@@ -31,7 +31,9 @@ class CommandHTTPServer {
     
     this.executor = new CommandExecutor({
       timeout: parseInt(process.env.COMMAND_TIMEOUT) || 30000,
-      maxOutputLength: parseInt(process.env.MAX_OUTPUT_LENGTH) || 10000
+      maxOutputLength: parseInt(process.env.MAX_OUTPUT_LENGTH) || 10000,
+      ollamaClient: this.ollamaClient,  // Pass OllamaClient for AI interpretation
+      useAIInterpretation: process.env.USE_AI_INTERPRETATION !== 'false'  // Default to true
     });
     
     this.serviceName = process.env.SERVICE_NAME || 'command-service';
@@ -206,27 +208,22 @@ class CommandHTTPServer {
         };
       }
       
-      // Step 4: Execute command
-      const execution = await this.executor.executeWithInterpretation(
-        shellCommand,
-        command
-      );
+      // Step 4: Execute command (raw output only, no interpretation)
+      const execution = await this.executor.execute(shellCommand);
       
       if (!execution.success) {
         return {
           success: false,
           error: execution.error,
-          interpretation: execution.interpretation,
           originalCommand: command,
           executedCommand: shellCommand
         };
       }
       
-      // Step 5: Return success
+      // Step 5: Return success with raw output (answer node will interpret)
       return {
         success: true,
-        result: execution.interpretation || execution.output,
-        output: execution.output,
+        output: execution.output, // Raw output for answer node to interpret
         originalCommand: command,
         executedCommand: shellCommand,
         category: validation.category,

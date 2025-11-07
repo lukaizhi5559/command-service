@@ -13,11 +13,14 @@ const execAsync = promisify(exec);
 class CommandExecutor {
   constructor(config = {}) {
     this.timeout = config.timeout || parseInt(process.env.COMMAND_TIMEOUT) || 30000;
-    this.maxOutputLength = config.maxOutputLength || parseInt(process.env.MAX_OUTPUT_LENGTH) || 10000;
+    this.maxOutputLength = config.maxOutputLength || parseInt(process.env.MAX_OUTPUT_LENGTH) || 1024 * 1024; // 1MB default
+    this.ollamaClient = config.ollamaClient || null; // Optional LLM for output interpretation
+    this.useAIInterpretation = config.useAIInterpretation !== false; // Default to true
     
     logger.info('CommandExecutor initialized', {
       timeout: this.timeout,
-      maxOutputLength: this.maxOutputLength
+      maxOutputLength: this.maxOutputLength,
+      aiInterpretation: this.useAIInterpretation && this.ollamaClient !== null
     });
   }
   
@@ -113,9 +116,35 @@ class CommandExecutor {
       };
     }
     
+    // Try AI-based interpretation first if available
+    if (this.useAIInterpretation && this.ollamaClient && result.output) {
+      try {
+        const aiResult = await this.ollamaClient.interpretOutput(
+          originalCommand,
+          command,
+          result.output
+        );
+        
+        if (aiResult.success) {
+          logger.info('Using AI interpretation for output');
+          return {
+            ...result,
+            interpretation: aiResult.interpretation,
+            interpretationType: 'ai'
+          };
+        }
+      } catch (error) {
+        logger.warn('AI interpretation failed, falling back to rule-based', {
+          error: error.message
+        });
+      }
+    }
+    
+    // Fallback to rule-based interpretation
     return {
       ...result,
-      interpretation: this._interpretOutput(command, result.output, originalCommand)
+      interpretation: this._interpretOutput(command, result.output, originalCommand),
+      interpretationType: 'rule-based'
     };
   }
   

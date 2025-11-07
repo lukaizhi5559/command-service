@@ -11,7 +11,7 @@ const logger = require('./logger.cjs');
 class OllamaClient {
   constructor(config = {}) {
     this.host = config.host || process.env.OLLAMA_HOST || 'http://localhost:11434';
-    this.model = config.model || process.env.OLLAMA_MODEL || 'llama3.2:3b';
+    this.model = config.model || process.env.OLLAMA_MODEL || 'qwen2:1.5b';
     this.timeout = config.timeout || 30000;
     
     this.ollama = new Ollama({ host: this.host });
@@ -31,9 +31,25 @@ class OllamaClient {
   async interpretCommand(naturalCommand, context = {}) {
     try {
       const os = context.os || process.platform;
+      
+      // Quick pattern matching for common commands (avoid slow LLM)
+      const quickMatch = this._quickMatchCommand(naturalCommand, os);
+      if (quickMatch) {
+        logger.info('Command matched via pattern', {
+          naturalCommand,
+          shellCommand: quickMatch
+        });
+        return {
+          success: true,
+          shellCommand: quickMatch,
+          originalCommand: naturalCommand,
+          method: 'pattern'
+        };
+      }
+      
       const prompt = this._buildCommandPrompt(naturalCommand, os, context);
       
-      logger.debug('Interpreting command', { naturalCommand, os });
+      logger.debug('Interpreting command via LLM', { naturalCommand, os });
       
       const response = await this.ollama.chat({
         model: this.model,
@@ -154,19 +170,113 @@ class OllamaClient {
     
     const osInfo = osSpecific[os] || 'Unix-like system';
     
-    return `Convert this natural language request into a shell command for ${osInfo}:
+    return `Convert this to a shell command for ${osInfo}:
 
 "${naturalCommand}"
 
-Rules:
-1. Return ONLY the shell command, nothing else
-2. No explanations, no markdown code blocks, no quotes around the command
-3. Use safe, standard commands
-4. For opening apps on macOS: use "open -a AppName"
-5. For system info: use appropriate commands (df, top, ps, etc.)
-6. Keep it simple and safe
+CRITICAL RULES:
+1. Output ONLY the command - NO explanations, NO markdown, NO quotes
+2. macOS app commands:
+   - Open: open -a "AppName"
+   - Close: osascript -e 'quit app "AppName"'
+   - List: ps aux
+3. File search: mdfind "kMDItemFSName == 'filename'"
+4. System info: df -h (disk), top -l 1 (memory), ps aux (processes)
+5. If unsure, output: echo "Cannot execute: [reason]"
 
-Shell command:`;
+Command:`;
+  }
+  
+  /**
+   * Quick pattern matching for common commands (fast, no LLM)
+   * @private
+   */
+  _quickMatchCommand(naturalCommand, os) {
+    const lower = naturalCommand.toLowerCase().trim();
+    
+    // macOS patterns
+    if (os === 'darwin') {
+      // List running apps/processes - FIXED: more specific patterns
+      if (/^what (apps?|applications?|programs?|processes) (are|is) (open|running)/i.test(lower) ||
+          /^(show|list|display) (running|open|all)?\s*(apps?|applications?|programs?|processes)/i.test(lower)) {
+        return 'ps aux';
+      }
+      
+      // Open app
+      const openMatch = lower.match(/^open\s+(\w+)/i);
+      if (openMatch) {
+        const appName = openMatch[1].charAt(0).toUpperCase() + openMatch[1].slice(1);
+        return `open -a ${appName}`;
+      }
+      
+      // Close/quit app
+      const closeMatch = lower.match(/^(close|quit|kill)\s+(\w+)/i);
+      if (closeMatch) {
+        const appName = closeMatch[2].charAt(0).toUpperCase() + closeMatch[2].slice(1);
+        return `pkill -x ${appName}`;
+      }
+      
+      // System info - disk/storage
+      if (/disk (space|usage)/i.test(lower) || 
+          /(how much|check).*(storage|disk|space).*(left|available|free|remaining)/i.test(lower)) {
+        return 'df -h';
+      }
+      
+      // System info - memory/RAM
+      if (/memory usage/i.test(lower) ||
+          /(how much|check).*(memory|ram).*(left|available|free|remaining)/i.test(lower)) {
+        return 'top -l 1 | grep PhysMem';
+      }
+      
+      // System info - CPU
+      if (/cpu usage/i.test(lower)) return 'top -l 1 | grep "CPU usage"';
+      
+      // App control - Open/Launch/Start/Run
+      // Match: "open [the] AppName [app]" or "open AppName"
+      if (/^(open|launch|start|run)\s+/i.test(lower)) {
+        // Try "open [the] X app" pattern first
+        let match = lower.match(/^(?:open|launch|start|run)\s+(?:the\s+)?([\w]+)(?:\s+app)?/i);
+        if (match) {
+          const appName = match[1].charAt(0).toUpperCase() + match[1].slice(1);
+          return `open -a "${appName}"`;
+        }
+      }
+      
+      // App control - Close/Quit/Exit/Kill/Stop
+      // Match: "close [the] AppName [app]"
+      if (/^(close|quit|exit|kill|stop)\s+/i.test(lower)) {
+        let match = lower.match(/^(?:close|quit|exit|kill|stop)\s+(?:the\s+)?([\w]+)(?:\s+app)?/i);
+        if (match) {
+          const appName = match[1].charAt(0).toUpperCase() + match[1].slice(1);
+          return `osascript -e 'quit app "${appName}"'`;
+        }
+      }
+      
+      // File search
+      if (/do i have.*folder.*called/i.test(lower) || /find.*folder.*called/i.test(lower)) {
+        const match = lower.match(/(?:folder|directory)\s+(?:called|named)\s+([a-z0-9_-]+)/i);
+        if (match) {
+          const folderName = match[1];
+          return `mdfind "kMDItemKind == 'Folder' && kMDItemFSName == '${folderName}'"`;
+        }
+      }
+      
+      // Count running apps
+      if (/how many apps.*open/i.test(lower) || /count.*apps.*running/i.test(lower)) {
+        return 'ps aux | grep -i ".app/Contents/MacOS" | grep -v grep | wc -l';
+      }
+    }
+    
+    // Linux patterns
+    if (os === 'linux') {
+      if (/^what (apps?|applications?|programs?|processes) (are|is) (open|running)/i.test(lower)) {
+        return 'ps aux';
+      }
+      if (/disk (space|usage)/i.test(lower)) return 'df -h';
+      if (/memory usage/i.test(lower)) return 'free -h';
+    }
+    
+    return null;
   }
   
   /**

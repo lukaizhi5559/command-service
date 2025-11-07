@@ -5,6 +5,7 @@ MCP service for natural language command execution in ThinkDrop AI using Ollama.
 ## Features
 
 - 🤖 **Natural Language Commands** - "Open Slack", "How much memory left?"
+- 💬 **AI-Powered Responses** - Human-readable output interpretation using LLM
 - 🔒 **Security First** - Whitelist validation, dangerous pattern blocking
 - ⚡ **Completely Free** - Uses local Ollama (llama3.2)
 - 🎯 **Intent-Based** - Handles `command` intent from ThinkDrop AI
@@ -82,6 +83,45 @@ npm start
 Or with auto-reload:
 ```bash
 npm run dev
+```
+
+### AI Output Interpretation
+
+The service now uses AI to interpret command output into human-readable responses. Instead of showing raw terminal output, you get conversational answers.
+
+**Example:**
+
+**User asks:** "What apps are open?"
+
+**Without AI interpretation:**
+```
+USER       PID  %CPU %MEM      VSZ    RSS   TT  STAT STARTED      TIME COMMAND
+lukaizhi 41903 40.9  0.1 411892480 10784 s001  R+   12:26AM   1:32.43 /opt/homebrew/Cellar/python...
+lukaizhi 42661 20.4  0.4 444692480 30208 s002  S+   12:28AM   0:04.35 /Users/lukaizhi/Desktop/projects...
+...
+```
+
+**With AI interpretation:**
+```
+Windsurf and Slack are currently active/open apps you have open.
+```
+
+**Configuration:**
+
+Enable/disable AI interpretation in `.env`:
+```bash
+USE_AI_INTERPRETATION=true  # Default: true
+```
+
+**How it works:**
+1. Command is executed and raw output captured
+2. LLM analyzes the output in context of the original question
+3. Concise, conversational response is generated (1-2 sentences)
+4. Falls back to rule-based interpretation if LLM fails
+
+**Test it:**
+```bash
+node test-interpretation.cjs
 ```
 
 ### MCP Actions
@@ -335,6 +375,7 @@ ALLOWED_COMMAND_CATEGORIES=open_app,system_info,file_read
 # Execution
 COMMAND_TIMEOUT=30000
 MAX_OUTPUT_LENGTH=10000
+USE_AI_INTERPRETATION=true  # Use LLM for human-readable output
 
 # Logging
 LOG_LEVEL=info
