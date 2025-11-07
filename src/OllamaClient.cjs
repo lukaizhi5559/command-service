@@ -6,6 +6,8 @@
  */
 
 const { Ollama } = require('ollama');
+const { execSync } = require('child_process');
+const fuzzysort = require('fuzzysort');
 const logger = require('./logger.cjs');
 
 class OllamaClient {
@@ -16,10 +18,135 @@ class OllamaClient {
     
     this.ollama = new Ollama({ host: this.host });
     
+    // Dynamic app cache for fuzzy matching
+    this.appCache = null;
+    this._loadInstalledApps();
+    
     logger.info('OllamaClient initialized', {
       host: this.host,
       model: this.model
     });
+  }
+  
+  /**
+   * Load installed apps dynamically (one-time on startup)
+   * Builds a cache of installed apps for fast fuzzy matching
+   * @private
+   */
+  _loadInstalledApps() {
+    try {
+      const os = process.platform;
+      let appList = [];
+
+      if (os === 'darwin') {
+        // macOS: List .app bundles from /Applications and ~/Applications
+        const systemApps = execSync('ls -1 /Applications/*.app 2>/dev/null | xargs -n1 basename', { encoding: 'utf8' })
+          .split('\n')
+          .map(name => name.replace(/\.app:?$/, '').trim()) // Remove .app or .app: suffix
+          .filter(name => name);
+        
+        const userApps = execSync('ls -1 ~/Applications/*.app 2>/dev/null | xargs -n1 basename || true', { encoding: 'utf8' })
+          .split('\n')
+          .map(name => name.replace(/\.app:?$/, '').trim()) // Remove .app or .app: suffix
+          .filter(name => name);
+        
+        appList = [...new Set([...systemApps, ...userApps])]; // Deduplicate
+      } else if (os === 'win32') {
+        // Windows: Use PowerShell
+        appList = execSync('powershell -Command "Get-StartApps | Select-Object -ExpandProperty Name"', { encoding: 'utf8' })
+          .split('\n')
+          .map(name => name.trim())
+          .filter(name => name && !name.startsWith('Microsoft.'));
+      } else if (os === 'linux') {
+        // Linux: List .desktop files
+        appList = execSync('ls /usr/share/applications/*.desktop 2>/dev/null | xargs -I {} basename {} .desktop || true', { encoding: 'utf8' })
+          .split('\n')
+          .map(name => name.trim())
+          .filter(name => name);
+      }
+
+      // Build fuzzy-searchable cache
+      this.appCache = {};
+      appList.forEach(appName => {
+        const lower = appName.toLowerCase();
+        this.appCache[lower] = appName;
+        
+        // Add common abbreviations (e.g., "Visual Studio Code" → "vscode", "vs code")
+        const words = lower.split(/\s+/);
+        if (words.length > 1) {
+          // First word
+          this.appCache[words[0]] = appName;
+          // First two words
+          if (words.length > 2) {
+            this.appCache[words.slice(0, 2).join(' ')] = appName;
+          }
+          // Initials (e.g., "vsc" for "Visual Studio Code")
+          const initials = words.map(w => w[0]).join('');
+          if (initials.length >= 2) {
+            this.appCache[initials] = appName;
+          }
+        }
+      });
+
+      logger.info('Loaded installed apps dynamically', { 
+        count: appList.length, 
+        os,
+        sample: appList.slice(0, 5)
+      });
+    } catch (error) {
+      logger.warn('Failed to load installed apps, using fallback', { error: error.message });
+      // Fallback to common apps
+      this.appCache = {
+        'slack': 'Slack',
+        'chrome': 'Google Chrome',
+        'safari': 'Safari',
+        'firefox': 'Firefox',
+        'vscode': 'Visual Studio Code',
+        'code': 'Visual Studio Code',
+        'terminal': 'Terminal',
+        'finder': 'Finder'
+      };
+    }
+  }
+  
+  /**
+   * Normalize app name using dynamic cache + fuzzy matching
+   * @param {string} raw - User input (e.g., "vs code", "slack app")
+   * @returns {string|null} Normalized app name (e.g., "Visual Studio Code")
+   * @private
+   */
+  _normalizeAppName(raw) {
+    if (!this.appCache) return null;
+
+    const lowerRaw = raw.toLowerCase().trim()
+      .replace(/\s+(app|application|program|window)$/i, '') // Remove trailing "app"
+      .replace(/^the\s+/i, ''); // Remove leading "the"
+    
+    // Exact match first
+    if (this.appCache[lowerRaw]) {
+      logger.debug('App matched exactly', { input: raw, matched: this.appCache[lowerRaw] });
+      return this.appCache[lowerRaw];
+    }
+
+    // Fuzzy match (e.g., "vscode" → "Visual Studio Code")
+    const keys = Object.keys(this.appCache);
+    const results = fuzzysort.go(lowerRaw, keys, { 
+      limit: 1, 
+      threshold: -10000 // Very permissive
+    });
+    
+    if (results.length > 0 && results[0].score > -5000) {
+      const match = this.appCache[results[0].target];
+      logger.debug('App matched via fuzzy search', { 
+        input: raw, 
+        matched: match, 
+        score: results[0].score 
+      });
+      return match;
+    }
+
+    logger.debug('No app match found', { input: raw });
+    return null;
   }
   
   /**
@@ -188,94 +315,75 @@ Command:`;
   }
   
   /**
-   * Quick pattern matching for common commands (fast, no LLM)
-   * @private
+   * Quick pattern matching for ONLY the most reliable commands
+   * Returns shell command if matched, null otherwise (then uses Gemini/Ollama)
+   * Simplified to ~10 ultra-reliable patterns to reduce maintenance
    */
   _quickMatchCommand(naturalCommand, os) {
+    if (!naturalCommand) return null;
+    
     const lower = naturalCommand.toLowerCase().trim();
     
-    // macOS patterns
+    // macOS patterns - ONLY exact, unambiguous matches
     if (os === 'darwin') {
-      // List running apps/processes - FIXED: more specific patterns
-      if (/^what (apps?|applications?|programs?|processes) (are|is) (open|running)/i.test(lower) ||
-          /^(show|list|display) (running|open|all)?\s*(apps?|applications?|programs?|processes)/i.test(lower)) {
-        return 'ps aux';
-      }
-      
-      // Open app
-      const openMatch = lower.match(/^open\s+(\w+)/i);
-      if (openMatch) {
-        const appName = openMatch[1].charAt(0).toUpperCase() + openMatch[1].slice(1);
-        return `open -a ${appName}`;
-      }
-      
-      // Close/quit app
-      const closeMatch = lower.match(/^(close|quit|kill)\s+(\w+)/i);
-      if (closeMatch) {
-        const appName = closeMatch[2].charAt(0).toUpperCase() + closeMatch[2].slice(1);
-        return `pkill -x ${appName}`;
-      }
-      
-      // System info - disk/storage
-      if (/disk (space|usage)/i.test(lower) || 
-          /(how much|check).*(storage|disk|space).*(left|available|free|remaining)/i.test(lower)) {
+      // Exact phrase matches for system info
+      if (lower === 'disk space' || lower === 'storage') {
         return 'df -h';
       }
       
-      // System info - memory/RAM
-      if (/memory usage/i.test(lower) ||
-          /(how much|check).*(memory|ram).*(left|available|free|remaining)/i.test(lower)) {
+      if (lower === 'memory' || lower === 'ram') {
         return 'top -l 1 | grep PhysMem';
       }
       
-      // System info - CPU
-      if (/cpu usage/i.test(lower)) return 'top -l 1 | grep "CPU usage"';
+      if (lower === 'battery') {
+        return 'pmset -g batt';
+      }
       
-      // App control - Open/Launch/Start/Run
-      // Match: "open [the] AppName [app]" or "open AppName"
-      if (/^(open|launch|start|run)\s+/i.test(lower)) {
-        // Try "open [the] X app" pattern first
-        let match = lower.match(/^(?:open|launch|start|run)\s+(?:the\s+)?([\w]+)(?:\s+app)?/i);
+      if (lower === 'what time is it' || lower === 'current time') {
+        return 'date "+%I:%M %p on %A, %B %d, %Y"';
+      }
+      
+      // App control with fuzzy matching (most reliable use case)
+      if (/^(open|launch)\s+/i.test(lower)) {
+        const match = lower.match(/^(?:open|launch)\s+(.+?)(?:\s+for me)?$/i);
         if (match) {
-          const appName = match[1].charAt(0).toUpperCase() + match[1].slice(1);
-          return `open -a "${appName}"`;
+          const rawAppName = match[1].trim();
+          const normalizedApp = this._normalizeAppName(rawAppName);
+          
+          if (normalizedApp) {
+            logger.info('App open command matched', { 
+              input: rawAppName, 
+              normalized: normalizedApp 
+            });
+            return `open -a "${normalizedApp}"`;
+          }
         }
       }
       
-      // App control - Close/Quit/Exit/Kill/Stop
-      // Match: "close [the] AppName [app]"
-      if (/^(close|quit|exit|kill|stop)\s+/i.test(lower)) {
-        let match = lower.match(/^(?:close|quit|exit|kill|stop)\s+(?:the\s+)?([\w]+)(?:\s+app)?/i);
+      if (/^(close|quit)\s+/i.test(lower)) {
+        const match = lower.match(/^(?:close|quit)\s+(.+?)(?:\s+for me)?$/i);
         if (match) {
-          const appName = match[1].charAt(0).toUpperCase() + match[1].slice(1);
-          return `osascript -e 'quit app "${appName}"'`;
+          const rawAppName = match[1].trim();
+          const normalizedApp = this._normalizeAppName(rawAppName);
+          
+          if (normalizedApp) {
+            logger.info('App close command matched', { 
+              input: rawAppName, 
+              normalized: normalizedApp 
+            });
+            return `osascript -e 'quit app "${normalizedApp}"'`;
+          }
         }
-      }
-      
-      // File search
-      if (/do i have.*folder.*called/i.test(lower) || /find.*folder.*called/i.test(lower)) {
-        const match = lower.match(/(?:folder|directory)\s+(?:called|named)\s+([a-z0-9_-]+)/i);
-        if (match) {
-          const folderName = match[1];
-          return `mdfind "kMDItemKind == 'Folder' && kMDItemFSName == '${folderName}'"`;
-        }
-      }
-      
-      // Count running apps
-      if (/how many apps.*open/i.test(lower) || /count.*apps.*running/i.test(lower)) {
-        return 'ps aux | grep -i ".app/Contents/MacOS" | grep -v grep | wc -l';
       }
     }
     
     // Linux patterns
     if (os === 'linux') {
-      if (/^what (apps?|applications?|programs?|processes) (are|is) (open|running)/i.test(lower)) {
-        return 'ps aux';
-      }
-      if (/disk (space|usage)/i.test(lower)) return 'df -h';
-      if (/memory usage/i.test(lower)) return 'free -h';
+      if (lower === 'disk space') return 'df -h';
+      if (lower === 'memory') return 'free -h';
     }
     
+    // No match - let Gemini/Ollama handle it
     return null;
   }
   

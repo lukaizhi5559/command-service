@@ -9,6 +9,8 @@ require('dotenv').config();
 const http = require('http');
 const url = require('url');
 const OllamaClient = require('./OllamaClient.cjs');
+const GeminiOAuthClient = require('./GeminiOAuthClient.cjs');
+const UsageTracker = require('./UsageTracker.cjs');
 const CommandValidator = require('./CommandValidator.cjs');
 const CommandExecutor = require('./CommandExecutor.cjs');
 const logger = require('./logger.cjs');
@@ -22,6 +24,15 @@ class CommandHTTPServer {
     this.ollamaClient = new OllamaClient({
       host: process.env.OLLAMA_HOST,
       model: process.env.OLLAMA_MODEL
+    });
+    
+    this.geminiClient = new GeminiOAuthClient({
+      model: process.env.GEMINI_MODEL,
+      enabled: process.env.ENABLE_GEMINI !== 'false'
+    });
+    
+    this.usageTracker = new UsageTracker({
+      dailyLimit: parseInt(process.env.GEMINI_DAILY_LIMIT) || 1500
     });
     
     this.validator = new CommandValidator({
@@ -44,6 +55,8 @@ class CommandHTTPServer {
       port: this.port,
       host: this.host,
       ollamaModel: this.ollamaClient.model,
+      geminiEnabled: this.geminiClient.enabled,
+      geminiConfigured: this.geminiClient.isAvailable(),
       allowedCategories: this.validator.allowedCategories
     });
   }
@@ -113,6 +126,22 @@ class CommandHTTPServer {
               response = await this.systemQuery(payload);
               break;
             
+            case 'gemini.oauth.start':
+              response = await this.startGeminiOAuth();
+              break;
+            
+            case 'gemini.oauth.revoke':
+              response = await this.revokeGeminiOAuth();
+              break;
+            
+            case 'gemini.status':
+              response = await this.getGeminiStatus();
+              break;
+            
+            case 'usage.status':
+              response = await this.getUsageStatus();
+              break;
+            
             case 'health':
               response = await this.healthCheck();
               break;
@@ -157,6 +186,7 @@ class CommandHTTPServer {
   
   /**
    * Execute a natural language command
+   * Routing: Pattern Matching → Gemini → Ollama (fallback)
    */
   async executeCommand(payload) {
     const { command, context = {} } = payload;
@@ -169,20 +199,93 @@ class CommandHTTPServer {
     }
     
     try {
-      // Step 1: Interpret natural language to shell command
-      const interpretation = await this.ollamaClient.interpretCommand(command, context);
+      let interpretation;
+      let interpretationSource = 'unknown';
+      
+      // Step 1: Try pattern matching first (instant, no API calls)
+      const os = context.os || process.platform;
+      const patternMatch = this.ollamaClient._quickMatchCommand(command, os);
+      
+      if (patternMatch) {
+        logger.info('Command matched via pattern', {
+          naturalCommand: command,
+          shellCommand: patternMatch
+        });
+        
+        interpretation = {
+          success: true,
+          shellCommand: patternMatch
+        };
+        interpretationSource = 'pattern';
+      }
+      // Step 2: Try Gemini if available and not rate limited
+      else if (this.geminiClient.isAvailable()) {
+        const usageCheck = this.usageTracker.recordCall({
+          command,
+          timestamp: new Date().toISOString()
+        });
+        
+        if (!usageCheck.allowed) {
+          logger.warn('Gemini rate limit reached, falling back to Ollama', {
+            count: usageCheck.count,
+            limit: usageCheck.limit
+          });
+          
+          // Fall through to Ollama
+          interpretation = await this.ollamaClient.interpretCommand(command, context);
+          interpretationSource = 'ollama-fallback';
+        } else {
+          logger.info('Attempting Gemini interpretation', {
+            command,
+            usage: `${usageCheck.count}/${usageCheck.limit}`
+          });
+          
+          interpretation = await this.geminiClient.interpretCommand(command, os, context);
+          
+          if (interpretation.success) {
+            interpretationSource = 'gemini';
+            logger.info('Command interpreted by Gemini', {
+              naturalCommand: command,
+              shellCommand: interpretation.command,
+              usage: `${usageCheck.count}/${usageCheck.limit}`
+            });
+            
+            // Normalize response format
+            interpretation.shellCommand = interpretation.command;
+            
+            // Warn user if approaching limit
+            if (usageCheck.warning) {
+              interpretation.usageWarning = usageCheck.warning;
+            }
+          } else {
+            // Gemini failed, fall back to Ollama
+            logger.warn('Gemini interpretation failed, falling back to Ollama', {
+              error: interpretation.error
+            });
+            interpretation = await this.ollamaClient.interpretCommand(command, context);
+            interpretationSource = 'ollama-fallback';
+          }
+        }
+      }
+      // Step 3: Fall back to Ollama (offline mode or Gemini not configured)
+      else {
+        logger.info('Using Ollama for interpretation (Gemini not available)');
+        interpretation = await this.ollamaClient.interpretCommand(command, context);
+        interpretationSource = 'ollama';
+      }
       
       if (!interpretation.success) {
         return {
           success: false,
           error: `Failed to interpret command: ${interpretation.error}`,
-          originalCommand: command
+          originalCommand: command,
+          interpretationSource
         };
       }
       
       const shellCommand = interpretation.shellCommand;
       
-      // Step 2: Validate shell command
+      // Step 4: Validate shell command
       const validation = this.validator.validate(shellCommand);
       
       if (!validation.isValid) {
@@ -191,11 +294,12 @@ class CommandHTTPServer {
           error: validation.error,
           originalCommand: command,
           interpretedCommand: shellCommand,
-          riskLevel: validation.riskLevel
+          riskLevel: validation.riskLevel,
+          interpretationSource
         };
       }
       
-      // Step 3: Check if confirmation is required
+      // Step 5: Check if confirmation is required
       if (validation.requiresConfirmation) {
         return {
           success: false,
@@ -204,11 +308,12 @@ class CommandHTTPServer {
           originalCommand: command,
           interpretedCommand: shellCommand,
           category: validation.category,
-          riskLevel: validation.riskLevel
+          riskLevel: validation.riskLevel,
+          interpretationSource
         };
       }
       
-      // Step 4: Execute command (raw output only, no interpretation)
+      // Step 6: Execute command (raw output only, no interpretation)
       const execution = await this.executor.execute(shellCommand);
       
       if (!execution.success) {
@@ -216,19 +321,28 @@ class CommandHTTPServer {
           success: false,
           error: execution.error,
           originalCommand: command,
-          executedCommand: shellCommand
+          executedCommand: shellCommand,
+          interpretationSource
         };
       }
       
-      // Step 5: Return success with raw output (answer node will interpret)
-      return {
+      // Step 7: Return success with raw output (answer node will interpret)
+      const response = {
         success: true,
         output: execution.output, // Raw output for answer node to interpret
         originalCommand: command,
         executedCommand: shellCommand,
         category: validation.category,
-        executionTime: execution.executionTime
+        executionTime: execution.executionTime,
+        interpretationSource
       };
+      
+      // Include usage warning if present
+      if (interpretation.usageWarning) {
+        response.usageWarning = interpretation.usageWarning;
+      }
+      
+      return response;
       
     } catch (error) {
       logger.error('Error executing command', {
@@ -313,11 +427,107 @@ class CommandHTTPServer {
   }
   
   /**
+   * Start Gemini OAuth flow
+   */
+  async startGeminiOAuth() {
+    try {
+      logger.info('Starting Gemini OAuth flow');
+      const result = await this.geminiClient.startOAuthFlow();
+      
+      if (result.success) {
+        // Test the connection
+        const testResult = await this.geminiClient.testConnection();
+        
+        if (testResult.success) {
+          logger.info('Gemini OAuth completed and tested successfully');
+          return {
+            success: true,
+            message: 'Successfully authenticated with Google Gemini',
+            status: this.geminiClient.getStatus()
+          };
+        } else {
+          return {
+            success: false,
+            error: `OAuth succeeded but connection test failed: ${testResult.error}`
+          };
+        }
+      } else {
+        return result;
+      }
+      
+    } catch (error) {
+      logger.error('OAuth flow failed', { error: error.message });
+      return {
+        success: false,
+        error: error.message
+      };
+    }
+  }
+  
+  /**
+   * Revoke Gemini OAuth token
+   */
+  async revokeGeminiOAuth() {
+    try {
+      const result = await this.geminiClient.revokeToken();
+      return result;
+    } catch (error) {
+      return {
+        success: false,
+        error: error.message
+      };
+    }
+  }
+  
+  /**
+   * Get Gemini status
+   */
+  async getGeminiStatus() {
+    try {
+      const status = this.geminiClient.getStatus();
+      const usageStatus = this.usageTracker.getStatus();
+      
+      return {
+        success: true,
+        gemini: status,
+        usage: usageStatus
+      };
+      
+    } catch (error) {
+      return {
+        success: false,
+        error: error.message
+      };
+    }
+  }
+  
+  /**
+   * Get usage status
+   */
+  async getUsageStatus() {
+    try {
+      const status = this.usageTracker.getStatus();
+      
+      return {
+        success: true,
+        ...status
+      };
+      
+    } catch (error) {
+      return {
+        success: false,
+        error: error.message
+      };
+    }
+  }
+  
+  /**
    * Health check
    */
   async healthCheck() {
     try {
       const ollamaHealthy = await this.ollamaClient.checkHealth();
+      const usageStatus = this.usageTracker.getStatus();
       
       return {
         success: true,
@@ -328,6 +538,12 @@ class CommandHTTPServer {
           host: this.ollamaClient.host,
           model: this.ollamaClient.model
         },
+        gemini: {
+          enabled: this.geminiClient.enabled,
+          configured: this.geminiClient.isAvailable(),
+          model: this.geminiClient.model
+        },
+        usage: usageStatus,
         validator: {
           enabled: this.validator.validationEnabled,
           allowedCategories: this.validator.allowedCategories

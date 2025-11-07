@@ -67,6 +67,7 @@ class CommandValidator {
       process: [
         /^(kill|killall|pkill)(\s|$)/i,               // Kill processes
         /^(systemctl|service)(\s|$)/i,                // Service management
+        /^osascript\s+-e\s+['"]quit\s+app/i,          // macOS: quit app via AppleScript
       ],
     };
     

@@ -1,18 +1,22 @@
 # Dependencies
 node_modules/
-package-lock.json
-yarn.lock
+# Note: yarn.lock should be committed for consistent installs
 
-# Environment
+# Environment variables
 .env
 .env.local
+.env.*.local
+
+# OAuth credentials (keep secure!)
+client_secret_*.json
+*oauth*.json
 
 # Logs
 logs/
 *.log
 npm-debug.log*
 
-# OS
+# OS files
 .DS_Store
 Thumbs.db
 
@@ -21,7 +25,13 @@ Thumbs.db
 .idea/
 *.swp
 *.swo
+*~
 
-# Testing
+# Build outputs
+dist/
+build/ng
 coverage/
 .nyc_output/
+
+# .yarn
+.yarn
