@@ -14,8 +14,8 @@ class CommandValidator {
     
     // Dangerous patterns that should always be blocked
     this.blockedPatterns = [
-      /rm\s+-rf\s+[\/~]/i,           // rm -rf / or ~
-      /:\(\)\{\s*:\|:&\s*\};:/,      // Fork bomb
+      /rm\s+-rf\s+[\/~]/i,            // rm -rf / or ~
+      /:\(\)\{\s*:\|:&\s*\};:/,       // Fork bomb
       /mkfs/i,                        // Format filesystem
       /dd\s+if=/i,                    // Disk operations
       />\/dev\/sd[a-z]/i,             // Write to disk
