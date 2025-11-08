@@ -308,7 +308,12 @@ CRITICAL RULES:
    - Close: osascript -e 'quit app "AppName"'
    - List: ps aux
 3. File search: mdfind "kMDItemFSName == 'filename'"
-4. System info: df -h (disk), top -l 1 (memory), ps aux (processes)
+4. System info:
+   - Disk: df -h
+   - Memory: top -l 1 | grep PhysMem
+   - Processes: ps aux
+   - IP address: curl -s ifconfig.me
+   - Local IP: ipconfig getifaddr en0
 5. If unsure, output: echo "Cannot execute: [reason]"
 
 Command:`;
@@ -341,6 +346,17 @@ Command:`;
       
       if (lower === 'what time is it' || lower === 'current time') {
         return 'date "+%I:%M %p on %A, %B %d, %Y"';
+      }
+      
+      // IP address queries
+      if (/\b(what|show|get|my|the)\s+(is\s+)?(my\s+)?(ip|ip address|external ip|public ip)\b/i.test(lower)) {
+        // External IP
+        return 'curl -s ifconfig.me';
+      }
+      
+      if (/\b(local|internal|private)\s+ip\b/i.test(lower)) {
+        // Local IP
+        return 'ipconfig getifaddr en0 || ipconfig getifaddr en1';
       }
       
       // App control with fuzzy matching (most reliable use case)

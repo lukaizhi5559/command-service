@@ -43,6 +43,11 @@ class CommandValidator {
         /^(ifconfig|ip\s+addr|netstat)(\s|$)/i,       // Network info
         /^(date|cal|uptime)(\s|$)/i,                  // Time info
         /^system_profiler/i,                           // macOS system info
+        // Version checks (generic - matches any command with version flags)
+        /\s+(--version|-v|-V|version)(\s|$)/i,        // Any command with version flags
+        /^[\w\-]+\s+--version$/i,                     // tool --version
+        /^[\w\-]+\s+-v$/i,                            // tool -v
+        /^[\w\-]+\s+-V$/i,                            // tool -V
       ],
       file_read: [
         /^(ls|ll|la)(\s|$)/i,                         // List files
@@ -54,6 +59,14 @@ class CommandValidator {
         /^find\s+/i,                                   // Find files
         /^grep\s+/i,                                   // Search in files
         /^pwd$/i,                                      // Print working directory
+        /^test\s+-[defLrwxs]/i,                       // Test file/directory existence
+        /^\[\s+-[defLrwxs]/i,                         // Test with [ syntax
+        /^(test|stat)\s+/i,                           // File status commands
+        // Conditional operators with safe commands (test, echo)
+        /^test\s+.*&&\s+echo/i,                       // test && echo
+        /^test\s+.*\|\|\s+echo/i,                     // test || echo
+        /^\[\s+.*\]\s+&&\s+echo/i,                    // [ ... ] && echo
+        /^\[\s+.*\]\s+\|\|\s+echo/i,                  // [ ... ] || echo
       ],
       file_write: [
         /^(touch|mkdir|cp|mv)(\s|$)/i,                // Create/move files
@@ -68,6 +81,9 @@ class CommandValidator {
         /^(kill|killall|pkill)(\s|$)/i,               // Kill processes
         /^(systemctl|service)(\s|$)/i,                // Service management
         /^osascript\s+-e\s+['"]quit\s+app/i,          // macOS: quit app via AppleScript
+        // Docker commands (read-only)
+        /^docker\s+(ps|images|container\s+ls|image\s+ls|version|info)(\s|$)/i,
+        /^docker-compose\s+(ps|config|version)(\s|$)/i,
       ],
     };
     

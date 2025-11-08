@@ -264,14 +264,29 @@ class CommandHTTPServer {
             });
             interpretation = await this.ollamaClient.interpretCommand(command, context);
             interpretationSource = 'ollama-fallback';
+            
+            // Add warning about Gemini failure
+            interpretation.geminiWarning = {
+              message: 'Gemini API failed. Using less reliable local model. Please check your Gemini connection in the MCP panel.',
+              action: 'configure_gemini',
+              severity: 'error',
+              details: interpretation.error
+            };
           }
         }
       }
       // Step 3: Fall back to Ollama (offline mode or Gemini not configured)
       else {
-        logger.info('Using Ollama for interpretation (Gemini not available)');
+        logger.warn('Using Ollama for interpretation (Gemini not available) - results may be unreliable');
         interpretation = await this.ollamaClient.interpretCommand(command, context);
         interpretationSource = 'ollama';
+        
+        // Add warning about Gemini configuration
+        interpretation.geminiWarning = {
+          message: 'Command interpretation is using a less reliable local model. For better results, please connect to Gemini.',
+          action: 'configure_gemini',
+          severity: 'warning'
+        };
       }
       
       if (!interpretation.success) {
@@ -299,8 +314,16 @@ class CommandHTTPServer {
         };
       }
       
-      // Step 5: Check if confirmation is required
-      if (validation.requiresConfirmation) {
+      // Step 5: Check if confirmation is required (unless bypassed by user approval)
+      const bypassConfirmation = context.bypassConfirmation === true;
+      
+      if (validation.requiresConfirmation && !bypassConfirmation) {
+        logger.info('Command requires confirmation', {
+          command: shellCommand,
+          category: validation.category,
+          riskLevel: validation.riskLevel
+        });
+        
         return {
           success: false,
           requiresConfirmation: true,
@@ -313,7 +336,15 @@ class CommandHTTPServer {
         };
       }
       
-      // Step 6: Execute command (raw output only, no interpretation)
+      // Log if confirmation was bypassed
+      if (bypassConfirmation && validation.requiresConfirmation) {
+        logger.info('Command confirmation bypassed by user approval', {
+          command: shellCommand,
+          category: validation.category
+        });
+      }
+      
+      // Step 6: Execute command
       const execution = await this.executor.execute(shellCommand);
       
       if (!execution.success) {
@@ -326,20 +357,103 @@ class CommandHTTPServer {
         };
       }
       
-      // Step 7: Return success with raw output (answer node will interpret)
+      // Step 7: Interpret output for concise summary (respecting privacy mode)
+      let interpretedOutput = execution.output;
+      let outputInterpretationSource = 'raw';
+      
+      // Only interpret if output is large (>500 chars)
+      if (execution.output && execution.output.length > 500) {
+        try {
+          // Check if user is in online mode (passed in context)
+          const useOnlineMode = payload.context?.useOnlineMode || false;
+          
+          // Smart truncation based on command type
+          let truncatedOutput = execution.output;
+          const maxLength = useOnlineMode ? 5000 : 2000; // Smaller for local Ollama
+          
+          if (execution.output.length > maxLength) {
+            // For list-style outputs (ps, ls, etc), take first N lines + last few lines
+            const lines = execution.output.split('\n');
+            if (lines.length > 50) {
+              const firstLines = lines.slice(0, 30).join('\n');
+              const lastLines = lines.slice(-5).join('\n');
+              truncatedOutput = `${firstLines}\n... (${lines.length - 35} more lines) ...\n${lastLines}`;
+            } else {
+              truncatedOutput = execution.output.substring(0, maxLength);
+            }
+          }
+          
+          const interpretationPrompt = `The user asked: "${command}"
+The command executed was: ${shellCommand}
+The output is:
+${truncatedOutput}
+
+Please provide a clear, concise answer to the user's question based on this output. Be specific and helpful. If there are multiple items, list the most relevant ones.`;
+
+          if (useOnlineMode && this.geminiClient.isConfigured()) {
+            // Online Mode: Use Gemini (cloud)
+            const canUseGemini = await this.usageTracker.canMakeRequest();
+            if (canUseGemini) {
+              logger.info('Interpreting command output with Gemini (Online Mode)', {
+                originalCommand: command,
+                outputLength: execution.output.length
+              });
+              
+              const interpretation = await this.geminiClient.generateContent(interpretationPrompt);
+              await this.usageTracker.recordRequest();
+              
+              interpretedOutput = interpretation;
+              outputInterpretationSource = 'gemini';
+              
+              logger.info('Output interpreted by Gemini', {
+                originalLength: execution.output.length,
+                interpretedLength: interpretation.length
+              });
+            }
+          } else {
+            // Private Mode: Use local Ollama (privacy-first)
+            logger.info('Interpreting command output with Ollama (Private Mode)', {
+              originalCommand: command,
+              outputLength: execution.output.length
+            });
+            
+            const interpretation = await this.ollamaClient.generateText(interpretationPrompt);
+            interpretedOutput = interpretation;
+            outputInterpretationSource = 'ollama';
+            
+            logger.info('Output interpreted by Ollama (private)', {
+              originalLength: execution.output.length,
+              interpretedLength: interpretation.length
+            });
+          }
+        } catch (error) {
+          logger.warn('Failed to interpret output, using raw output', {
+            error: error.message
+          });
+        }
+      }
+      
+      // Step 8: Return success with interpreted output
       const response = {
         success: true,
-        output: execution.output, // Raw output for answer node to interpret
+        output: interpretedOutput,
+        rawOutput: execution.output.length > 1000 ? execution.output.substring(0, 1000) + '...(truncated)' : execution.output,
         originalCommand: command,
         executedCommand: shellCommand,
         category: validation.category,
         executionTime: execution.executionTime,
-        interpretationSource
+        interpretationSource,
+        outputInterpretationSource
       };
       
       // Include usage warning if present
       if (interpretation.usageWarning) {
         response.usageWarning = interpretation.usageWarning;
+      }
+      
+      // Include Gemini configuration warning if present
+      if (interpretation.geminiWarning) {
+        response.geminiWarning = interpretation.geminiWarning;
       }
       
       return response;
