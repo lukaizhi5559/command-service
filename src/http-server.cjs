@@ -549,22 +549,26 @@ Please provide a clear, concise answer to the user's question based on this outp
       const result = await this.geminiClient.startOAuthFlow();
       
       if (result.success) {
-        // Test the connection
-        const testResult = await this.geminiClient.testConnection();
+        logger.info('OAuth completed successfully');
         
-        if (testResult.success) {
-          logger.info('Gemini OAuth completed and tested successfully');
-          return {
-            success: true,
-            message: 'Successfully authenticated with Google Gemini',
-            status: this.geminiClient.getStatus()
-          };
-        } else {
-          return {
-            success: false,
-            error: `OAuth succeeded but connection test failed: ${testResult.error}`
-          };
+        // Generate Google Cloud API key for Vision, Maps, YouTube, etc.
+        let apiKey = null;
+        try {
+          logger.info('Generating Google Cloud API key...');
+          apiKey = await this.geminiClient.createGoogleCloudAPIKey();
+          logger.info('Google Cloud API key generated successfully');
+        } catch (apiKeyError) {
+          logger.warn('Failed to generate Google Cloud API key', { error: apiKeyError.message });
+          // Don't fail the whole OAuth flow if API key generation fails
         }
+        
+        return {
+          success: true,
+          message: 'Successfully authenticated with Google',
+          status: this.geminiClient.getStatus(),
+          apiKey: apiKey, // Include the generated API key
+          tokens: this.geminiClient.oauth2Client?.credentials // Include OAuth tokens
+        };
       } else {
         return result;
       }

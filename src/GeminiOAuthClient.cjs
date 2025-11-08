@@ -158,7 +158,10 @@ class GeminiOAuthClient {
       // Generate auth URL
       const authUrl = this.oauth2Client.generateAuthUrl({
         access_type: 'offline',
-        scope: ['https://www.googleapis.com/auth/generative-language.retriever'],
+        scope: [
+          'https://www.googleapis.com/auth/cloud-platform', // For creating API keys
+          'https://www.googleapis.com/auth/generative-language.retriever' // For Gemini
+        ],
         prompt: 'consent'
       });
       
@@ -179,26 +182,15 @@ class GeminiOAuthClient {
       this.oauth2Client.setCredentials(tokens);
       this._saveToken(tokens);
       
-      // Create or retrieve API key using OAuth token
-      const apiKey = await this._getOrCreateApiKey(tokens);
+      // Note: API key creation is now handled by http-server.cjs after OAuth completes
+      // This allows us to create the correct Google Cloud API key with proper scopes
       
-      if (!apiKey) {
-        throw new Error('Failed to create Gemini API key');
-      }
+      logger.info('OAuth flow completed successfully');
       
-      // Initialize Gemini client with the API key
-      this.client = new GoogleGenerativeAI(apiKey);
-      
-      // Save API key locally as backup
-      await this._saveApiKeyToFile(apiKey);
-      
-      logger.info('OAuth flow completed successfully with API key');
-      
-      // Return API key and tokens to main app for centralized storage
+      // Return tokens to main app - API key will be created separately
       return {
         success: true,
-        message: 'Successfully authenticated with Google Gemini',
-        apiKey: apiKey,
+        message: 'Successfully authenticated with Google',
         tokens: {
           access_token: tokens.access_token,
           refresh_token: tokens.refresh_token,
@@ -650,6 +642,130 @@ COMMAND:`;
       tokenExpiry: tokenExpiry ? new Date(tokenExpiry).toISOString() : null,
       tokenValid: hasToken && (!tokenExpiry || Date.now() < tokenExpiry)
     };
+  }
+  
+  /**
+   * Create a Google Cloud API key for Vision, Maps, YouTube, etc.
+   * @returns {Promise<string>} The generated API key
+   */
+  async createGoogleCloudAPIKey() {
+    try {
+      if (!this.isAvailable()) {
+        throw new Error('OAuth not authenticated');
+      }
+      
+      // Debug: Log OAuth credentials
+      logger.info('OAuth credentials check', {
+        hasAccessToken: !!this.oauth2Client.credentials?.access_token,
+        hasRefreshToken: !!this.oauth2Client.credentials?.refresh_token,
+        scope: this.oauth2Client.credentials?.scope,
+        expiry: this.oauth2Client.credentials?.expiry_date
+      });
+      
+      // Use the googleapis library to create an API key
+      const apikeys = google.apikeys('v2');
+      
+      // Get the project ID from environment variable
+      const projectId = process.env.GOOGLE_CLOUD_PROJECT;
+      
+      if (!projectId) {
+        throw new Error(
+          'GOOGLE_CLOUD_PROJECT environment variable not set. ' +
+          'Please create a Google Cloud project and set the project ID.'
+        );
+      }
+      
+      logger.info('Creating API key for project', { projectId });
+      
+      // IMPORTANT: The API Keys API must be enabled in your Google Cloud project
+      // Go to: https://console.cloud.google.com/apis/library/apikeys.googleapis.com
+      // Click "Enable" for your project
+      
+      logger.info('Attempting to create API key with OAuth credentials');
+      
+      // First, try to list existing keys to verify permissions
+      try {
+        logger.info('Testing permissions by listing existing keys...');
+        const listResponse = await apikeys.projects.locations.keys.list({
+          parent: `projects/${projectId}/locations/global`,
+          auth: this.oauth2Client
+        });
+        logger.info('Successfully listed keys', { count: listResponse.data.keys?.length || 0 });
+      } catch (listError) {
+        logger.error('Failed to list API keys - permission issue?', { 
+          error: listError.message,
+          code: listError.code 
+        });
+        throw new Error(
+          `Cannot access API Keys in project ${projectId}. ` +
+          `Please ensure your Google account has the "API Keys Admin" role. ` +
+          `Go to: https://console.cloud.google.com/iam-admin/iam?project=${projectId}`
+        );
+      }
+      
+      // Create the API key - this returns an operation, not the key itself
+      const displayName = `ThinkDrop AI - ${new Date().toISOString()}`;
+      const createResponse = await apikeys.projects.locations.keys.create({
+        parent: `projects/${projectId}/locations/global`,
+        auth: this.oauth2Client,
+        requestBody: {
+          displayName: displayName,
+          restrictions: {
+            apiTargets: [
+              { service: 'vision.googleapis.com' },
+              { service: 'generativelanguage.googleapis.com' }, // Gemini API
+              { service: 'aiplatform.googleapis.com' }, // Vertex AI
+              { service: 'maps-backend.googleapis.com' },
+              { service: 'youtube.googleapis.com' },
+              { service: 'translate.googleapis.com' }
+            ]
+          }
+        }
+      });
+      
+      logger.info('API key creation initiated', {
+        operationName: createResponse.data.name,
+        displayName: displayName
+      });
+      
+      // The create returns an operation. We need to wait a moment for it to complete,
+      // then list keys to find the newly created one
+      logger.info('Waiting for key creation to complete...');
+      await new Promise(resolve => setTimeout(resolve, 2000)); // Wait 2 seconds
+      
+      // List keys to find the one we just created
+      const listResponse = await apikeys.projects.locations.keys.list({
+        parent: `projects/${projectId}/locations/global`,
+        auth: this.oauth2Client
+      });
+      
+      // Find the key we just created by display name
+      const newKey = listResponse.data.keys?.find(k => k.displayName === displayName);
+      
+      if (!newKey) {
+        throw new Error(`Could not find newly created key with display name: ${displayName}`);
+      }
+      
+      logger.info('Found newly created key', { keyName: newKey.name });
+      
+      // Get the key string
+      const keyResponse = await apikeys.projects.locations.keys.getKeyString({
+        name: newKey.name,
+        auth: this.oauth2Client
+      });
+      
+      const apiKey = keyResponse.data.keyString;
+      logger.info('Google Cloud API key retrieved successfully', {
+        keyId: newKey.name,
+        keyStringLength: apiKey?.length || 0
+      });
+      
+      return apiKey;
+      
+    } catch (error) {
+      logger.error('Failed to create Google Cloud API key', { error: error.message });
+      throw error;
+    }
   }
   
   /**
