@@ -14,6 +14,11 @@ const UsageTracker = require('./UsageTracker.cjs');
 const CommandValidator = require('./CommandValidator.cjs');
 const CommandExecutor = require('./CommandExecutor.cjs');
 const logger = require('./logger.cjs');
+const modelSelector = require('./utils/model-selector');
+
+// Smart model selection on startup
+const modelSelection = modelSelector.selectBestModel(process.env.OLLAMA_MODEL);
+process.env.OLLAMA_MODEL = modelSelection.model; // Override with selected model
 
 class CommandHTTPServer {
   constructor() {
@@ -81,10 +86,17 @@ class CommandHTTPServer {
     const parsedUrl = url.parse(req.url, true);
     const pathname = parsedUrl.pathname;
     
-    // Check API key
+    // Check API key (support both raw key and Bearer token format)
     const authHeader = req.headers['authorization'];
-    if (authHeader !== this.apiKey) {
-      logger.warn('Unauthorized request', { authHeader });
+    const providedKey = authHeader?.startsWith('Bearer ') 
+      ? authHeader.substring(7) 
+      : authHeader;
+    
+    if (providedKey !== this.apiKey) {
+      logger.warn('Unauthorized request', { 
+        authHeader: authHeader ? `${authHeader.substring(0, 10)}...` : 'missing',
+        expectedKey: `${this.apiKey.substring(0, 10)}...`
+      });
       res.writeHead(401, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ success: false, error: 'Unauthorized' }));
       return;
@@ -697,9 +709,12 @@ Please provide a clear, concise answer to the user's question based on this outp
       logger.info(`Command Service HTTP server listening`, {
         host: this.host,
         port: this.port,
-        url: `http://${this.host}:${this.port}`
+        url: `http://${this.host}:${this.port}`,
+        model: modelSelection.model,
+        modelReason: modelSelection.reason
       });
       console.log(`✅ Command Service running at http://${this.host}:${this.port}`);
+      console.log(`   🤖 Model: ${modelSelection.model} (${modelSelection.reason})`);
     });
     
     // Handle process signals
