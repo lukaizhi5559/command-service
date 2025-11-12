@@ -204,6 +204,7 @@ class NutjsAutomationHandler {
       
       // Step 2: Try plan-based execution first (Phase 1)
       const usePlanExecution = process.env.USE_PLAN_EXECUTION !== 'false'; // Default to true
+      let planFailureInfo = null;
       
       if (usePlanExecution) {
         try {
@@ -213,6 +214,15 @@ class NutjsAutomationHandler {
           if (result.success) {
             return result;
           }
+          
+          // Store plan failure info for fallback response
+          planFailureInfo = {
+            partialSuccess: result.partialSuccess,
+            completedSteps: result.metadata?.completedSteps,
+            totalSteps: result.metadata?.totalSteps,
+            completionRate: result.metadata?.completionRate,
+            error: result.error
+          };
           
           // If plan execution fails, fall back to raw code
           logger.warn('Plan execution failed, falling back to raw code execution', {
@@ -227,7 +237,30 @@ class NutjsAutomationHandler {
       
       // Fallback: Raw code execution (old method)
       logger.info('Using raw code execution (fallback)');
-      return await this.handleRawCodeAutomation(command);
+      const fallbackResult = await this.handleRawCodeAutomation(command);
+      
+      // If we had a plan failure (partial or complete), mark as uncertain success
+      if (planFailureInfo) {
+        // Change success to uncertain when plan failed but fallback "succeeded"
+        if (fallbackResult.success) {
+          fallbackResult.success = false; // Mark as failure since we can't verify
+          fallbackResult.uncertainResult = true; // Flag for UI to show special message
+          fallbackResult.warning = planFailureInfo.partialSuccess
+            ? `⚠️ The structured plan partially completed (${planFailureInfo.completedSteps}/${planFailureInfo.totalSteps} steps), ` +
+              `but couldn't finish. A fallback method was attempted, but the result cannot be verified. ` +
+              `**Please check if the task completed correctly.**`
+            : `⚠️ The structured plan failed, and a fallback method was attempted. ` +
+              `The result cannot be verified. **Please check if the task completed correctly.**`;
+          fallbackResult.planFailure = planFailureInfo;
+          
+          logger.warn('Fallback executed after plan failure - result uncertain', {
+            command,
+            planSteps: `${planFailureInfo.completedSteps}/${planFailureInfo.totalSteps}`
+          });
+        }
+      }
+      
+      return fallbackResult;
       
     } catch (error) {
       logger.error('Desktop automation failed', {
@@ -249,8 +282,8 @@ class NutjsAutomationHandler {
    * @returns {Promise<Object>}
    */
   async handlePlanBasedAutomation(command, context = {}) {
-    const { fetchAutomationPlan } = require('./services/backendClient');
-    const { executePlan, generateSummary } = require('./services/planExecutor');
+    const { fetchAutomationPlan } = require('./services/backendClient.cjs');
+    const { executePlan, generateSummary } = require('./services/planExecutor.cjs');
     
     try {
       // Step 1: Fetch structured plan from backend
@@ -275,8 +308,13 @@ class NutjsAutomationHandler {
           }
         };
       } else {
+        // Check if most steps completed (partial success)
+        const completionRate = result.summary.completed / result.summary.totalSteps;
+        const isPartialSuccess = completionRate >= 0.7; // 70% or more steps completed
+        
         return {
           success: false,
+          partialSuccess: isPartialSuccess,
           error: generateSummary(result),
           metadata: {
             planId: result.planId,
@@ -284,6 +322,7 @@ class NutjsAutomationHandler {
             failedStep: result.failedStep,
             completedSteps: result.summary.completed,
             totalSteps: result.summary.totalSteps,
+            completionRate: Math.round(completionRate * 100),
             executionTime: result.totalTime
           }
         };

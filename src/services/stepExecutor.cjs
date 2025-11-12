@@ -90,7 +90,18 @@ async function executeStep(step, planContext = {}) {
  * @param {Object} step - Step metadata
  */
 async function executeStepCode(code, step) {
-  // Create a function from the code string
+  // Strip out require statements since we're providing the modules as parameters
+  let cleanCode = code;
+  
+  // Remove common require patterns
+  cleanCode = cleanCode.replace(/const\s+\{[^}]+\}\s*=\s*require\([^)]+\);?\s*/g, '');
+  cleanCode = cleanCode.replace(/const\s+\w+\s*=\s*require\([^)]+\);?\s*/g, '');
+  cleanCode = cleanCode.replace(/require\([^)]+\);?\s*/g, '');
+  
+  // Debug: Log the code being executed
+  console.log(`[Step ${step.id}] 🔧 Executing code:\n${cleanCode.substring(0, 200)}${cleanCode.length > 200 ? '...' : ''}`);
+  
+  // Create a function from the cleaned code string
   const asyncFunction = new Function(
     'keyboard',
     'Key',
@@ -100,7 +111,7 @@ async function executeStepCode(code, step) {
     'sleep',
     'step',
     `return (async () => {
-      ${code}
+      ${cleanCode}
     })();`
   );
   
@@ -119,10 +130,10 @@ async function verifyStep(step) {
   }
   
   // Take screenshot for verification
-  let screenshot;
+  let screenshotBuffer;
   try {
     const result = await captureScreen();
-    screenshot = result.path;
+    screenshotBuffer = result.buffer;  // Use buffer, not path
   } catch (error) {
     console.warn(`[Step ${step.id}] ⚠️ Screenshot failed:`, error.message);
     // Continue without verification if screenshot fails
@@ -132,19 +143,19 @@ async function verifyStep(step) {
   try {
     switch (step.verification) {
       case 'element_visible':
-        return await verifyElementVisible(step, screenshot);
+        return await verifyElementVisible(step, screenshotBuffer);
         
       case 'compose_dialog_visible':
-        return await verifyComposeDialog(screenshot);
+        return await verifyComposeDialog(screenshotBuffer);
         
       case 'recipient_added':
-        return await verifyRecipientAdded(screenshot);
+        return await verifyRecipientAdded(screenshotBuffer);
         
       case 'send_button_enabled':
-        return await verifySendButtonEnabled(screenshot);
+        return await verifySendButtonEnabled(screenshotBuffer);
         
       case 'email_sent':
-        return await verifyEmailSent(screenshot);
+        return await verifyEmailSent(screenshotBuffer);
         
       case 'field_filled':
         // Assume success if no error thrown
@@ -163,13 +174,13 @@ async function verifyStep(step) {
 /**
  * Verify element is visible using vision AI
  */
-async function verifyElementVisible(step, screenshotPath) {
+async function verifyElementVisible(step, screenshotBuffer) {
   if (!step.verificationContext?.shouldSeeElement) {
     return { success: true };
   }
   
   try {
-    const elements = await analyzeImage(screenshotPath);
+    const elements = await analyzeImage(screenshotBuffer);
     const targetLabel = step.verificationContext.shouldSeeElement.toLowerCase();
     
     const found = elements.some(el => 
@@ -188,9 +199,9 @@ async function verifyElementVisible(step, screenshotPath) {
 /**
  * Verify Gmail compose dialog is visible
  */
-async function verifyComposeDialog(screenshotPath) {
+async function verifyComposeDialog(screenshotBuffer) {
   try {
-    const elements = await analyzeImage(screenshotPath);
+    const elements = await analyzeImage(screenshotBuffer);
     
     // Look for compose dialog indicators
     const hasToField = elements.some(e => 
@@ -215,7 +226,7 @@ async function verifyComposeDialog(screenshotPath) {
 /**
  * Verify recipient was added
  */
-async function verifyRecipientAdded(screenshotPath) {
+async function verifyRecipientAdded(screenshotBuffer) {
   // Simplified check - assume success for now
   // In production, you'd check for recipient chips/tags
   return { success: true };
@@ -224,9 +235,9 @@ async function verifyRecipientAdded(screenshotPath) {
 /**
  * Verify Send button is enabled
  */
-async function verifySendButtonEnabled(screenshotPath) {
+async function verifySendButtonEnabled(screenshotBuffer) {
   try {
-    const elements = await analyzeImage(screenshotPath);
+    const elements = await analyzeImage(screenshotBuffer);
     const sendButton = elements.find(e => 
       e.label.toLowerCase() === 'send' && 
       e.role === 'button'
@@ -245,9 +256,9 @@ async function verifySendButtonEnabled(screenshotPath) {
 /**
  * Verify email was sent (compose dialog closed)
  */
-async function verifyEmailSent(screenshotPath) {
+async function verifyEmailSent(screenshotBuffer) {
   try {
-    const elements = await analyzeImage(screenshotPath);
+    const elements = await analyzeImage(screenshotBuffer);
     
     // Check if compose dialog is gone
     const hasComposeDialog = elements.some(e => 

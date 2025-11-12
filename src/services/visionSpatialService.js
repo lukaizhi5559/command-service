@@ -61,8 +61,8 @@ async function captureScreen() {
       throw new Error(`Screenshot file was not created at ${cwdPath} or ${filePath}`);
     }
     
-    // Read the PNG file
-    const buffer = fs.readFileSync(filePath);
+    // Read the PNG file (use async version)
+    const buffer = await fs.promises.readFile(filePath);
     
     // Verify it's a valid PNG
     const isPNG = buffer[0] === 0x89 && buffer[1] === 0x50 && buffer[2] === 0x4E && buffer[3] === 0x47;
@@ -72,7 +72,6 @@ async function captureScreen() {
     }
     
     console.log(`📸 [VISION] Screenshot saved: ${filePath} (${(buffer.length / 1024).toFixed(2)} KB)`);
-
     
     return { buffer, path: filePath };
   } catch (error) {
@@ -94,7 +93,10 @@ async function analyzeImage(buffer) {
       throw new Error(`No API key found for ${API.provider}. Set OPENAI_API_KEY or ANTHROPIC_API_KEY.`);
     }
 
+    // Convert buffer to base64
     const base64Image = buffer.toString('base64');
+    
+    console.log(`📊 [VISION] Image size: ${(buffer.length / 1024).toFixed(2)} KB, Base64 length: ${base64Image.length}`);
     
     if (API.provider === 'anthropic') {
       return await analyzeWithAnthropic(base64Image);
@@ -313,7 +315,7 @@ async function findAndClick(label, role = null, useCache = true) {
     if (!element) {
       console.warn(`⚠️ [VISION] Element not found: "${label}"${role ? ` (${role})` : ''}`);
       console.log(`📋 [VISION] Available elements (${map.length}):`, map.map(el => `${el.label} (${el.role})`).join(', '));
-      return false;
+      throw new Error(`Element not found: "${label}"${role ? ` (${role})` : ''}`);
     }
     
     console.log(`✅ [VISION] Found element: "${element.label}" at bbox (${element.bbox.x}, ${element.bbox.y}, ${element.bbox.w}, ${element.bbox.h})`);
@@ -329,7 +331,7 @@ async function findAndClick(label, role = null, useCache = true) {
     return true;
   } catch (error) {
     console.error(`❌ [VISION] findAndClick failed:`, error.message);
-    return false;
+    throw error; // Re-throw to propagate to step executor
   }
 }
 

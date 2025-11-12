@@ -7,8 +7,11 @@
 
 const axios = require('axios');
 
-const BACKEND_URL = process.env.NUTJS_API_URL || 'http://localhost:4000/api/nutjs';
+// Configuration from environment
+const BACKEND_API_URL = process.env.NUTJS_API_URL || 'http://localhost:4000/api/nutjs';
 const BACKEND_API_KEY = process.env.BACKEND_API_KEY || process.env.THINKDROP_API_KEY;
+const MAX_RETRIES_PER_STEP = parseInt(process.env.MAX_RETRIES_PER_STEP || '3', 10);
+const PLAN_TIMEOUT_MS = parseInt(process.env.PLAN_TIMEOUT_MS || '300000', 10);
 
 /**
  * Fetch structured automation plan from backend
@@ -19,7 +22,7 @@ const BACKEND_API_KEY = process.env.BACKEND_API_KEY || process.env.THINKDROP_API
 async function fetchAutomationPlan(command, context = {}) {
   console.log(`\n🔄 [BACKEND] Fetching automation plan for: "${command}"`);
   
-  const planEndpoint = BACKEND_URL.replace('/api/nutjs', '/api/nutjs/plan');
+  const planEndpoint = BACKEND_API_URL.replace('/api/nutjs', '/api/nutjs/plan');
   
   try {
     const response = await axios.post(
@@ -35,9 +38,9 @@ async function fetchAutomationPlan(command, context = {}) {
       {
         headers: {
           'Content-Type': 'application/json',
-          ...(BACKEND_API_KEY && { 'Authorization': `Bearer ${BACKEND_API_KEY}` })
+          'x-api-key': BACKEND_API_KEY
         },
-        timeout: 30000 // 30 seconds for plan generation
+        timeout: PLAN_TIMEOUT_MS // 30 seconds for plan generation
       }
     );
 
@@ -46,6 +49,16 @@ async function fetchAutomationPlan(command, context = {}) {
     }
 
     const plan = response.data.plan;
+    
+    // Ensure plan has maxRetriesPerStep set (use env var as fallback)
+    if (!plan.maxRetriesPerStep) {
+      plan.maxRetriesPerStep = MAX_RETRIES_PER_STEP;
+    }
+    
+    // Ensure plan has totalTimeout set (use env var as fallback)
+    if (!plan.totalTimeout) {
+      plan.totalTimeout = PLAN_TIMEOUT_MS;
+    }
     
     console.log(`✅ [BACKEND] Plan generated successfully`);
     console.log(`   📋 Plan ID: ${plan.planId}`);
@@ -98,7 +111,7 @@ async function fetchAutomationCode(command, context = {}) {
           'Content-Type': 'application/json',
           ...(BACKEND_API_KEY && { 'Authorization': `Bearer ${BACKEND_API_KEY}` })
         },
-        timeout: 30000
+        timeout: 300000
       }
     );
 

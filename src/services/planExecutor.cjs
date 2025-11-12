@@ -7,7 +7,7 @@
  * - Detailed result collection
  */
 
-const { executeStep } = require('./stepExecutor');
+const { executeStep } = require('./stepExecutor.cjs');
 
 /**
  * Execute entire automation plan with step-by-step verification
@@ -113,8 +113,19 @@ function generateSummary(result) {
     return `✅ Command completed successfully in ${(result.totalTime / 1000).toFixed(1)}s. ` +
            `Executed ${result.summary.totalSteps} steps${retryInfo}.`;
   } else {
-    return `❌ Command failed at step ${result.failedStep}/${result.summary.totalSteps}: ${result.error}. ` +
-           `Completed ${result.summary.completed} steps before failure.`;
+    // Check for partial success (70% or more steps completed)
+    const completionRate = result.summary.completed / result.summary.totalSteps;
+    
+    if (completionRate >= 0.7) {
+      return `⚠️ I completed most of your command (${result.summary.completed} out of ${result.summary.totalSteps} steps), ` +
+             `but couldn't fully verify the final result. The task may have succeeded - please check if it worked as expected.\n\n` +
+             `Failed at step ${result.failedStep}: ${result.error}`;
+    } else {
+      return `❌ I wasn't able to complete that workflow command. This task might be too complex for me to automate right now.\n\n` +
+             `Failed at step ${result.failedStep}/${result.summary.totalSteps}: ${result.error}. ` +
+             `Completed ${result.summary.completed} steps before failure.\n\n` +
+             `If you'd like help with this, please submit a ticket at **ticket.thinkdrop.ai** and our team will look into it.`;
+    }
   }
 }
 
