@@ -76,7 +76,7 @@ class NutjsAutomationHandler {
           'X-API-Key': this.apiKey,
         },
         body: JSON.stringify({ command }),
-        timeout: 30000 // 30 seconds
+        timeout: 300000 // 300 seconds (5 minutes)
       });
       
       const data = await response.json();
@@ -96,7 +96,14 @@ class NutjsAutomationHandler {
         valid: data.validation?.valid
       });
       
-      return data;
+      // Inject vision service import if code interacts with UI elements
+      const enhancedCode = this.injectVisionService(data.code);
+      
+      return {
+        ...data,
+        code: enhancedCode,
+        visionInjected: enhancedCode !== data.code
+      };
       
     } catch (error) {
       logger.error('Failed to generate Nut.js code', {
@@ -132,7 +139,7 @@ class NutjsAutomationHandler {
       
       // Execute the code with proper module support
       const { stdout, stderr } = await execAsync(`node --input-type=module ${codeFilePath}`, {
-        timeout: 30000, // 30 seconds max execution time
+        timeout: 300000, // 300 seconds (5 minutes) max execution time
         maxBuffer: 1024 * 1024, // 1MB buffer
         env: { ...process.env, NODE_OPTIONS: '--experimental-modules' }
       });
@@ -180,9 +187,10 @@ class NutjsAutomationHandler {
   /**
    * Handle desktop automation command (full flow)
    * @param {string} command - Natural language command
+   * @param {Object} context - Additional context (os, userId, sessionId)
    * @returns {Promise<Object>} - { success, result, error, metadata }
    */
-  async handleAutomationCommand(command) {
+  async handleAutomationCommand(command, context = {}) {
     try {
       // Step 1: Check if service is healthy
       const isHealthy = await this.healthCheck();
@@ -194,42 +202,32 @@ class NutjsAutomationHandler {
         };
       }
       
-      // Step 2: Generate Nut.js code
-      const generation = await this.generateNutjsCode(command);
+      // Step 2: Try plan-based execution first (Phase 1)
+      const usePlanExecution = process.env.USE_PLAN_EXECUTION !== 'false'; // Default to true
       
-      if (!generation.success || !generation.code) {
-        return {
-          success: false,
-          error: generation.error || 'Failed to generate automation code',
-          provider: generation.provider
-        };
-      }
-      
-      // Step 3: Execute the code
-      const execution = await this.executeNutjsCode(generation.code, command);
-      
-      if (!execution.success) {
-        return {
-          success: false,
-          error: `Automation execution failed: ${execution.error}`,
-          generatedCode: generation.code,
-          provider: generation.provider,
-          executionTime: execution.executionTime
-        };
-      }
-      
-      // Step 4: Return success
-      return {
-        success: true,
-        result: execution.output,
-        metadata: {
-          provider: generation.provider,
-          codeGenerationTime: generation.latencyMs,
-          executionTime: execution.executionTime,
-          totalTime: generation.latencyMs + execution.executionTime,
-          codeValidation: generation.validation
+      if (usePlanExecution) {
+        try {
+          logger.info('Attempting plan-based execution (Phase 1)');
+          const result = await this.handlePlanBasedAutomation(command, context);
+          
+          if (result.success) {
+            return result;
+          }
+          
+          // If plan execution fails, fall back to raw code
+          logger.warn('Plan execution failed, falling back to raw code execution', {
+            error: result.error
+          });
+        } catch (planError) {
+          logger.warn('Plan-based execution error, falling back to raw code', {
+            error: planError.message
+          });
         }
-      };
+      }
+      
+      // Fallback: Raw code execution (old method)
+      logger.info('Using raw code execution (fallback)');
+      return await this.handleRawCodeAutomation(command);
       
     } catch (error) {
       logger.error('Desktop automation failed', {
@@ -242,6 +240,152 @@ class NutjsAutomationHandler {
         error: error.message
       };
     }
+  }
+  
+  /**
+   * Handle automation using structured plans (Phase 1)
+   * @param {string} command - Natural language command
+   * @param {Object} context - Additional context
+   * @returns {Promise<Object>}
+   */
+  async handlePlanBasedAutomation(command, context = {}) {
+    const { fetchAutomationPlan } = require('./services/backendClient');
+    const { executePlan, generateSummary } = require('./services/planExecutor');
+    
+    try {
+      // Step 1: Fetch structured plan from backend
+      const plan = await fetchAutomationPlan(command, context);
+      
+      // Step 2: Execute plan with verification and retries
+      const result = await executePlan(plan);
+      
+      // Step 3: Return result
+      if (result.status === 'completed') {
+        return {
+          success: true,
+          result: generateSummary(result),
+          metadata: {
+            planId: result.planId,
+            executionMode: 'plan',
+            totalSteps: result.summary.totalSteps,
+            successfulSteps: result.summary.successful,
+            retriedSteps: result.summary.withRetries,
+            totalRetries: result.summary.totalRetries,
+            executionTime: result.totalTime
+          }
+        };
+      } else {
+        return {
+          success: false,
+          error: generateSummary(result),
+          metadata: {
+            planId: result.planId,
+            executionMode: 'plan',
+            failedStep: result.failedStep,
+            completedSteps: result.summary.completed,
+            totalSteps: result.summary.totalSteps,
+            executionTime: result.totalTime
+          }
+        };
+      }
+      
+    } catch (error) {
+      logger.error('Plan-based automation failed', {
+        command,
+        error: error.message
+      });
+      throw error;
+    }
+  }
+  
+  /**
+   * Handle automation using raw code (fallback/old method)
+   * @param {string} command - Natural language command
+   * @returns {Promise<Object>}
+   */
+  async handleRawCodeAutomation(command) {
+    try {
+      // Step 1: Generate Nut.js code
+      const generation = await this.generateNutjsCode(command);
+      
+      if (!generation.success || !generation.code) {
+        return {
+          success: false,
+          error: generation.error || 'Failed to generate automation code',
+          provider: generation.provider
+        };
+      }
+      
+      // Step 2: Execute the code
+      const execution = await this.executeNutjsCode(generation.code, command);
+      
+      if (!execution.success) {
+        return {
+          success: false,
+          error: `Automation execution failed: ${execution.error}`,
+          generatedCode: generation.code,
+          provider: generation.provider,
+          executionTime: execution.executionTime
+        };
+      }
+      
+      // Step 3: Return success
+      return {
+        success: true,
+        result: execution.output,
+        metadata: {
+          executionMode: 'raw_code',
+          provider: generation.provider,
+          codeGenerationTime: generation.latencyMs,
+          executionTime: execution.executionTime,
+          totalTime: generation.latencyMs + execution.executionTime,
+          codeValidation: generation.validation
+        }
+      };
+      
+    } catch (error) {
+      throw error;
+    }
+  }
+  
+  /**
+   * Inject vision service import into generated code
+   * @param {string} code - Generated Nut.js code
+   * @returns {string} - Enhanced code with vision service
+   */
+  injectVisionService(code) {
+    // Check if code already has vision service import
+    if (code.includes('visionSpatialService')) {
+      return code;
+    }
+    
+    // Check if code uses mouse clicks or UI interaction that could benefit from vision
+    const needsVision = 
+      code.includes('mouse.move') ||
+      code.includes('mouse.click') ||
+      code.includes('leftClick') ||
+      code.includes('Point(');
+    
+    if (!needsVision) {
+      return code;
+    }
+    
+    // Find the first require statement
+    const requireMatch = code.match(/(const.*require.*\n)/);
+    
+    if (!requireMatch) {
+      // No requires found, add at the top
+      const visionImport = `const { findAndClick, getUIMap } = require('./services/visionSpatialService');\n\n`;
+      return visionImport + code;
+    }
+    
+    // Add vision import after the first require
+    const visionImport = `const { findAndClick, getUIMap } = require('./services/visionSpatialService');\n`;
+    const enhancedCode = code.replace(requireMatch[0], requireMatch[0] + visionImport);
+    
+    logger.info('Vision service import injected into generated code');
+    
+    return enhancedCode;
   }
   
   /**

@@ -674,8 +674,8 @@ Please provide a clear, concise answer to the user's question based on this outp
     try {
       logger.info('Executing desktop automation', { command, context });
       
-      // Call Nut.js automation handler
-      const result = await this.nutjsHandler.handleAutomationCommand(command);
+      // Call Nut.js automation handler with context
+      const result = await this.nutjsHandler.handleAutomationCommand(command, context);
       
       if (!result.success) {
         logger.warn('Desktop automation failed', {
