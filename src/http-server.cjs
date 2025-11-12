@@ -13,6 +13,7 @@ const GeminiOAuthClient = require('./GeminiOAuthClient.cjs');
 const UsageTracker = require('./UsageTracker.cjs');
 const CommandValidator = require('./CommandValidator.cjs');
 const CommandExecutor = require('./CommandExecutor.cjs');
+const NutjsAutomationHandler = require('./NutjsAutomationHandler.cjs');
 const logger = require('./logger.cjs');
 const modelSelector = require('./utils/model-selector');
 
@@ -51,6 +52,8 @@ class CommandHTTPServer {
       ollamaClient: this.ollamaClient,  // Pass OllamaClient for AI interpretation
       useAIInterpretation: process.env.USE_AI_INTERPRETATION !== 'false'  // Default to true
     });
+    
+    this.nutjsHandler = new NutjsAutomationHandler();
     
     this.serviceName = process.env.SERVICE_NAME || 'command-service';
     this.apiKey = process.env.MCP_COMMAND_API_KEY || 'auto-generated-key-command';
@@ -132,6 +135,10 @@ class CommandHTTPServer {
             
             case 'command.interpret':
               response = await this.interpretCommand(payload);
+              break;
+            
+            case 'command.automate':
+              response = await this.executeAutomation(payload);
               break;
             
             case 'system.query':
@@ -647,6 +654,67 @@ Please provide a clear, concise answer to the user's question based on this outp
       return {
         success: false,
         error: error.message
+      };
+    }
+  }
+  
+  /**
+   * Execute desktop automation via Nut.js API
+   */
+  async executeAutomation(payload) {
+    const { command, context = {} } = payload;
+    
+    if (!command) {
+      return {
+        success: false,
+        error: 'Command is required'
+      };
+    }
+    
+    try {
+      logger.info('Executing desktop automation', { command, context });
+      
+      // Call Nut.js automation handler
+      const result = await this.nutjsHandler.handleAutomationCommand(command);
+      
+      if (!result.success) {
+        logger.warn('Desktop automation failed', {
+          command,
+          error: result.error
+        });
+        
+        return {
+          success: false,
+          error: result.error,
+          originalCommand: command,
+          requiresService: result.requiresService,
+          provider: result.provider
+        };
+      }
+      
+      logger.info('Desktop automation completed', {
+        command,
+        provider: result.metadata?.provider,
+        totalTime: result.metadata?.totalTime
+      });
+      
+      return {
+        success: true,
+        result: result.result,
+        originalCommand: command,
+        metadata: result.metadata
+      };
+      
+    } catch (error) {
+      logger.error('Error executing automation', {
+        command,
+        error: error.message
+      });
+      
+      return {
+        success: false,
+        error: error.message,
+        originalCommand: command
       };
     }
   }

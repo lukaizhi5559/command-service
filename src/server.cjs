@@ -10,6 +10,7 @@ const readline = require('readline');
 const OllamaClient = require('./OllamaClient.cjs');
 const CommandValidator = require('./CommandValidator.cjs');
 const CommandExecutor = require('./CommandExecutor.cjs');
+const NutjsAutomationHandler = require('./NutjsAutomationHandler.cjs');
 const logger = require('./logger.cjs');
 
 class CommandServiceMCPServer {
@@ -29,6 +30,8 @@ class CommandServiceMCPServer {
       timeout: parseInt(process.env.COMMAND_TIMEOUT) || 30000,
       maxOutputLength: parseInt(process.env.MAX_OUTPUT_LENGTH) || 10000
     });
+    
+    this.nutjsHandler = new NutjsAutomationHandler();
     
     this.serviceName = process.env.SERVICE_NAME || 'command-service';
     
@@ -56,6 +59,9 @@ class CommandServiceMCPServer {
         
         case 'command.interpret':
           return await this.interpretCommand(payload);
+        
+        case 'command.automate':
+          return await this.executeAutomation(payload);
         
         case 'system.query':
           return await this.systemQuery(payload);
@@ -249,11 +255,74 @@ class CommandServiceMCPServer {
   }
   
   /**
+   * Execute desktop automation via Nut.js API
+   * @param {Object} payload - { command, context }
+   */
+  async executeAutomation(payload) {
+    const { command, context = {} } = payload;
+    
+    if (!command) {
+      return {
+        success: false,
+        error: 'Command is required'
+      };
+    }
+    
+    try {
+      logger.info('Executing desktop automation', { command, context });
+      
+      // Call Nut.js automation handler
+      const result = await this.nutjsHandler.handleAutomationCommand(command);
+      
+      if (!result.success) {
+        logger.warn('Desktop automation failed', {
+          command,
+          error: result.error
+        });
+        
+        return {
+          success: false,
+          error: result.error,
+          originalCommand: command,
+          requiresService: result.requiresService,
+          provider: result.provider
+        };
+      }
+      
+      logger.info('Desktop automation completed', {
+        command,
+        provider: result.metadata?.provider,
+        totalTime: result.metadata?.totalTime
+      });
+      
+      return {
+        success: true,
+        result: result.result,
+        originalCommand: command,
+        metadata: result.metadata
+      };
+      
+    } catch (error) {
+      logger.error('Error executing automation', {
+        command,
+        error: error.message
+      });
+      
+      return {
+        success: false,
+        error: error.message,
+        originalCommand: command
+      };
+    }
+  }
+  
+  /**
    * Health check
    */
   async healthCheck() {
     try {
       const ollamaHealthy = await this.ollamaClient.checkHealth();
+      const nutjsHealthy = await this.nutjsHandler.healthCheck();
       
       return {
         success: true,
@@ -263,6 +332,11 @@ class CommandServiceMCPServer {
           healthy: ollamaHealthy,
           host: this.ollamaClient.host,
           model: this.ollamaClient.model
+        },
+        nutjs: {
+          healthy: nutjsHealthy,
+          apiUrl: this.nutjsHandler.apiBaseUrl,
+          hasApiKey: !!this.nutjsHandler.apiKey
         },
         validator: {
           enabled: this.validator.validationEnabled,
