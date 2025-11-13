@@ -66,6 +66,9 @@ class CommandServiceMCPServer {
         case 'command.guide':
           return await this.executeGuide(payload);
         
+        case 'command.guide.execute':
+          return await this.executeGuideSteps(payload);
+        
         case 'system.query':
           return await this.systemQuery(payload);
         

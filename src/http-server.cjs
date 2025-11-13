@@ -728,14 +728,11 @@ Please provide a clear, concise answer to the user's question based on this outp
   }
   
   /**
-   * Execute educational guide generation
-   * @param {Object} payload - { command, context }
-   */
-  /**
-   * Execute educational guide generation and step-by-step execution
+   * Fetch educational guide (no execution)
    * @param {Object} payload - { command, context }
    */
   async executeGuide(payload) {
+    const guideStateManager = require('./services/guideStateManager.cjs');
     const { command, context = {} } = payload;
     
     if (!command) {
@@ -746,9 +743,9 @@ Please provide a clear, concise answer to the user's question based on this outp
     }
     
     try {
-      logger.info('Generating educational guide', { command, context });
+      logger.info('Fetching educational guide', { command, context });
       
-      // Step 1: Fetch guide from backend API
+      // Fetch guide from backend API
       const fetch = (await import('node-fetch')).default;
       const response = await fetch('http://localhost:4000/api/nutjs/guide', {
         method: 'POST',
@@ -794,46 +791,36 @@ Please provide a clear, concise answer to the user's question based on this outp
       }
       
       const guide = data.guide;
+      const guideId = guide.id || `guide_${Date.now()}`;
       
-      logger.info('Educational guide generated', {
+      // Save guide state to persistence layer
+      await guideStateManager.saveGuideState(guideId, guide, {
+        command,
+        currentStepIndex: 0,
+        status: 'active'
+      });
+      
+      logger.info('Educational guide fetched and saved', {
+        guideId,
         command,
         totalSteps: guide.totalSteps,
         provider: data.provider
       });
       
-      // Step 2: Execute guide code via Nut.js handler
-      const executionResult = await this.nutjsHandler.handleGuideCommand(guide, command);
-      
-      if (!executionResult.success) {
-        logger.warn('Guide execution failed', {
-          command,
-          error: executionResult.error
-        });
-      } else {
-        logger.info('Educational guide completed', {
-          command,
-          totalSteps: guide.totalSteps,
-          executed: executionResult.executed,
-          executionSuccess: executionResult.executionResult?.success
-        });
-      }
-      
-      // Step 3: Return guide data with execution results
+      // Return guide data WITHOUT execution
       return {
         success: true,
+        guideId,
         guide: guide,
-        executed: executionResult.executed,
-        executionResult: executionResult.executionResult,
         originalCommand: command,
         metadata: {
           provider: data.provider,
-          generationTime: data.latencyMs,
-          ...executionResult.metadata
+          generationTime: data.latencyMs
         }
       };
       
     } catch (error) {
-      logger.error('Error executing guide', {
+      logger.error('Error fetching guide', {
         command,
         error: error.message
       });
@@ -843,6 +830,166 @@ Please provide a clear, concise answer to the user's question based on this outp
         error: error.message,
         originalCommand: command
       };
+    }
+  }
+
+  /**
+   * Execute guide steps (triggered by "Do it for me")
+   * @param {Object} payload - { guideId, fromStep, toStep, abort }
+   */
+  async executeGuideSteps(payload) {
+    const guideStateManager = require('./services/guideStateManager.cjs');
+    const { guideId, fromStep, toStep, abort = false } = payload;
+    
+    if (!guideId) {
+      return {
+        success: false,
+        error: 'guideId is required'
+      };
+    }
+    
+    try {
+      // Get guide state
+      const state = await guideStateManager.getGuideState(guideId);
+      if (!state) {
+        return {
+          success: false,
+          error: `Guide not found: ${guideId}`
+        };
+      }
+
+      // Handle abort
+      if (abort) {
+        await guideStateManager.updateGuideStatus(guideId, 'aborted');
+        logger.info('Guide execution aborted', { guideId });
+        return {
+          success: true,
+          aborted: true,
+          guideId
+        };
+      }
+      
+      // Update status to executing
+      await guideStateManager.updateGuideStatus(guideId, 'executing');
+      
+      logger.info('Starting guide execution in background', {
+        guideId,
+        fromStep: fromStep || state.currentStepIndex,
+        toStep: toStep || state.guide.totalSteps - 1
+      });
+      
+      // Get updated state before starting background execution
+      const updatedState = await guideStateManager.getGuideState(guideId);
+      
+      // Start background execution AFTER we've prepared the response
+      // Use setImmediate to ensure response is sent first
+      setImmediate(() => {
+        this.executeGuideInBackground(guideId, state).catch(error => {
+          logger.error('Background guide execution failed', {
+            guideId,
+            error: error.message,
+            stack: error.stack
+          });
+        });
+      });
+      
+      // Return immediately with executing status
+      return {
+        success: true,
+        guideId,
+        status: 'executing',
+        message: 'Guide execution started in background',
+        state: updatedState
+      };
+      
+    } catch (error) {
+      logger.error('Error executing guide steps', {
+        guideId,
+        error: error.message
+      });
+      
+      // Update state to reflect error
+      try {
+        await guideStateManager.updateGuideStatus(guideId, 'active', {
+          lastError: error.message
+        });
+      } catch (stateError) {
+        logger.error('Failed to update guide state after error', {
+          guideId,
+          error: stateError.message
+        });
+      }
+      
+      return {
+        success: false,
+        error: error.message,
+        guideId
+      };
+    }
+  }
+  
+  /**
+   * Execute guide in background (async, non-blocking)
+   * @param {string} guideId - Guide identifier
+   * @param {Object} state - Guide state from state manager
+   */
+  async executeGuideInBackground(guideId, state) {
+    const guideStateManager = require('./services/guideStateManager.cjs');
+    
+    try {
+      logger.info('Background execution started', { guideId });
+      
+      // Execute guide via Nut.js handler
+      const executionResult = await this.nutjsHandler.handleGuideCommand(
+        state.guide,
+        state.command
+      );
+      
+      // Update state with execution result
+      await guideStateManager.addExecutionResult(guideId, executionResult);
+      
+      if (executionResult.success) {
+        await guideStateManager.updateGuideStatus(guideId, 'completed', {
+          completedSteps: state.guide.totalSteps
+        });
+        
+        logger.info('Background guide execution completed', {
+          guideId,
+          totalSteps: state.guide.totalSteps
+        });
+      } else {
+        await guideStateManager.updateGuideStatus(guideId, 'active', {
+          lastError: executionResult.error
+        });
+        
+        logger.warn('Background guide execution failed', {
+          guideId,
+          error: executionResult.error
+        });
+      }
+      
+      return executionResult;
+      
+    } catch (error) {
+      logger.error('Error in background guide execution', {
+        guideId,
+        error: error.message,
+        stack: error.stack
+      });
+      
+      // Update state to reflect error
+      try {
+        await guideStateManager.updateGuideStatus(guideId, 'active', {
+          lastError: error.message
+        });
+      } catch (stateError) {
+        logger.error('Failed to update guide state after background error', {
+          guideId,
+          error: stateError.message
+        });
+      }
+      
+      throw error;
     }
   }
   

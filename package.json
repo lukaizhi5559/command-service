@@ -7,8 +7,11 @@
   "scripts": {
     "start": "node src/http-server.cjs",
     "start:stdio": "node src/server.cjs",
-    "dev": "nodemon src/http-server.cjs",
+    "dev": "nodemon --ignore data/ src/http-server.cjs",
     "test": "node tests/test-service.cjs"
+  },
+  "nodemonConfig": {
+    "ignore": ["data/*", "*.log", ".temp/*"]
   },
   "keywords": [
     "command-execution",
