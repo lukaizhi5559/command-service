@@ -141,6 +141,14 @@ class CommandHTTPServer {
               response = await this.executeAutomation(payload);
               break;
             
+            case 'command.guide':
+              response = await this.executeGuide(payload);
+              break;
+            
+            case 'command.guide.execute':
+              response = await this.executeGuideSteps(payload);
+              break;
+            
             case 'system.query':
               response = await this.systemQuery(payload);
               break;
@@ -707,6 +715,125 @@ Please provide a clear, concise answer to the user's question based on this outp
       
     } catch (error) {
       logger.error('Error executing automation', {
+        command,
+        error: error.message
+      });
+      
+      return {
+        success: false,
+        error: error.message,
+        originalCommand: command
+      };
+    }
+  }
+  
+  /**
+   * Execute educational guide generation
+   * @param {Object} payload - { command, context }
+   */
+  /**
+   * Execute educational guide generation and step-by-step execution
+   * @param {Object} payload - { command, context }
+   */
+  async executeGuide(payload) {
+    const { command, context = {} } = payload;
+    
+    if (!command) {
+      return {
+        success: false,
+        error: 'Command is required'
+      };
+    }
+    
+    try {
+      logger.info('Generating educational guide', { command, context });
+      
+      // Step 1: Fetch guide from backend API
+      const fetch = (await import('node-fetch')).default;
+      const response = await fetch('http://localhost:4000/api/nutjs/guide', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': process.env.BACKEND_API_KEY || ''
+        },
+        body: JSON.stringify({
+          command,
+          context: {
+            os: context.os || process.platform,
+            userId: context.userId,
+            failedStep: context.failedStep,
+            failureType: context.failureType,
+            error: context.error
+          }
+        })
+      });
+      
+      if (!response.ok) {
+        const errorText = await response.text();
+        logger.warn('Guide API request failed', {
+          command,
+          status: response.status,
+          error: errorText
+        });
+        
+        return {
+          success: false,
+          error: `Guide API error: ${response.status} - ${errorText}`,
+          originalCommand: command
+        };
+      }
+      
+      const data = await response.json();
+      
+      if (!data.success || !data.guide) {
+        return {
+          success: false,
+          error: data.error || 'Failed to generate guide',
+          originalCommand: command
+        };
+      }
+      
+      const guide = data.guide;
+      
+      logger.info('Educational guide generated', {
+        command,
+        totalSteps: guide.totalSteps,
+        provider: data.provider
+      });
+      
+      // Step 2: Execute guide code via Nut.js handler
+      const executionResult = await this.nutjsHandler.handleGuideCommand(guide, command);
+      
+      if (!executionResult.success) {
+        logger.warn('Guide execution failed', {
+          command,
+          error: executionResult.error
+        });
+      } else {
+        logger.info('Educational guide completed', {
+          command,
+          totalSteps: guide.totalSteps,
+          executed: executionResult.executed,
+          executionSuccess: executionResult.executionResult?.success
+        });
+      }
+      
+      // Step 3: Return guide data with execution results
+      return {
+        success: true,
+        guide: guide,
+        executed: executionResult.executed,
+        executionResult: executionResult.executionResult,
+        originalCommand: command,
+        metadata: {
+          provider: data.provider,
+          generationTime: data.latencyMs,
+          ...executionResult.metadata
+        }
+      };
+      
+    } catch (error) {
+      logger.error('Error executing guide', {
         command,
         error: error.message
       });

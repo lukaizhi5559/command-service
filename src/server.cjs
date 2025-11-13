@@ -63,6 +63,9 @@ class CommandServiceMCPServer {
         case 'command.automate':
           return await this.executeAutomation(payload);
         
+        case 'command.guide':
+          return await this.executeGuide(payload);
+        
         case 'system.query':
           return await this.systemQuery(payload);
         
@@ -304,6 +307,102 @@ class CommandServiceMCPServer {
       
     } catch (error) {
       logger.error('Error executing automation', {
+        command,
+        error: error.message
+      });
+      
+      return {
+        success: false,
+        error: error.message,
+        originalCommand: command
+      };
+    }
+  }
+  
+  /**
+   * Execute educational guide mode
+   * @param {Object} payload - { command, context }
+   */
+  async executeGuide(payload) {
+    const { command, context = {} } = payload;
+    
+    if (!command) {
+      return {
+        success: false,
+        error: 'Command is required'
+      };
+    }
+    
+    try {
+      logger.info('Generating educational guide', { command, context });
+      
+      // Call the guide API endpoint
+      const fetch = (await import('node-fetch')).default;
+      const response = await fetch('http://localhost:4000/api/nutjs/guide', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': process.env.BACKEND_API_KEY || ''
+        },
+        body: JSON.stringify({
+          command,
+          context: {
+            os: context.os || process.platform,
+            userId: context.userId,
+            failedStep: context.failedStep,
+            failureType: context.failureType,
+            error: context.error
+          }
+        })
+      });
+      
+      if (!response.ok) {
+        const errorText = await response.text();
+        logger.warn('Guide API request failed', {
+          command,
+          status: response.status,
+          error: errorText
+        });
+        
+        return {
+          success: false,
+          error: `Guide API error: ${response.statusText}`,
+          originalCommand: command
+        };
+      }
+      
+      const data = await response.json();
+      
+      if (!data.success) {
+        logger.warn('Guide generation failed', {
+          command,
+          error: data.error
+        });
+        
+        return {
+          success: false,
+          error: data.error || 'Guide generation failed',
+          originalCommand: command
+        };
+      }
+      
+      logger.info('Guide generated successfully', {
+        command,
+        provider: data.provider,
+        totalSteps: data.guide.totalSteps,
+        latency: data.latencyMs
+      });
+      
+      return {
+        success: true,
+        guide: data.guide,
+        provider: data.provider,
+        latencyMs: data.latencyMs,
+        originalCommand: command
+      };
+      
+    } catch (error) {
+      logger.error('Error generating guide', {
         command,
         error: error.message
       });

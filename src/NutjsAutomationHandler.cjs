@@ -448,6 +448,177 @@ class NutjsAutomationHandler {
       return null;
     }
   }
+  
+  /**
+   * Handle educational guide execution (guide already fetched by http-server)
+   * Similar to handleAutomationCommand but for guides
+   * @param {Object} guide - Guide object from backend API
+   * @param {string} command - Original command for logging
+   * @returns {Promise<Object>} - { success, result, metadata }
+   */
+  async handleGuideCommand(guide, command) {
+    try {
+      logger.info('Executing educational guide', {
+        command,
+        totalSteps: guide.totalSteps,
+        hasCode: !!guide.code
+      });
+      
+      // Step 1: Try guide-based execution first
+      const useGuideExecution = guide.code && process.env.USE_GUIDE_EXECUTION !== 'false'; // Default to true
+      let guideFailureInfo = null;
+      
+      if (useGuideExecution) {
+        try {
+          logger.info('Attempting guide-based execution');
+          const result = await this.handleGuideBasedExecution(guide, command);
+          
+          if (result.success) {
+            return result;
+          }
+          
+          // Store guide failure info for fallback response
+          guideFailureInfo = {
+            totalSteps: guide.totalSteps,
+            error: result.error
+          };
+          
+          // If guide execution fails, fall back to raw code
+          logger.warn('Guide execution failed, falling back to raw code generation', {
+            error: result.error
+          });
+        } catch (guideError) {
+          logger.warn('Guide-based execution error, falling back to raw code', {
+            error: guideError.message
+          });
+        }
+      }
+      
+      // Fallback: Raw code execution (generate new code)
+      logger.info('Using raw code generation (fallback)');
+      const fallbackResult = await this.handleRawCodeAutomation(command);
+      
+      // If we had a guide failure, mark as uncertain success
+      if (guideFailureInfo) {
+        // Change success to uncertain when guide failed but fallback "succeeded"
+        if (fallbackResult.success) {
+          fallbackResult.success = false; // Mark as failure since we can't verify
+          fallbackResult.uncertainResult = true; // Flag for UI to show special message
+          fallbackResult.warning = `⚠️ The educational guide execution failed (${guideFailureInfo.totalSteps} steps), ` +
+            `and a fallback method was attempted. The result cannot be verified. ` +
+            `**Please check if the task completed correctly.**`;
+          fallbackResult.guideFailure = guideFailureInfo;
+          
+          logger.warn('Fallback executed after guide failure - result uncertain', {
+            command,
+            guideSteps: guideFailureInfo.totalSteps
+          });
+        }
+      }
+      
+      return fallbackResult;
+      
+    } catch (error) {
+      logger.error('Guide command handling failed', {
+        command,
+        error: error.message
+      });
+      
+      return {
+        success: false,
+        error: error.message
+      };
+    }
+  }
+  
+  /**
+   * Handle guide-based execution (execute guide steps with verification)
+   * Similar to handlePlanBasedAutomation but for guides
+   * @param {Object} guide - Guide object with steps
+   * @param {string} command - Original command
+   * @returns {Promise<Object>}
+   */
+  async handleGuideBasedExecution(guide, command) {
+    const { executePlan, generateSummary } = require('./services/planExecutor.cjs');
+    
+    try {
+      logger.info('Executing guide steps', { 
+        totalSteps: guide.totalSteps,
+        estimatedDuration: guide.metadata?.estimatedDuration 
+      });
+
+      console.log('[THE INTRO:]', guide.intro);
+      
+      // Transform guide into plan format for executePlan
+      const guidePlan = {
+        planId: guide.id,
+        originalCommand: command,
+        steps: guide.steps.map(step => ({
+          id: step.id,
+          description: step.title,
+          code: step.code,
+          expectedDuration: step.expectedDuration || 2000,
+          canFail: step.canFail || false,
+          verification: step.verification || null,
+          waitAfter: step.waitAfter || 1000,
+          maxRetries: 3,
+          explanation: step.explanation || null
+        })),
+        totalTimeout: guide.metadata?.estimatedDuration || 300000,
+        maxRetriesPerStep: 3,
+        targetOS: guide.metadata?.targetOS || process.platform,
+        targetApp: guide.metadata?.targetApp
+      };
+      
+      // Execute guide plan with verification and retries
+      const result = await executePlan(guidePlan);
+      
+      // Return result
+      if (result.status === 'completed') {
+        return {
+          success: true,
+          result: generateSummary(result),
+          metadata: {
+            guideId: guide.id,
+            executionMode: 'guide',
+            totalSteps: result.summary.totalSteps,
+            successfulSteps: result.summary.successful,
+            retriedSteps: result.summary.withRetries,
+            totalRetries: result.summary.totalRetries,
+            executionTime: result.totalTime,
+            targetApp: guide.metadata?.targetApp,
+            targetOS: guide.metadata?.targetOS
+          }
+        };
+      } else {
+        // Check if most steps completed (partial success)
+        const completionRate = result.summary.completed / result.summary.totalSteps;
+        const isPartialSuccess = completionRate >= 0.7; // 70% or more steps completed
+        
+        return {
+          success: false,
+          partialSuccess: isPartialSuccess,
+          error: generateSummary(result),
+          metadata: {
+            guideId: guide.id,
+            executionMode: 'guide',
+            failedStep: result.failedStep,
+            completedSteps: result.summary.completed,
+            totalSteps: result.summary.totalSteps,
+            completionRate: Math.round(completionRate * 100),
+            executionTime: result.totalTime
+          }
+        };
+      }
+      
+    } catch (error) {
+      logger.error('Guide-based execution failed', {
+        command,
+        error: error.message
+      });
+      throw error;
+    }
+  }
 }
 
 module.exports = NutjsAutomationHandler;

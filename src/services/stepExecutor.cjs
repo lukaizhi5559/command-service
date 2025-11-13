@@ -28,7 +28,10 @@ async function executeStep(step, planContext = {}) {
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
       console.log(`[Step ${step.id}] Attempt ${attempt}/${maxRetries}`);
-      
+      if (step?.explanation) {
+        console.log('[Step Explanation]', step.explanation)
+      }
+
       // Execute the step code
       await executeStepCode(step.code, step);
       
