@@ -348,6 +348,17 @@ Command:`;
         return 'date "+%I:%M %p on %A, %B %d, %Y"';
       }
       
+      // Find folder/file queries
+      if (/\b(find|locate|search|where\s+is|do\s+i\s+have)\b.*\b(folder|file|directory)\b/i.test(lower)) {
+        // Extract the search term (folder/file name)
+        const searchMatch = lower.match(/(?:find|locate|search|where\s+is|do\s+i\s+have)\s+(?:a|an|the|my)?\s*(?:folder|file|directory)?\s*(?:called|named|with)?\s*["']?([a-z0-9\-_]+)["']?/i);
+        if (searchMatch && searchMatch[1]) {
+          const searchTerm = searchMatch[1].trim();
+          logger.info('Folder/file search matched', { searchTerm });
+          return `mdfind "kMDItemFSName == '*${searchTerm}*'"`;
+        }
+      }
+      
       // IP address queries
       if (/\b(what|show|get|my|the)\s+(is\s+)?(my\s+)?(ip|ip address|external ip|public ip)\b/i.test(lower)) {
         // External IP
