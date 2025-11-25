@@ -20,6 +20,7 @@ class NutjsAutomationHandler {
     this.apiBaseUrl = process.env.NUTJS_API_URL || 'http://localhost:4000/api/nutjs';
     this.apiKey = process.env.THINKDROP_API_KEY;
     this.tempDir = path.join(process.cwd(), '.temp');
+    this.currentProcess = null; // Track running process for cancellation
     
     if (!this.apiKey) {
       logger.warn('THINKDROP_API_KEY not set - Nut.js automation will not work');
@@ -137,12 +138,43 @@ class NutjsAutomationHandler {
         codeFile: codeFilePath
       });
       
-      // Execute the code with proper module support
-      const { stdout, stderr } = await execAsync(`node --input-type=module ${codeFilePath}`, {
-        timeout: 300000, // 300 seconds (5 minutes) max execution time
-        maxBuffer: 1024 * 1024, // 1MB buffer
-        env: { ...process.env, NODE_OPTIONS: '--experimental-modules' }
+      // Execute the code with proper module support using exec (not execAsync) for cancellation support
+      const result = await new Promise((resolve, reject) => {
+        this.currentProcess = exec(
+          `node --input-type=module ${codeFilePath}`,
+          {
+            timeout: 60000, // 60 seconds max execution time
+            maxBuffer: 1024 * 1024, // 1MB buffer
+            env: { ...process.env, NODE_OPTIONS: '--experimental-modules' }
+          },
+          (error, stdout, stderr) => {
+            logger.info('Automation process completed', {
+              pid: this.currentProcess?.pid,
+              killed: error?.killed,
+              signal: error?.signal
+            });
+            this.currentProcess = null; // Clear process reference
+            
+            if (error) {
+              // Check if it was killed (cancelled)
+              if (error.killed || error.signal === 'SIGTERM' || error.signal === 'SIGKILL') {
+                reject(new Error('Automation cancelled by user'));
+              } else {
+                reject(error);
+              }
+            } else {
+              resolve({ stdout, stderr });
+            }
+          }
+        );
+        
+        logger.info('Automation process started', {
+          pid: this.currentProcess.pid,
+          command: 'node --input-type=module'
+        });
       });
+      
+      const { stdout, stderr } = result;
       
       // Clean up temporary file
       await fs.unlink(codeFilePath).catch(err => {
@@ -618,6 +650,45 @@ class NutjsAutomationHandler {
       });
       throw error;
     }
+  }
+  
+  /**
+   * Cancel currently running automation
+   * @returns {boolean} - True if a process was cancelled, false if nothing was running
+   */
+  cancelCurrentAutomation() {
+    logger.info('Cancel requested', {
+      hasProcess: !!this.currentProcess,
+      pid: this.currentProcess?.pid
+    });
+    
+    if (this.currentProcess) {
+      logger.info('Cancelling running automation', {
+        pid: this.currentProcess.pid
+      });
+      
+      try {
+        // Try to kill the process
+        // Note: On macOS, we need to kill just the PID, not the process group
+        this.currentProcess.kill('SIGTERM');
+        
+        logger.info('SIGTERM sent to process', {
+          pid: this.currentProcess.pid
+        });
+        
+        this.currentProcess = null;
+        return true;
+      } catch (error) {
+        logger.error('Failed to cancel automation', {
+          error: error.message,
+          pid: this.currentProcess?.pid
+        });
+        return false;
+      }
+    }
+    
+    logger.info('No automation running to cancel');
+    return false;
   }
 }
 

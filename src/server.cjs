@@ -63,6 +63,9 @@ class CommandServiceMCPServer {
         case 'command.automate':
           return await this.executeAutomation(payload);
         
+        case 'command.prompt-anywhere':
+          return await this.handlePromptAnywhere(payload);
+        
         case 'command.guide':
           return await this.executeGuide(payload);
         
@@ -414,6 +417,167 @@ class CommandServiceMCPServer {
         success: false,
         error: error.message,
         originalCommand: command
+      };
+    }
+  }
+  
+  /**
+   * Handle "Prompted Anywhere" command
+   * Captures text + screenshot from any app, generates and executes response
+   * @param {Object} payload - { text, screenshot, context }
+   */
+  async handlePromptAnywhere(payload) {
+    const { text, screenshot, context = {} } = payload;
+    
+    try {
+      logger.info('Handling Prompted Anywhere request', {
+        hasText: !!text,
+        hasScreenshot: !!screenshot,
+        textLength: text?.length || 0
+      });
+      
+      // Step 1: Determine the command
+      let command;
+      if (text && text.trim()) {
+        // User highlighted text - use it as the prompt
+        command = text.trim();
+        logger.info('Using highlighted text as command', { 
+          command: command.substring(0, 100) + (command.length > 100 ? '...' : '')
+        });
+      } else {
+        // No highlighted text - use default with screenshot context
+        command = 'Answer the question or provide helpful information based on what you see on screen';
+        logger.info('Using default command with screenshot analysis');
+      }
+      
+      // Step 2: Call backend with vision support
+      const result = await this.generatePromptAnywhereCode(command, screenshot, context);
+      
+      if (!result.success) {
+        return {
+          success: false,
+          error: result.error,
+          command
+        };
+      }
+      
+      // Step 3: Execute the generated code (which will type the response)
+      const execution = await this.executor.execute(result.code);
+      
+      if (!execution.success) {
+        return {
+          success: false,
+          error: `Failed to execute automation: ${execution.error}`,
+          generatedCode: result.code
+        };
+      }
+      
+      // Step 4: Return success
+      logger.info('Prompted Anywhere completed successfully', {
+        command: command.substring(0, 50) + '...',
+        executionTime: execution.executionTime
+      });
+      
+      return {
+        success: true,
+        result: 'Response typed successfully',
+        metadata: {
+          command,
+          usedVision: result.usedVision,
+          provider: result.provider,
+          latencyMs: result.latencyMs,
+          executionTime: execution.executionTime
+        }
+      };
+      
+    } catch (error) {
+      logger.error('Prompted Anywhere failed', {
+        error: error.message
+      });
+      
+      return {
+        success: false,
+        error: error.message
+      };
+    }
+  }
+  
+  /**
+   * Generate code for Prompted Anywhere
+   * @param {string} command - User command or highlighted text
+   * @param {string} screenshot - Base64 screenshot
+   * @param {Object} context - Additional context
+   */
+  async generatePromptAnywhereCode(command, screenshot, context) {
+    try {
+      const fetch = (await import('node-fetch')).default;
+      
+      const requestBody = {
+        command,
+        context: {
+          mode: 'prompt-anywhere',
+          os: context.os || process.platform,
+          timestamp: Date.now()
+        }
+      };
+      
+      // Add screenshot if available
+      if (screenshot) {
+        requestBody.screenshot = {
+          base64: screenshot,
+          mimeType: 'image/png'
+        };
+      }
+      
+      logger.info('Calling backend for Prompted Anywhere code generation', {
+        command: command.substring(0, 50) + '...',
+        hasScreenshot: !!screenshot
+      });
+      
+      const response = await fetch(process.env.NUTJS_API_URL || 'http://localhost:4000/api/nutjs', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-API-Key': process.env.THINKDROP_API_KEY || process.env.BACKEND_API_KEY
+        },
+        body: JSON.stringify(requestBody),
+        timeout: 60000 // 60 seconds
+      });
+      
+      if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(`Backend error: ${response.statusText} - ${errorText}`);
+      }
+      
+      const data = await response.json();
+      
+      if (!data.success) {
+        throw new Error(data.error || 'Backend returned unsuccessful response');
+      }
+      
+      logger.info('Code generated successfully', {
+        provider: data.provider,
+        usedVision: data.usedVision,
+        latencyMs: data.latencyMs,
+        codeLength: data.code.length
+      });
+      
+      return {
+        success: true,
+        code: data.code,
+        provider: data.provider,
+        usedVision: data.usedVision,
+        latencyMs: data.latencyMs
+      };
+      
+    } catch (error) {
+      logger.error('Failed to generate Prompted Anywhere code', {
+        error: error.message
+      });
+      
+      return {
+        success: false,
+        error: error.message
       };
     }
   }

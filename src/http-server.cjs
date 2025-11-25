@@ -141,6 +141,14 @@ class CommandHTTPServer {
               response = await this.executeAutomation(payload);
               break;
             
+            case 'command.prompt-anywhere':
+              response = await this.handlePromptAnywhere(payload);
+              break;
+            
+            case 'command.cancel-automation':
+              response = await this.handleCancelAutomation(payload);
+              break;
+            
             case 'command.guide':
               response = await this.executeGuide(payload);
               break;
@@ -728,6 +736,175 @@ Please provide a clear, concise answer to the user's question based on this outp
   }
   
   /**
+   * Handle "Prompted Anywhere" command
+   * Captures text + screenshot from any app, generates and executes response
+   * @param {Object} payload - { text, screenshot, context }
+   */
+  async handlePromptAnywhere(payload) {
+    const { text, screenshot, context = {} } = payload;
+    
+    try {
+      logger.info('Handling Prompted Anywhere request', {
+        hasText: !!text,
+        hasScreenshot: !!screenshot,
+        textLength: text?.length || 0
+      });
+      
+      // Step 1: Determine the command
+      let command;
+      if (text && text.trim()) {
+        // User highlighted text - use it as the prompt
+        command = text.trim();
+        logger.info('Using highlighted text as command', { 
+          command: command.substring(0, 100) + (command.length > 100 ? '...' : '')
+        });
+      } else {
+        // No highlighted text - use default with screenshot context
+        command = 'Answer the question or provide helpful information based on what you see on screen';
+        logger.info('Using default command with screenshot analysis');
+      }
+      
+      // Step 2: Call backend with vision support
+      const result = await this.generatePromptAnywhereCode(command, screenshot, context);
+      
+      if (!result.success) {
+        return {
+          success: false,
+          error: result.error,
+          command
+        };
+      }
+      
+      // Step 3: Execute the generated code (which will type the response)
+      const execution = await this.nutjsHandler.executeNutjsCode(result.code, command);
+      
+      if (!execution.success) {
+        return {
+          success: false,
+          error: `Failed to execute automation: ${execution.error}`,
+          generatedCode: result.code
+        };
+      }
+      
+      // Step 4: Return success
+      logger.info('Prompted Anywhere completed successfully', {
+        command: command.substring(0, 50) + '...',
+        executionTime: execution.executionTime
+      });
+      
+      return {
+        success: true,
+        result: 'Response typed successfully',
+        metadata: {
+          command,
+          usedVision: result.usedVision,
+          provider: result.provider,
+          latencyMs: result.latencyMs,
+          executionTime: execution.executionTime
+        }
+      };
+      
+    } catch (error) {
+      logger.error('Prompted Anywhere failed', {
+        error: error.message
+      });
+      
+      return {
+        success: false,
+        error: error.message
+      };
+    }
+  }
+  
+  /**
+   * Generate code for Prompted Anywhere
+   * @param {string} command - User command or highlighted text
+   * @param {string} screenshot - Base64 screenshot
+   * @param {Object} context - Additional context
+   */
+  async generatePromptAnywhereCode(command, screenshot, context) {
+    try {
+      const fetch = (await import('node-fetch')).default;
+      
+      const requestBody = {
+        command,
+        context: {
+          mode: 'prompt-anywhere',
+          os: context.os || process.platform,
+          timestamp: Date.now(),
+          typingStrategy: 'chunked', // Hint: Type in chunks with delays
+          maxChunkSize: 200, // Hint: Max characters per chunk
+          disableAutoCorrect: true, // Hint: Add Ctrl+Z workaround for autocorrect
+          useCodeBlock: true // Hint: For code, insert into code block if possible
+        }
+      };
+      
+      // Add screenshot if available
+      if (screenshot) {
+        requestBody.screenshot = {
+          base64: screenshot,
+          mimeType: 'image/png'
+        };
+      }
+      
+      logger.info('Calling backend for Prompted Anywhere code generation', {
+        command: command.substring(0, 50) + '...',
+        hasScreenshot: !!screenshot
+      });
+      
+      const response = await fetch(process.env.NUTJS_API_URL || 'http://localhost:4000/api/nutjs', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-API-Key': process.env.THINKDROP_API_KEY || process.env.BACKEND_API_KEY
+        },
+        body: JSON.stringify(requestBody),
+        timeout: 60000 // 60 seconds
+      });
+      
+      if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(`Backend error: ${response.statusText} - ${errorText}`);
+      }
+      
+      const data = await response.json();
+      
+      if (!data.success) {
+        throw new Error(data.error || 'Backend returned unsuccessful response');
+      }
+      
+      logger.info('Code generated successfully', {
+        provider: data.provider,
+        usedVision: data.usedVision,
+        latencyMs: data.latencyMs,
+        codeLength: data.code.length
+      });
+      
+      // Post-process code to add typing speed configuration
+      let processedCode = this.addTypingDelayConfig(data.code);
+      // let processedCode = data.code;
+      
+      return {
+        success: true,
+        code: processedCode,
+        provider: data.provider,
+        usedVision: data.usedVision,
+        latencyMs: data.latencyMs
+      };
+      
+    } catch (error) {
+      logger.error('Failed to generate Prompted Anywhere code', {
+        error: error.message
+      });
+      
+      return {
+        success: false,
+        error: error.message
+      };
+    }
+  }
+  
+  /**
    * Fetch educational guide (no execution)
    * @param {Object} payload - { command, context }
    */
@@ -1073,6 +1250,67 @@ Please provide a clear, concise answer to the user's question based on this outp
         process.exit(0);
       });
     });
+  }
+  
+  /**
+   * Cancel currently running automation
+   * @param {Object} payload - Request payload
+   * @returns {Promise<Object>} - Cancellation result
+   */
+  async handleCancelAutomation(payload) {
+    try {
+      logger.info('Cancelling automation');
+      
+      const cancelled = this.nutjsHandler.cancelCurrentAutomation();
+      
+      return {
+        success: true,
+        cancelled: cancelled,
+        message: cancelled 
+          ? 'Automation cancelled successfully' 
+          : 'No automation was running'
+      };
+      
+    } catch (error) {
+      logger.error('Failed to cancel automation', {
+        error: error.message
+      });
+      
+      return {
+        success: false,
+        error: error.message
+      };
+    }
+  }
+  
+  /**
+   * Add typing delay configuration to generated code
+   * Prevents dropped characters when typing in web applications
+   * @param {string} code - Generated NutJS code
+   * @returns {string} - Code with typing delays added
+   */
+  addTypingDelayConfig(code) {
+    // Check if code already has typing configuration
+    if (code.includes('keyboard.config.autoDelayMs')) {
+      return code;
+    }
+    
+    // Add typing delay configuration after the require statement
+    const configCode = `
+// Configure typing speed for reliability (prevents dropped characters)
+keyboard.config.autoDelayMs = 100; // 75ms delay between keystrokes
+`;
+    
+    // Insert after the first require statement
+    const requireMatch = code.match(/(const.*require\(['"]@nut-tree.*?\);)/);
+    if (requireMatch) {
+      const insertPos = code.indexOf(requireMatch[0]) + requireMatch[0].length;
+      code = code.slice(0, insertPos) + '\n' + configCode + code.slice(insertPos);
+      
+      logger.info('Added typing delay configuration to generated code');
+    }
+    
+    return code;
   }
 }
 
