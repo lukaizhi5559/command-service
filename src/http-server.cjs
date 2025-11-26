@@ -832,10 +832,13 @@ Please provide a clear, concise answer to the user's question based on this outp
           mode: 'prompt-anywhere',
           os: context.os || process.platform,
           timestamp: Date.now(),
+          requestId: `pa_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`, // Unique ID to prevent caching
           typingStrategy: 'chunked', // Hint: Type in chunks with delays
           maxChunkSize: 200, // Hint: Max characters per chunk
           disableAutoCorrect: true, // Hint: Add Ctrl+Z workaround for autocorrect
-          useCodeBlock: true // Hint: For code, insert into code block if possible
+          useCodeBlock: true, // Hint: For code, insert into code block if possible
+          responseMode: 'type-only', // CRITICAL: Only generate typing automation, never click/navigate UI
+          instruction: 'Generate NutJS code that ONLY types a helpful response. Do NOT use vision service or click any UI elements. Just type text using keyboard.type().'
         }
       };
       
@@ -847,9 +850,15 @@ Please provide a clear, concise answer to the user's question based on this outp
         };
       }
       
+      // Log screenshot hash to verify it's changing (use middle section to avoid PNG header)
+      const screenshotHash = screenshot ? screenshot.substring(100, 132) : 'none';
+      
       logger.info('Calling backend for Prompted Anywhere code generation', {
         command: command.substring(0, 50) + '...',
-        hasScreenshot: !!screenshot
+        hasScreenshot: !!screenshot,
+        screenshotHash: screenshotHash,
+        screenshotSize: screenshot ? screenshot.length : 0,
+        requestId: requestBody.context.requestId
       });
       
       const response = await fetch(process.env.NUTJS_API_URL || 'http://localhost:4000/api/nutjs', {
