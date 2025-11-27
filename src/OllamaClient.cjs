@@ -13,7 +13,7 @@ const logger = require('./logger.cjs');
 class OllamaClient {
   constructor(config = {}) {
     this.host = config.host || process.env.OLLAMA_HOST || 'http://localhost:11434';
-    this.model = config.model || process.env.OLLAMA_MODEL || 'qwen2:1.5b';
+    this.model = config.model || process.env.OLLAMA_MODEL || 'qwen2.5:3b';
     this.timeout = config.timeout || 30000;
     
     this.ollama = new Ollama({ host: this.host });
@@ -306,71 +306,37 @@ CRITICAL RULES:
 2. macOS app commands:
    - Open: open -a "AppName"
    - Close: osascript -e 'quit app "AppName"'
-   - List: ps aux
 3. File search: mdfind "kMDItemFSName == 'filename'"
 4. System info:
+   - Time: date "+%I:%M %p on %A, %B %d, %Y"
    - Disk: df -h
    - Memory: top -l 1 | grep PhysMem
    - Processes: ps aux
-   - IP address: curl -s ifconfig.me
+   - Battery: pmset -g batt
+5. Network info:
+   - Wi-Fi name/SSID: networksetup -getairportnetwork en0
+   - Public IP: curl -s ifconfig.me
    - Local IP: ipconfig getifaddr en0
-5. If unsure, output: echo "Cannot execute: [reason]"
+   - Network interfaces: networksetup -listallhardwareports
+6. If unsure, output: echo "Cannot execute: [reason]"
 
 Command:`;
   }
   
   /**
-   * Quick pattern matching for ONLY the most reliable commands
-   * Returns shell command if matched, null otherwise (then uses Gemini/Ollama)
-   * Simplified to ~10 ultra-reliable patterns to reduce maintenance
+   * Quick pattern matching for ONLY critical app control commands (for speed)
+   * Returns shell command if matched, null otherwise (then uses model)
+   * System queries (time, network, disk, etc.) are handled by the model for flexibility
    */
   _quickMatchCommand(naturalCommand, os) {
     if (!naturalCommand) return null;
     
     const lower = naturalCommand.toLowerCase().trim();
     
-    // macOS patterns - ONLY exact, unambiguous matches
+    // macOS patterns - ONLY critical app control commands (for speed)
+    // Let the model handle system queries (time, network, disk, etc.)
     if (os === 'darwin') {
-      // Exact phrase matches for system info
-      if (lower === 'disk space' || lower === 'storage') {
-        return 'df -h';
-      }
-      
-      if (lower === 'memory' || lower === 'ram') {
-        return 'top -l 1 | grep PhysMem';
-      }
-      
-      if (lower === 'battery') {
-        return 'pmset -g batt';
-      }
-      
-      if (lower === 'what time is it' || lower === 'current time') {
-        return 'date "+%I:%M %p on %A, %B %d, %Y"';
-      }
-      
-      // Find folder/file queries
-      if (/\b(find|locate|search|where\s+is|do\s+i\s+have)\b.*\b(folder|file|directory)\b/i.test(lower)) {
-        // Extract the search term (folder/file name)
-        const searchMatch = lower.match(/(?:find|locate|search|where\s+is|do\s+i\s+have)\s+(?:a|an|the|my)?\s*(?:folder|file|directory)?\s*(?:called|named|with)?\s*["']?([a-z0-9\-_]+)["']?/i);
-        if (searchMatch && searchMatch[1]) {
-          const searchTerm = searchMatch[1].trim();
-          logger.info('Folder/file search matched', { searchTerm });
-          return `mdfind "kMDItemFSName == '*${searchTerm}*'"`;
-        }
-      }
-      
-      // IP address queries
-      if (/\b(what|show|get|my|the)\s+(is\s+)?(my\s+)?(ip|ip address|external ip|public ip)\b/i.test(lower)) {
-        // External IP
-        return 'curl -s ifconfig.me';
-      }
-      
-      if (/\b(local|internal|private)\s+ip\b/i.test(lower)) {
-        // Local IP
-        return 'ipconfig getifaddr en0 || ipconfig getifaddr en1';
-      }
-      
-      // App control with fuzzy matching (most reliable use case)
+      // App control with fuzzy matching (most reliable use case - keep hardcoded for speed)
       if (/^(open|launch)\s+/i.test(lower)) {
         const match = lower.match(/^(?:open|launch)\s+(.+?)(?:\s+for me)?$/i);
         if (match) {
@@ -404,13 +370,7 @@ Command:`;
       }
     }
     
-    // Linux patterns
-    if (os === 'linux') {
-      if (lower === 'disk space') return 'df -h';
-      if (lower === 'memory') return 'free -h';
-    }
-    
-    // No match - let Gemini/Ollama handle it
+    // No match - let model handle it (system queries, network info, etc.)
     return null;
   }
   

@@ -41,8 +41,11 @@ class CommandValidator {
         /^(df|du|free|vm_stat)(\s|$)/i,               // Disk/memory info
         /^(uname|hostname|sw_vers)(\s|$)/i,           // System info
         /^(ifconfig|ip\s+addr|netstat)(\s|$)/i,       // Network info
+        /^ipconfig\s+/i,                               // IP configuration (macOS/Windows)
         /^(date|cal|uptime)(\s|$)/i,                  // Time info
         /^system_profiler/i,                           // macOS system info
+        /^pmset\s+-g/i,                                // macOS battery/power info (read-only)
+        /^networksetup\s+-get/i,                       // macOS network info (read-only get commands)
         // Version checks (generic - matches any command with version flags)
         /\s+(--version|-v|-V|version)(\s|$)/i,        // Any command with version flags
         /^[\w\-]+\s+--version$/i,                     // tool --version
