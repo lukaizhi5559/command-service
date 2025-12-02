@@ -303,22 +303,33 @@ class OllamaClient {
 
 CRITICAL RULES:
 1. Output ONLY the command - NO explanations, NO markdown, NO quotes
-2. macOS app commands:
+2. Use SIMPLE, STANDARD shell commands - avoid complex AppleScript unless absolutely necessary
+3. macOS app commands:
    - Open: open -a "AppName"
    - Close: osascript -e 'quit app "AppName"'
-3. File search: mdfind "kMDItemFSName == 'filename'"
-4. System info:
+4. File operations:
+   - Create file with text: echo "content" > ~/Desktop/filename.txt
+   - Create empty file: touch ~/Desktop/filename.txt
+   - Create directory: mkdir ~/Desktop/foldername
+   - NEVER mix AppleScript and bash in the same command
+5. File search: mdfind "kMDItemFSName == 'filename'"
+6. System info:
    - Time: date "+%I:%M %p on %A, %B %d, %Y"
    - Disk: df -h
    - Memory: top -l 1 | grep PhysMem
    - Processes: ps aux
    - Battery: pmset -g batt
-5. Network info:
+7. Network info:
    - Wi-Fi name/SSID: networksetup -getairportnetwork en0
    - Public IP: curl -s ifconfig.me
    - Local IP: ipconfig getifaddr en0
    - Network interfaces: networksetup -listallhardwareports
-6. If unsure, output: echo "Cannot execute: [reason]"
+8. If unsure, output: echo "Cannot execute: [reason]"
+
+EXAMPLES:
+- "Create a file called test.txt with Hello": echo "Hello" > ~/Desktop/test.txt
+- "Make a folder called projects": mkdir ~/Desktop/projects
+- "Open Chrome": open -a "Google Chrome"
 
 Command:`;
   }
@@ -368,6 +379,35 @@ Command:`;
           }
         }
       }
+    }
+    
+    // File creation patterns (cross-platform)
+    // Pattern: "create/make a file (on my desktop/in folder) called X with (text/content) Y"
+    const fileCreateMatch = lower.match(/(?:create|make)\s+(?:a\s+)?file\s+(?:on\s+my\s+desktop\s+|in\s+.+?\s+)?called\s+(\S+)\s+with\s+(?:the\s+)?(?:text|content)\s+(.+)/i);
+    if (fileCreateMatch) {
+      const filename = fileCreateMatch[1].trim();
+      const content = fileCreateMatch[2].trim();
+      
+      // Default to desktop if no path specified
+      const filepath = lower.includes('desktop') ? `~/Desktop/${filename}` : `./${filename}`;
+      
+      logger.info('File creation command matched', { 
+        filename, 
+        content: content.substring(0, 50) 
+      });
+      
+      return `echo "${content}" > ${filepath}`;
+    }
+    
+    // Pattern: "create/make a folder/directory called X"
+    const folderCreateMatch = lower.match(/(?:create|make)\s+(?:a\s+)?(?:folder|directory)\s+(?:on\s+my\s+desktop\s+|in\s+.+?\s+)?called\s+(\S+)/i);
+    if (folderCreateMatch) {
+      const foldername = folderCreateMatch[1].trim();
+      const folderpath = lower.includes('desktop') ? `~/Desktop/${foldername}` : `./${foldername}`;
+      
+      logger.info('Folder creation command matched', { foldername });
+      
+      return `mkdir ${folderpath}`;
     }
     
     // No match - let model handle it (system queries, network info, etc.)
