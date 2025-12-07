@@ -1,13 +1,14 @@
 /**
  * Command Service MCP Server
  * 
- * MCP service for natural language command execution using Ollama.
+ * MCP service for natural language command execution using fast pattern matching + embeddings.
  * Handles command interpretation, validation, and safe execution.
  */
 
 require('dotenv').config();
 const readline = require('readline');
-const OllamaClient = require('./OllamaClient.cjs');
+const CommandInterpreter = require('./CommandInterpreter.cjs');
+const EmbeddingClient = require('./EmbeddingClient.cjs');
 const CommandValidator = require('./CommandValidator.cjs');
 const CommandExecutor = require('./CommandExecutor.cjs');
 const NutjsAutomationHandler = require('./NutjsAutomationHandler.cjs');
@@ -16,9 +17,14 @@ const logger = require('./logger.cjs');
 class CommandServiceMCPServer {
   constructor() {
     // Initialize components
-    this.ollamaClient = new OllamaClient({
-      host: process.env.OLLAMA_HOST,
-      model: process.env.OLLAMA_MODEL
+    this.embeddingClient = new EmbeddingClient(
+      process.env.PHI4_SERVICE_URL || 'http://localhost:3002'
+    );
+    
+    this.interpreter = new CommandInterpreter({
+      platform: process.platform === 'win32' ? 'windows' : 'mac',
+      generateEmbedding: (text) => this.embeddingClient.generateEmbedding(text),
+      similarityThreshold: 0.75
     });
     
     this.validator = new CommandValidator({
@@ -37,7 +43,7 @@ class CommandServiceMCPServer {
     
     logger.info('CommandServiceMCPServer initialized', {
       serviceName: this.serviceName,
-      ollamaModel: this.ollamaClient.model,
+      interpreter: 'Pattern Matching + HuggingFace Embeddings',
       allowedCategories: this.validator.allowedCategories
     });
   }
@@ -113,18 +119,26 @@ class CommandServiceMCPServer {
     }
     
     try {
-      // Step 1: Interpret natural language to shell command
-      const interpretation = await this.ollamaClient.interpretCommand(command, context);
+      // Step 1: Interpret natural language to shell command (FAST: 10-300ms)
+      const interpretation = await this.interpreter.interpretCommand(command, context);
       
       if (!interpretation.success) {
         return {
           success: false,
           error: `Failed to interpret command: ${interpretation.error}`,
-          originalCommand: command
+          originalCommand: command,
+          confidence: interpretation.confidence
         };
       }
       
       const shellCommand = interpretation.shellCommand;
+      
+      logger.debug(`Command interpreted via ${interpretation.method}`, {
+        originalCommand: command,
+        shellCommand,
+        confidence: interpretation.confidence,
+        category: interpretation.category
+      });
       
       // Step 2: Validate shell command
       const validation = this.validator.validate(shellCommand);
@@ -208,7 +222,7 @@ class CommandServiceMCPServer {
     }
     
     try {
-      const interpretation = await this.ollamaClient.interpretCommand(command, context);
+      const interpretation = await this.interpreter.interpretCommand(command, context);
       
       if (!interpretation.success) {
         return interpretation;
@@ -220,6 +234,8 @@ class CommandServiceMCPServer {
         success: true,
         originalCommand: command,
         shellCommand: interpretation.shellCommand,
+        method: interpretation.method,
+        confidence: interpretation.confidence,
         isValid: validation.isValid,
         category: validation.category,
         riskLevel: validation.riskLevel,
@@ -251,8 +267,27 @@ class CommandServiceMCPServer {
     }
     
     try {
-      const result = await this.ollamaClient.querySystem(query);
-      return result;
+      // Use interpreter to convert query to shell command
+      const interpretation = await this.interpreter.interpretCommand(query);
+      
+      if (!interpretation.success) {
+        return {
+          success: false,
+          error: `Failed to interpret query: ${interpretation.error}`,
+          query
+        };
+      }
+      
+      // Execute the interpreted command
+      const execution = await this.executor.execute(interpretation.shellCommand);
+      
+      return {
+        success: execution.success,
+        result: execution.output,
+        shellCommand: interpretation.shellCommand,
+        method: interpretation.method,
+        query
+      };
       
     } catch (error) {
       return {
@@ -587,17 +622,26 @@ class CommandServiceMCPServer {
    */
   async healthCheck() {
     try {
-      const ollamaHealthy = await this.ollamaClient.checkHealth();
       const nutjsHealthy = await this.nutjsHandler.healthCheck();
+      
+      // Test embedding service connectivity
+      let embeddingHealthy = false;
+      try {
+        await this.embeddingClient.generateEmbedding('test');
+        embeddingHealthy = true;
+      } catch (error) {
+        logger.warn('Embedding service health check failed:', error.message);
+      }
       
       return {
         success: true,
         service: this.serviceName,
         status: 'healthy',
-        ollama: {
-          healthy: ollamaHealthy,
-          host: this.ollamaClient.host,
-          model: this.ollamaClient.model
+        interpreter: {
+          type: 'Pattern Matching + HuggingFace Embeddings',
+          platform: this.interpreter.platform,
+          embeddingService: embeddingHealthy ? 'healthy' : 'unhealthy',
+          similarityThreshold: this.interpreter.similarityThreshold
         },
         nutjs: {
           healthy: nutjsHealthy,
@@ -626,11 +670,13 @@ class CommandServiceMCPServer {
   async start() {
     logger.info('Starting MCP server in stdio mode');
     
-    // Check Ollama health on startup
-    const healthy = await this.ollamaClient.checkHealth();
-    if (!healthy) {
-      logger.warn('Ollama health check failed - service may not work correctly');
-      logger.warn(`Make sure Ollama is running and model ${this.ollamaClient.model} is available`);
+    // Check embedding service health on startup
+    try {
+      await this.embeddingClient.generateEmbedding('test');
+      logger.info('✅ Embedding service is healthy');
+    } catch (error) {
+      logger.warn('⚠️  Embedding service health check failed - pattern matching will still work, but semantic matching may fail');
+      logger.warn(`Make sure Phi4 service is running at ${this.embeddingClient.phi4ServiceUrl}`);
     }
     
     const rl = readline.createInterface({
