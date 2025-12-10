@@ -138,7 +138,8 @@ class CommandHTTPServer {
               break;
             
             case 'command.automate':
-              response = await this.executeAutomation(payload);
+              // Deprecated: Use nutjs.plan instead
+              response = await this.generateAutomationPlan(payload);
               break;
             
             case 'command.prompt-anywhere':
@@ -179,6 +180,19 @@ class CommandHTTPServer {
             
             case 'health':
               response = await this.healthCheck();
+              break;
+            
+            // Automation primitives
+            case 'keyboard.type':
+              response = await this.keyboardType(payload);
+              break;
+            
+            case 'keyboard.hotkey':
+              response = await this.keyboardHotkey(payload);
+              break;
+            
+            case 'mouse.click':
+              response = await this.mouseClick(payload);
               break;
             
             default:
@@ -726,6 +740,125 @@ Please provide a clear, concise answer to the user's question based on this outp
         command,
         error: error.message
       });
+      
+      return {
+        success: false,
+        error: error.message,
+        originalCommand: command
+      };
+    }
+  }
+  
+  /**
+   * Generate automation plan (replaces executeAutomation)
+   * Returns structured plan instead of executing immediately
+   * Calls backend API at http://localhost:4000/api/nutjs/plan
+   * @param {Object} payload - { command, intent, context }
+   */
+  async generateAutomationPlan(payload) {
+    const { command, intent = 'command_automate', context = {} } = payload;
+    
+    if (!command) {
+      return {
+        success: false,
+        error: 'Command is required'
+      };
+    }
+    
+    try {
+      logger.info('Generating automation plan via backend API', { command, intent });
+      
+      // Call backend API for plan generation
+      const fetch = (await import('node-fetch')).default;
+      const backendUrl = process.env.NUTJS_API_URL || 'http://localhost:4000/api/nutjs';
+      const planEndpoint = backendUrl.replace('/api/nutjs', '/api/nutjs/plan');
+      
+      logger.info('Calling backend plan API', { endpoint: planEndpoint });
+      
+      const response = await fetch(planEndpoint, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-API-Key': process.env.BACKEND_API_KEY || process.env.THINKDROP_API_KEY
+        },
+        body: JSON.stringify({
+          command,
+          intent,
+          context: {
+            os: context.os || process.platform,
+            userId: context.userId,
+            sessionId: context.sessionId
+          }
+        }),
+        timeout: 60000 // 60 seconds
+      });
+      
+      if (!response.ok) {
+        const errorText = await response.text();
+        logger.error('Backend plan API error', {
+          status: response.status,
+          statusText: response.statusText,
+          error: errorText
+        });
+        
+        // Check if backend is offline
+        if (response.status === 0 || !response.status) {
+          return {
+            success: false,
+            error: 'Backend automation service is offline. Please ensure the backend server is running at http://localhost:4000',
+            requiresBackend: true
+          };
+        }
+        
+        return {
+          success: false,
+          error: `Backend API error: ${response.statusText} - ${errorText}`,
+          originalCommand: command
+        };
+      }
+      
+      const data = await response.json();
+      
+      if (!data.success || !data.plan) {
+        logger.error('Backend returned unsuccessful response', {
+          success: data.success,
+          error: data.error
+        });
+        
+        return {
+          success: false,
+          error: data.error || 'Backend failed to generate plan',
+          originalCommand: command
+        };
+      }
+      
+      logger.info('Automation plan generated successfully', {
+        planId: data.plan.planId,
+        stepCount: data.plan.steps?.length || 0,
+        provider: data.plan.metadata?.provider
+      });
+      
+      return {
+        success: true,
+        plan: data.plan
+      };
+      
+    } catch (error) {
+      logger.error('Error calling backend plan API', {
+        command,
+        error: error.message,
+        stack: error.stack
+      });
+      
+      // Check if it's a connection error (backend offline)
+      if (error.code === 'ECONNREFUSED' || error.message.includes('ECONNREFUSED')) {
+        return {
+          success: false,
+          error: 'Cannot connect to backend automation service. Please ensure the backend server is running at http://localhost:4000',
+          requiresBackend: true,
+          originalCommand: command
+        };
+      }
       
       return {
         success: false,
@@ -1320,6 +1453,158 @@ keyboard.config.autoDelayMs = 100; // 75ms delay between keystrokes
     }
     
     return code;
+  }
+
+  /**
+   * Type text using keyboard
+   * @param {Object} payload - { text, submit }
+   * @returns {Promise<Object>} - Execution result
+   */
+  async keyboardType(payload) {
+    const { text, submit = false } = payload;
+    
+    if (!text) {
+      return {
+        success: false,
+        error: 'Text is required'
+      };
+    }
+    
+    try {
+      logger.info('Typing text', { length: text.length, submit });
+      
+      // Import NutJS keyboard
+      const { keyboard, Key } = await import('@nut-tree-fork/nut-js');
+      
+      // Configure typing speed for reliability
+      keyboard.config.autoDelayMs = 100;
+      
+      // Type the text
+      await keyboard.type(text);
+      
+      // Press Enter if submit is true
+      if (submit) {
+        await keyboard.type(Key.Enter);
+      }
+      
+      return {
+        success: true,
+        typed: text.length,
+        submitted: submit
+      };
+      
+    } catch (error) {
+      logger.error('Failed to type text', {
+        error: error.message
+      });
+      
+      return {
+        success: false,
+        error: error.message
+      };
+    }
+  }
+
+  /**
+   * Press a hotkey combination
+   * @param {Object} payload - { keys }
+   * @returns {Promise<Object>} - Execution result
+   */
+  async keyboardHotkey(payload) {
+    const { keys } = payload;
+    
+    if (!keys || !Array.isArray(keys) || keys.length === 0) {
+      return {
+        success: false,
+        error: 'Keys array is required'
+      };
+    }
+    
+    try {
+      logger.info('Pressing hotkey', { keys });
+      
+      // Import NutJS keyboard and Key
+      const { keyboard, Key } = await import('@nut-tree-fork/nut-js');
+      
+      // Map key names to Key constants
+      const keyObjects = keys.map(keyName => {
+        // Handle special keys
+        const normalizedKey = keyName.charAt(0).toUpperCase() + keyName.slice(1).toLowerCase();
+        
+        // Check if it's a special key
+        if (Key[normalizedKey]) {
+          return Key[normalizedKey];
+        }
+        
+        // Otherwise, treat as a regular character
+        return keyName;
+      });
+      
+      // Press the hotkey combination
+      await keyboard.pressKey(...keyObjects);
+      await keyboard.releaseKey(...keyObjects);
+      
+      return {
+        success: true,
+        keys: keys
+      };
+      
+    } catch (error) {
+      logger.error('Failed to press hotkey', {
+        error: error.message,
+        keys
+      });
+      
+      return {
+        success: false,
+        error: error.message
+      };
+    }
+  }
+
+  /**
+   * Click at specific coordinates
+   * @param {Object} payload - { x, y }
+   * @returns {Promise<Object>} - Execution result
+   */
+  async mouseClick(payload) {
+    const { x, y } = payload;
+    
+    if (x === undefined || y === undefined) {
+      return {
+        success: false,
+        error: 'Coordinates (x, y) are required'
+      };
+    }
+    
+    try {
+      logger.info('Clicking at coordinates', { x, y });
+      
+      // Import NutJS mouse and Point
+      const { mouse, Point } = await import('@nut-tree-fork/nut-js');
+      
+      // Move to position and click
+      await mouse.setPosition(new Point(x, y));
+      await mouse.click();
+      
+      return {
+        success: true,
+        x,
+        y
+      };
+      
+    } catch (error) {
+      logger.error('Failed to click', {
+        error: error.message,
+        x,
+        y
+      });
+      
+      return {
+        success: false,
+        error: error.message
+      };
+    }
   }
 }
 
