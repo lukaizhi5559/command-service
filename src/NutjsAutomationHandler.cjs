@@ -19,18 +19,11 @@ class NutjsAutomationHandler {
   constructor() {
     this.apiBaseUrl = process.env.NUTJS_API_URL || 'http://localhost:4000/api/nutjs';
     this.apiKey = process.env.THINKDROP_API_KEY;
-    this.tempDir = path.join(process.cwd(), '.temp');
     this.currentProcess = null; // Track running process for cancellation
     
     if (!this.apiKey) {
       logger.warn('THINKDROP_API_KEY not set - Nut.js automation will not work');
     }
-    
-    logger.info('NutjsAutomationHandler initialized', {
-      apiBaseUrl: this.apiBaseUrl,
-      hasApiKey: !!this.apiKey,
-      tempDir: this.tempDir
-    });
   }
   
   /**
@@ -125,14 +118,6 @@ class NutjsAutomationHandler {
     const startTime = Date.now();
     
     try {
-      // Ensure temp directory exists
-      await fs.mkdir(this.tempDir, { recursive: true });
-      
-      // Save code to temporary file
-      const timestamp = Date.now();
-      const codeFilePath = path.join(this.tempDir, `automation_${timestamp}.js`);
-      await fs.writeFile(codeFilePath, code, 'utf-8');
-      
       logger.info('Executing Nut.js automation', {
         command,
         codeFile: codeFilePath

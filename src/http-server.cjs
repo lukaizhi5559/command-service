@@ -194,6 +194,10 @@ class CommandHTTPServer {
             case 'mouse.click':
               response = await this.mouseClick(payload);
               break;
+
+            case 'mouse.scroll':
+              response = await this.mouseScroll(payload);
+              break;
             
             default:
               response = {
@@ -756,7 +760,7 @@ Please provide a clear, concise answer to the user's question based on this outp
    * @param {Object} payload - { command, intent, context }
    */
   async generateAutomationPlan(payload) {
-    const { command, intent = 'command_automate', context = {} } = payload;
+    const { command, intent = 'command_automate', context = {}, clarificationAnswers, previousPlan, feedback } = payload;
     
     if (!command) {
       return {
@@ -766,14 +770,75 @@ Please provide a clear, concise answer to the user's question based on this outp
     }
     
     try {
-      logger.info('Generating automation plan via backend API', { command, intent });
+      const isReplanning = !!clarificationAnswers || !!previousPlan || !!feedback;
+      logger.info('Generating automation plan via backend API', { 
+        command, 
+        intent,
+        isReplanning,
+        hasClarificationAnswers: !!clarificationAnswers,
+        hasPreviousPlan: !!previousPlan,
+        hasFeedback: !!feedback
+      });
       
       // Call backend API for plan generation
       const fetch = (await import('node-fetch')).default;
       const backendUrl = process.env.NUTJS_API_URL || 'http://localhost:4000/api/nutjs';
       const planEndpoint = backendUrl.replace('/api/nutjs', '/api/nutjs/plan');
       
-      logger.info('Calling backend plan API', { endpoint: planEndpoint });
+      logger.info('Calling backend plan API', { endpoint: planEndpoint, isReplanning });
+      
+      // Build request body - include replanning fields if present
+      const requestBody = {
+        command,
+        intent,
+        context: {
+          os: context.os || process.platform,
+          userId: context.userId,
+          sessionId: context.sessionId,
+          isReplanning: context.isReplanning || false,
+          requestPartialPlan: context.requestPartialPlan || false,
+          failedStepIndex: context.failedStepIndex
+        }
+      };
+      
+      // Add replanning fields if present
+      if (clarificationAnswers) {
+        requestBody.clarificationAnswers = clarificationAnswers;
+        logger.debug('Including clarificationAnswers in request', clarificationAnswers);
+      }
+      if (previousPlan) {
+        requestBody.previousPlan = previousPlan;
+        logger.debug('Including previousPlan in request');
+      }
+      if (feedback) {
+        requestBody.feedback = feedback;
+        logger.debug('Including feedback in request', feedback);
+      }
+      if (context.screenshot) {
+        // Include screenshot at both top level AND in context for backend compatibility
+        requestBody.screenshot = context.screenshot;
+        requestBody.context.screenshot = context.screenshot;
+        const screenshotSize = typeof context.screenshot === 'string' ? context.screenshot.length : 'not a string';
+        logger.info('📸 [COMMAND-SERVICE] Including screenshot in request', {
+          hasScreenshot: true,
+          screenshotType: typeof context.screenshot,
+          screenshotSize: screenshotSize,
+          isBase64: typeof context.screenshot === 'string' && context.screenshot.startsWith('data:image/')
+        });
+      } else {
+        logger.warn('⚠️ [COMMAND-SERVICE] No screenshot in context', {
+          contextKeys: Object.keys(context),
+          hasScreenshot: false
+        });
+      }
+      
+      // Log partial plan request
+      if (context.requestPartialPlan) {
+        logger.info('🔧 [COMMAND-SERVICE] Requesting PARTIAL fix plan', {
+          failedStepIndex: context.failedStepIndex,
+          feedback: feedback
+        });
+      }
       
       const response = await fetch(planEndpoint, {
         method: 'POST',
@@ -781,15 +846,7 @@ Please provide a clear, concise answer to the user's question based on this outp
           'Content-Type': 'application/json',
           'X-API-Key': process.env.BACKEND_API_KEY || process.env.THINKDROP_API_KEY
         },
-        body: JSON.stringify({
-          command,
-          intent,
-          context: {
-            os: context.os || process.platform,
-            userId: context.userId,
-            sessionId: context.sessionId
-          }
-        }),
+        body: JSON.stringify(requestBody),
         timeout: 60000 // 60 seconds
       });
       
@@ -819,10 +876,30 @@ Please provide a clear, concise answer to the user's question based on this outp
       
       const data = await response.json();
       
-      if (!data.success || !data.plan) {
-        logger.error('Backend returned unsuccessful response', {
-          success: data.success,
-          error: data.error
+      // Check if backend needs clarification
+      if (data.needsClarification) {
+        logger.info('Backend needs clarification', {
+          questionCount: data.clarificationQuestionCount || 0,
+          questions: data.clarificationQuestions
+        });
+        
+        return {
+          success: true,
+          needsClarification: true,
+          clarificationQuestions: data.clarificationQuestions || [],
+          originalCommand: command
+        };
+      }
+      
+      // Backend returns fullPlan, not plan
+      const plan = data.fullPlan || data.plan;
+      
+      if (!plan) {
+        logger.error('Backend returned no plan', {
+          hasFullPlan: !!data.fullPlan,
+          hasPlan: !!data.plan,
+          needsClarification: data.needsClarification,
+          keys: Object.keys(data)
         });
         
         return {
@@ -833,14 +910,14 @@ Please provide a clear, concise answer to the user's question based on this outp
       }
       
       logger.info('Automation plan generated successfully', {
-        planId: data.plan.planId,
-        stepCount: data.plan.steps?.length || 0,
-        provider: data.plan.metadata?.provider
+        planId: plan.planId,
+        stepCount: plan.steps?.length || 0,
+        provider: plan.metadata?.provider
       });
       
       return {
         success: true,
-        plan: data.plan
+        plan: plan
       };
       
     } catch (error) {
@@ -1352,6 +1429,40 @@ Please provide a clear, concise answer to the user's question based on this outp
   }
   
   /**
+   * Check and install cliclick on macOS for invisible clicks
+   */
+  async ensureCliclick() {
+    if (process.platform !== 'darwin') {
+      return; // Only needed on macOS
+    }
+
+    const { exec } = require('child_process');
+    const { promisify } = require('util');
+    const execAsync = promisify(exec);
+
+    try {
+      // Check if cliclick is installed
+      await execAsync('which cliclick');
+      logger.info('✅ cliclick is installed - invisible clicks enabled');
+    } catch (error) {
+      // cliclick not found, try to install via brew
+      logger.warn('⚠️ cliclick not found - attempting to install via Homebrew');
+      
+      try {
+        // Check if brew is installed
+        await execAsync('which brew');
+        
+        logger.info('📦 Installing cliclick via Homebrew...');
+        await execAsync('brew install cliclick', { timeout: 60000 });
+        logger.info('✅ cliclick installed successfully - invisible clicks enabled');
+      } catch (brewError) {
+        logger.warn('⚠️ Could not install cliclick - will fall back to NutJS (cursor will move)');
+        logger.warn('   To enable invisible clicks, install manually: brew install cliclick');
+      }
+    }
+  }
+
+  /**
    * Start HTTP server
    */
   async start() {
@@ -1361,6 +1472,9 @@ Please provide a clear, concise answer to the user's question based on this outp
       logger.warn('Ollama health check failed - service may not work correctly');
       logger.warn(`Make sure Ollama is running and model ${this.ollamaClient.model} is available`);
     }
+
+    // Ensure cliclick is installed on macOS for invisible clicks
+    await this.ensureCliclick();
     
     const server = http.createServer((req, res) => {
       this.handleRequest(req, res);
@@ -1578,14 +1692,74 @@ keyboard.config.autoDelayMs = 100; // 75ms delay between keystrokes
     }
     
     try {
-      logger.info('Clicking at coordinates', { x, y });
+      // Ensure coordinates are numbers (NutJS Point requires numbers, not strings)
+      const xNum = Number(x);
+      const yNum = Number(y);
       
-      // Import NutJS mouse and Point
-      const { mouse, Point } = await import('@nut-tree-fork/nut-js');
+      if (isNaN(xNum) || isNaN(yNum)) {
+        return {
+          success: false,
+          error: `Invalid coordinates: x=${x}, y=${y} (must be numbers)`
+        };
+      }
       
-      // Move to position and click
-      await mouse.setPosition(new Point(x, y));
-      await mouse.click();
+      logger.info('Clicking at coordinates', { x: xNum, y: yNum });
+      
+      const { exec } = require('child_process');
+      const { promisify } = require('util');
+      const execAsync = promisify(exec);
+      const platform = process.platform;
+      
+      // Platform-specific invisible click implementation
+      if (platform === 'darwin') {
+        // macOS: Try cliclick first, fall back to NutJS
+        logger.info('Attempting macOS click', { x: xNum, y: yNum });
+        
+        try {
+          // Try cliclick (if installed): clicks without moving cursor
+          await execAsync(`cliclick c:${xNum},${yNum}`);
+          logger.info('macOS cliclick executed successfully', { x: xNum, y: yNum });
+        } catch (cliclickError) {
+          // cliclick not installed, fall back to NutJS (moves cursor)
+          logger.warn('cliclick not available, using NutJS (cursor will move)', { 
+            x: xNum, 
+            y: yNum,
+            error: cliclickError.message 
+          });
+          
+          const { mouse, Point, Button } = await import('@nut-tree-fork/nut-js');
+          await mouse.setPosition(new Point(xNum, yNum));
+          await mouse.click(Button.LEFT);
+          logger.info('NutJS click executed', { x: xNum, y: yNum });
+        }
+        
+      } else if (platform === 'win32') {
+        // Windows: Use PowerShell with Windows.Forms for invisible clicks
+        logger.info('Executing Windows native click via PowerShell', { x: xNum, y: yNum });
+        
+        const psScript = `
+          Add-Type -AssemblyName System.Windows.Forms;
+          $oldPos = [System.Windows.Forms.Cursor]::Position;
+          [System.Windows.Forms.Cursor]::Position = New-Object System.Drawing.Point(${xNum}, ${yNum});
+          $signature = '[DllImport("user32.dll")] public static extern void mouse_event(int flags, int dx, int dy, int cData, int extraInfo);';
+          $type = Add-Type -MemberDefinition $signature -Name MouseEvent -Namespace Win32 -PassThru;
+          $type::mouse_event(0x02, 0, 0, 0, 0);
+          $type::mouse_event(0x04, 0, 0, 0, 0);
+          [System.Windows.Forms.Cursor]::Position = $oldPos;
+        `;
+        
+        await execAsync(`powershell -Command "${psScript.replace(/"/g, '\\"')}"`);
+        logger.info('Windows native click executed successfully', { x: xNum, y: yNum });
+        
+      } else {
+        // Linux/Other: Fall back to NutJS (moves cursor)
+        logger.info('Using NutJS click (cursor will move)', { x: xNum, y: yNum, platform });
+        
+        const { mouse, Point, Button } = await import('@nut-tree-fork/nut-js');
+        await mouse.setPosition(new Point(xNum, yNum));
+        await mouse.click(Button.LEFT);
+        logger.info('NutJS click executed', { x: xNum, y: yNum });
+      }
       
       return {
         success: true,
@@ -1600,6 +1774,50 @@ keyboard.config.autoDelayMs = 100; // 75ms delay between keystrokes
         y
       });
       
+      return {
+        success: false,
+        error: error.message
+      };
+    }
+  }
+
+  /**
+   * Scroll mouse wheel
+   * @param {Object} payload - { amount, direction }
+   * direction: 'down' | 'up' (default: 'down')
+   * amount: number of scroll steps (default: 5)
+   */
+  async mouseScroll(payload) {
+    const { amount = 5, direction = 'down' } = payload || {};
+
+    try {
+      const steps = Number(amount);
+      if (isNaN(steps) || steps <= 0) {
+        return {
+          success: false,
+          error: `Invalid scroll amount: ${amount} (must be a positive number)`
+        };
+      }
+
+      const { mouse } = await import('@nut-tree-fork/nut-js');
+
+      if (direction === 'up') {
+        await mouse.scrollUp(steps);
+      } else {
+        await mouse.scrollDown(steps);
+      }
+
+      return {
+        success: true,
+        amount: steps,
+        direction
+      };
+    } catch (error) {
+      logger.error('Failed to scroll', {
+        error: error.message,
+        payload
+      });
+
       return {
         success: false,
         error: error.message
