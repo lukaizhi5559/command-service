@@ -116,8 +116,29 @@ class NutjsAutomationHandler {
    */
   async executeNutjsCode(code, command) {
     const startTime = Date.now();
+    let codeFilePath = null;
     
     try {
+      // Write code to temporary file
+      const tmpDir = path.join(process.cwd(), 'tmp');
+      await fs.mkdir(tmpDir, { recursive: true });
+      
+      // Add typing speed configuration to code if not already present
+      let processedCode = code;
+      if (!code.includes('keyboard.config.autoDelayMs') && code.includes('keyboard')) {
+        // Insert after the require statement
+        const requireMatch = code.match(/(const.*require\(['"]@nut-tree.*?\);)/);
+        if (requireMatch) {
+          const insertPos = code.indexOf(requireMatch[0]) + requireMatch[0].length;
+          const speedConfig = '\n\n// Configure faster typing speed\nkeyboard.config.autoDelayMs = 10; // 10ms delay between keystrokes\n';
+          processedCode = code.slice(0, insertPos) + speedConfig + code.slice(insertPos);
+        }
+      }
+      
+      // Use .cjs extension to support CommonJS require() syntax in generated code
+      codeFilePath = path.join(tmpDir, `nutjs_${Date.now()}_${Math.random().toString(36).substring(7)}.cjs`);
+      await fs.writeFile(codeFilePath, processedCode, 'utf8');
+      
       logger.info('Executing Nut.js automation', {
         command,
         codeFile: codeFilePath
@@ -126,7 +147,7 @@ class NutjsAutomationHandler {
       // Execute the code with proper module support using exec (not execAsync) for cancellation support
       const result = await new Promise((resolve, reject) => {
         this.currentProcess = exec(
-          `node --input-type=module ${codeFilePath}`,
+          `node ${codeFilePath}`,
           {
             timeout: 60000, // 60 seconds max execution time
             maxBuffer: 1024 * 1024, // 1MB buffer
@@ -186,6 +207,13 @@ class NutjsAutomationHandler {
       
     } catch (error) {
       const executionTime = Date.now() - startTime;
+      
+      // Clean up temporary file on error
+      if (codeFilePath) {
+        await fs.unlink(codeFilePath).catch(err => {
+          logger.warn('Failed to delete temp file on error', { file: codeFilePath, error: err.message });
+        });
+      }
       
       logger.error('Automation execution failed', {
         command,

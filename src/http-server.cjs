@@ -1100,8 +1100,8 @@ Please provide a clear, concise answer to the user's question based on this outp
       });
       
       // Post-process code to add typing speed configuration
-      let processedCode = this.addTypingDelayConfig(data.code);
-      // let processedCode = data.code;
+      // let processedCode = this.addTypingDelayConfig(data.code);
+      let processedCode = data.code; // Disabled - was corrupting code
       
       return {
         success: true,
