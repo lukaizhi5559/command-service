@@ -1,13 +1,12 @@
 {
   "name": "command-service",
-  "version": "1.0.0",
-  "description": "Command execution MCP service for ThinkDrop AI - Natural language to shell command interpretation and execution",
+  "version": "2.0.0",
+  "description": "Actuation-only MCP service for ThinkDrop AI — owns all automation skills (shell.run, browser.act, ui.findAndClick, ui.typeText, ui.waitFor)",
   "main": "src/server.cjs",
   "type": "commonjs",
   "scripts": {
-    "start": "node src/http-server.cjs",
-    "start:stdio": "node src/server.cjs",
-    "dev": "nodemon --ignore data/ --ignore tmp/ src/http-server.cjs",
+    "start": "node src/server.cjs",
+    "dev": "nodemon --ignore data/ --ignore tmp/ --ignore logs/ src/server.cjs",
     "test": "node tests/test-service.cjs"
   },
   "nodemonConfig": {
@@ -15,31 +14,23 @@
       "data/*",
       "*.log",
       ".temp/*",
-      "tmp/*"
+      "tmp/*",
+      "logs/*"
     ]
   },
   "keywords": [
-    "command-execution",
-    "shell",
-    "ollama",
-    "llama",
+    "automation",
+    "skills",
+    "playwright",
+    "nutjs",
     "mcp",
     "thinkdrop"
   ],
   "author": "ThinkDrop AI Team",
   "license": "MIT",
   "dependencies": {
-    "@google/generative-ai": "^0.24.1",
     "@nut-tree-fork/nut-js": "^4.2.6",
-    "axios": "^1.13.2",
     "dotenv": "^16.0.0",
-    "form-data": "^4.0.4",
-    "fuzzysort": "^3.1.0",
-    "google-auth-library": "^10.5.0",
-    "googleapis": "^165.0.0",
-    "node-fetch": "^2.7.0",
-    "ollama": "^0.5.0",
-    "open": "^10.2.0",
     "winston": "^3.11.0"
   },
   "devDependencies": {
