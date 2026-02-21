@@ -11,7 +11,12 @@
     "test": "node tests/test-service.cjs"
   },
   "nodemonConfig": {
-    "ignore": ["data/*", "*.log", ".temp/*", "tmp/*"]
+    "ignore": [
+      "data/*",
+      "*.log",
+      ".temp/*",
+      "tmp/*"
+    ]
   },
   "keywords": [
     "command-execution",

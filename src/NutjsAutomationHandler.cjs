@@ -183,9 +183,9 @@ class NutjsAutomationHandler {
       const { stdout, stderr } = result;
       
       // Clean up temporary file
-      await fs.unlink(codeFilePath).catch(err => {
-        logger.warn('Failed to delete temp file', { file: codeFilePath, error: err.message });
-      });
+      // await fs.unlink(codeFilePath).catch(err => {
+      //   logger.warn('Failed to delete temp file', { file: codeFilePath, error: err.message });
+      // });
       
       const executionTime = Date.now() - startTime;
       
