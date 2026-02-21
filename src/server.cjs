@@ -11,6 +11,7 @@
 require('dotenv').config();
 const readline = require('readline');
 const logger = require('./logger.cjs');
+const { shellRun } = require('./skills/shell.run.cjs');
 
 class CommandServiceMCPServer {
   constructor() {
@@ -106,8 +107,7 @@ class CommandServiceMCPServer {
   // ---------------------------------------------------------------------------
 
   async _skillShellRun(args) {
-    // TODO: implement in skills/shell.run.cjs
-    return { success: false, error: 'shell.run not yet implemented' };
+    return await shellRun(args);
   }
 
   async _skillBrowserAct(args) {
@@ -156,7 +156,18 @@ class CommandServiceMCPServer {
       terminal: false
     });
 
+    let inFlight = 0;
+    let closing = false;
+
+    const maybeExit = () => {
+      if (closing && inFlight === 0) {
+        logger.info('MCP server stopped');
+        process.exit(0);
+      }
+    };
+
     rl.on('line', async (line) => {
+      inFlight++;
       try {
         const request = JSON.parse(line);
         const response = await this.handleRequest(request);
@@ -167,12 +178,15 @@ class CommandServiceMCPServer {
           success: false,
           error: 'Invalid request format'
         }));
+      } finally {
+        inFlight--;
+        maybeExit();
       }
     });
 
     rl.on('close', () => {
-      logger.info('MCP server stopped');
-      process.exit(0);
+      closing = true;
+      maybeExit();
     });
 
     process.on('SIGINT', () => { logger.info('SIGINT received'); rl.close(); });
