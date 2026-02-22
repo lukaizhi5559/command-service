@@ -12,6 +12,7 @@ require('dotenv').config();
 const http = require('http');
 const logger = require('./logger.cjs');
 const { shellRun } = require('./skills/shell.run.cjs');
+const { browserAct } = require('./skills/browser.act.cjs');
 
 class CommandServiceMCPServer {
   constructor() {
@@ -73,8 +74,7 @@ class CommandServiceMCPServer {
   }
 
   async _skillBrowserAct(args) {
-    // TODO: implement in skills/browser.act.cjs (Playwright)
-    return { success: false, error: 'browser.act not yet implemented' };
+    return await browserAct(args);
   }
 
   async _skillFindAndClick(args) {
