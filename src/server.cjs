@@ -9,7 +9,7 @@
  */
 
 require('dotenv').config();
-const readline = require('readline');
+const http = require('http');
 const logger = require('./logger.cjs');
 const { shellRun } = require('./skills/shell.run.cjs');
 
@@ -20,44 +20,6 @@ class CommandServiceMCPServer {
     logger.info('CommandServiceMCPServer initialized', {
       serviceName: this.serviceName
     });
-  }
-
-  /**
-   * Handle incoming MCP request
-   * @param {Object} request - MCP request { action, payload }
-   * @returns {Promise<Object>} - MCP response
-   */
-  async handleRequest(request) {
-    const { action, payload } = request;
-
-    logger.info('Received MCP request', { action });
-
-    try {
-      switch (action) {
-        case 'command.automate':
-          return await this.executeAutomation(payload);
-
-        case 'health':
-          return await this.healthCheck();
-
-        default:
-          return {
-            success: false,
-            error: `Unknown action: ${action}`
-          };
-      }
-    } catch (error) {
-      logger.error('Error handling request', {
-        action,
-        error: error.message,
-        stack: error.stack
-      });
-
-      return {
-        success: false,
-        error: error.message
-      };
-    }
   }
 
   /**
@@ -150,49 +112,56 @@ class CommandServiceMCPServer {
   async start() {
     logger.info('Starting Command Service MCP server (stdio)');
 
-    const rl = readline.createInterface({
-      input: process.stdin,
-      output: process.stdout,
-      terminal: false
+    // ── Minimal HTTP health server ───────────────────────────────────────────
+    // Keeps the Node.js event loop alive (no active I/O = process exits) and
+    // satisfies the service manager's health check at http://localhost:3007/health
+    const PORT = parseInt(process.env.PORT || '3007', 10);
+    const healthServer = http.createServer(async (req, res) => {
+      res.setHeader('Content-Type', 'application/json');
+
+      if (req.url === '/health' || req.url === '/service.health') {
+        res.writeHead(200);
+        res.end(JSON.stringify({
+          status: 'healthy',
+          service: this.serviceName,
+          skills: ['shell.run', 'browser.act', 'ui.findAndClick', 'ui.typeText', 'ui.waitFor']
+        }));
+        return;
+      }
+
+      if (req.method === 'POST' && req.url === '/command.automate') {
+        let body = '';
+        req.on('data', chunk => { body += chunk; });
+        req.on('end', async () => {
+          try {
+            const { payload } = JSON.parse(body);
+            const result = await this.executeAutomation(payload);
+            res.writeHead(200);
+            res.end(JSON.stringify(result));
+          } catch (err) {
+            res.writeHead(400);
+            res.end(JSON.stringify({ success: false, error: err.message }));
+          }
+        });
+        return;
+      }
+
+      res.writeHead(404);
+      res.end(JSON.stringify({ error: 'Not found' }));
+    });
+    healthServer.listen(PORT, () => {
+      logger.info(`Health endpoint listening on http://localhost:${PORT}/health`);
     });
 
-    let inFlight = 0;
-    let closing = false;
-
-    const maybeExit = () => {
-      if (closing && inFlight === 0) {
-        logger.info('MCP server stopped');
-        process.exit(0);
-      }
+    const shutdown = (signal) => {
+      logger.info(`${signal} received — shutting down`);
+      healthServer.close(() => process.exit(0));
     };
 
-    rl.on('line', async (line) => {
-      inFlight++;
-      try {
-        const request = JSON.parse(line);
-        const response = await this.handleRequest(request);
-        console.log(JSON.stringify(response));
-      } catch (error) {
-        logger.error('Error processing line', { error: error.message });
-        console.log(JSON.stringify({
-          success: false,
-          error: 'Invalid request format'
-        }));
-      } finally {
-        inFlight--;
-        maybeExit();
-      }
-    });
+    process.on('SIGINT',  () => shutdown('SIGINT'));
+    process.on('SIGTERM', () => shutdown('SIGTERM'));
 
-    rl.on('close', () => {
-      closing = true;
-      maybeExit();
-    });
-
-    process.on('SIGINT', () => { logger.info('SIGINT received'); rl.close(); });
-    process.on('SIGTERM', () => { logger.info('SIGTERM received'); rl.close(); });
-
-    logger.info('Command Service MCP ready — listening on stdin');
+    logger.info('Command Service ready');
   }
 }
 

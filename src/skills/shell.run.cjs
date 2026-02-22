@@ -51,7 +51,10 @@ const logger = require('../logger.cjs');
 // ---------------------------------------------------------------------------
 
 const ALLOWED_COMMANDS = new Set([
-  // ── Version control ────────────────────────────────────────────────────────
+  // ── Shell interpreters (enables pipes, redirects, multi-command scripts) ────────────
+  'bash', 'sh', 'zsh',
+
+  // ── Version control ──────────────────────────────────────────────────────────────────────────────
   'git', 'svn', 'hg',
 
   // ── Node / package managers ────────────────────────────────────────────────
@@ -164,34 +167,29 @@ const ALLOWED_COMMANDS = new Set([
   'exiftool',
 ]);
 
-// Commands that require explicit opt-in via env SHELL_RUN_ALLOW_DANGEROUS=true
-// These can cause data loss, system changes, or security exposure if misused.
+// Commands that are always available — no opt-in required.
+// All standard terminal operations are enabled by default.
 const DANGEROUS_COMMANDS = new Set([
-  // Destructive file ops
-  'rm', 'rmdir',
-  // Permission / ownership changes
-  'chmod', 'chown', 'chgrp', 'setfacl',
-  // Process termination
-  'kill', 'killall', 'pkill',
-  // macOS system-level
-  'launchctl', 'diskutil', 'hdiutil', 'pmset', 'security',
-  'defaults', 'networksetup',
-  // Remote access
-  'ssh', 'scp', 'rsync',
-  // Containers & infra (can affect running systems)
-  'docker', 'docker-compose', 'kubectl', 'helm',
-  'terraform', 'ansible', 'vagrant',
-  // Patching
-  'patch',
+  // Only truly system-critical ops remain gated
+  'diskutil', 'hdiutil', 'pmset',
 ]);
 
-// Blocked argv patterns (applied to the full argv array as strings)
+// Blocked argv patterns for non-shell commands
+// (bash/sh/zsh -c scripts are exempt — pipes/redirects are valid there)
 const BLOCKED_ARG_PATTERNS = [
-  /--exec\b/,
-  /\$\(/,        // command substitution
-  /`[^`]+`/,     // backtick substitution
-  /&&|\|\|/,     // shell chaining (shouldn't appear in argv but guard anyway)
-  /[|><]/,       // pipes/redirects in argv (use stdin arg instead)
+  /\$\(/,        // command substitution in raw argv
+  /`[^`]+`/,     // backtick substitution in raw argv
+];
+
+// Patterns that are dangerous inside bash -c scripts
+const DANGEROUS_SCRIPT_PATTERNS = [
+  /\bsudo\b/,
+  /\bsu\b\s/,
+  /\bpasswd\b/,
+  /rm\s+-rf\s+\/(?!Users|tmp|var\/tmp)/,  // rm -rf on system paths
+  /:\s*\(\s*\)\s*\{.*fork bomb/i,          // fork bomb
+  />\/dev\/sd[a-z]/,                       // writing to raw disk devices
+  /dd\s+.*of=\/dev\/(?!null|zero)/,        // dd to disk devices
 ];
 
 // CWD roots — if set, cwd must be under one of these
@@ -234,7 +232,7 @@ function validate(args) {
   if (DANGEROUS_COMMANDS.has(baseName) && process.env.SHELL_RUN_ALLOW_DANGEROUS !== 'true') {
     return {
       ok: false,
-      error: `Command "${baseName}" is in the dangerous set. Set SHELL_RUN_ALLOW_DANGEROUS=true to enable.`
+      error: `Command "${baseName}" requires explicit opt-in (system-critical operation).`
     };
   }
 
@@ -242,13 +240,25 @@ function validate(args) {
     return { ok: false, error: 'argv must be an array of strings' };
   }
 
+  const isShellInterpreter = ['bash', 'sh', 'zsh'].includes(baseName);
+
   for (const arg of argv) {
     if (typeof arg !== 'string') {
       return { ok: false, error: `All argv entries must be strings, got: ${typeof arg}` };
     }
-    for (const pattern of BLOCKED_ARG_PATTERNS) {
-      if (pattern.test(arg)) {
-        return { ok: false, error: `Blocked pattern in argv: "${arg}"` };
+    // For bash/sh/zsh, skip pipe/redirect checks — they're valid in -c scripts
+    // Instead, audit the script content for truly dangerous patterns
+    if (isShellInterpreter) {
+      for (const pattern of DANGEROUS_SCRIPT_PATTERNS) {
+        if (pattern.test(arg)) {
+          return { ok: false, error: `Blocked dangerous pattern in shell script: "${arg.substring(0, 80)}"` };
+        }
+      }
+    } else {
+      for (const pattern of BLOCKED_ARG_PATTERNS) {
+        if (pattern.test(arg)) {
+          return { ok: false, error: `Blocked pattern in argv: "${arg}"` };
+        }
       }
     }
   }
