@@ -129,6 +129,18 @@ const ALLOWED_COMMANDS = new Set([
   'eslint', 'prettier', 'tsc',
   'esbuild', 'vite', 'webpack', 'rollup',
 
+  // ── Cloud CLIs ────────────────────────────────────────────────────────────
+  'aws', 'awslocal',             // AWS CLI
+  'gcloud', 'gsutil', 'bq',     // Google Cloud
+  'az',                          // Azure CLI
+  'gh',                          // GitHub CLI
+  'heroku',                      // Heroku CLI
+  's3cmd', 'rclone',             // S3-compatible tools
+  'doctl',                       // DigitalOcean CLI
+  'fly',                         // Fly.io CLI
+  'vercel', 'netlify',           // Deployment CLIs
+  'wrangler',                    // Cloudflare CLI
+
   // ── Containers & infra ─────────────────────────────────────────────────────
   'docker', 'docker-compose',
   'kubectl', 'helm', 'k9s',
