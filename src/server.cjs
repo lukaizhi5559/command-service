@@ -13,6 +13,13 @@ const http = require('http');
 const logger = require('./logger.cjs');
 const { shellRun } = require('./skills/shell.run.cjs');
 const { browserAct } = require('./skills/browser.act.cjs');
+const { uiWaitFor } = require('./skills/ui.waitFor.cjs');
+const { uiFindAndClick } = require('./skills/ui.findAndClick.cjs');
+const { uiTypeText } = require('./skills/ui.typeText.cjs');
+const { uiScreenVerify } = require('./skills/ui.screen.verify.cjs');
+const { imageAnalyze } = require('./skills/image.analyze.cjs');
+const { uiMoveMouse } = require('./skills/ui.moveMouse.cjs');
+const { uiClick } = require('./skills/ui.click.cjs');
 
 class CommandServiceMCPServer {
   constructor() {
@@ -35,7 +42,7 @@ class CommandServiceMCPServer {
     if (!skill) {
       return {
         success: false,
-        error: 'skill is required (shell.run | browser.act | ui.findAndClick | ui.typeText | ui.waitFor)'
+        error: 'skill is required (shell.run | browser.act | ui.findAndClick | ui.typeText | ui.waitFor | ui.screen.verify)'
       };
     }
 
@@ -56,6 +63,18 @@ class CommandServiceMCPServer {
 
       case 'ui.waitFor':
         return await this._skillWaitFor(args);
+
+      case 'ui.screen.verify':
+        return await this._skillScreenVerify(args);
+
+      case 'image.analyze':
+        return await this._skillImageAnalyze(args);
+
+      case 'ui.moveMouse':
+        return await this._skillMoveMouse(args);
+
+      case 'ui.click':
+        return await this._skillClick(args);
 
       default:
         return {
@@ -78,18 +97,31 @@ class CommandServiceMCPServer {
   }
 
   async _skillFindAndClick(args) {
-    // TODO: implement in skills/ui.findAndClick.cjs (nut.js + OmniParser)
-    return { success: false, error: 'ui.findAndClick not yet implemented' };
+    return await uiFindAndClick(args);
   }
 
   async _skillTypeText(args) {
-    // TODO: implement in skills/ui.typeText.cjs (nut.js, token-aware)
-    return { success: false, error: 'ui.typeText not yet implemented' };
+    return await uiTypeText(args);
   }
 
   async _skillWaitFor(args) {
-    // TODO: implement in skills/ui.waitFor.cjs (polls /memory.getRecentOcr)
-    return { success: false, error: 'ui.waitFor not yet implemented' };
+    return await uiWaitFor(args);
+  }
+
+  async _skillScreenVerify(args) {
+    return await uiScreenVerify(args);
+  }
+
+  async _skillImageAnalyze(args) {
+    return await imageAnalyze(args);
+  }
+
+  async _skillMoveMouse(args) {
+    return await uiMoveMouse(args);
+  }
+
+  async _skillClick(args) {
+    return await uiClick(args);
   }
 
   // ---------------------------------------------------------------------------
@@ -101,7 +133,7 @@ class CommandServiceMCPServer {
       success: true,
       service: this.serviceName,
       status: 'healthy',
-      skills: ['shell.run', 'browser.act', 'ui.findAndClick', 'ui.typeText', 'ui.waitFor']
+      skills: ['shell.run', 'browser.act', 'ui.findAndClick', 'ui.moveMouse', 'ui.click', 'ui.typeText', 'ui.waitFor', 'ui.screen.verify', 'image.analyze']
     };
   }
 
@@ -136,11 +168,14 @@ class CommandServiceMCPServer {
           try {
             const { payload } = JSON.parse(body);
             const result = await this.executeAutomation(payload);
+            // Wrap in MCP envelope: envelope success=true always (HTTP 200).
+            // The skill's own success/failure is inside data — the StateGraph
+            // reads result.data and handles skill-level failures (needsManualStep, etc.)
             res.writeHead(200);
-            res.end(JSON.stringify(result));
+            res.end(JSON.stringify({ success: true, data: result }));
           } catch (err) {
-            res.writeHead(400);
-            res.end(JSON.stringify({ success: false, error: err.message }));
+            res.writeHead(200);
+            res.end(JSON.stringify({ success: true, data: { success: false, error: err.message } }));
           }
         });
         return;
