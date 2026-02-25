@@ -863,19 +863,22 @@ async function browserAct(args) {
 
       // ── waitForContent ────────────────────────────────────────────────────
       // Generic wait: polls page text every pollMs until it stops growing
-      // (2 consecutive stable checks). Works on any streaming AI response,
+      // (stableFor consecutive stable checks). Works on any streaming AI response,
       // search results page, or dynamically loaded content.
       // Args:
-      //   minLength?  (default 800)  — minimum chars before stability check starts
-      //   pollMs?     (default 2000) — polling interval in ms
-      //   stableFor?  (default 3)    — number of consecutive stable polls to confirm done
-      //   timeoutMs?  (default 60000)— give up after this many ms
-      //   selector?   (optional)     — scope to a specific element instead of full page
+      //   minLength?  (default 800)   — minimum chars before stability check starts
+      //   maxLength?  (default 2000)  — early-exit: if content exceeds this, stop immediately
+      //                                 (avoids waiting on live-updating pages like weather.com)
+      //   pollMs?     (default 2000)  — polling interval in ms
+      //   stableFor?  (default 2)     — number of consecutive stable polls to confirm done
+      //   timeoutMs?  (default 45000) — give up after this many ms
+      //   selector?   (optional)      — scope to a specific element instead of full page
       case 'waitForContent': {
         const minLength  = args.minLength  || 800;
+        const maxLength  = args.maxLength  || 2000;
         const pollMs     = args.pollMs     || 2000;
-        const stableFor  = args.stableFor  || 3;
-        const maxWait    = timeoutMs       || 60000;
+        const stableFor  = args.stableFor  || 2;
+        const maxWait    = timeoutMs       || 45000;
 
         const getLen = async () => {
           try {
@@ -901,6 +904,12 @@ async function browserAct(args) {
           await new Promise(r => setTimeout(r, pollMs));
           elapsed += pollMs;
           const curLen = await getLen();
+          // Early-exit: enough content loaded — don't wait for full stability
+          // (live-updating pages like weather/news never fully stabilize)
+          if (curLen >= maxLength) {
+            result = `content stable after ${elapsed}ms (${curLen} chars)`;
+            break;
+          }
           if (curLen >= minLength && curLen === lastLen) {
             stableCount++;
             if (stableCount >= stableFor) break;
@@ -910,7 +919,7 @@ async function browserAct(args) {
           lastLen = curLen;
         }
 
-        result = `content stable after ${elapsed}ms (${lastLen} chars)`;
+        if (!result) result = `content stable after ${elapsed}ms (${lastLen} chars)`;
         break;
       }
 
