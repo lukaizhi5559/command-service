@@ -133,6 +133,23 @@ async function captureScreenshot() {
 }
 
 // ---------------------------------------------------------------------------
+// Window context for cache key
+// ---------------------------------------------------------------------------
+
+async function getWindowContext() {
+  try {
+    const { activeWindow } = await import('active-win');
+    const win = await activeWindow();
+    return {
+      windowTitle: win?.title || '',
+      activeApp: win?.owner?.name || '',
+    };
+  } catch (_) {
+    return { windowTitle: '', activeApp: '' };
+  }
+}
+
+// ---------------------------------------------------------------------------
 // OmniParser detect call
 // ---------------------------------------------------------------------------
 
@@ -145,8 +162,9 @@ function inferIntentType(description) {
   return undefined;
 }
 
-async function detectElement(description, screenshot, timeoutMs) {
+async function detectElement(description, screenshot, timeoutMs, windowContext) {
   const intentType = inferIntentType(description);
+  const { windowTitle, activeApp } = windowContext || {};
   const body = {
     screenshot: {
       base64: screenshot.base64,
@@ -158,6 +176,8 @@ async function detectElement(description, screenshot, timeoutMs) {
       screenHeight: screenshot.height,
       screenshotWidth: screenshot.width,
       screenshotHeight: screenshot.height,
+      ...(windowTitle && { windowTitle }),
+      ...(activeApp && { activeApp }),
       ...(intentType && { intentType })
     }
   };
@@ -183,7 +203,13 @@ async function uiMoveMouse(args = {}) {
 
   const startTime = Date.now();
 
-  // Step 1: Capture screenshot
+  // Capture window context BEFORE hiding the overlay — once the overlay hides,
+  // the Electron window may steal focus and active-win returns 'Electron' instead
+  // of the real foreground app (Chrome, Slack, etc.), producing cache key 'unknown'.
+  const windowContext = await getWindowContext();
+  logger.debug('[ui.moveMouse] Window context', windowContext);
+
+  // Step 1: Capture screenshot (hide overlay so it doesn't appear in the image)
   let screenshot;
   try {
     await hideOverlay();
@@ -198,10 +224,10 @@ async function uiMoveMouse(args = {}) {
     return { success: false, error: `Screenshot capture failed: ${err.message}` };
   }
 
-  // Step 2: Detect element via OmniParser
+  // Step 2: Detect element via OmniParser (cache hit skips the API call on the backend)
   let detection;
   try {
-    detection = await detectElement(label, screenshot, timeoutMs);
+    detection = await detectElement(label, screenshot, timeoutMs, windowContext);
   } catch (err) {
     logger.warn('[ui.moveMouse] OmniParser detect failed', { error: err.message });
     return { success: false, error: `OmniParser unavailable: ${err.message}` };
@@ -213,7 +239,7 @@ async function uiMoveMouse(args = {}) {
     return { success: false, error: `Element not found: ${msg}` };
   }
 
-  const { coordinates, confidence, selectedElement } = detection;
+  const { coordinates, confidence, selectedElement, cacheHit } = detection;
 
   if (!coordinates?.x || !coordinates?.y) {
     return { success: false, error: 'OmniParser returned no coordinates' };
@@ -224,7 +250,10 @@ async function uiMoveMouse(args = {}) {
     return { success: false, error: `Low confidence: ${(confidence * 100).toFixed(0)}% (threshold ${(minConf * 100).toFixed(0)}%)`, coordinates, confidence };
   }
 
-  // Coordinate conversion: resized-image space → physical pixels → logical points
+  // Coordinate conversion: resized-image space → physical pixels → logical points.
+  // Backend bbox is in [0..screenshotWidth] space (resized physical pixels, MAX_WIDTH=1280).
+  // Same formula applies on both cache hit and miss — the stored screenshotWidth is always
+  // 1280 (the resized width we sent), so resizeRatio and pixelScale are stable.
   const pixelScale  = screenshot.pixelScale  || 1;
   const resizeRatio = screenshot.resizeRatio || 1;
   const logicalCoords = {
@@ -233,7 +262,7 @@ async function uiMoveMouse(args = {}) {
   };
 
   logger.info('[ui.moveMouse] Element detected, moving mouse', {
-    label, selectedElement,
+    label, selectedElement, cacheHit: !!cacheHit,
     omniCoords: coordinates,
     logicalCoords,
     pixelScale,
@@ -256,7 +285,7 @@ async function uiMoveMouse(args = {}) {
   }
 
   const elapsed = Date.now() - startTime;
-  logger.info('[ui.moveMouse] Done', { label, logicalCoords, confidence, elapsed });
+  logger.info('[ui.moveMouse] Done', { label, logicalCoords, confidence, cacheHit: !!cacheHit, elapsed });
 
   return {
     success: true,
@@ -264,6 +293,7 @@ async function uiMoveMouse(args = {}) {
     y: logicalCoords.y,
     confidence,
     selectedElement,
+    cacheHit: !!cacheHit,
     elapsed
   };
 }

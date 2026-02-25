@@ -30,6 +30,7 @@
   "license": "MIT",
   "dependencies": {
     "@nut-tree-fork/nut-js": "^4.2.6",
+    "active-win": "^9.0.0",
     "dotenv": "^16.0.0",
     "jimp": "^0.22.12",
     "playwright": "^1.58.2",

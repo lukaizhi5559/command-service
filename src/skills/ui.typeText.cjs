@@ -112,7 +112,11 @@ async function uiTypeText(args = {}) {
   // Set typing speed
   keyboard.config.autoDelayMs = delayMs;
 
-  const segments = parseTextSegments(text);
+  // Convert literal \n to {SHIFT+ENTER} so multiline text types correctly in chat inputs
+  // (plain \n passed to keyboard.type() is silently ignored or errors in nut-js)
+  const normalizedText = text.replace(/\n/g, '{SHIFT+ENTER}');
+
+  const segments = parseTextSegments(normalizedText);
 
   try {
     for (const seg of segments) {

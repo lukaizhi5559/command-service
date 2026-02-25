@@ -20,6 +20,10 @@ const { uiScreenVerify } = require('./skills/ui.screen.verify.cjs');
 const { imageAnalyze } = require('./skills/image.analyze.cjs');
 const { uiMoveMouse } = require('./skills/ui.moveMouse.cjs');
 const { uiClick } = require('./skills/ui.click.cjs');
+const { uiAxClick } = require('./skills/ui.axClick.cjs');
+const { fsRead } = require('./skills/fs.read.cjs');
+const { fileWatch } = require('./skills/file.watch.cjs');
+const { fileBridge } = require('./skills/file.bridge.cjs');
 
 class CommandServiceMCPServer {
   constructor() {
@@ -33,7 +37,7 @@ class CommandServiceMCPServer {
   /**
    * Skill router — dispatches to the appropriate automation skill
    * @param {Object} payload - { skill, args }
-   *   skill: 'shell.run' | 'browser.act' | 'ui.findAndClick' | 'ui.typeText' | 'ui.waitFor'
+   *   skill: 'shell.run' | 'browser.act' | 'ui.findAndClick' | 'ui.typeText' | 'ui.waitFor' | 'fs.read' | 'file.watch'
    *   args:  skill-specific arguments (see skills/ implementations)
    */
   async executeAutomation(payload) {
@@ -75,6 +79,18 @@ class CommandServiceMCPServer {
 
       case 'ui.click':
         return await this._skillClick(args);
+
+      case 'ui.axClick':
+        return await this._skillAxClick(args);
+
+      case 'fs.read':
+        return await this._skillFsRead(args);
+
+      case 'file.watch':
+        return await this._skillFileWatch(args);
+
+      case 'file.bridge':
+        return await this._skillFileBridge(args);
 
       default:
         return {
@@ -124,6 +140,22 @@ class CommandServiceMCPServer {
     return await uiClick(args);
   }
 
+  async _skillAxClick(args) {
+    return await uiAxClick(args);
+  }
+
+  async _skillFsRead(args) {
+    return await fsRead(args);
+  }
+
+  async _skillFileWatch(args) {
+    return await fileWatch(args);
+  }
+
+  async _skillFileBridge(args) {
+    return await fileBridge(args);
+  }
+
   // ---------------------------------------------------------------------------
   // Health
   // ---------------------------------------------------------------------------
@@ -133,7 +165,7 @@ class CommandServiceMCPServer {
       success: true,
       service: this.serviceName,
       status: 'healthy',
-      skills: ['shell.run', 'browser.act', 'ui.findAndClick', 'ui.moveMouse', 'ui.click', 'ui.typeText', 'ui.waitFor', 'ui.screen.verify', 'image.analyze']
+      skills: ['shell.run', 'browser.act', 'ui.axClick', 'ui.findAndClick', 'ui.moveMouse', 'ui.click', 'ui.typeText', 'ui.waitFor', 'ui.screen.verify', 'image.analyze', 'fs.read', 'file.watch', 'file.bridge']
     };
   }
 
@@ -156,7 +188,7 @@ class CommandServiceMCPServer {
         res.end(JSON.stringify({
           status: 'healthy',
           service: this.serviceName,
-          skills: ['shell.run', 'browser.act', 'ui.findAndClick', 'ui.typeText', 'ui.waitFor']
+          skills: ['shell.run', 'browser.act', 'ui.axClick', 'ui.findAndClick', 'ui.moveMouse', 'ui.click', 'ui.typeText', 'ui.waitFor', 'ui.screen.verify', 'image.analyze', 'fs.read', 'file.watch', 'file.bridge']
         }));
         return;
       }

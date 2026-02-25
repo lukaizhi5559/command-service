@@ -145,6 +145,23 @@ async function captureScreenshot() {
 }
 
 // ---------------------------------------------------------------------------
+// Window context for cache key
+// ---------------------------------------------------------------------------
+
+async function getWindowContext() {
+  try {
+    const { activeWindow } = await import('active-win');
+    const win = await activeWindow();
+    return {
+      windowTitle: win?.title || '',
+      activeApp: win?.owner?.name || '',
+    };
+  } catch (_) {
+    return { windowTitle: '', activeApp: '' };
+  }
+}
+
+// ---------------------------------------------------------------------------
 // OmniParser detect call
 // ---------------------------------------------------------------------------
 
@@ -157,8 +174,9 @@ function inferIntentType(description) {
   return undefined;
 }
 
-async function detectElement(description, screenshot, timeoutMs) {
+async function detectElement(description, screenshot, timeoutMs, windowContext) {
   const intentType = inferIntentType(description);
+  const { windowTitle, activeApp } = windowContext || {};
   const body = {
     screenshot: {
       base64: screenshot.base64,
@@ -170,6 +188,8 @@ async function detectElement(description, screenshot, timeoutMs) {
       screenHeight: screenshot.height,
       screenshotWidth: screenshot.width,
       screenshotHeight: screenshot.height,
+      ...(windowTitle && { windowTitle }),
+      ...(activeApp && { activeApp }),
       ...(intentType && { intentType })
     }
   };
@@ -243,6 +263,11 @@ async function uiFindAndClick(args = {}) {
     await new Promise(r => setTimeout(r, settleMs));
   }
 
+  // Capture window context BEFORE hiding the overlay — active-win must see the real
+  // foreground app (Chrome, Slack, etc.), not the Electron overlay that steals focus.
+  const windowContext = await getWindowContext();
+  logger.debug('[ui.findAndClick] Window context', windowContext);
+
   // Step 1: Capture screenshot — hide overlay, screenshot, restore overlay immediately.
   // Do NOT keep overlay hidden during OmniParser call (that takes 15-20s).
   let screenshot;
@@ -262,7 +287,7 @@ async function uiFindAndClick(args = {}) {
   // Step 2: Detect element via OmniParser
   let detection;
   try {
-    detection = await detectElement(label, screenshot, timeoutMs);
+    detection = await detectElement(label, screenshot, timeoutMs, windowContext);
   } catch (err) {
     logger.warn('[ui.findAndClick] OmniParser detect failed — requesting manual step', { error: err.message });
     return {
