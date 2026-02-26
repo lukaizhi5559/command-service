@@ -252,15 +252,20 @@ function validate(args) {
     return { ok: false, error: 'argv must be an array of strings' };
   }
 
+  // Shell interpreters and osascript pass scripts inline — skip pipe/backtick checks,
+  // audit for truly dangerous patterns instead
   const isShellInterpreter = ['bash', 'sh', 'zsh'].includes(baseName);
+  const isScriptInterpreter = isShellInterpreter || baseName === 'osascript';
 
   for (const arg of argv) {
     if (typeof arg !== 'string') {
       return { ok: false, error: `All argv entries must be strings, got: ${typeof arg}` };
     }
-    // For bash/sh/zsh, skip pipe/redirect checks — they're valid in -c scripts
-    // Instead, audit the script content for truly dangerous patterns
-    if (isShellInterpreter) {
+    // For bash/sh/zsh/osascript, skip pipe/redirect/backtick checks — they're valid in scripts.
+    // osascript uses -e flags with inline AppleScript that legitimately contains backticks,
+    // quotes, and message content (e.g. sending a summary via iMessage).
+    // Instead, audit the script content for truly dangerous patterns.
+    if (isScriptInterpreter) {
       for (const pattern of DANGEROUS_SCRIPT_PATTERNS) {
         if (pattern.test(arg)) {
           return { ok: false, error: `Blocked dangerous pattern in shell script: "${arg.substring(0, 80)}"` };
