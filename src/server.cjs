@@ -24,6 +24,7 @@ const { uiAxClick } = require('./skills/ui.axClick.cjs');
 const { fsRead } = require('./skills/fs.read.cjs');
 const { fileWatch } = require('./skills/file.watch.cjs');
 const { fileBridge } = require('./skills/file.bridge.cjs');
+const { run: externalSkillRun } = require('./skills/external.skill.cjs');
 
 class CommandServiceMCPServer {
   constructor() {
@@ -92,6 +93,9 @@ class CommandServiceMCPServer {
       case 'file.bridge':
         return await this._skillFileBridge(args);
 
+      case 'external.skill':
+        return await this._skillExternal(args, payload);
+
       default:
         return {
           success: false,
@@ -156,6 +160,10 @@ class CommandServiceMCPServer {
     return await fileBridge(args);
   }
 
+  async _skillExternal(args) {
+    return await externalSkillRun(args);
+  }
+
   // ---------------------------------------------------------------------------
   // Health
   // ---------------------------------------------------------------------------
@@ -165,7 +173,7 @@ class CommandServiceMCPServer {
       success: true,
       service: this.serviceName,
       status: 'healthy',
-      skills: ['shell.run', 'browser.act', 'ui.axClick', 'ui.findAndClick', 'ui.moveMouse', 'ui.click', 'ui.typeText', 'ui.waitFor', 'ui.screen.verify', 'image.analyze', 'fs.read', 'file.watch', 'file.bridge']
+      skills: ['shell.run', 'browser.act', 'ui.axClick', 'ui.findAndClick', 'ui.moveMouse', 'ui.click', 'ui.typeText', 'ui.waitFor', 'ui.screen.verify', 'image.analyze', 'fs.read', 'file.watch', 'file.bridge', 'external.skill']
     };
   }
 
@@ -188,7 +196,7 @@ class CommandServiceMCPServer {
         res.end(JSON.stringify({
           status: 'healthy',
           service: this.serviceName,
-          skills: ['shell.run', 'browser.act', 'ui.axClick', 'ui.findAndClick', 'ui.moveMouse', 'ui.click', 'ui.typeText', 'ui.waitFor', 'ui.screen.verify', 'image.analyze', 'fs.read', 'file.watch', 'file.bridge']
+          skills: ['shell.run', 'browser.act', 'ui.axClick', 'ui.findAndClick', 'ui.moveMouse', 'ui.click', 'ui.typeText', 'ui.waitFor', 'ui.screen.verify', 'image.analyze', 'fs.read', 'file.watch', 'file.bridge', 'external.skill']
         }));
         return;
       }
