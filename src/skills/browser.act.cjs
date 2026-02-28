@@ -278,7 +278,20 @@ async function getSession(sessionId, timeoutMs, profileName) {
     context = await getSharedContext();
   }
 
-  const page = await context.newPage();
+  // Reuse the initial about:blank tab Chromium opens automatically — avoids a persistent
+  // blank tab sitting next to every session page. Only reuse if it's still blank and not
+  // already claimed by another session.
+  let page;
+  const existingPages = context.pages();
+  const claimedPages = new Set([...sessions.values()].map(s => s.page));
+  const blankPage = existingPages.find(p => {
+    try { return p.url() === 'about:blank' && !claimedPages.has(p) && !p.isClosed(); } catch(_) { return false; }
+  });
+  if (blankPage) {
+    page = blankPage;
+  } else {
+    page = await context.newPage();
+  }
   page.setDefaultTimeout(timeoutMs || 15000);
   page.on('console', msg => {
     if (msg.text().startsWith('[ThinkDrop]')) logger.info(`[browser.act] PAGE_CONSOLE: ${msg.text()}`);
@@ -460,13 +473,39 @@ async function typeWithTokens(page, selector, text, delay, clear) {
 }
 
 // ---------------------------------------------------------------------------
+// Derive a stable sessionId from a URL's hostname.
+// e.g. "https://google.com/search?q=foo" → "google.com"
+//      "https://chat.openai.com/"         → "chat.openai.com"
+// Falls back to 'default' if the URL is not parseable.
+// ---------------------------------------------------------------------------
+function sessionIdFromUrl(url) {
+  try {
+    const { hostname } = new URL(url);
+    return hostname || 'default';
+  } catch (_) {
+    return 'default';
+  }
+}
+
+// Find an existing live session whose page URL matches the given hostname.
+// Returns the sessionId string or null if none found.
+function findSessionByHostname(hostname) {
+  for (const [id, s] of sessions.entries()) {
+    try {
+      const pageHostname = new URL(s.page.url()).hostname;
+      if (pageHostname === hostname && !s.page.isClosed()) return id;
+    } catch (_) {}
+  }
+  return null;
+}
+
+// ---------------------------------------------------------------------------
 // Main skill entry point
 // ---------------------------------------------------------------------------
 
 async function browserAct(args) {
   const {
     action,
-    sessionId = 'default',
     timeoutMs = 15000,
     url,
     waitUntil = 'load',
@@ -493,6 +532,38 @@ async function browserAct(args) {
     authSuccessUrl,   // URL pattern that indicates successful login (e.g. 'mail.google.com/mail')
     authTimeoutMs,    // max ms to wait for user to complete login (default: 5 minutes)
   } = args || {};
+
+  // ── Site-based session routing ────────────────────────────────────────────
+  // Each site (hostname) gets its own persistent tab. Rules:
+  //   1. If the caller provided an explicit sessionId in args, use it as-is.
+  //   2. For a `navigate` action with a URL: derive sessionId from hostname
+  //      (e.g. "google.com", "chat.openai.com"). If a live session already
+  //      exists for that hostname, reuse it — no new tab.
+  //   3. For non-navigate actions without an explicit sessionId: look for an
+  //      existing session whose page URL matches the target hostname in args.url
+  //      (if present), or fall back to 'default'.
+  const callerProvidedSessionId = (args || {}).hasOwnProperty('sessionId')
+    ? (args.sessionId ?? 'default')
+    : null;
+
+  let sessionId;
+  if (callerProvidedSessionId !== null) {
+    // Explicit caller override — always honour it
+    sessionId = callerProvidedSessionId;
+  } else if (action === 'navigate' && url) {
+    // Derive from destination hostname — reuse tab if already open for that site
+    const hostname = sessionIdFromUrl(url);
+    const existing = findSessionByHostname(hostname);
+    sessionId = existing || hostname;
+  } else if (url) {
+    // Non-navigate with a URL hint — try to find matching session
+    const hostname = sessionIdFromUrl(url);
+    const existing = findSessionByHostname(hostname);
+    sessionId = existing || 'default';
+  } else {
+    sessionId = 'default';
+  }
+  // ─────────────────────────────────────────────────────────────────────────
 
   if (!action) {
     return { ok: false, error: 'action is required' };
@@ -674,47 +745,75 @@ async function browserAct(args) {
     //   authTimeoutMs  — max wait for user login in ms (default: 300000 = 5 min)
     if (action === 'waitForAuth') {
       if (!url) return { ok: false, error: 'url is required for waitForAuth' };
-      if (!profile) return { ok: false, error: 'profile is required for waitForAuth' };
 
-      const profileName = profile;
+      const profileName = profile || null;
       const successPattern = authSuccessUrl || url;
       const maxWait = authTimeoutMs || 300000; // 5 minutes default
 
       logger.info(`[browser.act] waitForAuth: profile=${profileName} url=${url} successPattern=${successPattern}`);
 
-      // Get or create persistent context for this profile
-      const { context: pCtx, userDataDir } = await getPersistentContext(profileName);
+      // ── Prefer existing session page ────────────────────────────────────────
+      // The two-phase pre-scan already navigated guideSession to the sign-in page.
+      // Reuse it rather than spawning a new persistent context window.
+      let page = null;
+      let usingExistingSession = false;
 
-      // Reuse or create a page for this sessionId
-      let page;
       if (sessions.has(sessionId)) {
         try {
-          page = sessions.get(sessionId).page;
-          page.url(); // verify alive
+          const existingPage = sessions.get(sessionId).page;
+          existingPage.url(); // throws if closed
+          page = existingPage;
+          usingExistingSession = true;
+          logger.info(`[browser.act] waitForAuth: reusing existing session page for ${sessionId}`);
         } catch (_) {
           sessions.delete(sessionId);
-          page = null;
         }
       }
+
+      // ── Fall back to persistent profile context ─────────────────────────────
+      // Only used when there is no live session page (e.g. cold start).
       if (!page) {
+        if (!profileName) return { ok: false, error: 'profile is required for waitForAuth when no existing session' };
+        const { context: pCtx, userDataDir } = await getPersistentContext(profileName);
         page = await pCtx.newPage();
         page.setDefaultTimeout(timeoutMs);
         sessions.set(sessionId, { page, lastUsed: Date.now(), contextKey: userDataDir });
+        logger.info(`[browser.act] waitForAuth: created new page in persistent context for profile ${profileName}`);
       }
 
-      // Navigate to the target URL
-      try {
-        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: timeoutMs });
-      } catch (navErr) {
-        logger.warn(`[browser.act] waitForAuth: navigation error (may be redirect): ${navErr.message}`);
+      // Mark session as guide-active so the idle cleaner won't kill it
+      // during the potentially long auth wait.
+      if (sessions.has(sessionId)) {
+        sessions.get(sessionId).guideActive = true;
+        sessions.get(sessionId).lastUsed = Date.now();
+      }
+
+      // Navigate to the target URL (only if we're not already at/near it).
+      // Consider the page "already on target" if it's at the success URL, the
+      // target hostname, or any auth/sign-in page for that service (e.g.
+      // accounts.google.com for gmail, login.microsoftonline.com for outlook).
+      const priorUrl = page.url();
+      let targetHostname = '';
+      try { targetHostname = new URL(url).hostname; } catch (_) {}
+      const alreadyOnTarget = priorUrl.includes(successPattern) ||
+        (targetHostname && priorUrl.includes(targetHostname)) ||
+        /accounts\.|login\.|signin\.|auth\.|sso\./.test(priorUrl);
+
+      if (!alreadyOnTarget) {
+        try {
+          await page.goto(url, { waitUntil: 'domcontentloaded', timeout: timeoutMs });
+        } catch (navErr) {
+          logger.warn(`[browser.act] waitForAuth: navigation error (may be redirect): ${navErr.message}`);
+        }
       }
 
       const currentUrl = page.url();
       logger.info(`[browser.act] waitForAuth: landed on ${currentUrl}`);
 
-      // Check if already authenticated (URL matches success pattern)
+      // Check if already authenticated
       if (currentUrl.includes(successPattern)) {
         logger.info(`[browser.act] waitForAuth: already authenticated (${currentUrl})`);
+        if (sessions.has(sessionId)) sessions.get(sessionId).guideActive = false;
         return {
           ok: true,
           action,
@@ -726,8 +825,30 @@ async function browserAct(args) {
         };
       }
 
-      // Not authenticated — wait for user to log in manually
+      // Not authenticated — wait for user to complete login manually
       logger.info(`[browser.act] waitForAuth: login required — waiting up to ${maxWait}ms for user`);
+
+      // ── Navigation guard ──────────────────────────────────────────────────
+      // While waiting for login, block any navigation away from auth/login domains.
+      // This prevents background mic noise (picked up as browser commands) from
+      // redirecting the page away from the login form mid-auth.
+      const AUTH_DOMAINS = /accounts\.|login\.|signin\.|auth\.|sso\.|google\.|microsoft\.|github\.|apple\.|okta\./;
+      const navGuard = (request) => {
+        try {
+          if (request.isNavigationRequest() && request.frame() === page.mainFrame()) {
+            const destUrl = request.url();
+            if (!AUTH_DOMAINS.test(destUrl) && !destUrl.includes(successPattern)) {
+              logger.info(`[browser.act] waitForAuth: blocked navigation away from auth page → ${destUrl}`);
+              request.abort();
+              return;
+            }
+          }
+          request.continue();
+        } catch (_) {}
+      };
+      try {
+        await page.route('**', navGuard);
+      } catch (_) {}
 
       const deadline = Date.now() + maxWait;
       let authenticated = false;
@@ -741,6 +862,11 @@ async function browserAct(args) {
           break;
         }
       }
+
+      // Remove navigation guard
+      try { await page.unroute('**', navGuard); } catch (_) {}
+
+      if (sessions.has(sessionId)) sessions.get(sessionId).guideActive = false;
 
       if (!authenticated) {
         return {
@@ -989,6 +1115,19 @@ async function browserAct(args) {
           wftSession.guideActive = false;
           wftSession.triggerResolver = null;
           if (navListener) { try { page.off('framenavigated', navListener); } catch(_) {} navListener = null; }
+          // Only close the session page if it is still about:blank (never navigated).
+          // If the user triggered navigation (e.g. typed in Google and hit Enter), the page
+          // now holds live content — closing it would leave the browser showing about:blank.
+          if (sessionId !== 'default') {
+            try {
+              const finalUrl = page.url();
+              if (!finalUrl || finalUrl === 'about:blank') {
+                await page.close();
+                sessions.delete(sessionId);
+              }
+              // else: page has real content — leave it open for subsequent steps
+            } catch (_) {}
+          }
         }
         result = true;
         break;

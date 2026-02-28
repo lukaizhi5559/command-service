@@ -25,6 +25,7 @@ const { fsRead } = require('./skills/fs.read.cjs');
 const { fileWatch } = require('./skills/file.watch.cjs');
 const { fileBridge } = require('./skills/file.bridge.cjs');
 const { run: externalSkillRun } = require('./skills/external.skill.cjs');
+const { screenCapture } = require('./skills/screen.capture.cjs');
 
 class CommandServiceMCPServer {
   constructor() {
@@ -96,6 +97,9 @@ class CommandServiceMCPServer {
       case 'external.skill':
         return await this._skillExternal(args, payload);
 
+      case 'screen.capture':
+        return await this._skillScreenCapture(args);
+
       default:
         return {
           success: false,
@@ -154,6 +158,10 @@ class CommandServiceMCPServer {
 
   async _skillFileWatch(args) {
     return await fileWatch(args);
+  }
+
+  async _skillScreenCapture(args) {
+    return await screenCapture(args);
   }
 
   async _skillFileBridge(args) {
