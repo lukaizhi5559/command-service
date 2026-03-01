@@ -278,19 +278,34 @@ async function getSession(sessionId, timeoutMs, profileName) {
     context = await getSharedContext();
   }
 
-  // Reuse the initial about:blank tab Chromium opens automatically — avoids a persistent
-  // blank tab sitting next to every session page. Only reuse if it's still blank and not
-  // already claimed by another session.
+  // For 'default' sessionId with no existing entry: prefer the most recently active
+  // non-blank page already open in the shared context. This prevents smartType/keyboard/
+  // getPageText from opening a new blank tab when the LLM used hostname-derived sessionId
+  // for navigate (e.g. 'www.google.com') but then falls back to 'default' for later steps.
   let page;
   const existingPages = context.pages();
   const claimedPages = new Set([...sessions.values()].map(s => s.page));
-  const blankPage = existingPages.find(p => {
-    try { return p.url() === 'about:blank' && !claimedPages.has(p) && !p.isClosed(); } catch(_) { return false; }
-  });
-  if (blankPage) {
-    page = blankPage;
-  } else {
-    page = await context.newPage();
+
+  if (sessionId === 'default' && !profileName) {
+    const activePage = getMostRecentPage(context);
+    if (activePage && !claimedPages.has(activePage)) {
+      logger.info(`[browser.act] getSession: 'default' session — reusing active page ${activePage.url()}`);
+      page = activePage;
+    }
+  }
+
+  if (!page) {
+    // Reuse the initial about:blank tab Chromium opens automatically — avoids a persistent
+    // blank tab sitting next to every session page. Only reuse if it's still blank and not
+    // already claimed by another session.
+    const blankPage = existingPages.find(p => {
+      try { return p.url() === 'about:blank' && !claimedPages.has(p) && !p.isClosed(); } catch(_) { return false; }
+    });
+    if (blankPage) {
+      page = blankPage;
+    } else {
+      page = await context.newPage();
+    }
   }
   page.setDefaultTimeout(timeoutMs || 15000);
   page.on('console', msg => {
@@ -891,7 +906,7 @@ async function browserAct(args) {
     }
 
     const session = await getSession(sessionId, timeoutMs, profile);
-    const { page } = session;
+    let { page } = session;
     page.setDefaultTimeout(timeoutMs);
 
     let result;
@@ -900,7 +915,17 @@ async function browserAct(args) {
       // ── navigate ──────────────────────────────────────────────────────────
       case 'navigate': {
         if (!url) return { ok: false, error: 'url is required for navigate' };
-        await page.bringToFront();
+        try {
+          await page.bringToFront();
+        } catch (bringErr) {
+          // Page was closed (stale session from previous run) — drop it and get a fresh one
+          logger.warn(`[browser.act] navigate: bringToFront failed (stale session "${sessionId}") — reopening`);
+          sessions.delete(sessionId);
+          const freshSession = await getSession(sessionId, timeoutMs, profile);
+          page = freshSession.page;
+          page.setDefaultTimeout(timeoutMs);
+          await page.bringToFront();
+        }
         await page.goto(url, { waitUntil, timeout: timeoutMs });
         break;
       }
@@ -1000,11 +1025,11 @@ async function browserAct(args) {
       //   timeoutMs?  (default 45000) — give up after this many ms
       //   selector?   (optional)      — scope to a specific element instead of full page
       case 'waitForContent': {
-        const minLength  = args.minLength  || 800;
+        const minLength  = args.minLength  || 200;
         const maxLength  = args.maxLength  || 2000;
-        const pollMs     = args.pollMs     || 2000;
+        const pollMs     = args.pollMs     || 1500;
         const stableFor  = args.stableFor  || 2;
-        const maxWait    = timeoutMs       || 45000;
+        const maxWait    = timeoutMs       || 30000;
 
         const getLen = async () => {
           try {
@@ -1012,11 +1037,29 @@ async function browserAct(args) {
               return (await page.locator(selector).first().innerText({ timeout: 3000 })).length;
             }
             return await page.evaluate(() => {
-              const main = document.querySelector('main') ||
-                           document.querySelector('article') ||
-                           document.querySelector('[role="main"]') ||
-                           document.body;
-              return (main ? main.innerText : document.body.innerText).trim().length;
+              // Try semantic containers first, then SPA/Maps-specific containers, then body
+              const candidates = [
+                'main', 'article', '[role="main"]', '[role="article"]',
+                '[role="feed"]',           // Google Maps results feed
+                '[role="listitem"]',       // Maps result cards
+                '[role="list"]',           // generic list results
+                '[data-section-id]',       // Maps section panels
+                '.section-result',         // Maps older layout
+                '[data-value]',            // Maps data attributes
+                '#search',                 // Google Search results container
+                '.results-container',      // generic results
+                '#rso',                    // Google SERP organic results
+              ];
+              for (const sel of candidates) {
+                try {
+                  const els = document.querySelectorAll(sel);
+                  if (els.length > 0) {
+                    const text = Array.from(els).map(el => (el.innerText || '').trim()).filter(Boolean).join('\n');
+                    if (text.length > 50) return text.length;
+                  }
+                } catch (_) {}
+              }
+              return (document.body.innerText || '').trim().length;
             });
           } catch (_) { return 0; }
         };
@@ -1160,6 +1203,119 @@ async function browserAct(args) {
         break;
       }
 
+      // ── waitForStableText ─────────────────────────────────────────────────
+      // Universal "wait for content then return it" action.
+      // Polls the page's extracted text every pollMs until:
+      //   (a) content stops growing for stableFor consecutive polls, OR
+      //   (b) content reaches minChars, OR
+      //   (c) timeoutMs is reached (returns best text so far — never hangs)
+      // Works for any site: Maps, Google, AI chatbots, SPAs, slow pages.
+      // Returns the extracted text directly — no separate getPageText needed.
+      //
+      // Args:
+      //   minChars?   (default 100)   — stop early once this many chars are present
+      //   maxChars?   (default 4000)  — truncate returned text to this length
+      //   pollMs?     (default 1500)  — ms between polls
+      //   stableFor?  (default 2)     — consecutive stable polls before exit
+      //   timeoutMs?  (default 15000) — hard deadline; returns best text so far
+      //   selector?   (optional)      — scope to a specific element
+      case 'waitForStableText': {
+        const wstMinChars  = args.minChars  || 100;
+        const wstMaxChars  = args.maxChars  || 4000;
+        const wstPollMs    = args.pollMs    || 1500;
+        const wstStableFor = args.stableFor || 2;
+        const wstMaxWait   = timeoutMs      || 15000;
+
+        // Shared text extractor — clones body before removing noise so the LIVE PAGE is never mutated
+        const extractText = async () => {
+          try {
+            if (selector) {
+              return await page.locator(selector).first().innerText({ timeout: 3000 }).catch(() => '');
+            }
+            return await page.evaluate(() => {
+              const NOISE = [
+                'nav', 'footer', 'header', 'script', 'style', 'noscript', 'aside',
+                '[role="navigation"]', '[role="banner"]', '[role="contentinfo"]', '[role="complementary"]',
+                '[role="dialog"]', '[role="alertdialog"]',
+                '.cookie-banner', '.ad', '.advertisement', '#cookie', '#banner',
+              ];
+              // Clone into a detached div — mutations stay off-screen, real DOM untouched
+              const clone = document.body.cloneNode(true);
+              NOISE.forEach(s => {
+                try { clone.querySelectorAll(s).forEach(el => el.remove()); } catch (_) {}
+              });
+              // Try semantic containers, then SPA/Maps containers, then full clone body
+              const candidates = [
+                'main', 'article', '[role="main"]', '[role="article"]',
+                '[role="feed"]', '[role="listitem"]', '[role="list"]',
+                '[data-section-id]', '.section-result',
+                '#search', '#rso', '.results-container',
+              ];
+              for (const s of candidates) {
+                try {
+                  const els = clone.querySelectorAll(s);
+                  if (els.length > 0) {
+                    const text = Array.from(els).map(el => (el.innerText || el.textContent || '').trim()).filter(Boolean).join('\n\n');
+                    if (text.length > 80) return text.replace(/\n{3,}/g, '\n\n').trim();
+                  }
+                } catch (_) {}
+              }
+              return (clone.innerText || clone.textContent || '').replace(/\n{3,}/g, '\n\n').trim();
+            });
+          } catch (_) { return ''; }
+        };
+
+        const deadline = Date.now() + wstMaxWait;
+        let lastLen = -1;
+        let stableCount = 0;
+        let bestText = '';
+        let elapsed = 0;
+
+        while (Date.now() < deadline) {
+          await new Promise(r => setTimeout(r, wstPollMs));
+          elapsed += wstPollMs;
+          const text = await extractText();
+          const curLen = text.length;
+
+          if (curLen > bestText.length) bestText = text;
+
+          logger.info(`[browser.act] waitForStableText: poll ${elapsed}ms curLen=${curLen} lastLen=${lastLen} stable=${stableCount}`);
+
+          // Track stability regardless of minChars
+          if (curLen === lastLen && curLen > 0) {
+            stableCount++;
+          } else {
+            stableCount = 0;
+          }
+
+          // Primary exit: content reached minChars AND has been stable
+          if (curLen >= wstMinChars && stableCount >= wstStableFor) {
+            logger.info(`[browser.act] waitForStableText: stable after ${elapsed}ms (${curLen} chars)`);
+            break;
+          }
+
+          // Fallback exit: text is short but has been stable for stableFor+2 extra polls
+          // (handles AI chatbot short responses that won't grow further)
+          if (curLen > 0 && curLen < wstMinChars && stableCount >= wstStableFor + 2) {
+            logger.info(`[browser.act] waitForStableText: short-but-stable exit after ${elapsed}ms (${curLen} chars < minChars ${wstMinChars})`);
+            break;
+          }
+
+          // Fast exit: hit a generous char count — content is clearly loaded
+          if (curLen >= 2000) {
+            logger.info(`[browser.act] waitForStableText: content threshold reached after ${elapsed}ms (${curLen} chars)`);
+            break;
+          }
+
+          lastLen = curLen;
+        }
+
+        // Truncate and return
+        result = bestText.length > wstMaxChars ? bestText.substring(0, wstMaxChars) + '…' : bestText;
+        logger.info(`[browser.act] waitForStableText: done after ${elapsed}ms, returning ${result.length} chars`);
+        break;
+      }
+
       // ── getPageText ───────────────────────────────────────────────────────
       // Smart full-page text extraction for comparison/synthesis tasks.
       // Strips nav, footer, scripts, ads — returns meaningful body content.
@@ -1170,15 +1326,16 @@ async function browserAct(args) {
           result = await page.locator(selector).first().innerText({ timeout: timeoutMs });
         } else {
           result = await page.evaluate(() => {
-            // Remove chrome/noise elements before extracting — generic structural selectors only
-            const remove = [
+            const NOISE = [
               'nav', 'footer', 'header', 'script', 'style', 'noscript', 'aside',
               '[role="navigation"]', '[role="banner"]', '[role="contentinfo"]', '[role="complementary"]',
               '[role="dialog"]', '[role="alertdialog"]',
               '.cookie-banner', '.ad', '.advertisement', '#cookie', '#banner',
             ];
-            remove.forEach(sel => {
-              try { document.querySelectorAll(sel).forEach(el => el.remove()); } catch (_) {}
+            // Clone body — never mutate the live page
+            const clone = document.body.cloneNode(true);
+            NOISE.forEach(sel => {
+              try { clone.querySelectorAll(sel).forEach(el => el.remove()); } catch (_) {}
             });
 
             // Prefer semantic content containers — generic, works on any site
@@ -1187,16 +1344,15 @@ async function browserAct(args) {
             ];
             for (const sel of answerSelectors) {
               try {
-                const els = document.querySelectorAll(sel);
+                const els = clone.querySelectorAll(sel);
                 if (els.length > 0) {
-                  // Concatenate all matching elements (e.g. multiple assistant turns)
-                  const text = Array.from(els).map(el => el.innerText.trim()).filter(Boolean).join('\n\n');
+                  const text = Array.from(els).map(el => (el.innerText || el.textContent || '').trim()).filter(Boolean).join('\n\n');
                   if (text.length > 100) return text.replace(/\n{3,}/g, '\n\n').trim();
                 }
               } catch (_) {}
             }
-            // Fallback: full body
-            return document.body.innerText.replace(/\n{3,}/g, '\n\n').trim();
+            // Fallback: full clone
+            return (clone.innerText || clone.textContent || '').replace(/\n{3,}/g, '\n\n').trim();
           });
         }
         if (typeof result === 'string' && result.length > maxChars) {
@@ -1453,8 +1609,8 @@ async function browserAct(args) {
 
         logger.info(`[browser.act] smartType: resolved selector="${resolvedSelector}" (tag=${best.tag}, hint="${hint}")`);
 
-        // Always clear before typing when text is long (avoids accumulation on retry)
-        const effectiveClear = clear || String(text).length > 200;
+        // Always clear before typing — avoids appending to pre-filled values (e.g. URL params, retry state)
+        const effectiveClear = true;
         await typeWithTokens(page, resolvedSelector, String(text), delay, effectiveClear);
         result = { usedSelector: resolvedSelector, candidate: best };
         break;
