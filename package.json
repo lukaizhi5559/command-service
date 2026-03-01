@@ -33,6 +33,8 @@
     "active-win": "^9.0.0",
     "dotenv": "^16.0.0",
     "jimp": "^0.22.12",
+    "keytar": "^7.9.0",
+    "node-cron": "^3.0.3",
     "playwright": "^1.58.2",
     "winston": "^3.11.0"
   },
