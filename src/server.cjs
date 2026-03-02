@@ -25,6 +25,8 @@ const { fsRead } = require('./skills/fs.read.cjs');
 const { fileWatch } = require('./skills/file.watch.cjs');
 const { fileBridge } = require('./skills/file.bridge.cjs');
 const { run: externalSkillRun } = require('./skills/external.skill.cjs');
+const { cliAgent } = require('./skills/cli.agent.cjs');
+const { browserAgent } = require('./skills/browser.agent.cjs');
 const { screenCapture } = require('./skills/screen.capture.cjs');
 
 class CommandServiceMCPServer {
@@ -100,6 +102,12 @@ class CommandServiceMCPServer {
       case 'screen.capture':
         return await this._skillScreenCapture(args);
 
+      case 'cli.agent':
+        return await this._skillCliAgent(args);
+
+      case 'browser.agent':
+        return await this._skillBrowserAgent(args);
+
       default:
         return {
           success: false,
@@ -172,6 +180,14 @@ class CommandServiceMCPServer {
     return await externalSkillRun(args);
   }
 
+  async _skillCliAgent(args) {
+    return await cliAgent(args);
+  }
+
+  async _skillBrowserAgent(args) {
+    return await browserAgent(args);
+  }
+
   // ---------------------------------------------------------------------------
   // Health
   // ---------------------------------------------------------------------------
@@ -181,7 +197,7 @@ class CommandServiceMCPServer {
       success: true,
       service: this.serviceName,
       status: 'healthy',
-      skills: ['shell.run', 'browser.act', 'ui.axClick', 'ui.findAndClick', 'ui.moveMouse', 'ui.click', 'ui.typeText', 'ui.waitFor', 'ui.screen.verify', 'image.analyze', 'fs.read', 'file.watch', 'file.bridge', 'external.skill']
+      skills: ['shell.run', 'browser.act', 'ui.axClick', 'ui.findAndClick', 'ui.moveMouse', 'ui.click', 'ui.typeText', 'ui.waitFor', 'ui.screen.verify', 'image.analyze', 'fs.read', 'file.watch', 'file.bridge', 'external.skill', 'cli.agent', 'browser.agent']
     };
   }
 
@@ -204,7 +220,7 @@ class CommandServiceMCPServer {
         res.end(JSON.stringify({
           status: 'healthy',
           service: this.serviceName,
-          skills: ['shell.run', 'browser.act', 'ui.axClick', 'ui.findAndClick', 'ui.moveMouse', 'ui.click', 'ui.typeText', 'ui.waitFor', 'ui.screen.verify', 'image.analyze', 'fs.read', 'file.watch', 'file.bridge', 'external.skill']
+          skills: ['shell.run', 'browser.act', 'ui.axClick', 'ui.findAndClick', 'ui.moveMouse', 'ui.click', 'ui.typeText', 'ui.waitFor', 'ui.screen.verify', 'image.analyze', 'fs.read', 'file.watch', 'file.bridge', 'external.skill', 'cli.agent', 'browser.agent', 'screen.capture']
         }));
         return;
       }
