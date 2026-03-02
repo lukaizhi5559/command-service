@@ -32,6 +32,7 @@
     "@nut-tree-fork/nut-js": "^4.2.6",
     "active-win": "^9.0.0",
     "dotenv": "^16.0.0",
+    "duckdb": "^1.4.4",
     "jimp": "^0.22.12",
     "keytar": "^7.9.0",
     "node-cron": "^3.0.3",

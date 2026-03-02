@@ -843,28 +843,8 @@ async function browserAct(args) {
       // Not authenticated — wait for user to complete login manually
       logger.info(`[browser.act] waitForAuth: login required — waiting up to ${maxWait}ms for user`);
 
-      // ── Navigation guard ──────────────────────────────────────────────────
-      // While waiting for login, block any navigation away from auth/login domains.
-      // This prevents background mic noise (picked up as browser commands) from
-      // redirecting the page away from the login form mid-auth.
-      const AUTH_DOMAINS = /accounts\.|login\.|signin\.|auth\.|sso\.|google\.|microsoft\.|github\.|apple\.|okta\./;
-      const navGuard = (request) => {
-        try {
-          if (request.isNavigationRequest() && request.frame() === page.mainFrame()) {
-            const destUrl = request.url();
-            if (!AUTH_DOMAINS.test(destUrl) && !destUrl.includes(successPattern)) {
-              logger.info(`[browser.act] waitForAuth: blocked navigation away from auth page → ${destUrl}`);
-              request.abort();
-              return;
-            }
-          }
-          request.continue();
-        } catch (_) {}
-      };
-      try {
-        await page.route('**', navGuard);
-      } catch (_) {}
-
+      // Poll for successful login by watching the URL — no route interception so
+      // the page remains fully interactive and all network requests flow normally.
       const deadline = Date.now() + maxWait;
       let authenticated = false;
       while (Date.now() < deadline) {
@@ -877,9 +857,6 @@ async function browserAct(args) {
           break;
         }
       }
-
-      // Remove navigation guard
-      try { await page.unroute('**', navGuard); } catch (_) {}
 
       if (sessions.has(sessionId)) sessions.get(sessionId).guideActive = false;
 
