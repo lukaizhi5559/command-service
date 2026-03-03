@@ -27,6 +27,8 @@ const { fileBridge } = require('./skills/file.bridge.cjs');
 const { run: externalSkillRun } = require('./skills/external.skill.cjs');
 const { cliAgent } = require('./skills/cli.agent.cjs');
 const { browserAgent } = require('./skills/browser.agent.cjs');
+const creatorAgent = require('./skills/creator.agent.cjs');
+const reviewerAgent = require('./skills/reviewer.agent.cjs');
 const { screenCapture } = require('./skills/screen.capture.cjs');
 
 class CommandServiceMCPServer {
@@ -108,6 +110,12 @@ class CommandServiceMCPServer {
       case 'browser.agent':
         return await this._skillBrowserAgent(args);
 
+      case 'creator.agent':
+        return await this._skillCreatorAgent(args);
+
+      case 'reviewer.agent':
+        return await this._skillReviewerAgent(args);
+
       default:
         return {
           success: false,
@@ -188,6 +196,14 @@ class CommandServiceMCPServer {
     return await browserAgent(args);
   }
 
+  async _skillCreatorAgent(args) {
+    return await creatorAgent(args);
+  }
+
+  async _skillReviewerAgent(args) {
+    return await reviewerAgent(args);
+  }
+
   // ---------------------------------------------------------------------------
   // Health
   // ---------------------------------------------------------------------------
@@ -197,7 +213,7 @@ class CommandServiceMCPServer {
       success: true,
       service: this.serviceName,
       status: 'healthy',
-      skills: ['shell.run', 'browser.act', 'ui.axClick', 'ui.findAndClick', 'ui.moveMouse', 'ui.click', 'ui.typeText', 'ui.waitFor', 'ui.screen.verify', 'image.analyze', 'fs.read', 'file.watch', 'file.bridge', 'external.skill', 'cli.agent', 'browser.agent']
+      skills: ['shell.run', 'browser.act', 'ui.axClick', 'ui.findAndClick', 'ui.moveMouse', 'ui.click', 'ui.typeText', 'ui.waitFor', 'ui.screen.verify', 'image.analyze', 'fs.read', 'file.watch', 'file.bridge', 'external.skill', 'cli.agent', 'browser.agent', 'creator.agent', 'reviewer.agent']
     };
   }
 
