@@ -50,6 +50,38 @@ function validateExecPath(execPath) {
   return resolved;
 }
 
+/**
+ * Fallback for creator-built skills: checks ~/.thinkdrop/skills/<dotName>/index.cjs
+ * which skillCreator copies to when registering. Works even when user-memory is
+ * unavailable or returns UNAUTHORIZED.
+ * Tries both dot-notation (gmail.daily) and kebab-notation (gmail-daily) as dir names.
+ */
+async function fetchSkillRecordFromUserSkillsDir(name) {
+  try {
+    const candidates = [
+      name,                          // gmail.daily   (dot-notation)
+      name.replace(/\./g, '-'),      // gmail-daily   (kebab fallback)
+    ];
+    for (const candidate of candidates) {
+      const skillPath = path.join(SKILLS_BASE_DIR, candidate, 'index.cjs');
+      if (fs.existsSync(skillPath)) {
+        logger.info(`[external.skill] Found creator skill at ${skillPath}`);
+        return {
+          name,
+          execPath: skillPath,
+          execType: 'node',
+          enabled: true,
+          source: 'user-skills-dir',
+        };
+      }
+    }
+    return null;
+  } catch (e) {
+    logger.warn(`[external.skill] user-skills-dir fallback failed: ${e.message}`);
+    return null;
+  }
+}
+
 async function runNodeSkill(execPath, args, timeoutMs) {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
@@ -199,15 +231,25 @@ async function run(args) {
   logger.info(`[external.skill] Executing skill: ${name}`);
 
   let skillRecord;
+  let skillSource = 'user-memory';
+
   try {
     skillRecord = await fetchSkillRecord(name, 5000);
   } catch (err) {
-    return { ok: false, skillName: name, error: `Failed to fetch skill registration for "${name}": ${err.message}` };
+    logger.warn(`[external.skill] user-memory lookup failed for "${name}": ${err.message} — trying ~/.thinkdrop/skills/ fallback`);
+  }
+
+  if (!skillRecord) {
+    logger.info(`[external.skill] "${name}" not in user-memory — checking ~/.thinkdrop/skills/`);
+    skillRecord = await fetchSkillRecordFromUserSkillsDir(name);
+    if (skillRecord) skillSource = skillRecord.source;
   }
 
   if (!skillRecord) {
     return { ok: false, skillName: name, error: `No installed skill named "${name}". Use "install skill at <path>" to add it.` };
   }
+
+  logger.info(`[external.skill] Found skill "${name}" via ${skillSource}`);
 
   if (!skillRecord.enabled) {
     return { ok: false, skillName: name, error: `Skill "${name}" is currently disabled.` };

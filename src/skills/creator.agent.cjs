@@ -4,69 +4,53 @@ const os = require('os');
 const fs = require('fs');
 const { execSync, spawn } = require('child_process');
 const logger = require('../logger.cjs');
+const { getDb } = require('./agents-db.cjs');
 
-const PROJECTS_DB_PATH = path.join(os.homedir(), '.thinkdrop', 'agents.db');
 const PROJECTS_DIR = path.join(os.homedir(), '.thinkdrop', 'projects');
-
-let _db = null;
-async function getDb() {
-  if (_db) return _db;
-  fs.mkdirSync(path.dirname(PROJECTS_DB_PATH), { recursive: true });
-  fs.mkdirSync(PROJECTS_DIR, { recursive: true });
-  try {
-    const duckdbAsync = require('duckdb-async');
-    _db = await duckdbAsync.Database.create(PROJECTS_DB_PATH);
-  } catch {
-    try {
-      const { Database } = require('duckdb');
-      const raw = await new Promise((resolve, reject) => {
-        const db = new Database(PROJECTS_DB_PATH, (err) => { if (err) reject(err); else resolve(db); });
-      });
-      _db = {
-        run: (sql, ...p) => new Promise((res, rej) => { raw.run(sql, ...p, (e) => { if (e) rej(e); else res(); }); }),
-        all: (sql, ...p) => new Promise((res, rej) => { raw.all(sql, ...p, (e, rows) => { if (e) rej(e); else res(rows); }); }),
-        get: (sql, ...p) => new Promise((res, rej) => { raw.get(sql, ...p, (e, row) => { if (e) rej(e); else res(row); }); }),
-        close: () => new Promise((res) => raw.close(() => res())),
-      };
-    } catch { return null; }
-  }
-  await _db.run(`CREATE TABLE IF NOT EXISTS projects (
-    id TEXT PRIMARY KEY, prompt TEXT NOT NULL, name TEXT,
-    bdd_tests TEXT, agents_plan TEXT, tech_stack TEXT, prototype_path TEXT,
-    reviewer_verdict TEXT DEFAULT 'pending', reviewer_notes TEXT,
-    status TEXT NOT NULL DEFAULT 'planning',
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-  )`);
-  return _db;
-}
+let _llmCallSeq = 0;
 
 async function callLLM(systemPrompt, userPrompt, timeoutMs) {
   timeoutMs = timeoutMs || 120000;
   try {
     const WebSocket = require('ws');
-    const WS_URL = process.env.LLM_WS_URL || 'ws://127.0.0.1:3010/llm';
+    const WS_BASE = process.env.LLM_WS_URL || process.env.WEBSOCKET_URL || 'ws://localhost:4000/ws/stream';
+    const url = new URL(WS_BASE);
+    const apiKey = process.env.VSCODE_API_KEY || process.env.BACKEND_API_KEY || process.env.BASE_API_KEY || '';
+    if (apiKey) url.searchParams.set('apiKey', apiKey);
+    url.searchParams.set('userId', 'creator_agent');
+    url.searchParams.set('clientId', 'creator_' + Date.now() + '_' + (++_llmCallSeq));
     return await new Promise((resolve, reject) => {
-      const ws = new WebSocket(WS_URL);
+      const ws = new WebSocket(url.toString());
       let answer = '';
       const timer = setTimeout(() => { ws.close(); reject(new Error('LLM timeout')); }, timeoutMs);
-      ws.on('open', () => ws.send(JSON.stringify({ type: 'generate', systemPrompt, userPrompt })));
+      ws.on('open', () => ws.send(JSON.stringify({
+        id: 'cre_' + Date.now(), type: 'llm_request',
+        payload: { prompt: userPrompt, provider: 'openai', options: { temperature: 0.2, stream: true, taskType: 'ask' },
+          context: { systemInstructions: systemPrompt, recentContext: [], sessionFacts: [], memories: [] } },
+        timestamp: Date.now(), metadata: { source: 'creator_agent' },
+      })));
       ws.on('message', (data) => {
         try {
           const msg = JSON.parse(data.toString());
-          if (msg.type === 'chunk') answer += msg.text || '';
-          else if (msg.type === 'done') { clearTimeout(timer); ws.close(); resolve(answer); }
-          else if (msg.type === 'error') { clearTimeout(timer); ws.close(); reject(new Error(msg.error)); }
-        } catch { answer += data.toString(); }
+          if (msg.type === 'llm_stream_chunk') answer += msg.payload?.chunk || msg.payload?.text || '';
+          else if (msg.type === 'llm_stream_end') { clearTimeout(timer); ws.close(); resolve(answer); }
+          else if (msg.type === 'error') { clearTimeout(timer); ws.close(); reject(new Error(msg.payload?.message || 'LLM error')); }
+          // ignore: connection_status, llm_stream_start, and other control messages
+        } catch { /* ignore non-JSON frames */ }
       });
       ws.on('error', (e) => { clearTimeout(timer); reject(e); });
+      ws.on('close', () => {
+        clearTimeout(timer);
+        if (answer.trim().length > 0) resolve(answer);
+        else reject(new Error('LLM WS closed before sending any content'));
+      });
     });
   } catch {
     const http = require('http');
     const body = JSON.stringify({ payload: { skill: 'llm.generate', args: { systemPrompt, userPrompt } } });
     return new Promise((resolve, reject) => {
       const req = http.request({
-        hostname: '127.0.0.1', port: parseInt(process.env.COMMAND_SERVICE_PORT || '3001', 10),
+        hostname: '127.0.0.1', port: parseInt(process.env.COMMAND_SERVICE_PORT || '3007', 10),
         path: '/command.automate', method: 'POST',
         headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
         timeout: timeoutMs,
@@ -94,15 +78,15 @@ function writeFile(id, rel, content) {
 async function dbSave(db, r) {
   if (!db) return;
   await db.run(
-    `INSERT INTO projects (id,prompt,name,bdd_tests,agents_plan,tech_stack,prototype_path,reviewer_verdict,reviewer_notes,status,updated_at)
-     VALUES (?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP)
+    `INSERT INTO projects (id,prompt,name,bdd_tests,agents_plan,tech_stack,prototype_path,reviewer_verdict,reviewer_notes,status,created_at,updated_at)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
      ON CONFLICT(id) DO UPDATE SET bdd_tests=excluded.bdd_tests,agents_plan=excluded.agents_plan,
      tech_stack=excluded.tech_stack,prototype_path=excluded.prototype_path,
      reviewer_verdict=excluded.reviewer_verdict,reviewer_notes=excluded.reviewer_notes,
-     status=excluded.status,updated_at=CURRENT_TIMESTAMP`,
+     status=excluded.status,updated_at=excluded.updated_at`,
     r.id, r.prompt, r.name||null, r.bdd_tests||null, r.agents_plan||null,
     r.tech_stack||null, r.prototype_path||null, r.reviewer_verdict||'pending',
-    r.reviewer_notes||null, r.status||'planning'
+    r.reviewer_notes||null, r.status||'planning', new Date().toISOString(), new Date().toISOString()
   );
 }
 
@@ -116,6 +100,7 @@ Output raw Gherkin only (Feature/Scenario/Given/When/Then/And). No markdown fenc
 async function phase1(id, prompt) {
   logger.info('[creator.agent] Phase 1: BDD tests', { id });
   const gherkin = await callLLM(P1_SYS, 'Write BDD acceptance tests for:\n\n' + prompt);
+  if (!gherkin || gherkin.trim().length < 20) throw new Error('Phase 1: empty BDD response (len=' + (gherkin || '').length + ')');
   writeFile(id, 'tests/acceptance.feature', gherkin.trim());
   return gherkin.trim();
 }
@@ -136,38 +121,100 @@ For each agent:
 - role: what it does in this project
 - capabilities: bullet list
 - auth: how it authenticates
+## Skill Interface
+This section is REQUIRED. It defines the machine-readable interface for the generated skill.
+- skill_name: kebab-case name (e.g. gmail-daily-summary)
+- trigger: comma-separated natural language phrases that invoke this skill
+- inputs: YAML-style key: type pairs for runtime args (e.g. phone_number: string, timezone: string)
+- outputs: YAML-style key: type pairs returned after execution (e.g. sms_sent: boolean, message_count: integer)
+- secrets: EXHAUSTIVE list of every environment variable the skill needs at runtime — include ALL of: OAuth client IDs, client secrets, redirect URIs, refresh tokens, API keys, account SIDs, auth tokens, encryption keys, phone numbers, and any other service credential. Do NOT omit any. Example: GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REDIRECT_URI, GOOGLE_REFRESH_TOKEN, TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_PHONE_NUMBER, MY_PHONE_NUMBER, ENCRYPTION_KEY
+- schedule: cron expression if this runs on a schedule, or "on_demand" if triggered manually
+- runtime: node | python | shell
 Output: Markdown only.`;
 
-const P2_AGENTS_SYS = `You are a senior engineer writing deep validate_agent specifications.
-For EACH agent produce a thorough spec. Think like a human reviewer doing a real health check.
+const P2_AGENTS_SYS = `You are a senior engineer designing the agent roster for a software project.
+List every agent needed to deliver the project. For each agent produce a planning spec.
 
-For each agent use this format:
-## <agent-id>
-### validate_agent Spec
-#### 1. Version Check
-- Minimum required version and detection command
-- What to do if version is too old (auto-upgrade or error)
-#### 2. Auth Health
-- How to detect token/session validity without a real API call if possible
-- Token expiry detection, re-auth procedure if expired
-- Silent auth failure patterns to watch for in logs
-#### 3. Capability Smoke Tests
-- One real command per capability to confirm it actually works end-to-end
-- Expected output pattern to verify success
-- What a false-positive success looks like and how to rule it out
-#### 4. Edge Case Probes
-- Rate limit: how to detect it, backoff strategy
-- Empty results: differentiate "no data" vs "broken query"
-- Permission denied: distinguish auth error vs missing scope
-- Network timeout: detect vs hang, retry policy
-- Partial failure: command exits 0 but output indicates error
-#### 5. Log Scan Patterns
-- Regex or string patterns in CLI stdout/stderr or browser console that indicate silent failure
-- Example: "deprecated", "fallback", "retry", HTTP 4xx/5xx in logs
-#### 6. Self-Heal Actions
-- For each failure mode above: what validate_agent DOES (not just reports)
-- Examples: re-auth, update descriptor, patch capability list, escalate to user
+Use EXACTLY this format for each agent — the ## heading MUST be the agent's machine ID (lowercase, dots/hyphens only):
+
+## github.agent
+- type: cli
+- role: what this agent does in the project
+- capabilities:
+  - capability_one
+  - capability_two
+- auth: how it authenticates (e.g. OAuth2, API key via env var, gh auth login)
+- validate_agent:
+  - version_check: command to check CLI/tool version
+  - auth_health: how to verify auth without a live API call
+  - smoke_test: one command to confirm it works end-to-end
+  - self_heal: what to do if auth is expired or tool is missing
+
+Use real agent IDs that match the service: github.agent, gmail.agent, slack.agent, browser.agent, etc.
+Output: Markdown only. No prose before or after the agent sections.`;
+
+// Validate.agent spec system prompt — one per agent, focused on that agent only
+const VALIDATE_AGENT_SYS = `You are a senior reliability engineer writing a validate.agent specification.
+A validate.agent is paired 1:1 with a specific agent. It is the reviewer for that agent — it runs checks,
+detects failures, applies self-healing actions, and reports back. Think of it as the reviewer.agent
+relationship but scoped entirely to one agent's health and capabilities.
+
+You will receive: the agent's ID, type (cli|browser), role, capabilities, and auth method.
+
+Write a complete validate.agent spec in Markdown covering:
+
+## Identity
+- agent_id: <id>
+- validates: <agent being validated>
+- type: cli | browser
+- trigger: on_use | scheduled | on_failure
+
+## 1. Pre-flight Checks
+- Tool/binary existence check (exact command)
+- Version check (minimum required, detection command, auto-upgrade action if stale)
+- Auth validity check (no real API call if possible — check token file, env var, or dry-run command)
+
+## 2. Capability Smoke Tests
+For EACH capability listed:
+- Command or action to run
+- Expected output pattern (regex or string)
+- How to distinguish real success from false-positive
+
+## 3. Failure Detection
+For each of these failure modes, exact detection method + self-heal action:
+- Auth expired / token revoked
+- Rate limited
+- Missing scope / permission denied
+- CLI version too old / selector changed
+- Network timeout or unreachable
+- Silent failure (exit 0 but broken output)
+
+## 4. Self-Heal Runbook
+Ordered steps validate.agent takes before escalating to the user:
+1. Detect failure mode
+2. Attempt auto-fix (re-auth, update descriptor, retry with backoff)
+3. If still failing: patch the agent descriptor in DuckDB with updated instructions
+4. Escalate to user only if auto-fix exhausted
+
+## 5. Log Scan Patterns
+Regex patterns in stdout/stderr/browser console that signal silent failure.
+
+## 6. Health Report Schema
+JSON schema for what validate.agent writes back to DuckDB after each run:
+{ status, last_checked, capabilities_ok, failures, self_healed, escalation_needed }
+
 Output: Markdown only.`;
+
+async function generateValidateAgentSpec(agentId, agentSection, prompt) {
+  const userCtx = [
+    'Agent ID: ' + agentId,
+    'Project context: ' + prompt.slice(0, 400),
+    '',
+    'Agent spec from agents.md:',
+    agentSection.slice(0, 2000),
+  ].join('\n');
+  return callLLM(VALIDATE_AGENT_SYS, userCtx, 90000);
+}
 
 async function phase2(id, prompt, bddTests) {
   logger.info('[creator.agent] Phase 2: agent plan', { id });
@@ -176,64 +223,130 @@ async function phase2(id, prompt, bddTests) {
     callLLM(P2_PLAN_SYS, ctx, 120000),
     callLLM(P2_AGENTS_SYS, ctx, 120000),
   ]);
-  writeFile(id, 'plan.md', planMd.trim());
+  if (!planMd || planMd.trim().length < 20) throw new Error('Phase 2: empty plan.md response (len=' + (planMd || '').length + ')');
+  if (!agentsMd || agentsMd.trim().length < 20) throw new Error('Phase 2: empty agents.md response (len=' + (agentsMd || '').length + ')');
+
+  // Ensure ## Skill Interface is present — if the LLM omitted it, generate it now with a
+  // dedicated focused call before writing plan.md. This is creator.agent's responsibility.
+  let finalPlanMd = planMd.trim();
+  if (!finalPlanMd.includes('## Skill Interface')) {
+    logger.warn('[creator.agent] Phase 2: plan.md missing ## Skill Interface — generating dedicated section', { id });
+    const siSys = `You are a solution architect. Given a project plan and description, output ONLY the "## Skill Interface" markdown section with exactly these fields and no other text:
+
+## Skill Interface
+- skill_name: kebab-case name (e.g. gmail-daily-summary)
+- trigger: comma-separated natural language phrases that invoke this skill
+- inputs: YAML-style key: type pairs for runtime args
+- outputs: YAML-style key: type pairs
+- secrets: comma-separated list of ALL environment variable names needed (OAuth tokens, API keys, account SIDs, phone numbers, etc.)
+- schedule: cron expression or "on_demand"
+- runtime: node`;
+    const siPrompt = 'Project description: ' + prompt + '\n\nProject plan:\n' + finalPlanMd.slice(0, 2000);
+    try {
+      const siRaw = await callLLM(siSys, siPrompt, 60000);
+      const siClean = siRaw.trim().replace(/^```[a-z]*\n?/i, '').replace(/\n?```\s*$/i, '').trim();
+      if (siClean.includes('skill_name')) {
+        finalPlanMd = finalPlanMd + '\n\n' + siClean;
+        logger.info('[creator.agent] Phase 2: ## Skill Interface appended to plan.md', { id });
+      }
+    } catch (e) {
+      logger.warn('[creator.agent] Phase 2: ## Skill Interface generation failed', { id, error: e.message });
+    }
+  }
+
+  writeFile(id, 'plan.md', finalPlanMd);
   writeFile(id, 'agents.md', agentsMd.trim());
   const agentIds = (agentsMd.match(/^## ([a-zA-Z0-9._-]+)/gm) || []).map(m => m.replace('## ', '').trim());
-  const techSection = (planMd.match(/## Tech Stack\n([\s\S]*?)(?=\n##|$)/) || [])[1] || '';
+  const techSection = (finalPlanMd.match(/## Tech Stack\n([\s\S]*?)(?=\n##|$)/) || [])[1] || '';
+
+  // Generate a paired validate.agent spec for every agent planned in agents.md
+  // Each spec is written to agents/<agentId>.validate.md alongside the project
+  if (agentIds.length > 0) {
+    logger.info('[creator.agent] Phase 2: generating validate.agent specs', { id, agentIds });
+    // Extract each agent's section from agents.md for focused spec generation
+    const agentSections = {};
+    for (const aid of agentIds) {
+      const match = agentsMd.match(new RegExp('## ' + aid.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '[\\s\\S]*?(?=\\n## |$)'));
+      agentSections[aid] = match ? match[0] : '## ' + aid + '\n(no spec found)';
+    }
+    // Generate all validate.agent specs in parallel
+    const specs = await Promise.all(
+      agentIds.map(aid => generateValidateAgentSpec(aid, agentSections[aid], prompt)
+        .catch(e => '# validate.agent spec generation failed\nError: ' + e.message))
+    );
+    for (let i = 0; i < agentIds.length; i++) {
+      writeFile(id, path.join('agents', agentIds[i] + '.validate.md'), specs[i].trim());
+      logger.info('[creator.agent] Phase 2: validate.agent spec written', { id, agent: agentIds[i] });
+    }
+  }
+
   logger.info('[creator.agent] Phase 2 done', { id, agentIds });
-  return { planMd: planMd.trim(), agentsMd: agentsMd.trim(), agentIds, techStack: techSection.trim() };
+  return { planMd: finalPlanMd, agentsMd: agentsMd.trim(), agentIds, techStack: techSection.trim() };
 }
 
-// ── Phase 3: Runnable prototype ───────────────────────────────────────────────
-const P3_SYS = `You are a senior developer building a runnable prototype.
+// ── Phase 3: Runnable prototype (one file per LLM call to avoid truncation) ───
+// Each call generates a single file — small output, no truncation risk.
 
-Rules:
-- Use REAL npm packages wherever they work without hitting the network (fs, path, lodash, date-fns, chalk, etc.)
-- ONLY mock: HTTP calls, OAuth flows, API endpoints, anything needing credentials
-- Mocks go in __mocks__/ as named exports matching the real module interface exactly
-- prototype/index.js must be a complete, runnable entry point
-- package.json must have a "start" script and all deps listed
-- run.sh: #!/usr/bin/env bash\nset -e\nnpm install\nnpm start
-- tests/ must have one unit test file per BDD scenario using jest or node:test
-- This is as close to production as possible — not a throwaway
-
-Output a single JSON object:
-{
-  "files": [
-    { "path": "index.js", "content": "..." },
-    { "path": "package.json", "content": "..." },
-    { "path": "run.sh", "content": "..." },
-    { "path": "__mocks__/api.js", "content": "..." },
-    { "path": "tests/acceptance.test.js", "content": "..." }
-  ]
+function makeFileCtx(prompt, planMd, bddTests) {
+  return [
+    'Project: ' + prompt,
+    '\nTech stack and API surface (from plan.md):\n' + planMd.slice(0, 1200),
+    '\nBDD tests:\n' + bddTests.slice(0, 600),
+  ].join('\n');
 }
-Paths are relative to prototype/. Output valid JSON only. No markdown fences, no explanation.`;
+
+function stripFences(content) {
+  // Remove ```lang ... ``` or ``` ... ``` wrappers that LLM adds despite instructions
+  return content.replace(/^```[a-z]*\n?/i, '').replace(/\n?```\s*$/i, '').trim();
+}
+
+async function genFile(filePath, instruction, ctx) {
+  const sys = `You are a senior developer. Output ONLY the raw file content for "${filePath}". No markdown fences, no explanation, no JSON wrapper — just the file content itself.`;
+  const raw = await callLLM(sys, instruction + '\n\n' + ctx, 90000);
+  return stripFences(raw);
+}
 
 async function phase3(id, prompt, bddTests, planMd, agentsMd) {
   logger.info('[creator.agent] Phase 3: prototype scaffold', { id });
-  const ctx = [
-    'Project:\n' + prompt,
-    '\nBDD tests:\n' + bddTests,
-    '\nPlan:\n' + planMd,
-    '\nAgents:\n' + agentsMd,
-  ].join('\n');
-  const raw = await callLLM(P3_SYS, ctx, 180000);
-  let files = [];
+  const ctx = makeFileCtx(prompt, planMd, bddTests);
+  const written = [];
+
+  // package.json first — index.js imports depend on knowing the deps
   try {
-    const cleaned = raw.replace(/^```[a-z]*\n?/gm, '').replace(/^```\s*$/gm, '').trim();
-    files = JSON.parse(cleaned).files || [];
-  } catch (e) {
-    logger.warn('[creator.agent] Phase 3 JSON parse failed', { error: e.message });
-    writeFile(id, 'prototype/index.js', '// creator.agent parse error: ' + e.message + '\n\n' + raw);
-    return { ok: false, error: 'JSON parse failed: ' + e.message, protoDir: path.join(projectDir(id), 'prototype') };
-  }
-  for (const f of files) {
-    if (f.path && f.content != null) writeFile(id, path.join('prototype', f.path), f.content);
-  }
-  const runSh = path.join(projectDir(id), 'prototype', 'run.sh');
-  if (fs.existsSync(runSh)) { try { fs.chmodSync(runSh, 0o755); } catch (_) {} }
-  logger.info('[creator.agent] Phase 3 done', { id, fileCount: files.length });
-  return { ok: true, files: files.map(f => f.path), protoDir: path.join(projectDir(id), 'prototype') };
+    const pkgContent = await genFile('package.json',
+      'Write a complete package.json with: name, version, description, "start" script (node index.js), all required npm dependencies pinned to exact versions, and devDependencies including jest.',
+      ctx);
+    writeFile(id, 'prototype/package.json', pkgContent.trim());
+    written.push('package.json');
+  } catch (e) { logger.warn('[creator.agent] Phase 3 package.json failed', { error: e.message }); }
+
+  // index.js — the main entry point
+  try {
+    const indexContent = await genFile('index.js',
+      'Write a complete, runnable index.js entry point. Mock all HTTP calls and OAuth flows using inline stubs or __mocks__/. Use process.env for credentials. Must run without hitting the network.',
+      ctx);
+    writeFile(id, 'prototype/index.js', indexContent.trim());
+    written.push('index.js');
+  } catch (e) { logger.warn('[creator.agent] Phase 3 index.js failed', { error: e.message }); }
+
+  // run.sh
+  try {
+    writeFile(id, 'prototype/run.sh', '#!/usr/bin/env bash\nset -e\nnpm install\nnpm start\n');
+    fs.chmodSync(path.join(projectDir(id), 'prototype', 'run.sh'), 0o755);
+    written.push('run.sh');
+  } catch (_) {}
+
+  // tests/acceptance.test.js
+  try {
+    const testContent = await genFile('tests/acceptance.test.js',
+      'Write unit tests using jest (describe/it/expect) that cover each BDD scenario. Mock all external calls. Each test must be independently runnable.',
+      ctx);
+    writeFile(id, 'prototype/tests/acceptance.test.js', testContent.trim());
+    written.push('tests/acceptance.test.js');
+  } catch (e) { logger.warn('[creator.agent] Phase 3 test file failed', { error: e.message }); }
+
+  logger.info('[creator.agent] Phase 3 done', { id, fileCount: written.length, written });
+  return { ok: written.length > 0, files: written, protoDir: path.join(projectDir(id), 'prototype') };
 }
 
 // ── action: create_project ────────────────────────────────────────────────────
@@ -365,8 +478,8 @@ async function actionValidateProject({ id } = {}) {
       const verdict = result?.data?.verdict || result?.verdict || 'pass';
       const notes   = result?.data?.notes   || result?.notes   || '';
       if (db) {
-        await db.run('UPDATE projects SET reviewer_verdict=?, reviewer_notes=?, status=?, updated_at=CURRENT_TIMESTAMP WHERE id=?',
-          verdict, notes, verdict === 'pass' ? 'ready' : 'review', id);
+        await db.run('UPDATE projects SET reviewer_verdict=?, reviewer_notes=?, status=?, updated_at=? WHERE id=?',
+          verdict, notes, verdict === 'pass' ? 'ready' : 'review', new Date().toISOString(), id);
       }
       return { ok: true, id, verdict, notes };
     }
@@ -398,11 +511,127 @@ async function actionValidateProject({ id } = {}) {
   const notes     = issues.map(i => '[' + i.severity + '] ' + i.msg).join('\n');
 
   if (db) {
-    await db.run('UPDATE projects SET reviewer_verdict=?, reviewer_notes=?, status=?, updated_at=CURRENT_TIMESTAMP WHERE id=?',
-      verdict, notes, verdict === 'pass' || verdict === 'pass-with-warnings' ? 'ready' : 'review', id);
+    await db.run('UPDATE projects SET reviewer_verdict=?, reviewer_notes=?, status=?, updated_at=? WHERE id=?',
+      verdict, notes, verdict === 'pass' || verdict === 'pass-with-warnings' ? 'ready' : 'review', new Date().toISOString(), id);
   }
 
   return { ok: true, id, verdict, issues, notes };
+}
+
+// ── action: patch_project — applies reviewer feedback iteratively ─────────────
+// Called by creatorPlanning node after a reviewer 'fail' or 'pass-with-warnings'
+// with concrete blockers/patches. Fixes each affected file via a targeted LLM call.
+async function actionPatchProject({ id, reviewVerdict, blockers = [], warnings = [], patches = [], dimensions = {}, summary = '' } = {}) {
+  if (!id) return { ok: false, error: 'id is required' };
+  const db = await getDb();
+  const dir = projectDir(id);
+  if (!fs.existsSync(dir)) return { ok: false, error: 'Project dir not found: ' + dir };
+
+  logger.info('[creator.agent] patch_project start', { id, blockers: blockers.length, patches: patches.length });
+
+  // Build a concise feedback brief for the LLM
+  const feedbackBrief = [
+    'Reviewer verdict: ' + reviewVerdict,
+    summary ? 'Summary: ' + summary : '',
+    blockers.length  ? 'BLOCKERS (must fix):\n' + blockers.map(b => '- ' + b).join('\n') : '',
+    warnings.length  ? 'WARNINGS (should fix):\n' + warnings.map(w => '- ' + w).join('\n') : '',
+    patches.length   ? 'SUGGESTED PATCHES:\n' + patches.map(p => '- ' + p).join('\n') : '',
+    dimensions?.security?.findings?.length    ? 'Security issues:\n' + dimensions.security.findings.map(f => '- ' + f).join('\n') : '',
+    dimensions?.technicalSoundness?.findings?.length ? 'Technical issues:\n' + dimensions.technicalSoundness.findings.map(f => '- ' + f).join('\n') : '',
+    dimensions?.completeness?.findings?.length ? 'Completeness gaps:\n' + dimensions.completeness.findings.map(f => '- ' + f).join('\n') : '',
+  ].filter(Boolean).join('\n\n');
+
+  // Determine which files need patching based on feedback content
+  const filesToPatch = [];
+  const lower = (feedbackBrief + ' ' + patches.join(' ')).toLowerCase();
+
+  if (lower.includes('index.js') || lower.includes('technical') || lower.includes('runtime') || lower.includes('bug') || lower.includes('loop') || lower.includes('await') || lower.includes('import') || lower.includes('prototype')) {
+    filesToPatch.push('prototype/index.js');
+  }
+  if (lower.includes('package.json') || lower.includes('dep') || lower.includes('script') || lower.includes('version')) {
+    filesToPatch.push('prototype/package.json');
+  }
+  if (lower.includes('plan.md') || lower.includes('completeness') || lower.includes('api surface') || lower.includes('risk') || lower.includes('missing section') || lower.includes('agent coverage')) {
+    filesToPatch.push('plan.md');
+  }
+  if (lower.includes('agents.md') || lower.includes('agent coverage') || lower.includes('validate_agent') || lower.includes('agent spec')) {
+    filesToPatch.push('agents.md');
+  }
+  if (lower.includes('acceptance') || lower.includes('bdd') || lower.includes('scenario') || lower.includes('test')) {
+    filesToPatch.push('tests/acceptance.feature');
+  }
+  if (lower.includes('run.sh') || lower.includes('usability') || lower.includes('runnable')) {
+    filesToPatch.push('prototype/run.sh');
+  }
+  // Always patch at least index.js + package.json if there are blockers
+  if (blockers.length > 0) {
+    if (!filesToPatch.includes('prototype/index.js'))   filesToPatch.push('prototype/index.js');
+    if (!filesToPatch.includes('prototype/package.json')) filesToPatch.push('prototype/package.json');
+  }
+
+  const patchedFiles = [];
+  for (const rel of filesToPatch) {
+    const fullPath = path.join(dir, rel);
+    const existing = fs.existsSync(fullPath) ? fs.readFileSync(fullPath, 'utf8') : '(file did not exist — create it from scratch)';
+    const sys = `You are a senior developer applying code review feedback. You will receive:
+1. The current file content
+2. Reviewer feedback (blockers, warnings, patches)
+
+Apply ALL the reviewer feedback that is relevant to this file. Output ONLY the complete corrected file content.
+No markdown fences, no explanation, no JSON wrapper — just the corrected file content.
+Preserve everything that is already correct. Only fix what the reviewer flagged.
+CRITICAL: If the file is plan.md, you MUST preserve the ## Skill Interface section EXACTLY as-is. Never remove or modify it.`;
+    const prompt = [
+      'File: ' + rel,
+      '',
+      '--- CURRENT CONTENT ---',
+      existing.slice(0, 3000),
+      existing.length > 3000 ? '...(truncated, fix the issues you can see)' : '',
+      '',
+      '--- REVIEWER FEEDBACK ---',
+      feedbackBrief,
+    ].join('\n');
+
+    // For plan.md: snapshot the ## Skill Interface block before patching so we can
+    // restore it if the LLM accidentally drops it (a common regression during patching).
+    let skillInterfaceBlock = null;
+    if (rel === 'plan.md') {
+      // Greedy match to EOF — lazy quantifier misses when section is last in file
+      const siMatch = existing.match(/## Skill Interface[\s\S]*/);
+      if (siMatch && existing.includes('skill_name')) skillInterfaceBlock = siMatch[0].trimEnd();
+    }
+
+    try {
+      logger.info('[creator.agent] patch_project patching file', { id, file: rel });
+      const patched = await callLLM(sys, prompt, 90000);
+      let patchedClean = stripFences(patched || '');
+      if (patchedClean.length > 10) {
+        // Always strip any ## Skill Interface block the LLM wrote and re-append the
+        // snapshotted original — this is the only way to guarantee it is never corrupted.
+        if (rel === 'plan.md' && skillInterfaceBlock) {
+          const stripped = patchedClean.replace(/\n## Skill Interface[\s\S]*$/, '').trimEnd();
+          patchedClean = stripped + '\n\n' + skillInterfaceBlock;
+          logger.info('[creator.agent] patch_project: ## Skill Interface enforced from snapshot', { id });
+        }
+        writeFile(id, rel, patchedClean);
+        patchedFiles.push(rel);
+        logger.info('[creator.agent] patch_project file patched', { id, file: rel });
+      }
+    } catch (e) {
+      logger.warn('[creator.agent] patch_project file patch failed', { id, file: rel, error: e.message });
+    }
+  }
+
+  // Update DB record
+  if (db) {
+    await db.run(
+      'UPDATE projects SET status=?, reviewer_verdict=?, updated_at=? WHERE id=?',
+      'review', 'pending', new Date().toISOString(), id
+    ).catch(() => {});
+  }
+
+  logger.info('[creator.agent] patch_project done', { id, patchedFiles });
+  return { ok: true, id, patchedFiles, feedbackApplied: feedbackBrief.slice(0, 300) };
 }
 
 // ── Main dispatcher ───────────────────────────────────────────────────────────
@@ -411,12 +640,13 @@ async function creatorAgent(args) {
   logger.info('[creator.agent] invoked', { action });
   switch (action) {
     case 'create_project':   return actionCreateProject(args);
+    case 'patch_project':    return actionPatchProject(args);
     case 'run_prototype':    return actionRunPrototype(args);
     case 'query_project':    return actionQueryProject(args);
     case 'list_projects':    return actionListProjects();
     case 'validate_project': return actionValidateProject(args);
     default:
-      return { ok: false, error: 'Unknown action: "' + action + '". Valid: create_project | run_prototype | query_project | list_projects | validate_project' };
+      return { ok: false, error: 'Unknown action: "' + action + '". Valid: create_project | patch_project | run_prototype | query_project | list_projects | validate_project' };
   }
 }
 

@@ -29,6 +29,7 @@ const { cliAgent } = require('./skills/cli.agent.cjs');
 const { browserAgent } = require('./skills/browser.agent.cjs');
 const creatorAgent = require('./skills/creator.agent.cjs');
 const reviewerAgent = require('./skills/reviewer.agent.cjs');
+const skillCreator = require('./skills/skillCreator.skill.cjs');
 const { screenCapture } = require('./skills/screen.capture.cjs');
 
 class CommandServiceMCPServer {
@@ -115,6 +116,9 @@ class CommandServiceMCPServer {
 
       case 'reviewer.agent':
         return await this._skillReviewerAgent(args);
+
+      case 'skillCreator.skill':
+        return await this._skillCreator(args);
 
       default:
         return {
@@ -204,6 +208,10 @@ class CommandServiceMCPServer {
     return await reviewerAgent(args);
   }
 
+  async _skillCreator(args) {
+    return await skillCreator(args);
+  }
+
   // ---------------------------------------------------------------------------
   // Health
   // ---------------------------------------------------------------------------
@@ -223,6 +231,10 @@ class CommandServiceMCPServer {
 
   async start() {
     logger.info('Starting Command Service MCP server (stdio)');
+
+    // ── Warm up creator.agent DB (ensures projects table exists) ────────────
+    creatorAgent({ action: 'list_projects' }).catch(() => {});
+    reviewerAgent({ action: 'status', projectId: '__warmup__' }).catch(() => {});
 
     // ── Minimal HTTP health server ───────────────────────────────────────────
     // Keeps the Node.js event loop alive (no active I/O = process exits) and
