@@ -155,6 +155,9 @@ const ALLOWED_COMMANDS = new Set([
   'cursor',    // Cursor CLI
   'subl',      // Sublime Text CLI
 
+  // ── Browser automation ────────────────────────────────────────────────────
+  'playwright-cli',  // brew install playwright-cli — headed browser sessions
+
   // ── macOS-specific ─────────────────────────────────────────────────────────
   'open',          // open apps, files, URLs
   'osascript',     // AppleScript — app control, UI scripting

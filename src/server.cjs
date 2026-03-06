@@ -31,6 +31,7 @@ const creatorAgent = require('./skills/creator.agent.cjs');
 const reviewerAgent = require('./skills/reviewer.agent.cjs');
 const skillCreator = require('./skills/skillCreator.skill.cjs');
 const { screenCapture } = require('./skills/screen.capture.cjs');
+const skillScheduler = require('./skill-scheduler.cjs');
 
 class CommandServiceMCPServer {
   constructor() {
@@ -236,6 +237,11 @@ class CommandServiceMCPServer {
     creatorAgent({ action: 'list_projects' }).catch(() => {});
     reviewerAgent({ action: 'status', projectId: '__warmup__' }).catch(() => {});
 
+    // ── Start skill scheduler daemon ─────────────────────────────────────────
+    // Reads installed skills from user-memory MCP, registers node-cron jobs
+    // for any skill with a schedule ≠ on_demand. Re-syncs every 5 min.
+    skillScheduler.start().catch(err => logger.warn('[Server] Skill scheduler start failed', { error: err.message }));
+
     // ── Minimal HTTP health server ───────────────────────────────────────────
     // Keeps the Node.js event loop alive (no active I/O = process exits) and
     // satisfies the service manager's health check at http://localhost:3007/health
@@ -250,6 +256,60 @@ class CommandServiceMCPServer {
           service: this.serviceName,
           skills: ['shell.run', 'browser.act', 'ui.axClick', 'ui.findAndClick', 'ui.moveMouse', 'ui.click', 'ui.typeText', 'ui.waitFor', 'ui.screen.verify', 'image.analyze', 'fs.read', 'file.watch', 'file.bridge', 'external.skill', 'cli.agent', 'browser.agent', 'screen.capture']
         }));
+        return;
+      }
+
+      // ── POST /skill.schedule — register/refresh a skill's cron immediately ──
+      // Called by skillCreator after writing a new scheduled skill.
+      if (req.method === 'POST' && req.url === '/skill.schedule') {
+        let body = '';
+        req.on('data', chunk => { body += chunk; });
+        req.on('end', async () => {
+          try {
+            const { skillName, schedule, execPath } = JSON.parse(body || '{}');
+            await skillScheduler.registerSkill(skillName, schedule, execPath);
+            res.writeHead(200);
+            res.end(JSON.stringify({ ok: true }));
+          } catch (err) {
+            res.writeHead(400);
+            res.end(JSON.stringify({ error: err.message }));
+          }
+        });
+        return;
+      }
+
+      // ── GET /skill.schedule/list — list active cron jobs ─────────────────────
+      if (req.method === 'GET' && req.url === '/skill.schedule/list') {
+        res.writeHead(200);
+        res.end(JSON.stringify({ ok: true, jobs: skillScheduler.listJobs() }));
+        return;
+      }
+
+      // ── POST /skill.schedule/sync — force immediate re-sync from user-memory ──
+      if (req.method === 'POST' && req.url === '/skill.schedule/sync') {
+        skillScheduler.sync().catch(() => {});
+        res.writeHead(200);
+        res.end(JSON.stringify({ ok: true }));
+        return;
+      }
+
+      // ── POST /skill.schedule/toggle — pause or resume a skill's cron job ─────
+      if (req.method === 'POST' && req.url === '/skill.schedule/toggle') {
+        let body = '';
+        req.on('data', chunk => { body += chunk; });
+        req.on('end', () => {
+          try {
+            const { skillName, action } = JSON.parse(body || '{}');
+            if (skillName && (action === 'pause' || action === 'resume')) {
+              skillScheduler.toggleSkill(skillName, action);
+            }
+            res.writeHead(200);
+            res.end(JSON.stringify({ ok: true }));
+          } catch (err) {
+            res.writeHead(400);
+            res.end(JSON.stringify({ error: err.message }));
+          }
+        });
         return;
       }
 
@@ -292,8 +352,38 @@ class CommandServiceMCPServer {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Ensure playwright-cli is installed (brew install playwright-cli)
+// Runs async at startup — does not block the server from starting.
+// ---------------------------------------------------------------------------
+function ensurePlaywrightCli() {
+  const { execFile } = require('child_process');
+  const fs = require('fs');
+
+  const CLI_CANDIDATES = [
+    '/opt/homebrew/bin/playwright-cli',
+    '/usr/local/bin/playwright-cli',
+  ];
+
+  const found = CLI_CANDIDATES.some(c => { try { fs.accessSync(c, fs.constants.X_OK); return true; } catch (_) { return false; } });
+  if (found) {
+    logger.info('[startup] playwright-cli already installed ✓');
+    return;
+  }
+
+  logger.info('[startup] playwright-cli not found — installing via brew...');
+  execFile('brew', ['install', 'playwright-cli'], { timeout: 120000 }, (err, stdout, stderr) => {
+    if (err) {
+      logger.warn('[startup] brew install playwright-cli failed — browser.act will degrade gracefully', { error: err.message });
+    } else {
+      logger.info('[startup] playwright-cli installed ✓');
+    }
+  });
+}
+
 // Start server if run directly
 if (require.main === module) {
+  ensurePlaywrightCli();
   const server = new CommandServiceMCPServer();
   server.start().catch((error) => {
     logger.error('Failed to start server', { error: error.message });

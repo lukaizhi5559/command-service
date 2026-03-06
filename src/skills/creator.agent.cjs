@@ -127,9 +127,32 @@ This section is REQUIRED. It defines the machine-readable interface for the gene
 - trigger: comma-separated natural language phrases that invoke this skill
 - inputs: YAML-style key: type pairs for runtime args (e.g. phone_number: string, timezone: string)
 - outputs: YAML-style key: type pairs returned after execution (e.g. sms_sent: boolean, message_count: integer)
-- secrets: EXHAUSTIVE list of every environment variable the skill needs at runtime — include ALL of: OAuth client IDs, client secrets, redirect URIs, refresh tokens, API keys, account SIDs, auth tokens, encryption keys, phone numbers, and any other service credential. Do NOT omit any. Example: GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REDIRECT_URI, GOOGLE_REFRESH_TOKEN, TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_PHONE_NUMBER, MY_PHONE_NUMBER, ENCRYPTION_KEY
-- schedule: cron expression if this runs on a schedule, or "on_demand" if triggered manually
+- secrets: EXHAUSTIVE list of every environment variable the skill needs at runtime — include ALL of: OAuth client IDs, client secrets, redirect URIs, refresh tokens, API keys, account SIDs, auth tokens, encryption keys, phone numbers, service usernames/account logins, and any other service credential. Do NOT omit any. IMPORTANT: Many REST APIs require BOTH a username AND an API key for Basic auth — list BOTH as separate secrets. Example: GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REDIRECT_URI, GOOGLE_REFRESH_TOKEN, TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_PHONE_NUMBER, MY_PHONE_NUMBER, ENCRYPTION_KEY, CLICKSEND_USERNAME, CLICKSEND_API_KEY
+- schedule: cron expression OR special pattern (see SCHEDULE RULES below) if this runs on a schedule, or "on_demand" if triggered manually
 - runtime: node | python | shell
+
+SCHEDULE RULES — CRITICAL. The schedule field must contain one of:
+1. A standard 5-part cron expression: "MIN HOUR DOM MON DOW"
+   - "daily at 9pm"          → "0 21 * * *"
+   - "every day at 8am"      → "0 8 * * *"
+   - "every hour"            → "0 * * * *"
+   - "weekdays at 6pm"       → "0 18 * * 1-5"
+   - "every 30 minutes"      → "*/30 * * * *"
+2. A RANDOM_WINDOW pattern for randomized or spread-out firing:
+   Format: RANDOM_WINDOW(count=N,start=HH:MM,end=HH:MM,min_gap_minutes=M,days=DOW)
+   - "3 times a day randomly between 8am-5pm, at least 30min apart on weekdays"
+     → RANDOM_WINDOW(count=3,start=08:00,end=17:00,min_gap_minutes=30,days=1-5)
+   - "twice daily between 9am and 6pm with 2 hours between each"
+     → RANDOM_WINDOW(count=2,start=09:00,end=18:00,min_gap_minutes=120,days=*)
+3. "on_demand" — skill is only triggered manually, never on a schedule
+
+NEVER use vague strings like "daily", "nightly", "every day". Always convert to an exact cron or RANDOM_WINDOW.
+
+DEPENDENCY RULES — CRITICAL. The plan MUST follow these or it will be rejected:
+- NEVER invent CLI tools that don't exist on npm or homebrew as real, published packages. Every CLI or npm package listed in Tech Stack must be a real, publicly available package.
+- Known fake/non-existent CLIs that must NEVER appear: gmail-cli, imessage-cli, messages-cli, apple-messages, mail-cli, outlook-cli.
+- All phone numbers, recipient addresses, and other service credentials are secrets stored in keytar — list them in the secrets field (e.g. CLICKSEND_TO_PHONE, TWILIO_TO_NUMBER), never as hardcoded values or runtime args.
+- REST APIs using HTTP Basic Auth require BOTH parts: the account username AND the API key/password. Both are secrets. For ClickSend: CLICKSEND_USERNAME (the account email/login) + CLICKSEND_API_KEY. For any Basic Auth API, always declare both separately in secrets.
 Output: Markdown only.`;
 
 const P2_AGENTS_SYS = `You are a senior engineer designing the agent roster for a software project.
@@ -151,6 +174,11 @@ Use EXACTLY this format for each agent — the ## heading MUST be the agent's ma
   - self_heal: what to do if auth is expired or tool is missing
 
 Use real agent IDs that match the service: github.agent, gmail.agent, slack.agent, browser.agent, etc.
+
+AGENT RULES — CRITICAL. These are hard constraints, not suggestions:
+- NEVER create agents that use fake or non-existent CLI tools. Every CLI in validate_agent commands must be a real, published tool.
+- Known fake CLIs that must NEVER appear in any agent spec: gmail-cli, imessage-cli, messages-cli, apple-messages, mail-cli, outlook-cli.
+- Real CLI agents that DO exist: gh (GitHub), aws, gcloud, stripe, heroku, fly, railway, vercel, netlify, npm, yarn, twilio (Twilio CLI).
 Output: Markdown only. No prose before or after the agent sections.`;
 
 // Validate.agent spec system prompt — one per agent, focused on that agent only
@@ -216,9 +244,83 @@ async function generateValidateAgentSpec(agentId, agentSection, prompt) {
   return callLLM(VALIDATE_AGENT_SYS, userCtx, 90000);
 }
 
+// ── Detect service names from a free-text project description ──────────────────
+const PROMPT_SERVICE_DETECTORS = [
+  { pattern: /clicksend/i,                       service: 'clicksend' },
+  { pattern: /twilio/i,                          service: 'twilio' },
+  { pattern: /stripe/i,                          service: 'stripe' },
+  { pattern: /sendgrid/i,                        service: 'sendgrid' },
+  { pattern: /mailgun/i,                         service: 'mailgun' },
+  { pattern: /gmail|google mail|googleapis/i,    service: 'gmail' },
+  { pattern: /github/i,                          service: 'github' },
+  { pattern: /slack/i,                           service: 'slack' },
+  { pattern: /notion/i,                          service: 'notion' },
+  { pattern: /airtable/i,                        service: 'airtable' },
+  { pattern: /hubspot/i,                         service: 'hubspot' },
+  { pattern: /salesforce/i,                      service: 'salesforce' },
+  { pattern: /openai/i,                          service: 'openai' },
+  { pattern: /anthropic/i,                       service: 'anthropic' },
+  { pattern: /dropbox/i,                         service: 'dropbox' },
+  { pattern: /discord/i,                         service: 'discord' },
+  { pattern: /spotify/i,                         service: 'spotify' },
+  { pattern: /zoom/i,                            service: 'zoom' },
+  { pattern: /jira|atlassian/i,                  service: 'atlassian' },
+  { pattern: /aws |amazon web|s3\b|lambda|ec2/i, service: 'aws' },
+  { pattern: /azure/i,                           service: 'azure' },
+  { pattern: /vonage|messagebird/i,              service: 'vonage' },
+  { pattern: /plaid/i,                           service: 'plaid' },
+  { pattern: /shopify/i,                         service: 'shopify' },
+  { pattern: /sms|text message/i,                service: 'clicksend' },
+];
+
+function detectServicesFromPrompt(text) {
+  const found = new Set();
+  for (const { pattern, service } of PROMPT_SERVICE_DETECTORS) {
+    if (pattern.test(text)) found.add(service);
+  }
+  return [...found];
+}
+
+async function fetchApiRulesForPrompt(promptText) {
+  const services = detectServicesFromPrompt(promptText);
+  if (!services.length) return '';
+  try {
+    const http = require('http');
+    const MEM_PORT = parseInt(process.env.MEMORY_SERVICE_PORT || '3001', 10);
+    const MEM_API_KEY = process.env.MCP_USER_MEMORY_API_KEY || process.env.USER_MEMORY_API_KEY || process.env.MCP_API_KEY || '';
+    const body = JSON.stringify({ payload: { services }, requestId: 'creator-agent-' + Date.now() });
+    const raw = await new Promise((resolve) => {
+      const req = http.request({
+        hostname: '127.0.0.1', port: MEM_PORT, path: '/api_rule.search', method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body),
+          ...(MEM_API_KEY ? { 'Authorization': `Bearer ${MEM_API_KEY}` } : {}) },
+        timeout: 5000,
+      }, (res) => { let d = ''; res.on('data', c => { d += c; }); res.on('end', () => resolve(d)); });
+      req.on('error', () => resolve(''));
+      req.on('timeout', () => { req.destroy(); resolve(''); });
+      req.write(body); req.end();
+    });
+    const parsed = raw ? JSON.parse(raw) : null;
+    const results = parsed?.payload?.results || [];
+    if (!results.length) return '';
+    const lines = results.map(r => `- [${r.service}:${r.ruleType}] ${r.ruleText}`);
+    return `\n\nKNOWN API CONSTRAINTS (from api_rules DB — these are hard requirements, not suggestions):\n${lines.join('\n')}`;
+  } catch (_) {
+    return '';
+  }
+}
+
 async function phase2(id, prompt, bddTests) {
   logger.info('[creator.agent] Phase 2: agent plan', { id });
-  const ctx = 'Project:\n' + prompt + '\n\nAcceptance tests:\n' + bddTests;
+
+  // Inject api_rules constraints for detected services into the plan context
+  const apiConstraints = await fetchApiRulesForPrompt(prompt).catch(() => '');
+  const ctx = 'Project:\n' + prompt + (apiConstraints ? apiConstraints : '') + '\n\nAcceptance tests:\n' + bddTests;
+
+  if (apiConstraints) {
+    logger.info('[creator.agent] Phase 2: injecting api_rules constraints into plan prompt', { id });
+  }
+
   const [planMd, agentsMd] = await Promise.all([
     callLLM(P2_PLAN_SYS, ctx, 120000),
     callLLM(P2_AGENTS_SYS, ctx, 120000),
@@ -568,6 +670,13 @@ async function actionPatchProject({ id, reviewVerdict, blockers = [], warnings =
     if (!filesToPatch.includes('prototype/index.js'))   filesToPatch.push('prototype/index.js');
     if (!filesToPatch.includes('prototype/package.json')) filesToPatch.push('prototype/package.json');
   }
+  // Always patch plan.md + agents.md when banned patterns are detected
+  const bannedKeywords = ['gmail-cli', 'imessage-cli', 'imessage', 'osascript', 'applescript', 'messages.app', 'fake cli', 'banned_patterns', 'mail-cli', 'messages-cli'];
+  if (bannedKeywords.some(kw => lower.includes(kw))) {
+    if (!filesToPatch.includes('plan.md'))    filesToPatch.push('plan.md');
+    if (!filesToPatch.includes('agents.md')) filesToPatch.push('agents.md');
+    if (!filesToPatch.includes('prototype/index.js')) filesToPatch.push('prototype/index.js');
+  }
 
   const patchedFiles = [];
   for (const rel of filesToPatch) {
@@ -580,7 +689,11 @@ async function actionPatchProject({ id, reviewVerdict, blockers = [], warnings =
 Apply ALL the reviewer feedback that is relevant to this file. Output ONLY the complete corrected file content.
 No markdown fences, no explanation, no JSON wrapper — just the corrected file content.
 Preserve everything that is already correct. Only fix what the reviewer flagged.
-CRITICAL: If the file is plan.md, you MUST preserve the ## Skill Interface section EXACTLY as-is. Never remove or modify it.`;
+CRITICAL: If the file is plan.md, you MUST preserve the ## Skill Interface section EXACTLY as-is. Never remove or modify it.
+
+DEPENDENCY RULES — these MUST be enforced in every patched file:
+- NEVER invent CLI packages. Known fake CLIs to remove: gmail-cli, imessage-cli, messages-cli, apple-messages, mail-cli, outlook-cli.
+- All phone numbers, recipient addresses, and service credentials must come from context.secrets (stored in keytar), never hardcoded or runtime args.`;
     const prompt = [
       'File: ' + rel,
       '',
@@ -596,9 +709,11 @@ CRITICAL: If the file is plan.md, you MUST preserve the ## Skill Interface secti
     // restore it if the LLM accidentally drops it (a common regression during patching).
     let skillInterfaceBlock = null;
     if (rel === 'plan.md') {
-      // Greedy match to EOF — lazy quantifier misses when section is last in file
+      // Greedy match to EOF — lazy quantifier misses when section is last in file.
+      // Preserve the SI block even if skill_name is absent — skillCreator can derive it.
+      // Only skip preservation if there's NO ## Skill Interface section at all.
       const siMatch = existing.match(/## Skill Interface[\s\S]*/);
-      if (siMatch && existing.includes('skill_name')) skillInterfaceBlock = siMatch[0].trimEnd();
+      if (siMatch) skillInterfaceBlock = siMatch[0].trimEnd();
     }
 
     try {

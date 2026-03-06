@@ -38,3 +38,7 @@ coverage/
 
 # .temp
 .temp
+
+# playwright-cli
+.playwright-cli
+

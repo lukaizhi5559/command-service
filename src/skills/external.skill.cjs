@@ -82,7 +82,49 @@ async function fetchSkillRecordFromUserSkillsDir(name) {
   }
 }
 
-async function runNodeSkill(execPath, args, timeoutMs) {
+// ── Build context object passed as 2nd arg to skill run(args, context) ────────
+// Resolves secrets from keytar using the skill name as namespace.
+// context.secrets keys match the uppercase names declared in contract_md
+// context.oauth is a map of provider → parsed token object (from skills:oauth-connect flow)
+async function buildSkillContext(skillName, secretKeys, oauthProviders) {
+  let keytar = null;
+  try { keytar = require('keytar'); } catch (_) {}
+
+  const secrets = {};
+  if (keytar && secretKeys && secretKeys.length > 0) {
+    await Promise.all(secretKeys.map(async (key) => {
+      try {
+        // Try namespaced key first (skill:<name>:<key>), then bare key as fallback
+        const val = (await keytar.getPassword('thinkdrop', `skill:${skillName}:${key}`)) ||
+                    (await keytar.getPassword('thinkdrop', key));
+        if (val) secrets[key] = val;
+      } catch (_) {}
+    }));
+  }
+
+  // Load OAuth tokens stored by the Skills tab Connect flow
+  // Stored as JSON under key: oauth:<provider>:<skillName>
+  const oauth = {};
+  if (keytar && oauthProviders && oauthProviders.length > 0) {
+    await Promise.all(oauthProviders.map(async (provider) => {
+      try {
+        const raw = await keytar.getPassword('thinkdrop', `oauth:${provider}:${skillName}`);
+        if (raw) {
+          try { oauth[provider] = JSON.parse(raw); } catch(_) { oauth[provider] = { access_token: raw }; }
+        }
+      } catch (_) {}
+    }));
+  }
+
+  return {
+    logger,
+    secrets,
+    oauth,
+    skillName,
+  };
+}
+
+async function runNodeSkill(execPath, args, timeoutMs, context) {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
       reject(new Error(`Node skill timed out after ${timeoutMs}ms`));
@@ -99,7 +141,7 @@ async function runNodeSkill(execPath, args, timeoutMs) {
         return;
       }
 
-      Promise.resolve(skillFn(args || {}))
+      Promise.resolve(skillFn(args || {}, context || { logger, secrets: {} }))
         .then((result) => {
           clearTimeout(timer);
           const output = typeof result === 'string' ? result : JSON.stringify(result, null, 2);
@@ -221,7 +263,7 @@ async function fetchSkillRecord(name, timeoutMs) {
 }
 
 async function run(args) {
-  const { name, args: skillArgs, timeoutMs: rawTimeout } = args || {};
+  const { name, args: skillArgs, timeoutMs: rawTimeout, secretKeys } = args || {};
   const timeoutMs = Math.min(rawTimeout || DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS);
 
   if (!name) {
@@ -267,22 +309,66 @@ async function run(args) {
 
   logger.info(`[external.skill] Running ${execType} skill at: ${resolvedPath}`);
 
+  // Derive secretKeys from contractMd when not supplied by caller (e.g. cron run-now path)
+  let resolvedSecretKeys = secretKeys || [];
+  if (resolvedSecretKeys.length === 0 && skillRecord.contractMd) {
+    const secretsLine = skillRecord.contractMd.match(/^secrets:\s*(.+)$/m);
+    if (secretsLine && secretsLine[1].trim()) {
+      resolvedSecretKeys = secretsLine[1].split(',').map(s => s.trim()).filter(Boolean);
+      logger.info(`[external.skill] Resolved secretKeys from contractMd: ${resolvedSecretKeys.join(', ')}`);
+    }
+  }
+
+  // Parse oauth providers from contractMd
+  let resolvedOAuthProviders = [];
+  if (skillRecord.contractMd) {
+    const oauthLine = skillRecord.contractMd.match(/^oauth:\s*(.+)$/m);
+    if (oauthLine && oauthLine[1].trim()) {
+      resolvedOAuthProviders = oauthLine[1].split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
+      if (resolvedOAuthProviders.length > 0) {
+        logger.info(`[external.skill] OAuth providers for ${name}: ${resolvedOAuthProviders.join(', ')}`);
+      }
+    }
+  }
+
+  // Build context with logger + secrets + oauth tokens resolved from keytar
+  const context = await buildSkillContext(name, resolvedSecretKeys, resolvedOAuthProviders);
+
   try {
     let result;
     if (execType === 'node') {
-      result = await runNodeSkill(resolvedPath, skillArgs, timeoutMs);
+      result = await runNodeSkill(resolvedPath, skillArgs, timeoutMs, context);
     } else if (execType === 'shell') {
       result = await runShellSkill(resolvedPath, skillArgs, timeoutMs);
     } else {
       return { ok: false, skillName: name, error: `Unknown exec_type "${execType}". Must be "node" or "shell".` };
     }
 
+    // If the skill itself returned ok:false with a non-trivial error, report it as a potential
+    // API contract failure so skill.reviewer can write a learned api_rule.
+    if (!result.ok && result.error && !/missing.*secret|secret.*missing|not found|disabled/i.test(result.error)) {
+      _reportRuntimeFailure(name, result.error, resolvedPath).catch(() => {});
+    }
+
     logger.info(`[external.skill] Skill "${name}" completed successfully`);
     return { ...result, skillName: name, execType };
   } catch (err) {
     logger.error(`[external.skill] Skill "${name}" failed: ${err.message}`);
+    // Report unexpected runtime exceptions to skill.reviewer for learning
+    _reportRuntimeFailure(name, err.message, resolvedPath).catch(() => {});
     return { ok: false, skillName: name, execType, error: err.message };
   }
+}
+
+// ── Fire-and-forget runtime failure reporter ──────────────────────────────────
+async function _reportRuntimeFailure(skillName, errorMessage, execPath) {
+  try {
+    const fs = require('fs');
+    const skillCode = fs.existsSync(execPath) ? fs.readFileSync(execPath, 'utf8') : '';
+    if (!skillCode) return;
+    const skillReviewer = require('./skill.reviewer.cjs');
+    await skillReviewer({ action: 'report_failure', skillName, errorMessage, skillCode });
+  } catch (_) { /* non-fatal */ }
 }
 
 module.exports = { run };

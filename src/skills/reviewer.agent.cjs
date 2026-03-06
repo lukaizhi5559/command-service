@@ -180,6 +180,35 @@ function checkTests(projectDir) {
   return issues;
 }
 
+// ── Structural banned-pattern check ─────────────────────────────────────────
+// Hard errors that must block the project regardless of LLM verdict.
+// These patterns indicate the plan used fake/non-existent tools that will
+// never work at runtime.
+const BANNED_PATTERNS = [
+  { pattern: /gmail-cli/i,      msg: 'gmail-cli is not a real npm/brew package — it does not exist.' },
+  { pattern: /imessage-cli/i,   msg: 'imessage-cli is not a real npm/brew package — it does not exist.' },
+  { pattern: /messages-cli/i,   msg: 'messages-cli is not a real npm/brew package — it does not exist.' },
+  { pattern: /apple-messages/i, msg: 'apple-messages is not a real npm/brew package — it does not exist.' },
+  { pattern: /mail-cli/i,       msg: 'mail-cli is not a real npm/brew package — it does not exist.' },
+  { pattern: /outlook-cli/i,    msg: 'outlook-cli is not a real npm/brew package — it does not exist.' },
+];
+
+function checkBannedPatterns(projectDir) {
+  const issues = [];
+  const filesToScan = ['plan.md', 'agents.md', 'prototype/index.js'];
+  for (const rel of filesToScan) {
+    const fPath = path.join(projectDir, rel);
+    if (!fs.existsSync(fPath)) continue;
+    const content = fs.readFileSync(fPath, 'utf8');
+    for (const { pattern, msg } of BANNED_PATTERNS) {
+      if (pattern.test(content)) {
+        issues.push({ severity: 'error', check: 'banned_patterns', msg: `[${rel}] ${msg}` });
+      }
+    }
+  }
+  return issues;
+}
+
 function checkApiDocs(projectDir) {
   const issues = [];
   const planPath = path.join(projectDir, 'plan.md');
@@ -227,6 +256,8 @@ Your review MUST cover these dimensions. For each, give a concrete pass/fail ver
    - Will the prototype actually run? Are the imports real? Does the logic make sense?
    - Are the mocks realistic enough to test the real behavior?
    - Are there N+1s, infinite loops, missing awaits, or obvious bugs?
+   BANNED TOOLS — any of these are automatic FAIL in technicalSoundness:
+   - gmail-cli, imessage-cli, messages-cli, apple-messages, mail-cli, outlook-cli (none of these are real npm/brew packages — they do not exist)
 
 3. SECURITY
    - Any hardcoded secrets, tokens, or passwords?
@@ -289,6 +320,7 @@ async function actionReview({ projectId, projectDir: explicitDir } = {}) {
 
   // ── 1. Mechanical checklist ───────────────────────────────────────────────
   const checklistIssues = [
+    ...checkBannedPatterns(projectDir),  // run first — hard block on fake CLIs
     ...checkStructure(projectDir),
     ...await checkAgents(projectDir, db),
     ...checkTech(projectDir),
