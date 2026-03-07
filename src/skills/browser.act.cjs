@@ -128,18 +128,24 @@ function clearProfileLock(sessionId) {
 function sessionFlags(sessionId, headed = true) {
   const flags = [`-s=${sessionId}`];
   if (headed) flags.push('--headed');
-  // --profile persists cookies/localStorage to disk so logins survive restarts
-  flags.push(`--profile=${sessionProfileDir(sessionId)}`);
+  // NOTE: do NOT pass --profile here. playwright-cli -s=sessionId manages tab
+  // isolation natively within a single Chrome window. Using --profile forces
+  // Chrome to open a separate window per session (macOS treats profiles as
+  // separate app instances). Auth persistence is handled via state-save/state-load.
   return flags;
 }
 
 // ---------------------------------------------------------------------------
 // Snapshot cache — stores last snapshot text per session for ref resolution
 // ---------------------------------------------------------------------------
-const snapshotCache = new Map(); // sessionId → snapshot stdout
+const snapshotCache = new Map(); // sessionId → snapshot text (cleared on navigate)
 
 // Track which sessions have been opened (daemon started)
 const openSessions = new Set();
+
+// Track the last selector/ref that was successfully filled, per session.
+// Used by press Enter to refocus the input before submitting.
+const lastFilledTarget = new Map(); // sessionId → { target, ref }
 
 async function captureSnapshot(sessionId, headed, timeoutMs) {
   const res = await cliRun([...sessionFlags(sessionId, headed), 'snapshot'], timeoutMs);
@@ -150,8 +156,6 @@ async function captureSnapshot(sessionId, headed, timeoutMs) {
   const fileMatch = snapshotText.match(/\[Snapshot\]\(([^)]+\.yml)\)/);
   if (fileMatch) {
     try {
-      const fs = require('fs');
-      const path = require('path');
       const ymlPath = path.resolve(process.cwd(), fileMatch[1]);
       snapshotText = fs.readFileSync(ymlPath, 'utf8');
     } catch (_) {
@@ -171,22 +175,44 @@ const INPUT_ROLES = new Set(['textbox', 'searchbox', 'combobox', 'input', 'texta
 // Context patterns that indicate nav/sidebar/history elements — deprioritise these
 const EXCLUDE_CONTEXT = /search.{0,20}(chat|history|conversation|message)|filter|sidebar|nav\b|navigation|recent|previous/i;
 
-// Parse snapshot YAML lines into structured candidate objects
+// Parse snapshot YAML lines into structured candidate objects.
+// Handles two formats emitted by playwright-cli:
+//   Format A (old stdout):  "  - [e12] link "Bible Study" [href=...]"
+//   Format B (.yml file):   "    - link "Bible Study" [ref=e52] [cursor=pointer]:"
+//   Format C (no label):    "    - textbox [ref=e52]"
 function parseSnapshotCandidates(snap) {
   const candidates = [];
   const lines = snap.split('\n');
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
-    // Match: optional indent + [eN] + role + "label" + optional attributes
-    const m = line.match(/^(\s*)-?\s*\[?(e\d+)\]?\s+(\w[\w-]*)\s+"([^"]*)"(.*)/i);
-    if (!m) continue;
-    const [, indent, ref, role, label, attrs] = m;
+    let indent = '', ref = null, role = '', label = '', attrs = '';
+
+    // Format A: optional indent + dash + [eN] BEFORE role + "label" + optional attrs
+    const mA = line.match(/^(\s*)-?\s*\[?(e\d+)\]?\s+(\w[\w-]*)\s+"([^"]*)"(.*)/i);
+    if (mA) {
+      [, indent, ref, role, label, attrs] = mA;
+    } else {
+      // Format B (.yml): optional indent + dash + role + optional "label" + optional attrs
+      // ref appears in attrs as [ref=eN]
+      const mB = line.match(/^(\s*)-\s+(\w[\w-]*)(?:\s+"([^"]*)")?(.*)/i);
+      if (mB) {
+        [, indent, role, label, attrs] = mB;
+        label = label || '';
+        // Extract [ref=eN] from attrs if present
+        const refMatch = attrs && attrs.match(/\[ref=(e\d+)\]/i);
+        ref = refMatch ? refMatch[1] : `line_${i}`;
+      }
+    }
+
+    if (!role) continue;
+    // Skip lines that are just attribute continuations (e.g. "- /url: ...")
+    if (role.startsWith('/')) continue;
     candidates.push({
       ref,
       role: role.toLowerCase(),
       label,
       attrs,
-      depth: indent.length, // deeper = more nested = more likely to be a sub-element
+      depth: indent.length,
       lineIndex: i,
     });
   }
@@ -317,12 +343,13 @@ function resolveRef(sessionId, labelOrRef) {
 }
 
 // Synchronous resolver for CLICK: scores links/buttons as preferred
+// Returns { ref, label } so callers can use the matched label even when ref is synthetic.
 function resolveRefForClick(sessionId, labelOrRef) {
-  if (!labelOrRef) return null;
-  if (/^e\d+$/i.test(labelOrRef.trim())) return labelOrRef.trim();
+  if (!labelOrRef) return { ref: null, label: null };
+  if (/^e\d+$/i.test(labelOrRef.trim())) return { ref: labelOrRef.trim(), label: labelOrRef.trim() };
 
   const snap = snapshotCache.get(sessionId) || '';
-  if (!snap) return null;
+  if (!snap) return { ref: null, label: null };
 
   const candidates = parseSnapshotCandidates(snap);
   let best = null, bestScore = -Infinity;
@@ -332,9 +359,9 @@ function resolveRefForClick(sessionId, labelOrRef) {
   }
   if (best && bestScore > 0) {
     logger.info(`[browser.act] resolveRefForClick "${labelOrRef}" → ${best.ref} (${best.role} "${best.label}" score=${bestScore})`);
-    return best.ref;
+    return { ref: best.ref, label: best.label };
   }
-  return null;
+  return { ref: null, label: null };
 }
 
 // Async resolver: tries scored pick first, falls back to phi4 LLM when ambiguous
@@ -446,46 +473,43 @@ async function browserAct(args) {
       const navTimeout = Math.max(timeoutMs, 30000);
       const alreadyOpen = openSessions.has(sessionId);
       const navCmd = alreadyOpen ? 'goto' : 'open';
+      // Invalidate snapshot cache and last-filled target — the page is changing
+      snapshotCache.delete(sessionId);
+      lastFilledTarget.delete(sessionId);
       // Before cold-starting, remove any stale SingletonLock from a previous crash
       if (!alreadyOpen) clearProfileLock(sessionId);
       const res = await cliRun([...S, navCmd, url], navTimeout);
       if (res.ok) {
         openSessions.add(sessionId);
+        // For cold-starts: Chrome may show a "Restore pages?" dialog on about:blank.
+        // Pressing Escape on macOS Chrome CLOSES the window — don't use Escape.
+        // Instead, send an immediate goto to force-navigate past any dialog.
+        if (!alreadyOpen) {
+          logger.info(`[browser.act] cold-start: sending goto ${url} to bypass any restore dialog`);
+          await cliRun([...S, 'goto', url], navTimeout).catch(() => {});
+        }
       } else if (alreadyOpen && !res.ok) {
         // goto failed (daemon may have died) — retry with open to restart it
         logger.info(`[browser.act] goto failed, retrying with open for session=${sessionId}`);
         const retryRes = await cliRun([...S, 'open', url], navTimeout);
-        if (retryRes.ok) openSessions.add(sessionId);
+        if (retryRes.ok) { openSessions.add(sessionId); }
         logger.info(`[browser.act] open ${url} → exit ${retryRes.exitCode}`, { stderr: retryRes.stderr?.slice(0, 200) });
         return {
           ok:            retryRes.ok,
           action,
           sessionId,
+          url:           retryRes.ok ? url : undefined,
           result:        retryRes.stdout.trim() || undefined,
           executionTime: Date.now() - start,
           error:         retryRes.ok ? undefined : retryRes.error || retryRes.stderr?.trim(),
         };
       }
       logger.info(`[browser.act] ${navCmd} ${url} → exit ${res.exitCode}`, { stderr: res.stderr?.slice(0, 200) });
-      // After navigation, auto-dismiss Chrome "Restore pages" crash-recovery dialog.
-      // This is a native browser UI bubble — NOT in the page DOM — so eval won't work.
-      // Press Escape to dismiss it, then wait for page to settle.
-      if (res.ok) {
-        await new Promise(r => setTimeout(r, 700));
-        const bodyText = await cliRun([...S, 'eval', 'document.body.innerText'], 3000);
-        if (/restore pages?\?|chrome didn't shut down|didn't shut down correctly/i.test(bodyText.stdout || '')) {
-          logger.info(`[browser.act] Chrome restore dialog detected after navigate — pressing Escape to dismiss`);
-          await cliRun([...S, 'press', 'Escape'], 3000);
-          await new Promise(r => setTimeout(r, 500));
-          // Double-tap Escape in case dialog needs two dismissals
-          await cliRun([...S, 'press', 'Escape'], 3000);
-          await new Promise(r => setTimeout(r, 400));
-        }
-      }
       return {
         ok:            res.ok,
         action,
         sessionId,
+        url:           res.ok ? url : undefined,
         result:        res.stdout.trim() || undefined,
         executionTime: Date.now() - start,
         error:         res.ok ? undefined : res.error || res.stderr?.trim(),
@@ -523,47 +547,61 @@ async function browserAct(args) {
       const cmd = action === 'dblclick' ? 'dblclick' : 'click';
       // Ensure snapshot is fresh for ref resolution
       await captureSnapshot(sessionId, headed, timeoutMs);
-      const ref = resolveRefForClick(sessionId, selector);
+      const { ref: rawRef, label: matchedLabel } = resolveRefForClick(sessionId, selector);
+      // Only use refs that playwright-cli actually understands (eN format).
+      // Synthetic refs (line_N) come from the .yml file format — playwright-cli rejects them.
+      const ref = rawRef && /^e\d+$/i.test(rawRef) ? rawRef : null;
+      if (rawRef && !ref) {
+        logger.info(`[browser.act] click: synthetic ref "${rawRef}" (matched label="${matchedLabel}") — using eval-click fallback for "${selector}"`);
+      }
       if (!ref) {
-        // No ref found in snapshot — eval fallback with progressive word-drop
-        // "Bible Study Project" → tries "Bible Study Project", "Bible Study", "Bible"
-        logger.warn(`[browser.act] click: could not resolve ref for "${selector}" — trying eval click`);
-        const words = selector.trim().split(/\s+/);
+        // No real eN ref — use eval fallback.
+        // IMPORTANT: if resolveRefForClick already found a matched label (e.g. "Lemans" for selector "LeMans"),
+        // use that as the first attempt so case/spacing differences don't cause miss.
+        logger.warn(`[browser.act] click: could not resolve ref for "${selector}" — trying eval click (matchedLabel=${matchedLabel || 'none'})`);
+        // Build attempts: matched label first, then word-drops of original selector
+        const seen = new Set();
         const attempts = [];
-        for (let len = words.length; len >= 1; len--) {
-          attempts.push(words.slice(0, len).join(' '));
+        if (matchedLabel && matchedLabel !== selector) {
+          attempts.push(matchedLabel);
+          seen.add(matchedLabel.toLowerCase());
         }
-        // Build JS that tries each progressively shorter text
+        const words = selector.trim().split(/\s+/);
+        for (let len = words.length; len >= 1; len--) {
+          const t = words.slice(0, len).join(' ');
+          if (!seen.has(t.toLowerCase())) { attempts.push(t); seen.add(t.toLowerCase()); }
+        }
+        // playwright-cli eval expects a FUNCTION expression: () => value
+        // Case-insensitive matching so "LeMans" finds "Lemans", "lemans", etc.
+        // NOTE: never use querySelector("[aria-label='...']") with dynamic values — single-quotes in
+        // the value break the CSS selector syntax. Use getAttribute comparisons instead.
         const tryTexts = attempts.map(t => JSON.stringify(t)).join(', ');
-        const evalScript = `
-          (function() {
-            const texts = [${tryTexts}];
-            for (const t of texts) {
-              const el = document.querySelector('[aria-label="' + t + '"]')
-                || [...document.querySelectorAll('a,button,[role=button],[role=link],[role=menuitem],li')]
-                    .find(e => e.textContent.trim() === t
-                            || e.textContent.trim().startsWith(t)
-                            || e.getAttribute('data-testid') === t);
-              if (el) { el.click(); return 'clicked:' + t; }
-            }
-            return 'not-found';
-          })()
-        `.replace(/\s+/g, ' ').trim();
+        // Match priority: aria-label exact → textContent exact → textContent startsWith → textContent includes (for nested spans)
+        // NO form-submit fallback: that was causing silent false-positives (clicked:form) when the real target wasn't found.
+        // Two-pass strategy: pass 1 = strict (aria-label/exact/startsWith/data-testid), pass 2 = includes() but only on short-text elements (≤50 chars) to avoid matching long conversation titles that happen to contain the target text.
+        const evalScript = `() => { const texts = [${tryTexts}]; const CANDIDATES = 'a,button,input[type=submit],[role=button],[role=link],[role=menuitem],li'; for (const t of texts) { const tl = t.toLowerCase(); const all = [...document.querySelectorAll(CANDIDATES)]; const el = all.find(e => (e.getAttribute('aria-label') || '').toLowerCase() === tl || (e.getAttribute('aria-label') || '') === t || e.textContent.trim().toLowerCase() === tl || e.textContent.trim().toLowerCase().startsWith(tl) || e.getAttribute('data-testid') === t || (e.getAttribute('name') || '').toLowerCase() === tl || (e.getAttribute('value') || '').toLowerCase() === tl) || all.find(e => e.textContent.trim().length <= 50 && e.textContent.trim().toLowerCase().includes(tl)); if (el) { el.click(); return 'clicked:' + t; } } return 'not-found'; }`;
         const evalRes = await cliRun([...S, 'eval', evalScript], timeoutMs);
-        const evalOut = (evalRes.stdout || '').trim();
-        if (evalOut.includes('not-found') || (!evalOut.includes('clicked:') && evalRes.exitCode !== 0)) {
-          logger.warn(`[browser.act] eval-click: element not found for "${selector}" — stdout: ${evalOut.slice(0, 80)}`);
+        const evalRaw = (evalRes.stdout || '').trim();
+        // playwright-cli echoes back the script source in "### Ran Playwright code" block
+        // so we must extract ONLY the ### Result section to avoid false-positive 'not-found' match
+        const resultMatch = evalRaw.match(/###\s*Result\s*\n([\s\S]*?)(?=###|$)/i);
+        const evalResult = resultMatch ? resultMatch[1].trim().replace(/^["']|["']$/g, '') : evalRaw;
+        // 'clicked:form' and 'clicked:form-submit' were from the old fallback — treat as failure.
+        const clickSucceeded = (evalResult.startsWith('clicked:') || evalResult.includes('clicked:')) &&
+          evalResult !== 'clicked:form' && evalResult !== 'clicked:form-submit';
+        if (!clickSucceeded) {
+          logger.warn(`[browser.act] eval-click: element not found for "${selector}" — result: ${evalResult.slice(0, 80)}`);
           return {
             ok: false,
             action,
             sessionId,
-            result: evalOut,
+            result: evalRaw,
             executionTime: Date.now() - start,
             error: `Element not found: "${selector}" — could not locate a matching link, button, or item on the page`,
           };
         }
-        logger.info(`[browser.act] eval-click "${selector}" → ${evalOut}`, { stderr: evalRes.stderr?.slice(0, 80) });
-        return { ok: true, action, sessionId, result: evalOut, executionTime: Date.now() - start };
+        logger.info(`[browser.act] eval-click "${selector}" → ${evalResult}`, { stderr: evalRes.stderr?.slice(0, 80) });
+        return { ok: true, action, sessionId, result: evalResult, executionTime: Date.now() - start };
       }
       return run([cmd, ref], `${cmd} ${ref}`);
     }
@@ -572,11 +610,13 @@ async function browserAct(args) {
     case 'fill': {
       await captureSnapshot(sessionId, headed, timeoutMs);
       // Use intent-aware smart resolver: scored snapshot matching + phi4 LLM for ambiguous cases
-      const ref = await resolveRefSmart(sessionId, selector, text);
+      const rawFillRef = await resolveRefSmart(sessionId, selector, text);
+      // Only use real eN refs — synthetic line_N refs from .yml format are rejected by playwright-cli
+      const ref = rawFillRef && /^e\d+$/i.test(rawFillRef) ? rawFillRef : null;
       const fillTarget = ref || selector;
       logger.info(`[browser.act] fill resolved: "${selector}" → ${ref ? `ref ${ref}` : `direct selector "${selector}"`}`);
       const fillRes = await cliRun([...S, 'fill', fillTarget, text || ''], timeoutMs);
-      logger.info(`[browser.act] fill ${fillTarget} → exit ${fillRes.exitCode}`, { stderr: fillRes.stderr?.slice(0, 200) });
+      logger.info(`[browser.act] fill ${fillTarget} → exit ${fillRes.exitCode} stdout="${fillRes.stdout?.slice(0, 200)}"`, { stderr: fillRes.stderr?.slice(0, 200) });
 
       // playwright-cli exits 0 even on fill errors — check stdout for error markers
       // Two cases: (1) contenteditable div → "Element is not an <input>" → click+type fallback
@@ -594,6 +634,7 @@ async function browserAct(args) {
         await cliRun([...S, 'press', 'Meta+a'], timeoutMs);
         const typeRes = await cliRun([...S, 'type', text || ''], timeoutMs);
         logger.info(`[browser.act] click+type → exit ${typeRes.exitCode}`);
+        if (typeRes.ok) lastFilledTarget.set(sessionId, { target: fillTarget, ref });
         return {
           ok: typeRes.ok,
           action, sessionId,
@@ -604,6 +645,7 @@ async function browserAct(args) {
         };
       }
 
+      if (fillRes.ok) lastFilledTarget.set(sessionId, { target: fillTarget, ref });
       return {
         ok: fillRes.ok,
         action,
@@ -622,42 +664,79 @@ async function browserAct(args) {
     // ── Hover ────────────────────────────────────────────────────────────────
     case 'hover': {
       await captureSnapshot(sessionId, headed, timeoutMs);
-      const ref = resolveRef(sessionId, selector);
-      const hoverTarget = ref || selector;
+      const rawHoverRef = resolveRef(sessionId, selector);
+      const hoverTarget = (rawHoverRef && /^e\d+$/i.test(rawHoverRef) ? rawHoverRef : null) || selector;
       return run(['hover', hoverTarget], `hover ${hoverTarget}`);
     }
 
     // ── Select ───────────────────────────────────────────────────────────────
     case 'select': {
       await captureSnapshot(sessionId, headed, timeoutMs);
-      const ref = resolveRef(sessionId, selector);
-      const selTarget = ref || selector;
+      const rawSelRef = resolveRef(sessionId, selector);
+      const selTarget = (rawSelRef && /^e\d+$/i.test(rawSelRef) ? rawSelRef : null) || selector;
       return run(['select', selTarget, value || ''], `select ${selTarget}`);
     }
 
     // ── Check / Uncheck ──────────────────────────────────────────────────────
     case 'check': {
       await captureSnapshot(sessionId, headed, timeoutMs);
-      const ref = resolveRef(sessionId, selector);
-      return run(['check', ref || selector], `check ${ref || selector}`);
-    }
-    case 'uncheck': {
-      await captureSnapshot(sessionId, headed, timeoutMs);
-      const ref = resolveRef(sessionId, selector);
-      return run(['uncheck', ref || selector], `uncheck ${ref || selector}`);
+      const rawCheckRef = resolveRef(sessionId, selector);
+      const checkTarget = (rawCheckRef && /^e\d+$/i.test(rawCheckRef) ? rawCheckRef : null) || selector;
+      return run(['check', checkTarget], `check ${checkTarget}`);
     }
 
     // ── Keyboard ─────────────────────────────────────────────────────────────
     case 'keyboard':
     case 'press': {
-      return run(['press', key || text || ''], `press ${key || text}`);
+      const pressKey = key || text || '';
+      // For Enter/Return: refocus the last filled input first so the form submits correctly.
+      // After fill+click+type fallback, focus may have drifted — this guarantees the
+      // keypress lands on the right element and triggers form submission.
+      if (/^(Enter|Return)$/i.test(pressKey)) {
+        const lastFill = lastFilledTarget.get(sessionId);
+        if (lastFill) {
+          const refocusTarget = lastFill.ref || lastFill.target;
+          logger.info(`[browser.act] press Enter: refocusing last filled target "${refocusTarget}" before submit`);
+          await cliRun([...S, 'click', refocusTarget], 3000).catch(() => {});
+          await new Promise(r => setTimeout(r, 150));
+        }
+        // Enter triggers navigation — invalidate snapshot cache and lastFilledTarget
+        // so any subsequent fill/click gets a fresh snapshot with valid refs.
+        snapshotCache.delete(sessionId);
+        lastFilledTarget.delete(sessionId);
+      }
+      return run(['press', pressKey], `press ${pressKey}`);
     }
     case 'keydown': return run(['keydown', key || ''], `keydown ${key}`);
     case 'keyup':   return run(['keyup',   key || ''], `keyup ${key}`);
 
     // ── Scroll ───────────────────────────────────────────────────────────────
+    // Accepts: direction ('up'|'down'|'left'|'right'), distance ('100%'|number px),
+    // dx/dy raw pixels (legacy). Maps to playwright-cli mousewheel <dx> <dy>.
     case 'scroll': {
-      return run(['mousewheel', String(dx), String(dy)], `scroll dx=${dx} dy=${dy}`);
+      const direction = args.direction || 'down';
+      const distance  = args.distance;
+      let scrollDx = dx;
+      let scrollDy = dy;
+      // Parse distance: '100%' → full document height, numeric string → pixels
+      if (distance !== undefined) {
+        if (String(distance) === '100%' || String(distance).toLowerCase() === 'bottom') {
+          // Scroll to absolute bottom via eval, then mousewheel a large value
+          scrollDy = 99999;
+        } else if (String(distance) === '0%' || String(distance).toLowerCase() === 'top') {
+          scrollDy = -99999;
+        } else {
+          const px = parseInt(String(distance), 10);
+          if (!isNaN(px)) scrollDy = px;
+        }
+      }
+      // Apply direction to sign
+      if (direction === 'up')    scrollDy = -Math.abs(scrollDy);
+      if (direction === 'down')  scrollDy =  Math.abs(scrollDy);
+      if (direction === 'left')  { scrollDx = -Math.abs(scrollDy); scrollDy = 0; }
+      if (direction === 'right') { scrollDx =  Math.abs(scrollDy); scrollDy = 0; }
+      logger.info(`[browser.act] scroll dx=${scrollDx} dy=${scrollDy} (direction=${direction} distance=${distance ?? 'default'})`);
+      return run(['mousewheel', String(scrollDx), String(scrollDy)], `scroll dx=${scrollDx} dy=${scrollDy}`);
     }
 
     // ── Screenshot ───────────────────────────────────────────────────────────
@@ -784,7 +863,10 @@ async function browserAct(args) {
         prev = cur;
         await new Promise(r2 => setTimeout(r2, 1200));
       }
-      return { ok: true, action, sessionId, result: prev, executionTime: Date.now() - start };
+      // Timeout — page never stabilized. Do a final grab so we don't return empty.
+      // This happens when a page has dynamic ads/widgets that keep updating.
+      const finalText = prev || (await cliRun([...S, 'eval', 'document.body.innerText'], 5000)).stdout.trim();
+      return { ok: true, action, sessionId, result: finalText, executionTime: Date.now() - start };
     }
 
     // ── scanCurrentPage ───────────────────────────────────────────────────────
@@ -882,6 +964,77 @@ async function browserAct(args) {
       return run(['tab-new', url || ''], 'newPage');
     }
 
+    // ── diagnose ──────────────────────────────────────────────────────────────
+    // Self-healing action: when a browser.act command fails with a tool error,
+    // diagnose() probes playwright-cli --help, identifies the correct usage,
+    // writes a context_rule so the same mistake never repeats, and returns a fix.
+    // Args: failedAction (string), errorText (string), sessionId
+    case 'diagnose': {
+      const failedAction = args.failedAction || selector || '';
+      const errorText    = args.errorText    || text    || '';
+
+      logger.info(`[browser.act] diagnose: failedAction="${failedAction}" error="${errorText.slice(0, 120)}"`);
+
+      // 1. Probe playwright-cli --help to get ground-truth command list
+      const { spawnSync } = require('child_process');
+      const helpProc = spawnSync(CLI_BIN, ['--help'], { encoding: 'utf8', timeout: 5000 });
+      const helpText = (helpProc.stdout || '') + (helpProc.stderr || '');
+
+      // 2. If specific command failed, probe its --help too
+      let cmdHelp = '';
+      if (failedAction) {
+        const cmdHelpProc = spawnSync(CLI_BIN, ['--help', failedAction], { encoding: 'utf8', timeout: 5000 });
+        cmdHelp = (cmdHelpProc.stdout || '') + (cmdHelpProc.stderr || '');
+      }
+
+      // 3. Pattern-match known failure signatures → generate fix rule
+      const fixes = [];
+
+      // TypeError: result is not a function → eval expects () => expr not IIFE
+      if (/TypeError: result is not a function/i.test(errorText)) {
+        fixes.push('playwright-cli eval expects a function expression: `() => value` — NOT an IIFE `(() => {...})()`. Pass the function without calling it.');
+      }
+
+      // scroll with distance/direction not working → mousewheel
+      if (/scroll/i.test(failedAction) && /mousewheel|scroll/i.test(helpText)) {
+        const mwLine = helpText.split('\n').find(l => /mousewheel/i.test(l)) || '';
+        fixes.push(`scroll maps to playwright-cli mousewheel <dx> <dy>. Usage: ${mwLine.trim()}`);
+      }
+
+      // click with text selector rejected → needs snapshot ref
+      if (/click/i.test(failedAction) && /ref.*snapshot/i.test(helpText)) {
+        fixes.push('playwright-cli click only accepts element refs from snapshot (e.g. e12). Use eval with a function expression to click by text.');
+      }
+
+      const fixSummary = fixes.length > 0
+        ? fixes.join(' | ')
+        : `playwright-cli ${failedAction} usage: ${(cmdHelp || helpText).slice(0, 300)}`;
+
+      // 4. Write permanent context_rule so planner never repeats this mistake
+      try {
+        const db = require('../skill-db.cjs');
+        const ruleKey = `playwright-cli:${failedAction || 'general'}`;
+        await db.setContextRule(ruleKey, fixSummary);
+        logger.info(`[browser.act] diagnose: wrote context_rule for "${ruleKey}": ${fixSummary.slice(0, 120)}`);
+      } catch (e) {
+        logger.warn(`[browser.act] diagnose: failed to write context_rule — ${e.message}`);
+      }
+
+      return {
+        ok: true,
+        action,
+        sessionId,
+        diagnosis:     fixSummary,
+        failedAction,
+        errorText,
+        helpText:      helpText.slice(0, 800),
+        cmdHelp:       cmdHelp.slice(0, 400),
+        fixes,
+        result:        fixSummary,
+        executionTime: Date.now() - start,
+      };
+    }
+
     // ── examine ───────────────────────────────────────────────────────────────
     // Scans the current page snapshot against the planned next actions.
     // Uses LLM to diagnose: auth walls, missing elements, wrong page/section,
@@ -895,12 +1048,29 @@ async function browserAct(args) {
       const nextActions = args.nextActions || []; // upcoming plan steps
 
       // 1. Capture fresh snapshot + current URL
+      // Retry once if cache is empty — Chrome restore dialog may have blocked the first attempt.
+      // captureSnapshot sends blind Escapes first, so the retry should land on a clean page.
       await captureSnapshot(sessionId, headed, timeoutMs);
-      const snap = snapshotCache.get(sessionId) || '';
+      let snap = snapshotCache.get(sessionId) || '';
+      if (!snap) {
+        logger.info(`[browser.act] examine: snapshot empty — retrying after 600ms (dialog may have blocked first attempt)`);
+        await new Promise(r => setTimeout(r, 600));
+        await captureSnapshot(sessionId, headed, timeoutMs);
+        snap = snapshotCache.get(sessionId) || '';
+      }
+
+      // playwright-cli eval returns markdown-wrapped output: "### Result\n\"value\"\n### Ran..."
+      // Strip everything except the quoted value on the second line
+      function extractEvalValue(raw) {
+        const stripped = (raw || '').replace(/###[^\n]*\n?/g, '').replace(/```[^`]*```/g, '').trim();
+        // Remove surrounding quotes if present
+        return stripped.replace(/^["']|["']$/g, '').trim();
+      }
+
       const urlRes = await cliRun([...S, 'eval', 'location.href'], 3000);
-      const pageUrl = urlRes.stdout.trim() || 'unknown';
+      const pageUrl = extractEvalValue(urlRes.stdout) || 'unknown';
       const titleRes = await cliRun([...S, 'eval', 'document.title'], 3000);
-      const pageTitle = titleRes.stdout.trim() || '';
+      const pageTitle = extractEvalValue(titleRes.stdout) || '';
 
       if (!snap) {
         return { ok: false, action, sessionId, error: 'No snapshot available for examination', executionTime: Date.now() - start };
@@ -908,9 +1078,13 @@ async function browserAct(args) {
 
       // 2. Parse snapshot into candidates (structured ARIA data)
       const candidates = parseSnapshotCandidates(snap);
+      const snapPreview = snap.split('\n').slice(0, 3).join(' | ');
+      logger.info(`[browser.act] examine: ${candidates.length} candidates parsed (snap ${snap.length} chars). Preview: ${snapPreview.slice(0, 200)}`);
+      if (candidates.length > 0) {
+        logger.info(`[browser.act] examine: first 10 candidates: ${candidates.slice(0, 10).map(c => `${c.role}:"${c.label}"`).join(', ')}`);
+      }
 
       // 3. Fast-path heuristic checks before calling LLM
-      // Check for prominent auth elements (saves LLM call for obvious cases)
       const AUTH_LABELS = /^(log in|sign in|sign in to|sign up|sign up for free|create account|get started|login|signin|join free|join now)$/i;
       const authEl = candidates.find(c =>
         (c.role === 'link' || c.role === 'button') &&
@@ -918,12 +1092,35 @@ async function browserAct(args) {
         c.depth <= 24
       );
 
-      // Build a compact element summary for LLM (top 60 most relevant)
+      // Build element summary for LLM — keep all roles (sidebar links are often 'link' or 'generic')
+      // Include up to 120 candidates so the project list is visible to the LLM
       const elementSummary = candidates
-        .filter(c => c.role !== 'generic' && c.role !== 'none' && c.label.length > 1)
-        .slice(0, 60)
+        .filter(c => c.label.length > 0)
+        .slice(0, 120)
         .map(c => `[${c.role}] "${c.label}"${c.attrs ? ' ' + c.attrs.slice(0, 60) : ''}`)
         .join('\n');
+
+      // 3b. Fast-path OK check — if intent keywords directly match a candidate, skip LLM entirely
+      // This prevents false NEEDS_USER when the element IS visible but LLM misreads summary
+      if (intent && candidates.length > 0) {
+        const intentTokens = intent.toLowerCase().split(/\W+/).filter(t => t.length >= 3);
+        const directMatch = candidates.find(c => {
+          const lbl = c.label.toLowerCase();
+          return intentTokens.some(t => lbl.includes(t));
+        });
+        if (directMatch) {
+          logger.info(`[browser.act] examine: fast-path OK — intent token matched candidate ${directMatch.role}:"${directMatch.label}"`);
+          return {
+            ok: true, action, sessionId,
+            status: 'OK',
+            issue: null, recovery: null, userMessage: null, contextRule: null,
+            missingElements: [], availableAlternatives: [],
+            authRequired: false, needsUser: false,
+            result: 'Page ready',
+            executionTime: Date.now() - start,
+          };
+        }
+      }
 
       // 4. LLM diagnosis
       let diagnosis = null;
