@@ -37,7 +37,8 @@
     "jimp": "^0.22.12",
     "keytar": "^7.9.0",
     "node-cron": "^3.0.3",
-    "winston": "^3.11.0"
+    "winston": "^3.11.0",
+    "ws": "^8.19.0"
   },
   "devDependencies": {
     "nodemon": "^3.0.0"

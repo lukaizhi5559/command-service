@@ -11,6 +11,12 @@
 require('dotenv').config();
 const http = require('http');
 const logger = require('./logger.cjs');
+// Shared infrastructure for skills — intelligence + storage
+// Any skill can require these directly:
+//   const { ask } = require('../skill-llm.cjs');
+//   const db = require('../skill-db.cjs');
+const skillLlm = require('./skill-llm.cjs');
+const skillDb = require('./skill-db.cjs');
 const { shellRun } = require('./skills/shell.run.cjs');
 const { browserAct } = require('./skills/browser.act.cjs');
 const { uiWaitFor } = require('./skills/ui.waitFor.cjs');
