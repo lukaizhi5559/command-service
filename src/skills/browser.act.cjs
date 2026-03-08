@@ -143,6 +143,18 @@ const snapshotCache = new Map(); // sessionId → snapshot text (cleared on navi
 // Track which sessions have been opened (daemon started)
 const openSessions = new Set();
 
+// Probe whether a playwright-cli daemon is already alive for a session.
+// Used on navigate after app restart (openSessions cleared) to avoid cold-starting
+// a new Chrome tab when the browser is already open from a previous run.
+async function isDaemonAlive(sessionId, headed) {
+  try {
+    const probe = await cliRun([...sessionFlags(sessionId, headed), 'eval', '1'], 4000);
+    return probe.ok;
+  } catch (_) {
+    return false;
+  }
+}
+
 // Track the last selector/ref that was successfully filled, per session.
 // Used by press Enter to refocus the input before submitting.
 const lastFilledTarget = new Map(); // sessionId → { target, ref }
@@ -256,6 +268,11 @@ function scoreCandidateForFill(cand, selectorLabel) {
     const overlap = needleTokens.filter(t => labelTokens.includes(t)).length;
     if (overlap > 0) score += overlap * 30;
   }
+
+  // Penalize email/newsletter/subscribe fields — these are never the intended
+  // target when the user wants to search or type a query into a page.
+  const EMAIL_FIELD = /\b(email|e-mail|subscribe|newsletter|sign.?up|your email|enter.*email|email.*here)\b/i;
+  if (EMAIL_FIELD.test(label)) score -= 150;
 
   score -= Math.min(cand.depth * 0.5, 20);
   if (score <= 0) return -Infinity;
@@ -469,9 +486,18 @@ async function browserAct(args) {
     case 'goto': {
       if (!url) return { ok: false, action, sessionId, error: 'url required for navigate', executionTime: 0 };
       // Use 'open' to cold-start the daemon + navigate in one shot.
-      // Use 'goto' if daemon is already running — avoids exit -1 on re-navigation.
+      // Use 'goto' if daemon is already running — avoids spawning a new blank Chrome tab.
+      // After app restart openSessions is cleared, so probe the daemon directly with isDaemonAlive().
       const navTimeout = Math.max(timeoutMs, 30000);
-      const alreadyOpen = openSessions.has(sessionId);
+      let alreadyOpen = openSessions.has(sessionId);
+      if (!alreadyOpen) {
+        // Probe whether the daemon survived the app restart (Chrome still open from last run)
+        alreadyOpen = await isDaemonAlive(sessionId, headed);
+        if (alreadyOpen) {
+          openSessions.add(sessionId);
+          logger.info(`[browser.act] navigate: daemon alive for session=${sessionId} (post-restart probe) — using goto`);
+        }
+      }
       const navCmd = alreadyOpen ? 'goto' : 'open';
       // Invalidate snapshot cache and last-filled target — the page is changing
       snapshotCache.delete(sessionId);
@@ -488,6 +514,35 @@ async function browserAct(args) {
           logger.info(`[browser.act] cold-start: sending goto ${url} to bypass any restore dialog`);
           await cliRun([...S, 'goto', url], navTimeout).catch(() => {});
         }
+        // Bring Chrome to front, activating the tab with the target URL.
+        // Wait 2s so Chrome has time to finish loading the URL into the tab.
+        // NOTE: Do NOT close about:blank tabs — playwright-cli uses one as its internal
+        // control/session tab. Closing it kills the session mid-execution.
+        setTimeout(() => {
+          try {
+            const safeDomain = url.replace(/'/g, '');
+            const script = [
+              `tell application "Google Chrome"`,
+              `  activate`,
+              `  set found to false`,
+              `  repeat with w in windows`,
+              `    repeat with t in tabs of w`,
+              `      if URL of t starts with "${safeDomain}" then`,
+              `        set active tab of w to t`,
+              `        set index of w to 1`,
+              `        set found to true`,
+              `        exit repeat`,
+              `      end if`,
+              `    end repeat`,
+              `    if found then exit repeat`,
+              `  end repeat`,
+              `end tell`,
+            ].join('\n');
+            require('child_process').spawn('osascript', ['-e', script], { detached: true }).unref();
+          } catch (_) {
+            require('child_process').spawn('open', ['-a', 'Google Chrome'], { detached: true }).unref();
+          }
+        }, 2000);
       } else if (alreadyOpen && !res.ok) {
         // goto failed (daemon may have died) — retry with open to restart it
         logger.info(`[browser.act] goto failed, retrying with open for session=${sessionId}`);
@@ -704,6 +759,22 @@ async function browserAct(args) {
         // so any subsequent fill/click gets a fresh snapshot with valid refs.
         snapshotCache.delete(sessionId);
         lastFilledTarget.delete(sessionId);
+
+        // Run press and treat navigation-kill exits as success.
+        // playwright-cli exits with -1 or null when the page navigates away mid-keypress —
+        // that is the expected outcome of a form submit via Enter.
+        const pressRes = await cliRun([...S, 'press', pressKey], timeoutMs);
+        logger.info(`[browser.act] press ${pressKey} → exit ${pressRes.exitCode}`, { stderr: pressRes.stderr?.slice(0, 200) });
+        const navigationKill = pressRes.exitCode === -1 || pressRes.exitCode === null;
+        return {
+          ok:            pressRes.ok || navigationKill,
+          action,
+          sessionId,
+          result:        pressRes.stdout.trim() || undefined,
+          stdout:        pressRes.stdout,
+          executionTime: Date.now() - start,
+          error:         (pressRes.ok || navigationKill) ? undefined : pressRes.error || pressRes.stderr?.trim(),
+        };
       }
       return run(['press', pressKey], `press ${pressKey}`);
     }
@@ -770,13 +841,21 @@ async function browserAct(args) {
     // ── getText / getPageText ─────────────────────────────────────────────────
     case 'getText':
     case 'getPageText': {
-      // Use eval to extract innerText of the page body
-      const res = await cliRun([...S, 'eval', 'document.body.innerText'], timeoutMs);
+      // Use eval to extract innerText of the page body (truncated to 50k to avoid timeout on large pages)
+      const res = await cliRun([...S, 'eval', 'document.body.innerText.slice(0,50000)'], Math.min(timeoutMs, 8000));
+      // playwright-cli eval wraps output as: ### Result\n"<value>"\n### Ran Playwright code...
+      // Extract just the bare value from the ### Result block
+      const rawOut = res.stdout.trim();
+      const resultMatch = rawOut.match(/###\s*Result\s*\n([\s\S]*?)(?=###|$)/i);
+      const pageText = resultMatch
+        ? resultMatch[1].trim().replace(/^"|"$/g, '')
+        : rawOut;
       return {
         ok:            res.ok,
         action,
         sessionId,
-        result:        res.stdout.trim(),
+        stdout:        pageText,
+        result:        pageText,
         executionTime: Date.now() - start,
         error:         res.ok ? undefined : res.error,
       };
@@ -790,6 +869,12 @@ async function browserAct(args) {
 
     // ── waitForSelector ───────────────────────────────────────────────────────
     case 'waitForSelector': {
+      // "body" is not in the accessibility tree so resolveRef will never find it,
+      // but it trivially always exists — treat as a post-navigation settle wait.
+      if (!selector || /^body$/i.test(selector.trim())) {
+        await new Promise(r => setTimeout(r, 1500));
+        return { ok: true, action, sessionId, result: 'body', executionTime: Date.now() - start };
+      }
       // Poll snapshot until ref matching selector appears
       const deadline = Date.now() + timeoutMs;
       while (Date.now() < deadline) {
@@ -808,7 +893,7 @@ async function browserAct(args) {
       const needle = text || selector || '';
       const deadline = Date.now() + timeoutMs;
       while (Date.now() < deadline) {
-        const snapRes = await cliRun([...S, 'eval', 'document.body.innerText'], 5000);
+        const snapRes = await cliRun([...S, 'eval', 'document.body.innerText.slice(0,50000)'], 8000);
         if (snapRes.stdout.includes(needle)) {
           return { ok: true, action, sessionId, result: needle, executionTime: Date.now() - start };
         }
@@ -832,11 +917,26 @@ async function browserAct(args) {
       // Chrome crash-restore dialog
       const RESTORE_DIALOG = /restore pages?\?|chrome didn't shut down correctly|help make google chrome better/i;
 
+      // Cap effective timeout at 30s — MCPClient transport timeout is 60s.
+      // Each cliRun eval can take up to 8s, so we need a hard pre-check before
+      // each iteration to avoid overshooting. Stop if <10s remain to leave buffer.
+      const effectiveTimeout = Math.min(timeoutMs, 30000);
       let prev = '';
-      const deadline = Date.now() + timeoutMs;
+      const loopStart = Date.now();
+      const deadline = loopStart + effectiveTimeout;
       while (Date.now() < deadline) {
-        const r = await cliRun([...S, 'eval', 'document.body.innerText'], 5000);
-        const cur = r.stdout.trim();
+        // Hard bail: if less than 10s left, don't start another 8s eval — return what we have
+        if (deadline - Date.now() < 10000) break;
+        // Truncate to 50k chars to prevent huge pages (YouTube, Reddit) from timing out the eval.
+        // A SIGTERM to playwright-cli mid-eval causes it to navigate the tab to about:blank as cleanup.
+        const r = await cliRun([...S, 'eval', 'document.body.innerText.slice(0,50000)'], 8000);
+        // playwright-cli eval wraps output as: ### Result\n"<value>"\n### Ran Playwright code...
+        // Extract just the bare innerText value
+        const rawOut = r.stdout.trim();
+        const resultMatch = rawOut.match(/###\s*Result\s*\n([\s\S]*?)(?=###|$)/i);
+        const cur = resultMatch
+          ? resultMatch[1].trim().replace(/^"|"$/g, '')
+          : rawOut;
 
         // Detect Chrome restore dialog — dismiss it with Escape (native browser UI, not page DOM)
         if (RESTORE_DIALOG.test(cur)) {
@@ -855,17 +955,41 @@ async function browserAct(args) {
           const isAuthWall = AUTH_WALL_FIRST.test(firstLine) || AUTH_WALL_BODY.test(cur.slice(0, 500)) || AUTH_WALL_LOGGEDOUT.test(cur.slice(0, 600));
           if (isAuthWall) {
             logger.info(`[browser.act] waitForStableText: auth wall detected for session=${sessionId}`);
-            // Return authRequired:true and EMPTY stdout so synthesize knows this site had no data
             return { ok: true, action, sessionId, result: '', stdout: '', authRequired: true, authWallText: cur.slice(0, 100), executionTime: Date.now() - start };
           }
           return { ok: true, action, sessionId, result: cur, executionTime: Date.now() - start };
         }
+        // Early-exit: if content is substantial and barely changed since last poll,
+        // treat as "stable enough". Pages like YouTube search keep micro-updating
+        // (ad slots, counters) so perfect equality never happens within the window.
+        if (prev && cur && cur.length > 1000) {
+          const longer = Math.max(prev.length, cur.length);
+          const changeRatio = Math.abs(cur.length - prev.length) / longer;
+          if (changeRatio < 0.05) {
+            logger.info(`[browser.act] waitForStableText: near-stable (${(changeRatio * 100).toFixed(1)}% change) — returning early`);
+            return { ok: true, action, sessionId, result: cur, executionTime: Date.now() - start };
+          }
+          // Streaming-growth exit: AI answer pages (Grok, Perplexity, ChatGPT) keep growing
+          // continuously — content never stabilizes. If we've been polling >15s and have
+          // substantial content, accept what we have rather than waiting for the full timeout.
+          const elapsed = Date.now() - loopStart;
+          if (elapsed > 15000 && cur.length > 2000) {
+            logger.info(`[browser.act] waitForStableText: streaming page, ${elapsed}ms elapsed with ${cur.length} chars — accepting`);
+            return { ok: true, action, sessionId, result: cur, executionTime: Date.now() - start };
+          }
+        }
         prev = cur;
-        await new Promise(r2 => setTimeout(r2, 1200));
+        await new Promise(r2 => setTimeout(r2, 800));
       }
-      // Timeout — page never stabilized. Do a final grab so we don't return empty.
-      // This happens when a page has dynamic ads/widgets that keep updating.
-      const finalText = prev || (await cliRun([...S, 'eval', 'document.body.innerText'], 5000)).stdout.trim();
+      // Timeout — page never stabilized (e.g. YouTube infinite scroll, live feeds).
+      // Return whatever we last captured so the user gets real content instead of nothing.
+      let finalText = prev;
+      if (!finalText) {
+        const lastRes = await cliRun([...S, 'eval', 'document.body.innerText.slice(0,50000)'], 8000);
+        const lastRaw = lastRes.stdout.trim();
+        const lastMatch = lastRaw.match(/###\s*Result\s*\n([\s\S]*?)(?=###|$)/i);
+        finalText = lastMatch ? lastMatch[1].trim().replace(/^"|"$/g, '') : lastRaw;
+      }
       return { ok: true, action, sessionId, result: finalText, executionTime: Date.now() - start };
     }
 

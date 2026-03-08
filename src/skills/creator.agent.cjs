@@ -148,6 +148,17 @@ SCHEDULE RULES — CRITICAL. The schedule field must contain one of:
 
 NEVER use vague strings like "daily", "nightly", "every day". Always convert to an exact cron or RANDOM_WINDOW.
 
+SKILL RUNTIME CAPABILITIES — every generated skill receives these in its context object at runtime:
+- context.db — persistent KV store + semantic memory (HTTP to user-memory MCP port 3001):
+  - context.db.set(skillName, key, value) / get / del / list — for deduplication, caching, last-run timestamps
+  - context.db.remember(skillName, text) / recall(skillName, query) — semantic memory search via embeddings
+  - Use db for: deduplication (track seen email IDs, notification IDs), caching API responses, storing user preferences
+- context.llm — LLM reasoning (WebSocket to LLM backend):
+  - context.llm.ask(prompt) — single question
+  - context.llm.askWithMessages([{role,content}]) — multi-turn with system prompt
+  - Use llm for: summarizing content, classifying/categorizing data, generating text from structured data
+- When the project requires summarization, classification, or stateful memory between runs — plan for context.db and context.llm usage. Skills do NOT need to require() any external db or LLM library.
+
 DEPENDENCY RULES — CRITICAL. The plan MUST follow these or it will be rejected:
 - NEVER invent CLI tools that don't exist on npm or homebrew as real, published packages. Every CLI or npm package listed in Tech Stack must be a real, publicly available package.
 - Known fake/non-existent CLIs that must NEVER appear: gmail-cli, imessage-cli, messages-cli, apple-messages, mail-cli, outlook-cli.

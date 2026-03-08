@@ -244,7 +244,31 @@ A ThinkDrop skill is a CommonJS module (.skill.cjs) that exports an async functi
 
 Where:
 - args: object with runtime inputs (phone_number, timezone, etc.)
-- context: { logger, secrets } — secrets is an object with env var values loaded from keytar
+- context: {
+    logger,           // logging (context.logger.info/warn/error)
+    secrets,          // env var values loaded from keytar (context.secrets.MY_API_KEY)
+    db,               // persistent storage + semantic memory (see DB RULES below)
+    llm,              // LLM reasoning access (see LLM RULES below)
+    skillName,        // this skill's registered name (string)
+    oauth,            // OAuth token map (context.oauth.google, etc.)
+  }
+
+DB RULES — context.db (HTTP client to user-memory MCP on port 3001):
+- Persist state between runs:   await context.db.set(skillName, 'last_run', Date.now())
+- Read persisted state:         await context.db.get(skillName, 'last_run')
+- Delete a value:               await context.db.del(skillName, 'key')
+- List all KV for this skill:   await context.db.list(skillName)
+- Store semantic memory:        await context.db.remember(skillName, 'User prefers dark mode')
+- Search semantic memory:       await context.db.recall(skillName, 'user preferences', topK=5)
+- All db methods return null/[] on error — always degrade gracefully, never throw on db failure.
+- Use context.db to: deduplicate (track seen IDs), store last-run timestamps, cache API results, remember user preferences across runs.
+
+LLM RULES — context.llm (WebSocket connection to LLM backend):
+- Simple question:              await context.llm.ask('Summarize this email thread: ...')
+- Multi-turn with system prompt: await context.llm.askWithMessages([{ role: 'system', content: '...' }, { role: 'user', content: '...' }])
+- Check availability:           await context.llm.isAvailable()
+- Use context.llm to: summarize content, classify/categorize data, generate text, make decisions from unstructured input.
+- Always wrap in try/catch — LLM may be unavailable during offline runs.
 
 The skill must:
 1. Validate all required secrets/args at the top, return { ok: false, error: '...' } if missing

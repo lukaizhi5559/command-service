@@ -116,11 +116,20 @@ async function buildSkillContext(skillName, secretKeys, oauthProviders) {
     }));
   }
 
+  // Inject shared infrastructure so skills can use context.db and context.llm
+  // without needing to know the absolute path to command-service internals.
+  let db = null;
+  let llm = null;
+  try { db = require('../skill-db.cjs'); } catch (_) {}
+  try { llm = require('../skill-llm.cjs'); } catch (_) {}
+
   return {
     logger,
     secrets,
     oauth,
     skillName,
+    db,   // context.db.get/set/remember/recall/getSkill etc.
+    llm,  // context.llm.ask(prompt) / context.llm.askWithMessages(messages)
   };
 }
 
