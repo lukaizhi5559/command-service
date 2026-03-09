@@ -391,7 +391,7 @@ const CAPABILITY_FALLBACKS = {
     {
       name: 'twilio', type: 'api',
       description: 'Twilio SMS API — market leader, easy REST API',
-      authEnv: ['TWILIO_ACCOUNT_SID', 'TWILIO_AUTH_TOKEN', 'TWILIO_PHONE_NUMBER', 'RECIPIENT_PHONE_NUMBER'],
+      authEnv: ['TWILIO_ACCOUNT_SID', 'TWILIO_AUTH_TOKEN', 'TWILIO_PHONE_NUMBER'],
       authType: 'basic',
       baseUrl: 'https://api.twilio.com',
       initSnippet: `const https = require('https');\nconst auth = Buffer.from(secrets.TWILIO_ACCOUNT_SID + ':' + secrets.TWILIO_AUTH_TOKEN).toString('base64');`,
@@ -401,7 +401,7 @@ const CAPABILITY_FALLBACKS = {
     {
       name: 'clicksend', type: 'api',
       description: 'ClickSend SMS API — HTTP Basic auth, no SDK needed',
-      authEnv: ['CLICKSEND_USERNAME', 'CLICKSEND_API_KEY', 'RECIPIENT_PHONE_NUMBER'],
+      authEnv: ['CLICKSEND_USERNAME', 'CLICKSEND_API_KEY'],
       authType: 'basic',
       baseUrl: 'https://rest.clicksend.com',
       initSnippet: `const https = require('https');\nconst auth = Buffer.from(secrets.CLICKSEND_USERNAME + ':' + secrets.CLICKSEND_API_KEY).toString('base64');`,
@@ -411,7 +411,7 @@ const CAPABILITY_FALLBACKS = {
     {
       name: 'messagebird', type: 'api',
       description: 'MessageBird SMS API — global coverage, REST API',
-      authEnv: ['MESSAGEBIRD_API_KEY', 'MESSAGEBIRD_ORIGINATOR', 'RECIPIENT_PHONE_NUMBER'],
+      authEnv: ['MESSAGEBIRD_API_KEY', 'MESSAGEBIRD_ORIGINATOR'],
       authType: 'apikey',
       baseUrl: 'https://rest.messagebird.com',
       initSnippet: `const https = require('https');`,
@@ -421,7 +421,7 @@ const CAPABILITY_FALLBACKS = {
     {
       name: 'vonage', type: 'api',
       description: 'Vonage (Nexmo) SMS API — enterprise-grade messaging',
-      authEnv: ['VONAGE_API_KEY', 'VONAGE_API_SECRET', 'VONAGE_FROM_NUMBER', 'RECIPIENT_PHONE_NUMBER'],
+      authEnv: ['VONAGE_API_KEY', 'VONAGE_API_SECRET', 'VONAGE_FROM_NUMBER'],
       authType: 'apikey',
       baseUrl: 'https://rest.nexmo.com',
       initSnippet: `const https = require('https');`,
@@ -431,7 +431,7 @@ const CAPABILITY_FALLBACKS = {
     {
       name: 'sinch', type: 'api',
       description: 'Sinch SMS API — carrier-grade, global reach',
-      authEnv: ['SINCH_SERVICE_PLAN_ID', 'SINCH_API_TOKEN', 'SINCH_FROM_NUMBER', 'RECIPIENT_PHONE_NUMBER'],
+      authEnv: ['SINCH_SERVICE_PLAN_ID', 'SINCH_API_TOKEN', 'SINCH_FROM_NUMBER'],
       authType: 'bearer',
       baseUrl: 'https://us.sms.api.sinch.com',
       initSnippet: `const https = require('https');`,

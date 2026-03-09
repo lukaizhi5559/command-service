@@ -321,9 +321,20 @@ async function run(args) {
   // Derive secretKeys from contractMd when not supplied by caller (e.g. cron run-now path)
   let resolvedSecretKeys = secretKeys || [];
   if (resolvedSecretKeys.length === 0 && skillRecord.contractMd) {
-    const secretsLine = skillRecord.contractMd.match(/^secrets:\s*(.+)$/m);
-    if (secretsLine && secretsLine[1].trim()) {
-      resolvedSecretKeys = secretsLine[1].split(',').map(s => s.trim()).filter(Boolean);
+    // Block list format:  secrets:\n  - KEY1\n  - KEY2
+    const blockMatch = skillRecord.contractMd.match(/^secrets\s*:\s*\n((?:[ \t]+-[ \t]+\S+[ \t]*\n?)+)/m);
+    if (blockMatch) {
+      resolvedSecretKeys = blockMatch[1].split('\n')
+        .map(l => l.replace(/^[ \t]+-[ \t]+/, '').trim())
+        .filter(Boolean);
+    } else {
+      // Inline format:  secrets: KEY1, KEY2
+      const inlineMatch = skillRecord.contractMd.match(/^secrets:\s*(.+)$/m);
+      if (inlineMatch && inlineMatch[1].trim()) {
+        resolvedSecretKeys = inlineMatch[1].split(/[,\s]+/).map(s => s.trim()).filter(Boolean);
+      }
+    }
+    if (resolvedSecretKeys.length > 0) {
       logger.info(`[external.skill] Resolved secretKeys from contractMd: ${resolvedSecretKeys.join(', ')}`);
     }
   }
@@ -345,7 +356,15 @@ async function run(args) {
 
   try {
     let result;
-    if (execType === 'node') {
+    // .json paths are descriptors — route to the appropriate runner, not require()
+    const basename = require('path').basename(resolvedPath);
+    if (basename === 'api.json') {
+      const skillApiRunner = require('../skill-api-runner.cjs');
+      result = await skillApiRunner.run(name, skillArgs, { contractMd: skillRecord.contractMd, timeoutMs, context });
+    } else if (basename === 'cli.json') {
+      const skillCliRunner = require('../skill-cli-runner.cjs');
+      result = await skillCliRunner.run(name, skillArgs, { contractMd: skillRecord.contractMd, timeoutMs, context });
+    } else if (execType === 'node') {
       result = await runNodeSkill(resolvedPath, skillArgs, timeoutMs, context);
     } else if (execType === 'shell') {
       result = await runShellSkill(resolvedPath, skillArgs, timeoutMs);
