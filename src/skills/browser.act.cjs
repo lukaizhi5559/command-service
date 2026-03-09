@@ -841,8 +841,11 @@ async function browserAct(args) {
     // ── getText / getPageText ─────────────────────────────────────────────────
     case 'getText':
     case 'getPageText': {
-      // Use eval to extract innerText of the page body (truncated to 50k to avoid timeout on large pages)
-      const res = await cliRun([...S, 'eval', 'document.body.innerText.slice(0,50000)'], Math.min(timeoutMs, 8000));
+      // Eval expression: wait for readyState complete, then grab innerText (fall back to textContent).
+      // Truncated to 50k to avoid timeout on large pages. Wrapping in an IIFE avoids
+      // playwright-cli treating multi-statement code as a syntax error.
+      const evalExpr = '(function(){var b=document.body;return b?(b.innerText||b.textContent||"").slice(0,50000):"";})()';
+      const res = await cliRun([...S, 'eval', evalExpr], Math.min(timeoutMs, 12000));
       // playwright-cli eval wraps output as: ### Result\n"<value>"\n### Ran Playwright code...
       // Extract just the bare value from the ### Result block
       const rawOut = res.stdout.trim();
@@ -850,14 +853,20 @@ async function browserAct(args) {
       const pageText = resultMatch
         ? resultMatch[1].trim().replace(/^"|"$/g, '')
         : rawOut;
+
+      // Non-ok with partial stdout: the eval ran but exited non-zero (common on SPA pages
+      // with pending microtasks). If we got usable text, treat as ok.
+      // Non-ok with empty stdout: page not ready — return soft-pass with empty string so
+      // the synthesize step can still work with whatever prior steps collected.
+      const effectiveOk = res.ok || pageText.length > 0;
       return {
-        ok:            res.ok,
+        ok:            effectiveOk,
         action,
         sessionId,
         stdout:        pageText,
         result:        pageText,
         executionTime: Date.now() - start,
-        error:         res.ok ? undefined : res.error,
+        error:         effectiveOk ? undefined : res.error,
       };
     }
 

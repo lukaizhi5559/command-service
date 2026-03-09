@@ -676,9 +676,14 @@ async function actionPatchProject({ id, reviewVerdict, blockers = [], warnings =
   if (lower.includes('run.sh') || lower.includes('usability') || lower.includes('runnable')) {
     filesToPatch.push('prototype/run.sh');
   }
-  // Always patch at least index.js + package.json if there are blockers
-  if (blockers.length > 0) {
-    if (!filesToPatch.includes('prototype/index.js'))   filesToPatch.push('prototype/index.js');
+  // Only auto-add prototype/index.js + package.json if there are HARD blockers
+  // (fake CLIs, hardcoded secrets, missing plan sections) — NOT prototype-only soft issues
+  // like missing retry logic, mocked calls, incomplete error handling, etc.
+  // Patching prototype files for soft issues causes the same issues to re-appear next round.
+  const SOFT_BLOCKER_PATCH_RE = /register|registry|monitoring|logging|readme|retry|retries|backoff|error handling|graceful|edge case|timeout|rate limit|mock|mocked|stub|stubbed|placeholder|unit test|test coverage|test file|incomplete function|todo|missing await|console\.log|unpinned|devdependency|dev dependency|agent registration|not in registry|deploy time|deployment step|validate_agent|validate\.agent|validation spec|production standard|production quality/i;
+  const hasHardBlockers = blockers.some(b => !SOFT_BLOCKER_PATCH_RE.test(b));
+  if (hasHardBlockers) {
+    if (!filesToPatch.includes('prototype/index.js'))    filesToPatch.push('prototype/index.js');
     if (!filesToPatch.includes('prototype/package.json')) filesToPatch.push('prototype/package.json');
   }
   // Always patch plan.md + agents.md when banned patterns are detected

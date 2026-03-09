@@ -310,26 +310,17 @@ SCHEDULING RULES — CRITICAL:
 - The skill's run() function must just execute the core logic once and return. The scheduler handles repetition.
 - Example: for "daily at 9pm", schedule = "0 21 * * *". run() fetches emails and sends SMS once. Done.
 
-BROWSER.ACT RULES — CRITICAL (browser.act is backed by playwright-cli):
-- browser.act is a function call: const { browserAct } = require('./browser.act.cjs');
-- playwright-cli keeps a persistent headed Chromium session per sessionId. After every action it returns
-  a snapshot of the accessibility tree with element refs (e1, e21, etc.) cached per session.
-- ALWAYS call snapshot before the first click/fill on a new page to ensure the ref cache is fresh:
-    await browserAct({ action: 'navigate', url: '...', sessionId: 'mySession' });
-    await browserAct({ action: 'snapshot', sessionId: 'mySession' });
-    await browserAct({ action: 'click', selector: 'Sign in', sessionId: 'mySession' });
-- Pass the VISIBLE LABEL or aria-name as selector (e.g. 'Sign in', 'Email', 'Search') — playwright-cli
-  resolves it to the correct eN ref automatically via the cached snapshot.
-- CSS selectors (#id, .class, button:has-text()) still work as a fallback.
-- For text input: use fill (selector + text) or smartType (auto-discovers best visible input):
-    await browserAct({ action: 'fill', selector: 'Email', text: 'user@example.com', sessionId });
-    await browserAct({ action: 'smartType', text: 'search query', sessionId });
-- For key press: use press (not keyboard) with playwright key names: 'Enter', 'Tab', 'Escape':
-    await browserAct({ action: 'press', key: 'Enter', sessionId });
-- For reading page content: use waitForStableText (polls until content stable) or getPageText.
-- NEVER call waitForSelector before click/fill — snapshot + label resolution handles element discovery.
-- NEVER use evaluate for DOM reads when getPageText/waitForStableText/snapshot covers the need.
-- Use the same sessionId across ALL steps for a given site — mixing sessionIds targets different tabs.
+ISOLATION RULES — CRITICAL (user skills run in a sandboxed directory):
+- NEVER use require() with relative paths (e.g. require('./browser.act.cjs'), require('../server.cjs')).
+  User skills are installed at ~/.thinkdrop/skills/<name>/index.cjs and CANNOT access any command-service files.
+- NEVER require() these command-service internals — they do NOT exist in user skill context:
+  browser.act.cjs, external.skill.cjs, skill.reviewer.cjs, creator.agent.cjs, skillCreator.skill.cjs,
+  server.cjs, skill-llm.cjs, skill-db.cjs, logger.cjs — none of these are available to user skills.
+- If the task requires reading a file path from disk, use Node.js built-in fs module: require('fs').
+- If the task requires sending content via a messaging API (SMS, email, Slack), use that service's REST API
+  directly via https.request() — do NOT attempt browser automation inside a user skill.
+- context.db and context.llm are available for persistence and LLM reasoning — use them instead of
+  trying to require() any internal files.
 
 Output: raw CommonJS code only. No markdown fences, no explanation.`;
 
@@ -779,6 +770,16 @@ async function actionGenerateSkill({ projectId, projectDir: projDir } = {}) {
     // osascript / AppleScript for messaging — unreliable, not supported
     if (/osascript|applescript|tell application/i.test(code)) {
       issues.push(`NO_OSASCRIPT: Do not use osascript or AppleScript — these are platform-specific and unreliable in production. Instead, use a suitable API or library for the service.`);
+    }
+    // Relative require() paths — these reference command-service internals and WILL FAIL in user skills
+    // User skills run in isolation under ~/.thinkdrop/skills/<name>/ and cannot access ./browser.act.cjs etc.
+    const relativeRequires = code.match(/require\s*\(\s*['"](\.\.[/\\]|\.[/\\])[^'"]+['"]\s*\)/g) || [];
+    if (relativeRequires.length > 0) {
+      issues.push(`NO_RELATIVE_REQUIRE: Relative require() paths are forbidden in user skills (${relativeRequires.slice(0,3).join(', ')}). Skills run in isolation under ~/.thinkdrop/skills/<name>/ and CANNOT access command-service internals like browser.act.cjs, external.skill.cjs, etc. Use only npm packages or Node.js built-ins. For browser automation, use context.llm.ask() or https.request() to call APIs directly.`);
+    }
+    // browser.act.cjs / external.skill.cjs — command-service internal files, never available in user skills
+    if (/browser\.act\.cjs|external\.skill\.cjs|skill\.reviewer\.cjs|creator\.agent\.cjs|skillCreator/i.test(code)) {
+      issues.push(`NO_INTERNAL_SKILL_REQUIRE: Do NOT require() command-service internal skill files (browser.act.cjs, external.skill.cjs, etc.) — these are not available in user skill context. Use npm packages or REST APIs instead.`);
     }
     return issues;
   }

@@ -1,0 +1,341 @@
+{
+  "sms": {
+    "keywords": [
+      "sms",
+      "text message",
+      "text me",
+      "send text",
+      "send sms",
+      "messaging",
+      "twilio"
+    ],
+    "providers": {
+      "twilio": {
+        "tool": "twilio",
+        "installCmd": "npm install -g twilio-cli",
+        "installSource": "npm",
+        "probeCmd": "twilio --version",
+        "helpCmd": "twilio --help",
+        "authType": "env",
+        "authEnv": [
+          "TWILIO_ACCOUNT_SID",
+          "TWILIO_AUTH_TOKEN",
+          "TWILIO_PHONE_NUMBER"
+        ],
+        "exampleCmds": [
+          "twilio api:core:messages:create --from +15551234567 --to +15559876543 --body 'Hello'"
+        ],
+        "links": [
+          {
+            "label": "Twilio Console",
+            "url": "https://console.twilio.com"
+          }
+        ]
+      }
+    },
+    "defaultProvider": "twilio"
+  },
+  "github": {
+    "keywords": [
+      "github",
+      "pull request",
+      "pr",
+      "issue",
+      "repo",
+      "repository",
+      "commit",
+      "branch",
+      "merge",
+      "git hub"
+    ],
+    "providers": {
+      "gh": {
+        "tool": "gh",
+        "installCmd": "brew install gh",
+        "installSource": "brew",
+        "probeCmd": "gh --version",
+        "helpCmd": "gh --help",
+        "authType": "oauth",
+        "authCmd": "gh auth login",
+        "authEnv": [],
+        "exampleCmds": [
+          "gh pr create --title 'My PR' --body 'Description'",
+          "gh issue create --title 'Bug' --body 'Details'",
+          "gh repo list"
+        ],
+        "links": [
+          {
+            "label": "GitHub CLI docs",
+            "url": "https://cli.github.com/manual/"
+          }
+        ]
+      }
+    },
+    "defaultProvider": "gh"
+  },
+  "slack": {
+    "keywords": [
+      "slack",
+      "post to slack",
+      "slack message",
+      "slack channel",
+      "slack notification"
+    ],
+    "providers": {
+      "slack": {
+        "tool": "slack",
+        "installCmd": "brew install --cask slack-cli",
+        "installSource": "brew-cask",
+        "probeCmd": "slack --version",
+        "helpCmd": "slack --help",
+        "authType": "env",
+        "authEnv": [
+          "SLACK_BOT_TOKEN",
+          "SLACK_CHANNEL_ID"
+        ],
+        "exampleCmds": [
+          "slack message send --channel C1234567 --text 'Hello from ThinkDrop'"
+        ],
+        "links": [
+          {
+            "label": "Slack API",
+            "url": "https://api.slack.com/apps"
+          }
+        ]
+      }
+    },
+    "defaultProvider": "slack"
+  },
+  "aws": {
+    "keywords": [
+      "aws",
+      "amazon web services",
+      "s3",
+      "ec2",
+      "lambda",
+      "dynamodb",
+      "cloudwatch",
+      "iam"
+    ],
+    "providers": {
+      "aws": {
+        "tool": "aws",
+        "installCmd": "brew install awscli",
+        "installSource": "brew",
+        "probeCmd": "aws --version",
+        "helpCmd": "aws help",
+        "authType": "env",
+        "authEnv": [
+          "AWS_ACCESS_KEY_ID",
+          "AWS_SECRET_ACCESS_KEY",
+          "AWS_REGION"
+        ],
+        "exampleCmds": [
+          "aws s3 ls",
+          "aws ec2 describe-instances",
+          "aws lambda list-functions"
+        ],
+        "links": [
+          {
+            "label": "AWS CLI docs",
+            "url": "https://docs.aws.amazon.com/cli/latest/userguide/"
+          }
+        ]
+      }
+    },
+    "defaultProvider": "aws"
+  },
+  "gcp": {
+    "keywords": [
+      "gcp",
+      "google cloud",
+      "gcloud",
+      "google cloud platform",
+      "bigquery",
+      "cloud storage",
+      "compute engine"
+    ],
+    "providers": {
+      "gcloud": {
+        "tool": "gcloud",
+        "installCmd": "brew install --cask google-cloud-sdk",
+        "installSource": "brew",
+        "probeCmd": "gcloud --version",
+        "helpCmd": "gcloud help",
+        "authType": "oauth",
+        "authCmd": "gcloud auth login",
+        "authEnv": [
+          "GOOGLE_APPLICATION_CREDENTIALS"
+        ],
+        "exampleCmds": [
+          "gcloud compute instances list",
+          "gcloud storage ls"
+        ],
+        "links": [
+          {
+            "label": "gcloud CLI docs",
+            "url": "https://cloud.google.com/sdk/gcloud"
+          }
+        ]
+      }
+    },
+    "defaultProvider": "gcloud"
+  },
+  "azure": {
+    "keywords": [
+      "azure",
+      "microsoft azure",
+      "az cli",
+      "azure storage",
+      "azure vm",
+      "azure functions"
+    ],
+    "providers": {
+      "az": {
+        "tool": "az",
+        "installCmd": "brew install azure-cli",
+        "installSource": "brew",
+        "probeCmd": "az --version",
+        "helpCmd": "az --help",
+        "authType": "oauth",
+        "authCmd": "az login",
+        "authEnv": [],
+        "exampleCmds": [
+          "az vm list",
+          "az storage account list"
+        ],
+        "links": [
+          {
+            "label": "Azure CLI docs",
+            "url": "https://docs.microsoft.com/en-us/cli/azure/"
+          }
+        ]
+      }
+    },
+    "defaultProvider": "az"
+  },
+  "pdf": {
+    "keywords": [
+      "pdf",
+      "convert to pdf",
+      "merge pdf",
+      "split pdf",
+      "pdf to",
+      "pandoc"
+    ],
+    "providers": {
+      "pandoc": {
+        "tool": "pandoc",
+        "installCmd": "brew install pandoc",
+        "installSource": "brew",
+        "probeCmd": "pandoc --version",
+        "helpCmd": "pandoc --help",
+        "authType": "none",
+        "authEnv": [],
+        "exampleCmds": [
+          "pandoc input.md -o output.pdf",
+          "pandoc input.docx -o output.html"
+        ],
+        "links": [
+          {
+            "label": "Pandoc docs",
+            "url": "https://pandoc.org/getting-started.html"
+          }
+        ]
+      }
+    },
+    "defaultProvider": "pandoc"
+  },
+  "image": {
+    "keywords": [
+      "resize image",
+      "convert image",
+      "image processing",
+      "imagemagick",
+      "compress image",
+      "image to"
+    ],
+    "providers": {
+      "magick": {
+        "tool": "magick",
+        "installCmd": "brew install imagemagick",
+        "installSource": "brew",
+        "probeCmd": "magick --version",
+        "helpCmd": "magick --help",
+        "authType": "none",
+        "authEnv": [],
+        "exampleCmds": [
+          "magick input.jpg -resize 800x600 output.jpg",
+          "magick input.png output.jpg"
+        ],
+        "links": [
+          {
+            "label": "ImageMagick docs",
+            "url": "https://imagemagick.org/script/command-line-tools.php"
+          }
+        ]
+      }
+    },
+    "defaultProvider": "magick"
+  },
+  "video": {
+    "keywords": [
+      "video",
+      "convert video",
+      "ffmpeg",
+      "compress video",
+      "extract audio",
+      "video to"
+    ],
+    "providers": {
+      "ffmpeg": {
+        "tool": "ffmpeg",
+        "installCmd": "brew install ffmpeg",
+        "installSource": "brew",
+        "probeCmd": "ffmpeg -version",
+        "helpCmd": "ffmpeg --help",
+        "authType": "none",
+        "authEnv": [],
+        "exampleCmds": [
+          "ffmpeg -i input.mp4 output.avi",
+          "ffmpeg -i input.mp4 -vn output.mp3"
+        ],
+        "links": [
+          {
+            "label": "FFmpeg docs",
+            "url": "https://ffmpeg.org/documentation.html"
+          }
+        ]
+      }
+    },
+    "defaultProvider": "ffmpeg"
+  },
+  "http": {
+    "keywords": [
+      "http request",
+      "rest api",
+      "curl",
+      "webhook",
+      "post request",
+      "get request",
+      "api call"
+    ],
+    "providers": {
+      "curl": {
+        "tool": "curl",
+        "installCmd": "brew install curl",
+        "installSource": "brew",
+        "probeCmd": "curl --version",
+        "helpCmd": "curl --help",
+        "authType": "none",
+        "authEnv": [],
+        "exampleCmds": [
+          "curl -X POST https://api.example.com/endpoint -H 'Content-Type: application/json' -d '{\"key\":\"value\"}'",
+          "curl https://api.example.com/data"
+        ],
+        "links": []
+      }
+    },
+    "defaultProvider": "curl"
+  }
+}

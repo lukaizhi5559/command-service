@@ -299,6 +299,24 @@ class CommandServiceMCPServer {
         return;
       }
 
+      // ── POST /skill.unschedule — remove a skill's cron job (called on skill delete) ─
+      if (req.method === 'POST' && req.url === '/skill.unschedule') {
+        let body = '';
+        req.on('data', chunk => { body += chunk; });
+        req.on('end', () => {
+          try {
+            const { skillName } = JSON.parse(body || '{}');
+            if (skillName) skillScheduler.unregisterSkill(skillName);
+            res.writeHead(200);
+            res.end(JSON.stringify({ ok: true }));
+          } catch (err) {
+            res.writeHead(400);
+            res.end(JSON.stringify({ error: err.message }));
+          }
+        });
+        return;
+      }
+
       // ── POST /skill.schedule/toggle — pause or resume a skill's cron job ─────
       if (req.method === 'POST' && req.url === '/skill.schedule/toggle') {
         let body = '';

@@ -1,0 +1,224 @@
+{
+  "sms": {
+    "keywords": ["sms", "text message", "text me", "send text", "send sms", "messaging", "twilio sms"],
+    "providers": {
+      "twilio": {
+        "npm": "twilio",
+        "authEnv": ["TWILIO_ACCOUNT_SID", "TWILIO_AUTH_TOKEN", "TWILIO_PHONE_NUMBER"],
+        "initSnippet": "const twilio = require('twilio'); const client = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);",
+        "exampleSnippet": "await client.messages.create({ from: process.env.TWILIO_PHONE_NUMBER, to: '+15559876543', body: 'Hello from ThinkDrop' });",
+        "links": [{ "label": "Twilio Console", "url": "https://console.twilio.com" }]
+      }
+    },
+    "defaultProvider": "twilio"
+  },
+  "email": {
+    "keywords": ["send email", "email", "gmail", "sendgrid", "mailgun", "smtp", "mailchimp", "mail"],
+    "providers": {
+      "sendgrid": {
+        "npm": "@sendgrid/mail",
+        "authEnv": ["SENDGRID_API_KEY"],
+        "initSnippet": "const sgMail = require('@sendgrid/mail'); sgMail.setApiKey(process.env.SENDGRID_API_KEY);",
+        "exampleSnippet": "await sgMail.send({ to, from, subject, text });",
+        "links": [{ "label": "SendGrid API Keys", "url": "https://app.sendgrid.com/settings/api_keys" }]
+      },
+      "mailgun": {
+        "npm": "mailgun.js",
+        "authEnv": ["MAILGUN_API_KEY", "MAILGUN_DOMAIN"],
+        "initSnippet": "const Mailgun = require('mailgun.js'); const formData = require('form-data'); const mg = new Mailgun(formData).client({ username: 'api', key: process.env.MAILGUN_API_KEY });",
+        "exampleSnippet": "await mg.messages.create(process.env.MAILGUN_DOMAIN, { from, to, subject, text });",
+        "links": [{ "label": "Mailgun API", "url": "https://app.mailgun.com/app/account/security/api_keys" }]
+      },
+      "nodemailer": {
+        "npm": "nodemailer",
+        "authEnv": ["SMTP_HOST", "SMTP_PORT", "SMTP_USER", "SMTP_PASS"],
+        "initSnippet": "const nodemailer = require('nodemailer'); const transporter = nodemailer.createTransport({ host: process.env.SMTP_HOST, port: process.env.SMTP_PORT, auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS } });",
+        "exampleSnippet": "await transporter.sendMail({ from, to, subject, text });",
+        "links": []
+      }
+    },
+    "defaultProvider": "sendgrid"
+  },
+  "stripe": {
+    "keywords": ["stripe", "payment", "charge", "subscription", "invoice", "billing", "checkout"],
+    "providers": {
+      "stripe": {
+        "npm": "stripe",
+        "authEnv": ["STRIPE_SECRET_KEY"],
+        "initSnippet": "const Stripe = require('stripe'); const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);",
+        "exampleSnippet": "const paymentIntent = await stripe.paymentIntents.create({ amount, currency: 'usd' });",
+        "links": [{ "label": "Stripe Dashboard", "url": "https://dashboard.stripe.com/apikeys" }]
+      }
+    },
+    "defaultProvider": "stripe"
+  },
+  "openai": {
+    "keywords": ["openai", "gpt", "chatgpt", "dalle", "whisper", "ai completion", "text generation", "image generation"],
+    "providers": {
+      "openai": {
+        "npm": "openai",
+        "authEnv": ["OPENAI_API_KEY"],
+        "initSnippet": "const OpenAI = require('openai'); const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });",
+        "exampleSnippet": "const response = await client.chat.completions.create({ model: 'gpt-4o', messages: [{ role: 'user', content: prompt }] });",
+        "links": [{ "label": "OpenAI API Keys", "url": "https://platform.openai.com/api-keys" }]
+      }
+    },
+    "defaultProvider": "openai"
+  },
+  "notion": {
+    "keywords": ["notion", "notion page", "notion database", "notion block"],
+    "providers": {
+      "notion": {
+        "npm": "@notionhq/client",
+        "authEnv": ["NOTION_API_KEY"],
+        "initSnippet": "const { Client } = require('@notionhq/client'); const notion = new Client({ auth: process.env.NOTION_API_KEY });",
+        "exampleSnippet": "const pages = await notion.databases.query({ database_id: databaseId });",
+        "links": [{ "label": "Notion Integrations", "url": "https://www.notion.so/my-integrations" }]
+      }
+    },
+    "defaultProvider": "notion"
+  },
+  "airtable": {
+    "keywords": ["airtable", "airtable base", "airtable record", "airtable table"],
+    "providers": {
+      "airtable": {
+        "npm": "airtable",
+        "authEnv": ["AIRTABLE_API_KEY", "AIRTABLE_BASE_ID"],
+        "initSnippet": "const Airtable = require('airtable'); const base = new Airtable({ apiKey: process.env.AIRTABLE_API_KEY }).base(process.env.AIRTABLE_BASE_ID);",
+        "exampleSnippet": "const records = await base('TableName').select().all();",
+        "links": [{ "label": "Airtable API", "url": "https://airtable.com/create/tokens" }]
+      }
+    },
+    "defaultProvider": "airtable"
+  },
+  "shopify": {
+    "keywords": ["shopify", "shopify order", "shopify product", "shopify store", "ecommerce"],
+    "providers": {
+      "shopify": {
+        "npm": "@shopify/shopify-api",
+        "authEnv": ["SHOPIFY_SHOP_DOMAIN", "SHOPIFY_ACCESS_TOKEN"],
+        "initSnippet": "const { shopifyApi, ApiVersion } = require('@shopify/shopify-api'); require('@shopify/shopify-api/adapters/node');",
+        "exampleSnippet": "const client = new shopify.clients.Rest({ session }); const orders = await client.get({ path: 'orders' });",
+        "links": [{ "label": "Shopify Partners", "url": "https://partners.shopify.com/organizations" }]
+      }
+    },
+    "defaultProvider": "shopify"
+  },
+  "hubspot": {
+    "keywords": ["hubspot", "crm", "hubspot contact", "hubspot deal", "sales pipeline"],
+    "providers": {
+      "hubspot": {
+        "npm": "@hubspot/api-client",
+        "authEnv": ["HUBSPOT_ACCESS_TOKEN"],
+        "initSnippet": "const hubspot = require('@hubspot/api-client'); const client = new hubspot.Client({ accessToken: process.env.HUBSPOT_ACCESS_TOKEN });",
+        "exampleSnippet": "const contacts = await client.crm.contacts.basicApi.getPage();",
+        "links": [{ "label": "HubSpot Private Apps", "url": "https://app.hubspot.com/private-apps" }]
+      }
+    },
+    "defaultProvider": "hubspot"
+  },
+  "twitter": {
+    "keywords": ["twitter", "tweet", "x post", "x.com", "post tweet", "twitter api"],
+    "providers": {
+      "twitter": {
+        "npm": "twitter-api-v2",
+        "authEnv": ["TWITTER_API_KEY", "TWITTER_API_SECRET", "TWITTER_ACCESS_TOKEN", "TWITTER_ACCESS_SECRET"],
+        "initSnippet": "const { TwitterApi } = require('twitter-api-v2'); const client = new TwitterApi({ appKey: process.env.TWITTER_API_KEY, appSecret: process.env.TWITTER_API_SECRET, accessToken: process.env.TWITTER_ACCESS_TOKEN, accessSecret: process.env.TWITTER_ACCESS_SECRET });",
+        "exampleSnippet": "await client.v2.tweet('Hello from ThinkDrop!');",
+        "links": [{ "label": "Twitter Developer Portal", "url": "https://developer.twitter.com/en/portal/dashboard" }]
+      }
+    },
+    "defaultProvider": "twitter"
+  },
+  "discord": {
+    "keywords": ["discord", "discord message", "discord bot", "discord channel", "discord webhook"],
+    "providers": {
+      "discord": {
+        "npm": "discord.js",
+        "authEnv": ["DISCORD_BOT_TOKEN", "DISCORD_CHANNEL_ID"],
+        "initSnippet": "const { Client, GatewayIntentBits } = require('discord.js'); const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages] });",
+        "exampleSnippet": "const channel = await client.channels.fetch(process.env.DISCORD_CHANNEL_ID); await channel.send('Hello!');",
+        "links": [{ "label": "Discord Developer Portal", "url": "https://discord.com/developers/applications" }]
+      }
+    },
+    "defaultProvider": "discord"
+  },
+  "linear": {
+    "keywords": ["linear", "linear issue", "linear ticket", "linear project", "engineering tracker"],
+    "providers": {
+      "linear": {
+        "npm": "@linear/sdk",
+        "authEnv": ["LINEAR_API_KEY"],
+        "initSnippet": "const { LinearClient } = require('@linear/sdk'); const linear = new LinearClient({ apiKey: process.env.LINEAR_API_KEY });",
+        "exampleSnippet": "const issues = await linear.issues(); const me = await linear.viewer;",
+        "links": [{ "label": "Linear API Keys", "url": "https://linear.app/settings/api" }]
+      }
+    },
+    "defaultProvider": "linear"
+  },
+  "todoist": {
+    "keywords": ["todoist", "task", "todo", "to-do list", "create task", "add task"],
+    "providers": {
+      "todoist": {
+        "npm": "@doist/todoist-api-typescript",
+        "authEnv": ["TODOIST_API_TOKEN"],
+        "initSnippet": "const { TodoistApi } = require('@doist/todoist-api-typescript'); const api = new TodoistApi(process.env.TODOIST_API_TOKEN);",
+        "exampleSnippet": "await api.addTask({ content: 'Task content', dueString: 'tomorrow' });",
+        "links": [{ "label": "Todoist Integrations", "url": "https://todoist.com/app/settings/integrations/developer" }]
+      }
+    },
+    "defaultProvider": "todoist"
+  },
+  "dropbox": {
+    "keywords": ["dropbox", "upload to dropbox", "dropbox file", "cloud storage dropbox"],
+    "providers": {
+      "dropbox": {
+        "npm": "dropbox",
+        "authEnv": ["DROPBOX_ACCESS_TOKEN"],
+        "initSnippet": "const { Dropbox } = require('dropbox'); const dbx = new Dropbox({ accessToken: process.env.DROPBOX_ACCESS_TOKEN });",
+        "exampleSnippet": "await dbx.filesUpload({ path: '/path/to/file.txt', contents: fileBuffer });",
+        "links": [{ "label": "Dropbox App Console", "url": "https://www.dropbox.com/developers/apps" }]
+      }
+    },
+    "defaultProvider": "dropbox"
+  },
+  "spotify": {
+    "keywords": ["spotify", "play song", "spotify playlist", "spotify track", "music playback"],
+    "providers": {
+      "spotify": {
+        "npm": "spotify-web-api-node",
+        "authEnv": ["SPOTIFY_CLIENT_ID", "SPOTIFY_CLIENT_SECRET", "SPOTIFY_REFRESH_TOKEN"],
+        "initSnippet": "const SpotifyWebApi = require('spotify-web-api-node'); const spotifyApi = new SpotifyWebApi({ clientId: process.env.SPOTIFY_CLIENT_ID, clientSecret: process.env.SPOTIFY_CLIENT_SECRET, refreshToken: process.env.SPOTIFY_REFRESH_TOKEN });",
+        "exampleSnippet": "const data = await spotifyApi.refreshAccessToken(); spotifyApi.setAccessToken(data.body.access_token); await spotifyApi.play({ uris: [trackUri] });",
+        "links": [{ "label": "Spotify for Developers", "url": "https://developer.spotify.com/dashboard" }]
+      }
+    },
+    "defaultProvider": "spotify"
+  },
+  "supabase": {
+    "keywords": ["supabase", "postgres", "supabase database", "supabase auth", "supabase storage"],
+    "providers": {
+      "supabase": {
+        "npm": "@supabase/supabase-js",
+        "authEnv": ["SUPABASE_URL", "SUPABASE_ANON_KEY"],
+        "initSnippet": "const { createClient } = require('@supabase/supabase-js'); const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY);",
+        "exampleSnippet": "const { data, error } = await supabase.from('table').select('*');",
+        "links": [{ "label": "Supabase Dashboard", "url": "https://supabase.com/dashboard/project/_/settings/api" }]
+      }
+    },
+    "defaultProvider": "supabase"
+  },
+  "firebase": {
+    "keywords": ["firebase", "firestore", "firebase database", "firebase auth", "firebase storage", "google firebase"],
+    "providers": {
+      "firebase": {
+        "npm": "firebase-admin",
+        "authEnv": ["FIREBASE_PROJECT_ID", "FIREBASE_CLIENT_EMAIL", "FIREBASE_PRIVATE_KEY"],
+        "initSnippet": "const admin = require('firebase-admin'); admin.initializeApp({ credential: admin.credential.cert({ projectId: process.env.FIREBASE_PROJECT_ID, clientEmail: process.env.FIREBASE_CLIENT_EMAIL, privateKey: process.env.FIREBASE_PRIVATE_KEY.replace(/\\\\n/g, '\\n') }) });",
+        "exampleSnippet": "const db = admin.firestore(); const doc = await db.collection('users').doc(userId).get();",
+        "links": [{ "label": "Firebase Console", "url": "https://console.firebase.google.com" }]
+      }
+    },
+    "defaultProvider": "firebase"
+  }
+}
