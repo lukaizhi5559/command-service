@@ -61,7 +61,9 @@
         "exampleCmds": [
           "gh pr create --title 'My PR' --body 'Description'",
           "gh issue create --title 'Bug' --body 'Details'",
-          "gh repo list"
+          "gh repo list",
+          "gh pr view <number> --json title,body,files",
+          "gh pr checks <number>"
         ],
         "links": [
           {

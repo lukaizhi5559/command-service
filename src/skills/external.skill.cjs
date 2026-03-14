@@ -328,10 +328,11 @@ async function run(args) {
         .map(l => l.replace(/^[ \t]+-[ \t]+/, '').trim())
         .filter(Boolean);
     } else {
-      // Inline format:  secrets: KEY1, KEY2
+      // Inline format:  secrets: KEY1, KEY2  or  secrets: [KEY1, KEY2]
       const inlineMatch = skillRecord.contractMd.match(/^secrets:\s*(.+)$/m);
       if (inlineMatch && inlineMatch[1].trim()) {
-        resolvedSecretKeys = inlineMatch[1].split(/[,\s]+/).map(s => s.trim()).filter(Boolean);
+        const raw = inlineMatch[1].replace(/^\[|\]$/g, ''); // strip YAML brackets
+        resolvedSecretKeys = raw.split(/[,\s]+/).map(s => s.replace(/^["']|["']$/g, '').trim()).filter(Boolean);
       }
     }
     if (resolvedSecretKeys.length > 0) {
@@ -364,6 +365,20 @@ async function run(args) {
     } else if (basename === 'cli.json') {
       const skillCliRunner = require('../skill-cli-runner.cjs');
       result = await skillCliRunner.run(name, skillArgs, { contractMd: skillRecord.contractMd, timeoutMs, context });
+    } else if (resolvedPath.endsWith('.md')) {
+      // Contract-based skills: exec_path points to skill.md (not index.cjs).
+      // These skills define their execution as shell.run/curl steps in ## Plan / ## Commands.
+      // They cannot be require()'d or spawned — planSkills must read the contractMd
+      // and generate the appropriate shell.run / browser.act steps at plan time.
+      logger.info(`[external.skill] "${name}" is a contract-based skill (skill.md) — needs planSkills routing`);
+      return {
+        ok: false,
+        skillName: name,
+        execType,
+        contractBased: true,
+        contractMd: skillRecord.contractMd || null,
+        error: `Skill "${name}" is contract-based (skill.md). It defines shell.run/curl steps in its plan section. planSkills should read the contractMd and generate execution steps — not invoke external.skill directly.`
+      };
     } else if (execType === 'node') {
       result = await runNodeSkill(resolvedPath, skillArgs, timeoutMs, context);
     } else if (execType === 'shell') {

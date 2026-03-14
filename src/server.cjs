@@ -37,6 +37,7 @@ const creatorAgent = require('./skills/creator.agent.cjs');
 const reviewerAgent = require('./skills/reviewer.agent.cjs');
 const skillCreator = require('./skills/skillCreator.skill.cjs');
 const { screenCapture } = require('./skills/screen.capture.cjs');
+const { webCrawl } = require('./skills/web.crawl.cjs');
 const skillScheduler = require('./skill-scheduler.cjs');
 
 class CommandServiceMCPServer {
@@ -127,6 +128,9 @@ class CommandServiceMCPServer {
       case 'skillCreator.skill':
         return await this._skillCreator(args);
 
+      case 'web.crawl':
+        return await this._skillWebCrawl(args);
+
       default:
         return {
           success: false,
@@ -213,6 +217,10 @@ class CommandServiceMCPServer {
 
   async _skillReviewerAgent(args) {
     return await reviewerAgent(args);
+  }
+
+  async _skillWebCrawl(args) {
+    return await webCrawl(args);
   }
 
   async _skillCreator(args) {

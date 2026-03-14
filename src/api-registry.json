@@ -1,4 +1,18 @@
 {
+  "github": {
+    "keywords": ["github", "pull request", "pr", "pr review", "code review", "issue", "repo", "repository", "commit", "branch", "merge", "git hub", "github.com"],
+    "providers": {
+      "github": {
+        "npm": "@octokit/rest",
+        "authEnv": ["GH_TOKEN"],
+        "oauth": "github",
+        "initSnippet": "const { Octokit } = require('@octokit/rest'); const octokit = new Octokit({ auth: process.env.GH_TOKEN });",
+        "exampleSnippet": "const { data: pr } = await octokit.pulls.get({ owner, repo, pull_number }); const { data: files } = await octokit.pulls.listFiles({ owner, repo, pull_number });",
+        "links": [{ "label": "GitHub REST API", "url": "https://docs.github.com/en/rest" }, { "label": "GitHub Tokens", "url": "https://github.com/settings/tokens" }]
+      }
+    },
+    "defaultProvider": "github"
+  },
   "sms": {
     "keywords": ["sms", "text message", "text me", "send text", "send sms", "messaging", "twilio sms"],
     "providers": {

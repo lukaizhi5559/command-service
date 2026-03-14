@@ -1233,6 +1233,293 @@ Output ONLY valid JSON:
   "summary": "<one sentence overall assessment>"
 }`;
 
+// ---------------------------------------------------------------------------
+// Action: preflight_check — detect CLIs needed for a task and check their status
+//
+// Called by planSkills BEFORE the LLM prompt is built. Gives the LLM accurate
+// pre-flight context so it plans the right install/auth steps upfront instead of
+// discovering missing tools mid-execution.
+//
+// Returns:
+// {
+//   ok: true,
+//   brew: { installed: bool, path: string|null },
+//   curl: { installed: bool, path: string|null },
+//   detectedClis: [{ service, cli, installed, binPath, version, authed, authStatus, installMethod, installPkg, tokenCmd }],
+//   summary: string  — compact one-liner for planSkills context injection
+// }
+// ---------------------------------------------------------------------------
+
+// LLM-based service/CLI extraction — no static keyword map needed.
+// The LLM knows about any service (Zapier, IFTTT, Airtable, Linear, Notion, etc.)
+// and returns a list of { service, cli, installMethod, installPkg } objects.
+const PREFLIGHT_EXTRACT_PROMPT = `You are a CLI pre-flight detector. Given a task description, identify every external service or CLI tool the task needs.
+
+For each service found, output a JSON array of objects with these fields:
+- service: lowercase identifier (e.g. "github", "zapier", "linear", "airtable", "docker")
+- cli: the CLI tool name if one exists for this service, or null if API-key/OAuth only (e.g. "gh" for github, null for stripe)
+- installMethod: "brew" | "npm" | "curl" | "direct" | null — how to install the CLI on macOS
+- installPkg: the brew formula / npm package name / installer URL, or null
+- isApiKey: true if the service uses API key auth (no CLI login flow), false otherwise
+- isOAuth: true if the service uses OAuth browser login (no token CLI), false otherwise
+
+Known examples:
+- github → cli="gh", installMethod="brew", installPkg="gh"
+- aws → cli="aws", installMethod="brew", installPkg="awscli"
+- docker → cli="docker", installMethod="brew", installPkg="--cask docker"
+- kubernetes/k8s → cli="kubectl", installMethod="brew", installPkg="kubectl"
+- terraform → cli="terraform", installMethod="brew", installPkg="terraform"
+- vercel → cli="vercel", installMethod="npm", installPkg="vercel"
+- netlify → cli="netlify", installMethod="npm", installPkg="netlify-cli"
+- heroku → cli="heroku", installMethod="brew", installPkg="heroku/brew/heroku"
+- stripe → cli="stripe", installMethod="brew", installPkg="stripe/stripe-cli/stripe", isApiKey=true
+- gcloud → cli="gcloud", installMethod="curl", installPkg="https://sdk.cloud.google.com"
+- fly.io → cli="flyctl", installMethod="brew", installPkg="flyctl"
+- doppler → cli="doppler", installMethod="brew", installPkg="dopplerhq/cli/doppler"
+- supabase → cli="supabase", installMethod="brew", installPkg="supabase/tap/supabase"
+- railway → cli="railway", installMethod="npm", installPkg="@railway/cli"
+- shopify → cli="shopify", installMethod="npm", installPkg="@shopify/cli"
+- wrangler/cloudflare → cli="wrangler", installMethod="npm", installPkg="wrangler"
+- twilio → cli="twilio", installMethod="npm", installPkg="twilio-cli", isApiKey=true
+- zapier → cli="zapier", installMethod="npm", installPkg="zapier-platform-cli"
+- linear → cli=null, isApiKey=true (API only)
+- airtable → cli=null, isApiKey=true (API only)
+- notion → cli=null, isApiKey=true (API only)
+- ifttt → cli=null, isOAuth=true (OAuth only)
+- slack → cli=null, isApiKey=true (Bot token)
+- gmail/google → cli=null, isOAuth=true
+- openai → cli=null, isApiKey=true
+
+If the task mentions no external services or CLIs (pure local shell/file tasks), return [].
+Return ONLY a valid JSON array. No markdown, no explanation.`;
+
+async function checkAuthStatus(binPath, tokenCmd, timeoutMs = 8000) {
+  if (!binPath || !tokenCmd || tokenCmd.length === 0) {
+    return { authed: null, authStatus: 'unknown' };
+  }
+  const r = await spawnCapture(binPath, tokenCmd, { timeoutMs });
+  // A non-zero exit with "not logged in" / "unauthenticated" = clearly not authed
+  // A non-zero exit for other reasons (network, etc.) = unknown
+  const combined = (r.stdout + r.stderr).toLowerCase();
+  if (r.ok) {
+    const tokenLike = r.stdout.trim().length > 4;
+    return { authed: tokenLike, authStatus: tokenLike ? 'authenticated' : 'no_token_returned' };
+  }
+  if (/not logged in|not authenticated|unauthenticated|login required|run.*auth.*login|please login|please authenticate|no credentials/i.test(combined)) {
+    return { authed: false, authStatus: 'not_authenticated' };
+  }
+  return { authed: null, authStatus: 'unknown' };
+}
+
+// Parse a JSON array from a raw LLM string (handles markdown fences)
+function parseJsonArray(raw) {
+  if (!raw) return null;
+  let text = raw.trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```[\s\S]*$/, '').trim();
+  const start = text.indexOf('[');
+  if (start === -1) return null;
+  text = text.substring(start);
+  let depth = 0, inStr = false, esc = false, end = -1;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (esc) { esc = false; continue; }
+    if (ch === '\\' && inStr) { esc = true; continue; }
+    if (ch === '"') { inStr = !inStr; continue; }
+    if (inStr) continue;
+    if (ch === '[') depth++;
+    else if (ch === ']') { depth--; if (depth === 0) { end = i; break; } }
+  }
+  try { return JSON.parse(end !== -1 ? text.substring(0, end + 1) : text); } catch { return null; }
+}
+
+async function actionPreflightCheck({ task, clis: explicitClis }) {
+  // 1. Always check bootstrap tools: brew + curl (run in parallel with LLM detection)
+  const bootstrapPromise = Promise.all([
+    whichCli('brew'),
+    whichCli('curl'),
+  ]);
+
+  // 2. Detect which services/CLIs are relevant to the task
+  //    Priority: explicit list > LLM extraction > KNOWN_CLI_MAP keyword fallback
+  let llmExtracted = null;
+
+  if (Array.isArray(explicitClis) && explicitClis.length > 0) {
+    // Caller passed explicit service/CLI names — build minimal meta objects
+    llmExtracted = explicitClis.map(c => ({
+      service:       c.toLowerCase().replace(/[^a-z0-9]/g, ''),
+      cli:           null,  // will resolve via KNOWN_CLI_MAP below
+      installMethod: null,
+      installPkg:    null,
+      isApiKey:      false,
+      isOAuth:       false,
+    }));
+  } else if (task) {
+    // Use LLM to extract services — works for ANY service the LLM knows about
+    try {
+      let llmModule = null;
+      try { llmModule = require('../skill-llm.cjs'); } catch (_) {}
+
+      if (llmModule?.ask) {
+        const prompt = `${PREFLIGHT_EXTRACT_PROMPT}\n\nTask: "${task}"`;
+        const raw = await llmModule.ask(prompt, { maxTokens: 400, temperature: 0.0, fastMode: true })
+          .catch(() => null);
+        if (raw) {
+          const parsed = parseJsonArray(raw);
+          if (Array.isArray(parsed)) {
+            llmExtracted = parsed;
+            logger.info(`[cli.agent] preflight_check: LLM detected ${parsed.length} service(s) — ${parsed.map(p => p.service).join(', ')}`);
+          }
+        }
+      }
+    } catch (llmErr) {
+      logger.warn(`[cli.agent] preflight_check: LLM extraction failed — ${llmErr.message}`);
+    }
+
+    // Fallback: if LLM unavailable or returned nothing, use KNOWN_CLI_MAP keyword matching
+    if (!llmExtracted) {
+      const taskLower = task.toLowerCase();
+      const knownServices = Object.keys(KNOWN_CLI_MAP);
+      const matched = knownServices.filter(svc => taskLower.includes(svc));
+      llmExtracted = matched.map(svc => ({
+        service:       svc,
+        cli:           KNOWN_CLI_MAP[svc]?.cli || null,
+        installMethod: KNOWN_CLI_MAP[svc]?.method || null,
+        installPkg:    KNOWN_CLI_MAP[svc]?.pkg || null,
+        isApiKey:      KNOWN_CLI_MAP[svc]?.isApiKey || false,
+        isOAuth:       KNOWN_CLI_MAP[svc]?.isOAuth  || false,
+      }));
+      if (matched.length > 0) {
+        logger.info(`[cli.agent] preflight_check: keyword fallback matched ${matched.length} service(s)`);
+      }
+    }
+  }
+
+  const [brewPath, curlPath] = await bootstrapPromise;
+  const brew = { installed: !!brewPath, path: brewPath };
+  const curl = { installed: !!curlPath, path: curlPath };
+
+  const servicesToCheck = llmExtracted || [];
+
+  // 3. For each detected service, resolve meta + check CLI install + auth
+  const detectedClis = [];
+
+  await Promise.all(servicesToCheck.map(async (entry) => {
+    const serviceKey = entry.service;
+
+    // Merge LLM-extracted meta with KNOWN_CLI_MAP (KNOWN_CLI_MAP has tokenCmd etc.)
+    const knownMeta = KNOWN_CLI_MAP[serviceKey] || {};
+    const meta = {
+      cli:           entry.cli  || knownMeta.cli  || null,
+      method:        entry.installMethod || knownMeta.method || 'brew',
+      pkg:           entry.installPkg   || knownMeta.pkg   || entry.cli || null,
+      tokenCmd:      knownMeta.tokenCmd || null,
+      isApiKey:      entry.isApiKey ?? knownMeta.isApiKey ?? false,
+      isOAuth:       entry.isOAuth  ?? knownMeta.isOAuth  ?? false,
+      apiKeyEnvVar:  knownMeta.apiKeyEnvVar || null,
+      apiKeyUrl:     knownMeta.apiKeyUrl   || null,
+    };
+
+    const cliName = meta.cli;
+    if (!cliName) {
+      detectedClis.push({
+        service:       serviceKey,
+        cli:           null,
+        installed:     null,
+        binPath:       null,
+        version:       null,
+        authed:        null,
+        authStatus:    meta.isOAuth ? 'oauth_required' : (meta.isApiKey ? 'api_key_required' : 'no_cli'),
+        installMethod: null,
+        installPkg:    null,
+        tokenCmd:      null,
+        apiKeyEnvVar:  meta.apiKeyEnvVar,
+        apiKeyUrl:     meta.apiKeyUrl,
+        isApiKey:      meta.isApiKey,
+        isOAuth:       meta.isOAuth,
+      });
+      return;
+    }
+
+    const binPath = await whichCli(cliName);
+    if (!binPath) {
+      detectedClis.push({
+        service:       serviceKey,
+        cli:           cliName,
+        installed:     false,
+        binPath:       null,
+        version:       null,
+        authed:        false,
+        authStatus:    'not_installed',
+        installMethod: meta.method,
+        installPkg:    meta.pkg,
+        tokenCmd:      meta.tokenCmd,
+        isApiKey:      meta.isApiKey,
+        isOAuth:       meta.isOAuth,
+      });
+      return;
+    }
+
+    // CLI is installed — get version + check auth
+    const versionResult = await spawnCapture(binPath, ['--version'], { timeoutMs: 6000 });
+    const version = (versionResult.stdout || versionResult.stderr).split('\n')[0].trim() || null;
+
+    const authResult = meta.tokenCmd
+      ? await checkAuthStatus(binPath, meta.tokenCmd, 8000)
+      : { authed: null, authStatus: 'no_auth_check' };
+
+    detectedClis.push({
+      service:       serviceKey,
+      cli:           cliName,
+      installed:     true,
+      binPath,
+      version,
+      authed:        authResult.authed,
+      authStatus:    authResult.authStatus,
+      installMethod: meta.method,
+      installPkg:    meta.pkg,
+      tokenCmd:      meta.tokenCmd,
+      isApiKey:      meta.isApiKey,
+      isOAuth:       meta.isOAuth,
+    });
+  }));
+
+  // 4. Build compact summary for planSkills context injection
+  const brewNote = brew.installed ? `brew ✓` : `brew NOT INSTALLED (macOS: /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)")`;
+  const curlNote = curl.installed ? `curl ✓` : `curl NOT INSTALLED`;
+
+  const cliNotes = detectedClis.map(c => {
+    if (!c.cli) {
+      if (c.isOAuth)   return `${c.service}: OAuth-based (no CLI) — browser setup required`;
+      if (c.isApiKey)  return `${c.service}: API key required (${c.apiKeyEnvVar || 'check service settings'}) — no CLI`;
+      return `${c.service}: no CLI available`;
+    }
+    if (!c.installed) {
+      const installCmd = c.installMethod === 'npm'
+        ? `npm install -g ${c.installPkg}`
+        : `brew install ${c.installPkg || c.cli}`;
+      return `${c.cli} (${c.service}): NOT INSTALLED — install with: ${installCmd}`;
+    }
+    if (c.authStatus === 'not_authenticated') {
+      return `${c.cli} (${c.service}): installed (${c.version}) — NOT AUTHENTICATED`;
+    }
+    if (c.authStatus === 'authenticated') {
+      return `${c.cli} (${c.service}): installed (${c.version}) — authenticated ✓`;
+    }
+    return `${c.cli} (${c.service}): installed (${c.version}) — auth unknown`;
+  });
+
+  const summary = [brewNote, curlNote, ...cliNotes].join(' | ');
+
+  logger.info(`[cli.agent] preflight_check: ${detectedClis.length} CLI(s) detected — ${summary.slice(0, 200)}`);
+
+  return {
+    ok: true,
+    brew,
+    curl,
+    detectedClis,
+    summary,
+  };
+}
+
 async function actionReviewSeedMap() {
   const entries = Object.entries(KNOWN_CLI_MAP).map(([svc, meta]) => ({
     service: svc,
@@ -1313,10 +1600,13 @@ async function cliAgent(args) {
     case 'review_seed_map':
       return await actionReviewSeedMap(args);
 
+    case 'preflight_check':
+      return await actionPreflightCheck(args);
+
     default:
       return {
         ok: false,
-        error: `Unknown action: "${action}". Valid: discover | install | run | build_agent | query_agent | list_agents | validate_agent | record_failure | review_seed_map`,
+        error: `Unknown action: "${action}". Valid: discover | install | run | build_agent | query_agent | list_agents | validate_agent | record_failure | review_seed_map | preflight_check`,
       };
   }
 }

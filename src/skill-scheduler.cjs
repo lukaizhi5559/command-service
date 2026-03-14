@@ -242,7 +242,7 @@ async function syncScheduledSkills() {
     const fm = parseFrontmatter(full?.contractMd || '');
     const schedule = fm.schedule || 'on_demand';
 
-    if (!schedule || schedule === 'on_demand') continue;
+    if (!schedule || schedule === 'on_demand' || schedule === 'null' || schedule === 'false' || schedule === 'none') continue;
 
     const execPath = full?.execPath || row.execPath || path.join(os.homedir(), '.thinkdrop', 'skills', skillName, 'index.cjs');
     const cronId   = `skill_${skillName.replace(/\./g, '_')}`;

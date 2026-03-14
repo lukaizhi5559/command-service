@@ -123,7 +123,9 @@ Rules:
 - Do NOT use any relative require() paths
 - Do NOT call process.exit()
 - CRITICAL: Use ONLY ASCII characters — no smart quotes, no curly quotes, no unicode dashes
-- CRITICAL: Always call req.setTimeout(10000, () => { req.destroy(new Error('Request timed out')); }) on every https.request so the process never hangs`
+- CRITICAL: Always call req.setTimeout(10000, () => { req.destroy(new Error('Request timed out')); }) on every https.request so the process never hangs
+- CRITICAL: NEVER use secrets.KEY or context.secrets.KEY — always use process.env.KEY_NAME
+- CRITICAL: For phone numbers (args.to, args.phone, args.phoneNumber, args.phone_number, args.recipient), normalize to E.164 before sending: const raw = String(args.to||args.phoneNumber||args.phone||'').replace(/\D/g,''); const to = raw.length===10 ? '+1'+raw : '+'+raw;`
     : `You are a Node.js code generator for API SDK calls. Generate a minimal CommonJS async IIFE that accomplishes the user intent using the given SDK.
 
 Rules:
@@ -136,7 +138,8 @@ Rules:
 - Keep it minimal — just the init + one API call + output
 - Do NOT use any relative require() paths
 - Do NOT call process.exit()
-- CRITICAL: Use ONLY ASCII characters — no smart quotes, no curly quotes, no unicode dashes`;
+- CRITICAL: Use ONLY ASCII characters — no smart quotes, no curly quotes, no unicode dashes
+- CRITICAL: NEVER use secrets.KEY or context.secrets.KEY — always use process.env.KEY_NAME`;
 
   const user = isNativeHttp
     ? `API: native HTTPS (no npm package — use built-in https module)
@@ -151,6 +154,11 @@ ${secretsSummary}
 
 User intent: ${intent}
 
+Generate the complete async IIFE. CRITICAL requirements:
+1. Capture the result of every await call into a variable
+2. Always end with: console.log(JSON.stringify({ ok: true, result: <captured_result> }))
+3. Wrap in try/catch: catch(err){ console.log(JSON.stringify({ ok: false, error: err.message })) }
+4. Never leave an await result uncaptured — always assign it: const result = await new Promise(...)
 Generate the complete async IIFE Node.js snippet using only built-in https:`
     : `SDK npm package: ${apiConfig.npm}
 
@@ -164,6 +172,11 @@ ${secretsSummary}
 
 User intent: ${intent}
 
+Generate the complete async IIFE. CRITICAL requirements:
+1. Capture the result of every await call into a variable
+2. Always end with: console.log(JSON.stringify({ ok: true, result: <captured_result> }))
+3. Wrap in try/catch: catch(err){ console.log(JSON.stringify({ ok: false, error: err.message })) }
+4. Never leave an await result uncaptured — always assign it: const result = await ...
 Generate the complete async IIFE Node.js snippet:`;
 
   /**
@@ -320,9 +333,21 @@ async function run(skillName, args = {}, opts = {}) {
   }
 
   // ── 3. Build intent string from args ────────────────────────────────────────
-  const intent = typeof args === 'string'
-    ? args
-    : Object.entries(args)
+  // Normalize phone number fields to E.164 before passing to LLM
+  const normalizedArgs = typeof args === 'object' && args !== null
+    ? Object.fromEntries(Object.entries(args).map(([k, v]) => {
+        if (['to', 'phone', 'phonenumber', 'phoneNumber', 'phone_number', 'recipient', 'number'].includes(k) && typeof v === 'string') {
+          const digits = v.replace(/\D/g, '');
+          if (digits.length === 10) return [k, '+1' + digits];
+          if (digits.length === 11 && digits[0] === '1') return [k, '+' + digits];
+        }
+        return [k, v];
+      }))
+    : args;
+
+  const intent = typeof normalizedArgs === 'string'
+    ? normalizedArgs
+    : Object.entries(normalizedArgs)
         .filter(([k]) => k !== 'name' && k !== 'secretKeys')
         .map(([k, v]) => `${k}: ${String(v).slice(0, 200)}`)
         .join(', ');
@@ -341,7 +366,9 @@ async function run(skillName, args = {}, opts = {}) {
   }
 
   // ── 5. Execute snippet in isolated child process ─────────────────────────────
+  logger.info(`[SkillAPIRunner] Executing snippet for "${skillName}":\n${snippet}`);
   const execResult = executeSnippet(snippet, skillDir, secretsEnv, 20000);
+  logger.info(`[SkillAPIRunner] Execution result for "${skillName}": ok=${execResult.ok} result=${JSON.stringify(execResult.result)} raw=${execResult.raw} error=${execResult.error}`);
   if (execResult.ok) {
     return { ok: true, snippet, result: execResult.result };
   }

@@ -245,21 +245,68 @@ async function validateRegistryEntry(type, config) {
       return { valid: true, reason: `${tool} already installed`, helpText };
     }
 
-    // Not on PATH — verify the install source is real
+    // Not on PATH — ensure brew exists (install if needed), then install the formula
     if (installSource === 'brew' || installSource === 'brew-cask') {
       const isCask = installSource === 'brew-cask';
       const formula = (installCmd || '')
         .replace(/^brew install\s+(--cask\s+)?/i, '').trim();
       if (!formula) return { valid: false, reason: 'No brew formula in installCmd', helpText: null };
-      const args = isCask
-        ? ['info', '--cask', formula]
-        : ['info', formula, '--json'];
-      const r = spawnSync('brew', args, { timeout: 10000, encoding: 'utf8' });
-      if (r.status === 0 && r.stdout && !r.stdout.includes('No available formula') && !r.stdout.includes('No Cask')) {
-        logger.info(`[SkillScout] Validate CLI: brew ${isCask ? 'cask' : 'formula'} ${formula} exists`);
-        return { valid: true, reason: `brew ${isCask ? 'cask' : 'formula'} ${formula} exists`, helpText: null };
+
+      // ── Step 1: ensure brew is installed ─────────────────────────────────────
+      let brewPath = whichBinary('brew');
+      if (!brewPath) {
+        logger.info('[SkillScout] brew not found — installing Homebrew (this takes ~2 min first time)…');
+        const brewInstall = spawnSync('/bin/bash', [
+          '-c',
+          'NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"',
+        ], { timeout: 300000, encoding: 'utf8', env: { ...process.env, NONINTERACTIVE: '1' } });
+
+        if (brewInstall.status !== 0) {
+          logger.warn(`[SkillScout] Homebrew install failed: ${(brewInstall.stderr || '').slice(0, 300)}`);
+          return { valid: false, reason: 'Homebrew install failed — cannot proceed with brew-based CLI', helpText: null };
+        }
+
+        // Homebrew may land in /opt/homebrew/bin (Apple Silicon) or /usr/local/bin (Intel)
+        const appleBrewPath = '/opt/homebrew/bin/brew';
+        const intelBrewPath = '/usr/local/bin/brew';
+        brewPath = fs.existsSync(appleBrewPath) ? appleBrewPath
+                 : fs.existsSync(intelBrewPath) ? intelBrewPath
+                 : whichBinary('brew');
+
+        if (!brewPath) {
+          return { valid: false, reason: 'Homebrew installed but brew binary not found on PATH', helpText: null };
+        }
+        logger.info(`[SkillScout] Homebrew installed at ${brewPath}`);
       }
-      return { valid: false, reason: `brew ${isCask ? 'cask' : 'formula'} ${formula} not found`, helpText: null };
+
+      // ── Step 2: brew install the formula ────────────────────────────────────
+      logger.info(`[SkillScout] brew install ${isCask ? '--cask ' : ''}${formula}…`);
+      const installArgs = isCask ? ['install', '--cask', formula] : ['install', formula];
+      const installResult = spawnSync(brewPath, installArgs, {
+        timeout: 300000,
+        encoding: 'utf8',
+        env: { ...process.env, PATH: `${path.dirname(brewPath)}:${process.env.PATH}` },
+      });
+
+      if (installResult.status !== 0) {
+        logger.warn(`[SkillScout] brew install ${formula} failed: ${(installResult.stderr || '').slice(0, 300)}`);
+        return { valid: false, reason: `brew install ${formula} failed`, helpText: null };
+      }
+
+      // ── Step 3: grab --help text now that the tool is installed ─────────────
+      let helpText = null;
+      if (tool) {
+        try {
+          const brewBin = path.join(path.dirname(brewPath), tool);
+          const binToUse = whichBinary(tool) || (fs.existsSync(brewBin) ? brewBin : null);
+          if (binToUse) {
+            const h = spawnSync(binToUse, ['--help'], { timeout: 6000, encoding: 'utf8' });
+            helpText = ((h.stdout || '') + (h.stderr || '')).trim().slice(0, 2000) || null;
+          }
+        } catch (_) {}
+      }
+      logger.info(`[SkillScout] ${tool || formula} installed via brew`);
+      return { valid: true, reason: `${tool || formula} installed via brew`, helpText };
     }
 
     if (installSource === 'npm') {

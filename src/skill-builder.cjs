@@ -38,6 +38,7 @@
  */
 
 const { spawnSync } = require('child_process');
+const fs            = require('fs');
 const http          = require('http');
 const os            = require('os');
 const logger        = require('./logger.cjs');
@@ -153,15 +154,24 @@ function checkPrereqs() {
   let brew   = !!whichBinary('brew');
 
   if (!brew && process.platform === 'darwin') {
-    logger.info('[SkillBuilder] brew not found — attempting install via /bin/bash');
-    try {
-      // Non-interactive homebrew install (writes to /opt/homebrew or /usr/local)
-      spawnSync('/bin/bash', [
-        '-c',
-        'NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"',
-      ], { timeout: 120000, encoding: 'utf8', stdio: 'pipe' });
-      brew = !!whichBinary('brew');
-    } catch (_) {}
+    // Check well-known paths first — Electron's PATH often omits /opt/homebrew/bin
+    const knownBrewPaths = ['/opt/homebrew/bin/brew', '/usr/local/bin/brew'];
+    const existingBrew = knownBrewPaths.find(p => fs.existsSync(p));
+    if (existingBrew) {
+      brew = true;
+      logger.info(`[SkillBuilder] brew found at ${existingBrew} (not on PATH)`);
+    } else {
+      logger.info('[SkillBuilder] brew not found — attempting install via /bin/bash');
+      try {
+        spawnSync('/bin/bash', [
+          '-c',
+          'NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"',
+        ], { timeout: 120000, encoding: 'utf8', stdio: 'pipe' });
+        brew = !!whichBinary('brew')
+          || fs.existsSync('/opt/homebrew/bin/brew')
+          || fs.existsSync('/usr/local/bin/brew');
+      } catch (_) {}
+    }
   }
 
   logger.info(`[SkillBuilder] Prereqs — node:${node} npm:${npm} brew:${brew}`);
@@ -394,8 +404,8 @@ const CAPABILITY_FALLBACKS = {
       authEnv: ['TWILIO_ACCOUNT_SID', 'TWILIO_AUTH_TOKEN', 'TWILIO_PHONE_NUMBER'],
       authType: 'basic',
       baseUrl: 'https://api.twilio.com',
-      initSnippet: `const https = require('https');\nconst auth = Buffer.from(secrets.TWILIO_ACCOUNT_SID + ':' + secrets.TWILIO_AUTH_TOKEN).toString('base64');`,
-      exampleSnippet: `const body = new URLSearchParams({ To: secrets.RECIPIENT_PHONE_NUMBER, From: secrets.TWILIO_PHONE_NUMBER, Body: message }).toString();\nconst req = https.request({ hostname: 'api.twilio.com', path: \`/2010-04-01/Accounts/\${secrets.TWILIO_ACCOUNT_SID}/Messages.json\`, method: 'POST', headers: { Authorization: 'Basic ' + auth, 'Content-Type': 'application/x-www-form-urlencoded', 'Content-Length': Buffer.byteLength(body) } }, res => { let d=''; res.on('data',c=>d+=c); res.on('end',()=>resolve(JSON.parse(d))); });\nreq.on('error', reject); req.write(body); req.end();`,
+      initSnippet: `const https = require('https');\nconst auth = Buffer.from(process.env.TWILIO_ACCOUNT_SID + ':' + process.env.TWILIO_AUTH_TOKEN).toString('base64');`,
+      exampleSnippet: `const body = new URLSearchParams({ To: args.to, From: process.env.TWILIO_PHONE_NUMBER, Body: args.message }).toString();\nawait new Promise((resolve, reject) => {\n  const req = https.request({ hostname: 'api.twilio.com', path: \`/2010-04-01/Accounts/\${process.env.TWILIO_ACCOUNT_SID}/Messages.json\`, method: 'POST', headers: { Authorization: 'Basic ' + auth, 'Content-Type': 'application/x-www-form-urlencoded', 'Content-Length': Buffer.byteLength(body) } }, res => { let d=''; res.on('data',c=>d+=c); res.on('end',()=>resolve(JSON.parse(d))); });\n  req.setTimeout(10000, () => { req.destroy(new Error('Request timed out')); });\n  req.on('error', reject); req.write(body); req.end();\n});`,
       links: [{ label: 'Twilio Console', url: 'https://console.twilio.com' }, { label: 'Twilio SMS Docs', url: 'https://www.twilio.com/docs/sms/api' }],
     },
     {
@@ -404,8 +414,8 @@ const CAPABILITY_FALLBACKS = {
       authEnv: ['CLICKSEND_USERNAME', 'CLICKSEND_API_KEY'],
       authType: 'basic',
       baseUrl: 'https://rest.clicksend.com',
-      initSnippet: `const https = require('https');\nconst auth = Buffer.from(secrets.CLICKSEND_USERNAME + ':' + secrets.CLICKSEND_API_KEY).toString('base64');`,
-      exampleSnippet: `const payload = JSON.stringify({ messages: [{ to: secrets.RECIPIENT_PHONE_NUMBER, body: message, source: 'thinkdrop' }] });\nconst req = https.request({ hostname: 'rest.clicksend.com', path: '/v3/sms/send', method: 'POST', headers: { Authorization: 'Basic ' + auth, 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) } }, res => { let d=''; res.on('data',c=>d+=c); res.on('end',()=>resolve(JSON.parse(d))); });\nreq.on('error', reject); req.write(payload); req.end();`,
+      initSnippet: `const https = require('https');\nconst auth = Buffer.from(process.env.CLICKSEND_USERNAME + ':' + process.env.CLICKSEND_API_KEY).toString('base64');`,
+      exampleSnippet: `const rawTo = String(args.to).replace(/\\D/g,''); const to = rawTo.length === 10 ? '+1' + rawTo : '+' + rawTo;\nconst payload = JSON.stringify({ messages: [{ to, body: args.message, source: 'thinkdrop' }] });\nawait new Promise((resolve, reject) => {\n  const buf = Buffer.from(payload);\n  const req = https.request({ hostname: 'rest.clicksend.com', path: '/v3/sms/send', method: 'POST', headers: { Authorization: 'Basic ' + auth, 'Content-Type': 'application/json', 'Content-Length': buf.length } }, res => { let d=''; res.on('data',c=>d+=c); res.on('end',()=>resolve(JSON.parse(d))); });\n  req.setTimeout(10000, () => { req.destroy(new Error('Request timed out')); });\n  req.on('error', reject); req.write(payload); req.end();\n});`,
       links: [{ label: 'ClickSend Dashboard', url: 'https://dashboard.clicksend.com' }, { label: 'ClickSend SMS API Docs', url: 'https://developers.clicksend.com/docs/rest/v3/#send-sms' }],
     },
     {
@@ -415,7 +425,7 @@ const CAPABILITY_FALLBACKS = {
       authType: 'apikey',
       baseUrl: 'https://rest.messagebird.com',
       initSnippet: `const https = require('https');`,
-      exampleSnippet: `const payload = JSON.stringify({ recipients: [secrets.RECIPIENT_PHONE_NUMBER], originator: secrets.MESSAGEBIRD_ORIGINATOR, body: message });\nconst req = https.request({ hostname: 'rest.messagebird.com', path: '/messages', method: 'POST', headers: { Authorization: 'AccessKey ' + secrets.MESSAGEBIRD_API_KEY, 'Content-Type': 'application/json' } }, res => { let d=''; res.on('data',c=>d+=c); res.on('end',()=>resolve(JSON.parse(d))); });\nreq.on('error', reject); req.write(payload); req.end();`,
+      exampleSnippet: `const payload = JSON.stringify({ recipients: [args.to], originator: process.env.MESSAGEBIRD_ORIGINATOR, body: args.message });\nawait new Promise((resolve, reject) => {\n  const buf = Buffer.from(payload);\n  const req = https.request({ hostname: 'rest.messagebird.com', path: '/messages', method: 'POST', headers: { Authorization: 'AccessKey ' + process.env.MESSAGEBIRD_API_KEY, 'Content-Type': 'application/json', 'Content-Length': buf.length } }, res => { let d=''; res.on('data',c=>d+=c); res.on('end',()=>resolve(JSON.parse(d))); });\n  req.setTimeout(10000, () => { req.destroy(new Error('Request timed out')); });\n  req.on('error', reject); req.write(payload); req.end();\n});`,
       links: [{ label: 'MessageBird Dashboard', url: 'https://dashboard.messagebird.com' }, { label: 'MessageBird SMS Docs', url: 'https://developers.messagebird.com/api/sms-messaging/' }],
     },
     {
@@ -425,7 +435,7 @@ const CAPABILITY_FALLBACKS = {
       authType: 'apikey',
       baseUrl: 'https://rest.nexmo.com',
       initSnippet: `const https = require('https');`,
-      exampleSnippet: `const payload = JSON.stringify({ api_key: secrets.VONAGE_API_KEY, api_secret: secrets.VONAGE_API_SECRET, to: secrets.RECIPIENT_PHONE_NUMBER, from: secrets.VONAGE_FROM_NUMBER, text: message });\nconst req = https.request({ hostname: 'rest.nexmo.com', path: '/sms/json', method: 'POST', headers: { 'Content-Type': 'application/json' } }, res => { let d=''; res.on('data',c=>d+=c); res.on('end',()=>resolve(JSON.parse(d))); });\nreq.on('error', reject); req.write(payload); req.end();`,
+      exampleSnippet: `const payload = JSON.stringify({ api_key: process.env.VONAGE_API_KEY, api_secret: process.env.VONAGE_API_SECRET, to: args.to, from: process.env.VONAGE_FROM_NUMBER, text: args.message });\nawait new Promise((resolve, reject) => {\n  const buf = Buffer.from(payload);\n  const req = https.request({ hostname: 'rest.nexmo.com', path: '/sms/json', method: 'POST', headers: { 'Content-Type': 'application/json', 'Content-Length': buf.length } }, res => { let d=''; res.on('data',c=>d+=c); res.on('end',()=>resolve(JSON.parse(d))); });\n  req.setTimeout(10000, () => { req.destroy(new Error('Request timed out')); });\n  req.on('error', reject); req.write(payload); req.end();\n});`,
       links: [{ label: 'Vonage Dashboard', url: 'https://dashboard.nexmo.com' }, { label: 'Vonage SMS Docs', url: 'https://developer.vonage.com/messaging/sms/overview' }],
     },
     {
@@ -435,7 +445,7 @@ const CAPABILITY_FALLBACKS = {
       authType: 'bearer',
       baseUrl: 'https://us.sms.api.sinch.com',
       initSnippet: `const https = require('https');`,
-      exampleSnippet: `const payload = JSON.stringify({ from: secrets.SINCH_FROM_NUMBER, to: [secrets.RECIPIENT_PHONE_NUMBER], body: message });\nconst req = https.request({ hostname: 'us.sms.api.sinch.com', path: \`/xms/v1/\${secrets.SINCH_SERVICE_PLAN_ID}/batches\`, method: 'POST', headers: { Authorization: 'Bearer ' + secrets.SINCH_API_TOKEN, 'Content-Type': 'application/json' } }, res => { let d=''; res.on('data',c=>d+=c); res.on('end',()=>resolve(JSON.parse(d))); });\nreq.on('error', reject); req.write(payload); req.end();`,
+      exampleSnippet: `const payload = JSON.stringify({ from: process.env.SINCH_FROM_NUMBER, to: [args.to], body: args.message });\nawait new Promise((resolve, reject) => {\n  const buf = Buffer.from(payload);\n  const req = https.request({ hostname: 'us.sms.api.sinch.com', path: \`/xms/v1/\${process.env.SINCH_SERVICE_PLAN_ID}/batches\`, method: 'POST', headers: { Authorization: 'Bearer ' + process.env.SINCH_API_TOKEN, 'Content-Type': 'application/json', 'Content-Length': buf.length } }, res => { let d=''; res.on('data',c=>d+=c); res.on('end',()=>resolve(JSON.parse(d))); });\n  req.setTimeout(10000, () => { req.destroy(new Error('Request timed out')); });\n  req.on('error', reject); req.write(payload); req.end();\n});`,
       links: [{ label: 'Sinch Dashboard', url: 'https://dashboard.sinch.com' }, { label: 'Sinch SMS Docs', url: 'https://developers.sinch.com/docs/sms/api-reference/' }],
     },
   ],
@@ -443,41 +453,41 @@ const CAPABILITY_FALLBACKS = {
     {
       name: 'sendgrid', type: 'api',
       description: 'SendGrid email API — widely used, free tier available',
-      authEnv: ['SENDGRID_API_KEY', 'SENDER_EMAIL', 'RECIPIENT_EMAIL'],
+      authEnv: ['SENDGRID_API_KEY', 'SENDER_EMAIL'],
       authType: 'bearer',
       baseUrl: 'https://api.sendgrid.com',
       initSnippet: `const https = require('https');`,
-      exampleSnippet: `const payload = JSON.stringify({ personalizations:[{to:[{email:secrets.RECIPIENT_EMAIL}]}], from:{email:secrets.SENDER_EMAIL}, subject, content:[{type:'text/plain',value:message}] });\nconst req = https.request({ hostname:'api.sendgrid.com', path:'/v3/mail/send', method:'POST', headers:{ Authorization:'Bearer '+secrets.SENDGRID_API_KEY, 'Content-Type':'application/json' } }, res=>{let d='';res.on('data',c=>d+=c);res.on('end',()=>resolve(d));});\nreq.on('error',reject); req.write(payload); req.end();`,
+      exampleSnippet: `const payload = JSON.stringify({ personalizations:[{to:[{email:args.to}]}], from:{email:process.env.SENDER_EMAIL}, subject: args.subject || 'Message', content:[{type:'text/plain',value:args.message}] });\nawait new Promise((resolve, reject) => {\n  const buf = Buffer.from(payload);\n  const req = https.request({ hostname:'api.sendgrid.com', path:'/v3/mail/send', method:'POST', headers:{ Authorization:'Bearer '+process.env.SENDGRID_API_KEY, 'Content-Type':'application/json', 'Content-Length':buf.length } }, res=>{let d='';res.on('data',c=>d+=c);res.on('end',()=>resolve(d));});\n  req.setTimeout(10000, () => { req.destroy(new Error('Request timed out')); });\n  req.on('error',reject); req.write(payload); req.end();\n});`,
       links: [{ label: 'SendGrid Dashboard', url: 'https://app.sendgrid.com' }, { label: 'SendGrid Mail Send Docs', url: 'https://docs.sendgrid.com/api-reference/mail-send/mail-send' }],
     },
     {
       name: 'resend', type: 'api',
       description: 'Resend — modern developer-first email API',
-      authEnv: ['RESEND_API_KEY', 'SENDER_EMAIL', 'RECIPIENT_EMAIL'],
+      authEnv: ['RESEND_API_KEY', 'SENDER_EMAIL'],
       authType: 'bearer',
       baseUrl: 'https://api.resend.com',
       initSnippet: `const https = require('https');`,
-      exampleSnippet: `const payload = JSON.stringify({ from: secrets.SENDER_EMAIL, to: [secrets.RECIPIENT_EMAIL], subject, html: message });\nconst req = https.request({ hostname:'api.resend.com', path:'/emails', method:'POST', headers:{ Authorization:'Bearer '+secrets.RESEND_API_KEY, 'Content-Type':'application/json' } }, res=>{let d='';res.on('data',c=>d+=c);res.on('end',()=>resolve(JSON.parse(d)));});\nreq.on('error',reject); req.write(payload); req.end();`,
+      exampleSnippet: `const payload = JSON.stringify({ from: process.env.SENDER_EMAIL, to: [args.to], subject: args.subject || 'Message', html: args.message });\nawait new Promise((resolve, reject) => {\n  const buf = Buffer.from(payload);\n  const req = https.request({ hostname:'api.resend.com', path:'/emails', method:'POST', headers:{ Authorization:'Bearer '+process.env.RESEND_API_KEY, 'Content-Type':'application/json', 'Content-Length':buf.length } }, res=>{let d='';res.on('data',c=>d+=c);res.on('end',()=>resolve(JSON.parse(d)));});\n  req.setTimeout(10000, () => { req.destroy(new Error('Request timed out')); });\n  req.on('error',reject); req.write(payload); req.end();\n});`,
       links: [{ label: 'Resend Dashboard', url: 'https://resend.com/overview' }, { label: 'Resend API Docs', url: 'https://resend.com/docs/api-reference/emails/send-email' }],
     },
     {
       name: 'mailgun', type: 'api',
       description: 'Mailgun transactional email API',
-      authEnv: ['MAILGUN_API_KEY', 'MAILGUN_DOMAIN', 'SENDER_EMAIL', 'RECIPIENT_EMAIL'],
+      authEnv: ['MAILGUN_API_KEY', 'MAILGUN_DOMAIN', 'SENDER_EMAIL'],
       authType: 'basic',
       baseUrl: 'https://api.mailgun.net',
-      initSnippet: `const https = require('https');\nconst auth = Buffer.from('api:' + secrets.MAILGUN_API_KEY).toString('base64');`,
-      exampleSnippet: `const body = new URLSearchParams({ from: secrets.SENDER_EMAIL, to: secrets.RECIPIENT_EMAIL, subject, text: message }).toString();\nconst req = https.request({ hostname:'api.mailgun.net', path:\`/v3/\${secrets.MAILGUN_DOMAIN}/messages\`, method:'POST', headers:{ Authorization:'Basic '+auth, 'Content-Type':'application/x-www-form-urlencoded' } }, res=>{let d='';res.on('data',c=>d+=c);res.on('end',()=>resolve(JSON.parse(d)));});\nreq.on('error',reject); req.write(body); req.end();`,
+      initSnippet: `const https = require('https');\nconst auth = Buffer.from('api:' + process.env.MAILGUN_API_KEY).toString('base64');`,
+      exampleSnippet: `const body = new URLSearchParams({ from: process.env.SENDER_EMAIL, to: args.to, subject: args.subject || 'Message', text: args.message }).toString();\nawait new Promise((resolve, reject) => {\n  const req = https.request({ hostname:'api.mailgun.net', path:\`/v3/\${process.env.MAILGUN_DOMAIN}/messages\`, method:'POST', headers:{ Authorization:'Basic '+auth, 'Content-Type':'application/x-www-form-urlencoded', 'Content-Length':Buffer.byteLength(body) } }, res=>{let d='';res.on('data',c=>d+=c);res.on('end',()=>resolve(JSON.parse(d)));});\n  req.setTimeout(10000, () => { req.destroy(new Error('Request timed out')); });\n  req.on('error',reject); req.write(body); req.end();\n});`,
       links: [{ label: 'Mailgun Dashboard', url: 'https://app.mailgun.com' }, { label: 'Mailgun Send Docs', url: 'https://documentation.mailgun.com/docs/mailgun/api-reference/openapi-final/tag/Messages/' }],
     },
     {
       name: 'postmark', type: 'api',
       description: 'Postmark — fast transactional email delivery',
-      authEnv: ['POSTMARK_SERVER_TOKEN', 'SENDER_EMAIL', 'RECIPIENT_EMAIL'],
+      authEnv: ['POSTMARK_SERVER_TOKEN', 'SENDER_EMAIL'],
       authType: 'apikey',
       baseUrl: 'https://api.postmarkapp.com',
       initSnippet: `const https = require('https');`,
-      exampleSnippet: `const payload = JSON.stringify({ From: secrets.SENDER_EMAIL, To: secrets.RECIPIENT_EMAIL, Subject: subject, TextBody: message });\nconst req = https.request({ hostname:'api.postmarkapp.com', path:'/email', method:'POST', headers:{ 'X-Postmark-Server-Token': secrets.POSTMARK_SERVER_TOKEN, 'Content-Type':'application/json' } }, res=>{let d='';res.on('data',c=>d+=c);res.on('end',()=>resolve(JSON.parse(d)));});\nreq.on('error',reject); req.write(payload); req.end();`,
+      exampleSnippet: `const payload = JSON.stringify({ From: process.env.SENDER_EMAIL, To: args.to, Subject: args.subject || 'Message', TextBody: args.message });\nawait new Promise((resolve, reject) => {\n  const buf = Buffer.from(payload);\n  const req = https.request({ hostname:'api.postmarkapp.com', path:'/email', method:'POST', headers:{ 'X-Postmark-Server-Token': process.env.POSTMARK_SERVER_TOKEN, 'Content-Type':'application/json', 'Content-Length':buf.length } }, res=>{let d='';res.on('data',c=>d+=c);res.on('end',()=>resolve(JSON.parse(d)));});\n  req.setTimeout(10000, () => { req.destroy(new Error('Request timed out')); });\n  req.on('error',reject); req.write(payload); req.end();\n});`,
       links: [{ label: 'Postmark Account', url: 'https://account.postmarkapp.com' }, { label: 'Postmark Email Docs', url: 'https://postmarkapp.com/developer/api/email-api' }],
     },
   ],

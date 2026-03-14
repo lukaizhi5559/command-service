@@ -99,13 +99,21 @@ async function askWithMessages(messages, opts = {}) {
 
   let accumulated = '';
   let streamStarted = false;
-  const responseTimeout = opts.responseTimeoutMs || RESPONSE_TIMEOUT_MS;
+  const responseTimeoutMs = opts.responseTimeoutMs || RESPONSE_TIMEOUT_MS;
 
   await new Promise((resolve, reject) => {
-    const t = setTimeout(() => {
+    let t = setTimeout(() => {
       ws.terminate();
       reject(new Error('[skill-llm] Response timeout'));
-    }, responseTimeout);
+    }, responseTimeoutMs);
+
+    const resetTimeout = () => {
+      clearTimeout(t);
+      t = setTimeout(() => {
+        ws.terminate();
+        reject(new Error('[skill-llm] Response timeout'));
+      }, responseTimeoutMs);
+    };
 
     ws.on('message', (data) => {
       try {
@@ -113,6 +121,8 @@ async function askWithMessages(messages, opts = {}) {
         if (msg.type === 'llm_stream_start') {
           streamStarted = true;
           clearTimeout(t);
+        } else if (msg.type === 'llm_stream_fallback') {
+          resetTimeout();
         } else if (msg.type === 'llm_stream_chunk') {
           const chunk = msg.payload?.chunk || msg.payload?.text || '';
           if (chunk) {
@@ -123,6 +133,10 @@ async function askWithMessages(messages, opts = {}) {
           clearTimeout(t);
           ws.close();
           resolve();
+        } else if (msg.type === 'llm_error') {
+          clearTimeout(t);
+          ws.close();
+          reject(new Error(msg.payload?.message || '[skill-llm] LLM error'));
         } else if (msg.type === 'error') {
           clearTimeout(t);
           ws.close();
