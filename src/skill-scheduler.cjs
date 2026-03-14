@@ -428,4 +428,110 @@ function listJobs() {
   return [...crons, ...windows];
 }
 
-module.exports = { start, sync: syncScheduledSkills, registerSkill, unregisterSkill, listJobs, toggleSkill };
+// ── One-shot reminders ────────────────────────────────────────────────────────
+// Registered by executeCommand's schedule pseudo-skill instead of blocking.
+// When the timer fires, POSTs to the Electron overlay (port 3010) which routes
+// to notification/TTS (notify intent) or stategraph re-run (command_automate).
+//
+// Reminder shape: { id, label, triggerIntent, triggerPrompt, targetMs, timeout, createdAt }
+const _reminders = new Map();
+
+const OVERLAY_PORT = parseInt(process.env.OVERLAY_PORT || '3010', 10);
+
+function fireReminder(reminder) {
+  logger.info(`[SkillScheduler] 🔔 Reminder fired: "${reminder.label}" (intent=${reminder.triggerIntent})`);
+  _reminders.delete(reminder.id);
+
+  // POST to Electron overlay — main.js listens on /reminder/fire
+  const payload = JSON.stringify({
+    id: reminder.id,
+    label: reminder.label,
+    triggerIntent: reminder.triggerIntent,
+    triggerPrompt: reminder.triggerPrompt,
+    firedAt: new Date().toISOString(),
+  });
+  const req = http.request({
+    hostname: '127.0.0.1',
+    port: OVERLAY_PORT,
+    path: '/reminder/fire',
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) },
+    timeout: 5000,
+  }, (res) => {
+    let raw = '';
+    res.on('data', c => { raw += c; });
+    res.on('end', () => logger.info(`[SkillScheduler] Reminder fire POST → ${res.statusCode}`));
+  });
+  req.on('error', (e) => logger.warn(`[SkillScheduler] Reminder fire POST failed: ${e.message}`));
+  req.on('timeout', () => { req.destroy(); });
+  req.write(payload);
+  req.end();
+}
+
+/**
+ * Register a one-shot reminder.
+ * @param {object} opts
+ * @param {string} opts.id           — unique ID (e.g. "reminder_1773485200000")
+ * @param {number} opts.delayMs      — ms from now until fire
+ * @param {string} opts.label        — human-readable label ("Check the oven")
+ * @param {string} opts.triggerIntent — "notify" (just show message) or "command_automate" (re-run stategraph)
+ * @param {string} opts.triggerPrompt — message to show or prompt to re-run
+ * @returns {{ id, targetMs }}
+ */
+function registerReminder({ id, delayMs, label, triggerIntent = 'notify', triggerPrompt = '' }) {
+  // Cancel existing reminder with same ID if any
+  if (_reminders.has(id)) {
+    clearTimeout(_reminders.get(id).timeout);
+    _reminders.delete(id);
+  }
+
+  const targetMs = Date.now() + delayMs;
+  const reminder = {
+    id,
+    label: label || 'Reminder',
+    triggerIntent,
+    triggerPrompt: triggerPrompt || label || 'Reminder',
+    targetMs,
+    createdAt: Date.now(),
+    timeout: null,
+  };
+
+  reminder.timeout = setTimeout(() => fireReminder(reminder), delayMs);
+  _reminders.set(id, reminder);
+
+  const targetTime = new Date(targetMs).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  logger.info(`[SkillScheduler] Reminder registered: "${label}" fires at ${targetTime} (${Math.round(delayMs / 1000)}s, intent=${triggerIntent})`);
+  return { id, targetMs };
+}
+
+/**
+ * Cancel a pending reminder by ID.
+ */
+function cancelReminder(id) {
+  const entry = _reminders.get(id);
+  if (entry) {
+    clearTimeout(entry.timeout);
+    _reminders.delete(id);
+    logger.info(`[SkillScheduler] Reminder cancelled: ${id}`);
+    return true;
+  }
+  return false;
+}
+
+/**
+ * List all pending reminders (for Cron tab display).
+ */
+function listReminders() {
+  return Array.from(_reminders.values()).map(r => ({
+    id: r.id,
+    label: r.label,
+    triggerIntent: r.triggerIntent,
+    triggerPrompt: r.triggerPrompt,
+    targetMs: r.targetMs,
+    remainingMs: Math.max(0, r.targetMs - Date.now()),
+    createdAt: r.createdAt,
+    type: 'reminder',
+  }));
+}
+
+module.exports = { start, sync: syncScheduledSkills, registerSkill, unregisterSkill, listJobs, toggleSkill, registerReminder, cancelReminder, listReminders };

@@ -345,6 +345,49 @@ class CommandServiceMCPServer {
         return;
       }
 
+      // ── POST /reminder.register — register a one-shot reminder ────────────────
+      if (req.method === 'POST' && req.url === '/reminder.register') {
+        let body = '';
+        req.on('data', chunk => { body += chunk; });
+        req.on('end', () => {
+          try {
+            const { id, delayMs, label, triggerIntent, triggerPrompt } = JSON.parse(body || '{}');
+            const result = skillScheduler.registerReminder({ id, delayMs, label, triggerIntent, triggerPrompt });
+            res.writeHead(200);
+            res.end(JSON.stringify({ ok: true, ...result }));
+          } catch (err) {
+            res.writeHead(400);
+            res.end(JSON.stringify({ error: err.message }));
+          }
+        });
+        return;
+      }
+
+      // ── GET /reminder.list — list pending reminders ────────────────────────────
+      if (req.method === 'GET' && req.url === '/reminder.list') {
+        res.writeHead(200);
+        res.end(JSON.stringify({ ok: true, reminders: skillScheduler.listReminders() }));
+        return;
+      }
+
+      // ── POST /reminder.cancel — cancel a pending reminder ──────────────────────
+      if (req.method === 'POST' && req.url === '/reminder.cancel') {
+        let body = '';
+        req.on('data', chunk => { body += chunk; });
+        req.on('end', () => {
+          try {
+            const { id } = JSON.parse(body || '{}');
+            const cancelled = skillScheduler.cancelReminder(id);
+            res.writeHead(200);
+            res.end(JSON.stringify({ ok: true, cancelled }));
+          } catch (err) {
+            res.writeHead(400);
+            res.end(JSON.stringify({ error: err.message }));
+          }
+        });
+        return;
+      }
+
       if (req.method === 'POST' && req.url === '/command.automate') {
         let body = '';
         req.on('data', chunk => { body += chunk; });
