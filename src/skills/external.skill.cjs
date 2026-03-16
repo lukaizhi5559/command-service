@@ -271,6 +271,152 @@ async function fetchSkillRecord(name, timeoutMs) {
   });
 }
 
+// ── Project skill runner ───────────────────────────────────────────────────────
+// Manages the lifecycle of a project-type skill:
+//   1. Read manifest to get project dir + default port
+//   2. Check if process is already running (PID file)
+//   3. If not running → spawn `node server/index.js` on a random port
+//   4. Wait for /health to respond
+//   5. POST to /thinkdrop/command with the skill args
+//   6. Return result
+
+const _projectProcesses = new Map(); // projectName → { proc, port }
+
+async function runProjectSkill(projectDir, skillArgs, timeoutMs, skillName) {
+  const net = require('net');
+
+  // Read manifest
+  let manifest = {};
+  try {
+    const manifestPath = path.join(projectDir, '.thinkdrop-project.json');
+    if (fs.existsSync(manifestPath)) {
+      manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+    }
+  } catch (_) {}
+
+  const defaultPort = manifest.defaultPort || 40000;
+  let port = defaultPort;
+
+  // Check if already running
+  let existing = _projectProcesses.get(skillName);
+  if (existing) {
+    // Verify it's still alive
+    try {
+      await _pingProject(existing.port, 2000);
+      port = existing.port;
+      logger.info(`[external.skill] Project "${skillName}" already running on port ${port}`);
+    } catch (_) {
+      // Dead — clean up and restart
+      try { existing.proc.kill('SIGTERM'); } catch (_) {}
+      _projectProcesses.delete(skillName);
+      existing = null;
+    }
+  }
+
+  if (!existing) {
+    // Find an available port
+    port = await _findFreePort(defaultPort);
+
+    logger.info(`[external.skill] Starting project "${skillName}" on port ${port}...`);
+    const proc = spawn('node', ['server/index.js'], {
+      cwd: projectDir,
+      env: { ...process.env, PORT: String(port) },
+      detached: false,
+    });
+
+    proc.on('exit', () => { _projectProcesses.delete(skillName); });
+
+    _projectProcesses.set(skillName, { proc, port });
+
+    // Wait for server to be ready
+    const ready = await _waitProjectReady(port, 15000);
+    if (!ready) {
+      try { proc.kill('SIGTERM'); } catch (_) {}
+      _projectProcesses.delete(skillName);
+      return { ok: false, error: `Project "${skillName}" server failed to start on port ${port}` };
+    }
+  }
+
+  // POST command
+  const action = skillArgs?.action || 'run';
+  return new Promise((resolve) => {
+    const body = JSON.stringify({ action, args: skillArgs || {} });
+    const req = require('http').request({
+      hostname: '127.0.0.1',
+      port,
+      path: '/thinkdrop/command',
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
+    }, (res) => {
+      let data = '';
+      res.on('data', d => { data += d.toString(); });
+      res.on('end', () => {
+        try {
+          const parsed = JSON.parse(data);
+          resolve({ ok: parsed.ok === true, output: JSON.stringify(parsed.result), result: parsed.result, error: parsed.error });
+        } catch (_) {
+          resolve({ ok: false, error: `Invalid JSON response from project: ${data.slice(0, 200)}` });
+        }
+      });
+    });
+    const timer = setTimeout(() => { req.destroy(); resolve({ ok: false, error: `Project command timed out after ${timeoutMs}ms` }); }, timeoutMs);
+    req.on('error', err => { clearTimeout(timer); resolve({ ok: false, error: err.message }); });
+    req.on('response', () => clearTimeout(timer));
+    req.write(body);
+    req.end();
+  });
+}
+
+async function _pingProject(port, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const body = JSON.stringify({ action: 'ping' });
+    const req = require('http').request({
+      hostname: '127.0.0.1', port, path: '/thinkdrop/command', method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
+    }, (res) => { resolve(res.statusCode); });
+    req.on('error', reject);
+    req.setTimeout(timeoutMs, () => { req.destroy(); reject(new Error('ping timeout')); });
+    req.write(body);
+    req.end();
+  });
+}
+
+async function _waitProjectReady(port, timeoutMs) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    try {
+      await new Promise((resolve, reject) => {
+        const req = require('http').get(`http://127.0.0.1:${port}/health`, res => resolve(res.statusCode));
+        req.on('error', reject);
+        req.setTimeout(2000, () => { req.destroy(); reject(new Error('timeout')); });
+      });
+      return true;
+    } catch (_) {
+      await new Promise(r => setTimeout(r, 500));
+    }
+  }
+  return false;
+}
+
+async function _findFreePort(preferredPort) {
+  const net = require('net');
+  return new Promise((resolve) => {
+    const server = net.createServer();
+    server.listen(preferredPort, '127.0.0.1', () => {
+      const port = server.address().port;
+      server.close(() => resolve(port));
+    });
+    server.on('error', () => {
+      // Port in use — pick random
+      const server2 = net.createServer();
+      server2.listen(0, '127.0.0.1', () => {
+        const port = server2.address().port;
+        server2.close(() => resolve(port));
+      });
+    });
+  });
+}
+
 async function run(args) {
   const { name, args: skillArgs, timeoutMs: rawTimeout, secretKeys } = args || {};
   const timeoutMs = Math.min(rawTimeout || DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS);
@@ -379,12 +525,14 @@ async function run(args) {
         contractMd: skillRecord.contractMd || null,
         error: `Skill "${name}" is contract-based (skill.md). It defines shell.run/curl steps in its plan section. planSkills should read the contractMd and generate execution steps — not invoke external.skill directly.`
       };
+    } else if (execType === 'project') {
+      result = await runProjectSkill(resolvedPath, skillArgs, timeoutMs, name);
     } else if (execType === 'node') {
       result = await runNodeSkill(resolvedPath, skillArgs, timeoutMs, context);
     } else if (execType === 'shell') {
       result = await runShellSkill(resolvedPath, skillArgs, timeoutMs);
     } else {
-      return { ok: false, skillName: name, error: `Unknown exec_type "${execType}". Must be "node" or "shell".` };
+      return { ok: false, skillName: name, error: `Unknown exec_type "${execType}". Must be "node", "shell", or "project".` };
     }
 
     // If the skill itself returned ok:false with a non-trivial error, report it as a potential

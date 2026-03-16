@@ -31,6 +31,10 @@ const { fsRead } = require('./skills/fs.read.cjs');
 const { fileWatch } = require('./skills/file.watch.cjs');
 const { fileBridge } = require('./skills/file.bridge.cjs');
 const { run: externalSkillRun } = require('./skills/external.skill.cjs');
+const { run: projectBuilderRun } = require('./skills/project.builder.cjs');
+const { projectLaunch } = require('./skills/project.launcher.cjs');
+const { projectEdit } = require('./skills/project.editor.cjs');
+const { projectStop } = require('./skills/project.stopper.cjs');
 const { cliAgent } = require('./skills/cli.agent.cjs');
 const { browserAgent } = require('./skills/browser.agent.cjs');
 const creatorAgent = require('./skills/creator.agent.cjs');
@@ -131,6 +135,18 @@ class CommandServiceMCPServer {
       case 'web.crawl':
         return await this._skillWebCrawl(args);
 
+      case 'project.builder':
+        return await this._skillProjectBuilder(args);
+
+      case 'project.launcher':
+        return await this._skillProjectLauncher(args);
+
+      case 'project.editor':
+        return await this._skillProjectEditor(args);
+
+      case 'project.stopper':
+        return await this._skillProjectStopper(args);
+
       default:
         return {
           success: false,
@@ -225,6 +241,22 @@ class CommandServiceMCPServer {
 
   async _skillCreator(args) {
     return await skillCreator(args);
+  }
+
+  async _skillProjectBuilder(args) {
+    return await projectBuilderRun(args);
+  }
+
+  async _skillProjectLauncher(args) {
+    return await projectLaunch(args);
+  }
+
+  async _skillProjectEditor(args) {
+    return await projectEdit(args);
+  }
+
+  async _skillProjectStopper(args) {
+    return await projectStop(args);
   }
 
   // ---------------------------------------------------------------------------
