@@ -31,6 +31,59 @@ const SYNC_INTERVAL_MS     = 5 * 60 * 1000; // re-sync every 5 min
 // Map of cronId → { job, skillName, schedule } — kept in module scope
 const _jobs = new Map();
 
+// ── Bridge retry persistence ──────────────────────────────────────────────────
+// Pending bridge retries are written to disk so they survive process restarts.
+// Each entry: { skillName, metadata, retryCount, fireAtMs }
+const BRIDGE_PENDING_FILE = path.join(os.homedir(), '.thinkdrop', 'bridge-pending.json');
+
+function loadBridgePending() {
+  const fs = require('fs');
+  try {
+    return JSON.parse(fs.readFileSync(BRIDGE_PENDING_FILE, 'utf8'));
+  } catch (_) {
+    return [];
+  }
+}
+
+function saveBridgePending(entries) {
+  const fs = require('fs');
+  try {
+    fs.mkdirSync(path.join(os.homedir(), '.thinkdrop'), { recursive: true });
+    fs.writeFileSync(BRIDGE_PENDING_FILE, JSON.stringify(entries, null, 2), 'utf8');
+  } catch (err) {
+    logger.warn(`[SkillScheduler] saveBridgePending failed: ${err.message}`);
+  }
+}
+
+function addBridgePending(skillName, metadata, retryCount, fireAtMs) {
+  // One entry per skill — replace any existing entry for the same skill
+  const entries = loadBridgePending().filter(e => e.skillName !== skillName);
+  entries.push({ skillName, metadata, retryCount, fireAtMs });
+  saveBridgePending(entries);
+}
+
+function removeBridgePending(skillName) {
+  const entries = loadBridgePending().filter(e => e.skillName !== skillName);
+  saveBridgePending(entries);
+}
+
+// On startup: reload any pending bridge retries that survived a process restart.
+function reloadBridgePendingRetries() {
+  const entries = loadBridgePending();
+  if (!entries.length) return;
+  logger.info(`[SkillScheduler] Reloading ${entries.length} persisted bridge retry(ies)`);
+  const now = Date.now();
+  for (const entry of entries) {
+    const { skillName, metadata, retryCount, fireAtMs } = entry;
+    const delay = Math.max(0, fireAtMs - now);
+    logger.info(`[SkillScheduler] bridge retry restored: ${skillName} fires in ${Math.round(delay / 60000)}min (retry=${retryCount})`);
+    setTimeout(() => {
+      removeBridgePending(skillName);
+      fireBridgeSkill(skillName, metadata, retryCount, false);
+    }, delay);
+  }
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 const MEM_API_KEY = process.env.MCP_USER_MEMORY_API_KEY || process.env.USER_MEMORY_API_KEY || process.env.MCP_API_KEY || '';
@@ -191,8 +244,129 @@ function registerRandomWindow(cronId, skillName, execPath, rw) {
 
 // ── Fire a scheduled skill ────────────────────────────────────────────────────
 
-async function fireSkill(skillName, execPath) {
-  logger.info(`[SkillScheduler] Firing scheduled skill: ${skillName}`);
+// ── Tier: notify ─────────────────────────────────────────────────────────────
+// Fires an osascript display notification directly — no external.skill, no HTTP.
+function fireNotifySkill(skillName, metadata) {
+  const { execSync } = require('child_process');
+  const msg   = (metadata.message || `ThinkDrop: ${skillName}`).replace(/"/g, '\\"');
+  const title = (metadata.title   || 'ThinkDrop Reminder').replace(/"/g, '\\"');
+  try {
+    execSync(`osascript -e 'display notification "${msg}" with title "${title}" sound name "Glass"'`);
+    logger.info(`[SkillScheduler] notify fired: ${skillName}`);
+  } catch (err) {
+    logger.warn(`[SkillScheduler] notify osascript failed for ${skillName}: ${err.message}`);
+  }
+}
+
+// ── Tier: bridge helpers ──────────────────────────────────────────────────────
+
+// Query the Electron overlay server to check if the user is actively working.
+// Falls back to false (treat as idle) on any connection error so tasks never get lost.
+function checkUserActivity() {
+  return new Promise((resolve) => {
+    const req = http.request({
+      hostname: '127.0.0.1', port: OVERLAY_PORT, path: '/activity', method: 'GET',
+      timeout: 2000,
+    }, (res) => {
+      let raw = '';
+      res.on('data', c => { raw += c; });
+      res.on('end', () => {
+        try { resolve(JSON.parse(raw)?.active === true); } catch (_) { resolve(false); }
+      });
+    });
+    req.on('error',   () => resolve(false));
+    req.on('timeout', () => { req.destroy(); resolve(false); });
+    req.end();
+  });
+}
+
+// Append a WS:INSTRUCTION block to bridge.md so Electron's bridge watcher picks it up.
+function writeBridgeInstruction(skillName, instruction) {
+  const fs = require('fs');
+  const bridgePath = path.join(os.homedir(), '.thinkdrop', 'bridge.md');
+  const blockId    = `sched_${skillName.replace(/\./g, '_')}_${Date.now()}`;
+  const block = `\n<!-- WS:INSTRUCTION id="${blockId}" status="pending" -->\n${instruction}\n<!-- WS:END -->\n`;
+  try {
+    fs.appendFileSync(bridgePath, block, 'utf8');
+    logger.info(`[SkillScheduler] bridge instruction written: ${blockId}`);
+  } catch (err) {
+    logger.error(`[SkillScheduler] writeBridgeInstruction failed for ${skillName}: ${err.message}`);
+  }
+}
+
+// ── Tier: bridge ──────────────────────────────────────────────────────────────
+// Checks user activity before writing to bridge.md. If active, defers up to 3
+// times at 10-min intervals with a soft "will run soon" notification. After 3
+// retries (or if immediately idle), fires unconditionally so no task is lost.
+// Ask the Electron overlay to show a "Run now / Later" dialog for a deferred bridge skill.
+// Returns: 'run_now' | 'defer' | 'timeout' (on error fallback → treat as defer)
+async function askBridgeConfirm(skillName, instruction, retryCount) {
+  return new Promise((resolve) => {
+    const body = JSON.stringify({ skillName, instruction, retryCount });
+    const req = http.request({
+      hostname: '127.0.0.1', port: OVERLAY_PORT, path: '/bridge/confirm', method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
+      timeout: 65000, // dialog can wait up to ~60s for user to respond
+    }, (res) => {
+      let raw = '';
+      res.on('data', c => { raw += c; });
+      res.on('end', () => {
+        try { resolve(JSON.parse(raw)?.action || 'defer'); } catch (_) { resolve('defer'); }
+      });
+    });
+    req.on('error',   () => resolve('defer'));
+    req.on('timeout', () => { req.destroy(); resolve('defer'); });
+    req.write(body);
+    req.end();
+  });
+}
+
+async function fireBridgeSkill(skillName, metadata, retryCount = 0, forced = false) {
+  // forced=true skips activity check (used by Run now — user explicitly triggered it)
+  if (!forced) {
+    const active = await checkUserActivity();
+    if (active && retryCount < 3) {
+      logger.info(`[SkillScheduler] bridge deferred (user active) retry=${retryCount + 1}/3: ${skillName} — showing confirm dialog`);
+      const action = await askBridgeConfirm(skillName, metadata.instruction || skillName, retryCount);
+      if (action === 'run_now') {
+        // User clicked "Run Now" — force fire immediately (dialog already handled it via /skill.fire)
+        // The /bridge/confirm handler already called /skill.fire with forced:true, so we're done.
+        logger.info(`[SkillScheduler] bridge confirm: user chose Run Now for ${skillName}`);
+        removeBridgePending(skillName);
+        return;
+      }
+      // User chose "Later" — persist retry to disk so it survives process restarts
+      const fireAtMs = Date.now() + 10 * 60 * 1000;
+      addBridgePending(skillName, metadata, retryCount + 1, fireAtMs);
+      logger.info(`[SkillScheduler] bridge confirm: user deferred ${skillName}, retrying in 10min (persisted)`);
+      setTimeout(() => {
+        removeBridgePending(skillName);
+        fireBridgeSkill(skillName, metadata, retryCount + 1, false);
+      }, 10 * 60 * 1000);
+      return;
+    }
+  }
+  // Task is firing — clear any pending-retry entry
+  removeBridgePending(skillName);
+  writeBridgeInstruction(skillName, metadata.instruction || skillName);
+}
+
+// ── Tier dispatch ─────────────────────────────────────────────────────────────
+async function fireSkill(skillName, execPath, metadata = {}) {
+  const type = metadata.type || 'script';
+  logger.info(`[SkillScheduler] Firing scheduled skill: ${skillName} (type=${type})`);
+
+  if (type === 'notify') {
+    fireNotifySkill(skillName, metadata);
+    return;
+  }
+
+  if (type === 'bridge') {
+    await fireBridgeSkill(skillName, metadata, 0, metadata.forced === true);
+    return;
+  }
+
+  // Default: script tier — route through external.skill
   try {
     // /command.automate expects { payload: { skill, args } } — not bare { skill, args }
     const result = await mcpPost(COMMAND_SERVICE_PORT, '/command.automate', {
@@ -248,6 +422,13 @@ async function syncScheduledSkills() {
     const cronId   = `skill_${skillName.replace(/\./g, '_')}`;
     activeCronIds.add(cronId);
 
+    // ── Parse tier metadata from frontmatter ───────────────────────────────
+    const skillType    = fm.type        || 'script';
+    const notifMessage = fm.message     || `ThinkDrop: ${skillName}`;
+    const notifTitle   = fm.title       || 'ThinkDrop Reminder';
+    const instruction  = fm.instruction || '';
+    const metadata     = { type: skillType, message: notifMessage, title: notifTitle, instruction };
+
     // ── RANDOM_WINDOW pattern ───────────────────────────────────────────────
     const rw = parseRandomWindow(schedule);
     if (rw) {
@@ -266,18 +447,18 @@ async function syncScheduledSkills() {
 
     if (_jobs.has(cronId)) {
       const existing = _jobs.get(cronId);
-      if (existing.schedule === schedule) continue; // unchanged
+      if (existing.schedule === schedule && existing.type === skillType) continue; // unchanged
       try { existing.job.stop(); } catch (_) {}
       _jobs.delete(cronId);
       logger.info(`[SkillScheduler] Rescheduled ${skillName}: ${existing.schedule} → ${schedule}`);
     }
 
-    const job = cron.schedule(schedule, () => fireSkill(skillName, execPath), {
+    const job = cron.schedule(schedule, () => fireSkill(skillName, execPath, metadata), {
       scheduled: true,
       timezone: process.env.TZ || Intl.DateTimeFormat().resolvedOptions().timeZone || 'America/New_York',
     });
-    _jobs.set(cronId, { job, skillName, schedule, execPath });
-    logger.info(`[SkillScheduler] Registered cron: ${skillName} @ "${schedule}"`);
+    _jobs.set(cronId, { job, skillName, schedule, execPath, ...metadata });
+    logger.info(`[SkillScheduler] Registered cron: ${skillName} @ "${schedule}" (type=${skillType})`);
   }
 
   // 3. Stop jobs for skills that were uninstalled
@@ -307,6 +488,9 @@ async function syncScheduledSkills() {
 async function start() {
   logger.info('[SkillScheduler] Starting skill scheduler daemon');
 
+  // Reload any bridge retries that were deferred before a process restart
+  reloadBridgePendingRetries();
+
   // Initial sync after a short delay to let services come up
   setTimeout(async () => {
     await syncScheduledSkills();
@@ -326,11 +510,16 @@ async function start() {
  * Immediately register or refresh a single skill's cron job.
  * Called by skillCreator after installing a scheduled skill.
  */
-async function registerSkill(skillName, schedule, execPath) {
+async function registerSkill(skillName, schedule, execPath, metadata = {}) {
   if (!skillName || !schedule || schedule === 'on_demand') return;
 
   const cronId = `skill_${skillName.replace(/\./g, '_')}`;
   const resolvedPath = execPath || path.join(os.homedir(), '.thinkdrop', 'skills', skillName, 'index.cjs');
+  const skillType    = metadata.type        || 'script';
+  const notifMessage = metadata.message     || `ThinkDrop: ${skillName}`;
+  const notifTitle   = metadata.title       || 'ThinkDrop Reminder';
+  const instruction  = metadata.instruction || '';
+  const fullMeta     = { type: skillType, message: notifMessage, title: notifTitle, instruction };
 
   // ── RANDOM_WINDOW pattern ─────────────────────────────────────────────────
   const rw = parseRandomWindow(schedule);
@@ -352,12 +541,12 @@ async function registerSkill(skillName, schedule, execPath) {
     _jobs.delete(cronId);
   }
 
-  const job = cron.schedule(schedule, () => fireSkill(skillName, resolvedPath), {
+  const job = cron.schedule(schedule, () => fireSkill(skillName, resolvedPath, fullMeta), {
     scheduled: true,
     timezone: process.env.TZ || Intl.DateTimeFormat().resolvedOptions().timeZone || 'America/New_York',
   });
-  _jobs.set(cronId, { job, skillName, schedule, execPath: resolvedPath });
-  logger.info(`[SkillScheduler] registerSkill: ${skillName} @ "${schedule}"`);
+  _jobs.set(cronId, { job, skillName, schedule, execPath: resolvedPath, ...fullMeta });
+  logger.info(`[SkillScheduler] registerSkill: ${skillName} @ "${schedule}" (type=${skillType})`);
 }
 
 /**
@@ -418,7 +607,8 @@ function toggleSkill(skillName, action) {
  */
 function listJobs() {
   const crons = Array.from(_jobs.entries()).map(([id, e]) => ({
-    id, skillName: e.skillName, schedule: e.schedule, execPath: e.execPath, type: 'cron',
+    id, skillName: e.skillName, schedule: e.schedule, execPath: e.execPath,
+    type: e.type || 'script', cronType: 'cron',
   }));
   const windows = Array.from(_rwJobs.entries()).map(([id, e]) => ({
     id, skillName: e.skillName,
@@ -433,7 +623,7 @@ function listJobs() {
 // When the timer fires, POSTs to the Electron overlay (port 3010) which routes
 // to notification/TTS (notify intent) or stategraph re-run (command_automate).
 //
-// Reminder shape: { id, label, triggerIntent, triggerPrompt, targetMs, timeout, createdAt }
+// Reminder shape: { id, label, triggerIntent, triggerPrompt, pendingSteps, targetMs, timeout, createdAt }
 const _reminders = new Map();
 
 const OVERLAY_PORT = parseInt(process.env.OVERLAY_PORT || '3010', 10);
@@ -443,13 +633,15 @@ function fireReminder(reminder) {
   _reminders.delete(reminder.id);
 
   // POST to Electron overlay — main.js listens on /reminder/fire
-  const payload = JSON.stringify({
+  const firePayload = {
     id: reminder.id,
     label: reminder.label,
     triggerIntent: reminder.triggerIntent,
     triggerPrompt: reminder.triggerPrompt,
     firedAt: new Date().toISOString(),
-  });
+  };
+  if (reminder.pendingSteps) firePayload.pendingSteps = reminder.pendingSteps;
+  const payload = JSON.stringify(firePayload);
   const req = http.request({
     hostname: '127.0.0.1',
     port: OVERLAY_PORT,
@@ -474,11 +666,12 @@ function fireReminder(reminder) {
  * @param {string} opts.id           — unique ID (e.g. "reminder_1773485200000")
  * @param {number} opts.delayMs      — ms from now until fire
  * @param {string} opts.label        — human-readable label ("Check the oven")
- * @param {string} opts.triggerIntent — "notify" (just show message) or "command_automate" (re-run stategraph)
- * @param {string} opts.triggerPrompt — message to show or prompt to re-run
+ * @param {string} opts.triggerIntent — "notify" (show dialog only) or "execute_steps" (run pendingSteps via command-service)
+ * @param {string} opts.triggerPrompt — clean human-readable message shown in the dialog/notification
+ * @param {string|null} opts.pendingSteps — JSON-serialized array of plan steps to execute when reminder fires
  * @returns {{ id, targetMs }}
  */
-function registerReminder({ id, delayMs, label, triggerIntent = 'notify', triggerPrompt = '' }) {
+function registerReminder({ id, delayMs, label, triggerIntent = 'notify', triggerPrompt = '', pendingSteps = null }) {
   // Cancel existing reminder with same ID if any
   if (_reminders.has(id)) {
     clearTimeout(_reminders.get(id).timeout);
@@ -491,6 +684,7 @@ function registerReminder({ id, delayMs, label, triggerIntent = 'notify', trigge
     label: label || 'Reminder',
     triggerIntent,
     triggerPrompt: triggerPrompt || label || 'Reminder',
+    pendingSteps: pendingSteps || null,
     targetMs,
     createdAt: Date.now(),
     timeout: null,
@@ -534,4 +728,30 @@ function listReminders() {
   }));
 }
 
-module.exports = { start, sync: syncScheduledSkills, registerSkill, unregisterSkill, listJobs, toggleSkill, registerReminder, cancelReminder, listReminders };
+/**
+ * Immediately fire a scheduled skill by name (used by "Run now" in Cron tab).
+ * Looks up the live _jobs entry so bridge/notify/script type is respected.
+ * If the skill is not yet in _jobs (e.g. just installed), syncs first then fires.
+ */
+async function runSkillNow(skillName, forced = true) {
+  let entry = _jobs.get(`skill_${skillName.replace(/\./g, '_')}`);
+  if (!entry) {
+    // Skill may have just been installed — force a sync then retry once
+    await syncScheduledSkills();
+    entry = _jobs.get(`skill_${skillName.replace(/\./g, '_')}`);
+  }
+  if (!entry) {
+    // Not a cron skill — check random window jobs
+    const rwEntry = _rwJobs.get(`skill_${skillName.replace(/\./g, '_')}`);
+    if (rwEntry) {
+      await fireSkill(skillName, rwEntry.execPath || '', { type: rwEntry.type || 'script', message: rwEntry.message, title: rwEntry.title, instruction: rwEntry.instruction, forced });
+      return { ok: true };
+    }
+    return { ok: false, error: `Skill "${skillName}" is not registered in the scheduler. Make sure it has a valid cron schedule.` };
+  }
+  // forced:true — Run now bypasses the activity check so bridge tasks fire immediately
+  await fireSkill(skillName, entry.execPath, { type: entry.type, message: entry.message, title: entry.title, instruction: entry.instruction, forced });
+  return { ok: true };
+}
+
+module.exports = { start, sync: syncScheduledSkills, registerSkill, unregisterSkill, listJobs, toggleSkill, registerReminder, cancelReminder, listReminders, runSkillNow };

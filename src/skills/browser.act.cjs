@@ -269,10 +269,15 @@ function scoreCandidateForFill(cand, selectorLabel) {
     if (overlap > 0) score += overlap * 30;
   }
 
-  // Penalize email/newsletter/subscribe fields — these are never the intended
-  // target when the user wants to search or type a query into a page.
-  const EMAIL_FIELD = /\b(email|e-mail|subscribe|newsletter|sign.?up|your email|enter.*email|email.*here)\b/i;
-  if (EMAIL_FIELD.test(label)) score -= 150;
+  // Penalize subscribe/newsletter "sign-up email" boxes — NOT actual login email inputs.
+  // A plain "email" label on a login form (e.g. Google's "Email or phone") should NOT be
+  // penalized. Only penalize when the label clearly indicates a newsletter/subscribe context
+  // AND the selector is not explicitly targeting an email-type input.
+  const SUBSCRIBE_FIELD = /\b(subscribe|newsletter|sign[\s-]?up|your\s+email|enter.*email|email.*here)\b/i;
+  const selectorIsEmailInput = /type[=\s'"]*email|name[=\s'"]*(?:email|identifier|username)|autocomplete[=\s'"]*(?:email|username)/i.test(needle);
+  if (SUBSCRIBE_FIELD.test(label) && !selectorIsEmailInput) score -= 150;
+  // Bonus when selector explicitly targets an email/login input AND the label confirms it
+  if (selectorIsEmailInput && /\b(email|phone|username|identifier)\b/i.test(label)) score += 100;
 
   score -= Math.min(cand.depth * 0.5, 20);
   if (score <= 0) return -Infinity;
@@ -381,7 +386,11 @@ function resolveRefForClick(sessionId, labelOrRef) {
   return { ref: null, label: null };
 }
 
-// Async resolver: tries scored pick first, falls back to phi4 LLM when ambiguous
+// Async resolver: LLM-first using the full ARIA snapshot YAML, scoring as fallback.
+// playwright-cli's YAML snapshot is purpose-built for LLM consumption — it contains
+// every element's role, label, and ref in a structured, readable format.
+// The LLM reads the page exactly as playwright-cli sees it and picks the right ref,
+// which is far more reliable than regex scoring heuristics.
 async function resolveRefSmart(sessionId, labelOrRef, intentHint) {
   if (!labelOrRef) return null;
   if (/^e\d+$/i.test(labelOrRef.trim())) return labelOrRef.trim();
@@ -389,44 +398,47 @@ async function resolveRefSmart(sessionId, labelOrRef, intentHint) {
   const snap = snapshotCache.get(sessionId) || '';
   if (!snap) return null;
 
+  // ── Primary path: LLM reads the full ARIA snapshot and picks the ref ────────
+  // Trim to ~6 KB to stay within token budget while keeping full page context.
+  try {
+    const skillLlm = require('../skill-llm.cjs');
+    const snapTrimmed = snap.length > 6000 ? snap.slice(0, 6000) + '\n[...snapshot truncated]' : snap;
+    const prompt =
+      `You are a browser automation assistant.\n` +
+      `Here is the current page accessibility tree (playwright-cli ARIA snapshot):\n\n` +
+      `${snapTrimmed}\n\n` +
+      `Task: find the element ref to FILL for selector: "${labelOrRef}"` +
+      (intentHint ? `\nValue to be filled: "${intentHint}"` : '') +
+      `\n\nRules:\n` +
+      `- Respond with ONLY the ref id (e.g. e7). No explanation, no other text.\n` +
+      `- Choose a textbox, input, or combobox that matches the intent of "${labelOrRef}".\n` +
+      `- If the selector is a CSS selector list, identify which visible input best matches the first matching type.\n` +
+      `- Do NOT pick buttons, links, or language/region dropdowns unless explicitly requested.`;
+    const answer = await skillLlm.ask(prompt, { temperature: 0.0, responseTimeoutMs: 8000 });
+    // Extract first eN ref anywhere in the LLM response (it may include explanation text)
+    const pickedRef = (answer || '').match(/\b(e\d+)\b/i)?.[1];
+    // Validate the ref actually exists in the snapshot before trusting it
+    if (pickedRef && new RegExp(`ref=?${pickedRef}\\b|\\[${pickedRef}\\]|\\(${pickedRef}\\)`, 'i').test(snap)) {
+      logger.info(`[browser.act] resolveRefSmart LLM→ ${pickedRef} for "${labelOrRef}"`);
+      return pickedRef;
+    }
+    if (pickedRef) {
+      logger.warn(`[browser.act] resolveRefSmart LLM returned ${pickedRef} but it was not found in snapshot — using score fallback`);
+    }
+  } catch (err) {
+    logger.warn(`[browser.act] resolveRefSmart LLM unavailable (${err.message}) — falling back to scoring`);
+  }
+
+  // ── Fallback: scoring heuristics when LLM service is unreachable ────────────
   const candidates = parseSnapshotCandidates(snap);
-  // Score all candidates
   const scored = candidates
     .map(c => ({ ...c, score: scoreCandidateForSelector(c, labelOrRef) }))
     .filter(c => c.score > -Infinity)
     .sort((a, b) => b.score - a.score);
 
   if (scored.length === 0) return null;
-
   const top = scored[0];
-  const second = scored[1];
-
-  // Clear winner: top score is 50+ points ahead of second, or only one candidate
-  const CLEAR_MARGIN = 50;
-  if (!second || (top.score - second.score) >= CLEAR_MARGIN) {
-    logger.info(`[browser.act] resolveRefSmart clear winner: ${top.ref} (${top.role} "${top.label}" score=${top.score})`);
-    return top.ref;
-  }
-
-  // Ambiguous — ask the LLM backend (ws://localhost:4000/ws/stream) to pick the right element
-  logger.info(`[browser.act] resolveRefSmart ambiguous top2: ${top.ref}(${top.score}) vs ${second.ref}(${second.score}) — asking LLM`);
-  try {
-    const skillLlm = require('../skill-llm.cjs');
-    const topN = scored.slice(0, Math.min(5, scored.length));
-    const elementList = topN.map(c => `${c.ref}: ${c.role} "${c.label}"`).join('\n');
-    const prompt = `You are selecting the correct HTML element to fill text into.\n\nUser wants to fill: "${labelOrRef}"${intentHint ? `\nContext: ${intentHint}` : ''}\n\nAvailable elements:\n${elementList}\n\nRespond with ONLY the ref (e.g. e4). No explanation.`;
-    const answer = await skillLlm.ask(prompt, { temperature: 0.0, responseTimeoutMs: 8000 });
-    const pickedRef = (answer || '').trim().match(/^(e\d+)/i)?.[1];
-    if (pickedRef && scored.find(c => c.ref === pickedRef)) {
-      logger.info(`[browser.act] resolveRefSmart LLM picked: ${pickedRef}`);
-      return pickedRef;
-    }
-  } catch (err) {
-    logger.warn(`[browser.act] resolveRefSmart LLM fallback failed: ${err.message}`);
-  }
-
-  // LLM failed or gave bad answer — fall back to top scored candidate
-  logger.info(`[browser.act] resolveRefSmart LLM fallback to top: ${top.ref}`);
+  logger.info(`[browser.act] resolveRefSmart score fallback→ ${top.ref} (${top.role} "${top.label}" score=${top.score})`);
   return top.ref;
 }
 
@@ -507,12 +519,17 @@ async function browserAct(args) {
       const res = await cliRun([...S, navCmd, url], navTimeout);
       if (res.ok) {
         openSessions.add(sessionId);
-        // For cold-starts: Chrome may show a "Restore pages?" dialog on about:blank.
-        // Pressing Escape on macOS Chrome CLOSES the window — don't use Escape.
-        // Instead, send an immediate goto to force-navigate past any dialog.
+        // For cold-starts: Chrome may show a "Restore pages?" crash-recovery dialog.
+        // Only bypass it if we actually detect the dialog text — unconditionally sending
+        // a second goto clears the page mid-load and causes about:blank flicker.
         if (!alreadyOpen) {
-          logger.info(`[browser.act] cold-start: sending goto ${url} to bypass any restore dialog`);
-          await cliRun([...S, 'goto', url], navTimeout).catch(() => {});
+          const probeSnap = await cliRun([...S, 'snapshot'], 4000).catch(() => null);
+          const probeText = (probeSnap?.stdout || '').toLowerCase();
+          const RESTORE_DIALOG = /restore pages?\?|chrome didn't shut down correctly|help make google chrome better/i;
+          if (RESTORE_DIALOG.test(probeText)) {
+            logger.info(`[browser.act] cold-start: Chrome restore dialog detected — sending goto ${url} to dismiss`);
+            await cliRun([...S, 'goto', url], navTimeout).catch(() => {});
+          }
         }
         // Bring Chrome to front, activating the tab with the target URL.
         // Wait 2s so Chrome has time to finish loading the URL into the tab.
@@ -670,7 +687,7 @@ async function browserAct(args) {
       const ref = rawFillRef && /^e\d+$/i.test(rawFillRef) ? rawFillRef : null;
       const fillTarget = ref || selector;
       logger.info(`[browser.act] fill resolved: "${selector}" → ${ref ? `ref ${ref}` : `direct selector "${selector}"`}`);
-      const fillRes = await cliRun([...S, 'fill', fillTarget, text || ''], timeoutMs);
+      const fillRes = await cliRun([...S, 'fill', fillTarget, (text ?? value) || ''], timeoutMs);
       logger.info(`[browser.act] fill ${fillTarget} → exit ${fillRes.exitCode} stdout="${fillRes.stdout?.slice(0, 200)}"`, { stderr: fillRes.stderr?.slice(0, 200) });
 
       // playwright-cli exits 0 even on fill errors — check stdout for error markers
@@ -680,14 +697,26 @@ async function browserAct(args) {
       const stdoutHasErr = NOT_INPUT_ERR.test(fillRes.stdout || '') || NOT_INPUT_ERR.test(fillRes.stderr || '');
 
       if (stdoutHasErr) {
-        // The resolved element is a contenteditable div (common on AI chat UIs).
-        // Fall back to: click to focus → select-all → type keystrokes.
-        // resolveRefSmart already found the intent-correct element — we just use a
-        // different interaction method, not a different element.
-        logger.info(`[browser.act] fill not-input → click+type fallback on same target "${fillTarget}"`);
+        // The ref resolved to a non-input element (e.g. wrong ARIA pick or page changed).
+        // Preferred fallback: try the raw CSS selector directly — playwright-cli can
+        // locate the element itself without a snapshot ref.
+        // Only use click+type if the CSS selector also fails.
+        const cssRes = ref ? await cliRun([...S, 'fill', selector, (text ?? value) || ''], timeoutMs) : null;
+        if (cssRes && cssRes.ok && !NOT_INPUT_ERR.test(cssRes.stdout || '') && !NOT_INPUT_ERR.test(cssRes.stderr || '')) {
+          logger.info(`[browser.act] fill CSS fallback "${selector}" → exit ${cssRes.exitCode}`);
+          lastFilledTarget.set(sessionId, { target: selector, ref: null });
+          return {
+            ok: true, action, sessionId,
+            result: cssRes.stdout.trim() || undefined,
+            stdout: cssRes.stdout,
+            executionTime: Date.now() - start,
+          };
+        }
+        // CSS selector also failed — fall back to click+type on original target
+        logger.info(`[browser.act] fill not-input → click+type fallback on "${fillTarget}"`);
         await cliRun([...S, 'click', fillTarget], timeoutMs);
         await cliRun([...S, 'press', 'Meta+a'], timeoutMs);
-        const typeRes = await cliRun([...S, 'type', text || ''], timeoutMs);
+        const typeRes = await cliRun([...S, 'type', (text ?? value) || ''], timeoutMs);
         logger.info(`[browser.act] click+type → exit ${typeRes.exitCode}`);
         if (typeRes.ok) lastFilledTarget.set(sessionId, { target: fillTarget, ref });
         return {
@@ -766,6 +795,16 @@ async function browserAct(args) {
         const pressRes = await cliRun([...S, 'press', pressKey], timeoutMs);
         logger.info(`[browser.act] press ${pressKey} → exit ${pressRes.exitCode}`, { stderr: pressRes.stderr?.slice(0, 200) });
         const navigationKill = pressRes.exitCode === -1 || pressRes.exitCode === null;
+        if (navigationKill) {
+          // Daemon process was killed by the navigation. Remove from openSessions so the
+          // next navigate re-probes the daemon (isDaemonAlive) rather than blindly using
+          // goto on a dead session — which would succeed but leave the tab on about:blank.
+          openSessions.delete(sessionId);
+          // Give the browser ~2s to finish loading the new page before the next action.
+          await new Promise(r => setTimeout(r, 2000));
+          // Re-add to openSessions: the browser window is still open, just the session
+          // daemon needs a fresh probe. isDaemonAlive will confirm on next navigate call.
+        }
         return {
           ok:            pressRes.ok || navigationKill,
           action,
@@ -911,10 +950,69 @@ async function browserAct(args) {
       return { ok: false, action, sessionId, error: `Timeout waiting for content: "${needle}"`, executionTime: Date.now() - start };
     }
 
-    // ── waitForTrigger / waitForNavigation — alias to waitForStableText ────────
-    // playwright-cli has no native waitForTrigger/waitForNavigation commands.
-    // Fall through to waitForStableText which polls until page text stabilises.
-    case 'waitForTrigger':
+    // ── waitForTrigger ────────────────────────────────────────────────────────
+    // TRUE event-driven wait: injects a one-shot event listener, polls for the
+    // flag or a URL change. Unlike waitForStableText, this does NOT fire until the
+    // user actually clicks, types, or submits something on the page.
+    case 'waitForTrigger': {
+      // Minified inject script — registers first-interaction listener on the page.
+      const injectScript = `(function(){if(window.__tdListenerAttached)return;window.__tdTriggered=false;window.__tdListenerAttached=true;['click','keypress','submit','change'].forEach(function(ev){document.addEventListener(ev,function h(){window.__tdTriggered=true;document.removeEventListener(ev,h,true);},{once:true,capture:true});});})()`;
+      await cliRun([...S, 'eval', injectScript], 5000).catch(() => {});
+
+      const TRG_AUTH_WALL_FIRST = /^(sign in|log in|sign up|create account|join today|continue with google|continue with apple)\b/i;
+      const TRG_AUTH_WALL_BODY  = /\b(sign in|log in|sign up)\b[\s\S]{0,400}\b(google|apple|email|phone|username|password)\b/i;
+
+      // Capture initial URL so we can detect navigation
+      const extractResult = (stdout) => {
+        const m = stdout.trim().match(/###\s*Result\s*\n([\s\S]*?)(?=###|$)/i);
+        return (m ? m[1].trim() : stdout.trim()).replace(/^"|"$/g, '');
+      };
+      let prevUrl = '';
+      try {
+        prevUrl = extractResult((await cliRun([...S, 'eval', 'location.href'], 4000)).stdout);
+      } catch (_) {}
+
+      const effectiveTriggerTimeout = Math.min(timeoutMs, 300000);
+      const triggerDeadline = Date.now() + effectiveTriggerTimeout;
+      let authCheckCounter = 0;
+
+      while (Date.now() < triggerDeadline) {
+        await new Promise(r => setTimeout(r, 1200));
+        try {
+          // 1. Check interaction flag
+          const flagVal = extractResult((await cliRun([...S, 'eval', '!!(window.__tdTriggered)'], 4000)).stdout);
+          if (flagVal === 'true') {
+            await cliRun([...S, 'eval', 'window.__tdTriggered=false;window.__tdListenerAttached=false;'], 3000).catch(() => {});
+            return { ok: true, action, sessionId, result: 'triggered', executionTime: Date.now() - start };
+          }
+
+          // 2. Check URL change (user clicked a navigation link / submitted a form)
+          const curUrl = extractResult((await cliRun([...S, 'eval', 'location.href'], 4000)).stdout);
+          if (prevUrl && curUrl && curUrl !== prevUrl && !curUrl.startsWith('about:')) {
+            return { ok: true, action, sessionId, result: 'navigation', currentUrl: curUrl, executionTime: Date.now() - start };
+          }
+          if (curUrl && !curUrl.startsWith('about:')) prevUrl = curUrl;
+
+          // 3. Auth-wall check every 3 polls (saves bandwidth on static pages)
+          authCheckCounter++;
+          if (authCheckCounter % 3 === 0) {
+            const curTxt = extractResult((await cliRun([...S, 'eval', '(document.body.innerText||"").slice(0,800)'], 5000)).stdout);
+            const firstLine = curTxt.split('\n')[0].trim();
+            if (TRG_AUTH_WALL_FIRST.test(firstLine) || TRG_AUTH_WALL_BODY.test(curTxt.slice(0, 500))) {
+              return { ok: true, action, sessionId, result: '', stdout: '', authRequired: true, authWallText: curTxt.slice(0, 100), executionTime: Date.now() - start };
+            }
+            // Re-inject listener after page potentially changed (navigation, SPA route)
+            await cliRun([...S, 'eval', injectScript], 5000).catch(() => {});
+          }
+        } catch (pollErr) {
+          logger.debug?.(`[browser.act] waitForTrigger: poll error — ${pollErr.message?.slice(0, 60)}`);
+        }
+      }
+      return { ok: false, action, sessionId, error: `waitForTrigger: timeout after ${timeoutMs}ms — no user interaction detected`, executionTime: Date.now() - start };
+    }
+
+    // ── waitForNavigation — alias to waitForStableText ────────────────────────
+    // Falls through to waitForStableText which polls until page text stabilises.
     case 'waitForNavigation':
     // ── waitForStableText ─────────────────────────────────────────────────────
     case 'waitForStableText': {
@@ -1000,6 +1098,67 @@ async function browserAct(args) {
         finalText = lastMatch ? lastMatch[1].trim().replace(/^"|"$/g, '') : lastRaw;
       }
       return { ok: true, action, sessionId, result: finalText, executionTime: Date.now() - start };
+    }
+
+    // ── waitForAuth ───────────────────────────────────────────────────────────
+    // Polls the page until it is NO LONGER on a login/auth wall.
+    // Used after a login sub-plan to confirm authentication succeeded before
+    // the parent plan resumes.
+    //
+    // Returns:
+    //   { ok: true,  authResolved: true }   — page has left the login wall
+    //   { ok: false, authTimedOut: true }   — timed out still on login page
+    //   { ok: false, authFailed: true }     — explicit error/redirect detected
+    case 'waitForAuth': {
+      const AUTH_WAIT_FIRST = /^(sign in|log in|sign up|create account|join today|continue with google|continue with apple|sign in to x|sign in with google|sign in with apple|login to|log into|happening now|where should we begin)\b/i;
+      const AUTH_WAIT_BODY  = /\b(sign in|log in|sign up|join today|create account)\b[\s\S]{0,400}\b(google|apple|email|phone|username|password|sign up with|continue with)\b/i;
+      const AUTH_WAIT_LOGGEDOUT = /\b(log in|sign in|sign up for free)\b[\s\S]{0,200}\b(where should we begin|get started|create account|free account|try for free)\b/i;
+
+      // Default timeout: 120s — enough for a human to complete 2FA or MFA
+      const effectiveTimeout = Math.min(timeoutMs || 120000, 120000);
+      const deadline = Date.now() + effectiveTimeout;
+      const pollInterval = 2000;
+
+      logger.info(`[browser.act] waitForAuth: waiting for auth wall to clear on session=${sessionId} (timeout=${effectiveTimeout}ms)`);
+
+      while (Date.now() < deadline) {
+        await new Promise(r2 => setTimeout(r2, pollInterval));
+
+        try {
+          const evalRes = await cliRun([...S, 'eval', 'document.body.innerText.slice(0,5000)'], 8000);
+          const rawOut = evalRes.stdout.trim();
+          const resultMatch = rawOut.match(/###\s*Result\s*\n([\s\S]*?)(?=###|$)/i);
+          const pageText = resultMatch
+            ? resultMatch[1].trim().replace(/^"|"$/g, '')
+            : rawOut;
+
+          if (!pageText) continue;
+
+          const firstLine = pageText.split('\n')[0].trim();
+          const isStillAuthWall = AUTH_WAIT_FIRST.test(firstLine) ||
+            AUTH_WAIT_BODY.test(pageText.slice(0, 500)) ||
+            AUTH_WAIT_LOGGEDOUT.test(pageText.slice(0, 600));
+
+          if (!isStillAuthWall) {
+            logger.info(`[browser.act] waitForAuth: auth wall cleared for session=${sessionId}`);
+            return { ok: true, action, sessionId, authResolved: true, executionTime: Date.now() - start };
+          }
+
+          // Check for error signals — wrong password, account locked, etc.
+          const errorSignals = /wrong password|incorrect password|invalid credentials|account locked|too many attempts|verify it's you/i;
+          if (errorSignals.test(pageText.slice(0, 1000))) {
+            logger.warn(`[browser.act] waitForAuth: auth error detected on session=${sessionId}`);
+            return { ok: false, action, sessionId, authFailed: true, error: 'Authentication error detected — wrong credentials or account locked', executionTime: Date.now() - start };
+          }
+
+          logger.debug(`[browser.act] waitForAuth: still on auth wall, ${Math.round((deadline - Date.now()) / 1000)}s remaining`);
+        } catch (pollErr) {
+          logger.debug(`[browser.act] waitForAuth: poll error — ${pollErr.message?.slice(0, 60)}`);
+        }
+      }
+
+      logger.warn(`[browser.act] waitForAuth: timed out after ${effectiveTimeout}ms on session=${sessionId}`);
+      return { ok: false, action, sessionId, authTimedOut: true, error: `waitForAuth: timed out (${effectiveTimeout}ms) — authentication not completed`, executionTime: Date.now() - start };
     }
 
     // ── scanCurrentPage ───────────────────────────────────────────────────────

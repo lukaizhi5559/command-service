@@ -57,6 +57,7 @@
         "helpCmd": "gh --help",
         "authType": "oauth",
         "authCmd": "gh auth login",
+        "tokenCmd": "gh auth token",
         "authEnv": [],
         "exampleCmds": [
           "gh pr create --title 'My PR' --body 'Description'",
@@ -166,6 +167,7 @@
         "helpCmd": "gcloud help",
         "authType": "oauth",
         "authCmd": "gcloud auth login",
+        "tokenCmd": "gcloud auth print-access-token",
         "authEnv": [
           "GOOGLE_APPLICATION_CREDENTIALS"
         ],
@@ -201,6 +203,7 @@
         "helpCmd": "az --help",
         "authType": "oauth",
         "authCmd": "az login",
+        "tokenCmd": "az account get-access-token --query accessToken -o tsv",
         "authEnv": [],
         "exampleCmds": [
           "az vm list",

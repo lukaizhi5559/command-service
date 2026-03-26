@@ -268,7 +268,7 @@ class CommandServiceMCPServer {
       success: true,
       service: this.serviceName,
       status: 'healthy',
-      skills: ['shell.run', 'browser.act', 'ui.axClick', 'ui.findAndClick', 'ui.moveMouse', 'ui.click', 'ui.typeText', 'ui.waitFor', 'ui.screen.verify', 'image.analyze', 'fs.read', 'file.watch', 'file.bridge', 'external.skill', 'cli.agent', 'browser.agent', 'creator.agent', 'reviewer.agent']
+      skills: ['shell.run', 'browser.act', 'ui.axClick', 'ui.findAndClick', 'ui.moveMouse', 'ui.click', 'ui.typeText', 'ui.waitFor', 'ui.screen.verify', 'image.analyze', 'fs.read', 'file.watch', 'file.bridge', 'screen.capture', 'external.skill', 'web.crawl', 'cli.agent', 'browser.agent', 'creator.agent', 'reviewer.agent', 'skillCreator.skill', 'project.builder', 'project.launcher', 'project.editor', 'project.stopper']
     };
   }
 
@@ -300,7 +300,7 @@ class CommandServiceMCPServer {
         res.end(JSON.stringify({
           status: 'healthy',
           service: this.serviceName,
-          skills: ['shell.run', 'browser.act', 'ui.axClick', 'ui.findAndClick', 'ui.moveMouse', 'ui.click', 'ui.typeText', 'ui.waitFor', 'ui.screen.verify', 'image.analyze', 'fs.read', 'file.watch', 'file.bridge', 'external.skill', 'cli.agent', 'browser.agent', 'screen.capture']
+          skills: ['shell.run', 'browser.act', 'ui.axClick', 'ui.findAndClick', 'ui.moveMouse', 'ui.click', 'ui.typeText', 'ui.waitFor', 'ui.screen.verify', 'image.analyze', 'fs.read', 'file.watch', 'file.bridge', 'screen.capture', 'external.skill', 'web.crawl', 'cli.agent', 'browser.agent', 'creator.agent', 'reviewer.agent', 'skillCreator.skill', 'project.builder', 'project.launcher', 'project.editor', 'project.stopper']
         }));
         return;
       }
@@ -312,8 +312,8 @@ class CommandServiceMCPServer {
         req.on('data', chunk => { body += chunk; });
         req.on('end', async () => {
           try {
-            const { skillName, schedule, execPath } = JSON.parse(body || '{}');
-            await skillScheduler.registerSkill(skillName, schedule, execPath);
+            const { skillName, schedule, execPath, metadata } = JSON.parse(body || '{}');
+            await skillScheduler.registerSkill(skillName, schedule, execPath, metadata || {});
             res.writeHead(200);
             res.end(JSON.stringify({ ok: true }));
           } catch (err) {
@@ -328,6 +328,29 @@ class CommandServiceMCPServer {
       if (req.method === 'GET' && req.url === '/skill.schedule/list') {
         res.writeHead(200);
         res.end(JSON.stringify({ ok: true, jobs: skillScheduler.listJobs() }));
+        return;
+      }
+
+      // ── POST /skill.fire — immediately fire a scheduled skill ("Run now") ────
+      if (req.method === 'POST' && req.url === '/skill.fire') {
+        let body = '';
+        req.on('data', chunk => { body += chunk; });
+        req.on('end', async () => {
+          try {
+            const { skillName, forced } = JSON.parse(body || '{}');
+            if (!skillName) {
+              res.writeHead(400);
+              res.end(JSON.stringify({ ok: false, error: 'skillName required' }));
+              return;
+            }
+            const result = await skillScheduler.runSkillNow(skillName, forced === true);
+            res.writeHead(200);
+            res.end(JSON.stringify(result));
+          } catch (err) {
+            res.writeHead(500);
+            res.end(JSON.stringify({ ok: false, error: err.message }));
+          }
+        });
         return;
       }
 
@@ -383,8 +406,8 @@ class CommandServiceMCPServer {
         req.on('data', chunk => { body += chunk; });
         req.on('end', () => {
           try {
-            const { id, delayMs, label, triggerIntent, triggerPrompt } = JSON.parse(body || '{}');
-            const result = skillScheduler.registerReminder({ id, delayMs, label, triggerIntent, triggerPrompt });
+            const { id, delayMs, label, triggerIntent, triggerPrompt, pendingSteps } = JSON.parse(body || '{}');
+            const result = skillScheduler.registerReminder({ id, delayMs, label, triggerIntent, triggerPrompt, pendingSteps });
             res.writeHead(200);
             res.end(JSON.stringify({ ok: true, ...result }));
           } catch (err) {

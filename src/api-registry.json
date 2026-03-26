@@ -16,18 +16,47 @@
   "sms": {
     "keywords": ["sms", "text message", "text me", "send text", "send sms", "messaging", "twilio sms"],
     "providers": {
+      "clicksend": {
+        "tool": "clicksend",
+        "installCmd": "npm install clicksend",
+        "installSource": "npm",
+        "probeCmd": "node -e \"require('clicksend')\"",
+        "helpCmd": "https://developers.clicksend.com/docs/rest/v3/#send-sms",
+        "authType": "env",
+        "authEnv": ["CLICKSEND_USERNAME", "CLICKSEND_API_KEY"],
+        "exampleCmds": [
+          "const ClickSend = require('clicksend'); const client = new ClickSend.Client(process.env.CLICKSEND_USERNAME, process.env.CLICKSEND_API_KEY); await client.SMS.send({ messages: [{ source: 'node', from: '15551234567', to: '15559876543', body: 'Hello' }] });"
+        ],
+        "links": [
+          {
+            "label": "ClickSend Dashboard",
+            "url": "https://dashboard.clicksend.com"
+          }
+        ]
+      },
       "twilio": {
-        "npm": "twilio",
+        "tool": "twilio",
+        "installCmd": "npm install twilio",
+        "installSource": "npm",
+        "probeCmd": "node -e \"require('twilio')\"",
+        "helpCmd": "https://www.twilio.com/docs/sms/send-messages",
+        "authType": "env",
         "authEnv": ["TWILIO_ACCOUNT_SID", "TWILIO_AUTH_TOKEN", "TWILIO_PHONE_NUMBER"],
-        "initSnippet": "const twilio = require('twilio'); const client = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);",
-        "exampleSnippet": "await client.messages.create({ from: process.env.TWILIO_PHONE_NUMBER, to: '+15559876543', body: 'Hello from ThinkDrop' });",
-        "links": [{ "label": "Twilio Console", "url": "https://console.twilio.com" }]
+        "exampleCmds": [
+          "const twilio = require('twilio'); const client = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN); await client.messages.create({ from: process.env.TWILIO_PHONE_NUMBER, to: '15559876543', body: 'Hello' });"
+        ],
+        "links": [
+          {
+            "label": "Twilio Console",
+            "url": "https://console.twilio.com"
+          }
+        ]
       }
     },
     "defaultProvider": "twilio"
   },
   "email": {
-    "keywords": ["send email", "email", "gmail", "sendgrid", "mailgun", "smtp", "mailchimp", "mail"],
+    "keywords": ["send email", "sendgrid", "mailgun", "nodemailer", "smtp", "mailchimp"],
     "providers": {
       "sendgrid": {
         "npm": "@sendgrid/mail",
