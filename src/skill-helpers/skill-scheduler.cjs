@@ -22,7 +22,7 @@ const http  = require('http');
 const https = require('https');
 const path  = require('path');
 const os    = require('os');
-const logger = require('./logger.cjs');
+const logger = require('../logger.cjs');
 
 const MEMORY_SERVICE_PORT  = parseInt(process.env.MEMORY_SERVICE_PORT  || '3001', 10);
 const COMMAND_SERVICE_PORT = parseInt(process.env.PORT                  || '3007', 10);

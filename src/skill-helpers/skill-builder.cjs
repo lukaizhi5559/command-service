@@ -41,7 +41,7 @@ const { spawnSync } = require('child_process');
 const fs            = require('fs');
 const http          = require('http');
 const os            = require('os');
-const logger        = require('./logger.cjs');
+const logger        = require('../logger.cjs');
 
 const WEB_SEARCH_PORT    = process.env.MCP_WEB_SEARCH_PORT || 3002;
 const WEB_SEARCH_HOST    = '127.0.0.1';
@@ -110,7 +110,7 @@ function webSearch(query, maxResults) {
 
 // ── HTTP POST to skill-llm ask endpoint ───────────────────────────────────────
 function llmAsk(userPrompt, systemPrompt) {
-  const { ask } = require('./skill-llm.cjs');
+  const { ask } = require('../skill-llm.cjs');
   return Promise.race([
     ask(userPrompt, { systemPrompt, temperature: 0.1 }),
     new Promise((_, reject) => setTimeout(() => reject(new Error('LLM timeout')), LLM_TIMEOUT)),

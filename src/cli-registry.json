@@ -1,4 +1,15 @@
 {
+  "calendar": {
+    "keywords": ["google calendar", "gcal", "calendar events", "my calendar", "calendar"],
+    "providers": {
+      "google": {
+        "tool": "curl",
+        "authType": "oauth",
+        "tokenCmd": "python3 -c \"import json,os; f=os.path.expanduser('~/.thinkdrop/tokens/gcal.event.json'); d=json.load(open(f)); print(d['access_token'])\" 2>/dev/null"
+      }
+    },
+    "defaultProvider": "google"
+  },
   "sms": {
     "keywords": [
       "sms",

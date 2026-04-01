@@ -25,7 +25,7 @@
 'use strict';
 
 const http = require('http');
-const logger = require('./logger.cjs');
+const logger = require('../logger.cjs');
 
 const MEMORY_PORT = parseInt(process.env.MEMORY_SERVICE_PORT || '3001', 10);
 const MEMORY_HOST = process.env.MEMORY_SERVICE_HOST || '127.0.0.1';

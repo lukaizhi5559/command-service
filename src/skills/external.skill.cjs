@@ -86,6 +86,7 @@ async function fetchSkillRecordFromUserSkillsDir(name) {
 // Resolves secrets from keytar using the skill name as namespace.
 // context.secrets keys match the uppercase names declared in contract_md
 // context.oauth is a map of provider → parsed token object (from skills:oauth-connect flow)
+// context._missingOAuth lists providers that had no token (caller should gate on this)
 async function buildSkillContext(skillName, secretKeys, oauthProviders) {
   let keytar = null;
   try { keytar = require('keytar'); } catch (_) {}
@@ -102,17 +103,50 @@ async function buildSkillContext(skillName, secretKeys, oauthProviders) {
     }));
   }
 
-  // Load OAuth tokens stored by the Skills tab Connect flow
-  // Stored as JSON under key: oauth:<provider>:<skillName>
+  // Load OAuth tokens stored by the Skills tab Connect flow.
+  // Resolution order:
+  //   1. skill-specific key: oauth:<provider>:<skillName>  (set by per-skill Connect flow)
+  //   2. global key:         oauth:<provider>              (set by Connections tab Connect)
+  // Attempts token refresh for providers with short-lived access tokens (Google, Microsoft, etc.).
+  // Tracks providers with no token so callers can surface a helpful error.
   const oauth = {};
+  const missingOAuth = [];
   if (keytar && oauthProviders && oauthProviders.length > 0) {
+    let oauthRefresh = null;
+    try { oauthRefresh = require('../oauth-refresh.cjs'); } catch (_) {}
+
     await Promise.all(oauthProviders.map(async (provider) => {
       try {
-        const raw = await keytar.getPassword('thinkdrop', `oauth:${provider}:${skillName}`);
-        if (raw) {
-          try { oauth[provider] = JSON.parse(raw); } catch(_) { oauth[provider] = { access_token: raw }; }
+        // Attempt proactive token refresh for providers with expiring access tokens.
+        // Returns the (possibly refreshed) blob, or null if no token is stored.
+        let blob = null;
+        if (oauthRefresh) {
+          blob = await oauthRefresh.refreshTokenIfNeeded(keytar, provider, skillName);
         }
-      } catch (_) {}
+        // Fallback for non-expiring providers or when refresh module unavailable:
+        // load directly from keytar (skill-specific → global).
+        if (!blob) {
+          let raw = await keytar.getPassword('thinkdrop', `oauth:${provider}:${skillName}`);
+          if (!raw) raw = await keytar.getPassword('thinkdrop', `oauth:${provider}`);
+          if (raw) {
+            try { blob = JSON.parse(raw); } catch(_) { blob = { access_token: raw }; }
+          }
+        }
+
+        if (blob) {
+          // A blob with only client credentials (no access/refresh token) means the user
+          // hasn't completed the Connect flow yet — treat as missing.
+          if (!blob.access_token && !blob.refresh_token) {
+            missingOAuth.push(provider);
+          } else {
+            oauth[provider] = blob;
+          }
+        } else {
+          missingOAuth.push(provider);
+        }
+      } catch (_) {
+        missingOAuth.push(provider);
+      }
     }));
   }
 
@@ -120,8 +154,8 @@ async function buildSkillContext(skillName, secretKeys, oauthProviders) {
   // without needing to know the absolute path to command-service internals.
   let db = null;
   let llm = null;
-  try { db = require('../skill-db.cjs'); } catch (_) {}
-  try { llm = require('../skill-llm.cjs'); } catch (_) {}
+  try { db = require('../skill-helpers/skill-db.cjs'); } catch (_) {}
+  try { llm = require('../skill-helpers/skill-llm.cjs'); } catch (_) {}
 
   return {
     logger,
@@ -130,6 +164,7 @@ async function buildSkillContext(skillName, secretKeys, oauthProviders) {
     skillName,
     db,   // context.db.get/set/remember/recall/getSkill etc.
     llm,  // context.llm.ask(prompt) / context.llm.askWithMessages(messages)
+    _missingOAuth: missingOAuth, // providers with no stored token (caller gates on this)
   };
 }
 
@@ -501,15 +536,35 @@ async function run(args) {
   // Build context with logger + secrets + oauth tokens resolved from keytar
   const context = await buildSkillContext(name, resolvedSecretKeys, resolvedOAuthProviders);
 
+  // OAuth gate: if any declared OAuth provider has no token, fail fast with a
+  // structured needsOAuth response so executeCommand.js can trigger gatherOAuthCallback
+  // and prompt the user to connect before retrying — instead of a cryptic API error.
+  if (context._missingOAuth && context._missingOAuth.length > 0) {
+    const missing = context._missingOAuth;
+    const firstProvider = missing[0];
+    logger.warn(`[external.skill] "${name}" missing OAuth token for: ${missing.join(', ')}`);
+    return {
+      ok: false,
+      skillName: name,
+      needsOAuth: {
+        providers: missing,
+        provider:  firstProvider,
+        tokenKey:  `oauth:${firstProvider}:${name}`,
+        scopes:    '',  // caller fills from frontmatter if available
+      },
+      error: `Skill "${name}" needs OAuth connection for: ${missing.join(', ')}. Connect in the Skills tab first.`,
+    };
+  }
+
   try {
     let result;
     // .json paths are descriptors — route to the appropriate runner, not require()
     const basename = require('path').basename(resolvedPath);
     if (basename === 'api.json') {
-      const skillApiRunner = require('../skill-api-runner.cjs');
+      const skillApiRunner = require('../skill-helpers/skill-api-runner.cjs');
       result = await skillApiRunner.run(name, skillArgs, { contractMd: skillRecord.contractMd, timeoutMs, context });
     } else if (basename === 'cli.json') {
-      const skillCliRunner = require('../skill-cli-runner.cjs');
+      const skillCliRunner = require('../skill-helpers/skill-cli-runner.cjs');
       result = await skillCliRunner.run(name, skillArgs, { contractMd: skillRecord.contractMd, timeoutMs, context });
     } else if (resolvedPath.endsWith('.md')) {
       // Contract-based skills: exec_path points to skill.md (not index.cjs).

@@ -37,6 +37,187 @@ const os = require('os');
 const logger = require('../logger.cjs');
 
 // ---------------------------------------------------------------------------
+// OAuth environment variable injection
+// Loads OAuth access/refresh tokens from keychain and exposes them as env vars
+// (e.g. GOOGLE_ACCESS_TOKEN, GITHUB_ACCESS_TOKEN) so shell scripts don't need
+// to know internal keychain key names.
+// ---------------------------------------------------------------------------
+const OAUTH_PROVIDERS = [
+  'google','github','microsoft','facebook','twitter',
+  'linkedin','slack','notion','spotify','dropbox',
+  'discord','zoom','atlassian','salesforce','hubspot',
+];
+
+// Token refresh endpoints per provider
+const REFRESH_ENDPOINTS = {
+  google:    'https://oauth2.googleapis.com/token',
+  microsoft: 'https://login.microsoftonline.com/common/oauth2/v2.0/token',
+  github:    null,       // GitHub PATs don't expire / use different flow
+  facebook:  null,       // Facebook short-lived tokens use a different exchange
+  twitter:   null,       // Twitter OAuth 2.0 tokens use a different exchange
+  linkedin:  null,       // LinkedIn tokens use a different exchange
+  slack:     null,       // Slack app/user tokens use a different exchange
+  notion:    null,       // Notion integration tokens don't expire
+  discord:   null,       // Discord bot tokens don't expire
+  salesforce: null,      // Salesforce needs instance URL — handled separately
+  spotify:   'https://accounts.spotify.com/api/token',
+  dropbox:   'https://api.dropboxapi.com/oauth2/token',
+  zoom:      'https://zoom.us/oauth/token',
+  atlassian: 'https://auth.atlassian.com/oauth/token',
+  hubspot:   'https://api.hubapi.com/oauth/v1/token',
+};
+
+/**
+ * Returns true if the access token in `tok` is known to be expired.
+ * Checks `issued_at + expires_in` if present, otherwise assumes stale if
+ * the token has been in keytar for more than 50 minutes (conservative —
+ * Google access tokens last 60 minutes).
+ */
+// Conservative max-age: even if issued_at claims the token is fresh, if it's
+// older than MAX_TOKEN_AGE_S we treat it as expired. This guards against
+// tokens whose issued_at was recorded at storage time (e.g. seeded via a
+// script) rather than at Google issuance time.
+const MAX_TOKEN_AGE_S = 45 * 60; // 45 minutes (Google tokens last 60 min)
+
+function _isTokenExpired(tok) {
+  if (!tok.access_token) return true;
+  const now = Date.now() / 1000;
+  if (tok.issued_at && tok.expires_in) {
+    // Primary check: explicit deadline with 2-min buffer
+    if (now > (tok.issued_at + tok.expires_in - 120)) return true;
+    // Secondary check: guard against wrong issued_at (e.g., set at storage time)
+    if (now > (tok.issued_at + MAX_TOKEN_AGE_S)) return true;
+    return false;
+  }
+  // No timestamp — we don't know. Try refreshing if we have a refresh_token.
+  return !!tok.refresh_token;
+}
+
+/**
+ * Attempts to refresh the access token using the refresh_token.
+ * Returns the updated token blob on success, or null on failure.
+ */
+async function _refreshToken(provider, tok) {
+  const endpoint = REFRESH_ENDPOINTS[provider];
+  if (!endpoint || !tok.refresh_token) return null;
+
+  // Read client credentials: prefer token blob, fall back to keytar
+  let clientId     = tok.client_id;
+  let clientSecret = tok.client_secret;
+  if (!clientId || !clientSecret) {
+    try {
+      const keytar = require('keytar');
+      clientId     = clientId     || await keytar.getPassword('thinkdrop', `${provider.toUpperCase()}_CLIENT_ID`);
+      clientSecret = clientSecret || await keytar.getPassword('thinkdrop', `${provider.toUpperCase()}_CLIENT_SECRET`);
+    } catch (_) {}
+  }
+  if (!clientId || !clientSecret) return null;
+
+  try {
+    const https = require('https');
+    const body  = new URLSearchParams({
+      grant_type:    'refresh_token',
+      refresh_token: tok.refresh_token,
+      client_id:     clientId,
+      client_secret: clientSecret,
+    }).toString();
+
+    const refreshed = await new Promise((resolve, reject) => {
+      const url  = new URL(endpoint);
+      const opts = {
+        hostname: url.hostname, path: url.pathname, method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Content-Length': Buffer.byteLength(body) },
+      };
+      const req = https.request(opts, (res) => {
+        let data = '';
+        res.on('data', c => data += c);
+        res.on('end', () => { try { resolve(JSON.parse(data)); } catch(e) { reject(e); } });
+      });
+      req.on('error', reject);
+      req.write(body);
+      req.end();
+    });
+
+    if (!refreshed.access_token) {
+      logger.warn(`[loadOAuthEnv] ${provider} token refresh failed:`, refreshed.error || refreshed);
+      return null;
+    }
+
+    // Merge — preserve refresh_token + client creds if not returned in response
+    const updated = {
+      ...tok,
+      access_token: refreshed.access_token,
+      expires_in:   refreshed.expires_in   || tok.expires_in,
+      scope:        refreshed.scope        || tok.scope,
+      issued_at:    Math.floor(Date.now() / 1000),
+    };
+    if (refreshed.refresh_token) updated.refresh_token = refreshed.refresh_token;
+
+    // Persist updated token back to keytar and token file
+    try {
+      const keytar = require('keytar');
+      await keytar.setPassword('thinkdrop', `oauth:${provider}`, JSON.stringify(updated));
+      logger.info(`[loadOAuthEnv] ${provider} access token refreshed and saved to keytar`);
+    } catch (_) {}
+
+    // Also update the per-skill token file if it exists and matches this provider
+    try {
+      const fs   = require('fs');
+      const path = require('path');
+      const tokenDir = path.join(os.homedir(), '.thinkdrop', 'tokens');
+      if (fs.existsSync(tokenDir)) {
+        fs.readdirSync(tokenDir)
+          .filter(f => f.endsWith('.json'))
+          .forEach(f => {
+            try {
+              const fp  = path.join(tokenDir, f);
+              const fd  = JSON.parse(fs.readFileSync(fp, 'utf8'));
+              // Only overwrite if the file's refresh_token matches (same credential)
+              if (fd.refresh_token && fd.refresh_token === tok.refresh_token) {
+                fs.writeFileSync(fp, JSON.stringify({ ...fd, access_token: updated.access_token, issued_at: updated.issued_at }, null, 2), 'utf8');
+                logger.info(`[loadOAuthEnv] updated token file: ${f}`);
+              }
+            } catch (_) {}
+          });
+      }
+    } catch (_) {}
+
+    return updated;
+  } catch (e) {
+    logger.warn(`[loadOAuthEnv] ${provider} refresh request failed:`, e.message);
+    return null;
+  }
+}
+
+async function loadOAuthEnv() {
+  let keytar;
+  try { keytar = require('keytar'); } catch (_) { return {}; }
+  const vars = {};
+  await Promise.all(OAUTH_PROVIDERS.map(async (provider) => {
+    try {
+      const raw = await keytar.getPassword('thinkdrop', `oauth:${provider}`);
+      if (!raw) return;
+      let tok = JSON.parse(raw);
+
+      // Auto-refresh stale/expired access tokens before injecting into env
+      if (_isTokenExpired(tok)) {
+        logger.info(`[loadOAuthEnv] ${provider} access token may be expired — attempting refresh`);
+        const refreshed = await _refreshToken(provider, tok);
+        if (refreshed) tok = refreshed;
+        else logger.warn(`[loadOAuthEnv] ${provider} refresh failed — using existing token`);
+      }
+
+      const px = provider.toUpperCase();
+      if (tok.access_token)  vars[`${px}_ACCESS_TOKEN`]  = tok.access_token;
+      if (tok.refresh_token) vars[`${px}_REFRESH_TOKEN`] = tok.refresh_token;
+      if (tok.client_id)     vars[`${px}_CLIENT_ID`]     = tok.client_id;
+      if (tok.client_secret) vars[`${px}_CLIENT_SECRET`] = tok.client_secret;
+    } catch (_) {}
+  }));
+  return vars;
+}
+
+// ---------------------------------------------------------------------------
 // Policy: allowed commands
 // ---------------------------------------------------------------------------
 // NOTE: Shell builtins (cd, export, alias, source, set, read, history, etc.)
@@ -206,7 +387,10 @@ const DANGEROUS_SCRIPT_PATTERNS = [
   />\/dev\/sd[a-z]/,                       // writing to raw disk devices
   /dd\s+.*of=\/dev\/(?!null|zero)/,        // dd to disk devices
 ];
-
+// Pattern that detects direct reads from ~/.thinkdrop/tokens/ — blocked to enforce
+// $<PROVIDER>_ACCESS_TOKEN usage. The env vars are pre-injected and auto-refreshed;
+// reading the token files directly risks using stale access tokens.
+const OAUTH_TOKEN_FILE_PATTERN = /\.thinkdrop\/tokens\//;
 // CWD roots — if set, cwd must be under one of these
 // Defaults to home dir + /tmp. Override via env SHELL_RUN_CWD_ROOTS (colon-separated)
 function getCwdRoots() {
@@ -273,6 +457,19 @@ function validate(args) {
         if (pattern.test(arg)) {
           return { ok: false, error: `Blocked dangerous pattern in shell script: "${arg.substring(0, 80)}"` };
         }
+      }
+      // Block direct reads from ~/.thinkdrop/tokens/ inside shell scripts.
+      // Use $GOOGLE_ACCESS_TOKEN (or $<PROVIDER>_ACCESS_TOKEN) instead — these are
+      // pre-injected and auto-refreshed by the runtime before every shell.run call.
+      if (isShellInterpreter && OAUTH_TOKEN_FILE_PATTERN.test(arg)) {
+        return {
+          ok: false,
+          error:
+            'BLOCKED: Do not read OAuth tokens from ~/.thinkdrop/tokens/ files directly. ' +
+            'Use the pre-injected env var $GOOGLE_ACCESS_TOKEN (or $<PROVIDER>_ACCESS_TOKEN ' +
+            'for other providers). These env vars are automatically refreshed and available ' +
+            'in every shell.run call.'
+        };
       }
     } else {
       for (const pattern of BLOCKED_ARG_PATTERNS) {
@@ -453,9 +650,11 @@ async function shellRun(args) {
   }
 
   // Execute
+  const oauthEnv = await loadOAuthEnv();
   const result = await runProcess(cmd, argv, {
     cwd,
-    env,
+    // OAuth vars are the lowest priority — explicit env arg and process.env override them
+    env: { ...oauthEnv, ...env },
     timeoutMs: Math.min(timeoutMs, MAX_TIMEOUT_MS),
     stdin,
   });
@@ -466,6 +665,55 @@ async function shellRun(args) {
     executionTime: result.executionTime,
     ok: result.ok
   });
+
+  // ── 401/403 auto-retry ──────────────────────────────────────────────────
+  // If the command output contains signs of an auth failure AND OAuth tokens
+  // were injected, force-refresh all providers and retry the command once.
+  // This handles the case where issued_at was recorded incorrectly (e.g., at
+  // storage time rather than at Google token-issuance time).
+  const combinedOutput = (result.stdout || '') + (result.stderr || '');
+  const hasOAuthVars   = Object.keys(oauthEnv).some(k => k.endsWith('_ACCESS_TOKEN'));
+  const looksLike401   = hasOAuthVars && (
+    /"code"\s*:\s*40[13]/.test(combinedOutput)     ||
+    /HTTP\/[\d.]+ 40[13]/.test(combinedOutput)      ||
+    /401 Unauthorized/i.test(combinedOutput)         ||
+    /403 Forbidden/i.test(combinedOutput)            ||
+    /UNAUTHENTICATED/i.test(combinedOutput)          ||
+    /Invalid Credentials/i.test(combinedOutput)      ||
+    /invalid_token/i.test(combinedOutput)
+  );
+
+  if (looksLike401) {
+    logger.warn('[shell.run] 401/403 detected in output — forcing token refresh and retrying once');
+    // Invalidate all cached tokens by clearing issued_at so loadOAuthEnv
+    // re-evaluates expiry and refreshes each provider.
+    try {
+      const keytar = require('keytar');
+      for (const provider of OAUTH_PROVIDERS) {
+        const raw = await keytar.getPassword('thinkdrop', `oauth:${provider}`).catch(() => null);
+        if (!raw) continue;
+        const tok = JSON.parse(raw);
+        if (tok.refresh_token && REFRESH_ENDPOINTS[provider]) {
+          // Strip issued_at so _isTokenExpired falls through to: return !!tok.refresh_token
+          const invalidated = { ...tok, issued_at: undefined };
+          await keytar.setPassword('thinkdrop', `oauth:${provider}`, JSON.stringify(invalidated)).catch(() => {});
+        }
+      }
+    } catch (_) {}
+
+    const freshEnv   = await loadOAuthEnv();
+    const retryResult = await runProcess(cmd, argv, {
+      cwd,
+      env: { ...freshEnv, ...env },
+      timeoutMs: Math.min(timeoutMs, MAX_TIMEOUT_MS),
+      stdin,
+    });
+    logger.info('shell.run retry completed', {
+      cmd, exitCode: retryResult.exitCode, executionTime: retryResult.executionTime, ok: retryResult.ok,
+    });
+    return { ...retryResult, cmd: cmdString, dryRun: false, retried: true };
+  }
+  // ────────────────────────────────────────────────────────────────────────
 
   return {
     ...result,

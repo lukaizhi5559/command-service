@@ -401,7 +401,7 @@ async function resolveRefSmart(sessionId, labelOrRef, intentHint) {
   // ── Primary path: LLM reads the full ARIA snapshot and picks the ref ────────
   // Trim to ~6 KB to stay within token budget while keeping full page context.
   try {
-    const skillLlm = require('../skill-llm.cjs');
+    const skillLlm = require('../skill-helpers/skill-llm.cjs');
     const snapTrimmed = snap.length > 6000 ? snap.slice(0, 6000) + '\n[...snapshot truncated]' : snap;
     const prompt =
       `You are a browser automation assistant.\n` +
@@ -955,8 +955,10 @@ async function browserAct(args) {
     // flag or a URL change. Unlike waitForStableText, this does NOT fire until the
     // user actually clicks, types, or submits something on the page.
     case 'waitForTrigger': {
-      // Minified inject script — registers first-interaction listener on the page.
-      const injectScript = `(function(){if(window.__tdListenerAttached)return;window.__tdTriggered=false;window.__tdListenerAttached=true;['click','keypress','submit','change'].forEach(function(ev){document.addEventListener(ev,function h(){window.__tdTriggered=true;document.removeEventListener(ev,h,true);},{once:true,capture:true});});})()`;
+      // Minified inject script — registers a trusted-click-only listener on the page.
+      // isTrusted=false for synthetic JS-dispatched events (framework side-effects,
+      // mouse move events that bubble as clicks, etc.) — only real user clicks advance.
+      const injectScript = `(function(){if(window.__tdListenerAttached)return;window.__tdTriggered=false;window.__tdListenerAttached=true;document.addEventListener('click',function h(e){if(!e.isTrusted)return;window.__tdTriggered=true;document.removeEventListener('click',h,true);},{capture:true});})()`;
       await cliRun([...S, 'eval', injectScript], 5000).catch(() => {});
 
       const TRG_AUTH_WALL_FIRST = /^(sign in|log in|sign up|create account|join today|continue with google|continue with apple)\b/i;
@@ -1304,7 +1306,7 @@ async function browserAct(args) {
 
       // 4. Write permanent context_rule so planner never repeats this mistake
       try {
-        const db = require('../skill-db.cjs');
+        const db = require('../skill-helpers/skill-db.cjs');
         const ruleKey = `playwright-cli:${failedAction || 'general'}`;
         await db.setContextRule(ruleKey, fixSummary);
         logger.info(`[browser.act] diagnose: wrote context_rule for "${ruleKey}": ${fixSummary.slice(0, 120)}`);
@@ -1417,7 +1419,7 @@ async function browserAct(args) {
       // 4. LLM diagnosis
       let diagnosis = null;
       try {
-        const { ask } = require('../skill-llm.cjs');
+        const { ask } = require('../skill-helpers/skill-llm.cjs');
         const prompt = `You are a browser automation assistant examining a web page to determine if the planned actions can be completed.
 
 PAGE URL: ${pageUrl}
@@ -1475,7 +1477,7 @@ Respond ONLY with valid JSON:
       // 6. For RECOVERABLE: auto-write context_rule so replan has the info
       if ((diagnosis.status === 'RECOVERABLE' || diagnosis.status === 'NEEDS_USER') && diagnosis.contextRule) {
         try {
-          const db = require('../skill-db.cjs');
+          const db = require('../skill-helpers/skill-db.cjs');
           const domain = pageUrl.replace(/^https?:\/\//, '').split('/')[0];
           await db.setContextRule(domain, diagnosis.contextRule);
           logger.info(`[browser.act] examine: wrote context_rule for "${domain}": ${diagnosis.contextRule}`);

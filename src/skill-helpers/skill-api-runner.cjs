@@ -15,7 +15,7 @@ const path = require('path');
 const fs = require('fs');
 const os = require('os');
 const { execSync, spawnSync } = require('child_process');
-const logger = require('./logger.cjs');
+const logger = require('../logger.cjs');
 
 const SKILLS_DIR = path.join(os.homedir(), '.thinkdrop', 'skills');
 
@@ -100,7 +100,7 @@ async function loadSecrets(skillName, authEnv) {
  * @returns {Promise<string>}   JS code snippet (async IIFE)
  */
 async function buildSnippetWithLLM(apiConfig, intent, secretsEnv) {
-  const { ask } = require('./skill-llm.cjs');
+  const { ask } = require('../skill-llm.cjs');
 
   const secretsSummary = Object.keys(secretsEnv).length > 0
     ? `Secrets available as process.env.*: ${Object.keys(secretsEnv).join(', ')}`

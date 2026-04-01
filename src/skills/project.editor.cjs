@@ -159,7 +159,7 @@ async function projectEdit(args) {
   }
 
   // ── Step 2: Ask LLM to edit ─────────────────────────────────────────────────
-  const llm = require('../skill-llm.cjs');
+  const llm = require('../skill-helpers/skill-llm.cjs');
   if (!await llm.isAvailable()) {
     return { ok: false, error: 'LLM backend not available' };
   }

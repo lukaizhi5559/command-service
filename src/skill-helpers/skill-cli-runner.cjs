@@ -14,7 +14,7 @@ const path = require('path');
 const fs = require('fs');
 const os = require('os');
 const { execSync, spawnSync } = require('child_process');
-const logger = require('./logger.cjs');
+const logger = require('../logger.cjs');
 
 const SKILLS_DIR = path.join(os.homedir(), '.thinkdrop', 'skills');
 
@@ -89,7 +89,7 @@ async function loadSecrets(skillName, authEnv) {
  * @returns {Promise<string>}   the shell command to run
  */
 async function buildCommandWithLLM(cliConfig, helpText, intent, secretsEnv) {
-  const { ask } = require('./skill-llm.cjs');
+  const { ask } = require('../skill-llm.cjs');
 
   const secretsSummary = Object.keys(secretsEnv).length > 0
     ? `Available env vars (secrets loaded, values not shown): ${Object.keys(secretsEnv).join(', ')}`

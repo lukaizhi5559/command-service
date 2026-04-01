@@ -1356,7 +1356,7 @@ async function actionPreflightCheck({ task, clis: explicitClis }) {
     // Use LLM to extract services — works for ANY service the LLM knows about
     try {
       let llmModule = null;
-      try { llmModule = require('../skill-llm.cjs'); } catch (_) {}
+      try { llmModule = require('../skill-helpers/skill-llm.cjs'); } catch (_) {}
 
       if (llmModule?.ask) {
         const prompt = `${PREFLIGHT_EXTRACT_PROMPT}\n\nTask: "${task}"`;

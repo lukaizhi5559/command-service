@@ -12,7 +12,7 @@
 
 'use strict';
 
-const logger = require('./logger.cjs');
+const logger = require('../logger.cjs');
 
 const WS_URL = process.env.WEBSOCKET_URL || 'ws://localhost:4000/ws/stream';
 const WS_API_KEY = process.env.WEBSOCKET_API_KEY || '';

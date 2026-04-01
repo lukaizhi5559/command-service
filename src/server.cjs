@@ -15,8 +15,8 @@ const logger = require('./logger.cjs');
 // Any skill can require these directly:
 //   const { ask } = require('../skill-llm.cjs');
 //   const db = require('../skill-db.cjs');
-const skillLlm = require('./skill-llm.cjs');
-const skillDb = require('./skill-db.cjs');
+const skillLlm = require('./skill-helpers/skill-llm.cjs');
+const skillDb = require('./skill-helpers/skill-db.cjs');
 const { shellRun } = require('./skills/shell.run.cjs');
 const { browserAct } = require('./skills/browser.act.cjs');
 const { uiWaitFor } = require('./skills/ui.waitFor.cjs');
@@ -42,7 +42,7 @@ const reviewerAgent = require('./skills/reviewer.agent.cjs');
 const skillCreator = require('./skills/skillCreator.skill.cjs');
 const { screenCapture } = require('./skills/screen.capture.cjs');
 const { webCrawl } = require('./skills/web.crawl.cjs');
-const skillScheduler = require('./skill-scheduler.cjs');
+const skillScheduler = require('./skill-helpers/skill-scheduler.cjs');
 
 class CommandServiceMCPServer {
   constructor() {
@@ -288,6 +288,26 @@ class CommandServiceMCPServer {
     // for any skill with a schedule ≠ on_demand. Re-syncs every 5 min.
     skillScheduler.start().catch(err => logger.warn('[Server] Skill scheduler start failed', { error: err.message }));
 
+    // ── Startup skill health scan ─────────────────────────────────────────────
+    // Runs once after the scheduler starts — validates all installed skills and
+    // writes health records to the skill_health table. Non-blocking and non-fatal.
+    try {
+      const skillReview = require('./skills/skill.review.cjs');
+      skillReview({ action: 'scan_all' }, { logger })
+        .then(report => {
+          if (report?.summary) logger.info(`[skill.review] ${report.summary}`);
+          if (report?.invalidSkills?.length > 0) {
+            logger.warn('[skill.review] Invalid skills detected at startup', {
+              count: report.invalidSkills.length,
+              names: report.invalidSkills.map(s => s.name),
+            });
+          }
+        })
+        .catch(err => logger.warn('[skill.review] Startup scan failed (non-fatal)', { error: err.message }));
+    } catch (e) {
+      logger.warn('[skill.review] Could not load skill.review.cjs (non-fatal)', { error: e.message });
+    }
+
     // ── Minimal HTTP health server ───────────────────────────────────────────
     // Keeps the Node.js event loop alive (no active I/O = process exits) and
     // satisfies the service manager's health check at http://localhost:3007/health
@@ -443,6 +463,44 @@ class CommandServiceMCPServer {
         return;
       }
 
+      // ── POST /skill.oauth-status — check OAuth token presence for a skill ──────
+      // Lightweight pre-flight check used by executeCommand.js before dispatching
+      // an external.skill step. Returns connected/expired state per provider without
+      // performing any token exchange or modification.
+      if (req.method === 'POST' && req.url === '/skill.oauth-status') {
+        let body = '';
+        req.on('data', chunk => { body += chunk; });
+        req.on('end', async () => {
+          try {
+            const { skillName = '', providers = [] } = JSON.parse(body || '{}');
+            let keytar = null;
+            try { keytar = require('keytar'); } catch (_) {}
+            const statuses = await Promise.all(providers.map(async (provider) => {
+              if (!keytar) return { provider, connected: false, expired: false };
+              try {
+                // Mirror buildSkillContext key lookup order
+                let raw = await keytar.getPassword('thinkdrop', `oauth:${provider}:${skillName}`);
+                if (!raw) raw = await keytar.getPassword('thinkdrop', `oauth:${provider}`);
+                if (!raw) return { provider, connected: false, expired: false };
+                let tok;
+                try { tok = JSON.parse(raw); } catch (_) { return { provider, connected: true, expired: false }; }
+                // Blobs with only client creds (no access/refresh token) are not yet connected
+                const hasToken = !!(tok.access_token || tok.refresh_token);
+                if (!hasToken) return { provider, connected: false, expired: false };
+                const expired = !!(tok.expires_at && Date.now() >= Number(tok.expires_at));
+                return { provider, connected: true, expired };
+              } catch (_) { return { provider, connected: false, expired: false }; }
+            }));
+            res.writeHead(200);
+            res.end(JSON.stringify({ ok: true, statuses }));
+          } catch (err) {
+            res.writeHead(400);
+            res.end(JSON.stringify({ ok: false, error: err.message }));
+          }
+        });
+        return;
+      }
+
       if (req.method === 'POST' && req.url === '/command.automate') {
         let body = '';
         req.on('data', chunk => { body += chunk; });
@@ -511,9 +569,63 @@ function ensurePlaywrightCli() {
   });
 }
 
+/**
+ * Seed OAuth client credentials from environment variables into the keychain.
+ * Runs once on startup so skills can find client_id/client_secret without
+ * requiring the user to complete a full OAuth connect flow first.
+ * Never overwrites an existing value (preserves live access/refresh tokens).
+ */
+async function seedOAuthCredentials() {
+  let keytar;
+  try { keytar = require('keytar'); } catch (_) {
+    logger.warn('[startup] keytar unavailable — skipping OAuth credential seeding');
+    return;
+  }
+
+  const PROVIDERS = [
+    'google', 'github', 'microsoft', 'facebook', 'twitter',
+    'linkedin', 'slack', 'notion', 'spotify', 'dropbox',
+    'discord', 'zoom', 'atlassian', 'salesforce', 'hubspot',
+  ];
+
+  for (const provider of PROVIDERS) {
+    const prefix = provider.toUpperCase();
+    const envClientId     = process.env[`${prefix}_CLIENT_ID`];
+    const envClientSecret = process.env[`${prefix}_CLIENT_SECRET`];
+    if (!envClientId && !envClientSecret) continue;
+
+    const keychainKey = `oauth:${provider}`;
+    let blob = {};
+    try {
+      const raw = await keytar.getPassword('thinkdrop', keychainKey);
+      if (raw) blob = JSON.parse(raw);
+    } catch (_) { /* start fresh */ }
+
+    let changed = false;
+    if (envClientId && !blob.client_id) {
+      blob.client_id = envClientId;
+      changed = true;
+    }
+    if (envClientSecret && !blob.client_secret) {
+      blob.client_secret = envClientSecret;
+      changed = true;
+    }
+
+    if (changed) {
+      try {
+        await keytar.setPassword('thinkdrop', keychainKey, JSON.stringify(blob));
+        logger.info(`[startup] Seeded keychain oauth:${provider} from .env`);
+      } catch (err) {
+        logger.warn(`[startup] Failed to seed keychain oauth:${provider}`, { error: err.message });
+      }
+    }
+  }
+}
+
 // Start server if run directly
 if (require.main === module) {
   ensurePlaywrightCli();
+  seedOAuthCredentials().catch(err => logger.warn('[startup] seedOAuthCredentials failed', { error: err.message }));
   const server = new CommandServiceMCPServer();
   server.start().catch((error) => {
     logger.error('Failed to start server', { error: error.message });

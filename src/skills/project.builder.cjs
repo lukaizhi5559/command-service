@@ -299,7 +299,7 @@ async function run(args) {
     return { ok: false, error: 'project.builder requires capability or description' };
   }
 
-  const llm = require('../skill-llm.cjs');
+  const llm = require('../skill-helpers/skill-llm.cjs');
   if (!await llm.isAvailable()) {
     return { ok: false, error: 'LLM backend not available for project generation' };
   }

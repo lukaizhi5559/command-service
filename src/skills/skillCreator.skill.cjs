@@ -694,6 +694,37 @@ async function actionGenerateSkill({ projectId, projectDir: projDir } = {}) {
     return { ok: false, error: 'LLM returned empty skill code' };
   }
 
+  // ── Deterministic frontmatter normalization ────────────────────────────────
+  // After LLM generation the exec_type/exec_path in the frontmatter can be
+  // contradictory (e.g. exec_type:node with a .md exec_path, or vice versa).
+  // This deterministically overwrites both fields based on code content so the
+  // contract is always internally consistent before any validation runs.
+  function normalizeFrontmatter(code, dotName) {
+    const fmMatch = code.match(/^---\s*\n([\s\S]*?)\n---/);
+    if (!fmMatch) return code; // no frontmatter — leave as-is for validateContract to catch
+
+    const hasNodeExport = /module\.exports\s*=/.test(code);
+    const hasContractBody = /##\s*Commands/i.test(code) || (/curl\s+-[A-Z]/i.test(code) && /##\s*Plan/i.test(code));
+    // Node skill: has module.exports and no contract-style Commands/Plan sections
+    const isNodeSkill = hasNodeExport && !hasContractBody;
+
+    const skillType = isNodeSkill ? 'node' : 'shell';
+    const execPath  = isNodeSkill
+      ? '~/.thinkdrop/skills/' + dotName + '/index.cjs'
+      : '~/.thinkdrop/skills/' + dotName + '/skill.md';
+
+    let normalized = code
+      .replace(/^(exec_type:\s*)\S+/m, '$1' + skillType)
+      .replace(/^(exec_path:\s*).+/m, '$1' + execPath);
+    return normalized;
+  }
+
+  const dotName = (iface.skillName || '').replace(/-/g, '.');
+  if (dotName) {
+    skillCode = normalizeFrontmatter(skillCode, dotName);
+  }
+  // ── End frontmatter normalization ─────────────────────────────────────────
+
   // ── Static validation before writing ──────────────────────────────────────
   // Full rule set absorbed from dead validateSkill.js node.
   // One auto-retry with fix feedback if any errors found.
@@ -736,6 +767,11 @@ async function actionGenerateSkill({ projectId, projectDir: projDir } = {}) {
     // Must export a function
     if (!/module\.exports\s*=/.test(code)) {
       issues.push(`MUST_EXPORT: Skill must export a function via module.exports = async function run(args, context) { ... }`);
+    }
+    // Frontmatter consistency: exec_type:node requires module.exports, not a contract-only .md skill
+    const fmSection = (code.match(/^---\s*\n[\s\S]*?\n---/) || [''])[0];
+    if (/exec_type:\s*node/i.test(fmSection) && !/module\.exports/.test(code)) {
+      issues.push(`FM_MISMATCH: exec_type is 'node' but no module.exports found — this is a contract skill. Set exec_type: shell instead.`);
     }
     // process.exit() kills the host process
     if (/process\.exit\s*\(/.test(code)) {
@@ -831,7 +867,6 @@ async function actionGenerateSkill({ projectId, projectDir: projDir } = {}) {
 
   // Write the skill file directly to ~/.thinkdrop/skills/<dotName>/index.cjs
   // This is the canonical location — do NOT write to command-service/src/skills/
-  const dotName    = iface.skillName.replace(/-/g, '.');
   const skillDir   = path.join(USER_SKILLS_DIR, dotName);
   const skillPath  = path.join(skillDir, 'index.cjs');
   try {
@@ -914,14 +949,154 @@ async function actionGenerateSkill({ projectId, projectDir: projDir } = {}) {
   };
 }
 
+// ── repair-oauth: re-scan skill code and update contract_md with correct scopes ─
+// Triggered by user prompt: "repair skill <name> OAuth"
+// Reads index.cjs from disk → re-runs provider+scope detection → POSTs to
+// /skill.install (idempotent UPDATE) so skills:list shows the correct Connect button.
+async function actionRepairOAuth(args) {
+  const http = require('http');
+  const { skillName } = args;
+  if (!skillName) return { ok: false, error: 'skillName is required' };
+  const dotName  = String(skillName).replace(/-/g, '.');
+  const skillDir = path.join(USER_SKILLS_DIR, dotName);
+  const codePath = path.join(skillDir, 'index.cjs');
+
+  let skillCode;
+  try {
+    skillCode = fs.readFileSync(codePath, 'utf8');
+  } catch (e) {
+    return { ok: false, error: `Cannot read skill file at ${codePath}: ${e.message}` };
+  }
+
+  // Re-run the same provider detection logic used during skill creation
+  const code = skillCode;
+  let oauthProviders = [];
+  if (/googleapis|google\.auth|google-auth/i.test(code))            oauthProviders.push('google');
+  if (/octokit|github\.com\/login\/oauth|@octokit/i.test(code))     oauthProviders.push('github');
+  if (/microsoft\.com|msal|@azure|graph\.microsoft/i.test(code))    oauthProviders.push('microsoft');
+  if (/facebook\.com|graph\.facebook|fb-sdk|meta\.com/i.test(code)) oauthProviders.push('facebook');
+  if (/twitter\.com|api\.twitter|twit\b|twitter-api/i.test(code))   oauthProviders.push('twitter');
+  if (/linkedin\.com|linkedin-api/i.test(code))                     oauthProviders.push('linkedin');
+  if (/slack\.com|@slack\/web-api|@slack\/bolt/i.test(code))        oauthProviders.push('slack');
+  if (/notion\.com|@notionhq\/client/i.test(code))                  oauthProviders.push('notion');
+  if (/spotify\.com|spotify-web-api/i.test(code))                   oauthProviders.push('spotify');
+  if (/dropbox\.com|dropbox-sdk|Dropbox\(/i.test(code))             oauthProviders.push('dropbox');
+  if (/discord\.com|discord\.js|@discordjs/i.test(code))            oauthProviders.push('discord');
+  if (/zoom\.us|zoomus/i.test(code))                                 oauthProviders.push('zoom');
+  if (/atlassian\.com|jira\.com|atlassian-sdk/i.test(code))         oauthProviders.push('atlassian');
+  if (/salesforce\.com|jsforce|@salesforce/i.test(code))            oauthProviders.push('salesforce');
+  if (/hubspot\.com|@hubspot\/api-client/i.test(code))              oauthProviders.push('hubspot');
+  oauthProviders = [...new Set(oauthProviders)];
+
+  if (oauthProviders.length === 0) {
+    return { ok: false, error: `No OAuth providers detected in ${codePath}. Is this skill using an OAuth API?` };
+  }
+
+  // Re-run scope detection (mirrors logic in registerInMemoryMCP)
+  const oauthScopesMap = {};
+  if (oauthProviders.includes('google')) {
+    const googleScopes = new Set(['https://www.googleapis.com/auth/userinfo.email']);
+    if (/gmail/i.test(code))                googleScopes.add('https://www.googleapis.com/auth/gmail.modify');
+    if (/calendar/i.test(code))             googleScopes.add('https://www.googleapis.com/auth/calendar');
+    if (/drive/i.test(code))                googleScopes.add('https://www.googleapis.com/auth/drive');
+    if (/sheets/i.test(code))               googleScopes.add('https://www.googleapis.com/auth/spreadsheets');
+    if (/docs/i.test(code))                 googleScopes.add('https://www.googleapis.com/auth/documents');
+    if (/youtube/i.test(code))              googleScopes.add('https://www.googleapis.com/auth/youtube.readonly');
+    if (/admin.*sdk|directory/i.test(code)) googleScopes.add('https://www.googleapis.com/auth/admin.directory.user.readonly');
+    oauthScopesMap.google = [...googleScopes].join(' ');
+  }
+  if (oauthProviders.includes('github')) {
+    const ghScopes = new Set(['read:user', 'user:email']);
+    if (/createPull|pulls\.create|repo\.create|push|commit/i.test(code)) ghScopes.add('repo');
+    if (/issues\.create|createIssue/i.test(code)) ghScopes.add('repo');
+    oauthScopesMap.github = [...ghScopes].join(' ');
+  }
+  if (oauthProviders.includes('slack')) {
+    const slackScopes = new Set(['openid', 'profile', 'email']);
+    if (/chat\.postMessage|sendMessage/i.test(code)) slackScopes.add('chat:write');
+    if (/channels\.list|conversations\.list/i.test(code)) slackScopes.add('channels:read');
+    if (/users\.list|users\.info/i.test(code)) slackScopes.add('users:read');
+    oauthScopesMap.slack = [...slackScopes].join(' ');
+  }
+  if (oauthProviders.includes('microsoft')) {
+    const msScopes = new Set(['openid', 'profile', 'email', 'offline_access']);
+    if (/\/mail|messages|sendMail/i.test(code)) msScopes.add('Mail.ReadWrite');
+    if (/\/calendar|events/i.test(code)) msScopes.add('Calendars.ReadWrite');
+    if (/\/files|driveItem/i.test(code)) msScopes.add('Files.ReadWrite');
+    oauthScopesMap.microsoft = [...msScopes].join(' ');
+  }
+
+  // Fetch current contract_md from user-memory service
+  const memApiKey = process.env.MCP_USER_MEMORY_API_KEY || process.env.USER_MEMORY_API_KEY || process.env.MCP_API_KEY || '';
+  const memPort   = parseInt(process.env.MEMORY_SERVICE_PORT || '3001', 10);
+  const getBody   = JSON.stringify({ version: 'mcp.v1', service: 'user-memory', action: 'skill.get', payload: { name: dotName }, requestId: 'repair-oauth-get-' + Date.now() });
+  let existingContractMd = '';
+  await new Promise((resolve) => {
+    const req = http.request({
+      hostname: '127.0.0.1', port: memPort,
+      path: '/skill.get', method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(getBody), ...(memApiKey ? { 'Authorization': `Bearer ${memApiKey}` } : {}) },
+      timeout: 5000,
+    }, (res) => {
+      let d = ''; res.on('data', c => { d += c; }); res.on('end', () => {
+        try { existingContractMd = JSON.parse(d)?.data?.contractMd || ''; } catch (_) {}
+        resolve();
+      });
+    });
+    req.on('error', resolve); req.on('timeout', () => { req.destroy(); resolve(); });
+    req.write(getBody); req.end();
+  });
+
+  // Rebuild contract frontmatter: preserve existing fields, replace oauth + oauth_scopes
+  const fmMatch = existingContractMd.match(/^---\n([\s\S]*?)\n---/);
+  const existingLines = fmMatch ? fmMatch[1].split('\n') : [];
+  const filteredLines = existingLines.filter(l => !/^oauth(_scopes)?:\s*/.test(l));
+  filteredLines.push('oauth: ' + oauthProviders.join(', '));
+  if (Object.keys(oauthScopesMap).length > 0) {
+    const scopeStr = Object.entries(oauthScopesMap).map(([p, s]) => `${p}=${s}`).join(', ');
+    filteredLines.push('oauth_scopes: ' + scopeStr);
+  }
+  const bodyAfterFm  = existingContractMd.replace(/^---\n[\s\S]*?\n---\n?/, '').trim();
+  const newContractMd = ['---', ...filteredLines, '---', '', bodyAfterFm].join('\n');
+
+  // POST to /skill.install — idempotent UPDATE when skill already exists
+  const installBody = JSON.stringify({ version: 'mcp.v1', service: 'user-memory', action: 'skill.install', payload: { contractMd: newContractMd }, requestId: 'repair-oauth-' + Date.now() });
+  let installResult = {};
+  await new Promise((resolve) => {
+    const req = http.request({
+      hostname: '127.0.0.1', port: memPort,
+      path: '/skill.install', method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(installBody), ...(memApiKey ? { 'Authorization': `Bearer ${memApiKey}` } : {}) },
+      timeout: 8000,
+    }, (res) => {
+      let d = ''; res.on('data', c => { d += c; }); res.on('end', () => {
+        try { installResult = JSON.parse(d); } catch (_) {}
+        resolve();
+      });
+    });
+    req.on('error', resolve); req.on('timeout', () => { req.destroy(); resolve(); });
+    req.write(installBody); req.end();
+  });
+
+  logger.info('[skillCreator] repair-oauth completed', { dotName, providers: oauthProviders, scopes: oauthScopesMap });
+  return {
+    ok: true,
+    skillName: dotName,
+    providers: oauthProviders,
+    scopes:    oauthScopesMap,
+    message:   `Repaired OAuth for "${dotName}": providers=[${oauthProviders.join(', ')}], scopes updated. Re-connect in the Skills tab to grant the correct permissions.`,
+  };
+}
+
 // ── Main dispatcher ────────────────────────────────────────────────────────────
 async function skillCreator(args) {
   const { action } = args || {};
   logger.info('[skillCreator] invoked', { action });
   switch (action) {
     case 'generate_skill': return actionGenerateSkill(args);
+    case 'repair-oauth':   return actionRepairOAuth(args);
     default:
-      return { ok: false, error: 'Unknown action: "' + action + '". Valid: generate_skill' };
+      return { ok: false, error: 'Unknown action: "' + action + '". Valid: generate_skill, repair-oauth' };
   }
 }
 

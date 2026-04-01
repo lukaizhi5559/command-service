@@ -28,7 +28,7 @@ const path   = require('path');
 const fs     = require('fs');
 const os     = require('os');
 const { spawnSync } = require('child_process');
-const logger = require('./logger.cjs');
+const logger = require('../logger.cjs');
 
 const REGISTRY_DIR = path.join(__dirname);
 const CLI_REGISTRY_PATH = path.join(REGISTRY_DIR, 'cli-registry.json');
@@ -92,7 +92,7 @@ function brewSearch(query) {
 // ── LLM validation: pick the best CLI/SDK from candidates ─────────────────────
 async function llmPickBest(serviceName, capability, candidates, type) {
   try {
-    const { ask } = require('./skill-llm.cjs');
+    const { ask } = require('../skill-llm.cjs');
     const candidateList = candidates.map((c, i) => `${i + 1}. ${c.name || c} — ${c.description || ''}`).join('\n');
 
     const system = `You are a tool selector. Given a service name and a list of candidate CLI tools or npm SDKs, pick the single best official or most widely-used option. Respond with ONLY valid JSON, no explanation.

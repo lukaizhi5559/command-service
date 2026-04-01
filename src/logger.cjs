@@ -43,9 +43,9 @@ try {
     level: 'error'
   }));
   
-  logger.add(new winston.transports.File({
-    filename: path.join(logsDir, 'combined.log')
-  }));
+  // logger.add(new winston.transports.File({
+  //   filename: path.join(logsDir, 'combined.log')
+  // }));
 } catch (err) {
   // Logs directory not available, continue with console only
 }
