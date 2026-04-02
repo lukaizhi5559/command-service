@@ -588,7 +588,7 @@ async function registerInMemoryMCP(skillName, iface, sourceSkillPath, planMd) {
       'name: ' + dotName,
       'description: ' + description,
       'exec_path: ' + skillUserPath,
-      'exec_type: node',
+      'exec_type: ' + (/\.(cjs|js)$/.test(skillUserPath) ? 'node' : 'shell'),
       'version: 1.0.0',
       'trigger: ' + (iface.trigger || dotName),
       'schedule: ' + (iface.schedule || 'on_demand'),
