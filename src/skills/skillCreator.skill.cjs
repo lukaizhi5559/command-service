@@ -322,7 +322,20 @@ ISOLATION RULES — CRITICAL (user skills run in a sandboxed directory):
 - context.db and context.llm are available for persistence and LLM reasoning — use them instead of
   trying to require() any internal files.
 
-Output: raw CommonJS code only. No markdown fences, no explanation.`;
+   DATE / TIME RULES — CRITICAL (for skills that filter or query by date/time):
+   - NEVER hardcode any date, timestamp, or time expression in the generated skill code.
+   - NEVER call new Date() to compute a query boundary — the ThinkDrop planner resolves natural-language
+     temporal phrases ("last week", "3 hours ago", "yesterday") into concrete UTC ISO 8601 strings and
+     passes them in as args. The skill must accept and use them.
+   - For skills that search, filter, or list items by time (emails, events, messages, logs, issues, etc.),
+     declare optional inputs in the Skill Interface: timeMin (ISO 8601 UTC start) and timeMax (ISO 8601 UTC end).
+   - Inside run(), read them as: const { timeMin, timeMax } = args; and pass to the API only when present.
+   - For Unix-epoch APIs (Slack oldest/latest, GitHub created, etc.), convert with:
+       Math.floor(new Date(timeMin).getTime() / 1000)
+   - For date-only APIs, extract date portion: timeMin ? timeMin.slice(0, 10) : undefined
+   - Never substitute, guess, or default the date range if it is not provided — omit the filter param entirely.
+
+   Output: raw CommonJS code only. No markdown fences, no explanation.`;
 
 // ── Fetch api_rules from user-memory MCP for detected services ───────────────
 const SKILL_SERVICE_DETECTORS = [

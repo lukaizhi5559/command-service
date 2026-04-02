@@ -154,6 +154,25 @@ async function scanAll(logger) {
     const skill = detailRes?.data;
     if (!skill) { missing++; continue; }
 
+    // ── Disk-sync: disk is the source of truth for .md contract skills ────────
+    // If the on-disk skill.md differs from the DB's contract_md, sync DB from disk.
+    // This covers manual edits and template updates that haven't been re-registered.
+    // repair_one already keeps both in sync — this catches any remaining drift.
+    const _diskExecPath = (skill.execPath || '').replace(/^~/, os.homedir());
+    if (_diskExecPath.endsWith('.md') && fs.existsSync(_diskExecPath)) {
+      try {
+        const _diskMd = fs.readFileSync(_diskExecPath, 'utf8');
+        if (_diskMd.trim() !== (skill.contractMd || '').trim()) {
+          if (logger) logger.info(`[skill.review] Disk content differs from DB for "${sk.name}" — syncing DB from disk`);
+          await mcpPost('skill.install', { contractMd: _diskMd });
+          skill.contractMd = _diskMd; // use fresh content for validation below
+        }
+      } catch (_diskErr) {
+        if (logger) logger.warn(`[skill.review] Disk read failed for "${sk.name}" (non-fatal): ${_diskErr.message}`);
+      }
+    }
+    // ─────────────────────────────────────────────────────────────────────────
+
     const { ok, errors } = validateSkillContract(skill.contractMd, skill.execPath);
 
     if (ok) {
