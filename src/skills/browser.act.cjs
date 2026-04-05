@@ -977,6 +977,7 @@ async function browserAct(args) {
       const effectiveTriggerTimeout = Math.min(timeoutMs, 300000);
       const triggerDeadline = Date.now() + effectiveTriggerTimeout;
       let authCheckCounter = 0;
+      let consecutivePollErrors = 0;
 
       while (Date.now() < triggerDeadline) {
         await new Promise(r => setTimeout(r, 1200));
@@ -1006,7 +1007,15 @@ async function browserAct(args) {
             // Re-inject listener after page potentially changed (navigation, SPA route)
             await cliRun([...S, 'eval', injectScript], 5000).catch(() => {});
           }
+          // Reset consecutive error counter on any successful poll
+          consecutivePollErrors = 0;
         } catch (pollErr) {
+          consecutivePollErrors++;
+          // If every poll is failing, the browser session doesn't exist — fail fast
+          // instead of looping silently for up to 5 minutes.
+          if (consecutivePollErrors >= 3) {
+            return { ok: false, action, sessionId, error: `waitForTrigger: no active browser session "${sessionId}" — playwright-cli is not running or the session was never opened`, executionTime: Date.now() - start };
+          }
           logger.debug?.(`[browser.act] waitForTrigger: poll error — ${pollErr.message?.slice(0, 60)}`);
         }
       }
