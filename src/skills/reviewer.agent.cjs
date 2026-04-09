@@ -25,46 +25,16 @@ const os = require('os');
 const fs = require('fs');
 const { execSync } = require('child_process');
 const logger = require('../logger.cjs');
-const { getDb } = require('./agents-db.cjs');
-let _llmCallSeq = 0;
+const { getDb } = require('./lib/agents-db.cjs');
+const { askWithMessages } = require('../skill-helpers/skill-llm.cjs');
 
-// ── LLM helper (same WS pattern as creator.agent) ────────────────────────────
+// ── LLM helper (delegates to shared skill-llm.cjs) ───────────────────────────
 async function callLLM(systemPrompt, userPrompt, timeoutMs) {
-  timeoutMs = timeoutMs || 90000;
   try {
-    const WebSocket = require('ws');
-    const WS_BASE = process.env.LLM_WS_URL || process.env.WEBSOCKET_URL || 'ws://localhost:4000/ws/stream';
-    const url = new URL(WS_BASE);
-    const apiKey = process.env.VSCODE_API_KEY || process.env.BACKEND_API_KEY || process.env.BASE_API_KEY || '';
-    if (apiKey) url.searchParams.set('apiKey', apiKey);
-    url.searchParams.set('userId', 'reviewer_agent');
-    url.searchParams.set('clientId', 'reviewer_' + Date.now() + '_' + (++_llmCallSeq));
-    return await new Promise((resolve, reject) => {
-      const ws = new WebSocket(url.toString());
-      let answer = '';
-      const timer = setTimeout(() => { ws.close(); reject(new Error('LLM timeout')); }, timeoutMs);
-      ws.on('open', () => ws.send(JSON.stringify({
-        id: 'rev_' + Date.now(), type: 'llm_request',
-        payload: { prompt: userPrompt, provider: 'openai', options: { temperature: 0.15, stream: true, taskType: 'ask' },
-          context: { systemInstructions: systemPrompt, recentContext: [], sessionFacts: [], memories: [] } },
-        timestamp: Date.now(), metadata: { source: 'reviewer_agent' },
-      })));
-      ws.on('message', (data) => {
-        try {
-          const msg = JSON.parse(data.toString());
-          if (msg.type === 'llm_stream_chunk') answer += msg.payload?.chunk || msg.payload?.text || '';
-          else if (msg.type === 'llm_stream_end') { clearTimeout(timer); ws.close(); resolve(answer); }
-          else if (msg.type === 'error') { clearTimeout(timer); ws.close(); reject(new Error(msg.payload?.message || 'LLM error')); }
-          // ignore: connection_status, llm_stream_start, and other control messages
-        } catch { /* ignore non-JSON frames */ }
-      });
-      ws.on('error', (e) => { clearTimeout(timer); reject(e); });
-      ws.on('close', () => {
-        clearTimeout(timer);
-        if (answer.trim().length > 0) resolve(answer);
-        else reject(new Error('LLM WS closed before sending any content'));
-      });
-    });
+    return await askWithMessages(
+      [{ role: 'user', content: userPrompt }],
+      { systemInstructions: systemPrompt, responseTimeoutMs: timeoutMs || 90000, temperature: 0.15 }
+    );
   } catch {
     return null;
   }

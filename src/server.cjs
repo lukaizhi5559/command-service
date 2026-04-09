@@ -2,7 +2,7 @@
  * Command Service MCP Server
  *
  * Actuation-only MCP service. Owns all "can touch the machine" skills:
- *   - command.automate  → skill router (shell.run, browser.act, ui.findAndClick, ui.typeText, ui.waitFor)
+ *   - command.automate  → skill router (shell.run, browser.act, image.analyze, fs.read, file.watch, file.bridge, screen.capture, external.skill, cli.agent, browser.agent, creator.agent, reviewer.agent)
  *   - health            → service health check
  *
  * Perception, planning, memory, and intent resolution live in other services.
@@ -19,14 +19,8 @@ const skillLlm = require('./skill-helpers/skill-llm.cjs');
 const skillDb = require('./skill-helpers/skill-db.cjs');
 const { shellRun } = require('./skills/shell.run.cjs');
 const { browserAct } = require('./skills/browser.act.cjs');
-const { uiWaitFor } = require('./skills/ui.waitFor.cjs');
-const { uiFindAndClick } = require('./skills/ui.findAndClick.cjs');
-const { uiTypeText } = require('./skills/ui.typeText.cjs');
-const { uiScreenVerify } = require('./skills/ui.screen.verify.cjs');
+const { webCrawl } = require('./skills/web.crawl.cjs');
 const { imageAnalyze } = require('./skills/image.analyze.cjs');
-const { uiMoveMouse } = require('./skills/ui.moveMouse.cjs');
-const { uiClick } = require('./skills/ui.click.cjs');
-const { uiAxClick } = require('./skills/ui.axClick.cjs');
 const { fsRead } = require('./skills/fs.read.cjs');
 const { fileWatch } = require('./skills/file.watch.cjs');
 const { fileBridge } = require('./skills/file.bridge.cjs');
@@ -41,7 +35,6 @@ const creatorAgent = require('./skills/creator.agent.cjs');
 const reviewerAgent = require('./skills/reviewer.agent.cjs');
 const skillCreator = require('./skills/skillCreator.skill.cjs');
 const { screenCapture } = require('./skills/screen.capture.cjs');
-const { webCrawl } = require('./skills/web.crawl.cjs');
 const skillScheduler = require('./skill-helpers/skill-scheduler.cjs');
 
 class CommandServiceMCPServer {
@@ -56,7 +49,7 @@ class CommandServiceMCPServer {
   /**
    * Skill router — dispatches to the appropriate automation skill
    * @param {Object} payload - { skill, args }
-   *   skill: 'shell.run' | 'browser.act' | 'ui.findAndClick' | 'ui.typeText' | 'ui.waitFor' | 'fs.read' | 'file.watch'
+   *   skill: 'shell.run' | 'browser.act' | 'image.analyze' | 'fs.read' | 'file.watch' | 'file.bridge' | 'screen.capture' | 'external.skill' | 'cli.agent' | 'browser.agent'
    *   args:  skill-specific arguments (see skills/ implementations)
    */
   async executeAutomation(payload) {
@@ -65,7 +58,7 @@ class CommandServiceMCPServer {
     if (!skill) {
       return {
         success: false,
-        error: 'skill is required (shell.run | browser.act | ui.findAndClick | ui.typeText | ui.waitFor | ui.screen.verify)'
+        error: 'skill is required (shell.run | browser.act | image.analyze | fs.read | file.watch | file.bridge | screen.capture | external.skill | cli.agent | browser.agent)'
       };
     }
 
@@ -78,29 +71,11 @@ class CommandServiceMCPServer {
       case 'browser.act':
         return await this._skillBrowserAct(args);
 
-      case 'ui.findAndClick':
-        return await this._skillFindAndClick(args);
-
-      case 'ui.typeText':
-        return await this._skillTypeText(args);
-
-      case 'ui.waitFor':
-        return await this._skillWaitFor(args);
-
-      case 'ui.screen.verify':
-        return await this._skillScreenVerify(args);
+      case 'web.crawl':
+        return await this._skillWebCrawl(args);
 
       case 'image.analyze':
         return await this._skillImageAnalyze(args);
-
-      case 'ui.moveMouse':
-        return await this._skillMoveMouse(args);
-
-      case 'ui.click':
-        return await this._skillClick(args);
-
-      case 'ui.axClick':
-        return await this._skillAxClick(args);
 
       case 'fs.read':
         return await this._skillFsRead(args);
@@ -131,9 +106,6 @@ class CommandServiceMCPServer {
 
       case 'skillCreator.skill':
         return await this._skillCreator(args);
-
-      case 'web.crawl':
-        return await this._skillWebCrawl(args);
 
       case 'project.builder':
         return await this._skillProjectBuilder(args);
@@ -167,36 +139,12 @@ class CommandServiceMCPServer {
     return await browserAct(args);
   }
 
-  async _skillFindAndClick(args) {
-    return await uiFindAndClick(args);
-  }
-
-  async _skillTypeText(args) {
-    return await uiTypeText(args);
-  }
-
-  async _skillWaitFor(args) {
-    return await uiWaitFor(args);
-  }
-
-  async _skillScreenVerify(args) {
-    return await uiScreenVerify(args);
+  async _skillWebCrawl(args) {
+    return await webCrawl(args);
   }
 
   async _skillImageAnalyze(args) {
     return await imageAnalyze(args);
-  }
-
-  async _skillMoveMouse(args) {
-    return await uiMoveMouse(args);
-  }
-
-  async _skillClick(args) {
-    return await uiClick(args);
-  }
-
-  async _skillAxClick(args) {
-    return await uiAxClick(args);
   }
 
   async _skillFsRead(args) {
@@ -235,10 +183,6 @@ class CommandServiceMCPServer {
     return await reviewerAgent(args);
   }
 
-  async _skillWebCrawl(args) {
-    return await webCrawl(args);
-  }
-
   async _skillCreator(args) {
     return await skillCreator(args);
   }
@@ -268,7 +212,7 @@ class CommandServiceMCPServer {
       success: true,
       service: this.serviceName,
       status: 'healthy',
-      skills: ['shell.run', 'browser.act', 'ui.axClick', 'ui.findAndClick', 'ui.moveMouse', 'ui.click', 'ui.typeText', 'ui.waitFor', 'ui.screen.verify', 'image.analyze', 'fs.read', 'file.watch', 'file.bridge', 'screen.capture', 'external.skill', 'web.crawl', 'cli.agent', 'browser.agent', 'creator.agent', 'reviewer.agent', 'skillCreator.skill', 'project.builder', 'project.launcher', 'project.editor', 'project.stopper']
+      skills: ['shell.run', 'browser.act', 'image.analyze', 'fs.read', 'file.watch', 'file.bridge', 'screen.capture', 'external.skill', 'cli.agent', 'browser.agent', 'creator.agent', 'reviewer.agent', 'skillCreator.skill', 'project.builder', 'project.launcher', 'project.editor', 'project.stopper']
     };
   }
 
@@ -320,7 +264,7 @@ class CommandServiceMCPServer {
         res.end(JSON.stringify({
           status: 'healthy',
           service: this.serviceName,
-          skills: ['shell.run', 'browser.act', 'ui.axClick', 'ui.findAndClick', 'ui.moveMouse', 'ui.click', 'ui.typeText', 'ui.waitFor', 'ui.screen.verify', 'image.analyze', 'fs.read', 'file.watch', 'file.bridge', 'screen.capture', 'external.skill', 'web.crawl', 'cli.agent', 'browser.agent', 'creator.agent', 'reviewer.agent', 'skillCreator.skill', 'project.builder', 'project.launcher', 'project.editor', 'project.stopper']
+          skills: ['shell.run', 'browser.act', 'image.analyze', 'fs.read', 'file.watch', 'file.bridge', 'screen.capture', 'external.skill', 'cli.agent', 'browser.agent', 'creator.agent', 'reviewer.agent', 'skillCreator.skill', 'project.builder', 'project.launcher', 'project.editor', 'project.stopper']
         }));
         return;
       }

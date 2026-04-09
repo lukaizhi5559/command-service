@@ -24,7 +24,7 @@ const path = require('path');
 const os   = require('os');
 const fs   = require('fs');
 const logger = require('../logger.cjs');
-const { getDb } = require('./agents-db.cjs');
+const { getDb } = require('./lib/agents-db.cjs');
 
 const USER_SKILLS_DIR = path.join(os.homedir(), '.thinkdrop', 'skills');
 const PROJECTS_DIR    = path.join(os.homedir(), '.thinkdrop', 'projects');

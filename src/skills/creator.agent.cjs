@@ -4,66 +4,16 @@ const os = require('os');
 const fs = require('fs');
 const { execSync, spawn } = require('child_process');
 const logger = require('../logger.cjs');
-const { getDb } = require('./agents-db.cjs');
+const { getDb } = require('./lib/agents-db.cjs');
+const { askWithMessages } = require('../skill-helpers/skill-llm.cjs');
 
 const PROJECTS_DIR = path.join(os.homedir(), '.thinkdrop', 'projects');
-let _llmCallSeq = 0;
 
 async function callLLM(systemPrompt, userPrompt, timeoutMs) {
-  timeoutMs = timeoutMs || 120000;
-  try {
-    const WebSocket = require('ws');
-    const WS_BASE = process.env.LLM_WS_URL || process.env.WEBSOCKET_URL || 'ws://localhost:4000/ws/stream';
-    const url = new URL(WS_BASE);
-    const apiKey = process.env.VSCODE_API_KEY || process.env.BACKEND_API_KEY || process.env.BASE_API_KEY || '';
-    if (apiKey) url.searchParams.set('apiKey', apiKey);
-    url.searchParams.set('userId', 'creator_agent');
-    url.searchParams.set('clientId', 'creator_' + Date.now() + '_' + (++_llmCallSeq));
-    return await new Promise((resolve, reject) => {
-      const ws = new WebSocket(url.toString());
-      let answer = '';
-      const timer = setTimeout(() => { ws.close(); reject(new Error('LLM timeout')); }, timeoutMs);
-      ws.on('open', () => ws.send(JSON.stringify({
-        id: 'cre_' + Date.now(), type: 'llm_request',
-        payload: { prompt: userPrompt, provider: 'openai', options: { temperature: 0.2, stream: true, taskType: 'ask' },
-          context: { systemInstructions: systemPrompt, recentContext: [], sessionFacts: [], memories: [] } },
-        timestamp: Date.now(), metadata: { source: 'creator_agent' },
-      })));
-      ws.on('message', (data) => {
-        try {
-          const msg = JSON.parse(data.toString());
-          if (msg.type === 'llm_stream_chunk') answer += msg.payload?.chunk || msg.payload?.text || '';
-          else if (msg.type === 'llm_stream_end') { clearTimeout(timer); ws.close(); resolve(answer); }
-          else if (msg.type === 'error') { clearTimeout(timer); ws.close(); reject(new Error(msg.payload?.message || 'LLM error')); }
-          // ignore: connection_status, llm_stream_start, and other control messages
-        } catch { /* ignore non-JSON frames */ }
-      });
-      ws.on('error', (e) => { clearTimeout(timer); reject(e); });
-      ws.on('close', () => {
-        clearTimeout(timer);
-        if (answer.trim().length > 0) resolve(answer);
-        else reject(new Error('LLM WS closed before sending any content'));
-      });
-    });
-  } catch {
-    const http = require('http');
-    const body = JSON.stringify({ payload: { skill: 'llm.generate', args: { systemPrompt, userPrompt } } });
-    return new Promise((resolve, reject) => {
-      const req = http.request({
-        hostname: '127.0.0.1', port: parseInt(process.env.COMMAND_SERVICE_PORT || '3007', 10),
-        path: '/command.automate', method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
-        timeout: timeoutMs,
-      }, (res) => {
-        let raw = '';
-        res.on('data', c => { raw += c; });
-        res.on('end', () => { try { resolve(JSON.parse(raw)?.data?.answer || raw); } catch { resolve(raw); } });
-      });
-      req.on('timeout', () => { req.destroy(); reject(new Error('timeout')); });
-      req.on('error', reject);
-      req.write(body); req.end();
-    });
-  }
+  return askWithMessages(
+    [{ role: 'user', content: userPrompt }],
+    { systemInstructions: systemPrompt, responseTimeoutMs: timeoutMs || 120000 }
+  );
 }
 
 function slugify(t) { return t.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40); }

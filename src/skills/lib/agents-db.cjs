@@ -7,7 +7,7 @@
 const path = require('path');
 const os   = require('os');
 const fs   = require('fs');
-const logger = require('../logger.cjs');
+const logger = require('../../logger.cjs');
 
 const PROJECTS_DB_PATH = path.join(os.homedir(), '.thinkdrop', 'agents.db');
 

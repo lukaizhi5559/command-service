@@ -90,7 +90,7 @@ async function askWithMessages(messages, opts = {}) {
         sessionEntities: [],
         memories: [],
         webSearchResults: [],
-        systemInstructions: '',
+        systemInstructions: opts.systemInstructions || '',
       },
     },
     timestamp: Date.now(),
