@@ -386,62 +386,6 @@ function resolveRefForClick(sessionId, labelOrRef) {
   return { ref: null, label: null };
 }
 
-// Async resolver: LLM-first using the full ARIA snapshot YAML, scoring as fallback.
-// playwright-cli's YAML snapshot is purpose-built for LLM consumption — it contains
-// every element's role, label, and ref in a structured, readable format.
-// The LLM reads the page exactly as playwright-cli sees it and picks the right ref,
-// which is far more reliable than regex scoring heuristics.
-async function resolveRefSmart(sessionId, labelOrRef, intentHint) {
-  if (!labelOrRef) return null;
-  if (/^e\d+$/i.test(labelOrRef.trim())) return labelOrRef.trim();
-
-  const snap = snapshotCache.get(sessionId) || '';
-  if (!snap) return null;
-
-  // ── Primary path: LLM reads the full ARIA snapshot and picks the ref ────────
-  // Trim to ~6 KB to stay within token budget while keeping full page context.
-  try {
-    const skillLlm = require('../skill-helpers/skill-llm.cjs');
-    const snapTrimmed = snap.length > 6000 ? snap.slice(0, 6000) + '\n[...snapshot truncated]' : snap;
-    const prompt =
-      `You are a browser automation assistant.\n` +
-      `Here is the current page accessibility tree (playwright-cli ARIA snapshot):\n\n` +
-      `${snapTrimmed}\n\n` +
-      `Task: find the element ref to FILL for selector: "${labelOrRef}"` +
-      (intentHint ? `\nValue to be filled: "${intentHint}"` : '') +
-      `\n\nRules:\n` +
-      `- Respond with ONLY the ref id (e.g. e7). No explanation, no other text.\n` +
-      `- Choose a textbox, input, or combobox that matches the intent of "${labelOrRef}".\n` +
-      `- If the selector is a CSS selector list, identify which visible input best matches the first matching type.\n` +
-      `- Do NOT pick buttons, links, or language/region dropdowns unless explicitly requested.`;
-    const answer = await skillLlm.ask(prompt, { temperature: 0.0, responseTimeoutMs: 8000 });
-    // Extract first eN ref anywhere in the LLM response (it may include explanation text)
-    const pickedRef = (answer || '').match(/\b(e\d+)\b/i)?.[1];
-    // Validate the ref actually exists in the snapshot before trusting it
-    if (pickedRef && new RegExp(`ref=?${pickedRef}\\b|\\[${pickedRef}\\]|\\(${pickedRef}\\)`, 'i').test(snap)) {
-      logger.info(`[browser.act] resolveRefSmart LLM→ ${pickedRef} for "${labelOrRef}"`);
-      return pickedRef;
-    }
-    if (pickedRef) {
-      logger.warn(`[browser.act] resolveRefSmart LLM returned ${pickedRef} but it was not found in snapshot — using score fallback`);
-    }
-  } catch (err) {
-    logger.warn(`[browser.act] resolveRefSmart LLM unavailable (${err.message}) — falling back to scoring`);
-  }
-
-  // ── Fallback: scoring heuristics when LLM service is unreachable ────────────
-  const candidates = parseSnapshotCandidates(snap);
-  const scored = candidates
-    .map(c => ({ ...c, score: scoreCandidateForSelector(c, labelOrRef) }))
-    .filter(c => c.score > -Infinity)
-    .sort((a, b) => b.score - a.score);
-
-  if (scored.length === 0) return null;
-  const top = scored[0];
-  logger.info(`[browser.act] resolveRefSmart score fallback→ ${top.ref} (${top.role} "${top.label}" score=${top.score})`);
-  return top.ref;
-}
-
 // ---------------------------------------------------------------------------
 // Main skill entry point
 // ---------------------------------------------------------------------------
@@ -531,35 +475,6 @@ async function browserAct(args) {
             await cliRun([...S, 'goto', url], navTimeout).catch(() => {});
           }
         }
-        // Bring Chrome to front, activating the tab with the target URL.
-        // Wait 2s so Chrome has time to finish loading the URL into the tab.
-        // NOTE: Do NOT close about:blank tabs — playwright-cli uses one as its internal
-        // control/session tab. Closing it kills the session mid-execution.
-        setTimeout(() => {
-          try {
-            const safeDomain = url.replace(/'/g, '');
-            const script = [
-              `tell application "Google Chrome"`,
-              `  activate`,
-              `  set found to false`,
-              `  repeat with w in windows`,
-              `    repeat with t in tabs of w`,
-              `      if URL of t starts with "${safeDomain}" then`,
-              `        set active tab of w to t`,
-              `        set index of w to 1`,
-              `        set found to true`,
-              `        exit repeat`,
-              `      end if`,
-              `    end repeat`,
-              `    if found then exit repeat`,
-              `  end repeat`,
-              `end tell`,
-            ].join('\n');
-            require('child_process').spawn('osascript', ['-e', script], { detached: true }).unref();
-          } catch (_) {
-            require('child_process').spawn('open', ['-a', 'Google Chrome'], { detached: true }).unref();
-          }
-        }, 2000);
       } else if (alreadyOpen && !res.ok) {
         // goto failed (daemon may have died) — retry with open to restart it
         logger.info(`[browser.act] goto failed, retrying with open for session=${sessionId}`);
@@ -681,8 +596,7 @@ async function browserAct(args) {
     // ── Fill / Type ─────────────────────────────────────────────────────────
     case 'fill': {
       await captureSnapshot(sessionId, headed, timeoutMs);
-      // Use intent-aware smart resolver: scored snapshot matching + phi4 LLM for ambiguous cases
-      const rawFillRef = await resolveRefSmart(sessionId, selector, text);
+      const rawFillRef = resolveRef(sessionId, selector);
       // Only use real eN refs — synthetic line_N refs from .yml format are rejected by playwright-cli
       const ref = rawFillRef && /^e\d+$/i.test(rawFillRef) ? rawFillRef : null;
       const fillTarget = ref || selector;
