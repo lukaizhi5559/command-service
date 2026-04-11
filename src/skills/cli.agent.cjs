@@ -10,7 +10,8 @@
  * Actions:
  *   discover       { cli }                   → checks which/version/help
  *   install        { cli?, service?, method? }→ brew/npm/pip install
- *   run            { cli, argv, cwd?, env?,   → executes CLI, returns stdout/stderr
+ *   run            { agentId, task }           → agentic: reads descriptor from DuckDB, LLM infers argv, executes
+ *                  { cli, argv, cwd?, env?,   → raw: executes CLI directly (backward compat)
  *                   timeoutMs?, stdin? }
  *   build_agent    { service, cli?, force? }  → discovers CLI, generates .md descriptor,
  *                                               stores in DuckDB + ~/.thinkdrop/agents/
@@ -282,6 +283,96 @@ async function lookupServiceAsync(service) {
 // Action: discover
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Subcommand discovery — 3-tier: oclif → cobra → --help parse
+// Returns a map of { subcmd: helpText } for the top-level subcommands.
+// ---------------------------------------------------------------------------
+
+async function discoverSubcommands(binPath) {
+  const SUBCMD_CHARS = 350; // chars budget per subcommand help snippet (Tier 3 only)
+
+  // ── Tier 1: oclif (heroku, twilio, netlify, vercel, firebase, shopify) ──
+  // No cap — oclif `commands --json` returns compact {id, summary} objects (~100 chars each).
+  // 100+ entries is fine for any LLM we target (OpenAI/Claude 128K+; 7B Qwen 32K+).
+  try {
+    const oclifResult = await spawnCapture(binPath, ['commands', '--json'], { timeoutMs: 4000 });
+    if (oclifResult.ok && oclifResult.stdout.trim().startsWith('[')) {
+      const commands = JSON.parse(oclifResult.stdout.trim());
+      if (Array.isArray(commands) && commands.length > 0) {
+        const subMap = {};
+        for (const cmd of commands.slice(0, 100)) {
+          const id = cmd.id || cmd.name || '';
+          if (id) subMap[id] = cmd.summary || cmd.description || '';
+        }
+        return subMap;
+      }
+    }
+  } catch {}
+
+  // ── Tier 2: cobra __complete (gh, kubectl, helm, docker, fly, stripe, etc.) ──
+  // No cap on top-level commands — names are compact (comma-separated strings, ~10KB total).
+  // Removing the .slice() cap is the fix for cobra CLIs like `gh` which have 30+ top-level
+  // commands: the old cap of 15 cut off `repo`, `pr`, `issue`, `org` etc. entirely.
+  try {
+    const cobraResult = await spawnCapture(binPath, ['__complete', ''], { timeoutMs: 3000 });
+    if (cobraResult.ok || cobraResult.stdout.trim()) {
+      const topCmds = cobraResult.stdout.trim().split('\n')
+        .map(l => l.split('\t')[0].trim())
+        .filter(l => l && /^[a-z][a-z0-9\-_]*$/.test(l) && l !== ':0');
+      if (topCmds.length > 0) {
+        const subMap = {};
+        await Promise.all(topCmds.map(async (cmd) => {
+          const [subResult, helpR] = await Promise.all([
+            spawnCapture(binPath, ['__complete', cmd, ''], { timeoutMs: 2000 }),
+            spawnCapture(binPath, [cmd, '--help'],         { timeoutMs: 3000 }),
+          ]);
+          // cobra __complete: visible subcommands only
+          const cobraNames = (subResult.stdout || '').trim().split('\n')
+            .map(l => l.split('\t')[0].trim())
+            .filter(l => l && /^[a-z][a-z0-9\-_]*$/.test(l) && l !== ':0');
+          // --help: ALL subcommands including Hidden=true (e.g. `star`, `unstar`)
+          const helpText = helpR.stdout || helpR.stderr || '';
+          const SKIP = /^(usage|examples?|flags?|options?|help|version|available|additional|core|alias)$/i;
+          const helpNames = [...helpText.matchAll(/^ {2,8}([a-z][a-z0-9\-_]+)[:\s]/gm)]
+            .map(m => m[1]).filter(n => n.length > 1 && !SKIP.test(n));
+          // Leaf command (no cobra subcommands): store raw help text so the LLM sees actual flags/usage.
+          // Command group (has subcommands): store compact comma-separated subcommand names.
+          if (cobraNames.length === 0) {
+            subMap[cmd] = helpText.slice(0, SUBCMD_CHARS);
+          } else {
+            subMap[cmd] = [...new Set([...cobraNames, ...helpNames])].join(', ');
+          }
+        }));
+        return subMap;
+      }
+    }
+  } catch {}
+
+  // ── Tier 3: Universal fallback — parse --help text, fetch 1-level subcommand help ──
+  // Cap at 50 — each entry stores up to SUBCMD_CHARS (350) of full help text.
+  // 50 × 350 chars = ~17KB, well within any LLM context window.
+  try {
+    const helpResult = await spawnCapture(binPath, ['--help'], { timeoutMs: 5000 });
+    const helpText = helpResult.stdout || helpResult.stderr || '';
+    // Match lines like "  repo        Manage repositories"
+    const subcmdMatches = [...helpText.matchAll(/^ {1,4}([a-z][a-z0-9\-_]+)\s{2,}/gm)]
+      .map(m => m[1])
+      .filter(s => s.length > 1)
+      .slice(0, 50);
+    if (subcmdMatches.length > 0) {
+      const subMap = {};
+      await Promise.all(subcmdMatches.map(async (cmd) => {
+        const sub = await spawnCapture(binPath, [cmd, '--help'], { timeoutMs: 3000 });
+        const text = (sub.stdout || sub.stderr || '').slice(0, SUBCMD_CHARS);
+        if (text) subMap[cmd] = text;
+      }));
+      return subMap;
+    }
+  } catch {}
+
+  return {};
+}
+
 async function actionDiscover({ cli }) {
   if (!cli) return { ok: false, error: 'cli is required' };
   const binPath = await whichCli(cli);
@@ -289,6 +380,7 @@ async function actionDiscover({ cli }) {
 
   const versionResult = await spawnCapture(binPath, ['--version'], { timeoutMs: 8000 });
   const helpResult    = await spawnCapture(binPath, ['--help'],    { timeoutMs: 8000 });
+  const subcommandMap = await discoverSubcommands(binPath);
 
   return {
     ok: true,
@@ -297,6 +389,7 @@ async function actionDiscover({ cli }) {
     binPath,
     version: (versionResult.stdout || versionResult.stderr).split('\n')[0].trim() || null,
     help: (helpResult.stdout || helpResult.stderr).slice(0, 4000),
+    subcommandMap,
   };
 }
 
@@ -335,11 +428,381 @@ async function actionInstall({ cli, service, method }) {
 }
 
 // ---------------------------------------------------------------------------
+// Action: run — agentic loop helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Upgrades a CLI binary in-place via the appropriate package manager.
+ * Called by the agentic loop `run_update` action — never prompts the user.
+ */
+async function agentRunUpdate(cliName, meta) {
+  const method = meta?.method || 'brew';
+  const pkg    = meta?.pkg    || cliName;
+  logger.info(`[cli.agent] agentRunUpdate: ${method} force-reinstall ${pkg}`);
+  let result;
+  if (method === 'brew') {
+    // reinstall (not upgrade) — forces clean relink even when brew thinks it's already current.
+    // Fixes PATH shadowing where an old binary overrides the brew-managed one.
+    result = await spawnCapture('brew', ['reinstall', pkg], { timeoutMs: 180000 });
+    if (result.ok) {
+      await spawnCapture('brew', ['link', '--overwrite', pkg], { timeoutMs: 30000 });
+    }
+  } else if (method === 'npm') {
+    // Clear npm cache first, then force-reinstall global package
+    await spawnCapture('npm', ['cache', 'clean', '--force'], { timeoutMs: 30000 });
+    result = await spawnCapture('npm', ['install', '-g', `${pkg}@latest`], { timeoutMs: 120000 });
+  } else if (method === 'pip' || method === 'pip3') {
+    // --force-reinstall re-downloads and reinstalls even if already up-to-date
+    result = await spawnCapture('pip3', ['install', '--force-reinstall', '--upgrade', pkg], { timeoutMs: 120000 });
+  } else {
+    return { ok: false, error: `Unknown install method: ${method}` };
+  }
+  return { ok: result.ok, stdout: result.stdout || result.stderr || '', error: result.error };
+}
+
+async function agentWebSearch(query) {
+  const http = require('http');
+  return new Promise((resolve) => {
+    const body = JSON.stringify({
+      version: 'mcp.v1', service: 'web-search',
+      requestId: `ws_${Date.now()}`, action: 'search',
+      payload: { query, maxResults: 3 },
+    });
+    const req = http.request({
+      hostname: 'localhost', port: 3002,
+      path: '/', method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
+    }, (res) => {
+      let data = '';
+      res.on('data', c => { data += c; });
+      res.on('end', () => {
+        try {
+          const parsed = JSON.parse(data);
+          const results = parsed?.data?.results || parsed?.results || [];
+          if (results.length === 0) { resolve(`web_search returned no results for: "${query}" — try web_fetch with a direct docs URL instead`); return; }
+          resolve(results.slice(0, 3).map(r => `${r.title}\n${r.snippet}`).join('\n---\n'));
+        } catch { resolve(data.slice(0, 600) || `web_search returned no results for: "${query}" — try web_fetch with a direct docs URL instead`); }
+      });
+    });
+    req.on('error', (e) => resolve(`web_search failed: ${e.message || 'connection error'} — try web_fetch with a direct docs URL instead`));
+    req.setTimeout(5000, () => { req.destroy(); resolve(`web_search timed out for: "${query}" — try web_fetch with a direct docs URL instead`); });
+    req.write(body);
+    req.end();
+  });
+}
+
+async function agentWebFetch(url) {
+  const WEB_FETCH_CHARS = 2000;
+  const pc = await spawnCapture('/opt/homebrew/bin/playwright-cli', ['fetch', url], { timeoutMs: 15000 });
+  if (pc.ok && pc.stdout.trim()) return pc.stdout.slice(0, WEB_FETCH_CHARS);
+  const cr = await spawnCapture('curl', ['-sL', '--max-time', '10', url], { timeoutMs: 15000 });
+  if (cr.stdout) return cr.stdout.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').slice(0, WEB_FETCH_CHARS);
+  return '';
+}
+
+// Builds the systemInstructions for a loop turn: loop prompt + trimmed descriptor.
+// Descriptor is placed in system (not user) to avoid WS bridge prompt-field size limits.
+function buildTurnSystemPrompt(descriptor, learnedRules) {
+  const DESCRIPTOR_LIMIT = 3000;
+  const trimmedDescriptor = (descriptor || '(none)').slice(0, DESCRIPTOR_LIMIT);
+  const rulesSection = (Array.isArray(learnedRules) && learnedRules.length > 0)
+    ? '\n\n## Learned Command Rules (from past runs)\n' + learnedRules.map(r => `- ${r}`).join('\n')
+    : '';
+  return `${CLI_AGENTIC_LOOP_PROMPT}\n\n## Agent Descriptor\n${trimmedDescriptor}${rulesSection}`;
+}
+
+// Builds the user-turn prompt for a loop turn: task + history only (~200-400 chars).
+function buildTurnPrompt(task, history) {
+  const histLines = history.length === 0
+    ? '(none — this is turn 1)'
+    : history.map(h => {
+        const parts = Object.entries(h)
+          .filter(([k]) => k !== 'turn' && k !== 'observation')
+          .map(([k, v]) => `${k}=${JSON.stringify(v)}`).join(' ');
+        return `  Turn ${h.turn}: ${parts}\n    Observation: ${h.observation}`;
+      }).join('\n\n');
+  return `## Task\n${task}\n\n## Turn History\n${histLines}\n\n## Next Action\nOutput a single JSON action object.`;
+}
+
+const CLI_AGENTIC_LOOP_PROMPT = `You are an expert CLI automation agent executing a user task step-by-step.
+You have access to a CLI tool described in the Agent Descriptor below. The descriptor is the ONLY source of truth for what commands exist — do NOT invent or guess commands from training knowledge.
+Each turn you output exactly ONE JSON action object from this palette:
+
+  run_cmd    – execute CLI command:         { "action": "run_cmd", "argv": [...] }
+  run_help   – read subcommand help:        { "action": "run_help", "subcmd": [...] }
+  run_update – upgrade CLI to latest:       { "action": "run_update", "cli": "<name>" }
+  web_search – search for docs/examples:   { "action": "web_search", "query": "..." }
+  web_fetch  – read a docs/reference URL:  { "action": "web_fetch", "url": "..." }
+  done       – task complete:              { "action": "done", "summary": "..." }
+  ask_user   – need user clarification:    { "action": "ask_user", "question": "...", "options": [], "save_rule": "..." }  (save_rule optional — see Rules)
+
+Rules:
+- argv must NOT include the CLI binary name itself — only the subcommand and its arguments.
+- ONLY use subcommands and flags explicitly listed in the Agent Descriptor. Do NOT guess or invent commands from training knowledge — the descriptor is authoritative.
+- If the required subcommand is NOT in the descriptor, FIRST try run_help on the most likely escape-hatch subcommand (e.g. ["api"], ["call"], ["request"]) — it returns instant local docs in 1 turn. Only fall back to web_search if run_help output is insufficient or the operation is completely novel.
+- web_search and web_fetch are your fallback sources when run_help is insufficient — prefer fresh docs over assumptions. If 2 consecutive web_search turns returned "no results", STOP searching — hard-pivot to web_fetch with the best official docs URL you know. Do NOT keep issuing web_search with variant queries.
+- After run_cmd returns exitCode=0: if the task is fully complete (write/delete/star/follow — no output to process), output done. If the output needs further processing (decode base64, extract a URL or path, save content to a file), continue with the next action.
+- Use run_help when you know the subcommand path but need exact flags or argument format. \`subcmd\` is the path WITHOUT the binary — e.g. \`["compose", "up"]\` fetches \`docker compose up --help\`. \`subcmd\` must contain at least one entry — never call run_help with an empty array (root-level help is already in the Agent Descriptor).
+- Use run_update only when the CLI binary itself is confirmed missing or broken — never for unknown subcommands.
+- Output JSON only. No prose before or after the JSON object.
+- When you discover that a class of subcommands does NOT exist and there is a general escape-hatch alternative, write a BROAD save_rule that covers ALL similar operations — not just the one you just solved. The rule must include: (1) what pattern of operations has no dedicated subcommand, (2) the general escape-hatch command with syntax, (3) at least 3 examples covering different operation types so future runs never need to rediscover this pattern.
+  Bad (too narrow): "'gh repo star' does not exist. Use: gh api --method PUT /user/starred/{owner}/{repo}."
+  Good (broad): "Many 'gh' operations have no dedicated subcommand — use 'gh api --method GET/PUT/DELETE/POST <REST endpoint>' for all of them. Syntax: run_help [\"api\"] shows full flags. Examples: star=PUT /user/starred/{owner}/{repo}, unstar=DELETE /user/starred/{owner}/{repo}, readme=GET /repos/{owner}/{repo}/readme, releases=GET /repos/{owner}/{repo}/releases, follow_user=PUT /user/following/{username}."
+
+## Mandatory recovery protocol when run_cmd fails with "unknown command"
+If run_cmd returns exitCode≠0 with "unknown command" in the stderr observation:
+1. Do NOT retry variants. Do NOT use run_update.
+2. Read the [auto-fetched help] block appended to the observation — if it shows the correct syntax, output run_cmd immediately with that syntax.
+3. If the auto-fetched help does NOT reveal the correct syntax, try run_help on a likely escape-hatch subcommand: ["api"], ["call"], or ["request"]. If the help output confirms an escape-hatch pattern → output run_cmd directly with that syntax, then use ask_user with a broad save_rule covering the whole pattern.
+4. Only if run_help is insufficient: output web_search with query: "<cli-name> <operation> REST API official docs".
+5. Next turn: read the observation — if URLs are visible, output web_fetch with the most relevant official docs URL.
+6. If the fetched page confirms the correct command syntax → output run_cmd with exactly that syntax.
+7. If the fetched page shows the command does NOT exist or provides an alternative → output ask_user.
+   The ask_user message MUST explain: what you searched, what the docs say, and the best alternative found.
+   IMPORTANT: When proposing a specific command, embed it in the option text so the user's choice becomes an actionable task — NOT just "Yes, use the alternative".
+   IMPORTANT: save_rule must be BROAD — cover the general pattern, not just the one operation you just solved (see save_rule guidance above).
+   Example: { "action": "ask_user", "question": "I couldn't find a 'gh repo star' command. The gh CLI uses 'gh api --method <METHOD> <endpoint>' for REST operations without dedicated subcommands. Would you like me to use that?", "options": ["Yes, run: gh api --method PUT /user/starred/microsoft/vscode", "No, cancel"], "save_rule": "Many 'gh' operations have no dedicated subcommand — use 'gh api --method GET/PUT/DELETE/POST <REST endpoint>'. Syntax: run_help [\"api\"] shows full flags. Examples: star=PUT /user/starred/{owner}/{repo}, unstar=DELETE /user/starred/{owner}/{repo}, readme=GET /repos/{owner}/{repo}/readme, releases=GET /repos/{owner}/{repo}/releases, follow_user=PUT /user/following/{username}." }
+- ask_user can also be used to present a discovered alternative at any point — always include what was searched, what was found, and the proposed command.
+- Never use ask_user for CLI version or installation issues — use run_update instead.`;
+
+// ---------------------------------------------------------------------------
 // Action: run
 // ---------------------------------------------------------------------------
 
-async function actionRun({ cli, argv = [], cwd, env, timeoutMs, stdin }) {
-  if (!cli) return { ok: false, error: 'cli is required' };
+const CLI_RUN_SYSTEM_PROMPT = `You are a CLI command inference engine. Given an agent descriptor (which describes a CLI tool, its capabilities, and help text) and a plain-language task, output the minimal argv array needed to accomplish that task.
+
+Output ONLY valid JSON — an object with exactly these fields:
+{
+  "argv": ["<arg1>", "<arg2>", ...],
+  "reasoning": "<one sentence explaining the command choice>"
+}
+
+Rules:
+- argv should NOT include the CLI binary name itself, only the arguments
+- Prefer subcommands from the descriptor's Subcommand Reference or CLI Help Reference; for well-known CLIs (gh, aws, gcloud, kubectl, heroku, firebase, fly, doctl, stripe, vercel, netlify, railway, docker), also draw on your expert knowledge of the CLI when the specific subcommand is not in the descriptor
+- If the descriptor shows authentication is persistent (already logged in), do NOT add auth steps
+- If the task is ambiguous, pick the most common/safe interpretation
+- If the task genuinely cannot be expressed as a single CLI invocation, set argv to [] and explain in reasoning`;
+
+async function actionRun({ cli, argv = [], cwd, env, timeoutMs, stdin, agentId, task }) {
+  // ── Agentic path: agentId + task → LLM infers argv from descriptor ──
+  if (agentId && task) {
+    const db = await getDb();
+    if (!db) return { ok: false, error: 'DuckDB not available for agentic run' };
+
+    const rows = await db.all(
+      'SELECT id, cli_tool, descriptor, status FROM agents WHERE id = ?', agentId
+    ).catch(() => null);
+
+    if (!rows || rows.length === 0) {
+      return { ok: false, error: `No agent found: ${agentId}. Use action:build_agent to create it first.`, needsBuild: true };
+    }
+
+    const agent = rows[0];
+    if (agent.status === 'needs_update') {
+      logger.warn(`[cli.agent] run: agent ${agentId} status=needs_update, proceeding anyway`);
+    }
+
+    const cliTool = agent.cli_tool;
+    if (!cliTool) return { ok: false, error: `Agent ${agentId} has no cli_tool — cannot run` };
+
+    const binPath = await whichCli(cliTool);
+    if (!binPath) {
+      return { ok: false, error: `CLI not found: ${cliTool}. Run action:build_agent to reinstall.`, needsBuild: true };
+    }
+
+    logger.info(`[cli.agent] agentic run: ${agentId} task="${task}"`);
+
+    // ── Meta-task safety net: "rebuild/refresh/recreate/reset [X] agent" ──
+    // These are agent-management commands, not CLI tasks — route to build_agent.
+    if (/\b(rebuild|recreate|refresh|reset|reinitializ[e]?|re-?build|re-?create)\b/i.test(task) &&
+        /\bagent\b/i.test(task)) {
+      const service = (agent.service || cliTool || agentId.replace(/\.agent$/i, ''));
+      logger.info(`[cli.agent] run: meta-task detected ("${task}") — redirecting to build_agent for service "${service}"`);
+      return await actionBuildAgent({ service, force: true });
+    }
+
+    // ── Multi-turn agentic loop ──
+    const MAX_TURNS = 8;
+    const OBSERVATION_CHARS = 600;
+    const loopHistory = [];
+    const transcript = [];
+    let currentBinPath = binPath;
+    let loopMeta = null; // lazy-loaded on first run_update
+
+    // Load per-agent learned rules (saved by past ask_user save_rule events).
+    // Falls back to [] silently if user-memory service is unavailable.
+    const skillDb = require('../skill-helpers/skill-db.cjs');
+    const learnedRules = await skillDb.getContextRules('cli_agent:' + agentId).catch(() => []);
+    if (learnedRules.length > 0) {
+      logger.info(`[cli.agent] loaded ${learnedRules.length} learned rule(s) for ${agentId}`, { agentId });
+    }
+
+    for (let turn = 1; turn <= MAX_TURNS; turn++) {
+      const turnSys  = buildTurnSystemPrompt(agent.descriptor, learnedRules);
+      const turnUser = buildTurnPrompt(task, loopHistory);
+      logger.info(`[cli.agent] loop turn=${turn} syschars=${turnSys.length} userchars=${turnUser.length}`, { agentId, task });
+
+      const llmRaw = await callLLM(turnSys, turnUser, { temperature: 0.1, maxTokens: 400 });
+
+      logger.info(`[cli.agent] loop turn=${turn} llmRaw=${llmRaw === null ? 'NULL' : `"${(llmRaw || '').slice(0, 300)}"`}`, { agentId });
+
+      let action = null;
+      if (llmRaw) {
+        try {
+          // Greedy match — finds outermost { ... } even with nested braces
+          const m = llmRaw.match(/\{[\s\S]*\}/);
+          if (m) action = JSON.parse(m[0]);
+        } catch (parseErr) {
+          logger.warn(`[cli.agent] loop turn=${turn} JSON parse failed: ${parseErr.message}`, { agentId });
+        }
+      }
+
+      if (!action || !action.action) {
+        logger.warn(`[cli.agent] loop turn=${turn} parse_error — no valid action in LLM output`, { agentId });
+        loopHistory.push({ turn, action: 'parse_error', observation: `LLM output: ${(llmRaw || 'NULL').slice(0, 200)}` });
+        continue;
+      }
+
+      logger.info(`[cli.agent] loop turn=${turn} action=${action.action}`, { agentId, task });
+
+      if (action.action === 'done') {
+        transcript.push({ turn, action, outcome: { ok: true, result: action.summary || '' }, thoughts: null });
+        return { ok: true, agentId, task, stdout: action.summary || '', agentTurns: turn, transcript };
+      }
+
+      if (action.action === 'ask_user') {
+        // Persist any discovered command-mapping rule so future runs skip the discovery turns.
+        // Saved regardless of user's Yes/No — the CLI docs truth is independent of the user's choice.
+        if (action.save_rule && typeof action.save_rule === 'string' && action.save_rule.trim()) {
+          skillDb.setContextRule('cli_agent:' + agentId, action.save_rule.trim(), 'cli_agent').catch(() => {});
+          logger.info(`[cli.agent] saved learned rule for ${agentId}: "${action.save_rule.slice(0, 120)}"`, { agentId });
+        }
+        // Do NOT push to transcript — ask_user is a terminal escalation, not an executed step.
+        // Showing it as a turn bubble would duplicate the question text that the UI card already displays.
+        return { ok: false, agentId, task, askUser: true, question: action.question || '', options: action.options || [], agentTurns: turn, transcript, savedRule: (action.save_rule || '').trim() || null };
+      }
+
+      let observation = '';
+
+      if (action.action === 'run_cmd') {
+        const cmdResult = await spawnCapture(currentBinPath, action.argv || [], { cwd, env, timeoutMs: timeoutMs || 30000 });
+        logger.info(`[cli.agent] loop turn=${turn} run_cmd exitCode=${cmdResult.exitCode} stdout="${cmdResult.stdout.slice(0, 200)}" stderr="${(cmdResult.stderr || '').slice(0, 200)}"`, { agentId });
+        // Idempotent success: treat "already done" CLi responses as success (e.g. gh repo star on already-starred repo exits 1)
+        const alreadyDone = /already starred|already watching|already following|nothing to (do|change)|up.to.date|no changes/i.test(
+          cmdResult.stdout + ' ' + (cmdResult.stderr || '')
+        );
+        if (alreadyDone) {
+          // Idempotent: "already starred/following" etc — task definitively complete, exit immediately.
+          transcript.push({ turn, action, outcome: { ok: true, result: cmdResult.stdout.slice(0, 300) }, thoughts: null });
+          return {
+            ok: true, agentId, task,
+            inferredArgv: action.argv, stdout: cmdResult.stdout,
+            stderr: cmdResult.stderr, exitCode: cmdResult.exitCode, agentTurns: turn, transcript,
+          };
+        }
+        if (cmdResult.exitCode === -1) {
+          // Timeout — process was killed. Explicitly label so the LLM does NOT call done.
+          observation = `exitCode=-1 (TIMED OUT — command was killed before completing; it did NOT succeed). Do NOT call done. Use a faster alternative — e.g. for fetching a single GitHub file prefer "gh api /repos/{owner}/{repo}/readme" over "gh repo clone".`;
+        } else if (cmdResult.exitCode === 0) {
+          // Command succeeded — feed stdout back so the LLM can evaluate: call "done" if the
+          // task is fully complete, or continue (e.g. decode base64, save to file, follow a URL)
+          // if the output needs further processing. Do NOT auto-exit here.
+          transcript.push({ turn, action, outcome: { ok: true, result: cmdResult.stdout.slice(0, 300) }, thoughts: null });
+          observation = `exitCode=0 stdout="${cmdResult.stdout.slice(0, 800)}"`;
+          loopHistory.push({ turn, ...action, observation: observation.slice(0, OBSERVATION_CHARS) });
+          continue; // transcript already pushed above; skip bottom push
+        } else {
+          // Non-zero, non-timeout failure — auto-inject deep subcommand help on "unknown command".
+          // Build the help path by walking the argv, stripping trailing --flags and positional args (paths/URLs),
+          // so we fetch the most specific help available rather than just argv[0].
+          // Examples:
+          //   ["compose", "up", "--no-deps"]               → fetch ["compose", "up", "--help"]
+          //   ["api", "--method", "PUT", "/user/starred"]  → fetch ["api", "--help"]
+          //   ["repo", "star", "owner/repo"]               → fetch ["repo", "star", "--help"]
+          if (/unknown command/i.test(cmdResult.stderr || '')) {
+            const argv = action.argv || [];
+            const subcmdPath = argv
+              .slice(0, 3) // depth cap — avoid absurdly nested CLIs (e.g. gcloud)
+              .filter(a => !a.startsWith('-') && !/[/\\]/.test(a) && !/^[A-Z_]+=/.test(a));
+            if (subcmdPath.length > 0) {
+              const helpLabel = subcmdPath.join(' ');
+              const helpR = await spawnCapture(currentBinPath, [...subcmdPath, '--help'], { timeoutMs: 4000 });
+              const helpText = (helpR.stdout || helpR.stderr || '').slice(0, OBSERVATION_CHARS);
+              observation = `exitCode=${cmdResult.exitCode} stderr="${(cmdResult.stderr || '').slice(0, 200)}"\n[auto-fetched help for "${helpLabel}"]:\n${helpText}`;
+            } else {
+              observation = `exitCode=${cmdResult.exitCode} stdout="${cmdResult.stdout.slice(0, 300)}" stderr="${(cmdResult.stderr || '').slice(0, 200)}"`;
+            }
+          } else {
+            observation = `exitCode=${cmdResult.exitCode} stdout="${cmdResult.stdout.slice(0, 300)}" stderr="${(cmdResult.stderr || '').slice(0, 200)}"`;
+          }
+        }
+
+      } else if (action.action === 'run_help') {
+        const helpR = await spawnCapture(currentBinPath, [...(action.subcmd || []), '--help'], { timeoutMs: 4000 });
+        observation = (helpR.stdout || helpR.stderr || '').slice(0, OBSERVATION_CHARS);
+
+      } else if (action.action === 'run_update') {
+        if (!loopMeta) loopMeta = await lookupServiceAsync(cliTool);
+        const updateR = await agentRunUpdate(cliTool, loopMeta);
+        if (updateR.ok) {
+          const newBin = await whichCli(cliTool);
+          if (newBin) currentBinPath = newBin;
+          // Auto-retry the last failed run_cmd with the fresh binary — saves a full LLM turn.
+          // Without this, the LLM wastes turn 4 on run_help instead of retrying the command.
+          const lastCmd = [...loopHistory].reverse().find(h => h.action === 'run_cmd');
+          if (lastCmd?.argv) {
+            logger.info(`[cli.agent] loop turn=${turn} run_update ok — auto-retrying: ${JSON.stringify(lastCmd.argv)}`, { agentId });
+            const retryR = await spawnCapture(currentBinPath, lastCmd.argv, { cwd, env, timeoutMs: timeoutMs || 30000 });
+            logger.info(`[cli.agent] loop turn=${turn} auto-retry exitCode=${retryR.exitCode} stdout="${retryR.stdout.slice(0, 200)}" stderr="${(retryR.stderr || '').slice(0, 200)}"`, { agentId });
+            const alreadyDone = /already starred|already watching|already following|nothing to (do|change)|up.to.date|no changes/i.test(
+              retryR.stdout + ' ' + (retryR.stderr || '')
+            );
+            if (alreadyDone) {
+              transcript.push({ turn, action, outcome: { ok: true, result: retryR.stdout.slice(0, 300) }, thoughts: null });
+              return { ok: true, agentId, task, inferredArgv: lastCmd.argv, stdout: retryR.stdout, stderr: retryR.stderr, exitCode: retryR.exitCode, agentTurns: turn, transcript };
+            }
+            if (retryR.exitCode === -1) {
+              observation = `run_update ok; retry exitCode=-1 (TIMED OUT — command was killed before completing). Do NOT call done. Try a faster alternative approach.`;
+            } else if (retryR.exitCode === 0) {
+              transcript.push({ turn, action, outcome: { ok: true, result: retryR.stdout.slice(0, 300) }, thoughts: null });
+              observation = `run_update ok; retry exitCode=0 stdout="${retryR.stdout.slice(0, 800)}"`;
+              loopHistory.push({ turn, ...action, observation: observation.slice(0, OBSERVATION_CHARS) });
+              continue;
+            }
+            observation = `run_update ok; retry exitCode=${retryR.exitCode} stderr="${(retryR.stderr || '').slice(0, 300)}"`;
+          } else {
+            observation = `run_update succeeded: ${(updateR.stdout || '').slice(0, OBSERVATION_CHARS)}`;
+          }
+        } else {
+          observation = `run_update failed: ${(updateR.error || updateR.stdout || '').slice(0, OBSERVATION_CHARS)}`;
+        }
+
+      } else if (action.action === 'web_search') {
+        const snippets = await agentWebSearch(action.query || '');
+        observation = snippets.slice(0, OBSERVATION_CHARS);
+
+      } else if (action.action === 'web_fetch') {
+        const page = await agentWebFetch(action.url || '');
+        observation = page.slice(0, 2000);
+
+      } else {
+        observation = `unknown action: ${action.action}`;
+      }
+
+      loopHistory.push({ turn, ...action, observation: observation.slice(0, OBSERVATION_CHARS) });
+      transcript.push({ turn, action, outcome: { ok: false, error: observation.slice(0, 300) }, thoughts: null });
+    }
+
+    return {
+      ok: false, agentId, task,
+      error: `Agentic loop reached MAX_TURNS (${MAX_TURNS}) without completing`,
+      agentTurns: MAX_TURNS, transcript,
+    };
+  }
+
+  // ── Raw path: cli + argv (backward compat) ──
+  if (!cli) return { ok: false, error: 'cli or agentId is required' };
 
   const binPath = await whichCli(cli);
   if (!binPath) return { ok: false, error: `CLI not found: ${cli}. Use action:install first.` };
@@ -390,9 +853,9 @@ function inferCapabilities(helpText, meta) {
   return [...caps];
 }
 
-function buildDescriptorMd({ id, service, cliName, version, capabilities, helpText }) {
+function buildDescriptorMd({ id, service, cliName, version, capabilities, helpText, subcommandMap }) {
   const capYaml = capabilities.map(c => `  - ${c}`).join('\n');
-  return [
+  const parts = [
     '---',
     `id: ${id}`,
     `type: cli`,
@@ -410,9 +873,20 @@ function buildDescriptorMd({ id, service, cliName, version, capabilities, helpTe
     '',
     `## CLI Help Reference`,
     '```',
-    (helpText || '').slice(0, 3000),
+    (helpText || '').slice(0, 2000),
     '```',
-  ].join('\n');
+  ];
+
+  // Append subcommand reference when available
+  if (subcommandMap && Object.keys(subcommandMap).length > 0) {
+    parts.push('', '## Subcommand Reference');
+    for (const [subcmd, detail] of Object.entries(subcommandMap)) {
+      parts.push(`### ${subcmd}`);
+      if (detail) parts.push((String(detail)).slice(0, 350));
+    }
+  }
+
+  return parts.join('\n');
 }
 
 async function _buildApiKeyAgentDescriptor({ service, serviceKey, agentId, meta, force = false }) {
@@ -544,6 +1018,7 @@ async function actionBuildAgent({ service, cli: explicitCli, force = false }) {
     version: discovery.version,
     capabilities,
     helpText: discovery.help,
+    subcommandMap: discovery.subcommandMap,
   });
 
   // Write .md file to disk
@@ -577,6 +1052,7 @@ async function actionBuildAgent({ service, cli: explicitCli, force = false }) {
     capabilities,
     mdPath,
     descriptor,
+    stdout: `Agent ${agentId} built successfully. CLI: ${cliName} v${discovery.version || 'unknown'}. Capabilities: ${capabilities.join(', ')}.`,
   };
 }
 
@@ -693,7 +1169,7 @@ async function callLLM(systemPrompt, userQuery, { temperature = 0.2, maxTokens =
       try {
         const msg = JSON.parse(data.toString());
         if (msg.type === 'llm_stream_start') { streamStarted = true; }
-        else if (msg.type === 'llm_stream_chunk') { accumulated += (msg.payload?.chunk || ''); }
+        else if (msg.type === 'llm_stream_chunk') { accumulated += (msg.payload?.text || msg.payload?.chunk || ''); }
         else if (msg.type === 'llm_stream_end') { clearTimeout(respTimeout); ws.close(); resolve(accumulated); }
         else if (msg.type === 'error') { clearTimeout(respTimeout); ws.close(); resolve(accumulated || null); }
       } catch {}

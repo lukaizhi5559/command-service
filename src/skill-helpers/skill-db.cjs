@@ -29,21 +29,24 @@ const logger = require('../logger.cjs');
 
 const MEMORY_PORT = parseInt(process.env.MEMORY_SERVICE_PORT || '3001', 10);
 const MEMORY_HOST = process.env.MEMORY_SERVICE_HOST || '127.0.0.1';
+const MEM_API_KEY = process.env.MCP_USER_MEMORY_API_KEY || process.env.USER_MEMORY_API_KEY || process.env.MCP_API_KEY || '';
 
 // ── HTTP helper ──────────────────────────────────────────────────────────────
 
 function httpPost(path, body, timeoutMs = 8000) {
   return new Promise((resolve) => {
     const payload = JSON.stringify(body);
+    const headers = {
+      'Content-Type': 'application/json',
+      'Content-Length': Buffer.byteLength(payload),
+    };
+    if (MEM_API_KEY) headers['Authorization'] = `Bearer ${MEM_API_KEY}`;
     const req = http.request({
       hostname: MEMORY_HOST,
       port: MEMORY_PORT,
       path,
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Content-Length': Buffer.byteLength(payload),
-      },
+      headers,
     }, (res) => {
       let data = '';
       res.on('data', d => { data += d; });
@@ -153,18 +156,29 @@ async function recall(skillName, query, topK = 5) {
 
 async function setContextRule(contextKey, ruleText, contextType = 'site') {
   const res = await httpPost('/context_rule.upsert', {
-    context_type: contextType,
-    context_key: contextKey,
-    rule_text: ruleText,
+    version: 'mcp.v1',
+    service: 'user-memory',
+    action: 'context_rule.upsert',
+    payload: { contextKey, ruleText, contextType },
   });
-  return res?.success !== false;
+  if (res?.status !== 'ok') {
+    logger.warn(`[skill-db] setContextRule failed: ${JSON.stringify(res?.error || res)?.slice(0, 120)}`);
+  }
+  return res?.status === 'ok';
 }
 
 async function getContextRules(contextKey) {
   const res = await httpPost('/context_rule.search', {
-    context_key: contextKey,
+    version: 'mcp.v1',
+    service: 'user-memory',
+    action: 'context_rule.search',
+    payload: { contextKeys: [contextKey] },
   });
-  return Array.isArray(res?.rules) ? res.rules : [];
+  if (res && res.status !== 'ok') {
+    logger.warn(`[skill-db] getContextRules failed: ${JSON.stringify(res?.error || res)?.slice(0, 120)}`);
+  }
+  const results = res?.data?.results;
+  return Array.isArray(results) ? results.map(r => r.ruleText || r.rule_text || '').filter(Boolean) : [];
 }
 
 // ── Skill registry helpers ───────────────────────────────────────────────────

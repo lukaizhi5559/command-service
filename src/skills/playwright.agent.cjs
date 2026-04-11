@@ -46,6 +46,9 @@
  * }
  */
 
+const fs     = require('fs');
+const os     = require('os');
+const path   = require('path');
 const logger = require('../logger.cjs');
 const { browserAct } = require('./browser.act.cjs');
 const { askWithMessages } = require('../skill-helpers/skill-llm.cjs');
@@ -102,7 +105,9 @@ Rules:
 - Declare done:true ONLY when you have confirmed the goal is achieved (not just attempted).
 - If you cannot proceed after 3 consecutive failures, declare done:false with a result explaining why.
 - Never navigate away from the current URL unless the goal requires it.
-- Use state-save/state-load for auth persistence: filePath = ~/.thinkdrop/browser-sessions/<sessionId>.json`;
+- Use state-save/state-load for auth persistence: filePath = ~/.thinkdrop/browser-sessions/<sessionId>.json
+- CREDENTIALS RULE: If any step would require filling in a username, password, token, API key, or any other credential that is NOT explicitly provided in the GOAL text, immediately output done:true with result describing exactly what credentials are needed. NEVER invent, guess, or use placeholder values such as 'my-username', 'my-password', 'correct-password', or 'my-email@example.com'.
+- SESSION CHECK RULE: Before attempting any sign-in flow, take a snapshot and check whether you are already authenticated (look for a profile avatar, username, dashboard, or logout button). If already logged in, skip ALL login steps and proceed directly to the goal task.`;
 
 // ---------------------------------------------------------------------------
 // Parse LLM response — extract JSON even if wrapped in prose
@@ -186,6 +191,16 @@ async function playwrightAgent(args) {
         error: navResult.error,
         executionTime: Date.now() - start,
       };
+    }
+  }
+
+  // Auto-load saved browser session if one exists (avoids needing to log in again)
+  const sessionFile = path.join(os.homedir(), '.thinkdrop', 'browser-sessions', `${sessionId}.json`);
+  if (fs.existsSync(sessionFile)) {
+    logger.info(`[playwright.agent] loading saved session from ${sessionFile}`);
+    const loadResult = await browserAct({ action: 'state-load', sessionId, filePath: sessionFile, headed, timeoutMs });
+    if (!loadResult.ok) {
+      logger.warn(`[playwright.agent] session load failed (non-fatal): ${loadResult.error || 'unknown'}`);
     }
   }
 

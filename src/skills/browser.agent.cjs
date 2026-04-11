@@ -466,7 +466,7 @@ async function callLLM(systemPrompt, userQuery, { temperature = 0.2, maxTokens =
     ws.on('message', (data) => {
       try {
         const msg = JSON.parse(data.toString());
-        if (msg.type === 'llm_stream_chunk') { accumulated += (msg.payload?.chunk || ''); }
+        if (msg.type === 'llm_stream_chunk') { accumulated += (msg.payload?.text || msg.payload?.chunk || ''); }
         else if (msg.type === 'llm_stream_end') { clearTimeout(respTimeout); ws.close(); resolve(accumulated); }
         else if (msg.type === 'error') { clearTimeout(respTimeout); ws.close(); resolve(accumulated || null); }
       } catch {}
@@ -864,11 +864,89 @@ async function _updateStatus(id, status, failureNote) {
 
 
 // ---------------------------------------------------------------------------
-// Action: run — executes a task using the agent's descriptor as context
-// The agent descriptor is passed as system context; browser.act handles the
-// actual Playwright interactions. This action returns structured guidance
-// for the caller (typically planSkills/executeCommand) to act on.
+// Action: run — executes a task using the agent's descriptor as context.
+// Supports two paths based on agent type:
+//   api_key / bearer: LLM infers curl command → inject creds → shell exec
+//   browser / oauth:  waitForAuth → playwright.agent agentic loop
 // ---------------------------------------------------------------------------
+
+const BROWSER_RUN_CURL_PROMPT = `You are a REST API command inference engine. Given an agent descriptor and a task, output the curl command to accomplish that task.
+
+Use EXACTLY these shell variable names for credentials (they will be substituted before execution):
+  $CRED_PRIMARY    — the API key, auth token, or password
+  $CRED_USERNAME   — the username or account SID (for Basic auth)
+  $CRED_DOMAIN     — the domain or secondary identifier (if required, e.g. Mailgun sending domain)
+
+Output ONLY valid JSON:
+{
+  "curlArgs": ["-s", "-f", "-X", "POST", "<url>", ...],
+  "credVars": ["PRIMARY"],
+  "reasoning": "<one sentence>"
+}
+
+curlArgs must NOT include the word "curl" itself. Always use -s flag. Use -f to fail on HTTP errors.
+credVars = which of ["PRIMARY", "USERNAME", "DOMAIN"] are actually referenced in curlArgs.`;
+
+// Resolve a named credential: env var → keytar → null
+async function resolveCredential(agentId, credName) {
+  const serviceKey = agentId.replace('.agent', '');
+
+  // 1. Try env var patterns (CLICKSEND_API_KEY, CLICKSEND_USERNAME, etc.)
+  const candidates = [
+    `${serviceKey.toUpperCase()}_${credName}`,
+    `${serviceKey.toUpperCase()}_API_KEY`,
+    `${serviceKey.toUpperCase()}_TOKEN`,
+  ];
+  for (const envVar of candidates) {
+    if (process.env[envVar]) return process.env[envVar];
+  }
+
+  // 2. Try keytar (macOS Keychain)
+  try {
+    const { execFile } = require('child_process');
+    const accounts = [
+      `browser_agent:${agentId}:${credName}`,
+      `skill:${agentId}:${credName}`,
+      `browser_agent:${serviceKey}:${credName}`,
+    ];
+    for (const account of accounts) {
+      const val = await new Promise(resolve => {
+        execFile('security', ['find-generic-password', '-s', 'thinkdrop', '-a', account, '-w'], (err, stdout) => {
+          resolve(err ? null : stdout.trim());
+        });
+      });
+      if (val) return val;
+    }
+  } catch {}
+
+  return null;
+}
+
+// HTTP helper to call another skill in this command-service process
+function callSkill(skillName, args, timeoutMs = 120000) {
+  return new Promise((resolve, reject) => {
+    const body = JSON.stringify({ payload: { skill: skillName, args } });
+    const req = http.request({
+      hostname: '127.0.0.1',
+      port: BROWSER_ACT_PORT,
+      path: '/command.automate',
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
+      timeout: timeoutMs,
+    }, res => {
+      let raw = '';
+      res.on('data', c => { raw += c; });
+      res.on('end', () => {
+        try { resolve(JSON.parse(raw).data || JSON.parse(raw)); }
+        catch (e) { reject(new Error(`skill(${skillName}) parse error: ${e.message}`)); }
+      });
+    });
+    req.on('timeout', () => { req.destroy(); reject(new Error(`skill(${skillName}) timeout`)); });
+    req.on('error', reject);
+    req.write(body);
+    req.end();
+  });
+}
 
 async function actionRun({ agentId, task, context }) {
   if (!agentId) return { ok: false, error: 'agentId is required' };
@@ -876,24 +954,96 @@ async function actionRun({ agentId, task, context }) {
 
   const existing = await actionQueryAgent({ id: agentId });
   if (!existing.found) {
-    return { ok: false, error: `Agent not found: ${agentId}. Build it first with action:build_agent.` };
+    return { ok: false, error: `Agent not found: ${agentId}. Build it first with action:build_agent.`, needsBuild: true };
   }
 
-  // Extract start_url and auth_success_pattern from descriptor front matter
+  const agentType = (() => {
+    const m = (existing.descriptor || '').match(/^type:\s*(\S+)/m);
+    return m ? m[1].toLowerCase() : existing.type || 'browser';
+  })();
+
+  logger.info(`[browser.agent] run agentId=${agentId} type=${agentType} task="${task}"`);
+
+  // ── REST API path (api_key, bearer, basic) ─────────────────────────────
+  if (agentType === 'api_key' || agentType === 'bearer' || agentType === 'basic') {
+    const inferenceQuery = `Agent descriptor:\n${existing.descriptor || '(no descriptor)'}\n\nTask: ${task}`;
+    const raw = await callLLM(BROWSER_RUN_CURL_PROMPT, inferenceQuery, { temperature: 0.1, maxTokens: 600 });
+
+    let curlArgs = [];
+    let credVars = [];
+    let reasoning = '';
+
+    if (raw) {
+      try {
+        const match = raw.match(/\{[\s\S]*\}/);
+        if (match) {
+          const parsed = JSON.parse(match[0]);
+          curlArgs  = Array.isArray(parsed.curlArgs)  ? parsed.curlArgs  : [];
+          credVars  = Array.isArray(parsed.credVars)  ? parsed.credVars  : [];
+          reasoning = parsed.reasoning || '';
+        }
+      } catch {}
+    }
+
+    if (curlArgs.length === 0) {
+      return { ok: false, agentId, task, error: `Could not infer curl command. Reasoning: ${reasoning || 'LLM returned no curlArgs'}` };
+    }
+
+    // Resolve credentials
+    const creds = {
+      PRIMARY:  await resolveCredential(agentId, 'PRIMARY')  || await resolveCredential(agentId, 'API_KEY')  || '',
+      USERNAME: await resolveCredential(agentId, 'USERNAME') || await resolveCredential(agentId, 'USER')     || '',
+      DOMAIN:   await resolveCredential(agentId, 'DOMAIN')   || '',
+    };
+
+    if (credVars.includes('PRIMARY') && !creds.PRIMARY) {
+      return {
+        ok: false, agentId, task,
+        error: `Missing credential for ${agentId}. Store API key in Keychain: security add-generic-password -s thinkdrop -a "browser_agent:${agentId}:PRIMARY" -w "<your-key>"`,
+        needsCredentials: true,
+      };
+    }
+
+    // Substitute credential placeholders in curlArgs
+    const resolvedArgs = curlArgs.map(a =>
+      a.replace(/\$CRED_PRIMARY/g,  creds.PRIMARY)
+       .replace(/\$CRED_USERNAME/g, creds.USERNAME)
+       .replace(/\$CRED_DOMAIN/g,   creds.DOMAIN)
+    );
+
+    logger.info(`[browser.agent] api_key run: curl ${resolvedArgs.slice(0, 4).join(' ')} ...`, { agentId, reasoning });
+
+    const { execFile } = require('child_process');
+    const result = await new Promise(resolve => {
+      execFile('curl', resolvedArgs, { timeout: 30000, maxBuffer: 2 * 1024 * 1024 }, (err, out, errOut) => {
+        resolve({ ok: !err || err.code === 0, stdout: out, stderr: errOut, exitCode: err?.code ?? 0, error: err?.message });
+      });
+    });
+
+    return {
+      ok: result.ok,
+      agentId,
+      task,
+      reasoning,
+      stdout: result.stdout,
+      stderr: result.stderr,
+      exitCode: result.exitCode,
+      error: result.error,
+    };
+  }
+
+  // ── Browser / OAuth path ───────────────────────────────────────────────
   const startUrl           = extractDescriptorUrl(existing.descriptor, 'start_url');
-  // sign_in_url is the actual login form — prefer it for waitForAuth so we land on the form
   const signInUrl          = extractDescriptorUrl(existing.descriptor, 'sign_in_url');
   const authSuccessPattern = extractDescriptorUrl(existing.descriptor, 'auth_success_pattern');
-  const authTarget         = signInUrl || startUrl; // login form first, dashboard fallback
+  const authTarget         = signInUrl || startUrl;
 
   if (!startUrl) return { ok: false, error: 'Agent descriptor missing start_url' };
 
   const profile   = `${agentId.replace('.agent', '')}_agent`;
   const sessionId = `${agentId}_${Date.now()}`;
 
-  logger.info(`[browser.agent] run agentId=${agentId} task="${task}"`);
-
-  // Step 1: ensure auth session exists (persistent profile — login once)
+  // Step 1: ensure auth session exists
   let authResult;
   try {
     authResult = await callBrowserAct({
@@ -906,7 +1056,6 @@ async function actionRun({ agentId, task, context }) {
       timeoutMs: 15000,
     }, 3 * 60 * 1000);
   } catch (err) {
-    // waitForAuth threw (network error, browser crash) — self-heal immediately
     const failureNote = `[${new Date().toISOString()}] waitForAuth threw: ${err.message} | url=${startUrl} | task=${task}`;
     logger.warn(`[browser.agent] run: waitForAuth threw — triggering self-heal for ${agentId}`);
     (async () => {
@@ -922,17 +1071,11 @@ async function actionRun({ agentId, task, context }) {
   }
 
   if (!authResult?.ok) {
-    // ── Self-healing: record failure + auto-fire validate_agent ───────────────
-    // Write the failure into the agent's failure_log so validate_agent has real
-    // production context, then trigger validation immediately so it can diagnose
-    // the broken auth flow and patch the descriptor without user intervention.
     const failureNote = `[${new Date().toISOString()}] waitForAuth failed: ${authResult?.error || 'timeout'} | url=${startUrl} | task=${task}`;
     logger.warn(`[browser.agent] run: auth failed — recording failure + triggering self-heal for ${agentId}`);
-    // Fire-and-forget: record failure then validate
     (async () => {
       try {
         await actionRecordFailure({ id: agentId, failureEntry: failureNote });
-        logger.info(`[browser.agent] self-heal: failure recorded for ${agentId}, triggering validate_agent`);
         const healResult = await actionValidateAgent({ id: agentId });
         logger.info(`[browser.agent] self-heal: validate_agent verdict=${healResult?.verdict} for ${agentId}`);
       } catch (healErr) {
@@ -942,21 +1085,32 @@ async function actionRun({ agentId, task, context }) {
     return { ok: false, error: `Auth failed for ${agentId}: ${authResult?.error}` };
   }
 
-  // Step 2: return agent descriptor + session info so the LLM/executeCommand
-  // can compose the actual browser.act steps for this specific task
-  return {
-    ok: true,
-    agentId,
-    sessionId,
-    profile,
-    startUrl,
-    task,
-    authenticated: true,
-    alreadyAuthenticated: authResult.alreadyAuthenticated,
-    descriptor: existing.descriptor,
-    capabilities: existing.capabilities,
-    message: `Agent ${agentId} is ready. Session "${sessionId}" authenticated. Use browser.act with sessionId="${sessionId}" to execute task: "${task}".`,
-  };
+  // Step 2: delegate to playwright.agent with the authenticated session
+  logger.info(`[browser.agent] run: auth ok — delegating to playwright.agent for "${task}"`);
+  try {
+    const agentResult = await callSkill('playwright.agent', {
+      goal: `${task}\n\nAgent context: ${existing.descriptor ? existing.descriptor.slice(0, 800) : ''}`,
+      url: startUrl,
+      sessionId,
+      maxTurns: 15,
+      timeoutMs: 120000,
+    }, 130000);
+
+    return {
+      ok: agentResult?.ok ?? false,
+      agentId,
+      task,
+      sessionId,
+      authenticated: true,
+      result: agentResult?.result || agentResult?.stdout || '',
+      transcript: agentResult?.transcript || [],
+      turns: agentResult?.turns,
+      done: agentResult?.done,
+      error: agentResult?.error,
+    };
+  } catch (err) {
+    return { ok: false, agentId, task, error: `playwright.agent delegation failed: ${err.message}` };
+  }
 }
 
 // ---------------------------------------------------------------------------
