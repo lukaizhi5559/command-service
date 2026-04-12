@@ -462,6 +462,9 @@ async function agentRunUpdate(cliName, meta) {
 
 async function agentWebSearch(query) {
   const http = require('http');
+  const { URL } = require('url');
+  const wsUrl = new URL(process.env.MCCP_WEB_SEARCH_API_URL || 'http://127.0.0.1:3002');
+  const wsApiKey = process.env.MCP_WEB_SEARCH_API_KEY || '';
   return new Promise((resolve) => {
     const body = JSON.stringify({
       version: 'mcp.v1', service: 'web-search',
@@ -469,9 +472,9 @@ async function agentWebSearch(query) {
       payload: { query, maxResults: 3 },
     });
     const req = http.request({
-      hostname: 'localhost', port: 3002,
-      path: '/', method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
+      hostname: wsUrl.hostname, port: parseInt(wsUrl.port) || 3002,
+      path: '/web.search', method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body), 'Authorization': `Bearer ${wsApiKey}` },
     }, (res) => {
       let data = '';
       res.on('data', c => { data += c; });
@@ -480,7 +483,7 @@ async function agentWebSearch(query) {
           const parsed = JSON.parse(data);
           const results = parsed?.data?.results || parsed?.results || [];
           if (results.length === 0) { resolve(`web_search returned no results for: "${query}" — try web_fetch with a direct docs URL instead`); return; }
-          resolve(results.slice(0, 3).map(r => `${r.title}\n${r.snippet}`).join('\n---\n'));
+          resolve(results.slice(0, 3).map(r => `${r.title}\n${r.description}`).join('\n---\n'));
         } catch { resolve(data.slice(0, 600) || `web_search returned no results for: "${query}" — try web_fetch with a direct docs URL instead`); }
       });
     });
@@ -584,7 +587,7 @@ Rules:
 - If the task is ambiguous, pick the most common/safe interpretation
 - If the task genuinely cannot be expressed as a single CLI invocation, set argv to [] and explain in reasoning`;
 
-async function actionRun({ cli, argv = [], cwd, env, timeoutMs, stdin, agentId, task }) {
+async function actionRun({ cli, argv = [], cwd, env, timeoutMs, stdin, agentId, task, _progressCallbackUrl, _stepIndex }) {
   // ── Agentic path: agentId + task → LLM infers argv from descriptor ──
   if (agentId && task) {
     const db = await getDb();
@@ -639,6 +642,18 @@ async function actionRun({ cli, argv = [], cwd, env, timeoutMs, stdin, agentId, 
     }
 
     for (let turn = 1; turn <= MAX_TURNS; turn++) {
+      // ── Real-time turn progress → Electron overlay server ──────────────────
+      // POST turn info to the overlay /agent-turn endpoint so the UI can show
+      // "Turn N/M" in the heartbeat label before the full response arrives.
+      if (_progressCallbackUrl) {
+        const _turnPayload = JSON.stringify({ type: 'agent:turn_live', agentId, turn, maxTurns: MAX_TURNS, stepIndex: _stepIndex ?? 0 });
+        const http = require('http');
+        const _req = http.request({ hostname: '127.0.0.1', port: parseInt(new URL(_progressCallbackUrl).port, 10), path: new URL(_progressCallbackUrl).pathname, method: 'POST', headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(_turnPayload) }, timeout: 2000 });
+        _req.on('error', () => {}); // fire-and-forget
+        _req.write(_turnPayload);
+        _req.end();
+      }
+
       const turnSys  = buildTurnSystemPrompt(agent.descriptor, learnedRules);
       const turnUser = buildTurnPrompt(task, loopHistory);
       logger.info(`[cli.agent] loop turn=${turn} syschars=${turnSys.length} userchars=${turnUser.length}`, { agentId, task });
@@ -686,7 +701,15 @@ async function actionRun({ cli, argv = [], cwd, env, timeoutMs, stdin, agentId, 
       let observation = '';
 
       if (action.action === 'run_cmd') {
-        const cmdResult = await spawnCapture(currentBinPath, action.argv || [], { cwd, env, timeoutMs: timeoutMs || 30000 });
+        // Detect long-running gcloud commands and extend the timeout accordingly.
+        // `gcloud services enable` can take 60-180s for API activation.
+        const _argv = action.argv || [];
+        const _isGcloudServicesEnable = (
+          agentId.toLowerCase().includes('gcloud') &&
+          _argv[0] === 'services' && _argv[1] === 'enable'
+        );
+        const _stepTimeoutMs = _isGcloudServicesEnable ? 180000 : (timeoutMs || 30000);
+        const cmdResult = await spawnCapture(currentBinPath, _argv, { cwd, env, timeoutMs: _stepTimeoutMs });
         logger.info(`[cli.agent] loop turn=${turn} run_cmd exitCode=${cmdResult.exitCode} stdout="${cmdResult.stdout.slice(0, 200)}" stderr="${(cmdResult.stderr || '').slice(0, 200)}"`, { agentId });
         // Idempotent success: treat "already done" CLi responses as success (e.g. gh repo star on already-starred repo exits 1)
         const alreadyDone = /already starred|already watching|already following|nothing to (do|change)|up.to.date|no changes/i.test(

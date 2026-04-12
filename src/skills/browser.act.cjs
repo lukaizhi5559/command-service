@@ -148,7 +148,11 @@ const openSessions = new Set();
 // a new Chrome tab when the browser is already open from a previous run.
 async function isDaemonAlive(sessionId, headed) {
   try {
-    const probe = await cliRun([...sessionFlags(sessionId, headed), 'eval', '1'], 4000);
+    // Always probe headlessly — we only want to know if the daemon process exists.
+    // Passing `headed` here causes playwright-cli to briefly open a visible blank
+    // Chrome window then immediately close it when the daemon isn't running, which
+    // is jarring to the user. The probe result is the same either way.
+    const probe = await cliRun([...sessionFlags(sessionId, false), 'eval', '1'], 4000);
     return probe.ok;
   } catch (_) {
     return false;
@@ -406,6 +410,8 @@ async function browserAct(args) {
     filePath,
     headed     = true,
     timeoutMs  = 15000,
+    authSuccessUrl,
+    _progressCallbackUrl,
   } = args || {};
 
   const start = Date.now();
@@ -603,6 +609,23 @@ async function browserAct(args) {
       logger.info(`[browser.act] fill resolved: "${selector}" → ${ref ? `ref ${ref}` : `direct selector "${selector}"`}`);
       const fillRes = await cliRun([...S, 'fill', fillTarget, (text ?? value) || ''], timeoutMs);
       logger.info(`[browser.act] fill ${fillTarget} → exit ${fillRes.exitCode} stdout="${fillRes.stdout?.slice(0, 200)}"`, { stderr: fillRes.stderr?.slice(0, 200) });
+
+      // playwright-cli exits 0 even on hard failures — check for TimeoutError / ### Error
+      // before attempting any fallback. These indicate the element is unreachable (disabled,
+      // page navigated away, etc.) and click+type won't help either.
+      const PLAYWRIGHT_HARD_ERR = /^### Error|TimeoutError:/im;
+      if (PLAYWRIGHT_HARD_ERR.test(fillRes.stdout || '')) {
+        const errMatch = (fillRes.stdout || '').match(/([A-Za-z]*Error:[^\n]+)/);
+        const errMsg = errMatch ? errMatch[1].trim() : 'playwright-cli: element not fillable';
+        logger.warn(`[browser.act] fill ${fillTarget}: hard error in stdout — ${errMsg}`);
+        return {
+          ok: false, action, sessionId,
+          result: fillRes.stdout.trim(),
+          stdout: fillRes.stdout,
+          executionTime: Date.now() - start,
+          error: errMsg,
+        };
+      }
 
       // playwright-cli exits 0 even on fill errors — check stdout for error markers
       // Two cases: (1) contenteditable div → "Element is not an <input>" → click+type fallback
@@ -826,7 +849,50 @@ async function browserAct(args) {
     // ── evaluate ─────────────────────────────────────────────────────────────
     case 'evaluate': {
       const expr = text || selector || args.expression || '';
-      return run(['eval', expr], `eval "${expr.slice(0, 60)}"`);
+      const evalRef = args.ref || null;
+      const evalArgs = evalRef ? ['eval', expr, evalRef] : ['eval', expr];
+      return run(evalArgs, `eval "${expr.slice(0, 60)}"`);
+    }
+
+    // ── run-code ──────────────────────────────────────────────────────────────
+    // Runs a full multi-line Playwright Node.js snippet in the current page context.
+    // `page` is available. Use a `return` statement to emit a result value.
+    // playwright-cli prints the return value as "### Result\n<value>".
+    case 'run-code': {
+      let code = (args.code || text || '').trim();
+      if (!code) {
+        return { ok: false, action, sessionId, error: 'run-code: code is required', executionTime: Date.now() - start };
+      }
+      // playwright-cli run-code requires: async page => { ... }
+      // Auto-wrap raw statement snippets — top-level const/let are invalid in the
+      // Function() context playwright-cli uses internally.
+      const isWrapped = /^async\s+page\s*=>/.test(code) || /^async\s*\(/.test(code);
+      if (!isWrapped) {
+        code = `async page => {\n${code}\n}`;
+      }
+      const rcRes = await cliRun([...S, 'run-code', code], timeoutMs);
+      logger.info(`[browser.act] run-code → exit ${rcRes.exitCode}`, { stderr: rcRes.stderr?.slice(0, 200) });
+      // Extract the result value from "### Result\n<value>" in stdout
+      const rcStdout = rcRes.stdout || '';
+      const rcMatch = rcStdout.match(/###\s*Result\s*\n([\s\S]*?)(?=###|$)/i);
+      const rcResult = rcMatch ? rcMatch[1].trim().replace(/^"|"$/g, '') : rcStdout.trim();
+      const PLAYWRIGHT_HARD_ERR = /^### Error|Error:/im;
+      if (!rcRes.ok || PLAYWRIGHT_HARD_ERR.test(rcStdout)) {
+        const errMatch = rcStdout.match(/([A-Za-z]*Error:[^\n]+)/);
+        const errMsg = errMatch ? errMatch[1].trim() : (rcRes.error || rcRes.stderr?.trim() || 'run-code failed');
+        logger.warn(`[browser.act] run-code error: ${errMsg}`);
+        return { ok: false, action, sessionId, result: rcStdout.trim(), stdout: rcStdout, error: errMsg, executionTime: Date.now() - start };
+      }
+      return { ok: true, action, sessionId, result: rcResult, stdout: rcStdout, executionTime: Date.now() - start };
+    }
+
+    // ── dialog-accept / dialog-dismiss ────────────────────────────────────────
+    case 'dialog-accept': {
+      const prompt = args.prompt || text || undefined;
+      return run(prompt ? ['dialog-accept', prompt] : ['dialog-accept'], 'dialog-accept');
+    }
+    case 'dialog-dismiss': {
+      return run(['dialog-dismiss'], 'dialog-dismiss');
     }
 
     // ── waitForSelector ───────────────────────────────────────────────────────
@@ -1035,48 +1101,149 @@ async function browserAct(args) {
     //   { ok: false, authTimedOut: true }   — timed out still on login page
     //   { ok: false, authFailed: true }     — explicit error/redirect detected
     case 'waitForAuth': {
-      const AUTH_WAIT_FIRST = /^(sign in|log in|sign up|create account|join today|continue with google|continue with apple|sign in to x|sign in with google|sign in with apple|login to|log into|happening now|where should we begin)\b/i;
-      const AUTH_WAIT_BODY  = /\b(sign in|log in|sign up|join today|create account)\b[\s\S]{0,400}\b(google|apple|email|phone|username|password|sign up with|continue with)\b/i;
-      const AUTH_WAIT_LOGGEDOUT = /\b(log in|sign in|sign up for free)\b[\s\S]{0,200}\b(where should we begin|get started|create account|free account|try for free)\b/i;
+      // URL-host state machine — no hardcoded domain lists.
+      // authOriginHost = hostname of the sign-in URL (e.g. 'accounts.google.com').
+      // Derived dynamically at runtime so any OAuth provider works automatically.
+      //
+      //  IN_AUTH_FLOW: currentHost === authOriginHost  (email, pwd, 2FA, consent, etc.)
+      //  SUCCESS:      currentHost !== authOriginHost  AND urlWithoutQuery includes authSuccessUrl
+      //  LIMBO:        currentHost !== authOriginHost  AND NOT at authSuccessUrl
+      let authOriginHost = null;
+      try { if (url) authOriginHost = new URL(url).hostname; } catch (_) {}
+      const getHost = (u) => { try { return new URL(u).hostname; } catch (_) { return ''; } };
+      let lastLimboUrl = null; // anti-loop guard
 
       // Default timeout: 120s — enough for a human to complete 2FA or MFA
       const effectiveTimeout = Math.min(timeoutMs || 120000, 120000);
-      const deadline = Date.now() + effectiveTimeout;
       const pollInterval = 2000;
 
+      // ── Step 1: navigate to url first so the browser actually opens ──────
+      // Without this the daemon never starts, eval returns empty text, and we
+      // spin until timeout on about:blank (the session's last page or nothing).
+      if (url) {
+        const navTimeout = 30000;
+        let alreadyOpen = openSessions.has(sessionId);
+        if (!alreadyOpen) {
+          alreadyOpen = await isDaemonAlive(sessionId, headed);
+          if (alreadyOpen) openSessions.add(sessionId);
+        }
+        const navCmd = alreadyOpen ? 'goto' : 'open';
+        if (!alreadyOpen) clearProfileLock(sessionId);
+        snapshotCache.delete(sessionId);
+        const navRes = await cliRun([...S, navCmd, url], navTimeout);
+        if (navRes.ok) openSessions.add(sessionId);
+        logger.info(`[browser.act] waitForAuth: navigated to ${url} on session=${sessionId} (cmd=${navCmd}, ok=${navRes.ok})`);
+      }
+
+      // ── Step 2: poll until auth wall clears ──────────────────────────────
+      // Start deadline AFTER navigation so the full effectiveTimeout is for the login wait.
+      const deadline = Date.now() + effectiveTimeout;
+
       logger.info(`[browser.act] waitForAuth: waiting for auth wall to clear on session=${sessionId} (timeout=${effectiveTimeout}ms)`);
+
+      // On first auth wall detection, immediately notify the UI via _progressCallbackUrl
+      // then keep polling until the user signs in — no second request needed.
+      let authWallDetections = 0;
+      let loginNotificationSent = false;
 
       while (Date.now() < deadline) {
         await new Promise(r2 => setTimeout(r2, pollInterval));
 
         try {
-          const evalRes = await cliRun([...S, 'eval', 'document.body.innerText.slice(0,5000)'], 8000);
-          const rawOut = evalRes.stdout.trim();
-          const resultMatch = rawOut.match(/###\s*Result\s*\n([\s\S]*?)(?=###|$)/i);
-          const pageText = resultMatch
-            ? resultMatch[1].trim().replace(/^"|"$/g, '')
-            : rawOut;
+          // Two separate evals — playwright-cli JSON-stringifies results so \n in a
+          // JS string literal becomes the two chars \ and n in stdout; combined eval
+          // separator indexOf always returns -1 and currentUrl silently stays empty.
+          const urlRes = await cliRun([...S, 'eval', 'location.href'], 5000);
+          const urlRaw = urlRes.stdout.trim();
+          const urlMatch = urlRaw.match(/###\s*Result\s*\n([\s\S]*?)(?=###|$)/i);
+          const currentUrl = (urlMatch ? urlMatch[1].trim().replace(/^"|"$/g, '') : urlRaw).trim();
 
-          if (!pageText) continue;
+          if (!currentUrl) continue;
 
-          const firstLine = pageText.split('\n')[0].trim();
-          const isStillAuthWall = AUTH_WAIT_FIRST.test(firstLine) ||
-            AUTH_WAIT_BODY.test(pageText.slice(0, 500)) ||
-            AUTH_WAIT_LOGGEDOUT.test(pageText.slice(0, 600));
+          // Unblock: playwright-cli returns an error string (not a URL) when a dialog is pending.
+          // The "browser_evaluate does not handle the modal state" message repeats every poll and
+          // causes the limbo logic to bounce between sign-in and authSuccessUrl indefinitely.
+          // Fix: dismiss the dialog immediately and re-poll for the real URL.
+          if (/does not handle the modal state|beforeunload dialog/i.test(currentUrl)) {
+            logger.info(`[browser.act] waitForAuth: modal dialog blocking eval on session=${sessionId} — dismissing`);
+            await cliRun([...S, 'dialog-dismiss'], 5000).catch(() => {});
+            lastLimboUrl = null; // reset limbo guard so we don't get stuck after dismiss
+            continue;
+          }
 
-          if (!isStillAuthWall) {
-            logger.info(`[browser.act] waitForAuth: auth wall cleared for session=${sessionId}`);
+          const currentHost     = getHost(currentUrl);
+          const urlWithoutQuery = currentUrl.split('?')[0];
+
+          // State 1: SUCCESS — different host from auth domain AND at success URL
+          const atSuccess = authSuccessUrl
+            ? (urlWithoutQuery.includes(authSuccessUrl) && currentHost !== authOriginHost)
+            : (!!currentHost && !!authOriginHost && currentHost !== authOriginHost);
+          if (atSuccess) {
+            logger.info(`[browser.act] waitForAuth: success URL matched (${currentUrl}) for session=${sessionId}`);
             return { ok: true, action, sessionId, authResolved: true, executionTime: Date.now() - start };
           }
 
-          // Check for error signals — wrong password, account locked, etc.
-          const errorSignals = /wrong password|incorrect password|invalid credentials|account locked|too many attempts|verify it's you/i;
-          if (errorSignals.test(pageText.slice(0, 1000))) {
-            logger.warn(`[browser.act] waitForAuth: auth error detected on session=${sessionId}`);
-            return { ok: false, action, sessionId, authFailed: true, error: 'Authentication error detected — wrong credentials or account locked', executionTime: Date.now() - start };
+          // State 2: IN AUTH FLOW — same hostname as sign-in URL
+          // Covers: email entry, password challenge, 2FA, MFA, consent screen — never navigate away
+          const inAuthFlow = !!authOriginHost && currentHost === authOriginHost;
+          if (inAuthFlow) {
+            authWallDetections++;
+            if (!loginNotificationSent) {
+              loginNotificationSent = true;
+              logger.info(`[browser.act] waitForAuth: auth wall confirmed — notifying user, continuing to poll session=${sessionId} loginUrl=${url}`);
+              if (_progressCallbackUrl) {
+                const http = require('http');
+                const serviceDisplay = sessionId.replace('_agent', '');
+                const _payload = JSON.stringify({
+                  type: 'needs_login', sessionId, loginUrl: url, serviceDisplay,
+                  message: `Please sign in to **${serviceDisplay}** in the Chrome window that just opened (${url}).`,
+                });
+                const _req = http.request({
+                  hostname: '127.0.0.1',
+                  port: parseInt(new URL(_progressCallbackUrl).port, 10),
+                  path: new URL(_progressCallbackUrl).pathname,
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(_payload) },
+                  timeout: 2000,
+                });
+                _req.on('error', () => {});
+                _req.write(_payload);
+                _req.end();
+              }
+            }
+            // Spot-check for error signals every 5th poll (wrong password, account locked, etc.)
+            if (authWallDetections % 5 === 0) {
+              const errRes = await cliRun([...S, 'eval', 'document.body.innerText.slice(0,600)'], 5000);
+              const errRaw = errRes.stdout.trim();
+              const errMatch = errRaw.match(/###\s*Result\s*\n([\s\S]*?)(?=###|$)/i);
+              const errText = (errMatch ? errMatch[1].trim().replace(/^"|"$/g, '') : errRaw).trim();
+              const errorSignals = /wrong password|incorrect password|invalid credentials|account locked|too many attempts|verify it's you/i;
+              if (errorSignals.test(errText)) {
+                logger.warn(`[browser.act] waitForAuth: auth error detected on session=${sessionId}`);
+                return { ok: false, action, sessionId, authFailed: true, error: 'Authentication error detected — wrong credentials or account locked', executionTime: Date.now() - start };
+              }
+            }
+            logger.debug(`[browser.act] waitForAuth: in auth flow at ${currentUrl} (${authWallDetections} polls), ${Math.round((deadline - Date.now()) / 1000)}s remaining`);
+            continue;
           }
 
-          logger.debug(`[browser.act] waitForAuth: still on auth wall, ${Math.round((deadline - Date.now()) / 1000)}s remaining`);
+          // State 3: LIMBO — different domain, not at success URL
+          if (!authSuccessUrl) {
+            // No success URL to validate against — different domain means auth cleared
+            logger.info(`[browser.act] waitForAuth: auth wall cleared (different domain) for session=${sessionId}`);
+            return { ok: true, action, sessionId, authResolved: true, executionTime: Date.now() - start };
+          }
+          if (lastLimboUrl === currentUrl) {
+            // Stuck in same limbo URL — navigate back to sign-in URL
+            logger.info(`[browser.act] waitForAuth: limbo stuck at ${currentUrl} — navigating back to sign-in`);
+            if (url) await cliRun([...S, 'goto', url], 15000).catch(() => {});
+            lastLimboUrl = null;
+          } else {
+            // First time at this intermediate URL — navigate toward authSuccessUrl
+            logger.info(`[browser.act] waitForAuth: limbo state (${currentUrl}) — navigating to authSuccessUrl=${authSuccessUrl} for session=${sessionId}`);
+            lastLimboUrl = currentUrl;
+            await cliRun([...S, 'goto', authSuccessUrl], 15000).catch(() => {});
+          }
         } catch (pollErr) {
           logger.debug(`[browser.act] waitForAuth: poll error — ${pollErr.message?.slice(0, 60)}`);
         }

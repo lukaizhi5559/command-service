@@ -76,30 +76,188 @@ async function getDb() {
 // ---------------------------------------------------------------------------
 
 // Bootstrap seed map — cold-start anchors for first build_agent call before DuckDB has an entry.
-// signInUrl here is a BUILD-TIME HINT: it's written into the descriptor's sign_in_url: frontmatter
-// on first build so DuckDB immediately has the correct login form URL. After first build, DuckDB
-// owns sign_in_url: and validate_agent can correct it. signInUrl here is never read at runtime
-// (resolveBrowserMeta priorities: DuckDB descriptor → DuckDB meta cache → this seed map).
+// Three fields only: startUrl (post-login dashboard), authSuccessPattern (URL substring after auth),
+// isOAuth (true = browser OAuth session required; false = API key settings page).
+// After first build, DuckDB owns the descriptor and validate_agent can self-correct any entry.
+// (resolveBrowserMeta priorities: DuckDB descriptor → DuckDB meta cache → this seed map → LLM+web_search)
 const KNOWN_BROWSER_SERVICES = {
-  gmail:     { startUrl: 'https://mail.google.com',                       signInUrl: 'https://accounts.google.com/signin/v2/identifier', authSuccessPattern: 'mail.google.com',        capabilities: ['read_emails', 'send_email', 'manage_labels'],             isOAuth: true },
-  google:    { startUrl: 'https://accounts.google.com',                   signInUrl: 'https://accounts.google.com/signin/v2/identifier', authSuccessPattern: 'myaccount.google.com',   capabilities: ['authenticate'],                                            isOAuth: true },
-  slack:     { startUrl: 'https://app.slack.com',                         signInUrl: 'https://slack.com/signin',                         authSuccessPattern: 'app.slack.com/client',   capabilities: ['send_message', 'read_messages', 'manage_channels'] },
-  discord:   { startUrl: 'https://discord.com/channels/@me',              signInUrl: 'https://discord.com/login',                        authSuccessPattern: 'discord.com/channels',   capabilities: ['send_message', 'read_messages', 'manage_servers'] },
-  notion:    { startUrl: 'https://www.notion.so',                         signInUrl: 'https://www.notion.so/login',                      authSuccessPattern: 'notion.so/',             capabilities: ['create_page', 'read_page', 'manage_databases'] },
-  figma:     { startUrl: 'https://www.figma.com',                         signInUrl: 'https://www.figma.com/login',                      authSuccessPattern: 'figma.com/files',        capabilities: ['read_files', 'manage_projects'] },
-  linear:    { startUrl: 'https://linear.app',                            signInUrl: 'https://linear.app/login',                         authSuccessPattern: 'linear.app/',            capabilities: ['create_issue', 'list_issues', 'manage_projects'] },
-  jira:      { startUrl: 'https://id.atlassian.com',                      signInUrl: 'https://id.atlassian.com/login',                   authSuccessPattern: 'atlassian.net',          capabilities: ['create_issue', 'list_issues', 'manage_sprints'] },
-  confluence:{ startUrl: 'https://id.atlassian.com',                      signInUrl: 'https://id.atlassian.com/login',                   authSuccessPattern: 'atlassian.net/wiki',     capabilities: ['create_page', 'read_page', 'manage_spaces'] },
-  airtable:  { startUrl: 'https://airtable.com',                          signInUrl: 'https://airtable.com/login',                       authSuccessPattern: 'airtable.com/',          capabilities: ['read_records', 'create_records', 'manage_bases'] },
-  hubspot:   { startUrl: 'https://app.hubspot.com',                       signInUrl: 'https://app.hubspot.com/login',                    authSuccessPattern: 'app.hubspot.com/',       capabilities: ['manage_contacts', 'manage_deals', 'send_email'] },
-  salesforce:{ startUrl: 'https://login.salesforce.com',                  signInUrl: 'https://login.salesforce.com',                     authSuccessPattern: 'lightning.force.com',    capabilities: ['manage_leads', 'manage_opportunities', 'run_reports'] },
-  twitter:   { startUrl: 'https://twitter.com',                           signInUrl: 'https://twitter.com/i/flow/login',                 authSuccessPattern: 'twitter.com/home',       capabilities: ['post_tweet', 'read_timeline', 'manage_dms'] },
-  facebook:  { startUrl: 'https://www.facebook.com',                      signInUrl: 'https://www.facebook.com/login',                   authSuccessPattern: 'facebook.com/',          capabilities: ['post_content', 'read_feed', 'manage_pages'] },
-  instagram: { startUrl: 'https://www.instagram.com',                     signInUrl: 'https://www.instagram.com/accounts/login',         authSuccessPattern: 'instagram.com/',         capabilities: ['post_content', 'read_feed'] },
-  linkedin:  { startUrl: 'https://www.linkedin.com',                      signInUrl: 'https://www.linkedin.com/login',                   authSuccessPattern: 'linkedin.com/feed',      capabilities: ['post_content', 'manage_connections', 'read_messages'] },
-  openai:    { startUrl: 'https://platform.openai.com/api-keys',          signInUrl: 'https://platform.openai.com/api-keys',             authSuccessPattern: 'platform.openai.com',    capabilities: ['get_api_key', 'manage_usage'] },
-  sendgrid:  { startUrl: 'https://app.sendgrid.com/settings/api_keys',    signInUrl: 'https://app.sendgrid.com/settings/api_keys',       authSuccessPattern: 'app.sendgrid.com',       capabilities: ['get_api_key', 'send_email'] },
-  mailgun:   { startUrl: 'https://app.mailgun.com/settings/api_security', signInUrl: 'https://app.mailgun.com/settings/api_security',    authSuccessPattern: 'app.mailgun.com',        capabilities: ['get_api_key', 'send_email'] },
+  // ── Core social / collaboration ─────────────────────────────────────────────────────────────────────
+  gmail:          { startUrl: 'https://mail.google.com',                         signInUrl: 'https://accounts.google.com/signin/v2/identifier',  authSuccessPattern: 'mail.google.com',              isOAuth: true  },
+  google:         { startUrl: 'https://accounts.google.com',                     signInUrl: 'https://accounts.google.com',                       authSuccessPattern: 'myaccount.google.com',         isOAuth: true  },
+  slack:          { startUrl: 'https://app.slack.com',                           signInUrl: 'https://slack.com/signin',                          authSuccessPattern: 'app.slack.com/client',         isOAuth: true  },
+  discord:        { startUrl: 'https://discord.com/channels/@me',                signInUrl: 'https://discord.com/login',                         authSuccessPattern: 'discord.com/channels',         isOAuth: true  },
+  notion:         { startUrl: 'https://www.notion.so',                           signInUrl: 'https://www.notion.so/login',                       authSuccessPattern: 'notion.so/',                   isOAuth: true  },
+  figma:          { startUrl: 'https://www.figma.com',                           signInUrl: 'https://www.figma.com/login',                       authSuccessPattern: 'figma.com/files',              isOAuth: true  },
+  linear:         { startUrl: 'https://linear.app',                              signInUrl: 'https://linear.app/login',                          authSuccessPattern: 'linear.app/',                  isOAuth: true  },
+  jira:           { startUrl: 'https://id.atlassian.com',                        signInUrl: 'https://id.atlassian.com',                          authSuccessPattern: 'atlassian.net',                isOAuth: true  },
+  confluence:     { startUrl: 'https://id.atlassian.com',                        signInUrl: 'https://id.atlassian.com',                          authSuccessPattern: 'atlassian.net/wiki',           isOAuth: true  },
+  airtable:       { startUrl: 'https://airtable.com',                            signInUrl: 'https://airtable.com/login',                        authSuccessPattern: 'airtable.com/',                isOAuth: true  },
+  hubspot:        { startUrl: 'https://app.hubspot.com',                         signInUrl: 'https://app.hubspot.com/login',                     authSuccessPattern: 'app.hubspot.com/',             isOAuth: true  },
+  salesforce:     { startUrl: 'https://login.salesforce.com',                    signInUrl: 'https://login.salesforce.com',                      authSuccessPattern: 'lightning.force.com',          isOAuth: true  },
+  twitter:        { startUrl: 'https://twitter.com',                             signInUrl: 'https://twitter.com/i/flow/login',                  authSuccessPattern: 'twitter.com/home',             isOAuth: true  },
+  facebook:       { startUrl: 'https://www.facebook.com',                        signInUrl: 'https://www.facebook.com/login',                    authSuccessPattern: 'facebook.com/',                isOAuth: true  },
+  instagram:      { startUrl: 'https://www.instagram.com',                       signInUrl: 'https://www.instagram.com/accounts/login',          authSuccessPattern: 'instagram.com/',               isOAuth: true  },
+  linkedin:       { startUrl: 'https://www.linkedin.com',                        signInUrl: 'https://www.linkedin.com/login',                    authSuccessPattern: 'linkedin.com/feed',            isOAuth: true  },
+  // ── Email ───────────────────────────────────────────────────────────────────────────────────────────
+  outlook:        { startUrl: 'https://outlook.live.com',                        signInUrl: 'https://login.live.com',                            authSuccessPattern: 'outlook.live.com/mail',        isOAuth: true  },
+  yahoo:          { startUrl: 'https://mail.yahoo.com',                          signInUrl: 'https://login.yahoo.com',                           authSuccessPattern: 'mail.yahoo.com',               isOAuth: true  },
+  protonmail:     { startUrl: 'https://mail.proton.me',                          signInUrl: 'https://account.proton.me/login',                   authSuccessPattern: 'mail.proton.me',               isOAuth: true  },
+  fastmail:       { startUrl: 'https://www.fastmail.com',                        signInUrl: 'https://www.fastmail.com/login/',                   authSuccessPattern: 'fastmail.com',                 isOAuth: true  },
+  zohomail:       { startUrl: 'https://mail.zoho.com',                           signInUrl: 'https://accounts.zoho.com/signin',                  authSuccessPattern: 'mail.zoho.com',                isOAuth: true  },
+  // ── Social media ────────────────────────────────────────────────────────────────────────────────────
+  tiktok:         { startUrl: 'https://www.tiktok.com',                          signInUrl: 'https://www.tiktok.com/login',                      authSuccessPattern: 'tiktok.com/foryou',            isOAuth: true  },
+  pinterest:      { startUrl: 'https://www.pinterest.com',                       signInUrl: 'https://www.pinterest.com/login',                   authSuccessPattern: 'pinterest.com/',               isOAuth: true  },
+  reddit:         { startUrl: 'https://www.reddit.com',                          signInUrl: 'https://www.reddit.com/login',                      authSuccessPattern: 'reddit.com/',                  isOAuth: true  },
+  snapchat:       { startUrl: 'https://accounts.snapchat.com',                   signInUrl: 'https://accounts.snapchat.com',                     authSuccessPattern: 'accounts.snapchat.com',        isOAuth: true  },
+  mastodon:       { startUrl: 'https://mastodon.social',                         signInUrl: 'https://mastodon.social/auth/sign_in',              authSuccessPattern: 'mastodon.social/home',         isOAuth: true  },
+  bluesky:        { startUrl: 'https://bsky.app',                                signInUrl: 'https://bsky.app/login',                            authSuccessPattern: 'bsky.app',                     isOAuth: true  },
+  threads:        { startUrl: 'https://www.threads.net',                         signInUrl: 'https://www.threads.net/login',                     authSuccessPattern: 'threads.net',                  isOAuth: true  },
+  youtube:        { startUrl: 'https://studio.youtube.com',                      signInUrl: 'https://accounts.google.com/signin/v2/identifier',  authSuccessPattern: 'studio.youtube.com',           isOAuth: true  },
+  twitch:         { startUrl: 'https://www.twitch.tv',                           signInUrl: 'https://www.twitch.tv/login',                       authSuccessPattern: 'twitch.tv',                    isOAuth: true  },
+  // ── Developer tools ─────────────────────────────────────────────────────────────────────────────────
+  github:         { startUrl: 'https://github.com',                              signInUrl: 'https://github.com/login',                          authSuccessPattern: 'github.com/',                  isOAuth: true  },
+  gitlab:         { startUrl: 'https://gitlab.com',                              signInUrl: 'https://gitlab.com/users/sign_in',                  authSuccessPattern: 'gitlab.com/',                  isOAuth: true  },
+  bitbucket:      { startUrl: 'https://bitbucket.org',                           signInUrl: 'https://id.atlassian.com',                          authSuccessPattern: 'bitbucket.org/',               isOAuth: true  },
+  shortcut:       { startUrl: 'https://app.shortcut.com',                        signInUrl: 'https://app.shortcut.com/login',                    authSuccessPattern: 'app.shortcut.com/',            isOAuth: true  },
+  azuredevops:    { startUrl: 'https://dev.azure.com',                           signInUrl: 'https://login.microsoftonline.com',                 authSuccessPattern: 'dev.azure.com/',               isOAuth: true  },
+  // ── Productivity ────────────────────────────────────────────────────────────────────────────────────
+  trello:         { startUrl: 'https://trello.com',                              signInUrl: 'https://id.atlassian.com',                          authSuccessPattern: 'trello.com/',                  isOAuth: true  },
+  asana:          { startUrl: 'https://app.asana.com',                           signInUrl: 'https://app.asana.com/-/login',                     authSuccessPattern: 'app.asana.com/',               isOAuth: true  },
+  monday:         { startUrl: 'https://monday.com',                              signInUrl: 'https://auth.monday.com',                           authSuccessPattern: 'monday.com',                   isOAuth: true  },
+  clickup:        { startUrl: 'https://app.clickup.com',                         signInUrl: 'https://app.clickup.com/login',                     authSuccessPattern: 'app.clickup.com/',             isOAuth: true  },
+  basecamp:       { startUrl: 'https://launchpad.37signals.com',                 signInUrl: 'https://launchpad.37signals.com',                   authSuccessPattern: '37signals.com',                isOAuth: true  },
+  coda:           { startUrl: 'https://coda.io',                                 signInUrl: 'https://coda.io/login',                             authSuccessPattern: 'coda.io/d/',                   isOAuth: true  },
+  todoist:        { startUrl: 'https://todoist.com',                             signInUrl: 'https://todoist.com/auth/login',                    authSuccessPattern: 'todoist.com/',                 isOAuth: true  },
+  canva:          { startUrl: 'https://www.canva.com',                           signInUrl: 'https://www.canva.com/login',                       authSuccessPattern: 'canva.com/',                   isOAuth: true  },
+  miro:           { startUrl: 'https://miro.com',                                signInUrl: 'https://miro.com/login/',                           authSuccessPattern: 'miro.com/app/',                isOAuth: true  },
+  // ── Cloud / hosting ─────────────────────────────────────────────────────────────────────────────────
+  vercel:         { startUrl: 'https://vercel.com/dashboard',                    signInUrl: 'https://vercel.com/login',                          authSuccessPattern: 'vercel.com/',                  isOAuth: true  },
+  netlify:        { startUrl: 'https://app.netlify.com',                         signInUrl: 'https://app.netlify.com/login',                     authSuccessPattern: 'app.netlify.com/',             isOAuth: true  },
+  render:         { startUrl: 'https://dashboard.render.com',                    signInUrl: 'https://dashboard.render.com/login',                authSuccessPattern: 'dashboard.render.com/',        isOAuth: true  },
+  railway:        { startUrl: 'https://railway.app/dashboard',                   signInUrl: 'https://railway.app/login',                         authSuccessPattern: 'railway.app/',                 isOAuth: true  },
+  flyio:          { startUrl: 'https://fly.io/dashboard',                        signInUrl: 'https://fly.io/app/sign-in',                        authSuccessPattern: 'fly.io/',                      isOAuth: true  },
+  heroku:         { startUrl: 'https://dashboard.heroku.com',                    signInUrl: 'https://id.heroku.com/login',                       authSuccessPattern: 'dashboard.heroku.com/',        isOAuth: true  },
+  digitalocean:   { startUrl: 'https://cloud.digitalocean.com',                  signInUrl: 'https://cloud.digitalocean.com/login',              authSuccessPattern: 'cloud.digitalocean.com/',      isOAuth: true  },
+  cloudflare:     { startUrl: 'https://dash.cloudflare.com',                     signInUrl: 'https://dash.cloudflare.com/login',                 authSuccessPattern: 'dash.cloudflare.com/',         isOAuth: true  },
+  awsconsole:     { startUrl: 'https://console.aws.amazon.com',                  signInUrl: 'https://signin.aws.amazon.com/signin',              authSuccessPattern: 'console.aws.amazon.com/',      isOAuth: true  },
+  gcpconsole:     { startUrl: 'https://console.cloud.google.com',                signInUrl: 'https://accounts.google.com/signin/v2/identifier',  authSuccessPattern: 'console.cloud.google.com',     isOAuth: true  },
+  azureportal:    { startUrl: 'https://portal.azure.com',                        signInUrl: 'https://login.microsoftonline.com',                 authSuccessPattern: 'portal.azure.com/',            isOAuth: true  },
+  // ── AI platforms ────────────────────────────────────────────────────────────────────────────────────
+  openai:         { startUrl: 'https://platform.openai.com/api-keys',            authSuccessPattern: 'platform.openai.com',          isOAuth: false },
+  anthropic:      { startUrl: 'https://console.anthropic.com',                   authSuccessPattern: 'console.anthropic.com',        isOAuth: false },
+  mistral:        { startUrl: 'https://console.mistral.ai',                      authSuccessPattern: 'console.mistral.ai',           isOAuth: false },
+  cohere:         { startUrl: 'https://dashboard.cohere.com',                    authSuccessPattern: 'dashboard.cohere.com',         isOAuth: false },
+  groq:           { startUrl: 'https://console.groq.com',                        authSuccessPattern: 'console.groq.com',             isOAuth: false },
+  replicate:      { startUrl: 'https://replicate.com',                           signInUrl: 'https://replicate.com/signin',                      authSuccessPattern: 'replicate.com/',               isOAuth: true  },
+  huggingface:    { startUrl: 'https://huggingface.co/settings/tokens',          authSuccessPattern: 'huggingface.co/',              isOAuth: false },
+  together:       { startUrl: 'https://api.together.xyz',                        authSuccessPattern: 'api.together.xyz',             isOAuth: false },
+  perplexity:     { startUrl: 'https://www.perplexity.ai/settings/api',          authSuccessPattern: 'perplexity.ai/',               isOAuth: false },
+  fireworks:      { startUrl: 'https://fireworks.ai/account/api-keys',           authSuccessPattern: 'fireworks.ai/',                isOAuth: false },
+  deepseek:       { startUrl: 'https://platform.deepseek.com/api_keys',          authSuccessPattern: 'platform.deepseek.com/',       isOAuth: false },
+  // ── Email delivery APIs ──────────────────────────────────────────────────────────────────────────────
+  sendgrid:       { startUrl: 'https://app.sendgrid.com/settings/api_keys',      authSuccessPattern: 'app.sendgrid.com',             isOAuth: false },
+  mailgun:        { startUrl: 'https://app.mailgun.com/settings/api_security',   authSuccessPattern: 'app.mailgun.com',              isOAuth: false },
+  postmark:       { startUrl: 'https://account.postmarkapp.com/api_tokens',      authSuccessPattern: 'postmarkapp.com',              isOAuth: false },
+  resend:         { startUrl: 'https://resend.com/api-keys',                     authSuccessPattern: 'resend.com/',                  isOAuth: false },
+  mailchimp:      { startUrl: 'https://login.mailchimp.com',                     signInUrl: 'https://login.mailchimp.com',                       authSuccessPattern: 'mailchimp.com/',               isOAuth: true  },
+  brevo:          { startUrl: 'https://app.brevo.com',                           authSuccessPattern: 'app.brevo.com/',               isOAuth: false },
+  sparkpost:      { startUrl: 'https://app.sparkpost.com/account/api-keys',      authSuccessPattern: 'app.sparkpost.com/',           isOAuth: false },
+  convertkit:     { startUrl: 'https://app.convertkit.com/account_settings/advanced', authSuccessPattern: 'app.convertkit.com/',     isOAuth: false },
+  klaviyo:        { startUrl: 'https://www.klaviyo.com/account#api-keys-tab',    authSuccessPattern: 'klaviyo.com/',                 isOAuth: false },
+  // ── Payments / finance ───────────────────────────────────────────────────────────────────────────────
+  stripe:         { startUrl: 'https://dashboard.stripe.com/apikeys',            authSuccessPattern: 'dashboard.stripe.com/',        isOAuth: false },
+  paypal:         { startUrl: 'https://developer.paypal.com/dashboard',          signInUrl: 'https://www.paypal.com/signin',                     authSuccessPattern: 'developer.paypal.com/',        isOAuth: true  },
+  square:         { startUrl: 'https://developer.squareup.com/apps',             signInUrl: 'https://squareup.com/login',                        authSuccessPattern: 'developer.squareup.com/',      isOAuth: true  },
+  braintree:      { startUrl: 'https://sandbox.braintreegateway.com',            authSuccessPattern: 'braintreegateway.com/',        isOAuth: false },
+  plaid:          { startUrl: 'https://dashboard.plaid.com',                     signInUrl: 'https://dashboard.plaid.com/signin',                authSuccessPattern: 'dashboard.plaid.com/',         isOAuth: true  },
+  quickbooks:     { startUrl: 'https://app.qbo.intuit.com',                      signInUrl: 'https://accounts.intuit.com/app/sign-in',           authSuccessPattern: 'app.qbo.intuit.com/',          isOAuth: true  },
+  xero:           { startUrl: 'https://go.xero.com/app/dashboard',               signInUrl: 'https://login.xero.com',                            authSuccessPattern: 'go.xero.com/',                 isOAuth: true  },
+  // ── CRM / support ────────────────────────────────────────────────────────────────────────────────────
+  zohocrm:        { startUrl: 'https://crm.zoho.com',                            signInUrl: 'https://accounts.zoho.com/signin',                  authSuccessPattern: 'crm.zoho.com/',                isOAuth: true  },
+  pipedrive:      { startUrl: 'https://app.pipedrive.com',                       signInUrl: 'https://app.pipedrive.com/auth/login',              authSuccessPattern: 'app.pipedrive.com/',           isOAuth: true  },
+  activecampaign: { startUrl: 'https://www.activecampaign.com',                  authSuccessPattern: 'activecampaign.com/',          isOAuth: false },
+  freshdesk:      { startUrl: 'https://freshdesk.com',                           authSuccessPattern: 'freshdesk.com/',               isOAuth: false },
+  helpscout:      { startUrl: 'https://secure.helpscout.net',                    authSuccessPattern: 'secure.helpscout.net/',        isOAuth: false },
+  // ── Analytics ───────────────────────────────────────────────────────────────────────────────────────
+  mixpanel:       { startUrl: 'https://mixpanel.com',                            authSuccessPattern: 'mixpanel.com/',                isOAuth: false },
+  amplitude:      { startUrl: 'https://analytics.amplitude.com',                 authSuccessPattern: 'analytics.amplitude.com',      isOAuth: false },
+  posthog:        { startUrl: 'https://app.posthog.com',                         authSuccessPattern: 'app.posthog.com/',             isOAuth: false },
+  segment:        { startUrl: 'https://app.segment.com',                         signInUrl: 'https://app.segment.com/login',                     authSuccessPattern: 'app.segment.com/',             isOAuth: true  },
+  plausible:      { startUrl: 'https://plausible.io',                            authSuccessPattern: 'plausible.io/',                isOAuth: false },
+  // ── Monitoring / observability ───────────────────────────────────────────────────────────────────────
+  datadog:        { startUrl: 'https://app.datadoghq.com',                       authSuccessPattern: 'app.datadoghq.com/',           isOAuth: false },
+  newrelic:       { startUrl: 'https://login.newrelic.com',                      authSuccessPattern: 'one.newrelic.com/',            isOAuth: false },
+  grafana:        { startUrl: 'https://grafana.com/auth/sign-in',                signInUrl: 'https://grafana.com/auth/sign-in',                  authSuccessPattern: 'grafana.com/',                 isOAuth: true  },
+  sentry:         { startUrl: 'https://sentry.io',                               authSuccessPattern: 'sentry.io/',                   isOAuth: false },
+  pagerduty:      { startUrl: 'https://app.pagerduty.com',                       signInUrl: 'https://app.pagerduty.com/sign_in',                authSuccessPattern: 'app.pagerduty.com/',           isOAuth: true  },
+  // ── Databases / data ─────────────────────────────────────────────────────────────────────────────────
+  supabase:       { startUrl: 'https://app.supabase.com',                        signInUrl: 'https://supabase.com/dashboard/sign-in',            authSuccessPattern: 'app.supabase.com/',            isOAuth: true  },
+  neon:           { startUrl: 'https://console.neon.tech',                       signInUrl: 'https://console.neon.tech/login',                   authSuccessPattern: 'console.neon.tech/',           isOAuth: true  },
+  mongoatlas:     { startUrl: 'https://cloud.mongodb.com',                       signInUrl: 'https://account.mongodb.com/account/login',         authSuccessPattern: 'cloud.mongodb.com/',           isOAuth: true  },
+  firebase:       { startUrl: 'https://console.firebase.google.com',             signInUrl: 'https://accounts.google.com/signin/v2/identifier',  authSuccessPattern: 'console.firebase.google.com',  isOAuth: true  },
+  snowflake:      { startUrl: 'https://app.snowflake.com',                       signInUrl: 'https://app.snowflake.com',                         authSuccessPattern: 'app.snowflake.com/',           isOAuth: true  },
+  // ── Communications ───────────────────────────────────────────────────────────────────────────────────
+  twilio:         { startUrl: 'https://console.twilio.com',                      authSuccessPattern: 'console.twilio.com/',          isOAuth: false },
+  vonage:         { startUrl: 'https://dashboard.nexmo.com',                     authSuccessPattern: 'dashboard.nexmo.com/',         isOAuth: false },
+  pusher:         { startUrl: 'https://dashboard.pusher.com',                    authSuccessPattern: 'dashboard.pusher.com/',        isOAuth: false },
+  zoom:           { startUrl: 'https://zoom.us/signin',                          signInUrl: 'https://zoom.us/signin',                            authSuccessPattern: 'zoom.us/',                     isOAuth: true  },
+  loom:           { startUrl: 'https://www.loom.com/looms/videos',               signInUrl: 'https://www.loom.com/login',                        authSuccessPattern: 'loom.com/',                    isOAuth: true  },
+  // ── Identity / auth platforms ────────────────────────────────────────────────────────────────────────
+  auth0:          { startUrl: 'https://manage.auth0.com',                        authSuccessPattern: 'manage.auth0.com/',            isOAuth: false },
+  okta:           { startUrl: 'https://developer.okta.com',                      authSuccessPattern: 'developer.okta.com/',          isOAuth: false },
+  clerk:          { startUrl: 'https://dashboard.clerk.com',                     authSuccessPattern: 'dashboard.clerk.com/',         isOAuth: false },
+  // ── Storage ──────────────────────────────────────────────────────────────────────────────────────────
+  dropbox:        { startUrl: 'https://www.dropbox.com/home',                    signInUrl: 'https://www.dropbox.com/login',                     authSuccessPattern: 'dropbox.com/',                 isOAuth: true  },
+  box:            { startUrl: 'https://app.box.com',                             signInUrl: 'https://account.box.com/login',                     authSuccessPattern: 'app.box.com/',                 isOAuth: true  },
+  // ── CMS / e-commerce ─────────────────────────────────────────────────────────────────────────────────
+  shopify:        { startUrl: 'https://partners.shopify.com',                    signInUrl: 'https://accounts.shopify.com/lookup',               authSuccessPattern: 'partners.shopify.com/',        isOAuth: true  },
+  contentful:     { startUrl: 'https://app.contentful.com',                      authSuccessPattern: 'app.contentful.com/',          isOAuth: false },
+  sanity:         { startUrl: 'https://www.sanity.io/manage',                    signInUrl: 'https://www.sanity.io/login',                       authSuccessPattern: 'sanity.io/manage/',            isOAuth: true  },
+  webflow:        { startUrl: 'https://webflow.com/dashboard',                   signInUrl: 'https://webflow.com/dashboard/login',               authSuccessPattern: 'webflow.com/',                 isOAuth: true  },
+  ghost:          { startUrl: 'https://ghost.org/dashboard',                     signInUrl: 'https://ghost.org/dashboard/signin',                authSuccessPattern: 'ghost.org/',                   isOAuth: true  },
+  // ── Social media management ──────────────────────────────────────────────────────────────────────────
+  buffer:         { startUrl: 'https://app.buffer.com',                          signInUrl: 'https://app.buffer.com/login',                      authSuccessPattern: 'app.buffer.com/',              isOAuth: true  },
+  hootsuite:      { startUrl: 'https://hootsuite.com/dashboard',                 signInUrl: 'https://hootsuite.com/login',                       authSuccessPattern: 'hootsuite.com/',               isOAuth: true  },
+  // ── IoT / Smart Home ─────────────────────────────────────────────────────────────────────────────────
+  ifttt:          { startUrl: 'https://ifttt.com/home',                          signInUrl: 'https://ifttt.com/login',                           authSuccessPattern: 'ifttt.com/',                   isOAuth: true  },
+  homeassistant:  { startUrl: 'https://my.home-assistant.io',                    signInUrl: 'https://my.home-assistant.io',                      authSuccessPattern: 'home-assistant.io/',           isOAuth: true  },
+  smartthings:    { startUrl: 'https://account.smartthings.com',                 signInUrl: 'https://account.smartthings.com',                   authSuccessPattern: 'account.smartthings.com/',     isOAuth: true  },
+  nest:           { startUrl: 'https://home.nest.com',                           signInUrl: 'https://accounts.google.com/signin/v2/identifier',  authSuccessPattern: 'home.nest.com/',               isOAuth: true  },
+  ring:           { startUrl: 'https://account.ring.com',                        signInUrl: 'https://account.ring.com/sign-in',                  authSuccessPattern: 'account.ring.com/',            isOAuth: true  },
+  wyze:           { startUrl: 'https://app.wyzecam.com',                         signInUrl: 'https://app.wyzecam.com',                           authSuccessPattern: 'wyzecam.com/',                 isOAuth: true  },
+  tuya:           { startUrl: 'https://iot.tuya.com',                            signInUrl: 'https://iot.tuya.com',                              authSuccessPattern: 'iot.tuya.com/',                isOAuth: true  },
+  particle:       { startUrl: 'https://console.particle.io',                     signInUrl: 'https://login.particle.io',                         authSuccessPattern: 'console.particle.io/',         isOAuth: true  },
+  blynk:          { startUrl: 'https://blynk.cloud',                             authSuccessPattern: 'blynk.cloud/',                 isOAuth: false },
+  adafruitio:     { startUrl: 'https://io.adafruit.com',                         authSuccessPattern: 'io.adafruit.com/',             isOAuth: false },
+  arduino:        { startUrl: 'https://app.arduino.cc',                          signInUrl: 'https://login.arduino.cc',                          authSuccessPattern: 'app.arduino.cc/',              isOAuth: true  },
+  balena:         { startUrl: 'https://dashboard.balena-cloud.com',              signInUrl: 'https://dashboard.balena-cloud.com/login',          authSuccessPattern: 'dashboard.balena-cloud.com/',  isOAuth: true  },
+  ubidots:        { startUrl: 'https://industrial.ubidots.com',                  authSuccessPattern: 'industrial.ubidots.com/',      isOAuth: false },
+  thingsboard:    { startUrl: 'https://thingsboard.cloud/home',                  authSuccessPattern: 'thingsboard.cloud/',           isOAuth: false },
+  philipshue:     { startUrl: 'https://account.meethue.com',                     signInUrl: 'https://account.meethue.com/login',                 authSuccessPattern: 'meethue.com/',                 isOAuth: true  },
+  ecobee:         { startUrl: 'https://www.ecobee.com/home',                     signInUrl: 'https://www.ecobee.com/home/authorizationForm.jsp', authSuccessPattern: 'ecobee.com/',                  isOAuth: true  },
+  honeywell:      { startUrl: 'https://www.resideo.com',                         authSuccessPattern: 'resideo.com/',                 isOAuth: false },
+  switchbot:      { startUrl: 'https://account.switch-bot.com',                  signInUrl: 'https://account.switch-bot.com/login',              authSuccessPattern: 'switch-bot.com/',              isOAuth: true  },
+  govee:          { startUrl: 'https://developer.govee.com',                     authSuccessPattern: 'developer.govee.com/',         isOAuth: false },
+  lifx:           { startUrl: 'https://cloud.lifx.com',                          signInUrl: 'https://cloud.lifx.com/sign_in',                    authSuccessPattern: 'cloud.lifx.com/',              isOAuth: true  },
+  shelly:         { startUrl: 'https://my.shelly.cloud',                         authSuccessPattern: 'my.shelly.cloud/',             isOAuth: false },
+  meross:         { startUrl: 'https://www.meross.com/web/profile',              authSuccessPattern: 'meross.com/',                  isOAuth: false },
+  nanoleaf:       { startUrl: 'https://my.nanoleaf.me',                          signInUrl: 'https://my.nanoleaf.me/login',                      authSuccessPattern: 'nanoleaf.me/',                 isOAuth: true  },
+  wemo:           { startUrl: 'https://www.wemo.com/setup',                      authSuccessPattern: 'wemo.com/',                    isOAuth: false },
+  lutron:         { startUrl: 'https://www.casetawireless.com',                  signInUrl: 'https://www.casetawireless.com',                    authSuccessPattern: 'casetawireless.com/',          isOAuth: true  },
+  // ── Automotive / car connectivity ────────────────────────────────────────────────────────────────────
+  tesla:          { startUrl: 'https://auth.tesla.com/oauth2/v3/authorize',      signInUrl: 'https://auth.tesla.com/oauth2/v3/authorize',        authSuccessPattern: 'tesla.com/',                   isOAuth: true  },
+  smartcar:       { startUrl: 'https://dashboard.smartcar.com',                  signInUrl: 'https://dashboard.smartcar.com/login',              authSuccessPattern: 'dashboard.smartcar.com/',      isOAuth: true  },
+  ford:           { startUrl: 'https://fordpass.ford.com',                       signInUrl: 'https://fordpass.ford.com',                         authSuccessPattern: 'ford.com/',                    isOAuth: true  },
+  bmw:            { startUrl: 'https://www.bmwconnecteddrive.com',               signInUrl: 'https://www.bmwconnecteddrive.com',                 authSuccessPattern: 'bmwconnecteddrive.com/',        isOAuth: true  },
+  rivian:         { startUrl: 'https://rivian.com/account',                      signInUrl: 'https://rivian.com/account/sign-in',                authSuccessPattern: 'rivian.com/',                  isOAuth: true  },
+  onstar:         { startUrl: 'https://my.onstar.com',                           signInUrl: 'https://my.onstar.com/account/login',               authSuccessPattern: 'my.onstar.com/',               isOAuth: true  },
+  // ── Drone / aerial ──────────────────────────────────────────────────────────────────────────────────
+  dji:            { startUrl: 'https://developer.dji.com',                       signInUrl: 'https://account.dji.com/login',                     authSuccessPattern: 'developer.dji.com/',           isOAuth: true  },
+  dronedeploy:    { startUrl: 'https://www.dronedeploy.com/app2/',               signInUrl: 'https://www.dronedeploy.com/app2/login',            authSuccessPattern: 'dronedeploy.com/',             isOAuth: true  },
+  skydio:         { startUrl: 'https://www.skydio.com/login',                    signInUrl: 'https://www.skydio.com/login',                      authSuccessPattern: 'skydio.com/',                  isOAuth: true  },
+  autel:          { startUrl: 'https://passport.autelrobotics.com',              signInUrl: 'https://passport.autelrobotics.com',                authSuccessPattern: 'autelrobotics.com/',           isOAuth: true  },
+  airmap:         { startUrl: 'https://app.airmap.com',                          signInUrl: 'https://app.airmap.com/login',                      authSuccessPattern: 'app.airmap.com/',              isOAuth: true  },
+  dronelogbook:   { startUrl: 'https://dronelogbook.com',                        signInUrl: 'https://dronelogbook.com/login',                    authSuccessPattern: 'dronelogbook.com/',            isOAuth: true  },
 };
 
 function lookupBrowserService(service) {
@@ -112,20 +270,22 @@ function lookupBrowserService(service) {
 // Result cached in DuckDB so LLM is called at most once per service.
 // ---------------------------------------------------------------------------
 
-const BROWSER_DISCOVERY_SYSTEM_PROMPT = `You are a web service knowledge base. Given a service/product name, return structured JSON describing how to interact with it via a browser.
+const BROWSER_DISCOVERY_SYSTEM_PROMPT = `You are a web service knowledge base. Given a service/product name, return structured JSON with exactly four fields.
 
 Output ONLY valid JSON:
 {
-  "startUrl": "<full URL of the service home/dashboard after login>",
-  "signInUrl": "<full URL of the actual login/sign-in form page — NOT the marketing homepage>",
-  "authSuccessPattern": "<URL substring that appears after successful login>",
-  "capabilities": ["<verb_noun capability 1>", "<verb_noun capability 2>"],
-  "apiKeyUrl": "<URL of the API key settings page, or null if OAuth only>",
-  "isOAuth": true | false,
-  "notes": "<one sentence about auth>"
+  "signInUrl": "<URL of the actual login/sign-in form — the page where the user types credentials or clicks OAuth. Set to null for isOAuth=false services.>",
+  "startUrl": "<URL of the post-login dashboard or API key settings page>",
+  "authSuccessPattern": "<URL substring that reliably appears AFTER successful login>",
+  "isOAuth": true | false
 }
 
-CRITICAL: signInUrl must be the actual sign-in form URL (e.g. accounts.google.com/signin for Gmail, not gmail.com which is the marketing page).`;
+CRITICAL rules:
+- isOAuth=true means the service requires an OAuth browser session (social login, SSO, consent screen). isOAuth=false means the service uses an API key / token from a settings page.
+- signInUrl MUST be the actual login form URL, NOT the dashboard. Example: Dropbox signInUrl=https://www.dropbox.com/login (NOT www.dropbox.com). If the service redirects to a separate identity provider (Google, Microsoft, Okta), use that IdP's login URL.
+- For isOAuth=false services, set signInUrl to null.
+- startUrl is where the agent navigates AFTER login (dashboard, API keys page, etc.).
+- Getting isOAuth or signInUrl wrong causes auth flow failures — the agent will navigate to the wrong page and loop forever.`;
 
 async function resolveBrowserMeta(service) {
   const seedKey = service.toLowerCase().replace(/[^a-z0-9]/g, '');
@@ -145,12 +305,12 @@ async function resolveBrowserMeta(service) {
         const signInUrl = extractDescriptorUrl(desc, 'sign_in_url');
         const authSuccessPattern = extractDescriptorUrl(desc, 'auth_success_pattern');
         if (startUrl) {
-          // Merge with seed map for fields not in descriptor (capabilities, isOAuth)
+          // Merge with seed map for fields not in descriptor (isOAuth)
           const seed = KNOWN_BROWSER_SERVICES[seedKey] || {};
           return {
             ...seed,
             startUrl,
-            signInUrl: signInUrl || seed.signInUrl || startUrl,
+            ...(signInUrl ? { signInUrl } : {}),
             authSuccessPattern: authSuccessPattern || seed.authSuccessPattern || seedKey,
           };
         }
@@ -175,12 +335,33 @@ async function resolveBrowserMeta(service) {
   const fromSeed = KNOWN_BROWSER_SERVICES[seedKey];
   if (fromSeed) return fromSeed;
 
-  // 4. LLM discovery
+  // 4. LLM discovery with web_search grounding
   logger.info(`[browser.agent] resolveBrowserMeta: LLM lookup for "${service}"`);
+
+  // 4a. web_search grounding (non-blocking, 5s cap) — gives LLM real signal about auth type
+  let searchSnippets = '';
+  try {
+    searchSnippets = await Promise.race([
+      agentWebSearch(`${service} authentication type OAuth API key login URL`),
+      new Promise(r => setTimeout(() => r(''), 5000))
+    ]);
+  } catch {}
+
+  // 4b. Keyword heuristic vote — OAuth vs API key based on search snippet text
+  const snippetLower = (searchSnippets || '').toLowerCase();
+  const oauthKeywords  = ['oauth', 'sign in with', 'sso', 'openid connect', 'social login'];
+  const apikeyKeywords = ['api key', 'api token', 'bearer token', '/settings/api', 'access token', 'secret key'];
+  const votesOAuth   = oauthKeywords.filter(kw => snippetLower.includes(kw)).length;
+  const votesApiKey  = apikeyKeywords.filter(kw => snippetLower.includes(kw)).length;
+
+  // 4c. Grounded LLM call — search snippets injected as context when available
+  const groundedQuery = searchSnippets
+    ? `Web search results:\n${searchSnippets.slice(0, 800)}\n\nService: ${service}`
+    : `Service: ${service}`;
   const raw = await callLLM(
     BROWSER_DISCOVERY_SYSTEM_PROMPT,
-    `Service: ${service}`,
-    { temperature: 0.1, maxTokens: 400 }
+    groundedQuery,
+    { temperature: 0.1, maxTokens: 300 }
   );
 
   let meta = null;
@@ -189,6 +370,19 @@ async function resolveBrowserMeta(service) {
       const match = raw.match(/\{[\s\S]*\}/);
       if (match) meta = JSON.parse(match[0]);
     } catch {}
+  }
+
+  // 4d. Cross-validate isOAuth: trust keyword heuristic over LLM when they conflict
+  if (meta && searchSnippets && (votesOAuth > 0 || votesApiKey > 0)) {
+    const heuristicSaysApiKey = votesApiKey > votesOAuth;
+    const heuristicSaysOAuth  = votesOAuth  > votesApiKey;
+    if (heuristicSaysApiKey && meta.isOAuth === true) {
+      meta.isOAuth = false;
+      logger.warn(`[browser.agent] isOAuth conflict for "${service}": LLM=true but search suggests api_key → correcting to false`);
+    } else if (heuristicSaysOAuth && meta.isOAuth === false) {
+      meta.isOAuth = true;
+      logger.warn(`[browser.agent] isOAuth conflict for "${service}": LLM=false but search suggests OAuth → correcting to true`);
+    }
   }
 
   if (!meta || !meta.startUrl) {
@@ -200,7 +394,7 @@ async function resolveBrowserMeta(service) {
     };
   }
 
-  // 4. cache in DuckDB
+  // 5. cache in DuckDB
   try {
     const db = await getDb();
     if (db) {
@@ -256,24 +450,20 @@ function callBrowserAct(args, timeoutMs = 60000) {
 // Action: build_agent
 // ---------------------------------------------------------------------------
 
-function buildBrowserDescriptorMd({ id, service, startUrl, signInUrl, authSuccessPattern, capabilities }) {
+function buildBrowserDescriptorMd({ id, service, startUrl, signInUrl, authSuccessPattern, capabilities, type = 'browser' }) {
   const capYaml = capabilities.map(c => `  - ${c}`).join('\n');
-  // sign_in_url is the actual login form — distinct from start_url (the post-login dashboard).
-  // validate_agent will correct it if wrong; scan_page and actionRun prefer it over start_url.
-  const effectiveSignInUrl = signInUrl || startUrl;
   return [
     '---',
     `id: ${id}`,
-    `type: browser`,
+    `type: ${type}`,
     `service: ${service}`,
+    ...(signInUrl ? [`sign_in_url: ${signInUrl}`] : []),
     `start_url: ${startUrl}`,
-    `sign_in_url: ${effectiveSignInUrl}`,
     `auth_success_pattern: ${authSuccessPattern}`,
     `capabilities:`,
     capYaml,
     '---',
-    `# sign_in_url is the actual login form URL — validate_agent will correct this if wrong.`,
-    `# start_url is the service home/dashboard (used after auth).`,
+    `# start_url is the service home/dashboard (used as auth entry point and post-auth navigation target).`,
     '',
     `## Instructions`,
     `Use Playwright via browser.act skill for all ${service} operations.`,
@@ -281,7 +471,7 @@ function buildBrowserDescriptorMd({ id, service, startUrl, signInUrl, authSucces
     `Always start navigation from: ${startUrl}`,
     '',
     `## Auth`,
-    `Use action:waitForAuth with url="${startUrl}" and authSuccessUrl="${authSuccessPattern}".`,
+    `Use action:waitForAuth with url="${signInUrl || startUrl}" and authSuccessUrl="${authSuccessPattern}".`,
     `Once authenticated, the session is stored at ~/.thinkdrop/browser-sessions/${service}_agent/`,
     '',
     `## Navigation Patterns`,
@@ -306,6 +496,10 @@ async function actionBuildAgent({ service, startUrl: explicitUrl, force = false 
   const signInUrl          = meta?.signInUrl || null;
   const authSuccessPattern = meta?.authSuccessPattern || serviceKey;
   const capabilities       = meta?.capabilities || ['navigate', 'interact'];
+  // Derive auth type from meta: OAuth services need a browser session; api_key services use the
+  // multi-turn curl loop in actionRun. Default to 'api_key' when unknown — safer than 'browser'
+  // since the curl loop gracefully handles missing keys while browser flow needs a real session.
+  const agentType = meta?.isOAuth === true ? 'browser' : 'api_key';
 
   if (!startUrl) {
     return {
@@ -314,18 +508,20 @@ async function actionBuildAgent({ service, startUrl: explicitUrl, force = false 
     };
   }
 
-  // Check registry — skip rebuild unless forced
+  // Check registry — skip rebuild unless forced.
+  // Always rebuild if the stored type differs from the computed agentType so stale descriptors
+  // (e.g. Mailgun previously stored as type=browser) are corrected on the next build_agent call.
   if (!force) {
     const db = await getDb();
     if (db) {
-      const rows = await db.all('SELECT id, status FROM agents WHERE id = ?', agentId);
-      if (rows && rows.length > 0 && rows[0].status !== 'needs_update') {
+      const rows = await db.all('SELECT id, type, status FROM agents WHERE id = ?', agentId);
+      if (rows && rows.length > 0 && rows[0].status !== 'needs_update' && rows[0].type === agentType) {
         return { ok: true, agentId, alreadyExists: true, status: rows[0].status };
       }
     }
   }
 
-  const descriptor = buildBrowserDescriptorMd({ id: agentId, service: serviceKey, startUrl, signInUrl, authSuccessPattern, capabilities });
+  const descriptor = buildBrowserDescriptorMd({ id: agentId, service: serviceKey, startUrl, signInUrl, authSuccessPattern, capabilities, type: agentType });
 
   // Write .md to disk
   fs.mkdirSync(AGENTS_DIR, { recursive: true });
@@ -338,8 +534,9 @@ async function actionBuildAgent({ service, startUrl: explicitUrl, force = false 
     await db.run(
       `INSERT OR REPLACE INTO agents
          (id, type, service, cli_tool, capabilities, descriptor, last_validated, status, created_at)
-       VALUES (?, 'browser', ?, NULL, ?, ?, CURRENT_TIMESTAMP, 'healthy', CURRENT_TIMESTAMP)`,
+       VALUES (?, ?, ?, NULL, ?, ?, CURRENT_TIMESTAMP, 'healthy', CURRENT_TIMESTAMP)`,
       agentId,
+      agentType,
       serviceKey,
       JSON.stringify(capabilities),
       descriptor
@@ -864,9 +1061,64 @@ async function _updateStatus(id, status, failureNote) {
 
 
 // ---------------------------------------------------------------------------
+// Agentic loop helpers (api_key path) — mirrors cli.agent pattern
+// ---------------------------------------------------------------------------
+
+async function agentWebSearch(query) {
+  const { URL } = require('url');
+  const wsUrl = new URL(process.env.MCCP_WEB_SEARCH_API_URL || 'http://127.0.0.1:3002');
+  const wsApiKey = process.env.MCP_WEB_SEARCH_API_KEY || '';
+  return new Promise((resolve) => {
+    const body = JSON.stringify({
+      version: 'mcp.v1', service: 'web-search',
+      requestId: `ws_${Date.now()}`, action: 'search',
+      payload: { query, maxResults: 3 },
+    });
+    const req = http.request({
+      hostname: wsUrl.hostname, port: parseInt(wsUrl.port) || 3002,
+      path: '/web.search', method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body), 'Authorization': `Bearer ${wsApiKey}` },
+    }, (res) => {
+      let data = '';
+      res.on('data', c => { data += c; });
+      res.on('end', () => {
+        try {
+          const parsed = JSON.parse(data);
+          const results = parsed?.data?.results || parsed?.results || [];
+          if (results.length === 0) { resolve(`web_search returned no results for: "${query}" — try web_fetch with a direct docs URL instead`); return; }
+          resolve(results.slice(0, 3).map(r => `${r.title}\n${r.description}`).join('\n---\n'));
+        } catch { resolve(data.slice(0, 600) || `web_search returned no results for: "${query}" — try web_fetch with a direct docs URL instead`); }
+      });
+    });
+    req.on('error', (e) => resolve(`web_search failed: ${e.message || 'connection error'} — try web_fetch with a direct docs URL instead`));
+    req.setTimeout(5000, () => { req.destroy(); resolve(`web_search timed out for: "${query}" — try web_fetch with a direct docs URL instead`); });
+    req.write(body);
+    req.end();
+  });
+}
+
+async function agentWebFetch(url) {
+  const WEB_FETCH_CHARS = 2000;
+  const { execFile: _execFileWF } = require('child_process');
+  const pcResult = await new Promise(resolve => {
+    _execFileWF('/opt/homebrew/bin/playwright-cli', ['fetch', url], { timeout: 15000, maxBuffer: 1024 * 1024 }, (err, out) => {
+      resolve({ ok: !err, stdout: out || '' });
+    });
+  });
+  if (pcResult.ok && pcResult.stdout.trim()) return pcResult.stdout.slice(0, WEB_FETCH_CHARS);
+  const curlResult = await new Promise(resolve => {
+    _execFileWF('curl', ['-sL', '--max-time', '10', url], { timeout: 15000, maxBuffer: 1024 * 1024 }, (err, out) => {
+      resolve({ stdout: out || '' });
+    });
+  });
+  if (curlResult.stdout) return curlResult.stdout.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').slice(0, WEB_FETCH_CHARS);
+  return '';
+}
+
+// ---------------------------------------------------------------------------
 // Action: run — executes a task using the agent's descriptor as context.
 // Supports two paths based on agent type:
-//   api_key / bearer: LLM infers curl command → inject creds → shell exec
+//   api_key / bearer: multi-turn agentic loop (run_curl/web_search/web_fetch/done/ask_user)
 //   browser / oauth:  waitForAuth → playwright.agent agentic loop
 // ---------------------------------------------------------------------------
 
@@ -886,6 +1138,25 @@ Output ONLY valid JSON:
 
 curlArgs must NOT include the word "curl" itself. Always use -s flag. Use -f to fail on HTTP errors.
 credVars = which of ["PRIMARY", "USERNAME", "DOMAIN"] are actually referenced in curlArgs.`;
+
+const BROWSER_AGENTIC_LOOP_PROMPT = `You are an expert REST API automation agent executing a user task step-by-step.
+You have access to the API service described in the Agent Descriptor below.
+Each turn you output exactly ONE JSON action object from this palette:
+
+  run_curl   – execute API call:           { "action": "run_curl", "curlArgs": [...], "credVars": [...] }
+  web_search – search for API docs:        { "action": "web_search", "query": "..." }
+  web_fetch  – read an API docs/ref URL:   { "action": "web_fetch", "url": "..." }
+  done       – task complete:              { "action": "done", "summary": "..." }
+  ask_user   – need user clarification:    { "action": "ask_user", "question": "...", "options": [] }
+
+Rules:
+- curlArgs must NOT include the word "curl" itself. Always use -s flag. Do NOT use -f (you need to read error bodies on failure).
+- credVars lists which of ["PRIMARY", "USERNAME", "DOMAIN"] are referenced in curlArgs as $CRED_PRIMARY / $CRED_USERNAME / $CRED_DOMAIN.
+- On HTTP 4xx or 5xx: read the response body carefully for error details, then retry with corrected parameters or endpoint.
+- Use web_search or web_fetch to find the correct endpoint, required headers, or request body format when uncertain.
+- Use done immediately when HTTP 2xx is received and the task is confirmed complete.
+- Use ask_user only when genuinely blocked by missing information that cannot be resolved with the tools above.
+- Output JSON only. No prose. No markdown fences.`;
 
 // Resolve a named credential: env var → keytar → null
 async function resolveCredential(agentId, credName) {
@@ -948,9 +1219,34 @@ function callSkill(skillName, args, timeoutMs = 120000) {
   });
 }
 
-async function actionRun({ agentId, task, context }) {
+async function actionRun({ agentId, task, context, _progressCallbackUrl, _stepIndex }) {
   if (!agentId) return { ok: false, error: 'agentId is required' };
   if (!task)    return { ok: false, error: 'task is required' };
+
+  const _fs = require('fs');
+
+  // If the caller passed a full-content buffer file from a prior pipeline step, append it to the task
+  const _dataFile = context?._dataFile;
+  if (_dataFile) {
+    try {
+      const fileContent = _fs.readFileSync(_dataFile, 'utf8');
+      task = `${task}\n\n[DATA FROM PRIOR STEP]:\n${fileContent.slice(0, 8000)}`;
+    } catch (_) { /* non-fatal — file may not exist */ }
+  }
+
+  // Scan the task string for absolute file paths mentioned inline (e.g. "content of /tmp/foo.txt").
+  // Pre-read each file and replace the path reference with the actual content so the LLM never
+  // needs to generate run-code that tries require('fs') or fs.readFile inside playwright.
+  const FILE_PATH_RE = /(\/(?:tmp|var|home|Users|root|etc)[^\s"'`,;)]+)/g;
+  const mentionedPaths = [...new Set((task.match(FILE_PATH_RE) || []))];
+  for (const filePath of mentionedPaths) {
+    try {
+      const fileContent = _fs.readFileSync(filePath, 'utf8');
+      logger.info(`[browser.agent] pre-injecting file content from ${filePath} (${fileContent.length} chars)`);
+      task = task.replace(filePath, `[CONTENT OF ${filePath}]`) +
+             `\n\n[CONTENT OF ${filePath}]:\n${fileContent.slice(0, 8000)}`;
+    } catch (_) { /* file may not exist — leave path in task as-is */ }
+  }
 
   const existing = await actionQueryAgent({ id: agentId });
   if (!existing.found) {
@@ -964,72 +1260,120 @@ async function actionRun({ agentId, task, context }) {
 
   logger.info(`[browser.agent] run agentId=${agentId} type=${agentType} task="${task}"`);
 
-  // ── REST API path (api_key, bearer, basic) ─────────────────────────────
+  // ── REST API path (api_key, bearer, basic) — multi-turn agentic loop ──
   if (agentType === 'api_key' || agentType === 'bearer' || agentType === 'basic') {
-    const inferenceQuery = `Agent descriptor:\n${existing.descriptor || '(no descriptor)'}\n\nTask: ${task}`;
-    const raw = await callLLM(BROWSER_RUN_CURL_PROMPT, inferenceQuery, { temperature: 0.1, maxTokens: 600 });
+    const MAX_TURNS = 5;
+    const OBSERVATION_CHARS = 600;
+    const loopHistory = [];
 
-    let curlArgs = [];
-    let credVars = [];
-    let reasoning = '';
-
-    if (raw) {
-      try {
-        const match = raw.match(/\{[\s\S]*\}/);
-        if (match) {
-          const parsed = JSON.parse(match[0]);
-          curlArgs  = Array.isArray(parsed.curlArgs)  ? parsed.curlArgs  : [];
-          credVars  = Array.isArray(parsed.credVars)  ? parsed.credVars  : [];
-          reasoning = parsed.reasoning || '';
-        }
-      } catch {}
-    }
-
-    if (curlArgs.length === 0) {
-      return { ok: false, agentId, task, error: `Could not infer curl command. Reasoning: ${reasoning || 'LLM returned no curlArgs'}` };
-    }
-
-    // Resolve credentials
+    // Resolve credentials once before the loop starts
     const creds = {
       PRIMARY:  await resolveCredential(agentId, 'PRIMARY')  || await resolveCredential(agentId, 'API_KEY')  || '',
       USERNAME: await resolveCredential(agentId, 'USERNAME') || await resolveCredential(agentId, 'USER')     || '',
       DOMAIN:   await resolveCredential(agentId, 'DOMAIN')   || '',
     };
 
-    if (credVars.includes('PRIMARY') && !creds.PRIMARY) {
-      return {
-        ok: false, agentId, task,
-        error: `Missing credential for ${agentId}. Store API key in Keychain: security add-generic-password -s thinkdrop -a "browser_agent:${agentId}:PRIMARY" -w "<your-key>"`,
-        needsCredentials: true,
-      };
+    // Build system prompt with descriptor embedded (descriptor stays in system, not per-turn)
+    const DESCRIPTOR_LIMIT = 3000;
+    const trimmedDescriptor = (existing.descriptor || '(none)').slice(0, DESCRIPTOR_LIMIT);
+    const loopSystemPrompt = `${BROWSER_AGENTIC_LOOP_PROMPT}\n\n## Agent Descriptor\n${trimmedDescriptor}`;
+
+    // Helper: substitute credential placeholders and run curl
+    const { execFile: _execFileCurl } = require('child_process');
+    const execCurlWithCreds = (curlArgs) => {
+      const resolvedArgs = curlArgs.map(a =>
+        a.replace(/\$CRED_PRIMARY/g,  creds.PRIMARY)
+         .replace(/\$CRED_USERNAME/g, creds.USERNAME)
+         .replace(/\$CRED_DOMAIN/g,   creds.DOMAIN)
+      );
+      logger.info(`[browser.agent] api_key loop: curl ${resolvedArgs.filter(a => !creds.PRIMARY || !a.includes(creds.PRIMARY)).slice(0, 5).join(' ')} ...`);
+      return new Promise(resolve => {
+        _execFileCurl('curl', resolvedArgs, { timeout: 30000, maxBuffer: 2 * 1024 * 1024 }, (err, out, errOut) => {
+          resolve({ ok: !err || err.code === 0, stdout: out || '', stderr: errOut || '', exitCode: err?.code ?? 0, error: err?.message });
+        });
+      });
+    };
+
+    for (let turn = 1; turn <= MAX_TURNS; turn++) {
+      // Build per-turn user prompt
+      const histLines = loopHistory.length === 0
+        ? '(none — this is turn 1)'
+        : loopHistory.map(h => {
+            const parts = Object.entries(h)
+              .filter(([k]) => k !== 'turn' && k !== 'observation')
+              .map(([k, v]) => `${k}=${JSON.stringify(v)}`).join(' ');
+            return `  Turn ${h.turn}: ${parts}\n    Observation: ${h.observation}`;
+          }).join('\n\n');
+      const turnUser = `## Task\n${task}\n\n## Turn History\n${histLines}\n\n## Next Action\nOutput a single JSON action object.`;
+
+      const llmRaw = await callLLM(loopSystemPrompt, turnUser, { temperature: 0.1, maxTokens: 400 });
+
+      let action = null;
+      if (llmRaw) {
+        try {
+          const m = llmRaw.match(/\{[\s\S]*\}/);
+          if (m) action = JSON.parse(m[0]);
+        } catch {}
+      }
+
+      if (!action || !action.action) {
+        loopHistory.push({ turn, action: 'parse_error', observation: `LLM output unparseable: ${(llmRaw || '').slice(0, 200)}` });
+        continue;
+      }
+
+      logger.info(`[browser.agent] api_key loop turn ${turn}/${MAX_TURNS}: action=${action.action}`);
+
+      if (action.action === 'done') {
+        return { ok: true, agentId, task, stdout: action.summary || '', agentTurns: turn, loopHistory };
+      }
+
+      if (action.action === 'ask_user') {
+        return { ok: false, agentId, task, askUser: true, question: action.question, options: action.options || [], agentTurns: turn, loopHistory };
+      }
+
+      let observation = '';
+
+      if (action.action === 'run_curl') {
+        const curlArgs = Array.isArray(action.curlArgs) ? action.curlArgs : [];
+        const credVars = Array.isArray(action.credVars) ? action.credVars : [];
+        if (credVars.includes('PRIMARY') && !creds.PRIMARY) {
+          return {
+            ok: false, agentId, task,
+            error: `Missing credential for ${agentId}. Store API key in Keychain: security add-generic-password -s thinkdrop -a "browser_agent:${agentId}:PRIMARY" -w "<your-key>"`,
+            needsCredentials: true,
+          };
+        }
+        if (curlArgs.length === 0) {
+          observation = 'run_curl: no curlArgs provided';
+        } else {
+          const result = await execCurlWithCreds(curlArgs);
+          observation = (result.stdout || result.stderr || result.error || '').slice(0, OBSERVATION_CHARS);
+          // Auto-done on HTTP success (exitCode 0 = 2xx when -f is omitted)
+          if (result.ok && result.exitCode === 0) {
+            return {
+              ok: true, agentId, task,
+              stdout: result.stdout,
+              stderr: result.stderr,
+              exitCode: result.exitCode,
+              agentTurns: turn,
+              loopHistory,
+            };
+          }
+        }
+      } else if (action.action === 'web_search') {
+        const snippets = await agentWebSearch(action.query || '');
+        observation = snippets.slice(0, OBSERVATION_CHARS);
+      } else if (action.action === 'web_fetch') {
+        const page = await agentWebFetch(action.url || '');
+        observation = page.slice(0, OBSERVATION_CHARS);
+      } else {
+        observation = `Unknown action: ${action.action}`;
+      }
+
+      loopHistory.push({ turn, ...action, observation });
     }
 
-    // Substitute credential placeholders in curlArgs
-    const resolvedArgs = curlArgs.map(a =>
-      a.replace(/\$CRED_PRIMARY/g,  creds.PRIMARY)
-       .replace(/\$CRED_USERNAME/g, creds.USERNAME)
-       .replace(/\$CRED_DOMAIN/g,   creds.DOMAIN)
-    );
-
-    logger.info(`[browser.agent] api_key run: curl ${resolvedArgs.slice(0, 4).join(' ')} ...`, { agentId, reasoning });
-
-    const { execFile } = require('child_process');
-    const result = await new Promise(resolve => {
-      execFile('curl', resolvedArgs, { timeout: 30000, maxBuffer: 2 * 1024 * 1024 }, (err, out, errOut) => {
-        resolve({ ok: !err || err.code === 0, stdout: out, stderr: errOut, exitCode: err?.code ?? 0, error: err?.message });
-      });
-    });
-
-    return {
-      ok: result.ok,
-      agentId,
-      task,
-      reasoning,
-      stdout: result.stdout,
-      stderr: result.stderr,
-      exitCode: result.exitCode,
-      error: result.error,
-    };
+    return { ok: false, agentId, task, error: `Agentic loop reached MAX_TURNS (${MAX_TURNS}) without completing`, loopHistory };
   }
 
   // ── Browser / OAuth path ───────────────────────────────────────────────
@@ -1041,7 +1385,11 @@ async function actionRun({ agentId, task, context }) {
   if (!startUrl) return { ok: false, error: 'Agent descriptor missing start_url' };
 
   const profile   = `${agentId.replace('.agent', '')}_agent`;
-  const sessionId = `${agentId}_${Date.now()}`;
+  // Use the stable profile name as sessionId so browser-profiles/<sessionId>/ persists
+  // cookies across all invocations. A timestamped suffix creates a fresh dir each run
+  // → Chrome shows the login page every time. 'gmail_agent' ≈ 94-char socket path,
+  // safely under macOS's 104-char Unix socket limit.
+  const sessionId = profile;
 
   // Step 1: ensure auth session exists
   let authResult;
@@ -1052,8 +1400,8 @@ async function actionRun({ agentId, task, context }) {
       profile,
       url: authTarget,
       authSuccessUrl: authSuccessPattern,
-      authTimeoutMs: 2 * 60 * 1000,
-      timeoutMs: 15000,
+      timeoutMs: 2 * 60 * 1000,
+      _progressCallbackUrl,
     }, 3 * 60 * 1000);
   } catch (err) {
     const failureNote = `[${new Date().toISOString()}] waitForAuth threw: ${err.message} | url=${startUrl} | task=${task}`;
@@ -1092,8 +1440,11 @@ async function actionRun({ agentId, task, context }) {
       goal: `${task}\n\nAgent context: ${existing.descriptor ? existing.descriptor.slice(0, 800) : ''}`,
       url: startUrl,
       sessionId,
+      agentId,
       maxTurns: 15,
       timeoutMs: 120000,
+      _progressCallbackUrl,
+      _stepIndex,
     }, 130000);
 
     return {

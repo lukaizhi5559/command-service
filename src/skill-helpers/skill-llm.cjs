@@ -83,6 +83,7 @@ async function askWithMessages(messages, opts = {}) {
         temperature: opts.temperature ?? 0.2,
         stream: true,
         taskType: opts.taskType || 'ask',
+        ...(opts.maxTokens != null ? { max_tokens: opts.maxTokens } : {}),
       },
       context: {
         recentContext: [],

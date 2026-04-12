@@ -181,6 +181,28 @@ async function getContextRules(contextKey) {
   return Array.isArray(results) ? results.map(r => r.ruleText || r.rule_text || '').filter(Boolean) : [];
 }
 
+/**
+ * Fetch context rules for multiple keys at once (e.g. agentId + hostname).
+ * Optionally filter by contextType ('site' | 'app' | 'agent').
+ * Returns array of rule text strings ordered by hit_count DESC.
+ */
+async function getContextRulesByKeys(keys, contextType = undefined) {
+  if (!Array.isArray(keys) || keys.length === 0) return [];
+  const payload = { contextKeys: keys };
+  if (contextType) payload.contextType = contextType;
+  const res = await httpPost('/context_rule.search', {
+    version: 'mcp.v1',
+    service: 'user-memory',
+    action: 'context_rule.search',
+    payload,
+  });
+  if (res && res.status !== 'ok') {
+    logger.warn(`[skill-db] getContextRulesByKeys failed: ${JSON.stringify(res?.error || res)?.slice(0, 120)}`);
+  }
+  const results = res?.data?.results;
+  return Array.isArray(results) ? results.map(r => r.ruleText || r.rule_text || '').filter(Boolean) : [];
+}
+
 // ── Skill registry helpers ───────────────────────────────────────────────────
 
 async function getSkill(skillName) {
@@ -199,7 +221,7 @@ module.exports = {
   // Semantic memory
   remember, recall,
   // Context rules
-  setContextRule, getContextRules,
+  setContextRule, getContextRules, getContextRulesByKeys,
   // Skill registry
   getSkill, upsertSkill,
 };
