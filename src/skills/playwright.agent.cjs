@@ -103,6 +103,7 @@ Available actions:
   drag            { selector, targetSelector }
   waitForSelector { selector }
   waitForContent  { text }
+  getPageText     {}                   — returns ALL visible text from the page (body.innerText, up to 50k chars). Use this as the universal, site-agnostic way to read any page. Works on ChatGPT, Perplexity, Claude, Grok, and any other site without knowing site-specific CSS. Result auto-captured as task output.
   evaluate        { text: "<JS expression>" }  — single-expression JS returning a primitive (e.g. document.title)
   run-code        { code: "async page => { return await page.evaluate(() => { ...browser JS... }); }" }
                   — Node.js VM with real Playwright page object. Use page.evaluate() to reach browser DOM.
@@ -132,7 +133,11 @@ Rules:
 - Keep plan concise — no unnecessary waits or redundant snapshots.
 - MULTI-ITEM EXTRACTION: Use one run-code step with page.evaluate() + document.querySelectorAll(). Never click per-item.
 - RUN-CODE RETURN: run-code result is auto-captured as task output — do NOT add a placeholder return step after it.
-- DIALOG RULE: If a confirmation dialog may appear, add dialog-accept/dismiss immediately after the triggering action.`;
+- DIALOG RULE: If a confirmation dialog may appear, add dialog-accept/dismiss immediately after the triggering action.
+- MODAL/OVERLAY RULE: When clicking a button that opens a modal or overlay (Compose, New, Reply, etc.), add { "action": "snapshot" } as the very next step. This forces a DOM re-read so all following steps use fresh refs from the new modal. Without this, refs from the original page will fail inside the modal.
+- AI CHAT EXTRACTION RULE: When sending a message to an AI assistant (ChatGPT, Claude, Grok, Perplexity, etc.), after pressing Enter add: (1) { "action": "waitForStableText" } to wait for the streamed response to finish, (2) { "action": "getPageText" } to read all visible page text. This is the UNIVERSAL, site-agnostic approach — works on any AI chat site without CSS class knowledge. NEVER use run-code + page.evaluate() with site-specific CSS selectors (like .prose, .generic, [data-testid=...]) for AI chat extraction — these selectors break across sites and page updates. Do NOT add a return step — the getPageText result is automatically captured as task output and will be consumed by the synthesis step downstream.
+- SESSION ISOLATION RULE: When accessing an AI chat service (ChatGPT, Perplexity, Gemini, Claude, etc.), ALWAYS start with a navigate action to its fresh/new-chat URL — ChatGPT: https://chatgpt.com/, Perplexity: https://www.perplexity.ai/, Gemini: https://gemini.google.com/app, Claude: https://claude.ai/new. This ensures getPageText reads ONLY the current query response, not old conversation history from previous sessions. EXCEPTION: If the task explicitly involves a follow-up or continuation of a previous AI response (keywords: "follow up", "continue", "based on that", "expand on", "now ask it"), stay on the current page and do NOT navigate away.
+- NO PLACEHOLDER RULE: NEVER write literal template placeholder text like [ChatGPT response], [Perplexity response], [AI answer], or [insert content here] in any step args (task, body, text, etc.). When combining multi-source AI extractions into an email or message body, always use {{synthesisAnswer}} as the sole body content token — the orchestrator substitutes it with the real synthesized content before the step executes.`;
 
 // ---------------------------------------------------------------------------
 // Phase 2 prompt — called only when a step fails
@@ -192,7 +197,8 @@ Rules:
 - Autocomplete inputs (Gmail To:): fill then press Tab
 - Contenteditable areas: click first, then type (not fill)
 - Keep plan concise — no unnecessary waits or redundant snapshots
-- DIALOG RULE: If a confirmation dialog may appear, add dialog-accept/dismiss after the triggering action`;
+- DIALOG RULE: If a confirmation dialog may appear, add dialog-accept/dismiss after the triggering action
+- AI CHAT EXTRACTION RULE: If ANY stale remaining step was waitForStableText or getPageText, you MUST preserve BOTH in the re-plan — in order: first { "action": "waitForStableText" }, then { "action": "getPageText" }. NEVER collapse them into a single getText or omit waitForStableText. The AI response is still streaming when the DOM changes; skipping waitForStableText captures an incomplete response.`;
 
 // ---------------------------------------------------------------------------
 // Parse LLM JSON response — tolerant of markdown fences and prose wrappers
@@ -213,6 +219,51 @@ function parseJson(text) {
 function trimSnapshot(text, limit = 8000) {
   if (!text) return '(no snapshot available)';
   return text.length > limit ? text.slice(0, limit) + '\n[...snapshot truncated]' : text;
+}
+
+// ---------------------------------------------------------------------------
+// Extract only interactive element lines from a full snapshot.
+// Scans the ENTIRE text (no size limit) line-by-line, keeping only lines
+// that have both an interactive ARIA role AND a ref.  One parent context
+// line is preserved above each match so the LLM can see nesting (e.g.
+// "dialog New Message" before the To/Subject/body refs).
+// Falls back to trimSnapshot if no interactive elements are found.
+// ---------------------------------------------------------------------------
+function extractInteractiveRefs(snapshotText) {
+  if (!snapshotText) return '(no snapshot available)';
+  // Standard interactive ARIA roles
+  const INTERACTIVE   = /\b(textbox|searchbox|combobox|input|textarea|button|link|checkbox|radio|menuitem|option|tab|treeitem|switch|dialog|alertdialog)\b/i;
+  // Also capture contenteditable divs (Gmail body, rich-text editors) whose ARIA role is
+  // "generic" — they won't match INTERACTIVE but they DO have a ref and are fillable via type.
+  const CONTENTEDITABLE = /\[contenteditable\]|contenteditable=["']?true/i;
+  const HAS_REF         = /\[?e\d+\]|\[ref=e\d+\]/;
+  const lines = snapshotText.split('\n');
+  const added = new Set(); // track all pushed lines to prevent any duplicate
+  const out   = [];
+
+  const push = (line) => {
+    if (!added.has(line)) { added.add(line); out.push(line); }
+  };
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const isInteractive = (INTERACTIVE.test(line) || CONTENTEDITABLE.test(line)) && HAS_REF.test(line);
+    if (!isInteractive) continue;
+
+    // Walk backwards to find the nearest ancestor line that carries a meaningful label
+    // (quoted string) or a container role — skip blank/punctuation-only lines.
+    for (let p = i - 1; p >= Math.max(0, i - 5); p--) {
+      const candidate = lines[p];
+      if (candidate && candidate.trim() && candidate.trim() !== '-' && candidate.trim() !== ':') {
+        push(candidate);
+        break;
+      }
+    }
+    push(line);
+  }
+
+  if (out.length === 0) return trimSnapshot(snapshotText, 8000); // fallback
+  return `[Interactive elements extracted from ${lines.length}-line snapshot]\n` + out.join('\n');
 }
 
 // ---------------------------------------------------------------------------
@@ -273,6 +324,7 @@ async function playwrightAgent(args) {
     goal,
     sessionId             = 'playwright_agent',
     agentId               = sessionId,
+    agentContext,
     maxRepairs            = 4,
     timeoutMs             = 15000,
     headed                = true,
@@ -327,7 +379,7 @@ async function playwrightAgent(args) {
   logger.info(`[playwright.agent] phase 2: generating plan`);
   const planMessages = [
     { role: 'system', content: PLAN_SYSTEM_PROMPT + learnedRulesBlock },
-    { role: 'user',   content: `GOAL: ${goal}\n\nSNAPSHOT:\n${trimSnapshot(currentSnapshot, 16000)}` },
+    { role: 'user',   content: `GOAL: ${goal}\n\nSNAPSHOT:\n${trimSnapshot(currentSnapshot, 16000)}${agentContext ? `\n\nAGENT CONTEXT (agent instructions — follow these for site-specific behaviour):\n${agentContext}` : ''}` },
   ];
   let planRaw;
   try {
@@ -365,6 +417,7 @@ async function playwrightAgent(args) {
   let stepIndex  = 0;
   let totalRepairs = 0;
   let lastRunCodeResult = null; // captures last successful run-code output for implicit return
+  let lastGetPageTextResult = null; // captures last successful getPageText output for implicit return
 
   // Actions that can mutate the DOM structure (open modals, navigate pages, reveal
   // new elements via lazy-load, toggle conditional sections, etc.).  After any of these
@@ -406,20 +459,52 @@ async function playwrightAgent(args) {
       break;
     }
 
-    // Inline snapshot step — refresh and move on
+    // Inline snapshot step — refresh snapshot AND re-plan remaining steps with fresh refs.
+    // The LLM puts an explicit snapshot step when it knows the DOM will change (e.g. after
+    // clicking Compose, opening a modal, SPA navigation) but can't predict the new refs upfront.
+    // We MUST re-plan the subsequent steps from the new snapshot or they will use stale refs.
     if (step.action === 'snapshot') {
-      logger.info(`[playwright.agent] step ${stepIndex + 1}/${plan.length}: snapshot refresh`);
+      logger.info(`[playwright.agent] step ${stepIndex + 1}/${plan.length}: snapshot + re-plan`);
       const snap = await browserAct({ action: 'snapshot', sessionId, headed, timeoutMs });
       if (snap.ok && snap.result) currentSnapshot = snap.result;
-      transcript.push({ step: stepIndex + 1, action: step, outcome: { ok: true }, thoughts: 'snapshot refresh' });
+
+      const remainingAfterSnap = plan.slice(stepIndex + 1);
+      if (remainingAfterSnap.length > 0) {
+        logger.info(`[playwright.agent] snapshot step: re-planning ${remainingAfterSnap.length} step(s) with fresh refs`);
+        try {
+          const snapReplanRaw = await askWithMessages([
+            { role: 'system', content: REPLAN_SYSTEM_PROMPT },
+            { role: 'user', content: [
+              `GOAL: ${goal}`,
+              `COMPLETED_STEPS: ${JSON.stringify(plan.slice(0, stepIndex + 1))}`,
+              `STALE_REMAINING_PLAN: ${JSON.stringify(remainingAfterSnap)}`,
+              ``,
+              `FRESH_SNAPSHOT (interactive elements only — full ${countRefs(currentSnapshot)}-ref page):`,
+              extractInteractiveRefs(currentSnapshot),
+              learnedRulesBlock,
+            ].join('\n') },
+          ], { temperature: 0.1, maxTokens: 1024, responseTimeoutMs: 20000 });
+          const snapReplanParsed = parseJson(snapReplanRaw);
+          if (snapReplanParsed && Array.isArray(snapReplanParsed.plan) && snapReplanParsed.plan.length > 0) {
+            logger.info(`[playwright.agent] snapshot re-plan: ${snapReplanParsed.plan.length} fresh steps — ${snapReplanParsed.thoughts || ''}`);
+            plan = [...plan.slice(0, stepIndex + 1), ...snapReplanParsed.plan];
+          } else {
+            logger.warn(`[playwright.agent] snapshot re-plan unparseable — continuing with stale plan`);
+          }
+        } catch (snapReplanErr) {
+          logger.warn(`[playwright.agent] snapshot re-plan LLM error: ${snapReplanErr.message} — continuing with stale plan`);
+        }
+      }
+
+      transcript.push({ step: stepIndex + 1, action: step, outcome: { ok: true }, thoughts: 'snapshot + re-plan' });
       postProgress(_progressCallbackUrl, {
         type: 'agent:turn',
         stepIndex: _stepIndex,
         turn: stepIndex + 1,
         maxTurns: plan.length,
         action: step,
-        outcome: { ok: true, result: 'page re-read' },
-        thoughts: 'snapshot refresh',
+        outcome: { ok: true, result: 'page re-read + steps re-planned' },
+        thoughts: 'snapshot + re-plan',
       });
       stepIndex++;
       continue;
@@ -465,6 +550,38 @@ async function playwrightAgent(args) {
       if (step.action === 'run-code' && outcome.result) {
         lastRunCodeResult = outcome.result;
       }
+      if (step.action === 'getPageText' && outcome.result) {
+        lastGetPageTextResult = outcome.result;
+      }
+
+      // ── Post-fill body verification (self-healing + rule learning) ────────
+      // When filling a long text value (>80 chars — clearly email body content,
+      // not a short email address or subject line), verify the text actually
+      // landed in the page.  Gmail reply/compose bodies are contenteditable divs;
+      // a plain `fill` on the wrong ref silently succeeds (exit 0) but leaves the
+      // body empty.  If the text is not found in the page, override outcome to
+      // ok=false with a descriptive error so the existing repair→deriveRule
+      // pipeline fires and LEARNS the correct approach (keyboard.type / run-code).
+      // After the first repair the rule is stored in context_rules for gmail.agent
+      // and injected into every future plan, so this verification never fires again.
+      if (step.action === 'fill' && typeof step.text === 'string' && step.text.length > 80) {
+        try {
+          const verifySnap = await browserAct({
+            action: 'run-code',
+            code: `
+              const needle = ${JSON.stringify(step.text.slice(0, 40))};
+              const bodies = [...document.querySelectorAll('[contenteditable="true"], textarea')];
+              const found = bodies.some(el => (el.innerText || el.value || '').includes(needle));
+              return found ? 'ok' : 'empty';
+            `,
+            sessionId, headed, timeoutMs,
+          });
+          if (verifySnap.ok && verifySnap.result === 'empty') {
+            logger.warn(`[playwright.agent] post-fill body verification: text not found in contenteditable/textarea — triggering repair to learn correct approach`);
+            outcome = { ok: false, error: 'fill succeeded but body text not found in page — element is likely a contenteditable div; use run-code with page.keyboard.type() or page.getByRole("textbox").fill() instead of a plain fill step' };
+          }
+        } catch (_) { /* verification failure is non-fatal — proceed */ }
+      }
 
       // ── Auto re-snapshot after DOM-mutating actions ──────────────────────
       // Keeps snapshotCache live so subsequent fill/click use fresh refs.
@@ -477,10 +594,14 @@ async function playwrightAgent(args) {
           const postRefCount   = countRefs(currentSnapshot);
           const maxRefs        = Math.max(preRefCount, postRefCount, 1);
           const changeFraction = Math.abs(postRefCount - preRefCount) / maxRefs;
-          logger.info(`[playwright.agent] auto-resnapshot after ${step.action}: refs ${preRefCount}→${postRefCount} (${(changeFraction * 100).toFixed(0)}% change)`);
+          const absoluteDelta  = postRefCount - preRefCount;
+          logger.info(`[playwright.agent] auto-resnapshot after ${step.action}: refs ${preRefCount}→${postRefCount} (${(changeFraction * 100).toFixed(0)}% change, +${absoluteDelta} absolute)`);
 
           const remaining = plan.slice(stepIndex + 1);
-          const significantChange = changeFraction >= 0.30 && (preRefCount > 0 || postRefCount > 0);
+          // Trigger re-plan if ≥30% of refs changed OR ≥20 new refs appeared in absolute terms.
+          // The absolute check catches large pages (e.g. Gmail inbox = 993 refs) where opening
+          // the Compose modal adds ~75 refs — only 7% change but clearly a new modal overlay.
+          const significantChange = (changeFraction >= 0.30 || absoluteDelta >= 20) && (preRefCount > 0 || postRefCount > 0);
 
           if (significantChange && remaining.length > 0) {
             logger.info(`[playwright.agent] structural DOM change — re-planning ${remaining.length} remaining step(s) with fresh refs`);
@@ -492,8 +613,9 @@ async function playwrightAgent(args) {
                   `COMPLETED_STEPS: ${JSON.stringify(plan.slice(0, stepIndex + 1))}`,
                   `STALE_REMAINING_PLAN: ${JSON.stringify(remaining)}`,
                   ``,
-                  `FRESH_SNAPSHOT:`,
-                  trimSnapshot(currentSnapshot),
+                  `FRESH_SNAPSHOT (interactive elements only — full ${countRefs(currentSnapshot)}-ref page):`,
+                  extractInteractiveRefs(currentSnapshot),
+                  learnedRulesBlock,
                 ].join('\n') },
               ], { temperature: 0.1, maxTokens: 1024, responseTimeoutMs: 20000 });
               const replanParsed = parseJson(replanRaw);
@@ -596,6 +718,9 @@ async function playwrightAgent(args) {
   // If plan ended without an explicit return step, use the last run-code result
   if (finalResult === null && lastRunCodeResult !== null) {
     finalResult = lastRunCodeResult;
+  }
+  if (finalResult === null && lastGetPageTextResult !== null) {
+    finalResult = lastGetPageTextResult;
   }
 
   // ── Done ───────────────────────────────────────────────────────────────────

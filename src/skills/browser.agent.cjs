@@ -154,6 +154,88 @@ const KNOWN_BROWSER_SERVICES = {
   perplexity:     { startUrl: 'https://www.perplexity.ai/settings/api',          authSuccessPattern: 'perplexity.ai/',               isOAuth: false },
   fireworks:      { startUrl: 'https://fireworks.ai/account/api-keys',           authSuccessPattern: 'fireworks.ai/',                isOAuth: false },
   deepseek:       { startUrl: 'https://platform.deepseek.com/api_keys',          authSuccessPattern: 'platform.deepseek.com/',       isOAuth: false },
+  // ── AI consumer apps ─────────────────────────────────────────────────────────────────────────────────
+  // All anonymous-first (isOAuth: false). Only trigger waitForAuth if a login wall appears.
+  // IMPORTANT: these are CONSUMER WEBSITES — NOT the developer API consoles above in // ── AI platforms ──
+  // AI Chat
+  chatgpt:        { startUrl: 'https://chatgpt.com/',                             authSuccessPattern: 'chatgpt.com',                  isOAuth: false },
+  geminiai:       { startUrl: 'https://gemini.google.com/app',                   authSuccessPattern: 'gemini.google.com',             isOAuth: false },
+  gemini:         { startUrl: 'https://gemini.google.com/app',                   authSuccessPattern: 'gemini.google.com',             isOAuth: false },
+  googleai:       { startUrl: 'https://gemini.google.com/app',                   authSuccessPattern: 'gemini.google.com',             isOAuth: false },
+  claude:         { startUrl: 'https://claude.ai/new',                           authSuccessPattern: 'claude.ai',                    isOAuth: false },
+  perplexitychat: { startUrl: 'https://www.perplexity.ai/',                      authSuccessPattern: 'perplexity.ai',                isOAuth: false },
+  grok:           { startUrl: 'https://grok.com/',                               authSuccessPattern: 'grok.com',                     isOAuth: false },
+  copilotmsft:    { startUrl: 'https://copilot.microsoft.com/',                  authSuccessPattern: 'copilot.microsoft.com',        isOAuth: false },
+  deepseekchat:   { startUrl: 'https://chat.deepseek.com/',                      authSuccessPattern: 'chat.deepseek.com',            isOAuth: false },
+  mistralchat:    { startUrl: 'https://chat.mistral.ai/',                        authSuccessPattern: 'chat.mistral.ai',              isOAuth: false },
+  qwen:           { startUrl: 'https://chat.qwenlm.ai/',                         authSuccessPattern: 'chat.qwenlm.ai',               isOAuth: false },
+  // AI Image & Art
+  midjourney:     { startUrl: 'https://www.midjourney.com/',                     authSuccessPattern: 'midjourney.com',               isOAuth: false },
+  ideogram:       { startUrl: 'https://ideogram.ai/',                            authSuccessPattern: 'ideogram.ai',                  isOAuth: false },
+  stablechat:     { startUrl: 'https://dreamstudio.ai/generate',                 authSuccessPattern: 'dreamstudio.ai',               isOAuth: false },
+  firefly:        { startUrl: 'https://firefly.adobe.com/',                      authSuccessPattern: 'firefly.adobe.com',            isOAuth: false },
+  playground:     { startUrl: 'https://playground.com/',                         authSuccessPattern: 'playground.com',               isOAuth: false },
+  imagenfx:       { startUrl: 'https://labs.google/fx/tools/image-fx',           authSuccessPattern: 'labs.google',                  isOAuth: false },
+  craiyon:        { startUrl: 'https://www.craiyon.com/',                        authSuccessPattern: 'craiyon.com',                  isOAuth: false },
+  nightcafe:      { startUrl: 'https://creator.nightcafe.studio/',               authSuccessPattern: 'nightcafe.studio',             isOAuth: false },
+  leonardoai:     { startUrl: 'https://app.leonardo.ai/',                        authSuccessPattern: 'app.leonardo.ai',              isOAuth: false },
+  krea:           { startUrl: 'https://krea.ai/',                                authSuccessPattern: 'krea.ai',                      isOAuth: false },
+  // AI Music
+  suno:           { startUrl: 'https://suno.com/',                               authSuccessPattern: 'suno.com',                     isOAuth: false },
+  udio:           { startUrl: 'https://www.udio.com/',                           authSuccessPattern: 'udio.com',                     isOAuth: false },
+  soundraw:       { startUrl: 'https://soundraw.io/',                            authSuccessPattern: 'soundraw.io',                  isOAuth: false },
+  boomy:          { startUrl: 'https://boomy.com/',                              authSuccessPattern: 'boomy.com',                    isOAuth: false },
+  mubert:         { startUrl: 'https://mubert.com/',                             authSuccessPattern: 'mubert.com',                   isOAuth: false },
+  aiva:           { startUrl: 'https://www.aiva.ai/',                            authSuccessPattern: 'aiva.ai',                      isOAuth: false },
+  beatoven:       { startUrl: 'https://www.beatoven.ai/',                        authSuccessPattern: 'beatoven.ai',                  isOAuth: false },
+  stableaudio:    { startUrl: 'https://stableaudio.com/',                        authSuccessPattern: 'stableaudio.com',              isOAuth: false },
+  // AI Video
+  runwayml:       { startUrl: 'https://app.runwayml.com/',                       authSuccessPattern: 'runwayml.com',                 isOAuth: false },
+  pikaai:         { startUrl: 'https://pika.art/',                               authSuccessPattern: 'pika.art',                     isOAuth: false },
+  kling:          { startUrl: 'https://klingai.com/',                            authSuccessPattern: 'klingai.com',                  isOAuth: false },
+  heygen:         { startUrl: 'https://app.heygen.com/',                         authSuccessPattern: 'heygen.com',                   isOAuth: false },
+  synthesia:      { startUrl: 'https://app.synthesia.io/',                       authSuccessPattern: 'synthesia.io',                 isOAuth: false },
+  sora:           { startUrl: 'https://sora.com/',                               authSuccessPattern: 'sora.com',                     isOAuth: false },
+  lumai:          { startUrl: 'https://lumalabs.ai/dream-machine',               authSuccessPattern: 'lumalabs.ai',                  isOAuth: false },
+  kaiber:         { startUrl: 'https://kaiber.ai/',                              authSuccessPattern: 'kaiber.ai',                    isOAuth: false },
+  invideio:       { startUrl: 'https://invideo.io/',                             authSuccessPattern: 'invideo.io',                   isOAuth: false },
+  pictory:        { startUrl: 'https://pictory.ai/',                             authSuccessPattern: 'pictory.ai',                   isOAuth: false },
+  descript:       { startUrl: 'https://web.descript.com/',                       authSuccessPattern: 'descript.com',                 isOAuth: false },
+  // AI Writing
+  jasperai:       { startUrl: 'https://app.jasper.ai/',                          authSuccessPattern: 'app.jasper.ai',                isOAuth: false },
+  copyai:         { startUrl: 'https://app.copy.ai/',                            authSuccessPattern: 'app.copy.ai',                  isOAuth: false },
+  writesonic:     { startUrl: 'https://writesonic.com/',                         authSuccessPattern: 'writesonic.com',               isOAuth: false },
+  rytr:           { startUrl: 'https://rytr.me/',                                authSuccessPattern: 'rytr.me',                      isOAuth: false },
+  anyword:        { startUrl: 'https://app.anyword.com/',                        authSuccessPattern: 'app.anyword.com',              isOAuth: false },
+  sudowrite:      { startUrl: 'https://sudowrite.com/',                          authSuccessPattern: 'sudowrite.com',                isOAuth: false },
+  quillbot:       { startUrl: 'https://quillbot.com/',                           authSuccessPattern: 'quillbot.com',                 isOAuth: false },
+  grammarly:      { startUrl: 'https://app.grammarly.com/',                      authSuccessPattern: 'app.grammarly.com',            isOAuth: false },
+  // AI Comics & Books
+  comicai:        { startUrl: 'https://comicai.com/',                            authSuccessPattern: 'comicai.com',                  isOAuth: false },
+  novelai:        { startUrl: 'https://novelai.net/',                            authSuccessPattern: 'novelai.net',                  isOAuth: false },
+  webtooncanvas:  { startUrl: 'https://www.webtoons.com/en/canvas',              authSuccessPattern: 'webtoons.com',                 isOAuth: false },
+  pixton:         { startUrl: 'https://pixton.com/',                             authSuccessPattern: 'pixton.com',                   isOAuth: false },
+  // AI Science & Research
+  wolframalpha:   { startUrl: 'https://www.wolframalpha.com/',                   authSuccessPattern: 'wolframalpha.com',             isOAuth: false },
+  elicit:         { startUrl: 'https://elicit.com/',                             authSuccessPattern: 'elicit.com',                   isOAuth: false },
+  consensus:      { startUrl: 'https://consensus.app/',                          authSuccessPattern: 'consensus.app',                isOAuth: false },
+  semanticscholar:{ startUrl: 'https://www.semanticscholar.org/',                authSuccessPattern: 'semanticscholar.org',          isOAuth: false },
+  scite:          { startUrl: 'https://scite.ai/',                               authSuccessPattern: 'scite.ai',                     isOAuth: false },
+  connectedpapers:{ startUrl: 'https://www.connectedpapers.com/',                authSuccessPattern: 'connectedpapers.com',          isOAuth: false },
+  researchrabbit: { startUrl: 'https://www.researchrabbit.ai/',                  authSuccessPattern: 'researchrabbit.ai',            isOAuth: false },
+  litmaps:        { startUrl: 'https://www.litmaps.com/',                        authSuccessPattern: 'litmaps.com',                  isOAuth: false },
+  scholarcy:      { startUrl: 'https://app.scholarcy.com/',                      authSuccessPattern: 'app.scholarcy.com',            isOAuth: false },
+  explainpaper:   { startUrl: 'https://www.explainpaper.com/',                   authSuccessPattern: 'explainpaper.com',             isOAuth: false },
+  chatpdf:        { startUrl: 'https://www.chatpdf.com/',                        authSuccessPattern: 'chatpdf.com',                  isOAuth: false },
+  humata:         { startUrl: 'https://www.humata.ai/',                          authSuccessPattern: 'humata.ai',                    isOAuth: false },
+  scispace:       { startUrl: 'https://typeset.io/',                             authSuccessPattern: 'typeset.io',                   isOAuth: false },
+  paperpal:       { startUrl: 'https://paperpal.com/',                           authSuccessPattern: 'paperpal.com',                 isOAuth: false },
+  notebooklm:     { startUrl: 'https://notebooklm.google/',                      authSuccessPattern: 'notebooklm.google',            isOAuth: false },
+  undermind:      { startUrl: 'https://www.undermind.ai/',                       authSuccessPattern: 'undermind.ai',                 isOAuth: false },
+  openalex:       { startUrl: 'https://openalex.org/',                           authSuccessPattern: 'openalex.org',                 isOAuth: false },
+  jenni:          { startUrl: 'https://jenni.ai/',                               authSuccessPattern: 'jenni.ai',                     isOAuth: false },
+  askyourpdf:     { startUrl: 'https://askyourpdf.com/',                         authSuccessPattern: 'askyourpdf.com',               isOAuth: false },
+  inciteful:      { startUrl: 'https://inciteful.xyz/',                          authSuccessPattern: 'inciteful.xyz',                isOAuth: false },
   // ── Email delivery APIs ──────────────────────────────────────────────────────────────────────────────
   sendgrid:       { startUrl: 'https://app.sendgrid.com/settings/api_keys',      authSuccessPattern: 'app.sendgrid.com',             isOAuth: false },
   mailgun:        { startUrl: 'https://app.mailgun.com/settings/api_security',   authSuccessPattern: 'app.mailgun.com',              isOAuth: false },
@@ -1219,7 +1301,7 @@ function callSkill(skillName, args, timeoutMs = 120000) {
   });
 }
 
-async function actionRun({ agentId, task, context, _progressCallbackUrl, _stepIndex }) {
+async function actionRun({ agentId, task, context, requiresAuth, _progressCallbackUrl, _stepIndex }) {
   if (!agentId) return { ok: false, error: 'agentId is required' };
   if (!task)    return { ok: false, error: 'task is required' };
 
@@ -1391,53 +1473,62 @@ async function actionRun({ agentId, task, context, _progressCallbackUrl, _stepIn
   // safely under macOS's 104-char Unix socket limit.
   const sessionId = profile;
 
-  // Step 1: ensure auth session exists
-  let authResult;
-  try {
-    authResult = await callBrowserAct({
-      action: 'waitForAuth',
-      sessionId,
-      profile,
-      url: authTarget,
-      authSuccessUrl: authSuccessPattern,
-      timeoutMs: 2 * 60 * 1000,
-      _progressCallbackUrl,
-    }, 3 * 60 * 1000);
-  } catch (err) {
-    const failureNote = `[${new Date().toISOString()}] waitForAuth threw: ${err.message} | url=${startUrl} | task=${task}`;
-    logger.warn(`[browser.agent] run: waitForAuth threw — triggering self-heal for ${agentId}`);
-    (async () => {
-      try {
-        await actionRecordFailure({ id: agentId, failureEntry: failureNote });
-        const healResult = await actionValidateAgent({ id: agentId });
-        logger.info(`[browser.agent] self-heal (throw): validate_agent verdict=${healResult?.verdict} for ${agentId}`);
-      } catch (healErr) {
-        logger.warn(`[browser.agent] self-heal error: ${healErr.message}`);
-      }
-    })();
-    return { ok: false, error: `waitForAuth failed: ${err.message}` };
-  }
+  const _svcKey          = (existing.service || agentId.replace(/\.agent$/, '')).toLowerCase().replace(/[^a-z0-9]/g, '');
+  const _svcInfo         = lookupBrowserService(_svcKey);
+  const _skipInitialAuth = _svcInfo?.isOAuth === false && !requiresAuth;
 
-  if (!authResult?.ok) {
-    const failureNote = `[${new Date().toISOString()}] waitForAuth failed: ${authResult?.error || 'timeout'} | url=${startUrl} | task=${task}`;
-    logger.warn(`[browser.agent] run: auth failed — recording failure + triggering self-heal for ${agentId}`);
-    (async () => {
-      try {
-        await actionRecordFailure({ id: agentId, failureEntry: failureNote });
-        const healResult = await actionValidateAgent({ id: agentId });
-        logger.info(`[browser.agent] self-heal: validate_agent verdict=${healResult?.verdict} for ${agentId}`);
-      } catch (healErr) {
-        logger.warn(`[browser.agent] self-heal error: ${healErr.message}`);
-      }
-    })();
-    return { ok: false, error: `Auth failed for ${agentId}: ${authResult?.error}` };
+  // Step 1: ensure auth session exists (skipped for anonymous-first services unless caller explicitly set requiresAuth=true)
+  if (!_skipInitialAuth) {
+    let authResult;
+    try {
+      authResult = await callBrowserAct({
+        action: 'waitForAuth',
+        sessionId,
+        profile,
+        url: authTarget,
+        authSuccessUrl: authSuccessPattern,
+        timeoutMs: 2 * 60 * 1000,
+        _progressCallbackUrl,
+      }, 3 * 60 * 1000);
+    } catch (err) {
+      const failureNote = `[${new Date().toISOString()}] waitForAuth threw: ${err.message} | url=${startUrl} | task=${task}`;
+      logger.warn(`[browser.agent] run: waitForAuth threw — triggering self-heal for ${agentId}`);
+      (async () => {
+        try {
+          await actionRecordFailure({ id: agentId, failureEntry: failureNote });
+          const healResult = await actionValidateAgent({ id: agentId });
+          logger.info(`[browser.agent] self-heal (throw): validate_agent verdict=${healResult?.verdict} for ${agentId}`);
+        } catch (healErr) {
+          logger.warn(`[browser.agent] self-heal error: ${healErr.message}`);
+        }
+      })();
+      return { ok: false, error: `waitForAuth failed: ${err.message}` };
+    }
+
+    if (!authResult?.ok) {
+      const failureNote = `[${new Date().toISOString()}] waitForAuth failed: ${authResult?.error || 'timeout'} | url=${startUrl} | task=${task}`;
+      logger.warn(`[browser.agent] run: auth failed — recording failure + triggering self-heal for ${agentId}`);
+      (async () => {
+        try {
+          await actionRecordFailure({ id: agentId, failureEntry: failureNote });
+          const healResult = await actionValidateAgent({ id: agentId });
+          logger.info(`[browser.agent] self-heal: validate_agent verdict=${healResult?.verdict} for ${agentId}`);
+        } catch (healErr) {
+          logger.warn(`[browser.agent] self-heal error: ${healErr.message}`);
+        }
+      })();
+      return { ok: false, error: `Auth failed for ${agentId}: ${authResult?.error}` };
+    }
+  } else {
+    logger.info(`[browser.agent] run: skipping waitForAuth for anonymous-first service ${agentId} (isOAuth=false, requiresAuth=${!!requiresAuth})`);
   }
 
   // Step 2: delegate to playwright.agent with the authenticated session
   logger.info(`[browser.agent] run: auth ok — delegating to playwright.agent for "${task}"`);
   try {
     const agentResult = await callSkill('playwright.agent', {
-      goal: `${task}\n\nAgent context: ${existing.descriptor ? existing.descriptor.slice(0, 800) : ''}`,
+      goal: task,
+      agentContext: existing.descriptor ? existing.descriptor.slice(0, 800) : undefined,
       url: startUrl,
       sessionId,
       agentId,

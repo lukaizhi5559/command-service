@@ -432,7 +432,7 @@ async function browserAct(args) {
       ok:            res.ok,
       action,
       sessionId,
-      result:        res.stdout.trim() || undefined,
+      result:        (res.stdout || '').trim() || undefined,
       stdout:        res.stdout,
       executionTime: Date.now() - start,
       error:         res.ok ? undefined : res.error || res.stderr?.trim(),
@@ -492,7 +492,7 @@ async function browserAct(args) {
           action,
           sessionId,
           url:           retryRes.ok ? url : undefined,
-          result:        retryRes.stdout.trim() || undefined,
+          result:        (retryRes.stdout || '').trim() || undefined,
           executionTime: Date.now() - start,
           error:         retryRes.ok ? undefined : retryRes.error || retryRes.stderr?.trim(),
         };
@@ -503,7 +503,7 @@ async function browserAct(args) {
         action,
         sessionId,
         url:           res.ok ? url : undefined,
-        result:        res.stdout.trim() || undefined,
+        result:        (res.stdout || '').trim() || undefined,
         executionTime: Date.now() - start,
         error:         res.ok ? undefined : res.error || res.stderr?.trim(),
       };
@@ -620,7 +620,7 @@ async function browserAct(args) {
         logger.warn(`[browser.act] fill ${fillTarget}: hard error in stdout — ${errMsg}`);
         return {
           ok: false, action, sessionId,
-          result: fillRes.stdout.trim(),
+          result: (fillRes.stdout || '').trim(),
           stdout: fillRes.stdout,
           executionTime: Date.now() - start,
           error: errMsg,
@@ -644,7 +644,7 @@ async function browserAct(args) {
           lastFilledTarget.set(sessionId, { target: selector, ref: null });
           return {
             ok: true, action, sessionId,
-            result: cssRes.stdout.trim() || undefined,
+            result: (cssRes.stdout || '').trim() || undefined,
             stdout: cssRes.stdout,
             executionTime: Date.now() - start,
           };
@@ -659,7 +659,7 @@ async function browserAct(args) {
         return {
           ok: typeRes.ok,
           action, sessionId,
-          result: typeRes.stdout.trim() || undefined,
+          result: (typeRes.stdout || '').trim() || undefined,
           stdout: typeRes.stdout,
           executionTime: Date.now() - start,
           error: typeRes.ok ? undefined : typeRes.error || typeRes.stderr?.trim(),
@@ -671,7 +671,7 @@ async function browserAct(args) {
         ok: fillRes.ok,
         action,
         sessionId,
-        result: fillRes.stdout.trim() || undefined,
+        result: (fillRes.stdout || '').trim() || undefined,
         stdout: fillRes.stdout,
         executionTime: Date.now() - start,
         error: fillRes.ok ? undefined : fillRes.error || fillRes.stderr?.trim(),
@@ -746,7 +746,7 @@ async function browserAct(args) {
           ok:            pressRes.ok || navigationKill,
           action,
           sessionId,
-          result:        pressRes.stdout.trim() || undefined,
+          result:        (pressRes.stdout || '').trim() || undefined,
           stdout:        pressRes.stdout,
           executionTime: Date.now() - start,
           error:         (pressRes.ok || navigationKill) ? undefined : pressRes.error || pressRes.stderr?.trim(),
@@ -818,13 +818,13 @@ async function browserAct(args) {
     case 'getText':
     case 'getPageText': {
       // Eval expression: wait for readyState complete, then grab innerText (fall back to textContent).
-      // Truncated to 50k to avoid timeout on large pages. Wrapping in an IIFE avoids
+      // Truncated to 100k to avoid timeout on large pages. Wrapping in an IIFE avoids
       // playwright-cli treating multi-statement code as a syntax error.
-      const evalExpr = '(function(){var b=document.body;return b?(b.innerText||b.textContent||"").slice(0,50000):"";})()';
-      const res = await cliRun([...S, 'eval', evalExpr], Math.min(timeoutMs, 12000));
+      const evalExpr = '(function(){var b=document.body;return b?(b.innerText||b.textContent||"").slice(0,100000):"";})()';
+      const res = await cliRun([...S, 'eval', evalExpr], Math.min(timeoutMs, 20000));
       // playwright-cli eval wraps output as: ### Result\n"<value>"\n### Ran Playwright code...
       // Extract just the bare value from the ### Result block
-      const rawOut = res.stdout.trim();
+      const rawOut = (res.stdout || '').trim();
       const resultMatch = rawOut.match(/###\s*Result\s*\n([\s\S]*?)(?=###|$)/i);
       const pageText = resultMatch
         ? resultMatch[1].trim().replace(/^"|"$/g, '')
@@ -1030,7 +1030,7 @@ async function browserAct(args) {
         const r = await cliRun([...S, 'eval', 'document.body.innerText.slice(0,50000)'], 8000);
         // playwright-cli eval wraps output as: ### Result\n"<value>"\n### Ran Playwright code...
         // Extract just the bare innerText value
-        const rawOut = r.stdout.trim();
+        const rawOut = (r.stdout || '').trim();
         const resultMatch = rawOut.match(/###\s*Result\s*\n([\s\S]*?)(?=###|$)/i);
         const cur = resultMatch
           ? resultMatch[1].trim().replace(/^"|"$/g, '')
@@ -1084,7 +1084,7 @@ async function browserAct(args) {
       let finalText = prev;
       if (!finalText) {
         const lastRes = await cliRun([...S, 'eval', 'document.body.innerText.slice(0,50000)'], 8000);
-        const lastRaw = lastRes.stdout.trim();
+        const lastRaw = (lastRes.stdout || '').trim();
         const lastMatch = lastRaw.match(/###\s*Result\s*\n([\s\S]*?)(?=###|$)/i);
         finalText = lastMatch ? lastMatch[1].trim().replace(/^"|"$/g, '') : lastRaw;
       }
@@ -1154,22 +1154,11 @@ async function browserAct(args) {
           // JS string literal becomes the two chars \ and n in stdout; combined eval
           // separator indexOf always returns -1 and currentUrl silently stays empty.
           const urlRes = await cliRun([...S, 'eval', 'location.href'], 5000);
-          const urlRaw = urlRes.stdout.trim();
+          const urlRaw = (urlRes.stdout || '').trim();
           const urlMatch = urlRaw.match(/###\s*Result\s*\n([\s\S]*?)(?=###|$)/i);
           const currentUrl = (urlMatch ? urlMatch[1].trim().replace(/^"|"$/g, '') : urlRaw).trim();
 
           if (!currentUrl) continue;
-
-          // Unblock: playwright-cli returns an error string (not a URL) when a dialog is pending.
-          // The "browser_evaluate does not handle the modal state" message repeats every poll and
-          // causes the limbo logic to bounce between sign-in and authSuccessUrl indefinitely.
-          // Fix: dismiss the dialog immediately and re-poll for the real URL.
-          if (/does not handle the modal state|beforeunload dialog/i.test(currentUrl)) {
-            logger.info(`[browser.act] waitForAuth: modal dialog blocking eval on session=${sessionId} — dismissing`);
-            await cliRun([...S, 'dialog-dismiss'], 5000).catch(() => {});
-            lastLimboUrl = null; // reset limbo guard so we don't get stuck after dismiss
-            continue;
-          }
 
           const currentHost     = getHost(currentUrl);
           const urlWithoutQuery = currentUrl.split('?')[0];
@@ -1214,7 +1203,7 @@ async function browserAct(args) {
             // Spot-check for error signals every 5th poll (wrong password, account locked, etc.)
             if (authWallDetections % 5 === 0) {
               const errRes = await cliRun([...S, 'eval', 'document.body.innerText.slice(0,600)'], 5000);
-              const errRaw = errRes.stdout.trim();
+              const errRaw = (errRes.stdout || '').trim();
               const errMatch = errRaw.match(/###\s*Result\s*\n([\s\S]*?)(?=###|$)/i);
               const errText = (errMatch ? errMatch[1].trim().replace(/^"|"$/g, '') : errRaw).trim();
               const errorSignals = /wrong password|incorrect password|invalid credentials|account locked|too many attempts|verify it's you/i;
@@ -1265,7 +1254,7 @@ async function browserAct(args) {
         action,
         sessionId,
         result: {
-          url:      urlRes.stdout.trim() || '',
+          url:      (urlRes.stdout || '').trim() || '',
           elements,
           snapshot: snapRes.stdout,
         },
@@ -1301,7 +1290,7 @@ async function browserAct(args) {
           ok: gotoRaw.ok,
           action,
           sessionId,
-          result: listRaw.stdout.trim() || undefined,
+          result: (listRaw.stdout || '').trim() || undefined,
           stdout: gotoRaw.stdout || listRaw.stdout,
           executionTime: Date.now() - start,
           error: gotoRaw.ok ? undefined : gotoRaw.error || gotoRaw.stderr?.trim(),
@@ -1311,7 +1300,7 @@ async function browserAct(args) {
         ok: true,
         action,
         sessionId,
-        result: tabNewRaw.stdout.trim() || undefined,
+        result: (tabNewRaw.stdout || '').trim() || undefined,
         stdout: tabNewRaw.stdout,
         executionTime: Date.now() - start,
       };
