@@ -50,6 +50,71 @@ const { askWithMessages } = require('../skill-helpers/skill-llm.cjs');
 const skillDb = require('../skill-helpers/skill-db.cjs');
 
 // ---------------------------------------------------------------------------
+// Shared action schema constants — injected into multiple prompts so all LLMs
+// use identical field names (selector not ref, etc.)
+// ---------------------------------------------------------------------------
+
+// Full action menu — used by PLAN_SYSTEM_PROMPT only.
+const BROWSER_ACTIONS_FULL = `Available actions:
+  navigate        { url }
+  click           { selector }         — use snapshot ref (e12) when visible; label otherwise
+  dblclick        { selector }
+  fill            { selector, text }   — for <input> / <textarea> fields
+  type            { text }             — types into currently focused element (contenteditable, e.g. Gmail body)
+  press           { key }              — "Enter", "Tab", "Escape", "Meta+a", etc.
+  select          { selector, value }  — dropdown option
+  check           { selector }
+  uncheck         { selector }
+  hover           { selector }
+  scroll          { direction, distance }
+  drag            { selector, targetSelector }
+  waitForSelector { selector }
+  waitForContent  { text }
+  getPageText     {}                   — returns ALL visible text from the page (body.innerText, up to 50k chars). Use this as the universal, site-agnostic way to read any page. Works on ChatGPT, Perplexity, Claude, Grok, and any other site without knowing site-specific CSS. Result auto-captured as task output.
+  evaluate        { text: "<JS expression>" }  — single-expression JS returning a primitive (e.g. document.title)
+  run-code        { code: "async page => { return await page.evaluate(() => { ...browser JS... }); }" }
+                  — Node.js VM with real Playwright page object. Use page.evaluate() to reach browser DOM.
+                  ⚠ require() does NOT exist. Use dynamic import: const { fn } = await import('module')
+                  ⚠ NEVER read files inside run-code — file content is already in the task as [DATA FROM PRIOR STEP].
+                  Gmail inbox example (sender=.yX span/.zF  subject=.bog/.bqe  snippet=.y2  time=.xW span):
+                  { "action": "run-code", "code": "async page => { return await page.evaluate(() => { const rows = Array.from(document.querySelectorAll('tr.zA')).slice(0,5); if(!rows.length) return 'No emails found'; return rows.map((r,i)=>{ const s=r.querySelector('.yX span,.zF')?.innerText||''; const sub=r.querySelector('.bog,.bqe')?.innerText||''; const snip=r.querySelector('.y2')?.innerText||''; const t=r.querySelector('.xW span')?.innerText||''; return 'Email '+(i+1)+': From='+s+' | Subject='+sub+' | Preview='+snip+' | Time='+t; }).join('\\n'); }); }" }
+  screenshot      { filePath }
+  snapshot        {}                   — re-read the page (ONLY when page changes significantly)
+  return          { data: "<string>" } — MUST be LAST step; plain string output, max 2000 chars.
+  dialog-accept   { prompt? }
+  dialog-dismiss  {}`;
+
+// Interactive-only action menu — used by ORIENTATION_SYSTEM_PROMPT.
+// Excludes data-extraction actions (run-code, getPageText, evaluate, screenshot,
+// snapshot, return, waitForSelector, waitForContent) that are never needed to clear
+// an interstitial, and would confuse the orientation LLM into generating data steps.
+const BROWSER_ACTIONS_INTERACT = `Available actions (interstitial-clearing only):
+  navigate        { url }              — LAST RESORT only; STAY ON SERVICE domain
+  click           { selector }         — use snapshot ref (e12); MUST use "selector", NEVER "ref"
+  dblclick        { selector }
+  fill            { selector, text }   — for <input> / <textarea> fields
+  type            { text }             — types into currently focused element
+  press           { key }              — "Escape", "Enter", "Tab"
+  select          { selector, value }  — dropdown option (e.g. onboarding "How will you use this?")
+  check           { selector }         — tick a checkbox (e.g. terms agreement)
+  uncheck         { selector }
+  hover           { selector }
+  scroll          { direction, distance }
+  drag            { selector, targetSelector }
+  dialog-accept   { prompt? }
+  dialog-dismiss  {}`;
+
+// Step format rules — shared by PLAN and ORIENTATION so both LLMs use correct field names.
+const STEP_FORMAT_CRITICAL = `CRITICAL: each step MUST use this exact format: { "action": "<name>", ...args }
+CORRECT:  { "action": "navigate", "url": "https://mail.google.com/mail/u/0/#inbox" }
+CORRECT:  { "action": "click", "selector": "e24" }  — MUST use "selector", NEVER "ref" or "element"
+CORRECT:  { "action": "fill", "selector": "e12", "text": "user@example.com" }
+CORRECT:  { "action": "press", "key": "Escape" }
+WRONG:    { "navigate": { "url": "..." } }
+WRONG:    { "click": "Compose" }
+WRONG:    { "action": "click", "ref": "e24" }        — "ref" is NOT a valid field`;
+
+// ---------------------------------------------------------------------------
 // Phase 1 prompt — sent once, LLM returns the full step plan
 // ---------------------------------------------------------------------------
 const PLAN_SYSTEM_PROMPT = `You are a browser automation expert controlling a real Chrome browser via playwright-cli.
@@ -88,43 +153,12 @@ Respond with EXACTLY ONE JSON object (no markdown fences, no explanation):
   ]
 }
 
-Available actions:
-  navigate        { url }
-  click           { selector }         — use snapshot ref (e12) when visible; label otherwise
-  dblclick        { selector }
-  fill            { selector, text }   — for <input> / <textarea> fields
-  type            { text }             — types into currently focused element (contenteditable, e.g. Gmail body)
-  press           { key }              — "Enter", "Tab", "Escape", "Meta+a", etc.
-  select          { selector, value }  — dropdown option
-  check           { selector }
-  uncheck         { selector }
-  hover           { selector }
-  scroll          { direction, distance }
-  drag            { selector, targetSelector }
-  waitForSelector { selector }
-  waitForContent  { text }
-  getPageText     {}                   — returns ALL visible text from the page (body.innerText, up to 50k chars). Use this as the universal, site-agnostic way to read any page. Works on ChatGPT, Perplexity, Claude, Grok, and any other site without knowing site-specific CSS. Result auto-captured as task output.
-  evaluate        { text: "<JS expression>" }  — single-expression JS returning a primitive (e.g. document.title)
-  run-code        { code: "async page => { return await page.evaluate(() => { ...browser JS... }); }" }
-                  — Node.js VM with real Playwright page object. Use page.evaluate() to reach browser DOM.
-                  ⚠ require() does NOT exist. Use dynamic import: const { fn } = await import('module')
-                  ⚠ NEVER read files inside run-code — file content is already in the task as [DATA FROM PRIOR STEP].
-                  Gmail inbox example (sender=.yX span/.zF  subject=.bog/.bqe  snippet=.y2  time=.xW span):
-                  { "action": "run-code", "code": "async page => { return await page.evaluate(() => { const rows = Array.from(document.querySelectorAll('tr.zA')).slice(0,5); if(!rows.length) return 'No emails found'; return rows.map((r,i)=>{ const s=r.querySelector('.yX span,.zF')?.innerText||''; const sub=r.querySelector('.bog,.bqe')?.innerText||''; const snip=r.querySelector('.y2')?.innerText||''; const t=r.querySelector('.xW span')?.innerText||''; return 'Email '+(i+1)+': From='+s+' | Subject='+sub+' | Preview='+snip+' | Time='+t; }).join('\\n'); }); }" }
-  screenshot      { filePath }
-  snapshot        {}                   — re-read the page (ONLY when page changes significantly)
-  return          { data: "<string>" } — MUST be LAST step; plain string output, max 2000 chars.
-  dialog-accept   { prompt? }
-  dialog-dismiss  {}
+${BROWSER_ACTIONS_FULL}
 
-CRITICAL: each step MUST use this exact format: { "action": "<name>", ...args }
-CORRECT:  { "action": "navigate", "url": "https://mail.google.com/mail/u/0/#inbox" }
-CORRECT:  { "action": "click", "selector": "e24" }
-CORRECT:  { "action": "fill", "selector": "e12", "text": "user@example.com" }
-WRONG:    { "navigate": { "url": "..." } }
-WRONG:    { "click": "Compose" }
+${STEP_FORMAT_CRITICAL}
 
 Rules:
+- PAGE ORIENTATION RULE: Before writing any task steps, assess the snapshot — ask "Is this page where I can accomplish the goal?" If blocked by an interstitial (onboarding, cookie wall, paywall, 404, setup screen, or anything that prevents completing the task), FIRST ask: "Is there a clickable element in this snapshot that moves me TOWARD the goal?" — e.g. 'Continue', 'Skip', 'Get started', 'Go to my workspace', 'Accept', 'Dismiss', 'Enter workspace'. If YES, your FIRST step MUST be a click on that element, immediately followed by { "action": "snapshot" }. Only use navigate as a last resort when no bypass element exists in the snapshot. STAY ON SERVICE: any navigate MUST stay within the same service domain — never navigate to Google or external sites.
 - Use element refs (e12, e83) from the snapshot for click/fill/hover — most reliable for DOM actions. Not valid inside page.evaluate().
 - Autocomplete inputs (e.g. Gmail To:): fill then press Tab.
 - Contenteditable areas: click first, then type (not fill).
@@ -138,6 +172,34 @@ Rules:
 - AI CHAT EXTRACTION RULE: When sending a message to an AI assistant (ChatGPT, Claude, Grok, Perplexity, etc.), after pressing Enter add: (1) { "action": "waitForStableText" } to wait for the streamed response to finish, (2) { "action": "getPageText" } to read all visible page text. This is the UNIVERSAL, site-agnostic approach — works on any AI chat site without CSS class knowledge. NEVER use run-code + page.evaluate() with site-specific CSS selectors (like .prose, .generic, [data-testid=...]) for AI chat extraction — these selectors break across sites and page updates. Do NOT add a return step — the getPageText result is automatically captured as task output and will be consumed by the synthesis step downstream.
 - SESSION ISOLATION RULE: When accessing an AI chat service (ChatGPT, Perplexity, Gemini, Claude, etc.), ALWAYS start with a navigate action to its fresh/new-chat URL — ChatGPT: https://chatgpt.com/, Perplexity: https://www.perplexity.ai/, Gemini: https://gemini.google.com/app, Claude: https://claude.ai/new. This ensures getPageText reads ONLY the current query response, not old conversation history from previous sessions. EXCEPTION: If the task explicitly involves a follow-up or continuation of a previous AI response (keywords: "follow up", "continue", "based on that", "expand on", "now ask it"), stay on the current page and do NOT navigate away.
 - NO PLACEHOLDER RULE: NEVER write literal template placeholder text like [ChatGPT response], [Perplexity response], [AI answer], or [insert content here] in any step args (task, body, text, etc.). When combining multi-source AI extractions into an email or message body, always use {{synthesisAnswer}} as the sole body content token — the orchestrator substitutes it with the real synthesized content before the step executes.`;
+
+// ---------------------------------------------------------------------------
+// Phase 1.2 prompt — orientation loop.
+// Called BEFORE plan generation when an interstitial is detected.
+// Asks: is there ONE action that moves toward the goal? Or is the page clear?
+// ---------------------------------------------------------------------------
+const ORIENTATION_SYSTEM_PROMPT = `You are a browser automation assistant. The current page may be blocking a task.
+Your job: decide ONE thing — is there a SINGLE action you can take RIGHT NOW on this page that moves toward the goal?
+
+Respond with EXACTLY ONE JSON object (no markdown fences, no explanation):
+
+If the page IS the right starting point (workspace, inbox, chat interface, dashboard, etc.):
+{ "oriented": true }
+
+If there IS an action that moves toward the goal:
+{ "oriented": false, "step": { "action": "<action>", ...args } }
+
+${BROWSER_ACTIONS_INTERACT}
+
+${STEP_FORMAT_CRITICAL}
+
+DECISION RULES — apply in this priority order:
+1. PREFER CLICK: If there is a visible button or link like "Continue", "Skip", "Get started", "Go to my workspace", "Accept", "Dismiss", "Maybe later", "Enter workspace", "Open workspace", or any element that leads INTO the main app — click it using its snapshot ref (e.g. "e24").
+2. PRESS Escape: If a modal/dialog blocks the page and there is no obvious dismiss button, try { "action": "press", "key": "Escape" }.
+3. NAVIGATE (absolute last resort): If no clickable path exists anywhere in the snapshot, navigate to the service's direct workspace URL. STAY ON SERVICE — never navigate to Google or any external site.
+4. If the page IS already the right starting point — return { "oriented": true } immediately. Do not invent unnecessary steps.
+
+GOAL ALIGNMENT: The action must move TOWARD the goal. Ask: "After this action, will I be on a page where I can accomplish the goal?"`;
 
 // ---------------------------------------------------------------------------
 // Phase 2 prompt — called only when a step fails
@@ -214,6 +276,32 @@ function parseJson(text) {
 }
 
 // ---------------------------------------------------------------------------
+// Detect HTTP error pages in getPageText output.
+// Three-factor detection — all three must pass to avoid false positives:
+//   1. Contains an HTTP 5xx/429 status code number in the page text
+//   2. Contains error-page phrasing ("That's an error", "Bad Gateway", etc.)
+//   3. Does NOT contain AI service UI chrome ("New chat", "Enter a prompt", etc.)
+//      — a page with AI chrome cannot be a bare error page regardless of length
+// NOTE: No length guard — short factual AI answers are valid content. Detection
+// relies on the combination of all three signals, not response size.
+// ---------------------------------------------------------------------------
+function _detectHttpErrorPage(text) {
+  if (!text) return null;
+  const t = text.slice(0, 4000);
+  // Signal 1: must contain an HTTP error status code number
+  const statusMatch = t.match(/\b(500|502|503|504|429)\b/);
+  if (!statusMatch) return null;
+  // Signal 2: must contain error-page phrasing
+  const hasErrorPhrases = /that'?s an error|server error|temporarily unavailable|bad gateway|service unavailable|too many requests|please try again(?: later)?|error occurred|couldn'?t process|unexpected error/i.test(t);
+  if (!hasErrorPhrases) return null;
+  // Signal 3: must NOT look like a real AI chat/response page — these phrases
+  // appear in ChatGPT/Gemini/Claude page chrome and are mutually exclusive with error pages
+  const looksLikeAIPage = /new chat|start a new conversation|ask me anything|enter a prompt|how can i help|what can i help|ask gemini|message chatgpt/i.test(t);
+  if (looksLikeAIPage) return null;
+  return statusMatch[1];
+}
+
+// ---------------------------------------------------------------------------
 // Trim snapshot for LLM context window
 // ---------------------------------------------------------------------------
 function trimSnapshot(text, limit = 8000) {
@@ -273,6 +361,105 @@ function extractInteractiveRefs(snapshotText) {
 function countRefs(snapshotText) {
   if (!snapshotText) return 0;
   return (snapshotText.match(/\bref=e\d+\b|\[e\d+\]/g) || []).length;
+}
+
+// ---------------------------------------------------------------------------
+// Detect whether a snapshot looks like an interstitial blocking the task.
+// High-precision / low-recall — false negatives fall through to the PAGE
+// ORIENTATION RULE in the plan prompt. False positives waste one LLM call
+// but never break the agent. Zero LLM calls — pure regex.
+// ---------------------------------------------------------------------------
+function looksLikeInterstitial(snapshotText) {
+  if (!snapshotText) return false;
+  const t = snapshotText.slice(0, 6000).toLowerCase();
+  return (
+    // Onboarding / setup wizards
+    /how (do |will )?(you|we) (want to |plan to )?use|how are you planning to use/.test(t) ||
+    /set up your (workspace|account|profile)|complete your (setup|profile|onboarding)/.test(t) ||
+    /welcome to (your )?(notion|workspace|app)|let's get (you )?started|get started with/.test(t) ||
+    /create your first (page|project|task|workspace)|tell us about yourself/.test(t) ||
+    /personali(z|s)e your (experience|workspace)|choose a (template|plan|workspace)/.test(t) ||
+    // Cookie / consent walls
+    /\b(accept|agree to) (all )?(cookies|terms|privacy)|cookie (consent|policy|notice|banner)/.test(t) ||
+    /we use cookies|by (continuing|using this site) you agree/.test(t) ||
+    // Paywall / upsell overlays
+    /upgrade (your plan|to pro|to (a )?paid)|start (your )?free trial|choose a plan/.test(t) ||
+    // Generic blocking overlays
+    /sign in to continue|log in to (view|access|continue)|you (must|need to) (be logged in|sign in)/.test(t) ||
+    // Notion workspace join / onboarding flow
+    /\bjoin (workspace|space|team)\b|you('ve| have) been invited to join|join [a-z].{0,40}'?s (workspace|space)/.test(t) ||
+    /\bonboarding\b.*\b(skip|continue|join|get started)\b/.test(t)
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Orientation loop — runs up to MAX_ORIENT_STEPS iterations BEFORE plan
+// generation, clicking past interstitials one step at a time.
+// Returns the updated snapshot (cleared page) or the original (if no change).
+// Fully non-fatal: any LLM/browser error causes graceful fall-through.
+// ---------------------------------------------------------------------------
+const MAX_ORIENT_STEPS = 3;
+
+async function orientPage({ goal, snapshot, sessionId, headed, timeoutMs, learnedRulesBlock }) {
+  let currentSnapshot = snapshot;
+  for (let i = 0; i < MAX_ORIENT_STEPS; i++) {
+    let orientRaw;
+    try {
+      orientRaw = await askWithMessages([
+        { role: 'system', content: ORIENTATION_SYSTEM_PROMPT },
+        { role: 'user', content: `GOAL: ${goal}\n\nSNAPSHOT:\n${trimSnapshot(currentSnapshot, 8000)}${learnedRulesBlock || ''}` },
+      ], { temperature: 0.1, maxTokens: 256, responseTimeoutMs: 15000 });
+    } catch (err) {
+      logger.warn(`[playwright.agent] orientation LLM error (step ${i + 1}/${MAX_ORIENT_STEPS}): ${err.message} — skipping`);
+      break;
+    }
+
+    const parsed = parseJson(orientRaw);
+    if (!parsed) {
+      logger.warn(`[playwright.agent] orientation response unparseable (step ${i + 1}/${MAX_ORIENT_STEPS}) — skipping`);
+      break;
+    }
+
+    if (parsed.oriented === true) {
+      logger.info(`[playwright.agent] orientation: page is already the right starting point (after ${i} step(s))`);
+      break;
+    }
+
+    if (!parsed.step || typeof parsed.step.action !== 'string') {
+      logger.warn(`[playwright.agent] orientation: no valid step returned (step ${i + 1}/${MAX_ORIENT_STEPS}) — skipping`);
+      break;
+    }
+
+    const orientStep = parsed.step;
+    logger.info(`[playwright.agent] orientation step ${i + 1}/${MAX_ORIENT_STEPS}: ${JSON.stringify(orientStep)}`);
+
+    let outcome;
+    try {
+      outcome = await browserAct({ ...orientStep, sessionId, headed, timeoutMs });
+    } catch (err) {
+      outcome = { ok: false, error: err.message };
+    }
+
+    if (!outcome.ok) {
+      logger.warn(`[playwright.agent] orientation step ${i + 1} failed: ${outcome.error} — stopping orientation`);
+      break;
+    }
+
+    // Wait for navigation/animation to settle, then re-snapshot
+    await browserAct({ action: 'waitForStableText', sessionId, headed, timeoutMs: Math.min(timeoutMs, 8000) }).catch(() => {});
+    const reSnap = await browserAct({ action: 'snapshot', sessionId, headed, timeoutMs });
+    if (reSnap.ok && reSnap.result) {
+      currentSnapshot = reSnap.result;
+      logger.info(`[playwright.agent] orientation: re-snapshotted after step ${i + 1} (${countRefs(currentSnapshot)} refs)`);
+    }
+
+    // If interstitial cleared, we're done
+    if (!looksLikeInterstitial(currentSnapshot)) {
+      logger.info(`[playwright.agent] orientation: interstitial cleared after ${i + 1} step(s) ✓`);
+      break;
+    }
+  }
+  return currentSnapshot;
 }
 
 // ---------------------------------------------------------------------------
@@ -357,10 +544,27 @@ async function playwrightAgent(args) {
     }
   }
 
-  // ── Phase 1: Snapshot ──────────────────────────────────────────────────────
+  // ── Phase 1: Wait for SPA to stabilise, then snapshot ────────────────────
+  // Many SPAs (Gemini, ChatGPT, etc.) render a skeleton immediately after navigate,
+  // then populate the interactive DOM 500-2000ms later. Snapshotting too early
+  // captures a mostly-empty tree (e.g. 12 refs instead of 62), causing the LLM to
+  // pick wrong elements and triggering a costly navigate→re-snapshot cascade.
+  if (url) {
+    logger.info(`[playwright.agent] phase 1: waiting for page to stabilise before snapshot`);
+    await browserAct({ action: 'waitForStableText', sessionId, headed, timeoutMs: Math.min(timeoutMs, 15000) });
+  }
   logger.info(`[playwright.agent] phase 1: snapshot`);
   const initSnap = await browserAct({ action: 'snapshot', sessionId, headed, timeoutMs });
   let currentSnapshot = (initSnap.ok && initSnap.result) ? initSnap.result : '';
+
+  // ── Phase 1.2: Orientation loop — clear interstitials before plan generation ─
+  // Fires ONLY when the snapshot matches a known interstitial pattern (zero LLM
+  // calls on normal pages). Clicks past onboarding, cookie walls, setup wizards,
+  // etc. so Phase 2 plan generation always sees a clean starting page.
+  if (looksLikeInterstitial(currentSnapshot)) {
+    logger.info(`[playwright.agent] phase 1.2: interstitial detected — running orientation loop (up to ${MAX_ORIENT_STEPS} steps)`);
+    currentSnapshot = await orientPage({ goal, snapshot: currentSnapshot, sessionId, headed, timeoutMs, learnedRulesBlock: '' });
+  }
 
   // ── Phase 1.5: Load learned rules for this agent/hostname ──────────────────
   let learnedRulesBlock = '';
@@ -552,6 +756,38 @@ async function playwrightAgent(args) {
       }
       if (step.action === 'getPageText' && outcome.result) {
         lastGetPageTextResult = outcome.result;
+
+        // ── HTTP error page detection ─────────────────────────────────────
+        // If getPageText captured an HTTP error page instead of real AI content,
+        // navigate back to the start URL and re-plan the full task rather than
+        // letting the garbage text flow downstream into synthesize.
+        const _httpErr = _detectHttpErrorPage(outcome.result);
+        if (_httpErr && totalRepairs < maxRepairs && url) {
+          totalRepairs++;
+          logger.warn(`[playwright.agent] HTTP ${_httpErr} error page detected in getPageText — full retry ${totalRepairs}/${maxRepairs}`);
+          try {
+            await browserAct({ action: 'navigate', url, sessionId, headed, timeoutMs: Math.max(timeoutMs, 30000) });
+            await browserAct({ action: 'waitForStableText', sessionId, headed, timeoutMs: 15000 });
+            const retrySnap = await browserAct({ action: 'snapshot', sessionId, headed, timeoutMs });
+            if (retrySnap.ok && retrySnap.result) currentSnapshot = retrySnap.result;
+            const retryPlanRaw = await askWithMessages([
+              { role: 'system', content: PLAN_SYSTEM_PROMPT + learnedRulesBlock },
+              { role: 'user', content: `GOAL: ${goal}\n\nNOTE: A previous attempt failed because the page returned an HTTP ${_httpErr} error. The page has been refreshed — please re-plan the full task from the current snapshot.\n\nSNAPSHOT:\n${trimSnapshot(currentSnapshot, 16000)}${agentContext ? `\n\nAGENT CONTEXT:\n${agentContext}` : ''}` },
+            ], { temperature: 0.1, maxTokens: 2048, responseTimeoutMs: 30000 });
+            const retryPlanParsed = parseJson(retryPlanRaw);
+            if (retryPlanParsed && Array.isArray(retryPlanParsed.plan) && retryPlanParsed.plan.length > 0) {
+              logger.info(`[playwright.agent] HTTP error retry: re-planned ${retryPlanParsed.plan.length} step(s) — ${retryPlanParsed.thoughts || ''}`);
+              plan = retryPlanParsed.plan;
+              stepIndex = 0;
+              lastGetPageTextResult = null;
+              continue;
+            }
+          } catch (retryErr) {
+            logger.warn(`[playwright.agent] HTTP error retry re-plan failed: ${retryErr.message}`);
+          }
+        } else if (_httpErr) {
+          logger.warn(`[playwright.agent] HTTP ${_httpErr} error page in getPageText — repair budget exhausted or no start URL, proceeding with error content`);
+        }
       }
 
       // ── Post-fill body verification (self-healing + rule learning) ────────
@@ -598,12 +834,29 @@ async function playwrightAgent(args) {
           logger.info(`[playwright.agent] auto-resnapshot after ${step.action}: refs ${preRefCount}→${postRefCount} (${(changeFraction * 100).toFixed(0)}% change, +${absoluteDelta} absolute)`);
 
           const remaining = plan.slice(stepIndex + 1);
-          // Trigger re-plan if ≥30% of refs changed OR ≥20 new refs appeared in absolute terms.
-          // The absolute check catches large pages (e.g. Gmail inbox = 993 refs) where opening
-          // the Compose modal adds ~75 refs — only 7% change but clearly a new modal overlay.
-          const significantChange = (changeFraction >= 0.30 || absoluteDelta >= 20) && (preRefCount > 0 || postRefCount > 0);
+          // Trigger re-plan if:
+          //   navigate/goto: ANY ref change (even 1) — SPAs always invalidate refs on navigate,
+          //     so a plan using e178 from a pre-navigate snapshot will fail (Ref not found).
+          //   other actions: ≥30% change OR ≥20 new absolute refs (modal opened, inbox load, etc.)
+          const isNavStep = step.action === 'navigate' || step.action === 'goto';
+          const significantChange = isNavStep
+            ? (preRefCount > 0 || postRefCount > 0) && (changeFraction > 0 || absoluteDelta !== 0)
+            : (changeFraction >= 0.30 || absoluteDelta >= 20) && (preRefCount > 0 || postRefCount > 0);
 
           if (significantChange && remaining.length > 0) {
+            // If the snapshot captured only a skeleton (<20 refs), the page is still loading.
+            // Wait for it to stabilise before handing the tiny snapshot to the re-plan LLM —
+            // a 12-ref snapshot produces a bad plan (e.g. picks a nav link instead of the
+            // chat input). The threshold of 20 covers typical SPA loading states.
+            if (postRefCount < 20) {
+              logger.info(`[playwright.agent] post-nav snapshot too small (${postRefCount} refs) — waiting for page to stabilise`);
+              const stableSnap = await browserAct({ action: 'waitForStableText', sessionId, headed, timeoutMs: 12000 });
+              const reSnap = await browserAct({ action: 'snapshot', sessionId, headed, timeoutMs });
+              if (reSnap.ok && reSnap.result) {
+                currentSnapshot = reSnap.result;
+                logger.info(`[playwright.agent] re-snaphotted after stabilise: ${countRefs(currentSnapshot)} refs`);
+              }
+            }
             logger.info(`[playwright.agent] structural DOM change — re-planning ${remaining.length} remaining step(s) with fresh refs`);
             try {
               const replanRaw = await askWithMessages([

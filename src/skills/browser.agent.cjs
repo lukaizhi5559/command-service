@@ -86,7 +86,7 @@ const KNOWN_BROWSER_SERVICES = {
   google:         { startUrl: 'https://accounts.google.com',                     signInUrl: 'https://accounts.google.com',                       authSuccessPattern: 'myaccount.google.com',         isOAuth: true  },
   slack:          { startUrl: 'https://app.slack.com',                           signInUrl: 'https://slack.com/signin',                          authSuccessPattern: 'app.slack.com/client',         isOAuth: true  },
   discord:        { startUrl: 'https://discord.com/channels/@me',                signInUrl: 'https://discord.com/login',                         authSuccessPattern: 'discord.com/channels',         isOAuth: true  },
-  notion:         { startUrl: 'https://www.notion.so',                           signInUrl: 'https://www.notion.so/login',                       authSuccessPattern: 'notion.so/',                   isOAuth: true  },
+  notion:         { startUrl: 'https://www.notion.so',                           signInUrl: 'https://www.notion.so/login',                       authSuccessPattern: 'notion.so',                    isOAuth: true, preferAgentBrowser: true, postAuthUrl: 'https://www.notion.so'  },
   figma:          { startUrl: 'https://www.figma.com',                           signInUrl: 'https://www.figma.com/login',                       authSuccessPattern: 'figma.com/files',              isOAuth: true  },
   linear:         { startUrl: 'https://linear.app',                              signInUrl: 'https://linear.app/login',                          authSuccessPattern: 'linear.app/',                  isOAuth: true  },
   jira:           { startUrl: 'https://id.atlassian.com',                        signInUrl: 'https://id.atlassian.com',                          authSuccessPattern: 'atlassian.net',                isOAuth: true  },
@@ -158,10 +158,10 @@ const KNOWN_BROWSER_SERVICES = {
   // All anonymous-first (isOAuth: false). Only trigger waitForAuth if a login wall appears.
   // IMPORTANT: these are CONSUMER WEBSITES — NOT the developer API consoles above in // ── AI platforms ──
   // AI Chat
-  chatgpt:        { startUrl: 'https://chatgpt.com/',                             authSuccessPattern: 'chatgpt.com',                  isOAuth: false },
-  geminiai:       { startUrl: 'https://gemini.google.com/app',                   authSuccessPattern: 'gemini.google.com',             isOAuth: false },
-  gemini:         { startUrl: 'https://gemini.google.com/app',                   authSuccessPattern: 'gemini.google.com',             isOAuth: false },
-  googleai:       { startUrl: 'https://gemini.google.com/app',                   authSuccessPattern: 'gemini.google.com',             isOAuth: false },
+  chatgpt:        { startUrl: 'https://chatgpt.com/',                            authSuccessPattern: 'chatgpt.com',                  isOAuth: false },
+  geminiai:       { startUrl: 'https://gemini.google.com',                       authSuccessPattern: 'gemini.google.com',             isOAuth: false },
+  gemini:         { startUrl: 'https://gemini.google.com',                       authSuccessPattern: 'gemini.google.com',             isOAuth: false },
+  googleai:       { startUrl: 'https://gemini.google.com',                       authSuccessPattern: 'gemini.google.com',             isOAuth: false },
   claude:         { startUrl: 'https://claude.ai/new',                           authSuccessPattern: 'claude.ai',                    isOAuth: false },
   perplexitychat: { startUrl: 'https://www.perplexity.ai/',                      authSuccessPattern: 'perplexity.ai',                isOAuth: false },
   grok:           { startUrl: 'https://grok.com/',                               authSuccessPattern: 'grok.com',                     isOAuth: false },
@@ -344,7 +344,12 @@ const KNOWN_BROWSER_SERVICES = {
 
 function lookupBrowserService(service) {
   const key = (service || '').toLowerCase().replace(/[^a-z0-9]/g, '');
-  return KNOWN_BROWSER_SERVICES[key] || null;
+  const entry = KNOWN_BROWSER_SERVICES[key];
+  if (!entry) return null;
+  // All seed-map entries are browser-navigable services — inject default capabilities so that
+  // deriveAgentType() returns 'browser' for any isOAuth:false entry without an explicit type.
+  if (!entry.capabilities) return { ...entry, capabilities: ['navigate', 'interact'] };
+  return entry;
 }
 
 // ---------------------------------------------------------------------------
@@ -387,13 +392,17 @@ async function resolveBrowserMeta(service) {
         const signInUrl = extractDescriptorUrl(desc, 'sign_in_url');
         const authSuccessPattern = extractDescriptorUrl(desc, 'auth_success_pattern');
         if (startUrl) {
-          // Merge with seed map for fields not in descriptor (isOAuth)
+          // Merge with seed map — descriptor `is_oauth: true` overrides seed map so
+          // services that were initially anonymous-first but later required login
+          // (detected dynamically at runtime) are permanently upgraded.
           const seed = KNOWN_BROWSER_SERVICES[seedKey] || {};
+          const isOAuthFromDesc = /^is_oauth:\s*true/m.test(desc);
           return {
             ...seed,
             startUrl,
             ...(signInUrl ? { signInUrl } : {}),
             authSuccessPattern: authSuccessPattern || seed.authSuccessPattern || seedKey,
+            ...(isOAuthFromDesc ? { isOAuth: true } : {}),
           };
         }
       }
@@ -527,6 +536,48 @@ function callBrowserAct(args, timeoutMs = 60000) {
   });
 }
 
+// agentbrowser.act HTTP helper — same transport, different skill name
+function callAgentbrowserAct(args, timeoutMs = 60000) {
+  return new Promise((resolve, reject) => {
+    const body = JSON.stringify({ payload: { skill: 'agentbrowser.act', args } });
+    const req = http.request({
+      hostname: '127.0.0.1',
+      port: BROWSER_ACT_PORT,
+      path: '/command.automate',
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
+      timeout: timeoutMs,
+    }, res => {
+      let raw = '';
+      res.on('data', c => { raw += c; });
+      res.on('end', () => {
+        try { resolve(JSON.parse(raw).data || JSON.parse(raw)); }
+        catch (e) { reject(new Error('agentbrowser.act parse error: ' + e.message)); }
+      });
+    });
+    req.on('timeout', () => { req.destroy(); reject(new Error('agentbrowser.act timeout')); });
+    req.on('error', reject);
+    req.write(body);
+    req.end();
+  });
+}
+
+
+// ---------------------------------------------------------------------------
+// Agent type derivation — pure function, priority order:
+//   1. meta.type           (explicit override from descriptor or seed map)
+//   2. isOAuth: true        (OAuth-gated session services — always need browser)
+//   3. navigate/interact caps (browser UI signal — any web app that is navigated)
+//   4. default: 'api_key'  (safe fallback for pure REST endpoints with no browser UI)
+// NOTE: isOAuth:false alone does NOT imply api_key — it only controls _skipInitialAuth.
+// ---------------------------------------------------------------------------
+function deriveAgentType(meta) {
+  if (meta?.type) return meta.type;
+  if (meta?.isOAuth === true) return 'browser';
+  const caps = Array.isArray(meta?.capabilities) ? meta.capabilities : [];
+  if (caps.some(c => c === 'navigate' || c === 'interact')) return 'browser';
+  return 'api_key';
+}
 
 // ---------------------------------------------------------------------------
 // Action: build_agent
@@ -578,10 +629,9 @@ async function actionBuildAgent({ service, startUrl: explicitUrl, force = false 
   const signInUrl          = meta?.signInUrl || null;
   const authSuccessPattern = meta?.authSuccessPattern || serviceKey;
   const capabilities       = meta?.capabilities || ['navigate', 'interact'];
-  // Derive auth type from meta: OAuth services need a browser session; api_key services use the
-  // multi-turn curl loop in actionRun. Default to 'api_key' when unknown — safer than 'browser'
-  // since the curl loop gracefully handles missing keys while browser flow needs a real session.
-  const agentType = meta?.isOAuth === true ? 'browser' : 'api_key';
+  // Derive agent type using priority-ordered signals. isOAuth:false alone no longer implies
+  // api_key — consumer web apps (chatgpt, gemini, etc.) are always type=browser regardless.
+  const agentType = deriveAgentType({ ...meta, capabilities });
 
   if (!startUrl) {
     return {
@@ -765,32 +815,32 @@ const BROWSER_VALIDATOR_SYSTEM_PROMPT = `You are ThinkDrop's Browser Agent Valid
 
 You will receive:
 1. The agent's current descriptor (.md with navigation patterns, selectors, capabilities, auth flow)
-2. A DOM snapshot of the current live page (title, URL, visible elements with selectors)
+2. An accessibility snapshot of the current live page (title, URL, visible interactive elements)
 3. Any HTTP status / reachability info
 
 Your analysis must cover:
-- Do the documented navigation selectors still exist in the current DOM?
+- Do the documented navigation patterns still work on the current page?
 - Are any critical buttons, forms, or nav items missing or renamed?
 - Did the page structure change significantly (e.g. redesign, new auth flow, modal dialogs)?
-- Are there new navigation paths or features visible in the DOM that should be added to the descriptor?
-- Are timing issues likely? (e.g. heavy SPAs, lazy-loaded elements that may need waitFor)
+- Are there new navigation paths or features visible that should be added to the descriptor?
+- Are timing issues likely? (e.g. heavy SPAs, lazy-loaded elements that may need a wait step)
 - Did the auth flow or login URL change?
 
 Output ONLY valid JSON:
 {
   "verdict": "healthy" | "degraded" | "needs_update",
-  "missingSelectors": ["<selector from descriptor that is no longer in DOM>"],
+  "missingSelectors": ["<element from descriptor that is no longer on page>"],
   "changedSelectors": [{ "old": "<old selector>", "new": "<new selector or description of change>" }],
-  "newElements": ["<new important element found in DOM not in descriptor>"],
+  "newElements": ["<new important element found not in descriptor>"],
   "authFlowChanged": true | false,
   "timingRisk": true | false,
-  "timingAdvice": "<specific waitFor hint or null>",
+  "timingAdvice": "<specific wait hint or null>",
   "fixes": ["<precise fix — exact new selector, updated navigation step, or updated auth URL>"],
   "updatedInstructionsPatch": "<updated ## Navigation Patterns section text, or null if no change>",
   "summary": "<one sentence overall assessment>"
 }
 
-IMPORTANT: Be conservative — only flag selectors as missing if they are clearly gone from the DOM snapshot. A selector not visible in a partial snapshot may just not be on this specific page. Focus on login pages, main nav, and primary action elements.`;
+IMPORTANT: Be conservative — only flag elements as missing if they are clearly gone from the snapshot. An element not visible in a partial snapshot may just not be on this specific page. Focus on login pages, main nav, and primary action elements.`;
 
 // Phase 2: pipeline review — is the descriptor complete and correct for every node that consumes it?
 const BROWSER_PIPELINE_REVIEW_PROMPT = `You are ThinkDrop's Pipeline Review Agent. You perform a deep review of a browser agent descriptor — not just checking if selectors work, but whether the descriptor is COMPLETE and CORRECT for all the real-world cases the autonomous pipeline will encounter.
@@ -820,8 +870,8 @@ You must reason as a senior engineer reviewing this descriptor. Ask yourself:
    - Are there MFA/2FA flows not documented that will block automation?
 
 4. SKILL CODE QUALITY RISK
-   - If a skill is built using this descriptor, will the generated Playwright code be correct?
-   - Are the navigation patterns precise enough? (exact selectors, wait conditions, timing)
+   - If a skill is built using this descriptor, will the generated automation code be correct?
+   - Are the navigation patterns precise enough? (exact element identifiers, wait conditions, timing)
    - Are error states documented (rate limits, session expiry, CAPTCHA, consent dialogs)?
 
 5. PIPELINE GAPS
@@ -837,7 +887,7 @@ Output ONLY valid JSON:
   "missingCapabilities": ["<capability missing>"],
   "incorrectCapabilities": ["<capability that cannot reliably be done via browser>"],
   "authFlowIssues": ["<problem with auth flow>"],
-  "skillCodeRisks": ["<thing that will cause generated skill code to be wrong>"],
+  "skillCodeRisks": ["<thing that will cause generated automation code to be wrong>"],
   "pipelineGaps": ["<gap the pipeline will hit but descriptor doesn't cover>"],
   "setupStepsRequired": ["<one-time setup step the user must complete>"],
   "correctedUrls": {
@@ -1330,9 +1380,49 @@ async function actionRun({ agentId, task, context, requiresAuth, _progressCallba
     } catch (_) { /* file may not exist — leave path in task as-is */ }
   }
 
-  const existing = await actionQueryAgent({ id: agentId });
+  let existing = await actionQueryAgent({ id: agentId });
   if (!existing.found) {
-    return { ok: false, error: `Agent not found: ${agentId}. Build it first with action:build_agent.`, needsBuild: true };
+    // Auto-build the agent transparently — no plan step required for known services.
+    // actionBuildAgent already resolves service metadata from KNOWN_BROWSER_SERVICES so
+    // gemini / googleai / geminiai aliases all work without any extra config.
+    const serviceKey = agentId.replace(/\.agent$/, '');
+    logger.info(`[browser.agent] run: agent "${agentId}" not found — attempting auto-build for service "${serviceKey}"`);
+    try {
+      const buildResult = await actionBuildAgent({ service: serviceKey });
+      if (buildResult.ok) {
+        logger.info(`[browser.agent] run: auto-built "${agentId}" (alreadyExists=${buildResult.alreadyExists}) — re-querying`);
+        existing = await actionQueryAgent({ id: agentId });
+      } else {
+        logger.warn(`[browser.agent] run: auto-build failed for "${agentId}": ${buildResult.error}`);
+      }
+    } catch (buildErr) {
+      logger.warn(`[browser.agent] run: auto-build threw for "${agentId}": ${buildErr.message}`);
+    }
+    // If still not found after auto-build attempt, return the original error with needsBuild:true
+    // so recoverSkill.js fast-path can REPLAN instead of falling through to ASK_USER.
+    if (!existing.found) {
+      return { ok: false, error: `Agent not found: ${agentId}. Build it first with action:build_agent.`, needsBuild: true };
+    }
+  }
+
+  // Self-heal stale wrong-type entries (e.g. gemini.agent previously built as api_key).
+  // Happens when auto-build ran in a prior session before deriveAgentType() was introduced.
+  // Only triggers when stored type=api_key but the seed map says this is a browser UI service.
+  if (existing.found && (existing.type === 'api_key' || (existing.descriptor || '').match(/^type:\s*api_key/m))) {
+    const _selfHealKey = (existing.service || agentId.replace(/\.agent$/, '')).toLowerCase().replace(/[^a-z0-9]/g, '');
+    const _seedMeta    = lookupBrowserService(_selfHealKey);
+    if (_seedMeta !== null && deriveAgentType(_seedMeta) === 'browser') {
+      logger.info(`[browser.agent] run: type mismatch "${agentId}" stored=api_key expected=browser — force-rebuilding`);
+      try {
+        const _rebuildResult = await actionBuildAgent({ service: _selfHealKey, force: true });
+        if (_rebuildResult.ok) {
+          existing = await actionQueryAgent({ id: agentId });
+          logger.info(`[browser.agent] run: self-healed "${agentId}" — new type=${_rebuildResult.descriptor?.match(/^type:\s*(\S+)/m)?.[1] || 'browser'}`);
+        }
+      } catch (_rebuildErr) {
+        logger.warn(`[browser.agent] run: self-heal rebuild threw for "${agentId}": ${_rebuildErr.message}`);
+      }
+    }
   }
 
   const agentType = (() => {
@@ -1477,14 +1567,23 @@ async function actionRun({ agentId, task, context, requiresAuth, _progressCallba
   const _svcInfo         = lookupBrowserService(_svcKey);
   const _skipInitialAuth = _svcInfo?.isOAuth === false && !requiresAuth;
 
+  // Route to agentbrowser.agent when preferAgentBrowser is set on the service entry
+  // or when THINKDROP_CLI_DRIVER=agentbrowser is set globally.
+  const _useAgentBrowser = _svcInfo?.preferAgentBrowser === true || process.env.THINKDROP_CLI_DRIVER === 'agentbrowser';
+  const _agentSkill = _useAgentBrowser ? 'agentbrowser.agent' : 'playwright.agent';
+  if (_useAgentBrowser) {
+    logger.info(`[browser.agent] run: routing ${agentId} through agentbrowser.agent (preferAgentBrowser=${_svcInfo?.preferAgentBrowser}, env=${process.env.THINKDROP_CLI_DRIVER})`);
+  }
+
   // Step 1: ensure auth session exists (skipped for anonymous-first services unless caller explicitly set requiresAuth=true)
   if (!_skipInitialAuth) {
     let authResult;
     try {
+      // Always use playwright-cli (callBrowserAct) for OAuth — avoids navigator.webdriver=true
+      // rejection that CDP-controlled agentbrowser gets from Google & other providers.
       authResult = await callBrowserAct({
         action: 'waitForAuth',
         sessionId,
-        profile,
         url: authTarget,
         authSuccessUrl: authSuccessPattern,
         timeoutMs: 2 * 60 * 1000,
@@ -1519,17 +1618,43 @@ async function actionRun({ agentId, task, context, requiresAuth, _progressCallba
       })();
       return { ok: false, error: `Auth failed for ${agentId}: ${authResult?.error}` };
     }
+
+    // Bridge playwright-cli auth state → agentbrowser when using agentbrowser driver.
+    // playwright-cli handles OAuth without webdriver rejection; agent-browser loads
+    // the resulting storageState JSON so it starts with authenticated cookies.
+    if (_useAgentBrowser) {
+      const _stateFile = path.join(os.homedir(), '.thinkdrop', 'ab-sessions', `${sessionId}.json`);
+      fs.mkdirSync(path.dirname(_stateFile), { recursive: true });
+      try {
+        // Navigate playwright-cli to postAuthUrl so state-save captures workspace cookies,
+        // not an onboarding/interstitial page that waitForAuth may have stopped at.
+        if (_svcInfo?.postAuthUrl) {
+          logger.info(`[browser.agent] navigating playwright-cli to postAuthUrl before state-save: ${_svcInfo.postAuthUrl}`);
+          await callBrowserAct({ action: 'navigate', sessionId, url: _svcInfo.postAuthUrl }, 25000);
+          await callBrowserAct({ action: 'waitForStableText', sessionId }, 15000).catch(() => {});
+        }
+        await callBrowserAct({ action: 'state-save', sessionId, filePath: _stateFile }, 30000);
+        // Kill the agentbrowser daemon with --all so the next launch starts clean
+        // (correct --headed flag, fresh session flags). Do NOT close playwright-cli’s
+        // window here — closing it interferes with the user’s real Chrome sync.
+        await callAgentbrowserAct({ action: 'close-all' }, 8000).catch(() => {});
+        await callAgentbrowserAct({ action: 'state-load', sessionId, filePath: _stateFile }, 30000);
+        logger.info(`[browser.agent] auth state bridged playwright→agentbrowser for ${sessionId}`);
+      } catch (bridgeErr) {
+        logger.warn(`[browser.agent] auth state bridge failed (non-fatal) — ${bridgeErr.message}`);
+      }
+    }
   } else {
     logger.info(`[browser.agent] run: skipping waitForAuth for anonymous-first service ${agentId} (isOAuth=false, requiresAuth=${!!requiresAuth})`);
   }
 
-  // Step 2: delegate to playwright.agent with the authenticated session
-  logger.info(`[browser.agent] run: auth ok — delegating to playwright.agent for "${task}"`);
+  // Step 2: delegate to playwright.agent or agentbrowser.agent with the authenticated session
+  logger.info(`[browser.agent] run: auth ok — delegating to ${_agentSkill} for "${task}"`);
   try {
-    const agentResult = await callSkill('playwright.agent', {
+    const agentResult = await callSkill(_agentSkill, {
       goal: task,
       agentContext: existing.descriptor ? existing.descriptor.slice(0, 800) : undefined,
-      url: startUrl,
+      url: _skipInitialAuth ? startUrl : (_useAgentBrowser && _svcInfo?.postAuthUrl ? _svcInfo.postAuthUrl : undefined),
       sessionId,
       agentId,
       maxTurns: 15,
@@ -1538,13 +1663,73 @@ async function actionRun({ agentId, task, context, requiresAuth, _progressCallba
       _stepIndex,
     }, 130000);
 
+    const agentResultText = agentResult?.result || agentResult?.stdout || '';
+
+    // ── Dynamic login-wall detector ───────────────────────────────────────────
+    // If playwright.agent returned content that looks like a login/auth wall,
+    // the service has changed from anonymous-first to requiring login. Auto-patch
+    // the agent descriptor (DuckDB + disk) so future runs call waitForAuth and
+    // properly prompt the user to authenticate once.
+    //
+    // Two signal tiers:
+    //   Strong: OAuth provider button text ("Continue with Google", etc.) — single
+    //           match is definitive; these only appear on login walls.
+    //   Weak:   Generic auth phrases ("Sign in", "Log in", etc.) — require >= 2
+    //           matches AND sparse page (< 50 lines) to avoid false positives on
+    //           pages that merely show a nav-bar "Sign in" link alongside real content.
+    const _LOGIN_WALL_RE = /\b(sign[\s-]+in|log[\s-]+in|log[\s-]+into|create[\s-]+account|sign[\s-]+up|please[\s-]+log|welcome[\s-]+back|get[\s-]+started[\s-]+free)\b/gi;
+    const _OAUTH_PROVIDERS_RE = /\b(continue[\s-]+with[\s-]+(google|microsoft|apple|github|facebook|linkedin|twitter|x\.com|slack)|sign[\s-]+in[\s-]+with[\s-]+(google|microsoft|apple|github|facebook|linkedin|twitter)|google[\s-]+login)\b/i;
+    const _loginWallMatches = (agentResultText.match(_LOGIN_WALL_RE) || []).length;
+    const _hasOAuthProvider  = _OAUTH_PROVIDERS_RE.test(agentResultText);
+    const _isLoginWall       = _loginWallMatches >= 2 && agentResultText.trim().split(/\n+/).length < 50;
+
+    if (_isLoginWall || _hasOAuthProvider) {
+      logger.warn(`[browser.agent] Login wall detected for ${agentId} (signals=${_loginWallMatches}, oauthProvider=${_hasOAuthProvider}) — auto-upgrading to isOAuth:true`);
+      try {
+        const _patchDb = await getDb();
+        const _existingRows = _patchDb
+          ? await _patchDb.all('SELECT descriptor FROM agents WHERE id = ?', agentId).catch(() => null)
+          : null;
+        const _existingDesc = _existingRows?.[0]?.descriptor || '';
+        if (_existingDesc) {
+          // Patch descriptor frontmatter: mark is_oauth:true so lookupBrowserService
+          // picks it up on the next run and routes through waitForAuth.
+          // Also ensure sign_in_url is set — fall back to startUrl if not already present.
+          const _patchedDesc = rewriteDescriptorFrontmatter(_existingDesc, {
+            is_oauth: 'true',
+            ...(signInUrl ? {} : { sign_in_url: startUrl }),
+          });
+          const _mdPath = path.join(AGENTS_DIR, `${agentId}.md`);
+          fs.writeFileSync(_mdPath, _patchedDesc, 'utf8');
+          if (_patchDb) {
+            await _patchDb.run(
+              'UPDATE agents SET descriptor = ?, status = ? WHERE id = ?',
+              _patchedDesc, 'needs_auth', agentId
+            );
+          }
+          logger.info(`[browser.agent] ${agentId} patched: is_oauth=true${_hasOAuthProvider ? ' (OAuth provider buttons detected)' : ''} — will trigger waitForAuth on next run`);
+        }
+      } catch (patchErr) {
+        logger.warn(`[browser.agent] login-wall patch failed for ${agentId}: ${patchErr.message}`);
+      }
+      return {
+        ok: false,
+        agentId,
+        task,
+        error: `Login wall detected for ${agentId} — service requires authentication. Agent upgraded to isOAuth:true. Re-run the step to trigger the login flow via waitForAuth.`,
+        loginWallDetected: true,
+        oauthUpgraded: true,
+      };
+    }
+    // ─────────────────────────────────────────────────────────────────────────
+
     return {
       ok: agentResult?.ok ?? false,
       agentId,
       task,
       sessionId,
       authenticated: true,
-      result: agentResult?.result || agentResult?.stdout || '',
+      result: agentResultText,
       transcript: agentResult?.transcript || [],
       turns: agentResult?.turns,
       done: agentResult?.done,
@@ -1757,3 +1942,4 @@ async function browserAgent(args) {
 }
 
 module.exports = { browserAgent, KNOWN_BROWSER_SERVICES };
+module.exports._deriveAgentType = deriveAgentType;

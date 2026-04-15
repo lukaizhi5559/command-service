@@ -655,7 +655,12 @@ async function browserAct(args) {
         await cliRun([...S, 'press', 'Meta+a'], timeoutMs);
         const typeRes = await cliRun([...S, 'type', (text ?? value) || ''], timeoutMs);
         logger.info(`[browser.act] click+type → exit ${typeRes.exitCode}`);
-        if (typeRes.ok) lastFilledTarget.set(sessionId, { target: fillTarget, ref });
+        // Do NOT store the ref in lastFilledTarget — the click moved focus to fillTarget which
+        // may be a non-input container (e.g. Gemini's contenteditable wrapper div). If press
+        // Enter later re-clicks that element, it can navigate away (e.g. → accounts.google.com).
+        // After click+type the keyboard focus is already on the correct element; Enter will fire
+        // there without any refocus needed.
+        if (typeRes.ok) lastFilledTarget.delete(sessionId);
         return {
           ok: typeRes.ok,
           action, sessionId,
@@ -1109,9 +1114,11 @@ async function browserAct(args) {
       //  SUCCESS:      currentHost !== authOriginHost  AND urlWithoutQuery includes authSuccessUrl
       //  LIMBO:        currentHost !== authOriginHost  AND NOT at authSuccessUrl
       let authOriginHost = null;
-      try { if (url) authOriginHost = new URL(url).hostname; } catch (_) {}
+      let authSignInPath   = null; // for same-domain path exit (e.g. notion.so/login → notion.so/onboarding)
+      try { if (url) { const _u = new URL(url); authOriginHost = _u.hostname; authSignInPath = _u.pathname; } } catch (_) {}
       const getHost = (u) => { try { return new URL(u).hostname; } catch (_) { return ''; } };
-      let lastLimboUrl = null; // anti-loop guard
+      let lastLimboUrl = null;     // anti-loop guard
+      let backToSignInCount = 0;   // RC2: hard stop — max 3 code-triggered back-to-sign-in navigations
 
       // Default timeout: 120s — enough for a human to complete 2FA or MFA
       const effectiveTimeout = Math.min(timeoutMs || 120000, 120000);
@@ -1212,6 +1219,21 @@ async function browserAct(args) {
                 return { ok: false, action, sessionId, authFailed: true, error: 'Authentication error detected — wrong credentials or account locked', executionTime: Date.now() - start };
               }
             }
+            // ── Same-domain path exit ────────────────────────────────────────
+            // Handles services like Notion where sign-in URL and workspace URL share
+            // the same hostname (notion.so/login → notion.so/onboarding).
+            // If the path has moved away from the sign-in path, auth is complete.
+            if (authSignInPath) {
+              try {
+                const currentPath = new URL(currentUrl).pathname;
+                const leftLoginPage = currentPath !== authSignInPath &&
+                  !/\/(login|signin|sign-in|sign_in|auth|oauth|authorize)\b/i.test(currentPath);
+                if (leftLoginPage) {
+                  logger.info(`[browser.act] waitForAuth: same-domain path exit — left login page (${authSignInPath} → ${currentPath}) for session=${sessionId}`);
+                  return { ok: true, action, sessionId, authResolved: true, executionTime: Date.now() - start };
+                }
+              } catch (_) {}
+            }
             logger.debug(`[browser.act] waitForAuth: in auth flow at ${currentUrl} (${authWallDetections} polls), ${Math.round((deadline - Date.now()) / 1000)}s remaining`);
             continue;
           }
@@ -1222,16 +1244,51 @@ async function browserAct(args) {
             logger.info(`[browser.act] waitForAuth: auth wall cleared (different domain) for session=${sessionId}`);
             return { ok: true, action, sessionId, authResolved: true, executionTime: Date.now() - start };
           }
+
+          // RC1: skip transient non-http URLs (about:blank, chrome://, data:, etc.).
+          // These appear briefly during any OAuth popup or redirect handshake — they are
+          // never a real destination and must NEVER trigger a back-to-sign-in navigation.
+          // This applies universally across all services (Notion, Google, GitHub, etc.).
+          if (!currentUrl.startsWith('http')) {
+            logger.debug(`[browser.act] waitForAuth: transient non-http URL (${currentUrl}) — skipping, waiting for OAuth redirect session=${sessionId}`);
+            continue;
+          }
+
           if (lastLimboUrl === currentUrl) {
+            // RC2: count how many times the CODE navigates back to sign-in for a stuck URL.
+            // The user only signed in once — this counter tracks code-triggered retries only.
+            // On the 3rd attempt, give up: the auth flow is genuinely broken.
+            backToSignInCount++;
+            if (backToSignInCount >= 3) {
+              logger.warn(`[browser.act] waitForAuth: back-to-sign-in loop detected (${backToSignInCount} attempts) for stuck URL ${currentUrl} — aborting session=${sessionId}`);
+              return { ok: false, action, sessionId, authTimedOut: true, authLoopDetected: true, error: `waitForAuth: stuck in redirect loop at ${currentUrl} — authentication could not complete`, executionTime: Date.now() - start };
+            }
             // Stuck in same limbo URL — navigate back to sign-in URL
-            logger.info(`[browser.act] waitForAuth: limbo stuck at ${currentUrl} — navigating back to sign-in`);
+            logger.info(`[browser.act] waitForAuth: limbo stuck at ${currentUrl} (back-to-sign-in attempt ${backToSignInCount}/3) — navigating back to sign-in`);
             if (url) await cliRun([...S, 'goto', url], 15000).catch(() => {});
             lastLimboUrl = null;
           } else {
-            // First time at this intermediate URL — navigate toward authSuccessUrl
-            logger.info(`[browser.act] waitForAuth: limbo state (${currentUrl}) — navigating to authSuccessUrl=${authSuccessUrl} for session=${sessionId}`);
+            // First time at this intermediate URL — navigate toward authSuccessUrl only if it
+            // is a full navigable URL. Pattern substrings (e.g. 'notion.com') are not valid
+            // goto targets and cause a redirect oscillation loop.
             lastLimboUrl = currentUrl;
-            await cliRun([...S, 'goto', authSuccessUrl], 15000).catch(() => {});
+            if (/^https?:\/\//i.test(authSuccessUrl)) {
+              logger.info(`[browser.act] waitForAuth: limbo state (${currentUrl}) — navigating to authSuccessUrl=${authSuccessUrl} for session=${sessionId}`);
+              await cliRun([...S, 'goto', authSuccessUrl], 15000).catch(() => {});
+            } else {
+              // authSuccessUrl is a bare hostname pattern (e.g. 'mail.google.com', 'notion.com').
+              // Construct a navigable https:// URL from it so we can drive the browser there.
+              // This restores the pre-Phase-1 behavior for services like Gmail where the OAuth
+              // landing page (myaccount.google.com) differs from the target (mail.google.com).
+              const bareHostMatch = /^([\w.-]+\.[a-z]{2,})(\/.*)?$/i.exec(authSuccessUrl);
+              if (bareHostMatch) {
+                const gotoUrl = `https://${bareHostMatch[1]}`;
+                logger.info(`[browser.act] waitForAuth: limbo state (${currentUrl}) — authSuccessUrl is a pattern, constructing goto=${gotoUrl} for session=${sessionId}`);
+                await cliRun([...S, 'goto', gotoUrl], 15000).catch(() => {});
+              } else {
+                logger.info(`[browser.act] waitForAuth: limbo state (${currentUrl}) — authSuccessUrl is a pattern (not a URL), waiting for redirect for session=${sessionId}`);
+              }
+            }
           }
         } catch (pollErr) {
           logger.debug(`[browser.act] waitForAuth: poll error — ${pollErr.message?.slice(0, 60)}`);

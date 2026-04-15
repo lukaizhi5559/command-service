@@ -32,6 +32,8 @@ const { projectStop } = require('./skills/project.stopper.cjs');
 const { cliAgent } = require('./skills/cli.agent.cjs');
 const { browserAgent } = require('./skills/browser.agent.cjs');
 const { playwrightAgent } = require('./skills/playwright.agent.cjs');
+const { agentbrowserAct } = require('./skills/agentbrowser.act.cjs');
+const { agentbrowserAgent } = require('./skills/agentbrowser.agent.cjs');
 const creatorAgent = require('./skills/creator.agent.cjs');
 const reviewerAgent = require('./skills/reviewer.agent.cjs');
 const skillCreator = require('./skills/skillCreator.skill.cjs');
@@ -101,6 +103,12 @@ class CommandServiceMCPServer {
 
       case 'playwright.agent':
         return await this._skillPlaywrightAgent(args);
+
+      case 'agentbrowser.act':
+        return await this._skillAgentbrowserAct(args);
+
+      case 'agentbrowser.agent':
+        return await this._skillAgentbrowserAgent(args);
 
       case 'creator.agent':
         return await this._skillCreatorAgent(args);
@@ -211,6 +219,14 @@ class CommandServiceMCPServer {
     return await playwrightAgent(args);
   }
 
+  async _skillAgentbrowserAct(args) {
+    return await agentbrowserAct(args);
+  }
+
+  async _skillAgentbrowserAgent(args) {
+    return await agentbrowserAgent(args);
+  }
+
   // ---------------------------------------------------------------------------
   // Health
   // ---------------------------------------------------------------------------
@@ -220,7 +236,7 @@ class CommandServiceMCPServer {
       success: true,
       service: this.serviceName,
       status: 'healthy',
-      skills: ['shell.run', 'browser.act', 'web.crawl', 'image.analyze', 'fs.read', 'file.watch', 'file.bridge', 'screen.capture', 'external.skill', 'cli.agent', 'browser.agent', 'playwright.agent', 'creator.agent', 'reviewer.agent', 'skillCreator.skill', 'project.builder', 'project.launcher', 'project.editor', 'project.stopper']
+      skills: ['shell.run', 'browser.act', 'web.crawl', 'image.analyze', 'fs.read', 'file.watch', 'file.bridge', 'screen.capture', 'external.skill', 'cli.agent', 'browser.agent', 'playwright.agent', 'agentbrowser.act', 'agentbrowser.agent', 'creator.agent', 'reviewer.agent', 'skillCreator.skill', 'project.builder', 'project.launcher', 'project.editor', 'project.stopper']
     };
   }
 
@@ -272,7 +288,7 @@ class CommandServiceMCPServer {
         res.end(JSON.stringify({
           status: 'healthy',
           service: this.serviceName,
-          skills: ['shell.run', 'browser.act', 'web.crawl', 'image.analyze', 'fs.read', 'file.watch', 'file.bridge', 'screen.capture', 'external.skill', 'cli.agent', 'browser.agent', 'playwright.agent', 'creator.agent', 'reviewer.agent', 'skillCreator.skill', 'project.builder', 'project.launcher', 'project.editor', 'project.stopper']
+          skills: ['shell.run', 'browser.act', 'web.crawl', 'image.analyze', 'fs.read', 'file.watch', 'file.bridge', 'screen.capture', 'external.skill', 'cli.agent', 'browser.agent', 'playwright.agent', 'agentbrowser.act', 'agentbrowser.agent', 'creator.agent', 'reviewer.agent', 'skillCreator.skill', 'project.builder', 'project.launcher', 'project.editor', 'project.stopper']
         }));
         return;
       }
