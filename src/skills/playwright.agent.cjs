@@ -68,6 +68,10 @@ const BROWSER_ACTIONS_FULL = `Available actions:
   hover           { selector }
   scroll          { direction, distance }
   drag            { selector, targetSelector }
+  find-role       { role, name?, findAction, value? } — find by ARIA role (e.g. "textbox") + optional name; findAction is "click"|"fill"
+  find-label      { label, findAction, value? }       — find by label text; findAction is "click"|"fill"
+  find-text       { text }                            — click the first visible element containing this text
+  wait            { ms }                              — pause execution for up to 5000ms (use sparingly)
   waitForSelector { selector }
   waitForContent  { text }
   getPageText     {}                   — returns ALL visible text from the page (body.innerText, up to 50k chars). Use this as the universal, site-agnostic way to read any page. Works on ChatGPT, Perplexity, Claude, Grok, and any other site without knowing site-specific CSS. Result auto-captured as task output.
@@ -227,7 +231,8 @@ Respond with EXACTLY ONE JSON object (no markdown fences, no explanation):
   const fs = await import('node:fs/promises'); const content = await fs.readFile(path, 'utf8');
   But PREFER to avoid file I/O entirely — any needed content is already in the task as [DATA FROM PRIOR STEP].
 - If a run-code step failed due to require/file-reading: replace it with a \`type\` action using content
-  from the task description instead.`;
+  from the task description instead.
+- If the error contains "Timeout" and the failed step was navigate or click, a browser dialog (e.g. "Leave site?", "Leave page?") may be blocking. In that case start the repair with { "action": "dialog-accept" } before retrying the original step.`;
 
 // ---------------------------------------------------------------------------
 // Replan prompt — called when a DOM-mutating step caused a structural DOM change.
@@ -260,7 +265,47 @@ Rules:
 - Contenteditable areas: click first, then type (not fill)
 - Keep plan concise — no unnecessary waits or redundant snapshots
 - DIALOG RULE: If a confirmation dialog may appear, add dialog-accept/dismiss after the triggering action
-- AI CHAT EXTRACTION RULE: If ANY stale remaining step was waitForStableText or getPageText, you MUST preserve BOTH in the re-plan — in order: first { "action": "waitForStableText" }, then { "action": "getPageText" }. NEVER collapse them into a single getText or omit waitForStableText. The AI response is still streaming when the DOM changes; skipping waitForStableText captures an incomplete response.`;
+- AI CHAT EXTRACTION RULE: If ANY stale remaining step was waitForStableText or getPageText, you MUST preserve BOTH in the re-plan — in order: first { "action": "waitForStableText" }, then { "action": "getPageText" }. NEVER collapse them into a single getText or omit waitForStableText. The AI response is still streaming when the DOM changes; skipping waitForStableText captures an incomplete response.
+
+${STEP_FORMAT_CRITICAL}`;
+
+// ---------------------------------------------------------------------------
+// Post-task completion verification prompt — called once after all steps finish.
+// Asks the LLM whether the goal was actually achieved based on the final page state.
+// Catches silent completion failures: keyboard shortcuts that fired to the wrong focus,
+// form submits that didn't register, modal dismissals that didn't close, etc.
+// ---------------------------------------------------------------------------
+const VERIFY_SYSTEM_PROMPT = `You are verifying whether a browser automation task was truly completed.
+
+Respond with EXACTLY ONE JSON object (no markdown fences, no explanation):
+{
+  "completed": true | false,
+  "confidence": 0.0 to 1.0,
+  "evidence": "<one sentence: what you see on the page that supports your verdict>"
+}
+
+Signs the task is INCOMPLETE:
+- A compose / draft window is still visible and contains the message that was supposed to be sent
+- A form is still present and filled with data that was supposed to be submitted
+- A modal, dialog, or overlay is still open when it should have been dismissed
+- An item that was supposed to be deleted is still in the list
+- The URL is unchanged when a navigation was the last action
+- A progress indicator, toast, or error message indicates failure
+
+Signs the task is COMPLETE:
+- Page transitioned to a sent / confirmation / success view
+- The targeted element (compose window, modal, form) is no longer visible
+- A success toast, banner, or message is visible
+- The URL changed to confirm navigation succeeded
+- Content that was supposed to appear is now present
+
+Be conservative: if you see clear evidence of incompletion, prefer completed:false.
+Only mark completed:false when confidence >= 0.75 — minor UI ambiguities are not failures.`;
+
+// Regex to detect login-wall evidence in VERIFY output.
+// When the LLM reports the page is a login/signup wall, skip inline repair and
+// return loginWallDetected:true so browser.agent's waitForAuth + auto-retry fires.
+const VERIFY_LOGIN_WALL_RE = /sign[\s-]*(in|up|into)|log[\s-]*(in|into)|not[\s-]*(logged|authenticated)|login[\s-]*(required|wall|page)|continue[\s-]*with[\s-]*(google|apple|microsoft|github|facebook|email)|email[\s-]*(entry|input|field|address|address\s*required)|create[\s-]*account|authentication[\s-]*required|please[\s-]+log[\s-]*(in|into)|welcome[\s-]*back|enter[\s-]*(your[\s-]*)?email|your[\s-]*email[\s-]*address|[@][^\s]+[\s-]*required/i;
 
 // ---------------------------------------------------------------------------
 // Parse LLM JSON response — tolerant of markdown fences and prose wrappers
@@ -388,7 +433,14 @@ function looksLikeInterstitial(snapshotText) {
     /sign in to continue|log in to (view|access|continue)|you (must|need to) (be logged in|sign in)/.test(t) ||
     // Notion workspace join / onboarding flow
     /\bjoin (workspace|space|team)\b|you('ve| have) been invited to join|join [a-z].{0,40}'?s (workspace|space)/.test(t) ||
-    /\bonboarding\b.*\b(skip|continue|join|get started)\b/.test(t)
+    /\bonboarding\b.*\b(skip|continue|join|get started)\b/.test(t) ||
+    // Login / sign-up gates blocking content access (Reddit, news sites, social media, etc.)
+    // Matches patterns where auth is required to view the requested content.
+    /sign.?in to (view|see|access|read|continue|comment|vote|post|download)/i.test(t) ||
+    /log.?in to (view|see|access|read|continue|comment|vote|post|download)/i.test(t) ||
+    /you('ll)? need to (sign.?in|log.?in|create an account)|must be (signed in|logged in) to/i.test(t) ||
+    /join.{0,30}to (access|view|read|see|comment|vote|post)/i.test(t) ||
+    /create (a |an )?(free )?account to (access|view|read|comment|post)/i.test(t)
   );
 }
 
@@ -400,13 +452,13 @@ function looksLikeInterstitial(snapshotText) {
 // ---------------------------------------------------------------------------
 const MAX_ORIENT_STEPS = 3;
 
-async function orientPage({ goal, snapshot, sessionId, headed, timeoutMs, learnedRulesBlock }) {
+async function orientPage({ goal, snapshot, sessionId, headed, timeoutMs, learnedRulesBlock, domainLockBlock = '' }) {
   let currentSnapshot = snapshot;
   for (let i = 0; i < MAX_ORIENT_STEPS; i++) {
     let orientRaw;
     try {
       orientRaw = await askWithMessages([
-        { role: 'system', content: ORIENTATION_SYSTEM_PROMPT },
+        { role: 'system', content: ORIENTATION_SYSTEM_PROMPT + domainLockBlock },
         { role: 'user', content: `GOAL: ${goal}\n\nSNAPSHOT:\n${trimSnapshot(currentSnapshot, 8000)}${learnedRulesBlock || ''}` },
       ], { temperature: 0.1, maxTokens: 256, responseTimeoutMs: 15000 });
     } catch (err) {
@@ -469,6 +521,13 @@ async function orientPage({ goal, snapshot, sessionId, headed, timeoutMs, learne
 // ---------------------------------------------------------------------------
 function normalizeStep(step) {
   if (!step || typeof step !== 'object') return step;
+  // Defensive alias: some LLM outputs (especially from REPLAN) use "ref" instead of
+  // "selector". browser.act's click/fill handlers read args.selector — if only ref is
+  // present the handler gets undefined and throws "Cannot read properties of undefined
+  // (reading 'trim')". Alias here as defense-in-depth alongside STEP_FORMAT_CRITICAL.
+  if (typeof step.action === 'string' && step.ref && !step.selector) {
+    step = { ...step, selector: step.ref };
+  }
   if (typeof step.action === 'string') return step; // already correct format
   const keys = Object.keys(step);
   if (keys.length === 1) {
@@ -557,19 +616,41 @@ async function playwrightAgent(args) {
   const initSnap = await browserAct({ action: 'snapshot', sessionId, headed, timeoutMs });
   let currentSnapshot = (initSnap.ok && initSnap.result) ? initSnap.result : '';
 
+  // Compute hostname once — used for domain-lock block injected into all LLM calls
+  const hostname = url ? (() => { try { return new URL(url).hostname.replace(/^www\./, ''); } catch (_) { return null; } })() : null;
+  const domainLockBlock = hostname
+    ? `\n\nDOMAIN LOCK — ABSOLUTE:\nYou are automating '${hostname}'. NEVER navigate to any external site (not Google, Bing, DuckDuckGo, or anywhere outside ${hostname}). Any navigate step MUST stay on '${hostname}'.`
+    : '';
+
   // ── Phase 1.2: Orientation loop — clear interstitials before plan generation ─
   // Fires ONLY when the snapshot matches a known interstitial pattern (zero LLM
   // calls on normal pages). Clicks past onboarding, cookie walls, setup wizards,
   // etc. so Phase 2 plan generation always sees a clean starting page.
   if (looksLikeInterstitial(currentSnapshot)) {
     logger.info(`[playwright.agent] phase 1.2: interstitial detected — running orientation loop (up to ${MAX_ORIENT_STEPS} steps)`);
-    currentSnapshot = await orientPage({ goal, snapshot: currentSnapshot, sessionId, headed, timeoutMs, learnedRulesBlock: '' });
+    currentSnapshot = await orientPage({ goal, snapshot: currentSnapshot, sessionId, headed, timeoutMs, learnedRulesBlock: '', domainLockBlock });
+
+    // Post-orientation check: if a login/signup gate is STILL blocking after the
+    // orientation loop ran, bail immediately with loginWallDetected rather than
+    // generating a plan against a gated page (it always fails or gets degraded
+    // content). recoverSkill's auth fast-path surfaces this as ASK_USER.
+    const _loginGateRe = /sign.?in to (view|see|access|read|continue|comment|vote|post)|log.?in to (view|see|access|read|continue|comment|vote|post)|you('ll)? need to (sign.?in|log.?in|create an account)|must be (signed in|logged in) to|join.{0,30}to (access|view|read|see|comment|vote)/i;
+    if (looksLikeInterstitial(currentSnapshot) && _loginGateRe.test(currentSnapshot.slice(0, 6000))) {
+      logger.warn(`[playwright.agent] login-gate still blocking after orientation — returning loginWallDetected immediately`);
+      return {
+        ok: false, goal, sessionId,
+        turns: 0, done: false,
+        loginWallDetected: true,
+        result: 'This site requires authentication to access the requested content',
+        transcript: [],
+        executionTime: Date.now() - start,
+      };
+    }
   }
 
   // ── Phase 1.5: Load learned rules for this agent/hostname ──────────────────
   let learnedRulesBlock = '';
   try {
-    const hostname = url ? (() => { try { return new URL(url).hostname.replace(/^\.www\./, ''); } catch (_) { return null; } })() : null;
     const ruleKeys = [agentId];
     if (hostname) ruleKeys.push(hostname);
     const rules = await skillDb.getContextRulesByKeys(ruleKeys);
@@ -582,12 +663,15 @@ async function playwrightAgent(args) {
   // ── Phase 2: Plan generation ───────────────────────────────────────────────
   logger.info(`[playwright.agent] phase 2: generating plan`);
   const planMessages = [
-    { role: 'system', content: PLAN_SYSTEM_PROMPT + learnedRulesBlock },
-    { role: 'user',   content: `GOAL: ${goal}\n\nSNAPSHOT:\n${trimSnapshot(currentSnapshot, 16000)}${agentContext ? `\n\nAGENT CONTEXT (agent instructions — follow these for site-specific behaviour):\n${agentContext}` : ''}` },
+    { role: 'system', content: PLAN_SYSTEM_PROMPT + learnedRulesBlock + domainLockBlock },
+    { role: 'user',   content: `GOAL: ${goal}\n\nSNAPSHOT:\n${extractInteractiveRefs(currentSnapshot)}${agentContext ? `\n\nAGENT CONTEXT (agent instructions — follow these for site-specific behaviour):\n${agentContext}` : ''}` },
   ];
+  // Dynamic token cap: short focused tasks (< 400 chars) seldom produce > 3 steps
+  // so 800 tokens avoids wasting 1-2s on padding. Complex multi-site goals get 2048.
+  const _planMaxTokens = goal.length < 400 ? 800 : 2048;
   let planRaw;
   try {
-    planRaw = await askWithMessages(planMessages, { temperature: 0.1, maxTokens: 2048, responseTimeoutMs: 30000 });
+    planRaw = await askWithMessages(planMessages, { temperature: 0.1, maxTokens: _planMaxTokens, responseTimeoutMs: 30000 });
   } catch (err) {
     logger.error(`[playwright.agent] plan LLM error: ${err.message}`);
     return { ok: false, goal, sessionId, turns: 0, done: false, result: `LLM unavailable: ${err.message}`, transcript: [], error: err.message, executionTime: Date.now() - start };
@@ -598,7 +682,7 @@ async function playwrightAgent(args) {
     // Retry once — the first response may have been truncated mid-JSON
     logger.warn(`[playwright.agent] plan response unparseable on first attempt — retrying: ${planRaw?.slice(0, 200)}`);
     try {
-      planRaw = await askWithMessages(planMessages, { temperature: 0.1, maxTokens: 2048, responseTimeoutMs: 30000 });
+      planRaw = await askWithMessages(planMessages, { temperature: 0.1, maxTokens: _planMaxTokens, responseTimeoutMs: 30000 });
       planParsed = parseJson(planRaw);
     } catch (retryErr) {
       logger.error(`[playwright.agent] plan retry LLM error: ${retryErr.message}`);
@@ -730,7 +814,32 @@ async function playwrightAgent(args) {
     logger.info(`[playwright.agent] step ${stepIndex + 1}/${plan.length}: ${JSON.stringify(step)}`);
     let outcome;
     try {
-      outcome = await browserAct({ ...step, sessionId, headed, timeoutMs });
+      // ── Semantic fallback actions — translate to Playwright locator API ──────
+      if (step.action === 'find-role') {
+        const { role, name, findAction = 'click', value, text } = step;
+        const nameArg = name ? `, { name: ${JSON.stringify(name)} }` : '';
+        const loc = `page.getByRole(${JSON.stringify(role)}${nameArg})`;
+        const code = findAction === 'fill'
+          ? `async page => { await ${loc}.fill(${JSON.stringify(value ?? text ?? '')}); }`
+          : `async page => { await ${loc}.${findAction}(); }`;
+        outcome = await browserAct({ action: 'run-code', code, sessionId, headed, timeoutMs });
+      } else if (step.action === 'find-label') {
+        const { label, findAction = 'click', value, text } = step;
+        const loc = `page.getByLabel(${JSON.stringify(label)})`;
+        const code = findAction === 'fill'
+          ? `async page => { await ${loc}.fill(${JSON.stringify(value ?? text ?? '')}); }`
+          : `async page => { await ${loc}.${findAction}(); }`;
+        outcome = await browserAct({ action: 'run-code', code, sessionId, headed, timeoutMs });
+      } else if (step.action === 'find-text') {
+        const code = `async page => { await page.getByText(${JSON.stringify(step.text)}).first().click(); }`;
+        outcome = await browserAct({ action: 'run-code', code, sessionId, headed, timeoutMs });
+      } else if (step.action === 'wait') {
+        const ms = Math.min(parseInt(step.ms || step.duration || 2000, 10), 5000);
+        await new Promise(r => setTimeout(r, ms));
+        outcome = { ok: true, result: `waited ${ms}ms` };
+      } else {
+        outcome = await browserAct({ ...step, sessionId, headed, timeoutMs });
+      }
     } catch (err) {
       outcome = { ok: false, error: err.message };
     }
@@ -771,8 +880,8 @@ async function playwrightAgent(args) {
             const retrySnap = await browserAct({ action: 'snapshot', sessionId, headed, timeoutMs });
             if (retrySnap.ok && retrySnap.result) currentSnapshot = retrySnap.result;
             const retryPlanRaw = await askWithMessages([
-              { role: 'system', content: PLAN_SYSTEM_PROMPT + learnedRulesBlock },
-              { role: 'user', content: `GOAL: ${goal}\n\nNOTE: A previous attempt failed because the page returned an HTTP ${_httpErr} error. The page has been refreshed — please re-plan the full task from the current snapshot.\n\nSNAPSHOT:\n${trimSnapshot(currentSnapshot, 16000)}${agentContext ? `\n\nAGENT CONTEXT:\n${agentContext}` : ''}` },
+              { role: 'system', content: PLAN_SYSTEM_PROMPT + learnedRulesBlock + domainLockBlock },
+              { role: 'user', content: `GOAL: ${goal}\n\nNOTE: A previous attempt failed because the page returned an HTTP ${_httpErr} error. The page has been refreshed — please re-plan the full task from the current snapshot.\n\nSNAPSHOT:\n${extractInteractiveRefs(currentSnapshot)}${agentContext ? `\n\nAGENT CONTEXT:\n${agentContext}` : ''}` },
             ], { temperature: 0.1, maxTokens: 2048, responseTimeoutMs: 30000 });
             const retryPlanParsed = parseJson(retryPlanRaw);
             if (retryPlanParsed && Array.isArray(retryPlanParsed.plan) && retryPlanParsed.plan.length > 0) {
@@ -841,14 +950,14 @@ async function playwrightAgent(args) {
           const isNavStep = step.action === 'navigate' || step.action === 'goto';
           const significantChange = isNavStep
             ? (preRefCount > 0 || postRefCount > 0) && (changeFraction > 0 || absoluteDelta !== 0)
-            : (changeFraction >= 0.30 || absoluteDelta >= 20) && (preRefCount > 0 || postRefCount > 0);
+            : (changeFraction >= 0.15 || absoluteDelta >= 10) && (preRefCount > 0 || postRefCount > 0);
 
           if (significantChange && remaining.length > 0) {
             // If the snapshot captured only a skeleton (<20 refs), the page is still loading.
             // Wait for it to stabilise before handing the tiny snapshot to the re-plan LLM —
             // a 12-ref snapshot produces a bad plan (e.g. picks a nav link instead of the
             // chat input). The threshold of 20 covers typical SPA loading states.
-            if (postRefCount < 20) {
+            if (postRefCount < 10) {
               logger.info(`[playwright.agent] post-nav snapshot too small (${postRefCount} refs) — waiting for page to stabilise`);
               const stableSnap = await browserAct({ action: 'waitForStableText', sessionId, headed, timeoutMs: 12000 });
               const reSnap = await browserAct({ action: 'snapshot', sessionId, headed, timeoutMs });
@@ -858,6 +967,24 @@ async function playwrightAgent(args) {
               }
             }
             logger.info(`[playwright.agent] structural DOM change — re-planning ${remaining.length} remaining step(s) with fresh refs`);
+
+            // ── Login-wall interceptor: never let the LLM plan against a login page ──
+            // If the fresh snapshot contains an OAuth provider button ("Continue with
+            // Google / Apple / Microsoft"), this is definitely a login wall — escalate to
+            // browser.agent's waitForAuth immediately instead of asking the LLM to
+            // fill the email field (the LLM always does this and it is always wrong).
+            const OAUTH_BUTTON_SNAP_RE = /Continue with Google|Sign in with Google|Log in with Google|Continue with Apple|Sign in with Apple|Continue with Microsoft|Sign in with Microsoft|Continue with GitHub/i;
+            if (OAUTH_BUTTON_SNAP_RE.test(currentSnapshot)) {
+              logger.warn(`[playwright.agent] REPLAN blocked: OAuth login page detected in snapshot — returning loginWallDetected immediately`);
+              return {
+                ok: false, goal, sessionId,
+                turns: transcript.length, done: false,
+                loginWallDetected: true,
+                result: 'OAuth login page detected during navigation — escalating to waitForAuth',
+                transcript, executionTime: Date.now() - start,
+              };
+            }
+
             try {
               const replanRaw = await askWithMessages([
                 { role: 'system', content: REPLAN_SYSTEM_PROMPT },
@@ -903,6 +1030,11 @@ async function playwrightAgent(args) {
     totalRepairs++;
     logger.info(`[playwright.agent] step ${stepIndex + 1} failed — repair ${totalRepairs}/${maxRepairs}: ${outcome.error}`);
 
+    // Dismiss any pending browser dialog (e.g. "Leave site?") that may be blocking the
+    // session before we snapshot — otherwise the snapshot sees a dialog-blocked page and
+    // every subsequent repair step also times out (burning all repair credits).
+    await browserAct({ action: 'dialog-accept', sessionId, headed, timeoutMs: 3000 }).catch(() => {});
+
     // Fresh snapshot for repair context
     const repairSnap = await browserAct({ action: 'snapshot', sessionId, headed, timeoutMs });
     if (repairSnap.ok && repairSnap.result) currentSnapshot = repairSnap.result;
@@ -911,7 +1043,7 @@ async function playwrightAgent(args) {
     let repairRaw;
     try {
       repairRaw = await askWithMessages([
-        { role: 'system', content: REPAIR_SYSTEM_PROMPT },
+        { role: 'system', content: REPAIR_SYSTEM_PROMPT + domainLockBlock },
         { role: 'user', content: [
           `GOAL: ${goal}`,
           `FAILED_STEP: ${JSON.stringify(step)}`,
@@ -975,6 +1107,107 @@ async function playwrightAgent(args) {
   if (finalResult === null && lastGetPageTextResult !== null) {
     finalResult = lastGetPageTextResult;
   }
+
+  // ── Post-task completion verification ────────────────────────────────────────
+  // Takes a final snapshot after all steps complete and asks the LLM whether the
+  // goal was actually achieved. Catches silent completion failures where a step
+  // exits 0 but nothing happened: focus-wrong keyboard shortcuts, form submits that
+  // didn't register, modals that didn't close, etc.
+  //
+  // If verification fails (completed:false, confidence >= 0.75):
+  //   1. Run one targeted repair inline using the verify evidence as error context.
+  //   2. If repair steps execute cleanly → remove warning.
+  //   3. If repair also fails → return ok:true + verificationWarning (non-blocking).
+  // Entire block is non-fatal — any thrown error is caught and ignored.
+  // Skip for extraction tasks: when finalResult is long (> 100 chars), the agent
+  // already captured explicit content — verify would re-trigger a 9-39s LLM round-trip
+  // for no benefit. Only run for short/absent results (action tasks, form submits, etc.).
+  // ---------------------------------------------------------------------------
+  if (!finalResult || finalResult.length <= 100) {
+  try {
+    await new Promise(r => setTimeout(r, 1000)); // 1s post-action settle
+    const _verifySnap = await browserAct({ action: 'snapshot', sessionId, headed, timeoutMs: 10000 });
+    if (_verifySnap.ok && _verifySnap.result) {
+      const _lastActions = transcript.slice(-5).map(t => JSON.stringify(t.action)).join('\n');
+      const _verifyMsg = [
+        `GOAL: ${goal}`,
+        `LAST_ACTIONS:\n${_lastActions}`,
+        `CURRENT_PAGE:\n${trimSnapshot(_verifySnap.result, 3000)}`,
+      ].join('\n\n');
+
+      const _verifyRaw = await askWithMessages([
+        { role: 'system', content: VERIFY_SYSTEM_PROMPT },
+        { role: 'user', content: _verifyMsg },
+      ], { temperature: 0, maxTokens: 128, responseTimeoutMs: 12000 });
+
+      const _verifyParsed = parseJson(_verifyRaw);
+      if (_verifyParsed && _verifyParsed.completed === false && (_verifyParsed.confidence ?? 1) >= 0.75) {
+        logger.warn(`[playwright.agent] POST-TASK VERIFY FAILED (confidence=${_verifyParsed.confidence}): ${_verifyParsed.evidence || 'task incomplete'}`);
+
+        // If verification evidence describes a login/auth wall, skip inline repair —
+        // the repair LLM will just suggest clicking UI buttons (wrong approach).
+        // Return loginWallDetected:true so browser.agent's waitForAuth + auto-retry
+        // path fires, which is the only correct fix for an auth wall.
+        if (VERIFY_LOGIN_WALL_RE.test(_verifyParsed.evidence || '')) {
+          logger.warn(`[playwright.agent] verify: login wall detected in evidence — escalating to browser.agent waitForAuth (skipping repair)`);
+          return {
+            ok: false, done: false, goal, sessionId,
+            turns: transcript.length,
+            result: _verifyParsed.evidence,
+            transcript,
+            executionTime: Date.now() - start,
+            loginWallDetected: true,
+          };
+        }
+
+        let _verifyWarning = _verifyParsed.evidence || 'task may be incomplete';
+        try {
+          const _vRepairRaw = await askWithMessages([
+            { role: 'system', content: REPAIR_SYSTEM_PROMPT + domainLockBlock },
+            { role: 'user', content: [
+              `GOAL: ${goal}`,
+              `FAILED_STEP: ${JSON.stringify(transcript[transcript.length - 1]?.action || {})}`,
+              `ERROR: Post-task verification failed — ${_verifyParsed.evidence || 'task appears incomplete based on final page state'}`,
+              `REMAINING_PLAN: []`,
+              ``,
+              `SNAPSHOT:`,
+              trimSnapshot(_verifySnap.result),
+            ].join('\n') },
+          ], { temperature: 0.1, maxTokens: 1024, responseTimeoutMs: 20000 });
+
+          const _vRepairParsed = parseJson(_vRepairRaw);
+          if (_vRepairParsed && Array.isArray(_vRepairParsed.repair) && _vRepairParsed.repair.length > 0) {
+            logger.info(`[playwright.agent] verify-repair: ${_vRepairParsed.repair.length} corrective steps — ${_vRepairParsed.thoughts || ''}`);
+            for (const _vStep of _vRepairParsed.repair.slice(0, 3)) {
+              const _vNorm = normalizeStep(_vStep);
+              const _vOut = await browserAct({ ...(_vNorm || {}), sessionId, headed, timeoutMs });
+              transcript.push({ step: transcript.length + 1, action: _vNorm, outcome: _vOut, thoughts: 'verify-repair' });
+              if (_vOut.ok) _verifyWarning = null; // repair step succeeded — clear warning
+            }
+          }
+        } catch (_vRepairErr) {
+          logger.warn(`[playwright.agent] verify-repair LLM error: ${_vRepairErr.message}`);
+        }
+
+        if (_verifyWarning) {
+          // Non-login-wall verify failure: surface the warning but keep ok:false
+          // so the step shows as failed in the panel rather than silently green.
+          return {
+            ok: false, goal, sessionId,
+            turns: transcript.length, done: false,
+            result: finalResult !== null ? finalResult : `Completed: ${goal}`,
+            transcript,
+            executionTime: Date.now() - start,
+            verificationWarning: _verifyWarning,
+            error: `Task completion could not be verified: ${_verifyWarning}`,
+          };
+        }
+      }
+    }
+  } catch (_verifyErr) {
+    logger.warn(`[playwright.agent] post-task verification error (non-fatal): ${_verifyErr.message}`);
+  }
+  } // end verify gate
 
   // ── Done ───────────────────────────────────────────────────────────────────
   logger.info(`[playwright.agent] DONE — ${transcript.length} steps executed (${totalRepairs} repairs)`);

@@ -203,6 +203,19 @@ async function getContextRulesByKeys(keys, contextType = undefined) {
   return Array.isArray(results) ? results.map(r => r.ruleText || r.rule_text || '').filter(Boolean) : [];
 }
 
+async function deleteContextRulesByKey(contextKey) {
+  const res = await httpPost('/context_rule.delete_by_key', {
+    version: 'mcp.v1',
+    service: 'user-memory',
+    action: 'context_rule.delete_by_key',
+    payload: { contextKey },
+  });
+  if (res?.status !== 'ok') {
+    logger.warn(`[skill-db] deleteContextRulesByKey failed: ${JSON.stringify(res?.error || res)?.slice(0, 120)}`);
+  }
+  return res?.status === 'ok';
+}
+
 // ── Skill registry helpers ───────────────────────────────────────────────────
 
 async function getSkill(skillName) {
@@ -221,7 +234,7 @@ module.exports = {
   // Semantic memory
   remember, recall,
   // Context rules
-  setContextRule, getContextRules, getContextRulesByKeys,
+  setContextRule, getContextRules, getContextRulesByKeys, deleteContextRulesByKey,
   // Skill registry
   getSkill, upsertSkill,
 };

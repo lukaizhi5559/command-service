@@ -33,11 +33,12 @@ const { cliAgent } = require('./skills/cli.agent.cjs');
 const { browserAgent } = require('./skills/browser.agent.cjs');
 const { playwrightAgent } = require('./skills/playwright.agent.cjs');
 const { agentbrowserAct } = require('./skills/agentbrowser.act.cjs');
-const { agentbrowserAgent } = require('./skills/agentbrowser.agent.cjs');
+const { agentbrowserAgent, agentbrowserAgentSkill } = require('./skills/agentbrowser.agent.cjs');
 const creatorAgent = require('./skills/creator.agent.cjs');
 const reviewerAgent = require('./skills/reviewer.agent.cjs');
 const skillCreator = require('./skills/skillCreator.skill.cjs');
 const { screenCapture } = require('./skills/screen.capture.cjs');
+const { userAgent } = require('./skills/user.agent.cjs');
 const skillScheduler = require('./skill-helpers/skill-scheduler.cjs');
 
 class CommandServiceMCPServer {
@@ -131,6 +132,9 @@ class CommandServiceMCPServer {
       case 'project.stopper':
         return await this._skillProjectStopper(args);
 
+      case 'user.agent':
+        return await this._skillUserAgent(args);
+
       default:
         return {
           success: false,
@@ -215,6 +219,10 @@ class CommandServiceMCPServer {
     return await projectStop(args);
   }
 
+  async _skillUserAgent(args) {
+    return await userAgent(args);
+  }
+
   async _skillPlaywrightAgent(args) {
     return await playwrightAgent(args);
   }
@@ -224,7 +232,7 @@ class CommandServiceMCPServer {
   }
 
   async _skillAgentbrowserAgent(args) {
-    return await agentbrowserAgent(args);
+    return await agentbrowserAgentSkill(args);
   }
 
   // ---------------------------------------------------------------------------

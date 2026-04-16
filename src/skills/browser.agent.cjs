@@ -32,6 +32,13 @@ const AGENTS_DB_PATH = path.join(os.homedir(), '.thinkdrop', 'agents.db');
 const AGENTS_DIR     = path.join(os.homedir(), '.thinkdrop', 'agents');
 const BROWSER_ACT_PORT = parseInt(process.env.COMMAND_SERVICE_PORT || '3007', 10);
 
+// Lazy-loaded to avoid circular require — only pulled in when auto-connect is active
+let _ensureChromeCDP = null;
+function getEnsureChromeCDP() {
+  if (!_ensureChromeCDP) _ensureChromeCDP = require('./agentbrowser.act.cjs').ensureChromeCDP;
+  return _ensureChromeCDP;
+}
+
 // ---------------------------------------------------------------------------
 // DuckDB registry (shared with cli.agent)
 // ---------------------------------------------------------------------------
@@ -86,7 +93,7 @@ const KNOWN_BROWSER_SERVICES = {
   google:         { startUrl: 'https://accounts.google.com',                     signInUrl: 'https://accounts.google.com',                       authSuccessPattern: 'myaccount.google.com',         isOAuth: true  },
   slack:          { startUrl: 'https://app.slack.com',                           signInUrl: 'https://slack.com/signin',                          authSuccessPattern: 'app.slack.com/client',         isOAuth: true  },
   discord:        { startUrl: 'https://discord.com/channels/@me',                signInUrl: 'https://discord.com/login',                         authSuccessPattern: 'discord.com/channels',         isOAuth: true  },
-  notion:         { startUrl: 'https://www.notion.so',                           signInUrl: 'https://www.notion.so/login',                       authSuccessPattern: 'notion.so',                    isOAuth: true, preferAgentBrowser: true, postAuthUrl: 'https://www.notion.so'  },
+  notion:         { startUrl: 'https://www.notion.so',                           signInUrl: 'https://www.notion.so/login',                       authSuccessPattern: 'notion.so',                    isOAuth: true, preferAgentBrowser: true, postAuthUrl: 'https://www.notion.so', usePersistentProfile: true  },
   figma:          { startUrl: 'https://www.figma.com',                           signInUrl: 'https://www.figma.com/login',                       authSuccessPattern: 'figma.com/files',              isOAuth: true  },
   linear:         { startUrl: 'https://linear.app',                              signInUrl: 'https://linear.app/login',                          authSuccessPattern: 'linear.app/',                  isOAuth: true  },
   jira:           { startUrl: 'https://id.atlassian.com',                        signInUrl: 'https://id.atlassian.com',                          authSuccessPattern: 'atlassian.net',                isOAuth: true  },
@@ -162,7 +169,7 @@ const KNOWN_BROWSER_SERVICES = {
   geminiai:       { startUrl: 'https://gemini.google.com',                       authSuccessPattern: 'gemini.google.com',             isOAuth: false },
   gemini:         { startUrl: 'https://gemini.google.com',                       authSuccessPattern: 'gemini.google.com',             isOAuth: false },
   googleai:       { startUrl: 'https://gemini.google.com',                       authSuccessPattern: 'gemini.google.com',             isOAuth: false },
-  claude:         { startUrl: 'https://claude.ai/new',                           authSuccessPattern: 'claude.ai',                    isOAuth: false },
+  claude:         { startUrl: 'https://claude.ai/new', signInUrl: 'https://claude.ai/login', postAuthUrl: 'https://claude.ai/new', authSuccessPattern: 'claude.ai',      isOAuth: true  },
   perplexitychat: { startUrl: 'https://www.perplexity.ai/',                      authSuccessPattern: 'perplexity.ai',                isOAuth: false },
   grok:           { startUrl: 'https://grok.com/',                               authSuccessPattern: 'grok.com',                     isOAuth: false },
   copilotmsft:    { startUrl: 'https://copilot.microsoft.com/',                  authSuccessPattern: 'copilot.microsoft.com',        isOAuth: false },
@@ -1351,7 +1358,7 @@ function callSkill(skillName, args, timeoutMs = 120000) {
   });
 }
 
-async function actionRun({ agentId, task, context, requiresAuth, _progressCallbackUrl, _stepIndex }) {
+async function actionRun({ agentId, task, context, requiresAuth, _progressCallbackUrl, _stepIndex, _loginWallRetried = false }) {
   if (!agentId) return { ok: false, error: 'agentId is required' };
   if (!task)    return { ok: false, error: 'task is required' };
 
@@ -1552,8 +1559,6 @@ async function actionRun({ agentId, task, context, requiresAuth, _progressCallba
   const startUrl           = extractDescriptorUrl(existing.descriptor, 'start_url');
   const signInUrl          = extractDescriptorUrl(existing.descriptor, 'sign_in_url');
   const authSuccessPattern = extractDescriptorUrl(existing.descriptor, 'auth_success_pattern');
-  const authTarget         = signInUrl || startUrl;
-
   if (!startUrl) return { ok: false, error: 'Agent descriptor missing start_url' };
 
   const profile   = `${agentId.replace('.agent', '')}_agent`;
@@ -1565,7 +1570,6 @@ async function actionRun({ agentId, task, context, requiresAuth, _progressCallba
 
   const _svcKey          = (existing.service || agentId.replace(/\.agent$/, '')).toLowerCase().replace(/[^a-z0-9]/g, '');
   const _svcInfo         = lookupBrowserService(_svcKey);
-  const _skipInitialAuth = _svcInfo?.isOAuth === false && !requiresAuth;
 
   // Route to agentbrowser.agent when preferAgentBrowser is set on the service entry
   // or when THINKDROP_CLI_DRIVER=agentbrowser is set globally.
@@ -1575,77 +1579,121 @@ async function actionRun({ agentId, task, context, requiresAuth, _progressCallba
     logger.info(`[browser.agent] run: routing ${agentId} through agentbrowser.agent (preferAgentBrowser=${_svcInfo?.preferAgentBrowser}, env=${process.env.THINKDROP_CLI_DRIVER})`);
   }
 
-  // Step 1: ensure auth session exists (skipped for anonymous-first services unless caller explicitly set requiresAuth=true)
-  if (!_skipInitialAuth) {
-    let authResult;
-    try {
-      // Always use playwright-cli (callBrowserAct) for OAuth — avoids navigator.webdriver=true
-      // rejection that CDP-controlled agentbrowser gets from Google & other providers.
-      authResult = await callBrowserAct({
-        action: 'waitForAuth',
-        sessionId,
-        url: authTarget,
-        authSuccessUrl: authSuccessPattern,
-        timeoutMs: 2 * 60 * 1000,
-        _progressCallbackUrl,
-      }, 3 * 60 * 1000);
-    } catch (err) {
-      const failureNote = `[${new Date().toISOString()}] waitForAuth threw: ${err.message} | url=${startUrl} | task=${task}`;
-      logger.warn(`[browser.agent] run: waitForAuth threw — triggering self-heal for ${agentId}`);
-      (async () => {
-        try {
-          await actionRecordFailure({ id: agentId, failureEntry: failureNote });
-          const healResult = await actionValidateAgent({ id: agentId });
-          logger.info(`[browser.agent] self-heal (throw): validate_agent verdict=${healResult?.verdict} for ${agentId}`);
-        } catch (healErr) {
-          logger.warn(`[browser.agent] self-heal error: ${healErr.message}`);
-        }
-      })();
-      return { ok: false, error: `waitForAuth failed: ${err.message}` };
-    }
+  // When auto-connect is enabled, agentbrowser attaches to the user's already-running
+  // Chrome via CDP. No playwright waitForAuth / state-bridging needed — Chrome already
+  // has all auth cookies. Activate per service (useAutoConnect) or globally via env var.
+  const _useAutoConnect = _useAgentBrowser && (
+    _svcInfo?.useAutoConnect === true ||
+    process.env.THINKDROP_AUTO_CONNECT === 'true'
+  );
+  if (_useAutoConnect) {
+    logger.info(`[browser.agent] run: auto-connect mode for ${agentId} — skipping playwright auth, attaching to running Chrome`);
+  }
 
-    if (!authResult?.ok) {
-      const failureNote = `[${new Date().toISOString()}] waitForAuth failed: ${authResult?.error || 'timeout'} | url=${startUrl} | task=${task}`;
-      logger.warn(`[browser.agent] run: auth failed — recording failure + triggering self-heal for ${agentId}`);
-      (async () => {
-        try {
-          await actionRecordFailure({ id: agentId, failureEntry: failureNote });
-          const healResult = await actionValidateAgent({ id: agentId });
-          logger.info(`[browser.agent] self-heal: validate_agent verdict=${healResult?.verdict} for ${agentId}`);
-        } catch (healErr) {
-          logger.warn(`[browser.agent] self-heal error: ${healErr.message}`);
-        }
-      })();
-      return { ok: false, error: `Auth failed for ${agentId}: ${authResult?.error}` };
-    }
+  // Persistent-profile mode: agent-browser opens Chrome with a persistent profile dir so
+  // cookies survive between runs. User logs in once (headed), then auth is automatic.
+  const AGENT_BROWSER_PROFILE = path.join(os.homedir(), '.thinkdrop', 'agent-profile');
+  const _usePersistentProfile = _useAgentBrowser && (_svcInfo?.usePersistentProfile === true);
+  if (_usePersistentProfile) {
+    logger.info(`[browser.agent] run: persistent-profile mode for ${agentId} — profile=${AGENT_BROWSER_PROFILE}`);
+  }
 
-    // Bridge playwright-cli auth state → agentbrowser when using agentbrowser driver.
-    // playwright-cli handles OAuth without webdriver rejection; agent-browser loads
-    // the resulting storageState JSON so it starts with authenticated cookies.
-    if (_useAgentBrowser) {
-      const _stateFile = path.join(os.homedir(), '.thinkdrop', 'ab-sessions', `${sessionId}.json`);
-      fs.mkdirSync(path.dirname(_stateFile), { recursive: true });
+  // ── Step 1: Auth — lazy navigate-first ────────────────────────────────────
+  // Rule: go to the site first; only call waitForAuth if the site itself redirects
+  // to a login/auth page. Never navigate to sign-in upfront.
+  //
+  // agentbrowser path: fully independent — agentbrowser.agent handles its own lazy
+  //   auth gate; playwright-cli is never involved for this stack.
+  // playwright path: navigate to startUrl, probe current URL, call waitForAuth only
+  //   if redirected to a login path. Applies uniformly to all services.
+  let _effectiveAutoConnect = _useAutoConnect && !_usePersistentProfile;
+
+  if (_useAgentBrowser) {
+    // agentbrowser.agent handles its own auth lazily — no playwright-cli involvement.
+    if (_usePersistentProfile) {
+      // Daemon restart forces --profile/--headed flags on next launch.
+      await callAgentbrowserAct({ action: 'close-all' }, 8000).catch(() => {});
+      logger.info(`[browser.agent] persistent-profile: cleared sessions for ${agentId} — profile=${AGENT_BROWSER_PROFILE}`);
+    } else if (_useAutoConnect) {
       try {
-        // Navigate playwright-cli to postAuthUrl so state-save captures workspace cookies,
-        // not an onboarding/interstitial page that waitForAuth may have stopped at.
-        if (_svcInfo?.postAuthUrl) {
-          logger.info(`[browser.agent] navigating playwright-cli to postAuthUrl before state-save: ${_svcInfo.postAuthUrl}`);
-          await callBrowserAct({ action: 'navigate', sessionId, url: _svcInfo.postAuthUrl }, 25000);
-          await callBrowserAct({ action: 'waitForStableText', sessionId }, 15000).catch(() => {});
+        const cdpResult = await getEnsureChromeCDP()();
+        if (cdpResult.launched) {
+          logger.info(`[browser.agent] Chrome CDP launched for ${agentId} auto-connect ✓`);
+        } else if (!cdpResult.ok) {
+          logger.warn(`[browser.agent] CDP unavailable: ${cdpResult.error} — falling back to --profile Default for ${agentId}`);
+          _effectiveAutoConnect = false;
+        } else {
+          logger.info(`[browser.agent] Chrome CDP already available for ${agentId}`);
         }
-        await callBrowserAct({ action: 'state-save', sessionId, filePath: _stateFile }, 30000);
-        // Kill the agentbrowser daemon with --all so the next launch starts clean
-        // (correct --headed flag, fresh session flags). Do NOT close playwright-cli’s
-        // window here — closing it interferes with the user’s real Chrome sync.
-        await callAgentbrowserAct({ action: 'close-all' }, 8000).catch(() => {});
-        await callAgentbrowserAct({ action: 'state-load', sessionId, filePath: _stateFile }, 30000);
-        logger.info(`[browser.agent] auth state bridged playwright→agentbrowser for ${sessionId}`);
-      } catch (bridgeErr) {
-        logger.warn(`[browser.agent] auth state bridge failed (non-fatal) — ${bridgeErr.message}`);
+      } catch (cdpErr) {
+        logger.warn(`[browser.agent] ensureChromeCDP threw (non-fatal) — falling back to --profile Default: ${cdpErr.message}`);
+        _effectiveAutoConnect = false;
       }
     }
+    // agentbrowser.agent navigates to startUrl + lazy-checks auth itself.
+    logger.info(`[browser.agent] run: agentbrowser path — auth delegated to agentbrowser.agent for ${agentId}`);
   } else {
-    logger.info(`[browser.agent] run: skipping waitForAuth for anonymous-first service ${agentId} (isOAuth=false, requiresAuth=${!!requiresAuth})`);
+    // playwright path: navigate to startUrl first, probe URL, call waitForAuth only if
+    // the site redirects to a login path. Applies to ALL services uniformly.
+    let _authNeeded = false;
+    try {
+      logger.info(`[browser.agent] run: playwright auth-check — navigating to ${startUrl} for ${agentId}`);
+      const _probeNav = await callBrowserAct({ action: 'navigate', sessionId, url: startUrl, timeoutMs: 30000 }, 35000);
+      if (_probeNav?.ok !== false) {
+        const _hrefRes = await callBrowserAct({ action: 'evaluate', text: 'window.location.href', sessionId, timeoutMs: 5000 }, 8000).catch(() => ({}));
+        const _curHref = String(_hrefRes?.result ?? _hrefRes?.stdout ?? '').trim();
+        const _onLoginPage = _curHref.length > 4 && /\/(login|signin|sign[-_]in|auth|oauth|authorize)\b/i.test(_curHref);
+        if (_onLoginPage) {
+          logger.info(`[browser.agent] run: auth-check: login redirect (${_curHref}) — calling waitForAuth for ${agentId}`);
+          _authNeeded = true;
+        } else {
+          logger.info(`[browser.agent] run: auth-check: no login redirect${_curHref ? ` (${_curHref})` : ''} — skipping waitForAuth for ${agentId}`);
+        }
+      }
+    } catch (_probeErr) {
+      logger.warn(`[browser.agent] run: auth-check probe failed — falling back to waitForAuth: ${_probeErr.message}`);
+      _authNeeded = true;
+    }
+    if (_authNeeded) {
+      let authResult;
+      try {
+        authResult = await callBrowserAct({
+          action: 'waitForAuth',
+          sessionId,
+          url: signInUrl || startUrl,
+          authSuccessUrl: authSuccessPattern,
+          timeoutMs: 2 * 60 * 1000,
+          _progressCallbackUrl,
+        }, 3 * 60 * 1000);
+      } catch (err) {
+        const failureNote = `[${new Date().toISOString()}] waitForAuth threw: ${err.message} | url=${startUrl} | task=${task}`;
+        logger.warn(`[browser.agent] run: waitForAuth threw — triggering self-heal for ${agentId}`);
+        (async () => {
+          try {
+            await actionRecordFailure({ id: agentId, failureEntry: failureNote });
+            const healResult = await actionValidateAgent({ id: agentId });
+            logger.info(`[browser.agent] self-heal (throw): validate_agent verdict=${healResult?.verdict} for ${agentId}`);
+          } catch (healErr) {
+            logger.warn(`[browser.agent] self-heal error: ${healErr.message}`);
+          }
+        })();
+        return { ok: false, error: `waitForAuth failed: ${err.message}` };
+      }
+      if (!authResult?.ok) {
+        const failureNote = `[${new Date().toISOString()}] waitForAuth failed: ${authResult?.error || 'timeout'} | url=${startUrl} | task=${task}`;
+        logger.warn(`[browser.agent] run: auth failed — recording failure + triggering self-heal for ${agentId}`);
+        (async () => {
+          try {
+            await actionRecordFailure({ id: agentId, failureEntry: failureNote });
+            const healResult = await actionValidateAgent({ id: agentId });
+            logger.info(`[browser.agent] self-heal: validate_agent verdict=${healResult?.verdict} for ${agentId}`);
+          } catch (healErr) {
+            logger.warn(`[browser.agent] self-heal error: ${healErr.message}`);
+          }
+        })();
+        return { ok: false, error: `Auth failed for ${agentId}: ${authResult?.error}` };
+      }
+    }
   }
 
   // Step 2: delegate to playwright.agent or agentbrowser.agent with the authenticated session
@@ -1654,9 +1702,14 @@ async function actionRun({ agentId, task, context, requiresAuth, _progressCallba
     const agentResult = await callSkill(_agentSkill, {
       goal: task,
       agentContext: existing.descriptor ? existing.descriptor.slice(0, 800) : undefined,
-      url: _skipInitialAuth ? startUrl : (_useAgentBrowser && _svcInfo?.postAuthUrl ? _svcInfo.postAuthUrl : undefined),
+      url: _useAgentBrowser ? startUrl : undefined,
+      authSignInUrl: _useAgentBrowser ? (signInUrl || undefined) : undefined,
       sessionId,
       agentId,
+      autoConnect: _effectiveAutoConnect,
+      chromeProfile: _usePersistentProfile ? AGENT_BROWSER_PROFILE
+        : (!_effectiveAutoConnect && _useAutoConnect ? 'Default' : undefined),
+      headed: _usePersistentProfile ? true : undefined,
       maxTurns: 15,
       timeoutMs: 120000,
       _progressCallbackUrl,
@@ -1683,8 +1736,8 @@ async function actionRun({ agentId, task, context, requiresAuth, _progressCallba
     const _hasOAuthProvider  = _OAUTH_PROVIDERS_RE.test(agentResultText);
     const _isLoginWall       = _loginWallMatches >= 2 && agentResultText.trim().split(/\n+/).length < 50;
 
-    if (_isLoginWall || _hasOAuthProvider) {
-      logger.warn(`[browser.agent] Login wall detected for ${agentId} (signals=${_loginWallMatches}, oauthProvider=${_hasOAuthProvider}) — auto-upgrading to isOAuth:true`);
+    if (_isLoginWall || _hasOAuthProvider || agentResult?.loginWallDetected) {
+      logger.warn(`[browser.agent] Login wall detected for ${agentId} (signals=${_loginWallMatches}, oauthProvider=${_hasOAuthProvider}, explicitFlag=${!!agentResult?.loginWallDetected}) — auto-upgrading to isOAuth:true`);
       try {
         const _patchDb = await getDb();
         const _existingRows = _patchDb
@@ -1707,16 +1760,78 @@ async function actionRun({ agentId, task, context, requiresAuth, _progressCallba
               _patchedDesc, 'needs_auth', agentId
             );
           }
-          logger.info(`[browser.agent] ${agentId} patched: is_oauth=true${_hasOAuthProvider ? ' (OAuth provider buttons detected)' : ''} — will trigger waitForAuth on next run`);
+          logger.info(`[browser.agent] ${agentId} patched: is_oauth=true${_hasOAuthProvider ? ' (OAuth provider buttons detected)' : ''} — attempting auto-retry with waitForAuth`);
         }
       } catch (patchErr) {
         logger.warn(`[browser.agent] login-wall patch failed for ${agentId}: ${patchErr.message}`);
       }
+
+      // ── Auto-retry: trigger waitForAuth inline and re-run the agent once ──────
+      // This avoids requiring a manual re-run after the DB patch. The _loginWallRetried
+      // flag (passed via args) prevents an infinite retry loop if the second run also
+      // sees a wall (e.g. waitForAuth timed out, user didn't sign in).
+      if (!_loginWallRetried && !_useAgentBrowser) {
+        logger.info(`[browser.agent] auto-retry: calling waitForAuth for ${agentId} then re-delegating to ${_agentSkill}`);
+        try {
+          const _wallAuthResult = await callBrowserAct({
+            action: 'waitForAuth',
+            sessionId,
+            url: signInUrl || startUrl,
+            authSuccessUrl: authSuccessPattern,
+            timeoutMs: 2 * 60 * 1000,
+            _progressCallbackUrl,
+          }, 3 * 60 * 1000);
+
+          if (_wallAuthResult?.ok) {
+            logger.info(`[browser.agent] waitForAuth succeeded after login-wall upgrade for ${agentId} — retrying ${_agentSkill}`);
+            // Restore status to 'healthy' now that auth is confirmed working — ensures
+            // planSkills re-includes this agent in the AVAILABLE AGENTS list for future plans.
+            try {
+              const _healDb = await getDb();
+              if (_healDb) await _healDb.run('UPDATE agents SET status=? WHERE id=? AND status=?', 'healthy', agentId, 'needs_auth').catch(() => {});
+            } catch (_) {}
+            const _retryResult = await callSkill(_agentSkill, {
+              goal: task,
+              agentContext: existing.descriptor ? existing.descriptor.slice(0, 800) : undefined,
+              url: startUrl,
+              sessionId,
+              agentId,
+              autoConnect: _effectiveAutoConnect,
+              chromeProfile: _usePersistentProfile ? AGENT_BROWSER_PROFILE
+                : (!_effectiveAutoConnect && _useAutoConnect ? 'Default' : undefined),
+              headed: _usePersistentProfile ? true : undefined,
+              maxTurns: 15,
+              timeoutMs: 120000,
+              _progressCallbackUrl,
+              _stepIndex,
+              _loginWallRetried: true,  // prevent recursive retry
+            }, 130000);
+            return {
+              ok: _retryResult?.ok ?? false,
+              agentId,
+              task,
+              sessionId,
+              authenticated: true,
+              result: _retryResult?.result || _retryResult?.stdout || '',
+              transcript: _retryResult?.transcript || [],
+              turns: _retryResult?.turns,
+              done: _retryResult?.done,
+              error: _retryResult?.error,
+              autoRetriedAfterLoginWall: true,
+            };
+          } else {
+            logger.warn(`[browser.agent] waitForAuth did not complete for ${agentId} (user may not have signed in) — surfacing ASK_USER`);
+          }
+        } catch (retryErr) {
+          logger.warn(`[browser.agent] auto-retry after login-wall threw: ${retryErr.message}`);
+        }
+      }
+
       return {
         ok: false,
         agentId,
         task,
-        error: `Login wall detected for ${agentId} — service requires authentication. Agent upgraded to isOAuth:true. Re-run the step to trigger the login flow via waitForAuth.`,
+        error: `Login wall detected for ${agentId} — service requires authentication. Agent upgraded to isOAuth:true. Please sign in and re-run.`,
         loginWallDetected: true,
         oauthUpgraded: true,
       };
@@ -1905,6 +2020,44 @@ async function actionRecordFailure({ id, failureEntry }) {
 }
 
 // ---------------------------------------------------------------------------
+// actionExplore — resolve agent URL then invoke explore.agent
+// ---------------------------------------------------------------------------
+async function actionExplore({ agentId, goal, url, sessionId, maxDepth, maxNavItems }) {
+  if (!agentId) return { ok: false, error: 'agentId is required' };
+  if (!goal)    return { ok: false, error: 'goal is required' };
+
+  // Resolve start URL from agent descriptor (same pattern as actionRun)
+  let existing = await actionQueryAgent({ id: agentId });
+  if (!existing.found) {
+    const serviceKey = agentId.replace(/\.agent$/, '');
+    logger.info(`[browser.agent] explore: agent "${agentId}" not found — attempting auto-build for "${serviceKey}"`);
+    try {
+      const buildResult = await actionBuildAgent({ service: serviceKey });
+      if (buildResult.ok) existing = await actionQueryAgent({ id: agentId });
+    } catch (_) {}
+    if (!existing.found) {
+      return { ok: false, error: `Agent not found: ${agentId}. Build it first with action:build_agent.`, needsBuild: true };
+    }
+  }
+
+  const startUrl = url || existing.startUrl || existing.descriptor?.match(/start_url:\s*(.+)/)?.[1]?.trim();
+  if (!startUrl) return { ok: false, error: `No start URL for agent ${agentId}` };
+
+  const exploreSessionId = sessionId || `${agentId}_explore`;
+  logger.info(`[browser.agent] explore: goal="${goal}" url=${startUrl} session=${exploreSessionId}`);
+
+  const { exploreAgent } = require('./explore.agent.cjs');
+  return await exploreAgent({
+    goal,
+    url: startUrl,
+    agentId,
+    sessionId: exploreSessionId,
+    maxDepth: maxDepth || 4,
+    maxNavItems: maxNavItems || 20,
+  });
+}
+
+// ---------------------------------------------------------------------------
 
 async function browserAgent(args) {
   const { action } = args || {};
@@ -1927,6 +2080,9 @@ async function browserAgent(args) {
     case 'run':
       return await actionRun(args);
 
+    case 'explore':
+      return await actionExplore(args);
+
     case 'scan_page':
       return await actionScanPage(args);
 
@@ -1936,7 +2092,7 @@ async function browserAgent(args) {
     default:
       return {
         ok: false,
-        error: `Unknown action: "${action}". Valid: build_agent | query_agent | list_agents | validate_agent | run | scan_page | record_failure`,
+        error: `Unknown action: "${action}". Valid: build_agent | query_agent | list_agents | validate_agent | run | explore | scan_page | record_failure`,
       };
   }
 }

@@ -757,7 +757,15 @@ async function browserAct(args) {
           error:         (pressRes.ok || navigationKill) ? undefined : pressRes.error || pressRes.stderr?.trim(),
         };
       }
-      return run(['press', pressKey], `press ${pressKey}`);
+      // playwright-cli exits 0 even for invalid keys but writes the error into stdout.
+      // Detect and surface those as failures so plan repair fires instead of silently continuing.
+      const _pressRes = await run(['press', pressKey], `press ${pressKey}`);
+      if (_pressRes.ok && /\bError\b/i.test(_pressRes.stdout || '')) {
+        const _pressErr = (_pressRes.stdout || '').match(/Error[:\s].+/i)?.[0]?.trim() || `press failed: unknown key '${pressKey}'`;
+        logger.warn(`[browser.act] press ${pressKey}: stdout error detected — ${_pressErr}`);
+        return { ..._pressRes, ok: false, error: _pressErr };
+      }
+      return _pressRes;
     }
     case 'keydown': return run(['keydown', key || ''], `keydown ${key}`);
     case 'keyup':   return run(['keyup',   key || ''], `keyup ${key}`);
@@ -1140,6 +1148,38 @@ async function browserAct(args) {
         const navRes = await cliRun([...S, navCmd, url], navTimeout);
         if (navRes.ok) openSessions.add(sessionId);
         logger.info(`[browser.act] waitForAuth: navigated to ${url} on session=${sessionId} (cmd=${navCmd}, ok=${navRes.ok})`);
+      }
+
+      // ── Step 1b: Google OAuth fast-path ──────────────────────────────────
+      // Click "Continue with Google" via DOM eval — no snapshot file parsing needed.
+      // Using eval avoids fragile ref extraction: the DOM is the ground truth and this
+      // is the same pattern used by the click action's eval fallback throughout browser.act.
+      // Falls through to the passive poll regardless: if the click lands on
+      // accounts.google.com the poll detects host change → success. If button not found,
+      // the passive poll + UI card runs as before.
+      try {
+        await new Promise(r => setTimeout(r, 3000)); // settle — OAuth buttons render client-side after JS load
+        await cliRun([...S, 'waitForStableText'], 8000).catch(() => {});
+        const _oauthEval = `() => {
+          const GOOGLE_RE = /Continue with Google|Sign in with Google|Log in with Google/i;
+          const candidates = [...document.querySelectorAll('button,[role=button],[role=link],a')];
+          const btn = candidates.find(b =>
+            GOOGLE_RE.test((b.textContent || '').trim()) ||
+            GOOGLE_RE.test(b.getAttribute('aria-label') || '')
+          );
+          if (btn) { btn.click(); return 'clicked'; }
+          return 'not-found';
+        }`;
+        const _evalResult = await cliRun([...S, 'eval', _oauthEval], 6000);
+        const _evalOut = _evalResult.stdout || '';
+        if (_evalOut.includes('clicked')) {
+          logger.info(`[browser.act] waitForAuth: Google OAuth button clicked via eval for session=${sessionId}`);
+          await new Promise(r => setTimeout(r, 2000)); // let OAuth redirect start
+        } else {
+          logger.info(`[browser.act] waitForAuth: Google OAuth button not found via eval — falling back to passive poll`);
+        }
+      } catch (_oauthErr) {
+        logger.warn(`[browser.act] waitForAuth: OAuth fast-path error (non-fatal): ${_oauthErr.message}`);
       }
 
       // ── Step 2: poll until auth wall clears ──────────────────────────────

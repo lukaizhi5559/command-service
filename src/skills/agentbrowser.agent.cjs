@@ -44,6 +44,10 @@ const { agentbrowserAct } = require('./agentbrowser.act.cjs');
 const { askWithMessages } = require('../skill-helpers/skill-llm.cjs');
 const skillDb = require('../skill-helpers/skill-db.cjs');
 
+// Tracks in-progress sessions so the stealth daemon restart never kills a Chrome window
+// that is currently mid-auth or mid-execution. Checked by the close-all guard below.
+const _activeSessions = new Set();
+
 // ---------------------------------------------------------------------------
 // Action schema constants — agent-browser CLI semantics
 // Refs use @eN format. keyboard-type for contenteditable. eval for browser JS.
@@ -330,7 +334,12 @@ function looksLikeInterstitial(snapshotText) {
 // ---------------------------------------------------------------------------
 const MAX_ORIENT_STEPS = 3;
 
-async function orientPage({ goal, snapshot, sessionId, headed, timeoutMs, learnedRulesBlock }) {
+async function orientPage({ goal, snapshot, sessionId, headed, timeoutMs, learnedRulesBlock, autoConnect = false, stealth = false, provider = null }) {
+  // Build a local act helper bound to the same browser context as the caller.
+  const _orientAct = autoConnect
+    ? (a) => agentbrowserAct({ ...a, autoConnect: true, stealth, provider })
+    : (a) => agentbrowserAct({ ...a, stealth, provider });
+
   let currentSnapshot = snapshot;
   for (let i = 0; i < MAX_ORIENT_STEPS; i++) {
     let orientRaw;
@@ -365,7 +374,7 @@ async function orientPage({ goal, snapshot, sessionId, headed, timeoutMs, learne
 
     let outcome;
     try {
-      outcome = await _act({ ...orientStep, sessionId, headed, timeoutMs });
+      outcome = await _orientAct({ ...orientStep, sessionId, headed, timeoutMs });
     } catch (err) {
       outcome = { ok: false, error: err.message };
     }
@@ -375,8 +384,8 @@ async function orientPage({ goal, snapshot, sessionId, headed, timeoutMs, learne
       break;
     }
 
-    await _act({ action: 'waitForStableText', sessionId, headed, timeoutMs: Math.min(timeoutMs, 8000) }).catch(() => {});
-    const reSnap = await _act({ action: 'snapshot', sessionId, headed, timeoutMs });
+    await _orientAct({ action: 'waitForStableText', sessionId, headed, timeoutMs: Math.min(timeoutMs, 8000) }).catch(() => {});
+    const reSnap = await _orientAct({ action: 'snapshot', sessionId, headed, timeoutMs });
     if (reSnap.ok && reSnap.result) {
       currentSnapshot = reSnap.result;
       logger.info(`[agentbrowser.agent] orientation: re-snapshotted after step ${i + 1} (${countRefsAB(currentSnapshot)} refs)`);
@@ -449,57 +458,70 @@ async function agentbrowserAgent(args) {
     headed                = true,
     url,
     chromeProfile         = null,
+    autoConnect           = false,  // --auto-connect: attach to user's running Chrome
+    stealth               = (process.env.THINKDROP_STEALTH !== 'false'),  // env-driven default: true unless THINKDROP_STEALTH=false
+    provider              = null,   // cloud browser provider: 'browserless' | 'kernel' | etc.
     _progressCallbackUrl,
     _stepIndex            = 0,
   } = args || {};
 
   const start = Date.now();
-  // Partial-bind chromeProfile so every internal agentbrowserAct call uses the same
-  // browser context. When chromeProfile='Default', ALL calls use --profile Default
-  // (Chrome's real profile with Google auth cookies). When null, use --session isolation.
-  const _act = chromeProfile
-    ? (a) => agentbrowserAct({ ...a, chromeProfile })
-    : agentbrowserAct;
+  // Partial-bind autoConnect/chromeProfile so every internal agentbrowserAct call uses
+  // the same browser context.
+  //   autoConnect=true  → --auto-connect (attach to user's real running Chrome)
+  //   chromeProfile set → --profile <name> (persistent Chrome profile, Google OAuth)
+  //   neither           → --session isolation (default sandboxed session)
+  const _act = autoConnect
+    ? (a) => agentbrowserAct({ ...a, autoConnect: true, stealth, provider })
+    : (chromeProfile
+        ? (a) => agentbrowserAct({ ...a, chromeProfile, stealth, provider })
+        : (a) => agentbrowserAct({ ...a, stealth, provider }));
+
+  if (stealth) {
+    logger.info(`[agentbrowser.agent] stealth mode active${provider ? ` via provider=${provider}` : ' (local: real Chrome binary + navigator.webdriver suppression)'}`);
+    if (provider === 'browserless' && !process.env.BROWSERLESS_API_KEY) {
+      logger.warn('[agentbrowser.agent] BROWSERLESS_API_KEY not set — provider=browserless will fail');
+    }
+    if (provider === 'kernel' && !process.env.KERNEL_API_KEY) {
+      logger.warn('[agentbrowser.agent] KERNEL_API_KEY not set — provider=kernel will fail');
+    }
+    if (!autoConnect && !provider) {
+      // Kill any stale daemon — stealth flags (--executable-path, --args) are only
+      // honoured at daemon start time. If the daemon is already running it silently
+      // ignores them. Force a clean restart so the next 'open' launches Chrome with
+      // the real binary + anti-detection args.
+      // Guard: if any session is already executing (e.g. a concurrent retry fired by
+      // recoverSkill), skip close-all to avoid killing the active auth/browser window.
+      if (_activeSessions.size === 0) {
+        logger.info('[agentbrowser.agent] stealth: closing stale daemon so it restarts with anti-detection flags');
+        await agentbrowserAct({ action: 'close-all' }).catch(() => {});
+      } else {
+        logger.info(`[agentbrowser.agent] stealth: skipping close-all — ${_activeSessions.size} active session(s) in progress: ${[..._activeSessions].join(', ')}`);
+      }
+    }
+  }
 
   if (!goal) {
     return { ok: false, error: 'goal is required', executionTime: 0 };
   }
 
+  // Track this session so concurrent retries know not to call close-all while Chrome is active.
+  // try/finally ensures cleanup on every exit path (auth failure, plan failure, success).
+  _activeSessions.add(sessionId);
+  try {
   logger.info(`[agentbrowser.agent] start goal="${goal}" session=${sessionId} maxRepairs=${maxRepairs}`);
-
-  // ── Auth gate — runs BEFORE any navigation or task steps ─────────────────
-  // If authSignInUrl is provided, open the sign-in page and wait for user
-  // to complete authentication. agent-browser --session-name auto-persists
-  // the resulting cookies so subsequent steps are authenticated.
-  if (authSignInUrl) {
-    logger.info(`[agentbrowser.agent] waiting for auth: signIn=${authSignInUrl}`);
-    let authResult;
-    try {
-      authResult = await _act({
-        action:            'waitForAuth',
-        sessionId,
-        url:               authSignInUrl,
-        authSuccessUrl:    authSuccessPattern,
-        headed,
-        timeoutMs:         120000,
-        _progressCallbackUrl,
-      });
-    } catch (err) {
-      return { ok: false, goal, sessionId, error: `waitForAuth threw: ${err.message}`, executionTime: Date.now() - start };
-    }
-    if (!authResult?.ok) {
-      return { ok: false, goal, sessionId, error: `Auth failed: ${authResult?.error || 'timed out'}`, executionTime: Date.now() - start };
-    }
-    logger.info(`[agentbrowser.agent] auth resolved — proceeding with task`);
-  }
 
   const transcript = [];
   let finalResult = null;
 
   // ── Pre-navigation ─────────────────────────────────────────────────────────
-  if (url) {
-    logger.info(`[agentbrowser.agent] navigating to: ${url}`);
-    const navResult = await _act({ action: 'navigate', sessionId, url, headed, timeoutMs: Math.max(timeoutMs, 30000) });
+  // Always navigate to the site first. If authSignInUrl is set but no explicit
+  // start url, use the site root (origin of authSignInUrl) so we land on the
+  // real page — not the sign-in page — and can detect whether auth is needed.
+  const _navUrl = url || (authSignInUrl ? (() => { try { return new URL(authSignInUrl).origin; } catch (_) { return null; } })() : null);
+  if (_navUrl) {
+    logger.info(`[agentbrowser.agent] navigating to: ${_navUrl}`);
+    const navResult = await _act({ action: 'navigate', sessionId, url: _navUrl, headed, timeoutMs: Math.max(timeoutMs, 30000) });
     if (!navResult.ok) {
       return {
         ok: false, goal, sessionId, turns: 0, done: false,
@@ -510,9 +532,43 @@ async function agentbrowserAgent(args) {
   }
 
   // ── Phase 1: Wait for SPA to stabilise, then snapshot ────────────────────
-  if (url) {
+  if (_navUrl) {
     logger.info(`[agentbrowser.agent] phase 1: waiting for page to stabilise before snapshot`);
     await _act({ action: 'waitForStableText', sessionId, headed, timeoutMs: Math.min(timeoutMs, 15000) }).catch(() => {});
+  }
+
+  // ── Lazy auth gate — only trigger if site actually redirected to login ─────
+  // Check current URL after navigation. Only call waitForAuth if the site
+  // redirected to a sign-in path (session expired / first visit). This avoids
+  // blocking for 120s on sites that work without login (Perplexity basic use)
+  // and avoids navigating to 404 sign-in URLs that don't exist.
+  if (authSignInUrl) {
+    const hrefResult = await _act({ action: 'evaluate', text: 'window.location.href', sessionId, headed, timeoutMs: 5000 }).catch(() => ({}));
+    const currentHref = String(hrefResult?.result ?? hrefResult?.output ?? '');
+    const isLoginPage = currentHref.length > 0 && /sign.?in|log.?in|\/auth\b|\/login\b/i.test(currentHref);
+    if (isLoginPage) {
+      logger.info(`[agentbrowser.agent] auth required — site redirected to login page: ${currentHref}`);
+      let authResult;
+      try {
+        authResult = await _act({
+          action:            'waitForAuth',
+          sessionId,
+          url:               authSignInUrl,
+          authSuccessUrl:    authSuccessPattern,
+          headed,
+          timeoutMs:         120000,
+          _progressCallbackUrl,
+        });
+      } catch (err) {
+        return { ok: false, goal, sessionId, error: `waitForAuth threw: ${err.message}`, executionTime: Date.now() - start };
+      }
+      if (!authResult?.ok) {
+        return { ok: false, goal, sessionId, error: `Auth failed: ${authResult?.error || 'timed out'}`, executionTime: Date.now() - start };
+      }
+      logger.info(`[agentbrowser.agent] auth resolved — proceeding with task`);
+    } else {
+      logger.info(`[agentbrowser.agent] auth-check: site did not redirect to login${currentHref ? ` (${currentHref})` : ''} — skipping waitForAuth`);
+    }
   }
   logger.info(`[agentbrowser.agent] phase 1: snapshot`);
   const initSnap = await _act({ action: 'snapshot', sessionId, headed, timeoutMs });
@@ -521,7 +577,7 @@ async function agentbrowserAgent(args) {
   // ── Phase 1.2: Orientation loop — clear interstitials before plan generation
   if (looksLikeInterstitial(currentSnapshot)) {
     logger.info(`[agentbrowser.agent] phase 1.2: interstitial detected — running orientation loop (up to ${MAX_ORIENT_STEPS} steps)`);
-    currentSnapshot = await orientPage({ goal, snapshot: currentSnapshot, sessionId, headed, timeoutMs, learnedRulesBlock: '' });
+    currentSnapshot = await orientPage({ goal, snapshot: currentSnapshot, sessionId, headed, timeoutMs, learnedRulesBlock: '', autoConnect, stealth, provider });
   }
 
   // ── Phase 1.5: Load learned rules for this agent/hostname ─────────────────
@@ -537,14 +593,26 @@ async function agentbrowserAgent(args) {
     }
   } catch (_) { /* non-fatal */ }
 
+  // ── Phase 1.6: Build domain-lock block ──────────────────────────────────────
+  // Inject the service hostname so the planner and all re-plan/repair prompts
+  // know EXACTLY which domain they must stay on — LLM instruction only is
+  // insufficient when the goal wording is ambiguous (e.g. "search for X").
+  const hostname = url
+    ? (() => { try { return new URL(url).hostname.replace(/^www\./, ''); } catch (_) { return null; } })()
+    : null;
+  const domainLockBlock = hostname
+    ? `\n\nDOMAIN LOCK — ABSOLUTE:\nYou are automating '${hostname}'. NEVER navigate to any external site (not Google, Bing, DuckDuckGo, or any other place outside ${hostname}). If the goal involves searching, use ONLY the search/find features built into ${hostname} itself. Any navigate step MUST stay on '${hostname}' — violating this is a critical failure.`
+    : '';
+
   // ── Phase 2: Plan generation ───────────────────────────────────────────────
   // Pass snapshot directly to LLM — agent-browser -i snapshots are already
   // compact interactive-only text (~200-500 tokens), no preprocessing needed.
   logger.info(`[agentbrowser.agent] phase 2: generating plan (snapshot=${currentSnapshot.length} chars, ${countRefsAB(currentSnapshot)} refs)`);
   const snapshotForPlan = trimSnapshotAB(currentSnapshot, 32000);
+  const _serviceUrlLine = url ? `SERVICE URL: ${url}\n` : '';
   const planMessages = [
-    { role: 'system', content: AB_PLAN_SYSTEM_PROMPT + learnedRulesBlock },
-    { role: 'user',   content: `GOAL: ${goal}\n\nSNAPSHOT:\n${snapshotForPlan}${agentContext ? `\n\nAGENT CONTEXT (agent instructions — follow these for site-specific behaviour):\n${agentContext}` : ''}` },
+    { role: 'system', content: AB_PLAN_SYSTEM_PROMPT + learnedRulesBlock + domainLockBlock },
+    { role: 'user',   content: `${_serviceUrlLine}GOAL: ${goal}\n\nSNAPSHOT:\n${snapshotForPlan}${agentContext ? `\n\nAGENT CONTEXT (agent instructions — follow these for site-specific behaviour):\n${agentContext}` : ''}` },
   ];
   let planRaw;
   try {
@@ -630,8 +698,9 @@ async function agentbrowserAgent(args) {
         logger.info(`[agentbrowser.agent] snapshot step: re-planning ${remainingAfterSnap.length} step(s) with fresh refs`);
         try {
           const snapReplanRaw = await askWithMessages([
-            { role: 'system', content: AB_REPLAN_SYSTEM_PROMPT },
+            { role: 'system', content: AB_REPLAN_SYSTEM_PROMPT + domainLockBlock },
             { role: 'user', content: [
+              url ? `SERVICE URL: ${url}` : '',
               `GOAL: ${goal}`,
               `COMPLETED_STEPS: ${JSON.stringify(plan.slice(0, stepIndex + 1))}`,
               `STALE_REMAINING_PLAN: ${JSON.stringify(remainingAfterSnap)}`,
@@ -639,7 +708,7 @@ async function agentbrowserAgent(args) {
               `FRESH_SNAPSHOT (interactive elements, full ${countRefsAB(currentSnapshot)}-ref compact text):`,
               trimSnapshotAB(currentSnapshot, 32000),
               learnedRulesBlock,
-            ].join('\n') },
+            ].filter(Boolean).join('\n') },
           ], { temperature: 0.1, maxTokens: 1024, responseTimeoutMs: 20000 });
           const snapReplanParsed = parseJson(snapReplanRaw);
           if (snapReplanParsed && Array.isArray(snapReplanParsed.plan) && snapReplanParsed.plan.length > 0) {
@@ -779,8 +848,9 @@ async function agentbrowserAgent(args) {
             logger.info(`[agentbrowser.agent] structural DOM change — re-planning ${remaining.length} remaining step(s)`);
             try {
               const replanRaw = await askWithMessages([
-                { role: 'system', content: AB_REPLAN_SYSTEM_PROMPT },
+                { role: 'system', content: AB_REPLAN_SYSTEM_PROMPT + domainLockBlock },
                 { role: 'user', content: [
+                  url ? `SERVICE URL: ${url}` : '',
                   `GOAL: ${goal}`,
                   `COMPLETED_STEPS: ${JSON.stringify(plan.slice(0, stepIndex + 1))}`,
                   `STALE_REMAINING_PLAN: ${JSON.stringify(remaining)}`,
@@ -788,7 +858,7 @@ async function agentbrowserAgent(args) {
                   `FRESH_SNAPSHOT (interactive elements, full ${countRefsAB(currentSnapshot)}-ref compact text):`,
                   trimSnapshotAB(currentSnapshot, 32000),
                   learnedRulesBlock,
-                ].join('\n') },
+                ].filter(Boolean).join('\n') },
               ], { temperature: 0.1, maxTokens: 1024, responseTimeoutMs: 20000 });
               const replanParsed = parseJson(replanRaw);
               if (replanParsed && Array.isArray(replanParsed.plan) && replanParsed.plan.length > 0) {
@@ -831,8 +901,9 @@ async function agentbrowserAgent(args) {
     let repairRaw;
     try {
       repairRaw = await askWithMessages([
-        { role: 'system', content: AB_REPAIR_SYSTEM_PROMPT },
+        { role: 'system', content: AB_REPAIR_SYSTEM_PROMPT + domainLockBlock },
         { role: 'user', content: [
+          url ? `SERVICE URL: ${url}` : '',
           `GOAL: ${goal}`,
           `FAILED_STEP: ${JSON.stringify(step)}`,
           `ERROR: ${outcome.error}`,
@@ -840,7 +911,7 @@ async function agentbrowserAgent(args) {
           ``,
           `SNAPSHOT:`,
           trimSnapshotAB(currentSnapshot, 32000),
-        ].join('\n') },
+        ].filter(Boolean).join('\n') },
       ], { temperature: 0.1, maxTokens: 1024, responseTimeoutMs: 20000 });
     } catch (err) {
       return { ok: false, goal, sessionId, turns: transcript.length, done: false, result: `Repair LLM unavailable: ${err.message}`, transcript, error: err.message, executionTime: Date.now() - start };
@@ -910,6 +981,80 @@ async function agentbrowserAgent(args) {
     transcript,
     executionTime: Date.now() - start,
   };
+  } finally {
+    _activeSessions.delete(sessionId);
+  }
 }
 
-module.exports = { agentbrowserAgent };
+// ---------------------------------------------------------------------------
+// agentbrowserAgentSkill — action-based dispatcher (mirrors browser.agent API)
+// ---------------------------------------------------------------------------
+// Routes action: to the correct engine:
+//   build_agent / list_agents / validate_agent — DuckDB registry (browser.agent.cjs, no browser)
+//   run                                        — query registry → agentbrowserAgent
+//   explore                                    — agentbrowserAgent with goal+url, no descriptor
+//   (default)                                  — agentbrowserAgent passthrough (backward compat)
+//
+// Lazily requires browser.agent.cjs to avoid circular dependency at module init.
+// ---------------------------------------------------------------------------
+
+function _extractDescriptorField(descriptor, field) {
+  if (!descriptor) return null;
+  const m = descriptor.match(new RegExp(`^${field}:\\s*(.+)$`, 'm'));
+  return m ? m[1].trim() : null;
+}
+
+async function agentbrowserAgentSkill(args) {
+  const {
+    action = 'run', agentId, task, service, goal, url, sessionId, headed, ...rest
+  } = args;
+
+  // DuckDB registry operations — no browser needed; delegate to browser.agent
+  if (action === 'build_agent' || action === 'list_agents' || action === 'validate_agent') {
+    const { browserAgent } = require('./browser.agent.cjs');
+    return await browserAgent(args);
+  }
+
+  if (action === 'explore') {
+    return await agentbrowserAgent({
+      goal: goal || task || 'Explore this page',
+      url,
+      sessionId: sessionId || 'agentbrowser_explore',
+      headed: headed !== false,
+      ...rest,
+    });
+  }
+
+  if (action === 'run') {
+    if (!agentId) {
+      return { ok: false, error: 'agentbrowserAgentSkill action:run requires agentId' };
+    }
+    const { browserAgent } = require('./browser.agent.cjs');
+    const queryResult = await browserAgent({ action: 'query_agent', id: agentId });
+    if (!queryResult.ok || !queryResult.found) {
+      return {
+        ok: false,
+        error: `agentbrowserAgentSkill: agent "${agentId}" not found in registry. Build it first with action:build_agent.`,
+        queryResult,
+      };
+    }
+    const { descriptor, service: agentService } = queryResult;
+    const startUrl  = _extractDescriptorField(descriptor, 'start_url');
+    const signInUrl = _extractDescriptorField(descriptor, 'sign_in_url');
+    return await agentbrowserAgent({
+      goal: task || goal || `Complete the requested task on ${agentService}`,
+      sessionId: sessionId || agentId,
+      agentId,
+      agentContext: descriptor,
+      url: startUrl || url,
+      authSignInUrl: signInUrl,
+      headed: headed !== false,
+      ...rest,
+    });
+  }
+
+  // Default: pass through to agentbrowserAgent (backward compat)
+  return await agentbrowserAgent(args);
+}
+
+module.exports = { agentbrowserAgent, agentbrowserAgentSkill };
