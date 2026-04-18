@@ -173,7 +173,7 @@ ${STEP_FORMAT_CRITICAL}
 Rules:
 - PAGE ORIENTATION RULE: Before writing any task steps, assess the snapshot — ask "Is this page where I can accomplish the goal?" If blocked by an interstitial (onboarding, cookie wall, paywall, 404, setup screen, or anything that prevents completing the task), FIRST ask: "Is there a clickable element in this snapshot that moves me TOWARD the goal?" — e.g. 'Continue', 'Skip', 'Get started', 'Go to my workspace', 'Accept', 'Dismiss', 'Enter workspace'. If YES, your FIRST step MUST be a click on that element, immediately followed by { "action": "snapshot" }. Only use navigate as a last resort when no bypass element exists in the snapshot. STAY ON SERVICE: any navigate MUST stay within the same service domain — never navigate to Google or external sites.
 - Use element refs (e12, e83) from the snapshot for click/fill/hover — most reliable for DOM actions. Not valid inside page.evaluate().
-- Autocomplete inputs (e.g. Gmail To:): fill then press Tab.
+- Autocomplete inputs (e.g. Gmail To:, CC:, BCC:): fill then press Enter to confirm the recipient as a chip. Do NOT use Tab — Tab moves focus without creating the chip.
 - Contenteditable areas: click first, then type (not fill).
 - Do NOT include auth steps — assume already logged in.
 - CREDENTIALS RULE: If credentials not in goal text are required, return empty plan.
@@ -270,8 +270,9 @@ Respond with EXACTLY ONE JSON object (no markdown fences, no explanation):
 Rules:
 - Preserve the original INTENT of each stale step — just use correct fresh refs
 - Use element refs (e12, e83) from FRESH_SNAPSHOT for click/fill/hover
-- Autocomplete inputs (Gmail To:): fill then press Tab
+- Autocomplete inputs (Gmail To:, CC:, BCC:): fill then press Enter to confirm the recipient chip. Do NOT use Tab — Tab moves focus without creating the chip.
 - Contenteditable areas: click first, then type (not fill)
+- CREDENTIALS RULE: NEVER use placeholder text like 'your-email@gmail.com', 'user@example.com', '<email>', '<password>' in fill/type steps. Use {{service:username}} / {{service:password}} tokens, or exact values from GOAL text.
 - Keep plan concise — no unnecessary waits or redundant snapshots
 - DIALOG RULE: If a confirmation dialog may appear, add dialog-accept/dismiss after the triggering action
 - AI CHAT EXTRACTION RULE: If ANY stale remaining step was waitForStableText or getPageText, you MUST preserve BOTH in the re-plan — in order: first { "action": "waitForStableText" }, then { "action": "getPageText" }. NEVER collapse them into a single getText or omit waitForStableText. The AI response is still streaming when the DOM changes; skipping waitForStableText captures an incomplete response.
@@ -669,15 +670,26 @@ async function playwrightAgent(args) {
     }
   } catch (_) { /* non-fatal — proceed without rules */ }
 
+  // ── Phase 1.6: Stale compose-window guard for mail agents ─────────────────
+  // If a previous cron fire failed mid-compose, the browser session may have a
+  // compose window left open. The LLM will try to fill fields in it rather than
+  // opening a fresh one, causing "address in body" and send failures.
+  // Append a NOTE to the goal so the LLM closes any open compose/draft first.
+  const _isComposeTask = /send.*(email|mail)|compose|write.*to\s+\S+@/i.test(goal);
+  const _isMailAgentTask = ['gmail.agent', 'outlook.agent', 'yahoo.agent'].includes(agentId);
+  const effectiveGoal = (_isComposeTask && _isMailAgentTask)
+    ? `${goal}\n\nNOTE: If a compose or draft window is currently visible on the page, close it first (click its X button or press Escape) before opening a fresh Compose window.`
+    : goal;
+
   // ── Phase 2: Plan generation ───────────────────────────────────────────────
   logger.info(`[playwright.agent] phase 2: generating plan`);
   const planMessages = [
     { role: 'system', content: PLAN_SYSTEM_PROMPT + learnedRulesBlock + domainLockBlock },
-    { role: 'user',   content: `GOAL: ${goal}\n\nSNAPSHOT:\n${extractInteractiveRefs(currentSnapshot)}${agentContext ? `\n\nAGENT CONTEXT (agent instructions — follow these for site-specific behaviour):\n${agentContext}` : ''}` },
+    { role: 'user',   content: `GOAL: ${effectiveGoal}\n\nSNAPSHOT:\n${extractInteractiveRefs(currentSnapshot)}${agentContext ? `\n\nAGENT CONTEXT (agent instructions — follow these for site-specific behaviour):\n${agentContext}` : ''}` },
   ];
   // Dynamic token cap: short focused tasks (< 400 chars) seldom produce > 3 steps
   // so 800 tokens avoids wasting 1-2s on padding. Complex multi-site goals get 2048.
-  const _planMaxTokens = goal.length < 400 ? 800 : 2048;
+  const _planMaxTokens = effectiveGoal.length < 400 ? 800 : 2048;
   let planRaw;
   try {
     planRaw = await askWithMessages(planMessages, { temperature: 0.1, maxTokens: _planMaxTokens, responseTimeoutMs: 30000 });
@@ -890,7 +902,7 @@ async function playwrightAgent(args) {
             if (retrySnap.ok && retrySnap.result) currentSnapshot = retrySnap.result;
             const retryPlanRaw = await askWithMessages([
               { role: 'system', content: PLAN_SYSTEM_PROMPT + learnedRulesBlock + domainLockBlock },
-              { role: 'user', content: `GOAL: ${goal}\n\nNOTE: A previous attempt failed because the page returned an HTTP ${_httpErr} error. The page has been refreshed — please re-plan the full task from the current snapshot.\n\nSNAPSHOT:\n${extractInteractiveRefs(currentSnapshot)}${agentContext ? `\n\nAGENT CONTEXT:\n${agentContext}` : ''}` },
+              { role: 'user', content: `GOAL: ${effectiveGoal}\n\nNOTE: A previous attempt failed because the page returned an HTTP ${_httpErr} error. The page has been refreshed — please re-plan the full task from the current snapshot.\n\nSNAPSHOT:\n${extractInteractiveRefs(currentSnapshot)}${agentContext ? `\n\nAGENT CONTEXT:\n${agentContext}` : ''}` },
             ], { temperature: 0.1, maxTokens: 2048, responseTimeoutMs: 30000 });
             const retryPlanParsed = parseJson(retryPlanRaw);
             if (retryPlanParsed && Array.isArray(retryPlanParsed.plan) && retryPlanParsed.plan.length > 0) {
@@ -935,6 +947,63 @@ async function playwrightAgent(args) {
             outcome = { ok: false, error: 'fill succeeded but body text not found in page — element is likely a contenteditable div; use run-code with page.keyboard.type() or page.getByRole("textbox").fill() instead of a plain fill step' };
           }
         } catch (_) { /* verification failure is non-fatal — proceed */ }
+      }
+
+      // ── Post-fill recipient chip verification ─────────────────────────────
+      // Gmail (and similar webmail) requires pressing Enter after typing a
+      // recipient address to confirm it as a chip.  A plain `fill` leaves the
+      // address as unconfirmed text — Send silently drops it.
+      // Trigger: fill action + text looks like an email address + EITHER:
+      //   (a) the current session is a known mail agent (agentId/hostname-based), OR
+      //   (b) the step context mentions a recipient field (To / CC / BCC).
+      // Using (a) means the check always fires for gmail.agent even when the LLM
+      // generates opaque element refs like "e58" with no label text.
+      // Repair: if no chip found, press Enter, wait 400ms, re-verify once.
+      // If chip still absent after repair, mark outcome failed so the existing
+      // repair→deriveRule pipeline learns and stores the rule permanently.
+      const _isMailAgentSession = ['gmail.agent', 'outlook.agent', 'yahoo.agent'].includes(agentId)
+        || (hostname || '').includes('mail.google.com')
+        || (hostname || '').includes('outlook.live.com')
+        || (hostname || '').includes('mail.yahoo.com');
+      if (
+        step.action === 'fill' &&
+        typeof step.text === 'string' &&
+        /\S+@\S+\.\S+/.test(step.text) &&
+        (
+          _isMailAgentSession ||
+          /\bto\b|\bcc\b|\bbcc\b|\brecipient/i.test(
+            (step.selector || '') + ' ' + (step.description || '') + ' ' + (step.label || '')
+          )
+        )
+      ) {
+        try {
+          const _chipCheck = async () => {
+            const r = await browserAct({
+              action: 'run-code',
+              code: `
+                const addr = ${JSON.stringify(step.text.toLowerCase())};
+                const chips = [...document.querySelectorAll('[data-hovercard-id],[email],[data-chip],.vN [email],span[data-hovercard-id]')];
+                return chips.some(c =>
+                  (c.getAttribute('data-hovercard-id') || c.getAttribute('email') || c.textContent || '').toLowerCase().includes(addr)
+                ) ? 'chip_found' : 'no_chip';
+              `,
+              sessionId, headed, timeoutMs: 3000,
+            });
+            return r.ok ? r.result : 'no_chip';
+          };
+
+          let chipResult = await _chipCheck();
+          if (chipResult === 'no_chip') {
+            logger.info(`[playwright.agent] recipient chip not found after fill — pressing Enter to confirm`);
+            await browserAct({ action: 'press', key: 'Enter', sessionId, headed, timeoutMs: 3000 });
+            await new Promise(r => setTimeout(r, 400));
+            chipResult = await _chipCheck();
+          }
+          if (chipResult === 'no_chip') {
+            logger.warn(`[playwright.agent] recipient chip still absent after Enter — triggering repair`);
+            outcome = { ok: false, error: 'recipient address typed but chip not created — press Enter after filling the To/CC/BCC field to confirm the address as a chip before sending' };
+          }
+        } catch (_) { /* chip verification non-fatal — proceed */ }
       }
 
       // ── Auto re-snapshot after DOM-mutating actions ──────────────────────

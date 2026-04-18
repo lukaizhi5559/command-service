@@ -427,7 +427,8 @@ async function syncScheduledSkills() {
     const notifMessage = fm.message     || `ThinkDrop: ${skillName}`;
     const notifTitle   = fm.title       || 'ThinkDrop Reminder';
     const instruction  = fm.instruction || '';
-    const metadata     = { type: skillType, message: notifMessage, title: notifTitle, instruction };
+    // Bridge skills are scheduled intentionally — always fire without confirm dialog.
+    const metadata     = { type: skillType, message: notifMessage, title: notifTitle, instruction, ...(skillType === 'bridge' ? { forced: true } : {}) };
 
     // ── RANDOM_WINDOW pattern ───────────────────────────────────────────────
     const rw = parseRandomWindow(schedule);
@@ -519,7 +520,8 @@ async function registerSkill(skillName, schedule, execPath, metadata = {}) {
   const notifMessage = metadata.message     || `ThinkDrop: ${skillName}`;
   const notifTitle   = metadata.title       || 'ThinkDrop Reminder';
   const instruction  = metadata.instruction || '';
-  const fullMeta     = { type: skillType, message: notifMessage, title: notifTitle, instruction };
+  // Bridge skills are scheduled intentionally — always fire without confirm dialog.
+  const fullMeta     = { type: skillType, message: notifMessage, title: notifTitle, instruction, ...(skillType === 'bridge' ? { forced: true } : {}) };
 
   // ── RANDOM_WINDOW pattern ─────────────────────────────────────────────────
   const rw = parseRandomWindow(schedule);

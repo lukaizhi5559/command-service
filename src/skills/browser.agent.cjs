@@ -1359,7 +1359,7 @@ function callSkill(skillName, args, timeoutMs = 120000) {
   });
 }
 
-async function actionRun({ agentId, task, context, requiresAuth, _progressCallbackUrl, _stepIndex, _loginWallRetried = false }) {
+async function actionRun({ agentId, task, url, context, requiresAuth, _progressCallbackUrl, _stepIndex, _loginWallRetried = false }) {
   if (!agentId) return { ok: false, error: 'agentId is required' };
   if (!task)    return { ok: false, error: 'task is required' };
 
@@ -1784,7 +1784,7 @@ async function actionRun({ agentId, task, context, requiresAuth, _progressCallba
     const agentResult = await callSkill(_agentSkill, {
       goal: task,
       agentContext: existing.descriptor ? existing.descriptor.slice(0, 800) : undefined,
-      url: _useAgentBrowser ? startUrl : undefined,
+      url: url || (_useAgentBrowser ? startUrl : undefined),
       authSignInUrl: _useAgentBrowser ? (signInUrl || undefined) : undefined,
       sessionId,
       agentId,
