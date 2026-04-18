@@ -27,6 +27,7 @@ const os   = require('os');
 const fs   = require('fs');
 const http = require('http');
 const logger = require('../logger.cjs');
+const { userAgent } = require('./user.agent.cjs');
 
 const AGENTS_DB_PATH = path.join(os.homedir(), '.thinkdrop', 'agents.db');
 const AGENTS_DIR     = path.join(os.homedir(), '.thinkdrop', 'agents');
@@ -1636,15 +1637,54 @@ async function actionRun({ agentId, task, context, requiresAuth, _progressCallba
     // playwright path: navigate to startUrl first, probe URL, call waitForAuth only if
     // the site redirects to a login path. Applies to ALL services uniformly.
     let _authNeeded = false;
-    try {
+    let _skipNavigate = false;
+
+    // ── State persistence: try loading a saved auth session before doing a fresh
+    // navigate. playwright-cli injects saved cookies into the new browser process so
+    // sessions survive full app shutdown + OS restarts. Google cookies last ~2 weeks.
+    const _stateFile = path.join(os.homedir(), '.thinkdrop', 'browser-sessions', `${sessionId}.json`);
+    if (fs.existsSync(_stateFile)) {
+      logger.info(`[browser.agent] run: state file found for ${agentId} — loading persisted auth state`);
+      const _loadRes = await callBrowserAct({ action: 'state-load', sessionId, timeoutMs: 10000 }, 12000).catch(() => ({ ok: false }));
+      if (_loadRes?.ok !== false) {
+        // Navigate after injecting cookies — probe whether the session is still valid
+        const _stateNav = await callBrowserAct({ action: 'navigate', sessionId, url: startUrl, timeoutMs: 30000 }, 35000).catch(() => ({ ok: false }));
+        const _stateHrefRes = _stateNav?.ok !== false
+          ? await callBrowserAct({ action: 'evaluate', text: 'window.location.href', sessionId, timeoutMs: 5000 }, 8000).catch(() => ({}))
+          : {};
+        const _stateCurHref = String(_stateHrefRes?.result ?? _stateHrefRes?.stdout ?? '').trim();
+        const _stateOnLogin = _stateCurHref.length > 4 && /\/(login|signin|sign[-_]in|auth|oauth|authorize)\b/i.test(_stateCurHref);
+        _skipNavigate = true; // already navigated above — skip the auth-check navigate below
+        if (!_stateOnLogin) {
+          logger.info(`[browser.agent] run: state-load: auth cleared for ${agentId} (${_stateCurHref}) — skipping waitForAuth`);
+          // _authNeeded stays false
+        } else {
+          logger.warn(`[browser.agent] run: state-load: auth wall still present for ${agentId} — deleting stale state, re-authenticating`);
+          try { fs.unlinkSync(_stateFile); } catch (_) {}
+          _authNeeded = true;
+        }
+      } else {
+        logger.warn(`[browser.agent] run: state-load failed for ${agentId} — falling back to fresh auth check`);
+      }
+    }
+
+    if (!_skipNavigate) try {
       logger.info(`[browser.agent] run: playwright auth-check — navigating to ${startUrl} for ${agentId}`);
       const _probeNav = await callBrowserAct({ action: 'navigate', sessionId, url: startUrl, timeoutMs: 30000 }, 35000);
       if (_probeNav?.ok !== false) {
         const _hrefRes = await callBrowserAct({ action: 'evaluate', text: 'window.location.href', sessionId, timeoutMs: 5000 }, 8000).catch(() => ({}));
         const _curHref = String(_hrefRes?.result ?? _hrefRes?.stdout ?? '').trim();
         const _onLoginPage = _curHref.length > 4 && /\/(login|signin|sign[-_]in|auth|oauth|authorize)\b/i.test(_curHref);
-        if (_onLoginPage) {
-          logger.info(`[browser.agent] run: auth-check: login redirect (${_curHref}) — calling waitForAuth for ${agentId}`);
+        // Also detect domain mismatch — e.g. redirect to workspace.google.com instead of mail.google.com
+        let _wrongDomain = false;
+        try {
+          const _startHost = new URL(startUrl).hostname;
+          const _curHost   = new URL(_curHref.match(/https?:\/\//) ? _curHref : `https://${_curHref}`).hostname;
+          _wrongDomain = !!_startHost && !!_curHost && _curHost !== _startHost;
+        } catch (_) {}
+        if (_onLoginPage || _wrongDomain) {
+          const _reason = _onLoginPage ? 'login redirect' : `domain mismatch (expected ${(() => { try { return new URL(startUrl).hostname; } catch(_){return startUrl;} })()}, got ${(() => { try { return new URL(_curHref.match(/https?:\/\//) ? _curHref : `https://${_curHref}`).hostname; } catch(_){return _curHref;} })()})`;
+          logger.info(`[browser.agent] run: auth-check: ${_reason} — calling waitForAuth for ${agentId}`);
           _authNeeded = true;
         } else {
           logger.info(`[browser.agent] run: auth-check: no login redirect${_curHref ? ` (${_curHref})` : ''} — skipping waitForAuth for ${agentId}`);
@@ -1655,6 +1695,40 @@ async function actionRun({ agentId, task, context, requiresAuth, _progressCallba
       _authNeeded = true;
     }
     if (_authNeeded) {
+      // ── Resolve stored credentials via user.agent before opening auth form ──────
+      // user.agent calls profile.get which transparently decrypts SAFE: blobs so
+      // waitForAuth receives plaintext email + password for form auto-fill.
+      let _credentials = {};
+      try {
+        const credResult = await userAgent({ action: 'resolve_credentials', agentId });
+        if (credResult?.ok && credResult.resolved) {
+          _credentials = credResult.resolved;
+          const emailOk = !!_credentials.email;
+          const passOk  = !!_credentials.password;
+          logger.info(`[browser.agent] resolved credentials for ${agentId} (email ${emailOk ? '✓' : '✗'}, password ${passOk ? '✓' : '✗'})`);
+        }
+      } catch (_credErr) {
+        logger.warn(`[browser.agent] user.agent resolve_credentials failed (non-fatal): ${_credErr.message}`);
+      }
+
+      // ── Credential gate: prompt user if no email stored ─────────────────────
+      // Fires the existing ask_user short-circuit in executeCommand.js which
+      // surfaces the credential gather card and stores email/password securely.
+      // The user can type "skip" to proceed with manual login instead.
+      if (!_credentials.email) {
+        const _credNorm = agentId.toLowerCase().replace(/\.agent$/, '');
+        return {
+          ok:              false,
+          agentId,
+          task,
+          askUser:         true,
+          question:        `What email or username do you use for ${agentId}? (It will be stored securely for future logins. Type "skip" to log in manually.)`,
+          options:         [],
+          needsCredentials: true,
+          credentialKey:   `credential:${_credNorm}.agent:email`,
+        };
+      }
+
       let authResult;
       try {
         authResult = await callBrowserAct({
@@ -1662,6 +1736,7 @@ async function actionRun({ agentId, task, context, requiresAuth, _progressCallba
           sessionId,
           url: signInUrl || startUrl,
           authSuccessUrl: authSuccessPattern,
+          credentials: _credentials,
           timeoutMs: 2 * 60 * 1000,
           _progressCallbackUrl,
         }, 3 * 60 * 1000);
@@ -1693,6 +1768,13 @@ async function actionRun({ agentId, task, context, requiresAuth, _progressCallba
         })();
         return { ok: false, error: `Auth failed for ${agentId}: ${authResult?.error}` };
       }
+      // Auth succeeded — persist browser state so future runs skip waitForAuth entirely.
+      // state-save writes cookies + localStorage to ~/.thinkdrop/browser-sessions/<sessionId>.json.
+      // The file survives full shutdown; state-load injects it into a fresh process on next run.
+      logger.info(`[browser.agent] run: auth succeeded — saving browser state for ${agentId}`);
+      await callBrowserAct({ action: 'state-save', sessionId, timeoutMs: 10000 }, 12000).catch(e => {
+        logger.warn(`[browser.agent] run: state-save failed (non-fatal): ${e.message}`);
+      });
     }
   }
 

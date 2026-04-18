@@ -46,6 +46,33 @@ const os     = require('os');
 const fs     = require('fs');
 const { spawn } = require('child_process');
 const logger = require('../logger.cjs');
+const { askWithMessages } = require('../skill-helpers/skill-llm.cjs');
+
+// ---------------------------------------------------------------------------
+// Auth form loop — LLM prompt used by waitForAuth agentic fill
+// ---------------------------------------------------------------------------
+const AUTH_FORM_PROMPT = `You are a browser automation agent filling a login form.
+Given a page snapshot and the available credential types, decide the SINGLE next action.
+Reply ONLY with valid JSON — no markdown fences, no extra text:
+{"action":"fill_email","selector":"<CSS selector>","rationale":"<one line>"}
+
+action values:
+- fill_email    : An unfilled email/username input is visible. Use when has_email=true.
+- fill_password : A password input is visible. Use when has_password=true.
+- click_submit  : Credentials entered; a Next/Sign in/Log in button is visible and should be clicked.
+- done          : No more credential fields to fill (2FA page, CAPTCHA, or past login).
+
+Rules:
+- If both email AND password fields are visible at once, return fill_email first.
+- Prefer #id selectors. Then [name=x]. Then input[type="email"] or input[type="password"].
+- Never return fill_email if has_email=false. Never return fill_password if has_password=false.
+- Return done for 2FA prompts, CAPTCHA challenges, or when page has advanced past credential entry.
+- fill_email and fill_password are ONE-SHOT — never repeat an action already in "Completed actions".
+- click_submit MAY be retried: if credentials are filled but a submit button is still visible and the page has not yet transitioned, return click_submit again. Do NOT return done just because click_submit is already in Completed actions.
+- Only return done when you see a 2FA challenge, CAPTCHA, or the page is clearly past credential entry (e.g. inbox, dashboard).
+- "Visible inputs:" lists ONLY inputs that are truly visible (display!=none, visibility!=hidden, opacity>=0.9, height>0). Trust this over the ARIA snapshot which may include hidden inputs.
+- Never return fill_password unless "password" appears in the Visible inputs line.
+- selector must be a valid CSS selector string, or null for action=done.`;
 
 // ---------------------------------------------------------------------------
 // Binary resolution
@@ -411,6 +438,7 @@ async function browserAct(args) {
     headed     = true,
     timeoutMs  = 15000,
     authSuccessUrl,
+    credentials,
     _progressCallbackUrl,
   } = args || {};
 
@@ -601,85 +629,55 @@ async function browserAct(args) {
 
     // ── Fill / Type ─────────────────────────────────────────────────────────
     case 'fill': {
+      // Always use click → select-all → type (real keyboard events) rather than
+      // playwright-cli's native 'fill' which sets element.value directly. React,
+      // Vue, and other framework-controlled inputs (e.g. Google's sign-in page)
+      // ignore programmatic .value assignments — only actual keyboard events
+      // trigger their internal state updates and allow the form to submit correctly.
       await captureSnapshot(sessionId, headed, timeoutMs);
       const rawFillRef = resolveRef(sessionId, selector);
       // Only use real eN refs — synthetic line_N refs from .yml format are rejected by playwright-cli
       const ref = rawFillRef && /^e\d+$/i.test(rawFillRef) ? rawFillRef : null;
       const fillTarget = ref || selector;
-      logger.info(`[browser.act] fill resolved: "${selector}" → ${ref ? `ref ${ref}` : `direct selector "${selector}"`}`);
-      const fillRes = await cliRun([...S, 'fill', fillTarget, (text ?? value) || ''], timeoutMs);
-      logger.info(`[browser.act] fill ${fillTarget} → exit ${fillRes.exitCode} stdout="${fillRes.stdout?.slice(0, 200)}"`, { stderr: fillRes.stderr?.slice(0, 200) });
+      const fillText = (text ?? value) || '';
+      logger.info(`[browser.act] fill resolved: "${selector}" → ${ref ? `ref ${ref}` : `direct selector "${selector}"`} (click+type strategy)`);
 
-      // playwright-cli exits 0 even on hard failures — check for TimeoutError / ### Error
-      // before attempting any fallback. These indicate the element is unreachable (disabled,
-      // page navigated away, etc.) and click+type won't help either.
+      // Step 1: click to focus
+      const clickRes = await cliRun([...S, 'click', fillTarget], timeoutMs);
+      logger.info(`[browser.act] fill click ${fillTarget} → exit ${clickRes.exitCode}`, { stderr: clickRes.stderr?.slice(0, 200) });
+
+      // Hard error on click (element not found / timeout) — abort early
       const PLAYWRIGHT_HARD_ERR = /^### Error|TimeoutError:/im;
-      if (PLAYWRIGHT_HARD_ERR.test(fillRes.stdout || '')) {
-        const errMatch = (fillRes.stdout || '').match(/([A-Za-z]*Error:[^\n]+)/);
-        const errMsg = errMatch ? errMatch[1].trim() : 'playwright-cli: element not fillable';
-        logger.warn(`[browser.act] fill ${fillTarget}: hard error in stdout — ${errMsg}`);
+      if (PLAYWRIGHT_HARD_ERR.test(clickRes.stdout || '')) {
+        const errMatch = (clickRes.stdout || '').match(/([A-Za-z]*Error:[^\n]+)/);
+        const errMsg = errMatch ? errMatch[1].trim() : 'playwright-cli: element not clickable';
+        logger.warn(`[browser.act] fill ${fillTarget}: click hard error — ${errMsg}`);
         return {
           ok: false, action, sessionId,
-          result: (fillRes.stdout || '').trim(),
-          stdout: fillRes.stdout,
+          result: (clickRes.stdout || '').trim(),
+          stdout: clickRes.stdout,
           executionTime: Date.now() - start,
           error: errMsg,
         };
       }
 
-      // playwright-cli exits 0 even on fill errors — check stdout for error markers
-      // Two cases: (1) contenteditable div → "Element is not an <input>" → click+type fallback
-      //            (2) ref not found → try click+type on same ref
-      const NOT_INPUT_ERR = /Element is not an? <(input|textarea|select)|Ref .+ not found/i;
-      const stdoutHasErr = NOT_INPUT_ERR.test(fillRes.stdout || '') || NOT_INPUT_ERR.test(fillRes.stderr || '');
+      // Step 2: select-all to clear existing value, then type
+      await new Promise(r => setTimeout(r, 100));
+      await cliRun([...S, 'press', 'Meta+a'], 3000).catch(() => {});
+      const typeRes = await cliRun([...S, 'type', fillText], timeoutMs);
+      logger.info(`[browser.act] fill type → exit ${typeRes.exitCode}`, { stderr: typeRes.stderr?.slice(0, 200) });
 
-      if (stdoutHasErr) {
-        // The ref resolved to a non-input element (e.g. wrong ARIA pick or page changed).
-        // Preferred fallback: try the raw CSS selector directly — playwright-cli can
-        // locate the element itself without a snapshot ref.
-        // Only use click+type if the CSS selector also fails.
-        const cssRes = ref ? await cliRun([...S, 'fill', selector, (text ?? value) || ''], timeoutMs) : null;
-        if (cssRes && cssRes.ok && !NOT_INPUT_ERR.test(cssRes.stdout || '') && !NOT_INPUT_ERR.test(cssRes.stderr || '')) {
-          logger.info(`[browser.act] fill CSS fallback "${selector}" → exit ${cssRes.exitCode}`);
-          lastFilledTarget.set(sessionId, { target: selector, ref: null });
-          return {
-            ok: true, action, sessionId,
-            result: (cssRes.stdout || '').trim() || undefined,
-            stdout: cssRes.stdout,
-            executionTime: Date.now() - start,
-          };
-        }
-        // CSS selector also failed — fall back to click+type on original target
-        logger.info(`[browser.act] fill not-input → click+type fallback on "${fillTarget}"`);
-        await cliRun([...S, 'click', fillTarget], timeoutMs);
-        await cliRun([...S, 'press', 'Meta+a'], timeoutMs);
-        const typeRes = await cliRun([...S, 'type', (text ?? value) || ''], timeoutMs);
-        logger.info(`[browser.act] click+type → exit ${typeRes.exitCode}`);
-        // Do NOT store the ref in lastFilledTarget — the click moved focus to fillTarget which
-        // may be a non-input container (e.g. Gemini's contenteditable wrapper div). If press
-        // Enter later re-clicks that element, it can navigate away (e.g. → accounts.google.com).
-        // After click+type the keyboard focus is already on the correct element; Enter will fire
-        // there without any refocus needed.
-        if (typeRes.ok) lastFilledTarget.delete(sessionId);
-        return {
-          ok: typeRes.ok,
-          action, sessionId,
-          result: (typeRes.stdout || '').trim() || undefined,
-          stdout: typeRes.stdout,
-          executionTime: Date.now() - start,
-          error: typeRes.ok ? undefined : typeRes.error || typeRes.stderr?.trim(),
-        };
-      }
-
-      if (fillRes.ok) lastFilledTarget.set(sessionId, { target: fillTarget, ref });
+      // After click+type the keyboard focus is already on the correct element.
+      // Do NOT store ref in lastFilledTarget for contenteditable containers — if press
+      // Enter later re-clicks that element it can navigate away unexpectedly.
+      if (typeRes.ok) lastFilledTarget.delete(sessionId);
       return {
-        ok: fillRes.ok,
-        action,
-        sessionId,
-        result: (fillRes.stdout || '').trim() || undefined,
-        stdout: fillRes.stdout,
+        ok: typeRes.ok,
+        action, sessionId,
+        result: (typeRes.stdout || '').trim() || undefined,
+        stdout: typeRes.stdout,
         executionTime: Date.now() - start,
-        error: fillRes.ok ? undefined : fillRes.error || fillRes.stderr?.trim(),
+        error: typeRes.ok ? undefined : typeRes.error || typeRes.stderr?.trim(),
       };
     }
 
@@ -1150,36 +1148,262 @@ async function browserAct(args) {
         logger.info(`[browser.act] waitForAuth: navigated to ${url} on session=${sessionId} (cmd=${navCmd}, ok=${navRes.ok})`);
       }
 
-      // ── Step 1b: Google OAuth fast-path ──────────────────────────────────
-      // Click "Continue with Google" via DOM eval — no snapshot file parsing needed.
-      // Using eval avoids fragile ref extraction: the DOM is the ground truth and this
-      // is the same pattern used by the click action's eval fallback throughout browser.act.
-      // Falls through to the passive poll regardless: if the click lands on
-      // accounts.google.com the poll detects host change → success. If button not found,
-      // the passive poll + UI card runs as before.
+      // ── Step 1b: Agentic auth form loop ──────────────────────────────────
+      // snapshot → LLM → execute → snapshot → LLM → repeat.
+      // All page-transition waits are event-driven (URL change / element visibility)
+      // rather than fixed sleeps. No hardcoded timing or branch logic.
+      const _credentials = credentials || {};
       try {
-        await new Promise(r => setTimeout(r, 3000)); // settle — OAuth buttons render client-side after JS load
-        await cliRun([...S, 'waitForStableText'], 8000).catch(() => {});
-        const _oauthEval = `() => {
-          const GOOGLE_RE = /Continue with Google|Sign in with Google|Log in with Google/i;
-          const candidates = [...document.querySelectorAll('button,[role=button],[role=link],a')];
-          const btn = candidates.find(b =>
-            GOOGLE_RE.test((b.textContent || '').trim()) ||
-            GOOGLE_RE.test(b.getAttribute('aria-label') || '')
-          );
-          if (btn) { btn.click(); return 'clicked'; }
-          return 'not-found';
-        }`;
-        const _evalResult = await cliRun([...S, 'eval', _oauthEval], 6000);
-        const _evalOut = _evalResult.stdout || '';
-        if (_evalOut.includes('clicked')) {
-          logger.info(`[browser.act] waitForAuth: Google OAuth button clicked via eval for session=${sessionId}`);
-          await new Promise(r => setTimeout(r, 2000)); // let OAuth redirect start
-        } else {
-          logger.info(`[browser.act] waitForAuth: Google OAuth button not found via eval — falling back to passive poll`);
+        const _hasEmail    = !!(_credentials.email);
+        const _hasPassword = !!(_credentials.password);
+        let _loopFilledEmail    = false;
+        let _loopFilledPassword = false;
+        const _actionHistory   = []; // actions completed this session
+        let _stallCount        = 0;  // consecutive click_submit stalls
+
+        // ── Helper: extract URL value from playwright-cli eval stdout
+        const _parseUrl = (stdout) => {
+          const raw = (stdout || '').trim();
+          const m = raw.match(/###\s*Result\s*\n([\s\S]*?)(?=###|$)/i);
+          return (m ? m[1].trim().replace(/^"|"$/g, '') : raw).trim();
+        };
+
+        // ── Helper: inline 2-poll text settle (~600–1200ms).
+        // waitForStableText exits immediately on auth pages (auth-wall early-exit pattern)
+        // so we do our own lightweight settle: two eval polls 600ms apart.
+        const _textSettle = async () => {
+          const _et = async () => {
+            const r = await cliRun([...S, 'eval', 'document.body.innerText.slice(0,500)'], 5000).catch(() => ({}));
+            const raw = (r.stdout || '').trim();
+            const m = raw.match(/###\s*Result\s*\n([\s\S]*?)(?=###|$)/i);
+            return m ? m[1].trim().replace(/^"|"$/g, '') : raw;
+          };
+          const t1 = await _et();
+          await new Promise(r => setTimeout(r, 600));
+          const t2 = await _et();
+          if (t1 !== t2) await new Promise(r => setTimeout(r, 600)); // still changing — one more pause
+        };
+
+        // ── Helper: poll until a matching input is fully visible on screen.
+        // Checks display, visibility, opacity (>= 0.9), offsetHeight/Width — catches
+        // Google's hidden input[type="password"] on the email page (opacity:0, height:0).
+        // Returns the most specific selector available (#id > [name=x] > fallback) or null.
+        const _waitVisible = async (type /* 'email' | 'password' */, fallbackSel, timeoutMs = 15000) => {
+          const query = type === 'email'
+            ? 'input[type="email"],input[autocomplete="email"],input[autocomplete="username"],input[name="email"],input[name="username"],input[name="identifier"],input#identifierId'
+            : 'input[type="password"]';
+          const jsCheck = `() => {
+            const els = [...document.querySelectorAll(${JSON.stringify(query)})];
+            const vis = els.find(el => {
+              const cs = window.getComputedStyle(el);
+              return cs.display !== 'none'
+                && cs.visibility !== 'hidden'
+                && parseFloat(cs.opacity || '1') >= 0.9
+                && el.offsetHeight > 0
+                && el.offsetWidth > 0;
+            });
+            if (!vis) return null;
+            if (vis.id) return '#' + vis.id;
+            if (vis.name) return '[name="' + vis.name + '"]';
+            return ${JSON.stringify(fallbackSel)};
+          }`;
+          const deadline = Date.now() + timeoutMs;
+          while (Date.now() < deadline) {
+            const r = await cliRun([...S, 'eval', jsCheck], 5000).catch(() => ({}));
+            const raw = (r.stdout || '').trim();
+            const m = raw.match(/###\s*Result\s*\n([\s\S]*?)(?=###|$)/i);
+            const val = (m ? m[1].trim().replace(/^"|"$/g, '') : raw).trim();
+            if (val && val !== 'null' && val !== '') {
+              await new Promise(r2 => setTimeout(r2, 500)); // 500ms buffer: animation completing
+              return val; // specific selector of the visible element
+            }
+            await new Promise(r2 => setTimeout(r2, 500));
+          }
+          return null; // timed out
+        };
+
+        // ── Helper: get comma-separated list of truly-visible input types for LLM hint.
+        // Filters hidden inputs (Google hides password input during email page via opacity:0/height:0)
+        // so the LLM gets an accurate picture of what's actually on screen.
+        const _visibleInputsHint = async () => {
+          const jsVis = `() => [...document.querySelectorAll('input')].filter(el => {
+            const cs = window.getComputedStyle(el);
+            return cs.display !== 'none' && cs.visibility !== 'hidden'
+              && parseFloat(cs.opacity || '1') >= 0.9 && el.offsetHeight > 0;
+          }).map(el => el.type + (el.id ? '#' + el.id : (el.name ? '[' + el.name + ']' : ''))).join(',') || 'none'`;
+          const r = await cliRun([...S, 'eval', jsVis], 5000).catch(() => ({}));
+          const raw = (r.stdout || '').trim();
+          const m = raw.match(/###\s*Result\s*\n([\s\S]*?)(?=###|$)/i);
+          return (m ? m[1].trim().replace(/^"|"$/g, '') : raw) || 'unknown';
+        };
+
+        for (let _step = 0; _step < 8; _step++) {
+          // 1. Inline text settle — waits for DOM text to stop changing
+          await _textSettle();
+
+          // 2. Snapshot (ARIA accessibility tree)
+          const _snapRes = await cliRun([...S, 'snapshot'], 8000).catch(() => ({}));
+          const _snapText = (_snapRes.stdout || '').trim();
+          if (!_snapText) { logger.warn(`[browser.act] waitForAuth: auth-loop step ${_step + 1} — empty snapshot, stopping`); break; }
+          snapshotCache.set(sessionId, _snapText);
+
+          // 3. Check if URL has left auth domain
+          const _luProbe = await cliRun([...S, 'eval', 'location.href'], 5000).catch(() => ({}));
+          const _luUrl   = _parseUrl(_luProbe.stdout);
+          const _luHost  = _luUrl ? (() => { try { return new URL(_luUrl).hostname; } catch (_) { return ''; } })() : '';
+          if (authOriginHost && _luHost && _luHost !== authOriginHost) {
+            logger.info(`[browser.act] waitForAuth: auth-loop step ${_step + 1} — navigated away from auth domain (${_luHost}), done`);
+            break;
+          }
+
+          // 4. Get truly-visible inputs — filters CSS-hidden inputs from LLM context
+          const _visHint = await _visibleInputsHint();
+          logger.info(`[browser.act] waitForAuth: auth-loop step ${_step + 1} visible-inputs=${_visHint}`);
+
+          // 5. Ask LLM what to do next
+          let _dec = null;
+          try {
+            const _credHint = `Available credentials: has_email=${_hasEmail}, has_password=${_hasPassword}`;
+            const _histHint = _actionHistory.length ? `Completed actions: ${_actionHistory.join(' → ')}` : 'Completed actions: none';
+            const _llmRaw = await askWithMessages([
+              { role: 'system', content: AUTH_FORM_PROMPT },
+              { role: 'user',   content: `${_credHint}\n${_histHint}\nVisible inputs: ${_visHint}\n\nPAGE SNAPSHOT:\n${_snapText.slice(0, 6000)}` },
+            ], { temperature: 0.1, maxTokens: 128, responseTimeoutMs: 15000 });
+            let _s = _llmRaw.trim().replace(/^```(?:json)?\n?/i, '').replace(/\n?```\s*$/i, '').trim();
+            try { _dec = JSON.parse(_s); } catch (_) {
+              const _m = _s.match(/\{[\s\S]*?\}/);
+              if (_m) try { _dec = JSON.parse(_m[0]); } catch (_) {}
+            }
+          } catch (_le) {
+            logger.warn(`[browser.act] waitForAuth: auth-loop step ${_step + 1} LLM error — ${_le.message}`);
+            break;
+          }
+
+          if (!_dec?.action) {
+            logger.warn(`[browser.act] waitForAuth: auth-loop step ${_step + 1} — unparseable LLM response, stopping`);
+            break;
+          }
+
+          const _sel = _dec.selector ? String(_dec.selector).replace(/^@/, '') : null;
+          logger.info(`[browser.act] waitForAuth: auth-loop step ${_step + 1} action=${_dec.action} sel="${_sel}" | ${_dec.rationale}`);
+
+          // 6. Execute action
+          if (_dec.action === 'fill_email' && _hasEmail) {
+            // Poll until email input is truly visible before clicking
+            const _visSel = await _waitVisible('email', _sel || 'input[type="email"]');
+            if (!_visSel) {
+              logger.warn(`[browser.act] waitForAuth: auth-loop step ${_step + 1} fill_email — email input not visible after 15s, re-snapshotting`);
+              continue;
+            }
+            await cliRun([...S, 'click', _visSel], 5000).catch(() => {});
+            await new Promise(r => setTimeout(r, 150));
+            await cliRun([...S, 'press', 'Meta+a'], 3000).catch(() => {});
+            await cliRun([...S, 'type', _credentials.email], 8000).catch(() => {});
+            _loopFilledEmail = true;
+            _actionHistory.push('fill_email');
+
+          } else if (_dec.action === 'fill_password' && _hasPassword) {
+            // Poll until password input is truly visible (opacity >= 0.9, height > 0).
+            // Google keeps a hidden input[type="password"] in the email page DOM during the
+            // slide transition. _waitVisible returns the specific selector of the VISIBLE
+            // element (e.g. "#password"), not the generic css which would hit the hidden copy.
+            const _visSel = await _waitVisible('password', _sel || 'input[type="password"]');
+            if (!_visSel) {
+              logger.warn(`[browser.act] waitForAuth: auth-loop step ${_step + 1} fill_password — password input not visible after 15s, re-snapshotting`);
+              continue;
+            }
+            await cliRun([...S, 'click', _visSel], 5000).catch(() => {});
+            await new Promise(r => setTimeout(r, 150));
+            await cliRun([...S, 'press', 'Meta+a'], 3000).catch(() => {});
+            await cliRun([...S, 'type', _credentials.password], 8000).catch(() => {});
+            _loopFilledPassword = true;
+            _actionHistory.push('fill_password');
+
+          } else if (_dec.action === 'click_submit') {
+            // Capture pre-click state for both transition signals.
+            // Signal 1 (URL): works for traditional multi-page sites and SPA pushState/replaceState.
+            // Signal 2 (DOM): works for SPA DOM-only transitions — e.g. Google GlifWebSignIn
+            //   keeps accounts.google.com/v3/signin/identifier URL CONSTANT throughout
+            //   the email→password transition; only visible inputs change.
+            const _preClickUrl = _luUrl;
+            const _preVisHint  = _visHint; // captured earlier this iteration, free re-use
+            if (_sel) {
+              const _cr = await cliRun([...S, 'click', _sel], 5000).catch(() => ({ ok: false }));
+              if (!_cr?.ok) await cliRun([...S, 'press', 'Return'], 3000).catch(() => {});
+            } else {
+              await cliRun([...S, 'press', 'Return'], 3000).catch(() => {});
+            }
+            // Poll until URL OR visible-inputs changes — whichever fires first confirms transition.
+            // 12s deadline: Google CSS slide animation + network round-trip can take 2-3s.
+            const _navDeadline = Date.now() + 12000;
+            let _navConfirmed = false;
+            let _transitionReason = '';
+            while (Date.now() < _navDeadline) {
+              await new Promise(r => setTimeout(r, 500));
+              // Signal 1: URL change (traditional multi-page + SPA pushState)
+              const _postProbe = await cliRun([...S, 'eval', 'location.href'], 5000).catch(() => ({}));
+              const _postUrl   = _parseUrl(_postProbe.stdout);
+              if (_postUrl && _postUrl !== _preClickUrl) {
+                _transitionReason = `URL: ${_preClickUrl} → ${_postUrl}`;
+                _navConfirmed = true;
+                _stallCount = 0;
+                break;
+              }
+              // Signal 2: visible-inputs DOM change (SPA DOM-only transition, e.g. Google)
+              const _postVis = await _visibleInputsHint();
+              if (_postVis && _postVis !== 'unknown' && _postVis !== _preVisHint) {
+                _transitionReason = `DOM: ${_preVisHint} → ${_postVis}`;
+                _navConfirmed = true;
+                _stallCount = 0;
+                break;
+              }
+            }
+            if (_navConfirmed) {
+              logger.info(`[browser.act] waitForAuth: auth-loop step ${_step + 1} click_submit transition confirmed (${_transitionReason})`);
+            } else {
+              _stallCount++;
+              logger.warn(`[browser.act] waitForAuth: auth-loop step ${_step + 1} click_submit no transition after 12s, stall=${_stallCount}`);
+              if (_stallCount >= 1) {
+                // First stall: press Return as keyboard-submit fallback
+                logger.info(`[browser.act] waitForAuth: auth-loop stall fallback — pressing Return`);
+                await cliRun([...S, 'press', 'Return'], 3000).catch(() => {});
+                _stallCount = 0;
+                await new Promise(r => setTimeout(r, 1500));
+              }
+            }
+            _actionHistory.push('click_submit');
+
+          } else if (_dec.action === 'done') {
+            logger.info(`[browser.act] waitForAuth: auth-loop done after ${_step + 1} step(s) for session=${sessionId}`);
+            break;
+
+          } else {
+            logger.warn(`[browser.act] waitForAuth: auth-loop step ${_step + 1} — action "${_dec.action}" skipped/unexpected, stopping`);
+            break;
+          }
         }
-      } catch (_oauthErr) {
-        logger.warn(`[browser.act] waitForAuth: OAuth fast-path error (non-fatal): ${_oauthErr.message}`);
+
+        // ── OAuth / SSO button fallback ────────────────────────────────────
+        // If the loop ran but no credentials were filled (no credential form found),
+        // look for a "Continue with Google" / SSO button.
+        if (!_loopFilledEmail && !_loopFilledPassword) {
+          const _oauthEval = `() => {
+            const RE = /Continue with Google|Sign in with Google|Log in with Google|Sign in with SSO/i;
+            const btn = [...document.querySelectorAll('button,[role=button],[role=link],a')]
+              .find(b => RE.test((b.textContent || '').trim()) || RE.test(b.getAttribute('aria-label') || ''));
+            if (btn) { btn.click(); return 'clicked'; }
+            return 'not-found';
+          }`;
+          const _oauthRes = await cliRun([...S, 'eval', _oauthEval], 6000).catch(() => ({}));
+          if ((_oauthRes.stdout || '').includes('clicked')) {
+            logger.info(`[browser.act] waitForAuth: OAuth button clicked for session=${sessionId}`);
+            await new Promise(r => setTimeout(r, 2000));
+          } else {
+            logger.info(`[browser.act] waitForAuth: no form or OAuth button found for session=${sessionId} — passive poll`);
+          }
+        }
+      } catch (_formErr) {
+        logger.warn(`[browser.act] waitForAuth: form handler error (non-fatal): ${_formErr.message}`);
       }
 
       // ── Step 2: poll until auth wall clears ──────────────────────────────

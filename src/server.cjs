@@ -301,6 +301,51 @@ class CommandServiceMCPServer {
         return;
       }
 
+      // ── GET /debug/resolve-credentials?agentId=gmail.agent ──────────────────
+      // Test what resolveCredentials returns including all fallback steps.
+      // Usage: open http://localhost:3007/debug/resolve-credentials?agentId=gmail.agent
+      if (req.method === 'GET' && req.url?.startsWith('/debug/resolve-credentials')) {
+        const agentId = new URL(req.url, 'http://localhost').searchParams.get('agentId') || 'gmail.agent';
+        try {
+          const { userAgent } = require('./skills/user.agent.cjs');
+          const result = await userAgent({ action: 'resolve_credentials', agentId });
+          res.writeHead(200);
+          res.end(JSON.stringify(result, null, 2));
+        } catch (err) {
+          res.writeHead(500);
+          res.end(JSON.stringify({ error: err.message }));
+        }
+        return;
+      }
+
+      // ── GET /debug/profile?key=self:email ────────────────────────────────────
+      // Directly query a profile KV key to verify storage.
+      // Usage: open http://localhost:3007/debug/profile?key=self:email
+      if (req.method === 'GET' && req.url?.startsWith('/debug/profile')) {
+        const key = new URL(req.url, 'http://localhost').searchParams.get('key') || 'self:email';
+        try {
+          const http2 = require('http');
+          const body = JSON.stringify({ version: 'mcp.v1', service: 'user-memory', action: 'profile.get', payload: { key } });
+          const memUrl = process.env.MCP_USER_MEMORY_URL || 'http://127.0.0.1:3001';
+          const memKey = process.env.MCP_USER_MEMORY_API_KEY || '';
+          const parsed = new URL(memUrl);
+          const reqHeaders = { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) };
+          if (memKey) reqHeaders['Authorization'] = `Bearer ${memKey}`;
+          const raw = await new Promise((resolve, reject) => {
+            const r = http2.request({ hostname: parsed.hostname, port: Number(parsed.port) || 3001, path: '/profile.get', method: 'POST', headers: reqHeaders }, (resp) => {
+              let d = ''; resp.on('data', c => d += c); resp.on('end', () => resolve(d));
+            });
+            r.on('error', reject); r.write(body); r.end();
+          });
+          res.writeHead(200);
+          res.end(raw);
+        } catch (err) {
+          res.writeHead(500);
+          res.end(JSON.stringify({ error: err.message }));
+        }
+        return;
+      }
+
       // ── POST /skill.schedule — register/refresh a skill's cron immediately ──
       // Called by skillCreator after writing a new scheduled skill.
       if (req.method === 'POST' && req.url === '/skill.schedule') {

@@ -245,8 +245,10 @@ async function resolveForm(args) {
     }
 
     // ── 1. user_profile (primary) ───────────────────────────────────────────
+    // profile.get now transparently decrypts SAFE: and KEYTAR: refs — any
+    // non-null string returned here is already plaintext.
     value = await profileGet(profileKey);
-    if (value && !value.startsWith('SAFE:') && !value.startsWith('KEYTAR:')) {
+    if (value) {
       sources.add('user_profile');
     }
 
@@ -467,6 +469,115 @@ async function resolveContext(args) {
   };
 }
 
+// ── resolve_credentials action ─────────────────────────────────────────────
+// Looks up stored credentials for a service agent (email + password).
+// profile.get transparently decrypts SAFE: blobs so callers receive plaintext.
+//
+// Credential keys follow the gatherCredentialCallback convention in main.js:
+//   credential:{agentId}:email
+//   credential:{agentId}:password
+
+async function resolveCredentials(args) {
+  const { agentId } = args;
+  if (!agentId) {
+    return { ok: false, error: 'agentId is required for resolve_credentials' };
+  }
+
+  const normalized = agentId.toLowerCase().replace(/\.agent$/, '');
+  const emailKey    = `credential:${normalized}.agent:email`;
+  const passwordKey = `credential:${normalized}.agent:password`;
+  // Also try without .agent suffix in case stored without it
+  const emailKeyAlt    = `credential:${normalized}:email`;
+  const passwordKeyAlt = `credential:${normalized}:password`;
+  // username is a common alias stored by some credential-gather flows
+  const usernameKey    = `credential:${normalized}.agent:username`;
+  const usernameKeyAlt = `credential:${normalized}:username`;
+  // Legacy flat keys: stored as 'gmail_email' / 'gmail:username' (no credential: prefix)
+  const legacyEmailKey    = `${normalized}_email`;    // e.g. gmail_email
+  const legacyUsernameKey = `${normalized}:username`; // e.g. gmail:username (no credential: prefix)
+  const legacyPasswordKey = `${normalized}_password`;
+
+  let email    = (await profileGet(emailKey))    || (await profileGet(emailKeyAlt))
+               || (await profileGet(usernameKey)) || (await profileGet(usernameKeyAlt))
+               || (await profileGet(legacyEmailKey)) || (await profileGet(legacyUsernameKey))
+               || (await profileGet('self:email')); // profile KV from storeMemory dual-write
+  logger.info(`[user.agent] resolve_credentials step1 (profile KV): ${email || '✗'}`);
+  const password = (await profileGet(passwordKey)) || (await profileGet(passwordKeyAlt))
+               || (await profileGet(legacyPasswordKey));
+
+  // Fallback A: resolveForm — checks profile KV then structured memory search
+  if (!email) {
+    try {
+      const formResult = await resolveForm({ fields: ['email'] });
+      email = formResult?.resolved?.email || null;
+      logger.info(`[user.agent] resolve_credentials stepA (resolveForm): ${email || '✗'}`);
+    } catch (_) {}
+  }
+
+  // Fallback B: raw regex scan over personal_profile memories
+  if (!email) {
+    try {
+      const mems = await memorySearch('email address gmail work personal', { type: 'personal_profile' }, 10);
+      const EMAIL_RE = /[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/;
+      for (const m of mems) {
+        const text = m.source_text || m.extracted_text || '';
+        const match = text.match(EMAIL_RE);
+        if (match) { email = match[0]; break; }
+      }
+      logger.info(`[user.agent] resolve_credentials stepB (personal_profile scan): ${email || '✗'}`);
+    } catch (_) {}
+  }
+
+  // Fallback C: broader memory scan with no type filter
+  if (!email) {
+    try {
+      const mems = await memorySearch('my email is', {}, 10);
+      const EMAIL_RE = /[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/;
+      for (const m of mems) {
+        const text = m.source_text || m.extracted_text || '';
+        const match = text.match(EMAIL_RE);
+        if (match) { email = match[0]; break; }
+      }
+      logger.info(`[user.agent] resolve_credentials stepC (broad scan): ${email || '✗'}`);
+    } catch (_) {}
+  }
+
+  // Migration: if email was found via memory scan (stepB/C) but not in profile KV,
+  // write it to the canonical credential key so step1 finds it next time.
+  // Note: SAFE: encryption requires Electron safeStorage — plain text here is acceptable
+  // since user-memory encrypts at rest and the SAFE: prefix is only used by Electron main.
+  if (email) {
+    const hasInProfile = (await profileGet(emailKey)) || (await profileGet(emailKeyAlt))
+      || (await profileGet(legacyEmailKey)) || (await profileGet(legacyUsernameKey));
+    if (!hasInProfile) {
+      try {
+        await httpPost(MEMORY_URL, MEMORY_KEY, '/profile.set', {
+          version: 'mcp.v1', service: 'user-memory', action: 'profile.set',
+          payload: { key: emailKey, valueRef: email, sensitive: true },
+        });
+        logger.info(`[user.agent] resolve_credentials: migrated email to ${emailKey}`);
+      } catch (_) {}
+    }
+  }
+
+  const resolved = {};
+  const missing  = [];
+  if (email)    { resolved.email    = email;    } else { missing.push('email'); }
+  if (password) { resolved.password = password; } else { missing.push('password'); }
+
+  logger.info(`[user.agent] resolve_credentials: agentId=${agentId} email=${email ? '✓' : '✗'} password=${password ? '✓' : '✗'}`);
+
+  return {
+    ok:           true,
+    action:       'resolve_credentials',
+    resolved,
+    missing,
+    credentialKey: `credential:${normalized}.agent:email`, // key for gatherCredentialCallback to store to
+    summary: email ? `Credentials resolved for ${agentId}: email ✓${password ? ', password ✓' : ''}` : `No credentials stored for ${agentId}`,
+    sources: (email || password) ? ['user_profile'] : [],
+  };
+}
+
 // ── Main export ──────────────────────────────────────────────────────────────
 
 async function userAgent(args = {}) {
@@ -479,9 +590,12 @@ async function userAgent(args = {}) {
     if (action === 'resolve_context') {
       return await resolveContext(args);
     }
+    if (action === 'resolve_credentials') {
+      return await resolveCredentials(args);
+    }
     return {
       ok:    false,
-      error: `Unknown action: "${action}". Expected 'resolve_form' or 'resolve_context'.`,
+      error: `Unknown action: "${action}". Expected 'resolve_form', 'resolve_context', or 'resolve_credentials'.`,
     };
   } catch (err) {
     logger.error(`[user.agent] Unhandled error (action=${action}):`, err.message);

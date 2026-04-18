@@ -134,6 +134,15 @@ The SNAPSHOT is a YAML-formatted ARIA accessibility tree. Refs like e12, e83 are
 use them directly in click/fill/hover/select. They are the most reliable selectors for DOM actions.
 For run-code + page.evaluate(), refs do NOT exist in the browser — use real CSS selectors (e.g. 'tr.zA', '.bog').
 
+⚠ FORBIDDEN inside page.evaluate() — Playwright pseudo-selectors CRASH native browser querySelector:
+  NEVER use: :has-text("...")  :text("...")  :contains("...")  :visible  :enabled  :checked
+  NEVER use: generic:has(button:contains(...))  — :contains() is NOT valid CSS
+  NEVER use: 'generic', 'heading', 'paragraph', 'link' as CSS tag names — these are ARIA roles in the snapshot,
+             NOT real HTML tags. document.querySelectorAll('generic') returns NOTHING.
+  SAFE selectors inside page.evaluate(): 'article', 'h1','h2','h3', 'a[href]', '[role="article"]',
+             '[data-testid="..."]', '.className', 'div > span', '[href*="comments"]'
+  When snapshot shows ARIA roles (generic/heading/link), use innerHTML/textContent on real tags like h3, a, p.
+
 run-code context — Node.js VM (NOT the browser):
   - \`page\` is a real Playwright Page object (Node.js side)
   - document/window/fetch do NOT exist in this context — this is Node.js, not a browser
@@ -1180,6 +1189,13 @@ async function playwrightAgent(args) {
             logger.info(`[playwright.agent] verify-repair: ${_vRepairParsed.repair.length} corrective steps — ${_vRepairParsed.thoughts || ''}`);
             for (const _vStep of _vRepairParsed.repair.slice(0, 3)) {
               const _vNorm = normalizeStep(_vStep);
+              // Intercept 'wait' — not a browser action, handled locally
+              if (_vNorm?.action === 'wait') {
+                const _waitMs = Math.min(parseInt(_vNorm.ms || _vNorm.duration || 2000, 10), 5000);
+                await new Promise(r => setTimeout(r, _waitMs));
+                transcript.push({ step: transcript.length + 1, action: _vNorm, outcome: { ok: true, result: `waited ${_waitMs}ms` }, thoughts: 'verify-repair' });
+                continue;
+              }
               const _vOut = await browserAct({ ...(_vNorm || {}), sessionId, headed, timeoutMs });
               transcript.push({ step: transcript.length + 1, action: _vNorm, outcome: _vOut, thoughts: 'verify-repair' });
               if (_vOut.ok) _verifyWarning = null; // repair step succeeded — clear warning
