@@ -661,10 +661,31 @@ async function browserAct(args) {
         };
       }
 
-      // Step 2: select-all to clear existing value, then type
+      // Step 2: detect chip/combobox fields (Gmail To, Outlook To, tag inputs, etc.)
+      // Meta+a triggers "Select All" globally in some SPAs (e.g. Gmail) which kills
+      // focus on contenteditable chip fields — skip it for those field types.
       await new Promise(r => setTimeout(r, 100));
-      await cliRun([...S, 'press', 'Meta+a'], 3000).catch(() => {});
-      const typeRes = await cliRun([...S, 'type', fillText], timeoutMs);
+      const _chipProbe = await cliRun([...S, 'eval',
+        'document.activeElement && (document.activeElement.isContentEditable || ' +
+        'document.activeElement.getAttribute("role") === "combobox" || ' +
+        'document.activeElement.getAttribute("aria-autocomplete") !== null || ' +
+        '!!document.activeElement.closest("[role=combobox]")) ? "chip" : "normal"'
+      ], 2000).catch(() => null);
+      const _chipRaw = (_chipProbe?.stdout || '').trim();
+      const _chipResultMatch = _chipRaw.match(/###\s*Result\s*\n([\s\S]*?)(?=###|$)/i);
+      const _isChipField = (_chipResultMatch ? _chipResultMatch[1].trim() : _chipRaw).replace(/^["']|["']$/g, '') === 'chip';
+      logger.info(`[browser.act] fill chip-detect: ${_isChipField ? 'chip/combobox — skipping Meta+a' : 'normal input'}`);
+
+      let typeRes;
+      if (_isChipField) {
+        // Chip/combobox: type directly + Tab to confirm the chip (no Meta+a)
+        typeRes = await cliRun([...S, 'type', fillText], timeoutMs);
+        await cliRun([...S, 'press', 'Tab'], 2000).catch(() => {});
+      } else {
+        // Normal input: select-all to clear existing value, then type
+        await cliRun([...S, 'press', 'Meta+a'], 3000).catch(() => {});
+        typeRes = await cliRun([...S, 'type', fillText], timeoutMs);
+      }
       logger.info(`[browser.act] fill type → exit ${typeRes.exitCode}`, { stderr: typeRes.stderr?.slice(0, 200) });
 
       // After click+type the keyboard focus is already on the correct element.

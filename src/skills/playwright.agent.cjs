@@ -318,14 +318,27 @@ Only mark completed:false when confidence >= 0.75 — minor UI ambiguities are n
 const VERIFY_LOGIN_WALL_RE = /sign[\s-]*(in|up|into)|log[\s-]*(in|into)|not[\s-]*(logged|authenticated)|login[\s-]*(required|wall|page)|continue[\s-]*with[\s-]*(google|apple|microsoft|github|facebook|email)|email[\s-]*(entry|input|field|address|address\s*required)|create[\s-]*account|authentication[\s-]*required|please[\s-]+log[\s-]*(in|into)|welcome[\s-]*back|enter[\s-]*(your[\s-]*)?email|your[\s-]*email[\s-]*address|[@][^\s]+[\s-]*required/i;
 
 // ---------------------------------------------------------------------------
-// Parse LLM JSON response — tolerant of markdown fences and prose wrappers
+// Strip JS-style // comments from a string (LLMs sometimes emit these inside JSON)
+// ---------------------------------------------------------------------------
+function stripJsonComments(s) {
+  return s
+    .replace(/^\s*\/\/[^\n]*/gm, '')               // remove pure comment lines
+    .replace(/([}\],\d"'])\s*\/\/[^\n]*/g, '$1');  // remove trailing inline comments after tokens
+}
+
+// ---------------------------------------------------------------------------
+// Parse LLM JSON response — tolerant of markdown fences, prose wrappers, and
+// JS-style // comments that some models emit inside plan arrays.
 // ---------------------------------------------------------------------------
 function parseJson(text) {
   if (!text) return null;
   try { return JSON.parse(text.trim()); } catch (_) {}
   const stripped = text.replace(/```(?:json)?\n?/g, '').replace(/```/g, '').trim();
   try { return JSON.parse(stripped); } catch (_) {}
-  const match = stripped.match(/\{[\s\S]*\}/);
+  // Strip // comments and retry — handles "{ "plan": [ // do X\n { ... } ] }"
+  const commentStripped = stripJsonComments(stripped);
+  try { return JSON.parse(commentStripped); } catch (_) {}
+  const match = commentStripped.match(/\{[\s\S]*\}/);
   if (match) { try { return JSON.parse(match[0]); } catch (_) {} }
   return null;
 }
@@ -717,6 +730,16 @@ async function playwrightAgent(args) {
   let plan = planParsed.plan;
   logger.info(`[playwright.agent] plan generated: ${plan.length} steps — ${planParsed.thoughts}`);
 
+  // Emit initial plan thoughts so the UI can show them under the step card
+  if (planParsed.thoughts && _progressCallbackUrl) {
+    postProgress(_progressCallbackUrl, {
+      type: 'agent:thought',
+      stepIndex: _stepIndex ?? 0,
+      thoughts: planParsed.thoughts,
+      phase: 'plan',
+    });
+  }
+
   if (plan.length === 0) {
     return { ok: false, goal, sessionId, turns: 0, done: false, result: planParsed.thoughts || 'LLM returned empty plan', transcript: [], error: planParsed.thoughts, executionTime: Date.now() - start };
   }
@@ -735,6 +758,7 @@ async function playwrightAgent(args) {
   const DOM_MUTATING_ACTIONS = new Set([
     'click', 'dblclick',   // modals, dropdowns, SPA navigation
     'navigate', 'goto',    // full page change
+    'fill', 'type',        // chip/token creation; contenteditable content changes
     'press',               // Enter=submit, Escape=close dialog, Tab=autocomplete
     'select',              // conditional form sections show/hide
     'drag',                // reorders DOM nodes
@@ -796,6 +820,14 @@ async function playwrightAgent(args) {
           const snapReplanParsed = parseJson(snapReplanRaw);
           if (snapReplanParsed && Array.isArray(snapReplanParsed.plan) && snapReplanParsed.plan.length > 0) {
             logger.info(`[playwright.agent] snapshot re-plan: ${snapReplanParsed.plan.length} fresh steps — ${snapReplanParsed.thoughts || ''}`);
+            if (snapReplanParsed.thoughts && _progressCallbackUrl) {
+              postProgress(_progressCallbackUrl, {
+                type: 'agent:thought',
+                stepIndex: _stepIndex ?? 0,
+                thoughts: snapReplanParsed.thoughts,
+                phase: 'replan',
+              });
+            }
             plan = [...plan.slice(0, stepIndex + 1), ...snapReplanParsed.plan];
           } else {
             logger.warn(`[playwright.agent] snapshot re-plan unparseable — continuing with stale plan`);
@@ -858,6 +890,28 @@ async function playwrightAgent(args) {
         const ms = Math.min(parseInt(step.ms || step.duration || 2000, 10), 5000);
         await new Promise(r => setTimeout(r, ms));
         outcome = { ok: true, result: `waited ${ms}ms` };
+      } else if (
+        // ── Mail recipient fill — bypass browser.act's click+Meta+a+type sequence.
+        // Gmail's To field is a chip/token widget: Meta+a (⌘A) triggers Gmail's
+        // global "Select All messages" shortcut, killing focus on the To input before
+        // `type` fires — nothing gets typed.  Fix: click to focus, type keystrokes
+        // directly (no Meta+a), then Tab to confirm the chip and move to Subject.
+        step.action === 'fill' &&
+        typeof step.text === 'string' &&
+        /\S+@\S+\.\S+/.test(step.text) &&
+        (['gmail.agent', 'outlook.agent', 'yahoo.agent'].includes(agentId) ||
+          (hostname || '').includes('mail.google.com') ||
+          (hostname || '').includes('outlook.live.com') ||
+          (hostname || '').includes('mail.yahoo.com'))
+      ) {
+        logger.info(`[playwright.agent] mail recipient fill — using click+type+Tab to bypass Meta+a focus loss`);
+        await browserAct({ action: 'click', selector: step.selector, sessionId, headed, timeoutMs });
+        await new Promise(r => setTimeout(r, 200));
+        await browserAct({ action: 'type', text: step.text, sessionId, headed, timeoutMs });
+        await new Promise(r => setTimeout(r, 400));
+        await browserAct({ action: 'press', key: 'Tab', sessionId, headed, timeoutMs: 3000 });
+        await new Promise(r => setTimeout(r, 600));
+        outcome = { ok: true, action: 'fill', sessionId, result: 'recipient entered via click+type+Tab' };
       } else {
         outcome = await browserAct({ ...step, sessionId, headed, timeoutMs });
       }
@@ -932,14 +986,14 @@ async function playwrightAgent(args) {
       // and injected into every future plan, so this verification never fires again.
       if (step.action === 'fill' && typeof step.text === 'string' && step.text.length > 80) {
         try {
+          const _needleJson = JSON.stringify(step.text.slice(0, 40));
           const verifySnap = await browserAct({
             action: 'run-code',
-            code: `
-              const needle = ${JSON.stringify(step.text.slice(0, 40))};
-              const bodies = [...document.querySelectorAll('[contenteditable="true"], textarea')];
-              const found = bodies.some(el => (el.innerText || el.value || '').includes(needle));
-              return found ? 'ok' : 'empty';
-            `,
+            code: `async page => { return await page.evaluate(function(){
+              var needle = ${_needleJson};
+              var bodies = Array.from(document.querySelectorAll('[contenteditable="true"], textarea'));
+              return bodies.some(function(el){ return (el.innerText || el.value || '').includes(needle); }) ? 'ok' : 'empty';
+            }); }`,
             sessionId, headed, timeoutMs,
           });
           if (verifySnap.ok && verifySnap.result === 'empty') {
@@ -949,62 +1003,8 @@ async function playwrightAgent(args) {
         } catch (_) { /* verification failure is non-fatal — proceed */ }
       }
 
-      // ── Post-fill recipient chip verification ─────────────────────────────
-      // Gmail (and similar webmail) requires pressing Enter after typing a
-      // recipient address to confirm it as a chip.  A plain `fill` leaves the
-      // address as unconfirmed text — Send silently drops it.
-      // Trigger: fill action + text looks like an email address + EITHER:
-      //   (a) the current session is a known mail agent (agentId/hostname-based), OR
-      //   (b) the step context mentions a recipient field (To / CC / BCC).
-      // Using (a) means the check always fires for gmail.agent even when the LLM
-      // generates opaque element refs like "e58" with no label text.
-      // Repair: if no chip found, press Enter, wait 400ms, re-verify once.
-      // If chip still absent after repair, mark outcome failed so the existing
-      // repair→deriveRule pipeline learns and stores the rule permanently.
-      const _isMailAgentSession = ['gmail.agent', 'outlook.agent', 'yahoo.agent'].includes(agentId)
-        || (hostname || '').includes('mail.google.com')
-        || (hostname || '').includes('outlook.live.com')
-        || (hostname || '').includes('mail.yahoo.com');
-      if (
-        step.action === 'fill' &&
-        typeof step.text === 'string' &&
-        /\S+@\S+\.\S+/.test(step.text) &&
-        (
-          _isMailAgentSession ||
-          /\bto\b|\bcc\b|\bbcc\b|\brecipient/i.test(
-            (step.selector || '') + ' ' + (step.description || '') + ' ' + (step.label || '')
-          )
-        )
-      ) {
-        try {
-          const _chipCheck = async () => {
-            const r = await browserAct({
-              action: 'run-code',
-              code: `
-                const addr = ${JSON.stringify(step.text.toLowerCase())};
-                const chips = [...document.querySelectorAll('[data-hovercard-id],[email],[data-chip],.vN [email],span[data-hovercard-id]')];
-                return chips.some(c =>
-                  (c.getAttribute('data-hovercard-id') || c.getAttribute('email') || c.textContent || '').toLowerCase().includes(addr)
-                ) ? 'chip_found' : 'no_chip';
-              `,
-              sessionId, headed, timeoutMs: 3000,
-            });
-            return r.ok ? r.result : 'no_chip';
-          };
-
-          let chipResult = await _chipCheck();
-          if (chipResult === 'no_chip') {
-            logger.info(`[playwright.agent] recipient chip not found after fill — pressing Enter to confirm`);
-            await browserAct({ action: 'press', key: 'Enter', sessionId, headed, timeoutMs: 3000 });
-            await new Promise(r => setTimeout(r, 400));
-            chipResult = await _chipCheck();
-          }
-          if (chipResult === 'no_chip') {
-            logger.warn(`[playwright.agent] recipient chip still absent after Enter — triggering repair`);
-            outcome = { ok: false, error: 'recipient address typed but chip not created — press Enter after filling the To/CC/BCC field to confirm the address as a chip before sending' };
-          }
-        } catch (_) { /* chip verification non-fatal — proceed */ }
-      }
+      // (recipient chip confirmation handled pre-emptively in the
+      //  mail recipient fill interceptor above via click+type+Tab)
 
       // ── Auto re-snapshot after DOM-mutating actions ──────────────────────
       // Keeps snapshotCache live so subsequent fill/click use fresh refs.
@@ -1143,6 +1143,16 @@ async function playwrightAgent(args) {
     }
 
     logger.info(`[playwright.agent] repair: ${repairParsed.repair.length} corrective steps — ${repairParsed.thoughts}`);
+
+    // Emit repair thoughts to UI
+    if (repairParsed.thoughts && _progressCallbackUrl) {
+      postProgress(_progressCallbackUrl, {
+        type: 'agent:thought',
+        stepIndex: _stepIndex ?? 0,
+        thoughts: repairParsed.thoughts,
+        phase: 'repair',
+      });
+    }
 
     // Fire-and-forget: derive a ≤150-char rule from this failure+repair and store it in context_rules
     // so future plan generations for this agent automatically avoid the same mistake.

@@ -300,9 +300,9 @@ function writeBridgeInstruction(skillName, instruction) {
 // retries (or if immediately idle), fires unconditionally so no task is lost.
 // Ask the Electron overlay to show a "Run now / Later" dialog for a deferred bridge skill.
 // Returns: 'run_now' | 'defer' | 'timeout' (on error fallback → treat as defer)
-async function askBridgeConfirm(skillName, instruction, retryCount) {
+async function askBridgeConfirm(skillName, instruction, retryCount, schedule) {
   return new Promise((resolve) => {
-    const body = JSON.stringify({ skillName, instruction, retryCount });
+    const body = JSON.stringify({ skillName, instruction, retryCount, schedule });
     const req = http.request({
       hostname: '127.0.0.1', port: OVERLAY_PORT, path: '/bridge/confirm', method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
@@ -327,7 +327,7 @@ async function fireBridgeSkill(skillName, metadata, retryCount = 0, forced = fal
     const active = await checkUserActivity();
     if (active && retryCount < 3) {
       logger.info(`[SkillScheduler] bridge deferred (user active) retry=${retryCount + 1}/3: ${skillName} — showing confirm dialog`);
-      const action = await askBridgeConfirm(skillName, metadata.instruction || skillName, retryCount);
+      const action = await askBridgeConfirm(skillName, metadata.instruction || skillName, retryCount, metadata.schedule || null);
       if (action === 'run_now') {
         // User clicked "Run Now" — force fire immediately (dialog already handled it via /skill.fire)
         // The /bridge/confirm handler already called /skill.fire with forced:true, so we're done.
@@ -428,7 +428,7 @@ async function syncScheduledSkills() {
     const notifTitle   = fm.title       || 'ThinkDrop Reminder';
     const instruction  = fm.instruction || '';
     // Bridge skills are scheduled intentionally — always fire without confirm dialog.
-    const metadata     = { type: skillType, message: notifMessage, title: notifTitle, instruction, ...(skillType === 'bridge' ? { forced: true } : {}) };
+    const metadata     = { type: skillType, message: notifMessage, title: notifTitle, instruction, schedule, ...(skillType === 'bridge' ? { forced: true } : {}) };
 
     // ── RANDOM_WINDOW pattern ───────────────────────────────────────────────
     const rw = parseRandomWindow(schedule);
@@ -521,7 +521,7 @@ async function registerSkill(skillName, schedule, execPath, metadata = {}) {
   const notifTitle   = metadata.title       || 'ThinkDrop Reminder';
   const instruction  = metadata.instruction || '';
   // Bridge skills are scheduled intentionally — always fire without confirm dialog.
-  const fullMeta     = { type: skillType, message: notifMessage, title: notifTitle, instruction, ...(skillType === 'bridge' ? { forced: true } : {}) };
+  const fullMeta     = { type: skillType, message: notifMessage, title: notifTitle, instruction, schedule, ...(skillType === 'bridge' ? { forced: true } : {}) };
 
   // ── RANDOM_WINDOW pattern ─────────────────────────────────────────────────
   const rw = parseRandomWindow(schedule);

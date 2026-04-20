@@ -34,6 +34,7 @@
 const { spawn } = require('child_process');
 const path = require('path');
 const os = require('os');
+const fs = require('fs');
 const logger = require('../logger.cjs');
 
 // ---------------------------------------------------------------------------
@@ -361,7 +362,60 @@ const ALLOWED_COMMANDS = new Set([
   'ffmpeg', 'ffprobe',
   'convert', 'identify',  // ImageMagick
   'exiftool',
+
+  // ── Document / OCR / utility tools ─────────────────────────────────────────
+  'pandoc', 'wkhtmltopdf', 'tectonic',
+  'gs', 'pdf2ps', 'pdftk', 'pdftotext',
+  'magick',
+  'tesseract',
+  'mmdc', 'mermaid',
+  'nmap',
+  'http', 'httpie',
+  'fd', 'bat', 'fzf',
+  'mkcert',
+  'act',
 ]);
+
+const USER_ALLOWLIST_PATH = path.join(os.homedir(), '.thinkdrop', 'allowed-commands.json');
+
+function _loadUserAllowedCommands() {
+  try {
+    if (!fs.existsSync(USER_ALLOWLIST_PATH)) return new Set();
+    const raw = fs.readFileSync(USER_ALLOWLIST_PATH, 'utf8');
+    const parsed = JSON.parse(raw);
+    const entries = Array.isArray(parsed)
+      ? parsed
+      : (Array.isArray(parsed?.commands) ? parsed.commands : []);
+    const normalized = entries
+      .filter((v) => typeof v === 'string')
+      .map((v) => path.basename(v.trim()))
+      .filter(Boolean);
+    return new Set(normalized);
+  } catch (err) {
+    logger.warn(`[shell.run] Failed to load user allowlist ${USER_ALLOWLIST_PATH}: ${err.message}`);
+    return new Set();
+  }
+}
+
+let USER_ALLOWED_COMMANDS = _loadUserAllowedCommands();
+let USER_ALLOWLIST_MTIME_MS = (() => {
+  try { return fs.existsSync(USER_ALLOWLIST_PATH) ? fs.statSync(USER_ALLOWLIST_PATH).mtimeMs : 0; } catch (_) { return 0; }
+})();
+
+function _refreshUserAllowedCommandsIfNeeded() {
+  try {
+    const mtimeMs = fs.existsSync(USER_ALLOWLIST_PATH) ? fs.statSync(USER_ALLOWLIST_PATH).mtimeMs : 0;
+    if (mtimeMs !== USER_ALLOWLIST_MTIME_MS) {
+      USER_ALLOWED_COMMANDS = _loadUserAllowedCommands();
+      USER_ALLOWLIST_MTIME_MS = mtimeMs;
+    }
+  } catch (_) {}
+}
+
+function _isCommandAllowed(baseName) {
+  _refreshUserAllowedCommandsIfNeeded();
+  return ALLOWED_COMMANDS.has(baseName) || USER_ALLOWED_COMMANDS.has(baseName);
+}
 
 // Commands that are always available — no opt-in required.
 // All standard terminal operations are enabled by default.
@@ -408,6 +462,136 @@ const DEFAULT_TIMEOUT_MS = 30000;
 const MAX_TIMEOUT_MS = 300000;
 const MAX_OUTPUT_BYTES = 2 * 1024 * 1024; // 2MB
 
+function _resolveOutputPath(rawPath, cwd) {
+  if (!rawPath || rawPath === '-' || rawPath === '/dev/null') return null;
+  let candidate = String(rawPath).trim().replace(/^['"]|['"]$/g, '');
+  if (!candidate || candidate.startsWith('-')) return null;
+  if (candidate.startsWith('~/')) {
+    candidate = path.join(os.homedir(), candidate.slice(2));
+  }
+  if (!path.isAbsolute(candidate)) {
+    candidate = path.resolve(cwd || process.cwd(), candidate);
+  }
+  return candidate;
+}
+
+function _extractExpectedOutputs(baseName, argv = [], cwd) {
+  const expected = [];
+  const seen = new Set();
+  const pushExpected = (rawPath, type, toolName) => {
+    const absPath = _resolveOutputPath(rawPath, cwd);
+    if (!absPath || seen.has(absPath)) return;
+    seen.add(absPath);
+    expected.push({ path: absPath, type, toolName });
+  };
+
+  const isShellInterpreter = ['bash', 'sh', 'zsh'].includes(baseName);
+  const hasScript = isShellInterpreter && Array.isArray(argv) && argv[0] === '-c' && typeof argv[1] === 'string';
+
+  if (baseName === 'pandoc') {
+    const i = argv.findIndex((a) => a === '-o' || a === '--output');
+    if (i !== -1 && argv[i + 1]) pushExpected(argv[i + 1], 'file', 'pandoc');
+  }
+  if (baseName === 'curl') {
+    const i = argv.findIndex((a) => a === '-o' || a === '--output');
+    if (i !== -1 && argv[i + 1]) pushExpected(argv[i + 1], 'file', 'curl');
+  }
+  if (baseName === 'wget') {
+    const i = argv.findIndex((a) => a === '-O' || a === '--output-document');
+    if (i !== -1 && argv[i + 1]) pushExpected(argv[i + 1], 'file', 'wget');
+  }
+  if (baseName === 'touch') {
+    argv.filter((a) => typeof a === 'string' && !a.startsWith('-')).forEach((p) => pushExpected(p, 'file', 'touch'));
+  }
+  if (baseName === 'mkdir') {
+    argv.filter((a) => typeof a === 'string' && !a.startsWith('-')).forEach((p) => pushExpected(p, 'dir', 'mkdir'));
+  }
+  if (baseName === 'cp' || baseName === 'mv') {
+    const positional = argv.filter((a) => typeof a === 'string' && !a.startsWith('-'));
+    if (positional.length >= 2) pushExpected(positional[positional.length - 1], 'file', baseName);
+  }
+
+  if (!hasScript) return expected;
+
+  const script = argv[1];
+  const pathToken = '(?:"([^"]+)"|\'([^\']+)\'|([^\\s\"\'`;|&]+))';
+
+  let match;
+  const pandocOut = new RegExp(`\\bpandoc\\b[^\\n;|&]*?\\s-o\\s+${pathToken}`, 'g');
+  while ((match = pandocOut.exec(script)) !== null) pushExpected(match[1] || match[2] || match[3], 'file', 'pandoc');
+
+  const curlOut = new RegExp(`\\bcurl\\b[^\\n;|&]*?\\s-o\\s+${pathToken}`, 'g');
+  while ((match = curlOut.exec(script)) !== null) pushExpected(match[1] || match[2] || match[3], 'file', 'curl');
+
+  const wgetOut = new RegExp(`\\bwget\\b[^\\n;|&]*?\\s-O\\s+${pathToken}`, 'g');
+  while ((match = wgetOut.exec(script)) !== null) pushExpected(match[1] || match[2] || match[3], 'file', 'wget');
+
+  const writeOps = new RegExp(`(?:echo|printf|cat)\\b[^\\n]*?>+\\s*${pathToken}`, 'g');
+  while ((match = writeOps.exec(script)) !== null) pushExpected(match[1] || match[2] || match[3], 'file', 'bash');
+
+  const teeOps = new RegExp(`\\btee\\b(?:\\s+-[a-zA-Z]+)*\\s+${pathToken}`, 'g');
+  while ((match = teeOps.exec(script)) !== null) pushExpected(match[1] || match[2] || match[3], 'file', 'bash');
+
+  const copyMoveOps = new RegExp(`\\b(cp|mv)\\b[^\\n;|&]*?\\s+(?:"[^"]+"|'[^']+'|[^\\s\"';|&]+)\\s+${pathToken}`, 'g');
+  while ((match = copyMoveOps.exec(script)) !== null) pushExpected(match[2] || match[3] || match[4], 'file', match[1]);
+
+  const mkdirOps = new RegExp(`\\bmkdir\\b[^\\n;|&]*?\\s+${pathToken}`, 'g');
+  while ((match = mkdirOps.exec(script)) !== null) pushExpected(match[1] || match[2] || match[3], 'dir', 'mkdir');
+
+  return expected;
+}
+
+function _applyStrictShellMode(baseName, argv = []) {
+  const isShellInterpreter = ['bash', 'sh', 'zsh'].includes(baseName);
+  if (!isShellInterpreter || !Array.isArray(argv) || argv[0] !== '-c' || typeof argv[1] !== 'string') {
+    return { argv, strictModeInjected: false };
+  }
+
+  const script = argv[1];
+  if (/^\s*set\s+-e/m.test(script)) {
+    return { argv, strictModeInjected: false };
+  }
+
+  const strictPrefix = baseName === 'bash' ? 'set -euo pipefail\n' : 'set -e\n';
+  const nextArgv = [...argv];
+  nextArgv[1] = strictPrefix + script;
+  return { argv: nextArgv, strictModeInjected: true };
+}
+
+function _verifyExpectedOutputs(result, baseName, argv, cwd) {
+  if (!result.ok) return result;
+
+  const expected = _extractExpectedOutputs(baseName, argv, cwd);
+  if (expected.length === 0) return result;
+
+  const missing = expected.find((entry) => {
+    try {
+      if (!fs.existsSync(entry.path)) return true;
+      if (entry.type === 'dir') return !fs.statSync(entry.path).isDirectory();
+      return !fs.statSync(entry.path).isFile();
+    } catch (_) {
+      return true;
+    }
+  });
+
+  if (!missing) {
+    return {
+      ...result,
+      outputVerified: true,
+      verifiedOutputs: expected.map((entry) => entry.path),
+    };
+  }
+
+  return {
+    ...result,
+    ok: false,
+    error: `Output not created: ${missing.path}`,
+    missingPath: missing.path,
+    toolName: missing.toolName || baseName,
+    stderrHint: String(result.stderr || '').trim().slice(0, 300),
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Validation
 // ---------------------------------------------------------------------------
@@ -421,10 +605,13 @@ function validate(args) {
 
   const baseName = path.basename(cmd);
 
-  if (!ALLOWED_COMMANDS.has(baseName)) {
+  if (!_isCommandAllowed(baseName)) {
     return {
       ok: false,
-      error: `Command not allowed: "${baseName}". Add it to ALLOWED_COMMANDS if needed.`
+      error: `Command not allowed: "${baseName}". Add it to your trusted allowlist to proceed.`,
+      userAllowlistHint: true,
+      commandName: baseName,
+      userAllowlistPath: USER_ALLOWLIST_PATH,
     };
   }
 
@@ -614,7 +801,7 @@ async function shellRun(args) {
     stdin,
   } = args || {};
 
-  const cmdString = [cmd, ...argv].join(' ');
+  const originalCmdString = [cmd, ...argv].join(' ');
 
   logger.info('shell.run invoked', { cmd, argv, cwd, timeoutMs, dryRun });
 
@@ -628,30 +815,38 @@ async function shellRun(args) {
       stderr: '',
       exitCode: -1,
       executionTime: 0,
-      cmd: cmdString,
+      cmd: originalCmdString,
       dryRun,
-      error: validation.error
+      error: validation.error,
+      userAllowlistHint: !!validation.userAllowlistHint,
+      commandName: validation.commandName || null,
+      userAllowlistPath: validation.userAllowlistPath || null,
     };
   }
 
+  const baseName = path.basename(cmd);
+  const { argv: runArgv, strictModeInjected } = _applyStrictShellMode(baseName, argv);
+  const resolvedCmdString = [cmd, ...runArgv].join(' ');
+
   // Dry-run: return preview without executing
   if (dryRun) {
-    logger.info('shell.run dry-run', { cmd, argv, cwd });
+    logger.info('shell.run dry-run', { cmd, argv: runArgv, cwd });
     return {
       ok: true,
       stdout: '',
       stderr: '',
       exitCode: 0,
       executionTime: 0,
-      cmd: cmdString,
+      cmd: resolvedCmdString,
       dryRun: true,
-      preview: `Would run: ${cmdString}${cwd ? ` (in ${cwd})` : ''}`
+      preview: `Would run: ${resolvedCmdString}${cwd ? ` (in ${cwd})` : ''}`,
+      strictModeInjected,
     };
   }
 
   // Execute
   const oauthEnv = await loadOAuthEnv();
-  const result = await runProcess(cmd, argv, {
+  const result = await runProcess(cmd, runArgv, {
     cwd,
     // OAuth vars are the lowest priority — explicit env arg and process.env override them
     env: { ...oauthEnv, ...env },
@@ -659,11 +854,14 @@ async function shellRun(args) {
     stdin,
   });
 
+  const verifiedResult = _verifyExpectedOutputs(result, baseName, runArgv, cwd);
+
   logger.info('shell.run completed', {
     cmd,
-    exitCode: result.exitCode,
-    executionTime: result.executionTime,
-    ok: result.ok
+    exitCode: verifiedResult.exitCode,
+    executionTime: verifiedResult.executionTime,
+    ok: verifiedResult.ok,
+    strictModeInjected,
   });
 
   // ── 401/403 auto-retry ──────────────────────────────────────────────────
@@ -671,7 +869,7 @@ async function shellRun(args) {
   // were injected, force-refresh all providers and retry the command once.
   // This handles the case where issued_at was recorded incorrectly (e.g., at
   // storage time rather than at Google token-issuance time).
-  const combinedOutput = (result.stdout || '') + (result.stderr || '');
+  const combinedOutput = (verifiedResult.stdout || '') + (verifiedResult.stderr || '');
   const hasOAuthVars   = Object.keys(oauthEnv).some(k => k.endsWith('_ACCESS_TOKEN'));
   const looksLike401   = hasOAuthVars && (
     /"code"\s*:\s*40[13]/.test(combinedOutput)     ||
@@ -702,23 +900,31 @@ async function shellRun(args) {
     } catch (_) {}
 
     const freshEnv   = await loadOAuthEnv();
-    const retryResult = await runProcess(cmd, argv, {
+    const retryResult = await runProcess(cmd, runArgv, {
       cwd,
       env: { ...freshEnv, ...env },
       timeoutMs: Math.min(timeoutMs, MAX_TIMEOUT_MS),
       stdin,
     });
+    const verifiedRetryResult = _verifyExpectedOutputs(retryResult, baseName, runArgv, cwd);
     logger.info('shell.run retry completed', {
-      cmd, exitCode: retryResult.exitCode, executionTime: retryResult.executionTime, ok: retryResult.ok,
+      cmd, exitCode: verifiedRetryResult.exitCode, executionTime: verifiedRetryResult.executionTime, ok: verifiedRetryResult.ok,
     });
-    return { ...retryResult, cmd: cmdString, dryRun: false, retried: true };
+    return {
+      ...verifiedRetryResult,
+      cmd: resolvedCmdString,
+      dryRun: false,
+      retried: true,
+      strictModeInjected,
+    };
   }
   // ────────────────────────────────────────────────────────────────────────
 
   return {
-    ...result,
-    cmd: cmdString,
-    dryRun: false
+    ...verifiedResult,
+    cmd: resolvedCmdString,
+    dryRun: false,
+    strictModeInjected,
   };
 }
 

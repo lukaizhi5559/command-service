@@ -382,6 +382,385 @@ CRITICAL rules:
 - startUrl is where the agent navigates AFTER login (dashboard, API keys page, etc.).
 - Getting isOAuth or signInUrl wrong causes auth flow failures — the agent will navigate to the wrong page and loop forever.`;
 
+// ---------------------------------------------------------------------------
+// PLAYBOOK_SEED_MAP — battle-tested task playbooks for known services.
+// Keys match the serviceKey (lowercase, alphanumeric only).
+// Values are markdown strings using ONLY real playwright-cli action names.
+// Available actions (full vocabulary):
+//   INPUT:       fill (inputs), type (contenteditable), select (dropdowns),
+//                check, uncheck, upload
+//   INTERACTION: click, dblclick, hover, drag
+//   KEYBOARD:    press, keydown, keyup
+//   NAVIGATION:  navigate, go-back, reload, tab-new, tab-select, tab-close
+//   OBSERVATION: snapshot (after every DOM change), screenshot, eval
+//   EXTRACTION:  run-code (full page.evaluate)
+//   DIALOGS:     dialog-accept, dialog-dismiss
+//   SCROLL:      mousewheel (dx, dy)
+//   RESULT:      return
+// Each ### section header contains task keywords used by _resolvePlaybook() for matching.
+// ---------------------------------------------------------------------------
+const PLAYBOOK_SEED_MAP = {
+  gmail: `### Compose & Send Email (compose, send, email, draft, write, message)
+1. Click the Compose button: { "action": "click", "selector": "div[gh='cm']" }
+2. Wait for compose window: { "action": "snapshot" }
+3. Fill recipient — CHIP CONFIRMATION REQUIRED:
+   { "action": "fill", "selector": "input[name='to'],textarea[name='to']", "text": "<recipient email>" }
+   { "action": "press", "key": "Enter" }
+   { "action": "snapshot" }
+   RULE: After fill+Enter on To field, always snapshot. If the address is still in the input field (not converted to a chip/token), press Enter again and snapshot again before continuing to Subject.
+4. Fill subject: { "action": "fill", "selector": "input[name='subjectbox']", "text": "<subject>" }
+5. Click body to focus: { "action": "click", "selector": "div[aria-label='Message Body']" }
+6. Type body text: { "action": "type", "text": "<body>" }
+7. Safety snapshot before sending: { "action": "snapshot" }
+8. Click Send: { "action": "click", "selector": "div[data-tooltip*='Send'],div[aria-label*='Send']" }
+
+### Read Inbox (read, inbox, emails, messages, check, list, unread)
+Extract up to 15 inbox rows using page.evaluate with Gmail's stable CSS selectors:
+{ "action": "run-code", "code": "async page => { return await page.evaluate(() => { const rows=Array.from(document.querySelectorAll('tr.zA')).slice(0,5); if(!rows.length) return 'No emails found'; return rows.map((r,i)=>{ const s=r.querySelector('.yX span,.zF')?.innerText||''; const sub=r.querySelector('.bog,.bqe')?.innerText||''; const snip=r.querySelector('.y2')?.innerText||''; const t=r.querySelector('.xW span')?.innerText||''; return 'Email '+(i+1)+': From='+s+' | Subject='+sub+' | Preview='+snip+' | Time='+t; }).join('\\n'); }); }" }
+
+### Search Emails (search, find, look for, from, subject, filter)
+1. Click search box: { "action": "click", "selector": "input[aria-label*='Search']" }
+2. Type query: { "action": "type", "text": "<search query>" }
+3. Press Enter: { "action": "press", "key": "Enter" }
+4. Wait for results: { "action": "snapshot" }
+5. Extract results (same selectors as Read Inbox above)`,
+
+  outlook: `### Compose & Send Email (compose, send, email, draft, write, message)
+1. Click New mail: { "action": "click", "selector": "button[aria-label='New mail'],span[data-icon-name='ComposeRegular']" }
+2. Wait for compose: { "action": "snapshot" }
+3. Fill recipient — press Enter to confirm chip:
+   { "action": "fill", "selector": "div[aria-label='To']", "text": "<recipient>" }
+   { "action": "press", "key": "Enter" }
+   { "action": "snapshot" }
+4. Fill subject: { "action": "fill", "selector": "input[aria-label='Subject']", "text": "<subject>" }
+5. Click body: { "action": "click", "selector": "div[aria-label*='Message body']" }
+6. Type body: { "action": "type", "text": "<body>" }
+7. Click Send: { "action": "click", "selector": "button[aria-label='Send']" }
+
+### Read Inbox (read, inbox, emails, check, list, unread)
+{ "action": "run-code", "code": "async page => { return await page.evaluate(() => { const rows=Array.from(document.querySelectorAll('div[role=listitem]')).slice(0,5); return rows.map((r,i)=>{ const s=r.querySelector('.luvU6')?.innerText||''; const sub=r.querySelector('.nDYNg')?.innerText||''; const snip=r.querySelector('.SibTc')?.innerText||''; return 'Email '+(i+1)+': From='+s+' | Subject='+sub+' | Preview='+snip; }).join('\\n'); }); }" }`,
+
+  notion: `### Create New Page (create, new page, add page, write)
+1. Click new page in sidebar: { "action": "click", "selector": "div[data-testid='sidebar-new-page'],a[aria-label='Add a page']" }
+2. Snapshot to confirm page opened: { "action": "snapshot" }
+3. Type page title: { "action": "type", "text": "<page title>" }
+4. Press Enter to start body: { "action": "press", "key": "Enter" }
+5. Type body content: { "action": "type", "text": "<content>" }
+
+### Search Workspace (search, find, look for, page)
+1. Click search: { "action": "click", "selector": "div[aria-label='Search'],button[data-testid='search-button']" }
+2. Fill search: { "action": "fill", "selector": "input[placeholder*='Search']", "text": "<query>" }
+3. Snapshot results: { "action": "snapshot" }`,
+
+  slack: `### Send Message to Channel (send, message, post, write, channel, dm, direct)
+1. Navigate to channel (or use sidebar): { "action": "click", "selector": "a[data-qa*='channel_sidebar_name']" }
+2. Click message composer: { "action": "click", "selector": "div[data-qa='message_input']" }
+3. Type message: { "action": "type", "text": "<message>" }
+4. Press Enter to send: { "action": "press", "key": "Enter" }
+
+### Read Channel Messages (read, messages, check, latest, history)
+{ "action": "run-code", "code": "async page => { return await page.evaluate(() => { const msgs=Array.from(document.querySelectorAll('.c-message__body')).slice(-5); return msgs.map((m,i)=>'Msg '+(i+1)+': '+m.innerText).join('\\n'); }); }" }`,
+
+  github: `### Navigate to Repository (navigate, open, go to, repo, repository)
+1. Navigate directly: { "action": "navigate", "url": "https://github.com/<owner>/<repo>" }
+2. Snapshot: { "action": "snapshot" }
+
+### Create Issue (create, issue, bug, report, ticket, open issue)
+1. Navigate to new issue: { "action": "navigate", "url": "https://github.com/<owner>/<repo>/issues/new" }
+2. Fill title: { "action": "fill", "selector": "input#issue_title", "text": "<title>" }
+3. Click body area: { "action": "click", "selector": "div.CodeMirror,textarea#issue_body" }
+4. Type body: { "action": "type", "text": "<body>" }
+5. Submit: { "action": "click", "selector": "button[data-disable-with*='Submitting']" }
+NOTE: Prefer gh CLI for most GitHub operations — use browser only when CLI is unavailable.`,
+
+  reddit: `### Submit Text Post (submit, post, create, write, share)
+1. Navigate to submit: { "action": "navigate", "url": "https://www.reddit.com/r/<subreddit>/submit" }
+2. Click Text tab: { "action": "click", "selector": "button[id*='post-type-link-text'],button[aria-label='Text']" }
+3. Fill title: { "action": "fill", "selector": "textarea[placeholder='Title']", "text": "<title>" }
+4. Click body editor: { "action": "click", "selector": "div.public-DraftEditor-content,div[contenteditable=true]" }
+5. Type body: { "action": "type", "text": "<body>" }
+6. Submit: { "action": "click", "selector": "button[data-testid='submit-button'],button:has-text('Post')" }
+
+### Read Feed / Posts (read, feed, posts, subreddit, list, browse)
+{ "action": "run-code", "code": "async page => { return await page.evaluate(() => { const posts=Array.from(document.querySelectorAll('article,shreddit-post')).slice(0,5); return posts.map((p,i)=>{ const t=p.querySelector('a[slot=full-post-link],[data-testid=post-title]')?.innerText||''; return 'Post '+(i+1)+': '+t; }).join('\\n'); }); }" }`,
+
+  todoist: `### Add Task (add, create, task, todo, reminder, new task)
+1. Click add task: { "action": "click", "selector": "button[data-testid='add-task-button'],button[aria-label*='Add task']" }
+2. Snapshot: { "action": "snapshot" }
+3. Fill task name: { "action": "fill", "selector": "div[aria-label='Task name'],input[data-testid='task-editor-field']", "text": "<task name>" }
+4. Press Enter to save: { "action": "press", "key": "Enter" }
+
+### List Tasks (list, tasks, show, view, today)
+{ "action": "run-code", "code": "async page => { return await page.evaluate(() => { return Array.from(document.querySelectorAll('.task_content,[data-testid=task-content]')).map((t,i)=>'Task '+(i+1)+': '+t.innerText).join('\\n'); }); }" }`,
+
+  twitter: `### Compose Tweet (tweet, post, write, share, compose)
+1. Click new tweet button: { "action": "click", "selector": "a[data-testid='SideNav_NewTweet_Button'],button[data-testid='tweetButtonInline']" }
+2. Snapshot: { "action": "snapshot" }
+3. Click tweet textarea: { "action": "click", "selector": "div[data-testid='tweetTextarea_0']" }
+4. Type tweet: { "action": "type", "text": "<tweet text>" }
+5. Submit: { "action": "click", "selector": "button[data-testid='tweetButton'],button[data-testid='tweetButtonInline']" }
+
+### Read Timeline / Feed (read, timeline, feed, tweets, posts)
+{ "action": "run-code", "code": "async page => { return await page.evaluate(() => { const tweets=Array.from(document.querySelectorAll('article[data-testid=tweet]')).slice(0,5); return tweets.map((t,i)=>{ const u=t.querySelector('div[data-testid=User-Name]')?.innerText||''; const body=t.querySelector('div[data-testid=tweetText]')?.innerText||''; return 'Tweet '+(i+1)+': '+u+' → '+body; }).join('\\n'); }); }" }`,
+
+  chatgpt: `### Submit Prompt & Read Response (ask, prompt, query, chat, generate, write, help)
+1. Click prompt input: { "action": "click", "selector": "div#prompt-textarea,div[contenteditable][data-id]" }
+2. Type prompt: { "action": "type", "text": "<prompt>" }
+3. Press Enter to submit: { "action": "press", "key": "Enter" }
+4. Snapshot to wait for response to begin: { "action": "snapshot" }
+5. Extract last assistant response:
+{ "action": "run-code", "code": "async page => { return await page.evaluate(() => { const msgs=Array.from(document.querySelectorAll('[data-message-author-role=assistant]')); return msgs[msgs.length-1]?.innerText||'Response not yet loaded'; }); }" }`,
+
+  claude: `### Submit Prompt & Read Response (ask, prompt, query, chat, generate, write, help)
+1. Click input area: { "action": "click", "selector": "div.ProseMirror[contenteditable=true],div[data-testid='chat-input']" }
+2. Type prompt: { "action": "type", "text": "<prompt>" }
+3. Press Enter: { "action": "press", "key": "Enter" }
+4. Snapshot: { "action": "snapshot" }
+5. Extract response:
+{ "action": "run-code", "code": "async page => { return await page.evaluate(() => { const msgs=Array.from(document.querySelectorAll('[data-testid=assistant-message],[data-is-streaming=false]')); return msgs[msgs.length-1]?.innerText||'Response not yet loaded'; }); }" }`,
+
+  grok: `### Submit Prompt & Read Response (ask, prompt, query, chat, generate)
+1. Click input: { "action": "click", "selector": "textarea[placeholder*='Ask'],div[contenteditable=true]" }
+2. Type prompt: { "action": "type", "text": "<prompt>" }
+3. Press Enter: { "action": "press", "key": "Enter" }
+4. Snapshot: { "action": "snapshot" }
+5. Extract response:
+{ "action": "run-code", "code": "async page => { return await page.evaluate(() => { const msgs=Array.from(document.querySelectorAll('.response-content,.message-content,[data-message-role=assistant]')); return msgs[msgs.length-1]?.innerText||'Response not yet loaded'; }); }" }`,
+
+  gemini: `### Submit Prompt & Read Response (ask, prompt, query, chat, generate)
+1. Click input: { "action": "click", "selector": "div[contenteditable=true][aria-label*='Enter'],div.ql-editor" }
+2. Type prompt: { "action": "type", "text": "<prompt>" }
+3. Press Enter: { "action": "press", "key": "Enter" }
+4. Snapshot: { "action": "snapshot" }
+5. Extract response:
+{ "action": "run-code", "code": "async page => { return await page.evaluate(() => { const msgs=Array.from(document.querySelectorAll('model-response,message-content')); return msgs[msgs.length-1]?.innerText||'Response not yet loaded'; }); }" }`,
+};
+
+// ---------------------------------------------------------------------------
+// PLAYBOOK_BUILD_PROMPT — LLM prompt for generating playbooks for unknown
+// services at build time. Fires once, cached in DuckDB. ~600 tokens output.
+// ---------------------------------------------------------------------------
+const PLAYBOOK_BUILD_PROMPT = `You are a browser automation expert. Generate step-by-step playbooks for automating a web service using playwright-cli.
+
+You MUST use ONLY these action names in your steps (no others):
+
+INPUT
+  fill        — { "action": "fill", "selector": "...", "text": "..." }           — standard <input> / <textarea>
+  type        — { "action": "type", "text": "..." }                              — contenteditable / rich-text (no selector)
+  select      — { "action": "select", "selector": "...", "value": "..." }        — <select> dropdowns
+  check       — { "action": "check", "selector": "..." }                         — checkboxes / radio buttons
+  uncheck     — { "action": "uncheck", "selector": "..." }                       — uncheck a checkbox
+  upload      — { "action": "upload", "selector": "...", "files": ["..."] }      — file input upload
+
+DOM INTERACTION
+  click       — { "action": "click", "selector": "..." }
+  dblclick    — { "action": "dblclick", "selector": "..." }                      — double-click (inline edit, expand)
+  hover       — { "action": "hover", "selector": "..." }                         — reveal hover menus / tooltips
+  drag        — { "action": "drag", "startSelector": "...", "endSelector": "..." } — drag-and-drop
+
+KEYBOARD
+  press       — { "action": "press", "key": "Enter" }                            — Enter, Escape, Tab, ArrowDown, etc.
+  keydown     — { "action": "keydown", "key": "Shift" }                          — hold modifier before click
+  keyup       — { "action": "keyup", "key": "Shift" }                            — release modifier
+
+NAVIGATION
+  navigate    — { "action": "navigate", "url": "..." }
+  go-back     — { "action": "go-back" }                                          — browser back
+  reload      — { "action": "reload" }                                           — reload current page
+  tab-new     — { "action": "tab-new", "url": "..." }                            — open new tab
+  tab-select  — { "action": "tab-select", "index": 0 }                           — switch tab
+  tab-close   — { "action": "tab-close", "index": 0 }                            — close tab
+
+OBSERVATION  (ALWAYS snapshot after any DOM change before the next action)
+  snapshot    — { "action": "snapshot" }                                         — re-reads live DOM / ARIA tree
+  screenshot  — { "action": "screenshot" }                                       — capture visual screenshot
+  eval        — { "action": "eval", "expression": "document.title" }             — lightweight JS (no page.evaluate wrapper)
+
+DATA EXTRACTION
+  run-code    — { "action": "run-code", "code": "async page => { return await page.evaluate(() => ...) }" }
+
+DIALOGS
+  dialog-accept  — { "action": "dialog-accept" }                                 — confirm / OK dialogs
+  dialog-dismiss — { "action": "dialog-dismiss" }                                — cancel / dismiss dialogs
+
+SCROLL
+  mousewheel  — { "action": "mousewheel", "dx": 0, "dy": 500 }                  — scroll down (positive dy); up (negative dy)
+
+RESULT
+  return      — { "action": "return", "data": "..." }                            — emit final result
+
+Generate 2-4 playbooks covering the most common tasks for this service.
+Format each playbook as a ### section with task keywords in parentheses in the header.
+
+Example format:
+### Send Message (send, message, post, write)
+1. Click compose button: { "action": "click", "selector": "button[aria-label='Compose']" }
+2. Wait for modal: { "action": "snapshot" }
+3. Fill recipient: { "action": "fill", "selector": "input[placeholder='To']", "text": "<recipient>" }
+4. Type body: { "action": "type", "text": "<message>" }
+5. Click Send: { "action": "click", "selector": "button:has-text('Send')" }
+
+### Read Messages (read, messages, inbox, check)
+{ "action": "run-code", "code": "async page => { return await page.evaluate(() => { return Array.from(document.querySelectorAll('.message')).slice(0,5).map(m=>m.innerText).join('\\n'); }); }" }
+
+IMPORTANT:
+- Use CSS attribute selectors and ARIA labels — they are more stable than class names
+- For form fields that create chips/tokens (like email To fields), always fill + press Enter + snapshot before continuing
+- For contenteditable rich-text areas use type, not fill
+- After hover/dblclick/click that opens a menu or modal, always snapshot before the next action
+- Keep selectors as generic/semantic as possible since you don't have a live DOM
+- Output ONLY the ### playbook sections — no preamble, no explanation`;
+
+// ---------------------------------------------------------------------------
+// PLAYBOOK_RUNTIME_COT_PROMPT — LLM prompt for generating a single playbook
+// for a novel goal at runtime (Chain-of-Thought with few-shot examples).
+// Output is one ### section; appended to descriptor for future reuse.
+// ---------------------------------------------------------------------------
+const PLAYBOOK_RUNTIME_COT_PROMPT = `You are a browser automation expert. A user wants to accomplish a specific goal on a web service.
+
+You will receive:
+- SERVICE: the service name
+- START_URL: the service's base URL
+- GOAL: what the user wants to accomplish
+- EXISTING_PLAYBOOKS: 1-2 example playbooks for OTHER tasks on this service (use these as FORMAT REFERENCES only)
+- EXECUTION_RESULT (optional): what the agent actually observed/did when it ran this goal successfully.
+  If present, use it to ground your selectors and steps — it reflects the real DOM.
+
+Your job: generate ONE new playbook for the GOAL using the exact same format and action vocabulary as the examples.
+
+You MUST use ONLY these action names (full playwright-cli vocabulary):
+  INPUT:       fill (inputs), type (contenteditable), select (dropdowns), check, uncheck, upload
+  INTERACTION: click, dblclick, hover, drag
+  KEYBOARD:    press, keydown, keyup
+  NAVIGATION:  navigate, go-back, reload, tab-new, tab-select, tab-close
+  OBSERVATION: snapshot (after EVERY DOM change), screenshot, eval
+  EXTRACTION:  run-code (async page => { return await page.evaluate(() => ...) })
+  DIALOGS:     dialog-accept, dialog-dismiss
+  SCROLL:      mousewheel (dx, dy)
+  RESULT:      return
+
+Chain-of-thought approach:
+1. What page/view does this goal start from?
+2. What is the first action (click, navigate, hover to reveal a menu)?
+3. Does the DOM change after that action? If yes → snapshot.
+4. What fields need filling? Use fill for <input>/<textarea>, type for contenteditable.
+5. Are there chip/token confirmation steps? Fill + press Enter + snapshot + verify chip exists.
+6. Does the task involve drag, scroll-to-load, multi-select, or dialog confirmation?
+7. What is the final action (submit, press Enter, click Save)?
+8. Does the goal require reading data back? If yes → run-code with page.evaluate.
+
+Format your response as a single ### section:
+### <Task Name> (<keyword1>, <keyword2>, <keyword3>)
+<numbered steps or single run-code block>
+
+IMPORTANT:
+- The ### header keywords are used for future matching — make them comprehensive and relevant
+- Do NOT repeat steps from the existing playbooks — generate only what GOAL requires
+- Output ONLY the ### section — no preamble, no explanation`;
+
+// ---------------------------------------------------------------------------
+// _resolvePlaybook — 3-tier goal-aware playbook selection.
+// Returns: { tier, section, subsections }
+//   tier 1: keyword match found     — section = matched ### block
+//   tier 3: no match                — section = null, subsections = all ### blocks (for COT)
+// ---------------------------------------------------------------------------
+function _resolvePlaybook(descriptor, task) {
+  if (!descriptor || !task) return { tier: 3, section: null, subsections: [] };
+
+  // No `m` flag — `$` must match end-of-string to capture the full Playbooks block
+  const playbookMatch = descriptor.match(/\n## Playbooks\n([\s\S]*)$/);
+  if (!playbookMatch) return { tier: 3, section: null, subsections: [] };
+
+  const playbookBody = playbookMatch[1].trim();
+  // Split into ### subsections, keeping the header with each block
+  const subsections = playbookBody.split(/(?=### )/).map(s => s.trim()).filter(Boolean);
+  if (subsections.length === 0) return { tier: 3, section: null, subsections: [] };
+
+  const taskLower = task.toLowerCase();
+  const matched = [];
+  for (const sub of subsections) {
+    const headerLine = sub.split('\n')[0]; // e.g. "### Compose & Send Email (compose, send, email, ...)"
+    // Extract keywords from parentheses in header, plus individual words from the header title
+    const parenMatch = headerLine.match(/\(([^)]+)\)/);
+    const keywords   = parenMatch
+      ? parenMatch[1].split(',').map(k => k.trim().toLowerCase())
+      : headerLine.replace(/^###\s*/, '').toLowerCase().split(/\W+/).filter(k => k.length > 3);
+
+    if (keywords.some(kw => kw && taskLower.includes(kw))) {
+      matched.push(sub);
+    }
+  }
+
+  if (matched.length > 0) {
+    // Join all matching sections — compound tasks (e.g. "find and delete") get both playbooks
+    return { tier: 1, section: matched.join('\n\n'), subsections };
+  }
+
+  return { tier: 3, section: null, subsections };
+}
+
+// ---------------------------------------------------------------------------
+// _generateAndCachePlaybook — COT runtime playbook generation.
+// Generates one ### section for a novel goal, appends to descriptor in DuckDB + disk.
+// Non-blocking write-back; returns the generated section (or null on failure).
+// ---------------------------------------------------------------------------
+async function _generateAndCachePlaybook(agentId, descriptor, task, subsections, executionResult) {
+  try {
+    // Pick up to 2 shortest subsections as few-shot examples
+    const examples = [...subsections]
+      .sort((a, b) => a.length - b.length)
+      .slice(0, 2)
+      .join('\n\n');
+
+    // Extract startUrl from descriptor frontmatter
+    const urlLine  = (descriptor || '').split('\n').find(l => l.startsWith('start_url:'));
+    const startUrl = urlLine ? urlLine.replace('start_url:', '').trim() : '';
+    const serviceLine = (descriptor || '').split('\n').find(l => l.startsWith('service:'));
+    const service  = serviceLine ? serviceLine.replace('service:', '').trim() : agentId;
+
+    // If we have a real execution result (post-execution write-back path), include it as
+    // grounding context. The LLM can generate selectors from what the agent actually observed.
+    const resultCtx = executionResult
+      ? `\n\nEXECUTION_RESULT (what the agent observed/did successfully):\n${String(executionResult).slice(0, 800)}`
+      : '';
+
+    const userQuery = `SERVICE: ${service}\nSTART_URL: ${startUrl}\nGOAL: ${task}\n\nEXISTING_PLAYBOOKS:\n${examples}${resultCtx}`;
+    const raw = await callLLM(PLAYBOOK_RUNTIME_COT_PROMPT, userQuery, { temperature: 0.2, maxTokens: 500 });
+    if (!raw || !raw.includes('###')) return null;
+
+    // Extract the ### block
+    const sectionMatch = raw.match(/(###[\s\S]+)/);
+    if (!sectionMatch) return null;
+    const newSection = sectionMatch[1].trim();
+
+    // Append to descriptor — fire-and-forget write-back (non-blocking for caller)
+    setImmediate(async () => {
+      try {
+        let updatedDescriptor;
+        if (descriptor.includes('\n## Playbooks\n')) {
+          updatedDescriptor = descriptor.trimEnd() + '\n\n' + newSection;
+        } else {
+          updatedDescriptor = descriptor.trimEnd() + '\n\n## Playbooks\n' + newSection;
+        }
+        const mdPath = path.join(AGENTS_DIR, `${agentId}.md`);
+        fs.writeFileSync(mdPath, updatedDescriptor, 'utf8');
+        const db = await getDb();
+        if (db) {
+          await db.run('UPDATE agents SET descriptor = ? WHERE id = ?', updatedDescriptor, agentId);
+        }
+        logger.info(`[browser.agent] _generateAndCachePlaybook: cached new playbook for ${agentId} — goal="${task}"`);
+      } catch (writeErr) {
+        logger.warn(`[browser.agent] _generateAndCachePlaybook: write-back failed for ${agentId}: ${writeErr.message}`);
+      }
+    });
+
+    return newSection;
+  } catch (err) {
+    logger.warn(`[browser.agent] _generateAndCachePlaybook: LLM error for ${agentId}: ${err.message}`);
+    return null;
+  }
+}
+
 async function resolveBrowserMeta(service) {
   const seedKey = service.toLowerCase().replace(/[^a-z0-9]/g, '');
 
@@ -591,9 +970,9 @@ function deriveAgentType(meta) {
 // Action: build_agent
 // ---------------------------------------------------------------------------
 
-function buildBrowserDescriptorMd({ id, service, startUrl, signInUrl, authSuccessPattern, capabilities, type = 'browser' }) {
+function buildBrowserDescriptorMd({ id, service, startUrl, signInUrl, authSuccessPattern, capabilities, type = 'browser', playbooks = null }) {
   const capYaml = capabilities.map(c => `  - ${c}`).join('\n');
-  return [
+  const parts = [
     '---',
     `id: ${id}`,
     `type: ${type}`,
@@ -616,12 +995,18 @@ function buildBrowserDescriptorMd({ id, service, startUrl, signInUrl, authSucces
     `Once authenticated, the session is stored at ~/.thinkdrop/browser-sessions/${service}_agent/`,
     '',
     `## Navigation Patterns`,
-    `After auth, use action:scanCurrentPage to observe the DOM before clicking or typing.`,
-    `Use action:navigate to go to specific URLs within the service.`,
-    `Use action:click with selector from scanCurrentPage elements.`,
-    `Use action:type to fill in text fields.`,
-    `Use action:evaluate to extract values from the DOM.`,
-  ].join('\n');
+    `Use { "action": "snapshot" } to read the current DOM state before interacting.`,
+    `Use { "action": "navigate", "url": "..." } to go to specific URLs.`,
+    `Use { "action": "click", "selector": "..." } with ref from snapshot.`,
+    `Use { "action": "fill", "selector": "...", "text": "..." } for standard text inputs and form fields.`,
+    `Use { "action": "type", "text": "..." } for contenteditable areas (email body, chat prompts, rich-text editors).`,
+    `Use { "action": "press", "key": "..." } for keyboard actions (Enter=confirm/submit, Escape=close, Tab=autocomplete).`,
+    `Use { "action": "run-code", "code": "async page => { return await page.evaluate(() => ...) }" } to extract DOM data.`,
+  ];
+  if (playbooks) {
+    parts.push('', '## Playbooks', playbooks);
+  }
+  return parts.join('\n');
 }
 
 async function actionBuildAgent({ service, startUrl: explicitUrl, force = false }) {
@@ -661,7 +1046,32 @@ async function actionBuildAgent({ service, startUrl: explicitUrl, force = false 
     }
   }
 
-  const descriptor = buildBrowserDescriptorMd({ id: agentId, service: serviceKey, startUrl, signInUrl, authSuccessPattern, capabilities, type: agentType });
+  // Resolve playbooks: seed map first, then LLM generation for unknown services.
+  // LLM-generated playbooks are marked with a comment so validate_agent can refine them later.
+  let playbooks = PLAYBOOK_SEED_MAP[serviceKey] || null;
+  let playbooksSource = playbooks ? 'seeded' : null;
+  if (!playbooks) {
+    try {
+      const capList = capabilities.join(', ');
+      const buildQuery = `SERVICE: ${serviceKey}\nSTART_URL: ${startUrl}${signInUrl ? '\nSIGN_IN_URL: ' + signInUrl : ''}\nCAPS: ${capList}`;
+      const rawPlaybooks = await callLLM(PLAYBOOK_BUILD_PROMPT, buildQuery, { temperature: 0.2, maxTokens: 700 });
+      if (rawPlaybooks && rawPlaybooks.includes('###')) {
+        // Extract only the ### sections
+        const sectionsMatch = rawPlaybooks.match(/(###[\s\S]+)/);
+        playbooks = sectionsMatch ? sectionsMatch[1].trim() : null;
+        playbooksSource = 'generated';
+      }
+    } catch (pbErr) {
+      logger.warn(`[browser.agent] build_agent: playbook LLM generation failed for ${serviceKey}: ${pbErr.message}`);
+    }
+  }
+  logger.info(`[browser.agent] build_agent: playbooks for ${agentId} — source=${playbooksSource || 'none'}`);
+
+  // Agent status: LLM-generated playbooks are unverified — mark needs_validation so the first
+  // successful run can upgrade to 'healthy'. Seeded playbooks are battle-tested — healthy directly.
+  const initialStatus = playbooksSource === 'generated' ? 'needs_validation' : 'healthy';
+
+  const descriptor = buildBrowserDescriptorMd({ id: agentId, service: serviceKey, startUrl, signInUrl, authSuccessPattern, capabilities, type: agentType, playbooks });
 
   // Write .md to disk
   fs.mkdirSync(AGENTS_DIR, { recursive: true });
@@ -674,12 +1084,13 @@ async function actionBuildAgent({ service, startUrl: explicitUrl, force = false 
     await db.run(
       `INSERT OR REPLACE INTO agents
          (id, type, service, cli_tool, capabilities, descriptor, last_validated, status, created_at)
-       VALUES (?, ?, ?, NULL, ?, ?, CURRENT_TIMESTAMP, 'healthy', CURRENT_TIMESTAMP)`,
+       VALUES (?, ?, ?, NULL, ?, ?, CURRENT_TIMESTAMP, ?, CURRENT_TIMESTAMP)`,
       agentId,
       agentType,
       serviceKey,
       JSON.stringify(capabilities),
-      descriptor
+      descriptor,
+      initialStatus
     );
   }
 
@@ -1780,10 +2191,59 @@ async function actionRun({ agentId, task, url, context, requiresAuth, _progressC
 
   // Step 2: delegate to playwright.agent or agentbrowser.agent with the authenticated session
   logger.info(`[browser.agent] run: auth ok — delegating to ${_agentSkill} for "${task}"`);
+
+  // ── Goal-aware playbook injection ────────────────────────────────────────────
+  // Tier 1: one or more keyword-matched ### sections → injected directly, 0 LLM calls.
+  //         Compound tasks ("find and delete") get ALL matching sections concatenated.
+  // Tier 2: no keyword match → inject 2 seeded sections as FORMAT EXAMPLES + a NOVEL TASK
+  //         comment so playwright.agent reasons from the live snapshot. 0 LLM calls,
+  //         0 added latency. Async COT write-back fires after success to cache for next run.
+  // Tier 3: no playbook sections exist yet → inject core descriptor only (bare agent).
+  let _agentContext   = undefined;
+  let _playbookTier   = 3;        // tracked for post-execution write-back decision
+  if (existing.descriptor) {
+    const _coreDescriptor = existing.descriptor.replace(/\n## Playbooks[\s\S]*/m, '').trim();
+    const _playbook = _resolvePlaybook(existing.descriptor, task);
+    let _matchedPlaybook = null;
+
+    if (_playbook.tier === 1) {
+      // Tier 1: direct match (possibly multiple sections for compound tasks)
+      _matchedPlaybook = _playbook.section;
+      _playbookTier    = 1;
+      const headers = _playbook.section.match(/^### .+/gm) || [];
+      logger.info(`[browser.agent] playbook: tier-1 match (${headers.length} section(s)) for ${agentId} — ${headers.map(h => `"${h}"`).join(', ')}`);
+
+    } else if (_playbook.subsections.length > 0) {
+      // Tier 2: no keyword match but we have seed sections to use as format references.
+      // Inject the 2 shortest (most focused) sections as few-shot examples so playwright.agent
+      // understands action vocabulary and output format — then let it reason from the live snapshot.
+      const formatExamples = [..._playbook.subsections]
+        .sort((a, b) => a.length - b.length)
+        .slice(0, 2)
+        .join('\n\n');
+      _matchedPlaybook = `<!-- NOVEL TASK: no direct playbook match for this goal.\n` +
+        `Take a snapshot first, then reason from the live DOM to accomplish the goal.\n` +
+        `The sections below are FORMAT EXAMPLES ONLY — do not follow their steps literally.\n` +
+        `Available actions: click, dblclick, hover, drag, fill, type, select, check, uncheck, upload,\n` +
+        `press, keydown, keyup, navigate, go-back, reload, tab-new, tab-select, tab-close,\n` +
+        `snapshot (after every DOM change), screenshot, eval, run-code, dialog-accept, dialog-dismiss,\n` +
+        `mousewheel (scroll), return -->\n\n` +
+        formatExamples;
+      _playbookTier = 2;
+      logger.info(`[browser.agent] playbook: tier-2 format-reference for ${agentId} — novel goal="${task.slice(0, 60)}"`);
+
+    } else {
+      // Tier 3: no playbook sections at all — bare core descriptor
+      _playbookTier = 3;
+      logger.info(`[browser.agent] playbook: tier-3 core-only for ${agentId} — no playbook sections exist yet`);
+    }
+    _agentContext = (_coreDescriptor + (_matchedPlaybook ? '\n\n## Playbooks\n' + _matchedPlaybook : '')).slice(0, 3000);
+  }
+
   try {
     const agentResult = await callSkill(_agentSkill, {
       goal: task,
-      agentContext: existing.descriptor ? existing.descriptor.slice(0, 800) : undefined,
+      agentContext: _agentContext,
       url: url || (_useAgentBrowser ? startUrl : undefined),
       authSignInUrl: _useAgentBrowser ? (signInUrl || undefined) : undefined,
       sessionId,
@@ -1799,6 +2259,28 @@ async function actionRun({ agentId, task, url, context, requiresAuth, _progressC
     }, 130000);
 
     const agentResultText = agentResult?.result || agentResult?.stdout || '';
+
+    // ── Tier-2 post-execution write-back ──────────────────────────────────────
+    // When a novel-goal task (tier-2 format-reference) succeeds, fire an async COT
+    // call to generate a grounded ### playbook section from the actual execution
+    // result. On the next identical task, _resolvePlaybook will hit tier-1 directly.
+    if (_playbookTier === 2 && agentResult?.ok === true && existing.descriptor) {
+      // Parse only the ## Playbooks section — avoid matching ### headers in other sections
+      const _pbMatch = existing.descriptor.match(/\n## Playbooks\n([\s\S]*)$/);
+      const _existingSubsections = _pbMatch
+        ? _pbMatch[1].trim().split(/(?=### )/).map(s => s.trim()).filter(Boolean)
+        : [];
+      setImmediate(() => {
+        _generateAndCachePlaybook(
+          agentId,
+          existing.descriptor,
+          task,
+          _existingSubsections,
+          agentResultText.slice(0, 1200),
+        ).catch(() => {/* silent — write-back is best-effort */});
+      });
+      logger.info(`[browser.agent] playbook: tier-2 success — async COT write-back queued for ${agentId}`);
+    }
 
     // ── Dynamic login-wall detector ───────────────────────────────────────────
     // If playwright.agent returned content that looks like a login/auth wall,
@@ -1874,7 +2356,7 @@ async function actionRun({ agentId, task, url, context, requiresAuth, _progressC
             } catch (_) {}
             const _retryResult = await callSkill(_agentSkill, {
               goal: task,
-              agentContext: existing.descriptor ? existing.descriptor.slice(0, 800) : undefined,
+              agentContext: _agentContext,
               url: startUrl,
               sessionId,
               agentId,
