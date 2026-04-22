@@ -13,7 +13,7 @@
  *
  * Actions supported:
  *   navigate | goto | back | forward | reload | close | snapshot
- *   click | dblclick | fill | type | hover | select | check | uncheck
+ *   click | dblclick | fill | type | hover | select | check | uncheck | upload
  *   keyboard | press | scroll | screenshot | pdf
  *   getText | getPageText | evaluate | scanCurrentPage
  *   waitForSelector | waitForContent | waitForStableText
@@ -509,6 +509,20 @@ async function browserAct(args) {
             await cliRun([...S, 'goto', url], navTimeout).catch(() => {});
           }
         }
+
+        // Non-blocking post-nav verification so we can detect successful command
+        // execution that still lands on about:blank during tab/session instability.
+        try {
+          const _urlProbe = await cliRun([...S, 'eval', 'window.location.href'], 3000);
+          const _rawProbe = (_urlProbe.stdout || '').trim();
+          const _probeMatch = _rawProbe.match(/###\s*Result\s*\n([\s\S]*?)(?=###|$)/i);
+          const _curUrl = (_probeMatch ? _probeMatch[1] : _rawProbe).trim().replace(/^"|"$/g, '');
+          if (/about:blank/i.test(_curUrl)) {
+            logger.warn(`[browser.act] navigate: command succeeded but current URL is about:blank (session=${sessionId})`);
+          }
+        } catch (_) {
+          // Probe failure is non-fatal — navigation result stands.
+        }
       } else if (alreadyOpen && !res.ok) {
         // goto failed (daemon may have died) — retry with open to restart it
         logger.info(`[browser.act] goto failed, retrying with open for session=${sessionId}`);
@@ -640,6 +654,30 @@ async function browserAct(args) {
       const ref = rawFillRef && /^e\d+$/i.test(rawFillRef) ? rawFillRef : null;
       const fillTarget = ref || selector;
       const fillText = (text ?? value) || '';
+      const unresolvedCred = fillText.match(/\{\{[a-z0-9_.-]+:[a-z0-9_]+\}\}/i);
+      if (unresolvedCred) {
+        logger.warn(`[browser.act] fill: refusing unresolved credential token ${unresolvedCred[0]}`);
+        return {
+          ok: false,
+          action,
+          sessionId,
+          loginWallDetected: true,
+          needsCredentials: true,
+          executionTime: Date.now() - start,
+          error: `Unresolved credential token ${unresolvedCred[0]} — credentials must be resolved before fill`,
+        };
+      }
+      const placeholderEmail = fillText.match(/\b(?:example@domain\.com|user@example\.com|your-email@gmail\.com)\b|<\s*email\s*>/i);
+      if (placeholderEmail) {
+        logger.warn(`[browser.act] fill: refusing placeholder email value ${placeholderEmail[0]}`);
+        return {
+          ok: false,
+          action,
+          sessionId,
+          executionTime: Date.now() - start,
+          error: `Placeholder recipient value rejected: ${placeholderEmail[0]}`,
+        };
+      }
       logger.info(`[browser.act] fill resolved: "${selector}" → ${ref ? `ref ${ref}` : `direct selector "${selector}"`} (click+type strategy)`);
 
       // Step 1: click to focus
@@ -728,6 +766,81 @@ async function browserAct(args) {
       const rawCheckRef = resolveRef(sessionId, selector);
       const checkTarget = (rawCheckRef && /^e\d+$/i.test(rawCheckRef) ? rawCheckRef : null) || selector;
       return run(['check', checkTarget], `check ${checkTarget}`);
+    }
+
+    // ── Upload ───────────────────────────────────────────────────────────────
+    // playwright-cli upload takes ONLY file paths — no element ref.
+    // The correct sequence is:
+    //   1. click <ref>          — triggers the browser's file chooser dialog
+    //   2. upload <filepath>    — playwright-cli intercepts the active chooser
+    //                             and feeds the file in (CLI handles the timing)
+    // Fallback: if the chooser-based upload fails (hidden input, multiple file
+    // inputs, no chooser event), retry via run-code + getElement().setInputFiles()
+    // which targets the element directly and bypasses the chooser entirely.
+    case 'upload': {
+      const uploadFiles = (args.files && Array.isArray(args.files) ? args.files
+        : args.file ? [args.file]
+        : args.path ? [args.path] : []).filter(Boolean);
+      if (args.path && !args.files) {
+        logger.warn(`[browser.act] upload: "path" param used — prefer "files" array. Normalizing to files=[${args.path}]`);
+      }
+      if (!uploadFiles.length) {
+        return { ok: false, action, sessionId, error: 'upload: files[] or file is required', executionTime: Date.now() - start };
+      }
+      for (const _f of uploadFiles) {
+        const _raw = String(_f || '');
+        if (!path.isAbsolute(_raw)) {
+          return {
+            ok: false,
+            action,
+            sessionId,
+            error: `upload: path must be absolute: ${_raw}`,
+            executionTime: Date.now() - start,
+          };
+        }
+        if (/\/path\/to\/|\/Users\/the_user\/|\{\{[^}]+\}\}|<\s*file/i.test(_raw)) {
+          return {
+            ok: false,
+            action,
+            sessionId,
+            error: `upload: placeholder file path rejected: ${_raw}`,
+            executionTime: Date.now() - start,
+          };
+        }
+        if (!fs.existsSync(_raw)) {
+          return {
+            ok: false,
+            action,
+            sessionId,
+            error: `upload: file not found: ${_raw}`,
+            executionTime: Date.now() - start,
+          };
+        }
+      }
+      // Step 1: click the selector to open the file chooser (if selector provided)
+      if (selector) {
+        const _triggerRes = await run(['click', selector], `click ${selector} (trigger file chooser)`);
+        if (!_triggerRes.ok) {
+          logger.warn(`[browser.act] upload: click on selector "${selector}" failed — attempting upload without trigger`);
+        }
+      }
+      // Step 2: feed each file to the active chooser
+      let _uploadResult;
+      for (const _f of uploadFiles) {
+        _uploadResult = await run(['upload', _f], `upload ${_f}`);
+        if (!_uploadResult.ok) {
+          // Fallback: chooser-based approach failed — try direct setInputFiles via run-code.
+          // This handles hidden inputs and services with multiple <input type="file"> elements.
+          if (selector) {
+            logger.warn(`[browser.act] upload via chooser failed for "${_f}" — retrying via run-code setInputFiles on selector "${selector}"`);
+            const _rcCode = `async page => { await (await getElement(${JSON.stringify(selector)})).setInputFiles(${JSON.stringify(_f)}); return 'uploaded: ' + ${JSON.stringify(_f)}; }`;
+            _uploadResult = await run(['run-code', _rcCode], `setInputFiles ${_f}`);
+          }
+          if (!_uploadResult.ok) return _uploadResult;
+        }
+        logger.info(`[browser.act] upload: file attached — ${_f}`);
+      }
+      return _uploadResult;
     }
 
     // ── Keyboard ─────────────────────────────────────────────────────────────
@@ -1057,6 +1170,29 @@ async function browserAct(args) {
       while (Date.now() < deadline) {
         // Hard bail: if less than 10s left, don't start another 8s eval — return what we have
         if (deadline - Date.now() < 10000) break;
+
+        // Fail fast on about:blank so callers can recover instead of re-planning on empty data.
+        try {
+          const urlProbe = await cliRun([...S, 'eval', 'window.location.href'], 2000);
+          const urlRaw = (urlProbe.stdout || '').trim();
+          const urlMatch = urlRaw.match(/###\s*Result\s*\n([\s\S]*?)(?=###|$)/i);
+          const curUrl = (urlMatch ? urlMatch[1] : urlRaw).trim().replace(/^"|"$/g, '');
+          if (/about:blank/i.test(curUrl)) {
+            logger.warn(`[browser.act] waitForStableText: page is about:blank for session=${sessionId}`);
+            return {
+              ok: true,
+              action,
+              sessionId,
+              result: '',
+              stdout: '',
+              aboutBlankDetected: true,
+              executionTime: Date.now() - start,
+            };
+          }
+        } catch (_) {
+          // URL probe failures are transient; continue polling page text.
+        }
+
         // Truncate to 50k chars to prevent huge pages (YouTube, Reddit) from timing out the eval.
         // A SIGTERM to playwright-cli mid-eval causes it to navigate the tab to about:blank as cleanup.
         const r = await cliRun([...S, 'eval', 'document.body.innerText.slice(0,50000)'], 8000);

@@ -200,7 +200,17 @@ async function getContextRulesByKeys(keys, contextType = undefined) {
     logger.warn(`[skill-db] getContextRulesByKeys failed: ${JSON.stringify(res?.error || res)?.slice(0, 120)}`);
   }
   const results = res?.data?.results;
-  return Array.isArray(results) ? results.map(r => r.ruleText || r.rule_text || '').filter(Boolean) : [];
+  if (!Array.isArray(results)) return [];
+
+  // Never inject placeholder/tutorial artifacts as learned runtime rules.
+  const PLACEHOLDER_RULE_RE = /(?:example@|user@example|<\s*email\s*>|<\s*recipient\s*>|\/path\/to\/|\/Users\/the_user\/|\{\{[^}]+\}\})/i;
+  const allRules = results.map(r => r.ruleText || r.rule_text || '').filter(Boolean);
+  const safeRules = allRules.filter((rule) => !PLACEHOLDER_RULE_RE.test(rule));
+  const dropped = allRules.length - safeRules.length;
+  if (dropped > 0) {
+    logger.warn(`[skill-db] getContextRulesByKeys: dropped ${dropped} placeholder rule(s) from [${keys.join(', ')}]`);
+  }
+  return safeRules;
 }
 
 async function deleteContextRulesByKey(contextKey) {

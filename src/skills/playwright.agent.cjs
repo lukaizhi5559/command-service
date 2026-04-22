@@ -84,6 +84,7 @@ const BROWSER_ACTIONS_FULL = `Available actions:
                   { "action": "run-code", "code": "async page => { return await page.evaluate(() => { const rows = Array.from(document.querySelectorAll('tr.zA')).slice(0,5); if(!rows.length) return 'No emails found'; return rows.map((r,i)=>{ const s=r.querySelector('.yX span,.zF')?.innerText||''; const sub=r.querySelector('.bog,.bqe')?.innerText||''; const snip=r.querySelector('.y2')?.innerText||''; const t=r.querySelector('.xW span')?.innerText||''; return 'Email '+(i+1)+': From='+s+' | Subject='+sub+' | Preview='+snip+' | Time='+t; }).join('\\n'); }); }" }
   screenshot      { filePath }
   snapshot        {}                   — re-read the page (ONLY when page changes significantly)
+  upload          { selector, files }  — attach file(s): clicks selector to open chooser, feeds files to active chooser via setInputFiles. selector = button/input ref; files = array of real absolute paths from the task/request. IMPORTANT: always use "files" (array), NEVER use "path". NEVER invent placeholders like /path/to/file.pdf.
   return          { data: "<string>" } — MUST be LAST step; plain string output, max 2000 chars.
   dialog-accept   { prompt? }
   dialog-dismiss  {}`;
@@ -177,6 +178,7 @@ Rules:
 - Contenteditable areas: click first, then type (not fill).
 - Do NOT include auth steps — assume already logged in.
 - CREDENTIALS RULE: If credentials not in goal text are required, return empty plan.
+- NEVER emit credential template tokens like {{gmail:username}} or {{service:password}} in any step arg.
 - Keep plan concise — no unnecessary waits or redundant snapshots.
 - MULTI-ITEM EXTRACTION: Use one run-code step with page.evaluate() + document.querySelectorAll(). Never click per-item.
 - RUN-CODE RETURN: run-code result is auto-captured as task output — do NOT add a placeholder return step after it.
@@ -241,7 +243,8 @@ Respond with EXACTLY ONE JSON object (no markdown fences, no explanation):
   But PREFER to avoid file I/O entirely — any needed content is already in the task as [DATA FROM PRIOR STEP].
 - If a run-code step failed due to require/file-reading: replace it with a \`type\` action using content
   from the task description instead.
-- If the error contains "Timeout" and the failed step was navigate or click, a browser dialog (e.g. "Leave site?", "Leave page?") may be blocking. In that case start the repair with { "action": "dialog-accept" } before retrying the original step.`;
+- If the error contains "Timeout" and the failed step was navigate or click, a browser dialog (e.g. "Leave site?", "Leave page?") may be blocking. In that case start the repair with { "action": "dialog-accept" } before retrying the original step.
+- If the failed step is an upload action: the ONLY valid param for file paths is "files" (array of absolute paths). NEVER use "path". Correct form: { "action": "upload", "selector": "<ref>", "files": ["/absolute/path/to/file"] }`;
 
 // ---------------------------------------------------------------------------
 // Replan prompt — called when a DOM-mutating step caused a structural DOM change.
@@ -272,7 +275,9 @@ Rules:
 - Use element refs (e12, e83) from FRESH_SNAPSHOT for click/fill/hover
 - Autocomplete inputs (Gmail To:, CC:, BCC:): fill then press Enter to confirm the recipient chip. Do NOT use Tab — Tab moves focus without creating the chip.
 - Contenteditable areas: click first, then type (not fill)
-- CREDENTIALS RULE: NEVER use placeholder text like 'your-email@gmail.com', 'user@example.com', '<email>', '<password>' in fill/type steps. Use {{service:username}} / {{service:password}} tokens, or exact values from GOAL text.
+- CREDENTIALS RULE: NEVER use placeholder text like 'your-email@gmail.com', 'user@example.com', '<email>', '<password>' in fill/type steps.
+- NEVER emit credential template tokens like {{gmail:username}} / {{service:password}}.
+- If FRESH_SNAPSHOT is an auth/login wall, return an empty plan and explain auth is required.
 - Keep plan concise — no unnecessary waits or redundant snapshots
 - DIALOG RULE: If a confirmation dialog may appear, add dialog-accept/dismiss after the triggering action
 - AI CHAT EXTRACTION RULE: If ANY stale remaining step was waitForStableText or getPageText, you MUST preserve BOTH in the re-plan — in order: first { "action": "waitForStableText" }, then { "action": "getPageText" }. NEVER collapse them into a single getText or omit waitForStableText. The AI response is still streaming when the DOM changes; skipping waitForStableText captures an incomplete response.
@@ -429,6 +434,35 @@ function extractInteractiveRefs(snapshotText) {
 function countRefs(snapshotText) {
   if (!snapshotText) return 0;
   return (snapshotText.match(/\bref=e\d+\b|\[e\d+\]/g) || []).length;
+}
+
+function isAboutBlankSnapshot(snapshotText) {
+  if (!snapshotText) return false;
+  const t = String(snapshotText).slice(0, 3000);
+  return /about:blank/i.test(t);
+}
+
+function looksLikeLoginWallSnapshot(snapshotText) {
+  if (!snapshotText) return false;
+  const t = String(snapshotText).slice(0, 8000);
+  const oauthProvider = /Continue with Google|Sign in with Google|Log in with Google|Continue with Apple|Sign in with Apple|Continue with Microsoft|Sign in with Microsoft|Continue with GitHub/i.test(t);
+  const authCopy = /\b(sign\s*in|log\s*in|create\s*account|forgot\s*email|forgot\s*password|use\s*your\s*google\s*account|to\s*continue\s*to|identifier)\b/i.test(t);
+  const credentialUi = /\b(email|phone|username|password)\b/i.test(t);
+  return oauthProvider || (authCopy && credentialUi);
+}
+
+function findUnresolvedCredentialToken(step) {
+  if (!step || typeof step !== 'object') return null;
+  const TOKEN_RE = /\{\{[a-z0-9_.-]+:[a-z0-9_]+\}\}/i;
+  const fields = ['text', 'value', 'label', 'name'];
+  for (const key of fields) {
+    const v = step[key];
+    if (typeof v === 'string') {
+      const m = v.match(TOKEN_RE);
+      if (m) return m[0];
+    }
+  }
+  return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -678,7 +712,7 @@ async function playwrightAgent(args) {
     if (hostname) ruleKeys.push(hostname);
     const rules = await skillDb.getContextRulesByKeys(ruleKeys);
     if (rules.length > 0) {
-      learnedRulesBlock = `\n\nLEARNED RULES (from prior runs — follow exactly):\n${rules.map(r => `- ${r}`).join('\n')}`;
+      learnedRulesBlock = `\n\nLEARNED RULES (from prior runs — advisory, not absolute):\n${rules.map(r => `- ${r}`).join('\n')}\n- Never use tutorial placeholders (example@domain.com, /path/to/...) unless the user explicitly asked for an example.`;
       logger.info(`[playwright.agent] ${rules.length} learned rule(s) injected for [${ruleKeys.join(', ')}]`);
     }
   } catch (_) { /* non-fatal — proceed without rules */ }
@@ -803,6 +837,26 @@ async function playwrightAgent(args) {
 
       const remainingAfterSnap = plan.slice(stepIndex + 1);
       if (remainingAfterSnap.length > 0) {
+        if (looksLikeLoginWallSnapshot(currentSnapshot)) {
+          logger.warn(`[playwright.agent] snapshot re-plan blocked: login wall detected — escalating to waitForAuth`);
+          return {
+            ok: false, goal, sessionId,
+            turns: transcript.length, done: false,
+            loginWallDetected: true,
+            result: 'Login wall detected during snapshot re-plan — escalating to waitForAuth',
+            transcript, executionTime: Date.now() - start,
+          };
+        }
+        if (isAboutBlankSnapshot(currentSnapshot) || countRefs(currentSnapshot) === 0) {
+          logger.warn(`[playwright.agent] snapshot re-plan blocked: empty/about:blank snapshot (${countRefs(currentSnapshot)} refs)`);
+          return {
+            ok: false, goal, sessionId,
+            turns: transcript.length, done: false,
+            sessionRecoverNeeded: true,
+            result: 'Snapshot became empty/about:blank during re-plan — session recovery required',
+            transcript, executionTime: Date.now() - start,
+          };
+        }
         logger.info(`[playwright.agent] snapshot step: re-planning ${remainingAfterSnap.length} step(s) with fresh refs`);
         try {
           const snapReplanRaw = await askWithMessages([
@@ -866,6 +920,23 @@ async function playwrightAgent(args) {
 
     logger.info(`[playwright.agent] step ${stepIndex + 1}/${plan.length}: ${JSON.stringify(step)}`);
     let outcome;
+
+    const unresolvedCredToken = findUnresolvedCredentialToken(step);
+    if (
+      unresolvedCredToken &&
+      ['fill', 'type', 'find-label', 'find-role'].includes(step.action)
+    ) {
+      logger.warn(`[playwright.agent] refusing unresolved credential token in step ${stepIndex + 1}: ${unresolvedCredToken}`);
+      return {
+        ok: false, goal, sessionId,
+        turns: transcript.length, done: false,
+        loginWallDetected: true,
+        needsCredentials: true,
+        result: `Unresolved credential token ${unresolvedCredToken} in ${step.action} step — escalating to auth flow`,
+        transcript, executionTime: Date.now() - start,
+      };
+    }
+
     try {
       // ── Semantic fallback actions — translate to Playwright locator API ──────
       if (step.action === 'find-role') {
@@ -984,7 +1055,7 @@ async function playwrightAgent(args) {
       // pipeline fires and LEARNS the correct approach (keyboard.type / run-code).
       // After the first repair the rule is stored in context_rules for gmail.agent
       // and injected into every future plan, so this verification never fires again.
-      if (step.action === 'fill' && typeof step.text === 'string' && step.text.length > 80) {
+      if (_isMailAgentTask && _isComposeTask && step.action === 'fill' && typeof step.text === 'string' && step.text.length > 80) {
         try {
           const _needleJson = JSON.stringify(step.text.slice(0, 40));
           const verifySnap = await browserAct({
@@ -1038,11 +1109,32 @@ async function playwrightAgent(args) {
             if (postRefCount < 10) {
               logger.info(`[playwright.agent] post-nav snapshot too small (${postRefCount} refs) — waiting for page to stabilise`);
               const stableSnap = await browserAct({ action: 'waitForStableText', sessionId, headed, timeoutMs: 12000 });
+              if (stableSnap?.aboutBlankDetected) {
+                logger.warn(`[playwright.agent] waitForStableText reported about:blank — stopping re-plan to prevent loop`);
+                return {
+                  ok: false, goal, sessionId,
+                  turns: transcript.length, done: false,
+                  sessionRecoverNeeded: true,
+                  result: 'Page became about:blank while stabilising — session recovery required',
+                  transcript, executionTime: Date.now() - start,
+                };
+              }
               const reSnap = await browserAct({ action: 'snapshot', sessionId, headed, timeoutMs });
               if (reSnap.ok && reSnap.result) {
                 currentSnapshot = reSnap.result;
                 logger.info(`[playwright.agent] re-snaphotted after stabilise: ${countRefs(currentSnapshot)} refs`);
               }
+            }
+
+            if (isAboutBlankSnapshot(currentSnapshot) || countRefs(currentSnapshot) === 0) {
+              logger.warn(`[playwright.agent] REPLAN blocked: empty/about:blank snapshot (${countRefs(currentSnapshot)} refs) after ${step.action}`);
+              return {
+                ok: false, goal, sessionId,
+                turns: transcript.length, done: false,
+                sessionRecoverNeeded: true,
+                result: `Page became empty/about:blank after ${step.action} — session recovery required`,
+                transcript, executionTime: Date.now() - start,
+              };
             }
             logger.info(`[playwright.agent] structural DOM change — re-planning ${remaining.length} remaining step(s) with fresh refs`);
 
@@ -1051,14 +1143,13 @@ async function playwrightAgent(args) {
             // Google / Apple / Microsoft"), this is definitely a login wall — escalate to
             // browser.agent's waitForAuth immediately instead of asking the LLM to
             // fill the email field (the LLM always does this and it is always wrong).
-            const OAUTH_BUTTON_SNAP_RE = /Continue with Google|Sign in with Google|Log in with Google|Continue with Apple|Sign in with Apple|Continue with Microsoft|Sign in with Microsoft|Continue with GitHub/i;
-            if (OAUTH_BUTTON_SNAP_RE.test(currentSnapshot)) {
-              logger.warn(`[playwright.agent] REPLAN blocked: OAuth login page detected in snapshot — returning loginWallDetected immediately`);
+            if (looksLikeLoginWallSnapshot(currentSnapshot)) {
+              logger.warn(`[playwright.agent] REPLAN blocked: login page detected in snapshot — returning loginWallDetected immediately`);
               return {
                 ok: false, goal, sessionId,
                 turns: transcript.length, done: false,
                 loginWallDetected: true,
-                result: 'OAuth login page detected during navigation — escalating to waitForAuth',
+                result: 'Login page detected during navigation — escalating to waitForAuth',
                 transcript, executionTime: Date.now() - start,
               };
             }

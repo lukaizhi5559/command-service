@@ -27,7 +27,63 @@ const os   = require('os');
 const fs   = require('fs');
 const http = require('http');
 const logger = require('../logger.cjs');
+
+const SERVICE_UNAVAILABLE_PATTERNS = [
+  /\bhigh\s*demand\b/i,
+  /\brate\s*limit(?:ed|ing)?\b/i,
+  /\btoo\s+many\s+requests\b/i,
+  /\bat\s+capacity\b/i,
+  /\bover\s+capacity\b/i,
+  /\bserver\s+busy\b/i,
+  /\bbusy\s+right\s+now\b/i,
+  /\bmaintenance\b/i,
+  /\bdown\s+for\s+maintenance\b/i,
+  /\btemporarily\s+unavailable\b/i,
+  /\bservice\s+unavailable\b/i,
+  /\boutage\b/i,
+  /\bdegraded\s+service\b/i,
+  /\b(?:error\s*)?404\b/i,
+  /\b(?:error\s*)?429\b/i,
+  /\b(?:error\s*)?500\b/i,
+  /\b(?:error\s*)?502\b/i,
+  /\b(?:error\s*)?503\b/i,
+  /\bpage\s+not\s+found\b/i,
+  /\binternal\s+server\s+error\b/i,
+  /\bbad\s+gateway\b/i,
+  /\bsomething\s+went\s+wrong\b/i,
+  /\bsite\s+can(?:no)?t\s+be\s+reached\b/i,
+  /\bconnection\s+refused\b/i,
+  /\bname\s+not\s+resolved\b/i,
+  /\bnetwork\s+error\b/i,
+  /\berr_(?:connection|name|timed_out|ssl|internet)\w*\b/i,
+  /\bcoming\s+soon\b/i,
+  /\bunder\s+construction\b/i,
+  /\bnot\s+yet\s+available\b/i,
+  /\blaunching\s+soon\b/i,
+  /\bjoin\s+the\s+waitlist\b/i,
+  /\bwaitlist\b/i,
+  /\brequest\s+access\b/i,
+  /\binvite\s+only\b/i,
+  /\bearly\s+access\b/i,
+  /\baccess\s+blocked\b/i,
+  /\baccess\s+denied\b/i,
+  /\bnot\s+available\s+in\s+your\s+(?:region|country)\b/i,
+  /\bunsupported\s+region\b/i,
+  /\bupgrade\s+required\b/i,
+  /\bplan\s+required\b/i,
+];
+
+function detectServiceUnavailable(text) {
+  if (typeof text !== 'string' || !text.trim()) return null;
+  for (const pattern of SERVICE_UNAVAILABLE_PATTERNS) {
+    const match = text.match(pattern);
+    if (match && match[0]) return match[0];
+  }
+  return null;
+}
 const { userAgent } = require('./user.agent.cjs');
+
+const { resolveDestination, recordCorrection, classifyTaskIntent } = require('../skill-helpers/destination-resolver.cjs');
 
 const AGENTS_DB_PATH = path.join(os.homedir(), '.thinkdrop', 'agents.db');
 const AGENTS_DIR     = path.join(os.homedir(), '.thinkdrop', 'agents');
@@ -159,9 +215,13 @@ const KNOWN_BROWSER_SERVICES = {
   replicate:      { startUrl: 'https://replicate.com',                           signInUrl: 'https://replicate.com/signin',                      authSuccessPattern: 'replicate.com/',               isOAuth: true  },
   huggingface:    { startUrl: 'https://huggingface.co/settings/tokens',          authSuccessPattern: 'huggingface.co/',              isOAuth: false },
   together:       { startUrl: 'https://api.together.xyz',                        authSuccessPattern: 'api.together.xyz',             isOAuth: false },
-  perplexity:     { startUrl: 'https://www.perplexity.ai/settings/api',          authSuccessPattern: 'perplexity.ai/',               isOAuth: false },
+  // perplexity defaults to the chat/research interface; use perplexityplatform for API keys
+  perplexity:       { startUrl: 'https://www.perplexity.ai/',                      authSuccessPattern: 'perplexity.ai',                isOAuth: false },
+  perplexityplatform: { startUrl: 'https://www.perplexity.ai/settings/api',        authSuccessPattern: 'perplexity.ai/',               isOAuth: false },
   fireworks:      { startUrl: 'https://fireworks.ai/account/api-keys',           authSuccessPattern: 'fireworks.ai/',                isOAuth: false },
-  deepseek:       { startUrl: 'https://platform.deepseek.com/api_keys',          authSuccessPattern: 'platform.deepseek.com/',       isOAuth: false },
+  // deepseek defaults to the chat interface; use deepseekplatform for the API console
+  deepseek:         { startUrl: 'https://chat.deepseek.com/',                      authSuccessPattern: 'chat.deepseek.com',            isOAuth: false },
+  deepseekplatform: { startUrl: 'https://platform.deepseek.com/api_keys',          authSuccessPattern: 'platform.deepseek.com/',       isOAuth: false },
   // ── AI consumer apps ─────────────────────────────────────────────────────────────────────────────────
   // All anonymous-first (isOAuth: false). Only trigger waitForAuth if a login wall appears.
   // IMPORTANT: these are CONSUMER WEBSITES — NOT the developer API consoles above in // ── AI platforms ──
@@ -170,6 +230,9 @@ const KNOWN_BROWSER_SERVICES = {
   geminiai:       { startUrl: 'https://gemini.google.com',                       authSuccessPattern: 'gemini.google.com',             isOAuth: false },
   gemini:         { startUrl: 'https://gemini.google.com',                       authSuccessPattern: 'gemini.google.com',             isOAuth: false },
   googleai:       { startUrl: 'https://gemini.google.com',                       authSuccessPattern: 'gemini.google.com',             isOAuth: false },
+  // Google AI Mode — distinct from Gemini; navigate to google.com and click the AI Mode button
+  googleaimode:   { startUrl: 'https://www.google.com',                           authSuccessPattern: 'google.com',                   isOAuth: false,
+                    preTaskGoal: 'First locate and click the "AI Mode" tab or button near the top of the Google search page. Do NOT type anything yet — click AI Mode first, then in the AI Mode interface type the search query.' },
   claude:         { startUrl: 'https://claude.ai/new', signInUrl: 'https://claude.ai/login', postAuthUrl: 'https://claude.ai/new', authSuccessPattern: 'claude.ai',      isOAuth: true  },
   perplexitychat: { startUrl: 'https://www.perplexity.ai/',                      authSuccessPattern: 'perplexity.ai',                isOAuth: false },
   grok:           { startUrl: 'https://grok.com/',                               authSuccessPattern: 'grok.com',                     isOAuth: false },
@@ -550,7 +613,7 @@ INPUT
   select      — { "action": "select", "selector": "...", "value": "..." }        — <select> dropdowns
   check       — { "action": "check", "selector": "..." }                         — checkboxes / radio buttons
   uncheck     — { "action": "uncheck", "selector": "..." }                       — uncheck a checkbox
-  upload      — { "action": "upload", "selector": "...", "files": ["..."] }      — file input upload
+  upload      — { "action": "upload", "selector": "...", "files": ["/abs/path"] } — attach file(s): clicks selector to open the chooser, then feeds each file path to the active chooser. Fallback: if no chooser fires, targets the element directly via setInputFiles. selector = attach button ref from snapshot; files = absolute local file paths array.
 
 DOM INTERACTION
   click       — { "action": "click", "selector": "..." }
@@ -1968,10 +2031,16 @@ async function actionRun({ agentId, task, url, context, requiresAuth, _progressC
   }
 
   // ── Browser / OAuth path ───────────────────────────────────────────────
-  const startUrl           = extractDescriptorUrl(existing.descriptor, 'start_url');
+  let startUrl             = extractDescriptorUrl(existing.descriptor, 'start_url');
   const signInUrl          = extractDescriptorUrl(existing.descriptor, 'sign_in_url');
   const authSuccessPattern = extractDescriptorUrl(existing.descriptor, 'auth_success_pattern');
   if (!startUrl) return { ok: false, error: 'Agent descriptor missing start_url' };
+
+  // Strip any path from the stored descriptor start_url — always navigate to the
+  // landing page (scheme + hostname only). This is a data-quality rule on static
+  // defaults; resolveDestination corrections below are intentionally NOT stripped
+  // because they are dynamic, intent-aware overrides that may need a deep path.
+  try { const _u = new URL(startUrl); startUrl = `${_u.protocol}//${_u.hostname}`; } catch (_) {}
 
   const profile   = `${agentId.replace('.agent', '')}_agent`;
   // Use the stable profile name as sessionId so browser-profiles/<sessionId>/ persists
@@ -1982,6 +2051,39 @@ async function actionRun({ agentId, task, url, context, requiresAuth, _progressC
 
   const _svcKey          = (existing.service || agentId.replace(/\.agent$/, '')).toLowerCase().replace(/[^a-z0-9]/g, '');
   const _svcInfo         = lookupBrowserService(_svcKey);
+
+  // ── Destination intent mismatch correction ────────────────────────────────────
+  // Pre-navigation: detect when the configured startUrl (e.g. developer API console)
+  // does not match the task's intent (e.g. research/chat). Correct silently on high
+  // confidence; ask the user when ambiguous. Entirely non-blocking on error.
+  try {
+    const _destResult = await resolveDestination(_svcKey, task, startUrl, agentId);
+    if (_destResult.action === 'auto_correct') {
+      logger.info(`[browser.agent] run: destination auto-correct for "${agentId}": "${startUrl}" → "${_destResult.correctedUrl}" (${_destResult.reason})`);
+      startUrl = _destResult.correctedUrl;
+      // Record the correction so future runs use it without re-checking,
+      // but only when this isn't already a resume (avoid echoing learned corrections).
+      if (!_destResult.fromResumeContext) {
+        setImmediate(() => {
+          recordCorrection(_svcKey, _destResult.intent, _destResult.correctedUrl).catch(() => {});
+        });
+      }
+    } else if (_destResult.action === 'ask_user') {
+      logger.info(`[browser.agent] run: destination ambiguous for "${agentId}" — surfacing ASK_USER`);
+      return {
+        ok:               false,
+        agentId,
+        task,
+        askUser:          true,
+        wrongDestination: true,
+        question:         _destResult.question,
+        options:          _destResult.options || [],
+      };
+    }
+    // action === 'ok': no change needed
+  } catch (_destErr) {
+    logger.warn(`[browser.agent] run: destination-resolver error (non-fatal): ${_destErr.message}`);
+  }
 
   // Route to agentbrowser.agent when preferAgentBrowser is set on the service entry
   // or when THINKDROP_CLI_DRIVER=agentbrowser is set globally.
@@ -2061,9 +2163,12 @@ async function actionRun({ agentId, task, url, context, requiresAuth, _progressC
         // Navigate after injecting cookies — probe whether the session is still valid
         const _stateNav = await callBrowserAct({ action: 'navigate', sessionId, url: startUrl, timeoutMs: 30000 }, 35000).catch(() => ({ ok: false }));
         const _stateHrefRes = _stateNav?.ok !== false
-          ? await callBrowserAct({ action: 'evaluate', text: 'window.location.href', sessionId, timeoutMs: 5000 }, 8000).catch(() => ({}))
-          : {};
-        const _stateCurHref = String(_stateHrefRes?.result ?? _stateHrefRes?.stdout ?? '').trim();
+          ? await callBrowserAct({ action: 'evaluate', text: 'window.location.href', sessionId, timeoutMs: 5000 }, 8000).catch((err) => {
+              logger.error(`[browser.agent] auth-check eval failed (state persistence): ${err.message}`);
+              return { ok: false, error: err.message };
+            })
+          : { ok: false, error: 'navigation failed' };
+        const _stateCurHref = _stateHrefRes?.ok === false ? '' : String(_stateHrefRes?.result ?? _stateHrefRes?.stdout ?? '').trim();
         const _stateOnLogin = _stateCurHref.length > 4 && /\/(login|signin|sign[-_]in|auth|oauth|authorize)\b/i.test(_stateCurHref);
         _skipNavigate = true; // already navigated above — skip the auth-check navigate below
         if (!_stateOnLogin) {
@@ -2083,8 +2188,11 @@ async function actionRun({ agentId, task, url, context, requiresAuth, _progressC
       logger.info(`[browser.agent] run: playwright auth-check — navigating to ${startUrl} for ${agentId}`);
       const _probeNav = await callBrowserAct({ action: 'navigate', sessionId, url: startUrl, timeoutMs: 30000 }, 35000);
       if (_probeNav?.ok !== false) {
-        const _hrefRes = await callBrowserAct({ action: 'evaluate', text: 'window.location.href', sessionId, timeoutMs: 5000 }, 8000).catch(() => ({}));
-        const _curHref = String(_hrefRes?.result ?? _hrefRes?.stdout ?? '').trim();
+        const _hrefRes = await callBrowserAct({ action: 'evaluate', text: 'window.location.href', sessionId, timeoutMs: 5000 }, 8000).catch((err) => {
+          logger.error(`[browser.agent] auth-check eval failed (fresh check): ${err.message}`);
+          return { ok: false, error: err.message };
+        });
+        const _curHref = _hrefRes?.ok === false ? '' : String(_hrefRes?.result ?? _hrefRes?.stdout ?? '').trim();
         const _onLoginPage = _curHref.length > 4 && /\/(login|signin|sign[-_]in|auth|oauth|authorize)\b/i.test(_curHref);
         // Also detect domain mismatch — e.g. redirect to workspace.google.com instead of mail.google.com
         let _wrongDomain = false;
@@ -2192,6 +2300,20 @@ async function actionRun({ agentId, task, url, context, requiresAuth, _progressC
   // Step 2: delegate to playwright.agent or agentbrowser.agent with the authenticated session
   logger.info(`[browser.agent] run: auth ok — delegating to ${_agentSkill} for "${task}"`);
 
+  // ── preTaskGoal injection + startUrl recovery anchor ────────────────────────
+  // Some services (e.g. googleaimode) require a UI interaction BEFORE the main task.
+  // All services get a recovery anchor so playwright.agent knows where to return if
+  // the session goes blank (about:blank) — it must navigate back to startUrl, NOT
+  // invent its own fallback destination (e.g. google.com search).
+  const _recoveryAnchor = startUrl
+    ? `IMPORTANT: You are working on ${startUrl} (browser session: ${sessionId}). If the page ever shows about:blank, a blank page, or you lose the site, navigate back to ${startUrl} immediately — do NOT navigate to any other website as a fallback.`
+    : null;
+  const _effectiveTask = _svcInfo?.preTaskGoal
+    ? `${_svcInfo.preTaskGoal}\n\nTask: ${task}`
+    : _recoveryAnchor
+      ? `${_recoveryAnchor}\n\nTask: ${task}`
+      : task;
+
   // ── Goal-aware playbook injection ────────────────────────────────────────────
   // Tier 1: one or more keyword-matched ### sections → injected directly, 0 LLM calls.
   //         Compound tasks ("find and delete") get ALL matching sections concatenated.
@@ -2242,7 +2364,7 @@ async function actionRun({ agentId, task, url, context, requiresAuth, _progressC
 
   try {
     const agentResult = await callSkill(_agentSkill, {
-      goal: task,
+      goal: _effectiveTask,
       agentContext: _agentContext,
       url: url || (_useAgentBrowser ? startUrl : undefined),
       authSignInUrl: _useAgentBrowser ? (signInUrl || undefined) : undefined,
@@ -2355,7 +2477,7 @@ async function actionRun({ agentId, task, url, context, requiresAuth, _progressC
               if (_healDb) await _healDb.run('UPDATE agents SET status=? WHERE id=? AND status=?', 'healthy', agentId, 'needs_auth').catch(() => {});
             } catch (_) {}
             const _retryResult = await callSkill(_agentSkill, {
-              goal: task,
+              goal: _effectiveTask,
               agentContext: _agentContext,
               url: startUrl,
               sessionId,
@@ -2402,6 +2524,84 @@ async function actionRun({ agentId, task, url, context, requiresAuth, _progressC
     }
     // ─────────────────────────────────────────────────────────────────────────
 
+    // When the run succeeded and startUrl was auto-corrected by the destination resolver,
+    // reinforce the correction memory so future runs auto-correct with full confidence.
+    if (agentResult?.ok === true) {
+      try {
+        const _confirmedIntent = classifyTaskIntent(task);
+        const _origUrl = extractDescriptorUrl(existing.descriptor, 'start_url');
+        if (_origUrl && startUrl !== _origUrl) {
+          setImmediate(() => {
+            recordCorrection(_svcKey, _confirmedIntent, startUrl).catch(() => {});
+          });
+        }
+      } catch (_) {}
+    }
+
+    // ── Research content quality gate ─────────────────────────────────────────
+    // Catches pages that passed the login-wall detector above (e.g. Qwen welcome
+    // screen, Perplexity nav-only result) but returned no substantive research
+    // content.  Criteria for "empty research":
+    //   • task intent is research or chat
+    //   • result is sparse (< 40 lines)
+    //   • no keyword overlap with the task topic (< 2 words from task in result)
+    //   • result does NOT contain multi-sentence prose (< 3 sentences)
+    // When detected, return a structured failure so executeCommand / recoverSkill
+    // can surface ASK_USER with alternative source options instead of silently
+    // passing an empty result to the synthesize step.
+    if (agentResult?.ok === true) {
+      const _researchIntents = /\b(research|find|look\s+up|search|get\s+info|learn\s+about|tell\s+me\s+about|summarize|what\s+is|who\s+is|how\s+does|explain)\b/i;
+      const _taskIsResearch = _researchIntents.test(task);
+      if (_taskIsResearch) {
+        const _httpStatus = Number.isInteger(agentResult?.httpStatus) ? agentResult.httpStatus : null;
+        if (_httpStatus !== null && _httpStatus >= 400) {
+          logger.warn(`[browser.agent] Research quality gate: http error for ${agentId} (status=${_httpStatus}) — marking serviceUnavailable`);
+          return {
+            ok: false,
+            agentId,
+            task,
+            error: `${agentId} could not fulfill the research step because the service returned HTTP ${_httpStatus}.`,
+            researchContentEmpty: true,
+            serviceUnavailable: true,
+            unavailableReason: `HTTP ${_httpStatus}`,
+            httpStatus: _httpStatus,
+          };
+        }
+        const _unavailableReason = detectServiceUnavailable(agentResultText);
+        if (_unavailableReason) {
+          logger.warn(`[browser.agent] Research quality gate: unusable service state for ${agentId} (${_unavailableReason}) — marking serviceUnavailable`);
+          return {
+            ok: false,
+            agentId,
+            task,
+            error: `${agentId} could not fulfill the research step because the service showed an unavailable or blocked page (${_unavailableReason}).`,
+            researchContentEmpty: true,
+            serviceUnavailable: true,
+            unavailableReason: _unavailableReason,
+            httpStatus: _httpStatus,
+          };
+        }
+        const _lines = agentResultText.trim().split(/\n+/).filter(l => l.trim().length > 2);
+        // Content density scoring — nav/welcome pages have few long sentences;
+        // research pages have many lines with >6 words. Avoids fragile topic-word
+        // matching which causes false positives on synonyms / paraphrased results.
+        const _longLines = _lines.filter(l => l.trim().split(/\s+/).length > 6).length;
+        const _totalWords = agentResultText.trim().split(/\s+/).filter(Boolean).length;
+        const _isSparse = _longLines < 5 && _totalWords < 120;
+        if (_isSparse) {
+          logger.warn(`[browser.agent] Research quality gate: sparse content for ${agentId} (longLines=${_longLines}, totalWords=${_totalWords}) — marking researchContentEmpty`);
+          return {
+            ok: false,
+            agentId,
+            task,
+            error: `${agentId} returned navigation/welcome content instead of research data (${_longLines} content lines, ${_totalWords} total words). The service may require login or the URL landed on the wrong page.`,
+            researchContentEmpty: true,
+          };
+        }
+      }
+    }
+    // ─────────────────────────────────────────────────────────────────────────
+
     return {
       ok: agentResult?.ok ?? false,
       agentId,
@@ -2412,6 +2612,7 @@ async function actionRun({ agentId, task, url, context, requiresAuth, _progressC
       transcript: agentResult?.transcript || [],
       turns: agentResult?.turns,
       done: agentResult?.done,
+      httpStatus: Number.isInteger(agentResult?.httpStatus) ? agentResult.httpStatus : undefined,
       error: agentResult?.error,
     };
   } catch (err) {
