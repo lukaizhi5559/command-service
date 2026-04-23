@@ -475,7 +475,7 @@ const PLAYBOOK_SEED_MAP = {
 5. Click body to focus: { "action": "click", "selector": "div[aria-label='Message Body']" }
 6. Type body text: { "action": "type", "text": "<body>" }
 7. Safety snapshot before sending: { "action": "snapshot" }
-8. Click Send: { "action": "click", "selector": "div[data-tooltip*='Send'],div[aria-label*='Send']" }
+8. Click Send with verification: { "action": "sendEmailWithVerification", "selector": "div[data-tooltip*='Send'],div[aria-label*='Send']" }
 
 ### Read Inbox (read, inbox, emails, messages, check, list, unread)
 Extract up to 15 inbox rows using page.evaluate with Gmail's stable CSS selectors:
@@ -2168,14 +2168,31 @@ async function actionRun({ agentId, task, url, context, requiresAuth, _progressC
               return { ok: false, error: err.message };
             })
           : { ok: false, error: 'navigation failed' };
-        const _stateCurHref = _stateHrefRes?.ok === false ? '' : String(_stateHrefRes?.result ?? _stateHrefRes?.stdout ?? '').trim();
-        const _stateOnLogin = _stateCurHref.length > 4 && /\/(login|signin|sign[-_]in|auth|oauth|authorize)\b/i.test(_stateCurHref);
+        let _stateCurHref = _stateHrefRes?.ok === false ? '' : String(_stateHrefRes?.result ?? _stateHrefRes?.stdout ?? '').trim();
+        let _stateOnLogin = _stateCurHref.length > 4 && /\/(login|signin|sign[-_]in|auth|oauth|authorize)\b/i.test(_stateCurHref);
         _skipNavigate = true; // already navigated above — skip the auth-check navigate below
+
+        // Grace period: Google & other providers may briefly redirect to signin
+        // during cookie validation before settling. Retry once after 3s before
+        // deciding the session is truly stale.
+        if (_stateOnLogin) {
+          logger.info(`[browser.agent] run: state-load: initial redirect to signin for ${agentId} — waiting 3s and re-checking`);
+          await new Promise(r => setTimeout(r, 3000));
+          const _recheckRes = await callBrowserAct({ action: 'evaluate', text: 'window.location.href', sessionId, timeoutMs: 5000 }, 8000).catch(() => ({ ok: false }));
+          const _recheckHref = _recheckRes?.ok === false ? '' : String(_recheckRes?.result ?? _recheckRes?.stdout ?? '').trim();
+          const _recheckOnLogin = _recheckHref.length > 4 && /\/(login|signin|sign[-_]in|auth|oauth|authorize)\b/i.test(_recheckHref);
+          if (!_recheckOnLogin) {
+            logger.info(`[browser.agent] run: state-load: grace-period recheck cleared auth for ${agentId} (${_recheckHref})`);
+            _stateCurHref = _recheckHref;
+            _stateOnLogin = false;
+          }
+        }
+
         if (!_stateOnLogin) {
           logger.info(`[browser.agent] run: state-load: auth cleared for ${agentId} (${_stateCurHref}) — skipping waitForAuth`);
           // _authNeeded stays false
         } else {
-          logger.warn(`[browser.agent] run: state-load: auth wall still present for ${agentId} — deleting stale state, re-authenticating`);
+          logger.warn(`[browser.agent] run: state-load: auth wall still present for ${agentId} after grace period — deleting stale state, re-authenticating`);
           try { fs.unlinkSync(_stateFile); } catch (_) {}
           _authNeeded = true;
         }

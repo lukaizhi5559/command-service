@@ -26,16 +26,26 @@ try { skillDb = require('./skill-db.cjs'); } catch (_) {}
 
 const logger = require('../logger.cjs');
 
+let _skillLlm = null;
+try { _skillLlm = require('./skill-llm.cjs'); } catch (_) {}
+
+// ── LLM intent classification cache (keyed on first 100 chars of cleaned task) ─
+const _intentCache = new Map();
+
 // ── Intent constants ──────────────────────────────────────────────────────────
 const INTENTS = {
   CHAT:     'chat',       // converse with or query an AI assistant
   RESEARCH: 'research',   // look up / search / investigate a topic via AI
   DOCS:     'docs',       // read documentation, guides, tutorials
   CONSOLE:  'console',    // API keys, developer settings, platform console
-  SETTINGS: 'settings',   // account settings, profile, billing  MAIL:     'mail',       // send, compose, forward, reply to email  HOME:     'home',       // generic visit — open the site's landing page
+  SETTINGS: 'settings',   // account settings, profile, billing
+  MAIL:     'mail',       // send, compose, forward, reply to email
+  HOME:     'home',       // generic visit — open the site's landing page
 };
 
 // ── Task keywords → intent (first match wins) ─────────────────────────────────
+// NOTE: Input is scoped to first 280 chars of stripped task before matching.
+// Payload noise ([DATA FROM PRIOR STEP], body: ...) is stripped before reaching here.
 const INTENT_PATTERNS = [
   // CONSOLE — developer/API work first (before research to avoid keyword overlap)
   {
@@ -47,10 +57,15 @@ const INTENT_PATTERNS = [
     intent: INTENTS.DOCS,
     re: /\b(documentation|docs|tutorial|guide|reference|how[\s_-]?to[\s_-]?use|readme|manual)\b/i,
   },
-  // SETTINGS
+  // MAIL — email actions BEFORE settings to prevent payload keywords triggering settings
+  {
+    intent: INTENTS.MAIL,
+    re: /\b(send[\s_-]?email|compose[\s_-]?email|forward[\s_-]?email|reply[\s_-]?to|email[\s_-]?to|mail[\s_-]?to|write[\s_-]?email|draft[\s_-]?email|send[\s_-]?mail|compose[\s_-]?mail|attach[\s_-]?and[\s_-]?send|email[\s_-]?with[\s_-]?attachment)\b/i,
+  },
+  // SETTINGS — tightened: require contextual phrases, no bare "settings" or "preferences"
   {
     intent: INTENTS.SETTINGS,
-    re: /\b(settings|account[\s_-]?settings|billing|subscription|profile[\s_-]?settings|preferences)\b/i,
+    re: /\b(account[\s_-]?settings|billing[\s_-]?(info|page|settings)?|subscription[\s_-]?(management|settings)?|profile[\s_-]?settings|my[\s_-]?preferences|preferences[\s_-]?page|settings[\s_-]?(panel|screen|page))\b/i,
   },
   // CHAT — explicit chat/conversation verbs
   {
@@ -62,11 +77,6 @@ const INTENT_PATTERNS = [
     intent: INTENTS.RESEARCH,
     re: /\b(look[\s_-]?up|search|find[\s_-]?out|research|investigate|look[\s_-]?into|what[\s_-]?is|who[\s_-]?is|tell[\s_-]?me[\s_-]?about|learn[\s_-]?about|information[\s_-]?about|info[\s_-]?on|details[\s_-]?on|explore|find[\s_-]?information|gather[\s_-]?info)\b/i,
   },
-  // MAIL — email actions: send, compose, forward, reply
-  {
-    intent: INTENTS.MAIL,
-    re: /\b(send[\s_-]?email|compose[\s_-]?email|forward[\s_-]?email|reply[\s_-]?to|email[\s_-]?to|mail[\s_-]?to|write[\s_-]?email|draft[\s_-]?email|send[\s_-]?mail|compose[\s_-]?mail)\b/i,
-  },
   // HOME — generic navigation
   {
     intent: INTENTS.HOME,
@@ -74,15 +84,72 @@ const INTENT_PATTERNS = [
   },
 ];
 
+// ── Valid intent enum values (for LLM response validation) ────────────────────
+const VALID_INTENTS = new Set(Object.values(INTENTS));
+
+/**
+ * Strip payload noise from task string and return first N chars.
+ * Removes [DATA FROM PRIOR STEP]...[/DATA], [CONTENT OF ...]..., and body: ... blocks
+ * which can contain arbitrary text that would confuse intent classification.
+ */
+function _scopeTaskText(task, maxChars = 280) {
+  let text = String(task || '');
+  // Strip [DATA FROM PRIOR STEP] ... [/DATA FROM PRIOR STEP] blocks
+  text = text.replace(/\[DATA FROM PRIOR STEP\][\s\S]*?(?:\[\/DATA FROM PRIOR STEP\]|$)/gi, ' ');
+  // Strip [CONTENT OF ...] blocks
+  text = text.replace(/\[CONTENT OF[^\]]*\][\s\S]*?(?=\[|$)/gi, ' ');
+  // Strip body: ... multiline blocks (common in email task injections)
+  text = text.replace(/\bbody:\s*[\s\S]{0,3000}/gi, ' ');
+  // Strip [Resume context: ...] blocks
+  text = text.replace(/\[Resume context:[^\]]*\]/gi, ' ');
+  // Collapse whitespace
+  text = text.replace(/\s+/g, ' ').trim();
+  return text.slice(0, maxChars);
+}
+
 /**
  * Classify the task string to a primary intent.
+ * Primary: LLM classification on first 100 chars of stripped task.
+ * Fallback: hardened regex on first 280 chars of stripped task.
  * Returns one of the INTENTS values, or INTENTS.HOME as fallback.
  */
-function classifyTaskIntent(task) {
-  const text = String(task || '').toLowerCase();
-  for (const { intent, re } of INTENT_PATTERNS) {
-    if (re.test(text)) return intent;
+async function classifyTaskIntent(task) {
+  const _scopedFull = _scopeTaskText(task, 280);
+  const _scopedShort = _scopedFull.slice(0, 100);
+  const _cacheKey = _scopedShort;
+
+  // Return cached result if available
+  if (_intentCache.has(_cacheKey)) {
+    return _intentCache.get(_cacheKey);
   }
+
+  // ── Primary: LLM classification ───────────────────────────────────────────
+  if (_skillLlm && _scopedShort.trim().length > 3) {
+    try {
+      const _llmPrompt = `Classify this task into exactly one of these categories: chat / research / docs / console / settings / mail / home.\nReply with ONE word only — the category name.\n\nTask: ${_scopedShort}`;
+      const _llmRaw = await _skillLlm.ask(_llmPrompt, { temperature: 0.0, responseTimeoutMs: 8000 });
+      const _llmIntent = (_llmRaw || '').trim().toLowerCase().replace(/[^a-z]/g, '');
+      if (VALID_INTENTS.has(_llmIntent)) {
+        logger.debug(`[destination-resolver] LLM intent: "${_llmIntent}" for task: "${_scopedShort.slice(0, 60)}"`);
+        _intentCache.set(_cacheKey, _llmIntent);
+        return _llmIntent;
+      }
+      logger.debug(`[destination-resolver] LLM returned non-enum "${_llmRaw?.trim()}" — falling back to regex`);
+    } catch (_llmErr) {
+      logger.debug(`[destination-resolver] LLM intent classification failed: ${_llmErr.message} — falling back to regex`);
+    }
+  }
+
+  // ── Fallback: hardened regex on scoped text ───────────────────────────────
+  const _text = _scopedFull.toLowerCase();
+  for (const { intent, re } of INTENT_PATTERNS) {
+    if (re.test(_text)) {
+      _intentCache.set(_cacheKey, intent);
+      return intent;
+    }
+  }
+
+  _intentCache.set(_cacheKey, INTENTS.HOME);
   return INTENTS.HOME;
 }
 
@@ -90,6 +157,17 @@ function classifyTaskIntent(task) {
 // Given a URL, return the type of endpoint it most likely represents.
 
 const URL_TYPE_PATTERNS = [
+  {
+    type: INTENTS.MAIL,
+    tests: [
+      /mail\.google\.com/i,
+      /outlook\.live\.com/i,
+      /outlook\.office\.com/i,
+      /mail\.yahoo\.com/i,
+      /mail\.proton\.me/i,
+      /mail\.zoho\.com/i,
+    ],
+  },
   {
     type: INTENTS.CONSOLE,
     tests: [
@@ -264,6 +342,16 @@ function parseResumeContext(task) {
 async function resolveDestination(serviceKey, task, plannedUrl, agentId) {
   const _id = agentId || serviceKey;
 
+  // ── Short-circuit: known mail service navigating to its mail host ─────────
+  // Gmail/Outlook send tasks always land on their mail host — skip all mismatch
+  // logic entirely to prevent false-positive ask_user dialogs.
+  const _isMailService = /gmail|outlook|mail/i.test(serviceKey);
+  const _isMailHost = URL_TYPE_PATTERNS[0].tests.some(re => re.test(plannedUrl));
+  if (_isMailService && _isMailHost) {
+    logger.debug(`[destination-resolver] Short-circuit: mail service on mail host → ok`);
+    return { action: 'ok', intent: INTENTS.MAIL };
+  }
+
   // ── Resume context: user already answered a destination question ──────────
   // Honor their choice without prompting again.
   const resumeAnswer = parseResumeContext(task);
@@ -290,7 +378,7 @@ async function resolveDestination(serviceKey, task, plannedUrl, agentId) {
   }
 
   // ── Classify intent and check planned URL ─────────────────────────────────
-  const intent      = classifyTaskIntent(task);
+  const intent      = await classifyTaskIntent(task);
   const plannedType = classifyUrlType(plannedUrl);
   const accepted    = INTENT_ACCEPTED_URL_TYPES[intent]
     || [INTENTS.HOME, INTENTS.CHAT, INTENTS.DOCS, INTENTS.CONSOLE, INTENTS.SETTINGS];
@@ -331,8 +419,8 @@ async function resolveDestination(serviceKey, task, plannedUrl, agentId) {
     };
   }
 
-  // 3. Mail intent for gmail/outlook — auto-use planned URL (mail.google.com is correct for send)
-  if (intent === INTENTS.MAIL && isMailService) {
+  // 3. Mail intent with mail-host URL — always ok
+  if (intent === INTENTS.MAIL && (isMailService || classifyUrlType(plannedUrl) === INTENTS.MAIL)) {
     logger.info(`[destination-resolver] Auto-correct (mail service): ${_id} → ${plannedUrl}`);
     return {
       action:       'auto_correct',

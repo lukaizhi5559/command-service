@@ -19,6 +19,7 @@
  *   waitForSelector | waitForContent | waitForStableText
  *   tab-new | tab-list | tab-close | tab-select
  *   state-save | state-load | resize
+ *   paste | pasteAttachment
  *
  * Args schema:
  * {
@@ -625,25 +626,42 @@ function cliRun(args, timeoutMs = 15000) {
     const start = Date.now();
     let stdout = '';
     let stderr = '';
+    let resolved = false;
 
     const proc = spawn(CLI_BIN, args, {
       env: { ...process.env },
-      timeout: timeoutMs,
+      // Remove timeout to prevent Node.js from killing the process
+      // timeout: timeoutMs,
     });
 
     proc.stdout.on('data', d => { stdout += d.toString(); });
     proc.stderr.on('data', d => { stderr += d.toString(); });
 
+    // Custom timeout handling without SIGTERM to prevent about:blank navigation
     const timer = setTimeout(() => {
-      try { proc.kill('SIGTERM'); } catch (_) {}
-      resolve({ ok: false, stdout, stderr, exitCode: -1, executionTime: Date.now() - start, error: `Timed out after ${timeoutMs}ms` });
-    }, timeoutMs + 2000);
+      if (!resolved) {
+        resolved = true;
+        // Don't kill the process - let it finish naturally to avoid about:blank cleanup
+        logger.warn(`[browser.act] cliRun timeout after ${timeoutMs}ms - allowing process to finish gracefully`);
+        resolve({ 
+          ok: false, 
+          stdout, 
+          stderr, 
+          exitCode: -1, 
+          executionTime: Date.now() - start, 
+          error: `Timed out after ${timeoutMs}ms (process allowed to finish)` 
+        });
+      }
+    }, timeoutMs);
 
     proc.on('close', code => {
-      clearTimeout(timer);
-      const executionTime = Date.now() - start;
-      const ok = code === 0;
-      resolve({ ok, stdout, stderr, exitCode: code ?? -1, executionTime, error: ok ? undefined : stderr.trim() || `exit code ${code}` });
+      if (!resolved) {
+        resolved = true;
+        clearTimeout(timer);
+        const executionTime = Date.now() - start;
+        const ok = code === 0;
+        resolve({ ok, stdout, stderr, exitCode: code ?? -1, executionTime, error: ok ? undefined : stderr.trim() || `exit code ${code}` });
+      }
     });
 
     proc.on('error', err => {
@@ -652,6 +670,159 @@ function cliRun(args, timeoutMs = 15000) {
     });
   });
 }
+
+// ---------------------------------------------------------------------------
+// Gmail-Optimized Content Detection
+// ---------------------------------------------------------------------------
+
+// Lightweight content detection for Gmail pages to avoid timeout crashes
+async function getGmailPageContent(sessionId, timeoutMs = 5000) {
+  try {
+    // Try multiple lightweight strategies in order of preference
+    const strategies = [
+      {
+        name: 'title',
+        fn: () => cliRun([...sessionFlags(sessionId), 'eval', 'document.title'], 2000)
+      },
+      {
+        name: 'url',
+        fn: () => cliRun([...sessionFlags(sessionId), 'eval', 'window.location.href'], 2000)
+      },
+      {
+        name: 'minimal-content',
+        fn: () => cliRun([...sessionFlags(sessionId), 'eval', 'document.body.innerText.slice(0,1000)'], 3000)
+      },
+      {
+        name: 'gmail-main',
+        fn: () => cliRun([...sessionFlags(sessionId), 'eval', 'document.querySelector("[role=main]")?.innerText.slice(0,2000) || ""'], 3000)
+      },
+      {
+        name: 'gmail-compose',
+        fn: () => cliRun([...sessionFlags(sessionId), 'eval', 'document.querySelector("div[role=dialog]")?.innerText.slice(0,1500) || ""'], 3000)
+      }
+    ];
+
+    for (const strategy of strategies) {
+      try {
+        const result = await strategy.fn();
+        if (result.ok && result.stdout) {
+          const match = result.stdout.match(/###\s*Result\s*\n([\s\S]*?)(?=###|$)/i);
+          const content = match ? match[1].trim().replace(/^"|"$/g, '') : result.stdout.trim();
+          
+          if (content && content !== '' && content !== 'null') {
+            logger.debug(`[browser.act] Gmail content detected via ${strategy.name}: ${content.length} chars`);
+            return content;
+          }
+        }
+      } catch (error) {
+        logger.debug(`[browser.act] Gmail content strategy ${strategy.name} failed: ${error.message}`);
+        continue; // Try next strategy
+      }
+    }
+    
+    logger.debug(`[browser.act] All Gmail content strategies failed, returning empty string`);
+    return ''; // All strategies failed
+  } catch (error) {
+    logger.warn(`[browser.act] Gmail page content detection failed: ${error.message}`);
+    return '';
+  }
+}
+
+// Gmail-specific stable text detection with about:blank recovery
+async function waitForGmailStableText(sessionId, timeoutMs = 15000) {
+  const start = Date.now();
+  let prev = '';
+  let stableCount = 0;
+  const maxStableCount = 2; // Need 2 consecutive stable reads
+  const checkInterval = 1500; // Check every 1.5 seconds
+
+  logger.info(`[browser.act] waitForGmailStableText: starting for session=${sessionId}`);
+
+  while (Date.now() - start < timeoutMs) {
+    try {
+      // Check for about:blank first (fast check)
+      const urlCheck = await cliRun([...sessionFlags(sessionId), 'eval', 'window.location.href'], 2000);
+      if (urlCheck.ok && urlCheck.stdout.includes('about:blank')) {
+        logger.warn(`[browser.act] waitForGmailStableText: about:blank detected for session=${sessionId}`);
+        return { ok: true, result: '', aboutBlankDetected: true, executionTime: Date.now() - start };
+      }
+
+      // Use Gmail-optimized content detection
+      const cur = await getGmailPageContent(sessionId);
+      
+      if (cur === prev && cur !== '') {
+        stableCount++;
+        logger.debug(`[browser.act] waitForGmailStableText: stable count ${stableCount}/${maxStableCount}`);
+        
+        if (stableCount >= maxStableCount) {
+          logger.info(`[browser.act] waitForGmailStableText: content stabilized after ${Date.now() - start}ms`);
+          return { ok: true, result: cur, executionTime: Date.now() - start };
+        }
+      } else {
+        stableCount = 0;
+        prev = cur;
+        logger.debug(`[browser.act] waitForGmailStableText: content changed, resetting stability (${cur.length} chars)`);
+      }
+
+      await new Promise(resolve => setTimeout(resolve, checkInterval));
+    } catch (error) {
+      logger.warn(`[browser.act] waitForGmailStableText: check failed: ${error.message}`);
+      await new Promise(resolve => setTimeout(resolve, checkInterval));
+    }
+  }
+
+  logger.info(`[browser.act] waitForGmailStableText: timeout after ${Date.now() - start}ms, returning last content`);
+  return { ok: true, result: prev, executionTime: Date.now() - start }; // Return last known content
+}
+
+// Recover from about:blank without losing session
+async function recoverFromAboutBlank(sessionId, originalUrl = 'https://mail.google.com') {
+  try {
+    logger.info(`[browser.act] Recovering from about:blank for session=${sessionId}`);
+    
+    // Step 1: Check if browser window is still responsive
+    const ping = await cliRun([...sessionFlags(sessionId), 'eval', 'window.navigator.userAgent'], 3000);
+    
+    if (ping.ok && ping.stdout) {
+      logger.info(`[browser.act] Browser responsive, navigating back to Gmail for session=${sessionId}`);
+      // Browser is responsive, just navigate back
+      const navResult = await cliRun([...sessionFlags(sessionId), 'goto', originalUrl], 10000);
+      if (navResult.ok) {
+        // Wait for page to load
+        await new Promise(resolve => setTimeout(resolve, 3000));
+        logger.info(`[browser.act] Recovery successful via navigation for session=${sessionId}`);
+        return { recovered: true, method: 'navigate' };
+      }
+    }
+    
+    // Step 2: Browser unresponsive, restart session
+    logger.info(`[browser.act] Browser unresponsive, restarting session=${sessionId}`);
+    openSessions.delete(sessionId);
+    
+    const restartResult = await cliRun([...sessionFlags(sessionId), 'open', originalUrl], 15000);
+    if (restartResult.ok) {
+      openSessions.add(sessionId);
+      await new Promise(resolve => setTimeout(resolve, 5000));
+      logger.info(`[browser.act] Recovery successful via restart for session=${sessionId}`);
+      return { recovered: true, method: 'restart' };
+    }
+    
+    logger.error(`[browser.act] Recovery failed for session=${sessionId}`);
+    return { recovered: false, error: 'Failed to recover session - both navigation and restart failed' };
+  } catch (error) {
+    logger.error(`[browser.act] Recovery error for session=${sessionId}: ${error.message}`);
+    return { recovered: false, error: error.message };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Gmail Copy-Paste Attachment Method
+// ---------------------------------------------------------------------------
+
+
+// ---------------------------------------------------------------------------
+// Session Recovery and Enhanced Error Handling
+// ---------------------------------------------------------------------------
 
 // Persistent profile directory per session — preserves cookies/login across restarts
 function sessionProfileDir(sessionId) {
@@ -679,18 +850,20 @@ function shouldUsePersistentProfile(sessionId) {
 }
 
 // Build base flags for a session (with skills-based persistent profiles)
+// Each agent session gets its OWN profile directory under ~/.thinkdrop/browser-profiles/
+// so cookies/localStorage survive restarts without any cross-contamination between
+// agents. Fixes the "Chrome didn't shut down correctly" Restore-pages banner that
+// appears when multiple sessions fight over a single shared persistent profile.
 function sessionFlags(sessionId, headed = true) {
   const flags = [`-s=${sessionId}`];
   if (headed) flags.push('--headed');
-  
-  // Skills best practice: use persistent profiles for agent sessions
+
   if (shouldUsePersistentProfile(sessionId)) {
-    flags.push('--persistent');
-    logger.debug(`[browser.act] Using persistent profile for session=${sessionId}`);
+    const profileDir = sessionProfileDir(sessionId);
+    flags.push(`--profile=${profileDir}`);
+    logger.debug(`[browser.act] Using persistent profile dir ${profileDir} for session=${sessionId}`);
   }
-  
-  // NOTE: We use --persistent instead of --profile for better session management
-  // Auth persistence is handled via state-save/state-load in combination with persistent profiles
+
   return flags;
 }
 
@@ -705,14 +878,42 @@ const openSessions = new Set();
 // Probe whether a playwright-cli daemon is already alive for a session.
 // Used on navigate after app restart (openSessions cleared) to avoid cold-starting
 // a new Chrome tab when the browser is already open from a previous run.
+//
+// We intentionally avoid spawning a Chrome process to probe — with per-session
+// persistent profiles (see sessionFlags), a headless probe would lock the profile
+// and the subsequent headed open would collide on Chrome's SingletonLock,
+// producing the "window flashes blank then closes + reopens" symptom.
+//
+// Instead we check for an active SingletonLock symlink in the profile dir —
+// Chrome creates it at startup and removes it on clean exit. If it's alive and
+// pointing to a live pid, a Chrome process is running against this profile,
+// which means a daemon is alive.
 async function isDaemonAlive(sessionId, headed) {
   try {
-    // Always probe headlessly — we only want to know if the daemon process exists.
-    // Passing `headed` here causes playwright-cli to briefly open a visible blank
-    // Chrome window then immediately close it when the daemon isn't running, which
-    // is jarring to the user. The probe result is the same either way.
-    const probe = await cliRun([...sessionFlags(sessionId, false), 'eval', '1'], 4000);
-    return probe.ok;
+    if (!shouldUsePersistentProfile(sessionId)) {
+      // Fall back to a lightweight CLI probe (non-persistent sessions don't
+      // have a known-on-disk profile path to check).
+      const probe = await cliRun([...sessionFlags(sessionId, false), 'eval', '1'], 4000);
+      return probe.ok;
+    }
+    const profileDir = sessionProfileDir(sessionId);
+    const lockPath = path.join(profileDir, 'SingletonLock');
+    if (!fs.existsSync(lockPath)) return false;
+    // SingletonLock is a symlink like "<host>-<pid>"; extract the pid and verify.
+    let target = '';
+    try { target = fs.readlinkSync(lockPath); } catch (_) { return false; }
+    const m = String(target).match(/-(\d+)$/);
+    if (!m) return false;
+    const pid = parseInt(m[1], 10);
+    if (!pid) return false;
+    try {
+      process.kill(pid, 0); // signal 0 = existence check, does not actually signal
+      return true;
+    } catch (_) {
+      // Stale lock — pid is gone. Treat as dead daemon.
+      try { fs.unlinkSync(lockPath); } catch (_) {}
+      return false;
+    }
   } catch (_) {
     return false;
   }
@@ -953,6 +1154,293 @@ function resolveRefForClick(sessionId, labelOrRef) {
 
 // ---------------------------------------------------------------------------
 // Main skill entry point
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Gmail Attachment and Send Verification Functions
+// ---------------------------------------------------------------------------
+
+async function waitForAttachmentProcessing(sessionId, fileName) {
+  logger.info(`[browser.act] waitForAttachmentProcessing: checking attachment for ${fileName}`);
+  
+  const baseName = path.basename(fileName, path.extname(fileName));
+  const fileNameLower = baseName.toLowerCase();
+  const fullFileNameLower = path.basename(fileName).toLowerCase();
+  
+  let attempts = 0;
+  const maxAttempts = 15; // Increased from 10
+  
+  while (attempts < maxAttempts) {
+    try {
+      const snapshot = await cliRun([...sessionFlags(sessionId, false), 'snapshot'], 5000);
+      
+      if (!snapshot.ok) {
+        logger.warn(`[browser.act] waitForAttachmentProcessing: snapshot failed, retrying...`);
+        await new Promise(resolve => setTimeout(resolve, 1000));
+        attempts++;
+        continue;
+      }
+      
+      const content = snapshot.stdout;
+      const contentLower = content.toLowerCase();
+      
+      // Gmail-specific attachment indicators
+      const gmailAttachmentPatterns = [
+        // Filename variations
+        fileNameLower,
+        fullFileNameLower,
+        `${fileNameLower}.txt`,
+        `${baseName}`,
+        
+        // Gmail UI elements
+        'data-tooltip="Remove attachment"',
+        'aria-label="Remove attachment"',
+        'data-tooltip*="attachment"',
+        'aria-label*="attachment"',
+        
+        // Gmail attachment classes and elements
+        'class="attachment"',
+        'class*="attachment"',
+        'div[role="button"][data-tooltip*="attachment"]',
+        
+        // Gmail filename display patterns
+        `title="${fileNameLower}"`,
+        `aria-label="${fileNameLower}"`,
+        `title="${fullFileNameLower}"`,
+        `aria-label="${fullFileNameLower}"`,
+        
+        // Download and attachment indicators
+        'download',
+        '1 attachment',
+        'attachments',
+        'file attached',
+        'uploaded',
+        
+        // Generic indicators (fallback)
+        'attachment',
+        'attached'
+      ];
+      
+      const hasAttachment = gmailAttachmentPatterns.some(pattern => {
+        if (pattern.includes('*')) {
+          // Handle wildcard patterns
+          const regexPattern = pattern.replace(/\*/g, '.*');
+          return new RegExp(regexPattern, 'i').test(content);
+        }
+        return content.includes(pattern) || contentLower.includes(pattern.toLowerCase());
+      });
+      
+      if (hasAttachment) {
+        logger.info(`[browser.act] waitForAttachmentProcessing: Gmail attachment detected for ${fileName} (attempt ${attempts + 1})`);
+        // Additional wait for full processing
+        await new Promise(resolve => setTimeout(resolve, 3000)); // Increased from 2000
+        return true;
+      }
+      
+      logger.debug(`[browser.act] waitForAttachmentProcessing: Gmail attachment not yet visible for ${fileName} (attempt ${attempts + 1})`);
+      await new Promise(resolve => setTimeout(resolve, 1000));
+      attempts++;
+    } catch (error) {
+      logger.error(`[browser.act] waitForAttachmentProcessing: error checking attachment: ${error.message}`);
+      attempts++;
+    }
+  }
+  
+  // Log debug information for troubleshooting
+  try {
+    const debugSnapshot = await cliRun([...sessionFlags(sessionId, false), 'snapshot'], 5000);
+    const preview = debugSnapshot.stdout?.substring(0, 500) || 'No content';
+    logger.warn(`[browser.act] waitForAttachmentProcessing: timeout waiting for Gmail attachment ${fileName}. Content preview: ${preview}`);
+  } catch (debugError) {
+    logger.warn(`[browser.act] waitForAttachmentProcessing: timeout and debug snapshot failed: ${debugError.message}`);
+  }
+  
+  return false;
+}
+
+async function verifyAttachmentPresent(sessionId, fileName) {
+  try {
+    const snapshot = await cliRun([...sessionFlags(sessionId, false), 'snapshot'], 5000);
+    
+    if (!snapshot.ok) {
+      logger.warn(`[browser.act] verifyAttachmentPresent: snapshot failed`);
+      return false;
+    }
+    
+    const content = snapshot.stdout;
+    const contentLower = content.toLowerCase();
+    const baseName = path.basename(fileName, path.extname(fileName));
+    const fileNameLower = baseName.toLowerCase();
+    const fullFileNameLower = path.basename(fileName).toLowerCase();
+    
+    // Enhanced Gmail attachment verification patterns
+    const gmailAttachmentPatterns = [
+      // Filename variations
+      fileNameLower,
+      fullFileNameLower,
+      `${fileNameLower}.txt`,
+      `${baseName}`,
+      
+      // Gmail UI elements
+      'data-tooltip="Remove attachment"',
+      'aria-label="Remove attachment"',
+      'data-tooltip*="attachment"',
+      'aria-label*="attachment"',
+      
+      // Gmail attachment classes and elements
+      'class="attachment"',
+      'class*="attachment"',
+      'div[role="button"][data-tooltip*="attachment"]',
+      
+      // Gmail filename display patterns
+      `title="${fileNameLower}"`,
+      `aria-label="${fileNameLower}"`,
+      `title="${fullFileNameLower}"`,
+      `aria-label="${fullFileNameLower}"`,
+      
+      // Download and attachment indicators
+      'download',
+      '1 attachment',
+      'attachments',
+      'file attached',
+      'uploaded',
+      
+      // HTML tag patterns
+      `>${fileNameLower}<`,
+      `"${fileNameLower}"`,
+      `'${fileNameLower}'`,
+      
+      // Generic indicators
+      'attachment',
+      'attached'
+    ];
+    
+    const isAttached = gmailAttachmentPatterns.some(pattern => {
+      if (pattern.includes('*')) {
+        // Handle wildcard patterns
+        const regexPattern = pattern.replace(/\*/g, '.*');
+        return new RegExp(regexPattern, 'i').test(content);
+      }
+      return content.includes(pattern) || contentLower.includes(pattern.toLowerCase());
+    });
+    
+    logger.info(`[browser.act] verifyAttachmentPresent: ${fileName} Gmail attachment verified: ${isAttached}`);
+    return isAttached;
+  } catch (error) {
+    logger.error(`[browser.act] verifyAttachmentPresent: error verifying Gmail attachment: ${error.message}`);
+    return false;
+  }
+}
+
+async function checkForGmailErrors(sessionId) {
+  try {
+    const snapshot = await cliRun([...sessionFlags(sessionId, false), 'snapshot'], 5000);
+    
+    if (!snapshot.ok) {
+      return 'snapshot_failed';
+    }
+    
+    const content = snapshot.stdout.toLowerCase();
+    
+    // Common Gmail error messages
+    const errorPatterns = [
+      { pattern: 'attachment too large', message: 'attachment too large' },
+      { pattern: 'failed to attach', message: 'failed to attach' },
+      { pattern: 'unable to send', message: 'unable to send' },
+      { pattern: 'message not sent', message: 'message not sent' },
+      { pattern: 'please try again', message: 'please try again' },
+      { pattern: 'error occurred', message: 'error occurred' },
+      { pattern: 'some attachments', message: 'attachment issue' },
+      { pattern: 'couldn\'t attach', message: 'couldn\'t attach' }
+    ];
+    
+    for (const { pattern, message } of errorPatterns) {
+      if (content.includes(pattern)) {
+        logger.warn(`[browser.act] checkForGmailErrors: detected error: ${message}`);
+        return message;
+      }
+    }
+    
+    return null;
+  } catch (error) {
+    logger.error(`[browser.act] checkForGmailErrors: error checking for errors: ${error.message}`);
+    return 'error_check_failed';
+  }
+}
+
+async function sendEmailWithVerification(sessionId, sendSelector) {
+  logger.info(`[browser.act] sendEmailWithVerification: clicking send button ${sendSelector}`);
+  
+  try {
+    // Click send button
+    const sendResult = await cliRun([...sessionFlags(sessionId, false), 'click', sendSelector], 5000);
+    
+    if (!sendResult.ok) {
+      throw new Error(`Send button click failed: ${sendResult.error}`);
+    }
+    
+    // Wait for send to complete
+    logger.info(`[browser.act] sendEmailWithVerification: waiting for send completion`);
+    await new Promise(resolve => setTimeout(resolve, 3000));
+    
+    // Verify email was sent
+    const wasSent = await verifyEmailSent(sessionId);
+    
+    if (!wasSent) {
+      // Check for error dialogs
+      const hasError = await checkForGmailErrors(sessionId);
+      if (hasError) {
+        throw new Error(`Gmail send error: ${hasError}`);
+      }
+      
+      throw new Error('Email send verification failed - no confirmation detected');
+    }
+    
+    logger.info(`[browser.act] sendEmailWithVerification: email sent successfully`);
+    return true;
+  } catch (error) {
+    logger.error(`[browser.act] sendEmailWithVerification: ${error.message}`);
+    throw error;
+  }
+}
+
+async function verifyEmailSent(sessionId) {
+  try {
+    const snapshot = await cliRun([...sessionFlags(sessionId, false), 'snapshot'], 5000);
+    
+    if (!snapshot.ok) {
+      logger.warn(`[browser.act] verifyEmailSent: snapshot failed`);
+      return false;
+    }
+    
+    const content = snapshot.stdout.toLowerCase();
+    
+    // Check for sent email confirmation
+    const sentIndicators = [
+      'message sent',
+      'your message has been sent',
+      'sent successfully',
+      'email sent',
+      'conversation sent'
+    ];
+    
+    // Check for compose window being closed/cleared
+    const composeClosed = !content.includes('compose') || 
+                         !content.includes('to:') ||
+                         content.includes('message sent');
+    
+    const wasSent = sentIndicators.some(indicator => content.includes(indicator)) || composeClosed;
+    
+    logger.info(`[browser.act] verifyEmailSent: email sent: ${wasSent}`);
+    return wasSent;
+  } catch (error) {
+    logger.error(`[browser.act] verifyEmailSent: error verifying send: ${error.message}`);
+    return false;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Main Browser Action Function
 // ---------------------------------------------------------------------------
 
 async function browserAct(args) {
@@ -1519,6 +2007,12 @@ async function browserAct(args) {
         }
         
         logger.info(`[browser.act] upload: file attached successfully — ${_f}`);
+        
+        // Wait for Gmail to process the attachment
+        if (sessionId.includes('gmail') || sessionId.includes('mail')) {
+          logger.info(`[browser.act] upload: waiting for Gmail to process attachment: ${_f}`);
+          await waitForAttachmentProcessing(sessionId, _f);
+        }
       }
 
       logger.info(`[browser.act] upload: upload completed successfully for: ${uploadFiles.join(', ')}`);
@@ -1540,6 +2034,181 @@ async function browserAct(args) {
       }
       
       return result;
+    }
+
+    // ── Paste ───────────────────────────────────────────────────────────────
+    // Low-level paste primitive — presses Meta+V (macOS) or Ctrl+V (other) on
+    // whatever element currently has focus. Prefer `pasteAttachment` for file
+    // attachments because it focuses the compose body first.
+    case 'paste': {
+      logger.info(`[browser.act] Pasting clipboard content for session=${sessionId}`);
+
+      try {
+        const pasteKey = process.platform === 'darwin' ? 'Meta+v' : 'Control+v';
+
+        const pasteResult = await run(['press', pasteKey], `paste ${pasteKey}`);
+
+        if (!pasteResult.ok) {
+          throw new Error(`Failed to paste: ${pasteResult.error || pasteResult.stderr}`);
+        }
+
+        logger.info(`[browser.act] Paste completed successfully`);
+
+        return {
+          ok: true,
+          action,
+          sessionId,
+          executionTime: Date.now() - start,
+          result: 'Clipboard content pasted successfully'
+        };
+
+      } catch (error) {
+        logger.error(`[browser.act] Paste failed: ${error.message}`);
+        return {
+          ok: false,
+          action,
+          sessionId,
+          executionTime: Date.now() - start,
+          error: error.message
+        };
+      }
+    }
+
+    // ── PasteAttachment ─────────────────────────────────────────────────────
+    // High-level action for attaching a file to Gmail/chat compose windows via
+    // clipboard. Matches the human workflow:
+    //   1. (caller ran shell.run osascript earlier to put the file on the clipboard)
+    //   2. focus the COMPOSE BODY (contentEditable — NOT the attach/paperclip button,
+    //      whose native file chooser modal blocks keyboard events in playwright-cli)
+    //   3. press Meta+V (macOS) / Ctrl+V — the contentEditable receives a paste event
+    //      with a File in clipboardData, and Gmail auto-converts it to an attachment
+    // Caller may supply `selector` to explicitly target a body ref; otherwise we
+    // scan the snapshot for the best candidate.
+    case 'pasteAttachment': {
+      logger.info(`[browser.act] pasteAttachment: session=${sessionId}`);
+
+      try {
+        await captureSnapshot(sessionId, headed, timeoutMs);
+        const snap = snapshotCache.get(sessionId) || '';
+
+        // Locate the compose body. Caller can pin it via selector; otherwise
+        // search the snapshot for a textbox whose name/label matches body-ish tokens.
+        let bodyRef = null;
+        let bodyLabel = null;
+
+        if (selector) {
+          bodyRef = resolveRef(sessionId, selector);
+          bodyLabel = selector;
+        }
+
+        if (!bodyRef && snap) {
+          const candidates = parseSnapshotCandidates(snap);
+          const BODY_NAME_RX = /\b(message\s*body|body|message|compose|email\s*body)\b/i;
+          // Prefer textbox/richtext roles. Deprioritise anything mentioning attach/paperclip.
+          const ROLE_SCORE = { textbox: 4, combobox: 2, searchbox: 1 };
+          let best = null, bestScore = -Infinity;
+          for (const cand of candidates) {
+            const roleScore = ROLE_SCORE[String(cand.role || '').toLowerCase()] || 0;
+            if (roleScore === 0) continue;
+            const label = String(cand.label || '');
+            let s = roleScore;
+            if (BODY_NAME_RX.test(label)) s += 6;
+            if (/subject/i.test(label)) s -= 5;          // not the subject line
+            if (/to|recipient|cc|bcc/i.test(label)) s -= 5; // not the recipients row
+            if (/attach|paperclip|file/i.test(label)) s -= 8;
+            if (s > bestScore) { bestScore = s; best = cand; }
+          }
+          if (best && bestScore > 0) {
+            bodyRef = best.ref;
+            bodyLabel = best.label;
+            logger.info(`[browser.act] pasteAttachment: resolved compose body → ${bodyRef} ("${bodyLabel}" score=${bestScore})`);
+          }
+        }
+
+        if (!bodyRef || !/^e\d+$/i.test(String(bodyRef).trim())) {
+          const err = `pasteAttachment: could not locate compose body textbox in snapshot. Hint: supply selector="Message Body" or equivalent.`;
+          logger.error(`[browser.act] ${err}`);
+          return { ok: false, action, sessionId, error: err, executionTime: Date.now() - start };
+        }
+
+        // Focus the body by clicking it, then paste.
+        const clickRes = await run(['click', bodyRef], `pasteAttachment focus ${bodyRef}`);
+        if (!clickRes.ok) {
+          logger.warn(`[browser.act] pasteAttachment: click on body ref ${bodyRef} failed — continuing to paste anyway`);
+        }
+
+        // Short settle so the contentEditable is truly focused before keypress.
+        await new Promise(r => setTimeout(r, 150));
+
+        const pasteKey = process.platform === 'darwin' ? 'Meta+v' : 'Control+v';
+        const pasteRes = await run(['press', pasteKey], `pasteAttachment press ${pasteKey}`);
+
+        if (!pasteRes.ok) {
+          throw new Error(`Failed to paste into body: ${pasteRes.error || pasteRes.stderr}`);
+        }
+
+        // Detect the known "modal state" error early so callers don't burn
+        // repair cycles: it means the caller clicked the attach button before
+        // calling us, which is the anti-pattern this action was built to avoid.
+        const stdout = String(pasteRes.stdout || '');
+        if (/does not handle the modal state/i.test(stdout)) {
+          return {
+            ok: false,
+            action,
+            sessionId,
+            error: 'pasteAttachment: a modal (likely the native file chooser) is open and blocks keyboard events. Do NOT click the Attach button before pasteAttachment — paste directly into the compose body.',
+            executionTime: Date.now() - start
+          };
+        }
+
+        logger.info(`[browser.act] pasteAttachment: paste into body ${bodyRef} completed`);
+        return {
+          ok: true,
+          action,
+          sessionId,
+          executionTime: Date.now() - start,
+          result: `Attachment pasted into compose body (${bodyLabel || bodyRef})`
+        };
+      } catch (error) {
+        logger.error(`[browser.act] pasteAttachment failed: ${error.message}`);
+        return {
+          ok: false,
+          action,
+          sessionId,
+          executionTime: Date.now() - start,
+          error: error.message
+        };
+      }
+    }
+
+    // ── Send Email with Verification ───────────────────────────────────────
+    case 'sendEmailWithVerification': {
+      if (!selector) {
+        return { ok: false, action, sessionId, error: 'sendEmailWithVerification: selector (send button) is required', executionTime: Date.now() - start };
+      }
+
+      try {
+        logger.info(`[browser.act] sendEmailWithVerification: starting send verification for session=${sessionId}`);
+        
+        const wasSent = await sendEmailWithVerification(sessionId, selector);
+        
+        return {
+          ok: true,
+          action,
+          sessionId,
+          result: 'Email sent and verified successfully',
+          executionTime: Date.now() - start,
+        };
+      } catch (error) {
+        logger.error(`[browser.act] sendEmailWithVerification failed: ${error.message}`);
+        return {
+          ok: false,
+          action,
+          sessionId,
+          error: error.message,
+          executionTime: Date.now() - start,
+        };
+      }
     }
 
     // ── Keyboard ─────────────────────────────────────────────────────────────
@@ -1761,13 +2430,18 @@ async function browserAct(args) {
     }
 
     // ── waitForContent ────────────────────────────────────────────────────────
+    // COMPATIBILITY: Uses eval + polling since waitForContent not available in playwright-cli
     case 'waitForContent': {
       const needle = text || selector || '';
       const deadline = Date.now() + timeoutMs;
       while (Date.now() < deadline) {
-        const snapRes = await cliRun([...S, 'eval', 'document.body.innerText.slice(0,50000)'], 8000);
-        if (snapRes.stdout.includes(needle)) {
-          return { ok: true, action, sessionId, result: needle, executionTime: Date.now() - start };
+        const evalRes = await cliRun([...S, 'eval', 'document.body.innerText.slice(0,50000)'], 8000);
+        if (evalRes.ok) {
+          const pageText = evalRes.stdout.match(/###\s*Result\s*\n([\s\S]*?)(?=###|$)/i);
+          const textContent = pageText ? pageText[1].trim() : evalRes.stdout.trim();
+          if (textContent.includes(needle)) {
+            return { ok: true, action, sessionId, result: needle, executionTime: Date.now() - start };
+          }
         }
         await new Promise(r => setTimeout(r, 1500));
       }
@@ -1851,111 +2525,142 @@ async function browserAct(args) {
     case 'waitForNavigation':
     // ── waitForStableText ─────────────────────────────────────────────────────
     case 'waitForStableText': {
-      // Auth-wall patterns — text that indicates a login/sign-in page, not real content
-      const AUTH_WALL_FIRST = /^(sign in|log in|sign up|create account|join today|continue with google|continue with apple|sign in to x|sign in with google|sign in with apple|login to|log into|happening now|where should we begin)\b/i;
-      const AUTH_WALL_BODY = /\b(sign in|log in|sign up|join today|create account)\b[\s\S]{0,400}\b(google|apple|email|phone|username|password|sign up with|continue with)\b/i;
-      // Logged-out UI patterns — sites that show a guest/unauthenticated landing page
-      const AUTH_WALL_LOGGEDOUT = /\b(log in|sign in|sign up for free)\b[\s\S]{0,200}\b(where should we begin|get started|create account|free account|try for free)\b/i;
-      // Chrome crash-restore dialog
-      const RESTORE_DIALOG = /restore pages?\?|chrome didn't shut down correctly|help make google chrome better/i;
+      // Check if this is a Gmail session - use Gmail-optimized version if so
+      let isGmailSession = false;
+      try {
+        const hostnameCheck = await cliRun([...S, 'eval', 'window.location.hostname'], 2000);
+        if (hostnameCheck.ok && hostnameCheck.stdout) {
+          const hostname = hostnameCheck.stdout.match(/###\s*Result\s*\n([\s\S]*?)(?=###|$)/i);
+          isGmailSession = hostname && hostname[1] && hostname[1].includes('mail.google.com');
+        }
+      } catch (error) {
+        // If hostname check fails, try session name as fallback
+        isGmailSession = sessionId.includes('gmail');
+      }
+      
+      if (isGmailSession) {
+        // Use Gmail-optimized stable text detection
+        logger.info(`[browser.act] Using Gmail-optimized waitForStableText for session=${sessionId}`);
+        const gmailResult = await waitForGmailStableText(sessionId, timeoutMs);
+        
+        return {
+          ok: gmailResult.ok,
+          action,
+          sessionId,
+          result: gmailResult.result,
+          stdout: gmailResult.result,
+          aboutBlankDetected: gmailResult.aboutBlankDetected,
+          executionTime: gmailResult.executionTime || Date.now() - start
+        };
+      } else {
+        // Use original waitForStableText for non-Gmail pages
+        logger.info(`[browser.act] Using standard waitForStableText for session=${sessionId}`);
+        
+        // Auth-wall patterns — text that indicates a login/sign-in page, not real content
+        const AUTH_WALL_FIRST = /^(sign in|log in|sign up|create account|join today|continue with google|continue with apple|sign in to x|sign in with google|sign in with apple|login to|log into|happening now|where should we begin)\b/i;
+        const AUTH_WALL_BODY = /\b(sign in|log in|sign up|join today|create account)\b[\s\S]{0,400}\b(google|apple|email|phone|username|password|sign up with|continue with)\b/i;
+        // Logged-out UI patterns — sites that show a guest/unauthenticated landing page
+        const AUTH_WALL_LOGGEDOUT = /\b(log in|sign in|sign up for free)\b[\s\S]{0,200}\b(where should we begin|get started|create account|free account|try for free)\b/i;
+        // Chrome crash-restore dialog
+        const RESTORE_DIALOG = /restore pages?\?|chrome didn't shut down correctly|help make google chrome better/i;
 
-      // Cap effective timeout at 30s — MCPClient transport timeout is 60s.
-      // Each cliRun eval can take up to 8s, so we need a hard pre-check before
-      // each iteration to avoid overshooting. Stop if <10s remain to leave buffer.
-      const effectiveTimeout = Math.min(timeoutMs, 30000);
-      let prev = '';
-      const loopStart = Date.now();
-      const deadline = loopStart + effectiveTimeout;
-      while (Date.now() < deadline) {
-        // Hard bail: if less than 10s left, don't start another 8s eval — return what we have
-        if (deadline - Date.now() < 10000) break;
+        // Cap effective timeout at 30s — MCPClient transport timeout is 60s.
+        // Each cliRun eval can take up to 8s, so we need a hard pre-check before
+        // each iteration to avoid overshooting. Stop if <10s remain to leave buffer.
+        const effectiveTimeout = Math.min(timeoutMs, 30000);
+        let prev = '';
+        const loopStart = Date.now();
+        const deadline = loopStart + effectiveTimeout;
+        while (Date.now() < deadline) {
+          // Hard bail: if less than 10s left, don't start another 8s eval — return what we have
+          if (deadline - Date.now() < 10000) break;
 
-        // Fail fast on about:blank so callers can recover instead of re-planning on empty data.
-        try {
-          const urlProbe = await cliRun([...S, 'eval', 'window.location.href'], 2000);
-          const urlRaw = (urlProbe.stdout || '').trim();
-          const urlMatch = urlRaw.match(/###\s*Result\s*\n([\s\S]*?)(?=###|$)/i);
-          const curUrl = (urlMatch ? urlMatch[1] : urlRaw).trim().replace(/^"|"$/g, '');
-          if (/about:blank/i.test(curUrl)) {
-            logger.warn(`[browser.act] waitForStableText: page is about:blank for session=${sessionId}`);
-            return {
-              ok: true,
-              action,
-              sessionId,
-              result: '',
-              stdout: '',
-              aboutBlankDetected: true,
-              executionTime: Date.now() - start,
-            };
+          // Fail fast on about:blank so callers can recover instead of re-planning on empty data.
+          try {
+            const urlProbe = await cliRun([...S, 'eval', 'window.location.href'], 2000);
+            const urlRaw = (urlProbe.stdout || '').trim();
+            const urlMatch = urlRaw.match(/###\s*Result\s*\n([\s\S]*?)(?=###|$)/i);
+            const curUrl = (urlMatch ? urlMatch[1] : urlRaw).trim().replace(/^"|"$/g, '');
+            if (/about:blank/i.test(curUrl)) {
+              logger.warn(`[browser.act] waitForStableText: page is about:blank for session=${sessionId}`);
+              return {
+                ok: true,
+                action,
+                sessionId,
+                result: '',
+                stdout: '',
+                aboutBlankDetected: true,
+                executionTime: Date.now() - start,
+              };
+            }
+          } catch (_) {
+            // URL probe failures are transient; continue polling page text.
           }
-        } catch (_) {
-          // URL probe failures are transient; continue polling page text.
-        }
 
-        // Truncate to 50k chars to prevent huge pages (YouTube, Reddit) from timing out the eval.
-        // A SIGTERM to playwright-cli mid-eval causes it to navigate the tab to about:blank as cleanup.
-        const r = await cliRun([...S, 'eval', 'document.body.innerText.slice(0,50000)'], 8000);
-        // playwright-cli eval wraps output as: ### Result\n"<value>"\n### Ran Playwright code...
-        // Extract just the bare innerText value
-        const rawOut = (r.stdout || '').trim();
-        const resultMatch = rawOut.match(/###\s*Result\s*\n([\s\S]*?)(?=###|$)/i);
-        const cur = resultMatch
-          ? resultMatch[1].trim().replace(/^"|"$/g, '')
-          : rawOut;
+          // Use lighter eval for non-Gmail pages to reduce timeout risk
+          const r = await cliRun([...S, 'eval', 'document.body.innerText.slice(0,25000)'], 6000);
+          // playwright-cli eval wraps output as: ### Result\n"<value>"\n### Ran Playwright code...
+          // Extract just the bare innerText value
+          const rawOut = (r.stdout || '').trim();
+          const resultMatch = rawOut.match(/###\s*Result\s*\n([\s\S]*?)(?=###|$)/i);
+          const cur = resultMatch
+            ? resultMatch[1].trim().replace(/^"|"$/g, '')
+            : rawOut;
 
-        // Detect Chrome restore dialog — dismiss it with Escape (native browser UI, not page DOM)
-        if (RESTORE_DIALOG.test(cur)) {
-          logger.info(`[browser.act] waitForStableText: Chrome restore dialog detected — pressing Escape`);
-          await cliRun([...S, 'press', 'Escape'], 3000);
-          await new Promise(r2 => setTimeout(r2, 600));
-          await cliRun([...S, 'press', 'Escape'], 3000);
-          await new Promise(r2 => setTimeout(r2, 600));
-          prev = '';
-          continue;
-        }
-
-        if (cur && cur === prev) {
-          // Check if stable content is an auth wall
-          const firstLine = cur.split('\n')[0].trim();
-          const isAuthWall = AUTH_WALL_FIRST.test(firstLine) || AUTH_WALL_BODY.test(cur.slice(0, 500)) || AUTH_WALL_LOGGEDOUT.test(cur.slice(0, 600));
-          if (isAuthWall) {
-            logger.info(`[browser.act] waitForStableText: auth wall detected for session=${sessionId}`);
-            return { ok: true, action, sessionId, result: '', stdout: '', authRequired: true, authWallText: cur.slice(0, 100), executionTime: Date.now() - start };
+          // Detect Chrome restore dialog — dismiss it with Escape (native browser UI, not page DOM)
+          if (RESTORE_DIALOG.test(cur)) {
+            logger.info(`[browser.act] waitForStableText: Chrome restore dialog detected — pressing Escape`);
+            await cliRun([...S, 'press', 'Escape'], 3000);
+            await new Promise(r2 => setTimeout(r2, 600));
+            await cliRun([...S, 'press', 'Escape'], 3000);
+            await new Promise(r2 => setTimeout(r2, 600));
+            prev = '';
+            continue;
           }
-          return { ok: true, action, sessionId, result: cur, executionTime: Date.now() - start };
-        }
-        // Early-exit: if content is substantial and barely changed since last poll,
-        // treat as "stable enough". Pages like YouTube search keep micro-updating
-        // (ad slots, counters) so perfect equality never happens within the window.
-        if (prev && cur && cur.length > 1000) {
-          const longer = Math.max(prev.length, cur.length);
-          const changeRatio = Math.abs(cur.length - prev.length) / longer;
-          if (changeRatio < 0.05) {
-            logger.info(`[browser.act] waitForStableText: near-stable (${(changeRatio * 100).toFixed(1)}% change) — returning early`);
+
+          if (cur && cur === prev) {
+            // Check if stable content is an auth wall
+            const firstLine = cur.split('\n')[0].trim();
+            const isAuthWall = AUTH_WALL_FIRST.test(firstLine) || AUTH_WALL_BODY.test(cur.slice(0, 500)) || AUTH_WALL_LOGGEDOUT.test(cur.slice(0, 600));
+            if (isAuthWall) {
+              logger.info(`[browser.act] waitForStableText: auth wall detected for session=${sessionId}`);
+              return { ok: true, action, sessionId, result: '', stdout: '', authRequired: true, authWallText: cur.slice(0, 100), executionTime: Date.now() - start };
+            }
             return { ok: true, action, sessionId, result: cur, executionTime: Date.now() - start };
           }
-          // Streaming-growth exit: AI answer pages (Grok, Perplexity, ChatGPT) keep growing
-          // continuously — content never stabilizes. If we've been polling >15s and have
-          // substantial content, accept what we have rather than waiting for the full timeout.
-          const elapsed = Date.now() - loopStart;
-          if (elapsed > 15000 && cur.length > 2000) {
-            logger.info(`[browser.act] waitForStableText: streaming page, ${elapsed}ms elapsed with ${cur.length} chars — accepting`);
-            return { ok: true, action, sessionId, result: cur, executionTime: Date.now() - start };
+          // Early-exit: if content is substantial and barely changed since last poll,
+          // treat as "stable enough". Pages like YouTube search keep micro-updating
+          // (ad slots, counters) so perfect equality never happens within the window.
+          if (prev && cur && cur.length > 1000) {
+            const longer = Math.max(prev.length, cur.length);
+            const changeRatio = Math.abs(cur.length - prev.length) / longer;
+            if (changeRatio < 0.05) {
+              logger.info(`[browser.act] waitForStableText: near-stable (${(changeRatio * 100).toFixed(1)}% change) — returning early`);
+              return { ok: true, action, sessionId, result: cur, executionTime: Date.now() - start };
+            }
+            // Streaming-growth exit: AI answer pages (Grok, Perplexity, ChatGPT) keep growing
+            // continuously — content never stabilizes. If we've been polling >15s and have
+            // substantial content, accept what we have rather than waiting for the full timeout.
+            const elapsed = Date.now() - loopStart;
+            if (elapsed > 15000 && cur.length > 2000) {
+              logger.info(`[browser.act] waitForStableText: streaming page, ${elapsed}ms elapsed with ${cur.length} chars — accepting`);
+              return { ok: true, action, sessionId, result: cur, executionTime: Date.now() - start };
+            }
           }
+          prev = cur;
+          await new Promise(r2 => setTimeout(r2, 800));
         }
-        prev = cur;
-        await new Promise(r2 => setTimeout(r2, 800));
+        // Timeout — page never stabilized (e.g. YouTube infinite scroll, live feeds).
+        // Return whatever we last captured so the user gets real content instead of nothing.
+        let finalText = prev;
+        if (!finalText) {
+          const lastRes = await cliRun([...S, 'eval', 'document.body.innerText.slice(0,25000)'], 6000);
+          const lastRaw = (lastRes.stdout || '').trim();
+          const lastMatch = lastRaw.match(/###\s*Result\s*\n([\s\S]*?)(?=###|$)/i);
+          finalText = lastMatch ? lastMatch[1].trim().replace(/^"|"$/g, '') : lastRaw;
+        }
+        return { ok: true, action, sessionId, result: finalText, executionTime: Date.now() - start };
       }
-      // Timeout — page never stabilized (e.g. YouTube infinite scroll, live feeds).
-      // Return whatever we last captured so the user gets real content instead of nothing.
-      let finalText = prev;
-      if (!finalText) {
-        const lastRes = await cliRun([...S, 'eval', 'document.body.innerText.slice(0,50000)'], 8000);
-        const lastRaw = (lastRes.stdout || '').trim();
-        const lastMatch = lastRaw.match(/###\s*Result\s*\n([\s\S]*?)(?=###|$)/i);
-        finalText = lastMatch ? lastMatch[1].trim().replace(/^"|"$/g, '') : lastRaw;
-      }
-      return { ok: true, action, sessionId, result: finalText, executionTime: Date.now() - start };
     }
 
     // ── waitForAuth ───────────────────────────────────────────────────────────
@@ -2766,6 +3471,18 @@ Respond ONLY with valid JSON:
     // ── Chrome Crash Detection ─────────────────────────────────────────────────
     case 'detectCrash': {
       return await handleDetectCrash(sessionId, args.step || {}, args.error || 'Chrome crash detected');
+    }
+
+    // ── Session Recovery ───────────────────────────────────────────────────────
+    case 'recoverSession': {
+      const recovery = await recoverFromAboutBlank(sessionId, args.url || 'https://mail.google.com');
+      return {
+        ok: recovery.recovered,
+        action,
+        sessionId,
+        result: recovery.method || recovery.error,
+        executionTime: Date.now() - start
+      };
     }
 
     

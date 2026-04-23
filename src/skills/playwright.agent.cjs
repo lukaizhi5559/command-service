@@ -72,8 +72,7 @@ const BROWSER_ACTIONS_FULL = `Available actions:
   find-label      { label, findAction, value? }       — find by label text; findAction is "click"|"fill"
   find-text       { text }                            — click the first visible element containing this text
   wait            { ms }                              — pause execution for up to 5000ms (use sparingly)
-  waitForSelector { selector }
-  waitForContent  { text }
+  // REMOVED: waitForSelector, waitForContent - not available in playwright-cli, implemented as compatibility layers in browser.act.cjs
   getPageText     {}                   — returns ALL visible text from the page (body.innerText, up to 50k chars). Use this as the universal, site-agnostic way to read any page. Works on ChatGPT, Perplexity, Claude, Grok, and any other site without knowing site-specific CSS. Result auto-captured as task output.
   evaluate        { text: "<JS expression>" }  — single-expression JS returning a primitive (e.g. document.title)
   run-code        { code: "async page => { return await page.evaluate(() => { ...browser JS... }); }" }
@@ -85,6 +84,7 @@ const BROWSER_ACTIONS_FULL = `Available actions:
   screenshot      { filePath }
   snapshot        {}                   — re-read the page (ONLY when page changes significantly)
   upload          { selector, files }  — attach file(s): clicks selector to open chooser, then uses playwright-cli upload command. selector = button/input ref; files = array of real absolute paths from the task/request. IMPORTANT: always use "files" (array), NEVER use "path". NEVER invent placeholders like /path/to/file.pdf.
+  pasteAttachment { selector? }        — PREFERRED for Gmail/chat attachments. Assumes the file is already on the clipboard (a prior shell.run osascript step put it there). Finds the compose body textbox, focuses it, and presses Meta+V (macOS) / Ctrl+V (else). DO NOT click the paperclip/Attach button before this — the native file chooser modal blocks keyboard events. Optional selector pins the body ref if auto-detection picks the wrong textbox.
   return          { data: "<string>" } — MUST be LAST step; plain string output, max 2000 chars.
   dialog-accept   { prompt? }
   dialog-dismiss  {}`;
@@ -115,9 +115,16 @@ CORRECT:  { "action": "navigate", "url": "https://mail.google.com/mail/u/0/#inbo
 CORRECT:  { "action": "click", "selector": "e24" }  — MUST use "selector", NEVER "ref" or "element"
 CORRECT:  { "action": "fill", "selector": "e12", "text": "user@example.com" }
 CORRECT:  { "action": "press", "key": "Escape" }
+CORRECT:  { "action": "click", "selector": "e24", "expected": { "type": "element_visible", "selector": "#search-results", "timeout": 5000, "description": "Search results should appear" } }
 WRONG:    { "navigate": { "url": "..." } }
 WRONG:    { "click": "Compose" }
-WRONG:    { "action": "click", "ref": "e24" }        — "ref" is NOT a valid field`;
+WRONG:    { "action": "click", "ref": "e24" }        — "ref" is NOT a valid field
+
+EXPECTATION FIELD (optional but recommended for critical steps):
+- "expected": { "type": "element_visible|element_gone|url_change|text_present", "selector": "CSS selector or @eXX ref", "timeout": 5000, "description": "What should happen" }
+- Types: element_visible (element appears), element_gone (element disappears), url_change (URL matches pattern), text_present (text appears on page)
+- Use expectations for important actions to ensure they worked before continuing
+- Examples: clicking "Search" should make results visible, clicking "Send" should make compose window disappear`;
 
 // ---------------------------------------------------------------------------
 // Phase 1 prompt — sent once, LLM returns the full step plan
@@ -186,7 +193,9 @@ Rules:
 - MODAL/OVERLAY RULE: When clicking a button that opens a modal or overlay (Compose, New, Reply, etc.), add { "action": "snapshot" } as the very next step. This forces a DOM re-read so all following steps use fresh refs from the new modal. Without this, refs from the original page will fail inside the modal.
 - AI CHAT EXTRACTION RULE: When sending a message to an AI assistant (ChatGPT, Claude, Grok, Perplexity, etc.), after pressing Enter add: (1) { "action": "waitForStableText" } to wait for the streamed response to finish, (2) { "action": "getPageText" } to read all visible page text. This is the UNIVERSAL, site-agnostic approach — works on any AI chat site without CSS class knowledge. NEVER use run-code + page.evaluate() with site-specific CSS selectors (like .prose, .generic, [data-testid=...]) for AI chat extraction — these selectors break across sites and page updates. Do NOT add a return step — the getPageText result is automatically captured as task output and will be consumed by the synthesis step downstream.
 - SESSION ISOLATION RULE: When accessing an AI chat service (ChatGPT, Perplexity, Gemini, Claude, etc.), ALWAYS start with a navigate action to its fresh/new-chat URL — ChatGPT: https://chatgpt.com/, Perplexity: https://www.perplexity.ai/, Gemini: https://gemini.google.com/app, Claude: https://claude.ai/new. This ensures getPageText reads ONLY the current query response, not old conversation history from previous sessions. EXCEPTION: If the task explicitly involves a follow-up or continuation of a previous AI response (keywords: "follow up", "continue", "based on that", "expand on", "now ask it"), stay on the current page and do NOT navigate away.
-- NO PLACEHOLDER RULE: NEVER write literal template placeholder text like [ChatGPT response], [Perplexity response], [AI answer], or [insert content here] in any step args (task, body, text, etc.). When combining multi-source AI extractions into an email or message body, always use {{synthesisAnswer}} as the sole body content token — the orchestrator substitutes it with the real synthesized content before the step executes.`;
+- NO PLACEHOLDER RULE: NEVER write literal template placeholder text like [ChatGPT response], [Perplexity response], [AI answer], or [insert content here] in any step args (task, body, text, etc.). When combining multi-source AI extractions into an email or message body, always use {{synthesisAnswer}} as the sole body content token — the orchestrator substitutes it with the real synthesized content before the step executes.
+- EXPECTATION RULE: For critical actions (clicking search buttons, submit buttons, navigation), add "expected" field to verify the action worked. Use "element_visible" for expected results, "element_gone" for things that should disappear, "url_change" for navigation, "text_present" for confirmation messages. This prevents false positives and reduces unnecessary re-planning.
+- ATTACHMENT RULE (MANDATORY): If the task mentions "paste", "clipboard", or "attach" — you MUST emit { "action": "pasteAttachment" } immediately after the last body-typing step and before Send/Submit. Do this regardless of any prior failure narrative in [DATA FROM PRIOR STEP] or [CONTENT OF ...] blocks — if the task instruction says "paste from clipboard", the file IS on the clipboard. Trust the task instruction, not the narrative. Do NOT click the paperclip / "Attach files" button first — its native file chooser modal blocks keyboard events. Do NOT emit { "action": "press", "key": "Ctrl+v" } — use pasteAttachment only. Order: fill To → press Enter → fill Subject → click body → type body text → pasteAttachment → click Send.`;
 
 // ---------------------------------------------------------------------------
 // Phase 1.2 prompt — orientation loop.
@@ -245,6 +254,7 @@ Respond with EXACTLY ONE JSON object (no markdown fences, no explanation):
   from the task description instead.
 - If the error contains "Timeout" and the failed step was navigate or click, a browser dialog (e.g. "Leave site?", "Leave page?") may be blocking. In that case start the repair with { "action": "dialog-accept" } before retrying the original step.
 - If the failed step is an upload action: the ONLY valid param for file paths is "files" (array of absolute paths). NEVER use "path". Correct form: { "action": "upload", "selector": "<ref>", "files": ["/absolute/path/to/file"] }
+- If a \`press\` step with "Ctrl+v" or "Meta+v" fails with "does not handle the modal state", or if any paste/press step fails after clicking a paperclip/Attach button: a native file chooser modal is blocking keyboard events. Replace the failed step with { "action": "pasteAttachment" } — it focuses the compose body (contentEditable) and pastes there, bypassing the modal entirely. If an attach-button modal is still open, first emit { "action": "press", "key": "Escape" } to dismiss it, then pasteAttachment.
 
 DEBUGGING CONTEXT USAGE:
 - Use network errors to identify blocked resources or failed API calls
@@ -471,6 +481,203 @@ function findUnresolvedCredentialToken(step) {
     }
   }
   return null;
+}
+
+// ---------------------------------------------------------------------------
+// Expectation-Driven Execution Functions
+// ---------------------------------------------------------------------------
+
+// Verify that an action achieved its expected outcome
+async function verifyExpectation(step, sessionId, headed, timeoutMs) {
+  if (!step.expected) {
+    return { satisfied: true, reason: 'No expectation defined' };
+  }
+
+  const { type, selector, timeout = 5000 } = step.expected;
+  const startTime = Date.now();
+
+  try {
+    switch (type) {
+      case 'element_visible':
+        const visibleResult = await browserAct({ 
+          action: 'waitForSelector', 
+          selector, 
+          sessionId, 
+          headed, 
+          timeoutMs: Math.min(timeout, timeoutMs) 
+        });
+        return { 
+          satisfied: visibleResult.ok, 
+          reason: visibleResult.ok ? 'Element visible' : visibleResult.error 
+        };
+
+      case 'element_gone':
+        const goneResult = await browserAct({ 
+          action: 'evaluate', 
+          text: `!document.querySelector('${selector}')`, 
+          sessionId, 
+          headed, 
+          timeoutMs: Math.min(timeout, timeoutMs) 
+        });
+        return { 
+          satisfied: goneResult.ok && goneResult.result === 'true', 
+          reason: goneResult.ok && goneResult.result === 'true' ? 'Element gone' : 'Element still present' 
+        };
+
+      case 'url_change':
+        const urlResult = await browserAct({ 
+          action: 'evaluate', 
+          text: 'window.location.href', 
+          sessionId, 
+          headed, 
+          timeoutMs: 3000 
+        });
+        if (urlResult.ok && selector) {
+          const urlMatches = new RegExp(selector).test(urlResult.result);
+          return { satisfied: urlMatches, reason: urlMatches ? 'URL matches pattern' : 'URL does not match pattern' };
+        }
+        return { satisfied: false, reason: 'Failed to check URL' };
+
+      case 'text_present':
+        const textResult = await browserAct({ 
+          action: 'evaluate', 
+          text: `document.body.innerText.includes('${selector.replace(/'/g, "\\'")}')`, 
+          sessionId, 
+          headed, 
+          timeoutMs: 3000 
+        });
+        return { 
+          satisfied: textResult.ok && textResult.result === 'true', 
+          reason: textResult.ok && textResult.result === 'true' ? 'Text present' : 'Text not found' 
+        };
+
+      default:
+        return { satisfied: true, reason: `Unknown expectation type: ${type}, assuming satisfied` };
+    }
+  } catch (error) {
+    return { satisfied: false, reason: `Expectation verification failed: ${error.message}` };
+  } finally {
+    logger.debug(`[playwright.agent] Expectation verification for ${type} took ${Date.now() - startTime}ms`);
+  }
+}
+
+// Tier 1: Safe pattern recognition (no URL patterns for login)
+function handleKnownFailures(step, currentState, snapshot) {
+  // Network-based error detection (from playwright-cli network command)
+  // Note: This would need to be implemented by calling browserAct with 'network' action
+  // For now, we'll focus on content-based detection
+  
+  // Error page detection (content analysis - reliable)
+  if (hasErrorElements(snapshot)) {
+    return { cause: 'error_page', action: 'retry' };
+  }
+  
+  // Loading state detection (reliable indicators)
+  if (hasLoadingSpinner(snapshot) || hasSkeletonLoader(snapshot)) {
+    return { cause: 'still_loading', action: 'wait' };
+  }
+  
+  // AVOID: URL pattern matching for login (too many false positives/negatives)
+  // Login detection handled in Tier 2 with element-based checks
+  
+  return null; // Unknown - proceed to Tier 2
+}
+
+// Tier 2: Element-based logic (reliable login detection)
+function handleElementBasedFailures(step, snapshot) {
+  // Login form detection (ONLY with concrete evidence - no URL patterns)
+  if (!step.action.includes('login') && hasPasswordFields(snapshot) && hasLoginButton(snapshot)) {
+    return { cause: 'login_wall', action: 'auth' };
+  }
+  
+  // Modal/popup detection
+  if (hasModalOverlay(snapshot) && !step.action.includes('modal')) {
+    return { cause: 'modal_blocking', action: 'handle_modal' };
+  }
+  
+  // Expected content missing
+  if (step.expected && !elementExists(snapshot, step.expected.selector)) {
+    return { cause: 'expected_missing', action: 'investigate' };
+  }
+  
+  return null; // Unknown - proceed to Tier 3
+}
+
+// RELIABLE login detection - requires multiple signals
+function hasPasswordFields(snapshot) {
+  if (!snapshot) return false;
+  return snapshot.includes('type="password"') || snapshot.includes('name="password"');
+}
+
+function hasLoginButton(snapshot) {
+  if (!snapshot) return false;
+  const t = snapshot.toLowerCase();
+  return t.includes('login') || t.includes('signin') || 
+         t.includes('sign in') || t.includes('log in');
+}
+
+function hasErrorElements(snapshot) {
+  if (!snapshot) return false;
+  const t = snapshot.toLowerCase();
+  return t.includes('error') || t.includes('404') || t.includes('500') || 
+         t.includes('page not found') || t.includes('something went wrong');
+}
+
+function hasLoadingSpinner(snapshot) {
+  if (!snapshot) return false;
+  const t = snapshot.toLowerCase();
+  return t.includes('loading') || t.includes('spinner') || t.includes('loading...') ||
+         t.includes('please wait') || t.includes('processing');
+}
+
+function hasSkeletonLoader(snapshot) {
+  if (!snapshot) return false;
+  const t = snapshot.toLowerCase();
+  return t.includes('skeleton') || (t.includes('placeholder') && t.includes('loading'));
+}
+
+function hasModalOverlay(snapshot) {
+  if (!snapshot) return false;
+  const t = snapshot.toLowerCase();
+  return t.includes('modal') || t.includes('dialog') || t.includes('overlay') ||
+         t.includes('popup') || t.includes('lightbox');
+}
+
+function elementExists(snapshot, selector) {
+  if (!snapshot || !selector) return false;
+  // Simple check - in a full implementation, this would be more sophisticated
+  return snapshot.includes(selector) || snapshot.includes(`"${selector}"`);
+}
+
+// Tier 3: LLM analysis (rare, last resort)
+async function handleUnknownFailure(step, snapshot, error) {
+  logger.info(`[playwright.agent] Tier 3: Using LLM to analyze unknown failure`);
+  
+  try {
+    const analysis = await askWithMessages([
+      { role: 'system', content: 'You are a browser automation expert analyzing failures. Respond with JSON only.' },
+      { role: 'user', content: `
+Action taken: ${JSON.stringify(step)}
+Expected: ${JSON.stringify(step.expected || {})}
+Actual error: ${error.message || 'No error message'}
+Current state: ${extractInteractiveRefs(snapshot || '')}
+
+What happened and what should I do next?
+Respond with: {"cause": "...", "action": "...", "reason": "..."}
+` }
+    ], { temperature: 0.1, maxTokens: 300, responseTimeoutMs: 15000 });
+    
+    const parsed = parseJson(analysis);
+    if (parsed && parsed.cause && parsed.action) {
+      logger.info(`[playwright.agent] LLM analysis: ${parsed.cause} -> ${parsed.action} (${parsed.reason})`);
+      return parsed;
+    }
+  } catch (llmError) {
+    logger.warn(`[playwright.agent] LLM analysis failed: ${llmError.message}`);
+  }
+  
+  // Fallback: generic retry
+  return { cause: 'unknown_failure', action: 'retry', reason: 'Unknown failure, will retry' };
 }
 
 // ---------------------------------------------------------------------------
@@ -786,6 +993,31 @@ async function playwrightAgent(args) {
     return { ok: false, goal, sessionId, turns: 0, done: false, result: planParsed.thoughts || 'LLM returned empty plan', transcript: [], error: planParsed.thoughts, executionTime: Date.now() - start };
   }
 
+  // ── Post-plan attachment guard ────────────────────────────────────────────
+  // If the task mentions paste/clipboard/attach but the generated plan has no
+  // pasteAttachment step, auto-inject it after the last type/fill (body) step
+  // and before the final click (Send). This is a hard structural guarantee —
+  // LLM hallucination or contradictory task narratives cannot bypass it.
+  {
+    const _mentionsAttach = /paste|clipboard|attach/i.test(goal);
+    if (_mentionsAttach) {
+      const _hasPaste = plan.some(s => s.action === 'pasteAttachment');
+      if (!_hasPaste) {
+        let _lastTypeIdx = -1;
+        for (let _i = plan.length - 1; _i >= 0; _i--) {
+          if (plan[_i].action === 'type' || plan[_i].action === 'fill') {
+            _lastTypeIdx = _i;
+            break;
+          }
+        }
+        if (_lastTypeIdx >= 0) {
+          plan.splice(_lastTypeIdx + 1, 0, { action: 'pasteAttachment' });
+          logger.info('[playwright.agent] attachment guard: injected pasteAttachment after body type/fill step');
+        }
+      }
+    }
+  }
+
   // ── Phase 3: Execute plan ──────────────────────────────────────────────────
   logger.info(`[playwright.agent] phase 3: executing ${plan.length} steps`);
   let stepIndex  = 0;
@@ -809,7 +1041,7 @@ async function playwrightAgent(args) {
   ]);
 
   while (stepIndex < plan.length) {
-    const step = normalizeStep(plan[stepIndex]);
+    let step = normalizeStep(plan[stepIndex]);
 
     // Inline return step — LLM returns extracted data as the final result
     if (step.action === 'return') {
@@ -992,6 +1224,27 @@ async function playwrightAgent(args) {
         await new Promise(r => setTimeout(r, 600));
         outcome = { ok: true, action: 'fill', sessionId, result: 'recipient entered via click+type+Tab' };
       } else {
+        // ── Platform-correct clipboard shortcut scrubber ───────────────────
+        // LLMs routinely emit { action: 'press', key: 'Ctrl+v' } on macOS.
+        // On macOS, paste is Meta+V (⌘V) — Ctrl+v does nothing. Auto-rewrite
+        // so we don't silently fail and burn a repair cycle. Mirror the
+        // rewrite for non-macOS in case a plan emits Cmd+* / Meta+*.
+        if (step.action === 'press' && typeof step.key === 'string') {
+          const k = step.key.trim();
+          if (process.platform === 'darwin') {
+            const fixed = k.replace(/^(Ctrl|Control)\+/i, 'Meta+');
+            if (fixed !== k) {
+              logger.info(`[playwright.agent] scrubbing clipboard shortcut on macOS: "${k}" → "${fixed}"`);
+              step = { ...step, key: fixed };
+            }
+          } else {
+            const fixed = k.replace(/^(Meta|Cmd|Command)\+/i, 'Control+');
+            if (fixed !== k) {
+              logger.info(`[playwright.agent] scrubbing clipboard shortcut on ${process.platform}: "${k}" → "${fixed}"`);
+              step = { ...step, key: fixed };
+            }
+          }
+        }
         outcome = await browserAct({ ...step, sessionId, headed, timeoutMs });
       }
     } catch (err) {
@@ -1085,119 +1338,90 @@ async function playwrightAgent(args) {
       // (recipient chip confirmation handled pre-emptively in the
       //  mail recipient fill interceptor above via click+type+Tab)
 
-      // ── Auto re-snapshot after DOM-mutating actions ──────────────────────
-      // Keeps snapshotCache live so subsequent fill/click use fresh refs.
-      // If ≥30% of refs changed (modal opened, page navigated, etc.) also
-      // fire one targeted LLM call to re-plan the remaining steps.
-      if (isDomMutating) {
+      // ── Expectation-Driven Execution: Verify action achieved expected outcome ─────
+      // Instead of blind DOM change detection, we verify that the action achieved its goal
+      if (step.expected || isDomMutating) {
+        // Take a fresh snapshot after the action
         const postSnap = await browserAct({ action: 'snapshot', sessionId, headed, timeoutMs });
         if (postSnap.ok && postSnap.result) {
           currentSnapshot = postSnap.result;
-          const postRefCount   = countRefs(currentSnapshot);
-          const maxRefs        = Math.max(preRefCount, postRefCount, 1);
-          const changeFraction = Math.abs(postRefCount - preRefCount) / maxRefs;
-          const absoluteDelta  = postRefCount - preRefCount;
-          logger.info(`[playwright.agent] auto-resnapshot after ${step.action}: refs ${preRefCount}→${postRefCount} (${(changeFraction * 100).toFixed(0)}% change, +${absoluteDelta} absolute)`);
+        }
 
-          const remaining = plan.slice(stepIndex + 1);
-          // Trigger re-plan if:
-          //   navigate/goto: ANY ref change (even 1) — SPAs always invalidate refs on navigate,
-          //     so a plan using e178 from a pre-navigate snapshot will fail (Ref not found).
-          //   other actions: ≥30% change OR ≥20 new absolute refs (modal opened, inbox load, etc.)
-          const isNavStep = step.action === 'navigate' || step.action === 'goto';
-          const significantChange = isNavStep
-            ? (preRefCount > 0 || postRefCount > 0) && (changeFraction > 0 || absoluteDelta !== 0)
-            : (changeFraction >= 0.15 || absoluteDelta >= 10) && (preRefCount > 0 || postRefCount > 0);
-
-          if (significantChange && remaining.length > 0) {
-            // If the snapshot captured only a skeleton (<20 refs), the page is still loading.
-            // Wait for it to stabilise before handing the tiny snapshot to the re-plan LLM —
-            // a 12-ref snapshot produces a bad plan (e.g. picks a nav link instead of the
-            // chat input). The threshold of 20 covers typical SPA loading states.
-            if (postRefCount < 10) {
-              logger.info(`[playwright.agent] post-nav snapshot too small (${postRefCount} refs) — waiting for page to stabilise`);
-              const stableSnap = await browserAct({ action: 'waitForStableText', sessionId, headed, timeoutMs: 12000 });
-              if (stableSnap?.aboutBlankDetected) {
-                logger.warn(`[playwright.agent] waitForStableText reported about:blank — triggering Chrome crash detection`);
-                
-                // Trigger Chrome crash detection and capture debugging context
-                const crashInfo = await browserAct({ 
-                  action: 'detectCrash', 
-                  sessionId, 
-                  headed, 
-                  timeoutMs: 3000,
-                  step: { action: 'waitForStableText' },
-                  error: 'Chrome crash detected during page stabilization'
-                }).catch(() => ({ ok: false, error: 'Crash detection failed' }));
-                
-                return {
-                  ok: false, goal, sessionId,
-                  turns: transcript.length, done: false,
-                  chromeCrash: true,
-                  result: `Chrome browser crashed during page stabilization - page became about:blank`,
-                  transcript, 
-                  executionTime: Date.now() - start,
-                  debugContext: crashInfo.debugContext
-                };
-              }
-              const reSnap = await browserAct({ action: 'snapshot', sessionId, headed, timeoutMs });
-              if (reSnap.ok && reSnap.result) {
-                currentSnapshot = reSnap.result;
-                logger.info(`[playwright.agent] re-snaphotted after stabilise: ${countRefs(currentSnapshot)} refs`);
-              }
+        // Verify expectation if defined
+        if (step.expected) {
+          const expectationResult = await verifyExpectation(step, sessionId, headed, timeoutMs);
+          
+          if (!expectationResult.satisfied) {
+            logger.warn(`[playwright.agent] Expectation failed for ${step.action}: ${expectationResult.reason}`);
+            
+            // Apply tiered failure handling
+            const tier1Result = handleKnownFailures(step, {}, currentSnapshot);
+            let failureAnalysis = tier1Result;
+            
+            if (!failureAnalysis) {
+              const tier2Result = handleElementBasedFailures(step, currentSnapshot);
+              failureAnalysis = tier2Result;
             }
-
-            if (isAboutBlankSnapshot(currentSnapshot) || countRefs(currentSnapshot) === 0) {
-              logger.warn(`[playwright.agent] REPLAN blocked: empty/about:blank snapshot (${countRefs(currentSnapshot)} refs) after ${step.action}`);
-              return {
-                ok: false, goal, sessionId,
-                turns: transcript.length, done: false,
-                sessionRecoverNeeded: true,
-                result: `Page became empty/about:blank after ${step.action} — session recovery required`,
-                transcript, executionTime: Date.now() - start,
-              };
+            
+            if (!failureAnalysis) {
+              failureAnalysis = await handleUnknownFailure(step, currentSnapshot, { message: expectationResult.reason });
             }
-            logger.info(`[playwright.agent] structural DOM change — re-planning ${remaining.length} remaining step(s) with fresh refs`);
-
-            // ── Login-wall interceptor: never let the LLM plan against a login page ──
-            // If the fresh snapshot contains an OAuth provider button ("Continue with
-            // Google / Apple / Microsoft"), this is definitely a login wall — escalate to
-            // browser.agent's waitForAuth immediately instead of asking the LLM to
-            // fill the email field (the LLM always does this and it is always wrong).
-            if (looksLikeLoginWallSnapshot(currentSnapshot)) {
-              logger.warn(`[playwright.agent] REPLAN blocked: login page detected in snapshot — returning loginWallDetected immediately`);
+            
+            // Handle the failure based on analysis
+            if (failureAnalysis.cause === 'login_wall') {
+              logger.warn(`[playwright.agent] Login wall detected via expectation failure — escalating to waitForAuth`);
               return {
                 ok: false, goal, sessionId,
                 turns: transcript.length, done: false,
                 loginWallDetected: true,
-                result: 'Login page detected during navigation — escalating to waitForAuth',
+                result: 'Login wall detected during expectation verification — escalating to waitForAuth',
                 transcript, executionTime: Date.now() - start,
               };
-            }
-
-            try {
-              const replanRaw = await askWithMessages([
-                { role: 'system', content: REPLAN_SYSTEM_PROMPT },
-                { role: 'user', content: [
-                  `GOAL: ${goal}`,
-                  `COMPLETED_STEPS: ${JSON.stringify(plan.slice(0, stepIndex + 1))}`,
-                  `STALE_REMAINING_PLAN: ${JSON.stringify(remaining)}`,
-                  ``,
-                  `FRESH_SNAPSHOT (interactive elements only — full ${countRefs(currentSnapshot)}-ref page):`,
-                  extractInteractiveRefs(currentSnapshot),
-                  learnedRulesBlock,
-                ].join('\n') },
-              ], { temperature: 0.1, maxTokens: 1024, responseTimeoutMs: 20000 });
-              const replanParsed = parseJson(replanRaw);
-              if (replanParsed && Array.isArray(replanParsed.plan) && replanParsed.plan.length > 0) {
-                logger.info(`[playwright.agent] re-plan: ${replanParsed.plan.length} fresh steps — ${replanParsed.thoughts || ''}`);
-                plan = [...plan.slice(0, stepIndex + 1), ...replanParsed.plan];
+            } else if (failureAnalysis.cause === 'still_loading') {
+              logger.info(`[playwright.agent] Page still loading — waiting and retrying expectation`);
+              await new Promise(resolve => setTimeout(resolve, 2000)); // Wait 2 seconds
+              
+              // Retry expectation verification
+              const retryResult = await verifyExpectation(step, sessionId, headed, timeoutMs);
+              if (retryResult.satisfied) {
+                logger.info(`[playwright.agent] Expectation satisfied after wait`);
               } else {
-                logger.warn(`[playwright.agent] re-plan response unparseable or empty — continuing with stale plan`);
+                logger.warn(`[playwright.agent] Expectation still failed after wait: ${retryResult.reason}`);
+                // Continue with the step but mark as having issues
+                outcome.warning = `Expectation not fully satisfied: ${retryResult.reason}`;
               }
-            } catch (replanErr) {
-              logger.warn(`[playwright.agent] re-plan LLM error: ${replanErr.message} — continuing with stale plan`);
+            } else if (failureAnalysis.cause === 'error_page' || failureAnalysis.cause === 'server_error') {
+              if (totalRepairs < maxRepairs) {
+                totalRepairs++;
+                logger.warn(`[playwright.agent] ${failureAnalysis.cause} detected — attempting repair ${totalRepairs}/${maxRepairs}`);
+                // Trigger repair logic similar to existing error handling
+                outcome = { ok: false, error: `${failureAnalysis.cause}: ${expectationResult.reason}` };
+              } else {
+                logger.warn(`[playwright.agent] Repair budget exhausted for ${failureAnalysis.cause}`);
+                outcome.warning = `Possible ${failureAnalysis.cause}: ${expectationResult.reason}`;
+              }
+            } else {
+              logger.info(`[playwright.agent] Unknown failure handled: ${failureAnalysis.reason}`);
+              outcome.warning = `Unexpected issue: ${failureAnalysis.reason}`;
             }
+          } else {
+            logger.info(`[playwright.agent] Expectation satisfied for ${step.action}: ${expectationResult.reason}`);
+          }
+        }
+        
+        // For DOM-mutating actions without explicit expectations, check for login walls only
+        // (removed the aggressive DOM percentage thresholds)
+        if (isDomMutating && !step.expected) {
+          // Only check for login walls using reliable element-based detection
+          if (hasPasswordFields(currentSnapshot) && hasLoginButton(currentSnapshot)) {
+            logger.warn(`[playwright.agent] Login wall detected after DOM-mutating action — escalating to waitForAuth`);
+            return {
+              ok: false, goal, sessionId,
+              turns: transcript.length, done: false,
+              loginWallDetected: true,
+              result: 'Login wall detected after DOM-mutating action — escalating to waitForAuth',
+              transcript, executionTime: Date.now() - start,
+            };
           }
         }
       }
@@ -1234,6 +1458,36 @@ async function playwrightAgent(args) {
 
     totalRepairs++;
     logger.info(`[playwright.agent] step ${stepIndex + 1} failed — repair ${totalRepairs}/${maxRepairs}: ${outcome.error}`);
+
+    // ── Fast-path: clipboard-paste failed because of a native file-chooser modal.
+    // Known signature: step is `press` with Ctrl+v / Meta+v, and the error (or
+    // outcome.result) contains "does not handle the modal state". Skip the repair
+    // LLM entirely — the correct fix is always the same: Escape to dismiss the
+    // modal, then pasteAttachment which focuses the compose body and pastes there.
+    {
+      const _errText = `${outcome.error || ''} ${outcome.result || ''} ${outcome.stdout || ''}`;
+      const _isClipboardPress =
+        step.action === 'press' &&
+        typeof step.key === 'string' &&
+        /^(Meta|Ctrl|Control|Cmd|Command)\+v$/i.test(step.key.trim());
+      const _isModalStateErr = /does not handle the modal state/i.test(_errText);
+      if (_isClipboardPress && _isModalStateErr) {
+        logger.info(`[playwright.agent] fast-path repair: modal-state on clipboard press → Escape + pasteAttachment`);
+        // Inject the deterministic repair: dismiss the file chooser, then paste into body.
+        const fastRepair = [
+          { action: 'press', key: 'Escape' },
+          { action: 'pasteAttachment' },
+        ];
+        plan.splice(stepIndex, 1, ...fastRepair);
+        // Save the learned rule so future plans avoid the anti-pattern.
+        try {
+          const ruleText = `Attachments: use { "action": "pasteAttachment" } on the already-filled compose body — never press Ctrl+v / Meta+v after clicking the Attach/paperclip button (its native file chooser blocks keys).`;
+          await skillDb.setContextRule(agentId, ruleText, 'agent').catch(() => {});
+          logger.info(`[playwright.agent] learned rule saved for ${agentId}: "${ruleText.slice(0, 80)}..."`);
+        } catch (_) { /* non-fatal */ }
+        continue; // re-enter loop with injected steps at same index
+      }
+    }
 
     // Dismiss any pending browser dialog (e.g. "Leave site?") that may be blocking the
     // session before we snapshot — otherwise the snapshot sees a dialog-blocked page and
