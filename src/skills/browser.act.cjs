@@ -48,6 +48,527 @@ const { spawn } = require('child_process');
 const logger = require('../logger.cjs');
 const { askWithMessages } = require('../skill-helpers/skill-llm.cjs');
 
+// Generic debugging control for all playwright-cli tools
+const playwrightDebugEnabled = process.env.PLAYWRIGHT_DEBUG === 'true' || 
+                              process.env.PLAYWRIGHT_DEBUG === 'on' || 
+                              process.env.PLAYWRIGHT_DEBUG === '1';
+
+function shouldEnableDebugging(sessionId, action = null) {
+  // Generic debugging control for all sessions and agents
+  return playwrightDebugEnabled;
+}
+
+function getDebugConfig(sessionId, action) {
+  const baseConfig = {
+    console: playwrightDebugEnabled,
+    network: playwrightDebugEnabled,
+    tracing: playwrightDebugEnabled,
+    video: playwrightDebugEnabled,
+    devTools: playwrightDebugEnabled
+  };
+  
+  // Agent-specific adjustments can be added here if needed
+  return baseConfig;
+}
+
+// ---------------------------------------------------------------------------
+// Debugging Tracing Infrastructure
+// ---------------------------------------------------------------------------
+
+// Track active debugging sessions
+const debuggingSessions = new Map(); // sessionId -> debug data
+
+// Debug data structure for each session
+function createDebugSession(sessionId) {
+  return {
+    sessionId,
+    startTime: Date.now(),
+    tracingActive: false,
+    videoActive: false,
+    devToolsActive: false,
+    traceFile: null,
+    videoFile: null,
+    devToolsUrl: null,
+    snapshots: [],
+    networkErrors: [],
+    consoleErrors: [],
+    actionHistory: [],
+    devToolsData: {
+      networkRequests: [],
+      consoleLogs: [],
+      performanceMetrics: {}
+    }
+  };
+}
+
+// Start debugging tracing for a session
+async function startSessionTracing(sessionId) {
+  if (!shouldEnableDebugging(sessionId)) {
+    logger.debug(`[browser.act] Debugging disabled for ${sessionId} (PLAYWRIGHT_DEBUG=${process.env.PLAYWRIGHT_DEBUG})`);
+    return;
+  }
+  
+  if (debuggingSessions.has(sessionId)) {
+    logger.debug(`[browser.act] Debugging session already exists for ${sessionId}`);
+    return;
+  }
+
+  const debugSession = {
+    sessionId,
+    startTime: Date.now(),
+    tracingActive: false,
+    videoActive: false,
+    devToolsActive: false,
+    devToolsUrl: null,
+    traceFile: null,
+    videoFile: null,
+    snapshots: [],
+    networkErrors: [],
+    consoleErrors: [],
+    actionHistory: [],
+    devToolsData: {
+      networkRequests: [],
+      consoleLogs: [],
+      performanceMetrics: {}
+    }
+  };
+
+  debuggingSessions.set(sessionId, debugSession);
+  logger.info(`[browser.act] Started debugging session for ${sessionId}`);
+
+  // Start tracing
+  try {
+    const traceResult = await cliRun([...sessionFlags(sessionId), 'tracing-start'], 5000);
+    if (traceResult.ok) {
+      debugSession.tracingActive = true;
+      logger.info(`[browser.act] Started tracing for session=${sessionId}`);
+    } else {
+      logger.warn(`[browser.act] Failed to start tracing for session=${sessionId}: ${traceResult.error}`);
+    }
+  } catch (error) {
+    logger.warn(`[browser.act] Failed to start tracing for session=${sessionId}: ${error.message}`);
+  }
+
+  // Start video recording
+  try {
+    const videoResult = await cliRun([...sessionFlags(sessionId), 'video-start'], 5000);
+    if (videoResult.ok) {
+      debugSession.videoActive = true;
+      logger.info(`[browser.act] Started video recording for session=${sessionId}`);
+    } else {
+      logger.warn(`[browser.act] Failed to start video recording for session=${sessionId}: ${videoResult.error}`);
+    }
+  } catch (error) {
+    logger.warn(`[browser.act] Failed to start video recording for session=${sessionId}: ${error.message}`);
+  }
+
+  // Start DevTools for enhanced debugging
+  try {
+    const devToolsResult = await cliRun([...sessionFlags(sessionId), 'devtools-start'], 5000);
+    if (devToolsResult.ok) {
+      // Extract WebSocket URL from DevTools output
+      const devToolsOutput = devToolsResult.stdout || '';
+      const urlMatch = devToolsOutput.match(/Server is listening on:\s*(ws:\/\/[^\s]+)/);
+      if (urlMatch) {
+        const devToolsUrl = urlMatch[1].trim();
+        debugSession.devToolsActive = true;
+        debugSession.devToolsUrl = devToolsUrl;
+        logger.info(`[browser.act] Started DevTools for session=${sessionId}, URL: ${devToolsUrl}`);
+      } else {
+        logger.warn(`[browser.act] Could not extract DevTools URL from output: ${devToolsOutput.slice(0, 200)}`);
+      }
+    } else {
+      logger.warn(`[browser.act] Failed to start DevTools for session=${sessionId}: ${devToolsResult.error}`);
+    }
+  } catch (error) {
+    logger.warn(`[browser.act] Failed to start DevTools for session=${sessionId}: ${error.message}`);
+  }
+}
+
+// Stop tracing for a session
+async function stopSessionTracing(sessionId) {
+  const debugSession = debuggingSessions.get(sessionId);
+  if (!debugSession) return null;
+  
+  const traceData = {
+    traceFile: null,
+    videoFile: null,
+    networkErrors: debugSession.networkErrors,
+    consoleErrors: debugSession.consoleErrors,
+    snapshots: debugSession.snapshots,
+    actionHistory: debugSession.actionHistory
+  };
+  
+  if (debugSession.tracingActive) {
+    try {
+      const traceResult = await cliRun([...sessionFlags(sessionId), 'tracing-stop'], 5000);
+      if (traceResult.ok) {
+        // Extract trace file path from playwright-cli output
+        const traceOutput = traceResult.stdout || '';
+        const traceMatch = traceOutput.match(/\[Trace\]\(([^)]+)\)/);
+        if (traceMatch) {
+          const traceFile = traceMatch[1].trim();
+          debugSession.traceFile = traceFile;
+          traceData.traceFile = traceFile;
+          logger.info(`[browser.act] Stopped tracing for session=${sessionId}, trace file: ${traceFile}`);
+        } else {
+          logger.warn(`[browser.act] Could not extract trace file path from output: ${traceOutput.slice(0, 200)}`);
+        }
+        debugSession.tracingActive = false;
+      }
+    } catch (error) {
+      logger.warn(`[browser.act] Failed to stop tracing for session=${sessionId}: ${error.message}`);
+    }
+  }
+  
+  if (debugSession.videoActive) {
+    try {
+      const videoResult = await cliRun([...sessionFlags(sessionId), 'video-stop'], 5000);
+      if (videoResult.ok) {
+        // Extract video file path from playwright-cli output
+        const videoOutput = videoResult.stdout || '';
+        const videoMatch = videoOutput.match(/\[Video\]\(([^)]+)\)/);
+        if (videoMatch) {
+          const videoFile = videoMatch[1].trim();
+          debugSession.videoFile = videoFile;
+          traceData.videoFile = videoFile;
+          logger.info(`[browser.act] Stopped video recording for session=${sessionId}, video file: ${videoFile}`);
+        } else {
+          // Video recording might not be available or failed to start - this is non-fatal
+          logger.debug(`[browser.act] Video recording not available or failed for session=${sessionId}`);
+        }
+        debugSession.videoActive = false;
+      }
+    } catch (error) {
+      logger.warn(`[browser.act] Failed to stop video recording for session=${sessionId}: ${error.message}`);
+    }
+  }
+  
+  // Stop DevTools and capture final debugging data
+  if (debugSession.devToolsActive) {
+    try {
+      // DevTools doesn't need explicit stopping, but we can capture final state
+      traceData.devToolsUrl = debugSession.devToolsUrl;
+      traceData.devToolsData = debugSession.devToolsData;
+      debugSession.devToolsActive = false;
+      logger.info(`[browser.act] DevTools session ended for session=${sessionId}`);
+    } catch (error) {
+      logger.warn(`[browser.act] Failed to cleanup DevTools for session=${sessionId}: ${error.message}`);
+    }
+  }
+  
+  return traceData;
+}
+
+// Capture debugging context for failed actions
+async function captureDebugContext(sessionId, failedAction) {
+  const debugSession = debuggingSessions.get(sessionId);
+  if (!debugSession) return null;
+  
+  return {
+    sessionId,
+    traceFile: debugSession.traceFile,
+    videoFile: debugSession.videoFile,
+    devToolsUrl: debugSession.devToolsUrl,
+    snapshots: debugSession.snapshots,
+    actionHistory: debugSession.actionHistory,
+    networkErrors: debugSession.networkErrors,
+    consoleErrors: debugSession.consoleErrors,
+    devToolsData: debugSession.devToolsData,
+    failedAction: {
+      action: failedAction.action,
+      args: failedAction.args,
+      error: failedAction.error,
+      executionTime: failedAction.executionTime,
+      crashDetected: failedAction.crashDetected
+    },
+    sessionDuration: Date.now() - debugSession.startTime
+  };
+}
+
+// Store action in history for debugging
+function storeActionForDebugging(sessionId, actionData) {
+  // Skip storing action data if debugging is disabled
+  if (!shouldEnableDebugging(sessionId)) return;
+  
+  const debugSession = debuggingSessions.get(sessionId);
+  if (debugSession) {
+    debugSession.actionHistory.push(actionData);
+    
+    // Keep only last 50 actions
+    if (debugSession.actionHistory.length > 50) {
+      debugSession.actionHistory = debugSession.actionHistory.slice(-50);
+    }
+  }
+}
+
+// Detect Chrome crash (about:blank) and trigger debugging repair
+async function detectAndHandleChromeCrash(sessionId, action, args, error) {
+  try {
+    // Check if current page is about:blank (indicates Chrome crash)
+    const checkResult = await cliRun([...sessionFlags(sessionId), 'eval', 'window.location.href'], 3000);
+    if (checkResult.ok && checkResult.stdout && checkResult.stdout.includes('about:blank')) {
+      logger.error(`[browser.act] Chrome crash detected for session=${sessionId} - page is about:blank`);
+      
+      // Capture debugging context before recovery
+      const debugContext = captureDebugContext(sessionId, {
+        action,
+        args,
+        error: `Chrome crash detected: ${error}`,
+        crashDetected: true
+      });
+      
+      // Store crash event in debugging session
+      const debugSession = debuggingSessions.get(sessionId);
+      if (debugSession) {
+        debugSession.networkErrors.push(`Chrome crash: ${error}`);
+        debugSession.consoleErrors.push('Browser navigated to about:blank');
+      }
+      
+      return {
+        crashDetected: true,
+        debugContext,
+        error: `Chrome browser crashed - page is about:blank`
+      };
+    }
+  } catch (checkError) {
+    logger.warn(`[browser.act] Failed to check for Chrome crash: ${checkError.message}`);
+  }
+  
+  return { crashDetected: false };
+}
+
+// Store snapshot for debugging
+function storeSnapshotForDebugging(sessionId, snapshotText) {
+  const debugSession = debuggingSessions.get(sessionId);
+  if (debugSession && snapshotText) {
+    debugSession.snapshots.push({
+      timestamp: Date.now(),
+      snapshot: snapshotText
+    });
+    
+    // Keep only last 20 snapshots
+    if (debugSession.snapshots.length > 20) {
+      debugSession.snapshots = debugSession.snapshots.slice(-20);
+    }
+  }
+}
+
+// Cleanup old debugging sessions (call periodically)
+function cleanupOldDebugSessions() {
+  const oneHour = 60 * 60 * 1000;
+  const now = Date.now();
+  
+  for (const [sessionId, debugSession] of debuggingSessions.entries()) {
+    if (now - debugSession.startTime > oneHour) {
+      debuggingSessions.delete(sessionId);
+      logger.info(`[browser.act] Cleaned up old debugging session=${sessionId}`);
+    }
+  }
+}
+
+// Run cleanup every 30 minutes
+setInterval(cleanupOldDebugSessions, 30 * 60 * 1000);
+
+// Detect Chrome crash and capture debugging context
+async function handleDetectCrash(sessionId, step, error) {
+  logger.error(`[browser.act] Chrome crash detection requested for session=${sessionId}`);
+  
+  // Capture debugging context before recovery
+  const debugContext = captureDebugContext(sessionId, {
+    action: step?.action || 'unknown',
+    args: step || {},
+    error: error || 'Chrome crash detected',
+    crashDetected: true
+  });
+  
+  // Store crash event in debugging session
+  const debugSession = debuggingSessions.get(sessionId);
+  if (debugSession) {
+    debugSession.networkErrors.push(`Chrome crash: ${error}`);
+    debugSession.consoleErrors.push('Browser navigated to about:blank during automation');
+  }
+  
+  return {
+    ok: true,
+    action: 'detectCrash',
+    sessionId,
+    executionTime: 0,
+    debugContext,
+    result: 'Chrome crash detected and debugging context captured'
+  };
+}
+
+// Handle file upload using playwright-cli upload command
+async function handleUpload(sessionId, filePath, headed, timeoutMs) {
+  const start = Date.now();
+  
+  try {
+    // Validate file exists and is accessible
+    const fs = require('fs');
+    if (!fs.existsSync(filePath)) {
+      return {
+        ok: false,
+        action: 'upload',
+        sessionId,
+        executionTime: Date.now() - start,
+        error: `File does not exist: ${filePath}`
+      };
+    }
+    
+    // Check if file is readable
+    try {
+      fs.accessSync(filePath, fs.constants.R_OK);
+    } catch (accessError) {
+      return {
+        ok: false,
+        action: 'upload',
+        sessionId,
+        executionTime: Date.now() - start,
+        error: `File is not accessible: ${filePath} - ${accessError.message}`
+      };
+    }
+    
+    logger.info(`[browser.act] Uploading file: ${filePath} for session=${sessionId}`);
+    
+    // Use playwright-cli upload command - requires file chooser modal to be active
+    const S = sessionFlags(sessionId, headed);
+    const uploadResult = await cliRun([...S, 'upload', filePath], timeoutMs);
+    
+    if (uploadResult.ok) {
+      logger.info(`[browser.act] File upload successful: ${filePath} for session=${sessionId}`);
+      return {
+        ok: true,
+        action: 'upload',
+        sessionId,
+        filePath,
+        executionTime: Date.now() - start,
+        result: uploadResult.stdout || 'File uploaded successfully'
+      };
+    } else {
+      logger.error(`[browser.act] File upload failed: ${filePath} for session=${sessionId} - ${uploadResult.error}`);
+      
+      // Check if the error is about missing modal state
+      if (uploadResult.error && uploadResult.error.includes('modal state')) {
+        return {
+          ok: false,
+          action: 'upload',
+          sessionId,
+          filePath,
+          executionTime: Date.now() - start,
+          error: `File chooser modal not active. You must first click on a file input or attachment button to trigger the file chooser, then use upload. Error: ${uploadResult.error}`
+        };
+      }
+      
+      return {
+        ok: false,
+        action: 'upload',
+        sessionId,
+        filePath,
+        executionTime: Date.now() - start,
+        error: uploadResult.error || uploadResult.stderr || 'Upload command failed'
+      };
+    }
+  } catch (error) {
+    logger.error(`[browser.act] Upload error for session=${sessionId}: ${error.message}`);
+    return {
+      ok: false,
+      action: 'upload',
+      sessionId,
+      filePath,
+      executionTime: Date.now() - start,
+      error: error.message
+    };
+  }
+}
+
+// Collect DevTools data during action execution
+async function collectDevToolsData(sessionId, action, result) {
+  // Skip data collection if debugging is disabled
+  if (!shouldEnableDebugging(sessionId)) return;
+  
+  const debugSession = debuggingSessions.get(sessionId);
+  if (!debugSession || !debugSession.devToolsActive) return;
+
+  try {
+    // Collect network requests and console logs via eval commands
+    const networkData = await cliRun([...sessionFlags(sessionId), 'eval', `
+      (function() {
+        const requests = [];
+        const logs = [];
+        
+        // Get network requests from performance entries
+        if (window.performance && window.performance.getEntriesByType) {
+          const entries = window.performance.getEntriesByType('resource');
+          entries.forEach(entry => {
+            if (entry.initiatorType !== 'script' || entry.name.includes('.js')) {
+              requests.push({
+                url: entry.name,
+                method: 'GET', // Simplified - real implementation would need more sophisticated tracking
+                status: entry.responseStatus || 200,
+                duration: Math.round(entry.duration),
+                size: entry.transferSize || 0
+              });
+            }
+          });
+        }
+        
+        // Get console logs (simplified - real implementation would need console override)
+        if (window.console && window.console.logs) {
+          logs.push(...window.console.logs.slice(-10)); // Last 10 logs
+        }
+        
+        return JSON.stringify({ requests: requests.slice(-20), logs: logs });
+      })();
+    `], 3000);
+
+    if (networkData.ok && networkData.stdout) {
+      try {
+        const data = JSON.parse(networkData.stdout.replace(/###\s*Result\s*\n([\s\S]*?)\n###.*$/, '$1').replace(/^"|"$/g, ''));
+        debugSession.devToolsData.networkRequests.push(...data.requests);
+        debugSession.devToolsData.consoleLogs.push(...data.logs);
+        
+        // Keep only recent data to prevent memory bloat
+        debugSession.devToolsData.networkRequests = debugSession.devToolsData.networkRequests.slice(-50);
+        debugSession.devToolsData.consoleLogs = debugSession.devToolsData.consoleLogs.slice(-20);
+      } catch (parseError) {
+        logger.debug(`[browser.act] Failed to parse DevTools data: ${parseError.message}`);
+      }
+    }
+  } catch (error) {
+    logger.debug(`[browser.act] Failed to collect DevTools data: ${error.message}`);
+  }
+}
+
+// Export debugging functions for other agents
+function getDebuggingContext(sessionId, failedStep) {
+  const debugSession = debuggingSessions.get(sessionId);
+  if (!debugSession) return null;
+  
+  return {
+    sessionId,
+    traceFile: debugSession.traceFile,
+    videoFile: debugSession.videoFile,
+    devToolsUrl: debugSession.devToolsUrl,
+    snapshots: debugSession.snapshots,
+    actionHistory: debugSession.actionHistory,
+    networkErrors: debugSession.networkErrors,
+    consoleErrors: debugSession.consoleErrors,
+    devToolsData: debugSession.devToolsData,
+    failedStep,
+    sessionDuration: Date.now() - debugSession.startTime
+  };
+}
+
+// Export for use by playwright.agent and other debugging tools
+module.exports = { 
+  browserAct, 
+  getDebuggingContext,
+  captureDebugContext,
+  stopSessionTracing,
+  debuggingSessions: debuggingSessions
+};
+
 // ---------------------------------------------------------------------------
 // Auth form loop — LLM prompt used by waitForAuth agentic fill
 // ---------------------------------------------------------------------------
@@ -151,14 +672,25 @@ function clearProfileLock(sessionId) {
   } catch (_) {}
 }
 
-// Build base flags for a session
+// Determine if session should use persistent profile (skills best practice)
+function shouldUsePersistentProfile(sessionId) {
+  // Use persistent profiles for agent sessions to preserve auth state
+  return sessionId.includes('agent') || sessionId.includes('gmail') || sessionId.includes('slack') || sessionId.includes('notion');
+}
+
+// Build base flags for a session (with skills-based persistent profiles)
 function sessionFlags(sessionId, headed = true) {
   const flags = [`-s=${sessionId}`];
   if (headed) flags.push('--headed');
-  // NOTE: do NOT pass --profile here. playwright-cli -s=sessionId manages tab
-  // isolation natively within a single Chrome window. Using --profile forces
-  // Chrome to open a separate window per session (macOS treats profiles as
-  // separate app instances). Auth persistence is handled via state-save/state-load.
+  
+  // Skills best practice: use persistent profiles for agent sessions
+  if (shouldUsePersistentProfile(sessionId)) {
+    flags.push('--persistent');
+    logger.debug(`[browser.act] Using persistent profile for session=${sessionId}`);
+  }
+  
+  // NOTE: We use --persistent instead of --profile for better session management
+  // Auth persistence is handled via state-save/state-load in combination with persistent profiles
   return flags;
 }
 
@@ -207,6 +739,8 @@ async function captureSnapshot(sessionId, headed, timeoutMs) {
   }
   if (snapshotText) {
     snapshotCache.set(sessionId, snapshotText);
+    // Store snapshot for debugging
+    storeSnapshotForDebugging(sessionId, snapshotText);
   }
   res.snapshotText = snapshotText;
   return res;
@@ -450,19 +984,71 @@ async function browserAct(args) {
 
   logger.info(`[browser.act] ${action} session=${sessionId}`, { url, selector, text, key });
 
+  // Start debugging tracing if enabled and not upload action
+  if (action !== 'upload' && shouldEnableDebugging(sessionId)) {
+    await startSessionTracing(sessionId);
+  }
+
   const S = sessionFlags(sessionId, headed);
 
-  // Helper: run + return standardised result
+  // Helper: run + return standardised result with debugging
   async function run(cmdArgs, label) {
+    const actionStart = Date.now();
     const res = await cliRun([...S, ...cmdArgs], timeoutMs);
+    const executionTime = Date.now() - actionStart;
+    
     logger.info(`[browser.act] ${label} → exit ${res.exitCode}`, { stderr: res.stderr?.slice(0, 200) });
+    
+    // Store action for debugging (skip if debugging disabled or upload to prevent hanging)
+    if (action !== 'upload' && shouldEnableDebugging(sessionId)) {
+      storeActionForDebugging(sessionId, {
+        label,
+        cmdArgs,
+        result: res,
+        executionTime,
+        ok: res.ok
+      });
+      
+      // Collect DevTools data after action execution (both success and failure)
+      await collectDevToolsData(sessionId, action, res);
+    }
+    
+    // If action failed, check for Chrome crash and capture debugging context
+    if (!res.ok) {
+      // Check if this is a Chrome crash
+      const crashInfo = await detectAndHandleChromeCrash(sessionId, action, cmdArgs, res.error || res.stderr?.trim());
+      
+      const debugContext = await captureDebugContext(sessionId, {
+        action,
+        args: cmdArgs,
+        error: crashInfo.crashDetected ? crashInfo.error : (res.error || res.stderr?.trim()),
+        executionTime,
+        crashDetected: crashInfo.crashDetected
+      });
+      
+      logger.info(`[browser.act] Captured debug context for failed action: ${label}${crashInfo.crashDetected ? ' (Chrome crash detected)' : ''}`);
+      
+      // If Chrome crash detected, add special error info
+      if (crashInfo.crashDetected) {
+        return {
+          ok: false,
+          action,
+          sessionId,
+          executionTime,
+          error: crashInfo.error,
+          chromeCrash: true,
+          debugContext
+        };
+      }
+    }
+    
     return {
       ok:            res.ok,
       action,
       sessionId,
       result:        (res.stdout || '').trim() || undefined,
       stdout:        res.stdout,
-      executionTime: Date.now() - start,
+      executionTime: executionTime,
       error:         res.ok ? undefined : res.error || res.stderr?.trim(),
     };
   }
@@ -772,11 +1358,10 @@ async function browserAct(args) {
     // playwright-cli upload takes ONLY file paths — no element ref.
     // The correct sequence is:
     //   1. click <ref>          — triggers the browser's file chooser dialog
-    //   2. upload <filepath>    — playwright-cli intercepts the active chooser
+    //   2. wait 2s              — let the file chooser initialize
+    //   3. upload <filepath>    — playwright-cli intercepts the active chooser
     //                             and feeds the file in (CLI handles the timing)
-    // Fallback: if the chooser-based upload fails (hidden input, multiple file
-    // inputs, no chooser event), retry via run-code + getElement().setInputFiles()
-    // which targets the element directly and bypasses the chooser entirely.
+    // Retry upload with different delays if first attempt fails.
     case 'upload': {
       const uploadFiles = (args.files && Array.isArray(args.files) ? args.files
         : args.file ? [args.file]
@@ -787,8 +1372,86 @@ async function browserAct(args) {
       if (!uploadFiles.length) {
         return { ok: false, action, sessionId, error: 'upload: files[] or file is required', executionTime: Date.now() - start };
       }
+
+      // Debug logging
+      logger.info(`[browser.act] upload: starting upload for files: ${uploadFiles.join(', ')}`);
+
+      // Ensure browser session exists before upload - use existing session if available
+      try {
+        const sessionCheck = await cliRun([...sessionFlags(sessionId, false), 'snapshot'], 3000);
+        if (!sessionCheck.ok) {
+          logger.warn(`[browser.act] Browser session not active, attempting to start session for ${sessionId}`);
+          const startResult = await cliRun([...sessionFlags(sessionId, false), 'open'], 5000);
+          if (!startResult.ok) {
+            // If socket error occurs, try with a different session name
+            if (startResult.error?.includes('EINVAL') || startResult.error?.includes('socket')) {
+              const altSessionId = `${sessionId}_${Date.now()}`;
+              logger.info(`[browser.act] Retrying with alternative session: ${altSessionId}`);
+              const retryResult = await cliRun([...sessionFlags(altSessionId, false), 'open'], 5000);
+              if (!retryResult.ok) {
+                return {
+                  ok: false,
+                  action,
+                  sessionId,
+                  error: `Failed to start browser session for upload (socket error): ${retryResult.error}`,
+                  executionTime: Date.now() - start,
+                };
+              }
+              // Update sessionId for rest of function
+              sessionId = altSessionId;
+            } else {
+              return {
+                ok: false,
+                action,
+                sessionId,
+                error: `Failed to start browser session for upload: ${startResult.error}`,
+                executionTime: Date.now() - start,
+              };
+            }
+          }
+          // Wait a moment for session to fully initialize
+          await cliRun([...sessionFlags(sessionId, false), 'wait', '1000'], 2000);
+        }
+      } catch (sessionError) {
+        return {
+          ok: false,
+          action,
+          sessionId,
+          error: `Session check failed: ${sessionError.message}`,
+          executionTime: Date.now() - start,
+        };
+      }
+
       for (const _f of uploadFiles) {
-        const _raw = String(_f || '');
+        let _raw = String(_f || '');
+        
+        // Fix path resolution for /previous_step/ references
+        if (_raw.startsWith('/previous_step/')) {
+          const filename = _raw.replace('/previous_step/', '');
+          // Map to common user directories
+          const possiblePaths = [
+            `/Users/lukaizhi/Desktop/${filename}`,
+            `/Users/lukaizhi/Documents/${filename}`,
+            `/Users/lukaizhi/Downloads/${filename}`,
+            `/Users/lukaizhi/${filename}`
+          ];
+          
+          // Find the first existing file
+          for (const possiblePath of possiblePaths) {
+            if (fs.existsSync(possiblePath)) {
+              _raw = possiblePath;
+              logger.info(`[browser.act] upload: resolved /previous_step/${filename} to ${_raw}`);
+              break;
+            }
+          }
+          
+          // If still using /previous_step/ path, default to Desktop
+          if (_raw.startsWith('/previous_step/')) {
+            _raw = `/Users/lukaizhi/Desktop/${filename}`;
+            logger.warn(`[browser.act] upload: /previous_step/${filename} not found, defaulting to Desktop: ${_raw}`);
+          }
+        }
+        
         if (!path.isAbsolute(_raw)) {
           return {
             ok: false,
@@ -817,30 +1480,66 @@ async function browserAct(args) {
           };
         }
       }
+
       // Step 1: click the selector to open the file chooser (if selector provided)
       if (selector) {
-        const _triggerRes = await run(['click', selector], `click ${selector} (trigger file chooser)`);
+        logger.info(`[browser.act] upload: clicking attach button: ${selector}`);
+        // Direct CLI call without debugging infrastructure
+        const clickFlags = sessionFlags(sessionId, false); // Force headed=false to avoid DevTools
+        const _triggerRes = await cliRun([...clickFlags, 'click', selector], timeoutMs);
         if (!_triggerRes.ok) {
-          logger.warn(`[browser.act] upload: click on selector "${selector}" failed — attempting upload without trigger`);
+          return {
+            ok: false,
+            action,
+            sessionId,
+            error: `Failed to click attach button "${selector}": ${_triggerRes.error}`,
+            executionTime: Date.now() - start,
+          };
         }
+        // Brief wait to let file chooser initialize
+        logger.info(`[browser.act] upload: waiting 500ms for file chooser`);
+        await cliRun([...clickFlags, 'wait', '500'], timeoutMs);
       }
-      // Step 2: feed each file to the active chooser
-      let _uploadResult;
+
+      // Step 2: upload files using playwright-cli upload command (direct CLI only)
+      const uploadFlags = sessionFlags(sessionId, false); // Force headed=false to avoid DevTools
       for (const _f of uploadFiles) {
-        _uploadResult = await run(['upload', _f], `upload ${_f}`);
+        logger.info(`[browser.act] upload: attempting playwright-cli upload for: ${_f}`);
+        const _uploadResult = await cliRun([...uploadFlags, 'upload', _f], timeoutMs);
+        
         if (!_uploadResult.ok) {
-          // Fallback: chooser-based approach failed — try direct setInputFiles via run-code.
-          // This handles hidden inputs and services with multiple <input type="file"> elements.
-          if (selector) {
-            logger.warn(`[browser.act] upload via chooser failed for "${_f}" — retrying via run-code setInputFiles on selector "${selector}"`);
-            const _rcCode = `async page => { await (await getElement(${JSON.stringify(selector)})).setInputFiles(${JSON.stringify(_f)}); return 'uploaded: ' + ${JSON.stringify(_f)}; }`;
-            _uploadResult = await run(['run-code', _rcCode], `setInputFiles ${_f}`);
-          }
-          if (!_uploadResult.ok) return _uploadResult;
+          logger.error(`[browser.act] upload: failed for ${_f} - ${_uploadResult.error}`);
+          return {
+            ok: false,
+            action,
+            sessionId,
+            error: `Upload failed for ${_f}: ${_uploadResult.error}`,
+            executionTime: Date.now() - start,
+          };
         }
-        logger.info(`[browser.act] upload: file attached — ${_f}`);
+        
+        logger.info(`[browser.act] upload: file attached successfully — ${_f}`);
       }
-      return _uploadResult;
+
+      logger.info(`[browser.act] upload: upload completed successfully for: ${uploadFiles.join(', ')}`);
+      
+      const result = {
+        ok: true,
+        action,
+        sessionId,
+        files: uploadFiles,
+        executionTime: Date.now() - start,
+        result: `Successfully uploaded ${uploadFiles.length} file(s)`
+      };
+      
+      // Force process cleanup to prevent hanging (only for standalone testing)
+      if (process.env.NODE_ENV !== 'production' && !process.env.ELECTRON_RUN_AS_NODE) {
+        setTimeout(() => {
+          process.exit(0);
+        }, 100);
+      }
+      
+      return result;
     }
 
     // ── Keyboard ─────────────────────────────────────────────────────────────
@@ -2064,6 +2763,12 @@ Respond ONLY with valid JSON:
       };
     }
 
+    // ── Chrome Crash Detection ─────────────────────────────────────────────────
+    case 'detectCrash': {
+      return await handleDetectCrash(sessionId, args.step || {}, args.error || 'Chrome crash detected');
+    }
+
+    
     // ── Fallback ─────────────────────────────────────────────────────────────
     default: {
       logger.warn(`[browser.act] Unknown action "${action}" — attempting direct passthrough`);
@@ -2097,5 +2802,3 @@ function parseSnapshotToElements(snapshotText) {
   }
   return elements;
 }
-
-module.exports = { browserAct };

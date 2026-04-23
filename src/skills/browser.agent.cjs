@@ -613,7 +613,7 @@ INPUT
   select      — { "action": "select", "selector": "...", "value": "..." }        — <select> dropdowns
   check       — { "action": "check", "selector": "..." }                         — checkboxes / radio buttons
   uncheck     — { "action": "uncheck", "selector": "..." }                       — uncheck a checkbox
-  upload      — { "action": "upload", "selector": "...", "files": ["/abs/path"] } — attach file(s): clicks selector to open the chooser, then feeds each file path to the active chooser. Fallback: if no chooser fires, targets the element directly via setInputFiles. selector = attach button ref from snapshot; files = absolute local file paths array.
+  upload      — { "action": "upload", "selector": "...", "files": ["/abs/path"] } — attach file(s): clicks selector to open the chooser, then uses playwright-cli upload command for each file. selector = attach button ref from snapshot; files = absolute local file paths array.
 
 DOM INTERACTION
   click       — { "action": "click", "selector": "..." }

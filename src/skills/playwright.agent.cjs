@@ -45,7 +45,7 @@ const fs     = require('fs');
 const os     = require('os');
 const path   = require('path');
 const logger = require('../logger.cjs');
-const { browserAct } = require('./browser.act.cjs');
+const { browserAct, getDebuggingContext } = require('./browser.act.cjs');
 const { askWithMessages } = require('../skill-helpers/skill-llm.cjs');
 const skillDb = require('../skill-helpers/skill-db.cjs');
 
@@ -84,7 +84,7 @@ const BROWSER_ACTIONS_FULL = `Available actions:
                   { "action": "run-code", "code": "async page => { return await page.evaluate(() => { const rows = Array.from(document.querySelectorAll('tr.zA')).slice(0,5); if(!rows.length) return 'No emails found'; return rows.map((r,i)=>{ const s=r.querySelector('.yX span,.zF')?.innerText||''; const sub=r.querySelector('.bog,.bqe')?.innerText||''; const snip=r.querySelector('.y2')?.innerText||''; const t=r.querySelector('.xW span')?.innerText||''; return 'Email '+(i+1)+': From='+s+' | Subject='+sub+' | Preview='+snip+' | Time='+t; }).join('\\n'); }); }" }
   screenshot      { filePath }
   snapshot        {}                   — re-read the page (ONLY when page changes significantly)
-  upload          { selector, files }  — attach file(s): clicks selector to open chooser, feeds files to active chooser via setInputFiles. selector = button/input ref; files = array of real absolute paths from the task/request. IMPORTANT: always use "files" (array), NEVER use "path". NEVER invent placeholders like /path/to/file.pdf.
+  upload          { selector, files }  — attach file(s): clicks selector to open chooser, then uses playwright-cli upload command. selector = button/input ref; files = array of real absolute paths from the task/request. IMPORTANT: always use "files" (array), NEVER use "path". NEVER invent placeholders like /path/to/file.pdf.
   return          { data: "<string>" } — MUST be LAST step; plain string output, max 2000 chars.
   dialog-accept   { prompt? }
   dialog-dismiss  {}`;
@@ -221,7 +221,7 @@ GOAL ALIGNMENT: The action must move TOWARD the goal. Ask: "After this action, w
 // ---------------------------------------------------------------------------
 const REPAIR_SYSTEM_PROMPT = `You are a browser automation expert. One step in an automation plan has failed.
 
-You will receive the failed step, its error, the remaining plan, and the current page snapshot.
+You will receive the failed step, its error, the remaining plan, the current page snapshot, and debugging context from tracing/video analysis.
 Output corrective steps that replace the failed step and get the plan back on track.
 
 Respond with EXACTLY ONE JSON object (no markdown fences, no explanation):
@@ -244,7 +244,15 @@ Respond with EXACTLY ONE JSON object (no markdown fences, no explanation):
 - If a run-code step failed due to require/file-reading: replace it with a \`type\` action using content
   from the task description instead.
 - If the error contains "Timeout" and the failed step was navigate or click, a browser dialog (e.g. "Leave site?", "Leave page?") may be blocking. In that case start the repair with { "action": "dialog-accept" } before retrying the original step.
-- If the failed step is an upload action: the ONLY valid param for file paths is "files" (array of absolute paths). NEVER use "path". Correct form: { "action": "upload", "selector": "<ref>", "files": ["/absolute/path/to/file"] }`;
+- If the failed step is an upload action: the ONLY valid param for file paths is "files" (array of absolute paths). NEVER use "path". Correct form: { "action": "upload", "selector": "<ref>", "files": ["/absolute/path/to/file"] }
+
+DEBUGGING CONTEXT USAGE:
+- Use network errors to identify blocked resources or failed API calls
+- Use console errors to detect JavaScript failures or timing issues  
+- Use video analysis to identify visual indicators like error dialogs, loading states, or modal interference
+- Use action history to understand sequence of events that led to failure
+- Use timing data to add appropriate waits if operations were too fast
+- Prioritize fixes that address the root cause shown in debugging data over generic workarounds`;
 
 // ---------------------------------------------------------------------------
 // Replan prompt — called when a DOM-mutating step caused a structural DOM change.
@@ -1110,13 +1118,26 @@ async function playwrightAgent(args) {
               logger.info(`[playwright.agent] post-nav snapshot too small (${postRefCount} refs) — waiting for page to stabilise`);
               const stableSnap = await browserAct({ action: 'waitForStableText', sessionId, headed, timeoutMs: 12000 });
               if (stableSnap?.aboutBlankDetected) {
-                logger.warn(`[playwright.agent] waitForStableText reported about:blank — stopping re-plan to prevent loop`);
+                logger.warn(`[playwright.agent] waitForStableText reported about:blank — triggering Chrome crash detection`);
+                
+                // Trigger Chrome crash detection and capture debugging context
+                const crashInfo = await browserAct({ 
+                  action: 'detectCrash', 
+                  sessionId, 
+                  headed, 
+                  timeoutMs: 3000,
+                  step: { action: 'waitForStableText' },
+                  error: 'Chrome crash detected during page stabilization'
+                }).catch(() => ({ ok: false, error: 'Crash detection failed' }));
+                
                 return {
                   ok: false, goal, sessionId,
                   turns: transcript.length, done: false,
-                  sessionRecoverNeeded: true,
-                  result: 'Page became about:blank while stabilising — session recovery required',
-                  transcript, executionTime: Date.now() - start,
+                  chromeCrash: true,
+                  result: `Chrome browser crashed during page stabilization - page became about:blank`,
+                  transcript, 
+                  executionTime: Date.now() - start,
+                  debugContext: crashInfo.debugContext
                 };
               }
               const reSnap = await browserAct({ action: 'snapshot', sessionId, headed, timeoutMs });
@@ -1186,6 +1207,21 @@ async function playwrightAgent(args) {
     }
 
     // ── Step failed → repair ─────────────────────────────────────────────────
+    // Check for Chrome crash and handle specially
+    if (outcome.chromeCrash) {
+      logger.error(`[playwright.agent] Chrome crash detected during step ${stepIndex + 1} — using debugging repair`);
+      
+      // Return special crash result to trigger debugging repair instead of generic recovery
+      return {
+        ok: false, goal, sessionId,
+        turns: transcript.length, done: false,
+        chromeCrash: true,
+        result: `Chrome browser crashed during step ${stepIndex + 1} (${step.action}): ${outcome.error}`,
+        transcript, error: outcome.error, executionTime: Date.now() - start,
+        debugContext: outcome.debugContext
+      };
+    }
+
     if (totalRepairs >= maxRepairs) {
       logger.warn(`[playwright.agent] step ${stepIndex + 1} failed — repair limit (${maxRepairs}) reached`);
       return {
@@ -1208,20 +1244,54 @@ async function playwrightAgent(args) {
     const repairSnap = await browserAct({ action: 'snapshot', sessionId, headed, timeoutMs });
     if (repairSnap.ok && repairSnap.result) currentSnapshot = repairSnap.result;
 
+    // Get debugging context for enhanced repair
+    const debugContext = getDebuggingContext(sessionId, {
+      action: step.action,
+      args: step,
+      error: outcome.error,
+      executionTime: outcome.executionTime
+    });
+
     const remainingSteps = plan.slice(stepIndex + 1);
     let repairRaw;
     try {
+      const repairUserContent = [
+        `GOAL: ${goal}`,
+        `FAILED_STEP: ${JSON.stringify(step)}`,
+        `ERROR: ${outcome.error}`,
+        `REMAINING_PLAN: ${JSON.stringify(remainingSteps)}`,
+        ``,
+        `SNAPSHOT:`,
+        trimSnapshot(currentSnapshot)
+      ];
+
+      // Add debugging context if available
+      if (debugContext) {
+        repairUserContent.push(
+          ``,
+          `DEBUGGING CONTEXT:`,
+          `- Session duration: ${debugContext.sessionDuration}ms`,
+          `- Action history: ${debugContext.actionHistory.length} previous actions`,
+          `- Snapshots captured: ${debugContext.snapshots.length}`,
+          `- Network errors: ${debugContext.networkErrors.length}`,
+          `- Console errors: ${debugContext.consoleErrors.length}`,
+          `- Trace file: ${debugContext.traceFile || 'Not available'}`,
+          `- Video file: ${debugContext.videoFile || 'Not available'}`,
+          ``,
+          `RECENT ACTIONS:`,
+          ...debugContext.actionHistory.slice(-3).map(action => 
+            `• ${action.label}: ${action.ok ? 'SUCCESS' : 'FAILED'} (${action.executionTime}ms)`
+          ),
+          ``,
+          `ERRORS DETECTED:`,
+          ...debugContext.networkErrors.map(err => `• Network: ${err}`),
+          ...debugContext.consoleErrors.map(err => `• Console: ${err}`)
+        );
+      }
+
       repairRaw = await askWithMessages([
         { role: 'system', content: REPAIR_SYSTEM_PROMPT + domainLockBlock },
-        { role: 'user', content: [
-          `GOAL: ${goal}`,
-          `FAILED_STEP: ${JSON.stringify(step)}`,
-          `ERROR: ${outcome.error}`,
-          `REMAINING_PLAN: ${JSON.stringify(remainingSteps)}`,
-          ``,
-          `SNAPSHOT:`,
-          trimSnapshot(currentSnapshot),
-        ].join('\n') },
+        { role: 'user', content: repairUserContent.join('\n') },
       ], { temperature: 0.1, maxTokens: 1024, responseTimeoutMs: 20000 });
     } catch (err) {
       return { ok: false, goal, sessionId, turns: transcript.length, done: false, result: `Repair LLM unavailable: ${err.message}`, transcript, error: err.message, executionTime: Date.now() - start };
