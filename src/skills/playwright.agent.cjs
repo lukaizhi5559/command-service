@@ -84,7 +84,7 @@ const BROWSER_ACTIONS_FULL = `Available actions:
   screenshot      { filePath }
   snapshot        {}                   — re-read the page (ONLY when page changes significantly)
   upload          { selector, files }  — attach file(s): clicks selector to open chooser, then uses playwright-cli upload command. selector = button/input ref; files = array of real absolute paths from the task/request. IMPORTANT: always use "files" (array), NEVER use "path". NEVER invent placeholders like /path/to/file.pdf.
-  pasteAttachment { selector? }        — PREFERRED for Gmail/chat attachments. Assumes the file is already on the clipboard (a prior shell.run osascript step put it there). Finds the compose body textbox, focuses it, and presses Meta+V (macOS) / Ctrl+V (else). DO NOT click the paperclip/Attach button before this — the native file chooser modal blocks keyboard events. Optional selector pins the body ref if auto-detection picks the wrong textbox.
+  pasteAttachment { selector?, uploadWaitMs? } — PREFERRED for Gmail/chat attachments. Assumes the file is already on the clipboard (a prior shell.run osascript step put it there). Finds the compose body textbox, focuses it, and presses Meta+V (macOS) / Ctrl+V (else). DO NOT click the paperclip/Attach button before this — the native file chooser modal blocks keyboard events. Optional selector pins the body ref if auto-detection picks the wrong textbox. uploadWaitMs overrides the upload settle timeout (default 120000ms/2min): pass uploadWaitMs:300000 for video files, uploadWaitMs:180000 for audio or multiple files.
   return          { data: "<string>" } — MUST be LAST step; plain string output, max 2000 chars.
   dialog-accept   { prompt? }
   dialog-dismiss  {}`;

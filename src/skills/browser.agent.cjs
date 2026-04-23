@@ -2120,6 +2120,16 @@ async function actionRun({ agentId, task, url, context, requiresAuth, _progressC
   //   auth gate; playwright-cli is never involved for this stack.
   // playwright path: navigate to startUrl, probe current URL, call waitForAuth only
   //   if redirected to a login path. Applies uniformly to all services.
+
+  // Helper: detect a sign-in wall URL. Covers path-based patterns (/login, /signin,
+  // /auth, /oauth, /authorize) AND Google's accounts.google.com hostname which uses
+  // URL structures like /v3/signin/identifier that don't match path patterns.
+  const _isSigninWall = (href) =>
+    href.length > 4 && (
+      /\/(login|signin|sign[-_]in|auth|oauth|authorize)\b/i.test(href) ||
+      /\baccounts\.google\.com\b/i.test(href)
+    );
+
   let _effectiveAutoConnect = _useAutoConnect && !_usePersistentProfile;
 
   if (_useAgentBrowser) {
@@ -2152,11 +2162,20 @@ async function actionRun({ agentId, task, url, context, requiresAuth, _progressC
     let _authNeeded = false;
     let _skipNavigate = false;
 
-    // ── State persistence: try loading a saved auth session before doing a fresh
-    // navigate. playwright-cli injects saved cookies into the new browser process so
-    // sessions survive full app shutdown + OS restarts. Google cookies last ~2 weeks.
+    // ── Auth state persistence strategy ──────────────────────────────────────
+    // Persistent-profile sessions (*_agent) use Chrome's own cookie store at
+    // ~/.thinkdrop/browser-profiles/<sessionId>/. This preserves HttpOnly,
+    // SameSite=Strict, and cross-domain cookies (e.g. Google's accounts.google.com
+    // session tokens) that cannot be captured by playwright's JSON storageState.
+    //
+    // JSON state-load (browser-sessions/<sessionId>.json) is kept ONLY for
+    // non-persistent sessions where no profile dir exists — it works fine for
+    // simple sites but fails consistently for Google/Slack/Notion.
+    const _hasPersistentProfile = sessionId.includes('agent');
     const _stateFile = path.join(os.homedir(), '.thinkdrop', 'browser-sessions', `${sessionId}.json`);
-    if (fs.existsSync(_stateFile)) {
+    if (_hasPersistentProfile) {
+      logger.info(`[browser.agent] run: persistent-profile session — skipping JSON state-load, Chrome cookie store handles auth for ${agentId}`);
+    } else if (fs.existsSync(_stateFile)) {
       logger.info(`[browser.agent] run: state file found for ${agentId} — loading persisted auth state`);
       const _loadRes = await callBrowserAct({ action: 'state-load', sessionId, timeoutMs: 10000 }, 12000).catch(() => ({ ok: false }));
       if (_loadRes?.ok !== false) {
@@ -2169,19 +2188,15 @@ async function actionRun({ agentId, task, url, context, requiresAuth, _progressC
             })
           : { ok: false, error: 'navigation failed' };
         let _stateCurHref = _stateHrefRes?.ok === false ? '' : String(_stateHrefRes?.result ?? _stateHrefRes?.stdout ?? '').trim();
-        let _stateOnLogin = _stateCurHref.length > 4 && /\/(login|signin|sign[-_]in|auth|oauth|authorize)\b/i.test(_stateCurHref);
+        let _stateOnLogin = _isSigninWall(_stateCurHref);
         _skipNavigate = true; // already navigated above — skip the auth-check navigate below
 
-        // Grace period: Google & other providers may briefly redirect to signin
-        // during cookie validation before settling. Retry once after 3s before
-        // deciding the session is truly stale.
         if (_stateOnLogin) {
           logger.info(`[browser.agent] run: state-load: initial redirect to signin for ${agentId} — waiting 3s and re-checking`);
           await new Promise(r => setTimeout(r, 3000));
           const _recheckRes = await callBrowserAct({ action: 'evaluate', text: 'window.location.href', sessionId, timeoutMs: 5000 }, 8000).catch(() => ({ ok: false }));
           const _recheckHref = _recheckRes?.ok === false ? '' : String(_recheckRes?.result ?? _recheckRes?.stdout ?? '').trim();
-          const _recheckOnLogin = _recheckHref.length > 4 && /\/(login|signin|sign[-_]in|auth|oauth|authorize)\b/i.test(_recheckHref);
-          if (!_recheckOnLogin) {
+          if (!_isSigninWall(_recheckHref)) {
             logger.info(`[browser.agent] run: state-load: grace-period recheck cleared auth for ${agentId} (${_recheckHref})`);
             _stateCurHref = _recheckHref;
             _stateOnLogin = false;
@@ -2190,7 +2205,6 @@ async function actionRun({ agentId, task, url, context, requiresAuth, _progressC
 
         if (!_stateOnLogin) {
           logger.info(`[browser.agent] run: state-load: auth cleared for ${agentId} (${_stateCurHref}) — skipping waitForAuth`);
-          // _authNeeded stays false
         } else {
           logger.warn(`[browser.agent] run: state-load: auth wall still present for ${agentId} after grace period — deleting stale state, re-authenticating`);
           try { fs.unlinkSync(_stateFile); } catch (_) {}
@@ -2210,7 +2224,7 @@ async function actionRun({ agentId, task, url, context, requiresAuth, _progressC
           return { ok: false, error: err.message };
         });
         const _curHref = _hrefRes?.ok === false ? '' : String(_hrefRes?.result ?? _hrefRes?.stdout ?? '').trim();
-        const _onLoginPage = _curHref.length > 4 && /\/(login|signin|sign[-_]in|auth|oauth|authorize)\b/i.test(_curHref);
+        const _onLoginPage = _isSigninWall(_curHref);
         // Also detect domain mismatch — e.g. redirect to workspace.google.com instead of mail.google.com
         let _wrongDomain = false;
         try {
@@ -2304,13 +2318,17 @@ async function actionRun({ agentId, task, url, context, requiresAuth, _progressC
         })();
         return { ok: false, error: `Auth failed for ${agentId}: ${authResult?.error}` };
       }
-      // Auth succeeded — persist browser state so future runs skip waitForAuth entirely.
-      // state-save writes cookies + localStorage to ~/.thinkdrop/browser-sessions/<sessionId>.json.
-      // The file survives full shutdown; state-load injects it into a fresh process on next run.
-      logger.info(`[browser.agent] run: auth succeeded — saving browser state for ${agentId}`);
-      await callBrowserAct({ action: 'state-save', sessionId, timeoutMs: 10000 }, 12000).catch(e => {
-        logger.warn(`[browser.agent] run: state-save failed (non-fatal): ${e.message}`);
-      });
+      // Persistent-profile sessions: the Chrome profile dir already persists cookies/IndexedDB.
+      // JSON state-save is redundant for *_agent sessions and creates stale files that
+      // interfere on next run (Google rejects injected JSON cookies). Skip it.
+      if (!_hasPersistentProfile) {
+        logger.info(`[browser.agent] run: auth succeeded — saving browser state for ${agentId}`);
+        await callBrowserAct({ action: 'state-save', sessionId, timeoutMs: 10000 }, 12000).catch(e => {
+          logger.warn(`[browser.agent] run: state-save failed (non-fatal): ${e.message}`);
+        });
+      } else {
+        logger.info(`[browser.agent] run: auth succeeded for ${agentId} — profile dir persists auth (skipping JSON state-save)`);
+      }
     }
   }
 

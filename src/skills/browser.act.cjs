@@ -833,12 +833,28 @@ function sessionProfileDir(sessionId) {
 
 // Remove Chrome's SingletonLock file so a post-crash restart can reuse the profile
 // without Chrome deciding to start fresh (losing the logged-in session).
+// Also patches Default/Preferences exit_type → Normal to suppress the
+// "Chrome didn't shut down correctly / Restore pages?" dialog that appears
+// whenever the playwright-cli daemon was killed without a clean browser exit.
 function clearProfileLock(sessionId) {
   try {
     const lockFile = path.join(sessionProfileDir(sessionId), 'SingletonLock');
     if (fs.existsSync(lockFile)) {
       fs.unlinkSync(lockFile);
       logger.info(`[browser.act] Removed stale SingletonLock for session=${sessionId}`);
+    }
+  } catch (_) {}
+  try {
+    const prefsPath = path.join(sessionProfileDir(sessionId), 'Default', 'Preferences');
+    if (fs.existsSync(prefsPath)) {
+      const prefs = JSON.parse(fs.readFileSync(prefsPath, 'utf8'));
+      let patched = false;
+      if (prefs?.profile?.exit_type === 'Crashed') { prefs.profile.exit_type = 'Normal'; patched = true; }
+      if (prefs?.profile?.exited_cleanly === false) { prefs.profile.exited_cleanly = true; patched = true; }
+      if (patched) {
+        fs.writeFileSync(prefsPath, JSON.stringify(prefs), 'utf8');
+        logger.info(`[browser.act] Patched Preferences exit_type → Normal for session=${sessionId}`);
+      }
     }
   } catch (_) {}
 }
@@ -2161,7 +2177,44 @@ async function browserAct(args) {
           };
         }
 
-        logger.info(`[browser.act] pasteAttachment: paste into body ${bodyRef} completed`);
+        // ── Wait for upload to complete before returning ─────────────────────
+        // Web mail clients (Gmail, Outlook, Yahoo, etc.) upload files asynchronously
+        // after the paste event. Returning immediately causes the agent to click Send
+        // while the upload is still in progress, triggering "images still uploading" alerts.
+        //
+        // Generic approach: poll the accessibility tree for DOM stability.
+        // An in-progress upload continuously mutates the tree (progress %, spinner state,
+        // byte count). Once the tree is unchanged for STABLE_REQUIRED consecutive polls
+        // the upload is done. This works for any service without hardcoded strings.
+        //
+        // uploadWaitMs defaults to 120s (2 min) — safe for images/documents.
+        // Callers handling video/audio/multi-file should pass a larger value.
+        const uploadWaitMs = args.uploadWaitMs || 120000;
+        const UPLOAD_MIN_WAIT_MS = 1500;  // minimum settle (XHR pipeline startup)
+        const UPLOAD_POLL_MS = 800;
+        const STABLE_REQUIRED = 2;        // consecutive unchanged polls = done (~1.6s stable)
+
+        logger.info(`[browser.act] pasteAttachment: waiting for upload to complete (max ${Math.round(uploadWaitMs / 1000)}s)`);
+        await new Promise(r => setTimeout(r, UPLOAD_MIN_WAIT_MS));
+
+        const uploadStart = Date.now();
+        let prevSnapText = '';
+        let stableCount = 0;
+        while (Date.now() - uploadStart < uploadWaitMs) {
+          await new Promise(r => setTimeout(r, UPLOAD_POLL_MS));
+          await captureSnapshot(sessionId, headed, 5000).catch(() => null);
+          const snapText = (snapshotCache.get(sessionId) || '').slice(0, 3000);
+          if (snapText === prevSnapText) {
+            stableCount++;
+            if (stableCount >= STABLE_REQUIRED) break;
+          } else {
+            stableCount = 0;
+            prevSnapText = snapText;
+            logger.info(`[browser.act] pasteAttachment: DOM changing — upload in progress (${Math.round((Date.now() - uploadStart) / 1000)}s / ${Math.round(uploadWaitMs / 1000)}s max)`);
+          }
+        }
+        logger.info(`[browser.act] pasteAttachment: DOM stable or timeout — proceeding (${Math.round((Date.now() - uploadStart) / 1000)}s)`);
+
         return {
           ok: true,
           action,
