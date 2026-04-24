@@ -40,6 +40,7 @@ const skillCreator = require('./skills/skillCreator.skill.cjs');
 const { screenCapture } = require('./skills/screen.capture.cjs');
 const { userAgent } = require('./skills/user.agent.cjs');
 const skillScheduler = require('./skill-helpers/skill-scheduler.cjs');
+const { startIdleWatcher, startScanScheduler, runMaintenanceScan, cancelMaintenanceScan, getScanStatus } = require('./skills/explore.agent.cjs');
 
 class CommandServiceMCPServer {
   constructor() {
@@ -263,6 +264,16 @@ class CommandServiceMCPServer {
     // Reads installed skills from user-memory MCP, registers node-cron jobs
     // for any skill with a schedule ≠ on_demand. Re-syncs every 5 min.
     skillScheduler.start().catch(err => logger.warn('[Server] Skill scheduler start failed', { error: err.message }));
+
+    // ── explore.agent maintenance scan services ──────────────────────────────
+    // Idle watcher: polls system idle every 5min, fires maintenance scan after 30min idle + 24h cooldown
+    // Scan scheduler: reads ~/.thinkdrop/scan-schedule.json, registers node-cron job if configured
+    try {
+      startIdleWatcher();
+      startScanScheduler();
+    } catch (err) {
+      logger.warn('[Server] explore.agent maintenance services failed to start (non-fatal)', { error: err.message });
+    }
 
     // ── Startup skill health scan ─────────────────────────────────────────────
     // Runs once after the scheduler starts — validates all installed skills and
@@ -514,6 +525,66 @@ class CommandServiceMCPServer {
             }));
             res.writeHead(200);
             res.end(JSON.stringify({ ok: true, statuses }));
+          } catch (err) {
+            res.writeHead(400);
+            res.end(JSON.stringify({ ok: false, error: err.message }));
+          }
+        });
+        return;
+      }
+
+      // ── POST /scan.run — trigger maintenance scan immediately ──────────────
+      if (req.method === 'POST' && req.url === '/scan.run') {
+        let body = '';
+        req.on('data', chunk => { body += chunk; });
+        req.on('end', async () => {
+          try {
+            const { trigger = 'user' } = JSON.parse(body || '{}');
+            const result = await runMaintenanceScan({ trigger });
+            res.writeHead(200);
+            res.end(JSON.stringify({ ok: true, ...result }));
+          } catch (err) {
+            res.writeHead(500);
+            res.end(JSON.stringify({ ok: false, error: err.message }));
+          }
+        });
+        return;
+      }
+
+      // ── POST /scan.cancel — cancel an in-progress maintenance scan ─────────
+      if (req.method === 'POST' && req.url === '/scan.cancel') {
+        cancelMaintenanceScan();
+        res.writeHead(200);
+        res.end(JSON.stringify({ ok: true }));
+        return;
+      }
+
+      // ── GET /scan.status — return current scan state for UI polling ─────────
+      if (req.method === 'GET' && req.url === '/scan.status') {
+        res.writeHead(200);
+        res.end(JSON.stringify({ ok: true, ...getScanStatus() }));
+        return;
+      }
+
+      // ── POST /scan.schedule — write scan-schedule.json + restart scheduler ──
+      if (req.method === 'POST' && req.url === '/scan.schedule') {
+        let body = '';
+        req.on('data', chunk => { body += chunk; });
+        req.on('end', () => {
+          try {
+            const fs = require('fs');
+            const os = require('os');
+            const path = require('path');
+            const schedFile = path.join(os.homedir(), '.thinkdrop', 'scan-schedule.json');
+            const { cron, enabled } = JSON.parse(body || '{}');
+            let existing = {};
+            try { existing = JSON.parse(fs.readFileSync(schedFile, 'utf8')); } catch (_) {}
+            const updated = { ...existing, ...(cron !== undefined ? { cron } : {}), ...(enabled !== undefined ? { enabled } : {}) };
+            fs.mkdirSync(path.dirname(schedFile), { recursive: true });
+            fs.writeFileSync(schedFile, JSON.stringify(updated, null, 2), 'utf8');
+            startScanScheduler(); // re-register with new schedule
+            res.writeHead(200);
+            res.end(JSON.stringify({ ok: true, schedule: updated }));
           } catch (err) {
             res.writeHead(400);
             res.end(JSON.stringify({ ok: false, error: err.message }));

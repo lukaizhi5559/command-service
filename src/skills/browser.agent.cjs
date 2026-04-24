@@ -58,12 +58,6 @@ const SERVICE_UNAVAILABLE_PATTERNS = [
   /\berr_(?:connection|name|timed_out|ssl|internet)\w*\b/i,
   /\bcoming\s+soon\b/i,
   /\bunder\s+construction\b/i,
-  /\bnot\s+yet\s+available\b/i,
-  /\blaunching\s+soon\b/i,
-  /\bjoin\s+the\s+waitlist\b/i,
-  /\bwaitlist\b/i,
-  /\brequest\s+access\b/i,
-  /\binvite\s+only\b/i,
   /\bearly\s+access\b/i,
   /\baccess\s+blocked\b/i,
   /\baccess\s+denied\b/i,
@@ -72,6 +66,30 @@ const SERVICE_UNAVAILABLE_PATTERNS = [
   /\bupgrade\s+required\b/i,
   /\bplan\s+required\b/i,
 ];
+
+// ---------------------------------------------------------------------------
+// Domain Map helpers — content extraction discovery from explore.agent scan mode
+// ---------------------------------------------------------------------------
+
+const DOMAIN_MAPS_DIR = path.join(os.homedir(), '.thinkdrop', 'domain-maps');
+
+function _loadDomainMap(hostname) {
+  try {
+    const p = path.join(DOMAIN_MAPS_DIR, `${hostname}.json`);
+    if (!fs.existsSync(p)) return null;
+    return JSON.parse(fs.readFileSync(p, 'utf8'));
+  } catch (_) { return null; }
+}
+
+/**
+ * Get content extraction config from domain map for a hostname.
+ * Returns { primary_selector, fallback_selector, content_type } or null.
+ */
+function getContentExtractionConfig(hostname) {
+  if (!hostname) return null;
+  const map = _loadDomainMap(hostname.replace(/^www\./, ''));
+  return map?.content_extraction || null;
+}
 
 function detectServiceUnavailable(text) {
   if (typeof text !== 'string' || !text.trim()) return null;
@@ -2397,6 +2415,23 @@ async function actionRun({ agentId, task, url, context, requiresAuth, _progressC
     _agentContext = (_coreDescriptor + (_matchedPlaybook ? '\n\n## Playbooks\n' + _matchedPlaybook : '')).slice(0, 3000);
   }
 
+  // ── Inject domain map content extraction hints if available ───────────────
+  // explore.agent scan mode discovers optimal CSS selectors for content extraction.
+  // These hints help playwright.agent extract substantive content instead of UI chrome.
+  const _hostname = (() => { try { return new URL(startUrl).hostname.replace(/^www\./, ''); } catch (_) { return ''; } })();
+  const _contentExtraction = _hostname ? getContentExtractionConfig(_hostname) : null;
+  if (_contentExtraction?.primary_selector) {
+    const extractionHint = `
+\n## Content Extraction (discovered via scan mode)
+When extracting page content with run-code, prioritize these selectors over generic document.body:
+- Primary:   ${_contentExtraction.primary_selector}${_contentExtraction.fallback_selector ? `\n- Fallback:  ${_contentExtraction.fallback_selector}` : ''}
+- Type:      ${_contentExtraction.content_type}
+- Confidence: ${Math.round((_contentExtraction.confidence || 0) * 100)}%
+`;
+    _agentContext = (_agentContext + extractionHint).slice(0, 3200);
+    logger.info(`[browser.agent] run: injected content extraction hints for ${_hostname} (${_contentExtraction.primary_selector})`);
+  }
+
   try {
     const agentResult = await callSkill(_agentSkill, {
       goal: _effectiveTask,
@@ -2822,9 +2857,12 @@ async function actionRecordFailure({ id, failureEntry }) {
 // ---------------------------------------------------------------------------
 // actionExplore — resolve agent URL then invoke explore.agent
 // ---------------------------------------------------------------------------
-async function actionExplore({ agentId, goal, url, sessionId, maxDepth, maxNavItems }) {
+async function actionExplore({ agentId, goal, url, sessionId, maxDepth, maxNavItems, mode, _progressCallbackUrl }) {
   if (!agentId) return { ok: false, error: 'agentId is required' };
-  if (!goal)    return { ok: false, error: 'goal is required' };
+
+  // scan mode does not require a goal
+  const resolvedMode = mode || 'execute';
+  if (resolvedMode === 'execute' && !goal) return { ok: false, error: 'goal is required' };
 
   // Resolve start URL from agent descriptor (same pattern as actionRun)
   let existing = await actionQueryAgent({ id: agentId });
@@ -2844,17 +2882,37 @@ async function actionExplore({ agentId, goal, url, sessionId, maxDepth, maxNavIt
   if (!startUrl) return { ok: false, error: `No start URL for agent ${agentId}` };
 
   const exploreSessionId = sessionId || `${agentId}_explore`;
+
+  // scan mode — route directly to scanDomain (no goal needed)
+  if (resolvedMode === 'scan') {
+    logger.info(`[browser.agent] explore: scan mode — probing ${startUrl}`);
+    const { scanDomain } = require('./explore.agent.cjs');
+    return await scanDomain({ url: startUrl, agentId, sessionId: exploreSessionId, _progressCallbackUrl });
+  }
+
   logger.info(`[browser.agent] explore: goal="${goal}" url=${startUrl} session=${exploreSessionId}`);
 
-  const { exploreAgent } = require('./explore.agent.cjs');
-  return await exploreAgent({
+  const { exploreAgent, enqueueScan } = require('./explore.agent.cjs');
+  const result = await exploreAgent({
     goal,
     url: startUrl,
     agentId,
     sessionId: exploreSessionId,
     maxDepth: maxDepth || 4,
     maxNavItems: maxNavItems || 20,
+    mode: resolvedMode,
+    _progressCallbackUrl,
   });
+
+  // After a successful execute run, enqueue a background post-automation scan
+  // Only if the run succeeded and the map hasn't been updated in the last 24h
+  if (result?.ok && result?.done) {
+    try {
+      enqueueScan({ url: startUrl, agentId, _progressCallbackUrl }, 'post_automation');
+    } catch (_) { /* non-fatal */ }
+  }
+
+  return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -2883,6 +2941,10 @@ async function browserAgent(args) {
     case 'explore':
       return await actionExplore(args);
 
+    case 'scan_domain':
+      // Shortcut for mode:scan — background probe without a goal
+      return await actionExplore({ ...args, mode: 'scan' });
+
     case 'scan_page':
       return await actionScanPage(args);
 
@@ -2892,7 +2954,7 @@ async function browserAgent(args) {
     default:
       return {
         ok: false,
-        error: `Unknown action: "${action}". Valid: build_agent | query_agent | list_agents | validate_agent | run | explore | scan_page | record_failure`,
+        error: `Unknown action: "${action}". Valid: build_agent | query_agent | list_agents | validate_agent | run | explore | scan_domain | scan_page | record_failure`,
       };
   }
 }
