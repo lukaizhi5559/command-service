@@ -1197,6 +1197,19 @@ async function playwrightAgent(args) {
       } else if (step.action === 'find-text') {
         const code = `async page => { await page.getByText(${JSON.stringify(step.text)}).first().click(); }`;
         outcome = await browserAct({ action: 'run-code', code, sessionId, headed, timeoutMs });
+      } else if (step.action === 'getPageText') {
+        // ── Universal waitForStableText guard ─────────────────────────────────
+        // Ensure the page has stopped changing before we read it.
+        // If the last executed step was already waitForStableText (or waitForNavigation),
+        // skip the auto-inject to avoid double-polling.
+        // This is intentionally unconditional — works for AI chat, search results,
+        // stock filters, form submissions, or any page where response time is unknown.
+        const _lastAction = transcript.length > 0 ? transcript[transcript.length - 1].action?.action : null;
+        if (_lastAction !== 'waitForStableText' && _lastAction !== 'waitForNavigation') {
+          logger.info(`[playwright.agent] auto-injecting waitForStableText before getPageText (last step: ${_lastAction || 'none'})`);
+          await browserAct({ action: 'waitForStableText', sessionId, headed, timeoutMs: 30000 });
+        }
+        outcome = await browserAct({ action: 'getPageText', sessionId, headed, timeoutMs });
       } else if (step.action === 'wait') {
         const ms = Math.min(parseInt(step.ms || step.duration || 2000, 10), 5000);
         await new Promise(r => setTimeout(r, ms));

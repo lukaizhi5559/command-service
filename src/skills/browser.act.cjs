@@ -1593,11 +1593,24 @@ async function browserAct(args) {
         if (!alreadyOpen) {
           const probeSnap = await cliRun([...S, 'snapshot'], 4000).catch(() => null);
           const probeText = (probeSnap?.stdout || '').toLowerCase();
-          const RESTORE_DIALOG = /restore pages?\?|chrome didn't shut down correctly|help make google chrome better/i;
+          const RESTORE_DIALOG = /restore pages\?|chrome didn't shut down correctly|help make google chrome better/i;
           if (RESTORE_DIALOG.test(probeText)) {
             logger.info(`[browser.act] cold-start: Chrome restore dialog detected — sending goto ${url} to dismiss`);
             await cliRun([...S, 'goto', url], navTimeout).catch(() => {});
           }
+        }
+
+        // Handle permission popups (microphone, camera, etc.) that block page interaction
+        // These appear as native Chrome permission dialogs and must be dismissed
+        const permissionProbe = await cliRun([...S, 'snapshot'], 3000).catch(() => null);
+        const permissionText = (permissionProbe?.stdout || '').toLowerCase();
+        const PERMISSION_DIALOG = /wants to|would like to|permission|microphone|camera|notifications/i;
+        if (PERMISSION_DIALOG.test(permissionText)) {
+          logger.info(`[browser.act] Permission dialog detected — dismissing with Escape`);
+          // Press Escape to dismiss permission dialog, then Tab to move focus away
+          await cliRun([...S, 'press', 'Escape'], 2000).catch(() => {});
+          await new Promise(r => setTimeout(r, 200));
+          await cliRun([...S, 'press', 'Tab'], 2000).catch(() => {});
         }
 
         // Non-blocking post-nav verification so we can detect successful command
@@ -1794,7 +1807,11 @@ async function browserAct(args) {
       // focus on contenteditable chip fields — skip it for those field types.
       await new Promise(r => setTimeout(r, 100));
       const _chipProbe = await cliRun([...S, 'eval',
-        'document.activeElement && (document.activeElement.isContentEditable || ' +
+        'document.activeElement && ' +
+        'document.activeElement.tagName !== "TEXTAREA" && ' +
+        'document.activeElement.tagName !== "INPUT" && ' +
+        'document.activeElement.getAttribute("aria-multiline") !== "true" && ' +
+        '(document.activeElement.isContentEditable || ' +
         'document.activeElement.getAttribute("role") === "combobox" || ' +
         'document.activeElement.getAttribute("aria-autocomplete") !== null || ' +
         '!!document.activeElement.closest("[role=combobox]")) ? "chip" : "normal"'

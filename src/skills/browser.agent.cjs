@@ -2657,7 +2657,7 @@ When extracting page content with run-code, prioritize these selectors over gene
         // matching which causes false positives on synonyms / paraphrased results.
         const _longLines = _lines.filter(l => l.trim().split(/\s+/).length > 6).length;
         const _totalWords = agentResultText.trim().split(/\s+/).filter(Boolean).length;
-        const _isSparse = _longLines < 5 && _totalWords < 120;
+        const _isSparse = _longLines < 3 && _totalWords < 60;
         if (_isSparse) {
           logger.warn(`[browser.agent] Research quality gate: sparse content for ${agentId} (longLines=${_longLines}, totalWords=${_totalWords}) — marking researchContentEmpty`);
           return {
