@@ -42,11 +42,11 @@ const SERVICE_UNAVAILABLE_PATTERNS = [
   /\bservice\s+unavailable\b/i,
   /\boutage\b/i,
   /\bdegraded\s+service\b/i,
-  /\b(?:error\s*)?404\b/i,
-  /\b(?:error\s*)?429\b/i,
-  /\b(?:error\s*)?500\b/i,
-  /\b(?:error\s*)?502\b/i,
-  /\b(?:error\s*)?503\b/i,
+  /\b(error\s+404|http\s+404|status\s+404|404\s+not\s+found|404\s+error)\b/i,
+  /\b(error\s+429|http\s+429|status\s+429|429\s+too\s+many|rate\s+limited\s+429)\b/i,
+  /\b(error\s+500|http\s+500|status\s+500|500\s+internal\s+server|500\s+error|internal\s+server\s+error\s+500)\b/i,
+  /\b(error\s+502|http\s+502|status\s+502|502\s+bad\s+gateway|502\s+error)\b/i,
+  /\b(error\s+503|http\s+503|status\s+503|503\s+service\s+unavailable|503\s+error)\b/i,
   /\bpage\s+not\s+found\b/i,
   /\binternal\s+server\s+error\b/i,
   /\bbad\s+gateway\b/i,
@@ -66,6 +66,28 @@ const SERVICE_UNAVAILABLE_PATTERNS = [
   /\bupgrade\s+required\b/i,
   /\bplan\s+required\b/i,
 ];
+
+// ---------------------------------------------------------------------------
+// Auth-check result cache — avoids repeated navigate+evaluate probes
+// Key: agentId  Value: { ts: Date.now(), authNeeded: bool }
+// TTL: 60s — re-probe if the last confirmed-ok check is older than this.
+// ---------------------------------------------------------------------------
+const AUTH_CHECK_CACHE_TTL_MS = 60_000;
+const _authCheckCache = new Map(); // agentId → { ts, authNeeded }
+
+function _getCachedAuthCheck(agentId) {
+  const entry = _authCheckCache.get(agentId);
+  if (!entry) return null;
+  if (Date.now() - entry.ts > AUTH_CHECK_CACHE_TTL_MS) {
+    _authCheckCache.delete(agentId);
+    return null;
+  }
+  return entry;
+}
+
+function _setCachedAuthCheck(agentId, authNeeded) {
+  _authCheckCache.set(agentId, { ts: Date.now(), authNeeded });
+}
 
 // ---------------------------------------------------------------------------
 // Domain Map helpers — content extraction discovery from explore.agent scan mode
@@ -194,7 +216,7 @@ const KNOWN_BROWSER_SERVICES = {
   mastodon:       { startUrl: 'https://mastodon.social',                         signInUrl: 'https://mastodon.social/auth/sign_in',              authSuccessPattern: 'mastodon.social/home',         isOAuth: true  },
   bluesky:        { startUrl: 'https://bsky.app',                                signInUrl: 'https://bsky.app/login',                            authSuccessPattern: 'bsky.app',                     isOAuth: true  },
   threads:        { startUrl: 'https://www.threads.net',                         signInUrl: 'https://www.threads.net/login',                     authSuccessPattern: 'threads.net',                  isOAuth: true  },
-  youtube:        { startUrl: 'https://studio.youtube.com',                      signInUrl: 'https://accounts.google.com/signin/v2/identifier',  authSuccessPattern: 'studio.youtube.com',           isOAuth: true  },
+  youtube:        { startUrl: 'https://www.youtube.com',                         signInUrl: 'https://accounts.google.com/signin/v2/identifier',  authSuccessPattern: 'youtube.com',                  isOAuth: false },
   twitch:         { startUrl: 'https://www.twitch.tv',                           signInUrl: 'https://www.twitch.tv/login',                       authSuccessPattern: 'twitch.tv',                    isOAuth: true  },
   // ── Developer tools ─────────────────────────────────────────────────────────────────────────────────
   github:         { startUrl: 'https://github.com',                              signInUrl: 'https://github.com/login',                          authSuccessPattern: 'github.com/',                  isOAuth: true  },
@@ -2192,7 +2214,14 @@ async function actionRun({ agentId, task, url, context, requiresAuth, _progressC
     const _hasPersistentProfile = sessionId.includes('agent');
     const _stateFile = path.join(os.homedir(), '.thinkdrop', 'browser-sessions', `${sessionId}.json`);
     if (_hasPersistentProfile) {
-      logger.info(`[browser.agent] run: persistent-profile session — skipping JSON state-load, Chrome cookie store handles auth for ${agentId}`);
+      // ── Auth-check cache hit — skip navigate+evaluate if recently confirmed ──
+      const _cachedAuth = _getCachedAuthCheck(agentId);
+      if (_cachedAuth && !_cachedAuth.authNeeded) {
+        logger.info(`[browser.agent] run: auth-check cache hit for ${agentId} (${Math.round((Date.now() - _cachedAuth.ts) / 1000)}s ago) — skipping auth probe`);
+        _skipNavigate = true;
+      } else {
+        logger.info(`[browser.agent] run: persistent-profile session — skipping JSON state-load, Chrome cookie store handles auth for ${agentId}`);
+      }
     } else if (fs.existsSync(_stateFile)) {
       logger.info(`[browser.agent] run: state file found for ${agentId} — loading persisted auth state`);
       const _loadRes = await callBrowserAct({ action: 'state-load', sessionId, timeoutMs: 10000 }, 12000).catch(() => ({ ok: false }));
@@ -2256,6 +2285,7 @@ async function actionRun({ agentId, task, url, context, requiresAuth, _progressC
           _authNeeded = true;
         } else {
           logger.info(`[browser.agent] run: auth-check: no login redirect${_curHref ? ` (${_curHref})` : ''} — skipping waitForAuth for ${agentId}`);
+          _setCachedAuthCheck(agentId, false);
         }
       }
     } catch (_probeErr) {
@@ -2339,6 +2369,7 @@ async function actionRun({ agentId, task, url, context, requiresAuth, _progressC
       // Persistent-profile sessions: the Chrome profile dir already persists cookies/IndexedDB.
       // JSON state-save is redundant for *_agent sessions and creates stale files that
       // interfere on next run (Google rejects injected JSON cookies). Skip it.
+      _setCachedAuthCheck(agentId, false);
       if (!_hasPersistentProfile) {
         logger.info(`[browser.agent] run: auth succeeded — saving browser state for ${agentId}`);
         await callBrowserAct({ action: 'state-save', sessionId, timeoutMs: 10000 }, 12000).catch(e => {

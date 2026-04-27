@@ -2693,6 +2693,14 @@ async function browserAct(args) {
             const firstLine = cur.split('\n')[0].trim();
             const isAuthWall = AUTH_WALL_FIRST.test(firstLine) || AUTH_WALL_BODY.test(cur.slice(0, 500)) || AUTH_WALL_LOGGEDOUT.test(cur.slice(0, 600));
             if (isAuthWall) {
+              // If the page has substantial content (>100 words), the auth overlay is
+              // transient (e.g. Gemini "sign in to save history" banner on top of a real
+              // response). Return the content rather than blanking it out.
+              const wordCount = cur.trim().split(/\s+/).filter(Boolean).length;
+              if (wordCount > 100) {
+                logger.info(`[browser.act] waitForStableText: auth overlay detected but page has ${wordCount} words — returning content (transient overlay)`);
+                return { ok: true, action, sessionId, result: cur, executionTime: Date.now() - start };
+              }
               logger.info(`[browser.act] waitForStableText: auth wall detected for session=${sessionId}`);
               return { ok: true, action, sessionId, result: '', stdout: '', authRequired: true, authWallText: cur.slice(0, 100), executionTime: Date.now() - start };
             }
