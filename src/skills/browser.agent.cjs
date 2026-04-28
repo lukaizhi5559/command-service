@@ -1073,8 +1073,11 @@ function deriveAgentType(meta) {
 // Action: build_agent
 // ---------------------------------------------------------------------------
 
-function buildBrowserDescriptorMd({ id, service, startUrl, signInUrl, authSuccessPattern, capabilities, type = 'browser', playbooks = null }) {
+function buildBrowserDescriptorMd({ id, service, startUrl, signInUrl, authSuccessPattern, capabilities, type = 'browser', playbooks = null, goals = null }) {
   const capYaml = capabilities.map(c => `  - ${c}`).join('\n');
+  const goalsYaml = goals && goals.length > 0
+    ? goals.map(g => `  - "${g.replace(/"/g, '\\"')}"`).join('\n')
+    : '  - "General task automation"';
   const parts = [
     '---',
     `id: ${id}`,
@@ -1085,6 +1088,10 @@ function buildBrowserDescriptorMd({ id, service, startUrl, signInUrl, authSucces
     `auth_success_pattern: ${authSuccessPattern}`,
     `capabilities:`,
     capYaml,
+    `user_goals:`,
+    goalsYaml,
+    `learned_states: []`,
+    `trained_skills: []`,
     '---',
     `# start_url is the service home/dashboard (used as auth entry point and post-auth navigation target).`,
     '',
@@ -1112,7 +1119,7 @@ function buildBrowserDescriptorMd({ id, service, startUrl, signInUrl, authSucces
   return parts.join('\n');
 }
 
-async function actionBuildAgent({ service, startUrl: explicitUrl, force = false }) {
+async function actionBuildAgent({ service, startUrl: explicitUrl, force = false, goals = null }) {
   if (!service) return { ok: false, error: 'service is required' };
 
   const serviceKey = service.toLowerCase().replace(/[^a-z0-9]/g, '');
@@ -1174,7 +1181,7 @@ async function actionBuildAgent({ service, startUrl: explicitUrl, force = false 
   // successful run can upgrade to 'healthy'. Seeded playbooks are battle-tested — healthy directly.
   const initialStatus = playbooksSource === 'generated' ? 'needs_validation' : 'healthy';
 
-  const descriptor = buildBrowserDescriptorMd({ id: agentId, service: serviceKey, startUrl, signInUrl, authSuccessPattern, capabilities, type: agentType, playbooks });
+  const descriptor = buildBrowserDescriptorMd({ id: agentId, service: serviceKey, startUrl, signInUrl, authSuccessPattern, capabilities, type: agentType, playbooks, goals });
 
   // Write .md to disk
   fs.mkdirSync(AGENTS_DIR, { recursive: true });
