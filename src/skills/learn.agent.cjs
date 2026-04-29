@@ -69,7 +69,7 @@ async function actionLearn(args) {
   }
 
   // Load agent descriptor
-  const agentPath = path.join(AGENTS_DIR, `${agentId}.md`);
+  const agentPath = path.join(AGENTS_DIR, `${agentId}.agent.md`);
   if (!fs.existsSync(agentPath)) {
     return { ok: false, error: `Agent not found: ${agentId}` };
   }
@@ -127,7 +127,7 @@ async function actionLearn(args) {
       });
       
       // Use browser.agent's waitForAuth pattern
-      const browserAct = require('./browser.act.cjs');
+      const { browserAct } = require('./browser.act.cjs');
       const signInUrl = signInUrlMatch ? signInUrlMatch[1].trim() : startUrl;
       const authPattern = authPatternMatch ? authPatternMatch[1].trim() : hostname;
       

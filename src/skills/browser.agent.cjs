@@ -2867,6 +2867,104 @@ async function actionScanPage({ service, url: explicitUrl, secretKey }) {
 }
 
 // ---------------------------------------------------------------------------
+// Action: delete_agent — remove all artifacts tied to an agent
+// ---------------------------------------------------------------------------
+
+async function actionDeleteAgent({ id }) {
+  if (!id) return { ok: false, error: 'id is required' };
+
+  const deleted = [];
+  const errors  = [];
+
+  // ── 1. Read descriptor before deleting (need hostname for domain-map) ──────
+  let hostname = null;
+  const agentMdPath = path.join(AGENTS_DIR, `${id}.agent.md`);
+  if (fs.existsSync(agentMdPath)) {
+    try {
+      const desc = fs.readFileSync(agentMdPath, 'utf8');
+      const urlMatch = desc.match(/^start_url:\s*(.+)$/m);
+      if (urlMatch) {
+        try { hostname = new URL(urlMatch[1].trim()).hostname.replace(/^www\./, ''); } catch (_) {}
+      }
+    } catch (_) {}
+    try { fs.rmSync(agentMdPath, { force: true }); deleted.push(agentMdPath); } catch (e) { errors.push(e.message); }
+  }
+
+  // ── 2. DuckDB: agents table + browser_meta_cache ────────────────────────────
+  try {
+    const db = await getDb();
+    if (db) {
+      const service = id.replace(/\.agent$/, '');
+      await db.run('DELETE FROM agents WHERE id = ?', id).catch(() => {});
+      deleted.push(`DuckDB agents row: ${id}`);
+      await db.run('DELETE FROM browser_meta_cache WHERE service = ?', service).catch(() => {});
+      deleted.push(`DuckDB meta_cache row: ${service}`);
+    }
+  } catch (e) { errors.push(`DuckDB: ${e.message}`); }
+
+  // ── 3. Domain map JSON ───────────────────────────────────────────────────────
+  if (hostname) {
+    const domainMapPath = path.join(os.homedir(), '.thinkdrop', 'domain-maps', `${hostname}.json`);
+    if (fs.existsSync(domainMapPath)) {
+      try { fs.rmSync(domainMapPath, { force: true }); deleted.push(domainMapPath); } catch (e) { errors.push(e.message); }
+    }
+  }
+
+  // ── 4. Browser profile dir (persistent Chrome cookies) ──────────────────────
+  const service = id.replace(/\.agent$/, '');
+  const profileName = `${service}_agent`;
+  const profileDir = path.join(os.homedir(), '.thinkdrop', 'browser-profiles', profileName);
+  if (fs.existsSync(profileDir)) {
+    try { fs.rmSync(profileDir, { recursive: true, force: true }); deleted.push(profileDir); } catch (e) { errors.push(e.message); }
+  }
+
+  // ── 5. AB-sessions auth JSON ─────────────────────────────────────────────────
+  const abSessionFile = path.join(os.homedir(), '.thinkdrop', 'ab-sessions', `${profileName}.json`);
+  if (fs.existsSync(abSessionFile)) {
+    try { fs.rmSync(abSessionFile, { force: true }); deleted.push(abSessionFile); } catch (e) { errors.push(e.message); }
+  }
+
+  // ── 6. agent-profile sessions JSON ──────────────────────────────────────────
+  const agentProfileFile = path.join(os.homedir(), '.thinkdrop', 'agent-profile', `${profileName}.json`);
+  if (fs.existsSync(agentProfileFile)) {
+    try { fs.rmSync(agentProfileFile, { force: true }); deleted.push(agentProfileFile); } catch (e) { errors.push(e.message); }
+  }
+
+  // ── 7. Temp validate/scan dirs in ab-sessions ────────────────────────────────
+  const abDir = path.join(os.homedir(), '.thinkdrop', 'ab-sessions');
+  if (fs.existsSync(abDir)) {
+    try {
+      const entries = fs.readdirSync(abDir);
+      for (const entry of entries) {
+        if (entry.startsWith(`${id}_`) || entry.startsWith(`${service}.agent_`) || entry.startsWith(`${profileName}_`)) {
+          const fullPath = path.join(abDir, entry);
+          try { fs.rmSync(fullPath, { recursive: true, force: true }); deleted.push(fullPath); } catch (e) { errors.push(e.message); }
+        }
+      }
+    } catch (_) {}
+  }
+
+  // ── 8. scan-state.json — remove from lastRunAgents ───────────────────────────
+  const scanStatePath = path.join(os.homedir(), '.thinkdrop', 'scan-state.json');
+  if (fs.existsSync(scanStatePath)) {
+    try {
+      const scanState = JSON.parse(fs.readFileSync(scanStatePath, 'utf8'));
+      if (Array.isArray(scanState.lastRunAgents)) {
+        const before = scanState.lastRunAgents.length;
+        scanState.lastRunAgents = scanState.lastRunAgents.filter(a => a !== id && a !== `${service}.agent`);
+        if (scanState.lastRunAgents.length !== before) {
+          fs.writeFileSync(scanStatePath, JSON.stringify(scanState, null, 2), 'utf8');
+          deleted.push(`scan-state.json entry: ${id}`);
+        }
+      }
+    } catch (e) { errors.push(`scan-state.json: ${e.message}`); }
+  }
+
+  logger.info(`[browser.agent] delete_agent: removed ${deleted.length} artifacts for ${id}`, { deleted, errors });
+  return { ok: true, deleted, errors };
+}
+
+// ---------------------------------------------------------------------------
 // Action: record_failure — append a runtime error to failure_log
 // ---------------------------------------------------------------------------
 
@@ -2986,16 +3084,19 @@ async function browserAgent(args) {
     case 'scan_page':
       return await actionScanPage(args);
 
+    case 'delete_agent':
+      return await actionDeleteAgent(args);
+
     case 'record_failure':
       return await actionRecordFailure(args);
 
     default:
       return {
         ok: false,
-        error: `Unknown action: "${action}". Valid: build_agent | query_agent | list_agents | validate_agent | run | explore | scan_domain | scan_page | record_failure`,
+        error: `Unknown action: "${action}". Valid: build_agent | query_agent | list_agents | validate_agent | run | explore | scan_domain | scan_page | delete_agent | record_failure`,
       };
   }
 }
 
-module.exports = { browserAgent, KNOWN_BROWSER_SERVICES };
+module.exports = { browserAgent, KNOWN_BROWSER_SERVICES, actionDeleteAgent };
 module.exports._deriveAgentType = deriveAgentType;

@@ -67,7 +67,7 @@ async function actionTrain(args) {
   }
 
   // Load agent descriptor
-  const agentPath = path.join(AGENTS_DIR, `${agentId}.md`);
+  const agentPath = path.join(AGENTS_DIR, `${agentId}.agent.md`);
   if (!fs.existsSync(agentPath)) {
     return { ok: false, error: `Agent not found: ${agentId}` };
   }

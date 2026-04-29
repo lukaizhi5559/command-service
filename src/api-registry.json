@@ -96,7 +96,7 @@
     "defaultProvider": "stripe"
   },
   "openai": {
-    "keywords": ["openai", "gpt", "chatgpt", "dalle", "whisper", "ai completion", "text generation", "image generation"],
+    "keywords": ["openai", "dalle", "ai completion", "text generation", "image generation"],
     "providers": {
       "openai": {
         "npm": "openai",

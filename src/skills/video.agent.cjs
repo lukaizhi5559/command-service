@@ -76,35 +76,28 @@ async function extractMetadata(videoUrl, platform, browserAct) {
 
     // Extract duration based on platform
     let duration = 0;
-    
+
     if (platform === 'youtube') {
-      // Try to get duration from player
-      const result = await browserAct({
-        action: 'run-code',
-        code: `async page => {
-          const player = document.querySelector('video');
-          if (player) return { duration: player.duration || 0 };
-          // Fallback: extract from DOM
-          const timeEl = document.querySelector('.ytp-time-duration');
-          if (timeEl) {
-            const parts = timeEl.textContent.split(':').map(Number);
-            if (parts.length === 2) return { duration: parts[0] * 60 + parts[1] };
-            if (parts.length === 3) return { duration: parts[0] * 3600 + parts[1] * 60 + parts[2] };
-          }
-          return { duration: 0 };
-        }`
+      // Try to get duration from YouTube's movie_player or video element
+      const durationResult = await browserAct({
+        action: 'evaluate',
+        expression: `
+          (() => {
+            const player = document.getElementById('movie_player');
+            if (player && player.getDuration) return player.getDuration();
+            const video = document.querySelector('video');
+            return video ? video.duration : 0;
+          })()
+        `
       });
-      duration = result?.duration || 0;
+      duration = durationResult?.result || parseFloat(durationResult?.stdout || 0) || 0;
     } else {
       // Generic: try to find video element
-      const result = await browserAct({
-        action: 'run-code',
-        code: `async page => {
-          const video = document.querySelector('video');
-          return { duration: video?.duration || 0 };
-        }`
+      const durationResult = await browserAct({
+        action: 'evaluate',
+        expression: `document.querySelector('video')?.duration || 0`
       });
-      duration = result?.duration || 0;
+      duration = durationResult?.result || parseFloat(durationResult?.stdout || 0) || 0;
     }
 
     return { ok: true, duration };
@@ -121,49 +114,52 @@ async function extractYouTubeText(videoUrl, browserAct) {
   const sources = { transcript: null, description: null, comments: [] };
   
   try {
-    // Try to get transcript
-    await browserAct({
-      action: 'run-code',
-      code: `async page => {
-        // Click transcript button if available
-        const transcriptBtn = document.querySelector('button[aria-label*="transcript"], button[title*="transcript"]');
-        if (transcriptBtn) transcriptBtn.click();
-        return { clicked: !!transcriptBtn };
-      }`
+    // Try to get transcript - use evaluate to check and click transcript button
+    const hasTranscriptBtn = await browserAct({
+      action: 'evaluate',
+      expression: `!!document.querySelector('button[aria-label*="transcript"], button[title*="transcript"]')`
     });
     
-    await new Promise(r => setTimeout(r, 1000));
+    if (hasTranscriptBtn?.result) {
+      await browserAct({
+        action: 'click',
+        selector: 'button[aria-label*="transcript"], button[title*="transcript"]'
+      });
+      await new Promise(r => setTimeout(r, 1000));
+    }
     
+    // Extract transcript segments using evaluate
     const transcriptResult = await browserAct({
-      action: 'run-code',
-      code: `async page => {
-        const segments = document.querySelectorAll('ytd-transcript-segment-renderer');
-        if (segments.length === 0) return { transcript: null };
-        
-        const texts = [];
-        segments.forEach(seg => {
-          const text = seg.querySelector('.segment-text')?.textContent;
-          const time = seg.querySelector('.segment-timestamp')?.textContent;
-          if (text) texts.push({ time, text });
-        });
-        return { transcript: texts };
-      }`
+      action: 'evaluate',
+      expression: `
+        (() => {
+          const segments = document.querySelectorAll('ytd-transcript-segment-renderer');
+          if (segments.length === 0) return null;
+          
+          const texts = [];
+          segments.forEach(seg => {
+            const text = seg.querySelector('.segment-text')?.textContent;
+            const time = seg.querySelector('.segment-timestamp')?.textContent;
+            if (text) texts.push({ time, text });
+          });
+          return texts;
+        })()
+      `
     });
     
-    if (transcriptResult?.transcript) {
-      sources.transcript = transcriptResult.transcript;
+    if (transcriptResult?.result) {
+      sources.transcript = transcriptResult.result;
     }
 
-    // Get description
+    // Get description using evaluate
     const descResult = await browserAct({
-      action: 'run-code',
-      code: `async page => {
-        const desc = document.querySelector('#description-inline-expander, #description, [class*="description"]');
-        return { description: desc?.textContent?.substring(0, 2000) || null };
-      }`
+      action: 'evaluate',
+      expression: `
+        document.querySelector('#description-inline-expander, #description, [class*="description"]')?.textContent?.substring(0, 2000) || null
+      `
     });
     
-    sources.description = descResult?.description;
+    sources.description = descResult?.result || descResult?.stdout;
 
   } catch (err) {
     logger.warn(`[video.agent] Failed to extract YouTube text: ${err.message}`);
@@ -226,23 +222,16 @@ async function sampleVideoWithOcr(videoUrl, samplePoints, platform, browserAct) 
 
     for (const seconds of samplePoints) {
       // Seek to timestamp
-      if (platform === 'youtube') {
-        await browserAct({
-          action: 'run-code',
-          code: `async page => { 
-            const player = document.querySelector('video');
-            if (player) player.currentTime = ${seconds};
-          }`
-        });
-      } else {
-        await browserAct({
-          action: 'run-code',
-          code: `async page => {
+      await browserAct({
+        action: 'evaluate',
+        expression: `
+          (() => {
             const video = document.querySelector('video');
             if (video) video.currentTime = ${seconds};
-          }`
-        });
-      }
+            return true;
+          })()
+        `
+      });
       
       await new Promise(r => setTimeout(r, 1500)); // Wait for frame + UI
       
@@ -479,38 +468,41 @@ async function actionFindAndWatchTutorial({ platform, query, goal }, dependencie
 
     await new Promise(r => setTimeout(r, 2000));
 
-    // Extract video results with durations
-    const videos = await browserAct({
-      action: 'run-code',
-      code: `async page => {
-        const results = [];
-        const items = document.querySelectorAll('ytd-video-renderer, ytd-grid-video-renderer');
-        
-        for (const item of items.slice(0, 5)) {
-          const link = item.querySelector('a#video-title, a[title]');
-          const titleEl = item.querySelector('#video-title, .video-title');
-          const durationEl = item.querySelector('.ytd-thumbnail-overlay-time-status-renderer, .badge-shape-wiz__text');
+    // Extract video results with durations using evaluate
+    const videosResult = await browserAct({
+      action: 'evaluate',
+      expression: `
+        (() => {
+          const results = [];
+          const items = document.querySelectorAll('ytd-video-renderer, ytd-grid-video-renderer');
           
-          if (link && titleEl) {
-            const durationText = durationEl?.textContent?.trim() || '';
-            const parts = durationText.split(':').map(Number);
-            let seconds = 0;
-            if (parts.length === 2) seconds = parts[0] * 60 + parts[1];
-            if (parts.length === 3) seconds = parts[0] * 3600 + parts[1] * 60 + parts[2];
+          for (const item of items.slice(0, 5)) {
+            const link = item.querySelector('a#video-title, a[title]');
+            const titleEl = item.querySelector('#video-title, .video-title');
+            const durationEl = item.querySelector('.ytd-thumbnail-overlay-time-status-renderer, .badge-shape-wiz__text');
             
-            // Filter: 3-10 minutes for tutorials
-            if (seconds >= 180 && seconds <= 600) {
-              results.push({
-                title: titleEl.textContent.trim(),
-                url: link.href,
-                duration: seconds
-              });
+            if (link && titleEl) {
+              const durationText = durationEl?.textContent?.trim() || '';
+              const parts = durationText.split(':').map(Number);
+              let seconds = 0;
+              if (parts.length === 2) seconds = parts[0] * 60 + parts[1];
+              if (parts.length === 3) seconds = parts[0] * 3600 + parts[1] * 60 + parts[2];
+              
+              // Filter: 3-10 minutes for tutorials
+              if (seconds >= 180 && seconds <= 600) {
+                results.push({
+                  title: titleEl.textContent.trim(),
+                  url: link.href,
+                  duration: seconds
+                });
+              }
             }
           }
-        }
-        return results;
-      }`
-    }) || [];
+          return results;
+        })()
+      `
+    });
+    const videos = videosResult?.result || [] || [];
 
     if (videos.length === 0) {
       return { ok: false, error: 'No suitable tutorials found (looking for 3-10 min videos)' };
