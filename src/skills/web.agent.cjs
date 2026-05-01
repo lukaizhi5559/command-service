@@ -11,6 +11,7 @@
  *   get_tutorial_steps { query }            → extracts step-by-step instructions from search results
  */
 
+const http   = require('http');
 const logger = require('../logger.cjs');
 
 // Web Search MCP configuration from environment
@@ -18,37 +19,70 @@ const WEB_SEARCH_API_URL = process.env.MCP_WEB_SEARCH_API_URL;
 const WEB_SEARCH_API_KEY = process.env.MCP_WEB_SEARCH_API_KEY;
 
 /**
- * Search the web using configured MCP web_search service
+ * Search the web using configured MCP web_search service.
+ * Mirrors the agentWebSearch pattern in browser.agent.cjs for correct envelope format.
  */
 async function searchWeb(query, maxResults = 5) {
   if (!WEB_SEARCH_API_URL) {
     logger.warn('[web.agent] Web search not configured - MCP_WEB_SEARCH_API_URL missing');
-    return { ok: false, error: 'Web search not configured' };
+    return { ok: false, skipped: true, error: 'Web search not configured' };
   }
 
+  let wsHostname, wsPort;
   try {
-    const response = await fetch(WEB_SEARCH_API_URL, {
+    const _u = new URL(WEB_SEARCH_API_URL);
+    wsHostname = _u.hostname;
+    wsPort = parseInt(_u.port) || 3002;
+  } catch (_) {
+    logger.warn('[web.agent] MCP_WEB_SEARCH_API_URL is not a valid URL — web search skipped');
+    return { ok: false, skipped: true, error: 'Web search URL is invalid' };
+  }
+
+  return new Promise((resolve) => {
+    const body = JSON.stringify({
+      version: 'mcp.v1',
+      service: 'web-search',
+      requestId: `ws_${Date.now()}`,
+      action: 'search',
+      payload: { query, maxResults },
+    });
+    const req = http.request({
+      hostname: wsHostname,
+      port: wsPort,
+      path: '/web.search',
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        ...(WEB_SEARCH_API_KEY && { 'Authorization': `Bearer ${WEB_SEARCH_API_KEY}` })
+        'Content-Length': Buffer.byteLength(body),
+        'Authorization': `Bearer ${WEB_SEARCH_API_KEY || ''}`,
       },
-      body: JSON.stringify({
-        query,
-        max_results: maxResults
-      })
+    }, (res) => {
+      let data = '';
+      res.on('data', c => { data += c; });
+      res.on('end', () => {
+        try {
+          const parsed = JSON.parse(data);
+          const results = parsed?.data?.results || parsed?.results || [];
+          logger.info(`[web.agent] searchWeb: ${results.length} results for "${query.slice(0, 60)}"`);
+          resolve({ ok: true, results });
+        } catch (e) {
+          logger.error(`[web.agent] searchWeb parse error: ${e.message}`);
+          resolve({ ok: false, error: e.message });
+        }
+      });
     });
-
-    if (!response.ok) {
-      throw new Error(`HTTP ${response.status}: ${await response.text()}`);
-    }
-
-    const data = await response.json();
-    return { ok: true, results: data.results || [] };
-  } catch (err) {
-    logger.error(`[web.agent] Search failed: ${err.message}`);
-    return { ok: false, error: err.message };
-  }
+    req.on('error', (e) => {
+      logger.error(`[web.agent] searchWeb request error: ${e.message}`);
+      resolve({ ok: false, error: e.message });
+    });
+    req.setTimeout(8000, () => {
+      req.destroy();
+      logger.warn(`[web.agent] searchWeb timed out for "${query.slice(0, 60)}"`);
+      resolve({ ok: false, error: 'web search timed out' });
+    });
+    req.write(body);
+    req.end();
+  });
 }
 
 /**

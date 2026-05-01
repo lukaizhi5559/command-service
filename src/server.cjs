@@ -9,6 +9,9 @@
  */
 
 require('dotenv').config();
+const fs   = require('fs');
+const os   = require('os');
+const path = require('path');
 const http = require('http');
 const logger = require('./logger.cjs');
 // Shared infrastructure for skills — intelligence + storage
@@ -40,7 +43,7 @@ const skillCreator = require('./skills/skillCreator.skill.cjs');
 const { screenCapture } = require('./skills/screen.capture.cjs');
 const { userAgent } = require('./skills/user.agent.cjs');
 const skillScheduler = require('./skill-helpers/skill-scheduler.cjs');
-const { startIdleWatcher, startScanScheduler, runMaintenanceScan, cancelMaintenanceScan, getScanStatus } = require('./skills/explore.agent.cjs');
+const { startIdleWatcher, stopIdleWatcher, startScanScheduler, runMaintenanceScan, cancelMaintenanceScan, getScanStatus } = require('./skills/explore.agent.cjs');
 
 class CommandServiceMCPServer {
   constructor() {
@@ -256,6 +259,32 @@ class CommandServiceMCPServer {
   async start() {
     logger.info('Starting Command Service MCP server (stdio)');
 
+    // ── Prune stale ephemeral browser profile dirs ───────────────────────────
+    // Background scans create per-hostname _scan_ and _validate_ dirs. With stable
+    // session names these only grow by 1 dir per hostname, but old timestamped dirs
+    // from before the fix accumulate. Delete any *_scan_* / *_validate_* dirs older
+    // than 48h so disk usage stays bounded. Named agent dirs are never touched.
+    try {
+      const profilesDir = path.join(os.homedir(), '.thinkdrop', 'browser-profiles');
+      const cutoffMs    = 48 * 60 * 60 * 1000;
+      const entries     = fs.readdirSync(profilesDir, { withFileTypes: true });
+      let pruned = 0;
+      for (const entry of entries) {
+        if (!entry.isDirectory()) continue;
+        const isEphemeral = /_scan_\d|_validate_\d/.test(entry.name);
+        if (!isEphemeral) continue;
+        const fullPath = path.join(profilesDir, entry.name);
+        const { mtimeMs } = fs.statSync(fullPath);
+        if (Date.now() - mtimeMs > cutoffMs) {
+          fs.rmSync(fullPath, { recursive: true, force: true });
+          pruned++;
+        }
+      }
+      if (pruned > 0) logger.info(`[Server] Pruned ${pruned} stale ephemeral browser profile dir(s)`);
+    } catch (err) {
+      logger.debug(`[Server] Profile dir cleanup skipped: ${err.message}`);
+    }
+
     // ── Warm up creator.agent DB (ensures projects table exists) ────────────
     creatorAgent({ action: 'list_projects' }).catch(() => {});
     reviewerAgent({ action: 'status', projectId: '__warmup__' }).catch(() => {});
@@ -268,9 +297,24 @@ class CommandServiceMCPServer {
     // ── explore.agent maintenance scan services ──────────────────────────────
     // Idle watcher: polls system idle every 5min, fires maintenance scan after 30min idle + 24h cooldown
     // Scan scheduler: reads ~/.thinkdrop/scan-schedule.json, registers node-cron job if configured
+    // Auto-scan is opt-in — check settings file before starting idle watcher
     try {
-      startIdleWatcher();
-      startScanScheduler();
+      let autoScanEnabled = false;
+      try {
+        const settingsPath = path.join(os.homedir(), '.thinkdrop', 'settings.json');
+        if (fs.existsSync(settingsPath)) {
+          const settings = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
+          autoScanEnabled = !!settings.autoScanEnabled;
+        }
+      } catch (_) { /* ignore read errors, default to false */ }
+      
+      if (autoScanEnabled) {
+        startIdleWatcher();
+        logger.info('[Server] Idle watcher started (auto-scan enabled)');
+      } else {
+        logger.info('[Server] Idle watcher not started (auto-scan disabled by default — enable in Agents tab)');
+      }
+      startScanScheduler(); // Always start scan scheduler (cron-based, user-configured)
     } catch (err) {
       logger.warn('[Server] explore.agent maintenance services failed to start (non-fatal)', { error: err.message });
     }
@@ -585,6 +629,30 @@ class CommandServiceMCPServer {
             startScanScheduler(); // re-register with new schedule
             res.writeHead(200);
             res.end(JSON.stringify({ ok: true, schedule: updated }));
+          } catch (err) {
+            res.writeHead(400);
+            res.end(JSON.stringify({ ok: false, error: err.message }));
+          }
+        });
+        return;
+      }
+
+      // ── POST /scan.idle-watcher — enable/disable idle watcher ────────────────
+      if (req.method === 'POST' && req.url === '/scan.idle-watcher') {
+        let body = '';
+        req.on('data', chunk => { body += chunk; });
+        req.on('end', () => {
+          try {
+            const { enabled } = JSON.parse(body || '{}');
+            if (enabled) {
+              startIdleWatcher();
+              logger.info('[IdleWatcher] Started via /scan.idle-watcher');
+            } else {
+              stopIdleWatcher();
+              logger.info('[IdleWatcher] Stopped via /scan.idle-watcher');
+            }
+            res.writeHead(200);
+            res.end(JSON.stringify({ ok: true, enabled: !!enabled }));
           } catch (err) {
             res.writeHead(400);
             res.end(JSON.stringify({ ok: false, error: err.message }));

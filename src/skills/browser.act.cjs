@@ -861,8 +861,10 @@ function clearProfileLock(sessionId) {
 
 // Determine if session should use persistent profile (skills best practice)
 function shouldUsePersistentProfile(sessionId) {
-  // Use persistent profiles for agent sessions to preserve auth state
-  return sessionId.includes('agent') || sessionId.includes('gmail') || sessionId.includes('slack') || sessionId.includes('notion');
+  // Use persistent profiles for all sessions except explicitly ephemeral/one-shot ones.
+  // Ephemeral sessions are anonymous, test, or temp — everything else persists cookies.
+  const ephemeral = ['anon', 'temp', 'test'];
+  return !ephemeral.some(k => sessionId.includes(k));
 }
 
 // Build base flags for a session (with skills-based persistent profiles)
@@ -884,9 +886,18 @@ function sessionFlags(sessionId, headed = true) {
 }
 
 // ---------------------------------------------------------------------------
-// Snapshot cache — stores last snapshot text per session for ref resolution
+// Snapshot cache — stores last snapshot text per session+tab for ref resolution
+// Keyed as "sessionId:tabIndex" so switching tabs restores the correct refs.
 // ---------------------------------------------------------------------------
-const snapshotCache = new Map(); // sessionId → snapshot text (cleared on navigate)
+const snapshotCache = new Map();    // "sessionId:tabIndex" → snapshot text
+const currentTabIndex = new Map();  // sessionId → current tab index (default 0)
+
+function _tabKey(sessionId) {
+  return `${sessionId}:${currentTabIndex.get(sessionId) || 0}`;
+}
+function _tabKeyFor(sessionId, idx) {
+  return `${sessionId}:${idx}`;
+}
 
 // Track which sessions have been opened (daemon started)
 const openSessions = new Set();
@@ -955,7 +966,7 @@ async function captureSnapshot(sessionId, headed, timeoutMs) {
     }
   }
   if (snapshotText) {
-    snapshotCache.set(sessionId, snapshotText);
+    snapshotCache.set(_tabKey(sessionId), snapshotText);
     // Store snapshot for debugging
     storeSnapshotForDebugging(sessionId, snapshotText);
   }
@@ -1130,7 +1141,7 @@ function resolveRef(sessionId, labelOrRef) {
   if (!labelOrRef) return null;
   if (/^e\d+$/i.test(labelOrRef.trim())) return labelOrRef.trim();
 
-  const snap = snapshotCache.get(sessionId) || '';
+  const snap = snapshotCache.get(_tabKey(sessionId)) || '';
   if (!snap) return null;
 
   const candidates = parseSnapshotCandidates(snap);
@@ -1152,7 +1163,7 @@ function resolveRefForClick(sessionId, labelOrRef) {
   if (!labelOrRef) return { ref: null, label: null };
   if (/^e\d+$/i.test(labelOrRef.trim())) return { ref: labelOrRef.trim(), label: labelOrRef.trim() };
 
-  const snap = snapshotCache.get(sessionId) || '';
+  const snap = snapshotCache.get(_tabKey(sessionId)) || '';
   if (!snap) return { ref: null, label: null };
 
   const candidates = parseSnapshotCandidates(snap);
@@ -1579,8 +1590,8 @@ async function browserAct(args) {
         }
       }
       const navCmd = alreadyOpen ? 'goto' : 'open';
-      // Invalidate snapshot cache and last-filled target — the page is changing
-      snapshotCache.delete(sessionId);
+      // Invalidate snapshot cache for current tab — the page is changing
+      snapshotCache.delete(_tabKey(sessionId));
       lastFilledTarget.delete(sessionId);
       // Before cold-starting, remove any stale SingletonLock from a previous crash
       if (!alreadyOpen) clearProfileLock(sessionId);
@@ -1660,7 +1671,9 @@ async function browserAct(args) {
 
     case 'close': {
       const res = await cliRun([...S, 'close'], timeoutMs);
-      snapshotCache.delete(sessionId);
+      // Clear all per-tab cache entries for this session
+      for (const k of snapshotCache.keys()) { if (k.startsWith(`${sessionId}:`)) snapshotCache.delete(k); }
+      currentTabIndex.delete(sessionId);
       openSessions.delete(sessionId);
       return { ok: res.ok, action, sessionId, executionTime: Date.now() - start, error: res.ok ? undefined : res.error };
     }
@@ -2122,7 +2135,7 @@ async function browserAct(args) {
 
       try {
         await captureSnapshot(sessionId, headed, timeoutMs);
-        const snap = snapshotCache.get(sessionId) || '';
+        const snap = snapshotCache.get(_tabKey(sessionId)) || '';
 
         // Locate the compose body. Caller can pin it via selector; otherwise
         // search the snapshot for a textbox whose name/label matches body-ish tokens.
@@ -2220,7 +2233,7 @@ async function browserAct(args) {
         while (Date.now() - uploadStart < uploadWaitMs) {
           await new Promise(r => setTimeout(r, UPLOAD_POLL_MS));
           await captureSnapshot(sessionId, headed, 5000).catch(() => null);
-          const snapText = (snapshotCache.get(sessionId) || '').slice(0, 3000);
+          const snapText = (snapshotCache.get(_tabKey(sessionId)) || '').slice(0, 3000);
           if (snapText === prevSnapText) {
             stableCount++;
             if (stableCount >= STABLE_REQUIRED) break;
@@ -2296,9 +2309,9 @@ async function browserAct(args) {
           await cliRun([...S, 'click', refocusTarget], 3000).catch(() => {});
           await new Promise(r => setTimeout(r, 150));
         }
-        // Enter triggers navigation — invalidate snapshot cache and lastFilledTarget
+        // Enter triggers navigation — invalidate per-tab snapshot cache and lastFilledTarget
         // so any subsequent fill/click gets a fresh snapshot with valid refs.
-        snapshotCache.delete(sessionId);
+        snapshotCache.delete(_tabKey(sessionId));
         lastFilledTarget.delete(sessionId);
 
         // Run press and treat navigation-kill exits as success.
@@ -2434,7 +2447,22 @@ async function browserAct(args) {
       const expr = text || selector || args.expression || '';
       const evalRef = args.ref || null;
       const evalArgs = evalRef ? ['eval', expr, evalRef] : ['eval', expr];
-      return run(evalArgs, `eval "${expr.slice(0, 60)}"`);
+      const evalRes = await run(evalArgs, `eval "${expr.slice(0, 60)}"`);
+      if (!evalRes.ok) return evalRes;
+      
+      // Extract value from markdown wrapper: ### Result\n"value"\n### Ran...
+      const stdout = evalRes.stdout || '';
+      const match = stdout.match(/###\s*Result\s*\n([\s\S]*?)(?=###|$)/i);
+      const result = match ? match[1].trim().replace(/^["']|["']$/g, '') : stdout.trim();
+      
+      return {
+        ok: true,
+        action,
+        sessionId,
+        result,
+        stdout: evalRes.stdout,
+        executionTime: evalRes.executionTime
+      };
     }
 
     // ── run-code ──────────────────────────────────────────────────────────────
@@ -2764,6 +2792,7 @@ async function browserAct(args) {
       const getHost = (u) => { try { return new URL(u).hostname; } catch (_) { return ''; } };
       let lastLimboUrl = null;     // anti-loop guard
       let backToSignInCount = 0;   // RC2: hard stop — max 3 code-triggered back-to-sign-in navigations
+      let _wasOnOAuthProvider = false; // tracks that user visited a 3rd-party OAuth provider this session
 
       // Default timeout: 120s — enough for a human to complete 2FA or MFA
       const effectiveTimeout = Math.min(timeoutMs || 120000, 120000);
@@ -2781,7 +2810,7 @@ async function browserAct(args) {
         }
         const navCmd = alreadyOpen ? 'goto' : 'open';
         if (!alreadyOpen) clearProfileLock(sessionId);
-        snapshotCache.delete(sessionId);
+        snapshotCache.delete(_tabKey(sessionId));
         const navRes = await cliRun([...S, navCmd, url], navTimeout);
         if (navRes.ok) openSessions.add(sessionId);
         logger.info(`[browser.act] waitForAuth: navigated to ${url} on session=${sessionId} (cmd=${navCmd}, ok=${navRes.ok})`);
@@ -2884,7 +2913,7 @@ async function browserAct(args) {
           const _snapRes = await cliRun([...S, 'snapshot'], 8000).catch(() => ({}));
           const _snapText = (_snapRes.stdout || '').trim();
           if (!_snapText) { logger.warn(`[browser.act] waitForAuth: auth-loop step ${_step + 1} — empty snapshot, stopping`); break; }
-          snapshotCache.set(sessionId, _snapText);
+          snapshotCache.set(_tabKey(sessionId), _snapText);
 
           // 3. Check if URL has left auth domain
           const _luProbe = await cliRun([...S, 'eval', 'location.href'], 5000).catch(() => ({}));
@@ -3122,6 +3151,40 @@ async function browserAct(args) {
                 return { ok: false, action, sessionId, authFailed: true, error: 'Authentication error detected — wrong credentials or account locked', executionTime: Date.now() - start };
               }
             }
+            // ── OAuth return exit ─────────────────────────────────────────
+            // If user visited a 3rd-party OAuth provider (Google, Apple, etc.) and
+            // is now BACK on the origin host (inAuthFlow), they completed OAuth.
+            // Perplexity.ai is the canonical example: sign_in_url IS the app URL,
+            // so after Google OAuth the browser returns to perplexity.ai — which
+            // looks like inAuthFlow but is actually a successful post-OAuth landing.
+            if (_wasOnOAuthProvider) {
+              logger.info(`[browser.act] waitForAuth: returned to origin after OAuth provider — auth complete for session=${sessionId} url=${currentUrl}`);
+              return { ok: true, action, sessionId, authResolved: true, executionTime: Date.now() - start };
+            }
+            // ── Login callback query params ───────────────────────────────
+            // Secondary signal: login-source, code, state, access_token in query string
+            // while on origin host indicates a completed OAuth callback.
+            const _loginCbRe = /[?&](login-source|login-new|code|state|access_token|id_token|session)=/i;
+            if (_loginCbRe.test(currentUrl)) {
+              logger.info(`[browser.act] waitForAuth: login callback params detected — auth complete for session=${sessionId} url=${currentUrl}`);
+              // Notify overlay immediately (before returning) so UI dismisses auth prompt right away
+              if (_progressCallbackUrl) {
+                const http = require('http');
+                const _payload = JSON.stringify({ type: 'learn:auth_resolved', sessionId, resolvedUrl: currentUrl });
+                const _req = http.request({
+                  hostname: '127.0.0.1',
+                  port: parseInt(new URL(_progressCallbackUrl).port, 10),
+                  path: new URL(_progressCallbackUrl).pathname,
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(_payload) },
+                  timeout: 2000,
+                });
+                _req.on('error', () => {});
+                _req.write(_payload);
+                _req.end();
+              }
+              return { ok: true, action, sessionId, authResolved: true, executionTime: Date.now() - start };
+            }
             // ── Same-domain path exit ────────────────────────────────────────
             // Handles services like Notion where sign-in URL and workspace URL share
             // the same hostname (notion.so/login → notion.so/onboarding).
@@ -3138,6 +3201,21 @@ async function browserAct(args) {
               } catch (_) {}
             }
             logger.debug(`[browser.act] waitForAuth: in auth flow at ${currentUrl} (${authWallDetections} polls), ${Math.round((deadline - Date.now()) / 1000)}s remaining`);
+            continue;
+          }
+
+          // State 2.5: OAUTH REDIRECT — a third-party identity provider handling the OAuth flow.
+          // Detected by RFC 6749 standard query parameters (redirect_uri, response_type=code,
+          // client_id, code_challenge, flowName=...OAuthFlow) or OAuth path patterns.
+          // These appear on EVERY OAuth 2.0 provider (Google, Apple, GitHub, Discord, Slack,
+          // Microsoft, Okta, Auth0, Twitter/X, LinkedIn, etc.) — no provider list needed.
+          // Must NEVER trigger a back-to-sign-in navigation — they are in-flight auth redirects.
+          const _oauthQueryRe = /[?&](redirect_uri|response_type=code|code_challenge|flowName=[^&]*[Oo]auth)=/i;
+          const _oauthPathRe  = /\/(oauth2?|authorize|login\/oauth|signin\/oauth|connect\/oauth|v\d+\/signin\/identifier|auth\/callback|api\/auth\/callback)\b/i;
+          const isOAuthRedirect = _oauthQueryRe.test(currentUrl) || _oauthPathRe.test(urlWithoutQuery);
+          if (isOAuthRedirect) {
+            _wasOnOAuthProvider = true; // user has navigated to a 3rd-party OAuth provider
+            logger.debug(`[browser.act] waitForAuth: OAuth redirect in progress at ${currentHost} — waiting for callback, session=${sessionId}`);
             continue;
           }
 
@@ -3223,22 +3301,24 @@ async function browserAct(args) {
     }
 
     // ── Tabs ──────────────────────────────────────────────────────────────────
-    // tab-new: opens a new tab; if url provided, navigates to it in the new tab
+    // tab-new: opens a new tab; if url provided, navigates to it in the new tab.
+    // Tracks the new tab index in currentTabIndex so per-tab snapshot cache works.
     case 'tab-new': {
       const tabNewRaw = await cliRun([...S, 'tab-new'], timeoutMs);
       logger.info(`[browser.act] tab-new → exit ${tabNewRaw.exitCode}`, { stderr: tabNewRaw.stderr?.slice(0, 100) });
       if (!tabNewRaw.ok) {
         return { ok: false, action, sessionId, error: tabNewRaw.error || tabNewRaw.stderr?.trim(), executionTime: Date.now() - start };
       }
-      // Clear stale snapshot cache — new tab has a fresh page, old refs are invalid
-      snapshotCache.delete(sessionId);
+      // Give playwright-cli a moment to register the new tab, then determine its index
+      await new Promise(r => setTimeout(r, 400));
+      const listRaw = await cliRun([...S, 'tab-list'], 5000);
+      const tabCount = ((listRaw.stdout || '').match(/^\s*-\s+\d+:/gm) || []).length;
+      const lastIdx = Math.max(0, tabCount - 1);
+      // Update current tab tracker — new tab is now active
+      currentTabIndex.set(sessionId, lastIdx);
+      // Snapshot cache for this new tab starts empty (fresh page)
+      snapshotCache.delete(_tabKeyFor(sessionId, lastIdx));
       if (url) {
-        // Give playwright-cli a moment to register the new tab
-        await new Promise(r => setTimeout(r, 400));
-        // Get current tab list to find the index of the new (last) tab
-        const listRaw = await cliRun([...S, 'tab-list'], 5000);
-        const tabCount = ((listRaw.stdout || '').match(/^\s*-\s+\d+:/gm) || []).length;
-        const lastIdx = Math.max(0, tabCount - 1);
         // Explicitly select the newest tab so goto targets it, not an older one
         await cliRun([...S, 'tab-select', String(lastIdx)], 5000);
         await new Promise(r => setTimeout(r, 200));
@@ -3250,6 +3330,7 @@ async function browserAct(args) {
           ok: gotoRaw.ok,
           action,
           sessionId,
+          tabIndex: lastIdx,
           result: (listRaw.stdout || '').trim() || undefined,
           stdout: gotoRaw.stdout || listRaw.stdout,
           executionTime: Date.now() - start,
@@ -3260,7 +3341,8 @@ async function browserAct(args) {
         ok: true,
         action,
         sessionId,
-        result: (tabNewRaw.stdout || '').trim() || undefined,
+        tabIndex: lastIdx,
+        result: (listRaw.stdout || '').trim() || undefined,
         stdout: tabNewRaw.stdout,
         executionTime: Date.now() - start,
       };
@@ -3269,10 +3351,19 @@ async function browserAct(args) {
     // Accept tabIndex (LLM convention) or index (legacy)
     case 'tab-close': {
       const idx = args.tabIndex ?? args.index ?? 0;
+      // Delete per-tab snapshot cache entry for the closed tab
+      snapshotCache.delete(_tabKeyFor(sessionId, idx));
+      // If the closed tab was the active one, switch tracker back to tab 0
+      if ((currentTabIndex.get(sessionId) || 0) === idx) {
+        currentTabIndex.set(sessionId, 0);
+      }
       return run(['tab-close', String(idx)], `tab-close ${idx}`);
     }
     case 'tab-select': {
       const idx = args.tabIndex ?? args.index ?? 0;
+      // Update current tab tracker — restore cached snapshot for this tab if available
+      currentTabIndex.set(sessionId, idx);
+      logger.info(`[browser.act] tab-select ${idx}: switched active tab for session=${sessionId}`);
       return run(['tab-select', String(idx)], `tab-select ${idx}`);
     }
 
@@ -3384,12 +3475,12 @@ async function browserAct(args) {
       // Retry once if cache is empty — Chrome restore dialog may have blocked the first attempt.
       // captureSnapshot sends blind Escapes first, so the retry should land on a clean page.
       await captureSnapshot(sessionId, headed, timeoutMs);
-      let snap = snapshotCache.get(sessionId) || '';
+      let snap = snapshotCache.get(_tabKey(sessionId)) || '';
       if (!snap) {
         logger.info(`[browser.act] examine: snapshot empty — retrying after 600ms (dialog may have blocked first attempt)`);
         await new Promise(r => setTimeout(r, 600));
         await captureSnapshot(sessionId, headed, timeoutMs);
-        snap = snapshotCache.get(sessionId) || '';
+        snap = snapshotCache.get(_tabKey(sessionId)) || '';
       }
 
       // playwright-cli eval returns markdown-wrapped output: "### Result\n\"value\"\n### Ran..."

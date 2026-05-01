@@ -36,7 +36,6 @@ const logger             = require('../logger.cjs');
 // ---------------------------------------------------------------------------
 const BROWSER_ACT_PORT      = parseInt(process.env.COMMAND_SERVICE_PORT || '3007', 10);
 const SCREEN_SERVICE_PORT   = parseInt(process.env.SCREEN_INTEL_PORT || '3008', 10);
-const AGENT_BROWSER_PROFILE = path.join(os.homedir(), '.thinkdrop', 'agent-profile');
 const DOMAIN_MAPS_DIR       = path.join(os.homedir(), '.thinkdrop', 'domain-maps');
 const AGENTS_DIR            = path.join(os.homedir(), '.thinkdrop', 'agents');
 
@@ -50,6 +49,161 @@ const KNOWN_BROWSER_SERVICES = (() => {
   try { return require('./browser.agent.cjs').KNOWN_BROWSER_SERVICES || {}; }
   catch (_) { return {}; }
 })();
+
+// ---------------------------------------------------------------------------
+// Configurable Filter Configuration — Site-agnostic rules with per-site overrides
+// Stored in domain map or agent descriptor, not hardcoded
+// ---------------------------------------------------------------------------
+const DEFAULT_FILTER_CONFIG = {
+  // URL patterns that indicate historical content (regex strings)
+  historicalUrlPatterns: [
+    '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', // UUIDs
+    '/c/[a-zA-Z0-9-]+',        // Chat threads (ChatGPT)
+    '/chat/',                  // Chat paths
+    '/search/[a-z0-9-]+',      // Search results
+    '/thread/',                // Forum threads
+    '/message/',               // Messages
+    '#inbox/',                 // Email
+  ],
+  
+  // Text patterns that indicate user queries
+  queryTextPatterns: [
+    '^(what|how|why|when|where|who|can|is|are|do|does)\\s',
+    '^(find|get|show|tell|explain)\\s',
+  ],
+  
+  // Container indicators for history lists
+  historyContainerIndicators: [
+    'history',
+    'recent',
+    'past',
+    'previous',
+    'chat',
+    'conversation',
+    'thread',
+    'archive'
+  ],
+  
+  // Always-keep patterns (primary controls) - must match FULL words/phrases
+  primaryControlPatterns: [
+    '^(new|create|add|compose|start)$',           // Exact match only
+    '^(search|ask)$',                              // Exact match only (NOT "find" - that's too broad)
+    '^(send|submit|save)$',                        // Exact match only
+    '^(settings|profile|menu|help)$',            // Exact match only
+    '\\bnew\\s+(chat|conversation|message)',     // "New chat", "New conversation"
+    '\\bsearch\\b',                              // Word boundary for "search"
+    '^\\$',                                      // Dollar amount (pricing/billing)
+    '^upgrade', '^plan',                          // Pricing/plan controls
+  ],
+  
+  // Scoring thresholds
+  minHistoryScore: 3,
+  minPrimaryControlScore: 1
+};
+
+// ---------------------------------------------------------------------------
+// Interaction Type Schemas — Complete metadata for all 10+ interaction types
+// ---------------------------------------------------------------------------
+const INTERACTION_SCHEMAS = {
+  click: {
+    params: [],
+    description: "Click element",
+    paramTypes: {},
+    successCriteria: { expected_url_change: true }
+  },
+  dblclick: {
+    params: [],
+    description: "Double-click element (for file managers, grids)",
+    paramTypes: {},
+    successCriteria: { expected_url_change: true }
+  },
+  fill: {
+    params: ['text'],
+    description: "Fill input field with text",
+    paramTypes: { text: { type: 'string', required: true } },
+    followUp: ['press Enter for search inputs'],
+    successCriteria: { expected_url_change: false }
+  },
+  type: {
+    params: ['text'],
+    description: "Type into contenteditable rich text editor",
+    paramTypes: { text: { type: 'string', required: true } },
+    followUp: ['press Enter for search inputs'],
+    successCriteria: { expected_url_change: false }
+  },
+  select: {
+    params: ['value'],
+    description: "Select option from dropdown",
+    paramTypes: { value: { type: 'string', required: true, options: 'array' } },
+    successCriteria: { expected_url_change: false }
+  },
+  check: {
+    params: [],
+    description: "Check checkbox",
+    paramTypes: {},
+    successCriteria: { expected_url_change: false }
+  },
+  uncheck: {
+    params: [],
+    description: "Uncheck checkbox",
+    paramTypes: {},
+    successCriteria: { expected_url_change: false }
+  },
+  scroll: {
+    params: ['direction', 'distance'],
+    description: "Scroll container or page",
+    paramTypes: {
+      direction: { type: 'string', required: true, options: ['up', 'down', 'left', 'right'] },
+      distance: { type: 'number', required: true, default: 500 }
+    },
+    defaults: { direction: 'down', distance: 500 },
+    successCriteria: { expected_url_change: false }
+  },
+  drag: {
+    params: ['targetSelector'],
+    description: "Drag element to target",
+    paramTypes: { targetSelector: { type: 'string', required: true } },
+    successCriteria: { expected_url_change: false }
+  },
+  hover: {
+    params: [],
+    description: "Hover to reveal dropdown/menu",
+    paramTypes: {},
+    reveals: 'dropdown',
+    successCriteria: { expected_url_change: false }
+  },
+  upload: {
+    params: ['files'],
+    description: "Upload file(s)",
+    paramTypes: { files: { type: 'array', items: 'string', required: true } },
+    successCriteria: { expected_url_change: false }
+  }
+};
+
+// Per-site overrides loaded from agent descriptors or domain maps
+function _getFilterConfigForSite(hostname, domainMap = null) {
+  // Check if domain map has custom filter config
+  if (domainMap?._filterConfig) {
+    return { ...DEFAULT_FILTER_CONFIG, ...domainMap._filterConfig };
+  }
+  
+  // Check for agent descriptor with filter config
+  const agentPath = path.join(AGENTS_DIR, `${hostname.replace(/\./g, '_')}.md`);
+  if (fs.existsSync(agentPath)) {
+    try {
+      const content = fs.readFileSync(agentPath, 'utf8');
+      const configMatch = content.match(/^filter_config:\s*([\s\S]*?)(?:\n\n|\n[A-Za-z]|$)/m);
+      if (configMatch) {
+        const parsed = JSON.parse(configMatch[1].trim());
+        return { ...DEFAULT_FILTER_CONFIG, ...parsed };
+      }
+    } catch (_) {
+      // Fall back to defaults
+    }
+  }
+  
+  return DEFAULT_FILTER_CONFIG;
+}
 
 // ---------------------------------------------------------------------------
 // LLM System Prompts
@@ -185,21 +339,216 @@ function _parseJson(raw) {
 // Progress event poster — non-fatal HTTP POST to a callback URL
 // ---------------------------------------------------------------------------
 function _postProgress(callbackUrl, event) {
-  if (!callbackUrl) return;
+  if (!callbackUrl) {
+    logger.info(`[explore.agent] _postProgress: skipped - no callbackUrl`);
+    return;
+  }
   try {
     const body = JSON.stringify(event);
     const u = new URL(callbackUrl);
+    logger.info(`[explore.agent] _postProgress: sending ${event.type} to ${u.hostname}:${u.port}${u.pathname}`);
     const req = http.request({
       hostname: u.hostname,
       port: parseInt(u.port || '80', 10),
       path: u.pathname,
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
-    }, res => { res.resume(); });
-    req.on('error', () => {});
+    }, res => { 
+      logger.info(`[explore.agent] _postProgress: ${event.type} sent - status ${res.statusCode}`);
+      res.resume(); 
+    });
+    req.on('error', (err) => {
+      logger.warn(`[explore.agent] _postProgress: ${event.type} failed - ${err.message}`);
+    });
     req.write(body);
     req.end();
-  } catch (_) {}
+  } catch (err) {
+    logger.warn(`[explore.agent] _postProgress: exception - ${err.message}`);
+  }
+}
+
+
+// ---------------------------------------------------------------------------
+// Skill registration helper — saves skill to disk and registers in skill-db
+// ---------------------------------------------------------------------------
+const SKILLS_DIR = path.join(os.homedir(), '.thinkdrop', 'skills');
+
+function _ensureSkillsDir() {
+  try { fs.mkdirSync(SKILLS_DIR, { recursive: true }); } catch (_) {}
+}
+
+async function _registerSkill(skillData) {
+  _ensureSkillsDir();
+  
+  const skillName = skillData.skill_name || skillData.name;
+  if (!skillName) {
+    logger.warn(`[explore.agent] _registerSkill failed: no skill name provided`);
+    return false;
+  }
+  
+  const skillDir = path.join(SKILLS_DIR, skillName.replace(/\./g, '_'));
+  try {
+    fs.mkdirSync(skillDir, { recursive: true });
+    
+    // Write skill index.cjs
+    const skillCode = skillData.code || _generateSkillCode(skillData);
+    fs.writeFileSync(path.join(skillDir, 'index.cjs'), skillCode, 'utf8');
+    
+    // Write skill metadata
+    fs.writeFileSync(
+      path.join(skillDir, 'skill.json'),
+      JSON.stringify({
+        name: skillName,
+        description: skillData.description,
+        created_at: skillData._meta?.created_at || new Date().toISOString(),
+        ...skillData._meta
+      }, null, 2),
+      'utf8'
+    );
+    
+    logger.info(`[explore.agent] Skill saved to disk: ${skillName} at ${skillDir}`);
+    
+    // Register in skill-db via HTTP MCP
+    try {
+      const MEMORY_URL = process.env.MCP_USER_MEMORY_URL || 'http://127.0.0.1:3001';
+      const MEMORY_KEY = process.env.MCP_USER_MEMORY_API_KEY || '';
+      const parsedUrl = new URL(MEMORY_URL);
+      const headers = {
+        'Content-Type': 'application/json',
+      };
+      if (MEMORY_KEY) {
+        headers['Authorization'] = `Bearer ${MEMORY_KEY}`;
+      }
+      const dbReq = http.request({
+        hostname: parsedUrl.hostname,
+        port: parsedUrl.port || 3001,
+        path: '/skill.upsert',
+        method: 'POST',
+        headers,
+      }, res => {
+        if (res.statusCode === 200) {
+          logger.info(`[explore.agent] Skill registered in DB: ${skillName}`);
+          res.resume();
+        } else {
+          let errorBody = '';
+          res.on('data', chunk => { errorBody += chunk; });
+          res.on('end', () => {
+            logger.warn(`[explore.agent] Skill DB registration returned ${res.statusCode}: ${skillName} - ${errorBody}`);
+          });
+        }
+      });
+      dbReq.on('error', (err) => {
+        logger.warn(`[explore.agent] Skill DB registration error for ${skillName}: ${err.message}`);
+      });
+      // Send correct MCP payload that skill-db /skill.upsert expects
+      // Must include version, service, action, and payload fields
+      const skillDir = path.join(SKILLS_DIR, skillName);
+      const dbPayload = {
+        version: 'mcp.v1',
+        service: 'user-memory',
+        action: 'skill.upsert',
+        payload: {
+          name: skillName,
+          description: skillData.description || `Skill for ${skillData.skill_name || skillData.name}`,
+          execPath: path.join(skillDir, 'index.cjs'),
+          execType: 'node',
+          enabled: true,
+          contractMd: ''
+        },
+        requestId: `explore_${Date.now()}`
+      };
+      dbReq.write(JSON.stringify(dbPayload));
+      dbReq.end();
+    } catch (dbErr) {
+      logger.warn(`[explore.agent] Skill DB registration failed for ${skillName}: ${dbErr.message}`);
+    }
+    
+    return true;
+  } catch (e) {
+    logger.warn(`[explore.agent] _registerSkill failed for ${skillName}: ${e.message}`);
+    return false;
+  }
+}
+
+// Generate minimal skill code from action data
+function _generateSkillCode(skillData) {
+  const { skill_name, interaction, locators, description, parameters } = skillData;
+  return `// Auto-generated skill: ${skill_name}
+// Generated at: ${new Date().toISOString()}
+// Source domain: ${skillData._meta?.source_domain || 'unknown'}
+
+const { _browserAct } = require('../explore.agent.cjs');
+
+async function run(args = {}) {
+  const { sessionId, headed } = args;
+  const result = await _browserAct({
+    action: '${interaction}',
+    ref: '${locators?.primary || ''}',
+    sessionId,
+    headed,
+    timeoutMs: 10000
+  });
+  return { ok: result?.ok, result: result?.result };
+}
+
+module.exports = { run };
+`;
+}
+
+// ---------------------------------------------------------------------------
+// Goal relevance scoring — prioritize actions matching user's stated goal(s)
+// Supports single goal (string) or multiple goals (array) — returns highest relevance
+// ---------------------------------------------------------------------------
+function _calculateGoalRelevance(actionLabel, actionAttrs, interactionType, goalOrGoals) {
+  // Normalize to array
+  const goals = Array.isArray(goalOrGoals) ? goalOrGoals : (goalOrGoals ? [goalOrGoals] : []);
+  if (goals.length === 0 || goals.every(g => !g || g.length < 3)) return 1.0; // No goals = accept all
+  
+  const labelLower = (actionLabel || '').toLowerCase();
+  const textLower = (actionAttrs?.text || '').toLowerCase();
+  const ariaLower = (actionAttrs?.ariaLabel || '').toLowerCase();
+  const parentLower = (actionAttrs?.parentText || '').toLowerCase();
+  const searchText = `${labelLower} ${textLower} ${ariaLower} ${parentLower}`;
+  
+  // Extract filler words to ignore
+  const fillerWords = new Set(['to', 'the', 'a', 'an', 'and', 'or', 'on', 'in', 'at', 'for', 'with', 'using', 'use', 'from', 'of', 'by']);
+  
+  // Calculate relevance for each goal, return highest
+  let maxRelevance = 0;
+  let bestGoal = null;
+  
+  for (const goal of goals) {
+    if (!goal || goal.length < 3) continue;
+    
+    const goalLower = goal.toLowerCase();
+    const goalWords = goalLower.split(/\s+/).filter(w => w.length > 2 && !fillerWords.has(w));
+    if (goalWords.length === 0) continue;
+    
+    // Score based on keyword matches
+    let matchScore = 0;
+    for (const word of goalWords) {
+      if (searchText.includes(word)) {
+        matchScore += 1;
+        // Bonus for label match (most important)
+        if (labelLower.includes(word)) matchScore += 0.5;
+      }
+    }
+    
+    // Normalize score (0-1 range)
+    let relevance = Math.min(matchScore / goalWords.length, 1.0);
+    
+    // Boost for primary interactions that are commonly goal-relevant
+    if (interactionType === 'click' && /search|ask|new|create|send|submit/.test(labelLower)) {
+      relevance = Math.min(relevance + 0.2, 1.0);
+    }
+    
+    if (relevance > maxRelevance) {
+      maxRelevance = relevance;
+      bestGoal = goal;
+    }
+  }
+  
+  return maxRelevance;
 }
 
 // ---------------------------------------------------------------------------
@@ -250,12 +599,71 @@ function _domainMapExists(hostname) {
 }
 
 /**
+ * Clean domain map before new scan - PRESERVE VERIFIED ACTIONS ONLY.
+ * 
+ * Strategy:
+ * - Keep verified actions (verified=true AND failure_count < 3) - these are proven working
+ * - Remove ALL unverified actions - they may be garbage from bad previous scans
+ * - Clear data array entirely - let fresh scan populate with clean data
+ * - Remove states that have no verified actions after cleanup
+ */
+function _cleanDomainMap(domainMap) {
+  if (!domainMap || !domainMap.states) return domainMap;
+  
+  const cleaned = { ...domainMap };
+  const cleanedStates = {};
+  let verifiedKept = 0;
+  let unverifiedRemoved = 0;
+  let statesRemoved = 0;
+  
+  for (const [stateKey, state] of Object.entries(cleaned.states || {})) {
+    if (!state.actions) {
+      statesRemoved++;
+      continue; // Skip states with no actions
+    }
+    
+    const verifiedActions = {};
+    
+    for (const [actionKey, action] of Object.entries(state.actions)) {
+      const isVerified = action.verified && (action.failure_count || 0) < 3;
+      
+      if (isVerified) {
+        verifiedActions[actionKey] = action;
+        verifiedKept++;
+      } else {
+        unverifiedRemoved++;
+        logger.info(`[explore.agent] _cleanDomainMap: removed unverified action "${actionKey}"`);
+      }
+    }
+    
+    // Only keep states that have at least one verified action
+    if (Object.keys(verifiedActions).length > 0) {
+      cleanedStates[stateKey] = {
+        ...state,
+        actions: verifiedActions,
+        data: [] // Clear old data, let fresh scan repopulate
+      };
+    } else {
+      statesRemoved++;
+    }
+  }
+  
+  cleaned.states = cleanedStates;
+  
+  logger.info(`[explore.agent] _cleanDomainMap: kept ${verifiedKept} verified actions, removed ${unverifiedRemoved} unverified, removed ${statesRemoved} empty states`);
+  
+  return cleaned;
+}
+
+/**
  * Merge new state data into an existing domain map.
  * Verified actions with failure_count < 3 are never overwritten.
  * New states/actions are always added.
  */
 function _mergeDomainMap(existing, incoming) {
-  const merged = { ...existing };
+  // Clean old history links from existing before merging
+  const cleanedExisting = _cleanDomainMap(existing);
+  const merged = { ...cleanedExisting };
   for (const [stateKey, stateData] of Object.entries(incoming.states || {})) {
     if (!merged.states[stateKey]) {
       merged.states[stateKey] = stateData;
@@ -274,6 +682,17 @@ function _mergeDomainMap(existing, incoming) {
   // Merge content_extraction if present in incoming
   if (incoming.content_extraction) {
     merged.content_extraction = incoming.content_extraction;
+  }
+  // Preserve metadata configs
+  if (incoming._filterConfig) {
+    merged._filterConfig = incoming._filterConfig;
+  }
+  if (incoming._schemas) {
+    merged._schemas = incoming._schemas;
+  }
+  // Merge goals if present
+  if (incoming.goals) {
+    merged.goals = { ...existing.goals, ...incoming.goals };
   }
   return merged;
 }
@@ -347,7 +766,6 @@ async function _extractContentSignals(sessionId, headed) {
       }`,
       sessionId,
       headed,
-      chromeProfile: AGENT_BROWSER_PROFILE,
       timeoutMs: 15000
     }, 18000);
     
@@ -362,54 +780,329 @@ async function _extractContentSignals(sessionId, headed) {
 }
 
 // ---------------------------------------------------------------------------
-// Stable selector extraction — page.evaluate() → LLM → locator profile
+// Smart attribute-based selector extraction — no LLM, hierarchical fallbacks
 // ---------------------------------------------------------------------------
 
-async function _extractStableSelectors(ref, sessionId, headed, skillName, interaction) {
-  if (!ref) return null;
-  try {
-    const evalCode = `async page => {
-      const el = page.locator('[data-ref="${ref}"], [ref="${ref}"]').first();
-      try {
-        const handle = await el.elementHandle({ timeout: 3000 });
-        if (!handle) return null;
-        return await handle.evaluate(node => ({
-          tag: node.tagName.toLowerCase(),
-          text: (node.innerText || node.textContent || '').trim().slice(0, 80),
-          ariaLabel: node.getAttribute('aria-label'),
-          dataTestId: node.getAttribute('data-testid') || node.getAttribute('data-qa'),
-          role: node.getAttribute('role'),
-          type: node.getAttribute('type'),
-          href: node.getAttribute('href'),
-          id: node.id || null,
-          name: node.getAttribute('name'),
-          placeholder: node.getAttribute('placeholder'),
-          className: (node.className || '').slice(0, 100),
-        }));
-      } catch (_) { return null; }
-    }`;
+// Detect dynamic IDs like "react-12345", "ember-6789"
+function _isDynamicId(id) {
+  if (!id || typeof id !== 'string') return false;
+  // Pattern: word-12345 (word followed by 4+ digits)
+  return /^[a-z]+-\d{4,}$/i.test(id);
+}
 
-    const evalRes = await _browserAct({
-      action: 'run-code',
-      code: evalCode,
+// Filter out hashed/minified CSS classes
+function _filterSemanticClasses(className) {
+  if (!className || typeof className !== 'string') return [];
+  return className.split(/\s+/).filter(c => 
+    c && c.length > 2 && 
+    !/^css-[a-z0-9]{5,}$/i.test(c) &&  // css-1a2b3c
+    !/^[a-z0-9]{8,}$/i.test(c) &&      // random hashes
+    !/^style_[a-z0-9]+$/i.test(c)      // style_abc123
+  );
+}
+
+// Build smart selectors from element attributes
+function _buildSmartSelectors(attrs) {
+  const selectors = [];
+  const { tag, id, dataTestId, dataQa, ariaLabel, role, name, href, className, text, contenteditable, placeholder, type } = attrs;
+  
+  // Tier 1: ID (if not dynamic)
+  if (id && !_isDynamicId(id)) {
+    selectors.push({ 
+      selector: `[id="${id}"]`, 
+      score: 100, 
+      fingerprint: { id, tag, role },
+      stable: true 
+    });
+    if (role) {
+      selectors.push({ 
+        selector: `[id="${id}"][role="${role}"]`, 
+        score: 95,
+        fingerprint: { id, role, tag },
+        stable: true
+      });
+    }
+  }
+  
+  // Tier 2: Data attributes (very stable)
+  if (dataTestId) {
+    selectors.push({ 
+      selector: `[data-testid="${dataTestId}"]`, 
+      score: 95,
+      fingerprint: { dataTestId, tag },
+      stable: true
+    });
+  }
+  if (dataQa) {
+    selectors.push({ 
+      selector: `[data-qa="${dataQa}"]`, 
+      score: 94,
+      fingerprint: { dataQa, tag },
+      stable: true
+    });
+  }
+  
+  // Tier 3: ARIA label + role combination
+  if (ariaLabel && ariaLabel.length > 2) {
+    if (role) {
+      selectors.push({ 
+        selector: `[role="${role}"][aria-label="${ariaLabel}"]`, 
+        score: 90,
+        fingerprint: { role, ariaLabel, tag },
+        stable: true
+      });
+    }
+    selectors.push({ 
+      selector: `[aria-label="${ariaLabel}"]`, 
+      score: 85,
+      fingerprint: { ariaLabel, tag, role },
+      stable: true
+    });
+  }
+  
+  // Tier 4: Name attribute (for inputs)
+  if (name) {
+    selectors.push({ 
+      selector: `${tag || ''}[name="${name}"]`.trim(), 
+      score: 80,
+      fingerprint: { name, tag },
+      stable: true
+    });
+  }
+  
+  // Tier 5: Placeholder (for inputs)
+  if (placeholder && placeholder.length > 3) {
+    selectors.push({ 
+      selector: `[placeholder="${placeholder}"]`, 
+      score: 75,
+      fingerprint: { placeholder, tag },
+      stable: false
+    });
+  }
+  
+  // Tier 6: Href for links (with partial pattern)
+  if (tag === 'a' && href && !href.startsWith('#') && !href.startsWith('javascript:')) {
+    // Full href
+    selectors.push({ 
+      selector: `a[href="${href}"]`, 
+      score: 70,
+      fingerprint: { href, tag },
+      stable: false
+    });
+    // Partial href pattern (e.g., /computer/*)
+    const hrefParts = href.split('/').filter(Boolean);
+    if (hrefParts.length >= 2) {
+      const basePath = '/' + hrefParts.slice(0, 2).join('/');
+      selectors.push({ 
+        selector: `a[href^="${basePath}/"]`, 
+        score: 65,
+        fingerprint: { hrefBase: basePath, tag },
+        stable: false
+      });
+    }
+  }
+  
+  // Tier 7: Contenteditable
+  if (contenteditable === 'true') {
+    if (role) {
+      selectors.push({ 
+        selector: `[role="${role}"][contenteditable="true"]`, 
+        score: 60,
+        fingerprint: { role, contenteditable, tag },
+        stable: false
+      });
+    }
+    selectors.push({ 
+      selector: `[contenteditable="true"]`, 
+      score: 55,
+      fingerprint: { contenteditable, tag },
+      stable: false
+    });
+  }
+  
+  // Tier 8: Semantic CSS classes (filter out hashed classes)
+  const semanticClasses = _filterSemanticClasses(className);
+  if (semanticClasses.length > 0) {
+    const classSelector = semanticClasses.slice(0, 2).join('.');
+    selectors.push({ 
+      selector: `${tag || ''}.${classSelector}`.trim(), 
+      score: 50,
+      fingerprint: { classes: semanticClasses, tag },
+      stable: false
+    });
+  }
+  
+  // Tier 9: Text content (last resort)
+  if (text && text.length > 0 && text.length < 50) {
+    selectors.push({ 
+      selector: `${tag || ''}:has-text("${text.replace(/"/g, '\\"')}")`.trim(), 
+      score: 40,
+      fingerprint: { text: text.slice(0, 30), tag },
+      stable: false
+    });
+  }
+  
+  // Sort by score descending
+  selectors.sort((a, b) => b.score - a.score);
+  
+  // Take top 4 (1 primary + 3 fallbacks max)
+  const topSelectors = selectors.slice(0, 4);
+  
+  return {
+    primary: topSelectors[0]?.selector || null,
+    fallbacks: topSelectors.slice(1).map(s => s.selector),
+    fingerprint: topSelectors[0]?.fingerprint || {},
+    stability: topSelectors[0]?.stable || false,
+    score: topSelectors[0]?.score || 0
+  };
+}
+
+// Test selector at scan time to verify it works
+async function _verifySelector(selector, tag, ref, sessionId, headed) {
+  try {
+    const testFunc = `(el) => el ? {
+      tag: el.tagName.toLowerCase(),
+      visible: el.offsetParent !== null,
+      width: el.offsetWidth,
+      height: el.offsetHeight
+    } : null`;
+    
+    const testRes = await _browserAct({
+      action: 'evaluate',
+      text: testFunc,
+      ref,
       sessionId,
       headed,
-      chromeProfile: AGENT_BROWSER_PROFILE,
+      timeoutMs: 5000,
+    }, 6000).catch(() => null);
+    
+    if (testRes?.ok && testRes.result) {
+      const result = typeof testRes.result === 'string' ? JSON.parse(testRes.result) : testRes.result;
+      return result && result.tag === tag;
+    }
+    return false;
+  } catch (e) {
+    return false;
+  }
+}
+
+async function _extractStableSelectors(ref, sessionId, headed, skillName, interaction) {
+  if (!ref) {
+    logger.info(`[explore.agent] _extractStableSelectors: no ref provided`);
+    return null;
+  }
+  
+  try {
+    // Extract element attributes via browser evaluate
+    // Enhanced to detect all interaction types: click, fill, type, select, check, scroll, drag, hover, upload
+    const evalFunc = `(el) => el ? ({
+      tag: el.tagName.toLowerCase(),
+      text: (el.innerText || el.textContent || '').trim().slice(0, 80),
+      ariaLabel: el.getAttribute('aria-label'),
+      dataTestId: el.getAttribute('data-testid'),
+      dataQa: el.getAttribute('data-qa'),
+      role: el.getAttribute('role'),
+      type: el.getAttribute('type'),
+      href: el.getAttribute('href'),
+      id: el.id || null,
+      name: el.getAttribute('name'),
+      placeholder: el.getAttribute('placeholder'),
+      className: (el.className || '').slice(0, 100),
+      contenteditable: el.getAttribute('contenteditable'),
+      // New attributes for comprehensive interaction detection
+      draggable: el.getAttribute('draggable') === 'true',
+      checked: el.checked || false,
+      hasPopup: el.getAttribute('aria-haspopup'),
+      expanded: el.getAttribute('aria-expanded'),
+      selected: el.selected || false,
+      // Container properties for scroll detection
+      scrollHeight: el.scrollHeight || 0,
+      clientHeight: el.clientHeight || 0,
+      overflowY: window.getComputedStyle(el).overflowY,
+      // File upload
+      accept: el.getAttribute('accept'),
+      multiple: el.hasAttribute('multiple'),
+      // Options for select elements
+      options: el.tagName === 'SELECT' ? Array.from(el.options).slice(0, 10).map(o => ({ text: o.text, value: o.value })) : null,
+      // Context
+      inList: !!(el.closest && (el.closest('ul') || el.closest('ol') || el.closest('[role="list"]'))),
+      parentText: el.parentElement ? (el.parentElement.getAttribute('aria-label') || el.parentElement.innerText || '').slice(0, 50) : '',
+    }) : null`;
+
+    logger.info(`[explore.agent] _extractStableSelectors: evaluating ref=${ref}`);
+    const evalRes = await _browserAct({
+      action: 'evaluate',
+      text: evalFunc,
+      ref,
+      sessionId,
+      headed,
       timeoutMs: 8000,
-    }, 10000).catch(() => null);
+    }, 10000).catch((e) => {
+      logger.info(`[explore.agent] _extractStableSelectors: evaluate failed for ref=${ref}: ${e.message}`);
+      return null;
+    });
 
-    const attrs = evalRes?.ok ? evalRes.result : null;
-    if (!attrs) return null;
+    let attrs = null;
+    if (evalRes?.ok && evalRes.result) {
+      try {
+        const raw = typeof evalRes.result === 'string' ? evalRes.result : JSON.stringify(evalRes.result);
+        attrs = JSON.parse(raw);
+        logger.info(`[explore.agent] _extractStableSelectors: extracted attrs for ref=${ref}: ${JSON.stringify(attrs).slice(0, 150)}`);
+      } catch (e) { 
+        logger.info(`[explore.agent] _extractStableSelectors: failed to parse attrs for ref=${ref}: ${e.message}`);
+        return null; 
+      }
+    } else {
+      logger.info(`[explore.agent] _extractStableSelectors: evaluate returned no result for ref=${ref}`);
+      return null;
+    }
 
-    const attrsText = JSON.stringify(attrs, null, 2);
-    const llmRaw = await askWithMessages([
-      { role: 'system', content: STABLE_SELECTOR_PROMPT },
-      { role: 'user',   content: `ELEMENT_ATTRIBUTES:\n${attrsText}\n\nSKILL_NAME: ${skillName || 'unknown'}\nINTERACTION: ${interaction || 'click'}` },
-    ], { temperature: 0.1, maxTokens: 256, responseTimeoutMs: 12000 }).catch(() => null);
+    if (!attrs || !attrs.tag) {
+      logger.info(`[explore.agent] _extractStableSelectors: no attrs or tag for ref=${ref}`);
+      return null;
+    }
 
-    const parsed = _parseJson(llmRaw);
-    if (!parsed?.locators?.primary) return null;
-    return parsed;
+    // Build smart selectors from attributes
+    const selectorProfile = _buildSmartSelectors(attrs);
+    
+    if (!selectorProfile.primary) {
+      logger.info(`[explore.agent] _extractStableSelectors: no selectors could be built for ref=${ref}, attrs=${JSON.stringify(attrs).slice(0, 100)}`);
+      return null;
+    }
+    
+    logger.info(`[explore.agent] _extractStableSelectors: built selectors for ref=${ref} - primary: ${selectorProfile.primary}, score: ${selectorProfile.score}, stable: ${selectorProfile.stability}`);
+
+    // Test primary selector to verify it works
+    const verified = await _verifySelector(selectorProfile.primary, attrs.tag, ref, sessionId, headed);
+    if (!verified) {
+      logger.info(`[explore.agent] _extractStableSelectors: primary selector failed verification for ref=${ref}, trying fallbacks`);
+      // Try fallbacks
+      for (let i = 0; i < selectorProfile.fallbacks.length; i++) {
+        const fbVerified = await _verifySelector(selectorProfile.fallbacks[i], attrs.tag, ref, sessionId, headed);
+        if (fbVerified) {
+          logger.info(`[explore.agent] _extractStableSelectors: fallback ${i} verified for ref=${ref}: ${selectorProfile.fallbacks[i]}`);
+          // Swap this fallback to primary
+          selectorProfile.fallbacks[i] = selectorProfile.primary;
+          selectorProfile.primary = selectorProfile.fallbacks.splice(i, 1)[0];
+          break;
+        }
+      }
+    } else {
+      logger.info(`[explore.agent] _extractStableSelectors: primary selector verified for ref=${ref}`);
+    }
+
+    return {
+      locators: {
+        primary: selectorProfile.primary,
+        fallback_1: selectorProfile.fallbacks[0] || null,
+        fallback_2: selectorProfile.fallbacks[1] || null,
+      },
+      fingerprint: selectorProfile.fingerprint,
+      success_criteria: { expected_url_change: interaction === 'click', element_to_appear: null },
+      verified: verified,
+      score: selectorProfile.score,
+      stability: selectorProfile.stability
+    };
   } catch (err) {
     logger.warn(`[explore.agent] _extractStableSelectors failed for ${ref}: ${err.message}`);
     return null;
@@ -432,8 +1125,7 @@ async function _resolveLocator(locators, sessionId, headed) {
         selector,
         sessionId,
         headed,
-        chromeProfile: AGENT_BROWSER_PROFILE,
-        timeoutMs: 2000,
+          timeoutMs: 2000,
       }, 4000).catch(() => null);
       if (res?.ok) {
         logger.info(`[explore.agent] _resolveLocator: resolved via ${strategy} = "${selector}"`);
@@ -521,39 +1213,48 @@ function _isLoginWall(snapshot, currentUrl) {
 
 // ---------------------------------------------------------------------------
 // Navigation item extraction — pulls ALL links + buttons from YAML snapshot
+// Handles two formats emitted by playwright-cli:
+//   Format A: "  - [e12] link \"Bible Study\" [href=...]"
+//   Format B: "    - link \"Bible Study\" [ref=e52] [cursor=pointer]:"
 // ---------------------------------------------------------------------------
 function _extractNavItems(snapshot) {
   const items = [];
   const lines = (snapshot || '').split('\n');
-  const refRe = /^\s*-\s*ref=(@e\d+)/;
-  let currentRef = null;
-  let currentRole = null;
-  let currentName = null;
 
   for (const line of lines) {
-    const refMatch = line.match(refRe);
-    if (refMatch) {
-      if (currentRef && currentName && (currentRole === 'link' || currentRole === 'button')) {
-        items.push({ ref: currentRef, label: currentName.trim(), role: currentRole });
+    let ref = null;
+    let role = null;
+    let label = '';
+
+    // Format A: optional indent + dash + [eN] BEFORE role + "label" + optional attrs
+    // Example: "  - [e12] link \"Bible Study\" [href=...]"
+    const mA = line.match(/^\s*-?\s*\[?(e\d+)\]?\s+(\w[\w-]*)\s+"([^"]*)"/i);
+    if (mA) {
+      [, ref, role, label] = mA;
+    } else {
+      // Format B (.yml): optional indent + dash + role + optional "label" + optional attrs
+      // Example: "    - link \"Bible Study\" [ref=e52]"
+      const mB = line.match(/^\s*-\s+(\w[\w-]*)\s+"([^"]*)"/i);
+      if (mB) {
+        [, role, label] = mB;
+        // Extract [ref=eN] from the line if present
+        const refMatch = line.match(/\[ref=(e\d+)\]/i);
+        ref = refMatch ? refMatch[1] : null;
       }
-      currentRef  = refMatch[1];
-      currentRole = null;
-      currentName = null;
-      continue;
     }
-    if (currentRef) {
-      const roleMatch = line.match(/role=["']?(\w+)/);
-      if (roleMatch) currentRole = roleMatch[1].toLowerCase();
-      const nameMatch = line.match(/name=["']([^"']+)/);
-      if (nameMatch) currentName = nameMatch[1];
-      const textMatch = line.match(/text=["']([^"']+)/);
-      if (textMatch && !currentName) currentName = textMatch[1];
+
+    // Only keep interactive elements we can interact with
+    // Note: playwright-cli uses e12 format (NOT @e12) - resolveRef checks /^e\d+$/i
+    const roleLower = role ? role.toLowerCase() : '';
+    const isClickable = roleLower === 'link' || roleLower === 'button';
+    const isInputLike = roleLower === 'textbox' || roleLower === 'searchbox' || roleLower === 'combobox' || roleLower === 'spinbutton';
+    const isContentEditable = roleLower === 'textbox';  // contenteditable elements have role=textbox
+    
+    if (ref && role && (isClickable || isInputLike || isContentEditable)) {
+      items.push({ ref, label: label.trim(), role: roleLower });
     }
   }
-  // flush last
-  if (currentRef && currentName && (currentRole === 'link' || currentRole === 'button')) {
-    items.push({ ref: currentRef, label: currentName.trim(), role: currentRole });
-  }
+
   return items;
 }
 
@@ -654,7 +1355,6 @@ async function exploreAgent(args) {
       url: anchorUrl,
       sessionId: exploreSessionId,
       headed,
-      chromeProfile: AGENT_BROWSER_PROFILE,
       timeoutMs: 20000,
     }, 25000);
 
@@ -667,7 +1367,6 @@ async function exploreAgent(args) {
       action: 'waitForStableText',
       sessionId: exploreSessionId,
       headed,
-      chromeProfile: AGENT_BROWSER_PROFILE,
       timeoutMs: 6000,
     }, 8000).catch(() => {});
 
@@ -676,7 +1375,6 @@ async function exploreAgent(args) {
       selector: '[role=navigation]',
       sessionId: exploreSessionId,
       headed,
-      chromeProfile: AGENT_BROWSER_PROFILE,
       timeoutMs: 3000,
     }, 5000).catch(() => {});
   };
@@ -696,7 +1394,6 @@ async function exploreAgent(args) {
       authSuccessUrl: anchorUrl,
       sessionId: exploreSessionId,
       headed,
-      chromeProfile: AGENT_BROWSER_PROFILE,
       timeoutMs: 120000,
     }, 125000).catch(err => ({ ok: false, error: err.message }));
 
@@ -724,7 +1421,7 @@ async function exploreAgent(args) {
 
   // Take initial snapshot
   let currentSnapshot = '';
-  const initSnap = await _browserAct({ action: 'snapshot', sessionId: exploreSessionId, headed, chromeProfile: AGENT_BROWSER_PROFILE, timeoutMs: 10000 }, 12000).catch(() => null);
+  const initSnap = await _browserAct({ action: 'snapshot', sessionId: exploreSessionId, headed, timeoutMs: 10000 }, 12000).catch(() => null);
   if (initSnap?.ok && initSnap.result) currentSnapshot = initSnap.result;
 
   // Check for login wall after navigation
@@ -732,7 +1429,7 @@ async function exploreAgent(args) {
   if (_isLoginWall(currentSnapshot, initUrl)) {
     await _handleAuth(initUrl || anchorUrl);
     // Re-snapshot after auth
-    const postAuthSnap = await _browserAct({ action: 'snapshot', sessionId: exploreSessionId, headed, chromeProfile: AGENT_BROWSER_PROFILE, timeoutMs: 10000 }, 12000).catch(() => null);
+    const postAuthSnap = await _browserAct({ action: 'snapshot', sessionId: exploreSessionId, headed, timeoutMs: 10000 }, 12000).catch(() => null);
     if (postAuthSnap?.ok && postAuthSnap.result) currentSnapshot = postAuthSnap.result;
   }
 
@@ -809,7 +1506,7 @@ async function exploreAgent(args) {
     logger.info(`[explore.agent] explore loop depth ${depth}/${maxDepth}`);
 
     // Fresh snapshot
-    const snapRes = await _browserAct({ action: 'snapshot', sessionId: exploreSessionId, headed, chromeProfile: AGENT_BROWSER_PROFILE, timeoutMs: 10000 }, 12000).catch(() => null);
+    const snapRes = await _browserAct({ action: 'snapshot', sessionId: exploreSessionId, headed, timeoutMs: 10000 }, 12000).catch(() => null);
     if (snapRes?.ok && snapRes.result) currentSnapshot = snapRes.result;
 
     const currentUrl = await _getCurrentUrl(exploreSessionId, headed);
@@ -900,11 +1597,10 @@ async function exploreAgent(args) {
               text: goal,
               sessionId: exploreSessionId,
               headed,
-              chromeProfile: AGENT_BROWSER_PROFILE,
-              timeoutMs: 10000,
+                      timeoutMs: 10000,
             }, 12000).catch(err => ({ ok: false, error: err.message }));
             if (execRes?.ok) {
-              await _browserAct({ action: 'press', key: 'Enter', sessionId: exploreSessionId, headed, chromeProfile: AGENT_BROWSER_PROFILE, timeoutMs: 5000 }, 7000).catch(() => {});
+              await _browserAct({ action: 'press', key: 'Enter', sessionId: exploreSessionId, headed, timeoutMs: 5000 }, 7000).catch(() => {});
             }
           } else {
             execRes = await _browserAct({
@@ -912,8 +1608,7 @@ async function exploreAgent(args) {
               selector: resolved.selector,
               sessionId: exploreSessionId,
               headed,
-              chromeProfile: AGENT_BROWSER_PROFILE,
-              timeoutMs: 10000,
+                      timeoutMs: 10000,
             }, 12000).catch(err => ({ ok: false, error: err.message }));
           }
 
@@ -1003,7 +1698,7 @@ async function exploreAgent(args) {
         break;
       }
       logger.info('[explore.agent] no useful item found — navigating back to anchor');
-      await _browserAct({ action: 'navigate', url: anchorUrl, sessionId: exploreSessionId, headed, chromeProfile: AGENT_BROWSER_PROFILE, timeoutMs: 15000 }, 18000).catch(() => {});
+      await _browserAct({ action: 'navigate', url: anchorUrl, sessionId: exploreSessionId, headed, timeoutMs: 15000 }, 18000).catch(() => {});
       await _browserAct({ action: 'waitForStableText', sessionId: exploreSessionId, headed, timeoutMs: 6000 }, 8000).catch(() => {});
       continue;
     }
@@ -1015,8 +1710,7 @@ async function exploreAgent(args) {
         code: `async page => { await page.getByRole('searchbox').first().fill(${JSON.stringify(pick.searchQuery || goal)}); await page.keyboard.press('Enter'); }`,
         sessionId: exploreSessionId,
         headed,
-        chromeProfile: AGENT_BROWSER_PROFILE,
-        timeoutMs: 10000,
+          timeoutMs: 10000,
       }, 12000).catch(err => ({ ok: false, error: err.message }));
 
       if (!fillRes?.ok) {
@@ -1026,8 +1720,7 @@ async function exploreAgent(args) {
           code: `async page => { const inp = page.getByLabel('Search') || page.getByPlaceholder('Search'); await inp.fill(${JSON.stringify(pick.searchQuery || goal)}); await page.keyboard.press('Enter'); }`,
           sessionId: exploreSessionId,
           headed,
-          chromeProfile: AGENT_BROWSER_PROFILE,
-          timeoutMs: 10000,
+              timeoutMs: 10000,
         }, 12000).catch(() => {});
       }
 
@@ -1063,8 +1756,7 @@ async function exploreAgent(args) {
         selector: pick.ref,
         sessionId: exploreSessionId,
         headed,
-        chromeProfile: AGENT_BROWSER_PROFILE,
-        timeoutMs: 10000,
+          timeoutMs: 10000,
       }, 12000).catch(err => ({ ok: false, error: err.message }));
 
       if (!clickRes?.ok) {
@@ -1161,8 +1853,12 @@ async function scanDomain(args) {
     agentId       = 'explore_agent',
     sessionId:    callerSessionId,
     maxScanDepth  = 1,
+    goal,                         // Single goal (backward compat)
+    goals,                        // Array of goals for multi-goal learning
     _progressCallbackUrl,
     _trigger      = 'manual',
+    headed:       callerHeaded,  // caller may pass headed:true to reuse a visible learn session
+    _preAuthed,                   // true if user was already logged in (skip auth overlay)
   } = args || {};
 
   if (!url) return { ok: false, error: 'url is required for scanDomain' };
@@ -1172,26 +1868,65 @@ async function scanDomain(args) {
     return { ok: false, error: `Invalid url: ${url}` };
   }
 
+  // Normalize goals array from goal/goals parameters (multi-goal support)
+  const goalsArray = goals || (goal ? [goal] : []);
+  if (goalsArray.length > 0) {
+    logger.info(`[explore.agent] Multi-goal scanning: ${goalsArray.length} goal(s)`);
+  }
+
   const start          = Date.now();
-  const scanSessionId  = callerSessionId || `${hostname}_scan_${Date.now()}`;
-  const headed         = false;  // background scans are always headless — never open visible windows
+  // Use stable session name (no timestamp) so the same Chrome profile dir is reused across scans.
+  // Timestamped names created a new 20MB profile dir on every heartbeat/background scan.
+  const scanSessionId  = callerSessionId || `${hostname}_scan`;
+  // If caller provides a sessionId (e.g. learn_mode reusing auth session), respect their headed setting.
+  // Standalone background scans (no callerSessionId) are always headless.
+  const headed         = callerSessionId ? (callerHeaded !== undefined ? callerHeaded : true) : false;
+  // When a caller session is provided (learn_mode), use tab-new per page so we never navigate
+  // the auth tab (which would trigger Cloudflare re-challenges). Background scans navigate normally.
+  const useTabStrategy = !!callerSessionId;
+  let   _scanTabIdx    = -1; // index of the currently open scan tab (tab strategy only)
   let totalActions     = 0;
+  let botBlocked       = false;
+  
+  // Scan-level statistics for completion summary
+  let scanStats = {
+    successCount: 0,
+    failCount: 0,
+    filteredCount: 0,
+    totalElements: 0,
+    statesScanned: 0
+  };
+
+  logger.info(`[explore.agent] scanDomain config: session=${scanSessionId} headed=${headed} trigger=${_trigger}`);
 
   logger.info(`[explore.agent] scanDomain start: ${hostname} (trigger=${_trigger} maxScanDepth=${maxScanDepth})`);
   _postProgress(_progressCallbackUrl, { type: 'explore:scan_start', hostname, trigger: _trigger, agentId });
 
   try {
-    // Navigate to URL
-    await _browserAct({
-      action: 'navigate',
-      url,
-      sessionId: scanSessionId,
-      headed,
-      chromeProfile: AGENT_BROWSER_PROFILE,
-      timeoutMs: 25000,
-    }, 28000).catch(() => {});
+    // Navigate to start URL.
+    // Tab strategy: open a new tab in the caller's already-authenticated Chrome window.
+    // This avoids navigating the auth tab (which would re-trigger Cloudflare challenges).
+    // Background scans (no callerSessionId): navigate normally in their own session.
+    if (useTabStrategy) {
+      logger.info(`[explore.agent] scan: tab-new strategy — opening scan tab for ${url} on session=${scanSessionId}`);
+      const _tabNewRes = await _browserAct({ action: 'tab-new', url, sessionId: scanSessionId, headed, timeoutMs: 30000 }, 33000).catch(() => null);
+      // Determine tab index from tab-list output embedded in result
+      if (_tabNewRes?.result) {
+        const _tabCount = ((_tabNewRes.result || '').match(/^\s*-\s+\d+:/gm) || []).length;
+        _scanTabIdx = Math.max(0, _tabCount - 1);
+      }
+      // If user was already logged in, close the original tab (tab 0) to avoid duplicate site tabs
+      if (_preAuthed && _scanTabIdx > 0) {
+        logger.info(`[explore.agent] scan: closing original tab 0 (pre-authed, avoiding duplicate tabs)`);
+        await _browserAct({ action: 'tab-close', sessionId: scanSessionId, headed, tabIndex: 0 }, 5000).catch(() => {});
+        // Adjust scan tab index since tab 0 is now gone
+        _scanTabIdx = Math.max(0, _scanTabIdx - 1);
+      }
+    } else {
+      await _browserAct({ action: 'navigate', url, sessionId: scanSessionId, headed, timeoutMs: 25000 }, 28000).catch(() => {});
+    }
 
-    await _browserAct({ action: 'waitForStableText', sessionId: scanSessionId, headed, chromeProfile: AGENT_BROWSER_PROFILE, timeoutMs: 6000 }, 8000).catch(() => {});
+    await _browserAct({ action: 'waitForStableText', sessionId: scanSessionId, headed, timeoutMs: 6000 }, 8000).catch(() => {});
 
     // Extract content extraction signals from the landing page
     logger.info(`[explore.agent] scan: extracting content signals for ${hostname}`);
@@ -1201,11 +1936,18 @@ async function scanDomain(args) {
     }
 
     const existingMap = _loadDomainMap(hostname);
+    // Clean old history links from existing map before merging new scan data
+    const cleanedExisting = _cleanDomainMap(existingMap);
     const newMap      = { 
       domain: hostname, 
-      version: '1.0', 
+      version: '2.0', 
       last_scanned: null, 
       states: {},
+      // Store schemas for reference and validation
+      _schemas: {
+        interactions: INTERACTION_SCHEMAS,
+        filter: DEFAULT_FILTER_CONFIG
+      },
       ...(contentSignals?.primary_selector ? {
         content_extraction: {
           primary_selector: contentSignals.primary_selector,
@@ -1219,20 +1961,64 @@ async function scanDomain(args) {
 
     const visitedUrls = new Set([url]);
     const scanQueue   = [{ url, depth: 0 }];
+    // _scanTabIdx declared above at function start (TDZ fix)
 
     while (scanQueue.length > 0) {
       const { url: pageUrl, depth } = scanQueue.shift();
 
-      // Navigate if not already there
-      const currentScanUrl = await _getCurrentUrl(scanSessionId, headed);
-      if (currentScanUrl !== pageUrl) {
-        await _browserAct({ action: 'navigate', url: pageUrl, sessionId: scanSessionId, headed, chromeProfile: AGENT_BROWSER_PROFILE, timeoutMs: 20000 }, 23000).catch(() => {});
-        await _browserAct({ action: 'waitForStableText', sessionId: scanSessionId, headed, chromeProfile: AGENT_BROWSER_PROFILE, timeoutMs: 5000 }, 7000).catch(() => {});
+      if (useTabStrategy) {
+        // Tab strategy: open each page in a fresh tab on the authenticated session.
+        // This keeps the Cloudflare-cleared session alive and avoids profile lock conflicts.
+        // The initial tab-new for depth=0 was already done above; depth>0 opens new tabs.
+        if (depth > 0) {
+          const _dTabRes = await _browserAct({ action: 'tab-new', url: pageUrl, sessionId: scanSessionId, headed, timeoutMs: 28000 }, 31000).catch(() => null);
+          if (_dTabRes?.result) {
+            const _tc = ((_dTabRes.result || '').match(/^\s*-\s+\d+:/gm) || []).length;
+            _scanTabIdx = Math.max(0, _tc - 1);
+          }
+          await _browserAct({ action: 'waitForStableText', sessionId: scanSessionId, headed, timeoutMs: 5000 }, 7000).catch(() => {});
+        }
+        // depth=0: already navigated via the initial tab-new above — just snapshot
+      } else {
+        // Background scan: navigate the single session tab normally
+        const currentScanUrl = await _getCurrentUrl(scanSessionId, headed);
+        if (currentScanUrl !== pageUrl) {
+          await _browserAct({ action: 'navigate', url: pageUrl, sessionId: scanSessionId, headed, timeoutMs: 20000 }, 23000).catch(() => {});
+          await _browserAct({ action: 'waitForStableText', sessionId: scanSessionId, headed, timeoutMs: 5000 }, 7000).catch(() => {});
+        }
       }
 
-      const snapRes = await _browserAct({ action: 'snapshot', sessionId: scanSessionId, headed, chromeProfile: AGENT_BROWSER_PROFILE, timeoutMs: 10000 }, 12000).catch(() => null);
-      const snapshot = snapRes?.ok && snapRes.result ? snapRes.result : '';
-      if (!snapshot) continue;
+      let snapRes = await _browserAct({ action: 'snapshot', sessionId: scanSessionId, headed, timeoutMs: 10000 }, 12000).catch(() => null);
+      let snapshot = snapRes?.ok && snapRes.result ? snapRes.result : '';
+      if (!snapshot) {
+        if (useTabStrategy && depth > 0 && _scanTabIdx >= 0) {
+          await _browserAct({ action: 'tab-close', sessionId: scanSessionId, headed, tabIndex: _scanTabIdx }, 5000).catch(() => {});
+        }
+        continue;
+      }
+
+      // If the page is a login wall, attempt auth with same session before extracting elements.
+      // This handles sites that show a sign-in modal over '/' without redirecting to /login.
+      if (_isLoginWall(snapshot, pageUrl)) {
+        logger.info(`[explore.agent] scan: login wall detected at ${pageUrl} — attempting waitForAuth`);
+        const authRes = await _browserAct({
+          action: 'waitForAuth',
+          url: pageUrl,
+          authSuccessUrl: hostname,
+          sessionId: scanSessionId,
+          headed: true,
+          timeoutMs: 120000,
+        }, 125000).catch(err => ({ ok: false, error: err.message }));
+        if (authRes?.ok) {
+          logger.info(`[explore.agent] scan: auth succeeded — re-snapping`);
+          snapRes = await _browserAct({ action: 'snapshot', sessionId: scanSessionId, headed: true, timeoutMs: 10000 }, 12000).catch(() => null);
+          snapshot = snapRes?.ok && snapRes.result ? snapRes.result : '';
+          if (!snapshot) continue;
+        } else {
+          logger.warn(`[explore.agent] scan: auth not completed (${authRes?.error}) — skipping page`);
+          continue;
+        }
+      }
 
       const pageStateInfo = await _identifyPageState(snapshot, pageUrl);
       const stateKey = pageStateInfo?.state_key || `page_${depth}_${visitedUrls.size}`;
@@ -1240,31 +2026,295 @@ async function scanDomain(args) {
 
       logger.info(`[explore.agent] scan: state="${stateKey}" at ${pageUrl}`);
 
+      // ---------------------------------------------------------------------------
+      // Generic History Link Detection — works across ANY site, not Perplexity-specific
+      // Uses configurable filter rules that can be overridden per-site
+      // Returns: history score (0+), where >= minHistoryScore means likely history
+      // ---------------------------------------------------------------------------
+      const filterConfig = _getFilterConfigForSite(hostname, existingMap);
+      
+      function isGenericHistoryLink(element, surroundingText) {
+        const href = element.href || '';
+        const text = element.text || element.ariaLabel || '';
+        const parentText = surroundingText || '';
+        
+        // Score-based detection (multiple signals = higher confidence)
+        let historyScore = 0;
+        
+        // Signal 1: URL matches historical patterns from config
+        for (const pattern of filterConfig.historicalUrlPatterns) {
+          try {
+            const regex = new RegExp(pattern, 'i');
+            if (regex.test(href)) {
+              historyScore += 2;
+              break; // Only count once even if multiple patterns match
+            }
+          } catch (_) {
+            // Skip invalid regex patterns
+          }
+        }
+        
+        // Signal 2: URL contains conversational path segments (fallback)
+        const conversationalPaths = ['chat', 'conversation', 'thread', 'message', 'query', 'search'];
+        if (conversationalPaths.some(p => href.toLowerCase().includes(`/${p}/`))) {
+          historyScore += 1;
+        }
+        
+        // Signal 3: Text looks like a user query (uses config patterns)
+        for (const pattern of filterConfig.queryTextPatterns) {
+          try {
+            const regex = new RegExp(pattern, 'i');
+            if (regex.test(text) && text.length > 10 && text.length < 200) {
+              historyScore += 2;
+              break;
+            }
+          } catch (_) {
+            // Skip invalid regex patterns
+          }
+        }
+        
+        // Signal 4: Parent container suggests history list (uses config)
+        for (const indicator of filterConfig.historyContainerIndicators) {
+          if (parentText.toLowerCase().includes(indicator)) {
+            historyScore += 2;
+            break;
+          }
+        }
+        
+        // Signal 5: Element is in a list container (common for history)
+        if (element.tag === 'a' && element.inList) {
+          historyScore += 1;
+        }
+        
+        // Signal 6: Long URL path (specific item, not general navigation)
+        if (href.split('/').length > 4) {
+          historyScore += 1;
+        }
+        
+        // Signal 7: Very long text (likely user query, not UI label)
+        if (text.length > 50) {
+          historyScore += 2;
+        }
+        
+        // Signal 8: Contains CJK characters (likely user query in Asian language)
+        if (/[\u4e00-\u9fff\u3040-\u309f\u30a0-\u30ff\uac00-\ud7af]/.test(text)) {
+          historyScore += 2;
+        }
+        
+        // Return the score (caller checks against threshold)
+        return historyScore;
+      }
+      
+      // Check if element is a primary control (should always keep)
+      function isPrimaryControl(element) {
+        const text = (element.text || element.ariaLabel || '').toLowerCase();
+        for (const pattern of filterConfig.primaryControlPatterns) {
+          try {
+            const regex = new RegExp(pattern, 'i');
+            if (regex.test(text)) {
+              return true;
+            }
+          } catch (_) {
+            // Skip invalid regex patterns
+          }
+        }
+        return false;
+      }
+
+      // ---------------------------------------------------------------------------
+      // Generic UI Element Classification — determines what an element DOES
+      // Returns interaction type and metadata for all 10+ interaction types
+      // ---------------------------------------------------------------------------
+      function classifyInteraction(attrs) {
+        const { tag, role, type, contenteditable, draggable, hasPopup, checked, scrollHeight, clientHeight, overflowY, className, ariaLabel } = attrs;
+        
+        // 1. File upload (most specific)
+        if (tag === 'input' && type === 'file') {
+          return { type: 'upload', params: ['files'], priority: 1 };
+        }
+        
+        // 2. Checkboxes
+        if (tag === 'input' && type === 'checkbox') {
+          return { type: checked ? 'uncheck' : 'check', params: [], priority: 2 };
+        }
+        
+        // 3. Dropdowns
+        if (tag === 'select' || (role === 'combobox' && hasPopup === 'listbox')) {
+          return { type: 'select', params: ['value'], options: attrs.options || [], priority: 3 };
+        }
+        
+        // 4. Contenteditable rich text editors (CRITICAL: Perplexity search input!)
+        if (contenteditable === 'true' && (role === 'textbox' || !role)) {
+          // Detect if this is a search input that needs Enter pressed after typing
+          const isSearch = (ariaLabel || '').toLowerCase().includes('search') || 
+                           (className || '').toLowerCase().includes('search') ||
+                           (attrs.placeholder || '').toLowerCase().includes('search');
+          return { 
+            type: 'type', 
+            params: ['text'], 
+            priority: 4,
+            followUp: isSearch ? { action: 'press', key: 'Enter' } : null
+          };
+        }
+        
+        // 5. Standard inputs
+        if (tag === 'input' || tag === 'textarea') {
+          // Detect if search input
+          const isSearch = type === 'search' || 
+                           (attrs.placeholder || '').toLowerCase().includes('search') ||
+                           (ariaLabel || '').toLowerCase().includes('search');
+          return { 
+            type: 'fill', 
+            params: ['text'], 
+            priority: 5,
+            followUp: isSearch ? { action: 'press', key: 'Enter' } : null
+          };
+        }
+        
+        // 6. Scrollable containers (feeds, lists, modals)
+        if ((scrollHeight && clientHeight && scrollHeight > clientHeight * 1.2) ||
+            overflowY === 'auto' || overflowY === 'scroll' ||
+            (className || '').match(/scrollable|overflow|feed|list/)) {
+          return { 
+            type: 'scroll', 
+            params: ['direction', 'distance'], 
+            priority: 6,
+            defaults: { direction: 'down', distance: 500 }
+          };
+        }
+        
+        // 7. Draggable
+        if (draggable) {
+          return { type: 'drag', params: ['targetSelector'], priority: 7 };
+        }
+        
+        // 8. Hover menus (has popup/dropdown)
+        if (hasPopup === 'true' || hasPopup === 'menu' || hasPopup === 'listbox') {
+          return { type: 'hover', params: [], priority: 8, reveals: 'dropdown' };
+        }
+        
+        // 9. Double-click (file managers, grids)
+        if (role === 'gridcell' || role === 'listitem' || 
+            (className || '').match(/grid|file|item/)) {
+          return { type: 'dblclick', params: [], priority: 9 };
+        }
+        
+        // 10. Default: click for buttons and links
+        if (['button', 'a'].includes(tag) || role === 'button') {
+          return { type: 'click', params: [], priority: 10 };
+        }
+        
+        return { type: 'unknown', params: [], priority: 11 };
+      }
+      
+      // ---------------------------------------------------------------------------
+      // Multi-Step Action Detection — determines if action needs follow-up
+      // ---------------------------------------------------------------------------
+      function detectMultiStepSequence(interactionInfo, attrs) {
+        const sequences = [];
+        
+        // Type/Fill → Press Enter (for search inputs)
+        if ((interactionInfo.type === 'type' || interactionInfo.type === 'fill') && interactionInfo.followUp) {
+          sequences.push({
+            name: `${interactionInfo.type}_and_submit`,
+            steps: [
+              { action: interactionInfo.type, param: 'text' },
+              interactionInfo.followUp
+            ]
+          });
+        }
+        
+        // Hover → Click (for dropdown menus)
+        if (interactionInfo.type === 'hover' && interactionInfo.reveals === 'dropdown') {
+          sequences.push({
+            name: 'open_dropdown_menu',
+            steps: [
+              { action: 'hover' },
+              { action: 'click', target: 'revealed_item' }
+            ]
+          });
+        }
+        
+        return sequences;
+      }
+
+      // ---------------------------------------------------------------------------
+      // Skill Name Sanitizer — prevents empty, underscore-only, or invalid names
+      // ---------------------------------------------------------------------------
+      function generateSkillName(label, interaction) {
+        if (!label || typeof label !== 'string') {
+          return `${interaction}_element`;
+        }
+        
+        // Remove special chars, limit length
+        let name = label
+          .toLowerCase()
+          .replace(/[^a-z0-9\s]/g, '')  // Remove special chars
+          .trim()
+          .slice(0, 30)              // Limit length
+          .replace(/\s+/g, '_');      // Spaces to underscores
+        
+        // Prevent empty or underscore-only names
+        if (!name || name.match(/^_*$/) || name.length < 2) {
+          name = `${interaction}_element`;
+        }
+        
+        // Ensure it starts with a letter
+        if (!/^[a-z]/.test(name)) {
+          name = 'action_' + name;
+        }
+        
+        return name;
+      }
+
+      // Detect bot/Cloudflare protection page — skip extraction, flag for caller
+      const BOT_STATE_RE = /security.verif|cloudflare|bot.protect|captcha|ddos.protect|access.denied|challenge/i;
+      if (BOT_STATE_RE.test(stateKey) || BOT_STATE_RE.test(identification)) {
+        logger.warn(`[explore.agent] scan: bot-protection state detected ("${stateKey}") — skipping page`);
+        botBlocked = true;
+        _postProgress(_progressCallbackUrl, { type: 'explore:bot_detected', hostname, stateKey, pageUrl });
+        if (useTabStrategy && depth > 0 && _scanTabIdx >= 0) {
+          await _browserAct({ action: 'tab-close', sessionId: scanSessionId, headed, tabIndex: _scanTabIdx }, 5000).catch(() => {});
+        }
+        continue;
+      }
+
       if (!newMap.states[stateKey]) {
-        newMap.states[stateKey] = { identification, actions: {} };
+        newMap.states[stateKey] = { identification, actions: {}, data: [] };
       }
 
       // Extract all interactable items from snapshot
       const allItems = _extractNavItems(snapshot);
 
       // Also extract inputs/selects from snapshot
+      // Handles same formats as _extractNavItems:
+      //   Format A: "  - [e12] textbox \"Search...\""
+      //   Format B: "    - searchbox \"Search...\" [ref=e52]"
       const inputRefs = [];
-      const inputRe   = /^\s*-\s*ref=(@e\d+)/;
-      let capRef = null, capRole = null, capName = null;
+      const INPUT_ROLES = new Set(['textbox', 'searchbox', 'combobox', 'spinbutton']);
+
       for (const line of snapshot.split('\n')) {
-        const rm = line.match(inputRe);
-        if (rm) { capRef = rm[1]; capRole = null; capName = null; continue; }
-        if (capRef) {
-          const roleM = line.match(/role=["']?(\w+)/);
-          if (roleM) capRole = roleM[1].toLowerCase();
-          const nameM = line.match(/name=["']([^"']+)/);
-          if (nameM) capName = nameM[1];
-          const phM = line.match(/placeholder=["']([^"']+)/);
-          if (phM && !capName) capName = phM[1];
-          if (capRole && (capRole === 'textbox' || capRole === 'searchbox' || capRole === 'combobox' || capRole === 'spinbutton')) {
-            inputRefs.push({ ref: capRef, label: capName || capRole, role: capRole });
-            capRef = null;
+        let ref = null;
+        let role = null;
+        let label = '';
+
+        // Format A: [eN] role "label"
+        const mA = line.match(/^\s*-?\s*\[?(e\d+)\]?\s+(\w[\w-]*)\s+"([^"]*)"/i);
+        if (mA) {
+          [, ref, role, label] = mA;
+        } else {
+          // Format B: role "label" [ref=eN]
+          const mB = line.match(/^\s*-\s+(\w[\w-]*)\s+"([^"]*)"/i);
+          if (mB) {
+            [, role, label] = mB;
+            const refMatch = line.match(/\[ref=(e\d+)\]/i);
+            ref = refMatch ? refMatch[1] : null;
           }
+        }
+
+        // Note: playwright-cli uses e12 format (NOT @e12) - resolveRef checks /^e\d+$/i
+        if (ref && role && INPUT_ROLES.has(role.toLowerCase())) {
+          inputRefs.push({ ref, label: label.trim() || role, role: role.toLowerCase() });
         }
       }
 
@@ -1272,27 +2322,266 @@ async function scanDomain(args) {
       const allScanItems = [...allItems, ...inputRefs];
       let pageActions = 0;
 
-      for (const item of allScanItems.slice(0, 30)) {
-        const interaction = (item.role === 'textbox' || item.role === 'searchbox' || item.role === 'combobox') ? 'fill' : 'click';
-        const selectorProfile = await _extractStableSelectors(item.ref, scanSessionId, headed, item.label, interaction);
-        if (!selectorProfile?.locators?.primary) continue;
+      const totalElements = Math.min(allScanItems.length, 30);
+      logger.info(`[explore.agent] scan: state="${stateKey}" — ${totalElements} elements to process (capped at 30)`);
+      _postProgress(_progressCallbackUrl, { type: 'explore:scan_elements_start', hostname, state: stateKey, elementCount: totalElements, depth, message: `🔍 Discovering ${totalElements} interactive elements on ${stateKey}...` });
 
-        const actionKey = item.label.toLowerCase().replace(/[^a-z0-9]+/g, '_').slice(0, 40);
+      // State-level counters (reset per state)
+      let stateSuccess = 0;
+      let stateFail = 0;
+      let stateFiltered = 0;
+      let processedCount = 0;
+      
+      for (const item of allScanItems.slice(0, 30)) {
+        processedCount++;
+        scanStats.totalElements++;
+        const progressPct = Math.round((processedCount / totalElements) * 100);
+        
+        // Send progress update every 3 elements or on first
+        if (processedCount === 1 || processedCount % 3 === 0) {
+          _postProgress(_progressCallbackUrl, {
+            type: 'explore:scan_progress',
+            hostname,
+            state: stateKey,
+            message: `📍 Processing element ${processedCount}/${totalElements} (${progressPct}%) — ${item.label}`,
+            current: processedCount,
+            total: totalElements,
+            percent: progressPct,
+            depth
+          });
+        }
+        // First, extract attributes to determine interaction type and filter
+        const attrsRes = await _browserAct({
+          action: 'evaluate',
+          text: `(el) => el ? ({
+            tag: el.tagName.toLowerCase(),
+            text: (el.innerText || el.textContent || '').trim().slice(0, 80),
+            ariaLabel: el.getAttribute('aria-label'),
+            role: el.getAttribute('role'),
+            type: el.getAttribute('type'),
+            href: el.getAttribute('href'),
+            id: el.id || null,
+            contenteditable: el.getAttribute('contenteditable'),
+            draggable: el.getAttribute('draggable') === 'true',
+            checked: el.checked || false,
+            hasPopup: el.getAttribute('aria-haspopup'),
+            inList: !!(el.closest && (el.closest('ul') || el.closest('ol') || el.closest('[role="list"]'))),
+            parentText: el.parentElement ? (el.parentElement.getAttribute('aria-label') || el.parentElement.innerText || '').slice(0, 50) : '',
+          }) : null`,
+          ref: item.ref,
+          sessionId: scanSessionId,
+          headed,
+          timeoutMs: 5000,
+        }, 7000).catch(() => null);
+        
+        if (!attrsRes?.ok || !attrsRes.result) {
+          logger.info(`[explore.agent] scan: failed to extract attrs for ref=${item.ref} — skipping`);
+          stateFail++;
+          scanStats.failCount++;
+          continue;
+        }
+        
+        let attrs;
+        try {
+          attrs = JSON.parse(typeof attrsRes.result === 'string' ? attrsRes.result : JSON.stringify(attrsRes.result));
+        } catch (e) {
+          logger.info(`[explore.agent] scan: failed to parse attrs for ref=${item.ref} — skipping`);
+          stateFail++;
+          scanStats.failCount++;
+          continue;
+        }
+        
+        // Determine what type of element this is
+        // Priority: 1. History detection (strong signals), 2. Primary controls, 3. Regular actions
+        const historyScore = isGenericHistoryLink(attrs, attrs.parentText);
+        const isHistory = historyScore >= filterConfig.minHistoryScore;
+        const isPrimary = isPrimaryControl(attrs);
+        
+        // If it's clearly history, save to data array but don't add as action (unless it's also primary)
+        if (isHistory && !isPrimary) {
+          logger.info(`[explore.agent] scan: saving history item to data ref=${item.ref} label="${item.label}" score=${historyScore}`);
+          
+          // Add to data array for potential summarization/querying
+          newMap.states[stateKey].data.push({
+            type: 'history',
+            ref: item.ref,
+            label: item.label,
+            href: attrs.href,
+            timestamp: new Date().toISOString(),
+            score: historyScore,
+            attrs: {
+              tag: attrs.tag,
+              ariaLabel: attrs.ariaLabel,
+              text: attrs.text
+            }
+          });
+          
+          _postProgress(_progressCallbackUrl, {
+            type: 'explore:scan_data_collected',
+            hostname,
+            state: stateKey,
+            message: `📊 Collected history item: "${item.label}"`,
+            label: item.label,
+            dataType: 'history'
+          });
+          
+          stateFiltered++;
+          scanStats.filteredCount++;
+          continue;  // Skip adding as action - only save as data
+        }
+        
+        // If it's a primary control, always keep it as an action (even if it looks like history)
+        if (isPrimary) {
+          logger.info(`[explore.agent] scan: keeping primary control ref=${item.ref} label="${item.label}"`);
+          // Continue to process as action below
+        }
+        
+        // Classify interaction type using comprehensive detection
+        const interactionInfo = classifyInteraction(attrs);
+        const interaction = interactionInfo.type;
+        
+        logger.info(`[explore.agent] scan: extracting selectors for ref=${item.ref} label="${item.label}" interaction=${interaction}`);
+        _postProgress(_progressCallbackUrl, {
+          type: 'explore:scan_extracting',
+          hostname,
+          state: stateKey,
+          message: `🔧 Extracting selectors for: "${item.label}" (${interaction})`,
+          label: item.label,
+          interaction,
+          ref: item.ref
+        });
+        
+        // Skip unknown interactions
+        if (interaction === 'unknown') {
+          logger.info(`[explore.agent] scan: unknown interaction type for ref=${item.ref} — skipping`);
+          stateFail++;
+          scanStats.failCount++;
+          continue;
+        }
+        
+        const selectorProfile = await _extractStableSelectors(item.ref, scanSessionId, headed, item.label, interaction);
+        if (!selectorProfile?.locators?.primary) {
+          logger.info(`[explore.agent] scan: selector extract FAILED for ref=${item.ref} label="${item.label}" — skipping`);
+          _postProgress(_progressCallbackUrl, {
+            type: 'explore:scan_failed',
+            hostname,
+            state: stateKey,
+            message: `❌ Failed to extract: "${item.label}"`,
+            label: item.label
+          });
+          stateFail++;
+          scanStats.failCount++;
+          continue;
+        }
+        stateSuccess++;
+        scanStats.successCount++;
+
+        // Check goal relevance before adding action (support multi-goal)
+        const relevance = _calculateGoalRelevance(item.label, attrs, interaction, goalsArray);
+        const RELEVANCE_THRESHOLD = 0.3; // Minimum relevance to keep action
+        
+        if (relevance < RELEVANCE_THRESHOLD) {
+          const goalsStr = goalsArray.length > 1 ? `${goalsArray.length} goals` : (goalsArray[0] || 'none');
+          logger.info(`[explore.agent] scan: filtering out low-relevance action "${item.label}" (relevance: ${relevance.toFixed(2)}) for ${goalsStr}`);
+          stateFiltered++;
+          scanStats.filteredCount++;
+          continue;
+        }
+        
+        const goalsStr = goalsArray.length > 1 ? `${goalsArray.length} goals` : (goalsArray[0] || 'none');
+        logger.info(`[explore.agent] scan: keeping relevant action "${item.label}" (relevance: ${relevance.toFixed(2)}) for ${goalsStr}`);
+
+        // Use improved skill name generation
+        const actionKey = generateSkillName(item.label, interaction);
+
+        _postProgress(_progressCallbackUrl, {
+          type: 'explore:scan_success',
+          hostname,
+          state: stateKey,
+          message: `✅ Captured: "${item.label}" (${interaction})`,
+          label: item.label,
+          interaction,
+          skillName: actionKey
+        });
+        
+        // Build parameter metadata for parameterized skills
+        const acceptsParams = interactionInfo.params || [];
+        const paramMapping = {};
+        const examples = [];
+        
+        if (acceptsParams.length > 0) {
+          // Create param mapping for each parameter
+          acceptsParams.forEach(param => {
+            if (param === 'text') {
+              paramMapping.query = { field: 'text', required: true };
+            } else if (param === 'value') {
+              paramMapping.selection = { field: 'value', required: true, options: interactionInfo.options || [] };
+            } else if (param === 'files') {
+              paramMapping.file_path = { field: 'files', required: true, type: 'array' };
+            } else {
+              paramMapping[param] = { field: param, required: true };
+            }
+          });
+          
+          // Generate example based on label
+          if (item.label.toLowerCase().includes('search') || item.label.toLowerCase().includes('ask')) {
+            examples.push({ query: 'best vegan restaurants near me' });
+          } else if (interaction === 'fill' || interaction === 'type') {
+            examples.push({ text: item.placeholder || 'Enter your text here' });
+          }
+        }
+        
+        // Detect multi-step sequences (e.g., type then press Enter)
+        const multiStepSequences = detectMultiStepSequence(interactionInfo, attrs);
+        
+        // Build follow-up actions
+        const followUpActions = [];
+        if (interactionInfo.followUp) {
+          followUpActions.push(interactionInfo.followUp);
+        }
+        if (interactionInfo.defaults) {
+          followUpActions.push({ action: 'set_defaults', values: interactionInfo.defaults });
+        }
+        
         newMap.states[stateKey].actions[actionKey] = {
           skill_name: actionKey,
           interaction,
           locators: selectorProfile.locators,
           fingerprint: selectorProfile.fingerprint,
-          success_criteria: selectorProfile.success_criteria || { expected_url_change: true, element_to_appear: null },
+          success_criteria: selectorProfile.success_criteria || { expected_url_change: interaction === 'click', element_to_appear: null },
           verified: false,
           last_verified: null,
           failure_count: 0,
+          // Parameter support for Phase 2
+          accepts_params: acceptsParams,
+          param_mapping: Object.keys(paramMapping).length > 0 ? paramMapping : null,
+          examples: examples.length > 0 ? examples : null,
+          // Multi-step action support (Phase 3)
+          follow_up_actions: followUpActions.length > 0 ? followUpActions : null,
+          multi_step_sequences: multiStepSequences.length > 0 ? multiStepSequences : null,
+          // Parameter defaults for scroll, etc.
+          param_defaults: interactionInfo.defaults || null,
+          // Goal relevance tracking
+          goal_relevance: relevance,
+          goal_matched: goal || null,
+          // Additional metadata
+          _options: interactionInfo.options || null,
+          _priority: interactionInfo.priority || 9,
+          _reveals: interactionInfo.reveals || null,
         };
         pageActions++;
         totalActions++;
       }
+      
+      scanStats.statesScanned++;
+      logger.info(`[explore.agent] scan: state="${stateKey}" — ${stateSuccess} succeeded, ${stateFail} failed, ${stateFiltered} filtered (history) out of ${Math.min(allScanItems.length, 30)} attempted`);
 
       _postProgress(_progressCallbackUrl, { type: 'explore:scan_progress', hostname, state: stateKey, actionsFound: pageActions, depth });
+
+      // Close tab when done with this page (tab strategy only, depth>0 tabs)
+      if (useTabStrategy && depth > 0 && _scanTabIdx >= 0) {
+        await _browserAct({ action: 'tab-close', sessionId: scanSessionId, headed, tabIndex: _scanTabIdx }, 5000).catch(() => {});
+      }
 
       // Enqueue same-hostname links for next depth level
       if (depth < maxScanDepth) {
@@ -1314,16 +2603,161 @@ async function scanDomain(args) {
       }
     }
 
-    // Merge with existing map and save
-    const mergedMap = _mergeDomainMap(existingMap, newMap);
+    // Merge with cleaned existing map and save
+    const mergedMap = _mergeDomainMap(cleanedExisting, newMap);
+    
+    // Update metadata for v2.0 schema
+    mergedMap.version = '2.0';
+    mergedMap._schemas = INTERACTION_SCHEMAS;
+    mergedMap._filterConfig = {
+      historyContainerIndicators: ['history', 'recent', 'previous', 'conversation'],
+      primaryControlPatterns: ['new', 'search', 'ask', 'create', 'settings', 'computer']
+    };
+    mergedMap.last_scanned = new Date().toISOString();
+    
     _saveDomainMap(hostname, mergedMap);
 
     const mapPath = _mapPath(hostname);
     const duration = Date.now() - start;
     logger.info(`[explore.agent] scanDomain complete: ${hostname} — ${totalActions} actions in ${duration}ms`);
-    _postProgress(_progressCallbackUrl, { type: 'explore:scan_complete', hostname, totalActions, mapPath, duration, trigger: _trigger });
+    _postProgress(_progressCallbackUrl, {
+      type: 'explore:scan_complete',
+      hostname,
+      totalActions,
+      mapPath,
+      duration,
+      trigger: _trigger,
+      message: `🛠️ Generating skills from ${totalActions} discovered actions...`,
+      phase: 'generating'
+    });
 
-    return { ok: true, hostname, actionsFound: totalActions, mapPath, duration };
+    // Generate skills from all discovered actions (skill cache)
+    let skillsGenerated = 0;
+    let actionCount = 0;
+    
+    logger.info(`[explore.agent] Starting skill generation from ${Object.keys(newMap.states || {}).length} states...`);
+    
+    for (const [stateKey, state] of Object.entries(newMap.states || {})) {
+      const actionKeys = Object.keys(state.actions || {});
+      logger.info(`[explore.agent] Processing state "${stateKey}" with ${actionKeys.length} actions`);
+      
+      for (const [actionKey, action] of Object.entries(state.actions || {})) {
+        actionCount++;
+        try {
+          const skill = generateSkillFromAction(hostname, stateKey, actionKey);
+          if (skill && !skill.error) {
+            // Save skill with metadata for cache management
+            const skillWithMeta = {
+              ...skill,
+              _meta: {
+                source_domain: hostname,
+                source_action: actionKey,
+                created_at: new Date().toISOString(),
+                goal_tied: true,  // All scanned skills are goal-tied initially
+                use_count: 0,
+                last_used: null
+              }
+            };
+            
+            // Register in skill registry
+            await _registerSkill(skillWithMeta);
+            skillsGenerated++;
+            logger.info(`[explore.agent] Generated skill: ${skill.name || actionKey}`);
+            
+            if (skillsGenerated % 3 === 0) {
+              _postProgress(_progressCallbackUrl, {
+                type: 'explore:scan_skill_progress',
+                hostname,
+                message: `⚡ Generated ${skillsGenerated}/${totalActions} skills...`,
+                current: skillsGenerated,
+                total: totalActions
+              });
+            }
+          } else if (skill?.error) {
+            logger.warn(`[explore.agent] Skill generation failed for ${actionKey}: ${skill.error}`);
+          }
+        } catch (e) {
+          logger.warn(`[explore.agent] Failed to generate skill for ${actionKey}: ${e.message}`);
+        }
+      }
+    }
+    
+    // Generate navigate_history skill from collected data
+    const dataItems = Object.values(newMap.states || {}).flatMap(state => state.data || []);
+    const historyItems = dataItems.filter(d => d.type === 'history');
+    
+    if (historyItems.length > 0) {
+      try {
+        const navigateSkill = generateNavigateHistorySkill(hostname, historyItems);
+        if (navigateSkill && !navigateSkill.error) {
+          const skillWithMeta = {
+            ...navigateSkill,
+            _meta: {
+              source_domain: hostname,
+              source_action: 'navigate_history',
+              created_at: new Date().toISOString(),
+              goal_tied: true,
+              use_count: 0,
+              last_used: null
+            }
+          };
+          await _registerSkill(skillWithMeta);
+          skillsGenerated++;
+          logger.info(`[explore.agent] Generated navigate_history skill with ${historyItems.length} history items`);
+        }
+      } catch (e) {
+        logger.warn(`[explore.agent] Failed to generate navigate_history skill: ${e.message}`);
+      }
+    }
+    
+    // Count data items collected
+    const dataItemsCount = dataItems.length;
+    
+    logger.info(`[explore.agent] Skill generation complete: ${skillsGenerated}/${actionCount} skills generated from ${Object.keys(newMap.states || {}).length} states, ${dataItemsCount} data items collected`);
+    
+    // Send completion summary with requiresDismissal flag to prevent auto-dismiss
+    const summaryStats = {
+      totalElements: scanStats.totalElements,
+      successful: scanStats.successCount,
+      failed: scanStats.failCount,
+      filtered: scanStats.filteredCount,
+      states: scanStats.statesScanned,
+      skillsGenerated: skillsGenerated,
+      dataItems: dataItemsCount,
+      duration: Math.round(duration / 1000)
+    };
+
+    logger.info(`[explore.agent] Posting scan_summary event to ${_progressCallbackUrl} with requiresDismissal=true`);
+    
+    _postProgress(_progressCallbackUrl, {
+      type: 'explore:scan_summary',
+      hostname,
+      message: `✨ Scan complete! Found ${totalActions} actions, collected ${dataItemsCount} data items, generated ${skillsGenerated} skills`,
+      requiresDismissal: true,
+      ...summaryStats,
+      actions: Object.values(newMap.states || {}).flatMap(s => Object.keys(s.actions || {}))
+    });
+    
+    logger.info(`[explore.agent] scan_summary event posted successfully`);
+
+    // Collect generated skill names to pass back to learn.agent
+    const generatedSkills = Object.values(newMap.states || {}).flatMap(state => 
+      Object.values(state.actions || {}).map(action => ({
+        name: action.skill_name || action.action_key,
+        description: action.skill_description || `Interact with ${action.action_key}`
+      }))
+    );
+    
+    // Add navigate_history skill if history items were collected
+    if (historyItems.length > 0) {
+      const navigateSkillName = `${hostname.replace(/\./g, '_')}_navigate_history`;
+      generatedSkills.push({
+        name: navigateSkillName,
+        description: 'Navigate to previous searches by fuzzy matching against history'
+      });
+    }
+
+    return { ok: true, hostname, actionsFound: totalActions, mapPath, duration, botBlocked, summary: summaryStats, generatedSkills };
 
   } catch (err) {
     logger.warn(`[explore.agent] scanDomain error for ${hostname}: ${err.message}`);
@@ -1746,6 +3180,547 @@ function stopIdleWatcher() {
   if (_idleWatcherTimer) { clearInterval(_idleWatcherTimer); _idleWatcherTimer = null; }
 }
 
+// ---------------------------------------------------------------------------
+// Skill Generator — Creates parameterized skills from domain map actions
+// ---------------------------------------------------------------------------
+/**
+ * Generate a parameterized skill from a domain map action
+ * @param {string} hostname - Domain (e.g., 'perplexity.ai')
+ * @param {string} stateKey - State key in domain map (e.g., 'home_page')
+ * @param {string} actionKey - Action key in state (e.g., 'search_input')
+ * @param {Object} customParams - Optional custom parameters to override defaults
+ * @returns {Object} Generated skill code and metadata
+ */
+function generateSkillFromAction(hostname, stateKey, actionKey, customParams = {}) {
+  // Load domain map
+  const domainMap = _loadDomainMap(hostname);
+  if (!domainMap || !domainMap.states[stateKey] || !domainMap.states[stateKey].actions[actionKey]) {
+    return { error: `Action not found: ${hostname}.${stateKey}.${actionKey}` };
+  }
+  
+  const action = domainMap.states[stateKey].actions[actionKey];
+  const { skill_name, interaction, locators, accepts_params, param_mapping, examples } = action;
+  
+  // Build skill name
+  const skillName = customParams.name || `${hostname.replace(/\./g, '_')}_${skill_name}`;
+  const displayName = customParams.displayName || skill_name.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase());
+  
+  // Build parameter definitions
+  const params = accepts_params || [];
+  const paramDefs = {};
+  
+  if (param_mapping && Object.keys(param_mapping).length > 0) {
+    Object.entries(param_mapping).forEach(([key, config]) => {
+      paramDefs[key] = {
+        type: config.type || 'string',
+        required: config.required !== false,
+        description: config.description || `Parameter for ${key}`,
+        ...(config.options ? { options: config.options } : {})
+      };
+    });
+  } else if (params.length > 0) {
+    // Fallback: create param defs from accepts_params
+    params.forEach(param => {
+      const paramName = param === 'text' ? 'query' : param;
+      paramDefs[paramName] = { type: 'string', required: true };
+    });
+  }
+  
+  // Generate skill code based on interaction type
+  let skillCode;
+  
+  switch (interaction) {
+    case 'fill':
+    case 'type':
+      skillCode = _generateFillSkill(skillName, locators, paramDefs, interaction);
+      break;
+    case 'click':
+      skillCode = _generateClickSkill(skillName, locators);
+      break;
+    case 'select':
+      skillCode = _generateSelectSkill(skillName, locators, paramDefs);
+      break;
+    case 'check':
+    case 'uncheck':
+      skillCode = _generateToggleSkill(skillName, locators, interaction);
+      break;
+    case 'upload':
+      skillCode = _generateUploadSkill(skillName, locators, paramDefs);
+      break;
+    case 'scroll':
+      skillCode = _generateScrollSkill(skillName, locators, paramDefs);
+      break;
+    case 'dblclick':
+      skillCode = _generateDblclickSkill(skillName, locators);
+      break;
+    case 'hover':
+      skillCode = _generateHoverSkill(skillName, locators);
+      break;
+    default:
+      skillCode = _generateGenericSkill(skillName, locators, interaction, paramDefs);
+  }
+  
+  return {
+    name: skillName,
+    displayName,
+    hostname,
+    stateKey,
+    actionKey,
+    interaction,
+    parameters: paramDefs,
+    examples: examples || [],
+    code: skillCode,
+    locators,
+  };
+}
+
+// Generate navigate_history skill from collected history data
+function generateNavigateHistorySkill(hostname, historyItems) {
+  if (!historyItems || historyItems.length === 0) {
+    return { error: 'No history items provided' };
+  }
+  
+  const skillName = `${hostname.replace(/\./g, '_')}_navigate_history`;
+  const baseUrl = `https://${hostname}`;
+  
+  // Build skill code that fuzzy-matches and navigates
+  const skillCode = `'use strict';
+/**
+ * Skill: ${skillName}
+ * Navigate to previous search/conversation by fuzzy matching query against history
+ */
+const browserAct = require('./browser.act.cjs');
+
+// History index built at skill creation time
+const historyIndex = ${JSON.stringify(historyItems.map(h => ({ label: h.label, href: h.href, ref: h.ref })), null, 2)};
+
+// Simple fuzzy match function
+function fuzzyMatch(query, text) {
+  const q = query.toLowerCase().trim();
+  const t = text.toLowerCase().trim();
+  
+  // Exact match
+  if (t.includes(q)) return 1.0;
+  
+  // Word-by-word match
+  const qWords = q.split(/\\s+/);
+  const tWords = t.split(/\\s+/);
+  let matches = 0;
+  for (const qw of qWords) {
+    if (qw.length > 2 && tWords.some(tw => tw.includes(qw) || qw.includes(tw))) {
+      matches++;
+    }
+  }
+  return matches / qWords.length;
+}
+
+module.exports = {
+  name: '${skillName}',
+  description: 'Navigate to a previous search or conversation by describing it',
+  parameters: {
+    query: {
+      type: 'string',
+      required: true,
+      description: 'Keywords from the history item you want to navigate to (e.g., "winter clothes")'
+    }
+  },
+  
+  async run(args = {}) {
+    const { sessionId, headed, query } = args;
+    
+    if (!query) {
+      throw new Error('Missing required parameter: query');
+    }
+    
+    // Find best match
+    let bestMatch = null;
+    let bestScore = 0;
+    
+    for (const item of historyIndex) {
+      const score = fuzzyMatch(query, item.label);
+      if (score > bestScore) {
+        bestScore = score;
+        bestMatch = item;
+      }
+    }
+    
+    if (!bestMatch || bestScore < 0.3) {
+      return { 
+        success: false, 
+        error: 'No history match found for "' + query + '". Try different keywords.',
+        availableItems: historyIndex.slice(0, 5).map(h => h.label)
+      };
+    }
+    
+    // Navigate to the matched URL
+    const fullUrl = bestMatch.href.startsWith('http') ? bestMatch.href : 'https://${hostname}' + bestMatch.href;
+    
+    const res = await browserAct({
+      action: 'navigate',
+      url: fullUrl,
+      sessionId,
+      headed,
+      timeoutMs: 15000,
+    });
+    
+    if (!res.ok) {
+      throw new Error('Failed to navigate: ' + (res.error || 'Unknown error'));
+    }
+    
+    return { 
+      success: true, 
+      navigatedTo: bestMatch.label,
+      url: fullUrl,
+      matchConfidence: Math.round(bestScore * 100) + '%'
+    };
+  }
+};`;
+
+  return {
+    name: skillName,
+    displayName: 'Navigate History',
+    skill_name: skillName,
+    description: 'Navigate to previous searches by fuzzy matching against history',
+    interaction: 'navigate',
+    code: skillCode,
+    parameters: {
+      query: {
+        type: 'string',
+        required: true,
+        description: 'Keywords from the history item you want to navigate to'
+      }
+    },
+    hostname,
+  };
+}
+
+// Skill code generators for each interaction type
+function _generateFillSkill(name, locators, paramDefs, interaction) {
+  const paramNames = Object.keys(paramDefs);
+  const mainParam = paramNames[0] || 'query';
+  const selector = locators.primary || locators.fallback_1 || '[data-testid="input"]';
+  
+  return `'use strict';
+/**
+ * Skill: ${name}
+ * Interaction: ${interaction}
+ */
+const browserAct = require('./browser.act.cjs');
+
+module.exports = {
+  name: '${name}',
+  description: '${interaction === 'type' ? 'Type text into contenteditable field' : 'Fill input field'}',
+  parameters: ${JSON.stringify(paramDefs, null, 2)},
+  
+  async run({ ${paramNames.join(', ')} }) {
+    const text = ${mainParam};
+    if (!text) throw new Error('Missing required parameter: ${mainParam}');
+    
+    // ${interaction} the text into the field
+    const res = await browserAct({
+      action: '${interaction}',
+      selector: '${selector}',
+      text: text,
+      timeoutMs: 15000,
+    });
+    
+    if (!res.ok) {
+      throw new Error(\`Failed to ${interaction}: \${res.error || 'Unknown error'}\`);
+    }
+    
+    return { success: true, text };
+  }
+};`;
+}
+
+function _generateClickSkill(name, locators) {
+  const selector = locators.primary || locators.fallback_1 || '[data-testid="button"]';
+  
+  return `'use strict';
+/**
+ * Skill: ${name}
+ * Interaction: click
+ */
+const browserAct = require('./browser.act.cjs');
+
+module.exports = {
+  name: '${name}',
+  description: 'Click element',
+  parameters: {},
+  
+  async run() {
+    const res = await browserAct({
+      action: 'click',
+      selector: '${selector}',
+      timeoutMs: 15000,
+    });
+    
+    if (!res.ok) {
+      throw new Error(\`Failed to click: \${res.error || 'Unknown error'}\`);
+    }
+    
+    return { success: true };
+  }
+};`;
+}
+
+function _generateSelectSkill(name, locators, paramDefs) {
+  const paramNames = Object.keys(paramDefs);
+  const mainParam = paramNames[0] || 'selection';
+  const selector = locators.primary || locators.fallback_1 || 'select';
+  const options = paramDefs[mainParam]?.options || [];
+  
+  return `'use strict';
+/**
+ * Skill: ${name}
+ * Interaction: select (dropdown)
+ */
+const browserAct = require('./browser.act.cjs');
+
+module.exports = {
+  name: '${name}',
+  description: 'Select option from dropdown',
+  parameters: ${JSON.stringify(paramDefs, null, 2)},
+  options: ${JSON.stringify(options)},
+  
+  async run({ ${paramNames.join(', ')} }) {
+    const value = ${mainParam};
+    if (!value) throw new Error('Missing required parameter: ${mainParam}');
+    
+    const res = await browserAct({
+      action: 'select',
+      selector: '${selector}',
+      value: value,
+      timeoutMs: 15000,
+    });
+    
+    if (!res.ok) {
+      throw new Error(\`Failed to select: \${res.error || 'Unknown error'}\`);
+    }
+    
+    return { success: true, selected: value };
+  }
+};`;
+}
+
+function _generateToggleSkill(name, locators, interaction) {
+  const selector = locators.primary || locators.fallback_1 || 'input[type="checkbox"]';
+  
+  return `'use strict';
+/**
+ * Skill: ${name}
+ * Interaction: ${interaction}
+ */
+const browserAct = require('./browser.act.cjs');
+
+module.exports = {
+  name: '${name}',
+  description: '${interaction === 'check' ? 'Check checkbox' : 'Uncheck checkbox'}',
+  parameters: {},
+  
+  async run() {
+    const res = await browserAct({
+      action: '${interaction}',
+      selector: '${selector}',
+      timeoutMs: 15000,
+    });
+    
+    if (!res.ok) {
+      throw new Error(\`Failed to ${interaction}: \${res.error || 'Unknown error'}\`);
+    }
+    
+    return { success: true, action: '${interaction}' };
+  }
+};`;
+}
+
+function _generateUploadSkill(name, locators, paramDefs) {
+  const paramNames = Object.keys(paramDefs);
+  const mainParam = paramNames[0] || 'file_path';
+  const selector = locators.primary || locators.fallback_1 || 'input[type="file"]';
+  
+  return `'use strict';
+/**
+ * Skill: ${name}
+ * Interaction: upload
+ */
+const browserAct = require('./browser.act.cjs');
+const fs = require('fs');
+const path = require('path');
+
+module.exports = {
+  name: '${name}',
+  description: 'Upload file(s)',
+  parameters: ${JSON.stringify(paramDefs, null, 2)},
+  
+  async run({ ${paramNames.join(', ')} }) {
+    const files = Array.isArray(${mainParam}) ? ${mainParam} : [${mainParam}];
+    
+    // Validate files exist
+    for (const file of files) {
+      if (!fs.existsSync(file)) {
+        throw new Error(\`File not found: \${file}\`);
+      }
+    }
+    
+    const res = await browserAct({
+      action: 'upload',
+      selector: '${selector}',
+      files: files,
+      timeoutMs: 30000,
+    });
+    
+    if (!res.ok) {
+      throw new Error(\`Failed to upload: \${res.error || 'Unknown error'}\`);
+    }
+    
+    return { success: true, uploaded: files.length };
+  }
+};`;
+}
+
+function _generateGenericSkill(name, locators, interaction, paramDefs) {
+  const paramNames = Object.keys(paramDefs);
+  const selector = locators.primary || locators.fallback_1 || '[data-testid="element"]';
+  
+  return `'use strict';
+/**
+ * Skill: ${name}
+ * Interaction: ${interaction}
+ */
+const browserAct = require('./browser.act.cjs');
+
+module.exports = {
+  name: '${name}',
+  description: 'Perform ${interaction} action',
+  parameters: ${JSON.stringify(paramDefs, null, 2)},
+  
+  async run(params = {}) {
+    const { ${paramNames.join(', ')} } = params;
+    
+    const res = await browserAct({
+      action: '${interaction}',
+      selector: '${selector}',
+      ${paramNames.length > 0 ? `text: ${paramNames[0]},` : ''}
+      timeoutMs: 15000,
+    });
+    
+    if (!res.ok) {
+      throw new Error(\`Failed to ${interaction}: \${res.error || 'Unknown error'}\`);
+    }
+    
+    return { success: true };
+  }
+};`;
+}
+
+function _generateScrollSkill(name, locators, paramDefs) {
+  const paramNames = Object.keys(paramDefs);
+  const hasDirection = paramNames.includes('direction');
+  const hasDistance = paramNames.includes('distance');
+  const selector = locators.primary || locators.fallback_1 || 'body';
+  
+  return `'use strict';
+/**
+ * Skill: ${name}
+ * Interaction: scroll
+ */
+const browserAct = require('./browser.act.cjs');
+
+module.exports = {
+  name: '${name}',
+  description: 'Scroll container or page',
+  parameters: ${JSON.stringify(paramDefs, null, 2)},
+  defaults: { direction: 'down', distance: 500 },
+  
+  async run({ ${paramNames.join(', ')} }) {
+    const dir = direction || 'down';
+    const dist = distance || 500;
+    const dy = dir === 'down' ? dist : dir === 'up' ? -dist : 0;
+    const dx = dir === 'right' ? dist : dir === 'left' ? -dist : 0;
+    
+    const res = await browserAct({
+      action: 'scroll',
+      selector: '${selector}',
+      dx: dx,
+      dy: dy,
+      timeoutMs: 15000,
+    });
+    
+    if (!res.ok) {
+      throw new Error(\`Failed to scroll: \${res.error || 'Unknown error'}\`);
+    }
+    
+    return { success: true, scrolled: { direction: dir, distance: dist } };
+  }
+};`;
+}
+
+function _generateDblclickSkill(name, locators) {
+  const selector = locators.primary || locators.fallback_1 || '[data-testid="item"]';
+  
+  return `'use strict';
+/**
+ * Skill: ${name}
+ * Interaction: double-click
+ */
+const browserAct = require('./browser.act.cjs');
+
+module.exports = {
+  name: '${name}',
+  description: 'Double-click element (for file managers, grids)',
+  parameters: {},
+  
+  async run() {
+    const res = await browserAct({
+      action: 'dblclick',
+      selector: '${selector}',
+      timeoutMs: 15000,
+    });
+    
+    if (!res.ok) {
+      throw new Error(\`Failed to double-click: \${res.error || 'Unknown error'}\`);
+    }
+    
+    return { success: true };
+  }
+};`;
+}
+
+function _generateHoverSkill(name, locators) {
+  const selector = locators.primary || locators.fallback_1 || '[data-testid="hover-trigger"]';
+  
+  return `'use strict';
+/**
+ * Skill: ${name}
+ * Interaction: hover
+ */
+const browserAct = require('./browser.act.cjs');
+
+module.exports = {
+  name: '${name}',
+  description: 'Hover over element to reveal dropdown/menu',
+  parameters: {},
+  
+  async run() {
+    const res = await browserAct({
+      action: 'hover',
+      selector: '${selector}',
+      timeoutMs: 15000,
+    });
+    
+    if (!res.ok) {
+      throw new Error(\`Failed to hover: \${res.error || 'Unknown error'}\`);
+    }
+    
+    return { success: true, revealed: 'dropdown' };
+  }
+};`;
+}
+
+// ---------------------------------------------------------------------------
+// Export all functions
+// ---------------------------------------------------------------------------
 module.exports = {
   exploreAgent,
   scanDomain,
@@ -1756,4 +3731,7 @@ module.exports = {
   cancelMaintenanceScan,
   getScanStatus,
   enqueueScan: _enqueueScan,
+  generateSkillFromAction,
+  // Export schemas for external reference
+  INTERACTION_SCHEMAS,
 };
