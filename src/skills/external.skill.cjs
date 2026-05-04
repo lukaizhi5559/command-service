@@ -60,6 +60,7 @@ async function fetchSkillRecordFromUserSkillsDir(name) {
   try {
     const candidates = [
       name,                          // gmail.daily   (dot-notation)
+      name.replace(/\./g, '_'),      // gmail_daily   (underscore — canonical dir name)
       name.replace(/\./g, '-'),      // gmail-daily   (kebab fallback)
     ];
     for (const candidate of candidates) {
@@ -177,11 +178,19 @@ async function runNodeSkill(execPath, args, timeoutMs, context) {
     try {
       delete require.cache[require.resolve(execPath)];
       const skillModule = require(execPath);
-      const skillFn = typeof skillModule === 'function' ? skillModule : skillModule.default;
+      // Support three export styles:
+      // 1. module.exports = function(args, ctx) {}          — legacy function style
+      // 2. module.exports = { run(args, ctx) {} }           — object style (domain skills from explore.agent)
+      // 3. module.exports = { default: function(args) {} }  — ES module compat
+      const skillFn = typeof skillModule === 'function'
+        ? skillModule
+        : (typeof skillModule?.run === 'function'
+          ? (args, ctx) => skillModule.run(args, ctx)
+          : skillModule?.default);
 
       if (typeof skillFn !== 'function') {
         clearTimeout(timer);
-        reject(new Error(`Skill module at "${execPath}" must export a function`));
+        reject(new Error(`Skill module at "${execPath}" must export a function or an object with a run() method`));
         return;
       }
 
@@ -453,8 +462,14 @@ async function _findFreePort(preferredPort) {
 }
 
 async function run(args) {
-  const { name, args: skillArgs, timeoutMs: rawTimeout, secretKeys } = args || {};
+  const { name, args: skillArgs, timeoutMs: rawTimeout, secretKeys, ...flatRest } = args || {};
   const timeoutMs = Math.min(rawTimeout || DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS);
+  // Defense-in-depth: LLMs sometimes emit skill params flat alongside "name" instead of
+  // nesting them under "args". Merge any unknown top-level keys into skillArgs so the
+  // skill receives them regardless of the LLM's output format.
+  let mergedSkillArgs = (skillArgs != null || Object.keys(flatRest).length > 0)
+    ? { ...(flatRest || {}), ...(skillArgs || {}) }
+    : undefined;
 
   if (!name) {
     return { ok: false, error: 'external.skill requires args.name (the skill name to execute)' };
@@ -483,6 +498,29 @@ async function run(args) {
 
   logger.info(`[external.skill] Found skill "${name}" via ${skillSource}`);
 
+  // Inject sessionId from skill's sourceDomain when caller didn't supply one.
+  // Skills created for a specific agent (e.g. perplexity_*) must run in that
+  // agent's persistent browser session — not the default unauthenticated tab.
+  // Fallback: derive from skill name prefix (e.g. "perplexity_ai_navigate_history" → "perplexity_agent")
+  // for manually-created skills that were not registered with sourceDomain.
+  if (!mergedSkillArgs?.sessionId) {
+    let _derivedSessionId = null;
+    if (skillRecord?.sourceDomain) {
+      _derivedSessionId = skillRecord.sourceDomain.replace(/[\.\-]/g, '_') + '_agent';
+    } else if (name && /^[a-z][a-z0-9]+_/.test(name)) {
+      // Extract first word of underscore-delimited skill name as domain hint
+      // e.g. "perplexity_ai_navigate_history" → "perplexity", "gmail_send" → "gmail"
+      const _prefix = name.split('_')[0];
+      // Only inject if the prefix maps to a known agent file pattern
+      const _agentId = _prefix + '_agent';
+      _derivedSessionId = _agentId;
+    }
+    if (_derivedSessionId) {
+      mergedSkillArgs = { ...(mergedSkillArgs || {}), sessionId: _derivedSessionId };
+      logger.info(`[external.skill] Injected sessionId="${_derivedSessionId}" for skill "${name}"`);
+    }
+  }
+
   if (!skillRecord.enabled) {
     return { ok: false, skillName: name, error: `Skill "${name}" is currently disabled.` };
   }
@@ -494,10 +532,51 @@ async function run(args) {
   try {
     resolvedPath = validateExecPath(execPath);
   } catch (err) {
-    return { ok: false, skillName: name, execType, error: err.message };
+    // exec_path from user-memory might be stale (dot-notation dir).
+    // Try underscore-normalized directory before failing.
+    const _dotDir = path.basename(path.dirname(execPath.replace(/^~/, os.homedir())));
+    const _underDir = _dotDir.replace(/\./g, '_');
+    if (_underDir !== _dotDir) {
+      const altPath = path.join(SKILLS_BASE_DIR, _underDir, path.basename(execPath));
+      try {
+        resolvedPath = validateExecPath(altPath);
+        logger.info(`[external.skill] Resolved stale exec_path via underscore fallback: ${altPath}`);
+      } catch (_) {
+        return { ok: false, skillName: name, execType, error: err.message };
+      }
+    } else {
+      return { ok: false, skillName: name, execType, error: err.message };
+    }
   }
 
   logger.info(`[external.skill] Running ${execType} skill at: ${resolvedPath}`);
+
+  // ── Staleness check for navigate_history skills ───────────────────────────
+  // navigate_history skills bake a static history index at scan time. If the
+  // index is older than HISTORY_SKILL_TTL_DAYS, emit a non-blocking warning so
+  // the user knows results may not include recent searches. Execution continues
+  // regardless — the post-run rescan in browser.agent will refresh it afterward.
+  const HISTORY_SKILL_TTL_DAYS = 7;
+  const _isHistorySkill = name.endsWith('_navigate_history') || (skillRecord?.sourceAction === 'navigate_history');
+  if (_isHistorySkill) {
+    try {
+      const _skillDir = path.dirname(resolvedPath);
+      const _skillJsonPath = path.join(_skillDir, 'skill.json');
+      if (fs.existsSync(_skillJsonPath)) {
+        const _skillMeta = JSON.parse(fs.readFileSync(_skillJsonPath, 'utf8'));
+        const _scannedAt = _skillMeta.scanned_at || _skillMeta.created_at;
+        if (_scannedAt) {
+          const _ageMs = Date.now() - new Date(_scannedAt).getTime();
+          const _ageDays = Math.floor(_ageMs / (1000 * 60 * 60 * 24));
+          if (_ageDays >= HISTORY_SKILL_TTL_DAYS) {
+            logger.warn(`[external.skill] "${name}" history index is ${_ageDays} day(s) old — results may not include recent searches. A background rescan will refresh it after this run.`);
+          }
+        }
+      }
+    } catch (_ttlErr) {
+      // Non-fatal — proceed with execution
+    }
+  }
 
   // Derive secretKeys from contractMd when not supplied by caller (e.g. cron run-now path)
   let resolvedSecretKeys = secretKeys || [];
@@ -562,10 +641,10 @@ async function run(args) {
     const basename = require('path').basename(resolvedPath);
     if (basename === 'api.json') {
       const skillApiRunner = require('../skill-helpers/skill-api-runner.cjs');
-      result = await skillApiRunner.run(name, skillArgs, { contractMd: skillRecord.contractMd, timeoutMs, context });
+      result = await skillApiRunner.run(name, mergedSkillArgs, { contractMd: skillRecord.contractMd, timeoutMs, context });
     } else if (basename === 'cli.json') {
       const skillCliRunner = require('../skill-helpers/skill-cli-runner.cjs');
-      result = await skillCliRunner.run(name, skillArgs, { contractMd: skillRecord.contractMd, timeoutMs, context });
+      result = await skillCliRunner.run(name, mergedSkillArgs, { contractMd: skillRecord.contractMd, timeoutMs, context });
     } else if (resolvedPath.endsWith('.md')) {
       // Contract-based skills: exec_path points to skill.md (not index.cjs).
       // These skills define their execution as shell.run/curl steps in ## Plan / ## Commands.
@@ -581,11 +660,11 @@ async function run(args) {
         error: `Skill "${name}" is contract-based (skill.md). It defines shell.run/curl steps in its plan section. planSkills should read the contractMd and generate execution steps — not invoke external.skill directly.`
       };
     } else if (execType === 'project') {
-      result = await runProjectSkill(resolvedPath, skillArgs, timeoutMs, name);
+      result = await runProjectSkill(resolvedPath, mergedSkillArgs, timeoutMs, name);
     } else if (execType === 'node') {
-      result = await runNodeSkill(resolvedPath, skillArgs, timeoutMs, context);
+      result = await runNodeSkill(resolvedPath, mergedSkillArgs, timeoutMs, context);
     } else if (execType === 'shell') {
-      result = await runShellSkill(resolvedPath, skillArgs, timeoutMs);
+      result = await runShellSkill(resolvedPath, mergedSkillArgs, timeoutMs);
     } else {
       return { ok: false, skillName: name, error: `Unknown exec_type "${execType}". Must be "node", "shell", or "project".` };
     }

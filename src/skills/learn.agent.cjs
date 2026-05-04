@@ -675,6 +675,12 @@ function actionCancelLearn(args) {
   session.cancelRequested = true;
   _postLearnProgress(agentId, { type: 'learn:cancelling' });
 
+  // Signal the active scanDomain call to exit at its next cancel checkpoint.
+  try {
+    const exploreAgent = require('./explore.agent.cjs');
+    exploreAgent.cancelActiveScan();
+  } catch (_) {}
+
   // Navigate the browser session to about:blank to interrupt the waitForAuth poll loop.
   // Without this, waitForAuth blocks for up to 120s before the cancelRequested flag is checked.
   try {

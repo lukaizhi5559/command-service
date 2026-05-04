@@ -94,9 +94,16 @@ function validateSkillContract(contractMd, execPath) {
     errors.push(`exec_path is a JS file but exec_type is '${execType}' — should be exec_type: node`);
   }
 
-  // exec_path file existence check
+  // exec_path file existence check — try underscore-normalized dir for stale dot-notation paths
   if (resolvedPath && !fs.existsSync(resolvedPath)) {
-    errors.push(`exec_path file does not exist on disk: ${resolvedPath}`);
+    const _dir = path.basename(path.dirname(resolvedPath));
+    const _uDir = _dir.replace(/\./g, '_');
+    const _alt = (_uDir !== _dir)
+      ? path.join(path.dirname(path.dirname(resolvedPath)), _uDir, path.basename(resolvedPath))
+      : null;
+    if (!_alt || !fs.existsSync(_alt)) {
+      errors.push(`exec_path file does not exist on disk: ${resolvedPath}`);
+    }
   }
 
   return { ok: errors.length === 0, errors };
@@ -146,7 +153,7 @@ async function scanAll(logger) {
     return { ok: true, summary: 'No installed skills to scan', scanned: 0, healthy: 0, invalid: 0 };
   }
 
-  let healthy = 0, invalid = 0, missing = 0;
+  let healthy = 0, invalid = 0, missing = 0, purged = 0;
   const invalidSkills = [];
 
   for (const sk of skills) {
@@ -186,19 +193,43 @@ async function scanAll(logger) {
     } else {
       invalid++;
       invalidSkills.push({ name: sk.name, errors });
-      await mcpPost('skill.health.upsert', {
-        skillName: sk.name,
-        status: 'invalid',
-        errors: errors.join('; '),
-        autoRepaired: false,
-      });
-      if (logger) logger.warn(`[skill.review] Invalid skill: ${sk.name}`, { errors });
+
+      // ── Auto-purge ghost skills whose exec_path file no longer exists ─────
+      // These records cannot be repaired (the file is gone) and will cause the
+      // planner to attempt skill execution that always fails. Purge them from
+      // DuckDB now so they no longer pollute planSkills context.
+      const _hasMissingFile = errors.some(e => e.includes('exec_path file does not exist'));
+      const _hasEmptyContract = errors.some(e => e.includes('contract_md is empty'));
+      if (_hasMissingFile || _hasEmptyContract) {
+        const purgeRes = await mcpPost('skill.remove', { name: sk.name });
+        if (purgeRes && purgeRes.status === 'ok') {
+          purged++;
+          if (logger) logger.info(`[skill.review] Auto-purged ghost skill: ${sk.name} (reason: ${errors[0]})`);
+        } else {
+          // Could not purge — still mark health so it shows as invalid in UI
+          await mcpPost('skill.health.upsert', {
+            skillName: sk.name,
+            status: 'invalid',
+            errors: errors.join('; '),
+            autoRepaired: false,
+          });
+          if (logger) logger.warn(`[skill.review] Invalid skill (purge failed): ${sk.name}`, { errors });
+        }
+      } else {
+        await mcpPost('skill.health.upsert', {
+          skillName: sk.name,
+          status: 'invalid',
+          errors: errors.join('; '),
+          autoRepaired: false,
+        });
+        if (logger) logger.warn(`[skill.review] Invalid skill: ${sk.name}`, { errors });
+      }
     }
   }
 
-  const summary = `Scanned ${skills.length} skill(s): ${healthy} healthy, ${invalid} invalid, ${missing} missing contract`;
+  const summary = `Scanned ${skills.length} skill(s): ${healthy} healthy, ${invalid} invalid, ${missing} missing contract, ${purged} purged`;
   if (logger) logger.info(`[skill.review] scan_all complete — ${summary}`);
-  return { ok: true, summary, scanned: skills.length, healthy, invalid, missing, invalidSkills };
+  return { ok: true, summary, scanned: skills.length, healthy, invalid, missing, purged, invalidSkills };
 }
 
 async function validateOne(skillName, logger) {

@@ -2353,6 +2353,48 @@ async function browserAct(args) {
     case 'keydown': return run(['keydown', key || ''], `keydown ${key}`);
     case 'keyup':   return run(['keyup',   key || ''], `keyup ${key}`);
 
+    // ── Drag ─────────────────────────────────────────────────────────────────
+    // Drags the source element (selector/ref) to the targetSelector element.
+    // Uses playwright-cli drag-and-drop command when available, falls back to
+    // a mouse-based drag sequence via evaluate.
+    case 'drag': {
+      const targetSel = args.targetSelector || args.target;
+      if (!targetSel) {
+        return { ok: false, action, sessionId, error: 'drag requires targetSelector', executionTime: Date.now() - start };
+      }
+      const sourceSel = resolvedSelector || ref;
+      if (!sourceSel) {
+        return { ok: false, action, sessionId, error: 'drag requires a source selector or ref', executionTime: Date.now() - start };
+      }
+      logger.info(`[browser.act] drag from="${sourceSel}" to="${targetSel}"`);
+      // Try playwright-cli drag-and-drop (available in recent playwright-cli versions)
+      const dragRes = await cliRun([...S, 'drag-and-drop', sourceSel, targetSel], timeoutMs);
+      if (dragRes.ok) return { ok: true, action, sessionId, executionTime: Date.now() - start };
+      // Fallback: mouse-based drag via evaluate
+      const fallbackRes = await cliRun([
+        ...S, 'evaluate',
+        `async () => {
+          const src = document.querySelector(${JSON.stringify(sourceSel)});
+          const tgt = document.querySelector(${JSON.stringify(targetSel)});
+          if (!src || !tgt) throw new Error('drag: element not found');
+          const srcR = src.getBoundingClientRect();
+          const tgtR = tgt.getBoundingClientRect();
+          src.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, clientX: srcR.x + srcR.width/2, clientY: srcR.y + srcR.height/2 }));
+          src.dispatchEvent(new MouseEvent('dragstart', { bubbles: true }));
+          tgt.dispatchEvent(new MouseEvent('dragover', { bubbles: true, clientX: tgtR.x + tgtR.width/2, clientY: tgtR.y + tgtR.height/2 }));
+          tgt.dispatchEvent(new MouseEvent('drop', { bubbles: true }));
+          src.dispatchEvent(new MouseEvent('dragend', { bubbles: true }));
+        }`
+      ], timeoutMs);
+      return {
+        ok: fallbackRes.ok,
+        action,
+        sessionId,
+        error: fallbackRes.ok ? undefined : (fallbackRes.stderr || 'drag failed'),
+        executionTime: Date.now() - start,
+      };
+    }
+
     // ── Scroll ───────────────────────────────────────────────────────────────
     // Accepts: direction ('up'|'down'|'left'|'right'), distance ('100%'|number px),
     // dx/dy raw pixels (legacy). Maps to playwright-cli mousewheel <dx> <dy>.

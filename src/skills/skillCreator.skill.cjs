@@ -722,9 +722,10 @@ async function actionGenerateSkill({ projectId, projectDir: projDir } = {}) {
     const isNodeSkill = hasNodeExport && !hasContractBody;
 
     const skillType = isNodeSkill ? 'node' : 'shell';
+    const dirName   = dotName.replace(/\./g, '_');
     const execPath  = isNodeSkill
-      ? '~/.thinkdrop/skills/' + dotName + '/index.cjs'
-      : '~/.thinkdrop/skills/' + dotName + '/skill.md';
+      ? '~/.thinkdrop/skills/' + dirName + '/index.cjs'
+      : '~/.thinkdrop/skills/' + dirName + '/skill.md';
 
     let normalized = code
       .replace(/^(exec_type:\s*)\S+/m, '$1' + skillType)
@@ -878,9 +879,10 @@ async function actionGenerateSkill({ projectId, projectDir: projDir } = {}) {
     logger.warn('[skillCreator] skill.reviewer not available (non-fatal)', { error: e.message });
   }
 
-  // Write the skill file directly to ~/.thinkdrop/skills/<dotName>/index.cjs
-  // This is the canonical location — do NOT write to command-service/src/skills/
-  const skillDir   = path.join(USER_SKILLS_DIR, dotName);
+  // Write the skill file directly to ~/.thinkdrop/skills/<dirName>/index.cjs
+  // Directory names use underscores; dot-notation is for skill names/references only.
+  const dirName    = dotName.replace(/\./g, '_');
+  const skillDir   = path.join(USER_SKILLS_DIR, dirName);
   const skillPath  = path.join(skillDir, 'index.cjs');
   try {
     fs.mkdirSync(skillDir, { recursive: true });
@@ -971,7 +973,8 @@ async function actionRepairOAuth(args) {
   const { skillName } = args;
   if (!skillName) return { ok: false, error: 'skillName is required' };
   const dotName  = String(skillName).replace(/-/g, '.');
-  const skillDir = path.join(USER_SKILLS_DIR, dotName);
+  const dirName  = dotName.replace(/\./g, '_');
+  const skillDir = path.join(USER_SKILLS_DIR, dirName);
   const codePath = path.join(skillDir, 'index.cjs');
 
   let skillCode;

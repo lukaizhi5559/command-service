@@ -123,10 +123,26 @@ async function classifyTaskIntent(task) {
     return _intentCache.get(_cacheKey);
   }
 
+  // Intra-app short-circuit
+  if (_scopedFull.includes('openai') || _scopedFull.includes('chatgpt')) {
+    return INTENTS.CHAT;
+  }
+
   // ── Primary: LLM classification ───────────────────────────────────────────
   if (_skillLlm && _scopedShort.trim().length > 3) {
     try {
-      const _llmPrompt = `Classify this task into exactly one of these categories: chat / research / docs / console / settings / mail / home.\nReply with ONE word only — the category name.\n\nTask: ${_scopedShort}`;
+      const _llmPrompt = `Classify this browser task into exactly one of these categories:
+- chat     : converse with or send a message to an AI assistant
+- research : look up, search, investigate or summarize a topic
+- docs     : read documentation, guides, tutorials, reference material
+- console  : ONLY for: API key generation, developer dashboard, bearer/secret tokens, platform console
+- settings : account settings, billing, profile, subscription management
+- mail     : send, compose, forward or reply to an email
+- home     : any other navigation, visiting a site, opening a page, history, clicking elements
+
+Reply with ONE word only — the category name.
+
+Task: ${_scopedShort}`;
       const _llmRaw = await _skillLlm.ask(_llmPrompt, { temperature: 0.0, responseTimeoutMs: 8000 });
       const _llmIntent = (_llmRaw || '').trim().toLowerCase().replace(/[^a-z]/g, '');
       if (VALID_INTENTS.has(_llmIntent)) {
@@ -343,6 +359,20 @@ function parseResumeContext(task) {
 async function resolveDestination(serviceKey, task, plannedUrl, agentId) {
   const _id = agentId || serviceKey;
 
+  // ── Short-circuit: home-type agents never need destination correction ────
+  // The resolver's sole purpose is to detect when an agent's start_url is a
+  // developer/API console but the task intent is chat/research — and redirect
+  // to the correct consumer interface. For any agent whose start_url is a plain
+  // home page (perplexity.ai, claude.ai, chatgpt.com, etc.) there is nothing to
+  // correct: the landing page is always the right destination regardless of the
+  // task phrasing. Skipping here eliminates all false-positive ASK_USER dialogs
+  // caused by the intent classifier misreading task text (e.g. "account" → settings).
+  const _plannedUrlType = classifyUrlType(plannedUrl);
+  if (_plannedUrlType !== INTENTS.CONSOLE && _plannedUrlType !== INTENTS.SETTINGS) {
+    logger.debug(`[destination-resolver] Short-circuit: home-type start_url for "${_id}" — skip destination check`);
+    return { action: 'ok', intent: INTENTS.HOME, reason: 'Home-type agent — destination check not applicable' };
+  }
+
   // ── Short-circuit: known mail service navigating to its mail host ─────────
   // Gmail/Outlook send tasks always land on their mail host — skip all mismatch
   // logic entirely to prevent false-positive ask_user dialogs.
@@ -376,6 +406,19 @@ async function resolveDestination(serviceKey, task, plannedUrl, agentId) {
     // No clear direction from resume context — skip destination check to avoid loop
     logger.debug(`[destination-resolver] Resume context present but no clear direction — skipping check`);
     return { action: 'ok', intent: INTENTS.HOME, reason: 'Resume context present' };
+  }
+
+  // ── Short-circuit: intra-app / in-session navigation tasks ─────────────────
+  // Tasks that navigate *within* an already-open page (history, clicking elements,
+  // scrolling, going back) do not need destination validation — the start_url is
+  // irrelevant because the session is already established.  Letting the resolver
+  // run on these tasks causes false-positive ask_user dialogs (e.g. classifying
+  // "navigate to history section" as console intent).
+  const _taskForCheck = _scopeTaskText(task, 280).toLowerCase();
+  const _isIntraApp = /\b(history|go[\s_-]?back|previous[\s_-]?searches?|navigate[\s_-]?to[\s_-]?section|within|inside|scroll[\s_-]?to|click[\s_-]?on|open[\s_-]?the[\s_-]?(menu|sidebar|panel|tab|section|dropdown))\b/i.test(_taskForCheck);
+  if (_isIntraApp) {
+    logger.debug(`[destination-resolver] Short-circuit: intra-app navigation task — skipping destination check`);
+    return { action: 'ok', intent: INTENTS.HOME, reason: 'Intra-app navigation — skipping destination check' };
   }
 
   // ── Classify intent and check planned URL ─────────────────────────────────

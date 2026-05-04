@@ -39,6 +39,10 @@ const SCREEN_SERVICE_PORT   = parseInt(process.env.SCREEN_INTEL_PORT || '3008', 
 const DOMAIN_MAPS_DIR       = path.join(os.homedir(), '.thinkdrop', 'domain-maps');
 const AGENTS_DIR            = path.join(os.homedir(), '.thinkdrop', 'agents');
 
+// Absolute path to browser.act.cjs — baked into generated skill code so skills
+// can require() it regardless of where they are stored on disk (e.g. ~/.thinkdrop/skills/).
+const BROWSER_ACT_PATH      = path.join(__dirname, 'browser.act.cjs');
+
 const MAP_STALE_MS          = 7 * 24 * 60 * 60 * 1000;  // 7 days
 const MAP_LAZY_RESCAN_MS    = 24 * 60 * 60 * 1000;       // 24 hours (post-automation gate)
 const OVERLAY_PORT          = parseInt(process.env.OVERLAY_CONTROL_PORT || '3010', 10);
@@ -323,6 +327,33 @@ function _browserAct(args, timeoutMs = 30000) {
 }
 
 // ---------------------------------------------------------------------------
+// _highlightElement — inject a visual pulse highlight into the headed browser
+// during scan/learn so non-technical users can see what the agent is studying.
+// Only fires when headed === true; silently no-ops otherwise.
+// ---------------------------------------------------------------------------
+async function _highlightElement(ref, label, sessionId, headed) {
+  if (!headed || !ref) return;
+  try {
+    // Self-contained script — injects border + label chip, auto-removes in 1.5s
+    const safeLabel = (label || '').replace(/"/g, '\\"').slice(0, 60);
+    const script = `(function(){try{
+      if(!document.getElementById('__td_kf')){var s=document.createElement('style');s.id='__td_kf';
+      s.textContent='@keyframes __tdP{0%{opacity:0;transform:scale(0.98)}25%{opacity:1;transform:scale(1)}85%{opacity:1}100%{opacity:0}}';document.head.appendChild(s);}
+      var r=el.getBoundingClientRect();if(!r||r.width===0)return;
+      var d=document.createElement('div');
+      d.setAttribute('data-thinkdrop','1');
+      d.style.cssText='position:fixed;z-index:2147483647;pointer-events:none;border:2px solid #f97316;border-radius:5px;box-shadow:0 0 0 4px rgba(249,115,22,0.18);left:'+(r.left-3)+'px;top:'+(r.top-3)+'px;width:'+(r.width+6)+'px;height:'+(r.height+6)+'px;animation:__tdP 1.5s ease forwards';
+      var chip=document.createElement('div');
+      chip.textContent='\\u26a1 Studying: "${safeLabel}"';
+      chip.style.cssText='position:absolute;top:-26px;left:0;background:#f97316;color:#fff;font:600 11px/1 system-ui,sans-serif;padding:3px 8px;border-radius:4px;white-space:nowrap;box-shadow:0 2px 6px rgba(0,0,0,0.25)';
+      d.appendChild(chip);document.body.appendChild(d);
+      setTimeout(function(){if(d.parentNode)d.parentNode.removeChild(d);},1500);
+    }catch(e){}})()`;
+    await _browserAct({ action: 'evaluate', text: script, ref, sessionId, headed }, 4000).catch(() => {});
+  } catch (_) {}
+}
+
+// ---------------------------------------------------------------------------
 // JSON parser — tolerates markdown code fences
 // ---------------------------------------------------------------------------
 function _parseJson(raw) {
@@ -395,12 +426,14 @@ async function _registerSkill(skillData) {
     fs.writeFileSync(path.join(skillDir, 'index.cjs'), skillCode, 'utf8');
     
     // Write skill metadata
+    const _now = new Date().toISOString();
     fs.writeFileSync(
       path.join(skillDir, 'skill.json'),
       JSON.stringify({
         name: skillName,
         description: skillData.description,
-        created_at: skillData._meta?.created_at || new Date().toISOString(),
+        created_at: skillData._meta?.created_at || _now,
+        scanned_at: skillData._meta?.scanned_at || _now,
         ...skillData._meta
       }, null, 2),
       'utf8'
@@ -442,18 +475,32 @@ async function _registerSkill(skillData) {
       });
       // Send correct MCP payload that skill-db /skill.upsert expects
       // Must include version, service, action, and payload fields
-      const skillDir = path.join(SKILLS_DIR, skillName);
+      // NOTE: skill files are written with dots replaced by underscores — match that here
+      const skillDirName = skillName.replace(/\./g, '_');
+      const registeredSkillDir = path.join(SKILLS_DIR, skillDirName);
+      const execPath = path.join(registeredSkillDir, 'index.cjs');
+      const skillDescription = skillData.description || `Skill for ${skillData.skill_name || skillData.name}`;
+      const contractMd = [
+        '---',
+        `name: ${skillName}`,
+        `description: ${skillDescription}`,
+        `exec_path: ${execPath}`,
+        `exec_type: node`,
+        '---',
+      ].join('\n');
       const dbPayload = {
         version: 'mcp.v1',
         service: 'user-memory',
         action: 'skill.upsert',
         payload: {
           name: skillName,
-          description: skillData.description || `Skill for ${skillData.skill_name || skillData.name}`,
-          execPath: path.join(skillDir, 'index.cjs'),
+          description: skillDescription,
+          execPath,
           execType: 'node',
           enabled: true,
-          contractMd: ''
+          contractMd,
+          sourceDomain: skillData._meta?.source_domain || null,
+          sourceAction: skillData._meta?.source_action || null,
         },
         requestId: `explore_${Date.now()}`
       };
@@ -473,25 +520,38 @@ async function _registerSkill(skillData) {
 // Generate minimal skill code from action data
 function _generateSkillCode(skillData) {
   const { skill_name, interaction, locators, description, parameters } = skillData;
-  return `// Auto-generated skill: ${skill_name}
+  const sourceDomain = skillData._meta?.source_domain || 'unknown';
+  // Derive the default agentId session from the source domain hostname
+  // e.g. 'perplexity.ai' → 'perplexity_agent'
+  const defaultSessionId = sourceDomain !== 'unknown'
+    ? sourceDomain.replace(/\..*$/, '').replace(/[^a-z0-9]/gi, '_') + '_agent'
+    : null;
+  return `'use strict';
+// Auto-generated skill: ${skill_name}
 // Generated at: ${new Date().toISOString()}
-// Source domain: ${skillData._meta?.source_domain || 'unknown'}
+// Source domain: ${sourceDomain}
+const { browserAct } = require('${BROWSER_ACT_PATH}');
 
-const { _browserAct } = require('../explore.agent.cjs');
+module.exports = {
+  name: '${skill_name}',
+  description: '${(description || ('Interact with ' + sourceDomain)).replace(/'/g, "\\'")}',
+  parameters: {},
 
-async function run(args = {}) {
-  const { sessionId, headed } = args;
-  const result = await _browserAct({
-    action: '${interaction}',
-    ref: '${locators?.primary || ''}',
-    sessionId,
-    headed,
-    timeoutMs: 10000
-  });
-  return { ok: result?.ok, result: result?.result };
-}
-
-module.exports = { run };
+  async run(args = {}) {
+    const sessionId = args.sessionId || ${defaultSessionId ? `'${defaultSessionId}'` : 'undefined'};
+    const headed = args.headed !== undefined ? args.headed : false;
+    const result = await browserAct({
+      action: '${interaction}',
+      ref: '${locators?.primary || ''}',
+      selector: '${locators?.primary || ''}',
+      sessionId,
+      headed,
+      timeoutMs: 15000
+    });
+    if (!result?.ok) throw new Error('Skill ${skill_name} failed: ' + (result?.error || 'Unknown error'));
+    return { success: true, result: result?.result };
+  }
+};
 `;
 }
 
@@ -1897,6 +1957,9 @@ async function scanDomain(args) {
     statesScanned: 0
   };
 
+  // Reset scan cancel flag at entry so previous cancellations don't affect this run
+  _scanCancelFlag = false;
+
   logger.info(`[explore.agent] scanDomain config: session=${scanSessionId} headed=${headed} trigger=${_trigger}`);
 
   logger.info(`[explore.agent] scanDomain start: ${hostname} (trigger=${_trigger} maxScanDepth=${maxScanDepth})`);
@@ -1964,6 +2027,13 @@ async function scanDomain(args) {
     // _scanTabIdx declared above at function start (TDZ fix)
 
     while (scanQueue.length > 0) {
+      // Cancel checkpoint — after each page in the scan queue
+      if (_scanCancelFlag) {
+        logger.info(`[explore.agent] scanDomain cancelled by user at page queue (${visitedUrls.size} pages visited)`);
+        _postProgress(_progressCallbackUrl, { type: 'explore:scan_cancelled', hostname, message: 'Scan cancelled by user' });
+        return { ok: false, hostname, reason: 'cancelled' };
+      }
+
       const { url: pageUrl, depth } = scanQueue.shift();
 
       if (useTabStrategy) {
@@ -2333,6 +2403,13 @@ async function scanDomain(args) {
       let processedCount = 0;
       
       for (const item of allScanItems.slice(0, 30)) {
+        // Cancel checkpoint — during element extraction loop (every 5 elements)
+        if (processedCount > 0 && processedCount % 5 === 0 && _scanCancelFlag) {
+          logger.info(`[explore.agent] scanDomain cancelled by user during element extraction (${processedCount}/${totalElements})`);
+          _postProgress(_progressCallbackUrl, { type: 'explore:scan_cancelled', hostname, message: 'Scan cancelled by user' });
+          return { ok: false, hostname, reason: 'cancelled' };
+        }
+
         processedCount++;
         scanStats.totalElements++;
         const progressPct = Math.round((processedCount / totalElements) * 100);
@@ -2450,7 +2527,11 @@ async function scanDomain(args) {
           interaction,
           ref: item.ref
         });
-        
+
+        // Visual highlight — pulses the element in the headed browser so the user
+        // can see what the agent is studying in real time. No-op when headless.
+        await _highlightElement(item.ref, item.label, scanSessionId, headed);
+
         // Skip unknown interactions
         if (interaction === 'unknown') {
           logger.info(`[explore.agent] scan: unknown interaction type for ref=${item.ref} — skipping`);
@@ -2631,6 +2712,17 @@ async function scanDomain(args) {
       phase: 'generating'
     });
 
+    // Cancel checkpoint — before skill generation phase
+    if (_scanCancelFlag) {
+      logger.info(`[explore.agent] scanDomain cancelled by user before skill generation`);
+      _postProgress(_progressCallbackUrl, { type: 'explore:scan_cancelled', hostname, message: 'Scan cancelled by user' });
+      // Still save the partial domain map so discovered states aren't lost
+      const partialMerged = _mergeDomainMap(cleanedExisting, newMap);
+      partialMerged.last_scanned = new Date().toISOString();
+      _saveDomainMap(hostname, partialMerged);
+      return { ok: false, hostname, reason: 'cancelled' };
+    }
+
     // Generate skills from all discovered actions (skill cache)
     let skillsGenerated = 0;
     let actionCount = 0;
@@ -2690,12 +2782,15 @@ async function scanDomain(args) {
       try {
         const navigateSkill = generateNavigateHistorySkill(hostname, historyItems);
         if (navigateSkill && !navigateSkill.error) {
+          const _navHistoryTs = new Date().toISOString();
           const skillWithMeta = {
             ...navigateSkill,
             _meta: {
               source_domain: hostname,
               source_action: 'navigate_history',
-              created_at: new Date().toISOString(),
+              created_at: _navHistoryTs,
+              scanned_at: _navHistoryTs,
+              history_count: historyItems.length,
               goal_tied: true,
               use_count: 0,
               last_used: null
@@ -2781,6 +2876,7 @@ let _idleWatcherTimer  = null;
 let _scanSchedulerJob  = null;
 let _maintenanceRunning = false;
 let _maintenanceCancelRequested = false;
+let _scanCancelFlag = false;  // Module-level flag to cancel active scanDomain calls
 
 // ---------------------------------------------------------------------------
 // Scan state I/O
@@ -3010,8 +3106,13 @@ async function _runMaintenanceScan(opts = {}) {
         const tryEnqueue = () => {
           if (_activeScanCount < _MAX_CONCURRENT_SCANS && _scanQueueList.length === 0) {
             _enqueueScan({ url: agent.startUrl, agentId: agent.agentId }, 'maintenance');
-            // Wait for this agent's scan to finish
+            // Wait for this agent's scan to finish (also respects cancel flag)
             const waitDone = setInterval(() => {
+              if (_maintenanceCancelRequested) {
+                clearInterval(waitDone);
+                resolve();
+                return;
+              }
               if (!_scanQueueSet.has(new URL(agent.startUrl).hostname.replace(/^www\./, ''))) {
                 clearInterval(waitDone);
                 completed++;
@@ -3056,6 +3157,12 @@ async function _runMaintenanceScan(opts = {}) {
 
 function cancelMaintenanceScan() {
   _maintenanceCancelRequested = true;
+  _scanCancelFlag = true;  // Also cancel any active scanDomain call
+}
+
+// Cancel just the active scanDomain call (used by learn.agent cancel)
+function cancelActiveScan() {
+  _scanCancelFlag = true;
 }
 
 // ---------------------------------------------------------------------------
@@ -3199,7 +3306,10 @@ function generateSkillFromAction(hostname, stateKey, actionKey, customParams = {
   }
   
   const action = domainMap.states[stateKey].actions[actionKey];
-  const { skill_name, interaction, locators, accepts_params, param_mapping, examples } = action;
+  const { skill_name, interaction, locators, accepts_params, param_mapping, examples, follow_up_actions } = action;
+  
+  // Extract follow-up action (e.g. press Enter after fill for search inputs)
+  const followUp = (follow_up_actions || []).find(a => a.action === 'press') || null;
   
   // Build skill name
   const skillName = customParams.name || `${hostname.replace(/\./g, '_')}_${skill_name}`;
@@ -3232,7 +3342,7 @@ function generateSkillFromAction(hostname, stateKey, actionKey, customParams = {
   switch (interaction) {
     case 'fill':
     case 'type':
-      skillCode = _generateFillSkill(skillName, locators, paramDefs, interaction);
+      skillCode = _generateFillSkill(skillName, locators, paramDefs, interaction, followUp);
       break;
     case 'click':
       skillCode = _generateClickSkill(skillName, locators);
@@ -3255,6 +3365,9 @@ function generateSkillFromAction(hostname, stateKey, actionKey, customParams = {
       break;
     case 'hover':
       skillCode = _generateHoverSkill(skillName, locators);
+      break;
+    case 'drag':
+      skillCode = _generateDragSkill(skillName, locators);
       break;
     default:
       skillCode = _generateGenericSkill(skillName, locators, interaction, paramDefs);
@@ -3289,7 +3402,7 @@ function generateNavigateHistorySkill(hostname, historyItems) {
  * Skill: ${skillName}
  * Navigate to previous search/conversation by fuzzy matching query against history
  */
-const browserAct = require('./browser.act.cjs');
+const { browserAct } = require('${BROWSER_ACT_PATH}');
 
 // History index built at skill creation time
 const historyIndex = ${JSON.stringify(historyItems.map(h => ({ label: h.label, href: h.href, ref: h.ref })), null, 2)};
@@ -3395,79 +3508,107 @@ module.exports = {
 }
 
 // Skill code generators for each interaction type
-function _generateFillSkill(name, locators, paramDefs, interaction) {
+function _generateFillSkill(name, locators, paramDefs, interaction, followUp = null) {
   const paramNames = Object.keys(paramDefs);
   const mainParam = paramNames[0] || 'query';
-  const selector = locators.primary || locators.fallback_1 || '[data-testid="input"]';
+  const primary = locators.primary || '';
+  const fallback1 = locators.fallback_1 || '';
+  const fallback2 = locators.fallback_2 || '';
+  const fallbackDefault = interaction === 'type' ? '[contenteditable="true"]' : '[data-testid="input"]';
   
+  // Build follow-up action code (e.g. press Enter for search inputs)
+  const followUpCode = followUp && followUp.action === 'press' ? `
+    // Follow-up: press key after ${interaction}
+    await browserAct({ action: 'press', key: '${followUp.key}', sessionId, headed, timeoutMs: 5000 }).catch(() => {});` : '';
+
   return `'use strict';
 /**
  * Skill: ${name}
  * Interaction: ${interaction}
  */
-const browserAct = require('./browser.act.cjs');
+const { browserAct } = require('${BROWSER_ACT_PATH}');
 
 module.exports = {
   name: '${name}',
   description: '${interaction === 'type' ? 'Type text into contenteditable field' : 'Fill input field'}',
   parameters: ${JSON.stringify(paramDefs, null, 2)},
   
-  async run({ ${paramNames.join(', ')} }) {
-    const text = ${mainParam};
+  async run(args = {}) {
+    const { sessionId, headed } = args;
+    const text = args.${mainParam} || args[Object.keys(args).find(k => k !== 'sessionId' && k !== 'headed') || ''] || args.text;
     if (!text) throw new Error('Missing required parameter: ${mainParam}');
     
-    // ${interaction} the text into the field
-    const res = await browserAct({
-      action: '${interaction}',
-      selector: '${selector}',
-      text: text,
-      timeoutMs: 15000,
-    });
-    
-    if (!res.ok) {
-      throw new Error(\`Failed to ${interaction}: \${res.error || 'Unknown error'}\`);
+    const selectors = ['${primary}', '${fallback1}', '${fallback2}', '${fallbackDefault}'].filter(Boolean);
+    let res;
+    for (const sel of selectors) {
+      res = await browserAct({
+        action: '${interaction}',
+        selector: sel,
+        text: text,
+        sessionId,
+        headed,
+        timeoutMs: 15000,
+      });
+      if (res.ok) break;
     }
     
+    if (!res || !res.ok) {
+      throw new Error(\`Failed to ${interaction}: \${res?.error || 'Unknown error'}\`);
+    }
+    ${followUpCode}
     return { success: true, text };
   }
 };`;
 }
 
 function _generateClickSkill(name, locators) {
-  const selector = locators.primary || locators.fallback_1 || '[data-testid="button"]';
+  const primary = locators.primary || '';
+  const fallback1 = locators.fallback_1 || '';
+  const fallback2 = locators.fallback_2 || '';
   
   return `'use strict';
 /**
  * Skill: ${name}
  * Interaction: click
  */
-const browserAct = require('./browser.act.cjs');
+const { browserAct } = require('${BROWSER_ACT_PATH}');
 
 module.exports = {
   name: '${name}',
   description: 'Click element',
   parameters: {},
   
-  async run() {
-    const res = await browserAct({
-      action: 'click',
-      selector: '${selector}',
-      timeoutMs: 15000,
-    });
+  async run(args = {}) {
+    const { sessionId, headed } = args;
+    const selectors = ['${primary}', '${fallback1}', '${fallback2}'].filter(Boolean);
+    if (!selectors.length) selectors.push('[data-testid="button"]');
+    let res;
+    for (const sel of selectors) {
+      res = await browserAct({
+        action: 'click',
+        selector: sel,
+        sessionId,
+        headed,
+        timeoutMs: 15000,
+      });
+      if (res.ok) break;
+    }
     
-    if (!res.ok) {
-      throw new Error(\`Failed to click: \${res.error || 'Unknown error'}\`);
+    if (!res || !res.ok) {
+      throw new Error(\`Failed to click: \${res?.error || 'Unknown error'}\`);
     }
     
     return { success: true };
   }
-};`;
+}`;
 }
 
 function _generateSelectSkill(name, locators, paramDefs) {
   const paramNames = Object.keys(paramDefs);
   const mainParam = paramNames[0] || 'selection';
-  const selector = locators.primary || locators.fallback_1 || 'select';
+  const primary = locators.primary || '';
+  const fallback1 = locators.fallback_1 || '';
+  const fallback2 = locators.fallback_2 || '';
   const options = paramDefs[mainParam]?.options || [];
   
   return `'use strict';
@@ -3475,7 +3616,7 @@ function _generateSelectSkill(name, locators, paramDefs) {
  * Skill: ${name}
  * Interaction: select (dropdown)
  */
-const browserAct = require('./browser.act.cjs');
+const { browserAct } = require('${BROWSER_ACT_PATH}');
 
 module.exports = {
   name: '${name}',
@@ -3483,68 +3624,88 @@ module.exports = {
   parameters: ${JSON.stringify(paramDefs, null, 2)},
   options: ${JSON.stringify(options)},
   
-  async run({ ${paramNames.join(', ')} }) {
-    const value = ${mainParam};
+  async run(args = {}) {
+    const { sessionId, headed } = args;
+    const value = args.${mainParam} || args.value;
     if (!value) throw new Error('Missing required parameter: ${mainParam}');
     
-    const res = await browserAct({
-      action: 'select',
-      selector: '${selector}',
-      value: value,
-      timeoutMs: 15000,
-    });
+    const selectors = ['${primary}', '${fallback1}', '${fallback2}', 'select'].filter(Boolean);
+    let res;
+    for (const sel of selectors) {
+      res = await browserAct({
+        action: 'select',
+        selector: sel,
+        value: value,
+        sessionId,
+        headed,
+        timeoutMs: 15000,
+      });
+      if (res.ok) break;
+    }
     
-    if (!res.ok) {
-      throw new Error(\`Failed to select: \${res.error || 'Unknown error'}\`);
+    if (!res || !res.ok) {
+      throw new Error(\`Failed to select: \${res?.error || 'Unknown error'}\`);
     }
     
     return { success: true, selected: value };
   }
-};`;
+}`;
 }
 
 function _generateToggleSkill(name, locators, interaction) {
-  const selector = locators.primary || locators.fallback_1 || 'input[type="checkbox"]';
+  const primary = locators.primary || '';
+  const fallback1 = locators.fallback_1 || '';
+  const fallback2 = locators.fallback_2 || '';
   
   return `'use strict';
 /**
  * Skill: ${name}
  * Interaction: ${interaction}
  */
-const browserAct = require('./browser.act.cjs');
+const { browserAct } = require('${BROWSER_ACT_PATH}');
 
 module.exports = {
   name: '${name}',
   description: '${interaction === 'check' ? 'Check checkbox' : 'Uncheck checkbox'}',
   parameters: {},
   
-  async run() {
-    const res = await browserAct({
-      action: '${interaction}',
-      selector: '${selector}',
-      timeoutMs: 15000,
-    });
+  async run(args = {}) {
+    const { sessionId, headed } = args;
+    const selectors = ['${primary}', '${fallback1}', '${fallback2}', 'input[type="checkbox"]'].filter(Boolean);
+    let res;
+    for (const sel of selectors) {
+      res = await browserAct({
+        action: '${interaction}',
+        selector: sel,
+        sessionId,
+        headed,
+        timeoutMs: 15000,
+      });
+      if (res.ok) break;
+    }
     
-    if (!res.ok) {
-      throw new Error(\`Failed to ${interaction}: \${res.error || 'Unknown error'}\`);
+    if (!res || !res.ok) {
+      throw new Error(\`Failed to ${interaction}: \${res?.error || 'Unknown error'}\`);
     }
     
     return { success: true, action: '${interaction}' };
   }
-};`;
+}`;
 }
 
 function _generateUploadSkill(name, locators, paramDefs) {
   const paramNames = Object.keys(paramDefs);
   const mainParam = paramNames[0] || 'file_path';
-  const selector = locators.primary || locators.fallback_1 || 'input[type="file"]';
+  const primary = locators.primary || '';
+  const fallback1 = locators.fallback_1 || '';
+  const fallback2 = locators.fallback_2 || '';
   
   return `'use strict';
 /**
  * Skill: ${name}
  * Interaction: upload
  */
-const browserAct = require('./browser.act.cjs');
+const { browserAct } = require('${BROWSER_ACT_PATH}');
 const fs = require('fs');
 const path = require('path');
 
@@ -3553,8 +3714,10 @@ module.exports = {
   description: 'Upload file(s)',
   parameters: ${JSON.stringify(paramDefs, null, 2)},
   
-  async run({ ${paramNames.join(', ')} }) {
-    const files = Array.isArray(${mainParam}) ? ${mainParam} : [${mainParam}];
+  async run(args = {}) {
+    const { sessionId, headed } = args;
+    const fileArg = args.${mainParam} || args.file_path || args.files;
+    const files = Array.isArray(fileArg) ? fileArg : [fileArg];
     
     // Validate files exist
     for (const file of files) {
@@ -3563,69 +3726,83 @@ module.exports = {
       }
     }
     
-    const res = await browserAct({
-      action: 'upload',
-      selector: '${selector}',
-      files: files,
-      timeoutMs: 30000,
-    });
+    const selectors = ['${primary}', '${fallback1}', '${fallback2}', 'input[type="file"]'].filter(Boolean);
+    let res;
+    for (const sel of selectors) {
+      res = await browserAct({
+        action: 'upload',
+        selector: sel,
+        files: files,
+        sessionId,
+        headed,
+        timeoutMs: 30000,
+      });
+      if (res.ok) break;
+    }
     
-    if (!res.ok) {
-      throw new Error(\`Failed to upload: \${res.error || 'Unknown error'}\`);
+    if (!res || !res.ok) {
+      throw new Error(\`Failed to upload: \${res?.error || 'Unknown error'}\`);
     }
     
     return { success: true, uploaded: files.length };
   }
-};`;
+}`;
 }
 
 function _generateGenericSkill(name, locators, interaction, paramDefs) {
   const paramNames = Object.keys(paramDefs);
-  const selector = locators.primary || locators.fallback_1 || '[data-testid="element"]';
+  const primary = locators.primary || '';
+  const fallback1 = locators.fallback_1 || '';
+  const fallback2 = locators.fallback_2 || '';
   
   return `'use strict';
 /**
  * Skill: ${name}
  * Interaction: ${interaction}
  */
-const browserAct = require('./browser.act.cjs');
+const { browserAct } = require('${BROWSER_ACT_PATH}');
 
 module.exports = {
   name: '${name}',
   description: 'Perform ${interaction} action',
   parameters: ${JSON.stringify(paramDefs, null, 2)},
   
-  async run(params = {}) {
-    const { ${paramNames.join(', ')} } = params;
+  async run(args = {}) {
+    const { sessionId, headed } = args;
+    const selectors = ['${primary}', '${fallback1}', '${fallback2}', '[data-testid="element"]'].filter(Boolean);
+    let res;
+    for (const sel of selectors) {
+      res = await browserAct({
+        action: '${interaction}',
+        selector: sel,
+        ${paramNames.length > 0 ? `text: args.${paramNames[0]},` : ''}
+        sessionId,
+        headed,
+        timeoutMs: 15000,
+      });
+      if (res.ok) break;
+    }
     
-    const res = await browserAct({
-      action: '${interaction}',
-      selector: '${selector}',
-      ${paramNames.length > 0 ? `text: ${paramNames[0]},` : ''}
-      timeoutMs: 15000,
-    });
-    
-    if (!res.ok) {
-      throw new Error(\`Failed to ${interaction}: \${res.error || 'Unknown error'}\`);
+    if (!res || !res.ok) {
+      throw new Error(\`Failed to ${interaction}: \${res?.error || 'Unknown error'}\`);
     }
     
     return { success: true };
   }
-};`;
+}`;
 }
 
 function _generateScrollSkill(name, locators, paramDefs) {
-  const paramNames = Object.keys(paramDefs);
-  const hasDirection = paramNames.includes('direction');
-  const hasDistance = paramNames.includes('distance');
-  const selector = locators.primary || locators.fallback_1 || 'body';
+  const primary = locators.primary || '';
+  const fallback1 = locators.fallback_1 || '';
+  const fallback2 = locators.fallback_2 || '';
   
   return `'use strict';
 /**
  * Skill: ${name}
  * Interaction: scroll
  */
-const browserAct = require('./browser.act.cjs');
+const { browserAct } = require('${BROWSER_ACT_PATH}');
 
 module.exports = {
   name: '${name}',
@@ -3633,89 +3810,265 @@ module.exports = {
   parameters: ${JSON.stringify(paramDefs, null, 2)},
   defaults: { direction: 'down', distance: 500 },
   
-  async run({ ${paramNames.join(', ')} }) {
-    const dir = direction || 'down';
-    const dist = distance || 500;
+  async run(args = {}) {
+    const { sessionId, headed } = args;
+    const dir = args.direction || 'down';
+    const dist = args.distance || 500;
     const dy = dir === 'down' ? dist : dir === 'up' ? -dist : 0;
     const dx = dir === 'right' ? dist : dir === 'left' ? -dist : 0;
     
-    const res = await browserAct({
-      action: 'scroll',
-      selector: '${selector}',
-      dx: dx,
-      dy: dy,
-      timeoutMs: 15000,
-    });
+    const selectors = ['${primary}', '${fallback1}', '${fallback2}', 'body'].filter(Boolean);
+    let res;
+    for (const sel of selectors) {
+      res = await browserAct({
+        action: 'scroll',
+        selector: sel,
+        dx: dx,
+        dy: dy,
+        sessionId,
+        headed,
+        timeoutMs: 15000,
+      });
+      if (res.ok) break;
+    }
     
-    if (!res.ok) {
-      throw new Error(\`Failed to scroll: \${res.error || 'Unknown error'}\`);
+    if (!res || !res.ok) {
+      throw new Error(\`Failed to scroll: \${res?.error || 'Unknown error'}\`);
     }
     
     return { success: true, scrolled: { direction: dir, distance: dist } };
   }
-};`;
+}`;
 }
 
 function _generateDblclickSkill(name, locators) {
-  const selector = locators.primary || locators.fallback_1 || '[data-testid="item"]';
+  const primary = locators.primary || '';
+  const fallback1 = locators.fallback_1 || '';
+  const fallback2 = locators.fallback_2 || '';
   
   return `'use strict';
 /**
  * Skill: ${name}
  * Interaction: double-click
  */
-const browserAct = require('./browser.act.cjs');
+const { browserAct } = require('${BROWSER_ACT_PATH}');
 
 module.exports = {
   name: '${name}',
   description: 'Double-click element (for file managers, grids)',
   parameters: {},
   
-  async run() {
-    const res = await browserAct({
-      action: 'dblclick',
-      selector: '${selector}',
-      timeoutMs: 15000,
-    });
+  async run(args = {}) {
+    const { sessionId, headed } = args;
+    const selectors = ['${primary}', '${fallback1}', '${fallback2}', '[data-testid="item"]'].filter(Boolean);
+    let res;
+    for (const sel of selectors) {
+      res = await browserAct({
+        action: 'dblclick',
+        selector: sel,
+        sessionId,
+        headed,
+        timeoutMs: 15000,
+      });
+      if (res.ok) break;
+    }
     
-    if (!res.ok) {
-      throw new Error(\`Failed to double-click: \${res.error || 'Unknown error'}\`);
+    if (!res || !res.ok) {
+      throw new Error(\`Failed to double-click: \${res?.error || 'Unknown error'}\`);
     }
     
     return { success: true };
   }
-};`;
+}`;
 }
 
 function _generateHoverSkill(name, locators) {
-  const selector = locators.primary || locators.fallback_1 || '[data-testid="hover-trigger"]';
+  const primary = locators.primary || '';
+  const fallback1 = locators.fallback_1 || '';
+  const fallback2 = locators.fallback_2 || '';
   
   return `'use strict';
 /**
  * Skill: ${name}
  * Interaction: hover
  */
-const browserAct = require('./browser.act.cjs');
+const { browserAct } = require('${BROWSER_ACT_PATH}');
 
 module.exports = {
   name: '${name}',
   description: 'Hover over element to reveal dropdown/menu',
   parameters: {},
   
-  async run() {
-    const res = await browserAct({
-      action: 'hover',
-      selector: '${selector}',
-      timeoutMs: 15000,
-    });
-    
-    if (!res.ok) {
-      throw new Error(\`Failed to hover: \${res.error || 'Unknown error'}\`);
+  async run(args = {}) {
+    const { sessionId, headed } = args;
+    const selectors = ['${primary}', '${fallback1}', '${fallback2}', '[data-testid="hover-trigger"]'].filter(Boolean);
+    let res;
+    for (const sel of selectors) {
+      res = await browserAct({
+        action: 'hover',
+        selector: sel,
+        sessionId,
+        headed,
+        timeoutMs: 15000,
+      });
+      if (res.ok) break;
     }
     
+    if (!res || !res.ok) {
+      throw new Error(\`Failed to hover: \${res?.error || 'Unknown error'}\`);
+    }
+    
+    // Follow-up: click the revealed dropdown item if needed
     return { success: true, revealed: 'dropdown' };
   }
+}`;
+}
+
+// ---------------------------------------------------------------------------
+// Drag skill generator (Part 2)
+// ---------------------------------------------------------------------------
+function _generateDragSkill(name, locators) {
+  const primary = locators.primary || '';
+  const fallback1 = locators.fallback_1 || '';
+  const fallback2 = locators.fallback_2 || '';
+
+  return `'use strict';
+/**
+ * Skill: ${name}
+ * Interaction: drag
+ */
+const { browserAct } = require('${BROWSER_ACT_PATH}');
+
+module.exports = {
+  name: '${name}',
+  description: 'Drag element to a target',
+  parameters: {
+    targetSelector: { type: 'string', required: true, description: 'CSS selector of the drop target' },
+  },
+
+  async run(args = {}) {
+    const { sessionId, headed, targetSelector } = args;
+    if (!targetSelector) throw new Error('Missing required parameter: targetSelector');
+
+    const selectors = ['${primary}', '${fallback1}', '${fallback2}'].filter(Boolean);
+    if (!selectors.length) throw new Error('No source selector available for drag');
+
+    let res;
+    for (const sel of selectors) {
+      res = await browserAct({
+        action: 'drag',
+        selector: sel,
+        targetSelector,
+        sessionId,
+        headed,
+        timeoutMs: 15000,
+      });
+      if (res.ok) break;
+    }
+
+    if (!res || !res.ok) {
+      throw new Error(\`Failed to drag: \${res?.error || 'Unknown error'}\`);
+    }
+
+    return { success: true };
+  }
+}`;
+}
+
+// ---------------------------------------------------------------------------
+// Composite agent skill generator (Part 3)
+// Called after a successful multi-step same-domain plan execution.
+// orderedActions: Array of { stateKey, actionKey, interaction, locators, paramKey? }
+// hostname: e.g. 'perplexity.ai'
+// agentName: e.g. 'perplexity_history_search_agent'
+// ---------------------------------------------------------------------------
+function generateCompositeAgentSkill(hostname, agentName, orderedActions) {
+  if (!orderedActions || orderedActions.length < 2) {
+    return { error: 'Need at least 2 actions to generate a composite agent skill' };
+  }
+
+  // Collect which steps need a text/query param
+  const fillSteps = orderedActions.filter(a =>
+    a.interaction === 'fill' || a.interaction === 'type'
+  );
+  const hasQuery = fillSteps.length > 0;
+
+  // Build per-step code blocks
+  const stepBlocks = orderedActions.map((action, i) => {
+    const stepNum = i + 1;
+    const primary = action.locators?.primary || '';
+    const fallback1 = action.locators?.fallback_1 || '';
+    const fallback2 = action.locators?.fallback_2 || '';
+    const selectors = [primary, fallback1, fallback2].filter(Boolean);
+    const selectorLiteral = JSON.stringify(selectors);
+    const isTextStep = action.interaction === 'fill' || action.interaction === 'type';
+    const textArg = isTextStep ? `text: query,` : '';
+    const followUpCode = action.followUp && action.followUp.action === 'press'
+      ? `\n      await browserAct({ action: 'press', key: '${action.followUp.key}', sessionId, headed, timeoutMs: 5000 }).catch(() => {});`
+      : '';
+
+    return `
+    // Step ${stepNum}: ${action.actionKey}
+    {
+      const _sels${stepNum} = ${selectorLiteral};
+      let _res${stepNum};
+      for (const sel of _sels${stepNum}) {
+        _res${stepNum} = await browserAct({
+          action: '${action.interaction}',
+          selector: sel,
+          ${textArg}
+          sessionId,
+          headed,
+          timeoutMs: 15000,
+        });
+        if (_res${stepNum}.ok) break;
+      }
+      if (!_res${stepNum} || !_res${stepNum}.ok) throw new Error('Step ${stepNum} (${action.actionKey}) failed: ' + (_res${stepNum}?.error || 'Unknown'));${followUpCode}
+    }`;
+  }).join('\n');
+
+  const skillCode = `'use strict';
+/**
+ * Composite agent skill: ${agentName}
+ * Domain: ${hostname}
+ * Steps: ${orderedActions.map(a => a.actionKey).join(' → ')}
+ * Auto-generated from successful plan execution
+ */
+const { browserAct } = require('${BROWSER_ACT_PATH}');
+
+module.exports = {
+  name: '${agentName}',
+  description: 'Multi-step agent for ${hostname}: ${orderedActions.map(a => a.actionKey).join(' → ')}',
+  parameters: {${hasQuery ? `
+    query: { type: 'string', required: true, description: 'Search query or text to use in fill steps' },` : ''}
+  },
+
+  async run(args = {}) {
+    const { sessionId, headed${hasQuery ? ', query' : ''} } = args;
+    ${hasQuery ? "if (!query) throw new Error('Missing required parameter: query');" : ''}
+${stepBlocks}
+
+    return { success: true, stepsCompleted: ${orderedActions.length} };
+  }
 };`;
+
+  return {
+    name: agentName,
+    skill_name: agentName,
+    hostname,
+    interaction: 'composite',
+    code: skillCode,
+    parameters: hasQuery ? { query: { type: 'string', required: true } } : {},
+    _meta: {
+      source_domain: hostname,
+      source_action: 'composite',
+      composite_steps: orderedActions.map(a => a.actionKey),
+      created_at: new Date().toISOString(),
+      goal_tied: true,
+      use_count: 0,
+      last_used: null,
+    },
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -3729,9 +4082,11 @@ module.exports = {
   startScanScheduler,
   runMaintenanceScan: _runMaintenanceScan,
   cancelMaintenanceScan,
+  cancelActiveScan,
   getScanStatus,
   enqueueScan: _enqueueScan,
   generateSkillFromAction,
+  generateCompositeAgentSkill,
   // Export schemas for external reference
   INTERACTION_SCHEMAS,
 };

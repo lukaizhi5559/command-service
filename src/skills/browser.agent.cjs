@@ -2636,7 +2636,7 @@ When extracting page content with run-code, prioritize these selectors over gene
     // reinforce the correction memory so future runs auto-correct with full confidence.
     if (agentResult?.ok === true) {
       try {
-        const _confirmedIntent = classifyTaskIntent(task);
+        const _confirmedIntent = await classifyTaskIntent(task);
         const _origUrl = extractDescriptorUrl(existing.descriptor, 'start_url');
         if (_origUrl && startUrl !== _origUrl) {
           setImmediate(() => {
@@ -2696,7 +2696,14 @@ When extracting page content with run-code, prioritize these selectors over gene
         const _longLines = _lines.filter(l => l.trim().split(/\s+/).length > 6).length;
         const _totalWords = agentResultText.trim().split(/\s+/).filter(Boolean).length;
         const _isSparse = _longLines < 3 && _totalWords < 60;
-        if (_isSparse) {
+        // Navigation/action tasks (goto, click, open, navigate to, go to history, etc.)
+        // produce sparse output by design — the task is complete when the page loads.
+        // Only apply the quality gate to research/lookup tasks.
+        const _taskLower = (task || '').toLowerCase();
+        const _isNavTask = /\b(goto|go to|navigate|click|open|visit|go back|return to|scroll|history|previous|close|dismiss)\b/.test(_taskLower);
+        const _isResearchTask = /\b(search|find|look up|lookup|research|what is|summarize|compare|list|show me|tell me|fetch|get me)\b/.test(_taskLower);
+        const _skipQualityGate = _isNavTask && !_isResearchTask;
+        if (_isSparse && !_skipQualityGate) {
           logger.warn(`[browser.agent] Research quality gate: sparse content for ${agentId} (longLines=${_longLines}, totalWords=${_totalWords}) — marking researchContentEmpty`);
           return {
             ok: false,
@@ -2710,7 +2717,7 @@ When extracting page content with run-code, prioritize these selectors over gene
     }
     // ─────────────────────────────────────────────────────────────────────────
 
-    return {
+    const _runResult = {
       ok: agentResult?.ok ?? false,
       agentId,
       task,
@@ -2723,6 +2730,21 @@ When extracting page content with run-code, prioritize these selectors over gene
       httpStatus: Number.isInteger(agentResult?.httpStatus) ? agentResult.httpStatus : undefined,
       error: agentResult?.error,
     };
+
+    // ── Post-run background rescan ────────────────────────────────────────────
+    // After a successful run, enqueue a background scan to rebuild domain maps
+    // and navigate_history skills with fresh data. This ensures the history index
+    // stays current without blocking the current task.
+    if (_runResult.ok === true) {
+      try {
+        const { enqueueScan } = require('./explore.agent.cjs');
+        enqueueScan({ url: startUrl, agentId }, 'post_automation');
+      } catch (_enqueuErr) {
+        // Non-fatal — scan will be triggered on next periodic heartbeat
+      }
+    }
+
+    return _runResult;
   } catch (err) {
     return { ok: false, agentId, task, error: `playwright.agent delegation failed: ${err.message}` };
   }
