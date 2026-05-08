@@ -226,6 +226,88 @@ async function deleteContextRulesByKey(contextKey) {
   return res?.status === 'ok';
 }
 
+// ── Context rules management (UI + cleanup) ────────────────────────────────
+
+async function listAllContextRules() {
+  const res = await httpPost('/context_rule.list_all', {
+    version: 'mcp.v1',
+    service: 'user-memory',
+    action: 'context_rule.list_all',
+    payload: {},
+  });
+  if (res?.status !== 'ok') {
+    logger.warn(`[skill-db] listAllContextRules failed: ${JSON.stringify(res?.error || res)?.slice(0, 120)}`);
+  }
+  return res?.data?.grouped || {};
+}
+
+async function updateContextRule(id, updates) {
+  const res = await httpPost('/context_rule.update', {
+    version: 'mcp.v1',
+    service: 'user-memory',
+    action: 'context_rule.update',
+    payload: { id, updates },
+  });
+  if (res?.status !== 'ok') {
+    logger.warn(`[skill-db] updateContextRule failed: ${JSON.stringify(res?.error || res)?.slice(0, 120)}`);
+  }
+  return res?.status === 'ok';
+}
+
+async function deleteContextRuleById(id) {
+  const res = await httpPost('/context_rule.delete_by_id', {
+    version: 'mcp.v1',
+    service: 'user-memory',
+    action: 'context_rule.delete_by_id',
+    payload: { id },
+  });
+  if (res?.status !== 'ok') {
+    logger.warn(`[skill-db] deleteContextRuleById failed: ${JSON.stringify(res?.error || res)?.slice(0, 120)}`);
+  }
+  return res?.status === 'ok';
+}
+
+async function analyzeContextRules(contextKey) {
+  const res = await httpPost('/context_rule.analyze_cleanup', {
+    version: 'mcp.v1',
+    service: 'user-memory',
+    action: 'context_rule.analyze_cleanup',
+    payload: { contextKey },
+  });
+  if (res?.status !== 'ok') {
+    logger.warn(`[skill-db] analyzeContextRules failed: ${JSON.stringify(res?.error || res)?.slice(0, 120)}`);
+  }
+  return res?.data || null;
+}
+
+// ── Constraint rules management (UI) ─────────────────────────────────────────
+
+async function listConstraints() {
+  const res = await httpPost('/constraint.list', {
+    version: 'mcp.v1',
+    service: 'user-memory',
+    action: 'constraint.list',
+    payload: {},
+  });
+  if (res?.status !== 'ok') {
+    logger.warn(`[skill-db] listConstraints failed: ${JSON.stringify(res?.error || res)?.slice(0, 120)}`);
+  }
+  return res?.data?.constraints || [];
+}
+
+async function updateConstraint(id, updates) {
+  const res = await httpPost('/constraint.update', {
+    version: 'mcp.v1',
+    service: 'user-memory',
+    action: 'constraint.update',
+    payload: { id, updates },
+  });
+  if (res?.status !== 'ok') {
+    logger.warn(`[skill-db] updateConstraint failed: ${JSON.stringify(res?.error || res)?.slice(0, 120)}`);
+  }
+  return res?.status === 'ok';
+}
+
 // ── Skill registry helpers ───────────────────────────────────────────────────
 
 async function getSkill(skillName) {
@@ -243,8 +325,12 @@ module.exports = {
   set, get, del, list,
   // Semantic memory
   remember, recall,
-  // Context rules
+  // Context rules (read)
   setContextRule, getContextRules, getContextRulesByKeys, deleteContextRulesByKey,
+  // Context rules (management)
+  listAllContextRules, updateContextRule, deleteContextRuleById, analyzeContextRules,
+  // Constraint rules (management)
+  listConstraints, updateConstraint,
   // Skill registry
   getSkill, upsertSkill,
 };

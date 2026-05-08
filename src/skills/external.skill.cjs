@@ -198,7 +198,9 @@ async function runNodeSkill(execPath, args, timeoutMs, context) {
         .then((result) => {
           clearTimeout(timer);
           const output = typeof result === 'string' ? result : JSON.stringify(result, null, 2);
-          resolve({ ok: true, output });
+          // Preserve sessionFileCreations if skill returned it (for "newly created file" references)
+          const sessionFileCreations = result?.sessionFileCreations || null;
+          resolve({ ok: true, output, sessionFileCreations });
         })
         .catch((err) => {
           clearTimeout(timer);
@@ -498,23 +500,49 @@ async function run(args) {
 
   logger.info(`[external.skill] Found skill "${name}" via ${skillSource}`);
 
-  // Inject sessionId from skill's sourceDomain when caller didn't supply one.
-  // Skills created for a specific agent (e.g. perplexity_*) must run in that
-  // agent's persistent browser session — not the default unauthenticated tab.
-  // Fallback: derive from skill name prefix (e.g. "perplexity_ai_navigate_history" → "perplexity_agent")
-  // for manually-created skills that were not registered with sourceDomain.
+  // Inject sessionId from skill's agentId when caller didn't supply one.
+  // Skills created for a specific agent must run in that agent's persistent
+  // browser session — not the default unauthenticated tab.
+  //
+  // Resolution order (most → least authoritative):
+  //   1. skillRecord.agentId   — set by explore.agent in user-memory (e.g. "gmail" → "gmail_agent")
+  //   2. skill.json agent_id   — read from disk when user-memory record omits agentId
+  //   3. sourceDomain prefix   — last resort: "perplexity.ai" → "perplexity_agent"
+  //   4. skill name prefix     — "perplexity_ai_navigate_history" → "perplexity_agent"
   if (!mergedSkillArgs?.sessionId) {
     let _derivedSessionId = null;
-    if (skillRecord?.sourceDomain) {
-      _derivedSessionId = skillRecord.sourceDomain.replace(/[\.\-]/g, '_') + '_agent';
-    } else if (name && /^[a-z][a-z0-9]+_/.test(name)) {
-      // Extract first word of underscore-delimited skill name as domain hint
-      // e.g. "perplexity_ai_navigate_history" → "perplexity", "gmail_send" → "gmail"
-      const _prefix = name.split('_')[0];
-      // Only inject if the prefix maps to a known agent file pattern
-      const _agentId = _prefix + '_agent';
-      _derivedSessionId = _agentId;
+
+    // 1. agentId from user-memory record (most reliable — set explicitly by explore.agent)
+    if (skillRecord?.agentId) {
+      _derivedSessionId = skillRecord.agentId.replace(/[^a-z0-9]/gi, '_').toLowerCase() + '_agent';
     }
+
+    // 2. agent_id from skill.json on disk (populated by explore.agent; may not be in user-memory)
+    if (!_derivedSessionId) {
+      try {
+        const _skillDir = path.join(SKILLS_BASE_DIR, name.replace(/\./g, '_'));
+        const _skillJsonPath = path.join(_skillDir, 'skill.json');
+        if (fs.existsSync(_skillJsonPath)) {
+          const _meta = JSON.parse(fs.readFileSync(_skillJsonPath, 'utf8'));
+          if (_meta.agent_id) {
+            _derivedSessionId = _meta.agent_id.replace(/[^a-z0-9]/gi, '_').toLowerCase() + '_agent';
+            logger.debug(`[external.skill] Read agent_id="${_meta.agent_id}" from skill.json for "${name}"`);
+          }
+        }
+      } catch (_) { /* non-fatal */ }
+    }
+
+    // 3. sourceDomain first label: "mail.google.com" → first segment before dot → fallback to full replace
+    if (!_derivedSessionId && skillRecord?.sourceDomain) {
+      const _domainFirstLabel = skillRecord.sourceDomain.split('.')[0];
+      _derivedSessionId = _domainFirstLabel + '_agent';
+    }
+
+    // 4. skill name prefix: "perplexity_ai_navigate_history" → "perplexity_agent"
+    if (!_derivedSessionId && name && /^[a-z][a-z0-9]+_/.test(name)) {
+      _derivedSessionId = name.split('_')[0] + '_agent';
+    }
+
     if (_derivedSessionId) {
       mergedSkillArgs = { ...(mergedSkillArgs || {}), sessionId: _derivedSessionId };
       logger.info(`[external.skill] Injected sessionId="${_derivedSessionId}" for skill "${name}"`);

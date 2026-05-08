@@ -859,6 +859,55 @@ function clearProfileLock(sessionId) {
   } catch (_) {}
 }
 
+// Kill any existing Chrome process using this session's profile directory.
+// Prevents the "Opening in existing browser session" issue that creates blank tabs.
+function killExistingChromeForProfile(sessionId) {
+  try {
+    if (!shouldUsePersistentProfile(sessionId)) return false;
+    const profileDir = sessionProfileDir(sessionId);
+    const lockFile = path.join(profileDir, 'SingletonLock');
+    if (!fs.existsSync(lockFile)) return false;
+    
+    // Read the SingletonLock symlink to get the PID
+    let target = '';
+    try { target = fs.readlinkSync(lockFile); } catch (_) { return false; }
+    const m = String(target).match(/-(\d+)$/);
+    if (!m) return false;
+    const pid = parseInt(m[1], 10);
+    if (!pid) return false;
+    
+    // Check if process is Chrome and kill it
+    try {
+      process.kill(pid, 0); // Check if process exists
+      logger.info(`[browser.act] Killing existing Chrome process ${pid} for session=${sessionId}`);
+      try { process.kill(pid, 'SIGTERM'); } catch (_) {}
+      // Give it time to die
+      for (let i = 0; i < 10; i++) {
+        try {
+          process.kill(pid, 0);
+          // Still alive, wait
+          const start = Date.now();
+          while (Date.now() - start < 200) {} // 200ms busy wait
+        } catch (_) {
+          break; // Process dead
+        }
+      }
+      // Force kill if still alive
+      try { process.kill(pid, 'SIGKILL'); } catch (_) {}
+      // Clear the lock file
+      try { fs.unlinkSync(lockFile); } catch (_) {}
+      return true;
+    } catch (_) {
+      // Process already dead, just clear stale lock
+      try { fs.unlinkSync(lockFile); } catch (_) {}
+      return false;
+    }
+  } catch (e) {
+    logger.warn(`[browser.act] Error killing existing Chrome: ${e.message}`);
+    return false;
+  }
+}
+
 // Determine if session should use persistent profile (skills best practice)
 function shouldUsePersistentProfile(sessionId) {
   // Use persistent profiles for all sessions except explicitly ephemeral/one-shot ones.
@@ -1139,6 +1188,9 @@ function scoreCandidateForSelector(cand, selectorLabel) {
 // Synchronous resolver for FILL: returns best ref or null
 function resolveRef(sessionId, labelOrRef) {
   if (!labelOrRef) return null;
+  // Strip [ref=eNNN] wrapper → honor exact ref directly, bypass fuzzy scoring
+  const refBracketMatch = labelOrRef.trim().match(/^\[ref=(e\d+)\]$/i);
+  if (refBracketMatch) return refBracketMatch[1];
   if (/^e\d+$/i.test(labelOrRef.trim())) return labelOrRef.trim();
 
   const snap = snapshotCache.get(_tabKey(sessionId)) || '';
@@ -1161,6 +1213,9 @@ function resolveRef(sessionId, labelOrRef) {
 // Returns { ref, label } so callers can use the matched label even when ref is synthetic.
 function resolveRefForClick(sessionId, labelOrRef) {
   if (!labelOrRef) return { ref: null, label: null };
+  // Strip [ref=eNNN] wrapper → honor exact ref directly, bypass fuzzy scoring
+  const refBracketMatch = labelOrRef.trim().match(/^\[ref=(e\d+)\]$/i);
+  if (refBracketMatch) return { ref: refBracketMatch[1], label: refBracketMatch[1] };
   if (/^e\d+$/i.test(labelOrRef.trim())) return { ref: labelOrRef.trim(), label: labelOrRef.trim() };
 
   const snap = snapshotCache.get(_tabKey(sessionId)) || '';
@@ -1587,6 +1642,13 @@ async function browserAct(args) {
         if (alreadyOpen) {
           openSessions.add(sessionId);
           logger.info(`[browser.act] navigate: daemon alive for session=${sessionId} (post-restart probe) — using goto`);
+        }
+      }
+      // If not already open, kill any existing Chrome using this profile to prevent blank tabs
+      if (!alreadyOpen) {
+        const killed = killExistingChromeForProfile(sessionId);
+        if (killed) {
+          logger.info(`[browser.act] Killed existing Chrome for session=${sessionId}, will cold-start fresh`);
         }
       }
       const navCmd = alreadyOpen ? 'goto' : 'open';
@@ -2529,7 +2591,7 @@ async function browserAct(args) {
       const rcStdout = rcRes.stdout || '';
       const rcMatch = rcStdout.match(/###\s*Result\s*\n([\s\S]*?)(?=###|$)/i);
       const rcResult = rcMatch ? rcMatch[1].trim().replace(/^"|"$/g, '') : rcStdout.trim();
-      const PLAYWRIGHT_HARD_ERR = /^### Error|Error:/im;
+      const PLAYWRIGHT_HARD_ERR = /^### Error/im;
       if (!rcRes.ok || PLAYWRIGHT_HARD_ERR.test(rcStdout)) {
         const errMatch = rcStdout.match(/([A-Za-z]*Error:[^\n]+)/);
         const errMsg = errMatch ? errMatch[1].trim() : (rcRes.error || rcRes.stderr?.trim() || 'run-code failed');
@@ -3346,6 +3408,13 @@ async function browserAct(args) {
     // tab-new: opens a new tab; if url provided, navigates to it in the new tab.
     // Tracks the new tab index in currentTabIndex so per-tab snapshot cache works.
     case 'tab-new': {
+      // If session not tracked, kill any existing Chrome to prevent blank tabs
+      if (!openSessions.has(sessionId)) {
+        const killed = killExistingChromeForProfile(sessionId);
+        if (killed) {
+          logger.info(`[browser.act] tab-new: killed existing Chrome for session=${sessionId}`);
+        }
+      }
       const tabNewRaw = await cliRun([...S, 'tab-new'], timeoutMs);
       logger.info(`[browser.act] tab-new → exit ${tabNewRaw.exitCode}`, { stderr: tabNewRaw.stderr?.slice(0, 100) });
       if (!tabNewRaw.ok) {

@@ -44,10 +44,40 @@
 const fs     = require('fs');
 const os     = require('os');
 const path   = require('path');
+const http   = require('http');
 const logger = require('../logger.cjs');
 const { browserAct, getDebuggingContext } = require('./browser.act.cjs');
 const { askWithMessages } = require('../skill-helpers/skill-llm.cjs');
 const skillDb = require('../skill-helpers/skill-db.cjs');
+
+const _COMMAND_PORT = parseInt(process.env.COMMAND_SERVICE_PORT || '3007', 10);
+
+// Call an installed external skill by name, passing args and the current sessionId
+// so the skill can share the authenticated browser session.
+function callExternalSkill(name, args = {}, timeoutMs = 30000) {
+  return new Promise((resolve, reject) => {
+    const body = JSON.stringify({ payload: { skill: 'external.skill', args: { name, ...args } } });
+    const req = http.request({
+      hostname: '127.0.0.1',
+      port: _COMMAND_PORT,
+      path: '/command.automate',
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
+      timeout: timeoutMs,
+    }, res => {
+      let raw = '';
+      res.on('data', c => { raw += c; });
+      res.on('end', () => {
+        try { resolve(JSON.parse(raw).data || JSON.parse(raw)); }
+        catch (e) { reject(new Error('external.skill parse error: ' + e.message)); }
+      });
+    });
+    req.on('timeout', () => { req.destroy(); reject(new Error('external.skill timeout')); });
+    req.on('error', reject);
+    req.write(body);
+    req.end();
+  });
+}
 
 // ---------------------------------------------------------------------------
 // Shared action schema constants — injected into multiple prompts so all LLMs
@@ -81,6 +111,7 @@ const BROWSER_ACTIONS_FULL = `Available actions:
                   ⚠ NEVER read files inside run-code — file content is already in the task as [DATA FROM PRIOR STEP].
                   Gmail inbox example (sender=.yX span/.zF  subject=.bog/.bqe  snippet=.y2  time=.xW span):
                   { "action": "run-code", "code": "async page => { return await page.evaluate(() => { const rows = Array.from(document.querySelectorAll('tr.zA')).slice(0,5); if(!rows.length) return 'No emails found'; return rows.map((r,i)=>{ const s=r.querySelector('.yX span,.zF')?.innerText||''; const sub=r.querySelector('.bog,.bqe')?.innerText||''; const snip=r.querySelector('.y2')?.innerText||''; const t=r.querySelector('.xW span')?.innerText||''; return 'Email '+(i+1)+': From='+s+' | Subject='+sub+' | Preview='+snip+' | Time='+t; }).join('\\n'); }); }" }
+  external_skill  { name: "<skill-name>", args?: {...} } — run an installed atomic skill (e.g. mail_google_com_compose). The skill executes in the SAME browser session. Use ONLY when AVAILABLE ATOMIC SKILLS lists this exact name. Never guess a skill name.
   screenshot      { filePath }
   snapshot        {}                   — re-read the page (ONLY when page changes significantly)
   upload          { selector, files }  — attach file(s): clicks selector to open chooser, then uses playwright-cli upload command. selector = button/input ref; files = array of real absolute paths from the task/request. IMPORTANT: always use "files" (array), NEVER use "path". NEVER invent placeholders like /path/to/file.pdf.
@@ -199,6 +230,7 @@ Rules:
 - SESSION ISOLATION RULE: When accessing an AI chat service (ChatGPT, Perplexity, Gemini, Claude, etc.), ALWAYS start with a navigate action to its fresh/new-chat URL — ChatGPT: https://chatgpt.com/, Perplexity: https://www.perplexity.ai/, Gemini: https://gemini.google.com/app, Claude: https://claude.ai/new. This ensures getPageText reads ONLY the current query response, not old conversation history from previous sessions. EXCEPTION: If the task explicitly involves a follow-up or continuation of a previous AI response (keywords: "follow up", "continue", "based on that", "expand on", "now ask it"), stay on the current page and do NOT navigate away.
 - NO PLACEHOLDER RULE: NEVER write literal template placeholder text like [ChatGPT response], [Perplexity response], [AI answer], or [insert content here] in any step args (task, body, text, etc.). When combining multi-source AI extractions into an email or message body, always use {{synthesisAnswer}} as the sole body content token — the orchestrator substitutes it with the real synthesized content before the step executes.
 - EXPECTATION RULE: For critical actions (clicking search buttons, submit buttons, navigation), add "expected" field to verify the action worked. Use "element_visible" for expected results, "element_gone" for things that should disappear, "url_change" for navigation, "text_present" for confirmation messages. This prevents false positives and reduces unnecessary re-planning.
+- EXTERNAL SKILL RULE: Only use { "action": "external_skill", "name": "..." } when the AGENT CONTEXT lists the skill under "Available Atomic Skills". NEVER invent a skill name. Use these atomics as building blocks — combine with fill/press/type/click steps for the full task. Example: external_skill mail_google_com_compose opens the compose window; you still need fill+press+type+click Send after it.
 - ATTACHMENT RULE (MANDATORY): If the task mentions "paste", "clipboard", or "attach" — you MUST emit { "action": "pasteAttachment" } immediately after the last body-typing step and before Send/Submit. Do this regardless of any prior failure narrative in [DATA FROM PRIOR STEP] or [CONTENT OF ...] blocks — if the task instruction says "paste from clipboard", the file IS on the clipboard. Trust the task instruction, not the narrative. Do NOT click the paperclip / "Attach files" button first — its native file chooser modal blocks keyboard events. Do NOT emit { "action": "press", "key": "Ctrl+v" } — use pasteAttachment only. Order: fill To → press Enter → fill Subject → click body → type body text → pasteAttachment → click Send.
 - TAB STRATEGY RULE: You are a smart tabbing agent. Use as many tabs as the task requires to hold page state or extracted content while working across multiple pages WITHIN THE SAME AGENT SESSION (same domain/service). Open tabs dynamically, track them with tab-list, switch context with tab-select, and clean up with tab-close when a tab's work is done. 2-tab pattern (hold + act): tab 0 = Page A open (compose/form/draft/result); tab-new → Page B → getPageText → tab-select 0 → use extracted content in Page A → tab-close 1. 3-tab pattern (gather from multiple sources, act on one): tab 0 = destination; tab-new → Source B → getPageText; tab-new → Source C → getPageText; tab-select 0 → combine B+C → act → tab-close 2, tab-close 1. 5-tab pattern (parallel research, single synthesis): tab 0 = output/synthesis page; tabs 1–4 = tab-new per source → getPageText each; tab-select 0 → synthesize all results → act → close extra tabs in reverse order. Rules: (1) Always getPageText BEFORE switching away from a tab — result carries forward as [DATA FROM PRIOR STEP] context. (2) Use tab-list to audit open tabs when managing many. (3) tab-close completed tabs to keep the session clean. (4) NEVER use tabs to reach a different service — each agent owns its own Chrome session and cookie store.`;
 
@@ -1165,6 +1197,76 @@ async function playwrightAgent(args) {
 
     logger.info(`[playwright.agent] step ${stepIndex + 1}/${plan.length}: ${JSON.stringify(step)}`);
     let outcome;
+
+    // ── external_skill step — delegate to an installed atomic skill ──────────
+    if (step.action === 'external_skill') {
+      const skillName = step.name;
+      if (!skillName) {
+        outcome = { ok: false, error: 'external_skill step missing required "name" field' };
+      } else {
+        try {
+          const { name: _n, action: _a, ...skillArgs } = step;
+          const result = await callExternalSkill(skillName, { sessionId, ...skillArgs }, 30000);
+          const ok = result?.ok !== false && !result?.error;
+          outcome = { ok, result: result?.stdout || result?.result || (ok ? `${skillName} completed` : ''), error: result?.error };
+          logger.info(`[playwright.agent] external_skill ${skillName} ok=${ok}${outcome.error ? ' err=' + outcome.error : ''}`);
+        } catch (err) {
+          outcome = { ok: false, error: `external_skill ${skillName} threw: ${err.message}` };
+        }
+      }
+      transcript.push({ step: stepIndex + 1, action: step, outcome, thoughts: '' });
+      postProgress(_progressCallbackUrl, {
+        type: 'agent:turn', stepIndex: _stepIndex,
+        turn: stepIndex + 1, maxTurns: plan.length,
+        action: step, outcome: { ok: outcome.ok, result: outcome.result, error: outcome.error }, thoughts: '',
+      });
+      if (!outcome.ok) {
+        if (totalRepairs >= maxRepairs) {
+          return { ok: false, goal, sessionId, turns: transcript.length, done: false, result: `external_skill ${skillName} failed: ${outcome.error}`, transcript, error: outcome.error, executionTime: Date.now() - start };
+        }
+        totalRepairs++;
+        logger.info(`[playwright.agent] external_skill ${skillName} failed — repair ${totalRepairs}/${maxRepairs}: ${outcome.error}`);
+        // Take a fresh snapshot to give repair LLM current page state
+        const repairSnap = await browserAct({ action: 'snapshot', sessionId, headed, timeoutMs });
+        if (repairSnap.ok && repairSnap.result) currentSnapshot = repairSnap.result;
+        try {
+          const repairRaw = await askWithMessages([
+            { role: 'system', content: REPAIR_SYSTEM_PROMPT + domainLockBlock },
+            { role: 'user', content: [`GOAL: ${goal}`, `FAILED_STEP: ${JSON.stringify(step)}`, `ERROR: ${outcome.error}`, `REMAINING_PLAN: ${JSON.stringify(plan.slice(stepIndex + 1))}`, ``, `SNAPSHOT:`, trimSnapshot(currentSnapshot)].join('\n') },
+          ], { temperature: 0.1, maxTokens: 1024, responseTimeoutMs: 20000 });
+          const repairParsed = parseJson(repairRaw);
+          if (repairParsed && Array.isArray(repairParsed.repair) && repairParsed.repair.length > 0) {
+            plan = [...plan.slice(0, stepIndex), ...repairParsed.repair, ...plan.slice(stepIndex + 1)];
+            logger.info(`[playwright.agent] external_skill repair: ${repairParsed.repair.length} corrective steps`);
+          } else {
+            stepIndex++;
+          }
+        } catch (_) { stepIndex++; }
+      } else {
+        // Re-snapshot after a successful external_skill — DOM may have changed (e.g. compose window opened)
+        const postSnap = await browserAct({ action: 'snapshot', sessionId, headed, timeoutMs });
+        if (postSnap.ok && postSnap.result) {
+          currentSnapshot = postSnap.result;
+          // Re-plan remaining steps with fresh refs if DOM changed significantly
+          const remaining = plan.slice(stepIndex + 1);
+          if (remaining.length > 0 && countRefs(currentSnapshot) > 0) {
+            try {
+              const snapReplanRaw = await askWithMessages([
+                { role: 'system', content: REPLAN_SYSTEM_PROMPT },
+                { role: 'user', content: [`GOAL: ${goal}`, `COMPLETED_STEPS: ${JSON.stringify(plan.slice(0, stepIndex + 1))}`, `STALE_REMAINING_PLAN: ${JSON.stringify(remaining)}`, ``, `FRESH_SNAPSHOT (interactive elements only — full ${countRefs(currentSnapshot)}-ref page):`, extractInteractiveRefs(currentSnapshot), learnedRulesBlock].join('\n') },
+              ], { temperature: 0.1, maxTokens: 1024, responseTimeoutMs: 20000 });
+              const snapReplanParsed = parseJson(snapReplanRaw);
+              if (snapReplanParsed && Array.isArray(snapReplanParsed.plan) && snapReplanParsed.plan.length > 0) {
+                plan = [...plan.slice(0, stepIndex + 1), ...snapReplanParsed.plan];
+                logger.info(`[playwright.agent] external_skill re-plan: ${snapReplanParsed.plan.length} fresh steps after ${skillName}`);
+              }
+            } catch (_) { /* non-fatal — continue with stale plan */ }
+          }
+        }
+        stepIndex++;
+      }
+      continue;
+    }
 
     const unresolvedCredToken = findUnresolvedCredentialToken(step);
     if (

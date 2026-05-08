@@ -1262,23 +1262,46 @@ async function actionQueryAgent({ service, id }) {
 
 async function actionListAgents() {
   const db = await getDb();
-  if (!db) {
-    if (!fs.existsSync(AGENTS_DIR)) return { ok: true, agents: [] };
-    const files = fs.readdirSync(AGENTS_DIR).filter(f => f.endsWith('.agent.md'));
-    return { ok: true, agents: files.map(f => ({ id: f.replace('.md', ''), type: 'browser' })) };
+  let dbAgents = [];
+  if (db) {
+    try {
+      const rows = await db.all("SELECT id, type, service, capabilities, status, last_validated FROM agents WHERE type = 'browser' ORDER BY created_at DESC");
+      dbAgents = (rows || []).map(r => ({
+        id: r.id,
+        type: r.type,
+        service: r.service,
+        capabilities: r.capabilities ? JSON.parse(r.capabilities) : [],
+        status: r.status,
+        lastValidated: r.last_validated,
+      }));
+    } catch (_) {}
   }
-  const rows = await db.all("SELECT id, type, service, capabilities, status, last_validated FROM agents WHERE type = 'browser' ORDER BY created_at DESC");
-  return {
-    ok: true,
-    agents: (rows || []).map(r => ({
-      id: r.id,
-      type: r.type,
-      service: r.service,
-      capabilities: r.capabilities ? JSON.parse(r.capabilities) : [],
-      status: r.status,
-      lastValidated: r.last_validated,
-    })),
-  };
+  // Merge .md file agents not yet in DB (e.g. gmail.agent created by explore.agent before DB registration)
+  if (fs.existsSync(AGENTS_DIR)) {
+    try {
+      const files = fs.readdirSync(AGENTS_DIR).filter(f => f.endsWith('.agent.md'));
+      const dbIds = new Set(dbAgents.map(a => a.id));
+      for (const f of files) {
+        const id = f.replace('.md', '');
+        if (dbIds.has(id)) continue;
+        try {
+          const content = fs.readFileSync(path.join(AGENTS_DIR, f), 'utf8');
+          const statusMatch  = content.match(/^status:\s*(\S+)/m);
+          const typeMatch    = content.match(/^type:\s*(\S+)/m);
+          const serviceMatch = content.match(/^service:\s*(\S+)/m);
+          const rawStatus = statusMatch?.[1] || 'healthy';
+          // Normalize non-standard statuses to 'healthy' so planSkills includes them
+          const HEALTHY_STATUSES = new Set(['healthy', 'learned', 'degraded', 'needs_auth', 'needs_validation']);
+          const normalStatus = HEALTHY_STATUSES.has(rawStatus) ? 'healthy' : rawStatus;
+          const type    = typeMatch?.[1]    || 'browser';
+          const service = serviceMatch?.[1] || id.replace('.agent', '');
+          dbAgents.push({ id, type, service, capabilities: [], status: normalStatus });
+          logger.info(`[browser.agent] list_agents: merged .md-only agent ${id} (status=${normalStatus})`);
+        } catch (_) {}
+      }
+    } catch (_) {}
+  }
+  return { ok: true, agents: dbAgents };
 }
 
 // ---------------------------------------------------------------------------
@@ -2452,6 +2475,38 @@ async function actionRun({ agentId, task, url, context, requiresAuth, _progressC
     }
     _agentContext = (_coreDescriptor + (_matchedPlaybook ? '\n\n## Playbooks\n' + _matchedPlaybook : '')).slice(0, 3000);
   }
+
+  // ── Inject installed domain skills into _agentContext ───────────────────────
+  // Load atomic skills for this agent's service domain and surface them to playwright.agent
+  // so it can plan external_skill steps alongside browser.act steps.
+  const _domainForSkills = existing?.service || agentId.replace('.agent', '');
+  try {
+    const SKILLS_BASE = path.join(os.homedir(), '.thinkdrop', 'skills');
+    if (fs.existsSync(SKILLS_BASE)) {
+      const skillDirs = fs.readdirSync(SKILLS_BASE).filter(d =>
+        fs.existsSync(path.join(SKILLS_BASE, d, 'skill.json'))
+      );
+      const domainSkills = [];
+      for (const d of skillDirs) {
+        try {
+          const sj = JSON.parse(fs.readFileSync(path.join(SKILLS_BASE, d, 'skill.json'), 'utf8'));
+          const skillDomain = sj.source_domain || sj.agent_id?.replace('.agent', '') || '';
+          if (!skillDomain) continue;
+          // Match if skill's domain contains the agent service name or vice-versa
+          if (skillDomain.includes(_domainForSkills) || _domainForSkills.includes(skillDomain)) {
+            if (!sj.goal_tied) continue; // only surface goal_tied atomics as building blocks
+            domainSkills.push({ name: d, description: sj.description || sj.source_action || d, sourceAction: sj.source_action || '' });
+          }
+        } catch (_) {}
+      }
+      if (domainSkills.length > 0) {
+        const skillsNote = `\n\n## Available Atomic Skills (use external_skill action for these exact sub-tasks)\n` +
+          domainSkills.map(s => `- ${s.name}: ${s.description}`).join('\n');
+        _agentContext = (_agentContext + skillsNote).slice(0, 3500);
+        logger.info(`[browser.agent] run: injected ${domainSkills.length} domain skill(s) for ${_domainForSkills} into context`);
+      }
+    }
+  } catch (_) { /* non-fatal */ }
 
   // ── Inject domain map content extraction hints if available ───────────────
   // explore.agent scan mode discovers optimal CSS selectors for content extraction.

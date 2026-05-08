@@ -113,6 +113,7 @@ const INTERACTION_SCHEMAS = {
     params: [],
     description: "Click element",
     paramTypes: {},
+    reveals: null,
     successCriteria: { expected_url_change: true }
   },
   dblclick: {
@@ -174,6 +175,13 @@ const INTERACTION_SCHEMAS = {
     description: "Hover to reveal dropdown/menu",
     paramTypes: {},
     reveals: 'dropdown',
+    successCriteria: { expected_url_change: false }
+  },
+  reveal: {
+    params: [],
+    description: "Click to reveal hidden surface (sidebar, drawer, panel, popover, sheet)",
+    paramTypes: {},
+    reveals: null,
     successCriteria: { expected_url_change: false }
   },
   upload: {
@@ -290,12 +298,26 @@ const STATE_IDENTIFY_PROMPT = `You are a browser automation expert. Given a page
 Reply ONLY with a valid JSON object:
 {
   "state_key": "<snake_case key, e.g. landing_page_logged_out | search_results | user_dashboard | login_modal>",
-  "identification": "<one-line description of how to detect this state, e.g. URL='/' AND Login button visible>"
+  "identification": "<one-line description of how to detect this state, e.g. URL='/' AND Login button visible>",
+  "context_type": "<page | modal | dropdown | sidebar | drawer | panel | popover | sheet | tab | tooltip>",
+  "url_pattern": "<URL glob pattern for this state, e.g. https://perplexity.ai/c/* or https://perplexity.ai/ — use * for variable path segments. Empty string for all non-page types.>"
 }
 Rules:
 - state_key must be lowercase snake_case, ≤40 chars
 - Be specific: "landing_page_logged_out" not "home"
 - Focus on auth state + page type as the two axes
+- context_type values:
+  - "page" = full navigable page with distinct URL
+  - "modal" = dialog overlay that dims background, no URL change
+  - "dropdown" = small floating list/menu revealed by click or hover, no URL change
+  - "sidebar" = slide-in nav/content panel (left or right edge), no URL change
+  - "drawer" = bottom or side slide-up/in sheet (mobile-style), no URL change
+  - "panel" = inline collapsible/accordion section, no URL change
+  - "popover" = floating anchored content revealed by click (not hover), no URL change
+  - "sheet" = full-width bottom overlay lighter than modal, no URL change
+  - "tab" = in-page tab panel switching content without navigation, no URL change
+  - "tooltip" = hover-triggered read-only text overlay (skip scanning — not interactive)
+- url_pattern: use the current URL with * replacing variable path segments. MUST be empty string for all non-page context_types.
 Reply with ONLY valid JSON, no preamble.`;
 
 // ---------------------------------------------------------------------------
@@ -658,14 +680,17 @@ function _domainMapExists(hostname) {
   try { fs.accessSync(_mapPath(hostname)); return true; } catch (_) { return false; }
 }
 
+const FRESHNESS_THRESHOLD_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
+
 /**
- * Clean domain map before new scan - PRESERVE VERIFIED ACTIONS ONLY.
+ * Clean domain map before new scan - PRESERVE VERIFIED ACTIONS AND FRESH STATES.
  * 
  * Strategy:
  * - Keep verified actions (verified=true AND failure_count < 3) - these are proven working
- * - Remove ALL unverified actions - they may be garbage from bad previous scans
- * - Clear data array entirely - let fresh scan populate with clean data
- * - Remove states that have no verified actions after cleanup
+ * - Keep ALL actions in states scanned within FRESHNESS_THRESHOLD_MS (7 days) - fresh enough to trust
+ * - Remove unverified actions in stale states (> 7 days old) - may be garbage from bad previous scans
+ * - Clear data array entirely - let fresh scan repopulate with clean data
+ * - Remove states that have no verified or fresh actions after cleanup
  */
 function _cleanDomainMap(domainMap) {
   if (!domainMap || !domainMap.states) return domainMap;
@@ -673,34 +698,46 @@ function _cleanDomainMap(domainMap) {
   const cleaned = { ...domainMap };
   const cleanedStates = {};
   let verifiedKept = 0;
+  let freshKept = 0;
   let unverifiedRemoved = 0;
   let statesRemoved = 0;
+  const now = Date.now();
   
   for (const [stateKey, state] of Object.entries(cleaned.states || {})) {
     if (!state.actions) {
       statesRemoved++;
       continue; // Skip states with no actions
     }
+
+    // Check if this state was recently scanned (within 7 days)
+    const lastScanned = state.last_scanned ? new Date(state.last_scanned).getTime() : 0;
+    const isFresh = (now - lastScanned) < FRESHNESS_THRESHOLD_MS;
+
+    if (isFresh && Object.keys(state.actions).length > 0) {
+      // Keep the entire state intact — it was scanned recently enough
+      cleanedStates[stateKey] = { ...state, data: [] };
+      freshKept += Object.keys(state.actions).length;
+      continue;
+    }
     
-    const verifiedActions = {};
+    const keptActions = {};
     
     for (const [actionKey, action] of Object.entries(state.actions)) {
       const isVerified = action.verified && (action.failure_count || 0) < 3;
       
       if (isVerified) {
-        verifiedActions[actionKey] = action;
+        keptActions[actionKey] = action;
         verifiedKept++;
       } else {
         unverifiedRemoved++;
-        logger.info(`[explore.agent] _cleanDomainMap: removed unverified action "${actionKey}"`);
       }
     }
     
     // Only keep states that have at least one verified action
-    if (Object.keys(verifiedActions).length > 0) {
+    if (Object.keys(keptActions).length > 0) {
       cleanedStates[stateKey] = {
         ...state,
-        actions: verifiedActions,
+        actions: keptActions,
         data: [] // Clear old data, let fresh scan repopulate
       };
     } else {
@@ -710,7 +747,7 @@ function _cleanDomainMap(domainMap) {
   
   cleaned.states = cleanedStates;
   
-  logger.info(`[explore.agent] _cleanDomainMap: kept ${verifiedKept} verified actions, removed ${unverifiedRemoved} unverified, removed ${statesRemoved} empty states`);
+  logger.info(`[explore.agent] _cleanDomainMap: kept ${verifiedKept} verified actions, kept ${freshKept} fresh actions (< 7d), removed ${unverifiedRemoved} unverified, removed ${statesRemoved} empty states`);
   
   return cleaned;
 }
@@ -902,20 +939,34 @@ function _buildSmartSelectors(attrs) {
     });
   }
   
-  // Tier 3: ARIA label + role combination
+  // Tier 3: ARIA label + role combination (highly stable semantic selectors)
+  // These are preferred over CSS classes because they're accessibility-first
+  // and less likely to change when sites redesign their styling
   if (ariaLabel && ariaLabel.length > 2) {
     if (role) {
+      // Role + ARIA label is the gold standard - very specific and stable
       selectors.push({ 
         selector: `[role="${role}"][aria-label="${ariaLabel}"]`, 
-        score: 90,
+        score: 94,  // Boosted to match data-qa (above CSS classes)
         fingerprint: { role, ariaLabel, tag },
         stable: true
       });
     }
+    // ARIA label alone is still very good
     selectors.push({ 
       selector: `[aria-label="${ariaLabel}"]`, 
-      score: 85,
+      score: 88,  // Boosted above semantic CSS classes
       fingerprint: { ariaLabel, tag, role },
+      stable: true
+    });
+  }
+  
+  // Tier 3b: Role + text content (for buttons with clear text labels)
+  if (role && text && text.length > 0 && text.length < 30) {
+    selectors.push({
+      selector: `[role="${role}"]:has-text("${text.replace(/"/g, '\\"')}")`,
+      score: 85,  // Good fallback when aria-label is missing
+      fingerprint: { role, text: text.slice(0, 30), tag },
       stable: true
     });
   }
@@ -1087,6 +1138,9 @@ async function _extractStableSelectors(ref, sessionId, headed, skillName, intera
       // Context
       inList: !!(el.closest && (el.closest('ul') || el.closest('ol') || el.closest('[role="list"]'))),
       parentText: el.parentElement ? (el.parentElement.getAttribute('aria-label') || el.parentElement.innerText || '').slice(0, 50) : '',
+      // Reveal detection
+      ariaControls: el.getAttribute('aria-controls'),
+      ariaExpanded: el.getAttribute('aria-expanded'),
     }) : null`;
 
     logger.info(`[explore.agent] _extractStableSelectors: evaluating ref=${ref}`);
@@ -1133,7 +1187,7 @@ async function _extractStableSelectors(ref, sessionId, headed, skillName, intera
     logger.info(`[explore.agent] _extractStableSelectors: built selectors for ref=${ref} - primary: ${selectorProfile.primary}, score: ${selectorProfile.score}, stable: ${selectorProfile.stability}`);
 
     // Test primary selector to verify it works
-    const verified = await _verifySelector(selectorProfile.primary, attrs.tag, ref, sessionId, headed);
+    let verified = await _verifySelector(selectorProfile.primary, attrs.tag, ref, sessionId, headed);
     if (!verified) {
       logger.info(`[explore.agent] _extractStableSelectors: primary selector failed verification for ref=${ref}, trying fallbacks`);
       // Try fallbacks
@@ -1144,11 +1198,37 @@ async function _extractStableSelectors(ref, sessionId, headed, skillName, intera
           // Swap this fallback to primary
           selectorProfile.fallbacks[i] = selectorProfile.primary;
           selectorProfile.primary = selectorProfile.fallbacks.splice(i, 1)[0];
+          verified = true;
           break;
         }
       }
     } else {
       logger.info(`[explore.agent] _extractStableSelectors: primary selector verified for ref=${ref}`);
+    }
+
+    // Post-verification: Prefer semantic selectors (ARIA-based) over CSS classes for long-term stability
+    // Even if a CSS class selector worked, if a semantic selector also works, use the semantic one as primary
+    const allSelectors = [selectorProfile.primary, ...selectorProfile.fallbacks].filter(Boolean);
+    const semanticSelector = allSelectors.find(sel => 
+      sel.includes('[aria-label=') || sel.includes('[role=')
+    );
+    const cssClassSelector = allSelectors.find(sel => 
+      sel.includes('.') && !sel.includes('[') && !sel.includes(':has-text')
+    );
+    
+    // If we have both semantic and CSS class selectors, and primary is CSS class but semantic also works,
+    // prefer the semantic one
+    if (semanticSelector && cssClassSelector && selectorProfile.primary === cssClassSelector) {
+      const semanticVerified = await _verifySelector(semanticSelector, attrs.tag, ref, sessionId, headed);
+      if (semanticVerified) {
+        logger.info(`[explore.agent] _extractStableSelectors: preferring semantic selector over CSS class for ref=${ref}`);
+        // Swap semantic to primary
+        const idx = selectorProfile.fallbacks.indexOf(semanticSelector);
+        if (idx >= 0) {
+          selectorProfile.fallbacks[idx] = selectorProfile.primary;
+          selectorProfile.primary = semanticSelector;
+        }
+      }
     }
 
     return {
@@ -1909,7 +1989,8 @@ async function exploreAgent(args) {
 // ---------------------------------------------------------------------------
 async function scanDomain(args) {
   const {
-    url,
+    url,                          // Single URL (backward compat)
+    urls,                         // Array of URLs for multi-URL scanning
     agentId       = 'explore_agent',
     sessionId:    callerSessionId,
     maxScanDepth  = 1,
@@ -1921,11 +2002,15 @@ async function scanDomain(args) {
     _preAuthed,                   // true if user was already logged in (skip auth overlay)
   } = args || {};
 
-  if (!url) return { ok: false, error: 'url is required for scanDomain' };
+  // Support both single url and urls array
+  const urlsToScan = urls || (url ? [url] : []);
+  if (!urlsToScan.length) return { ok: false, error: 'url or urls is required for scanDomain' };
 
+  // Use first URL to determine hostname
+  const startUrl = urlsToScan[0];
   let hostname;
-  try { hostname = new URL(url).hostname.replace(/^www\./, ''); } catch (_) {
-    return { ok: false, error: `Invalid url: ${url}` };
+  try { hostname = new URL(startUrl).hostname.replace(/^www\./, ''); } catch (_) {
+    return { ok: false, error: `Invalid url: ${startUrl}` };
   }
 
   // Normalize goals array from goal/goals parameters (multi-goal support)
@@ -1938,9 +2023,10 @@ async function scanDomain(args) {
   // Use stable session name (no timestamp) so the same Chrome profile dir is reused across scans.
   // Timestamped names created a new 20MB profile dir on every heartbeat/background scan.
   const scanSessionId  = callerSessionId || `${hostname}_scan`;
-  // If caller provides a sessionId (e.g. learn_mode reusing auth session), respect their headed setting.
-  // Standalone background scans (no callerSessionId) are always headless.
-  const headed         = callerSessionId ? (callerHeaded !== undefined ? callerHeaded : true) : false;
+  // Always run scan headlessly to prevent blank tab flicker. 
+  // The learn session remains visible (if callerHeaded=true), but scan automation runs invisibly.
+  // Both use the same Chrome profile via scanSessionId.
+  const headed         = false;
   // When a caller session is provided (learn_mode), use tab-new per page so we never navigate
   // the auth tab (which would trigger Cloudflare re-challenges). Background scans navigate normally.
   const useTabStrategy = !!callerSessionId;
@@ -1962,46 +2048,14 @@ async function scanDomain(args) {
 
   logger.info(`[explore.agent] scanDomain config: session=${scanSessionId} headed=${headed} trigger=${_trigger}`);
 
-  logger.info(`[explore.agent] scanDomain start: ${hostname} (trigger=${_trigger} maxScanDepth=${maxScanDepth})`);
+  logger.info(`[explore.agent] scanDomain start: ${hostname} (trigger=${_trigger} maxScanDepth=${maxScanDepth}, urls=${urlsToScan.length})`);
   _postProgress(_progressCallbackUrl, { type: 'explore:scan_start', hostname, trigger: _trigger, agentId });
 
   try {
-    // Navigate to start URL.
-    // Tab strategy: open a new tab in the caller's already-authenticated Chrome window.
-    // This avoids navigating the auth tab (which would re-trigger Cloudflare challenges).
-    // Background scans (no callerSessionId): navigate normally in their own session.
-    if (useTabStrategy) {
-      logger.info(`[explore.agent] scan: tab-new strategy — opening scan tab for ${url} on session=${scanSessionId}`);
-      const _tabNewRes = await _browserAct({ action: 'tab-new', url, sessionId: scanSessionId, headed, timeoutMs: 30000 }, 33000).catch(() => null);
-      // Determine tab index from tab-list output embedded in result
-      if (_tabNewRes?.result) {
-        const _tabCount = ((_tabNewRes.result || '').match(/^\s*-\s+\d+:/gm) || []).length;
-        _scanTabIdx = Math.max(0, _tabCount - 1);
-      }
-      // If user was already logged in, close the original tab (tab 0) to avoid duplicate site tabs
-      if (_preAuthed && _scanTabIdx > 0) {
-        logger.info(`[explore.agent] scan: closing original tab 0 (pre-authed, avoiding duplicate tabs)`);
-        await _browserAct({ action: 'tab-close', sessionId: scanSessionId, headed, tabIndex: 0 }, 5000).catch(() => {});
-        // Adjust scan tab index since tab 0 is now gone
-        _scanTabIdx = Math.max(0, _scanTabIdx - 1);
-      }
-    } else {
-      await _browserAct({ action: 'navigate', url, sessionId: scanSessionId, headed, timeoutMs: 25000 }, 28000).catch(() => {});
-    }
-
-    await _browserAct({ action: 'waitForStableText', sessionId: scanSessionId, headed, timeoutMs: 6000 }, 8000).catch(() => {});
-
-    // Extract content extraction signals from the landing page
-    logger.info(`[explore.agent] scan: extracting content signals for ${hostname}`);
-    const contentSignals = await _extractContentSignals(scanSessionId, headed);
-    if (contentSignals?.primary_selector) {
-      logger.info(`[explore.agent] scan: detected content type="${contentSignals.content_type}" selector="${contentSignals.primary_selector}" confidence=${contentSignals.confidence}`);
-    }
-
     const existingMap = _loadDomainMap(hostname);
     // Clean old history links from existing map before merging new scan data
     const cleanedExisting = _cleanDomainMap(existingMap);
-    const newMap      = { 
+    const newMap = { 
       domain: hostname, 
       version: '2.0', 
       last_scanned: null, 
@@ -2010,21 +2064,74 @@ async function scanDomain(args) {
       _schemas: {
         interactions: INTERACTION_SCHEMAS,
         filter: DEFAULT_FILTER_CONFIG
-      },
-      ...(contentSignals?.primary_selector ? {
-        content_extraction: {
-          primary_selector: contentSignals.primary_selector,
-          fallback_selector: contentSignals.fallback_selector,
-          content_type: contentSignals.content_type,
-          confidence: contentSignals.confidence,
-          last_updated: new Date().toISOString()
-        }
-      } : {})
+      }
     };
 
-    const visitedUrls = new Set([url]);
-    const scanQueue   = [{ url, depth: 0 }];
+    // Support multiple starting URLs - each URL is treated as a separate starting point
+    const allStartUrls = urlsToScan;
+    let currentUrlIndex = 0;
+    const totalUrlsToScan = allStartUrls.length;
+    
+    // Track visited URLs across all scans
+    const visitedUrls = new Set();
+    let scanQueue = [];
     // _scanTabIdx declared above at function start (TDZ fix)
+    
+    // Track if we've opened the initial tab
+    let initialTabOpened = false;
+
+    // Loop through each starting URL
+    for (let urlIdx = 0; urlIdx < allStartUrls.length; urlIdx++) {
+      const startUrl = allStartUrls[urlIdx];
+      currentUrlIndex = urlIdx;
+      
+      // Skip if already visited
+      if (visitedUrls.has(startUrl)) continue;
+      
+      logger.info(`[explore.agent] scan: processing URL ${urlIdx + 1}/${allStartUrls.length}: ${startUrl}`);
+      _postProgress(_progressCallbackUrl, { 
+        type: 'explore:url_scan_start', 
+        url: startUrl, 
+        urlIndex: urlIdx + 1, 
+        totalUrls: allStartUrls.length,
+        hostname 
+      });
+
+      // Navigate to the URL
+      // For the first URL in learn_mode, use tab-new; for subsequent URLs, use navigate
+      if (useTabStrategy) {
+        if (!initialTabOpened) {
+          // First URL: use tab-new to open in the authenticated session
+          logger.info(`[explore.agent] scan: tab-new strategy — opening scan tab for ${startUrl} on session=${scanSessionId}`);
+          const _tabNewRes = await _browserAct({ action: 'tab-new', url: startUrl, sessionId: scanSessionId, headed, timeoutMs: 30000 }, 33000).catch(() => null);
+          if (_tabNewRes?.result) {
+            const _tabCount = ((_tabNewRes.result || '').match(/^\s*-\s+\d+:/gm) || []).length;
+            _scanTabIdx = Math.max(0, _tabCount - 1);
+          }
+          // If user was already logged in, close the original tab (tab 0) to avoid duplicate site tabs
+          if (_preAuthed && _scanTabIdx > 0) {
+            logger.info(`[explore.agent] scan: closing original tab 0 (pre-authed, avoiding duplicate tabs)`);
+            await _browserAct({ action: 'tab-close', sessionId: scanSessionId, headed, tabIndex: 0 }, 5000).catch(() => {});
+            _scanTabIdx = Math.max(0, _scanTabIdx - 1);
+          }
+          initialTabOpened = true;
+        } else {
+          // Subsequent URLs: reuse the existing blank tab (left by the previous URL's blank-out).
+          // This avoids opening yet another tab-new which can cause Chrome to show
+          // "Restore pages?" if the previous tab was closed and Chrome briefly had 0 tabs.
+          logger.info(`[explore.agent] scan: navigating existing blank tab to ${startUrl} on session=${scanSessionId}`);
+          await _browserAct({ action: 'navigate', url: startUrl, sessionId: scanSessionId, headed, timeoutMs: 25000 }, 28000).catch(() => {});
+          // _scanTabIdx stays the same — we're reusing the same tab slot
+        }
+      } else {
+        // Background scan: navigate normally
+        await _browserAct({ action: 'navigate', url: startUrl, sessionId: scanSessionId, headed, timeoutMs: 25000 }, 28000).catch(() => {});
+      }
+
+      await _browserAct({ action: 'waitForStableText', sessionId: scanSessionId, headed, timeoutMs: 6000 }, 8000).catch(() => {});
+      
+      // Add the starting URL to the scan queue for crawling
+      scanQueue = [{ url: startUrl, depth: 0 }];
 
     while (scanQueue.length > 0) {
       // Cancel checkpoint — after each page in the scan queue
@@ -2196,7 +2303,7 @@ async function scanDomain(args) {
       // Returns interaction type and metadata for all 10+ interaction types
       // ---------------------------------------------------------------------------
       function classifyInteraction(attrs) {
-        const { tag, role, type, contenteditable, draggable, hasPopup, checked, scrollHeight, clientHeight, overflowY, className, ariaLabel } = attrs;
+        const { tag, role, type, contenteditable, draggable, hasPopup, checked, scrollHeight, clientHeight, overflowY, className, ariaLabel, ariaControls, ariaExpanded } = attrs;
         
         // 1. File upload (most specific)
         if (tag === 'input' && type === 'file') {
@@ -2258,6 +2365,37 @@ async function scanDomain(args) {
           return { type: 'drag', params: ['targetSelector'], priority: 7 };
         }
         
+        // 7b. Sidebar trigger — aria-expanded + label/class/aria-controls heuristics
+        if (ariaExpanded !== null && (tag === 'button' || role === 'button') && (
+          (ariaLabel || '').match(/menu|sidebar|nav|drawer|panel/i) ||
+          (className || '').match(/sidebar|hamburger|nav.?toggle|drawer|menu.?toggle|side.?bar/i) ||
+          (ariaControls || '').match(/sidebar|nav|drawer|panel/i)
+        )) {
+          const revealType = (ariaLabel || className || ariaControls || '').match(/drawer/i) ? 'drawer' : 'sidebar';
+          return { type: 'click', params: [], priority: 7, reveals: revealType };
+        }
+
+        // 7c. Panel / accordion trigger — expand/collapse button with aria-expanded
+        if (ariaExpanded !== null && (tag === 'button' || role === 'button') && (
+          (ariaLabel || '').match(/expand|collapse|show|hide|toggle|accordion/i) ||
+          (className || '').match(/accordion|collapsible|expandable|toggle/i)
+        )) {
+          return { type: 'click', params: [], priority: 7, reveals: 'panel' };
+        }
+
+        // 7d. Sheet trigger — bottom sheet or slide-up pattern
+        if (ariaExpanded !== null && (
+          (ariaLabel || '').match(/sheet|bottom|slide/i) ||
+          (className || '').match(/sheet|bottom.?sheet|slide.?up/i)
+        )) {
+          return { type: 'click', params: [], priority: 7, reveals: 'sheet' };
+        }
+
+        // 7e. Popover trigger — click-activated dialog popup (not hover)
+        if (hasPopup === 'dialog' && (tag === 'button' || role === 'button')) {
+          return { type: 'click', params: [], priority: 7, reveals: 'popover' };
+        }
+
         // 8. Hover menus (has popup/dropdown)
         if (hasPopup === 'true' || hasPopup === 'menu' || hasPopup === 'listbox') {
           return { type: 'hover', params: [], priority: 8, reveals: 'dropdown' };
@@ -2301,6 +2439,18 @@ async function scanDomain(args) {
             steps: [
               { action: 'hover' },
               { action: 'click', target: 'revealed_item' }
+            ]
+          });
+        }
+
+        // Click → Re-scan (for sidebar/drawer/panel/popover/sheet triggers)
+        const RESCAN_REVEAL_TYPES = ['sidebar', 'drawer', 'panel', 'popover', 'sheet'];
+        if (interactionInfo.type === 'click' && RESCAN_REVEAL_TYPES.includes(interactionInfo.reveals)) {
+          sequences.push({
+            name: `open_${interactionInfo.reveals}`,
+            steps: [
+              { action: 'click' },
+              { action: 'rescan', context_type: interactionInfo.reveals }
             ]
           });
         }
@@ -2349,8 +2499,26 @@ async function scanDomain(args) {
         continue;
       }
 
+      // --- 7-day freshness check: skip states already scanned recently ---
+      const _existingState = existingMap?.states?.[stateKey];
+      if (_existingState?.last_scanned && Object.keys(_existingState.actions || {}).length > 0) {
+        const _stateAge = Date.now() - new Date(_existingState.last_scanned).getTime();
+        if (_stateAge < FRESHNESS_THRESHOLD_MS) {
+          logger.info(`[explore.agent] scan: skipping fresh state "${stateKey}" (scanned ${Math.round(_stateAge / 86400000)}d ago, ${Object.keys(_existingState.actions).length} actions preserved)`);
+          _postProgress(_progressCallbackUrl, { type: 'explore:scan_progress', hostname, state: stateKey, message: `Skipping recently-scanned state: ${stateKey}`, actionsFound: Object.keys(_existingState.actions).length, depth });
+          // Copy the existing state into newMap so it's preserved in the merge
+          newMap.states[stateKey] = { ..._existingState };
+          scanStats.statesScanned++;
+          totalActions += Object.keys(_existingState.actions).length;
+          continue;
+        }
+      }
+      // --- end freshness check ---
+
       if (!newMap.states[stateKey]) {
-        newMap.states[stateKey] = { identification, actions: {}, data: [] };
+        const _urlPattern = pageStateInfo?.url_pattern || '';
+        const _contextType = pageStateInfo?.context_type || 'page';
+        newMap.states[stateKey] = { identification, source_url: pageUrl, url_pattern: _urlPattern, context_type: _contextType, actions: {}, data: [] };
       }
 
       // Extract all interactable items from snapshot
@@ -2392,8 +2560,8 @@ async function scanDomain(args) {
       const allScanItems = [...allItems, ...inputRefs];
       let pageActions = 0;
 
-      const totalElements = Math.min(allScanItems.length, 30);
-      logger.info(`[explore.agent] scan: state="${stateKey}" — ${totalElements} elements to process (capped at 30)`);
+      const totalElements = Math.min(allScanItems.length, 50);
+      logger.info(`[explore.agent] scan: state="${stateKey}" — ${totalElements} elements to process (capped at 50)`);
       _postProgress(_progressCallbackUrl, { type: 'explore:scan_elements_start', hostname, state: stateKey, elementCount: totalElements, depth, message: `🔍 Discovering ${totalElements} interactive elements on ${stateKey}...` });
 
       // State-level counters (reset per state)
@@ -2402,7 +2570,7 @@ async function scanDomain(args) {
       let stateFiltered = 0;
       let processedCount = 0;
       
-      for (const item of allScanItems.slice(0, 30)) {
+      for (const item of allScanItems.slice(0, 50)) {
         // Cancel checkpoint — during element extraction loop (every 5 elements)
         if (processedCount > 0 && processedCount % 5 === 0 && _scanCancelFlag) {
           logger.info(`[explore.agent] scanDomain cancelled by user during element extraction (${processedCount}/${totalElements})`);
@@ -2529,8 +2697,9 @@ async function scanDomain(args) {
         });
 
         // Visual highlight — pulses the element in the headed browser so the user
-        // can see what the agent is studying in real time. No-op when headless.
-        await _highlightElement(item.ref, item.label, scanSessionId, headed);
+        // can see what the agent is studying in real time. Uses the caller's visible
+        // session (callerSessionId) when launched from learn mode; no-op otherwise.
+        await _highlightElement(item.ref, item.label, callerSessionId || scanSessionId, !!callerHeaded);
 
         // Skip unknown interactions
         if (interaction === 'unknown') {
@@ -2654,10 +2823,178 @@ async function scanDomain(args) {
         totalActions++;
       }
       
+      // Stamp last_scanned on the state so freshness checks work on next run
+      if (newMap.states[stateKey]) {
+        newMap.states[stateKey].last_scanned = new Date().toISOString();
+      }
+
       scanStats.statesScanned++;
-      logger.info(`[explore.agent] scan: state="${stateKey}" — ${stateSuccess} succeeded, ${stateFail} failed, ${stateFiltered} filtered (history) out of ${Math.min(allScanItems.length, 30)} attempted`);
+      logger.info(`[explore.agent] scan: state="${stateKey}" — ${stateSuccess} succeeded, ${stateFail} failed, ${stateFiltered} filtered (history) out of ${Math.min(allScanItems.length, 50)} attempted`);
 
       _postProgress(_progressCallbackUrl, { type: 'explore:scan_progress', hostname, state: stateKey, actionsFound: pageActions, depth });
+
+      // ---------------------------------------------------------------------------
+      // Reveal Loop — open hidden surfaces (sidebar/drawer/panel/popover/sheet)
+      // and re-scan their contents as new states in the domain map.
+      // Playwright snapshots only show currently visible elements, so closed
+      // sidebars/drawers/panels produce zero skills until explicitly opened.
+      // ---------------------------------------------------------------------------
+      const REVEAL_ACTIONS_CAP = 5;
+      const RESCAN_REVEAL_TYPES = new Set(['sidebar', 'drawer', 'panel', 'popover', 'sheet', 'modal']);
+      const revealCandidates = Object.entries(newMap.states[stateKey]?.actions || {})
+        .filter(([, a]) => a._reveals && RESCAN_REVEAL_TYPES.has(a._reveals))
+        .slice(0, REVEAL_ACTIONS_CAP);
+
+      for (const [revealActionKey, revealAction] of revealCandidates) {
+        // Skip if we've already scanned a state for this reveal type on this page
+        const alreadyScanned = Object.values(newMap.states).some(
+          s => s.context_type === revealAction._reveals && s.source_url === pageUrl
+        );
+        if (alreadyScanned) {
+          logger.info(`[explore.agent] reveal-loop: skipping ${revealAction._reveals} — already scanned for ${pageUrl}`);
+          continue;
+        }
+
+        logger.info(`[explore.agent] reveal-loop: opening ${revealAction._reveals} via action "${revealActionKey}"`);
+        _postProgress(_progressCallbackUrl, {
+          type: 'explore:reveal_start',
+          hostname,
+          state: stateKey,
+          revealType: revealAction._reveals,
+          triggerAction: revealActionKey,
+          message: `🔍 Opening ${revealAction._reveals} to scan hidden elements...`
+        });
+
+        try {
+          // Resolve the trigger locator and click to open the hidden surface
+          const revealLocators = revealAction.locators || {};
+          const revealSelectors = [revealLocators.primary, revealLocators.fallback_1, revealLocators.fallback_2].filter(Boolean);
+          let revealOpened = false;
+
+          for (const sel of revealSelectors) {
+            const clickRes = await _browserAct({
+              action: 'click',
+              selector: sel,
+              sessionId: scanSessionId,
+              headed,
+              timeoutMs: 5000
+            }, 7000).catch(() => null);
+            if (clickRes?.ok) { revealOpened = true; break; }
+          }
+
+          if (!revealOpened) {
+            logger.warn(`[explore.agent] reveal-loop: could not open ${revealAction._reveals} for action "${revealActionKey}" — skipping`);
+            continue;
+          }
+
+          // Wait for DOM to settle after reveal
+          await _browserAct({ action: 'waitForStableText', sessionId: scanSessionId, headed, timeoutMs: 3000 }, 5000).catch(() => {});
+
+          // Re-snapshot to capture the newly revealed elements
+          const revealSnapRes = await _browserAct({ action: 'snapshot', sessionId: scanSessionId, headed, timeoutMs: 8000 }, 10000).catch(() => null);
+          const revealSnapshot = revealSnapRes?.ok && revealSnapRes.result ? revealSnapRes.result : '';
+
+          if (revealSnapshot) {
+            // Identify the new state produced by the reveal
+            const revealStateInfo = await _identifyPageState(revealSnapshot, pageUrl);
+            const revealStateKey = revealStateInfo?.state_key || `${revealAction._reveals}_from_${stateKey}`;
+            const revealIdentification = revealStateInfo?.identification || `${revealAction._reveals} opened from ${stateKey}`;
+
+            if (!newMap.states[revealStateKey]) {
+              newMap.states[revealStateKey] = {
+                identification: revealIdentification,
+                source_url: pageUrl,
+                url_pattern: '',
+                context_type: revealAction._reveals,
+                triggered_by: { state: stateKey, action: revealActionKey },
+                actions: {},
+                data: []
+              };
+              logger.info(`[explore.agent] reveal-loop: new state "${revealStateKey}" (${revealAction._reveals}) — extracting elements`);
+
+              // Extract elements from the revealed surface
+              const revealItems = _extractNavItems(revealSnapshot);
+              const revealInputRefs = [];
+              // (quick input extraction from reveal snapshot)
+              for (const line of revealSnapshot.split('\n')) {
+                const inputMatch = line.match(/\[ref=(e\d+)\].*?(textbox|searchbox|combobox|spinbutton|input)/i) ||
+                                   line.match(/- \[(e\d+)\]\s+(textbox|searchbox|combobox|spinbutton)/i);
+                if (inputMatch) {
+                  revealInputRefs.push({ ref: inputMatch[1], label: inputMatch[2], role: inputMatch[2].toLowerCase() });
+                }
+              }
+              const revealScanItems = [...revealItems, ...revealInputRefs].slice(0, 20);
+
+              for (const revealItem of revealScanItems) {
+                try {
+                  const revealSelectorProfile = await _extractStableSelectors(
+                    revealItem.ref, scanSessionId, headed, revealItem.label, 'click'
+                  );
+                  if (!revealSelectorProfile || revealSelectorProfile.error) continue;
+
+                  const revealAttrs = revealSelectorProfile._attrs || {};
+                  const revealInteractionInfo = classifyInteraction(revealAttrs);
+                  const revealActionKeyInner = generateSkillName(revealItem.label, revealInteractionInfo.type);
+                  if (!revealActionKeyInner || revealActionKeyInner === 'unknown_element') continue;
+
+                  newMap.states[revealStateKey].actions[revealActionKeyInner] = {
+                    skill_name: revealActionKeyInner,
+                    interaction: revealInteractionInfo.type,
+                    locators: revealSelectorProfile.locators,
+                    success_criteria: INTERACTION_SCHEMAS[revealInteractionInfo.type]?.successCriteria || {},
+                    verified: false,
+                    last_verified: null,
+                    failure_count: 0,
+                    accepts_params: revealInteractionInfo.params || [],
+                    param_mapping: null,
+                    examples: null,
+                    follow_up_actions: null,
+                    multi_step_sequences: null,
+                    param_defaults: revealInteractionInfo.defaults || null,
+                    goal_relevance: 0,
+                    goal_matched: null,
+                    _options: revealInteractionInfo.options || null,
+                    _priority: revealInteractionInfo.priority || 9,
+                    _reveals: revealInteractionInfo.reveals || null,
+                  };
+                  totalActions++;
+                } catch (revealItemErr) {
+                  logger.warn(`[explore.agent] reveal-loop: error processing item ${revealItem.ref}: ${revealItemErr.message}`);
+                }
+              }
+
+              _postProgress(_progressCallbackUrl, {
+                type: 'explore:reveal_complete',
+                hostname,
+                revealState: revealStateKey,
+                revealType: revealAction._reveals,
+                actionsFound: Object.keys(newMap.states[revealStateKey].actions).length,
+                message: `✅ ${revealAction._reveals} scanned: ${Object.keys(newMap.states[revealStateKey].actions).length} elements discovered`
+              });
+            }
+          }
+
+          // Close the revealed surface by clicking the trigger again (toggle) or pressing Escape
+          const escRes = await _browserAct({ action: 'press', key: 'Escape', sessionId: scanSessionId, headed, timeoutMs: 3000 }, 5000).catch(() => null);
+          if (!escRes?.ok) {
+            // Try clicking the trigger again to toggle closed
+            for (const sel of revealSelectors) {
+              const closeRes = await _browserAct({ action: 'click', selector: sel, sessionId: scanSessionId, headed, timeoutMs: 3000 }, 5000).catch(() => null);
+              if (closeRes?.ok) break;
+            }
+          }
+          // Brief wait for close animation
+          await _browserAct({ action: 'waitForStableText', sessionId: scanSessionId, headed, timeoutMs: 2000 }, 4000).catch(() => {});
+
+        } catch (revealErr) {
+          logger.warn(`[explore.agent] reveal-loop: error handling ${revealAction._reveals} for "${revealActionKey}": ${revealErr.message}`);
+          // Non-fatal: press Escape to attempt recovery, then continue
+          await _browserAct({ action: 'press', key: 'Escape', sessionId: scanSessionId, headed, timeoutMs: 2000 }, 4000).catch(() => {});
+        }
+      }
+      // ---------------------------------------------------------------------------
+      // End Reveal Loop
+      // ---------------------------------------------------------------------------
 
       // Close tab when done with this page (tab strategy only, depth>0 tabs)
       if (useTabStrategy && depth > 0 && _scanTabIdx >= 0) {
@@ -2682,7 +3019,27 @@ async function scanDomain(args) {
           }
         }
       }
+    } // End while (scanQueue.length > 0)
+
+    // Navigate the depth-0 scan tab to about:blank after finishing this URL.
+    // We intentionally do NOT close it — closing the last tab causes Chrome to treat
+    // the session as crashed and show "Restore pages?" on the next open.
+    // The blank tab is reused (navigated into) by subsequent URLs in this scan.
+    if (useTabStrategy && _scanTabIdx >= 0) {
+      logger.info(`[explore.agent] scan: blanking depth-0 scan tab ${_scanTabIdx} after completing URL ${startUrl}`);
+      await _browserAct({ action: 'navigate', url: 'about:blank', sessionId: scanSessionId, headed, timeoutMs: 5000 }, 7000).catch(() => {});
     }
+
+    // Post-progress for URL completion
+    _postProgress(_progressCallbackUrl, { 
+      type: 'explore:url_scan_complete', 
+      url: startUrl,
+      urlIndex: currentUrlIndex + 1, 
+      totalUrls: totalUrlsToScan,
+      hostname 
+    });
+    
+    } // End for loop through URLs
 
     // Merge with cleaned existing map and save
     const mergedMap = _mergeDomainMap(cleanedExisting, newMap);
@@ -2738,12 +3095,27 @@ async function scanDomain(args) {
         try {
           const skill = generateSkillFromAction(hostname, stateKey, actionKey);
           if (skill && !skill.error) {
+            // Skip if the skill file already exists — 7-day freshness guards re-scanning,
+            // so we never need to overwrite a skill that was generated in a prior scan.
+            const _existingSkillPath = path.join(SKILLS_DIR, skill.name, 'index.cjs');
+            if (fs.existsSync(_existingSkillPath)) {
+              logger.info(`[explore.agent] Skipping existing skill: ${skill.name}`);
+              continue;
+            }
             // Save skill with metadata for cache management
+            const _stateEntry = newMap.states[stateKey] || {};
+            const _actionEntry = _stateEntry.actions?.[actionKey] || {};
             const skillWithMeta = {
               ...skill,
               _meta: {
+                agent_id: agentId,
                 source_domain: hostname,
                 source_action: actionKey,
+                source_state_key: stateKey,
+                source_url: _stateEntry.source_url || null,
+                url_pattern: _stateEntry.url_pattern || null,
+                context_type: _stateEntry.context_type || 'page',
+                reveals: _actionEntry._reveals || null,
                 created_at: new Date().toISOString(),
                 goal_tied: true,  // All scanned skills are goal-tied initially
                 use_count: 0,
@@ -2786,6 +3158,7 @@ async function scanDomain(args) {
           const skillWithMeta = {
             ...navigateSkill,
             _meta: {
+              agent_id: agentId,
               source_domain: hostname,
               source_action: 'navigate_history',
               created_at: _navHistoryTs,
@@ -3311,8 +3684,13 @@ function generateSkillFromAction(hostname, stateKey, actionKey, customParams = {
   // Extract follow-up action (e.g. press Enter after fill for search inputs)
   const followUp = (follow_up_actions || []).find(a => a.action === 'press') || null;
   
-  // Build skill name
-  const skillName = customParams.name || `${hostname.replace(/\./g, '_')}_${skill_name}`;
+  // Build skill name — include a stateKey prefix to avoid collisions when multiple
+  // states share the same action key (e.g. both "settings_general" and "settings_fwd"
+  // have a "settings" action → without disambiguation they'd both write the same file).
+  const _hostPart = hostname.replace(/\./g, '_');
+  const _statePrefix = stateKey.replace(/[^a-z0-9]+/gi, '_').slice(0, 24).replace(/_+$/, '');
+  const _defaultName = `${_hostPart}_${_statePrefix}_${skill_name}`;
+  const skillName = customParams.name || _defaultName;
   const displayName = customParams.displayName || skill_name.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase());
   
   // Build parameter definitions
@@ -3345,7 +3723,7 @@ function generateSkillFromAction(hostname, stateKey, actionKey, customParams = {
       skillCode = _generateFillSkill(skillName, locators, paramDefs, interaction, followUp);
       break;
     case 'click':
-      skillCode = _generateClickSkill(skillName, locators);
+      skillCode = _generateClickSkill(skillName, locators, action);
       break;
     case 'select':
       skillCode = _generateSelectSkill(skillName, locators, paramDefs);
@@ -3561,7 +3939,7 @@ module.exports = {
 };`;
 }
 
-function _generateClickSkill(name, locators) {
+function _generateClickSkill(name, locators, _meta = {}) {
   const primary = locators.primary || '';
   const fallback1 = locators.fallback_1 || '';
   const fallback2 = locators.fallback_2 || '';
@@ -4087,6 +4465,10 @@ module.exports = {
   enqueueScan: _enqueueScan,
   generateSkillFromAction,
   generateCompositeAgentSkill,
+  registerSkill: _registerSkill,
+  generateSkillCode: _generateSkillCode,
+  SKILLS_DIR,
+  BROWSER_ACT_PATH,
   // Export schemas for external reference
   INTERACTION_SCHEMAS,
 };
