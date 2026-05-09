@@ -567,7 +567,10 @@ module.exports = {
   getDebuggingContext,
   captureDebugContext,
   stopSessionTracing,
-  debuggingSessions: debuggingSessions
+  debuggingSessions: debuggingSessions,
+  killExistingChromeForProfile,
+  clearProfileLock,
+  findCli,
 };
 
 // ---------------------------------------------------------------------------

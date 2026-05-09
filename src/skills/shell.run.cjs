@@ -466,6 +466,7 @@ function _resolveOutputPath(rawPath, cwd) {
   if (!rawPath || rawPath === '-' || rawPath === '/dev/null') return null;
   let candidate = String(rawPath).trim().replace(/^['"]|['"]$/g, '');
   if (!candidate || candidate.startsWith('-')) return null;
+  if (candidate.includes('$')) return null;  // Shell variable — can't verify statically
   if (candidate.startsWith('~/')) {
     candidate = path.join(os.homedir(), candidate.slice(2));
   }
@@ -548,7 +549,19 @@ function _applyStrictShellMode(baseName, argv = []) {
   }
 
   const script = argv[1];
+
+  // Already has explicit set -e — respect the script author's intent
   if (/^\s*set\s+-e/m.test(script)) {
+    return { argv, strictModeInjected: false };
+  }
+
+  // Skip strict mode for loop constructs (for/while/until).
+  // Loop bodies routinely invoke commands that return non-zero for expected,
+  // non-error conditions: xattr -d on a file without that attribute, grep with
+  // no match, diff on differing files, etc.  set -e would abort the entire loop
+  // on the first benign failure, defeating the purpose of the loop.
+  // Linear scripts (curl, mv, cp && rm, pipelines) retain full strict mode protection.
+  if (/^\s*(for|while|until)\b/m.test(script)) {
     return { argv, strictModeInjected: false };
   }
 

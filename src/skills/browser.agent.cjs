@@ -124,6 +124,7 @@ function detectServiceUnavailable(text) {
 const { userAgent } = require('./user.agent.cjs');
 
 const { resolveDestination, recordCorrection, classifyTaskIntent } = require('../skill-helpers/destination-resolver.cjs');
+const { killExistingChromeForProfile, clearProfileLock, findCli } = require('./browser.act.cjs');
 
 const AGENTS_DB_PATH = path.join(os.homedir(), '.thinkdrop', 'agents.db');
 const AGENTS_DIR     = path.join(os.homedir(), '.thinkdrop', 'agents');
@@ -451,6 +452,28 @@ const KNOWN_BROWSER_SERVICES = {
   autel:          { startUrl: 'https://passport.autelrobotics.com',              signInUrl: 'https://passport.autelrobotics.com',                authSuccessPattern: 'autelrobotics.com/',           isOAuth: true  },
   airmap:         { startUrl: 'https://app.airmap.com',                          signInUrl: 'https://app.airmap.com/login',                      authSuccessPattern: 'app.airmap.com/',              isOAuth: true  },
   dronelogbook:   { startUrl: 'https://dronelogbook.com',                        signInUrl: 'https://dronelogbook.com/login',                    authSuccessPattern: 'dronelogbook.com/',            isOAuth: true  },
+  // ── Public reference / search / e-commerce (no auth required) ─────────────────────────────────────
+  stackoverflow:  { startUrl: 'https://stackoverflow.com',                      authSuccessPattern: 'stackoverflow.com',            isOAuth: false },
+  stackexchange:  { startUrl: 'https://stackexchange.com',                      authSuccessPattern: 'stackexchange.com',            isOAuth: false },
+  wikipedia:      { startUrl: 'https://en.wikipedia.org',                       authSuccessPattern: 'wikipedia.org',                isOAuth: false },
+  amazon:         { startUrl: 'https://www.amazon.com',                         authSuccessPattern: 'amazon.com',                   isOAuth: false },
+  ebay:           { startUrl: 'https://www.ebay.com',                           authSuccessPattern: 'ebay.com',                     isOAuth: false },
+  imdb:           { startUrl: 'https://www.imdb.com',                           authSuccessPattern: 'imdb.com',                     isOAuth: false },
+  yelp:           { startUrl: 'https://www.yelp.com',                           authSuccessPattern: 'yelp.com',                     isOAuth: false },
+  tripadvisor:    { startUrl: 'https://www.tripadvisor.com',                    authSuccessPattern: 'tripadvisor.com',              isOAuth: false },
+  biblegateway:   { startUrl: 'https://www.biblegateway.com',                   authSuccessPattern: 'biblegateway.com',             isOAuth: false },
+  duckduckgo:     { startUrl: 'https://duckduckgo.com',                         authSuccessPattern: 'duckduckgo.com',               isOAuth: false },
+  bing:           { startUrl: 'https://www.bing.com',                           authSuccessPattern: 'bing.com',                     isOAuth: false },
+  medium:         { startUrl: 'https://medium.com',                             authSuccessPattern: 'medium.com',                   isOAuth: false },
+  quora:          { startUrl: 'https://www.quora.com',                          authSuccessPattern: 'quora.com',                    isOAuth: false },
+  hackernews:     { startUrl: 'https://news.ycombinator.com',                   authSuccessPattern: 'news.ycombinator.com',         isOAuth: false },
+  arxiv:          { startUrl: 'https://arxiv.org',                              authSuccessPattern: 'arxiv.org',                    isOAuth: false },
+  npm:            { startUrl: 'https://www.npmjs.com',                          authSuccessPattern: 'npmjs.com',                    isOAuth: false },
+  pypi:           { startUrl: 'https://pypi.org',                               authSuccessPattern: 'pypi.org',                     isOAuth: false },
+  craigslist:     { startUrl: 'https://www.craigslist.org',                     authSuccessPattern: 'craigslist.org',               isOAuth: false },
+  zillow:         { startUrl: 'https://www.zillow.com',                         authSuccessPattern: 'zillow.com',                   isOAuth: false },
+  weather:        { startUrl: 'https://weather.com',                            authSuccessPattern: 'weather.com',                  isOAuth: false },
+  googlemaps:     { startUrl: 'https://www.google.com/maps',                    authSuccessPattern: 'google.com/maps',              isOAuth: false },
 };
 
 function lookupBrowserService(service) {
@@ -2292,15 +2315,63 @@ async function actionRun({ agentId, task, url, context, requiresAuth, _progressC
       }
     }
 
+    // ── Close any existing playwright-cli daemon for this session ──────────
+    try {
+      const { spawnSync } = require('child_process');
+      const _closeRes = spawnSync(findCli(), ['-s=' + sessionId, 'close'], { timeout: 5000, encoding: 'utf8' });
+      if (_closeRes.status === 0) logger.info(`[browser.agent] closed existing playwright-cli daemon for session=${sessionId}`);
+    } catch (_) {}
+
+    // ── Kill existing Chrome for this profile — prevents .sock EINVAL ──────
+    try {
+      const _killed = killExistingChromeForProfile(sessionId);
+      if (_killed) logger.info(`[browser.agent] killed existing Chrome for session=${sessionId}`);
+    } catch (_killErr) {
+      logger.warn(`[browser.agent] killExistingChromeForProfile error (non-fatal): ${_killErr.message}`);
+    }
+
+    // ── Stale .sock cleanup — prevents EINVAL on first navigate ──────────
+    try {
+      const _sockDir = path.join(os.tmpdir(), 'playwright-cli');
+      if (fs.existsSync(_sockDir)) {
+        const _sockFiles = fs.readdirSync(_sockDir, { recursive: true }).filter(f => String(f).endsWith('.sock') && String(f).includes(sessionId));
+        for (const sf of _sockFiles) {
+          try { fs.unlinkSync(path.join(_sockDir, String(sf))); logger.info(`[browser.agent] cleaned stale .sock: ${sf}`); } catch (_) {}
+        }
+      }
+    } catch (_) {}
+
+    // ── Helper: detect Chrome session conflict errors ─────────────────────
+    const _isChromeSessionConflict = (result) => {
+      const errStr = String(result?.error || result?.stderr || result?.stdout || '');
+      return /Opening in existing browser session/i.test(errStr) ||
+             /Failed to launch the browser process/i.test(errStr) ||
+             /EINVAL.*\.sock/i.test(errStr);
+    };
+
     if (!_skipNavigate) try {
       logger.info(`[browser.agent] run: playwright auth-check — navigating to ${startUrl} for ${agentId}`);
       const _probeNav = await callBrowserAct({ action: 'navigate', sessionId, url: startUrl, timeoutMs: 30000 }, 35000);
+
+      // ── Chrome session conflict detection — fail fast ──────────────────
+      if (_isChromeSessionConflict(_probeNav)) {
+        logger.error(`[browser.agent] run: Chrome session conflict detected for ${agentId} — aborting (no retry)`);
+        return { ok: false, agentId, task, error: 'Browser session conflict: Chrome is already running with this profile. Close existing Chrome windows for this agent or restart the app.' };
+      }
+
       if (_probeNav?.ok !== false) {
         const _hrefRes = await callBrowserAct({ action: 'evaluate', text: 'window.location.href', sessionId, timeoutMs: 5000 }, 8000).catch((err) => {
           logger.error(`[browser.agent] auth-check eval failed (fresh check): ${err.message}`);
           return { ok: false, error: err.message };
         });
-        const _curHref = _hrefRes?.ok === false ? '' : String(_hrefRes?.result ?? _hrefRes?.stdout ?? '').trim();
+
+        // ── Session health check: if eval also fails, browser is not running ──
+        if (_hrefRes?.ok === false || _isChromeSessionConflict(_hrefRes)) {
+          logger.error(`[browser.agent] run: browser session not alive after navigate for ${agentId} — aborting`);
+          return { ok: false, agentId, task, error: 'Browser failed to start: navigate succeeded but session is not responding. Close existing Chrome windows and retry.' };
+        }
+
+        const _curHref = String(_hrefRes?.result ?? _hrefRes?.stdout ?? '').trim();
         const _onLoginPage = _isSigninWall(_curHref);
         // Also detect domain mismatch — e.g. redirect to workspace.google.com instead of mail.google.com
         let _wrongDomain = false;
@@ -2319,6 +2390,11 @@ async function actionRun({ agentId, task, url, context, requiresAuth, _progressC
         }
       }
     } catch (_probeErr) {
+      // Check if the thrown error is a Chrome conflict — fail fast instead of falling to waitForAuth
+      if (/Opening in existing browser session/i.test(_probeErr.message) || /Failed to launch/i.test(_probeErr.message)) {
+        logger.error(`[browser.agent] run: Chrome session conflict (thrown) for ${agentId} — aborting`);
+        return { ok: false, agentId, task, error: 'Browser session conflict: Chrome is already running with this profile. Close existing Chrome windows for this agent or restart the app.' };
+      }
       logger.warn(`[browser.agent] run: auth-check probe failed — falling back to waitForAuth: ${_probeErr.message}`);
       _authNeeded = true;
     }
