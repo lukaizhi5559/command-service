@@ -571,6 +571,7 @@ module.exports = {
   killExistingChromeForProfile,
   clearProfileLock,
   findCli,
+  shortSessionId,
 };
 
 // ---------------------------------------------------------------------------
@@ -919,13 +920,27 @@ function shouldUsePersistentProfile(sessionId) {
   return !ephemeral.some(k => sessionId.includes(k));
 }
 
+// macOS limits Unix domain socket paths to 104 bytes (sun_path). The playwright-cli
+// daemon socket lives at: <tmpdir>/playwright-cli/<hash>/<sessionId>.sock
+// With a typical macOS tmpdir the prefix is ~81 chars, leaving ~18 chars for the
+// session name + ".sock" (5 chars) = max 13 chars for the session name.
+// Longer names cause EINVAL on Node 25+. We hash them to fit.
+const _sidCache = new Map(); // shortId → original sessionId (for logging)
+function shortSessionId(sessionId) {
+  if (sessionId.length <= 12) return sessionId;
+  const crypto = require('crypto');
+  const short = crypto.createHash('md5').update(sessionId).digest('hex').slice(0, 12);
+  _sidCache.set(short, sessionId);
+  return short;
+}
+
 // Build base flags for a session (with skills-based persistent profiles)
 // Each agent session gets its OWN profile directory under ~/.thinkdrop/browser-profiles/
 // so cookies/localStorage survive restarts without any cross-contamination between
 // agents. Fixes the "Chrome didn't shut down correctly" Restore-pages banner that
 // appears when multiple sessions fight over a single shared persistent profile.
 function sessionFlags(sessionId, headed = true) {
-  const flags = [`-s=${sessionId}`];
+  const flags = [`-s=${shortSessionId(sessionId)}`];
   if (headed) flags.push('--headed');
 
   if (shouldUsePersistentProfile(sessionId)) {
@@ -1634,6 +1649,15 @@ async function browserAct(args) {
     case 'navigate':
     case 'goto': {
       if (!url) return { ok: false, action, sessionId, error: 'url required for navigate', executionTime: 0 };
+      // Guard: detect unresolved template variables (e.g., {{prev_stdout.besturl}})
+      if (/\{\{[a-zA-Z_0-9.]+\}\}/.test(url)) {
+        const unresolvedToken = (url.match(/\{\{[a-zA-Z_0-9.]+\}\}/) || [])[0];
+        logger.error(`[browser.act] navigate: unresolved template variable ${unresolvedToken} in URL: ${url}`);
+        return { ok: false, action, sessionId, error: `Unresolved template variable ${unresolvedToken} in URL. Use {{bestUrl}} for web.agent results, not {{prev_stdout.property}}.` };
+      }
+      // Sanitize: extract bare URL in case caller passes "Best URL: https://... — title" formatted text
+      const _m = /https?:\/\/[^\s"'\`>\),]+/.exec(url);
+      const sanitizedUrl = _m ? _m[0] : url;
       // Use 'open' to cold-start the daemon + navigate in one shot.
       // Use 'goto' if daemon is already running — avoids spawning a new blank Chrome tab.
       // After app restart openSessions is cleared, so probe the daemon directly with isDaemonAlive().
@@ -1660,7 +1684,7 @@ async function browserAct(args) {
       lastFilledTarget.delete(sessionId);
       // Before cold-starting, remove any stale SingletonLock from a previous crash
       if (!alreadyOpen) clearProfileLock(sessionId);
-      const res = await cliRun([...S, navCmd, url], navTimeout);
+      const res = await cliRun([...S, navCmd, sanitizedUrl], navTimeout);
       if (res.ok) {
         openSessions.add(sessionId);
         // For cold-starts: Chrome may show a "Restore pages?" crash-recovery dialog.
@@ -1671,8 +1695,8 @@ async function browserAct(args) {
           const probeText = (probeSnap?.stdout || '').toLowerCase();
           const RESTORE_DIALOG = /restore pages\?|chrome didn't shut down correctly|help make google chrome better/i;
           if (RESTORE_DIALOG.test(probeText)) {
-            logger.info(`[browser.act] cold-start: Chrome restore dialog detected — sending goto ${url} to dismiss`);
-            await cliRun([...S, 'goto', url], navTimeout).catch(() => {});
+            logger.info(`[browser.act] cold-start: Chrome restore dialog detected — sending goto ${sanitizedUrl} to dismiss`);
+            await cliRun([...S, 'goto', sanitizedUrl], navTimeout).catch(() => {});
           }
         }
 
@@ -2549,6 +2573,41 @@ async function browserAct(args) {
       };
     }
 
+    // ── getPageLinks ──────────────────────────────────────────────────────────
+    case 'getPageLinks': {
+      // Extract all visible links with their text and href
+      const evalExpr = `(function(){
+        return JSON.stringify(Array.from(document.querySelectorAll('a[href]')).map(a => ({
+          text: (a.innerText || a.textContent || '').trim().replace(/\\s+/g, ' ').substring(0, 200),
+          href: a.href,
+          title: (a.title || '').trim()
+        })).filter(l => l.href && !l.href.startsWith('javascript:') && !l.href.startsWith('javascript:void')));
+      })()`;
+      const res = await cliRun([...S, 'eval', evalExpr], Math.min(timeoutMs, 20000));
+      const rawOut = (res.stdout || '').trim();
+      const resultMatch = rawOut.match(/###\s*Result\s*\n([\s\S]*?)(?=###|$)/i);
+      const jsonStr = resultMatch
+        ? resultMatch[1].trim().replace(/^["']|["']$/g, '')
+        : rawOut;
+
+      let links = [];
+      try {
+        links = JSON.parse(jsonStr);
+      } catch (e) {
+        // Return empty array on parse failure
+      }
+
+      return {
+        ok:            res.ok || links.length > 0,
+        action,
+        sessionId,
+        links:         Array.isArray(links) ? links : [],
+        stdout:        jsonStr,
+        executionTime: Date.now() - start,
+        error:         res.ok ? undefined : res.error,
+      };
+    }
+
     // ── evaluate ─────────────────────────────────────────────────────────────
     case 'evaluate': {
       const expr = text || selector || args.expression || '';
@@ -2774,6 +2833,7 @@ async function browserAct(args) {
         // each iteration to avoid overshooting. Stop if <10s remain to leave buffer.
         const effectiveTimeout = Math.min(timeoutMs, 30000);
         let prev = '';
+        let nearStableCount = 0; // Require 2 consecutive near-stable polls before early-exit
         const loopStart = Date.now();
         const deadline = loopStart + effectiveTimeout;
         while (Date.now() < deadline) {
@@ -2844,18 +2904,26 @@ async function browserAct(args) {
           // Early-exit: if content is substantial and barely changed since last poll,
           // treat as "stable enough". Pages like YouTube search keep micro-updating
           // (ad slots, counters) so perfect equality never happens within the window.
-          if (prev && cur && cur.length > 1000) {
+          // REQUIRE 2 consecutive near-stable polls to prevent false positives on skeleton pages
+          // that appear stable before hydration completes.
+          if (prev && cur && cur.length > 3000) {
             const longer = Math.max(prev.length, cur.length);
             const changeRatio = Math.abs(cur.length - prev.length) / longer;
             if (changeRatio < 0.05) {
-              logger.info(`[browser.act] waitForStableText: near-stable (${(changeRatio * 100).toFixed(1)}% change) — returning early`);
-              return { ok: true, action, sessionId, result: cur, executionTime: Date.now() - start };
+              nearStableCount++;
+              if (nearStableCount >= 2) {
+                logger.info(`[browser.act] waitForStableText: near-stable x2 (${(changeRatio * 100).toFixed(1)}% change, ${cur.length} chars) — returning early`);
+                return { ok: true, action, sessionId, result: cur, executionTime: Date.now() - start };
+              }
+              logger.debug(`[browser.act] waitForStableText: near-stable (${(changeRatio * 100).toFixed(1)}% change) — count ${nearStableCount}/2`);
+            } else {
+              nearStableCount = 0; // Reset counter if content changed significantly
             }
             // Streaming-growth exit: AI answer pages (Grok, Perplexity, ChatGPT) keep growing
             // continuously — content never stabilizes. If we've been polling >15s and have
             // substantial content, accept what we have rather than waiting for the full timeout.
             const elapsed = Date.now() - loopStart;
-            if (elapsed > 15000 && cur.length > 2000) {
+            if (elapsed > 15000 && cur.length > 1500) {
               logger.info(`[browser.act] waitForStableText: streaming page, ${elapsed}ms elapsed with ${cur.length} chars — accepting`);
               return { ok: true, action, sessionId, result: cur, executionTime: Date.now() - start };
             }
@@ -2863,15 +2931,16 @@ async function browserAct(args) {
           prev = cur;
           await new Promise(r2 => setTimeout(r2, 800));
         }
-        // Timeout — page never stabilized (e.g. YouTube infinite scroll, live feeds).
-        // Return whatever we last captured so the user gets real content instead of nothing.
-        let finalText = prev;
-        if (!finalText) {
-          const lastRes = await cliRun([...S, 'eval', 'document.body.innerText.slice(0,25000)'], 6000);
-          const lastRaw = (lastRes.stdout || '').trim();
-          const lastMatch = lastRaw.match(/###\s*Result\s*\n([\s\S]*?)(?=###|$)/i);
-          finalText = lastMatch ? lastMatch[1].trim().replace(/^"|"$/g, '') : lastRaw;
-        }
+        // Timeout — page never stabilized (e.g. hydration-delayed pages, infinite scroll, live feeds).
+        // Always do a final fetch here — prev may contain stale skeleton content from early polls.
+        // The final fetch captures whatever is actually on the page now, even if it never "stabilized".
+        logger.info(`[browser.act] waitForStableText: timeout after ${Date.now() - start}ms — doing final content fetch`);
+        const lastRes = await cliRun([...S, 'eval', 'document.body.innerText.slice(0,25000)'], 6000);
+        const lastRaw = (lastRes.stdout || '').trim();
+        const lastMatch = lastRaw.match(/###\s*Result\s*\n([\s\S]*?)(?=###|$)/i);
+        const finalText = lastMatch ? lastMatch[1].trim().replace(/^"|"$/g, '') : lastRaw;
+        const wordCount = finalText.trim().split(/\s+/).filter(Boolean).length;
+        logger.info(`[browser.act] waitForStableText: final fetch returned ${finalText.length} chars, ${wordCount} words`);
         return { ok: true, action, sessionId, result: finalText, executionTime: Date.now() - start };
       }
     }

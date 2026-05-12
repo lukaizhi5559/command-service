@@ -2,7 +2,7 @@
  * Command Service MCP Server
  *
  * Actuation-only MCP service. Owns all "can touch the machine" skills:
- *   - command.automate  → skill router (shell.run, browser.act, image.analyze, fs.read, file.watch, file.bridge, screen.capture, external.skill, cli.agent, browser.agent, creator.agent, reviewer.agent)
+ *   - command.automate  → skill router (shell.run, browser.act, image.analyze, fs.read, file.watch, file.bridge, screen.capture, external.skill, cli.agent, browser.agent, web.agent, video.agent, creator.agent, reviewer.agent)
  *   - health            → service health check
  *
  * Perception, planning, memory, and intent resolution live in other services.
@@ -40,6 +40,8 @@ const reviewerAgent = require('./skills/reviewer.agent.cjs');
 const skillCreator = require('./skills/skillCreator.skill.cjs');
 const { screenCapture } = require('./skills/screen.capture.cjs');
 const { userAgent } = require('./skills/user.agent.cjs');
+const webAgent   = require('./skills/web.agent.cjs');
+const videoAgent = require('./skills/video.agent.cjs');
 const skillScheduler = require('./skill-helpers/skill-scheduler.cjs');
 const { startIdleWatcher, stopIdleWatcher, startScanScheduler, runMaintenanceScan, cancelMaintenanceScan, getScanStatus } = require('./skills/explore.agent.cjs');
 
@@ -131,6 +133,12 @@ class CommandServiceMCPServer {
       case 'user.agent':
         return await this._skillUserAgent(args);
 
+      case 'web.agent':
+        return await this._skillWebAgent(args);
+
+      case 'video.agent':
+        return await this._skillVideoAgent(args);
+
       default:
         return {
           success: false,
@@ -153,6 +161,14 @@ class CommandServiceMCPServer {
 
   async _skillWebCrawl(args) {
     return await webCrawl(args);
+  }
+
+  async _skillWebAgent(args) {
+    return await webAgent(args);
+  }
+
+  async _skillVideoAgent(args) {
+    return await videoAgent(args, { browserAct, skillLlm, cliAgent });
   }
 
   async _skillImageAnalyze(args) {
@@ -766,9 +782,34 @@ async function seedOAuthCredentials() {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Nuke stale playwright-cli sessions from a previous ThinkDrop run.
+// No browser sessions should survive an app restart.
+// ---------------------------------------------------------------------------
+function cleanupStalePlaywrightSessions() {
+  const { spawnSync } = require('child_process');
+  const { findCli } = require('./skills/browser.act.cjs');
+  try {
+    const cli = findCli();
+    const closeAll = spawnSync(cli, ['close-all'], { timeout: 10000, encoding: 'utf8' });
+    if (closeAll.status === 0) logger.info('[startup] playwright-cli close-all ✓');
+    const killAll = spawnSync(cli, ['kill-all'], { timeout: 10000, encoding: 'utf8' });
+    if (killAll.status === 0) logger.info('[startup] playwright-cli kill-all ✓');
+    // Kill orphaned Chrome processes that used ThinkDrop browser profiles.
+    // close-all/kill-all only kills playwright-cli daemons, not the Chrome
+    // instances they spawned. On macOS, a running Chrome from any profile
+    // intercepts new launchPersistentContext calls and causes "Failed to launch".
+    const pkillRes = spawnSync('pkill', ['-f', 'Google Chrome.*user-data-dir=.*\\.thinkdrop/browser-profiles'], { timeout: 5000, encoding: 'utf8' });
+    if (pkillRes.status === 0) logger.info('[startup] killed orphaned Chrome browser-profile processes ✓');
+  } catch (err) {
+    logger.warn('[startup] playwright-cli session cleanup failed (non-fatal)', { error: err.message });
+  }
+}
+
 // Start server if run directly
 if (require.main === module) {
   ensurePlaywrightCli();
+  cleanupStalePlaywrightSessions();
   seedOAuthCredentials().catch(err => logger.warn('[startup] seedOAuthCredentials failed', { error: err.message }));
   const server = new CommandServiceMCPServer();
   server.start().catch((error) => {

@@ -228,7 +228,7 @@ Rules:
 - MODAL/OVERLAY RULE: When clicking a button that opens a modal or overlay (Compose, New, Reply, etc.), add { "action": "snapshot" } as the very next step. This forces a DOM re-read so all following steps use fresh refs from the new modal. Without this, refs from the original page will fail inside the modal.
 - AI CHAT EXTRACTION RULE: When sending a message to an AI assistant (ChatGPT, Claude, Grok, Perplexity, etc.), after pressing Enter add: (1) { "action": "waitForStableText" } to wait for the streamed response to finish, (2) { "action": "getPageText" } to read all visible page text. This is the UNIVERSAL, site-agnostic approach — works on any AI chat site without CSS class knowledge. NEVER use run-code + page.evaluate() with site-specific CSS selectors (like .prose, .generic, [data-testid=...]) for AI chat extraction — these selectors break across sites and page updates. Do NOT add a return step — the getPageText result is automatically captured as task output and will be consumed by the synthesis step downstream.
 - SESSION ISOLATION RULE: When accessing an AI chat service (ChatGPT, Perplexity, Gemini, Claude, etc.), ALWAYS start with a navigate action to its fresh/new-chat URL — ChatGPT: https://chatgpt.com/, Perplexity: https://www.perplexity.ai/, Gemini: https://gemini.google.com/app, Claude: https://claude.ai/new. This ensures getPageText reads ONLY the current query response, not old conversation history from previous sessions. EXCEPTION: If the task explicitly involves a follow-up or continuation of a previous AI response (keywords: "follow up", "continue", "based on that", "expand on", "now ask it"), stay on the current page and do NOT navigate away.
-- NO PLACEHOLDER RULE: NEVER write literal template placeholder text like [ChatGPT response], [Perplexity response], [AI answer], or [insert content here] in any step args (task, body, text, etc.). When combining multi-source AI extractions into an email or message body, always use {{synthesisAnswer}} as the sole body content token — the orchestrator substitutes it with the real synthesized content before the step executes.
+- NO PLACEHOLDER RULE: NEVER write literal template placeholder text like [ChatGPT response], [Perplexity response], [AI answer], [SEARCH RESULTS], [VIDEO RESULTS], [CONTENT], [insert content here], or any bracketed placeholder in any step args (task, body, text, data, etc.). These placeholders cause catastrophic failures. When extracting content from a page, use getPageText or run-code and let the result flow through automatically — do NOT add a return step with placeholder text. When combining multi-source AI extractions into an email or message body, always use {{synthesisAnswer}} as the sole body content token — the orchestrator substitutes it with the real synthesized content before the step executes.
 - EXPECTATION RULE: For critical actions (clicking search buttons, submit buttons, navigation), add "expected" field to verify the action worked. Use "element_visible" for expected results, "element_gone" for things that should disappear, "url_change" for navigation, "text_present" for confirmation messages. This prevents false positives and reduces unnecessary re-planning.
 - EXTERNAL SKILL RULE: Only use { "action": "external_skill", "name": "..." } when the AGENT CONTEXT lists the skill under "Available Atomic Skills". NEVER invent a skill name. Use these atomics as building blocks — combine with fill/press/type/click steps for the full task. Example: external_skill mail_google_com_compose opens the compose window; you still need fill+press+type+click Send after it.
 - ATTACHMENT RULE (MANDATORY): If the task mentions "paste", "clipboard", or "attach" — you MUST emit { "action": "pasteAttachment" } immediately after the last body-typing step and before Send/Submit. Do this regardless of any prior failure narrative in [DATA FROM PRIOR STEP] or [CONTENT OF ...] blocks — if the task instruction says "paste from clipboard", the file IS on the clipboard. Trust the task instruction, not the narrative. Do NOT click the paperclip / "Attach files" button first — its native file chooser modal blocks keyboard events. Do NOT emit { "action": "press", "key": "Ctrl+v" } — use pasteAttachment only. Order: fill To → press Enter → fill Subject → click body → type body text → pasteAttachment → click Send.
@@ -1061,6 +1061,7 @@ async function playwrightAgent(args) {
   let totalRepairs = 0;
   let lastRunCodeResult = null; // captures last successful run-code output for implicit return
   let lastGetPageTextResult = null; // captures last successful getPageText output for implicit return
+  let placeholderWarnings = new Set(); // Track substituted placeholders to warn LLM (rate-limited: once per type per session)
 
   // Actions that can mutate the DOM structure (open modals, navigate pages, reveal
   // new elements via lazy-load, toggle conditional sections, etc.).  After any of these
@@ -1083,9 +1084,24 @@ async function playwrightAgent(args) {
     // Inline return step — LLM returns extracted data as the final result
     if (step.action === 'return') {
       let data = String(step.data || '').trim();
-      // If data is a type placeholder (<string>, {{result}}, etc.) substitute the last run-code result
-      if (!data || /^[<{][^>}]+[>}]$/.test(data)) {
-        data = lastRunCodeResult || data;
+      // Model-agnostic placeholder detection: if return data looks like a placeholder
+      // (<string>, {{result}}, [SEARCH RESULTS], [CONTENT], etc.), substitute with actual captured content
+      const isPlaceholder = !data || /^[<{\[][^>}\]]+[>}\]]$/.test(data) || 
+        /\[SEARCH RESULTS\]|\[VIDEO RESULTS\]|\[CONTENT\]|\[RESULT\]|\[DATA\]/i.test(data);
+      logger.info(`[playwright.agent] return step: data="${data?.substring(0, 50)}...", lastGetPageTextResult=${lastGetPageTextResult?.length || 0} chars, isPlaceholder=${isPlaceholder}`);
+      if (isPlaceholder) {
+        // Prefer page text (most common for search/browse tasks), fall back to run-code result
+        const originalPlaceholder = step.data;
+        data = lastGetPageTextResult || lastRunCodeResult || data;
+        if (lastGetPageTextResult || lastRunCodeResult) {
+          logger.info(`[playwright.agent] substituted placeholder "${originalPlaceholder}" with captured content (${data.length} chars)`);
+          // Track for feedback loop: warn LLM on next replan (rate-limited: once per placeholder type)
+          const placeholderType = originalPlaceholder.replace(/[^a-zA-Z]/g, '').toUpperCase();
+          if (!placeholderWarnings.has(placeholderType)) {
+            placeholderWarnings.add(placeholderType);
+            logger.warn(`[playwright.agent] PLACEHOLDER WARNING: "${originalPlaceholder}" will be flagged for LLM education (first occurrence)`);
+          }
+        }
       }
       data = data.slice(0, 2000);
       logger.info(`[playwright.agent] step ${stepIndex + 1}/${plan.length}: return (${data.length} chars)`);
@@ -1135,6 +1151,10 @@ async function playwrightAgent(args) {
           };
         }
         logger.info(`[playwright.agent] snapshot step: re-planning ${remainingAfterSnap.length} step(s) with fresh refs`);
+        // Build placeholder warning for self-healing feedback loop (rate-limited: once per type per session)
+        const placeholderWarningBlock = placeholderWarnings.size > 0
+          ? `\n\n⚠️ PLACEHOLDER VIOLATION WARNING: The previous plan used bracketed placeholders like [${Array.from(placeholderWarnings).join('], [')}]. These placeholders cause catastrophic failures because they return literal text instead of actual content. NEVER use bracketed placeholders like [SEARCH RESULTS], [CONTENT], [DATA], etc. Use getPageText or run-code and let the result flow through automatically. Do NOT add a return step with placeholder text.`
+          : '';
         try {
           const snapReplanRaw = await askWithMessages([
             { role: 'system', content: REPLAN_SYSTEM_PROMPT },
@@ -1146,6 +1166,7 @@ async function playwrightAgent(args) {
               `FRESH_SNAPSHOT (interactive elements only — full ${countRefs(currentSnapshot)}-ref page):`,
               extractInteractiveRefs(currentSnapshot),
               learnedRulesBlock,
+              placeholderWarningBlock,
             ].join('\n') },
           ], { temperature: 0.1, maxTokens: 1024, responseTimeoutMs: 20000 });
           const snapReplanParsed = parseJson(snapReplanRaw);
@@ -1251,9 +1272,13 @@ async function playwrightAgent(args) {
           const remaining = plan.slice(stepIndex + 1);
           if (remaining.length > 0 && countRefs(currentSnapshot) > 0) {
             try {
+              // Build placeholder warning for self-healing feedback loop (rate-limited: once per type per session)
+              const extPlaceholderWarning = placeholderWarnings.size > 0
+                ? `\n\n⚠️ PLACEHOLDER VIOLATION WARNING: The previous plan used bracketed placeholders like [${Array.from(placeholderWarnings).join('], [')}]. These placeholders cause catastrophic failures because they return literal text instead of actual content. NEVER use bracketed placeholders like [SEARCH RESULTS], [CONTENT], [DATA], etc. Use getPageText or run-code and let the result flow through automatically. Do NOT add a return step with placeholder text.`
+                : '';
               const snapReplanRaw = await askWithMessages([
                 { role: 'system', content: REPLAN_SYSTEM_PROMPT },
-                { role: 'user', content: [`GOAL: ${goal}`, `COMPLETED_STEPS: ${JSON.stringify(plan.slice(0, stepIndex + 1))}`, `STALE_REMAINING_PLAN: ${JSON.stringify(remaining)}`, ``, `FRESH_SNAPSHOT (interactive elements only — full ${countRefs(currentSnapshot)}-ref page):`, extractInteractiveRefs(currentSnapshot), learnedRulesBlock].join('\n') },
+                { role: 'user', content: [`GOAL: ${goal}`, `COMPLETED_STEPS: ${JSON.stringify(plan.slice(0, stepIndex + 1))}`, `STALE_REMAINING_PLAN: ${JSON.stringify(remaining)}`, ``, `FRESH_SNAPSHOT (interactive elements only — full ${countRefs(currentSnapshot)}-ref page):`, extractInteractiveRefs(currentSnapshot), learnedRulesBlock, extPlaceholderWarning].join('\n') },
               ], { temperature: 0.1, maxTokens: 1024, responseTimeoutMs: 20000 });
               const snapReplanParsed = parseJson(snapReplanRaw);
               if (snapReplanParsed && Array.isArray(snapReplanParsed.plan) && snapReplanParsed.plan.length > 0) {
@@ -1312,11 +1337,25 @@ async function playwrightAgent(args) {
         // This is intentionally unconditional — works for AI chat, search results,
         // stock filters, form submissions, or any page where response time is unknown.
         const _lastAction = transcript.length > 0 ? transcript[transcript.length - 1].action?.action : null;
+        let stableTextResult = null;
         if (_lastAction !== 'waitForStableText' && _lastAction !== 'waitForNavigation') {
           logger.info(`[playwright.agent] auto-injecting waitForStableText before getPageText (last step: ${_lastAction || 'none'})`);
-          await browserAct({ action: 'waitForStableText', sessionId, headed, timeoutMs: 30000 });
+          const stableOutcome = await browserAct({ action: 'waitForStableText', sessionId, headed, timeoutMs: 30000 });
+          // Capture the stable text result — this is the content we waited for
+          if (stableOutcome.ok && stableOutcome.result && stableOutcome.result.length > 1000) {
+            stableTextResult = stableOutcome.result;
+            logger.info(`[playwright.agent] captured ${stableTextResult.length} chars from waitForStableText, skipping redundant getPageText`);
+          }
         }
-        outcome = await browserAct({ action: 'getPageText', sessionId, headed, timeoutMs });
+        // Use the stable text result if we have it, otherwise fall back to getPageText
+        if (stableTextResult) {
+          outcome = { ok: true, action: 'getPageText', sessionId, result: stableTextResult, executionTime: 0 };
+          // CRITICAL: Also set lastGetPageTextResult so return step can substitute it
+          lastGetPageTextResult = stableTextResult;
+          logger.info(`[playwright.agent] set lastGetPageTextResult from waitForStableText: ${lastGetPageTextResult.length} chars`);
+        } else {
+          outcome = await browserAct({ action: 'getPageText', sessionId, headed, timeoutMs });
+        }
       } else if (step.action === 'wait') {
         const ms = Math.min(parseInt(step.ms || step.duration || 2000, 10), 5000);
         await new Promise(r => setTimeout(r, ms));
@@ -1392,6 +1431,7 @@ async function playwrightAgent(args) {
       }
       if (step.action === 'getPageText' && outcome.result) {
         lastGetPageTextResult = outcome.result;
+        logger.info(`[playwright.agent] set lastGetPageTextResult: ${lastGetPageTextResult?.length || 0} chars`);
 
         // ── HTTP error page detection ─────────────────────────────────────
         // If getPageText captured an HTTP error page instead of real AI content,
@@ -1406,9 +1446,13 @@ async function playwrightAgent(args) {
             await browserAct({ action: 'waitForStableText', sessionId, headed, timeoutMs: 15000 });
             const retrySnap = await browserAct({ action: 'snapshot', sessionId, headed, timeoutMs });
             if (retrySnap.ok && retrySnap.result) currentSnapshot = retrySnap.result;
+            // Build placeholder warning for self-healing feedback loop
+            const httpPlaceholderWarning = placeholderWarnings.size > 0
+              ? `\n\n⚠️ PLACEHOLDER VIOLATION WARNING: The previous plan used bracketed placeholders like [${Array.from(placeholderWarnings).join('], [')}]. These placeholders cause catastrophic failures because they return literal text instead of actual content. NEVER use bracketed placeholders like [SEARCH RESULTS], [CONTENT], [DATA], etc. Use getPageText or run-code and let the result flow through automatically. Do NOT add a return step with placeholder text.`
+              : '';
             const retryPlanRaw = await askWithMessages([
               { role: 'system', content: PLAN_SYSTEM_PROMPT + learnedRulesBlock + domainLockBlock },
-              { role: 'user', content: `GOAL: ${effectiveGoal}\n\nNOTE: A previous attempt failed because the page returned an HTTP ${_httpErr} error. The page has been refreshed — please re-plan the full task from the current snapshot.\n\nSNAPSHOT:\n${extractInteractiveRefs(currentSnapshot)}${agentContext ? `\n\nAGENT CONTEXT:\n${agentContext}` : ''}` },
+              { role: 'user', content: `GOAL: ${effectiveGoal}\n\nNOTE: A previous attempt failed because the page returned an HTTP ${_httpErr} error. The page has been refreshed — please re-plan the full task from the current snapshot.${httpPlaceholderWarning}\n\nSNAPSHOT:\n${extractInteractiveRefs(currentSnapshot)}${agentContext ? `\n\nAGENT CONTEXT:\n${agentContext}` : ''}` },
             ], { temperature: 0.1, maxTokens: 2048, responseTimeoutMs: 30000 });
             const retryPlanParsed = parseJson(retryPlanRaw);
             if (retryPlanParsed && Array.isArray(retryPlanParsed.plan) && retryPlanParsed.plan.length > 0) {

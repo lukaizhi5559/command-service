@@ -7,8 +7,9 @@
  * Provides domain research, tutorial step extraction, and insight synthesis.
  *
  * Actions:
- *   research_domain  { domain, query }      → searches web for domain-specific guidance
- *   get_tutorial_steps { query }            → extracts step-by-step instructions from search results
+ *   research_domain      { domain, query }              → searches web for domain-specific guidance
+ *   get_tutorial_steps   { query }                       → extracts step-by-step instructions from search results
+ *   search_and_navigate  { query, preferDomain? }        → searches web, picks best URL to navigate to directly
  */
 
 const http   = require('http');
@@ -86,6 +87,89 @@ async function searchWeb(query, maxResults = 5) {
 }
 
 /**
+ * Detect parking/squatter content from a search result snippet or title.
+ * Works on content signals, not hostname lists — scales to any broker/registrar.
+ */
+function _isParkingContent(title, snippet, url) {
+  const text = `${title || ''} ${snippet || ''}`.toLowerCase();
+  const urlLower = (url || '').toLowerCase();
+  // Parking language in title/snippet
+  if (/\bdomain\s+(for\s+sale|is\s+for\s+sale|available\s+for\s+sale)\b/.test(text)) return true;
+  if (/\bbuy\s+this\s+domain\b/.test(text)) return true;
+  if (/\bmake\s+an?\s+offer\b/.test(text)) return true;
+  if (/\bparked\s+(by|domain|page)\b/.test(text)) return true;
+  if (/\binquire\s+about\s+this\s+domain\b/.test(text)) return true;
+  if (/\bthis\s+domain\s+(may\s+be|is)\s+(for\s+sale|available)\b/.test(text)) return true;
+  // URL-level parking indicators
+  if (/buy.*domain|domain.*sale|domain.*park|domainbroker/i.test(urlLower)) return true;
+  return false;
+}
+
+/**
+ * Score a search result URL for quality.
+ * Higher = better. Penalizes parking pages via content signals, rewards preferDomain match.
+ */
+function _scoreResult(result, preferDomain) {
+  let score = 50; // baseline
+  try {
+    const host = new URL(result.url).hostname.replace(/^www\./, '');
+    // Penalize parking/squatter content — content-based, not hostname-list-based
+    if (_isParkingContent(result.title, result.snippet, result.url)) return -1;
+    // Prefer explicit domain match
+    if (preferDomain) {
+      const pref = preferDomain.toLowerCase().replace(/^www\./, '');
+      if (host === pref || host.endsWith('.' + pref) || pref.endsWith('.' + host)) score += 40;
+      else if (host.includes(pref) || pref.includes(host.split('.')[0])) score += 20;
+    }
+    // Prefer reputable TLDs for dev/doc content
+    if (host.endsWith('.org') || host.endsWith('.io') || host.endsWith('.dev')) score += 10;
+    // Prefer official-looking subdomains
+    if (host.startsWith('docs.') || host.startsWith('developer.') || host.startsWith('help.')) score += 15;
+    // Boost if snippet has step-like content
+    if (result.snippet && /step|how to|navigate|click|select/i.test(result.snippet)) score += 5;
+  } catch (_) { score = 0; }
+  return score;
+}
+
+/**
+ * Search the web and return the best URL to navigate to directly.
+ * Used by browser.agent internally and as a plan-level skill.
+ */
+async function actionSearchAndNavigate({ query, preferDomain, maxResults = 5 }) {
+  if (!query) return { ok: false, error: 'query is required' };
+
+  logger.info(`[web.agent] search_and_navigate: "${query.slice(0, 80)}" preferDomain=${preferDomain || 'none'}`);
+
+  const searchResult = await searchWeb(query, maxResults);
+  if (!searchResult.ok) return searchResult;
+
+  const results = searchResult.results || [];
+  if (results.length === 0) return { ok: false, error: 'No search results returned' };
+
+  // Score all results, filter negatives
+  const scored = results
+    .map(r => ({ ...r, _score: _scoreResult(r, preferDomain) }))
+    .filter(r => r._score >= 0)
+    .sort((a, b) => b._score - a._score);
+
+  if (scored.length === 0) {
+    return { ok: false, error: 'All search results were parking/squatter pages' };
+  }
+
+  const best = scored[0];
+  logger.info(`[web.agent] search_and_navigate: best=${best.url} score=${best._score}`);
+
+  return {
+    ok: true,
+    bestUrl: best.url,
+    title: best.title,
+    snippet: best.snippet,
+    score: best._score,
+    allResults: scored.map(r => ({ url: r.url, title: r.title, score: r._score })),
+  };
+}
+
+/**
  * Research a domain for specific task guidance
  */
 async function actionResearchDomain({ domain, query, maxResults = 5 }) {
@@ -102,22 +186,47 @@ async function actionResearchDomain({ domain, query, maxResults = 5 }) {
     return searchResult;
   }
 
-  // Synthesize insights from search results
-  const insights = searchResult.results.map(r => ({
-    title: r.title,
-    snippet: r.snippet,
-    url: r.url,
-    source: new URL(r.url).hostname
-  }));
+  // Synthesize insights from search results, filtering parking/squatter content
+  const insights = searchResult.results
+    .filter(r => !_isParkingContent(r.title, r.snippet, r.url))
+    .map(r => ({
+      title: r.title,
+      snippet: r.snippet,
+      url: r.url,
+      source: new URL(r.url).hostname
+    }));
 
   // Extract common patterns and steps
   const stepPatterns = _extractStepPatterns(insights);
+
+  // Pick best URL from results (highest scoring non-parking result)
+  const preferDomain = domain || null;
+  const scored = (searchResult.results || [])
+    .map(r => ({ ...r, _score: _scoreResult(r, preferDomain) }))
+    .filter(r => r._score >= 0)
+    .sort((a, b) => b._score - a._score);
+  const bestUrl = scored.length > 0 ? scored[0].url : null;
+
+  // Synthesize a plain-text insights string for injection into agent context
+  const insightsText = insights
+    .slice(0, 3)
+    .map(i => `- ${i.title}: ${i.snippet}`)
+    .join('\n');
+
+  // Confidence: based on result quality and step extraction
+  const confidence = insights.length >= 3 && stepPatterns.length >= 3 ? 0.8
+    : insights.length >= 2 ? 0.5
+    : insights.length >= 1 ? 0.3
+    : 0;
 
   return {
     ok: true,
     query: searchQuery,
     insights,
+    insightsText,
     stepPatterns,
+    bestUrl,
+    confidence,
     sourceCount: insights.length
   };
 }
@@ -298,7 +407,13 @@ module.exports = async function webAgent(args) {
       return await actionResearchDomain(params);
     case 'get_tutorial_steps':
       return await actionGetTutorialSteps(params);
+    case 'search_and_navigate':
+      return await actionSearchAndNavigate(params);
     default:
       return { ok: false, error: `Unknown action: ${action}` };
   }
 };
+
+module.exports.actionResearchDomain    = actionResearchDomain;
+module.exports.actionGetTutorialSteps  = actionGetTutorialSteps;
+module.exports.actionSearchAndNavigate = actionSearchAndNavigate;

@@ -124,7 +124,7 @@ function detectServiceUnavailable(text) {
 const { userAgent } = require('./user.agent.cjs');
 
 const { resolveDestination, recordCorrection, classifyTaskIntent } = require('../skill-helpers/destination-resolver.cjs');
-const { killExistingChromeForProfile, clearProfileLock, findCli } = require('./browser.act.cjs');
+const { killExistingChromeForProfile, clearProfileLock, findCli, shortSessionId } = require('./browser.act.cjs');
 
 const AGENTS_DB_PATH = path.join(os.homedir(), '.thinkdrop', 'agents.db');
 const AGENTS_DIR     = path.join(os.homedir(), '.thinkdrop', 'agents');
@@ -660,6 +660,22 @@ NOTE: Prefer gh CLI for most GitHub operations — use browser only when CLI is 
 4. Snapshot: { "action": "snapshot" }
 5. Extract response:
 { "action": "run-code", "code": "async page => { return await page.evaluate(() => { const msgs=Array.from(document.querySelectorAll('model-response,message-content')); return msgs[msgs.length-1]?.innerText||'Response not yet loaded'; }); }" }`,
+
+  youtube: `### Search Videos (search, find, lookup, video, sourdough, tutorial, how to)
+1. Navigate directly to search results: { "action": "navigate", "url": "https://www.youtube.com/results?search_query=<encoded_query>" }
+2. Wait for results to load: { "action": "waitForStableText" }
+3. Read search results: { "action": "getPageText" }
+NOTE: Use /results?search_query= URL directly — it is more reliable than click+fill+Enter (avoids autocomplete dropdown timing issues). Encode spaces as + in the query.
+
+### Watch Video (watch, play, view, open, specific video)
+1. Navigate to video URL: { "action": "navigate", "url": "<video_url>" }
+2. Wait for page to load: { "action": "waitForStableText" }
+3. Read video page content: { "action": "getPageText" }
+
+### Browse Feed / Subscriptions (subscriptions, feed, home, browse, latest)
+1. Navigate to YouTube feed: { "action": "navigate", "url": "https://www.youtube.com/feed/subscriptions" }
+2. Wait for feed to load: { "action": "waitForStableText" }
+3. Read feed content: { "action": "getPageText" }`,
 };
 
 // ---------------------------------------------------------------------------
@@ -698,12 +714,16 @@ NAVIGATION
   tab-close   — { "action": "tab-close", "index": 0 }                            — close tab
 
 OBSERVATION  (ALWAYS snapshot after any DOM change before the next action)
-  snapshot    — { "action": "snapshot" }                                         — re-reads live DOM / ARIA tree
-  screenshot  — { "action": "screenshot" }                                       — capture visual screenshot
-  eval        — { "action": "eval", "expression": "document.title" }             — lightweight JS (no page.evaluate wrapper)
+  snapshot          — { "action": "snapshot" }                                         — re-reads live DOM / ARIA tree
+  screenshot        — { "action": "screenshot" }                                       — capture visual screenshot
+  eval              — { "action": "eval", "expression": "document.title" }             — lightweight JS (no page.evaluate wrapper)
+  waitForStableText — { "action": "waitForStableText" }                                — wait until page text stops changing (use after navigate on dynamic/JS-rendered pages, after search, after pressing Enter)
+  getPageText       — { "action": "getPageText" }                                      — read all visible page text as plain string (use after waitForStableText to capture search results, listings, or content)
 
 DATA EXTRACTION
   run-code    — { "action": "run-code", "code": "async page => { return await page.evaluate(() => ...) }" }
+
+CONTENT EXTRACTION RULE: For any playbook that navigates to a search results page or a dynamic content page, ALWAYS end with { "action": "waitForStableText" } followed by { "action": "getPageText" } so the results are captured and returned to the user. Without getPageText, the task result will be empty.
 
 DIALOGS
   dialog-accept  — { "action": "dialog-accept" }                                 — confirm / OK dialogs
@@ -1980,6 +2000,29 @@ async function actionRun({ agentId, task, url, context, requiresAuth, _progressC
     }
   }
 
+  // Self-heal: .md file was deleted (e.g. to force a playbook refresh) but DuckDB entry still
+  // has the old descriptor. When the service has a PLAYBOOK_SEED_MAP entry, force-rebuild so
+  // the new seed playbook replaces the stale DB record.
+  if (existing.found) {
+    const _mdPath = path.join(AGENTS_DIR, `${agentId}.md`);
+    const _serviceKey = (existing.service || agentId.replace(/\.agent$/, '')).toLowerCase().replace(/[^a-z0-9]/g, '');
+    const _hasSeed = Object.prototype.hasOwnProperty.call(PLAYBOOK_SEED_MAP, _serviceKey);
+    if (!_fs.existsSync(_mdPath) && _hasSeed) {
+      logger.info(`[browser.agent] run: "${agentId}" .md missing but has seed — force-rebuilding from PLAYBOOK_SEED_MAP`);
+      try {
+        const _seedRebuild = await actionBuildAgent({ service: _serviceKey, force: true });
+        if (_seedRebuild.ok) {
+          existing = await actionQueryAgent({ id: agentId });
+          logger.info(`[browser.agent] run: seed-rebuild complete for "${agentId}"`);
+        } else {
+          logger.warn(`[browser.agent] run: seed-rebuild failed for "${agentId}": ${_seedRebuild.error}`);
+        }
+      } catch (_seedErr) {
+        logger.warn(`[browser.agent] run: seed-rebuild threw for "${agentId}": ${_seedErr.message}`);
+      }
+    }
+  }
+
   // Self-heal stale wrong-type entries (e.g. gemini.agent previously built as api_key).
   // Happens when auto-build ran in a prior session before deriveAgentType() was introduced.
   // Only triggers when stored type=api_key but the seed map says this is a browser UI service.
@@ -2316,10 +2359,11 @@ async function actionRun({ agentId, task, url, context, requiresAuth, _progressC
     }
 
     // ── Close any existing playwright-cli daemon for this session ──────────
+    const _shortSid = shortSessionId(sessionId);
     try {
       const { spawnSync } = require('child_process');
-      const _closeRes = spawnSync(findCli(), ['-s=' + sessionId, 'close'], { timeout: 5000, encoding: 'utf8' });
-      if (_closeRes.status === 0) logger.info(`[browser.agent] closed existing playwright-cli daemon for session=${sessionId}`);
+      const _closeRes = spawnSync(findCli(), ['-s=' + _shortSid, 'close'], { timeout: 5000, encoding: 'utf8' });
+      if (_closeRes.status === 0) logger.info(`[browser.agent] closed existing playwright-cli daemon for session=${sessionId} (sid=${_shortSid})`);
     } catch (_) {}
 
     // ── Kill existing Chrome for this profile — prevents .sock EINVAL ──────
@@ -2330,11 +2374,14 @@ async function actionRun({ agentId, task, url, context, requiresAuth, _progressC
       logger.warn(`[browser.agent] killExistingChromeForProfile error (non-fatal): ${_killErr.message}`);
     }
 
+    // ── Clear profile lock + crash markers so fresh launch succeeds ───────
+    try { clearProfileLock(sessionId); } catch (_) {}
+
     // ── Stale .sock cleanup — prevents EINVAL on first navigate ──────────
     try {
       const _sockDir = path.join(os.tmpdir(), 'playwright-cli');
       if (fs.existsSync(_sockDir)) {
-        const _sockFiles = fs.readdirSync(_sockDir, { recursive: true }).filter(f => String(f).endsWith('.sock') && String(f).includes(sessionId));
+        const _sockFiles = fs.readdirSync(_sockDir, { recursive: true }).filter(f => String(f).endsWith('.sock') && (String(f).includes(sessionId) || String(f).includes(_shortSid)));
         for (const sf of _sockFiles) {
           try { fs.unlinkSync(path.join(_sockDir, String(sf))); logger.info(`[browser.agent] cleaned stale .sock: ${sf}`); } catch (_) {}
         }
@@ -2375,13 +2422,97 @@ async function actionRun({ agentId, task, url, context, requiresAuth, _progressC
         const _onLoginPage = _isSigninWall(_curHref);
         // Also detect domain mismatch — e.g. redirect to workspace.google.com instead of mail.google.com
         let _wrongDomain = false;
+        let _curHost = '';
         try {
           const _startHost = new URL(startUrl).hostname;
-          const _curHost   = new URL(_curHref.match(/https?:\/\//) ? _curHref : `https://${_curHref}`).hostname;
+          _curHost   = new URL(_curHref.match(/https?:\/\//) ? _curHref : `https://${_curHref}`).hostname;
           _wrongDomain = !!_startHost && !!_curHost && _curHost !== _startHost;
         } catch (_) {}
-        if (_onLoginPage || _wrongDomain) {
-          const _reason = _onLoginPage ? 'login redirect' : `domain mismatch (expected ${(() => { try { return new URL(startUrl).hostname; } catch(_){return startUrl;} })()}, got ${(() => { try { return new URL(_curHref.match(/https?:\/\//) ? _curHref : `https://${_curHref}`).hostname; } catch(_){return _curHref;} })()})`;
+
+        // ── Parking/squatter detection via live page content ───────────────────
+        // Checks page title + body text for broker/parking language. This is
+        // content-based (not a hostname list) so it catches any parking provider.
+        let _isParkingPage = false;
+        try {
+          const _pageInfoRes = await callBrowserAct({
+            action: 'evaluate',
+            text: `(() => {
+              const title = document.title || '';
+              const body   = (document.body && document.body.innerText) ? document.body.innerText.slice(0, 800) : '';
+              const links  = document.querySelectorAll('a').length;
+              return JSON.stringify({ title, body, links });
+            })()`,
+            sessionId,
+            timeoutMs: 5000,
+          }, 8000).catch(() => null);
+          if (_pageInfoRes?.ok !== false) {
+            const _pageInfo = (() => { try { return JSON.parse(_pageInfoRes?.result ?? '{}'); } catch (_) { return {}; } })();
+            const _pageText = `${_pageInfo.title || ''} ${_pageInfo.body || ''}`.toLowerCase();
+            const _PARKING_RE = /\bdomain\s+(for\s+sale|is\s+for\s+sale|available\s+for\s+sale)\b|\bbuy\s+this\s+domain\b|\bmake\s+an?\s+offer\b|\bparked\s+(by|domain|page)\b|\binquire\s+about\s+this\s+domain\b|\bthis\s+domain\s+(may\s+be|is)\s+(for\s+sale|available)\b/;
+            if (_PARKING_RE.test(_pageText) || (Number(_pageInfo.links) < 10 && /for\s+sale|buy|offer|domain/i.test(_pageText))) {
+              _isParkingPage = true;
+              logger.warn(`[browser.agent] run: parking/squatter content detected on ${_curHost} for ${agentId}`);
+            }
+          }
+        } catch (_pageErr) {
+          logger.warn(`[browser.agent] run: parking content check failed (non-fatal): ${_pageErr.message}`);
+        }
+
+        // ── Internal web.agent self-heal ───────────────────────────────────────
+        // Trigger on: (a) domain mismatch OR (b) parking content detected on any domain.
+        // For domain mismatch that is NOT a parking page (e.g. workspace.google.com for mail.google.com),
+        // web.agent is tried first but if it finds nothing we fall through to waitForAuth — no regression.
+        const _needsHeal = _wrongDomain || _isParkingPage;
+        if (_needsHeal && !_onLoginPage) {
+          const _svcName = existing?.service || agentId.replace('.agent', '');
+          const _healReason = _isParkingPage ? `parking content on ${_curHost}` : `domain mismatch (expected ${(() => { try { return new URL(startUrl).hostname; } catch(_){return startUrl;} })()}, got ${_curHost})`;
+          logger.warn(`[browser.agent] run: ${_healReason} — attempting web.agent self-heal for ${agentId}`);
+          let _healedUrl = null;
+          try {
+            const _webResult = await callSkill('web.agent', {
+              action: 'search_and_navigate',
+              query: `${_svcName} official website`,
+              preferDomain: _svcName,
+            }, 10000);
+            if (_webResult?.ok && _webResult?.bestUrl) {
+              _healedUrl = _webResult.bestUrl;
+              logger.info(`[browser.agent] self-heal: web.agent found ${_healedUrl} for ${agentId}`);
+            }
+          } catch (_healErr) {
+            logger.warn(`[browser.agent] self-heal: web.agent call failed: ${_healErr.message}`);
+          }
+
+          if (_healedUrl) {
+            // Update startUrl and invalidate DuckDB meta cache so next run uses the correct URL
+            startUrl = _healedUrl;
+            try {
+              const _db = await getDb();
+              if (_db) {
+                const _seedKey = _svcName.toLowerCase().replace(/[^a-z0-9]/g, '');
+                await _db.run('DELETE FROM browser_meta_cache WHERE service = ?', _seedKey).catch(() => {});
+              }
+            } catch (_) {}
+            logger.info(`[browser.agent] self-heal: retrying with corrected startUrl=${startUrl}`);
+            const _retryNav = await callBrowserAct({ action: 'navigate', sessionId, url: startUrl, timeoutMs: 30000 }, 35000).catch(() => ({ ok: false }));
+            if (_retryNav?.ok !== false) {
+              logger.info(`[browser.agent] self-heal: navigate to corrected URL succeeded — skipping waitForAuth`);
+              _setCachedAuthCheck(agentId, false);
+            } else {
+              logger.warn(`[browser.agent] self-heal: corrected URL navigate failed — failing fast`);
+              return { ok: false, agentId, task, wrongDomain: true, landedUrl: _curHref, expectedService: agentId, error: `Navigated to corrected URL ${startUrl} but browser failed to load it.` };
+            }
+          } else if (_isParkingPage) {
+            // Parking page + web.agent found nothing → fail fast, recoverSkill handles it
+            logger.warn(`[browser.agent] self-heal: parking page detected but no corrected URL found — returning wrongDomain error`);
+            return { ok: false, agentId, task, wrongDomain: true, landedUrl: _curHref, expectedService: agentId, error: `${agentId} loaded a domain parking/squatter page at ${_curHref}. Could not automatically resolve the correct URL for "${_svcName}".` };
+          } else {
+            // Domain mismatch but web.agent found nothing better → this may be a valid redirect (e.g. workspace.google.com)
+            // Fall through to waitForAuth as before
+            logger.info(`[browser.agent] self-heal: no better URL found for domain mismatch — falling back to waitForAuth`);
+            _authNeeded = true;
+          }
+        } else if (_onLoginPage || _wrongDomain) {
+          const _reason = _onLoginPage ? 'login redirect' : `domain mismatch (expected ${(() => { try { return new URL(startUrl).hostname; } catch(_){return startUrl;} })()}, got ${_curHost || _curHref})`;
           logger.info(`[browser.agent] run: auth-check: ${_reason} — calling waitForAuth for ${agentId}`);
           _authNeeded = true;
         } else {
@@ -2549,6 +2680,37 @@ async function actionRun({ agentId, task, url, context, requiresAuth, _progressC
       _playbookTier = 3;
       logger.info(`[browser.agent] playbook: tier-3 core-only for ${agentId} — no playbook sections exist yet`);
     }
+
+    // ── Substitute playbook placeholders (e.g., <encoded_query>) ─────────────
+    // Extract query from task and substitute into playbook templates
+    if (_matchedPlaybook && task) {
+      // Extract query from patterns like "search youtube for X", "find X videos", etc.
+      const queryMatch = task.match(/(?:search|find|lookup)\s+(?:youtube|videos?\s+(?:about|for|on))\s+for\s+(.+)$/i) ||
+                         task.match(/(?:search|find|lookup)\s+(?:youtube|videos?\s+(?:about|for|on))\s+(.+)$/i) ||
+                         task.match(/(?:search|find)\s+for\s+(.+?)\s+(?:on\s+youtube|videos)/i) ||
+                         task.match(/(?:watch|find)\s+(.+?)\s+(?:video|tutorial)/i) ||
+                         task.match(/(?:how\s+to|what\s+is)\s+(.+)$/i);
+      
+      if (queryMatch) {
+        const rawQuery = queryMatch[1].trim();
+        // Remove trailing punctuation and common suffixes
+        const cleanQuery = rawQuery
+          .replace(/\s+(?:video|videos|tutorial|tutorials)\s*$/i, '')
+          .replace(/[?.!]+$/, '')
+          .trim();
+        
+        if (cleanQuery) {
+          const encodedQuery = encodeURIComponent(cleanQuery).replace(/%20/g, '+');
+          const originalPlaybook = _matchedPlaybook;
+          _matchedPlaybook = _matchedPlaybook.replace(/<encoded_query>/g, encodedQuery);
+          
+          if (_matchedPlaybook !== originalPlaybook) {
+            logger.info(`[browser.agent] playbook: substituted <encoded_query> with "${cleanQuery.slice(0, 40)}"`);
+          }
+        }
+      }
+    }
+
     _agentContext = (_coreDescriptor + (_matchedPlaybook ? '\n\n## Playbooks\n' + _matchedPlaybook : '')).slice(0, 3000);
   }
 
@@ -2583,6 +2745,49 @@ async function actionRun({ agentId, task, url, context, requiresAuth, _progressC
       }
     }
   } catch (_) { /* non-fatal */ }
+
+  // ── Step 1c: Tier 2/3 nav context enrichment via web.agent / video.agent ──
+  // When playwright.agent has no keyword-matched playbook (Tier 2 or 3), it reasons
+  // purely from the live DOM. Inject web-researched navigation hints to guide it.
+  if (_playbookTier >= 2) {
+    try {
+      const _navSvcName = existing?.service || agentId.replace('.agent', '');
+      const _navQuery   = `how to navigate to ${task} on ${_navSvcName}`;
+      logger.info(`[browser.agent] tier-${_playbookTier}: fetching web.agent nav hints for "${_navQuery.slice(0, 80)}"`);
+      const _navHints = await callSkill('web.agent', {
+        action: 'research_domain',
+        domain: _navSvcName,
+        query: _navQuery,
+        maxResults: 3,
+      }, 8000).catch(() => null);
+
+      if (_navHints?.ok && _navHints?.insightsText) {
+        _agentContext = (_agentContext + `\n\n## Web-Researched Navigation Hints\n${_navHints.insightsText.slice(0, 600)}`).slice(0, 4000);
+        logger.info(`[browser.agent] tier-${_playbookTier}: injected web.agent nav hints (confidence=${_navHints.confidence}) for ${agentId}`);
+
+        // Escalate to video.agent only for Tier 3 (no playbook at all) with low web.agent confidence
+        if (_playbookTier === 3 && (_navHints.confidence || 0) < 0.5) {
+          logger.info(`[browser.agent] tier-3: web.agent confidence low (${_navHints.confidence}) — escalating to video.agent`);
+          const _videoHints = await callSkill('video.agent', {
+            action: 'find_and_watch_tutorial',
+            platform: 'youtube',
+            query: `${_navSvcName} ${task} tutorial`,
+            goal: task,
+          }, 30000).catch(() => null);
+
+          if (_videoHints?.ok && Array.isArray(_videoHints?.steps) && _videoHints.steps.length > 0) {
+            const _videoSteps = _videoHints.steps.map(s => `${s.step}. ${s.text}`).join('\n');
+            _agentContext = (_agentContext + `\n\n## Video Tutorial Steps\n${_videoSteps}`).slice(0, 4500);
+            logger.info(`[browser.agent] tier-3: injected video.agent tutorial steps (${_videoHints.steps.length} steps) for ${agentId}`);
+          }
+        }
+      } else {
+        logger.info(`[browser.agent] tier-${_playbookTier}: web.agent nav hints unavailable or empty — proceeding without`);
+      }
+    } catch (_navErr) {
+      logger.warn(`[browser.agent] tier-${_playbookTier}: nav enrichment failed (non-fatal): ${_navErr.message}`);
+    }
+  }
 
   // ── Inject domain map content extraction hints if available ───────────────
   // explore.agent scan mode discovers optimal CSS selectors for content extraction.

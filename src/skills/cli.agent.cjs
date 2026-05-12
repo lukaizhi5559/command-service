@@ -878,6 +878,10 @@ function inferCapabilities(helpText, meta) {
 
 function buildDescriptorMd({ id, service, cliName, version, capabilities, helpText, subcommandMap }) {
   const capYaml = capabilities.map(c => `  - ${c}`).join('\n');
+
+  // Generate usage playbook from capabilities and subcommandMap
+  const usagePlaybook = generateUsagePlaybook(service, cliName, capabilities, subcommandMap);
+
   const parts = [
     '---',
     `id: ${id}`,
@@ -894,22 +898,92 @@ function buildDescriptorMd({ id, service, cliName, version, capabilities, helpTe
     `Authentication is persistent after the first \`${cliName} auth login\` (or equivalent).`,
     `Always use \`${cliName} --help\` for the latest flag syntax before running unfamiliar commands.`,
     '',
-    `## CLI Help Reference`,
+    `## CLI Help Output`,
     '```',
     (helpText || '').slice(0, 2000),
     '```',
   ];
 
-  // Append subcommand reference when available
+  // Append subcommand help when available
   if (subcommandMap && Object.keys(subcommandMap).length > 0) {
-    parts.push('', '## Subcommand Reference');
-    for (const [subcmd, detail] of Object.entries(subcommandMap)) {
-      parts.push(`### ${subcmd}`);
-      if (detail) parts.push((String(detail)).slice(0, 350));
+    parts.push('', '## Subcommand Help');
+    // Include top 5 subcommands with their full --help output
+    const subcmds = Object.entries(subcommandMap).slice(0, 5);
+    for (const [subcmd, detail] of subcmds) {
+      parts.push(`### ${subcmd} --help`);
+      parts.push('```');
+      parts.push((String(detail)).slice(0, 500));
+      parts.push('```');
     }
   }
 
+  // Append usage playbook
+  parts.push('', usagePlaybook);
+
   return parts.join('\n');
+}
+
+/**
+ * Generate usage playbook from capabilities and subcommands
+ * Maps natural language to CLI commands
+ */
+function generateUsagePlaybook(service, cliName, capabilities, subcommandMap) {
+  const playbook = ['## Usage Playbook', ''];
+  playbook.push('| User Says | CLI Command |');
+  playbook.push('|-----------|-------------|');
+
+  // Map common capabilities to example commands
+  const capabilityPatterns = {
+    'create_pr': [`Create a pull request for "fix bug"`, `${cliName} pr create --title "fix bug"`],
+    'create_issue': [`File a bug about login`, `${cliName} issue create --title "Login bug" --label bug`],
+    'manage_repos': [`List my repositories`, `${cliName} repo list`],
+    'send_message': [`Send "hello" to #general`, `${cliName} chat send --channel general --message "hello"`],
+    'deploy': [`Deploy to production`, `${cliName} deploy --prod`],
+    'manage_secrets': [`Set API_KEY secret`, `${cliName} secrets set API_KEY`],
+    'view_logs': [`Show recent logs`, `${cliName} logs --tail`],
+    'manage_config': [`Set config value`, `${cliName} config set key value`],
+    'authenticate': [`Login to ${service}`, `${cliName} auth login`],
+    'get_token': [`Get current auth token`, `${cliName} auth token`],
+    'run_commands': [`Run a command on ${service}`, `${cliName} <command>`],
+    'transcribe': [`Transcribe video to text`, `${cliName} <video_url>`],
+    'transcribe_video': [`Transcribe this YouTube video`, `${cliName} "https://youtube.com/watch?v=..."`],
+    'extract_audio': [`Extract audio from video`, `${cliName} <video> --extract-audio`],
+  };
+
+  // Add patterns for each capability
+  for (const cap of capabilities) {
+    if (capabilityPatterns[cap]) {
+      playbook.push(`| ${capabilityPatterns[cap][0]} | \`${capabilityPatterns[cap][1]}\` |`);
+    }
+  }
+
+  // Add patterns from subcommandMap
+  if (subcommandMap && Object.keys(subcommandMap).length > 0) {
+    const subcmds = Object.keys(subcommandMap).slice(0, 3);
+    for (const subcmd of subcmds) {
+      playbook.push(`| ${subcmd} something with ${service} | \`${cliName} ${subcmd} <args>\` |`);
+    }
+  }
+
+  // Default pattern if no specific capabilities
+  if (capabilities.length === 0 || capabilities.includes('run_commands')) {
+    playbook.push(`| Work with ${service} | \`${cliName} <command> <args>\` |`);
+  }
+
+  // Add natural language patterns section
+  playbook.push('');
+  playbook.push('## Natural Language Patterns');
+  playbook.push(`- "use ${service} to <action>"`);
+  playbook.push(`- "${cliName} <command>"`);
+  playbook.push(`- "help me with ${service}"`);
+
+  // Add capability-specific patterns
+  for (const cap of capabilities.slice(0, 3)) {
+    const pattern = cap.replace(/_/g, ' ');
+    playbook.push(`- "${pattern} using ${service}"`);
+  }
+
+  return playbook.join('\n');
 }
 
 async function _buildApiKeyAgentDescriptor({ service, serviceKey, agentId, meta, force = false }) {
