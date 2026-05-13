@@ -109,6 +109,7 @@ const BROWSER_ACTIONS_FULL = `Available actions:
                   — Node.js VM with real Playwright page object. Use page.evaluate() to reach browser DOM.
                   ⚠ require() does NOT exist. Use dynamic import: const { fn } = await import('module')
                   ⚠ NEVER read files inside run-code — file content is already in the task as [DATA FROM PRIOR STEP].
+                  ⚠ SCOPE: only \`page\` exists in the function — \`task\`, \`task.results\`, \`results\`, \`context\`, \`globalState\` do NOT exist and will throw ReferenceError.
                   Gmail inbox example (sender=.yX span/.zF  subject=.bog/.bqe  snippet=.y2  time=.xW span):
                   { "action": "run-code", "code": "async page => { return await page.evaluate(() => { const rows = Array.from(document.querySelectorAll('tr.zA')).slice(0,5); if(!rows.length) return 'No emails found'; return rows.map((r,i)=>{ const s=r.querySelector('.yX span,.zF')?.innerText||''; const sub=r.querySelector('.bog,.bqe')?.innerText||''; const snip=r.querySelector('.y2')?.innerText||''; const t=r.querySelector('.xW span')?.innerText||''; return 'Email '+(i+1)+': From='+s+' | Subject='+sub+' | Preview='+snip+' | Time='+t; }).join('\\n'); }); }" }
   external_skill  { name: "<skill-name>", args?: {...} } — run an installed atomic skill (e.g. mail_google_com_compose). The skill executes in the SAME browser session. Use ONLY when AVAILABLE ATOMIC SKILLS lists this exact name. Never guess a skill name.
@@ -224,9 +225,11 @@ Rules:
 - Keep plan concise — no unnecessary waits or redundant snapshots.
 - MULTI-ITEM EXTRACTION: Use one run-code step with page.evaluate() + document.querySelectorAll(). Never click per-item.
 - RUN-CODE RETURN: run-code result is auto-captured as task output — do NOT add a placeholder return step after it.
+- RUN-CODE CHAINING: To use a run-code result in a LATER step, combine both operations into ONE run-code (extract + act in same function). NEVER reference\`task\`, \`task.results\`, \`results\`, \`context\`, or any variable not in the \`async page =>\` signature — only \`page\` is available. These variables do NOT exist and will throw ReferenceError.
 - DIALOG RULE: If a confirmation dialog may appear, add dialog-accept/dismiss immediately after the triggering action.
 - MODAL/OVERLAY RULE: When clicking a button that opens a modal or overlay (Compose, New, Reply, etc.), add { "action": "snapshot" } as the very next step. This forces a DOM re-read so all following steps use fresh refs from the new modal. Without this, refs from the original page will fail inside the modal.
 - AI CHAT EXTRACTION RULE: When sending a message to an AI assistant (ChatGPT, Claude, Grok, Perplexity, etc.), after pressing Enter add: (1) { "action": "waitForStableText" } to wait for the streamed response to finish, (2) { "action": "getPageText" } to read all visible page text. This is the UNIVERSAL, site-agnostic approach — works on any AI chat site without CSS class knowledge. NEVER use run-code + page.evaluate() with site-specific CSS selectors (like .prose, .generic, [data-testid=...]) for AI chat extraction — these selectors break across sites and page updates. Do NOT add a return step — the getPageText result is automatically captured as task output and will be consumed by the synthesis step downstream.
+- CONTENT EXTRACTION RULE (CRITICAL): When extracting content from ANY page (search results, YouTube, news, documentation, etc.), use { "action": "getPageText" } and let the result flow through automatically. Do NOT add a { "action": "return" } step after getPageText. The getPageText result is automatically captured as the task output. Adding a return step with placeholder text or summary text like "Successfully searched..." will BLOCK the actual content from reaching the synthesis step and cause a "no useful content" failure. NEVER add a return step after getPageText — the system handles output automatically.
 - SESSION ISOLATION RULE: When accessing an AI chat service (ChatGPT, Perplexity, Gemini, Claude, etc.), ALWAYS start with a navigate action to its fresh/new-chat URL — ChatGPT: https://chatgpt.com/, Perplexity: https://www.perplexity.ai/, Gemini: https://gemini.google.com/app, Claude: https://claude.ai/new. This ensures getPageText reads ONLY the current query response, not old conversation history from previous sessions. EXCEPTION: If the task explicitly involves a follow-up or continuation of a previous AI response (keywords: "follow up", "continue", "based on that", "expand on", "now ask it"), stay on the current page and do NOT navigate away.
 - NO PLACEHOLDER RULE: NEVER write literal template placeholder text like [ChatGPT response], [Perplexity response], [AI answer], [SEARCH RESULTS], [VIDEO RESULTS], [CONTENT], [insert content here], or any bracketed placeholder in any step args (task, body, text, data, etc.). These placeholders cause catastrophic failures. When extracting content from a page, use getPageText or run-code and let the result flow through automatically — do NOT add a return step with placeholder text. When combining multi-source AI extractions into an email or message body, always use {{synthesisAnswer}} as the sole body content token — the orchestrator substitutes it with the real synthesized content before the step executes.
 - EXPECTATION RULE: For critical actions (clicking search buttons, submit buttons, navigation), add "expected" field to verify the action worked. Use "element_visible" for expected results, "element_gone" for things that should disappear, "url_change" for navigation, "text_present" for confirmation messages. This prevents false positives and reduces unnecessary re-planning.
@@ -289,6 +292,7 @@ Respond with EXACTLY ONE JSON object (no markdown fences, no explanation):
   But PREFER to avoid file I/O entirely — any needed content is already in the task as [DATA FROM PRIOR STEP].
 - If a run-code step failed due to require/file-reading: replace it with a \`type\` action using content
   from the task description instead.
+- If a run-code step failed with "task is not defined", "results is not defined", or "ReferenceError" on any cross-step variable: the run-code VM only has \`page\` in scope. Check PRIOR_STEP_RESULT in context — if it contains a URL, emit { "action": "navigate", "url": "<that url>" } directly. Otherwise combine the extraction and usage into one run-code step that does both.
 - If the error contains "Timeout" and the failed step was navigate or click, a browser dialog (e.g. "Leave site?", "Leave page?") may be blocking. In that case start the repair with { "action": "dialog-accept" } before retrying the original step.
 - If the failed step is an upload action: the ONLY valid param for file paths is "files" (array of absolute paths). NEVER use "path". Correct form: { "action": "upload", "selector": "<ref>", "files": ["/absolute/path/to/file"] }
 - If a \`press\` step with "Ctrl+v" or "Meta+v" fails with "does not handle the modal state", or if any paste/press step fails after clicking a paperclip/Attach button: a native file chooser modal is blocking keyboard events. Replace the failed step with { "action": "pasteAttachment" } — it focuses the compose body (contentEditable) and pastes there, bypassing the modal entirely. If an attach-button modal is still open, first emit { "action": "press", "key": "Escape" } to dismiss it, then pasteAttachment.
@@ -1086,9 +1090,14 @@ async function playwrightAgent(args) {
       let data = String(step.data || '').trim();
       // Model-agnostic placeholder detection: if return data looks like a placeholder
       // (<string>, {{result}}, [SEARCH RESULTS], [CONTENT], etc.), substitute with actual captured content
-      const isPlaceholder = !data || /^[<{\[][^>}\]]+[>}\]]$/.test(data) || 
+      // Also catch short "success" messages when we have substantial captured content
+      const hasBracketedPlaceholder = /^[<{\[][^>}\]]+[>}\]]$/.test(data) || 
         /\[SEARCH RESULTS\]|\[VIDEO RESULTS\]|\[CONTENT\]|\[RESULT\]|\[DATA\]/i.test(data);
-      logger.info(`[playwright.agent] return step: data="${data?.substring(0, 50)}...", lastGetPageTextResult=${lastGetPageTextResult?.length || 0} chars, isPlaceholder=${isPlaceholder}`);
+      const hasSuccessMessage = data && data.length < 100 && 
+        /successfully|completed|done|finished/i.test(data) &&
+        lastGetPageTextResult && lastGetPageTextResult.length > 500;
+      const isPlaceholder = !data || hasBracketedPlaceholder || hasSuccessMessage;
+      logger.info(`[playwright.agent] return step: data="${data?.substring(0, 50)}..." (${data?.length || 0} chars), lastGetPageTextResult=${lastGetPageTextResult?.length || 0} chars, isPlaceholder=${isPlaceholder}`);
       if (isPlaceholder) {
         // Prefer page text (most common for search/browse tasks), fall back to run-code result
         const originalPlaceholder = step.data;
@@ -1210,6 +1219,7 @@ async function playwrightAgent(args) {
     // Notify frontend — step starting
     postProgress(_progressCallbackUrl, {
       type: 'agent:turn_live',
+      agentId,
       stepIndex: _stepIndex,
       turn: stepIndex + 1,
       maxTurns: plan.length,
@@ -1678,10 +1688,18 @@ async function playwrightAgent(args) {
         `FAILED_STEP: ${JSON.stringify(step)}`,
         `ERROR: ${outcome.error}`,
         `REMAINING_PLAN: ${JSON.stringify(remainingSteps)}`,
-        ``,
-        `SNAPSHOT:`,
-        trimSnapshot(currentSnapshot)
       ];
+
+      // Inject last successful run-code result (smart truncation: full if ≤200 chars, summary if larger)
+      if (lastRunCodeResult) {
+        const _priorLen = lastRunCodeResult.length;
+        const _priorPreview = _priorLen <= 200
+          ? lastRunCodeResult
+          : lastRunCodeResult.slice(0, 200) + `...(${_priorLen} chars total, large data blob)`;
+        repairUserContent.push(``, `PRIOR_STEP_RESULT (last successful run-code): ${_priorPreview}`);
+      }
+
+      repairUserContent.push(``, `SNAPSHOT:`, trimSnapshot(currentSnapshot));
 
       // Add debugging context if available
       if (debugContext) {
@@ -1735,7 +1753,12 @@ async function playwrightAgent(args) {
 
     // Fire-and-forget: derive a ≤150-char rule from this failure+repair and store it in context_rules
     // so future plan generations for this agent automatically avoid the same mistake.
-    if (!repairParsed.skip_original && repairParsed.repair.length > 0) {
+    // Skip rule learning for hallucinated-variable errors — the derived rule would be factually wrong
+    // and would poison future planning sessions (e.g. "use page.url() instead of task" is incorrect).
+    const _skipRuleLearning = ['task is not defined', 'results is not defined', 'globalState'].some(
+      s => (outcome.error || '').includes(s)
+    );
+    if (!_skipRuleLearning && !repairParsed.skip_original && repairParsed.repair.length > 0) {
       (async () => {
         try {
           const ruleRaw = await askWithMessages([
@@ -1888,7 +1911,7 @@ async function playwrightAgent(args) {
   postProgress(_progressCallbackUrl, {
     type: 'agent:complete',
     stepIndex: _stepIndex,
-    agentId: 'playwright.agent',
+    agentId,
     task: goal,
     totalTurns: transcript.length,
     done: true,

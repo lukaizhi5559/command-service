@@ -3,13 +3,12 @@
 /**
  * skill: video.agent
  *
- * Universal video watching agent with HYBRID intelligence:
- * 1. CLI transcription (fast, reliable, uses transcribe-anything if available)
- * 2. Targeted OCR sampling (captures visual context at key moments)
- * 3. Combined synthesis for complete understanding
+ * Universal video extraction agent:
+ * 1. Extract rich page content (metadata, description, comments)
+ * 2. Audio transcription via transcribe-anything Python API (when available)
+ * 3. Combine for comprehensive video understanding
  *
- * Works with YouTube, Vimeo, or any video page.
- * Uses screen-intelligence MCP with tesseract.js for text extraction.
+ * Works with YouTube, Vimeo, Rumble, BitChute, news embeds, or any video page.
  *
  * Actions:
  *   watch_video          { videoUrl, goal, options }     → watch specific video
@@ -104,35 +103,6 @@ function decodeInvalidVideoUrl(videoUrl) {
 }
 
 /**
- * Call user-memory MCP for recent OCR
- */
-async function getRecentOcr(maxAgeSeconds = 15) {
-  try {
-    const response = await fetch(`${USER_MEMORY_URL}/memory.getRecentOcr`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        payload: { maxAgeSeconds },
-        context: {},
-        requestId: `video_${Date.now()}`
-      })
-    });
-
-    if (!response.ok) {
-      const err = new Error(`HTTP ${response.status}`);
-      err.statusCode = response.status;
-      throw err;
-    }
-
-    const data = await response.json();
-    return data.result || { available: false };
-  } catch (err) {
-    logger.warn(`[video.agent] Failed to get OCR: ${err.message}`);
-    return { available: false, statusCode: err.statusCode || 0 };
-  }
-}
-
-/**
  * Extract metadata from video page
  */
 async function extractMetadata(videoUrl, platform, browserAct, sessionId = 'default') {
@@ -141,10 +111,10 @@ async function extractMetadata(videoUrl, platform, browserAct, sessionId = 'defa
     await browserAct({ action: 'navigate', url: videoUrl });
     await new Promise(r => setTimeout(r, 2000)); // Wait for player load
 
-    // Handle pre-roll ads
+    // Handle pre-roll ads (8s polling for YouTube ads that load gradually)
     logger.info('[video.agent] Checking for pre-roll ads...');
     const adResult = await adHandler.handleAds(platform, browserAct, sessionId, {
-      initialWaitMs: 3000,
+      initialWaitMs: 8000,      // Poll for 8s to catch ads that load gradually
       skipCountdownMs: 5000,
       maxAdWaitMs: 30000
     });
@@ -256,502 +226,339 @@ async function extractYouTubeText(videoUrl, browserAct) {
 }
 
 /**
- * Calculate sample points based on video duration
+ * Extract generic page content for any video platform
  */
-function calculateSamplePoints(durationSeconds) {
-  // Tier 1: Short tutorials (3-5 min)
-  if (durationSeconds <= 300) {
-    const interval = Math.max(30, Math.floor(durationSeconds / 6));
-    return generatePoints(durationSeconds, interval, 12);
-  }
-  
-  // Tier 2: Medium (5-10 min)
-  if (durationSeconds <= 600) {
-    const interval = Math.max(60, Math.floor(durationSeconds / 8));
-    return generatePoints(durationSeconds, interval, 12);
-  }
-  
-  // Tier 3: Longer (10-20 min)
-  if (durationSeconds <= 1200) {
-    const interval = Math.max(90, Math.floor(durationSeconds / 12));
-    return generatePoints(durationSeconds, interval, 15);
-  }
-  
-  // Tier 4: Maximum (20-30 min)
-  const interval = Math.max(120, Math.floor(durationSeconds / 15));
-  return generatePoints(durationSeconds, interval, 18);
-}
+async function extractGenericPageContent(videoUrl, browserAct) {
+  const content = {
+    title: null,
+    description: null,
+    channel: null,
+    views: null,
+    duration: null,
+    topComments: []
+  };
 
-function generatePoints(duration, interval, maxSamples) {
-  const points = [];
-  let current = 0;
-  while (current < duration && points.length < maxSamples - 1) {
-    points.push(current);
-    current += interval;
-  }
-  // ALWAYS include final frame
-  if (points[points.length - 1] !== duration) {
-    points.push(duration);
-  }
-  return points;
-}
-
-/**
- * Sample video with OCR
- */
-async function sampleVideoWithOcr(videoUrl, samplePoints, platform, browserAct) {
-  const ocrTexts = [];
-  
   try {
-    // Make fullscreen
-    await browserAct({ action: 'press', key: 'f' });
-    await new Promise(r => setTimeout(r, 1000));
+    // Extract page title
+    const titleResult = await browserAct({
+      action: 'evaluate',
+      expression: `document.title?.replace(/ - YouTube$| - Vimeo$/, '') || null`
+    });
+    content.title = titleResult?.result || titleResult?.stdout;
 
-    let ocrAvailable = true; // Track if OCR service is reachable
+    // Extract meta description
+    const descResult = await browserAct({
+      action: 'evaluate',
+      expression: `
+        document.querySelector('meta[name="description"]')?.content ||
+        document.querySelector('meta[property="og:description"]')?.content ||
+        document.querySelector('[class*="description" i]')?.textContent?.substring(0, 2000) ||
+        null
+      `
+    });
+    content.description = descResult?.result || descResult?.stdout;
 
-    for (const seconds of samplePoints) {
-      if (!ocrAvailable) break; // Bail if service is down
+    // Try to extract channel/uploader info
+    const channelResult = await browserAct({
+      action: 'evaluate',
+      expression: `
+        document.querySelector('[class*="channel" i]')?.textContent?.trim() ||
+        document.querySelector('[class*="author" i]')?.textContent?.trim() ||
+        document.querySelector('[class*="uploader" i]')?.textContent?.trim() ||
+        document.querySelector('meta[property="og:site_name"]')?.content ||
+        null
+      `
+    });
+    content.channel = channelResult?.result || channelResult?.stdout;
 
-      // Seek to timestamp
-      await browserAct({
-        action: 'evaluate',
-        expression: `
-          (() => {
-            const video = document.querySelector('video');
-            if (video) video.currentTime = ${seconds};
-            return true;
-          })()
-        `
-      });
-      
-      await new Promise(r => setTimeout(r, 1500)); // Wait for frame + UI
-      
-      // Trigger screen capture and get OCR
-      const ocrResult = await getRecentOcr(15);
+    // Try to extract view count
+    const viewsResult = await browserAct({
+      action: 'evaluate',
+      expression: `
+        document.querySelector('[class*="view" i]')?.textContent?.match(/[\d,]+(?:\.\d+)?\s*[KM]?\s*(?:views?|views)/i)?.[0] ||
+        document.querySelector('[class*="count" i]')?.textContent?.match(/[\d,]+/)?.[0] ||
+        null
+      `
+    });
+    content.views = viewsResult?.result || viewsResult?.stdout;
 
-      // If OCR service returned 401/403, bail immediately — don't waste time retrying
-      if (ocrResult.statusCode === 401 || ocrResult.statusCode === 403) {
-        logger.warn(`[video.agent] OCR service returned ${ocrResult.statusCode} — skipping remaining samples`);
-        ocrAvailable = false;
-        break;
-      }
-      
-      if (ocrResult.available && ocrResult.capture) {
-        ocrTexts.push({
-          timestamp: seconds,
-          text: ocrResult.capture.text,
-          appName: ocrResult.capture.appName
-        });
-      }
-    }
+    // Try to extract top comments (first 3)
+    const commentsResult = await browserAct({
+      action: 'evaluate',
+      expression: `
+        (() => {
+          const comments = document.querySelectorAll('[class*="comment" i] [class*="text" i], [class*="comment" i] [class*="content" i], .comment');
+          const texts = [];
+          for (let i = 0; i < Math.min(comments.length, 3); i++) {
+            const text = comments[i]?.textContent?.trim();
+            if (text && text.length > 20) texts.push(text.substring(0, 300));
+          }
+          return texts;
+        })()
+      `
+    });
+    content.topComments = commentsResult?.result || [];
 
-    // Exit fullscreen
-    await browserAct({ action: 'press', key: 'Escape' });
-    
+    logger.info(`[video.agent] Generic extraction: title="${content.title?.substring(0, 50)}...", desc=${content.description?.length || 0} chars`);
   } catch (err) {
-    logger.error(`[video.agent] OCR sampling failed: ${err.message}`);
+    logger.warn(`[video.agent] Generic page content extraction failed: ${err.message}`);
   }
-  
-  return ocrTexts;
+
+  return content;
+}
+
+
+/**
+ * Strip SRT/VTT timestamp lines and formatting, leaving only plain spoken text.
+ * Handles: "00:00:01,000 --> 00:00:03,000", "WEBVTT", sequence numbers, HTML tags.
+ */
+function stripSubtitleFormatting(raw) {
+  return raw
+    .split('\n')
+    .filter(line => {
+      const t = line.trim();
+      if (!t) return false;
+      if (/^WEBVTT/.test(t)) return false;
+      if (/^\d+$/.test(t)) return false; // SRT sequence numbers
+      if (/^\d{2}:\d{2}/.test(t)) return false; // timestamp lines
+      if (/^NOTE\b/.test(t)) return false;
+      return true;
+    })
+    .map(line => line.replace(/<[^>]+>/g, '').trim()) // strip HTML/VTT tags
+    .filter(Boolean)
+    .join(' ')
+    .replace(/\s{2,}/g, ' ')
+    .trim();
 }
 
 /**
- * Synthesize text sources with LLM
+ * PRIMARY: Transcribe/caption a video using yt-dlp --write-auto-subs.
+ * Downloads only the subtitle file (~2s), no audio download needed.
+ * Works for YouTube auto-captions via the android API (no JS runtime required).
+ *
+ * FALLBACK: transcribe-anything (Whisper) — for videos with no auto-captions
+ * (private videos, live streams, non-YouTube platforms without captions).
  */
-async function synthesizeTextSources(textSources, goal, skillLlm) {
+async function transcribeWithYtDlp(videoUrl) {
+  const { spawnSync, spawn } = require('child_process');
+  const os = require('os');
+  const crypto = require('crypto');
+  const fs = require('fs');
+
+  const hash = crypto.createHash('md5').update(videoUrl).digest('hex').slice(0, 8);
+  const outTemplate = path.join(os.tmpdir(), `thinkdrop_transcript_${hash}`);
+
+  // ── PRIMARY: yt-dlp subtitle extraction ──────────────────────────────────
+  logger.info(`[video.agent] transcribeWithYtDlp: extracting subtitles for ${videoUrl}`);
+
+  const ytdlpPath = spawnSync('which', ['yt-dlp'], { encoding: 'utf8' }).stdout.trim() || 'yt-dlp';
+
+  const ytResult = await new Promise((resolve) => {
+    const proc = spawn(ytdlpPath, [
+      videoUrl,
+      '--write-auto-subs',
+      '--sub-lang', 'en',
+      '--skip-download',
+      '--convert-subs', 'srt',
+      '--no-playlist',
+      '--js-runtimes', 'node',
+      '-o', outTemplate,
+      '--quiet',
+    ], { timeout: 30000 });
+
+    let stderr = '';
+    proc.stderr.on('data', d => { stderr += d.toString(); });
+    proc.on('error', err => resolve({ ok: false, error: err.message }));
+    proc.on('close', code => resolve({ ok: code === 0, code, stderr }));
+  });
+
+  // yt-dlp writes <outTemplate>.en.srt (or similar)
+  let srtFile = null;
+  try {
+    const tmpDir = os.tmpdir();
+    const prefix = `thinkdrop_transcript_${hash}`;
+    const candidates = fs.readdirSync(tmpDir).filter(f => f.startsWith(prefix) && f.endsWith('.srt'));
+    if (candidates.length > 0) srtFile = path.join(tmpDir, candidates[0]);
+  } catch (_) { /* ignore */ }
+
+  if (srtFile && fs.existsSync(srtFile)) {
+    try {
+      const raw = fs.readFileSync(srtFile, 'utf8');
+      fs.unlinkSync(srtFile); // clean up
+      const transcript = stripSubtitleFormatting(raw);
+      if (transcript.length > 50) {
+        logger.info(`[video.agent] yt-dlp subtitles: ${transcript.length} chars`);
+        return { ok: true, transcript, source: 'yt-dlp-subs' };
+      }
+    } catch (readErr) {
+      logger.warn(`[video.agent] Failed to read SRT file: ${readErr.message}`);
+    }
+  }
+
+  logger.info(`[video.agent] yt-dlp subtitles unavailable (${ytResult.stderr?.slice(0, 120) || 'no srt written'}) — trying transcribe-anything fallback`);
+
+  // ── FALLBACK: transcribe-anything (Whisper) ───────────────────────────────
+  const _platform = os.platform();
+  const _arch = os.arch();
+  let device = 'cpu';
+  if (_platform === 'darwin' && _arch === 'arm64') {
+    device = 'mlx';
+    logger.info('[video.agent] Using MLX backend (Apple Silicon)');
+  }
+
+  try {
+    const checkResult = spawnSync('python3', ['-c', 'import transcribe_anything'], { timeout: 5000, encoding: 'utf8' });
+    if (checkResult.status !== 0) {
+      logger.info('[video.agent] transcribe-anything not found — attempting pip3 install...');
+      const installResult = spawnSync('pip3', ['install', 'transcribe-anything', '--quiet', '--user'], { timeout: 120000, encoding: 'utf8' });
+      if (installResult.status !== 0) {
+        logger.warn(`[video.agent] pip3 install transcribe-anything failed: ${installResult.stderr}`);
+        return { ok: false, error: 'No subtitles available and transcribe-anything could not be installed' };
+      }
+      logger.info('[video.agent] transcribe-anything installed successfully');
+    }
+  } catch (installErr) {
+    return { ok: false, error: `transcribe-anything check failed: ${installErr.message}` };
+  }
+
+  return new Promise((resolve) => {
+    const pythonScript = `
+import sys, json
+try:
+    from transcribe_anything import transcribe
+    result = transcribe(url_or_file="${videoUrl}", device="${device}", model="large", task="transcribe")
+    print(json.dumps({"success": True, "transcript": result}))
+except Exception as e:
+    print(json.dumps({"success": False, "error": str(e)}))
+`;
+    const pythonProcess = spawn('python3', ['-c', pythonScript], { timeout: 120000 });
+    let stdout = '', stderr = '';
+    pythonProcess.stdout.on('data', d => { stdout += d.toString(); });
+    pythonProcess.stderr.on('data', d => { stderr += d.toString(); });
+    pythonProcess.on('close', (code) => {
+      if (code !== 0) {
+        logger.warn(`[video.agent] transcribe-anything exited ${code}: ${stderr.slice(0, 200)}`);
+        resolve({ ok: false, error: `Transcription failed: ${stderr || 'exit ' + code}` });
+        return;
+      }
+      try {
+        const result = JSON.parse(stdout);
+        if (result.success && result.transcript) {
+          logger.info(`[video.agent] transcribe-anything: ${result.transcript.length} chars`);
+          resolve({ ok: true, transcript: result.transcript, source: 'transcribe-anything' });
+        } else {
+          resolve({ ok: false, error: result.error || 'Unknown transcription error' });
+        }
+      } catch (_) {
+        if (stdout && stdout.length > 100) {
+          resolve({ ok: true, transcript: stdout, source: 'transcribe-anything-raw' });
+        } else {
+          resolve({ ok: false, error: 'Could not parse transcription output' });
+        }
+      }
+    });
+    pythonProcess.on('error', err => resolve({ ok: false, error: `Python not available: ${err.message}` }));
+  });
+}
+
+/**
+ * Combine page content and transcription using LLM
+ */
+async function synthesizeVideoContent(pageContent, transcription, goal, skillLlm) {
+  // Pre-calculate hasTranscript so it's available in catch block
+  const hasTranscript = transcription && transcription.length > 100;
+
   if (!skillLlm) {
-    return { confidence: 0, steps: [] };
+    return { confidence: 0, steps: [], hasTranscript };
   }
 
   try {
     const { ask } = skillLlm;
-    
-    let transcriptText = 'No transcript available';
-    if (textSources.transcript) {
-      if (Array.isArray(textSources.transcript)) {
-        transcriptText = textSources.transcript.map(t => `[${t.time || ''}] ${t.text || t}`).join('\n');
-      } else if (typeof textSources.transcript === 'string') {
-        transcriptText = textSources.transcript;
-      }
-    }
-    
-    const prompt = `Analyze this video content and extract actionable steps for: "${goal}"
 
-TRANSCRIPT:
-${transcriptText}
+    let prompt;
+    if (hasTranscript) {
+      // Have both page content AND transcription
+      prompt = `Synthesize this video content into clear actionable steps for: "${goal}"
 
-DESCRIPTION:
-${textSources.description || 'No description available'}
+=== VIDEO METADATA ===
+Title: ${pageContent.title || 'Unknown'}
+Channel: ${pageContent.channel || 'Unknown'}
+Duration: ${pageContent.duration || 'Unknown'}
+Views: ${pageContent.views || 'Unknown'}
+
+=== VIDEO DESCRIPTION ===
+${pageContent.description?.substring(0, 2000) || 'No description'}
+
+=== AUDIO TRANSCRIPT (What was said) ===
+${transcription.substring(0, 4000)}
+
+=== TOP COMMENTS (Viewer insights) ===
+${(Array.isArray(pageContent.topComments) ? pageContent.topComments : []).map(c => `- ${c}`).join('\n') || 'No comments'}
 
 Extract 5-10 clear, actionable steps. Format as:
-1. [Action] [Target/Detail]
+1. [Action] [Detail]
 2. ...
 
-If the content doesn't provide enough information for clear steps, respond with "INSUFFICIENT".
+If the content is insufficient for clear steps, respond with "INSUFFICIENT" and explain why.
 
 STEPS:`;
+    } else {
+      // Page content only
+      prompt = `Extract actionable steps from this video information for: "${goal}"
 
-    const response = await ask(prompt, { maxTokens: 500, temperature: 0.3 });
-    
-    if (response.includes('INSUFFICIENT')) {
-      return { confidence: 0, steps: [] };
-    }
+=== VIDEO METADATA ===
+Title: ${pageContent.title || 'Unknown'}
+Channel: ${pageContent.channel || 'Unknown'}
+Duration: ${pageContent.duration || 'Unknown'}
+Views: ${pageContent.views || 'Unknown'}
 
-    // Parse steps from response
-    const steps = response
-      .split('\n')
-      .map(line => line.replace(/^\d+\.\s*/, '').trim())
-      .filter(line => line.length > 10);
+=== VIDEO DESCRIPTION ===
+${pageContent.description?.substring(0, 3000) || 'No description'}
 
-    return {
-      confidence: steps.length >= 5 ? 0.85 : steps.length >= 3 ? 0.6 : 0.3,
-      steps: steps.map((text, i) => ({ step: i + 1, text }))
-    };
-  } catch (err) {
-    logger.warn(`[video.agent] Text synthesis failed: ${err.message}`);
-    return { confidence: 0, steps: [] };
-  }
-}
+=== TOP COMMENTS ===
+${(Array.isArray(pageContent.topComments) ? pageContent.topComments : []).map(c => `- ${c}`).join('\n') || 'No comments'}
 
-/**
- * Analyze OCR samples to extract actionable steps
- */
-async function analyzeOcrSamples(ocrSamples, goal, skillLlm) {
-  if (!skillLlm || ocrSamples.length === 0) {
-    return { steps: [], confidence: 0 };
-  }
-
-  try {
-    const { ask } = skillLlm;
-    
-    const ocrText = ocrSamples.map(s => `[${s.timestamp}s] ${s.text}`).join('\n');
-
-    const prompt = `Analyze these video frame captures (OCR text) and extract actionable steps for: "${goal}"
-
-CAPTURED FRAMES (timestamp + visible text):
-${ocrText}
-
-Extract 5-10 clear, actionable steps based on what the video shows. If the OCR text is insufficient or unclear, respond with "INSUFFICIENT" and explain why.
-
-Format as:
-1. [Action] [Target]
+Extract 3-10 clear, actionable steps based on the information available. Format as:
+1. [Action] [Detail]
 2. ...
 
-STEPS:`;
-
-    const response = await ask(prompt, { maxTokens: 600, temperature: 0.3 });
-
-    if (response.includes('INSUFFICIENT')) {
-      return { confidence: 0, steps: [] };
-    }
-
-    const steps = response
-      .split('\n')
-      .map(line => line.replace(/^\d+\.\s*/, '').trim())
-      .filter(line => line.length > 10);
-
-    return {
-      confidence: Math.min(0.85, 0.5 + (steps.length * 0.05)),
-      steps: steps.map((text, i) => ({ step: i + 1, text }))
-    };
-  } catch (err) {
-    logger.warn(`[video.agent] OCR analysis failed: ${err.message}`);
-    return { steps: [], confidence: 0 };
-  }
-}
-
-/**
- * Combine text and OCR analysis
- */
-async function combineTextAndVisual(textAnalysis, ocrSamples, goal, skillLlm) {
-  if (!skillLlm || ocrSamples.length === 0) {
-    return textAnalysis || { steps: [], confidence: 0 };
-  }
-
-  try {
-    const { ask } = skillLlm;
-    
-    const ocrText = ocrSamples.map(s => `[${s.timestamp}s] ${s.text}`).join('\n');
-    const textSteps = textAnalysis?.steps?.map(s => s.text).join('\n') || 'No text analysis available';
-
-    const prompt = `Combine these video analysis sources to extract steps for: "${goal}"
-
-FROM VIDEO TEXT (transcript/description):
-${textSteps}
-
-FROM OCR SCREENSHOTS:
-${ocrText}
-
-Synthesize into 5-10 clear, actionable steps. Format as:
-1. [Action] [Target]
-2. ...
+If the content is insufficient, respond with "INSUFFICIENT".
 
 STEPS:`;
-
-    const response = await ask(prompt, { maxTokens: 600, temperature: 0.3 });
-
-    const steps = response
-      .split('\n')
-      .map(line => line.replace(/^\d+\.\s*/, '').trim())
-      .filter(line => line.length > 10);
-
-    return {
-      confidence: Math.min(0.9, (textAnalysis?.confidence || 0) + 0.1),
-      steps: steps.map((text, i) => ({ step: i + 1, text }))
-    };
-  } catch (err) {
-    logger.warn(`[video.agent] Combined analysis failed: ${err.message}`);
-    return textAnalysis || { steps: [], confidence: 0 };
-  }
-}
-
-/**
- * Transcribe video using CLI tool (e.g., transcribe-anything)
- * Fast path: gets full transcript in ~10 seconds
- */
-async function transcribeWithCli(videoUrl, cliAgent, skillLlm) {
-  if (!cliAgent) {
-    return { ok: false, error: 'cliAgent not available' };
-  }
-
-  try {
-    // Check if video-transcription CLI agent exists
-    const queryResult = await cliAgent({
-      action: 'query_agent',
-      service: 'video-transcription'
-    });
-
-    if (!queryResult.ok || !queryResult.agent) {
-      logger.info('[video.agent] No video-transcription CLI agent found');
-      return { ok: false, error: 'No transcription CLI agent found' };
     }
-
-    const agentId = queryResult.agent.id;
-    logger.info(`[video.agent] Using CLI agent ${agentId} for transcription`);
-
-    // Run transcription
-    const runResult = await cliAgent({
-      action: 'run',
-      agentId: agentId,
-      task: `transcribe ${videoUrl} to text`
-    });
-
-    if (!runResult.ok) {
-      logger.warn(`[video.agent] CLI transcription failed: ${runResult.error}`);
-      return { ok: false, error: runResult.error };
-    }
-
-    // Extract transcript from stdout
-    const transcript = runResult.stdout || '';
-    if (!transcript || transcript.length < 50) {
-      return { ok: false, error: 'Transcript too short or empty' };
-    }
-
-    logger.info(`[video.agent] CLI transcription successful: ${transcript.length} chars`);
-    return { ok: true, transcript, source: 'cli' };
-
-  } catch (err) {
-    logger.warn(`[video.agent] CLI transcription error: ${err.message}`);
-    return { ok: false, error: err.message };
-  }
-}
-
-/**
- * Extract key visual moments from transcript that would benefit from OCR
- */
-async function extractKeyMoments(transcript, goal, skillLlm) {
-  if (!skillLlm || !transcript) {
-    return { moments: [] };
-  }
-
-  try {
-    const { ask } = skillLlm;
-
-    const prompt = `From this video transcript, identify 3-4 key moments where visual context would help understand: "${goal}"
-
-Transcript:
-${transcript.substring(0, 3000)}
-
-For each moment:
-1. Identify the timestamp (estimate based on content flow, format as MM:SS)
-2. Describe what visual information would be helpful
-3. Explain why this moment matters
-
-Return ONLY a JSON array like:
-[
-  { "timestamp": "02:30", "reason": "Shows the dough consistency after folding" },
-  { "timestamp": "05:45", "reason": "Demonstrates the scoring technique" }
-]`;
-
-    const response = await ask(prompt, { maxTokens: 400, temperature: 0.3 });
-
-    // Parse JSON array from response
-    const jsonMatch = response.match(/\[[\s\S]*\]/);
-    if (jsonMatch) {
-      const moments = JSON.parse(jsonMatch[0]);
-      logger.info(`[video.agent] Extracted ${moments.length} key moments from transcript`);
-      return { moments: moments.slice(0, 4) }; // Max 4 moments
-    }
-
-    return { moments: [] };
-  } catch (err) {
-    logger.warn(`[video.agent] Failed to extract key moments: ${err.message}`);
-    return { moments: [] };
-  }
-}
-
-/**
- * Sample specific timestamps with OCR (targeted, not random)
- */
-async function sampleTimestamps(videoUrl, moments, platform, browserAct) {
-  if (!moments || moments.length === 0 || !browserAct) {
-    return [];
-  }
-
-  const ocrSamples = [];
-
-  try {
-    // Navigate to video
-    await browserAct({ action: 'navigate', url: videoUrl });
-    await new Promise(r => setTimeout(r, 2000));
-
-    // Make fullscreen for better OCR
-    await browserAct({ action: 'press', key: 'f' });
-    await new Promise(r => setTimeout(r, 1000));
-
-    for (const moment of moments) {
-      try {
-        const timestamp = moment.timestamp; // Format: MM:SS or HH:MM:SS
-        const seconds = timestampToSeconds(timestamp);
-
-        if (seconds === null) continue;
-
-        // Seek to timestamp
-        await browserAct({
-          action: 'evaluate',
-          expression: `
-            (() => {
-              const video = document.querySelector('video');
-              if (video) {
-                video.currentTime = ${seconds};
-                video.pause();
-                return true;
-              }
-              return false;
-            })()
-          `
-        });
-
-        await new Promise(r => setTimeout(r, 1500)); // Wait for frame
-
-        // Trigger screen capture and get OCR
-        const ocrResult = await getRecentOcr(15);
-
-        if (ocrResult.available && ocrResult.capture) {
-          ocrSamples.push({
-            timestamp: timestamp,
-            seconds: seconds,
-            text: ocrResult.capture.text,
-            reason: moment.reason,
-            appName: ocrResult.capture.appName
-          });
-        }
-      } catch (err) {
-        logger.warn(`[video.agent] Failed to sample timestamp ${moment.timestamp}: ${err.message}`);
-      }
-    }
-
-    // Exit fullscreen
-    await browserAct({ action: 'press', key: 'Escape' });
-
-    logger.info(`[video.agent] Targeted OCR captured ${ocrSamples.length}/${moments.length} moments`);
-    return ocrSamples;
-
-  } catch (err) {
-    logger.error(`[video.agent] Timestamp sampling failed: ${err.message}`);
-    return [];
-  }
-}
-
-/**
- * Helper: Convert MM:SS or HH:MM:SS to seconds
- */
-function timestampToSeconds(timestamp) {
-  if (!timestamp) return null;
-
-  const parts = timestamp.split(':').map(Number);
-  if (parts.some(isNaN)) return null;
-
-  if (parts.length === 2) {
-    // MM:SS
-    return parts[0] * 60 + parts[1];
-  } else if (parts.length === 3) {
-    // HH:MM:SS
-    return parts[0] * 3600 + parts[1] * 60 + parts[2];
-  }
-
-  return null;
-}
-
-/**
- * Combine CLI transcript with targeted OCR samples
- */
-async function combineTranscriptAndVisuals(transcript, ocrSamples, goal, skillLlm) {
-  if (!skillLlm) {
-    return { confidence: 0, steps: [] };
-  }
-
-  try {
-    const { ask } = skillLlm;
-
-    const ocrText = ocrSamples.map(s =>
-      `[${s.timestamp}] (Visual: ${s.reason})\n${s.text}`
-    ).join('\n\n');
-
-    const prompt = `Synthesize this video content into clear actionable steps for: "${goal}"
-
-=== AUDIO TRANSCRIPT (What they said) ===
-${transcript.substring(0, 4000)}
-
-=== VISUAL CONTEXT (What was shown) ===
-${ocrText || 'No visual samples captured'}
-
-Extract 5-10 clear, actionable steps. For each step that has visual context, include a brief visual description.
-
-Format as:
-1. [Action] [Detail] [Visual context if available]
-2. ...
-
-STEPS:`;
 
     const response = await ask(prompt, { maxTokens: 800, temperature: 0.3 });
 
-    // Parse steps
+    if (response.includes('INSUFFICIENT')) {
+      return { confidence: 0, steps: [], hasTranscript };
+    }
+
     const steps = response
       .split('\n')
       .map(line => line.replace(/^\d+\.\s*/, '').trim())
       .filter(line => line.length > 10);
 
-    const confidence = Math.min(0.95, 0.7 + (steps.length * 0.02) + (ocrSamples.length * 0.05));
+    // Higher confidence if we have transcript
+    const baseConfidence = hasTranscript ? 0.85 : 0.7;
+    const confidence = Math.min(0.95, baseConfidence + (steps.length * 0.02));
 
     return {
       confidence,
       steps: steps.map((text, i) => ({ step: i + 1, text })),
-      hasVisualContext: ocrSamples.length > 0
+      hasTranscript
     };
-
   } catch (err) {
-    logger.warn(`[video.agent] Combined synthesis failed: ${err.message}`);
-    return { confidence: 0, steps: [], hasVisualContext: false };
+    logger.warn(`[video.agent] Video synthesis failed: ${err.message}`);
+    return { confidence: 0, steps: [], hasTranscript };
   }
 }
 
 /**
- * Main action: Watch a specific video with hybrid CLI+OCR approach
+ * Main action: Watch a specific video with page content + transcription approach
  */
 async function actionWatchVideo({ videoUrl, goal, options = {} }, dependencies = {}) {
-  const { browserAct, skillLlm, cliAgent } = dependencies;
-  const { 
+  const { browserAct, skillLlm } = dependencies;
+  const {
     maxDuration = 1800,
     context = 'standalone',
     allowLongVideos = false,
@@ -786,7 +593,7 @@ async function actionWatchVideo({ videoUrl, goal, options = {} }, dependencies =
 
   // Extract metadata (with ad handling)
   const metadata = await extractMetadata(videoUrl, platform, browserAct, sessionId);
-  
+
   if (!metadata.ok) {
     return metadata;
   }
@@ -794,9 +601,9 @@ async function actionWatchVideo({ videoUrl, goal, options = {} }, dependencies =
   // Check duration limits
   if (metadata.duration > effectiveMax) {
     if (context === 'agent_learning') {
-      return { 
-        ok: false, 
-        error: `Video too long for learning: ${Math.round(metadata.duration/60)}min > ${Math.round(effectiveMax/60)}min limit` 
+      return {
+        ok: false,
+        error: `Video too long for learning: ${Math.round(metadata.duration/60)}min > ${Math.round(effectiveMax/60)}min limit`
       };
     } else if (!allowLongVideos) {
       return {
@@ -809,132 +616,79 @@ async function actionWatchVideo({ videoUrl, goal, options = {} }, dependencies =
   }
 
   // ===================================================================
-  // HYBRID APPROACH: CLI transcription first, then targeted OCR
+  // NEW APPROACH: Page content extraction + Audio transcription
   // ===================================================================
 
-  // STEP 1: Try CLI transcription (fastest, most reliable)
-  logger.info('[video.agent] Attempting CLI transcription first');
-  let cliResult = null;
-  
-  if (cliAgent) {
-    cliResult = await transcribeWithCli(videoUrl, cliAgent, skillLlm);
-  } else {
-    logger.info('[video.agent] cliAgent not provided, skipping CLI transcription');
-  }
-
-  if (cliResult?.ok) {
-    logger.info(`[video.agent] CLI transcription successful: ${cliResult.transcript.length} chars`);
-
-    // STEP 2: Extract key moments from transcript for targeted OCR
-    const keyMoments = await extractKeyMoments(cliResult.transcript, goal, skillLlm);
-    
-    // STEP 3: Do targeted OCR at those moments
-    let ocrSamples = [];
-    if (keyMoments.moments.length > 0) {
-      logger.info(`[video.agent] Targeted OCR at ${keyMoments.moments.length} key moments`);
-      ocrSamples = await sampleTimestamps(videoUrl, keyMoments.moments, platform, browserAct);
-    }
-
-    // STEP 4: Combine transcript + visuals
-    const combinedResult = await combineTranscriptAndVisuals(
-      cliResult.transcript, 
-      ocrSamples, 
-      goal, 
-      skillLlm
-    );
-
-    if (combinedResult.confidence > 0.6) {
-      const cliSteps = combinedResult.steps || [];
-      const cliStepsText = cliSteps.map((s, i) => `${i + 1}. ${s.text || s}`).join('\n');
-      return { 
-        ok: true, 
-        steps: cliSteps,
-        stdout: cliStepsText || `Watched video: ${videoUrl}`,
-        source: ocrSamples.length > 0 ? 'cli+targeted_ocr' : 'cli_transcript',
-        platform,
-        duration: metadata.duration,
-        visualSamples: ocrSamples.length,
-        confidence: combinedResult.confidence
-      };
-    }
-  }
-
-  // ===================================================================
-  // FALLBACK: Traditional OCR-based approach if CLI fails
-  // ===================================================================
-  logger.info('[video.agent] CLI approach insufficient, falling back to traditional OCR');
-
-  const samplePoints = calculateSamplePoints(metadata.duration);
-  logger.info(`[video.agent] Sampling ${samplePoints.length} points with OCR`);
-  
-  let ocrSamples = [];
-  try {
-    ocrSamples = await sampleVideoWithOcr(videoUrl, samplePoints, platform, browserAct);
-    logger.info(`[video.agent] OCR captured ${ocrSamples.length} samples`);
-  } catch (err) {
-    logger.warn(`[video.agent] OCR sampling failed: ${err.message}`);
-  }
-
-  // If OCR captured substantial content, use it immediately
-  if (ocrSamples.length > 0 && skillLlm) {
-    const ocrAnalysis = await analyzeOcrSamples(ocrSamples, goal, skillLlm);
-    
-    if (ocrAnalysis.confidence > 0.6) {
-      const ocrSteps = ocrAnalysis.steps || [];
-      const ocrStepsText = ocrSteps.map((s, i) => `${i + 1}. ${s.text || s}`).join('\n');
-      return { 
-        ok: true, 
-        steps: ocrSteps,
-        stdout: ocrStepsText || `Watched video: ${videoUrl}`,
-        source: 'ocr',
-        platform,
-        duration: metadata.duration,
-        sampleCount: ocrSamples.length
-      };
-    }
-  }
-
-  // STEP 2: Fall back to transcript/text extraction if OCR insufficient
-  logger.info(`[video.agent] OCR insufficient, falling back to text extraction`);
-  
-  let textSources = null;
+  // STEP 1: Extract rich page content (always works)
+  logger.info('[video.agent] Extracting page content...');
+  let pageContent = null;
   if (platform === 'youtube') {
-    textSources = await extractYouTubeText(videoUrl, browserAct);
+    pageContent = await extractYouTubeText(videoUrl, browserAct);
   }
 
-  // Synthesize text sources
-  let textAnalysis = null;
-  if (textSources && skillLlm) {
-    textAnalysis = await synthesizeTextSources(textSources, goal, skillLlm);
-    
-    if (textAnalysis.confidence > 0.8) {
-      const txtSteps = textAnalysis.steps || [];
-      const txtStepsText = txtSteps.map((s, i) => `${i + 1}. ${s.text || s}`).join('\n');
-      return { 
-        ok: true, 
-        steps: txtSteps,
-        stdout: txtStepsText || `Watched video: ${videoUrl}`,
-        source: 'text',
-        platform,
-        duration: metadata.duration
-      };
+  // If platform-specific extraction failed or not available, try generic
+  if (!pageContent || !pageContent.title) {
+    pageContent = await extractGenericPageContent(videoUrl, browserAct);
+  }
+
+  // STEP 2: Try subtitle/transcript extraction (best effort - don't block on failure)
+  logger.info('[video.agent] Attempting transcript extraction (yt-dlp subs → transcribe-anything fallback)...');
+  let transcription = null;
+  try {
+    const txResult = await transcribeWithYtDlp(videoUrl);
+    if (txResult.ok) {
+      transcription = txResult.transcript;
+      logger.info(`[video.agent] Transcript acquired via ${txResult.source}: ${transcription.length} chars`);
+    } else {
+      logger.info(`[video.agent] Transcript unavailable: ${txResult.error}`);
     }
+  } catch (err) {
+    logger.info(`[video.agent] Transcript error (non-blocking): ${err.message}`);
   }
 
-  // STEP 3: Combine both sources if both available
-  const combinedAnalysis = await combineTextAndVisual(textAnalysis, ocrSamples, goal, skillLlm);
+  // STEP 3: Combine page content + transcription using LLM
+  if (!skillLlm) {
+    return {
+      ok: true,
+      steps: [],
+      stdout: `Watched video: ${pageContent?.title || videoUrl}`,
+      source: transcription ? 'page+transcription' : 'page_only',
+      platform,
+      duration: metadata.duration,
+      pageContent,
+      transcriptLength: transcription?.length || 0
+    };
+  }
 
-  const finalSteps = combinedAnalysis.steps || [];
-  const stepsText = finalSteps.map((s, i) => `${i + 1}. ${s.text || s}`).join('\n');
+  const synthesis = await synthesizeVideoContent(pageContent, transcription, goal, skillLlm);
 
-  return { 
-    ok: true, 
-    steps: finalSteps,
-    stdout: stepsText || `Watched video: ${videoUrl}`,
-    source: textSources ? 'text+ocr' : 'ocr',
+  if (synthesis.confidence > 0.5 && synthesis.steps.length > 0) {
+    const stepsText = synthesis.steps.map((s, i) => `${i + 1}. ${s.text}`).join('\n');
+    return {
+      ok: true,
+      steps: synthesis.steps,
+      stdout: stepsText || `Watched video: ${pageContent?.title || videoUrl}`,
+      source: synthesis.hasTranscript ? 'page+transcription' : 'page_only',
+      platform,
+      duration: metadata.duration,
+      confidence: synthesis.confidence,
+      transcriptLength: transcription?.length || 0,
+      pageTitle: pageContent?.title
+    };
+  }
+
+  // Low confidence - return raw content for user review
+  return {
+    ok: true,
+    steps: [],
+    stdout: `Watched video: ${pageContent?.title || videoUrl}\n\nDescription:\n${pageContent?.description?.substring(0, 500) || 'No description available'}`,
+    source: transcription ? 'page+transcription' : 'page_only',
     platform,
     duration: metadata.duration,
-    sampleCount: ocrSamples.length
+    confidence: synthesis.confidence,
+    transcriptLength: transcription?.length || 0,
+    pageContent,
+    lowConfidence: true
   };
 }
 
@@ -1012,17 +766,87 @@ function _wordOverlap(a, b) {
 }
 
 /**
+ * Extract potential channel/creator name from a search query.
+ * Returns { channel: string|null, topic: string } where topic is the query minus channel.
+ *
+ * Patterns:
+ *   - "by [Channel]": "sourdough by Natasha Kitchen" → channel="Natasha Kitchen"
+ *   - "from [Channel]": "recipe from Bon Appetit" → channel="Bon Appetit"
+ *   - Possessive: "Natasha's Kitchen" → "Natasha Kitchen"
+ *   - Capitalized words at start: "Joshua Weissman pasta" → channel="Joshua Weissman"
+ */
+function _extractChannelFromQuery(query) {
+  if (!query) return { channel: null, topic: query || '' };
+
+  let cleanQuery = query.trim();
+
+  // Strip possessive apostrophes: "Natasha's Kitchen" → "Natasha Kitchen"
+  cleanQuery = cleanQuery.replace(/(\w+)'s\s+(Kitchen|Cooking|Food|Channel)/gi, '$1 $2');
+
+  // Pattern 1: "by [Channel]" or "from [Channel]"
+  const byMatch = cleanQuery.match(/\bby\s+([A-Z][A-Za-z\s]+?)(?:\s+(?:about|on|for|tutorial|recipe|video|how)|$)/i) ||
+                    cleanQuery.match(/\bfrom\s+([A-Z][A-Za-z\s]+?)(?:\s+(?:about|on|for|tutorial|recipe|video|how)|$)/i);
+  if (byMatch) {
+    const channel = byMatch[1].trim();
+    const topic = cleanQuery.replace(byMatch[0], '').trim();
+    return { channel, topic };
+  }
+
+  // Pattern 2: Leading capitalized words (potential channel name)
+  // Look for 1-3 capitalized words at the start followed by lowercase topic words
+  const leadingMatch = cleanQuery.match(/^([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2})\s+([a-z].+)$/);
+  if (leadingMatch) {
+    const potentialChannel = leadingMatch[1].trim();
+    const topic = leadingMatch[2].trim();
+    // Only treat as channel if it's not common words
+    const commonWords = ['how', 'what', 'why', 'when', 'where', 'the', 'best', 'easy', 'quick', 'simple'];
+    if (!commonWords.includes(potentialChannel.toLowerCase())) {
+      return { channel: potentialChannel, topic };
+    }
+  }
+
+  return { channel: null, topic: cleanQuery };
+}
+
+/**
+ * Check if a result contains the channel name (exact or fuzzy match).
+ * Returns match confidence: 1.0 = exact, 0.5 = partial, 0 = no match
+ */
+function _channelMatchScore(result, channelName) {
+  if (!channelName) return 0;
+
+  const searchText = `${result.title || ''} ${result.snippet || ''}`.toLowerCase();
+  const channelLower = channelName.toLowerCase();
+
+  // Exact match
+  if (searchText.includes(channelLower)) return 1.0;
+
+  // Fuzzy match - each word of channel appears
+  const channelWords = channelLower.split(/\s+/).filter(w => w.length > 2);
+  if (channelWords.length > 1) {
+    const matchedWords = channelWords.filter(w => searchText.includes(w));
+    if (matchedWords.length === channelWords.length) return 1.0;
+    if (matchedWords.length >= Math.ceil(channelWords.length * 0.7)) return 0.5;
+  }
+
+  return 0;
+}
+
+/**
  * Score a web search result as a direct video URL candidate.
  * Returns a confidence value 0.0–1.0.
  *
  * Signals (additive):
  *   +0.40  URL contains a valid platform video ID (watch?v=, /video/, /v/ etc.)
+ *   +0.35  Channel name appears in result (exact match)
+ *   +0.20  Channel name appears in result (partial/fuzzy match)
+ *   -0.30  Query has channel name but result doesn't match (penalty)
  *   +0.30  Title word overlap with rawQuery ≥ 60%
  *   +0.15  Title word overlap 30–60%
  *   +0.10  Snippet mentions at least 2 query keywords
  *   +0.05  Result domain matches the expected platform domain
  */
-function _scoreVideoResult(result, rawQuery, platformDomain) {
+function _scoreVideoResult(result, rawQuery, platformDomain, channelName) {
   let score = 0;
   const url = result.url || '';
   const title = result.title || '';
@@ -1051,7 +875,25 @@ function _scoreVideoResult(result, rawQuery, platformDomain) {
   // +0.05 — domain match
   if (platformDomain && url.includes(platformDomain)) score += 0.05;
 
-  return Math.min(score, 1.0);
+  // Channel name scoring — CRITICAL for correct video selection
+  if (channelName) {
+    const channelScore = _channelMatchScore(result, channelName);
+    if (channelScore === 1.0) {
+      // +0.35 — exact channel match (high priority)
+      score += 0.35;
+      logger.info(`[video.agent] Channel match: "${channelName}" found in result "${title.substring(0, 50)}"`);
+    } else if (channelScore === 0.5) {
+      // +0.20 — partial/fuzzy channel match
+      score += 0.20;
+      logger.info(`[video.agent] Partial channel match: "${channelName}" partially found in result "${title.substring(0, 50)}"`);
+    } else {
+      // -0.30 — penalty if query has channel but result doesn't match
+      score -= 0.30;
+      logger.info(`[video.agent] Channel mismatch: query has "${channelName}" but result "${title.substring(0, 50)}" doesn't match — applying penalty`);
+    }
+  }
+
+  return Math.min(Math.max(score, 0), 1.0);
 }
 
 /**
@@ -1077,13 +919,22 @@ async function _resolveVideoUrl(rawQuery, platformKey) {
   const cleanQuery = _normalizeQuery(rawQuery);
   const platformDomain = PLATFORM_DOMAIN[platformKey] || '';
 
+  // Extract channel name from query for better video matching
+  const { channel: extractedChannel, topic } = _extractChannelFromQuery(cleanQuery);
+  if (extractedChannel) {
+    logger.info(`[video.agent] _resolveVideoUrl: extracted channel="${extractedChannel}", topic="${topic}"`);
+  }
+
   if (!_WS_API_URL) {
     logger.info(`[video.agent] _resolveVideoUrl: web search not configured — using platform search page with cleaned query`);
     return { resolved: false, cleanQuery };
   }
 
+  // If we have a channel, include it in the search query for better results
   const siteQuery = platformDomain
-    ? `${cleanQuery} site:${platformDomain}`
+    ? extractedChannel
+      ? `${cleanQuery} "${extractedChannel}" site:${platformDomain}`
+      : `${cleanQuery} site:${platformDomain}`
     : cleanQuery;
 
   logger.info(`[video.agent] _resolveVideoUrl: searching web for "${siteQuery}"`);
@@ -1143,7 +994,7 @@ async function _resolveVideoUrl(rawQuery, platformKey) {
       url: r.url,
       title: r.title || '',
       snippet: r.snippet || '',
-      score: _scoreVideoResult(r, cleanQuery, platformDomain),
+      score: _scoreVideoResult(r, cleanQuery, platformDomain, extractedChannel),
     })).sort((a, b) => b.score - a.score);
 
     const best = scored[0];

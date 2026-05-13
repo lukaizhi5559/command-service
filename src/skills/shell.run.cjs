@@ -360,6 +360,7 @@ const ALLOWED_COMMANDS = new Set([
 
   // ── Media ──────────────────────────────────────────────────────────────────
   'ffmpeg', 'ffprobe',
+  'yt-dlp', 'gallery-dl', 'whisper', 'spotdl',  // media download / transcription
   'convert', 'identify',  // ImageMagick
   'exiftool',
 

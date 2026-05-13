@@ -177,6 +177,23 @@ async function getDb() {
 
 
 // ---------------------------------------------------------------------------
+// Video platforms list — services that have video content and need video.agent delegation
+// ---------------------------------------------------------------------------
+const VIDEO_PLATFORMS = new Set([
+  'youtube', 'vimeo', 'rumble', 'tiktok', 'facebook', 'fb', 'instagram', 'ig',
+  'twitch', 'kick', 'dailymotion', 'bilibili', 'youku', 'tudou', 'peertube',
+  'odysee', 'lbry', 'bitchute', 'brighteon', 'bannedvideo', 'bandcamp',
+  'spotify', 'soundcloud', 'mixcloud', 'anchor', 'podcast', 'applepodcasts',
+  'netflix', 'hulu', 'disneyplus', 'hbomax', 'primevideo', 'appletv', 'peacock',
+  'crunchyroll', 'funimation', 'vrv', 'tubi', 'pluto', 'roku', 'plex',
+  'wistia', 'loom', 'vidyard', 'brightcove', 'kaltura', 'jwplayer',
+  'coursera', 'udemy', 'skillshare', 'masterclass', 'edx', 'khanacademy',
+  'ted', 'tedtalks', 'bigthink', 'vsauce', 'veritasium', 'kurzgesagt',
+  'foodnetwork', 'allrecipes', 'seriouseats', 'natashaskitchen', 'tasty',
+  'bonappetit', 'chefsteps', 'americastestkitchen', 'cookingchannel',
+]);
+
+// ---------------------------------------------------------------------------
 // Known browser-only services map
 // ---------------------------------------------------------------------------
 
@@ -672,6 +689,11 @@ NOTE: Use /results?search_query= URL directly — it is more reliable than click
 2. Wait for page to load: { "action": "waitForStableText" }
 3. Read video page content: { "action": "getPageText" }
 
+### Extract Video Content (watch and tell me about it, tell me about, tell me what, describe it, describe the video, explain it, give me a summary, watch and summarize, extract, steps, transcript, tutorial, learn, summarize, content, analyze)
+DELEGATE_TO: video.agent
+PLATFORM: youtube
+INSTRUCTION: Use video.agent to find and watch tutorial videos, extracting actionable steps and content via page metadata + audio transcription.
+
 ### Browse Feed / Subscriptions (subscriptions, feed, home, browse, latest)
 1. Navigate to YouTube feed: { "action": "navigate", "url": "https://www.youtube.com/feed/subscriptions" }
 2. Wait for feed to load: { "action": "waitForStableText" }
@@ -755,7 +777,18 @@ IMPORTANT:
 - For contenteditable rich-text areas use type, not fill
 - After hover/dblclick/click that opens a menu or modal, always snapshot before the next action
 - Keep selectors as generic/semantic as possible since you don't have a live DOM
-- Output ONLY the ### playbook sections — no preamble, no explanation`;
+- Output ONLY the ### playbook sections — no preamble, no explanation
+
+VIDEO CONTENT DETECTION:
+- Analyze the service at START_URL. Does it host videos, have video players, or embed video content?
+- If YES, you MUST include this additional playbook:
+
+### Extract Video Content (extract, steps, transcript, tutorial, learn, summarize, content, analyze)
+DELEGATE_TO: video.agent
+PLATFORM: <service_name>
+INSTRUCTION: Use video.agent to find and watch tutorial videos, extracting actionable steps and content via page metadata + audio transcription.
+
+This signals the system to delegate video extraction tasks to the specialized video.agent skill.`;
 
 // ---------------------------------------------------------------------------
 // PLAYBOOK_RUNTIME_COT_PROMPT — LLM prompt for generating a single playbook
@@ -802,7 +835,19 @@ Format your response as a single ### section:
 IMPORTANT:
 - The ### header keywords are used for future matching — make them comprehensive and relevant
 - Do NOT repeat steps from the existing playbooks — generate only what GOAL requires
-- Output ONLY the ### section — no preamble, no explanation`;
+- Output ONLY the ### section — no preamble, no explanation
+
+VIDEO CONTENT DETECTION AT RUNTIME:
+- If the GOAL involves extracting steps, transcript, or content from a video on this site
+- AND no existing playbook handles video extraction
+- Generate a playbook with this format:
+
+### Extract Video Content (extract, steps, transcript, tutorial, learn, summarize, content, analyze)
+DELEGATE_TO: video.agent
+PLATFORM: <service_name>
+INSTRUCTION: Use video.agent to find and watch tutorial videos, extracting actionable steps and content.
+
+This enables automatic video extraction capability without needing browser automation steps.`;
 
 // ---------------------------------------------------------------------------
 // _resolvePlaybook — 3-tier goal-aware playbook selection.
@@ -810,6 +855,9 @@ IMPORTANT:
 //   tier 1: keyword match found     — section = matched ### block
 //   tier 3: no match                — section = null, subsections = all ### blocks (for COT)
 // ---------------------------------------------------------------------------
+// Keywords indicating video/content extraction intent — prioritize DELEGATE_TO playbooks
+const EXTRACTION_INTENT_KEYWORDS = ['extract', 'steps', 'transcribe', 'summarize', 'learn from', 'content', 'analyze', 'watch and', 'tutorial and', 'tell me the', 'give me the'];
+
 function _resolvePlaybook(descriptor, task) {
   if (!descriptor || !task) return { tier: 3, section: null, subsections: [] };
 
@@ -838,11 +886,120 @@ function _resolvePlaybook(descriptor, task) {
   }
 
   if (matched.length > 0) {
+    // Check for extraction intent — prioritize DELEGATE_TO playbooks
+    const hasExtractionIntent = EXTRACTION_INTENT_KEYWORDS.some(kw => taskLower.includes(kw));
+    if (hasExtractionIntent) {
+      const delegatePlaybooks = matched.filter(pb => pb.includes('DELEGATE_TO:'));
+      if (delegatePlaybooks.length > 0) {
+        logger.info(`[browser.agent] _resolvePlaybook: extraction intent detected, prioritizing DELEGATE_TO playbook(s)`);
+        return { tier: 1, section: delegatePlaybooks.join('\n\n'), subsections };
+      }
+    }
     // Join all matching sections — compound tasks (e.g. "find and delete") get both playbooks
     return { tier: 1, section: matched.join('\n\n'), subsections };
   }
 
   return { tier: 3, section: null, subsections };
+}
+
+// ---------------------------------------------------------------------------
+// _cosineSim — dot-product cosine similarity between two equal-length vectors.
+// ---------------------------------------------------------------------------
+function _cosineSim(a, b) {
+  let dot = 0, na = 0, nb = 0;
+  for (let i = 0; i < a.length; i++) { dot += a[i] * b[i]; na += a[i] * a[i]; nb += b[i] * b[i]; }
+  const denom = Math.sqrt(na) * Math.sqrt(nb);
+  return denom === 0 ? 0 : dot / denom;
+}
+
+// ---------------------------------------------------------------------------
+// _resolvePlaybookSemantic — semantic embedding-based playbook selection.
+// Calls /memory.embed on the user-memory service (port 3001) to get vectors
+// for the task + all playbook headers, computes cosine similarity in-process,
+// and returns the best-matching section(s).
+// Falls back to keyword-based _resolvePlaybook() if the embedding service is
+// unreachable or returns no results.
+// ---------------------------------------------------------------------------
+const _MEMORY_EMBED_PORT = parseInt(process.env.MEMORY_SERVICE_PORT || '3001', 10);
+const _MEMORY_EMBED_HOST = process.env.MEMORY_SERVICE_HOST || '127.0.0.1';
+const _MEMORY_EMBED_KEY  = process.env.MCP_USER_MEMORY_API_KEY || process.env.USER_MEMORY_API_KEY || process.env.MCP_API_KEY || '';
+
+async function _resolvePlaybookSemantic(agentId, descriptor, task) {
+  if (!descriptor || !task) return _resolvePlaybook(descriptor, task);
+
+  const playbookMatch = descriptor.match(/\n## Playbooks\n([\s\S]*)$/);
+  if (!playbookMatch) return _resolvePlaybook(descriptor, task);
+
+  const subsections = playbookMatch[1].trim()
+    .split(/(?=### )/).map(s => s.trim()).filter(Boolean);
+  if (subsections.length === 0) return _resolvePlaybook(descriptor, task);
+
+  const headers = subsections.map(s => s.split('\n')[0]);
+
+  try {
+    const body = JSON.stringify({
+      version: 'mcp.v1',
+      requestId: `embed_${Date.now()}`,
+      action: 'memory.embed',
+      payload: { texts: [task, ...headers] },
+    });
+
+    const embedResult = await new Promise((resolve) => {
+      const req = http.request({
+        hostname: _MEMORY_EMBED_HOST,
+        port: _MEMORY_EMBED_PORT,
+        path: '/memory.embed',
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Content-Length': Buffer.byteLength(body),
+          'Authorization': `Bearer ${_MEMORY_EMBED_KEY}`,
+        },
+      }, (res) => {
+        let data = '';
+        res.on('data', c => { data += c; });
+        res.on('end', () => { try { resolve(JSON.parse(data)); } catch { resolve(null); } });
+      });
+      req.on('error', () => resolve(null));
+      req.setTimeout(5000, () => { req.destroy(); resolve(null); });
+      req.write(body);
+      req.end();
+    });
+
+    const vectors = embedResult?.result?.embeddings || embedResult?.embeddings;
+    if (!Array.isArray(vectors) || vectors.length < 2) {
+      return _resolvePlaybook(descriptor, task);
+    }
+
+    const [taskVec, ...headerVecs] = vectors;
+
+    const scored = headers.map((h, i) => ({
+      score:         _cosineSim(taskVec, headerVecs[i] || []),
+      section:       subsections[i],
+      hasDelegation: subsections[i].includes('DELEGATE_TO:'),
+    })).sort((a, b) => b.score - a.score);
+
+    logger.info(`[browser.agent] _resolvePlaybookSemantic: top scores for ${agentId} — ${scored.slice(0, 3).map(s => `"${s.section.split('\n')[0].slice(0, 50)}" (${s.score.toFixed(3)})`).join(', ')}`);
+
+    // Prioritize DELEGATE_TO if it scores above 0.30
+    const delegateMatch = scored.find(s => s.hasDelegation && s.score >= 0.30);
+    if (delegateMatch) {
+      logger.info(`[browser.agent] _resolvePlaybookSemantic: delegation match → "${delegateMatch.section.split('\n')[0]}" (score=${delegateMatch.score.toFixed(3)})`);
+      return { tier: 1, section: delegateMatch.section, subsections };
+    }
+
+    // Collect all sections above threshold (compound tasks get multiple sections)
+    const matched = scored.filter(s => s.score >= 0.35).map(s => s.section);
+    if (matched.length > 0) {
+      return { tier: 1, section: matched.join('\n\n'), subsections };
+    }
+
+    return { tier: 3, section: null, subsections };
+
+  } catch (_semErr) {
+    logger.warn(`[browser.agent] _resolvePlaybookSemantic: embedding call failed (${_semErr.message}) — falling back to keyword scan`);
+    return _resolvePlaybook(descriptor, task);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1219,6 +1376,13 @@ async function actionBuildAgent({ service, startUrl: explicitUrl, force = false,
     }
   }
   logger.info(`[browser.agent] build_agent: playbooks for ${agentId} — source=${playbooksSource || 'none'}`);
+
+  // Inject video extraction playbook for video-capable platforms (fallback for LLM not generating it)
+  if (VIDEO_PLATFORMS.has(serviceKey) && !playbooks?.includes('DELEGATE_TO: video.agent')) {
+    const videoPlaybook = `\n\n### Extract Video Content (watch and tell me about it, tell me about, tell me what, describe it, describe the video, explain it, give me a summary, watch and summarize, extract, steps, transcript, tutorial, learn, summarize, content, analyze)\nDELEGATE_TO: video.agent\nPLATFORM: ${serviceKey}\nINSTRUCTION: Use video.agent to find and watch tutorial videos, extracting actionable steps and content via page metadata + audio transcription.`;
+    playbooks = (playbooks || '') + videoPlaybook;
+    logger.info(`[browser.agent] build_agent: injected video extraction playbook for ${agentId}`);
+  }
 
   // Agent status: LLM-generated playbooks are unverified — mark needs_validation so the first
   // successful run can upgrade to 'healthy'. Seeded playbooks are battle-tested — healthy directly.
@@ -1882,6 +2046,12 @@ Rules:
 - On HTTP 4xx or 5xx: read the response body carefully for error details, then retry with corrected parameters or endpoint.
 - Use web_search or web_fetch to find the correct endpoint, required headers, or request body format when uncertain.
 - Use done immediately when HTTP 2xx is received and the task is confirmed complete.
+- On HTTP 4xx/5xx, diagnose before retrying:
+  401/403 → auth issue: verify credential format matches descriptor (Bearer vs Basic vs header name), retry with corrected auth header
+  404     → bad endpoint: use web_fetch to find correct URL path from API docs, then retry
+  400/422 → bad request body: use web_fetch to check required fields and format, then retry
+  5xx     → server error: retry once; if persists, use ask_user
+  Never use ask_user for 4xx without first attempting one web_fetch diagnostic probe.
 - Use ask_user only when genuinely blocked by missing information that cannot be resolved with the tools above.
 - Output JSON only. No prose. No markdown fences.`;
 
@@ -2052,7 +2222,7 @@ async function actionRun({ agentId, task, url, context, requiresAuth, _progressC
 
   // ── REST API path (api_key, bearer, basic) — multi-turn agentic loop ──
   if (agentType === 'api_key' || agentType === 'bearer' || agentType === 'basic') {
-    const MAX_TURNS = 5;
+    const MAX_TURNS = 8;
     const OBSERVATION_CHARS = 600;
     const loopHistory = [];
 
@@ -2636,9 +2806,11 @@ async function actionRun({ agentId, task, url, context, requiresAuth, _progressC
       : task;
 
   // ── Goal-aware playbook injection ────────────────────────────────────────────
-  // Tier 1: one or more keyword-matched ### sections → injected directly, 0 LLM calls.
-  //         Compound tasks ("find and delete") get ALL matching sections concatenated.
-  // Tier 2: no keyword match → inject 2 seeded sections as FORMAT EXAMPLES + a NOVEL TASK
+  // Tier 1: semantic embedding match → best ### section(s) injected directly.
+  //         Uses /memory.embed (user-memory service) + local cosine similarity.
+  //         Falls back to keyword scan if embedding service is unavailable.
+  //         Compound tasks get all sections above the similarity threshold.
+  // Tier 2: no match → inject 2 seeded sections as FORMAT EXAMPLES + a NOVEL TASK
   //         comment so playwright.agent reasons from the live snapshot. 0 LLM calls,
   //         0 added latency. Async COT write-back fires after success to cache for next run.
   // Tier 3: no playbook sections exist yet → inject core descriptor only (bare agent).
@@ -2646,7 +2818,7 @@ async function actionRun({ agentId, task, url, context, requiresAuth, _progressC
   let _playbookTier   = 3;        // tracked for post-execution write-back decision
   if (existing.descriptor) {
     const _coreDescriptor = existing.descriptor.replace(/\n## Playbooks[\s\S]*/m, '').trim();
-    const _playbook = _resolvePlaybook(existing.descriptor, task);
+    const _playbook = await _resolvePlaybookSemantic(agentId, existing.descriptor, task);
     let _matchedPlaybook = null;
 
     if (_playbook.tier === 1) {
@@ -2655,6 +2827,64 @@ async function actionRun({ agentId, task, url, context, requiresAuth, _progressC
       _playbookTier    = 1;
       const headers = _playbook.section.match(/^### .+/gm) || [];
       logger.info(`[browser.agent] playbook: tier-1 match (${headers.length} section(s)) for ${agentId} — ${headers.map(h => `"${h}"`).join(', ')}`);
+
+      // Check for DELEGATE_TO directive — special playbooks that delegate to other skills
+      const delegateMatch = _matchedPlaybook.match(/DELEGATE_TO:\s*(\S+)/);
+      if (delegateMatch) {
+        const delegateSkill = delegateMatch[1];
+        const platformMatch = _matchedPlaybook.match(/PLATFORM:\s*(\S+)/);
+        const platform = platformMatch ? platformMatch[1] : serviceKey;
+
+        if (delegateSkill === 'video.agent') {
+          // Strip instruction noise before passing to video.agent.
+          // Task like "watch X, extract the key steps, then summarize" → "X"
+          // Only the video identity part (title/creator) should reach the search.
+          const _videoQuery = task
+            .replace(/,.*$/s, '')                                   // drop everything after first comma
+            .replace(/;\s*.*/s, '')                                  // drop everything after semicolon
+            .replace(/^(?:watch|find|play|open|show|get|look up|navigate to|go to)\s+/i, '') // leading verb
+            .replace(/\s+(?:and|then)\s+.*$/i, '')                  // trailing "and/then ..."
+            .trim() || task;
+          logger.info(`[browser.agent] run: delegating to video.agent for ${agentId} — query="${_videoQuery.slice(0, 80)}"`);
+          try {
+            const videoResult = await callSkill('video.agent', {
+              action: 'find_and_watch_tutorial',
+              platform: platform,
+              query: _videoQuery,
+              goal: task,
+            }, 120000);
+
+            if (videoResult?.ok) {
+              logger.info(`[browser.agent] run: video.agent completed successfully`);
+              return {
+                ok: true,
+                agentId,
+                task,
+                result: videoResult.result || videoResult.data || videoResult,
+                delegated: 'video.agent',
+              };
+            } else {
+              logger.warn(`[browser.agent] run: video.agent failed — ${videoResult?.error || 'unknown error'}`);
+              return {
+                ok: false,
+                agentId,
+                task,
+                error: videoResult?.error || 'video.agent delegation failed',
+                delegated: 'video.agent',
+              };
+            }
+          } catch (videoErr) {
+            logger.error(`[browser.agent] run: video.agent error — ${videoErr.message}`);
+            return {
+              ok: false,
+              agentId,
+              task,
+              error: `video.agent error: ${videoErr.message}`,
+              delegated: 'video.agent',
+            };
+          }
+        }
+      }
 
     } else if (_playbook.subsections.length > 0) {
       // Tier 2: no keyword match but we have seed sections to use as format references.

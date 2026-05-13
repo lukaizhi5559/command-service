@@ -16,16 +16,23 @@ const PLATFORM_PATTERNS = {
       '.ytp-ad-module',
       '.ytp-ad-player-overlay',
       '.ytp-ads',
+      '.ytp-ad-overlay',
       '[class*="ad-showing"]',
+      '[class*="ad-overlay"]',
       '.ytp-ad-display',
-      '.ytp-ad-text'
+      '.ytp-ad-text',
+      '.ytp-skip-ad-button' // Skip button presence indicates ad
     ],
     skipButtons: [
       '.ytp-skip-ad-button',
       '.ytp-ad-skip-button',
       'button.ytp-skip-ad-button',
+      '.ytp-skip-ad-button__text',
       '[class*="skip-ad" i]',
-      '[aria-label*="skip" i]'
+      '[class*="skip-button" i]',
+      '[aria-label*="skip" i]',
+      'button:has-text("Skip")',
+      '.ytp-ad-skip-button-modern'
     ]
   },
   vimeo: {
@@ -57,12 +64,15 @@ const PLATFORM_PATTERNS = {
 const AD_KEYWORDS = [
   'skip ad',
   'skip advertisement', 
+  'skip',
   'advertisement',
   'sponsored',
   'your video will begin',
   'video will play after',
   'ad in',
-  'seconds'
+  'seconds',
+  '1 of 2',
+  '2 of 2'
 ];
 
 /**
@@ -261,33 +271,56 @@ async function waitForAdEnd(platform, browserAct, sessionId, maxWaitMs = 30000, 
  */
 async function handleAds(platform, browserAct, sessionId, options = {}) {
   const {
-    initialWaitMs = 3000,      // Wait for page render
+    initialWaitMs = 8000,      // Wait for page render + ad load (increased from 3s)
     skipCountdownMs = 5000,    // Wait for YouTube's "Skip in 5..."
     maxAdWaitMs = 30000,       // Max wait for ad
-    pollIntervalMs = 3000      // Polling frequency
+    pollIntervalMs = 2000        // Polling frequency (more frequent)
   } = options;
   
   try {
     logger.info(`[ad-handler] Starting ad handling for ${platform}`);
     
-    // Step 1: Initial wait for page to render
-    logger.info(`[ad-handler] Waiting ${initialWaitMs}ms for initial render`);
-    await sleep(initialWaitMs);
+    // Step 1: Poll during initial wait period to catch ads that load gradually
+    logger.info(`[ad-handler] Polling for ${initialWaitMs}ms during initial load`);
+    const initialStart = Date.now();
+    let adDetected = null;
     
-    // Quick check if there's an ad immediately
-    const initialCheck = await detectAd(platform, browserAct, sessionId);
-    if (!initialCheck.isPlaying) {
-      logger.info('[ad-handler] No ad detected, proceeding');
+    while (Date.now() - initialStart < initialWaitMs) {
+      const check = await detectAd(platform, browserAct, sessionId);
+      if (check.isPlaying) {
+        adDetected = check;
+        logger.info(`[ad-handler] Ad detected after ${Date.now() - initialStart}ms: skip=${check.hasSkipButton}`);
+        break;
+      }
+      await sleep(pollIntervalMs);
+    }
+    
+    if (!adDetected) {
+      logger.info('[ad-handler] No ad detected during initial wait, proceeding');
       return { success: true, skipped: false, waited: false, error: null };
     }
     
     logger.info('[ad-handler] Ad detected, beginning ad handling');
     
-    // Step 2: Wait for skip countdown (YouTube's "Skip in 5...")
+    // Step 2: If skip button already available, try clicking immediately
+    if (adDetected.hasSkipButton && adDetected.skipSelector) {
+      logger.info('[ad-handler] Skip button available immediately, attempting click');
+      const clicked = await clickSkipButton(adDetected.skipSelector, browserAct, sessionId);
+      if (clicked) {
+        await sleep(1000);
+        const verifySkip = await detectAd(platform, browserAct, sessionId);
+        if (!verifySkip.isPlaying) {
+          logger.info('[ad-handler] Ad skipped immediately');
+          return { success: true, skipped: true, waited: false, error: null };
+        }
+      }
+    }
+    
+    // Step 3: Wait for skip countdown (YouTube's "Skip in 5...")
     logger.info(`[ad-handler] Waiting ${skipCountdownMs}ms for skip countdown`);
     await sleep(skipCountdownMs);
     
-    // Step 3: Check for skip button and try to click
+    // Step 4: Check for skip button again and try to click
     const afterCountdown = await detectAd(platform, browserAct, sessionId);
     if (afterCountdown.hasSkipButton && afterCountdown.skipSelector) {
       const clicked = await clickSkipButton(afterCountdown.skipSelector, browserAct, sessionId);
@@ -302,7 +335,7 @@ async function handleAds(platform, browserAct, sessionId, options = {}) {
       }
     }
     
-    // Step 4: If still playing, wait for ad to end
+    // Step 5: If still playing, wait for ad to end
     const waited = await waitForAdEnd(platform, browserAct, sessionId, maxAdWaitMs, pollIntervalMs);
     
     if (waited) {

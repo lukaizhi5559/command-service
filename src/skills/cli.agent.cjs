@@ -26,6 +26,17 @@ const fs   = require('fs');
 const { spawn } = require('child_process');
 const logger = require('../logger.cjs');
 
+// Import shell.run's allowlist so run_shell interpreter validation and
+// LLM tool awareness stay in sync with what shell.run will actually accept.
+const { ALLOWED_COMMANDS: SHELL_ALLOWED_COMMANDS } = require('./shell.run.cjs');
+
+// Subset of ALLOWED_COMMANDS that are script interpreters (accept -c or -e flag)
+const _SHELL_INTERPRETERS = new Set(
+  [...SHELL_ALLOWED_COMMANDS].filter(cmd =>
+    /^(bash|sh|zsh|fish|node|python[23]?|ruby|perl|deno|bun)$/.test(cmd)
+  )
+);
+
 const AGENTS_DB_PATH = path.join(os.homedir(), '.thinkdrop', 'agents.db');
 const AGENTS_DIR     = path.join(os.homedir(), '.thinkdrop', 'agents');
 const DEFAULT_TIMEOUT_MS = 15000;
@@ -533,24 +544,107 @@ Each turn you output exactly ONE JSON action object from this palette:
 
   run_cmd    – execute CLI command:         { "action": "run_cmd", "argv": [...] }
   run_help   – read subcommand help:        { "action": "run_help", "subcmd": [...] }
+  run_shell  – script for probing/piping:   { "action": "run_shell", "script": "...", "interpreter": "bash" }
+             interpreters: bash (default) | node | python3
+             bash:    "yt-dlp --help 2>&1 | grep -A3 'sub'"
+             node:    "const r=require('child_process').execSync('yt-dlp --version').toString(); console.log(r)"
+             python3: "import subprocess,json; r=subprocess.run(['yt-dlp','--version'],capture_output=True); print(r.stdout.decode())"
   run_update – upgrade CLI to latest:       { "action": "run_update", "cli": "<name>" }
   web_search – search for docs/examples:   { "action": "web_search", "query": "..." }
   web_fetch  – read a docs/reference URL:  { "action": "web_fetch", "url": "..." }
   done       – task complete:              { "action": "done", "summary": "..." }
   ask_user   – need user clarification:    { "action": "ask_user", "question": "...", "options": [], "save_rule": "..." }  (save_rule optional — see Rules)
 
+Each action object may include an optional "thinking" field: one sentence (max 120 chars) explaining why you chose this action. Example: { "action": "run_help", "subcmd": [], "thinking": "Need to check yt-dlp flag syntax before running." }
+
 Rules:
 - argv must NOT include the CLI binary name itself — only the subcommand and its arguments.
-- ONLY use subcommands and flags explicitly listed in the Agent Descriptor. Do NOT guess or invent commands from training knowledge — the descriptor is authoritative.
-- If the required subcommand is NOT in the descriptor, FIRST try run_help on the most likely escape-hatch subcommand (e.g. ["api"], ["call"], ["request"]) — it returns instant local docs in 1 turn. Only fall back to web_search if run_help output is insufficient or the operation is completely novel.
+- ONLY use subcommands and flags explicitly listed in the Agent Descriptor. Do NOT guess or invent commands from training knowledge — the descriptor is authoritative. EXCEPTION: if the CLI tool itself emits a WARNING: line recommending a specific flag (e.g. "add --js-runtimes node", "use --config"), you MAY add that exact flag on the next retry even if it is not in the descriptor. This is self-healing behavior — the tool is telling you what it needs.
+- If the required subcommand or flag is NOT in the descriptor, use run_help FIRST — it reads the CLI's own built-in docs in 1 turn and is always more accurate than web_search. For subcommand CLIs (gh, docker, aws) pass the relevant subcmd path. For flag-driven CLIs (yt-dlp, ffmpeg, curl) where flags are not subcommands, pass a relevant section keyword if available, e.g. ["--help"]. Only fall back to web_search if run_help output is insufficient or the operation is completely novel.
+- Do NOT issue web_search on turn 1 if the CLI tool is installed and you only need flag syntax — run_help is faster, free, and the tool's own docs are the authoritative source.
 - web_search and web_fetch are your fallback sources when run_help is insufficient — prefer fresh docs over assumptions. If 2 consecutive web_search turns returned "no results", STOP searching — hard-pivot to web_fetch with the best official docs URL you know. Do NOT keep issuing web_search with variant queries.
 - After run_cmd returns exitCode=0: if the task is fully complete (write/delete/star/follow — no output to process), output done. If the output needs further processing (decode base64, extract a URL or path, save content to a file), continue with the next action.
-- Use run_help when you know the subcommand path but need exact flags or argument format. \`subcmd\` is the path WITHOUT the binary — e.g. \`["compose", "up"]\` fetches \`docker compose up --help\`. \`subcmd\` must contain at least one entry — never call run_help with an empty array (root-level help is already in the Agent Descriptor).
+- Use run_help when you need exact flags or argument format. \`subcmd\` is the path WITHOUT the binary — e.g. \`["compose", "up"]\` fetches \`docker compose up --help\`. For flag-driven CLIs with no subcommands (e.g. yt-dlp, ffmpeg, curl), use an empty array \`[]\` to fetch the full --help, which contains all flag syntax. The run_help output is automatically keyword-filtered to show lines relevant to the current task.
+- run_shell is your PRIMARY DIAGNOSTIC INSTRUMENT — use it to probe any unknown before making assumptions or giving up. It is not just for flag discovery; it is how you test hypotheses about WHY something failed. run_shell for PROBING/DIAGNOSIS; run_cmd for primary task execution.
+  Diagnostic uses: verify a URL is live, check a dependency exists, grep help output, test a permission, inspect a file, confirm env vars.
+  Interpreter guidance: use "bash" (default) for grep/pipe/head/curl; use "node" when you need JSON.parse, regex processing, or child_process; use "python3" for data manipulation.
+  Example: { "action": "run_shell", "script": "yt-dlp --help 2>&1 | grep -B1 -A3 'sub\\|caption\\|vtt'", "interpreter": "bash" }
+  Within bash scripts, you can use any allowlisted system tool: jq, curl, wget, grep, sed, awk, head, tail, wc, sort, uniq, cut, base64, ffmpeg, ffprobe, git, node, python3, and all standard Unix utilities.
 - Use run_update only when the CLI binary itself is confirmed missing or broken — never for unknown subcommands.
 - Output JSON only. No prose before or after the JSON object.
 - When you discover that a class of subcommands does NOT exist and there is a general escape-hatch alternative, write a BROAD save_rule that covers ALL similar operations — not just the one you just solved. The rule must include: (1) what pattern of operations has no dedicated subcommand, (2) the general escape-hatch command with syntax, (3) at least 3 examples covering different operation types so future runs never need to rediscover this pattern.
   Bad (too narrow): "'gh repo star' does not exist. Use: gh api --method PUT /user/starred/{owner}/{repo}."
   Good (broad): "Many 'gh' operations have no dedicated subcommand — use 'gh api --method GET/PUT/DELETE/POST <REST endpoint>' for all of them. Syntax: run_help [\"api\"] shows full flags. Examples: star=PUT /user/starred/{owner}/{repo}, unstar=DELETE /user/starred/{owner}/{repo}, readme=GET /repos/{owner}/{repo}/readme, releases=GET /repos/{owner}/{repo}/releases, follow_user=PUT /user/following/{username}."
+- ask_user is the LAST RESORT. Do NOT use ask_user until you have run at least one diagnostic probe (run_shell or run_help) after a failure. The user should never see ask_user for a failure that a 1-line shell probe could have explained or resolved.
+- Never use ask_user for CLI version or installation issues — use run_update instead.
+
+## Universal Failure Protocol — DIAGNOSE FIRST (applies to every run_cmd exitCode≠0)
+
+When run_cmd returns exitCode≠0, your FIRST job is to DIAGNOSE the failure category before retrying or escalating.
+Every CLI failure belongs to one of 5 categories. Identify the category from the error signal, then run the corresponding probe:
+
+**Category A — Wrong flags/syntax**
+  Signals: "unknown option", "invalid", "unrecognized", "unexpected argument", "missing required"
+
+  Step A-1 (MANDATORY): Probe for the correct flag:
+    run_shell: <cli> --help 2>&1 | grep -B2 -A4 '<keyword from error>'
+
+  Step A-2 (MANDATORY if probe shows the correct syntax):
+    Output run_cmd immediately with the corrected flags from the help output.
+    DO NOT use ask_user if the help output reveals the correct flag — apply it directly.
+    Only use ask_user if 2 consecutive run_help/run_shell probes both fail to reveal the correct syntax.
+
+**Category B — Missing dependency or runtime**
+  Signals: WARNING about missing runtime/component, "not found", "install", "requires", "no such file"
+
+  Step B-1 (MANDATORY): Probe whether the dependency exists:
+    run_shell: which <dependency> 2>&1; <dependency> --version 2>&1
+
+  Step B-2 (MANDATORY — DO NOT use ask_user for a missing runtime):
+    - If dependency exists → retry run_cmd with the correct runtime flag (e.g. --js-runtimes node)
+    - If dependency is missing → run_update to install it; never ask the user to install it manually
+  Special: if WARNING mentions "Remote component challenge solver script... skipped", add --remote-components ejs:github to next run_cmd alongside --js-runtimes node.
+
+**Category C — Bad input (URL dead, file missing, ID deleted, resource removed)**
+  Signals: "unavailable", "not found", "404", "does not exist", "private", "removed", "Video unavailable", "No such file"
+  This error is about the TARGET (URL/file/ID), NOT the command syntax — do NOT change flags first.
+
+  Step C-1 (MANDATORY): Probe the input to confirm it is dead:
+    run_shell: <cli> --<cheapest-verify-flag> '<input>' 2>&1
+    Examples: yt-dlp --get-title --js-runtimes node --remote-components ejs:github '<url>'; curl -sI '<url>' | head -3; ls -la '<filepath>'
+
+  Step C-2a (if probe exitCode≠0 — input is confirmed dead — MANDATORY before ask_user):
+    Search for a working alternative in the SAME run_shell turn or next turn:
+      - YouTube URL dead: run_shell: yt-dlp --flat-playlist --get-url --js-runtimes node --remote-components ejs:github 'ytsearch3:<video title and creator>' 2>&1 | head -5
+      - File missing: run_shell: find ~ -name '<filename>' -type f 2>/dev/null | head -5
+    Take the FIRST returned URL/path and immediately output run_cmd with it.
+    DO NOT use ask_user before attempting this alternative search — it is MANDATORY.
+    Only use ask_user if the alternative search itself returns no results or all alternatives also fail.
+
+  Step C-2b (if probe exitCode=0 — input is alive):
+    The original flags were wrong → retry run_cmd with corrected flags (not a Category C issue after all).
+
+**Category D — Tool itself broken or missing**
+  Signals: "command not found", segfault, "No such file or directory" for the binary, version mismatch
+
+  Step D-1 (MANDATORY): Probe whether the tool exists and its version:
+    run_shell: which <cli> 2>&1; <cli> --version 2>&1
+
+  Step D-2 (MANDATORY — DO NOT use ask_user for a missing or broken binary):
+    - If tool found but version is outdated → run_update immediately
+    - If tool not found at all → run_update to install it
+    Never ask the user to install or update a CLI manually — run_update handles it.
+
+**Category E — Environment, auth, or network failure**
+  Signals: "permission denied", "unauthorized", "403", "401", "connection refused", "token expired", "SSL error"
+  Probe:   run_shell: curl -sI '<url>' 2>&1 | head -5  OR  <cli> whoami 2>&1  OR  <cli> auth status 2>&1
+  Fix:     surface the specific finding to the user with ask_user — include what the probe returned.
+
+**ORDERING RULE:**
+1. Read the error signal → identify category A/B/C/D/E
+2. Run the cheapest probe that confirms the hypothesis (1 run_shell turn)
+3. Apply the category fix
+4. Only escalate to ask_user after probe confirms the problem cannot be self-resolved
 
 ## Mandatory recovery protocol when run_cmd fails with "unknown command"
 If run_cmd returns exitCode≠0 with "unknown command" in the stderr observation:
@@ -566,7 +660,19 @@ If run_cmd returns exitCode≠0 with "unknown command" in the stderr observation
    IMPORTANT: save_rule must be BROAD — cover the general pattern, not just the one operation you just solved (see save_rule guidance above).
    Example: { "action": "ask_user", "question": "I couldn't find a 'gh repo star' command. The gh CLI uses 'gh api --method <METHOD> <endpoint>' for REST operations without dedicated subcommands. Would you like me to use that?", "options": ["Yes, run: gh api --method PUT /user/starred/microsoft/vscode", "No, cancel"], "save_rule": "Many 'gh' operations have no dedicated subcommand — use 'gh api --method GET/PUT/DELETE/POST <REST endpoint>'. Syntax: run_help [\"api\"] shows full flags. Examples: star=PUT /user/starred/{owner}/{repo}, unstar=DELETE /user/starred/{owner}/{repo}, readme=GET /repos/{owner}/{repo}/readme, releases=GET /repos/{owner}/{repo}/releases, follow_user=PUT /user/following/{username}." }
 - ask_user can also be used to present a discovered alternative at any point — always include what was searched, what was found, and the proposed command.
-- Never use ask_user for CLI version or installation issues — use run_update instead.`;
+- Never use ask_user for CLI version or installation issues — use run_update instead.
+
+## Mandatory recovery protocol when run_cmd observation contains [ACTIONABLE WARNINGS]
+If the observation starts with "[ACTIONABLE WARNINGS — act on these]:", the CLI tool itself is telling you how to fix the command:
+1. Read every WARNING line carefully — it is authoritative, higher priority than the descriptor.
+2. On the NEXT turn, retry run_cmd with the suggested flag/option added to the previous argv.
+   - If the warning says "add --flag VALUE", add exactly that to argv.
+   - If the warning says an optional dependency is missing (e.g. deno, bun), try the next available runtime flag first (e.g. --js-runtimes node, then --js-runtimes bun) before escalating.
+3. Do NOT issue web_search for something the CLI warning already told you.
+4. Do NOT repeat the identical argv — always incorporate the warning's suggestion.
+5. If the retry still fails with a new warning, apply that warning's suggestion in the next turn.
+6. Only escalate to ask_user if 2 consecutive WARNING-driven retries both fail with exitCode≠0 and no new actionable warning is present.
+   Special case: if WARNING mentions "Remote component challenge solver script (node) was skipped", add --remote-components ejs:github alongside --js-runtimes node on the next retry — both flags are required together for yt-dlp YouTube extraction.`;
 
 // ---------------------------------------------------------------------------
 // Action: run
@@ -616,6 +722,171 @@ async function actionRun({ cli, argv = [], cwd, env, timeoutMs, stdin, agentId, 
 
     logger.info(`[cli.agent] agentic run: ${agentId} task="${task}"`);
 
+    // ── pre_steps: execute shared services before the CLI loop ──────────────
+    // Descriptor frontmatter may declare pre_steps that must run first.
+    // Supported purposes:
+    //   resolve_url  → calls web.agent search to find a URL; injects {{resolvedUrl}}
+    //   resolve_user → calls user.agent to get user context; injects {{userName}}, {{userEmail}}
+    // Results are injected as template tokens into the task string before the loop.
+    let resolvedTask = task;
+    try {
+      const _fmMatch = (agent.descriptor || '').match(/^---\s*\n([\s\S]*?)\n---/);
+      if (_fmMatch) {
+        const _yaml = _fmMatch[1];
+        const _preStepsMatch = _yaml.match(/pre_steps:\s*\n((?:\s+-[^\n]*\n?)*)/);
+        if (_preStepsMatch) {
+          const _preLines = _preStepsMatch[1].split('\n')
+            .map(l => l.trim().replace(/^-\s*/, ''))
+            .filter(Boolean);
+
+          for (const _preLine of _preLines) {
+            // Parse "skill: web.agent action: search_and_navigate purpose: resolve_url"
+            const _skillM   = _preLine.match(/skill:\s*(\S+)/);
+            const _purposeM = _preLine.match(/purpose:\s*(\S+)/);
+            const _skill    = _skillM?.[1] || '';
+            const _purpose  = _purposeM?.[1] || '';
+
+            if (_skill === 'web.agent' && _purpose === 'resolve_url') {
+              logger.info(`[cli.agent] pre_step: web.agent resolve_url for task "${task.slice(0, 80)}"`);
+              try {
+                // ── Fast path: URL already present in the task string ──────────
+                // If the task already contains a URL (e.g. second invocation after
+                // web.agent found one), use it directly — skip the web search entirely.
+                // This prevents resolve_url from replacing a known YouTube URL with an
+                // unrelated blog result that the generic extractor cannot handle.
+                const _existingUrlMatch = task.match(/https?:\/\/[^\s"'<>]+/);
+                let _resolvedUrl = _existingUrlMatch ? _existingUrlMatch[0] : '';
+
+                if (!_resolvedUrl) {
+                  // ── Web search path ──────────────────────────────────────────
+                  // Bias the web search toward the platform the CLI is designed for.
+                  // Inferred from: (1) task text platform signals, (2) agent descriptor capabilities.
+                  // No hardcoded CLI names — fully data-driven.
+                  const _taskLower = task.toLowerCase();
+                  let _searchBias = '';
+                  // Hoist _isMediaDownloader before the if/else so it is always in scope.
+                  const _agentCaps = (agent?.capabilities || []).join(' ').toLowerCase();
+                  const _isMediaDownloader = /download|extract_audio|extract_subtitle|write_subs|write_auto_subs|stream/.test(_agentCaps);
+                  if (_taskLower.includes('youtube') || _taskLower.includes('youtu.be')) {
+                    _searchBias = ' site:youtube.com';
+                  } else {
+                    if (_isMediaDownloader) _searchBias = ' site:youtube.com';
+                  }
+                  const _searchSnippets = await agentWebSearch(task + _searchBias);
+                  // For media downloader agents (or youtube-biased searches), require a
+                  // youtube.com/watch URL specifically — prevents picking up recipe blog
+                  // URLs or other non-video pages that yt-dlp cannot process.
+                  if (_isMediaDownloader || _searchBias.includes('youtube.com')) {
+                    const _ytMatch = _searchSnippets.match(/https?:\/\/(?:www\.)?youtube\.com\/watch\?[^\s"'<>]+/);
+                    _resolvedUrl = _ytMatch ? _ytMatch[0] : '';
+                  }
+                  // Fall back to first URL in snippets only if no platform-specific match found
+                  if (!_resolvedUrl) {
+                    const _urlMatch = _searchSnippets.match(/https?:\/\/[^\s"'<>]+/);
+                    _resolvedUrl = _urlMatch ? _urlMatch[0] : '';
+                  }
+                }
+
+                if (_resolvedUrl) {
+                  logger.info(`[cli.agent] pre_step: resolved URL = ${_resolvedUrl}`);
+                  resolvedTask = resolvedTask.replace(/\{\{resolvedUrl\}\}/g, _resolvedUrl);
+                  // Also append URL to task if no template token present
+                  if (!task.includes('{{resolvedUrl}}')) {
+                    resolvedTask = `${resolvedTask} URL: ${_resolvedUrl}`;
+                  }
+                }
+              } catch (_preErr) {
+                logger.warn(`[cli.agent] pre_step web.agent failed (non-fatal): ${_preErr.message}`);
+              }
+
+            } else if (_skill === 'web.agent' && _purpose === 'resolve_file') {
+              // resolve_file: extract a file path from the task, resolving to an absolute path.
+              // Checks common user locations in priority order.
+              logger.info(`[cli.agent] pre_step: resolve_file for task "${task.slice(0, 80)}"`);
+              try {
+                const _fs = require('fs');
+                const _os = require('os');
+                const _path = require('path');
+
+                // Try to extract an explicit file reference from the task string
+                const _fileMatch = task.match(
+                  /(?:file|path|input|source|from|open|read|process|convert|encode)\s+["\u2018\u2019\u201c\u201d]?([^\s"'<>]+\.[a-zA-Z0-9]{2,6})["\u2018\u2019\u201c\u201d]?/i
+                ) || task.match(/([~/]?(?:[^/\s]+\/)+[^/\s]+\.[a-zA-Z0-9]{2,6})/);
+
+                const _rawFilePath = _fileMatch ? _fileMatch[1] : null;
+
+                if (_rawFilePath) {
+                  // Resolve ~ to home
+                  const _expandedPath = _rawFilePath.startsWith('~')
+                    ? _path.join(_os.homedir(), _rawFilePath.slice(1))
+                    : _rawFilePath;
+
+                  // Check absolute path first, then search common locations
+                  const _searchDirs = [
+                    '',                                          // as-is / absolute
+                    _os.homedir(),
+                    _path.join(_os.homedir(), 'Downloads'),
+                    _path.join(_os.homedir(), 'Desktop'),
+                    _path.join(_os.homedir(), 'Documents'),
+                    process.cwd(),
+                  ];
+
+                  let _resolvedFile = null;
+                  for (const _dir of _searchDirs) {
+                    const _candidate = _dir ? _path.join(_dir, _path.basename(_expandedPath)) : _expandedPath;
+                    if (_fs.existsSync(_candidate)) {
+                      _resolvedFile = _candidate;
+                      break;
+                    }
+                  }
+
+                  if (_resolvedFile) {
+                    logger.info(`[cli.agent] pre_step: resolved file = ${_resolvedFile}`);
+                    resolvedTask = resolvedTask.replace(/\{\{resolvedFile\}\}/g, _resolvedFile);
+                    if (!task.includes('{{resolvedFile}}')) {
+                      resolvedTask = `${resolvedTask} FILE: ${_resolvedFile}`;
+                    }
+                  } else {
+                    logger.warn(`[cli.agent] pre_step resolve_file: "${_rawFilePath}" not found in common locations`);
+                    // Still inject the raw path — let the CLI agent handle the error
+                    resolvedTask = resolvedTask.replace(/\{\{resolvedFile\}\}/g, _expandedPath);
+                    if (!task.includes('{{resolvedFile}}')) {
+                      resolvedTask = `${resolvedTask} FILE: ${_expandedPath}`;
+                    }
+                  }
+                }
+              } catch (_preErr) {
+                logger.warn(`[cli.agent] pre_step resolve_file failed (non-fatal): ${_preErr.message}`);
+              }
+
+            } else if (_skill === 'web.agent' && _purpose === 'resolve_query') {
+              // resolve_query: convert a natural-language task into a structured search/query string.
+              // Uses agentWebSearch to find relevant context, then extracts the best query.
+              logger.info(`[cli.agent] pre_step: resolve_query for task "${task.slice(0, 80)}"`);
+              try {
+                const _snippets = await agentWebSearch(task);
+                // Extract the most relevant title line as a structured query
+                const _titleMatch = _snippets.match(/^(.+?)(?:\n|$)/);
+                const _resolvedQuery = _titleMatch ? _titleMatch[1].trim() : task.slice(0, 120);
+                if (_resolvedQuery) {
+                  logger.info(`[cli.agent] pre_step: resolved query = "${_resolvedQuery.slice(0, 80)}"`);
+                  resolvedTask = resolvedTask.replace(/\{\{resolvedQuery\}\}/g, _resolvedQuery);
+                  if (!task.includes('{{resolvedQuery}}')) {
+                    resolvedTask = `${resolvedTask} QUERY: ${_resolvedQuery}`;
+                  }
+                }
+              } catch (_preErr) {
+                logger.warn(`[cli.agent] pre_step resolve_query failed (non-fatal): ${_preErr.message}`);
+              }
+            }
+          }
+        }
+      }
+    } catch (_preStepErr) {
+      logger.warn(`[cli.agent] pre_steps parse failed (non-fatal): ${_preStepErr.message}`);
+    }
+    const effectiveTask = resolvedTask;
+
     // ── Meta-task safety net: "rebuild/refresh/recreate/reset [X] agent" ──
     // These are agent-management commands, not CLI tasks — route to build_agent.
     if (/\b(rebuild|recreate|refresh|reset|reinitializ[e]?|re-?build|re-?create)\b/i.test(task) &&
@@ -626,8 +897,9 @@ async function actionRun({ cli, argv = [], cwd, env, timeoutMs, stdin, agentId, 
     }
 
     // ── Multi-turn agentic loop ──
-    const MAX_TURNS = 8;
+    const MAX_TURNS = 12;
     const OBSERVATION_CHARS = 600;
+    const RUN_HELP_CHARS = 3000; // larger budget for run_help — flag syntax needs space
     const loopHistory = [];
     const transcript = [];
     let currentBinPath = binPath;
@@ -641,12 +913,15 @@ async function actionRun({ cli, argv = [], cwd, env, timeoutMs, stdin, agentId, 
       logger.info(`[cli.agent] loaded ${learnedRules.length} learned rule(s) for ${agentId}`, { agentId });
     }
 
+    // Use effectiveTask (with pre_step token injections) as the loop task
+    const loopTask = effectiveTask;
+
     for (let turn = 1; turn <= MAX_TURNS; turn++) {
       // ── Real-time turn progress → Electron overlay server ──────────────────
       // POST turn info to the overlay /agent-turn endpoint so the UI can show
       // "Turn N/M" in the heartbeat label before the full response arrives.
       if (_progressCallbackUrl) {
-        const _turnPayload = JSON.stringify({ type: 'agent:turn_live', agentId, turn, maxTurns: MAX_TURNS, stepIndex: _stepIndex ?? 0 });
+        const _turnPayload = JSON.stringify({ type: 'agent:turn_live', agentId, turn, maxTurns: MAX_TURNS, stepIndex: _stepIndex ?? 0, currentAction: null });
         const http = require('http');
         const _req = http.request({ hostname: '127.0.0.1', port: parseInt(new URL(_progressCallbackUrl).port, 10), path: new URL(_progressCallbackUrl).pathname, method: 'POST', headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(_turnPayload) }, timeout: 2000 });
         _req.on('error', () => {}); // fire-and-forget
@@ -655,8 +930,8 @@ async function actionRun({ cli, argv = [], cwd, env, timeoutMs, stdin, agentId, 
       }
 
       const turnSys  = buildTurnSystemPrompt(agent.descriptor, learnedRules);
-      const turnUser = buildTurnPrompt(task, loopHistory);
-      logger.info(`[cli.agent] loop turn=${turn} syschars=${turnSys.length} userchars=${turnUser.length}`, { agentId, task });
+      const turnUser = buildTurnPrompt(loopTask, loopHistory);
+      logger.info(`[cli.agent] loop turn=${turn} syschars=${turnSys.length} userchars=${turnUser.length}`, { agentId, task: loopTask });
 
       const llmRaw = await callLLM(turnSys, turnUser, { temperature: 0.1, maxTokens: 400 });
 
@@ -681,8 +956,20 @@ async function actionRun({ cli, argv = [], cwd, env, timeoutMs, stdin, agentId, 
 
       logger.info(`[cli.agent] loop turn=${turn} action=${action.action}`, { agentId, task });
 
+      // Fire a second turn_live update now that we know the actual action type.
+      // The first one (top of loop) fires before LLM responds — this one fires after parse.
+      // Also carry the optional thinking field so the UI can show it live.
+      if (_progressCallbackUrl) {
+        const _actionPayload = JSON.stringify({ type: 'agent:turn_live', agentId, turn, maxTurns: MAX_TURNS, stepIndex: _stepIndex ?? 0, currentAction: action.action, thinking: action.thinking || null });
+        const http = require('http');
+        const _req2 = http.request({ hostname: '127.0.0.1', port: parseInt(new URL(_progressCallbackUrl).port, 10), path: new URL(_progressCallbackUrl).pathname, method: 'POST', headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(_actionPayload) }, timeout: 2000 });
+        _req2.on('error', () => {});
+        _req2.write(_actionPayload);
+        _req2.end();
+      }
+
       if (action.action === 'done') {
-        transcript.push({ turn, action, outcome: { ok: true, result: action.summary || '' }, thoughts: null });
+        transcript.push({ turn, action, outcome: { ok: true, result: action.summary || '' }, thoughts: action.thinking || null });
         return { ok: true, agentId, task, stdout: action.summary || '', agentTurns: turn, transcript };
       }
 
@@ -717,7 +1004,7 @@ async function actionRun({ cli, argv = [], cwd, env, timeoutMs, stdin, agentId, 
         );
         if (alreadyDone) {
           // Idempotent: "already starred/following" etc — task definitively complete, exit immediately.
-          transcript.push({ turn, action, outcome: { ok: true, result: cmdResult.stdout.slice(0, 300) }, thoughts: null });
+          transcript.push({ turn, action, outcome: { ok: true, result: cmdResult.stdout.slice(0, 300) }, thoughts: action.thinking || null });
           return {
             ok: true, agentId, task,
             inferredArgv: action.argv, stdout: cmdResult.stdout,
@@ -731,7 +1018,7 @@ async function actionRun({ cli, argv = [], cwd, env, timeoutMs, stdin, agentId, 
           // Command succeeded — feed stdout back so the LLM can evaluate: call "done" if the
           // task is fully complete, or continue (e.g. decode base64, save to file, follow a URL)
           // if the output needs further processing. Do NOT auto-exit here.
-          transcript.push({ turn, action, outcome: { ok: true, result: cmdResult.stdout.slice(0, 300) }, thoughts: null });
+          transcript.push({ turn, action, outcome: { ok: true, result: cmdResult.stdout.slice(0, 300) }, thoughts: action.thinking || null });
           observation = `exitCode=0 stdout="${cmdResult.stdout.slice(0, 800)}"`;
           loopHistory.push({ turn, ...action, observation: observation.slice(0, OBSERVATION_CHARS) });
           continue; // transcript already pushed above; skip bottom push
@@ -757,13 +1044,53 @@ async function actionRun({ cli, argv = [], cwd, env, timeoutMs, stdin, agentId, 
               observation = `exitCode=${cmdResult.exitCode} stdout="${cmdResult.stdout.slice(0, 300)}" stderr="${(cmdResult.stderr || '').slice(0, 200)}"`;
             }
           } else {
-            observation = `exitCode=${cmdResult.exitCode} stdout="${cmdResult.stdout.slice(0, 300)}" stderr="${(cmdResult.stderr || '').slice(0, 200)}"`;
+            // Extract WARNING: lines and surface them as top-priority actionable hints.
+            // Any CLI WARNING: that says "add --flag" or "use --option" is a self-healing signal.
+            const _warningLines = (cmdResult.stderr || '')
+              .split('\n')
+              .filter(l => /^\s*WARNING:/i.test(l) && l.trim().length > 10)
+              .map(l => l.trim())
+              .join('\n');
+            if (_warningLines) {
+              observation = `exitCode=${cmdResult.exitCode}\n[ACTIONABLE WARNINGS — act on these]:\n${_warningLines.slice(0, 400)}\nstdout="${cmdResult.stdout.slice(0, 150)}"`;
+            } else {
+              observation = `exitCode=${cmdResult.exitCode} stdout="${cmdResult.stdout.slice(0, 300)}" stderr="${(cmdResult.stderr || '').slice(0, 200)}"`;
+            }
           }
         }
 
       } else if (action.action === 'run_help') {
-        const helpR = await spawnCapture(currentBinPath, [...(action.subcmd || []), '--help'], { timeoutMs: 4000 });
-        observation = (helpR.stdout || helpR.stderr || '').slice(0, OBSERVATION_CHARS);
+        const helpR = await spawnCapture(currentBinPath, [...(action.subcmd || []), '--help'], { timeoutMs: 8000 });
+        const _rawHelp = helpR.stdout || helpR.stderr || '';
+        // When subcmd is [] (full --help), the raw output can be 60KB+ with relevant flags
+        // buried deep (e.g. yt-dlp subtitle flags at char ~28000). Instead of returning
+        // the useless head, extract task-relevant keywords and return targeted lines.
+        if ((action.subcmd || []).length === 0 && _rawHelp.length > RUN_HELP_CHARS) {
+          // Build keyword set from the current task string
+          const _taskWords = loopTask.toLowerCase().replace(/[^a-z0-9\s]/g, ' ').split(/\s+/).filter(w => w.length > 3);
+          const _MEDIA_KEYWORDS = ['sub', 'caption', 'transcript', 'srt', 'vtt', 'write', 'audio', 'extract', 'format', 'playlist', 'chapter', 'thumb', 'metadata', 'embed'];
+          const _keywords = [...new Set([..._taskWords, ..._MEDIA_KEYWORDS])].filter(k => k.length > 2);
+          const _helpLines = _rawHelp.split('\n');
+          const _CONTEXT = 2; // lines of context around each match
+          const _matchedIdx = new Set();
+          _helpLines.forEach((line, i) => {
+            const _lc = line.toLowerCase();
+            if (_keywords.some(kw => _lc.includes(kw))) {
+              for (let c = Math.max(0, i - _CONTEXT); c <= Math.min(_helpLines.length - 1, i + _CONTEXT); c++) {
+                _matchedIdx.add(c);
+              }
+            }
+          });
+          if (_matchedIdx.size > 0) {
+            const _filtered = [..._matchedIdx].sort((a, b) => a - b).map(i => _helpLines[i]).join('\n');
+            observation = `[keyword-filtered help — ${_matchedIdx.size} relevant lines]:\n${_filtered}`.slice(0, RUN_HELP_CHARS);
+            logger.info(`[cli.agent] loop turn=${turn} run_help: keyword-filtered ${_matchedIdx.size}/${_helpLines.length} lines`, { agentId });
+          } else {
+            observation = _rawHelp.slice(0, RUN_HELP_CHARS);
+          }
+        } else {
+          observation = _rawHelp.slice(0, RUN_HELP_CHARS);
+        }
 
       } else if (action.action === 'run_update') {
         if (!loopMeta) loopMeta = await lookupServiceAsync(cliTool);
@@ -782,13 +1109,13 @@ async function actionRun({ cli, argv = [], cwd, env, timeoutMs, stdin, agentId, 
               retryR.stdout + ' ' + (retryR.stderr || '')
             );
             if (alreadyDone) {
-              transcript.push({ turn, action, outcome: { ok: true, result: retryR.stdout.slice(0, 300) }, thoughts: null });
+              transcript.push({ turn, action, outcome: { ok: true, result: retryR.stdout.slice(0, 300) }, thoughts: action.thinking || null });
               return { ok: true, agentId, task, inferredArgv: lastCmd.argv, stdout: retryR.stdout, stderr: retryR.stderr, exitCode: retryR.exitCode, agentTurns: turn, transcript };
             }
             if (retryR.exitCode === -1) {
               observation = `run_update ok; retry exitCode=-1 (TIMED OUT — command was killed before completing). Do NOT call done. Try a faster alternative approach.`;
             } else if (retryR.exitCode === 0) {
-              transcript.push({ turn, action, outcome: { ok: true, result: retryR.stdout.slice(0, 300) }, thoughts: null });
+              transcript.push({ turn, action, outcome: { ok: true, result: retryR.stdout.slice(0, 300) }, thoughts: action.thinking || null });
               observation = `run_update ok; retry exitCode=0 stdout="${retryR.stdout.slice(0, 800)}"`;
               loopHistory.push({ turn, ...action, observation: observation.slice(0, OBSERVATION_CHARS) });
               continue;
@@ -809,12 +1136,41 @@ async function actionRun({ cli, argv = [], cwd, env, timeoutMs, stdin, agentId, 
         const page = await agentWebFetch(action.url || '');
         observation = page.slice(0, 2000);
 
+      } else if (action.action === 'run_shell') {
+        // Shell composition action — runs a script via bash/node/python3 so the LLM can pipe,
+        // grep, head, and combine stdout+stderr. Use for probing ONLY, not primary task execution.
+        const _script = (action.script || '').trim();
+        if (!_script) {
+          observation = 'run_shell: script is required';
+        } else {
+          try {
+            const { shellRun } = require('./shell.run.cjs');
+            // Derive interpreter set from shell.run's ALLOWED_COMMANDS — stays in sync automatically
+            const _interp = _SHELL_INTERPRETERS.has(action.interpreter) ? action.interpreter : 'bash';
+            // node uses -e (eval), shell interpreters use -c (command)
+            const _interpFlag = _interp === 'node' ? '-e' : '-c';
+            const _shellR = await shellRun({ cmd: _interp, argv: [_interpFlag, _script], timeoutMs: 15000 });
+            const _combined = [_shellR.stdout || '', _shellR.stderr || ''].filter(Boolean).join('\n').trim();
+            // When probe returns the same short error as the original failure (< 60 chars),
+            // the LLM has no new information. Enrich with a diagnostic hint so it knows
+            // the input type may be wrong (not just dead) and suggests ytsearch3: recovery.
+            if (_shellR.exitCode !== 0 && _combined.length < 60) {
+              observation = `exitCode=${_shellR.exitCode} probe_output="${_combined}" — probe returned same error as original command; the input URL/file may be the wrong type entirely (not just unavailable). NEXT STEP (MANDATORY): run_shell: yt-dlp --flat-playlist --get-url --js-runtimes node --remote-components ejs:github 'ytsearch3:<video title and creator>' 2>&1 | head -5`;
+            } else {
+              observation = (_combined || `exitCode=${_shellR.exitCode}`).slice(0, RUN_HELP_CHARS);
+            }
+            logger.info(`[cli.agent] loop turn=${turn} run_shell interp=${_interp} exitCode=${_shellR.exitCode} chars=${_combined.length}`, { agentId });
+          } catch (_shellErr) {
+            observation = `run_shell error: ${_shellErr.message}`;
+          }
+        }
+
       } else {
         observation = `unknown action: ${action.action}`;
       }
 
       loopHistory.push({ turn, ...action, observation: observation.slice(0, OBSERVATION_CHARS) });
-      transcript.push({ turn, action, outcome: { ok: false, error: observation.slice(0, 300) }, thoughts: null });
+      transcript.push({ turn, action, observation: observation.slice(0, 300), outcome: { ok: false, error: observation.slice(0, 300) }, thoughts: action.thinking || null });
     }
 
     return {
@@ -847,6 +1203,32 @@ async function actionRun({ cli, argv = [], cwd, env, timeoutMs, stdin, agentId, 
 
 
 // ---------------------------------------------------------------------------
+// _registerCliInAllowlist — proactively register a CLI in shell.run's
+// user allowlist (~/.thinkdrop/allowed-commands.json) so shell.run can
+// execute it directly without hitting the reactive consent gate.
+// Called by actionBuildAgent after a CLI is confirmed installed.
+// Non-fatal: build_agent succeeds even if this write fails.
+// ---------------------------------------------------------------------------
+function _registerCliInAllowlist(cliName) {
+  try {
+    const allowPath = path.join(os.homedir(), '.thinkdrop', 'allowed-commands.json');
+    fs.mkdirSync(path.dirname(allowPath), { recursive: true });
+    let existing = [];
+    if (fs.existsSync(allowPath)) {
+      try {
+        const raw = JSON.parse(fs.readFileSync(allowPath, 'utf8'));
+        existing = Array.isArray(raw) ? raw : (Array.isArray(raw?.commands) ? raw.commands : []);
+      } catch (_) {}
+    }
+    const baseName = path.basename(cliName);
+    const normalized = [...new Set([...existing, baseName])].sort();
+    fs.writeFileSync(allowPath, JSON.stringify({ commands: normalized }, null, 2), 'utf8');
+    logger.info(`[cli.agent] registered "${baseName}" in shell.run allowlist (${allowPath})`);
+  } catch (err) {
+    logger.warn(`[cli.agent] could not register "${cliName}" in shell.run allowlist: ${err.message}`);
+  }
+}
+
 // Action: build_agent
 // ---------------------------------------------------------------------------
 
@@ -876,11 +1258,173 @@ function inferCapabilities(helpText, meta) {
   return [...caps];
 }
 
-function buildDescriptorMd({ id, service, cliName, version, capabilities, helpText, subcommandMap }) {
+// ---------------------------------------------------------------------------
+// extractCapabilitiesAndFlags — LLM-driven capability + flag table extraction.
+// Passes the FULL --help text to the LLM (no char truncation — LLMs have 128K+
+// context; 60KB of help text is trivial). Returns:
+//   { capabilities: string[], flagTable: string }
+// where flagTable is a markdown table of capability → exact flag syntax.
+// Falls back to inferCapabilities() regex if LLM is unavailable.
+// ---------------------------------------------------------------------------
+const CAPABILITY_EXTRACT_SYSTEM = `You are a CLI tool analyst. Given a CLI tool's --help output, extract its key capabilities and the exact flag syntax needed to use each one.
+
+Output ONLY valid JSON with this exact structure:
+{
+  "capabilities": ["capability_slug_1", "capability_slug_2", ...],
+  "flagMap": {
+    "capability_slug_1": "--flag1 VALUE --flag2",
+    "capability_slug_2": "--other-flag"
+  },
+  "notes": "any critical env requirements (e.g. required runtimes, auth steps)"
+}
+
+Rules:
+- capability slugs: lowercase_underscore, e.g. "extract_subtitles", "download_video", "extract_audio"
+- flagMap values: exact flag syntax as you would type it (no binary name, no URL placeholder)
+- Include at most 15 capabilities — prioritize in this order:
+  1. HIGHEST PRIORITY — media/content operations: download, extract, subtitle, transcription, audio, video, format selection, playlist, captions, chapters
+  2. MEDIUM PRIORITY — core functional ops: search, convert, stream, record, upload
+  3. LOW PRIORITY — tool management: update, configure, list-extractors, set-user-agent, rate-limit, network options
+  (If cap limit forces exclusion, drop low-priority items first)
+- For video/audio download tools (yt-dlp, youtube-dl, gallery-dl, spotdl): you MUST include BOTH:
+  - "extract_subtitles": "--write-subs --sub-langs LANG --sub-format FORMAT --skip-download"
+  - "write_auto_subs": "--write-auto-subs --sub-langs LANG --sub-format FORMAT --skip-download"
+  Replace LANG with the actual flag default (e.g. "en") and FORMAT with common format (e.g. "vtt")
+- For tools with JS runtime requirements (yt-dlp, etc.), include a "js_runtime" entry in flagMap with the flag to specify the runtime
+- notes: one short sentence only, or empty string
+- No markdown, no explanation — ONLY the JSON object`;
+
+async function extractCapabilitiesAndFlags(cliName, helpText) {
+  if (!helpText || !helpText.trim()) return null;
+
+  const user = `CLI tool: ${cliName}
+
+Full --help output:
+${helpText}
+
+Extract capabilities and flag syntax.`;
+
+  try {
+    const raw = await callLLM(CAPABILITY_EXTRACT_SYSTEM, user, { temperature: 0.1, maxTokens: 800 });
+    if (raw) {
+      const m = raw.match(/\{[\s\S]*\}/);
+      if (m) {
+        const parsed = JSON.parse(m[0]);
+        if (Array.isArray(parsed?.capabilities) && parsed.capabilities.length > 0) {
+          logger.info(`[cli.agent] extractCapabilitiesAndFlags: extracted ${parsed.capabilities.length} capabilities for "${cliName}"`);
+          return parsed;
+        }
+      }
+    }
+  } catch (llmErr) {
+    logger.warn(`[cli.agent] extractCapabilitiesAndFlags LLM failed for "${cliName}" (falling back to regex): ${llmErr.message}`);
+  }
+  return null;
+}
+
+// Regex fallback for inferPreSteps when LLM is unavailable.
+function _inferPreStepsFallback(cliName, helpText) {
+  const help = (helpText || '').toLowerCase();
+  const name = cliName.toLowerCase();
+  const steps = [];
+
+  // URL-primary tools
+  const URL_RE = [
+    /\burl\b.*\binput\b|\binput\b.*\burl\b/,
+    /\byoutube\b|\bvimeo\b|\btiktok\b|\brumble\b|\bdailymot/,
+    /yt.dlp|youtube.dl|gallery.dl/,
+    /\b(download|extract|fetch|scrape)\b.*\burl\b/,
+    /usage:.*\s+url/,
+    /positional.*\burl\b|\burl\b.*positional/,
+  ];
+  if (URL_RE.some(re => re.test(help)) || URL_RE.some(re => re.test(name))) {
+    steps.push('  - skill: web.agent action: search_and_navigate purpose: resolve_url');
+  }
+
+  // File-primary tools
+  const FILE_RE = [
+    /\binput\b.*\bfile\b|\bfile\b.*\binput\b/,
+    /usage:.*<(input|source|file|src)>/,
+    /ffmpeg|imagemagick|magick|pandoc|convert|sox|mutagen|exiftool/,
+  ];
+  if (FILE_RE.some(re => re.test(help)) || FILE_RE.some(re => re.test(name))) {
+    steps.push('  - skill: web.agent action: search_and_navigate purpose: resolve_file');
+  }
+
+  return steps;
+}
+
+/**
+ * Infer pre_steps for a CLI descriptor using LLM analysis of --help output.
+ * The LLM determines what external inputs the tool requires as primary positional
+ * arguments (URL, file path, structured query) that a user's natural-language
+ * task description may not provide explicitly.
+ * Falls back to regex detection if LLM is unavailable.
+ */
+async function inferPreSteps(cliName, helpText) {
+  const HELP_LIMIT = 3000;
+  const trimmedHelp = (helpText || '').slice(0, HELP_LIMIT);
+
+  if (!trimmedHelp) return _inferPreStepsFallback(cliName, helpText);
+
+  const system = `You are a CLI tool analyst. Given a CLI tool's --help output, identify what external inputs the tool requires as its PRIMARY positional arguments — things the tool cannot function without, and that a user's natural-language task description might not provide explicitly.
+
+Three input types to detect:
+- "resolve_url"   → tool's primary positional arg is a URL (e.g. yt-dlp <URL>, wget <URL>, gallery-dl <URL>)
+- "resolve_file"  → tool's primary positional arg is a local file path (e.g. ffmpeg -i <file>, pandoc <file>, convert <file>)
+- "resolve_query" → tool requires a structured search/query string rather than accepting free-form natural language directly
+
+Rules:
+- Only include a pre_step when the tool CANNOT run without that input type
+- "resolve_url" and "resolve_file" are mutually exclusive as the PRIMARY input
+- Never add pre_steps for optional flags or configuration options
+- If no pre_steps are needed (tool is self-contained), return { "pre_steps": [] }
+- Respond ONLY with valid JSON, no markdown, no explanation
+
+Output format:
+{ "pre_steps": [ { "purpose": "resolve_url", "reason": "<one sentence>" } ] }`;
+
+  const user = `CLI tool: ${cliName}
+
+--help output:
+${trimmedHelp}
+
+What external primary inputs does "${cliName}" require that a user's natural-language task description might not provide explicitly?`;
+
+  try {
+    const raw = await callLLM(system, user, { temperature: 0.1, maxTokens: 300 });
+    if (raw) {
+      const m = raw.match(/\{[\s\S]*\}/);
+      if (m) {
+        const parsed = JSON.parse(m[0]);
+        if (Array.isArray(parsed?.pre_steps)) {
+          const steps = parsed.pre_steps
+            .filter(s => s && typeof s.purpose === 'string')
+            .map(s => `  - skill: web.agent action: search_and_navigate purpose: ${s.purpose}`);
+          logger.info(`[cli.agent] inferPreSteps LLM result for "${cliName}": ${JSON.stringify(parsed.pre_steps)}`);
+          return steps;
+        }
+      }
+    }
+  } catch (llmErr) {
+    logger.warn(`[cli.agent] inferPreSteps LLM failed (falling back to regex): ${llmErr.message}`);
+  }
+
+  // Fallback to regex if LLM unavailable or returned unparseable output
+  return _inferPreStepsFallback(cliName, helpText);
+}
+
+async function buildDescriptorMd({ id, service, cliName, version, capabilities, helpText, subcommandMap, llmExtraction }) {
   const capYaml = capabilities.map(c => `  - ${c}`).join('\n');
 
   // Generate usage playbook from capabilities and subcommandMap
   const usagePlaybook = generateUsagePlaybook(service, cliName, capabilities, subcommandMap);
+
+  // Infer pre_steps via LLM analysis of --help output (regex fallback if LLM unavailable)
+  const preStepsLines = await inferPreSteps(cliName, helpText);
+  const preStepsYaml = preStepsLines.length > 0
+    ? `pre_steps:\n${preStepsLines.join('\n')}\n`
+    : '';
 
   const parts = [
     '---',
@@ -891,18 +1435,45 @@ function buildDescriptorMd({ id, service, cliName, version, capabilities, helpTe
     `capabilities:`,
     capYaml,
     `version: ${version || 'unknown'}`,
+    ...(preStepsYaml ? [preStepsYaml.trimEnd()] : []),
     '---',
     '',
     `## Instructions`,
     `Use \`${cliName}\` CLI for all ${service} operations.`,
     `Authentication is persistent after the first \`${cliName} auth login\` (or equivalent).`,
-    `Always use \`${cliName} --help\` for the latest flag syntax before running unfamiliar commands.`,
-    '',
-    `## CLI Help Output`,
-    '```',
-    (helpText || '').slice(0, 2000),
-    '```',
+    `Always use \`run_help\` to check flag syntax before running unfamiliar commands.`,
   ];
+
+  // ── LLM-extracted capability + flag table (preferred) ──────────────────────
+  // When available, this replaces the raw truncated --help blob entirely.
+  // The LLM reads the FULL --help (no char limit) and produces a compact,
+  // authoritative table of capabilities → exact flag syntax.
+  if (llmExtraction?.flagMap && Object.keys(llmExtraction.flagMap).length > 0) {
+    parts.push('');
+    parts.push('## Key Capabilities & Flags');
+    parts.push('| Capability | Exact Flag Syntax |');
+    parts.push('|---|---|');
+    for (const [cap, flags] of Object.entries(llmExtraction.flagMap)) {
+      parts.push(`| ${cap.replace(/_/g, ' ')} | \`${flags}\` |`);
+    }
+    if (llmExtraction.notes) {
+      parts.push('');
+      parts.push(`> **Note:** ${llmExtraction.notes}`);
+    }
+    // Keep a short head of raw help for basic usage/version context
+    parts.push('');
+    parts.push('## CLI Usage (head)');
+    parts.push('```');
+    parts.push((helpText || '').slice(0, 500));
+    parts.push('```');
+  } else {
+    // ── Fallback: raw --help head (no LLM extraction available) ──────────────
+    parts.push('');
+    parts.push('## CLI Help Output');
+    parts.push('```');
+    parts.push((helpText || '').slice(0, 2000));
+    parts.push('```');
+  }
 
   // Append subcommand help when available
   if (subcommandMap && Object.keys(subcommandMap).length > 0) {
@@ -1107,8 +1678,14 @@ async function actionBuildAgent({ service, cli: explicitCli, force = false }) {
     };
   }
 
-  const capabilities = inferCapabilities(discovery.help || '', meta);
-  const descriptor   = buildDescriptorMd({
+  // LLM-driven capability + flag extraction from FULL --help (no char limit).
+  // Falls back to regex inferCapabilities() if LLM is unavailable.
+  const llmExtraction = await extractCapabilitiesAndFlags(cliName, discovery.help || '');
+  const capabilities = llmExtraction?.capabilities?.length
+    ? llmExtraction.capabilities
+    : inferCapabilities(discovery.help || '', meta);
+
+  const descriptor   = await buildDescriptorMd({
     id: agentId,
     service: serviceKey,
     cliName,
@@ -1116,7 +1693,12 @@ async function actionBuildAgent({ service, cli: explicitCli, force = false }) {
     capabilities,
     helpText: discovery.help,
     subcommandMap: discovery.subcommandMap,
+    llmExtraction,
   });
+
+  // Proactively register CLI in shell.run's user allowlist so shell.run can
+  // execute it directly (e.g. via bash -c "yt-dlp ...") without the consent gate.
+  _registerCliInAllowlist(cliName);
 
   // Write .md file to disk
   fs.mkdirSync(AGENTS_DIR, { recursive: true });
@@ -2136,6 +2718,40 @@ async function _updateAgentStatus(id, status, failureNote) {
 }
 
 
+/**
+ * Patch an existing agent descriptor in-place — update capabilities and/or descriptor text
+ * without a full rebuild. Used to add capabilities (e.g. extract_transcript) post-build.
+ */
+async function actionPatchAgent({ id, capabilities, descriptor, status }) {
+  if (!id) return { ok: false, error: 'id is required' };
+  const db = await getDb();
+  if (!db) return { ok: false, error: 'DuckDB not available' };
+
+  const rows = await db.all('SELECT id, capabilities, descriptor, status FROM agents WHERE id = ?', id).catch(() => null);
+  if (!rows || rows.length === 0) return { ok: false, error: `Agent not found: ${id}` };
+
+  const current = rows[0];
+
+  // Merge capabilities if provided (union, no duplicates)
+  let newCaps = current.capabilities || [];
+  if (Array.isArray(capabilities) && capabilities.length > 0) {
+    const capSet = new Set([...(Array.isArray(newCaps) ? newCaps : []), ...capabilities]);
+    newCaps = [...capSet];
+  }
+
+  const newDescriptor = descriptor || current.descriptor;
+  const newStatus = status || current.status;
+
+  await db.run(
+    'UPDATE agents SET capabilities = ?, descriptor = ?, status = ?, last_validated = CURRENT_TIMESTAMP WHERE id = ?',
+    JSON.stringify(newCaps), newDescriptor, newStatus, id
+  );
+
+  logger.info(`[cli.agent] patch_agent: updated ${id} — caps=${newCaps.join(',').slice(0, 80)}`);
+  return { ok: true, id, capabilities: newCaps, status: newStatus };
+}
+
+
 // ---------------------------------------------------------------------------
 // Main entry point
 // ---------------------------------------------------------------------------
@@ -2164,6 +2780,9 @@ async function cliAgent(args) {
     case 'list_agents':
       return await actionListAgents();
 
+    case 'patch_agent':
+      return await actionPatchAgent(args);
+
     case 'validate_agent':
       return await actionValidateAgent(args);
 
@@ -2179,9 +2798,80 @@ async function cliAgent(args) {
     default:
       return {
         ok: false,
-        error: `Unknown action: "${action}". Valid: discover | install | run | build_agent | query_agent | list_agents | validate_agent | record_failure | review_seed_map | preflight_check`,
+        error: `Unknown action: "${action}". Valid: discover | install | run | build_agent | patch_agent | query_agent | list_agents | validate_agent | record_failure | review_seed_map | preflight_check`,
       };
   }
 }
 
 module.exports = { cliAgent, KNOWN_CLI_MAP };
+
+// ── One-shot startup migration: ensure ytdlp.agent has transcript capabilities ──
+// Runs 5s after module load to allow DuckDB init. No-ops if already patched.
+setTimeout(async () => {
+  try {
+    const db = await getDb();
+    if (!db) return;
+    const rows = await db.all("SELECT capabilities FROM agents WHERE id = 'ytdlp.agent'").catch(() => null);
+    if (!rows || rows.length === 0) return;
+    const caps = Array.isArray(rows[0].capabilities) ? rows[0].capabilities : [];
+    if (caps.includes('extract_transcript')) return; // already patched
+    await actionPatchAgent({
+      id: 'ytdlp.agent',
+      capabilities: ['extract_transcript', 'write_auto_subs', 'write_subs', 'list_subs'],
+      descriptor: [
+        '---',
+        'id: ytdlp.agent',
+        'type: cli',
+        'service: ytdlp',
+        'cli_tool: yt-dlp',
+        'capabilities:',
+        '  - update_tool', '  - ignore_errors', '  - list_extractors',
+        '  - use_specific_extractors', '  - set_default_search_prefix',
+        '  - output_to_file', '  - simulate_download', '  - force_ipv4',
+        '  - set_user_agent', '  - limit_download_rate',
+        '  - download_audio_only', '  - extract_audio',
+        '  - extract_transcript', '  - write_auto_subs', '  - write_subs', '  - list_subs',
+        'version: 2026.03.17',
+        'pre_steps:',
+        '  - skill: web.agent action: search_and_navigate purpose: resolve_url',
+        '---',
+        '',
+        '## Instructions',
+        'Use `yt-dlp` CLI for all ytdlp operations.',
+        'Add `--js-runtimes node` to any command that fails with a JS runtime warning.',
+        '',
+        '## Key Capabilities & Flags',
+        '| Capability | Exact Flag Syntax |',
+        '|---|---|',
+        '| update tool | `-U` |',
+        '| ignore errors | `-i` |',
+        '| list extractors | `--list-extractors` |',
+        '| output to file | `-o TEMPLATE` |',
+        '| simulate download | `-s` |',
+        '| force ipv4 | `--force-ipv4` |',
+        '| download audio only | `-x` |',
+        '| extract audio | `--extract-audio` |',
+        '| extract transcript/subtitles | `--write-auto-subs --sub-lang en --skip-download --convert-subs srt -o /tmp/transcript_%(id)s --js-runtimes node` |',
+        '| list available subtitles | `--list-subs` |',
+        '| write embedded subs | `--write-subs --sub-lang en` |',
+        '',
+        '## Usage Playbook',
+        '',
+        '| User Says | CLI Command |',
+        '|-----------|-------------|',
+        '| Extract audio from video | `yt-dlp <video> --extract-audio --js-runtimes node` |',
+        '| Get transcript / subtitles | `yt-dlp <video> --write-auto-subs --sub-lang en --skip-download --convert-subs srt -o /tmp/transcript_%(id)s --js-runtimes node` |',
+        '| Download video | `yt-dlp <video> --js-runtimes node` |',
+        '',
+        '## Natural Language Patterns',
+        '- "get transcript from video"',
+        '- "download subtitles for video"',
+        '- "extract audio from video"',
+        '- "download video"',
+      ].join('\n'),
+    });
+    logger.info('[cli.agent] startup migration: ytdlp.agent patched with transcript capabilities');
+  } catch (e) {
+    logger.warn(`[cli.agent] startup migration failed (non-fatal): ${e.message}`);
+  }
+}, 5000);
