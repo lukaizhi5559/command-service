@@ -1727,6 +1727,11 @@ async function actionGoalDirectedLearn(args) {
     return { ok: false, error: err.message };
   } finally {
     activeLearnSessions.delete(agentId);
+    // Close the browser after goal-directed learning completes
+    try {
+      const { browserAct } = require('./browser.act.cjs');
+      browserAct({ action: 'close', sessionId: _learnSessionId, headed: true }).catch(() => {});
+    } catch (_) {}
   }
 }
 
@@ -1754,12 +1759,12 @@ function actionCancelLearn(args) {
     exploreAgent.cancelActiveScan();
   } catch (_) {}
 
-  // Navigate the browser session to about:blank to interrupt the waitForAuth poll loop.
+  // Close the browser to interrupt the waitForAuth poll loop.
   // Without this, waitForAuth blocks for up to 120s before the cancelRequested flag is checked.
   try {
     const { browserAct } = require('./browser.act.cjs');
     const cancelSessionId = `${agentId.replace(/[^a-z0-9_]/gi, '_')}_agent`;
-    browserAct({ action: 'navigate', url: 'about:blank', sessionId: cancelSessionId, headed: true, timeoutMs: 5000 }).catch(() => {});
+    browserAct({ action: 'close', sessionId: cancelSessionId, headed: true }).catch(() => {});
   } catch (_) {}
 
   return { ok: true, message: 'Learn mode cancellation requested' };

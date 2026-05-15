@@ -510,7 +510,13 @@ function _extractExpectedOutputs(baseName, argv = [], cwd) {
   }
   if (baseName === 'cp' || baseName === 'mv') {
     const positional = argv.filter((a) => typeof a === 'string' && !a.startsWith('-'));
-    if (positional.length >= 2) pushExpected(positional[positional.length - 1], 'file', baseName);
+    if (positional.length >= 2) {
+      const dest = positional[positional.length - 1];
+      // If destination ends with /, it's a directory target
+      // Also check if glob was used (multiple source args expanded)
+      const isDirTarget = dest.endsWith('/') || positional.length > 2;
+      pushExpected(dest, isDirTarget ? 'dir' : 'file', baseName);
+    }
   }
 
   if (!hasScript) return expected;
@@ -534,8 +540,16 @@ function _extractExpectedOutputs(baseName, argv = [], cwd) {
   const teeOps = new RegExp(`\\btee\\b(?:\\s+-[a-zA-Z]+)*\\s+${pathToken}`, 'g');
   while ((match = teeOps.exec(script)) !== null) pushExpected(match[1] || match[2] || match[3], 'file', 'bash');
 
-  const copyMoveOps = new RegExp(`\\b(cp|mv)\\b[^\\n;|&]*?\\s+(?:"[^"]+"|'[^']+'|[^\\s\"';|&]+)\\s+${pathToken}`, 'g');
-  while ((match = copyMoveOps.exec(script)) !== null) pushExpected(match[2] || match[3] || match[4], 'file', match[1]);
+  // Skip scripts that use find -exec mv — destination is N individual files, not a single path we can verify statically.
+  const hasFindExecMove = /\bfind\b[^\n]*-exec\s+mv\b/.test(script);
+  if (!hasFindExecMove) {
+    const copyMoveOps = new RegExp(`\\b(cp|mv)\\b[^\\n;|&]*?\\s+(?:"[^"]+"|'[^']+'|[^\\s"';|&]+)\\s+${pathToken}`, 'g');
+    while ((match = copyMoveOps.exec(script)) !== null) {
+      const dest = match[2] || match[3] || match[4];
+      if (!dest || dest === '{}') continue; // {} is a find placeholder, not a real path
+      pushExpected(dest, 'file', match[1]);
+    }
+  }
 
   const mkdirOps = new RegExp(`\\bmkdir\\b[^\\n;|&]*?\\s+${pathToken}`, 'g');
   while ((match = mkdirOps.exec(script)) !== null) pushExpected(match[1] || match[2] || match[3], 'dir', 'mkdir');
@@ -582,7 +596,11 @@ function _verifyExpectedOutputs(result, baseName, argv, cwd) {
     try {
       if (!fs.existsSync(entry.path)) return true;
       if (entry.type === 'dir') return !fs.statSync(entry.path).isDirectory();
-      return !fs.statSync(entry.path).isFile();
+      // For mv/cp where dest is an existing directory, the files land inside it —
+      // the directory itself existing is sufficient verification; don't require isFile().
+      const stat = fs.statSync(entry.path);
+      if (stat.isDirectory()) return false;
+      return !stat.isFile();
     } catch (_) {
       return true;
     }

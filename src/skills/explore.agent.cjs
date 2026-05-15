@@ -54,6 +54,12 @@ const KNOWN_BROWSER_SERVICES = (() => {
   catch (_) { return {}; }
 })();
 
+// Site presets from browser.agent.cjs — used to check if startUrl differs from signInUrl
+const SITE_PRESETS = (() => {
+  try { return require('./browser.agent.cjs').KNOWN_BROWSER_SERVICES || {}; }
+  catch (_) { return {}; }
+})();
+
 // ---------------------------------------------------------------------------
 // Configurable Filter Configuration — Site-agnostic rules with per-site overrides
 // Stored in domain map or agent descriptor, not hardcoded
@@ -2023,10 +2029,10 @@ async function scanDomain(args) {
   // Use stable session name (no timestamp) so the same Chrome profile dir is reused across scans.
   // Timestamped names created a new 20MB profile dir on every heartbeat/background scan.
   const scanSessionId  = callerSessionId || `${hostname}_scan`;
-  // Always run scan headlessly to prevent blank tab flicker. 
-  // The learn session remains visible (if callerHeaded=true), but scan automation runs invisibly.
+  // Run scan in headed mode when called from learn mode (callerHeaded=true) to avoid bot detection
+  // on sites like YouTube. Background scans without caller session still run headless.
   // Both use the same Chrome profile via scanSessionId.
-  const headed         = false;
+  const headed         = callerHeaded !== undefined ? callerHeaded : false;
   // When a caller session is provided (learn_mode), use tab-new per page so we never navigate
   // the auth tab (which would trigger Cloudflare re-challenges). Background scans navigate normally.
   const useTabStrategy = !!callerSessionId;
@@ -2098,29 +2104,40 @@ async function scanDomain(args) {
       });
 
       // Navigate to the URL
-      // For the first URL in learn_mode, use tab-new; for subsequent URLs, use navigate
+      // Use navigate on existing tab when browser already open (e.g., after auth), 
+      // use tab-new only for subsequent URLs in the same scan
       if (useTabStrategy) {
         if (!initialTabOpened) {
-          // First URL: use tab-new to open in the authenticated session
+          // Check if pre-authenticated and startUrl differs from signInUrl
+          // If so, auth redirect already landed us on the correct page - skip navigation
+          const sitePreset = Object.values(SITE_PRESETS).find(p => 
+            startUrl.includes(p.startUrl?.replace(/^https?:\/\//, '').split('/')[0] || '')
+          );
+          const skipNavigation = _preAuthed && sitePreset && sitePreset.startUrl !== sitePreset.signInUrl;
+          
+          if (skipNavigation) {
+            logger.info(`[explore.agent] scan: skipping navigation - pre-authenticated and already on ${startUrl} from auth redirect`);
+          } else {
+            // First URL: use navigate on existing authenticated browser session
+            // This avoids tab-new issues when browser is already open from auth flow
+            logger.info(`[explore.agent] scan: navigating existing tab to ${startUrl} on session=${scanSessionId}`);
+            await _browserAct({ action: 'navigate', url: startUrl, sessionId: scanSessionId, headed, timeoutMs: 30000 }, 33000).catch(() => {});
+          }
+          // Get tab index after navigation (or after auth redirect)
+          const _listRes = await _browserAct({ action: 'tab-list', sessionId: scanSessionId, headed }, 5000).catch(() => null);
+          if (_listRes?.result) {
+            const _tabCount = ((_listRes.result || '').match(/^\s*-\s+\d+:/gm) || []).length;
+            _scanTabIdx = Math.max(0, _tabCount - 1);
+          }
+          initialTabOpened = true;
+        } else {
+          // Subsequent URLs: open new tab for crawling
           logger.info(`[explore.agent] scan: tab-new strategy — opening scan tab for ${startUrl} on session=${scanSessionId}`);
           const _tabNewRes = await _browserAct({ action: 'tab-new', url: startUrl, sessionId: scanSessionId, headed, timeoutMs: 30000 }, 33000).catch(() => null);
           if (_tabNewRes?.result) {
             const _tabCount = ((_tabNewRes.result || '').match(/^\s*-\s+\d+:/gm) || []).length;
             _scanTabIdx = Math.max(0, _tabCount - 1);
           }
-          // If user was already logged in, close the original tab (tab 0) to avoid duplicate site tabs
-          if (_preAuthed && _scanTabIdx > 0) {
-            logger.info(`[explore.agent] scan: closing original tab 0 (pre-authed, avoiding duplicate tabs)`);
-            await _browserAct({ action: 'tab-close', sessionId: scanSessionId, headed, tabIndex: 0 }, 5000).catch(() => {});
-            _scanTabIdx = Math.max(0, _scanTabIdx - 1);
-          }
-          initialTabOpened = true;
-        } else {
-          // Subsequent URLs: reuse the existing blank tab (left by the previous URL's blank-out).
-          // This avoids opening yet another tab-new which can cause Chrome to show
-          // "Restore pages?" if the previous tab was closed and Chrome briefly had 0 tabs.
-          logger.info(`[explore.agent] scan: navigating existing blank tab to ${startUrl} on session=${scanSessionId}`);
-          await _browserAct({ action: 'navigate', url: startUrl, sessionId: scanSessionId, headed, timeoutMs: 25000 }, 28000).catch(() => {});
           // _scanTabIdx stays the same — we're reusing the same tab slot
         }
       } else {
@@ -3224,6 +3241,10 @@ async function scanDomain(args) {
         description: 'Navigate to previous searches by fuzzy matching against history'
       });
     }
+
+    // Close the browser after scan completes — clean shutdown instead of leaving about:blank
+    logger.info(`[explore.agent] Closing browser for session=${scanSessionId} after scan complete`);
+    await _browserAct({ action: 'close', sessionId: scanSessionId, headed }, 10000).catch(() => {});
 
     return { ok: true, hostname, actionsFound: totalActions, mapPath, duration, botBlocked, summary: summaryStats, generatedSkills };
 

@@ -865,50 +865,70 @@ function clearProfileLock(sessionId) {
 
 // Kill any existing Chrome process using this session's profile directory.
 // Prevents the "Opening in existing browser session" issue that creates blank tabs.
+// Also kills zombie Chrome processes that lost their SingletonLock after crashing.
 function killExistingChromeForProfile(sessionId) {
+  let killed = false;
   try {
     if (!shouldUsePersistentProfile(sessionId)) return false;
     const profileDir = sessionProfileDir(sessionId);
     const lockFile = path.join(profileDir, 'SingletonLock');
-    if (!fs.existsSync(lockFile)) return false;
     
-    // Read the SingletonLock symlink to get the PID
-    let target = '';
-    try { target = fs.readlinkSync(lockFile); } catch (_) { return false; }
-    const m = String(target).match(/-(\d+)$/);
-    if (!m) return false;
-    const pid = parseInt(m[1], 10);
-    if (!pid) return false;
-    
-    // Check if process is Chrome and kill it
-    try {
-      process.kill(pid, 0); // Check if process exists
-      logger.info(`[browser.act] Killing existing Chrome process ${pid} for session=${sessionId}`);
-      try { process.kill(pid, 'SIGTERM'); } catch (_) {}
-      // Give it time to die
-      for (let i = 0; i < 10; i++) {
-        try {
-          process.kill(pid, 0);
-          // Still alive, wait
-          const start = Date.now();
-          while (Date.now() - start < 200) {} // 200ms busy wait
-        } catch (_) {
-          break; // Process dead
+    // Method 1: Kill via SingletonLock PID (clean shutdown path)
+    if (fs.existsSync(lockFile)) {
+      let target = '';
+      try { target = fs.readlinkSync(lockFile); } catch (_) {}
+      const m = String(target).match(/-(\d+)$/);
+      if (m) {
+        const pid = parseInt(m[1], 10);
+        if (pid) {
+          try {
+            process.kill(pid, 0); // Check if process exists
+            logger.info(`[browser.act] Killing existing Chrome process ${pid} for session=${sessionId}`);
+            try { process.kill(pid, 'SIGTERM'); } catch (_) {}
+            for (let i = 0; i < 10; i++) {
+              try {
+                process.kill(pid, 0);
+                const start = Date.now();
+                while (Date.now() - start < 200) {} // 200ms busy wait
+              } catch (_) { break; }
+            }
+            try { process.kill(pid, 'SIGKILL'); } catch (_) {}
+            killed = true;
+          } catch (_) {}
+          try { fs.unlinkSync(lockFile); } catch (_) {}
         }
       }
-      // Force kill if still alive
-      try { process.kill(pid, 'SIGKILL'); } catch (_) {}
-      // Clear the lock file
-      try { fs.unlinkSync(lockFile); } catch (_) {}
-      return true;
-    } catch (_) {
-      // Process already dead, just clear stale lock
-      try { fs.unlinkSync(lockFile); } catch (_) {}
-      return false;
     }
+    
+    // Method 2: Kill any Chrome processes with this profile dir in their cmdline
+    // This catches zombies that lost their SingletonLock after crashing
+    try {
+      const { spawnSync } = require('child_process');
+      // Find Chrome processes using this specific profile directory
+      const pgrepResult = spawnSync('pgrep', ['-f', `Google Chrome.*${profileDir}`], { encoding: 'utf8' });
+      if (pgrepResult.status === 0 && pgrepResult.stdout) {
+        const pids = pgrepResult.stdout.trim().split('\n').filter(p => p.trim());
+        for (const pidStr of pids) {
+          const pid = parseInt(pidStr, 10);
+          if (!pid) continue;
+          try {
+            process.kill(pid, 0); // Verify process exists
+            logger.info(`[browser.act] Killing zombie Chrome process ${pid} for session=${sessionId} (no lock)`);
+            try { process.kill(pid, 'SIGTERM'); } catch (_) {}
+            // Brief wait then force kill
+            const start = Date.now();
+            while (Date.now() - start < 500) {} // 500ms busy wait
+            try { process.kill(pid, 'SIGKILL'); } catch (_) {}
+            killed = true;
+          } catch (_) {}
+        }
+      }
+    } catch (_) {}
+    
+    return killed;
   } catch (e) {
     logger.warn(`[browser.act] Error killing existing Chrome: ${e.message}`);
-    return false;
+    return killed;
   }
 }
 
@@ -3480,13 +3500,160 @@ async function browserAct(args) {
     // tab-new: opens a new tab; if url provided, navigates to it in the new tab.
     // Tracks the new tab index in currentTabIndex so per-tab snapshot cache works.
     case 'tab-new': {
-      // If session not tracked, kill any existing Chrome to prevent blank tabs
-      if (!openSessions.has(sessionId)) {
+      // Check if daemon is alive (like navigate does) — tab-new requires running browser
+      let alreadyOpen = openSessions.has(sessionId);
+      if (!alreadyOpen) {
+        alreadyOpen = await isDaemonAlive(sessionId, headed);
+        if (alreadyOpen) {
+          openSessions.add(sessionId);
+          logger.info(`[browser.act] tab-new: daemon alive for session=${sessionId}`);
+        }
+      }
+      // If not already open, probe to see if browser actually exists (might be missing SingletonLock)
+      if (!alreadyOpen && url) {
+        logger.info(`[browser.act] tab-new: probing browser directly despite daemon check failure`);
+        try {
+          const probe = await cliRun([...S, 'eval', 'window.location.href'], 5000);
+          if (probe.ok) {
+            logger.info(`[browser.act] tab-new: browser exists! using goto instead of open`);
+            alreadyOpen = true;
+            openSessions.add(sessionId);
+            // Navigate to URL in existing browser
+            const gotoRes = await cliRun([...S, 'goto', url], Math.max(timeoutMs, 30000));
+            logger.info(`[browser.act] tab-new: goto result: ok=${gotoRes.ok}`);
+            if (!gotoRes.ok) {
+              return {
+                ok: false,
+                action,
+                sessionId,
+                error: `Failed to navigate: ${gotoRes.error || gotoRes.stderr?.trim()}`,
+                executionTime: Date.now() - start,
+              };
+            }
+            await new Promise(r => setTimeout(r, 400));
+            const listRaw = await cliRun([...S, 'tab-list'], 5000).catch(() => ({ stdout: '' }));
+            const tabCount = ((listRaw.stdout || '').match(/^\s*-\s+\d+:/gm) || []).length;
+            const lastIdx = Math.max(0, tabCount - 1);
+            currentTabIndex.set(sessionId, lastIdx);
+            snapshotCache.delete(_tabKeyFor(sessionId, lastIdx));
+            await run(['waitForStableText'], 'waitForStableText', { timeoutMs: 15000 });
+            return {
+              ok: true,
+              action,
+              sessionId,
+              tabIndex: lastIdx,
+              result: listRaw.stdout?.trim() || undefined,
+              executionTime: Date.now() - start,
+            };
+          }
+        } catch (e) {
+          logger.info(`[browser.act] tab-new: browser probe failed, will cold-start`);
+        }
+      }
+      // If not already open, kill any existing Chrome and clear profile locks
+      if (!alreadyOpen) {
         const killed = killExistingChromeForProfile(sessionId);
         if (killed) {
           logger.info(`[browser.act] tab-new: killed existing Chrome for session=${sessionId}`);
         }
+        clearProfileLock(sessionId);
       }
+      // If daemon not running and URL provided, use 'open' to cold-start instead of tab-new
+      if (!alreadyOpen && url) {
+        logger.info(`[browser.act] tab-new: cold-starting browser with open for session=${sessionId}`);
+        // Use open with URL parameter - more reliable for navigation
+        const openRes = await cliRun([...S, 'open', url], Math.max(timeoutMs, 30000));
+        logger.info(`[browser.act] tab-new cold-start: open command result: ok=${openRes.ok}, exitCode=${openRes.exitCode}`);
+        if (openRes.ok) {
+          openSessions.add(sessionId);
+          
+          // Give Chrome time to initialize
+          await new Promise(r => setTimeout(r, 1000));
+          
+          // Determine tab index after open
+          const listRaw = await cliRun([...S, 'tab-list'], 5000).catch(() => ({ stdout: '' }));
+          const tabCount = ((listRaw.stdout || '').match(/^\s*-\s+\d+:/gm) || []).length;
+          const lastIdx = Math.max(0, tabCount - 1);
+          currentTabIndex.set(sessionId, lastIdx);
+          snapshotCache.delete(_tabKeyFor(sessionId, lastIdx));
+          logger.info(`[browser.act] tab-new cold-start: tab index set to ${lastIdx}`);
+          
+          // Check current URL - if we're on about:blank, Chrome is in a broken state
+          let actualUrl = '';
+          try {
+            const urlProbe = await cliRun([...S, 'eval', 'window.location.href'], 3000);
+            const probeMatch = urlProbe.stdout?.match(/###\s*Result\s*\n([\s\S]*?)(?=###|$)/i);
+            actualUrl = (probeMatch ? probeMatch[1] : urlProbe.stdout || '').trim().replace(/^"|"$/g, '');
+            logger.info(`[browser.act] tab-new cold-start: current URL is ${actualUrl}`);
+          } catch (e) {
+            logger.warn(`[browser.act] tab-new cold-start: URL check error: ${e.message}`);
+          }
+          
+          // If on about:blank, Chrome session is broken (no SingletonLock) - kill and restart
+          if (actualUrl === 'about:blank' || actualUrl === 'chrome://newtab/' || actualUrl === '') {
+            logger.warn(`[browser.act] tab-new cold-start: Chrome opened to blank page (broken session), killing and restarting`);
+            
+            // Kill the broken Chrome session
+            killExistingChromeForProfile(sessionId);
+            openSessions.delete(sessionId);
+            await new Promise(r => setTimeout(r, 1500));
+            
+            // Clear profile lock and try fresh
+            clearProfileLock(sessionId);
+            
+            // Try open again with URL
+            logger.info(`[browser.act] tab-new cold-start: retrying open with ${url}`);
+            const retryRes = await cliRun([...S, 'open', url], Math.max(timeoutMs, 30000));
+            logger.info(`[browser.act] tab-new cold-start: retry result: ok=${retryRes.ok}`);
+            
+            if (!retryRes.ok) {
+              return {
+                ok: false,
+                action,
+                sessionId,
+                error: `Failed to open browser after retry: ${retryRes.error || retryRes.stderr?.trim()}`,
+                executionTime: Date.now() - start,
+              };
+            }
+          }
+          
+          // Wait for page to stabilize
+          logger.info(`[browser.act] tab-new cold-start: waiting for page to stabilize`);
+          const stableRes = await run(['waitForStableText'], 'waitForStableText', { timeoutMs: 15000 });
+          logger.info(`[browser.act] tab-new cold-start: waitForStableText returned: ok=${stableRes.ok}, aboutBlank=${stableRes.aboutBlankDetected}`);
+          
+          // If still on about:blank after retry, something is seriously wrong
+          if (stableRes.aboutBlankDetected) {
+            logger.error(`[browser.act] tab-new cold-start: still on about:blank after retry - giving up`);
+            return {
+              ok: false,
+              action,
+              sessionId,
+              error: 'Browser repeatedly opened to about:blank instead of target URL',
+              executionTime: Date.now() - start,
+            };
+          }
+          
+          return {
+            ok: true,
+            action,
+            sessionId,
+            tabIndex: lastIdx,
+            result: listRaw.stdout?.trim() || undefined,
+            stdout: openRes.stdout,
+            executionTime: Date.now() - start,
+          };
+        }
+        logger.error(`[browser.act] tab-new cold-start: open command failed: ${openRes.error || openRes.stderr}`);
+        return {
+          ok: false,
+          action,
+          sessionId,
+          error: openRes.error || openRes.stderr?.trim(),
+          executionTime: Date.now() - start,
+        };
+      }
+      // Daemon is running: use tab-new
       const tabNewRaw = await cliRun([...S, 'tab-new'], timeoutMs);
       logger.info(`[browser.act] tab-new → exit ${tabNewRaw.exitCode}`, { stderr: tabNewRaw.stderr?.slice(0, 100) });
       if (!tabNewRaw.ok) {
