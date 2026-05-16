@@ -42,6 +42,33 @@ async function ask(prompt, opts = {}) {
  * @returns {Promise<string>}
  */
 async function askWithMessages(messages, opts = {}) {
+  const MAX_RETRIES = 3;
+  const RETRY_BASE_MS = 600;
+  let lastErr;
+  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+    if (attempt > 1) {
+      await new Promise(r => setTimeout(r, RETRY_BASE_MS * (attempt - 1)));
+      logger.warn(`[skill-llm] attempt ${attempt}/${MAX_RETRIES} — retrying after empty/error`);
+    }
+    try {
+      const result = await _askWithMessagesOnce(messages, opts);
+      if (result.length > 0) return result;
+      lastErr = new Error('[skill-llm] Empty response');
+      logger.warn(`[skill-llm] attempt ${attempt}/${MAX_RETRIES} returned empty response`);
+    } catch (err) {
+      lastErr = err;
+      logger.warn(`[skill-llm] attempt ${attempt}/${MAX_RETRIES} error: ${err.message}`);
+    }
+  }
+  logger.error(`[skill-llm] all ${MAX_RETRIES} attempts failed — last: ${lastErr?.message}`);
+  return '';
+}
+
+/**
+ * Single-attempt implementation — called by askWithMessages retry loop.
+ * @private
+ */
+async function _askWithMessagesOnce(messages, opts = {}) {
   let WebSocket;
   try {
     WebSocket = require('ws');

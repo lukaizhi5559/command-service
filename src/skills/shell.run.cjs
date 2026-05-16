@@ -16,6 +16,7 @@
  *   timeoutMs:  number   — max execution time, default 30000, max 300000
  *   dryRun:     boolean  — validate + preview without executing (default false)
  *   stdin:      string   — optional stdin to pipe into the process
+ *   goal:       string   — plain-language goal (alternative to cmd+argv); resolved via internal LLM
  * }
  *
  * Returns:
@@ -36,6 +37,114 @@ const path = require('path');
 const os = require('os');
 const fs = require('fs');
 const logger = require('../logger.cjs');
+const skillLlm = require('../skill-helpers/skill-llm.cjs');
+
+// ---------------------------------------------------------------------------
+// Internal LLM prompt — translates a plain-language goal into a concrete bash
+// command. Fires ONLY when a plan step passes args.goal (natural language) instead
+// of args.argv (pre-built command). The pre-built argv path is 100% unchanged.
+// ---------------------------------------------------------------------------
+const SHELL_RUN_SYSTEM = `You are a macOS shell expert. Your job is to convert a plain-language automation goal into a single, safe bash -c command.
+
+Rules:
+- Return ONLY valid JSON: { "cmd": "bash", "argv": ["-c", "<script>"] }
+- No explanation, no markdown, no code fences — only JSON.
+- Always use bash -c as the outer command.
+- Prefer single-line pipelines. For multi-step logic, use a heredoc or temp script.
+
+BARE FOLDER/FILE NAME RULE (most important rule — read first):
+When the goal mentions a folder or file by name only with no absolute path (e.g. "gongzuo folder", "my projects folder", "resume.pdf"):
+- NEVER hard-code ~/folderName or /Users/<user>/folderName — this path almost certainly does not exist.
+- ALWAYS locate first using mdfind, then act on the result:
+  SRC=$(mdfind -name "FOLDERNAME" -onlyin "$HOME" | grep -v node_modules | head -1)
+  [ -d "$SRC" ] && <your command using "$SRC"> || echo "Folder not found: FOLDERNAME"
+- Example — "list files in the gongzuo folder":
+  SRC=$(mdfind -name "gongzuo" -onlyin "$HOME" | grep -v node_modules | head -1); [ -d "$SRC" ] && find "$SRC" -type f || echo "Folder not found: gongzuo"
+- Example — "count files in the gongzuo folder":
+  SRC=$(mdfind -name "gongzuo" -onlyin "$HOME" | grep -v node_modules | head -1); [ -d "$SRC" ] && find "$SRC" -type f | wc -l || echo "0"
+- For other unknown paths: SRC=$(mdfind -name "FILENAME" | grep -v node_modules | head -1)
+
+File move/copy safety rules (CRITICAL — bash loop bugs are the #1 failure):
+- NEVER use wildcards that include the destination: mv ~/Desktop/* ~/Desktop/dest/ WRONG (moves dest into itself)
+- ALWAYS use find with -type f: find SRC -maxdepth 1 -type f -exec mv -n {} DEST/ \\;
+- In while/for loops: use the loop variable ($file), NOT the source dir variable ($SRC) as the mv source argument
+- Unknown path: SRC=$(mdfind -name "FOLDERNAME" -onlyin "$HOME" | head -1); [ -d "$SRC" ] && find "$SRC" -maxdepth 1 -type f -exec mv -n {} ~/Desktop/ \\;
+- For any loop-based file move: prefer python3 shutil.move() — eliminates the loop-variable class of bugs entirely
+  Example: python3 -c "import shutil,pathlib; [shutil.move(str(f), 'DEST') for f in pathlib.Path('SRC').iterdir() if f.is_file()]"
+
+Tool selection by task type:
+| Task | Preferred tool |
+|---|---|
+| File move/copy/rename | python3 shutil (preferred) or bash find -exec mv |
+| Text search | bash: grep, rg, mdfind |
+| JSON/YAML transform (simple) | bash: jq, yq |
+| JSON/YAML transform (complex) | python3 -c or /tmp script |
+| CSV / Excel read/write/pivot | python3: pandas, openpyxl |
+| PDF text extraction | pdftotext (brew) or python3 pdfplumber |
+| Image resize/convert | ffmpeg or imagemagick (brew) |
+| Audio/video conversion | ffmpeg (brew) |
+| Multi-step logic, conditionals | python3 temp script via synthesize then shell.run |
+| macOS Finder / desktop ops | osascript -e |
+| macOS file locate | mdfind -name or mdfind -onlyin |
+| macOS plist edit | /usr/libexec/PlistBuddy |
+
+Python package quick-ref (install: pip3 install PKG --quiet --user):
+- CSV/Excel: pandas, openpyxl
+- PDF: pdfplumber, PyPDF2
+- Images: Pillow
+- HTTP: requests
+- Word docs: python-docx
+- JSON/data: json (stdlib), pathlib (stdlib)
+
+Brew tool quick-ref (install: brew install PKG):
+- JSON: jq | YAML: yq | PDF text: poppler (pdftotext) | Images: imagemagick, ffmpeg
+- Search: ripgrep (rg), fd | Archive: p7zip, unar
+
+Platform: macOS. Home dir: ${os.homedir()}
+`;
+
+/**
+ * Resolve a plain-language goal to a concrete { cmd, argv } using the internal LLM.
+ * Only called when args.goal is provided instead of args.argv.
+ *
+ * @param {string} goal
+ * @param {function} [onProgress] — optional callback for progress events:
+ *   { type: 'shell:goal_resolving', attempt, maxAttempts, goal }
+ *   { type: 'shell:goal_resolved', cmd, argv }
+ *   { type: 'shell:goal_failed', error }
+ */
+async function _resolveGoalToCommand(goal, onProgress) {
+  if (!skillLlm.isAvailable()) {
+    return { ok: false, error: 'LLM not available to resolve shell goal — provide cmd/argv directly' };
+  }
+  const MAX_ATTEMPTS = 3;
+  let lastErr = '';
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    if (onProgress) onProgress({ type: 'shell:goal_resolving', attempt, maxAttempts: MAX_ATTEMPTS, goal });
+    try {
+      const response = await skillLlm.askWithMessages([
+        { role: 'system', content: SHELL_RUN_SYSTEM },
+        { role: 'user', content: `Goal: ${goal}` },
+      ], { maxTokens: 300 });
+      const raw = (response || '').trim().replace(/^```[a-z]*\n?|```$/g, '').trim();
+      if (!raw) {
+        lastErr = 'LLM returned empty response';
+        continue;
+      }
+      const parsed = JSON.parse(raw);
+      if (!parsed.cmd || !Array.isArray(parsed.argv)) {
+        lastErr = `LLM returned invalid command shape: ${raw}`;
+        continue;
+      }
+      if (onProgress) onProgress({ type: 'shell:goal_resolved', cmd: parsed.cmd, argv: parsed.argv });
+      return { ok: true, cmd: parsed.cmd, argv: parsed.argv };
+    } catch (err) {
+      lastErr = `Goal resolution failed: ${err.message}`;
+    }
+  }
+  if (onProgress) onProgress({ type: 'shell:goal_failed', error: lastErr });
+  return { ok: false, error: lastErr };
+}
 
 // ---------------------------------------------------------------------------
 // OAuth environment variable injection
@@ -635,6 +744,20 @@ function validate(args) {
     return { ok: false, error: 'cmd is required and must be a string' };
   }
 
+  // Detect full shell string in cmd (spaces, globs, operators) — spawn cannot handle these.
+  // Return a structural error with clear guidance instead of a misleading allowlist gate.
+  // (path.basename("mv /path/to/Desktop/") = "Desktop" → wrong allowlist check otherwise)
+  if (/[\s*?|;&]/.test(cmd)) {
+    const needsShell = /[*?|;&$`]/.test(cmd);
+    return {
+      ok: false,
+      error: needsShell
+        ? `cmd contains shell operators/globs — use cmd:"bash", argv:["-c","<command>"] instead`
+        : `cmd contains spaces — split into cmd (binary name only) and argv (arguments array)`,
+      _shellStringInCmd: true,
+    };
+  }
+
   const baseName = path.basename(cmd);
 
   if (!_isCommandAllowed(baseName)) {
@@ -823,7 +946,7 @@ function runProcess(cmd, argv, options) {
 // ---------------------------------------------------------------------------
 
 async function shellRun(args) {
-  const {
+  let {
     cmd,
     argv = [],
     cwd,
@@ -831,14 +954,31 @@ async function shellRun(args) {
     timeoutMs = DEFAULT_TIMEOUT_MS,
     dryRun = false,
     stdin,
+    goal,
+    _progressCallback,
   } = args || {};
 
-  const originalCmdString = [cmd, ...argv].join(' ');
+  // ── Goal resolution path ─────────────────────────────────────────────────
+  // When the planner passes a plain-language args.goal instead of args.argv,
+  // resolve it to a concrete command via the internal LLM before proceeding.
+  if (goal && !cmd) {
+    logger.info('[shell.run] Resolving goal via internal LLM', { goal });
+    const resolved = await _resolveGoalToCommand(goal, _progressCallback || null);
+    if (!resolved.ok) {
+      return { ok: false, stdout: '', stderr: '', exitCode: -1, executionTime: 0, cmd: '', dryRun, error: resolved.error };
+    }
+    cmd = resolved.cmd;
+    argv = resolved.argv;
+    logger.info('[shell.run] Goal resolved to command', { cmd, argv });
+  }
+  // ─────────────────────────────────────────────────────────────────────────
+
+  const originalCmdString = [cmd, ...(argv || [])].join(' ');
 
   logger.info('shell.run invoked', { cmd, argv, cwd, timeoutMs, dryRun });
 
   // Validate
-  const validation = validate(args);
+  const validation = validate({ ...args, cmd, argv });
   if (!validation.ok) {
     logger.warn('shell.run validation failed', { error: validation.error, cmd, argv });
     return {
@@ -853,6 +993,7 @@ async function shellRun(args) {
       userAllowlistHint: !!validation.userAllowlistHint,
       commandName: validation.commandName || null,
       userAllowlistPath: validation.userAllowlistPath || null,
+      _shellStringInCmd: !!validation._shellStringInCmd,
     };
   }
 
