@@ -72,33 +72,49 @@ File move/copy safety rules (CRITICAL — bash loop bugs are the #1 failure):
 - For any loop-based file move: prefer python3 shutil.move() — eliminates the loop-variable class of bugs entirely
   Example: python3 -c "import shutil,pathlib; [shutil.move(str(f), 'DEST') for f in pathlib.Path('SRC').iterdir() if f.is_file()]"
 
-Tool selection by task type:
-| Task | Preferred tool |
-|---|---|
-| File move/copy/rename | python3 shutil (preferred) or bash find -exec mv |
-| Text search | bash: grep, rg, mdfind |
-| JSON/YAML transform (simple) | bash: jq, yq |
-| JSON/YAML transform (complex) | python3 -c or /tmp script |
-| CSV / Excel read/write/pivot | python3: pandas, openpyxl |
-| PDF text extraction | pdftotext (brew) or python3 pdfplumber |
-| Image resize/convert | ffmpeg or imagemagick (brew) |
-| Audio/video conversion | ffmpeg (brew) |
-| Multi-step logic, conditionals | python3 temp script via synthesize then shell.run |
-| macOS Finder / desktop ops | osascript -e |
-| macOS file locate | mdfind -name or mdfind -onlyin |
-| macOS plist edit | /usr/libexec/PlistBuddy |
+Available runtimes and what they handle:
 
-Python package quick-ref (install: pip3 install PKG --quiet --user):
-- CSV/Excel: pandas, openpyxl
-- PDF: pdfplumber, PyPDF2
-- Images: Pillow
-- HTTP: requests
-- Word docs: python-docx
-- JSON/data: json (stdlib), pathlib (stdlib)
+bash       — file ops (mv, cp, find, mkdir, rm), text processing (grep, awk, sed, cut),
+             process control, system queries, piping. Best for: single-line transforms,
+             file/folder ops, OS-level tasks.
 
-Brew tool quick-ref (install: brew install PKG):
-- JSON: jq | YAML: yq | PDF text: poppler (pdftotext) | Images: imagemagick, ffmpeg
-- Search: ripgrep (rg), fd | Archive: p7zip, unar
+python3    — the general-purpose workhorse. Handles ANY file format, data transform,
+             document generation, network call, or complex multi-step logic. stdlib covers
+             most needs (pathlib, shutil, json, csv, subprocess, os, re). For tasks that
+             need a third-party package, install it inline:
+               python3 -m pip install PKG --quiet --user
+             then import and use it in the same -c script or /tmp script. The ecosystem is
+             vast — use your knowledge to pick the right package for the task; don't limit
+             yourself to a fixed list. Never approximate with the wrong tool (e.g. touch to
+             "create" a file that needs real content — always generate actual bytes).
+
+node       — JavaScript execution. Use when the task is JS-native (JSON transforms, quick
+             HTTP fetch, node scripts). Install packages inline with npm install if needed.
+
+brew       — macOS package manager for CLI binaries (ffmpeg, imagemagick, pandoc, jq,
+             ripgrep, fd, poppler, etc.). Prefer brew when a native binary is cleaner than
+             a python3 script. Check if installed first: command -v TOOL || brew install TOOL.
+
+osascript  — macOS Finder, app control, desktop UI automation. Use for anything that needs
+             to interact with the macOS GUI layer (open Finder windows, click menus, control
+             apps by name, move windows).
+
+Discovery rule: if the right package or CLI tool is not immediately obvious, reason from
+first principles — what file format or protocol is involved, which runtime handles it best,
+what is the canonical library in that ecosystem — then install and use it inline.
+
+Idempotency rule (CRITICAL — prevents false retry loops):
+For rename, move, create, mkdir, or install operations: ALWAYS check if the goal is already
+achieved BEFORE failing. If the result already exists, exit 0 and print a confirmation.
+- Rename/move: check if destination already exists → if yes, echo "already done: DEST exists" && exit 0
+- Create file/folder: check if already exists → if yes, echo "already done: PATH exists" && exit 0
+- Install: check if already installed → if yes, echo "already done: TOOL already installed" && exit 0
+Example for rename (correct idempotent pattern):
+  SRC="$HOME/Desktop/some-folder"; DEST="$HOME/Desktop/test-folder"
+  if [ -d "$DEST" ]; then echo "already done: $DEST already exists"; exit 0; fi
+  if [ ! -d "$SRC" ]; then echo "Error: source $SRC not found" >&2; exit 1; fi
+  mv -v "$SRC" "$DEST"
+Never exit 1 when the goal state is already observably complete.
 
 Platform: macOS. Home dir: ${os.homedir()}
 `;
@@ -541,16 +557,23 @@ const BLOCKED_ARG_PATTERNS = [
   /`[^`]+`/,     // backtick substitution in raw argv
 ];
 
-// Patterns that are dangerous inside bash -c scripts
+// Patterns that are dangerous inside bash -c scripts.
+// NOTE: sudo by itself is NOT blocked — package installers (sudo installer, sudo brew)
+// are legitimate. Only block sudo paired with high-risk targets.
 const DANGEROUS_SCRIPT_PATTERNS = [
-  /\bsudo\b/,
-  /\bsu\b\s/,
+  /\bsudo\s+(rm|shred|mkfs|fdisk|parted|dd|wipefs)\b/,   // sudo + destructive disk/file ops
+  /\bsudo\s+chmod\s+[0-7]*7[0-7]*\s+\/(?!Users|tmp)/,   // sudo chmod 7xx on system paths
+  /\bsu\b\s+-[\s]*[cslp]/,                               // su -c / su -l / su -s / su -p
   /\bpasswd\b/,
   /rm\s+-rf\s+\/(?!Users|tmp|var\/tmp)/,  // rm -rf on system paths
   /:\s*\(\s*\)\s*\{.*fork bomb/i,          // fork bomb
   />\/dev\/sd[a-z]/,                       // writing to raw disk devices
   /dd\s+.*of=\/dev\/(?!null|zero)/,        // dd to disk devices
 ];
+
+// sudo operations that are safe to allow but require user visibility
+// When a script contains these, emit shell:sudo_required before execution
+const SUDO_INSTALL_PATTERN = /\bsudo\b/;
 // Pattern that detects direct reads from ~/.thinkdrop/tokens/ — blocked to enforce
 // $<PROVIDER>_ACCESS_TOKEN usage. The env vars are pre-injected and auto-refreshed;
 // reading the token files directly risks using stale access tokens.
@@ -850,7 +873,7 @@ function validate(args) {
 // Execution
 // ---------------------------------------------------------------------------
 
-function runProcess(cmd, argv, options) {
+function runProcess(cmd, argv, options, onProgress) {
   return new Promise((resolve) => {
     const startTime = Date.now();
 
@@ -878,18 +901,39 @@ function runProcess(cmd, argv, options) {
     let stderrBuf = '';
     let truncated = false;
 
+    // Debounce chunk emission so rapid output doesn't flood the UI bridge
+    let _chunkTimer = null;
+    let _pendingChunk = '';
+    function _flushChunk() {
+      if (_pendingChunk && onProgress) {
+        onProgress({ type: 'shell:stdout_chunk', text: _pendingChunk });
+      }
+      _pendingChunk = '';
+      _chunkTimer = null;
+    }
+
     proc.stdout.on('data', (chunk) => {
+      const text = chunk.toString();
       if (stdoutBuf.length < MAX_OUTPUT_BYTES) {
-        stdoutBuf += chunk.toString();
+        stdoutBuf += text;
       } else if (!truncated) {
         stdoutBuf += '\n[output truncated]';
         truncated = true;
       }
+      if (onProgress) {
+        _pendingChunk += text;
+        if (!_chunkTimer) _chunkTimer = setTimeout(_flushChunk, 120);
+      }
     });
 
     proc.stderr.on('data', (chunk) => {
+      const text = chunk.toString();
       if (stderrBuf.length < MAX_OUTPUT_BYTES) {
-        stderrBuf += chunk.toString();
+        stderrBuf += text;
+      }
+      if (onProgress) {
+        _pendingChunk += text;
+        if (!_chunkTimer) _chunkTimer = setTimeout(_flushChunk, 120);
       }
     });
 
@@ -1019,13 +1063,25 @@ async function shellRun(args) {
 
   // Execute
   const oauthEnv = await loadOAuthEnv();
+
+  // ── sudo visibility — emit event before execution so the UI can warn the user ──
+  const isShellScript = ['bash', 'sh', 'zsh'].includes(path.basename(cmd));
+  const scriptBody = isShellScript && Array.isArray(runArgv) && runArgv[0] === '-c' ? (runArgv[1] || '') : '';
+  if (scriptBody && SUDO_INSTALL_PATTERN.test(scriptBody) && _progressCallback) {
+    _progressCallback({
+      type: 'shell:sudo_required',
+      message: 'This step requires administrator access (sudo). You may be prompted for your system password in the terminal.',
+      cmd: resolvedCmdString,
+    });
+  }
+
   const result = await runProcess(cmd, runArgv, {
     cwd,
     // OAuth vars are the lowest priority — explicit env arg and process.env override them
     env: { ...oauthEnv, ...env },
     timeoutMs: Math.min(timeoutMs, MAX_TIMEOUT_MS),
     stdin,
-  });
+  }, _progressCallback || null);
 
   const verifiedResult = _verifyExpectedOutputs(result, baseName, runArgv, cwd);
 

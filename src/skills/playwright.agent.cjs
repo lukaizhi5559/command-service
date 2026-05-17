@@ -1357,14 +1357,20 @@ async function playwrightAgent(args) {
             logger.info(`[playwright.agent] captured ${stableTextResult.length} chars from waitForStableText, skipping redundant getPageText`);
           }
         }
-        // Use the stable text result if we have it, otherwise fall back to getPageText
-        if (stableTextResult) {
+        // Always run a final getPageText after waitForStableText.
+        // Reusing the stable-text result directly risks capturing a mid-stream snapshot
+        // on streaming pages (e.g. ChatGPT) where two polls land in the same inter-burst
+        // gap and falsely declare stability before the response is complete.
+        outcome = await browserAct({ action: 'getPageText', sessionId, headed, timeoutMs });
+        // If getPageText came back empty but waitForStableText had content, use that as fallback
+        if ((!outcome.result || outcome.result.length < 100) && stableTextResult) {
           outcome = { ok: true, action: 'getPageText', sessionId, result: stableTextResult, executionTime: 0 };
-          // CRITICAL: Also set lastGetPageTextResult so return step can substitute it
-          lastGetPageTextResult = stableTextResult;
-          logger.info(`[playwright.agent] set lastGetPageTextResult from waitForStableText: ${lastGetPageTextResult.length} chars`);
-        } else {
-          outcome = await browserAct({ action: 'getPageText', sessionId, headed, timeoutMs });
+          logger.info(`[playwright.agent] getPageText returned empty — falling back to waitForStableText result (${stableTextResult.length} chars)`);
+        }
+        // CRITICAL: Set lastGetPageTextResult so return step can substitute it
+        if (outcome.result) {
+          lastGetPageTextResult = outcome.result;
+          logger.info(`[playwright.agent] set lastGetPageTextResult: ${lastGetPageTextResult.length} chars`);
         }
       } else if (step.action === 'wait') {
         const ms = Math.min(parseInt(step.ms || step.duration || 2000, 10), 5000);
