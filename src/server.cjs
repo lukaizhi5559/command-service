@@ -44,6 +44,7 @@ const webAgent   = require('./skills/web.agent.cjs');
 const videoAgent = require('./skills/video.agent.cjs');
 const skillScheduler = require('./skill-helpers/skill-scheduler.cjs');
 const { startIdleWatcher, stopIdleWatcher, startScanScheduler, runMaintenanceScan, cancelMaintenanceScan, getScanStatus } = require('./skills/explore.agent.cjs');
+const { systemIntrospect } = require('./skills/system.introspect.cjs');
 
 class CommandServiceMCPServer {
   constructor() {
@@ -138,6 +139,9 @@ class CommandServiceMCPServer {
 
       case 'video.agent':
         return await this._skillVideoAgent(args);
+
+      case 'system.introspect':
+        return await this._skillSystemIntrospect(args);
 
       default:
         return {
@@ -239,6 +243,10 @@ class CommandServiceMCPServer {
     return await playwrightAgent(args);
   }
 
+  async _skillSystemIntrospect(args) {
+    return await systemIntrospect(args);
+  }
+
   // ---------------------------------------------------------------------------
   // Health
   // ---------------------------------------------------------------------------
@@ -248,7 +256,7 @@ class CommandServiceMCPServer {
       success: true,
       service: this.serviceName,
       status: 'healthy',
-      skills: ['shell.run', 'browser.act', 'web.crawl', 'image.analyze', 'fs.read', 'file.watch', 'file.bridge', 'screen.capture', 'external.skill', 'cli.agent', 'browser.agent', 'playwright.agent', 'creator.agent', 'reviewer.agent', 'skillCreator.skill', 'project.builder', 'project.launcher', 'project.editor', 'project.stopper']
+      skills: ['shell.run', 'browser.act', 'web.crawl', 'image.analyze', 'fs.read', 'file.watch', 'file.bridge', 'screen.capture', 'external.skill', 'cli.agent', 'browser.agent', 'playwright.agent', 'creator.agent', 'reviewer.agent', 'skillCreator.skill', 'project.builder', 'project.launcher', 'project.editor', 'project.stopper', 'system.introspect']
     };
   }
 
@@ -288,6 +296,11 @@ class CommandServiceMCPServer {
     // ── Warm up creator.agent DB (ensures projects table exists) ────────────
     creatorAgent({ action: 'list_projects' }).catch(() => {});
     reviewerAgent({ action: 'status', projectId: '__warmup__' }).catch(() => {});
+
+    // ── Generate workspace manifest ────────────────────────────────────────────
+    // Creates ~/.thinkdrop/manifest.json with agents, skills, DB info for self-awareness
+    const { generateManifest } = require('./workspace-manifest.cjs');
+    generateManifest().catch(err => logger.warn('[Server] Manifest generation failed (non-fatal)', { error: err.message }));
 
     // ── Start skill scheduler daemon ─────────────────────────────────────────
     // Reads installed skills from user-memory MCP, registers node-cron jobs
@@ -351,7 +364,7 @@ class CommandServiceMCPServer {
         res.end(JSON.stringify({
           status: 'healthy',
           service: this.serviceName,
-          skills: ['shell.run', 'browser.act', 'web.crawl', 'image.analyze', 'fs.read', 'file.watch', 'file.bridge', 'screen.capture', 'external.skill', 'cli.agent', 'browser.agent', 'playwright.agent', 'creator.agent', 'reviewer.agent', 'skillCreator.skill', 'project.builder', 'project.launcher', 'project.editor', 'project.stopper']
+          skills: ['shell.run', 'browser.act', 'web.crawl', 'image.analyze', 'fs.read', 'file.watch', 'file.bridge', 'screen.capture', 'external.skill', 'cli.agent', 'browser.agent', 'playwright.agent', 'creator.agent', 'reviewer.agent', 'skillCreator.skill', 'project.builder', 'project.launcher', 'project.editor', 'project.stopper', 'system.introspect']
         }));
         return;
       }

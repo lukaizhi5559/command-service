@@ -516,13 +516,19 @@ async function agentWebFetch(url) {
 
 // Builds the systemInstructions for a loop turn: loop prompt + trimmed descriptor.
 // Descriptor is placed in system (not user) to avoid WS bridge prompt-field size limits.
-function buildTurnSystemPrompt(descriptor, learnedRules) {
+function buildTurnSystemPrompt(descriptor, learnedRules, userContext) {
   const DESCRIPTOR_LIMIT = 3000;
   const trimmedDescriptor = (descriptor || '(none)').slice(0, DESCRIPTOR_LIMIT);
   const rulesSection = (Array.isArray(learnedRules) && learnedRules.length > 0)
     ? '\n\n## Learned Command Rules (from past runs)\n' + learnedRules.map(r => `- ${r}`).join('\n')
     : '';
-  return `${CLI_AGENTIC_LOOP_PROMPT}\n\n## Agent Descriptor\n${trimmedDescriptor}${rulesSection}`;
+  // User context: authenticated identities so the LLM knows the correct owner/account
+  // without guessing (e.g. github: lukaizhi5559 → use -R lukaizhi5559/repo, not repo/repo)
+  const userContextSection = (userContext && Object.keys(userContext).length > 0)
+    ? '\n\n## User Context (authenticated identities — use these, do NOT guess)\n' +
+      Object.entries(userContext).map(([svc, user]) => `- ${svc}: ${user}`).join('\n')
+    : '';
+  return `${CLI_AGENTIC_LOOP_PROMPT}\n\n## Agent Descriptor\n${trimmedDescriptor}${rulesSection}${userContextSection}`;
 }
 
 // Builds the user-turn prompt for a loop turn: task + history only (~200-400 chars).
@@ -913,6 +919,26 @@ async function actionRun({ cli, argv = [], cwd, env, timeoutMs, stdin, agentId, 
       logger.info(`[cli.agent] loaded ${learnedRules.length} learned rule(s) for ${agentId}`, { agentId });
     }
 
+    // Resolve authenticated user identity for this agent's service.
+    // Injected into the system prompt so the LLM uses the correct owner/account.
+    const _serviceKey = (agent.service || agentId.replace(/\.agent$/i, '')).toLowerCase().replace(/[^a-z0-9]/g, '');
+    const _userContext = {};
+    if (IDENTITY_COMMANDS[_serviceKey]) {
+      try {
+        const _idCmd = IDENTITY_COMMANDS[_serviceKey];
+        const _idR = await spawnCapture(currentBinPath, _idCmd.argv, { timeoutMs: 5000 });
+        if (_idR.ok) {
+          const _user = _idCmd.extract(_idR.stdout);
+          if (_user) {
+            _userContext[_serviceKey] = _user;
+            logger.info(`[cli.agent] agentic run: resolved ${_serviceKey} identity → "${_user}"`, { agentId });
+          }
+        }
+      } catch (_idErr) {
+        logger.debug(`[cli.agent] agentic run: identity resolution failed for ${_serviceKey}: ${_idErr.message}`);
+      }
+    }
+
     // Use effectiveTask (with pre_step token injections) as the loop task
     const loopTask = effectiveTask;
 
@@ -929,7 +955,7 @@ async function actionRun({ cli, argv = [], cwd, env, timeoutMs, stdin, agentId, 
         _req.end();
       }
 
-      const turnSys  = buildTurnSystemPrompt(agent.descriptor, learnedRules);
+      const turnSys  = buildTurnSystemPrompt(agent.descriptor, learnedRules, _userContext);
       const turnUser = buildTurnPrompt(loopTask, loopHistory);
       logger.info(`[cli.agent] loop turn=${turn} syschars=${turnSys.length} userchars=${turnUser.length}`, { agentId, task: loopTask });
 
@@ -2448,9 +2474,25 @@ Known examples:
 If the task mentions no external services or CLIs (pure local shell/file tasks), return [].
 Return ONLY a valid JSON array. No markdown, no explanation.`;
 
-async function checkAuthStatus(binPath, tokenCmd, timeoutMs = 8000) {
+// Per-service identity resolution commands — returns the authenticated username/account.
+// Keys must match KNOWN_CLI_MAP service keys. Each entry: { argv, extract(stdout) → string|null }
+const IDENTITY_COMMANDS = {
+  github:  { argv: ['api', 'user', '--jq', '.login'],                       extract: s => s.trim() || null },
+  aws:     { argv: ['sts', 'get-caller-identity', '--query', 'Account', '--output', 'text'], extract: s => s.trim() || null },
+  gcloud:  { argv: ['config', 'get-value', 'account'],                      extract: s => { const v = s.trim(); return v && !v.includes('(unset)') ? v : null; } },
+  vercel:  { argv: ['whoami'],                                               extract: s => s.trim() || null },
+  netlify: { argv: ['status', '--json'],                                     extract: s => { try { return JSON.parse(s).email || null; } catch { return s.trim().match(/Email:\s*(\S+)/)?.[1] || null; } } },
+  fly:     { argv: ['auth', 'whoami'],                                       extract: s => s.trim() || null },
+  heroku:  { argv: ['auth:whoami'],                                          extract: s => s.trim() || null },
+  doctl:   { argv: ['account', 'get', '--format', 'Email', '--no-header'],   extract: s => s.trim() || null },
+  supabase:{ argv: ['status'],                                               extract: s => s.trim().match(/(?:email|user):\s*(\S+)/i)?.[1] || null },
+  railway: { argv: ['whoami'],                                               extract: s => s.trim() || null },
+  wrangler:{ argv: ['whoami'],                                               extract: s => s.trim().match(/(\S+@\S+|\S+)/)?.[1] || null },
+};
+
+async function checkAuthStatus(binPath, tokenCmd, timeoutMs = 8000, serviceKey = null) {
   if (!binPath || !tokenCmd || tokenCmd.length === 0) {
-    return { authed: null, authStatus: 'unknown' };
+    return { authed: null, authStatus: 'unknown', authUser: null };
   }
   const r = await spawnCapture(binPath, tokenCmd, { timeoutMs });
   // A non-zero exit with "not logged in" / "unauthenticated" = clearly not authed
@@ -2458,12 +2500,28 @@ async function checkAuthStatus(binPath, tokenCmd, timeoutMs = 8000) {
   const combined = (r.stdout + r.stderr).toLowerCase();
   if (r.ok) {
     const tokenLike = r.stdout.trim().length > 4;
-    return { authed: tokenLike, authStatus: tokenLike ? 'authenticated' : 'no_token_returned' };
+    // Resolve authenticated user identity if we have a service-specific command
+    let authUser = null;
+    if (tokenLike && serviceKey && IDENTITY_COMMANDS[serviceKey]) {
+      try {
+        const idCmd = IDENTITY_COMMANDS[serviceKey];
+        const idR = await spawnCapture(binPath, idCmd.argv, { timeoutMs: 5000 });
+        if (idR.ok) {
+          authUser = idCmd.extract(idR.stdout);
+          if (authUser) {
+            logger.info(`[cli.agent] checkAuthStatus: ${serviceKey} identity resolved → "${authUser}"`);
+          }
+        }
+      } catch (idErr) {
+        logger.debug(`[cli.agent] checkAuthStatus: ${serviceKey} identity resolution failed: ${idErr.message}`);
+      }
+    }
+    return { authed: tokenLike, authStatus: tokenLike ? 'authenticated' : 'no_token_returned', authUser };
   }
   if (/not logged in|not authenticated|unauthenticated|login required|run.*auth.*login|please login|please authenticate|no credentials/i.test(combined)) {
-    return { authed: false, authStatus: 'not_authenticated' };
+    return { authed: false, authStatus: 'not_authenticated', authUser: null };
   }
-  return { authed: null, authStatus: 'unknown' };
+  return { authed: null, authStatus: 'unknown', authUser: null };
 }
 
 // Parse a JSON array from a raw LLM string (handles markdown fences)
@@ -2618,8 +2676,8 @@ async function actionPreflightCheck({ task, clis: explicitClis }) {
     const version = (versionResult.stdout || versionResult.stderr).split('\n')[0].trim() || null;
 
     const authResult = meta.tokenCmd
-      ? await checkAuthStatus(binPath, meta.tokenCmd, 8000)
-      : { authed: null, authStatus: 'no_auth_check' };
+      ? await checkAuthStatus(binPath, meta.tokenCmd, 8000, serviceKey)
+      : { authed: null, authStatus: 'no_auth_check', authUser: null };
 
     detectedClis.push({
       service:       serviceKey,
@@ -2629,6 +2687,7 @@ async function actionPreflightCheck({ task, clis: explicitClis }) {
       version,
       authed:        authResult.authed,
       authStatus:    authResult.authStatus,
+      authUser:      authResult.authUser || null,
       installMethod: meta.method,
       installPkg:    meta.pkg,
       tokenCmd:      meta.tokenCmd,
@@ -2657,7 +2716,8 @@ async function actionPreflightCheck({ task, clis: explicitClis }) {
       return `${c.cli} (${c.service}): installed (${c.version}) — NOT AUTHENTICATED`;
     }
     if (c.authStatus === 'authenticated') {
-      return `${c.cli} (${c.service}): installed (${c.version}) — authenticated ✓`;
+      const userNote = c.authUser ? ` as ${c.authUser}` : '';
+      return `${c.cli} (${c.service}): installed (${c.version}) — authenticated${userNote} ✓`;
     }
     return `${c.cli} (${c.service}): installed (${c.version}) — auth unknown`;
   });
