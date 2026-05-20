@@ -932,6 +932,33 @@ function killExistingChromeForProfile(sessionId) {
   }
 }
 
+// Close any about:blank / chrome://newtab tabs that accumulated from failed navigations.
+// Called after a successful navigate to clean up ghost tabs.
+async function closeBlankTabs(sessionId, headed = true) {
+  const S = sessionFlags(sessionId, headed);
+  try {
+    const listRes = await cliRun([...S, 'tab-list'], 5000);
+    if (!listRes.ok) return 0;
+    const lines = (listRes.stdout || '').split('\n');
+    const blankIndices = [];
+    for (const line of lines) {
+      const m = line.match(/^\s*-\s+(\d+):\s+(about:blank|chrome:\/\/newtab)/);
+      if (m) blankIndices.push(parseInt(m[1], 10));
+    }
+    if (blankIndices.length === 0) return 0;
+    // Close from highest index down to preserve tab ordering
+    for (const idx of blankIndices.sort((a, b) => b - a)) {
+      await cliRun([...S, 'tab-select', String(idx)], 3000);
+      await cliRun([...S, 'tab-close'], 3000);
+    }
+    logger.info(`[browser.act] closeBlankTabs: closed ${blankIndices.length} blank tab(s) for session=${sessionId}`);
+    return blankIndices.length;
+  } catch (e) {
+    logger.warn(`[browser.act] closeBlankTabs error: ${e.message}`);
+    return 0;
+  }
+}
+
 // Determine if session should use persistent profile (skills best practice)
 function shouldUsePersistentProfile(sessionId) {
   // Use persistent profiles for all sessions except explicitly ephemeral/one-shot ones.
@@ -1746,9 +1773,16 @@ async function browserAct(args) {
         } catch (_) {
           // Probe failure is non-fatal — navigation result stands.
         }
+
+        // Clean up any ghost about:blank tabs from prior failed attempts
+        closeBlankTabs(sessionId, headed).catch(() => {});
       } else if (alreadyOpen && !res.ok) {
-        // goto failed (daemon may have died) — retry with open to restart it
-        logger.info(`[browser.act] goto failed, retrying with open for session=${sessionId}`);
+        // goto failed (daemon may have died) — kill Chrome, clear profile lock, then retry with open
+        logger.info(`[browser.act] goto failed, killing Chrome and retrying with open for session=${sessionId}`);
+        killExistingChromeForProfile(sessionId);
+        await new Promise(r => setTimeout(r, 1000));
+        clearProfileLock(sessionId);
+        openSessions.delete(sessionId);
         const retryRes = await cliRun([...S, 'open', url], navTimeout);
         if (retryRes.ok) { openSessions.add(sessionId); }
         logger.info(`[browser.act] open ${url} → exit ${retryRes.exitCode}`, { stderr: retryRes.stderr?.slice(0, 200) });

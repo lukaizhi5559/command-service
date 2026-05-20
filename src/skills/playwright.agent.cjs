@@ -884,7 +884,7 @@ async function playwrightAgent(args) {
     sessionId             = 'playwright_agent',
     agentId               = sessionId,
     agentContext,
-    maxRepairs            = 4,
+    maxRepairs            = 2,
     timeoutMs             = 15000,
     headed                = true,
     url,

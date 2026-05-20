@@ -3132,18 +3132,51 @@ When extracting page content with run-code, prioritize these selectors over gene
       // sees a wall (e.g. waitForAuth timed out, user didn't sign in).
       if (!_loginWallRetried && !_useAgentBrowser) {
         logger.info(`[browser.agent] auto-retry: calling waitForAuth for ${agentId} then re-delegating to ${_agentSkill}`);
+
+        // ── Emit task:auth_required so the UI shows the full auth overlay ────
+        const _svcDisplay = agentId.replace('.agent', '').replace(/_/g, ' ');
+        if (_progressCallbackUrl) {
+          try {
+            const http = require('http');
+            const _authPayload = JSON.stringify({
+              type: 'task:auth_required',
+              agentId,
+              serviceDisplay: _svcDisplay,
+              loginUrl: signInUrl || startUrl,
+              sessionId,
+              stepIndex: _stepIndex ?? 0,
+              message: `Sign in to ${_svcDisplay} in the browser window that just opened.`,
+            });
+            const _authReq = http.request({ hostname: '127.0.0.1', port: parseInt(new URL(_progressCallbackUrl).port, 10), path: new URL(_progressCallbackUrl).pathname, method: 'POST', headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(_authPayload) }, timeout: 3000 });
+            _authReq.on('error', () => {});
+            _authReq.write(_authPayload);
+            _authReq.end();
+          } catch (_notifyErr) { /* fire-and-forget */ }
+        }
+
         try {
           const _wallAuthResult = await callBrowserAct({
             action: 'waitForAuth',
             sessionId,
             url: signInUrl || startUrl,
             authSuccessUrl: authSuccessPattern,
-            timeoutMs: 2 * 60 * 1000,
+            timeoutMs: 5 * 60 * 1000,
             _progressCallbackUrl,
-          }, 3 * 60 * 1000);
+          }, 6 * 60 * 1000);
 
           if (_wallAuthResult?.ok) {
             logger.info(`[browser.agent] waitForAuth succeeded after login-wall upgrade for ${agentId} — retrying ${_agentSkill}`);
+            // ── Emit task:auth_resolved so the UI dismisses the auth overlay ──
+            if (_progressCallbackUrl) {
+              try {
+                const http = require('http');
+                const _resolvedPayload = JSON.stringify({ type: 'task:auth_resolved', agentId, sessionId, stepIndex: _stepIndex ?? 0 });
+                const _resolvedReq = http.request({ hostname: '127.0.0.1', port: parseInt(new URL(_progressCallbackUrl).port, 10), path: new URL(_progressCallbackUrl).pathname, method: 'POST', headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(_resolvedPayload) }, timeout: 3000 });
+                _resolvedReq.on('error', () => {});
+                _resolvedReq.write(_resolvedPayload);
+                _resolvedReq.end();
+              } catch (_) { /* fire-and-forget */ }
+            }
             // Restore status to 'healthy' now that auth is confirmed working — ensures
             // planSkills re-includes this agent in the AVAILABLE AGENTS list for future plans.
             try {
@@ -3187,11 +3220,15 @@ When extracting page content with run-code, prioritize these selectors over gene
         }
       }
 
+      const _svcDisplayFinal = agentId.replace('.agent', '').replace(/_/g, ' ');
       return {
         ok: false,
         agentId,
         task,
-        error: `Login wall detected for ${agentId} — service requires authentication. Agent upgraded to isOAuth:true. Please sign in and re-run.`,
+        askUser: true,
+        question: `${_svcDisplayFinal} requires sign-in. A browser window has been opened — please sign in there to continue.`,
+        options: [],
+        error: `Login wall detected for ${agentId} — service requires authentication.`,
         loginWallDetected: true,
         oauthUpgraded: true,
       };

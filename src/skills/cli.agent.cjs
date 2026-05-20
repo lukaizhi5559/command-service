@@ -942,6 +942,8 @@ async function actionRun({ cli, argv = [], cwd, env, timeoutMs, stdin, agentId, 
     // Use effectiveTask (with pre_step token injections) as the loop task
     const loopTask = effectiveTask;
 
+    let _authAttempted = false; // prevents infinite auto-auth retry within the agentic loop
+
     for (let turn = 1; turn <= MAX_TURNS; turn++) {
       // ── Real-time turn progress → Electron overlay server ──────────────────
       // POST turn info to the overlay /agent-turn endpoint so the UI can show
@@ -970,7 +972,33 @@ async function actionRun({ cli, argv = [], cwd, env, timeoutMs, stdin, agentId, 
           const m = llmRaw.match(/\{[\s\S]*\}/);
           if (m) action = JSON.parse(m[0]);
         } catch (parseErr) {
-          logger.warn(`[cli.agent] loop turn=${turn} JSON parse failed: ${parseErr.message}`, { agentId });
+          logger.warn(`[cli.agent] loop turn=${turn} JSON parse failed: ${parseErr.message} — attempting sanitize`, { agentId });
+          // ── Fallback: sanitize common LLM JSON errors and retry ──────────
+          try {
+            const m = llmRaw.match(/\{[\s\S]*\}/);
+            if (m) {
+              const sanitized = m[0]
+                .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f]/g, '')   // strip control chars
+                .replace(/\\'/g, "'")                              // \' → '
+                .replace(/\n/g, '\\n')                             // unescaped newlines
+                .replace(/\r/g, '\\r')                             // unescaped CRs
+                .replace(/\t/g, '\\t')                             // unescaped tabs
+                .replace(/,\s*([\]}])/g, '$1');                    // trailing commas
+              action = JSON.parse(sanitized);
+              logger.info(`[cli.agent] loop turn=${turn} JSON sanitize recovered action=${action?.action}`, { agentId });
+            }
+          } catch (_sanitizeErr) {
+            // ── Last resort: regex-extract action + question for ask_user ──
+            const actionMatch = llmRaw.match(/"action"\s*:\s*"([^"]+)"/);
+            const questionMatch = llmRaw.match(/"question"\s*:\s*"((?:[^"\\]|\\.)*)"/);
+            if (actionMatch) {
+              action = { action: actionMatch[1] };
+              if (questionMatch) action.question = questionMatch[1].replace(/\\"/g, '"').replace(/\\n/g, '\n');
+              logger.info(`[cli.agent] loop turn=${turn} regex fallback recovered action=${action.action}`, { agentId });
+            } else {
+              logger.warn(`[cli.agent] loop turn=${turn} all parse fallbacks failed`, { agentId });
+            }
+          }
         }
       }
 
@@ -1006,6 +1034,66 @@ async function actionRun({ cli, argv = [], cwd, env, timeoutMs, stdin, agentId, 
           skillDb.setContextRule('cli_agent:' + agentId, action.save_rule.trim(), 'cli_agent').catch(() => {});
           logger.info(`[cli.agent] saved learned rule for ${agentId}: "${action.save_rule.slice(0, 120)}"`, { agentId });
         }
+
+        // ── Auto-auth intercept: if this ask_user is about authentication, attempt silent login ──
+        const _questionLower = (action.question || '').toLowerCase();
+        const _isAuthQuestion = /\b(auth|login|sign[\s-]?in|not logged|unauthorized|unauthenticated|credentials|token expired|permission denied|403|401)\b/i.test(_questionLower);
+        if (_isAuthQuestion && currentBinPath && !_authAttempted) {
+          _authAttempted = true; // prevent infinite retry
+          logger.info(`[cli.agent] ask_user appears auth-related for ${agentId} — attempting auto-auth`, { agentId });
+          try {
+            const _authArgv = await discoverAuthLoginCmd(currentBinPath, cliTool || agentId);
+            if (_authArgv) {
+              // Emit task:auth_required so UI shows the overlay
+              if (_progressCallbackUrl) {
+                try {
+                  const http = require('http');
+                  const _svcDisplay = (agent?.service || cliTool || agentId).replace(/_/g, ' ');
+                  const _payload = JSON.stringify({
+                    type: 'task:auth_required',
+                    agentId,
+                    serviceDisplay: _svcDisplay,
+                    loginUrl: '',
+                    sessionId: null,
+                    stepIndex: _stepIndex ?? 0,
+                    message: `Signing in to ${_svcDisplay}… A browser window may open for authorization.`,
+                  });
+                  const _req = http.request({ hostname: '127.0.0.1', port: parseInt(new URL(_progressCallbackUrl).port, 10), path: new URL(_progressCallbackUrl).pathname, method: 'POST', headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(_payload) }, timeout: 3000 });
+                  _req.on('error', () => {});
+                  _req.write(_payload);
+                  _req.end();
+                } catch (_) {}
+              }
+
+              // Run the auth command (may open a browser for OAuth)
+              logger.info(`[cli.agent] running auto-auth: ${currentBinPath} ${_authArgv.join(' ')}`, { agentId });
+              const _authResult = await spawnCapture(currentBinPath, _authArgv, { timeoutMs: 180000 });
+              logger.info(`[cli.agent] auto-auth result: exitCode=${_authResult.exitCode}`, { agentId });
+
+              // Emit task:auth_resolved
+              if (_progressCallbackUrl) {
+                try {
+                  const http = require('http');
+                  const _resolvedPayload = JSON.stringify({ type: 'task:auth_resolved', agentId, stepIndex: _stepIndex ?? 0 });
+                  const _resolvedReq = http.request({ hostname: '127.0.0.1', port: parseInt(new URL(_progressCallbackUrl).port, 10), path: new URL(_progressCallbackUrl).pathname, method: 'POST', headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(_resolvedPayload) }, timeout: 3000 });
+                  _resolvedReq.on('error', () => {});
+                  _resolvedReq.write(_resolvedPayload);
+                  _resolvedReq.end();
+                } catch (_) {}
+              }
+
+              if (_authResult.exitCode === 0) {
+                // Auth succeeded — retry the loop instead of surfacing ask_user
+                logger.info(`[cli.agent] auto-auth succeeded for ${agentId} — retrying task`, { agentId });
+                loopHistory.push({ turn, action: 'auto_auth', observation: `Auto-login succeeded. Retrying original task.` });
+                continue; // back to top of agentic loop
+              }
+            }
+          } catch (_authErr) {
+            logger.warn(`[cli.agent] auto-auth failed for ${agentId}: ${_authErr.message}`, { agentId });
+          }
+        }
+
         // Do NOT push to transcript — ask_user is a terminal escalation, not an executed step.
         // Showing it as a turn bubble would duplicate the question text that the UI card already displays.
         return { ok: false, agentId, task, askUser: true, question: action.question || '', options: action.options || [], agentTurns: turn, transcript, savedRule: (action.save_rule || '').trim() || null };
@@ -1229,6 +1317,68 @@ async function actionRun({ cli, argv = [], cwd, env, timeoutMs, stdin, agentId, 
 
 
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// discoverAuthLoginCmd — dynamically discovers the auth login command for a CLI.
+// Probes `<cli> auth login --help`, then `<cli> login --help`, then `<cli> auth --help`
+// to find the correct authentication subcommand. Also detects --web/--browser flags
+// for non-interactive OAuth. Returns argv array or null if not discoverable.
+// Caches results in-memory so subsequent calls for the same CLI skip probe overhead.
+// ---------------------------------------------------------------------------
+const _authLoginCmdCache = new Map(); // cliName → argv[] | null
+
+async function discoverAuthLoginCmd(binPath, cliName) {
+  // Check in-memory cache first
+  if (_authLoginCmdCache.has(cliName)) {
+    return _authLoginCmdCache.get(cliName);
+  }
+  // Probe 1: <cli> auth login --help
+  const r1 = await spawnCapture(binPath, ['auth', 'login', '--help'], { timeoutMs: 5000 });
+  const r1out = (r1.stdout || '') + (r1.stderr || '');
+  if (r1.exitCode === 0 && /usage|login|authenticate/i.test(r1out)) {
+    const argv = ['auth', 'login'];
+    if (/--web\b/.test(r1out)) argv.push('--web');
+    else if (/--browser\b/.test(r1out)) argv.push('--browser');
+    logger.info(`[cli.agent] discoverAuthLoginCmd: ${cliName} → [${argv.join(' ')}]`);
+    _authLoginCmdCache.set(cliName, argv);
+    return argv;
+  }
+
+  // Probe 2: <cli> login --help
+  const r2 = await spawnCapture(binPath, ['login', '--help'], { timeoutMs: 5000 });
+  const r2out = (r2.stdout || '') + (r2.stderr || '');
+  if (r2.exitCode === 0 && /usage|login|authenticate/i.test(r2out)) {
+    const argv = ['login'];
+    if (/--web\b/.test(r2out)) argv.push('--web');
+    else if (/--browser\b/.test(r2out)) argv.push('--browser');
+    logger.info(`[cli.agent] discoverAuthLoginCmd: ${cliName} → [${argv.join(' ')}]`);
+    _authLoginCmdCache.set(cliName, argv);
+    return argv;
+  }
+
+  // Probe 3: <cli> auth --help — look for a login/signin subcommand
+  const r3 = await spawnCapture(binPath, ['auth', '--help'], { timeoutMs: 5000 });
+  const r3out = (r3.stdout || '') + (r3.stderr || '');
+  if (r3.exitCode === 0) {
+    const subMatch = r3out.match(/\b(login|signin|sign-in|authenticate)\b/i);
+    if (subMatch) {
+      const subcmd = subMatch[1].toLowerCase();
+      const argv = ['auth', subcmd];
+      // Check if this subcmd supports --web
+      const r3b = await spawnCapture(binPath, ['auth', subcmd, '--help'], { timeoutMs: 5000 });
+      const r3bout = (r3b.stdout || '') + (r3b.stderr || '');
+      if (/--web\b/.test(r3bout)) argv.push('--web');
+      else if (/--browser\b/.test(r3bout)) argv.push('--browser');
+      logger.info(`[cli.agent] discoverAuthLoginCmd: ${cliName} → [${argv.join(' ')}]`);
+      _authLoginCmdCache.set(cliName, argv);
+      return argv;
+    }
+  }
+
+  logger.info(`[cli.agent] discoverAuthLoginCmd: ${cliName} → not discoverable`);
+  _authLoginCmdCache.set(cliName, null);
+  return null;
+}
+
 // _registerCliInAllowlist — proactively register a CLI in shell.run's
 // user allowlist (~/.thinkdrop/allowed-commands.json) so shell.run can
 // execute it directly without hitting the reactive consent gate.
@@ -2675,9 +2825,31 @@ async function actionPreflightCheck({ task, clis: explicitClis }) {
     const versionResult = await spawnCapture(binPath, ['--version'], { timeoutMs: 6000 });
     const version = (versionResult.stdout || versionResult.stderr).split('\n')[0].trim() || null;
 
-    const authResult = meta.tokenCmd
+    let authResult = meta.tokenCmd
       ? await checkAuthStatus(binPath, meta.tokenCmd, 8000, serviceKey)
       : { authed: null, authStatus: 'no_auth_check', authUser: null };
+
+    // ── Proactive auto-auth: if not authenticated, attempt discoverAuthLoginCmd + run ──
+    if (authResult.authStatus === 'not_authenticated') {
+      try {
+        const _authArgv = await discoverAuthLoginCmd(binPath, cliName);
+        if (_authArgv) {
+          logger.info(`[cli.agent] preflight_check: ${cliName} not authenticated — running auto-auth: ${_authArgv.join(' ')}`);
+          const _autoAuthR = await spawnCapture(binPath, _authArgv, { timeoutMs: 180000 });
+          if (_autoAuthR.exitCode === 0) {
+            // Re-check auth after login
+            authResult = meta.tokenCmd
+              ? await checkAuthStatus(binPath, meta.tokenCmd, 8000, serviceKey)
+              : { authed: true, authStatus: 'authenticated', authUser: null };
+            logger.info(`[cli.agent] preflight_check: ${cliName} auto-auth succeeded — authStatus=${authResult.authStatus}`);
+          } else {
+            logger.warn(`[cli.agent] preflight_check: ${cliName} auto-auth failed (exit=${_autoAuthR.exitCode})`);
+          }
+        }
+      } catch (_autoErr) {
+        logger.warn(`[cli.agent] preflight_check: ${cliName} auto-auth error: ${_autoErr.message}`);
+      }
+    }
 
     detectedClis.push({
       service:       serviceKey,

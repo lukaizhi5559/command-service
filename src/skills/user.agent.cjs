@@ -73,6 +73,32 @@ const SELF_KEYS = {
 // Personality trait categories that are user facts (not AI character)
 const USER_TRAIT_CATEGORIES = new Set(['user_interests', 'user_projects', 'relationship_style']);
 
+// ── Placeholder value guards ─────────────────────────────────────────────────
+// Domains LLMs commonly emit as example/placeholder emails — never real addresses.
+const _PLACEHOLDER_EMAIL_DOMAINS = new Set([
+  'yourdomain.com', 'example.com', 'domain.com', 'test.com',
+  'placeholder.com', 'company.com', 'email.com', 'yourcompany.com',
+  'acme.com', 'sample.com', 'mail.com', 'user.com', 'yourname.com',
+]);
+
+function _isPlaceholderEmail(value) {
+  if (!value || typeof value !== 'string') return false;
+  const lower = value.toLowerCase().trim();
+  if (/^(test|user|email|example|fake|temp|dummy)@/i.test(lower)) return true;
+  const domain = lower.split('@')[1];
+  return domain ? _PLACEHOLDER_EMAIL_DOMAINS.has(domain) : false;
+}
+
+function _isPlaceholderPhone(value) {
+  if (!value || typeof value !== 'string') return false;
+  const digits = value.replace(/\D/g, '');
+  if (digits.length < 10) return false;
+  if (/^(\d)\1{9,}$/.test(digits)) return true; // 1111111111 etc.
+  if (digits === '1234567890' || digits === '0987654321') return true;
+  if (/^1?555/.test(digits) && digits.length <= 11) return true; // 555-xxxx Hollywood numbers
+  return false;
+}
+
 // ── Generic HTTP POST helper ─────────────────────────────────────────────────
 
 function httpPost(baseUrl, apiKey, path, payload, timeoutMs = 6000) {
@@ -128,12 +154,12 @@ async function profileList() {
   return res?.data?.entries || [];
 }
 
-async function memorySearch(query, filters = {}, limit = 8) {
+async function memorySearch(query, filters = {}, limit = 8, minSimilarity = 0.3) {
   const res = await httpPost(MEMORY_URL, MEMORY_KEY, '/memory.search', {
     version: 'mcp.v1', service: 'user-memory', action: 'memory.search',
-    payload: { query, filters, limit, userId: 'local_user' },
+    payload: { query, filters, limit, userId: 'local_user', minSimilarity },
   });
-  return res?.data?.memories || res?.memories || [];
+  return res?.data?.results || res?.results || res?.data?.memories || res?.memories || [];
 }
 
 async function getPersonalityTraits() {
@@ -141,7 +167,19 @@ async function getPersonalityTraits() {
     version: 'mcp.v1', service: 'user-memory', action: 'personality.getTraits',
     payload: {},
   });
-  return res?.data?.traits || [];
+  const traits = res?.data?.traits;
+  // Handle both object format (new API) and array format (legacy)
+  if (Array.isArray(traits)) return traits;
+  if (traits && typeof traits === 'object') {
+    // Convert object {trait_key: {value, source, weight}} to array format expected by callers
+    return Object.entries(traits).map(([trait_name, data]) => ({
+      trait_name,
+      trait_value: data.value,
+      source: data.source,
+      weight: data.weight,
+    }));
+  }
+  return [];
 }
 
 async function listConstraints() {
@@ -248,6 +286,14 @@ async function resolveForm(args) {
     // profile.get now transparently decrypts SAFE: and KEYTAR: refs — any
     // non-null string returned here is already plaintext.
     value = await profileGet(profileKey);
+    // Reject placeholder/example values — treat as missing and fall through
+    if (value && field === 'email' && _isPlaceholderEmail(value)) {
+      logger.warn(`[user.agent] resolveForm: rejecting placeholder email "${value}" for field "${field}" — falling through to memory`);
+      value = null;
+    } else if (value && field === 'phone' && _isPlaceholderPhone(value)) {
+      logger.warn(`[user.agent] resolveForm: rejecting placeholder phone "${value}" — falling through to memory`);
+      value = null;
+    }
     if (value) {
       sources.add('user_profile');
     }
@@ -260,7 +306,7 @@ async function resolveForm(args) {
       const memories = await memorySearch(query, { type: 'personal_profile' }, 5);
       if (memories.length > 0) {
         // Extract the value from the most relevant memory text
-        const text = memories[0].source_text || memories[0].extracted_text || '';
+        const text = memories[0].text || memories[0].source_text || memories[0].extracted_text || '';
         // Simple field extraction: look for the field keyword followed by a value
         const pattern = new RegExp(`(?:${field.replace(/_/g, '[\\s_]*')})\\s*(?:is|:|—)\\s*([^\\n.,;]{2,80})`, 'i');
         const m = text.match(pattern);
@@ -363,13 +409,29 @@ async function resolveContext(args) {
 
   // ── 2. memory.search: search for topic + entities ──────────────────────────
   if (topic) {
-    const query = entities.length > 0
+    // Build a richer query — include common family/contact keywords to improve recall
+    const extraTerms = ['my', 'family', 'contact', 'name', 'phone', 'email', 'address'];
+    const topicWords = topic.toLowerCase().split(/\s+/);
+    const missingTerms = extraTerms.filter(t => !topicWords.includes(t));
+    const enrichedQuery = entities.length > 0
       ? `${topic} ${entities.join(' ')}`
-      : topic;
-    const memories = await memorySearch(query, {}, 10);
-    if (memories.length > 0) {
-      resolved.memories = memories.map(m => m.source_text || m.extracted_text || '').filter(Boolean);
+      : `${topic} ${missingTerms.slice(0, 3).join(' ')}`;
+    logger.info(`[user.agent] Searching memories for: "${enrichedQuery}" (topic="${topic}", entities=[${entities.join(', ')}])`);
+    const memories = await memorySearch(enrichedQuery, {}, 15, 0.2);
+    // Filter out screen captures and browser-tab noise memories
+    const BROWSER_APP_PATTERN = /^(Google Chrome|Microsoft Edge|Safari|Firefox|Opera|Brave):/i;
+    const filteredMemories = memories.filter(m =>
+      m.type !== 'screen_capture' &&
+      !BROWSER_APP_PATTERN.test((m.text || '').trim()) &&
+      (m.text || '').trim().length > 10
+    );
+    logger.info(`[user.agent] Found ${memories.length} memories, ${filteredMemories.length} after filtering screen captures and browser noise`);
+    if (filteredMemories.length > 0) {
+      resolved.memories = filteredMemories.map(m => m.text || '').filter(Boolean);
       sources.add('memory');
+      logger.info(`[user.agent] Resolved ${resolved.memories.length} memory texts: ${resolved.memories.map(t => t.slice(0, 60)).join(' | ')}`);
+    } else {
+      logger.info(`[user.agent] No memories found — will rely on user_profile and conversation history`);
     }
   }
 
@@ -501,6 +563,11 @@ async function resolveCredentials(args) {
                || (await profileGet(usernameKey)) || (await profileGet(usernameKeyAlt))
                || (await profileGet(legacyEmailKey)) || (await profileGet(legacyUsernameKey))
                || (await profileGet('self:email')); // profile KV from storeMemory dual-write
+  // Reject placeholder emails from profile — fall through to memory-based fallbacks
+  if (email && _isPlaceholderEmail(email)) {
+    logger.warn(`[user.agent] resolve_credentials: rejecting placeholder email "${email}" from profile — falling through to memory fallbacks`);
+    email = null;
+  }
   logger.info(`[user.agent] resolve_credentials step1 (profile KV): ${email || '✗'}`);
   const password = (await profileGet(passwordKey)) || (await profileGet(passwordKeyAlt))
                || (await profileGet(legacyPasswordKey));
@@ -520,9 +587,9 @@ async function resolveCredentials(args) {
       const mems = await memorySearch('email address gmail work personal', { type: 'personal_profile' }, 10);
       const EMAIL_RE = /[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/;
       for (const m of mems) {
-        const text = m.source_text || m.extracted_text || '';
+        const text = m.text || m.source_text || m.extracted_text || '';
         const match = text.match(EMAIL_RE);
-        if (match) { email = match[0]; break; }
+        if (match && !_isPlaceholderEmail(match[0])) { email = match[0]; break; }
       }
       logger.info(`[user.agent] resolve_credentials stepB (personal_profile scan): ${email || '✗'}`);
     } catch (_) {}
@@ -534,9 +601,9 @@ async function resolveCredentials(args) {
       const mems = await memorySearch('my email is', {}, 10);
       const EMAIL_RE = /[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/;
       for (const m of mems) {
-        const text = m.source_text || m.extracted_text || '';
+        const text = m.text || m.source_text || m.extracted_text || '';
         const match = text.match(EMAIL_RE);
-        if (match) { email = match[0]; break; }
+        if (match && !_isPlaceholderEmail(match[0])) { email = match[0]; break; }
       }
       logger.info(`[user.agent] resolve_credentials stepC (broad scan): ${email || '✗'}`);
     } catch (_) {}
