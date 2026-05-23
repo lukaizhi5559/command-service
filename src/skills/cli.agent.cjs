@@ -1094,9 +1094,57 @@ async function actionRun({ cli, argv = [], cwd, env, timeoutMs, stdin, agentId, 
           }
         }
 
+        // ── Credential-aware ask_user enhancement ────────────────────────────────
+        // Detect missing credential questions and provide actionable options
+        const _questionText = action.question || '';
+        const _credentialKeywords = /\b(client_id|client_secret|api_key|token|credential|password|secret|auth)\b/i;
+        const _isCredentialQuestion = _credentialKeywords.test(_questionText);
+        
+        let _enhancedOptions = action.options || [];
+        let _actionMeta = {};
+        
+        if (_isCredentialQuestion && _enhancedOptions.length === 0) {
+          // Extract credential type from question
+          const _credMatch = _questionText.match(/\b(client_id|client_secret|api_key|token|credential|password|secret)\b/i);
+          const _credType = _credMatch ? _credMatch[1].toLowerCase() : 'credential';
+          const _serviceName = agent.service || agentId.replace(/\.agent$/i, '');
+          
+          _enhancedOptions = [
+            { 
+              label: `Yes, I have ${_credType} — Open ${agentId} settings`, 
+              value: 'have_credentials',
+              action: 'open_agent_settings',
+              agentId 
+            },
+            { 
+              label: `No, help me create ${_credType}`, 
+              value: 'need_help',
+              action: 'web_search',
+              query: `${_serviceName} ${_credType} setup create get how to`
+            }
+          ];
+          
+          _actionMeta = { 
+            isCredentialRequest: true, 
+            credentialType: _credType,
+            service: _serviceName 
+          };
+        }
+
         // Do NOT push to transcript — ask_user is a terminal escalation, not an executed step.
         // Showing it as a turn bubble would duplicate the question text that the UI card already displays.
-        return { ok: false, agentId, task, askUser: true, question: action.question || '', options: action.options || [], agentTurns: turn, transcript, savedRule: (action.save_rule || '').trim() || null };
+        return { 
+          ok: false, 
+          agentId, 
+          task, 
+          askUser: true, 
+          question: _questionText, 
+          options: _enhancedOptions, 
+          agentTurns: turn, 
+          transcript, 
+          savedRule: (action.save_rule || '').trim() || null,
+          ..._actionMeta
+        };
       }
 
       let observation = '';
@@ -1829,8 +1877,11 @@ async function actionBuildAgent({ service, cli: explicitCli, force = false }) {
     const db = await getDb();
     if (db) {
       const rows = await db.all('SELECT id, status FROM agents WHERE id = ?', agentId);
-      if (rows && rows.length > 0 && rows[0].status !== 'needs_update') {
-        return { ok: true, agentId, alreadyExists: true, status: rows[0].status };
+      if (rows && rows.length > 0) {
+        const existingStatus = rows[0].status || 'needs_validation';
+        if (existingStatus !== 'needs_update') {
+          return { ok: true, agentId, alreadyExists: true, status: existingStatus };
+        }
       }
     }
   }
@@ -1887,7 +1938,7 @@ async function actionBuildAgent({ service, cli: explicitCli, force = false }) {
     await db.run(
       `INSERT OR REPLACE INTO agents
          (id, type, service, cli_tool, capabilities, descriptor, last_validated, status, created_at)
-       VALUES (?, 'cli', ?, ?, ?, ?, CURRENT_TIMESTAMP, 'healthy', CURRENT_TIMESTAMP)`,
+       VALUES (?, 'cli', ?, ?, ?, ?, CURRENT_TIMESTAMP, 'needs_validation', CURRENT_TIMESTAMP)`,
       agentId,
       serviceKey,
       cliName,
@@ -1946,7 +1997,7 @@ async function actionQueryAgent({ service, id }) {
     service: row.service,
     cliTool: row.cli_tool,
     capabilities: row.capabilities ? JSON.parse(row.capabilities) : [],
-    status: row.status,
+    status: row.status || 'needs_validation',
     lastValidated: row.last_validated,
     descriptor: row.descriptor,
   };
@@ -1964,7 +2015,7 @@ async function actionListAgents() {
     return { ok: true, agents: files.map(f => ({ id: f.replace('.md', ''), type: 'cli' })) };
   }
 
-  const rows = await db.all("SELECT id, type, service, cli_tool, capabilities, status, last_validated FROM agents ORDER BY created_at DESC");
+  const rows = await db.all("SELECT id, type, service, cli_tool, capabilities, status, last_validated FROM agents WHERE type = 'cli' ORDER BY created_at DESC");
   return {
     ok: true,
     agents: (rows || []).map(r => ({
@@ -1973,9 +2024,44 @@ async function actionListAgents() {
       service: r.service,
       cliTool: r.cli_tool,
       capabilities: r.capabilities ? JSON.parse(r.capabilities) : [],
-      status: r.status,
+      status: r.status || 'needs_validation',
       lastValidated: r.last_validated,
     })),
+  };
+}
+
+// Action: list_all_agents (for main process UI via HTTP)
+// ---------------------------------------------------------------------------
+
+function _parseFrontmatterField(descriptor, key) {
+  if (!descriptor) return null;
+  const match = descriptor.match(new RegExp(`^${key}:\\s*(.+)`, 'm'));
+  return match ? match[1].trim() : null;
+}
+
+async function actionListAllAgents() {
+  const db = await getDb();
+  if (!db) {
+    return { ok: false, error: 'DB not available', agents: [] };
+  }
+  const rows = await db.all("SELECT id, type, service, cli_tool, capabilities, status, last_validated, descriptor FROM agents ORDER BY created_at DESC");
+  return {
+    ok: true,
+    agents: (rows || []).map(r => {
+      const apiKeyUrl = _parseFrontmatterField(r.descriptor, 'api_key_url');
+      const apiKeyEnv = _parseFrontmatterField(r.descriptor, 'api_key_env');
+      return {
+        id: r.id,
+        type: r.type || 'browser',
+        service: r.service,
+        cliTool: r.cli_tool,
+        capabilities: r.capabilities ? JSON.parse(r.capabilities) : [],
+        status: r.status || 'pending',
+        lastValidated: r.last_validated,
+        ...(apiKeyUrl ? { apiKeyUrl } : {}),
+        ...(apiKeyEnv ? { apiKeyEnv } : {}),
+      };
+    }),
   };
 }
 
@@ -3035,7 +3121,7 @@ async function cliAgent(args) {
   }
 }
 
-module.exports = { cliAgent, KNOWN_CLI_MAP };
+module.exports = { cliAgent, KNOWN_CLI_MAP, actionListAllAgents };
 
 // ── One-shot startup migration: ensure ytdlp.agent has transcript capabilities ──
 // Runs 5s after module load to allow DuckDB init. No-ops if already patched.

@@ -296,6 +296,12 @@ Respond with EXACTLY ONE JSON object (no markdown fences, no explanation):
 - If the error contains "Timeout" and the failed step was navigate or click, a browser dialog (e.g. "Leave site?", "Leave page?") may be blocking. In that case start the repair with { "action": "dialog-accept" } before retrying the original step.
 - If the failed step is an upload action: the ONLY valid param for file paths is "files" (array of absolute paths). NEVER use "path". Correct form: { "action": "upload", "selector": "<ref>", "files": ["/absolute/path/to/file"] }
 - If a \`press\` step with "Ctrl+v" or "Meta+v" fails with "does not handle the modal state", or if any paste/press step fails after clicking a paperclip/Attach button: a native file chooser modal is blocking keyboard events. Replace the failed step with { "action": "pasteAttachment" } — it focuses the compose body (contentEditable) and pastes there, bypassing the modal entirely. If an attach-button modal is still open, first emit { "action": "press", "key": "Escape" } to dismiss it, then pasteAttachment.
+- FORM SUBMISSION FAILURE PATTERN: When a "press Enter" step fails to submit a form or the page doesn't change after submission:
+  1. First try: Click the input field, then press Enter (ensure focus is in the field before submit)
+  2. Second try: Look for and click the explicit submit/search button (often has text like "Search", "Submit", "Ask", or a magnifying glass icon)
+  3. Third try: Check if the form needs a modifier key (Ctrl+Enter, Shift+Enter) or if there's a button with type="submit"
+  - The repair should try the NEXT method, not just retry the same failed action
+  - Use the snapshot to identify submit buttons by their text, aria-label, or icon (e.g., "Search", "Ask", "Go", "→", "🔍")
 
 DEBUGGING CONTEXT USAGE:
 - Use network errors to identify blocked resources or failed API calls
@@ -1031,7 +1037,8 @@ async function playwrightAgent(args) {
   }
 
   if (plan.length === 0) {
-    return { ok: false, goal, sessionId, turns: 0, done: false, result: planParsed.thoughts || 'LLM returned empty plan', transcript: [], error: planParsed.thoughts, executionTime: Date.now() - start };
+    // Goal already satisfied (LLM said "already on the page / no action needed")
+    return { ok: true, goal, sessionId, turns: 0, done: true, result: planParsed.thoughts || 'Goal already satisfied', transcript: [], executionTime: Date.now() - start };
   }
 
   // ── Post-plan attachment guard ────────────────────────────────────────────
@@ -1066,6 +1073,7 @@ async function playwrightAgent(args) {
   let lastRunCodeResult = null; // captures last successful run-code output for implicit return
   let lastGetPageTextResult = null; // captures last successful getPageText output for implicit return
   let placeholderWarnings = new Set(); // Track substituted placeholders to warn LLM (rate-limited: once per type per session)
+  const _typedTexts = new Set(); // Track typed texts to prevent duplicate typing in same session
 
   // Actions that can mutate the DOM structure (open modals, navigate pages, reveal
   // new elements via lazy-load, toggle conditional sections, etc.).  After any of these
@@ -1082,835 +1090,942 @@ async function playwrightAgent(args) {
     'scroll',              // lazy-load / infinite scroll injects new refs
   ]);
 
-  while (stepIndex < plan.length) {
-    let step = normalizeStep(plan[stepIndex]);
+  // ── Main execution loop (supports adaptive replanning restart) ───────────────
+  executionLoop: while (true) {
+    while (stepIndex < plan.length) {
+      let step = normalizeStep(plan[stepIndex]);
 
-    // Inline return step — LLM returns extracted data as the final result
-    if (step.action === 'return') {
-      let data = String(step.data || '').trim();
-      // Model-agnostic placeholder detection: if return data looks like a placeholder
-      // (<string>, {{result}}, [SEARCH RESULTS], [CONTENT], etc.), substitute with actual captured content
-      // Also catch short "success" messages when we have substantial captured content
-      const hasBracketedPlaceholder = /^[<{\[][^>}\]]+[>}\]]$/.test(data) || 
-        /\[SEARCH RESULTS\]|\[VIDEO RESULTS\]|\[CONTENT\]|\[RESULT\]|\[DATA\]/i.test(data);
-      const hasSuccessMessage = data && data.length < 100 && 
-        /successfully|completed|done|finished/i.test(data) &&
-        lastGetPageTextResult && lastGetPageTextResult.length > 500;
-      const isPlaceholder = !data || hasBracketedPlaceholder || hasSuccessMessage;
-      logger.info(`[playwright.agent] return step: data="${data?.substring(0, 50)}..." (${data?.length || 0} chars), lastGetPageTextResult=${lastGetPageTextResult?.length || 0} chars, isPlaceholder=${isPlaceholder}`);
-      if (isPlaceholder) {
-        // Prefer page text (most common for search/browse tasks), fall back to run-code result
-        const originalPlaceholder = step.data;
-        data = lastGetPageTextResult || lastRunCodeResult || data;
-        if (lastGetPageTextResult || lastRunCodeResult) {
-          logger.info(`[playwright.agent] substituted placeholder "${originalPlaceholder}" with captured content (${data.length} chars)`);
-          // Track for feedback loop: warn LLM on next replan (rate-limited: once per placeholder type)
-          const placeholderType = originalPlaceholder.replace(/[^a-zA-Z]/g, '').toUpperCase();
-          if (!placeholderWarnings.has(placeholderType)) {
-            placeholderWarnings.add(placeholderType);
-            logger.warn(`[playwright.agent] PLACEHOLDER WARNING: "${originalPlaceholder}" will be flagged for LLM education (first occurrence)`);
-          }
-        }
-      }
-      data = data.slice(0, 2000);
-      logger.info(`[playwright.agent] step ${stepIndex + 1}/${plan.length}: return (${data.length} chars)`);
-      transcript.push({ step: stepIndex + 1, action: step, outcome: { ok: true, result: data }, thoughts: '' });
-      postProgress(_progressCallbackUrl, {
-        type: 'agent:turn',
-        stepIndex: _stepIndex,
-        turn: stepIndex + 1,
-        maxTurns: plan.length,
-        action: step,
-        outcome: { ok: true, result: data },
-        thoughts: '',
-      });
-      finalResult = data;
-      break;
-    }
-
-    // Inline snapshot step — refresh snapshot AND re-plan remaining steps with fresh refs.
-    // The LLM puts an explicit snapshot step when it knows the DOM will change (e.g. after
-    // clicking Compose, opening a modal, SPA navigation) but can't predict the new refs upfront.
-    // We MUST re-plan the subsequent steps from the new snapshot or they will use stale refs.
-    if (step.action === 'snapshot') {
-      logger.info(`[playwright.agent] step ${stepIndex + 1}/${plan.length}: snapshot + re-plan`);
-      const snap = await browserAct({ action: 'snapshot', sessionId, headed, timeoutMs });
-      if (snap.ok && snap.result) currentSnapshot = snap.result;
-
-      const remainingAfterSnap = plan.slice(stepIndex + 1);
-      if (remainingAfterSnap.length > 0) {
-        if (looksLikeLoginWallSnapshot(currentSnapshot)) {
-          logger.warn(`[playwright.agent] snapshot re-plan blocked: login wall detected — escalating to waitForAuth`);
-          return {
-            ok: false, goal, sessionId,
-            turns: transcript.length, done: false,
-            loginWallDetected: true,
-            result: 'Login wall detected during snapshot re-plan — escalating to waitForAuth',
-            transcript, executionTime: Date.now() - start,
-          };
-        }
-        if (isAboutBlankSnapshot(currentSnapshot) || countRefs(currentSnapshot) === 0) {
-          logger.warn(`[playwright.agent] snapshot re-plan blocked: empty/about:blank snapshot (${countRefs(currentSnapshot)} refs)`);
-          return {
-            ok: false, goal, sessionId,
-            turns: transcript.length, done: false,
-            sessionRecoverNeeded: true,
-            result: 'Snapshot became empty/about:blank during re-plan — session recovery required',
-            transcript, executionTime: Date.now() - start,
-          };
-        }
-        logger.info(`[playwright.agent] snapshot step: re-planning ${remainingAfterSnap.length} step(s) with fresh refs`);
-        // Build placeholder warning for self-healing feedback loop (rate-limited: once per type per session)
-        const placeholderWarningBlock = placeholderWarnings.size > 0
-          ? `\n\n⚠️ PLACEHOLDER VIOLATION WARNING: The previous plan used bracketed placeholders like [${Array.from(placeholderWarnings).join('], [')}]. These placeholders cause catastrophic failures because they return literal text instead of actual content. NEVER use bracketed placeholders like [SEARCH RESULTS], [CONTENT], [DATA], etc. Use getPageText or run-code and let the result flow through automatically. Do NOT add a return step with placeholder text.`
-          : '';
-        try {
-          const snapReplanRaw = await askWithMessages([
-            { role: 'system', content: REPLAN_SYSTEM_PROMPT },
-            { role: 'user', content: [
-              `GOAL: ${goal}`,
-              `COMPLETED_STEPS: ${JSON.stringify(plan.slice(0, stepIndex + 1))}`,
-              `STALE_REMAINING_PLAN: ${JSON.stringify(remainingAfterSnap)}`,
-              ``,
-              `FRESH_SNAPSHOT (interactive elements only — full ${countRefs(currentSnapshot)}-ref page):`,
-              extractInteractiveRefs(currentSnapshot),
-              learnedRulesBlock,
-              placeholderWarningBlock,
-            ].join('\n') },
-          ], { temperature: 0.1, maxTokens: 1024, responseTimeoutMs: 20000 });
-          const snapReplanParsed = parseJson(snapReplanRaw);
-          if (snapReplanParsed && Array.isArray(snapReplanParsed.plan) && snapReplanParsed.plan.length > 0) {
-            logger.info(`[playwright.agent] snapshot re-plan: ${snapReplanParsed.plan.length} fresh steps — ${snapReplanParsed.thoughts || ''}`);
-            if (snapReplanParsed.thoughts && _progressCallbackUrl) {
-              postProgress(_progressCallbackUrl, {
-                type: 'agent:thought',
-                stepIndex: _stepIndex ?? 0,
-                thoughts: snapReplanParsed.thoughts,
-                phase: 'replan',
-              });
-            }
-            plan = [...plan.slice(0, stepIndex + 1), ...snapReplanParsed.plan];
-          } else {
-            logger.warn(`[playwright.agent] snapshot re-plan unparseable — continuing with stale plan`);
-          }
-        } catch (snapReplanErr) {
-          logger.warn(`[playwright.agent] snapshot re-plan LLM error: ${snapReplanErr.message} — continuing with stale plan`);
-        }
-      }
-
-      transcript.push({ step: stepIndex + 1, action: step, outcome: { ok: true }, thoughts: 'snapshot + re-plan' });
-      postProgress(_progressCallbackUrl, {
-        type: 'agent:turn',
-        stepIndex: _stepIndex,
-        turn: stepIndex + 1,
-        maxTurns: plan.length,
-        action: step,
-        outcome: { ok: true, result: 'page re-read + steps re-planned' },
-        thoughts: 'snapshot + re-plan',
-      });
-      stepIndex++;
-      continue;
-    }
-
-    // Capture structural state before DOM-mutating actions for change detection
-    const isDomMutating = DOM_MUTATING_ACTIONS.has(step.action);
-    const preRefCount   = isDomMutating ? countRefs(currentSnapshot) : 0;
-
-    // Notify frontend — step starting
-    postProgress(_progressCallbackUrl, {
-      type: 'agent:turn_live',
-      agentId,
-      stepIndex: _stepIndex,
-      turn: stepIndex + 1,
-      maxTurns: plan.length,
-      action: step,
-    });
-
-    logger.info(`[playwright.agent] step ${stepIndex + 1}/${plan.length}: ${JSON.stringify(step)}`);
-    let outcome;
-
-    // ── external_skill step — delegate to an installed atomic skill ──────────
-    if (step.action === 'external_skill') {
-      const skillName = step.name;
-      if (!skillName) {
-        outcome = { ok: false, error: 'external_skill step missing required "name" field' };
-      } else {
-        try {
-          const { name: _n, action: _a, ...skillArgs } = step;
-          const result = await callExternalSkill(skillName, { sessionId, ...skillArgs }, 30000);
-          const ok = result?.ok !== false && !result?.error;
-          outcome = { ok, result: result?.stdout || result?.result || (ok ? `${skillName} completed` : ''), error: result?.error };
-          logger.info(`[playwright.agent] external_skill ${skillName} ok=${ok}${outcome.error ? ' err=' + outcome.error : ''}`);
-        } catch (err) {
-          outcome = { ok: false, error: `external_skill ${skillName} threw: ${err.message}` };
-        }
-      }
-      transcript.push({ step: stepIndex + 1, action: step, outcome, thoughts: '' });
-      postProgress(_progressCallbackUrl, {
-        type: 'agent:turn', stepIndex: _stepIndex,
-        turn: stepIndex + 1, maxTurns: plan.length,
-        action: step, outcome: { ok: outcome.ok, result: outcome.result, error: outcome.error }, thoughts: '',
-      });
-      if (!outcome.ok) {
-        if (totalRepairs >= maxRepairs) {
-          return { ok: false, goal, sessionId, turns: transcript.length, done: false, result: `external_skill ${skillName} failed: ${outcome.error}`, transcript, error: outcome.error, executionTime: Date.now() - start };
-        }
-        totalRepairs++;
-        logger.info(`[playwright.agent] external_skill ${skillName} failed — repair ${totalRepairs}/${maxRepairs}: ${outcome.error}`);
-        // Take a fresh snapshot to give repair LLM current page state
-        const repairSnap = await browserAct({ action: 'snapshot', sessionId, headed, timeoutMs });
-        if (repairSnap.ok && repairSnap.result) currentSnapshot = repairSnap.result;
-        try {
-          const repairRaw = await askWithMessages([
-            { role: 'system', content: REPAIR_SYSTEM_PROMPT + domainLockBlock },
-            { role: 'user', content: [`GOAL: ${goal}`, `FAILED_STEP: ${JSON.stringify(step)}`, `ERROR: ${outcome.error}`, `REMAINING_PLAN: ${JSON.stringify(plan.slice(stepIndex + 1))}`, ``, `SNAPSHOT:`, trimSnapshot(currentSnapshot)].join('\n') },
-          ], { temperature: 0.1, maxTokens: 1024, responseTimeoutMs: 20000 });
-          const repairParsed = parseJson(repairRaw);
-          if (repairParsed && Array.isArray(repairParsed.repair) && repairParsed.repair.length > 0) {
-            plan = [...plan.slice(0, stepIndex), ...repairParsed.repair, ...plan.slice(stepIndex + 1)];
-            logger.info(`[playwright.agent] external_skill repair: ${repairParsed.repair.length} corrective steps`);
-          } else {
-            stepIndex++;
-          }
-        } catch (_) { stepIndex++; }
-      } else {
-        // Re-snapshot after a successful external_skill — DOM may have changed (e.g. compose window opened)
-        const postSnap = await browserAct({ action: 'snapshot', sessionId, headed, timeoutMs });
-        if (postSnap.ok && postSnap.result) {
-          currentSnapshot = postSnap.result;
-          // Re-plan remaining steps with fresh refs if DOM changed significantly
-          const remaining = plan.slice(stepIndex + 1);
-          if (remaining.length > 0 && countRefs(currentSnapshot) > 0) {
-            try {
-              // Build placeholder warning for self-healing feedback loop (rate-limited: once per type per session)
-              const extPlaceholderWarning = placeholderWarnings.size > 0
-                ? `\n\n⚠️ PLACEHOLDER VIOLATION WARNING: The previous plan used bracketed placeholders like [${Array.from(placeholderWarnings).join('], [')}]. These placeholders cause catastrophic failures because they return literal text instead of actual content. NEVER use bracketed placeholders like [SEARCH RESULTS], [CONTENT], [DATA], etc. Use getPageText or run-code and let the result flow through automatically. Do NOT add a return step with placeholder text.`
-                : '';
-              const snapReplanRaw = await askWithMessages([
-                { role: 'system', content: REPLAN_SYSTEM_PROMPT },
-                { role: 'user', content: [`GOAL: ${goal}`, `COMPLETED_STEPS: ${JSON.stringify(plan.slice(0, stepIndex + 1))}`, `STALE_REMAINING_PLAN: ${JSON.stringify(remaining)}`, ``, `FRESH_SNAPSHOT (interactive elements only — full ${countRefs(currentSnapshot)}-ref page):`, extractInteractiveRefs(currentSnapshot), learnedRulesBlock, extPlaceholderWarning].join('\n') },
-              ], { temperature: 0.1, maxTokens: 1024, responseTimeoutMs: 20000 });
-              const snapReplanParsed = parseJson(snapReplanRaw);
-              if (snapReplanParsed && Array.isArray(snapReplanParsed.plan) && snapReplanParsed.plan.length > 0) {
-                plan = [...plan.slice(0, stepIndex + 1), ...snapReplanParsed.plan];
-                logger.info(`[playwright.agent] external_skill re-plan: ${snapReplanParsed.plan.length} fresh steps after ${skillName}`);
-              }
-            } catch (_) { /* non-fatal — continue with stale plan */ }
-          }
-        }
-        stepIndex++;
-      }
-      continue;
-    }
-
-    const unresolvedCredToken = findUnresolvedCredentialToken(step);
-    if (
-      unresolvedCredToken &&
-      ['fill', 'type', 'find-label', 'find-role'].includes(step.action)
-    ) {
-      logger.warn(`[playwright.agent] refusing unresolved credential token in step ${stepIndex + 1}: ${unresolvedCredToken}`);
-      return {
-        ok: false, goal, sessionId,
-        turns: transcript.length, done: false,
-        loginWallDetected: true,
-        needsCredentials: true,
-        result: `Unresolved credential token ${unresolvedCredToken} in ${step.action} step — escalating to auth flow`,
-        transcript, executionTime: Date.now() - start,
-      };
-    }
-
-    try {
-      // ── Semantic fallback actions — translate to Playwright locator API ──────
-      if (step.action === 'find-role') {
-        const { role, name, findAction = 'click', value, text } = step;
-        const nameArg = name ? `, { name: ${JSON.stringify(name)} }` : '';
-        const loc = `page.getByRole(${JSON.stringify(role)}${nameArg})`;
-        const code = findAction === 'fill'
-          ? `async page => { await ${loc}.fill(${JSON.stringify(value ?? text ?? '')}); }`
-          : `async page => { await ${loc}.${findAction}(); }`;
-        outcome = await browserAct({ action: 'run-code', code, sessionId, headed, timeoutMs });
-      } else if (step.action === 'find-label') {
-        const { label, findAction = 'click', value, text } = step;
-        const loc = `page.getByLabel(${JSON.stringify(label)})`;
-        const code = findAction === 'fill'
-          ? `async page => { await ${loc}.fill(${JSON.stringify(value ?? text ?? '')}); }`
-          : `async page => { await ${loc}.${findAction}(); }`;
-        outcome = await browserAct({ action: 'run-code', code, sessionId, headed, timeoutMs });
-      } else if (step.action === 'find-text') {
-        const code = `async page => { await page.getByText(${JSON.stringify(step.text)}).first().click(); }`;
-        outcome = await browserAct({ action: 'run-code', code, sessionId, headed, timeoutMs });
-      } else if (step.action === 'getPageText') {
-        // ── Universal waitForStableText guard ─────────────────────────────────
-        // Ensure the page has stopped changing before we read it.
-        // If the last executed step was already waitForStableText (or waitForNavigation),
-        // skip the auto-inject to avoid double-polling.
-        // This is intentionally unconditional — works for AI chat, search results,
-        // stock filters, form submissions, or any page where response time is unknown.
-        const _lastAction = transcript.length > 0 ? transcript[transcript.length - 1].action?.action : null;
-        let stableTextResult = null;
-        if (_lastAction !== 'waitForStableText' && _lastAction !== 'waitForNavigation') {
-          logger.info(`[playwright.agent] auto-injecting waitForStableText before getPageText (last step: ${_lastAction || 'none'})`);
-          const stableOutcome = await browserAct({ action: 'waitForStableText', sessionId, headed, timeoutMs: 30000 });
-          // Capture the stable text result — this is the content we waited for
-          if (stableOutcome.ok && stableOutcome.result && stableOutcome.result.length > 1000) {
-            stableTextResult = stableOutcome.result;
-            logger.info(`[playwright.agent] captured ${stableTextResult.length} chars from waitForStableText, skipping redundant getPageText`);
-          }
-        }
-        // Always run a final getPageText after waitForStableText.
-        // Reusing the stable-text result directly risks capturing a mid-stream snapshot
-        // on streaming pages (e.g. ChatGPT) where two polls land in the same inter-burst
-        // gap and falsely declare stability before the response is complete.
-        outcome = await browserAct({ action: 'getPageText', sessionId, headed, timeoutMs });
-        // If getPageText came back empty but waitForStableText had content, use that as fallback
-        if ((!outcome.result || outcome.result.length < 100) && stableTextResult) {
-          outcome = { ok: true, action: 'getPageText', sessionId, result: stableTextResult, executionTime: 0 };
-          logger.info(`[playwright.agent] getPageText returned empty — falling back to waitForStableText result (${stableTextResult.length} chars)`);
-        }
-        // CRITICAL: Set lastGetPageTextResult so return step can substitute it
-        if (outcome.result) {
-          lastGetPageTextResult = outcome.result;
-          logger.info(`[playwright.agent] set lastGetPageTextResult: ${lastGetPageTextResult.length} chars`);
-        }
-      } else if (step.action === 'wait') {
-        const ms = Math.min(parseInt(step.ms || step.duration || 2000, 10), 5000);
-        await new Promise(r => setTimeout(r, ms));
-        outcome = { ok: true, result: `waited ${ms}ms` };
-      } else if (
-        // ── Mail recipient fill — bypass browser.act's click+Meta+a+type sequence.
-        // Gmail's To field is a chip/token widget: Meta+a (⌘A) triggers Gmail's
-        // global "Select All messages" shortcut, killing focus on the To input before
-        // `type` fires — nothing gets typed.  Fix: click to focus, type keystrokes
-        // directly (no Meta+a), then Tab to confirm the chip and move to Subject.
-        step.action === 'fill' &&
-        typeof step.text === 'string' &&
-        /\S+@\S+\.\S+/.test(step.text) &&
-        (['gmail.agent', 'outlook.agent', 'yahoo.agent'].includes(agentId) ||
-          (hostname || '').includes('mail.google.com') ||
-          (hostname || '').includes('outlook.live.com') ||
-          (hostname || '').includes('mail.yahoo.com'))
-      ) {
-        logger.info(`[playwright.agent] mail recipient fill — using click+type+Tab to bypass Meta+a focus loss`);
-        await browserAct({ action: 'click', selector: step.selector, sessionId, headed, timeoutMs });
-        await new Promise(r => setTimeout(r, 200));
-        await browserAct({ action: 'type', text: step.text, sessionId, headed, timeoutMs });
-        await new Promise(r => setTimeout(r, 400));
-        await browserAct({ action: 'press', key: 'Tab', sessionId, headed, timeoutMs: 3000 });
-        await new Promise(r => setTimeout(r, 600));
-        outcome = { ok: true, action: 'fill', sessionId, result: 'recipient entered via click+type+Tab' };
-      } else {
-        // ── Platform-correct clipboard shortcut scrubber ───────────────────
-        // LLMs routinely emit { action: 'press', key: 'Ctrl+v' } on macOS.
-        // On macOS, paste is Meta+V (⌘V) — Ctrl+v does nothing. Auto-rewrite
-        // so we don't silently fail and burn a repair cycle. Mirror the
-        // rewrite for non-macOS in case a plan emits Cmd+* / Meta+*.
-        if (step.action === 'press' && typeof step.key === 'string') {
-          const k = step.key.trim();
-          if (process.platform === 'darwin') {
-            const fixed = k.replace(/^(Ctrl|Control)\+/i, 'Meta+');
-            if (fixed !== k) {
-              logger.info(`[playwright.agent] scrubbing clipboard shortcut on macOS: "${k}" → "${fixed}"`);
-              step = { ...step, key: fixed };
-            }
-          } else {
-            const fixed = k.replace(/^(Meta|Cmd|Command)\+/i, 'Control+');
-            if (fixed !== k) {
-              logger.info(`[playwright.agent] scrubbing clipboard shortcut on ${process.platform}: "${k}" → "${fixed}"`);
-              step = { ...step, key: fixed };
+      // Inline return step — LLM returns extracted data as the final result
+      if (step.action === 'return') {
+        let data = String(step.data || '').trim();
+        // Model-agnostic placeholder detection: if return data looks like a placeholder
+        // (<string>, {{result}}, [SEARCH RESULTS], [CONTENT], etc.), substitute with actual captured content
+        // Also catch short "success" messages when we have substantial captured content
+        const hasBracketedPlaceholder = /^[<{\[][^>}\]]+[>}\]]$/.test(data) || 
+          /\[SEARCH RESULTS\]|\[VIDEO RESULTS\]|\[CONTENT\]|\[RESULT\]|\[DATA\]/i.test(data);
+        const hasSuccessMessage = data && data.length < 100 && 
+          /successfully|completed|done|finished/i.test(data) &&
+          lastGetPageTextResult && lastGetPageTextResult.length > 500;
+        const isPlaceholder = !data || hasBracketedPlaceholder || hasSuccessMessage;
+        logger.info(`[playwright.agent] return step: data="${data?.substring(0, 50)}..." (${data?.length || 0} chars), lastGetPageTextResult=${lastGetPageTextResult?.length || 0} chars, isPlaceholder=${isPlaceholder}`);
+        if (isPlaceholder) {
+          // Prefer page text (most common for search/browse tasks), fall back to run-code result
+          const originalPlaceholder = step.data;
+          data = lastGetPageTextResult || lastRunCodeResult || data;
+          if (lastGetPageTextResult || lastRunCodeResult) {
+            logger.info(`[playwright.agent] substituted placeholder "${originalPlaceholder}" with captured content (${data.length} chars)`);
+            // Track for feedback loop: warn LLM on next replan (rate-limited: once per placeholder type)
+            const placeholderType = originalPlaceholder.replace(/[^a-zA-Z]/g, '').toUpperCase();
+            if (!placeholderWarnings.has(placeholderType)) {
+              placeholderWarnings.add(placeholderType);
+              logger.warn(`[playwright.agent] PLACEHOLDER WARNING: "${originalPlaceholder}" will be flagged for LLM education (first occurrence)`);
             }
           }
         }
-        outcome = await browserAct({ ...step, sessionId, headed, timeoutMs });
-      }
-    } catch (err) {
-      outcome = { ok: false, error: err.message };
-    }
-
-    logger.info(`[playwright.agent] step ${stepIndex + 1} ok=${outcome.ok}${outcome.error ? ' err=' + outcome.error : ''}`);
-    const thoughts = outcome.ok ? '' : (outcome.error || 'failed');
-    transcript.push({ step: stepIndex + 1, action: step, outcome, thoughts });
-
-    // Notify frontend — step completed
-    postProgress(_progressCallbackUrl, {
-      type: 'agent:turn',
-      stepIndex: _stepIndex,
-      turn: stepIndex + 1,
-      maxTurns: plan.length,
-      action: step,
-      outcome: { ok: outcome.ok, result: outcome.result, error: outcome.error },
-      thoughts,
-    });
-
-    if (outcome.ok) {
-      if (step.action === 'run-code' && outcome.result) {
-        lastRunCodeResult = outcome.result;
-      }
-      if (step.action === 'getPageText' && outcome.result) {
-        lastGetPageTextResult = outcome.result;
-        logger.info(`[playwright.agent] set lastGetPageTextResult: ${lastGetPageTextResult?.length || 0} chars`);
-
-        // ── HTTP error page detection ─────────────────────────────────────
-        // If getPageText captured an HTTP error page instead of real AI content,
-        // navigate back to the start URL and re-plan the full task rather than
-        // letting the garbage text flow downstream into synthesize.
-        const _httpErr = _detectHttpErrorPage(outcome.result);
-        if (_httpErr && totalRepairs < maxRepairs && url) {
-          totalRepairs++;
-          logger.warn(`[playwright.agent] HTTP ${_httpErr} error page detected in getPageText — full retry ${totalRepairs}/${maxRepairs}`);
-          try {
-            await browserAct({ action: 'navigate', url, sessionId, headed, timeoutMs: Math.max(timeoutMs, 30000) });
-            await browserAct({ action: 'waitForStableText', sessionId, headed, timeoutMs: 15000 });
-            const retrySnap = await browserAct({ action: 'snapshot', sessionId, headed, timeoutMs });
-            if (retrySnap.ok && retrySnap.result) currentSnapshot = retrySnap.result;
-            // Build placeholder warning for self-healing feedback loop
-            const httpPlaceholderWarning = placeholderWarnings.size > 0
-              ? `\n\n⚠️ PLACEHOLDER VIOLATION WARNING: The previous plan used bracketed placeholders like [${Array.from(placeholderWarnings).join('], [')}]. These placeholders cause catastrophic failures because they return literal text instead of actual content. NEVER use bracketed placeholders like [SEARCH RESULTS], [CONTENT], [DATA], etc. Use getPageText or run-code and let the result flow through automatically. Do NOT add a return step with placeholder text.`
-              : '';
-            const retryPlanRaw = await askWithMessages([
-              { role: 'system', content: PLAN_SYSTEM_PROMPT + learnedRulesBlock + domainLockBlock },
-              { role: 'user', content: `GOAL: ${effectiveGoal}\n\nNOTE: A previous attempt failed because the page returned an HTTP ${_httpErr} error. The page has been refreshed — please re-plan the full task from the current snapshot.${httpPlaceholderWarning}\n\nSNAPSHOT:\n${extractInteractiveRefs(currentSnapshot)}${agentContext ? `\n\nAGENT CONTEXT:\n${agentContext}` : ''}` },
-            ], { temperature: 0.1, maxTokens: 2048, responseTimeoutMs: 30000 });
-            const retryPlanParsed = parseJson(retryPlanRaw);
-            if (retryPlanParsed && Array.isArray(retryPlanParsed.plan) && retryPlanParsed.plan.length > 0) {
-              logger.info(`[playwright.agent] HTTP error retry: re-planned ${retryPlanParsed.plan.length} step(s) — ${retryPlanParsed.thoughts || ''}`);
-              plan = retryPlanParsed.plan;
-              stepIndex = 0;
-              lastGetPageTextResult = null;
-              continue;
-            }
-          } catch (retryErr) {
-            logger.warn(`[playwright.agent] HTTP error retry re-plan failed: ${retryErr.message}`);
-          }
-        } else if (_httpErr) {
-          logger.warn(`[playwright.agent] HTTP ${_httpErr} error page in getPageText — repair budget exhausted or no start URL, proceeding with error content`);
-        }
+        data = data.slice(0, 2000);
+        logger.info(`[playwright.agent] step ${stepIndex + 1}/${plan.length}: return (${data.length} chars)`);
+        transcript.push({ step: stepIndex + 1, action: step, outcome: { ok: true, result: data }, thoughts: '' });
+        postProgress(_progressCallbackUrl, {
+          type: 'agent:turn',
+          stepIndex: _stepIndex,
+          turn: stepIndex + 1,
+          maxTurns: plan.length,
+          action: step,
+          outcome: { ok: true, result: data },
+          thoughts: '',
+        });
+        finalResult = data;
+        break;
       }
 
-      // ── Post-fill body verification (self-healing + rule learning) ────────
-      // When filling a long text value (>80 chars — clearly email body content,
-      // not a short email address or subject line), verify the text actually
-      // landed in the page.  Gmail reply/compose bodies are contenteditable divs;
-      // a plain `fill` on the wrong ref silently succeeds (exit 0) but leaves the
-      // body empty.  If the text is not found in the page, override outcome to
-      // ok=false with a descriptive error so the existing repair→deriveRule
-      // pipeline fires and LEARNS the correct approach (keyboard.type / run-code).
-      // After the first repair the rule is stored in context_rules for gmail.agent
-      // and injected into every future plan, so this verification never fires again.
-      if (_isMailAgentTask && _isComposeTask && step.action === 'fill' && typeof step.text === 'string' && step.text.length > 80) {
-        try {
-          const _needleJson = JSON.stringify(step.text.slice(0, 40));
-          const verifySnap = await browserAct({
-            action: 'run-code',
-            code: `async page => { return await page.evaluate(function(){
-              var needle = ${_needleJson};
-              var bodies = Array.from(document.querySelectorAll('[contenteditable="true"], textarea'));
-              return bodies.some(function(el){ return (el.innerText || el.value || '').includes(needle); }) ? 'ok' : 'empty';
-            }); }`,
-            sessionId, headed, timeoutMs,
-          });
-          if (verifySnap.ok && verifySnap.result === 'empty') {
-            logger.warn(`[playwright.agent] post-fill body verification: text not found in contenteditable/textarea — triggering repair to learn correct approach`);
-            outcome = { ok: false, error: 'fill succeeded but body text not found in page — element is likely a contenteditable div; use run-code with page.keyboard.type() or page.getByRole("textbox").fill() instead of a plain fill step' };
-          }
-        } catch (_) { /* verification failure is non-fatal — proceed */ }
-      }
+      // Inline snapshot step — refresh snapshot AND re-plan remaining steps with fresh refs.
+      // The LLM puts an explicit snapshot step when it knows the DOM will change (e.g. after
+      // clicking Compose, opening a modal, SPA navigation) but can't predict the new refs upfront.
+      // We MUST re-plan the subsequent steps from the new snapshot or they will use stale refs.
+      if (step.action === 'snapshot') {
+        logger.info(`[playwright.agent] step ${stepIndex + 1}/${plan.length}: snapshot + re-plan`);
+        const snap = await browserAct({ action: 'snapshot', sessionId, headed, timeoutMs });
+        if (snap.ok && snap.result) currentSnapshot = snap.result;
 
-      // (recipient chip confirmation handled pre-emptively in the
-      //  mail recipient fill interceptor above via click+type+Tab)
-
-      // ── Expectation-Driven Execution: Verify action achieved expected outcome ─────
-      // Instead of blind DOM change detection, we verify that the action achieved its goal
-      if (step.expected || isDomMutating) {
-        // Take a fresh snapshot after the action
-        const postSnap = await browserAct({ action: 'snapshot', sessionId, headed, timeoutMs });
-        if (postSnap.ok && postSnap.result) {
-          currentSnapshot = postSnap.result;
-        }
-
-        // Verify expectation if defined
-        if (step.expected) {
-          const expectationResult = await verifyExpectation(step, sessionId, headed, timeoutMs);
-          
-          if (!expectationResult.satisfied) {
-            logger.warn(`[playwright.agent] Expectation failed for ${step.action}: ${expectationResult.reason}`);
-            
-            // Apply tiered failure handling
-            const tier1Result = handleKnownFailures(step, {}, currentSnapshot);
-            let failureAnalysis = tier1Result;
-            
-            if (!failureAnalysis) {
-              const tier2Result = handleElementBasedFailures(step, currentSnapshot);
-              failureAnalysis = tier2Result;
-            }
-            
-            if (!failureAnalysis) {
-              failureAnalysis = await handleUnknownFailure(step, currentSnapshot, { message: expectationResult.reason });
-            }
-            
-            // Handle the failure based on analysis
-            if (failureAnalysis.cause === 'login_wall') {
-              logger.warn(`[playwright.agent] Login wall detected via expectation failure — escalating to waitForAuth`);
-              return {
-                ok: false, goal, sessionId,
-                turns: transcript.length, done: false,
-                loginWallDetected: true,
-                result: 'Login wall detected during expectation verification — escalating to waitForAuth',
-                transcript, executionTime: Date.now() - start,
-              };
-            } else if (failureAnalysis.cause === 'still_loading') {
-              logger.info(`[playwright.agent] Page still loading — waiting and retrying expectation`);
-              await new Promise(resolve => setTimeout(resolve, 2000)); // Wait 2 seconds
-              
-              // Retry expectation verification
-              const retryResult = await verifyExpectation(step, sessionId, headed, timeoutMs);
-              if (retryResult.satisfied) {
-                logger.info(`[playwright.agent] Expectation satisfied after wait`);
-              } else {
-                logger.warn(`[playwright.agent] Expectation still failed after wait: ${retryResult.reason}`);
-                // Continue with the step but mark as having issues
-                outcome.warning = `Expectation not fully satisfied: ${retryResult.reason}`;
-              }
-            } else if (failureAnalysis.cause === 'error_page' || failureAnalysis.cause === 'server_error') {
-              if (totalRepairs < maxRepairs) {
-                totalRepairs++;
-                logger.warn(`[playwright.agent] ${failureAnalysis.cause} detected — attempting repair ${totalRepairs}/${maxRepairs}`);
-                // Trigger repair logic similar to existing error handling
-                outcome = { ok: false, error: `${failureAnalysis.cause}: ${expectationResult.reason}` };
-              } else {
-                logger.warn(`[playwright.agent] Repair budget exhausted for ${failureAnalysis.cause}`);
-                outcome.warning = `Possible ${failureAnalysis.cause}: ${expectationResult.reason}`;
-              }
-            } else {
-              logger.info(`[playwright.agent] Unknown failure handled: ${failureAnalysis.reason}`);
-              outcome.warning = `Unexpected issue: ${failureAnalysis.reason}`;
-            }
-          } else {
-            logger.info(`[playwright.agent] Expectation satisfied for ${step.action}: ${expectationResult.reason}`);
-          }
-        }
-        
-        // For DOM-mutating actions without explicit expectations, check for login walls only
-        // (removed the aggressive DOM percentage thresholds)
-        if (isDomMutating && !step.expected) {
-          // Only check for login walls using reliable element-based detection
-          if (hasPasswordFields(currentSnapshot) && hasLoginButton(currentSnapshot)) {
-            logger.warn(`[playwright.agent] Login wall detected after DOM-mutating action — escalating to waitForAuth`);
+        const remainingAfterSnap = plan.slice(stepIndex + 1);
+        if (remainingAfterSnap.length > 0) {
+          if (looksLikeLoginWallSnapshot(currentSnapshot)) {
+            logger.warn(`[playwright.agent] snapshot re-plan blocked: login wall detected — escalating to waitForAuth`);
             return {
               ok: false, goal, sessionId,
               turns: transcript.length, done: false,
               loginWallDetected: true,
-              result: 'Login wall detected after DOM-mutating action — escalating to waitForAuth',
+              result: 'Login wall detected during snapshot re-plan — escalating to waitForAuth',
               transcript, executionTime: Date.now() - start,
+            };
+          }
+          if (isAboutBlankSnapshot(currentSnapshot) || countRefs(currentSnapshot) === 0) {
+            logger.warn(`[playwright.agent] snapshot re-plan blocked: empty/about:blank snapshot (${countRefs(currentSnapshot)} refs)`);
+            return {
+              ok: false, goal, sessionId,
+              turns: transcript.length, done: false,
+              sessionRecoverNeeded: true,
+              result: 'Snapshot became empty/about:blank during re-plan — session recovery required',
+              transcript, executionTime: Date.now() - start,
+            };
+          }
+          logger.info(`[playwright.agent] snapshot step: re-planning ${remainingAfterSnap.length} step(s) with fresh refs`);
+          // Build placeholder warning for self-healing feedback loop (rate-limited: once per type per session)
+          const placeholderWarningBlock = placeholderWarnings.size > 0
+            ? `\n\n⚠️ PLACEHOLDER VIOLATION WARNING: The previous plan used bracketed placeholders like [${Array.from(placeholderWarnings).join('], [')}]. These placeholders cause catastrophic failures because they return literal text instead of actual content. NEVER use bracketed placeholders like [SEARCH RESULTS], [CONTENT], [DATA], etc. Use getPageText or run-code and let the result flow through automatically. Do NOT add a return step with placeholder text.`
+            : '';
+          try {
+            const snapReplanRaw = await askWithMessages([
+              { role: 'system', content: REPLAN_SYSTEM_PROMPT },
+              { role: 'user', content: [
+                `GOAL: ${goal}`,
+                `COMPLETED_STEPS: ${JSON.stringify(plan.slice(0, stepIndex + 1))}`,
+                `STALE_REMAINING_PLAN: ${JSON.stringify(remainingAfterSnap)}`,
+                ``,
+                `FRESH_SNAPSHOT (interactive elements only — full ${countRefs(currentSnapshot)}-ref page):`,
+                extractInteractiveRefs(currentSnapshot),
+                learnedRulesBlock,
+                placeholderWarningBlock,
+              ].join('\n') },
+            ], { temperature: 0.1, maxTokens: 1024, responseTimeoutMs: 20000 });
+            const snapReplanParsed = parseJson(snapReplanRaw);
+            if (snapReplanParsed && Array.isArray(snapReplanParsed.plan) && snapReplanParsed.plan.length > 0) {
+              logger.info(`[playwright.agent] snapshot re-plan: ${snapReplanParsed.plan.length} fresh steps — ${snapReplanParsed.thoughts || ''}`);
+              if (snapReplanParsed.thoughts && _progressCallbackUrl) {
+                postProgress(_progressCallbackUrl, {
+                  type: 'agent:thought',
+                  stepIndex: _stepIndex ?? 0,
+                  thoughts: snapReplanParsed.thoughts,
+                  phase: 'replan',
+                });
+              }
+              plan = [...plan.slice(0, stepIndex + 1), ...snapReplanParsed.plan];
+            } else {
+              logger.warn(`[playwright.agent] snapshot re-plan unparseable — continuing with stale plan`);
+            }
+          } catch (snapReplanErr) {
+            logger.warn(`[playwright.agent] snapshot re-plan LLM error: ${snapReplanErr.message} — continuing with stale plan`);
+          }
+        }
+
+        transcript.push({ step: stepIndex + 1, action: step, outcome: { ok: true }, thoughts: 'snapshot + re-plan' });
+        postProgress(_progressCallbackUrl, {
+          type: 'agent:turn',
+          stepIndex: _stepIndex,
+          turn: stepIndex + 1,
+          maxTurns: plan.length,
+          action: step,
+          outcome: { ok: true, result: 'page re-read + steps re-planned' },
+          thoughts: 'snapshot + re-plan',
+        });
+        stepIndex++;
+        continue;
+      }
+
+      // Capture structural state before DOM-mutating actions for change detection
+      const isDomMutating = DOM_MUTATING_ACTIONS.has(step.action);
+      const preRefCount   = isDomMutating ? countRefs(currentSnapshot) : 0;
+
+      // Notify frontend — step starting
+      postProgress(_progressCallbackUrl, {
+        type: 'agent:turn_live',
+        agentId,
+        stepIndex: _stepIndex,
+        turn: stepIndex + 1,
+        maxTurns: plan.length,
+        action: step,
+      });
+
+      logger.info(`[playwright.agent] step ${stepIndex + 1}/${plan.length}: ${JSON.stringify(step)}`);
+      let outcome;
+
+      // ── external_skill step — delegate to an installed atomic skill ──────────
+      if (step.action === 'external_skill') {
+        const skillName = step.name;
+        if (!skillName) {
+          outcome = { ok: false, error: 'external_skill step missing required "name" field' };
+        } else {
+          try {
+            const { name: _n, action: _a, ...skillArgs } = step;
+            const result = await callExternalSkill(skillName, { sessionId, ...skillArgs }, 30000);
+            const ok = result?.ok !== false && !result?.error;
+            outcome = { ok, result: result?.stdout || result?.result || (ok ? `${skillName} completed` : ''), error: result?.error };
+            logger.info(`[playwright.agent] external_skill ${skillName} ok=${ok}${outcome.error ? ' err=' + outcome.error : ''}`);
+          } catch (err) {
+            outcome = { ok: false, error: `external_skill ${skillName} threw: ${err.message}` };
+          }
+        }
+        transcript.push({ step: stepIndex + 1, action: step, outcome, thoughts: '' });
+        postProgress(_progressCallbackUrl, {
+          type: 'agent:turn', stepIndex: _stepIndex,
+          turn: stepIndex + 1, maxTurns: plan.length,
+          action: step, outcome: { ok: outcome.ok, result: outcome.result, error: outcome.error }, thoughts: '',
+        });
+        if (!outcome.ok) {
+          if (totalRepairs >= maxRepairs) {
+            return { ok: false, goal, sessionId, turns: transcript.length, done: false, result: `external_skill ${skillName} failed: ${outcome.error}`, transcript, error: outcome.error, executionTime: Date.now() - start };
+          }
+          totalRepairs++;
+          logger.info(`[playwright.agent] external_skill ${skillName} failed — repair ${totalRepairs}/${maxRepairs}: ${outcome.error}`);
+          // Take a fresh snapshot to give repair LLM current page state
+          const repairSnap = await browserAct({ action: 'snapshot', sessionId, headed, timeoutMs });
+          if (repairSnap.ok && repairSnap.result) currentSnapshot = repairSnap.result;
+          try {
+            const repairRaw = await askWithMessages([
+              { role: 'system', content: REPAIR_SYSTEM_PROMPT + domainLockBlock },
+              { role: 'user', content: [`GOAL: ${goal}`, `FAILED_STEP: ${JSON.stringify(step)}`, `ERROR: ${outcome.error}`, `REMAINING_PLAN: ${JSON.stringify(plan.slice(stepIndex + 1))}`, ``, `SNAPSHOT:`, trimSnapshot(currentSnapshot)].join('\n') },
+            ], { temperature: 0.1, maxTokens: 1024, responseTimeoutMs: 20000 });
+            const repairParsed = parseJson(repairRaw);
+            if (repairParsed && Array.isArray(repairParsed.repair) && repairParsed.repair.length > 0) {
+              plan = [...plan.slice(0, stepIndex), ...repairParsed.repair, ...plan.slice(stepIndex + 1)];
+              logger.info(`[playwright.agent] external_skill repair: ${repairParsed.repair.length} corrective steps`);
+            } else {
+              stepIndex++;
+            }
+          } catch (_) { stepIndex++; }
+        } else {
+          // Re-snapshot after a successful external_skill — DOM may have changed (e.g. compose window opened)
+          const postSnap = await browserAct({ action: 'snapshot', sessionId, headed, timeoutMs });
+          if (postSnap.ok && postSnap.result) {
+            currentSnapshot = postSnap.result;
+            // Re-plan remaining steps with fresh refs if DOM changed significantly
+            const remaining = plan.slice(stepIndex + 1);
+            if (remaining.length > 0 && countRefs(currentSnapshot) > 0) {
+              try {
+                // Build placeholder warning for self-healing feedback loop (rate-limited: once per type per session)
+                const extPlaceholderWarning = placeholderWarnings.size > 0
+                  ? `\n\n⚠️ PLACEHOLDER VIOLATION WARNING: The previous plan used bracketed placeholders like [${Array.from(placeholderWarnings).join('], [')}]. These placeholders cause catastrophic failures because they return literal text instead of actual content. NEVER use bracketed placeholders like [SEARCH RESULTS], [CONTENT], [DATA], etc. Use getPageText or run-code and let the result flow through automatically. Do NOT add a return step with placeholder text.`
+                  : '';
+                const snapReplanRaw = await askWithMessages([
+                  { role: 'system', content: REPLAN_SYSTEM_PROMPT },
+                  { role: 'user', content: [`GOAL: ${goal}`, `COMPLETED_STEPS: ${JSON.stringify(plan.slice(0, stepIndex + 1))}`, `STALE_REMAINING_PLAN: ${JSON.stringify(remaining)}`, ``, `FRESH_SNAPSHOT (interactive elements only — full ${countRefs(currentSnapshot)}-ref page):`, extractInteractiveRefs(currentSnapshot), learnedRulesBlock, extPlaceholderWarning].join('\n') },
+                ], { temperature: 0.1, maxTokens: 1024, responseTimeoutMs: 20000 });
+                const snapReplanParsed = parseJson(snapReplanRaw);
+                if (snapReplanParsed && Array.isArray(snapReplanParsed.plan) && snapReplanParsed.plan.length > 0) {
+                  plan = [...plan.slice(0, stepIndex + 1), ...snapReplanParsed.plan];
+                  logger.info(`[playwright.agent] external_skill re-plan: ${snapReplanParsed.plan.length} fresh steps after ${skillName}`);
+                }
+              } catch (_) { /* non-fatal — continue with stale plan */ }
+            }
+          }
+          stepIndex++;
+        }
+        continue;
+      }
+
+      const unresolvedCredToken = findUnresolvedCredentialToken(step);
+      if (
+        unresolvedCredToken &&
+        ['fill', 'type', 'find-label', 'find-role'].includes(step.action)
+      ) {
+        logger.warn(`[playwright.agent] refusing unresolved credential token in step ${stepIndex + 1}: ${unresolvedCredToken}`);
+        return {
+          ok: false, goal, sessionId,
+          turns: transcript.length, done: false,
+          loginWallDetected: true,
+          needsCredentials: true,
+          result: `Unresolved credential token ${unresolvedCredToken} in ${step.action} step — escalating to auth flow`,
+          transcript, executionTime: Date.now() - start,
+        };
+      }
+
+      // ── Deduplication: skip redundant fill/type of same text ───────────────
+      // Check both 'value' (fill) and 'text' (type) properties for deduplication
+      if ((step.action === 'fill' || step.action === 'type')) {
+        const textToType = step.value || step.text;
+        if (typeof textToType === 'string') {
+          // Normalize: trim whitespace and lowercase for comparison
+          const normalizedText = textToType.trim().toLowerCase();
+          if (normalizedText.length > 0 && _typedTexts.has(normalizedText)) {
+            logger.info(`[playwright.agent] deduplication: skipping duplicate ${step.action} for "${textToType.slice(0, 40)}..."`);
+            stepIndex++;
+            continue;
+          }
+          _typedTexts.add(normalizedText);
+        }
+      }
+
+      try {
+        // ── Semantic fallback actions — translate to Playwright locator API ──────
+        if (step.action === 'find-role') {
+          const { role, name, findAction = 'click', value, text } = step;
+          const nameArg = name ? `, { name: ${JSON.stringify(name)} }` : '';
+          const loc = `page.getByRole(${JSON.stringify(role)}${nameArg})`;
+          const code = findAction === 'fill'
+            ? `async page => { await ${loc}.fill(${JSON.stringify(value ?? text ?? '')}); }`
+            : `async page => { await ${loc}.${findAction}(); }`;
+          outcome = await browserAct({ action: 'run-code', code, sessionId, headed, timeoutMs });
+        } else if (step.action === 'find-label') {
+          const { label, findAction = 'click', value, text } = step;
+          const loc = `page.getByLabel(${JSON.stringify(label)})`;
+          const code = findAction === 'fill'
+            ? `async page => { await ${loc}.fill(${JSON.stringify(value ?? text ?? '')}); }`
+            : `async page => { await ${loc}.${findAction}(); }`;
+          outcome = await browserAct({ action: 'run-code', code, sessionId, headed, timeoutMs });
+        } else if (step.action === 'find-text') {
+          const code = `async page => { await page.getByText(${JSON.stringify(step.text)}).first().click(); }`;
+          outcome = await browserAct({ action: 'run-code', code, sessionId, headed, timeoutMs });
+        } else if (step.action === 'getPageText') {
+          // ── Universal waitForStableText guard ─────────────────────────────────
+          // Ensure the page has stopped changing before we read it.
+          // If the last executed step was already waitForStableText (or waitForNavigation),
+          // skip the auto-inject to avoid double-polling.
+          // This is intentionally unconditional — works for AI chat, search results,
+          // stock filters, form submissions, or any page where response time is unknown.
+          const _lastAction = transcript.length > 0 ? transcript[transcript.length - 1].action?.action : null;
+          let stableTextResult = null;
+          if (_lastAction !== 'waitForStableText' && _lastAction !== 'waitForNavigation') {
+            logger.info(`[playwright.agent] auto-injecting waitForStableText before getPageText (last step: ${_lastAction || 'none'})`);
+            const stableOutcome = await browserAct({ action: 'waitForStableText', sessionId, headed, timeoutMs: 30000 });
+            // Capture the stable text result — this is the content we waited for
+            if (stableOutcome.ok && stableOutcome.result && stableOutcome.result.length > 1000) {
+              stableTextResult = stableOutcome.result;
+              logger.info(`[playwright.agent] captured ${stableTextResult.length} chars from waitForStableText, skipping redundant getPageText`);
+            }
+          }
+          // Always run a final getPageText after waitForStableText.
+          // Reusing the stable-text result directly risks capturing a mid-stream snapshot
+          // on streaming pages (e.g. ChatGPT) where two polls land in the same inter-burst
+          // gap and falsely declare stability before the response is complete.
+          outcome = await browserAct({ action: 'getPageText', sessionId, headed, timeoutMs });
+          // If getPageText came back empty but waitForStableText had content, use that as fallback
+          if ((!outcome.result || outcome.result.length < 100) && stableTextResult) {
+            outcome = { ok: true, action: 'getPageText', sessionId, result: stableTextResult, executionTime: 0 };
+            logger.info(`[playwright.agent] getPageText returned empty — falling back to waitForStableText result (${stableTextResult.length} chars)`);
+          }
+          // CRITICAL: Set lastGetPageTextResult so return step can substitute it
+          if (outcome.result) {
+            lastGetPageTextResult = outcome.result;
+            logger.info(`[playwright.agent] set lastGetPageTextResult: ${lastGetPageTextResult.length} chars`);
+          }
+        } else if (step.action === 'wait') {
+          const ms = Math.min(parseInt(step.ms || step.duration || 2000, 10), 5000);
+          await new Promise(r => setTimeout(r, ms));
+          outcome = { ok: true, result: `waited ${ms}ms` };
+        } else if (
+          // ── Mail recipient fill — bypass browser.act's click+Meta+a+type sequence.
+          // Gmail's To field is a chip/token widget: Meta+a (⌘A) triggers Gmail's
+          // global "Select All messages" shortcut, killing focus on the To input before
+          // `type` fires — nothing gets typed.  Fix: click to focus, type keystrokes
+          // directly (no Meta+a), then Tab to confirm the chip and move to Subject.
+          step.action === 'fill' &&
+          typeof step.text === 'string' &&
+          /\S+@\S+\.\S+/.test(step.text) &&
+          (['gmail.agent', 'outlook.agent', 'yahoo.agent'].includes(agentId) ||
+            (hostname || '').includes('mail.google.com') ||
+            (hostname || '').includes('outlook.live.com') ||
+            (hostname || '').includes('mail.yahoo.com'))
+        ) {
+          logger.info(`[playwright.agent] mail recipient fill — using click+type+Tab to bypass Meta+a focus loss`);
+          await browserAct({ action: 'click', selector: step.selector, sessionId, headed, timeoutMs });
+          await new Promise(r => setTimeout(r, 200));
+          await browserAct({ action: 'type', text: step.text, sessionId, headed, timeoutMs });
+          await new Promise(r => setTimeout(r, 400));
+          await browserAct({ action: 'press', key: 'Tab', sessionId, headed, timeoutMs: 3000 });
+          await new Promise(r => setTimeout(r, 600));
+          outcome = { ok: true, action: 'fill', sessionId, result: 'recipient entered via click+type+Tab' };
+        } else {
+          // ── Platform-correct clipboard shortcut scrubber ───────────────────
+          // LLMs routinely emit { action: 'press', key: 'Ctrl+v' } on macOS.
+          // On macOS, paste is Meta+V (⌘V) — Ctrl+v does nothing. Auto-rewrite
+          // so we don't silently fail and burn a repair cycle. Mirror the
+          // rewrite for non-macOS in case a plan emits Cmd+* / Meta+*.
+          if (step.action === 'press' && typeof step.key === 'string') {
+            const k = step.key.trim();
+            if (process.platform === 'darwin') {
+              const fixed = k.replace(/^(Ctrl|Control)\+/i, 'Meta+');
+              if (fixed !== k) {
+                logger.info(`[playwright.agent] scrubbing clipboard shortcut on macOS: "${k}" → "${fixed}"`);
+                step = { ...step, key: fixed };
+              }
+            } else {
+              const fixed = k.replace(/^(Meta|Cmd|Command)\+/i, 'Control+');
+              if (fixed !== k) {
+                logger.info(`[playwright.agent] scrubbing clipboard shortcut on ${process.platform}: "${k}" → "${fixed}"`);
+                step = { ...step, key: fixed };
+              }
+            }
+          }
+          outcome = await browserAct({ ...step, sessionId, headed, timeoutMs });
+        }
+      } catch (err) {
+        outcome = { ok: false, error: err.message };
+      }
+
+      logger.info(`[playwright.agent] step ${stepIndex + 1} ok=${outcome.ok}${outcome.error ? ' err=' + outcome.error : ''}`);
+      const thoughts = outcome.ok ? '' : (outcome.error || 'failed');
+      transcript.push({ step: stepIndex + 1, action: step, outcome, thoughts });
+
+      // Notify frontend — step completed
+      postProgress(_progressCallbackUrl, {
+        type: 'agent:turn',
+        stepIndex: _stepIndex,
+        turn: stepIndex + 1,
+        maxTurns: plan.length,
+        action: step,
+        outcome: { ok: outcome.ok, result: outcome.result, error: outcome.error },
+        thoughts,
+      });
+
+      if (outcome.ok) {
+        if (step.action === 'run-code' && outcome.result) {
+          lastRunCodeResult = outcome.result;
+        }
+        if (step.action === 'getPageText' && outcome.result) {
+          lastGetPageTextResult = outcome.result;
+          logger.info(`[playwright.agent] set lastGetPageTextResult: ${lastGetPageTextResult?.length || 0} chars`);
+
+          // ── HTTP error page detection ─────────────────────────────────────
+          // If getPageText captured an HTTP error page instead of real AI content,
+          // navigate back to the start URL and re-plan the full task rather than
+          // letting the garbage text flow downstream into synthesize.
+          const _httpErr = _detectHttpErrorPage(outcome.result);
+          let _httpRetryPlan = null;
+          if (_httpErr && totalRepairs < maxRepairs && url) {
+            totalRepairs++;
+            logger.warn(`[playwright.agent] HTTP ${_httpErr} error page detected in getPageText — full retry ${totalRepairs}/${maxRepairs}`);
+            try {
+              await browserAct({ action: 'navigate', url, sessionId, headed, timeoutMs: Math.max(timeoutMs, 30000) });
+              await browserAct({ action: 'waitForStableText', sessionId, headed, timeoutMs: 15000 });
+              const retrySnap = await browserAct({ action: 'snapshot', sessionId, headed, timeoutMs });
+              if (retrySnap.ok && retrySnap.result) currentSnapshot = retrySnap.result;
+              // Build placeholder warning for self-healing feedback loop
+              const httpPlaceholderWarning = placeholderWarnings.size > 0
+                ? `\n\n⚠️ PLACEHOLDER VIOLATION WARNING: The previous plan used bracketed placeholders like [${Array.from(placeholderWarnings).join('], [')}]. These placeholders cause catastrophic failures because they return literal text instead of actual content. NEVER use bracketed placeholders like [SEARCH RESULTS], [CONTENT], [DATA], etc. Use getPageText or run-code and let the result flow through automatically. Do NOT add a return step with placeholder text.`
+                : '';
+              const retryPlanRaw = await askWithMessages([
+                { role: 'system', content: PLAN_SYSTEM_PROMPT + learnedRulesBlock + domainLockBlock },
+                { role: 'user', content: `GOAL: ${effectiveGoal}\n\nNOTE: A previous attempt failed because the page returned an HTTP ${_httpErr} error. The page has been refreshed — please re-plan the full task from the current snapshot.${httpPlaceholderWarning}\n\nSNAPSHOT:\n${extractInteractiveRefs(currentSnapshot)}${agentContext ? `\n\nAGENT CONTEXT:\n${agentContext}` : ''}` },
+              ], { temperature: 0.1, maxTokens: 2048, responseTimeoutMs: 30000 });
+              const retryPlanParsed = parseJson(retryPlanRaw);
+              if (retryPlanParsed && Array.isArray(retryPlanParsed.plan) && retryPlanParsed.plan.length > 0) {
+                logger.info(`[playwright.agent] HTTP error retry: re-planned ${retryPlanParsed.plan.length} step(s) — ${retryPlanParsed.thoughts || ''}`);
+                // Store plan for restart outside try-catch (continue can't cross function boundary)
+                _httpRetryPlan = retryPlanParsed.plan;
+              }
+            } catch (retryErr) {
+              logger.warn(`[playwright.agent] HTTP error retry re-plan failed: ${retryErr.message}`);
+            }
+            // Execute retry restart outside try-catch to allow continue
+            if (_httpRetryPlan) {
+              plan = _httpRetryPlan;
+              stepIndex = 0;
+              lastGetPageTextResult = null;
+              continue;
+            }
+          } else if (_httpErr) {
+            logger.warn(`[playwright.agent] HTTP ${_httpErr} error page in getPageText — repair budget exhausted or no start URL, proceeding with error content`);
+          }
+        }
+
+        // ── Post-fill body verification (self-healing + rule learning) ────────
+        // When filling a long text value (>80 chars — clearly email body content,
+        // not a short email address or subject line), verify the text actually
+        // landed in the page.  Gmail reply/compose bodies are contenteditable divs;
+        // a plain `fill` on the wrong ref silently succeeds (exit 0) but leaves the
+        // body empty.  If the text is not found in the page, override outcome to
+        // ok=false with a descriptive error so the existing repair→deriveRule
+        // pipeline fires and LEARNS the correct approach (keyboard.type / run-code).
+        // After the first repair the rule is stored in context_rules for gmail.agent
+        // and injected into every future plan, so this verification never fires again.
+        if (_isMailAgentTask && _isComposeTask && step.action === 'fill' && typeof step.text === 'string' && step.text.length > 80) {
+          try {
+            const _needleJson = JSON.stringify(step.text.slice(0, 40));
+            const verifySnap = await browserAct({
+              action: 'run-code',
+              code: `async page => { return await page.evaluate(function(){
+                var needle = ${_needleJson};
+                var bodies = Array.from(document.querySelectorAll('[contenteditable="true"], textarea'));
+                return bodies.some(function(el){ return (el.innerText || el.value || '').includes(needle); }) ? 'ok' : 'empty';
+              }); }`,
+              sessionId, headed, timeoutMs,
+            });
+            if (verifySnap.ok && verifySnap.result === 'empty') {
+              logger.warn(`[playwright.agent] post-fill body verification: text not found in contenteditable/textarea — triggering repair to learn correct approach`);
+              outcome = { ok: false, error: 'fill succeeded but body text not found in page — element is likely a contenteditable div; use run-code with page.keyboard.type() or page.getByRole("textbox").fill() instead of a plain fill step' };
+            }
+          } catch (_) { /* verification failure is non-fatal — proceed */ }
+        }
+
+        // (recipient chip confirmation handled pre-emptively in the
+        //  mail recipient fill interceptor above via click+type+Tab)
+
+        // ── Expectation-Driven Execution: Verify action achieved expected outcome ─────
+        // Instead of blind DOM change detection, we verify that the action achieved its goal
+        if (step.expected || isDomMutating) {
+          // Take a fresh snapshot after the action
+          const postSnap = await browserAct({ action: 'snapshot', sessionId, headed, timeoutMs });
+          if (postSnap.ok && postSnap.result) {
+            currentSnapshot = postSnap.result;
+          }
+
+          // Verify expectation if defined
+          if (step.expected) {
+            const expectationResult = await verifyExpectation(step, sessionId, headed, timeoutMs);
+            
+            if (!expectationResult.satisfied) {
+              logger.warn(`[playwright.agent] Expectation failed for ${step.action}: ${expectationResult.reason}`);
+              
+              // Apply tiered failure handling
+              const tier1Result = handleKnownFailures(step, {}, currentSnapshot);
+              let failureAnalysis = tier1Result;
+              
+              if (!failureAnalysis) {
+                const tier2Result = handleElementBasedFailures(step, currentSnapshot);
+                failureAnalysis = tier2Result;
+              }
+              
+              if (!failureAnalysis) {
+                failureAnalysis = await handleUnknownFailure(step, currentSnapshot, { message: expectationResult.reason });
+              }
+              
+              // Handle the failure based on analysis
+              if (failureAnalysis.cause === 'login_wall') {
+                logger.warn(`[playwright.agent] Login wall detected via expectation failure — escalating to waitForAuth`);
+                return {
+                  ok: false, goal, sessionId,
+                  turns: transcript.length, done: false,
+                  loginWallDetected: true,
+                  result: 'Login wall detected during expectation verification — escalating to waitForAuth',
+                  transcript, executionTime: Date.now() - start,
+                };
+              } else if (failureAnalysis.cause === 'still_loading') {
+                logger.info(`[playwright.agent] Page still loading — waiting and retrying expectation`);
+                await new Promise(resolve => setTimeout(resolve, 2000)); // Wait 2 seconds
+                
+                // Retry expectation verification
+                const retryResult = await verifyExpectation(step, sessionId, headed, timeoutMs);
+                if (retryResult.satisfied) {
+                  logger.info(`[playwright.agent] Expectation satisfied after wait`);
+                } else {
+                  logger.warn(`[playwright.agent] Expectation still failed after wait: ${retryResult.reason}`);
+                  // Continue with the step but mark as having issues
+                  outcome.warning = `Expectation not fully satisfied: ${retryResult.reason}`;
+                }
+              } else if (failureAnalysis.cause === 'error_page' || failureAnalysis.cause === 'server_error') {
+                if (totalRepairs < maxRepairs) {
+                  totalRepairs++;
+                  logger.warn(`[playwright.agent] ${failureAnalysis.cause} detected — attempting repair ${totalRepairs}/${maxRepairs}`);
+                  // Trigger repair logic similar to existing error handling
+                  outcome = { ok: false, error: `${failureAnalysis.cause}: ${expectationResult.reason}` };
+                } else {
+                  logger.warn(`[playwright.agent] Repair budget exhausted for ${failureAnalysis.cause}`);
+                  outcome.warning = `Possible ${failureAnalysis.cause}: ${expectationResult.reason}`;
+                }
+              } else {
+                logger.info(`[playwright.agent] Unknown failure handled: ${failureAnalysis.reason}`);
+                outcome.warning = `Unexpected issue: ${failureAnalysis.reason}`;
+              }
+            } else {
+              logger.info(`[playwright.agent] Expectation satisfied for ${step.action}: ${expectationResult.reason}`);
+            }
+          }
+          
+        }
+
+        stepIndex++;
+        continue;
+      }
+
+      // ── Step failed → repair ─────────────────────────────────────────────────
+      // Check for Chrome crash and handle specially
+      if (outcome.chromeCrash) {
+        logger.error(`[playwright.agent] Chrome crash detected during step ${stepIndex + 1} — using debugging repair`);
+        
+        // Return special crash result to trigger debugging repair instead of generic recovery
+        return {
+          ok: false, goal, sessionId,
+          turns: transcript.length, done: false,
+          chromeCrash: true,
+          result: `Chrome browser crashed during step ${stepIndex + 1} (${step.action}): ${outcome.error}`,
+          transcript, error: outcome.error, executionTime: Date.now() - start,
+          debugContext: outcome.debugContext
+        };
+      }
+
+      if (totalRepairs >= maxRepairs) {
+        logger.warn(`[playwright.agent] step ${stepIndex + 1} failed — repair limit (${maxRepairs}) reached`);
+        return {
+          ok: false, goal, sessionId,
+          turns: transcript.length, done: false,
+          result: `Step ${stepIndex + 1} (${step.action}) failed: ${outcome.error}`,
+          transcript, error: outcome.error, executionTime: Date.now() - start,
+        };
+      }
+
+      totalRepairs++;
+      logger.info(`[playwright.agent] step ${stepIndex + 1} failed — repair ${totalRepairs}/${maxRepairs}: ${outcome.error}`);
+
+      // ── Check for login wall on failure ─────────────────────────────────────
+      // Only check for login walls when a step actually fails (not after every action)
+      if (hasPasswordFields(currentSnapshot) && hasLoginButton(currentSnapshot)) {
+        logger.warn(`[playwright.agent] Login wall detected on failed step — escalating to waitForAuth`);
+        return {
+          ok: false, goal, sessionId,
+          turns: transcript.length, done: false,
+          loginWallDetected: true,
+          result: `Step ${stepIndex + 1} failed and login wall detected — escalating to waitForAuth`,
+          transcript, error: outcome.error, executionTime: Date.now() - start,
+        };
+      }
+
+      // ── Fast-path: clipboard-paste failed because of a native file-chooser modal.
+      // Known signature: step is `press` with Ctrl+v / Meta+v, and the error (or
+      // outcome.result) contains "does not handle the modal state". Skip the repair
+      // LLM entirely — the correct fix is always the same: Escape to dismiss the
+      // modal, then pasteAttachment which focuses the compose body and pastes there.
+      {
+        const _errText = `${outcome.error || ''} ${outcome.result || ''} ${outcome.stdout || ''}`;
+        const _isClipboardPress =
+          step.action === 'press' &&
+          typeof step.key === 'string' &&
+          /^(Meta|Ctrl|Control|Cmd|Command)\+v$/i.test(step.key.trim());
+        const _isModalStateErr = /does not handle the modal state/i.test(_errText);
+        if (_isClipboardPress && _isModalStateErr) {
+          logger.info(`[playwright.agent] fast-path repair: modal-state on clipboard press → Escape + pasteAttachment`);
+          // Inject the deterministic repair: dismiss the file chooser, then paste into body.
+          const fastRepair = [
+            { action: 'press', key: 'Escape' },
+            { action: 'pasteAttachment' },
+          ];
+          plan.splice(stepIndex, 1, ...fastRepair);
+          // Save the learned rule so future plans avoid the anti-pattern.
+          try {
+            const ruleText = `Attachments: use { "action": "pasteAttachment" } on the already-filled compose body — never press Ctrl+v / Meta+v after clicking the Attach/paperclip button (its native file chooser blocks keys).`;
+            await skillDb.setContextRule(agentId, ruleText, 'agent').catch(() => {});
+            logger.info(`[playwright.agent] learned rule saved for ${agentId}: "${ruleText.slice(0, 80)}..."`);
+          } catch (_) { /* non-fatal */ }
+          continue; // re-enter loop with injected steps at same index
+        }
+      }
+
+      // Dismiss any pending browser dialog (e.g. "Leave site?") that may be blocking the
+      // session before we snapshot — otherwise the snapshot sees a dialog-blocked page and
+      // every subsequent repair step also times out (burning all repair credits).
+      await browserAct({ action: 'dialog-accept', sessionId, headed, timeoutMs: 3000 }).catch(() => {});
+
+      // Fresh snapshot for repair context
+      const repairSnap = await browserAct({ action: 'snapshot', sessionId, headed, timeoutMs });
+      if (repairSnap.ok && repairSnap.result) currentSnapshot = repairSnap.result;
+
+      // Get debugging context for enhanced repair
+      const debugContext = getDebuggingContext(sessionId, {
+        action: step.action,
+        args: step,
+        error: outcome.error,
+        executionTime: outcome.executionTime
+      });
+
+      const remainingSteps = plan.slice(stepIndex + 1);
+      let repairRaw;
+      try {
+        const repairUserContent = [
+          `GOAL: ${goal}`,
+          `FAILED_STEP: ${JSON.stringify(step)}`,
+          `ERROR: ${outcome.error}`,
+          `REMAINING_PLAN: ${JSON.stringify(remainingSteps)}`,
+        ];
+
+        // Inject last successful run-code result (smart truncation: full if ≤200 chars, summary if larger)
+        if (lastRunCodeResult) {
+          const _priorLen = lastRunCodeResult.length;
+          const _priorPreview = _priorLen <= 200
+            ? lastRunCodeResult
+            : lastRunCodeResult.slice(0, 200) + `...(${_priorLen} chars total, large data blob)`;
+          repairUserContent.push(``, `PRIOR_STEP_RESULT (last successful run-code): ${_priorPreview}`);
+        }
+
+        repairUserContent.push(``, `SNAPSHOT:`, trimSnapshot(currentSnapshot));
+
+        // Add debugging context if available
+        if (debugContext) {
+          repairUserContent.push(
+            ``,
+            `DEBUGGING CONTEXT:`,
+            `- Session duration: ${debugContext.sessionDuration}ms`,
+            `- Action history: ${debugContext.actionHistory.length} previous actions`,
+            `- Snapshots captured: ${debugContext.snapshots.length}`,
+            `- Network errors: ${debugContext.networkErrors.length}`,
+            `- Console errors: ${debugContext.consoleErrors.length}`,
+            `- Trace file: ${debugContext.traceFile || 'Not available'}`,
+            `- Video file: ${debugContext.videoFile || 'Not available'}`,
+            ``,
+            `RECENT ACTIONS:`,
+            ...debugContext.actionHistory.slice(-3).map(action => 
+              `• ${action.label}: ${action.ok ? 'SUCCESS' : 'FAILED'} (${action.executionTime}ms)`
+            ),
+            ``,
+            `ERRORS DETECTED:`,
+            ...debugContext.networkErrors.map(err => `• Network: ${err}`),
+            ...debugContext.consoleErrors.map(err => `• Console: ${err}`)
+          );
+        }
+
+        repairRaw = await askWithMessages([
+          { role: 'system', content: REPAIR_SYSTEM_PROMPT + domainLockBlock },
+          { role: 'user', content: repairUserContent.join('\n') },
+        ], { temperature: 0.1, maxTokens: 1024, responseTimeoutMs: 20000 });
+      } catch (err) {
+        return { ok: false, goal, sessionId, turns: transcript.length, done: false, result: `Repair LLM unavailable: ${err.message}`, transcript, error: err.message, executionTime: Date.now() - start };
+      }
+
+      const repairParsed = parseJson(repairRaw);
+      if (!repairParsed || !Array.isArray(repairParsed.repair)) {
+        logger.warn(`[playwright.agent] repair response unparseable — aborting`);
+        return { ok: false, goal, sessionId, turns: transcript.length, done: false, result: `Step ${stepIndex + 1} failed and repair was unparseable`, transcript, error: outcome.error, executionTime: Date.now() - start };
+      }
+
+      logger.info(`[playwright.agent] repair: ${repairParsed.repair.length} corrective steps — ${repairParsed.thoughts}`);
+
+      // Emit repair thoughts to UI
+      if (repairParsed.thoughts && _progressCallbackUrl) {
+        postProgress(_progressCallbackUrl, {
+          type: 'agent:thought',
+          stepIndex: _stepIndex ?? 0,
+          thoughts: repairParsed.thoughts,
+          phase: 'repair',
+        });
+      }
+
+      // Fire-and-forget: derive a ≤150-char rule from this failure+repair and store it in context_rules
+      // so future plan generations for this agent automatically avoid the same mistake.
+      // Skip rule learning for hallucinated-variable errors — the derived rule would be factually wrong
+      // and would poison future planning sessions (e.g. "use page.url() instead of task" is incorrect).
+      const _skipRuleLearning = ['task is not defined', 'results is not defined', 'globalState'].some(
+        s => (outcome.error || '').includes(s)
+      );
+      if (!_skipRuleLearning && !repairParsed.skip_original && repairParsed.repair.length > 0) {
+        (async () => {
+          try {
+            const ruleRaw = await askWithMessages([
+              { role: 'system', content: 'You derive short browser automation rules from failures. Reply with ONLY the rule text (≤150 chars), no preamble or quotes.' },
+              { role: 'user', content: `Failed step: ${JSON.stringify(step)}\nError: ${outcome.error}\nFixed by: ${JSON.stringify(repairParsed.repair)}\n\nWrite a single rule that prevents this failure next time.` },
+            ], { temperature: 0.1, maxTokens: 80, responseTimeoutMs: 10000 });
+            const ruleText = (ruleRaw || '').trim().replace(/^["'`]|["'`]$/g, '').slice(0, 150);
+            if (ruleText && ruleText.length > 10) {
+              await skillDb.setContextRule(agentId, ruleText, 'agent');
+              const hostname = url ? (() => { try { return new URL(url).hostname.replace(/^www\./, ''); } catch (_) { return null; } })() : null;
+              if (hostname) await skillDb.setContextRule(hostname, ruleText, 'site');
+              logger.info(`[playwright.agent] learned rule saved for ${agentId}: "${ruleText}"`);
+            }
+          } catch (_) { /* non-fatal */ }
+        })();
+      }
+
+      if (repairParsed.skip_original) {
+        // LLM says the step actually succeeded (false-negative) — skip it
+        stepIndex++;
+      } else {
+        // Splice repair steps in place of the failed step; remaining plan is preserved
+        plan = [
+          ...plan.slice(0, stepIndex),        // steps already done
+          ...repairParsed.repair,             // replacement for failed step
+          ...plan.slice(stepIndex + 1),       // original remaining steps
+        ];
+        // stepIndex stays — now points to first repair step
+      }
+    }
+
+    // If plan ended without an explicit return step, use the last run-code result
+    if (finalResult === null && lastRunCodeResult !== null) {
+      finalResult = lastRunCodeResult;
+    }
+    if (finalResult === null && lastGetPageTextResult !== null) {
+      finalResult = lastGetPageTextResult;
+    }
+
+    // ── Post-task completion verification ────────────────────────────────────────
+    // Takes a final snapshot after all steps complete and asks the LLM whether the
+    // goal was actually achieved. Catches silent completion failures where a step
+    // exits 0 but nothing happened: focus-wrong keyboard shortcuts, form submits that
+    // didn't register, modals that didn't close, etc.
+    //
+    // If verification fails (completed:false, confidence >= 0.75):
+    //   1. Run one targeted repair inline using the verify evidence as error context.
+    //   2. If repair steps execute cleanly → remove warning.
+    //   3. If repair also fails → return ok:true + verificationWarning (non-blocking).
+    // Entire block is non-fatal — any thrown error is caught and ignored.
+    // Skip for extraction tasks: when finalResult is long (> 100 chars), the agent
+    // already captured explicit content — verify would re-trigger a 9-39s LLM round-trip
+    // for no benefit. Only run for short/absent results (action tasks, form submits, etc.).
+    // ---------------------------------------------------------------------------
+    if (!finalResult || finalResult.length <= 100) {
+    try {
+      await new Promise(r => setTimeout(r, 1000)); // 1s post-action settle
+      const _verifySnap = await browserAct({ action: 'snapshot', sessionId, headed, timeoutMs: 10000 });
+      if (_verifySnap.ok && _verifySnap.result) {
+        const _lastActions = transcript.slice(-5).map(t => JSON.stringify(t.action)).join('\n');
+        const _verifyMsg = [
+          `GOAL: ${goal}`,
+          `LAST_ACTIONS:\n${_lastActions}`,
+          `CURRENT_PAGE:\n${trimSnapshot(_verifySnap.result, 3000)}`,
+        ].join('\n\n');
+
+        const _verifyRaw = await askWithMessages([
+          { role: 'system', content: VERIFY_SYSTEM_PROMPT },
+          { role: 'user', content: _verifyMsg },
+        ], { temperature: 0, maxTokens: 128, responseTimeoutMs: 12000 });
+
+        const _verifyParsed = parseJson(_verifyRaw);
+        if (_verifyParsed && _verifyParsed.completed === false && (_verifyParsed.confidence ?? 1) >= 0.75) {
+          logger.warn(`[playwright.agent] POST-TASK VERIFY FAILED (confidence=${_verifyParsed.confidence}): ${_verifyParsed.evidence || 'task incomplete'}`);
+
+          // If verification evidence describes a login/auth wall, skip inline repair —
+          // the repair LLM will just suggest clicking UI buttons (wrong approach).
+          // Return loginWallDetected:true so browser.agent's waitForAuth + auto-retry
+          // path fires, which is the only correct fix for an auth wall.
+          if (VERIFY_LOGIN_WALL_RE.test(_verifyParsed.evidence || '')) {
+            logger.warn(`[playwright.agent] verify: login wall detected in evidence — escalating to browser.agent waitForAuth (skipping repair)`);
+            return {
+              ok: false, done: false, goal, sessionId,
+              turns: transcript.length,
+              result: _verifyParsed.evidence,
+              transcript,
+              executionTime: Date.now() - start,
+              loginWallDetected: true,
+            };
+          }
+
+          let _verifyWarning = _verifyParsed.evidence || 'task may be incomplete';
+          try {
+            const _vRepairRaw = await askWithMessages([
+              { role: 'system', content: REPAIR_SYSTEM_PROMPT + domainLockBlock },
+              { role: 'user', content: [
+                `GOAL: ${goal}`,
+                `FAILED_STEP: ${JSON.stringify(transcript[transcript.length - 1]?.action || {})}`,
+                `ERROR: Post-task verification failed — ${_verifyParsed.evidence || 'task appears incomplete based on final page state'}`,
+                `REMAINING_PLAN: []`,
+                ``,
+                `SNAPSHOT:`,
+                trimSnapshot(_verifySnap.result),
+              ].join('\n') },
+            ], { temperature: 0.1, maxTokens: 1024, responseTimeoutMs: 20000 });
+
+            const _vRepairParsed = parseJson(_vRepairRaw);
+            if (_vRepairParsed && Array.isArray(_vRepairParsed.repair) && _vRepairParsed.repair.length > 0) {
+              logger.info(`[playwright.agent] verify-repair: ${_vRepairParsed.repair.length} corrective steps — ${_vRepairParsed.thoughts || ''}`);
+              for (const _vStep of _vRepairParsed.repair.slice(0, 3)) {
+                const _vNorm = normalizeStep(_vStep);
+                // Intercept 'wait' — not a browser action, handled locally
+                if (_vNorm?.action === 'wait') {
+                  const _waitMs = Math.min(parseInt(_vNorm.ms || _vNorm.duration || 2000, 10), 5000);
+                  await new Promise(r => setTimeout(r, _waitMs));
+                  transcript.push({ step: transcript.length + 1, action: _vNorm, outcome: { ok: true, result: `waited ${_waitMs}ms` }, thoughts: 'verify-repair' });
+                  continue;
+                }
+                const _vOut = await browserAct({ ...(_vNorm || {}), sessionId, headed, timeoutMs });
+                transcript.push({ step: transcript.length + 1, action: _vNorm, outcome: _vOut, thoughts: 'verify-repair' });
+                if (_vOut.ok) _verifyWarning = null; // repair step succeeded — clear warning
+              }
+            }
+          } catch (_vRepairErr) {
+            logger.warn(`[playwright.agent] verify-repair LLM error: ${_vRepairErr.message}`);
+          }
+
+          if (_verifyWarning) {
+            // Non-login-wall verify failure: surface the warning but keep ok:false
+            // so the step shows as failed in the panel rather than silently green.
+            return {
+              ok: false, goal, sessionId,
+              turns: transcript.length, done: false,
+              result: finalResult !== null ? finalResult : `Completed: ${goal}`,
+              transcript,
+              executionTime: Date.now() - start,
+              verificationWarning: _verifyWarning,
+              error: `Task completion could not be verified: ${_verifyWarning}`,
             };
           }
         }
       }
-
-      stepIndex++;
-      continue;
+    } catch (_verifyErr) {
+      logger.warn(`[playwright.agent] post-task verification error (non-fatal): ${_verifyErr.message}`);
     }
+    } // end verify gate
 
-    // ── Step failed → repair ─────────────────────────────────────────────────
-    // Check for Chrome crash and handle specially
-    if (outcome.chromeCrash) {
-      logger.error(`[playwright.agent] Chrome crash detected during step ${stepIndex + 1} — using debugging repair`);
-      
-      // Return special crash result to trigger debugging repair instead of generic recovery
-      return {
-        ok: false, goal, sessionId,
-        turns: transcript.length, done: false,
-        chromeCrash: true,
-        result: `Chrome browser crashed during step ${stepIndex + 1} (${step.action}): ${outcome.error}`,
-        transcript, error: outcome.error, executionTime: Date.now() - start,
-        debugContext: outcome.debugContext
-      };
-    }
+    // ── Goal Achievement Verification (Research Tasks) ───────────────────────────
+    // For research/lookup goals, verify that actual content was retrieved, not just
+    // that steps executed. If goal wasn't achieved, trigger adaptive replanning with
+    // fresh snapshot so LLM can try a completely different approach.
+    let _shouldReplan = false;
+    let _replanPlan = null;
+    const _researchGoalPattern = /\b(search|find|look\s+up|lookup|research|what\s+is|who\s+is|how\s+does|explain|summarize|compare|list|show\s+me|tell\s+me|fetch|get\s+me|ask|query)\b/i;
+    if (_researchGoalPattern.test(goal) && totalRepairs < maxRepairs) {
+      try {
+        const _goalVerifySnap = await browserAct({ action: 'snapshot', sessionId, headed, timeoutMs: 10000 });
+        if (_goalVerifySnap.ok && _goalVerifySnap.result) {
+          const _pageText = _goalVerifySnap.result;
+          const _lines = _pageText.trim().split(/\n+/).filter(l => l.trim().length > 2);
+          const _longLines = _lines.filter(l => l.trim().split(/\s+/).length > 6).length;
+          const _totalWords = _pageText.trim().split(/\s+/).filter(Boolean).length;
+          const _isSparse = _longLines < 3 && _totalWords < 60;
 
-    if (totalRepairs >= maxRepairs) {
-      logger.warn(`[playwright.agent] step ${stepIndex + 1} failed — repair limit (${maxRepairs}) reached`);
-      return {
-        ok: false, goal, sessionId,
-        turns: transcript.length, done: false,
-        result: `Step ${stepIndex + 1} (${step.action}) failed: ${outcome.error}`,
-        transcript, error: outcome.error, executionTime: Date.now() - start,
-      };
-    }
+          // Check if search query is still in input field (common sign of "Enter" not submitting)
+          const _searchBoxStillHasQuery = /search|query|ask/i.test(goal) &&
+            (_pageText.includes(goal.replace(/.*\b(about|for|on)\s+/i, '').slice(0, 20)) ||
+            _lines.some(l => l.includes('?') && l.length < 100));
 
-    totalRepairs++;
-    logger.info(`[playwright.agent] step ${stepIndex + 1} failed — repair ${totalRepairs}/${maxRepairs}: ${outcome.error}`);
+          if (_isSparse || _searchBoxStillHasQuery) {
+            logger.warn(`[playwright.agent] Goal achievement check: sparse content (${_longLines} long lines, ${_totalWords} words) — goal likely not achieved`);
+            totalRepairs++;
 
-    // ── Fast-path: clipboard-paste failed because of a native file-chooser modal.
-    // Known signature: step is `press` with Ctrl+v / Meta+v, and the error (or
-    // outcome.result) contains "does not handle the modal state". Skip the repair
-    // LLM entirely — the correct fix is always the same: Escape to dismiss the
-    // modal, then pasteAttachment which focuses the compose body and pastes there.
-    {
-      const _errText = `${outcome.error || ''} ${outcome.result || ''} ${outcome.stdout || ''}`;
-      const _isClipboardPress =
-        step.action === 'press' &&
-        typeof step.key === 'string' &&
-        /^(Meta|Ctrl|Control|Cmd|Command)\+v$/i.test(step.key.trim());
-      const _isModalStateErr = /does not handle the modal state/i.test(_errText);
-      if (_isClipboardPress && _isModalStateErr) {
-        logger.info(`[playwright.agent] fast-path repair: modal-state on clipboard press → Escape + pasteAttachment`);
-        // Inject the deterministic repair: dismiss the file chooser, then paste into body.
-        const fastRepair = [
-          { action: 'press', key: 'Escape' },
-          { action: 'pasteAttachment' },
-        ];
-        plan.splice(stepIndex, 1, ...fastRepair);
-        // Save the learned rule so future plans avoid the anti-pattern.
-        try {
-          const ruleText = `Attachments: use { "action": "pasteAttachment" } on the already-filled compose body — never press Ctrl+v / Meta+v after clicking the Attach/paperclip button (its native file chooser blocks keys).`;
-          await skillDb.setContextRule(agentId, ruleText, 'agent').catch(() => {});
-          logger.info(`[playwright.agent] learned rule saved for ${agentId}: "${ruleText.slice(0, 80)}..."`);
-        } catch (_) { /* non-fatal */ }
-        continue; // re-enter loop with injected steps at same index
-      }
-    }
+            // ADAPTIVE REPLANNING: Get fresh snapshot and ask LLM for new approach
+            const _replanSnap = await browserAct({ action: 'snapshot', sessionId, headed, timeoutMs });
+            if (_replanSnap.ok && _replanSnap.result) currentSnapshot = _replanSnap.result;
 
-    // Dismiss any pending browser dialog (e.g. "Leave site?") that may be blocking the
-    // session before we snapshot — otherwise the snapshot sees a dialog-blocked page and
-    // every subsequent repair step also times out (burning all repair credits).
-    await browserAct({ action: 'dialog-accept', sessionId, headed, timeoutMs: 3000 }).catch(() => {});
+            const _lastAttemptSummary = transcript.map(t => `${t.action.action}: ${t.outcome.ok ? 'ok' : 'failed'}`).join('; ');
+            const _replanPrompt = `ORIGINAL GOAL: ${goal}
 
-    // Fresh snapshot for repair context
-    const repairSnap = await browserAct({ action: 'snapshot', sessionId, headed, timeoutMs });
-    if (repairSnap.ok && repairSnap.result) currentSnapshot = repairSnap.result;
+PREVIOUS ATTEMPT SUMMARY:
+${_lastAttemptSummary}
 
-    // Get debugging context for enhanced repair
-    const debugContext = getDebuggingContext(sessionId, {
-      action: step.action,
-      args: step,
-      error: outcome.error,
-      executionTime: outcome.executionTime
-    });
+ISSUE: The previous approach did NOT achieve the goal. The page shows sparse content (${_longLines} substantive lines, ${_totalWords} words), suggesting the search/form submission didn't complete or returned empty results.
 
-    const remainingSteps = plan.slice(stepIndex + 1);
-    let repairRaw;
-    try {
-      const repairUserContent = [
-        `GOAL: ${goal}`,
-        `FAILED_STEP: ${JSON.stringify(step)}`,
-        `ERROR: ${outcome.error}`,
-        `REMAINING_PLAN: ${JSON.stringify(remainingSteps)}`,
-      ];
+CURRENT PAGE STATE (fresh snapshot):
+${extractInteractiveRefs(currentSnapshot)}
 
-      // Inject last successful run-code result (smart truncation: full if ≤200 chars, summary if larger)
-      if (lastRunCodeResult) {
-        const _priorLen = lastRunCodeResult.length;
-        const _priorPreview = _priorLen <= 200
-          ? lastRunCodeResult
-          : lastRunCodeResult.slice(0, 200) + `...(${_priorLen} chars total, large data blob)`;
-        repairUserContent.push(``, `PRIOR_STEP_RESULT (last successful run-code): ${_priorPreview}`);
-      }
+Your task: Generate a COMPLETELY NEW plan to achieve the goal. Try a DIFFERENT approach:
+- If you pressed Enter before, try clicking a specific submit/search button
+- If you clicked one button, try a different one
+- Look for dropdown menus, search buttons, or alternate submission methods
+- Consider that the page might need a different interaction pattern
 
-      repairUserContent.push(``, `SNAPSHOT:`, trimSnapshot(currentSnapshot));
+Return a JSON plan with "thoughts" explaining your new strategy and "plan" array with fresh steps.`;
 
-      // Add debugging context if available
-      if (debugContext) {
-        repairUserContent.push(
-          ``,
-          `DEBUGGING CONTEXT:`,
-          `- Session duration: ${debugContext.sessionDuration}ms`,
-          `- Action history: ${debugContext.actionHistory.length} previous actions`,
-          `- Snapshots captured: ${debugContext.snapshots.length}`,
-          `- Network errors: ${debugContext.networkErrors.length}`,
-          `- Console errors: ${debugContext.consoleErrors.length}`,
-          `- Trace file: ${debugContext.traceFile || 'Not available'}`,
-          `- Video file: ${debugContext.videoFile || 'Not available'}`,
-          ``,
-          `RECENT ACTIONS:`,
-          ...debugContext.actionHistory.slice(-3).map(action => 
-            `• ${action.label}: ${action.ok ? 'SUCCESS' : 'FAILED'} (${action.executionTime}ms)`
-          ),
-          ``,
-          `ERRORS DETECTED:`,
-          ...debugContext.networkErrors.map(err => `• Network: ${err}`),
-          ...debugContext.consoleErrors.map(err => `• Console: ${err}`)
-        );
-      }
+            const _replanRaw = await askWithMessages([
+              { role: 'system', content: PLAN_SYSTEM_PROMPT + learnedRulesBlock + domainLockBlock },
+              { role: 'user', content: _replanPrompt },
+            ], { temperature: 0.2, maxTokens: _planMaxTokens, responseTimeoutMs: 30000 });
 
-      repairRaw = await askWithMessages([
-        { role: 'system', content: REPAIR_SYSTEM_PROMPT + domainLockBlock },
-        { role: 'user', content: repairUserContent.join('\n') },
-      ], { temperature: 0.1, maxTokens: 1024, responseTimeoutMs: 20000 });
-    } catch (err) {
-      return { ok: false, goal, sessionId, turns: transcript.length, done: false, result: `Repair LLM unavailable: ${err.message}`, transcript, error: err.message, executionTime: Date.now() - start };
-    }
-
-    const repairParsed = parseJson(repairRaw);
-    if (!repairParsed || !Array.isArray(repairParsed.repair)) {
-      logger.warn(`[playwright.agent] repair response unparseable — aborting`);
-      return { ok: false, goal, sessionId, turns: transcript.length, done: false, result: `Step ${stepIndex + 1} failed and repair was unparseable`, transcript, error: outcome.error, executionTime: Date.now() - start };
-    }
-
-    logger.info(`[playwright.agent] repair: ${repairParsed.repair.length} corrective steps — ${repairParsed.thoughts}`);
-
-    // Emit repair thoughts to UI
-    if (repairParsed.thoughts && _progressCallbackUrl) {
-      postProgress(_progressCallbackUrl, {
-        type: 'agent:thought',
-        stepIndex: _stepIndex ?? 0,
-        thoughts: repairParsed.thoughts,
-        phase: 'repair',
-      });
-    }
-
-    // Fire-and-forget: derive a ≤150-char rule from this failure+repair and store it in context_rules
-    // so future plan generations for this agent automatically avoid the same mistake.
-    // Skip rule learning for hallucinated-variable errors — the derived rule would be factually wrong
-    // and would poison future planning sessions (e.g. "use page.url() instead of task" is incorrect).
-    const _skipRuleLearning = ['task is not defined', 'results is not defined', 'globalState'].some(
-      s => (outcome.error || '').includes(s)
-    );
-    if (!_skipRuleLearning && !repairParsed.skip_original && repairParsed.repair.length > 0) {
-      (async () => {
-        try {
-          const ruleRaw = await askWithMessages([
-            { role: 'system', content: 'You derive short browser automation rules from failures. Reply with ONLY the rule text (≤150 chars), no preamble or quotes.' },
-            { role: 'user', content: `Failed step: ${JSON.stringify(step)}\nError: ${outcome.error}\nFixed by: ${JSON.stringify(repairParsed.repair)}\n\nWrite a single rule that prevents this failure next time.` },
-          ], { temperature: 0.1, maxTokens: 80, responseTimeoutMs: 10000 });
-          const ruleText = (ruleRaw || '').trim().replace(/^["'`]|["'`]$/g, '').slice(0, 150);
-          if (ruleText && ruleText.length > 10) {
-            await skillDb.setContextRule(agentId, ruleText, 'agent');
-            const hostname = url ? (() => { try { return new URL(url).hostname.replace(/^www\./, ''); } catch (_) { return null; } })() : null;
-            if (hostname) await skillDb.setContextRule(hostname, ruleText, 'site');
-            logger.info(`[playwright.agent] learned rule saved for ${agentId}: "${ruleText}"`);
-          }
-        } catch (_) { /* non-fatal */ }
-      })();
-    }
-
-    if (repairParsed.skip_original) {
-      // LLM says the step actually succeeded (false-negative) — skip it
-      stepIndex++;
-    } else {
-      // Splice repair steps in place of the failed step; remaining plan is preserved
-      plan = [
-        ...plan.slice(0, stepIndex),        // steps already done
-        ...repairParsed.repair,             // replacement for failed step
-        ...plan.slice(stepIndex + 1),       // original remaining steps
-      ];
-      // stepIndex stays — now points to first repair step
-    }
-  }
-
-  // If plan ended without an explicit return step, use the last run-code result
-  if (finalResult === null && lastRunCodeResult !== null) {
-    finalResult = lastRunCodeResult;
-  }
-  if (finalResult === null && lastGetPageTextResult !== null) {
-    finalResult = lastGetPageTextResult;
-  }
-
-  // ── Post-task completion verification ────────────────────────────────────────
-  // Takes a final snapshot after all steps complete and asks the LLM whether the
-  // goal was actually achieved. Catches silent completion failures where a step
-  // exits 0 but nothing happened: focus-wrong keyboard shortcuts, form submits that
-  // didn't register, modals that didn't close, etc.
-  //
-  // If verification fails (completed:false, confidence >= 0.75):
-  //   1. Run one targeted repair inline using the verify evidence as error context.
-  //   2. If repair steps execute cleanly → remove warning.
-  //   3. If repair also fails → return ok:true + verificationWarning (non-blocking).
-  // Entire block is non-fatal — any thrown error is caught and ignored.
-  // Skip for extraction tasks: when finalResult is long (> 100 chars), the agent
-  // already captured explicit content — verify would re-trigger a 9-39s LLM round-trip
-  // for no benefit. Only run for short/absent results (action tasks, form submits, etc.).
-  // ---------------------------------------------------------------------------
-  if (!finalResult || finalResult.length <= 100) {
-  try {
-    await new Promise(r => setTimeout(r, 1000)); // 1s post-action settle
-    const _verifySnap = await browserAct({ action: 'snapshot', sessionId, headed, timeoutMs: 10000 });
-    if (_verifySnap.ok && _verifySnap.result) {
-      const _lastActions = transcript.slice(-5).map(t => JSON.stringify(t.action)).join('\n');
-      const _verifyMsg = [
-        `GOAL: ${goal}`,
-        `LAST_ACTIONS:\n${_lastActions}`,
-        `CURRENT_PAGE:\n${trimSnapshot(_verifySnap.result, 3000)}`,
-      ].join('\n\n');
-
-      const _verifyRaw = await askWithMessages([
-        { role: 'system', content: VERIFY_SYSTEM_PROMPT },
-        { role: 'user', content: _verifyMsg },
-      ], { temperature: 0, maxTokens: 128, responseTimeoutMs: 12000 });
-
-      const _verifyParsed = parseJson(_verifyRaw);
-      if (_verifyParsed && _verifyParsed.completed === false && (_verifyParsed.confidence ?? 1) >= 0.75) {
-        logger.warn(`[playwright.agent] POST-TASK VERIFY FAILED (confidence=${_verifyParsed.confidence}): ${_verifyParsed.evidence || 'task incomplete'}`);
-
-        // If verification evidence describes a login/auth wall, skip inline repair —
-        // the repair LLM will just suggest clicking UI buttons (wrong approach).
-        // Return loginWallDetected:true so browser.agent's waitForAuth + auto-retry
-        // path fires, which is the only correct fix for an auth wall.
-        if (VERIFY_LOGIN_WALL_RE.test(_verifyParsed.evidence || '')) {
-          logger.warn(`[playwright.agent] verify: login wall detected in evidence — escalating to browser.agent waitForAuth (skipping repair)`);
-          return {
-            ok: false, done: false, goal, sessionId,
-            turns: transcript.length,
-            result: _verifyParsed.evidence,
-            transcript,
-            executionTime: Date.now() - start,
-            loginWallDetected: true,
-          };
-        }
-
-        let _verifyWarning = _verifyParsed.evidence || 'task may be incomplete';
-        try {
-          const _vRepairRaw = await askWithMessages([
-            { role: 'system', content: REPAIR_SYSTEM_PROMPT + domainLockBlock },
-            { role: 'user', content: [
-              `GOAL: ${goal}`,
-              `FAILED_STEP: ${JSON.stringify(transcript[transcript.length - 1]?.action || {})}`,
-              `ERROR: Post-task verification failed — ${_verifyParsed.evidence || 'task appears incomplete based on final page state'}`,
-              `REMAINING_PLAN: []`,
-              ``,
-              `SNAPSHOT:`,
-              trimSnapshot(_verifySnap.result),
-            ].join('\n') },
-          ], { temperature: 0.1, maxTokens: 1024, responseTimeoutMs: 20000 });
-
-          const _vRepairParsed = parseJson(_vRepairRaw);
-          if (_vRepairParsed && Array.isArray(_vRepairParsed.repair) && _vRepairParsed.repair.length > 0) {
-            logger.info(`[playwright.agent] verify-repair: ${_vRepairParsed.repair.length} corrective steps — ${_vRepairParsed.thoughts || ''}`);
-            for (const _vStep of _vRepairParsed.repair.slice(0, 3)) {
-              const _vNorm = normalizeStep(_vStep);
-              // Intercept 'wait' — not a browser action, handled locally
-              if (_vNorm?.action === 'wait') {
-                const _waitMs = Math.min(parseInt(_vNorm.ms || _vNorm.duration || 2000, 10), 5000);
-                await new Promise(r => setTimeout(r, _waitMs));
-                transcript.push({ step: transcript.length + 1, action: _vNorm, outcome: { ok: true, result: `waited ${_waitMs}ms` }, thoughts: 'verify-repair' });
-                continue;
-              }
-              const _vOut = await browserAct({ ...(_vNorm || {}), sessionId, headed, timeoutMs });
-              transcript.push({ step: transcript.length + 1, action: _vNorm, outcome: _vOut, thoughts: 'verify-repair' });
-              if (_vOut.ok) _verifyWarning = null; // repair step succeeded — clear warning
+            const _replanParsed = parseJson(_replanRaw);
+            if (_replanParsed && Array.isArray(_replanParsed.plan) && _replanParsed.plan.length > 0) {
+              logger.info(`[playwright.agent] Adaptive replanning: new approach with ${_replanParsed.plan.length} step(s) — ${_replanParsed.thoughts || 'retrying with different strategy'}`);
+              // Set flag to replan instead of using continue (which can't cross try-catch boundary)
+              _shouldReplan = true;
+              _replanPlan = _replanParsed.plan;
+            } else {
+              logger.warn(`[playwright.agent] Adaptive replanning: LLM returned unparseable plan — returning sparse content result`);
             }
           }
-        } catch (_vRepairErr) {
-          logger.warn(`[playwright.agent] verify-repair LLM error: ${_vRepairErr.message}`);
         }
-
-        if (_verifyWarning) {
-          // Non-login-wall verify failure: surface the warning but keep ok:false
-          // so the step shows as failed in the panel rather than silently green.
-          return {
-            ok: false, goal, sessionId,
-            turns: transcript.length, done: false,
-            result: finalResult !== null ? finalResult : `Completed: ${goal}`,
-            transcript,
-            executionTime: Date.now() - start,
-            verificationWarning: _verifyWarning,
-            error: `Task completion could not be verified: ${_verifyWarning}`,
-          };
-        }
+      } catch (_goalVerifyErr) {
+        logger.warn(`[playwright.agent] goal achievement verification error (non-fatal): ${_goalVerifyErr.message}`);
       }
     }
-  } catch (_verifyErr) {
-    logger.warn(`[playwright.agent] post-task verification error (non-fatal): ${_verifyErr.message}`);
-  }
-  } // end verify gate
+
+    // Execute replanning if flag was set (outside try-catch to allow continue)
+    if (_shouldReplan && _replanPlan) {
+      plan = _replanPlan;
+      stepIndex = 0;
+      lastGetPageTextResult = null;
+      lastRunCodeResult = null;
+      _shouldReplan = false;
+      _replanPlan = null;
+      continue executionLoop; // Restart execution loop with completely new plan
+    }
+
+    // Exit outer execution loop on successful completion
+    break executionLoop;
+  } // end executionLoop
 
   // ── Done ───────────────────────────────────────────────────────────────────
   logger.info(`[playwright.agent] DONE — ${transcript.length} steps executed (${totalRepairs} repairs)`);

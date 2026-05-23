@@ -45,7 +45,7 @@
 const path   = require('path');
 const os     = require('os');
 const fs     = require('fs');
-const { spawn } = require('child_process');
+const { spawn, exec } = require('child_process');
 const logger = require('../logger.cjs');
 const { askWithMessages } = require('../skill-helpers/skill-llm.cjs');
 
@@ -4038,6 +4038,45 @@ Respond ONLY with valid JSON:
       };
     }
 
+    
+    // ── Minimize ─────────────────────────────────────────────────────────────
+    case 'minimize': {
+      const platform = process.platform;
+      const minimizeCommands = [];
+      
+      if (platform === 'darwin') {
+        // macOS: minimize front Chrome window
+        minimizeCommands.push(`osascript -e 'tell application "Google Chrome" to set miniaturized of front window to true'`);
+      } else if (platform === 'win32') {
+        // Windows: minimize using PowerShell and user32.dll
+        minimizeCommands.push(`powershell -Command "Add-Type '[DllImport(\"user32.dll\")]public static extern bool ShowWindowAsync(IntPtr hWnd,int nCmdShow);' -Name Win -Namespace Native; \$chrome = Get-Process chrome -ErrorAction SilentlyContinue | Select-Object -First 1; if (\$chrome -and \$chrome.MainWindowHandle -ne 0) { [Native.Win]::ShowWindowAsync(\$chrome.MainWindowHandle, 2) | Out-Null; 'Minimized' } else { 'No Chrome window found' }"`);
+      } else if (platform === 'linux') {
+        // Linux: try multiple fallback commands
+        minimizeCommands.push('xdotool getactivewindow windowminimize 2>/dev/null || wmctrl -r :ACTIVE: -b add,hidden 2>/dev/null || wlrctl window minimize 2>/dev/null || true');
+      }
+      
+      let minimized = false;
+      for (const cmd of minimizeCommands) {
+        try {
+          await new Promise((resolve) => {
+            exec(cmd, { timeout: 5000 }, (error, stdout, stderr) => {
+              if (!error) {
+                minimized = true;
+                logger.info(`[browser.act] minimize succeeded: ${stdout?.trim() || 'ok'}`);
+              } else {
+                logger.debug(`[browser.act] minimize attempt failed: ${error.message}`);
+              }
+              resolve();
+            });
+          });
+          if (minimized) break;
+        } catch (e) {
+          logger.debug(`[browser.act] minimize error: ${e.message}`);
+        }
+      }
+      
+      return { ok: true, action, sessionId, minimized, executionTime: Date.now() - start };
+    }
     
     // ── Fallback ─────────────────────────────────────────────────────────────
     default: {

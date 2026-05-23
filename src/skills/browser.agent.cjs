@@ -68,6 +68,32 @@ const SERVICE_UNAVAILABLE_PATTERNS = [
 ];
 
 // ---------------------------------------------------------------------------
+// LLM-based auth detection prompt — semantic analysis of page content
+// ---------------------------------------------------------------------------
+const AUTH_CHECK_PROMPT = `You are analyzing a web page to determine if user authentication is required.
+Given the page TITLE and BODY TEXT, determine if this page requires the user to log in or sign up before they can access the actual service.
+
+Reply ONLY with a JSON object:
+{
+  "authRequired": true|false,
+  "confidence": 0.0-1.0,
+  "reason": "brief explanation"
+}
+
+Indicate authRequired=true if the page shows:
+- Login forms, sign-in buttons, or email/password fields
+- Landing pages that say "Sign in to continue" or similar
+- Marketing pages that require authentication to proceed
+- "Workspace not found" or "Sign in to your workspace" messages
+- Pages that say "Get started" or "Create account" as the primary action
+- Email input fields with text like "Enter your email to sign in"
+
+Indicate authRequired=false if:
+- The user is already logged in and can see their content
+- The page is a publicly accessible dashboard
+- The page shows actual app content (channels, messages, files, etc.)`;
+
+// ---------------------------------------------------------------------------
 // Auth-check result cache — avoids repeated navigate+evaluate probes
 // Key: agentId  Value: { ts: Date.now(), authNeeded: bool }
 // TTL: 60s — re-probe if the last confirmed-ok check is older than this.
@@ -87,6 +113,33 @@ function _getCachedAuthCheck(agentId) {
 
 function _setCachedAuthCheck(agentId, authNeeded) {
   _authCheckCache.set(agentId, { ts: Date.now(), authNeeded });
+}
+
+// ---------------------------------------------------------------------------
+// LLM-based auth detection — semantic analysis when URL patterns fail
+// ---------------------------------------------------------------------------
+async function _detectAuthViaLLM(title, body, agentId) {
+  try {
+    const { askWithMessages } = require('../skill-llm.cjs');
+    const raw = await askWithMessages([
+      { role: 'system', content: AUTH_CHECK_PROMPT },
+      { role: 'user', content: `TITLE: ${(title || '').slice(0, 200)}\n\nBODY: ${(body || '').slice(0, 1000)}` }
+    ], { temperature: 0.1, maxTokens: 256, responseTimeoutMs: 10000 });
+
+    const parsed = (() => {
+      try { return JSON.parse(raw); }
+      catch (_) { return null; }
+    })();
+
+    if (parsed?.authRequired && (parsed.confidence ?? 0) >= 0.7) {
+      logger.info(`[browser.agent] LLM auth detection: auth required (confidence=${parsed.confidence}, reason=${parsed.reason})`);
+      return true;
+    }
+    return false;
+  } catch (err) {
+    logger.warn(`[browser.agent] LLM auth detection failed (non-fatal): ${err.message}`);
+    return false;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -2116,7 +2169,7 @@ function callSkill(skillName, args, timeoutMs = 120000) {
   });
 }
 
-async function actionRun({ agentId, task, url, context, requiresAuth, _progressCallbackUrl, _stepIndex, _loginWallRetried = false }) {
+async function actionRun({ agentId, task, url, context, requiresAuth, skipAuth, _progressCallbackUrl, _stepIndex, _loginWallRetried = false }) {
   if (!agentId) return { ok: false, error: 'agentId is required' };
   if (!task)    return { ok: false, error: 'task is required' };
 
@@ -2465,6 +2518,10 @@ async function actionRun({ agentId, task, url, context, requiresAuth, _progressC
   } else {
     // playwright path: navigate to startUrl first, probe URL, call waitForAuth only if
     // the site redirects to a login path. Applies to ALL services uniformly.
+    // skipAuth: true bypasses all auth checks (used for "Try without logging in" in parallel groups).
+    if (skipAuth) {
+      logger.info(`[browser.agent] run: skipAuth=true for ${agentId} — bypassing waitForAuth`);
+    }
     let _authNeeded = false;
     let _skipNavigate = false;
 
@@ -2584,8 +2641,16 @@ async function actionRun({ agentId, task, url, context, requiresAuth, _progressC
 
         // ── Session health check: if eval also fails, browser is not running ──
         if (_hrefRes?.ok === false || _isChromeSessionConflict(_hrefRes)) {
-          logger.error(`[browser.agent] run: browser session not alive after navigate for ${agentId} — aborting`);
-          return { ok: false, agentId, task, error: 'Browser failed to start: navigate succeeded but session is not responding. Close existing Chrome windows and retry.' };
+          logger.error(`[browser.agent] run: browser session crashed for ${agentId} — flagging for retry`);
+          return {
+            ok: false,
+            chromeCrash: true,
+            agentId,
+            task,
+            error: 'Browser session crashed, will retry once',
+            result: null,
+            stdout: null,
+          };
         }
 
         const _curHref = String(_hrefRes?.result ?? _hrefRes?.stdout ?? '').trim();
@@ -2622,6 +2687,22 @@ async function actionRun({ agentId, task, url, context, requiresAuth, _progressC
             if (_PARKING_RE.test(_pageText) || (Number(_pageInfo.links) < 10 && /for\s+sale|buy|offer|domain/i.test(_pageText))) {
               _isParkingPage = true;
               logger.warn(`[browser.agent] run: parking/squatter content detected on ${_curHost} for ${agentId}`);
+            }
+
+            // ── LLM-based auth detection — catches landing pages not detected by URL patterns ──
+            // If URL check passed but page content shows auth indicators (landing page, "sign in to continue", etc.)
+            // use LLM semantic analysis to confirm before skipping auth.
+            if (!_onLoginPage) {
+              // Quick keyword pre-filter to avoid unnecessary LLM calls
+              const _authIndicators = /sign\s*in|log\s*in|enter\s*your\s*email|workspace\s*not\s*found|where\s*should\s*we\s*begin|get\s*started|create\s*workspace|sign\s*in\s*to\s*continue/i;
+              if (_authIndicators.test(_pageText)) {
+                logger.info(`[browser.agent] Auth indicators found in page content, confirming with LLM...`);
+                const _llmDetected = await _detectAuthViaLLM(_pageInfo.title || '', _pageInfo.body || '', agentId);
+                if (_llmDetected) {
+                  _onLoginPage = true;
+                  logger.info(`[browser.agent] LLM confirmed auth required — treating as login page`);
+                }
+              }
             }
           }
         } catch (_pageErr) {
@@ -2698,6 +2779,10 @@ async function actionRun({ agentId, task, url, context, requiresAuth, _progressC
       }
       logger.warn(`[browser.agent] run: auth-check probe failed — falling back to waitForAuth: ${_probeErr.message}`);
       _authNeeded = true;
+    }
+    if (_authNeeded && skipAuth) {
+      logger.info(`[browser.agent] run: login wall detected but skipAuth=true for ${agentId} — proceeding as guest`);
+      _authNeeded = false;
     }
     if (_authNeeded) {
       // ── Resolve stored credentials via user.agent before opening auth form ──────
@@ -3344,6 +3429,15 @@ When extracting page content with run-code, prioritize these selectors over gene
         enqueueScan({ url: startUrl, agentId }, 'post_automation');
       } catch (_enqueuErr) {
         // Non-fatal — scan will be triggered on next periodic heartbeat
+      }
+    }
+
+    // ── Minimize browser window after successful completion ───────────────────
+    if (_runResult.ok === true && _usePersistentProfile) {
+      try {
+        await browserAct({ action: 'minimize', sessionId, headed: true });
+      } catch (minimizeErr) {
+        logger.debug(`[browser.agent] minimize failed (non-critical): ${minimizeErr.message}`);
       }
     }
 

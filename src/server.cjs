@@ -369,6 +369,21 @@ class CommandServiceMCPServer {
         return;
       }
 
+      // ── GET /agents.list ────────────────────────────────────────────────────
+      // List all agents (browser + CLI) from DuckDB for main process UI
+      if (req.method === 'GET' && req.url === '/agents.list') {
+        try {
+          const { actionListAllAgents } = require('./skills/cli.agent.cjs');
+          const result = await actionListAllAgents();
+          res.writeHead(200);
+          res.end(JSON.stringify(result));
+        } catch (err) {
+          res.writeHead(500);
+          res.end(JSON.stringify({ ok: false, error: err.message }));
+        }
+        return;
+      }
+
       // ── GET /debug/resolve-credentials?agentId=gmail.agent ──────────────────
       // Test what resolveCredentials returns including all fallback steps.
       // Usage: open http://localhost:3007/debug/resolve-credentials?agentId=gmail.agent
