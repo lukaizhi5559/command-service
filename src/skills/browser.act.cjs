@@ -1299,6 +1299,57 @@ function resolveRefForClick(sessionId, labelOrRef) {
   return { ref: null, label: null };
 }
 
+// Detect if an element is a microphone/voice search button based on its properties
+// Works with parsed snapshot candidates (label, role, attrs) or DOM elements (ariaLabel, title, html)
+function _isMicrophoneButton(element) {
+  if (!element) return false;
+  
+  // Handle both parsed snapshot candidates and DOM element formats
+  const label = (element.label || '').toLowerCase();
+  const ariaLabel = (element.ariaLabel || element.aria_label || '').toLowerCase();
+  const title = (element.title || '').toLowerCase();
+  const role = (element.role || '').toLowerCase();
+  const attrs = (element.attrs || '').toLowerCase();
+  
+  // Check for microphone/voice related labels in any text property
+  const voiceKeywords = ['microphone', 'mic', 'voice', 'audio', 'speak', 'speech'];
+  const hasVoiceLabel = voiceKeywords.some(kw => 
+    label.includes(kw) || 
+    ariaLabel.includes(kw) || 
+    title.includes(kw) ||
+    attrs.includes(kw)
+  );
+  
+  // Check for microphone icon indicators in element attributes/html
+  // YouTube's mic button often has specific aria-labels or SVG icons
+  const html = (element.html || '').toLowerCase();
+  const hasMicIcon = html.includes('m9.6') || html.includes('voice') || attrs.includes('m9.6');
+  
+  return hasVoiceLabel || hasMicIcon;
+}
+
+// Filter out microphone buttons from candidates when purpose is "search"
+function _filterMicrophoneButtons(candidates, purpose) {
+  if (!candidates || candidates.length === 0) return candidates;
+  if (purpose === 'voice-input' || purpose === 'audio') return candidates; // Allow mic for voice tasks
+  
+  // For search/find purposes, filter out microphone buttons
+  const filtered = candidates.filter(c => !_isMicrophoneButton(c));
+  if (filtered.length < candidates.length) {
+    logger.info(`[browser.act] Filtered out ${candidates.length - filtered.length} microphone button(s) for purpose="${purpose}"`);
+  }
+  return filtered.length > 0 ? filtered : candidates; // Return original if all were filtered
+}
+
+// Get element details from snapshot cache by ref
+function _getElementByRef(sessionId, ref) {
+  const snap = snapshotCache.get(_tabKey(sessionId)) || '';
+  if (!snap || !ref) return null;
+  
+  const candidates = parseSnapshotCandidates(snap);
+  return candidates.find(c => c.ref === ref) || null;
+}
+
 // ---------------------------------------------------------------------------
 // Main skill entry point
 // ---------------------------------------------------------------------------
@@ -1839,14 +1890,54 @@ async function browserAct(args) {
     case 'click':
     case 'dblclick': {
       const cmd = action === 'dblclick' ? 'dblclick' : 'click';
+      // Extract purpose hint from args (e.g., "search", "voice-input", "navigate")
+      const clickPurpose = args?.purpose || args?.intent || 'default';
       // Ensure snapshot is fresh for ref resolution
       await captureSnapshot(sessionId, headed, timeoutMs);
+      
+      // Get all candidates and filter out microphone buttons if purpose is search
+      const snapText = snapshotCache.get(_tabKey(sessionId)) || '';
+      let clickCandidates = snapText ? parseSnapshotCandidates(snapText) : [];
+      if (clickCandidates.length > 0 && (clickPurpose === 'search' || clickPurpose === 'find' || clickPurpose === 'submit')) {
+        const beforeCount = clickCandidates.length;
+        clickCandidates = _filterMicrophoneButtons(clickCandidates, clickPurpose);
+        if (clickCandidates.length < beforeCount) {
+          logger.info(`[browser.act] click: filtered microphone buttons for purpose="${clickPurpose}"`);
+        }
+      }
+      
       const { ref: rawRef, label: matchedLabel } = resolveRefForClick(sessionId, selector);
+      
+      // Check if resolved element is a microphone button for search purposes
+      let finalRef = rawRef;
+      let finalLabel = matchedLabel;
+      const resolvedElement = rawRef ? _getElementByRef(sessionId, rawRef) : null;
+      
+      if (resolvedElement && _isMicrophoneButton(resolvedElement) && 
+          (clickPurpose === 'search' || clickPurpose === 'find' || clickPurpose === 'submit')) {
+        logger.info(`[browser.act] Resolved ref ${rawRef} is microphone button - finding alternative`);
+        
+        // Find alternative non-mic button
+        const candidates = parseSnapshotCandidates(snapshotCache.get(_tabKey(sessionId)) || '');
+        const alternative = candidates.find(c => {
+          if (_isMicrophoneButton(c)) return false;
+          // Prefer buttons near search boxes or with submit-like roles
+          return ['button', 'submit'].includes(c.role?.toLowerCase()) ||
+                 (c.label?.toLowerCase().includes('search'));
+        });
+        
+        if (alternative) {
+          logger.info(`[browser.act] Using alternative button ${alternative.ref} instead of mic button`);
+          finalRef = alternative.ref;
+          finalLabel = alternative.label;
+        }
+      }
+      
       // Only use refs that playwright-cli actually understands (eN format).
       // Synthetic refs (line_N) come from the .yml file format — playwright-cli rejects them.
-      const ref = rawRef && /^e\d+$/i.test(rawRef) ? rawRef : null;
-      if (rawRef && !ref) {
-        logger.info(`[browser.act] click: synthetic ref "${rawRef}" (matched label="${matchedLabel}") — using eval-click fallback for "${selector}"`);
+      const ref = finalRef && /^e\d+$/i.test(finalRef) ? finalRef : null;
+      if (finalRef && !ref) {
+        logger.info(`[browser.act] click: synthetic ref "${finalRef}" (matched label="${finalLabel}") — using eval-click fallback for "${selector}"`);
       }
       if (!ref) {
         // No real eN ref — use eval fallback.
@@ -1873,12 +1964,30 @@ async function browserAct(args) {
         // Match priority: aria-label exact → textContent exact → textContent startsWith → textContent includes (for nested spans)
         // NO form-submit fallback: that was causing silent false-positives (clicked:form) when the real target wasn't found.
         // Two-pass strategy: pass 1 = strict (aria-label/exact/startsWith/data-testid), pass 2 = includes() but only on short-text elements (≤50 chars) to avoid matching long conversation titles that happen to contain the target text.
-        const evalScript = `() => { const texts = [${tryTexts}]; const CANDIDATES = 'a,button,input[type=submit],[role=button],[role=link],[role=menuitem],li'; for (const t of texts) { const tl = t.toLowerCase(); const all = [...document.querySelectorAll(CANDIDATES)]; const el = all.find(e => (e.getAttribute('aria-label') || '').toLowerCase() === tl || (e.getAttribute('aria-label') || '') === t || e.textContent.trim().toLowerCase() === tl || e.textContent.trim().toLowerCase().startsWith(tl) || e.getAttribute('data-testid') === t || (e.getAttribute('name') || '').toLowerCase() === tl || (e.getAttribute('value') || '').toLowerCase() === tl) || all.find(e => e.textContent.trim().length <= 50 && e.textContent.trim().toLowerCase().includes(tl)); if (el) { el.click(); return 'clicked:' + t; } } return 'not-found'; }`;
+        // Microphone button avoidance: when purpose is search/find, skip elements with voice/mic related aria-labels
+        const isSearchPurpose = clickPurpose === 'search' || clickPurpose === 'find' || clickPurpose === 'submit';
+        const evalScript = `() => { 
+          const texts = [${tryTexts}]; 
+          const CANDIDATES = 'a,button,input[type=submit],[role=button],[role=link],[role=menuitem],li';
+          const isSearch = ${isSearchPurpose};
+          const isMic = (el) => {
+            const al = (el.getAttribute('aria-label') || '').toLowerCase();
+            return ['microphone','mic','voice','audio','speak','speech'].some(k => al.includes(k));
+          };
+          for (const t of texts) { 
+            const tl = t.toLowerCase(); 
+            const all = [...document.querySelectorAll(CANDIDATES)];
+            const candidates = isSearch ? all.filter(e => !isMic(e)) : all;
+            const el = candidates.find(e => (e.getAttribute('aria-label') || '').toLowerCase() === tl || (e.getAttribute('aria-label') || '') === t || e.textContent.trim().toLowerCase() === tl || e.textContent.trim().toLowerCase().startsWith(tl) || e.getAttribute('data-testid') === t || (e.getAttribute('name') || '').toLowerCase() === tl || (e.getAttribute('value') || '').toLowerCase() === tl) || candidates.find(e => e.textContent.trim().length <= 50 && e.textContent.trim().toLowerCase().includes(tl)); 
+            if (el) { el.click(); return 'clicked:' + t; } 
+          } 
+          return 'not-found'; 
+        }`;
         const evalRes = await cliRun([...S, 'eval', evalScript], timeoutMs);
         const evalRaw = (evalRes.stdout || '').trim();
         // playwright-cli echoes back the script source in "### Ran Playwright code" block
         // so we must extract ONLY the ### Result section to avoid false-positive 'not-found' match
-        const resultMatch = evalRaw.match(/###\s*Result\s*\n([\s\S]*?)(?=###|$)/i);
+        const resultMatch = evalRaw.match(/###\s*Result\s*\n([\s\S]*)(?=###\s*Ran Playwright|$)/i);
         const evalResult = resultMatch ? resultMatch[1].trim().replace(/^["']|["']$/g, '') : evalRaw;
         // 'clicked:form' and 'clicked:form-submit' were from the old fallback — treat as failure.
         const clickSucceeded = (evalResult.startsWith('clicked:') || evalResult.includes('clicked:')) &&
@@ -2595,6 +2704,260 @@ async function browserAct(args) {
       };
     }
 
+    // ── Universal Content Extraction ───────────────────────────────────────────
+    case 'extractContent': {
+      // Multi-layer extraction: DOM-based + regex fallback + structured data
+      const evalExpr = `(function(){
+        try {
+          // Layer 1: DOM-based extraction
+          const content = {
+            links: [],
+            images: [],
+            videos: [],
+            documents: [],
+            structured: []
+          };
+          
+          // Extract all links
+          document.querySelectorAll('a[href]').forEach(a => {
+            const href = a.href;
+            const text = (a.innerText || a.textContent || '').trim().replace(/\\s+/g, ' ').substring(0, 200);
+            if (href && !href.startsWith('javascript:') && !href.startsWith('javascript:void')) {
+              content.links.push({ href, text, title: a.title || '' });
+            }
+          });
+          
+          // Extract all images
+          document.querySelectorAll('img[src]').forEach(img => {
+            const src = img.src;
+            const alt = img.alt || '';
+            const title = img.title || '';
+            if (src) {
+              content.images.push({ src, alt, title });
+            }
+          });
+          
+          // Extract videos
+          document.querySelectorAll('video[src], source[src]').forEach(el => {
+            const src = el.src || el.dataset.src;
+            if (src) {
+              content.videos.push({ src });
+            }
+          });
+          
+          // Extract documents
+          document.querySelectorAll('a[href$=".pdf"], a[href$=".doc"], a[href$=".docx"], a[href$=".xls"], a[href$=".xlsx"], a[href$=".ppt"], a[href$=".pptx"]').forEach(a => {
+            const href = a.href;
+            const text = (a.innerText || a.textContent || '').trim();
+            if (href) {
+              content.documents.push({ href, text });
+            }
+          });
+          
+          // Layer 2: Schema.org structured data
+          const scripts = document.querySelectorAll('script[type="application/ld+json"]');
+          scripts.forEach(script => {
+            try {
+              const data = JSON.parse(script.textContent);
+              if (data) {
+                content.structured.push({ type: 'schema.org', data });
+              }
+            } catch (e) {
+              // Ignore malformed JSON
+            }
+          });
+          
+          // Layer 3: Meta tags for social media
+          const metaTags = {};
+          ['og:title', 'og:description', 'og:image', 'og:url', 'twitter:title', 'twitter:description', 'twitter:image', 'twitter:url'].forEach(prop => {
+            const meta = document.querySelector(\`meta[property="\${prop}"], meta[name="\${prop}"]\`);
+            if (meta && meta.content) {
+              metaTags[prop] = meta.content;
+            }
+          });
+          if (Object.keys(metaTags).length > 0) {
+            content.structured.push({ type: 'meta', data: metaTags });
+          }
+          
+          return JSON.stringify(content);
+        } catch (e) {
+          return JSON.stringify({ error: e.message });
+        }
+      })()`;
+      
+      const res = await cliRun([...S, 'eval', evalExpr], Math.min(timeoutMs, 20000));
+      const rawOut = (res.stdout || '').trim();
+      // Use greedy match to capture everything until the LAST ### marker
+      const resultMatch = rawOut.match(/###\s*Result\s*\n([\s\S]*)(?=###\s*Ran Playwright|$)/i);
+      let jsonStr;
+      if (resultMatch) {
+        jsonStr = resultMatch[1].trim().replace(/^["']|["']$/g, '');
+      } else {
+        jsonStr = rawOut;
+      }
+
+      let extractedContent = null;
+      try {
+        extractedContent = JSON.parse(jsonStr);
+      } catch (e) {
+        logger.warn(`[browser.act] Failed to parse extracted content JSON: ${e.message}`);
+        extractedContent = { error: 'Failed to parse content' };
+      }
+
+      // Layer 4: Text-based regex extraction as fallback
+      const pageTextRes = await cliRun([...S, 'eval', '(function(){var b=document.body;return b?(b.innerText||b.textContent||"").slice(0,50000):"";})()'], Math.min(timeoutMs, 10000));
+      const pageRawOut = (pageTextRes.stdout || '').trim();
+      // Use greedy match to capture everything until the LAST ### marker
+      const pageResultMatch = pageRawOut.match(/###\s*Result\s*\n([\s\S]*)(?=###\s*Ran Playwright|$)/i);
+      let pageText;
+      if (pageResultMatch) {
+        pageText = pageResultMatch[1].trim().replace(/^"/, '').replace(/"$/, '');
+      } else {
+        pageText = pageRawOut;
+      }
+
+      // Regex extraction for URLs
+      const urlRegex = /https?:\/\/[^\s"'\`>\),]+/g;
+      const imageRegex = /\.(jpg|jpeg|png|gif|webp|svg|avif)(?:\?[^\s]*)?/gi;
+      const videoRegex = /\.(mp4|webm|ogg|mov|avi)(?:\?[^\s]*)?/gi;
+      const documentRegex = /\.(pdf|doc|docx|xls|xlsx|ppt|pptx)(?:\?[^\s]*)?/gi;
+      
+      const regexUrls = pageText.match(urlRegex) || [];
+      const regexImages = pageText.match(imageRegex) || [];
+      const regexVideos = pageText.match(videoRegex) || [];
+      const regexDocuments = pageText.match(documentRegex) || [];
+
+      // Merge DOM and regex results
+      const mergedContent = {
+        links: extractedContent?.links || [],
+        images: extractedContent?.images || [],
+        videos: extractedContent?.videos || [],
+        documents: extractedContent?.documents || [],
+        structured: extractedContent?.structured || [],
+        // Add regex-only results
+        regexOnly: {
+          urls: regexUrls.filter(url => !extractedContent?.links?.some(link => link.href === url)),
+          images: regexImages.filter(img => !extractedContent?.images?.some(image => image.src.includes(img))),
+          videos: regexVideos.filter(video => !extractedContent?.videos?.some(vid => vid.src.includes(video))),
+          documents: regexDocuments.filter(doc => !extractedContent?.documents?.some(document => document.href.includes(doc)))
+        }
+      };
+
+      // Format as markdown for display
+      let markdownContent = '';
+      
+      if (mergedContent.links.length > 0) {
+        markdownContent += '\\n## Links\\n';
+        mergedContent.links.slice(0, 20).forEach(link => {
+          markdownContent += `- [${link.text || link.href}](${link.href})\\n`;
+        });
+        if (mergedContent.links.length > 20) {
+          markdownContent += `- ... and ${mergedContent.links.length - 20} more links\\n`;
+        }
+      }
+      
+      if (mergedContent.images.length > 0) {
+        markdownContent += '\\n## Images\\n';
+        mergedContent.images.slice(0, 10).forEach(img => {
+          markdownContent += `![${img.alt || 'image'}](${img.src})\\n`;
+        });
+        if (mergedContent.images.length > 10) {
+          markdownContent += `- ... and ${mergedContent.images.length - 10} more images\\n`;
+        }
+      }
+      
+      if (mergedContent.videos.length > 0) {
+        markdownContent += '\\n## Videos\\n';
+        mergedContent.videos.forEach(video => {
+          markdownContent += `- [Video](${video.src})\\n`;
+        });
+      }
+      
+      if (mergedContent.documents.length > 0) {
+        markdownContent += '\\n## Documents\\n';
+        mergedContent.documents.forEach(doc => {
+          markdownContent += `- [${doc.text || 'Document'}](${doc.href})\\n`;
+        });
+      }
+      
+      if (Object.values(mergedContent.regexOnly).some(arr => arr.length > 0)) {
+        markdownContent += '\\n## Additional Content (Regex Extracted)\\n';
+        if (mergedContent.regexOnly.urls.length > 0) {
+          markdownContent += '### URLs\\n';
+          mergedContent.regexOnly.urls.slice(0, 10).forEach(url => {
+            markdownContent += `- ${url}\\n`;
+          });
+        }
+        if (mergedContent.regexOnly.images.length > 0) {
+          markdownContent += '### Images\\n';
+          mergedContent.regexOnly.images.slice(0, 5).forEach(img => {
+            markdownContent += `- ${img}\\n`;
+          });
+        }
+      }
+
+      // Layer 5: LLM smart extraction for YouTube and complex pages when no links found
+      if (mergedContent.links.length === 0 && pageText.length > 100) {
+        try {
+          const { ask } = require('../skill-llm.cjs');
+          const llmExtractionPrompt = `Extract all video links from this page text. Look for video titles and their corresponding YouTube watch URLs.
+
+Page text (first 15000 chars):
+${pageText.slice(0, 15000)}
+
+Return ONLY a JSON array of objects with these exact fields:
+- title: the video title
+- href: the full YouTube URL (https://www.youtube.com/watch?v=...)
+- channel: channel name if visible
+
+Example: [{"title": "10 Min Workout", "href": "https://www.youtube.com/watch?v=AbC123", "channel": "Fitness"}]
+
+If no videos found, return []. Do not explain, only output the JSON array.`;
+
+          const llmResult = await ask(llmExtractionPrompt, { maxTokens: 2000, temperature: 0.1 });
+          const jsonMatch = llmResult.match(/\[[\s\S]*\]/);
+          if (jsonMatch) {
+            const parsedLinks = JSON.parse(jsonMatch[0]);
+            if (Array.isArray(parsedLinks) && parsedLinks.length > 0) {
+              const llmLinks = parsedLinks.map(v => ({
+                text: v.title || 'Video',
+                href: v.href,
+                title: v.title || 'Video',
+                source: 'llm-extraction',
+                channel: v.channel
+              })).filter(l => l.href && l.href.includes('watch?v='));
+              
+              if (llmLinks.length > 0) {
+                mergedContent.links = llmLinks;
+                logger.info(`[browser.act] LLM Layer 5 extraction found ${llmLinks.length} video(s)`);
+                
+                // Rebuild markdown with LLM-extracted links
+                markdownContent = '\n## Links (LLM Extracted)\n';
+                llmLinks.slice(0, 20).forEach(link => {
+                  markdownContent += `- [${link.title}](${link.href})${link.channel ? ` — ${link.channel}` : ''}\n`;
+                });
+              }
+            }
+          }
+        } catch (e) {
+          logger.warn(`[browser.act] Layer 5 LLM extraction failed: ${e.message}`);
+        }
+      }
+
+      const effectiveOk = res.ok || extractedContent;
+      return {
+        ok: effectiveOk,
+        action,
+        sessionId,
+        stdout: markdownContent || pageText,
+        result: markdownContent || pageText,
+        extractedContent: mergedContent,
+        pageText: pageText,
+        executionTime: Date.now() - start,
+        error: effectiveOk ? undefined : res.error,
+      };
+    }
+
     // ── getText / getPageText ─────────────────────────────────────────────────
     case 'getText':
     case 'getPageText': {
@@ -2606,10 +2969,23 @@ async function browserAct(args) {
       // playwright-cli eval wraps output as: ### Result\n"<value>"\n### Ran Playwright code...
       // Extract just the bare value from the ### Result block
       const rawOut = (res.stdout || '').trim();
-      const resultMatch = rawOut.match(/###\s*Result\s*\n([\s\S]*?)(?=###|$)/i);
-      const pageText = resultMatch
-        ? resultMatch[1].trim().replace(/^"|"$/g, '')
-        : rawOut;
+      // Use greedy match to capture everything until the LAST ### marker
+      // The ### marker appears at the end as "### Ran Playwright code..."
+      const resultMatch = rawOut.match(/###\s*Result\s*\n([\s\S]*)(?=###\s*Ran Playwright|$)/i);
+      let pageText;
+      if (resultMatch) {
+        pageText = resultMatch[1].trim();
+        // Remove surrounding quotes if present
+        pageText = pageText.replace(/^"/, '').replace(/"$/, '');
+      } else {
+        // Fallback: try to extract from raw output
+        pageText = rawOut;
+      }
+      
+      // Log for debugging
+      if (pageText.length < 200) {
+        logger.info(`[browser.act] getPageText: short content (${pageText.length} chars), raw: ${rawOut.slice(0,200)}`);
+      }
 
       // Non-ok with partial stdout: the eval ran but exited non-zero (common on SPA pages
       // with pending microtasks). If we got usable text, treat as ok.
@@ -2639,10 +3015,14 @@ async function browserAct(args) {
       })()`;
       const res = await cliRun([...S, 'eval', evalExpr], Math.min(timeoutMs, 20000));
       const rawOut = (res.stdout || '').trim();
-      const resultMatch = rawOut.match(/###\s*Result\s*\n([\s\S]*?)(?=###|$)/i);
-      const jsonStr = resultMatch
-        ? resultMatch[1].trim().replace(/^["']|["']$/g, '')
-        : rawOut;
+      // Use greedy match to capture everything until the LAST ### marker
+      const resultMatch = rawOut.match(/###\s*Result\s*\n([\s\S]*)(?=###\s*Ran Playwright|$)/i);
+      let jsonStr;
+      if (resultMatch) {
+        jsonStr = resultMatch[1].trim().replace(/^["']|["']$/g, '');
+      } else {
+        jsonStr = rawOut;
+      }
 
       let links = [];
       try {
@@ -2871,7 +3251,7 @@ async function browserAct(args) {
           executionTime: gmailResult.executionTime || Date.now() - start
         };
       } else {
-        // Use original waitForStableText for non-Gmail pages
+        // Use standard waitForStableText with universal skeleton detection for dynamic sites
         logger.info(`[browser.act] Using standard waitForStableText for session=${sessionId}`);
         
         // Auth-wall patterns — text that indicates a login/sign-in page, not real content
@@ -2921,7 +3301,7 @@ async function browserAct(args) {
           // playwright-cli eval wraps output as: ### Result\n"<value>"\n### Ran Playwright code...
           // Extract just the bare innerText value
           const rawOut = (r.stdout || '').trim();
-          const resultMatch = rawOut.match(/###\s*Result\s*\n([\s\S]*?)(?=###|$)/i);
+          const resultMatch = rawOut.match(/###\s*Result\s*\n([\s\S]*)(?=###\s*Ran Playwright|$)/i);
           const cur = resultMatch
             ? resultMatch[1].trim().replace(/^"|"$/g, '')
             : rawOut;
@@ -2934,6 +3314,17 @@ async function browserAct(args) {
             await cliRun([...S, 'press', 'Escape'], 3000);
             await new Promise(r2 => setTimeout(r2, 600));
             prev = '';
+            continue;
+          }
+
+          // Universal skeleton content detection for ALL dynamic sites (YouTube, Facebook, etc.)
+          // If content is suspiciously sparse (<20 words), it's not "stable" yet
+          const wordCount = cur.split(/\s+/).filter(w => w.length > 0).length;
+          if (wordCount < 20 && !cur.includes('about:blank')) {
+            logger.debug(`[browser.act] waitForStableText: skeleton content detected (${wordCount} words), continuing wait...`);
+            stableCount = 0; // Reset - skeleton is not "stable enough"
+            prev = cur;
+            await new Promise(r => setTimeout(r, checkInterval));
             continue;
           }
 

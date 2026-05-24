@@ -87,7 +87,7 @@ function callExternalSkill(name, args = {}, timeoutMs = 30000) {
 // Full action menu — used by PLAN_SYSTEM_PROMPT only.
 const BROWSER_ACTIONS_FULL = `Available actions:
   navigate        { url }
-  click           { selector }         — use snapshot ref (e12) when visible; label otherwise
+  click           { selector, purpose? }  — purpose: 'search' | 'submit' | 'navigate' | 'voice' | 'general'. ALWAYS use 'search' when clicking a search button after typing in a search box.
   dblclick        { selector }
   fill            { selector, text }   — for <input> / <textarea> fields
   type            { text }             — types into currently focused element (contenteditable, e.g. Gmail body)
@@ -123,7 +123,17 @@ const BROWSER_ACTIONS_FULL = `Available actions:
   tab-new         { url? }             — open a new tab; if url provided, navigates to it. Returns new tab index.
   tab-list        {}                   — list all open tabs with their indices and URLs. Use to audit tabs.
   tab-select      { tabIndex }         — switch active focus to the tab at tabIndex
-  tab-close       { tabIndex }         — close tab at tabIndex and free its resources. NEVER close tab 0.`;
+  tab-close       { tabIndex }         — close tab at tabIndex and free its resources. NEVER close tab 0.
+
+PURPOSE FIELD GUIDE (for click action):
+When including a click step, ALWAYS specify the purpose to help the browser automation avoid clicking the wrong element:
+- "search": Clicking a search button after typing in a search box (e.g., YouTube search, Google search, Amazon search). CRITICAL: Use this to avoid accidentally clicking the microphone/voice search icon which triggers permission dialogs.
+- "submit": Clicking a form submit button (login, signup, contact forms)
+- "navigate": Clicking a link, menu item, or navigation element to go to a different page
+- "voice": Intentionally clicking a voice/microphone button when the task explicitly requires audio input
+- "general": Any other click (buttons, toggles, expand/collapse, etc.)
+
+⚠️ CRITICAL FOR SEARCH TASKS: When the goal involves searching (finding YouTube videos, searching Google, etc.), after filling the search box, click the SEARCH BUTTON (magnifying glass icon) not the MICROPHONE icon, and include "purpose": "search". The microphone button triggers browser permission dialogs that cannot be automated and will cause the task to fail.`;
 
 // Interactive-only action menu — used by ORIENTATION_SYSTEM_PROMPT.
 // Excludes data-extraction actions (run-code, getPageText, evaluate, screenshot,
@@ -1383,15 +1393,24 @@ async function playwrightAgent(args) {
               logger.info(`[playwright.agent] captured ${stableTextResult.length} chars from waitForStableText, skipping redundant getPageText`);
             }
           }
-          // Always run a final getPageText after waitForStableText.
-          // Reusing the stable-text result directly risks capturing a mid-stream snapshot
-          // on streaming pages (e.g. ChatGPT) where two polls land in the same inter-burst
-          // gap and falsely declare stability before the response is complete.
-          outcome = await browserAct({ action: 'getPageText', sessionId, headed, timeoutMs });
-          // If getPageText came back empty but waitForStableText had content, use that as fallback
+          
+          // Try extractContent first for rich content extraction
+          logger.info(`[playwright.agent] attempting extractContent for rich content extraction`);
+          const extractOutcome = await browserAct({ action: 'extractContent', sessionId, headed, timeoutMs: 25000 });
+          
+          if (extractOutcome.ok && extractOutcome.result && extractOutcome.result.length > 100) {
+            outcome = extractOutcome;
+            logger.info(`[playwright.agent] extractContent succeeded: ${outcome.result.length} chars with ${extractOutcome.extractedContent?.links?.length || 0} links, ${extractOutcome.extractedContent?.images?.length || 0} images`);
+          } else {
+            // Fallback to regular getPageText if extractContent fails
+            logger.info(`[playwright.agent] extractContent failed or returned minimal content, falling back to getPageText`);
+            outcome = await browserAct({ action: 'getPageText', sessionId, headed, timeoutMs });
+          }
+          
+          // If both extractContent and getPageText came back empty but waitForStableText had content, use that as fallback
           if ((!outcome.result || outcome.result.length < 100) && stableTextResult) {
             outcome = { ok: true, action: 'getPageText', sessionId, result: stableTextResult, executionTime: 0 };
-            logger.info(`[playwright.agent] getPageText returned empty — falling back to waitForStableText result (${stableTextResult.length} chars)`);
+            logger.info(`[playwright.agent] content extraction returned empty — falling back to waitForStableText result (${stableTextResult.length} chars)`);
           }
           // CRITICAL: Set lastGetPageTextResult so return step can substitute it
           if (outcome.result) {
@@ -1957,12 +1976,53 @@ async function playwrightAgent(args) {
           const _lines = _pageText.trim().split(/\n+/).filter(l => l.trim().length > 2);
           const _longLines = _lines.filter(l => l.trim().split(/\s+/).length > 6).length;
           const _totalWords = _pageText.trim().split(/\s+/).filter(Boolean).length;
-          const _isSparse = _longLines < 3 && _totalWords < 60;
+          
+          // Generic content quality analysis - works for ANY search/result page
+          const _hasStructuredContent = _lines.some(l => 
+            /\d+\./.test(l) ||           // Numbered lists
+            /^[•\-\*]\s/.test(l) ||      // Bullet points
+            /\b\d{1,2}\/\d{1,2}\/\d{4}/.test(l) || // Dates
+            /\$\d+/.test(l) ||           // Prices
+            /\d+\s*(views|likes|shares|comments|results|items|products|videos|articles)/i.test(l)
+          );
+          
+          const _hasNavigationElements = _pageText.includes('Next') || 
+            _pageText.includes('Previous') || 
+            _pageText.includes('Page') || 
+            _pageText.includes('More') ||
+            /\b\d+\s+of\s+\d+/.test(_pageText) ||
+            /page\s+\d+/.test(_pageText.toLowerCase());
+          
+          const _hasInteractiveElements = _pageText.includes('button') ||
+            _pageText.includes('link') ||
+            _pageText.includes('click') ||
+            /\b(click|tap|select|choose|view|open|read|watch|listen)\b/i.test(_pageText);
+          
+          const _hasResultContainers = _lines.some(l => 
+            /\b(result|item|product|video|article|post|entry|listing)\b/i.test(l) ||
+            l.length > 100 && /\w/.test(l) // Substantial content lines
+          );
+          
+          // Adaptive threshold based on content structure
+          let _isSparse = _longLines < 3 && _totalWords < 60;
+          
+          // If page has structured content, be more lenient
+          if (_hasStructuredContent || _hasNavigationElements || _hasResultContainers) {
+            _isSparse = _longLines < 1 && _totalWords < 20; // Much more lenient for structured pages
+          }
+          
+          // If page has interactive elements, be even more lenient
+          if (_hasInteractiveElements && (_hasStructuredContent || _hasNavigationElements)) {
+            _isSparse = _totalWords < 10; // Very lenient for interactive structured pages
+          }
 
           // Check if search query is still in input field (common sign of "Enter" not submitting)
           const _searchBoxStillHasQuery = /search|query|ask/i.test(goal) &&
             (_pageText.includes(goal.replace(/.*\b(about|for|on)\s+/i, '').slice(0, 20)) ||
             _lines.some(l => l.includes('?') && l.length < 100));
+
+          // Enhanced logging for debugging
+          logger.info(`[playwright.agent] Content quality analysis: longLines=${_longLines}, totalWords=${_totalWords}, structured=${_hasStructuredContent}, navigation=${_hasNavigationElements}, interactive=${_hasInteractiveElements}, resultContainers=${_hasResultContainers}, isSparse=${_isSparse}`);
 
           if (_isSparse || _searchBoxStillHasQuery) {
             logger.warn(`[playwright.agent] Goal achievement check: sparse content (${_longLines} long lines, ${_totalWords} words) — goal likely not achieved`);

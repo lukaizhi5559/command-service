@@ -735,12 +735,14 @@ NOTE: Prefer gh CLI for most GitHub operations — use browser only when CLI is 
 1. Navigate directly to search results: { "action": "navigate", "url": "https://www.youtube.com/results?search_query=<encoded_query>" }
 2. Wait for results to load: { "action": "waitForStableText" }
 3. Read search results: { "action": "getPageText" }
+4. Extract video links: { "action": "getPageLinks" }
 NOTE: Use /results?search_query= URL directly — it is more reliable than click+fill+Enter (avoids autocomplete dropdown timing issues). Encode spaces as + in the query.
 
 ### Watch Video (watch, play, view, open, specific video)
 1. Navigate to video URL: { "action": "navigate", "url": "<video_url>" }
 2. Wait for page to load: { "action": "waitForStableText" }
 3. Read video page content: { "action": "getPageText" }
+4. Extract video metadata and links: { "action": "getPageLinks" }
 
 ### Extract Video Content (watch and tell me about it, tell me about, tell me what, describe it, describe the video, explain it, give me a summary, watch and summarize, extract, steps, transcript, tutorial, learn, summarize, content, analyze)
 DELEGATE_TO: video.agent
@@ -3391,7 +3393,16 @@ When extracting page content with run-code, prioritize these selectors over gene
         const _isNavTask = /\b(goto|go to|navigate|click|open|visit|go back|return to|scroll|history|previous|close|dismiss)\b/.test(_taskLower);
         const _isResearchTask = /\b(search|find|look up|lookup|research|what is|summarize|compare|list|show me|tell me|fetch|get me)\b/.test(_taskLower);
         const _skipQualityGate = _isNavTask && !_isResearchTask;
-        if (_isSparse && !_skipQualityGate) {
+        // Check if we have video links or comprehensive content extracted - if so, don't fail on sparse content
+        const _hasVideoLinks = agentResult?.transcript?.some(step => 
+          step.action === 'getPageLinks' && step.result && step.result.length > 0
+        );
+        const _hasExtractedContent = agentResult?.transcript?.some(step =>
+          step.action === 'extractContent' && step.result && 
+          (step.result.text || step.result.links) && 
+          ((step.result.text?.length || 0) > 100 || (step.result.links?.length || 0) > 0)
+        );
+        if (_isSparse && !_skipQualityGate && !_hasVideoLinks && !_hasExtractedContent) {
           logger.warn(`[browser.agent] Research quality gate: sparse content for ${agentId} (longLines=${_longLines}, totalWords=${_totalWords}) — marking researchContentEmpty`);
           return {
             ok: false,
