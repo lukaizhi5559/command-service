@@ -48,6 +48,7 @@ const fs     = require('fs');
 const { spawn, exec } = require('child_process');
 const logger = require('../logger.cjs');
 const { askWithMessages } = require('../skill-helpers/skill-llm.cjs');
+const shellRun = require('./shell.run.cjs');
 
 // Generic debugging control for all playwright-cli tools
 const playwrightDebugEnabled = process.env.PLAYWRIGHT_DEBUG === 'true' || 
@@ -1725,6 +1726,47 @@ async function browserAct(args) {
           chromeCrash: true,
           debugContext
         };
+      }
+      
+      // ── Auto-fallback to shell.run with playwright-cli ────────────────────
+      // If browser action fails (not Chrome crash), try shell.run as fallback
+      // This helps with YouTube extraction and other challenging scenarios
+      if (!crashInfo.crashDetected && !res.ok) {
+        logger.info(`[browser.act] Attempting fallback to shell.run for action: ${action}`);
+        
+        try {
+          // Build playwright-cli command from session flags and command args
+          const playwrightCmd = [
+            'playwright-cli',
+            '--session', sessionId,
+            ...(headed ? [] : ['--headless']),
+            ...cmdArgs
+          ].join(' ');
+          
+          const fallbackResult = await shellRun.run({
+            command: playwrightCmd,
+            timeout: timeoutMs + 10000, // Extra timeout for fallback
+            workingDir: process.cwd()
+          });
+          
+          if (fallbackResult.ok) {
+            logger.info(`[browser.act] shell.run fallback succeeded for action: ${action}`);
+            return {
+              ok: true,
+              action,
+              sessionId,
+              result: (fallbackResult.stdout || '').trim() || undefined,
+              stdout: fallbackResult.stdout,
+              executionTime: executionTime + (fallbackResult.executionTime || 0),
+              fallback: 'shell.run',
+              error: undefined
+            };
+          } else {
+            logger.warn(`[browser.act] shell.run fallback failed: ${fallbackResult.error || fallbackResult.stderr}`);
+          }
+        } catch (fallbackError) {
+          logger.error(`[browser.act] shell.run fallback error: ${fallbackError.message}`);
+        }
       }
     }
     
