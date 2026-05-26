@@ -84,11 +84,42 @@ function httpPost(host, port, urlPath, body, timeoutMs) {
 }
 
 async function imageAnalyze(args = {}) {
-  let { filePath, query } = args;
+  let { filePath, query, priorContracts } = args;
   const timeoutMs = Math.min(MAX_TIMEOUT, Math.max(5000, parseInt(args.timeoutMs || DEFAULT_TIMEOUT, 10)));
 
+  // Auto-discover filePath from prior step contracts if not provided
+  if (!filePath && priorContracts && Array.isArray(priorContracts) && priorContracts.length > 0) {
+    for (let i = priorContracts.length - 1; i >= 0; i--) {
+      const contract = priorContracts[i];
+
+      // Look for image files in shell.run stdout
+      if (contract.skill === 'shell.run' && contract.outputs?.filePaths?.value?.length > 0) {
+        const imagePath = contract.outputs.filePaths.value.find(p =>
+          /\.(png|jpg|jpeg|gif|webp|bmp|tiff|heic)$/i.test(p)
+        );
+        if (imagePath) {
+          filePath = imagePath;
+          logger.info(`[image.analyze] Auto-discovered filePath from prior shell.run: ${filePath}`);
+          break;
+        }
+      }
+
+      // Look for image files in fs.read results
+      if (contract.skill === 'fs.read' && contract.outputs?.files?.value?.length > 0) {
+        const imagePath = contract.outputs.files.value.find(f =>
+          /\.(png|jpg|jpeg|gif|webp|bmp|tiff|heic)$/i.test(f)
+        );
+        if (imagePath) {
+          filePath = imagePath;
+          logger.info(`[image.analyze] Auto-discovered filePath from prior fs.read: ${filePath}`);
+          break;
+        }
+      }
+    }
+  }
+
   if (!filePath) {
-    return { success: false, error: 'filePath is required — provide the absolute path to the image file' };
+    return { success: false, error: 'filePath is required — provide the absolute path to the image file, or pass priorContracts to auto-discover' };
   }
 
   const ext = path.extname(filePath).toLowerCase();
@@ -243,4 +274,29 @@ async function imageAnalyze(args = {}) {
   };
 }
 
-module.exports = { imageAnalyze };
+/**
+ * Generate an output contract for this skill's execution result.
+ */
+function getOutputContract(result) {
+  if (!result) return null;
+
+  return {
+    skill: 'image.analyze',
+    timestamp: Date.now(),
+    success: result.success === true,
+    summary: result.success
+      ? `Image analysis completed (${result.provider || 'unknown'})`
+      : `Image analysis failed: ${result.error || 'Unknown error'}`,
+    outputs: {
+      analysis: { type: 'text', value: result.answer || result.description || '' },
+      filePath: { type: 'text', value: result.filePath || '' },
+      provider: { type: 'text', value: result.provider || '' },
+      confidence: { type: 'number', value: result.confidence || null }
+    },
+    error: result.success ? undefined : {
+      message: result.error || 'Image analysis failed'
+    }
+  };
+}
+
+module.exports = { imageAnalyze, getOutputContract };

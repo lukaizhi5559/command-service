@@ -543,6 +543,46 @@ function _isCommandAllowed(baseName) {
   return ALLOWED_COMMANDS.has(baseName) || USER_ALLOWED_COMMANDS.has(baseName);
 }
 
+/**
+ * Add a command to the user's allowlist.
+ * @param {string} commandName - The command to add
+ * @returns {boolean} - True if successfully added
+ */
+function addCommandToAllowlist(commandName) {
+  try {
+    _refreshUserAllowedCommandsIfNeeded();
+    const normalized = path.basename(commandName.trim());
+    if (!normalized) return false;
+
+    // Add to in-memory set
+    USER_ALLOWED_COMMANDS.add(normalized);
+
+    // Persist to file
+    const existing = _loadUserAllowedCommands();
+    existing.add(normalized);
+
+    const data = {
+      commands: Array.from(existing),
+      updatedAt: new Date().toISOString()
+    };
+
+    // Ensure directory exists
+    const dir = path.dirname(USER_ALLOWLIST_PATH);
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
+    }
+
+    fs.writeFileSync(USER_ALLOWLIST_PATH, JSON.stringify(data, null, 2), 'utf8');
+    USER_ALLOWLIST_MTIME_MS = fs.statSync(USER_ALLOWLIST_PATH).mtimeMs;
+
+    logger.info(`[shell.run] Added '${normalized}' to user allowlist`);
+    return true;
+  } catch (err) {
+    logger.warn(`[shell.run] Failed to add command to allowlist: ${err.message}`);
+    return false;
+  }
+}
+
 // Commands that are always available — no opt-in required.
 // All standard terminal operations are enabled by default.
 const DANGEROUS_COMMANDS = new Set([
@@ -784,12 +824,16 @@ function validate(args) {
   const baseName = path.basename(cmd);
 
   if (!_isCommandAllowed(baseName)) {
+    // Return askUser response for unknown commands
+    // This triggers the ASK_USER flow in the UI
     return {
       ok: false,
-      error: `Command not allowed: "${baseName}". Add it to your trusted allowlist to proceed.`,
-      userAllowlistHint: true,
+      askUser: true,
+      question: `The command '${baseName}' is not in the allowlist. Would you like to allow this command?`,
+      options: ['Yes, add to allowlist and run', 'Yes, run once without adding', 'No, skip this step'],
       commandName: baseName,
       userAllowlistPath: USER_ALLOWLIST_PATH,
+      _isShellAllowlist: true,  // Marker for executeCommand to handle specially
     };
   }
 
@@ -1157,4 +1201,54 @@ async function shellRun(args) {
   };
 }
 
-module.exports = { shellRun, validate, ALLOWED_COMMANDS, DANGEROUS_COMMANDS };
+/**
+ * Generate an output contract for this skill's execution result.
+ * This allows downstream steps to understand what this step produced.
+ */
+function getOutputContract(result) {
+  if (!result) return null;
+
+  // Extract file paths from stdout
+  const filePaths = [];
+  if (result.stdout && typeof result.stdout === 'string') {
+    // Match absolute paths: /Users/name/... or ~/...
+    const pathPatterns = [
+      /(?:^|\s)(\/[^\s\n]+\.\w+)(?=\s|$)/gm,
+      /(?:^|\s)(~\/[^\s\n]+\.\w+)(?=\s|$)/gm,
+      /"([^"]+\.\w+)"/g,
+      /'([^']+\.\w+)'/g
+    ];
+
+    for (const pattern of pathPatterns) {
+      let match;
+      while ((match = pattern.exec(result.stdout)) !== null) {
+        const path = match[1] || match[0];
+        if (path && !filePaths.includes(path)) {
+          filePaths.push(path);
+        }
+      }
+    }
+  }
+
+  return {
+    skill: 'shell.run',
+    timestamp: Date.now(),
+    success: result.ok === true,
+    summary: result.ok
+      ? `Shell command '${result.cmd}' completed (exit ${result.exitCode})`
+      : `Shell command '${result.cmd}' failed (exit ${result.exitCode})`,
+    outputs: {
+      stdout: { type: 'text', value: result.stdout || '' },
+      stderr: { type: 'text', value: result.stderr || '' },
+      exitCode: { type: 'number', value: result.exitCode ?? null },
+      filePaths: { type: 'array', value: filePaths },
+      cmd: { type: 'text', value: result.cmd || '' }
+    },
+    error: result.ok ? undefined : {
+      message: result.error || 'Command failed',
+      exitCode: result.exitCode
+    }
+  };
+}
+
+module.exports = { shellRun, validate, getOutputContract, addCommandToAllowlist, ALLOWED_COMMANDS, DANGEROUS_COMMANDS };

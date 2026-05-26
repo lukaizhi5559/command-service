@@ -562,19 +562,6 @@ function getDebuggingContext(sessionId, failedStep) {
   };
 }
 
-// Export for use by playwright.agent and other debugging tools
-module.exports = { 
-  browserAct, 
-  getDebuggingContext,
-  captureDebugContext,
-  stopSessionTracing,
-  debuggingSessions: debuggingSessions,
-  killExistingChromeForProfile,
-  clearProfileLock,
-  findCli,
-  shortSessionId,
-};
-
 // ---------------------------------------------------------------------------
 // Auth form loop — LLM prompt used by waitForAuth agentic fill
 // ---------------------------------------------------------------------------
@@ -621,6 +608,26 @@ function findCli() {
 const CLI_BIN = findCli();
 logger.info(`[browser.act] playwright-cli binary: ${CLI_BIN}`);
 
+// Check if playwright-cli is actually available
+const PLAYWRIGHT_CLI_AVAILABLE = (() => {
+  try {
+    // Check if binary exists and is executable
+    const fs = require('fs');
+    const isBinary = CLI_BIN.startsWith('/') || CLI_BIN.startsWith('\\');
+    if (isBinary) {
+      fs.accessSync(CLI_BIN, fs.constants.X_OK);
+    }
+    // Try a quick version check
+    const { execSync } = require('child_process');
+    execSync(`${CLI_BIN} --version`, { timeout: 5000, stdio: 'pipe' });
+    logger.info('[browser.act] playwright-cli is available and working');
+    return true;
+  } catch (err) {
+    logger.warn(`[browser.act] playwright-cli not available: ${err.message}`);
+    return false;
+  }
+})();
+
 // ---------------------------------------------------------------------------
 // Core executor — runs playwright-cli with given args
 // Returns: { ok, stdout, stderr, exitCode, executionTime }
@@ -629,6 +636,22 @@ logger.info(`[browser.act] playwright-cli binary: ${CLI_BIN}`);
 function cliRun(args, timeoutMs = 15000) {
   return new Promise((resolve) => {
     const start = Date.now();
+
+    // ── Check playwright-cli availability ────────────────────────────────────
+    if (!PLAYWRIGHT_CLI_AVAILABLE) {
+      logger.error('[browser.act] playwright-cli is not available - cannot execute browser actions');
+      resolve({
+        ok: false,
+        stdout: '',
+        stderr: 'playwright-cli is not installed or not executable',
+        exitCode: -1,
+        executionTime: 0,
+        error: 'playwright-cli is not available. Please install with: brew install playwright-cli',
+        playwrightCliMissing: true
+      });
+      return;
+    }
+
     let stdout = '';
     let stderr = '';
     let resolved = false;
@@ -4544,3 +4567,17 @@ function parseSnapshotToElements(snapshotText) {
   }
   return elements;
 }
+
+// Export for use by playwright.agent and other debugging tools
+module.exports = { 
+  browserAct, 
+  getDebuggingContext,
+  captureDebugContext,
+  stopSessionTracing,
+  debuggingSessions: debuggingSessions,
+  killExistingChromeForProfile,
+  clearProfileLock,
+  findCli,
+  shortSessionId,
+  PLAYWRIGHT_CLI_AVAILABLE,
+};

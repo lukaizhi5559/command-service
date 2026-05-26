@@ -649,4 +649,47 @@ async function fsRead(args) {
   return { ...result, action };
 }
 
-module.exports = { fsRead };
+/**
+ * Generate an output contract for this skill's execution result.
+ */
+function getOutputContract(result) {
+  if (!result) return null;
+
+  // Extract files from different action types
+  let files = [];
+  if (result.files && Array.isArray(result.files)) {
+    files = result.files.map(f => f.path || f).filter(Boolean);
+  } else if (result.tree && typeof result.tree === 'string') {
+    // Parse tree output for file names
+    const lines = result.tree.split('\n');
+    for (const line of lines) {
+      const name = line.replace(/^[│├└─\s]+/, '').replace(/\s*\([\d.]+[KMB]+\)\s*$/, '').trim();
+      if (name && !name.endsWith('/')) {
+        files.push(name);
+      }
+    }
+  } else if (result.matches && Array.isArray(result.matches)) {
+    files = result.matches.map(m => m.path || m).filter(Boolean);
+  }
+
+  return {
+    skill: 'fs.read',
+    timestamp: Date.now(),
+    success: result.ok === true,
+    summary: result.ok
+      ? `File system ${result.action} completed`
+      : `File system ${result.action} failed`,
+    outputs: {
+      files: { type: 'array', value: files },
+      tree: { type: 'text', value: result.tree || '' },
+      content: { type: 'text', value: result.content || result.stdout || '' },
+      action: { type: 'text', value: result.action || '' },
+      path: { type: 'text', value: result.path || '' }
+    },
+    error: result.ok ? undefined : {
+      message: result.error || 'fs.read failed'
+    }
+  };
+}
+
+module.exports = { fsRead, getOutputContract };

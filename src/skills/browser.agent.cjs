@@ -2171,11 +2171,36 @@ function callSkill(skillName, args, timeoutMs = 120000) {
   });
 }
 
-async function actionRun({ agentId, task, url, context, requiresAuth, skipAuth, _progressCallbackUrl, _stepIndex, _loginWallRetried = false }) {
+async function actionRun({ agentId, task, url, context, requiresAuth, skipAuth, _progressCallbackUrl, _stepIndex, _loginWallRetried = false, _emitThinking = null }) {
   if (!agentId) return { ok: false, error: 'agentId is required' };
   if (!task)    return { ok: false, error: 'task is required' };
 
   const _fs = require('fs');
+
+  // ── AGENT THINKING PHASE ─────────────────────────────────────────────────
+  // Emit thinking event to provide user insight into agent's reasoning process
+  const thinkingContext = {
+    agentId,
+    task: task.slice(0, 200),
+    hasUrl: !!url,
+    requiresAuth: !!requiresAuth,
+    timestamp: Date.now()
+  };
+
+  // Generate agent's initial reasoning about the task
+  const thinking = _generateAgentThinking('browser.agent', thinkingContext);
+
+  // Emit thinking event via callback if provided
+  if (typeof _emitThinking === 'function') {
+    _emitThinking({
+      type: 'agent:thinking',
+      agent: 'browser.agent',
+      agentId,
+      phase: 'preparation',
+      thought: thinking,
+      context: thinkingContext
+    });
+  }
 
   // If the caller passed a full-content buffer file from a prior pipeline step, append it to the task
   const _dataFile = context?._dataFile;
@@ -3828,5 +3853,45 @@ async function browserAgent(args) {
   }
 }
 
-module.exports = { browserAgent, KNOWN_BROWSER_SERVICES, actionDeleteAgent };
+// ---------------------------------------------------------------------------
+// Agent Thinking Helper — generates reasoning text for UI display
+// ---------------------------------------------------------------------------
+
+/**
+ * Generate agent thinking/reasoning text for user insight.
+ * This provides transparency into what the agent is about to do.
+ */
+function _generateAgentThinking(agentType, context) {
+  const { agentId, task, hasUrl, requiresAuth } = context;
+
+  const thoughts = [];
+
+  // Opening statement based on agent type
+  thoughts.push(`I'm ${agentType} preparing to execute a task.`);
+
+  // Task analysis
+  if (task) {
+    const taskSummary = task.length > 100 ? task.slice(0, 100) + '...' : task;
+    thoughts.push(`Task: "${taskSummary}"`);
+  }
+
+  // URL context
+  if (hasUrl) {
+    thoughts.push(`I'll navigate to the specified URL.`);
+  } else if (agentId) {
+    thoughts.push(`I'll work with the ${agentId} agent configuration.`);
+  }
+
+  // Auth consideration
+  if (requiresAuth) {
+    thoughts.push(`Authentication may be required — I'll check for login pages.`);
+  }
+
+  // Plan statement
+  thoughts.push(`My approach: analyze the page, identify elements, and execute the task step by step.`);
+
+  return thoughts.join(' ');
+}
+
+module.exports = { browserAgent, KNOWN_BROWSER_SERVICES, actionDeleteAgent, _generateAgentThinking };
 module.exports._deriveAgentType = deriveAgentType;
