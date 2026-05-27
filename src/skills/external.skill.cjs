@@ -51,9 +51,9 @@ function validateExecPath(execPath) {
 }
 
 /**
- * Fallback for creator-built skills: checks ~/.thinkdrop/skills/<dotName>/index.cjs
- * which skillCreator copies to when registering. Works even when user-memory is
- * unavailable or returns UNAUTHORIZED.
+ * Fallback for creator-built skills: checks ~/.thinkdrop/skills/<dotName>/
+ * for index.py (Python) first, then index.cjs (Node.js).
+ * Works even when user-memory is unavailable or returns UNAUTHORIZED.
  * Tries both dot-notation (gmail.daily) and kebab-notation (gmail-daily) as dir names.
  */
 async function fetchSkillRecordFromUserSkillsDir(name) {
@@ -63,13 +63,27 @@ async function fetchSkillRecordFromUserSkillsDir(name) {
       name.replace(/\./g, '_'),      // gmail_daily   (underscore — canonical dir name)
       name.replace(/\./g, '-'),      // gmail-daily   (kebab fallback)
     ];
+    // Check for Python skills first, then Node.js
     for (const candidate of candidates) {
-      const skillPath = path.join(SKILLS_BASE_DIR, candidate, 'index.cjs');
-      if (fs.existsSync(skillPath)) {
-        logger.info(`[external.skill] Found creator skill at ${skillPath}`);
+      const pythonPath = path.join(SKILLS_BASE_DIR, candidate, 'index.py');
+      if (fs.existsSync(pythonPath)) {
+        logger.info(`[external.skill] Found Python skill at ${pythonPath}`);
         return {
           name,
-          execPath: skillPath,
+          execPath: pythonPath,
+          execType: 'python',
+          enabled: true,
+          source: 'user-skills-dir',
+        };
+      }
+    }
+    for (const candidate of candidates) {
+      const nodePath = path.join(SKILLS_BASE_DIR, candidate, 'index.cjs');
+      if (fs.existsSync(nodePath)) {
+        logger.info(`[external.skill] Found Node.js skill at ${nodePath}`);
+        return {
+          name,
+          execPath: nodePath,
           execType: 'node',
           enabled: true,
           source: 'user-skills-dir',
@@ -248,6 +262,67 @@ async function runShellSkill(execPath, args, timeoutMs) {
     child.on('error', (err) => {
       clearTimeout(timer);
       reject(err);
+    });
+  });
+}
+
+/**
+ * Run a Python skill by spawning python3 process with JSON args via stdin
+ */
+async function runPythonSkill(execPath, args, timeoutMs, context) {
+  return new Promise((resolve, reject) => {
+    const argsJson = JSON.stringify(args || {});
+    const contextJson = JSON.stringify({
+      logger: { info: () => {}, warn: () => {}, error: () => {}, debug: () => {} },
+      secrets: context?.secrets || {},
+      skillName: context?.skillName || 'python-skill',
+      db: context?.db || null
+    });
+
+    const child = spawn('python3', [execPath], {
+      env: { ...process.env, SKILL_CONTEXT: contextJson },
+      killSignal: 'SIGTERM'
+    });
+
+    let stdout = '';
+    let stderr = '';
+
+    child.stdout.on('data', (d) => { stdout += d.toString(); });
+    child.stderr.on('data', (d) => { stderr += d.toString(); });
+
+    // Send args as JSON via stdin
+    child.stdin.write(argsJson);
+    child.stdin.end();
+
+    const timer = setTimeout(() => {
+      child.kill('SIGTERM');
+      reject(new Error(`Python skill timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+
+    child.on('close', (code) => {
+      clearTimeout(timer);
+      try {
+        // Try to parse stdout as JSON (expected format: { ok: true/false, output/error: ... })
+        const result = JSON.parse(stdout.trim());
+        resolve(result);
+      } catch (e) {
+        // If not valid JSON, treat as plain text output
+        if (code === 0) {
+          resolve({ ok: true, output: stdout.trim() });
+        } else {
+          resolve({ ok: false, error: stderr.trim() || stdout.trim() || 'Python skill failed' });
+        }
+      }
+    });
+
+    child.on('error', (err) => {
+      clearTimeout(timer);
+      // If python3 not found, return clear error
+      if (err.message?.includes('ENOENT')) {
+        resolve({ ok: false, error: 'Python3 not found. Please install Python 3 to run this skill.' });
+      } else {
+        reject(err);
+      }
     });
   });
 }
@@ -689,12 +764,14 @@ async function run(args) {
       };
     } else if (execType === 'project') {
       result = await runProjectSkill(resolvedPath, mergedSkillArgs, timeoutMs, name);
+    } else if (execType === 'python') {
+      result = await runPythonSkill(resolvedPath, mergedSkillArgs, timeoutMs, context);
     } else if (execType === 'node') {
       result = await runNodeSkill(resolvedPath, mergedSkillArgs, timeoutMs, context);
     } else if (execType === 'shell') {
       result = await runShellSkill(resolvedPath, mergedSkillArgs, timeoutMs);
     } else {
-      return { ok: false, skillName: name, error: `Unknown exec_type "${execType}". Must be "node", "shell", or "project".` };
+      return { ok: false, skillName: name, error: `Unknown exec_type "${execType}". Must be "python", "node", "shell", or "project".` };
     }
 
     // If the skill itself returned ok:false with a non-trivial error, report it as a potential

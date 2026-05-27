@@ -157,9 +157,9 @@ async function scanAll(logger) {
   const invalidSkills = [];
 
   for (const sk of skills) {
-    const detailRes = await mcpPost('skill.get', { name: sk.name });
-    const skill = detailRes?.data;
-    if (!skill) { missing++; continue; }
+    // contractMd is now included in skill.list response — no need for a per-skill skill.get call
+    const skill = sk.contractMd !== undefined ? sk : null;
+    if (!skill || !skill.execPath) { missing++; continue; }
 
     // ── Disk-sync: disk is the source of truth for .md contract skills ────────
     // If the on-disk skill.md differs from the DB's contract_md, sync DB from disk.
@@ -184,12 +184,6 @@ async function scanAll(logger) {
 
     if (ok) {
       healthy++;
-      await mcpPost('skill.health.upsert', {
-        skillName: sk.name,
-        status: 'ok',
-        errors: null,
-        autoRepaired: false,
-      });
     } else {
       invalid++;
       invalidSkills.push({ name: sk.name, errors });

@@ -410,15 +410,13 @@ async function syncScheduledSkills() {
     const skillName = row.name;
     if (!skillName) continue;
 
-    // 2. Fetch full skill to get contract_md with schedule
-    const getRes = await mcpPost(MEMORY_SERVICE_PORT, '/skill.get', { name: skillName }, 'skill.get');
-    const full = getRes?.data || null;
-    const fm = parseFrontmatter(full?.contractMd || '');
+    // 2. Parse schedule from contractMd already included in skill.list response
+    const fm = parseFrontmatter(row.contractMd || '');
     const schedule = fm.schedule || 'on_demand';
 
     if (!schedule || schedule === 'on_demand' || schedule === 'null' || schedule === 'false' || schedule === 'none') continue;
 
-    const execPath = full?.execPath || row.execPath || path.join(os.homedir(), '.thinkdrop', 'skills', skillName, 'index.cjs');
+    const execPath = row.execPath || path.join(os.homedir(), '.thinkdrop', 'skills', skillName, 'index.cjs');
     const cronId   = `skill_${skillName.replace(/\./g, '_')}`;
     activeCronIds.add(cronId);
 
