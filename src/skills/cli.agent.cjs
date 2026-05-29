@@ -646,8 +646,28 @@ Every CLI failure belongs to one of 5 categories. Identify the category from the
   Probe:   run_shell: curl -sI '<url>' 2>&1 | head -5  OR  <cli> whoami 2>&1  OR  <cli> auth status 2>&1
   Fix:     surface the specific finding to the user with ask_user — include what the probe returned.
 
+**Category F — Interactive TUI / requires PTY (terminal emulator)**
+  Signals: "No tty detected", "interactive terminal required", "not a tty", "requires a terminal", "must be run in a terminal", "isatty"
+  Root cause: The tool calls isatty() at the OS level. NO flag (-t, --tty, --no-tty, --force-tty, --batch) can bypass a missing PTY — these flags change rendering mode only, not whether a PTY exists.
+  DO NOT: retry with -t or --no-tty — both will fail with the same error. DO NOT: use ask_user for this.
+
+  Step F-1 (MANDATORY — skip ALL flag retries):
+    Output run_shell immediately with a non-interactive equivalent that achieves the same goal:
+    - System resource monitor / top processes: run_shell "top -l 1 -n 10 -o cpu 2>/dev/null | head -30 || ps aux --sort=-%cpu | head -15"
+    - Disk usage: run_shell "df -h && du -sh /* 2>/dev/null | sort -rh | head -20"
+    - Memory stats: run_shell "vm_stat 2>/dev/null || free -h 2>/dev/null"
+    - Network stats: run_shell "netstat -an | head -30 || ss -tuln | head -20"
+    - If the tool has a --once, --batch, or --export flag: try run_cmd with that flag instead of run_shell.
+
+  Step F-2: After run_shell succeeds, call done with the output — the task is complete.
+    If run_shell also fails: call done with a clear explanation:
+    "This tool requires an interactive terminal (PTY) and cannot run in the automation environment. Here is equivalent data from system utilities: [any partial output]"
+
+  NEVER use ask_user for "No tty detected" — it is a fixed environment constraint, not a user decision.
+  NEVER retry run_cmd with tty-related flags after seeing this error even once.
+
 **ORDERING RULE:**
-1. Read the error signal → identify category A/B/C/D/E
+1. Read the error signal → identify category A/B/C/D/E/F
 2. Run the cheapest probe that confirms the hypothesis (1 run_shell turn)
 3. Apply the category fix
 4. Only escalate to ask_user after probe confirms the problem cannot be self-resolved
@@ -911,6 +931,24 @@ async function actionRun({ cli, argv = [], cwd, env, timeoutMs, stdin, agentId, 
     let currentBinPath = binPath;
     let loopMeta = null; // lazy-loaded on first run_update
 
+    // ── Resume context injection ──────────────────────────────────────────────
+    // When main.js resumes after an ask_user pause, it appends a [Resume context:]
+    // block to the task string. Parse it and pre-populate loopHistory with a
+    // synthetic prior turn so the LLM doesn't restart from turn 1 and repeat
+    // the same failed probe sequence it already ran before pausing.
+    const _resumeMatch = effectiveTask.match(/\[Resume context: You previously asked "(.+?)"\. The user answered: "(.+?)"\. Continue from this point based on the user's answer\.\]/s);
+    if (_resumeMatch) {
+      const _priorQuestion = _resumeMatch[1];
+      const _userAnswer    = _resumeMatch[2];
+      loopHistory.push({
+        turn: 1,
+        action: 'ask_user',
+        question: _priorQuestion,
+        observation: `User answered: "${_userAnswer}". Continue from this point — do NOT repeat previous diagnostic attempts. Apply the user's answer directly.`,
+      });
+      logger.info(`[cli.agent] resume context detected for ${agentId} — pre-seeded loopHistory with prior ask_user + user answer`, { agentId });
+    }
+
     // Load per-agent learned rules (saved by past ask_user save_rule events).
     // Falls back to [] silently if user-memory service is unavailable.
     const skillDb = require('../skill-helpers/skill-db.cjs');
@@ -939,8 +977,10 @@ async function actionRun({ cli, argv = [], cwd, env, timeoutMs, stdin, agentId, 
       }
     }
 
-    // Use effectiveTask (with pre_step token injections) as the loop task
-    const loopTask = effectiveTask;
+    // Use effectiveTask (with pre_step token injections) as the loop task.
+    // Strip any [Resume context: ...] suffix — it's already pre-seeded into loopHistory
+    // as a synthetic turn above, so including it in the task string would be redundant.
+    const loopTask = effectiveTask.replace(/\s*\[Resume context:[\s\S]*?\]\s*$/, '').trim();
 
     let _authAttempted = false; // prevents infinite auto-auth retry within the agentic loop
 

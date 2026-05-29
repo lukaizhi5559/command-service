@@ -3387,9 +3387,9 @@ If no videos found, return []. Do not explain, only output the JSON array.`;
           const wordCount = cur.split(/\s+/).filter(w => w.length > 0).length;
           if (wordCount < 20 && !cur.includes('about:blank')) {
             logger.debug(`[browser.act] waitForStableText: skeleton content detected (${wordCount} words), continuing wait...`);
-            stableCount = 0; // Reset - skeleton is not "stable enough"
+            nearStableCount = 0; // Reset - skeleton is not "stable enough"
             prev = cur;
-            await new Promise(r => setTimeout(r, checkInterval));
+            await new Promise(r => setTimeout(r, 800));
             continue;
           }
 

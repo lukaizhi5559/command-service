@@ -2024,7 +2024,7 @@ async function playwrightAgent(args) {
           // Enhanced logging for debugging
           logger.info(`[playwright.agent] Content quality analysis: longLines=${_longLines}, totalWords=${_totalWords}, structured=${_hasStructuredContent}, navigation=${_hasNavigationElements}, interactive=${_hasInteractiveElements}, resultContainers=${_hasResultContainers}, isSparse=${_isSparse}`);
 
-          if (_isSparse || _searchBoxStillHasQuery) {
+          if (_isSparse || (_searchBoxStillHasQuery && !_hasResultContainers)) {
             logger.warn(`[playwright.agent] Goal achievement check: sparse content (${_longLines} long lines, ${_totalWords} words) — goal likely not achieved`);
             totalRepairs++;
 
