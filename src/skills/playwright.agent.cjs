@@ -1471,6 +1471,51 @@ async function playwrightAgent(args) {
         outcome = { ok: false, error: err.message };
       }
 
+      // ── iframe fallback: retry in first visible iframe when main frame fails ──
+      // Sites like w3schools TryIt embed content in iframes; page.evaluate() runs
+      // in the main frame which may not have the DOM the LLM targeted.
+      const _iframeError = !outcome.ok && outcome.error &&
+        (/document is not defined|Cannot read properties of null|execution context was destroyed/i.test(outcome.error));
+      const _iframeEligible = _iframeError && ['evaluate', 'run-code', 'getPageText'].includes(step.action);
+      if (_iframeEligible) {
+        logger.info(`[playwright.agent] iframe fallback: "${step.action}" failed with "${outcome.error.slice(0, 60)}" — retrying inside first iframe`);
+        try {
+          let iframeCode;
+          if (step.action === 'getPageText') {
+            iframeCode = `async page => {
+              const frames = page.frames();
+              const contentFrame = frames.find(f => f !== page.mainFrame() && f.url() !== 'about:blank') || frames[1];
+              if (!contentFrame) return 'No iframe found';
+              return await contentFrame.evaluate(() => document.body ? document.body.innerText.substring(0, 50000) : '');
+            }`;
+          } else if (step.action === 'evaluate') {
+            iframeCode = `async page => {
+              const frames = page.frames();
+              const contentFrame = frames.find(f => f !== page.mainFrame() && f.url() !== 'about:blank') || frames[1];
+              if (!contentFrame) return 'No iframe found';
+              return await contentFrame.evaluate(() => ${step.text || 'document.title'});
+            }`;
+          } else {
+            // run-code: wrap user code to target first content iframe
+            const userCode = step.code || '';
+            iframeCode = `async page => {
+              const frames = page.frames();
+              const contentFrame = frames.find(f => f !== page.mainFrame() && f.url() !== 'about:blank') || frames[1];
+              if (!contentFrame) return 'No iframe found';
+              const iframeFn = ${userCode.replace(/^async\s*page\s*=>/, 'async frame =>')};
+              return await iframeFn(contentFrame);
+            }`;
+          }
+          const iframeOutcome = await browserAct({ action: 'run-code', code: iframeCode, sessionId, headed, timeoutMs });
+          if (iframeOutcome.ok) {
+            outcome = iframeOutcome;
+            logger.info(`[playwright.agent] iframe fallback succeeded: ${(outcome.result || '').length} chars`);
+          }
+        } catch (_iframeErr) {
+          logger.warn(`[playwright.agent] iframe fallback threw: ${_iframeErr.message}`);
+        }
+      }
+
       logger.info(`[playwright.agent] step ${stepIndex + 1} ok=${outcome.ok}${outcome.error ? ' err=' + outcome.error : ''}`);
       const thoughts = outcome.ok ? '' : (outcome.error || 'failed');
       transcript.push({ step: stepIndex + 1, action: step, outcome, thoughts });

@@ -68,6 +68,107 @@ const SERVICE_UNAVAILABLE_PATTERNS = [
 ];
 
 // ---------------------------------------------------------------------------
+// WALT: Build JavaScript extraction code for different extract types
+// ---------------------------------------------------------------------------
+function _buildExtractionCode(selector, extractType, extractOptions = {}) {
+  const escapedSelector = selector.replace(/"/g, '\\"');
+  const { dataAttr, attrName } = extractOptions;
+  
+  switch (extractType) {
+    case 'text':
+      return `(function() {
+        const el = document.querySelector("${escapedSelector}");
+        if (!el) return null;
+        return el.textContent.trim();
+      })()`;
+    case 'href':
+      return `(function() {
+        const el = document.querySelector("${escapedSelector}");
+        if (!el) return null;
+        return el.href || el.getAttribute('href') || null;
+      })()`;
+    case 'value':
+      return `(function() {
+        const el = document.querySelector("${escapedSelector}");
+        if (!el) return null;
+        return el.value || el.getAttribute('value') || null;
+      })()`;
+    case 'html':
+      return `(function() {
+        const el = document.querySelector("${escapedSelector}");
+        if (!el) return null;
+        return el.outerHTML;
+      })()`;
+    case 'src':
+      return `(function() {
+        const el = document.querySelector("${escapedSelector}");
+        if (!el) return null;
+        return el.src || el.getAttribute('src') || null;
+      })()`;
+    case 'data':
+      return `(function() {
+        const el = document.querySelector("${escapedSelector}");
+        if (!el) return null;
+        const dataAttr = "${dataAttr || 'id'}";
+        return el.getAttribute('data-' + dataAttr) || el.dataset[dataAttr] || null;
+      })()`;
+    case 'attr':
+      return `(function() {
+        const el = document.querySelector("${escapedSelector}");
+        if (!el) return null;
+        const attrName = "${attrName || 'id'}";
+        return el.getAttribute(attrName) || null;
+      })()`;
+    case 'json':
+      return `(function() {
+        const el = document.querySelector("${escapedSelector}");
+        if (!el) return null;
+        try {
+          const text = el.textContent.trim();
+          return JSON.parse(text);
+        } catch (e) {
+          return null;
+        }
+      })()`;
+    case 'table':
+      return `(function() {
+        const table = document.querySelector("${escapedSelector}");
+        if (!table) return null;
+        const rows = [];
+        const headers = [];
+        const ths = table.querySelectorAll('th');
+        ths.forEach(th => headers.push(th.textContent.trim()));
+        const trs = table.querySelectorAll('tr');
+        trs.forEach(tr => {
+          const tds = tr.querySelectorAll('td');
+          if (tds.length === 0) return;
+          const row = {};
+          tds.forEach((td, i) => {
+            const key = headers[i] || 'col' + i;
+            row[key] = td.textContent.trim();
+          });
+          rows.push(row);
+        });
+        return rows;
+      })()`;
+    case 'list':
+      return `(function() {
+        const el = document.querySelector("${escapedSelector}");
+        if (!el) return null;
+        const items = el.querySelectorAll('li');
+        if (items.length === 0) return [el.textContent.trim()];
+        return Array.from(items).map(li => li.textContent.trim());
+      })()`;
+    default:
+      return `(function() {
+        const el = document.querySelector("${escapedSelector}");
+        if (!el) return null;
+        return el.textContent.trim();
+      })()`;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // LLM-based auth detection prompt — semantic analysis of page content
 // ---------------------------------------------------------------------------
 const AUTH_CHECK_PROMPT = `You are analyzing a web page to determine if user authentication is required.
@@ -203,7 +304,9 @@ async function getDb() {
   try {
     const duckdbAsync = require('duckdb-async');
     _db = await duckdbAsync.Database.create(AGENTS_DB_PATH);
-  } catch {
+    logger.info(`[browser.agent] getDb: connected via duckdb-async to ${AGENTS_DB_PATH}`);
+  } catch (e1) {
+    logger.warn(`[browser.agent] getDb: duckdb-async failed: ${e1.message}`);
     try {
       const { Database } = require('duckdb');
       const raw = await new Promise((resolve, reject) => {
@@ -215,7 +318,11 @@ async function getDb() {
         get: (sql, ...p) => new Promise((res, rej) => { raw.get(sql, ...p, (e, row) => { if (e) rej(e); else res(row); }); }),
         close: () => new Promise((res) => raw.close(() => res())),
       };
-    } catch { return null; }
+      logger.info(`[browser.agent] getDb: connected via duckdb to ${AGENTS_DB_PATH}`);
+    } catch (e2) {
+      logger.error(`[browser.agent] getDb: both duckdb-async and duckdb failed. duckdb-async: ${e1.message}, duckdb: ${e2.message}`);
+      return null;
+    }
   }
   await _db.run(`CREATE TABLE IF NOT EXISTS agents (
     id TEXT PRIMARY KEY, type TEXT NOT NULL DEFAULT 'cli', service TEXT NOT NULL,
@@ -2612,200 +2719,256 @@ async function actionRun({ agentId, task, url, context, requiresAuth, skipAuth, 
       }
     }
 
-    // ── Close any existing playwright-cli daemon for this session ──────────
-    const _shortSid = shortSessionId(sessionId);
+    // ── Domain continuity check: skip restart if already on target ─────────
+    // Query user-memory to check if we're already on the target domain/page.
+    // If so, skip daemon restart, auth checks, and recipe waypoints entirely.
+    let _domainContinuitySkip = false;
+    let _currentBrowserUrl = null;
     try {
-      const { spawnSync } = require('child_process');
-      const _closeRes = spawnSync(findCli(), ['-s=' + _shortSid, 'close'], { timeout: 5000, encoding: 'utf8' });
-      if (_closeRes.status === 0) logger.info(`[browser.agent] closed existing playwright-cli daemon for session=${sessionId} (sid=${_shortSid})`);
-    } catch (_) {}
-
-    // ── Kill existing Chrome for this profile — prevents .sock EINVAL ──────
-    try {
-      const _killed = killExistingChromeForProfile(sessionId);
-      if (_killed) logger.info(`[browser.agent] killed existing Chrome for session=${sessionId}`);
-    } catch (_killErr) {
-      logger.warn(`[browser.agent] killExistingChromeForProfile error (non-fatal): ${_killErr.message}`);
+      const memHost = process.env.MEMORY_SERVICE_HOST || '127.0.0.1';
+      const memPort = parseInt(process.env.MEMORY_SERVICE_PORT || '3001', 10);
+      const memBody = JSON.stringify({
+        version: 'mcp.v1',
+        service: 'user-memory',
+        action: 'memory.getRecentOcr',
+        payload: { maxAgeSeconds: 15 },
+        context: { userId: 'local_user' }
+      });
+      const memRes = await new Promise((resolve, reject) => {
+        const http = require('http');
+        const req = http.request({ hostname: memHost, port: memPort, path: '/memory.getRecentOcr', method: 'POST', headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(memBody) }, timeout: 3000 }, res => { let raw = ''; res.on('data', c => raw += c); res.on('end', () => { try { resolve(JSON.parse(raw)); } catch (e) { resolve({}); } }); });
+        req.on('error', reject);
+        req.on('timeout', () => { req.destroy(); reject(new Error('timeout')); });
+        req.write(memBody);
+        req.end();
+      });
+      // MCP response format: { data: { available: true, capture: { url, appName, ... } } }
+      logger.debug(`[browser.agent] domain-continuity: raw memRes keys=${Object.keys(memRes || {}).join(',')}`);
+      const captureData = memRes?.data?.capture || memRes?.result?.capture;
+      const isAvailable = memRes?.data?.available || memRes?.result?.available;
+      logger.debug(`[browser.agent] domain-continuity: captureData=${!!captureData}, isAvailable=${isAvailable}`);
+      if (isAvailable && captureData?.url) {
+        _currentBrowserUrl = captureData.url;
+        const currentHostname = new URL(_currentBrowserUrl).hostname;
+        const startHostname = new URL(startUrl).hostname;
+        // Extract base domain (e.g., w3schools.com from www.w3schools.com or my-learning.w3schools.com)
+        const currentBaseDomain = currentHostname.split('.').slice(-2).join('.');
+        const startBaseDomain = startHostname.split('.').slice(-2).join('.');
+        logger.info(`[browser.agent] domain-continuity check: current=${currentHostname} (base: ${currentBaseDomain}) vs start=${startHostname} (base: ${startBaseDomain})`);
+        // If already on same base domain, skip restart
+        if (currentBaseDomain === startBaseDomain) {
+          _domainContinuitySkip = true;
+          logger.info(`[browser.agent] domain-continuity: MATCH - skipping browser restart`);
+        } else {
+          logger.info(`[browser.agent] domain-continuity: NO MATCH - will restart browser`);
+        }
+      } else {
+        logger.info(`[browser.agent] domain-continuity: no current browser URL available (available=${isAvailable}, hasUrl=${!!captureData?.url})`);
+      }
+    } catch (_memErr) {
+      logger.info(`[browser.agent] domain-continuity: user-memory query failed: ${_memErr.message}`);
     }
 
-    // ── Clear profile lock + crash markers so fresh launch succeeds ───────
-    try { clearProfileLock(sessionId); } catch (_) {}
+    // ── Skip browser restart if domain continuity detected ────────────────
+    if (!_domainContinuitySkip) {
+      // ── Close any existing playwright-cli daemon for this session ──────────
+      const _shortSid = shortSessionId(sessionId);
+      try {
+        const { spawnSync } = require('child_process');
+        const _closeRes = spawnSync(findCli(), ['-s=' + _shortSid, 'close'], { timeout: 5000, encoding: 'utf8' });
+        if (_closeRes.status === 0) logger.info(`[browser.agent] closed existing playwright-cli daemon for session=${sessionId} (sid=${_shortSid})`);
+      } catch (_) {}
 
-    // ── Stale .sock cleanup — prevents EINVAL on first navigate ──────────
-    try {
-      const _sockDir = path.join(os.tmpdir(), 'playwright-cli');
-      if (fs.existsSync(_sockDir)) {
-        const _sockFiles = fs.readdirSync(_sockDir, { recursive: true }).filter(f => String(f).endsWith('.sock') && (String(f).includes(sessionId) || String(f).includes(_shortSid)));
-        for (const sf of _sockFiles) {
-          try { fs.unlinkSync(path.join(_sockDir, String(sf))); logger.info(`[browser.agent] cleaned stale .sock: ${sf}`); } catch (_) {}
-        }
-      }
-    } catch (_) {}
-
-    // ── Helper: detect Chrome session conflict errors ─────────────────────
-    const _isChromeSessionConflict = (result) => {
-      const errStr = String(result?.error || result?.stderr || result?.stdout || '');
-      return /Opening in existing browser session/i.test(errStr) ||
-             /Failed to launch the browser process/i.test(errStr) ||
-             /EINVAL.*\.sock/i.test(errStr);
-    };
-
-    if (!_skipNavigate) try {
-      logger.info(`[browser.agent] run: playwright auth-check — navigating to ${startUrl} for ${agentId}`);
-      const _probeNav = await callBrowserAct({ action: 'navigate', sessionId, url: startUrl, timeoutMs: 30000 }, 35000);
-
-      // ── Chrome session conflict detection — fail fast ──────────────────
-      if (_isChromeSessionConflict(_probeNav)) {
-        logger.error(`[browser.agent] run: Chrome session conflict detected for ${agentId} — aborting (no retry)`);
-        return { ok: false, agentId, task, error: 'Browser session conflict: Chrome is already running with this profile. Close existing Chrome windows for this agent or restart the app.' };
+      // ── Kill existing Chrome for this profile — prevents .sock EINVAL ──────
+      try {
+        const _killed = killExistingChromeForProfile(sessionId);
+        if (_killed) logger.info(`[browser.agent] killed existing Chrome for session=${sessionId}`);
+      } catch (_killErr) {
+        logger.warn(`[browser.agent] killExistingChromeForProfile error (non-fatal): ${_killErr.message}`);
       }
 
-      if (_probeNav?.ok !== false) {
-        const _hrefRes = await callBrowserAct({ action: 'evaluate', text: 'window.location.href', sessionId, timeoutMs: 5000 }, 8000).catch((err) => {
-          logger.error(`[browser.agent] auth-check eval failed (fresh check): ${err.message}`);
-          return { ok: false, error: err.message };
-        });
+      // ── Clear profile lock + crash markers so fresh launch succeeds ───────
+      try { clearProfileLock(sessionId); } catch (_) {}
 
-        // ── Session health check: if eval also fails, browser is not running ──
-        if (_hrefRes?.ok === false || _isChromeSessionConflict(_hrefRes)) {
-          logger.error(`[browser.agent] run: browser session crashed for ${agentId} — flagging for retry`);
-          return {
-            ok: false,
-            chromeCrash: true,
-            agentId,
-            task,
-            error: 'Browser session crashed, will retry once',
-            result: null,
-            stdout: null,
-          };
+      // ── Stale .sock cleanup — prevents EINVAL on first navigate ──────────
+      try {
+        const _sockDir = path.join(os.tmpdir(), 'playwright-cli');
+        if (fs.existsSync(_sockDir)) {
+          const _sockFiles = fs.readdirSync(_sockDir, { recursive: true }).filter(f => String(f).endsWith('.sock') && (String(f).includes(sessionId) || String(f).includes(_shortSid)));
+          for (const sf of _sockFiles) {
+            try { fs.unlinkSync(path.join(_sockDir, String(sf))); logger.info(`[browser.agent] cleaned stale .sock: ${sf}`); } catch (_) {}
+          }
+        }
+      } catch (_) {}
+
+      // ── Helper: detect Chrome session conflict errors ─────────────────────
+      const _isChromeSessionConflict = (result) => {
+        const errStr = String(result?.error || result?.stderr || result?.stdout || '');
+        return /Opening in existing browser session/i.test(errStr) ||
+               /Failed to launch the browser process/i.test(errStr) ||
+               /EINVAL.*\.sock/i.test(errStr);
+      };
+
+      if (!_skipNavigate) try {
+        logger.info(`[browser.agent] run: playwright auth-check — navigating to ${startUrl} for ${agentId}`);
+        const _probeNav = await callBrowserAct({ action: 'navigate', sessionId, url: startUrl, timeoutMs: 30000 }, 35000);
+
+        // ── Chrome session conflict detection — fail fast ──────────────────
+        if (_isChromeSessionConflict(_probeNav)) {
+          logger.error(`[browser.agent] run: Chrome session conflict detected for ${agentId} — aborting (no retry)`);
+          return { ok: false, agentId, task, error: 'Browser session conflict: Chrome is already running with this profile. Close existing Chrome windows for this agent or restart the app.' };
         }
 
-        const _curHref = String(_hrefRes?.result ?? _hrefRes?.stdout ?? '').trim();
-        const _onLoginPage = _isSigninWall(_curHref);
-        // Also detect domain mismatch — e.g. redirect to workspace.google.com instead of mail.google.com
-        let _wrongDomain = false;
-        let _curHost = '';
-        try {
-          const _startHost = new URL(startUrl).hostname;
-          _curHost   = new URL(_curHref.match(/https?:\/\//) ? _curHref : `https://${_curHref}`).hostname;
-          _wrongDomain = !!_startHost && !!_curHost && _curHost !== _startHost;
-        } catch (_) {}
+        if (_probeNav?.ok !== false) {
+          const _hrefRes = await callBrowserAct({ action: 'evaluate', text: 'window.location.href', sessionId, timeoutMs: 5000 }, 8000).catch((err) => {
+            logger.error(`[browser.agent] auth-check eval failed (fresh check): ${err.message}`);
+            return { ok: false, error: err.message };
+          });
 
-        // ── Parking/squatter detection via live page content ───────────────────
-        // Checks page title + body text for broker/parking language. This is
-        // content-based (not a hostname list) so it catches any parking provider.
-        let _isParkingPage = false;
-        try {
-          const _pageInfoRes = await callBrowserAct({
-            action: 'evaluate',
-            text: `(() => {
-              const title = document.title || '';
-              const body   = (document.body && document.body.innerText) ? document.body.innerText.slice(0, 800) : '';
-              const links  = document.querySelectorAll('a').length;
-              return JSON.stringify({ title, body, links });
-            })()`,
-            sessionId,
-            timeoutMs: 5000,
-          }, 8000).catch(() => null);
-          if (_pageInfoRes?.ok !== false) {
-            const _pageInfo = (() => { try { return JSON.parse(_pageInfoRes?.result ?? '{}'); } catch (_) { return {}; } })();
-            const _pageText = `${_pageInfo.title || ''} ${_pageInfo.body || ''}`.toLowerCase();
-            const _PARKING_RE = /\bdomain\s+(for\s+sale|is\s+for\s+sale|available\s+for\s+sale)\b|\bbuy\s+this\s+domain\b|\bmake\s+an?\s+offer\b|\bparked\s+(by|domain|page)\b|\binquire\s+about\s+this\s+domain\b|\bthis\s+domain\s+(may\s+be|is)\s+(for\s+sale|available)\b/;
-            if (_PARKING_RE.test(_pageText) || (Number(_pageInfo.links) < 10 && /for\s+sale|buy|offer|domain/i.test(_pageText))) {
-              _isParkingPage = true;
-              logger.warn(`[browser.agent] run: parking/squatter content detected on ${_curHost} for ${agentId}`);
-            }
+          // ── Session health check: if eval also fails, browser is not running ──
+          if (_hrefRes?.ok === false || _isChromeSessionConflict(_hrefRes)) {
+            logger.error(`[browser.agent] run: browser session crashed for ${agentId} — flagging for retry`);
+            return {
+              ok: false,
+              chromeCrash: true,
+              agentId,
+              task,
+              error: 'Browser session crashed, will retry once',
+              result: null,
+              stdout: null,
+            };
+          }
 
-            // ── LLM-based auth detection — catches landing pages not detected by URL patterns ──
-            // If URL check passed but page content shows auth indicators (landing page, "sign in to continue", etc.)
-            // use LLM semantic analysis to confirm before skipping auth.
-            if (!_onLoginPage) {
-              // Quick keyword pre-filter to avoid unnecessary LLM calls
-              const _authIndicators = /sign\s*in|log\s*in|enter\s*your\s*email|workspace\s*not\s*found|where\s*should\s*we\s*begin|get\s*started|create\s*workspace|sign\s*in\s*to\s*continue/i;
-              if (_authIndicators.test(_pageText)) {
-                logger.info(`[browser.agent] Auth indicators found in page content, confirming with LLM...`);
-                const _llmDetected = await _detectAuthViaLLM(_pageInfo.title || '', _pageInfo.body || '', agentId);
-                if (_llmDetected) {
-                  _onLoginPage = true;
-                  logger.info(`[browser.agent] LLM confirmed auth required — treating as login page`);
+          const _curHref = String(_hrefRes?.result ?? _hrefRes?.stdout ?? '').trim();
+          const _onLoginPage = _isSigninWall(_curHref);
+          // Also detect domain mismatch — e.g. redirect to workspace.google.com instead of mail.google.com
+          let _wrongDomain = false;
+          let _curHost = '';
+          try {
+            const _startHost = new URL(startUrl).hostname;
+            _curHost   = new URL(_curHref.match(/https?:\/\//) ? _curHref : `https://${_curHref}`).hostname;
+            _wrongDomain = !!_startHost && !!_curHost && _curHost !== _startHost;
+          } catch (_) {}
+
+          // ── Parking/squatter detection via live page content ───────────────────
+          // Checks page title + body text for broker/parking language. This is
+          // content-based (not a hostname list) so it catches any parking provider.
+          let _isParkingPage = false;
+          try {
+            const _pageInfoRes = await callBrowserAct({
+              action: 'evaluate',
+              text: `(() => {
+                const title = document.title || '';
+                const body   = (document.body && document.body.innerText) ? document.body.innerText.slice(0, 800) : '';
+                const links  = document.querySelectorAll('a').length;
+                return JSON.stringify({ title, body, links });
+              })()`,
+              sessionId,
+              timeoutMs: 5000,
+            }, 8000).catch(() => null);
+            if (_pageInfoRes?.ok !== false) {
+              const _pageInfo = (() => { try { return JSON.parse(_pageInfoRes?.result ?? '{}'); } catch (_) { return {}; } })();
+              const _pageText = `${_pageInfo.title || ''} ${_pageInfo.body || ''}`.toLowerCase();
+              const _PARKING_RE = /\bdomain\s+(for\s+sale|is\s+for\s+sale|available\s+for\s+sale)\b|\bbuy\s+this\s+domain\b|\bmake\s+an?\s+offer\b|\bparked\s+(by|domain|page)\b|\binquire\s+about\s+this\s+domain\b|\bthis\s+domain\s+(may\s+be|is)\s+(for\s+sale|available)\b/;
+              if (_PARKING_RE.test(_pageText) || (Number(_pageInfo.links) < 10 && /for\s+sale|buy|offer|domain/i.test(_pageText))) {
+                _isParkingPage = true;
+                logger.warn(`[browser.agent] run: parking/squatter content detected on ${_curHost} for ${agentId}`);
+              }
+
+              // ── LLM-based auth detection — catches landing pages not detected by URL patterns ──
+              // If URL check passed but page content shows auth indicators (landing page, "sign in to continue", etc.)
+              // use LLM semantic analysis to confirm before skipping auth.
+              if (!_onLoginPage) {
+                // Quick keyword pre-filter to avoid unnecessary LLM calls
+                const _authIndicators = /sign\s*in|log\s*in|enter\s*your\s*email|workspace\s*not\s+found|where\s+should\s+we\s+begin|get\s+started|create\s+workspace|sign\s*in\s*to\s*continue/i;
+                if (_authIndicators.test(_pageText)) {
+                  logger.info(`[browser.agent] Auth indicators found in page content, confirming with LLM...`);
+                  const _llmDetected = await _detectAuthViaLLM(_pageInfo.title || '', _pageInfo.body || '', agentId);
+                  if (_llmDetected) {
+                    _onLoginPage = true;
+                    logger.info(`[browser.agent] LLM confirmed auth required — treating as login page`);
+                  }
                 }
               }
             }
-          }
-        } catch (_pageErr) {
-          logger.warn(`[browser.agent] run: parking content check failed (non-fatal): ${_pageErr.message}`);
-        }
-
-        // ── Internal web.agent self-heal ───────────────────────────────────────
-        // Trigger on: (a) domain mismatch OR (b) parking content detected on any domain.
-        // For domain mismatch that is NOT a parking page (e.g. workspace.google.com for mail.google.com),
-        // web.agent is tried first but if it finds nothing we fall through to waitForAuth — no regression.
-        const _needsHeal = _wrongDomain || _isParkingPage;
-        if (_needsHeal && !_onLoginPage) {
-          const _svcName = existing?.service || agentId.replace('.agent', '');
-          const _healReason = _isParkingPage ? `parking content on ${_curHost}` : `domain mismatch (expected ${(() => { try { return new URL(startUrl).hostname; } catch(_){return startUrl;} })()}, got ${_curHost})`;
-          logger.warn(`[browser.agent] run: ${_healReason} — attempting web.agent self-heal for ${agentId}`);
-          let _healedUrl = null;
-          try {
-            const _webResult = await callSkill('web.agent', {
-              action: 'search_and_navigate',
-              query: `${_svcName} official website`,
-              preferDomain: _svcName,
-            }, 10000);
-            if (_webResult?.ok && _webResult?.bestUrl) {
-              _healedUrl = _webResult.bestUrl;
-              logger.info(`[browser.agent] self-heal: web.agent found ${_healedUrl} for ${agentId}`);
-            }
-          } catch (_healErr) {
-            logger.warn(`[browser.agent] self-heal: web.agent call failed: ${_healErr.message}`);
+          } catch (_pageErr) {
+            logger.warn(`[browser.agent] run: parking content check failed (non-fatal): ${_pageErr.message}`);
           }
 
-          if (_healedUrl) {
-            // Update startUrl and invalidate DuckDB meta cache so next run uses the correct URL
-            startUrl = _healedUrl;
+          // ── Internal web.agent self-heal ───────────────────────────────────────
+          // Trigger on: (a) domain mismatch OR (b) parking content detected on any domain.
+          // For domain mismatch that is NOT a parking page (e.g. workspace.google.com for mail.google.com),
+          // web.agent is tried first but if it finds nothing we fall through to waitForAuth — no regression.
+          const _needsHeal = _wrongDomain || _isParkingPage;
+          if (_needsHeal && !_onLoginPage) {
+            const _svcName = existing?.service || agentId.replace('.agent', '');
+            const _healReason = _isParkingPage ? `parking content on ${_curHost}` : `domain mismatch (expected ${(() => { try { return new URL(startUrl).hostname; } catch(_){return startUrl;} })()}, got ${_curHost})`;
+            logger.warn(`[browser.agent] run: ${_healReason} — attempting web.agent self-heal for ${agentId}`);
+            let _healedUrl = null;
             try {
-              const _db = await getDb();
-              if (_db) {
-                const _seedKey = _svcName.toLowerCase().replace(/[^a-z0-9]/g, '');
-                await _db.run('DELETE FROM browser_meta_cache WHERE service = ?', _seedKey).catch(() => {});
+              const _webResult = await callSkill('web.agent', {
+                action: 'search_and_navigate',
+                query: `${_svcName} official website`,
+                preferDomain: _svcName,
+              }, 10000);
+              if (_webResult?.ok && _webResult?.bestUrl) {
+                _healedUrl = _webResult.bestUrl;
+                logger.info(`[browser.agent] self-heal: web.agent found ${_healedUrl} for ${agentId}`);
               }
-            } catch (_) {}
-            logger.info(`[browser.agent] self-heal: retrying with corrected startUrl=${startUrl}`);
-            const _retryNav = await callBrowserAct({ action: 'navigate', sessionId, url: startUrl, timeoutMs: 30000 }, 35000).catch(() => ({ ok: false }));
-            if (_retryNav?.ok !== false) {
-              logger.info(`[browser.agent] self-heal: navigate to corrected URL succeeded — skipping waitForAuth`);
-              _setCachedAuthCheck(agentId, false);
-            } else {
-              logger.warn(`[browser.agent] self-heal: corrected URL navigate failed — failing fast`);
-              return { ok: false, agentId, task, wrongDomain: true, landedUrl: _curHref, expectedService: agentId, error: `Navigated to corrected URL ${startUrl} but browser failed to load it.` };
+            } catch (_healErr) {
+              logger.warn(`[browser.agent] self-heal: web.agent call failed: ${_healErr.message}`);
             }
-          } else if (_isParkingPage) {
-            // Parking page + web.agent found nothing → fail fast, recoverSkill handles it
-            logger.warn(`[browser.agent] self-heal: parking page detected but no corrected URL found — returning wrongDomain error`);
-            return { ok: false, agentId, task, wrongDomain: true, landedUrl: _curHref, expectedService: agentId, error: `${agentId} loaded a domain parking/squatter page at ${_curHref}. Could not automatically resolve the correct URL for "${_svcName}".` };
-          } else {
-            // Domain mismatch but web.agent found nothing better → this may be a valid redirect (e.g. workspace.google.com)
-            // Fall through to waitForAuth as before
-            logger.info(`[browser.agent] self-heal: no better URL found for domain mismatch — falling back to waitForAuth`);
+
+            if (_healedUrl) {
+              // Update startUrl and invalidate DuckDB meta cache so next run uses the correct URL
+              startUrl = _healedUrl;
+              try {
+                const _db = await getDb();
+                if (_db) {
+                  const _seedKey = _svcName.toLowerCase().replace(/[^a-z0-9]/g, '');
+                  await _db.run('DELETE FROM browser_meta_cache WHERE service = ?', _seedKey).catch(() => {});
+                }
+              } catch (_) {}
+              logger.info(`[browser.agent] self-heal: retrying with corrected startUrl=${startUrl}`);
+              const _retryNav = await callBrowserAct({ action: 'navigate', sessionId, url: startUrl, timeoutMs: 30000 }, 35000).catch(() => ({ ok: false }));
+              if (_retryNav?.ok !== false) {
+                logger.info(`[browser.agent] self-heal: navigate to corrected URL succeeded — skipping waitForAuth`);
+                _setCachedAuthCheck(agentId, false);
+              } else {
+                logger.warn(`[browser.agent] self-heal: corrected URL navigate failed — failing fast`);
+                return { ok: false, agentId, task, wrongDomain: true, landedUrl: _curHref, expectedService: agentId, error: `Navigated to corrected URL ${startUrl} but browser failed to load it.` };
+              }
+            } else if (_isParkingPage) {
+              // Parking page + web.agent found nothing → fail fast, recoverSkill handles it
+              logger.warn(`[browser.agent] self-heal: parking page detected but no corrected URL found — returning wrongDomain error`);
+              return { ok: false, agentId, task, wrongDomain: true, landedUrl: _curHref, expectedService: agentId, error: `${agentId} loaded a domain parking/squatter page at ${_curHref}. Could not automatically resolve the correct URL for "${_svcName}".` };
+            } else {
+              // Domain mismatch but web.agent found nothing better → this may be a valid redirect (e.g. workspace.google.com)
+              // Fall through to waitForAuth as before
+              logger.info(`[browser.agent] self-heal: no better URL found for domain mismatch — falling back to waitForAuth`);
+              _authNeeded = true;
+            }
+          } else if (_onLoginPage || _wrongDomain) {
+            const _reason = _onLoginPage ? 'login redirect' : `domain mismatch (expected ${(() => { try { return new URL(startUrl).hostname; } catch(_){return startUrl;} })()}, got ${_curHost || _curHref})`;
+            logger.info(`[browser.agent] run: auth-check: ${_reason} — calling waitForAuth for ${agentId}`);
             _authNeeded = true;
+          } else {
+            logger.info(`[browser.agent] run: auth-check: no login redirect${_curHref ? ` (${_curHref})` : ''} — skipping waitForAuth for ${agentId}`);
+            _setCachedAuthCheck(agentId, false);
           }
-        } else if (_onLoginPage || _wrongDomain) {
-          const _reason = _onLoginPage ? 'login redirect' : `domain mismatch (expected ${(() => { try { return new URL(startUrl).hostname; } catch(_){return startUrl;} })()}, got ${_curHost || _curHref})`;
-          logger.info(`[browser.agent] run: auth-check: ${_reason} — calling waitForAuth for ${agentId}`);
-          _authNeeded = true;
-        } else {
-          logger.info(`[browser.agent] run: auth-check: no login redirect${_curHref ? ` (${_curHref})` : ''} — skipping waitForAuth for ${agentId}`);
-          _setCachedAuthCheck(agentId, false);
         }
+      } catch (_probeErr) {
+        // Check if the thrown error is a Chrome conflict — fail fast instead of falling to waitForAuth
+        if (/Opening in existing browser session/i.test(_probeErr.message) || /Failed to launch/i.test(_probeErr.message)) {
+          logger.error(`[browser.agent] run: Chrome session conflict (thrown) for ${agentId} — aborting`);
+          return { ok: false, agentId, task, error: 'Browser session conflict: Chrome is already running with this profile. Close existing Chrome windows for this agent or restart the app.' };
+        }
+        logger.warn(`[browser.agent] run: auth-check probe failed — falling back to waitForAuth: ${_probeErr.message}`);
+        _authNeeded = true;
       }
-    } catch (_probeErr) {
-      // Check if the thrown error is a Chrome conflict — fail fast instead of falling to waitForAuth
-      if (/Opening in existing browser session/i.test(_probeErr.message) || /Failed to launch/i.test(_probeErr.message)) {
-        logger.error(`[browser.agent] run: Chrome session conflict (thrown) for ${agentId} — aborting`);
-        return { ok: false, agentId, task, error: 'Browser session conflict: Chrome is already running with this profile. Close existing Chrome windows for this agent or restart the app.' };
-      }
-      logger.warn(`[browser.agent] run: auth-check probe failed — falling back to waitForAuth: ${_probeErr.message}`);
-      _authNeeded = true;
+    } else {
+      // Domain continuity: skip auth checks and proceed directly to task
+      logger.info(`[browser.agent] domain-continuity: skipping auth checks, proceeding directly to task execution`);
     }
     if (_authNeeded && skipAuth) {
       logger.info(`[browser.agent] run: login wall detected but skipAuth=true for ${agentId} — proceeding as guest`);
@@ -3088,10 +3251,329 @@ async function actionRun({ agentId, task, url, context, requiresAuth, skipAuth, 
     }
   } catch (_) { /* non-fatal */ }
 
+  // ── Trained recipe injection (guided agentic mode) ──────────────────────────
+  // If the user's task matches a trained skill recipe (fuzzy: dots/spaces/underscores),
+  // inject the waypoint recipe as navigation guidance for playwright.agent.
+  // The recipe provides ordered waypoints so the agent knows WHERE to navigate,
+  // then the user's actual task tells it WHAT to do once there.
+  let _trainedRecipeInjected = false;
+  try {
+    const trainerAgent = require('./trainer.agent.cjs');
+    const _agentIdClean = agentId.replace('.agent', '');
+    // Try fuzzy match on task text first, then fall back to single-recipe auto-inject
+    let recipe = trainerAgent.findMatchingRecipe(_agentIdClean, task);
+    if (!recipe) {
+      // Fallback: if this agent has exactly 1 trained recipe, auto-inject it
+      const allSkills = trainerAgent.actionListSkills({ agentId: _agentIdClean });
+      if (allSkills.ok && allSkills.skills && allSkills.skills.length === 1) {
+        recipe = trainerAgent.loadRecipe(_agentIdClean, allSkills.skills[0].name);
+        if (recipe) logger.info(`[browser.agent] run: auto-injecting sole trained recipe "${recipe.name}" for ${agentId}`);
+      }
+    }
+    if (recipe && recipe.waypoints && recipe.waypoints.length > 0) {
+      const waypointSteps = recipe.waypoints.map(wp => {
+        if (wp.type === 'navigate') return `  ${wp.step}. NAVIGATE to ${wp.url} (checkpoint: ${wp.checkpoint || wp.pageTitle || ''})`;
+        if (wp.type === 'click') return `  ${wp.step}. CLICK "${wp.elementText || ''}" selector: ${wp.selector}${wp.altSelectors?.length ? ` (alt: ${wp.altSelectors[0]})` : ''}`;
+        if (wp.type === 'check') return `  ${wp.step}. CHECK "${wp.label || ''}" selector: ${wp.selector} → ${wp.checked ? 'on' : 'off'}`;
+        if (wp.type === 'drag') return `  ${wp.step}. DRAG from ${wp.fromSelector} by (${(wp.toX || 0) - (wp.fromX || 0)}, ${(wp.toY || 0) - (wp.fromY || 0)})px`;
+        if (wp.type === 'scroll') return `  ${wp.step}. SCROLL ${wp.deltaY > 0 ? 'down' : 'up'} ${Math.abs(wp.deltaY || 0)}px to reveal content`;
+        return `  ${wp.step}. ${wp.type.toUpperCase()} ${wp.selector || wp.url || ''}`;
+      }).join('\n');
+
+      const recipeBlock = `\n\n## Trained Navigation Recipe: ${recipe.name}\n` +
+        `TARGET: ${recipe.targetUrl || recipe.targetDescription || ''}\n` +
+        `Follow these waypoints IN ORDER to reach the target page. After reaching the target, execute the user's task.\n` +
+        `WAYPOINTS:\n${waypointSteps}\n\n` +
+        `RULES:\n` +
+        `- Follow waypoints sequentially — verify each checkpoint before advancing\n` +
+        `- If a waypoint selector fails, try altSelectors or reason from the live snapshot\n` +
+        `- Once at the TARGET page, stop navigating and execute the user's actual task\n` +
+        `- The recipe is GUIDANCE — if the site layout changed, adapt using the snapshot`;
+
+      _agentContext = (_agentContext + recipeBlock).slice(0, 5000);
+      _trainedRecipeInjected = true;
+      logger.info(`[browser.agent] run: injected trained recipe "${recipe.name}" (${recipe.waypoints.length} waypoints) for ${agentId}`);
+    }
+  } catch (_recipeErr) {
+    logger.warn(`[browser.agent] trained recipe lookup failed (non-fatal): ${_recipeErr.message}`);
+  }
+
+  // ── Query current browser state from user-memory monitor ──────────────────
+  // Use the background screen monitor (running every 5s) to check if we're already
+  // on the target domain. This enables "do it" / "now look up X" style follow-ups
+  // without re-navigating from scratch.
+  let _currentBrowserState = null;
+  let _skipNavigation = false;
+  try {
+    const memHost = process.env.MEMORY_SERVICE_HOST || '127.0.0.1';
+    const memPort = parseInt(process.env.MEMORY_SERVICE_PORT || '3001', 10);
+    const memBody = JSON.stringify({
+      version: 'mcp.v1',
+      service: 'user-memory',
+      action: 'memory.getRecentOcr',
+      payload: { maxAgeSeconds: 15 },
+      context: { userId: 'local_user' }
+    });
+    const memRes = await new Promise((resolve, reject) => {
+      const req = http.request({ hostname: memHost, port: memPort, path: '/memory.getRecentOcr', method: 'POST', headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(memBody) }, timeout: 3000 }, res => { let raw = ''; res.on('data', c => raw += c); res.on('end', () => { try { resolve(JSON.parse(raw)); } catch (e) { resolve({}); } }); });
+      req.on('error', reject);
+      req.on('timeout', () => { req.destroy(); reject(new Error('timeout')); });
+      req.write(memBody);
+      req.end();
+    });
+    // MCP response format: { data: { available: true, capture: { url, appName, ... } } }
+    const captureData = memRes?.data?.capture || memRes?.result?.capture;
+    const isAvailable = memRes?.data?.available || memRes?.result?.available;
+    if (isAvailable && captureData) {
+      _currentBrowserState = { appName: captureData.appName, windowTitle: captureData.windowTitle, url: captureData.url, text: captureData.text };
+      logger.info(`[browser.agent] current browser state: ${captureData.windowTitle} @ ${captureData.url}`);
+    }
+  } catch (_memErr) {
+    // Non-fatal, proceed without current state
+    logger.debug(`[browser.agent] could not fetch current browser state: ${_memErr.message}`);
+  }
+
+  // ── Deterministic recipe execution ─────────────────────────────────────────
+  // Instead of relying on the LLM to interpret recipe waypoints from prompt text,
+  // execute them programmatically using browser.act. Once at the target page,
+  // playwright.agent only needs to handle the user's actual creative task.
+  let _recipeExecutedOk = false;
+  let _extractedData = null; // WALT: stores extraction waypoint results
+  if (_trainedRecipeInjected) {
+    try {
+      const trainerAgent = require('./trainer.agent.cjs');
+      const _agentIdClean = agentId.replace('.agent', '');
+      const _execRecipe = trainerAgent.findMatchingRecipe(_agentIdClean, task)
+        || (() => { const ls = trainerAgent.actionListSkills({ agentId: _agentIdClean }); return (ls.ok && ls.skills?.length === 1) ? trainerAgent.loadRecipe(_agentIdClean, ls.skills[0].name) : null; })();
+
+      if (_execRecipe && _execRecipe.waypoints && _execRecipe.waypoints.length > 0) {
+        // ── Domain continuity check ─────────────────────────────────────────
+        // Check if we're already on the target domain (trained recipe target)
+        if (_currentBrowserState?.url && _execRecipe.targetUrl) {
+          try {
+            const currentHostname = new URL(_currentBrowserState.url).hostname;
+            const targetHostname = new URL(_execRecipe.targetUrl).hostname;
+            // Extract base domain (e.g., w3schools.com from www.w3schools.com or my-learning.w3schools.com)
+            const currentBaseDomain = currentHostname.split('.').slice(-2).join('.');
+            const targetBaseDomain = targetHostname.split('.').slice(-2).join('.');
+            const targetPath = new URL(_execRecipe.targetUrl).pathname;
+            // If same base domain AND current URL contains the target path → skip navigation
+            if (currentBaseDomain === targetBaseDomain && _currentBrowserState.url.includes(targetPath.replace(/\/$/, ''))) {
+              _skipNavigation = true;
+              _recipeExecutedOk = true;
+              logger.info(`[browser.agent] domain-continuity: already at target (${_currentBrowserState.url}), skipping recipe navigation`);
+            }
+          } catch {}
+        }
+
+        if (!_skipNavigation) {
+          logger.info(`[browser.agent] recipe-exec: executing ${_execRecipe.waypoints.length} waypoints deterministically for "${_execRecipe.name}"`);
+          let _wpFailed = false;
+
+          for (const wp of _execRecipe.waypoints) {
+            if (_wpFailed) break;
+            try {
+              if (wp.type === 'navigate') {
+                const navRes = await callBrowserAct({ action: 'navigate', url: wp.url, sessionId });
+                if (!navRes?.ok && navRes?.error) { logger.warn(`[browser.agent] recipe-exec: navigate failed — ${navRes.error}`); _wpFailed = true; }
+                else { logger.info(`[browser.agent] recipe-exec: step ${wp.step} navigate → ${wp.url} ✓`); }
+              } else if (wp.type === 'click') {
+                // Build selector fallback chain with priorities
+                let selectors = [];
+                
+                // Priority 1: Combined href + text (most specific from new CDP recorder)
+                if (wp.altSelectors) {
+                  const combined = wp.altSelectors.find(s => s.includes('[href*="') && s.includes(':has-text('));
+                  if (combined) selectors.push(combined);
+                }
+                
+                // Priority 2: href-based selector (most reliable for links)
+                if (wp.href) {
+                  try {
+                    const hrefPath = new URL(wp.href).pathname;
+                    selectors.push(`a[href="${wp.href}"]`);
+                    selectors.push(`a[href*="${hrefPath}"]`);
+                    // Also try just the filename
+                    const filename = hrefPath.split('/').pop();
+                    if (filename) selectors.push(`a[href*="${filename}"]`);
+                  } catch {}
+                }
+                
+                // Priority 3: primary selector
+                if (wp.selector) selectors.push(wp.selector);
+                
+                // Priority 4: alt selectors from new CDP format (href-exact, href-partial, text, class+text)
+                if (wp.altSelectors) {
+                  // href-exact
+                  const hrefExact = wp.altSelectors.find(s => s.match(/\[href="[^"]+"\]$/));
+                  if (hrefExact && !selectors.includes(hrefExact)) selectors.push(hrefExact);
+                  // href-partial
+                  const hrefPartial = wp.altSelectors.find(s => s.includes('[href*="') && !s.includes(':has-text('));
+                  if (hrefPartial && !selectors.includes(hrefPartial)) selectors.push(hrefPartial);
+                  // class+text
+                  const classText = wp.altSelectors.find(s => s.match(/\.[a-z][a-z0-9_-]*.*:has-text/));
+                  if (classText && !selectors.includes(classText)) selectors.push(classText);
+                  // has-text
+                  const hasText = wp.altSelectors.find(s => s.includes(':has-text('));
+                  if (hasText && !selectors.includes(hasText)) selectors.push(hasText);
+                  // text-is (exact match)
+                  const textIs = wp.altSelectors.find(s => s.includes(':text-is('));
+                  if (textIs && !selectors.includes(textIs)) selectors.push(textIs);
+                }
+                
+                // Priority 5: text-based fallback (last resort)
+                if (wp.elementText) {
+                  selectors.push(`text="${wp.elementText.substring(0, 40)}"`);
+                }
+                
+                // Priority 6: ARIA-based from altSelectors
+                if (wp.altSelectors) {
+                  const ariaSel = wp.altSelectors.find(s => s.includes('[aria-label=') || s.includes('[aria-labelledby='));
+                  if (ariaSel && !selectors.includes(ariaSel)) selectors.push(ariaSel);
+                }
+
+                let clicked = false;
+                let lastError = '';
+                let successSelector = '';
+                for (const sel of selectors) {
+                  const clickRes = await callBrowserAct({ action: 'click', selector: sel, sessionId });
+                  // Use exitCode for consistent success checking
+                  if (clickRes?.exitCode === 0) {
+                    clicked = true;
+                    successSelector = sel;
+                    logger.info(`[browser.agent] recipe-exec: step ${wp.step} click "${wp.elementText || sel}" ✓ (selector: ${sel.substring(0, 50)})`);
+                    break;
+                  } else {
+                    lastError = clickRes?.stderr || clickRes?.error || 'unknown';
+                    logger.debug(`[browser.agent] recipe-exec: step ${wp.step} click failed with selector "${sel.substring(0, 40)}" — ${lastError}`);
+                  }
+                }
+                if (!clicked) {
+                  logger.warn(`[browser.agent] recipe-exec: step ${wp.step} click failed for all selectors (last error: ${lastError})`);
+                  _wpFailed = true;
+                } else {
+                  // After successful click, if target URL is specified, navigate directly to it
+                  // This avoids tab-switching issues by staying in current tab
+                  if (wp.href && _execRecipe.targetUrl) {
+                    try {
+                      await new Promise(r => setTimeout(r, 1000)); // Brief wait for any navigation to start
+                      const urlCheck = await callBrowserAct({ action: 'evaluate', text: 'window.location.href', sessionId });
+                      const currentUrl = (urlCheck?.result || urlCheck?.data || '').replace(/"/g, '');
+                      
+                      // If we're not at the target yet, navigate directly to wp.href
+                      const targetPath = new URL(_execRecipe.targetUrl).pathname.split('?')[0];
+                      if (!currentUrl.includes(targetPath)) {
+                        logger.info(`[browser.agent] recipe-exec: navigating directly to target href ${wp.href} (avoiding new tab issues)`);
+                        const navRes = await callBrowserAct({ action: 'navigate', url: wp.href, sessionId });
+                        if (navRes?.exitCode === 0) {
+                          logger.info(`[browser.agent] recipe-exec: direct navigation to ${wp.href} ✓`);
+                          _currentBrowserState = { ..._currentBrowserState, url: wp.href };
+                        } else {
+                          logger.warn(`[browser.agent] recipe-exec: direct navigation failed, will retry verification`);
+                        }
+                      }
+                    } catch (navErr) {
+                      logger.debug(`[browser.agent] recipe-exec: post-click navigation check failed (non-fatal): ${navErr.message}`);
+                    }
+                  }
+                }
+              } else if (wp.type === 'check') {
+                // Try primary selector, then alt selectors
+                let checkSelectors = [wp.selector];
+                if (wp.altSelectors) {
+                  checkSelectors.push(...wp.altSelectors.filter(s => !s.startsWith('text=')));
+                }
+                
+                let checked = false;
+                for (const sel of checkSelectors) {
+                  const checkRes = await callBrowserAct({ action: 'click', selector: sel, sessionId });
+                  if (checkRes?.exitCode === 0) {
+                    checked = true;
+                    logger.info(`[browser.agent] recipe-exec: step ${wp.step} check "${wp.label}" ✓`);
+                    break;
+                  }
+                }
+                if (!checked) { 
+                  logger.warn(`[browser.agent] recipe-exec: step ${wp.step} check failed for all selectors`);
+                  _wpFailed = true; 
+                }
+              } else if (wp.type === 'extract') {
+                // Data extraction waypoint - WALT tool returns
+                try {
+                  const extractOptions = { dataAttr: wp.dataAttr, attrName: wp.attrName };
+                  const extractCode = _buildExtractionCode(wp.selector, wp.extractType || 'text', extractOptions);
+                  const extractRes = await callBrowserAct({ action: 'evaluate', text: extractCode, sessionId });
+                  
+                  if (extractRes?.exitCode === 0) {
+                    const extractedValue = (extractRes?.result || extractRes?.data || '').replace(/^["']|["']$/g, '');
+                    
+                    // Store in agent context for LLM to use
+                    if (!_extractedData) _extractedData = {};
+                    _extractedData[wp.extractName] = extractedValue;
+                    
+                    // Also add to _agentContext so LLM sees it
+                    const extractInfo = `\n[EXTRACTION] ${wp.extractName}: "${extractedValue.substring(0, 200)}${extractedValue.length > 200 ? '...' : ''}"`;
+                    _agentContext = (_agentContext + extractInfo).slice(0, 5000);
+                    
+                    logger.info(`[browser.agent] recipe-exec: step ${wp.step} extract "${wp.extractName}" ✓ (${extractedValue.length} chars)`);
+                  } else {
+                    logger.warn(`[browser.agent] recipe-exec: step ${wp.step} extract failed — ${extractRes?.stderr || 'unknown error'}`);
+                    // Don't fail the recipe for extraction errors, just log
+                  }
+                } catch (extractErr) {
+                  logger.debug(`[browser.agent] recipe-exec: extract error (non-fatal): ${extractErr.message}`);
+                }
+              }
+              // Brief pause between waypoints to let page settle
+              await new Promise(r => setTimeout(r, 1500));
+            } catch (wpErr) {
+              logger.warn(`[browser.agent] recipe-exec: step ${wp.step} error — ${wpErr.message}`);
+              _wpFailed = true;
+            }
+          }
+
+          if (!_wpFailed) {
+            // Verify we reached the target by checking current URL
+            try {
+              const urlCheck = await callBrowserAct({ action: 'evaluate', text: 'window.location.href', sessionId });
+              const currentUrl = (urlCheck?.result || urlCheck?.data || '').replace(/"/g, '');
+              if (_execRecipe.targetUrl && currentUrl.includes(new URL(_execRecipe.targetUrl).pathname.split('?')[0])) {
+                _recipeExecutedOk = true;
+                logger.info(`[browser.agent] recipe-exec: target reached ✓ — ${currentUrl}`);
+              } else if (_execRecipe.targetUrl) {
+                logger.warn(`[browser.agent] recipe-exec: target URL mismatch — got "${currentUrl}", expected path from "${_execRecipe.targetUrl}"`);
+                // Target mismatch - don't strip recipe context so LLM can recover
+                _recipeExecutedOk = false;
+                _wpFailed = true;
+              } else {
+                // No targetUrl specified in recipe, assume success
+                _recipeExecutedOk = true;
+              }
+            } catch { 
+              // Verification failed, but waypoints completed - be optimistic
+              _recipeExecutedOk = true; 
+            }
+          } else {
+            logger.warn(`[browser.agent] recipe-exec: waypoint failed — falling back to LLM-guided recipe`);
+          }
+        }
+
+        // If execution succeeded (or skipped due to continuity), strip recipe from context
+        if (_recipeExecutedOk) {
+          _agentContext = _agentContext.replace(/\n\n## Trained Navigation Recipe:[\s\S]*?— if the site layout changed, adapt using the snapshot/, '');
+          logger.info(`[browser.agent] recipe-exec: stripped recipe from context — playwright.agent will only handle the user task`);
+        }
+      }
+    } catch (_execErr) {
+      logger.warn(`[browser.agent] recipe-exec: deterministic execution failed (non-fatal): ${_execErr.message}`);
+    }
+  }
+
   // ── Step 1c: Tier 2/3 nav context enrichment via web.agent / video.agent ──
   // When playwright.agent has no keyword-matched playbook (Tier 2 or 3), it reasons
   // purely from the live DOM. Inject web-researched navigation hints to guide it.
-  if (_playbookTier >= 2) {
+  // Skip if a trained recipe was already injected (recipe provides the navigation path).
+  if (_playbookTier >= 2 && !_trainedRecipeInjected) {
     try {
       const _navSvcName = existing?.service || agentId.replace('.agent', '');
       const _navQuery   = `how to navigate to ${task} on ${_navSvcName}`;
@@ -3149,10 +3631,15 @@ When extracting page content with run-code, prioritize these selectors over gene
   }
 
   try {
+    // If recipe was successfully executed, we're already on the target page - don't navigate
+    const _playwrightUrl = _recipeExecutedOk ? undefined : (url || (_useAgentBrowser ? startUrl : undefined));
+    if (_recipeExecutedOk && url) {
+      logger.info(`[browser.agent] run: recipe executed successfully - NOT passing URL to playwright.agent to stay on target page`);
+    }
     const agentResult = await callSkill(_agentSkill, {
       goal: _effectiveTask,
       agentContext: _agentContext,
-      url: url || (_useAgentBrowser ? startUrl : undefined),
+      url: _playwrightUrl,
       authSignInUrl: _useAgentBrowser ? (signInUrl || undefined) : undefined,
       sessionId,
       agentId,
@@ -3631,10 +4118,41 @@ async function actionDeleteAgent({ id }) {
   const deleted = [];
   const errors  = [];
 
+  logger.info(`[browser.agent] delete_agent: starting delete for ${id}`);
+  logger.info(`[browser.agent] delete_agent: AGENTS_DIR = ${AGENTS_DIR}`);
+  logger.info(`[browser.agent] delete_agent: AGENTS_DB_PATH = ${AGENTS_DB_PATH}`);
+
   // ── 1. Read descriptor before deleting (need hostname for domain-map) ──────
   let hostname = null;
-  const agentMdPath = path.join(AGENTS_DIR, `${id}.agent.md`);
-  if (fs.existsSync(agentMdPath)) {
+  
+  // Try multiple file naming patterns
+  const possiblePaths = [
+    path.join(AGENTS_DIR, `${id}.agent.md`),  // w3schools.agent.md
+    path.join(AGENTS_DIR, `${id}.md`),         // w3schools.agent.md (if id already has .agent)
+    path.join(AGENTS_DIR, `${id.replace(/\.agent$/, '')}.agent.md`), // w3schools.agent.md
+  ];
+  
+  logger.info(`[browser.agent] delete_agent: checking paths: ${JSON.stringify(possiblePaths)}`);
+
+  // Debug: list actual files in AGENTS_DIR
+  try {
+    const files = fs.readdirSync(AGENTS_DIR);
+    logger.info(`[browser.agent] delete_agent: files in AGENTS_DIR: ${JSON.stringify(files)}`);
+  } catch (e) {
+    logger.error(`[browser.agent] delete_agent: cannot read AGENTS_DIR: ${e.message}`);
+  }
+
+  let agentMdPath = null;
+  for (const tryPath of possiblePaths) {
+    const exists = fs.existsSync(tryPath);
+    logger.info(`[browser.agent] delete_agent: checking ${tryPath}: ${exists}`);
+    if (exists) {
+      agentMdPath = tryPath;
+      break;
+    }
+  }
+  
+  if (agentMdPath) {
     try {
       const desc = fs.readFileSync(agentMdPath, 'utf8');
       const urlMatch = desc.match(/^start_url:\s*(.+)$/m);
@@ -3642,7 +4160,9 @@ async function actionDeleteAgent({ id }) {
         try { hostname = new URL(urlMatch[1].trim()).hostname.replace(/^www\./, ''); } catch (_) {}
       }
     } catch (_) {}
-    try { fs.rmSync(agentMdPath, { force: true }); deleted.push(agentMdPath); } catch (e) { errors.push(e.message); }
+    try { fs.rmSync(agentMdPath, { force: true }); deleted.push(agentMdPath); logger.info(`[browser.agent] delete_agent: removed file ${agentMdPath}`); } catch (e) { errors.push(e.message); }
+  } else {
+    logger.warn(`[browser.agent] delete_agent: no .md file found for ${id}`);
   }
 
   // ── 2. DuckDB: agents table + browser_meta_cache ────────────────────────────
@@ -3650,12 +4170,40 @@ async function actionDeleteAgent({ id }) {
     const db = await getDb();
     if (db) {
       const service = id.replace(/\.agent$/, '');
-      await db.run('DELETE FROM agents WHERE id = ?', id).catch(() => {});
-      deleted.push(`DuckDB agents row: ${id}`);
-      await db.run('DELETE FROM browser_meta_cache WHERE service = ?', service).catch(() => {});
-      deleted.push(`DuckDB meta_cache row: ${service}`);
+      logger.info(`[browser.agent] delete_agent: looking for service = ${service}`);
+      
+      // Check if agent exists before delete
+      const beforeRows = await db.all('SELECT id FROM agents WHERE id = ?', id).catch((e) => {
+        logger.error(`[browser.agent] delete_agent: SELECT error: ${e.message}`);
+        return [];
+      });
+      logger.info(`[browser.agent] delete_agent: found ${beforeRows.length} rows for id = ${id}`);
+      if (beforeRows.length > 0) {
+        await db.run('DELETE FROM agents WHERE id = ?', id);
+        deleted.push(`DuckDB agents row: ${id}`);
+        logger.info(`[browser.agent] delete_agent: removed ${id} from DuckDB agents table`);
+      } else {
+        // List all agents to debug
+        const allAgents = await db.all('SELECT id FROM agents').catch(() => []);
+        logger.warn(`[browser.agent] delete_agent: agent ${id} not found. Available agents: ${JSON.stringify(allAgents.map(r => r.id))}`);
+      }
+      
+      // Delete from meta cache
+      const metaRows = await db.all('SELECT service FROM browser_meta_cache WHERE service = ?', service).catch(() => []);
+      if (metaRows.length > 0) {
+        await db.run('DELETE FROM browser_meta_cache WHERE service = ?', service);
+        deleted.push(`DuckDB meta_cache row: ${service}`);
+      }
+      
+      // Force checkpoint to make deletes visible to other connections
+      await db.run('CHECKPOINT').catch(() => {});
+    } else {
+      logger.error(`[browser.agent] delete_agent: db connection is null`);
     }
-  } catch (e) { errors.push(`DuckDB: ${e.message}`); }
+  } catch (e) { 
+    logger.error(`[browser.agent] delete_agent: DuckDB error: ${e.message}`);
+    errors.push(`DuckDB: ${e.message}`); 
+  }
 
   // ── 3. Domain map JSON ───────────────────────────────────────────────────────
   if (hostname) {
@@ -3713,6 +4261,17 @@ async function actionDeleteAgent({ id }) {
         }
       }
     } catch (e) { errors.push(`scan-state.json: ${e.message}`); }
+  }
+
+  // ── 9. Skills directory (trained recipes and atomic skills) ────────────────────
+  const skillsDir = path.join(os.homedir(), '.thinkdrop', 'skills', service);
+  if (fs.existsSync(skillsDir)) {
+    try { fs.rmSync(skillsDir, { recursive: true, force: true }); deleted.push(skillsDir); } catch (e) { errors.push(e.message); }
+  }
+  // Also try id-based directory name (some skills use full agent id)
+  const skillsDirById = path.join(os.homedir(), '.thinkdrop', 'skills', id.replace(/\./g, '_'));
+  if (fs.existsSync(skillsDirById) && skillsDirById !== skillsDir) {
+    try { fs.rmSync(skillsDirById, { recursive: true, force: true }); deleted.push(skillsDirById); } catch (e) { errors.push(e.message); }
   }
 
   logger.info(`[browser.agent] delete_agent: removed ${deleted.length} artifacts for ${id}`, { deleted, errors });

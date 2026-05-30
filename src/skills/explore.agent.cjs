@@ -686,6 +686,96 @@ function _domainMapExists(hostname) {
   try { fs.accessSync(_mapPath(hostname)); return true; } catch (_) { return false; }
 }
 
+// ---------------------------------------------------------------------------
+// WALT: Build tools registry from trained recipes
+// ---------------------------------------------------------------------------
+function _buildToolsFromRecipes(hostname) {
+  const tools = [];
+  const serviceName = hostname.replace(/^www\./, '').split('.')[0];
+  const skillsDir = path.join(os.homedir(), '.thinkdrop', 'skills', serviceName);
+  
+  try {
+    if (!fs.existsSync(skillsDir)) return tools;
+    
+    const entries = fs.readdirSync(skillsDir);
+    for (const entry of entries) {
+      if (!entry.endsWith('.recipe.json')) continue;
+      
+      const recipePath = path.join(skillsDir, entry);
+      try {
+        const recipe = JSON.parse(fs.readFileSync(recipePath, 'utf8'));
+        
+        // Only add recipes with extraction waypoints as tools
+        const hasExtractions = recipe.waypoints?.some(wp => wp.type === 'extract');
+        if (!hasExtractions && !recipe.returns) continue;
+        
+        // Build tool entry
+        const toolName = recipe.name?.replace(/\./g, '_') || entry.replace('.recipe.json', '');
+        const tool = {
+          name: toolName,
+          recipe: recipe.name,
+          description: recipe.targetDescription || `Trained skill: ${toolName}`,
+          startUrl: recipe.startUrl,
+          targetUrl: recipe.targetUrl,
+          parameters: _extractParametersFromWaypoints(recipe.waypoints),
+          returns: recipe.returns || _buildReturnsFromExtractions(recipe.waypoints),
+          waypointCount: recipe.waypoints?.length || 0,
+          extractCount: recipe.waypoints?.filter(wp => wp.type === 'extract').length || 0
+        };
+        
+        tools.push(tool);
+        logger.info(`[explore.agent] WALT tool registered: ${toolName} (${tool.extractCount} extractions)`);
+      } catch (recipeErr) {
+        logger.debug(`[explore.agent] Failed to load recipe ${entry}: ${recipeErr.message}`);
+      }
+    }
+  } catch (dirErr) {
+    logger.debug(`[explore.agent] No skills directory for ${serviceName}: ${dirErr.message}`);
+  }
+  
+  return tools;
+}
+
+// Extract parameters from fill waypoints
+function _extractParametersFromWaypoints(waypoints) {
+  const params = {};
+  if (!waypoints) return params;
+  
+  for (const wp of waypoints) {
+    if (wp.type === 'fill' && wp.value) {
+      // Heuristic: if value looks like a placeholder, treat as parameter
+      if (wp.value.match(/^\[.*\]$/) || wp.value.length > 3) {
+        const paramName = wp.elementText?.toLowerCase().replace(/[^a-z0-9]+/g, '_').slice(0, 20) || 'input';
+        params[paramName] = {
+          type: 'string',
+          description: `Fill ${wp.elementText || 'input field'}`,
+          selector: wp.selector
+        };
+      }
+    }
+  }
+  
+  return params;
+}
+
+// Build returns schema from extraction waypoints
+function _buildReturnsFromExtractions(waypoints) {
+  const returns = {};
+  if (!waypoints) return returns;
+  
+  for (const wp of waypoints) {
+    if (wp.type === 'extract' && wp.extractName) {
+      returns[wp.extractName] = {
+        type: wp.extractType === 'html' ? 'string' : 'string',
+        description: wp.description || `Extracted ${wp.extractName}`,
+        selector: wp.selector
+      };
+    }
+  }
+  
+  return returns;
+}
+
 const FRESHNESS_THRESHOLD_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 
 /**
@@ -2066,6 +2156,8 @@ async function scanDomain(args) {
       version: '2.0', 
       last_scanned: null, 
       states: {},
+      // WALT: Tools registry - populated from trained recipes with extraction waypoints
+      tools: [],
       // Store schemas for reference and validation
       _schemas: {
         interactions: INTERACTION_SCHEMAS,
@@ -3069,6 +3161,9 @@ async function scanDomain(args) {
       primaryControlPatterns: ['new', 'search', 'ask', 'create', 'settings', 'computer']
     };
     mergedMap.last_scanned = new Date().toISOString();
+    
+    // WALT: Populate tools from trained recipes
+    mergedMap.tools = _buildToolsFromRecipes(hostname);
     
     _saveDomainMap(hostname, mergedMap);
 

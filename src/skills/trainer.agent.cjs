@@ -1,14 +1,13 @@
 'use strict';
 // ---------------------------------------------------------------------------
-// trainer.agent.cjs — Training mode orchestration with "Teach Me" support
+// trainer.agent.cjs — Interactive Path Recording + Waypoint Recipe Generator
 //
-// Manages the training session:
-// 1. Opens browser to agent's domain
-// 2. Captures accessibility snapshots every 2s + on DOM mutations
-// 3. Builds real-time narrative of user actions
-// 4. Detects confusion triggers → "Teach Me" dialog
-// 5. Self-test execution with learned actions
-// 6. Skill generation (draft)
+// Architecture:
+// 1. Opens browser to agent's start_url (headed mode)
+// 2. Injects CDP event listener script to capture user clicks/navigations
+// 3. Polls captured events and emits them to the UI as recorded steps
+// 4. On "Save": LLM cleans raw events into a minimal waypoint recipe JSON
+// 5. Recipe saved to ~/.thinkdrop/skills/<agentId>/<dotName>.recipe.json
 //
 // Called from main.js when user clicks "Train" on an agent
 // ---------------------------------------------------------------------------
@@ -24,13 +23,18 @@ const OVERLAY_PORT = parseInt(process.env.OVERLAY_CONTROL_PORT || '3010', 10);
 const AGENTS_DIR   = path.join(os.homedir(), '.thinkdrop', 'agents');
 const SKILLS_DIR   = path.join(os.homedir(), '.thinkdrop', 'skills');
 
-// Track active training sessions
-const activeTrainingSessions = new Map(); // agentId -> session
+// Active training sessions
+const activeSessions = new Map(); // agentId -> session
+
+// Normalize agentId for skills directory (strip .agent suffix if present)
+function _skillDirId(agentId) {
+  return agentId.endsWith('.agent') ? agentId.slice(0, -6) : agentId;
+}
 
 // ---------------------------------------------------------------------------
 // Progress reporting to Electron UI
 // ---------------------------------------------------------------------------
-function _postTrainingProgress(agentId, payload) {
+function _postProgress(agentId, payload) {
   try {
     const data = JSON.stringify({ ...payload, agentId, timestamp: Date.now() });
     const req = http.request({
@@ -40,7 +44,7 @@ function _postTrainingProgress(agentId, payload) {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(data) },
       timeout: 3000,
-    }, (res) => {});
+    }, () => {});
     req.on('error', () => {});
     req.on('timeout', () => req.destroy());
     req.write(data);
@@ -49,707 +53,807 @@ function _postTrainingProgress(agentId, payload) {
 }
 
 // ---------------------------------------------------------------------------
-// Main training action
+// CDP Recorder Script — injected into the browser page
+// Captures clicks, inputs, navigations, and form submissions.
+// Results stored in window.__tdTrainEvents for polling.
+// ---------------------------------------------------------------------------
+const CDP_RECORDER_SCRIPT = `
+(function() {
+  if (window.__tdRecorderActive) return;
+  window.__tdRecorderActive = true;
+  window.__tdTrainEvents = window.__tdTrainEvents || [];
+
+  function getSelector(el) {
+    if (el.id) return '#' + el.id;
+    if (el.getAttribute('data-testid')) return '[data-testid="' + el.getAttribute('data-testid') + '"]';
+    if (el.getAttribute('aria-label')) return '[aria-label="' + el.getAttribute('aria-label') + '"]';
+    var path = el.tagName.toLowerCase();
+    if (el.className && typeof el.className === 'string') {
+      var cls = el.className.split(/\\\\s+/).filter(function(c) { return c && !c.startsWith('_'); }).slice(0, 2).join('.');
+      if (cls) path += '.' + cls;
+    }
+    var parent = el.parentElement;
+    if (parent) {
+      var siblings = Array.from(parent.children).filter(function(c) { return c.tagName === el.tagName; });
+      if (siblings.length > 1) {
+        var idx = siblings.indexOf(el) + 1;
+        path += ':nth-child(' + idx + ')';
+      }
+    }
+    return path;
+  }
+
+  function getAltSelectors(el) {
+    var alts = [];
+    var tag = el.tagName.toLowerCase();
+    var text = (el.textContent || '').trim().substring(0, 50);
+    var href = el.getAttribute('href') || '';
+    
+    // 1. Combined href + text selector (most specific for links)
+    if (href && text && tag === 'a') {
+      var shortText = text.substring(0, 20);
+      alts.push(tag + '[href*="' + href.split('?')[0].split('/').pop() + '"]:has-text("' + shortText + '")');
+    }
+    
+    // 2. Exact href match (highly deterministic)
+    if (href) {
+      alts.push(tag + '[href="' + href + '"]');
+      // Partial href match (path only, no query params)
+      var pathMatch = href.split('?')[0];
+      if (pathMatch && pathMatch !== href) {
+        alts.push(tag + '[href*="' + pathMatch.split('/').pop() + '"]');
+      }
+      // Short href match (just filename)
+      var filename = href.split('/').pop().split('?')[0];
+      if (filename && filename.length > 3) {
+        alts.push(tag + '[href*="' + filename + '"]');
+      }
+    }
+    
+    // 3. Text-based selector (for buttons/links with text)
+    if (text && text.length > 1 && text.length < 60) {
+      alts.push(tag + ':has-text("' + text.substring(0, 30) + '")');
+      // Exact text match variant
+      alts.push(tag + ':text-is("' + text.substring(0, 30) + '")');
+    }
+    
+    // 4. ARIA-based selectors (accessibility)
+    var role = el.getAttribute('role') || (tag === 'button' ? 'button' : tag === 'a' ? 'link' : null);
+    var ariaLabel = el.getAttribute('aria-label');
+    var ariaLabelledBy = el.getAttribute('aria-labelledby');
+    if (ariaLabel) {
+      alts.push(tag + '[aria-label="' + ariaLabel + '"]');
+      if (role) alts.push('[role="' + role + '"][aria-label="' + ariaLabel + '"]');
+    }
+    if (ariaLabelledBy) {
+      alts.push(tag + '[aria-labelledby="' + ariaLabelledBy + '"]');
+    }
+    
+    // 5. Class-based with text (for styled buttons)
+    var classes = el.className && typeof el.className === 'string' ? 
+      el.className.split(/\\s+/).filter(function(c) { return c && !c.match(/^_/) && c.length > 2; }).slice(0, 2) : [];
+    if (classes.length > 0 && text) {
+      alts.push(tag + '.' + classes.join('.') + ':has-text("' + text.substring(0, 20) + '")');
+    }
+    
+    // 6. Legacy format for backwards compatibility
+    if (text) alts.push('text=' + text);
+    if (role && (ariaLabel || text)) {
+      alts.push('role=' + role + '[name="' + (ariaLabel || text).substring(0, 40) + '"]');
+    }
+    
+    return alts;
+  }
+
+  // Checkbox/Radio — dedicated handler to capture checked state + label
+  document.addEventListener('click', function(e) {
+    var el = e.target;
+    if (el.tagName === 'INPUT' && (el.type === 'checkbox' || el.type === 'radio')) {
+      var label = (el.labels && el.labels[0]) ? el.labels[0].textContent.trim().substring(0, 60) : '';
+      window.__tdTrainEvents.push({
+        type: 'check', selector: getSelector(el), altSelectors: getAltSelectors(el),
+        checked: el.checked, label: label, inputType: el.type,
+        elementTag: el.tagName.toLowerCase(),
+        url: location.href, timestamp: Date.now()
+      });
+    }
+  }, true);
+
+  // Generic click — skip checkboxes/radios (handled above)
+  document.addEventListener('click', function(e) {
+    var raw = e.target;
+    if (raw.tagName === 'INPUT' && (raw.type === 'checkbox' || raw.type === 'radio')) return;
+    var el = raw.closest('a, button, [role="button"], [role="link"], input[type="submit"], [onclick]') || raw;
+    var selector = getSelector(el);
+    var altSelectors = getAltSelectors(el);
+    var text = (el.textContent || '').trim().substring(0, 60);
+    var href = el.href || (el.closest('a') || {}).href || '';
+    window.__tdTrainEvents.push({
+      type: 'click', selector: selector, altSelectors: altSelectors,
+      elementText: text, elementTag: el.tagName.toLowerCase(),
+      href: href, url: location.href, timestamp: Date.now()
+    });
+  }, true);
+
+  // Drag-and-drop — pointerdown/pointerup with 30px minimum distance
+  var _dragState = null;
+  document.addEventListener('pointerdown', function(e) {
+    _dragState = { startX: e.clientX, startY: e.clientY, el: e.target, time: Date.now() };
+  }, true);
+  document.addEventListener('pointerup', function(e) {
+    if (!_dragState) return;
+    var dx = e.clientX - _dragState.startX;
+    var dy = e.clientY - _dragState.startY;
+    var dist = Math.sqrt(dx * dx + dy * dy);
+    if (dist > 30) {
+      window.__tdTrainEvents.push({
+        type: 'drag', fromSelector: getSelector(_dragState.el),
+        altSelectors: getAltSelectors(_dragState.el),
+        fromX: _dragState.startX, fromY: _dragState.startY,
+        toX: e.clientX, toY: e.clientY,
+        distance: Math.round(dist),
+        url: location.href, timestamp: Date.now()
+      });
+    }
+    _dragState = null;
+  }, true);
+
+  // Scroll — debounced 500ms, 50px minimum delta
+  var _scrollTimer = null;
+  var _scrollStart = { x: window.scrollX, y: window.scrollY };
+  document.addEventListener('scroll', function() {
+    if (!_scrollTimer) {
+      _scrollStart = { x: window.scrollX, y: window.scrollY };
+    }
+    clearTimeout(_scrollTimer);
+    _scrollTimer = setTimeout(function() {
+      var deltaX = window.scrollX - _scrollStart.x;
+      var deltaY = window.scrollY - _scrollStart.y;
+      if (Math.abs(deltaX) > 50 || Math.abs(deltaY) > 50) {
+        window.__tdTrainEvents.push({
+          type: 'scroll', deltaX: deltaX, deltaY: deltaY,
+          scrollY: window.scrollY,
+          viewportHeight: window.innerHeight,
+          pageHeight: document.documentElement.scrollHeight,
+          url: location.href, timestamp: Date.now()
+        });
+      }
+      _scrollTimer = null;
+    }, 500);
+  }, true);
+
+  document.addEventListener('change', function(e) {
+    var el = e.target;
+    if (['INPUT', 'TEXTAREA', 'SELECT'].indexOf(el.tagName) === -1) return;
+    // Skip checkboxes/radios — already handled by the check listener
+    if (el.tagName === 'INPUT' && (el.type === 'checkbox' || el.type === 'radio')) return;
+    var selector = getSelector(el);
+    window.__tdTrainEvents.push({
+      type: el.tagName === 'SELECT' ? 'select' : 'fill',
+      selector: selector, altSelectors: getAltSelectors(el),
+      value: el.value, elementTag: el.tagName.toLowerCase(),
+      url: location.href, timestamp: Date.now()
+    });
+  }, true);
+
+  var lastUrl = location.href;
+  setInterval(function() {
+    if (location.href !== lastUrl) {
+      window.__tdTrainEvents.push({
+        type: 'navigate', url: location.href, previousUrl: lastUrl,
+        pageTitle: document.title, timestamp: Date.now()
+      });
+      lastUrl = location.href;
+    }
+  }, 300);
+
+  document.addEventListener('submit', function(e) {
+    window.__tdTrainEvents.push({
+      type: 'submit', selector: getSelector(e.target),
+      url: location.href, timestamp: Date.now()
+    });
+  }, true);
+
+  window.__tdTrainEvents.push({
+    type: 'navigate', url: location.href,
+    pageTitle: document.title, timestamp: Date.now()
+  });
+})();
+`;
+
+// ---------------------------------------------------------------------------
+// Main training action — start CDP recording session
 // ---------------------------------------------------------------------------
 async function actionTrain(args) {
-  const {
-    agentId,
-    _progressCallbackUrl,
-  } = args || {};
+  const { agentId } = args || {};
 
-  if (!agentId) {
-    return { ok: false, error: 'agentId is required' };
-  }
+  if (!agentId) return { ok: false, error: 'agentId is required' };
+  if (activeSessions.has(agentId)) return { ok: false, error: 'Training already in progress' };
 
-  // Check if already training
-  if (activeTrainingSessions.has(agentId)) {
-    return { ok: false, error: 'Training already in progress for this agent' };
-  }
-
-  // Load agent descriptor
-  const agentPath = path.join(AGENTS_DIR, `${agentId}.agent.md`);
-  if (!fs.existsSync(agentPath)) {
-    return { ok: false, error: `Agent not found: ${agentId}` };
-  }
+  const agentFile = agentId.endsWith('.agent') ? `${agentId}.md` : `${agentId}.agent.md`;
+  const agentPath = path.join(AGENTS_DIR, agentFile);
+  if (!fs.existsSync(agentPath)) return { ok: false, error: `Agent not found: ${agentId}` };
 
   const descriptor = fs.readFileSync(agentPath, 'utf8');
-  
-  // Extract start_url from frontmatter
   const startUrlMatch = descriptor.match(/^start_url:\s*(.+)$/m);
-  if (!startUrlMatch) {
-    return { ok: false, error: 'Agent missing start_url in frontmatter' };
-  }
-  
+  if (!startUrlMatch) return { ok: false, error: 'Agent missing start_url' };
+
   const startUrl = startUrlMatch[1].trim();
   const hostname = new URL(startUrl).hostname.replace(/^www\./, '');
+  const sessionId = `${agentId}_train`;
 
-  // Extract user_goals from frontmatter (multi-goal support)
-  const goalsMatch = descriptor.match(/^user_goals:[\s\S]*?(?=^\w|$)/m);
-  let userGoals = [];
-  if (goalsMatch) {
-    const goalLines = goalsMatch[0].split('\n').slice(1);
-    userGoals = goalLines
-      .map(line => line.match(/^\s*-\s*"?([^"\n]+)"?/)?.[1])
-      .filter(Boolean);
-  }
-  
-  // Fallback to legacy user_goal if no user_goals found
-  if (userGoals.length === 0) {
-    const legacyGoalMatch = descriptor.match(/^user_goal:\s*"?([^"\n]+)"?/m);
-    if (legacyGoalMatch) {
-      userGoals = [legacyGoalMatch[1].trim()];
-    }
-  }
-  
-  const primaryGoal = userGoals[0] || 'automate tasks';
-
-  // Create training session
   const session = {
-    agentId,
-    hostname,
-    startUrl,
-    userGoals,           // Array of goals to train for
-    primaryGoal,         // Primary goal for this session
-    currentGoalIndex: 0,  // Track which goal we're training for
+    agentId, hostname, startUrl, sessionId,
+    rawEvents: [],
     startTime: Date.now(),
-    snapshots: [], // { timestamp, snapshot, url }
-    narrative: [], // { timestamp, action, description }
-    teachMeQueue: [], // Confusion points to ask user
-    currentStep: 'observing', // observing | teach_me | self_test | generating
+    pollInterval: null,
     cancelRequested: false,
-    browserSessionId: `${agentId}_train_${Date.now()}`,
   };
-  activeTrainingSessions.set(agentId, session);
+  activeSessions.set(agentId, session);
 
-  logger.info(`[trainer.agent] Starting training for ${agentId} at ${startUrl} (${userGoals.length} goals)`);
-  _postTrainingProgress(agentId, { 
-    type: 'training:start', 
-    hostname, 
-    startUrl,
-    goals: userGoals,
-    primaryGoal,
-    message: `Training for: ${primaryGoal}${userGoals.length > 1 ? ` (${userGoals.length - 1} more goals)` : ''}`
-  });
+  logger.info(`[trainer.agent] Starting CDP recording for ${agentId} at ${startUrl}`);
 
   try {
-    // Phase 1: Open browser and start observation
-    await _startObservation(session);
-    
-    // Phase 2: Build narrative from snapshots (runs in background)
-    _startNarrativeBuilder(session);
-    
-    return {
-      ok: true,
-      agentId,
-      message: 'Training started. Browser opened. Click "Done Training" when finished demonstrating.',
-    };
+    const { browserAct } = require('./browser.act.cjs');
 
+    _postProgress(agentId, { type: 'training:start', hostname, startUrl });
+    await browserAct({ action: 'navigate', url: startUrl, sessionId, headed: true, timeoutMs: 30000 });
+    await browserAct({ action: 'waitForStableText', sessionId, headed: true, timeoutMs: 8000 }).catch(() => {});
+
+    // Inject CDP recorder script via addScriptTag (persists in page main world)
+    await browserAct({
+      action: 'run-code', sessionId, headed: true, timeoutMs: 15000,
+      code: `async page => { await page.addScriptTag({ content: ${JSON.stringify(CDP_RECORDER_SCRIPT)} }); return 'injected'; }`,
+    });
+
+    // Start polling for events
+    _startEventPoller(session);
+
+    // Emit initial step to UI
+    _postProgress(agentId, {
+      type: 'training:step-recorded',
+      stepType: 'url',
+      target: `${hostname} \u2192 Landing`,
+      url: startUrl,
+      pageTitle: hostname,
+    });
+
+    return { ok: true, agentId, message: 'Training recording started.' };
   } catch (err) {
-    logger.error(`[trainer.agent] Training error: ${err.message}`);
-    activeTrainingSessions.delete(agentId);
+    logger.error(`[trainer.agent] Start failed: ${err.message}`);
+    activeSessions.delete(agentId);
     return { ok: false, error: err.message };
   }
 }
 
 // ---------------------------------------------------------------------------
-// Phase 1: Open browser and capture snapshots
+// Poll injected event array every 2s (serialised — no overlapping calls)
+// Uses run-code with page.evaluate/page.addScriptTag for persistent state.
 // ---------------------------------------------------------------------------
-async function _startObservation(session) {
-  const { startUrl, browserSessionId, agentId } = session;
-  
-  // Navigate to the site via browser.act
-  const browserAct = require('./browser.act.cjs');
-  
-  _postTrainingProgress(agentId, { type: 'training:navigating', message: 'Opening browser...' });
-  
-  // Navigate
-  await browserAct({
-    action: 'navigate',
-    url: startUrl,
-    sessionId: browserSessionId,
-    headed: true, // Show browser window
-    timeoutMs: 30000,
-  });
-  
-  // Wait for page to stabilize
-  await browserAct({
-    action: 'waitForStableText',
-    sessionId: browserSessionId,
-    headed: true,
-    timeoutMs: 10000,
-  }).catch(() => {});
-  
-  _postTrainingProgress(agentId, { 
-    type: 'training:observing', 
-    message: 'Watching your interactions... Click "Done Training" when finished.' 
-  });
-  
-  // Start snapshot capture loop
-  session.snapshotInterval = setInterval(async () => {
-    if (session.cancelRequested) {
-      clearInterval(session.snapshotInterval);
-      return;
+function _startEventPoller(session) {
+  const { agentId, sessionId } = session;
+  let lastIndex = 0;
+  let polling = false; // lock to prevent concurrent poll cycles
+
+  // Single run-code snippet that checks guard + reads events + re-injects if needed.
+  // IMPORTANT: We JSON.stringify the result ourselves inside run-code and return a string
+  // so that playwright-cli outputs it as a quoted string in ### Result.  Returning a raw
+  // object from page.evaluate would let Playwright re-serialise it, but the run-code
+  // wrapper only captures the outer return value — and when that value is an object
+  // playwright-cli prints its own representation which can be truncated or reformatted.
+  // By stringifying once here we get a single predictable escaped-JSON string.
+  //
+  // To avoid double-escape issues we do the JSON.stringify in the Node run-code context
+  // (not inside page.evaluate) so only one serialisation layer exists.
+  const POLL_CODE = `async page => {
+    const active = await page.evaluate(() => !!window.__tdRecorderActive);
+    if (!active) {
+      await page.addScriptTag({ content: ${JSON.stringify(CDP_RECORDER_SCRIPT)} });
+      return '__REINJECTED__';
     }
-    
+    const events = await page.evaluate(() => window.__tdTrainEvents || []);
+    return JSON.stringify(events);
+  }`;
+
+  session.pollInterval = setInterval(async () => {
+    if (session.cancelRequested) { clearInterval(session.pollInterval); return; }
+    if (polling) return; // previous cycle still in flight
+    polling = true;
+
     try {
-      const snapResult = await browserAct({
-        action: 'snapshot',
-        sessionId: browserSessionId,
-        headed: true,
-        timeoutMs: 10000,
+      const { browserAct } = require('./browser.act.cjs');
+
+      const result = await browserAct({
+        action: 'run-code', sessionId, headed: true, timeoutMs: 15000,
+        code: POLL_CODE,
       });
-      
-      if (snapResult.ok && snapResult.result) {
-        const snapshot = {
-          timestamp: Date.now(),
-          snapshot: snapResult.result,
-          url: snapResult.url || startUrl,
-        };
-        session.snapshots.push(snapshot);
-        
-        // Keep only last 100 snapshots to prevent memory bloat
-        if (session.snapshots.length > 100) {
-          session.snapshots.shift();
-        }
-        
-        // Check for confusion triggers
-        _detectConfusion(session, snapshot);
-      }
-    } catch (e) {
-      // Non-fatal - continue capturing
-    }
-  }, 2000); // Capture every 2 seconds
-}
 
-// ---------------------------------------------------------------------------
-// Phase 2: Build narrative from snapshots using LLM
-// ---------------------------------------------------------------------------
-function _startNarrativeBuilder(session) {
-  const { agentId } = session;
-  
-  let lastSnapshotIndex = 0;
-  
-  session.narrativeInterval = setInterval(async () => {
-    if (session.cancelRequested || session.currentStep !== 'observing') {
-      clearInterval(session.narrativeInterval);
-      return;
-    }
-    
-    // Process new snapshots
-    const newSnapshots = session.snapshots.slice(lastSnapshotIndex);
-    if (newSnapshots.length < 2) return; // Need at least 2 to compare
-    
-    lastSnapshotIndex = session.snapshots.length;
-    
-    // Compare last two snapshots to detect changes
-    const current = newSnapshots[newSnapshots.length - 1];
-    const previous = newSnapshots[newSnapshots.length - 2];
-    
-    // Check if significant change occurred
-    if (_hasSignificantChange(previous.snapshot, current.snapshot)) {
-      // Ask LLM to describe what happened
+      logger.info(`[trainer.agent] poll: ok=${result.ok} resultType=${typeof result.result} resultLen=${(result.result||'').length} preview=${JSON.stringify((result.result||'').slice(0,80))}`);
+      if (!result.ok || !result.result) { logger.info('[trainer.agent] poll: empty result, skipping'); polling = false; return; }
+
+      const raw = result.result;
+
+      // Sentinel: if we just re-injected, skip this cycle
+      if (raw === '__REINJECTED__') {
+        logger.info(`[trainer.agent] Re-injected CDP recorder after navigation`);
+        polling = false;
+        return;
+      }
+
+      // The run-code returns JSON.stringify(events) from Node context.
+      // playwright-cli wraps it as: ### Result\n"<json-string-escaped>"\n
+      // The result extractor strips outer quotes but leaves \" escapes intact.
+      // So raw = [{\"type\":\"navigate\",...}] — this is a JSON-string body
+      // without the surrounding quotes.  Re-wrapping in quotes and JSON.parse
+      // correctly unescapes everything including nested quotes in altSelectors.
+      let parsed;
       try {
-        const narrative = await _generateNarrative(previous, current, session);
-        if (narrative) {
-          session.narrative.push({
-            timestamp: current.timestamp,
-            action: narrative.action,
-            description: narrative.description,
-          });
-          
-          _postTrainingProgress(agentId, {
-            type: 'training:narrative',
-            message: narrative.description,
-            narrative: session.narrative,
-          });
+        // First try direct parse (works if result extractor gave clean JSON)
+        parsed = JSON.parse(raw);
+      } catch {
+        try {
+          // Re-wrap as a JSON string value, then parse to get the unescaped string
+          const unescaped = JSON.parse('"' + raw + '"');
+          parsed = JSON.parse(unescaped);
+        } catch (e2) {
+          logger.warn(`[trainer.agent] poll JSON parse failed: ${e2.message} rawLen=${raw.length} raw=${JSON.stringify(raw.slice(0, 200))}`);
+          polling = false; return;
         }
-      } catch (e) {
-        logger.warn(`[trainer.agent] Narrative generation failed: ${e.message}`);
       }
-    }
-  }, 3000); // Check every 3 seconds
+      // If parsed is still a string (extra encoding layer), parse once more
+      if (typeof parsed === 'string') {
+        try { parsed = JSON.parse(parsed); } catch (e) {
+          logger.warn(`[trainer.agent] poll double-parse failed: ${e.message}`);
+          polling = false; return;
+        }
+      }
+
+      // parsed should be the events array
+      const events = Array.isArray(parsed) ? parsed : [];
+      const newEvents = events.slice(lastIndex);
+      logger.info(`[trainer.agent] poll: parsed ${events.length} events, ${newEvents.length} new (lastIndex=${lastIndex})`);
+      lastIndex = events.length;
+
+      for (const evt of newEvents) {
+        // Deduplicate: skip same type+selector within 500ms
+        const last = session.rawEvents[session.rawEvents.length - 1];
+        if (last && last.type === evt.type && last.selector === evt.selector
+            && Math.abs(evt.timestamp - last.timestamp) < 500) continue;
+
+        session.rawEvents.push(evt);
+
+        // Emit to UI
+        const uiStep = _eventToUIStep(evt);
+        logger.info(`[trainer.agent] emitting step: type=${evt.type} uiStep=${!!uiStep}`);
+        if (uiStep) _postProgress(agentId, { type: 'training:step-recorded', ...uiStep });
+      }
+    } catch (pollErr) { logger.warn(`[trainer.agent] poll error: ${pollErr.message}`); }
+    polling = false;
+  }, 1000);
 }
 
 // ---------------------------------------------------------------------------
-// Detect confusion triggers for "Teach Me"
+// Convert raw CDP event to UI step format
 // ---------------------------------------------------------------------------
-async function _detectConfusion(session, snapshot) {
-  const { agentId, narrative } = session;
-  
-  // Triggers:
-  // 1. Page changed but we can't determine what happened
-  // 2. Multiple interactive elements appeared
-  // 3. Form validation errors
-  // 4. Unexpected modal/dialog
-  
-  const snapshotText = snapshot.snapshot.toLowerCase();
-  
-  // Check for error indicators
-  const errorIndicators = ['error', 'invalid', 'required', 'please fill', 'not valid'];
-  const hasError = errorIndicators.some(ind => snapshotText.includes(ind));
-  
-  // Check for modal/dialog
-  const modalIndicators = ['modal', 'dialog', 'popup', 'overlay'];
-  const hasModal = modalIndicators.some(ind => snapshotText.includes(ind));
-  
-  if (hasError || hasModal) {
-    // Pause and ask user
-    session.currentStep = 'teach_me';
-    
-    const question = hasError 
-      ? "I see a form error. What field needs to be corrected?"
-      : "A dialog/modal appeared. What is this for?";
-    
-    const options = hasError
-      ? ['Fix missing field', 'Correct format', 'Add required info', 'Something else']
-      : ['Confirm action', 'Enter information', 'Close/cancel', 'Something else'];
-    
-    _postTrainingProgress(agentId, {
-      type: 'training:teach_me',
-      question,
-      options,
-      snapshot: snapshot.snapshot.substring(0, 500), // Truncated for UI
-    });
+function _eventToUIStep(evt) {
+  switch (evt.type) {
+    case 'navigate':
+      return {
+        stepType: 'url',
+        target: `${evt.pageTitle || new URL(evt.url).pathname} \u2192 Page`,
+        url: evt.url,
+        pageTitle: evt.pageTitle,
+      };
+    case 'click':
+      return {
+        stepType: 'click',
+        target: `${evt.elementText || evt.selector} \u2192 Clicked`,
+        selector: evt.selector,
+        url: evt.url,
+      };
+    case 'fill':
+      return {
+        stepType: 'fill',
+        target: `${evt.selector} \u2192 "${(evt.value || '').substring(0, 30)}"`,
+        selector: evt.selector,
+        value: evt.value,
+        url: evt.url,
+      };
+    case 'select':
+      return {
+        stepType: 'select',
+        target: `${evt.selector} \u2192 Selected "${(evt.value || '').substring(0, 30)}"`,
+        selector: evt.selector,
+        value: evt.value,
+        url: evt.url,
+      };
+    case 'submit':
+      return {
+        stepType: 'submit',
+        target: `Form submitted`,
+        selector: evt.selector,
+        url: evt.url,
+      };
+    case 'check':
+      return {
+        stepType: 'check',
+        target: `${evt.label || evt.selector} \u2192 ${evt.checked ? 'checked' : 'unchecked'}`,
+        selector: evt.selector,
+        url: evt.url,
+      };
+    case 'drag':
+      return {
+        stepType: 'drag',
+        target: `${evt.fromSelector} \u2192 dragged ${evt.distance}px`,
+        selector: evt.fromSelector,
+        url: evt.url,
+      };
+    case 'scroll':
+      return {
+        stepType: 'scroll',
+        target: `Scrolled ${evt.deltaY > 0 ? 'down' : 'up'} ${Math.abs(evt.deltaY)}px`,
+        url: evt.url,
+      };
+    case 'extract':
+      return {
+        stepType: 'extract',
+        target: `Extract "${evt.extractName}" from ${evt.selector}`,
+        selector: evt.selector,
+        extractName: evt.extractName,
+        extractType: evt.extractType,
+        url: evt.url,
+      };
+    default:
+      return null;
   }
 }
 
 // ---------------------------------------------------------------------------
-// Generate narrative from snapshot changes
+// Save training — LLM cleans events into waypoint recipe, saves to disk
 // ---------------------------------------------------------------------------
-async function _generateNarrative(previous, current, session) {
-  const currentGoal = session.userGoals[session.currentGoalIndex] || session.primaryGoal;
-  
-  const prompt = `You are observing a user training a browser automation agent.
+async function actionSaveTraining(args) {
+  const { agentId, skillName } = args || {};
 
-GOAL: ${currentGoal}
+  if (!agentId) return { ok: false, error: 'agentId is required' };
+  if (!skillName) return { ok: false, error: 'skillName is required' };
 
-Previous page state:
-URL: ${previous.url}
-Snapshot: ${previous.snapshot.substring(0, 1000)}
+  // Validate dot-name format
+  if (!/^[a-z][a-z0-9]*\.[a-z][a-z0-9_]*$/.test(skillName)) {
+    return { ok: false, error: 'Skill name must be dot-separated: agent.suffix (e.g. w3schools.editor)' };
+  }
 
-Current page state:
-URL: ${current.url}
-Snapshot: ${current.snapshot.substring(0, 1000)}
+  const session = activeSessions.get(agentId);
+  if (!session) return { ok: false, error: 'No active training session' };
+  if (session.rawEvents.length < 2) return { ok: false, error: 'Not enough recorded steps' };
 
-Describe what the user likely did in ONE SHORT SENTENCE (max 10 words).
-Focus on the ACTION that advances toward the goal, not the result.
+  // Stop polling
+  if (session.pollInterval) clearInterval(session.pollInterval);
+  session.cancelRequested = true;
 
-Examples:
-- "Clicked the Create Track button"
-- "Filled in the title field"
-- "Selected Electronic from dropdown"
-- "Submitted the form"
+  _postProgress(agentId, { type: 'training:saving', message: 'Building waypoint recipe...' });
 
-Reply ONLY with the description sentence, no preamble.`;
+  try {
+    // Build recipe via LLM cleanup
+    const recipe = await _buildRecipe(session, skillName);
+
+    // Save recipe file
+    const skillDir = path.join(SKILLS_DIR, _skillDirId(agentId));
+    if (!fs.existsSync(skillDir)) fs.mkdirSync(skillDir, { recursive: true });
+
+    const recipePath = path.join(skillDir, `${skillName}.recipe.json`);
+    fs.writeFileSync(recipePath, JSON.stringify(recipe, null, 2), 'utf8');
+
+    // Update agent descriptor with trained_skills entry
+    _registerSkillInAgent(agentId, skillName, recipe);
+
+    // Clean up session
+    activeSessions.delete(agentId);
+
+    logger.info(`[trainer.agent] Recipe saved: ${recipePath}`);
+    _postProgress(agentId, {
+      type: 'training:saved',
+      skillName,
+      recipePath,
+      waypointCount: recipe.waypoints.length,
+      message: `Skill "${skillName}" saved with ${recipe.waypoints.length} waypoints.`,
+    });
+
+    return { ok: true, skillName, recipePath, recipe };
+  } catch (err) {
+    logger.error(`[trainer.agent] Save failed: ${err.message}`);
+    _postProgress(agentId, { type: 'training:error', message: err.message });
+    return { ok: false, error: err.message };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Build waypoint recipe from raw events using LLM
+// ---------------------------------------------------------------------------
+async function _buildRecipe(session, skillName) {
+  const { agentId, hostname, startUrl, rawEvents } = session;
+
+  // Format events for LLM
+  const eventSummary = rawEvents.map((e, i) => {
+    switch (e.type) {
+      case 'navigate': return `${i + 1}. [NAV] ${e.url} (title: "${e.pageTitle || ''}")`;
+      case 'click': return `${i + 1}. [CLICK] "${e.elementText || ''}" selector: ${e.selector}${e.href ? ` href: ${e.href}` : ''}`;
+      case 'check': return `${i + 1}. [CHECK] "${e.label || ''}" selector: ${e.selector} → ${e.checked ? 'checked' : 'unchecked'}`;
+      case 'drag': return `${i + 1}. [DRAG] from ${e.fromSelector} (${e.fromX},${e.fromY}) → (${e.toX},${e.toY}) dist: ${e.distance}px`;
+      case 'scroll': return `${i + 1}. [SCROLL] dy: ${e.deltaY}px (now at ${e.scrollY}/${e.pageHeight})`;
+      case 'fill': return `${i + 1}. [FILL] ${e.selector} value: "${e.value || ''}"`;
+      case 'select': return `${i + 1}. [SELECT] ${e.selector} value: "${e.value || ''}"`;
+      case 'submit': return `${i + 1}. [SUBMIT] ${e.selector}`;
+      case 'extract': return `${i + 1}. [EXTRACT] "${e.extractName}" from ${e.selector} (type: ${e.extractType || 'text'})`;
+      default: return `${i + 1}. [${e.type}] ${e.selector || e.url}`;
+    }
+  }).join('\n');
+
+  const prompt = `You are processing raw browser interaction events into a minimal waypoint recipe for browser automation.
+
+AGENT: ${agentId}
+START URL: ${startUrl}
+SKILL NAME: ${skillName}
+
+RAW EVENTS (in order):
+${eventSummary}
+
+Create a MINIMAL waypoint recipe. Rules:
+1. Merge consecutive clicks that lead to the same page into a single navigate waypoint
+2. Remove noise (duplicate navigations, insignificant clicks)
+3. Each waypoint should represent a meaningful navigation step
+4. The LAST waypoint is the TARGET — where the user wants the AI to start working
+5. Include the primary CSS selector AND alternative selectors for each click waypoint
+6. Include URL checkpoints for navigation waypoints
+7. EXTRACT waypoints capture data from the page - preserve them for WALT tool returns
+
+WAYPOINT TYPE CATALOG (use only what the workflow needs):
+- navigate: { step, type: "navigate", url, pageTitle?, checkpoint? }
+- click: { step, type: "click", selector, altSelectors[], elementText?, href?, expectedResult? }
+- fill: { step, type: "fill", selector, value, elementText? }
+- select: { step, type: "select", selector, value }
+- check: { step, type: "check", selector, label?, checked? }
+- drag: { step, type: "drag", fromSelector, fromX, fromY, toX, toY, distance }
+- scroll: { step, type: "scroll", deltaY, scrollY?, pageHeight? }
+- submit: { step, type: "submit", selector }
+- extract: { step, type: "extract", selector, extractName, extractType, description?, dataAttr?, attrName? }
+
+EXTRACT TYPES (for extract waypoints):
+- text: Element textContent
+- href: Link URL
+- value: Input value
+- html: Outer HTML
+- src: Image/video source URL
+- data: data-* attribute (requires dataAttr field)
+- attr: Any attribute by name (requires attrName field)
+- json: Parse content as JSON
+- table: Extract table as array of objects
+- list: Extract list items as array
+
+Map each RAW EVENT to the appropriate waypoint type from the catalog. Output ONLY valid JSON:
+{
+  "name": "${skillName}",
+  "agentId": "${agentId}",
+  "startUrl": "${startUrl}",
+  "targetUrl": "<final URL>",
+  "waypoints": [<array of waypoints, mix types as needed>],
+  "returns": {<if extract waypoints: "extractName": { "type": "string", "description": "..." }>},
+  "targetDescription": "<description>",
+  "created": "${new Date().toISOString()}"
+}`;
 
   const response = await askWithMessages([
-    { role: 'system', content: 'You describe user actions for browser automation training.' },
-    { role: 'user', content: prompt }
-  ], { maxTokens: 100, temperature: 0.3 });
+    { role: 'system', content: 'You convert raw browser events into minimal waypoint recipes. Output ONLY valid JSON.' },
+    { role: 'user', content: prompt },
+  ], { maxTokens: 1500, temperature: 0.2 });
 
-  const description = response?.trim() || 'Performed an action';
-  
+  // Parse response — strip markdown fences if present
+  let json = (response || '').trim();
+  json = json.replace(/^```(?:json)?\s*\n?/i, '').replace(/\n?```\s*$/, '');
+
+  try {
+    const recipe = JSON.parse(json);
+    // Ensure required fields
+    recipe.name = skillName;
+    recipe.agentId = agentId;
+    recipe.startUrl = startUrl;
+    recipe.created = recipe.created || new Date().toISOString();
+    return recipe;
+  } catch (e) {
+    // Fallback: build a simple recipe from raw events
+    logger.warn(`[trainer.agent] LLM recipe parse failed, using fallback: ${e.message}`);
+    return _buildFallbackRecipe(session, skillName);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Fallback recipe builder (no LLM needed)
+// ---------------------------------------------------------------------------
+function _buildFallbackRecipe(session, skillName) {
+  const { agentId, startUrl, hostname, rawEvents } = session;
+
+  // Extract unique navigations and significant clicks
+  const waypoints = [];
+  let step = 0;
+  const seenUrls = new Set();
+
+  const returns = {};
+
+  for (const evt of rawEvents) {
+    if (evt.type === 'navigate' && !seenUrls.has(evt.url)) {
+      seenUrls.add(evt.url);
+      step++;
+      waypoints.push({
+        step,
+        type: 'navigate',
+        url: evt.url,
+        pageTitle: evt.pageTitle || '',
+        checkpoint: `Page loaded: ${evt.pageTitle || evt.url}`,
+      });
+    } else if (evt.type === 'click' && evt.elementText) {
+      step++;
+      waypoints.push({
+        step,
+        type: 'click',
+        selector: evt.selector,
+        altSelectors: evt.altSelectors || [],
+        elementText: evt.elementText,
+        href: evt.href || '',
+        expectedResult: `Navigate or interact with "${evt.elementText}"`,
+      });
+    } else if (evt.type === 'extract') {
+      step++;
+      waypoints.push({
+        step,
+        type: 'extract',
+        selector: evt.selector,
+        extractName: evt.extractName,
+        extractType: evt.extractType || 'text',
+        description: `Extract ${evt.extractName} from page`,
+      });
+      // Add to returns schema
+      returns[evt.extractName] = {
+        type: evt.extractType === 'html' ? 'string' : 'string',
+        description: `Extracted ${evt.extractName} from ${evt.selector}`,
+      };
+    }
+  }
+
+  const lastNav = rawEvents.filter(e => e.type === 'navigate').pop();
+
   return {
-    action: 'interaction',
-    description,
+    name: skillName,
+    agentId,
+    startUrl,
+    targetUrl: lastNav?.url || startUrl,
+    waypoints,
+    returns: Object.keys(returns).length > 0 ? returns : undefined,
+    targetDescription: `Target page: ${lastNav?.pageTitle || lastNav?.url || startUrl}`,
+    created: new Date().toISOString(),
   };
 }
 
 // ---------------------------------------------------------------------------
-// Check if snapshots have significant changes
+// Register trained skill in agent's .md descriptor
 // ---------------------------------------------------------------------------
-function _hasSignificantChange(prevSnapshot, currSnapshot) {
-  // Simple heuristic: check if text content changed significantly
-  const prevText = prevSnapshot.replace(/\s+/g, ' ').trim();
-  const currText = currSnapshot.replace(/\s+/g, ' ').trim();
-  
-  // Calculate rough difference
-  const minLen = Math.min(prevText.length, currText.length);
-  if (minLen === 0) return currText.length > 0;
-  
-  const diff = Math.abs(prevText.length - currText.length);
-  const ratio = diff / minLen;
-  
-  // Significant if >10% change
-  return ratio > 0.1;
-}
-
-// ---------------------------------------------------------------------------
-// User answers "Teach Me" question
-// ---------------------------------------------------------------------------
-async function actionAnswerTeachMe(args) {
-  const { agentId, answer, explanation } = args || {};
-  
-  const session = activeTrainingSessions.get(agentId);
-  if (!session) {
-    return { ok: false, error: 'No active training session' };
-  }
-  
-  // Store the teaching moment
-  session.narrative.push({
-    timestamp: Date.now(),
-    action: 'teach_me',
-    description: `Learned: ${answer}${explanation ? ` (${explanation})` : ''}`,
-  });
-  
-  // Resume observation
-  session.currentStep = 'observing';
-  _startNarrativeBuilder(session);
-  
-  _postTrainingProgress(agentId, {
-    type: 'training:resumed',
-    message: `Got it! ${answer}. Continuing observation...`,
-  });
-  
-  return { ok: true };
-}
-
-// ---------------------------------------------------------------------------
-// User clicks "Done Training" - Phase 3: Self-Test
-// ---------------------------------------------------------------------------
-async function actionFinishTraining(args) {
-  const { agentId } = args || {};
-  
-  const session = activeTrainingSessions.get(agentId);
-  if (!session) {
-    return { ok: false, error: 'No active training session' };
-  }
-  
-  session.currentStep = 'self_test';
-  
-  // Stop observation
-  if (session.snapshotInterval) clearInterval(session.snapshotInterval);
-  if (session.narrativeInterval) clearInterval(session.narrativeInterval);
-  
-  _postTrainingProgress(agentId, {
-    type: 'training:review',
-    message: 'Reviewing what I learned...',
-    narrative: session.narrative,
-  });
-  
-  // Generate cleaned narrative with LLM
-  const cleanedNarrative = await _generateCleanNarrative(session);
-  
-  _postTrainingProgress(agentId, {
-    type: 'training:test_prompt',
-    message: `I learned: ${cleanedNarrative.summary}. Should I test this?`,
-    narrative: cleanedNarrative,
-  });
-  
-  return { ok: true, narrative: cleanedNarrative };
-}
-
-// ---------------------------------------------------------------------------
-// Generate cleaned narrative and identify parameters
-// ---------------------------------------------------------------------------
-async function _generateCleanNarrative(session) {
-  const { narrative, startUrl, hostname } = session;
-  
-  const narrativeText = narrative.map(n => `- ${n.description}`).join('\n');
-  
-  const prompt = `Clean up this browser automation training narrative and identify parameters vs hardcoded values.
-
-Raw training log:
-${narrativeText}
-
-Format as JSON:
-{
-  "summary": "One sentence describing the overall task",
-  "steps": [
-    { "action": "navigate", "target": "URL", "is_parameter": false }
-  ],
-  "parameters": [
-    { "name": "param_name", "description": "what this is for", "example": "example value" }
-  ],
-  "hardcoded": [
-    { "what": "terms checkbox", "why": "always required" }
-  ]
-}
-
-Guidelines:
-- User-entered text → parameter (title, name, message, etc.)
-- Pre-filled or static values → hardcoded
-- Navigation URLs → hardcoded (domain-specific)
-- Confirmation/verification steps → hardcoded
-
-Reply with ONLY valid JSON.`;
-
+function _registerSkillInAgent(agentId, skillName, recipe) {
   try {
-    const response = await askWithMessages([
-      { role: 'system', content: 'You clean up browser automation training narratives.' },
-      { role: 'user', content: prompt }
-    ], { maxTokens: 800, temperature: 0.3 });
-    
-    const cleaned = JSON.parse(response);
-    return cleaned;
-  } catch (e) {
-    // Fallback
-    return {
-      summary: 'Learned browser automation task',
-      steps: narrative.map(n => ({ action: 'interact', description: n.description })),
-      parameters: [],
-      hardcoded: [],
-    };
-  }
-}
+    const agentFile = agentId.endsWith('.agent') ? `${agentId}.md` : `${agentId}.agent.md`;
+    const agentPath = path.join(AGENTS_DIR, agentFile);
+    if (!fs.existsSync(agentPath)) return;
 
-// ---------------------------------------------------------------------------
-// Execute self-test with test values
-// ---------------------------------------------------------------------------
-async function actionRunSelfTest(args) {
-  const { agentId, testValues } = args || {};
-  
-  const session = activeTrainingSessions.get(agentId);
-  if (!session) {
-    return { ok: false, error: 'No active training session' };
-  }
-  
-  _postTrainingProgress(agentId, {
-    type: 'testing:start',
-    message: 'Running self-test with test values...',
-  });
-  
-  try {
-    const browserAct = require('./browser.act.cjs');
-    
-    // Replay the learned steps with test values
-    // This is simplified - real implementation would parse the cleaned narrative
-    
-    _postTrainingProgress(agentId, {
-      type: 'testing:progress',
-      message: 'Executing learned steps...',
-    });
-    
-    // Simulate test execution (would actually run browser.act steps)
-    await new Promise(r => setTimeout(r, 3000));
-    
-    _postTrainingProgress(agentId, {
-      type: 'testing:complete',
-      success: true,
-      message: 'Self-test completed successfully!',
-    });
-    
-    return { ok: true, success: true };
-    
-  } catch (err) {
-    _postTrainingProgress(agentId, {
-      type: 'testing:failed',
-      success: false,
-      message: `Test failed: ${err.message}`,
-    });
-    return { ok: false, error: err.message };
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Phase 4: Generate skill file (draft)
-// ---------------------------------------------------------------------------
-async function actionGenerateSkill(args) {
-  const { agentId, skillName } = args || {};
-  
-  const session = activeTrainingSessions.get(agentId);
-  if (!session) {
-    return { ok: false, error: 'No active training session' };
-  }
-  
-  const { narrative, hostname, startUrl } = session;
-  
-  _postTrainingProgress(agentId, {
-    type: 'generating:start',
-    message: `Generating skill "${skillName}"...`,
-  });
-  
-  try {
-    // Generate cleaned narrative
-    const cleaned = await _generateCleanNarrative(session);
-    
-    // Generate skill code
-    const skillCode = _generateSkillCode(skillName, cleaned, hostname, startUrl);
-    
-    // Ensure skills dir exists
-    if (!fs.existsSync(SKILLS_DIR)) {
-      fs.mkdirSync(SKILLS_DIR, { recursive: true });
-    }
-    
-    // Write draft skill
-    const skillPath = path.join(SKILLS_DIR, `${agentId}.${skillName}.draft.cjs`);
-    fs.writeFileSync(skillPath, skillCode, 'utf8');
-    
-    // Update agent.md with trained skill
-    _updateAgentWithSkill(agentId, skillName, cleaned.parameters);
-    
-    _postTrainingProgress(agentId, {
-      type: 'generating:complete',
-      message: `Skill "${skillName}" created as draft!`,
-      skillName,
-      parameters: cleaned.parameters.map(p => p.name),
-    });
-    
-    // Clean up session
-    activeTrainingSessions.delete(agentId);
-    
-    return { 
-      ok: true, 
-      skillName, 
-      skillPath,
-      parameters: cleaned.parameters.map(p => p.name),
-    };
-    
-  } catch (err) {
-    _postTrainingProgress(agentId, {
-      type: 'generating:error',
-      message: `Failed to generate skill: ${err.message}`,
-    });
-    return { ok: false, error: err.message };
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Generate deterministic skill code
-// ---------------------------------------------------------------------------
-function _generateSkillCode(skillName, cleaned, hostname, startUrl) {
-  const paramsList = cleaned.parameters.map(p => p.name).join(', ');
-  const paramChecks = cleaned.parameters.map(p => 
-    `  if (!${p.name}) return { ok: false, error: '${p.name} parameter required' };`
-  ).join('\n');
-  
-  const domainMapPath = `path.join(os.homedir(), '.thinkdrop', 'domain-maps', '${hostname}.json')`;
-  
-  return `'use strict';
-/**
- * ${skillName}.skill.cjs
- * Generated from training session on ${new Date().toISOString().split('T')[0]}
- * Domain: ${hostname}
- * Learned: ${cleaned.summary}
- */
-
-const path = require('path');
-const os = require('os');
-const fs = require('fs');
-
-const DOMAIN_MAP_PATH = ${domainMapPath};
-
-module.exports = async function run(args, context) {
-  const { ${paramsList} } = args;
-  const { logger } = context;
-  
-  // Validate parameters
-${paramChecks || '  // No parameters required'}
-  
-  // Load domain map
-  let domainMap;
-  try {
-    domainMap = JSON.parse(fs.readFileSync(DOMAIN_MAP_PATH, 'utf8'));
-  } catch (e) {
-    return { ok: false, error: 'Domain not learned. Please run Learn mode first.' };
-  }
-  
-  // Execute learned steps via browser.act
-  const browserAct = require('../mcp-services/command-service/src/skills/browser.act.cjs');
-  
-  const steps = [
-    // Steps would be generated from cleaned.steps
-    // This is a placeholder - real implementation would have actual steps
-    { action: 'navigate', url: '${startUrl}' },
-  ];
-  
-  for (const step of steps) {
-    const result = await browserAct({
-      ...step,
-      sessionId: context.sessionId || 'default',
-      timeoutMs: 30000,
-    });
-    
-    if (!result.ok) {
-      return { ok: false, error: \`Step failed: \${step.action}\`, step };
-    }
-  }
-  
-  return { 
-    ok: true, 
-    output: \`Completed: ${cleaned.summary}\`,
-  };
-};
-
-module.exports.validate = async function validate(context) {
-  // Quick health check
-  try {
-    const fs = require('fs');
-    if (!fs.existsSync(DOMAIN_MAP_PATH)) {
-      return { ok: false, error: 'Domain map not found' };
-    }
-    return { ok: true };
-  } catch (e) {
-    return { ok: false, error: e.message };
-  }
-};
-`;
-}
-
-// ---------------------------------------------------------------------------
-// Update agent.md with trained skill
-// ---------------------------------------------------------------------------
-function _updateAgentWithSkill(agentId, skillName, parameters) {
-  try {
-    const agentPath = path.join(AGENTS_DIR, `${agentId}.md`);
     let descriptor = fs.readFileSync(agentPath, 'utf8');
-    
-    // Add to trained_skills frontmatter
-    const skillEntry = `\n  - name: ${skillName}\n    status: draft\n    parameters: [${parameters.map(p => p.name).join(', ')}]`;
-    
+    const entry = `\n  - name: "${skillName}"\n    type: trained_recipe\n    target: "${recipe.targetDescription || ''}"\n    waypoints: ${recipe.waypoints.length}`;
+
     if (descriptor.includes('trained_skills:')) {
-      // Append to existing list
-      descriptor = descriptor.replace(
-        /(trained_skills:)/,
-        `$1${skillEntry}`
-      );
+      descriptor = descriptor.replace(/(trained_skills:)/, `$1${entry}`);
     } else {
-      // Add new section
-      descriptor = descriptor.replace(
-        /^(---\s*\n[\s\S]*?\n---)/,
-        `$1\ntrained_skills:${skillEntry}`
-      );
+      descriptor = descriptor.replace(/^(---\s*\n[\s\S]*?\n---)/, `$1\ntrained_skills:${entry}`);
     }
-    
+
     fs.writeFileSync(agentPath, descriptor, 'utf8');
-    logger.info(`[trainer.agent] Updated agent ${agentId} with skill ${skillName}`);
+    logger.info(`[trainer.agent] Registered ${skillName} in ${agentId}.agent.md`);
   } catch (e) {
-    logger.error(`[trainer.agent] Failed to update agent: ${e.message}`);
+    logger.error(`[trainer.agent] Failed to register skill: ${e.message}`);
   }
 }
 
 // ---------------------------------------------------------------------------
-// Cancel training
+// Cancel training — stop polling, close browser
 // ---------------------------------------------------------------------------
 function actionCancelTraining(args) {
   const { agentId } = args || {};
-  
-  const session = activeTrainingSessions.get(agentId);
-  if (!session) {
-    return { ok: false, error: 'No active training session' };
-  }
-  
+
+  const session = activeSessions.get(agentId);
+  if (!session) return { ok: false, error: 'No active training session' };
+
   session.cancelRequested = true;
-  
-  // Stop intervals
-  if (session.snapshotInterval) clearInterval(session.snapshotInterval);
-  if (session.narrativeInterval) clearInterval(session.narrativeInterval);
-  
-  // Close browser
-  const browserAct = require('./browser.act.cjs');
-  browserAct({
-    action: 'close',
-    sessionId: session.browserSessionId,
-  }).catch(() => {});
-  
-  activeTrainingSessions.delete(agentId);
-  
-  _postTrainingProgress(agentId, {
-    type: 'training:cancelled',
-    message: 'Training cancelled',
-  });
-  
+  if (session.pollInterval) clearInterval(session.pollInterval);
+
+  // Close browser session
+  const { browserAct } = require('./browser.act.cjs');
+  browserAct({ action: 'close', sessionId: session.sessionId }).catch(() => {});
+
+  activeSessions.delete(agentId);
+  _postProgress(agentId, { type: 'training:cancelled', message: 'Training cancelled' });
+
   return { ok: true };
+}
+
+// ---------------------------------------------------------------------------
+// List trained skills for an agent
+// ---------------------------------------------------------------------------
+function actionListSkills(args) {
+  const { agentId } = args || {};
+  if (!agentId) return { ok: false, error: 'agentId is required' };
+
+  const skillDir = path.join(SKILLS_DIR, _skillDirId(agentId));
+  if (!fs.existsSync(skillDir)) return { ok: true, skills: [] };
+
+  const files = fs.readdirSync(skillDir).filter(f => f.endsWith('.recipe.json'));
+  const skills = files.map(f => {
+    try {
+      const recipe = JSON.parse(fs.readFileSync(path.join(skillDir, f), 'utf8'));
+      return { name: recipe.name, target: recipe.targetDescription, waypoints: recipe.waypoints?.length || 0, created: recipe.created };
+    } catch { return null; }
+  }).filter(Boolean);
+
+  return { ok: true, skills };
+}
+
+// ---------------------------------------------------------------------------
+// Load a specific recipe by skill name (used by browser.agent at runtime)
+// ---------------------------------------------------------------------------
+function loadRecipe(agentId, skillName) {
+  const recipePath = path.join(SKILLS_DIR, _skillDirId(agentId), `${skillName}.recipe.json`);
+  if (!fs.existsSync(recipePath)) return null;
+  try {
+    return JSON.parse(fs.readFileSync(recipePath, 'utf8'));
+  } catch { return null; }
+}
+
+// ---------------------------------------------------------------------------
+// Fuzzy skill name matching — normalize dots/spaces/underscores
+// ---------------------------------------------------------------------------
+function findMatchingRecipe(agentId, taskText) {
+  const skillDir = path.join(SKILLS_DIR, _skillDirId(agentId));
+  if (!fs.existsSync(skillDir)) return null;
+
+  const normalized = taskText.toLowerCase().replace(/[\s_]+/g, '.');
+  const taskLower = taskText.toLowerCase();
+  const files = fs.readdirSync(skillDir).filter(f => f.endsWith('.recipe.json'));
+
+  // Pass 1: exact name match in task text (original fuzzy match)
+  for (const f of files) {
+    const name = f.replace('.recipe.json', '');
+    if (normalized.includes(name)) {
+      try { return JSON.parse(fs.readFileSync(path.join(skillDir, f), 'utf8')); }
+      catch { continue; }
+    }
+  }
+
+  // Pass 2: match on targetDescription or targetUrl keywords
+  for (const f of files) {
+    try {
+      const recipe = JSON.parse(fs.readFileSync(path.join(skillDir, f), 'utf8'));
+      // Check targetDescription keywords (2+ word overlap)
+      if (recipe.targetDescription) {
+        const descWords = recipe.targetDescription.toLowerCase().split(/\s+/).filter(w => w.length > 3);
+        const matchCount = descWords.filter(w => taskLower.includes(w)).length;
+        if (matchCount >= 2) return recipe;
+      }
+      // Check targetUrl path segments
+      if (recipe.targetUrl) {
+        try {
+          const urlPath = new URL(recipe.targetUrl).pathname.toLowerCase().replace(/[/_-]+/g, ' ').trim();
+          const pathWords = urlPath.split(/\s+/).filter(w => w.length > 3);
+          const pathMatch = pathWords.filter(w => taskLower.includes(w)).length;
+          if (pathMatch >= 1) return recipe;
+        } catch {}
+      }
+    } catch { continue; }
+  }
+
+  return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -757,9 +861,9 @@ function actionCancelTraining(args) {
 // ---------------------------------------------------------------------------
 module.exports = {
   actionTrain,
-  actionAnswerTeachMe,
-  actionFinishTraining,
-  actionRunSelfTest,
-  actionGenerateSkill,
+  actionSaveTraining,
   actionCancelTraining,
+  actionListSkills,
+  loadRecipe,
+  findMatchingRecipe,
 };

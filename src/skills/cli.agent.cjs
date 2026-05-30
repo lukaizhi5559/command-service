@@ -47,6 +47,10 @@ const DEFAULT_TIMEOUT_MS = 15000;
 
 let _db = null;
 
+function resetDbCache() {
+  _db = null;
+}
+
 async function getDb() {
   if (_db) return _db;
   fs.mkdirSync(path.dirname(AGENTS_DB_PATH), { recursive: true });
@@ -2080,6 +2084,8 @@ function _parseFrontmatterField(descriptor, key) {
 }
 
 async function actionListAllAgents() {
+  // Reset connection to ensure we see latest data (other modules may have deleted)
+  resetDbCache();
   const db = await getDb();
   if (!db) {
     return { ok: false, error: 'DB not available', agents: [] };
@@ -3161,7 +3167,7 @@ async function cliAgent(args) {
   }
 }
 
-module.exports = { cliAgent, KNOWN_CLI_MAP, actionListAllAgents };
+module.exports = { cliAgent, KNOWN_CLI_MAP, actionListAllAgents, resetDbCache };
 
 // ── One-shot startup migration: ensure ytdlp.agent has transcript capabilities ──
 // Runs 5s after module load to allow DuckDB init. No-ops if already patched.
