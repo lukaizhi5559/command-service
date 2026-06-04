@@ -4,7 +4,7 @@ const os = require('os');
 const fs = require('fs');
 const { execSync, spawn } = require('child_process');
 const logger = require('../logger.cjs');
-const { getDb } = require('./lib/agents-db.cjs');
+const { withDb } = require('@thinkdrop/agents-db');
 const { askWithMessages } = require('../skill-helpers/skill-llm.cjs');
 
 const PROJECTS_DIR = path.join(os.homedir(), '.thinkdrop', 'projects');
@@ -415,28 +415,28 @@ async function phase3(id, prompt, bddTests, planMd, agentsMd) {
 // ── action: create_project ────────────────────────────────────────────────────
 async function actionCreateProject({ prompt, name } = {}) {
   if (!prompt?.trim()) return { ok: false, error: 'prompt is required' };
-  const db = await getDb();
-  const id = makeId(prompt, name);
-  fs.mkdirSync(projectDir(id), { recursive: true });
-  logger.info('[creator.agent] create_project', { id });
-  const rec = { id, prompt, name: name || id, status: 'planning',
-    bdd_tests: null, agents_plan: null, tech_stack: null,
-    prototype_path: null, reviewer_verdict: 'pending', reviewer_notes: null };
-  await dbSave(db, rec);
-  try {
-    // Phase 1
-    rec.bdd_tests = await phase1(id, prompt);
+  return await withDb(async (db) => {
+    const id = makeId(prompt, name);
+    fs.mkdirSync(projectDir(id), { recursive: true });
+    logger.info('[creator.agent] create_project', { id });
+    const rec = { id, prompt, name: name || id, status: 'planning',
+      bdd_tests: null, agents_plan: null, tech_stack: null,
+      prototype_path: null, reviewer_verdict: 'pending', reviewer_notes: null };
     await dbSave(db, rec);
-    // Phase 2
-    const { planMd, agentsMd, agentIds, techStack } = await phase2(id, prompt, rec.bdd_tests);
-    rec.agents_plan = JSON.stringify({ planMd, agentsMd, agentIds });
-    rec.tech_stack = techStack;
-    rec.status = 'prototype';
-    await dbSave(db, rec);
-    // Phase 3
-    const p3 = await phase3(id, prompt, rec.bdd_tests, planMd, agentsMd);
-    rec.prototype_path = p3.protoDir;
-    rec.status = 'review';
+    try {
+      // Phase 1
+      rec.bdd_tests = await phase1(id, prompt);
+      await dbSave(db, rec);
+      // Phase 2
+      const { planMd, agentsMd, agentIds, techStack } = await phase2(id, prompt, rec.bdd_tests);
+      rec.agents_plan = JSON.stringify({ planMd, agentsMd, agentIds });
+      rec.tech_stack = techStack;
+      rec.status = 'prototype';
+      await dbSave(db, rec);
+      // Phase 3
+      const p3 = await phase3(id, prompt, rec.bdd_tests, planMd, agentsMd);
+      rec.prototype_path = p3.protoDir;
+      rec.status = 'review';
     await dbSave(db, rec);
     logger.info('[creator.agent] create_project complete', { id, status: 'review' });
     return {
@@ -450,24 +450,23 @@ async function actionCreateProject({ prompt, name } = {}) {
       },
       message: 'Project "' + id + '" ready for reviewer.agent. Run validate_project to gate it.',
     };
-  } catch (err) {
-    rec.status = 'error';
-    rec.reviewer_notes = err.message;
-    await dbSave(db, rec);
-    logger.error('[creator.agent] create_project failed', { id, error: err.message });
-    return { ok: false, id, error: err.message };
-  }
+    } catch (err) {
+      rec.status = 'error';
+      rec.reviewer_notes = err.message;
+      await dbSave(db, rec);
+      logger.error('[creator.agent] create_project failed', { id, error: err.message });
+      return { ok: false, id, error: err.message };
+    }
+  });
 }
 
 // ── action: run_prototype ─────────────────────────────────────────────────────
 async function actionRunPrototype({ id } = {}) {
   if (!id) return { ok: false, error: 'id is required' };
-  const db = await getDb();
-  let protoDir;
-  if (db) {
+  let protoDir = await withDb(async (db) => {
     const row = await db.get('SELECT prototype_path FROM projects WHERE id = ?', id);
-    protoDir = row?.prototype_path;
-  }
+    return row?.prototype_path;
+  }).catch(() => null);
   if (!protoDir) protoDir = path.join(projectDir(id), 'prototype');
   if (!fs.existsSync(protoDir)) return { ok: false, error: 'Prototype not found: ' + protoDir };
   if (!fs.existsSync(path.join(protoDir, 'package.json'))) return { ok: false, error: 'No package.json in prototype' };
@@ -481,34 +480,35 @@ async function actionRunPrototype({ id } = {}) {
 // ── action: query_project ─────────────────────────────────────────────────────
 async function actionQueryProject({ id } = {}) {
   if (!id) return { ok: false, error: 'id is required' };
-  const db = await getDb();
-  if (!db) return { ok: false, error: 'DuckDB not available' };
-  const row = await db.get('SELECT * FROM projects WHERE id = ?', id);
-  if (!row) return { ok: false, error: 'Project not found: ' + id };
-  const dir = projectDir(id);
-  return {
-    ok: true, project: row, dir,
-    files: {
-      bddTests: fs.existsSync(path.join(dir, 'tests', 'acceptance.feature')) ? path.join(dir, 'tests', 'acceptance.feature') : null,
-      plan:     fs.existsSync(path.join(dir, 'plan.md'))   ? path.join(dir, 'plan.md')   : null,
-      agents:   fs.existsSync(path.join(dir, 'agents.md')) ? path.join(dir, 'agents.md') : null,
-    },
-  };
+  return await withDb(async (db) => {
+    const row = await db.get('SELECT * FROM projects WHERE id = ?', id);
+    if (!row) return { ok: false, error: 'Project not found: ' + id };
+    const dir = projectDir(id);
+    return {
+      ok: true, project: row, dir,
+      files: {
+        bddTests: fs.existsSync(path.join(dir, 'tests', 'acceptance.feature')) ? path.join(dir, 'tests', 'acceptance.feature') : null,
+        plan:     fs.existsSync(path.join(dir, 'plan.md'))   ? path.join(dir, 'plan.md')   : null,
+        agents:   fs.existsSync(path.join(dir, 'agents.md')) ? path.join(dir, 'agents.md') : null,
+      },
+    };
+  });
 }
 
 // ── action: list_projects ─────────────────────────────────────────────────────
 async function actionListProjects() {
-  const db = await getDb();
-  if (!db) return { ok: false, error: 'DuckDB not available' };
-  const rows = await db.all('SELECT id, name, status, reviewer_verdict, created_at FROM projects ORDER BY created_at DESC');
-  return { ok: true, projects: rows };
+  return await withDb(async (db) => {
+    const rows = await db.all('SELECT id, name, status, reviewer_verdict, created_at FROM projects ORDER BY created_at DESC');
+    return { ok: true, projects: rows };
+  });
 }
 
 // ── action: validate_project — calls reviewer.agent ──────────────────────────
 async function actionValidateProject({ id } = {}) {
   if (!id) return { ok: false, error: 'id is required' };
-  const db = await getDb();
-  const row = db ? await db.get('SELECT * FROM projects WHERE id = ?', id) : null;
+  const row = await withDb(async (db) => {
+    return await db.get('SELECT * FROM projects WHERE id = ?', id);
+  }).catch(() => null);
   if (!row) return { ok: false, error: 'Project not found: ' + id };
 
   const dir = projectDir(id);
@@ -540,10 +540,10 @@ async function actionValidateProject({ id } = {}) {
     if (result?.data?.ok || result?.ok) {
       const verdict = result?.data?.verdict || result?.verdict || 'pass';
       const notes   = result?.data?.notes   || result?.notes   || '';
-      if (db) {
+      await withDb(async (db) => {
         await db.run('UPDATE projects SET reviewer_verdict=?, reviewer_notes=?, status=?, updated_at=? WHERE id=?',
           verdict, notes, verdict === 'pass' ? 'ready' : 'review', new Date().toISOString(), id);
-      }
+      });
       return { ok: true, id, verdict, notes };
     }
   } catch (_) { /* reviewer.agent not yet available — fall through to built-in checklist */ }
@@ -573,10 +573,10 @@ async function actionValidateProject({ id } = {}) {
   const verdict   = hasErrors ? 'fail' : issues.length === 0 ? 'pass' : 'pass-with-warnings';
   const notes     = issues.map(i => '[' + i.severity + '] ' + i.msg).join('\n');
 
-  if (db) {
+  await withDb(async (db) => {
     await db.run('UPDATE projects SET reviewer_verdict=?, reviewer_notes=?, status=?, updated_at=? WHERE id=?',
       verdict, notes, verdict === 'pass' || verdict === 'pass-with-warnings' ? 'ready' : 'review', new Date().toISOString(), id);
-  }
+  });
 
   return { ok: true, id, verdict, issues, notes };
 }
@@ -586,7 +586,6 @@ async function actionValidateProject({ id } = {}) {
 // with concrete blockers/patches. Fixes each affected file via a targeted LLM call.
 async function actionPatchProject({ id, reviewVerdict, blockers = [], warnings = [], patches = [], dimensions = {}, summary = '' } = {}) {
   if (!id) return { ok: false, error: 'id is required' };
-  const db = await getDb();
   const dir = projectDir(id);
   if (!fs.existsSync(dir)) return { ok: false, error: 'Project dir not found: ' + dir };
 
@@ -704,12 +703,12 @@ DEPENDENCY RULES — these MUST be enforced in every patched file:
   }
 
   // Update DB record
-  if (db) {
+  await withDb(async (db) => {
     await db.run(
       'UPDATE projects SET status=?, reviewer_verdict=?, updated_at=? WHERE id=?',
       'review', 'pending', new Date().toISOString(), id
     ).catch(() => {});
-  }
+  });
 
   logger.info('[creator.agent] patch_project done', { id, patchedFiles });
   return { ok: true, id, patchedFiles, feedbackApplied: feedbackBrief.slice(0, 300) };

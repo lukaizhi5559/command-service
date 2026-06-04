@@ -25,7 +25,7 @@ const os = require('os');
 const fs = require('fs');
 const { execSync } = require('child_process');
 const logger = require('../logger.cjs');
-const { getDb } = require('./lib/agents-db.cjs');
+const { withDb } = require('@thinkdrop/agents-db');
 const { askWithMessages } = require('../skill-helpers/skill-llm.cjs');
 
 // ── LLM helper (delegates to shared skill-llm.cjs) ───────────────────────────
@@ -294,12 +294,13 @@ Output ONLY valid JSON:
 async function actionReview({ projectId, projectDir: explicitDir } = {}) {
   if (!projectId) return { ok: false, error: 'projectId is required' };
 
-  const db = await getDb();
   let projectDir = explicitDir;
 
   // Look up project dir from DuckDB if not provided
-  if (!projectDir && db) {
-    const row = await db.get('SELECT * FROM projects WHERE id = ?', projectId).catch(() => null);
+  if (!projectDir) {
+    const row = await withDb(async (db) => {
+      return await db.get('SELECT * FROM projects WHERE id = ?', projectId).catch(() => null);
+    }).catch(() => null);
     if (row) projectDir = path.join(os.homedir(), '.thinkdrop', 'projects', projectId);
   }
   if (!projectDir) projectDir = path.join(os.homedir(), '.thinkdrop', 'projects', projectId);
@@ -464,14 +465,14 @@ async function actionReview({ projectId, projectDir: explicitDir } = {}) {
 // ── action: status ────────────────────────────────────────────────────────────
 async function actionStatus({ projectId } = {}) {
   if (!projectId) return { ok: false, error: 'projectId is required' };
-  const db = await getDb();
-  if (!db) return { ok: false, error: 'DuckDB not available' };
-  const row = await db.get(
-    'SELECT id, status, reviewer_verdict, reviewer_notes, updated_at FROM projects WHERE id = ?',
-    projectId
-  ).catch(() => null);
-  if (!row) return { ok: false, error: 'Project not found: ' + projectId };
-  return { ok: true, projectId, status: row.status, verdict: row.reviewer_verdict, notes: row.reviewer_notes, updatedAt: row.updated_at };
+  return await withDb(async (db) => {
+    const row = await db.get(
+      'SELECT id, status, reviewer_verdict, reviewer_notes, updated_at FROM projects WHERE id = ?',
+      projectId
+    ).catch(() => null);
+    if (!row) return { ok: false, error: 'Project not found: ' + projectId };
+    return { ok: true, projectId, status: row.status, verdict: row.reviewer_verdict, notes: row.reviewer_notes, updatedAt: row.updated_at };
+  });
 }
 
 // ── Main dispatcher ───────────────────────────────────────────────────────────

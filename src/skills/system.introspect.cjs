@@ -20,6 +20,7 @@ const path = require('path');
 const os = require('os');
 const fs = require('fs');
 const logger = require('../logger.cjs');
+const { withDb } = require('@thinkdrop/agents-db');
 
 const THINKDROP_DIR = path.join(os.homedir(), '.thinkdrop');
 const AGENTS_DB_PATH = path.join(THINKDROP_DIR, 'agents.db');
@@ -76,27 +77,29 @@ async function closeDb(db) {
 // ── Query handlers ───────────────────────────────────────────────────────────
 
 async function queryAgents() {
-  const db = await openDb(AGENTS_DB_PATH);
-  if (!db) {
+  // Use withDb from agents-db.cjs to ensure proper connection management
+  try {
+    return await withDb(async (db) => {
+      const rows = await db.all("SELECT id, type, service, cli_tool, status, last_validated FROM agents ORDER BY created_at DESC");
+      return {
+        count: rows.length,
+        agents: rows.map(r => ({
+          id: r.id,
+          type: r.type,
+          service: r.service,
+          cliTool: r.cli_tool,
+          status: r.status,
+          lastValidated: r.last_validated,
+        })),
+      };
+    });
+  } catch (e) {
+    logger.warn(`[system.introspect] Failed to query agents: ${e.message}`);
     // Fallback: read .md files from agents dir
     if (!fs.existsSync(AGENTS_DIR)) return { count: 0, agents: [] };
     const files = fs.readdirSync(AGENTS_DIR).filter(f => f.endsWith('.md'));
     return { count: files.length, agents: files.map(f => ({ id: f.replace('.md', ''), source: 'file' })) };
   }
-  try {
-    const rows = await dbAll(db, "SELECT id, type, service, cli_tool, status, last_validated FROM agents ORDER BY created_at DESC");
-    return {
-      count: rows.length,
-      agents: rows.map(r => ({
-        id: r.id,
-        type: r.type,
-        service: r.service,
-        cliTool: r.cli_tool,
-        status: r.status,
-        lastValidated: r.last_validated,
-      })),
-    };
-  } finally { await closeDb(db); }
 }
 
 async function querySkills() {
@@ -117,14 +120,38 @@ async function querySkills() {
 }
 
 async function queryDatabases() {
-  const dbFiles = [
-    { name: 'agents.db', path: AGENTS_DB_PATH },
+  // Use withDb for agents.db (single source of truth), openDb for others
+  const otherDbFiles = [
     { name: 'user_memory.duckdb', path: path.resolve(__dirname, '../../..', 'thinkdrop-user-memory-service/data/user_memory.duckdb') },
     { name: 'conversation.duckdb', path: path.resolve(__dirname, '../../..', 'conversation-service/data/conversation.duckdb') },
   ];
 
   const results = [];
-  for (const dbFile of dbFiles) {
+
+  // Handle agents.db using withDb (single source of truth)
+  if (fs.existsSync(AGENTS_DB_PATH)) {
+    try {
+      const agentsResult = await withDb(async (db) => {
+        const tables = await db.all("SELECT table_name FROM information_schema.tables WHERE table_schema = 'main'");
+        const tableDetails = [];
+        for (const t of tables) {
+          const name = t.table_name;
+          const countRows = await db.all(`SELECT COUNT(*) as cnt FROM "${name}"`);
+          tableDetails.push({ name, rowCount: countRows[0]?.cnt ?? 0 });
+        }
+        return { name: 'agents.db', exists: true, tables: tableDetails };
+      });
+      results.push(agentsResult);
+    } catch (e) {
+      logger.warn(`[system.introspect] Failed to query agents.db: ${e.message}`);
+      results.push({ name: 'agents.db', exists: true, tables: [], error: e.message });
+    }
+  } else {
+    results.push({ name: 'agents.db', exists: false, tables: [] });
+  }
+
+  // Handle other databases using openDb/closeDb
+  for (const dbFile of otherDbFiles) {
     if (!fs.existsSync(dbFile.path)) {
       results.push({ name: dbFile.name, exists: false, tables: [] });
       continue;

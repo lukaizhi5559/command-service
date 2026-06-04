@@ -30,6 +30,9 @@ const logger = require('../logger.cjs');
 // LLM tool awareness stay in sync with what shell.run will actually accept.
 const { ALLOWED_COMMANDS: SHELL_ALLOWED_COMMANDS } = require('./shell.run.cjs');
 
+// Import shared database module
+const { withDb, resetDbCache, AGENTS_DB_PATH, AGENTS_DIR } = require('@thinkdrop/agents-db');
+
 // Subset of ALLOWED_COMMANDS that are script interpreters (accept -c or -e flag)
 const _SHELL_INTERPRETERS = new Set(
   [...SHELL_ALLOWED_COMMANDS].filter(cmd =>
@@ -37,51 +40,7 @@ const _SHELL_INTERPRETERS = new Set(
   )
 );
 
-const AGENTS_DB_PATH = path.join(os.homedir(), '.thinkdrop', 'agents.db');
-const AGENTS_DIR     = path.join(os.homedir(), '.thinkdrop', 'agents');
 const DEFAULT_TIMEOUT_MS = 15000;
-
-// ---------------------------------------------------------------------------
-// DuckDB registry
-// ---------------------------------------------------------------------------
-
-let _db = null;
-
-function resetDbCache() {
-  _db = null;
-}
-
-async function getDb() {
-  if (_db) return _db;
-  fs.mkdirSync(path.dirname(AGENTS_DB_PATH), { recursive: true });
-  fs.mkdirSync(AGENTS_DIR, { recursive: true });
-  try {
-    const duckdbAsync = require('duckdb-async');
-    _db = await duckdbAsync.Database.create(AGENTS_DB_PATH);
-  } catch {
-    try {
-      const { Database } = require('duckdb');
-      const raw = await new Promise((resolve, reject) => {
-        const db = new Database(AGENTS_DB_PATH, (err) => { if (err) reject(err); else resolve(db); });
-      });
-      _db = {
-        run: (sql, ...p) => new Promise((res, rej) => { raw.run(sql, ...p, (e) => { if (e) rej(e); else res(); }); }),
-        all: (sql, ...p) => new Promise((res, rej) => { raw.all(sql, ...p, (e, rows) => { if (e) rej(e); else res(rows); }); }),
-        get: (sql, ...p) => new Promise((res, rej) => { raw.get(sql, ...p, (e, row) => { if (e) rej(e); else res(row); }); }),
-        close: () => new Promise((res) => raw.close(() => res())),
-      };
-    } catch { return null; }
-  }
-  await _db.run(`CREATE TABLE IF NOT EXISTS agents (
-    id TEXT PRIMARY KEY, type TEXT NOT NULL DEFAULT 'cli', service TEXT NOT NULL,
-    cli_tool TEXT, capabilities TEXT, descriptor TEXT, last_validated TIMESTAMP,
-    failure_log TEXT, status TEXT NOT NULL DEFAULT 'healthy', created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-  )`);
-  await _db.run(`CREATE TABLE IF NOT EXISTS cli_meta_cache (
-    service TEXT PRIMARY KEY, meta_json TEXT NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-  )`);
-  return _db;
-}
 
 
 // ---------------------------------------------------------------------------
@@ -225,16 +184,17 @@ async function resolveCLIMeta(service) {
   // 1. DuckDB cli_meta_cache — highest priority.
   //    validate_agent writes corrected meta here; this must win over the seed map
   //    so corrections actually propagate on subsequent calls.
+  let cachedMeta = null;
   try {
-    const db = await getDb();
-    if (db) {
+    await withDb(async (db) => {
       const rows = await db.all(
         "SELECT meta_json FROM cli_meta_cache WHERE service = ?", seedKey
       ).catch(() => null);
       if (rows && rows.length > 0) {
-        try { return JSON.parse(rows[0].meta_json); } catch {}
+        try { cachedMeta = JSON.parse(rows[0].meta_json); } catch {}
       }
-    }
+    });
+    if (cachedMeta) return cachedMeta;
   } catch {}
 
   // 2. Seed map — bootstrap fallback only (cold-start before any agent has been built).
@@ -264,8 +224,7 @@ async function resolveCLIMeta(service) {
 
   // 4. cache result in DuckDB
   try {
-    const db = await getDb();
-    if (db) {
+    await withDb(async (db) => {
       await db.run(`
         CREATE TABLE IF NOT EXISTS cli_meta_cache (
           service     TEXT PRIMARY KEY,
@@ -277,7 +236,7 @@ async function resolveCLIMeta(service) {
         "INSERT OR REPLACE INTO cli_meta_cache (service, meta_json, created_at) VALUES (?, ?, CURRENT_TIMESTAMP)",
         seedKey, JSON.stringify(meta)
       );
-    }
+    });
   } catch {}
 
   return meta;
@@ -726,31 +685,34 @@ Rules:
 async function actionRun({ cli, argv = [], cwd, env, timeoutMs, stdin, agentId, task, _progressCallbackUrl, _stepIndex }) {
   // ── Agentic path: agentId + task → LLM infers argv from descriptor ──
   if (agentId && task) {
-    const db = await getDb();
-    if (!db) return { ok: false, error: 'DuckDB not available for agentic run' };
+    const agentResult = await withDb(async (db) => {
+      const rows = await db.all(
+        'SELECT id, cli_tool, descriptor, status FROM agents WHERE id = ?', agentId
+      ).catch(() => null);
 
-    const rows = await db.all(
-      'SELECT id, cli_tool, descriptor, status FROM agents WHERE id = ?', agentId
-    ).catch(() => null);
+      if (!rows || rows.length === 0) {
+        return { ok: false, error: `No agent found: ${agentId}. Use action:build_agent to create it first.`, needsBuild: true };
+      }
 
-    if (!rows || rows.length === 0) {
-      return { ok: false, error: `No agent found: ${agentId}. Use action:build_agent to create it first.`, needsBuild: true };
-    }
+      const agent = rows[0];
+      if (agent.status === 'needs_update') {
+        logger.warn(`[cli.agent] run: agent ${agentId} status=needs_update, proceeding anyway`);
+      }
 
-    const agent = rows[0];
-    if (agent.status === 'needs_update') {
-      logger.warn(`[cli.agent] run: agent ${agentId} status=needs_update, proceeding anyway`);
-    }
+      const cliTool = agent.cli_tool;
+      if (!cliTool) return { ok: false, error: `Agent ${agentId} has no cli_tool — cannot run` };
 
-    const cliTool = agent.cli_tool;
-    if (!cliTool) return { ok: false, error: `Agent ${agentId} has no cli_tool — cannot run` };
+      const binPath = await whichCli(cliTool);
+      if (!binPath) {
+        return { ok: false, error: `CLI not found: ${cliTool}. Run action:build_agent to reinstall.`, needsBuild: true };
+      }
 
-    const binPath = await whichCli(cliTool);
-    if (!binPath) {
-      return { ok: false, error: `CLI not found: ${cliTool}. Run action:build_agent to reinstall.`, needsBuild: true };
-    }
+      logger.info(`[cli.agent] agentic run: ${agentId} task="${task}"`);
+      return { ok: true, agent, cliTool, binPath };
+    });
 
-    logger.info(`[cli.agent] agentic run: ${agentId} task="${task}"`);
+    if (!agentResult.ok) return agentResult;
+    const { agent, cliTool, binPath } = agentResult;
 
     // ── pre_steps: execute shared services before the CLI loop ──────────────
     // Descriptor frontmatter may declare pre_steps that must run first.
@@ -1828,12 +1790,15 @@ function generateUsagePlaybook(service, cliName, capabilities, subcommandMap) {
 async function _buildApiKeyAgentDescriptor({ service, serviceKey, agentId, meta, force = false }) {
   // Check registry
   if (!force) {
-    const db = await getDb();
-    if (db) {
+    const checkResult = await withDb(async (db) => {
       const rows = await db.all('SELECT id, status FROM agents WHERE id = ?', agentId);
       if (rows && rows.length > 0 && rows[0].status !== 'needs_update') {
-        return { ok: true, agentId, alreadyExists: true, status: rows[0].status, isApiKey: true };
+        return { found: true, status: rows[0].status };
       }
+      return { found: false };
+    });
+    if (checkResult.found) {
+      return { ok: true, agentId, alreadyExists: true, status: checkResult.status, isApiKey: true };
     }
   }
 
@@ -1865,15 +1830,14 @@ async function _buildApiKeyAgentDescriptor({ service, serviceKey, agentId, meta,
   const mdPath = path.join(AGENTS_DIR, `${agentId}.md`);
   fs.writeFileSync(mdPath, descriptor, 'utf8');
 
-  const db = await getDb();
-  if (db) {
+  await withDb(async (db) => {
     await db.run(
       `INSERT OR REPLACE INTO agents
          (id, type, service, cli_tool, capabilities, descriptor, last_validated, status, created_at)
        VALUES (?, 'api_key', ?, NULL, ?, ?, CURRENT_TIMESTAMP, 'healthy', CURRENT_TIMESTAMP)`,
       agentId, serviceKey, JSON.stringify(capabilities), descriptor
     );
-  }
+  });
 
   logger.info(`[cli.agent] built api_key agent: ${agentId}`);
   return { ok: true, agentId, alreadyExists: false, isApiKey: true, service: serviceKey, apiKeyEnvVar, apiKeyUrl, descriptor, mdPath };
@@ -1918,15 +1882,16 @@ async function actionBuildAgent({ service, cli: explicitCli, force = false }) {
 
   // Check registry — skip rebuild unless forced
   if (!force) {
-    const db = await getDb();
-    if (db) {
+    const checkResult = await withDb(async (db) => {
       const rows = await db.all('SELECT id, status FROM agents WHERE id = ?', agentId);
-      if (rows && rows.length > 0) {
-        const existingStatus = rows[0].status || 'needs_validation';
-        if (existingStatus !== 'needs_update') {
-          return { ok: true, agentId, alreadyExists: true, status: existingStatus };
-        }
+      if (rows?.length > 0) {
+        const status = rows[0].status || 'needs_validation';
+        if (status !== 'needs_update') return { found: true, status };
       }
+      return { found: false };
+    });
+    if (checkResult.found) {
+      return { ok: true, agentId, alreadyExists: true, status: checkResult.status };
     }
   }
 
@@ -1977,8 +1942,7 @@ async function actionBuildAgent({ service, cli: explicitCli, force = false }) {
   fs.writeFileSync(mdPath, descriptor, 'utf8');
 
   // Upsert into DuckDB
-  const db = await getDb();
-  if (db) {
+  await withDb(async (db) => {
     await db.run(
       `INSERT OR REPLACE INTO agents
          (id, type, service, cli_tool, capabilities, descriptor, last_validated, status, created_at)
@@ -1989,7 +1953,7 @@ async function actionBuildAgent({ service, cli: explicitCli, force = false }) {
       JSON.stringify(capabilities),
       descriptor
     );
-  }
+  });
 
   logger.info(`[cli.agent] built agent: ${agentId}`, { capabilities });
   return {
@@ -2014,37 +1978,30 @@ async function actionBuildAgent({ service, cli: explicitCli, force = false }) {
 async function actionQueryAgent({ service, id }) {
   if (!service && !id) return { ok: false, error: 'service or id is required' };
 
-  const db = await getDb();
-  if (!db) {
-    // Fallback: read from .md file on disk
-    const agentId  = id || `${(service || '').toLowerCase().replace(/[^a-z0-9]/g, '')}.agent`;
-    const mdPath   = path.join(AGENTS_DIR, `${agentId}.md`);
-    if (!fs.existsSync(mdPath)) return { ok: true, found: false, agentId };
-    return { ok: true, found: true, agentId, descriptor: fs.readFileSync(mdPath, 'utf8') };
-  }
+  return await withDb(async (db) => {
+    let rows;
+    if (id) {
+      rows = await db.all('SELECT * FROM agents WHERE id = ?', id);
+    } else {
+      const serviceKey = (service || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+      rows = await db.all('SELECT * FROM agents WHERE service = ? AND type = ?', serviceKey, 'cli');
+    }
 
-  let rows;
-  if (id) {
-    rows = await db.all('SELECT * FROM agents WHERE id = ?', id);
-  } else {
-    const serviceKey = (service || '').toLowerCase().replace(/[^a-z0-9]/g, '');
-    rows = await db.all('SELECT * FROM agents WHERE service = ? AND type = ?', serviceKey, 'cli');
-  }
+    if (!rows || rows.length === 0) return { ok: true, found: false };
 
-  if (!rows || rows.length === 0) return { ok: true, found: false };
-
-  const row = rows[0];
-  return {
-    ok: true,
-    found: true,
-    agentId: row.id,
-    service: row.service,
-    cliTool: row.cli_tool,
-    capabilities: row.capabilities ? JSON.parse(row.capabilities) : [],
-    status: row.status || 'needs_validation',
-    lastValidated: row.last_validated,
-    descriptor: row.descriptor,
-  };
+    const row = rows[0];
+    return {
+      ok: true,
+      found: true,
+      agentId: row.id,
+      service: row.service,
+      cliTool: row.cli_tool,
+      capabilities: row.capabilities ? JSON.parse(row.capabilities) : [],
+      status: row.status || 'needs_validation',
+      lastValidated: row.last_validated,
+      descriptor: row.descriptor,
+    };
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -2052,26 +2009,23 @@ async function actionQueryAgent({ service, id }) {
 // ---------------------------------------------------------------------------
 
 async function actionListAgents() {
-  const db = await getDb();
-  if (!db) {
-    if (!fs.existsSync(AGENTS_DIR)) return { ok: true, agents: [] };
-    const files = fs.readdirSync(AGENTS_DIR).filter(f => f.endsWith('.agent.md'));
-    return { ok: true, agents: files.map(f => ({ id: f.replace('.md', ''), type: 'cli' })) };
-  }
-
-  const rows = await db.all("SELECT id, type, service, cli_tool, capabilities, status, last_validated FROM agents WHERE type = 'cli' ORDER BY created_at DESC");
-  return {
-    ok: true,
-    agents: (rows || []).map(r => ({
-      id: r.id,
-      type: r.type,
-      service: r.service,
-      cliTool: r.cli_tool,
-      capabilities: r.capabilities ? JSON.parse(r.capabilities) : [],
-      status: r.status || 'needs_validation',
-      lastValidated: r.last_validated,
-    })),
-  };
+  if (!fs.existsSync(AGENTS_DIR)) return { ok: true, agents: [] };
+  
+  return await withDb(async (db) => {
+    const rows = await db.all("SELECT id, type, service, cli_tool, capabilities, status, last_validated FROM agents WHERE type = 'cli' ORDER BY created_at DESC");
+    return {
+      ok: true,
+      agents: (rows || []).map(r => ({
+        id: r.id,
+        type: r.type,
+        service: r.service,
+        cliTool: r.cli_tool,
+        capabilities: r.capabilities ? JSON.parse(r.capabilities) : [],
+        status: r.status || 'needs_validation',
+        lastValidated: r.last_validated,
+      })),
+    };
+  });
 }
 
 // Action: list_all_agents (for main process UI via HTTP)
@@ -2084,31 +2038,27 @@ function _parseFrontmatterField(descriptor, key) {
 }
 
 async function actionListAllAgents() {
-  // Reset connection to ensure we see latest data (other modules may have deleted)
-  resetDbCache();
-  const db = await getDb();
-  if (!db) {
-    return { ok: false, error: 'DB not available', agents: [] };
-  }
-  const rows = await db.all("SELECT id, type, service, cli_tool, capabilities, status, last_validated, descriptor FROM agents ORDER BY created_at DESC");
-  return {
-    ok: true,
-    agents: (rows || []).map(r => {
-      const apiKeyUrl = _parseFrontmatterField(r.descriptor, 'api_key_url');
-      const apiKeyEnv = _parseFrontmatterField(r.descriptor, 'api_key_env');
-      return {
-        id: r.id,
-        type: r.type || 'browser',
-        service: r.service,
-        cliTool: r.cli_tool,
-        capabilities: r.capabilities ? JSON.parse(r.capabilities) : [],
-        status: r.status || 'pending',
-        lastValidated: r.last_validated,
-        ...(apiKeyUrl ? { apiKeyUrl } : {}),
-        ...(apiKeyEnv ? { apiKeyEnv } : {}),
-      };
-    }),
-  };
+  return await withDb(async (db) => {
+    const rows = await db.all("SELECT id, type, service, cli_tool, capabilities, status, last_validated, descriptor FROM agents ORDER BY created_at DESC");
+    return {
+      ok: true,
+      agents: (rows || []).map(r => {
+        const apiKeyUrl = _parseFrontmatterField(r.descriptor, 'api_key_url');
+        const apiKeyEnv = _parseFrontmatterField(r.descriptor, 'api_key_env');
+        return {
+          id: r.id,
+          type: r.type || 'browser',
+          service: r.service,
+          cliTool: r.cli_tool,
+          capabilities: r.capabilities ? JSON.parse(r.capabilities) : [],
+          status: r.status || 'pending',
+          lastValidated: r.last_validated,
+          ...(apiKeyUrl ? { apiKeyUrl } : {}),
+          ...(apiKeyEnv ? { apiKeyEnv } : {}),
+        };
+      }),
+    };
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -2526,8 +2476,7 @@ Output ONLY valid JSON: { "issues": ["<precise mismatch description and fix>"], 
   if (descriptorPatched && !rebuildTriggered) {
     const mdPath = path.join(AGENTS_DIR, `${id}.md`);
     fs.writeFileSync(mdPath, patchedDescriptor, 'utf8');
-    const db = await getDb();
-    if (db) {
+    await withDb(async (db) => {
       await db.run(
         `UPDATE agents SET descriptor = ?, status = ?, failure_log = ?, last_validated = CURRENT_TIMESTAMP WHERE id = ?`,
         patchedDescriptor, finalStatus, failureLog, id
@@ -2563,7 +2512,7 @@ Output ONLY valid JSON: { "issues": ["<precise mismatch description and fix>"], 
       } catch (cacheErr) {
         logger.warn(`[cli.agent] validate_agent: cli_meta_cache write failed: ${cacheErr.message}`);
       }
-    }
+    });
   } else {
     await _updateAgentStatus(id, finalStatus, failureLog);
   }
@@ -2649,22 +2598,22 @@ function patchDescriptor(descriptor, { version, patch, newCaps, removedCaps }) {
 
 async function actionRecordFailure({ id, failureEntry }) {
   if (!id || !failureEntry) return { ok: false, error: 'id and failureEntry are required' };
-  const db = await getDb();
-  if (!db) return { ok: false, error: 'DB unavailable' };
   try {
-    // Append to existing failure_log (keep last 5 entries, newest first)
-    const row = await db.get('SELECT failure_log FROM agents WHERE id = ?', id);
-    if (!row) return { ok: false, error: `Agent not found: ${id}` };
-    const existing = row.failure_log || '';
-    const entries = existing ? existing.split('\n---\n') : [];
-    entries.unshift(failureEntry); // newest first
-    const trimmed = entries.slice(0, 5).join('\n---\n');
-    await db.run(
-      'UPDATE agents SET failure_log = ?, status = CASE WHEN status = \'healthy\' THEN \'degraded\' ELSE status END WHERE id = ?',
-      trimmed, id
-    );
-    logger.info(`[cli.agent] record_failure: appended runtime error for ${id}`);
-    return { ok: true, agentId: id };
+    return await withDb(async (db) => {
+      // Append to existing failure_log (keep last 5 entries, newest first)
+      const row = await db.get('SELECT failure_log FROM agents WHERE id = ?', id);
+      if (!row) return { ok: false, error: `Agent not found: ${id}` };
+      const existing = row.failure_log || '';
+      const entries = existing ? existing.split('\n---\n') : [];
+      entries.unshift(failureEntry); // newest first
+      const trimmed = entries.slice(0, 5).join('\n---\n');
+      await db.run(
+        'UPDATE agents SET failure_log = ?, status = CASE WHEN status = \'healthy\' THEN \'degraded\' ELSE status END WHERE id = ?',
+        trimmed, id
+      );
+      logger.info(`[cli.agent] record_failure: appended runtime error for ${id}`);
+      return { ok: true, agentId: id };
+    });
   } catch (err) {
     return { ok: false, error: err.message };
   }
@@ -3066,19 +3015,19 @@ async function actionReviewSeedMap() {
 }
 
 async function _updateAgentStatus(id, status, failureNote) {
-  const db = await getDb();
-  if (!db) return;
-  if (failureNote) {
-    await db.run(
-      'UPDATE agents SET status = ?, failure_log = ?, last_validated = CURRENT_TIMESTAMP WHERE id = ?',
-      status, failureNote, id
-    );
-  } else {
-    await db.run(
-      'UPDATE agents SET status = ?, last_validated = CURRENT_TIMESTAMP WHERE id = ?',
-      status, id
-    );
-  }
+  await withDb(async (db) => {
+    if (failureNote) {
+      await db.run(
+        'UPDATE agents SET status = ?, failure_log = ?, last_validated = CURRENT_TIMESTAMP WHERE id = ?',
+        status, failureNote, id
+      );
+    } else {
+      await db.run(
+        'UPDATE agents SET status = ?, last_validated = CURRENT_TIMESTAMP WHERE id = ?',
+        status, id
+      );
+    }
+  });
 }
 
 
@@ -3088,31 +3037,28 @@ async function _updateAgentStatus(id, status, failureNote) {
  */
 async function actionPatchAgent({ id, capabilities, descriptor, status }) {
   if (!id) return { ok: false, error: 'id is required' };
-  const db = await getDb();
-  if (!db) return { ok: false, error: 'DuckDB not available' };
+  return await withDb(async (db) => {
+    const rows = await db.all('SELECT id, capabilities, descriptor, status FROM agents WHERE id = ?', id).catch(() => null);
+    if (!rows || rows.length === 0) return { ok: false, error: `Agent not found: ${id}` };
 
-  const rows = await db.all('SELECT id, capabilities, descriptor, status FROM agents WHERE id = ?', id).catch(() => null);
-  if (!rows || rows.length === 0) return { ok: false, error: `Agent not found: ${id}` };
+    const current = rows[0];
+    let newCaps = current.capabilities || [];
+    if (Array.isArray(capabilities) && capabilities.length > 0) {
+      const capSet = new Set([...(Array.isArray(newCaps) ? newCaps : []), ...capabilities]);
+      newCaps = [...capSet];
+    }
 
-  const current = rows[0];
+    const newDescriptor = descriptor || current.descriptor;
+    const newStatus = status || current.status;
 
-  // Merge capabilities if provided (union, no duplicates)
-  let newCaps = current.capabilities || [];
-  if (Array.isArray(capabilities) && capabilities.length > 0) {
-    const capSet = new Set([...(Array.isArray(newCaps) ? newCaps : []), ...capabilities]);
-    newCaps = [...capSet];
-  }
+    await db.run(
+      'UPDATE agents SET capabilities = ?, descriptor = ?, status = ?, last_validated = CURRENT_TIMESTAMP WHERE id = ?',
+      JSON.stringify(newCaps), newDescriptor, newStatus, id
+    );
 
-  const newDescriptor = descriptor || current.descriptor;
-  const newStatus = status || current.status;
-
-  await db.run(
-    'UPDATE agents SET capabilities = ?, descriptor = ?, status = ?, last_validated = CURRENT_TIMESTAMP WHERE id = ?',
-    JSON.stringify(newCaps), newDescriptor, newStatus, id
-  );
-
-  logger.info(`[cli.agent] patch_agent: updated ${id} — caps=${newCaps.join(',').slice(0, 80)}`);
-  return { ok: true, id, capabilities: newCaps, status: newStatus };
+    logger.info(`[cli.agent] patch_agent: updated ${id}`);
+    return { ok: true, id, capabilities: newCaps, status: newStatus };
+  });
 }
 
 
@@ -3173,22 +3119,21 @@ module.exports = { cliAgent, KNOWN_CLI_MAP, actionListAllAgents, resetDbCache };
 // Runs 5s after module load to allow DuckDB init. No-ops if already patched.
 setTimeout(async () => {
   try {
-    const db = await getDb();
-    if (!db) return;
-    const rows = await db.all("SELECT capabilities FROM agents WHERE id = 'ytdlp.agent'").catch(() => null);
-    if (!rows || rows.length === 0) return;
-    const caps = Array.isArray(rows[0].capabilities) ? rows[0].capabilities : [];
-    if (caps.includes('extract_transcript')) return; // already patched
-    await actionPatchAgent({
-      id: 'ytdlp.agent',
-      capabilities: ['extract_transcript', 'write_auto_subs', 'write_subs', 'list_subs'],
-      descriptor: [
-        '---',
-        'id: ytdlp.agent',
-        'type: cli',
-        'service: ytdlp',
-        'cli_tool: yt-dlp',
-        'capabilities:',
+    await withDb(async (db) => {
+      const rows = await db.all("SELECT capabilities FROM agents WHERE id = 'ytdlp.agent'").catch(() => null);
+      if (!rows || rows.length === 0) return;
+      const caps = Array.isArray(rows[0].capabilities) ? rows[0].capabilities : [];
+      if (caps.includes('extract_transcript')) return; // already patched
+      await actionPatchAgent({
+        id: 'ytdlp.agent',
+        capabilities: ['extract_transcript', 'write_auto_subs', 'write_subs', 'list_subs'],
+        descriptor: [
+          '---',
+          'id: ytdlp.agent',
+          'type: cli',
+          'service: ytdlp',
+          'cli_tool: yt-dlp',
+          'capabilities:',
         '  - update_tool', '  - ignore_errors', '  - list_extractors',
         '  - use_specific_extractors', '  - set_default_search_prefix',
         '  - output_to_file', '  - simulate_download', '  - force_ipv4',
@@ -3235,6 +3180,7 @@ setTimeout(async () => {
       ].join('\n'),
     });
     logger.info('[cli.agent] startup migration: ytdlp.agent patched with transcript capabilities');
+    });
   } catch (e) {
     logger.warn(`[cli.agent] startup migration failed (non-fatal): ${e.message}`);
   }

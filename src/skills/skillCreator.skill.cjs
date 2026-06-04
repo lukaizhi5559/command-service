@@ -24,7 +24,7 @@ const path = require('path');
 const os   = require('os');
 const fs   = require('fs');
 const logger = require('../logger.cjs');
-const { getDb } = require('./lib/agents-db.cjs');
+const { withDb } = require('@thinkdrop/agents-db');
 
 const USER_SKILLS_DIR = path.join(os.homedir(), '.thinkdrop', 'skills');
 const PROJECTS_DIR    = path.join(os.homedir(), '.thinkdrop', 'projects');
@@ -914,8 +914,9 @@ async function actionGenerateSkill({ projectId, projectDir: projDir } = {}) {
   }
 
   // Register in DuckDB + memory MCP
-  const db = await getDb();
-  await registerSkill(db, dotName, skillPath, iface, projectId);
+  await withDb(async (db) => {
+    await registerSkill(db, dotName, skillPath, iface, projectId);
+  });
   // registerInMemoryMCP calls /skill.install on user-memory MCP (skill already at skillPath)
   // Pass _skillCode so oauth providers can be auto-detected from require() patterns
   const registeredName = await registerInMemoryMCP(dotName, { ...iface, _skillCode: skillCode }, skillPath, planMd) || dotName;

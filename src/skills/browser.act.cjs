@@ -4270,6 +4270,11 @@ If no videos found, return []. Do not explain, only output the JSON array.`;
         fixes.push('playwright-cli click only accepts element refs from snapshot (e.g. e12). Use eval with a function expression to click by text.');
       }
 
+      // Serialization/deserialization errors → session restart required
+      if (/Failed to deserialize|Serialization Error|expected end of object/i.test(errorText)) {
+        fixes.push('Node.js IPC serialization error detected. The browser session may be corrupted. Restart the browser session with a fresh sessionId.');
+      }
+
       const fixSummary = fixes.length > 0
         ? fixes.join(' | ')
         : `playwright-cli ${failedAction} usage: ${(cmdHelp || helpText).slice(0, 300)}`;

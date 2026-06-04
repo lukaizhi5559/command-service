@@ -280,9 +280,10 @@ const { userAgent } = require('./user.agent.cjs');
 const { resolveDestination, recordCorrection, classifyTaskIntent } = require('../skill-helpers/destination-resolver.cjs');
 const { killExistingChromeForProfile, clearProfileLock, findCli, shortSessionId } = require('./browser.act.cjs');
 
-const AGENTS_DB_PATH = path.join(os.homedir(), '.thinkdrop', 'agents.db');
-const AGENTS_DIR     = path.join(os.homedir(), '.thinkdrop', 'agents');
 const BROWSER_ACT_PORT = parseInt(process.env.COMMAND_SERVICE_PORT || '3007', 10);
+
+// Import shared database module
+const { withDb, AGENTS_DB_PATH, AGENTS_DIR } = require('@thinkdrop/agents-db');
 
 // Lazy-loaded to avoid circular require — only pulled in when auto-connect is active
 let _ensureChromeCDP = null;
@@ -290,51 +291,6 @@ function getEnsureChromeCDP() {
   if (!_ensureChromeCDP) _ensureChromeCDP = require('./agentbrowser.act.cjs').ensureChromeCDP;
   return _ensureChromeCDP;
 }
-
-// ---------------------------------------------------------------------------
-// DuckDB registry (shared with cli.agent)
-// ---------------------------------------------------------------------------
-
-let _db = null;
-
-async function getDb() {
-  if (_db) return _db;
-  fs.mkdirSync(path.dirname(AGENTS_DB_PATH), { recursive: true });
-  fs.mkdirSync(AGENTS_DIR, { recursive: true });
-  try {
-    const duckdbAsync = require('duckdb-async');
-    _db = await duckdbAsync.Database.create(AGENTS_DB_PATH);
-    logger.info(`[browser.agent] getDb: connected via duckdb-async to ${AGENTS_DB_PATH}`);
-  } catch (e1) {
-    logger.warn(`[browser.agent] getDb: duckdb-async failed: ${e1.message}`);
-    try {
-      const { Database } = require('duckdb');
-      const raw = await new Promise((resolve, reject) => {
-        const db = new Database(AGENTS_DB_PATH, (err) => { if (err) reject(err); else resolve(db); });
-      });
-      _db = {
-        run: (sql, ...p) => new Promise((res, rej) => { raw.run(sql, ...p, (e) => { if (e) rej(e); else res(); }); }),
-        all: (sql, ...p) => new Promise((res, rej) => { raw.all(sql, ...p, (e, rows) => { if (e) rej(e); else res(rows); }); }),
-        get: (sql, ...p) => new Promise((res, rej) => { raw.get(sql, ...p, (e, row) => { if (e) rej(e); else res(row); }); }),
-        close: () => new Promise((res) => raw.close(() => res())),
-      };
-      logger.info(`[browser.agent] getDb: connected via duckdb to ${AGENTS_DB_PATH}`);
-    } catch (e2) {
-      logger.error(`[browser.agent] getDb: both duckdb-async and duckdb failed. duckdb-async: ${e1.message}, duckdb: ${e2.message}`);
-      return null;
-    }
-  }
-  await _db.run(`CREATE TABLE IF NOT EXISTS agents (
-    id TEXT PRIMARY KEY, type TEXT NOT NULL DEFAULT 'cli', service TEXT NOT NULL,
-    cli_tool TEXT, capabilities TEXT, descriptor TEXT, last_validated TIMESTAMP,
-    failure_log TEXT, status TEXT NOT NULL DEFAULT 'healthy', created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-  )`);
-  await _db.run(`CREATE TABLE IF NOT EXISTS browser_meta_cache (
-    service TEXT PRIMARY KEY, meta_json TEXT NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-  )`);
-  return _db;
-}
-
 
 // ---------------------------------------------------------------------------
 // Video platforms list — services that have video content and need video.agent delegation
@@ -1209,10 +1165,9 @@ async function _generateAndCachePlaybook(agentId, descriptor, task, subsections,
         }
         const mdPath = path.join(AGENTS_DIR, `${agentId}.md`);
         fs.writeFileSync(mdPath, updatedDescriptor, 'utf8');
-        const db = await getDb();
-        if (db) {
+        await withDb(async (db) => {
           await db.run('UPDATE agents SET descriptor = ? WHERE id = ?', updatedDescriptor, agentId);
-        }
+        });
         logger.info(`[browser.agent] _generateAndCachePlaybook: cached new playbook for ${agentId} — goal="${task}"`);
       } catch (writeErr) {
         logger.warn(`[browser.agent] _generateAndCachePlaybook: write-back failed for ${agentId}: ${writeErr.message}`);
@@ -1233,8 +1188,7 @@ async function resolveBrowserMeta(service) {
   //    Extract startUrl and signInUrl from the stored descriptor frontmatter so any
   //    URL corrections validate_agent made are immediately visible to callers.
   try {
-    const db = await getDb();
-    if (db) {
+    const agentResult = await withDb(async (db) => {
       const rows = await db.all(
         'SELECT descriptor, capabilities FROM agents WHERE id = ?', `${seedKey}.agent`
       ).catch(() => null);
@@ -1244,9 +1198,6 @@ async function resolveBrowserMeta(service) {
         const signInUrl = extractDescriptorUrl(desc, 'sign_in_url');
         const authSuccessPattern = extractDescriptorUrl(desc, 'auth_success_pattern');
         if (startUrl) {
-          // Merge with seed map — descriptor `is_oauth: true` overrides seed map so
-          // services that were initially anonymous-first but later required login
-          // (detected dynamically at runtime) are permanently upgraded.
           const seed = KNOWN_BROWSER_SERVICES[seedKey] || {};
           const isOAuthFromDesc = /^is_oauth:\s*true/m.test(desc);
           return {
@@ -1258,20 +1209,23 @@ async function resolveBrowserMeta(service) {
           };
         }
       }
-    }
+      return null;
+    });
+    if (agentResult) return agentResult;
   } catch {}
 
   // 2. DuckDB meta cache (LLM discovery result cached here for unknown services)
   try {
-    const db = await getDb();
-    if (db) {
+    const cachedMeta = await withDb(async (db) => {
       const rows = await db.all(
         "SELECT meta_json FROM browser_meta_cache WHERE service = ?", seedKey
       ).catch(() => null);
       if (rows && rows.length > 0) {
         try { return JSON.parse(rows[0].meta_json); } catch {}
       }
-    }
+      return null;
+    });
+    if (cachedMeta) return cachedMeta;
   } catch {}
 
   // 3. Seed map — bootstrap fallback only (cold-start before any agent has been built)
@@ -1339,8 +1293,7 @@ async function resolveBrowserMeta(service) {
 
   // 5. cache in DuckDB
   try {
-    const db = await getDb();
-    if (db) {
+    await withDb(async (db) => {
       await db.run(`
         CREATE TABLE IF NOT EXISTS browser_meta_cache (
           service     TEXT PRIMARY KEY,
@@ -1352,7 +1305,7 @@ async function resolveBrowserMeta(service) {
         "INSERT OR REPLACE INTO browser_meta_cache (service, meta_json, created_at) VALUES (?, ?, CURRENT_TIMESTAMP)",
         seedKey, JSON.stringify(meta)
       );
-    }
+    });
   } catch {}
 
   return meta;
@@ -1509,12 +1462,15 @@ async function actionBuildAgent({ service, startUrl: explicitUrl, force = false,
   // Always rebuild if the stored type differs from the computed agentType so stale descriptors
   // (e.g. Mailgun previously stored as type=browser) are corrected on the next build_agent call.
   if (!force) {
-    const db = await getDb();
-    if (db) {
+    const existsResult = await withDb(async (db) => {
       const rows = await db.all('SELECT id, type, status FROM agents WHERE id = ?', agentId);
       if (rows && rows.length > 0 && rows[0].status !== 'needs_update' && rows[0].type === agentType) {
-        return { ok: true, agentId, alreadyExists: true, status: rows[0].status };
+        return { alreadyExists: true, status: rows[0].status };
       }
+      return null;
+    });
+    if (existsResult) {
+      return { ok: true, agentId, ...existsResult };
     }
   }
 
@@ -1558,8 +1514,7 @@ async function actionBuildAgent({ service, startUrl: explicitUrl, force = false,
   fs.writeFileSync(mdPath, descriptor, 'utf8');
 
   // Upsert into DuckDB
-  const db = await getDb();
-  if (db) {
+  await withDb(async (db) => {
     await db.run(
       `INSERT OR REPLACE INTO agents
          (id, type, service, cli_tool, capabilities, descriptor, last_validated, status, created_at)
@@ -1571,7 +1526,7 @@ async function actionBuildAgent({ service, startUrl: explicitUrl, force = false,
       descriptor,
       initialStatus
     );
-  }
+  });
 
   logger.info(`[browser.agent] built agent: ${agentId}`, { capabilities });
   return {
@@ -1594,35 +1549,29 @@ async function actionBuildAgent({ service, startUrl: explicitUrl, force = false,
 async function actionQueryAgent({ service, id }) {
   if (!service && !id) return { ok: false, error: 'service or id is required' };
 
-  const db = await getDb();
-  if (!db) {
-    const agentId = id || `${(service || '').toLowerCase().replace(/[^a-z0-9]/g, '')}.agent`;
-    const mdPath  = path.join(AGENTS_DIR, `${agentId}.md`);
-    if (!fs.existsSync(mdPath)) return { ok: true, found: false, agentId };
-    return { ok: true, found: true, agentId, descriptor: fs.readFileSync(mdPath, 'utf8') };
-  }
+  return await withDb(async (db) => {
+    let rows;
+    if (id) {
+      rows = await db.all("SELECT * FROM agents WHERE id = ?", id);
+    } else {
+      const serviceKey = (service || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+      rows = await db.all("SELECT * FROM agents WHERE service = ? AND type = 'browser'", serviceKey);
+    }
 
-  let rows;
-  if (id) {
-    rows = await db.all("SELECT * FROM agents WHERE id = ?", id);
-  } else {
-    const serviceKey = (service || '').toLowerCase().replace(/[^a-z0-9]/g, '');
-    rows = await db.all("SELECT * FROM agents WHERE service = ? AND type = 'browser'", serviceKey);
-  }
+    if (!rows || rows.length === 0) return { ok: true, found: false };
 
-  if (!rows || rows.length === 0) return { ok: true, found: false };
-
-  const row = rows[0];
-  return {
-    ok: true,
-    found: true,
-    agentId: row.id,
-    service: row.service,
-    capabilities: row.capabilities ? JSON.parse(row.capabilities) : [],
-    status: row.status,
-    lastValidated: row.last_validated,
-    descriptor: row.descriptor,
-  };
+    const row = rows[0];
+    return {
+      ok: true,
+      found: true,
+      agentId: row.id,
+      service: row.service,
+      capabilities: row.capabilities ? JSON.parse(row.capabilities) : [],
+      status: row.status,
+      lastValidated: row.last_validated,
+      descriptor: row.descriptor,
+    };
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -1630,10 +1579,9 @@ async function actionQueryAgent({ service, id }) {
 // ---------------------------------------------------------------------------
 
 async function actionListAgents() {
-  const db = await getDb();
   let dbAgents = [];
-  if (db) {
-    try {
+  try {
+    await withDb(async (db) => {
       const rows = await db.all("SELECT id, type, service, capabilities, status, last_validated FROM agents WHERE type = 'browser' ORDER BY created_at DESC");
       dbAgents = (rows || []).map(r => ({
         id: r.id,
@@ -1643,8 +1591,8 @@ async function actionListAgents() {
         status: r.status,
         lastValidated: r.last_validated,
       }));
-    } catch (_) {}
-  }
+    });
+  } catch (_) {}
   // Merge .md file agents not yet in DB (e.g. gmail.agent created by explore.agent before DB registration)
   if (fs.existsSync(AGENTS_DIR)) {
     try {
@@ -2009,13 +1957,12 @@ async function actionValidateAgent({ id, sessionId: explicitSession }) {
   if (descriptorPatched) {
     const mdPath = path.join(AGENTS_DIR, `${id}.md`);
     fs.writeFileSync(mdPath, patchedDescriptor, 'utf8');
-    const db = await getDb();
-    if (db) {
+    await withDb(async (db) => {
       await db.run(
         `UPDATE agents SET descriptor = ?, status = ?, failure_log = ?, last_validated = CURRENT_TIMESTAMP WHERE id = ?`,
         patchedDescriptor, finalStatus, failureLog, id
       );
-    }
+    });
     logger.info(`[browser.agent] validate_agent auto-patched descriptor for ${id}`);
   } else {
     await _updateStatus(id, finalStatus, failureLog);
@@ -2097,19 +2044,19 @@ function patchBrowserDescriptor(descriptor, { patch, timingAdvice }) {
 }
 
 async function _updateStatus(id, status, failureNote) {
-  const db = await getDb();
-  if (!db) return;
-  if (failureNote) {
-    await db.run(
-      'UPDATE agents SET status = ?, failure_log = ?, last_validated = CURRENT_TIMESTAMP WHERE id = ?',
-      status, failureNote, id
-    );
-  } else {
-    await db.run(
-      'UPDATE agents SET status = ?, last_validated = CURRENT_TIMESTAMP WHERE id = ?',
-      status, id
-    );
-  }
+  await withDb(async (db) => {
+    if (failureNote) {
+      await db.run(
+        'UPDATE agents SET status = ?, failure_log = ?, last_validated = CURRENT_TIMESTAMP WHERE id = ?',
+        status, failureNote, id
+      );
+    } else {
+      await db.run(
+        'UPDATE agents SET status = ?, last_validated = CURRENT_TIMESTAMP WHERE id = ?',
+        status, id
+      );
+    }
+  });
 }
 
 
@@ -2278,7 +2225,17 @@ function callSkill(skillName, args, timeoutMs = 120000) {
   });
 }
 
-async function actionRun({ agentId, task, url, context, requiresAuth, skipAuth, _progressCallbackUrl, _stepIndex, _loginWallRetried = false, _emitThinking = null }) {
+async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAuth, skipAuth, _progressCallbackUrl, _stepIndex, _loginWallRetried = false, _emitThinking = null }) {
+  // Derive agentId from url hostname when caller omits it (LLM sometimes emits only url)
+  let agentId = _agentIdArg;
+  if (!agentId && url) {
+    try {
+      const _host = new URL(url).hostname.replace(/^www\./, '');
+      const _svc  = _host.split('.')[0].toLowerCase().replace(/[^a-z0-9]/g, '');
+      agentId = `${_svc}.agent`;
+      logger.info(`[browser.agent] run: derived agentId="${agentId}" from url="${url}"`);
+    } catch (_) { /* malformed url — fall through to error below */ }
+  }
   if (!agentId) return { ok: false, error: 'agentId is required' };
   if (!task)    return { ok: false, error: 'task is required' };
 
@@ -2923,11 +2880,10 @@ async function actionRun({ agentId, task, url, context, requiresAuth, skipAuth, 
               // Update startUrl and invalidate DuckDB meta cache so next run uses the correct URL
               startUrl = _healedUrl;
               try {
-                const _db = await getDb();
-                if (_db) {
+                await withDb(async (_db) => {
                   const _seedKey = _svcName.toLowerCase().replace(/[^a-z0-9]/g, '');
                   await _db.run('DELETE FROM browser_meta_cache WHERE service = ?', _seedKey).catch(() => {});
-                }
+                });
               } catch (_) {}
               logger.info(`[browser.agent] self-heal: retrying with corrected startUrl=${startUrl}`);
               const _retryNav = await callBrowserAct({ action: 'navigate', sessionId, url: startUrl, timeoutMs: 30000 }, 35000).catch(() => ({ ok: false }));
@@ -3698,29 +3654,30 @@ When extracting page content with run-code, prioritize these selectors over gene
     if (_isLoginWall || _hasOAuthProvider || agentResult?.loginWallDetected) {
       logger.warn(`[browser.agent] Login wall detected for ${agentId} (signals=${_loginWallMatches}, oauthProvider=${_hasOAuthProvider}, explicitFlag=${!!agentResult?.loginWallDetected}) — auto-upgrading to isOAuth:true`);
       try {
-        const _patchDb = await getDb();
-        const _existingRows = _patchDb
-          ? await _patchDb.all('SELECT descriptor FROM agents WHERE id = ?', agentId).catch(() => null)
-          : null;
-        const _existingDesc = _existingRows?.[0]?.descriptor || '';
-        if (_existingDesc) {
-          // Patch descriptor frontmatter: mark is_oauth:true so lookupBrowserService
-          // picks it up on the next run and routes through waitForAuth.
-          // Also ensure sign_in_url is set — fall back to startUrl if not already present.
-          const _patchedDesc = rewriteDescriptorFrontmatter(_existingDesc, {
-            is_oauth: 'true',
-            ...(signInUrl ? {} : { sign_in_url: startUrl }),
-          });
-          const _mdPath = path.join(AGENTS_DIR, `${agentId}.md`);
-          fs.writeFileSync(_mdPath, _patchedDesc, 'utf8');
-          if (_patchDb) {
-            await _patchDb.run(
-              'UPDATE agents SET descriptor = ?, status = ? WHERE id = ?',
-              _patchedDesc, 'needs_auth', agentId
-            );
+        await withDb(async (_patchDb) => {
+          const _existingRows = _patchDb
+            ? await _patchDb.all('SELECT descriptor FROM agents WHERE id = ?', agentId).catch(() => null)
+            : null;
+          const _existingDesc = _existingRows?.[0]?.descriptor || '';
+          if (_existingDesc) {
+            // Patch descriptor frontmatter: mark is_oauth:true so lookupBrowserService
+            // picks it up on the next run and routes through waitForAuth.
+            // Also ensure sign_in_url is set — fall back to startUrl if not already present.
+            const _patchedDesc = rewriteDescriptorFrontmatter(_existingDesc, {
+              is_oauth: 'true',
+              ...(signInUrl ? {} : { sign_in_url: startUrl }),
+            });
+            const _mdPath = path.join(AGENTS_DIR, `${agentId}.md`);
+            fs.writeFileSync(_mdPath, _patchedDesc, 'utf8');
+            if (_patchDb) {
+              await _patchDb.run(
+                'UPDATE agents SET descriptor = ?, status = ? WHERE id = ?',
+                _patchedDesc, 'needs_auth', agentId
+              );
+            }
+            logger.info(`[browser.agent] ${agentId} patched: is_oauth=true${_hasOAuthProvider ? ' (OAuth provider buttons detected)' : ''} — attempting auto-retry with waitForAuth`);
           }
-          logger.info(`[browser.agent] ${agentId} patched: is_oauth=true${_hasOAuthProvider ? ' (OAuth provider buttons detected)' : ''} — attempting auto-retry with waitForAuth`);
-        }
+        })
       } catch (patchErr) {
         logger.warn(`[browser.agent] login-wall patch failed for ${agentId}: ${patchErr.message}`);
       }
@@ -3779,8 +3736,9 @@ When extracting page content with run-code, prioritize these selectors over gene
             // Restore status to 'healthy' now that auth is confirmed working — ensures
             // planSkills re-includes this agent in the AVAILABLE AGENTS list for future plans.
             try {
-              const _healDb = await getDb();
-              if (_healDb) await _healDb.run('UPDATE agents SET status=? WHERE id=? AND status=?', 'healthy', agentId, 'needs_auth').catch(() => {});
+              await withDb(async (_healDb) => {
+                await _healDb.run('UPDATE agents SET status=? WHERE id=? AND status=?', 'healthy', agentId, 'needs_auth').catch(() => {});
+              });
             } catch (_) {}
             const _retryResult = await callSkill(_agentSkill, {
               goal: _effectiveTask,
@@ -4167,8 +4125,7 @@ async function actionDeleteAgent({ id }) {
 
   // ── 2. DuckDB: agents table + browser_meta_cache ────────────────────────────
   try {
-    const db = await getDb();
-    if (db) {
+    await withDb(async (db) => {
       const service = id.replace(/\.agent$/, '');
       logger.info(`[browser.agent] delete_agent: looking for service = ${service}`);
       
@@ -4195,11 +4152,8 @@ async function actionDeleteAgent({ id }) {
         deleted.push(`DuckDB meta_cache row: ${service}`);
       }
       
-      // Force checkpoint to make deletes visible to other connections
-      await db.run('CHECKPOINT').catch(() => {});
-    } else {
-      logger.error(`[browser.agent] delete_agent: db connection is null`);
-    }
+      // Note: withDb closes connection automatically, no need for CHECKPOINT
+    });
   } catch (e) { 
     logger.error(`[browser.agent] delete_agent: DuckDB error: ${e.message}`);
     errors.push(`DuckDB: ${e.message}`); 
@@ -4284,9 +4238,7 @@ async function actionDeleteAgent({ id }) {
 
 async function actionRecordFailure({ id, failureEntry }) {
   if (!id || !failureEntry) return { ok: false, error: 'id and failureEntry are required' };
-  const db = await getDb();
-  if (!db) return { ok: false, error: 'DB unavailable' };
-  try {
+  return await withDb(async (db) => {
     const row = await db.get('SELECT failure_log FROM agents WHERE id = ?', id);
     if (!row) return { ok: false, error: `Agent not found: ${id}` };
     const existing = row.failure_log || '';
@@ -4299,9 +4251,7 @@ async function actionRecordFailure({ id, failureEntry }) {
     );
     logger.info(`[browser.agent] record_failure: appended runtime error for ${id}`);
     return { ok: true, agentId: id };
-  } catch (err) {
-    return { ok: false, error: err.message };
-  }
+  });
 }
 
 // ---------------------------------------------------------------------------
