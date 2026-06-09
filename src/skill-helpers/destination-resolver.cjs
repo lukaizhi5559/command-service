@@ -202,11 +202,11 @@ const URL_TYPE_PATTERNS = [
   {
     type: INTENTS.SETTINGS,
     tests: [
-      /\/settings(?!\/api)/i,
-      /\/account(?!\/api)/i,
-      /\/profile(?!\/api)/i,
-      /\/billing/i,
-      /\/preferences/i,
+      /^https?:\/\/[^/]+\/settings(?!\/api)/i,
+      /^https?:\/\/[^/]+\/account(?!\/api)/i,
+      /^https?:\/\/[^/]+\/profile(?!\/api)/i,
+      /^https?:\/\/[^/]+\/billing/i,
+      /^https?:\/\/[^/]+\/preferences/i,
     ],
   },
   {
@@ -381,6 +381,16 @@ async function resolveDestination(serviceKey, task, plannedUrl, agentId) {
   if (_isMailService && _isMailHost) {
     logger.debug(`[destination-resolver] Short-circuit: mail service on mail host → ok`);
     return { action: 'ok', intent: INTENTS.MAIL };
+  }
+
+  // ── Short-circuit: tutorial / editor services ─────────────────────────────
+  // These services use a profile/hub subdomain as their dashboard but are never
+  // developer-console or settings destinations. Destination correction does not
+  // apply — always ok regardless of task intent.
+  const _isTutorialService = /w3schools/i.test(serviceKey);
+  if (_isTutorialService) {
+    logger.debug(`[destination-resolver] Short-circuit: tutorial/editor service "${_id}" — skip destination check`);
+    return { action: 'ok', intent: INTENTS.HOME, reason: 'Tutorial/editor service — destination check not applicable' };
   }
 
   // ── Resume context: user already answered a destination question ──────────

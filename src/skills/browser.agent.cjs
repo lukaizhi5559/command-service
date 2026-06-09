@@ -221,7 +221,7 @@ function _setCachedAuthCheck(agentId, authNeeded) {
 // ---------------------------------------------------------------------------
 async function _detectAuthViaLLM(title, body, agentId) {
   try {
-    const { askWithMessages } = require('../skill-llm.cjs');
+    const { askWithMessages } = require('../skill-helpers/skill-llm.cjs');
     const raw = await askWithMessages([
       { role: 'system', content: AUTH_CHECK_PROMPT },
       { role: 'user', content: `TITLE: ${(title || '').slice(0, 200)}\n\nBODY: ${(body || '').slice(0, 1000)}` }
@@ -895,18 +895,7 @@ IMPORTANT:
 - For contenteditable rich-text areas use type, not fill
 - After hover/dblclick/click that opens a menu or modal, always snapshot before the next action
 - Keep selectors as generic/semantic as possible since you don't have a live DOM
-- Output ONLY the ### playbook sections — no preamble, no explanation
-
-VIDEO CONTENT DETECTION:
-- Analyze the service at START_URL. Does it host videos, have video players, or embed video content?
-- If YES, you MUST include this additional playbook:
-
-### Extract Video Content (extract, steps, transcript, tutorial, learn, summarize, content, analyze)
-DELEGATE_TO: video.agent
-PLATFORM: <service_name>
-INSTRUCTION: Use video.agent to find and watch tutorial videos, extracting actionable steps and content via page metadata + audio transcription.
-
-This signals the system to delegate video extraction tasks to the specialized video.agent skill.`;
+- Output ONLY the ### playbook sections — no preamble, no explanation`;
 
 // ---------------------------------------------------------------------------
 // PLAYBOOK_RUNTIME_COT_PROMPT — LLM prompt for generating a single playbook
@@ -953,19 +942,7 @@ Format your response as a single ### section:
 IMPORTANT:
 - The ### header keywords are used for future matching — make them comprehensive and relevant
 - Do NOT repeat steps from the existing playbooks — generate only what GOAL requires
-- Output ONLY the ### section — no preamble, no explanation
-
-VIDEO CONTENT DETECTION AT RUNTIME:
-- If the GOAL involves extracting steps, transcript, or content from a video on this site
-- AND no existing playbook handles video extraction
-- Generate a playbook with this format:
-
-### Extract Video Content (extract, steps, transcript, tutorial, learn, summarize, content, analyze)
-DELEGATE_TO: video.agent
-PLATFORM: <service_name>
-INSTRUCTION: Use video.agent to find and watch tutorial videos, extracting actionable steps and content.
-
-This enables automatic video extraction capability without needing browser automation steps.`;
+- Output ONLY the ### section — no preamble, no explanation`;
 
 // ---------------------------------------------------------------------------
 // _resolvePlaybook — 3-tier goal-aware playbook selection.
@@ -973,10 +950,7 @@ This enables automatic video extraction capability without needing browser autom
 //   tier 1: keyword match found     — section = matched ### block
 //   tier 3: no match                — section = null, subsections = all ### blocks (for COT)
 // ---------------------------------------------------------------------------
-// Keywords indicating video/content extraction intent — prioritize DELEGATE_TO playbooks
-const EXTRACTION_INTENT_KEYWORDS = ['extract', 'steps', 'transcribe', 'summarize', 'learn from', 'content', 'analyze', 'watch and', 'tutorial and', 'tell me the', 'give me the'];
-
-function _resolvePlaybook(descriptor, task) {
+function _resolvePlaybook(descriptor, task, agentId) {
   if (!descriptor || !task) return { tier: 3, section: null, subsections: [] };
 
   // No `m` flag — `$` must match end-of-string to capture the full Playbooks block
@@ -1004,15 +978,6 @@ function _resolvePlaybook(descriptor, task) {
   }
 
   if (matched.length > 0) {
-    // Check for extraction intent — prioritize DELEGATE_TO playbooks
-    const hasExtractionIntent = EXTRACTION_INTENT_KEYWORDS.some(kw => taskLower.includes(kw));
-    if (hasExtractionIntent) {
-      const delegatePlaybooks = matched.filter(pb => pb.includes('DELEGATE_TO:'));
-      if (delegatePlaybooks.length > 0) {
-        logger.info(`[browser.agent] _resolvePlaybook: extraction intent detected, prioritizing DELEGATE_TO playbook(s)`);
-        return { tier: 1, section: delegatePlaybooks.join('\n\n'), subsections };
-      }
-    }
     // Join all matching sections — compound tasks (e.g. "find and delete") get both playbooks
     return { tier: 1, section: matched.join('\n\n'), subsections };
   }
@@ -1043,14 +1008,25 @@ const _MEMORY_EMBED_HOST = process.env.MEMORY_SERVICE_HOST || '127.0.0.1';
 const _MEMORY_EMBED_KEY  = process.env.MCP_USER_MEMORY_API_KEY || process.env.USER_MEMORY_API_KEY || process.env.MCP_API_KEY || '';
 
 async function _resolvePlaybookSemantic(agentId, descriptor, task) {
-  if (!descriptor || !task) return _resolvePlaybook(descriptor, task);
+  if (!descriptor || !task) return _resolvePlaybook(descriptor, task, agentId);
+
+  // Sanitize: strip DELEGATE_TO: video.agent playbook blocks from non-video agents.
+  // This cleans up descriptors that were polluted by old LLM prompts without a DB migration.
+  const _serviceKey = (agentId || '').replace('.agent', '').toLowerCase();
+  if (!VIDEO_PLATFORMS.has(_serviceKey) && descriptor.includes('DELEGATE_TO: video.agent')) {
+    descriptor = descriptor
+      .split(/(?=\n### )/)
+      .filter(block => !block.includes('DELEGATE_TO: video.agent'))
+      .join('');
+    logger.debug(`[browser.agent] _resolvePlaybookSemantic: stripped video.agent DELEGATE_TO from non-video descriptor for ${agentId}`);
+  }
 
   const playbookMatch = descriptor.match(/\n## Playbooks\n([\s\S]*)$/);
-  if (!playbookMatch) return _resolvePlaybook(descriptor, task);
+  if (!playbookMatch) return _resolvePlaybook(descriptor, task, agentId);
 
   const subsections = playbookMatch[1].trim()
     .split(/(?=### )/).map(s => s.trim()).filter(Boolean);
-  if (subsections.length === 0) return _resolvePlaybook(descriptor, task);
+  if (subsections.length === 0) return _resolvePlaybook(descriptor, task, agentId);
 
   const headers = subsections.map(s => s.split('\n')[0]);
 
@@ -1086,7 +1062,7 @@ async function _resolvePlaybookSemantic(agentId, descriptor, task) {
 
     const vectors = embedResult?.result?.embeddings || embedResult?.embeddings;
     if (!Array.isArray(vectors) || vectors.length < 2) {
-      return _resolvePlaybook(descriptor, task);
+      return _resolvePlaybook(descriptor, task, agentId);
     }
 
     const [taskVec, ...headerVecs] = vectors;
@@ -1099,11 +1075,16 @@ async function _resolvePlaybookSemantic(agentId, descriptor, task) {
 
     logger.info(`[browser.agent] _resolvePlaybookSemantic: top scores for ${agentId} — ${scored.slice(0, 3).map(s => `"${s.section.split('\n')[0].slice(0, 50)}" (${s.score.toFixed(3)})`).join(', ')}`);
 
-    // Prioritize DELEGATE_TO if it scores above 0.30
+    // Delegate only if the best-scoring DELEGATE_TO playbook is for a video platform
     const delegateMatch = scored.find(s => s.hasDelegation && s.score >= 0.30);
     if (delegateMatch) {
-      logger.info(`[browser.agent] _resolvePlaybookSemantic: delegation match → "${delegateMatch.section.split('\n')[0]}" (score=${delegateMatch.score.toFixed(3)})`);
-      return { tier: 1, section: delegateMatch.section, subsections };
+      const _delegatePlatform = (delegateMatch.section.match(/PLATFORM:\s*(\S+)/) || [])[1] || '';
+      const _serviceKey = (agentId || '').replace('.agent', '').toLowerCase();
+      if (VIDEO_PLATFORMS.has(_delegatePlatform.toLowerCase()) || VIDEO_PLATFORMS.has(_serviceKey)) {
+        logger.info(`[browser.agent] _resolvePlaybookSemantic: delegation match → "${delegateMatch.section.split('\n')[0]}" (score=${delegateMatch.score.toFixed(3)})`);
+        return { tier: 1, section: delegateMatch.section, subsections };
+      }
+      logger.info(`[browser.agent] _resolvePlaybookSemantic: ignored DELEGATE_TO for non-video agent ${agentId} (score=${delegateMatch.score.toFixed(3)})`);
     }
 
     // Collect all sections above threshold (compound tasks get multiple sections)
@@ -1116,7 +1097,7 @@ async function _resolvePlaybookSemantic(agentId, descriptor, task) {
 
   } catch (_semErr) {
     logger.warn(`[browser.agent] _resolvePlaybookSemantic: embedding call failed (${_semErr.message}) — falling back to keyword scan`);
-    return _resolvePlaybook(descriptor, task);
+    return _resolvePlaybook(descriptor, task, agentId);
   }
 }
 
@@ -1582,6 +1563,14 @@ async function actionListAgents() {
   let dbAgents = [];
   try {
     await withDb(async (db) => {
+      // One-time migration: delete legacy bare-id rows (e.g. 'youtube') when a canonical
+      // 'youtube.agent' counterpart exists. Safe to run every call — no-op once clean.
+      await db.run(`
+        DELETE FROM agents
+        WHERE id NOT LIKE '%.agent'
+          AND id || '.agent' IN (SELECT id FROM agents WHERE id LIKE '%.agent')
+      `).catch(() => {});
+
       const rows = await db.all("SELECT id, type, service, capabilities, status, last_validated FROM agents WHERE type = 'browser' ORDER BY created_at DESC");
       dbAgents = (rows || []).map(r => ({
         id: r.id,
@@ -2113,6 +2102,217 @@ async function agentWebFetch(url) {
   });
   if (curlResult.stdout) return curlResult.stdout.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').slice(0, WEB_FETCH_CHARS);
   return '';
+}
+
+// ---------------------------------------------------------------------------
+// Recipe Doctor — diagnoseAndPatchRecipe()
+//
+// Called when a recipe-driven task fails goal verification.
+// Automatically:
+//   1. Probes the last recipe step's target element via page.evaluate()
+//   2. Detects known JS frameworks (CodeMirror, Monaco, ACE, Quill, etc.)
+//   3. If framework unknown, calls web search MCP for interaction hints
+//   4. LLM generates a patched waypoint (e.g. evaluate instead of focus)
+//   5. Writes the patched recipe JSON to disk
+//
+// Returns { patched: true, summary, patchedWaypoint } on success
+// or      { patched: false, reason } on any failure (always non-fatal)
+// ---------------------------------------------------------------------------
+
+async function diagnoseAndPatchRecipe({ agentId, recipeName, recipe, failureReason, sessionId }) {
+  const SKILLS_DIR = path.join(os.homedir(), '.thinkdrop', 'skills');
+
+  try {
+    if (!recipe || !recipe.waypoints || !Array.isArray(recipe.waypoints)) {
+      return { patched: false, reason: 'No recipe waypoints to inspect' };
+    }
+
+    // Identify the last substantive waypoint (the handoff step — usually focus/fill/click on the editor)
+    const _interactionTypes = ['focus', 'fill', 'click', 'evaluate', 'keycombo', 'paste'];
+    const lastWp = [...recipe.waypoints].reverse().find(wp => _interactionTypes.includes(wp.type));
+    if (!lastWp) {
+      return { patched: false, reason: 'No interaction waypoint found to diagnose' };
+    }
+
+    // Skip re-patching if waypoint is already an evaluate with a setValue call.
+    // In that case the recipe step itself is correct — the failure is that playwright.agent
+    // ignored the targetDescription and used type instead of run-code+editor.setValue().
+    // Re-patching the same evaluate step again just thrashes the recipe file with no benefit.
+    if (lastWp.type === 'evaluate' && lastWp.code && /setValue/i.test(lastWp.code)) {
+      logger.info(`[browser.agent] recipe-doctor: step ${lastWp.step} already has evaluate+setValue — recipe is correct, skipping re-patch (failure is in LLM plan, not recipe)`);
+      return { patched: false, reason: 'Recipe step already correct (evaluate+setValue) — LLM plan generation issue, not recipe issue' };
+    }
+
+    logger.info(`[browser.agent] recipe-doctor: diagnosing step ${lastWp.step} (${lastWp.type} on "${lastWp.selector || 'no selector'}")`);
+
+    // ── Step 1: DOM probe ──────────────────────────────────────────────────
+    let elementProfile = null;
+    if (lastWp.selector) {
+      const probeCode = `(function() {
+        const sel = ${JSON.stringify(lastWp.selector)};
+        const el = document.querySelector(sel);
+        if (!el) return JSON.stringify({ found: false, selector: sel });
+        const style = window.getComputedStyle(el);
+        const visible = style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0';
+        const framework =
+          (window.editor && typeof window.editor.setValue === 'function') ? 'codemirror' :
+          (window.monaco) ? 'monaco' :
+          (window.ace && typeof window.ace.edit === 'function') ? 'ace' :
+          (window.Quill) ? 'quill' :
+          (window.CodeMirror) ? 'codemirror' :
+          null;
+        const globalApi =
+          framework === 'codemirror' ? 'editor.setValue(content)' :
+          framework === 'monaco' ? 'monaco.editor.getModels()[0].setValue(content)' :
+          framework === 'ace' ? 'ace.edit(el).setValue(content)' :
+          framework === 'quill' ? 'new Quill(el).setText(content)' :
+          null;
+        const editableChild = el.querySelector('[contenteditable="true"], textarea:not([style*="display:none"])');
+        return JSON.stringify({
+          found: true,
+          selector: sel,
+          tagName: el.tagName.toLowerCase(),
+          visible,
+          contenteditable: el.contentEditable,
+          role: el.getAttribute('role'),
+          framework,
+          globalApi,
+          editableChildTag: editableChild ? editableChild.tagName.toLowerCase() : null,
+          classes: el.className.slice(0, 100),
+        });
+      })()`;
+
+      const probeRes = await callBrowserAct({ action: 'evaluate', text: probeCode, sessionId }).catch(() => null);
+      if (probeRes) {
+        // browser.act wraps eval output in "### Result\n<value>" markdown.
+        // For complex JSON strings the outer-quote strip in the evaluate handler
+        // can mangle content — extract directly from stdout as the reliable path.
+        let raw = '';
+        if (probeRes.stdout) {
+          const _m = probeRes.stdout.match(/###\s*Result\s*\n([\s\S]*?)(?=###|$)/i);
+          raw = _m ? _m[1].trim() : probeRes.stdout.trim();
+          if (raw.startsWith('"') && raw.endsWith('"')) raw = raw.slice(1, -1).replace(/\\"/g, '"');
+        } else {
+          raw = String(probeRes?.result || '').replace(/^"|"$/g, '');
+        }
+        try { elementProfile = JSON.parse(raw); } catch (_) { /* non-fatal */ }
+      }
+      logger.info(`[browser.agent] recipe-doctor: element profile: ${JSON.stringify(elementProfile)}`);
+    }
+
+    // ── Step 2: Web search for unknown elements ────────────────────────────
+    let webHints = '';
+    if (elementProfile && elementProfile.found && !elementProfile.framework) {
+      // Unknown element type — search for how to interact with it
+      try {
+        let hostname = 'unknown';
+        try { hostname = new URL(recipe.targetUrl || '').hostname; } catch (_) {}
+        const searchQuery = `how to programmatically set content in ${elementProfile.tagName} ${elementProfile.classes.split(' ')[0]} editor on ${hostname}`;
+        logger.info(`[browser.agent] recipe-doctor: web search for unknown element: "${searchQuery.slice(0, 80)}"`);
+        webHints = await agentWebSearch(searchQuery);
+        logger.info(`[browser.agent] recipe-doctor: web hints: ${webHints.slice(0, 200)}`);
+      } catch (_) { /* non-fatal */ }
+    }
+
+    // ── Step 3: LLM generates a patch ─────────────────────────────────────
+    const { askWithMessages } = require('../skill-helpers/skill-llm.cjs');
+
+    const patchPrompt = `A recipe step failed. Your job is to generate a REPLACEMENT waypoint that correctly interacts with the target element.
+
+FAILED WAYPOINT:
+${JSON.stringify(lastWp, null, 2)}
+
+FAILURE REASON: ${failureReason}
+
+ELEMENT PROFILE (from live DOM inspection):
+${elementProfile ? JSON.stringify(elementProfile, null, 2) : 'Could not probe element'}
+
+${webHints ? `WEB SEARCH HINTS (advisory — use only if directly relevant):\n${webHints.slice(0, 400)}` : ''}
+
+RULES:
+- If framework is "codemirror" and globalApi is "editor.setValue(content)": use type "evaluate" with code that calls editor.setValue('') to CLEAR the editor. The playwright.agent will then use run-code to SET the content.
+- If framework is "monaco": use type "evaluate" with code calling monaco.editor.getModels()[0].setValue('').
+- If element tagName is "div" and not visible or contenteditable is "false": the selector is wrong — suggest using ".CodeMirror-code" or the editableChild instead.
+- If no framework detected: use type "keycombo" with key "Meta+a" then type "evaluate" with document.execCommand('delete') OR suggest a "fill" on the editableChild.
+- The patched waypoint should be a SINGLE JSON object (one step).
+- Use type "evaluate" for JS API calls. The "code" field is raw JS expression (not async).
+- Keep the same step number as the failed waypoint.
+
+Respond with ONLY a valid JSON object — no markdown, no explanation:
+{
+  "step": <number>,
+  "type": "evaluate" | "fill" | "keycombo" | "focus",
+  "code": "<JS expression if type=evaluate>",
+  "selector": "<CSS selector if needed>",
+  "description": "<what this step does>",
+  "patchReason": "<one sentence explaining why the original step failed>"
+}`;
+
+    const patchRaw = await askWithMessages([
+      { role: 'system', content: 'You are a browser automation expert. Respond with JSON only. No markdown fences.' },
+      { role: 'user', content: patchPrompt },
+    ], { temperature: 0.0, maxTokens: 400, responseTimeoutMs: 20000 });
+
+    let patchedWaypoint = null;
+    try {
+      const cleaned = (patchRaw || '').trim().replace(/^```[a-z]*\n?/i, '').replace(/\n?```$/i, '');
+      patchedWaypoint = JSON.parse(cleaned);
+    } catch (_) {
+      logger.warn(`[browser.agent] recipe-doctor: LLM returned unparseable patch — aborting`);
+      return { patched: false, reason: 'LLM patch parse failed' };
+    }
+
+    if (!patchedWaypoint || !patchedWaypoint.type) {
+      return { patched: false, reason: 'LLM patch missing required fields' };
+    }
+
+    logger.info(`[browser.agent] recipe-doctor: patch generated: ${JSON.stringify(patchedWaypoint)}`);
+
+    // ── Step 4: Apply patch + update targetDescription ────────────────────
+    const patchedWaypoints = recipe.waypoints.map(wp =>
+      wp.step === lastWp.step ? { ...patchedWaypoint } : wp
+    );
+
+    // Derive improved targetDescription if we found a framework
+    let patchedTargetDescription = recipe.targetDescription || '';
+    if (elementProfile?.framework === 'codemirror' && elementProfile?.globalApi) {
+      patchedTargetDescription = `${patchedTargetDescription.split('.')[0]}. IMPORTANT: Editor uses CodeMirror. To write content use run-code: page.evaluate(() => editor.setValue(htmlString)). The editor has been cleared by the recipe — do NOT use type or fill on the editor directly.`;
+    } else if (elementProfile?.framework && elementProfile?.globalApi) {
+      patchedTargetDescription = `${patchedTargetDescription.split('.')[0]}. IMPORTANT: Editor uses ${elementProfile.framework}. To write content use run-code: page.evaluate(() => ${elementProfile.globalApi.replace('content', 'newContent')}). Do NOT use raw type or fill.`;
+    } else if (patchedWaypoint.patchReason) {
+      patchedTargetDescription = `${patchedTargetDescription} [Auto-patched: ${patchedWaypoint.patchReason}]`;
+    }
+
+    const patchedRecipe = {
+      ...recipe,
+      waypoints: patchedWaypoints,
+      targetDescription: patchedTargetDescription,
+      _autoPatchedAt: new Date().toISOString(),
+      _autoPatchReason: patchedWaypoint.patchReason || failureReason,
+    };
+
+    // ── Step 5: Write patched recipe to disk ──────────────────────────────
+    const _skillDirId = (id) => id.replace(/\.agent$/, '').replace(/[^a-z0-9_]/gi, '_');
+    const skillDir = path.join(SKILLS_DIR, _skillDirId(agentId));
+    const recipePath = path.join(skillDir, `${recipeName}.recipe.json`);
+
+    if (!fs.existsSync(skillDir)) {
+      logger.warn(`[browser.agent] recipe-doctor: skill dir not found: ${skillDir}`);
+      return { patched: false, reason: 'Skill directory not found' };
+    }
+
+    fs.writeFileSync(recipePath, JSON.stringify(patchedRecipe, null, 2), 'utf8');
+    logger.info(`[browser.agent] recipe-doctor: patched recipe written to ${recipePath}`);
+
+    const summary = `Auto-patched step ${lastWp.step}: changed "${lastWp.type}" → "${patchedWaypoint.type}"${elementProfile?.framework ? ` (detected ${elementProfile.framework})` : ''}. ${patchedWaypoint.patchReason || ''}`;
+    logger.info(`[browser.agent] recipe-doctor: ${summary}`);
+
+    return { patched: true, summary, patchedWaypoint, recipePath };
+
+  } catch (err) {
+    logger.warn(`[browser.agent] recipe-doctor: diagnosis failed (non-fatal): ${err.message}`);
+    return { patched: false, reason: err.message };
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -2804,7 +3004,10 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
           try {
             const _startHost = new URL(startUrl).hostname;
             _curHost   = new URL(_curHref.match(/https?:\/\//) ? _curHref : `https://${_curHref}`).hostname;
-            _wrongDomain = !!_startHost && !!_curHost && _curHost !== _startHost;
+            // Same base domain (e.g. pathfinder.w3schools.com vs profile.w3schools.com) is NOT a mismatch
+            const _startBase = _startHost.split('.').slice(-2).join('.');
+            const _curBase   = _curHost.split('.').slice(-2).join('.');
+            _wrongDomain = !!_startHost && !!_curHost && _curBase !== _startBase;
           } catch (_) {}
 
           // ── Parking/squatter detection via live page content ───────────────────
@@ -3237,7 +3440,8 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
       }).join('\n');
 
       const recipeBlock = `\n\n## Trained Navigation Recipe: ${recipe.name}\n` +
-        `TARGET: ${recipe.targetUrl || recipe.targetDescription || ''}\n` +
+        `TARGET: ${recipe.targetUrl || ''}\n` +
+        (recipe.targetDescription ? `EDITOR/PAGE RULES: ${recipe.targetDescription}\n` : '') +
         `Follow these waypoints IN ORDER to reach the target page. After reaching the target, execute the user's task.\n` +
         `WAYPOINTS:\n${waypointSteps}\n\n` +
         `RULES:\n` +
@@ -3294,15 +3498,18 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
   // execute them programmatically using browser.act. Once at the target page,
   // playwright.agent only needs to handle the user's actual creative task.
   let _recipeExecutedOk = false;
+  let _activeRecipe = null;   // hoisted so recipe-doctor can access it at askUser time
+  let _activeAgentIdClean = agentId.replace('.agent', '');
   let _extractedData = null; // WALT: stores extraction waypoint results
   if (_trainedRecipeInjected) {
     try {
       const trainerAgent = require('./trainer.agent.cjs');
-      const _agentIdClean = agentId.replace('.agent', '');
+      const _agentIdClean = _activeAgentIdClean;
       const _execRecipe = trainerAgent.findMatchingRecipe(_agentIdClean, task)
         || (() => { const ls = trainerAgent.actionListSkills({ agentId: _agentIdClean }); return (ls.ok && ls.skills?.length === 1) ? trainerAgent.loadRecipe(_agentIdClean, ls.skills[0].name) : null; })();
 
       if (_execRecipe && _execRecipe.waypoints && _execRecipe.waypoints.length > 0) {
+        _activeRecipe = _execRecipe; // hoist for recipe-doctor access at askUser time
         // ── Domain continuity check ─────────────────────────────────────────
         // Check if we're already on the target domain (trained recipe target)
         if (_currentBrowserState?.url && _execRecipe.targetUrl) {
@@ -3394,7 +3601,7 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
                 for (const sel of selectors) {
                   const clickRes = await callBrowserAct({ action: 'click', selector: sel, sessionId });
                   // Use exitCode for consistent success checking
-                  if (clickRes?.exitCode === 0) {
+                  if (clickRes?.exitCode === 0 || clickRes?.ok === true) {
                     clicked = true;
                     successSelector = sel;
                     logger.info(`[browser.agent] recipe-exec: step ${wp.step} click "${wp.elementText || sel}" ✓ (selector: ${sel.substring(0, 50)})`);
@@ -3408,24 +3615,26 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
                   logger.warn(`[browser.agent] recipe-exec: step ${wp.step} click failed for all selectors (last error: ${lastError})`);
                   _wpFailed = true;
                 } else {
-                  // After successful click, if target URL is specified, navigate directly to it
-                  // This avoids tab-switching issues by staying in current tab
-                  if (wp.href && _execRecipe.targetUrl) {
+                  // After successful click, check if the target URL was reached.
+                  // Links that open in a new tab will leave the current tab unchanged —
+                  // detect this and navigate directly to wp.href to stay on track.
+                  if (wp.href) {
                     try {
-                      await new Promise(r => setTimeout(r, 1000)); // Brief wait for any navigation to start
+                      await new Promise(r => setTimeout(r, 800)); // Brief wait for any navigation to start
                       const urlCheck = await callBrowserAct({ action: 'evaluate', text: 'window.location.href', sessionId });
-                      const currentUrl = (urlCheck?.result || urlCheck?.data || '').replace(/"/g, '');
+                      const currentUrl = (urlCheck?.result || urlCheck?.data || '').replace(/"/g, '').replace(/^"|"$/g, '');
                       
-                      // If we're not at the target yet, navigate directly to wp.href
-                      const targetPath = new URL(_execRecipe.targetUrl).pathname.split('?')[0];
-                      if (!currentUrl.includes(targetPath)) {
-                        logger.info(`[browser.agent] recipe-exec: navigating directly to target href ${wp.href} (avoiding new tab issues)`);
-                        const navRes = await callBrowserAct({ action: 'navigate', url: wp.href, sessionId });
-                        if (navRes?.exitCode === 0) {
-                          logger.info(`[browser.agent] recipe-exec: direct navigation to ${wp.href} ✓`);
-                          _currentBrowserState = { ..._currentBrowserState, url: wp.href };
+                      // Determine expected destination: wp.href itself or the recipe targetUrl
+                      const _destUrl  = wp.href;
+                      const _destPath = new URL(_destUrl).pathname.split('?')[0];
+                      if (currentUrl && !currentUrl.includes(_destPath)) {
+                        logger.info(`[browser.agent] recipe-exec: step ${wp.step} click opened new tab or didn't navigate — navigating directly to ${_destUrl}`);
+                        const navRes = await callBrowserAct({ action: 'navigate', url: _destUrl, sessionId });
+                        if (navRes?.exitCode === 0 || navRes?.ok === true) {
+                          logger.info(`[browser.agent] recipe-exec: direct navigation to ${_destUrl} ✓`);
+                          _currentBrowserState = { ..._currentBrowserState, url: _destUrl };
                         } else {
-                          logger.warn(`[browser.agent] recipe-exec: direct navigation failed, will retry verification`);
+                          logger.warn(`[browser.agent] recipe-exec: direct navigation failed — ${navRes?.error || 'unknown'}`);
                         }
                       }
                     } catch (navErr) {
@@ -3479,9 +3688,195 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
                 } catch (extractErr) {
                   logger.debug(`[browser.agent] recipe-exec: extract error (non-fatal): ${extractErr.message}`);
                 }
+
+              } else if (wp.type === 'scroll') {
+                // Scroll the page — non-fatal
+                const scrollCode = `window.scrollBy(0, ${wp.deltaY || 0})`;
+                await callBrowserAct({ action: 'evaluate', text: scrollCode, sessionId });
+                logger.info(`[browser.agent] recipe-exec: step ${wp.step} scroll ${wp.deltaY || 0}px ✓`);
+
+              } else if (wp.type === 'focus') {
+                // Focus an element (e.g. textarea, input) — non-fatal
+                const focusSelectors = [wp.selector, ...(wp.altSelectors || [])].filter(Boolean);
+                let focused = false;
+                for (const sel of focusSelectors) {
+                  const focusCode = `(function(){ const el = document.querySelector(${JSON.stringify(sel)}); if (el) { el.focus(); return true; } return false; })()`;
+                  const focusRes = await callBrowserAct({ action: 'evaluate', text: focusCode, sessionId });
+                  const result = String(focusRes?.result || focusRes?.data || '').replace(/^"|"$/g, '');
+                  if (result === 'true' || focusRes?.exitCode === 0) {
+                    focused = true;
+                    logger.info(`[browser.agent] recipe-exec: step ${wp.step} focus "${sel}" ✓`);
+                    break;
+                  }
+                }
+                if (!focused) logger.warn(`[browser.agent] recipe-exec: step ${wp.step} focus — element not found (non-fatal)`);
+
+              } else if (wp.type === 'evaluate') {
+                // Run arbitrary JS on the page — non-fatal
+                // Used by patched recipes to call JS APIs (e.g. editor.setValue('') for CodeMirror)
+                if (wp.code) {
+                  const evalRes = await callBrowserAct({ action: 'evaluate', text: wp.code, sessionId });
+                  const evalResult = String(evalRes?.result || evalRes?.data || '').replace(/^"|"$/g, '');
+                  logger.info(`[browser.agent] recipe-exec: step ${wp.step} evaluate → ${evalResult.slice(0, 80) || 'ok'}`);
+                } else {
+                  logger.warn(`[browser.agent] recipe-exec: step ${wp.step} evaluate — no code provided (skipped)`);
+                }
+
+              } else if (wp.type === 'fill') {
+                // Fill an input/textarea — fatal if all selectors fail
+                const fillSelectors = [wp.selector, ...(wp.altSelectors || [])].filter(Boolean);
+                let filled = false;
+                for (const sel of fillSelectors) {
+                  const fillRes = await callBrowserAct({ action: 'type', selector: sel, text: wp.value || '', sessionId });
+                  if (fillRes?.exitCode === 0 || fillRes?.ok === true) {
+                    filled = true;
+                    logger.info(`[browser.agent] recipe-exec: step ${wp.step} fill "${sel}" ✓`);
+                    break;
+                  }
+                }
+                if (!filled) {
+                  logger.warn(`[browser.agent] recipe-exec: step ${wp.step} fill failed for all selectors`);
+                  _wpFailed = true;
+                }
+
+              } else if (wp.type === 'keycombo') {
+                // Press a key combination (e.g. Enter, Ctrl+A) — non-fatal
+                const key = [wp.ctrl ? 'Control' : '', wp.shift ? 'Shift' : '', wp.alt ? 'Alt' : '', wp.key].filter(Boolean).join('+') || wp.key || 'Enter';
+                const keySel = wp.selector;
+                const keyRes = keySel
+                  ? await callBrowserAct({ action: 'press-key', selector: keySel, key, sessionId })
+                  : await callBrowserAct({ action: 'press-key', key, sessionId });
+                if (keyRes?.exitCode === 0 || keyRes?.ok === true) {
+                  logger.info(`[browser.agent] recipe-exec: step ${wp.step} keycombo ${key} ✓`);
+                } else {
+                  logger.warn(`[browser.agent] recipe-exec: step ${wp.step} keycombo ${key} failed (non-fatal)`);
+                }
+
+              } else if (wp.type === 'select') {
+                // Select a dropdown option — non-fatal
+                const selectSelectors = [wp.selector, ...(wp.altSelectors || [])].filter(Boolean);
+                let selected = false;
+                for (const sel of selectSelectors) {
+                  const selectRes = await callBrowserAct({ action: 'select', selector: sel, value: wp.value || '', sessionId });
+                  if (selectRes?.exitCode === 0 || selectRes?.ok === true) {
+                    selected = true;
+                    logger.info(`[browser.agent] recipe-exec: step ${wp.step} select "${wp.value}" on "${sel}" ✓`);
+                    break;
+                  }
+                }
+                if (!selected) logger.warn(`[browser.agent] recipe-exec: step ${wp.step} select failed (non-fatal)`);
+
+              } else if (wp.type === 'dblclick') {
+                // Double-click an element — non-fatal
+                const dblSelectors = [wp.selector, ...(wp.altSelectors || [])].filter(Boolean);
+                let dblClicked = false;
+                for (const sel of dblSelectors) {
+                  const dblRes = await callBrowserAct({ action: 'dblclick', selector: sel, sessionId });
+                  if (dblRes?.exitCode === 0 || dblRes?.ok === true) {
+                    dblClicked = true;
+                    logger.info(`[browser.agent] recipe-exec: step ${wp.step} dblclick "${sel}" ✓`);
+                    break;
+                  }
+                }
+                if (!dblClicked) logger.warn(`[browser.agent] recipe-exec: step ${wp.step} dblclick failed (non-fatal)`);
+
+              } else if (wp.type === 'submit') {
+                // Form submit — treat as click on the submit button selector — non-fatal
+                const submitSelectors = [wp.selector, ...(wp.altSelectors || [])].filter(Boolean);
+                let submitted = false;
+                for (const sel of submitSelectors) {
+                  const submitRes = await callBrowserAct({ action: 'click', selector: sel, sessionId });
+                  if (submitRes?.exitCode === 0 || submitRes?.ok === true) {
+                    submitted = true;
+                    logger.info(`[browser.agent] recipe-exec: step ${wp.step} submit "${sel}" ✓`);
+                    break;
+                  }
+                }
+                if (!submitted) logger.warn(`[browser.agent] recipe-exec: step ${wp.step} submit failed (non-fatal)`);
+
+              } else if (wp.type === 'paste') {
+                // Paste text into an element — non-fatal
+                const pasteSelectors = [wp.selector, ...(wp.altSelectors || [])].filter(Boolean);
+                const pasteText = wp.text || wp.value || '';
+                let pasted = false;
+                for (const sel of pasteSelectors) {
+                  const pasteCode = `(function(){ const el = document.querySelector(${JSON.stringify(sel)}); if (!el) return false; el.focus(); document.execCommand('insertText', false, ${JSON.stringify(pasteText)}); return true; })()`;
+                  const pasteRes = await callBrowserAct({ action: 'evaluate', text: pasteCode, sessionId });
+                  const result = String(pasteRes?.result || pasteRes?.data || '').replace(/^"|"$/g, '');
+                  if (result === 'true' || pasteRes?.exitCode === 0) {
+                    pasted = true;
+                    logger.info(`[browser.agent] recipe-exec: step ${wp.step} paste into "${sel}" ✓`);
+                    break;
+                  }
+                }
+                if (!pasted) logger.warn(`[browser.agent] recipe-exec: step ${wp.step} paste failed (non-fatal)`);
+
+              } else if (wp.type === 'drag') {
+                // Drag-and-drop — non-fatal
+                if (wp.fromSelector && (wp.toX !== undefined || wp.toSelector)) {
+                  const dragArgs = wp.toSelector
+                    ? { action: 'drag', fromSelector: wp.fromSelector, toSelector: wp.toSelector, sessionId }
+                    : { action: 'drag', fromSelector: wp.fromSelector, toX: wp.toX, toY: wp.toY, sessionId };
+                  const dragRes = await callBrowserAct(dragArgs);
+                  if (dragRes?.exitCode === 0 || dragRes?.ok === true) {
+                    logger.info(`[browser.agent] recipe-exec: step ${wp.step} drag ✓`);
+                  } else {
+                    logger.warn(`[browser.agent] recipe-exec: step ${wp.step} drag failed (non-fatal): ${dragRes?.stderr || 'unknown'}`);
+                  }
+                } else {
+                  logger.warn(`[browser.agent] recipe-exec: step ${wp.step} drag skipped — missing fromSelector/toX`);
+                }
+
+              } else if (wp.type === 'hover') {
+                // Hover over an element (menu reveals, tooltips) — non-fatal
+                const hoverSelectors = [wp.selector, ...(wp.altSelectors || [])].filter(Boolean);
+                for (const sel of hoverSelectors) {
+                  const hoverRes = await callBrowserAct({ action: 'hover', selector: sel, sessionId });
+                  if (hoverRes?.exitCode === 0 || hoverRes?.ok === true) {
+                    logger.info(`[browser.agent] recipe-exec: step ${wp.step} hover "${sel}" ✓`);
+                    break;
+                  }
+                }
+
+              } else if (wp.type === 'back') {
+                // Browser back navigation — non-fatal
+                await callBrowserAct({ action: 'evaluate', text: 'window.history.back()', sessionId });
+                logger.info(`[browser.agent] recipe-exec: step ${wp.step} back ✓`);
+                await callBrowserAct({ action: 'waitForStableText', sessionId, timeoutMs: 8000 }).catch(() => {});
+
+              } else if (wp.type === 'forward') {
+                // Browser forward navigation — non-fatal
+                await callBrowserAct({ action: 'evaluate', text: 'window.history.forward()', sessionId });
+                logger.info(`[browser.agent] recipe-exec: step ${wp.step} forward ✓`);
+                await callBrowserAct({ action: 'waitForStableText', sessionId, timeoutMs: 8000 }).catch(() => {});
+
+              } else if (wp.type === 'rightclick' || wp.type === 'tab-new') {
+                // rightclick: context menus can't be replayed deterministically — skip gracefully
+                // tab-new: tab management is handled by post-click URL check — skip gracefully
+                logger.info(`[browser.agent] recipe-exec: step ${wp.step} ${wp.type} — skipped gracefully (not replayable)`);
               }
-              // Brief pause between waypoints to let page settle
-              await new Promise(r => setTimeout(r, 1500));
+
+              // ── Smart per-type wait after each waypoint ───────────────────────────────
+              // navigate/click-with-href: waitForStableText confirms rendered content
+              // submit/dblclick with potential navigation: short waitForStableText
+              // back/forward: already waited above
+              // fill/select/keycombo/paste/drag/hover/scroll/focus/rightclick/tab-new: short fixed pause
+              if (wp.type === 'navigate') {
+                await callBrowserAct({ action: 'waitForStableText', sessionId, timeoutMs: 8000 }).catch(() => {});
+              } else if (wp.type === 'click' && wp.href) {
+                // Post-click URL resolution already ran above; wait for content to stabilise
+                await callBrowserAct({ action: 'waitForStableText', sessionId, timeoutMs: 8000 }).catch(() => {});
+              } else if (wp.type === 'submit' || wp.type === 'dblclick') {
+                // May trigger navigation — short waitForStableText
+                await callBrowserAct({ action: 'waitForStableText', sessionId, timeoutMs: 5000 }).catch(() => {});
+              } else if (wp.type === 'back' || wp.type === 'forward') {
+                // Already waited in handler above — no extra wait needed
+              } else if (wp.type === 'fill' || wp.type === 'keycombo' || wp.type === 'select') {
+                await new Promise(r => setTimeout(r, 500));
+              } else {
+                // scroll, focus, evaluate, hover, drag, paste, check, extract, rightclick, tab-new
+                await new Promise(r => setTimeout(r, 300));
+              }
             } catch (wpErr) {
               logger.warn(`[browser.agent] recipe-exec: step ${wp.step} error — ${wpErr.message}`);
               _wpFailed = true;
@@ -3514,9 +3909,15 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
           }
         }
 
-        // If execution succeeded (or skipped due to continuity), strip recipe from context
+        // If execution succeeded (or skipped due to continuity), strip recipe nav steps from context
+        // but PRESERVE targetDescription as a standalone Editor Context block so playwright.agent
+        // still sees critical editor rules (e.g. CRITICAL RULE: use run-code+editor.setValue()) even
+        // after the navigation waypoints are gone.
         if (_recipeExecutedOk) {
           _agentContext = _agentContext.replace(/\n\n## Trained Navigation Recipe:[\s\S]*?— if the site layout changed, adapt using the snapshot/, '');
+          if (_activeRecipe?.targetDescription) {
+            _agentContext = (_agentContext + `\n\n## Editor Context (from trained recipe)\n${_activeRecipe.targetDescription}`).slice(0, 5500);
+          }
           logger.info(`[browser.agent] recipe-exec: stripped recipe from context — playwright.agent will only handle the user task`);
         }
       }
@@ -3605,11 +4006,63 @@ When extracting page content with run-code, prioritize these selectors over gene
       headed: _usePersistentProfile ? true : undefined,
       maxTurns: 15,
       timeoutMs: 120000,
+      recipeWasUsed: _recipeExecutedOk,
       _progressCallbackUrl,
       _stepIndex,
     }, 130000);
 
     const agentResultText = agentResult?.result || agentResult?.stdout || '';
+
+    // ── Bubble up askUser from playwright.agent ────────────────────────────────
+    // If playwright.agent surfaced an ask_user (goal not achieved after recipe
+    // or after exhausting replanning), propagate it directly to the caller
+    // so recoverSkill / executeCommand can surface the choice to the user.
+    if (agentResult?.askUser === true) {
+      logger.info(`[browser.agent] propagating askUser from playwright.agent: "${agentResult.question}"`);
+
+      // ── Recipe Doctor: auto-diagnose and patch the recipe before asking user ──
+      // When a recipe-driven task fails, attempt to auto-diagnose why the last
+      // recipe step didn't work and patch it — so the next run just works.
+      let _doctorSummary = null;
+      if (_recipeExecutedOk && _activeRecipe && sessionId) {
+        logger.info(`[browser.agent] recipe-doctor: goal not achieved after recipe — running diagnosis`);
+        try {
+          const _doctorResult = await diagnoseAndPatchRecipe({
+            agentId,
+            recipeName: _activeRecipe.name,
+            recipe: _activeRecipe,
+            failureReason: agentResult.question || 'Task goal not achieved',
+            sessionId,
+          });
+          if (_doctorResult.patched) {
+            _doctorSummary = _doctorResult.summary;
+            logger.info(`[browser.agent] recipe-doctor: patch applied — "${_doctorSummary}"`);
+          } else {
+            logger.info(`[browser.agent] recipe-doctor: no patch applied — ${_doctorResult.reason}`);
+          }
+        } catch (_docErr) {
+          logger.warn(`[browser.agent] recipe-doctor: non-fatal error: ${_docErr.message}`);
+        }
+      }
+
+      const _questionText = _doctorSummary
+        ? `${agentResult.question}\n\n✅ Recipe auto-fixed: ${_doctorSummary}\n\nTry again to use the patched recipe.`
+        : agentResult.question;
+      const _options = _doctorSummary
+        ? ['Try again with patched recipe', ...( agentResult.options || []).filter(o => !/try again/i.test(o))]
+        : (agentResult.options || []);
+
+      return {
+        ok: false,
+        agentId,
+        task,
+        askUser: true,
+        question: _questionText,
+        options: _options,
+        recipeWasUsed: _recipeExecutedOk,
+        recipePatched: !!_doctorSummary,
+      };
+    }
 
     // ── Tier-2 post-execution write-back ──────────────────────────────────────
     // When a novel-goal task (tier-2 format-reference) succeeds, fire an async COT
@@ -4109,7 +4562,30 @@ async function actionDeleteAgent({ id }) {
       break;
     }
   }
-  
+
+  // Fuzzy fallback: normalize both the requested id and each filename to find closest match.
+  // Handles mismatches where UI sends display id (e.g. 'w3schoolsagent') but file is
+  // stored as 'w3schools.agent.md' (canonical id 'w3schools.agent').
+  if (!agentMdPath) {
+    try {
+      const _norm = (s) => s.toLowerCase().replace(/[^a-z0-9]/g, '');
+      const _idNorm = _norm(id);
+      const _allFiles = fs.readdirSync(AGENTS_DIR).filter(f => f.endsWith('.agent.md'));
+      const _match = _allFiles.find(f => {
+        const base = f.replace(/\.agent\.md$/, '');
+        return _norm(base) === _idNorm || _norm(f.replace(/\.md$/, '')) === _idNorm;
+      });
+      if (_match) {
+        agentMdPath = path.join(AGENTS_DIR, _match);
+        logger.info(`[browser.agent] delete_agent: fuzzy match found: ${_match} for id=${id}`);
+      } else {
+        logger.warn(`[browser.agent] delete_agent: no .md file found for ${id} (fuzzy scan also failed)`);
+      }
+    } catch (_fuzzyErr) {
+      logger.warn(`[browser.agent] delete_agent: no .md file found for ${id}`);
+    }
+  }
+
   if (agentMdPath) {
     try {
       const desc = fs.readFileSync(agentMdPath, 'utf8');
@@ -4119,8 +4595,6 @@ async function actionDeleteAgent({ id }) {
       }
     } catch (_) {}
     try { fs.rmSync(agentMdPath, { force: true }); deleted.push(agentMdPath); logger.info(`[browser.agent] delete_agent: removed file ${agentMdPath}`); } catch (e) { errors.push(e.message); }
-  } else {
-    logger.warn(`[browser.agent] delete_agent: no .md file found for ${id}`);
   }
 
   // ── 2. DuckDB: agents table + browser_meta_cache ────────────────────────────
@@ -4140,9 +4614,22 @@ async function actionDeleteAgent({ id }) {
         deleted.push(`DuckDB agents row: ${id}`);
         logger.info(`[browser.agent] delete_agent: removed ${id} from DuckDB agents table`);
       } else {
-        // List all agents to debug
-        const allAgents = await db.all('SELECT id FROM agents').catch(() => []);
-        logger.warn(`[browser.agent] delete_agent: agent ${id} not found. Available agents: ${JSON.stringify(allAgents.map(r => r.id))}`);
+        // Fuzzy fallback: match by normalized service name so 'w3schoolsagent' finds 'w3schools.agent'
+        const _norm = (s) => s.toLowerCase().replace(/[^a-z0-9]/g, '');
+        const _idNorm = _norm(id);
+        const allAgents = await db.all('SELECT id, service FROM agents').catch(() => []);
+        const _fuzzyRow = allAgents.find(r =>
+          _norm(r.id) === _idNorm ||
+          _norm(r.service || '') === _idNorm ||
+          _norm(r.id.replace(/\.agent$/, '')) === _idNorm
+        );
+        if (_fuzzyRow) {
+          await db.run('DELETE FROM agents WHERE id = ?', _fuzzyRow.id);
+          deleted.push(`DuckDB agents row: ${_fuzzyRow.id}`);
+          logger.info(`[browser.agent] delete_agent: fuzzy-removed ${_fuzzyRow.id} from DuckDB (matched id=${id})`);
+        } else {
+          logger.warn(`[browser.agent] delete_agent: agent ${id} not found in DuckDB. Available: ${JSON.stringify(allAgents.map(r => r.id))}`);
+        }
       }
       
       // Delete from meta cache

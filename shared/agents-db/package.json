@@ -1,0 +1,22 @@
+{
+  "name": "@thinkdrop/agents-db",
+  "version": "1.0.0",
+  "description": "Shared agents database access for ThinkDrop services",
+  "main": "index.cjs",
+  "type": "commonjs",
+  "exports": {
+    ".": "./index.cjs"
+  },
+  "keywords": [
+    "thinkdrop",
+    "agents",
+    "duckdb",
+    "database"
+  ],
+  "author": "ThinkDrop",
+  "license": "MIT",
+  "dependencies": {
+    "duckdb": "^0.10.0",
+    "duckdb-async": "^0.10.0"
+  }
+}

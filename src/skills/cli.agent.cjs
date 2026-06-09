@@ -2050,7 +2050,7 @@ async function actionListAllAgents() {
           type: r.type || 'browser',
           service: r.service,
           cliTool: r.cli_tool,
-          capabilities: r.capabilities ? JSON.parse(r.capabilities) : [],
+          capabilities: (() => { try { return r.capabilities ? JSON.parse(r.capabilities) : []; } catch (_) { return []; } })(),
           status: r.status || 'pending',
           lastValidated: r.last_validated,
           ...(apiKeyUrl ? { apiKeyUrl } : {}),

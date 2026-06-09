@@ -229,6 +229,7 @@ Rules:
 - Use element refs (e12, e83) from the snapshot for click/fill/hover — most reliable for DOM actions. Not valid inside page.evaluate().
 - Autocomplete inputs (e.g. Gmail To:, CC:, BCC:): fill then press Enter to confirm the recipient as a chip. Do NOT use Tab — Tab moves focus without creating the chip.
 - Contenteditable areas: click first, then type (not fill).
+- CODE_EDITOR_RULE: When writing into a code editor (CodeMirror, Monaco, ACE, textareawrapper, or any editor where clicking places a cursor rather than selecting all), ALWAYS clear existing content first before typing. Preferred approach: use run-code with page.evaluate() to call the editor's JS API (e.g. editor.setValue(newHtml) for CodeMirror, monaco.editor.getModels()[0].setValue(content) for Monaco). If no JS API is available: click the editor → press Meta+a → press Delete → then type. NEVER type directly into a code editor without clearing first — the cursor position appends text rather than replacing.
 - Do NOT include auth steps — assume already logged in.
 - CREDENTIALS RULE: If credentials not in goal text are required, return empty plan.
 - NEVER emit credential template tokens like {{gmail:username}} or {{service:password}} in any step arg.
@@ -319,7 +320,8 @@ DEBUGGING CONTEXT USAGE:
 - Use video analysis to identify visual indicators like error dialogs, loading states, or modal interference
 - Use action history to understand sequence of events that led to failure
 - Use timing data to add appropriate waits if operations were too fast
-- Prioritize fixes that address the root cause shown in debugging data over generic workarounds`;
+- Prioritize fixes that address the root cause shown in debugging data over generic workarounds
+- CODE_EDITOR_RULE: When writing into a code editor (CodeMirror, Monaco, ACE, or any editor where clicking places a cursor), NEVER use type/fill to insert content. Use run-code with page.evaluate() to call the JS API: editor.setValue(fullHtmlString) for CodeMirror (sets ALL content atomically), monaco.editor.getModels()[0].setValue(content) for Monaco. One single run-code step should BOTH set the content AND handle the full replacement — do NOT split into clear+type.`;
 
 // ---------------------------------------------------------------------------
 // Replan prompt — called when a DOM-mutating step caused a structural DOM change.
@@ -596,6 +598,10 @@ async function verifyExpectation(step, sessionId, headed, timeoutMs) {
         return { satisfied: false, reason: 'Failed to check URL' };
 
       case 'text_present':
+        // Aria refs (e.g. e18, e3) are playwright-cli accessibility IDs, never visible page text
+        if (/^e\d+$/.test(selector)) {
+          return { satisfied: true, reason: 'Aria ref selector — skipping text_present check' };
+        }
         const textResult = await browserAct({ 
           action: 'evaluate', 
           text: `document.body.innerText.includes('${selector.replace(/'/g, "\\'")}')`, 
@@ -904,6 +910,7 @@ async function playwrightAgent(args) {
     timeoutMs             = 15000,
     headed                = true,
     url,
+    recipeWasUsed         = false,
     _progressCallbackUrl,
     _stepIndex            = 0,
   } = args || {};
@@ -2006,95 +2013,78 @@ async function playwrightAgent(args) {
     }
     } // end verify gate
 
-    // ── Goal Achievement Verification (Research Tasks) ───────────────────────────
-    // For research/lookup goals, verify that actual content was retrieved, not just
-    // that steps executed. If goal wasn't achieved, trigger adaptive replanning with
-    // fresh snapshot so LLM can try a completely different approach.
+    // ── LLM Goal-Achievement Judge ────────────────────────────────────────────
+    // Ask the LLM whether the goal was actually achieved based on the transcript
+    // and current page state. This replaces the old word-count _isSparse heuristic
+    // which falsely triggered on code editors, dashboards, forms, and other
+    // UI-heavy pages that have little prose but a fully completed goal.
     let _shouldReplan = false;
     let _replanPlan = null;
-    const _researchGoalPattern = /\b(search|find|look\s+up|lookup|research|what\s+is|who\s+is|how\s+does|explain|summarize|compare|list|show\s+me|tell\s+me|fetch|get\s+me|ask|query)\b/i;
-    if (_researchGoalPattern.test(goal) && totalRepairs < maxRepairs) {
-      try {
-        const _goalVerifySnap = await browserAct({ action: 'snapshot', sessionId, headed, timeoutMs: 10000 });
-        if (_goalVerifySnap.ok && _goalVerifySnap.result) {
-          const _pageText = _goalVerifySnap.result;
-          const _lines = _pageText.trim().split(/\n+/).filter(l => l.trim().length > 2);
-          const _longLines = _lines.filter(l => l.trim().split(/\s+/).length > 6).length;
-          const _totalWords = _pageText.trim().split(/\s+/).filter(Boolean).length;
-          
-          // Generic content quality analysis - works for ANY search/result page
-          const _hasStructuredContent = _lines.some(l => 
-            /\d+\./.test(l) ||           // Numbered lists
-            /^[•\-\*]\s/.test(l) ||      // Bullet points
-            /\b\d{1,2}\/\d{1,2}\/\d{4}/.test(l) || // Dates
-            /\$\d+/.test(l) ||           // Prices
-            /\d+\s*(views|likes|shares|comments|results|items|products|videos|articles)/i.test(l)
-          );
-          
-          const _hasNavigationElements = _pageText.includes('Next') || 
-            _pageText.includes('Previous') || 
-            _pageText.includes('Page') || 
-            _pageText.includes('More') ||
-            /\b\d+\s+of\s+\d+/.test(_pageText) ||
-            /page\s+\d+/.test(_pageText.toLowerCase());
-          
-          const _hasInteractiveElements = _pageText.includes('button') ||
-            _pageText.includes('link') ||
-            _pageText.includes('click') ||
-            /\b(click|tap|select|choose|view|open|read|watch|listen)\b/i.test(_pageText);
-          
-          const _hasResultContainers = _lines.some(l => 
-            /\b(result|item|product|video|article|post|entry|listing)\b/i.test(l) ||
-            l.length > 100 && /\w/.test(l) // Substantial content lines
-          );
-          
-          // Adaptive threshold based on content structure
-          let _isSparse = _longLines < 3 && _totalWords < 60;
-          
-          // If page has structured content, be more lenient
-          if (_hasStructuredContent || _hasNavigationElements || _hasResultContainers) {
-            _isSparse = _longLines < 1 && _totalWords < 20; // Much more lenient for structured pages
-          }
-          
-          // If page has interactive elements, be even more lenient
-          if (_hasInteractiveElements && (_hasStructuredContent || _hasNavigationElements)) {
-            _isSparse = _totalWords < 10; // Very lenient for interactive structured pages
-          }
+    try {
+      const _judgeSnap = await browserAct({ action: 'snapshot', sessionId, headed, timeoutMs: 10000 });
+      const _judgePageText = (_judgeSnap.ok && _judgeSnap.result) ? _judgeSnap.result : currentSnapshot;
+      if (_judgeSnap.ok && _judgeSnap.result) currentSnapshot = _judgeSnap.result;
 
-          // Check if search query is still in input field (common sign of "Enter" not submitting)
-          const _searchBoxStillHasQuery = /search|query|ask/i.test(goal) &&
-            (_pageText.includes(goal.replace(/.*\b(about|for|on)\s+/i, '').slice(0, 20)) ||
-            _lines.some(l => l.includes('?') && l.length < 100));
+      const _stepSummary = transcript.map(t => `${t.action.action}:${t.outcome.ok ? 'ok' : 'fail'}`).join('; ');
+      const _judgePrompt = `GOAL: ${goal}
 
-          // Enhanced logging for debugging
-          logger.info(`[playwright.agent] Content quality analysis: longLines=${_longLines}, totalWords=${_totalWords}, structured=${_hasStructuredContent}, navigation=${_hasNavigationElements}, interactive=${_hasInteractiveElements}, resultContainers=${_hasResultContainers}, isSparse=${_isSparse}`);
+STEPS EXECUTED: ${_stepSummary}
 
-          if (_isSparse || (_searchBoxStillHasQuery && !_hasResultContainers)) {
-            logger.warn(`[playwright.agent] Goal achievement check: sparse content (${_longLines} long lines, ${_totalWords} words) — goal likely not achieved`);
+CURRENT PAGE SNAPSHOT (first 1500 chars):
+${_judgePageText.slice(0, 1500)}
+
+Did these steps achieve the goal? Consider what the goal asked for and what the agent actually did.
+Respond with JSON only — no markdown, no explanation outside the JSON:
+{ "achieved": true, "reason": "one sentence" }
+or
+{ "achieved": false, "reason": "one sentence", "canRetry": true|false }
+
+Set canRetry:false only if the goal is fundamentally impossible on this page/site.`;
+
+      const _judgeRaw = await askWithMessages([
+        { role: 'system', content: 'You are a concise browser automation judge. Respond with JSON only.' },
+        { role: 'user', content: _judgePrompt },
+      ], { temperature: 0.0, maxTokens: 120, responseTimeoutMs: 20000 });
+
+      const _judgeResult = parseJson(_judgeRaw);
+      logger.info(`[playwright.agent] Goal-achievement judge: achieved=${_judgeResult?.achieved} reason="${_judgeResult?.reason}" recipeWasUsed=${recipeWasUsed}`);
+
+      if (_judgeResult && _judgeResult.achieved === false) {
+        if (recipeWasUsed) {
+          // ── Recipe path: never replan internally — surface ask_user ──────────
+          // The recipe already navigated correctly. If the LLM task still failed,
+          // the user should retry or retrain the recipe.
+          logger.warn(`[playwright.agent] Goal not achieved after recipe execution — surfacing ask_user`);
+          return {
+            ok: false,
+            askUser: true,
+            question: `The recipe navigated to the target page, but the task wasn't completed successfully.\n\nReason: ${_judgeResult.reason}\n\nWhat would you like to do?`,
+            options: ['Try again', 'Retrain recipe'],
+            goal,
+            sessionId,
+            executionTime: Date.now() - start,
+          };
+        } else {
+          // ── Non-recipe path: exhaust adaptive replanning until LLM says stuck ─
+          const _canRetry = _judgeResult.canRetry !== false; // default true unless LLM says false
+          if (_canRetry && totalRepairs < maxRepairs) {
             totalRepairs++;
+            logger.warn(`[playwright.agent] Goal not achieved — adaptive replan ${totalRepairs}/${maxRepairs}: ${_judgeResult.reason}`);
 
-            // ADAPTIVE REPLANNING: Get fresh snapshot and ask LLM for new approach
             const _replanSnap = await browserAct({ action: 'snapshot', sessionId, headed, timeoutMs });
             if (_replanSnap.ok && _replanSnap.result) currentSnapshot = _replanSnap.result;
 
-            const _lastAttemptSummary = transcript.map(t => `${t.action.action}: ${t.outcome.ok ? 'ok' : 'failed'}`).join('; ');
             const _replanPrompt = `ORIGINAL GOAL: ${goal}
 
-PREVIOUS ATTEMPT SUMMARY:
-${_lastAttemptSummary}
+PREVIOUS ATTEMPT SUMMARY: ${_stepSummary}
 
-ISSUE: The previous approach did NOT achieve the goal. The page shows sparse content (${_longLines} substantive lines, ${_totalWords} words), suggesting the search/form submission didn't complete or returned empty results.
+REASON GOAL NOT MET: ${_judgeResult.reason}
 
-CURRENT PAGE STATE (fresh snapshot):
+CURRENT PAGE STATE:
 ${extractInteractiveRefs(currentSnapshot)}
 
-Your task: Generate a COMPLETELY NEW plan to achieve the goal. Try a DIFFERENT approach:
-- If you pressed Enter before, try clicking a specific submit/search button
-- If you clicked one button, try a different one
-- Look for dropdown menus, search buttons, or alternate submission methods
-- Consider that the page might need a different interaction pattern
-
-Return a JSON plan with "thoughts" explaining your new strategy and "plan" array with fresh steps.`;
+Generate a COMPLETELY NEW plan to achieve the goal. Try a DIFFERENT approach than before.
+Return JSON: { "thoughts": "strategy explanation", "plan": [...steps] }`;
 
             const _replanRaw = await askWithMessages([
               { role: 'system', content: PLAN_SYSTEM_PROMPT + learnedRulesBlock + domainLockBlock },
@@ -2103,18 +2093,31 @@ Return a JSON plan with "thoughts" explaining your new strategy and "plan" array
 
             const _replanParsed = parseJson(_replanRaw);
             if (_replanParsed && Array.isArray(_replanParsed.plan) && _replanParsed.plan.length > 0) {
-              logger.info(`[playwright.agent] Adaptive replanning: new approach with ${_replanParsed.plan.length} step(s) — ${_replanParsed.thoughts || 'retrying with different strategy'}`);
-              // Set flag to replan instead of using continue (which can't cross try-catch boundary)
+              logger.info(`[playwright.agent] Adaptive replanning: new approach with ${_replanParsed.plan.length} step(s) — ${_replanParsed.thoughts || 'retrying'}`);
               _shouldReplan = true;
               _replanPlan = _replanParsed.plan;
             } else {
-              logger.warn(`[playwright.agent] Adaptive replanning: LLM returned unparseable plan — returning sparse content result`);
+              logger.warn(`[playwright.agent] Adaptive replanning: LLM returned no parseable plan — surfacing ask_user`);
             }
           }
+
+          // If replan budget exhausted or LLM says canRetry:false, surface ask_user
+          if (!_shouldReplan) {
+            logger.warn(`[playwright.agent] Goal not achievable — surfacing ask_user (canRetry=${_canRetry}, repairs=${totalRepairs}/${maxRepairs})`);
+            return {
+              ok: false,
+              askUser: true,
+              question: `I wasn't able to complete the task after ${totalRepairs} attempt(s).\n\nReason: ${_judgeResult.reason}\n\nWhat would you like to do?`,
+              options: ['Try again', 'Train me to navigate this path'],
+              goal,
+              sessionId,
+              executionTime: Date.now() - start,
+            };
+          }
         }
-      } catch (_goalVerifyErr) {
-        logger.warn(`[playwright.agent] goal achievement verification error (non-fatal): ${_goalVerifyErr.message}`);
       }
+    } catch (_judgeErr) {
+      logger.warn(`[playwright.agent] goal-achievement judge error (non-fatal): ${_judgeErr.message}`);
     }
 
     // Execute replanning if flag was set (outside try-catch to allow continue)

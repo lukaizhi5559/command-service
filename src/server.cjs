@@ -370,13 +370,79 @@ class CommandServiceMCPServer {
       }
 
       // ── GET /agents.list ────────────────────────────────────────────────────
-      // List all agents (browser + CLI) from DuckDB for main process UI
+      // List all agents: DB rows merged with disk-scan of .agent.md files.
+      // Disk-scan ensures agents that haven't been migrated to DB are visible.
       if (req.method === 'GET' && req.url === '/agents.list') {
         try {
+          const fsL = require('fs');
+          const pathL = require('path');
+          const osL = require('os');
           const { actionListAllAgents } = require('./skills/cli.agent.cjs');
-          const result = await actionListAllAgents();
+
+          // DB agents (may be partial)
+          let dbAgents = [];
+          try {
+            const result = await actionListAllAgents();
+            dbAgents = result?.agents || [];
+          } catch (_) {}
+
+          // Disk-scan fallback — parse .agent.md frontmatter
+          const agentsDir = pathL.join(osL.homedir(), '.thinkdrop', 'agents');
+          const diskAgents = [];
+          try {
+            if (fsL.existsSync(agentsDir)) {
+              const files = fsL.readdirSync(agentsDir).filter(f => f.endsWith('.agent.md'));
+              for (const file of files) {
+                try {
+                  const content = fsL.readFileSync(pathL.join(agentsDir, file), 'utf8');
+                  const fmMatch = content.match(/^---\s*\n([\s\S]*?)\n---/);
+                  if (!fmMatch) continue;
+                  const fm = {};
+                  for (const line of fmMatch[1].split('\n')) {
+                    if (/^[ \t]/.test(line)) continue; // skip indented sub-keys (nested YAML blocks)
+                    const ci = line.indexOf(':');
+                    if (ci === -1) continue;
+                    const k = line.slice(0, ci).trim();
+                    const v = line.slice(ci + 1).trim().replace(/^['"]|['"]$/g, '');
+                    if (k && !k.startsWith('-')) fm[k] = v;
+                  }
+                  if (!fm.id) continue;
+                  const capMatch = content.match(/^capabilities:\s*\n((?:[ \t]+-[^\n]*\n?)*)/m);
+                  const capabilities = capMatch
+                    ? capMatch[1].split('\n').map(l => l.replace(/^\s*-\s*/, '').trim()).filter(Boolean)
+                    : [];
+                  diskAgents.push({
+                    id: fm.id,
+                    type: fm.type || 'browser',
+                    service: fm.service || fm.id.replace('.agent', ''),
+                    cliTool: fm.cli_tool || null,
+                    capabilities,
+                    status: fm.status || 'healthy',
+                    lastValidated: null,
+                    descriptor: content,
+                  });
+                } catch (_) {}
+              }
+            }
+          } catch (_) {}
+
+          // Dedup within DB results: legacy rows stored id='youtube' alongside canonical id='youtube.agent'
+          // Keep the .agent-suffixed row when both exist for the same service.
+          const _normKey = id => (id || '').replace(/\.agent$/, '').toLowerCase().trim();
+          const _seen = new Map();
+          for (const a of dbAgents) {
+            const key = _normKey(a.id);
+            const existing = _seen.get(key);
+            if (!existing || a.id.endsWith('.agent')) _seen.set(key, a);
+          }
+          dbAgents = [..._seen.values()];
+
+          // Merge: DB takes priority, disk fills in missing agents
+          const dbIds = new Set(dbAgents.map(a => _normKey(a.id)));
+          const merged = [...dbAgents, ...diskAgents.filter(a => !dbIds.has(_normKey(a.id)))];
+
           res.writeHead(200);
-          res.end(JSON.stringify(result));
+          res.end(JSON.stringify({ ok: true, agents: merged }));
         } catch (err) {
           res.writeHead(500);
           res.end(JSON.stringify({ ok: false, error: err.message }));
@@ -709,6 +775,153 @@ class CommandServiceMCPServer {
         return;
       }
 
+      // ── POST /agent.list — list all agents from DuckDB ─────────────────────
+      // Used by user-memory proxy and main.js; replaces direct DB access in those processes.
+      if (req.method === 'POST' && req.url === '/agent.list') {
+        try {
+          const { actionListAllAgents } = require('./skills/cli.agent.cjs');
+          const agents = await actionListAllAgents();
+          res.writeHead(200);
+          res.end(JSON.stringify({ status: 'ok', action: 'agent.list', data: agents.agents || [] }));
+        } catch (err) {
+          res.writeHead(500);
+          res.end(JSON.stringify({ status: 'error', error: err.message }));
+        }
+        return;
+      }
+
+      // ── POST /agent.update — update agent fields in DuckDB ───────────────────
+      if (req.method === 'POST' && req.url === '/agent.update') {
+        let body = '';
+        req.on('data', chunk => { body += chunk; });
+        req.on('end', async () => {
+          try {
+            const { id, status, descriptor, failureLog } = JSON.parse(body || '{}');
+            if (!id) { res.writeHead(400); res.end(JSON.stringify({ ok: false, error: 'id required' })); return; }
+            const { withDb } = require('@thinkdrop/agents-db');
+            await withDb(async (db) => {
+              if (descriptor !== undefined) {
+                await db.run('UPDATE agents SET descriptor = ?, last_validated = CURRENT_TIMESTAMP WHERE id = ?', descriptor, id);
+              }
+              if (status !== undefined) {
+                const fl = failureLog !== undefined ? failureLog : null;
+                await db.run('UPDATE agents SET status = ?, failure_log = ?, last_validated = CURRENT_TIMESTAMP WHERE id = ?', status, fl, id);
+              }
+            });
+            res.writeHead(200);
+            res.end(JSON.stringify({ ok: true }));
+          } catch (err) {
+            res.writeHead(500);
+            res.end(JSON.stringify({ ok: false, error: err.message }));
+          }
+        });
+        return;
+      }
+
+      // ── POST /agent.delete — delete all artifacts for an agent ─────────────
+      if (req.method === 'POST' && req.url === '/agent.delete') {
+        let body = '';
+        req.on('data', chunk => { body += chunk; });
+        req.on('end', async () => {
+          try {
+            const { id } = JSON.parse(body || '{}');
+            if (!id) { res.writeHead(400); res.end(JSON.stringify({ ok: false, error: 'id required' })); return; }
+            const { actionDeleteAgent } = require('./skills/browser.agent.cjs');
+            const result = await actionDeleteAgent({ id });
+            res.writeHead(result.ok ? 200 : 500);
+            res.end(JSON.stringify(result));
+          } catch (err) {
+            res.writeHead(500);
+            res.end(JSON.stringify({ ok: false, error: err.message }));
+          }
+        });
+        return;
+      }
+
+      // ── POST /agent.query — query a single agent by id ───────────────────────
+      if (req.method === 'POST' && req.url === '/agent.query') {
+        let body = '';
+        req.on('data', chunk => { body += chunk; });
+        req.on('end', async () => {
+          try {
+            const { id } = JSON.parse(body || '{}');
+            if (!id) { res.writeHead(400); res.end(JSON.stringify({ ok: false, error: 'id required' })); return; }
+            const { cliAgent } = require('./skills/cli.agent.cjs');
+            const result = await cliAgent({ action: 'query_agent', id });
+            res.writeHead(200);
+            res.end(JSON.stringify({ ok: true, data: result }));
+          } catch (err) {
+            res.writeHead(500);
+            res.end(JSON.stringify({ ok: false, error: err.message }));
+          }
+        });
+        return;
+      }
+
+      // ── POST /agent.migrate — migrate legacy .agent.md files to DuckDB ───────
+      if (req.method === 'POST' && req.url === '/agent.migrate') {
+        (async () => {
+          try {
+            const fsM = require('fs');
+            const pathM = require('path');
+            const osM = require('os');
+            const { withDb } = require('@thinkdrop/agents-db');
+            const agentsDir = pathM.join(osM.homedir(), '.thinkdrop', 'agents');
+            if (!fsM.existsSync(agentsDir)) { res.writeHead(200); res.end(JSON.stringify({ ok: true, migrated: 0 })); return; }
+            await withDb(async (db) => {
+              const existingRows = await db.all("SELECT id FROM agents WHERE type = 'browser' OR type IS NULL");
+              const existingIds = new Set(existingRows.map(r => r.id));
+              const files = fsM.readdirSync(agentsDir).filter(f => f.endsWith('.agent.md'));
+              let migrated = 0;
+              for (const file of files) {
+                const id = file.replace('.agent.md', '');
+                if (existingIds.has(id)) continue;
+                const content = fsM.readFileSync(pathM.join(agentsDir, file), 'utf8');
+                const fmMatch = content.match(/^---\s*\n([\s\S]*?)\n---/);
+                const fm = fmMatch ? fmMatch[1] : '';
+                const getField = (key) => { const m = fm.match(new RegExp(`^${key}\\s*:\\s*(.+)$`, 'm')); return m ? m[1].trim() : undefined; };
+                const service = getField('service') || id.replace('.agent', '');
+                const status = getField('status') || 'pending';
+                const capabilities = getField('capabilities') || '[]';
+                try {
+                  await db.run(
+                    `INSERT OR REPLACE INTO agents (id, type, service, cli_tool, capabilities, descriptor, last_validated, status, created_at) VALUES (?, 'browser', ?, NULL, ?, ?, CURRENT_TIMESTAMP, ?, CURRENT_TIMESTAMP)`,
+                    id, service, capabilities, content, status === 'healthy' ? 'learned' : status
+                  );
+                  migrated++;
+                } catch (_) {}
+              }
+              res.writeHead(200);
+              res.end(JSON.stringify({ ok: true, migrated }));
+            });
+          } catch (err) {
+            res.writeHead(500);
+            res.end(JSON.stringify({ ok: false, error: err.message }));
+          }
+        })();
+        return;
+      }
+
+      // ── POST /agent.build — build a browser agent (owns DuckDB lock here) ────
+      if (req.method === 'POST' && req.url === '/agent.build') {
+        let body = '';
+        req.on('data', chunk => { body += chunk; });
+        req.on('end', async () => {
+          try {
+            const { service, startUrl, goals, force } = JSON.parse(body || '{}');
+            if (!service) { res.writeHead(400); res.end(JSON.stringify({ ok: false, error: 'service is required' })); return; }
+            const { browserAgent } = require('./skills/browser.agent.cjs');
+            const result = await browserAgent({ action: 'build_agent', service, startUrl, goals, force: !!force });
+            res.writeHead(200);
+            res.end(JSON.stringify(result));
+          } catch (err) {
+            res.writeHead(500);
+            res.end(JSON.stringify({ ok: false, error: err.message }));
+          }
+        });
+        return;
+      }
+
       res.writeHead(404);
       res.end(JSON.stringify({ error: 'Not found' }));
     });
@@ -716,8 +929,9 @@ class CommandServiceMCPServer {
       logger.info(`Health endpoint listening on http://localhost:${PORT}/health`);
     });
 
-    const shutdown = (signal) => {
+    const shutdown = async (signal) => {
       logger.info(`${signal} received — shutting down`);
+      try { const { closeDb } = require('@thinkdrop/agents-db'); await closeDb(); } catch (_) {}
       healthServer.close(() => process.exit(0));
     };
 
