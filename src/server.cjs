@@ -42,6 +42,7 @@ const { screenCapture } = require('./skills/screen.capture.cjs');
 const { userAgent } = require('./skills/user.agent.cjs');
 const webAgent   = require('./skills/web.agent.cjs');
 const videoAgent = require('./skills/video.agent.cjs');
+const appAgent   = require('./skills/app.agent.cjs');
 const skillScheduler = require('./skill-helpers/skill-scheduler.cjs');
 const { startIdleWatcher, stopIdleWatcher, startScanScheduler, runMaintenanceScan, cancelMaintenanceScan, getScanStatus } = require('./skills/explore.agent.cjs');
 const { systemIntrospect } = require('./skills/system.introspect.cjs');
@@ -358,6 +359,16 @@ class CommandServiceMCPServer {
     const PORT = parseInt(process.env.PORT || '3007', 10);
     const healthServer = http.createServer(async (req, res) => {
       res.setHeader('Content-Type', 'application/json');
+      res.setHeader('Access-Control-Allow-Origin', '*');
+      res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+      res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+
+      // Handle preflight OPTIONS
+      if (req.method === 'OPTIONS') {
+        res.writeHead(200);
+        res.end();
+        return;
+      }
 
       if (req.url === '/health' || req.url === '/service.health') {
         res.writeHead(200);
@@ -915,6 +926,66 @@ class CommandServiceMCPServer {
             res.writeHead(200);
             res.end(JSON.stringify(result));
           } catch (err) {
+            res.writeHead(500);
+            res.end(JSON.stringify({ ok: false, error: err.message }));
+          }
+        });
+        return;
+      }
+
+      // ── POST /app.agent — desktop application automation via LiteParse ──────
+      if (req.method === 'POST' && req.url === '/app.agent') {
+        let body = '';
+        req.on('data', chunk => { body += chunk; });
+        req.on('end', async () => {
+          try {
+            const { action, ...args } = JSON.parse(body || '{}');
+            if (!action) {
+              res.writeHead(400);
+              res.end(JSON.stringify({ ok: false, error: 'action is required' }));
+              return;
+            }
+
+            logger.info(`[app.agent] Executing action: ${action}`);
+
+            let result;
+            switch (action) {
+              case 'parse_screenshot':
+                result = await appAgent.actionParseScreenshot(args);
+                break;
+              case 'find_elements':
+                result = await appAgent.actionFindElements(args);
+                break;
+              case 'highlight_all':
+                result = await appAgent.actionHighlightAll(args);
+                break;
+              case 'highlight_search':
+                result = await appAgent.actionHighlightSearch(args);
+                break;
+              case 'highlight_boundaries':
+                result = await appAgent.actionHighlightBoundaries(args);
+                break;
+              case 'highlight_assets':
+                result = await appAgent.actionHighlightAssets(args);
+                break;
+              case 'clear_highlights':
+                result = await appAgent.actionClearHighlights();
+                break;
+              case 'capture_screen':
+                result = await appAgent.actionCaptureScreen();
+                break;
+              default:
+                res.writeHead(400);
+                res.end(JSON.stringify({ ok: false, error: `Unknown action: ${action}` }));
+                return;
+            }
+
+            // Always return 200 for successful action execution, even if action returned an error result
+            // The result.ok flag indicates business logic success/failure, not HTTP status
+            res.writeHead(200);
+            res.end(JSON.stringify(result));
+          } catch (err) {
+            logger.error(`[app.agent] Error: ${err.message}`);
             res.writeHead(500);
             res.end(JSON.stringify({ ok: false, error: err.message }));
           }

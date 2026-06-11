@@ -1207,6 +1207,7 @@ __metadata:
     node-cron: ^3.0.3
     nodemailer: ^8.0.5
     nodemon: ^3.0.0
+    screenshot-desktop: ^1.15.0
     winston: ^3.11.0
     ws: ^8.19.0
   languageName: unknown
@@ -2435,7 +2436,7 @@ __metadata:
   languageName: node
   linkType: hard
 
-"minimist@npm:^1.2.0, minimist@npm:^1.2.3":
+"minimist@npm:^1.2.0, minimist@npm:^1.2.3, minimist@npm:^1.2.6":
   version: 1.2.8
   resolution: "minimist@npm:1.2.8"
   checksum: 75a6d645fb122dad29c06a7597bddea977258957ed88d7a6df59b5cd3fe4a527e253e9bbf2e783e4b73657f9098b96a5fe96ab8a113655d4109108577ecf85b0
@@ -2563,6 +2564,17 @@ __metadata:
   version: 0.5.3
   resolution: "mkdirp-classic@npm:0.5.3"
   checksum: 3f4e088208270bbcc148d53b73e9a5bd9eef05ad2cbf3b3d0ff8795278d50dd1d11a8ef1875ff5aea3fa888931f95bfcb2ad5b7c1061cfefd6284d199e6776ac
+  languageName: node
+  linkType: hard
+
+"mkdirp@npm:^0.5.1":
+  version: 0.5.6
+  resolution: "mkdirp@npm:0.5.6"
+  dependencies:
+    minimist: ^1.2.6
+  bin:
+    mkdirp: bin/cmd.js
+  checksum: 0c91b721bb12c3f9af4b77ebf73604baf350e64d80df91754dc509491ae93bf238581e59c7188360cec7cb62fc4100959245a42cfe01834efedc5e9d068376c2
   languageName: node
   linkType: hard
 
@@ -3243,6 +3255,17 @@ __metadata:
   languageName: node
   linkType: hard
 
+"rimraf@npm:~2.6.2":
+  version: 2.6.3
+  resolution: "rimraf@npm:2.6.3"
+  dependencies:
+    glob: ^7.1.3
+  bin:
+    rimraf: ./bin.js
+  checksum: 3ea587b981a19016297edb96d1ffe48af7e6af69660e3b371dbfc73722a73a0b0e9be5c88089fbeeb866c389c1098e07f64929c7414290504b855f54f901ab10
+  languageName: node
+  linkType: hard
+
 "safe-buffer@npm:^5.0.1, safe-buffer@npm:~5.2.0":
   version: 5.2.1
   resolution: "safe-buffer@npm:5.2.1"
@@ -3268,6 +3291,15 @@ __metadata:
   version: 1.4.4
   resolution: "sax@npm:1.4.4"
   checksum: a6082a153b4ab00968894b3751f6fdc431b0b7edc2d086da67ee162a06716f4bc7d0546e875993e950c757039c9e3838747ab77f50578a6ce579f970a6feadaf
+  languageName: node
+  linkType: hard
+
+"screenshot-desktop@npm:^1.15.0":
+  version: 1.15.4
+  resolution: "screenshot-desktop@npm:1.15.4"
+  dependencies:
+    temp: ^0.9.4
+  checksum: 1301a2af1adb73caf908ddf309ca12ed4ac77a087432f4aced6bf2b074d8ece6f5c446a66d18fc7c03814dca4da26c3a8285cec1636178dc34c8626b3ef52d0e
   languageName: node
   linkType: hard
 
@@ -3634,6 +3666,16 @@ __metadata:
     minizlib: ^3.1.0
     yallist: ^5.0.0
   checksum: 9b7f886f5ce8681a7430f80b9b377bfa498e6feb957b9afe6507db08e59d309f8546b7f76a0c2e47bdb54da4602575a5c7519e287fe94de8302e635032fc94f1
+  languageName: node
+  linkType: hard
+
+"temp@npm:^0.9.4":
+  version: 0.9.4
+  resolution: "temp@npm:0.9.4"
+  dependencies:
+    mkdirp: ^0.5.1
+    rimraf: ~2.6.2
+  checksum: 8709d4d63278bd309ca0e49e80a268308dea543a949e71acd427b3314cd9417da9a2cc73425dd9c21c6780334dbffd67e05e7be5aaa73e9affe8479afc6f20e3
   languageName: node
   linkType: hard
 
