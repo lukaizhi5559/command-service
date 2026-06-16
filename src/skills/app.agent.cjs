@@ -24,6 +24,35 @@ const fs = require('fs');
 const os = require('os');
 const logger = require('../logger.cjs');
 
+// Quadrant-based coordinate adjustment settings
+// Fine-tune these to fix vertical/horizontal offset issues in different screen sections
+const QUADRANT_OFFSETS = {
+  upperLeft:  { x: -5, y: 0 },   // Top half - no adjustment needed
+  upperRight: { x: 10, y: 0 },   // Top half - no adjustment needed
+  lowerLeft:  { x: -5, y: 15 },  // Bottom half - push down 15px
+  lowerRight: { x: 10, y: 15 }   // Bottom half - push down 15px
+};
+
+// Screen center coordinates (updated dynamically from screenshot)
+let screenCenterX = 720;  // Default: half of 1440px
+let screenCenterY = 450;  // Default: half of 900px
+
+/**
+ * Get quadrant-based coordinate adjustment for an element
+ * @param {number} x - Element x position
+ * @param {number} y - Element y position
+ * @returns {Object} - { x: offsetX, y: offsetY }
+ */
+function getQuadrantOffset(x, y) {
+  const isUpper = y < screenCenterY;
+  const isLeft = x < screenCenterX;
+
+  if (isUpper && isLeft) return QUADRANT_OFFSETS.upperLeft;
+  if (isUpper && !isLeft) return QUADRANT_OFFSETS.upperRight;
+  if (!isUpper && isLeft) return QUADRANT_OFFSETS.lowerLeft;
+  return QUADRANT_OFFSETS.lowerRight;
+}
+
 // Overlay communication settings
 const OVERLAY_HOST = process.env.OVERLAY_HOST || '127.0.0.1';
 const OVERLAY_PORT = process.env.OVERLAY_PORT || '3010';
@@ -398,33 +427,349 @@ async function actionFindElements(args = {}) {
   }
   
   const searchLower = searchText.toLowerCase();
+  
+  // Check if this is a compound term (contains dots, arrows, etc.)
+  // These often get split by LiteParse into separate items
+  const compoundSeparators = /[.\->_:]/;
+  const isCompoundTerm = compoundSeparators.test(searchText) && !searchText.includes(' ');
+  
+  if (isCompoundTerm) {
+    logger.info(`[actionFindElements] Compound term detected: "${searchText}"`);
+    
+    // First, try substring matching (LiteParse may return full term as single item)
+    const substringMatches = [];
+    textItems.forEach(item => {
+      const itemText = item.text.toLowerCase();
+      if (itemText.includes(searchLower)) {
+        substringMatches.push({ ...item, matchType: 'compound-substring', matchScore: 1.0 });
+      }
+    });
+    
+    if (substringMatches.length > 0) {
+      logger.info(`[actionFindElements] Found ${substringMatches.length} substring matches for compound term`);
+      return {
+        ok: true,
+        matches: substringMatches,
+        count: substringMatches.length,
+        searchText
+      };
+    }
+    
+    // Fall back to multi-part matching if no single-item matches found
+    const parts = searchLower.split(/[.\->_:]+/).filter(p => p.length > 0);
+    if (parts.length > 1) {
+      logger.info(`[actionFindElements] Trying multi-part matching: ${parts.join(', ')}`);
+      return findCompoundMatches(textItems, parts, searchText);
+    }
+  }
+  
+  const searchWords = searchLower.split(/\s+/).filter(w => w.length > 0);
   const matches = [];
   
-  textItems.forEach(item => {
-    const itemText = item.text.toLowerCase();
-    
-    // Exact match
-    if (itemText === searchLower) {
-      matches.push({ ...item, matchType: 'exact', matchScore: 1.0 });
+  // Single word search - use existing logic
+  if (searchWords.length === 1) {
+    textItems.forEach(item => {
+      const itemText = item.text.toLowerCase();
+      
+      // Exact match
+      if (itemText === searchLower) {
+        matches.push({ ...item, matchType: 'exact', matchScore: 1.0 });
+      }
+      // Contains match
+      else if (itemText.includes(searchLower)) {
+        matches.push({ ...item, matchType: 'contains', matchScore: 0.8 });
+      }
+      // Fuzzy match (word boundaries)
+      else if (fuzzy && fuzzyMatch(searchLower, itemText)) {
+        matches.push({ ...item, matchType: 'fuzzy', matchScore: 0.6 });
+      }
+    });
+  } else {
+    // Multi-word search: first check if entire phrase appears in a single item
+    const fullPhrase = searchLower;
+
+    // DEBUG: Log what we're searching for
+    logger.info(`[actionFindElements] Multi-word search: "${searchText}" -> words: [${searchWords.join(', ')}] pageTextLen=${args.pageText ? args.pageText.length : 'MISSING'}`);
+
+    // DEBUG: Log sample of text items to see what LiteParse returns
+    const sampleItems = textItems.slice(0, 100).map(i => `"${i.text}"`).join(', ');
+    logger.info(`[actionFindElements] First 100 text items: ${sampleItems}`);
+
+    // DEBUG: Also search for items containing "star" to debug
+    const starItems = textItems.filter(i => i.text.toLowerCase().includes('star')).map(i => `"${i.text}"`).join(', ');
+    logger.info(`[actionFindElements] Items containing 'star': ${starItems || 'NONE FOUND'}`);
+
+    // DEBUG: Log all standalone "1" and "5" items with coordinates
+    const numItems = textItems.filter(i => i.text.trim() === searchWords[0]).map(i => `"${i.text}"@(${Math.round(i.x)},${Math.round(i.y)})`).join(', ');
+    logger.info(`[actionFindElements] Items matching first word "${searchWords[0]}": ${numItems || 'NONE'}`);
+
+    // Compact phrase: words joined with no space — handles OCR-merged tokens like "1star", "3star"
+    const compactPhrase = searchWords.join('');
+
+    textItems.forEach(item => {
+      const itemText = item.text.toLowerCase();
+
+      // Check if entire phrase appears in this single item (spaced or compact)
+      if (itemText === fullPhrase || itemText.includes(fullPhrase)) {
+        logger.info(`[actionFindElements] Single-item phrase match: "${item.text}"`);
+        matches.push({ ...item, matchType: 'exact-phrase', matchScore: 1.0 });
+      } else if (compactPhrase !== fullPhrase && (itemText === compactPhrase || itemText.includes(compactPhrase))) {
+        logger.info(`[actionFindElements] Compact-phrase match: "${item.text}" (compact="${compactPhrase}")`);
+        matches.push({ ...item, matchType: 'exact-phrase', matchScore: 1.0 });
+      }
+    });
+
+    // Also try combining items via spatial proximity
+    for (let i = 0; i < textItems.length; i++) {
+      const combined = tryCombineItems(textItems, i, searchWords);
+      if (combined) {
+        logger.info(`[actionFindElements] Combined match: "${combined.text}"`);
+        matches.push({
+          x: combined.x,
+          y: combined.y,
+          width: combined.width,
+          height: combined.height,
+          text: combined.text,
+          matchType: 'phrase',
+          matchScore: 0.9
+        });
+        i += combined._consumed - 1;
+      }
     }
-    // Contains match
-    else if (itemText.includes(searchLower)) {
-      matches.push({ ...item, matchType: 'contains', matchScore: 0.8 });
+
+    // Page-text fallback: if no matches yet, check full-page OCR text string.
+    // LiteParse's pages[0].text often contains "5 star" even when textItems are fragmented.
+    if (matches.length === 0 && args.pageText) {
+      const pageTextLower = args.pageText.toLowerCase();
+      // Check both spaced ("5 star") and compact ("5star") forms in page text
+      const pageHasPhrase = pageTextLower.includes(fullPhrase) ||
+                            (compactPhrase !== fullPhrase && pageTextLower.includes(compactPhrase));
+      if (pageHasPhrase) {
+        const matchedForm = pageTextLower.includes(fullPhrase) ? fullPhrase : compactPhrase;
+        logger.info(`[actionFindElements] Page-text fallback: found "${matchedForm}" in full page text`);
+        // Build a union bounding box from all individual word matches found in textItems
+        const wordBoxes = searchWords.map(word => {
+          return textItems.find(item => {
+            const t = item.text.toLowerCase().trim();
+            return t === word || new RegExp(`\\b${word}\\b`, 'i').test(t);
+          });
+        }).filter(Boolean);
+        if (wordBoxes.length === searchWords.length) {
+          const minX = Math.min(...wordBoxes.map(i => i.x));
+          const minY = Math.min(...wordBoxes.map(i => i.y));
+          const maxRight = Math.max(...wordBoxes.map(i => i.x + i.width));
+          const maxBottom = Math.max(...wordBoxes.map(i => i.y + i.height));
+          logger.info(`[actionFindElements] Page-text fallback bbox: (${Math.round(minX)},${Math.round(minY)}) ${Math.round(maxRight-minX)}x${Math.round(maxBottom-minY)}`);
+          matches.push({
+            x: minX, y: minY,
+            width: maxRight - minX,
+            height: maxBottom - minY,
+            text: fullPhrase,
+            matchType: 'page-text-fallback',
+            matchScore: 0.7
+          });
+        }
+      }
     }
-    // Fuzzy match (word boundaries)
-    else if (fuzzy && fuzzyMatch(searchLower, itemText)) {
-      matches.push({ ...item, matchType: 'fuzzy', matchScore: 0.6 });
+
+    // Digit-star special case: "N star" (e.g. "1 star", "5 star") where "N" is absent as a standalone
+    // token. Check page text for digit adjacent to "star", then match any "star" or "Nstar" textItem.
+    if (matches.length === 0 && searchWords.length === 2 &&
+        /^\d+$/.test(searchWords[0]) && searchWords[1] === 'star') {
+      const digit = searchWords[0];
+      const pageTextLower = (args.pageText || '').toLowerCase();
+      const adjacentRegex = new RegExp(`${digit}[\\s\\-]?star`, 'i');
+      const foundInPageText = adjacentRegex.test(pageTextLower);
+      logger.info(`[actionFindElements] Digit-star check: "${digit} star" in pageText=${foundInPageText}`);
+      if (foundInPageText) {
+        // Prefer exact "Nstar" concat token, then any standalone "star" item
+        const concatItem = textItems.find(i => i.text.toLowerCase().trim() === `${digit}star`);
+        const anyStarItem = textItems.find(i => /\bstar\b/i.test(i.text) || i.text.toLowerCase() === 'star');
+        const bestMatch = concatItem || anyStarItem;
+        if (bestMatch) {
+          logger.info(`[actionFindElements] Digit-star match: "${bestMatch.text}" at (${Math.round(bestMatch.x)},${Math.round(bestMatch.y)})`);
+          matches.push({ ...bestMatch, matchType: 'digit-star', matchScore: 0.85 });
+        }
+      }
     }
-  });
+
+    // DEBUG: Log final result
+    logger.info(`[actionFindElements] Total matches found: ${matches.length}`);
+  }
   
   // Sort by match score
   matches.sort((a, b) => b.matchScore - a.matchScore);
   
   return {
-    ok: true,
+    ok: matches.length > 0,
     matches,
     count: matches.length,
     searchText
+  };
+}
+
+/**
+ * Try to combine text items to match a phrase using spatial proximity.
+ * Checks if textItems[startIdx] matches the first word, then spatially
+ * finds each subsequent word on the same row (y-diff <= 20px).
+ * Returns combined bounding box if all words found, null otherwise.
+ */
+function tryCombineItems(textItems, startIdx, searchWords) {
+  const firstItem = textItems[startIdx];
+  if (!firstItem) return null;
+
+  const firstText = firstItem.text.toLowerCase().trim();
+  const firstWord = searchWords[0];
+
+  // Check if this item matches the first search word.
+  // For pure numeric tokens (e.g. "5", "1"), require exact match to avoid
+  // false positives like "5.5s" or "15%" matching \b5\b.
+  const isNumericToken = /^\d+$/.test(firstWord);
+  const isFirstMatch = isNumericToken
+    ? firstText === firstWord
+    : (firstText === firstWord || new RegExp(`\\b${firstWord}\\b`, 'i').test(firstText));
+
+  // Diagnostic: log every time first word matches (not too spammy since most items won't match)
+  if (isFirstMatch) {
+    logger.info(`[tryCombineItems] First word "${firstWord}" matched item "${firstItem.text}" at (${Math.round(firstItem.x)},${Math.round(firstItem.y)}) idx=${startIdx}`);
+  }
+
+  if (!isFirstMatch) return null;
+
+  // First word matched — spatially find all remaining words on the same row
+  let combinedText = firstItem.text;
+  let minX = firstItem.x, minY = firstItem.y;
+  let maxRight = firstItem.x + firstItem.width;
+  let maxBottom = firstItem.y + firstItem.height;
+  let allWordsFound = true;
+
+  for (let w = 1; w < searchWords.length; w++) {
+    const targetWord = searchWords[w];
+    let bestMatch = null;
+    let bestAbsXDist = Infinity;
+
+    // Spatial scan: search ALL items for the closest same-row match
+    for (let j = 0; j < textItems.length; j++) {
+      const item = textItems[j];
+      const itemText = item.text.toLowerCase().trim();
+
+      const isMatch = itemText === targetWord ||
+                      new RegExp(`\\b${targetWord}\\b`, 'i').test(itemText);
+      if (!isMatch) continue;
+
+      // Same row: y-diff <= 80px.
+      // Live OCR may return "5" from "4.4 out of 5" (y≈308) while "star" rows are at y≈373 (65px diff).
+      const yDiff = Math.abs(item.y - firstItem.y);
+      if (yDiff > 80) continue;
+
+      // Must be within 400px of the FIRST matched word horizontally (same visual cluster).
+      // NOTE: do NOT require right-of — the star rating table has "5" in right column
+      // and "star" labels in left column (x=432 < x=603).
+      const absXDist = Math.abs(item.x - firstItem.x);
+      if (absXDist > 400) continue;
+
+      if (absXDist < bestAbsXDist) {
+        bestAbsXDist = absXDist;
+        bestMatch = item;
+      }
+    }
+
+    if (!bestMatch) {
+      allWordsFound = false;
+      break;
+    }
+
+    combinedText += ' ' + bestMatch.text;
+    minX = Math.min(minX, bestMatch.x);
+    minY = Math.min(minY, bestMatch.y);
+    maxRight = Math.max(maxRight, bestMatch.x + bestMatch.width);
+    maxBottom = Math.max(maxBottom, bestMatch.y + bestMatch.height);
+    logger.info(`[tryCombineItems] Spatial match: "${targetWord}" found at (${bestMatch.x.toFixed(0)}, ${bestMatch.y.toFixed(0)}) absXDist=${bestAbsXDist.toFixed(0)}px yDiff=${Math.abs(bestMatch.y - firstItem.y).toFixed(0)}px`);
+  }
+
+  if (allWordsFound) {
+    logger.info(`[tryCombineItems] Matched phrase: "${combinedText}"`);
+    return {
+      x: minX,
+      y: minY,
+      width: maxRight - minX,
+      height: maxBottom - minY,
+      text: combinedText,
+      _consumed: 1
+    };
+  }
+
+  return null;
+}
+
+/**
+ * Find matches for compound terms (dot-separated, etc.)
+ * Searches for consecutive items that collectively match
+ */
+function findCompoundMatches(textItems, parts, originalSearch) {
+  const matches = [];
+  const searchLower = originalSearch.toLowerCase();
+  
+  for (let i = 0; i < textItems.length; i++) {
+    let combinedText = '';
+    let minX = Infinity, minY = Infinity, maxRight = 0, maxBottom = 0;
+    let partsFound = 0;
+    let itemsConsumed = 0;
+    
+    for (let j = i; j < textItems.length && itemsConsumed < parts.length * 2; j++) {
+      const item = textItems[j];
+      const itemText = item.text.toLowerCase().trim();
+      
+      if (!itemText) continue;
+      
+      const targetPart = parts[partsFound];
+      
+      // Check if item matches current part (or contains it)
+      if (itemText === targetPart || 
+          itemText.includes(targetPart) || 
+          targetPart.includes(itemText)) {
+        combinedText += item.text;
+        minX = Math.min(minX, item.x);
+        minY = Math.min(minY, item.y);
+        maxRight = Math.max(maxRight, item.x + item.width);
+        maxBottom = Math.max(maxBottom, item.y + item.height);
+        
+        partsFound++;
+        itemsConsumed++;
+        
+        if (partsFound >= parts.length) {
+          // Combined text found - create match
+          matches.push({
+            x: minX,
+            y: minY,
+            width: maxRight - minX,
+            height: maxBottom - minY,
+            text: combinedText,
+            matchType: 'compound',
+            matchScore: 1.0
+          });
+          break;
+        }
+      } else if (partsFound > 0) {
+        // Allow separators (dots, arrows, etc.) between parts
+        if (/^[.\->_:]$/.test(itemText)) {
+          combinedText += item.text;
+          itemsConsumed++;
+          // Don't increment partsFound
+        } else {
+          break; // Non-matching item, stop
+        }
+      } else {
+        break; // First item didn't match
+      }
+    }
+  }
+  
+  return {
+    ok: matches.length > 0,
+    matches,
+    count: matches.length,
+    searchText: originalSearch
   };
 }
 
@@ -562,21 +907,37 @@ async function actionHighlightSearch(args = {}) {
   }
   
   try {
-    // Send scanning start
+    // Send scanning start — hides overlay windows for a clean screenshot (no GhostLayer yet)
     logger.info('[actionHighlightSearch] Starting scan');
     await sendOverlayIpc({ type: 'scanning_start' });
-    
-    // 1. Parse screenshot
+    // Wait for macOS to fully composite the hide before capturing
+    await new Promise(r => setTimeout(r, 150));
+
+    // 1. Parse screenshot (overlay is hidden — clean capture)
     const parseResult = await actionParseScreenshot({});
+
+    // Now show the GhostLayer scanning animation (screenshot already taken)
+    sendOverlayIpc({ type: 'show_scan_overlay' });
     if (!parseResult.ok) {
       sendOverlayIpc({ type: 'scanning_complete' });
       return parseResult;
     }
-    
+
+    // Update screen center from parsed dimensions (if available from LiteParse)
+    if (parseResult.imageWidth && parseResult.imageHeight) {
+      screenCenterX = parseResult.imageWidth / 2;
+      screenCenterY = parseResult.imageHeight / 2;
+      logger.info(`[actionHighlightSearch] Screen center updated: ${screenCenterX}x${screenCenterY}`);
+    }
+
     // 2. Find matching elements
+    const pageText = parseResult.raw && parseResult.raw.pages && parseResult.raw.pages[0]
+      ? (parseResult.raw.pages[0].text || '')
+      : '';
     const findResult = await actionFindElements({
       searchText,
-      textItems: parseResult.textItems
+      textItems: parseResult.textItems,
+      pageText
     });
     
     if (!findResult.ok || findResult.matches.length === 0) {
@@ -584,18 +945,27 @@ async function actionHighlightSearch(args = {}) {
       return { ok: false, error: `No elements found matching "${searchText}"` };
     }
     
-    // 3. Add padding to search matches for better visibility
-    const paddedMatches = findResult.matches.map(match => ({
-      ...match,
-      x: match.x - 8,        // 8px left padding
-      y: match.y - 4,        // 4px top padding
-      width: match.width + 16, // 8px each side
-      height: match.height + 8 // 4px each side
-    }));
+    logger.info(`[actionHighlightSearch] Found ${findResult.matches.length} matches for "${searchText}"`);
+    findResult.matches.slice(0, 5).forEach((match, i) => {
+      const quadrant = match.y < screenCenterY ? (match.x < screenCenterX ? 'UL' : 'UR') : (match.x < screenCenterX ? 'LL' : 'LR');
+      logger.info(`[actionHighlightSearch] Match ${i} [${quadrant}]: "${match.text?.substring(0, 40)}" at (${match.x.toFixed(0)}, ${match.y.toFixed(0)})`);
+    });
+    
+    // 3. Add padding and apply quadrant-based coordinate adjustments
+    const adjustedMatches = findResult.matches.map(match => {
+      const quadrantOffset = getQuadrantOffset(match.x, match.y);
+      return {
+        ...match,
+        x: match.x + 15 + quadrantOffset.x,         // Base padding + quadrant x offset
+        y: match.y + 5 + quadrantOffset.y,          // Base padding + quadrant y offset
+        width: match.width + 20,  // 5px each side = 10px total
+        height: match.height + 20 // 5px each side = 10px total
+      };
+    });
     
     // 4. Highlight matches in different color (persistent)
     const result = await actionHighlightElements({
-      elements: paddedMatches,
+      elements: adjustedMatches,
       duration: args.duration || 0,  // 0 = persistent
       color: '#ff0000'  // Red for search matches
     });
@@ -2273,6 +2643,862 @@ async function actionClearHighlights() {
 }
 
 // ---------------------------------------------------------------------------
+// Phase 2: App Taxonomy & Category System
+// ---------------------------------------------------------------------------
+
+const db = require('../skill-helpers/skill-db.cjs');
+const { ask: skillLlmAsk } = require('../skill-helpers/skill-llm.cjs');
+const webAgent = require('./web.agent.cjs');
+const { webCrawl } = require('./web.crawl.cjs');
+
+const KNOWN_APPS = {
+  'Google Chrome': 'browser',
+  'Safari': 'browser',
+  'Firefox': 'browser',
+  'Microsoft Edge': 'browser',
+  'Brave Browser': 'browser',
+  'Visual Studio Code': 'editor',
+  'Code': 'editor',
+  'Cursor': 'editor',
+  'Windsurf': 'editor',
+  'Zed': 'editor',
+  'Sublime Text': 'editor',
+  'TextEdit': 'editor',
+  'Devin': 'editor',
+  'Slack': 'chat',
+  'Discord': 'chat',
+  'Microsoft Teams': 'chat',
+  'Telegram': 'chat',
+  'WhatsApp': 'chat',
+  'Messages': 'chat',
+  'Figma': 'design',
+  'Adobe Photoshop': 'design',
+  'Adobe Illustrator': 'design',
+  'Sketch': 'design',
+  'Terminal': 'terminal',
+  'iTerm': 'terminal',
+  'iTerm2': 'terminal',
+  'Warp': 'terminal',
+  'Hyper': 'terminal',
+  'Mail': 'email',
+  'Microsoft Outlook': 'email',
+  'Spark': 'email'
+};
+
+const CATEGORY_SCHEMAS = {
+  browser: {
+    regions: {
+      addressBar: { x: [150, 800], y: [70, 100], type: 'url_input' },
+      tabBar: { x: [0, 1200], y: [35, 70], type: 'tabs' },
+      contentArea: { x: [0, 1280], y: [100, 800], type: 'page_content' }
+    },
+    inferBoundaryType: (width, height, x, y) => {
+      if (y > 70 && y < 100 && x > 150) return { type: 'address_bar', confidence: 0.9 };
+      if (y > 100 && width > 800) return { type: 'content', confidence: 0.85 };
+      return { type: 'unknown', confidence: 0.3 };
+    },
+    clipboardBehavior: { cmdA: 'select_all_page', extractionStrategy: 'Cmd+L then Cmd+A' },
+    monitoringModes: ['passive'],
+    universalFind: 'Cmd+F'
+  },
+  editor: {
+    regions: {
+      sidebar: { x: [0, 250], y: [35, 800], type: 'file_tree' },
+      editorPane: { x: [250, 1200], y: [70, 750], type: 'code_editor' },
+      terminal: { x: [250, 1200], y: [750, 800], type: 'terminal' },
+      tabBar: { x: [250, 1200], y: [35, 70], type: 'tabs' }
+    },
+    inferBoundaryType: (width, height, x, y) => {
+      if (x < 250 && width < 300) return { type: 'sidebar', confidence: 0.9 };
+      if (x > 250 && width > 600 && y < 750) return { type: 'editor', confidence: 0.9 };
+      if (y > 750) return { type: 'terminal', confidence: 0.8 };
+      return { type: 'unknown', confidence: 0.3 };
+    },
+    clipboardBehavior: { cmdA: 'select_all_file', extractionStrategy: 'Cmd+1 then Cmd+A then Cmd+C' },
+    monitoringModes: ['passive'],
+    universalFind: 'Cmd+F'
+  },
+  chat: {
+    regions: {
+      sidebar: { x: [0, 220], y: [50, 800], type: 'channel_list' },
+      messageArea: { x: [220, 1200], y: [50, 700], type: 'messages' },
+      inputArea: { x: [220, 1200], y: [700, 800], type: 'input_box' }
+    },
+    inferBoundaryType: (width, height, x, y) => {
+      if (width < 250 && x < 220) return { type: 'sidebar', confidence: 0.95 };
+      if (y > 700 && height < 100) return { type: 'input', confidence: 0.9 };
+      if (x > 220 && y < 700) return { type: 'messages', confidence: 0.85 };
+      return { type: 'unknown', confidence: 0.3 };
+    },
+    clipboardBehavior: { cmdA: 'select_input_only', extractionStrategy: 'Scroll + OCR accumulation' },
+    monitoringModes: ['active', 'passive'],
+    universalFind: 'Cmd+F'
+  },
+  design: {
+    regions: {
+      toolbar: { x: [0, 1280], y: [0, 50], type: 'toolbar' },
+      canvas: { x: [200, 1100], y: [50, 800], type: 'canvas' },
+      layers: { x: [0, 200], y: [50, 800], type: 'layers' },
+      properties: { x: [1100, 1280], y: [50, 800], type: 'properties' }
+    },
+    inferBoundaryType: (width, height, x, y) => {
+      if (y < 50) return { type: 'toolbar', confidence: 0.9 };
+      if (x < 200) return { type: 'layers', confidence: 0.85 };
+      if (x > 1100) return { type: 'properties', confidence: 0.85 };
+      return { type: 'canvas', confidence: 0.7 };
+    },
+    clipboardBehavior: { cmdA: 'select_all_canvas', extractionStrategy: 'Specific element selection only' },
+    monitoringModes: ['passive'],
+    universalFind: 'Cmd+F'
+  },
+  terminal: {
+    regions: {
+      scrollback: { x: [0, 1280], y: [0, 750], type: 'output' },
+      input: { x: [0, 1280], y: [750, 800], type: 'input_line' }
+    },
+    inferBoundaryType: (width, height, x, y) => {
+      if (y > 750) return { type: 'input', confidence: 0.9 };
+      return { type: 'scrollback', confidence: 0.8 };
+    },
+    clipboardBehavior: { cmdA: 'not_applicable', extractionStrategy: 'Selection copy only' },
+    monitoringModes: ['passive'],
+    universalFind: null
+  },
+  email: {
+    regions: {
+      folders: { x: [0, 200], y: [50, 800], type: 'folder_list' },
+      messageList: { x: [200, 600], y: [50, 800], type: 'message_list' },
+      readingPane: { x: [600, 1280], y: [50, 800], type: 'reading_pane' }
+    },
+    inferBoundaryType: (width, height, x, y) => {
+      if (x < 200) return { type: 'folders', confidence: 0.9 };
+      if (x > 200 && x < 600) return { type: 'message_list', confidence: 0.85 };
+      return { type: 'reading_pane', confidence: 0.8 };
+    },
+    clipboardBehavior: { cmdA: 'select_all_messages', extractionStrategy: 'Focus reading pane then Cmd+A' },
+    monitoringModes: ['passive'],
+    universalFind: 'Cmd+F'
+  },
+  other: {
+    regions: {},
+    inferBoundaryType: () => ({ type: 'unknown', confidence: 0.3 }),
+    clipboardBehavior: { cmdA: 'unknown', extractionStrategy: 'Verify before acting' },
+    monitoringModes: ['passive'],
+    universalFind: null
+  }
+};
+
+function _buildBoundaryCacheKey(appName, windowTitle) {
+  const titleHash = windowTitle
+    ? windowTitle.slice(0, 40).replace(/[^a-z0-9]/gi, '_').toLowerCase()
+    : 'default';
+  return `${appName.replace(/\s+/g, '_').toLowerCase()}_${titleHash}`;
+}
+
+function _isStale(lastUpdated, maxAgeMs) {
+  return !lastUpdated || (Date.now() - lastUpdated) > maxAgeMs;
+}
+
+async function _shouldInvalidateBoundaryCache(appName, windowTitle, currentDiffRatio, currentDimensions) {
+  try {
+    const cacheKey = _buildBoundaryCacheKey(appName, windowTitle);
+    const cached = await db.get('boundary_layout', cacheKey);
+    if (!cached) return true;
+
+    const dimsChanged = currentDimensions &&
+      (Math.abs((currentDimensions.width || 0) - (cached.screenWidth || 0)) > 100 ||
+       Math.abs((currentDimensions.height || 0) - (cached.screenHeight || 0)) > 100);
+    if (dimsChanged) return true;
+
+    if (currentDiffRatio > 0.30) return true;
+
+    if (cached.capturedAt && (Date.now() - cached.capturedAt) > 60000) return true;
+
+    return false;
+  } catch (_) {
+    return true;
+  }
+}
+
+async function getBoundariesFromCache(appName, windowTitle) {
+  try {
+    const cacheKey = _buildBoundaryCacheKey(appName, windowTitle);
+    const cached = await db.get('boundary_layout', cacheKey);
+    if (cached && !_isStale(cached.capturedAt, 60000)) {
+      return cached.boundaries || [];
+    }
+    return null;
+  } catch (_) {
+    return null;
+  }
+}
+
+async function _storeBoundaryCache(appName, windowTitle, boundaries, category) {
+  try {
+    const cacheKey = _buildBoundaryCacheKey(appName, windowTitle);
+    await db.set('boundary_layout', cacheKey, {
+      boundaries,
+      screenWidth: 1440,
+      screenHeight: 900,
+      capturedAt: Date.now(),
+      category
+    });
+  } catch (_) {}
+}
+
+async function actionDiscoverShortcuts({ appName, category }) {
+  const cacheKey = `${appName.toLowerCase().replace(/\s+/g, '_')}_${category || 'other'}`;
+  try {
+    const cached = await db.get('app_shortcuts', cacheKey);
+    if (cached && !_isStale(cached.lastUpdated, 7 * 24 * 60 * 60 * 1000)) {
+      logger.info(`[app.agent] Shortcuts served from cache for ${appName}`);
+      return { ok: true, shortcuts: cached.shortcuts, source: 'cache' };
+    }
+  } catch (_) {}
+
+  try {
+    const searchResult = await webAgent.actionSearchAndNavigate({
+      query: `${appName} keyboard shortcuts cheat sheet macOS`,
+      maxResults: 5
+    });
+
+    if (!searchResult || !searchResult.ok || !searchResult.bestUrl) {
+      logger.warn(`[app.agent] No web result for ${appName} shortcuts`);
+      return { ok: false, shortcuts: [], error: 'No search result' };
+    }
+
+    const crawlResult = await webCrawl({ url: searchResult.bestUrl, maxChars: 15000 });
+    if (!crawlResult || !crawlResult.ok) {
+      return { ok: false, shortcuts: [], error: 'Crawl failed' };
+    }
+
+    const llmResult = await skillLlmAsk(`
+Extract keyboard shortcuts from this content.
+App: ${appName}
+Category: ${category}
+
+Return JSON only:
+{
+  "shortcuts": [
+    { "action": "open_file", "shortcut": "Cmd+O", "context": "file" }
+  ]
+}
+
+Content:
+${crawlResult.content.slice(0, 8000)}
+`);
+
+    let shortcuts = [];
+    try {
+      const parsed = JSON.parse(llmResult.replace(/```json|```/g, '').trim());
+      shortcuts = parsed.shortcuts || [];
+    } catch (_) {
+      logger.warn(`[app.agent] LLM shortcut parse failed for ${appName}`);
+    }
+
+    try {
+      await db.set('app_shortcuts', cacheKey, {
+        shortcuts,
+        sourceUrl: searchResult.bestUrl,
+        category,
+        lastUpdated: Date.now()
+      });
+    } catch (_) {}
+
+    logger.info(`[app.agent] Shortcuts discovered and cached for ${appName}: ${shortcuts.length} shortcuts`);
+    return { ok: true, shortcuts, source: 'web' };
+  } catch (err) {
+    logger.error(`[app.agent] actionDiscoverShortcuts error: ${err.message}`);
+    return { ok: false, shortcuts: [], error: err.message };
+  }
+}
+
+async function enrichAppContext(appName, windowTitle, { background = false } = {}) {
+  try {
+    const category = KNOWN_APPS[appName] || 'other';
+
+    let boundaries = await getBoundariesFromCache(appName, windowTitle);
+    if (!boundaries) {
+      const parseResult = await actionParseScreenshot({});
+      if (parseResult.ok && parseResult.textItems && parseResult.textItems.length > 0) {
+        boundaries = groupTextItemsIntoBoundaries(parseResult.textItems);
+        await _storeBoundaryCache(appName, windowTitle, boundaries, category);
+      } else {
+        boundaries = [];
+      }
+    }
+
+    const shortcutsResult = await actionDiscoverShortcuts({ appName, category });
+
+    logger.info(`[app.agent] enrichAppContext complete: ${appName} (${category}), boundaries: ${boundaries.length}, shortcuts: ${shortcutsResult.shortcuts.length}`);
+    return { category, boundaries, shortcuts: shortcutsResult.shortcuts };
+  } catch (err) {
+    logger.error(`[app.agent] enrichAppContext error: ${err.message}`);
+    return { category: KNOWN_APPS[appName] || 'other', boundaries: [], shortcuts: [] };
+  }
+}
+
+function inferMainRegion(boundaries, category) {
+  const schema = CATEGORY_SCHEMAS[category] || CATEGORY_SCHEMAS.other;
+  if (!boundaries || boundaries.length === 0) {
+    return { centerX: 640, centerY: 400 };
+  }
+
+  const scored = boundaries.map(b => {
+    const inferred = schema.inferBoundaryType(b.width, b.height, b.x, b.y);
+    const isMain = inferred.type === 'content' || inferred.type === 'messages' ||
+                   inferred.type === 'editor' || inferred.type === 'scrollback' ||
+                   inferred.type === 'canvas' || inferred.type === 'reading_pane';
+    return { ...b, isMain, confidence: inferred.confidence };
+  }).filter(b => b.isMain);
+
+  if (scored.length === 0) {
+    const largest = [...boundaries].sort((a, b) => (b.width * b.height) - (a.width * a.height))[0];
+    return { centerX: largest.x + largest.width / 2, centerY: largest.y + largest.height / 2 };
+  }
+
+  const best = scored.sort((a, b) => b.confidence - a.confidence)[0];
+  return { centerX: best.x + best.width / 2, centerY: best.y + best.height / 2 };
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3: Monitoring, Scroll Modes, and getRecentOCR
+// ---------------------------------------------------------------------------
+
+const MEMORY_PORT = parseInt(process.env.MEMORY_SERVICE_PORT || '3001', 10);
+const MEMORY_HOST = process.env.MEMORY_SERVICE_HOST || '127.0.0.1';
+const MEMORY_API_KEY = process.env.MCP_USER_MEMORY_API_KEY || process.env.USER_MEMORY_API_KEY || '';
+
+async function getRecentOCR({ maxAgeSeconds = 10 } = {}) {
+  return new Promise((resolve) => {
+    const http = require('http');
+    const body = JSON.stringify({ payload: { maxAgeSeconds }, requestId: `ocr_${Date.now()}` });
+    const options = {
+      hostname: MEMORY_HOST,
+      port: MEMORY_PORT,
+      path: '/memory.getRecentOcr',
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(body),
+        'x-api-key': MEMORY_API_KEY
+      }
+    };
+    const req = http.request(options, (res) => {
+      let raw = '';
+      res.on('data', d => { raw += d; });
+      res.on('end', () => {
+        try {
+          const data = JSON.parse(raw);
+          const capture = data.result?.capture || data.capture || null;
+          resolve({
+            text: capture?.text || capture?.source_text || capture?.extracted_text || '',
+            appName: capture?.appName || null,
+            windowTitle: capture?.windowTitle || null,
+            timestamp: capture?.created_at || null,
+            available: data.result?.available ?? (capture !== null)
+          });
+        } catch (_) {
+          resolve({ text: '', appName: null, windowTitle: null, timestamp: null, available: false });
+        }
+      });
+    });
+    req.on('error', () => resolve({ text: '', appName: null, windowTitle: null, timestamp: null, available: false }));
+    req.setTimeout(3000, () => { req.destroy(); resolve({ text: '', appName: null, windowTitle: null, timestamp: null, available: false }); });
+    req.write(body);
+    req.end();
+  });
+}
+
+function _getTopWords(text, n) {
+  if (!text) return [];
+  return text.trim().split(/\s+/).slice(0, n);
+}
+
+async function _sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function actionPreScrollPlan({ goal, appName, category, maxScrolls }) {
+  try {
+    const currentOCR = await getRecentOCR();
+    const prompt = `
+User goal: "${goal}"
+App: ${appName} (category: ${category})
+Current screen OCR: ${(currentOCR.text || '').slice(0, 600)}
+
+Think like a human. Determine:
+1. direction: "up" or "down"
+2. scrollMode: "search" (finding specific past content), "ai_response" (waiting for desktop AI), "live_chat" (waiting for human reply), or "passive_read" (consuming document content)
+3. stopKeyword: the specific word, date, or phrase that signals success
+4. purposeStatement: one sentence describing what success looks like
+5. maxScrolls: how many scroll steps before giving up (10-30)
+
+Return JSON only, no markdown fences.`;
+
+    const result = await skillLlmAsk(prompt);
+    const parsed = JSON.parse(result.replace(/```json|```/g, '').trim());
+    return {
+      ok: true,
+      direction: parsed.direction || 'down',
+      scrollMode: parsed.scrollMode || 'passive_read',
+      stopKeyword: parsed.stopKeyword || '',
+      purposeStatement: parsed.purposeStatement || goal,
+      maxScrolls: parsed.maxScrolls || maxScrolls || 20
+    };
+  } catch (err) {
+    logger.warn(`[app.agent] actionPreScrollPlan failed: ${err.message}`);
+    return { ok: false, direction: 'down', scrollMode: 'passive_read', stopKeyword: '', purposeStatement: goal, maxScrolls: maxScrolls || 20 };
+  }
+}
+
+async function actionSearchScroll({ scrollPlan, appName, windowTitle, category }) {
+  const { direction, stopKeyword, purposeStatement, maxScrolls } = scrollPlan;
+  let nut;
+  try {
+    nut = require('@nut-tree-fork/nut-js');
+  } catch (err) {
+    return { ok: false, found: false, stopReason: 'nutjs_unavailable', error: err.message };
+  }
+
+  const boundaries = await getBoundariesFromCache(appName, windowTitle) || [];
+  const mainRegion = inferMainRegion(boundaries, category);
+
+  try {
+    await nut.mouse.move([{ x: mainRegion.centerX, y: mainRegion.centerY }]);
+    await _sleep(200);
+  } catch (_) {}
+
+  let scrollCount = 0;
+  let lastOCR = await getRecentOCR();
+  let noChangeStreak = 0;
+
+  while (scrollCount < maxScrolls) {
+    try {
+      if (direction === 'up') await nut.mouse.scrollUp(3);
+      else await nut.mouse.scrollDown(3);
+    } catch (err) {
+      return { ok: false, found: false, stopReason: 'scroll_error', error: err.message };
+    }
+    await _sleep(500);
+
+    const currentOCR = await getRecentOCR();
+
+    if (stopKeyword && currentOCR.text.toLowerCase().includes(stopKeyword.toLowerCase())) {
+      return { ok: true, found: true, scrolls: scrollCount, stopReason: 'keyword_found' };
+    }
+
+    const topBefore = _getTopWords(lastOCR.text, 5);
+    const topAfter = _getTopWords(currentOCR.text, 5);
+    const scrolled = topBefore.some(w => !topAfter.includes(w));
+    if (!scrolled) {
+      noChangeStreak++;
+      if (noChangeStreak >= 2) {
+        return { ok: false, found: false, scrolls: scrollCount, stopReason: 'content_boundary_reached' };
+      }
+    } else {
+      noChangeStreak = 0;
+    }
+
+    if (scrollCount % 5 === 4) {
+      try {
+        const check = await skillLlmAsk(`
+Purpose: ${purposeStatement}
+Looking for: "${stopKeyword}"
+Screen now: ${currentOCR.text.slice(0, 500)}
+Scrolls done: ${scrollCount + 1}/${maxScrolls}
+Respond with exactly one word: FOUND, KEEP_SCROLLING, or GIVE_UP`);
+        const answer = check.trim().toUpperCase();
+        if (answer === 'FOUND') return { ok: true, found: true, scrolls: scrollCount, stopReason: 'llm_confirmed' };
+        if (answer === 'GIVE_UP') return { ok: false, found: false, scrolls: scrollCount, stopReason: 'llm_gave_up' };
+      } catch (_) {}
+    }
+
+    lastOCR = currentOCR;
+    scrollCount++;
+  }
+  return { ok: false, found: false, scrolls: scrollCount, stopReason: 'max_scrolls_exhausted' };
+}
+
+async function actionAiResponseScroll({ scrollPlan, appName, windowTitle, category }) {
+  const { stopKeyword, purposeStatement, maxScrolls } = scrollPlan;
+  let nut;
+  try {
+    nut = require('@nut-tree-fork/nut-js');
+  } catch (err) {
+    return { ok: false, found: false, stopReason: 'nutjs_unavailable', error: err.message };
+  }
+
+  const boundaries = await getBoundariesFromCache(appName, windowTitle) || [];
+  const mainRegion = inferMainRegion(boundaries, category);
+  let scrollCount = 0;
+
+  while (scrollCount < maxScrolls) {
+    await _sleep(5000);
+    const currentOCR = await getRecentOCR();
+
+    try {
+      const stateResult = await skillLlmAsk(`
+Purpose: ${purposeStatement}
+Looking for: "${stopKeyword}"
+App: ${appName}
+Screen: ${currentOCR.text.slice(0, 600)}
+
+What is the AI/app doing right now?
+GENERATING | QUESTION | APPROVE | MORE_CONTENT | COMPLETE | STUCK
+
+If QUESTION: include the question text.
+If APPROVE: include the button label.
+
+Return JSON only: { "state": "...", "detail": "..." }`);
+
+      let parsed;
+      try {
+        parsed = JSON.parse(stateResult.replace(/```json|```/g, '').trim());
+      } catch (_) {
+        parsed = { state: 'GENERATING', detail: '' };
+      }
+
+      if (parsed.state === 'COMPLETE') return { ok: true, found: true, stopReason: 'ai_complete' };
+      if (parsed.state === 'GENERATING') continue;
+
+      if (parsed.state === 'QUESTION') {
+        logger.info(`[app.agent] AI asked question: ${parsed.detail}`);
+        continue;
+      }
+
+      if (parsed.state === 'MORE_CONTENT') {
+        try {
+          await nut.mouse.move([{ x: mainRegion.centerX, y: mainRegion.centerY }]);
+          await _sleep(200);
+          await nut.mouse.scrollDown(3);
+          await _sleep(500);
+          scrollCount++;
+        } catch (_) {}
+        continue;
+      }
+
+      if (parsed.state === 'STUCK') return { ok: false, found: false, stopReason: 'ai_stuck' };
+      if (parsed.state === 'APPROVE') {
+        logger.info(`[app.agent] AI needs approval: ${parsed.detail}`);
+        continue;
+      }
+    } catch (_) {}
+  }
+  return { ok: false, stopReason: 'max_scrolls_exhausted' };
+}
+
+async function actionScroll({ goal, appName, windowTitle, category, maxScrolls = 20 }) {
+  const scrollPlan = await actionPreScrollPlan({ goal, appName, category, maxScrolls });
+
+  if (scrollPlan.scrollMode === 'search') {
+    return await actionSearchScroll({ scrollPlan, appName, windowTitle, category });
+  }
+
+  if (scrollPlan.scrollMode === 'ai_response') {
+    return await actionAiResponseScroll({ scrollPlan, appName, windowTitle, category });
+  }
+
+  if (scrollPlan.scrollMode === 'live_chat') {
+    return await actionLiveChatScroll({ scrollPlan, appName, windowTitle, category });
+  }
+
+  if (scrollPlan.scrollMode === 'passive_read') {
+    return await actionPassiveReadScroll({ scrollPlan, appName, windowTitle, category });
+  }
+
+  return await actionSearchScroll({ scrollPlan, appName, windowTitle, category });
+}
+
+async function actionLiveChatScroll({ scrollPlan, appName, windowTitle, category }) {
+  const { stopKeyword, purposeStatement, maxScrolls = 60 } = scrollPlan;
+  const sessionId = `live_chat_${appName}_${Date.now()}`;
+
+  return new Promise((resolve) => {
+    let resolved = false;
+    const maxWaitMs = maxScrolls * 5000;
+
+    const onNewContent = async (lines) => {
+      if (resolved) return;
+      const joined = lines.join('\n');
+      logger.info(`[app.agent] watchMode newContent: ${joined.slice(0, 100)}`);
+
+      if (stopKeyword && joined.toLowerCase().includes(stopKeyword.toLowerCase())) {
+        resolved = true;
+        try {
+          const monSvc = require('../monitor/monitorService');
+          if (monSvc && monSvc.deactivateWatchMode) monSvc.deactivateWatchMode(sessionId);
+        } catch (_) {}
+        resolve({ ok: true, found: true, stopReason: 'keyword_found', content: joined });
+      }
+    };
+
+    const onTimeout = () => {
+      if (!resolved) {
+        resolved = true;
+        resolve({ ok: false, found: false, stopReason: 'timeout' });
+      }
+    };
+
+    try {
+      const monSvc = require('../monitor/monitorService');
+      if (monSvc && monSvc.activateWatchMode) {
+        monSvc.activateWatchMode({
+          sessionId,
+          appName,
+          baselineOCR: '',
+          stopKeyword,
+          maxWaitMs,
+          autoScrollMs: 0,
+          onNewContent,
+          onTimeout
+        });
+      } else {
+        resolve({ ok: false, stopReason: 'monitor_service_unavailable' });
+      }
+    } catch (err) {
+      resolve({ ok: false, stopReason: 'error', error: err.message });
+    }
+  });
+}
+
+async function actionPassiveReadScroll({ scrollPlan, appName, windowTitle, category }) {
+  const { stopKeyword, purposeStatement, maxScrolls = 30 } = scrollPlan;
+  let nut;
+  try {
+    nut = require('@nut-tree-fork/nut-js');
+  } catch (err) {
+    return { ok: false, stopReason: 'nutjs_unavailable', error: err.message };
+  }
+
+  const boundaries = await getBoundariesFromCache(appName, windowTitle) || [];
+  const mainRegion = inferMainRegion(boundaries, category);
+  let scrollCount = 0;
+  const accumulatedText = [];
+
+  await nut.mouse.move([{ x: mainRegion.centerX, y: mainRegion.centerY }]);
+  await _sleep(200);
+
+  while (scrollCount < maxScrolls) {
+    const currentOCR = await getRecentOCR();
+    if (currentOCR.text) accumulatedText.push(currentOCR.text);
+
+    if (stopKeyword && currentOCR.text.toLowerCase().includes(stopKeyword.toLowerCase())) {
+      return { ok: true, found: true, stopReason: 'keyword_found', scrolls: scrollCount, text: accumulatedText.join('\n') };
+    }
+
+    const topWordsBefore = currentOCR.text.split(/\s+/).slice(0, 5);
+
+    try {
+      await nut.mouse.scrollDown(3);
+      await _sleep(600);
+    } catch (_) {}
+    scrollCount++;
+
+    const afterOCR = await getRecentOCR();
+    const topWordsAfter = afterOCR.text.split(/\s+/).slice(0, 5);
+    const scrollOccurred = topWordsBefore.some(w => w.length > 3 && !topWordsAfter.includes(w));
+
+    if (!scrollOccurred && scrollCount > 2) {
+      return { ok: true, found: false, stopReason: 'end_of_content', scrolls: scrollCount, text: accumulatedText.join('\n') };
+    }
+  }
+
+  return { ok: true, found: false, stopReason: 'max_scrolls_exhausted', scrolls: scrollCount, text: accumulatedText.join('\n') };
+}
+
+async function actionTeleportToElement({ appName, searchText, followWithTab = false }) {
+  let nut;
+  try {
+    nut = require('@nut-tree-fork/nut-js');
+  } catch (err) {
+    return { ok: false, error: 'NutJS unavailable: ' + err.message };
+  }
+
+  const beforeOCR = await getRecentOCR();
+
+  try {
+    const { Key } = nut;
+    await nut.keyboard.pressKey(Key.LeftSuper, Key.F);
+    await nut.keyboard.releaseKey(Key.LeftSuper, Key.F);
+    await _sleep(300);
+
+    await nut.keyboard.type(searchText);
+    await _sleep(300);
+
+    await nut.keyboard.pressKey(Key.Escape);
+    await nut.keyboard.releaseKey(Key.Escape);
+    await _sleep(200);
+
+    if (followWithTab) {
+      await nut.keyboard.pressKey(Key.Tab);
+      await nut.keyboard.releaseKey(Key.Tab);
+      await _sleep(100);
+    }
+  } catch (err) {
+    return { ok: false, error: `Keyboard error: ${err.message}` };
+  }
+
+  const afterOCR = await getRecentOCR();
+  const anchorVisible = afterOCR.text.toLowerCase().includes(searchText.toLowerCase());
+
+  return {
+    ok: anchorVisible,
+    anchoredAt: searchText,
+    verified: anchorVisible,
+    beforeSnapshot: beforeOCR.text.slice(0, 200),
+    afterSnapshot: afterOCR.text.slice(0, 200)
+  };
+}
+
+async function actionMonitorWithBackoff({ goal, mode = 'passive', maxDurationMs = 300000, appName }) {
+  const startTime = Date.now();
+  let baseline = await getRecentOCR();
+  let checkInterval = 10000;
+
+  while (Date.now() - startTime < maxDurationMs) {
+    await _sleep(checkInterval);
+    const current = await getRecentOCR();
+
+    if (!current.text || current.text === baseline.text) {
+      checkInterval = mode === 'active'
+        ? Math.min(checkInterval * 1.2, 30000)
+        : Math.min(checkInterval * 1.5, 60000);
+      continue;
+    }
+
+    try {
+      const result = await skillLlmAsk(`
+Compare these two screen states.
+Goal: ${goal}
+App: ${appName || 'unknown'}
+
+Before:
+${baseline.text.slice(0, 1500)}
+
+After:
+${current.text.slice(0, 1500)}
+
+Has the goal been achieved? Is there an error? Is progress being made?
+Return JSON: { "status": "complete|progress|error|stalled", "summary": "..." }`);
+
+      let parsed;
+      try {
+        parsed = JSON.parse(result.replace(/```json|```/g, '').trim());
+      } catch (_) {
+        parsed = { status: 'progress', summary: 'Screen changed' };
+      }
+
+      if (parsed.status === 'complete') return { ok: true, summary: parsed.summary };
+      if (parsed.status === 'error') return { ok: false, error: parsed.summary };
+      if (parsed.status === 'progress') {
+        checkInterval = 10000;
+        baseline = current;
+      }
+    } catch (_) {}
+  }
+
+  return { ok: false, error: 'Monitoring timeout', elapsed: Date.now() - startTime };
+}
+
+async function verifyAppFocused({ appName, waitMs = 5000 }) {
+  const start = Date.now();
+
+  const _matches = (a, b) => {
+    const al = (a || '').toLowerCase();
+    const bl = (b || '').toLowerCase();
+    return al.includes(bl) || bl.includes(al);
+  };
+
+  const current = await getRecentOCR();
+  if (current.appName && _matches(current.appName, appName)) {
+    return { focused: true, appName: current.appName, waited: 0 };
+  }
+
+  try {
+    const { execSync } = require('child_process');
+    execSync(`open -a "${appName}"`, { timeout: 3000 });
+  } catch (_) {}
+
+  const pollInterval = 500;
+  while (Date.now() - start < waitMs) {
+    await _sleep(pollInterval);
+    const after = await getRecentOCR();
+    if (after.appName && _matches(after.appName, appName)) {
+      return { focused: true, appName: after.appName, waited: Date.now() - start };
+    }
+  }
+
+  const final = await getRecentOCR();
+  return { focused: false, appName: final.appName || 'unknown', waited: Date.now() - start };
+}
+
+async function actionExecuteShortcut({ appName, action, shortcutOverride, verifyWith, skipFocusCheck = false }) {
+  let nut;
+  try {
+    nut = require('@nut-tree-fork/nut-js');
+  } catch (err) {
+    return { ok: false, error: 'NutJS unavailable: ' + err.message };
+  }
+
+  if (appName && !skipFocusCheck) {
+    const focusResult = await verifyAppFocused({ appName, waitMs: 5000 });
+    if (!focusResult.focused) {
+      return { ok: false, error: `App not focused: expected "${appName}", currently "${focusResult.appName}"`, focusResult };
+    }
+  }
+
+  const category = KNOWN_APPS[appName] || 'other';
+  let shortcutStr = shortcutOverride;
+
+  if (!shortcutStr) {
+    const cached = await actionDiscoverShortcuts({ appName, category });
+    const match = (cached.shortcuts || []).find(s => s.action === action);
+    if (match) shortcutStr = match.shortcut;
+  }
+
+  if (!shortcutStr) {
+    return { ok: false, error: `No shortcut found for action: ${action}` };
+  }
+
+  const beforeOCR = await getRecentOCR();
+
+  try {
+    const { Key } = nut;
+    const parts = shortcutStr.split('+').map(p => p.trim());
+    const modifiers = [];
+    let key = null;
+
+    for (const part of parts) {
+      const lower = part.toLowerCase();
+      if (lower === 'cmd' || lower === 'command') modifiers.push(Key.LeftSuper);
+      else if (lower === 'shift') modifiers.push(Key.LeftShift);
+      else if (lower === 'alt' || lower === 'option') modifiers.push(Key.LeftAlt);
+      else if (lower === 'ctrl' || lower === 'control') modifiers.push(Key.LeftControl);
+      else key = Key[part.toUpperCase()] || Key[part];
+    }
+
+    if (key) {
+      await nut.keyboard.pressKey(...modifiers, key);
+      await nut.keyboard.releaseKey(...modifiers, key);
+    }
+  } catch (err) {
+    return { ok: false, error: `Shortcut execution error: ${err.message}` };
+  }
+
+  await _sleep(300);
+  const afterOCR = await getRecentOCR();
+
+  if (verifyWith) {
+    const appeared = afterOCR.text.toLowerCase().includes(verifyWith.toLowerCase());
+    const changed = afterOCR.text !== beforeOCR.text;
+    return { ok: changed || appeared, shortcut: shortcutStr, beforeOCR: beforeOCR.text.slice(0, 200), afterOCR: afterOCR.text.slice(0, 200) };
+  }
+
+  return { ok: afterOCR.text !== beforeOCR.text, shortcut: shortcutStr };
+}
+
+// ---------------------------------------------------------------------------
 // Exports
 // ---------------------------------------------------------------------------
 
@@ -2306,12 +3532,24 @@ module.exports = {
   // Utility
   actionClearHighlights,
   
-  // Placeholder for future phases
-  // actionAnalyzeViewport,
-  // actionDecideScroll,
-  // actionMonitorWithBackoff,
-  // actionTeleportToElement,
-  // actionDiscoverShortcuts,
-  // actionExecuteShortcut,
-  // actionVirtualDocumentEdit,
+  // Phase 2: App Taxonomy & Category System
+  KNOWN_APPS,
+  CATEGORY_SCHEMAS,
+  enrichAppContext,
+  actionDiscoverShortcuts,
+  getBoundariesFromCache,
+  inferMainRegion,
+
+  // Phase 3: Monitoring & Intelligent Scroll
+  getRecentOCR,
+  actionPreScrollPlan,
+  actionScroll,
+  actionSearchScroll,
+  actionAiResponseScroll,
+  actionLiveChatScroll,
+  actionPassiveReadScroll,
+  actionTeleportToElement,
+  actionMonitorWithBackoff,
+  verifyAppFocused,
+  actionExecuteShortcut,
 };

@@ -141,6 +141,9 @@ class CommandServiceMCPServer {
       case 'video.agent':
         return await this._skillVideoAgent(args);
 
+      case 'app.agent':
+        return await this._skillAppAgent(args);
+
       case 'system.introspect':
         return await this._skillSystemIntrospect(args);
 
@@ -248,6 +251,54 @@ class CommandServiceMCPServer {
     return await systemIntrospect(args);
   }
 
+  async _skillAppAgent(args) {
+    const { action, ...rest } = args || {};
+    const ACTION_MAP = {
+      parse_screenshot:          appAgent.actionParseScreenshot,
+      parse_screenshot_docling:  appAgent.actionParseScreenshotDocling,
+      find_elements:             appAgent.actionFindElements,
+      highlight_elements:        appAgent.actionHighlightElements,
+      highlight_all:             appAgent.actionHighlightAll,
+      highlight_search:          appAgent.actionHighlightSearch,
+      highlight_boundaries:      appAgent.actionHighlightBoundaries,
+      highlight_assets:          appAgent.actionHighlightAssets,
+      analyze_spatial_grid:      appAgent.actionAnalyzeSpatialGrid,
+      capture_screen:            appAgent.actionCaptureScreen,
+      clear_highlights:          appAgent.actionClearHighlights,
+      // Phase 2
+      enrich_app_context:        appAgent.enrichAppContext,
+      discover_shortcuts:        appAgent.actionDiscoverShortcuts,
+      // Phase 3
+      pre_scroll_plan:           appAgent.actionPreScrollPlan,
+      scroll:                    appAgent.actionScroll,
+      search_scroll:             appAgent.actionSearchScroll,
+      ai_response_scroll:        appAgent.actionAiResponseScroll,
+      monitor_with_backoff:      appAgent.actionMonitorWithBackoff,
+      execute_shortcut:          appAgent.actionExecuteShortcut,
+      get_recent_ocr:            appAgent.getRecentOCR,
+      // Phase 3 new actions
+      live_chat_scroll:          appAgent.actionLiveChatScroll,
+      passive_read_scroll:       appAgent.actionPassiveReadScroll,
+      teleport_to_element:       appAgent.actionTeleportToElement,
+      infer_main_region:         appAgent.inferMainRegion,
+      get_boundaries:            appAgent.getBoundariesFromCache,
+      verify_app_focused:        appAgent.verifyAppFocused,
+    };
+
+    const fn = ACTION_MAP[action];
+    if (!fn) {
+      return { success: false, error: `Unknown app.agent action: ${action}. Valid: ${Object.keys(ACTION_MAP).join(', ')}` };
+    }
+
+    try {
+      const result = await fn(rest);
+      return { success: true, ...result };
+    } catch (err) {
+      logger.error(`[app.agent] action=${action} error: ${err.message}`);
+      return { success: false, error: err.message };
+    }
+  }
+
   // ---------------------------------------------------------------------------
   // Health
   // ---------------------------------------------------------------------------
@@ -257,7 +308,7 @@ class CommandServiceMCPServer {
       success: true,
       service: this.serviceName,
       status: 'healthy',
-      skills: ['shell.run', 'browser.act', 'web.crawl', 'image.analyze', 'fs.read', 'file.watch', 'file.bridge', 'screen.capture', 'external.skill', 'cli.agent', 'browser.agent', 'playwright.agent', 'creator.agent', 'reviewer.agent', 'skillCreator.skill', 'project.builder', 'project.launcher', 'project.editor', 'project.stopper', 'system.introspect']
+      skills: ['shell.run', 'browser.act', 'web.crawl', 'image.analyze', 'fs.read', 'file.watch', 'file.bridge', 'screen.capture', 'external.skill', 'cli.agent', 'browser.agent', 'playwright.agent', 'creator.agent', 'reviewer.agent', 'skillCreator.skill', 'project.builder', 'project.launcher', 'project.editor', 'project.stopper', 'app.agent', 'system.introspect']
     };
   }
 
@@ -375,7 +426,7 @@ class CommandServiceMCPServer {
         res.end(JSON.stringify({
           status: 'healthy',
           service: this.serviceName,
-          skills: ['shell.run', 'browser.act', 'web.crawl', 'image.analyze', 'fs.read', 'file.watch', 'file.bridge', 'screen.capture', 'external.skill', 'cli.agent', 'browser.agent', 'playwright.agent', 'creator.agent', 'reviewer.agent', 'skillCreator.skill', 'project.builder', 'project.launcher', 'project.editor', 'project.stopper', 'system.introspect']
+          skills: ['shell.run', 'browser.act', 'web.crawl', 'image.analyze', 'fs.read', 'file.watch', 'file.bridge', 'screen.capture', 'external.skill', 'cli.agent', 'browser.agent', 'playwright.agent', 'creator.agent', 'reviewer.agent', 'skillCreator.skill', 'project.builder', 'project.launcher', 'project.editor', 'project.stopper', 'app.agent', 'system.introspect']
         }));
         return;
       }
