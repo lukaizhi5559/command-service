@@ -2969,8 +2969,15 @@ const MEMORY_PORT = parseInt(process.env.MEMORY_SERVICE_PORT || '3001', 10);
 const MEMORY_HOST = process.env.MEMORY_SERVICE_HOST || '127.0.0.1';
 const MEMORY_API_KEY = process.env.MCP_USER_MEMORY_API_KEY || process.env.USER_MEMORY_API_KEY || '';
 
-async function getRecentOCR({ maxAgeSeconds = 10 } = {}) {
-  return new Promise((resolve) => {
+async function getRecentOCR({ maxAgeSeconds = 10, appName: targetApp = null } = {}) {
+  const _appMatches = (a, b) => {
+    if (!a || !b) return false;
+    const al = a.toLowerCase();
+    const bl = b.toLowerCase();
+    return al.includes(bl) || bl.includes(al);
+  };
+
+  const dbResult = await new Promise((resolve) => {
     const http = require('http');
     const body = JSON.stringify({ payload: { maxAgeSeconds }, requestId: `ocr_${Date.now()}` });
     const options = {
@@ -3008,6 +3015,33 @@ async function getRecentOCR({ maxAgeSeconds = 10 } = {}) {
     req.write(body);
     req.end();
   });
+
+  // Hybrid fallback: if caller specifies a target app and either:
+  //   (a) the DB result is from a different app (stale — e.g. monitorService captured Devin), or
+  //   (b) the DB has no capture at all (no record within maxAgeSeconds)
+  // fall back to a live screen capture so we always get the correct app's content.
+  const _needsLiveFallback = targetApp && (!dbResult.appName || !_appMatches(dbResult.appName, targetApp));
+  if (_needsLiveFallback) {
+    logger.info(`[app.agent] getRecentOCR: DB has "${dbResult.appName}" but target is "${targetApp}" — falling back to live screen capture`);
+    try {
+      const { screenCapture } = require('./screen.capture.cjs');
+      const live = await screenCapture({});
+      if (live.success && live.text) {
+        return {
+          text: live.text,
+          appName: live.appName || targetApp,
+          windowTitle: live.windowTitle || null,
+          timestamp: new Date().toISOString(),
+          available: true,
+          source: 'live'
+        };
+      }
+    } catch (liveErr) {
+      logger.warn(`[app.agent] getRecentOCR: live screen capture fallback failed: ${liveErr.message}`);
+    }
+  }
+
+  return dbResult;
 }
 
 function _getTopWords(text, n) {
@@ -3410,7 +3444,7 @@ async function verifyAppFocused({ appName, waitMs = 5000 }) {
     return al.includes(bl) || bl.includes(al);
   };
 
-  const current = await getRecentOCR();
+  const current = await getRecentOCR({ appName });
   if (current.appName && _matches(current.appName, appName)) {
     return { focused: true, appName: current.appName, waited: 0 };
   }
@@ -3423,13 +3457,13 @@ async function verifyAppFocused({ appName, waitMs = 5000 }) {
   const pollInterval = 500;
   while (Date.now() - start < waitMs) {
     await _sleep(pollInterval);
-    const after = await getRecentOCR();
+    const after = await getRecentOCR({ appName });
     if (after.appName && _matches(after.appName, appName)) {
       return { focused: true, appName: after.appName, waited: Date.now() - start };
     }
   }
 
-  const final = await getRecentOCR();
+  const final = await getRecentOCR({ appName });
   return { focused: false, appName: final.appName || 'unknown', waited: Date.now() - start };
 }
 
