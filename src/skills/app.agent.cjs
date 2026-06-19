@@ -2846,6 +2846,18 @@ async function _storeBoundaryCache(appName, windowTitle, boundaries, category) {
   } catch (_) {}
 }
 
+async function actionClearBoundaryCache({ appName, windowTitle }) {
+  try {
+    const cacheKey = _buildBoundaryCacheKey(appName, windowTitle);
+    await db.delete('boundary_layout', cacheKey);
+    logger.info(`[app.agent] Boundary cache cleared: ${cacheKey}`);
+    return { ok: true, cacheKey };
+  } catch (err) {
+    logger.warn(`[app.agent] Failed to clear boundary cache: ${err.message}`);
+    return { ok: false, error: err.message };
+  }
+}
+
 async function actionDiscoverShortcuts({ appName, category }) {
   const cacheKey = `${appName.toLowerCase().replace(/\s+/g, '_')}_${category || 'other'}`;
   try {
@@ -2969,7 +2981,7 @@ const MEMORY_PORT = parseInt(process.env.MEMORY_SERVICE_PORT || '3001', 10);
 const MEMORY_HOST = process.env.MEMORY_SERVICE_HOST || '127.0.0.1';
 const MEMORY_API_KEY = process.env.MCP_USER_MEMORY_API_KEY || process.env.USER_MEMORY_API_KEY || '';
 
-async function getRecentOCR({ maxAgeSeconds = 10, appName: targetApp = null } = {}) {
+async function getRecentOCR({ maxAgeSeconds = 3, appName: targetApp = null } = {}) {
   const _appMatches = (a, b) => {
     if (!a || !b) return false;
     const al = a.toLowerCase();
@@ -3385,23 +3397,101 @@ async function actionTeleportToElement({ appName, searchText, followWithTab = fa
   };
 }
 
-async function actionMonitorWithBackoff({ goal, mode = 'passive', maxDurationMs = 300000, appName }) {
+// ---------------------------------------------------------------------------
+// Phase 3: Semantic Embedding Helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Compute cosine similarity between two embedding vectors.
+ * Returns 1.0 for identical vectors, 0.0 for orthogonal.
+ */
+function cosineSimilarity(a, b) {
+  if (!a || !b || a.length !== b.length) return 0;
+  let dot = 0, normA = 0, normB = 0;
+  for (let i = 0; i < a.length; i++) {
+    dot += a[i] * b[i];
+    normA += a[i] * a[i];
+    normB += b[i] * b[i];
+  }
+  if (normA === 0 || normB === 0) return 0;
+  return dot / (Math.sqrt(normA) * Math.sqrt(normB));
+}
+
+/**
+ * Compute simple embedding from text (fallback when embedding service unavailable).
+ * Uses character n-gram frequency vector.
+ */
+function computeSimpleEmbedding(text, dims = 128) {
+  const vector = new Array(dims).fill(0);
+  if (!text) return vector;
+  const normalized = text.toLowerCase().replace(/[^a-z0-9\s]/g, '');
+  for (let i = 0; i < normalized.length - 2; i++) {
+    const trigram = normalized.slice(i, i + 3);
+    let hash = 0;
+    for (let j = 0; j < trigram.length; j++) {
+      hash = ((hash << 5) - hash) + trigram.charCodeAt(j);
+      hash = hash & hash;
+    }
+    const idx = Math.abs(hash) % dims;
+    vector[idx] += 1;
+  }
+  // Normalize
+  const norm = Math.sqrt(vector.reduce((s, v) => s + v * v, 0));
+  return norm > 0 ? vector.map(v => v / norm) : vector;
+}
+
+async function actionMonitorWithBackoff({ goal, mode = 'passive', maxDurationMs = 300000, appName, useSemanticComparison = true }) {
   const startTime = Date.now();
   let baseline = await getRecentOCR();
   let checkInterval = 10000;
+  let llmCalls = 0;
+  const MAX_LLM_CALLS = 20; // Phase 3 success criteria: <20 LLM calls for 10-min tasks
+
+  // Compute baseline embedding
+  let baselineEmbedding = useSemanticComparison ? computeSimpleEmbedding(baseline.text) : null;
 
   while (Date.now() - startTime < maxDurationMs) {
     await _sleep(checkInterval);
     const current = await getRecentOCR();
 
-    if (!current.text || current.text === baseline.text) {
+    if (!current.text) {
       checkInterval = mode === 'active'
         ? Math.min(checkInterval * 1.2, 30000)
         : Math.min(checkInterval * 1.5, 60000);
       continue;
     }
 
+    // Phase 3: Semantic early-exit to save LLM calls
+    if (useSemanticComparison && baselineEmbedding) {
+      const currentEmbedding = computeSimpleEmbedding(current.text);
+      const similarity = cosineSimilarity(baselineEmbedding, currentEmbedding);
+
+      if (similarity > 0.95) {
+        // No meaningful change - increase backoff (skip LLM call)
+        checkInterval = mode === 'active'
+          ? Math.min(checkInterval * 1.2, 30000)
+          : Math.min(checkInterval * 1.5, 60000);
+        continue;
+      }
+
+      // Meaningful change detected - proceed to LLM evaluation
+      baselineEmbedding = currentEmbedding;
+    } else if (current.text === baseline.text) {
+      // Fallback: naive text equality check
+      checkInterval = mode === 'active'
+        ? Math.min(checkInterval * 1.2, 30000)
+        : Math.min(checkInterval * 1.5, 60000);
+      continue;
+    }
+
+    // Rate limit LLM calls for long-running tasks
+    if (llmCalls >= MAX_LLM_CALLS) {
+      logger.warn(`[app.agent] Monitor hit LLM call limit (${MAX_LLM_CALLS}), switching to text-only mode`);
+      useSemanticComparison = false;
+    }
+
     try {
+      llmCalls++;
       const result = await skillLlmAsk(`
 Compare these two screen states.
 Goal: ${goal}
@@ -3423,16 +3513,132 @@ Return JSON: { "status": "complete|progress|error|stalled", "summary": "..." }`)
         parsed = { status: 'progress', summary: 'Screen changed' };
       }
 
-      if (parsed.status === 'complete') return { ok: true, summary: parsed.summary };
-      if (parsed.status === 'error') return { ok: false, error: parsed.summary };
+      if (parsed.status === 'complete') {
+        return { ok: true, summary: parsed.summary, llmCalls, elapsed: Date.now() - startTime };
+      }
+      if (parsed.status === 'error') {
+        return { ok: false, error: parsed.summary, llmCalls, elapsed: Date.now() - startTime };
+      }
       if (parsed.status === 'progress') {
+        // Reset interval on meaningful progress
         checkInterval = 10000;
         baseline = current;
+        if (useSemanticComparison) {
+          baselineEmbedding = computeSimpleEmbedding(current.text);
+        }
       }
     } catch (_) {}
   }
 
-  return { ok: false, error: 'Monitoring timeout', elapsed: Date.now() - startTime };
+  return { ok: false, error: 'Monitoring timeout', llmCalls, elapsed: Date.now() - startTime };
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3: Additional Monitoring Use Cases
+// ---------------------------------------------------------------------------
+
+/**
+ * Monitor for file upload completion.
+ * Detects upload progress bars, percentage indicators, and completion messages.
+ */
+async function actionMonitorFileUpload({ uploadIndicator, successIndicator, maxDurationMs = 300000, appName }) {
+  const UPLOAD_KEYWORDS = ['upload', 'uploading', 'progress', '%', 'transfer', 'sent'];
+  const COMPLETION_KEYWORDS = ['complete', 'done', 'uploaded', 'finished', 'success', 'checkmark', '✓'];
+  const FAILURE_KEYWORDS = ['failed', 'error', 'retry', 'cancelled', 'network error', 'timed out'];
+
+  return actionMonitorWithBackoff({
+    goal: `Wait for file upload to complete. Current indicator: "${uploadIndicator || 'upload in progress'}". Success indicator: "${successIndicator || 'upload complete'}"`,
+    mode: 'active',
+    maxDurationMs,
+    appName
+  });
+}
+
+/**
+ * Monitor for build/test completion in terminal/IDE.
+ * Detects build output patterns for success, failure, or completion.
+ */
+async function actionMonitorBuildCompletion({ buildCommand, successPattern, failurePattern, maxDurationMs = 600000, appName }) {
+  const DEFAULT_SUCCESS = ['build successful', 'build succeeded', '✓', 'done', 'completed', 'exit 0', '0 errors', 'passed'];
+  const DEFAULT_FAILURE = ['build failed', 'error:', 'failed', 'exit 1', '✗', 'failed to', 'compilation error', 'test failed'];
+
+  const successKeywords = successPattern ? [successPattern] : DEFAULT_SUCCESS;
+  const failureKeywords = failurePattern ? [failurePattern] : DEFAULT_FAILURE;
+
+  const startTime = Date.now();
+  let baseline = await getRecentOCR();
+  let checkInterval = 5000; // Faster polling for builds
+
+  while (Date.now() - startTime < maxDurationMs) {
+    await _sleep(checkInterval);
+    const current = await getRecentOCR();
+
+    const text = current.text.toLowerCase();
+
+    // Check for success patterns
+    const succeeded = successKeywords.some(kw => text.includes(kw.toLowerCase()));
+    if (succeeded) {
+      return { ok: true, status: 'success', buildCommand, text: current.text.slice(0, 500) };
+    }
+
+    // Check for failure patterns
+    const failed = failureKeywords.some(kw => text.includes(kw.toLowerCase()));
+    if (failed) {
+      return { ok: false, status: 'failed', buildCommand, text: current.text.slice(0, 500) };
+    }
+
+    // Adaptive backoff - if no new output, slow down
+    if (current.text === baseline.text) {
+      checkInterval = Math.min(checkInterval * 1.5, 30000);
+    } else {
+      checkInterval = 5000;
+      baseline = current;
+    }
+  }
+
+  return { ok: false, status: 'timeout', buildCommand, elapsed: Date.now() - startTime };
+}
+
+/**
+ * Monitor for form submission completion.
+ * Detects success messages, redirects, or error states.
+ */
+async function actionMonitorFormSubmission({ formName, successIndicator, errorIndicator, maxDurationMs = 120000, appName }) {
+  const startTime = Date.now();
+  const baseline = await getRecentOCR();
+  let checkInterval = 3000;
+
+  while (Date.now() - startTime < maxDurationMs) {
+    await _sleep(checkInterval);
+    const current = await getRecentOCR();
+    const text = current.text.toLowerCase();
+
+    // Check for explicit success/error indicators
+    if (successIndicator && text.includes(successIndicator.toLowerCase())) {
+      return { ok: true, status: 'submitted', form: formName };
+    }
+    if (errorIndicator && text.includes(errorIndicator.toLowerCase())) {
+      return { ok: false, status: 'error', form: formName, error: errorIndicator };
+    }
+
+    // Check for generic completion patterns
+    const genericSuccess = ['submitted', 'saved', 'success', 'thank you', 'done', 'confirmed'];
+    const genericError = ['error', 'failed', 'invalid', 'required', 'retry'];
+
+    if (genericSuccess.some(kw => text.includes(kw))) {
+      return { ok: true, status: 'submitted', form: formName, matched: 'generic_success' };
+    }
+    if (genericError.some(kw => text.includes(kw))) {
+      return { ok: false, status: 'error', form: formName, matched: 'generic_error' };
+    }
+
+    // Adaptive backoff
+    if (current.text === baseline.text) {
+      checkInterval = Math.min(checkInterval * 1.3, 15000);
+    }
+  }
+
+  return { ok: false, status: 'timeout', form: formName };
 }
 
 async function verifyAppFocused({ appName, waitMs = 5000 }) {
@@ -3533,6 +3739,218 @@ async function actionExecuteShortcut({ appName, action, shortcutOverride, verify
 }
 
 // ---------------------------------------------------------------------------
+// Phase 3.5: "What Was There Is No Longer" Verification
+// ---------------------------------------------------------------------------
+
+/**
+ * Verifies a shortcut/action by checking BOTH:
+ * 1. Target text appeared
+ * 2. Placeholder/initial text disappeared
+ *
+ * Example: Typing "hello" in field with "Ask Anything" placeholder
+ * - Verify "hello" appears in OCR
+ * - Verify "Ask Anything" NO LONGER appears
+ * If placeholder still visible → text didn't enter field
+ */
+async function actionVerifyShortcut({ shortcutStr, targetText, placeholder, appName, maxRetries = 2 }) {
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    const beforeOCR = await getRecentOCR();
+
+    // Execute shortcut
+    try {
+      const { Key } = nut;
+      const parts = shortcutStr.split('+').map(p => p.trim());
+      const modifiers = [];
+      let key = null;
+
+      for (const part of parts) {
+        const lower = part.toLowerCase();
+        if (lower === 'cmd' || lower === 'command') modifiers.push(Key.LeftSuper);
+        else if (lower === 'shift') modifiers.push(Key.LeftShift);
+        else if (lower === 'alt' || lower === 'option') modifiers.push(Key.LeftAlt);
+        else if (lower === 'ctrl' || lower === 'control') modifiers.push(Key.LeftControl);
+        else key = Key[part.toUpperCase()] || Key[part];
+      }
+
+      if (key) {
+        await nut.keyboard.pressKey(...modifiers, key);
+        await nut.keyboard.releaseKey(...modifiers, key);
+      }
+    } catch (err) {
+      return { ok: false, error: `Shortcut execution error: ${err.message}` };
+    }
+
+    await _sleep(300);
+    const afterOCR = await getRecentOCR();
+
+    // "What was there is no longer" verification
+    const targetAppeared = targetText
+      ? afterOCR.text.toLowerCase().includes(targetText.toLowerCase())
+      : true;
+
+    const placeholderGone = placeholder
+      ? !afterOCR.text.toLowerCase().includes(placeholder.toLowerCase())
+      : true;
+
+    if (targetAppeared && placeholderGone) {
+      return {
+        ok: true,
+        attempt: attempt + 1,
+        verificationMethod: 'what_was_there_is_no_longer',
+        targetAppeared,
+        placeholderGone,
+        shortcut: shortcutStr,
+        beforeOCR: beforeOCR.text.slice(0, 200),
+        afterOCR: afterOCR.text.slice(0, 200)
+      };
+    }
+
+    // Failed verification - wait and retry
+    if (attempt < maxRetries - 1) {
+      logger.warn(`[app.agent] Verification failed for "${shortcutStr}", retrying... (targetAppeared=${targetAppeared}, placeholderGone=${placeholderGone})`);
+      await _sleep(500);
+    }
+  }
+
+  return {
+    ok: false,
+    error: 'Verification failed after max retries',
+    verificationMethod: 'what_was_there_is_no_longer',
+    targetAppeared: false,
+    placeholderGone: false,
+    shortcut: shortcutStr
+  };
+}
+
+/**
+ * Generic action verification using "what was there is no longer" pattern
+ */
+async function actionVerifyAction({ beforeState, afterState, targetText, placeholder }) {
+  const textAppeared = targetText
+    ? afterState.toLowerCase().includes(targetText.toLowerCase())
+    : true;
+
+  const placeholderGone = placeholder
+    ? !afterState.toLowerCase().includes(placeholder.toLowerCase())
+    : true;
+
+  return {
+    ok: textAppeared && placeholderGone,
+    verificationMethod: 'what_was_there_is_no_longer',
+    textAppeared,
+    placeholderGone,
+    stateChanged: beforeState !== afterState,
+    beforeSnapshot: beforeState.slice(0, 200),
+    afterSnapshot: afterState.slice(0, 200)
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4: Clipboard Agent - Content Extraction with Style Preservation
+// ---------------------------------------------------------------------------
+
+const CLIPBOARD_BACKUP_KEY = 'app_agent_clipboard_backup';
+const CLIPBOARD_DIR = path.join(os.homedir(), '.thinkdrop', 'clipboard');
+
+async function ensureClipboardDir() {
+  try {
+    await fs.promises.mkdir(CLIPBOARD_DIR, { recursive: true });
+  } catch (_) {}
+}
+
+async function actionClipboardBackup() {
+  try {
+    const { execSync } = require('child_process');
+    const backup = execSync('pbpaste', { encoding: 'utf8', timeout: 5000 });
+    await db.set('clipboard', CLIPBOARD_BACKUP_KEY, { content: backup, timestamp: Date.now() });
+    return { ok: true, backupSize: backup.length };
+  } catch (err) {
+    logger.warn(`[app.agent] Clipboard backup failed: ${err.message}`);
+    return { ok: false, error: err.message };
+  }
+}
+
+async function actionClipboardRestore() {
+  try {
+    const backup = await db.get('clipboard', CLIPBOARD_BACKUP_KEY);
+    if (!backup || !backup.content) {
+      return { ok: false, error: 'No clipboard backup found' };
+    }
+    const { execSync } = require('child_process');
+    execSync('pbcopy', { input: backup.content, timeout: 5000 });
+    return { ok: true, restoredSize: backup.content.length };
+  } catch (err) {
+    logger.warn(`[app.agent] Clipboard restore failed: ${err.message}`);
+    return { ok: false, error: err.message };
+  }
+}
+
+async function actionExtractContentViaClipboard({ appName, category = 'browser' }) {
+  await ensureClipboardDir();
+  
+  // 1. Backup current clipboard
+  const backupResult = await actionClipboardBackup();
+  if (!backupResult.ok) {
+    logger.warn('[app.agent] Proceeding without clipboard backup');
+  }
+  
+  try {
+    // 2. Execute category-specific selection chain
+    const categorySchema = CATEGORY_SCHEMAS[category] || CATEGORY_SCHEMAS.other;
+    const extractionStrategy = categorySchema?.clipboardBehavior?.extractionStrategy || 'Cmd+A then Cmd+C';
+    
+    logger.info(`[app.agent] Extracting content from ${appName} using strategy: ${extractionStrategy}`);
+    
+    // Browser: Cmd+L -> Tab -> Cmd+A -> Cmd+C
+    if (category === 'browser') {
+      await actionExecuteShortcut({ appName, shortcutOverride: 'Cmd+L' }); // Focus address bar
+      await _sleep(100);
+      await actionExecuteShortcut({ appName, shortcutOverride: 'Tab' });   // Move to content
+      await _sleep(100);
+      await actionExecuteShortcut({ appName, shortcutOverride: 'Cmd+A' }); // Select all
+      await _sleep(100);
+      await actionExecuteShortcut({ appName, shortcutOverride: 'Cmd+C' }); // Copy
+      await _sleep(100);
+    } else {
+      // Generic: just Cmd+A -> Cmd+C
+      await actionExecuteShortcut({ appName, shortcutOverride: 'Cmd+A' });
+      await _sleep(100);
+      await actionExecuteShortcut({ appName, shortcutOverride: 'Cmd+C' });
+      await _sleep(100);
+    }
+    
+    // 3. Read clipboard
+    const { execSync } = require('child_process');
+    const extractedContent = execSync('pbpaste', { encoding: 'utf8', timeout: 5000 });
+    
+    // 4. Save to clipboard directory
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const safeAppName = appName.replace(/[^a-zA-Z0-9]/g, '_');
+    const filename = `${timestamp}_${safeAppName}_extracted.txt`;
+    const filepath = path.join(CLIPBOARD_DIR, filename);
+    
+    await fs.promises.writeFile(filepath, extractedContent, 'utf8');
+    
+    // 5. Restore original clipboard
+    await actionClipboardRestore();
+    
+    return {
+      ok: true,
+      content: extractedContent,
+      savedTo: filepath,
+      contentLength: extractedContent.length,
+      strategy: extractionStrategy
+    };
+    
+  } catch (err) {
+    // Try to restore even on error
+    await actionClipboardRestore().catch(() => {});
+    logger.error(`[app.agent] Content extraction failed: ${err.message}`);
+    return { ok: false, error: err.message };
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Exports
 // ---------------------------------------------------------------------------
 
@@ -3572,6 +3990,7 @@ module.exports = {
   enrichAppContext,
   actionDiscoverShortcuts,
   getBoundariesFromCache,
+  actionClearBoundaryCache,
   inferMainRegion,
 
   // Phase 3: Monitoring & Intelligent Scroll
@@ -3586,4 +4005,17 @@ module.exports = {
   actionMonitorWithBackoff,
   verifyAppFocused,
   actionExecuteShortcut,
+  // Phase 3: Additional Use Cases
+  actionMonitorFileUpload,
+  actionMonitorBuildCompletion,
+  actionMonitorFormSubmission,
+
+  // Phase 3.5: "What Was There Is No Longer" Verification
+  actionVerifyShortcut,
+  actionVerifyAction,
+
+  // Phase 4: Clipboard Agent
+  actionClipboardBackup,
+  actionClipboardRestore,
+  actionExtractContentViaClipboard,
 };

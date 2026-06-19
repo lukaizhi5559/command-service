@@ -268,6 +268,7 @@ class CommandServiceMCPServer {
       // Phase 2
       enrich_app_context:        appAgent.enrichAppContext,
       discover_shortcuts:        appAgent.actionDiscoverShortcuts,
+      clear_boundary_cache:      appAgent.actionClearBoundaryCache,
       // Phase 3
       pre_scroll_plan:           appAgent.actionPreScrollPlan,
       scroll:                    appAgent.actionScroll,
@@ -276,6 +277,10 @@ class CommandServiceMCPServer {
       monitor_with_backoff:      appAgent.actionMonitorWithBackoff,
       execute_shortcut:          appAgent.actionExecuteShortcut,
       get_recent_ocr:            appAgent.getRecentOCR,
+      // Phase 3 additional use cases
+      monitor_file_upload:       appAgent.actionMonitorFileUpload,
+      monitor_build_completion:  appAgent.actionMonitorBuildCompletion,
+      monitor_form_submission:   appAgent.actionMonitorFormSubmission,
       // Phase 3 new actions
       live_chat_scroll:          appAgent.actionLiveChatScroll,
       passive_read_scroll:       appAgent.actionPassiveReadScroll,
@@ -283,6 +288,13 @@ class CommandServiceMCPServer {
       infer_main_region:         appAgent.inferMainRegion,
       get_boundaries:            appAgent.getBoundariesFromCache,
       verify_app_focused:        appAgent.verifyAppFocused,
+      // Phase 3.5
+      verify_shortcut:               appAgent.actionVerifyShortcut,
+      verify_action:                 appAgent.actionVerifyAction,
+      // Phase 4
+      clipboard_backup:              appAgent.actionClipboardBackup,
+      clipboard_restore:             appAgent.actionClipboardRestore,
+      extract_content_via_clipboard: appAgent.actionExtractContentViaClipboard,
     };
 
     const fn = ACTION_MAP[action];
