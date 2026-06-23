@@ -24,6 +24,14 @@ const fs = require('fs');
 const os = require('os');
 const logger = require('../logger.cjs');
 
+// In-process boundary cache — keyed by "appName::WxH", TTL 5 minutes
+// Replaces the broken skill-db KV store for boundary_layout
+const _boundaryCache = new Map();
+const _BOUNDARY_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+
+// Agent descriptor directory
+const AGENTS_DIR = path.join(os.homedir(), '.thinkdrop', 'agents');
+
 // Quadrant-based coordinate adjustment settings
 // Fine-tune these to fix vertical/horizontal offset issues in different screen sections
 const QUADRANT_OFFSETS = {
@@ -407,6 +415,45 @@ async function actionCaptureScreen() {
   } catch (error) {
     logger.error(`[app.agent] Screen capture error: ${error.message}`);
     return { ok: false, error: `Screen capture unavailable: ${error.message}` };
+  }
+}
+
+/**
+ * Get bounds of the current foreground app window using active-win.
+ * Must be called BEFORE hiding our own overlay, because the overlay may steal focus.
+ */
+async function _getActiveAppBounds() {
+  try {
+    const { activeWindow } = await import('active-win');
+    const win = await activeWindow();
+    if (win?.bounds) {
+      return { ...win.bounds, appName: win.owner?.name || '' };
+    }
+  } catch (err) {
+    logger.debug(`[app.agent] _getActiveAppBounds failed: ${err.message}`);
+  }
+  return null;
+}
+
+/**
+ * Hide our own overlay window before taking a screenshot, restore it after.
+ */
+async function _withOverlayHidden(fn) {
+  const http = require('http');
+  const port = parseInt(process.env.OVERLAY_CONTROL_PORT || '3010', 10);
+  const _post = (path) => new Promise(resolve => {
+    const req = http.request({ hostname: '127.0.0.1', port, path, method: 'POST' });
+    req.on('error', () => resolve());
+    req.on('response', () => resolve());
+    req.end();
+    setTimeout(resolve, 600);
+  });
+  await _post('/overlay/hide');
+  await _sleep(250);
+  try {
+    return await fn();
+  } finally {
+    await _post('/overlay/show');
   }
 }
 
@@ -883,10 +930,14 @@ async function actionHighlightAll(args = {}) {
     if (!parseResult.ok) {
       return parseResult;
     }
-    
-    // 2. Highlight all elements (persistent)
+
+    // 2. Clip to active app window — drops menu bar, Dock, overlay, other apps
+    const appBounds = await _getActiveAppBounds().catch(() => null);
+    const filteredItems = _filterItemsByAppBounds(parseResult.textItems, appBounds);
+
+    // 3. Highlight all elements within app bounds (persistent)
     return await actionHighlightElements({
-      elements: parseResult.textItems,
+      elements: filteredItems,
       duration: args.duration || 0,  // 0 = persistent
       color: args.color || '#00ff00'
     });
@@ -930,13 +981,17 @@ async function actionHighlightSearch(args = {}) {
       logger.info(`[actionHighlightSearch] Screen center updated: ${screenCenterX}x${screenCenterY}`);
     }
 
-    // 2. Find matching elements
+    // 2. Clip to active app window — drops menu bar, Dock, overlay, other apps
+    const _highlightAppBounds = await _getActiveAppBounds().catch(() => null);
+    const _filteredItems = _filterItemsByAppBounds(parseResult.textItems, _highlightAppBounds);
+
+    // 3. Find matching elements within app bounds only
     const pageText = parseResult.raw && parseResult.raw.pages && parseResult.raw.pages[0]
       ? (parseResult.raw.pages[0].text || '')
       : '';
     const findResult = await actionFindElements({
       searchText,
-      textItems: parseResult.textItems,
+      textItems: _filteredItems,
       pageText
     });
     
@@ -1270,99 +1325,6 @@ function mergeSmallGroupsIntoClusters(boundaries, options = {}) {
   
   logger.info(`[mergeSmallGroupsIntoClusters] Merged ${boundaries.length} -> ${clusters.length} clusters`);
   return clusters;
-}
-
-/**
- * DBSCAN clustering for text items - groups nearby text into clusters
- * @param {Array} textItems - Text items with x, y, width, height
- * @param {Object} options - Clustering parameters
- * @returns {Array} - Clusters with bounds and items
- */
-function clusterTextItemsDBSCAN(textItems, options = {}) {
-  const { eps = 150, minPts = 5 } = options;
-
-  if (!textItems || textItems.length === 0) return [];
-
-  // Calculate center points
-  const points = textItems.map((item, idx) => ({
-    ...item,
-    idx,
-    cx: item.x + item.width / 2,
-    cy: item.y + item.height / 2
-  }));
-
-  const labels = new Array(points.length).fill(undefined);
-  let clusterId = 0;
-
-  // Find neighbors within eps distance
-  function getNeighbors(pIdx) {
-    const neighbors = [];
-    const p = points[pIdx];
-    for (let i = 0; i < points.length; i++) {
-      if (i === pIdx) continue;
-      const q = points[i];
-      const dist = Math.sqrt((p.cx - q.cx) ** 2 + (p.cy - q.cy) ** 2);
-      if (dist <= eps) neighbors.push(i);
-    }
-    return neighbors;
-  }
-
-  for (let i = 0; i < points.length; i++) {
-    if (labels[i] !== undefined) continue;
-
-    const neighbors = getNeighbors(i);
-
-    if (neighbors.length < minPts) {
-      labels[i] = -1; // Noise
-      continue;
-    }
-
-    // Start new cluster
-    clusterId++;
-    labels[i] = clusterId;
-    const seeds = [...neighbors];
-
-    for (let j = 0; j < seeds.length; j++) {
-      const seedIdx = seeds[j];
-
-      if (labels[seedIdx] === -1) labels[seedIdx] = clusterId;
-      if (labels[seedIdx] !== undefined) continue;
-
-      labels[seedIdx] = clusterId;
-      const seedNeighbors = getNeighbors(seedIdx);
-
-      if (seedNeighbors.length >= minPts) {
-        seeds.push(...seedNeighbors);
-      }
-    }
-  }
-
-  // Group by cluster ID
-  const clusters = new Map();
-  for (let i = 0; i < points.length; i++) {
-    const id = labels[i];
-    if (id <= 0) continue; // Skip noise
-    if (!clusters.has(id)) clusters.set(id, []);
-    clusters.get(id).push(points[i]);
-  }
-
-  // Convert to bounding boxes
-  return Array.from(clusters.values()).map((items, idx) => {
-    const xs = items.map(i => i.x);
-    const ys = items.map(i => i.y);
-    const rights = items.map(i => i.x + i.width);
-    const bottoms = items.map(i => i.y + i.height);
-
-    return {
-      x: Math.min(...xs) - 15,
-      y: Math.min(...ys) - 15,
-      width: Math.max(...rights) - Math.min(...xs) + 30,
-      height: Math.max(...bottoms) - Math.min(...ys) + 30,
-      items: items,
-      label: `Cluster ${idx + 1} (${items.length} items)`,
-      color: '#00aaff'
-    };
-  });
 }
 
 /**
@@ -1965,12 +1927,99 @@ function areBoxesClose(b1, b2, thresholdX, thresholdY) {
 }
 
 /**
- * Merge close boxes using edge-to-edge distance and BFS
- * Based on LLM's mathematical approach for text proximity clustering
- * @param {Array} textItems - Text items
- * @param {Object} options - distance thresholds
- * @returns {Array} - Merged sections
+ * Module-level app name matcher — case-insensitive substring match in either direction.
+ * Used to verify that active-win's reported app matches the intended target.
  */
+function _appNameMatches(a, b) {
+  if (!a || !b) return false;
+  const al = a.toLowerCase();
+  const bl = b.toLowerCase();
+  return al.includes(bl) || bl.includes(al);
+}
+
+/**
+ * Fuzzy-match a stopKeyword against OCR text, tolerating date format variations.
+ * Handles: ordinal suffixes (18th→18), month abbreviations (June↔Jun),
+ * punctuation differences, and token-level overlap.
+ * Returns true if the keyword semantically matches anywhere in the OCR text.
+ */
+function _keywordFuzzyMatchesOCR(keyword, ocrText) {
+  if (!keyword || !ocrText) return false;
+  // 1. Fast path: exact case-insensitive substring
+  if (ocrText.toLowerCase().includes(keyword.toLowerCase())) return true;
+  // 2. Normalize: strip ordinals, abbreviate month names, remove punctuation
+  const MONTH_MAP = {
+    'january':'jan','february':'feb','march':'mar','april':'apr',
+    'may':'may','june':'jun','july':'jul','august':'aug',
+    'september':'sep','october':'oct','november':'nov','december':'dec'
+  };
+  const normalize = (s) => s.toLowerCase()
+    .replace(/\b(\d+)(st|nd|rd|th)\b/g, '$1')
+    .replace(/\b(january|february|march|april|may|june|july|august|september|october|november|december)\b/g,
+             m => MONTH_MAP[m])
+    .replace(/[,.\-]/g, ' ')
+    .replace(/\s+/g, ' ').trim();
+  const normKeyword = normalize(keyword);
+  const normOCR = normalize(ocrText);
+  // 3. Normalized exact match
+  if (normOCR.includes(normKeyword)) return true;
+  // 4. Windowed token proximity: all keyword tokens must appear within a 6-word
+  // sliding window — prevents "jun" (from date divider) + "18" (from a "9:18 AM"
+  // timestamp) combining into a false positive for "June 18th".
+  const kwTokens = normKeyword.split(/\s+/).filter(Boolean);
+  if (kwTokens.length === 0) return false;
+  if (kwTokens.length === 1) return normOCR.includes(kwTokens[0]);
+  const ocrTokens = normOCR.split(/\s+/);
+  const WINDOW = 6;
+  for (let i = 0; i <= ocrTokens.length - kwTokens.length; i++) {
+    const win = ocrTokens.slice(i, i + WINDOW).join(' ');
+    if (kwTokens.every(tok => win.includes(tok))) return true;
+  }
+  return false;
+}
+
+/**
+ * Ask the LLM whether the scroll goal is already satisfied by the current OCR text.
+ * Used as a second gate after fuzzy keyword match to distinguish a date label
+ * (always visible in viewport) from actual target content that has been scrolled to.
+ * Returns 'yes', 'partial', or 'no'.
+ */
+async function _llmCheckScrollGoalMet(purposeStatement, ocrText) {
+  try {
+    const answer = await skillLlmAsk(
+      `Scroll goal: "${purposeStatement}"\n\nScreen text (OCR):\n${ocrText.slice(0, 3000)}\n\nIs the TARGET content (not just a date label or section divider at the edge of the current view) now visible on screen? Reply with exactly one word: yes, no, or partial.`
+    );
+    const a = (answer || '').trim().toLowerCase().replace(/[^a-z]/g, '');
+    return a === 'yes' ? 'yes' : a === 'partial' ? 'partial' : 'no';
+  } catch (_) { return 'no'; }
+}
+
+/**
+ * Filter LiteParse textItems to only those that overlap the active app window.
+ * Discards items from the macOS menu bar, Dock, other app windows, and the
+ * ThinkDrop overlay that appear in a full-screen screenshot but are outside
+ * the target application's bounds.
+ *
+ * Uses overlap detection (not strict containment) so items straddling the
+ * app window edge are kept.
+ *
+ * @param {Array}       textItems - Raw LiteParse items with {x, y, width, height}
+ * @param {Object|null} appBounds - {x, y, width, height} from active-win, or null
+ * @returns {Array} Filtered subset of textItems
+ */
+function _filterItemsByAppBounds(textItems, appBounds) {
+  if (!appBounds || !textItems || textItems.length === 0) return textItems || [];
+  const { x: ax, y: ay, width: aw, height: ah } = appBounds;
+  const filtered = textItems.filter(item => {
+    const itemRight  = item.x + (item.width  || 0);
+    const itemBottom = item.y + (item.height || 0);
+    return item.x < ax + aw && itemRight  > ax &&
+           item.y < ay + ah && itemBottom > ay;
+  });
+  logger.info(`[app.agent] _filterItemsByAppBounds: kept ${filtered.length}/${textItems.length} items within appBounds (${ax},${ay} ${aw}x${ah})`);
+  return filtered;
+}
+
 function mergeCloseBoxes(textItems, options = {}) {
   const {
     thresholdX = 40,   // Horizontal: larger gap allowed (words in same line)
@@ -2072,13 +2121,17 @@ async function actionHighlightBoundaries(args = {}) {
       return parseResult;
     }
 
-    const textItems = parseResult.textItems || [];
-    if (textItems.length === 0) {
+    const rawTextItems = parseResult.textItems || [];
+    if (rawTextItems.length === 0) {
       sendOverlayIpc({ type: 'scanning_complete' });
       return { ok: false, error: 'No text found' };
     }
 
-    // Step 2: Edge-to-edge clustering with BFS
+    // Step 2: Clip to active app window before clustering
+    const _boundaryAppBounds = await _getActiveAppBounds().catch(() => null);
+    const textItems = _filterItemsByAppBounds(rawTextItems, _boundaryAppBounds);
+
+    // Step 3: Edge-to-edge clustering with BFS (app-bounded items only)
     const sections = mergeCloseBoxes(textItems, {
       thresholdX: args.thresholdX || 50,   // Larger horizontal gap for sidebar separation
       thresholdY: args.thresholdY || 25,   // Smaller vertical gap for line grouping
@@ -2651,6 +2704,49 @@ const { ask: skillLlmAsk } = require('../skill-helpers/skill-llm.cjs');
 const webAgent = require('./web.agent.cjs');
 const { webCrawl } = require('./web.crawl.cjs');
 
+const VALID_CATEGORIES = ['browser', 'editor', 'chat', 'design', 'terminal', 'email', 'other'];
+
+/**
+ * Resolve any caller-supplied category string to one of the valid CATEGORY_SCHEMAS keys.
+ * Priority: (1) KNOWN_APPS by appName, (2) callerCategory if already valid,
+ * (3) LLM classification for unrecognized strings, (4) 'other' fallback.
+ */
+async function _resolveCategory(appName, callerCategory) {
+  if (KNOWN_APPS[appName]) return KNOWN_APPS[appName];
+  if (callerCategory && VALID_CATEGORIES.includes(callerCategory)) return callerCategory;
+  if (callerCategory) {
+    try {
+      const answer = await skillLlmAsk(
+        `App: "${appName}", described as: "${callerCategory}"\nChoose the single best category from this list: ${VALID_CATEGORIES.join(', ')}\nReply with ONLY the category word, nothing else.`
+      );
+      const classified = (answer || '').trim().toLowerCase().replace(/[^a-z]/g, '');
+      if (VALID_CATEGORIES.includes(classified)) {
+        logger.info(`[app.agent] _resolveCategory: "${callerCategory}" → "${classified}" (LLM)`);
+        return classified;
+      }
+    } catch (_) {}
+  }
+  return 'other';
+}
+
+/**
+ * Score a candidate scroll region type against the purposeStatement to prefer
+ * the region that best matches the user's intent (message panel vs sidebar, etc.).
+ * Returns a numeric bonus: positive = preferred, negative = deprioritized.
+ */
+function _scrollRegionPriority(inferredType, purposeStatement) {
+  const ps = (purposeStatement || '').toLowerCase();
+  if (/message|date|conversation|thread|post|reply|sent|received/.test(ps)) {
+    if (inferredType === 'messages') return 100;
+    if (inferredType === 'sidebar' || inferredType === 'channel_list') return -50;
+  }
+  if (/channel|project|chat name|conversation list|find.*chat|find.*channel/.test(ps)) {
+    if (inferredType === 'sidebar' || inferredType === 'channel_list') return 100;
+    if (inferredType === 'messages') return -50;
+  }
+  return 0;
+}
+
 const KNOWN_APPS = {
   'Google Chrome': 'browser',
   'Safari': 'browser',
@@ -2692,7 +2788,14 @@ const CATEGORY_SCHEMAS = {
       tabBar: { x: [0, 1200], y: [35, 70], type: 'tabs' },
       contentArea: { x: [0, 1280], y: [100, 800], type: 'page_content' }
     },
-    inferBoundaryType: (width, height, x, y) => {
+    inferBoundaryType: (width, height, x, y, appBounds) => {
+      if (appBounds) {
+        const relY = y - appBounds.y;
+        const ah = appBounds.height;
+        if (relY / ah > 0.04 && relY / ah < 0.12 && x > appBounds.x + 150) return { type: 'address_bar', confidence: 0.9 };
+        if (relY / ah > 0.12 && width > appBounds.width * 0.6) return { type: 'content', confidence: 0.85 };
+        return { type: 'unknown', confidence: 0.3 };
+      }
       if (y > 70 && y < 100 && x > 150) return { type: 'address_bar', confidence: 0.9 };
       if (y > 100 && width > 800) return { type: 'content', confidence: 0.85 };
       return { type: 'unknown', confidence: 0.3 };
@@ -2708,7 +2811,17 @@ const CATEGORY_SCHEMAS = {
       terminal: { x: [250, 1200], y: [750, 800], type: 'terminal' },
       tabBar: { x: [250, 1200], y: [35, 70], type: 'tabs' }
     },
-    inferBoundaryType: (width, height, x, y) => {
+    inferBoundaryType: (width, height, x, y, appBounds) => {
+      if (appBounds) {
+        const relX = x - appBounds.x;
+        const relY = y - appBounds.y;
+        const aw = appBounds.width;
+        const ah = appBounds.height;
+        if (relX / aw < 0.20 && width / aw < 0.25) return { type: 'sidebar', confidence: 0.9 };
+        if (relX / aw > 0.18 && width / aw > 0.45 && relY / ah < 0.88) return { type: 'editor', confidence: 0.9 };
+        if (relY / ah > 0.88) return { type: 'terminal', confidence: 0.8 };
+        return { type: 'unknown', confidence: 0.3 };
+      }
       if (x < 250 && width < 300) return { type: 'sidebar', confidence: 0.9 };
       if (x > 250 && width > 600 && y < 750) return { type: 'editor', confidence: 0.9 };
       if (y > 750) return { type: 'terminal', confidence: 0.8 };
@@ -2724,10 +2837,23 @@ const CATEGORY_SCHEMAS = {
       messageArea: { x: [220, 1200], y: [50, 700], type: 'messages' },
       inputArea: { x: [220, 1200], y: [700, 800], type: 'input_box' }
     },
-    inferBoundaryType: (width, height, x, y) => {
+    inferBoundaryType: (width, height, x, y, appBounds) => {
+      if (appBounds) {
+        const relX = x - appBounds.x;
+        const relY = y - appBounds.y;
+        const aw = appBounds.width;
+        const ah = appBounds.height;
+        if (relX / aw < 0.25 && width / aw < 0.25) return { type: 'sidebar', confidence: 0.95 };
+        if (relY / ah > 0.88 && height / ah < 0.15) return { type: 'input', confidence: 0.9 };
+        // Exclude header zone (top ~20% of app window) and input area at bottom
+        if (relX / aw > 0.18 && relY / ah >= 0.20 && (relY + height) / ah < 0.92) return { type: 'messages', confidence: 0.85 };
+        return { type: 'unknown', confidence: 0.3 };
+      }
+      // Fallback: original hardcoded pixel logic
       if (width < 250 && x < 220) return { type: 'sidebar', confidence: 0.95 };
       if (y > 700 && height < 100) return { type: 'input', confidence: 0.9 };
-      if (x > 220 && y < 700) return { type: 'messages', confidence: 0.85 };
+      // Exclude header/toolbar zone (top ~200px) — channel title bar ends ~180px, messages start below
+      if (x > 220 && y >= 200 && y < 700) return { type: 'messages', confidence: 0.85 };
       return { type: 'unknown', confidence: 0.3 };
     },
     clipboardBehavior: { cmdA: 'select_input_only', extractionStrategy: 'Scroll + OCR accumulation' },
@@ -2741,7 +2867,17 @@ const CATEGORY_SCHEMAS = {
       layers: { x: [0, 200], y: [50, 800], type: 'layers' },
       properties: { x: [1100, 1280], y: [50, 800], type: 'properties' }
     },
-    inferBoundaryType: (width, height, x, y) => {
+    inferBoundaryType: (width, height, x, y, appBounds) => {
+      if (appBounds) {
+        const relX = x - appBounds.x;
+        const relY = y - appBounds.y;
+        const aw = appBounds.width;
+        const ah = appBounds.height;
+        if (relY / ah < 0.07) return { type: 'toolbar', confidence: 0.9 };
+        if (relX / aw < 0.17) return { type: 'layers', confidence: 0.85 };
+        if ((relX + width) / aw > 0.87) return { type: 'properties', confidence: 0.85 };
+        return { type: 'canvas', confidence: 0.7 };
+      }
       if (y < 50) return { type: 'toolbar', confidence: 0.9 };
       if (x < 200) return { type: 'layers', confidence: 0.85 };
       if (x > 1100) return { type: 'properties', confidence: 0.85 };
@@ -2756,7 +2892,13 @@ const CATEGORY_SCHEMAS = {
       scrollback: { x: [0, 1280], y: [0, 750], type: 'output' },
       input: { x: [0, 1280], y: [750, 800], type: 'input_line' }
     },
-    inferBoundaryType: (width, height, x, y) => {
+    inferBoundaryType: (width, height, x, y, appBounds) => {
+      if (appBounds) {
+        const relY = y - appBounds.y;
+        const ah = appBounds.height;
+        if (relY / ah > 0.88) return { type: 'input', confidence: 0.9 };
+        return { type: 'scrollback', confidence: 0.8 };
+      }
       if (y > 750) return { type: 'input', confidence: 0.9 };
       return { type: 'scrollback', confidence: 0.8 };
     },
@@ -2770,7 +2912,14 @@ const CATEGORY_SCHEMAS = {
       messageList: { x: [200, 600], y: [50, 800], type: 'message_list' },
       readingPane: { x: [600, 1280], y: [50, 800], type: 'reading_pane' }
     },
-    inferBoundaryType: (width, height, x, y) => {
+    inferBoundaryType: (width, height, x, y, appBounds) => {
+      if (appBounds) {
+        const relX = x - appBounds.x;
+        const aw = appBounds.width;
+        if (relX / aw < 0.17) return { type: 'folders', confidence: 0.9 };
+        if (relX / aw >= 0.17 && relX / aw < 0.50) return { type: 'message_list', confidence: 0.85 };
+        return { type: 'reading_pane', confidence: 0.8 };
+      }
       if (x < 200) return { type: 'folders', confidence: 0.9 };
       if (x > 200 && x < 600) return { type: 'message_list', confidence: 0.85 };
       return { type: 'reading_pane', confidence: 0.8 };
@@ -2788,86 +2937,230 @@ const CATEGORY_SCHEMAS = {
   }
 };
 
-function _buildBoundaryCacheKey(appName, windowTitle) {
-  const titleHash = windowTitle
-    ? windowTitle.slice(0, 40).replace(/[^a-z0-9]/gi, '_').toLowerCase()
-    : 'default';
-  return `${appName.replace(/\s+/g, '_').toLowerCase()}_${titleHash}`;
+function _buildBoundaryCacheKey(appName, screenDims = {}) {
+  const w = screenDims.width || 0;
+  const h = screenDims.height || 0;
+  return `${appName.replace(/\s+/g, '_').toLowerCase()}::${w}x${h}`;
 }
 
 function _isStale(lastUpdated, maxAgeMs) {
   return !lastUpdated || (Date.now() - lastUpdated) > maxAgeMs;
 }
 
-async function _shouldInvalidateBoundaryCache(appName, windowTitle, currentDiffRatio, currentDimensions) {
-  try {
-    const cacheKey = _buildBoundaryCacheKey(appName, windowTitle);
-    const cached = await db.get('boundary_layout', cacheKey);
-    if (!cached) return true;
-
-    const dimsChanged = currentDimensions &&
-      (Math.abs((currentDimensions.width || 0) - (cached.screenWidth || 0)) > 100 ||
-       Math.abs((currentDimensions.height || 0) - (cached.screenHeight || 0)) > 100);
-    if (dimsChanged) return true;
-
-    if (currentDiffRatio > 0.30) return true;
-
-    if (cached.capturedAt && (Date.now() - cached.capturedAt) > 60000) return true;
-
-    return false;
-  } catch (_) {
-    return true;
+function _inferBoundaryType(b, category, appBounds) {
+  const schema = CATEGORY_SCHEMAS[category] || CATEGORY_SCHEMAS.other;
+  if (schema && schema.inferBoundaryType) {
+    return schema.inferBoundaryType(b.width, b.height, b.x, b.y, appBounds);
   }
+  return { type: 'unknown', confidence: 0.3 };
 }
 
-async function getBoundariesFromCache(appName, windowTitle) {
-  try {
-    const cacheKey = _buildBoundaryCacheKey(appName, windowTitle);
-    const cached = await db.get('boundary_layout', cacheKey);
-    if (cached && !_isStale(cached.capturedAt, 60000)) {
-      return cached.boundaries || [];
+function _isLikelyOverlayWindow(b, screenWidth, screenHeight) {
+  // Floating panel signature: starts in bottom-right quadrant, not full-screen-sized
+  const inBottomRight = b.x > screenWidth * 0.5 && b.y > screenHeight * 0.5;
+  const isSmallish = (b.width * b.height) < (screenWidth * screenHeight * 0.4);
+  return inBottomRight && isSmallish;
+}
+
+function _scoreBoundariesForMain(boundaries, category, screenWidth, screenHeight, appBounds) {
+  const schema = CATEGORY_SCHEMAS[category] || CATEGORY_SCHEMAS.other;
+  const inferred = boundaries.map(b => ({
+    ...b,
+    typeInfo: _inferBoundaryType(b, category, appBounds),
+    cx: b.x + b.width / 2,
+    cy: b.y + b.height / 2
+  }));
+
+  // Detect sidebar candidates (for sidebar-implies-main heuristic)
+  const sidebars = inferred.filter(b => b.typeInfo.type === 'sidebar');
+  let mainBySidebar = null;
+  if (sidebars.length > 0 && appBounds) {
+    const bestSidebar = sidebars.sort((a, b) => a.width * a.height - b.width * b.height)[0];
+    const rightOfSidebar = inferred.filter(b => b.x > bestSidebar.x + bestSidebar.width * 0.5);
+    const overlappingVertically = rightOfSidebar.filter(b =>
+      b.y < bestSidebar.y + bestSidebar.height && b.y + b.height > bestSidebar.y
+    );
+    if (overlappingVertically.length > 0) {
+      mainBySidebar = overlappingVertically.sort((a, b) => (b.width * b.height) - (a.width * a.height))[0];
     }
+  }
+
+  const appCenter = appBounds ? {
+    x: appBounds.x + appBounds.width / 2,
+    y: appBounds.y + appBounds.height / 2
+  } : { x: screenWidth / 2, y: screenHeight / 2 };
+  const appWidth = appBounds ? appBounds.width : screenWidth;
+
+  const mainTypes = ['content', 'messages', 'editor', 'scrollback', 'canvas', 'reading_pane'];
+  return inferred.map(b => {
+    // cy < 150 is always a toolbar/header strip — never a scrollable main region
+    const isMain = mainTypes.includes(b.typeInfo.type) && b.cy >= 150;
+    const isFloating = _isLikelyOverlayWindow(b, screenWidth, screenHeight);
+    const distFromCenter = Math.sqrt((b.cx - appCenter.x) ** 2 + (b.cy - appCenter.y) ** 2);
+    const isSidebarRightNeighbor = mainBySidebar && b === mainBySidebar;
+    const nearCenter = distFromCenter < appWidth * 0.20;
+    const score = (isMain ? b.width * b.height : 0)
+                + (isSidebarRightNeighbor ? 500_000 : 0)
+                + (nearCenter ? 200_000 : 0)
+                - (isFloating ? 999_999 : 0);
+    return { ...b, isMain, isFloating, score };
+  });
+}
+
+function _findBoundaryCacheEntry(appName) {
+  const prefix = appName.replace(/\s+/g, '_').toLowerCase() + '::';
+  for (const [key, entry] of _boundaryCache.entries()) {
+    if (key.startsWith(prefix) && !_isStale(entry.capturedAt, _BOUNDARY_CACHE_TTL_MS)) {
+      return entry;
+    }
+  }
+  return null;
+}
+
+function getBoundariesFromCache(appName, screenDims = {}) {
+  // If screenDims provided, do exact key lookup
+  if (screenDims && (screenDims.width || screenDims.height)) {
+    const key = _buildBoundaryCacheKey(appName, screenDims);
+    const entry = _boundaryCache.get(key);
+    if (entry && !_isStale(entry.capturedAt, _BOUNDARY_CACHE_TTL_MS)) {
+      logger.info(`[app.agent] Boundary cache HIT for ${key} (${entry.boundaries.length} boundaries)`);
+      return entry.boundaries;
+    }
+    if (entry) _boundaryCache.delete(key);
     return null;
+  }
+  // No screenDims: prefix scan — return most recent valid entry for this app
+  const prefix = appName.replace(/\s+/g, '_').toLowerCase() + '::';
+  for (const [key, entry] of _boundaryCache.entries()) {
+    if (key.startsWith(prefix) && !_isStale(entry.capturedAt, _BOUNDARY_CACHE_TTL_MS)) {
+      logger.info(`[app.agent] Boundary cache prefix HIT for ${key} (${entry.boundaries.length} boundaries)`);
+      return entry.boundaries;
+    }
+  }
+  return null;
+}
+
+function _storeBoundaryCache(appName, boundaries, category, screenDims = {}, appBounds = null) {
+  const key = _buildBoundaryCacheKey(appName, screenDims);
+  _boundaryCache.set(key, {
+    boundaries,
+    screenWidth: screenDims.width || 1440,
+    screenHeight: screenDims.height || 900,
+    appBounds,
+    capturedAt: Date.now(),
+    category
+  });
+  logger.info(`[app.agent] Boundary cache STORED for ${key} (${boundaries.length} boundaries, appBounds: ${appBounds ? 'yes' : 'no'})`);
+}
+
+function _getScreenDimsFromScreenshot(screenshotPath) {
+  try {
+    const { PNG } = require('pngjs');
+    const buf = fs.readFileSync(screenshotPath);
+    const png = PNG.sync.read(buf);
+    return { width: png.width, height: png.height };
+  } catch (_) {
+    return { width: 1440, height: 900 };
+  }
+}
+
+function actionClearBoundaryCache({ appName } = {}) {
+  if (appName) {
+    const prefix = appName.replace(/\s+/g, '_').toLowerCase();
+    for (const key of _boundaryCache.keys()) {
+      if (key.startsWith(prefix + '::')) _boundaryCache.delete(key);
+    }
+    logger.info(`[app.agent] Boundary cache cleared for ${appName}`);
+    return { ok: true, appName };
+  }
+  _boundaryCache.clear();
+  logger.info(`[app.agent] Boundary cache cleared (all)`);
+  return { ok: true, appName: 'all' };
+}
+
+function _appAgentDescriptorPath(appName) {
+  const safe = appName.replace(/\s+/g, '_').toLowerCase();
+  return path.join(AGENTS_DIR, `${safe}.app.agent.md`);
+}
+
+function _readShortcutsFromDescriptor(appName) {
+  try {
+    const filePath = _appAgentDescriptorPath(appName);
+    if (!fs.existsSync(filePath)) return null;
+    const content = fs.readFileSync(filePath, 'utf8');
+    const shortcutsMatch = content.match(/## Shortcuts\n([\s\S]*?)(?=\n## |$)/);
+    if (!shortcutsMatch) return null;
+    const tableLines = shortcutsMatch[1].trim().split('\n').filter(l => l.startsWith('|') && !l.includes('---'));
+    const shortcuts = tableLines.slice(1).map(line => {
+      const cols = line.split('|').map(c => c.trim()).filter(Boolean);
+      if (cols.length >= 2) return { action: cols[0], shortcut: cols[1], context: cols[2] || '' };
+      return null;
+    }).filter(Boolean);
+    if (shortcuts.length === 0) return null;
+    logger.info(`[app.agent] Shortcuts loaded from descriptor for ${appName}: ${shortcuts.length} shortcuts`);
+    return shortcuts;
   } catch (_) {
     return null;
   }
 }
 
-async function _storeBoundaryCache(appName, windowTitle, boundaries, category) {
+function _writeShortcutsToDescriptor(appName, category, shortcuts) {
   try {
-    const cacheKey = _buildBoundaryCacheKey(appName, windowTitle);
-    await db.set('boundary_layout', cacheKey, {
-      boundaries,
-      screenWidth: 1440,
-      screenHeight: 900,
-      capturedAt: Date.now(),
-      category
-    });
-  } catch (_) {}
-}
+    fs.mkdirSync(AGENTS_DIR, { recursive: true });
+    const filePath = _appAgentDescriptorPath(appName);
+    const safe = appName.replace(/\s+/g, '_').toLowerCase();
 
-async function actionClearBoundaryCache({ appName, windowTitle }) {
-  try {
-    const cacheKey = _buildBoundaryCacheKey(appName, windowTitle);
-    await db.delete('boundary_layout', cacheKey);
-    logger.info(`[app.agent] Boundary cache cleared: ${cacheKey}`);
-    return { ok: true, cacheKey };
+    const shortcutRows = shortcuts.map(s =>
+      `| ${s.action || ''} | ${s.shortcut || ''} | ${s.context || ''} |`
+    ).join('\n');
+
+    const shortcutsSection = `## Shortcuts
+| Action | Shortcut | Context |
+|--------|----------|----------|
+${shortcutRows}
+`;
+
+    if (fs.existsSync(filePath)) {
+      let content = fs.readFileSync(filePath, 'utf8');
+      if (content.includes('## Shortcuts')) {
+        content = content.replace(/## Shortcuts[\s\S]*?(?=\n## |$)/, shortcutsSection);
+      } else {
+        content = content.trimEnd() + '\n\n' + shortcutsSection;
+      }
+      fs.writeFileSync(filePath, content, 'utf8');
+    } else {
+      const descriptor = `---
+id: ${safe}.app.agent
+type: app
+service: ${safe}
+category: ${category || 'other'}
+capabilities:
+  - scroll
+  - highlight_boundaries
+  - search_scroll
+  - execute_shortcut
+---
+
+## Instructions
+Use app.agent skill for all native ${appName} desktop operations.
+
+${shortcutsSection}`;
+      fs.writeFileSync(filePath, descriptor, 'utf8');
+    }
+    logger.info(`[app.agent] Shortcuts written to descriptor: ${filePath}`);
   } catch (err) {
-    logger.warn(`[app.agent] Failed to clear boundary cache: ${err.message}`);
-    return { ok: false, error: err.message };
+    logger.warn(`[app.agent] Failed to write shortcuts to descriptor: ${err.message}`);
   }
 }
 
 async function actionDiscoverShortcuts({ appName, category }) {
-  const cacheKey = `${appName.toLowerCase().replace(/\s+/g, '_')}_${category || 'other'}`;
-  try {
-    const cached = await db.get('app_shortcuts', cacheKey);
-    if (cached && !_isStale(cached.lastUpdated, 7 * 24 * 60 * 60 * 1000)) {
-      logger.info(`[app.agent] Shortcuts served from cache for ${appName}`);
-      return { ok: true, shortcuts: cached.shortcuts, source: 'cache' };
-    }
-  } catch (_) {}
+  // 1. Check agent descriptor file first (persists across restarts)
+  const cachedShortcuts = _readShortcutsFromDescriptor(appName);
+  if (cachedShortcuts) {
+    return { ok: true, shortcuts: cachedShortcuts, source: 'descriptor' };
+  }
 
+  // 2. Web crawl — only runs once ever per app
   try {
     const searchResult = await webAgent.actionSearchAndNavigate({
       query: `${appName} keyboard shortcuts cheat sheet macOS`,
@@ -2908,16 +3201,10 @@ ${crawlResult.content.slice(0, 8000)}
       logger.warn(`[app.agent] LLM shortcut parse failed for ${appName}`);
     }
 
-    try {
-      await db.set('app_shortcuts', cacheKey, {
-        shortcuts,
-        sourceUrl: searchResult.bestUrl,
-        category,
-        lastUpdated: Date.now()
-      });
-    } catch (_) {}
+    // 3. Persist to agent descriptor so future runs skip the web crawl
+    _writeShortcutsToDescriptor(appName, category, shortcuts);
 
-    logger.info(`[app.agent] Shortcuts discovered and cached for ${appName}: ${shortcuts.length} shortcuts`);
+    logger.info(`[app.agent] Shortcuts discovered and written to descriptor for ${appName}: ${shortcuts.length} shortcuts`);
     return { ok: true, shortcuts, source: 'web' };
   } catch (err) {
     logger.error(`[app.agent] actionDiscoverShortcuts error: ${err.message}`);
@@ -2925,24 +3212,66 @@ ${crawlResult.content.slice(0, 8000)}
   }
 }
 
-async function enrichAppContext(appName, windowTitle, { background = false } = {}) {
+async function enrichAppContext({ appName, category: callerCategory, background = false } = {}) {
   try {
-    const category = KNOWN_APPS[appName] || 'other';
+    const category = await _resolveCategory(appName, callerCategory);
 
-    let boundaries = await getBoundariesFromCache(appName, windowTitle);
+    // 1. Capture active app window bounds BEFORE touching our overlay.
+    //    Hiding the overlay may steal focus, so active-win must run first.
+    //    If active window is ThinkDrop (Electron), fall back to cached bounds for target app.
+    let appBounds = await _getActiveAppBounds().catch(() => null);
+    if (!appBounds || !_appNameMatches(appBounds.appName, appName)) {
+      const _prevCache = _findBoundaryCacheEntry(appName);
+      if (_prevCache?.appBounds) {
+        logger.info(`[app.agent] enrichAppContext: active window is "${appBounds?.appName || 'unknown'}" — using cached appBounds for ${appName}`);
+        appBounds = _prevCache.appBounds;
+      } else {
+        logger.info(`[app.agent] enrichAppContext: active app bounds unavailable (active: "${appBounds?.appName || 'unknown'}")`);
+        appBounds = null;
+      }
+    } else {
+      logger.info(`[app.agent] enrichAppContext: active app bounds ${JSON.stringify(appBounds)}`);
+    }
+
+    // 2. Capture screen + parse with our overlay hidden so ThinkDrop doesn't appear in the screenshot
+    let captureResult, screenDims;
+    await _withOverlayHidden(async () => {
+      captureResult = await actionCaptureScreen();
+      screenDims = captureResult.ok ? _getScreenDimsFromScreenshot(captureResult.path) : { width: 1440, height: 900 };
+    });
+
+    // 3. Check in-process boundary cache (keyed by appName + screen dimensions)
+    let boundaries = getBoundariesFromCache(appName, screenDims);
     if (!boundaries) {
-      const parseResult = await actionParseScreenshot({});
+      let parseResult;
+      await _withOverlayHidden(async () => {
+        parseResult = await actionParseScreenshot({ screenshotPath: captureResult.ok ? captureResult.path : undefined });
+      });
       if (parseResult.ok && parseResult.textItems && parseResult.textItems.length > 0) {
-        boundaries = groupTextItemsIntoBoundaries(parseResult.textItems);
-        await _storeBoundaryCache(appName, windowTitle, boundaries, category);
+        boundaries = mergeCloseBoxes(parseResult.textItems, { thresholdX: 50, thresholdY: 25, minItems: 3 });
+        _storeBoundaryCache(appName, boundaries, category, screenDims, appBounds);
       } else {
         boundaries = [];
       }
     }
 
+    // 4. Score boundaries using app context and filter overlay-shaped panels
+    if (boundaries.length > 0) {
+      const scored = _scoreBoundariesForMain(boundaries, category, screenDims.width, screenDims.height, appBounds);
+      const filtered = scored.filter(b => !b.isFloating);
+      filtered.sort((a, z) => z.score - a.score);
+      const topBounds = filtered.slice(0, 8).map(s => ({
+        x: s.x, y: s.y, width: s.width, height: s.height,
+        label: s.label || s.typeInfo?.type || '',
+        color: '#00aaff'
+      }));
+      _sendHighlightToOverlay({ type: 'highlight', elements: topBounds, source: 'enrich_app_context' }).catch(() => {});
+    }
+
+    // 5. Shortcuts — reads from agent descriptor if present, only web-crawls once ever
     const shortcutsResult = await actionDiscoverShortcuts({ appName, category });
 
-    logger.info(`[app.agent] enrichAppContext complete: ${appName} (${category}), boundaries: ${boundaries.length}, shortcuts: ${shortcutsResult.shortcuts.length}`);
+    logger.info(`[app.agent] enrichAppContext complete: ${appName} (${category}), boundaries: ${boundaries.length}, shortcuts: ${shortcutsResult.shortcuts.length}, shortcutSource: ${shortcutsResult.source}`);
     return { category, boundaries, shortcuts: shortcutsResult.shortcuts };
   } catch (err) {
     logger.error(`[app.agent] enrichAppContext error: ${err.message}`);
@@ -2950,26 +3279,20 @@ async function enrichAppContext(appName, windowTitle, { background = false } = {
   }
 }
 
-function inferMainRegion(boundaries, category) {
-  const schema = CATEGORY_SCHEMAS[category] || CATEGORY_SCHEMAS.other;
+function inferMainRegion(boundaries, category, appBounds = null, screenWidth = 1440, screenHeight = 900) {
   if (!boundaries || boundaries.length === 0) {
     return { centerX: 640, centerY: 400 };
   }
 
-  const scored = boundaries.map(b => {
-    const inferred = schema.inferBoundaryType(b.width, b.height, b.x, b.y);
-    const isMain = inferred.type === 'content' || inferred.type === 'messages' ||
-                   inferred.type === 'editor' || inferred.type === 'scrollback' ||
-                   inferred.type === 'canvas' || inferred.type === 'reading_pane';
-    return { ...b, isMain, confidence: inferred.confidence };
-  }).filter(b => b.isMain);
+  const scored = _scoreBoundariesForMain(boundaries, category, screenWidth, screenHeight, appBounds)
+    .filter(b => b.isMain && !b.isFloating);
 
   if (scored.length === 0) {
     const largest = [...boundaries].sort((a, b) => (b.width * b.height) - (a.width * a.height))[0];
     return { centerX: largest.x + largest.width / 2, centerY: largest.y + largest.height / 2 };
   }
 
-  const best = scored.sort((a, b) => b.confidence - a.confidence)[0];
+  const best = scored.sort((a, b) => b.score - a.score)[0];
   return { centerX: best.x + best.width / 2, centerY: best.y + best.height / 2 };
 }
 
@@ -3061,8 +3384,105 @@ function _getTopWords(text, n) {
   return text.trim().split(/\s+/).slice(0, n);
 }
 
+/**
+ * Deduplicate ordered OCR snapshots from a scroll session into a single
+ * coherent transcript. Consecutive snapshots overlap by ~50% (half-viewport
+ * scrolls), so deduplication is line-based: only lines not seen before are kept.
+ * Capped at MAX_ACCUMULATED chars to prevent context overflow in synthesis.
+ */
+const _MAX_ACCUMULATED_CHARS = 15000;
+function _deduplicateScrollJournal(journal, finalText) {
+  const all = finalText ? [...journal, finalText] : [...journal];
+  if (!all.length) return finalText || '';
+  const seen = new Set();
+  const lines = [];
+  for (const snapshot of all) {
+    if (!snapshot) continue;
+    for (const line of snapshot.split(/\n/).map(l => l.trim()).filter(l => l.length > 15)) {
+      if (!seen.has(line)) {
+        seen.add(line);
+        lines.push(line);
+      }
+    }
+  }
+  return lines.join('\n').slice(0, _MAX_ACCUMULATED_CHARS);
+}
+
 async function _sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+/**
+ * Ask the LLM whether the content that appeared after a scroll is semantically
+ * relevant to the scroll goal. Catches cases where the wrong region scrolled
+ * (e.g. sidebar showing channel names instead of messages).
+ * Fails open — returns true if LLM is unavailable.
+ */
+async function _llmCheckRegionRelevance(purposeStatement, beforeText, afterText) {
+  try {
+    const beforeWords = new Set(beforeText.toLowerCase().split(/\s+/));
+    const addedWords = afterText.toLowerCase().split(/\s+/).filter(w => w.length > 3 && !beforeWords.has(w));
+    const addedSample = addedWords.slice(0, 40).join(' ');
+    if (!addedSample) return true; // nothing to judge
+
+    // OCR noise gate: if most new words contain non-alphabetic artifacts or there are
+    // too few of them, the screenshot captured UI chrome / overlay flicker — not real
+    // content. Rejecting a region based on noise falsely discards a working scroll target.
+    const noisyWords = addedWords.filter(w => /[^a-z0-9'.,!?\-]/.test(w));
+    const noiseRatio = noisyWords.length / Math.max(addedWords.length, 1);
+    if (noiseRatio > 0.5 || addedWords.length < 5) {
+      logger.info(`[app.agent] _llmCheckRegionRelevance: OCR noise gate triggered (noiseRatio=${noiseRatio.toFixed(2)}, words=${addedWords.length}) — accepting region`);
+      return true;
+    }
+
+    const answer = await skillLlmAsk(
+      `Scroll goal: "${purposeStatement}"\n\nBefore scroll (sample): ${beforeText.slice(0, 300)}\nNew content that appeared after scroll: "${addedSample}"\n\nDoes the new content look like it belongs to the correct area for this goal? (e.g. goal is about messages/dates → new content should be chat messages, not channel names or code lines)\nReply with one word: yes or no.`
+    );
+    const result = (answer || '').trim().toLowerCase().startsWith('y');
+    logger.info(`[app.agent] _llmCheckRegionRelevance → ${result ? 'relevant' : 'irrelevant'} (added: "${addedSample.slice(0, 60)}...")`);
+    return result;
+  } catch (_) { return true; }
+}
+
+/**
+ * Probe a candidate scroll region by moving the mouse to (cx, cy), scrolling
+ * a few steps, and checking whether the OCR content changed.
+ * When purposeStatement is provided, also checks whether the changed content
+ * is semantically relevant to the scroll goal.
+ * Returns { scrolled: boolean, relevant: boolean }
+ */
+async function _probeBoundaryForScroll(cx, cy, direction, nut, purposeStatement) {
+  try {
+    const { screenCapture } = require('./screen.capture.cjs');
+    await nut.mouse.move([{ x: cx, y: cy }]);
+    await _sleep(400); // longer settle — lets ThinkDrop overlay finish any flicker before OCR
+    const beforeCapture = await screenCapture({});
+    const beforeText = beforeCapture.success ? (beforeCapture.text || '') : '';
+    if (direction === 'up') await nut.mouse.scrollUp(150);
+    else await nut.mouse.scrollDown(150);
+    await _sleep(1000);
+    const afterCapture = await screenCapture({});
+    const afterText = afterCapture.success ? (afterCapture.text || '') : '';
+    const topBefore = _getTopWords(beforeText, 8);
+    const topAfter  = _getTopWords(afterText,  8);
+    const changed = topBefore.some(w => !topAfter.includes(w)) || topAfter.some(w => !topBefore.includes(w));
+    // Restore position so probe is non-destructive
+    try {
+      if (direction === 'up') await nut.mouse.scrollDown(150);
+      else await nut.mouse.scrollUp(150);
+      await _sleep(400);
+    } catch (_) {}
+    // If changed, check whether the new content is semantically right for the goal
+    let relevant = true;
+    if (changed && purposeStatement) {
+      relevant = await _llmCheckRegionRelevance(purposeStatement, beforeText, afterText);
+    }
+    logger.info(`[app.agent] _probeBoundaryForScroll (${cx},${cy}) → changed=${changed}, relevant=${relevant}`);
+    return { scrolled: changed, relevant };
+  } catch (err) {
+    logger.warn(`[app.agent] _probeBoundaryForScroll error at (${cx},${cy}): ${err.message || err}`);
+    return { scrolled: false, relevant: false };
+  }
 }
 
 async function actionPreScrollPlan({ goal, appName, category, maxScrolls }) {
@@ -3098,7 +3518,7 @@ Return JSON only, no markdown fences.`;
   }
 }
 
-async function actionSearchScroll({ scrollPlan, appName, windowTitle, category }) {
+async function actionSearchScroll({ scrollPlan, appName, category, scrollCandidates }) {
   const { direction, stopKeyword, purposeStatement, maxScrolls } = scrollPlan;
   let nut;
   try {
@@ -3107,66 +3527,361 @@ async function actionSearchScroll({ scrollPlan, appName, windowTitle, category }
     return { ok: false, found: false, stopReason: 'nutjs_unavailable', error: err.message };
   }
 
-  const boundaries = await getBoundariesFromCache(appName, windowTitle) || [];
-  const mainRegion = inferMainRegion(boundaries, category);
+  // ── Step 1: Build candidate scroll regions from boundaries ──────────────────
+  // Use in-process boundary cache (dimension-keyed, no DB needed)
+  // Try all cached entries for this appName — pick the most recent valid one
+  const cacheEntry = _findBoundaryCacheEntry(appName);
+  const boundaries = cacheEntry?.boundaries || [];
+  const screenHeight = cacheEntry?.screenHeight || 900;
+  const screenWidth = cacheEntry?.screenWidth || 1440;
+  const appBounds = cacheEntry?.appBounds || null;
+  if (boundaries.length > 0) {
+    logger.info(`[app.agent] actionSearchScroll: using cached boundaries from ${appName} (${boundaries.length} boundaries)`);
+  }
 
+  // Prefer a fresh active-win measurement for scroll-step calculation; fall back to cache.
+  // IMPORTANT: only use live bounds if the active window IS the target app (not Electron overlay).
+  let liveAppBounds = appBounds;
   try {
-    await nut.mouse.move([{ x: mainRegion.centerX, y: mainRegion.centerY }]);
-    await _sleep(200);
+    const live = await _getActiveAppBounds();
+    if (live && live.height > 100 && _appNameMatches(live.appName, appName)) {
+      liveAppBounds = live;
+      logger.info(`[app.agent] actionSearchScroll: live appBounds from active-win (${live.appName}) ${live.width}x${live.height}`);
+    } else if (live) {
+      logger.info(`[app.agent] actionSearchScroll: active window is "${live.appName}" (overlay/other) — using cached appBounds for ${appName}`);
+    }
+  } catch (_) {}
+  const windowHeight = liveAppBounds?.height || screenHeight;
+  logger.info(`[app.agent] actionSearchScroll: windowHeight=${windowHeight} (appBounds.height=${liveAppBounds?.height ?? 'n/a'})`);
+
+  // Derive effectiveStopKeyword from purposeStatement via LLM when not explicitly set
+  let effectiveStopKeyword = stopKeyword;
+  if (!effectiveStopKeyword && purposeStatement) {
+    try {
+      const derived = (await skillLlmAsk(
+        `Scroll goal: "${purposeStatement}"\nWhat single word or short phrase (≤4 words) should appear on screen when this goal is achieved? Reply with ONLY the keyword, nothing else.`
+      )).trim().replace(/^["']|["']$/g, '');
+      if (derived && derived.length > 0 && derived.length < 50) {
+        effectiveStopKeyword = derived;
+        logger.info(`[app.agent] actionSearchScroll: LLM-derived stopKeyword "${effectiveStopKeyword}" from purposeStatement`);
+      }
+    } catch (_) {}
+  }
+
+  let candidates = [];
+
+  if (scrollCandidates && scrollCandidates.length > 0) {
+    // Caller supplied explicit [cx, cy] pairs — no boundary ref available
+    candidates = scrollCandidates.map(c => ({ cx: c[0], cy: c[1], b: null, confidence: 0 }));
+  } else if (boundaries.length > 0) {
+    // Derive from cached boundaries — score by category schema + layout context
+    const scored = _scoreBoundariesForMain(boundaries, category, screenWidth, screenHeight, appBounds)
+      .filter(b => b.isMain && !b.isFloating);
+    scored.sort((a, z) => z.score - a.score);
+    candidates = scored.slice(0, 4)
+      .filter(s => Math.round(s.y + s.height / 2) >= 200) // exclude header/toolbar strips (cy<200)
+      .map(s => ({
+        cx: Math.round(s.x + s.width / 2),
+        cy: Math.round(s.y + s.height / 2),
+        b: s,
+        confidence: s.typeInfo?.confidence || 0,
+        inferredType: s.typeInfo?.type || 'unknown'
+      }));
+  }
+
+  // Append the schema's default center only when no typed candidates were found
+  const defaultRegion = inferMainRegion(boundaries, category, appBounds, screenWidth, screenHeight);
+  if (candidates.length === 0) {
+    candidates.push({ cx: defaultRegion.centerX, cy: defaultRegion.centerY, b: null, confidence: 0 });
+  }
+
+  // Sort candidates by purposeStatement intent — prefer the region type that best
+  // matches what the user is searching for (messages vs sidebar, etc.)
+  if (purposeStatement && candidates.some(c => c.inferredType)) {
+    candidates.sort((a, b) =>
+      _scrollRegionPriority(b.inferredType, purposeStatement) -
+      _scrollRegionPriority(a.inferredType, purposeStatement)
+    );
+    logger.info(`[app.agent] actionSearchScroll: intent-sorted candidates: ${candidates.map(c => c.inferredType || 'unknown').join(', ')}`);
+  }
+
+  // Clamp candidates to the left portion of the screen when appBounds are unavailable.
+  // ThinkDrop overlay occupies the right side — any candidate with cx in the overlay
+  // region will scroll the overlay panel, not the target app.
+  const _maxScrollCandidateX = appBounds ? (appBounds.x + appBounds.width) : Math.round(screenWidth * 0.75);
+  const _clampedCandidates = candidates.filter(c => c.cx <= _maxScrollCandidateX);
+  if (_clampedCandidates.length > 0) {
+    candidates = _clampedCandidates;
+    logger.info(`[app.agent] actionSearchScroll: clamped candidates to cx≤${_maxScrollCandidateX} (${candidates.length} remaining)`);
+  } else {
+    // All candidates were in the overlay — use center-left as safe fallback
+    candidates = [{ cx: Math.round(screenWidth * 0.4), cy: Math.round(screenHeight * 0.5), b: null, confidence: 0 }];
+    logger.warn(`[app.agent] actionSearchScroll: all candidates beyond overlay threshold — using center-left fallback`);
+  }
+
+  // ── Step 2: Probe candidates — skip probe for high-confidence regions ────────
+  const _SCROLL_TYPES = ['messages', 'content', 'editor', 'scrollback', 'reading_pane'];
+  let activeRegion = null;
+  for (const candidate of candidates) {
+    const { cx, cy, b, confidence, inferredType } = candidate;
+    // High-confidence known scroll panels: trust position, skip OCR-diff probe
+    if (b && confidence >= 0.8 && _SCROLL_TYPES.includes(inferredType)) {
+      activeRegion = { cx, cy };
+      logger.info(`[app.agent] actionSearchScroll: high-confidence region (${inferredType}@${confidence}) at (${cx},${cy}) — skipping probe`);
+      break;
+    }
+    // Low-confidence or unknown: probe with bigger scroll
+    const probe = await _probeBoundaryForScroll(cx, cy, direction, nut, purposeStatement);
+    if (probe.scrolled && probe.relevant) {
+      activeRegion = { cx, cy };
+      logger.info(`[app.agent] actionSearchScroll: probe confirmed scroll region at (${cx},${cy})`);
+      break;
+    }
+    if (probe.scrolled && !probe.relevant) {
+      logger.info(`[app.agent] actionSearchScroll: (${cx},${cy}) scrolled but content irrelevant for goal — trying next candidate`);
+    } else {
+      logger.info(`[app.agent] actionSearchScroll: boundary (${cx},${cy}) did not respond, trying next`);
+    }
+  }
+
+  // ── Step 3: AppleScript keyboard scroll fallback ────────────────────────────
+  // When no NutJS candidate was confirmed (all probes rejected or failed),
+  // test whether AppleScript Page Up/Down actually moves the screen content.
+  // If it does, set useKeyboardScroll=true and enter the real scroll loop
+  // using keyboard events instead of NutJS mouse scroll.
+  let useKeyboardScroll = false;
+  if (!activeRegion) {
+    logger.warn('[app.agent] actionSearchScroll: no NutJS region confirmed — probing AppleScript keyboard scroll');
+    const { execSync: _execSyncFallback } = require('child_process');
+    const _keyCode = direction === 'up' ? '116' : '121'; // Page Up / Page Down
+    let _beforeKb = '';
+    try {
+      const { screenCapture: _scKb } = require('./screen.capture.cjs');
+      const _beforeCapKb = await _scKb({});
+      _beforeKb = _beforeCapKb.success ? (_beforeCapKb.text || '') : '';
+    } catch (_) { _beforeKb = (await getRecentOCR()).text || ''; }
+    try {
+      _execSyncFallback(`osascript -e 'tell application "${appName}" to activate'`, { timeout: 2000 });
+      await _sleep(300);
+      _execSyncFallback(`osascript -e 'tell application "System Events" to key code ${_keyCode}'`);
+      await _sleep(800);
+    } catch (_kbErr) {
+      logger.warn(`[app.agent] AppleScript keyboard probe failed: ${_kbErr.message}`);
+    }
+    let _afterKb = '';
+    try {
+      const { screenCapture: _scKb2 } = require('./screen.capture.cjs');
+      const _afterCapKb = await _scKb2({});
+      _afterKb = _afterCapKb.success ? (_afterCapKb.text || '') : '';
+    } catch (_) { _afterKb = (await getRecentOCR()).text || ''; }
+    const _kbScrolled = _beforeKb !== _afterKb && _afterKb.length > 20;
+    if (_kbScrolled) {
+      logger.info('[app.agent] actionSearchScroll: AppleScript keyboard scroll works — entering scroll loop in keyboard mode');
+      useKeyboardScroll = true;
+      activeRegion = { cx: Math.round(screenWidth * 0.4), cy: Math.round(screenHeight * 0.5) };
+    } else {
+      // Keyboard scroll also failed — truly stuck, surface what we have
+      logger.warn('[app.agent] actionSearchScroll: AppleScript keyboard scroll also did not move content — giving up');
+      return {
+        ok: true, found: false, scrolls: 0,
+        stopReason: 'no_scroll_region_found',
+        text: _afterKb || _beforeKb
+      };
+    }
+  }
+
+  // ── Step 4: Main scroll loop on confirmed region ────────────────────────────
+  // Notify GhostLayer: confirmed scroll region → turn green; others fade out
+  _sendHighlightToOverlay({
+    type: 'highlight_update',
+    cx: activeRegion.cx,
+    cy: activeRegion.cy,
+    role: 'scroll_active'
+  }).catch(() => {});
+
+  // Move mouse to confirmed region once before starting
+  try {
+    await nut.mouse.move([{ x: activeRegion.cx, y: activeRegion.cy }]);
+    await _sleep(150);
   } catch (_) {}
 
+  const { screenCapture: _liveCapture } = require('./screen.capture.cjs');
+  // Use cached OCR for most iterations (instant); only do a fresh screenCapture every 3 scrolls
+  // This cuts per-iteration time from ~15s (2 full OCR calls) down to ~1s
+  const _liveText = async (forceFresh = false) => {
+    try {
+      if (forceFresh) {
+        const r = await _liveCapture({});
+        if (r.success) return { text: r.text || '', confidence: r.confidence || 0 };
+        const cached = await getRecentOCR();
+        return { text: cached.text || '', confidence: 0 };
+      }
+      const cached = await getRecentOCR();
+      return { text: cached.text || '', confidence: cached.confidence || 0 };
+    } catch (_) {
+      return { text: '', confidence: 0 };
+    }
+  };
+
   let scrollCount = 0;
-  let lastOCR = await getRecentOCR();
+  // Seed lastText from a fresh capture so we have a true pre-scroll baseline
+  let { text: lastText, confidence: _lastConf } = await _liveText(true);
   let noChangeStreak = 0;
+  // Accumulate OCR snapshots across all scrolls for richer synthesis context
+  const scrollJournal = [];
+  // Seed journal with the pre-scroll baseline so deduplication has a starting
+  // point and accumulatedText always contains at least the opening viewport.
+  if (lastText && lastText.length > 20) scrollJournal.push(lastText);
+  // Track remaining candidates for mid-loop region switching
+  let _candidateIndex = candidates.indexOf(candidates.find(c => c.cx === activeRegion?.cx && c.cy === activeRegion?.cy) || {});
+  const _tryNextCandidate = async () => {
+    _candidateIndex++;
+    const next = candidates[_candidateIndex];
+    if (!next) return false;
+    activeRegion = { cx: next.cx, cy: next.cy };
+    try { await nut.mouse.move([{ x: next.cx, y: next.cy }]); } catch (_) {}
+    logger.info(`[app.agent] actionSearchScroll: switched to candidate ${_candidateIndex} at (${next.cx},${next.cy}) after region validation failure`);
+    return true;
+  };
+
+  // Pre-scroll check: fuzzy-match the stopKeyword against current OCR.
+  // Only run when confidence >= 65 — low-confidence OCR misreads digits (e.g. "19"→"18")
+  // and would stop the scroll on the wrong date. LLM gate provides the fallback.
+  if (effectiveStopKeyword && _lastConf >= 65 && _keywordFuzzyMatchesOCR(effectiveStopKeyword, lastText)) {
+    if (purposeStatement) {
+      const alreadyMet = await _llmCheckScrollGoalMet(purposeStatement, lastText);
+      if (alreadyMet === 'yes') {
+        logger.info(`[app.agent] actionSearchScroll: LLM confirmed goal already met — no scroll needed`);
+        return { ok: true, found: true, scrolls: 0, stopReason: 'keyword_already_visible', text: lastText };
+      }
+      logger.info(`[app.agent] actionSearchScroll: fuzzy matched "${effectiveStopKeyword}" but LLM says goal NOT yet met — proceeding with scroll`);
+    } else {
+      logger.info(`[app.agent] actionSearchScroll: stopKeyword "${effectiveStopKeyword}" already visible — no scroll needed`);
+      return { ok: true, found: true, scrolls: 0, stopReason: 'keyword_already_visible', text: lastText };
+    }
+  }
+  // NutJS scroll units are app-defined; Slack needs ~100 units for a half-window scroll.
+  // The probe uses 150 and successfully scrolls a full screen — 100 is a safe half-screen.
+  const scrollStep = 100;
+  logger.info(`[app.agent] actionSearchScroll: scrollStep=${scrollStep} NutJS units (fixed, probe confirmed 150=full-screen)`);
+
+  // Activate target app via AppleScript before scrolling so NutJS events land in the
+  // correct window (not in the Electron overlay which may have stolen focus).
+  try {
+    const { execSync: _execSyncActivate } = require('child_process');
+    _execSyncActivate(`osascript -e 'tell application "${appName}" to activate'`, { timeout: 2000 });
+    await _sleep(300);
+    logger.info(`[app.agent] actionSearchScroll: activated "${appName}" before scroll loop`);
+  } catch (_activateErr) {
+    logger.warn(`[app.agent] actionSearchScroll: AppleScript activate failed (${_activateErr.message}) — continuing anyway`);
+  }
+
+  const _kbKeyCode = direction === 'up' ? '116' : '121'; // Page Up / Page Down
+  const { execSync: _execSyncKb } = useKeyboardScroll ? require('child_process') : { execSync: null };
 
   while (scrollCount < maxScrolls) {
     try {
-      if (direction === 'up') await nut.mouse.scrollUp(3);
-      else await nut.mouse.scrollDown(3);
+      if (useKeyboardScroll) {
+        // Keyboard scroll mode: send Page Up/Down via AppleScript for each step unit
+        const _kbPresses = Math.max(1, Math.ceil(scrollStep / 5));
+        for (let _ki = 0; _ki < _kbPresses; _ki++) {
+          _execSyncKb(`osascript -e 'tell application "System Events" to key code ${_kbKeyCode}'`);
+          await _sleep(80);
+        }
+      } else {
+        if (direction === 'up') await nut.mouse.scrollUp(scrollStep);
+        else await nut.mouse.scrollDown(scrollStep);
+      }
     } catch (err) {
-      return { ok: false, found: false, stopReason: 'scroll_error', error: err.message };
+      return { ok: false, found: false, scrolls: scrollCount, stopReason: 'scroll_error', error: String(err.message || err) };
     }
-    await _sleep(500);
+    // Give the screen time to settle after scroll before reading
+    await _sleep(600);
 
-    const currentOCR = await getRecentOCR();
+    // Always take a fresh screen capture — stale cache masks whether scroll moved anything
+    const { text: currentText, confidence: _curConf } = await _liveText(true);
 
-    if (stopKeyword && currentOCR.text.toLowerCase().includes(stopKeyword.toLowerCase())) {
-      return { ok: true, found: true, scrolls: scrollCount, stopReason: 'keyword_found' };
+    // Append to scroll journal if this snapshot contains meaningful new content
+    const _lastJournal = scrollJournal[scrollJournal.length - 1] || lastText;
+    const _newWordCount = currentText.split(/\s+/).filter(w => w.length > 3 && !_lastJournal.includes(w)).length;
+    // Push when >= 3 new unique words appear OR every 4th scroll as a safety net
+    // (Slack OCR snapshots overlap ~95% per step so the old >=10 threshold was never met)
+    if (_newWordCount >= 3 || scrollCount % 4 === 3) scrollJournal.push(currentText);
+
+    if (effectiveStopKeyword && _curConf >= 65 && _keywordFuzzyMatchesOCR(effectiveStopKeyword, currentText)) {
+      // The date divider label (e.g. "Thursday, June 18th") is visible but the actual
+      // messages from that date may still be partially below the fold. Do one small
+      // extra scroll to bring those messages into view before capturing the final text.
+      logger.info(`[app.agent] actionSearchScroll: stopKeyword "${effectiveStopKeyword}" fuzzy-matched — doing one overshoot-correction scroll to bring messages into view`);
+      try {
+        const _halfStep = Math.max(2, Math.round(scrollStep / 3));
+        if (useKeyboardScroll) {
+          _execSyncKb(`osascript -e 'tell application "System Events" to key code ${_kbKeyCode}'`);
+        } else {
+          if (direction === 'up') await nut.mouse.scrollUp(_halfStep);
+          else await nut.mouse.scrollDown(_halfStep);
+        }
+        await _sleep(700);
+      } catch (_) {}
+      const { text: finalText } = await _liveText(true);
+      if (finalText && finalText.length > 20) scrollJournal.push(finalText);
+      const accumulatedText = _deduplicateScrollJournal(scrollJournal, finalText || currentText);
+      logger.info(`[app.agent] actionSearchScroll: stopKeyword "${effectiveStopKeyword}" found after ${scrollCount + 1} scrolls (journal: ${scrollJournal.length} snapshots, ${accumulatedText.length} chars accumulated)`);
+      return { ok: true, found: true, scrolls: scrollCount, stopReason: 'keyword_found', text: finalText || currentText, accumulatedText };
     }
 
-    const topBefore = _getTopWords(lastOCR.text, 5);
-    const topAfter = _getTopWords(currentOCR.text, 5);
-    const scrolled = topBefore.some(w => !topAfter.includes(w));
-    if (!scrolled) {
+    // After first scroll: validate the region is producing the right type of content.
+    // If the region scrolled but content is wrong (e.g. channel names vs messages),
+    // switch to the next candidate before continuing.
+    if (scrollCount === 0 && purposeStatement && activeRegion) {
+      const regionOk = await _llmCheckRegionRelevance(purposeStatement, lastText, currentText);
+      if (!regionOk) {
+        logger.warn(`[app.agent] actionSearchScroll: first-scroll region validation FAILED — content doesn't match goal, trying next candidate`);
+        const switched = await _tryNextCandidate();
+        if (!switched) {
+          logger.warn(`[app.agent] actionSearchScroll: no more candidates — continuing with current region despite mismatch`);
+        }
+      } else {
+        logger.info(`[app.agent] actionSearchScroll: first-scroll region validation OK — content matches goal`);
+      }
+    }
+
+    const topBefore = _getTopWords(lastText, 8);
+    const topAfter  = _getTopWords(currentText, 8);
+    const scrollMoved = topBefore.some(w => !topAfter.includes(w)) || topAfter.some(w => !topBefore.includes(w));
+    if (!scrollMoved) {
       noChangeStreak++;
-      if (noChangeStreak >= 2) {
-        return { ok: false, found: false, scrolls: scrollCount, stopReason: 'content_boundary_reached' };
+      if (noChangeStreak >= 4) {
+        // Soft success — we've hit the content boundary; surface whatever is visible
+        return { ok: true, found: false, scrolls: scrollCount, stopReason: 'content_boundary_reached', text: currentText, accumulatedText: _deduplicateScrollJournal(scrollJournal, currentText) };
       }
     } else {
       noChangeStreak = 0;
     }
 
-    if (scrollCount % 5 === 4) {
+    if (scrollCount % 3 === 2) {
       try {
         const check = await skillLlmAsk(`
 Purpose: ${purposeStatement}
-Looking for: "${stopKeyword}"
-Screen now: ${currentOCR.text.slice(0, 500)}
+Looking for: "${effectiveStopKeyword || stopKeyword || '(any relevant content)'}"
+Accumulated scroll content so far:
+${_deduplicateScrollJournal(scrollJournal, null).slice(-800) || currentText.slice(0, 500)}
+Current viewport: ${currentText.slice(0, 300)}
 Scrolls done: ${scrollCount + 1}/${maxScrolls}
 Respond with exactly one word: FOUND, KEEP_SCROLLING, or GIVE_UP`);
         const answer = check.trim().toUpperCase();
-        if (answer === 'FOUND') return { ok: true, found: true, scrolls: scrollCount, stopReason: 'llm_confirmed' };
-        if (answer === 'GIVE_UP') return { ok: false, found: false, scrolls: scrollCount, stopReason: 'llm_gave_up' };
+        if (answer === 'FOUND') return { ok: true, found: true, scrolls: scrollCount, stopReason: 'llm_confirmed', text: currentText, accumulatedText: _deduplicateScrollJournal(scrollJournal, currentText) };
+        if (answer === 'GIVE_UP') return { ok: true, found: false, scrolls: scrollCount, stopReason: 'llm_gave_up', text: currentText, accumulatedText: _deduplicateScrollJournal(scrollJournal, currentText) };
       } catch (_) {}
     }
 
-    lastOCR = currentOCR;
+    lastText = currentText;
     scrollCount++;
   }
-  return { ok: false, found: false, scrolls: scrollCount, stopReason: 'max_scrolls_exhausted' };
+  return { ok: true, found: false, scrolls: scrollCount, stopReason: 'max_scrolls_exhausted', text: lastText, accumulatedText: _deduplicateScrollJournal(scrollJournal, lastText) };
 }
 
-async function actionAiResponseScroll({ scrollPlan, appName, windowTitle, category }) {
+async function actionAiResponseScroll({ scrollPlan, appName, category }) {
   const { stopKeyword, purposeStatement, maxScrolls } = scrollPlan;
   let nut;
   try {
@@ -3175,8 +3890,9 @@ async function actionAiResponseScroll({ scrollPlan, appName, windowTitle, catego
     return { ok: false, found: false, stopReason: 'nutjs_unavailable', error: err.message };
   }
 
-  const boundaries = await getBoundariesFromCache(appName, windowTitle) || [];
-  const mainRegion = inferMainRegion(boundaries, category);
+  const cacheEntry = _findBoundaryCacheEntry(appName);
+  const boundaries = cacheEntry?.boundaries || [];
+  const mainRegion = inferMainRegion(boundaries, category, cacheEntry?.appBounds, cacheEntry?.screenWidth || 1440, cacheEntry?.screenHeight || 900);
   let scrollCount = 0;
 
   while (scrollCount < maxScrolls) {
@@ -3269,6 +3985,7 @@ async function actionLiveChatScroll({ scrollPlan, appName, windowTitle, category
       const joined = lines.join('\n');
       logger.info(`[app.agent] watchMode newContent: ${joined.slice(0, 100)}`);
 
+      // Fast path: keyword match
       if (stopKeyword && joined.toLowerCase().includes(stopKeyword.toLowerCase())) {
         resolved = true;
         try {
@@ -3276,6 +3993,24 @@ async function actionLiveChatScroll({ scrollPlan, appName, windowTitle, category
           if (monSvc && monSvc.deactivateWatchMode) monSvc.deactivateWatchMode(sessionId);
         } catch (_) {}
         resolve({ ok: true, found: true, stopReason: 'keyword_found', content: joined });
+        return;
+      }
+
+      // Semantic path: LLM checks if purposeStatement goal is satisfied by new content
+      if (purposeStatement) {
+        try {
+          const check = await skillLlmAsk(
+            `Goal: "${purposeStatement}"\nNew content received:\n${joined.slice(0, 400)}\nDoes this content satisfy the goal? Reply with exactly one word: YES or NO`
+          );
+          if (check.trim().toUpperCase() === 'YES') {
+            resolved = true;
+            try {
+              const monSvc = require('../monitor/monitorService');
+              if (monSvc && monSvc.deactivateWatchMode) monSvc.deactivateWatchMode(sessionId);
+            } catch (_) {}
+            resolve({ ok: true, found: true, stopReason: 'llm_confirmed', content: joined });
+          }
+        } catch (_) {}
       }
     };
 
@@ -3308,7 +4043,7 @@ async function actionLiveChatScroll({ scrollPlan, appName, windowTitle, category
   });
 }
 
-async function actionPassiveReadScroll({ scrollPlan, appName, windowTitle, category }) {
+async function actionPassiveReadScroll({ scrollPlan, appName, category }) {
   const { stopKeyword, purposeStatement, maxScrolls = 30 } = scrollPlan;
   let nut;
   try {
@@ -3317,32 +4052,64 @@ async function actionPassiveReadScroll({ scrollPlan, appName, windowTitle, categ
     return { ok: false, stopReason: 'nutjs_unavailable', error: err.message };
   }
 
-  const boundaries = await getBoundariesFromCache(appName, windowTitle) || [];
-  const mainRegion = inferMainRegion(boundaries, category);
+  const cacheEntry = _findBoundaryCacheEntry(appName);
+  const boundaries = cacheEntry?.boundaries || [];
+  const screenHeight = cacheEntry?.screenHeight || 900;
+
+  // Prefer a fresh active-win measurement for scroll-step calculation; fall back to cache.
+  // Only use live bounds if the active window IS the target app (not Electron overlay).
+  let liveAppBounds = cacheEntry?.appBounds || null;
+  try {
+    const live = await _getActiveAppBounds();
+    if (live && live.height > 100 && _appNameMatches(live.appName, appName)) {
+      liveAppBounds = live;
+    } else if (live) {
+      logger.info(`[app.agent] actionPassiveReadScroll: active window is "${live.appName}" — using cached appBounds for ${appName}`);
+    }
+  } catch (_) {}
+  const windowHeight = liveAppBounds?.height || screenHeight;
+
+  // Half-window scroll: 1 NutJS scroll unit ≈ 20px at macOS default speed
+  const PIXELS_PER_NUT_UNIT = 20;
+  const scrollStep = Math.max(3, Math.round((windowHeight / 2) / PIXELS_PER_NUT_UNIT));
+  logger.info(`[app.agent] actionPassiveReadScroll: scrollStep=${scrollStep} NutJS units (windowHeight=${windowHeight}px)`);
+
+  const mainRegion = inferMainRegion(boundaries, category, liveAppBounds, cacheEntry?.screenWidth || 1440, screenHeight);
   let scrollCount = 0;
   const accumulatedText = [];
 
-  await nut.mouse.move([{ x: mainRegion.centerX, y: mainRegion.centerY }]);
-  await _sleep(200);
+  try {
+    await nut.mouse.move([{ x: mainRegion.centerX, y: mainRegion.centerY }]);
+    await _sleep(200);
+  } catch (_) {}
+
+  const { screenCapture: _passiveCapture } = require('./screen.capture.cjs');
+  const _freshText = async () => {
+    try {
+      const r = await _passiveCapture({});
+      return r.success ? (r.text || '') : (await getRecentOCR()).text || '';
+    } catch (_) { return (await getRecentOCR()).text || ''; }
+  };
 
   while (scrollCount < maxScrolls) {
-    const currentOCR = await getRecentOCR();
-    if (currentOCR.text) accumulatedText.push(currentOCR.text);
+    // Always fresh OCR so we read what is actually on screen now
+    const currentText = await _freshText();
+    if (currentText) accumulatedText.push(currentText);
 
-    if (stopKeyword && currentOCR.text.toLowerCase().includes(stopKeyword.toLowerCase())) {
+    if (stopKeyword && currentText.toLowerCase().includes(stopKeyword.toLowerCase())) {
       return { ok: true, found: true, stopReason: 'keyword_found', scrolls: scrollCount, text: accumulatedText.join('\n') };
     }
 
-    const topWordsBefore = currentOCR.text.split(/\s+/).slice(0, 5);
+    const topWordsBefore = currentText.split(/\s+/).slice(0, 5);
 
     try {
-      await nut.mouse.scrollDown(3);
-      await _sleep(600);
+      await nut.mouse.scrollDown(scrollStep);
+      await _sleep(700);
     } catch (_) {}
     scrollCount++;
 
-    const afterOCR = await getRecentOCR();
-    const topWordsAfter = afterOCR.text.split(/\s+/).slice(0, 5);
+    const afterText = await _freshText();
+    const topWordsAfter = afterText.split(/\s+/).slice(0, 5);
     const scrollOccurred = topWordsBefore.some(w => w.length > 3 && !topWordsAfter.includes(w));
 
     if (!scrollOccurred && scrollCount > 2) {
@@ -3353,7 +4120,7 @@ async function actionPassiveReadScroll({ scrollPlan, appName, windowTitle, categ
   return { ok: true, found: false, stopReason: 'max_scrolls_exhausted', scrolls: scrollCount, text: accumulatedText.join('\n') };
 }
 
-async function actionTeleportToElement({ appName, searchText, followWithTab = false }) {
+async function actionTeleportToElement({ searchText, followWithTab = false }) {
   let nut;
   try {
     nut = require('@nut-tree-fork/nut-js');
@@ -3650,27 +4417,45 @@ async function verifyAppFocused({ appName, waitMs = 5000 }) {
     return al.includes(bl) || bl.includes(al);
   };
 
-  const current = await getRecentOCR({ appName });
-  if (current.appName && _matches(current.appName, appName)) {
-    return { focused: true, appName: current.appName, waited: 0 };
+  // Use active-win directly — it's faster than OCR and doesn't capture the
+  // ThinkDrop overlay when it's visible.
+  const liveWin = await _getActiveAppBounds().catch(() => null);
+  const liveAppName = liveWin?.appName || '';
+  const OVERLAY_APPS = ['electron', 'thinkdrop'];
+  const isOverlayActive = OVERLAY_APPS.some(o => liveAppName.toLowerCase().includes(o));
+
+  if (liveWin && _matches(liveWin.appName, appName)) {
+    return { focused: true, appName: liveWin.appName, waited: 0 };
+  }
+
+  // If the ThinkDrop overlay is currently in the foreground but we have a
+  // boundary cache for the target app, treat it as focused. The overlay will
+  // hide before NutJS sends the keystrokes, and the OS will deliver them to
+  // the previously-active app (the one the user was looking at).
+  if (isOverlayActive) {
+    const cached = _findBoundaryCacheEntry(appName);
+    if (cached) {
+      logger.info(`[app.agent] verifyAppFocused: overlay active but "${appName}" has boundary cache — treating as focused`);
+      return { focused: true, appName, waited: 0, viaCache: true };
+    }
   }
 
   try {
     const { execSync } = require('child_process');
     execSync(`open -a "${appName}"`, { timeout: 3000 });
-  } catch (_) {}
+  } catch (_) { /* non-fatal */ }
 
   const pollInterval = 500;
   while (Date.now() - start < waitMs) {
     await _sleep(pollInterval);
-    const after = await getRecentOCR({ appName });
-    if (after.appName && _matches(after.appName, appName)) {
+    const after = await _getActiveAppBounds().catch(() => null);
+    if (after && _matches(after.appName, appName)) {
       return { focused: true, appName: after.appName, waited: Date.now() - start };
     }
   }
 
-  const final = await getRecentOCR({ appName });
-  return { focused: false, appName: final.appName || 'unknown', waited: Date.now() - start };
+  const final = await _getActiveAppBounds().catch(() => null);
+  return { focused: false, appName: final?.appName || 'unknown', waited: Date.now() - start };
 }
 
 async function actionExecuteShortcut({ appName, action, shortcutOverride, verifyWith, skipFocusCheck = false }) {
@@ -3895,33 +4680,41 @@ async function actionExtractContentViaClipboard({ appName, category = 'browser' 
   }
   
   try {
-    // 2. Execute category-specific selection chain
+    // 2. Execute category-specific selection chain.
+    // Hide the overlay first so the target app is visible and can receive focus.
     const categorySchema = CATEGORY_SCHEMAS[category] || CATEGORY_SCHEMAS.other;
     const extractionStrategy = categorySchema?.clipboardBehavior?.extractionStrategy || 'Cmd+A then Cmd+C';
     
     logger.info(`[app.agent] Extracting content from ${appName} using strategy: ${extractionStrategy}`);
     
-    // Browser: Cmd+L -> Tab -> Cmd+A -> Cmd+C
-    if (category === 'browser') {
-      await actionExecuteShortcut({ appName, shortcutOverride: 'Cmd+L' }); // Focus address bar
-      await _sleep(100);
-      await actionExecuteShortcut({ appName, shortcutOverride: 'Tab' });   // Move to content
-      await _sleep(100);
-      await actionExecuteShortcut({ appName, shortcutOverride: 'Cmd+A' }); // Select all
-      await _sleep(100);
-      await actionExecuteShortcut({ appName, shortcutOverride: 'Cmd+C' }); // Copy
-      await _sleep(100);
-    } else {
-      // Generic: just Cmd+A -> Cmd+C
-      await actionExecuteShortcut({ appName, shortcutOverride: 'Cmd+A' });
-      await _sleep(100);
-      await actionExecuteShortcut({ appName, shortcutOverride: 'Cmd+C' });
-      await _sleep(100);
-    }
-    
-    // 3. Read clipboard
-    const { execSync } = require('child_process');
-    const extractedContent = execSync('pbpaste', { encoding: 'utf8', timeout: 5000 });
+    let extractedContent = '';
+    await _withOverlayHidden(async () => {
+      // Bring the target app to the front so NutJS keystrokes land there.
+      const { execSync } = require('child_process');
+      try { execSync(`open -a "${appName}"`, { timeout: 3000 }); } catch (_) { /* non-fatal */ }
+      await _sleep(400); // wait for window focus to settle
+
+      // Browser: Cmd+L -> Tab -> Cmd+A -> Cmd+C
+      if (category === 'browser') {
+        await actionExecuteShortcut({ appName, shortcutOverride: 'Cmd+L', skipFocusCheck: true }); // Focus address bar
+        await _sleep(150);
+        await actionExecuteShortcut({ appName, shortcutOverride: 'Tab', skipFocusCheck: true });   // Move to content
+        await _sleep(150);
+        await actionExecuteShortcut({ appName, shortcutOverride: 'Cmd+A', skipFocusCheck: true }); // Select all
+        await _sleep(150);
+        await actionExecuteShortcut({ appName, shortcutOverride: 'Cmd+C', skipFocusCheck: true }); // Copy
+        await _sleep(400);
+      } else {
+        // Generic: just Cmd+A -> Cmd+C
+        await actionExecuteShortcut({ appName, shortcutOverride: 'Cmd+A', skipFocusCheck: true });
+        await _sleep(150);
+        await actionExecuteShortcut({ appName, shortcutOverride: 'Cmd+C', skipFocusCheck: true });
+        await _sleep(400);
+      }
+
+      // Read clipboard while overlay is still hidden, so pbpaste sees the new content.
+      extractedContent = execSync('pbpaste', { encoding: 'utf8', timeout: 5000 });
+    });
     
     // 4. Save to clipboard directory
     const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
