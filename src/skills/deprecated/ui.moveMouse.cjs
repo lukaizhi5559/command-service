@@ -138,7 +138,7 @@ async function captureScreenshot() {
 
 async function getWindowContext() {
   try {
-    const { activeWindow } = await import('active-win');
+    const { activeWindow } = await import('get-windows');
     const win = await activeWindow();
     return {
       windowTitle: win?.title || '',

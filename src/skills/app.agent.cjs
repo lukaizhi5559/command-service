@@ -419,20 +419,193 @@ async function actionCaptureScreen() {
 }
 
 /**
- * Get bounds of the current foreground app window using active-win.
+ * Get bounds of the current foreground app window using get-windows.
  * Must be called BEFORE hiding our own overlay, because the overlay may steal focus.
+ *
+ * Uses get-windows (the maintained successor to the deprecated active-win, same
+ * library used by screen-intelligence-service and thinkdrop-user-memory-service).
  */
 async function _getActiveAppBounds() {
+  const startTime = Date.now();
   try {
-    const { activeWindow } = await import('active-win');
-    const win = await activeWindow();
-    if (win?.bounds) {
-      return { ...win.bounds, appName: win.owner?.name || '' };
+    logger.debug(`[app.agent] _getActiveAppBounds: starting get-windows check`);
+    
+    const { activeWindow } = await import('get-windows');
+    const timeoutPromise = new Promise((_, reject) => {
+      setTimeout(() => reject(new Error('get-windows timeout after 3000ms')), 3000);
+    });
+    
+    const win = await Promise.race([
+      activeWindow(),
+      timeoutPromise
+    ]);
+    
+    const elapsed = Date.now() - startTime;
+    
+    if (win?.bounds && (win.bounds.width > 0 || win.bounds.height > 0)) {
+      const result = { ...win.bounds, appName: win.owner?.name || 'unknown', source: 'get-windows' };
+      logger.debug(`[app.agent] _getActiveAppBounds: success - appName: "${result.appName}", bounds: ${JSON.stringify({ x: result.x, y: result.y, width: result.width, height: result.height })}, source: get-windows, elapsed: ${elapsed}ms`);
+      return result;
+    } else {
+      logger.warn(`[app.agent] _getActiveAppBounds: no usable bounds returned - win: ${JSON.stringify(win)}, elapsed: ${elapsed}ms`);
+      // Fall through to AppleScript / boundary-scan via the catch's darwin path
+      const appName = win?.owner?.name || null;
+      if (process.platform === 'darwin') {
+        return await _macFallbackBounds(appName);
+      }
+      return null;
     }
   } catch (err) {
-    logger.debug(`[app.agent] _getActiveAppBounds failed: ${err.message}`);
+    const elapsed = Date.now() - startTime;
+    logger.error(`[app.agent] _getActiveAppBounds failed after ${elapsed}ms: ${err.message}`);
+    
+    // Try alternative methods on macOS if active-win fails
+    if (process.platform === 'darwin') {
+      return await _macFallbackBounds(null);
+    }
+    
+    return null;
   }
+}
+
+/**
+ * macOS bounds fallback chain, used when active-win is unavailable or returns
+ * zero-size bounds. Order:
+ *   1. AppleScript (System Events) — fast, works for apps that expose window bounds.
+ *   2. Boundary-scan — derive {x,y,width,height} from the OCR region scan when
+ *      AppleScript returns 0,0,0,0 (e.g. borderless/Electron apps like Devin).
+ *
+ * @param {string|null} knownAppName - app name already detected by active-win, if any.
+ * @returns {Promise<Object|null>} bounds with appName + source, or null.
+ */
+async function _macFallbackBounds(knownAppName) {
+  // 1. AppleScript bounds
+  let appName = knownAppName || null;
+  try {
+    logger.debug(`[app.agent] _macFallbackBounds: trying macOS AppleScript`);
+    const { execSync } = require('child_process');
+    const script = `
+      tell application "System Events"
+        set frontApp to first application process whose frontmost is true
+        set appName to name of frontApp
+        try
+          set windowBounds to bounds of front window of frontApp
+          return appName & "," & item 1 of windowBounds & "," & item 2 of windowBounds & "," & item 3 of windowBounds & "," & item 4 of windowBounds
+        on error
+          return appName & ",0,0,0,0"
+        end try
+      end tell
+    `;
+
+    const result = execSync(`osascript -e '${script.replace(/'/g, "\\'")}'`, {
+      encoding: 'utf8',
+      timeout: 2000
+    }).trim();
+
+    const [asAppName, x, y, width, height] = result.split(',').map(s => s.trim());
+    appName = asAppName || appName;
+    const w = parseInt(width) || 0;
+    const h = parseInt(height) || 0;
+
+    if (w > 0 && h > 0) {
+      logger.info(`[app.agent] _macFallbackBounds: AppleScript succeeded - appName: "${appName}", bounds: ${x},${y},${w},${h}, source: applescript`);
+      return {
+        x: parseInt(x) || 0,
+        y: parseInt(y) || 0,
+        width: w,
+        height: h,
+        appName: appName || 'unknown',
+        source: 'applescript'
+      };
+    }
+    logger.info(`[app.agent] _macFallbackBounds: AppleScript returned no usable bounds for "${appName}" — trying boundary scan`);
+  } catch (appleScriptErr) {
+    logger.debug(`[app.agent] _macFallbackBounds: AppleScript failed: ${appleScriptErr.message}`);
+  }
+
+  // 2. Boundary-scan derived bounds (no native deps)
+  try {
+    const derived = await _deriveBoundsFromScan(appName);
+    if (derived) return derived;
+  } catch (scanErr) {
+    logger.debug(`[app.agent] _macFallbackBounds: boundary scan failed: ${scanErr.message}`);
+  }
+
   return null;
+}
+
+/**
+ * Derive approximate window bounds from the on-screen OCR region scan when
+ * neither active-win nor AppleScript can supply them. Reuses the existing
+ * screenshot → mergeCloseBoxes → _scoreBoundariesForMain pipeline and returns
+ * the union bounding box of the top-scored main region(s).
+ *
+ * Results are cached via _storeBoundaryCache (5-min TTL) and looked up via
+ * _findBoundaryCacheEntry to avoid re-scanning on every call.
+ *
+ * @param {string|null} appName
+ * @returns {Promise<Object|null>} { x, y, width, height, appName, source: 'boundary-scan'|'cache' }
+ */
+async function _deriveBoundsFromScan(appName) {
+  // Reuse a recent cached scan for this app if available.
+  if (appName) {
+    const cached = _findBoundaryCacheEntry(appName);
+    if (cached?.appBounds && cached.appBounds.width > 0 && cached.appBounds.height > 0) {
+      logger.info(`[app.agent] _deriveBoundsFromScan: using cached bounds for "${appName}": ${JSON.stringify(cached.appBounds)}, source: cache`);
+      return { ...cached.appBounds, appName, source: 'cache' };
+    }
+  }
+
+  const category = appName ? (KNOWN_APPS[appName] || 'other') : 'other';
+
+  let parseResult, screenDims;
+  await _withCaptureWindow(async () => {
+    const captureResult = await actionCaptureScreen();
+    screenDims = captureResult.ok ? _getScreenDimsFromScreenshot(captureResult.path) : { width: 1440, height: 900 };
+    parseResult = await actionParseScreenshot({ screenshotPath: captureResult.ok ? captureResult.path : undefined });
+  });
+
+  if (!parseResult?.ok || !Array.isArray(parseResult.textItems) || parseResult.textItems.length === 0) {
+    logger.debug(`[app.agent] _deriveBoundsFromScan: no text items to derive bounds from`);
+    return null;
+  }
+
+  const boundaries = mergeCloseBoxes(parseResult.textItems, { thresholdX: 50, thresholdY: 25, minItems: 3 });
+  if (!boundaries.length) return null;
+
+  // Score regions and keep the main, non-floating ones. Fall back to the
+  // largest region if scoring yields nothing.
+  const scored = _scoreBoundariesForMain(boundaries, category, screenDims.width, screenDims.height, null)
+    .filter(b => b.isMain && !b.isFloating);
+  const regions = scored.length
+    ? scored.sort((a, z) => z.score - a.score).slice(0, 3)
+    : [[...boundaries].sort((a, z) => (z.width * z.height) - (a.width * a.height))[0]];
+
+  // Union bounding box of the selected region(s).
+  let minX = Infinity, minY = Infinity, maxRight = -Infinity, maxBottom = -Infinity;
+  for (const r of regions) {
+    minX = Math.min(minX, r.x);
+    minY = Math.min(minY, r.y);
+    maxRight = Math.max(maxRight, r.x + r.width);
+    maxBottom = Math.max(maxBottom, r.y + r.height);
+  }
+
+  const bounds = {
+    x: Math.max(0, Math.round(minX)),
+    y: Math.max(0, Math.round(minY)),
+    width: Math.round(maxRight - minX),
+    height: Math.round(maxBottom - minY)
+  };
+
+  if (!(bounds.width > 0 && bounds.height > 0)) return null;
+
+  // Cache the full scan + derived bounds for reuse within the TTL.
+  try {
+    _storeBoundaryCache(appName || 'unknown', boundaries, category, screenDims, bounds);
+  } catch (_) { /* non-fatal */ }
+
+  logger.info(`[app.agent] _deriveBoundsFromScan: derived bounds for "${appName || 'unknown'}": ${JSON.stringify(bounds)}, source: boundary-scan`);
+  return { ...bounds, appName: appName || 'unknown', source: 'boundary-scan' };
 }
 
 /**
@@ -454,6 +627,40 @@ async function _withOverlayHidden(fn) {
     return await fn();
   } finally {
     await _post('/overlay/show');
+  }
+}
+
+/**
+ * Graceful capture handshake: instead of a hard overlay hide/show, ask the main
+ * process to fade the ThinkDrop progress "drop" out (and hide the panel), wait
+ * until it confirms the screen is clear, run the screenshot `fn`, then fade the
+ * drop back in. Falls back to the hard _withOverlayHidden if the overlay control
+ * server is unreachable, so captures are never left exposed to overlay taint.
+ */
+async function _withCaptureWindow(fn) {
+  const http = require('http');
+  const port = parseInt(process.env.OVERLAY_CONTROL_PORT || '3010', 10);
+  const _post = (path, timeoutMs) => new Promise((resolve) => {
+    let done = false;
+    const finish = (ok) => { if (!done) { done = true; resolve(ok); } };
+    const req = http.request({ hostname: '127.0.0.1', port, path, method: 'POST' }, () => finish(true));
+    req.on('error', () => finish(false));
+    req.end();
+    setTimeout(() => finish(false), timeoutMs);
+  });
+
+  // capture-begin resolves once the drop has faded out (renderer handshake) or
+  // after the main process's ~700ms fallback; allow headroom before giving up.
+  const beganOk = await _post('/overlay/capture-begin', 1500);
+  if (!beganOk) {
+    logger.warn('[app.agent] _withCaptureWindow: capture-begin unreachable — falling back to hard overlay hide');
+    return _withOverlayHidden(fn);
+  }
+
+  try {
+    return await fn();
+  } finally {
+    await _post('/overlay/capture-end', 800);
   }
 }
 
@@ -917,6 +1124,53 @@ async function _sendHighlightToOverlay(data) {
     req.write(payload);
     req.end();
   });
+}
+
+/**
+ * Draw a visible border around the currently focused app window.
+ * Useful during app.agent steps so the user can see which app is being targeted.
+ */
+async function actionHighlightAppBoundary({ appName, color = '#ffaa00', label } = {}) {
+  const bounds = await _getActiveAppBounds().catch(() => null);
+  if (!bounds) {
+    logger.debug('[app.agent] Cannot highlight app boundary — no active window bounds');
+    return { ok: false, error: 'No active window bounds' };
+  }
+  const el = {
+    x: bounds.x,
+    y: bounds.y,
+    width: bounds.width,
+    height: bounds.height,
+    label: label || bounds.appName || appName || 'active app',
+    color
+  };
+  return actionHighlightElements({ elements: [el], duration: 0, color });
+}
+
+/**
+ * Return the bounds + name of the currently focused (front) app window.
+ * Screenshot-free (uses get-windows / AppleScript fallback) so main.js can draw
+ * a persistent session boundary without tainting OCR. Fast — no OCR.
+ */
+async function actionGetActiveBounds() {
+  const bounds = await _getActiveAppBounds().catch(() => null);
+  if (!bounds || !(bounds.width > 0 && bounds.height > 0)) {
+    return { ok: false, error: 'No active window bounds' };
+  }
+  return { ok: true, bounds };
+}
+
+/**
+ * Clear the app boundary highlight from the overlay.
+ */
+async function actionClearAppBoundary() {
+  try {
+    await sendOverlayIpc({ type: 'clear' });
+    return { ok: true };
+  } catch (error) {
+    logger.debug(`[app.agent] Clear app boundary failed: ${error.message}`);
+    return { ok: false, error: error.message };
+  }
 }
 
 /**
@@ -2704,7 +2958,7 @@ const { ask: skillLlmAsk } = require('../skill-helpers/skill-llm.cjs');
 const webAgent = require('./web.agent.cjs');
 const { webCrawl } = require('./web.crawl.cjs');
 
-const VALID_CATEGORIES = ['browser', 'editor', 'chat', 'design', 'terminal', 'email', 'other'];
+const VALID_CATEGORIES = ['browser', 'editor', 'chat', 'design', 'terminal', 'email', 'document', 'other'];
 
 /**
  * Resolve any caller-supplied category string to one of the valid CATEGORY_SCHEMAS keys.
@@ -2778,7 +3032,23 @@ const KNOWN_APPS = {
   'Hyper': 'terminal',
   'Mail': 'email',
   'Microsoft Outlook': 'email',
-  'Spark': 'email'
+  'Spark': 'email',
+  'Microsoft Word': 'document',
+  'Word': 'document',
+  'Pages': 'document',
+  'Google Docs': 'document',
+  'Writer': 'document',
+  'LibreOffice Writer': 'document'
+};
+
+const CATEGORY_SCROLL_DEFAULTS = {
+  editor: 'up',
+  chat: 'up',
+  terminal: 'up',
+  email: 'down',
+  design: 'down',
+  document: 'down',
+  other: 'down'
 };
 
 const CATEGORY_SCHEMAS = {
@@ -2925,6 +3195,25 @@ const CATEGORY_SCHEMAS = {
       return { type: 'reading_pane', confidence: 0.8 };
     },
     clipboardBehavior: { cmdA: 'select_all_messages', extractionStrategy: 'Focus reading pane then Cmd+A' },
+    monitoringModes: ['passive'],
+    universalFind: 'Cmd+F'
+  },
+  document: {
+    regions: {
+      toolbar: { x: [0, 1280], y: [0, 80], type: 'toolbar' },
+      document: { x: [120, 1160], y: [80, 800], type: 'document_content' }
+    },
+    inferBoundaryType: (width, height, x, y, appBounds) => {
+      if (appBounds) {
+        const relY = y - appBounds.y;
+        const ah = appBounds.height;
+        if (relY / ah < 0.12) return { type: 'toolbar', confidence: 0.85 };
+        return { type: 'document_content', confidence: 0.8 };
+      }
+      if (y < 80) return { type: 'toolbar', confidence: 0.85 };
+      return { type: 'document_content', confidence: 0.8 };
+    },
+    clipboardBehavior: { cmdA: 'select_all_document', extractionStrategy: 'Cmd+A then Cmd+C' },
     monitoringModes: ['passive'],
     universalFind: 'Cmd+F'
   },
@@ -3235,7 +3524,7 @@ async function enrichAppContext({ appName, category: callerCategory, background 
 
     // 2. Capture screen + parse with our overlay hidden so ThinkDrop doesn't appear in the screenshot
     let captureResult, screenDims;
-    await _withOverlayHidden(async () => {
+    await _withCaptureWindow(async () => {
       captureResult = await actionCaptureScreen();
       screenDims = captureResult.ok ? _getScreenDimsFromScreenshot(captureResult.path) : { width: 1440, height: 900 };
     });
@@ -3244,7 +3533,7 @@ async function enrichAppContext({ appName, category: callerCategory, background 
     let boundaries = getBoundariesFromCache(appName, screenDims);
     if (!boundaries) {
       let parseResult;
-      await _withOverlayHidden(async () => {
+      await _withCaptureWindow(async () => {
         parseResult = await actionParseScreenshot({ screenshotPath: captureResult.ok ? captureResult.path : undefined });
       });
       if (parseResult.ok && parseResult.textItems && parseResult.textItems.length > 0) {
@@ -3304,7 +3593,7 @@ const MEMORY_PORT = parseInt(process.env.MEMORY_SERVICE_PORT || '3001', 10);
 const MEMORY_HOST = process.env.MEMORY_SERVICE_HOST || '127.0.0.1';
 const MEMORY_API_KEY = process.env.MCP_USER_MEMORY_API_KEY || process.env.USER_MEMORY_API_KEY || '';
 
-async function getRecentOCR({ maxAgeSeconds = 3, appName: targetApp = null } = {}) {
+async function getRecentOCR({ maxAgeSeconds = 3, appName: targetApp = null, liveOverlayHidden = false } = {}) {
   const _appMatches = (a, b) => {
     if (!a || !b) return false;
     const al = a.toLowerCase();
@@ -3357,10 +3646,14 @@ async function getRecentOCR({ maxAgeSeconds = 3, appName: targetApp = null } = {
   // fall back to a live screen capture so we always get the correct app's content.
   const _needsLiveFallback = targetApp && (!dbResult.appName || !_appMatches(dbResult.appName, targetApp));
   if (_needsLiveFallback) {
-    logger.info(`[app.agent] getRecentOCR: DB has "${dbResult.appName}" but target is "${targetApp}" — falling back to live screen capture`);
+    logger.info(`[app.agent] getRecentOCR: DB has "${dbResult.appName}" but target is "${targetApp}" — falling back to live screen capture${liveOverlayHidden ? ' (overlay hidden)' : ''}`);
     try {
       const { screenCapture } = require('./screen.capture.cjs');
-      const live = await screenCapture({});
+      // When requested (e.g. by the monitor), hide the ThinkDrop overlay during
+      // the capture so its UI text doesn't taint the OCR and misreport the app.
+      const live = liveOverlayHidden
+        ? await _withCaptureWindow(() => screenCapture({}))
+        : await screenCapture({});
       if (live.success && live.text) {
         return {
           text: live.text,
@@ -3408,9 +3701,22 @@ function _deduplicateScrollJournal(journal, finalText) {
   return lines.join('\n').slice(0, _MAX_ACCUMULATED_CHARS);
 }
 
-async function _sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
+async function _sleep(ms, signal) {
+  return new Promise((resolve) => {
+    if (signal?.aborted) return resolve();
+    const t = setTimeout(() => {
+      if (signal) { try { signal.removeEventListener('abort', onAbort); } catch (_) {} }
+      resolve();
+    }, ms);
+    const onAbort = () => { clearTimeout(t); resolve(); };
+    if (signal) signal.addEventListener('abort', onAbort, { once: true });
+  });
 }
+
+// Single-flight monitor registry — only one monitor loop may run at a time.
+// recoverSkill retries / concurrent calls would otherwise spawn parallel loops
+// that keep capturing the screen after the UI already moved on.
+let _activeMonitorController = null;
 
 /**
  * Ask the LLM whether the content that appeared after a scroll is semantically
@@ -3488,13 +3794,15 @@ async function _probeBoundaryForScroll(cx, cy, direction, nut, purposeStatement)
 async function actionPreScrollPlan({ goal, appName, category, maxScrolls }) {
   try {
     const currentOCR = await getRecentOCR();
+    const defaultDirection = CATEGORY_SCROLL_DEFAULTS[category] || 'down';
     const prompt = `
 User goal: "${goal}"
 App: ${appName} (category: ${category})
+Default scroll direction for this category: ${defaultDirection}
 Current screen OCR: ${(currentOCR.text || '').slice(0, 600)}
 
 Think like a human. Determine:
-1. direction: "up" or "down"
+1. direction: "up" or "down". Use the category default above unless the goal explicitly requires the opposite.
 2. scrollMode: "search" (finding specific past content), "ai_response" (waiting for desktop AI), "live_chat" (waiting for human reply), or "passive_read" (consuming document content)
 3. stopKeyword: the specific word, date, or phrase that signals success
 4. purposeStatement: one sentence describing what success looks like
@@ -3504,9 +3812,24 @@ Return JSON only, no markdown fences.`;
 
     const result = await skillLlmAsk(prompt);
     const parsed = JSON.parse(result.replace(/```json|```/g, '').trim());
+
+    let chosenDirection = (parsed.direction || '').toLowerCase();
+    if (chosenDirection !== 'up' && chosenDirection !== 'down') {
+      logger.info(`[app.agent] actionPreScrollPlan: LLM returned invalid direction "${parsed.direction}" — using category default "${defaultDirection}"`);
+      chosenDirection = defaultDirection;
+    }
+
+    // For passive read, strongly enforce the category default so bottom-to-top
+    // apps (chat/editor/terminal) and top-to-bottom apps (email/design/document)
+    // accumulate text in the correct order.
+    if ((parsed.scrollMode || 'passive_read') === 'passive_read' && chosenDirection !== defaultDirection) {
+      logger.info(`[app.agent] actionPreScrollPlan: overriding LLM direction "${chosenDirection}" to category default "${defaultDirection}" for passive_read (category: ${category})`);
+      chosenDirection = defaultDirection;
+    }
+
     return {
       ok: true,
-      direction: parsed.direction || 'down',
+      direction: chosenDirection,
       scrollMode: parsed.scrollMode || 'passive_read',
       stopKeyword: parsed.stopKeyword || '',
       purposeStatement: parsed.purposeStatement || goal,
@@ -3514,7 +3837,7 @@ Return JSON only, no markdown fences.`;
     };
   } catch (err) {
     logger.warn(`[app.agent] actionPreScrollPlan failed: ${err.message}`);
-    return { ok: false, direction: 'down', scrollMode: 'passive_read', stopKeyword: '', purposeStatement: goal, maxScrolls: maxScrolls || 20 };
+    return { ok: false, direction: CATEGORY_SCROLL_DEFAULTS[category] || 'down', scrollMode: 'passive_read', stopKeyword: '', purposeStatement: goal, maxScrolls: maxScrolls || 20 };
   }
 }
 
@@ -4044,6 +4367,7 @@ async function actionLiveChatScroll({ scrollPlan, appName, windowTitle, category
 }
 
 async function actionPassiveReadScroll({ scrollPlan, appName, category }) {
+  const direction = scrollPlan?.direction || CATEGORY_SCROLL_DEFAULTS[category] || 'down';
   const { stopKeyword, purposeStatement, maxScrolls = 30 } = scrollPlan;
   let nut;
   try {
@@ -4072,11 +4396,26 @@ async function actionPassiveReadScroll({ scrollPlan, appName, category }) {
   // Half-window scroll: 1 NutJS scroll unit ≈ 20px at macOS default speed
   const PIXELS_PER_NUT_UNIT = 20;
   const scrollStep = Math.max(3, Math.round((windowHeight / 2) / PIXELS_PER_NUT_UNIT));
-  logger.info(`[app.agent] actionPassiveReadScroll: scrollStep=${scrollStep} NutJS units (windowHeight=${windowHeight}px)`);
+  logger.info(`[app.agent] actionPassiveReadScroll: direction=${direction}, scrollStep=${scrollStep} NutJS units (windowHeight=${windowHeight}px)`);
 
   const mainRegion = inferMainRegion(boundaries, category, liveAppBounds, cacheEntry?.screenWidth || 1440, screenHeight);
   let scrollCount = 0;
   const accumulatedText = [];
+
+  // For bottom-to-top categories, jump to the bottom of the content first so we
+  // start with the newest text and accumulate history as we scroll up.
+  if (direction === 'up' && appName) {
+    try {
+      logger.info(`[app.agent] actionPassiveReadScroll: jumping to bottom of ${appName} before scrolling up`);
+      let jump = await actionExecuteShortcut({ appName, shortcutOverride: 'Cmd+End', skipFocusCheck: true });
+      if (!jump.ok) {
+        jump = await actionExecuteShortcut({ appName, shortcutOverride: 'Ctrl+End', skipFocusCheck: true });
+      }
+      await _sleep(jump.ok ? 400 : 200);
+    } catch (err) {
+      logger.warn(`[app.agent] actionPassiveReadScroll: jump-to-bottom failed (${err.message}), continuing from current position`);
+    }
+  }
 
   try {
     await nut.mouse.move([{ x: mainRegion.centerX, y: mainRegion.centerY }]);
@@ -4097,13 +4436,18 @@ async function actionPassiveReadScroll({ scrollPlan, appName, category }) {
     if (currentText) accumulatedText.push(currentText);
 
     if (stopKeyword && currentText.toLowerCase().includes(stopKeyword.toLowerCase())) {
-      return { ok: true, found: true, stopReason: 'keyword_found', scrolls: scrollCount, text: accumulatedText.join('\n') };
+      const resultText = accumulatedText.join('\n');
+      return { ok: true, found: true, stopReason: 'keyword_found', scrolls: scrollCount, text: resultText, accumulatedText: resultText };
     }
 
     const topWordsBefore = currentText.split(/\s+/).slice(0, 5);
 
     try {
-      await nut.mouse.scrollDown(scrollStep);
+      if (direction === 'up') {
+        await nut.mouse.scrollUp(scrollStep);
+      } else {
+        await nut.mouse.scrollDown(scrollStep);
+      }
       await _sleep(700);
     } catch (_) {}
     scrollCount++;
@@ -4113,11 +4457,13 @@ async function actionPassiveReadScroll({ scrollPlan, appName, category }) {
     const scrollOccurred = topWordsBefore.some(w => w.length > 3 && !topWordsAfter.includes(w));
 
     if (!scrollOccurred && scrollCount > 2) {
-      return { ok: true, found: false, stopReason: 'end_of_content', scrolls: scrollCount, text: accumulatedText.join('\n') };
+      const resultText = accumulatedText.join('\n');
+      return { ok: true, found: false, stopReason: 'end_of_content', scrolls: scrollCount, text: resultText, accumulatedText: resultText };
     }
   }
 
-  return { ok: true, found: false, stopReason: 'max_scrolls_exhausted', scrolls: scrollCount, text: accumulatedText.join('\n') };
+  const resultText = accumulatedText.join('\n');
+  return { ok: true, found: false, stopReason: 'max_scrolls_exhausted', scrolls: scrollCount, text: resultText, accumulatedText: resultText };
 }
 
 async function actionTeleportToElement({ searchText, followWithTab = false }) {
@@ -4164,6 +4510,187 @@ async function actionTeleportToElement({ searchText, followWithTab = false }) {
   };
 }
 
+async function actionSearchAndClick({ searchText, appName, category, maxMatches = 5, fallbackToMouse = true }) {
+  let nut;
+  try {
+    nut = require('@nut-tree-fork/nut-js');
+  } catch (err) {
+    return { ok: false, error: 'NutJS unavailable: ' + err.message };
+  }
+
+  if (!searchText) {
+    return { ok: false, error: 'searchText is required' };
+  }
+
+  if (category && category !== 'browser') {
+    logger.warn(`[app.agent] search_and_click is designed for browser category; received category=${category}. Proceeding with caution.`);
+  }
+
+  if (appName) {
+    const focus = await verifyAppFocused({ appName, waitMs: 5000 });
+    if (!focus.focused) {
+      return { ok: false, error: `App "${appName}" could not be focused` };
+    }
+  }
+
+  // Capture a fresh baseline before any UI interaction so we compare against
+  // the real screen state, not a stale DB cache. Hide the ThinkDrop overlay
+  // so its own UI text doesn't taint the OCR comparison.
+  const _captureFreshOCR = async () => {
+    const { screenCapture } = require('./screen.capture.cjs');
+    const live = await _withCaptureWindow(() => screenCapture({}));
+    if (live.success && live.text) {
+      return {
+        text: live.text,
+        appName: live.appName || appName || null,
+        windowTitle: live.windowTitle || null,
+        timestamp: new Date().toISOString(),
+        available: true,
+        source: 'live'
+      };
+    }
+    return getRecentOCR({ appName, liveOverlayHidden: true });
+  };
+
+  const baselineOCR = await _captureFreshOCR();
+  const baselineText = baselineOCR.text || '';
+  logger.info(`[app.agent] search_and_click: baseline captured (${baselineText.length} chars, source: ${baselineOCR.source || 'unknown'})`);
+
+  const _normalized = (text) => (text || '').toLowerCase().replace(/\s+/g, ' ').trim();
+
+  // Compare post-click OCR against the baseline. A successful click opens new
+  // UI content, which shows up as: (1) a remainder of >=10 chars, and (2) at least
+  // one new meaningful word not present in the baseline.
+  const _detectStateChangeAgainstBaseline = async (afterTextRaw) => {
+    const afterText = afterTextRaw || '';
+    const baselineNorm = _normalized(baselineText);
+    const afterNorm = _normalized(afterText);
+
+    if (baselineNorm === afterNorm) {
+      return { changed: false, afterText, reason: 'identical_to_baseline' };
+    }
+
+    const charDiff = Math.abs(baselineNorm.length - afterNorm.length);
+    if (charDiff < 10) {
+      return { changed: false, afterText, reason: 'char_diff_below_threshold' };
+    }
+
+    // Look for new meaningful words (>3 chars, containing at least one letter).
+    const baselineWords = new Set(
+      baselineNorm.split(/\s+/).filter(w => w.length > 3 && /[a-z]/.test(w))
+    );
+    const afterWords = afterNorm.split(/\s+/).filter(w => w.length > 3 && /[a-z]/.test(w));
+    const newWords = afterWords.filter(w => !baselineWords.has(w));
+
+    if (newWords.length === 0) {
+      return { changed: false, afterText, reason: 'no_new_meaningful_words' };
+    }
+
+    return { changed: true, afterText, newWords };
+  };
+
+  try {
+    const { Key } = nut;
+
+    // Open browser find bar and type the search text.
+    await nut.keyboard.pressKey(Key.LeftSuper, Key.F);
+    await nut.keyboard.releaseKey(Key.LeftSuper, Key.F);
+    await _sleep(500);
+
+    await nut.keyboard.type(searchText);
+    await _sleep(500);
+
+    // Cycle through find-bar matches.
+    for (let matchIndex = 1; matchIndex <= maxMatches; matchIndex++) {
+      logger.info(`[app.agent] search_and_click: trying match ${matchIndex}/${maxMatches}`);
+
+      // Select the next match.
+      await nut.keyboard.pressKey(Key.Enter);
+      await nut.keyboard.releaseKey(Key.Enter);
+      await _sleep(200);
+
+      // Close the find bar while keeping the page highlight.
+      await nut.keyboard.pressKey(Key.Escape);
+      await nut.keyboard.releaseKey(Key.Escape);
+      await _sleep(300);
+
+      // Activate the highlighted element (link/button).
+      await nut.keyboard.pressKey(Key.Enter);
+      await nut.keyboard.releaseKey(Key.Enter);
+      await _sleep(800);
+
+      const afterClick = await _captureFreshOCR();
+      const result = await _detectStateChangeAgainstBaseline(afterClick.text);
+      logger.info(`[app.agent] search_and_click: match ${matchIndex} state change=${result.changed}${result.reason ? ` (${result.reason})` : ''}`);
+      if (result.changed) {
+        return { ok: true, matchIndex, method: 'find_bar_enter', stateChanged: true, afterText: result.afterText.slice(0, 200) };
+      }
+
+      // Reopen the find bar for the next match if there are more attempts.
+      if (matchIndex < maxMatches) {
+        await nut.keyboard.pressKey(Key.LeftSuper, Key.F);
+        await nut.keyboard.releaseKey(Key.LeftSuper, Key.F);
+        await _sleep(300);
+      }
+    }
+
+    // Ensure the find bar is closed.
+    await nut.keyboard.pressKey(Key.Escape);
+    await nut.keyboard.releaseKey(Key.Escape);
+    await _sleep(200);
+  } catch (err) {
+    return { ok: false, error: `Keyboard error during search_and_click: ${err.message}` };
+  }
+
+  // Fallback: low-level mouse move + click based on OCR coordinates.
+  if (fallbackToMouse) {
+    logger.info(`[app.agent] search_and_click: keyboard path failed after ${maxMatches} matches, trying mouse fallback`);
+    try {
+      const parseResult = await _withCaptureWindow(() => actionParseScreenshot({}));
+      if (!parseResult.ok || !parseResult.textItems || parseResult.textItems.length === 0) {
+        return { ok: false, error: 'Keyboard path failed and no OCR text items available for mouse fallback' };
+      }
+
+      const findResult = await actionFindElements({ searchText, textItems: parseResult.textItems });
+      if (!findResult.ok || findResult.matches.length === 0) {
+        return { ok: false, error: 'Keyboard path failed and no OCR match found for mouse fallback' };
+      }
+
+      for (let matchIndex = 0; matchIndex < findResult.matches.length; matchIndex++) {
+        const match = findResult.matches[matchIndex];
+        const centerX = Math.round(match.x + (match.width || 0) / 2);
+        const centerY = Math.round(match.y + (match.height || 0) / 2);
+
+        logger.info(`[app.agent] search_and_click: mouse fallback trying match ${matchIndex + 1}/${findResult.matches.length} at (${centerX}, ${centerY})`);
+        await nut.mouse.move([{ x: centerX, y: centerY }]);
+        await _sleep(200);
+        await nut.mouse.leftClick();
+        await _sleep(800);
+
+        const afterMouse = await _captureFreshOCR();
+        const mouseResult = await _detectStateChangeAgainstBaseline(afterMouse.text);
+        logger.info(`[app.agent] search_and_click: mouse fallback match ${matchIndex + 1} state change=${mouseResult.changed}${mouseResult.reason ? ` (${mouseResult.reason})` : ''}`);
+        if (mouseResult.changed) {
+          return {
+            ok: true,
+            matchIndex: matchIndex + 1,
+            method: 'mouse_click',
+            stateChanged: true,
+            afterText: mouseResult.afterText.slice(0, 200),
+            fallbackFrom: 'find_bar_enter'
+          };
+        }
+      }
+
+      return { ok: false, error: 'No mouse click produced a detectable screen change' };
+    } catch (mouseErr) {
+      return { ok: false, error: `Keyboard path failed; mouse fallback error: ${mouseErr.message}` };
+    }
+  }
+
+  return { ok: false, error: 'No search match produced a state change' };
+}
+
 // ---------------------------------------------------------------------------
 // Phase 3: Semantic Embedding Helpers
 // ---------------------------------------------------------------------------
@@ -4207,19 +4734,103 @@ function computeSimpleEmbedding(text, dims = 128) {
   return norm > 0 ? vector.map(v => v / norm) : vector;
 }
 
-async function actionMonitorWithBackoff({ goal, mode = 'passive', maxDurationMs = 300000, appName, useSemanticComparison = true }) {
+async function actionMonitorWithBackoff({ goal, mode = 'passive', maxDurationMs = 300000, appName, useSemanticComparison = true, signal = null }) {
+  // ── Single-flight: abort any monitor still running before starting a new one.
+  // Guarantees only one loop captures the screen even if a socket 'close' was
+  // missed or recoverSkill relaunched a monitor concurrently.
+  if (_activeMonitorController) {
+    try { _activeMonitorController.abort(); } catch (_) {}
+    logger.warn('[app.agent] Monitor: aborting previous in-flight monitor before starting new one');
+  }
+  const controller = new AbortController();
+  _activeMonitorController = controller;
+  // Link the incoming HTTP signal so a client timeout (socket destroy) aborts us.
+  if (signal) {
+    if (signal.aborted) controller.abort();
+    else signal.addEventListener('abort', () => { try { controller.abort(); } catch (_) {} }, { once: true });
+  }
+  const monitorSignal = controller.signal;
+
+  try {
   const startTime = Date.now();
-  let baseline = await getRecentOCR();
+  let baseline = await getRecentOCR({ appName, liveOverlayHidden: true });
   let checkInterval = 10000;
   let llmCalls = 0;
   const MAX_LLM_CALLS = 20; // Phase 3 success criteria: <20 LLM calls for 10-min tasks
+  let focusCheckCount = 0;
+  const FOCUS_CHECK_INTERVAL = 3; // Check focus every 3rd iteration
 
   // Compute baseline embedding
   let baselineEmbedding = useSemanticComparison ? computeSimpleEmbedding(baseline.text) : null;
 
-  while (Date.now() - startTime < maxDurationMs) {
-    await _sleep(checkInterval);
-    const current = await getRecentOCR();
+  // Stability-as-completion state. For "wait until the AI finishes responding"
+  // goals the DONE signal is the screen going *stable*, not changing — so we
+  // must trigger a completion check on stability, not back off forever.
+  let stableCount = 0;
+  let sawProgress = false;
+  const STABLE_POLLS_FOR_COMPLETION = 2;
+
+  // Live-UI tolerance: agents like Devin keep spinners/elapsed-timers ticking, so
+  // OCR similarity rarely hits 0.95 even when the answer is done. Treat similarity
+  // above a slightly lower threshold as "settled" so jitter doesn't block forever.
+  const CHANGE_THRESHOLD = 0.90;
+
+  // Time-cadence completion check: regardless of change/stability, ask the LLM
+  // "has it finished?" every ~35s (still capped by MAX_LLM_CALLS). This catches
+  // done-states that never go fully stable because of animated UI.
+  const LLM_CADENCE_MS = 35000;
+  let lastLlmCheckTime = 0;
+
+  // Concrete completion cues for the LLM — concise, agent-agnostic but tuned for
+  // assistant/agent UIs (Devin, ChatGPT, etc.).
+  const COMPLETION_CUES = `Signals the task is FINISHED: the input box is ready/enabled again, there is NO "thinking"/"working"/"running"/"generating" spinner or progress indicator, no elapsed/“running for …” timer is still counting, and a complete answer or result block is present. Signals it is STILL PENDING: a spinner, a "Stop"/"Cancel" button, streaming text, or a live elapsed timer.`;
+
+  // Each OCR capture can take 10–14s (OmniParser), so a too-small caller timeout
+  // (e.g. a 20s step timeout) would fire before even one poll completes. Enforce
+  // a floor so the monitor always gets enough wall-clock to observe completion.
+  const MIN_MONITOR_DURATION_MS = 180000; // 3 min
+  const effectiveMaxDuration = Math.max(Number(maxDurationMs) || 0, MIN_MONITOR_DURATION_MS);
+
+  while (Date.now() - startTime < effectiveMaxDuration) {
+    if (monitorSignal.aborted) {
+      logger.info('[app.agent] Monitor: aborted (client disconnected / superseded) — stopping loop');
+      return { ok: false, aborted: true, llmCalls, elapsed: Date.now() - startTime };
+    }
+    await _sleep(checkInterval, monitorSignal);
+    if (monitorSignal.aborted) {
+      logger.info('[app.agent] Monitor: aborted during sleep — stopping loop');
+      return { ok: false, aborted: true, llmCalls, elapsed: Date.now() - startTime };
+    }
+    focusCheckCount++;
+    
+    // Periodically verify app focus if appName is provided
+    if (appName && focusCheckCount % FOCUS_CHECK_INTERVAL === 0) {
+      logger.debug(`[app.agent] actionMonitorWithBackoff: checking focus for "${appName}" (check #${focusCheckCount})`);
+      const focusResult = await verifyAppFocused({ appName, waitMs: 2000 });
+      
+      if (!focusResult.focused) {
+        logger.warn(`[app.agent] actionMonitorWithBackoff: app "${appName}" lost focus (detected: "${focusResult.appName}"), attempting to refocus`);
+        
+        // Try to refocus the app
+        try {
+          const { execSync } = require('child_process');
+          execSync(`open -a "${appName}"`, { timeout: 3000 });
+          await _sleep(1000); // Give it time to focus
+          
+          // Verify refocus was successful
+          const refocusResult = await verifyAppFocused({ appName, waitMs: 2000 });
+          if (refocusResult.focused) {
+            logger.info(`[app.agent] actionMonitorWithBackoff: successfully refocused "${appName}"`);
+          } else {
+            logger.warn(`[app.agent] actionMonitorWithBackoff: failed to refocus "${appName}" (still: "${refocusResult.appName}")`);
+          }
+        } catch (err) {
+          logger.error(`[app.agent] actionMonitorWithBackoff: error trying to refocus "${appName}": ${err.message}`);
+        }
+      }
+    }
+    
+    const current = await getRecentOCR({ appName, liveOverlayHidden: true });
 
     if (!current.text) {
       checkInterval = mode === 'active'
@@ -4228,28 +4839,106 @@ async function actionMonitorWithBackoff({ goal, mode = 'passive', maxDurationMs 
       continue;
     }
 
-    // Phase 3: Semantic early-exit to save LLM calls
+    // ── Time-cadence completion check ──────────────────────────────────────
+    // Live-UI agents (Devin etc.) keep animating, so neither the change nor the
+    // stability path may ever fire a completion check. Independently of those,
+    // ask "is it finished?" every ~35s (capped by MAX_LLM_CALLS) so a done-state
+    // hidden behind a ticking timer is still detected before timeout.
+    if (sawProgress && llmCalls < MAX_LLM_CALLS && (Date.now() - lastLlmCheckTime) >= LLM_CADENCE_MS) {
+      lastLlmCheckTime = Date.now();
+      try {
+        llmCalls++;
+        const result = await skillLlmAsk(`
+You are monitoring app "${appName || 'unknown'}" to determine if a long-running task has finished.
+Goal: ${goal}
+
+${COMPLETION_CUES}
+
+Current screen:
+${current.text.slice(0, 1800)}
+
+Return JSON: { "status": "complete|pending|error", "summary": "..." }`);
+        let parsed;
+        try { parsed = JSON.parse(result.replace(/```json|```/g, '').trim()); }
+        catch (_) { parsed = { status: 'pending', summary: 'cadence check unparseable' }; }
+        if (parsed.status === 'complete') {
+          logger.info(`[app.agent] Monitor: cadence completion confirmed — ${parsed.summary}`);
+          return { ok: true, summary: parsed.summary, llmCalls, elapsed: Date.now() - startTime };
+        }
+        if (parsed.status === 'error') {
+          return { ok: false, error: parsed.summary, llmCalls, elapsed: Date.now() - startTime };
+        }
+      } catch (_) {}
+      if (monitorSignal.aborted) {
+        return { ok: false, aborted: true, llmCalls, elapsed: Date.now() - startTime };
+      }
+    }
+
+    // Did the screen change meaningfully since the last baseline?
+    let changed;
     if (useSemanticComparison && baselineEmbedding) {
       const currentEmbedding = computeSimpleEmbedding(current.text);
       const similarity = cosineSimilarity(baselineEmbedding, currentEmbedding);
+      changed = similarity <= CHANGE_THRESHOLD;
+      if (changed) baselineEmbedding = currentEmbedding;
+    } else {
+      changed = current.text !== baseline.text;
+    }
 
-      if (similarity > 0.95) {
-        // No meaningful change - increase backoff (skip LLM call)
-        checkInterval = mode === 'active'
-          ? Math.min(checkInterval * 1.2, 30000)
-          : Math.min(checkInterval * 1.5, 60000);
-        continue;
+    if (!changed) {
+      // Screen is STABLE. For "wait until the AI finishes responding" goals this
+      // is the completion signal — not a reason to keep backing off forever (the
+      // old bug: it only ever consulted the LLM on CHANGE, so the stable
+      // end-state was never evaluated → guaranteed timeout). After a couple of
+      // stable polls (and once the response has actually started, i.e. we saw a
+      // change), ask the LLM whether the goal is now complete.
+      stableCount++;
+      const shouldCheckCompletion =
+        stableCount >= STABLE_POLLS_FOR_COMPLETION &&
+        (sawProgress || stableCount >= STABLE_POLLS_FOR_COMPLETION * 2) &&
+        llmCalls < MAX_LLM_CALLS;
+
+      if (shouldCheckCompletion) {
+        stableCount = 0; // reset so we re-accumulate stability before re-checking (rate-limits LLM)
+        lastLlmCheckTime = Date.now(); // count this toward the cadence budget too
+        try {
+          llmCalls++;
+          const result = await skillLlmAsk(`
+The screen for app "${appName || 'unknown'}" has stopped changing.
+Goal: ${goal}
+
+${COMPLETION_CUES}
+
+Current screen:
+${current.text.slice(0, 1800)}
+
+Has the goal been achieved / has the response finished? Or is it still loading, in progress, or showing an error?
+Return JSON: { "status": "complete|pending|error", "summary": "..." }`);
+          let parsed;
+          try { parsed = JSON.parse(result.replace(/```json|```/g, '').trim()); }
+          catch (_) { parsed = { status: 'pending', summary: 'Screen stable but response unparseable' }; }
+
+          if (parsed.status === 'complete') {
+            logger.info(`[app.agent] Monitor: stability completion confirmed — ${parsed.summary}`);
+            return { ok: true, summary: parsed.summary, llmCalls, elapsed: Date.now() - startTime };
+          }
+          if (parsed.status === 'error') {
+            return { ok: false, error: parsed.summary, llmCalls, elapsed: Date.now() - startTime };
+          }
+          logger.debug(`[app.agent] Monitor: screen stable but still pending — ${parsed.summary}`);
+        } catch (_) {}
       }
 
-      // Meaningful change detected - proceed to LLM evaluation
-      baselineEmbedding = currentEmbedding;
-    } else if (current.text === baseline.text) {
-      // Fallback: naive text equality check
+      // Still waiting — back off and keep polling.
       checkInterval = mode === 'active'
         ? Math.min(checkInterval * 1.2, 30000)
         : Math.min(checkInterval * 1.5, 60000);
       continue;
     }
+
+    // Screen changed → the task is actively progressing.
+    sawProgress = true;
+    stableCount = 0;
 
     // Rate limit LLM calls for long-running tasks
     if (llmCalls >= MAX_LLM_CALLS) {
@@ -4298,6 +4987,11 @@ Return JSON: { "status": "complete|progress|error|stalled", "summary": "..." }`)
   }
 
   return { ok: false, error: 'Monitoring timeout', llmCalls, elapsed: Date.now() - startTime };
+  } finally {
+    // Release the single-flight slot only if we still own it (a newer monitor
+    // may have replaced us via the abort-previous path above).
+    if (_activeMonitorController === controller) _activeMonitorController = null;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -4308,7 +5002,7 @@ Return JSON: { "status": "complete|progress|error|stalled", "summary": "..." }`)
  * Monitor for file upload completion.
  * Detects upload progress bars, percentage indicators, and completion messages.
  */
-async function actionMonitorFileUpload({ uploadIndicator, successIndicator, maxDurationMs = 300000, appName }) {
+async function actionMonitorFileUpload({ uploadIndicator, successIndicator, maxDurationMs = 300000, appName, signal = null }) {
   const UPLOAD_KEYWORDS = ['upload', 'uploading', 'progress', '%', 'transfer', 'sent'];
   const COMPLETION_KEYWORDS = ['complete', 'done', 'uploaded', 'finished', 'success', 'checkmark', '✓'];
   const FAILURE_KEYWORDS = ['failed', 'error', 'retry', 'cancelled', 'network error', 'timed out'];
@@ -4317,7 +5011,8 @@ async function actionMonitorFileUpload({ uploadIndicator, successIndicator, maxD
     goal: `Wait for file upload to complete. Current indicator: "${uploadIndicator || 'upload in progress'}". Success indicator: "${successIndicator || 'upload complete'}"`,
     mode: 'active',
     maxDurationMs,
-    appName
+    appName,
+    signal
   });
 }
 
@@ -4419,10 +5114,16 @@ async function verifyAppFocused({ appName, waitMs = 5000 }) {
 
   // Use active-win directly — it's faster than OCR and doesn't capture the
   // ThinkDrop overlay when it's visible.
-  const liveWin = await _getActiveAppBounds().catch(() => null);
+  const liveWin = await _getActiveAppBounds().catch((err) => {
+    logger.debug(`[app.agent] verifyAppFocused: initial _getActiveAppBounds failed: ${err.message}`);
+    return null;
+  });
   const liveAppName = liveWin?.appName || '';
   const OVERLAY_APPS = ['electron', 'thinkdrop'];
   const isOverlayActive = OVERLAY_APPS.some(o => liveAppName.toLowerCase().includes(o));
+
+  const _hasBounds = !!(liveWin && liveWin.width > 0 && liveWin.height > 0);
+  logger.info(`[app.agent] verifyAppFocused: initial check - liveWin: ${liveWin ? JSON.stringify({ appName: liveWin.appName, hasBounds: _hasBounds, source: liveWin.source || 'unknown' }) : 'null'}, isOverlayActive: ${isOverlayActive}`);
 
   if (liveWin && _matches(liveWin.appName, appName)) {
     return { focused: true, appName: liveWin.appName, waited: 0 };
@@ -4440,22 +5141,283 @@ async function verifyAppFocused({ appName, waitMs = 5000 }) {
     }
   }
 
-  try {
+  // Hide the ThinkDrop overlay before trying to bring the target app forward.
+  // If the overlay is visible, macOS keeps our Electron window in the foreground
+  // and active-win reports "unknown" even after open -a, so the shortcut step fails.
+  return _withOverlayHidden(async () => {
     const { execSync } = require('child_process');
-    execSync(`open -a "${appName}"`, { timeout: 3000 });
-  } catch (_) { /* non-fatal */ }
 
-  const pollInterval = 500;
-  while (Date.now() - start < waitMs) {
-    await _sleep(pollInterval);
-    const after = await _getActiveAppBounds().catch(() => null);
-    if (after && _matches(after.appName, appName)) {
-      return { focused: true, appName: after.appName, waited: Date.now() - start };
+    try {
+      execSync(`open -a "${appName}"`, { timeout: 3000 });
+      logger.info(`[app.agent] verifyAppFocused: executed 'open -a "${appName}"'`);
+    } catch (err) {
+      logger.warn(`[app.agent] verifyAppFocused: failed to open app "${appName}": ${err.message}`);
     }
-  }
 
-  const final = await _getActiveAppBounds().catch(() => null);
-  return { focused: false, appName: final?.appName || 'unknown', waited: Date.now() - start };
+    // Give the target app time to gain focus and for active-win to read it.
+    await _sleep(1000);
+
+    // Implement exponential backoff retry logic
+    let retryDelay = 500; // Start with 500ms
+    const maxRetryDelay = 2000; // Cap at 2 seconds
+    let attempts = 0;
+    const maxAttempts = Math.floor(waitMs / 500); // Rough estimate of max attempts
+
+    while (Date.now() - start < waitMs && attempts < maxAttempts) {
+      attempts++;
+      await _sleep(retryDelay);
+      
+      const after = await _getActiveAppBounds().catch((err) => {
+        logger.debug(`[app.agent] verifyAppFocused: attempt ${attempts} - _getActiveAppBounds failed: ${err.message}`);
+        return null;
+      });
+      
+      const detectedAppName = after?.appName || 'unknown';
+      logger.info(`[app.agent] verifyAppFocused: attempt ${attempts}/${maxAttempts} - detected: "${detectedAppName}", expected: "${appName}", delay: ${retryDelay}ms`);
+      
+      if (after && _matches(after.appName, appName)) {
+        logger.info(`[app.agent] verifyAppFocused: SUCCESS - matched "${after.appName}" after ${Date.now() - start}ms`);
+        return { focused: true, appName: after.appName, waited: Date.now() - start, attempts };
+      }
+      
+      // Exponential backoff: double the delay, but don't exceed maxRetryDelay
+      retryDelay = Math.min(retryDelay * 2, maxRetryDelay);
+    }
+
+    const final = await _getActiveAppBounds().catch((err) => {
+      logger.error(`[app.agent] verifyAppFocused: final _getActiveAppBounds failed: ${err.message}`);
+      return null;
+    });
+    const finalAppName = final?.appName || 'unknown';
+    const totalWaited = Date.now() - start;
+
+    // The retry loop's time budget can be exhausted by `open -a` + the initial
+    // sleep (yielding "0 attempts"), so the app may already be focused by now.
+    // Re-check the final result before declaring failure to avoid a false negative.
+    if (final && _matches(final.appName, appName)) {
+      logger.info(`[app.agent] verifyAppFocused: SUCCESS (final check) - matched "${final.appName}" after ${totalWaited}ms`);
+      return { focused: true, appName: final.appName, waited: totalWaited, attempts };
+    }
+
+    logger.error(`[app.agent] verifyAppFocused: FAILED - expected "${appName}", got "${finalAppName}" after ${totalWaited}ms, ${attempts} attempts`);
+    
+    // Try fallback detection methods if active-win failed
+    if (finalAppName === 'unknown' || !final) {
+      logger.info(`[app.agent] verifyAppFocused: trying fallback detection methods...`);
+      
+      // Fallback 1: Try to detect via window title OCR
+      const titleResult = await _detectAppByWindowTitle(appName);
+      if (titleResult.detected) {
+        logger.info(`[app.agent] verifyAppFocused: fallback OCR detected "${appName}"`);
+        return { focused: true, appName, waited: totalWaited, attempts, fallback: 'ocr' };
+      }
+      
+      // Fallback 2: Try to detect via OCR difference comparison
+      const deltaResult = await _detectAppByOCRDifference(appName);
+      if (deltaResult.detected) {
+        logger.info(`[app.agent] verifyAppFocused: fallback OCR-delta detected "${appName}" (similarity: ${deltaResult.similarity?.toFixed(3)}, titleChanged: ${deltaResult.titleChanged})`);
+        return { focused: true, appName, waited: totalWaited, attempts, fallback: 'ocr-delta', deltaResult };
+      }
+    }
+    
+    return { focused: false, appName: finalAppName, waited: totalWaited, attempts };
+  });
+}
+
+/**
+ * Generate dynamic patterns for app name matching without hardcoded mappings
+ */
+function _generateAppPatterns(appName) {
+  const name = appName.toLowerCase();
+  const patterns = [name];
+  
+  // Add common variations
+  patterns.push(name.replace(/\s+/g, '')); // Remove spaces
+  patterns.push(name.replace(/[^a-z0-9]/g, '')); // Remove special chars
+  
+  // Add partial matches for longer names (split into words)
+  if (name.length > 5) {
+    const words = name.split(/\s+/).filter(word => word.length > 3);
+    words.forEach(word => {
+      if (!patterns.includes(word)) {
+        patterns.push(word);
+      }
+    });
+  }
+  
+  // Add camelCase variations for multi-word names
+  const words = name.split(/\s+/);
+  if (words.length > 1) {
+    const camelCase = words.map((word, index) => 
+      index === 0 ? word : word.charAt(0).toUpperCase() + word.slice(1)
+    ).join('');
+    patterns.push(camelCase.toLowerCase());
+  }
+  
+  // Remove duplicates and return
+  return [...new Set(patterns)];
+}
+
+/**
+ * Fallback detection method: Try to detect app by analyzing window titles from recent OCR captures
+ */
+async function _detectAppByWindowTitle(appName) {
+  try {
+    // Get recent OCR data from user-memory service
+    const { screenCapture } = require('./screen.capture.cjs');
+    const recentCapture = await screenCapture({ recent: true });
+    
+    if (!recentCapture.success || !recentCapture.text) {
+      logger.debug(`[app.agent] _detectAppByWindowTitle: no recent OCR data available`);
+      return { detected: false };
+    }
+    
+    const windowTitle = recentCapture.windowTitle || '';
+    const ocrText = recentCapture.text.toLowerCase();
+    const appNameLower = appName.toLowerCase();
+    
+    logger.debug(`[app.agent] _detectAppByWindowTitle: checking "${appName}" against windowTitle "${windowTitle}" and OCR text`);
+    
+    // Check window title first
+    if (windowTitle.toLowerCase().includes(appNameLower) || appNameLower.includes(windowTitle.toLowerCase())) {
+      return { detected: true, method: 'window-title', windowTitle };
+    }
+    
+    // Generate dynamic patterns for the app name
+    const patterns = _generateAppPatterns(appName);
+    const found = patterns.some(pattern => ocrText.includes(pattern));
+    
+    if (found) {
+      return { detected: true, method: 'ocr-pattern', windowTitle, ocrText, patterns };
+    }
+    
+    return { detected: false };
+  } catch (err) {
+    logger.error(`[app.agent] _detectAppByWindowTitle error: ${err.message}`);
+    return { detected: false };
+  }
+}
+
+/**
+ * Compute similarity between two OCR texts using simple overlap and semantic comparison
+ */
+function _computeOCRSimilarity(text1, text2) {
+  if (!text1 || !text2) return 0;
+  
+  // Simple character-level similarity for quick check
+  const chars1 = new Set(text1.toLowerCase().replace(/\s+/g, ''));
+  const chars2 = new Set(text2.toLowerCase().replace(/\s+/g, ''));
+  
+  const intersection = new Set([...chars1].filter(x => chars2.has(x)));
+  const union = new Set([...chars1, ...chars2]);
+  
+  const charSimilarity = intersection.size / union.size;
+  
+  // Word-level similarity for more accuracy
+  const words1 = new Set(text1.toLowerCase().split(/\s+/).filter(w => w.length > 2));
+  const words2 = new Set(text2.toLowerCase().split(/\s+/).filter(w => w.length > 2));
+  
+  const wordIntersection = new Set([...words1].filter(x => words2.has(x)));
+  const wordUnion = new Set([...words1, ...words2]);
+  
+  const wordSimilarity = wordUnion.size > 0 ? wordIntersection.size / wordUnion.size : 0;
+  
+  // Weight word similarity more heavily
+  return (charSimilarity * 0.3) + (wordSimilarity * 0.7);
+}
+
+/**
+ * Generic app detection by comparing OCR states before and after attempting to focus the app
+ * This works for any macOS application without requiring hardcoded mappings
+ */
+async function _detectAppByOCRDifference(appName) {
+  try {
+    logger.debug(`[app.agent] _detectAppByOCRDifference: starting detection for "${appName}"`);
+    
+    // 1. Capture baseline OCR state
+    const { screenCapture } = require('./screen.capture.cjs');
+    const baseline = await screenCapture({ recent: true });
+    
+    if (!baseline.success || !baseline.text) {
+      logger.debug(`[app.agent] _detectAppByOCRDifference: no baseline OCR available`);
+      return { detected: false, method: 'ocr-delta', error: 'No baseline OCR' };
+    }
+    
+    // 2. Attempt to focus the target app
+    const { execSync } = require('child_process');
+    try {
+      execSync(`open -a "${appName}"`, { timeout: 3000 });
+      logger.debug(`[app.agent] _detectAppByOCRDifference: executed 'open -a "${appName}"'`);
+    } catch (err) {
+      logger.warn(`[app.agent] _detectAppByOCRDifference: failed to open app "${appName}": ${err.message}`);
+      return { detected: false, method: 'ocr-delta', error: 'Failed to open app' };
+    }
+    
+    // 3. Wait for app to focus and UI to stabilize
+    await _sleep(1500);
+    
+    // 4. Trigger a non-invasive action to ensure OCR captures the new state
+    // We'll use a harmless function key that most apps don't use
+    try {
+      const nut = require('@nut-tree-fork/nut-js');
+      await nut.keyboard.pressKey(nut.Key.F15);
+      await nut.keyboard.releaseKey(nut.Key.F15);
+      await _sleep(200); // Small delay for UI to update
+    } catch (err) {
+      // If NutJS isn't available, just wait a bit longer
+      logger.debug(`[app.agent] _detectAppByOCRDifference: NutJS not available, skipping F15 press`);
+      await _sleep(500);
+    }
+    
+    // 5. Capture post-focus OCR state
+    const afterFocus = await screenCapture({ recent: true });
+    
+    if (!afterFocus.success || !afterFocus.text) {
+      logger.debug(`[app.agent] _detectAppByOCRDifference: no post-focus OCR available`);
+      return { detected: false, method: 'ocr-delta', error: 'No post-focus OCR' };
+    }
+    
+    // 6. Compare OCR states
+    const similarity = _computeOCRSimilarity(baseline.text, afterFocus.text);
+    
+    // 7. Check if window title contains app name
+    const appNameLower = appName.toLowerCase();
+    const beforeTitle = (baseline.windowTitle || '').toLowerCase();
+    const afterTitle = (afterFocus.windowTitle || '').toLowerCase();
+    
+    const titleContainsApp = afterTitle.includes(appNameLower) || 
+                           appNameLower.includes(afterTitle) ||
+                           afterTitle.includes(appNameLower.replace(/\s+/g, ''));
+    
+    const titleChanged = beforeTitle !== afterTitle;
+    
+    // 8. Determine if app was successfully focused
+    // App is considered focused if:
+    // - OCR similarity is low (significant change) OR
+    // - Window title contains app name OR  
+    // - Window title changed significantly
+    const significantChange = similarity < 0.8;
+    const detected = significantChange || titleContainsApp || (titleChanged && afterTitle.length > 0);
+    
+    logger.debug(`[app.agent] _detectAppByOCRDifference: similarity=${similarity.toFixed(3)}, significantChange=${significantChange}, titleContainsApp=${titleContainsApp}, titleChanged=${titleChanged}`);
+    
+    return {
+      detected,
+      method: 'ocr-delta',
+      similarity,
+      significantChange,
+      titleContainsApp,
+      titleChanged,
+      beforeTitle: baseline.windowTitle,
+      afterTitle: afterFocus.windowTitle,
+      baselineLength: baseline.text.length,
+      afterLength: afterFocus.text.length
+    };
+    
+  } catch (err) {
+    logger.error(`[app.agent] _detectAppByOCRDifference error: ${err.message}`);
+    return { detected: false, method: 'ocr-delta', error: err.message };
+  }
 }
 
 async function actionExecuteShortcut({ appName, action, shortcutOverride, verifyWith, skipFocusCheck = false }) {
@@ -4486,41 +5448,79 @@ async function actionExecuteShortcut({ appName, action, shortcutOverride, verify
     return { ok: false, error: `No shortcut found for action: ${action}` };
   }
 
-  const beforeOCR = await getRecentOCR();
+  // Parse the shortcut string into NutJS modifiers + key BEFORE highlighting,
+  // so we can fail fast with a descriptive error if it can't be mapped.
+  const { Key } = nut;
+  const parts = shortcutStr.split('+').map(p => p.trim());
+  const modifiers = [];
+  let key = null;
 
+  for (const part of parts) {
+    const lower = part.toLowerCase();
+    if (lower === 'cmd' || lower === 'command') modifiers.push(Key.LeftSuper);
+    else if (lower === 'shift') modifiers.push(Key.LeftShift);
+    else if (lower === 'alt' || lower === 'option') modifiers.push(Key.LeftAlt);
+    else if (lower === 'ctrl' || lower === 'control') modifiers.push(Key.LeftControl);
+    else key = Key[part] ?? Key[part.toUpperCase()] ?? Key[part.charAt(0).toUpperCase() + part.slice(1).toLowerCase()];
+  }
+
+  if (!key) {
+    logger.warn(`[app.agent] actionExecuteShortcut: could not map key from shortcut "${shortcutStr}"`);
+    return { ok: false, error: `Could not map shortcut keys: "${shortcutStr}"`, shortcut: shortcutStr };
+  }
+
+  // 1. Dispatch the keystroke FIRST — while verifyAppFocused's confirmation is
+  //    still fresh. The boundary highlight is a fullscreen GhostLayer op that can
+  //    disturb the foreground app, so it is shown AFTER the key has landed.
+  logger.info(`[app.agent] actionExecuteShortcut: dispatching "${shortcutStr}" on "${appName}" (action: ${action || 'override'}, modifiers: ${modifiers.length}, key: ${key})`);
   try {
-    const { Key } = nut;
-    const parts = shortcutStr.split('+').map(p => p.trim());
-    const modifiers = [];
-    let key = null;
-
-    for (const part of parts) {
-      const lower = part.toLowerCase();
-      if (lower === 'cmd' || lower === 'command') modifiers.push(Key.LeftSuper);
-      else if (lower === 'shift') modifiers.push(Key.LeftShift);
-      else if (lower === 'alt' || lower === 'option') modifiers.push(Key.LeftAlt);
-      else if (lower === 'ctrl' || lower === 'control') modifiers.push(Key.LeftControl);
-      else key = Key[part.toUpperCase()] || Key[part];
-    }
-
-    if (key) {
-      await nut.keyboard.pressKey(...modifiers, key);
-      await nut.keyboard.releaseKey(...modifiers, key);
-    }
+    await nut.keyboard.pressKey(...modifiers, key);
+    await nut.keyboard.releaseKey(...modifiers, key);
   } catch (err) {
-    return { ok: false, error: `Shortcut execution error: ${err.message}` };
+    logger.error(`[app.agent] actionExecuteShortcut: dispatch error for "${shortcutStr}": ${err.message}`);
+    return { ok: false, error: `Shortcut execution error: ${err.message}`, shortcut: shortcutStr };
   }
+  logger.info(`[app.agent] actionExecuteShortcut: dispatched "${shortcutStr}" successfully`);
 
-  await _sleep(300);
-  const afterOCR = await getRecentOCR();
+  // NOTE: The app-boundary highlight is now owned by the drop session in main.js
+  // for the whole plan (drawn on app.agent step_start, cleared on the terminal
+  // event), so we no longer draw-then-clear a 300ms flash here. Drawing it per
+  // shortcut caused a visible flicker and competed with the session boundary.
 
+  // 2. Verify the EFFECT only when the caller asks for it (verifyWith). Capture
+  //    with the ThinkDrop overlay hidden so its UI text ("Results"/"Agents"/
+  //    "Ask or Drag-Drop") can't pollute the OCR and mask the app's content.
   if (verifyWith) {
-    const appeared = afterOCR.text.toLowerCase().includes(verifyWith.toLowerCase());
-    const changed = afterOCR.text !== beforeOCR.text;
-    return { ok: changed || appeared, shortcut: shortcutStr, beforeOCR: beforeOCR.text.slice(0, 200), afterOCR: afterOCR.text.slice(0, 200) };
+    const { screenCapture } = require('./screen.capture.cjs');
+    const target = verifyWith.toLowerCase();
+    let lastText = '';
+    for (let attempt = 0; attempt < 6; attempt++) {
+      let live;
+      try {
+        live = await _withCaptureWindow(() => screenCapture({}));
+      } catch (capErr) {
+        logger.warn(`[app.agent] actionExecuteShortcut: live capture failed (attempt ${attempt + 1}): ${capErr.message}`);
+      }
+      lastText = live?.text || lastText;
+      if (lastText && lastText.toLowerCase().includes(target)) {
+        logger.info(`[app.agent] actionExecuteShortcut: verified "${verifyWith}" appeared after "${shortcutStr}"`);
+        return { ok: true, dispatched: true, shortcut: shortcutStr, verifiedWith: verifyWith, afterOCR: lastText.slice(0, 200) };
+      }
+      await _sleep(500);
+    }
+    logger.warn(`[app.agent] actionExecuteShortcut: dispatched "${shortcutStr}" but verifyWith "${verifyWith}" not detected after ~3s`);
+    return {
+      ok: false,
+      dispatched: true,
+      error: `Shortcut dispatched but verifyWith "${verifyWith}" not detected after ~3s`,
+      shortcut: shortcutStr,
+      afterOCR: lastText.slice(0, 200)
+    };
   }
 
-  return { ok: afterOCR.text !== beforeOCR.text, shortcut: shortcutStr };
+  // 3. No explicit verification requested: a dispatched keystroke is success.
+  //    Response/effect confirmation is the monitor step's responsibility.
+  return { ok: true, dispatched: true, shortcut: shortcutStr, note: 'effect verification deferred to monitor step' };
 }
 
 // ---------------------------------------------------------------------------
@@ -4554,7 +5554,7 @@ async function actionVerifyShortcut({ shortcutStr, targetText, placeholder, appN
         else if (lower === 'shift') modifiers.push(Key.LeftShift);
         else if (lower === 'alt' || lower === 'option') modifiers.push(Key.LeftAlt);
         else if (lower === 'ctrl' || lower === 'control') modifiers.push(Key.LeftControl);
-        else key = Key[part.toUpperCase()] || Key[part];
+        else key = Key[part] ?? Key[part.toUpperCase()] ?? Key[part.charAt(0).toUpperCase() + part.slice(1).toLowerCase()];
       }
 
       if (key) {
@@ -4695,15 +5695,16 @@ async function actionExtractContentViaClipboard({ appName, category = 'browser' 
       await _sleep(400); // wait for window focus to settle
 
       // Browser: Cmd+L -> Tab -> Cmd+A -> Cmd+C
+      // Tab moves focus from address bar to first focusable element in page body
       if (category === 'browser') {
         await actionExecuteShortcut({ appName, shortcutOverride: 'Cmd+L', skipFocusCheck: true }); // Focus address bar
         await _sleep(150);
-        await actionExecuteShortcut({ appName, shortcutOverride: 'Tab', skipFocusCheck: true });   // Move to content
+        await actionExecuteShortcut({ appName, shortcutOverride: 'Tab', skipFocusCheck: true }); // Move focus to page body
         await _sleep(150);
-        await actionExecuteShortcut({ appName, shortcutOverride: 'Cmd+A', skipFocusCheck: true }); // Select all
-        await _sleep(150);
+        await actionExecuteShortcut({ appName, shortcutOverride: 'Cmd+A', skipFocusCheck: true }); // Select all page content
+        await _sleep(200);
         await actionExecuteShortcut({ appName, shortcutOverride: 'Cmd+C', skipFocusCheck: true }); // Copy
-        await _sleep(400);
+        await _sleep(500);
       } else {
         // Generic: just Cmd+A -> Cmd+C
         await actionExecuteShortcut({ appName, shortcutOverride: 'Cmd+A', skipFocusCheck: true });
@@ -4795,8 +5796,10 @@ module.exports = {
   actionLiveChatScroll,
   actionPassiveReadScroll,
   actionTeleportToElement,
+  actionSearchAndClick,
   actionMonitorWithBackoff,
   verifyAppFocused,
+  actionGetActiveBounds,
   actionExecuteShortcut,
   // Phase 3: Additional Use Cases
   actionMonitorFileUpload,

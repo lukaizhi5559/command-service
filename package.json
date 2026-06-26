@@ -32,9 +32,9 @@
   "dependencies": {
     "@nut-tree-fork/nut-js": "^4.2.6",
     "@thinkdrop/agents-db": "file:./shared/agents-db",
-    "active-win": "^9.0.0",
     "dotenv": "^16.0.0",
     "duckdb": "^1.4.4",
+    "get-windows": "^9.2.3",
     "googleapis": "^171.4.0",
     "jimp": "^0.22.12",
     "keytar": "^7.9.0",

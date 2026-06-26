@@ -62,7 +62,7 @@ class CommandServiceMCPServer {
    *   skill: 'shell.run' | 'browser.act' | 'image.analyze' | 'fs.read' | 'file.watch' | 'file.bridge' | 'screen.capture' | 'external.skill' | 'cli.agent' | 'browser.agent'
    *   args:  skill-specific arguments (see skills/ implementations)
    */
-  async executeAutomation(payload) {
+  async executeAutomation(payload, opts = {}) {
     const { skill, args = {} } = payload || {};
 
     if (!skill) {
@@ -142,7 +142,7 @@ class CommandServiceMCPServer {
         return await this._skillVideoAgent(args);
 
       case 'app.agent':
-        return await this._skillAppAgent(args);
+        return await this._skillAppAgent(args, opts);
 
       case 'system.introspect':
         return await this._skillSystemIntrospect(args);
@@ -251,8 +251,11 @@ class CommandServiceMCPServer {
     return await systemIntrospect(args);
   }
 
-  async _skillAppAgent(args) {
+  async _skillAppAgent(args, opts = {}) {
     const { action, ...rest } = args || {};
+    // Long-running monitor actions honor an AbortSignal so the server-side loop
+    // stops when the HTTP client times out and destroys the socket.
+    if (opts.signal) rest.signal = opts.signal;
     const ACTION_MAP = {
       parse_screenshot:          appAgent.actionParseScreenshot,
       parse_screenshot_docling:  appAgent.actionParseScreenshotDocling,
@@ -285,9 +288,11 @@ class CommandServiceMCPServer {
       live_chat_scroll:          appAgent.actionLiveChatScroll,
       passive_read_scroll:       appAgent.actionPassiveReadScroll,
       teleport_to_element:       appAgent.actionTeleportToElement,
+      search_and_click:          appAgent.actionSearchAndClick,
       infer_main_region:         appAgent.inferMainRegion,
       get_boundaries:            appAgent.getBoundariesFromCache,
       verify_app_focused:        appAgent.verifyAppFocused,
+      get_active_bounds:         appAgent.actionGetActiveBounds,
       // Phase 3.5
       verify_shortcut:               appAgent.actionVerifyShortcut,
       verify_action:                 appAgent.actionVerifyAction,
@@ -832,10 +837,20 @@ class CommandServiceMCPServer {
       if (req.method === 'POST' && req.url === '/command.automate') {
         let body = '';
         req.on('data', chunk => { body += chunk; });
+        // Thread an AbortSignal tied to the socket lifecycle. The MCP client
+        // (ThinkDropMCPClient._httpPost) calls req.destroy() on timeout, which
+        // closes this socket. Long-running skills (app.agent monitors) honor the
+        // signal so the server-side loop actually stops instead of running on.
+        const controller = new AbortController();
+        let responded = false;
+        const onClose = () => { if (!responded) controller.abort(); };
+        req.on('close', onClose);
+        req.on('aborted', onClose);
         req.on('end', async () => {
           try {
             const { payload } = JSON.parse(body);
-            const result = await this.executeAutomation(payload);
+            const result = await this.executeAutomation(payload, { signal: controller.signal });
+            responded = true;
             // Wrap in MCP envelope: envelope success=true always (HTTP 200).
             // The skill's own success/failure is inside data — the StateGraph
             // reads result.data and handles skill-level failures (needsManualStep, etc.)

@@ -95,9 +95,16 @@ brew       — macOS package manager for CLI binaries (ffmpeg, imagemagick, pand
              ripgrep, fd, poppler, etc.). Prefer brew when a native binary is cleaner than
              a python3 script. Check if installed first: command -v TOOL || brew install TOOL.
 
-osascript  — macOS Finder, app control, desktop UI automation. Use for anything that needs
-             to interact with the macOS GUI layer (open Finder windows, click menus, control
-             apps by name, move windows).
+osascript  — macOS Finder and desktop UI automation. Use ONLY for complex GUI actions that
+             no other skill can do (open Finder windows, click menus, move windows). Do NOT use
+             for bringing apps to the front or activating them — that is handled by app.agent.
+
+open       — Launch files and URLs by association. Do NOT use for app focus/activation; route
+             those goals to app.agent instead.
+
+GUI focus / app activation rule:
+When the goal is to bring an application to the front, focus it, or activate it, do NOT generate
+a shell command. Instead, return an error indicating that this should be handled by app.agent.
 
 Discovery rule: if the right package or CLI tool is not immediately obvious, reason from
 first principles — what file format or protocol is involved, which runtime handles it best,
@@ -115,6 +122,11 @@ Example for rename (correct idempotent pattern):
   if [ ! -d "$SRC" ]; then echo "Error: source $SRC not found" >&2; exit 1; fi
   mv -v "$SRC" "$DEST"
 Never exit 1 when the goal state is already observably complete.
+
+Exception — clipboard/pipe writes: when the goal writes clipboard or piped output to a file
+(pbpaste, stdin redirect, echo/printf redirection), ALWAYS overwrite the file directly.
+Do NOT check if the file exists first — content changes every run.
+Use: pbpaste > "$FILE"  (no existence guard, no idempotency check)
 
 Platform: macOS. Home dir: ${os.homedir()}
 `;
