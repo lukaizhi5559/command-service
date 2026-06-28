@@ -674,7 +674,7 @@ async function _withCaptureWindow(fn) {
  * @returns {Promise<{ok: boolean, matches: Array}>}
  */
 async function actionFindElements(args = {}) {
-  const { searchText, textItems = [], fuzzy = true } = args;
+  const { searchText, textItems = [], fuzzy = true, highlight = true, highlightColor = '#ff0000' } = args;
   
   if (!searchText) {
     return { ok: false, error: 'searchText is required' };
@@ -701,6 +701,9 @@ async function actionFindElements(args = {}) {
     
     if (substringMatches.length > 0) {
       logger.info(`[actionFindElements] Found ${substringMatches.length} substring matches for compound term`);
+      if (highlight) {
+        await actionHighlightElements({ elements: substringMatches, duration: 0, color: highlightColor });
+      }
       return {
         ok: true,
         matches: substringMatches,
@@ -713,7 +716,11 @@ async function actionFindElements(args = {}) {
     const parts = searchLower.split(/[.\->_:]+/).filter(p => p.length > 0);
     if (parts.length > 1) {
       logger.info(`[actionFindElements] Trying multi-part matching: ${parts.join(', ')}`);
-      return findCompoundMatches(textItems, parts, searchText);
+      const compoundResult = findCompoundMatches(textItems, parts, searchText);
+      if (compoundResult.ok && compoundResult.matches.length > 0 && highlight) {
+        await actionHighlightElements({ elements: compoundResult.matches, duration: 0, color: highlightColor });
+      }
+      return compoundResult;
     }
   }
   
@@ -853,7 +860,11 @@ async function actionFindElements(args = {}) {
   
   // Sort by match score
   matches.sort((a, b) => b.matchScore - a.matchScore);
-  
+
+  if (matches.length > 0 && highlight) {
+    await actionHighlightElements({ elements: matches, duration: 0, color: highlightColor });
+  }
+
   return {
     ok: matches.length > 0,
     matches,
@@ -3449,56 +3460,97 @@ async function actionDiscoverShortcuts({ appName, category }) {
     return { ok: true, shortcuts: cachedShortcuts, source: 'descriptor' };
   }
 
-  // 2. Web crawl — only runs once ever per app
-  try {
-    const searchResult = await webAgent.actionSearchAndNavigate({
-      query: `${appName} keyboard shortcuts cheat sheet macOS`,
-      maxResults: 5
-    });
+  // 2. Web crawl with multiple targeted queries; pick the result with the most content.
+  const queries = [
+    `${appName} keyboard shortcuts`,
+    `${appName} keyboard shortcuts macOS`,
+    `${appName} AI assistant shortcut`,
+    `${appName} command palette shortcut`,
+    `${appName} docs keyboard shortcuts`,
+  ];
 
-    if (!searchResult || !searchResult.ok || !searchResult.bestUrl) {
-      logger.warn(`[app.agent] No web result for ${appName} shortcuts`);
-      return { ok: false, shortcuts: [], error: 'No search result' };
+  let bestUrl = null;
+  let bestContent = '';
+  let bestQuery = '';
+
+  for (const query of queries) {
+    try {
+      const searchResult = await webAgent.actionSearchAndNavigate({ query, maxResults: 3 });
+      if (!searchResult || !searchResult.ok || !searchResult.bestUrl) continue;
+
+      const crawlResult = await webCrawl({ url: searchResult.bestUrl, maxChars: 10000 });
+      if (!crawlResult || !crawlResult.ok || !crawlResult.content) continue;
+
+      if (crawlResult.content.length > bestContent.length) {
+        bestContent = crawlResult.content;
+        bestUrl = searchResult.bestUrl;
+        bestQuery = query;
+      }
+      if (bestContent.length > 3000) break; // good enough
+    } catch (err) {
+      logger.warn(`[app.agent] actionDiscoverShortcuts query failed: ${query} - ${err.message}`);
     }
+  }
 
-    const crawlResult = await webCrawl({ url: searchResult.bestUrl, maxChars: 15000 });
-    if (!crawlResult || !crawlResult.ok) {
-      return { ok: false, shortcuts: [], error: 'Crawl failed' };
-    }
-
+  let shortcuts = [];
+  if (bestContent) {
     const llmResult = await skillLlmAsk(`
 Extract keyboard shortcuts from this content.
 App: ${appName}
 Category: ${category}
 
+Include these semantic actions if they are present:
+- quick_open (command palette, quick open, go to file)
+- open_file_dialog (open file dialog)
+- focus_ai (focus AI assistant, open AI chat/panel)
+- save
+- select_all
+- copy, paste
+- find/search
+
 Return JSON only:
 {
   "shortcuts": [
-    { "action": "open_file", "shortcut": "Cmd+O", "context": "file" }
+    { "action": "quick_open", "shortcut": "Cmd+P", "context": "file" },
+    { "action": "focus_ai", "shortcut": "Cmd+L", "context": "ai" }
   ]
 }
 
 Content:
-${crawlResult.content.slice(0, 8000)}
+${bestContent.slice(0, 8000)}
 `);
 
-    let shortcuts = [];
     try {
       const parsed = JSON.parse(llmResult.replace(/```json|```/g, '').trim());
       shortcuts = parsed.shortcuts || [];
     } catch (_) {
       logger.warn(`[app.agent] LLM shortcut parse failed for ${appName}`);
     }
-
-    // 3. Persist to agent descriptor so future runs skip the web crawl
-    _writeShortcutsToDescriptor(appName, category, shortcuts);
-
-    logger.info(`[app.agent] Shortcuts discovered and written to descriptor for ${appName}: ${shortcuts.length} shortcuts`);
-    return { ok: true, shortcuts, source: 'web' };
-  } catch (err) {
-    logger.error(`[app.agent] actionDiscoverShortcuts error: ${err.message}`);
-    return { ok: false, shortcuts: [], error: err.message };
   }
+
+  // 3. Inject conservative category defaults for missing core actions so the proxy
+  //    workflow can still run. Defaults are marked in the context column so the
+  //    planner can treat them as unverified if needed.
+  const coreActions = ['quick_open', 'focus_ai', 'save', 'select_all', 'open_file_dialog'];
+  const categoryDefaults = {
+    editor: { quick_open: 'Cmd+P', open_file_dialog: 'Cmd+O', focus_ai: 'Cmd+L', save: 'Cmd+S', select_all: 'Cmd+A' },
+    browser: { quick_open: 'Cmd+L', focus_ai: 'Cmd+Shift+A', save: 'Cmd+S', select_all: 'Cmd+A' },
+    chat: { focus_ai: 'Cmd+L', save: 'Cmd+S', select_all: 'Cmd+A' },
+    terminal: { save: 'Cmd+S', select_all: 'Cmd+A' },
+  };
+
+  const defaults = categoryDefaults[category] || {};
+  for (const action of coreActions) {
+    if (!shortcuts.find(s => s.action === action) && defaults[action]) {
+      shortcuts.push({ action, shortcut: defaults[action], context: 'default' });
+    }
+  }
+
+  // 4. Persist to agent descriptor so future runs skip the web crawl
+  _writeShortcutsToDescriptor(appName, category, shortcuts);
+
+  logger.info(`[app.agent] Shortcuts discovered for ${appName}: ${shortcuts.length} shortcuts (best query: ${bestQuery || 'none'}, source: ${bestUrl ? 'web' : 'default'})`);
+  return { ok: true, shortcuts, source: bestUrl ? 'web' : 'default' };
 }
 
 async function enrichAppContext({ appName, category: callerCategory, background = false } = {}) {
@@ -4510,7 +4562,7 @@ async function actionTeleportToElement({ searchText, followWithTab = false }) {
   };
 }
 
-async function actionSearchAndClick({ searchText, appName, category, maxMatches = 5, fallbackToMouse = true }) {
+async function actionSearchAndClick({ searchText, appName, category, maxMatches = 3, fallbackToKeyboard = true, signal }) {
   let nut;
   try {
     nut = require('@nut-tree-fork/nut-js');
@@ -4526,17 +4578,52 @@ async function actionSearchAndClick({ searchText, appName, category, maxMatches 
     logger.warn(`[app.agent] search_and_click is designed for browser category; received category=${category}. Proceeding with caution.`);
   }
 
+  // Hard timeout and abort handling so a timed-out HTTP request does not leave
+  // a runaway skill loop running in the command service.
+  const MAX_SEARCH_AND_CLICK_MS = 45000;
+  const controller = new AbortController();
+  const startMs = Date.now();
+  if (signal) {
+    if (signal.aborted) controller.abort();
+    else signal.addEventListener('abort', () => { try { controller.abort(); } catch (_) {} }, { once: true });
+  }
+  const _isExpired = () => Date.now() - startMs > MAX_SEARCH_AND_CLICK_MS;
+  const _checkAbort = (label) => {
+    if (signal?.aborted || controller.signal.aborted || _isExpired()) {
+      logger.info(`[app.agent] search_and_click: aborting at ${label} (elapsed=${Date.now() - startMs}ms)`);
+      if (!controller.signal.aborted) controller.abort();
+      throw new Error(`search_and_click aborted or timed out after ${Date.now() - startMs}ms`);
+    }
+  };
+  const _isAbortError = (err) => err && err.message && (err.message.includes('timed out') || err.message.includes('aborted'));
+
   if (appName) {
+    _checkAbort('before_verify_app_focus');
     const focus = await verifyAppFocused({ appName, waitMs: 5000 });
     if (!focus.focused) {
       return { ok: false, error: `App "${appName}" could not be focused` };
     }
   }
 
+  // Generate progressively shorter search variants from the original phrase
+  // down to two words. This handles cases where the user phrase includes a
+  // trailing word that is not actually present on screen (e.g. "channel").
+  const _buildSearchVariants = (text) => {
+    const words = text.trim().split(/\s+/).filter(Boolean);
+    const variants = [];
+    for (let i = words.length; i >= 2; i--) {
+      variants.push(words.slice(0, i).join(' '));
+    }
+    return variants;
+  };
+  const searchVariants = _buildSearchVariants(searchText);
+  logger.info(`[app.agent] search_and_click: searchText="${searchText}" variants=${JSON.stringify(searchVariants)}`);
+
   // Capture a fresh baseline before any UI interaction so we compare against
   // the real screen state, not a stale DB cache. Hide the ThinkDrop overlay
   // so its own UI text doesn't taint the OCR comparison.
   const _captureFreshOCR = async () => {
+    _checkAbort('before_capture');
     const { screenCapture } = require('./screen.capture.cjs');
     const live = await _withCaptureWindow(() => screenCapture({}));
     if (live.success && live.text) {
@@ -4552,6 +4639,7 @@ async function actionSearchAndClick({ searchText, appName, category, maxMatches 
     return getRecentOCR({ appName, liveOverlayHidden: true });
   };
 
+  _checkAbort('before_baseline');
   const baselineOCR = await _captureFreshOCR();
   const baselineText = baselineOCR.text || '';
   logger.info(`[app.agent] search_and_click: baseline captured (${baselineText.length} chars, source: ${baselineOCR.source || 'unknown'})`);
@@ -4559,8 +4647,10 @@ async function actionSearchAndClick({ searchText, appName, category, maxMatches 
   const _normalized = (text) => (text || '').toLowerCase().replace(/\s+/g, ' ').trim();
 
   // Compare post-click OCR against the baseline. A successful click opens new
-  // UI content, which shows up as: (1) a remainder of >=10 chars, and (2) at least
-  // one new meaningful word not present in the baseline.
+  // UI content, which shows up as: (1) the post-click text is at least 10 chars
+  // longer than the baseline, and (2) at least one new meaningful word not present
+  // in the baseline. We require a net gain (not just any change) to avoid false
+  // positives when a click removes or swaps content without opening the target.
   const _detectStateChangeAgainstBaseline = async (afterTextRaw) => {
     const afterText = afterTextRaw || '';
     const baselineNorm = _normalized(baselineText);
@@ -4570,9 +4660,9 @@ async function actionSearchAndClick({ searchText, appName, category, maxMatches 
       return { changed: false, afterText, reason: 'identical_to_baseline' };
     }
 
-    const charDiff = Math.abs(baselineNorm.length - afterNorm.length);
+    const charDiff = afterNorm.length - baselineNorm.length;
     if (charDiff < 10) {
-      return { changed: false, afterText, reason: 'char_diff_below_threshold' };
+      return { changed: false, afterText, reason: 'char_gain_below_threshold' };
     }
 
     // Look for new meaningful words (>3 chars, containing at least one letter).
@@ -4589,106 +4679,155 @@ async function actionSearchAndClick({ searchText, appName, category, maxMatches 
     return { changed: true, afterText, newWords };
   };
 
-  try {
-    const { Key } = nut;
+  // Discovery phase: find the longest variant that has at least one OCR match.
+  // Returns { variant, matches, variantIndex } or { variant: null } if none match.
+  const _findBestVariant = async () => {
+    for (let variantIndex = 0; variantIndex < searchVariants.length; variantIndex++) {
+      const variant = searchVariants[variantIndex];
+      logger.info(`[app.agent] search_and_click: searching variant ${variantIndex + 1}/${searchVariants.length} "${variant}"`);
+      _checkAbort(`before_find_variant_${variantIndex}`);
 
-    // Open browser find bar and type the search text.
-    await nut.keyboard.pressKey(Key.LeftSuper, Key.F);
-    await nut.keyboard.releaseKey(Key.LeftSuper, Key.F);
-    await _sleep(500);
-
-    await nut.keyboard.type(searchText);
-    await _sleep(500);
-
-    // Cycle through find-bar matches.
-    for (let matchIndex = 1; matchIndex <= maxMatches; matchIndex++) {
-      logger.info(`[app.agent] search_and_click: trying match ${matchIndex}/${maxMatches}`);
-
-      // Select the next match.
-      await nut.keyboard.pressKey(Key.Enter);
-      await nut.keyboard.releaseKey(Key.Enter);
-      await _sleep(200);
-
-      // Close the find bar while keeping the page highlight.
-      await nut.keyboard.pressKey(Key.Escape);
-      await nut.keyboard.releaseKey(Key.Escape);
-      await _sleep(300);
-
-      // Activate the highlighted element (link/button).
-      await nut.keyboard.pressKey(Key.Enter);
-      await nut.keyboard.releaseKey(Key.Enter);
-      await _sleep(800);
-
-      const afterClick = await _captureFreshOCR();
-      const result = await _detectStateChangeAgainstBaseline(afterClick.text);
-      logger.info(`[app.agent] search_and_click: match ${matchIndex} state change=${result.changed}${result.reason ? ` (${result.reason})` : ''}`);
-      if (result.changed) {
-        return { ok: true, matchIndex, method: 'find_bar_enter', stateChanged: true, afterText: result.afterText.slice(0, 200) };
-      }
-
-      // Reopen the find bar for the next match if there are more attempts.
-      if (matchIndex < maxMatches) {
-        await nut.keyboard.pressKey(Key.LeftSuper, Key.F);
-        await nut.keyboard.releaseKey(Key.LeftSuper, Key.F);
-        await _sleep(300);
+      try {
+        const parseResult = await _withCaptureWindow(() => actionParseScreenshot({}));
+        if (parseResult.ok && parseResult.textItems && parseResult.textItems.length > 0) {
+          const findResult = await actionFindElements({ searchText: variant, textItems: parseResult.textItems, highlight: false });
+          if (findResult.ok && findResult.matches.length > 0) {
+            // Variants are ordered from longest to shortest, so the first match is the longest.
+            logger.info(`[app.agent] search_and_click: selected longest matching variant "${variant}" with ${findResult.matches.length} match(es)`);
+            return { variant, matches: findResult.matches, variantIndex };
+          }
+        }
+        logger.info(`[app.agent] search_and_click: no OCR matches for variant "${variant}"`);
+      } catch (err) {
+        if (_isAbortError(err)) throw err;
+        logger.warn(`[app.agent] search_and_click: error finding variant "${variant}": ${err.message}`);
       }
     }
+    return { variant: null, matches: null, variantIndex: -1 };
+  };
 
-    // Ensure the find bar is closed.
-    await nut.keyboard.pressKey(Key.Escape);
-    await nut.keyboard.releaseKey(Key.Escape);
-    await _sleep(200);
-  } catch (err) {
-    return { ok: false, error: `Keyboard error during search_and_click: ${err.message}` };
-  }
+  // Click the matches of the selected variant. Returns { ok: true, ... } on success.
+  const _clickMatches = async (variant, matches) => {
+    const clickMatches = matches.slice(0, 20);
+    logger.info(`[app.agent] search_and_click: clicking ${clickMatches.length} match(es) for "${variant}"`);
+    for (let matchIndex = 0; matchIndex < clickMatches.length; matchIndex++) {
+      const match = clickMatches[matchIndex];
+      const centerX = Math.round(match.x + (match.width || 0) / 2);
+      const centerY = Math.round(match.y + (match.height || 0) / 2);
 
-  // Fallback: low-level mouse move + click based on OCR coordinates.
-  if (fallbackToMouse) {
-    logger.info(`[app.agent] search_and_click: keyboard path failed after ${maxMatches} matches, trying mouse fallback`);
+      logger.info(`[app.agent] search_and_click: mouse click trying match ${matchIndex + 1}/${clickMatches.length} at (${centerX}, ${centerY}) for "${variant}"`);
+      _checkAbort(`mouse_click_${matchIndex}`);
+      await nut.mouse.move([{ x: centerX, y: centerY }]);
+      await _sleep(200, controller.signal);
+      await nut.mouse.leftClick();
+      await _sleep(800, controller.signal);
+
+      const afterMouse = await _captureFreshOCR();
+      const mouseResult = await _detectStateChangeAgainstBaseline(afterMouse.text);
+      logger.info(`[app.agent] search_and_click: mouse click match ${matchIndex + 1} for "${variant}" state change=${mouseResult.changed}${mouseResult.reason ? ` (${mouseResult.reason})` : ''}`);
+      if (mouseResult.changed) {
+        return {
+          ok: true,
+          matchIndex: matchIndex + 1,
+          method: 'mouse_click',
+          stateChanged: true,
+          afterText: mouseResult.afterText.slice(0, 200)
+        };
+      }
+    }
+    logger.info(`[app.agent] search_and_click: mouse click tried ${clickMatches.length} matches for "${variant}" without state change`);
+    return { ok: false };
+  };
+
+  // Keyboard find-bar path for a single variant.
+  const _tryKeyboardPath = async (variant) => {
+    logger.info(`[app.agent] search_and_click: trying keyboard fallback for "${variant}"`);
     try {
-      const parseResult = await _withCaptureWindow(() => actionParseScreenshot({}));
-      if (!parseResult.ok || !parseResult.textItems || parseResult.textItems.length === 0) {
-        return { ok: false, error: 'Keyboard path failed and no OCR text items available for mouse fallback' };
-      }
+      _checkAbort('before_keyboard_open');
+      // Open browser find bar and type the search variant.
+      await nut.keyboard.pressKey(Key.LeftSuper, Key.F);
+      await nut.keyboard.releaseKey(Key.LeftSuper, Key.F);
+      await _sleep(500, controller.signal);
 
-      const findResult = await actionFindElements({ searchText, textItems: parseResult.textItems });
-      if (!findResult.ok || findResult.matches.length === 0) {
-        return { ok: false, error: 'Keyboard path failed and no OCR match found for mouse fallback' };
-      }
+      await nut.keyboard.type(variant);
+      await _sleep(500, controller.signal);
 
-      for (let matchIndex = 0; matchIndex < findResult.matches.length; matchIndex++) {
-        const match = findResult.matches[matchIndex];
-        const centerX = Math.round(match.x + (match.width || 0) / 2);
-        const centerY = Math.round(match.y + (match.height || 0) / 2);
+      // Cycle through find-bar matches.
+      for (let matchIndex = 1; matchIndex <= maxMatches; matchIndex++) {
+        _checkAbort(`keyboard_match_${matchIndex}`);
+        logger.info(`[app.agent] search_and_click: keyboard fallback trying match ${matchIndex}/${maxMatches} for "${variant}"`);
 
-        logger.info(`[app.agent] search_and_click: mouse fallback trying match ${matchIndex + 1}/${findResult.matches.length} at (${centerX}, ${centerY})`);
-        await nut.mouse.move([{ x: centerX, y: centerY }]);
-        await _sleep(200);
-        await nut.mouse.leftClick();
-        await _sleep(800);
+        // Select the next match.
+        await nut.keyboard.pressKey(Key.Enter);
+        await nut.keyboard.releaseKey(Key.Enter);
+        await _sleep(200, controller.signal);
 
-        const afterMouse = await _captureFreshOCR();
-        const mouseResult = await _detectStateChangeAgainstBaseline(afterMouse.text);
-        logger.info(`[app.agent] search_and_click: mouse fallback match ${matchIndex + 1} state change=${mouseResult.changed}${mouseResult.reason ? ` (${mouseResult.reason})` : ''}`);
-        if (mouseResult.changed) {
-          return {
-            ok: true,
-            matchIndex: matchIndex + 1,
-            method: 'mouse_click',
-            stateChanged: true,
-            afterText: mouseResult.afterText.slice(0, 200),
-            fallbackFrom: 'find_bar_enter'
-          };
+        // Close the find bar while keeping the page highlight.
+        await nut.keyboard.pressKey(Key.Escape);
+        await nut.keyboard.releaseKey(Key.Escape);
+        await _sleep(300, controller.signal);
+
+        // Activate the highlighted element (link/button).
+        await nut.keyboard.pressKey(Key.Enter);
+        await nut.keyboard.releaseKey(Key.Enter);
+        await _sleep(800, controller.signal);
+
+        const afterClick = await _captureFreshOCR();
+        const result = await _detectStateChangeAgainstBaseline(afterClick.text);
+        logger.info(`[app.agent] search_and_click: keyboard fallback match ${matchIndex} for "${variant}" state change=${result.changed}${result.reason ? ` (${result.reason})` : ''}`);
+        if (result.changed) {
+          return { ok: true, matchIndex, method: 'find_bar_enter', stateChanged: true, afterText: result.afterText.slice(0, 200) };
+        }
+
+        // Reopen the find bar for the next match if there are more attempts.
+        if (matchIndex < maxMatches) {
+          await nut.keyboard.pressKey(Key.LeftSuper, Key.F);
+          await nut.keyboard.releaseKey(Key.LeftSuper, Key.F);
+          await _sleep(300, controller.signal);
         }
       }
 
-      return { ok: false, error: 'No mouse click produced a detectable screen change' };
-    } catch (mouseErr) {
-      return { ok: false, error: `Keyboard path failed; mouse fallback error: ${mouseErr.message}` };
-    }
-  }
+      // Ensure the find bar is closed.
+      await nut.keyboard.pressKey(Key.Escape);
+      await nut.keyboard.releaseKey(Key.Escape);
+      await _sleep(200, controller.signal);
 
-  return { ok: false, error: 'No search match produced a state change' };
+      return { ok: false, found: false, tried: maxMatches };
+    } catch (err) {
+      if (_isAbortError(err)) throw err;
+      logger.warn(`[app.agent] search_and_click: keyboard path error for "${variant}": ${err.message}`);
+      return { ok: false, error: `Keyboard error during search_and_click: ${err.message}` };
+    }
+  };
+
+  const { Key } = nut;
+
+  try {
+    const best = await _findBestVariant();
+    if (!best.variant || !best.matches || best.matches.length === 0) {
+      return { ok: false, needsManualStep: true, error: `Could not find "${searchText}" on screen. Tried variants: ${searchVariants.join(' → ')}. Please rephrase or point to the target.` };
+    }
+
+    _checkAbort(`before_click_variant_${best.variantIndex}`);
+    // Show the boundary highlight for the selected variant before clicking.
+    await actionHighlightElements({ elements: best.matches.slice(0, 20), duration: 0, color: '#ff0000' });
+
+    const clickResult = await _clickMatches(best.variant, best.matches);
+    if (clickResult.ok) return clickResult;
+
+    if (fallbackToKeyboard) {
+      _checkAbort(`before_keyboard_variant_${best.variantIndex}`);
+      const keyboardResult = await _tryKeyboardPath(best.variant);
+      if (keyboardResult.ok) return keyboardResult;
+    }
+
+    return { ok: false, needsManualStep: true, error: `Found "${best.variant}" on screen but clicking it did not change the page state. Please rephrase or point to the target.` };
+  } catch (err) {
+    if (signal?.aborted || controller.signal.aborted || err.message.includes('timed out') || err.message.includes('aborted')) {
+      return { ok: false, aborted: true, error: err.message };
+    }
+    return { ok: false, error: `Error during search_and_click: ${err.message}` };
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -4832,10 +4971,11 @@ async function actionMonitorWithBackoff({ goal, mode = 'passive', maxDurationMs 
     
     const current = await getRecentOCR({ appName, liveOverlayHidden: true });
 
-    if (!current.text) {
-      checkInterval = mode === 'active'
-        ? Math.min(checkInterval * 1.2, 30000)
-        : Math.min(checkInterval * 1.5, 60000);
+    if (!current.text || current.text.trim().length < 10) {
+      // Empty/low-confidence capture is likely a transient capture failure.
+      // Retry quickly rather than treating the screen as "stable" and backing off.
+      logger.warn('[app.agent] Monitor: empty or low-confidence OCR, retrying capture quickly');
+      checkInterval = 3000;
       continue;
     }
 
@@ -4913,6 +5053,7 @@ Current screen:
 ${current.text.slice(0, 1800)}
 
 Has the goal been achieved / has the response finished? Or is it still loading, in progress, or showing an error?
+If the screen text is jumbled, incomplete, or unclear, do NOT return "error" — return "pending" so the system can retry the capture. Only return "error" if you can clearly identify an actual failure state.
 Return JSON: { "status": "complete|pending|error", "summary": "..." }`);
           let parsed;
           try { parsed = JSON.parse(result.replace(/```json|```/g, '').trim()); }
@@ -4960,6 +5101,7 @@ After:
 ${current.text.slice(0, 1500)}
 
 Has the goal been achieved? Is there an error? Is progress being made?
+If the screen text is jumbled, incomplete, or unclear, do NOT return "error" — return "pending" so the system can retry the capture. Only return "error" if you can clearly identify an actual failure state (error message, crash, or the task cannot continue).
 Return JSON: { "status": "complete|progress|error|stalled", "summary": "..." }`);
 
       let parsed;
@@ -5124,6 +5266,21 @@ async function verifyAppFocused({ appName, waitMs = 5000 }) {
 
   const _hasBounds = !!(liveWin && liveWin.width > 0 && liveWin.height > 0);
   logger.info(`[app.agent] verifyAppFocused: initial check - liveWin: ${liveWin ? JSON.stringify({ appName: liveWin.appName, hasBounds: _hasBounds, source: liveWin.source || 'unknown' }) : 'null'}, isOverlayActive: ${isOverlayActive}`);
+
+  // Generic browser sentinel: the planner may pass appName="browser" for any
+  // browser-category action. If the active window is a known browser, treat it
+  // as focused instead of trying to run `open -a "browser"`, which fails.
+  const BROWSER_APP_NAMES = ['Google Chrome', 'Safari', 'Firefox', 'Arc', 'Brave Browser', 'Microsoft Edge', 'Opera'];
+  const _isBrowserAppName = (name) => BROWSER_APP_NAMES.some(b => _matches(name, b));
+  if (appName && appName.toLowerCase() === 'browser') {
+    if (liveWin && _isBrowserAppName(liveWin.appName)) {
+      logger.info(`[app.agent] verifyAppFocused: generic "browser" matched active window "${liveWin.appName}"`);
+      return { focused: true, appName: liveWin.appName, waited: 0 };
+    }
+    // No active browser detected yet; fall back to a real app name for focus.
+    appName = 'Google Chrome';
+    logger.info(`[app.agent] verifyAppFocused: generic "browser" remapped to "${appName}" for focus attempt`);
+  }
 
   if (liveWin && _matches(liveWin.appName, appName)) {
     return { focused: true, appName: liveWin.appName, waited: 0 };
@@ -5745,6 +5902,315 @@ async function actionExtractContentViaClipboard({ appName, category = 'browser' 
 }
 
 // ---------------------------------------------------------------------------
+// Text typing utility (replaces deprecated ui.typeText)
+// ---------------------------------------------------------------------------
+
+const _TYPE_TEXT_TOKEN_MAP = {
+  '{ENTER}':     'Return',
+  '{TAB}':       'Tab',
+  '{ESC}':       'Escape',
+  '{BACKSPACE}': 'Backspace',
+  '{UP}':        'Up',
+  '{DOWN}':      'Down',
+  '{LEFT}':      'Left',
+  '{RIGHT}':     'Right',
+  '{DELETE}':    'Delete',
+  '{HOME}':      'Home',
+  '{END}':       'End',
+  '{PAGEUP}':    'PageUp',
+  '{PAGEDOWN}':  'PageDown',
+  '{SPACE}':     'Space',
+};
+
+const _TYPE_TEXT_COMBO_PATTERN = /^\{(CMD|CTRL|ALT|SHIFT)\+(.+)\}$/i;
+
+function _parseTypeTextSegments(text) {
+  const segments = [];
+  const tokenPattern = /\{[^}]+\}/g;
+  let lastIndex = 0;
+  let match;
+
+  while ((match = tokenPattern.exec(text)) !== null) {
+    if (match.index > lastIndex) {
+      segments.push({ type: 'text', value: text.slice(lastIndex, match.index) });
+    }
+    segments.push({ type: 'token', value: match[0] });
+    lastIndex = match.index + match[0].length;
+  }
+
+  if (lastIndex < text.length) {
+    segments.push({ type: 'text', value: text.slice(lastIndex) });
+  }
+
+  return segments;
+}
+
+async function actionTypeText({ text, appName, delayMs = 0 } = {}) {
+  if (!text && text !== '') {
+    return { ok: false, error: 'text is required' };
+  }
+
+  const resolvedDelayMs = Math.min(500, Math.max(0, parseInt(delayMs ?? 0, 10)));
+
+  if (appName) {
+    const focusResult = await verifyAppFocused({ appName, waitMs: 5000 });
+    if (!focusResult.focused) {
+      return { ok: false, error: `App not focused: expected "${appName}", currently "${focusResult.appName}"`, focusResult };
+    }
+  }
+
+  let keyboard, Key;
+  try {
+    const nutjs = require('@nut-tree-fork/nut-js');
+    keyboard = nutjs.keyboard;
+    Key = nutjs.Key;
+  } catch (err) {
+    return { ok: false, error: `nut-js not available: ${err.message}` };
+  }
+
+  keyboard.config.autoDelayMs = resolvedDelayMs;
+
+  // Convert literal \n to {SHIFT+ENTER} so multiline text types correctly in chat inputs.
+  const normalizedText = text.replace(/\n/g, '{SHIFT+ENTER}');
+  const segments = _parseTypeTextSegments(normalizedText);
+  const startTime = Date.now();
+
+  try {
+    for (const seg of segments) {
+      if (seg.type === 'text') {
+        if (seg.value.length > 0) {
+          await keyboard.type(seg.value);
+        }
+      } else {
+        const token = seg.value.toUpperCase();
+        const comboMatch = _TYPE_TEXT_COMBO_PATTERN.exec(seg.value);
+
+        if (comboMatch) {
+          const modifier = comboMatch[1].toUpperCase();
+          const keyName  = comboMatch[2].toUpperCase();
+
+          const modifierKey = {
+            'CMD':   Key.LeftSuper,
+            'CTRL':  Key.LeftControl,
+            'ALT':   Key.LeftAlt,
+            'SHIFT': Key.LeftShift
+          }[modifier];
+
+          let targetKey = Key[keyName] || Key[keyName.charAt(0).toUpperCase() + keyName.slice(1).toLowerCase()];
+          if (!targetKey && keyName === 'ENTER') targetKey = Key.Return;
+
+          if (modifierKey && targetKey) {
+            await keyboard.pressKey(modifierKey, targetKey);
+            await keyboard.releaseKey(modifierKey, targetKey);
+          } else {
+            logger.warn(`[app.agent] actionTypeText: unknown combo key ${seg.value}`);
+          }
+        } else if (_TYPE_TEXT_TOKEN_MAP[token]) {
+          const keyName = _TYPE_TEXT_TOKEN_MAP[token];
+          const nutKey = Key[keyName];
+          if (nutKey !== undefined) {
+            await keyboard.pressKey(nutKey);
+            await keyboard.releaseKey(nutKey);
+          } else {
+            logger.warn(`[app.agent] actionTypeText: unknown key name ${keyName}`);
+          }
+        } else {
+          logger.warn(`[app.agent] actionTypeText: unrecognized token — typing literally: ${seg.value}`);
+          await keyboard.type(seg.value);
+        }
+      }
+    }
+  } catch (err) {
+    logger.error(`[app.agent] actionTypeText: keyboard input failed: ${err.message}`);
+    return { ok: false, error: `Keyboard input failed: ${err.message}` };
+  }
+
+  const elapsed = Date.now() - startTime;
+  logger.info(`[app.agent] actionTypeText done`, { typed: text.length, elapsed });
+  return { ok: true, typed: text, elapsed };
+}
+
+// ---------------------------------------------------------------------------
+// Per-app skill runner (skills pattern: single app.agent + per-app packages)
+// ---------------------------------------------------------------------------
+
+function _escapeRegex(string) {
+  return string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function _extractFilePathAndPrompt(task) {
+  // Find the first absolute path in the task.
+  const pathMatch = task.match(/(\/[^\s'"]+)/);
+  const filePath = pathMatch ? pathMatch[1] : null;
+  if (!filePath) return { filePath: null, prompt: null };
+
+  // Strip common boilerplate and the path to isolate the instruction.
+  let prompt = task
+    .replace(/open\s+/i, '')
+    .replace(new RegExp(_escapeRegex(filePath), 'i'), '')
+    .replace(/and\s+use\s+(the\s+)?app'?s?\s+AI\s+assistant\s+to\s+/i, '')
+    .replace(/and\s+ask\s+(the\s+)?AI\s+(assistant\s+)?to\s+/i, '')
+    .replace(/and\s+then\s+/i, '')
+    .replace(/^to\s+/i, '')
+    .trim();
+
+  prompt = prompt.replace(/[.!?]$/, '').trim();
+  return { filePath, prompt };
+}
+
+function _readAgentDescriptor(appName) {
+  try {
+    const filePath = _appAgentDescriptorPath(appName);
+    if (!fs.existsSync(filePath)) return null;
+    const content = fs.readFileSync(filePath, 'utf8');
+
+    // Parse YAML frontmatter for category and capabilities.
+    const fmMatch = content.match(/^---\n([\s\S]*?)\n---/);
+    let category = 'other';
+    let capabilities = [];
+    if (fmMatch) {
+      const fm = fmMatch[1];
+      const catMatch = fm.match(/category:\s*(.+)/);
+      if (catMatch) category = catMatch[1].trim();
+      const capMatch = fm.match(/capabilities:\s*\n([\s\S]*?)(?=\n\w|$)/);
+      if (capMatch) {
+        capabilities = capMatch[1].split('\n').map(l => l.trim().replace(/^- /, '')).filter(Boolean);
+      }
+    }
+
+    const shortcuts = _readShortcutsFromDescriptor(appName) || [];
+    return { filePath, category, capabilities, shortcuts };
+  } catch (err) {
+    logger.warn(`[app.agent] _readAgentDescriptor error: ${err.message}`);
+    return null;
+  }
+}
+
+async function _executeShortcutWithFallback({ appName, action, category }) {
+  // Try the descriptor action first.
+  const result = await actionExecuteShortcut({ appName, action });
+  if (result.ok) return result;
+
+  // Conservative category defaults for the proxy workflow.
+  const defaults = {
+    editor: { quick_open: 'Cmd+P', open_file_dialog: 'Cmd+O', focus_ai: 'Cmd+L', save: 'Cmd+S', select_all: 'Cmd+A' },
+    browser: { quick_open: 'Cmd+L', focus_ai: 'Cmd+Shift+A', save: 'Cmd+S', select_all: 'Cmd+A' },
+    chat: { focus_ai: 'Cmd+L', save: 'Cmd+S', select_all: 'Cmd+A' },
+    terminal: { save: 'Cmd+S', select_all: 'Cmd+A' },
+  };
+
+  const defaultShortcut = defaults[category]?.[action];
+  if (defaultShortcut) {
+    logger.warn(`[app.agent] actionRunAgent: descriptor action ${action} failed for ${appName}, trying default ${defaultShortcut}`);
+    return actionExecuteShortcut({ appName, shortcutOverride: defaultShortcut });
+  }
+
+  return result;
+}
+
+async function actionRunAgent({ appName, task, filePath, prompt, maxDurationMs = 300000 } = {}) {
+  if (!appName) {
+    return { ok: false, error: 'appName is required' };
+  }
+  if (!task && (!filePath || !prompt)) {
+    return { ok: false, error: 'task or (filePath + prompt) is required' };
+  }
+
+  let resolvedFilePath = filePath;
+  let resolvedPrompt = prompt;
+
+  if (task && (!resolvedFilePath || !resolvedPrompt)) {
+    const extracted = _extractFilePathAndPrompt(task);
+    resolvedFilePath = resolvedFilePath || extracted.filePath;
+    resolvedPrompt = resolvedPrompt || extracted.prompt;
+  }
+
+  if (!resolvedFilePath || !resolvedPrompt) {
+    return { ok: false, error: 'Could not extract filePath and prompt from task' };
+  }
+
+  const descriptor = _readAgentDescriptor(appName);
+  const category = descriptor?.category || KNOWN_APPS[appName] || 'other';
+
+  // 1. Verify app focused.
+  const focusResult = await verifyAppFocused({ appName, waitMs: 5000 });
+  if (!focusResult.focused) {
+    return { ok: false, error: `App not focused: ${appName}`, focusResult };
+  }
+
+  // 2. Open quick file switcher.
+  const openResult = await _executeShortcutWithFallback({ appName, action: 'quick_open', category });
+  if (!openResult.ok) {
+    return { ok: false, error: `Failed to open quick_open in ${appName}: ${openResult.error}`, openResult };
+  }
+  await _sleep(500);
+
+  // 3. Type file path and press Enter.
+  const typePathResult = await actionTypeText({ appName, text: `${resolvedFilePath}{ENTER}` });
+  if (!typePathResult.ok) {
+    return { ok: false, error: `Failed to type file path in ${appName}: ${typePathResult.error}`, typePathResult };
+  }
+  await _sleep(1000); // allow file to open
+
+  // 4. Focus AI assistant input.
+  const aiFocusResult = await _executeShortcutWithFallback({ appName, action: 'focus_ai', category });
+  if (!aiFocusResult.ok) {
+    return { ok: false, error: `Failed to focus AI in ${appName}: ${aiFocusResult.error}`, aiFocusResult };
+  }
+  await _sleep(500);
+
+  // 5. Type prompt and press Enter.
+  const typePromptResult = await actionTypeText({ appName, text: `${resolvedPrompt}{ENTER}` });
+  if (!typePromptResult.ok) {
+    return { ok: false, error: `Failed to type prompt in ${appName}: ${typePromptResult.error}`, typePromptResult };
+  }
+
+  // Give the app's AI a moment to start responding so the first monitor capture
+  // doesn't see a stale/jumbled screen before the response begins.
+  await _sleep(8000);
+
+  // 6. Wait for AI assistant to finish editing.
+  const monitorResult = await actionMonitorWithBackoff({
+    goal: `${appName} AI assistant has finished editing ${resolvedFilePath}`,
+    mode: 'passive',
+    maxDurationMs,
+    appName
+  });
+  if (!monitorResult.ok) {
+    return { ok: false, error: `Monitor failed: ${monitorResult.error}`, monitorResult };
+  }
+
+  // 7. Save the file.
+  const saveResult = await _executeShortcutWithFallback({ appName, action: 'save', category });
+  if (!saveResult.ok) {
+    return { ok: false, error: `Failed to save in ${appName}: ${saveResult.error}`, saveResult };
+  }
+
+  // 8. Verify the file was actually modified by the app's save action.
+  let fileVerified = false;
+  try {
+    const fs = require('fs');
+    const stats = await fs.promises.stat(resolvedFilePath);
+    const ageMs = Date.now() - stats.mtime.getTime();
+    fileVerified = ageMs < 120000; // saved within the last 2 minutes
+    if (!fileVerified) {
+      logger.warn(`[app.agent] actionRunAgent: file ${resolvedFilePath} mtime is ${ageMs}ms old; save may not have written through`);
+    }
+  } catch (statErr) {
+    logger.warn(`[app.agent] actionRunAgent: could not stat ${resolvedFilePath}: ${statErr.message}`);
+  }
+
+  return {
+    ok: true,
+    appName,
+    filePath: resolvedFilePath,
+    prompt: resolvedPrompt,
+    fileVerified,
+    summary: `Opened ${resolvedFilePath} in ${appName}, sent the prompt to the AI assistant, and saved the file.`
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Exports
 // ---------------------------------------------------------------------------
 
@@ -5801,6 +6267,8 @@ module.exports = {
   verifyAppFocused,
   actionGetActiveBounds,
   actionExecuteShortcut,
+  actionTypeText,
+  actionRunAgent,
   // Phase 3: Additional Use Cases
   actionMonitorFileUpload,
   actionMonitorBuildCompletion,

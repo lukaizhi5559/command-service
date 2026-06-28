@@ -64,48 +64,62 @@ function httpPost(host, port, urlPath, body, timeoutMs = 15000) {
 }
 
 async function screenCapture(args = {}) {
-  const timeoutMs = Math.min(60000, Math.max(5000, parseInt(args.timeoutMs || DEFAULT_TIMEOUT, 10)));
+  const baseTimeoutMs = Math.min(60000, Math.max(5000, parseInt(args.timeoutMs || DEFAULT_TIMEOUT, 10)));
   const startTime = Date.now();
+  const MAX_RETRIES = 2;
 
-  logger.info('[screen.capture] Capturing screen via screen-intelligence-service');
+  let lastError = null;
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    const timeoutMs = baseTimeoutMs + (attempt * 5000);
+    logger.info('[screen.capture] Capturing screen via screen-intelligence-service', { attempt: attempt + 1, timeoutMs });
 
-  try {
-    const result = await httpPost(
-      SCREEN_SERVICE_HOST,
-      SCREEN_SERVICE_PORT,
-      '/screen.analyze',
-      {},
-      timeoutMs
-    );
+    try {
+      const result = await httpPost(
+        SCREEN_SERVICE_HOST,
+        SCREEN_SERVICE_PORT,
+        '/screen.analyze',
+        {},
+        timeoutMs
+      );
 
-    if (!result?.success) {
-      return { success: false, error: result?.error || 'screen.analyze returned failure' };
+      if (!result?.success) {
+        lastError = result?.error || 'screen.analyze returned failure';
+        logger.warn('[screen.capture] analyze returned failure', { attempt: attempt + 1, error: lastError });
+        continue;
+      }
+
+      const text = result.text || result.rawText || '';
+      const elapsed = Date.now() - startTime;
+
+      logger.info('[screen.capture] Done', {
+        chars: text.length,
+        confidence: result.confidence,
+        app: result.appName,
+        elapsed,
+        attempts: attempt + 1
+      });
+
+      return {
+        success: true,
+        text,
+        appName: result.appName || null,
+        windowTitle: result.windowTitle || null,
+        url: result.url || null,
+        confidence: result.confidence || null,
+        elapsed,
+        stdout: text,  // expose as stdout so synthesize can consume it via {{prev_stdout}}
+      };
+    } catch (err) {
+      lastError = err.message;
+      logger.warn('[screen.capture] attempt failed', { attempt: attempt + 1, error: err.message });
+      if (attempt < MAX_RETRIES) {
+        await new Promise(r => setTimeout(r, 1000 * (attempt + 1)));
+      }
     }
-
-    const text = result.text || result.rawText || '';
-    const elapsed = Date.now() - startTime;
-
-    logger.info('[screen.capture] Done', {
-      chars: text.length,
-      confidence: result.confidence,
-      app: result.appName,
-      elapsed
-    });
-
-    return {
-      success: true,
-      text,
-      appName: result.appName || null,
-      windowTitle: result.windowTitle || null,
-      url: result.url || null,
-      confidence: result.confidence || null,
-      elapsed,
-      stdout: text,  // expose as stdout so synthesize can consume it via {{prev_stdout}}
-    };
-  } catch (err) {
-    logger.error('[screen.capture] Failed', { error: err.message });
-    return { success: false, error: `screen.capture failed: ${err.message}` };
   }
+
+  logger.error('[screen.capture] Failed after retries', { error: lastError });
+  return { success: false, error: `screen.capture failed: ${lastError}` };
 }
 
 module.exports = { screenCapture };

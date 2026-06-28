@@ -279,6 +279,8 @@ class CommandServiceMCPServer {
       ai_response_scroll:        appAgent.actionAiResponseScroll,
       monitor_with_backoff:      appAgent.actionMonitorWithBackoff,
       execute_shortcut:          appAgent.actionExecuteShortcut,
+      type_text:                 appAgent.actionTypeText,
+      run_agent:                 appAgent.actionRunAgent,
       get_recent_ocr:            appAgent.getRecentOCR,
       // Phase 3 additional use cases
       monitor_file_upload:       appAgent.actionMonitorFileUpload,
@@ -844,7 +846,10 @@ class CommandServiceMCPServer {
         const controller = new AbortController();
         let responded = false;
         const onClose = () => { if (!responded) controller.abort(); };
-        req.on('close', onClose);
+        // Use the socket's close event, not the request stream's close event,
+        // because req.on('close') fires as soon as the request body is consumed
+        // (end-of-stream), even though the HTTP connection is still alive.
+        if (req.socket) req.socket.on('close', onClose);
         req.on('aborted', onClose);
         req.on('end', async () => {
           try {
@@ -1086,6 +1091,7 @@ class CommandServiceMCPServer {
 
     process.on('SIGINT',  () => shutdown('SIGINT'));
     process.on('SIGTERM', () => shutdown('SIGTERM'));
+    process.on('SIGHUP',  () => logger.info('SIGHUP received — ignoring (background process)'));
 
     logger.info('Command Service ready');
   }
