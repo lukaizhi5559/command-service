@@ -6132,82 +6132,312 @@ async function actionRunAgent({ appName, task, filePath, prompt, maxDurationMs =
   const descriptor = _readAgentDescriptor(appName);
   const category = descriptor?.category || KNOWN_APPS[appName] || 'other';
 
-  // 1. Verify app focused.
-  const focusResult = await verifyAppFocused({ appName, waitMs: 5000 });
-  if (!focusResult.focused) {
-    return { ok: false, error: `App not focused: ${appName}`, focusResult };
-  }
+  // ── Self-healing retry loop ──────────────────────────────────────────────
+  // Re-attempts failed steps with a brief delay. Each retry re-verifies app focus
+  // and re-attempts the failed step. Steps are idempotent (quick_open, type_text).
+  const MAX_RETRIES = 2;
+  const retryDelays = [1000, 2000];
+  let lastError = null;
+  let attemptHistory = [];
 
-  // 2. Open quick file switcher.
-  const openResult = await _executeShortcutWithFallback({ appName, action: 'quick_open', category });
-  if (!openResult.ok) {
-    return { ok: false, error: `Failed to open quick_open in ${appName}: ${openResult.error}`, openResult };
-  }
-  await _sleep(500);
-
-  // 3. Type file path and press Enter.
-  const typePathResult = await actionTypeText({ appName, text: `${resolvedFilePath}{ENTER}` });
-  if (!typePathResult.ok) {
-    return { ok: false, error: `Failed to type file path in ${appName}: ${typePathResult.error}`, typePathResult };
-  }
-  await _sleep(1000); // allow file to open
-
-  // 4. Focus AI assistant input.
-  const aiFocusResult = await _executeShortcutWithFallback({ appName, action: 'focus_ai', category });
-  if (!aiFocusResult.ok) {
-    return { ok: false, error: `Failed to focus AI in ${appName}: ${aiFocusResult.error}`, aiFocusResult };
-  }
-  await _sleep(500);
-
-  // 5. Type prompt and press Enter.
-  const typePromptResult = await actionTypeText({ appName, text: `${resolvedPrompt}{ENTER}` });
-  if (!typePromptResult.ok) {
-    return { ok: false, error: `Failed to type prompt in ${appName}: ${typePromptResult.error}`, typePromptResult };
-  }
-
-  // Give the app's AI a moment to start responding so the first monitor capture
-  // doesn't see a stale/jumbled screen before the response begins.
-  await _sleep(8000);
-
-  // 6. Wait for AI assistant to finish editing.
-  const monitorResult = await actionMonitorWithBackoff({
-    goal: `${appName} AI assistant has finished editing ${resolvedFilePath}`,
-    mode: 'passive',
-    maxDurationMs,
-    appName
-  });
-  if (!monitorResult.ok) {
-    return { ok: false, error: `Monitor failed: ${monitorResult.error}`, monitorResult };
-  }
-
-  // 7. Save the file.
-  const saveResult = await _executeShortcutWithFallback({ appName, action: 'save', category });
-  if (!saveResult.ok) {
-    return { ok: false, error: `Failed to save in ${appName}: ${saveResult.error}`, saveResult };
-  }
-
-  // 8. Verify the file was actually modified by the app's save action.
-  let fileVerified = false;
-  try {
-    const fs = require('fs');
-    const stats = await fs.promises.stat(resolvedFilePath);
-    const ageMs = Date.now() - stats.mtime.getTime();
-    fileVerified = ageMs < 120000; // saved within the last 2 minutes
-    if (!fileVerified) {
-      logger.warn(`[app.agent] actionRunAgent: file ${resolvedFilePath} mtime is ${ageMs}ms old; save may not have written through`);
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    if (attempt > 0) {
+      logger.info(`[app.agent] actionRunAgent: retry attempt ${attempt}/${MAX_RETRIES} for ${appName} — last error: ${lastError?.slice(0, 120)}`);
+      await _sleep(retryDelays[attempt - 1] || 2000);
     }
-  } catch (statErr) {
-    logger.warn(`[app.agent] actionRunAgent: could not stat ${resolvedFilePath}: ${statErr.message}`);
+
+    // 1. Verify app focused.
+    const focusResult = await verifyAppFocused({ appName, waitMs: 5000 });
+    if (!focusResult.focused) {
+      lastError = `App not focused: ${appName}`;
+      attemptHistory.push({ step: 'focus', attempt, error: lastError });
+      continue;
+    }
+
+    // 2. Open quick file switcher.
+    const openResult = await _executeShortcutWithFallback({ appName, action: 'quick_open', category });
+    if (!openResult.ok) {
+      lastError = `Failed to open quick_open in ${appName}: ${openResult.error}`;
+      attemptHistory.push({ step: 'quick_open', attempt, error: lastError });
+      continue;
+    }
+    await _sleep(500);
+
+    // 3. Type file path and press Enter.
+    const typePathResult = await actionTypeText({ appName, text: `${resolvedFilePath}{ENTER}` });
+    if (!typePathResult.ok) {
+      lastError = `Failed to type file path in ${appName}: ${typePathResult.error}`;
+      attemptHistory.push({ step: 'type_path', attempt, error: lastError });
+      continue;
+    }
+    await _sleep(1000);
+
+    // 4. Focus AI assistant input.
+    const aiFocusResult = await _executeShortcutWithFallback({ appName, action: 'focus_ai', category });
+    if (!aiFocusResult.ok) {
+      lastError = `Failed to focus AI in ${appName}: ${aiFocusResult.error}`;
+      attemptHistory.push({ step: 'focus_ai', attempt, error: lastError });
+      continue;
+    }
+    await _sleep(500);
+
+    // 5. Type prompt and press Enter.
+    const typePromptResult = await actionTypeText({ appName, text: `${resolvedPrompt}{ENTER}` });
+    if (!typePromptResult.ok) {
+      lastError = `Failed to type prompt in ${appName}: ${typePromptResult.error}`;
+      attemptHistory.push({ step: 'type_prompt', attempt, error: lastError });
+      continue;
+    }
+
+    // Give the app's AI a moment to start responding.
+    await _sleep(8000);
+
+    // 6. Wait for AI assistant to finish editing.
+    const monitorResult = await actionMonitorWithBackoff({
+      goal: `${appName} AI assistant has finished editing ${resolvedFilePath}`,
+      mode: 'passive',
+      maxDurationMs,
+      appName
+    });
+    if (!monitorResult.ok) {
+      lastError = `Monitor failed: ${monitorResult.error}`;
+      attemptHistory.push({ step: 'monitor', attempt, error: lastError });
+      continue;
+    }
+
+    // 7. Save the file.
+    const saveResult = await _executeShortcutWithFallback({ appName, action: 'save', category });
+    if (!saveResult.ok) {
+      lastError = `Failed to save in ${appName}: ${saveResult.error}`;
+      attemptHistory.push({ step: 'save', attempt, error: lastError });
+      continue;
+    }
+
+    // 8. Verify the file was actually modified.
+    let fileVerified = false;
+    try {
+      const fs = require('fs');
+      const stats = await fs.promises.stat(resolvedFilePath);
+      const ageMs = Date.now() - stats.mtime.getTime();
+      fileVerified = ageMs < 120000;
+      if (!fileVerified) {
+        logger.warn(`[app.agent] actionRunAgent: file ${resolvedFilePath} mtime is ${ageMs}ms old; save may not have written through`);
+      }
+    } catch (statErr) {
+      logger.warn(`[app.agent] actionRunAgent: could not stat ${resolvedFilePath}: ${statErr.message}`);
+    }
+
+    return {
+      ok: true,
+      appName,
+      filePath: resolvedFilePath,
+      prompt: resolvedPrompt,
+      fileVerified,
+      retriesUsed: attempt,
+      summary: `Opened ${resolvedFilePath} in ${appName}, sent the prompt to the AI assistant, and saved the file.`
+    };
+  }
+
+  // All retries exhausted
+  return {
+    ok: false,
+    error: lastError || `Unknown failure in actionRunAgent for ${appName}`,
+    appName,
+    filePath: resolvedFilePath,
+    prompt: resolvedPrompt,
+    retriesUsed: MAX_RETRIES,
+    attemptHistory,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Action: build_agent — generate app.agent descriptor with shortcut playbooks
+// ---------------------------------------------------------------------------
+
+async function actionBuildAgent({ appName, force } = {}) {
+  if (!appName) {
+    return { ok: false, error: 'appName is required' };
+  }
+
+  const safe = appName.replace(/\s+/g, '_').toLowerCase();
+  const agentId = `${safe}.app.agent`;
+  const category = KNOWN_APPS[appName] || 'other';
+
+  // Check if already built (unless force)
+  if (!force) {
+    const descriptorPath = _appAgentDescriptorPath(appName);
+    if (fs.existsSync(descriptorPath)) {
+      const existing = _readAgentDescriptor(appName);
+      if (existing && existing.shortcuts && existing.shortcuts.length > 0) {
+        logger.info(`[app.agent] build_agent: ${agentId} already exists with ${existing.shortcuts.length} shortcuts — skipping (use force:true to rebuild)`);
+        return { ok: true, agentId, alreadyExists: true, shortcuts: existing.shortcuts.length };
+      }
+    }
+  }
+
+  // 1. Discover shortcuts via web crawl + category defaults
+  let shortcuts = [];
+  try {
+    const scResult = await actionDiscoverShortcuts({ appName, category });
+    shortcuts = scResult?.shortcuts || [];
+    logger.info(`[app.agent] build_agent: discovered ${shortcuts.length} shortcuts for ${appName}`);
+  } catch (err) {
+    logger.warn(`[app.agent] build_agent: shortcut discovery failed: ${err.message}`);
+  }
+
+  // 2. Enrich app context (boundary layout)
+  let boundaries = [];
+  try {
+    const ctxResult = await enrichAppContext({ appName });
+    boundaries = ctxResult?.boundaries || [];
+  } catch (err) {
+    logger.warn(`[app.agent] build_agent: context enrichment failed: ${err.message}`);
+  }
+
+  // 3. Build capabilities list from category schema
+  const categorySchema = CATEGORY_SCHEMAS[category] || {};
+  const capabilities = [
+    'scroll',
+    'highlight_boundaries',
+    'search_scroll',
+    'execute_shortcut',
+    'type_text',
+    'monitor_with_backoff',
+    'capture_screen',
+  ];
+  if (category === 'editor') {
+    capabilities.push('run_agent', 'quick_open', 'focus_ai', 'save');
+  }
+  if (category === 'chat') {
+    capabilities.push('passive_read_scroll', 'live_chat_scroll');
+  }
+
+  // 4. Build shortcut playbooks section
+  const shortcutRows = shortcuts.map(s =>
+    `| ${s.action || ''} | ${s.shortcut || ''} | ${s.context || ''} |`
+  ).join('\n');
+
+  const shortcutsSection = shortcuts.length > 0
+    ? `## Shortcuts\n| Action | Shortcut | Context |\n|--------|----------|----------|\n${shortcutRows}\n`
+    : '';
+
+  // 5. Build playbooks section — common task patterns per category
+  const playbooks = _buildAppPlaybooks(appName, category, shortcuts);
+
+  // 6. Assemble descriptor
+  const descriptor = `---
+id: ${agentId}
+type: app
+service: ${safe}
+category: ${category}
+capabilities:
+${capabilities.map(c => `  - ${c}`).join('\n')}
+last_validated: ${new Date().toISOString()}
+status: healthy
+---
+
+## Instructions
+Use app.agent skill for all native ${appName} desktop operations.
+The app must be running and focused before executing any action.
+
+## Capabilities
+${capabilities.map(c => `- ${c}`).join('\n')}
+
+${shortcutsSection}
+${playbooks}
+`.trim();
+
+  // 7. Write .md to disk
+  fs.mkdirSync(AGENTS_DIR, { recursive: true });
+  const mdPath = _appAgentDescriptorPath(appName);
+  fs.writeFileSync(mdPath, descriptor, 'utf8');
+  logger.info(`[app.agent] build_agent: wrote descriptor to ${mdPath}`);
+
+  // 8. Upsert into DuckDB
+  try {
+    const { withDb } = require('@thinkdrop/agents-db');
+    await withDb(async (db) => {
+      await db.run(
+        `INSERT OR REPLACE INTO agents
+           (id, type, service, cli_tool, capabilities, descriptor, last_validated, status, created_at)
+         VALUES (?, 'app', ?, NULL, ?, ?, CURRENT_TIMESTAMP, 'healthy', CURRENT_TIMESTAMP)`,
+        agentId,
+        safe,
+        JSON.stringify(capabilities),
+        descriptor
+      );
+    });
+    logger.info(`[app.agent] build_agent: upserted ${agentId} into DuckDB`);
+  } catch (dbErr) {
+    logger.warn(`[app.agent] build_agent: DuckDB upsert failed (non-fatal): ${dbErr.message}`);
   }
 
   return {
     ok: true,
+    agentId,
+    alreadyExists: false,
     appName,
-    filePath: resolvedFilePath,
-    prompt: resolvedPrompt,
-    fileVerified,
-    summary: `Opened ${resolvedFilePath} in ${appName}, sent the prompt to the AI assistant, and saved the file.`
+    category,
+    capabilities,
+    shortcutsCount: shortcuts.length,
+    mdPath,
+    descriptor,
   };
+}
+
+function _buildAppPlaybooks(appName, category, shortcuts) {
+  const findShortcut = (action) => shortcuts.find(s => s.action === action)?.shortcut || '';
+  const quickOpen = findShortcut('quick_open');
+  const focusAi = findShortcut('focus_ai');
+  const save = findShortcut('save');
+
+  const playbooks = [];
+
+  if (category === 'editor') {
+    playbooks.push(`### Open File and Send Prompt to AI (edit, fix, refactor, improve, change, update, modify, add, create, write, build, implement)
+ACTION: app.agent { action: "run_agent", appName: "${appName}", task: "open <filePath> and <prompt>" }
+QUICK_OPEN: ${quickOpen || 'Cmd+P'}
+FOCUS_AI: ${focusAi || 'Cmd+I'}
+SAVE: ${save || 'Cmd+S'}
+INSTRUCTION: Opens the file in ${appName}, sends the prompt to the built-in AI assistant, waits for completion, and saves.`);
+
+    playbooks.push(`### Search Within Project (find, search, locate, grep, where is)
+ACTION: app.agent { action: "execute_shortcut", appName: "${appName}", action: "search" }
+SHORTCUT: ${findShortcut('search') || 'Cmd+Shift+F'}
+INSTRUCTION: Opens project-wide search in ${appName}.`);
+
+    playbooks.push(`### Go to Definition (jump, go to, definition, declaration)
+ACTION: app.agent { action: "execute_shortcut", appName: "${appName}", action: "go_to_definition" }
+SHORTCUT: ${findShortcut('go_to_definition') || 'F12'}
+INSTRUCTION: Jumps to the definition of the symbol under the cursor.`);
+  }
+
+  if (category === 'chat') {
+    playbooks.push(`### Read Latest Messages (read, check, what did, latest, recent, scroll up)
+ACTION: app.agent { action: "passive_read_scroll", appName: "${appName}", mode: "passive" }
+INSTRUCTION: Scrolls to the latest messages in ${appName} and captures the content.`);
+
+    playbooks.push(`### Search Messages (search, find message, find conversation)
+ACTION: app.agent { action: "execute_shortcut", appName: "${appName}", action: "search" }
+SHORTCUT: ${findShortcut('search') || 'Cmd+F'}
+INSTRUCTION: Opens the search bar in ${appName}.`);
+  }
+
+  if (category === 'browser') {
+    playbooks.push(`### Navigate to URL (go to, open, navigate, visit)
+ACTION: app.agent { action: "type_text", appName: "${appName}", text: "<url>{ENTER}" }
+SHORTCUT: ${findShortcut('focus_address_bar') || 'Cmd+L'}
+INSTRUCTION: Focuses the address bar and types the URL.`);
+  }
+
+  // Generic: scroll and read
+  playbooks.push(`### Scroll and Read Content (scroll, read, see, view, content, page)
+ACTION: app.agent { action: "scroll", appName: "${appName}", direction: "down" }
+INSTRUCTION: Scrolls down in ${appName} to reveal more content. Use direction: "up" to scroll back up.`);
+
+  if (playbooks.length === 0) return '';
+
+  return `## Playbooks\n\n${playbooks.join('\n\n')}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -6269,6 +6499,7 @@ module.exports = {
   actionExecuteShortcut,
   actionTypeText,
   actionRunAgent,
+  actionBuildAgent,
   // Phase 3: Additional Use Cases
   actionMonitorFileUpload,
   actionMonitorBuildCompletion,

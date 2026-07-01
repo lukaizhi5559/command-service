@@ -986,6 +986,22 @@ function _resolvePlaybook(descriptor, task, agentId) {
 }
 
 // ---------------------------------------------------------------------------
+// _isPureSearchTask — true when the task is just a search/lookup and does not
+// ask to watch, play, summarize, extract, or otherwise consume a video.
+// ---------------------------------------------------------------------------
+function _isPureSearchTask(task) {
+  if (!task) return false;
+  const t = task.toLowerCase();
+  // Must be a search/lookup request
+  const hasSearchVerb = /\b(search|find|look up|lookup)\b/.test(t);
+  if (!hasSearchVerb) return false;
+  // Must NOT ask for video consumption/extraction/analysis
+  const videoExtraction = /\b(watch|play|view|open|summarize|summarise|extract|describe|explain|analyze|analyse|learn from|transcript|steps|content)\b/.test(t);
+  if (videoExtraction) return false;
+  return true;
+}
+
+// ---------------------------------------------------------------------------
 // _cosineSim — dot-product cosine similarity between two equal-length vectors.
 // ---------------------------------------------------------------------------
 function _cosineSim(a, b) {
@@ -3269,7 +3285,15 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
         const platformMatch = _matchedPlaybook.match(/PLATFORM:\s*(\S+)/);
         const platform = platformMatch ? platformMatch[1] : serviceKey;
 
-        if (delegateSkill === 'video.agent') {
+        // Pure search/lookup tasks should stay in browser.agent instead of being handed to video.agent.
+        // e.g. "search YouTube for sourdough bread tutorials" should use the Search Videos playbook.
+        if (delegateSkill === 'video.agent' && _isPureSearchTask(task)) {
+          logger.info(`[browser.agent] run: pure search task detected for ${agentId} — keeping in browser.agent, skipping video.agent delegation`);
+          _matchedPlaybook = _matchedPlaybook
+            .split(/(?=\n### )/)
+            .filter(block => !block.includes('DELEGATE_TO: video.agent'))
+            .join('');
+        } else if (delegateSkill === 'video.agent') {
           // Strip instruction noise before passing to video.agent.
           // Task like "watch X, extract the key steps, then summarize" → "X"
           // Only the video identity part (title/creator) should reach the search.

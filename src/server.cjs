@@ -302,6 +302,8 @@ class CommandServiceMCPServer {
       clipboard_backup:              appAgent.actionClipboardBackup,
       clipboard_restore:             appAgent.actionClipboardRestore,
       extract_content_via_clipboard: appAgent.actionExtractContentViaClipboard,
+      // Phase 5: Agent factory
+      build_agent:                   appAgent.actionBuildAgent,
     };
 
     const fn = ACTION_MAP[action];

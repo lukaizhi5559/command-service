@@ -145,11 +145,89 @@ const KNOWN_CLI_MAP = {
   linear:      { cli: null, method: null, pkg: null, tokenCmd: null, isApiKey: true,  apiKeyUrl: 'https://linear.app/settings/api',                   apiKeyEnvVar: 'LINEAR_API_KEY' },
   sendgrid:    { cli: null, method: null, pkg: null, tokenCmd: null, isApiKey: true,  apiKeyUrl: 'https://app.sendgrid.com/settings/api_keys',         apiKeyEnvVar: 'SENDGRID_API_KEY' },
   mailgun:     { cli: null, method: null, pkg: null, tokenCmd: null, isApiKey: true,  apiKeyUrl: 'https://app.mailgun.com/settings/api_security',      apiKeyEnvVar: 'MAILGUN_API_KEY' },
-  pinecone:    { cli: null, method: null, pkg: null, tokenCmd: null, isApiKey: true,  apiKeyUrl: 'https://app.pinecone.io/organizations/-/projects/-/keys', apiKeyEnvVar: 'PINECONE_API_KEY' },
+  pinecone:    { cli: null, method: null, pkg: null, tokenCmd: null, isApiKey: true,  apiKeyUrl: 'https://pinecone.io/organizations/-/projects/-/keys', apiKeyEnvVar: 'PINECONE_API_KEY' },
   cohere:      { cli: null, method: null, pkg: null, tokenCmd: null, isApiKey: true,  apiKeyUrl: 'https://dashboard.cohere.com/api-keys',              apiKeyEnvVar: 'COHERE_API_KEY' },
   huggingface: { cli: null, method: null, pkg: null, tokenCmd: null, isApiKey: true,  apiKeyUrl: 'https://huggingface.co/settings/tokens',             apiKeyEnvVar: 'HF_TOKEN' },
   google:      { cli: 'gcloud',      method: 'brew', pkg: 'google-cloud-sdk',             tokenCmd: ['auth', 'print-access-token'] },
 };
+
+// ---------------------------------------------------------------------------
+// CLI registry loader — merges runtime cli-registry.json providers into
+// KNOWN_CLI_MAP so preflight and build_agent know about pandoc, ffmpeg,
+// imagemagick, etc. without hardcoding them.
+// ---------------------------------------------------------------------------
+
+const CLI_REGISTRY_PATH = path.join(__dirname, '..', 'cli-registry.json');
+
+function loadCliRegistry() {
+  try {
+    if (!fs.existsSync(CLI_REGISTRY_PATH)) return null;
+    return JSON.parse(fs.readFileSync(CLI_REGISTRY_PATH, 'utf8'));
+  } catch (err) {
+    logger.warn(`[cli.agent] loadCliRegistry: failed — ${err.message}`);
+    return null;
+  }
+}
+
+function registryProviderToMeta(provider) {
+  const method = provider.installSource?.startsWith('npm') ? 'npm'
+    : provider.installSource?.startsWith('pip') ? 'pip'
+    : provider.installSource?.startsWith('brew') ? 'brew'
+    : provider.installSource?.startsWith('curl') ? 'curl'
+    : 'brew';
+
+  let pkg = provider.installPkg || null;
+  if (!pkg && provider.installCmd) {
+    const parts = provider.installCmd.trim().split(/\s+/);
+    const installIdx = parts.findIndex(p => p === 'install' || p === 'i');
+    const candidate = installIdx >= 0 && parts[installIdx + 1] ? parts[installIdx + 1] : null;
+    pkg = candidate ? candidate.replace(/^-+/, '') : parts[parts.length - 1];
+  }
+
+  return {
+    cli: provider.tool || null,
+    method,
+    pkg,
+    tokenCmd: null,
+    isOAuth: provider.authType === 'oauth',
+    isApiKey: provider.authType === 'env',
+    authEnv: provider.authEnv || [],
+    authCmd: provider.authCmd || null,
+    apiKeyEnvVar: provider.authEnv?.[0] || null,
+    apiKeyUrl: provider.links?.[0]?.url || null,
+    _keywords: [],
+  };
+}
+
+function mergeRegistryIntoKnownMap(registry) {
+  if (!registry || typeof registry !== 'object') return;
+  for (const [serviceKey, serviceDef] of Object.entries(registry)) {
+    const providers = serviceDef.providers || {};
+    const defaultProvider = serviceDef.defaultProvider;
+    const keywords = Array.isArray(serviceDef.keywords) ? serviceDef.keywords : [];
+
+    for (const [providerKey, provider] of Object.entries(providers)) {
+      const meta = registryProviderToMeta(provider);
+      const key = providerKey.toLowerCase().replace(/[^a-z0-9]/g, '');
+      if (!KNOWN_CLI_MAP[key]) {
+        KNOWN_CLI_MAP[key] = { ...meta, _keywords: [...keywords, providerKey, provider.tool || ''].filter(Boolean) };
+      } else if (KNOWN_CLI_MAP[key]._keywords) {
+        KNOWN_CLI_MAP[key]._keywords.push(...keywords, providerKey, provider.tool || '');
+      }
+    }
+
+    if (defaultProvider && providers[defaultProvider]) {
+      const key = serviceKey.toLowerCase().replace(/[^a-z0-9]/g, '');
+      const meta = registryProviderToMeta(providers[defaultProvider]);
+      if (!KNOWN_CLI_MAP[key]) {
+        KNOWN_CLI_MAP[key] = { ...meta, _keywords: [...keywords, serviceKey, defaultProvider, providers[defaultProvider].tool || ''].filter(Boolean) };
+      }
+    }
+  }
+}
+
+const CLI_REGISTRY = loadCliRegistry();
+mergeRegistryIntoKnownMap(CLI_REGISTRY);
 
 // ---------------------------------------------------------------------------
 // LLM-driven CLI meta resolution — called when service is not in KNOWN_CLI_MAP
@@ -2818,21 +2896,37 @@ async function actionPreflightCheck({ task, clis: explicitClis }) {
       logger.warn(`[cli.agent] preflight_check: LLM extraction failed — ${llmErr.message}`);
     }
 
-    // Fallback: if LLM unavailable or returned nothing, use KNOWN_CLI_MAP keyword matching
+    // Fallback: if LLM unavailable or returned nothing, use KNOWN_CLI_MAP keyword matching.
+    // Registry-loaded entries carry _keywords, so phrases like "convert to pdf" match the pdf service.
     if (!llmExtracted) {
       const taskLower = task.toLowerCase();
       const knownServices = Object.keys(KNOWN_CLI_MAP);
-      const matched = knownServices.filter(svc => taskLower.includes(svc));
-      llmExtracted = matched.map(svc => ({
-        service:       svc,
-        cli:           KNOWN_CLI_MAP[svc]?.cli || null,
-        installMethod: KNOWN_CLI_MAP[svc]?.method || null,
-        installPkg:    KNOWN_CLI_MAP[svc]?.pkg || null,
-        isApiKey:      KNOWN_CLI_MAP[svc]?.isApiKey || false,
-        isOAuth:       KNOWN_CLI_MAP[svc]?.isOAuth  || false,
-      }));
+      const matchedSet = new Map();
+      for (const svc of knownServices) {
+        const meta = KNOWN_CLI_MAP[svc];
+        if (taskLower.includes(svc)) {
+          matchedSet.set(svc, meta);
+          continue;
+        }
+        const keywords = Array.isArray(meta._keywords) ? meta._keywords : [];
+        if (keywords.some(k => k && taskLower.includes(k.toLowerCase()))) {
+          matchedSet.set(svc, meta);
+        }
+      }
+      const matched = Array.from(matchedSet.keys());
+      llmExtracted = matched.map(svc => {
+        const meta = KNOWN_CLI_MAP[svc];
+        return {
+          service:       svc,
+          cli:           meta?.cli || null,
+          installMethod: meta?.method || null,
+          installPkg:    meta?.pkg || null,
+          isApiKey:      meta?.isApiKey || false,
+          isOAuth:       meta?.isOAuth  || false,
+        };
+      });
       if (matched.length > 0) {
-        logger.info(`[cli.agent] preflight_check: keyword fallback matched ${matched.length} service(s)`);
+        logger.info(`[cli.agent] preflight_check: keyword fallback matched ${matched.length} service(s) — ${matched.join(', ')}`);
       }
     }
   }
