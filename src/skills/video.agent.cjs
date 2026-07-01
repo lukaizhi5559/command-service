@@ -23,6 +23,96 @@ const adHandler = require('./ad-handler.cjs');
 // User Memory MCP configuration
 const USER_MEMORY_URL = process.env.USER_MEMORY_MCP_URL || 'http://localhost:3001';
 
+// ── yt-dlp version management ────────────────────────────────────────────────
+// yt-dlp tracks YouTube's internal API and must be updated every ~4-6 weeks.
+// We check once per process startup and auto-upgrade if the binary is stale.
+let _ytdlpChecked = false;  // true after the first successful check this process
+let _ytdlpUpgrading = null; // Promise<void> while upgrade is in progress
+
+/**
+ * Parse a yt-dlp version string like "2026.03.17" into a Date.
+ * Returns null if unparseable.
+ */
+function _parseYtDlpDate(versionStr) {
+  const m = (versionStr || '').match(/(\d{4})\.(\d{2})\.(\d{2})/);
+  if (!m) return null;
+  return new Date(`${m[1]}-${m[2]}-${m[3]}`);
+}
+
+/**
+ * Run pip3 install --upgrade yt-dlp.
+ * Returns { ok, newVersion } — always resolves (never throws).
+ */
+async function _upgradeYtDlp() {
+  const { spawn } = require('child_process');
+  return new Promise((resolve) => {
+    logger.info('[video.agent] Upgrading yt-dlp via pip3...');
+    const proc = spawn('pip3', ['install', '--upgrade', 'yt-dlp', '--quiet'], { timeout: 60000 });
+    let stderr = '';
+    proc.stderr.on('data', d => { stderr += d.toString(); });
+    proc.on('error', err => {
+      logger.warn(`[video.agent] pip3 upgrade failed: ${err.message}`);
+      resolve({ ok: false });
+    });
+    proc.on('close', (code) => {
+      if (code !== 0) {
+        logger.warn(`[video.agent] pip3 upgrade exited ${code}: ${stderr.slice(0, 200)}`);
+        resolve({ ok: false });
+        return;
+      }
+      // Read the new version after upgrade
+      const { spawnSync } = require('child_process');
+      const ytdlpPath = spawnSync('which', ['yt-dlp'], { encoding: 'utf8' }).stdout.trim() || 'yt-dlp';
+      const vRes = spawnSync(ytdlpPath, ['--version'], { encoding: 'utf8', timeout: 5000 });
+      const newVersion = (vRes.stdout || '').trim();
+      logger.info(`[video.agent] yt-dlp upgraded successfully → ${newVersion}`);
+      resolve({ ok: true, newVersion });
+    });
+  });
+}
+
+/**
+ * Ensure yt-dlp is fresh (≤60 days old). Runs at most once per process.
+ * If stale, upgrades in-place before returning.
+ * On any error, logs a warning and proceeds — never blocks transcription.
+ */
+async function ensureYtDlpFresh() {
+  if (_ytdlpChecked) return;           // already verified this process
+  if (_ytdlpUpgrading) return _ytdlpUpgrading; // upgrade already in flight
+
+  _ytdlpUpgrading = (async () => {
+    try {
+      const { spawnSync } = require('child_process');
+      const ytdlpPath = spawnSync('which', ['yt-dlp'], { encoding: 'utf8' }).stdout.trim() || 'yt-dlp';
+      const vRes = spawnSync(ytdlpPath, ['--version'], { encoding: 'utf8', timeout: 5000 });
+      const versionStr = (vRes.stdout || '').trim();
+      const vDate = _parseYtDlpDate(versionStr);
+
+      if (!vDate) {
+        logger.warn(`[video.agent] Could not parse yt-dlp version: "${versionStr}" — skipping freshness check`);
+        return;
+      }
+
+      const ageMs = Date.now() - vDate.getTime();
+      const ageDays = Math.floor(ageMs / 86400000);
+      logger.info(`[video.agent] yt-dlp version ${versionStr} (${ageDays} days old)`);
+
+      if (ageDays > 60) {
+        logger.info(`[video.agent] yt-dlp is ${ageDays} days old (threshold: 60) — auto-upgrading...`);
+        await _upgradeYtDlp();
+      } else {
+        logger.info(`[video.agent] yt-dlp is fresh (${ageDays} days old) — no upgrade needed`);
+      }
+    } catch (err) {
+      logger.warn(`[video.agent] yt-dlp freshness check failed (non-fatal): ${err.message}`);
+    } finally {
+      _ytdlpChecked = true;
+    }
+  })();
+
+  return _ytdlpUpgrading;
+}
+
 /**
  * Detect video platform from URL
  */
@@ -165,50 +255,17 @@ async function extractMetadata(videoUrl, platform, browserAct, sessionId = 'defa
 }
 
 /**
- * Extract YouTube-specific text sources (transcript, description)
+ * Extract YouTube-specific text sources (description only).
+ * NOTE: Transcript extraction via in-page button click has been intentionally removed.
+ * browser.act's resolveRefForClick can match sidebar recommendation links instead of the
+ * transcript toggle button, causing navigation to a different video before metadata is read.
+ * Full transcription is handled by transcribeWithYtDlp (yt-dlp subtitles → Whisper fallback).
  */
 async function extractYouTubeText(videoUrl, browserAct) {
   const sources = { transcript: null, description: null, comments: [] };
   
   try {
-    // Try to get transcript - use evaluate to check and click transcript button
-    const hasTranscriptBtn = await browserAct({
-      action: 'evaluate',
-      expression: `!!document.querySelector('button[aria-label*="transcript"], button[title*="transcript"]')`
-    });
-    
-    if (hasTranscriptBtn?.result) {
-      await browserAct({
-        action: 'click',
-        selector: 'button[aria-label*="transcript"], button[title*="transcript"]'
-      });
-      await new Promise(r => setTimeout(r, 1000));
-    }
-    
-    // Extract transcript segments using evaluate
-    const transcriptResult = await browserAct({
-      action: 'evaluate',
-      expression: `
-        (() => {
-          const segments = document.querySelectorAll('ytd-transcript-segment-renderer');
-          if (segments.length === 0) return null;
-          
-          const texts = [];
-          segments.forEach(seg => {
-            const text = seg.querySelector('.segment-text')?.textContent;
-            const time = seg.querySelector('.segment-timestamp')?.textContent;
-            if (text) texts.push({ time, text });
-          });
-          return texts;
-        })()
-      `
-    });
-    
-    if (transcriptResult?.result) {
-      sources.transcript = transcriptResult.result;
-    }
-
-    // Get description using evaluate
+    // Get description using evaluate (no click actions — avoids risk of navigation)
     const descResult = await browserAct({
       action: 'evaluate',
       expression: `
@@ -239,10 +296,29 @@ async function extractGenericPageContent(videoUrl, browserAct) {
   };
 
   try {
-    // Extract page title
+    // Verify we are still on the expected page before extracting any metadata.
+    // A misresolved click earlier in the pipeline could have navigated away.
+    try {
+      const urlCheck = await browserAct({
+        action: 'evaluate',
+        expression: `window.location.href`
+      });
+      const currentUrl = String(urlCheck?.result || urlCheck?.stdout || '').replace(/^"|"$/g, '').trim();
+      if (currentUrl && videoUrl && !currentUrl.includes(new URL(videoUrl).hostname)) {
+        logger.warn(`[video.agent] URL drift detected: expected ${videoUrl}, got ${currentUrl} — re-navigating`);
+        await browserAct({ action: 'navigate', url: videoUrl });
+        await new Promise(r => setTimeout(r, 2000));
+      }
+    } catch (_) { /* non-fatal — proceed with extraction */ }
+
+    // Extract page title — prefer og:title (set at page load, stable) over document.title (can drift)
     const titleResult = await browserAct({
       action: 'evaluate',
-      expression: `document.title?.replace(/ - YouTube$| - Vimeo$/, '') || null`
+      expression: `
+        document.querySelector('meta[property="og:title"]')?.content ||
+        document.title?.replace(/ - YouTube$| - Vimeo$/, '') ||
+        null
+      `
     });
     content.title = titleResult?.result || titleResult?.stdout;
 
@@ -345,32 +421,53 @@ async function transcribeWithYtDlp(videoUrl) {
   const crypto = require('crypto');
   const fs = require('fs');
 
+  // Ensure yt-dlp is up to date before attempting extraction (once per process)
+  await ensureYtDlpFresh();
+
   const hash = crypto.createHash('md5').update(videoUrl).digest('hex').slice(0, 8);
   const outTemplate = path.join(os.tmpdir(), `thinkdrop_transcript_${hash}`);
+
+  // ── Helper: run yt-dlp subtitle extraction ───────────────────────────────
+  const _runYtDlpSubs = () => {
+    const ytdlpPath = spawnSync('which', ['yt-dlp'], { encoding: 'utf8' }).stdout.trim() || 'yt-dlp';
+    return new Promise((resolve) => {
+      const proc = spawn(ytdlpPath, [
+        videoUrl,
+        '--write-auto-subs',
+        '--sub-lang', 'en',
+        '--skip-download',
+        '--convert-subs', 'srt',
+        '--no-playlist',
+        '--js-runtimes', 'node',
+        '-o', outTemplate,
+        '--quiet',
+      ], { timeout: 30000 });
+
+      let stderr = '';
+      proc.stderr.on('data', d => { stderr += d.toString(); });
+      proc.on('error', err => resolve({ ok: false, error: err.message }));
+      proc.on('close', code => resolve({ ok: code === 0, code, stderr }));
+    });
+  };
 
   // ── PRIMARY: yt-dlp subtitle extraction ──────────────────────────────────
   logger.info(`[video.agent] transcribeWithYtDlp: extracting subtitles for ${videoUrl}`);
 
-  const ytdlpPath = spawnSync('which', ['yt-dlp'], { encoding: 'utf8' }).stdout.trim() || 'yt-dlp';
+  let ytResult = await _runYtDlpSubs();
 
-  const ytResult = await new Promise((resolve) => {
-    const proc = spawn(ytdlpPath, [
-      videoUrl,
-      '--write-auto-subs',
-      '--sub-lang', 'en',
-      '--skip-download',
-      '--convert-subs', 'srt',
-      '--no-playlist',
-      '--js-runtimes', 'node',
-      '-o', outTemplate,
-      '--quiet',
-    ], { timeout: 30000 });
-
-    let stderr = '';
-    proc.stderr.on('data', d => { stderr += d.toString(); });
-    proc.on('error', err => resolve({ ok: false, error: err.message }));
-    proc.on('close', code => resolve({ ok: code === 0, code, stderr }));
-  });
+  // ── Reactive staleness recovery ───────────────────────────────────────────
+  // If yt-dlp itself warned about being outdated in stderr, upgrade and retry once.
+  // This catches the case where ensureYtDlpFresh() ran but the version was borderline,
+  // or the binary changed between startup and now.
+  const _stalenessWarning = /older than \d+ days/i.test(ytResult.stderr || '');
+  if (_stalenessWarning && !ytResult.ok) {
+    logger.info('[video.agent] yt-dlp reported staleness warning on failure — upgrading and retrying once...');
+    _ytdlpChecked = false; // reset so ensureYtDlpFresh will re-run upgrade
+    await _upgradeYtDlp();
+    _ytdlpChecked = true;
+    ytResult = await _runYtDlpSubs();
+    logger.info(`[video.agent] yt-dlp retry after upgrade: ok=${ytResult.ok}`);
+  }
 
   // yt-dlp writes <outTemplate>.en.srt (or similar)
   let srtFile = null;

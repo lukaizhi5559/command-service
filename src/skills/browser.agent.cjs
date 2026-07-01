@@ -28,45 +28,6 @@ const fs   = require('fs');
 const http = require('http');
 const logger = require('../logger.cjs');
 
-const SERVICE_UNAVAILABLE_PATTERNS = [
-  /\bhigh\s*demand\b/i,
-  /\brate\s*limit(?:ed|ing)?\b/i,
-  /\btoo\s+many\s+requests\b/i,
-  /\bat\s+capacity\b/i,
-  /\bover\s+capacity\b/i,
-  /\bserver\s+busy\b/i,
-  /\bbusy\s+right\s+now\b/i,
-  /\bmaintenance\b/i,
-  /\bdown\s+for\s+maintenance\b/i,
-  /\btemporarily\s+unavailable\b/i,
-  /\bservice\s+unavailable\b/i,
-  /\boutage\b/i,
-  /\bdegraded\s+service\b/i,
-  /\b(error\s+404|http\s+404|status\s+404|404\s+not\s+found|404\s+error)\b/i,
-  /\b(error\s+429|http\s+429|status\s+429|429\s+too\s+many|rate\s+limited\s+429)\b/i,
-  /\b(error\s+500|http\s+500|status\s+500|500\s+internal\s+server|500\s+error|internal\s+server\s+error\s+500)\b/i,
-  /\b(error\s+502|http\s+502|status\s+502|502\s+bad\s+gateway|502\s+error)\b/i,
-  /\b(error\s+503|http\s+503|status\s+503|503\s+service\s+unavailable|503\s+error)\b/i,
-  /\bpage\s+not\s+found\b/i,
-  /\binternal\s+server\s+error\b/i,
-  /\bbad\s+gateway\b/i,
-  /\bsomething\s+went\s+wrong\b/i,
-  /\bsite\s+can(?:no)?t\s+be\s+reached\b/i,
-  /\bconnection\s+refused\b/i,
-  /\bname\s+not\s+resolved\b/i,
-  /\bnetwork\s+error\b/i,
-  /\berr_(?:connection|name|timed_out|ssl|internet)\w*\b/i,
-  /\bcoming\s+soon\b/i,
-  /\bunder\s+construction\b/i,
-  /\bearly\s+access\b/i,
-  /\baccess\s+blocked\b/i,
-  /\baccess\s+denied\b/i,
-  /\bnot\s+available\s+in\s+your\s+(?:region|country)\b/i,
-  /\bunsupported\s+region\b/i,
-  /\bupgrade\s+required\b/i,
-  /\bplan\s+required\b/i,
-];
-
 // ---------------------------------------------------------------------------
 // WALT: Build JavaScript extraction code for different extract types
 // ---------------------------------------------------------------------------
@@ -267,14 +228,6 @@ function getContentExtractionConfig(hostname) {
   return map?.content_extraction || null;
 }
 
-function detectServiceUnavailable(text) {
-  if (typeof text !== 'string' || !text.trim()) return null;
-  for (const pattern of SERVICE_UNAVAILABLE_PATTERNS) {
-    const match = text.match(pattern);
-    if (match && match[0]) return match[0];
-  }
-  return null;
-}
 const { userAgent } = require('./user.agent.cjs');
 
 const { resolveDestination, recordCorrection, classifyTaskIntent } = require('../skill-helpers/destination-resolver.cjs');
@@ -4309,20 +4262,6 @@ When extracting page content with run-code, prioritize these selectors over gene
             researchContentEmpty: true,
             serviceUnavailable: true,
             unavailableReason: `HTTP ${_httpStatus}`,
-            httpStatus: _httpStatus,
-          };
-        }
-        const _unavailableReason = detectServiceUnavailable(agentResultText);
-        if (_unavailableReason) {
-          logger.warn(`[browser.agent] Research quality gate: unusable service state for ${agentId} (${_unavailableReason}) — marking serviceUnavailable`);
-          return {
-            ok: false,
-            agentId,
-            task,
-            error: `${agentId} could not fulfill the research step because the service showed an unavailable or blocked page (${_unavailableReason}).`,
-            researchContentEmpty: true,
-            serviceUnavailable: true,
-            unavailableReason: _unavailableReason,
             httpStatus: _httpStatus,
           };
         }

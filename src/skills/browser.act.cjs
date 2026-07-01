@@ -2964,7 +2964,7 @@ async function browserAct(args) {
       // Layer 5: LLM smart extraction for YouTube and complex pages when no links found
       if (mergedContent.links.length === 0 && pageText.length > 100) {
         try {
-          const { ask } = require('../skill-llm.cjs');
+          const { ask } = require('../skill-helpers/skill-llm.cjs');
           const llmExtractionPrompt = `Extract all video links from this page text. Look for video titles and their corresponding YouTube watch URLs.
 
 Page text (first 15000 chars):

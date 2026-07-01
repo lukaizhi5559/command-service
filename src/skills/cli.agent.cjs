@@ -118,7 +118,7 @@ const KNOWN_CLI_MAP = {
   vercel:      { cli: 'vercel',      method: 'npm',  pkg: 'vercel',                       tokenCmd: ['whoami'] },
   firebase:    { cli: 'firebase',    method: 'npm',  pkg: 'firebase-tools',               tokenCmd: ['login:ci'] },
   gcloud:      { cli: 'gcloud',      method: 'brew', pkg: 'google-cloud-sdk',             tokenCmd: ['auth', 'print-access-token'] },
-  fly:         { cli: 'fly',         method: 'brew', pkg: 'flyctl',                       tokenCmd: ['auth', 'token'] },
+  fly:         { cli: 'fly',         method: 'brew', pkg: 'flyctl',                       tokenCmd: ['auth', 'token'], installUrl: 'https://fly.io/install.sh' },
   doctl:       { cli: 'doctl',       method: 'brew', pkg: 'doctl',                        tokenCmd: ['auth', 'token'] },
   docker:      { cli: 'docker',      method: 'brew', pkg: 'docker',                       tokenCmd: null },
   twilio:      { cli: 'twilio',      method: 'npm',  pkg: 'twilio-cli',                   tokenCmd: ['profiles:list'] },
@@ -456,11 +456,31 @@ async function actionInstall({ cli, service, method }) {
   const cliName   = cli || meta?.cli;
   const instMethod = method || meta?.method || 'brew';
   const pkg        = meta?.pkg || cliName;
+  const installUrl = meta?.installUrl || null;
 
   if (!cliName) return { ok: false, error: 'Cannot determine CLI name' };
 
   const alreadyAt = await whichCli(cliName);
   if (alreadyAt) return { ok: true, alreadyInstalled: true, cli: cliName, binPath: alreadyAt };
+
+  // If the CLI uses a script-based install (curl | bash pattern), route through vet
+  // for security: vet fetches, lints with shellcheck, diffs, and requires approval.
+  if (installUrl && instMethod === 'script') {
+    const vetPath = await whichCli('vet');
+    if (vetPath) {
+      logger.info(`[cli.agent] actionInstall: routing ${cliName} through vet for secure install from ${installUrl}`);
+      const result = await spawnCapture(vetPath, [installUrl], { timeoutMs: 120000 });
+      if (!result.ok) return { ok: false, error: result.stderr || result.error, stdout: result.stdout };
+      const binPath = await whichCli(cliName);
+      return { ok: true, alreadyInstalled: false, cli: cliName, binPath, stdout: result.stdout, vetted: true };
+    }
+    // vet not available — fall back to curl | bash with a security warning
+    logger.warn(`[cli.agent] actionInstall: vet not available — falling back to curl|bash for ${cliName}. Install vet for secure installs: brew tap vet-run/vet && brew install vet-run`);
+    const curlResult = await spawnCapture('bash', ['-c', `curl -fsSL ${installUrl} | bash`], { timeoutMs: 120000 });
+    if (!curlResult.ok) return { ok: false, error: curlResult.stderr || curlResult.error, stdout: curlResult.stdout };
+    const binPath = await whichCli(cliName);
+    return { ok: true, alreadyInstalled: false, cli: cliName, binPath, stdout: curlResult.stdout, vetted: false };
+  }
 
   let result;
   if (instMethod === 'brew') {
@@ -2949,6 +2969,7 @@ async function actionPreflightCheck({ task, clis: explicitClis }) {
       cli:           entry.cli  || knownMeta.cli  || null,
       method:        entry.installMethod || knownMeta.method || 'brew',
       pkg:           entry.installPkg   || knownMeta.pkg   || entry.cli || null,
+      installUrl:    knownMeta.installUrl || null,
       tokenCmd:      knownMeta.tokenCmd || null,
       isApiKey:      entry.isApiKey ?? knownMeta.isApiKey ?? false,
       isOAuth:       entry.isOAuth  ?? knownMeta.isOAuth  ?? false,
@@ -2989,6 +3010,7 @@ async function actionPreflightCheck({ task, clis: explicitClis }) {
         authStatus:    'not_installed',
         installMethod: meta.method,
         installPkg:    meta.pkg,
+        installUrl:    meta.installUrl || null,
         tokenCmd:      meta.tokenCmd,
         isApiKey:      meta.isApiKey,
         isOAuth:       meta.isOAuth,
@@ -3037,6 +3059,7 @@ async function actionPreflightCheck({ task, clis: explicitClis }) {
       authUser:      authResult.authUser || null,
       installMethod: meta.method,
       installPkg:    meta.pkg,
+      installUrl:    meta.installUrl || null,
       tokenCmd:      meta.tokenCmd,
       isApiKey:      meta.isApiKey,
       isOAuth:       meta.isOAuth,

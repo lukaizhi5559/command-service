@@ -1404,10 +1404,22 @@ async function playwrightAgent(args) {
           // Try extractContent first for rich content extraction
           logger.info(`[playwright.agent] attempting extractContent for rich content extraction`);
           const extractOutcome = await browserAct({ action: 'extractContent', sessionId, headed, timeoutMs: 25000 });
-          
-          if (extractOutcome.ok && extractOutcome.result && extractOutcome.result.length > 100) {
+
+          const extractLinks = extractOutcome.extractedContent?.links?.length || 0;
+          const extractImages = extractOutcome.extractedContent?.images?.length || 0;
+          const extractVideos = extractOutcome.extractedContent?.videos?.length || 0;
+          const extractDocs = extractOutcome.extractedContent?.documents?.length || 0;
+          const hasRichStructure = extractLinks > 0 || extractImages > 0 || extractVideos > 0 || extractDocs > 0;
+          const isSubstantialText = extractOutcome.result && extractOutcome.result.length >= 1000;
+          const useExtractContent = extractOutcome.ok && extractOutcome.result && (hasRichStructure || isSubstantialText);
+
+          if (useExtractContent) {
             outcome = extractOutcome;
-            logger.info(`[playwright.agent] extractContent succeeded: ${outcome.result.length} chars with ${extractOutcome.extractedContent?.links?.length || 0} links, ${extractOutcome.extractedContent?.images?.length || 0} images`);
+            logger.info(`[playwright.agent] extractContent succeeded: ${outcome.result.length} chars with ${extractLinks} links, ${extractImages} images`);
+          } else if (stableTextResult) {
+            // extractContent returned sparse/unstructured content but waitForStableText captured a rich page snapshot.
+            logger.info(`[playwright.agent] extractContent sparse or unstructured — falling back to waitForStableText result (${stableTextResult.length} chars)`);
+            outcome = { ok: true, action: 'getPageText', sessionId, result: stableTextResult, executionTime: 0 };
           } else {
             // Fallback to regular getPageText if extractContent fails
             logger.info(`[playwright.agent] extractContent failed or returned minimal content, falling back to getPageText`);
@@ -2025,15 +2037,30 @@ async function playwrightAgent(args) {
       const _judgePageText = (_judgeSnap.ok && _judgeSnap.result) ? _judgeSnap.result : currentSnapshot;
       if (_judgeSnap.ok && _judgeSnap.result) currentSnapshot = _judgeSnap.result;
 
+      // Fetch current URL — the most reliable signal for whether an action executed
+      // (e.g. search_query param proves search ran regardless of which UI mechanism was used)
+      let _judgeCurrentUrl = '';
+      try {
+        const _urlRes = await browserAct({ action: 'evaluate', text: 'window.location.href', sessionId, headed, timeoutMs: 3000 });
+        if (_urlRes.ok && _urlRes.result) {
+          _judgeCurrentUrl = String(_urlRes.result).trim().replace(/^"|"$/g, '');
+        }
+      } catch (_) {}
+
       const _stepSummary = transcript.map(t => `${t.action.action}:${t.outcome.ok ? 'ok' : 'fail'}`).join('; ');
+      // Page content (lastGetPageTextResult) is the strongest signal for goal relevance —
+      // it contains actual titles/descriptions that can be matched against the goal topic.
+      const _judgeContentSample = lastGetPageTextResult ? lastGetPageTextResult.slice(0, 800) : '';
       const _judgePrompt = `GOAL: ${goal}
 
 STEPS EXECUTED: ${_stepSummary}
+${_judgeCurrentUrl ? `\nCURRENT URL: ${_judgeCurrentUrl}` : ''}
+${_judgeContentSample ? `\nPAGE CONTENT (sample):\n${_judgeContentSample}` : ''}
 
-CURRENT PAGE SNAPSHOT (first 1500 chars):
-${_judgePageText.slice(0, 1500)}
+CURRENT PAGE SNAPSHOT (first 800 chars):
+${_judgePageText.slice(0, 800)}
 
-Did these steps achieve the goal? Consider what the goal asked for and what the agent actually did.
+Does the current page state satisfy the goal? Focus on the END STATE — does the PAGE CONTENT and URL show that the goal was accomplished? The exact steps or UI mechanism used (button click, Enter key, direct URL navigation) are irrelevant — only whether the result matches what the goal asked for.
 Respond with JSON only — no markdown, no explanation outside the JSON:
 { "achieved": true, "reason": "one sentence" }
 or
@@ -2042,7 +2069,7 @@ or
 Set canRetry:false only if the goal is fundamentally impossible on this page/site.`;
 
       const _judgeRaw = await askWithMessages([
-        { role: 'system', content: 'You are a concise browser automation judge. Respond with JSON only.' },
+        { role: 'system', content: 'You are a browser automation judge. Evaluate whether the current page state satisfies the user\'s goal — focus on the page content and URL as evidence of the outcome, not on which specific steps or UI actions were performed. Respond with JSON only.' },
         { role: 'user', content: _judgePrompt },
       ], { temperature: 0.0, maxTokens: 120, responseTimeoutMs: 20000 });
 
