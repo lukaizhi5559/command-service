@@ -49,6 +49,27 @@ const { spawn, exec } = require('child_process');
 const logger = require('../logger.cjs');
 const { askWithMessages } = require('../skill-helpers/skill-llm.cjs');
 const shellRun = require('./shell.run.cjs');
+const { buildAdBlockScript } = require('../utils/ad-block-init.js');
+const { BASELINE_DOMAINS } = require('../utils/ad-block-updater.cjs');
+const { setupInterception, clearAdBlockSession } = require('../utils/ad-block-network.cjs');
+
+// Build the ad-block script once at module load.
+// Use only BASELINE_DOMAINS (~30 top ad networks) — NOT the full 46K cached list.
+// The full list inflates the script to ~971KB which exceeds macOS ARG_MAX when
+// passed as a spawn() arg, causing silent injection failure. BASELINE_DOMAINS
+// covers doubleclick, googlesyndication, taboola, criteo etc. — the vast majority
+// of ads on any site. Script size: ~3KB.
+const _AD_BLOCK_SCRIPT = buildAdBlockScript(BASELINE_DOMAINS);
+
+// Write the ad-block script to a stable temp file so injectAdBlock can read it
+// via a short inline eval rather than passing ~4KB as a CLI arg (avoids quoting issues).
+const _AD_BLOCK_SCRIPT_FILE = path.join(os.tmpdir(), 'td-adblock.js');
+try {
+  fs.writeFileSync(_AD_BLOCK_SCRIPT_FILE, _AD_BLOCK_SCRIPT, 'utf8');
+  logger.info(`[browser.act] Ad-block script written to ${_AD_BLOCK_SCRIPT_FILE} (${_AD_BLOCK_SCRIPT.length} chars)`);
+} catch (e) {
+  logger.warn(`[browser.act] Could not write ad-block script file: ${e.message}`);
+}
 
 // Generic debugging control for all playwright-cli tools
 const playwrightDebugEnabled = process.env.PLAYWRIGHT_DEBUG === 'true' || 
@@ -700,6 +721,67 @@ function cliRun(args, timeoutMs = 15000) {
 }
 
 // ---------------------------------------------------------------------------
+// Ad-block injection helper
+// ---------------------------------------------------------------------------
+
+/**
+ * Injects the ad-blocking script into the currently loaded page for a session.
+ * Non-blocking, non-fatal — never throws, never delays the caller.
+ * Guard in the script prevents double-injection on repeated navigate calls.
+ *
+ * @param {string}  sessionId
+ * @param {boolean} headed
+ */
+// run-code snippet: clicks skip button if visible, removes ad-showing class so
+// the video player resumes. Handles the "stuck ad" state that occurs when route
+// blocking freezes the ad video stream but YouTube's JS still shows the ad overlay.
+const _AD_DISMISS_CODE = `async (page) => {
+  try {
+    return await page.evaluate(() => {
+      const skipBtn = document.querySelector('.ytp-skip-ad-button, .ytp-ad-skip-button-modern, .ytp-ad-skip-button');
+      if (skipBtn) { skipBtn.click(); return 'skipped'; }
+      const adEl = document.querySelector('.ad-showing');
+      if (adEl) {
+        adEl.classList.remove('ad-showing');
+        const vid = document.querySelector('video');
+        if (vid && vid.paused) vid.play().catch(() => {});
+        return 'dismissed';
+      }
+      return 'no-ad';
+    });
+  } catch(e) { return 'error:' + e.message; }
+}`;
+
+async function injectAdBlock(sessionId, headed) {
+  try {
+    // Layer 3a: CSS cosmetic hiding — hides sidebar/banner ads via injected IIFE.
+    const injectResult = await cliRun(
+      [...sessionFlags(sessionId, headed), 'eval', _AD_BLOCK_SCRIPT],
+      8000
+    );
+
+    if (injectResult?.ok || injectResult?.exitCode === 0) {
+      logger.info(`[browser.act] injectAdBlock: ✓ CSS cosmetics injected (session=${sessionId})`);
+    } else {
+      logger.warn(`[browser.act] injectAdBlock: eval failed (session=${sessionId}) exitCode=${injectResult?.exitCode} stderr=${(injectResult?.stderr || '').slice(0, 200)}`);
+    }
+
+    // Layer 3b: Click skip button or dismiss stuck ad overlay (non-fatal).
+    // Handles the case where route blocking froze the ad stream but the overlay lingers.
+    const dismissResult = await cliRun(
+      [...sessionFlags(sessionId, headed), 'run-code', _AD_DISMISS_CODE],
+      5000
+    );
+    if (dismissResult?.ok) {
+      const outcome = (dismissResult.stdout || '').match(/["']?(skipped|dismissed|no-ad)["']?/)?.[1] || 'unknown';
+      logger.info(`[browser.act] injectAdBlock: ad dismiss → ${outcome} (session=${sessionId})`);
+    }
+  } catch (err) {
+    logger.warn(`[browser.act] injectAdBlock error (session=${sessionId}): ${err.message}`);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Gmail-Optimized Content Detection
 // ---------------------------------------------------------------------------
 
@@ -826,8 +908,9 @@ async function recoverFromAboutBlank(sessionId, originalUrl = 'https://mail.goog
     // Step 2: Browser unresponsive, restart session
     logger.info(`[browser.act] Browser unresponsive, restarting session=${sessionId}`);
     openSessions.delete(sessionId);
+    clearAdBlockSession(sessionId);
     
-    const restartResult = await cliRun([...sessionFlags(sessionId), 'open', originalUrl], 15000);
+    const restartResult = await cliRun([...sessionFlags(sessionId), 'open', ...openFlags(), originalUrl], 15000);
     if (restartResult.ok) {
       openSessions.add(sessionId);
       await new Promise(resolve => setTimeout(resolve, 5000));
@@ -1021,6 +1104,14 @@ function sessionFlags(sessionId, headed = true) {
   }
 
   return flags;
+}
+
+// Returns ['--config=<path>'] to be inserted after 'open' subcommand.
+// --config is an open-subcommand flag in playwright-cli — it MUST come after 'open',
+// not in the pre-subcommand session flags. Returns [] if config file is missing.
+function openFlags() {
+  const cliConfig = path.join(os.homedir(), '.thinkdrop', 'cli.config.json');
+  return fs.existsSync(cliConfig) ? [`--config=${cliConfig}`] : [];
 }
 
 // ---------------------------------------------------------------------------
@@ -1841,13 +1932,40 @@ async function browserAct(args) {
           logger.info(`[browser.act] Killed existing Chrome for session=${sessionId}, will cold-start fresh`);
         }
       }
-      const navCmd = alreadyOpen ? 'goto' : 'open';
       // Invalidate snapshot cache for current tab — the page is changing
       snapshotCache.delete(_tabKey(sessionId));
       lastFilledTarget.delete(sessionId);
       // Before cold-starting, remove any stale SingletonLock from a previous crash
       if (!alreadyOpen) clearProfileLock(sessionId);
-      const res = await cliRun([...S, navCmd, sanitizedUrl], navTimeout);
+
+      // Ad blocking strategy:
+      // - Cold-start: open about:blank (with --config for serviceWorkers:block), register
+      //   both route blocking AND page.addInitScript (strips YouTube adPlacements before
+      //   the player reads them), then goto the real URL.
+      // - Already open: register interception (idempotent), then goto the real URL.
+      // setupInterception() from ad-block-network.cjs handles both layers atomically.
+      let res;
+      if (!alreadyOpen) {
+        // Cold-start: open browser on a neutral page first so interception can be registered
+        const openRes = await cliRun([...S, 'open', ...openFlags(), 'about:blank'], Math.min(navTimeout, 15000));
+        if (openRes.ok) {
+          openSessions.add(sessionId);
+          // Register route blocking (Layer 1) + init script (Layer 2) BEFORE navigating
+          await setupInterception(cliRun, sessionFlags, sessionId, headed);
+          // Now navigate to the real URL
+          res = await cliRun([...S, 'goto', sanitizedUrl], navTimeout);
+        } else {
+          res = openRes;
+        }
+      } else {
+        // Already open daemon: navigate to about:blank first to bust bfcache, then register
+        // context-level interception, then goto the real URL.
+        // Without the about:blank step, goto to the same YouTube URL can restore from bfcache
+        // which bypasses addInitScript entirely — the JSON.parse proxy never fires.
+        await cliRun([...S, 'goto', 'about:blank'], 5000);
+        await setupInterception(cliRun, sessionFlags, sessionId, headed);
+        res = await cliRun([...S, 'goto', sanitizedUrl], navTimeout);
+      }
       if (res.ok) {
         openSessions.add(sessionId);
         // For cold-starts: Chrome may show a "Restore pages?" crash-recovery dialog.
@@ -1892,6 +2010,8 @@ async function browserAct(args) {
 
         // Clean up any ghost about:blank tabs from prior failed attempts
         closeBlankTabs(sessionId, headed).catch(() => {});
+        // Inject CSS cosmetic ad-hiding (Layer 3) — non-blocking cleanup
+        injectAdBlock(sessionId, headed).catch(() => {});
       } else if (alreadyOpen && !res.ok) {
         // goto failed (daemon may have died) — kill Chrome, clear profile lock, then retry with open
         logger.info(`[browser.act] goto failed, killing Chrome and retrying with open for session=${sessionId}`);
@@ -1899,7 +2019,15 @@ async function browserAct(args) {
         await new Promise(r => setTimeout(r, 1000));
         clearProfileLock(sessionId);
         openSessions.delete(sessionId);
-        const retryRes = await cliRun([...S, 'open', url], navTimeout);
+        clearAdBlockSession(sessionId);
+        // Retry: open about:blank → register interception → goto real URL
+        const retryOpenRes = await cliRun([...S, 'open', ...openFlags(), 'about:blank'], Math.min(navTimeout, 15000));
+        let retryRes = retryOpenRes;
+        if (retryOpenRes.ok) {
+          openSessions.add(sessionId);
+          await setupInterception(cliRun, sessionFlags, sessionId, headed);
+          retryRes = await cliRun([...S, 'goto', url], navTimeout);
+        }
         if (retryRes.ok) { openSessions.add(sessionId); }
         logger.info(`[browser.act] open ${url} → exit ${retryRes.exitCode}`, { stderr: retryRes.stderr?.slice(0, 200) });
         return {
@@ -1912,7 +2040,7 @@ async function browserAct(args) {
           error:         retryRes.ok ? undefined : retryRes.error || retryRes.stderr?.trim(),
         };
       }
-      logger.info(`[browser.act] ${navCmd} ${url} → exit ${res.exitCode}`, { stderr: res.stderr?.slice(0, 200) });
+      logger.info(`[browser.act] navigate ${url} → exit ${res.exitCode} (session=${sessionId})`, { stderr: res.stderr?.slice(0, 200) });
       return {
         ok:            res.ok,
         action,
@@ -1934,6 +2062,8 @@ async function browserAct(args) {
       for (const k of snapshotCache.keys()) { if (k.startsWith(`${sessionId}:`)) snapshotCache.delete(k); }
       currentTabIndex.delete(sessionId);
       openSessions.delete(sessionId);
+      // Reset ad-block interception guard so next open re-registers routes + init script
+      clearAdBlockSession(sessionId);
       return { ok: res.ok, action, sessionId, executionTime: Date.now() - start, error: res.ok ? undefined : res.error };
     }
 
@@ -3118,7 +3248,14 @@ If no videos found, return []. Do not explain, only output the JSON array.`;
       // Extract value from markdown wrapper: ### Result\n"value"\n### Ran...
       const stdout = evalRes.stdout || '';
       const match = stdout.match(/###\s*Result\s*\n([\s\S]*?)(?=###|$)/i);
-      const result = match ? match[1].trim().replace(/^["']|["']$/g, '') : stdout.trim();
+      const rawResult = match ? match[1].trim().replace(/^["']|["']$/g, '') : stdout.trim();
+      // Auto-parse JSON so IIFEs returning objects come back as objects (not strings).
+      // Skills like ad-handler use result.result expecting an object — without this they
+      // always get undefined → {}, making all detection signals false.
+      let result = rawResult;
+      if (typeof rawResult === 'string' && (rawResult.startsWith('{') || rawResult.startsWith('['))) {
+        try { result = JSON.parse(rawResult); } catch { /* keep as string */ }
+      }
       
       return {
         ok: true,
@@ -3497,7 +3634,7 @@ If no videos found, return []. Do not explain, only output the JSON array.`;
         const navCmd = alreadyOpen ? 'goto' : 'open';
         if (!alreadyOpen) clearProfileLock(sessionId);
         snapshotCache.delete(_tabKey(sessionId));
-        const navRes = await cliRun([...S, navCmd, url], navTimeout);
+        const navRes = await cliRun([...S, navCmd, ...(navCmd === 'open' ? openFlags() : []), url], navTimeout);
         if (navRes.ok) openSessions.add(sessionId);
         logger.info(`[browser.act] waitForAuth: navigated to ${url} on session=${sessionId} (cmd=${navCmd}, ok=${navRes.ok})`);
       }
@@ -4052,8 +4189,8 @@ If no videos found, return []. Do not explain, only output the JSON array.`;
       if (!alreadyOpen && url) {
         logger.info(`[browser.act] tab-new: cold-starting browser with open for session=${sessionId}`);
         // Use open with URL parameter - more reliable for navigation
-        const openRes = await cliRun([...S, 'open', url], Math.max(timeoutMs, 30000));
-        logger.info(`[browser.act] tab-new cold-start: open command result: ok=${openRes.ok}, exitCode=${openRes.exitCode}`);
+        const openRes = await cliRun([...S, 'open', ...openFlags(), url], Math.max(timeoutMs, 30000));
+        logger.info(`[browser.act] tab-new cold-start: open command result: ok=${openRes.ok}, exitCode=${openRes.exitCode}`);    
         if (openRes.ok) {
           openSessions.add(sessionId);
           
@@ -4093,7 +4230,7 @@ If no videos found, return []. Do not explain, only output the JSON array.`;
             
             // Try open again with URL
             logger.info(`[browser.act] tab-new cold-start: retrying open with ${url}`);
-            const retryRes = await cliRun([...S, 'open', url], Math.max(timeoutMs, 30000));
+            const retryRes = await cliRun([...S, 'open', ...openFlags(), url], Math.max(timeoutMs, 30000));
             logger.info(`[browser.act] tab-new cold-start: retry result: ok=${retryRes.ok}`);
             
             if (!retryRes.ok) {
@@ -4584,5 +4721,6 @@ module.exports = {
   clearProfileLock,
   findCli,
   shortSessionId,
+  injectAdBlock,
   PLAYWRIGHT_CLI_AVAILABLE,
 };

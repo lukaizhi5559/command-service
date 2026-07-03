@@ -24,6 +24,10 @@ const os    = require('os');
 const crypto = require('crypto');
 
 const logger = require('../logger.cjs');
+const { buildAdBlockScript } = require('../utils/ad-block-init.js');
+const { BASELINE_DOMAINS } = require('../utils/ad-block-updater.cjs');
+
+const _WC_AD_BLOCK_SCRIPT = buildAdBlockScript(BASELINE_DOMAINS);
 
 // ── playwright-cli binary resolution (mirrors browser.act.cjs) ──────────────
 const CLI_CANDIDATES = [
@@ -156,6 +160,9 @@ async function webCrawl(args) {
         return { ok: false, url: normalizedUrl, error: `Navigation failed: ${navRes.stderr.slice(0, 200)}`, elapsedMs: Date.now() - startTime };
       }
     }
+
+    // Step 1b: Inject ad-blocker into crawl page (non-blocking, non-fatal)
+    cliRun([...S, 'eval', _WC_AD_BLOCK_SCRIPT], 5000).catch(() => {});
 
     // Step 2: Wait for JS to render (settle delay)
     if (waitMs > 0) {

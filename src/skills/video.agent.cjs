@@ -18,7 +18,7 @@
 
 const logger = require('../logger.cjs');
 const path = require('path');
-const adHandler = require('./ad-handler.cjs');
+const { injectAdBlock } = require('./browser.act.cjs');
 
 // User Memory MCP configuration
 const USER_MEMORY_URL = process.env.USER_MEMORY_MCP_URL || 'http://localhost:3001';
@@ -199,27 +199,15 @@ async function extractMetadata(videoUrl, platform, browserAct, sessionId = 'defa
   try {
     // Navigate to video
     await browserAct({ action: 'navigate', url: videoUrl });
+    // Explicitly inject ad-blocker (belt-and-suspenders — also fires via browser.act hook)
+    // This now sets up: Layer 1 (network route blocking) + Layer 2 (document-start init
+    // script that strips YouTube ad data before the player reads it) + Layer 3 (CSS cosmetics).
+    injectAdBlock(sessionId, true).catch(() => {});
     await new Promise(r => setTimeout(r, 2000)); // Wait for player load
 
-    // Handle pre-roll ads (8s polling for YouTube ads that load gradually)
-    logger.info('[video.agent] Checking for pre-roll ads...');
-    const adResult = await adHandler.handleAds(platform, browserAct, sessionId, {
-      initialWaitMs: 8000,      // Poll for 8s to catch ads that load gradually
-      skipCountdownMs: 5000,
-      maxAdWaitMs: 30000
-    });
-    
-    if (adResult.success) {
-      if (adResult.skipped) {
-        logger.info('[video.agent] Ad was skipped');
-      } else if (adResult.waited) {
-        logger.info('[video.agent] Ad finished after waiting');
-      } else {
-        logger.info('[video.agent] No ad detected');
-      }
-    } else {
-      logger.warn(`[video.agent] Ad handling issue: ${adResult.error}`);
-    }
+    // Ads are now blocked at the network/player-data level — no DOM polling needed.
+    // The document-start init script (Layer 2) strips adPlacements/playerAds/adSlots
+    // from ytInitialPlayerResponse before YouTube's player can queue any ads.
 
     // Extract duration based on platform
     let duration = 0;
@@ -386,7 +374,8 @@ async function extractGenericPageContent(videoUrl, browserAct) {
 
 /**
  * Strip SRT/VTT timestamp lines and formatting, leaving only plain spoken text.
- * Handles: "00:00:01,000 --> 00:00:03,000", "WEBVTT", sequence numbers, HTML tags.
+ * Handles: "00:00:01,000 --> 00:00:03,000", "WEBVTT", sequence numbers, HTML tags,
+ * VTT metadata headers (Kind:, Language:, X-TIMESTAMP-MAP:), and inline position tags.
  */
 function stripSubtitleFormatting(raw) {
   return raw
@@ -396,11 +385,14 @@ function stripSubtitleFormatting(raw) {
       if (!t) return false;
       if (/^WEBVTT/.test(t)) return false;
       if (/^\d+$/.test(t)) return false; // SRT sequence numbers
-      if (/^\d{2}:\d{2}/.test(t)) return false; // timestamp lines
+      if (/^\d{2}:\d{2}/.test(t)) return false; // timestamp lines (SRT + VTT)
       if (/^NOTE\b/.test(t)) return false;
+      if (/^Kind:/i.test(t)) return false;     // VTT metadata
+      if (/^Language:/i.test(t)) return false; // VTT metadata
+      if (/^X-TIMESTAMP-MAP:/i.test(t)) return false; // VTT metadata
       return true;
     })
-    .map(line => line.replace(/<[^>]+>/g, '').trim()) // strip HTML/VTT tags
+    .map(line => line.replace(/<[^>]+>/g, '').trim()) // strip HTML/VTT inline tags
     .filter(Boolean)
     .join(' ')
     .replace(/\s{2,}/g, ' ')
@@ -436,7 +428,6 @@ async function transcribeWithYtDlp(videoUrl) {
         '--write-auto-subs',
         '--sub-lang', 'en',
         '--skip-download',
-        '--convert-subs', 'srt',
         '--no-playlist',
         '--js-runtimes', 'node',
         '-o', outTemplate,
@@ -469,30 +460,35 @@ async function transcribeWithYtDlp(videoUrl) {
     logger.info(`[video.agent] yt-dlp retry after upgrade: ok=${ytResult.ok}`);
   }
 
-  // yt-dlp writes <outTemplate>.en.srt (or similar)
-  let srtFile = null;
+  // yt-dlp writes <outTemplate>.en.vtt (native, no ffmpeg needed) or .en.srt if conversion was possible
+  let subFile = null;
   try {
     const tmpDir = os.tmpdir();
     const prefix = `thinkdrop_transcript_${hash}`;
-    const candidates = fs.readdirSync(tmpDir).filter(f => f.startsWith(prefix) && f.endsWith('.srt'));
-    if (candidates.length > 0) srtFile = path.join(tmpDir, candidates[0]);
+    // Prefer .vtt (written without ffmpeg); fall back to .srt if somehow present
+    const candidates = fs.readdirSync(tmpDir).filter(f => f.startsWith(prefix) && (f.endsWith('.vtt') || f.endsWith('.srt')));
+    if (candidates.length > 0) {
+      // Prefer .vtt over .srt
+      const vtt = candidates.find(f => f.endsWith('.vtt'));
+      subFile = path.join(tmpDir, vtt || candidates[0]);
+    }
   } catch (_) { /* ignore */ }
 
-  if (srtFile && fs.existsSync(srtFile)) {
+  if (subFile && fs.existsSync(subFile)) {
     try {
-      const raw = fs.readFileSync(srtFile, 'utf8');
-      fs.unlinkSync(srtFile); // clean up
+      const raw = fs.readFileSync(subFile, 'utf8');
+      fs.unlinkSync(subFile); // clean up
       const transcript = stripSubtitleFormatting(raw);
       if (transcript.length > 50) {
         logger.info(`[video.agent] yt-dlp subtitles: ${transcript.length} chars`);
         return { ok: true, transcript, source: 'yt-dlp-subs' };
       }
     } catch (readErr) {
-      logger.warn(`[video.agent] Failed to read SRT file: ${readErr.message}`);
+      logger.warn(`[video.agent] Failed to read subtitle file: ${readErr.message}`);
     }
   }
 
-  logger.info(`[video.agent] yt-dlp subtitles unavailable (${ytResult.stderr?.slice(0, 120) || 'no srt written'}) — trying transcribe-anything fallback`);
+  logger.info(`[video.agent] yt-dlp subtitles unavailable (${ytResult.stderr?.slice(0, 120) || 'no subtitle file written'}) — trying transcribe-anything fallback`);
 
   // ── FALLBACK: transcribe-anything (Whisper) ───────────────────────────────
   const _platform = os.platform();
@@ -753,38 +749,50 @@ async function actionWatchVideo({ videoUrl, goal, options = {} }, dependencies =
       platform,
       duration: metadata.duration,
       pageContent,
+      pageTitle: pageContent?.title || null,
       transcriptLength: transcription?.length || 0
     };
   }
 
   const synthesis = await synthesizeVideoContent(pageContent, transcription, goal, skillLlm);
 
+  const _pageTitle = pageContent?.title || null;
+
   if (synthesis.confidence > 0.5 && synthesis.steps.length > 0) {
     const stepsText = synthesis.steps.map((s, i) => `${i + 1}. ${s.text}`).join('\n');
     return {
       ok: true,
       steps: synthesis.steps,
-      stdout: stepsText || `Watched video: ${pageContent?.title || videoUrl}`,
+      stdout: stepsText || `Watched video: ${_pageTitle || videoUrl}`,
       source: synthesis.hasTranscript ? 'page+transcription' : 'page_only',
       platform,
       duration: metadata.duration,
       confidence: synthesis.confidence,
       transcriptLength: transcription?.length || 0,
-      pageTitle: pageContent?.title
+      pageTitle: _pageTitle
     };
   }
 
-  // Low confidence - return raw content for user review
+  // Low confidence — return richest available content so the synthesize step has real data
+  const _descText = pageContent?.description?.substring(0, 1000) || '';
+  const _transcriptSnippet = transcription ? `\n\nTranscript (excerpt):\n${transcription.substring(0, 1500)}` : '';
+  const _stdoutFallback = [
+    `Watched video: ${_pageTitle || videoUrl}`,
+    _descText ? `\nDescription:\n${_descText}` : '',
+    _transcriptSnippet,
+  ].join('').trim();
+
   return {
     ok: true,
     steps: [],
-    stdout: `Watched video: ${pageContent?.title || videoUrl}\n\nDescription:\n${pageContent?.description?.substring(0, 500) || 'No description available'}`,
+    stdout: _stdoutFallback,
     source: transcription ? 'page+transcription' : 'page_only',
     platform,
     duration: metadata.duration,
     confidence: synthesis.confidence,
     transcriptLength: transcription?.length || 0,
     pageContent,
+    pageTitle: _pageTitle,
     lowConfidence: true
   };
 }

@@ -60,19 +60,19 @@ const PLATFORM_PATTERNS = {
   }
 };
 
-// Generic ad indicators that work across platforms
+// Generic ad indicators that work across platforms.
+// IMPORTANT: Only multi-word / unambiguous phrases — standalone words like 'skip',
+// 'seconds', 'sponsored' appear on regular YouTube pages and cause false positives.
 const AD_KEYWORDS = [
   'skip ad',
-  'skip advertisement', 
-  'skip',
-  'advertisement',
-  'sponsored',
+  'skip advertisement',
   'your video will begin',
   'video will play after',
+  'video will resume',
   'ad in',
-  'seconds',
   '1 of 2',
-  '2 of 2'
+  '2 of 2',
+  'learn more about this ad'
 ];
 
 /**
@@ -88,7 +88,7 @@ async function detectAd(platform, browserAct, sessionId) {
     
     const result = await browserAct({
       action: 'evaluate',
-      code: `(() => {
+      expression: `(() => {
         // Check for platform-specific ad modules
         const adSelectors = ${JSON.stringify(patterns.adModules)};
         let adElement = null;
@@ -117,13 +117,10 @@ async function detectAd(platform, browserAct, sessionId) {
           } catch (e) {}
         }
         
-        // Check video player state
-        const video = document.querySelector('video');
+        // Check video player state — look for ad-specific player class
         const player = document.querySelector('.html5-video-player, .video-player, #player');
-        
-        // Ad indicators from player classes
         const playerClasses = player?.className?.toLowerCase() || '';
-        const isAdClass = playerClasses.includes('ad-') || playerClasses.includes('ads');
+        const isAdClass = playerClasses.includes('ad-showing') || playerClasses.includes('ad-interrupting');
         
         // Check if controls are hidden (common during ads)
         const controlsHidden = playerClasses.includes('hide-controls') || 
@@ -133,9 +130,13 @@ async function detectAd(platform, browserAct, sessionId) {
         const bodyText = document.body?.innerText?.toLowerCase() || '';
         const foundKeywords = ${JSON.stringify(AD_KEYWORDS)}.filter(kw => bodyText.includes(kw));
         
-        // Check for short video duration (ads are typically < 60s)
-        const videoDuration = video?.duration || 0;
-        const isShortVideo = videoDuration > 0 && videoDuration < 60;
+        // Target the AD video element specifically (.ad-showing video or .ad-interrupting video)
+        // YouTube plays pre-rolls in a separate video element, not the main one
+        const adVideo = document.querySelector('.ad-showing video, .ad-interrupting video') ||
+                        (isAdClass ? document.querySelector('video') : null);
+        const mainVideo = document.querySelector('video:not([src*="blob:"])') || document.querySelector('video');
+        const adVideoDuration = adVideo?.duration || 0;
+        const isShortVideo = adVideoDuration > 0 && adVideoDuration < 60;
         
         return {
           hasAdModule: !!adElement,
@@ -144,9 +145,10 @@ async function detectAd(platform, browserAct, sessionId) {
           isAdClass,
           controlsHidden,
           foundKeywords,
-          videoDuration,
+          videoDuration: adVideoDuration,
           isShortVideo,
-          playerClasses
+          playerClasses,
+          hasAdVideo: !!adVideo
         };
       })()`,
       sessionId
@@ -156,11 +158,18 @@ async function detectAd(platform, browserAct, sessionId) {
       return { isPlaying: false, hasSkipButton: false, skipSelector: null, duration: 0 };
     }
     
-    const data = result.result || {};
-    
+    const raw = result.result;
+    // result.result is now auto-parsed by browser.act evaluate handler (JSON objects
+    // come back as objects, not strings). Defensive fallback for scalar returns.
+    const data = (typeof raw === 'object' && raw !== null) ? raw :
+                 (() => { try { return JSON.parse(String(raw)); } catch { return {}; } })();
+
+    logger.debug(`[ad-handler] detectAd raw signals: hasAdModule=${data.hasAdModule} isAdClass=${data.isAdClass} hasAdVideo=${data.hasAdVideo} hasSkipButton=${data.hasSkipButton} keywords=${JSON.stringify(data.foundKeywords)} playerClasses="${(data.playerClasses||'').slice(0,80)}"`);
+
     // Determine if ad is playing based on multiple signals
     const isPlaying = data.hasAdModule || 
                       data.isAdClass || 
+                      data.hasAdVideo ||
                       (data.isShortVideo && data.controlsHidden) ||
                       (data.foundKeywords && data.foundKeywords.length > 0);
     
@@ -211,6 +220,57 @@ async function clickSkipButton(selector, browserAct, sessionId) {
 }
 
 /**
+ * Seek the ad video to its end (unskippable ad fallback).
+ * Targets the ad-specific video element (.ad-showing video / .ad-interrupting video)
+ * rather than the main video, so we don't disrupt the real content.
+ * @param {Function} browserAct - Browser act function
+ * @param {string} sessionId - Browser session ID
+ * @returns {Promise<boolean>} - True if seek was attempted
+ */
+async function seekAdToEnd(browserAct, sessionId) {
+  try {
+    logger.info('[ad-handler] Attempting seek-to-end on ad video (unskippable ad fallback)');
+    const result = await browserAct({
+      action: 'evaluate',
+      expression: `(() => {
+        // Target the ad video specifically — not the main content video
+        const adVideo = document.querySelector('.ad-showing video, .ad-interrupting video');
+        const player = document.querySelector('.html5-video-player, #player');
+        const playerClasses = player?.className?.toLowerCase() || '';
+        const isAdShowing = playerClasses.includes('ad-showing') || playerClasses.includes('ad-interrupting');
+        const vid = adVideo || (isAdShowing ? document.querySelector('video') : null);
+        if (vid && vid.duration && isFinite(vid.duration) && vid.duration > 0) {
+          vid.muted = true;
+          vid.playbackRate = 16;
+          vid.currentTime = vid.duration - 0.1;
+          return { sought: true, duration: vid.duration, wasAdVideo: !!adVideo };
+        }
+        // Fallback: try YouTube Player API
+        const moviePlayer = document.getElementById('movie_player');
+        if (moviePlayer && isAdShowing) {
+          if (typeof moviePlayer.seekTo === 'function' && typeof moviePlayer.getDuration === 'function') {
+            moviePlayer.seekTo(moviePlayer.getDuration() - 0.1, true);
+            return { sought: true, duration: moviePlayer.getDuration(), wasAdVideo: false, usedAPI: true };
+          }
+        }
+        return { sought: false };
+      })()`,
+      sessionId
+    });
+    const sought = result?.result?.sought || false;
+    if (sought) {
+      logger.info(`[ad-handler] Seek-to-end: duration=${result?.result?.duration?.toFixed(1)}s adVideo=${result?.result?.wasAdVideo}`);
+    } else {
+      logger.warn('[ad-handler] Seek-to-end: no suitable video element found');
+    }
+    return sought;
+  } catch (err) {
+    logger.warn(`[ad-handler] seekAdToEnd error: ${err.message}`);
+    return false;
+  }
+}
+
+/**
  * Wait for ad to finish playing
  * @param {string} platform - Platform name
  * @param {Function} browserAct - Browser act function
@@ -243,6 +303,17 @@ async function waitForAdEnd(platform, browserAct, sessionId, maxWaitMs = 30000, 
         const afterClick = await detectAd(platform, browserAct, sessionId);
         if (!afterClick.isPlaying) {
           logger.info('[ad-handler] Ad skipped successfully');
+          return true;
+        }
+      }
+    } else if (status.isPlaying) {
+      // No skip button available — seek the ad video to its end (unskippable ad)
+      const sought = await seekAdToEnd(browserAct, sessionId);
+      if (sought) {
+        await sleep(1500);
+        const afterSeek = await detectAd(platform, browserAct, sessionId);
+        if (!afterSeek.isPlaying) {
+          logger.info('[ad-handler] Ad ended via seek-to-end');
           return true;
         }
       }
@@ -280,7 +351,13 @@ async function handleAds(platform, browserAct, sessionId, options = {}) {
   try {
     logger.info(`[ad-handler] Starting ad handling for ${platform}`);
     
-    // Step 1: Poll during initial wait period to catch ads that load gradually
+    // Step 1: Pre-wait 3s before polling — YouTube injects its ad player after the
+    // main page renders, typically 3–6s after load. Polling too early means the
+    // .ad-showing / .ytp-ad-module elements don't exist yet.
+    logger.info('[ad-handler] Pre-wait 3s for ad player to initialize...');
+    await sleep(3000);
+
+    // Step 2: Poll during initial wait period to catch ads that load gradually
     logger.info(`[ad-handler] Polling for ${initialWaitMs}ms during initial load`);
     const initialStart = Date.now();
     let adDetected = null;
@@ -333,9 +410,21 @@ async function handleAds(platform, browserAct, sessionId, options = {}) {
           return { success: true, skipped: true, waited: false, error: null };
         }
       }
+    } else if (afterCountdown.isPlaying) {
+      // No skip button after countdown — unskippable ad. Seek to end immediately.
+      logger.info('[ad-handler] No skip button after countdown — seeking ad to end');
+      const sought = await seekAdToEnd(browserAct, sessionId);
+      if (sought) {
+        await sleep(1500);
+        const afterSeek = await detectAd(platform, browserAct, sessionId);
+        if (!afterSeek.isPlaying) {
+          logger.info('[ad-handler] Unskippable ad ended via seek-to-end');
+          return { success: true, skipped: true, waited: false, error: null };
+        }
+      }
     }
     
-    // Step 5: If still playing, wait for ad to end
+    // Step 5: If still playing, wait for ad to end (final fallback)
     const waited = await waitForAdEnd(platform, browserAct, sessionId, maxAdWaitMs, pollIntervalMs);
     
     if (waited) {
@@ -363,6 +452,7 @@ module.exports = {
   handleAds,
   detectAd,
   clickSkipButton,
+  seekAdToEnd,
   waitForAdEnd,
   PLATFORM_PATTERNS
 };

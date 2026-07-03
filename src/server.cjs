@@ -425,6 +425,19 @@ class CommandServiceMCPServer {
       logger.warn('[skill.review] Could not load skill.review.cjs (non-fatal)', { error: e.message });
     }
 
+    // ── Ad-block domain list refresh (non-blocking, every N days) ───────────
+    try {
+      const adBlockUpdater = require('./utils/ad-block-updater.cjs');
+      adBlockUpdater.refreshIfStale()
+        .then(r => {
+          if (r.refreshed) logger.info(`[Server] Ad-block list refreshed: ${r.count} domains (${r.source})`);
+          else logger.info(`[Server] Ad-block list up-to-date: ${r.count} domains`);
+        })
+        .catch(err => logger.warn('[Server] Ad-block list refresh failed (non-fatal)', { error: err.message }));
+    } catch (e) {
+      logger.warn('[Server] Could not load ad-block-updater (non-fatal)', { error: e.message });
+    }
+
     // ── Minimal HTTP health server ───────────────────────────────────────────
     // Keeps the Node.js event loop alive (no active I/O = process exits) and
     // satisfies the service manager's health check at http://localhost:3007/health
@@ -632,6 +645,20 @@ class CommandServiceMCPServer {
         skillScheduler.sync().catch(() => {});
         res.writeHead(200);
         res.end(JSON.stringify({ ok: true }));
+        return;
+      }
+
+      // ── POST /adblock.refresh — refresh ad-block domain list from remote sources ──
+      if (req.method === 'POST' && req.url === '/adblock.refresh') {
+        try {
+          const adBlockUpdater = require('./utils/ad-block-updater.cjs');
+          const result = await adBlockUpdater.refreshIfStale();
+          res.writeHead(200);
+          res.end(JSON.stringify({ ok: true, ...result }));
+        } catch (err) {
+          res.writeHead(500);
+          res.end(JSON.stringify({ ok: false, error: err.message }));
+        }
         return;
       }
 
@@ -1129,6 +1156,104 @@ function ensurePlaywrightCli() {
 }
 
 /**
+ * Ensure uBlock Origin (Chromium) is installed for playwright-cli ad blocking.
+ * Downloads from GitHub releases if missing. Updates cli.config.json with the
+ * correct absolute extension path. Non-blocking and non-fatal — if GitHub is
+ * unreachable the existing blockedOrigins + serviceWorkers:block config still works.
+ */
+async function ensureUBlockOrigin() {
+  const https   = require('https');
+  const fsSync  = require('fs');
+  const pathMod = require('path');
+  const osMod   = require('os');
+  const { execFile } = require('child_process');
+
+  const installDir  = pathMod.join(osMod.homedir(), '.thinkdrop', 'extensions', 'ublock-origin');
+  const manifestPath = pathMod.join(installDir, 'manifest.json');
+  const configPath  = pathMod.join(osMod.homedir(), '.thinkdrop', 'cli.config.json');
+
+  // Helper: ensure cli.config.json has serviceWorkers:block set.
+  // Note: uBlock extension args are NOT added — Playwright's hardcoded
+  // --disable-component-extensions-with-background-pages flag kills uBlock's
+  // background engine, making the extension non-functional. Ad blocking is
+  // handled instead via page.context().route() in browser.act.cjs.
+  function patchConfig() {
+    let cfg = {};
+    try { cfg = JSON.parse(fsSync.readFileSync(configPath, 'utf8')); } catch (_) {}
+    if (!cfg.browser) cfg.browser = {};
+    // Remove dead extension args if they exist from a previous install
+    if (cfg.browser.launchOptions?.args) delete cfg.browser.launchOptions.args;
+    if (!cfg.browser.contextOptions) cfg.browser.contextOptions = {};
+    cfg.browser.contextOptions.serviceWorkers = 'block';
+    fsSync.mkdirSync(pathMod.dirname(configPath), { recursive: true });
+    fsSync.writeFileSync(configPath, JSON.stringify(cfg, null, 2));
+  }
+
+  // Already installed?
+  if (fsSync.existsSync(manifestPath)) {
+    const { version } = JSON.parse(fsSync.readFileSync(manifestPath, 'utf8'));
+    // Ensure config paths are correct (handles profile dir changes, reinstalls, etc.)
+    patchConfig();
+    return { status: 'already installed', version };
+  }
+
+  // Fetch latest release tag from GitHub
+  const version = await new Promise((resolve, reject) => {
+    https.get(
+      'https://api.github.com/repos/gorhill/uBlock/releases/latest',
+      { headers: { 'User-Agent': 'thinkdrop-startup' } },
+      (res) => {
+        let body = '';
+        res.on('data', d => { body += d; });
+        res.on('end', () => {
+          try { resolve(JSON.parse(body).tag_name); } catch (e) { reject(e); }
+        });
+      }
+    ).on('error', reject);
+  });
+
+  const zipUrl = `https://github.com/gorhill/uBlock/releases/download/${version}/uBlock0_${version}.chromium.zip`;
+  const tmpZip = pathMod.join(osMod.tmpdir(), `ublock-${version}.zip`);
+  const tmpDir = pathMod.join(osMod.tmpdir(), `ublock-extract-${version}`);
+
+  // Download zip
+  await new Promise((resolve, reject) => {
+    const follow = (url, depth = 0) => {
+      if (depth > 5) return reject(new Error('Too many redirects'));
+      const mod = url.startsWith('https') ? https : require('http');
+      mod.get(url, { headers: { 'User-Agent': 'thinkdrop-startup' } }, (res) => {
+        if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+          return follow(res.headers.location, depth + 1);
+        }
+        const file = fsSync.createWriteStream(tmpZip);
+        res.pipe(file);
+        file.on('finish', () => file.close(resolve));
+        file.on('error', reject);
+      }).on('error', reject);
+    };
+    follow(zipUrl);
+  });
+
+  // Unzip + install
+  await new Promise((resolve, reject) => {
+    fsSync.mkdirSync(tmpDir, { recursive: true });
+    execFile('unzip', ['-q', '-o', tmpZip, '-d', tmpDir], { timeout: 30000 }, (err) => {
+      if (err) return reject(err);
+      const src = pathMod.join(tmpDir, 'uBlock0.chromium');
+      fsSync.rmSync(installDir, { recursive: true, force: true });
+      fsSync.mkdirSync(pathMod.dirname(installDir), { recursive: true });
+      fsSync.renameSync(src, installDir);
+      fsSync.rmSync(tmpZip, { force: true });
+      fsSync.rmSync(tmpDir, { recursive: true, force: true });
+      resolve();
+    });
+  });
+
+  patchConfig();
+  return { status: 'installed', version };
+}
+
+/**
  * Seed OAuth client credentials from environment variables into the keychain.
  * Runs once on startup so skills can find client_id/client_secret without
  * requiring the user to complete a full OAuth connect flow first.
@@ -1210,6 +1335,9 @@ if (require.main === module) {
   ensurePlaywrightCli();
   cleanupStalePlaywrightSessions();
   seedOAuthCredentials().catch(err => logger.warn('[startup] seedOAuthCredentials failed', { error: err.message }));
+  ensureUBlockOrigin()
+    .then(r => logger.info(`[startup] uBlock Origin: ${r.status} (${r.version})`))
+    .catch(err => logger.warn('[startup] uBlock Origin setup failed (non-fatal)', { error: err.message }));
   const server = new CommandServiceMCPServer();
   server.start().catch((error) => {
     logger.error('Failed to start server', { error: error.message });
