@@ -46,6 +46,7 @@ const appAgent   = require('./skills/app.agent.cjs');
 const skillScheduler = require('./skill-helpers/skill-scheduler.cjs');
 const { startIdleWatcher, stopIdleWatcher, startScanScheduler, runMaintenanceScan, cancelMaintenanceScan, getScanStatus } = require('./skills/explore.agent.cjs');
 const { systemIntrospect } = require('./skills/system.introspect.cjs');
+const toolDiscoverAgent = require('./skills/tool.discover.agent.cjs');
 
 class CommandServiceMCPServer {
   constructor() {
@@ -146,6 +147,9 @@ class CommandServiceMCPServer {
 
       case 'system.introspect':
         return await this._skillSystemIntrospect(args);
+
+      case 'tool.discover':
+        return await this._skillToolDiscover(args);
 
       default:
         return {
@@ -249,6 +253,10 @@ class CommandServiceMCPServer {
 
   async _skillSystemIntrospect(args) {
     return await systemIntrospect(args);
+  }
+
+  async _skillToolDiscover(args) {
+    return await toolDiscoverAgent(args);
   }
 
   async _skillAppAgent(args, opts = {}) {

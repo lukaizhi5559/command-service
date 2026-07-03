@@ -4329,6 +4329,23 @@ When extracting page content with run-code, prioritize these selectors over gene
       }
     }
 
+    // ── Discovered tool playbook write-back ────────────────────────────────────
+    // When a discovered external AI tool was used successfully, cache it in
+    // semantic memory via tool.discover's namespace so future runs can recall
+    // it instantly without re-searching. The agent descriptor already contains
+    // the tool URL and capabilities — we write a memory entry with metadata.
+    if (_runResult.ok === true && existing?.start_url) {
+      try {
+        const toolDb = require('../skill-helpers/skill-db.cjs');
+        const _svcKey = (existing.service || agentId.replace(/\.agent$/, '')).toLowerCase().replace(/[^a-z0-9]/g, '');
+        const _memText = `TOOL_NAME: ${agentId}\nTOOL_URL: ${existing.start_url}\nTOOL_TYPE: browser\nTOOL_TIER: ${existing.is_oauth ? 'free_account' : 'free_no_account'}\nINSTRUCTION: Use browser.agent { action: 'run', agentId: '${agentId}', task: '...' } for tasks on this service.\nSERVICE: ${_svcKey}`;
+        toolDb.remember('tool.discover', _memText, { agentId, url: existing.start_url, service: _svcKey }).catch(() => {});
+        logger.info(`[browser.agent] Discovered tool write-back: cached ${agentId} for future recall`);
+      } catch (_writeBackErr) {
+        // Non-fatal — best-effort caching
+      }
+    }
+
     // ── Minimize browser window after successful completion ───────────────────
     if (_runResult.ok === true && _usePersistentProfile) {
       try {
