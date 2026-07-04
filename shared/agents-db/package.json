@@ -16,7 +16,6 @@
   "author": "ThinkDrop",
   "license": "MIT",
   "dependencies": {
-    "duckdb": "^0.10.0",
-    "duckdb-async": "^0.10.0"
+    "duckdb": "^1.4.4"
   }
 }

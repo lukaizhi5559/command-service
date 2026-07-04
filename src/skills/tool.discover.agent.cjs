@@ -136,16 +136,18 @@ function _classifyTierCli(text) {
 }
 
 function _deriveServiceName(url, name) {
-  if (name) {
-    return name.toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 20);
-  }
+  // Prefer the URL hostname so derived agent IDs stay tied to real domains
+  // (e.g., mailmeteor.com -> mailmeteor.agent) instead of garbled tool names.
   try {
     const host = new URL(url).hostname.replace(/^www\./, '');
     const base = host.split('.')[0];
-    return base.replace(/[^a-z0-9]/g, '').slice(0, 20);
-  } catch (_) {
-    return 'discovered';
+    const derived = base.replace(/[^a-z0-9]/g, '').slice(0, 20);
+    if (derived) return derived;
+  } catch (_) {}
+  if (name) {
+    return name.toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 20);
   }
+  return 'discovered';
 }
 
 function _deriveToolType(url) {
@@ -156,6 +158,18 @@ function _deriveToolType(url) {
     return 'browser';
   } catch (_) {
     return 'browser';
+  }
+}
+
+function _isValidToolUrl(url) {
+  try {
+    const parsed = new URL(url);
+    if (!parsed.hostname) return false;
+    if (parsed.hostname === 'localhost' || parsed.hostname.includes('localhost')) return false;
+    if (!parsed.hostname.includes('.')) return false;
+    return true;
+  } catch (_) {
+    return false;
   }
 }
 
@@ -394,11 +408,13 @@ If ALL tools are paid, set bestToolIndex to -1 and include all options with pric
     const match = response.match(/\{[\s\S]*\}/);
     if (match) {
       const parsed = JSON.parse(match[0]);
-      allTools = (parsed.tools || []).map((t, i) => ({
-        ...t,
-        serviceName: _deriveServiceName(t.url, t.name),
-        iconUrl: `https://www.google.com/s2/favicons?domain=${encodeURIComponent(_safeHostname(t.url))}&sz=128`,
-      }));
+      allTools = (parsed.tools || [])
+        .filter(t => _isValidToolUrl(t.url))
+        .map((t, i) => ({
+          ...t,
+          serviceName: _deriveServiceName(t.url, t.name),
+          iconUrl: `https://www.google.com/s2/favicons?domain=${encodeURIComponent(_safeHostname(t.url))}&sz=128`,
+        }));
 
       if (parsed.bestToolIndex >= 0 && parsed.bestToolIndex < allTools.length) {
         bestTool = allTools[parsed.bestToolIndex];
@@ -410,18 +426,22 @@ If ALL tools are paid, set bestToolIndex to -1 and include all options with pric
 
   // Step 6: Fallback — use top scored result if LLM failed
   if (!bestTool && topCandidates.length > 0) {
-    const top = topCandidates[0];
-    bestTool = {
-      name: top.title?.slice(0, 60) || 'Discovered Tool',
-      url: top.url,
-      type: top._type,
-      tier: top._tier,
-      description: top.snippet?.slice(0, 200) || '',
-      howToUse: 'Navigate to the tool and interact with it for the task.',
-      serviceName: _deriveServiceName(top.url, null),
-      iconUrl: `https://www.google.com/s2/favicons?domain=${encodeURIComponent(_safeHostname(top.url))}&sz=128`,
-    };
-    allTools = [bestTool];
+    const top = topCandidates.find(t => _isValidToolUrl(t.url)) || topCandidates[0];
+    if (_isValidToolUrl(top.url)) {
+      bestTool = {
+        name: top.title?.slice(0, 60) || 'Discovered Tool',
+        url: top.url,
+        type: top._type,
+        tier: top._tier,
+        description: top.snippet?.slice(0, 200) || '',
+        howToUse: 'Navigate to the tool and interact with it for the task.',
+        serviceName: _deriveServiceName(top.url, null),
+        iconUrl: `https://www.google.com/s2/favicons?domain=${encodeURIComponent(_safeHostname(top.url))}&sz=128`,
+      };
+      allTools = [bestTool];
+    } else {
+      logger.warn(`[tool.discover] Fallback top result has invalid URL: ${top.url}`);
+    }
   }
 
   if (!bestTool) {

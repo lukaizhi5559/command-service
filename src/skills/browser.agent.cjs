@@ -1532,13 +1532,9 @@ async function actionListAgents() {
   let dbAgents = [];
   try {
     await withDb(async (db) => {
-      // One-time migration: delete legacy bare-id rows (e.g. 'youtube') when a canonical
-      // 'youtube.agent' counterpart exists. Safe to run every call — no-op once clean.
-      await db.run(`
-        DELETE FROM agents
-        WHERE id NOT LIKE '%.agent'
-          AND id || '.agent' IN (SELECT id FROM agents WHERE id LIKE '%.agent')
-      `).catch(() => {});
+      // Unconditional: delete all legacy bare-id rows (e.g. 'youtube', 'gmail')
+      // that don't have the canonical '.agent' suffix. Safe to run every call.
+      await db.run("DELETE FROM agents WHERE id NOT LIKE '%.agent'").catch(() => {});
 
       const rows = await db.all("SELECT id, type, service, capabilities, status, last_validated FROM agents WHERE type = 'browser' ORDER BY created_at DESC");
       dbAgents = (rows || []).map(r => ({
@@ -4684,16 +4680,47 @@ async function actionDeleteAgent({ id }) {
     } catch (e) { errors.push(`scan-state.json: ${e.message}`); }
   }
 
-  // ── 9. Skills directory (trained recipes and atomic skills) ────────────────────
-  const skillsDir = path.join(os.homedir(), '.thinkdrop', 'skills', service);
-  if (fs.existsSync(skillsDir)) {
-    try { fs.rmSync(skillsDir, { recursive: true, force: true }); deleted.push(skillsDir); } catch (e) { errors.push(e.message); }
+  // ── 9. Skills directory (trained recipes and atomic skills) ────────────────
+  // Skill dirs use domain-based prefixes: e.g. "amazon_com_amazon_homepage_logged_o_*"
+  // Delete all dirs that start with the service prefix or domain-derived prefix.
+  const skillsBaseDir = path.join(os.homedir(), '.thinkdrop', 'skills');
+  if (fs.existsSync(skillsBaseDir)) {
+    try {
+      const allSkillDirs = fs.readdirSync(skillsBaseDir).filter(f =>
+        fs.statSync(path.join(skillsBaseDir, f)).isDirectory()
+      );
+      const servicePrefix = service.toLowerCase();
+      const idPrefix = id.replace(/\./g, '_').toLowerCase();
+      for (const dir of allSkillDirs) {
+        const dirLower = dir.toLowerCase();
+        if (dirLower.startsWith(servicePrefix + '_') ||
+            dirLower.startsWith(idPrefix + '_') ||
+            dirLower === servicePrefix || dirLower === idPrefix) {
+          const fullPath = path.join(skillsBaseDir, dir);
+          try { fs.rmSync(fullPath, { recursive: true, force: true }); deleted.push(fullPath); }
+          catch (e) { errors.push(e.message); }
+        }
+      }
+    } catch (e) { errors.push(`skills dir scan: ${e.message}`); }
   }
-  // Also try id-based directory name (some skills use full agent id)
-  const skillsDirById = path.join(os.homedir(), '.thinkdrop', 'skills', id.replace(/\./g, '_'));
-  if (fs.existsSync(skillsDirById) && skillsDirById !== skillsDir) {
-    try { fs.rmSync(skillsDirById, { recursive: true, force: true }); deleted.push(skillsDirById); } catch (e) { errors.push(e.message); }
-  }
+
+  // ── 10. installed_skills in user-memory service (HTTP API on port 3001) ────
+  // Delete rows where source_domain matches the agent's service.
+  try {
+    const userMemPort = process.env.USER_MEMORY_PORT || '3001';
+    const removePayload = JSON.stringify({ payload: { sourceDomain: service } });
+    await new Promise((resolve) => {
+      const req = http.request(
+        { hostname: '127.0.0.1', port: parseInt(userMemPort), path: '/skill.removeByDomain', method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(removePayload) } },
+        (res) => { res.on('data', () => {}); res.on('end', () => resolve()); }
+      );
+      req.on('error', () => resolve());
+      req.setTimeout(3000, () => { req.destroy(); resolve(); });
+      req.end(removePayload);
+    });
+    deleted.push(`installed_skills rows for domain: ${service}`);
+  } catch (e) { errors.push(`installed_skills cleanup: ${e.message}`); }
 
   logger.info(`[browser.agent] delete_agent: removed ${deleted.length} artifacts for ${id}`, { deleted, errors });
   return { ok: true, deleted, errors };

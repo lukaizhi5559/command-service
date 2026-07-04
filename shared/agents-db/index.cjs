@@ -32,11 +32,8 @@ async function _getDb() {
     fs.mkdirSync(AGENTS_DIR, { recursive: true });
 
     let db;
+    // Native duckdb 1.4.x is required; duckdb-async 0.10.x cannot read DBs created by 1.4.x.
     try {
-      const duckdbAsync = require('duckdb-async');
-      db = await duckdbAsync.Database.create(AGENTS_DB_PATH);
-      logger.info('Persistent connection opened via duckdb-async');
-    } catch (e1) {
       const { Database } = require('duckdb');
       const raw = await new Promise((resolve, reject) => {
         const d = new Database(AGENTS_DB_PATH, (err) => {
@@ -51,6 +48,8 @@ async function _getDb() {
         close: () => new Promise((res) => raw.close(() => res())),
       };
       logger.info('Persistent connection opened via duckdb native');
+    } catch (e) {
+      throw new Error(`Failed to open DuckDB with native driver: ${e.message}`);
     }
 
     await db.run(`CREATE TABLE IF NOT EXISTS agents (
