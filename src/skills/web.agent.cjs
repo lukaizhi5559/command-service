@@ -10,6 +10,7 @@
  *   research_domain      { domain, query }              → searches web for domain-specific guidance
  *   get_tutorial_steps   { query }                       → extracts step-by-step instructions from search results
  *   search_and_navigate  { query, preferDomain? }        → searches web, picks best URL to navigate to directly
+ *   discover_task_url   { domain, task }                → dual search (site-scoped + broad) to find the most direct deep-link URL for a task
  */
 
 const http   = require('http');
@@ -398,6 +399,144 @@ function _calculateStepConfidence(mergedSteps, sourceCount) {
   return 0.3;
 }
 
+/**
+ * Discover the most direct deep-link URL for a task on a given service domain.
+ * Uses two search strategies and merges results:
+ *   A) site-scoped:   site:<domain> <task>          → finds indexed app pages
+ *   B) broad:         <domain> <task> how to page URL → finds URLs mentioned in tutorials/guides
+ * Scores all candidates and returns the best one.
+ */
+async function actionDiscoverTaskUrl({ domain, task, maxResults = 5, candidateUrl }) {
+  if (!domain) return { ok: false, error: 'domain is required' };
+  if (!task)   return { ok: false, error: 'task is required' };
+
+  const cleanDomain = domain.replace(/^https?:\/\//, '').replace(/^www\./, '').replace(/\/$/, '');
+  logger.info(`[web.agent] discover_task_url: domain=${cleanDomain} task="${task.slice(0, 80)}" candidateUrl=${candidateUrl || 'none'}`);
+
+  // Extract task keywords for scoring
+  const taskKeywords = (task.toLowerCase()
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .split(/\s+/)
+    .filter(w => w.length > 2 && !['the', 'and', 'for', 'with', 'how', 'use', 'page', 'url', 'site'].includes(w))
+  );
+
+  const allCandidates = [];
+
+  // Seed with a previously verified URL if provided; it will compete with discovered candidates
+  if (candidateUrl && candidateUrl.includes(cleanDomain)) {
+    allCandidates.push({ url: candidateUrl, title: 'Previously verified URL', snippet: '', source: 'verified-cache' });
+  }
+
+  // ── Strategy A: site-scoped search ──────────────────────────────────────
+  const queryA = `site:${cleanDomain} ${task.slice(0, 100)}`;
+  logger.info(`[web.agent] discover_task_url: strategy A (site-scoped): "${queryA.slice(0, 80)}"`);
+  const resultA = await searchWeb(queryA, maxResults).catch(() => ({ ok: false }));
+  if (resultA.ok && resultA.results) {
+    for (const r of resultA.results) {
+      if (!_isParkingContent(r.title, r.snippet, r.url)) {
+        allCandidates.push({ url: r.url, title: r.title, snippet: r.snippet, source: 'site-scoped' });
+      }
+    }
+  }
+
+  // ── Strategy B: broad search + snippet URL extraction ───────────────────
+  const queryB = `${cleanDomain} ${task.slice(0, 80)} how to page URL`;
+  logger.info(`[web.agent] discover_task_url: strategy B (broad): "${queryB.slice(0, 80)}"`);
+  const resultB = await searchWeb(queryB, maxResults).catch(() => ({ ok: false }));
+  if (resultB.ok && resultB.results) {
+    for (const r of resultB.results) {
+      if (!_isParkingContent(r.title, r.snippet, r.url)) {
+        // The result URL itself might be on the service domain
+        allCandidates.push({ url: r.url, title: r.title, snippet: r.snippet, source: 'broad-result' });
+        // Also extract URLs mentioned in snippets (tutorials often say "go to exampleapp.com/create")
+        // Include #, ?, =, &, % and other common URL chars so deep links like mail.google.com/mail/u/0/#inbox?compose=new are captured.
+        const snippetUrls = (r.snippet || '').match(new RegExp(
+          cleanDomain.replace(/\./g, '\\.') + '\\/[a-z0-9\/_#?=&.~%+-]+', 'gi'
+        ));
+        if (snippetUrls) {
+          for (const su of snippetUrls) {
+            const fullUrl = su.startsWith('http') ? su : `https://${su}`;
+            allCandidates.push({ url: fullUrl, title: r.title, snippet: r.snippet, source: 'broad-snippet' });
+          }
+        }
+      }
+    }
+  }
+
+  if (allCandidates.length === 0) {
+    logger.info('[web.agent] discover_task_url: no candidates found from either strategy');
+    return { ok: false, error: 'No deep-link candidates found' };
+  }
+
+  // ── Score all candidates ────────────────────────────────────────────────
+  const domainBase = cleanDomain.split('.')[0]; // e.g. 'exampleapp' from 'exampleapp.com'
+  const scored = allCandidates.map(c => {
+    let score = 10; // baseline
+    try {
+      const parsed = new URL(c.url);
+      const host = parsed.hostname.replace(/^www\./, '');
+      const path = parsed.pathname.toLowerCase();
+
+      // +50: URL path contains task keywords
+      for (const kw of taskKeywords) {
+        if (path.includes(kw)) score += 50 / taskKeywords.length;
+      }
+
+      // +30: Same domain as the service
+      if (host === cleanDomain || host.endsWith('.' + cleanDomain)) score += 30;
+      else if (host.includes(domainBase)) score += 15;
+
+      // +20: On the service domain (not a blog/reddit)
+      if (host === cleanDomain || host.endsWith('.' + cleanDomain)) score += 20;
+
+      // +25: Previously verified URL from cache
+      if (c.source === 'verified-cache') score += 25;
+
+      // +10: Snippet mentions "how to" + task keywords
+      const snippetLower = (c.snippet || '').toLowerCase();
+      if (/how to/.test(snippetLower)) {
+        for (const kw of taskKeywords) {
+          if (snippetLower.includes(kw)) { score += 10 / taskKeywords.length; break; }
+        }
+      }
+
+      // Penalize root paths (just the homepage)
+      if (path === '/' || path === '') score -= 20;
+
+      // Penalize very long paths (likely article/blog pages, not app pages)
+      if (path.split('/').length > 5) score -= 10;
+
+    } catch (_) { score = 0; }
+    return { ...c, _score: Math.round(score) };
+  }).filter(c => c._score > 0)
+    .sort((a, b) => b._score - a._score);
+
+  // Deduplicate by URL (keep highest score)
+  const seen = new Set();
+  const deduped = scored.filter(c => {
+    if (seen.has(c.url)) return false;
+    seen.add(c.url);
+    return true;
+  });
+
+  if (deduped.length === 0 || deduped[0]._score < 30) {
+    logger.info(`[web.agent] discover_task_url: best candidate scored ${deduped[0]?._score || 0} — below threshold, no override`);
+    return { ok: false, error: 'No candidate scored above threshold', bestScore: deduped[0]?._score || 0 };
+  }
+
+  const best = deduped[0];
+  const confidence = Math.min(1, best._score / 100);
+  logger.info(`[web.agent] discover_task_url: best=${best.url} score=${best._score} confidence=${confidence.toFixed(2)} source=${best.source}`);
+
+  return {
+    ok: true,
+    taskUrl: best.url,
+    confidence,
+    score: best._score,
+    allCandidates: deduped.slice(0, 5).map(c => ({ url: c.url, score: c._score, source: c.source })),
+  };
+}
+
 // Main export handler
 module.exports = async function webAgent(args) {
   const { action, ...params } = args || {};
@@ -409,6 +548,8 @@ module.exports = async function webAgent(args) {
       return await actionGetTutorialSteps(params);
     case 'search_and_navigate':
       return await actionSearchAndNavigate(params);
+    case 'discover_task_url':
+      return await actionDiscoverTaskUrl(params);
     default:
       return { ok: false, error: `Unknown action: ${action}` };
   }
@@ -417,3 +558,4 @@ module.exports = async function webAgent(args) {
 module.exports.actionResearchDomain    = actionResearchDomain;
 module.exports.actionGetTutorialSteps  = actionGetTutorialSteps;
 module.exports.actionSearchAndNavigate = actionSearchAndNavigate;
+module.exports.actionDiscoverTaskUrl  = actionDiscoverTaskUrl;

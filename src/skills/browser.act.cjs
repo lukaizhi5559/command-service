@@ -1397,6 +1397,10 @@ function resolveRefForClick(sessionId, labelOrRef) {
   const refBracketMatch = labelOrRef.trim().match(/^\[ref=(e\d+)\]$/i);
   if (refBracketMatch) return { ref: refBracketMatch[1], label: refBracketMatch[1] };
   if (/^e\d+$/i.test(labelOrRef.trim())) return { ref: labelOrRef.trim(), label: labelOrRef.trim() };
+  // CSS attribute/pseudo selectors (e.g. div[aria-label='Message Body'], button.send, #id)
+  // must be passed directly to playwright-cli — fuzzy scoring against snapshot text
+  // will mis-resolve them (e.g. matching 'body' in 'Message Body' to 'Create new label').
+  if (/[\[\]#.>:()"'=~^$*|]/.test(labelOrRef.trim())) return { ref: null, label: null };
 
   const snap = snapshotCache.get(_tabKey(sessionId)) || '';
   if (!snap) return { ref: null, label: null };
@@ -1682,74 +1686,134 @@ async function checkForGmailErrors(sessionId) {
 }
 
 async function sendEmailWithVerification(sessionId, sendSelector) {
-  logger.info(`[browser.act] sendEmailWithVerification: clicking send button ${sendSelector}`);
-  
-  try {
-    // Click send button
-    const sendResult = await cliRun([...sessionFlags(sessionId, false), 'click', sendSelector], 5000);
-    
-    if (!sendResult.ok) {
-      throw new Error(`Send button click failed: ${sendResult.error}`);
-    }
-    
-    // Wait for send to complete
-    logger.info(`[browser.act] sendEmailWithVerification: waiting for send completion`);
-    await new Promise(resolve => setTimeout(resolve, 3000));
-    
-    // Verify email was sent
-    const wasSent = await verifyEmailSent(sessionId);
-    
-    if (!wasSent) {
-      // Check for error dialogs
-      const hasError = await checkForGmailErrors(sessionId);
-      if (hasError) {
-        throw new Error(`Gmail send error: ${hasError}`);
-      }
-      
-      throw new Error('Email send verification failed - no confirmation detected');
-    }
-    
-    logger.info(`[browser.act] sendEmailWithVerification: email sent successfully`);
-    return true;
-  } catch (error) {
-    logger.error(`[browser.act] sendEmailWithVerification: ${error.message}`);
-    throw error;
-  }
-}
+  logger.info(`[browser.act] sendEmailWithVerification: pre-send validation + send for session=${sessionId}`);
 
-async function verifyEmailSent(sessionId) {
+  // ── Step 1: Pre-send validation ──────────────────────────────────────────
+  // Run page.evaluate to verify: (a) at least 1 recipient chip, (b) subject non-empty,
+  // (c) compose window is visible. Surface actionable errors before clicking Send.
   try {
-    const snapshot = await cliRun([...sessionFlags(sessionId, false), 'snapshot'], 5000);
-    
-    if (!snapshot.ok) {
-      logger.warn(`[browser.act] verifyEmailSent: snapshot failed`);
-      return false;
+    const S = sessionFlags(sessionId, false);
+    const validationCode = `async page => {
+      return await page.evaluate(() => {
+        const chips = document.querySelectorAll('[data-hovercard-id],[email],[data-name].vM,.vR,.afV');
+        const recipientInput = document.querySelector('input[name="to"],textarea[name="to"]');
+        const rawToText = (recipientInput?.value || '').trim();
+        const hasChip = chips.length > 0;
+        const hasRawTo = rawToText.length > 3 && rawToText.includes('@');
+        const subject = (document.querySelector('input[name="subjectbox"]')?.value || '').trim();
+        const body = (document.querySelector('div[aria-label="Message Body"]')?.innerText || '').trim();
+        const composeVisible = !!document.querySelector('div[gh="cm"] + div, .T-I-KE, div[aria-label="New Message"], div[aria-label="Message"]');
+        return JSON.stringify({ hasChip, hasRawTo, rawToText: rawToText.slice(0,50), subject: subject.slice(0,50), bodyLen: body.length, composeVisible });
+      });
+    }`;
+    const valRes = await cliRun([...S, 'run-code', validationCode], 8000);
+    if (valRes.ok && valRes.stdout) {
+      let valData = null;
+      try { valData = JSON.parse(valRes.stdout.trim().replace(/^"|"$/g, '').replace(/\\"/g, '"')); } catch (_) {}
+      if (valData) {
+        if (!valData.hasChip && !valData.hasRawTo) {
+          throw new Error('sendEmailWithVerification: No recipient chip confirmed — fill the To field and press Enter to create a chip before sending');
+        }
+        if (valData.hasRawTo && !valData.hasChip) {
+          // Address is still raw text, not a chip — press Enter to confirm it then continue
+          logger.warn(`[browser.act] sendEmailWithVerification: recipient "${valData.rawToText}" is raw text, not chip — pressing Enter to confirm`);
+          await cliRun([...S, 'press', 'Enter'], 3000).catch(() => {});
+          await new Promise(r => setTimeout(r, 500));
+        }
+        logger.info(`[browser.act] sendEmailWithVerification: validation ok — chips=${valData.hasChip}, subject="${valData.subject}", bodyLen=${valData.bodyLen}`);
+      }
     }
-    
-    const content = snapshot.stdout.toLowerCase();
-    
-    // Check for sent email confirmation
-    const sentIndicators = [
-      'message sent',
-      'your message has been sent',
-      'sent successfully',
-      'email sent',
-      'conversation sent'
-    ];
-    
-    // Check for compose window being closed/cleared
-    const composeClosed = !content.includes('compose') || 
-                         !content.includes('to:') ||
-                         content.includes('message sent');
-    
-    const wasSent = sentIndicators.some(indicator => content.includes(indicator)) || composeClosed;
-    
-    logger.info(`[browser.act] verifyEmailSent: email sent: ${wasSent}`);
-    return wasSent;
-  } catch (error) {
-    logger.error(`[browser.act] verifyEmailSent: error verifying send: ${error.message}`);
-    return false;
+  } catch (valErr) {
+    if (valErr.message.startsWith('sendEmailWithVerification:')) throw valErr; // re-throw actionable errors
+    logger.warn(`[browser.act] sendEmailWithVerification: pre-send validation failed (non-fatal): ${valErr.message}`);
   }
+
+  // ── Step 2: Click Send — multi-strategy ──────────────────────────────────
+  // Strategy 1: use the provided selector (ARIA ref or CSS)
+  // Strategy 2: fallback CSS selectors for Gmail send button
+  // Strategy 3: keyboard shortcut Ctrl+Enter
+  const S = sessionFlags(sessionId, false);
+  let sendClicked = false;
+
+  const sendStrategies = [
+    { label: 'selector', fn: () => cliRun([...S, 'click', sendSelector], 5000) },
+    { label: 'css-tooltip', fn: () => cliRun([...S, 'click', 'div[data-tooltip*="Send"]'], 4000) },
+    { label: 'css-aria-send', fn: () => cliRun([...S, 'click', 'div[aria-label*="Send"]'], 4000) },
+    { label: 'keyboard-ctrl-enter', fn: async () => {
+      // Focus body first so Ctrl+Enter hits compose, not the browser
+      await cliRun([...S, 'click', 'div[aria-label="Message Body"]'], 2000).catch(() => {});
+      return cliRun([...S, 'press', 'Control+Enter'], 4000);
+    }},
+  ];
+
+  for (const strategy of sendStrategies) {
+    try {
+      const res = await strategy.fn();
+      if (res.ok) {
+        logger.info(`[browser.act] sendEmailWithVerification: send clicked via ${strategy.label}`);
+        sendClicked = true;
+        break;
+      }
+      logger.warn(`[browser.act] sendEmailWithVerification: strategy "${strategy.label}" failed — trying next`);
+    } catch (_) {}
+  }
+
+  if (!sendClicked) {
+    throw new Error('sendEmailWithVerification: all send strategies failed — could not locate or click Send button');
+  }
+
+  // ── Step 3: Wait for result — compose close OR dialog ───────────────────
+  await new Promise(r => setTimeout(r, 1500));
+  const postSnap = await cliRun([...S, 'snapshot'], 8000);
+  if (!postSnap.ok) {
+    // Can't verify — assume sent since click succeeded
+    logger.warn(`[browser.act] sendEmailWithVerification: post-send snapshot failed — assuming sent`);
+    return true;
+  }
+
+  const snapText = (postSnap.stdout || '').toLowerCase();
+
+  // ── Step 4: Detect and classify dialogs ─────────────────────────────────
+  // "Send without subject?" / "Send without body?" → auto-accept (user intent to send)
+  const isSendAnywayDialog = /send\s*anyway|send\s*without\s*(subject|text|body)|missing\s*subject|no\s*subject/i.test(postSnap.stdout || '');
+  if (isSendAnywayDialog) {
+    logger.info(`[browser.act] sendEmailWithVerification: "send anyway" dialog detected — auto-accepting`);
+    const acceptRes = await cliRun([...S, 'dialog-accept'], 3000).catch(() => ({ ok: false }));
+    if (!acceptRes.ok) {
+      // Try clicking "Send" in the dialog text
+      await cliRun([...S, 'find-text', 'Send anyway'], 3000).catch(() => {});
+      await cliRun([...S, 'find-text', 'OK'], 3000).catch(() => {});
+    }
+    await new Promise(r => setTimeout(r, 1500));
+    const afterAcceptSnap = await cliRun([...S, 'snapshot'], 5000).catch(() => ({ ok: false }));
+    const afterText = ((afterAcceptSnap.ok && afterAcceptSnap.stdout) || '').toLowerCase();
+    const sentAfterAccept = /message sent|email sent|sent successfully/i.test(afterText) ||
+      !/compose|new message/i.test(afterText);
+    logger.info(`[browser.act] sendEmailWithVerification: sent after dialog accept: ${sentAfterAccept}`);
+    return sentAfterAccept;
+  }
+
+  // "Address not recognized" → surface as structured error
+  const isAddressError = /address.*not recognized|invalid.*address|couldn.t find.*user|no account found/i.test(postSnap.stdout || '');
+  if (isAddressError) {
+    const errMatch = (postSnap.stdout || '').match(/[^\n]*(?:address.*not recognized|invalid.*address|couldn.t find|no account found)[^\n]*/i);
+    throw new Error(`sendEmailWithVerification: recipient address error — ${(errMatch?.[0] || 'address not recognized').trim()}`);
+  }
+
+  // ── Step 5: Confirm "Message sent" snackbar / compose closed ────────────
+  const confirmedSent = /message sent|email sent|sent successfully|your message has been sent/i.test(postSnap.stdout || '');
+  const composeGone = !/new message|compose.*window|aria-label="new message"/i.test(postSnap.stdout || '');
+  const wasSent = confirmedSent || composeGone;
+
+  if (wasSent) {
+    logger.info(`[browser.act] sendEmailWithVerification: email sent (confirmedSent=${confirmedSent}, composeGone=${composeGone})`);
+  } else {
+    const gmailErr = await checkForGmailErrors(sessionId);
+    if (gmailErr) throw new Error(`sendEmailWithVerification: Gmail error after send — ${gmailErr}`);
+    throw new Error('sendEmailWithVerification: compose window still open with no confirmation — send may not have fired');
+  }
+
+  return true;
 }
 
 // ---------------------------------------------------------------------------

@@ -158,10 +158,37 @@ Indicate authRequired=false if:
 // ---------------------------------------------------------------------------
 // Auth-check result cache — avoids repeated navigate+evaluate probes
 // Key: agentId  Value: { ts: Date.now(), authNeeded: bool }
-// TTL: 60s — re-probe if the last confirmed-ok check is older than this.
+// TTL: 120s — re-probe if the last confirmed-ok check is older than this.
 // ---------------------------------------------------------------------------
-const AUTH_CHECK_CACHE_TTL_MS = 60_000;
+const AUTH_CHECK_CACHE_TTL_MS = 120_000;
 const _authCheckCache = new Map(); // agentId → { ts, authNeeded }
+
+// ---------------------------------------------------------------------------
+// Session mutex — prevents concurrent playwright.agent + waitForAuth calls
+// on the same browser session. Key: sessionId  Value: Promise (running task)
+// When waitForAuth is needed, the current playwright.agent run MUST have
+// already returned (loginWallDetected:true) before waitForAuth fires —
+// the mutex enforces this and provides a guard for any future parallel calls.
+// ---------------------------------------------------------------------------
+const _sessionMutex = new Map(); // sessionId → Promise
+
+async function _withSessionMutex(sessionId, fn) {
+  // Wait for any in-progress operation on this session to finish first
+  const _existing = _sessionMutex.get(sessionId);
+  if (_existing) {
+    logger.warn(`[browser.agent] session mutex: waiting for prior operation on ${sessionId} to finish`);
+    await _existing.catch(() => {}); // wait but don't rethrow prior errors
+  }
+  let _resolve;
+  const _lock = new Promise(r => { _resolve = r; });
+  _sessionMutex.set(sessionId, _lock);
+  try {
+    return await fn();
+  } finally {
+    _resolve();
+    if (_sessionMutex.get(sessionId) === _lock) _sessionMutex.delete(sessionId);
+  }
+}
 
 function _getCachedAuthCheck(agentId) {
   const entry = _authCheckCache.get(agentId);
@@ -230,7 +257,7 @@ function getContentExtractionConfig(hostname) {
 
 const { userAgent } = require('./user.agent.cjs');
 
-const { resolveDestination, recordCorrection, classifyTaskIntent } = require('../skill-helpers/destination-resolver.cjs');
+const { resolveDestination, recordCorrection, classifyTaskIntent, classifyUrlType, getLearnedCorrection } = require('../skill-helpers/destination-resolver.cjs');
 const { killExistingChromeForProfile, clearProfileLock, findCli, shortSessionId } = require('./browser.act.cjs');
 
 const BROWSER_ACT_PORT = parseInt(process.env.COMMAND_SERVICE_PORT || '3007', 10);
@@ -2364,6 +2391,42 @@ async function resolveCredential(agentId, credName) {
   return null;
 }
 
+/**
+ * Quick validation that a discovered deep-link URL is reachable and stays on the
+ * expected service domain. Used before overriding startUrl. Returns true only if
+ * navigation succeeds and the resulting page shows no obvious error.
+ */
+async function verifyDeepLinkUrl(url, sessionId, expectedHost, timeoutMs = 15000) {
+  try {
+    const nav = await callSkill('browser.act', { action: 'navigate', url, sessionId, timeoutMs }, timeoutMs + 3000).catch(() => ({ ok: false }));
+    if (!nav?.ok) return false;
+
+    const loc = await callSkill('browser.act', { action: 'evaluate', text: 'window.location.href', sessionId, timeoutMs: 5000 }, 8000).catch(() => ({ ok: false }));
+    if (!loc?.ok) return false;
+    const curHref = String(loc?.result ?? loc?.stdout ?? '').trim().replace(/^"|"$/g, '');
+    if (!curHref) return false;
+
+    const curHost = (() => { try { return new URL(curHref).hostname.replace(/^www\./, ''); } catch (_) { return ''; } })();
+    if (!curHost || curHost !== expectedHost) {
+      logger.warn(`[browser.agent] verifyDeepLinkUrl: host mismatch expected=${expectedHost} actual=${curHost} for ${url}`);
+      return false;
+    }
+
+    const body = await callSkill('browser.act', { action: 'evaluate', text: 'document.title + " " + ((document.body && document.body.innerText) ? document.body.innerText.slice(0, 500) : "")', sessionId, timeoutMs: 5000 }, 8000).catch(() => ({ ok: false }));
+    if (!body?.ok) return false;
+    const text = String(body?.result ?? body?.stdout ?? '').toLowerCase();
+    if (/\b404\b|\bnot found\b|\bsomething went wrong\b|\berror\b|\bunavailable\b/.test(text)) {
+      logger.warn(`[browser.agent] verifyDeepLinkUrl: error indicator found on ${url}`);
+      return false;
+    }
+
+    return true;
+  } catch (err) {
+    logger.warn(`[browser.agent] verifyDeepLinkUrl error for ${url}: ${err.message}`);
+    return false;
+  }
+}
+
 // HTTP helper to call another skill in this command-service process
 function callSkill(skillName, args, timeoutMs = 120000) {
   return new Promise((resolve, reject) => {
@@ -2403,6 +2466,11 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
   }
   if (!agentId) return { ok: false, error: 'agentId is required' };
   if (!task)    return { ok: false, error: 'task is required' };
+
+  // Domain-continuity flag: set in the playwright auth path, read later during
+  // deep-link discovery. Declared at function scope so it is visible outside the
+  // if/else branch that populates it.
+  let _domainContinuitySkip = false;
 
   const _fs = require('fs');
 
@@ -2844,7 +2912,7 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
     // ── Domain continuity check: skip restart if already on target ─────────
     // Query user-memory to check if we're already on the target domain/page.
     // If so, skip daemon restart, auth checks, and recipe waypoints entirely.
-    let _domainContinuitySkip = false;
+    _domainContinuitySkip = false;
     let _currentBrowserUrl = null;
     try {
       const memHost = process.env.MEMORY_SERVICE_HOST || '127.0.0.1';
@@ -3943,6 +4011,93 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
     }
   }
 
+  // ── Deep-link discovery: find the most direct URL for this task ────────────
+  // Uses web.agent's discover_task_url (dual search: site-scoped + broad) to find
+  // a deep-link URL that goes straight to the task's functional page. Discovery
+  // runs for every task unless a trained recipe is injected. Domain continuity
+  // only skips browser restart; it does not skip URL discovery, because the user
+  // may already be on the same domain but on a different page (e.g. inbox vs compose).
+  // Discovered URLs are validated against the page and cached in the shared
+  // nav-correction store so future runs avoid stale URLs.
+  let _deepLinkOverride = null;
+  if (!_trainedRecipeInjected) {
+    try {
+      const _serviceKey = (existing?.service || agentId.replace(/\.agent$/, '')).toLowerCase().replace(/[^a-z0-9]/g, '');
+      const _intent = await classifyTaskIntent(task);
+      const _baseHost = (() => { try { return new URL(startUrl).hostname.replace(/^www\./, ''); } catch (_) { return ''; } })();
+      if (!_baseHost) throw new Error('could not derive hostname from startUrl');
+
+      // 1. Check cached verified correction
+      const _cached = await getLearnedCorrection(_serviceKey, _intent);
+      if (_cached?.correctedUrl) {
+        logger.info(`[browser.agent] deep-link: cached correction ${_cached.correctedUrl} (conf=${_cached.confidence.toFixed(2)}) for ${_serviceKey}:${_intent}`);
+      }
+
+      // 2. If cached correction has high confidence, skip web search entirely
+      //    and use the cached URL directly — saves ~2-8s of web.agent discovery.
+      let _dlResult = null;
+      if (!_cached?.correctedUrl || _cached.confidence < 0.8) {
+        _dlResult = await callSkill('web.agent', {
+          action: 'discover_task_url',
+          domain: _baseHost,
+          task: task.slice(0, 200),
+          candidateUrl: _cached?.correctedUrl,
+        }, 10000).catch(() => null);
+      }
+
+      // 3. Pick best candidate (cached URL is preferred if discovery returns it)
+      let _bestUrl = null;
+      let _bestScore = 0;
+      let _bestSource = 'none';
+      if (_cached?.correctedUrl) {
+        _bestUrl = _cached.correctedUrl;
+        _bestScore = 100; // high baseline for previously verified URLs
+        _bestSource = 'cache';
+      }
+      if (_dlResult?.ok && _dlResult.taskUrl && (_dlResult.score || 0) > _bestScore) {
+        _bestUrl = _dlResult.taskUrl;
+        _bestScore = _dlResult.score;
+        _bestSource = `discovery:${_dlResult.confidence?.toFixed?.(2) || '?'}`;
+      }
+
+      if (_bestUrl) {
+        // 4. Security: same domain check
+        const _dlHost = (() => { try { return new URL(_bestUrl).hostname.replace(/^www\./, ''); } catch (_) { return ''; } })();
+        if (_dlHost && (_dlHost === _baseHost || _dlHost.endsWith('.' + _baseHost) || _baseHost.endsWith('.' + _dlHost))) {
+          // 5. Validate the candidate URL before trusting it
+          const _valid = await verifyDeepLinkUrl(_bestUrl, sessionId, _baseHost, 15000);
+          if (_valid) {
+            _deepLinkOverride = _bestUrl;
+            logger.info(`[browser.agent] deep-link: verified ${_bestUrl} (source=${_bestSource}, score=${_bestScore}) for task "${task.slice(0, 60)}" — overriding startUrl from ${startUrl}`);
+            // Record this working URL so future runs benefit immediately
+            setImmediate(() => {
+              recordCorrection(_serviceKey, _intent, _bestUrl).catch(() => {});
+            });
+          } else {
+            logger.warn(`[browser.agent] deep-link: candidate ${_bestUrl} failed validation — using startUrl ${startUrl}`);
+            // If cached URL failed, clear it so we rediscover next time
+            if (_bestSource === 'cache') {
+              setImmediate(() => {
+                const skillDb = require('../skill-helpers/skill-db.cjs');
+                skillDb.del('nav-correction', `${_serviceKey}:${_intent}`).catch(() => {});
+              });
+            }
+          }
+        } else {
+          logger.warn(`[browser.agent] deep-link: ignored ${_bestUrl} — domain mismatch with ${startUrl}`);
+        }
+      } else {
+        logger.info(`[browser.agent] deep-link: no suitable URL found${_dlResult?.error ? ' (' + _dlResult.error + ')' : ''} — using startUrl ${startUrl}`);
+      }
+    } catch (_dlErr) {
+      logger.warn(`[browser.agent] deep-link discovery failed (non-fatal): ${_dlErr.message}`);
+    }
+  }
+
+  if (_deepLinkOverride) {
+    startUrl = _deepLinkOverride;
+  }
+
   // ── Inject domain map content extraction hints if available ───────────────
   // explore.agent scan mode discovers optimal CSS selectors for content extraction.
   // These hints help playwright.agent extract substantive content instead of UI chrome.
@@ -3966,7 +4121,7 @@ When extracting page content with run-code, prioritize these selectors over gene
     if (_recipeExecutedOk && url) {
       logger.info(`[browser.agent] run: recipe executed successfully - NOT passing URL to playwright.agent to stay on target page`);
     }
-    const agentResult = await callSkill(_agentSkill, {
+    const agentResult = await _withSessionMutex(sessionId, () => callSkill(_agentSkill, {
       goal: _effectiveTask,
       agentContext: _agentContext,
       url: _playwrightUrl,
@@ -3980,9 +4135,10 @@ When extracting page content with run-code, prioritize these selectors over gene
       maxTurns: 15,
       timeoutMs: 120000,
       recipeWasUsed: _recipeExecutedOk,
+      authConfirmedAt: (_getCachedAuthCheck(agentId)?.ts ?? null),
       _progressCallbackUrl,
       _stepIndex,
-    }, 130000);
+    }, 130000));
 
     const agentResultText = agentResult?.result || agentResult?.stdout || '';
 
@@ -4166,7 +4322,7 @@ When extracting page content with run-code, prioritize these selectors over gene
                 await _healDb.run('UPDATE agents SET status=? WHERE id=? AND status=?', 'healthy', agentId, 'needs_auth').catch(() => {});
               });
             } catch (_) {}
-            const _retryResult = await callSkill(_agentSkill, {
+            const _retryResult = await _withSessionMutex(sessionId, () => callSkill(_agentSkill, {
               goal: _effectiveTask,
               agentContext: _agentContext,
               url: startUrl,
@@ -4178,10 +4334,11 @@ When extracting page content with run-code, prioritize these selectors over gene
               headed: _usePersistentProfile ? true : undefined,
               maxTurns: 15,
               timeoutMs: 120000,
+              authConfirmedAt: Date.now(),
               _progressCallbackUrl,
               _stepIndex,
               _loginWallRetried: true,  // prevent recursive retry
-            }, 130000);
+            }, 130000));
             return {
               ok: _retryResult?.ok ?? false,
               agentId,
@@ -4312,11 +4469,29 @@ When extracting page content with run-code, prioritize these selectors over gene
       error: agentResult?.error,
     };
 
+    // ── Auto-recipe generation from successful run ─────────────────────────────
+    // After a successful run that was NOT recipe-driven, auto-generate a recipe
+    // from the execution transcript so subsequent identical tasks replay
+    // deterministically without LLM planning, web-search discovery, or re-plans.
+    let _autoRecipeCreated = false;
+    if (_runResult.ok === true && !_trainedRecipeInjected && _runResult.transcript.length >= 2) {
+      try {
+        const trainerAgent = require('./trainer.agent.cjs');
+        const _autoRecipe = await trainerAgent.saveAutoRecipe(
+          agentId, task, _runResult.transcript, startUrl, _agentContext
+        );
+        if (_autoRecipe) _autoRecipeCreated = true;
+      } catch (_autoRecipeErr) {
+        logger.warn(`[browser.agent] auto-recipe generation failed (non-fatal): ${_autoRecipeErr.message}`);
+      }
+    }
+
     // ── Post-run background rescan ────────────────────────────────────────────
     // After a successful run, enqueue a background scan to rebuild domain maps
     // and navigate_history skills with fresh data. This ensures the history index
     // stays current without blocking the current task.
-    if (_runResult.ok === true) {
+    // Skip when a recipe was used or just created — the workflow is already cached.
+    if (_runResult.ok === true && !_trainedRecipeInjected && !_autoRecipeCreated) {
       try {
         const { enqueueScan } = require('./explore.agent.cjs');
         enqueueScan({ url: startUrl, agentId }, 'post_automation');

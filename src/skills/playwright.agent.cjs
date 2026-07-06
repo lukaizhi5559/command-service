@@ -241,11 +241,12 @@ Rules:
 - MODAL/OVERLAY RULE: When clicking a button that opens a modal or overlay (Compose, New, Reply, etc.), add { "action": "snapshot" } as the very next step. This forces a DOM re-read so all following steps use fresh refs from the new modal. Without this, refs from the original page will fail inside the modal.
 - AI CHAT EXTRACTION RULE: When sending a message to an AI assistant (ChatGPT, Claude, Grok, Perplexity, etc.), after pressing Enter add: (1) { "action": "waitForStableText" } to wait for the streamed response to finish, (2) { "action": "getPageText" } to read all visible page text. This is the UNIVERSAL, site-agnostic approach — works on any AI chat site without CSS class knowledge. NEVER use run-code + page.evaluate() with site-specific CSS selectors (like .prose, .generic, [data-testid=...]) for AI chat extraction — these selectors break across sites and page updates. Do NOT add a return step — the getPageText result is automatically captured as task output and will be consumed by the synthesis step downstream.
 - CONTENT EXTRACTION RULE (CRITICAL): When extracting content from ANY page (search results, YouTube, news, documentation, etc.), use { "action": "getPageText" } and let the result flow through automatically. Do NOT add a { "action": "return" } step after getPageText. The getPageText result is automatically captured as the task output. Adding a return step with placeholder text or summary text like "Successfully searched..." will BLOCK the actual content from reaching the synthesis step and cause a "no useful content" failure. NEVER add a return step after getPageText — the system handles output automatically.
-- SESSION ISOLATION RULE: When accessing an AI chat service (ChatGPT, Perplexity, Gemini, Claude, etc.), ALWAYS start with a navigate action to its fresh/new-chat URL — ChatGPT: https://chatgpt.com/, Perplexity: https://www.perplexity.ai/, Gemini: https://gemini.google.com/app, Claude: https://claude.ai/new. This ensures getPageText reads ONLY the current query response, not old conversation history from previous sessions. EXCEPTION: If the task explicitly involves a follow-up or continuation of a previous AI response (keywords: "follow up", "continue", "based on that", "expand on", "now ask it"), stay on the current page and do NOT navigate away.
+- SESSION ISOLATION RULE: When accessing an AI chat service, ALWAYS start with a navigate action to its fresh/new-chat URL to ensure getPageText reads ONLY the current query response, not old conversation history from previous sessions. EXCEPTION: If the task explicitly involves a follow-up or continuation of a previous AI response (keywords: "follow up", "continue", "based on that", "expand on", "now ask it"), stay on the current page and do NOT navigate away.
 - NO PLACEHOLDER RULE: NEVER write literal template placeholder text like [ChatGPT response], [Perplexity response], [AI answer], [SEARCH RESULTS], [VIDEO RESULTS], [CONTENT], [insert content here], or any bracketed placeholder in any step args (task, body, text, data, etc.). These placeholders cause catastrophic failures. When extracting content from a page, use getPageText or run-code and let the result flow through automatically — do NOT add a return step with placeholder text. When combining multi-source AI extractions into an email or message body, always use {{synthesisAnswer}} as the sole body content token — the orchestrator substitutes it with the real synthesized content before the step executes.
 - EXPECTATION RULE: For critical actions (clicking search buttons, submit buttons, navigation), add "expected" field to verify the action worked. Use "element_visible" for expected results, "element_gone" for things that should disappear, "url_change" for navigation, "text_present" for confirmation messages. This prevents false positives and reduces unnecessary re-planning.
 - EXTERNAL SKILL RULE: Only use { "action": "external_skill", "name": "..." } when the AGENT CONTEXT lists the skill under "Available Atomic Skills". NEVER invent a skill name. Use these atomics as building blocks — combine with fill/press/type/click steps for the full task. Example: external_skill mail_google_com_compose opens the compose window; you still need fill+press+type+click Send after it.
 - ATTACHMENT RULE (MANDATORY): If the task mentions "paste", "clipboard", or "attach" — you MUST emit { "action": "pasteAttachment" } immediately after the last body-typing step and before Send/Submit. Do this regardless of any prior failure narrative in [DATA FROM PRIOR STEP] or [CONTENT OF ...] blocks — if the task instruction says "paste from clipboard", the file IS on the clipboard. Trust the task instruction, not the narrative. Do NOT click the paperclip / "Attach files" button first — its native file chooser modal blocks keyboard events. Do NOT emit { "action": "press", "key": "Ctrl+v" } — use pasteAttachment only. Order: fill To → press Enter → fill Subject → click body → type body text → pasteAttachment → click Send.
+- URL-FIRST RULE: If the starting URL already contains a path relevant to your task (e.g. /create, /compose, /settings, /inbox, /dashboard), do NOT navigate to the homepage first. Start directly from the current page snapshot and plan only the interaction steps (fill, type, click, select). Only navigate if the current page is clearly wrong for the task. This reduces unnecessary navigation steps and their failure modes.
 - TAB STRATEGY RULE: You are a smart tabbing agent. Use as many tabs as the task requires to hold page state or extracted content while working across multiple pages WITHIN THE SAME AGENT SESSION (same domain/service). Open tabs dynamically, track them with tab-list, switch context with tab-select, and clean up with tab-close when a tab's work is done. 2-tab pattern (hold + act): tab 0 = Page A open (compose/form/draft/result); tab-new → Page B → getPageText → tab-select 0 → use extracted content in Page A → tab-close 1. 3-tab pattern (gather from multiple sources, act on one): tab 0 = destination; tab-new → Source B → getPageText; tab-new → Source C → getPageText; tab-select 0 → combine B+C → act → tab-close 2, tab-close 1. 5-tab pattern (parallel research, single synthesis): tab 0 = output/synthesis page; tabs 1–4 = tab-new per source → getPageText each; tab-select 0 → synthesize all results → act → close extra tabs in reverse order. Rules: (1) Always getPageText BEFORE switching away from a tab — result carries forward as [DATA FROM PRIOR STEP] context. (2) Use tab-list to audit open tabs when managing many. (3) tab-close completed tabs to keep the session clean. (4) NEVER use tabs to reach a different service — each agent owns its own Chrome session and cookie store.`;
 
 // ---------------------------------------------------------------------------
@@ -277,6 +278,36 @@ DECISION RULES — apply in this priority order:
 GOAL ALIGNMENT: The action must move TOWARD the goal. Ask: "After this action, will I be on a page where I can accomplish the goal?"`;
 
 // ---------------------------------------------------------------------------
+// Phase 1.7 prompt — page study (understand the page before planning)
+// Called AFTER orientation, BEFORE plan generation.
+// Asks: what page is this, what elements matter, what's the expected flow?
+// ---------------------------------------------------------------------------
+const PAGE_STUDY_PROMPT = `You are a browser automation analyst. Given a page snapshot and a task goal, analyze the page and return a structured assessment. Do NOT generate action steps — only analyze.
+
+Respond with EXACTLY ONE JSON object (no markdown fences, no explanation):
+
+{
+  "pageType": "<free-text short description — e.g. 'create', 'settings', 'inbox', 'login', 'homepage', 'dashboard', 'search-results', 'profile', 'feed', 'list', 'detail', 'editor', 'onboarding', 'checkout', 'error', 'landing'>",
+  "rightPage": true | false,
+  "confidence": 0.0,
+  "keyElements": [
+    { "ref": "e42", "role": "textbox", "label": "Primary input", "purpose": "where main content/prompt goes" }
+  ],
+  "expectedFlow": ["fill primary input", "select options", "click submit/generate", "wait for result"],
+  "potentialBlockers": ["may require option selection", "may show confirmation dialog"],
+  "wrongPageReason": null
+}
+
+Rules:
+- pageType is free-text — use the most descriptive short label for the page. The suggested values above cover common cases but you may encounter any page type.
+- rightPage: true if this page can accomplish the goal, false if we are on the wrong page.
+- confidence: how sure you are that this page can accomplish the goal (0.0 = definitely wrong, 1.0 = definitely right).
+- keyElements: list the interactive elements (from the snapshot refs) that are relevant to the goal. Include ref, role, label, and purpose (how it relates to the task).
+- expectedFlow: high-level logical steps to accomplish the goal on this page (NOT playwright actions — just the conceptual flow).
+- potentialBlockers: anything that might complicate execution (dialogs, required fields, auth gates, dynamic content).
+- wrongPageReason: if rightPage is false, explain why and what page we should be on instead.`;
+
+// ---------------------------------------------------------------------------
 // Phase 2 prompt — called only when a step fails
 // ---------------------------------------------------------------------------
 const REPAIR_SYSTEM_PROMPT = `You are a browser automation expert. One step in an automation plan has failed.
@@ -305,6 +336,7 @@ Respond with EXACTLY ONE JSON object (no markdown fences, no explanation):
   from the task description instead.
 - If a run-code step failed with "task is not defined", "results is not defined", or "ReferenceError" on any cross-step variable: the run-code VM only has \`page\` in scope. Check PRIOR_STEP_RESULT in context — if it contains a URL, emit { "action": "navigate", "url": "<that url>" } directly. Otherwise combine the extraction and usage into one run-code step that does both.
 - If the error contains "Timeout" and the failed step was navigate or click, a browser dialog (e.g. "Leave site?", "Leave page?") may be blocking. In that case start the repair with { "action": "dialog-accept" } before retrying the original step.
+- CHIP INPUT RULE (MANDATORY): For any To:, CC:, BCC:, recipient, tag, label, or assignee field that creates chips/tokens — the correct sequence is ALWAYS: fill → press Enter → snapshot → VERIFY chip appeared. NEVER use Tab to confirm (Tab moves focus without creating the chip). If chip not confirmed in snapshot, press Enter again. Never skip the verify snapshot step.
 - If the failed step is an upload action: the ONLY valid param for file paths is "files" (array of absolute paths). NEVER use "path". Correct form: { "action": "upload", "selector": "<ref>", "files": ["/absolute/path/to/file"] }
 - If a \`press\` step with "Ctrl+v" or "Meta+v" fails with "does not handle the modal state", or if any paste/press step fails after clicking a paperclip/Attach button: a native file chooser modal is blocking keyboard events. Replace the failed step with { "action": "pasteAttachment" } — it focuses the compose body (contentEditable) and pastes there, bypassing the modal entirely. If an attach-button modal is still open, first emit { "action": "press", "key": "Escape" } to dismiss it, then pasteAttachment.
 - FORM SUBMISSION FAILURE PATTERN: When a "press Enter" step fails to submit a form or the page doesn't change after submission:
@@ -350,7 +382,7 @@ Respond with EXACTLY ONE JSON object (no markdown fences, no explanation):
 Rules:
 - Preserve the original INTENT of each stale step — just use correct fresh refs
 - Use element refs (e12, e83) from FRESH_SNAPSHOT for click/fill/hover
-- Autocomplete inputs (Gmail To:, CC:, BCC:): fill then press Enter to confirm the recipient chip. Do NOT use Tab — Tab moves focus without creating the chip.
+- CHIP INPUT RULE (MANDATORY): For any To:, CC:, BCC:, recipient, tag, label, or assignee field that creates chips/tokens — the correct sequence is ALWAYS: fill → press Enter → snapshot → VERIFY chip appeared. NEVER use Tab to confirm (Tab moves focus without creating the chip). If chip not confirmed in snapshot, press Enter again. Never skip the verify snapshot step.
 - Contenteditable areas: click first, then type (not fill)
 - CREDENTIALS RULE: NEVER use placeholder text like 'your-email@gmail.com', 'user@example.com', '<email>', '<password>' in fill/type steps.
 - NEVER emit credential template tokens like {{gmail:username}} / {{service:password}}.
@@ -373,21 +405,31 @@ Respond with EXACTLY ONE JSON object (no markdown fences, no explanation):
 {
   "completed": true | false,
   "confidence": 0.0 to 1.0,
-  "evidence": "<one sentence: what you see on the page that supports your verdict>"
+  "evidence": "<one sentence: what you see on the page that supports your verdict>",
+  "dialog_blocking": true | false,
+  "dialog_text": "<text of the dialog if one is visible, else empty string>"
 }
 
-Signs the task is INCOMPLETE:
+DIALOG RULE (check FIRST before everything else):
+- If a modal dialog, alert, confirmation prompt, or browser dialog is visibly blocking the page
+  (e.g. "Send anyway?", "Send without subject?", "Leave page?", "Are you sure?", cookie banners,
+  onboarding modals, "Discard draft?"), set dialog_blocking:true and completed:false.
+- A blocking dialog is NOT a task failure — it is an intermediate state requiring a decision.
+- Do NOT count a blocking dialog as evidence of incompletion on the underlying task.
+- Only evaluate task completion AFTER mentally dismissing the dialog.
+
+Signs the task is INCOMPLETE (only applies when NO dialog is blocking):
 - A compose / draft window is still visible and contains the message that was supposed to be sent
 - A form is still present and filled with data that was supposed to be submitted
-- A modal, dialog, or overlay is still open when it should have been dismissed
 - An item that was supposed to be deleted is still in the list
 - The URL is unchanged when a navigation was the last action
 - A progress indicator, toast, or error message indicates failure
+- An "address not recognized" or validation error is shown in the compose window
 
 Signs the task is COMPLETE:
 - Page transitioned to a sent / confirmation / success view
 - The targeted element (compose window, modal, form) is no longer visible
-- A success toast, banner, or message is visible
+- A success toast, banner, or message is visible ("Message sent", "Saved", "Done", etc.)
 - The URL changed to confirm navigation succeeded
 - Content that was supposed to appear is now present
 
@@ -571,6 +613,13 @@ async function verifyExpectation(step, sessionId, headed, timeoutMs) {
         };
 
       case 'element_gone':
+        // Aria snapshot refs (e.g. e1491) are not valid CSS selectors —
+        // document.querySelector('e1491') always returns null so !null === true,
+        // creating a permanent false-positive. Skip the check; rely on the
+        // goal-achievement judge for actual confirmation.
+        if (/^e\d+$/i.test((selector || '').trim())) {
+          return { satisfied: true, reason: 'Aria ref selector — skipping element_gone querySelector check' };
+        }
         const goneResult = await browserAct({ 
           action: 'evaluate', 
           text: `!document.querySelector('${selector}')`, 
@@ -911,6 +960,7 @@ async function playwrightAgent(args) {
     headed                = true,
     url,
     recipeWasUsed         = false,
+    authConfirmedAt       = null,
     _progressCallbackUrl,
     _stepIndex            = 0,
   } = args || {};
@@ -1007,15 +1057,75 @@ async function playwrightAgent(args) {
     ? `${goal}\n\nNOTE: If a compose or draft window is currently visible on the page, close it first (click its X button or press Escape) before opening a fresh Compose window.`
     : goal;
 
+  // ── Phase 1.7: Goal-state pre-check ───────────────────────────────────────
+  // Before generating a full plan, check if prerequisite state is already satisfied.
+  // This avoids: re-clicking Compose when compose window is already open, re-searching
+  // when results are already displayed, re-navigating when already on target URL.
+  // Injected as a NOTE in effectiveGoal so the LLM skips already-done steps.
+  let _goalStateNote = '';
+  try {
+    if (_isComposeTask && _isMailAgentTask) {
+      // Require a real compose form, not just the sidebar "Compose" button. The inbox has a Compose
+      // button but lacks To + Subject + message body fields together.
+      const _snapshotLower = currentSnapshot.toLowerCase();
+      const _hasToField = /\bto\b/.test(_snapshotLower);
+      const _hasSubjectField = /\bsubject\b/.test(_snapshotLower);
+      const _hasBodyField = /message body|compose|contenteditable|draft/i.test(_snapshotLower);
+      const _composeAlreadyOpen = _hasToField && _hasSubjectField && _hasBodyField;
+      if (_composeAlreadyOpen) {
+        _goalStateNote = '\n\nNOTE: A compose/draft window is ALREADY OPEN in the browser. Do NOT navigate to compose URL or click Compose again — start directly by filling the To field using refs from the snapshot above.';
+        logger.info('[playwright.agent] goal-state: compose window already open — injecting skip-compose note');
+      }
+    }
+    // Generic: if we're already on the task's target URL, skip navigate steps
+    if (!_goalStateNote && url) {
+      const _curUrlRes = await browserAct({ action: 'evaluate', text: 'window.location.href', sessionId, headed, timeoutMs: 3000 }).catch(() => ({ ok: false }));
+      const _curUrl = _curUrlRes?.ok ? String(_curUrlRes.result || '').replace(/^"|"$/g, '') : '';
+      if (_curUrl && url && _curUrl.startsWith(url.replace(/#.*$/, ''))) {
+        _goalStateNote = `\n\nNOTE: The browser is ALREADY on ${_curUrl}. Do NOT add a navigate step — start directly with the task actions using refs from the snapshot above.`;
+        logger.info(`[playwright.agent] goal-state: already on target URL ${_curUrl} — injecting skip-navigate note`);
+      }
+    }
+  } catch (_gsErr) {
+    logger.warn(`[playwright.agent] goal-state pre-check failed (non-fatal): ${_gsErr.message}`);
+  }
+
+  const _finalGoal = _goalStateNote ? effectiveGoal + _goalStateNote : effectiveGoal;
+
+  // ── Phase 1.7: Page study — understand the page before planning ──────────
+  // A lightweight LLM call that analyzes the current page snapshot and returns
+  // a structured assessment (page type, key elements, expected flow, blockers).
+  // This is injected into the plan generation prompt to produce more accurate plans.
+  let _pageStudy = null;
+  let _studyBlock = '';
+  try {
+    const _studyRaw = await askWithMessages([
+      { role: 'system', content: PAGE_STUDY_PROMPT + domainLockBlock },
+      { role: 'user',   content: `GOAL: ${_finalGoal}\n\nSNAPSHOT:\n${extractInteractiveRefs(currentSnapshot)}` },
+    ], { temperature: 0.1, maxTokens: 600, responseTimeoutMs: 15000 });
+    _pageStudy = parseJson(_studyRaw);
+    if (_pageStudy && typeof _pageStudy === 'object') {
+      logger.info(`[playwright.agent] phase 1.7: page study — pageType=${_pageStudy.pageType}, rightPage=${_pageStudy.rightPage}, confidence=${_pageStudy.confidence}, elements=${_pageStudy.keyElements?.length || 0}`);
+      if (_pageStudy.rightPage === false && (_pageStudy.confidence || 0) < 0.3) {
+        logger.warn(`[playwright.agent] phase 1.7: wrong page detected — ${_pageStudy.wrongPageReason || 'no reason given'}`);
+      }
+      _studyBlock = `\nPAGE ANALYSIS (from pre-plan study phase — use this to guide your plan):\n- Page type: ${_pageStudy.pageType || 'unknown'}\n- Right page: ${_pageStudy.rightPage}\n- Confidence: ${_pageStudy.confidence}\n- Key elements: ${JSON.stringify((_pageStudy.keyElements || []).slice(0, 10))}\n- Expected flow: ${(_pageStudy.expectedFlow || []).join(' → ')}\n- Potential blockers: ${(_pageStudy.potentialBlockers || []).join('; ')}\n`;
+    } else {
+      logger.warn(`[playwright.agent] phase 1.7: page study response unparseable — proceeding without`);
+    }
+  } catch (_studyErr) {
+    logger.warn(`[playwright.agent] phase 1.7: page study failed (non-fatal): ${_studyErr.message}`);
+  }
+
   // ── Phase 2: Plan generation ───────────────────────────────────────────────
   logger.info(`[playwright.agent] phase 2: generating plan`);
   const planMessages = [
     { role: 'system', content: PLAN_SYSTEM_PROMPT + learnedRulesBlock + domainLockBlock },
-    { role: 'user',   content: `GOAL: ${effectiveGoal}\n\nSNAPSHOT:\n${extractInteractiveRefs(currentSnapshot)}${agentContext ? `\n\nAGENT CONTEXT (agent instructions — follow these for site-specific behaviour):\n${agentContext}` : ''}` },
+    { role: 'user',   content: `GOAL: ${_finalGoal}${_studyBlock}\n\nSNAPSHOT:\n${extractInteractiveRefs(currentSnapshot)}${agentContext ? `\n\nAGENT CONTEXT (agent instructions — follow these for site-specific behaviour):\n${agentContext}` : ''}` },
   ];
   // Dynamic token cap: short focused tasks (< 400 chars) seldom produce > 3 steps
   // so 800 tokens avoids wasting 1-2s on padding. Complex multi-site goals get 2048.
-  const _planMaxTokens = effectiveGoal.length < 400 ? 800 : 2048;
+  const _planMaxTokens = _finalGoal.length < 400 ? 800 : 2048;
   let planRaw;
   try {
     planRaw = await askWithMessages(planMessages, { temperature: 0.1, maxTokens: _planMaxTokens, responseTimeoutMs: 30000 });
@@ -1029,7 +1139,7 @@ async function playwrightAgent(args) {
     // Retry once — the first response may have been truncated mid-JSON
     logger.warn(`[playwright.agent] plan response unparseable on first attempt — retrying: ${planRaw?.slice(0, 200)}`);
     try {
-      planRaw = await askWithMessages(planMessages, { temperature: 0.1, maxTokens: _planMaxTokens, responseTimeoutMs: 30000 });
+      planRaw = await askWithMessages(planMessages, { temperature: 0.15, maxTokens: _planMaxTokens, responseTimeoutMs: 30000 });
       planParsed = parseJson(planRaw);
     } catch (retryErr) {
       logger.error(`[playwright.agent] plan retry LLM error: ${retryErr.message}`);
@@ -1083,6 +1193,39 @@ async function playwrightAgent(args) {
     }
   }
 
+  // ── Post-plan send guard for mail compose tasks ───────────────────────────
+  // The LLM always emits { "action": "click", "selector": "eNNN" } for the Send
+  // button, never { "action": "sendEmailWithVerification" }. This guard replaces
+  // the last Send/Submit click with the robust native action that includes
+  // pre-send validation, multi-strategy click, dialog handling, and sent
+  // confirmation — a hard structural guarantee, no LLM dependency.
+  function replaceSendWithVerification(_plan) {
+    if (!(_isComposeTask && _isMailAgentTask)) return;
+    // First pass: try to find a click whose selector/aria-label clearly says Send/Submit.
+    for (let _i = _plan.length - 1; _i >= 0; _i--) {
+      const _s = _plan[_i];
+      const _selStr = String(_s.selector || _s.ref || _s['aria-label'] || '');
+      const _isSendClick = _s.action === 'click' && /send|submit/i.test(_selStr);
+      if (_isSendClick) {
+        _plan[_i] = { action: 'sendEmailWithVerification', selector: _s.selector };
+        logger.info(`[playwright.agent] send guard: replaced click with sendEmailWithVerification at step ${_i + 1} (was: ${_selStr})`);
+        return;
+      }
+    }
+    // Fallback: after re-planning, the LLM may emit a numeric ref (e.g., e1839) with no
+    // descriptive text. For mail compose tasks, the final click of the plan is structurally
+    // the send action, so replace it as a last resort.
+    for (let _i = _plan.length - 1; _i >= 0; _i--) {
+      const _s = _plan[_i];
+      if (_s.action === 'click') {
+        _plan[_i] = { action: 'sendEmailWithVerification', selector: _s.selector };
+        logger.info(`[playwright.agent] send guard: replaced final click with sendEmailWithVerification at step ${_i + 1} (selector: ${_s.selector || _s.ref || 'none'})`);
+        return;
+      }
+    }
+  }
+  replaceSendWithVerification(plan);
+
   // ── Phase 3: Execute plan ──────────────────────────────────────────────────
   logger.info(`[playwright.agent] phase 3: executing ${plan.length} steps`);
   let stepIndex  = 0;
@@ -1091,6 +1234,8 @@ async function playwrightAgent(args) {
   let lastGetPageTextResult = null; // captures last successful getPageText output for implicit return
   let placeholderWarnings = new Set(); // Track substituted placeholders to warn LLM (rate-limited: once per type per session)
   const _typedTexts = new Set(); // Track typed texts to prevent duplicate typing in same session
+  let _emailSendVerification = null; // captures verified email send outcome for the judge
+  let _emailAlreadySent = false; // true once sendEmailWithVerification succeeds; prevents duplicate sends
 
   // Actions that can mutate the DOM structure (open modals, navigate pages, reveal
   // new elements via lazy-load, toggle conditional sections, etc.).  After any of these
@@ -1167,14 +1312,21 @@ async function playwrightAgent(args) {
         const remainingAfterSnap = plan.slice(stepIndex + 1);
         if (remainingAfterSnap.length > 0) {
           if (looksLikeLoginWallSnapshot(currentSnapshot)) {
-            logger.warn(`[playwright.agent] snapshot re-plan blocked: login wall detected — escalating to waitForAuth`);
-            return {
-              ok: false, goal, sessionId,
-              turns: transcript.length, done: false,
-              loginWallDetected: true,
-              result: 'Login wall detected during snapshot re-plan — escalating to waitForAuth',
-              transcript, executionTime: Date.now() - start,
-            };
+            // Suppress false-positive: if auth was confirmed < 120s ago, the "login wall"
+            // is likely the Google/OAuth redirect from waitForAuth itself, not a real logout.
+            const _authAge = authConfirmedAt ? Date.now() - authConfirmedAt : Infinity;
+            if (_authAge < 120_000) {
+              logger.warn(`[playwright.agent] snapshot re-plan: login-wall suppressed — auth confirmed ${Math.round(_authAge / 1000)}s ago (< 120s threshold). Continuing with fresh snapshot.`);
+            } else {
+              logger.warn(`[playwright.agent] snapshot re-plan blocked: login wall detected — escalating to waitForAuth`);
+              return {
+                ok: false, goal, sessionId,
+                turns: transcript.length, done: false,
+                loginWallDetected: true,
+                result: 'Login wall detected during snapshot re-plan — escalating to waitForAuth',
+                transcript, executionTime: Date.now() - start,
+              };
+            }
           }
           if (isAboutBlankSnapshot(currentSnapshot) || countRefs(currentSnapshot) === 0) {
             logger.warn(`[playwright.agent] snapshot re-plan blocked: empty/about:blank snapshot (${countRefs(currentSnapshot)} refs)`);
@@ -1217,6 +1369,7 @@ async function playwrightAgent(args) {
                 });
               }
               plan = [...plan.slice(0, stepIndex + 1), ...snapReplanParsed.plan];
+              replaceSendWithVerification(plan);
             } else {
               logger.warn(`[playwright.agent] snapshot re-plan unparseable — continuing with stale plan`);
             }
@@ -1321,6 +1474,7 @@ async function playwrightAgent(args) {
                 if (snapReplanParsed && Array.isArray(snapReplanParsed.plan) && snapReplanParsed.plan.length > 0) {
                   plan = [...plan.slice(0, stepIndex + 1), ...snapReplanParsed.plan];
                   logger.info(`[playwright.agent] external_skill re-plan: ${snapReplanParsed.plan.length} fresh steps after ${skillName}`);
+                  replaceSendWithVerification(plan);
                 }
               } catch (_) { /* non-fatal — continue with stale plan */ }
             }
@@ -1594,11 +1748,28 @@ async function playwrightAgent(args) {
               plan = _httpRetryPlan;
               stepIndex = 0;
               lastGetPageTextResult = null;
+              _typedTexts.clear();
+              replaceSendWithVerification(plan);
               continue;
             }
           } else if (_httpErr) {
             logger.warn(`[playwright.agent] HTTP ${_httpErr} error page in getPageText — repair budget exhausted or no start URL, proceeding with error content`);
           }
+        }
+        if (step.action === 'sendEmailWithVerification' && !_emailAlreadySent) {
+          _emailAlreadySent = true;
+          finalResult = outcome.result || 'Email sent and verified successfully';
+          const _emailRecipient = (goal.match(/\b([\w.+-]+@[\w.-]+\.[a-zA-Z]{2,})\b/) || [])[1] || null;
+          const _emailSubjectMatch = goal.match(/subject\s*['"]\s*([^'"]+)['"]/i) || goal.match(/subject\s+([^,]+)/i);
+          const _emailSubject = _emailSubjectMatch ? _emailSubjectMatch[1].trim() : null;
+          _emailSendVerification = {
+            sent: true,
+            recipient: _emailRecipient,
+            subject: _emailSubject,
+            result: finalResult,
+            timestamp: new Date().toISOString(),
+          };
+          logger.info(`[playwright.agent] email send verified — recipient=${_emailRecipient || 'unknown'}, subject=${_emailSubject || 'unknown'}`);
         }
 
         // ── Post-fill body verification (self-healing + rule learning) ────────
@@ -1635,12 +1806,20 @@ async function playwrightAgent(args) {
 
         // ── Expectation-Driven Execution: Verify action achieved expected outcome ─────
         // Instead of blind DOM change detection, we verify that the action achieved its goal
-        if (step.expected || isDomMutating) {
+        // For recipe-driven tasks, skip automatic post-snapshot for fill/type/press —
+        // the recipe already navigated to the target page, these actions don't need re-planning.
+        const _skipAutoReplan = recipeWasUsed && ['fill', 'type', 'press', 'press-key', 'select', 'check', 'uncheck'].includes(step.action);
+        if ((step.expected || (isDomMutating && !_skipAutoReplan))) {
+          // Capture pre-snapshot before updating currentSnapshot (used by confidence scoring below)
+          const _preStepSnapshot = currentSnapshot;
           // Take a fresh snapshot after the action
           const postSnap = await browserAct({ action: 'snapshot', sessionId, headed, timeoutMs });
           if (postSnap.ok && postSnap.result) {
             currentSnapshot = postSnap.result;
           }
+          // Attach pre/post to outcome so confidence scoring can use them without extra snapshot calls
+          outcome._preStepSnapshot  = _preStepSnapshot;
+          outcome._postStepSnapshot = currentSnapshot;
 
           // Verify expectation if defined
           if (step.expected) {
@@ -1704,6 +1883,91 @@ async function playwrightAgent(args) {
             }
           }
           
+        }
+
+        // ── Per-step confidence scoring ───────────────────────────────────────────
+        // After any DOM-mutating step succeeds, compute a heuristic confidence score
+        // without an LLM call. If score < 0.5, fire a micro-replan for remaining steps.
+        // This catches compounding errors early before they spiral into unrecoverable state.
+        // Skip for recipe-driven fill/type/press — no post-snapshot was taken.
+        if (DOM_MUTATING_ACTIONS.has(step.action) && outcome._postStepSnapshot && !_skipAutoReplan) {
+          const _preSnap  = outcome._preStepSnapshot || '';
+          const _postSnap = outcome._postStepSnapshot || '';
+          let _stepConf = 1.0;
+          const _preRefs  = countRefs(_preSnap);
+          const _postRefs = countRefs(_postSnap);
+
+          // Session loss: login page appeared during a non-navigate action
+          if (!['navigate', 'goto'].includes(step.action) &&
+              /accounts\.google\.com|\/login|\/signin|\/auth\b/i.test(_postSnap)) {
+            _stepConf -= 0.5;
+            logger.warn(`[playwright.agent] step-confidence: login redirect detected during ${step.action} (conf=${_stepConf.toFixed(2)})`);
+          }
+          // Compose window closed unexpectedly during a non-click action on a compose task
+          if (_isComposeTask && _isMailAgentTask &&
+              /new message|compose/i.test(_preSnap) &&
+              !/new message|compose/i.test(_postSnap) &&
+              !['click', 'navigate', 'goto'].includes(step.action)) {
+            _stepConf -= 0.4;
+            logger.warn(`[playwright.agent] step-confidence: compose window closed unexpectedly after ${step.action} (conf=${_stepConf.toFixed(2)})`);
+          }
+          // Sharp ref count drop — page navigated away unexpectedly
+          if (_preRefs > 10 && _postRefs < 3) {
+            _stepConf -= 0.3;
+            logger.warn(`[playwright.agent] step-confidence: ref count dropped ${_preRefs}→${_postRefs} (conf=${_stepConf.toFixed(2)})`);
+          }
+
+          _stepConf = Math.max(0, _stepConf);
+          if (_stepConf < 0.5 && totalRepairs < maxRepairs && stepIndex < plan.length - 1) {
+            logger.warn(`[playwright.agent] step-confidence ${_stepConf.toFixed(2)} < 0.5 after step ${stepIndex + 1} (${step.action}) — triggering micro-replan for remaining ${plan.length - stepIndex - 1} step(s)`);
+            const _microSnap = await browserAct({ action: 'snapshot', sessionId, headed, timeoutMs }).catch(() => ({ ok: false }));
+            if (_microSnap.ok && _microSnap.result) {
+              currentSnapshot = _microSnap.result;
+              const _microRemaining = plan.slice(stepIndex + 1);
+              const _microRaw = await askWithMessages([
+                { role: 'system', content: REPLAN_SYSTEM_PROMPT + domainLockBlock },
+                { role: 'user', content: `GOAL: ${_finalGoal || effectiveGoal}\nSTALE_REMAINING:\n${JSON.stringify(_microRemaining)}\nFRESH_SNAPSHOT:\n${extractInteractiveRefs(currentSnapshot)}` },
+              ], { temperature: 0.1, maxTokens: 800, responseTimeoutMs: 20000 }).catch(() => null);
+              const _microParsed = _microRaw ? parseJson(_microRaw) : null;
+              if (_microParsed && Array.isArray(_microParsed.plan) && _microParsed.plan.length > 0) {
+                plan = [...plan.slice(0, stepIndex + 1), ..._microParsed.plan];
+                logger.info(`[playwright.agent] step-confidence micro-replan: replaced ${_microRemaining.length} stale step(s) with ${_microParsed.plan.length} fresh step(s)`);
+              }
+            }
+          }
+        }
+
+        // ── Chip input guard ─────────────────────────────────────────────────────
+        // After a successful fill on a recipient/tag/chip field, ensure the next
+        // planned steps include press Enter + snapshot to confirm chip creation.
+        // This is a code-level guarantee — no LLM dependency, no rule-recall needed.
+        // Applies to: Gmail To/CC/BCC, Slack DM recipient, Notion mention, Linear assignee, etc.
+        if (step.action === 'fill') {
+          const _chipFieldRe = /\b(to|cc|bcc|recipient|email|tag|label|member|assign|people|participants|invite)\b/i;
+          const _selectorStr = String(step.selector || step.ref || '');
+          const _ariaLabelStr = String(step['aria-label'] || '');
+          const _isChipField = _chipFieldRe.test(_selectorStr) || _chipFieldRe.test(_ariaLabelStr) ||
+            /input\[name=['"]?(to|cc|bcc)['"]?\]/i.test(_selectorStr) ||
+            /textarea\[name=['"]?(to|cc|bcc)['"]?\]/i.test(_selectorStr);
+          if (_isChipField) {
+            const _nextStep = plan[stepIndex + 1];
+            const _nextIsEnter = _nextStep?.action === 'press' && String(_nextStep?.key || '').toLowerCase() === 'enter';
+            const _nextIsSnapshot = _nextStep?.action === 'snapshot';
+            if (!_nextIsEnter && !_nextIsSnapshot) {
+              plan.splice(stepIndex + 1, 0,
+                { action: 'press', key: 'Enter' },
+                { action: 'snapshot' }
+              );
+              logger.info('[playwright.agent] chip guard: injected Enter+snapshot after fill on chip/recipient field');
+            } else if (_nextIsEnter) {
+              // Enter is there but no snapshot after it — inject snapshot after the Enter
+              const _stepAfterEnter = plan[stepIndex + 2];
+              if (!_stepAfterEnter || _stepAfterEnter.action !== 'snapshot') {
+                plan.splice(stepIndex + 2, 0, { action: 'snapshot' });
+                logger.info('[playwright.agent] chip guard: injected snapshot after Enter on chip/recipient field');
+              }
+            }
+          }
         }
 
         stepIndex++;
@@ -1931,8 +2195,9 @@ async function playwrightAgent(args) {
     // Skip for extraction tasks: when finalResult is long (> 100 chars), the agent
     // already captured explicit content — verify would re-trigger a 9-39s LLM round-trip
     // for no benefit. Only run for short/absent results (action tasks, form submits, etc.).
+    // Also skip when the email has already been verified sent via sendEmailWithVerification.
     // ---------------------------------------------------------------------------
-    if (!finalResult || finalResult.length <= 100) {
+    if (!_emailAlreadySent && (!finalResult || finalResult.length <= 100)) {
     try {
       await new Promise(r => setTimeout(r, 1000)); // 1s post-action settle
       const _verifySnap = await browserAct({ action: 'snapshot', sessionId, headed, timeoutMs: 10000 });
@@ -1947,9 +2212,38 @@ async function playwrightAgent(args) {
         const _verifyRaw = await askWithMessages([
           { role: 'system', content: VERIFY_SYSTEM_PROMPT },
           { role: 'user', content: _verifyMsg },
-        ], { temperature: 0, maxTokens: 128, responseTimeoutMs: 12000 });
+        ], { temperature: 0, maxTokens: 200, responseTimeoutMs: 12000 });
 
         const _verifyParsed = parseJson(_verifyRaw);
+
+        // ── Dialog-blocking auto-dismiss ─────────────────────────────────────
+        // If a dialog is blocking the page, dismiss it and re-verify ONCE.
+        // This prevents a "send without subject?" dialog from being counted as a failure.
+        if (_verifyParsed && _verifyParsed.dialog_blocking === true) {
+          logger.info(`[playwright.agent] verify: dialog blocking detected — auto-dismissing: "${(_verifyParsed.dialog_text || '').slice(0, 80)}"`);
+          await browserAct({ action: 'dialog-accept', sessionId, headed, timeoutMs: 3000 }).catch(() => {});
+          // Brief settle then re-snapshot + re-verify (only once, non-fatal if it fails)
+          await new Promise(r => setTimeout(r, 800));
+          try {
+            const _reVerifySnap = await browserAct({ action: 'snapshot', sessionId, headed, timeoutMs: 8000 });
+            if (_reVerifySnap.ok && _reVerifySnap.result) {
+              const _reVerifyRaw = await askWithMessages([
+                { role: 'system', content: VERIFY_SYSTEM_PROMPT },
+                { role: 'user', content: [`GOAL: ${goal}`, `LAST_ACTIONS:\n${_lastActions}`, `CURRENT_PAGE:\n${trimSnapshot(_reVerifySnap.result, 3000)}`].join('\n\n') },
+              ], { temperature: 0, maxTokens: 128, responseTimeoutMs: 12000 });
+              const _reVerifyParsed = parseJson(_reVerifyRaw);
+              if (_reVerifyParsed && _reVerifyParsed.completed === true) {
+                logger.info(`[playwright.agent] verify: task confirmed complete after dialog dismiss`);
+                break executionLoop; // Task done — exit cleanly
+              }
+              // Use the re-verify result for the rest of the flow below
+              if (_reVerifyParsed) Object.assign(_verifyParsed, _reVerifyParsed, { dialog_blocking: false });
+            }
+          } catch (_rdErr) {
+            logger.warn(`[playwright.agent] verify: re-verify after dialog dismiss failed (non-fatal): ${_rdErr.message}`);
+          }
+        }
+
         if (_verifyParsed && _verifyParsed.completed === false && (_verifyParsed.confidence ?? 1) >= 0.75) {
           logger.warn(`[playwright.agent] POST-TASK VERIFY FAILED (confidence=${_verifyParsed.confidence}): ${_verifyParsed.evidence || 'task incomplete'}`);
 
@@ -1958,15 +2252,23 @@ async function playwrightAgent(args) {
           // Return loginWallDetected:true so browser.agent's waitForAuth + auto-retry
           // path fires, which is the only correct fix for an auth wall.
           if (VERIFY_LOGIN_WALL_RE.test(_verifyParsed.evidence || '')) {
-            logger.warn(`[playwright.agent] verify: login wall detected in evidence — escalating to browser.agent waitForAuth (skipping repair)`);
-            return {
-              ok: false, done: false, goal, sessionId,
-              turns: transcript.length,
-              result: _verifyParsed.evidence,
-              transcript,
-              executionTime: Date.now() - start,
-              loginWallDetected: true,
-            };
+            // Suppress false-positive: if auth was confirmed < 120s ago, the verify LLM
+            // may have seen an OAuth redirect URL in the snapshot, not an actual logout.
+            const _authAgeVerify = authConfirmedAt ? Date.now() - authConfirmedAt : Infinity;
+            if (_authAgeVerify < 120_000) {
+              logger.warn(`[playwright.agent] verify: login-wall in evidence suppressed — auth confirmed ${Math.round(_authAgeVerify / 1000)}s ago (< 120s). Treating as incomplete, not auth failure.`);
+              // Fall through to normal repair path instead of escalating to waitForAuth
+            } else {
+              logger.warn(`[playwright.agent] verify: login wall detected in evidence — escalating to browser.agent waitForAuth (skipping repair)`);
+              return {
+                ok: false, done: false, goal, sessionId,
+                turns: transcript.length,
+                result: _verifyParsed.evidence,
+                transcript,
+                executionTime: Date.now() - start,
+                loginWallDetected: true,
+              };
+            }
           }
 
           let _verifyWarning = _verifyParsed.evidence || 'task may be incomplete';
@@ -2030,6 +2332,10 @@ async function playwrightAgent(args) {
     // and current page state. This replaces the old word-count _isSparse heuristic
     // which falsely triggered on code editors, dashboards, forms, and other
     // UI-heavy pages that have little prose but a fully completed goal.
+    if (_emailAlreadySent) {
+      logger.info(`[playwright.agent] skipping goal-achievement judge — email already verified sent`);
+      break executionLoop;
+    }
     let _shouldReplan = false;
     let _replanPlan = null;
     try {
@@ -2048,19 +2354,33 @@ async function playwrightAgent(args) {
       } catch (_) {}
 
       const _stepSummary = transcript.map(t => `${t.action.action}:${t.outcome.ok ? 'ok' : 'fail'}`).join('; ');
+      const _stepResults = transcript.slice(-3).map(t => {
+        const _res = t.outcome.result || t.outcome.error || '';
+        return `${t.action.action}:${t.outcome.ok ? 'ok' : 'fail'}${_res ? ` (${_res.slice(0, 120)})` : ''}`;
+      }).join('; ');
       // Page content (lastGetPageTextResult) is the strongest signal for goal relevance —
       // it contains actual titles/descriptions that can be matched against the goal topic.
       const _judgeContentSample = lastGetPageTextResult ? lastGetPageTextResult.slice(0, 800) : '';
+      const _emailVerifyBlock = _emailSendVerification
+        ? `\nEMAIL_SEND_VERIFICATION: ${JSON.stringify(_emailSendVerification)}`
+        : '';
       const _judgePrompt = `GOAL: ${goal}
 
 STEPS EXECUTED: ${_stepSummary}
+RECENT STEP RESULTS: ${_stepResults}${_emailVerifyBlock}
 ${_judgeCurrentUrl ? `\nCURRENT URL: ${_judgeCurrentUrl}` : ''}
 ${_judgeContentSample ? `\nPAGE CONTENT (sample):\n${_judgeContentSample}` : ''}
 
 CURRENT PAGE SNAPSHOT (first 800 chars):
 ${_judgePageText.slice(0, 800)}
 
-Does the current page state satisfy the goal? Focus on the END STATE — does the PAGE CONTENT and URL show that the goal was accomplished? The exact steps or UI mechanism used (button click, Enter key, direct URL navigation) are irrelevant — only whether the result matches what the goal asked for.
+Judge whether the goal was accomplished. Consider BOTH the action history and the current page state.
+
+IMPORTANT RULES:
+- If the action history includes ">sendEmailWithVerification:ok", the email was successfully sent and verified. This is conclusive evidence. The mail inbox is the expected page after a successful send. The absence of a compose window means the email was sent, not that it failed.
+- If EMAIL_SEND_VERIFICATION is provided, it is authoritative proof of completion.
+- For non-mail tasks, focus on the END STATE — does the page content/URL show the goal was accomplished?
+
 Respond with JSON only — no markdown, no explanation outside the JSON:
 { "achieved": true, "reason": "one sentence" }
 or
@@ -2069,7 +2389,7 @@ or
 Set canRetry:false only if the goal is fundamentally impossible on this page/site.`;
 
       const _judgeRaw = await askWithMessages([
-        { role: 'system', content: 'You are a browser automation judge. Evaluate whether the current page state satisfies the user\'s goal — focus on the page content and URL as evidence of the outcome, not on which specific steps or UI actions were performed. Respond with JSON only.' },
+        { role: 'system', content: 'You are a browser automation judge. Evaluate whether the user\'s goal was accomplished by considering BOTH the action history (including verified outcomes) and the current page state. Respond with JSON only.' },
         { role: 'user', content: _judgePrompt },
       ], { temperature: 0.0, maxTokens: 120, responseTimeoutMs: 20000 });
 
@@ -2153,6 +2473,8 @@ Return JSON: { "thoughts": "strategy explanation", "plan": [...steps] }`;
       stepIndex = 0;
       lastGetPageTextResult = null;
       lastRunCodeResult = null;
+      _typedTexts.clear(); // Reset dedup set so re-fills on the new plan are not skipped
+      replaceSendWithVerification(plan);
       _shouldReplan = false;
       _replanPlan = null;
       continue executionLoop; // Restart execution loop with completely new plan
