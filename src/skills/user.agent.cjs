@@ -418,16 +418,57 @@ async function resolveContext(args) {
       : `${topic} ${missingTerms.slice(0, 3).join(' ')}`;
     logger.info(`[user.agent] Searching memories for: "${enrichedQuery}" (topic="${topic}", entities=[${entities.join(', ')}])`);
     const memories = await memorySearch(enrichedQuery, {}, 15, 0.2);
-    // Filter out screen captures and browser-tab noise memories
+    // Filter out screen captures, browser-tab noise, and generic/outdated memories
     const BROWSER_APP_PATTERN = /^(Google Chrome|Microsoft Edge|Safari|Firefox|Opera|Brave):/i;
-    const filteredMemories = memories.filter(m =>
-      m.type !== 'screen_capture' &&
-      !BROWSER_APP_PATTERN.test((m.text || '').trim()) &&
-      (m.text || '').trim().length > 10
-    );
-    logger.info(`[user.agent] Found ${memories.length} memories, ${filteredMemories.length} after filtering screen captures and browser noise`);
-    if (filteredMemories.length > 0) {
-      resolved.memories = filteredMemories.map(m => m.text || '').filter(Boolean);
+    const GENERIC_PATTERNS = [
+      /^My email address is/i,
+      /^My name is/i,
+      /^Interests:.*u$/i,  // Truncated interests
+      /^The user's interests.*u$/i,  // Truncated interests
+      /^I am interested in.*u$/i,  // Truncated interests
+    ];
+    
+    // Filter and deduplicate memories
+    const seenTexts = new Set();
+    const filteredMemories = memories.filter(m => {
+      const text = (m.text || '').trim();
+      // Skip if already seen (deduplicate)
+      if (seenTexts.has(text)) return false;
+      seenTexts.add(text);
+      
+      // Apply filters
+      return m.type !== 'screen_capture' &&
+        !BROWSER_APP_PATTERN.test(text) &&
+        !GENERIC_PATTERNS.some(pattern => pattern.test(text)) &&
+        text.length > 10 &&
+        !text.endsWith('u');  // Filter truncated memories
+    });
+    
+    // Sort by relevance (prioritize work-related memories for work topics)
+    const isWorkRelated = (text) => {
+      const workKeywords = ['work', 'project', 'task', 'meeting', 'email', 'code', 'development', 'bug', 'feature', 'deploy', 'review'];
+      return workKeywords.some(keyword => text.toLowerCase().includes(keyword));
+    };
+    
+    const sortedMemories = filteredMemories.sort((a, b) => {
+      const aText = (a.text || '').toLowerCase();
+      const bText = (b.text || '').toLowerCase();
+      const aIsWork = isWorkRelated(aText);
+      const bIsWork = isWorkRelated(bText);
+      
+      // If this is a work-related query, prioritize work memories
+      if (topic.toLowerCase().includes('work')) {
+        if (aIsWork && !bIsWork) return -1;
+        if (!aIsWork && bIsWork) return 1;
+      }
+      
+      // Otherwise, sort by recency (newer first)
+      return new Date(b.created_at || 0) - new Date(a.created_at || 0);
+    });
+    
+    logger.info(`[user.agent] Found ${memories.length} memories, ${filteredMemories.length} after filtering, ${sortedMemories.length} after deduplication`);
+    if (sortedMemories.length > 0) {
+      resolved.memories = sortedMemories.slice(0, 10).map(m => m.text || '').filter(Boolean);
       sources.add('memory');
       logger.info(`[user.agent] Resolved ${resolved.memories.length} memory texts: ${resolved.memories.map(t => t.slice(0, 60)).join(' | ')}`);
     } else {

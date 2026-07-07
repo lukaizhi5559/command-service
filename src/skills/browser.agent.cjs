@@ -4426,12 +4426,13 @@ When extracting page content with run-code, prioritize these selectors over gene
         const _totalWords = agentResultText.trim().split(/\s+/).filter(Boolean).length;
         const _isSparse = _longLines < 3 && _totalWords < 60;
         // Navigation/action tasks (goto, click, open, navigate to, go to history, etc.)
-        // produce sparse output by design — the task is complete when the page loads.
+        // and email tasks (send, compose, draft) produce sparse output by design.
         // Only apply the quality gate to research/lookup tasks.
         const _taskLower = (task || '').toLowerCase();
         const _isNavTask = /\b(goto|go to|navigate|click|open|visit|go back|return to|scroll|history|previous|close|dismiss)\b/.test(_taskLower);
+        const _isEmailTask = /\b(send|email|mail|compose|draft|message)\b/.test(_taskLower);
         const _isResearchTask = /\b(search|find|look up|lookup|research|what is|summarize|compare|list|show me|tell me|fetch|get me)\b/.test(_taskLower);
-        const _skipQualityGate = _isNavTask && !_isResearchTask;
+        const _skipQualityGate = (_isNavTask || _isEmailTask) && !_isResearchTask;
         // Check if we have video links or comprehensive content extracted - if so, don't fail on sparse content
         const _hasVideoLinks = agentResult?.transcript?.some(step => 
           step.action === 'getPageLinks' && step.result && step.result.length > 0
