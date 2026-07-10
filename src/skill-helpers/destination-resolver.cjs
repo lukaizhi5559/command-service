@@ -5,7 +5,7 @@
  * and returns a verdict: ok / auto_correct / ask_user.
  *
  * Flow:
- *   1. classifyTaskIntent(task) → intent string (chat | research | docs | console | settings | home)
+ *   1. classifyTaskIntent(task) → intent string (chat | research | search | docs | console | settings | mail | social | commerce | content_create | scheduling | maps | download | support | dashboard | home)
  *   2. classifyUrlType(url)     → endpoint type the URL represents
  *   3. Compare: if the planned URL type is incompatible with the task intent → mismatch
  *   4. On mismatch:
@@ -33,14 +33,25 @@ try { _skillLlm = require('./skill-llm.cjs'); } catch (_) {}
 const _intentCache = new Map();
 
 // ── Intent constants ──────────────────────────────────────────────────────────
+// Derived from common web-agent benchmarks (Mind2Web, WebArena, WebVoyager).
+// Intents are used to decide whether a planned start URL matches the user's task.
 const INTENTS = {
-  CHAT:     'chat',       // converse with or query an AI assistant
-  RESEARCH: 'research',   // look up / search / investigate a topic via AI
-  DOCS:     'docs',       // read documentation, guides, tutorials
-  CONSOLE:  'console',    // API keys, developer settings, platform console
-  SETTINGS: 'settings',   // account settings, profile, billing
-  MAIL:     'mail',       // send, compose, forward, reply to email
-  HOME:     'home',       // generic visit — open the site's landing page
+  CHAT:           'chat',           // converse with or query an AI assistant
+  RESEARCH:       'research',       // look up / search / investigate a topic via AI
+  SEARCH:         'search',         // explicit site search / "search X for Y" / "google X"
+  DOCS:           'docs',           // read documentation, guides, tutorials
+  CONSOLE:        'console',        // API keys, developer settings, platform console
+  SETTINGS:       'settings',       // account settings, profile, billing
+  MAIL:           'mail',           // send, compose, forward, reply to email
+  SOCIAL:         'social',         // post, comment, message, follow on social/forum
+  COMMERCE:       'commerce',       // buy, cart, checkout, order, purchase
+  CONTENT_CREATE: 'content_create', // write, compose, publish, upload content
+  SCHEDULING:     'scheduling',     // book, schedule, reserve, appointment, calendar
+  MAPS:           'maps',           // directions, nearby, navigate, locate
+  DOWNLOAD:       'download',       // download, export, save a file
+  SUPPORT:        'support',        // contact support, help center, ticket
+  DASHBOARD:      'dashboard',      // analytics, stats, admin, overview
+  HOME:           'home',           // generic visit — open the site's landing page
 };
 
 // ── Task keywords → intent (first match wins) ─────────────────────────────────
@@ -60,22 +71,67 @@ const INTENT_PATTERNS = [
   // MAIL — email actions BEFORE settings to prevent payload keywords triggering settings
   {
     intent: INTENTS.MAIL,
-    re: /\b(send[\s_-]?email|compose[\s_-]?email|forward[\s_-]?email|reply[\s_-]?to|email[\s_-]?to|mail[\s_-]?to|write[\s_-]?email|draft[\s_-]?email|send[\s_-]?mail|compose[\s_-]?mail|attach[\s_-]?and[\s_-]?send|email[\s_-]?with[\s_-]?attachment)\b/i,
+    re: /\b((?:send|compose|write|draft|forward|reply)(?:\s+\w+){0,3}\s+(?:email|mail)|email[\s_-]to|mail[\s_-]to|newsletter|the\s+email)\b/i,
   },
-  // SETTINGS — tightened: require contextual phrases, no bare "settings" or "preferences"
+  // SETTINGS — account/profile/billing/subscription management
   {
     intent: INTENTS.SETTINGS,
-    re: /\b(account[\s_-]?settings|billing[\s_-]?(info|page|settings)?|subscription[\s_-]?(management|settings)?|profile[\s_-]?settings|my[\s_-]?preferences|preferences[\s_-]?page|settings[\s_-]?(panel|screen|page))\b/i,
+    re: /\b(account[\s_-]?settings|billing[\s_-]?(info|page|settings)?|subscription[\s_-]?(management|settings)?|profile[\s_-]?settings|update\s+my\s+profile|change\s+billing|manage\s+subscription|my[\s_-]?preferences|preferences[\s_-]?page|settings[\s_-]?(panel|screen|page))\b/i,
   },
   // CHAT — explicit chat/conversation verbs
   {
     intent: INTENTS.CHAT,
-    re: /\b(ask[\s_-]?it|chat|converse|have[\s_-]?a[\s_-]?conversation|talk[\s_-]?to|message[\s_-]?the[\s_-]?ai|tell[\s_-]?it|prompt[\s_-]?it)\b/i,
+    re: /\b(ask[\s_-]?(?:chatgpt|claude|grok|gemini|ai|the\s+ai|it)|chat[\s_-]?(?:with|gpt)?|converse|have[\s_-]?a[\s_-]?conversation|talk[\s_-]?to[\s_-]?(?:chatgpt|claude|grok|gemini|ai)?|message[\s_-]?the[\s_-]?ai|tell[\s_-]?it|prompt[\s_-]?it)\b/i,
+  },
+  // SEARCH — explicit search/query phrasing (must come before RESEARCH so "search" wins)
+  {
+    intent: INTENTS.SEARCH,
+    re: /\b(search\s+(?:for|on|google|youtube)?|google\s+(?:for|search|maps|flights)?|site:)/i,
+  },
+  // CONTENT_CREATE — create and publish content (before SOCIAL so "write a post" wins)
+  {
+    intent: INTENTS.CONTENT_CREATE,
+    re: /\b(write[\s_-].*(?:post|blog|article)|publish[\s_-].*(?:article|post|video)|upload[\s_-].*(?:video|file|image)|create[\s_-].*(?:page|post|blog|listing))\b/i,
+  },
+  // SOCIAL — explicit posting/messaging/following on social or forum platforms
+  {
+    intent: INTENTS.SOCIAL,
+    re: /\b(post\s+(?:to|on)|tweet|retweet|follow\s+(?:[\w@]+\s+)?on|comment\s+on|like\s+(?:the\s+)?post|share\s+on|send\s+a\s+dm|message\s+on\s+(?:twitter|x|instagram|linkedin|facebook|reddit|discord|slack))\b/i,
+  },
+  // COMMERCE — explicit shopping/checkout actions
+  {
+    intent: INTENTS.COMMERCE,
+    re: /\b(add(?:\s+\w+){0,2}\s+to\s+cart|shopping\s+cart|checkout|place\s+an?\s+order|buy\s+(?:now|this)|purchase\s+(?:this|item))\b/i,
+  },
+  // SCHEDULING — calendar / appointment / reservation
+  {
+    intent: INTENTS.SCHEDULING,
+    re: /\b(book[\s_-].*(?:appointment|reservation|table|slot)|schedule[\s_-].*(?:meeting|call|appointment)|reserve[\s_-].*(?:table|room|seat)|add[\s_-].*calendar\s+event)\b/i,
+  },
+  // MAPS — directions / nearby / navigation
+  {
+    intent: INTENTS.MAPS,
+    re: /\b(directions\s+(?:to|from)|navigate\s+(?:to|from)|find\s+nearby|locate\s+(?:a|the)|map\s+of|route\s+(?:to|from)|nearby\s+(?:restaurants|gas|hotels|stores))\b/i,
+  },
+  // DOWNLOAD — save/export a file
+  {
+    intent: INTENTS.DOWNLOAD,
+    re: /\b(download[\s_-].*(?:file|pdf|image|video|report)|export[\s_-].*(?:data|report|list|file)|save[\s_-].*(?:file|pdf|image))\b/i,
+  },
+  // SUPPORT — help / contact / ticket
+  {
+    intent: INTENTS.SUPPORT,
+    re: /\b(contact\s+support|open\s+(?:a\s+)?(?:support\s+)?ticket|report\s+(?:an?\s+)?issue|help\s+center|customer\s+support)\b/i,
+  },
+  // DASHBOARD — analytics / admin / overview
+  {
+    intent: INTENTS.DASHBOARD,
+    re: /\b(show\s+my\s+dashboard|open\s+(?:the\s+)?dashboard|view\s+(?:my\s+)?dashboard|view\s+(?:my\s+)?analytics|show\s+(?:my\s+)?stats|admin\s+panel|overview\s+page)\b/i,
   },
   // RESEARCH — broad: look up, find, research, learn, "what is", "who is"
   {
     intent: INTENTS.RESEARCH,
-    re: /\b(look[\s_-]?up|search|find[\s_-]?out|research|investigate|look[\s_-]?into|what[\s_-]?is|who[\s_-]?is|tell[\s_-]?me[\s_-]?about|learn[\s_-]?about|information[\s_-]?about|info[\s_-]?on|details[\s_-]?on|explore|find[\s_-]?information|gather[\s_-]?info)\b/i,
+    re: /\b(look[\s_-]?up|find[\s_-]?out|research|investigate|look[\s_-]?into|what[\s_-]?is|who[\s_-]?is|tell[\s_-]?me[\s_-]?about|learn[\s_-]?about|information[\s_-]?about|info[\s_-]?on|details[\s_-]?on|explore|find[\s_-]?information|gather[\s_-]?info)\b/i,
   },
   // HOME — generic navigation
   {
@@ -131,20 +187,31 @@ async function classifyTaskIntent(task) {
   // ── Primary: LLM classification ───────────────────────────────────────────
   if (_skillLlm && _scopedShort.trim().length > 3) {
     try {
-      const _llmPrompt = `Classify this browser task into exactly one of these categories:
-- chat     : converse with or send a message to an AI assistant
-- research : look up, search, investigate or summarize a topic
-- docs     : read documentation, guides, tutorials, reference material
-- console  : ONLY for: API key generation, developer dashboard, bearer/secret tokens, platform console
-- settings : account settings, billing, profile, subscription management
-- mail     : send, compose, forward or reply to an email
-- home     : any other navigation, visiting a site, opening a page, history, clicking elements
+      const _llmPrompt = `Classify this browser task into exactly one of these categories. Return ONE word only.
 
-Reply with ONE word only — the category name.
+Definitions and examples:
+- chat           : converse with an AI assistant. Examples: "ask ChatGPT", "talk to Claude", "start a conversation with Grok"
+- research       : look up, summarize, or investigate a topic. Examples: "what is photosynthesis", "find information about Mars", "research vegan diets"
+- search         : explicit site search. Examples: "search Google for best sushi", "google cheap flights", "search YouTube for lo-fi"
+- docs           : read documentation, guides, tutorials, or reference. Examples: "show me the React docs", "how to use git rebase"
+- console        : API keys, developer dashboard, bearer/secret tokens, platform console. Examples: "create an OpenAI API key", "go to the developer console"
+- settings       : account settings, billing, profile, subscription management. Examples: "update my profile", "change billing info"
+- mail           : send, compose, forward, or reply to email. Examples: "send an email to Bob", "reply to the last message", "compose a new email"
+- social         : post, comment, message, follow, share on a social or forum platform. Examples: "post on X", "comment on Instagram", "tweet this link", "follow Elon on X"
+- commerce       : buy, add to cart, checkout, order, purchase. Examples: "add headphones to cart", "checkout on Amazon", "buy this item"
+- content_create : write, compose, publish, or upload content. Examples: "write a blog post on Medium", "upload a YouTube video", "publish an article"
+- scheduling     : book, schedule, reserve, appointment, calendar. Examples: "book a table on OpenTable", "schedule a Zoom meeting", "reserve a room"
+- maps           : directions, nearby, navigate, locate. Examples: "directions to the airport", "find nearby gas stations", "navigate to Times Square"
+- download       : download, export, or save a file. Examples: "download the PDF", "export the report", "save the image"
+- support        : contact support, help center, ticket. Examples: "open a support ticket", "contact customer support"
+- dashboard      : analytics, stats, admin, overview. Examples: "show my dashboard", "view analytics", "open admin panel"
+- home           : any other generic navigation, visiting a site, opening a page, clicking elements. Examples: "go to github.com", "open Slack", "visit the homepage"
 
-Task: ${_scopedShort}`;
+Task: ${_scopedShort}
+
+Category:`;
       const _llmRaw = await _skillLlm.ask(_llmPrompt, { temperature: 0.0, responseTimeoutMs: 8000 });
-      const _llmIntent = (_llmRaw || '').trim().toLowerCase().replace(/[^a-z]/g, '');
+      const _llmIntent = (_llmRaw || '').trim().toLowerCase().replace(/[^a-z_]/g, '');
       if (VALID_INTENTS.has(_llmIntent)) {
         logger.debug(`[destination-resolver] LLM intent: "${_llmIntent}" for task: "${_scopedShort.slice(0, 60)}"`);
         _intentCache.set(_cacheKey, _llmIntent);
@@ -185,6 +252,126 @@ const URL_TYPE_PATTERNS = [
     ],
   },
   {
+    type: INTENTS.CHAT,
+    tests: [
+      /^https?:\/\/chat\./i,
+      /\/chat\b/i,
+      /chatgpt\.com/i,
+      /claude\.ai/i,
+      /gemini\.google\.com/i,
+      /grok\.com/i,
+      /copilot\.microsoft\.com/i,
+      /chat\.mistral\.ai/i,
+      /chat\.qwenlm\.ai/i,
+    ],
+  },
+  {
+    type: INTENTS.SOCIAL,
+    tests: [
+      /\/post\b/i,
+      /\/compose/i,
+      /\/tweet/i,
+      /\/messages/i,
+      /\/feed/i,
+      /\/social/i,
+      /\/community/i,
+      /\/forum/i,
+      /\/follow/i,
+      /twitter\.com\/compose/i,
+      /x\.com\/compose/i,
+      /linkedin\.com\/share/i,
+      /reddit\.com\/submit/i,
+    ],
+  },
+  {
+    type: INTENTS.CONTENT_CREATE,
+    tests: [
+      /\/upload/i,
+      /\/publish/i,
+      /\/editor/i,
+      /\/create\b/i,
+      /\/write/i,
+      /\/new\b/i,
+      /youtube\.com\/upload/i,
+      /medium\.com\/new/i,
+      /notion\.so\/new/i,
+    ],
+  },
+  {
+    type: INTENTS.COMMERCE,
+    tests: [
+      /\/cart/i,
+      /\/checkout/i,
+      /\/order/i,
+      /\/buy/i,
+      /\/purchase/i,
+      /\/shop/i,
+      /\/store/i,
+      /\/product/i,
+      /amazon\.com\/gp\/aws\/cart/i,
+      /ebay\.com\/itm/i,
+    ],
+  },
+  {
+    type: INTENTS.SCHEDULING,
+    tests: [
+      /\/book/i,
+      /\/schedule/i,
+      /\/appointment/i,
+      /\/reserve/i,
+      /\/calendar/i,
+      /\/events/i,
+      /calendly\.com/i,
+      /open-table/i,
+      /opentable\.com/i,
+    ],
+  },
+  {
+    type: INTENTS.MAPS,
+    tests: [
+      /\/maps/i,
+      /\/directions/i,
+      /\/nearby/i,
+      /\/places/i,
+      /google\.com\/maps/i,
+      /maps\.google\.com/i,
+    ],
+  },
+  {
+    type: INTENTS.DOWNLOAD,
+    tests: [
+      /\/download/i,
+      /\/export/i,
+      /\.pdf$/i,
+      /\.zip$/i,
+      /\/file\//i,
+      /drive\.google\.com\/uc/i,
+    ],
+  },
+  {
+    type: INTENTS.SUPPORT,
+    tests: [
+      /\/support/i,
+      /\/contact/i,
+      /\/help/i,
+      /\/ticket/i,
+      /\/help-center/i,
+      /zendesk\.com/i,
+    ],
+  },
+  {
+    type: INTENTS.DASHBOARD,
+    tests: [
+      /\/dashboard/i,
+      /\/admin/i,
+      /\/analytics/i,
+      /\/overview/i,
+      /\/reports/i,
+      /\/stats/i,
+      /\/metrics/i,
+    ],
+  },
+  {
     type: INTENTS.CONSOLE,
     tests: [
       /\/api[_-]?keys?/i,
@@ -207,20 +394,6 @@ const URL_TYPE_PATTERNS = [
       /^https?:\/\/[^/]+\/profile(?!\/api)/i,
       /^https?:\/\/[^/]+\/billing/i,
       /^https?:\/\/[^/]+\/preferences/i,
-    ],
-  },
-  {
-    type: INTENTS.CHAT,
-    tests: [
-      /^https?:\/\/chat\./i,
-      /\/chat\b/i,
-      /chatgpt\.com/i,
-      /claude\.ai/i,
-      /gemini\.google\.com/i,
-      /grok\.com/i,
-      /copilot\.microsoft\.com/i,
-      /chat\.mistral\.ai/i,
-      /chat\.qwenlm\.ai/i,
     ],
   },
   {
@@ -248,13 +421,22 @@ function classifyUrlType(url) {
 // Maps a task intent to the set of URL types considered compatible.
 
 const INTENT_ACCEPTED_URL_TYPES = {
-  [INTENTS.CHAT]:     [INTENTS.CHAT, INTENTS.HOME],
-  [INTENTS.RESEARCH]: [INTENTS.CHAT, INTENTS.HOME],
-  [INTENTS.DOCS]:     [INTENTS.DOCS, INTENTS.HOME],
-  [INTENTS.CONSOLE]:  [INTENTS.CONSOLE],
-  [INTENTS.SETTINGS]: [INTENTS.SETTINGS, INTENTS.CONSOLE],
-  [INTENTS.MAIL]:     ['mail', INTENTS.HOME],
-  [INTENTS.HOME]:     [INTENTS.HOME, INTENTS.CHAT, INTENTS.DOCS, INTENTS.CONSOLE, INTENTS.SETTINGS],
+  [INTENTS.CHAT]:           [INTENTS.CHAT, INTENTS.HOME],
+  [INTENTS.RESEARCH]:       [INTENTS.CHAT, INTENTS.HOME],
+  [INTENTS.SEARCH]:         [INTENTS.HOME, INTENTS.CHAT, INTENTS.DOCS, INTENTS.RESEARCH, INTENTS.MAIL, INTENTS.CONSOLE, INTENTS.SETTINGS, INTENTS.SOCIAL, INTENTS.COMMERCE, INTENTS.CONTENT_CREATE, INTENTS.SCHEDULING, INTENTS.MAPS, INTENTS.DOWNLOAD, INTENTS.SUPPORT, INTENTS.DASHBOARD],
+  [INTENTS.DOCS]:           [INTENTS.DOCS, INTENTS.HOME],
+  [INTENTS.CONSOLE]:        [INTENTS.CONSOLE],
+  [INTENTS.SETTINGS]:       [INTENTS.SETTINGS, INTENTS.CONSOLE],
+  [INTENTS.MAIL]:           ['mail', INTENTS.HOME],
+  [INTENTS.SOCIAL]:         [INTENTS.SOCIAL, INTENTS.HOME, INTENTS.CONTENT_CREATE],
+  [INTENTS.COMMERCE]:       [INTENTS.COMMERCE, INTENTS.HOME],
+  [INTENTS.CONTENT_CREATE]: [INTENTS.CONTENT_CREATE, INTENTS.HOME, INTENTS.SOCIAL],
+  [INTENTS.SCHEDULING]:     [INTENTS.SCHEDULING, INTENTS.HOME],
+  [INTENTS.MAPS]:           [INTENTS.MAPS, INTENTS.HOME],
+  [INTENTS.DOWNLOAD]:       [INTENTS.DOWNLOAD, INTENTS.HOME, INTENTS.DOCS],
+  [INTENTS.SUPPORT]:        [INTENTS.SUPPORT, INTENTS.HOME],
+  [INTENTS.DASHBOARD]:      [INTENTS.DASHBOARD, INTENTS.HOME, INTENTS.CONSOLE, INTENTS.SETTINGS],
+  [INTENTS.HOME]:           [INTENTS.HOME, INTENTS.CHAT, INTENTS.DOCS, INTENTS.CONSOLE, INTENTS.SETTINGS, INTENTS.SOCIAL, INTENTS.COMMERCE, INTENTS.CONTENT_CREATE, INTENTS.SCHEDULING, INTENTS.MAPS, INTENTS.DOWNLOAD, INTENTS.SUPPORT, INTENTS.DASHBOARD],
 };
 
 // ── Per-service fallback chat/home URLs ───────────────────────────────────────
@@ -461,8 +643,8 @@ async function resolveDestination(serviceKey, task, plannedUrl, agentId) {
     };
   }
 
-  // 2. Hard-coded per-service chat URL (chat/research intents against console URLs)
-  if ((intent === INTENTS.CHAT || intent === INTENTS.RESEARCH) && SERVICE_CHAT_URLS[serviceKey]) {
+  // 2. Hard-coded per-service chat URL (chat/research/search intents against console URLs)
+  if ((intent === INTENTS.CHAT || intent === INTENTS.RESEARCH || intent === INTENTS.SEARCH) && SERVICE_CHAT_URLS[serviceKey]) {
     const correctedUrl = SERVICE_CHAT_URLS[serviceKey];
     logger.info(`[destination-resolver] Auto-correct (hard-coded): ${_id} → ${correctedUrl}`);
     return {
@@ -501,11 +683,84 @@ async function resolveDestination(serviceKey, task, plannedUrl, agentId) {
   };
 }
 
+// ── LLM-suggested task URL ────────────────────────────────────────────────────
+// For a given service + task, ask the LLM for the most direct deep-link URL.
+// The suggestion is validated by the caller (browser.agent uses verifyDeepLinkUrl).
+// This scales to any service without hardcoding URLs.
+
+/**
+ * Ask the LLM for the single most direct URL to start accomplishing `task`
+ * on service `serviceKey` with base URL `startUrl`. Returns the suggested URL
+ * only if the response parses cleanly and stays on the expected host domain.
+ */
+async function suggestTaskUrl(serviceKey, startUrl, intent, task) {
+  if (!_skillLlm) {
+    return { ok: false, error: 'skill-llm not available' };
+  }
+
+  const cleanStartUrl = String(startUrl || '').trim();
+  if (!cleanStartUrl) {
+    return { ok: false, error: 'startUrl is required' };
+  }
+
+  const baseHost = (() => {
+    try { return new URL(cleanStartUrl).hostname.replace(/^www\./, ''); }
+    catch (_) { return ''; }
+  })();
+  if (!baseHost) {
+    return { ok: false, error: 'could not parse startUrl hostname' };
+  }
+
+  const _taskPreview = _scopeTaskText(task, 200);
+  const prompt = `You are a browser automation assistant. Given:
+- service: ${serviceKey}
+- base URL: ${cleanStartUrl}
+- task intent: ${intent}
+- task: ${_taskPreview}
+
+What is the single most direct URL to open in a browser to begin this task? Return ONLY the full absolute URL. If you cannot determine a direct URL, return exactly the word none (lowercase). Do not include any explanation, markdown, or trailing punctuation.`;
+
+  try {
+    const raw = await _skillLlm.ask(prompt, { temperature: 0.0, responseTimeoutMs: 6000 });
+    let candidate = String(raw || '').trim();
+
+    // Strip markdown code fences or leading/trailing noise
+    candidate = candidate.replace(/^```[a-zA-Z]*\s*/i, '').replace(/\s*```$/i, '').trim();
+    if (!candidate || candidate.toLowerCase() === 'none') {
+      return { ok: false, error: 'LLM returned no URL' };
+    }
+
+    // Resolve relative URLs against startUrl
+    let resolved;
+    try {
+      resolved = new URL(candidate, cleanStartUrl).href;
+    } catch (_) {
+      return { ok: false, error: `LLM returned unparseable URL: ${candidate}` };
+    }
+
+    // Security: must stay on the expected service domain or a subdomain
+    const resolvedHost = (() => {
+      try { return new URL(resolved).hostname.replace(/^www\./, ''); }
+      catch (_) { return ''; }
+    })();
+    if (!resolvedHost || (resolvedHost !== baseHost && !resolvedHost.endsWith('.' + baseHost))) {
+      return { ok: false, error: `LLM suggested off-domain URL: ${resolved}` };
+    }
+
+    logger.info(`[destination-resolver] suggestTaskUrl: ${serviceKey}:${intent} → ${resolved}`);
+    return { ok: true, url: resolved };
+  } catch (err) {
+    logger.warn(`[destination-resolver] suggestTaskUrl failed: ${err.message}`);
+    return { ok: false, error: err.message };
+  }
+}
+
 module.exports = {
   classifyTaskIntent,
   classifyUrlType,
   resolveDestination,
   recordCorrection,
   getLearnedCorrection,
+  suggestTaskUrl,
   INTENTS,
 };

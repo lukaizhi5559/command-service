@@ -257,7 +257,7 @@ function getContentExtractionConfig(hostname) {
 
 const { userAgent } = require('./user.agent.cjs');
 
-const { resolveDestination, recordCorrection, classifyTaskIntent, classifyUrlType, getLearnedCorrection } = require('../skill-helpers/destination-resolver.cjs');
+const { resolveDestination, recordCorrection, classifyTaskIntent, classifyUrlType, getLearnedCorrection, suggestTaskUrl, INTENTS } = require('../skill-helpers/destination-resolver.cjs');
 const { killExistingChromeForProfile, clearProfileLock, findCli, shortSessionId } = require('./browser.act.cjs');
 
 const BROWSER_ACT_PORT = parseInt(process.env.COMMAND_SERVICE_PORT || '3007', 10);
@@ -1532,18 +1532,25 @@ async function actionQueryAgent({ service, id }) {
       rows = await db.all("SELECT * FROM agents WHERE id = ?", id);
     } else {
       const serviceKey = (service || '').toLowerCase().replace(/[^a-z0-9]/g, '');
-      rows = await db.all("SELECT * FROM agents WHERE service = ? AND type = 'browser'", serviceKey);
+      rows = await db.all("SELECT * FROM agents WHERE service = ? AND type IN ('browser', 'api_key', 'bearer', 'basic')", serviceKey);
     }
 
     if (!rows || rows.length === 0) return { ok: true, found: false };
 
     const row = rows[0];
+    let _caps = [];
+    if (row.capabilities) {
+      try { _caps = JSON.parse(row.capabilities); } catch (_parseErr) {
+        logger.warn(`[browser.agent] actionQueryAgent: corrupted capabilities for "${row.id}" — resetting to []. Value: ${String(row.capabilities).slice(0, 80)}`);
+        await db.run('UPDATE agents SET capabilities = ? WHERE id = ?', '[]', row.id).catch(() => {});
+      }
+    }
     return {
       ok: true,
       found: true,
       agentId: row.id,
       service: row.service,
-      capabilities: row.capabilities ? JSON.parse(row.capabilities) : [],
+      capabilities: _caps,
       status: row.status,
       lastValidated: row.last_validated,
       descriptor: row.descriptor,
@@ -1563,12 +1570,12 @@ async function actionListAgents() {
       // that don't have the canonical '.agent' suffix. Safe to run every call.
       await db.run("DELETE FROM agents WHERE id NOT LIKE '%.agent'").catch(() => {});
 
-      const rows = await db.all("SELECT id, type, service, capabilities, status, last_validated FROM agents WHERE type = 'browser' ORDER BY created_at DESC");
+      const rows = await db.all("SELECT id, type, service, capabilities, status, last_validated FROM agents WHERE type IN ('browser', 'api_key', 'bearer', 'basic') ORDER BY created_at DESC");
       dbAgents = (rows || []).map(r => ({
         id: r.id,
         type: r.type,
         service: r.service,
-        capabilities: r.capabilities ? JSON.parse(r.capabilities) : [],
+        capabilities: r.capabilities ? (() => { try { return JSON.parse(r.capabilities); } catch (_) { return []; } })() : [],
         status: r.status,
         lastValidated: r.last_validated,
       }));
@@ -2356,7 +2363,60 @@ Rules:
 - Use ask_user only when genuinely blocked by missing information that cannot be resolved with the tools above.
 - Output JSON only. No prose. No markdown fences.`;
 
-// Resolve a named credential: env var → keytar → null
+// Resolve a named credential from user-memory profile.
+// Returns plaintext valueRef (SAFE:/KEYTAR: refs are decrypted by user-memory).
+async function _profileGetValue(key) {
+  if (!key) return null;
+  const memUrl = process.env.MCP_USER_MEMORY_URL || 'http://127.0.0.1:3001';
+  const memKey = process.env.MCP_USER_MEMORY_API_KEY || process.env.MCP_API_KEY || '';
+  let parsed;
+  try { parsed = new URL(memUrl); } catch (_) { return null; }
+  const body = JSON.stringify({
+    version: 'mcp.v1',
+    service: 'user-memory',
+    action: 'profile.get',
+    payload: { key },
+    requestId: `browser-agent-${Date.now()}`,
+  });
+  const headers = {
+    'Content-Type': 'application/json',
+    'Content-Length': Buffer.byteLength(body),
+  };
+  if (memKey) headers.Authorization = `Bearer ${memKey}`;
+  return new Promise((resolve) => {
+    const mod = parsed.protocol === 'https:' ? require('https') : require('http');
+    const req = mod.request({
+      hostname: parsed.hostname,
+      port: parsed.port || 3001,
+      path: '/profile.get',
+      method: 'POST',
+      headers,
+      timeout: 5000,
+    }, (res) => {
+      let data = '';
+      res.on('data', d => { data += d; });
+      res.on('end', () => {
+        try {
+          const json = JSON.parse(data);
+          const val = json?.data?.valueRef || null;
+          // If the crypto bridge is unavailable, the service may return the raw ref.
+          // Treat those as missing so we fall back to keytar rather than leaking a ref.
+          if (val && !String(val).startsWith('SAFE:') && !String(val).startsWith('KEYTAR:')) {
+            resolve(val);
+            return;
+          }
+        } catch (_) {}
+        resolve(null);
+      });
+    });
+    req.on('error', () => resolve(null));
+    req.on('timeout', () => { try { req.destroy(); } catch (_) {} resolve(null); });
+    req.write(body);
+    req.end();
+  });
+}
+
+// Resolve a named credential: env var → user-memory profile → keytar → null
 async function resolveCredential(agentId, credName) {
   const serviceKey = agentId.replace('.agent', '');
 
@@ -2370,7 +2430,18 @@ async function resolveCredential(agentId, credName) {
     if (process.env[envVar]) return process.env[envVar];
   }
 
-  // 2. Try keytar (macOS Keychain)
+  // 2. Try user-memory profile (canonical credential keys used by gatherCredentialCallback)
+  const profileKeys = [
+    `credential:${serviceKey}.agent:${credName}`,
+    `credential:${agentId}:${credName}`,
+    `credential:${serviceKey}:${credName}`,
+  ];
+  for (const key of profileKeys) {
+    const val = await _profileGetValue(key);
+    if (val) return val;
+  }
+
+  // 3. Try keytar (macOS Keychain)
   try {
     const { execFile } = require('child_process');
     const accounts = [
@@ -2453,7 +2524,76 @@ function callSkill(skillName, args, timeoutMs = 120000) {
   });
 }
 
-async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAuth, skipAuth, _progressCallbackUrl, _stepIndex, _loginWallRetried = false, _emitThinking = null }) {
+async function _resolveTaskDeepLink(agentId, serviceKey, baseStartUrl, task) {
+  try {
+    const intent = await classifyTaskIntent(task);
+    const isSearchLike = intent === INTENTS.SEARCH || /\b(search|look\s*up|google|find)\b/i.test(task);
+    if (intent !== INTENTS.SEARCH && intent !== INTENTS.DOCS && intent !== INTENTS.MAIL && intent !== INTENTS.CONSOLE && !isSearchLike) {
+      return null;
+    }
+
+    const baseHost = (() => {
+      try { return new URL(baseStartUrl).hostname.replace(/^www\./, ''); }
+      catch (_) { return serviceKey; }
+    })();
+
+    // 1. Try web.agent discover_task_url
+    let candidate = null;
+    try {
+      const webResult = await callSkill('web.agent', {
+        action: 'discover_task_url',
+        domain: baseHost,
+        task,
+      }, 15000);
+      if (webResult?.ok && webResult?.taskUrl) candidate = webResult.taskUrl;
+    } catch (webErr) {
+      logger.debug(`[browser.agent] deep-link: web.agent failed: ${webErr.message}`);
+    }
+
+    // 2. Fallback to LLM-suggested URL
+    if (!candidate) {
+      const suggestion = await suggestTaskUrl(serviceKey, baseStartUrl, intent, task);
+      if (suggestion?.ok && suggestion?.url) candidate = suggestion.url;
+    }
+
+    if (!candidate) return null;
+
+    // 3. Security: must stay on expected domain or a subdomain
+    const candidateHost = (() => {
+      try { return new URL(candidate).hostname.replace(/^www\./, ''); }
+      catch (_) { return ''; }
+    })();
+    if (!candidateHost || (candidateHost !== baseHost && !candidateHost.endsWith('.' + baseHost))) {
+      logger.warn(`[browser.agent] deep-link: off-domain candidate rejected: ${candidate}`);
+      return null;
+    }
+
+    logger.info(`[browser.agent] deep-link: ${agentId} → ${candidate}`);
+    return candidate;
+  } catch (err) {
+    logger.warn(`[browser.agent] deep-link resolution error: ${err.message}`);
+    return null;
+  }
+}
+
+// Helper: detect a sign-in wall URL. Covers path-based patterns (/login, /signin,
+// /auth, /oauth, /authorize) AND Google's accounts.google.com hostname which uses
+// URL structures like /v3/signin/identifier that don't match path patterns.
+// Also catches logged-out Google Workspace product landing pages (e.g.
+// workspace.google.com/intl/en-US/gmail/) that are often served instead of
+// mail.google.com when the session has expired server-side.
+function _isSigninWall(href) {
+  if (!href || href.length <= 4) return false;
+  if (/\/(login|signin|sign[-_]in|auth|oauth|authorize)\b/i.test(href)) return true;
+  if (/\baccounts\.google\.com\b/i.test(href)) return true;
+  // Google Workspace logged-out marketing pages for Gmail/Workspace apps
+  if (/\bworkspace\.google\.com\b/i.test(href)) return true;
+  // Any non-mail.google.com host showing a /gmail/ path is a marketing/landing page
+  if (/\/gmail\//i.test(href) && !/\bmail\.google\.com\b/i.test(href)) return true;
+  return false;
+}
+
+async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAuth, skipAuth, _progressCallbackUrl, _stepIndex, _loginWallRetried = false, _emitThinking = null, _authOnly = false }) {
   // Derive agentId from url hostname when caller omits it (LLM sometimes emits only url)
   let agentId = _agentIdArg;
   if (!agentId && url) {
@@ -2599,6 +2739,23 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
 
   // ── REST API path (api_key, bearer, basic) — multi-turn agentic loop ──
   if (agentType === 'api_key' || agentType === 'bearer' || agentType === 'basic') {
+    // Auth-only mode: just verify credentials are present.
+    if (_authOnly) {
+      const primary = await resolveCredential(agentId, 'PRIMARY') || await resolveCredential(agentId, 'API_KEY') || '';
+      if (!primary) {
+        return {
+          ok: false,
+          agentId,
+          askUser: true,
+          needsCredentials: true,
+          authType: agentType,
+          question: `What API key or token do you use for ${agentId}? (It will be stored securely for future requests.)`,
+          credentialKey: `credential:${agentId.toLowerCase().replace(/\.agent$/, '')}.agent:PRIMARY`,
+        };
+      }
+      return { ok: true, agentId, authed: true };
+    }
+
     const MAX_TURNS = 8;
     const OBSERVATION_CHARS = 600;
     const loopHistory = [];
@@ -2803,15 +2960,6 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
   //   auth gate; playwright-cli is never involved for this stack.
   // playwright path: navigate to startUrl, probe current URL, call waitForAuth only
   //   if redirected to a login path. Applies uniformly to all services.
-
-  // Helper: detect a sign-in wall URL. Covers path-based patterns (/login, /signin,
-  // /auth, /oauth, /authorize) AND Google's accounts.google.com hostname which uses
-  // URL structures like /v3/signin/identifier that don't match path patterns.
-  const _isSigninWall = (href) =>
-    href.length > 4 && (
-      /\/(login|signin|sign[-_]in|auth|oauth|authorize)\b/i.test(href) ||
-      /\baccounts\.google\.com\b/i.test(href)
-    );
 
   let _effectiveAutoConnect = _useAutoConnect && !_usePersistentProfile;
 
@@ -3194,6 +3342,7 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
           agentId,
           task,
           askUser:         true,
+          authType:        'browser_oauth',
           question:        `What email or username do you use for ${agentId}? (It will be stored securely for future logins. Type "skip" to log in manually.)`,
           options:         [],
           needsCredentials: true,
@@ -3253,6 +3402,27 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
         logger.info(`[browser.agent] run: auth succeeded for ${agentId} — profile dir persists auth (skipping JSON state-save)`);
       }
     }
+  }
+
+  // If this is an auth-only call, stop here.
+  if (_authOnly) {
+    logger.info(`[browser.agent] run: auth-only call complete for ${agentId}`);
+    return { ok: true, agentId, authed: true, startUrl };
+  }
+
+  // ── Caller-provided direct URL takes priority (e.g. from planSkillsV2) ───────
+  if (url) {
+    try {
+      const _callerUrl = new URL(url, startUrl).href;
+      logger.info(`[browser.agent] run: using caller-provided url ${_callerUrl} for ${agentId}`);
+      startUrl = _callerUrl;
+    } catch (_) {
+      logger.warn(`[browser.agent] run: caller-provided url "${url}" is invalid — ignoring`);
+    }
+  } else {
+    // ── Task-specific deep-link resolution ─────────────────────────────────────
+    const _deepLink = await _resolveTaskDeepLink(agentId, _svcKey, startUrl, task);
+    if (_deepLink) startUrl = _deepLink;
   }
 
   // Step 2: delegate to playwright.agent or agentbrowser.agent with the authenticated session
@@ -4012,13 +4182,11 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
   }
 
   // ── Deep-link discovery: find the most direct URL for this task ────────────
-  // Uses web.agent's discover_task_url (dual search: site-scoped + broad) to find
-  // a deep-link URL that goes straight to the task's functional page. Discovery
-  // runs for every task unless a trained recipe is injected. Domain continuity
-  // only skips browser restart; it does not skip URL discovery, because the user
-  // may already be on the same domain but on a different page (e.g. inbox vs compose).
-  // Discovered URLs are validated against the page and cached in the shared
-  // nav-correction store so future runs avoid stale URLs.
+  // Three-layer URL-first approach:
+  //   Layer 0: Cached verified correction (from prior successful runs)
+  //   Layer 1: LLM-suggested direct URL for this service+task
+  //   Layer 2: web.agent discover_task_url (site-scoped + broad web search)
+  //   Fallback: startUrl (service home/dashboard)
   let _deepLinkOverride = null;
   if (!_trainedRecipeInjected) {
     try {
@@ -4027,40 +4195,67 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
       const _baseHost = (() => { try { return new URL(startUrl).hostname.replace(/^www\./, ''); } catch (_) { return ''; } })();
       if (!_baseHost) throw new Error('could not derive hostname from startUrl');
 
-      // 1. Check cached verified correction
+      // Layer 0: Cached verified correction (from prior successful runs)
       const _cached = await getLearnedCorrection(_serviceKey, _intent);
       if (_cached?.correctedUrl) {
         logger.info(`[browser.agent] deep-link: cached correction ${_cached.correctedUrl} (conf=${_cached.confidence.toFixed(2)}) for ${_serviceKey}:${_intent}`);
+        if (_cached.confidence >= 0.6) {
+          const _cachedValid = await verifyDeepLinkUrl(_cached.correctedUrl, sessionId, _baseHost, 15000);
+          if (_cachedValid) {
+            _deepLinkOverride = _cached.correctedUrl;
+            logger.info(`[browser.agent] deep-link: using cached URL ${_cached.correctedUrl} — overriding startUrl from ${startUrl}`);
+          } else {
+            logger.warn(`[browser.agent] deep-link: cached URL ${_cached.correctedUrl} failed validation — falling through to LLM/web search`);
+            setImmediate(() => {
+              const skillDb = require('../skill-helpers/skill-db.cjs');
+              skillDb.del('nav-correction', `${_serviceKey}:${_intent}`).catch(() => {});
+            });
+          }
+        }
       }
 
-      // 2. If cached correction has high confidence, skip web search entirely
-      //    and use the cached URL directly — saves ~2-8s of web.agent discovery.
-      let _dlResult = null;
-      if (!_cached?.correctedUrl || _cached.confidence < 0.8) {
+      // Layer 1: LLM-suggested direct URL for this service+task
+      if (!_deepLinkOverride) {
+        const _llmSuggest = await suggestTaskUrl(_serviceKey, startUrl, _intent, task);
+        if (_llmSuggest?.ok && _llmSuggest.url) {
+          logger.info(`[browser.agent] deep-link: LLM suggested URL for ${_serviceKey}:${_intent} → ${_llmSuggest.url}`);
+          const _llmValid = await verifyDeepLinkUrl(_llmSuggest.url, sessionId, _baseHost, 15000);
+          if (_llmValid) {
+            _deepLinkOverride = _llmSuggest.url;
+            logger.info(`[browser.agent] deep-link: verified LLM URL ${_llmSuggest.url} — overriding startUrl from ${startUrl}`);
+            setImmediate(() => { recordCorrection(_serviceKey, _intent, _llmSuggest.url).catch(() => {}); });
+          } else {
+            logger.warn(`[browser.agent] deep-link: LLM URL ${_llmSuggest.url} failed validation — falling through to web search`);
+          }
+        }
+      }
+
+      // Layer 2: web.agent discovery (final fallback)
+      if (!_deepLinkOverride) {
+        let _dlResult = null;
         _dlResult = await callSkill('web.agent', {
-          action: 'discover_task_url',
-          domain: _baseHost,
-          task: task.slice(0, 200),
-          candidateUrl: _cached?.correctedUrl,
+        action: 'discover_task_url',
+        domain: _baseHost,
+        task: task.slice(0, 200),
+        candidateUrl: _cached?.correctedUrl,
         }, 10000).catch(() => null);
-      }
 
-      // 3. Pick best candidate (cached URL is preferred if discovery returns it)
-      let _bestUrl = null;
-      let _bestScore = 0;
-      let _bestSource = 'none';
-      if (_cached?.correctedUrl) {
+        // Pick best candidate from web.agent discovery (seed any existing cached URL as a fallback)
+        let _bestUrl = null;
+        let _bestScore = 0;
+        let _bestSource = 'none';
+        if (_cached?.correctedUrl) {
         _bestUrl = _cached.correctedUrl;
         _bestScore = 100; // high baseline for previously verified URLs
         _bestSource = 'cache';
-      }
-      if (_dlResult?.ok && _dlResult.taskUrl && (_dlResult.score || 0) > _bestScore) {
+        }
+        if (_dlResult?.ok && _dlResult.taskUrl && (_dlResult.score || 0) > _bestScore) {
         _bestUrl = _dlResult.taskUrl;
         _bestScore = _dlResult.score;
         _bestSource = `discovery:${_dlResult.confidence?.toFixed?.(2) || '?'}`;
-      }
+        }
 
-      if (_bestUrl) {
+        if (_bestUrl) {
         // 4. Security: same domain check
         const _dlHost = (() => { try { return new URL(_bestUrl).hostname.replace(/^www\./, ''); } catch (_) { return ''; } })();
         if (_dlHost && (_dlHost === _baseHost || _dlHost.endsWith('.' + _baseHost) || _baseHost.endsWith('.' + _dlHost))) {
@@ -4086,9 +4281,10 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
         } else {
           logger.warn(`[browser.agent] deep-link: ignored ${_bestUrl} — domain mismatch with ${startUrl}`);
         }
-      } else {
+        } else {
         logger.info(`[browser.agent] deep-link: no suitable URL found${_dlResult?.error ? ' (' + _dlResult.error + ')' : ''} — using startUrl ${startUrl}`);
-      }
+        }
+      } // end if (!_deepLinkOverride) — skip LLM/web search if cache already resolved
     } catch (_dlErr) {
       logger.warn(`[browser.agent] deep-link discovery failed (non-fatal): ${_dlErr.message}`);
     }
@@ -4119,25 +4315,25 @@ When extracting page content with run-code, prioritize these selectors over gene
     // If recipe was successfully executed, we're already on the target page - don't navigate
     const _playwrightUrl = _recipeExecutedOk ? undefined : (url || (_useAgentBrowser ? startUrl : undefined));
     if (_recipeExecutedOk && url) {
-      logger.info(`[browser.agent] run: recipe executed successfully - NOT passing URL to playwright.agent to stay on target page`);
+        logger.info(`[browser.agent] run: recipe executed successfully - NOT passing URL to playwright.agent to stay on target page`);
     }
     const agentResult = await _withSessionMutex(sessionId, () => callSkill(_agentSkill, {
-      goal: _effectiveTask,
-      agentContext: _agentContext,
-      url: _playwrightUrl,
-      authSignInUrl: _useAgentBrowser ? (signInUrl || undefined) : undefined,
-      sessionId,
-      agentId,
-      autoConnect: _effectiveAutoConnect,
-      chromeProfile: _usePersistentProfile ? AGENT_BROWSER_PROFILE
+        goal: _effectiveTask,
+        agentContext: _agentContext,
+        url: _playwrightUrl,
+        authSignInUrl: _useAgentBrowser ? (signInUrl || undefined) : undefined,
+        sessionId,
+        agentId,
+        autoConnect: _effectiveAutoConnect,
+        chromeProfile: _usePersistentProfile ? AGENT_BROWSER_PROFILE
         : (!_effectiveAutoConnect && _useAutoConnect ? 'Default' : undefined),
-      headed: _usePersistentProfile ? true : undefined,
-      maxTurns: 15,
-      timeoutMs: 120000,
-      recipeWasUsed: _recipeExecutedOk,
-      authConfirmedAt: (_getCachedAuthCheck(agentId)?.ts ?? null),
-      _progressCallbackUrl,
-      _stepIndex,
+        headed: _usePersistentProfile ? true : undefined,
+        maxTurns: 15,
+        timeoutMs: 120000,
+        recipeWasUsed: _recipeExecutedOk,
+        authConfirmedAt: (_getCachedAuthCheck(agentId)?.ts ?? null),
+        _progressCallbackUrl,
+        _stepIndex,
     }, 130000));
 
     const agentResultText = agentResult?.result || agentResult?.stdout || '';
@@ -4147,13 +4343,13 @@ When extracting page content with run-code, prioritize these selectors over gene
     // or after exhausting replanning), propagate it directly to the caller
     // so recoverSkill / executeCommand can surface the choice to the user.
     if (agentResult?.askUser === true) {
-      logger.info(`[browser.agent] propagating askUser from playwright.agent: "${agentResult.question}"`);
+        logger.info(`[browser.agent] propagating askUser from playwright.agent: "${agentResult.question}"`);
 
-      // ── Recipe Doctor: auto-diagnose and patch the recipe before asking user ──
-      // When a recipe-driven task fails, attempt to auto-diagnose why the last
-      // recipe step didn't work and patch it — so the next run just works.
-      let _doctorSummary = null;
-      if (_recipeExecutedOk && _activeRecipe && sessionId) {
+        // ── Recipe Doctor: auto-diagnose and patch the recipe before asking user ──
+        // When a recipe-driven task fails, attempt to auto-diagnose why the last
+        // recipe step didn't work and patch it — so the next run just works.
+        let _doctorSummary = null;
+        if (_recipeExecutedOk && _activeRecipe && sessionId) {
         logger.info(`[browser.agent] recipe-doctor: goal not achieved after recipe — running diagnosis`);
         try {
           const _doctorResult = await diagnoseAndPatchRecipe({
@@ -4172,16 +4368,16 @@ When extracting page content with run-code, prioritize these selectors over gene
         } catch (_docErr) {
           logger.warn(`[browser.agent] recipe-doctor: non-fatal error: ${_docErr.message}`);
         }
-      }
+        }
 
-      const _questionText = _doctorSummary
+        const _questionText = _doctorSummary
         ? `${agentResult.question}\n\n✅ Recipe auto-fixed: ${_doctorSummary}\n\nTry again to use the patched recipe.`
         : agentResult.question;
-      const _options = _doctorSummary
+        const _options = _doctorSummary
         ? ['Try again with patched recipe', ...( agentResult.options || []).filter(o => !/try again/i.test(o))]
         : (agentResult.options || []);
 
-      return {
+        return {
         ok: false,
         agentId,
         task,
@@ -4190,7 +4386,7 @@ When extracting page content with run-code, prioritize these selectors over gene
         options: _options,
         recipeWasUsed: _recipeExecutedOk,
         recipePatched: !!_doctorSummary,
-      };
+        };
     }
 
     // ── Tier-2 post-execution write-back ──────────────────────────────────────
@@ -4198,12 +4394,12 @@ When extracting page content with run-code, prioritize these selectors over gene
     // call to generate a grounded ### playbook section from the actual execution
     // result. On the next identical task, _resolvePlaybook will hit tier-1 directly.
     if (_playbookTier === 2 && agentResult?.ok === true && existing.descriptor) {
-      // Parse only the ## Playbooks section — avoid matching ### headers in other sections
-      const _pbMatch = existing.descriptor.match(/\n## Playbooks\n([\s\S]*)$/);
-      const _existingSubsections = _pbMatch
+        // Parse only the ## Playbooks section — avoid matching ### headers in other sections
+        const _pbMatch = existing.descriptor.match(/\n## Playbooks\n([\s\S]*)$/);
+        const _existingSubsections = _pbMatch
         ? _pbMatch[1].trim().split(/(?=### )/).map(s => s.trim()).filter(Boolean)
         : [];
-      setImmediate(() => {
+        setImmediate(() => {
         _generateAndCachePlaybook(
           agentId,
           existing.descriptor,
@@ -4211,8 +4407,8 @@ When extracting page content with run-code, prioritize these selectors over gene
           _existingSubsections,
           agentResultText.slice(0, 1200),
         ).catch(() => {/* silent — write-back is best-effort */});
-      });
-      logger.info(`[browser.agent] playbook: tier-2 success — async COT write-back queued for ${agentId}`);
+        });
+        logger.info(`[browser.agent] playbook: tier-2 success — async COT write-back queued for ${agentId}`);
     }
 
     // ── Dynamic login-wall detector ───────────────────────────────────────────
@@ -4234,8 +4430,8 @@ When extracting page content with run-code, prioritize these selectors over gene
     const _isLoginWall       = _loginWallMatches >= 2 && agentResultText.trim().split(/\n+/).length < 50;
 
     if (_isLoginWall || _hasOAuthProvider || agentResult?.loginWallDetected) {
-      logger.warn(`[browser.agent] Login wall detected for ${agentId} (signals=${_loginWallMatches}, oauthProvider=${_hasOAuthProvider}, explicitFlag=${!!agentResult?.loginWallDetected}) — auto-upgrading to isOAuth:true`);
-      try {
+        logger.warn(`[browser.agent] Login wall detected for ${agentId} (signals=${_loginWallMatches}, oauthProvider=${_hasOAuthProvider}, explicitFlag=${!!agentResult?.loginWallDetected}) — auto-upgrading to isOAuth:true`);
+        try {
         await withDb(async (_patchDb) => {
           const _existingRows = _patchDb
             ? await _patchDb.all('SELECT descriptor FROM agents WHERE id = ?', agentId).catch(() => null)
@@ -4260,15 +4456,15 @@ When extracting page content with run-code, prioritize these selectors over gene
             logger.info(`[browser.agent] ${agentId} patched: is_oauth=true${_hasOAuthProvider ? ' (OAuth provider buttons detected)' : ''} — attempting auto-retry with waitForAuth`);
           }
         })
-      } catch (patchErr) {
+        } catch (patchErr) {
         logger.warn(`[browser.agent] login-wall patch failed for ${agentId}: ${patchErr.message}`);
-      }
+        }
 
-      // ── Auto-retry: trigger waitForAuth inline and re-run the agent once ──────
-      // This avoids requiring a manual re-run after the DB patch. The _loginWallRetried
-      // flag (passed via args) prevents an infinite retry loop if the second run also
-      // sees a wall (e.g. waitForAuth timed out, user didn't sign in).
-      if (!_loginWallRetried && !_useAgentBrowser) {
+        // ── Auto-retry: trigger waitForAuth inline and re-run the agent once ──────
+        // This avoids requiring a manual re-run after the DB patch. The _loginWallRetried
+        // flag (passed via args) prevents an infinite retry loop if the second run also
+        // sees a wall (e.g. waitForAuth timed out, user didn't sign in).
+        if (!_loginWallRetried && !_useAgentBrowser) {
         logger.info(`[browser.agent] auto-retry: calling waitForAuth for ${agentId} then re-delegating to ${_agentSkill}`);
 
         // ── Emit task:auth_required so the UI shows the full auth overlay ────
@@ -4358,10 +4554,10 @@ When extracting page content with run-code, prioritize these selectors over gene
         } catch (retryErr) {
           logger.warn(`[browser.agent] auto-retry after login-wall threw: ${retryErr.message}`);
         }
-      }
+        }
 
-      const _svcDisplayFinal = agentId.replace('.agent', '').replace(/_/g, ' ');
-      return {
+        const _svcDisplayFinal = agentId.replace('.agent', '').replace(/_/g, ' ');
+        return {
         ok: false,
         agentId,
         task,
@@ -4371,14 +4567,14 @@ When extracting page content with run-code, prioritize these selectors over gene
         error: `Login wall detected for ${agentId} — service requires authentication.`,
         loginWallDetected: true,
         oauthUpgraded: true,
-      };
+        };
     }
     // ─────────────────────────────────────────────────────────────────────────
 
     // When the run succeeded and startUrl was auto-corrected by the destination resolver,
     // reinforce the correction memory so future runs auto-correct with full confidence.
     if (agentResult?.ok === true) {
-      try {
+        try {
         const _confirmedIntent = await classifyTaskIntent(task);
         const _origUrl = extractDescriptorUrl(existing.descriptor, 'start_url');
         if (_origUrl && startUrl !== _origUrl) {
@@ -4386,7 +4582,7 @@ When extracting page content with run-code, prioritize these selectors over gene
             recordCorrection(_svcKey, _confirmedIntent, startUrl).catch(() => {});
           });
         }
-      } catch (_) {}
+        } catch (_) {}
     }
 
     // ── Research content quality gate ─────────────────────────────────────────
@@ -4401,9 +4597,9 @@ When extracting page content with run-code, prioritize these selectors over gene
     // can surface ASK_USER with alternative source options instead of silently
     // passing an empty result to the synthesize step.
     if (agentResult?.ok === true) {
-      const _researchIntents = /\b(research|find|look\s+up|search|get\s+info|learn\s+about|tell\s+me\s+about|summarize|what\s+is|who\s+is|how\s+does|explain)\b/i;
-      const _taskIsResearch = _researchIntents.test(task);
-      if (_taskIsResearch) {
+        const _researchIntents = /\b(research|find|look\s+up|search|get\s+info|learn\s+about|tell\s+me\s+about|summarize|what\s+is|who\s+is|how\s+does|explain)\b/i;
+        const _taskIsResearch = _researchIntents.test(task);
+        if (_taskIsResearch) {
         const _httpStatus = Number.isInteger(agentResult?.httpStatus) ? agentResult.httpStatus : null;
         if (_httpStatus !== null && _httpStatus >= 400) {
           logger.warn(`[browser.agent] Research quality gate: http error for ${agentId} (status=${_httpStatus}) — marking serviceUnavailable`);
@@ -4452,22 +4648,22 @@ When extracting page content with run-code, prioritize these selectors over gene
             researchContentEmpty: true,
           };
         }
-      }
+        }
     }
     // ─────────────────────────────────────────────────────────────────────────
 
     const _runResult = {
-      ok: agentResult?.ok ?? false,
-      agentId,
-      task,
-      sessionId,
-      authenticated: true,
-      result: agentResultText,
-      transcript: agentResult?.transcript || [],
-      turns: agentResult?.turns,
-      done: agentResult?.done,
-      httpStatus: Number.isInteger(agentResult?.httpStatus) ? agentResult.httpStatus : undefined,
-      error: agentResult?.error,
+        ok: agentResult?.ok ?? false,
+        agentId,
+        task,
+        sessionId,
+        authenticated: true,
+        result: agentResultText,
+        transcript: agentResult?.transcript || [],
+        turns: agentResult?.turns,
+        done: agentResult?.done,
+        httpStatus: Number.isInteger(agentResult?.httpStatus) ? agentResult.httpStatus : undefined,
+        error: agentResult?.error,
     };
 
     // ── Auto-recipe generation from successful run ─────────────────────────────
@@ -4476,15 +4672,15 @@ When extracting page content with run-code, prioritize these selectors over gene
     // deterministically without LLM planning, web-search discovery, or re-plans.
     let _autoRecipeCreated = false;
     if (_runResult.ok === true && !_trainedRecipeInjected && _runResult.transcript.length >= 2) {
-      try {
+        try {
         const trainerAgent = require('./trainer.agent.cjs');
         const _autoRecipe = await trainerAgent.saveAutoRecipe(
           agentId, task, _runResult.transcript, startUrl, _agentContext
         );
         if (_autoRecipe) _autoRecipeCreated = true;
-      } catch (_autoRecipeErr) {
+        } catch (_autoRecipeErr) {
         logger.warn(`[browser.agent] auto-recipe generation failed (non-fatal): ${_autoRecipeErr.message}`);
-      }
+        }
     }
 
     // ── Post-run background rescan ────────────────────────────────────────────
@@ -4493,12 +4689,12 @@ When extracting page content with run-code, prioritize these selectors over gene
     // stays current without blocking the current task.
     // Skip when a recipe was used or just created — the workflow is already cached.
     if (_runResult.ok === true && !_trainedRecipeInjected && !_autoRecipeCreated) {
-      try {
+        try {
         const { enqueueScan } = require('./explore.agent.cjs');
         enqueueScan({ url: startUrl, agentId }, 'post_automation');
-      } catch (_enqueuErr) {
+        } catch (_enqueuErr) {
         // Non-fatal — scan will be triggered on next periodic heartbeat
-      }
+        }
     }
 
     // ── Discovered tool playbook write-back ────────────────────────────────────
@@ -4507,24 +4703,24 @@ When extracting page content with run-code, prioritize these selectors over gene
     // it instantly without re-searching. The agent descriptor already contains
     // the tool URL and capabilities — we write a memory entry with metadata.
     if (_runResult.ok === true && existing?.start_url) {
-      try {
+        try {
         const toolDb = require('../skill-helpers/skill-db.cjs');
         const _svcKey = (existing.service || agentId.replace(/\.agent$/, '')).toLowerCase().replace(/[^a-z0-9]/g, '');
         const _memText = `TOOL_NAME: ${agentId}\nTOOL_URL: ${existing.start_url}\nTOOL_TYPE: browser\nTOOL_TIER: ${existing.is_oauth ? 'free_account' : 'free_no_account'}\nINSTRUCTION: Use browser.agent { action: 'run', agentId: '${agentId}', task: '...' } for tasks on this service.\nSERVICE: ${_svcKey}`;
         toolDb.remember('tool.discover', _memText, { agentId, url: existing.start_url, service: _svcKey }).catch(() => {});
         logger.info(`[browser.agent] Discovered tool write-back: cached ${agentId} for future recall`);
-      } catch (_writeBackErr) {
+        } catch (_writeBackErr) {
         // Non-fatal — best-effort caching
-      }
+        }
     }
 
     // ── Minimize browser window after successful completion ───────────────────
     if (_runResult.ok === true && _usePersistentProfile) {
-      try {
+        try {
         await browserAct({ action: 'minimize', sessionId, headed: true });
-      } catch (minimizeErr) {
+        } catch (minimizeErr) {
         logger.debug(`[browser.agent] minimize failed (non-critical): ${minimizeErr.message}`);
-      }
+        }
     }
 
     return _runResult;
@@ -4545,11 +4741,11 @@ Output ONLY valid JSON:
   "pageType": "login" | "api_key" | "oauth_setup" | "unknown",
   "fields": [
     {
-      "name": "<machine-readable key name, e.g. GMAIL_EMAIL>",
-      "label": "<human-readable label from page, e.g. Email or phone>",
-      "type": "email" | "password" | "text" | "url",
-      "placeholder": "<placeholder text if any>",
-      "required": true | false
+        "name": "<machine-readable key name, e.g. GMAIL_EMAIL>",
+        "label": "<human-readable label from page, e.g. Email or phone>",
+        "type": "email" | "password" | "text" | "url",
+        "placeholder": "<placeholder text if any>",
+        "required": true | false
     }
   ],
   "submitLabel": "<text on the submit button, e.g. Next or Sign in>",
@@ -4582,13 +4778,13 @@ async function actionScanPage({ service, url: explicitUrl, secretKey }) {
     const stored = await actionQueryAgent({ id: agentId }).catch(() => null);
     const storedSignIn = stored?.found ? extractDescriptorUrl(stored.descriptor, 'sign_in_url') : null;
     if (storedSignIn) {
-      scanUrl = storedSignIn;
-      logger.info(`[browser.agent] scan_page: using DuckDB sign_in_url for ${service}: ${scanUrl}`);
+        scanUrl = storedSignIn;
+        logger.info(`[browser.agent] scan_page: using DuckDB sign_in_url for ${service}: ${scanUrl}`);
     } else {
-      // Priority 2: seed map startUrl (bootstrap fallback only)
-      const meta = await resolveBrowserMeta(service).catch(() => null);
-      scanUrl = meta?.startUrl || `https://${serviceKey}.com`;
-      logger.info(`[browser.agent] scan_page: no stored sign_in_url — using seed startUrl: ${scanUrl}`);
+        // Priority 2: seed map startUrl (bootstrap fallback only)
+        const meta = await resolveBrowserMeta(service).catch(() => null);
+        scanUrl = meta?.startUrl || `https://${serviceKey}.com`;
+        logger.info(`[browser.agent] scan_page: no stored sign_in_url — using seed startUrl: ${scanUrl}`);
     }
   }
   if (!scanUrl) return { ok: false, error: 'url or service is required for scan_page' };
@@ -4599,22 +4795,22 @@ async function actionScanPage({ service, url: explicitUrl, secretKey }) {
   let domSnapshot = '';
   try {
     const scanResult = await callBrowserAct({
-      action: 'scanCurrentPage',
-      url: scanUrl,
-      sessionId: `scan_${serviceKey}_${Date.now()}`,
-      isolated: true,
-      timeoutMs: 20000,
+        action: 'scanCurrentPage',
+        url: scanUrl,
+        sessionId: `scan_${serviceKey}_${Date.now()}`,
+        isolated: true,
+        timeoutMs: 20000,
     }, 30000);
     if (scanResult?.elements) {
-      // Flatten elements to a readable text snapshot for the LLM
-      domSnapshot = (scanResult.elements || [])
+        // Flatten elements to a readable text snapshot for the LLM
+        domSnapshot = (scanResult.elements || [])
         .slice(0, 60)
         .map(el => `[${el.tag}] label="${el.label || ''}" placeholder="${el.placeholder || ''}" type="${el.type || ''}" id="${el.id || ''}" name="${el.name || ''}"`)
         .join('\n');
     } else if (scanResult?.html) {
-      domSnapshot = scanResult.html.slice(0, 4000);
+        domSnapshot = scanResult.html.slice(0, 4000);
     } else if (typeof scanResult === 'string') {
-      domSnapshot = scanResult.slice(0, 4000);
+        domSnapshot = scanResult.slice(0, 4000);
     }
   } catch (err) {
     logger.warn(`[browser.agent] scan_page: DOM scan failed (${err.message}), using LLM knowledge only`);
@@ -4632,8 +4828,8 @@ async function actionScanPage({ service, url: explicitUrl, secretKey }) {
   try {
     const raw = await callLLM(SCAN_PAGE_SYSTEM_PROMPT, userQuery, { temperature: 0.1, maxTokens: 600 });
     if (raw) {
-      const match = raw.match(/\{[\s\S]*\}/);
-      if (match) parsed = JSON.parse(match[0]);
+        const match = raw.match(/\{[\s\S]*\}/);
+        if (match) parsed = JSON.parse(match[0]);
     }
   } catch (err) {
     logger.warn(`[browser.agent] scan_page: LLM parse failed: ${err.message}`);
@@ -4645,16 +4841,16 @@ async function actionScanPage({ service, url: explicitUrl, secretKey }) {
     const isPassword = key.includes('PASSWORD') || key.includes('SECRET');
     const isEmail    = key.includes('EMAIL') || key.includes('USER');
     parsed = {
-      pageType: 'unknown',
-      fields: [{
+        pageType: 'unknown',
+        fields: [{
         name: secretKey || `${serviceKey.toUpperCase()}_KEY`,
         label: (secretKey || 'API Key').replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase()),
         type: isPassword ? 'password' : isEmail ? 'email' : 'text',
         placeholder: '',
         required: true,
-      }],
-      pageTitle: service,
-      notes: `Credential required for ${service}`,
+        }],
+        pageTitle: service,
+        notes: `Credential required for ${service}`,
     };
   }
 
@@ -4710,8 +4906,8 @@ async function actionDeleteAgent({ id }) {
     const exists = fs.existsSync(tryPath);
     logger.info(`[browser.agent] delete_agent: checking ${tryPath}: ${exists}`);
     if (exists) {
-      agentMdPath = tryPath;
-      break;
+        agentMdPath = tryPath;
+        break;
     }
   }
 
@@ -4720,31 +4916,31 @@ async function actionDeleteAgent({ id }) {
   // stored as 'w3schools.agent.md' (canonical id 'w3schools.agent').
   if (!agentMdPath) {
     try {
-      const _norm = (s) => s.toLowerCase().replace(/[^a-z0-9]/g, '');
-      const _idNorm = _norm(id);
-      const _allFiles = fs.readdirSync(AGENTS_DIR).filter(f => f.endsWith('.agent.md'));
-      const _match = _allFiles.find(f => {
+        const _norm = (s) => s.toLowerCase().replace(/[^a-z0-9]/g, '');
+        const _idNorm = _norm(id);
+        const _allFiles = fs.readdirSync(AGENTS_DIR).filter(f => f.endsWith('.agent.md'));
+        const _match = _allFiles.find(f => {
         const base = f.replace(/\.agent\.md$/, '');
         return _norm(base) === _idNorm || _norm(f.replace(/\.md$/, '')) === _idNorm;
-      });
-      if (_match) {
+        });
+        if (_match) {
         agentMdPath = path.join(AGENTS_DIR, _match);
         logger.info(`[browser.agent] delete_agent: fuzzy match found: ${_match} for id=${id}`);
-      } else {
+        } else {
         logger.warn(`[browser.agent] delete_agent: no .md file found for ${id} (fuzzy scan also failed)`);
-      }
+        }
     } catch (_fuzzyErr) {
-      logger.warn(`[browser.agent] delete_agent: no .md file found for ${id}`);
+        logger.warn(`[browser.agent] delete_agent: no .md file found for ${id}`);
     }
   }
 
   if (agentMdPath) {
     try {
-      const desc = fs.readFileSync(agentMdPath, 'utf8');
-      const urlMatch = desc.match(/^start_url:\s*(.+)$/m);
-      if (urlMatch) {
+        const desc = fs.readFileSync(agentMdPath, 'utf8');
+        const urlMatch = desc.match(/^start_url:\s*(.+)$/m);
+        if (urlMatch) {
         try { hostname = new URL(urlMatch[1].trim()).hostname.replace(/^www\./, ''); } catch (_) {}
-      }
+        }
     } catch (_) {}
     try { fs.rmSync(agentMdPath, { force: true }); deleted.push(agentMdPath); logger.info(`[browser.agent] delete_agent: removed file ${agentMdPath}`); } catch (e) { errors.push(e.message); }
   }
@@ -4752,20 +4948,20 @@ async function actionDeleteAgent({ id }) {
   // ── 2. DuckDB: agents table + browser_meta_cache ────────────────────────────
   try {
     await withDb(async (db) => {
-      const service = id.replace(/\.agent$/, '');
-      logger.info(`[browser.agent] delete_agent: looking for service = ${service}`);
-      
-      // Check if agent exists before delete
-      const beforeRows = await db.all('SELECT id FROM agents WHERE id = ?', id).catch((e) => {
+        const service = id.replace(/\.agent$/, '');
+        logger.info(`[browser.agent] delete_agent: looking for service = ${service}`);
+        
+        // Check if agent exists before delete
+        const beforeRows = await db.all('SELECT id FROM agents WHERE id = ?', id).catch((e) => {
         logger.error(`[browser.agent] delete_agent: SELECT error: ${e.message}`);
         return [];
-      });
-      logger.info(`[browser.agent] delete_agent: found ${beforeRows.length} rows for id = ${id}`);
-      if (beforeRows.length > 0) {
+        });
+        logger.info(`[browser.agent] delete_agent: found ${beforeRows.length} rows for id = ${id}`);
+        if (beforeRows.length > 0) {
         await db.run('DELETE FROM agents WHERE id = ?', id);
         deleted.push(`DuckDB agents row: ${id}`);
         logger.info(`[browser.agent] delete_agent: removed ${id} from DuckDB agents table`);
-      } else {
+        } else {
         // Fuzzy fallback: match by normalized service name so 'w3schoolsagent' finds 'w3schools.agent'
         const _norm = (s) => s.toLowerCase().replace(/[^a-z0-9]/g, '');
         const _idNorm = _norm(id);
@@ -4782,16 +4978,16 @@ async function actionDeleteAgent({ id }) {
         } else {
           logger.warn(`[browser.agent] delete_agent: agent ${id} not found in DuckDB. Available: ${JSON.stringify(allAgents.map(r => r.id))}`);
         }
-      }
-      
-      // Delete from meta cache
-      const metaRows = await db.all('SELECT service FROM browser_meta_cache WHERE service = ?', service).catch(() => []);
-      if (metaRows.length > 0) {
+        }
+        
+        // Delete from meta cache
+        const metaRows = await db.all('SELECT service FROM browser_meta_cache WHERE service = ?', service).catch(() => []);
+        if (metaRows.length > 0) {
         await db.run('DELETE FROM browser_meta_cache WHERE service = ?', service);
         deleted.push(`DuckDB meta_cache row: ${service}`);
-      }
-      
-      // Note: withDb closes connection automatically, no need for CHECKPOINT
+        }
+        
+        // Note: withDb closes connection automatically, no need for CHECKPOINT
     });
   } catch (e) { 
     logger.error(`[browser.agent] delete_agent: DuckDB error: ${e.message}`);
@@ -4802,7 +4998,7 @@ async function actionDeleteAgent({ id }) {
   if (hostname) {
     const domainMapPath = path.join(os.homedir(), '.thinkdrop', 'domain-maps', `${hostname}.json`);
     if (fs.existsSync(domainMapPath)) {
-      try { fs.rmSync(domainMapPath, { force: true }); deleted.push(domainMapPath); } catch (e) { errors.push(e.message); }
+        try { fs.rmSync(domainMapPath, { force: true }); deleted.push(domainMapPath); } catch (e) { errors.push(e.message); }
     }
   }
 
@@ -4830,13 +5026,13 @@ async function actionDeleteAgent({ id }) {
   const abDir = path.join(os.homedir(), '.thinkdrop', 'ab-sessions');
   if (fs.existsSync(abDir)) {
     try {
-      const entries = fs.readdirSync(abDir);
-      for (const entry of entries) {
+        const entries = fs.readdirSync(abDir);
+        for (const entry of entries) {
         if (entry.startsWith(`${id}_`) || entry.startsWith(`${service}.agent_`) || entry.startsWith(`${profileName}_`)) {
           const fullPath = path.join(abDir, entry);
           try { fs.rmSync(fullPath, { recursive: true, force: true }); deleted.push(fullPath); } catch (e) { errors.push(e.message); }
         }
-      }
+        }
     } catch (_) {}
   }
 
@@ -4844,15 +5040,15 @@ async function actionDeleteAgent({ id }) {
   const scanStatePath = path.join(os.homedir(), '.thinkdrop', 'scan-state.json');
   if (fs.existsSync(scanStatePath)) {
     try {
-      const scanState = JSON.parse(fs.readFileSync(scanStatePath, 'utf8'));
-      if (Array.isArray(scanState.lastRunAgents)) {
+        const scanState = JSON.parse(fs.readFileSync(scanStatePath, 'utf8'));
+        if (Array.isArray(scanState.lastRunAgents)) {
         const before = scanState.lastRunAgents.length;
         scanState.lastRunAgents = scanState.lastRunAgents.filter(a => a !== id && a !== `${service}.agent`);
         if (scanState.lastRunAgents.length !== before) {
           fs.writeFileSync(scanStatePath, JSON.stringify(scanState, null, 2), 'utf8');
           deleted.push(`scan-state.json entry: ${id}`);
         }
-      }
+        }
     } catch (e) { errors.push(`scan-state.json: ${e.message}`); }
   }
 
@@ -4862,12 +5058,12 @@ async function actionDeleteAgent({ id }) {
   const skillsBaseDir = path.join(os.homedir(), '.thinkdrop', 'skills');
   if (fs.existsSync(skillsBaseDir)) {
     try {
-      const allSkillDirs = fs.readdirSync(skillsBaseDir).filter(f =>
+        const allSkillDirs = fs.readdirSync(skillsBaseDir).filter(f =>
         fs.statSync(path.join(skillsBaseDir, f)).isDirectory()
-      );
-      const servicePrefix = service.toLowerCase();
-      const idPrefix = id.replace(/\./g, '_').toLowerCase();
-      for (const dir of allSkillDirs) {
+        );
+        const servicePrefix = service.toLowerCase();
+        const idPrefix = id.replace(/\./g, '_').toLowerCase();
+        for (const dir of allSkillDirs) {
         const dirLower = dir.toLowerCase();
         if (dirLower.startsWith(servicePrefix + '_') ||
             dirLower.startsWith(idPrefix + '_') ||
@@ -4876,7 +5072,7 @@ async function actionDeleteAgent({ id }) {
           try { fs.rmSync(fullPath, { recursive: true, force: true }); deleted.push(fullPath); }
           catch (e) { errors.push(e.message); }
         }
-      }
+        }
     } catch (e) { errors.push(`skills dir scan: ${e.message}`); }
   }
 
@@ -4886,14 +5082,14 @@ async function actionDeleteAgent({ id }) {
     const userMemPort = process.env.USER_MEMORY_PORT || '3001';
     const removePayload = JSON.stringify({ payload: { sourceDomain: service } });
     await new Promise((resolve) => {
-      const req = http.request(
+        const req = http.request(
         { hostname: '127.0.0.1', port: parseInt(userMemPort), path: '/skill.removeByDomain', method: 'POST',
           headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(removePayload) } },
         (res) => { res.on('data', () => {}); res.on('end', () => resolve()); }
-      );
-      req.on('error', () => resolve());
-      req.setTimeout(3000, () => { req.destroy(); resolve(); });
-      req.end(removePayload);
+        );
+        req.on('error', () => resolve());
+        req.setTimeout(3000, () => { req.destroy(); resolve(); });
+        req.end(removePayload);
     });
     deleted.push(`installed_skills rows for domain: ${service}`);
   } catch (e) { errors.push(`installed_skills cleanup: ${e.message}`); }
@@ -4916,11 +5112,30 @@ async function actionRecordFailure({ id, failureEntry }) {
     entries.unshift(failureEntry);
     const trimmed = entries.slice(0, 5).join('\n---\n');
     await db.run(
-      'UPDATE agents SET failure_log = ?, status = CASE WHEN status = \'healthy\' THEN \'degraded\' ELSE status END WHERE id = ?',
-      trimmed, id
+        'UPDATE agents SET failure_log = ?, status = CASE WHEN status = \'healthy\' THEN \'degraded\' ELSE status END WHERE id = ?',
+        trimmed, id
     );
     logger.info(`[browser.agent] record_failure: appended runtime error for ${id}`);
     return { ok: true, agentId: id };
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Action: authenticate
+// ---------------------------------------------------------------------------
+// Ensures a browser or API-key agent has valid credentials/session before the
+// plan runs. Reuses actionRun's agent lookup + auth flow but stops as soon as
+// auth succeeds. Called from preflightAgents.
+async function actionAuthenticate({ agentId, task, url, skipAuth, _progressCallbackUrl }) {
+  if (!agentId) return { ok: false, error: 'agentId is required' };
+  const authTask = task || `Authenticate to ${agentId}`;
+  return await actionRun({
+    agentId,
+    task: authTask,
+    url,
+    skipAuth,
+    _progressCallbackUrl,
+    _authOnly: true,
   });
 }
 
@@ -4940,11 +5155,11 @@ async function actionExplore({ agentId, goal, url, sessionId, maxDepth, maxNavIt
     const serviceKey = agentId.replace(/\.agent$/, '');
     logger.info(`[browser.agent] explore: agent "${agentId}" not found — attempting auto-build for "${serviceKey}"`);
     try {
-      const buildResult = await actionBuildAgent({ service: serviceKey });
-      if (buildResult.ok) existing = await actionQueryAgent({ id: agentId });
+        const buildResult = await actionBuildAgent({ service: serviceKey });
+        if (buildResult.ok) existing = await actionQueryAgent({ id: agentId });
     } catch (_) {}
     if (!existing.found) {
-      return { ok: false, error: `Agent not found: ${agentId}. Build it first with action:build_agent.`, needsBuild: true };
+        return { ok: false, error: `Agent not found: ${agentId}. Build it first with action:build_agent.`, needsBuild: true };
     }
   }
 
@@ -4978,7 +5193,7 @@ async function actionExplore({ agentId, goal, url, sessionId, maxDepth, maxNavIt
   // Only if the run succeeded and the map hasn't been updated in the last 24h
   if (result?.ok && result?.done) {
     try {
-      enqueueScan({ url: startUrl, agentId, _progressCallbackUrl }, 'post_automation');
+        enqueueScan({ url: startUrl, agentId, _progressCallbackUrl }, 'post_automation');
     } catch (_) { /* non-fatal */ }
   }
 
@@ -4994,41 +5209,44 @@ async function browserAgent(args) {
 
   switch (action) {
     case 'build_agent':
-      return await actionBuildAgent(args);
+        return await actionBuildAgent(args);
 
     case 'query_agent':
-      return await actionQueryAgent(args);
+        return await actionQueryAgent(args);
 
     case 'list_agents':
-      return await actionListAgents();
+        return await actionListAgents();
 
     case 'validate_agent':
-      return await actionValidateAgent(args);
+        return await actionValidateAgent(args);
 
     case 'run':
-      return await actionRun(args);
+        return await actionRun(args);
+
+    case 'authenticate':
+        return await actionAuthenticate(args);
 
     case 'explore':
-      return await actionExplore(args);
+        return await actionExplore(args);
 
     case 'scan_domain':
-      // Shortcut for mode:scan — background probe without a goal
-      return await actionExplore({ ...args, mode: 'scan' });
+        // Shortcut for mode:scan — background probe without a goal
+        return await actionExplore({ ...args, mode: 'scan' });
 
     case 'scan_page':
-      return await actionScanPage(args);
+        return await actionScanPage(args);
 
     case 'delete_agent':
-      return await actionDeleteAgent(args);
+        return await actionDeleteAgent(args);
 
     case 'record_failure':
-      return await actionRecordFailure(args);
+        return await actionRecordFailure(args);
 
     default:
-      return {
+        return {
         ok: false,
-        error: `Unknown action: "${action}". Valid: build_agent | query_agent | list_agents | validate_agent | run | explore | scan_domain | scan_page | delete_agent | record_failure`,
-      };
+        error: `Unknown action: "${action}". Valid: build_agent | query_agent | list_agents | validate_agent | run | authenticate | explore | scan_domain | scan_page | delete_agent | record_failure`,
+        };
   }
 }
 
@@ -5074,3 +5292,6 @@ function _generateAgentThinking(agentType, context) {
 
 module.exports = { browserAgent, KNOWN_BROWSER_SERVICES, actionDeleteAgent, _generateAgentThinking };
 module.exports._deriveAgentType = deriveAgentType;
+module.exports.resolveCredential = resolveCredential;
+module.exports._profileGetValue = _profileGetValue;
+module.exports._isSigninWall = _isSigninWall;

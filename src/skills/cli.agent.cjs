@@ -2137,14 +2137,23 @@ function _parseFrontmatterField(descriptor, key) {
 
 async function actionListAllAgents() {
   return await withDb(async (db) => {
+    // Unconditional: delete all legacy bare-id rows (e.g. 'youtube', 'gmail')
+    // that don't have the canonical '.agent' suffix. Safe to run every call.
+    await db.run("DELETE FROM agents WHERE id NOT LIKE '%.agent'").catch(() => {});
+
     const rows = await db.all("SELECT id, type, service, cli_tool, capabilities, status, last_validated, descriptor FROM agents ORDER BY created_at DESC");
     return {
       ok: true,
       agents: (rows || []).map(r => {
         const apiKeyUrl = _parseFrontmatterField(r.descriptor, 'api_key_url');
         const apiKeyEnv = _parseFrontmatterField(r.descriptor, 'api_key_env');
+        // Normalize id to canonical '.agent' suffix
+        let id = r.id || '';
+        if (id && !id.toLowerCase().endsWith('.agent')) {
+          id = `${id}.agent`;
+        }
         return {
-          id: r.id,
+          id,
           type: r.type || 'browser',
           service: r.service,
           cliTool: r.cli_tool,

@@ -17,7 +17,8 @@ const path    = require('path');
 const { EventEmitter } = require('events');
 
 // ─── Shared mutable mock state (reset between tests) ─────────────────────────
-let mockLLMResponse = null;   // string → callLLM returns this; null → emit error
+let mockLLMResponse  = null;   // string → all turns get this; null → emit error
+let mockLLMResponses = null;   // array  → consumed in sequence (for multi-turn loops)
 const mockDbRows    = {};     // tableName → rows[]
 let mockSpawnResult = null;   // { stdout, stderr, exitCode } for non-which spawns
 const mockExecFileMap = {};   // cmd → { err, stdout, stderr }
@@ -31,7 +32,9 @@ class MockWebSocket extends EventEmitter {
     super();
     setImmediate(() => {
       this.emit('open');
-      const reply = mockLLMResponse;
+      const reply = (Array.isArray(mockLLMResponses) && mockLLMResponses.length)
+        ? mockLLMResponses.shift()
+        : mockLLMResponse;
       setImmediate(() => {
         if (reply !== null) {
           this.emit('message', Buffer.from(JSON.stringify({ type: 'llm_stream_start' })));
@@ -179,7 +182,8 @@ let passed = 0, failed = 0;
 
 async function test(name, fn) {
   // Reset all shared mock state before each test
-  mockLLMResponse = null;
+  mockLLMResponse  = null;
+  mockLLMResponses  = null;
   mockSpawnResult = null;
   Object.keys(mockDbRows).forEach(k => delete mockDbRows[k]);
   Object.keys(mockExecFileMap).forEach(k => delete mockExecFileMap[k]);
@@ -203,15 +207,17 @@ async function runAll() {
   // U-01: cli.agent agentic run — happy path
   await test('U-01: cli.agent agentic run returns ok + inferredArgv', async () => {
     mockDbRows['agents']  = [{ id: 'github.agent', cli_tool: 'gh', status: 'healthy', descriptor: 'type: cli\nservice: github' }];
-    mockLLMResponse       = JSON.stringify({ argv: ['repo', 'list'], reasoning: 'list all repos' });
-    mockSpawnResult       = { stdout: 'org/repo1\norg/repo2\n', stderr: '', exitCode: 0 };
+    mockLLMResponses = [
+      JSON.stringify({ action: 'run_cmd', argv: ['repo', 'list'], thinking: 'list repos' }),
+      JSON.stringify({ action: 'done', summary: 'org/repo1\norg/repo2' }),
+    ];
+    mockSpawnResult  = { stdout: 'org/repo1\norg/repo2\n', stderr: '', exitCode: 0 };
 
     const result = await cliAgent({ action: 'run', agentId: 'github.agent', task: 'list my repos' });
 
     assert.equal(result.ok, true,                              `ok should be true, got: ${JSON.stringify(result)}`);
     assert.equal(result.agentId,     'github.agent');
-    assert.deepEqual(result.inferredArgv, ['repo', 'list'],   `inferredArgv mismatch: ${JSON.stringify(result.inferredArgv)}`);
-    assert.ok(result.stdout.includes('repo1'),                 `stdout should contain repo1: ${result.stdout}`);
+    assert.ok(result.stdout.includes('repo1'),                 `stdout/summary should contain repo1: ${JSON.stringify(result)}`);
   });
 
   // U-02: cli.agent unknown agentId → needsBuild
@@ -246,9 +252,9 @@ async function runAll() {
       descriptor: 'type: api_key\nservice: openai\nstart_url: https://api.openai.com',
     }];
     mockLLMResponse = JSON.stringify({
-      curlArgs:  ['-s', '-f', 'https://api.openai.com/v1/models', '-H', 'Authorization: Bearer $CRED_PRIMARY'],
-      credVars:  ['PRIMARY'],
-      reasoning: 'fetch models list',
+      action:   'run_curl',
+      curlArgs: ['-s', '-f', 'https://api.openai.com/v1/models', '-H', 'Authorization: Bearer $CRED_PRIMARY'],
+      credVars: ['PRIMARY'],
     });
     mockExecFileMap['curl'] = { err: null, stdout: '{"object":"list","data":[]}', stderr: '' };
 
@@ -275,9 +281,9 @@ async function runAll() {
       descriptor: 'type: api_key\nservice: stripe\nstart_url: https://api.stripe.com',
     }];
     mockLLMResponse = JSON.stringify({
-      curlArgs:  ['-s', '-f', 'https://api.stripe.com/v1/customers', '-H', 'Authorization: Bearer $CRED_PRIMARY'],
-      credVars:  ['PRIMARY'],
-      reasoning: 'list customers',
+      action:   'run_curl',
+      curlArgs: ['-s', '-f', 'https://api.stripe.com/v1/customers', '-H', 'Authorization: Bearer $CRED_PRIMARY'],
+      credVars: ['PRIMARY'],
     });
     // security returns an error (key not in Keychain)
     mockExecFileMap['security'] = { err: new Error('security: not found'), stdout: '', stderr: '' };
@@ -298,12 +304,17 @@ async function runAll() {
       descriptor: 'type: browser\nservice: notion\nstart_url: https://notion.so\nsign_in_url: https://notion.so/login\nauth_success_pattern: notion.so/dashboard',
     }];
 
-    // Two sequential HTTP calls: waitForAuth → playwright.agent delegation
+    // HTTP sequence: waitForAuth → web.agent nav hints → skill-db → web.agent deep-link → agentbrowser.agent
     let callIdx = 0;
     const httpResponses = [
-      JSON.stringify({ data: { ok: true } }),
-      JSON.stringify({ data: { ok: true, result: 'page created', transcript: [], turns: 3, done: true } }),
+      JSON.stringify({ data: { ok: true } }),                           // 0 waitForAuth
+      JSON.stringify({ ok: true, data: [] }),                           // 1 memory.getRecentOcr
+      JSON.stringify({ ok: false, error: 'No nav hints' }),             // 2 web.agent nav hints
+      JSON.stringify({ ok: true, data: null }),                         // 3 memory.retrieve / getLearnedCorrection
+      JSON.stringify({ ok: false, error: 'No deep-link candidates found' }), // 4 web.agent deep-link
+      JSON.stringify({ data: { ok: true, result: 'page created', transcript: [], turns: 3, done: true } }), // 5 agentbrowser.agent
     ];
+    mockLLMResponse = 'none';   // skip LLM-suggested URL layer in deep-link discovery
     _origHttpRequest = http.request;
     http.request = (_opts, cb) => {
       const body = httpResponses[callIdx++] || JSON.stringify({ data: { ok: false, error: 'unexpected call' } });
@@ -341,9 +352,9 @@ async function runAll() {
       descriptor: 'type: api_key\nservice: hubspot\nstart_url: https://api.hubapi.com',
     }];
     mockLLMResponse = JSON.stringify({
-      curlArgs:  ['-s', 'https://api.hubapi.com/contacts/v1/lists', '-H', 'Authorization: Bearer $CRED_PRIMARY'],
-      credVars:  ['PRIMARY'],
-      reasoning: 'list contact lists',
+      action:   'run_curl',
+      curlArgs: ['-s', 'https://api.hubapi.com/contacts/v1/lists', '-H', 'Authorization: Bearer $CRED_PRIMARY'],
+      credVars: ['PRIMARY'],
     });
     mockExecFileMap['curl'] = { err: null, stdout: '{"lists":[]}', stderr: '' };
 
@@ -370,8 +381,11 @@ async function runAll() {
     let callIdx = 0;
     const httpResponses = [
       JSON.stringify({ data: { ok: true } }),  // waitForAuth succeeds
+      JSON.stringify({ ok: false, error: 'No nav hints' }),  // web.agent nav hints
+      JSON.stringify({ ok: false, error: 'No deep-link candidates found' }),  // web.agent deep-link fallback
       'THIS IS NOT VALID JSON',                 // playwright.agent responds with garbage → parse error
     ];
+    mockLLMResponse = 'none';   // skip LLM-suggested URL layer in deep-link discovery
     _origHttpRequest = http.request;
     http.request = (_opts, cb) => {
       const body = httpResponses[callIdx++] || '';

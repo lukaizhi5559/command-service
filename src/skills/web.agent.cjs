@@ -506,6 +506,19 @@ async function actionDiscoverTaskUrl({ domain, task, maxResults = 5, candidateUr
       // Penalize very long paths (likely article/blog pages, not app pages)
       if (path.split('/').length > 5) score -= 10;
 
+      // Penalize help/support/community pages — these are never app deep links
+      const fullUrl = c.url.toLowerCase();
+      const titleLower = (c.title || '').toLowerCase();
+      if (/\/(support|help|helpcenter|topic|community|forum|answers|thread)\b/i.test(fullUrl) ||
+          /\b(support|help)\b/i.test(host) ||
+          /how to|tutorial|guide|help center|support/i.test(titleLower)) {
+        score -= 40;
+      }
+
+      // Boost app-like URLs with deep-link markers (#, ?, compose, draft, new, create)
+      if (/[#?]/.test(fullUrl) && host === cleanDomain) score += 15;
+      if (/\b(compose|draft|new|create|inbox|mail|message)\b/i.test(path) && host === cleanDomain) score += 20;
+
     } catch (_) { score = 0; }
     return { ...c, _score: Math.round(score) };
   }).filter(c => c._score > 0)
