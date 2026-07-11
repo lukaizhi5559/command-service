@@ -2558,6 +2558,14 @@ async function _resolveTaskDeepLink(agentId, serviceKey, baseStartUrl, task) {
 
     if (!candidate) return null;
 
+    // Reject poisoned deep-links that include extension pages/options URLs in query params.
+    // These can leak from browser extensions and break deterministic recipe execution.
+    const _candidateLower = String(candidate).toLowerCase();
+    if (_candidateLower.includes('chrome-extension://') || _candidateLower.includes('chrome-extension%3a%2f%2f')) {
+      logger.warn(`[browser.agent] deep-link: rejected extension-origin candidate for ${agentId}: ${candidate}`);
+      return null;
+    }
+
     // 3. Security: must stay on expected domain or a subdomain
     const candidateHost = (() => {
       try { return new URL(candidate).hostname.replace(/^www\./, ''); }
@@ -2565,6 +2573,12 @@ async function _resolveTaskDeepLink(agentId, serviceKey, baseStartUrl, task) {
     })();
     if (!candidateHost || (candidateHost !== baseHost && !candidateHost.endsWith('.' + baseHost))) {
       logger.warn(`[browser.agent] deep-link: off-domain candidate rejected: ${candidate}`);
+      return null;
+    }
+
+    // Gmail-specific hardening: avoid malformed compose links with extension payloads.
+    if (serviceKey === 'gmail' && /mail\.google\.com\/mail\?body=/i.test(candidate)) {
+      logger.warn(`[browser.agent] deep-link: rejected malformed Gmail compose candidate for ${agentId}: ${candidate}`);
       return null;
     }
 
@@ -2593,7 +2607,7 @@ function _isSigninWall(href) {
   return false;
 }
 
-async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAuth, skipAuth, _progressCallbackUrl, _stepIndex, _loginWallRetried = false, _emitThinking = null, _authOnly = false }) {
+async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAuth, skipAuth, manualLogin = false, preflightProbe = false, _progressCallbackUrl, _stepIndex, _loginWallRetried = false, _emitThinking = null, _authOnly = false }) {
   // Derive agentId from url hostname when caller omits it (LLM sometimes emits only url)
   let agentId = _agentIdArg;
   if (!agentId && url) {
@@ -2603,6 +2617,11 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
       agentId = `${_svc}.agent`;
       logger.info(`[browser.agent] run: derived agentId="${agentId}" from url="${url}"`);
     } catch (_) { /* malformed url — fall through to error below */ }
+  }
+  if (agentId && !agentId.endsWith('.agent')) {
+    const normalizedAgentId = `${agentId}.agent`;
+    logger.info(`[browser.agent] run: normalized bare agentId "${agentId}" → "${normalizedAgentId}"`);
+    agentId = normalizedAgentId;
   }
   if (!agentId) return { ok: false, error: 'agentId is required' };
   if (!task)    return { ok: false, error: 'task is required' };
@@ -2736,6 +2755,7 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
   })();
 
   logger.info(`[browser.agent] run agentId=${agentId} type=${agentType} task="${task}"`);
+  const _silentPreflightProbe = _authOnly && preflightProbe === true;
 
   // ── REST API path (api_key, bearer, basic) — multi-turn agentic loop ──
   if (agentType === 'api_key' || agentType === 'bearer' || agentType === 'basic') {
@@ -3022,9 +3042,9 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
       const _loadRes = await callBrowserAct({ action: 'state-load', sessionId, timeoutMs: 10000 }, 12000).catch(() => ({ ok: false }));
       if (_loadRes?.ok !== false) {
         // Navigate after injecting cookies — probe whether the session is still valid
-        const _stateNav = await callBrowserAct({ action: 'navigate', sessionId, url: startUrl, timeoutMs: 30000 }, 35000).catch(() => ({ ok: false }));
+        const _stateNav = await callBrowserAct({ action: 'navigate', sessionId, url: startUrl, timeoutMs: 30000, headed: _silentPreflightProbe ? false : undefined }, 35000).catch(() => ({ ok: false }));
         const _stateHrefRes = _stateNav?.ok !== false
-          ? await callBrowserAct({ action: 'evaluate', text: 'window.location.href', sessionId, timeoutMs: 5000 }, 8000).catch((err) => {
+          ? await callBrowserAct({ action: 'evaluate', text: 'window.location.href', sessionId, timeoutMs: 5000, headed: _silentPreflightProbe ? false : undefined }, 8000).catch((err) => {
               logger.error(`[browser.agent] auth-check eval failed (state persistence): ${err.message}`);
               return { ok: false, error: err.message };
             })
@@ -3149,7 +3169,7 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
 
       if (!_skipNavigate) try {
         logger.info(`[browser.agent] run: playwright auth-check — navigating to ${startUrl} for ${agentId}`);
-        const _probeNav = await callBrowserAct({ action: 'navigate', sessionId, url: startUrl, timeoutMs: 30000 }, 35000);
+        const _probeNav = await callBrowserAct({ action: 'navigate', sessionId, url: startUrl, timeoutMs: 30000, headed: _silentPreflightProbe ? false : undefined }, 35000);
 
         // ── Chrome session conflict detection — fail fast ──────────────────
         if (_isChromeSessionConflict(_probeNav)) {
@@ -3158,7 +3178,7 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
         }
 
         if (_probeNav?.ok !== false) {
-          const _hrefRes = await callBrowserAct({ action: 'evaluate', text: 'window.location.href', sessionId, timeoutMs: 5000 }, 8000).catch((err) => {
+          const _hrefRes = await callBrowserAct({ action: 'evaluate', text: 'window.location.href', sessionId, timeoutMs: 5000, headed: _silentPreflightProbe ? false : undefined }, 8000).catch((err) => {
             logger.error(`[browser.agent] auth-check eval failed (fresh check): ${err.message}`);
             return { ok: false, error: err.message };
           });
@@ -3314,40 +3334,52 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
       logger.info(`[browser.agent] run: login wall detected but skipAuth=true for ${agentId} — proceeding as guest`);
       _authNeeded = false;
     }
-    if (_authNeeded) {
-      // ── Resolve stored credentials via user.agent before opening auth form ──────
-      // user.agent calls profile.get which transparently decrypts SAFE: blobs so
-      // waitForAuth receives plaintext email + password for form auto-fill.
-      let _credentials = {};
-      try {
-        const credResult = await userAgent({ action: 'resolve_credentials', agentId });
-        if (credResult?.ok && credResult.resolved) {
-          _credentials = credResult.resolved;
-          const emailOk = !!_credentials.email;
-          const passOk  = !!_credentials.password;
-          logger.info(`[browser.agent] resolved credentials for ${agentId} (email ${emailOk ? '✓' : '✗'}, password ${passOk ? '✓' : '✗'})`);
-        }
-      } catch (_credErr) {
-        logger.warn(`[browser.agent] user.agent resolve_credentials failed (non-fatal): ${_credErr.message}`);
-      }
 
-      // ── Credential gate: prompt user if no email stored ─────────────────────
-      // Fires the existing ask_user short-circuit in executeCommand.js which
-      // surfaces the credential gather card and stores email/password securely.
-      // The user can type "skip" to proceed with manual login instead.
-      if (!_credentials.email) {
-        const _credNorm = agentId.toLowerCase().replace(/\.agent$/, '');
-        return {
-          ok:              false,
-          agentId,
-          task,
-          askUser:         true,
-          authType:        'browser_oauth',
-          question:        `What email or username do you use for ${agentId}? (It will be stored securely for future logins. Type "skip" to log in manually.)`,
-          options:         [],
-          needsCredentials: true,
-          credentialKey:   `credential:${_credNorm}.agent:email`,
-        };
+    // Silent preflight probe should never run interactive login. Signal auth needed and exit.
+    if (_authNeeded && _silentPreflightProbe) {
+      logger.info(`[browser.agent] run: preflightProbe detected auth-needed for ${agentId} — skipping interactive waitForAuth`);
+      return { ok: false, agentId, authed: false, authRequired: true, error: 'auth required' };
+    }
+
+    if (_authNeeded) {
+      let _credentials = {};
+      const _manualLogin = manualLogin === true;
+      if (_manualLogin) {
+        logger.info(`[browser.agent] manualLogin=true for ${agentId} — skipping credential resolution/autofill`);
+      } else {
+        // ── Resolve stored credentials via user.agent before opening auth form ──────
+        // user.agent calls profile.get which transparently decrypts SAFE: blobs so
+        // waitForAuth receives plaintext email + password for form auto-fill.
+        try {
+          const credResult = await userAgent({ action: 'resolve_credentials', agentId });
+          if (credResult?.ok && credResult.resolved) {
+            _credentials = credResult.resolved;
+            const emailOk = !!_credentials.email;
+            const passOk  = !!_credentials.password;
+            logger.info(`[browser.agent] resolved credentials for ${agentId} (email ${emailOk ? '✓' : '✗'}, password ${passOk ? '✓' : '✗'})`);
+          }
+        } catch (_credErr) {
+          logger.warn(`[browser.agent] user.agent resolve_credentials failed (non-fatal): ${_credErr.message}`);
+        }
+
+        // ── Credential gate: prompt user if no email stored ─────────────────────
+        // Fires the existing ask_user short-circuit in executeCommand.js which
+        // surfaces the credential gather card and stores email/password securely.
+        // The user can type "skip" to proceed with manual login instead.
+        if (!_credentials.email) {
+          const _credNorm = agentId.toLowerCase().replace(/\.agent$/, '');
+          return {
+            ok:              false,
+            agentId,
+            task,
+            askUser:         true,
+            authType:        'browser_oauth',
+            question:        `What email or username do you use for ${agentId}? (It will be stored securely for future logins. Type "skip" to log in manually.)`,
+            options:         [],
+            needsCredentials: true,
+            credentialKey:   `credential:${_credNorm}.agent:email`,
+          };
+        }
       }
 
       let authResult;
@@ -3358,6 +3390,7 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
           url: signInUrl || startUrl,
           authSuccessUrl: authSuccessPattern,
           credentials: _credentials,
+          noAutofill: _manualLogin,
           timeoutMs: 2 * 60 * 1000,
           _progressCallbackUrl,
         }, 3 * 60 * 1000);
@@ -3406,6 +3439,9 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
 
   // If this is an auth-only call, stop here.
   if (_authOnly) {
+    if (_silentPreflightProbe) {
+      await callBrowserAct({ action: 'close', sessionId, headed: false }, 8000).catch(() => {});
+    }
     logger.info(`[browser.agent] run: auth-only call complete for ${agentId}`);
     return { ok: true, agentId, authed: true, startUrl };
   }
@@ -5126,7 +5162,7 @@ async function actionRecordFailure({ id, failureEntry }) {
 // Ensures a browser or API-key agent has valid credentials/session before the
 // plan runs. Reuses actionRun's agent lookup + auth flow but stops as soon as
 // auth succeeds. Called from preflightAgents.
-async function actionAuthenticate({ agentId, task, url, skipAuth, _progressCallbackUrl }) {
+async function actionAuthenticate({ agentId, task, url, skipAuth, manualLogin = false, preflightProbe = false, _progressCallbackUrl }) {
   if (!agentId) return { ok: false, error: 'agentId is required' };
   const authTask = task || `Authenticate to ${agentId}`;
   return await actionRun({
@@ -5134,6 +5170,8 @@ async function actionAuthenticate({ agentId, task, url, skipAuth, _progressCallb
     task: authTask,
     url,
     skipAuth,
+    manualLogin,
+    preflightProbe,
     _progressCallbackUrl,
     _authOnly: true,
   });

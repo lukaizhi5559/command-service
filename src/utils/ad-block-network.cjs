@@ -211,6 +211,7 @@ function clearSession(sessionId) {
 
 module.exports = {
   setupInterception,
+  clearAdBlockSession: clearSession,
   clearSession,
   AD_NETWORK_DOMAINS,
 };

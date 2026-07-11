@@ -1838,6 +1838,7 @@ async function browserAct(args) {
     timeoutMs  = 15000,
     authSuccessUrl,
     credentials,
+    noAutofill = false,
     _progressCallbackUrl,
   } = args || {};
 
@@ -3708,6 +3709,7 @@ If no videos found, return []. Do not explain, only output the JSON array.`;
       // All page-transition waits are event-driven (URL change / element visibility)
       // rather than fixed sleeps. No hardcoded timing or branch logic.
       const _credentials = credentials || {};
+      if (!noAutofill) {
       try {
         const _hasEmail    = !!(_credentials.email);
         const _hasPassword = !!(_credentials.password);
@@ -3959,6 +3961,9 @@ If no videos found, return []. Do not explain, only output the JSON array.`;
         }
       } catch (_formErr) {
         logger.warn(`[browser.act] waitForAuth: form handler error (non-fatal): ${_formErr.message}`);
+      }
+      } else {
+        logger.info(`[browser.act] waitForAuth: noAutofill=true — skipping auth-loop form fill for session=${sessionId}`);
       }
 
       // ── Step 2: poll until auth wall clears ──────────────────────────────
