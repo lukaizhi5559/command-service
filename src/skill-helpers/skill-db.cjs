@@ -89,67 +89,115 @@ function httpGet(path, timeoutMs = 8000) {
   });
 }
 
+// ── MCP envelope helper ──────────────────────────────────────────────────────
+
+function mcpPost(action, payload, timeoutMs = 8000) {
+  const requestId = `skill-db-${action}-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+  return httpPost(`/${action}`, {
+    version: 'mcp.v1',
+    service: 'user-memory',
+    action,
+    requestId,
+    context: { userId: 'local_user' },
+    payload,
+  }, timeoutMs);
+}
+
+function makeKvKey(skillName, key) {
+  return `skill_kv:${String(skillName).toLowerCase()}:${key}`;
+}
+
 // ── Key-Value store ──────────────────────────────────────────────────────────
-// Uses the memory store with type='skill_kv', namespace=skillName, key=key
+// Backed by userProfile entries keyed as skill_kv:<skillName>:<key>
 
 async function set(skillName, key, value) {
-  const res = await httpPost('/memory.store', {
-    type: 'skill_kv',
-    namespace: skillName,
-    key,
-    value: typeof value === 'string' ? value : JSON.stringify(value),
-    overwrite: true,
-  });
-  return res?.success !== false;
+  try {
+    const res = await mcpPost('profile.set', {
+      key: makeKvKey(skillName, key),
+      valueRef: JSON.stringify(value),
+      service: skillName,
+    });
+    return res?.status === 'ok';
+  } catch (err) {
+    logger.warn(`[skill-db] set error: ${err.message}`);
+    return false;
+  }
 }
 
 async function get(skillName, key) {
-  const res = await httpPost('/memory.retrieve', {
-    type: 'skill_kv',
-    namespace: skillName,
-    key,
-  });
-  if (!res || !res.value) return null;
-  try { return JSON.parse(res.value); } catch (_) { return res.value; }
+  try {
+    const res = await mcpPost('profile.get', { key: makeKvKey(skillName, key) });
+    if (res?.status !== 'ok' || !res?.data?.valueRef) return null;
+    const value = res.data.valueRef;
+    try { return JSON.parse(value); } catch (_) { return value; }
+  } catch (err) {
+    logger.warn(`[skill-db] get error: ${err.message}`);
+    return null;
+  }
 }
 
 async function del(skillName, key) {
-  const res = await httpPost('/memory.delete', {
-    type: 'skill_kv',
-    namespace: skillName,
-    key,
-  });
-  return res?.success !== false;
+  try {
+    const res = await mcpPost('profile.delete', { key: makeKvKey(skillName, key) });
+    return res?.status === 'ok';
+  } catch (err) {
+    logger.warn(`[skill-db] del error: ${err.message}`);
+    return false;
+  }
 }
 
 async function list(skillName) {
-  const res = await httpPost('/memory.list', {
-    type: 'skill_kv',
-    namespace: skillName,
-  });
-  return Array.isArray(res?.items) ? res.items : [];
+  try {
+    const res = await mcpPost('profile.list', { service: skillName });
+    if (res?.status !== 'ok' || !Array.isArray(res?.data?.entries)) return [];
+    const prefix = `skill_kv:${String(skillName).toLowerCase()}:`;
+    return res.data.entries.map((entry) => {
+      const rawKey = entry.key || '';
+      const key = rawKey.startsWith(prefix) ? rawKey.slice(prefix.length) : rawKey;
+      let value = entry.valueRef;
+      try { value = JSON.parse(value); } catch (_) {}
+      return { key, value };
+    });
+  } catch (err) {
+    logger.warn(`[skill-db] list error: ${err.message}`);
+    return [];
+  }
 }
 
 // ── Semantic memory store ────────────────────────────────────────────────────
 
 async function remember(skillName, text, metadata = {}) {
-  const res = await httpPost('/memory.store', {
-    type: 'skill_memory',
-    namespace: skillName,
-    value: text,
-    metadata,
-  });
-  return res?.success !== false;
+  try {
+    const res = await mcpPost('memory.store', {
+      text,
+      type: 'skill_memory',
+      metadata: { namespace: skillName, ...metadata },
+    });
+    return res?.status === 'ok';
+  } catch (err) {
+    logger.warn(`[skill-db] remember error: ${err.message}`);
+    return false;
+  }
 }
 
 async function recall(skillName, query, topK = 5) {
-  const res = await httpPost('/memory.search', {
-    query,
-    type: 'skill_memory',
-    namespace: skillName,
-    topK,
-  });
-  return Array.isArray(res?.results) ? res.results : [];
+  try {
+    const res = await mcpPost('memory.search', {
+      query,
+      limit: topK,
+      filters: { type: 'skill_memory' },
+    });
+    const results = res?.data?.results;
+    if (!Array.isArray(results)) return [];
+    return results.map(r => ({
+      text: r.text || '',
+      metadata: r.metadata || {},
+      similarity: r.similarity || 0,
+    }));
+  } catch (err) {
+    logger.warn(`[skill-db] recall error: ${err.message}`);
+    return [];
+  }
 }
 
 // ── Context rules (per-site/app LLM prompt injection) ───────────────────────

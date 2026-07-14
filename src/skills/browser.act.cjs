@@ -327,6 +327,11 @@ function storeActionForDebugging(sessionId, actionData) {
 
 // Detect Chrome crash (about:blank) and trigger debugging repair
 async function detectAndHandleChromeCrash(sessionId, action, args, error) {
+  // If the session was intentionally closed (e.g. user cancelled), skip crash detection.
+  // The eval would re-launch Chrome and show an about:blank window to the user.
+  if (!openSessions.has(sessionId)) {
+    return { crashDetected: false };
+  }
   try {
     // Check if current page is about:blank (indicates Chrome crash)
     const checkResult = await cliRun([...sessionFlags(sessionId), 'eval', 'window.location.href'], 3000);
@@ -1837,6 +1842,7 @@ async function browserAct(args) {
     headed     = true,
     timeoutMs  = 15000,
     authSuccessUrl,
+    currentUrl,
     credentials,
     noAutofill = false,
     _progressCallbackUrl,
@@ -1922,7 +1928,7 @@ async function browserAct(args) {
             ...cmdArgs
           ].join(' ');
           
-          const fallbackResult = await shellRun.run({
+          const fallbackResult = await shellRun.shellRun({
             command: playwrightCmd,
             timeout: timeoutMs + 10000, // Extra timeout for fallback
             workingDir: process.cwd()
@@ -2122,11 +2128,13 @@ async function browserAct(args) {
     case 'reload':  return run(['reload'],     'reload');
 
     case 'close': {
+      // Remove from openSessions FIRST so concurrent poll loops (e.g. waitForAuth)
+      // see the session as gone immediately and don't spawn a new daemon.
+      openSessions.delete(sessionId);
       const res = await cliRun([...S, 'close'], timeoutMs);
       // Clear all per-tab cache entries for this session
       for (const k of snapshotCache.keys()) { if (k.startsWith(`${sessionId}:`)) snapshotCache.delete(k); }
       currentTabIndex.delete(sessionId);
-      openSessions.delete(sessionId);
       // Reset ad-block interception guard so next open re-registers routes + init script
       clearAdBlockSession(sessionId);
       return { ok: res.ok, action, sessionId, executionTime: Date.now() - start, error: res.ok ? undefined : res.error };
@@ -3696,12 +3704,28 @@ If no videos found, return []. Do not explain, only output the JSON array.`;
           alreadyOpen = await isDaemonAlive(sessionId, headed);
           if (alreadyOpen) openSessions.add(sessionId);
         }
-        const navCmd = alreadyOpen ? 'goto' : 'open';
-        if (!alreadyOpen) clearProfileLock(sessionId);
-        snapshotCache.delete(_tabKey(sessionId));
-        const navRes = await cliRun([...S, navCmd, ...(navCmd === 'open' ? openFlags() : []), url], navTimeout);
-        if (navRes.ok) openSessions.add(sessionId);
-        logger.info(`[browser.act] waitForAuth: navigated to ${url} on session=${sessionId} (cmd=${navCmd}, ok=${navRes.ok})`);
+        // Skip navigation if browser is already on the target login URL's hostname.
+        // currentUrl is passed by browser.agent (the URL it already probed) — avoids
+        // an extra eval call and brittle stdout regex parsing.
+        let _skipNav = false;
+        if (alreadyOpen && currentUrl) {
+          try {
+            const _curHost = new URL(currentUrl).hostname;
+            const _targetHost = new URL(url).hostname;
+            if (_curHost === _targetHost) {
+              _skipNav = true;
+              logger.info(`[browser.act] waitForAuth: already on ${_curHost} — skipping redundant navigation (session=${sessionId})`);
+            }
+          } catch (_) { /* URL parse failed — proceed with navigation */ }
+        }
+        if (!_skipNav) {
+          const navCmd = alreadyOpen ? 'goto' : 'open';
+          if (!alreadyOpen) clearProfileLock(sessionId);
+          snapshotCache.delete(_tabKey(sessionId));
+          const navRes = await cliRun([...S, navCmd, ...(navCmd === 'open' ? openFlags() : []), url], navTimeout);
+          if (navRes.ok) openSessions.add(sessionId);
+          logger.info(`[browser.act] waitForAuth: navigated to ${url} on session=${sessionId} (cmd=${navCmd}, ok=${navRes.ok})`);
+        }
       }
 
       // ── Step 1b: Agentic auth form loop ──────────────────────────────────
@@ -3980,6 +4004,12 @@ If no videos found, return []. Do not explain, only output the JSON array.`;
       while (Date.now() < deadline) {
         await new Promise(r2 => setTimeout(r2, pollInterval));
 
+        // Early exit if session was closed externally (e.g. cancel handler)
+        if (!openSessions.has(sessionId)) {
+          logger.info(`[browser.act] waitForAuth: session ${sessionId} closed externally — aborting poll`);
+          return { ok: false, action, sessionId, authTimedOut: true, error: 'Session closed (cancelled)', executionTime: Date.now() - start };
+        }
+
         try {
           // Two separate evals — playwright-cli JSON-stringifies results so \n in a
           // JS string literal becomes the two chars \ and n in stdout; combined eval
@@ -4008,6 +4038,48 @@ If no videos found, return []. Do not explain, only output the JSON array.`;
           const inAuthFlow = !!authOriginHost && currentHost === authOriginHost;
           if (inAuthFlow) {
             authWallDetections++;
+            // ── Metadata eval: title + robots noindex ────────────────────────
+            // Runs every poll to determine if the current page is still a login
+            // wall regardless of URL path or form structure. Works for:
+            // - Multi-step login (Google: email first, no password field on step 1)
+            // - Passkey flows (no traditional inputs)
+            // - 2FA screens (text/number input, not email/password)
+            // titleIsLogin OR isNoIndex = confirmed login wall → suppress same-domain success check
+            // hasUserGlobal = true → authenticated immediately (SPA injected user object)
+            let _pageMetaLoginWall = false;
+            let _pageMetaAuthed = false;
+            let _pageTitle = '';
+            try {
+              const _metaRes = await cliRun([...S, 'eval', `(() => {
+  const title = document.title || '';
+  const titleLower = title.toLowerCase();
+  const titleIsLogin = /sign.?in|log.?in|\\blogin\\b|authenticate|verify|two.factor|2fa/.test(titleLower);
+  const robotsMeta = document.querySelector('meta[name="robots"]');
+  const robotsContent = robotsMeta ? (robotsMeta.getAttribute('content') || '').toLowerCase() : '';
+  const isNoIndex = robotsContent.includes('noindex');
+  const hasUserGlobal = !!(window.__user || window.currentUser ||
+    (window.App && window.App.user) || (window.__INITIAL_STATE__ && window.__INITIAL_STATE__.user));
+  return JSON.stringify({ titleIsLogin, isNoIndex, hasUserGlobal, title });
+})()`], 3000);
+              const _metaRaw = (_metaRes.stdout || '').trim();
+              const _metaMatch = _metaRaw.match(/###\s*Result\s*\n([\s\S]*?)(?=###|$)/i);
+              const _metaStr = (_metaMatch ? _metaMatch[1].trim().replace(/^"|"$/g, '') : _metaRaw).trim();
+              const _meta = JSON.parse(_metaStr);
+              _pageTitle = _meta.title || '';
+              if (_meta.hasUserGlobal) {
+                logger.info(`[browser.act] waitForAuth: JS user global detected — auth complete for session=${sessionId}`);
+                _pageMetaAuthed = true;
+              } else {
+                _pageMetaLoginWall = _meta.titleIsLogin || _meta.isNoIndex;
+                logger.debug(`[browser.act] waitForAuth: meta check — title="${_meta.title}" titleIsLogin=${_meta.titleIsLogin} isNoIndex=${_meta.isNoIndex} loginWall=${_pageMetaLoginWall}`);
+              }
+            } catch (_metaErr) {
+              logger.debug(`[browser.act] waitForAuth: metadata eval failed (non-fatal): ${_metaErr.message}`);
+            }
+            // JS user global confirmed authenticated — return success immediately
+            if (_pageMetaAuthed) {
+              return { ok: true, action, sessionId, authResolved: true, executionTime: Date.now() - start };
+            }
             if (!loginNotificationSent) {
               loginNotificationSent = true;
               logger.info(`[browser.act] waitForAuth: auth wall confirmed — notifying user, continuing to poll session=${sessionId} loginUrl=${url}`);
@@ -4016,6 +4088,7 @@ If no videos found, return []. Do not explain, only output the JSON array.`;
                 const serviceDisplay = sessionId.replace('_agent', '');
                 const _payload = JSON.stringify({
                   type: 'needs_login', sessionId, loginUrl: url, serviceDisplay,
+                  pageTitle: _pageTitle,
                   message: `Please sign in to **${serviceDisplay}** in the Chrome window that just opened (${url}).`,
                 });
                 const _req = http.request({
@@ -4077,17 +4150,47 @@ If no videos found, return []. Do not explain, only output the JSON array.`;
               }
               return { ok: true, action, sessionId, authResolved: true, executionTime: Date.now() - start };
             }
-            // ── Same-domain path exit ────────────────────────────────────────
-            // Handles services like Notion where sign-in URL and workspace URL share
-            // the same hostname (notion.so/login → notion.so/onboarding).
-            // If the path has moved away from the sign-in path, auth is complete.
-            if (authSignInPath) {
+            // ── Same-domain auth success check ──────────────────────────────
+            // Uses authSuccessUrl (always populated from descriptor/seed/LLM) to
+            // determine if the browser has actually reached the authenticated app.
+            // Gated by metadata: if title or robots noindex still signals a login
+            // wall, suppress this check even if the URL pattern would match — this
+            // prevents SPAs that auto-redirect within the auth domain (e.g. ProtonMail
+            // account.proton.me/login → /mail while still unauthenticated) from
+            // producing a false positive.
+            //
+            // For cross-host services (ProtonMail, Gmail, Outlook): authSuccessUrl
+            // host differs from authOriginHost so the pattern never matches on the
+            // auth domain — State 1 (host-change) handles those correctly instead.
+            //
+            // For same-host services (Discord, Twitter, GitHub, Reddit): the
+            // authSuccessUrl substring IS present once the user lands on the app
+            // (e.g. discord.com/channels/@me includes 'discord.com/channels') ✓
+            if (authSuccessUrl) {
+              try {
+                const urlWithoutQuery = currentUrl.split('?')[0];
+                const currentPath = new URL(currentUrl).pathname;
+                const notOnLoginPath = !/\/(login|signin|sign-in|sign_in|auth|oauth|authorize)\b/i.test(currentPath);
+                // Metadata gate: skip success check if page still signals a login wall
+                const _metaSuppressed = _pageMetaLoginWall;
+                if (!_metaSuppressed && urlWithoutQuery.includes(authSuccessUrl) && notOnLoginPath) {
+                  logger.info(`[browser.act] waitForAuth: same-domain success pattern matched (${currentUrl}) for session=${sessionId}`);
+                  return { ok: true, action, sessionId, authResolved: true, executionTime: Date.now() - start };
+                }
+                if (_metaSuppressed && urlWithoutQuery.includes(authSuccessUrl)) {
+                  logger.debug(`[browser.act] waitForAuth: authSuccessUrl matched but metadata confirms still login wall — suppressing (${currentUrl})`);
+                }
+              } catch (_) {}
+            } else if (authSignInPath) {
               try {
                 const currentPath = new URL(currentUrl).pathname;
-                const leftLoginPage = currentPath !== authSignInPath &&
+                const elapsedMs = Date.now() - start;
+                const leftLoginPage = authWallDetections >= 3 &&
+                  elapsedMs >= 8000 &&
+                  currentPath !== authSignInPath &&
                   !/\/(login|signin|sign-in|sign_in|auth|oauth|authorize)\b/i.test(currentPath);
                 if (leftLoginPage) {
-                  logger.info(`[browser.act] waitForAuth: same-domain path exit — left login page (${authSignInPath} → ${currentPath}) for session=${sessionId}`);
+                  logger.info(`[browser.act] waitForAuth: same-domain path exit (no authSuccessUrl) — left login page (${authSignInPath} → ${currentPath}) for session=${sessionId}`);
                   return { ok: true, action, sessionId, authResolved: true, executionTime: Date.now() - start };
                 }
               } catch (_) {}

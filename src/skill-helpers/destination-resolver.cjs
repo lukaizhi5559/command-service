@@ -488,23 +488,51 @@ async function getLearnedCorrection(serviceKey, intent) {
 }
 
 /**
+ * Delete a learned correction from persistent storage.
+ * Returns true if the deletion succeeded (or no helper is available), false otherwise.
+ */
+async function deleteLearnedCorrection(serviceKey, intent) {
+  if (!skillDb) return false;
+  const key = `${serviceKey}:${intent}`;
+  try {
+    const ok = await skillDb.del(CORRECTION_NS, key);
+    if (ok) {
+      logger.info(`[destination-resolver] Deleted correction: ${key}`);
+    } else {
+      logger.warn(`[destination-resolver] deleteLearnedCorrection returned false for ${key}`);
+    }
+    return ok;
+  } catch (err) {
+    logger.warn(`[destination-resolver] deleteLearnedCorrection error for ${key}: ${err.message}`);
+    return false;
+  }
+}
+
+/**
  * Persist a successful destination correction.
  * Confidence grows with repeated hits (capped at 1.0).
+ * Returns true when the underlying write succeeds, false otherwise.
  */
 async function recordCorrection(serviceKey, intent, correctedUrl) {
-  if (!skillDb) return;
+  if (!skillDb) return false;
   try {
     const existing = await skillDb.get(CORRECTION_NS, `${serviceKey}:${intent}`);
     const prevHits  = existing?.hitCount || 0;
-    await skillDb.set(CORRECTION_NS, `${serviceKey}:${intent}`, {
+    const ok = await skillDb.set(CORRECTION_NS, `${serviceKey}:${intent}`, {
       correctedUrl,
       confidence:  Math.min(1.0, 0.70 + prevHits * 0.05),
       updatedAt:   Date.now(),
       hitCount:    prevHits + 1,
     });
-    logger.info(`[destination-resolver] Recorded: ${serviceKey}:${intent} → ${correctedUrl} (hits=${prevHits + 1})`);
+    if (ok) {
+      logger.info(`[destination-resolver] Recorded: ${serviceKey}:${intent} → ${correctedUrl} (hits=${prevHits + 1})`);
+    } else {
+      logger.warn(`[destination-resolver] Failed to record ${serviceKey}:${intent} → ${correctedUrl}`);
+    }
+    return ok;
   } catch (err) {
     logger.warn(`[destination-resolver] recordCorrection error: ${err.message}`);
+    return false;
   }
 }
 
@@ -761,6 +789,7 @@ module.exports = {
   resolveDestination,
   recordCorrection,
   getLearnedCorrection,
+  deleteLearnedCorrection,
   suggestTaskUrl,
   INTENTS,
 };

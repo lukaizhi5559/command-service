@@ -257,7 +257,7 @@ function getContentExtractionConfig(hostname) {
 
 const { userAgent } = require('./user.agent.cjs');
 
-const { resolveDestination, recordCorrection, classifyTaskIntent, classifyUrlType, getLearnedCorrection, suggestTaskUrl, INTENTS } = require('../skill-helpers/destination-resolver.cjs');
+const { resolveDestination, recordCorrection, classifyTaskIntent, classifyUrlType, getLearnedCorrection, deleteLearnedCorrection, suggestTaskUrl, INTENTS } = require('../skill-helpers/destination-resolver.cjs');
 const { killExistingChromeForProfile, clearProfileLock, findCli, shortSessionId } = require('./browser.act.cjs');
 
 const BROWSER_ACT_PORT = parseInt(process.env.COMMAND_SERVICE_PORT || '3007', 10);
@@ -2467,8 +2467,28 @@ async function resolveCredential(agentId, credName) {
  * expected service domain. Used before overriding startUrl. Returns true only if
  * navigation succeeds and the resulting page shows no obvious error.
  */
+function _isUnsafeDeepLinkUrl(candidateUrl, expectedHost = '') {
+  const candidate = String(candidateUrl || '');
+  const lower = candidate.toLowerCase();
+  if (!candidate) return true;
+  if (lower.includes('chrome-extension://') || lower.includes('chrome-extension%3a%2f%2f')) {
+    return true;
+  }
+  if (String(expectedHost || '').replace(/^www\./, '') === 'mail.google.com') {
+    if (/mail\.google\.com\/mail(?:\/u\/\d+)?\/?\?body=/i.test(candidate)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 async function verifyDeepLinkUrl(url, sessionId, expectedHost, timeoutMs = 15000) {
   try {
+    if (_isUnsafeDeepLinkUrl(url, expectedHost)) {
+      logger.warn(`[browser.agent] verifyDeepLinkUrl: rejected unsafe candidate for ${expectedHost}: ${url}`);
+      return false;
+    }
+
     const nav = await callSkill('browser.act', { action: 'navigate', url, sessionId, timeoutMs }, timeoutMs + 3000).catch(() => ({ ok: false }));
     if (!nav?.ok) return false;
 
@@ -2537,20 +2557,45 @@ async function _resolveTaskDeepLink(agentId, serviceKey, baseStartUrl, task) {
       catch (_) { return serviceKey; }
     })();
 
-    // 1. Try web.agent discover_task_url
-    let candidate = null;
-    try {
-      const webResult = await callSkill('web.agent', {
-        action: 'discover_task_url',
-        domain: baseHost,
-        task,
-      }, 15000);
-      if (webResult?.ok && webResult?.taskUrl) candidate = webResult.taskUrl;
-    } catch (webErr) {
-      logger.debug(`[browser.agent] deep-link: web.agent failed: ${webErr.message}`);
+    const _buildIntentTemplateUrl = () => {
+      const svc = String(serviceKey || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+      if (intent === INTENTS.MAIL) {
+        if (svc === 'gmail' || baseHost === 'mail.google.com') {
+          return 'https://mail.google.com/mail/u/0/#inbox?compose=new';
+        }
+      }
+      if (intent === INTENTS.SEARCH || isSearchLike) {
+        const qMatch = task.match(/\b(?:search|find|look\s*up|google)\s+(?:for\s+)?(.+?)$/i);
+        const q = qMatch?.[1] ? encodeURIComponent(String(qMatch[1]).trim().replace(/[?.!]+$/g, '')) : '';
+        if (!q) return null;
+        if (baseHost === 'google.com') return `https://www.google.com/search?q=${q}`;
+        if (baseHost === 'youtube.com') return `https://www.youtube.com/results?search_query=${q}`;
+        if (baseHost === 'w3schools.com') return `https://www.w3schools.com/search/search.asp?q=${q}`;
+      }
+      return null;
+    };
+
+    // 1. Prefer service intent templates for deterministic URL-first starts.
+    let candidate = _buildIntentTemplateUrl();
+    if (candidate) {
+      logger.info(`[browser.agent] deep-link: using intent template for ${agentId}: ${candidate}`);
     }
 
-    // 2. Fallback to LLM-suggested URL
+    // 2. Try web.agent discover_task_url
+    if (!candidate) {
+      try {
+        const webResult = await callSkill('web.agent', {
+          action: 'discover_task_url',
+          domain: baseHost,
+          task,
+        }, 15000);
+        if (webResult?.ok && webResult?.taskUrl) candidate = webResult.taskUrl;
+      } catch (webErr) {
+        logger.debug(`[browser.agent] deep-link: web.agent failed: ${webErr.message}`);
+      }
+    }
+
+    // 3. Fallback to LLM-suggested URL
     if (!candidate) {
       const suggestion = await suggestTaskUrl(serviceKey, baseStartUrl, intent, task);
       if (suggestion?.ok && suggestion?.url) candidate = suggestion.url;
@@ -2566,7 +2611,7 @@ async function _resolveTaskDeepLink(agentId, serviceKey, baseStartUrl, task) {
       return null;
     }
 
-    // 3. Security: must stay on expected domain or a subdomain
+    // 4. Security: must stay on expected domain or a subdomain
     const candidateHost = (() => {
       try { return new URL(candidate).hostname.replace(/^www\./, ''); }
       catch (_) { return ''; }
@@ -3016,6 +3061,7 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
     }
     let _authNeeded = false;
     let _skipNavigate = false;
+    let _curHref = '';
 
     // ── Auth state persistence strategy ──────────────────────────────────────
     // Persistent-profile sessions (*_agent) use Chrome's own cookie store at
@@ -3035,7 +3081,30 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
         logger.info(`[browser.agent] run: auth-check cache hit for ${agentId} (${Math.round((Date.now() - _cachedAuth.ts) / 1000)}s ago) — skipping auth probe`);
         _skipNavigate = true;
       } else {
-        logger.info(`[browser.agent] run: persistent-profile session — skipping JSON state-load, Chrome cookie store handles auth for ${agentId}`);
+        // ── DuckDB persistent auth fast-path ─────────────────────────────────
+        // Check if agent has a recorded auth that hasn't expired yet. This survives
+        // process restarts (in-memory cache doesn't). Non-fatal: falls through to
+        // full probe if DuckDB read fails or record is missing/expired.
+        try {
+          const _dbAuthRow = await withDb(async (db) => db.get(
+            `SELECT authed_at, auth_expires_at FROM agents WHERE id = ?`, agentId
+          ));
+          if (_dbAuthRow?.auth_expires_at) {
+            const _expiresMs = new Date(_dbAuthRow.auth_expires_at).getTime();
+            if (_expiresMs > Date.now()) {
+              logger.info(`[browser.agent] run: DuckDB auth fast-path for ${agentId} — auth valid until ${_dbAuthRow.auth_expires_at} — skipping preflight probe`);
+              _setCachedAuthCheck(agentId, false);
+              _skipNavigate = true;
+            } else {
+              logger.info(`[browser.agent] run: DuckDB auth expired for ${agentId} (was ${_dbAuthRow.auth_expires_at}) — running preflight probe`);
+            }
+          }
+        } catch (_dbFastPathErr) {
+          logger.debug(`[browser.agent] run: DuckDB auth fast-path check failed (non-fatal): ${_dbFastPathErr.message}`);
+        }
+        if (!_skipNavigate) {
+          logger.info(`[browser.agent] run: persistent-profile session — skipping JSON state-load, Chrome cookie store handles auth for ${agentId}`);
+        }
       }
     } else if (fs.existsSync(_stateFile)) {
       logger.info(`[browser.agent] run: state file found for ${agentId} — loading persisted auth state`);
@@ -3178,7 +3247,7 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
         }
 
         if (_probeNav?.ok !== false) {
-          const _hrefRes = await callBrowserAct({ action: 'evaluate', text: 'window.location.href', sessionId, timeoutMs: 5000, headed: _silentPreflightProbe ? false : undefined }, 8000).catch((err) => {
+          const _hrefRes = await callBrowserAct({ action: 'evaluate', text: 'window.location.href', sessionId, timeoutMs: 10000, headed: _silentPreflightProbe ? false : undefined }, 13000).catch((err) => {
             logger.error(`[browser.agent] auth-check eval failed (fresh check): ${err.message}`);
             return { ok: false, error: err.message };
           });
@@ -3197,8 +3266,8 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
             };
           }
 
-          const _curHref = String(_hrefRes?.result ?? _hrefRes?.stdout ?? '').trim();
-          const _onLoginPage = _isSigninWall(_curHref);
+          _curHref = String(_hrefRes?.result ?? _hrefRes?.stdout ?? '').trim();
+          let _onLoginPage = _isSigninWall(_curHref);
           // Also detect domain mismatch — e.g. redirect to workspace.google.com instead of mail.google.com
           let _wrongDomain = false;
           let _curHost = '';
@@ -3211,10 +3280,27 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
             _wrongDomain = !!_startHost && !!_curHost && _curBase !== _startBase;
           } catch (_) {}
 
+          // ── Auth success pattern mismatch detection ─────────────────────────────
+          // The service descriptor defines the URL substring that proves the user is
+          // logged in (e.g. app.slack.com/client for Slack). If the browser did not end
+          // up on that URL after navigating to startUrl, auth is required — even when
+          // the base domain is the same.
+          let _authSuccessMismatch = false;
+          if (authSuccessPattern && _curHref) {
+            const _curHrefLower = _curHref.toLowerCase();
+            const _patterns = authSuccessPattern.split(/[,|]/).map(p => p.trim().toLowerCase()).filter(Boolean);
+            _authSuccessMismatch = !_patterns.some(p => _curHrefLower.includes(p));
+            if (_authSuccessMismatch) {
+              logger.info(`[browser.agent] run: auth-check: auth_success_pattern mismatch for ${agentId} (expected ${authSuccessPattern}, got ${_curHref})`);
+            }
+          }
+
           // ── Parking/squatter detection via live page content ───────────────────
           // Checks page title + body text for broker/parking language. This is
           // content-based (not a hostname list) so it catches any parking provider.
           let _isParkingPage = false;
+          let _pageMetaLoginWall = false;
+          let _pageMetaAuthed = false;
           try {
             const _pageInfoRes = await callBrowserAct({
               action: 'evaluate',
@@ -3222,18 +3308,46 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
                 const title = document.title || '';
                 const body   = (document.body && document.body.innerText) ? document.body.innerText.slice(0, 800) : '';
                 const links  = document.querySelectorAll('a').length;
-                return JSON.stringify({ title, body, links });
+                const titleLower = title.toLowerCase();
+                const titleIsLogin = /sign.?in|log.?in|\\blogin\\b|authenticate|verify|two.factor|2fa/.test(titleLower);
+                const robotsMeta = document.querySelector('meta[name="robots"]');
+                const robotsContent = (robotsMeta ? robotsMeta.getAttribute('content') : '').toLowerCase();
+                const isNoIndex = robotsContent.includes('noindex');
+                const hasUserGlobal = !!(window.__user || window.currentUser ||
+                  (window.App && window.App.user) ||
+                  (window.__INITIAL_STATE__ && window.__INITIAL_STATE__.user));
+                return JSON.stringify({ title, body, links, titleIsLogin, isNoIndex, hasUserGlobal });
               })()`,
               sessionId,
               timeoutMs: 5000,
+              headed: _silentPreflightProbe ? false : undefined,
             }, 8000).catch(() => null);
             if (_pageInfoRes?.ok !== false) {
-              const _pageInfo = (() => { try { return JSON.parse(_pageInfoRes?.result ?? '{}'); } catch (_) { return {}; } })();
+              // browser.act evaluate auto-parses JSON, so result may already be an object.
+              // JSON.parse(object) throws — handle both object and string cases.
+              const _pageInfo = (typeof _pageInfoRes?.result === 'object' && _pageInfoRes.result !== null)
+                ? _pageInfoRes.result
+                : (() => { try { return JSON.parse(String(_pageInfoRes?.result ?? '{}')); } catch (_) { return {}; } })();
               const _pageText = `${_pageInfo.title || ''} ${_pageInfo.body || ''}`.toLowerCase();
               const _PARKING_RE = /\bdomain\s+(for\s+sale|is\s+for\s+sale|available\s+for\s+sale)\b|\bbuy\s+this\s+domain\b|\bmake\s+an?\s+offer\b|\bparked\s+(by|domain|page)\b|\binquire\s+about\s+this\s+domain\b|\bthis\s+domain\s+(may\s+be|is)\s+(for\s+sale|available)\b/;
               if (_PARKING_RE.test(_pageText) || (Number(_pageInfo.links) < 10 && /for\s+sale|buy|offer|domain/i.test(_pageText))) {
                 _isParkingPage = true;
                 logger.warn(`[browser.agent] run: parking/squatter content detected on ${_curHost} for ${agentId}`);
+              }
+
+              // ── Metadata-based login-wall / auth detection ────────────────────
+              // Reuses the same signals already validated in browser.act waitForAuth:
+              // title keywords + robots:noindex strongly indicate a login wall; a JS user
+              // global strongly indicates an authenticated app. This catches marketing
+              // homepages that redirect within the same base domain (e.g. Slack).
+              if (!_onLoginPage && !_wrongDomain) {
+                if (_pageInfo.hasUserGlobal) {
+                  _pageMetaAuthed = true;
+                  logger.info(`[browser.agent] run: auth-check JS user global detected — authenticated for ${agentId}`);
+                } else if (_pageInfo.titleIsLogin || _pageInfo.isNoIndex) {
+                  _pageMetaLoginWall = true;
+                  logger.info(`[browser.agent] run: auth-check metadata login wall for ${agentId} (title="${_pageInfo.title}" titleIsLogin=${_pageInfo.titleIsLogin} isNoIndex=${_pageInfo.isNoIndex})`);
+                }
               }
 
               // ── LLM-based auth detection — catches landing pages not detected by URL patterns ──
@@ -3257,10 +3371,9 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
           }
 
           // ── Internal web.agent self-heal ───────────────────────────────────────
-          // Trigger on: (a) domain mismatch OR (b) parking content detected on any domain.
-          // For domain mismatch that is NOT a parking page (e.g. workspace.google.com for mail.google.com),
-          // web.agent is tried first but if it finds nothing we fall through to waitForAuth — no regression.
-          const _needsHeal = _wrongDomain || _isParkingPage;
+          // Trigger ONLY for parking/squatter pages — domain mismatch (cross-domain redirect)
+          // is treated as an auth redirect and goes to waitForAuth instead.
+          const _needsHeal = _isParkingPage; // domain mismatch alone no longer triggers self-heal — cross-domain redirects are auth redirects, not broken URLs
           if (_needsHeal && !_onLoginPage) {
             const _svcName = existing?.service || agentId.replace('.agent', '');
             const _healReason = _isParkingPage ? `parking content on ${_curHost}` : `domain mismatch (expected ${(() => { try { return new URL(startUrl).hostname; } catch(_){return startUrl;} })()}, got ${_curHost})`;
@@ -3292,8 +3405,47 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
               logger.info(`[browser.agent] self-heal: retrying with corrected startUrl=${startUrl}`);
               const _retryNav = await callBrowserAct({ action: 'navigate', sessionId, url: startUrl, timeoutMs: 30000 }, 35000).catch(() => ({ ok: false }));
               if (_retryNav?.ok !== false) {
-                logger.info(`[browser.agent] self-heal: navigate to corrected URL succeeded — skipping waitForAuth`);
-                _setCachedAuthCheck(agentId, false);
+                // Re-probe the landed URL — self-heal may have landed on a marketing/landing page
+                // (e.g. proton.me/mail) rather than the authenticated inbox. Never assume
+                // navigate success = auth success.
+                let _healAuthNeeded = false;
+                try {
+                  const _healHrefRes = await callBrowserAct({ action: 'evaluate', text: 'window.location.href', sessionId, timeoutMs: 5000 }, 8000).catch(() => ({ ok: false }));
+                  const _healHref = String(_healHrefRes?.result ?? _healHrefRes?.stdout ?? '').trim();
+                  if (_healHref) {
+                    _curHref = _healHref;
+                    if (_isSigninWall(_healHref)) {
+                      _healAuthNeeded = true;
+                      logger.info(`[browser.agent] self-heal: corrected URL is a sign-in page by URL pattern (${_healHref}) — calling waitForAuth`);
+                    } else {
+                      // URL pattern didn't flag it — check page body via keyword + LLM (catches marketing/landing pages)
+                      const _healPageRes = await callBrowserAct({ action: 'evaluate', text: '(() => { const title = document.title || \'\'; const body = (document.body && document.body.innerText) ? document.body.innerText.slice(0, 800) : \'\'; return JSON.stringify({ title, body }); })()', sessionId, timeoutMs: 5000 }, 8000).catch(() => ({ ok: false }));
+                      // browser.act evaluate auto-parses JSON, so result may already be an object.
+                      // JSON.parse(object) throws — handle both object and string cases.
+                      const _healPageInfo = (typeof _healPageRes?.result === 'object' && _healPageRes.result !== null)
+                        ? _healPageRes.result
+                        : (() => { try { return JSON.parse(String(_healPageRes?.result ?? _healPageRes?.stdout ?? '{}')); } catch (_) { return {}; } })();
+                      const _healText = `${_healPageInfo.title || ''} ${_healPageInfo.body || ''}`;
+                      const _authIndicatorsRe = /sign\s*in|log\s*in|enter\s*your\s*email|workspace\s*not\s+found|where\s+should\s+we\s+begin|get\s+started|create\s+workspace|sign\s*in\s*to\s*continue|create\s+a\s+free\s+account/i;
+                      if (_authIndicatorsRe.test(_healText)) {
+                        logger.info(`[browser.agent] self-heal: auth indicators in page content after corrected nav — confirming with LLM for ${agentId}`);
+                        const _llmDetected = await _detectAuthViaLLM(_healPageInfo.title || '', _healPageInfo.body || '', agentId);
+                        if (_llmDetected) {
+                          _healAuthNeeded = true;
+                          logger.info(`[browser.agent] self-heal: LLM confirmed auth still required after corrected nav (${_healHref}) — calling waitForAuth`);
+                        }
+                      }
+                    }
+                  }
+                } catch (_healProbeErr) {
+                  logger.warn(`[browser.agent] self-heal: re-probe after corrected nav failed (non-fatal): ${_healProbeErr.message}`);
+                }
+                if (_healAuthNeeded) {
+                  _authNeeded = true;
+                } else {
+                  logger.info(`[browser.agent] self-heal: navigate to corrected URL succeeded and auth confirmed cleared — skipping waitForAuth`);
+                  _setCachedAuthCheck(agentId, false);
+                }
               } else {
                 logger.warn(`[browser.agent] self-heal: corrected URL navigate failed — failing fast`);
                 return { ok: false, agentId, task, wrongDomain: true, landedUrl: _curHref, expectedService: agentId, error: `Navigated to corrected URL ${startUrl} but browser failed to load it.` };
@@ -3308,10 +3460,16 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
               logger.info(`[browser.agent] self-heal: no better URL found for domain mismatch — falling back to waitForAuth`);
               _authNeeded = true;
             }
-          } else if (_onLoginPage || _wrongDomain) {
-            const _reason = _onLoginPage ? 'login redirect' : `domain mismatch (expected ${(() => { try { return new URL(startUrl).hostname; } catch(_){return startUrl;} })()}, got ${_curHost || _curHref})`;
+          } else if (_onLoginPage || _wrongDomain || _authSuccessMismatch || _pageMetaLoginWall) {
+            const _reason = _onLoginPage ? 'login redirect'
+              : _wrongDomain ? `domain mismatch (expected ${(() => { try { return new URL(startUrl).hostname; } catch(_){return startUrl;} })()}, got ${_curHost || _curHref})`
+              : _authSuccessMismatch ? `auth_success_pattern mismatch (expected ${authSuccessPattern}, got ${_curHref})`
+              : 'metadata login wall';
             logger.info(`[browser.agent] run: auth-check: ${_reason} — calling waitForAuth for ${agentId}`);
             _authNeeded = true;
+          } else if (_pageMetaAuthed) {
+            logger.info(`[browser.agent] run: auth-check: metadata indicates authenticated app — skipping waitForAuth for ${agentId}`);
+            _setCachedAuthCheck(agentId, false);
           } else {
             logger.info(`[browser.agent] run: auth-check: no login redirect${_curHref ? ` (${_curHref})` : ''} — skipping waitForAuth for ${agentId}`);
             _setCachedAuthCheck(agentId, false);
@@ -3338,6 +3496,7 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
     // Silent preflight probe should never run interactive login. Signal auth needed and exit.
     if (_authNeeded && _silentPreflightProbe) {
       logger.info(`[browser.agent] run: preflightProbe detected auth-needed for ${agentId} — skipping interactive waitForAuth`);
+      await callBrowserAct({ action: 'close', sessionId, headed: false }, 8000).catch(() => {});
       return { ok: false, agentId, authed: false, authRequired: true, error: 'auth required' };
     }
 
@@ -3388,6 +3547,7 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
           action: 'waitForAuth',
           sessionId,
           url: signInUrl || startUrl,
+          currentUrl: _curHref,
           authSuccessUrl: authSuccessPattern,
           credentials: _credentials,
           noAutofill: _manualLogin,
@@ -3396,36 +3556,57 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
         }, 3 * 60 * 1000);
       } catch (err) {
         const failureNote = `[${new Date().toISOString()}] waitForAuth threw: ${err.message} | url=${startUrl} | task=${task}`;
-        logger.warn(`[browser.agent] run: waitForAuth threw — triggering self-heal for ${agentId}`);
-        (async () => {
-          try {
-            await actionRecordFailure({ id: agentId, failureEntry: failureNote });
-            const healResult = await actionValidateAgent({ id: agentId });
-            logger.info(`[browser.agent] self-heal (throw): validate_agent verdict=${healResult?.verdict} for ${agentId}`);
-          } catch (healErr) {
-            logger.warn(`[browser.agent] self-heal error: ${healErr.message}`);
-          }
-        })();
+        logger.warn(`[browser.agent] run: waitForAuth threw for ${agentId}`);
+        if (!_authOnly) {
+          (async () => {
+            try {
+              await actionRecordFailure({ id: agentId, failureEntry: failureNote });
+              const healResult = await actionValidateAgent({ id: agentId });
+              logger.info(`[browser.agent] self-heal (throw): validate_agent verdict=${healResult?.verdict} for ${agentId}`);
+            } catch (healErr) {
+              logger.warn(`[browser.agent] self-heal error: ${healErr.message}`);
+            }
+          })();
+        }
         return { ok: false, error: `waitForAuth failed: ${err.message}` };
       }
       if (!authResult?.ok) {
         const failureNote = `[${new Date().toISOString()}] waitForAuth failed: ${authResult?.error || 'timeout'} | url=${startUrl} | task=${task}`;
-        logger.warn(`[browser.agent] run: auth failed — recording failure + triggering self-heal for ${agentId}`);
-        (async () => {
-          try {
-            await actionRecordFailure({ id: agentId, failureEntry: failureNote });
-            const healResult = await actionValidateAgent({ id: agentId });
-            logger.info(`[browser.agent] self-heal: validate_agent verdict=${healResult?.verdict} for ${agentId}`);
-          } catch (healErr) {
-            logger.warn(`[browser.agent] self-heal error: ${healErr.message}`);
-          }
-        })();
+        logger.warn(`[browser.agent] run: auth failed for ${agentId}`);
+        if (!_authOnly) {
+          (async () => {
+            try {
+              await actionRecordFailure({ id: agentId, failureEntry: failureNote });
+              const healResult = await actionValidateAgent({ id: agentId });
+              logger.info(`[browser.agent] self-heal: validate_agent verdict=${healResult?.verdict} for ${agentId}`);
+            } catch (healErr) {
+              logger.warn(`[browser.agent] self-heal error: ${healErr.message}`);
+            }
+          })();
+        }
         return { ok: false, error: `Auth failed for ${agentId}: ${authResult?.error}` };
       }
       // Persistent-profile sessions: the Chrome profile dir already persists cookies/IndexedDB.
       // JSON state-save is redundant for *_agent sessions and creates stale files that
       // interfere on next run (Google rejects injected JSON cookies). Skip it.
       _setCachedAuthCheck(agentId, false);
+      // Persist auth timestamp to DuckDB so future runs can fast-path past the preflight probe
+      // for 30 days (conservative — most OAuth sessions last at least this long).
+      (async () => {
+        try {
+          const _now = new Date().toISOString();
+          const _expires = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
+          await withDb(async (db) => {
+            await db.run(
+              `UPDATE agents SET authed_at = ?, auth_expires_at = ? WHERE id = ?`,
+              _now, _expires, agentId
+            );
+          });
+          logger.info(`[browser.agent] run: DuckDB auth record updated for ${agentId} (expires ${_expires})`);
+        } catch (_dbErr) {
+          logger.warn(`[browser.agent] run: DuckDB auth record update failed (non-fatal): ${_dbErr.message}`);
+        }
+      })();
       if (!_hasPersistentProfile) {
         logger.info(`[browser.agent] run: auth succeeded — saving browser state for ${agentId}`);
         await callBrowserAct({ action: 'state-save', sessionId, timeoutMs: 10000 }, 12000).catch(e => {
@@ -3439,6 +3620,8 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
 
   // If this is an auth-only call, stop here.
   if (_authOnly) {
+    // Headless preflight probes must close the browser so it doesn't stay open between
+    // preflight and actual plan execution. The persistent profile keeps cookies.
     if (_silentPreflightProbe) {
       await callBrowserAct({ action: 'close', sessionId, headed: false }, 8000).catch(() => {});
     }
@@ -3446,19 +3629,32 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
     return { ok: true, agentId, authed: true, startUrl };
   }
 
+  const _allowAutoGeneratedRecipes = process.env.THINKDROP_ALLOW_AUTOGENERATED_RECIPES === 'true';
+  let _urlFirstNavigationSelected = false;
+
   // ── Caller-provided direct URL takes priority (e.g. from planSkillsV2) ───────
   if (url) {
     try {
       const _callerUrl = new URL(url, startUrl).href;
       logger.info(`[browser.agent] run: using caller-provided url ${_callerUrl} for ${agentId}`);
       startUrl = _callerUrl;
+      _urlFirstNavigationSelected = true;
     } catch (_) {
       logger.warn(`[browser.agent] run: caller-provided url "${url}" is invalid — ignoring`);
     }
   } else {
     // ── Task-specific deep-link resolution ─────────────────────────────────────
     const _deepLink = await _resolveTaskDeepLink(agentId, _svcKey, startUrl, task);
-    if (_deepLink) startUrl = _deepLink;
+    if (_deepLink) {
+      startUrl = _deepLink;
+      _urlFirstNavigationSelected = true;
+    }
+  }
+
+  const _skipDeterministicRecipeReplay =
+    _urlFirstNavigationSelected && process.env.THINKDROP_REPLAY_WITH_DIRECT_URL !== 'true';
+  if (_skipDeterministicRecipeReplay) {
+    logger.info(`[browser.agent] run: URL-first selected for ${agentId} — deterministic recipe replay disabled`);
   }
 
   // Step 2: delegate to playwright.agent or agentbrowser.agent with the authenticated session
@@ -3667,12 +3863,13 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
     const trainerAgent = require('./trainer.agent.cjs');
     const _agentIdClean = agentId.replace('.agent', '');
     // Try fuzzy match on task text first, then fall back to single-recipe auto-inject
-    let recipe = trainerAgent.findMatchingRecipe(_agentIdClean, task);
+    let recipe = trainerAgent.findMatchingRecipe(_agentIdClean, task, { allowAutoGenerated: _allowAutoGeneratedRecipes });
     if (!recipe) {
       // Fallback: if this agent has exactly 1 trained recipe, auto-inject it
       const allSkills = trainerAgent.actionListSkills({ agentId: _agentIdClean });
-      if (allSkills.ok && allSkills.skills && allSkills.skills.length === 1) {
-        recipe = trainerAgent.loadRecipe(_agentIdClean, allSkills.skills[0].name);
+      const eligibleSkills = (allSkills?.skills || []).filter(s => _allowAutoGeneratedRecipes || s?.autoGenerated !== true);
+      if (allSkills.ok && eligibleSkills.length === 1) {
+        recipe = trainerAgent.loadRecipe(_agentIdClean, eligibleSkills[0].name);
         if (recipe) logger.info(`[browser.agent] run: auto-injecting sole trained recipe "${recipe.name}" for ${agentId}`);
       }
     }
@@ -3748,12 +3945,16 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
   let _activeRecipe = null;   // hoisted so recipe-doctor can access it at askUser time
   let _activeAgentIdClean = agentId.replace('.agent', '');
   let _extractedData = null; // WALT: stores extraction waypoint results
-  if (_trainedRecipeInjected) {
+  if (_trainedRecipeInjected && !_skipDeterministicRecipeReplay) {
     try {
       const trainerAgent = require('./trainer.agent.cjs');
       const _agentIdClean = _activeAgentIdClean;
-      const _execRecipe = trainerAgent.findMatchingRecipe(_agentIdClean, task)
-        || (() => { const ls = trainerAgent.actionListSkills({ agentId: _agentIdClean }); return (ls.ok && ls.skills?.length === 1) ? trainerAgent.loadRecipe(_agentIdClean, ls.skills[0].name) : null; })();
+      const _execRecipe = trainerAgent.findMatchingRecipe(_agentIdClean, task, { allowAutoGenerated: _allowAutoGeneratedRecipes })
+        || (() => {
+          const ls = trainerAgent.actionListSkills({ agentId: _agentIdClean });
+          const eligible = (ls?.skills || []).filter(s => _allowAutoGeneratedRecipes || s?.autoGenerated !== true);
+          return (ls.ok && eligible.length === 1) ? trainerAgent.loadRecipe(_agentIdClean, eligible[0].name) : null;
+        })();
 
       if (_execRecipe && _execRecipe.waypoints && _execRecipe.waypoints.length > 0) {
         _activeRecipe = _execRecipe; // hoist for recipe-doctor access at askUser time
@@ -4171,6 +4372,8 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
     } catch (_execErr) {
       logger.warn(`[browser.agent] recipe-exec: deterministic execution failed (non-fatal): ${_execErr.message}`);
     }
+  } else if (_trainedRecipeInjected && _skipDeterministicRecipeReplay) {
+    logger.info(`[browser.agent] recipe-exec: skipped deterministic replay because URL-first navigation was selected for ${agentId}`);
   }
 
   // ── Step 1c: Tier 2/3 nav context enrichment via web.agent / video.agent ──
@@ -4224,7 +4427,7 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
   //   Layer 2: web.agent discover_task_url (site-scoped + broad web search)
   //   Fallback: startUrl (service home/dashboard)
   let _deepLinkOverride = null;
-  if (!_trainedRecipeInjected) {
+  if (!_trainedRecipeInjected && !_urlFirstNavigationSelected) {
     try {
       const _serviceKey = (existing?.service || agentId.replace(/\.agent$/, '')).toLowerCase().replace(/[^a-z0-9]/g, '');
       const _intent = await classifyTaskIntent(task);
@@ -4235,7 +4438,12 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
       const _cached = await getLearnedCorrection(_serviceKey, _intent);
       if (_cached?.correctedUrl) {
         logger.info(`[browser.agent] deep-link: cached correction ${_cached.correctedUrl} (conf=${_cached.confidence.toFixed(2)}) for ${_serviceKey}:${_intent}`);
-        if (_cached.confidence >= 0.6) {
+        if (_isUnsafeDeepLinkUrl(_cached.correctedUrl, _baseHost)) {
+          logger.warn(`[browser.agent] deep-link: dropping unsafe cached correction for ${_serviceKey}:${_intent}: ${_cached.correctedUrl}`);
+          setImmediate(() => {
+            deleteLearnedCorrection(_serviceKey, _intent).catch(() => {});
+          });
+        } else if (_cached.confidence >= 0.6) {
           const _cachedValid = await verifyDeepLinkUrl(_cached.correctedUrl, sessionId, _baseHost, 15000);
           if (_cachedValid) {
             _deepLinkOverride = _cached.correctedUrl;
@@ -4243,8 +4451,7 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
           } else {
             logger.warn(`[browser.agent] deep-link: cached URL ${_cached.correctedUrl} failed validation — falling through to LLM/web search`);
             setImmediate(() => {
-              const skillDb = require('../skill-helpers/skill-db.cjs');
-              skillDb.del('nav-correction', `${_serviceKey}:${_intent}`).catch(() => {});
+              deleteLearnedCorrection(_serviceKey, _intent).catch(() => {});
             });
           }
         }
@@ -4255,13 +4462,17 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
         const _llmSuggest = await suggestTaskUrl(_serviceKey, startUrl, _intent, task);
         if (_llmSuggest?.ok && _llmSuggest.url) {
           logger.info(`[browser.agent] deep-link: LLM suggested URL for ${_serviceKey}:${_intent} → ${_llmSuggest.url}`);
-          const _llmValid = await verifyDeepLinkUrl(_llmSuggest.url, sessionId, _baseHost, 15000);
-          if (_llmValid) {
+          if (_isUnsafeDeepLinkUrl(_llmSuggest.url, _baseHost)) {
+            logger.warn(`[browser.agent] deep-link: rejected unsafe LLM URL for ${_serviceKey}:${_intent}: ${_llmSuggest.url}`);
+          } else {
+            const _llmValid = await verifyDeepLinkUrl(_llmSuggest.url, sessionId, _baseHost, 15000);
+            if (_llmValid) {
             _deepLinkOverride = _llmSuggest.url;
             logger.info(`[browser.agent] deep-link: verified LLM URL ${_llmSuggest.url} — overriding startUrl from ${startUrl}`);
             setImmediate(() => { recordCorrection(_serviceKey, _intent, _llmSuggest.url).catch(() => {}); });
-          } else {
-            logger.warn(`[browser.agent] deep-link: LLM URL ${_llmSuggest.url} failed validation — falling through to web search`);
+            } else {
+              logger.warn(`[browser.agent] deep-link: LLM URL ${_llmSuggest.url} failed validation — falling through to web search`);
+            }
           }
         }
       }
@@ -4292,6 +4503,14 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
         }
 
         if (_bestUrl) {
+        if (_isUnsafeDeepLinkUrl(_bestUrl, _baseHost)) {
+          logger.warn(`[browser.agent] deep-link: rejected unsafe discovery candidate for ${_serviceKey}:${_intent}: ${_bestUrl}`);
+          if (_bestSource === 'cache') {
+            setImmediate(() => {
+              deleteLearnedCorrection(_serviceKey, _intent).catch(() => {});
+            });
+          }
+        } else {
         // 4. Security: same domain check
         const _dlHost = (() => { try { return new URL(_bestUrl).hostname.replace(/^www\./, ''); } catch (_) { return ''; } })();
         if (_dlHost && (_dlHost === _baseHost || _dlHost.endsWith('.' + _baseHost) || _baseHost.endsWith('.' + _dlHost))) {
@@ -4309,13 +4528,13 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
             // If cached URL failed, clear it so we rediscover next time
             if (_bestSource === 'cache') {
               setImmediate(() => {
-                const skillDb = require('../skill-helpers/skill-db.cjs');
-                skillDb.del('nav-correction', `${_serviceKey}:${_intent}`).catch(() => {});
+                deleteLearnedCorrection(_serviceKey, _intent).catch(() => {});
               });
             }
           }
         } else {
           logger.warn(`[browser.agent] deep-link: ignored ${_bestUrl} — domain mismatch with ${startUrl}`);
+        }
         }
         } else {
         logger.info(`[browser.agent] deep-link: no suitable URL found${_dlResult?.error ? ' (' + _dlResult.error + ')' : ''} — using startUrl ${startUrl}`);
@@ -4324,6 +4543,8 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
     } catch (_dlErr) {
       logger.warn(`[browser.agent] deep-link discovery failed (non-fatal): ${_dlErr.message}`);
     }
+  } else if (_urlFirstNavigationSelected) {
+    logger.info(`[browser.agent] deep-link: skipping secondary discovery because URL-first navigation is already selected for ${agentId}`);
   }
 
   if (_deepLinkOverride) {
@@ -4349,7 +4570,7 @@ When extracting page content with run-code, prioritize these selectors over gene
 
   try {
     // If recipe was successfully executed, we're already on the target page - don't navigate
-    const _playwrightUrl = _recipeExecutedOk ? undefined : (url || (_useAgentBrowser ? startUrl : undefined));
+    const _playwrightUrl = _recipeExecutedOk ? undefined : ((_urlFirstNavigationSelected || _useAgentBrowser) ? startUrl : undefined);
     if (_recipeExecutedOk && url) {
         logger.info(`[browser.agent] run: recipe executed successfully - NOT passing URL to playwright.agent to stay on target page`);
     }
@@ -5043,7 +5264,13 @@ async function actionDeleteAgent({ id }) {
   const profileName = `${service}_agent`;
   const profileDir = path.join(os.homedir(), '.thinkdrop', 'browser-profiles', profileName);
   if (fs.existsSync(profileDir)) {
-    try { fs.rmSync(profileDir, { recursive: true, force: true }); deleted.push(profileDir); } catch (e) { errors.push(e.message); }
+    try { fs.rmSync(profileDir, { recursive: true, force: true }); deleted.push(profileDir); }
+    catch (e) {
+      // Retry after 1s — Chrome may still be releasing file handles
+      await new Promise(r => setTimeout(r, 1000));
+      try { fs.rmSync(profileDir, { recursive: true, force: true }); deleted.push(profileDir); }
+      catch (e2) { errors.push(`Profile dir: ${e2.message}`); }
+    }
   }
 
   // ── 5. AB-sessions auth JSON ─────────────────────────────────────────────────
@@ -5129,6 +5356,11 @@ async function actionDeleteAgent({ id }) {
     });
     deleted.push(`installed_skills rows for domain: ${service}`);
   } catch (e) { errors.push(`installed_skills cleanup: ${e.message}`); }
+
+  // ── 11. Clear in-memory auth check cache ───────────────────────────────────
+  _authCheckCache.delete(id.toLowerCase());
+  _authCheckCache.delete(id.replace(/\.agent$/, '').toLowerCase());
+  logger.info(`[browser.agent] delete_agent: cleared auth check cache for ${id}`);
 
   logger.info(`[browser.agent] delete_agent: removed ${deleted.length} artifacts for ${id}`, { deleted, errors });
   return { ok: true, deleted, errors };
@@ -5328,7 +5560,9 @@ function _generateAgentThinking(agentType, context) {
   return thoughts.join(' ');
 }
 
-module.exports = { browserAgent, KNOWN_BROWSER_SERVICES, actionDeleteAgent, _generateAgentThinking };
+module.exports = { browserAgent, KNOWN_BROWSER_SERVICES, actionDeleteAgent, _generateAgentThinking, clearAuthCaches: (agentId) => {
+  _authCheckCache.delete((agentId || '').toLowerCase());
+} };
 module.exports._deriveAgentType = deriveAgentType;
 module.exports.resolveCredential = resolveCredential;
 module.exports._profileGetValue = _profileGetValue;

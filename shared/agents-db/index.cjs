@@ -57,6 +57,11 @@ async function _getDb() {
       cli_tool TEXT, capabilities TEXT, descriptor TEXT, last_validated TIMESTAMP,
       failure_log TEXT, status TEXT NOT NULL DEFAULT 'healthy', created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )`);
+    // Migration: add auth tracking columns if they don't exist yet (safe on existing tables)
+    const _agentCols = await db.all(`SELECT column_name FROM information_schema.columns WHERE table_name = 'agents'`).catch(() => []);
+    const _colNames = (_agentCols || []).map(r => (r.column_name || r.COLUMN_NAME || '').toLowerCase());
+    if (!_colNames.includes('authed_at'))      await db.run(`ALTER TABLE agents ADD COLUMN authed_at TIMESTAMP`).catch(() => {});
+    if (!_colNames.includes('auth_expires_at')) await db.run(`ALTER TABLE agents ADD COLUMN auth_expires_at TIMESTAMP`).catch(() => {});
     await db.run(`CREATE TABLE IF NOT EXISTS browser_meta_cache (
       service TEXT PRIMARY KEY, meta_json TEXT NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )`);

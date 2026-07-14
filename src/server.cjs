@@ -473,6 +473,26 @@ class CommandServiceMCPServer {
         return;
       }
 
+      // ── GET /ping ─────────────────────────────────────────────────────────────
+      // Lightweight health/no-op used by StateGraph preflight checks.
+      if (req.method === 'GET' && req.url === '/ping') {
+        res.writeHead(200);
+        res.end(JSON.stringify({ success: true, status: 'ok', service: this.serviceName }));
+        return;
+      }
+
+      // ── POST /ping ────────────────────────────────────────────────────────────
+      // MCP-envelope no-op used by ThinkDropMCPClient preflight checks.
+      if (req.method === 'POST' && req.url === '/ping') {
+        let body = '';
+        req.on('data', chunk => { body += chunk; });
+        req.on('end', () => {
+          res.writeHead(200);
+          res.end(JSON.stringify({ success: true, status: 'ok', service: this.serviceName }));
+        });
+        return;
+      }
+
       // ── GET /agents.list ────────────────────────────────────────────────────
       // List all agents: DB rows merged with disk-scan of .agent.md files.
       // Disk-scan ensures agents that haven't been migrated to DB are visible.
