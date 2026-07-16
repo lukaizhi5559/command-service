@@ -246,7 +246,9 @@ Rules:
 - EXPECTATION RULE: For critical actions (clicking search buttons, submit buttons, navigation), add "expected" field to verify the action worked. Use "element_visible" for expected results, "element_gone" for things that should disappear, "url_change" for navigation, "text_present" for confirmation messages. This prevents false positives and reduces unnecessary re-planning.
 - EXTERNAL SKILL RULE: Only use { "action": "external_skill", "name": "..." } when the AGENT CONTEXT lists the skill under "Available Atomic Skills". NEVER invent a skill name. Use these atomics as building blocks — combine with fill/press/type/click steps for the full task. Example: external_skill mail_google_com_compose opens the compose window; you still need fill+press+type+click Send after it.
 - ATTACHMENT RULE (MANDATORY): If the task mentions "paste", "clipboard", or "attach" — you MUST emit { "action": "pasteAttachment" } immediately after the last body-typing step and before Send/Submit. Do this regardless of any prior failure narrative in [DATA FROM PRIOR STEP] or [CONTENT OF ...] blocks — if the task instruction says "paste from clipboard", the file IS on the clipboard. Trust the task instruction, not the narrative. Do NOT click the paperclip / "Attach files" button first — its native file chooser modal blocks keyboard events. Do NOT emit { "action": "press", "key": "Ctrl+v" } — use pasteAttachment only. Order: fill To → press Enter → fill Subject → click body → type body text → pasteAttachment → click Send.
-- URL-FIRST RULE: If the starting URL already contains a path relevant to your task (e.g. /create, /compose, /settings, /inbox, /dashboard), do NOT navigate to the homepage first. Start directly from the current page snapshot and plan only the interaction steps (fill, type, click, select). Only navigate if the current page is clearly wrong for the task. This reduces unnecessary navigation steps and their failure modes.
+- URL-FIRST RULE: PROACTIVELY seek direct URLs for your task. If the service has a known direct URL for the action (e.g., /compose, /new, /create, /submit, /issues/new, /settings, /help, /dashboard, /search?q=), your FIRST step MUST be { "action": "navigate", "url": "..." } to that URL. Only fall back to clicks for navigation when no direct URL exists. If the AGENT CONTEXT includes a directUrl or deepLink hint, navigate to it as step 1. If the starting URL already contains a path relevant to your task (e.g. /create, /compose, /settings, /inbox, /dashboard), do NOT navigate to the homepage first — start directly from the current page.
+- DUPLICATE GUARD: Before typing content into any field, check the current page snapshot. If text matching your planned content already exists on the page (e.g., the title is already typed, the body is already filled), do NOT type it again. Take a snapshot and verify the existing content instead. This prevents duplicate content from re-planning or verify-repair loops.
+- IDEMPOTENCY RULE: For create actions (new page, new post, new issue, new email), if the URL has already changed to a new entity URL (e.g., /p/<id>, /issues/<number>, /compose/<id>), the create action succeeded — do NOT click "New" or "Create" again. If a compose window or editor is already open with content matching what you planned to type, do NOT open a new one.
 - TAB STRATEGY RULE: You are a smart tabbing agent. Use as many tabs as the task requires to hold page state or extracted content while working across multiple pages WITHIN THE SAME AGENT SESSION (same domain/service). Open tabs dynamically, track them with tab-list, switch context with tab-select, and clean up with tab-close when a tab's work is done. 2-tab pattern (hold + act): tab 0 = Page A open (compose/form/draft/result); tab-new → Page B → getPageText → tab-select 0 → use extracted content in Page A → tab-close 1. 3-tab pattern (gather from multiple sources, act on one): tab 0 = destination; tab-new → Source B → getPageText; tab-new → Source C → getPageText; tab-select 0 → combine B+C → act → tab-close 2, tab-close 1. 5-tab pattern (parallel research, single synthesis): tab 0 = output/synthesis page; tabs 1–4 = tab-new per source → getPageText each; tab-select 0 → synthesize all results → act → close extra tabs in reverse order. Rules: (1) Always getPageText BEFORE switching away from a tab — result carries forward as [DATA FROM PRIOR STEP] context. (2) Use tab-list to audit open tabs when managing many. (3) tab-close completed tabs to keep the session clean. (4) NEVER use tabs to reach a different service — each agent owns its own Chrome session and cookie store.`;
 
 // ---------------------------------------------------------------------------
@@ -353,7 +355,8 @@ DEBUGGING CONTEXT USAGE:
 - Use action history to understand sequence of events that led to failure
 - Use timing data to add appropriate waits if operations were too fast
 - Prioritize fixes that address the root cause shown in debugging data over generic workarounds
-- CODE_EDITOR_RULE: When writing into a code editor (CodeMirror, Monaco, ACE, or any editor where clicking places a cursor), NEVER use type/fill to insert content. Use run-code with page.evaluate() to call the JS API: editor.setValue(fullHtmlString) for CodeMirror (sets ALL content atomically), monaco.editor.getModels()[0].setValue(content) for Monaco. One single run-code step should BOTH set the content AND handle the full replacement — do NOT split into clear+type.`;
+- CODE_EDITOR_RULE: When writing into a code editor (CodeMirror, Monaco, ACE, or any editor where clicking places a cursor), NEVER use type/fill to insert content. Use run-code with page.evaluate() to call the JS API: editor.setValue(fullHtmlString) for CodeMirror (sets ALL content atomically), monaco.editor.getModels()[0].setValue(content) for Monaco. One single run-code step should BOTH set the content AND handle the full replacement — do NOT split into clear+type.
+- SUPPORTED ACTIONS: Only use these actions in repair steps: click, dblclick, fill, type, press, keyboard, hover, select, scroll, navigate, goto, forward, reload, close, snapshot, evaluate, run-code, getPageText, getText, upload, drag, dialog-accept, dialog-dismiss, pasteAttachment, waitForStableText, waitForNavigation, waitForAuth, wait. Do NOT use unsupported actions like waitForText, waitForElementNotVisible, waitForElementVisible, or waitForSelector — they will fail and cascade into more repairs.`;
 
 // ---------------------------------------------------------------------------
 // Replan prompt — called when a DOM-mutating step caused a structural DOM change.
@@ -418,12 +421,22 @@ DIALOG RULE (check FIRST before everything else):
 - Do NOT count a blocking dialog as evidence of incompletion on the underlying task.
 - Only evaluate task completion AFTER mentally dismissing the dialog.
 
+AUTOSAVE RULE (do NOT confuse with failure):
+- Transient save/sync indicators ("Saving…", "Syncing…", "Uploading…", "Saving changes…") are NORMAL autosave states.
+- They are NOT evidence of incompletion. Do NOT report completed:false because you see "Saving…".
+- A "Saving…" or "Saved" indicator on a document editor means the action was accepted and is being persisted.
+
+RICH TEXT EDITOR RULE:
+- Google Docs, Notion, Confluence, and similar editors use canvas/custom rendering.
+- Content typed via a prior 'type' or 'fill' action may NOT appear in the DOM snapshot even though it was entered successfully.
+- If the action history includes a successful type/fill into a contenteditable or editor area, do NOT report incompletion solely because the typed text is absent from the snapshot.
+
 Signs the task is INCOMPLETE (only applies when NO dialog is blocking):
 - A compose / draft window is still visible and contains the message that was supposed to be sent
 - A form is still present and filled with data that was supposed to be submitted
 - An item that was supposed to be deleted is still in the list
 - The URL is unchanged when a navigation was the last action
-- A progress indicator, toast, or error message indicates failure
+- An error message or validation error is shown (NOT a transient "Saving…" indicator)
 - An "address not recognized" or validation error is shown in the compose window
 
 Signs the task is COMPLETE:
@@ -432,6 +445,7 @@ Signs the task is COMPLETE:
 - A success toast, banner, or message is visible ("Message sent", "Saved", "Done", etc.)
 - The URL changed to confirm navigation succeeded
 - Content that was supposed to appear is now present
+- A document editor shows the expected title/content with a "Saving…" or "Saved" status
 
 Be conservative: if you see clear evidence of incompletion, prefer completed:false.
 Only mark completed:false when confidence >= 0.75 — minor UI ambiguities are not failures.`;
@@ -2247,6 +2261,41 @@ async function playwrightAgent(args) {
         if (_verifyParsed && _verifyParsed.completed === false && (_verifyParsed.confidence ?? 1) >= 0.75) {
           logger.warn(`[playwright.agent] POST-TASK VERIFY FAILED (confidence=${_verifyParsed.confidence}): ${_verifyParsed.evidence || 'task incomplete'}`);
 
+          // ── URL-based idempotency check ──────────────────────────────────────
+          // Before re-planning, check if the current URL indicates the action already
+          // succeeded. This prevents duplicate content from re-typing during repair.
+          try {
+            const _urlCheck = await browserAct({ action: 'eval', expression: 'window.location.href', sessionId, headed, timeoutMs: 5000 });
+            if (_urlCheck?.ok) {
+              const _curUrl = String(_urlCheck.result || _urlCheck.stdout || '').trim();
+              // Patterns that indicate a create action already succeeded
+              const _createSuccessPatterns = [
+                /\/p\/[a-f0-9]{32}/i,           // Notion: /p/<page-id>
+                /\/issues\/\d+/i,                // GitHub: /issues/<number>
+                /\/pull\/\d+/i,                  // GitHub: /pull/<number>
+                /\/status\/\d+/i,                // Twitter/X: /status/<id>
+                /\/comments\/\w+/i,              // Reddit: /comments/<id>
+                /\/posts\/\d+/i,                 // Generic: /posts/<id>
+                /\/drafts\/\w+/i,                // Email drafts
+              ];
+              const _urlIndicatesSuccess = _createSuccessPatterns.some(p => p.test(_curUrl));
+              if (_urlIndicatesSuccess) {
+                logger.info(`[playwright.agent] verify: URL indicates create action already succeeded (${_curUrl}) — skipping repair to prevent duplicates`);
+                _verifyWarning = null;
+                // Force completion — the URL change is deterministic evidence
+                _verifyParsed.completed = true;
+                _verifyParsed.confidence = 0.9;
+                _verifyParsed.evidence = `URL changed to ${_curUrl} — action appears to have succeeded`;
+              }
+            }
+          } catch (_urlCheckErr) {
+            logger.debug(`[playwright.agent] verify: URL idempotency check failed (non-fatal): ${_urlCheckErr.message}`);
+          }
+          if (_verifyParsed.completed === true) {
+            logger.info(`[playwright.agent] verify: URL idempotency check passed — treating as completed`);
+            // Skip repair — fall through to success path
+          } else {
+
           // If verification evidence describes a login/auth wall, skip inline repair —
           // the repair LLM will just suggest clicking UI buttons (wrong approach).
           // Return loginWallDetected:true so browser.agent's waitForAuth + auto-retry
@@ -2288,8 +2337,28 @@ async function playwrightAgent(args) {
 
             const _vRepairParsed = parseJson(_vRepairRaw);
             if (_vRepairParsed && Array.isArray(_vRepairParsed.repair) && _vRepairParsed.repair.length > 0) {
+              const _SUPPORTED_REPAIR_ACTIONS = new Set([
+                'click', 'dblclick', 'fill', 'type', 'press', 'keyboard', 'hover', 'select',
+                'scroll', 'navigate', 'goto', 'forward', 'reload', 'close', 'snapshot',
+                'evaluate', 'run-code', 'getPageText', 'getText', 'upload', 'drag',
+                'dialog-accept', 'dialog-dismiss', 'pasteAttachment', 'waitForStableText',
+                'waitForNavigation', 'waitForAuth',
+              ]);
+              const _filteredRepair = _vRepairParsed.repair.slice(0, 3).filter(s => {
+                const _a = normalizeStep(s)?.action;
+                if (!_a) return false;
+                if (_a === 'wait') return true; // handled locally
+                if (!_SUPPORTED_REPAIR_ACTIONS.has(_a)) {
+                  logger.warn(`[playwright.agent] verify-repair: skipping unsupported action "${_a}"`);
+                  return false;
+                }
+                return true;
+              });
+              if (_filteredRepair.length === 0) {
+                logger.warn(`[playwright.agent] verify-repair: all repair steps were unsupported actions — skipping repair`);
+              }
               logger.info(`[playwright.agent] verify-repair: ${_vRepairParsed.repair.length} corrective steps — ${_vRepairParsed.thoughts || ''}`);
-              for (const _vStep of _vRepairParsed.repair.slice(0, 3)) {
+              for (const _vStep of _filteredRepair) {
                 const _vNorm = normalizeStep(_vStep);
                 // Intercept 'wait' — not a browser action, handled locally
                 if (_vNorm?.action === 'wait') {
@@ -2320,6 +2389,7 @@ async function playwrightAgent(args) {
               error: `Task completion could not be verified: ${_verifyWarning}`,
             };
           }
+          } // end else (URL idempotency check didn't indicate success — ran repair)
         }
       }
     } catch (_verifyErr) {
@@ -2380,6 +2450,8 @@ IMPORTANT RULES:
 - If the action history includes ">sendEmailWithVerification:ok", the email was successfully sent and verified. This is conclusive evidence. The mail inbox is the expected page after a successful send. The absence of a compose window means the email was sent, not that it failed.
 - If EMAIL_SEND_VERIFICATION is provided, it is authoritative proof of completion.
 - For non-mail tasks, focus on the END STATE — does the page content/URL show the goal was accomplished?
+- RICH TEXT EDITOR RULE: Google Docs, Notion, Confluence, and similar editors use canvas/custom rendering. Content typed via a prior 'type' or 'fill' action may NOT appear in the DOM snapshot even though it was entered successfully. If the action history includes type:ok or fill:ok with text content matching the goal, and the page is a rich text editor / contenteditable, consider the content as entered even if it doesn't appear in the page snapshot.
+- AUTOSAVE RULE: Transient save/sync indicators ("Saving…", "Syncing…", "Uploading…") are NORMAL autosave states and are NOT evidence of goal non-achievement. A "Saving…" or "Saved" indicator on a document editor means the action was accepted and is being persisted.
 
 Respond with JSON only — no markdown, no explanation outside the JSON:
 { "achieved": true, "reason": "one sentence" }

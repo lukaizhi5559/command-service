@@ -124,6 +124,7 @@ async function webCrawl(args) {
     maxChars  = 12000,
     timeoutMs = 20000,
     waitMs    = 1500,
+    extractLinks = false,
     onProgress = null,
   } = args || {};
 
@@ -196,6 +197,27 @@ async function webCrawl(args) {
 
     progress(`Crawl complete — ${contentLength} chars extracted${truncated ? ' (truncated)' : ''}`);
 
+    // Step 5: Optionally extract <a href> links from the page
+    let links = null;
+    if (extractLinks) {
+      progress('Extracting page links...');
+      const linkExpr = `() => Array.from(document.querySelectorAll('a[href]')).map(a => ({ href: a.href, text: (a.innerText || a.textContent || '').trim().slice(0, 100) })).filter(l => l.href && l.href.startsWith('http')).slice(0, 200)`;
+      const linkRes = await cliRun([...S, 'eval', linkExpr], 8000);
+      const linkRaw = unwrapEvalResult(linkRes.stdout);
+      try {
+        links = JSON.parse(linkRaw);
+      } catch (_) {
+        // Fallback: try to extract JSON array from the raw output
+        const jsonMatch = linkRaw.match(/\[[\s\S]*\]/);
+        if (jsonMatch) {
+          try { links = JSON.parse(jsonMatch[0]); } catch (_) { links = null; }
+        }
+      }
+      if (links && Array.isArray(links)) {
+        progress(`Extracted ${links.length} links from page`);
+      }
+    }
+
     return {
       ok: true,
       url: normalizedUrl,
@@ -203,6 +225,7 @@ async function webCrawl(args) {
       content,
       contentLength,
       truncated,
+      links,
       elapsedMs: Date.now() - startTime,
     };
 

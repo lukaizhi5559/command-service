@@ -6251,6 +6251,86 @@ async function actionRunAgent({ appName, task, filePath, prompt, maxDurationMs =
 }
 
 // ---------------------------------------------------------------------------
+// Action: check_installed — detect if a desktop app is installed
+// ---------------------------------------------------------------------------
+
+const APP_DOWNLOAD_URLS = {
+  'Notion': 'https://www.notion.so/desktop',
+  'Slack': 'https://slack.com/downloads',
+  'Discord': 'https://discord.com/download',
+  'Spotify': 'https://www.spotify.com/download',
+  'Zoom': 'https://zoom.us/download',
+  'Microsoft Teams': 'https://www.microsoft.com/en-us/microsoft-teams/download-app',
+  'Telegram': 'https://telegram.org/apps',
+  'WhatsApp': 'https://www.whatsapp.com/download',
+  'Figma': 'https://www.figma.com/downloads/',
+  'Visual Studio Code': 'https://code.visualstudio.com/download',
+  'Cursor': 'https://cursor.com/download',
+  'Windsurf': 'https://windsurf.com/download',
+};
+
+async function actionCheckInstalled({ appName } = {}) {
+  if (!appName) {
+    return { ok: false, error: 'appName is required' };
+  }
+
+  const { execSync } = require('child_process');
+  let installed = false;
+  let appPath = null;
+
+  // Method 1: Check /Applications/ directory
+  const appsDir = '/Applications';
+  if (fs.existsSync(appsDir)) {
+    try {
+      const entries = fs.readdirSync(appsDir);
+      const match = entries.find(e =>
+        e.toLowerCase().includes(appName.toLowerCase()) ||
+        appName.toLowerCase().includes(e.replace(/\.app$/i, '').toLowerCase())
+      );
+      if (match) {
+        appPath = path.join(appsDir, match);
+        installed = true;
+      }
+    } catch (_) {}
+  }
+
+  // Method 2: Spotlight mdfind (more thorough, finds apps in non-standard locations)
+  if (!installed) {
+    try {
+      const result = execSync(
+        `mdfind "kMDItemContentType == 'com.apple.application-bundle' && kMDItemDisplayName == '${appName.replace(/'/g, "\\'")}'" 2>/dev/null`,
+        { encoding: 'utf8', timeout: 5000 }
+      ).trim();
+      if (result) {
+        const lines = result.split('\n').filter(Boolean);
+        if (lines.length > 0) {
+          appPath = lines[0];
+          installed = true;
+        }
+      }
+    } catch (_) {}
+  }
+
+  // Method 3: Quick `open -a` test (fallback)
+  if (!installed) {
+    try {
+      execSync(`open -a "${appName}" --get-launch-info 2>/dev/null`, { encoding: 'utf8', timeout: 3000 });
+      installed = true;
+    } catch (_) {}
+  }
+
+  const downloadUrl = APP_DOWNLOAD_URLS[appName] || null;
+
+  return {
+    ok: true,
+    installed,
+    appPath,
+    downloadUrl,
+    appName,
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Action: build_agent — generate app.agent descriptor with shortcut playbooks
 // ---------------------------------------------------------------------------
 
@@ -6500,6 +6580,7 @@ module.exports = {
   actionTypeText,
   actionRunAgent,
   actionBuildAgent,
+  actionCheckInstalled,
   // Phase 3: Additional Use Cases
   actionMonitorFileUpload,
   actionMonitorBuildCompletion,

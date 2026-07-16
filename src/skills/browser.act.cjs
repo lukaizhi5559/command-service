@@ -1845,6 +1845,8 @@ async function browserAct(args) {
     currentUrl,
     credentials,
     noAutofill = false,
+    hostAliases,
+    postAuthUrl,
     _progressCallbackUrl,
   } = args || {};
 
@@ -2357,12 +2359,12 @@ async function browserAct(args) {
       let typeRes;
       if (_isChipField) {
         // Chip/combobox: type directly + Tab to confirm the chip (no Meta+a)
-        typeRes = await cliRun([...S, 'type', fillText], timeoutMs);
+        typeRes = await cliRun([...S, 'type', '--', fillText], timeoutMs);
         await cliRun([...S, 'press', 'Tab'], 2000).catch(() => {});
       } else {
         // Normal input: select-all to clear existing value, then type
         await cliRun([...S, 'press', 'Meta+a'], 3000).catch(() => {});
-        typeRes = await cliRun([...S, 'type', fillText], timeoutMs);
+        typeRes = await cliRun([...S, 'type', '--', fillText], timeoutMs);
       }
       logger.info(`[browser.act] fill type → exit ${typeRes.exitCode}`, { stderr: typeRes.stderr?.slice(0, 200) });
 
@@ -2381,7 +2383,7 @@ async function browserAct(args) {
     }
 
     case 'type': {
-      return run(['type', text || ''], `type "${text}"`);
+      return run(['type', '--', text || ''], `type "${text}"`);
     }
 
     // ── Hover ────────────────────────────────────────────────────────────────
@@ -2397,7 +2399,7 @@ async function browserAct(args) {
       await captureSnapshot(sessionId, headed, timeoutMs);
       const rawSelRef = resolveRef(sessionId, selector);
       const selTarget = (rawSelRef && /^e\d+$/i.test(rawSelRef) ? rawSelRef : null) || selector;
-      return run(['select', selTarget, value || ''], `select ${selTarget}`);
+      return run(['select', '--', selTarget, value || ''], `select ${selTarget}`);
     }
 
     // ── Check / Uncheck ──────────────────────────────────────────────────────
@@ -3314,7 +3316,7 @@ If no videos found, return []. Do not explain, only output the JSON array.`;
     case 'evaluate': {
       const expr = text || selector || args.expression || '';
       const evalRef = args.ref || null;
-      const evalArgs = evalRef ? ['eval', expr, evalRef] : ['eval', expr];
+      const evalArgs = evalRef ? ['eval', '--', expr, evalRef] : ['eval', '--', expr];
       const evalRes = await run(evalArgs, `eval "${expr.slice(0, 60)}"`);
       if (!evalRes.ok) return evalRes;
       
@@ -3356,7 +3358,7 @@ If no videos found, return []. Do not explain, only output the JSON array.`;
       if (!isWrapped) {
         code = `async page => {\n${code}\n}`;
       }
-      const rcRes = await cliRun([...S, 'run-code', code], timeoutMs);
+      const rcRes = await cliRun([...S, 'run-code', '--', code], timeoutMs);
       logger.info(`[browser.act] run-code → exit ${rcRes.exitCode}`, { stderr: rcRes.stderr?.slice(0, 200) });
       // Extract the result value from "### Result\n<value>" in stdout
       const rcStdout = rcRes.stdout || '';
@@ -3375,7 +3377,7 @@ If no videos found, return []. Do not explain, only output the JSON array.`;
     // ── dialog-accept / dialog-dismiss ────────────────────────────────────────
     case 'dialog-accept': {
       const prompt = args.prompt || text || undefined;
-      return run(prompt ? ['dialog-accept', prompt] : ['dialog-accept'], 'dialog-accept');
+      return run(prompt ? ['dialog-accept', '--', prompt] : ['dialog-accept'], 'dialog-accept');
     }
     case 'dialog-dismiss': {
       return run(['dialog-dismiss'], 'dialog-dismiss');
@@ -3678,10 +3680,26 @@ If no videos found, return []. Do not explain, only output the JSON array.`;
       // URL-host state machine — no hardcoded domain lists.
       // authOriginHost = hostname of the sign-in URL (e.g. 'accounts.google.com').
       // Derived dynamically at runtime so any OAuth provider works automatically.
+      // hostAliases = optional array of equivalent hostnames (e.g. notion.so ↔ notion.com).
       //
-      //  IN_AUTH_FLOW: currentHost === authOriginHost  (email, pwd, 2FA, consent, etc.)
-      //  SUCCESS:      currentHost !== authOriginHost  AND urlWithoutQuery includes authSuccessUrl
-      //  LIMBO:        currentHost !== authOriginHost  AND NOT at authSuccessUrl
+      //  IN_AUTH_FLOW: isHostEquivalent(currentHost, authOriginHost)  (email, pwd, 2FA, consent, etc.)
+      //  SUCCESS:      !isHostEquivalent(currentHost, authOriginHost) AND urlWithoutQuery includes authSuccessUrl
+      //  LIMBO:        !isHostEquivalent(currentHost, authOriginHost) AND NOT at authSuccessUrl
+      const _aliases = Array.isArray(hostAliases) ? hostAliases.map(h => String(h).toLowerCase()).filter(Boolean) : [];
+      const isHostEquivalent = (a, b) => {
+        if (!a || !b) return false;
+        const ah = a.toLowerCase(), bh = b.toLowerCase();
+        if (ah === bh) return true;
+        const ab = ah.split('.').slice(-2).join('.');
+        const bb = bh.split('.').slice(-2).join('.');
+        if (ab === bb) return true;
+        for (const alias of _aliases) {
+          const alb = alias.split('.').slice(-2).join('.');
+          if (alb === ab || alb === bb) return true;
+          if (alias === ah || alias === bh) return true;
+        }
+        return false;
+      };
       let authOriginHost = null;
       let authSignInPath   = null; // for same-domain path exit (e.g. notion.so/login → notion.so/onboarding)
       try { if (url) { const _u = new URL(url); authOriginHost = _u.hostname; authSignInPath = _u.pathname; } } catch (_) {}
@@ -3712,9 +3730,9 @@ If no videos found, return []. Do not explain, only output the JSON array.`;
           try {
             const _curHost = new URL(currentUrl).hostname;
             const _targetHost = new URL(url).hostname;
-            if (_curHost === _targetHost) {
+            if (isHostEquivalent(_curHost, _targetHost)) {
               _skipNav = true;
-              logger.info(`[browser.act] waitForAuth: already on ${_curHost} — skipping redundant navigation (session=${sessionId})`);
+              logger.info(`[browser.act] waitForAuth: already on ${_curHost} (equivalent to ${_targetHost}) — skipping redundant navigation (session=${sessionId})`);
             }
           } catch (_) { /* URL parse failed — proceed with navigation */ }
         }
@@ -3832,7 +3850,7 @@ If no videos found, return []. Do not explain, only output the JSON array.`;
           const _luProbe = await cliRun([...S, 'eval', 'location.href'], 5000).catch(() => ({}));
           const _luUrl   = _parseUrl(_luProbe.stdout);
           const _luHost  = _luUrl ? (() => { try { return new URL(_luUrl).hostname; } catch (_) { return ''; } })() : '';
-          if (authOriginHost && _luHost && _luHost !== authOriginHost) {
+          if (authOriginHost && _luHost && !isHostEquivalent(_luHost, authOriginHost)) {
             logger.info(`[browser.act] waitForAuth: auth-loop step ${_step + 1} — navigated away from auth domain (${_luHost}), done`);
             break;
           }
@@ -3879,7 +3897,7 @@ If no videos found, return []. Do not explain, only output the JSON array.`;
             await cliRun([...S, 'click', _visSel], 5000).catch(() => {});
             await new Promise(r => setTimeout(r, 150));
             await cliRun([...S, 'press', 'Meta+a'], 3000).catch(() => {});
-            await cliRun([...S, 'type', _credentials.email], 8000).catch(() => {});
+            await cliRun([...S, 'type', '--', _credentials.email], 8000).catch(() => {});
             _loopFilledEmail = true;
             _actionHistory.push('fill_email');
 
@@ -3896,7 +3914,7 @@ If no videos found, return []. Do not explain, only output the JSON array.`;
             await cliRun([...S, 'click', _visSel], 5000).catch(() => {});
             await new Promise(r => setTimeout(r, 150));
             await cliRun([...S, 'press', 'Meta+a'], 3000).catch(() => {});
-            await cliRun([...S, 'type', _credentials.password], 8000).catch(() => {});
+            await cliRun([...S, 'type', '--', _credentials.password], 8000).catch(() => {});
             _loopFilledPassword = true;
             _actionHistory.push('fill_password');
 
@@ -4026,16 +4044,16 @@ If no videos found, return []. Do not explain, only output the JSON array.`;
 
           // State 1: SUCCESS — different host from auth domain AND at success URL
           const atSuccess = authSuccessUrl
-            ? (urlWithoutQuery.includes(authSuccessUrl) && currentHost !== authOriginHost)
-            : (!!currentHost && !!authOriginHost && currentHost !== authOriginHost);
+            ? (urlWithoutQuery.includes(authSuccessUrl) && !isHostEquivalent(currentHost, authOriginHost))
+            : (!!currentHost && !!authOriginHost && !isHostEquivalent(currentHost, authOriginHost));
           if (atSuccess) {
             logger.info(`[browser.act] waitForAuth: success URL matched (${currentUrl}) for session=${sessionId}`);
             return { ok: true, action, sessionId, authResolved: true, executionTime: Date.now() - start };
           }
 
-          // State 2: IN AUTH FLOW — same hostname as sign-in URL
+          // State 2: IN AUTH FLOW — same hostname as sign-in URL (or a configured alias)
           // Covers: email entry, password challenge, 2FA, MFA, consent screen — never navigate away
-          const inAuthFlow = !!authOriginHost && currentHost === authOriginHost;
+          const inAuthFlow = !!authOriginHost && isHostEquivalent(currentHost, authOriginHost);
           if (inAuthFlow) {
             authWallDetections++;
             // ── Metadata eval: title + robots noindex ────────────────────────
@@ -4059,13 +4077,24 @@ If no videos found, return []. Do not explain, only output the JSON array.`;
   const isNoIndex = robotsContent.includes('noindex');
   const hasUserGlobal = !!(window.__user || window.currentUser ||
     (window.App && window.App.user) || (window.__INITIAL_STATE__ && window.__INITIAL_STATE__.user));
-  return JSON.stringify({ titleIsLogin, isNoIndex, hasUserGlobal, title });
+  const signInLinks = document.querySelectorAll(
+    'a[href*="login"], a[href*="signin"], a[href*="sign-in"], a[href*="signup"], a[href*="register"]'
+  );
+  const signInButtons = Array.from(
+    document.querySelectorAll('button, a[role="button"], [data-testid]')
+  ).filter(el => {
+    const text = (el.textContent || el.innerText || '').toLowerCase().trim();
+    return /^(sign\s*in|log\s*in|sign\s*up|register)\b/.test(text);
+  });
+  const hasSignInButton = signInLinks.length > 0 || signInButtons.length > 0;
+  return JSON.stringify({ titleIsLogin, isNoIndex, hasUserGlobal, title, hasSignInButton });
 })()`], 3000);
               const _metaRaw = (_metaRes.stdout || '').trim();
               const _metaMatch = _metaRaw.match(/###\s*Result\s*\n([\s\S]*?)(?=###|$)/i);
               const _metaStr = (_metaMatch ? _metaMatch[1].trim().replace(/^"|"$/g, '') : _metaRaw).trim();
               const _meta = JSON.parse(_metaStr);
               _pageTitle = _meta.title || '';
+              let _hasSignInButton = !!_meta.hasSignInButton;
               if (_meta.hasUserGlobal) {
                 logger.info(`[browser.act] waitForAuth: JS user global detected — auth complete for session=${sessionId}`);
                 _pageMetaAuthed = true;
@@ -4173,7 +4202,7 @@ If no videos found, return []. Do not explain, only output the JSON array.`;
                 const notOnLoginPath = !/\/(login|signin|sign-in|sign_in|auth|oauth|authorize)\b/i.test(currentPath);
                 // Metadata gate: skip success check if page still signals a login wall
                 const _metaSuppressed = _pageMetaLoginWall;
-                if (!_metaSuppressed && urlWithoutQuery.includes(authSuccessUrl) && notOnLoginPath) {
+                if (!_metaSuppressed && urlWithoutQuery.includes(authSuccessUrl) && notOnLoginPath && !_hasSignInButton) {
                   logger.info(`[browser.act] waitForAuth: same-domain success pattern matched (${currentUrl}) for session=${sessionId}`);
                   return { ok: true, action, sessionId, authResolved: true, executionTime: Date.now() - start };
                 }
@@ -4244,11 +4273,13 @@ If no videos found, return []. Do not explain, only output the JSON array.`;
             if (url) await cliRun([...S, 'goto', url], 15000).catch(() => {});
             lastLimboUrl = null;
           } else {
-            // First time at this intermediate URL — navigate toward authSuccessUrl only if it
-            // is a full navigable URL. Pattern substrings (e.g. 'notion.com') are not valid
-            // goto targets and cause a redirect oscillation loop.
+            // First time at this intermediate URL — navigate toward the canonical post-auth URL.
+            // Prefer postAuthUrl (a full navigable URL) over authSuccessUrl (which may be a bare pattern).
             lastLimboUrl = currentUrl;
-            if (/^https?:\/\//i.test(authSuccessUrl)) {
+            if (postAuthUrl && /^https?:\/\//i.test(postAuthUrl)) {
+              logger.info(`[browser.act] waitForAuth: limbo state (${currentUrl}) — navigating to postAuthUrl=${postAuthUrl} for session=${sessionId}`);
+              await cliRun([...S, 'goto', postAuthUrl], 15000).catch(() => {});
+            } else if (/^https?:\/\//i.test(authSuccessUrl)) {
               logger.info(`[browser.act] waitForAuth: limbo state (${currentUrl}) — navigating to authSuccessUrl=${authSuccessUrl} for session=${sessionId}`);
               await cliRun([...S, 'goto', authSuccessUrl], 15000).catch(() => {});
             } else {

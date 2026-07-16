@@ -304,7 +304,7 @@ const KNOWN_BROWSER_SERVICES = {
   google:         { startUrl: 'https://accounts.google.com',                     signInUrl: 'https://accounts.google.com',                       authSuccessPattern: 'myaccount.google.com',         isOAuth: true  },
   slack:          { startUrl: 'https://app.slack.com',                           signInUrl: 'https://slack.com/signin',                          authSuccessPattern: 'app.slack.com/client',         isOAuth: true  },
   discord:        { startUrl: 'https://discord.com/channels/@me',                signInUrl: 'https://discord.com/login',                         authSuccessPattern: 'discord.com/channels',         isOAuth: true  },
-  notion:         { startUrl: 'https://www.notion.so',                           signInUrl: 'https://www.notion.so/login',                       authSuccessPattern: 'notion.so',                    isOAuth: true, preferAgentBrowser: true, postAuthUrl: 'https://www.notion.so', usePersistentProfile: true  },
+  notion:         { startUrl: 'https://app.notion.com',                           signInUrl: 'https://www.notion.com/login',                       authSuccessPattern: 'app.notion.com',                    isOAuth: true, preferAgentBrowser: true, postAuthUrl: 'https://app.notion.com', usePersistentProfile: true, hostAliases: ['www.notion.so', 'www.notion.com', 'notion.so', 'notion.com'], _metaRevision: 2  },
   figma:          { startUrl: 'https://www.figma.com',                           signInUrl: 'https://www.figma.com/login',                       authSuccessPattern: 'figma.com/files',              isOAuth: true  },
   linear:         { startUrl: 'https://linear.app',                              signInUrl: 'https://linear.app/login',                          authSuccessPattern: 'linear.app/',                  isOAuth: true  },
   jira:           { startUrl: 'https://id.atlassian.com',                        signInUrl: 'https://id.atlassian.com',                          authSuccessPattern: 'atlassian.net',                isOAuth: true  },
@@ -599,6 +599,31 @@ function lookupBrowserService(service) {
   return entry;
 }
 
+// Check if currentHost is equivalent to expectedHost, considering configured host aliases.
+// Aliases are normalized to hostnames only (no scheme/path). Only configured aliases may
+// bypass cross-host rejection — redirects to unconfigured hosts are still treated as mismatches.
+function isHostAlias(currentHost, expectedHost, aliases) {
+  if (!currentHost || !expectedHost) return false;
+  const ch = currentHost.toLowerCase();
+  const eh = expectedHost.toLowerCase();
+  if (ch === eh) return true;
+  // Compare base domains (last two labels) as a baseline
+  const cb = ch.split('.').slice(-2).join('.');
+  const eb = eh.split('.').slice(-2).join('.');
+  if (cb === eb) return true;
+  // Check explicit aliases
+  if (aliases && aliases.length > 0) {
+    const aliasSet = new Set(aliases.map(a => a.toLowerCase()));
+    if (aliasSet.has(ch) || aliasSet.has(eh)) return true;
+    // Also check base-domain of aliases
+    for (const a of aliasSet) {
+      const ab = a.split('.').slice(-2).join('.');
+      if (ab === cb || ab === eb) return true;
+    }
+  }
+  return false;
+}
+
 // ---------------------------------------------------------------------------
 // LLM-driven browser service meta resolution — for services not in seed map.
 // Result cached in DuckDB so LLM is called at most once per service.
@@ -640,7 +665,7 @@ CRITICAL rules:
 // ---------------------------------------------------------------------------
 const PLAYBOOK_SEED_MAP = {
   gmail: `### Compose & Send Email (compose, send, email, draft, write, message)
-1. Click the Compose button: { "action": "click", "selector": "div[gh='cm']" }
+1. Navigate to compose URL: { "action": "navigate", "url": "https://mail.google.com/mail/u/0/#inbox?compose=new" }
 2. Wait for compose window: { "action": "snapshot" }
 3. Fill recipient — CHIP CONFIRMATION REQUIRED:
    { "action": "fill", "selector": "input[name='to'],textarea[name='to']", "text": "<recipient email>" }
@@ -665,7 +690,7 @@ Extract up to 15 inbox rows using page.evaluate with Gmail's stable CSS selector
 5. Extract results (same selectors as Read Inbox above)`,
 
   outlook: `### Compose & Send Email (compose, send, email, draft, write, message)
-1. Click New mail: { "action": "click", "selector": "button[aria-label='New mail'],span[data-icon-name='ComposeRegular']" }
+1. Navigate to compose URL: { "action": "navigate", "url": "https://outlook.live.com/mail/0/deeplink/compose" }
 2. Wait for compose: { "action": "snapshot" }
 3. Fill recipient — press Enter to confirm chip:
    { "action": "fill", "selector": "div[aria-label='To']", "text": "<recipient>" }
@@ -680,11 +705,25 @@ Extract up to 15 inbox rows using page.evaluate with Gmail's stable CSS selector
 { "action": "run-code", "code": "async page => { return await page.evaluate(() => { const rows=Array.from(document.querySelectorAll('div[role=listitem]')).slice(0,5); return rows.map((r,i)=>{ const s=r.querySelector('.luvU6')?.innerText||''; const sub=r.querySelector('.nDYNg')?.innerText||''; const snip=r.querySelector('.SibTc')?.innerText||''; return 'Email '+(i+1)+': From='+s+' | Subject='+sub+' | Preview='+snip; }).join('\\n'); }); }" }`,
 
   notion: `### Create New Page (create, new page, add page, write)
-1. Click new page in sidebar: { "action": "click", "selector": "div[data-testid='sidebar-new-page'],a[aria-label='Add a page']" }
-2. Snapshot to confirm page opened: { "action": "snapshot" }
-3. Type page title: { "action": "type", "text": "<page title>" }
-4. Press Enter to start body: { "action": "press", "key": "Enter" }
-5. Type body content: { "action": "type", "text": "<content>" }
+1. Check if page already exists in sidebar:
+   { "action": "run-code", "code": "async page => { return await page.evaluate(() => { const items=Array.from(document.querySelectorAll('div[role=treeitem],a[role=treeitem]')); const target='<page title>'.toLowerCase(); const found=items.find(i=>i.innerText.trim().toLowerCase()===target); return found ? 'PAGE_EXISTS' : 'NOT_FOUND'; }); }" }
+   RULE: If result is PAGE_EXISTS, do NOT create a duplicate — navigate to the existing page instead.
+2. Click new page in sidebar: { "action": "click", "selector": "div[data-testid='sidebar-new-page'],a[aria-label='Add a page']" }
+3. Snapshot to confirm page opened: { "action": "snapshot" }
+4. Type page title: { "action": "type", "text": "<page title>" }
+5. Press Enter to start body: { "action": "press", "key": "Enter" }
+6. Verify URL changed to new page URL:
+   { "action": "eval", "expression": "window.location.href" }
+   RULE: If URL contains '/p/' followed by an ID, the page was created successfully. Do NOT re-create.
+7. For each todo item, use the /todo slash command:
+   { "action": "type", "text": "/todo" }
+   { "action": "press", "key": "Enter" }
+   { "action": "snapshot" }
+   RULE: After /todo + Enter, verify a checkbox block appeared. If not, retry once.
+   Then type the todo text: { "action": "type", "text": "<todo item text>" }
+   { "action": "press", "key": "Enter" }
+   { "action": "snapshot" }
+   Repeat for each todo item.
 
 ### Search Workspace (search, find, look for, page)
 1. Click search: { "action": "click", "selector": "div[aria-label='Search'],button[data-testid='search-button']" }
@@ -733,7 +772,7 @@ NOTE: Prefer gh CLI for most GitHub operations — use browser only when CLI is 
 { "action": "run-code", "code": "async page => { return await page.evaluate(() => { return Array.from(document.querySelectorAll('.task_content,[data-testid=task-content]')).map((t,i)=>'Task '+(i+1)+': '+t.innerText).join('\\n'); }); }" }`,
 
   twitter: `### Compose Tweet (tweet, post, write, share, compose)
-1. Click new tweet button: { "action": "click", "selector": "a[data-testid='SideNav_NewTweet_Button'],button[data-testid='tweetButtonInline']" }
+1. Navigate to compose URL: { "action": "navigate", "url": "https://x.com/compose/post" }
 2. Snapshot: { "action": "snapshot" }
 3. Click tweet textarea: { "action": "click", "selector": "div[data-testid='tweetTextarea_0']" }
 4. Type tweet: { "action": "type", "text": "<tweet text>" }
@@ -804,6 +843,8 @@ INSTRUCTION: Use video.agent to find and watch tutorial videos, extracting actio
 // ---------------------------------------------------------------------------
 const PLAYBOOK_BUILD_PROMPT = `You are a browser automation expert. Generate step-by-step playbooks for automating a web service using playwright-cli.
 
+URL-FIRST RULE: Before any click or type action, consider whether the service has a direct URL for the task (e.g., /new, /compose, /create, /submit, /settings, /help, /dashboard, /search?q=). If so, your FIRST step MUST be { "action": "navigate", "url": "..." } to that URL. Only fall back to clicks for navigation when no direct URL exists.
+
 You MUST use ONLY these action names in your steps (no others):
 
 INPUT
@@ -860,8 +901,8 @@ Format each playbook as a ### section with task keywords in parentheses in the h
 
 Example format:
 ### Send Message (send, message, post, write)
-1. Click compose button: { "action": "click", "selector": "button[aria-label='Compose']" }
-2. Wait for modal: { "action": "snapshot" }
+1. Navigate to compose URL: { "action": "navigate", "url": "https://<service>/compose" }
+2. Wait for page load: { "action": "snapshot" }
 3. Fill recipient: { "action": "fill", "selector": "input[placeholder='To']", "text": "<recipient>" }
 4. Type body: { "action": "type", "text": "<message>" }
 5. Click Send: { "action": "click", "selector": "button:has-text('Send')" }
@@ -870,6 +911,7 @@ Example format:
 { "action": "run-code", "code": "async page => { return await page.evaluate(() => { return Array.from(document.querySelectorAll('.message')).slice(0,5).map(m=>m.innerText).join('\\n'); }); }" }
 
 IMPORTANT:
+- Prefer navigate to a direct URL as the first step when the service likely supports one (e.g., /compose, /new, /create, /submit, /settings, /help, /dashboard, /search?q=). Only use click to navigate when no direct URL exists.
 - Use CSS attribute selectors and ARIA labels — they are more stable than class names
 - For form fields that create chips/tokens (like email To fields), always fill + press Enter + snapshot before continuing
 - For contenteditable rich-text areas use type, not fill
@@ -907,7 +949,7 @@ You MUST use ONLY these action names (full playwright-cli vocabulary):
 
 Chain-of-thought approach:
 1. What page/view does this goal start from?
-2. What is the first action (click, navigate, hover to reveal a menu)?
+2. Is there a direct URL for this goal? If the service likely has a URL like /new, /compose, /create, /submit, /settings, /help, /dashboard, start with { "action": "navigate", "url": "..." } to that URL.
 3. Does the DOM change after that action? If yes → snapshot.
 4. What fields need filling? Use fill for <input>/<textarea>, type for contenteditable.
 5. Are there chip/token confirmation steps? Fill + press Enter + snapshot + verify chip exists.
@@ -922,6 +964,7 @@ Format your response as a single ### section:
 IMPORTANT:
 - The ### header keywords are used for future matching — make them comprehensive and relevant
 - Do NOT repeat steps from the existing playbooks — generate only what GOAL requires
+- Prefer URL-first navigation over DOM clicks when a direct URL likely exists (e.g., /compose, /new, /create, /submit, /settings, /help, /dashboard)
 - Output ONLY the ### section — no preamble, no explanation`;
 
 // ---------------------------------------------------------------------------
@@ -1174,14 +1217,19 @@ async function resolveBrowserMeta(service) {
         const startUrl  = extractDescriptorUrl(desc, 'start_url');
         const signInUrl = extractDescriptorUrl(desc, 'sign_in_url');
         const authSuccessPattern = extractDescriptorUrl(desc, 'auth_success_pattern');
+        const hostAliasesDesc = extractDescriptorUrl(desc, 'host_aliases');
         if (startUrl) {
           const seed = KNOWN_BROWSER_SERVICES[seedKey] || {};
           const isOAuthFromDesc = /^is_oauth:\s*true/m.test(desc);
+          const hostAliases = hostAliasesDesc
+            ? hostAliasesDesc.split(',').map(h => h.trim()).filter(Boolean)
+            : (seed.hostAliases || undefined);
           return {
             ...seed,
             startUrl,
             ...(signInUrl ? { signInUrl } : {}),
             authSuccessPattern: authSuccessPattern || seed.authSuccessPattern || seedKey,
+            ...(hostAliases && hostAliases.length > 0 ? { hostAliases } : {}),
             ...(isOAuthFromDesc ? { isOAuth: true } : {}),
           };
         }
@@ -1365,7 +1413,7 @@ function deriveAgentType(meta) {
 // Action: build_agent
 // ---------------------------------------------------------------------------
 
-function buildBrowserDescriptorMd({ id, service, startUrl, signInUrl, authSuccessPattern, capabilities, type = 'browser', playbooks = null, goals = null }) {
+function buildBrowserDescriptorMd({ id, service, startUrl, signInUrl, authSuccessPattern, capabilities, type = 'browser', playbooks = null, goals = null, hostAliases = null, metaRevision = null }) {
   const capYaml = capabilities.map(c => `  - ${c}`).join('\n');
   const goalsYaml = goals && goals.length > 0
     ? goals.map(g => `  - "${g.replace(/"/g, '\\"')}"`).join('\n')
@@ -1378,6 +1426,8 @@ function buildBrowserDescriptorMd({ id, service, startUrl, signInUrl, authSucces
     ...(signInUrl ? [`sign_in_url: ${signInUrl}`] : []),
     `start_url: ${startUrl}`,
     `auth_success_pattern: ${authSuccessPattern}`,
+    ...(hostAliases && hostAliases.length > 0 ? [`host_aliases: ${hostAliases.join(', ')}`] : []),
+    ...(metaRevision ? [`meta_revision: ${metaRevision}`] : []),
     `capabilities:`,
     capYaml,
     `user_goals:`,
@@ -1414,7 +1464,7 @@ function buildBrowserDescriptorMd({ id, service, startUrl, signInUrl, authSucces
 async function actionBuildAgent({ service, startUrl: explicitUrl, force = false, goals = null }) {
   if (!service) return { ok: false, error: 'service is required' };
 
-  const serviceKey = service.toLowerCase().replace(/[^a-z0-9]/g, '');
+  const serviceKey = service.toLowerCase().replace(/[^a-z0-9_]/g, '');
   const agentId    = `${serviceKey}.agent`;
 
   // Resolve via LLM if not in seed map — never hard-fail on unknown service
@@ -1483,7 +1533,7 @@ async function actionBuildAgent({ service, startUrl: explicitUrl, force = false,
   // successful run can upgrade to 'healthy'. Seeded playbooks are battle-tested — healthy directly.
   const initialStatus = playbooksSource === 'generated' ? 'needs_validation' : 'healthy';
 
-  const descriptor = buildBrowserDescriptorMd({ id: agentId, service: serviceKey, startUrl, signInUrl, authSuccessPattern, capabilities, type: agentType, playbooks, goals });
+  const descriptor = buildBrowserDescriptorMd({ id: agentId, service: serviceKey, startUrl, signInUrl, authSuccessPattern, capabilities, type: agentType, playbooks, goals, hostAliases: meta?.hostAliases, metaRevision: meta?._metaRevision });
 
   // Write .md to disk
   fs.mkdirSync(AGENTS_DIR, { recursive: true });
@@ -1518,6 +1568,80 @@ async function actionBuildAgent({ service, startUrl: explicitUrl, force = false,
   };
 }
 
+// ---------------------------------------------------------------------------
+// Migrate stale built-in browser-agent descriptors to current seed metadata.
+// Compares the descriptor's meta_revision against the seed's _metaRevision.
+// If the seed is newer, patches only metadata fields (start_url, sign_in_url,
+// auth_success_pattern, host_aliases, meta_revision) while preserving
+// playbooks, capabilities, goals, and all other descriptor content.
+// Returns the patched descriptor string if migrated, or null if up-to-date.
+// ---------------------------------------------------------------------------
+async function migrateStaleDescriptor(agentId, existing) {
+  const serviceKey = (existing.service || agentId.replace(/\.agent$/, '')).toLowerCase().replace(/[^a-z0-9]/g, '');
+  const seed = KNOWN_BROWSER_SERVICES[serviceKey];
+  if (!seed || !seed._metaRevision) return null;
+
+  const descRevisionStr = extractDescriptorUrl(existing.descriptor, 'meta_revision');
+  const currentRevision = parseInt(descRevisionStr, 10) || 0;
+  const seedRevision = parseInt(seed._metaRevision, 10) || 0;
+
+  if (currentRevision >= seedRevision) return null;
+
+  logger.info(`[browser.agent] migrate: ${agentId} descriptor revision ${currentRevision} < seed revision ${seedRevision} — upgrading metadata`);
+
+  let patched = existing.descriptor;
+
+  const fields = [
+    ['start_url', seed.startUrl],
+    ['sign_in_url', seed.signInUrl],
+    ['auth_success_pattern', seed.authSuccessPattern],
+  ];
+  if (seed.hostAliases && seed.hostAliases.length > 0) {
+    fields.push(['host_aliases', seed.hostAliases.join(', ')]);
+  }
+
+  for (const [field, value] of fields) {
+    if (!value) continue;
+    const re = new RegExp(`^${field}:.*$`, 'm');
+    if (re.test(patched)) {
+      patched = patched.replace(re, `${field}: ${value}`);
+    } else {
+      patched = patched.replace(/^(service:.*)$/m, `$1\n${field}: ${value}`);
+    }
+  }
+
+  const revRe = /^meta_revision:.*$/m;
+  if (revRe.test(patched)) {
+    patched = patched.replace(revRe, `meta_revision: ${seedRevision}`);
+  } else {
+    patched = patched.replace(/^(service:.*)$/m, `$1\nmeta_revision: ${seedRevision}`);
+  }
+
+  try {
+    const mdPath = path.join(AGENTS_DIR, `${agentId}.md`);
+    fs.writeFileSync(mdPath, patched, 'utf8');
+  } catch (e) {
+    logger.warn(`[browser.agent] migrate: failed to write .md for ${agentId}: ${e.message}`);
+  }
+
+  try {
+    await withDb(async (db) => {
+      await db.run('UPDATE agents SET descriptor = ? WHERE id = ?', patched, agentId);
+    });
+  } catch (e) {
+    logger.warn(`[browser.agent] migrate: failed to update DuckDB for ${agentId}: ${e.message}`);
+  }
+
+  try {
+    await withDb(async (db) => {
+      await db.run('DELETE FROM browser_meta_cache WHERE service = ?', serviceKey).catch(() => {});
+    });
+  } catch {}
+
+  logger.info(`[browser.agent] migrate: ${agentId} upgraded to revision ${seedRevision}`);
+  return patched;
+}
+
 
 // ---------------------------------------------------------------------------
 // Action: query_agent
@@ -1531,7 +1655,7 @@ async function actionQueryAgent({ service, id }) {
     if (id) {
       rows = await db.all("SELECT * FROM agents WHERE id = ?", id);
     } else {
-      const serviceKey = (service || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+      const serviceKey = (service || '').toLowerCase().replace(/[^a-z0-9_]/g, '');
       rows = await db.all("SELECT * FROM agents WHERE service = ? AND type IN ('browser', 'api_key', 'bearer', 'basic')", serviceKey);
     }
 
@@ -2548,9 +2672,6 @@ async function _resolveTaskDeepLink(agentId, serviceKey, baseStartUrl, task) {
   try {
     const intent = await classifyTaskIntent(task);
     const isSearchLike = intent === INTENTS.SEARCH || /\b(search|look\s*up|google|find)\b/i.test(task);
-    if (intent !== INTENTS.SEARCH && intent !== INTENTS.DOCS && intent !== INTENTS.MAIL && intent !== INTENTS.CONSOLE && !isSearchLike) {
-      return null;
-    }
 
     const baseHost = (() => {
       try { return new URL(baseStartUrl).hostname.replace(/^www\./, ''); }
@@ -2559,11 +2680,70 @@ async function _resolveTaskDeepLink(agentId, serviceKey, baseStartUrl, task) {
 
     const _buildIntentTemplateUrl = () => {
       const svc = String(serviceKey || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+      const startUrlBase = baseStartUrl.replace(/\/$/, '');
+
+      // ── MAIL ──────────────────────────────────────────────────────────────
       if (intent === INTENTS.MAIL) {
         if (svc === 'gmail' || baseHost === 'mail.google.com') {
           return 'https://mail.google.com/mail/u/0/#inbox?compose=new';
         }
+        if (svc === 'outlook' || baseHost === 'outlook.live.com' || baseHost === 'outlook.office.com') {
+          return 'https://outlook.live.com/mail/0/deeplink/compose';
+        }
       }
+
+      // ── CONTENT_CREATE ────────────────────────────────────────────────────
+      if (intent === INTENTS.CONTENT_CREATE) {
+        if (svc === 'github' || baseHost === 'github.com') {
+          const repoMatch = task.match(/(?:in|on)\s+([\w-]+\/[\w-]+)/i);
+          if (repoMatch) return `https://github.com/${repoMatch[1]}/issues/new`;
+          return null;
+        }
+        if (svc === 'twitter' || svc === 'x' || baseHost === 'x.com') {
+          return 'https://x.com/compose/post';
+        }
+        if (svc === 'reddit' || baseHost === 'reddit.com') {
+          const subMatch = task.match(/r\/([\w-]+)/i);
+          if (subMatch) return `https://www.reddit.com/r/${subMatch[1]}/submit`;
+          return 'https://www.reddit.com/submit';
+        }
+        if (svc === 'medium' || baseHost === 'medium.com') {
+          return 'https://medium.com/new-story';
+        }
+        if (svc === 'youtube' || baseHost === 'youtube.com' || baseHost === 'studio.youtube.com') {
+          return 'https://studio.youtube.com/videos/upload';
+        }
+        if (svc === 'linkedin' || baseHost === 'linkedin.com') {
+          return 'https://www.linkedin.com/post/new';
+        }
+      }
+
+      // ── SOCIAL ────────────────────────────────────────────────────────────
+      if (intent === INTENTS.SOCIAL) {
+        if (svc === 'twitter' || svc === 'x' || baseHost === 'x.com') {
+          return 'https://x.com/compose/post';
+        }
+        if (svc === 'linkedin' || baseHost === 'linkedin.com') {
+          return 'https://www.linkedin.com/feed/?shareActive=true';
+        }
+        if (svc === 'reddit' || baseHost === 'reddit.com') {
+          const subMatch = task.match(/r\/([\w-]+)/i);
+          if (subMatch) return `https://www.reddit.com/r/${subMatch[1]}/submit`;
+          return 'https://www.reddit.com/submit';
+        }
+      }
+
+      // ── SCHEDULING ────────────────────────────────────────────────────────
+      if (intent === INTENTS.SCHEDULING) {
+        if (svc === 'googlecalendar' || svc === 'calendar' || baseHost === 'calendar.google.com') {
+          return 'https://calendar.google.com/calendar/u/0/r';
+        }
+        if (svc === 'calendly' || baseHost === 'calendly.com') {
+          return 'https://calendly.com/events/new';
+        }
+      }
+
+      // ── SEARCH ────────────────────────────────────────────────────────────
       if (intent === INTENTS.SEARCH || isSearchLike) {
         const qMatch = task.match(/\b(?:search|find|look\s*up|google)\s+(?:for\s+)?(.+?)$/i);
         const q = qMatch?.[1] ? encodeURIComponent(String(qMatch[1]).trim().replace(/[?.!]+$/g, '')) : '';
@@ -2572,6 +2752,33 @@ async function _resolveTaskDeepLink(agentId, serviceKey, baseStartUrl, task) {
         if (baseHost === 'youtube.com') return `https://www.youtube.com/results?search_query=${q}`;
         if (baseHost === 'w3schools.com') return `https://www.w3schools.com/search/search.asp?q=${q}`;
       }
+
+      // ── SETTINGS ──────────────────────────────────────────────────────────
+      if (intent === INTENTS.SETTINGS) {
+        return `${startUrlBase}/settings`;
+      }
+
+      // ── SUPPORT ───────────────────────────────────────────────────────────
+      if (intent === INTENTS.SUPPORT) {
+        return `${startUrlBase}/help`;
+      }
+
+      // ── DASHBOARD ──────────────────────────────────────────────────────────
+      if (intent === INTENTS.DASHBOARD) {
+        return `${startUrlBase}/dashboard`;
+      }
+
+      // ── DOCS ──────────────────────────────────────────────────────────────
+      if (intent === INTENTS.DOCS) {
+        if (baseHost === 'w3schools.com') return `${startUrlBase}/`;
+        return `https://docs.${baseHost}`;
+      }
+
+      // ── CONSOLE ────────────────────────────────────────────────────────────
+      if (intent === INTENTS.CONSOLE) {
+        return `${startUrlBase}/console`;
+      }
+
       return null;
     };
 
@@ -2592,6 +2799,55 @@ async function _resolveTaskDeepLink(agentId, serviceKey, baseStartUrl, task) {
         if (webResult?.ok && webResult?.taskUrl) candidate = webResult.taskUrl;
       } catch (webErr) {
         logger.debug(`[browser.agent] deep-link: web.agent failed: ${webErr.message}`);
+      }
+    }
+
+    // 2.5. Try web.crawl link extraction — crawl the service's start URL and
+    // extract <a href> links to discover action URLs not indexed by search engines.
+    if (!candidate) {
+      try {
+        const crawlResult = await callSkill('web.crawl', {
+          url: baseStartUrl,
+          extractLinks: true,
+          maxChars: 1000,
+          timeoutMs: 15000,
+          waitMs: 2000,
+        }, 20000);
+        if (crawlResult?.ok && Array.isArray(crawlResult.links) && crawlResult.links.length > 0) {
+          // Intent-based path patterns to filter links
+          const _INTENT_LINK_PATTERNS = {
+            [INTENTS.CONTENT_CREATE]: /\/(new|create|compose|upload|publish|submit|add)/i,
+            [INTENTS.SOCIAL]:         /\/(compose|post|share|submit|tweet)/i,
+            [INTENTS.MAIL]:           /\/(compose|draft|new|mail)/i,
+            [INTENTS.SETTINGS]:       /\/(settings|account|preferences|profile)/i,
+            [INTENTS.SUPPORT]:        /\/(help|support|contact|ticket)/i,
+            [INTENTS.DASHBOARD]:      /\/(dashboard|admin|overview|home|console)/i,
+            [INTENTS.DOCS]:           /\/(docs|documentation|guide|tutorial|help)/i,
+            [INTENTS.CONSOLE]:        /\/(console|developer|api|platform|settings)/i,
+            [INTENTS.SCHEDULING]:     /\/(calendar|schedule|book|event|new)/i,
+            [INTENTS.SEARCH]:         /\/(search|find)/i,
+          };
+          const _linkPattern = _INTENT_LINK_PATTERNS[intent];
+          if (_linkPattern) {
+            // Filter on-domain links matching the intent pattern
+            const _matchingLinks = crawlResult.links
+              .filter(l => {
+                try {
+                  const linkHost = new URL(l.href).hostname.replace(/^www\./, '');
+                  return (linkHost === baseHost || linkHost.endsWith('.' + baseHost)) && _linkPattern.test(l.href);
+                } catch (_) { return false; }
+              })
+              .map(l => ({ ...l, _score: (l.text || '').toLowerCase().split(/\s+/).filter(w => task.toLowerCase().includes(w)).length }))
+              .sort((a, b) => b._score - a._score);
+
+            if (_matchingLinks.length > 0) {
+              candidate = _matchingLinks[0].href;
+              logger.info(`[browser.agent] deep-link: web.crawl discovered ${candidate} (text="${_matchingLinks[0].text}", score=${_matchingLinks[0]._score}) for ${agentId}`);
+            }
+          }
+        }
+      } catch (crawlErr) {
+        logger.debug(`[browser.agent] deep-link: web.crawl failed: ${crawlErr.message}`);
       }
     }
 
@@ -2652,13 +2908,13 @@ function _isSigninWall(href) {
   return false;
 }
 
-async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAuth, skipAuth, manualLogin = false, preflightProbe = false, _progressCallbackUrl, _stepIndex, _loginWallRetried = false, _emitThinking = null, _authOnly = false }) {
+async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAuth, skipAuth, manualLogin = false, preflightProbe = false, forceAuthProbe = false, _progressCallbackUrl, _stepIndex, _loginWallRetried = false, _emitThinking = null, _authOnly = false }) {
   // Derive agentId from url hostname when caller omits it (LLM sometimes emits only url)
   let agentId = _agentIdArg;
   if (!agentId && url) {
     try {
       const _host = new URL(url).hostname.replace(/^www\./, '');
-      const _svc  = _host.split('.')[0].toLowerCase().replace(/[^a-z0-9]/g, '');
+      const _svc  = _host.split('.')[0].toLowerCase().replace(/[^a-z0-9_]/g, '');
       agentId = `${_svc}.agent`;
       logger.info(`[browser.agent] run: derived agentId="${agentId}" from url="${url}"`);
     } catch (_) { /* malformed url — fall through to error below */ }
@@ -2794,6 +3050,17 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
     }
   }
 
+  // Self-heal stale built-in metadata (e.g. Notion changed from notion.so to app.notion.com).
+  // Compares the descriptor's meta_revision against the seed's _metaRevision. If the seed
+  // is newer, patches only the metadata fields (start_url, sign_in_url, auth_success_pattern,
+  // host_aliases, meta_revision) while preserving playbooks, capabilities, and goals.
+  if (existing.found) {
+    const _migratedDesc = await migrateStaleDescriptor(agentId, existing);
+    if (_migratedDesc) {
+      existing.descriptor = _migratedDesc;
+    }
+  }
+
   const agentType = (() => {
     const m = (existing.descriptor || '').match(/^type:\s*(\S+)/m);
     return m ? m[1].toLowerCase() : existing.type || 'browser';
@@ -2818,7 +3085,7 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
           credentialKey: `credential:${agentId.toLowerCase().replace(/\.agent$/, '')}.agent:PRIMARY`,
         };
       }
-      return { ok: true, agentId, authed: true };
+      return { ok: true, agentId, authed: true, authVerified: true };
     }
 
     const MAX_TURNS = 8;
@@ -2936,9 +3203,17 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
   }
 
   // ── Browser / OAuth path ───────────────────────────────────────────────
+  const _svcKey          = (existing.service || agentId.replace(/\.agent$/, '')).toLowerCase().replace(/[^a-z0-9]/g, '');
+  const _svcInfo         = lookupBrowserService(_svcKey);
+
   let startUrl             = extractDescriptorUrl(existing.descriptor, 'start_url');
   const signInUrl          = extractDescriptorUrl(existing.descriptor, 'sign_in_url');
   const authSuccessPattern = extractDescriptorUrl(existing.descriptor, 'auth_success_pattern');
+  const _hostAliasesDesc   = extractDescriptorUrl(existing.descriptor, 'host_aliases');
+  const hostAliases        = _hostAliasesDesc
+    ? _hostAliasesDesc.split(',').map(h => h.trim().toLowerCase()).filter(Boolean)
+    : (_svcInfo?.hostAliases || []);
+  const postAuthUrl        = _svcInfo?.postAuthUrl || null;
   if (!startUrl) return { ok: false, error: 'Agent descriptor missing start_url' };
 
   // Strip any path from the stored descriptor start_url — always navigate to the
@@ -2953,9 +3228,6 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
   // → Chrome shows the login page every time. 'gmail_agent' ≈ 94-char socket path,
   // safely under macOS's 104-char Unix socket limit.
   const sessionId = profile;
-
-  const _svcKey          = (existing.service || agentId.replace(/\.agent$/, '')).toLowerCase().replace(/[^a-z0-9]/g, '');
-  const _svcInfo         = lookupBrowserService(_svcKey);
 
   // ── Destination intent mismatch correction ────────────────────────────────────
   // Pre-navigation: detect when the configured startUrl (e.g. developer API console)
@@ -2990,12 +3262,11 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
     logger.warn(`[browser.agent] run: destination-resolver error (non-fatal): ${_destErr.message}`);
   }
 
-  // Route to agentbrowser.agent when preferAgentBrowser is set on the service entry
-  // or when THINKDROP_CLI_DRIVER=agentbrowser is set globally.
-  const _useAgentBrowser = _svcInfo?.preferAgentBrowser === true || process.env.THINKDROP_CLI_DRIVER === 'agentbrowser';
-  const _agentSkill = _useAgentBrowser ? 'agentbrowser.agent' : 'playwright.agent';
-  if (_useAgentBrowser) {
-    logger.info(`[browser.agent] run: routing ${agentId} through agentbrowser.agent (preferAgentBrowser=${_svcInfo?.preferAgentBrowser}, env=${process.env.THINKDROP_CLI_DRIVER})`);
+  // Use the registered Playwright driver until an agent-browser agent implementation is available.
+  const _useAgentBrowser = false;
+  const _agentSkill = 'playwright.agent';
+  if (_svcInfo?.preferAgentBrowser === true || process.env.THINKDROP_CLI_DRIVER === 'agentbrowser') {
+    logger.warn(`[browser.agent] run: agentbrowser requested for ${agentId}, but no agentbrowser.agent skill is registered — using playwright.agent`);
   }
 
   // When auto-connect is enabled, agentbrowser attaches to the user's already-running
@@ -3077,7 +3348,7 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
     if (_hasPersistentProfile) {
       // ── Auth-check cache hit — skip navigate+evaluate if recently confirmed ──
       const _cachedAuth = _getCachedAuthCheck(agentId);
-      if (_cachedAuth && !_cachedAuth.authNeeded) {
+      if (!forceAuthProbe && _cachedAuth && !_cachedAuth.authNeeded) {
         logger.info(`[browser.agent] run: auth-check cache hit for ${agentId} (${Math.round((Date.now() - _cachedAuth.ts) / 1000)}s ago) — skipping auth probe`);
         _skipNavigate = true;
       } else {
@@ -3091,7 +3362,7 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
           ));
           if (_dbAuthRow?.auth_expires_at) {
             const _expiresMs = new Date(_dbAuthRow.auth_expires_at).getTime();
-            if (_expiresMs > Date.now()) {
+            if (!forceAuthProbe && _expiresMs > Date.now()) {
               logger.info(`[browser.agent] run: DuckDB auth fast-path for ${agentId} — auth valid until ${_dbAuthRow.auth_expires_at} — skipping preflight probe`);
               _setCachedAuthCheck(agentId, false);
               _skipNavigate = true;
@@ -3178,12 +3449,9 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
         _currentBrowserUrl = captureData.url;
         const currentHostname = new URL(_currentBrowserUrl).hostname;
         const startHostname = new URL(startUrl).hostname;
-        // Extract base domain (e.g., w3schools.com from www.w3schools.com or my-learning.w3schools.com)
-        const currentBaseDomain = currentHostname.split('.').slice(-2).join('.');
-        const startBaseDomain = startHostname.split('.').slice(-2).join('.');
-        logger.info(`[browser.agent] domain-continuity check: current=${currentHostname} (base: ${currentBaseDomain}) vs start=${startHostname} (base: ${startBaseDomain})`);
-        // If already on same base domain, skip restart
-        if (currentBaseDomain === startBaseDomain) {
+        logger.info(`[browser.agent] domain-continuity check: current=${currentHostname} vs start=${startHostname} (aliases=${hostAliases.join(',')})`);
+        // If on same host or a configured alias, skip restart
+        if (isHostAlias(currentHostname, startHostname, hostAliases)) {
           _domainContinuitySkip = true;
           logger.info(`[browser.agent] domain-continuity: MATCH - skipping browser restart`);
         } else {
@@ -3236,6 +3504,15 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
                /EINVAL.*\.sock/i.test(errStr);
       };
 
+      // UI-driven "Sign in" card (manualLogin) is an explicit auth request: skip the
+      // lazy auth-check probe and open the sign-in URL directly, then waitForAuth.
+      // Without this, the probe navigates to startUrl, the page is not a login wall,
+      // and the function returns ok: true while the user is still unauthenticated.
+      if (_authOnly && manualLogin === true && !_silentPreflightProbe) {
+        _authNeeded = true;
+        _skipNavigate = true;
+      }
+
       if (!_skipNavigate) try {
         logger.info(`[browser.agent] run: playwright auth-check — navigating to ${startUrl} for ${agentId}`);
         const _probeNav = await callBrowserAct({ action: 'navigate', sessionId, url: startUrl, timeoutMs: 30000, headed: _silentPreflightProbe ? false : undefined }, 35000);
@@ -3269,15 +3546,13 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
           _curHref = String(_hrefRes?.result ?? _hrefRes?.stdout ?? '').trim();
           let _onLoginPage = _isSigninWall(_curHref);
           // Also detect domain mismatch — e.g. redirect to workspace.google.com instead of mail.google.com
+          // Uses isHostAlias to allow configured host aliases (e.g. notion.so ↔ notion.com) to pass.
           let _wrongDomain = false;
           let _curHost = '';
           try {
             const _startHost = new URL(startUrl).hostname;
             _curHost   = new URL(_curHref.match(/https?:\/\//) ? _curHref : `https://${_curHref}`).hostname;
-            // Same base domain (e.g. pathfinder.w3schools.com vs profile.w3schools.com) is NOT a mismatch
-            const _startBase = _startHost.split('.').slice(-2).join('.');
-            const _curBase   = _curHost.split('.').slice(-2).join('.');
-            _wrongDomain = !!_startHost && !!_curHost && _curBase !== _startBase;
+            _wrongDomain = !!_startHost && !!_curHost && !isHostAlias(_curHost, _startHost, hostAliases);
           } catch (_) {}
 
           // ── Auth success pattern mismatch detection ─────────────────────────────
@@ -3301,6 +3576,7 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
           let _isParkingPage = false;
           let _pageMetaLoginWall = false;
           let _pageMetaAuthed = false;
+          let _pageInfo = {};
           try {
             const _pageInfoRes = await callBrowserAct({
               action: 'evaluate',
@@ -3316,18 +3592,31 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
                 const hasUserGlobal = !!(window.__user || window.currentUser ||
                   (window.App && window.App.user) ||
                   (window.__INITIAL_STATE__ && window.__INITIAL_STATE__.user));
-                return JSON.stringify({ title, body, links, titleIsLogin, isNoIndex, hasUserGlobal });
+                const signInLinks = document.querySelectorAll(
+                  'a[href*="login"], a[href*="signin"], a[href*="sign-in"], a[href*="signup"], a[href*="register"]'
+                );
+                const signInButtons = Array.from(
+                  document.querySelectorAll('button, a[role="button"], [data-testid]')
+                ).filter(el => {
+                  const text = (el.textContent || el.innerText || '').toLowerCase().trim();
+                  return /^(sign\s*in|log\s*in|sign\s*up|register)\b/.test(text);
+                });
+                const hasSignInButton = signInLinks.length > 0 || signInButtons.length > 0;
+                return JSON.stringify({ title, body, links, titleIsLogin, isNoIndex, hasUserGlobal, hasSignInButton });
               })()`,
               sessionId,
               timeoutMs: 5000,
               headed: _silentPreflightProbe ? false : undefined,
             }, 8000).catch(() => null);
-            if (_pageInfoRes?.ok !== false) {
-              // browser.act evaluate auto-parses JSON, so result may already be an object.
-              // JSON.parse(object) throws — handle both object and string cases.
-              const _pageInfo = (typeof _pageInfoRes?.result === 'object' && _pageInfoRes.result !== null)
+            // browser.act evaluate auto-parses JSON, so result may already be an object.
+            // JSON.parse(object) throws — handle both object and string cases.
+            // Hoisted to outer scope so the tier-based fallback can read _pageInfo.hasSignInButton.
+            _pageInfo = (_pageInfoRes?.ok !== false)
+              ? (typeof _pageInfoRes?.result === 'object' && _pageInfoRes.result !== null)
                 ? _pageInfoRes.result
-                : (() => { try { return JSON.parse(String(_pageInfoRes?.result ?? '{}')); } catch (_) { return {}; } })();
+                : (() => { try { return JSON.parse(String(_pageInfoRes?.result ?? '{}')); } catch (_) { return {}; } })()
+              : {};
+            if (_pageInfoRes?.ok !== false) {
               const _pageText = `${_pageInfo.title || ''} ${_pageInfo.body || ''}`.toLowerCase();
               const _PARKING_RE = /\bdomain\s+(for\s+sale|is\s+for\s+sale|available\s+for\s+sale)\b|\bbuy\s+this\s+domain\b|\bmake\s+an?\s+offer\b|\bparked\s+(by|domain|page)\b|\binquire\s+about\s+this\s+domain\b|\bthis\s+domain\s+(may\s+be|is)\s+(for\s+sale|available)\b/;
               if (_PARKING_RE.test(_pageText) || (Number(_pageInfo.links) < 10 && /for\s+sale|buy|offer|domain/i.test(_pageText))) {
@@ -3470,6 +3759,17 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
           } else if (_pageMetaAuthed) {
             logger.info(`[browser.agent] run: auth-check: metadata indicates authenticated app — skipping waitForAuth for ${agentId}`);
             _setCachedAuthCheck(agentId, false);
+          } else if (_silentPreflightProbe || forceAuthProbe) {
+            if (_pageInfo.hasSignInButton) {
+              logger.info(`[browser.agent] run: auth-check: sign-in button detected — auth needed for ${agentId}`);
+              _authNeeded = true;
+            } else if (_authSuccessMismatch) {
+              logger.info(`[browser.agent] run: auth-check: URL does not match auth_success_pattern — auth needed for ${agentId}`);
+              _authNeeded = true;
+            } else {
+              logger.info(`[browser.agent] run: auth-check: no sign-in button, URL matches auth_success_pattern — authenticated for ${agentId}`);
+              _setCachedAuthCheck(agentId, false);
+            }
           } else {
             logger.info(`[browser.agent] run: auth-check: no login redirect${_curHref ? ` (${_curHref})` : ''} — skipping waitForAuth for ${agentId}`);
             _setCachedAuthCheck(agentId, false);
@@ -3549,6 +3849,8 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
           url: signInUrl || startUrl,
           currentUrl: _curHref,
           authSuccessUrl: authSuccessPattern,
+          hostAliases,
+          postAuthUrl,
           credentials: _credentials,
           noAutofill: _manualLogin,
           timeoutMs: 2 * 60 * 1000,
@@ -3626,7 +3928,7 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
       await callBrowserAct({ action: 'close', sessionId, headed: false }, 8000).catch(() => {});
     }
     logger.info(`[browser.agent] run: auth-only call complete for ${agentId}`);
-    return { ok: true, agentId, authed: true, startUrl };
+    return { ok: true, agentId, authed: true, authVerified: true, startUrl };
   }
 
   const _allowAutoGeneratedRecipes = process.env.THINKDROP_ALLOW_AUTOGENERATED_RECIPES === 'true';
@@ -4751,6 +5053,8 @@ When extracting page content with run-code, prioritize these selectors over gene
             sessionId,
             url: signInUrl || startUrl,
             authSuccessUrl: authSuccessPattern,
+            hostAliases,
+            postAuthUrl,
             timeoutMs: 5 * 60 * 1000,
             _progressCallbackUrl,
           }, 6 * 60 * 1000);
@@ -5026,7 +5330,7 @@ function extractDescriptorUrl(descriptor, field) {
 }
 
 async function actionScanPage({ service, url: explicitUrl, secretKey }) {
-  const serviceKey = (service || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+  const serviceKey = (service || '').toLowerCase().replace(/[^a-z0-9_]/g, '');
 
   let scanUrl = explicitUrl;
   if (!scanUrl && serviceKey) {
@@ -5394,7 +5698,7 @@ async function actionRecordFailure({ id, failureEntry }) {
 // Ensures a browser or API-key agent has valid credentials/session before the
 // plan runs. Reuses actionRun's agent lookup + auth flow but stops as soon as
 // auth succeeds. Called from preflightAgents.
-async function actionAuthenticate({ agentId, task, url, skipAuth, manualLogin = false, preflightProbe = false, _progressCallbackUrl }) {
+async function actionAuthenticate({ agentId, task, url, skipAuth, manualLogin = false, preflightProbe = false, forceAuthProbe = false, _progressCallbackUrl }) {
   if (!agentId) return { ok: false, error: 'agentId is required' };
   const authTask = task || `Authenticate to ${agentId}`;
   return await actionRun({
@@ -5404,6 +5708,7 @@ async function actionAuthenticate({ agentId, task, url, skipAuth, manualLogin = 
     skipAuth,
     manualLogin,
     preflightProbe,
+    forceAuthProbe,
     _progressCallbackUrl,
     _authOnly: true,
   });

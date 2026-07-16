@@ -157,6 +157,17 @@ if (ddbKey) {
 const { cliAgent }     = require('../src/skills/cli.agent.cjs');
 const { browserAgent } = require('../src/skills/browser.agent.cjs');
 
+// Prevent explore.agent background scans from consuming test HTTP mocks.
+// enqueueScan fires scanDomain asynchronously after successful runs, and its
+// HTTP calls race with subsequent tests' mocked http.request, shifting response
+// alignment. Replace with a no-op so no background scans start during tests.
+try {
+  const _exploreMod = require('../src/skills/explore.agent.cjs');
+  if (_exploreMod && typeof _exploreMod.enqueueScan === 'function') {
+    _exploreMod.enqueueScan = () => {};
+  }
+} catch (_) { /* explore.agent may not be loadable in test env — non-fatal */ }
+
 // ─── http mock (mutate after load — browser.agent holds a ref to the http obj) ─
 const http = require('http');
 let _origHttpRequest = null;
@@ -301,18 +312,21 @@ async function runAll() {
       type:       'browser',
       service:    'notion',
       status:     'healthy',
-      descriptor: 'type: browser\nservice: notion\nstart_url: https://notion.so\nsign_in_url: https://notion.so/login\nauth_success_pattern: notion.so/dashboard',
+      descriptor: 'type: browser\nservice: notion\nstart_url: https://app.notion.com\nsign_in_url: https://www.notion.com/login\nauth_success_pattern: app.notion.com\nmeta_revision: 2',
     }];
 
-    // HTTP sequence: waitForAuth → web.agent nav hints → skill-db → web.agent deep-link → agentbrowser.agent
+    // HTTP sequence: domain-continuity → navigate → evaluate(href) → evaluate(metadata) → current-browser-state → web.agent nav hints → getLearnedCorrection → web.agent deep-link → playwright.agent
     let callIdx = 0;
     const httpResponses = [
-      JSON.stringify({ data: { ok: true } }),                           // 0 waitForAuth
-      JSON.stringify({ ok: true, data: [] }),                           // 1 memory.getRecentOcr
-      JSON.stringify({ ok: false, error: 'No nav hints' }),             // 2 web.agent nav hints
-      JSON.stringify({ ok: true, data: null }),                         // 3 memory.retrieve / getLearnedCorrection
-      JSON.stringify({ ok: false, error: 'No deep-link candidates found' }), // 4 web.agent deep-link
-      JSON.stringify({ data: { ok: true, result: 'page created', transcript: [], turns: 3, done: true } }), // 5 agentbrowser.agent
+      JSON.stringify({ data: { available: false } }),                                                                    // 0 domain continuity (memory.getRecentOcr)
+      JSON.stringify({ data: { ok: true } }),                                                                             // 1 callBrowserAct navigate
+      JSON.stringify({ data: { ok: true, result: 'https://app.notion.com/chat' } }),                                      // 2 callBrowserAct evaluate (window.location.href)
+      JSON.stringify({ data: { ok: true, result: JSON.stringify({ title: 'Notion', hasUserGlobal: true, titleIsLogin: false, isNoIndex: false }) } }), // 3 callBrowserAct evaluate (page metadata — authenticated)
+      JSON.stringify({ data: { available: false } }),                                                                    // 4 current browser state (memory.getRecentOcr)
+      JSON.stringify({ ok: false, error: 'No nav hints' }),             // 5 web.agent nav hints (tier-3 enrichment)
+      JSON.stringify({ ok: true, data: null }),                         // 6 getLearnedCorrection (skill-db)
+      JSON.stringify({ ok: false, error: 'No deep-link candidates found' }), // 7 web.agent deep-link (discover_task_url)
+      JSON.stringify({ data: { ok: true, result: 'page created', transcript: [], turns: 3, done: true } }), // 8 playwright.agent (final delegation)
     ];
     mockLLMResponse = 'none';   // skip LLM-suggested URL layer in deep-link discovery
     _origHttpRequest = http.request;
@@ -407,6 +421,113 @@ async function runAll() {
       result.error && (result.error.toLowerCase().includes('parse') || result.error.toLowerCase().includes('failed')),
       `expected parse/delegation error in result.error, got: ${result.error}`
     );
+  });
+
+  // U-09: browser.agent authenticate with host_aliases — regression for _svcInfo TDZ error
+  await test('U-09: browser.agent authenticate with host_aliases does not throw _svcInfo ReferenceError', async () => {
+    mockDbRows['agents'] = [{
+      id:         'notion.agent',
+      type:       'browser',
+      service:    'notion',
+      status:     'healthy',
+      descriptor: 'type: browser\nservice: notion\nstart_url: https://app.notion.com\nsign_in_url: https://www.notion.com/login\nauth_success_pattern: app.notion.com\nhost_aliases: www.notion.so, www.notion.com, notion.so, notion.com\nmeta_revision: 2',
+    }];
+
+    let callIdx = 0;
+    const httpResponses = [
+      JSON.stringify({ data: { available: false } }),                                                                    // 0: domain continuity (memory.getRecentOcr) — no capture
+      JSON.stringify({ data: { ok: true } }),                                                                             // 1: callBrowserAct navigate → success
+      JSON.stringify({ data: { ok: true, result: 'https://app.notion.com/chat' } }),                                      // 2: callBrowserAct evaluate (window.location.href)
+      JSON.stringify({ data: { ok: true, result: JSON.stringify({ title: 'Notion', hasUserGlobal: true, titleIsLogin: false, isNoIndex: false }) } }), // 3: callBrowserAct evaluate (page metadata — authenticated)
+      JSON.stringify({ data: { ok: true } }),                                                                             // 4: callBrowserAct close (silent preflight probe cleanup)
+    ];
+    mockLLMResponse = 'none';
+    _origHttpRequest = http.request;
+    http.request = (_opts, cb) => {
+      const body = httpResponses[callIdx++] || JSON.stringify({ data: { ok: false, error: 'unexpected call' } });
+      const res  = new EventEmitter();
+      res.statusCode = 200;
+      setImmediate(() => {
+        if (cb) cb(res);
+        setImmediate(() => { res.emit('data', body); res.emit('end'); });
+      });
+      const req = { write: () => {}, end: () => {}, on: (_e, _f) => req, destroy: () => {} };
+      return req;
+    };
+
+    const result = await browserAgent({
+      action:         'authenticate',
+      agentId:        'notion.agent',
+      task:           'Authenticate to notion.agent',
+      preflightProbe: true,
+      forceAuthProbe: true,
+    });
+    restoreHttp();
+
+    assert.equal(result.ok,           true,  `ok should be true, got: ${JSON.stringify(result)}`);
+    assert.equal(result.authed,       true,  'authed should be true');
+    assert.equal(result.authVerified, true,  'authVerified should be true');
+    assert.equal(result.agentId,      'notion.agent', 'agentId should match');
+  });
+
+  // U-10: browser.agent migrates stale Notion descriptor to canonical URLs before auth
+  await test('U-10: browser.agent migrates stale Notion descriptor and navigates to canonical URL', async () => {
+    mockDbRows['agents'] = [{
+      id:         'notion.agent',
+      type:       'browser',
+      service:    'notion',
+      status:     'healthy',
+      descriptor: 'type: browser\nservice: notion\nstart_url: https://www.notion.so\nsign_in_url: https://www.notion.so/login\nauth_success_pattern: notion.so',
+    }];
+
+    let navigateUrl = null;
+    let callIdx = 0;
+    const httpResponses = [
+      JSON.stringify({ data: { available: false } }),                                                                    // 0: domain continuity (memory.getRecentOcr)
+      JSON.stringify({ data: { ok: true } }),                                                                             // 1: callBrowserAct navigate → success
+      JSON.stringify({ data: { ok: true, result: 'https://app.notion.com/chat' } }),                                      // 2: callBrowserAct evaluate (window.location.href)
+      JSON.stringify({ data: { ok: true, result: JSON.stringify({ title: 'Notion', hasUserGlobal: true, titleIsLogin: false, isNoIndex: false }) } }), // 3: callBrowserAct evaluate (page metadata — authenticated)
+      JSON.stringify({ data: { ok: true } }),                                                                             // 4: callBrowserAct close (silent preflight probe cleanup)
+    ];
+    mockLLMResponse = 'none';
+    _origHttpRequest = http.request;
+    http.request = (_opts, cb) => {
+      const body = httpResponses[callIdx++] || JSON.stringify({ data: { ok: false, error: 'unexpected call' } });
+      const res  = new EventEmitter();
+      res.statusCode = 200;
+      setImmediate(() => {
+        if (cb) cb(res);
+        setImmediate(() => { res.emit('data', body); res.emit('end'); });
+      });
+      const req = {
+        write: (data) => {
+          try {
+            const parsed = JSON.parse(data);
+            if (parsed?.payload?.args?.action === 'navigate') {
+              navigateUrl = parsed.payload.args.url;
+            }
+          } catch {}
+        },
+        end:  () => {},
+        on:   (_e, _f) => req,
+        destroy: () => {},
+      };
+      return req;
+    };
+
+    const result = await browserAgent({
+      action:         'authenticate',
+      agentId:        'notion.agent',
+      task:           'Authenticate to notion.agent',
+      preflightProbe: true,
+      forceAuthProbe: true,
+    });
+    restoreHttp();
+
+    assert.equal(result.ok,           true,  `ok should be true, got: ${JSON.stringify(result)}`);
+    assert.equal(result.authed,       true,  'authed should be true');
+    assert.equal(result.authVerified, true,  'authVerified should be true');
+    assert.equal(navigateUrl,         'https://app.notion.com', `navigate URL should be canonical after migration, got: ${navigateUrl}`);
   });
 
   // ── Summary ────────────────────────────────────────────────────────────────
