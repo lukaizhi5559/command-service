@@ -772,7 +772,10 @@ What is the single most direct URL to open in a browser to begin this task? Retu
       catch (_) { return ''; }
     })();
     if (!resolvedHost || (resolvedHost !== baseHost && !resolvedHost.endsWith('.' + baseHost))) {
-      return { ok: false, error: `LLM suggested off-domain URL: ${resolved}` };
+      // Don't reject — return with flag so caller can verify via navigation.
+      // Shortcut domains (e.g. notion.new → app.notion.com) redirect to the canonical service.
+      logger.info(`[destination-resolver] suggestTaskUrl: off-domain candidate for ${serviceKey}:${intent} → ${resolved} (needsVerification)`);
+      return { ok: true, url: resolved, needsVerification: true };
     }
 
     logger.info(`[destination-resolver] suggestTaskUrl: ${serviceKey}:${intent} → ${resolved}`);

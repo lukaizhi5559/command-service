@@ -106,6 +106,35 @@ function _isParkingContent(title, snippet, url) {
   return false;
 }
 
+function _classifyDiscoveryCandidate({ url, title, snippet }, serviceDomain) {
+  const text = `${url || ''} ${title || ''} ${snippet || ''}`.toLowerCase();
+  let host = '';
+  let path = '';
+  try {
+    const parsed = new URL(url);
+    host = parsed.hostname.replace(/^www\./, '');
+    path = parsed.pathname.toLowerCase();
+  } catch (_) {
+    return { pageClass: 'unknown', onServiceDomain: false };
+  }
+
+  const normalizedServiceDomain = String(serviceDomain || '').replace(/^www\./, '').toLowerCase();
+  const onServiceDomain = host === normalizedServiceDomain || host.endsWith(`.${normalizedServiceDomain}`);
+  if (/\b(help|support|documentation|docs|guide|tutorial|community|forum)\b/.test(text)) {
+    return { pageClass: 'documentation', onServiceDomain };
+  }
+  if (/\/(compose|draft|new|create|upload|publish|submit|editor)(?:\b|\/)/.test(path)) {
+    return { pageClass: 'app-action', onServiceDomain };
+  }
+  if (/\/(p|page|post|article|blog|item)\//.test(path)) {
+    return { pageClass: onServiceDomain ? 'app-content' : 'public-content', onServiceDomain };
+  }
+  if (onServiceDomain && (path === '/' || path === '')) {
+    return { pageClass: 'app-home', onServiceDomain };
+  }
+  return { pageClass: 'unknown', onServiceDomain };
+}
+
 /**
  * Score a search result URL for quality.
  * Higher = better. Penalizes parking pages via content signals, rewards preferDomain match.
@@ -401,9 +430,10 @@ function _calculateStepConfidence(mergedSteps, sourceCount) {
 
 /**
  * Discover the most direct deep-link URL for a task on a given service domain.
- * Uses two search strategies and merges results:
+ * Uses three search strategies and merges results:
  *   A) site-scoped:   site:<domain> <task>          → finds indexed app pages
  *   B) broad:         <domain> <task> how to page URL → finds URLs mentioned in tutorials/guides
+ *   C) shortcut:      <serviceName> <taskType> direct URL shortcut → finds shortcut domains (e.g. notion.new)
  * Scores all candidates and returns the best one.
  */
 async function actionDiscoverTaskUrl({ domain, task, maxResults = 5, candidateUrl }) {
@@ -411,6 +441,7 @@ async function actionDiscoverTaskUrl({ domain, task, maxResults = 5, candidateUr
   if (!task)   return { ok: false, error: 'task is required' };
 
   const cleanDomain = domain.replace(/^https?:\/\//, '').replace(/^www\./, '').replace(/\/$/, '');
+  const domainBase = cleanDomain.split('.')[0]; // e.g. 'notion' from 'app.notion.com'
   logger.info(`[web.agent] discover_task_url: domain=${cleanDomain} task="${task.slice(0, 80)}" candidateUrl=${candidateUrl || 'none'}`);
 
   // Extract task keywords for scoring
@@ -450,8 +481,14 @@ async function actionDiscoverTaskUrl({ domain, task, maxResults = 5, candidateUr
         allCandidates.push({ url: r.url, title: r.title, snippet: r.snippet, source: 'broad-result' });
         // Also extract URLs mentioned in snippets (tutorials often say "go to exampleapp.com/create")
         // Include #, ?, =, &, % and other common URL chars so deep links like mail.google.com/mail/u/0/#inbox?compose=new are captured.
+        // Extract URLs matching the full cleanDomain/path pattern
         const snippetUrls = (r.snippet || '').match(new RegExp(
           cleanDomain.replace(/\./g, '\\.') + '\\/[a-z0-9\/_#?=&.~%+-]+', 'gi'
+        ));
+        // Also extract shortcut-domain URLs (e.g. notion.new, notion.so) —
+        // serviceName.<tld> patterns that may not match cleanDomain
+        const shortcutSnippetUrls = (r.snippet || '').match(new RegExp(
+          domainBase.replace(/\./g, '\\.') + '\\.[a-z]{2,}(?:\\/[a-z0-9\/_#?=&.~%+-]*)?', 'gi'
         ));
         if (snippetUrls) {
           for (const su of snippetUrls) {
@@ -459,17 +496,51 @@ async function actionDiscoverTaskUrl({ domain, task, maxResults = 5, candidateUr
             allCandidates.push({ url: fullUrl, title: r.title, snippet: r.snippet, source: 'broad-snippet' });
           }
         }
+        if (shortcutSnippetUrls) {
+          for (const su of shortcutSnippetUrls) {
+            const fullUrl = su.startsWith('http') ? su : `https://${su}`;
+            // Avoid duplicates already added via snippetUrls
+            if (!allCandidates.some(c => c.url === fullUrl)) {
+              allCandidates.push({ url: fullUrl, title: r.title, snippet: r.snippet, source: 'broad-snippet-shortcut' });
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // ── Strategy C: shortcut/direct URL search ─────────────────────────────
+  // Search for "<serviceName> <taskType> direct URL shortcut" to find shortcut
+  // domains like notion.new, docs.google.com/forms, etc.
+  const serviceName = cleanDomain.split('.')[0]; // 'notion' from 'app.notion.com'
+  const taskType = /create|new|compose|write|draft/i.test(task) ? 'create new page' : task.split(' ').slice(0, 3).join(' ');
+  const queryC = `${serviceName} ${taskType} direct URL shortcut`;
+  logger.info(`[web.agent] discover_task_url: strategy C (shortcut): "${queryC.slice(0, 80)}"`);
+  const resultC = await searchWeb(queryC, maxResults).catch(() => ({ ok: false }));
+  if (resultC.ok && resultC.results) {
+    for (const r of resultC.results) {
+      if (!_isParkingContent(r.title, r.snippet, r.url)) {
+        allCandidates.push({ url: r.url, title: r.title, snippet: r.snippet, source: 'shortcut-result' });
+        // Extract shortcut URLs from snippets — patterns like notion.new, notion.so, etc.
+        const shortcutUrls = (r.snippet || '').match(new RegExp(
+          serviceName.replace(/\./g, '\\\.') + '\\.[a-z]{2,}(?:\\/[a-z0-9\/_#?=&.~%+-]*)?', 'gi'
+        ));
+        if (shortcutUrls) {
+          for (const su of shortcutUrls) {
+            const fullUrl = su.startsWith('http') ? su : `https://${su}`;
+            allCandidates.push({ url: fullUrl, title: r.title, snippet: r.snippet, source: 'shortcut-snippet' });
+          }
+        }
       }
     }
   }
 
   if (allCandidates.length === 0) {
-    logger.info('[web.agent] discover_task_url: no candidates found from either strategy');
+    logger.info('[web.agent] discover_task_url: no candidates found from any strategy');
     return { ok: false, error: 'No deep-link candidates found' };
   }
 
   // ── Score all candidates ────────────────────────────────────────────────
-  const domainBase = cleanDomain.split('.')[0]; // e.g. 'exampleapp' from 'exampleapp.com'
   const scored = allCandidates.map(c => {
     let score = 10; // baseline
     try {
@@ -485,6 +556,8 @@ async function actionDiscoverTaskUrl({ domain, task, maxResults = 5, candidateUr
       // +30: Same domain as the service
       if (host === cleanDomain || host.endsWith('.' + cleanDomain)) score += 30;
       else if (host.includes(domainBase)) score += 15;
+      // +15: Hostname starts with service name base but different TLD (likely shortcut domain)
+      else if (host.split('.')[0] === domainBase) score += 15;
 
       // +20: On the service domain (not a blog/reddit)
       if (host === cleanDomain || host.endsWith('.' + cleanDomain)) score += 20;
@@ -537,16 +610,27 @@ async function actionDiscoverTaskUrl({ domain, task, maxResults = 5, candidateUr
     return { ok: false, error: 'No candidate scored above threshold', bestScore: deduped[0]?._score || 0 };
   }
 
-  const best = deduped[0];
-  const confidence = Math.min(1, best._score / 100);
-  logger.info(`[web.agent] discover_task_url: best=${best.url} score=${best._score} confidence=${confidence.toFixed(2)} source=${best.source}`);
+  const candidates = deduped.slice(0, 5).map(c => ({
+    url: c.url,
+    title: c.title,
+    snippet: c.snippet,
+    score: c._score,
+    source: c.source,
+    trust: 'search',
+    ..._classifyDiscoveryCandidate(c, cleanDomain),
+  }));
+  const best = candidates[0];
+  const confidence = Math.min(1, best.score / 100);
+  logger.info(`[web.agent] discover_task_url: candidate=${best.url} score=${best.score} confidence=${confidence.toFixed(2)} source=${best.source} class=${best.pageClass}`);
 
   return {
     ok: true,
     taskUrl: best.url,
     confidence,
-    score: best._score,
-    allCandidates: deduped.slice(0, 5).map(c => ({ url: c.url, score: c._score, source: c.source })),
+    score: best.score,
+    trust: 'search',
+    candidate: best,
+    allCandidates: candidates,
   };
 }
 
@@ -572,3 +656,4 @@ module.exports.actionResearchDomain    = actionResearchDomain;
 module.exports.actionGetTutorialSteps  = actionGetTutorialSteps;
 module.exports.actionSearchAndNavigate = actionSearchAndNavigate;
 module.exports.actionDiscoverTaskUrl  = actionDiscoverTaskUrl;
+module.exports._classifyDiscoveryCandidate = _classifyDiscoveryCandidate;

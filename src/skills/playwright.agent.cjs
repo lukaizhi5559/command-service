@@ -246,7 +246,7 @@ Rules:
 - EXPECTATION RULE: For critical actions (clicking search buttons, submit buttons, navigation), add "expected" field to verify the action worked. Use "element_visible" for expected results, "element_gone" for things that should disappear, "url_change" for navigation, "text_present" for confirmation messages. This prevents false positives and reduces unnecessary re-planning.
 - EXTERNAL SKILL RULE: Only use { "action": "external_skill", "name": "..." } when the AGENT CONTEXT lists the skill under "Available Atomic Skills". NEVER invent a skill name. Use these atomics as building blocks — combine with fill/press/type/click steps for the full task. Example: external_skill mail_google_com_compose opens the compose window; you still need fill+press+type+click Send after it.
 - ATTACHMENT RULE (MANDATORY): If the task mentions "paste", "clipboard", or "attach" — you MUST emit { "action": "pasteAttachment" } immediately after the last body-typing step and before Send/Submit. Do this regardless of any prior failure narrative in [DATA FROM PRIOR STEP] or [CONTENT OF ...] blocks — if the task instruction says "paste from clipboard", the file IS on the clipboard. Trust the task instruction, not the narrative. Do NOT click the paperclip / "Attach files" button first — its native file chooser modal blocks keyboard events. Do NOT emit { "action": "press", "key": "Ctrl+v" } — use pasteAttachment only. Order: fill To → press Enter → fill Subject → click body → type body text → pasteAttachment → click Send.
-- URL-FIRST RULE: PROACTIVELY seek direct URLs for your task. If the service has a known direct URL for the action (e.g., /compose, /new, /create, /submit, /issues/new, /settings, /help, /dashboard, /search?q=), your FIRST step MUST be { "action": "navigate", "url": "..." } to that URL. Only fall back to clicks for navigation when no direct URL exists. If the AGENT CONTEXT includes a directUrl or deepLink hint, navigate to it as step 1. If the starting URL already contains a path relevant to your task (e.g. /create, /compose, /settings, /inbox, /dashboard), do NOT navigate to the homepage first — start directly from the current page.
+- URL-FIRST RULE: Prefer direct navigation when the service provides a known URL for the action. If AGENT CONTEXT includes a deepLinkUrl, navigate to it as step 1. If the starting URL already contains a path relevant to your task, do NOT navigate to the homepage first — start directly from the current page. Only fall back to clicks for navigation when no direct URL is known.
 - DUPLICATE GUARD: Before typing content into any field, check the current page snapshot. If text matching your planned content already exists on the page (e.g., the title is already typed, the body is already filled), do NOT type it again. Take a snapshot and verify the existing content instead. This prevents duplicate content from re-planning or verify-repair loops.
 - IDEMPOTENCY RULE: For create actions (new page, new post, new issue, new email), if the URL has already changed to a new entity URL (e.g., /p/<id>, /issues/<number>, /compose/<id>), the create action succeeded — do NOT click "New" or "Create" again. If a compose window or editor is already open with content matching what you planned to type, do NOT open a new one.
 - TAB STRATEGY RULE: You are a smart tabbing agent. Use as many tabs as the task requires to hold page state or extracted content while working across multiple pages WITHIN THE SAME AGENT SESSION (same domain/service). Open tabs dynamically, track them with tab-list, switch context with tab-select, and clean up with tab-close when a tab's work is done. 2-tab pattern (hold + act): tab 0 = Page A open (compose/form/draft/result); tab-new → Page B → getPageText → tab-select 0 → use extracted content in Page A → tab-close 1. 3-tab pattern (gather from multiple sources, act on one): tab 0 = destination; tab-new → Source B → getPageText; tab-new → Source C → getPageText; tab-select 0 → combine B+C → act → tab-close 2, tab-close 1. 5-tab pattern (parallel research, single synthesis): tab 0 = output/synthesis page; tabs 1–4 = tab-new per source → getPageText each; tab-select 0 → synthesize all results → act → close extra tabs in reverse order. Rules: (1) Always getPageText BEFORE switching away from a tab — result carries forward as [DATA FROM PRIOR STEP] context. (2) Use tab-list to audit open tabs when managing many. (3) tab-close completed tabs to keep the session clean. (4) NEVER use tabs to reach a different service — each agent owns its own Chrome session and cookie store.`;
@@ -852,6 +852,8 @@ const MAX_ORIENT_STEPS = 3;
 
 async function orientPage({ goal, snapshot, sessionId, headed, timeoutMs, learnedRulesBlock, domainLockBlock = '' }) {
   let currentSnapshot = snapshot;
+  let _lastHash = snapshotHash(currentSnapshot);
+  let _noChangeCount = 0;
   for (let i = 0; i < MAX_ORIENT_STEPS; i++) {
     let orientRaw;
     try {
@@ -880,7 +882,7 @@ async function orientPage({ goal, snapshot, sessionId, headed, timeoutMs, learne
       break;
     }
 
-    const orientStep = parsed.step;
+    const orientStep = normalizeStep(parsed.step);
     logger.info(`[playwright.agent] orientation step ${i + 1}/${MAX_ORIENT_STEPS}: ${JSON.stringify(orientStep)}`);
 
     let outcome;
@@ -900,7 +902,19 @@ async function orientPage({ goal, snapshot, sessionId, headed, timeoutMs, learne
     const reSnap = await browserAct({ action: 'snapshot', sessionId, headed, timeoutMs });
     if (reSnap.ok && reSnap.result) {
       currentSnapshot = reSnap.result;
-      logger.info(`[playwright.agent] orientation: re-snapshotted after step ${i + 1} (${countRefs(currentSnapshot)} refs)`);
+      const _newHash = snapshotHash(currentSnapshot);
+      logger.info(`[playwright.agent] orientation: re-snapshotted after step ${i + 1} (${countRefs(currentSnapshot)} refs, hash=${_newHash})`);
+      // Phase 7: Detect no-change to prevent infinite orientation loop
+      if (_newHash === _lastHash) {
+        _noChangeCount++;
+        if (_noChangeCount >= 2) {
+          logger.warn(`[playwright.agent] orientation: snapshot unchanged after 2 consecutive steps — stopping (infinite loop guard)`);
+          break;
+        }
+      } else {
+        _noChangeCount = 0;
+        _lastHash = _newHash;
+      }
     }
 
     // If interstitial cleared, we're done
@@ -926,7 +940,23 @@ function normalizeStep(step) {
   if (typeof step.action === 'string' && step.ref && !step.selector) {
     step = { ...step, selector: step.ref };
   }
-  if (typeof step.action === 'string') return step; // already correct format
+  if (typeof step.action === 'string') {
+    // Phase 7: Validate and auto-fix malformed selectors (e.g. button[ref=e24] → e24)
+    if (step.selector) {
+      const _selCheck = validateSelector(step.selector);
+      if (!_selCheck.valid) {
+        // Try to extract bare ref from malformed selector
+        const _refMatch = String(step.selector).match(/e\d+/);
+        if (_refMatch) {
+          logger.warn(`[playwright.agent] normalizeStep: auto-fixing selector "${step.selector}" → "${_refMatch[0]}" (${_selCheck.reason})`);
+          step = { ...step, selector: _refMatch[0] };
+        } else {
+          logger.warn(`[playwright.agent] normalizeStep: invalid selector "${step.selector}" — ${_selCheck.reason}`);
+        }
+      }
+    }
+    return step;
+  }
   const keys = Object.keys(step);
   if (keys.length === 1) {
     const action = keys[0];
@@ -961,6 +991,955 @@ function postProgress(callbackUrl, evt) {
 }
 
 // ---------------------------------------------------------------------------
+// Phase 7: Snapshot hash — for orientation loop change detection
+// ---------------------------------------------------------------------------
+function snapshotHash(snapshotText) {
+  if (!snapshotText) return '0';
+  return String(snapshotText.length) + ':' + String(countRefs(snapshotText));
+}
+
+// ---------------------------------------------------------------------------
+// Phase 7: Validate selector — reject malformed ref/CSS hybrid selectors
+// ---------------------------------------------------------------------------
+function validateSelector(selector) {
+  if (!selector || typeof selector !== 'string') return { valid: false, reason: 'missing or non-string selector' };
+  const s = selector.trim();
+  if (!s) return { valid: false, reason: 'empty selector' };
+  // Reject button[ref=eN] — ref/CSS syntax confusion
+  if (/button\[ref=e\d+\]|\[ref=e\d+\]/i.test(s)) {
+    return { valid: false, reason: `malformed ref/CSS hybrid selector: "${s}" — refs should be bare (e.g. "e24"), not wrapped in CSS attribute selectors` };
+  }
+  return { valid: true };
+}
+
+// ---------------------------------------------------------------------------
+// Phase 6: Snapshot pruning — filter noise from ARIA snapshot before LLM
+// Removes role: generic nodes with no interactive children or text, caps at ~50 refs
+// ---------------------------------------------------------------------------
+function pruneSnapshot(snapshotText, maxRefs = 50) {
+  if (!snapshotText) return '(no snapshot available)';
+  const lines = snapshotText.split('\n');
+  const INTERACTIVE = /\b(textbox|searchbox|combobox|input|textarea|button|link|checkbox|radio|menuitem|option|tab|treeitem|switch|dialog|alertdialog)\b/i;
+  const CONTENTEDITABLE = /\[contenteditable\]|contenteditable=["']?true/i;
+  const HAS_REF = /\[?e\d+\]|\[ref=e\d+\]/;
+  const GENERIC = /\bgeneric\b/i;
+  const added = new Set();
+  const out = [];
+
+  const push = (line) => {
+    if (!added.has(line)) { added.add(line); out.push(line); }
+  };
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    // Always keep interactive elements and contenteditable
+    if ((INTERACTIVE.test(line) || CONTENTEDITABLE.test(line)) && HAS_REF.test(line)) {
+      // Walk backwards to find nearest meaningful parent
+      for (let p = i - 1; p >= Math.max(0, i - 3); p--) {
+        const candidate = lines[p];
+        if (candidate && candidate.trim() && candidate.trim() !== '-' && candidate.trim() !== ':') {
+          push(candidate);
+          break;
+        }
+      }
+      push(line);
+      continue;
+    }
+    // Keep lines with text content (quoted strings) even if generic
+    if (HAS_REF.test(line) && !GENERIC.test(line)) {
+      push(line);
+      continue;
+    }
+    // Keep generic lines that have text labels (quoted strings)
+    if (GENERIC.test(line) && HAS_REF.test(line) && /"[^"]{3,}"/.test(line)) {
+      push(line);
+      continue;
+    }
+  }
+
+  if (out.length === 0) return trimSnapshot(snapshotText, 8000);
+  // Cap at maxRefs lines (not exact ref count, but close enough)
+  const capped = out.slice(0, maxRefs * 2); // ~2 lines per ref (parent + element)
+  return `[Pruned snapshot: ${countRefs(snapshotText)} refs → ${countRefs(capped.join('\n'))} meaningful refs]\n` + capped.join('\n');
+}
+
+// ---------------------------------------------------------------------------
+// Phase 1: Page probe — lightweight eval, no LLM call
+// Runs after URL-first navigation settles, classifies page structure
+// ---------------------------------------------------------------------------
+async function pageProbe(sessionId, headed, timeoutMs = 5000) {
+  const probeCode = `JSON.stringify({
+    hasContentEditable: document.querySelector('[contenteditable]') !== null,
+    contentEditableCount: document.querySelectorAll('[contenteditable]').length,
+    activeElementEditable: document.activeElement?.isContentEditable || false,
+    activeElementTag: document.activeElement?.tagName || null,
+    activeElementRole: document.activeElement?.getAttribute('role') || null,
+    interactiveCount: document.querySelectorAll('button, input, select, textarea, a[href]').length,
+    ariaGenericCount: document.querySelectorAll('[role="generic"], div:not([role])').length,
+    hasCanvas: document.querySelector('canvas') !== null,
+    bodyTextLength: document.body?.innerText?.length || 0,
+    hostname: window.location.hostname
+  })`;
+  try {
+    const result = await browserAct({ action: 'evaluate', text: probeCode, sessionId, headed, timeoutMs });
+    if (result.ok && result.result) {
+      const parsed = JSON.parse(result.result.replace(/^"|"$/g, '').replace(/\\"/g, '"'));
+      logger.info(`[playwright.agent] page probe: ${JSON.stringify(parsed)}`);
+      return parsed;
+    }
+  } catch (err) {
+    logger.warn(`[playwright.agent] page probe failed (non-fatal): ${err.message}`);
+  }
+  return null;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 1: Classify page type — deterministic, no LLM
+// ---------------------------------------------------------------------------
+function classifyPageType(probe) {
+  if (!probe) return 'sparse';
+  const { hasContentEditable, contentEditableCount, interactiveCount } = probe;
+
+  // Canvas app: contenteditable dominates, few semantic interactive elements
+  if (hasContentEditable && contentEditableCount >= 1 && interactiveCount < 20) {
+    return 'canvas';
+  }
+
+  // Hybrid: has contenteditable AND rich interactive elements
+  if (hasContentEditable && interactiveCount >= 20) {
+    return 'hybrid';
+  }
+
+  // Traditional DOM: no contenteditable, rich interactive elements
+  if (!hasContentEditable && interactiveCount >= 5) {
+    return 'traditional';
+  }
+
+  // Sparse/unknown: very few elements — could be loading, login wall, or SPA shell
+  return 'sparse';
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4: Script DB helpers — store/retrieve interaction scripts via skill-db KV
+// Uses KV store with key prefix 'interaction_script:'
+// ---------------------------------------------------------------------------
+const SCRIPT_KV_PREFIX = 'interaction_script';
+
+async function getInteractionScript(service, pageType, taskKeywords = []) {
+  try {
+    // Try exact match: service + page_type
+    const exactKey = `${SCRIPT_KV_PREFIX}:${service}:${pageType}`;
+    const exact = await skillDb.get('_playwright_agent', exactKey);
+    if (exact && exact.script_yaml && (exact.status === 'healthy' || exact.status === 'degraded')) {
+      logger.info(`[playwright.agent] script DB: found exact match for ${service}:${pageType} (status=${exact.status})`);
+      return exact;
+    }
+    // Try fallback: any script for this service
+    const all = await skillDb.list('_playwright_agent');
+    for (const entry of all) {
+      if (!entry.key.startsWith(SCRIPT_KV_PREFIX + ':' + service)) continue;
+      const val = entry.value;
+      if (!val || !val.script_yaml) continue;
+      if (val.status !== 'healthy' && val.status !== 'degraded') continue;
+      // Keyword matching if trigger_keywords present
+      if (val.trigger_keywords && taskKeywords.length > 0) {
+        const overlap = val.trigger_keywords.filter(k => taskKeywords.some(t => t.toLowerCase().includes(k.toLowerCase()) || k.toLowerCase().includes(t.toLowerCase())));
+        if (overlap.length > 0) {
+          logger.info(`[playwright.agent] script DB: keyword match for ${service} (keywords: ${overlap.join(',')})`);
+          return val;
+        }
+      } else {
+        // No keywords to match — return first found
+        logger.info(`[playwright.agent] script DB: fallback match for ${service} (key=${entry.key})`);
+        return val;
+      }
+    }
+  } catch (err) {
+    logger.warn(`[playwright.agent] script DB lookup failed (non-fatal): ${err.message}`);
+  }
+  return null;
+}
+
+async function saveInteractionScript(service, action, pageType, scriptYaml, triggerKeywords = []) {
+  try {
+    const key = `${SCRIPT_KV_PREFIX}:${service}:${action}`;
+    const script = {
+      id: `${service}.${action}`,
+      service,
+      action,
+      page_type: pageType,
+      trigger_keywords: triggerKeywords,
+      script_yaml: scriptYaml,
+      status: 'healthy',
+      last_validated: Date.now(),
+      failure_count: 0,
+      success_count: 1,
+      created_at: Date.now(),
+    };
+    await skillDb.set('_playwright_agent', key, script);
+    logger.info(`[playwright.agent] script DB: saved ${key} (status=healthy)`);
+    return true;
+  } catch (err) {
+    logger.warn(`[playwright.agent] script DB save failed (non-fatal): ${err.message}`);
+    return false;
+  }
+}
+
+async function incrementScriptSuccess(service, action) {
+  try {
+    const key = `${SCRIPT_KV_PREFIX}:${service}:${action}`;
+    const existing = await skillDb.get('_playwright_agent', key);
+    if (existing) {
+      existing.success_count = (existing.success_count || 0) + 1;
+      existing.last_validated = Date.now();
+      await skillDb.set('_playwright_agent', key, existing);
+    }
+  } catch (_) {}
+}
+
+async function incrementScriptFailure(service, action) {
+  try {
+    const key = `${SCRIPT_KV_PREFIX}:${service}:${action}`;
+    const existing = await skillDb.get('_playwright_agent', key);
+    if (existing) {
+      existing.failure_count = (existing.failure_count || 0) + 1;
+      if (existing.failure_count > 3) {
+        existing.status = 'degraded';
+        logger.warn(`[playwright.agent] script DB: ${key} marked degraded (failure_count=${existing.failure_count})`);
+      }
+      await skillDb.set('_playwright_agent', key, existing);
+    }
+  } catch (_) {}
+}
+
+// ---------------------------------------------------------------------------
+// Phase 10: Async script generation queue
+// When a canvas/hybrid page has no script in DB, queue background generation
+// so the next run can use Tier 2 instead of falling through to Tier 3.
+// ---------------------------------------------------------------------------
+const _scriptGenQueue = new Set(); // dedup by service:action
+let _scriptGenProcessing = false;
+
+function queueAsyncScriptGeneration(service, pageType, goal, taskKeywords) {
+  const action = deriveActionFromGoal(goal);
+  const queueKey = `${service}:${action}`;
+  if (_scriptGenQueue.has(queueKey)) return; // already queued
+  _scriptGenQueue.add(queueKey);
+
+  // Fire-and-forget — process asynchronously
+  _processAsyncScriptGen(service, action, pageType, goal, taskKeywords, queueKey).catch(() => {
+    _scriptGenQueue.delete(queueKey);
+  });
+}
+
+async function _processAsyncScriptGen(service, action, pageType, goal, taskKeywords, queueKey) {
+  // Check if script already exists (maybe another run created it)
+  const existing = await getInteractionScript(service, pageType, taskKeywords);
+  if (existing) {
+    _scriptGenQueue.delete(queueKey);
+    return;
+  }
+
+  logger.info(`[playwright.agent] Phase 10: async script gen queued for ${queueKey} (pageType=${pageType})`);
+
+  try {
+    // Use the sync script generation prompt to generate a script without executing it
+    const raw = await askWithMessages([
+      { role: 'system', content: SYNC_SCRIPT_GEN_PROMPT },
+      { role: 'user', content: `GOAL: ${goal}\nPAGE_TYPE: ${pageType}\nSERVICE: ${service}\n\nGenerate a keyboard-first script:` },
+    ], { temperature: 0.1, maxTokens: 800, responseTimeoutMs: 20000 });
+
+    const parsed = parseJson(raw);
+    if (!parsed || !parsed.script || !Array.isArray(parsed.script.steps)) {
+      logger.warn(`[playwright.agent] Phase 10: async script gen failed — no valid script for ${queueKey}`);
+      _scriptGenQueue.delete(queueKey);
+      return;
+    }
+
+    // Save to script DB with status 'healthy' but success_count=0 (untested)
+    const script = {
+      id: `${service}.${action}`,
+      service,
+      action,
+      page_type: pageType,
+      trigger_keywords: taskKeywords || [],
+      script_yaml: parsed.script,
+      status: 'healthy',
+      last_validated: Date.now(),
+      failure_count: 0,
+      success_count: 0,
+      created_at: Date.now(),
+      auto_generated: true,
+    };
+    const key = `${SCRIPT_KV_PREFIX}:${service}:${action}`;
+    await skillDb.set('_playwright_agent', key, script);
+    logger.info(`[playwright.agent] Phase 10: async script gen saved ${queueKey} (${parsed.script.steps.length} steps, untested)`);
+  } catch (err) {
+    logger.warn(`[playwright.agent] Phase 10: async script gen error for ${queueKey} (non-fatal): ${err.message}`);
+  } finally {
+    _scriptGenQueue.delete(queueKey);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4: Seed scripts — curated keyboard-first scripts for top canvas apps
+// ---------------------------------------------------------------------------
+const SEED_SCRIPTS = [
+  {
+    service: 'notion',
+    action: 'create_page_with_todos',
+    page_type: 'canvas',
+    trigger_keywords: ['create', 'page', 'todo', 'list', 'weekly', 'goals', 'tasks', 'notion'],
+    script_yaml: {
+      preconditions: { url_pattern: 'app.notion.com/p/.*' },
+      params: ['title', 'items'],
+      steps: [
+        { assert_focus: { check: 'document.activeElement.isContentEditable', fix: 'click', fix_locator: "getByRole('textbox')", on_fail: 'fallback' } },
+        { type: '{{title}}' },
+        { press: 'Enter' },
+        { for_each: 'items', do: [
+          { type: '[] {{item}}' },
+          { press: 'Enter' },
+        ]},
+      ],
+      verify: [
+        { eval: "document.body.innerText.includes('{{title}}')" },
+      ],
+    },
+  },
+  {
+    service: 'chatgpt',
+    action: 'new_chat',
+    page_type: 'canvas',
+    trigger_keywords: ['chatgpt', 'send', 'message', 'chat', 'ask', 'prompt', 'new'],
+    script_yaml: {
+      preconditions: { url_pattern: 'chatgpt.com.*' },
+      params: ['message'],
+      steps: [
+        { assert_focus: { check: "document.activeElement.id === 'prompt-textarea' || document.activeElement.tagName === 'TEXTAREA'", fix: 'click', fix_locator: "getByRole('textbox', { name: 'Message ChatGPT' })", on_fail: 'fallback' } },
+        { type: '{{message}}' },
+        { press: 'Enter' },
+      ],
+      verify: [
+        { eval: "document.body.innerText.length > 100" },
+      ],
+    },
+  },
+  {
+    service: 'gemini',
+    action: 'new_chat',
+    page_type: 'canvas',
+    trigger_keywords: ['gemini', 'send', 'message', 'chat', 'ask', 'prompt', 'new'],
+    script_yaml: {
+      preconditions: { url_pattern: 'gemini.google.com.*' },
+      params: ['message'],
+      steps: [
+        { assert_focus: { check: "document.activeElement.tagName === 'TEXTAREA'", fix: 'click', fix_locator: "getByRole('textbox')", on_fail: 'fallback' } },
+        { type: '{{message}}' },
+        { press: 'Enter' },
+      ],
+      verify: [
+        { eval: "document.body.innerText.length > 100" },
+      ],
+    },
+  },
+];
+
+async function ensureSeedScripts() {
+  for (const seed of SEED_SCRIPTS) {
+    try {
+      const key = `${SCRIPT_KV_PREFIX}:${seed.service}:${seed.action}`;
+      const existing = await skillDb.get('_playwright_agent', key);
+      if (!existing) {
+        await skillDb.set('_playwright_agent', key, {
+          id: `${seed.service}.${seed.action}`,
+          ...seed,
+          status: 'healthy',
+          last_validated: Date.now(),
+          failure_count: 0,
+          success_count: 0,
+          created_at: Date.now(),
+        });
+        logger.info(`[playwright.agent] script DB: seeded ${key}`);
+      }
+    } catch (_) {}
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2: Script-first executor — runs script steps deterministically
+// ---------------------------------------------------------------------------
+async function executeScript(script, params, sessionId, headed, timeoutMs) {
+  const yaml = script.script_yaml;
+  if (!yaml || !yaml.steps) return { ok: false, error: 'Script has no steps' };
+
+  const transcript = [];
+  const steps = yaml.steps;
+
+  // Template variable substitution
+  function substitute(val) {
+    if (typeof val !== 'string') return val;
+    let result = val;
+    for (const [key, value] of Object.entries(params || {})) {
+      result = result.replace(new RegExp(`\\{\\{${key}\\}\\}`, 'g'), String(value));
+    }
+    return result;
+  }
+
+  for (let i = 0; i < steps.length; i++) {
+    const step = steps[i];
+    logger.info(`[playwright.agent] script step ${i + 1}/${steps.length}: ${JSON.stringify(step)}`);
+
+    // Handle for_each loops
+    if (step.for_each) {
+      const arrName = step.for_each;
+      const arr = params[arrName];
+      if (!Array.isArray(arr)) {
+        return { ok: false, error: `for_each: "${arrName}" is not an array`, transcript, stepIndex: i };
+      }
+      const doSteps = step.do || [];
+      for (let j = 0; j < arr.length; j++) {
+        // Set {{item}} to current array element
+        const itemParams = { ...params, item: arr[j], item_index: j };
+        for (const doStep of doSteps) {
+          const expandedStep = {};
+          for (const [k, v] of Object.entries(doStep)) {
+            if (typeof v === 'string') {
+              expandedStep[k] = substitute(v.replace(/\{\{item\}\}/g, String(arr[j])));
+            } else if (typeof v === 'object') {
+              expandedStep[k] = JSON.parse(substitute(JSON.stringify(v).replace(/\{\{item\}\}/g, String(arr[j]))));
+            } else {
+              expandedStep[k] = v;
+            }
+          }
+          let loopResult;
+          try {
+            loopResult = await executeScriptStep(expandedStep, itemParams, sessionId, headed, timeoutMs, substitute);
+          } catch (stepErr) {
+            loopResult = { ok: false, error: stepErr.message };
+          }
+          transcript.push({ step: `${i + 1}.${j + 1}`, action: expandedStep, outcome: loopResult });
+          if (!loopResult.ok) {
+            return { ok: false, error: `Script step ${i + 1}.${j + 1} failed: ${loopResult.error}`, transcript, stepIndex: i };
+          }
+        }
+      }
+      continue;
+    }
+
+    let result;
+    try {
+      result = await executeScriptStep(step, params, sessionId, headed, timeoutMs, substitute);
+    } catch (stepErr) {
+      result = { ok: false, error: stepErr.message };
+    }
+    transcript.push({ step: i + 1, action: step, outcome: result });
+    if (!result.ok) {
+      return { ok: false, error: `Script step ${i + 1} failed: ${result.error}`, transcript, stepIndex: i };
+    }
+  }
+
+  // Run verify block if present
+  if (yaml.verify) {
+    for (const vStep of yaml.verify) {
+      if (vStep.eval) {
+        const evalCode = substitute(vStep.eval);
+        try {
+          const vResult = await browserAct({ action: 'evaluate', text: evalCode, sessionId, headed, timeoutMs: 5000 });
+          if (!vResult.ok || vResult.result !== 'true') {
+            logger.warn(`[playwright.agent] script verify failed: ${evalCode} → ${vResult.result}`);
+            return { ok: false, error: `Verification failed: ${evalCode}`, transcript, verified: false };
+          }
+        } catch (err) {
+          logger.warn(`[playwright.agent] script verify error: ${err.message}`);
+          return { ok: false, error: `Verification error: ${err.message}`, transcript, verified: false };
+        }
+      }
+    }
+  }
+
+  return { ok: true, transcript, verified: true };
+}
+
+async function executeScriptStep(step, params, sessionId, headed, timeoutMs, substituteFn) {
+  const sub = substituteFn || ((v) => typeof v === 'string' ? v.replace(/\{\{(\w+)\}\}/g, (_, k) => params[k] ?? '') : v);
+
+  // assert_focus
+  if (step.assert_focus) {
+    const check = sub(step.assert_focus.check);
+    try {
+      const result = await browserAct({ action: 'evaluate', text: check, sessionId, headed, timeoutMs: 3000 });
+      if (result.ok && result.result === 'true') {
+        return { ok: true, result: 'focus check passed' };
+      }
+      // Focus check failed — try fix
+      if (step.assert_focus.fix === 'click' && step.assert_focus.fix_locator) {
+        const locator = step.assert_focus.fix_locator;
+        const code = `async page => { await ${locator}.click(); }`;
+        const fixResult = await browserAct({ action: 'run-code', code, sessionId, headed, timeoutMs });
+        if (fixResult.ok) {
+          // Re-check focus
+          const recheck = await browserAct({ action: 'evaluate', text: check, sessionId, headed, timeoutMs: 3000 });
+          if (recheck.ok && recheck.result === 'true') {
+            return { ok: true, result: 'focus fixed via click' };
+          }
+        }
+      }
+      if (step.assert_focus.on_fail === 'fallback') {
+        return { ok: false, error: `Focus assertion failed: ${check}` };
+      }
+      return { ok: false, error: `Focus assertion failed: ${check}` };
+    } catch (err) {
+      return { ok: false, error: `Focus check error: ${err.message}` };
+    }
+  }
+
+  // type
+  if (step.type) {
+    const text = sub(step.type);
+    const result = await browserAct({ action: 'type', text, sessionId, headed, timeoutMs });
+    return result;
+  }
+
+  // press
+  if (step.press) {
+    const key = sub(step.press);
+    const result = await browserAct({ action: 'press', key, sessionId, headed, timeoutMs });
+    return result;
+  }
+
+  // click (via Playwright semantic locator)
+  if (step.click) {
+    const locator = sub(step.click);
+    const code = `async page => { await ${locator}.click(); }`;
+    const result = await browserAct({ action: 'run-code', code, sessionId, headed, timeoutMs });
+    return result;
+  }
+
+  // wait (via Playwright locator)
+  if (step.wait) {
+    const locator = sub(step.wait);
+    const code = `async page => { await ${locator}.waitFor({ timeout: ${timeoutMs} }); }`;
+    const result = await browserAct({ action: 'run-code', code, sessionId, headed, timeoutMs });
+    return result;
+  }
+
+  // eval
+  if (step.eval) {
+    const code = sub(step.eval);
+    const result = await browserAct({ action: 'evaluate', text: code, sessionId, headed, timeoutMs });
+    return result;
+  }
+
+  return { ok: false, error: `Unknown script step type: ${JSON.stringify(Object.keys(step))}` };
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3: Tier 2.5 — Best-effort keyboard mode
+// LLM generates keyboard-only steps (type/press, no clicks/refs) from goal
+// ---------------------------------------------------------------------------
+const BEST_EFFORT_KEYBOARD_PROMPT = `You are a keyboard automation expert. Given a task goal and page type, generate keyboard-only steps to accomplish the task. NO clicks, NO element targeting — just keyboard events to whatever has focus.
+
+Respond with EXACTLY ONE JSON object (no markdown fences):
+{
+  "thoughts": "<one sentence>",
+  "steps": [
+    { "type": "<text to type>" },
+    { "press": "<key>" }
+  ]
+}
+
+Rules:
+- Use ONLY type and press steps — no clicks, no selectors, no refs
+- Assume focus is already in the right place (URL-first navigation handled targeting)
+- For Notion: type title, press Enter (moves to body), type "[] item" for todos, press Enter between items
+- For ChatGPT/Gemini: type the message, press Enter to send
+- Keep steps minimal — just the keyboard sequence needed
+- For markdown shortcuts: "[]" for todo checkbox, "# " for heading, "- " for bullet, "> " for quote`;
+
+async function bestEffortKeyboard(goal, pageType, sessionId, headed, timeoutMs) {
+  try {
+    const raw = await askWithMessages([
+      { role: 'system', content: BEST_EFFORT_KEYBOARD_PROMPT },
+      { role: 'user', content: `GOAL: ${goal}\nPAGE_TYPE: ${pageType}\n\nGenerate keyboard-only steps:` },
+    ], { temperature: 0.1, maxTokens: 600, responseTimeoutMs: 15000 });
+
+    const parsed = parseJson(raw);
+    if (!parsed || !Array.isArray(parsed.steps) || parsed.steps.length === 0) {
+      return { ok: false, error: 'Best-effort keyboard: no steps generated', transcript: [] };
+    }
+
+    logger.info(`[playwright.agent] Tier 2.5 best-effort: ${parsed.steps.length} keyboard steps — ${parsed.thoughts}`);
+    const transcript = [];
+
+    for (let i = 0; i < parsed.steps.length; i++) {
+      const step = parsed.steps[i];
+      let result;
+      if (step.type) {
+        result = await browserAct({ action: 'type', text: step.type, sessionId, headed, timeoutMs });
+      } else if (step.press) {
+        result = await browserAct({ action: 'press', key: step.press, sessionId, headed, timeoutMs });
+      } else {
+        continue;
+      }
+      transcript.push({ step: i + 1, action: step, outcome: result });
+      if (!result.ok) {
+        return { ok: false, error: `Best-effort step ${i + 1} failed: ${result.error}`, transcript };
+      }
+      // Small delay between steps for page to react
+      await new Promise(r => setTimeout(r, 300));
+    }
+
+    return { ok: true, transcript, thoughts: parsed.thoughts };
+  } catch (err) {
+    return { ok: false, error: `Best-effort keyboard error: ${err.message}`, transcript: [] };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3: Tier 2.5 — Sync script generation
+// LLM generates a grounded script from page type + goal (no web search yet)
+// ---------------------------------------------------------------------------
+const SYNC_SCRIPT_GEN_PROMPT = `You are a browser automation script generator. Given a task goal, page type, and service name, generate a keyboard-first interaction script.
+
+The script should use keyboard shortcuts and markdown syntax that are stable across page reloads. NO element refs (eN), NO CSS selectors for targeting — use keyboard events and Playwright semantic locators only.
+
+Respond with EXACTLY ONE JSON object (no markdown fences):
+{
+  "thoughts": "<one sentence>",
+  "script": {
+    "steps": [
+      { "type": "<text>" },
+      { "press": "<key>" },
+      { "assert_focus": { "check": "<JS expression>", "fix": "click", "fix_locator": "<Playwright locator>", "on_fail": "fallback" } }
+    ],
+    "verify": [
+      { "eval": "<JS expression that returns true/false>" }
+    ]
+  }
+}
+
+Rules:
+- Use type/press for keyboard input — these go to whatever has focus
+- Use assert_focus ONLY when you need to verify focus before typing
+- For Notion: "[]" creates a todo checkbox, Enter after title moves to body, "/todo" creates a todo block
+- For ChatGPT: type message, press Enter to send
+- For Gemini: type message, press Enter to send
+- Verify should check page content (document.body.innerText.includes(...))
+- Keep steps minimal and deterministic`;
+
+async function syncScriptGeneration(goal, pageType, service, sessionId, headed, timeoutMs) {
+  try {
+    const raw = await askWithMessages([
+      { role: 'system', content: SYNC_SCRIPT_GEN_PROMPT },
+      { role: 'user', content: `GOAL: ${goal}\nPAGE_TYPE: ${pageType}\nSERVICE: ${service}\n\nGenerate a keyboard-first script:` },
+    ], { temperature: 0.1, maxTokens: 800, responseTimeoutMs: 20000 });
+
+    const parsed = parseJson(raw);
+    if (!parsed || !parsed.script || !Array.isArray(parsed.script.steps)) {
+      return { ok: false, error: 'Sync script gen: no valid script generated' };
+    }
+
+    logger.info(`[playwright.agent] Tier 2.5 sync gen: ${parsed.script.steps.length} steps — ${parsed.thoughts}`);
+
+    // Execute the generated script
+    const scriptObj = {
+      script_yaml: parsed.script,
+      service,
+      action: 'auto_generated',
+      status: 'healthy',
+    };
+
+    // Extract params from goal (simple heuristic)
+    const params = extractParamsFromGoal(goal);
+    const result = await executeScript(scriptObj, params, sessionId, headed, timeoutMs);
+
+    if (result.ok) {
+      // Cache the successful script
+      const action = deriveActionFromGoal(goal);
+      await saveInteractionScript(service, action, pageType, parsed.script, extractKeywordsFromGoal(goal));
+    }
+
+    return result;
+  } catch (err) {
+    return { ok: false, error: `Sync script gen error: ${err.message}` };
+  }
+}
+
+// Simple heuristic param extraction from goal text
+function extractParamsFromGoal(goal) {
+  const params = {};
+  // Extract title (text in quotes or after "called/named/titled")
+  const titleMatch = goal.match(/(?:called|named|titled)\s+["']([^"']+)["']/i) || goal.match(/["']([^"']{3,50})["']/);
+  if (titleMatch) params.title = titleMatch[1];
+  // Extract items (text after "with" or "containing" or listed items)
+  const itemsMatch = goal.match(/(?:with|containing|including)\s+(.+)/i);
+  if (itemsMatch) {
+    const itemsText = itemsMatch[1];
+    // Split by commas, "and", or numbered lists
+    const items = itemsText.split(/,\s*|\s+and\s+|;\s*/).map(s => s.trim().replace(/^(?:\d+[.)]\s*|\[\]\s*)/, '')).filter(s => s.length > 0);
+    if (items.length > 0) params.items = items;
+  }
+  // Extract message (for chat apps)
+  const msgMatch = goal.match(/(?:send|say|ask|message|prompt)\s+["']([^"']+)["']/i) || goal.match(/(?:send|say|ask|message|prompt)\s+(.+)/i);
+  if (msgMatch) params.message = msgMatch[1];
+  return params;
+}
+
+function deriveActionFromGoal(goal) {
+  const g = goal.toLowerCase();
+  if (/create.*page.*todo|todo.*page|create.*todo/i.test(g)) return 'create_page_with_todos';
+  if (/send.*message|new.*chat|ask/i.test(g)) return 'new_chat';
+  if (/create.*page|new.*page/i.test(g)) return 'create_page';
+  return 'auto_' + Date.now().toString(36);
+}
+
+function extractKeywordsFromGoal(goal) {
+  return goal.toLowerCase()
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .split(/\s+/)
+    .filter(w => w.length > 2)
+    .slice(0, 10);
+}
+
+// ---------------------------------------------------------------------------
+// Phase 1: Extract service name from hostname
+// ---------------------------------------------------------------------------
+function serviceFromHostname(hostname) {
+  if (!hostname) return null;
+  // Strip TLD and subdomains: app.notion.com → notion, chatgpt.com → chatgpt
+  const parts = hostname.split('.');
+  // Handle co.uk, co.jp etc
+  if (parts.length >= 3 && parts[parts.length - 2].length <= 3) {
+    return parts[parts.length - 3];
+  }
+  if (parts.length >= 2) {
+    return parts[parts.length - 2];
+  }
+  return hostname;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 11: VLM screenshot verification — calls /api/vision/verify on backend
+// Reads screenshot file → base64 → POST to vision API → returns graded result
+// ---------------------------------------------------------------------------
+const _VLM_BACKEND_HOST = process.env.THINKDROP_BACKEND_HOST || '127.0.0.1';
+const _VLM_BACKEND_PORT = parseInt(process.env.THINKDROP_BACKEND_PORT || '4000', 10);
+const _VLM_TIMEOUT_MS = 20000;
+
+function _vlmHttpPost(host, port, urlPath, body, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const payload = JSON.stringify(body);
+    const req = http.request({
+      hostname: host,
+      port,
+      path: urlPath,
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) },
+    }, (res) => {
+      let data = '';
+      res.on('data', chunk => { data += chunk; });
+      res.on('end', () => {
+        try { resolve(JSON.parse(data)); } catch (e) {
+          reject(new Error(`Invalid JSON from vision API: ${data.slice(0, 200)}`));
+        }
+      });
+    });
+    req.setTimeout(timeoutMs, () => {
+      req.destroy(new Error(`Vision API request timed out after ${timeoutMs}ms`));
+    });
+    req.on('error', reject);
+    req.write(payload);
+    req.end();
+  });
+}
+
+async function _vlmVerifyScreenshot(screenshotPath, goal, pageType) {
+  if (!screenshotPath || !fs.existsSync(screenshotPath)) return null;
+
+  // Read screenshot file and convert to base64
+  let base64;
+  try {
+    const buffer = fs.readFileSync(screenshotPath);
+    base64 = buffer.toString('base64');
+  } catch (err) {
+    logger.warn(`[playwright.agent] VLM: failed to read screenshot file: ${err.message}`);
+    return null;
+  }
+
+  // Resize large screenshots to reduce payload (max 1280px wide via sips on macOS)
+  let effectiveBase64 = base64;
+  let mimeType = 'image/png';
+  try {
+    const { execSync } = require('child_process');
+    const tempResized = path.join(os.tmpdir(), `vlm_verify_${Date.now()}.jpg`);
+    execSync(`sips -Z 1280 -s format jpeg "${screenshotPath}" --out "${tempResized}"`, { timeout: 5000 });
+    if (fs.existsSync(tempResized)) {
+      effectiveBase64 = fs.readFileSync(tempResized).toString('base64');
+      mimeType = 'image/jpeg';
+      try { fs.unlinkSync(tempResized); } catch (_) {}
+    }
+  } catch (_) { /* sips not available or failed — use original */ }
+
+  // Construct verification prompt
+  const verifyPrompt = `Verify whether this browser automation task was completed successfully.
+
+TASK GOAL: ${goal}
+PAGE TYPE: ${pageType}
+
+Look at the screenshot and determine if the goal appears to have been achieved. For canvas apps (Notion, ChatGPT, etc.), check if the expected content is visible on the page. Respond with whether the task is complete and your confidence level.`;
+
+  try {
+    const result = await _vlmHttpPost(
+      _VLM_BACKEND_HOST,
+      _VLM_BACKEND_PORT,
+      '/api/vision/verify',
+      {
+        screenshot: { base64: effectiveBase64, mimeType },
+        prompt: verifyPrompt,
+        stepDescription: `Automation goal: ${goal}`,
+        context: { pageType, goal },
+      },
+      _VLM_TIMEOUT_MS
+    );
+
+    if (!result?.success) {
+      logger.warn(`[playwright.agent] VLM: API returned failure: ${result?.error || 'unknown'}`);
+      return null;
+    }
+
+    return {
+      verified: result.verified,
+      confidence: result.confidence || 0,
+      reasoning: result.reasoning || '',
+      suggestion: result.suggestion || '',
+      provider: result.provider || 'unknown',
+    };
+  } catch (err) {
+    logger.warn(`[playwright.agent] VLM: request failed (non-fatal): ${err.message}`);
+    return null;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 8: Verification layer — eval check + screenshot after any tier
+// ---------------------------------------------------------------------------
+async function verifyTierCompletion(goal, pageType, routingDecision, script, sessionId, headed, timeoutMs) {
+  const result = { pass: false, warn: false, fail: false, reason: '', screenshot: null, evalResults: [] };
+
+  // 1. Eval check — run script verify block if available, otherwise goal-derived eval
+  if (script && script.script_yaml && script.script_yaml.verify) {
+    for (const vStep of script.script_yaml.verify) {
+      if (vStep.eval) {
+        try {
+          const vRes = await browserAct({ action: 'evaluate', text: vStep.eval, sessionId, headed, timeoutMs: 5000 });
+          const passed = vRes.ok && (vRes.result === 'true' || vRes.result === true);
+          result.evalResults.push({ eval: vStep.eval, passed });
+          if (!passed) {
+            result.fail = true;
+            result.reason = `Verify eval failed: ${vStep.eval} → ${vRes.result}`;
+            logger.warn(`[playwright.agent] verification layer: eval fail — ${vStep.eval}`);
+          }
+        } catch (err) {
+          result.evalResults.push({ eval: vStep.eval, passed: false, error: err.message });
+          result.warn = true;
+          result.reason = `Verify eval error: ${err.message}`;
+        }
+      }
+    }
+  } else {
+    // Goal-derived eval: check if page text contains expected keywords from goal
+    try {
+      const pageTextRes = await browserAct({ action: 'evaluate', text: 'document.body?.innerText?.slice(0, 2000) || ""', sessionId, headed, timeoutMs: 5000 });
+      const pageText = pageTextRes.ok ? String(pageTextRes.result || '').toLowerCase() : '';
+      const goalKeywords = goal.toLowerCase()
+        .replace(/[^a-z0-9\s]/g, ' ')
+        .split(/\s+/)
+        .filter(w => w.length > 3)
+        .slice(0, 5);
+      const matched = goalKeywords.filter(k => pageText.includes(k));
+      const matchRatio = goalKeywords.length > 0 ? matched.length / goalKeywords.length : 0;
+
+      if (matchRatio >= 0.4) {
+        result.evalResults.push({ type: 'goal_keyword_match', ratio: matchRatio, matched });
+        result.pass = true;
+        result.reason = `Goal keyword match: ${matched.join(', ')} (${(matchRatio * 100).toFixed(0)}%)`;
+      } else if (matchRatio > 0) {
+        result.warn = true;
+        result.reason = `Partial goal keyword match: ${matched.join(', ')} (${(matchRatio * 100).toFixed(0)}%)`;
+      } else {
+        // For canvas apps, page text may not contain goal keywords (contenteditable)
+        if (pageType === 'canvas' || pageType === 'hybrid') {
+          result.warn = true;
+          result.reason = `Canvas app — page text doesn't contain goal keywords (expected for contenteditable)`;
+        } else {
+          result.fail = true;
+          result.reason = `No goal keywords found in page text`;
+        }
+      }
+    } catch (err) {
+      result.warn = true;
+      result.reason = `Goal-derived eval error: ${err.message}`;
+    }
+  }
+
+  // 2. Screenshot capture (non-fatal — for debugging and future VLM grading)
+  try {
+    const screenshotRes = await browserAct({ action: 'screenshot', sessionId, headed, timeoutMs: 5000 });
+    if (screenshotRes.ok && screenshotRes.result) {
+      result.screenshot = screenshotRes.result;
+
+      // Phase 11: VLM screenshot grading — especially for canvas apps where eval is insufficient
+      // Only run VLM if eval was inconclusive (warn) or page is canvas/hybrid (eval unreliable)
+      const _shouldVlm = result.warn || ((pageType === 'canvas' || pageType === 'hybrid') && !result.pass);
+      if (_shouldVlm) {
+        try {
+          const _vlmResult = await _vlmVerifyScreenshot(screenshotRes.result, goal, pageType);
+          if (_vlmResult) {
+            result.vlm = _vlmResult;
+            if (_vlmResult.verified === true) {
+              // VLM says pass — upgrade from warn/fail to pass
+              result.pass = true;
+              result.fail = false;
+              result.warn = false;
+              result.reason = `VLM verified: ${_vlmResult.reasoning || 'screenshot matches goal'}`;
+              logger.info(`[playwright.agent] verification layer: VLM PASS (confidence=${_vlmResult.confidence}, provider=${_vlmResult.provider})`);
+            } else if (_vlmResult.verified === false) {
+              // VLM says fail — downgrade to fail
+              result.pass = false;
+              result.fail = true;
+              result.warn = false;
+              result.reason = `VLM failed: ${_vlmResult.reasoning || 'screenshot does not match goal'}`;
+              logger.warn(`[playwright.agent] verification layer: VLM FAIL (confidence=${_vlmResult.confidence}, provider=${_vlmResult.provider})`);
+            }
+            // verified === null means VLM was uncertain/unavailable — keep existing eval result
+          }
+        } catch (_vlmErr) {
+          logger.warn(`[playwright.agent] verification layer: VLM error (non-fatal): ${_vlmErr.message}`);
+        }
+      }
+    }
+  } catch (_) {}
+
+  // 3. If eval checks all passed and no fail, mark as pass
+  if (!result.fail && !result.warn && result.evalResults.length > 0) {
+    const allPassed = result.evalResults.every(r => r.passed);
+    if (allPassed) {
+      result.pass = true;
+      result.reason = result.reason || 'All eval checks passed';
+    }
+  }
+
+  // 4. If eval fail but no warn, mark fail
+  if (result.fail && !result.warn) {
+    result.pass = false;
+  }
+
+  logger.info(`[playwright.agent] verification layer: pass=${result.pass} warn=${result.warn} fail=${result.fail} reason="${result.reason}"`);
+  return result;
+}
+
+// ---------------------------------------------------------------------------
 // Main entry point
 // ---------------------------------------------------------------------------
 async function playwrightAgent(args) {
@@ -975,11 +1954,19 @@ async function playwrightAgent(args) {
     url,
     recipeWasUsed         = false,
     authConfirmedAt       = null,
+    overallTimeoutMs      = 120000,
     _progressCallbackUrl,
     _stepIndex            = 0,
   } = args || {};
 
   const start = Date.now();
+  const _deadline = start + overallTimeoutMs;
+  function _checkDeadline() {
+    if (Date.now() > _deadline) {
+      logger.warn(`[playwright.agent] overall timeout (${overallTimeoutMs}ms) exceeded — aborting`);
+      throw new Error(`Overall timeout (${overallTimeoutMs}ms) exceeded`);
+    }
+  }
 
   if (!goal) {
     return { ok: false, error: 'goal is required', executionTime: 0 };
@@ -1003,12 +1990,29 @@ async function playwrightAgent(args) {
     }
   }
 
-  // ── Phase 1: Wait for SPA to stabilise, then snapshot ────────────────────
-  // Many SPAs (Gemini, ChatGPT, etc.) render a skeleton immediately after navigate,
-  // then populate the interactive DOM 500-2000ms later. Snapshotting too early
-  // captures a mostly-empty tree (e.g. 12 refs instead of 62), causing the LLM to
-  // pick wrong elements and triggering a costly navigate→re-snapshot cascade.
+  // ── Phase 1: Wait for redirect to settle, then for SPA to stabilise ──────
+  // Shortcut URLs (e.g. notion.new) redirect through one or more intermediate URLs
+  // before landing on the final destination. If we snapshot during the redirect,
+  // we capture a blank/interstitial page and the LLM generates a plan against
+  // zero elements — causing wrong-element clicks and mistyped content.
   if (url) {
+    let _prevHref = '';
+    let _hrefStable = false;
+    for (let _i = 0; _i < 15; _i++) {
+      _checkDeadline();
+      const _hrefRes = await browserAct({ action: 'evaluate', text: 'window.location.href', sessionId, headed, timeoutMs: 5000 }).catch(() => ({ ok: false }));
+      const _curHref = _hrefRes?.ok ? String(_hrefRes.result || '').replace(/^"|"$/g, '') : '';
+      if (_curHref && _curHref === _prevHref) {
+        _hrefStable = true;
+        logger.info(`[playwright.agent] phase 1: redirect settled on ${_curHref} after ${_i + 1} check(s)`);
+        break;
+      }
+      _prevHref = _curHref;
+      await new Promise(r => setTimeout(r, 1000));
+    }
+    if (!_hrefStable) {
+      logger.warn(`[playwright.agent] phase 1: redirect did not stabilize after 15s — proceeding with current page`);
+    }
     logger.info(`[playwright.agent] phase 1: waiting for page to stabilise before snapshot`);
     await browserAct({ action: 'waitForStableText', sessionId, headed, timeoutMs: Math.min(timeoutMs, 15000) });
   }
@@ -1016,11 +2020,172 @@ async function playwrightAgent(args) {
   const initSnap = await browserAct({ action: 'snapshot', sessionId, headed, timeoutMs });
   let currentSnapshot = (initSnap.ok && initSnap.result) ? initSnap.result : '';
 
-  // Compute hostname once — used for domain-lock block injected into all LLM calls
-  const hostname = url ? (() => { try { return new URL(url).hostname.replace(/^www\./, ''); } catch (_) { return null; } })() : null;
+  // Compute hostname from the actual post-navigation browser URL.
+  // This handles shortcut domains (e.g. notion.new → app.notion.com) generically —
+  // no hardcoded mapping needed, we just read where the browser ended up.
+  let hostname = null;
+  if (url) {
+    try {
+      const navResult = await browserAct({ action: 'evaluate', text: 'window.location.hostname', sessionId, headed, timeoutMs: 5000 });
+      if (navResult.ok && navResult.result) {
+        hostname = String(navResult.result).replace(/^www\./, '').toLowerCase();
+      }
+    } catch (_) { /* fall back to URL-derived hostname */ }
+    if (!hostname) {
+      try { hostname = new URL(url).hostname.replace(/^www\./, '').toLowerCase(); }
+      catch (_) { /* hostname stays null */ }
+    }
+  }
   const domainLockBlock = hostname
     ? `\n\nDOMAIN LOCK — ABSOLUTE:\nYou are automating '${hostname}'. NEVER navigate to any external site (not Google, Bing, DuckDuckGo, or anywhere outside ${hostname}). Any navigate step MUST stay on '${hostname}'.`
     : '';
+
+  // ── Phase 1.1: Page probe + intelligent routing ─────────────────────────────
+  // Lightweight eval to classify page structure (canvas, traditional, hybrid, sparse).
+  // Routes to Tier 2 (script-first), Tier 2.5 (best-effort keyboard), or Tier 3 (LLM).
+  let _pageType = 'sparse';
+  let _routingDecision = 'tier3_llm';
+  let _probeResult = null;
+  let _scriptResult = null;
+  let _partialProgressNote = '';
+  // Build a generic note from a failed tier's transcript so the next tier
+  // doesn't repeat actions that already executed (e.g. re-type a title).
+  function _buildPartialProgressNote(transcript, tierLabel) {
+    if (!Array.isArray(transcript) || transcript.length === 0) return '';
+    const doneActions = [];
+    for (const t of transcript) {
+      const outcome = t.outcome || t;
+      if (!outcome || outcome.ok === false) continue;
+      const action = t.action || {};
+      if (action.type) doneActions.push(`typed "${String(action.type).slice(0, 60)}"`);
+      else if (action.press) doneActions.push(`pressed ${action.press}`);
+      else if (action.click) doneActions.push(`clicked ${String(action.click).slice(0, 60)}`);
+    }
+    if (doneActions.length === 0) return '';
+    return `\n\nNOTE: A previous ${tierLabel} attempt already executed these actions on the current page before failing: ${doneActions.join('; ')}. Do NOT repeat completed actions — inspect the current page state and continue from where it left off.`;
+  }
+  try {
+    // Ensure seed scripts exist in DB (fire-and-forget, non-blocking)
+    ensureSeedScripts().catch(() => {});
+
+    _probeResult = await pageProbe(sessionId, headed, 5000);
+    _pageType = classifyPageType(_probeResult);
+    const _service = serviceFromHostname(hostname) || serviceFromHostname(_probeResult?.hostname);
+
+    logger.info(`[playwright.agent] phase 1.1: page probe → type=${_pageType}, service=${_service || 'unknown'}, interactive=${_probeResult?.interactiveCount ?? '?'}, contentEditable=${_probeResult?.contentEditableCount ?? '?'}`);
+
+    // Script DB lookup for (service, page_type)
+    const _taskKeywords = extractKeywordsFromGoal(goal);
+    const _matchedScript = _service ? await getInteractionScript(_service, _pageType, _taskKeywords) : null;
+
+    if (_matchedScript && (_pageType === 'canvas' || _pageType === 'hybrid')) {
+      // Tier 2: Script-first execution
+      _routingDecision = 'tier2_script';
+      logger.info(`[playwright.agent] routing: Tier 2 (script-first) — service=${_service}, script=${_matchedScript.id || 'unknown'}`);
+
+      const _params = extractParamsFromGoal(goal);
+      _scriptResult = await executeScript(_matchedScript, _params, sessionId, headed, timeoutMs);
+
+      if (_scriptResult.ok) {
+        logger.info(`[playwright.agent] Tier 2 script succeeded — ${_scriptResult.transcript.length} steps, verified=${_scriptResult.verified}`);
+        await incrementScriptSuccess(_service, _matchedScript.action).catch(() => {});
+        // Phase 8: Verification layer
+        const _verify = await verifyTierCompletion(goal, _pageType, _routingDecision, _matchedScript, sessionId, headed, timeoutMs);
+        if (_verify.fail) {
+          logger.warn(`[playwright.agent] verification layer: FAIL after Tier 2 — ${_verify.reason} — falling back`);
+          await incrementScriptFailure(_service, _matchedScript.action).catch(() => {});
+          // Fall through to Tier 2.5 or Tier 3
+        } else {
+          return {
+            ok: true, goal, sessionId,
+            turns: _scriptResult.transcript.length, done: true,
+            result: `Completed via script: ${_matchedScript.id}${_verify.warn ? ' (warning: ' + _verify.reason + ')' : ''}`,
+            transcript: _scriptResult.transcript,
+            routingDecision: _routingDecision,
+            pageType: _pageType,
+            verification: _verify,
+            executionTime: Date.now() - start,
+          };
+        }
+      } else {
+        logger.warn(`[playwright.agent] Tier 2 script failed: ${_scriptResult.error} — falling back`);
+        await incrementScriptFailure(_service, _matchedScript.action).catch(() => {});
+        _partialProgressNote = _buildPartialProgressNote(_scriptResult.transcript, 'script');
+        if (_partialProgressNote) logger.info(`[playwright.agent] partial-progress note built from ${_scriptResult.transcript?.length || 0} Tier 2 steps`);
+        // Fall through to Tier 2.5 or Tier 3
+      }
+    }
+
+    if (_pageType === 'canvas' && !_scriptResult?.ok) {
+      // Tier 2.5: Best-effort keyboard mode (no script or script failed)
+      _routingDecision = 'tier2_5_keyboard';
+      logger.info(`[playwright.agent] routing: Tier 2.5 (best-effort keyboard) — service=${_service || 'unknown'}, pageType=${_pageType}`);
+
+      // Phase 10: Queue async script generation for this service so next run can use Tier 2
+      if (_service && !_matchedScript) {
+        queueAsyncScriptGeneration(_service, _pageType, goal, _taskKeywords);
+      }
+
+      // Try sync script generation first (generates + caches a script)
+      if (_service) {
+        _scriptResult = await syncScriptGeneration(goal + _partialProgressNote, _pageType, _service, sessionId, headed, timeoutMs);
+        if (_scriptResult.ok) {
+          logger.info(`[playwright.agent] Tier 2.5 sync gen succeeded — ${_scriptResult.transcript?.length || 0} steps`);
+          // Phase 8: Verification layer
+          const _verify = await verifyTierCompletion(goal, _pageType, _routingDecision, null, sessionId, headed, timeoutMs);
+          if (_verify.fail) {
+            logger.warn(`[playwright.agent] verification layer: FAIL after Tier 2.5 sync gen — ${_verify.reason} — trying best-effort keyboard`);
+          } else {
+            return {
+              ok: true, goal, sessionId,
+              turns: _scriptResult.transcript?.length || 0, done: true,
+              result: `Completed via sync-generated script${_verify.warn ? ' (warning: ' + _verify.reason + ')' : ''}`,
+              transcript: _scriptResult.transcript || [],
+              routingDecision: _routingDecision,
+              pageType: _pageType,
+              verification: _verify,
+              executionTime: Date.now() - start,
+            };
+          }
+        }
+        logger.warn(`[playwright.agent] Tier 2.5 sync gen failed: ${_scriptResult.error} — trying best-effort keyboard`);
+        if (!_partialProgressNote) _partialProgressNote = _buildPartialProgressNote(_scriptResult?.transcript, 'keyboard-script');
+      }
+
+      // Fall back to best-effort keyboard
+      const _bestEffort = await bestEffortKeyboard(goal + _partialProgressNote, _pageType, sessionId, headed, timeoutMs);
+      if (_bestEffort.ok) {
+        logger.info(`[playwright.agent] Tier 2.5 best-effort keyboard succeeded — ${_bestEffort.transcript.length} steps`);
+        // Phase 8: Verification layer
+        const _verify = await verifyTierCompletion(goal, _pageType, _routingDecision, null, sessionId, headed, timeoutMs);
+        if (_verify.fail) {
+          logger.warn(`[playwright.agent] verification layer: FAIL after Tier 2.5 best-effort — ${_verify.reason} — falling back to Tier 3 (LLM)`);
+        } else {
+          return {
+            ok: true, goal, sessionId,
+            turns: _bestEffort.transcript.length, done: true,
+            result: `Completed via best-effort keyboard${_verify.warn ? ' (warning: ' + _verify.reason + ')' : ''}`,
+            transcript: _bestEffort.transcript,
+            routingDecision: _routingDecision,
+            pageType: _pageType,
+            verification: _verify,
+            executionTime: Date.now() - start,
+          };
+        }
+      }
+      logger.warn(`[playwright.agent] Tier 2.5 best-effort failed: ${_bestEffort.error} — falling back to Tier 3 (LLM)`);
+      if (!_partialProgressNote) _partialProgressNote = _buildPartialProgressNote(_bestEffort?.transcript, 'keyboard');
+      // Fall through to Tier 3
+    }
+
+    if (_pageType === 'traditional' || _pageType === 'sparse' || _pageType === 'hybrid') {
+      _routingDecision = 'tier3_llm';
+      logger.info(`[playwright.agent] routing: Tier 3 (LLM snapshot loop) — pageType=${_pageType}`);
+    }
+  } catch (_probeErr) {
+    logger.warn(`[playwright.agent] phase 1.1: page probe + routing error (non-fatal): ${_probeErr.message} — defaulting to Tier 3`);
+    _routingDecision = 'tier3_llm';
+  }
 
   // ── Phase 1.2: Orientation loop — clear interstitials before plan generation ─
   // Fires ONLY when the snapshot matches a known interstitial pattern (zero LLM
@@ -1095,16 +2260,34 @@ async function playwrightAgent(args) {
     if (!_goalStateNote && url) {
       const _curUrlRes = await browserAct({ action: 'evaluate', text: 'window.location.href', sessionId, headed, timeoutMs: 3000 }).catch(() => ({ ok: false }));
       const _curUrl = _curUrlRes?.ok ? String(_curUrlRes.result || '').replace(/^"|"$/g, '') : '';
-      if (_curUrl && url && _curUrl.startsWith(url.replace(/#.*$/, ''))) {
-        _goalStateNote = `\n\nNOTE: The browser is ALREADY on ${_curUrl}. Do NOT add a navigate step — start directly with the task actions using refs from the snapshot above.`;
-        logger.info(`[playwright.agent] goal-state: already on target URL ${_curUrl} — injecting skip-navigate note`);
+      if (_curUrl && url) {
+        try {
+          const _cur = new URL(_curUrl);
+          const _tgt = new URL(url);
+          const _tgtPath = _tgt.pathname.replace(/\/$/, '') || '/';
+          const _curPath = _cur.pathname.replace(/\/$/, '') || '/';
+          const _sameOrigin = _cur.origin === _tgt.origin;
+          // For root targets (/), require exact path match — SPA redirects to sub-pages must NOT match
+          // For specific targets, allow startsWith on pathname (e.g. /workspace matches /workspace/team)
+          const _pathMatch = _tgtPath === '/' ? _curPath === '/' : _curPath.startsWith(_tgtPath);
+          if (_sameOrigin && _pathMatch) {
+            _goalStateNote = `\n\nNOTE: The browser is ALREADY on ${_curUrl}. Do NOT add a navigate step — start directly with the task actions using refs from the snapshot above.`;
+            logger.info(`[playwright.agent] goal-state: already on target URL ${_curUrl} — injecting skip-navigate note`);
+          }
+        } catch (_) {
+          // URL parse fallback — use startsWith for non-standard URLs
+          if (_curUrl.startsWith(url.replace(/#.*$/, ''))) {
+            _goalStateNote = `\n\nNOTE: The browser is ALREADY on ${_curUrl}. Do NOT add a navigate step — start directly with the task actions using refs from the snapshot above.`;
+            logger.info(`[playwright.agent] goal-state: already on target URL ${_curUrl} — injecting skip-navigate note`);
+          }
+        }
       }
     }
   } catch (_gsErr) {
     logger.warn(`[playwright.agent] goal-state pre-check failed (non-fatal): ${_gsErr.message}`);
   }
 
-  const _finalGoal = _goalStateNote ? effectiveGoal + _goalStateNote : effectiveGoal;
+  const _finalGoal = (effectiveGoal + (_goalStateNote || '') + (_partialProgressNote || ''));
 
   // ── Phase 1.7: Page study — understand the page before planning ──────────
   // A lightweight LLM call that analyzes the current page snapshot and returns
@@ -1115,7 +2298,7 @@ async function playwrightAgent(args) {
   try {
     const _studyRaw = await askWithMessages([
       { role: 'system', content: PAGE_STUDY_PROMPT + domainLockBlock },
-      { role: 'user',   content: `GOAL: ${_finalGoal}\n\nSNAPSHOT:\n${extractInteractiveRefs(currentSnapshot)}` },
+      { role: 'user',   content: `GOAL: ${_finalGoal}\n\nSNAPSHOT:\n${pruneSnapshot(extractInteractiveRefs(currentSnapshot))}` },
     ], { temperature: 0.1, maxTokens: 600, responseTimeoutMs: 15000 });
     _pageStudy = parseJson(_studyRaw);
     if (_pageStudy && typeof _pageStudy === 'object') {
@@ -1135,7 +2318,7 @@ async function playwrightAgent(args) {
   logger.info(`[playwright.agent] phase 2: generating plan`);
   const planMessages = [
     { role: 'system', content: PLAN_SYSTEM_PROMPT + learnedRulesBlock + domainLockBlock },
-    { role: 'user',   content: `GOAL: ${_finalGoal}${_studyBlock}\n\nSNAPSHOT:\n${extractInteractiveRefs(currentSnapshot)}${agentContext ? `\n\nAGENT CONTEXT (agent instructions — follow these for site-specific behaviour):\n${agentContext}` : ''}` },
+    { role: 'user',   content: `GOAL: ${_finalGoal}${_studyBlock}\n\nSNAPSHOT:\n${pruneSnapshot(extractInteractiveRefs(currentSnapshot))}${agentContext ? `\n\nAGENT CONTEXT (agent instructions — follow these for site-specific behaviour):\n${agentContext}` : ''}` },
   ];
   // Dynamic token cap: short focused tasks (< 400 chars) seldom produce > 3 steps
   // so 800 tokens avoids wasting 1-2s on padding. Complex multi-site goals get 2048.
@@ -1267,8 +2450,10 @@ async function playwrightAgent(args) {
   ]);
 
   // ── Main execution loop (supports adaptive replanning restart) ───────────────
+  try {
   executionLoop: while (true) {
     while (stepIndex < plan.length) {
+      _checkDeadline();
       let step = normalizeStep(plan[stepIndex]);
 
       // Inline return step — LLM returns extracted data as the final result
@@ -1366,9 +2551,14 @@ async function playwrightAgent(args) {
                 `STALE_REMAINING_PLAN: ${JSON.stringify(remainingAfterSnap)}`,
                 ``,
                 `FRESH_SNAPSHOT (interactive elements only — full ${countRefs(currentSnapshot)}-ref page):`,
-                extractInteractiveRefs(currentSnapshot),
+                pruneSnapshot(extractInteractiveRefs(currentSnapshot)),
                 learnedRulesBlock,
                 placeholderWarningBlock,
+                ...(agentContext ? [
+                  ``,
+                  `AGENT CONTEXT (site-specific instructions — follow these for this service):`,
+                  agentContext,
+                ] : []),
               ].join('\n') },
             ], { temperature: 0.1, maxTokens: 1024, responseTimeoutMs: 20000 });
             const snapReplanParsed = parseJson(snapReplanRaw);
@@ -1482,7 +2672,7 @@ async function playwrightAgent(args) {
                   : '';
                 const snapReplanRaw = await askWithMessages([
                   { role: 'system', content: REPLAN_SYSTEM_PROMPT },
-                  { role: 'user', content: [`GOAL: ${goal}`, `COMPLETED_STEPS: ${JSON.stringify(plan.slice(0, stepIndex + 1))}`, `STALE_REMAINING_PLAN: ${JSON.stringify(remaining)}`, ``, `FRESH_SNAPSHOT (interactive elements only — full ${countRefs(currentSnapshot)}-ref page):`, extractInteractiveRefs(currentSnapshot), learnedRulesBlock, extPlaceholderWarning].join('\n') },
+                  { role: 'user', content: [`GOAL: ${goal}`, `COMPLETED_STEPS: ${JSON.stringify(plan.slice(0, stepIndex + 1))}`, `STALE_REMAINING_PLAN: ${JSON.stringify(remaining)}`, ``, `FRESH_SNAPSHOT (interactive elements only — full ${countRefs(currentSnapshot)}-ref page):`, extractInteractiveRefs(currentSnapshot), learnedRulesBlock, extPlaceholderWarning, ...(agentContext ? [``, `AGENT CONTEXT (site-specific instructions — follow these for this service):`, agentContext] : [])].join('\n') },
                 ], { temperature: 0.1, maxTokens: 1024, responseTimeoutMs: 20000 });
                 const snapReplanParsed = parseJson(snapReplanRaw);
                 if (snapReplanParsed && Array.isArray(snapReplanParsed.plan) && snapReplanParsed.plan.length > 0) {
@@ -1512,6 +2702,55 @@ async function playwrightAgent(args) {
           result: `Unresolved credential token ${unresolvedCredToken} in ${step.action} step — escalating to auth flow`,
           transcript, executionTime: Date.now() - start,
         };
+      }
+
+      // ── Page-ready pre-condition: verify page is not blank before type/fill ──
+      // Prevents typing into wrong element when page is still loading/about:blank.
+      // This was the root cause of "Item 1" being typed into the Notion title: the
+      // page was blank when the plan was generated, so the LLM picked the wrong ref.
+      if ((step.action === 'fill' || step.action === 'type') && (step.text || step.value)) {
+        _checkDeadline();
+        const _readyCheck = await browserAct({ action: 'evaluate', text: 'window.location.href + "|" + document.body.innerText.length', sessionId, headed, timeoutMs: 3000 }).catch(() => ({ ok: false }));
+        if (_readyCheck?.ok) {
+          const [_curHref, _bodyLen] = String(_readyCheck.result || '').split('|');
+          if (/about:blank/i.test(_curHref) || parseInt(_bodyLen || '0', 10) < 10) {
+            logger.warn(`[playwright.agent] page-ready guard: page is blank/about:blank before ${step.action} — waiting 3s and re-checking`);
+            await new Promise(r => setTimeout(r, 3000));
+            const _reCheck = await browserAct({ action: 'evaluate', text: 'window.location.href + "|" + document.body.innerText.length', sessionId, headed, timeoutMs: 3000 }).catch(() => ({ ok: false }));
+            if (_reCheck?.ok) {
+              const [_reHref, _reBodyLen] = String(_reCheck.result || '').split('|');
+              if (/about:blank/i.test(_reHref) || parseInt(_reBodyLen || '0', 10) < 10) {
+                logger.warn(`[playwright.agent] page-ready guard: page still blank after 3s wait — skipping ${step.action} to prevent wrong-element typing`);
+                outcome = { ok: false, error: `Page is blank/about:blank — cannot safely ${step.action} into unknown element` };
+                transcript.push({ step: stepIndex + 1, action: step, outcome, thoughts: 'page-ready guard: blank page' });
+                postProgress(_progressCallbackUrl, {
+                  type: 'agent:turn', stepIndex: _stepIndex,
+                  turn: stepIndex + 1, maxTurns: plan.length,
+                  action: step, outcome: { ok: false, error: outcome.error }, thoughts: 'page-ready guard: blank page',
+                });
+                // Force repair path
+                if (totalRepairs >= maxRepairs) {
+                  return { ok: false, goal, sessionId, turns: transcript.length, done: false, result: `Page stayed blank — cannot execute ${step.action}`, transcript, error: outcome.error, executionTime: Date.now() - start };
+                }
+                totalRepairs++;
+                const _guardSnap = await browserAct({ action: 'snapshot', sessionId, headed, timeoutMs });
+                if (_guardSnap.ok && _guardSnap.result) currentSnapshot = _guardSnap.result;
+                try {
+                  const _guardRepairRaw = await askWithMessages([
+                    { role: 'system', content: REPAIR_SYSTEM_PROMPT + domainLockBlock },
+                    { role: 'user', content: [`GOAL: ${goal}`, `FAILED_STEP: ${JSON.stringify(step)}`, `ERROR: Page was blank/about:blank — the page may still be loading or redirecting. Wait for the page to fully load before retrying.`, `REMAINING_PLAN: ${JSON.stringify(plan.slice(stepIndex + 1))}`, ``, `SNAPSHOT:`, trimSnapshot(currentSnapshot)].join('\n') },
+                  ], { temperature: 0.1, maxTokens: 1024, responseTimeoutMs: 20000 });
+                  const _guardRepairParsed = parseJson(_guardRepairRaw);
+                  if (_guardRepairParsed && Array.isArray(_guardRepairParsed.repair) && _guardRepairParsed.repair.length > 0) {
+                    plan = [...plan.slice(0, stepIndex), ..._guardRepairParsed.repair, ...plan.slice(stepIndex + 1)];
+                    logger.info(`[playwright.agent] page-ready guard repair: ${_guardRepairParsed.repair.length} corrective steps`);
+                  } else { stepIndex++; }
+                } catch (_) { stepIndex++; }
+                continue;
+              }
+            }
+          }
+        }
       }
 
       // ── Deduplication: skip redundant fill/type of same text ───────────────
@@ -1746,7 +2985,7 @@ async function playwrightAgent(args) {
                 : '';
               const retryPlanRaw = await askWithMessages([
                 { role: 'system', content: PLAN_SYSTEM_PROMPT + learnedRulesBlock + domainLockBlock },
-                { role: 'user', content: `GOAL: ${effectiveGoal}\n\nNOTE: A previous attempt failed because the page returned an HTTP ${_httpErr} error. The page has been refreshed — please re-plan the full task from the current snapshot.${httpPlaceholderWarning}\n\nSNAPSHOT:\n${extractInteractiveRefs(currentSnapshot)}${agentContext ? `\n\nAGENT CONTEXT:\n${agentContext}` : ''}` },
+                { role: 'user', content: `GOAL: ${effectiveGoal}\n\nNOTE: A previous attempt failed because the page returned an HTTP ${_httpErr} error. The page has been refreshed — please re-plan the full task from the current snapshot.${httpPlaceholderWarning}\n\nSNAPSHOT:\n${pruneSnapshot(extractInteractiveRefs(currentSnapshot))}${agentContext ? `\n\nAGENT CONTEXT:\n${agentContext}` : ''}` },
               ], { temperature: 0.1, maxTokens: 2048, responseTimeoutMs: 30000 });
               const retryPlanParsed = parseJson(retryPlanRaw);
               if (retryPlanParsed && Array.isArray(retryPlanParsed.plan) && retryPlanParsed.plan.length > 0) {
@@ -1940,7 +3179,7 @@ async function playwrightAgent(args) {
               const _microRemaining = plan.slice(stepIndex + 1);
               const _microRaw = await askWithMessages([
                 { role: 'system', content: REPLAN_SYSTEM_PROMPT + domainLockBlock },
-                { role: 'user', content: `GOAL: ${_finalGoal || effectiveGoal}\nSTALE_REMAINING:\n${JSON.stringify(_microRemaining)}\nFRESH_SNAPSHOT:\n${extractInteractiveRefs(currentSnapshot)}` },
+                { role: 'user', content: `GOAL: ${_finalGoal || effectiveGoal}\nSTALE_REMAINING:\n${JSON.stringify(_microRemaining)}\nFRESH_SNAPSHOT:\n${pruneSnapshot(extractInteractiveRefs(currentSnapshot))}${agentContext ? `\n\nAGENT CONTEXT (site-specific instructions — follow these for this service):\n${agentContext}` : ''}` },
               ], { temperature: 0.1, maxTokens: 800, responseTimeoutMs: 20000 }).catch(() => null);
               const _microParsed = _microRaw ? parseJson(_microRaw) : null;
               if (_microParsed && Array.isArray(_microParsed.plan) && _microParsed.plan.length > 0) {
@@ -2265,7 +3504,7 @@ async function playwrightAgent(args) {
           // Before re-planning, check if the current URL indicates the action already
           // succeeded. This prevents duplicate content from re-typing during repair.
           try {
-            const _urlCheck = await browserAct({ action: 'eval', expression: 'window.location.href', sessionId, headed, timeoutMs: 5000 });
+            const _urlCheck = await browserAct({ action: 'evaluate', text: 'window.location.href', sessionId, headed, timeoutMs: 5000 });
             if (_urlCheck?.ok) {
               const _curUrl = String(_urlCheck.result || _urlCheck.stdout || '').trim();
               // Patterns that indicate a create action already succeeded
@@ -2447,16 +3686,18 @@ ${_judgePageText.slice(0, 800)}
 Judge whether the goal was accomplished. Consider BOTH the action history and the current page state.
 
 IMPORTANT RULES:
+- PAGE CONTENT IS PRIMARY EVIDENCE: The page content/URL/snapshot must show evidence that the goal was achieved. Action history alone (e.g. "type:ok" or "click:ok") is NOT sufficient — a successful action does not mean the goal was accomplished. You must find concrete evidence in the page state.
 - If the action history includes ">sendEmailWithVerification:ok", the email was successfully sent and verified. This is conclusive evidence. The mail inbox is the expected page after a successful send. The absence of a compose window means the email was sent, not that it failed.
 - If EMAIL_SEND_VERIFICATION is provided, it is authoritative proof of completion.
-- For non-mail tasks, focus on the END STATE — does the page content/URL show the goal was accomplished?
+- For non-mail tasks, focus on the END STATE — does the page content/URL show the goal was accomplished? If the page content does not contain expected text/elements matching the goal, achieved MUST be false.
 - RICH TEXT EDITOR RULE: Google Docs, Notion, Confluence, and similar editors use canvas/custom rendering. Content typed via a prior 'type' or 'fill' action may NOT appear in the DOM snapshot even though it was entered successfully. If the action history includes type:ok or fill:ok with text content matching the goal, and the page is a rich text editor / contenteditable, consider the content as entered even if it doesn't appear in the page snapshot.
 - AUTOSAVE RULE: Transient save/sync indicators ("Saving…", "Syncing…", "Uploading…") are NORMAL autosave states and are NOT evidence of goal non-achievement. A "Saving…" or "Saved" indicator on a document editor means the action was accepted and is being persisted.
+- CANVAS APP RULE: For canvas apps (Notion, Google Docs, etc.), if page content is sparse but action history shows successful type/press steps matching the goal text, AND the page type was classified as 'canvas' or 'hybrid', consider the goal achieved. The ARIA tree cannot represent canvas content.
 
 Respond with JSON only — no markdown, no explanation outside the JSON:
-{ "achieved": true, "reason": "one sentence" }
+{ "achieved": true, "reason": "one sentence citing page evidence" }
 or
-{ "achieved": false, "reason": "one sentence", "canRetry": true|false }
+{ "achieved": false, "reason": "one sentence citing missing evidence", "canRetry": true|false }
 
 Set canRetry:false only if the goal is fundamentally impossible on this page/site.`;
 
@@ -2500,7 +3741,7 @@ PREVIOUS ATTEMPT SUMMARY: ${_stepSummary}
 REASON GOAL NOT MET: ${_judgeResult.reason}
 
 CURRENT PAGE STATE:
-${extractInteractiveRefs(currentSnapshot)}
+${pruneSnapshot(extractInteractiveRefs(currentSnapshot))}
 
 Generate a COMPLETELY NEW plan to achieve the goal. Try a DIFFERENT approach than before.
 Return JSON: { "thoughts": "strategy explanation", "plan": [...steps] }`;
@@ -2526,8 +3767,12 @@ Return JSON: { "thoughts": "strategy explanation", "plan": [...steps] }`;
             return {
               ok: false,
               askUser: true,
+              trainingHandoff: true,
               question: `I wasn't able to complete the task after ${totalRepairs} attempt(s).\n\nReason: ${_judgeResult.reason}\n\nWhat would you like to do?`,
-              options: ['Try again', 'Train me to navigate this path'],
+              options: [
+                { label: 'Try again', value: 'try_again' },
+                { label: 'Train me to navigate this path', value: 'open_agents_training' },
+              ],
               goal,
               sessionId,
               executionTime: Date.now() - start,
@@ -2555,6 +3800,18 @@ Return JSON: { "thoughts": "strategy explanation", "plan": [...steps] }`;
     // Exit outer execution loop on successful completion
     break executionLoop;
   } // end executionLoop
+  } catch (_deadlineErr) {
+    if (/Overall timeout/.test(_deadlineErr.message)) {
+      logger.warn(`[playwright.agent] aborted due to overall timeout — returning partial result`);
+      return {
+        ok: false, goal, sessionId,
+        turns: transcript.length, done: false,
+        result: `Task timed out after ${overallTimeoutMs}ms`,
+        transcript, error: _deadlineErr.message, executionTime: Date.now() - start,
+      };
+    }
+    throw _deadlineErr;
+  }
 
   // ── Done ───────────────────────────────────────────────────────────────────
   logger.info(`[playwright.agent] DONE — ${transcript.length} steps executed (${totalRepairs} repairs)`);
@@ -2568,13 +3825,62 @@ Return JSON: { "thoughts": "strategy explanation", "plan": [...steps] }`;
     ok: true,
     result: finalResult !== null ? finalResult : `Completed: ${goal}`,
   });
+  // Phase 8: Verification layer for Tier 3
+  let _tier3Verification = null;
+  try {
+    _tier3Verification = await verifyTierCompletion(goal, _pageType, _routingDecision, null, sessionId, headed, timeoutMs);
+    if (_tier3Verification.fail) {
+      logger.warn(`[playwright.agent] verification layer: FAIL after Tier 3 — ${_tier3Verification.reason}`);
+    }
+  } catch (_vErr) {
+    logger.warn(`[playwright.agent] verification layer error (non-fatal): ${_vErr.message}`);
+  }
+
+  // Phase 10: Learning layer — distill successful Tier 3 canvas/hybrid runs into keyboard scripts
+  if (!_tier3Verification?.fail && (_pageType === 'canvas' || _pageType === 'hybrid') && transcript.length >= 2) {
+    const _distillService = serviceFromHostname(hostname) || (agentId || '').replace(/\.agent$/, '').replace(/[^a-z0-9]/gi, '').toLowerCase();
+    if (_distillService) {
+      try {
+        const { distillKeyboardScript } = require('./trainer.agent.cjs');
+        distillKeyboardScript(agentId, goal, transcript, _pageType, _distillService)
+          .then(_r => { if (_r) logger.info(`[playwright.agent] Phase 10: distilled script ${_r.service}.${_r.action} (${_r.steps} steps)`); })
+          .catch(_e => logger.warn(`[playwright.agent] Phase 10: distill error (non-fatal): ${_e.message}`));
+      } catch (_) { /* non-fatal */ }
+    }
+  }
+
   return {
     ok: true, goal, sessionId,
     turns: transcript.length, done: true,
     result: finalResult !== null ? finalResult : `Completed: ${goal}`,
     transcript,
+    routingDecision: _routingDecision,
+    pageType: _pageType,
+    verification: _tier3Verification,
     executionTime: Date.now() - start,
   };
 }
 
-module.exports = { playwrightAgent };
+module.exports = {
+  playwrightAgent,
+  // Exported for testing and Phase 8 verification layer
+  pageProbe,
+  classifyPageType,
+  serviceFromHostname,
+  pruneSnapshot,
+  snapshotHash,
+  validateSelector,
+  verifyTierCompletion,
+  getInteractionScript,
+  saveInteractionScript,
+  incrementScriptSuccess,
+  incrementScriptFailure,
+  ensureSeedScripts,
+  executeScript,
+  bestEffortKeyboard,
+  syncScriptGeneration,
+  extractParamsFromGoal,
+  deriveActionFromGoal,
+  extractKeywordsFromGoal,
+  queueAsyncScriptGeneration,
+};

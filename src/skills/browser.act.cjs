@@ -691,19 +691,23 @@ function cliRun(args, timeoutMs = 15000) {
     proc.stdout.on('data', d => { stdout += d.toString(); });
     proc.stderr.on('data', d => { stderr += d.toString(); });
 
-    // Custom timeout handling without SIGTERM to prevent about:blank navigation
+    // Timeout handling: resolve with ok:false so the caller can proceed.
+    // Do NOT kill the process — cliRun is used for short internal probes
+    // (2000ms hostname check, URL probe) as well as main actions. Killing
+    // on any timeout destroys the playwright-cli daemon = kills the browser
+    // session. The overallTimeoutMs in playwright.agent handles task-level
+    // timeout enforcement at the correct layer.
     const timer = setTimeout(() => {
       if (!resolved) {
         resolved = true;
-        // Don't kill the process - let it finish naturally to avoid about:blank cleanup
-        logger.warn(`[browser.act] cliRun timeout after ${timeoutMs}ms - allowing process to finish gracefully`);
+        logger.warn(`[browser.act] cliRun timeout after ${timeoutMs}ms (pid=${proc.pid}) — letting process finish naturally`);
         resolve({ 
           ok: false, 
           stdout, 
           stderr, 
           exitCode: -1, 
           executionTime: Date.now() - start, 
-          error: `Timed out after ${timeoutMs}ms (process allowed to finish)` 
+          error: `Timed out after ${timeoutMs}ms` 
         });
       }
     }, timeoutMs);
@@ -719,8 +723,11 @@ function cliRun(args, timeoutMs = 15000) {
     });
 
     proc.on('error', err => {
-      clearTimeout(timer);
-      resolve({ ok: false, stdout, stderr, exitCode: -1, executionTime: Date.now() - start, error: err.message });
+      if (!resolved) {
+        resolved = true;
+        clearTimeout(timer);
+        resolve({ ok: false, stdout, stderr, exitCode: -1, executionTime: Date.now() - start, error: err.message });
+      }
     });
   });
 }
@@ -4153,30 +4160,6 @@ If no videos found, return []. Do not explain, only output the JSON array.`;
             // looks like inAuthFlow but is actually a successful post-OAuth landing.
             if (_wasOnOAuthProvider) {
               logger.info(`[browser.act] waitForAuth: returned to origin after OAuth provider — auth complete for session=${sessionId} url=${currentUrl}`);
-              return { ok: true, action, sessionId, authResolved: true, executionTime: Date.now() - start };
-            }
-            // ── Login callback query params ───────────────────────────────
-            // Secondary signal: login-source, code, state, access_token in query string
-            // while on origin host indicates a completed OAuth callback.
-            const _loginCbRe = /[?&](login-source|login-new|code|state|access_token|id_token|session)=/i;
-            if (_loginCbRe.test(currentUrl)) {
-              logger.info(`[browser.act] waitForAuth: login callback params detected — auth complete for session=${sessionId} url=${currentUrl}`);
-              // Notify overlay immediately (before returning) so UI dismisses auth prompt right away
-              if (_progressCallbackUrl) {
-                const http = require('http');
-                const _payload = JSON.stringify({ type: 'learn:auth_resolved', sessionId, resolvedUrl: currentUrl });
-                const _req = http.request({
-                  hostname: '127.0.0.1',
-                  port: parseInt(new URL(_progressCallbackUrl).port, 10),
-                  path: new URL(_progressCallbackUrl).pathname,
-                  method: 'POST',
-                  headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(_payload) },
-                  timeout: 2000,
-                });
-                _req.on('error', () => {});
-                _req.write(_payload);
-                _req.end();
-              }
               return { ok: true, action, sessionId, authResolved: true, executionTime: Date.now() - start };
             }
             // ── Same-domain auth success check ──────────────────────────────

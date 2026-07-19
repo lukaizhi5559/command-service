@@ -375,6 +375,9 @@ async function fireSkill(skillName, execPath, metadata = {}) {
     });
     if (result?.data?.success === false) {
       logger.warn(`[SkillScheduler] Skill run failed: ${skillName}`, { error: result?.data?.error });
+      if (result?.data?.sessionExpired) {
+        writeBridgeInstruction(skillName, `Scheduled task "${skillName}" failed: ${result.data.question || 'Browser session expired — please re-authenticate in the Agents tab.'}`);
+      }
     } else {
       logger.info(`[SkillScheduler] Skill run ok: ${skillName}`);
     }

@@ -23,7 +23,6 @@ const skillDb = require('./skill-helpers/skill-db.cjs');
 const { shellRun } = require('./skills/shell.run.cjs');
 const { browserAct } = require('./skills/browser.act.cjs');
 const { webCrawl } = require('./skills/web.crawl.cjs');
-const { notionApi } = require('./skills/notion.api.cjs');
 const { imageAnalyze } = require('./skills/image.analyze.cjs');
 const { fsRead } = require('./skills/fs.read.cjs');
 const { fileWatch } = require('./skills/file.watch.cjs');
@@ -85,9 +84,6 @@ class CommandServiceMCPServer {
 
       case 'web.crawl':
         return await this._skillWebCrawl(args);
-
-      case 'notion.api':
-        return await this._skillNotionApi(args);
 
       case 'image.analyze':
         return await this._skillImageAnalyze(args);
@@ -177,10 +173,6 @@ class CommandServiceMCPServer {
 
   async _skillWebCrawl(args) {
     return await webCrawl(args);
-  }
-
-  async _skillNotionApi(args) {
-    return await notionApi(args);
   }
 
   async _skillWebAgent(args) {

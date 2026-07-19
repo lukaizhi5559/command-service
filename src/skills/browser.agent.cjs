@@ -304,7 +304,7 @@ const KNOWN_BROWSER_SERVICES = {
   google:         { startUrl: 'https://accounts.google.com',                     signInUrl: 'https://accounts.google.com',                       authSuccessPattern: 'myaccount.google.com',         isOAuth: true  },
   slack:          { startUrl: 'https://app.slack.com',                           signInUrl: 'https://slack.com/signin',                          authSuccessPattern: 'app.slack.com/client',         isOAuth: true  },
   discord:        { startUrl: 'https://discord.com/channels/@me',                signInUrl: 'https://discord.com/login',                         authSuccessPattern: 'discord.com/channels',         isOAuth: true  },
-  notion:         { startUrl: 'https://app.notion.com',                           signInUrl: 'https://www.notion.com/login',                       authSuccessPattern: 'app.notion.com',                    isOAuth: true, preferAgentBrowser: true, postAuthUrl: 'https://app.notion.com', usePersistentProfile: true, hostAliases: ['www.notion.so', 'www.notion.com', 'notion.so', 'notion.com'], _metaRevision: 2  },
+  notion:         { startUrl: 'https://app.notion.com',                           signInUrl: 'https://www.notion.com/login',                       authSuccessPattern: 'app.notion.com',                    isOAuth: true, preferAgentBrowser: true, postAuthUrl: 'https://app.notion.com', usePersistentProfile: true, hostAliases: ['www.notion.so', 'www.notion.com', 'notion.so', 'notion.com', 'notion.new'], _metaRevision: 2  },
   figma:          { startUrl: 'https://www.figma.com',                           signInUrl: 'https://www.figma.com/login',                       authSuccessPattern: 'figma.com/files',              isOAuth: true  },
   linear:         { startUrl: 'https://linear.app',                              signInUrl: 'https://linear.app/login',                          authSuccessPattern: 'linear.app/',                  isOAuth: true  },
   jira:           { startUrl: 'https://id.atlassian.com',                        signInUrl: 'https://id.atlassian.com',                          authSuccessPattern: 'atlassian.net',                isOAuth: true  },
@@ -705,25 +705,17 @@ Extract up to 15 inbox rows using page.evaluate with Gmail's stable CSS selector
 { "action": "run-code", "code": "async page => { return await page.evaluate(() => { const rows=Array.from(document.querySelectorAll('div[role=listitem]')).slice(0,5); return rows.map((r,i)=>{ const s=r.querySelector('.luvU6')?.innerText||''; const sub=r.querySelector('.nDYNg')?.innerText||''; const snip=r.querySelector('.SibTc')?.innerText||''; return 'Email '+(i+1)+': From='+s+' | Subject='+sub+' | Preview='+snip; }).join('\\n'); }); }" }`,
 
   notion: `### Create New Page (create, new page, add page, write)
-1. Check if page already exists in sidebar:
-   { "action": "run-code", "code": "async page => { return await page.evaluate(() => { const items=Array.from(document.querySelectorAll('div[role=treeitem],a[role=treeitem]')); const target='<page title>'.toLowerCase(); const found=items.find(i=>i.innerText.trim().toLowerCase()===target); return found ? 'PAGE_EXISTS' : 'NOT_FOUND'; }); }" }
-   RULE: If result is PAGE_EXISTS, do NOT create a duplicate — navigate to the existing page instead.
-2. Click new page in sidebar: { "action": "click", "selector": "div[data-testid='sidebar-new-page'],a[aria-label='Add a page']" }
-3. Snapshot to confirm page opened: { "action": "snapshot" }
-4. Type page title: { "action": "type", "text": "<page title>" }
-5. Press Enter to start body: { "action": "press", "key": "Enter" }
-6. Verify URL changed to new page URL:
-   { "action": "eval", "expression": "window.location.href" }
-   RULE: If URL contains '/p/' followed by an ID, the page was created successfully. Do NOT re-create.
-7. For each todo item, use the /todo slash command:
-   { "action": "type", "text": "/todo" }
-   { "action": "press", "key": "Enter" }
-   { "action": "snapshot" }
-   RULE: After /todo + Enter, verify a checkbox block appeared. If not, retry once.
-   Then type the todo text: { "action": "type", "text": "<todo item text>" }
-   { "action": "press", "key": "Enter" }
-   { "action": "snapshot" }
+1. Start on the new page directly: navigate to https://notion.new (Notion shortcut that creates a blank page in the Private section). If already on a Notion page editor with a blank title, skip navigation.
+2. Wait for the page/editor to stabilise, then snapshot: { "action": "snapshot" }
+3. Type the page title: { "action": "type", "text": "<page title>" }
+4. Press Enter to move to the body: { "action": "press", "key": "Enter" }
+5. For each todo item, create a checkbox — NEVER a bullet list. Use ONE of these methods per item:
+   PREFERRED: { "action": "type", "text": "[]" } then { "action": "press", "key": "Space" } then type the todo item text, then { "action": "press", "key": "Enter" }
+   ALTERNATIVE: { "action": "type", "text": "/todo" } then { "action": "press", "key": "Enter" }, wait briefly, then type the todo item text, then { "action": "press", "key": "Enter" }
+   RULE: Do NOT type "- Item 1" or use "*"/"-" (that creates bullets, not checkboxes). Each todo must be created with [] (Space) or /todo.
+   RULE: After creating each todo, take a snapshot to confirm a checkbox block appeared before typing the text. If a checkbox did not appear, retry with [] + Space.
    Repeat for each todo item.
+6. Verify completion: { "action": "eval", "expression": "document.title" } — the title should be "<page title>".
 
 ### Search Workspace (search, find, look for, page)
 1. Click search: { "action": "click", "selector": "div[aria-label='Search'],button[data-testid='search-button']" }
@@ -843,7 +835,7 @@ INSTRUCTION: Use video.agent to find and watch tutorial videos, extracting actio
 // ---------------------------------------------------------------------------
 const PLAYBOOK_BUILD_PROMPT = `You are a browser automation expert. Generate step-by-step playbooks for automating a web service using playwright-cli.
 
-URL-FIRST RULE: Before any click or type action, consider whether the service has a direct URL for the task (e.g., /new, /compose, /create, /submit, /settings, /help, /dashboard, /search?q=). If so, your FIRST step MUST be { "action": "navigate", "url": "..." } to that URL. Only fall back to clicks for navigation when no direct URL exists.
+URL-FIRST RULE: Prefer direct navigation when the service provides a known URL for the action. If a deepLinkUrl is provided in the agent context, use it as the first navigate step. Only fall back to clicks for navigation when no direct URL is known.
 
 You MUST use ONLY these action names in your steps (no others):
 
@@ -911,7 +903,7 @@ Example format:
 { "action": "run-code", "code": "async page => { return await page.evaluate(() => { return Array.from(document.querySelectorAll('.message')).slice(0,5).map(m=>m.innerText).join('\\n'); }); }" }
 
 IMPORTANT:
-- Prefer navigate to a direct URL as the first step when the service likely supports one (e.g., /compose, /new, /create, /submit, /settings, /help, /dashboard, /search?q=). Only use click to navigate when no direct URL exists.
+- Prefer navigate to a direct URL as the first step when a deepLinkUrl is provided or the service has a known URL for the action. Only use click to navigate when no direct URL is known.
 - Use CSS attribute selectors and ARIA labels — they are more stable than class names
 - For form fields that create chips/tokens (like email To fields), always fill + press Enter + snapshot before continuing
 - For contenteditable rich-text areas use type, not fill
@@ -949,7 +941,7 @@ You MUST use ONLY these action names (full playwright-cli vocabulary):
 
 Chain-of-thought approach:
 1. What page/view does this goal start from?
-2. Is there a direct URL for this goal? If the service likely has a URL like /new, /compose, /create, /submit, /settings, /help, /dashboard, start with { "action": "navigate", "url": "..." } to that URL.
+2. Is there a direct URL for this goal? If a deepLinkUrl is provided, start with { "action": "navigate", "url": "..." } to that URL.
 3. Does the DOM change after that action? If yes → snapshot.
 4. What fields need filling? Use fill for <input>/<textarea>, type for contenteditable.
 5. Are there chip/token confirmation steps? Fill + press Enter + snapshot + verify chip exists.
@@ -964,7 +956,7 @@ Format your response as a single ### section:
 IMPORTANT:
 - The ### header keywords are used for future matching — make them comprehensive and relevant
 - Do NOT repeat steps from the existing playbooks — generate only what GOAL requires
-- Prefer URL-first navigation over DOM clicks when a direct URL likely exists (e.g., /compose, /new, /create, /submit, /settings, /help, /dashboard)
+- Prefer URL-first navigation over DOM clicks when a deepLinkUrl is provided or the service has a known URL for the action
 - Output ONLY the ### section — no preamble, no explanation`;
 
 // ---------------------------------------------------------------------------
@@ -1001,8 +993,8 @@ function _resolvePlaybook(descriptor, task, agentId) {
   }
 
   if (matched.length > 0) {
-    // Join all matching sections — compound tasks (e.g. "find and delete") get both playbooks
-    return { tier: 1, section: matched.join('\n\n'), subsections };
+    const isMutationTask = /\b(create|add|write|send|post|publish|upload|schedule|book|buy|delete|update)\b/i.test(task);
+    return { tier: 1, section: isMutationTask ? matched[0] : matched.join('\n\n'), subsections };
   }
 
   return { tier: 3, section: null, subsections };
@@ -1129,7 +1121,8 @@ async function _resolvePlaybookSemantic(agentId, descriptor, task) {
     // Collect all sections above threshold (compound tasks get multiple sections)
     const matched = scored.filter(s => s.score >= 0.35).map(s => s.section);
     if (matched.length > 0) {
-      return { tier: 1, section: matched.join('\n\n'), subsections };
+      const isMutationTask = /\b(create|add|write|send|post|publish|upload|schedule|book|buy|delete|update)\b/i.test(task);
+      return { tier: 1, section: isMutationTask ? matched[0] : matched.join('\n\n'), subsections };
     }
 
     return { tier: 3, section: null, subsections };
@@ -1553,6 +1546,12 @@ async function actionBuildAgent({ service, startUrl: explicitUrl, force = false,
       descriptor,
       initialStatus
     );
+    // Clear any stale auth timestamps from a previous build. A rebuild resets the
+    // agent, so previous authentication is no longer implicitly valid.
+    await db.run(
+      'UPDATE agents SET authed_at = NULL, auth_expires_at = NULL WHERE id = ?',
+      agentId
+    );
   });
 
   logger.info(`[browser.agent] built agent: ${agentId}`, { capabilities });
@@ -1694,7 +1693,7 @@ async function actionListAgents() {
       // that don't have the canonical '.agent' suffix. Safe to run every call.
       await db.run("DELETE FROM agents WHERE id NOT LIKE '%.agent'").catch(() => {});
 
-      const rows = await db.all("SELECT id, type, service, capabilities, status, last_validated FROM agents WHERE type IN ('browser', 'api_key', 'bearer', 'basic') ORDER BY created_at DESC");
+      const rows = await db.all("SELECT id, type, service, capabilities, status, last_validated, descriptor FROM agents WHERE type IN ('browser', 'api_key', 'bearer', 'basic') ORDER BY created_at DESC");
       dbAgents = (rows || []).map(r => ({
         id: r.id,
         type: r.type,
@@ -1702,6 +1701,7 @@ async function actionListAgents() {
         capabilities: r.capabilities ? (() => { try { return JSON.parse(r.capabilities); } catch (_) { return []; } })() : [],
         status: r.status,
         lastValidated: r.last_validated,
+        start_url: extractDescriptorUrl(r.descriptor, 'start_url') || null,
       }));
     });
   } catch (_) {}
@@ -1724,7 +1724,8 @@ async function actionListAgents() {
           const normalStatus = HEALTHY_STATUSES.has(rawStatus) ? 'healthy' : rawStatus;
           const type    = typeMatch?.[1]    || 'browser';
           const service = serviceMatch?.[1] || id.replace('.agent', '');
-          dbAgents.push({ id, type, service, capabilities: [], status: normalStatus });
+          const startUrlMatch = content.match(/^start_url:\s*(.+)/m);
+          dbAgents.push({ id, type, service, capabilities: [], status: normalStatus, start_url: startUrlMatch ? startUrlMatch[1].trim() : null });
           logger.info(`[browser.agent] list_agents: merged .md-only agent ${id} (status=${normalStatus})`);
         } catch (_) {}
       }
@@ -2606,7 +2607,7 @@ function _isUnsafeDeepLinkUrl(candidateUrl, expectedHost = '') {
   return false;
 }
 
-async function verifyDeepLinkUrl(url, sessionId, expectedHost, timeoutMs = 15000) {
+async function verifyDeepLinkUrl(url, sessionId, expectedHost, timeoutMs = 15000, hostAliases = []) {
   try {
     if (_isUnsafeDeepLinkUrl(url, expectedHost)) {
       logger.warn(`[browser.agent] verifyDeepLinkUrl: rejected unsafe candidate for ${expectedHost}: ${url}`);
@@ -2622,7 +2623,7 @@ async function verifyDeepLinkUrl(url, sessionId, expectedHost, timeoutMs = 15000
     if (!curHref) return false;
 
     const curHost = (() => { try { return new URL(curHref).hostname.replace(/^www\./, ''); } catch (_) { return ''; } })();
-    if (!curHost || curHost !== expectedHost) {
+    if (!curHost || (curHost !== expectedHost && !curHost.endsWith('.' + expectedHost) && !isHostAlias(curHost, expectedHost, hostAliases))) {
       logger.warn(`[browser.agent] verifyDeepLinkUrl: host mismatch expected=${expectedHost} actual=${curHost} for ${url}`);
       return false;
     }
@@ -2668,8 +2669,50 @@ function callSkill(skillName, args, timeoutMs = 120000) {
   });
 }
 
-async function _resolveTaskDeepLink(agentId, serviceKey, baseStartUrl, task) {
+function _isMutationIntent(intent) {
+  return [INTENTS.CONTENT_CREATE, INTENTS.SOCIAL, INTENTS.MAIL, INTENTS.SCHEDULING, INTENTS.COMMERCE].includes(intent);
+}
+
+function _canPromoteDeepLink(candidate, source, intent, baseHost, serviceKey = '') {
+  if (!candidate || _isUnsafeDeepLinkUrl(candidate, baseHost)) return false;
+  let parsed;
+  try { parsed = new URL(candidate); } catch (_) { return false; }
+  const host = parsed.hostname.replace(/^www\./, '');
+
+  // Check if candidate is on-domain (exact, subdomain, or configured host alias)
+  const svc = String(serviceKey || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+  const svcEntry = lookupBrowserService(svc);
+  const aliases = svcEntry?.hostAliases;
+  const isOnDomain = isHostAlias(host, baseHost, aliases);
+
+  // Off-domain candidates from crawl are untrusted — reject.
+  // Off-domain from llm/suggestion/search/template/authenticated/caller are allowed through
+  // to verification (verifyDeepLinkUrl navigates and checks the redirect target).
+  if (!isOnDomain && source === 'crawl') return false;
+
+  if (_isMutationIntent(intent) && !['caller', 'template', 'authenticated'].includes(source)) return false;
+  if (source === 'search' && /\/(support|help|docs|documentation|community|forum|p|page|post|article|blog|item)\//i.test(parsed.pathname)) return false;
+  return true;
+}
+
+async function _resolveTaskDeepLink(agentId, serviceKey, baseStartUrl, task, existingDeepLinkUrl, sessionId) {
   try {
+    // If a deep-link was already resolved (e.g., by preflight), skip resolution.
+    if (existingDeepLinkUrl) {
+      const _existingHost = (() => {
+        try { return new URL(existingDeepLinkUrl).hostname.replace(/^www\./, ''); }
+        catch (_) { return ''; }
+      })();
+      const _baseHost = (() => {
+        try { return new URL(baseStartUrl).hostname.replace(/^www\./, ''); }
+        catch (_) { return serviceKey; }
+      })();
+      if (_existingHost && (_existingHost === _baseHost || _existingHost.endsWith('.' + _baseHost) || _baseHost.endsWith('.' + _existingHost))) {
+        logger.info(`[browser.agent] deep-link: using pre-resolved deepLinkUrl for ${agentId}: ${existingDeepLinkUrl}`);
+        return { url: existingDeepLinkUrl, source: 'preflight' };
+      }
+    }
+
     const intent = await classifyTaskIntent(task);
     const isSearchLike = intent === INTENTS.SEARCH || /\b(search|look\s*up|google|find)\b/i.test(task);
 
@@ -2715,6 +2758,9 @@ async function _resolveTaskDeepLink(agentId, serviceKey, baseStartUrl, task) {
         }
         if (svc === 'linkedin' || baseHost === 'linkedin.com') {
           return 'https://www.linkedin.com/post/new';
+        }
+        if (svc === 'notion' || baseHost === 'app.notion.com') {
+          return 'https://notion.new';
         }
       }
 
@@ -2784,19 +2830,71 @@ async function _resolveTaskDeepLink(agentId, serviceKey, baseStartUrl, task) {
 
     // 1. Prefer service intent templates for deterministic URL-first starts.
     let candidate = _buildIntentTemplateUrl();
+    let candidateSource = candidate ? 'template' : null;
     if (candidate) {
       logger.info(`[browser.agent] deep-link: using intent template for ${agentId}: ${candidate}`);
     }
 
+    // 1.5. Authenticated eval — extract <a href> links from the live browser session.
+    // This discovers action URLs only visible to logged-in users (e.g., app menus, dashboards).
+    if (!candidate && sessionId) {
+      try {
+        const evalResult = await callSkill('browser.act', {
+          action: 'evaluate',
+          sessionId,
+          text: 'JSON.stringify(Array.from(document.querySelectorAll("a[href]")).map(a=>({href:a.href,text:(a.innerText||"").trim().slice(0,80)})).filter(l=>l.href.startsWith("http")).slice(0,150))',
+        }, 10000);
+        const evalRaw = String(evalResult?.result || evalResult?.stdout || '').trim();
+        let evalLinks = null;
+        try { evalLinks = JSON.parse(evalRaw); } catch (_) { const m = evalRaw.match(/\[[\s\S]*\]/); if (m) try { evalLinks = JSON.parse(m[0]); } catch (_) {} }
+        if (Array.isArray(evalLinks) && evalLinks.length > 0) {
+          const _INTENT_EVAL_PATTERNS = {
+            [INTENTS.CONTENT_CREATE]: /\/(new|create|compose|upload|publish|submit|add)/i,
+            [INTENTS.SOCIAL]:         /\/(compose|post|share|submit|tweet)/i,
+            [INTENTS.MAIL]:           /\/(compose|draft|new|mail)/i,
+            [INTENTS.SETTINGS]:       /\/(settings|account|preferences|profile)/i,
+            [INTENTS.SUPPORT]:        /\/(help|support|contact|ticket)/i,
+            [INTENTS.DASHBOARD]:      /\/(dashboard|admin|overview|home|console)/i,
+            [INTENTS.DOCS]:           /\/(docs|documentation|guide|tutorial|help)/i,
+            [INTENTS.CONSOLE]:        /\/(console|developer|api|platform|settings)/i,
+            [INTENTS.SCHEDULING]:     /\/(calendar|schedule|book|event|new)/i,
+            [INTENTS.SEARCH]:         /\/(search|find)/i,
+          };
+          const _evalPattern = _INTENT_EVAL_PATTERNS[intent];
+          if (_evalPattern) {
+            const _evalMatches = evalLinks
+              .filter(l => {
+                try {
+                  const linkHost = new URL(l.href).hostname.replace(/^www\./, '');
+                  return (linkHost === baseHost || linkHost.endsWith('.' + baseHost)) && _evalPattern.test(l.href);
+                } catch (_) { return false; }
+              })
+              .map(l => ({ ...l, _score: (l.text || '').toLowerCase().split(/\s+/).filter(w => w.length > 2 && task.toLowerCase().includes(w)).length }))
+              .sort((a, b) => b._score - a._score);
+            if (_evalMatches.length > 0) {
+              candidate = _evalMatches[0].href;
+              candidateSource = 'authenticated';
+              logger.info(`[browser.agent] deep-link: authenticated eval discovered ${candidate} (text="${_evalMatches[0].text}", score=${_evalMatches[0]._score}) for ${agentId}`);
+            }
+          }
+        }
+      } catch (evalErr) {
+        logger.debug(`[browser.agent] deep-link: authenticated eval failed: ${evalErr.message}`);
+      }
+    }
+
     // 2. Try web.agent discover_task_url
-    if (!candidate) {
+    if (!candidate && !_isMutationIntent(intent)) {
       try {
         const webResult = await callSkill('web.agent', {
           action: 'discover_task_url',
           domain: baseHost,
           task,
         }, 15000);
-        if (webResult?.ok && webResult?.taskUrl) candidate = webResult.taskUrl;
+        if (webResult?.ok && webResult?.taskUrl) {
+          candidate = webResult.taskUrl;
+          candidateSource = 'search';
+        }
       } catch (webErr) {
         logger.debug(`[browser.agent] deep-link: web.agent failed: ${webErr.message}`);
       }
@@ -2804,7 +2902,7 @@ async function _resolveTaskDeepLink(agentId, serviceKey, baseStartUrl, task) {
 
     // 2.5. Try web.crawl link extraction — crawl the service's start URL and
     // extract <a href> links to discover action URLs not indexed by search engines.
-    if (!candidate) {
+    if (!candidate && !_isMutationIntent(intent)) {
       try {
         const crawlResult = await callSkill('web.crawl', {
           url: baseStartUrl,
@@ -2842,6 +2940,7 @@ async function _resolveTaskDeepLink(agentId, serviceKey, baseStartUrl, task) {
 
             if (_matchingLinks.length > 0) {
               candidate = _matchingLinks[0].href;
+              candidateSource = 'crawl';
               logger.info(`[browser.agent] deep-link: web.crawl discovered ${candidate} (text="${_matchingLinks[0].text}", score=${_matchingLinks[0]._score}) for ${agentId}`);
             }
           }
@@ -2854,10 +2953,20 @@ async function _resolveTaskDeepLink(agentId, serviceKey, baseStartUrl, task) {
     // 3. Fallback to LLM-suggested URL
     if (!candidate) {
       const suggestion = await suggestTaskUrl(serviceKey, baseStartUrl, intent, task);
-      if (suggestion?.ok && suggestion?.url) candidate = suggestion.url;
+      if (suggestion?.ok && suggestion?.url) {
+        candidate = suggestion.url;
+        candidateSource = 'suggestion';
+      }
     }
 
     if (!candidate) return null;
+
+    const _svcKeyNorm = String(serviceKey || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+
+    if (!_canPromoteDeepLink(candidate, candidateSource, intent, baseHost, _svcKeyNorm)) {
+      logger.warn(`[browser.agent] deep-link: rejected ${candidateSource || 'unknown'} candidate for ${agentId}: ${candidate}`);
+      return null;
+    }
 
     // Reject poisoned deep-links that include extension pages/options URLs in query params.
     // These can leak from browser extensions and break deterministic recipe execution.
@@ -2867,14 +2976,27 @@ async function _resolveTaskDeepLink(agentId, serviceKey, baseStartUrl, task) {
       return null;
     }
 
-    // 4. Security: must stay on expected domain or a subdomain
+    // 4. Security: on-domain candidates pass through. Off-domain candidates must be
+    // verified by navigation (verifyDeepLinkUrl) — shortcut domains like notion.new
+    // redirect to the canonical service host.
     const candidateHost = (() => {
       try { return new URL(candidate).hostname.replace(/^www\./, ''); }
       catch (_) { return ''; }
     })();
-    if (!candidateHost || (candidateHost !== baseHost && !candidateHost.endsWith('.' + baseHost))) {
-      logger.warn(`[browser.agent] deep-link: off-domain candidate rejected: ${candidate}`);
-      return null;
+    const _svcEntry = lookupBrowserService(_svcKeyNorm);
+    const _svcAliases = _svcEntry?.hostAliases;
+    const _isOnDomain = isHostAlias(candidateHost, baseHost, _svcAliases);
+    if (!_isOnDomain) {
+      if (!sessionId) {
+        logger.warn(`[browser.agent] deep-link: off-domain candidate rejected (no sessionId for verification): ${candidate}`);
+        return null;
+      }
+      const _verified = await verifyDeepLinkUrl(candidate, sessionId, baseHost, 15000, _svcAliases);
+      if (!_verified) {
+        logger.warn(`[browser.agent] deep-link: off-domain candidate failed verification: ${candidate}`);
+        return null;
+      }
+      logger.info(`[browser.agent] deep-link: off-domain candidate verified via redirect: ${candidate}`);
     }
 
     // Gmail-specific hardening: avoid malformed compose links with extension payloads.
@@ -2883,8 +3005,8 @@ async function _resolveTaskDeepLink(agentId, serviceKey, baseStartUrl, task) {
       return null;
     }
 
-    logger.info(`[browser.agent] deep-link: ${agentId} → ${candidate}`);
-    return candidate;
+    logger.info(`[browser.agent] deep-link: ${agentId} → ${candidate} (source=${candidateSource})`);
+    return { url: candidate, source: candidateSource };
   } catch (err) {
     logger.warn(`[browser.agent] deep-link resolution error: ${err.message}`);
     return null;
@@ -3892,12 +4014,14 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
       // JSON state-save is redundant for *_agent sessions and creates stale files that
       // interfere on next run (Google rejects injected JSON cookies). Skip it.
       _setCachedAuthCheck(agentId, false);
-      // Persist auth timestamp to DuckDB so future runs can fast-path past the preflight probe
-      // for 30 days (conservative — most OAuth sessions last at least this long).
+      // Persist auth timestamp to DuckDB so future runs can fast-path past the preflight probe.
+      // Use a long expiry (365 days) — the Chrome persistent profile is the source of truth.
+      // The service itself will serve a login wall when the session expires server-side,
+      // which the run-path probe detects during task execution.
       (async () => {
         try {
           const _now = new Date().toISOString();
-          const _expires = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
+          const _expires = new Date(Date.now() + 365 * 24 * 60 * 60 * 1000).toISOString();
           await withDb(async (db) => {
             await db.run(
               `UPDATE agents SET authed_at = ?, auth_expires_at = ? WHERE id = ?`,
@@ -3933,6 +4057,7 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
 
   const _allowAutoGeneratedRecipes = process.env.THINKDROP_ALLOW_AUTOGENERATED_RECIPES === 'true';
   let _urlFirstNavigationSelected = false;
+  let _deepLinkSource = null;
 
   // ── Caller-provided direct URL takes priority (e.g. from planSkillsV2) ───────
   if (url) {
@@ -3941,22 +4066,46 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
       logger.info(`[browser.agent] run: using caller-provided url ${_callerUrl} for ${agentId}`);
       startUrl = _callerUrl;
       _urlFirstNavigationSelected = true;
+      _deepLinkSource = 'caller';
     } catch (_) {
       logger.warn(`[browser.agent] run: caller-provided url "${url}" is invalid — ignoring`);
     }
   } else {
     // ── Task-specific deep-link resolution ─────────────────────────────────────
-    const _deepLink = await _resolveTaskDeepLink(agentId, _svcKey, startUrl, task);
+    const _deepLinkResult = await _resolveTaskDeepLink(agentId, _svcKey, startUrl, task, null, sessionId);
+    const _deepLink = _deepLinkResult?.url || (typeof _deepLinkResult === 'string' ? _deepLinkResult : null);
+    _deepLinkSource = _deepLinkResult?.source || null;
     if (_deepLink) {
       startUrl = _deepLink;
       _urlFirstNavigationSelected = true;
+    } else {
+      const _taskIntent = await classifyTaskIntent(task);
+      if (_isMutationIntent(_taskIntent)) {
+        const trainerAgent = require('./trainer.agent.cjs');
+        const recipe = trainerAgent.findMatchingRecipe(agentId.replace('.agent', ''), task, { allowAutoGenerated: _allowAutoGeneratedRecipes });
+        if (!recipe) return {
+          ok: false,
+          agentId,
+          task,
+          askUser: true,
+          trainingHandoff: true,
+          question: `I couldn't find a direct route for this task in ${_svcKey}. Would you like to train a recipe?`,
+          options: [
+            { label: `Open ${_svcKey} agent training`, value: 'open_agents_training' },
+            { label: 'Cancel', value: 'cancel' },
+          ],
+        };
+      }
     }
   }
 
-  const _skipDeterministicRecipeReplay =
-    _urlFirstNavigationSelected && process.env.THINKDROP_REPLAY_WITH_DIRECT_URL !== 'true';
-  if (_skipDeterministicRecipeReplay) {
-    logger.info(`[browser.agent] run: URL-first selected for ${agentId} — deterministic recipe replay disabled`);
+  // Phase 5: Recipe replay and URL-first navigation are no longer mutually exclusive.
+  // URL-first provides the initial URL; recipe replay can still run for non-navigation
+  // waypoints (clicks, fills, etc.). The recipe's navigate waypoints are skipped if
+  // URL-first already landed on the right page (domain continuity check handles this).
+  const _skipDeterministicRecipeReplay = false;
+  if (_urlFirstNavigationSelected) {
+    logger.info(`[browser.agent] run: URL-first selected for ${agentId} — recipe replay will run for non-navigation waypoints`);
   }
 
   // Step 2: delegate to playwright.agent or agentbrowser.agent with the authenticated session
@@ -4674,8 +4823,8 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
     } catch (_execErr) {
       logger.warn(`[browser.agent] recipe-exec: deterministic execution failed (non-fatal): ${_execErr.message}`);
     }
-  } else if (_trainedRecipeInjected && _skipDeterministicRecipeReplay) {
-    logger.info(`[browser.agent] recipe-exec: skipped deterministic replay because URL-first navigation was selected for ${agentId}`);
+  } else if (_trainedRecipeInjected && _urlFirstNavigationSelected) {
+    logger.info(`[browser.agent] recipe-exec: URL-first navigation was selected for ${agentId} — recipe waypoints may be skipped via domain continuity check`);
   }
 
   // ── Step 1c: Tier 2/3 nav context enrichment via web.agent / video.agent ──
@@ -4735,6 +4884,8 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
       const _intent = await classifyTaskIntent(task);
       const _baseHost = (() => { try { return new URL(startUrl).hostname.replace(/^www\./, ''); } catch (_) { return ''; } })();
       if (!_baseHost) throw new Error('could not derive hostname from startUrl');
+      const _svcEntry3 = lookupBrowserService(_serviceKey);
+      const _hostAliases = _svcEntry3?.hostAliases || [];
 
       // Layer 0: Cached verified correction (from prior successful runs)
       const _cached = await getLearnedCorrection(_serviceKey, _intent);
@@ -4746,7 +4897,7 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
             deleteLearnedCorrection(_serviceKey, _intent).catch(() => {});
           });
         } else if (_cached.confidence >= 0.6) {
-          const _cachedValid = await verifyDeepLinkUrl(_cached.correctedUrl, sessionId, _baseHost, 15000);
+          const _cachedValid = await verifyDeepLinkUrl(_cached.correctedUrl, sessionId, _baseHost, 15000, _hostAliases);
           if (_cachedValid) {
             _deepLinkOverride = _cached.correctedUrl;
             logger.info(`[browser.agent] deep-link: using cached URL ${_cached.correctedUrl} — overriding startUrl from ${startUrl}`);
@@ -4767,7 +4918,7 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
           if (_isUnsafeDeepLinkUrl(_llmSuggest.url, _baseHost)) {
             logger.warn(`[browser.agent] deep-link: rejected unsafe LLM URL for ${_serviceKey}:${_intent}: ${_llmSuggest.url}`);
           } else {
-            const _llmValid = await verifyDeepLinkUrl(_llmSuggest.url, sessionId, _baseHost, 15000);
+            const _llmValid = await verifyDeepLinkUrl(_llmSuggest.url, sessionId, _baseHost, 15000, _hostAliases);
             if (_llmValid) {
             _deepLinkOverride = _llmSuggest.url;
             logger.info(`[browser.agent] deep-link: verified LLM URL ${_llmSuggest.url} — overriding startUrl from ${startUrl}`);
@@ -4813,11 +4964,9 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
             });
           }
         } else {
-        // 4. Security: same domain check
-        const _dlHost = (() => { try { return new URL(_bestUrl).hostname.replace(/^www\./, ''); } catch (_) { return ''; } })();
-        if (_dlHost && (_dlHost === _baseHost || _dlHost.endsWith('.' + _baseHost) || _baseHost.endsWith('.' + _dlHost))) {
-          // 5. Validate the candidate URL before trusting it
-          const _valid = await verifyDeepLinkUrl(_bestUrl, sessionId, _baseHost, 15000);
+        // 4. Security: verify candidate by navigation. Off-domain candidates are allowed
+        // through to verification — shortcut domains (e.g. notion.new) redirect to canonical host.
+        const _valid = await verifyDeepLinkUrl(_bestUrl, sessionId, _baseHost, 15000, _hostAliases);
           if (_valid) {
             _deepLinkOverride = _bestUrl;
             logger.info(`[browser.agent] deep-link: verified ${_bestUrl} (source=${_bestSource}, score=${_bestScore}) for task "${task.slice(0, 60)}" — overriding startUrl from ${startUrl}`);
@@ -4834,9 +4983,6 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
               });
             }
           }
-        } else {
-          logger.warn(`[browser.agent] deep-link: ignored ${_bestUrl} — domain mismatch with ${startUrl}`);
-        }
         }
         } else {
         logger.info(`[browser.agent] deep-link: no suitable URL found${_dlResult?.error ? ' (' + _dlResult.error + ')' : ''} — using startUrl ${startUrl}`);
@@ -4870,6 +5016,16 @@ When extracting page content with run-code, prioritize these selectors over gene
     logger.info(`[browser.agent] run: injected content extraction hints for ${_hostname} (${_contentExtraction.primary_selector})`);
   }
 
+  // ── Inject deep-link provenance into agentContext ────────────────────────
+  // Tell playwright.agent that the start URL was verified and its source,
+  // so the planner doesn't second-guess the navigation or try to re-discover it.
+  if (_urlFirstNavigationSelected && !_recipeExecutedOk) {
+    const _provenanceSource = _deepLinkSource || (url ? 'caller' : 'resolved');
+    const _provenanceNote = `\n\n## Verified Destination URL\nThe navigation URL (${startUrl}) has been verified (source: ${_provenanceSource}).\nDo NOT search for or navigate to alternative URLs. Use this URL as the first navigation step. If the page loads correctly, proceed directly with the user's task.`;
+    _agentContext = (_agentContext + _provenanceNote).slice(0, 5500);
+    logger.info(`[browser.agent] run: injected deep-link provenance for ${agentId} (source=${_provenanceSource})`);
+  }
+
   try {
     // If recipe was successfully executed, we're already on the target page - don't navigate
     const _playwrightUrl = _recipeExecutedOk ? undefined : ((_urlFirstNavigationSelected || _useAgentBrowser) ? startUrl : undefined);
@@ -4889,6 +5045,7 @@ When extracting page content with run-code, prioritize these selectors over gene
         headed: _usePersistentProfile ? true : undefined,
         maxTurns: 15,
         timeoutMs: 120000,
+        overallTimeoutMs: 120000,
         recipeWasUsed: _recipeExecutedOk,
         authConfirmedAt: (_getCachedAuthCheck(agentId)?.ts ?? null),
         _progressCallbackUrl,
@@ -4941,6 +5098,7 @@ When extracting page content with run-code, prioritize these selectors over gene
         agentId,
         task,
         askUser: true,
+        trainingHandoff: agentResult.trainingHandoff === true,
         question: _questionText,
         options: _options,
         recipeWasUsed: _recipeExecutedOk,
@@ -5091,6 +5249,7 @@ When extracting page content with run-code, prioritize these selectors over gene
               headed: _usePersistentProfile ? true : undefined,
               maxTurns: 15,
               timeoutMs: 120000,
+              overallTimeoutMs: 120000,
               authConfirmedAt: Date.now(),
               _progressCallbackUrl,
               _stepIndex,
@@ -5123,7 +5282,8 @@ When extracting page content with run-code, prioritize these selectors over gene
         agentId,
         task,
         askUser: true,
-        question: `${_svcDisplayFinal} requires sign-in. A browser window has been opened — please sign in there to continue.`,
+        sessionExpired: true,
+        question: `${_svcDisplayFinal} session has expired. Please re-authenticate in the Agents tab to resume scheduled tasks.`,
         options: [],
         error: `Login wall detected for ${agentId} — service requires authentication.`,
         loginWallDetected: true,
@@ -5817,10 +5977,18 @@ async function browserAgent(args) {
     case 'record_failure':
         return await actionRecordFailure(args);
 
+    case 'resolve_deep_link': {
+        const { agentId: _aId, serviceKey: _svcKey, startUrl: _startUrl, task: _task, sessionId: _sid, existingDeepLinkUrl: _existing } = args;
+        if (!_startUrl || !_task) return { ok: false, error: 'startUrl and task are required for resolve_deep_link' };
+        const _result = await _resolveTaskDeepLink(_aId || 'unknown', _svcKey || '', _startUrl, _task, _existing, _sid);
+        const _dlUrl = _result?.url || (typeof _result === 'string' ? _result : null);
+        return { ok: !!_dlUrl, deepLinkUrl: _dlUrl, deepLinkSource: _result?.source || null };
+    }
+
     default:
         return {
         ok: false,
-        error: `Unknown action: "${action}". Valid: build_agent | query_agent | list_agents | validate_agent | run | authenticate | explore | scan_domain | scan_page | delete_agent | record_failure`,
+        error: `Unknown action: "${action}". Valid: build_agent | query_agent | list_agents | validate_agent | run | authenticate | explore | scan_domain | scan_page | delete_agent | record_failure | resolve_deep_link`,
         };
   }
 }
@@ -5872,3 +6040,7 @@ module.exports._deriveAgentType = deriveAgentType;
 module.exports.resolveCredential = resolveCredential;
 module.exports._profileGetValue = _profileGetValue;
 module.exports._isSigninWall = _isSigninWall;
+module.exports._canPromoteDeepLink = _canPromoteDeepLink;
+module.exports._isMutationIntent = _isMutationIntent;
+module.exports._isUnsafeDeepLinkUrl = _isUnsafeDeepLinkUrl;
+module.exports._resolvePlaybook = _resolvePlaybook;

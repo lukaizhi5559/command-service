@@ -2141,7 +2141,7 @@ async function actionListAllAgents() {
     // that don't have the canonical '.agent' suffix. Safe to run every call.
     await db.run("DELETE FROM agents WHERE id NOT LIKE '%.agent'").catch(() => {});
 
-    const rows = await db.all("SELECT id, type, service, cli_tool, capabilities, status, last_validated, descriptor FROM agents ORDER BY created_at DESC");
+    const rows = await db.all("SELECT id, type, service, cli_tool, capabilities, status, last_validated, descriptor, authed_at FROM agents ORDER BY created_at DESC");
     return {
       ok: true,
       agents: (rows || []).map(r => {
@@ -2160,6 +2160,8 @@ async function actionListAllAgents() {
           capabilities: (() => { try { return r.capabilities ? JSON.parse(r.capabilities) : []; } catch (_) { return []; } })(),
           status: r.status || 'pending',
           lastValidated: r.last_validated,
+          authedAt: r.authed_at || null,
+          start_url: _parseFrontmatterField(r.descriptor, 'start_url') || null,
           ...(apiKeyUrl ? { apiKeyUrl } : {}),
           ...(apiKeyEnv ? { apiKeyEnv } : {}),
         };

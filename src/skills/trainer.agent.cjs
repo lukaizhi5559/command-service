@@ -2095,6 +2095,221 @@ async function saveAutoRecipe(agentId, task, transcript, targetUrl, playbookCont
 }
 
 // ---------------------------------------------------------------------------
+// Phase 10: Distill keyboard-first script from successful Tier 3 canvas run
+// Converts transcript actions into script YAML format for script DB
+// ---------------------------------------------------------------------------
+async function distillKeyboardScript(agentId, task, transcript, pageType, service) {
+  if (!transcript || !Array.isArray(transcript) || transcript.length < 2) return null;
+  if (pageType !== 'canvas' && pageType !== 'hybrid') return null;
+
+  const _service = service || (agentId || '').replace(/\.agent$/, '').replace(/[^a-z0-9]/gi, '').toLowerCase();
+  if (!_service) return null;
+
+  // Extract keyboard-relevant actions from transcript
+  const keyboardActions = [];
+  for (const entry of transcript) {
+    const act = entry.action || entry;
+    const a = act.action;
+    if (!a) continue;
+
+    if (a === 'type' || a === 'fill') {
+      const text = act.text || act.value || '';
+      if (text) keyboardActions.push({ type: 'type', text });
+    } else if (a === 'press' || a === 'press-key') {
+      keyboardActions.push({ type: 'press', key: act.key || 'Enter' });
+    } else if (a === 'click') {
+      // Include clicks only if they have semantic locators (not refs)
+      const sel = act.selector || '';
+      if (sel && !sel.match(/^e\d+$/) && !sel.match(/^button\[ref=/)) {
+        keyboardActions.push({ type: 'click', locator: sel });
+      }
+    }
+  }
+
+  if (keyboardActions.length < 2) {
+    logger.info(`[trainer.agent] distill: only ${keyboardActions.length} keyboard actions from transcript — skipping`);
+    return null;
+  }
+
+  // Use LLM to generate a clean script YAML with verify block
+  const DISTILL_PROMPT = `You are a browser automation script distiller. Given a list of keyboard actions that successfully completed a task, generate a clean keyboard-first interaction script.
+
+Respond with EXACTLY ONE JSON object (no markdown fences):
+{
+  "thoughts": "<one sentence>",
+  "script": {
+    "steps": [
+      { "type": "<text>" },
+      { "press": "<key>" },
+      { "assert_focus": { "check": "<JS expression>", "fix": "click", "fix_locator": "<Playwright locator>", "on_fail": "fallback" } }
+    ],
+    "verify": [
+      { "eval": "<JS expression that returns true/false>" }
+    ]
+  }
+}
+
+Rules:
+- Use type/press for keyboard input — these go to whatever has focus
+- Include assert_focus only if the original actions suggest focus verification is needed
+- Generalize specific text values into template variables: {{title}}, {{message}}, {{items}}
+- For list items, use for_each: items with {{item}} template
+- Verify should check page content (document.body.innerText.includes(...))
+- Keep steps minimal and deterministic
+- Service: ${_service}
+- Task: ${task}
+
+Raw keyboard actions:
+${JSON.stringify(keyboardActions, null, 2)}`;
+
+  try {
+    const raw = await askWithMessages([
+      { role: 'system', content: DISTILL_PROMPT },
+      { role: 'user', content: `Distill a keyboard-first script for service=${_service}, task="${task}"` },
+    ], { temperature: 0.1, maxTokens: 800, responseTimeoutMs: 15000 });
+
+    // Parse response
+    let parsed = null;
+    try {
+      const jsonMatch = raw.match(/\{[\s\S]*\}/);
+      if (jsonMatch) parsed = JSON.parse(jsonMatch[0]);
+    } catch (_) { /* try raw */ }
+    if (!parsed) {
+      try { parsed = JSON.parse(raw); } catch (_) {}
+    }
+
+    if (!parsed || !parsed.script || !Array.isArray(parsed.script.steps)) {
+      logger.warn(`[trainer.agent] distill: LLM returned no valid script`);
+      return null;
+    }
+
+    // Store in script DB
+    const { saveInteractionScript } = require('./playwright.agent.cjs');
+    const action = _deriveScriptAction(task);
+    const triggerKeywords = task.toLowerCase()
+      .replace(/[^a-z0-9\s]/g, '')
+      .split(/\s+/)
+      .filter(w => w.length > 2)
+      .slice(0, 8);
+
+    await saveInteractionScript(_service, action, pageType, parsed.script, triggerKeywords);
+    logger.info(`[trainer.agent] distill: saved keyboard script ${_service}.${action} (${parsed.script.steps.length} steps)`);
+    return { service: _service, action, steps: parsed.script.steps.length };
+  } catch (err) {
+    logger.warn(`[trainer.agent] distill error (non-fatal): ${err.message}`);
+    return null;
+  }
+}
+
+function _deriveScriptAction(task) {
+  return task.toLowerCase()
+    .replace(/[^a-z0-9\s]/g, '')
+    .trim()
+    .split(/\s+/)
+    .slice(0, 4)
+    .join('_') || 'auto_distilled';
+}
+
+// ---------------------------------------------------------------------------
+// Phase 10: Distill human correction from Tier 4 take-over into script YAML
+// Called after user demonstrates correct action via trainer.agent recording
+// ---------------------------------------------------------------------------
+async function distillHumanCorrection(agentId, task, recordedEvents, pageType, service) {
+  if (!recordedEvents || !Array.isArray(recordedEvents) || recordedEvents.length < 2) return null;
+
+  const _service = service || (agentId || '').replace(/\.agent$/, '').replace(/[^a-z0-9]/gi, '').toLowerCase();
+  if (!_service) return null;
+
+  // Convert recorded CDP events to keyboard actions
+  const keyboardActions = [];
+  for (const evt of recordedEvents) {
+    if (evt.type === 'click') {
+      const sel = evt.selector || '';
+      if (sel && !sel.match(/^e\d+$/)) {
+        keyboardActions.push({ type: 'click', locator: sel });
+      }
+    } else if (evt.type === 'fill' || evt.type === 'type') {
+      if (evt.value) keyboardActions.push({ type: 'type', text: evt.value });
+    } else if (evt.type === 'keycombo' || evt.type === 'press') {
+      keyboardActions.push({ type: 'press', key: evt.key || 'Enter' });
+    } else if (evt.type === 'navigate') {
+      keyboardActions.push({ type: 'navigate', url: evt.url });
+    }
+  }
+
+  if (keyboardActions.length < 2) {
+    logger.info(`[trainer.agent] human correction: only ${keyboardActions.length} actions — skipping script distillation`);
+    return null;
+  }
+
+  // Use LLM to generate script YAML (same prompt as distillKeyboardScript)
+  const DISTILL_PROMPT = `You are a browser automation script distiller. Given a list of human-demonstrated actions that correctly completed a task, generate a clean keyboard-first interaction script.
+
+Respond with EXACTLY ONE JSON object (no markdown fences):
+{
+  "thoughts": "<one sentence>",
+  "script": {
+    "steps": [
+      { "type": "<text>" },
+      { "press": "<key>" },
+      { "assert_focus": { "check": "<JS expression>", "fix": "click", "fix_locator": "<Playwright locator>", "on_fail": "fallback" } }
+    ],
+    "verify": [
+      { "eval": "<JS expression that returns true/false>" }
+    ]
+  }
+}
+
+Rules:
+- Use type/press for keyboard input — these go to whatever has focus
+- Generalize specific text values into template variables: {{title}}, {{message}}, {{items}}
+- For list items, use for_each: items with {{item}} template
+- Verify should check page content (document.body.innerText.includes(...))
+- Keep steps minimal and deterministic
+- Service: ${_service}
+- Task: ${task}
+
+Human-demonstrated actions:
+${JSON.stringify(keyboardActions, null, 2)}`;
+
+  try {
+    const raw = await askWithMessages([
+      { role: 'system', content: DISTILL_PROMPT },
+      { role: 'user', content: `Distill a keyboard-first script from human correction for service=${_service}, task="${task}"` },
+    ], { temperature: 0.1, maxTokens: 800, responseTimeoutMs: 15000 });
+
+    let parsed = null;
+    try {
+      const jsonMatch = raw.match(/\{[\s\S]*\}/);
+      if (jsonMatch) parsed = JSON.parse(jsonMatch[0]);
+    } catch (_) {}
+    if (!parsed) {
+      try { parsed = JSON.parse(raw); } catch (_) {}
+    }
+
+    if (!parsed || !parsed.script || !Array.isArray(parsed.script.steps)) {
+      logger.warn(`[trainer.agent] human correction: LLM returned no valid script`);
+      return null;
+    }
+
+    const { saveInteractionScript } = require('./playwright.agent.cjs');
+    const action = _deriveScriptAction(task);
+    const triggerKeywords = task.toLowerCase()
+      .replace(/[^a-z0-9\s]/g, '')
+      .split(/\s+/)
+      .filter(w => w.length > 2)
+      .slice(0, 8);
+
+    await saveInteractionScript(_service, action, pageType || 'canvas', parsed.script, triggerKeywords);
+    logger.info(`[trainer.agent] human correction: saved script ${_service}.${action} (${parsed.script.steps.length} steps)`);
+    return { service: _service, action, steps: parsed.script.steps.length };
+  } catch (err) {
+    logger.warn(`[trainer.agent] human correction distill error (non-fatal): ${err.message}`);
+    return null;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Module exports
 // ---------------------------------------------------------------------------
 module.exports = {
@@ -2105,4 +2320,6 @@ module.exports = {
   loadRecipe,
   findMatchingRecipe,
   saveAutoRecipe,
+  distillKeyboardScript,
+  distillHumanCorrection,
 };
