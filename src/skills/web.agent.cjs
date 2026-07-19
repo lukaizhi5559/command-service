@@ -634,6 +634,111 @@ async function actionDiscoverTaskUrl({ domain, task, maxResults = 5, candidateUr
   };
 }
 
+/**
+ * Discover setup requirements for a CLI tool or service.
+ * Searches for official installation/authentication documentation and extracts
+ * structured setupInfo fields (installCmd, authCmd, setupUrl, credentials, instructions).
+ *
+ * @param {string} service   - service name (e.g. "gcalcli", "github")
+ * @param {string} [cliTool] - CLI tool name (e.g. "gcalcli", "gh")
+ * @param {number} [maxResults=5]
+ * @returns {Promise<{ok, setupInfo, sources}>}
+ */
+async function actionDiscoverSetup({ service, cliTool, maxResults = 5 }) {
+  if (!service && !cliTool) {
+    return { ok: false, error: 'service or cliTool is required' };
+  }
+
+  const tool = cliTool || service;
+  const searchQuery = `${tool} CLI install authenticate setup guide official documentation`;
+  logger.info(`[web.agent] discover_setup: searching for "${searchQuery.slice(0, 80)}"`);
+
+  const searchResult = await searchWeb(searchQuery, maxResults);
+  if (!searchResult.ok) {
+    return { ok: false, error: searchResult.error || 'web search failed', setupInfo: null };
+  }
+
+  const results = searchResult.results || [];
+  if (results.length === 0) {
+    return { ok: false, error: 'No search results found', setupInfo: null };
+  }
+
+  // Score results — prefer official documentation domains
+  const preferDomain = `${service}.com`;
+  const scored = results
+    .map(r => ({ ...r, _score: _scoreResult(r, preferDomain) }))
+    .filter(r => r._score >= 0)
+    .sort((a, b) => b._score - a._score);
+
+  // Extract setup hints from snippets
+  const setupInfo = {};
+  const sources = [];
+
+  // Look for install commands in snippets
+  const allSnippets = scored.map(r => r.snippet || '').join(' ');
+  const allText = `${scored.map(r => `${r.title} ${r.snippet}`).join(' ')} `.toLowerCase();
+
+  // Install command patterns
+  const installPatterns = [
+    { regex: /(?:brew install|pip install|npm install -g|pipx install)\s+[\w-]+/gi, field: 'installCmd' },
+    { regex: /(?:apt-get install|apt install|snap install)\s+[\w-]+/gi, field: 'installCmd' },
+  ];
+  for (const { regex, field } of installPatterns) {
+    const m = allSnippets.match(regex);
+    if (m && m[0] && !setupInfo[field]) {
+      setupInfo[field] = m[0].trim();
+      break;
+    }
+  }
+
+  // Auth/login command patterns
+  const authPatterns = [
+    { regex: new RegExp(`${tool.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s+(?:login|auth|authenticate)`, 'gi'), field: 'authCmd' },
+    { regex: /(?:gh auth|gcloud auth|aws configure|docker login)\s+/gi, field: 'authCmd' },
+  ];
+  for (const { regex, field } of authPatterns) {
+    const m = allSnippets.match(regex);
+    if (m && m[0] && !setupInfo[field]) {
+      setupInfo[field] = m[0].trim();
+      break;
+    }
+  }
+
+  // Credentials patterns
+  const credMatches = [];
+  if (/api[_ ]?key/i.test(allText)) credMatches.push('api_key');
+  if (/oauth/i.test(allText)) credMatches.push('oauth');
+  if (/access[_ ]?token/i.test(allText)) credMatches.push('access_token');
+  if (/client[_ ]?secret/i.test(allText)) credMatches.push('client_secret');
+  if (credMatches.length > 0) setupInfo.credentials = credMatches;
+
+  // Best official URL for setup
+  const bestResult = scored[0];
+  if (bestResult?.url) {
+    setupInfo.setupUrl = bestResult.url;
+  }
+
+  // Instructions: synthesize from top snippets
+  const topSnippets = scored.slice(0, 3).map(r => r.snippet).filter(Boolean);
+  if (topSnippets.length > 0) {
+    setupInfo.instructions = topSnippets.join(' ').slice(0, 500);
+  }
+
+  // Collect source URLs
+  for (const r of scored.slice(0, 5)) {
+    sources.push({ url: r.url, title: r.title, score: r._score });
+  }
+
+  logger.info(`[web.agent] discover_setup: extracted ${Object.keys(setupInfo).length} fields from ${scored.length} results`);
+
+  return {
+    ok: true,
+    setupInfo: Object.keys(setupInfo).length > 0 ? setupInfo : null,
+    sources,
+    bestUrl: bestResult?.url || null,
+  };
+}
+
 // Main export handler
 module.exports = async function webAgent(args) {
   const { action, ...params } = args || {};
@@ -647,6 +752,8 @@ module.exports = async function webAgent(args) {
       return await actionSearchAndNavigate(params);
     case 'discover_task_url':
       return await actionDiscoverTaskUrl(params);
+    case 'discover_setup':
+      return await actionDiscoverSetup(params);
     default:
       return { ok: false, error: `Unknown action: ${action}` };
   }
@@ -656,4 +763,5 @@ module.exports.actionResearchDomain    = actionResearchDomain;
 module.exports.actionGetTutorialSteps  = actionGetTutorialSteps;
 module.exports.actionSearchAndNavigate = actionSearchAndNavigate;
 module.exports.actionDiscoverTaskUrl  = actionDiscoverTaskUrl;
+module.exports.actionDiscoverSetup    = actionDiscoverSetup;
 module.exports._classifyDiscoveryCandidate = _classifyDiscoveryCandidate;

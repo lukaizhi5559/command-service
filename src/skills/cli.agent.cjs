@@ -2884,7 +2884,7 @@ function parseJsonArray(raw) {
   try { return JSON.parse(end !== -1 ? text.substring(0, end + 1) : text); } catch { return null; }
 }
 
-async function actionPreflightCheck({ task, clis: explicitClis }) {
+async function actionPreflightCheck({ task, clis: explicitClis, agents: explicitAgents }) {
   // 1. Always check bootstrap tools: brew + curl (run in parallel with LLM detection)
   const bootstrapPromise = Promise.all([
     whichCli('brew'),
@@ -2892,10 +2892,28 @@ async function actionPreflightCheck({ task, clis: explicitClis }) {
   ]);
 
   // 2. Detect which services/CLIs are relevant to the task
-  //    Priority: explicit list > LLM extraction > KNOWN_CLI_MAP keyword fallback
+  //    Priority: explicit agents > explicit list > LLM extraction + keyword fallback
   let llmExtracted = null;
+  let agentSetupInfos = {}; // service → setupInfo from agent descriptors
 
-  if (Array.isArray(explicitClis) && explicitClis.length > 0) {
+  if (Array.isArray(explicitAgents) && explicitAgents.length > 0) {
+    // Caller passed registered agent descriptors — build meta from them
+    llmExtracted = explicitAgents.map(a => ({
+      service:       (a.service || a.id || '').toLowerCase().replace(/[^a-z0-9]/g, ''),
+      cli:           a.cliTool || a.cli || null,
+      installMethod: a.installMethod || null,
+      installPkg:    a.installPkg || null,
+      isApiKey:      a.isApiKey || false,
+      isOAuth:       a.isOAuth || false,
+      _agentId:      a.id || null,
+      _setupInfo:    a.setupInfo || null,
+    }));
+    // Collect setupInfo per service
+    for (const a of explicitAgents) {
+      const svcKey = (a.service || a.id || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+      if (a.setupInfo) agentSetupInfos[svcKey] = a.setupInfo;
+    }
+  } else if (Array.isArray(explicitClis) && explicitClis.length > 0) {
     // Caller passed explicit service/CLI names — build minimal meta objects
     llmExtracted = explicitClis.map(c => ({
       service:       c.toLowerCase().replace(/[^a-z0-9]/g, ''),
@@ -2927,9 +2945,12 @@ async function actionPreflightCheck({ task, clis: explicitClis }) {
       logger.warn(`[cli.agent] preflight_check: LLM extraction failed — ${llmErr.message}`);
     }
 
-    // Fallback: if LLM unavailable or returned nothing, use KNOWN_CLI_MAP keyword matching.
-    // Registry-loaded entries carry _keywords, so phrases like "convert to pdf" match the pdf service.
-    if (!llmExtracted) {
+    // Fallback: if LLM unavailable or returned an empty array, use KNOWN_CLI_MAP keyword matching.
+    // An empty array from the LLM is NOT definitive — the LLM may miss services that
+    // have registered CLI agents (e.g. gcalcli for Google Calendar). Always run keyword
+    // fallback and merge any new services with the LLM result.
+    if (!llmExtracted || (Array.isArray(llmExtracted) && llmExtracted.length === 0)) {
+      const _llmServices = new Set(Array.isArray(llmExtracted) ? llmExtracted.map(e => e.service) : []);
       const taskLower = task.toLowerCase();
       const knownServices = Object.keys(KNOWN_CLI_MAP);
       const matchedSet = new Map();
@@ -2944,8 +2965,8 @@ async function actionPreflightCheck({ task, clis: explicitClis }) {
           matchedSet.set(svc, meta);
         }
       }
-      const matched = Array.from(matchedSet.keys());
-      llmExtracted = matched.map(svc => {
+      const matched = Array.from(matchedSet.keys()).filter(svc => !_llmServices.has(svc));
+      const keywordResults = matched.map(svc => {
         const meta = KNOWN_CLI_MAP[svc];
         return {
           service:       svc,
@@ -2959,6 +2980,8 @@ async function actionPreflightCheck({ task, clis: explicitClis }) {
       if (matched.length > 0) {
         logger.info(`[cli.agent] preflight_check: keyword fallback matched ${matched.length} service(s) — ${matched.join(', ')}`);
       }
+      // Merge: keep LLM results, add keyword-only services
+      llmExtracted = [...(Array.isArray(llmExtracted) ? llmExtracted : []), ...keywordResults];
     }
   }
 
@@ -2976,6 +2999,7 @@ async function actionPreflightCheck({ task, clis: explicitClis }) {
 
     // Merge LLM-extracted meta with KNOWN_CLI_MAP (KNOWN_CLI_MAP has tokenCmd etc.)
     const knownMeta = KNOWN_CLI_MAP[serviceKey] || {};
+    const setupInfo = entry._setupInfo || agentSetupInfos[serviceKey] || knownMeta.setupInfo || null;
     const meta = {
       cli:           entry.cli  || knownMeta.cli  || null,
       method:        entry.installMethod || knownMeta.method || 'brew',
@@ -2986,6 +3010,7 @@ async function actionPreflightCheck({ task, clis: explicitClis }) {
       isOAuth:       entry.isOAuth  ?? knownMeta.isOAuth  ?? false,
       apiKeyEnvVar:  knownMeta.apiKeyEnvVar || null,
       apiKeyUrl:     knownMeta.apiKeyUrl   || null,
+      setupInfo:     setupInfo,
     };
 
     const cliName = meta.cli;
@@ -3005,6 +3030,8 @@ async function actionPreflightCheck({ task, clis: explicitClis }) {
         apiKeyUrl:     meta.apiKeyUrl,
         isApiKey:      meta.isApiKey,
         isOAuth:       meta.isOAuth,
+        agentId:       entry._agentId || null,
+        setupInfo:     meta.setupInfo || null,
       });
       return;
     }
@@ -3025,6 +3052,8 @@ async function actionPreflightCheck({ task, clis: explicitClis }) {
         tokenCmd:      meta.tokenCmd,
         isApiKey:      meta.isApiKey,
         isOAuth:       meta.isOAuth,
+        agentId:       entry._agentId || null,
+        setupInfo:     meta.setupInfo || null,
       });
       return;
     }
@@ -3074,6 +3103,8 @@ async function actionPreflightCheck({ task, clis: explicitClis }) {
       tokenCmd:      meta.tokenCmd,
       isApiKey:      meta.isApiKey,
       isOAuth:       meta.isOAuth,
+      agentId:       entry._agentId || null,
+      setupInfo:     meta.setupInfo || null,
     });
   }));
 
