@@ -920,8 +920,22 @@ class CommandServiceMCPServer {
             res.writeHead(200);
             res.end(JSON.stringify({ success: true, data: result }));
           } catch (err) {
+            const payloadContext = (() => {
+              try {
+                const parsed = JSON.parse(body || '{}').payload || {};
+                return {
+                  skill: parsed.skill || null,
+                  action: parsed.args?.action || null,
+                  agentId: parsed.args?.agentId || null,
+                  sessionId: parsed.args?.sessionId || null,
+                };
+              } catch (_) {
+                return {};
+              }
+            })();
+            logger.error(`[server] command.automate failed: ${err.stack || err.message}`, payloadContext);
             res.writeHead(200);
-            res.end(JSON.stringify({ success: true, data: { success: false, error: err.message } }));
+            res.end(JSON.stringify({ success: true, data: { ok: false, error: err.message } }));
           }
         });
         return;
@@ -1010,6 +1024,66 @@ class CommandServiceMCPServer {
         return;
       }
 
+      // ── POST /agent.validate — validate a single agent by id ───────────────
+      if (req.method === 'POST' && req.url === '/agent.validate') {
+        let body = '';
+        req.on('data', chunk => { body += chunk; });
+        req.on('end', async () => {
+          try {
+            const { id } = JSON.parse(body || '{}');
+            if (!id) { res.writeHead(400); res.end(JSON.stringify({ ok: false, error: 'id required' })); return; }
+            const { cliAgent } = require('./skills/cli.agent.cjs');
+            const result = await cliAgent({ action: 'validate_agent', id });
+            res.writeHead(200);
+            res.end(JSON.stringify(result));
+          } catch (err) {
+            res.writeHead(500);
+            res.end(JSON.stringify({ ok: false, error: err.message }));
+          }
+        });
+        return;
+      }
+
+      // ── POST /agent.cli-build — build/rebuild a CLI agent ──────────────────
+      if (req.method === 'POST' && req.url === '/agent.cli-build') {
+        let body = '';
+        req.on('data', chunk => { body += chunk; });
+        req.on('end', async () => {
+          try {
+            const { service, cliTool, force } = JSON.parse(body || '{}');
+            if (!service) { res.writeHead(400); res.end(JSON.stringify({ ok: false, error: 'service required' })); return; }
+            const { cliAgent } = require('./skills/cli.agent.cjs');
+            const result = await cliAgent({ action: 'build_agent', service, cliTool, force: !!force });
+            res.writeHead(200);
+            res.end(JSON.stringify(result));
+          } catch (err) {
+            res.writeHead(500);
+            res.end(JSON.stringify({ ok: false, error: err.message }));
+          }
+        });
+        return;
+      }
+
+      // ── POST /agent.run — run an agent with a task (e.g. auth login) ────────
+      if (req.method === 'POST' && req.url === '/agent.run') {
+        let body = '';
+        req.on('data', chunk => { body += chunk; });
+        req.on('end', async () => {
+          try {
+            const { agentId, task } = JSON.parse(body || '{}');
+            if (!agentId || !task) { res.writeHead(400); res.end(JSON.stringify({ ok: false, error: 'agentId and task required' })); return; }
+            const { cliAgent } = require('./skills/cli.agent.cjs');
+            const result = await cliAgent({ action: 'run', agentId, task });
+            res.writeHead(200);
+            res.end(JSON.stringify(result));
+          } catch (err) {
+            res.writeHead(500);
+            res.end(JSON.stringify({ ok: false, error: err.message }));
+          }
+        });
+        return;
+      }
+
       // ── POST /agent.migrate — migrate legacy .agent.md files to DuckDB ───────
       if (req.method === 'POST' && req.url === '/agent.migrate') {
         (async () => {
@@ -1066,6 +1140,27 @@ class CommandServiceMCPServer {
             const result = await browserAgent({ action: 'build_agent', service, startUrl, goals, force: !!force });
             res.writeHead(200);
             res.end(JSON.stringify(result));
+          } catch (err) {
+            res.writeHead(500);
+            res.end(JSON.stringify({ ok: false, error: err.message }));
+          }
+        });
+        return;
+      }
+
+      // ── POST /browser.auth_complete — manual auth confirmation from UI ──────
+      if (req.method === 'POST' && req.url === '/browser.auth_complete') {
+        let body = '';
+        req.on('data', chunk => { body += chunk; });
+        req.on('end', async () => {
+          try {
+            const { sessionId } = JSON.parse(body || '{}');
+            if (!sessionId) { res.writeHead(400); res.end(JSON.stringify({ ok: false, error: 'sessionId is required' })); return; }
+            if (!global.__manualAuthCompleteSessions) global.__manualAuthCompleteSessions = new Set();
+            global.__manualAuthCompleteSessions.add(sessionId);
+            logger.info(`[server] manual auth complete for session=${sessionId}`);
+            res.writeHead(200);
+            res.end(JSON.stringify({ ok: true }));
           } catch (err) {
             res.writeHead(500);
             res.end(JSON.stringify({ ok: false, error: err.message }));

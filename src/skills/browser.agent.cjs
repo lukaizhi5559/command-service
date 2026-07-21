@@ -302,6 +302,9 @@ const KNOWN_BROWSER_SERVICES = {
   // ── Core social / collaboration ─────────────────────────────────────────────────────────────────────
   gmail:          { startUrl: 'https://mail.google.com',                         signInUrl: 'https://accounts.google.com/signin/v2/identifier',  authSuccessPattern: 'mail.google.com',              isOAuth: true  },
   google:         { startUrl: 'https://accounts.google.com',                     signInUrl: 'https://accounts.google.com',                       authSuccessPattern: 'myaccount.google.com',         isOAuth: true  },
+  googledocs:     { startUrl: 'https://docs.google.com',                         signInUrl: 'https://accounts.google.com/signin/v2/identifier',  authSuccessPattern: 'docs.google.com/document',     isOAuth: true, hostAliases: ['docs.google.com'] },
+  googlesheets:   { startUrl: 'https://sheets.google.com',                       signInUrl: 'https://accounts.google.com/signin/v2/identifier',  authSuccessPattern: 'docs.google.com/spreadsheets', isOAuth: true, hostAliases: ['sheets.google.com', 'docs.google.com'] },
+  googlecalendar: { startUrl: 'https://calendar.google.com',                     signInUrl: 'https://accounts.google.com/signin/v2/identifier',  authSuccessPattern: 'calendar.google.com',          isOAuth: true, hostAliases: ['calendar.google.com'] },
   slack:          { startUrl: 'https://app.slack.com',                           signInUrl: 'https://slack.com/signin',                          authSuccessPattern: 'app.slack.com/client',         isOAuth: true  },
   discord:        { startUrl: 'https://discord.com/channels/@me',                signInUrl: 'https://discord.com/login',                         authSuccessPattern: 'discord.com/channels',         isOAuth: true  },
   notion:         { startUrl: 'https://app.notion.com',                           signInUrl: 'https://www.notion.com/login',                       authSuccessPattern: 'app.notion.com',                    isOAuth: true, preferAgentBrowser: true, postAuthUrl: 'https://app.notion.com', usePersistentProfile: true, hostAliases: ['www.notion.so', 'www.notion.com', 'notion.so', 'notion.com', 'notion.new'], _metaRevision: 2  },
@@ -641,10 +644,26 @@ Output ONLY valid JSON:
 
 CRITICAL rules:
 - isOAuth=true means the service requires an OAuth browser session (social login, SSO, consent screen). isOAuth=false means the service uses an API key / token from a settings page.
-- signInUrl MUST be the actual login form URL, NOT the dashboard. Example: Dropbox signInUrl=https://www.dropbox.com/login (NOT www.dropbox.com). If the service redirects to a separate identity provider (Google, Microsoft, Okta), use that IdP's login URL.
+- signInUrl MUST be the actual login form URL, NOT the dashboard. Example: Dropbox signInUrl=https://www.dropbox.com/login (NOT www.dropbox.com). If the service redirects to a separate identity provider (Google, Microsoft, Okta), use that IdP's login page URL.
 - For isOAuth=false services, set signInUrl to null.
 - startUrl is where the agent navigates AFTER login (dashboard, API keys page, etc.).
-- Getting isOAuth or signInUrl wrong causes auth flow failures — the agent will navigate to the wrong page and loop forever.`;
+- Getting isOAuth or signInUrl wrong causes auth flow failures — the agent will navigate to the wrong page and loop forever.
+
+FORBIDDEN — OAuth authorization endpoints:
+- signInUrl must be a page that LOADS IN A BROWSER and shows a login form to the user.
+- signInUrl must NEVER be an OAuth 2.0 authorization endpoint. Any URL containing these path segments is FORBIDDEN as signInUrl:
+  /oauth2/auth, /oauth2/authorize, /o/oauth2/auth, /oauth/authorize, /connect/authorize
+  These endpoints require client_id, redirect_uri, response_type, and scope parameters that the agent does not have. Navigating to them bare produces HTTP 400 errors.
+- For services that delegate to a known identity provider (IdP), use the IdP's LOGIN PAGE, not its OAuth endpoint:
+  Google:      https://accounts.google.com/signin/v2/identifier
+  Microsoft:   https://login.live.com  (consumer) or https://login.microsoftonline.com (enterprise)
+  Okta:        https://<tenant>.okta.com
+  GitHub:      https://github.com/login
+  Apple:       https://appleid.apple.com
+
+FORBIDDEN — OAuth parameters as authSuccessPattern:
+- authSuccessPattern must be a URL substring from the TARGET SERVICE's domain (e.g. "sheets.google.com", "mail.google.com", "app.slack.com/client").
+- authSuccessPattern must NEVER be an OAuth redirect parameter such as "code=", "token=", "access_token=", "state=". These are query-string fragments that appear on the IdP's redirect, not on the target service's post-login URL.`;
 
 // ---------------------------------------------------------------------------
 // PLAYBOOK_SEED_MAP — battle-tested task playbooks for known services.
@@ -1194,6 +1213,58 @@ async function _generateAndCachePlaybook(agentId, descriptor, task, subsections,
   }
 }
 
+// ── Browser meta sanitization helpers ──────────────────────────────────────────
+// Applied to ALL resolveBrowserMeta return paths so cached/seed/LLM values are
+// always checked for bare OAuth endpoints and OAuth-parameter authSuccessPattern.
+const OAUTH_ENDPOINT_RE = /\/(o\/)?oauth2?\/(auth|authorize)|\/connect\/authorize/i;
+const IDP_LOGIN_MAP = {
+  'accounts.google.com': 'https://accounts.google.com/signin/v2/identifier',
+  'login.microsoftonline.com': 'https://login.microsoftonline.com',
+  'login.live.com': 'https://login.live.com',
+  'github.com': 'https://github.com/login',
+  'appleid.apple.com': 'https://appleid.apple.com',
+};
+
+function _sanitizeBrowserMeta(meta, service) {
+  if (!meta) return meta;
+
+  // Fix bare OAuth authorization endpoints in signInUrl
+  if (meta.signInUrl && OAUTH_ENDPOINT_RE.test(meta.signInUrl)) {
+    const badUrl = meta.signInUrl;
+    logger.warn(`[browser.agent] _sanitizeBrowserMeta: detected bare OAuth endpoint as signInUrl for "${service}": ${badUrl}`);
+    let fixed = false;
+    try {
+      const idpHost = new URL(badUrl).hostname;
+      if (IDP_LOGIN_MAP[idpHost]) {
+        meta.signInUrl = IDP_LOGIN_MAP[idpHost];
+        fixed = true;
+        logger.info(`[browser.agent] _sanitizeBrowserMeta: mapped IdP "${idpHost}" → ${meta.signInUrl}`);
+      }
+    } catch {}
+    if (!fixed) {
+      meta.signInUrl = meta.startUrl || null;
+      logger.warn(`[browser.agent] _sanitizeBrowserMeta: could not fix OAuth endpoint — falling back to startUrl: ${meta.signInUrl}`);
+    }
+  }
+
+  // Fix OAuth redirect parameters in authSuccessPattern
+  if (meta.authSuccessPattern && /^(code|token|access_token|state)=/i.test(meta.authSuccessPattern)) {
+    const badPattern = meta.authSuccessPattern;
+    logger.warn(`[browser.agent] _sanitizeBrowserMeta: detected OAuth parameter as authSuccessPattern for "${service}": ${badPattern}`);
+    try {
+      const startHost = new URL(meta.startUrl).hostname;
+      meta.authSuccessPattern = startHost;
+      logger.info(`[browser.agent] _sanitizeBrowserMeta: replaced authSuccessPattern with startUrl hostname: ${startHost}`);
+    } catch {
+      const seedKey = service.toLowerCase().replace(/[^a-z0-9]/g, '');
+      meta.authSuccessPattern = seedKey;
+      logger.info(`[browser.agent] _sanitizeBrowserMeta: replaced authSuccessPattern with serviceKey: ${seedKey}`);
+    }
+  }
+
+  return meta;
+}
+
 async function resolveBrowserMeta(service) {
   const seedKey = service.toLowerCase().replace(/[^a-z0-9]/g, '');
 
@@ -1229,7 +1300,7 @@ async function resolveBrowserMeta(service) {
       }
       return null;
     });
-    if (agentResult) return agentResult;
+    if (agentResult) return _sanitizeBrowserMeta(agentResult, service);
   } catch {}
 
   // 2. DuckDB meta cache (LLM discovery result cached here for unknown services)
@@ -1243,12 +1314,12 @@ async function resolveBrowserMeta(service) {
       }
       return null;
     });
-    if (cachedMeta) return cachedMeta;
+    if (cachedMeta) return _sanitizeBrowserMeta(cachedMeta, service);
   } catch {}
 
   // 3. Seed map — bootstrap fallback only (cold-start before any agent has been built)
   const fromSeed = KNOWN_BROWSER_SERVICES[seedKey];
-  if (fromSeed) return fromSeed;
+  if (fromSeed) return _sanitizeBrowserMeta(fromSeed, service);
 
   // 4. LLM discovery with web_search grounding
   logger.info(`[browser.agent] resolveBrowserMeta: LLM lookup for "${service}"`);
@@ -1257,7 +1328,7 @@ async function resolveBrowserMeta(service) {
   let searchSnippets = '';
   try {
     searchSnippets = await Promise.race([
-      agentWebSearch(`${service} authentication type OAuth API key login URL`),
+      agentWebSearch(`${service} sign in login page URL site`),
       new Promise(r => setTimeout(() => r(''), 5000))
     ]);
   } catch {}
@@ -1297,6 +1368,71 @@ async function resolveBrowserMeta(service) {
     } else if (heuristicSaysOAuth && meta.isOAuth === false) {
       meta.isOAuth = true;
       logger.warn(`[browser.agent] isOAuth conflict for "${service}": LLM=false but search suggests OAuth → correcting to true`);
+    }
+  }
+
+  // 4e. Post-discovery validation guard — reject bare OAuth authorization endpoints
+  // The LLM sometimes returns /o/oauth2/auth or /oauth2/authorize as signInUrl.
+  // _sanitizeBrowserMeta handles IdP mapping and authSuccessPattern fix.
+  // For LLM output, we also try a correction re-prompt before falling back to startUrl.
+  if (meta && meta.signInUrl && OAUTH_ENDPOINT_RE.test(meta.signInUrl)) {
+    const badUrl = meta.signInUrl;
+    logger.warn(`[browser.agent] resolveBrowserMeta: detected bare OAuth endpoint as signInUrl for "${service}": ${badUrl}`);
+
+    // Step 1: Try deterministic IdP login page mapping (from _sanitizeBrowserMeta's map)
+    let fixed = false;
+    try {
+      const idpHost = new URL(badUrl).hostname;
+      if (IDP_LOGIN_MAP[idpHost]) {
+        meta.signInUrl = IDP_LOGIN_MAP[idpHost];
+        fixed = true;
+        logger.info(`[browser.agent] resolveBrowserMeta: mapped IdP "${idpHost}" → ${meta.signInUrl}`);
+      }
+    } catch {}
+
+    // Step 2: LLM re-prompt with correction instruction
+    if (!fixed) {
+      try {
+        const correctionQuery = `${groundedQuery}\n\nCORRECTION: The signInUrl you returned ("${badUrl}") is an OAuth authorization endpoint that requires client parameters (client_id, redirect_uri, response_type). It CANNOT be used as a login page. Return the actual login PAGE URL — the page where a user types their email/password in a browser. For Google services use https://accounts.google.com/signin/v2/identifier. Try again.`;
+        const retryRaw = await callLLM(
+          BROWSER_DISCOVERY_SYSTEM_PROMPT,
+          correctionQuery,
+          { temperature: 0.1, maxTokens: 300 }
+        );
+        if (retryRaw) {
+          const retryMatch = retryRaw.match(/\{[\s\S]*\}/);
+          if (retryMatch) {
+            const retryMeta = JSON.parse(retryMatch[0]);
+            if (retryMeta.signInUrl && !OAUTH_ENDPOINT_RE.test(retryMeta.signInUrl)) {
+              meta.signInUrl = retryMeta.signInUrl;
+              fixed = true;
+              logger.info(`[browser.agent] resolveBrowserMeta: LLM re-prompt corrected signInUrl → ${meta.signInUrl}`);
+            }
+          }
+        }
+      } catch (retryErr) {
+        logger.warn(`[browser.agent] resolveBrowserMeta: LLM re-prompt failed: ${retryErr.message}`);
+      }
+    }
+
+    // Step 3: Fall back to startUrl — the service itself will redirect to its IdP login page
+    if (!fixed) {
+      meta.signInUrl = meta.startUrl || null;
+      logger.warn(`[browser.agent] resolveBrowserMeta: could not fix OAuth endpoint — falling back to startUrl as signInUrl: ${meta.signInUrl}`);
+    }
+  }
+
+  // 4f. Validate authSuccessPattern — reject OAuth redirect parameters
+  if (meta && meta.authSuccessPattern && /^(code|token|access_token|state)=/i.test(meta.authSuccessPattern)) {
+    const badPattern = meta.authSuccessPattern;
+    logger.warn(`[browser.agent] resolveBrowserMeta: detected OAuth parameter as authSuccessPattern for "${service}": ${badPattern}`);
+    try {
+      const startHost = new URL(meta.startUrl).hostname;
+      meta.authSuccessPattern = startHost;
+      logger.info(`[browser.agent] resolveBrowserMeta: replaced authSuccessPattern with startUrl hostname: ${startHost}`);
+    } catch {
+      meta.authSuccessPattern = seedKey;
+      logger.info(`[browser.agent] resolveBrowserMeta: replaced authSuccessPattern with serviceKey: ${seedKey}`);
     }
   }
 
@@ -2690,7 +2826,7 @@ function _canPromoteDeepLink(candidate, source, intent, baseHost, serviceKey = '
   // to verification (verifyDeepLinkUrl navigates and checks the redirect target).
   if (!isOnDomain && source === 'crawl') return false;
 
-  if (_isMutationIntent(intent) && !['caller', 'template', 'authenticated'].includes(source)) return false;
+  if (_isMutationIntent(intent) && !['caller', 'template', 'authenticated', 'suggestion'].includes(source)) return false;
   if (source === 'search' && /\/(support|help|docs|documentation|community|forum|p|page|post|article|blog|item)\//i.test(parsed.pathname)) return false;
   return true;
 }
@@ -2737,6 +2873,12 @@ async function _resolveTaskDeepLink(agentId, serviceKey, baseStartUrl, task, exi
 
       // ── CONTENT_CREATE ────────────────────────────────────────────────────
       if (intent === INTENTS.CONTENT_CREATE) {
+        if (svc === 'googledocs' || baseHost === 'docs.google.com') {
+          return 'https://docs.google.com/document/create';
+        }
+        if (svc === 'googlesheets' || baseHost === 'sheets.google.com') {
+          return 'https://docs.google.com/spreadsheets/create';
+        }
         if (svc === 'github' || baseHost === 'github.com') {
           const repoMatch = task.match(/(?:in|on)\s+([\w-]+\/[\w-]+)/i);
           if (repoMatch) return `https://github.com/${repoMatch[1]}/issues/new`;
@@ -3992,6 +4134,9 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
             }
           })();
         }
+        if (_authOnly) {
+          await callBrowserAct({ action: 'close', sessionId, headed: false }, 8000).catch(() => {});
+        }
         return { ok: false, error: `waitForAuth failed: ${err.message}` };
       }
       if (!authResult?.ok) {
@@ -4007,6 +4152,9 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
               logger.warn(`[browser.agent] self-heal error: ${healErr.message}`);
             }
           })();
+        }
+        if (_authOnly) {
+          await callBrowserAct({ action: 'close', sessionId, headed: false }, 8000).catch(() => {});
         }
         return { ok: false, error: `Auth failed for ${agentId}: ${authResult?.error}` };
       }
@@ -5701,11 +5849,12 @@ async function actionDeleteAgent({ id }) {
         }
         }
         
-        // Delete from meta cache
-        const metaRows = await db.all('SELECT service FROM browser_meta_cache WHERE service = ?', service).catch(() => []);
+        // Delete from meta cache — normalize service key to match resolveBrowserMeta's seedKey
+        const normalizedService = service.toLowerCase().replace(/[^a-z0-9]/g, '');
+        const metaRows = await db.all('SELECT service FROM browser_meta_cache WHERE service = ?', normalizedService).catch(() => []);
         if (metaRows.length > 0) {
-        await db.run('DELETE FROM browser_meta_cache WHERE service = ?', service);
-        deleted.push(`DuckDB meta_cache row: ${service}`);
+        await db.run('DELETE FROM browser_meta_cache WHERE service = ?', normalizedService);
+        deleted.push(`DuckDB meta_cache row: ${normalizedService}`);
         }
         
         // Note: withDb closes connection automatically, no need for CHECKPOINT
@@ -5982,6 +6131,10 @@ async function browserAgent(args) {
         if (!_startUrl || !_task) return { ok: false, error: 'startUrl and task are required for resolve_deep_link' };
         const _result = await _resolveTaskDeepLink(_aId || 'unknown', _svcKey || '', _startUrl, _task, _existing, _sid);
         const _dlUrl = _result?.url || (typeof _result === 'string' ? _result : null);
+        // Close any browser session opened during deep-link resolution (authenticated eval)
+        if (_sid) {
+          await callBrowserAct({ action: 'close', sessionId: _sid, headed: false }, 8000).catch(() => {});
+        }
         return { ok: !!_dlUrl, deepLinkUrl: _dlUrl, deepLinkSource: _result?.source || null };
     }
 

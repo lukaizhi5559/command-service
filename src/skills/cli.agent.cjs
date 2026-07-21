@@ -589,7 +589,11 @@ function buildTurnSystemPrompt(descriptor, learnedRules, userContext) {
     ? '\n\n## User Context (authenticated identities — use these, do NOT guess)\n' +
       Object.entries(userContext).map(([svc, user]) => `- ${svc}: ${user}`).join('\n')
     : '';
-  return `${CLI_AGENTIC_LOOP_PROMPT}\n\n## Agent Descriptor\n${trimmedDescriptor}${rulesSection}${userContextSection}`;
+  const now = new Date();
+  const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'local time';
+  const currentDate = new Intl.DateTimeFormat('en-CA', { timeZone: timezone }).format(now);
+  const temporalContext = `\n\n## Temporal Context\nCurrent local date: ${currentDate}. Time zone: ${timezone}. For a month/day with no year that has already passed this year, schedule the next occurrence. For an event with no time, create an all-day event. Never invent a historical year.`;
+  return `${CLI_AGENTIC_LOOP_PROMPT}\n\n## Agent Descriptor\n${trimmedDescriptor}${rulesSection}${userContextSection}${temporalContext}`;
 }
 
 // Builds the user-turn prompt for a loop turn: task + history only (~200-400 chars).
@@ -644,6 +648,7 @@ Rules:
   Good (broad): "Many 'gh' operations have no dedicated subcommand — use 'gh api --method GET/PUT/DELETE/POST <REST endpoint>' for all of them. Syntax: run_help [\"api\"] shows full flags. Examples: star=PUT /user/starred/{owner}/{repo}, unstar=DELETE /user/starred/{owner}/{repo}, readme=GET /repos/{owner}/{repo}/readme, releases=GET /repos/{owner}/{repo}/releases, follow_user=PUT /user/following/{username}."
 - ask_user is the LAST RESORT. Do NOT use ask_user until you have run at least one diagnostic probe (run_shell or run_help) after a failure. The user should never see ask_user for a failure that a 1-line shell probe could have explained or resolved.
 - Never use ask_user for CLI version or installation issues — use run_update instead.
+- MULTI-TURN ask_user: When processing a resume context where the user selected an option that implies a value is needed (e.g. "Yes, specify duration") but the actual value was NOT provided in the answer, emit another ask_user with an EMPTY options array to collect the specific value via free-text input. Do NOT guess or hallucinate values the user did not explicitly provide. The UI will show a free-text input field when options is empty.
 
 ## Universal Failure Protocol — DIAGNOSE FIRST (applies to every run_cmd exitCode≠0)
 
@@ -997,20 +1002,43 @@ async function actionRun({ cli, argv = [], cwd, env, timeoutMs, stdin, agentId, 
 
     // ── Resume context injection ──────────────────────────────────────────────
     // When main.js resumes after an ask_user pause, it appends a [Resume context:]
-    // block to the task string. Parse it and pre-populate loopHistory with a
-    // synthetic prior turn so the LLM doesn't restart from turn 1 and repeat
+    // block to the task string. Parse it and pre-populate loopHistory with
+    // synthetic prior turns so the LLM doesn't restart from turn 1 and repeat
     // the same failed probe sequence it already ran before pausing.
-    const _resumeMatch = effectiveTask.match(/\[Resume context: You previously asked "(.+?)"\. The user answered: "(.+?)"\. Continue from this point based on the user's answer\.\]/s);
-    if (_resumeMatch) {
-      const _priorQuestion = _resumeMatch[1];
-      const _userAnswer    = _resumeMatch[2];
+    //
+    // Supports two formats:
+    //   1. Legacy single-pair: [Resume context: You previously asked "Q". The user answered: "A". Continue from this point based on the user's answer.]
+    //   2. Multi-pair: [Resume context:\n  Previous Q&A:\n  1. Q: "Q1" → A: "A1"\n  2. Q: "Q2" → A: "A2"\n  Continue from this point. If any answer is a choice that implies a value is needed but doesn't contain the actual value, emit another ask_user to collect it. Do NOT guess values.]
+    const _legacyResumeMatch = effectiveTask.match(/\[Resume context: You previously asked "(.+?)"\. The user answered: "(.+?)"\. Continue from this point based on the user's answer\.\][\s\S]*/s);
+    const _multiResumeMatch = effectiveTask.match(/\[Resume context:\s*\n\s*Previous Q&A:\s*\n([\s\S]*?)\n\s*Continue from this point\.[\s\S]*?\]/s);
+
+    if (_legacyResumeMatch) {
+      const _priorQuestion = _legacyResumeMatch[1];
+      const _userAnswer    = _legacyResumeMatch[2];
       loopHistory.push({
         turn: 1,
         action: 'ask_user',
         question: _priorQuestion,
-        observation: `User answered: "${_userAnswer}". Continue from this point — do NOT repeat previous diagnostic attempts. Apply the user's answer directly.`,
+        observation: `User answered: "${_userAnswer}". Continue from this point — do NOT repeat previous diagnostic attempts. If the user's answer indicates a DIRECTION (e.g. "duration" / "Specify duration") but does NOT contain the actual VALUE needed to proceed, your NEXT action MUST be ask_user with an EMPTY options array asking for the specific value (e.g. "What duration?"). Do NOT repeat the previous choice question. Do NOT guess values.`,
       });
-      logger.info(`[cli.agent] resume context detected for ${agentId} — pre-seeded loopHistory with prior ask_user + user answer`, { agentId });
+      logger.info(`[cli.agent] resume context (legacy single-pair) detected for ${agentId} — pre-seeded loopHistory with prior ask_user + user answer`, { agentId });
+    } else if (_multiResumeMatch) {
+      const _qaBlock = _multiResumeMatch[1];
+      const _pairRegex = /\d+\.\s*Q:\s*"(.+?)"\s*→\s*A:\s*"(.+?)"/g;
+      let _pair;
+      let _pairIdx = 1;
+      while ((_pair = _pairRegex.exec(_qaBlock)) !== null) {
+        const _q = _pair[1];
+        const _a = _pair[2];
+        loopHistory.push({
+          turn: _pairIdx,
+          action: 'ask_user',
+          question: _q,
+          observation: `User answered: "${_a}". Continue from this point — do NOT repeat previous diagnostic attempts. If the user's answer indicates a DIRECTION (e.g. "duration" / "Specify duration") but does NOT contain the actual VALUE needed to proceed, your NEXT action MUST be ask_user with an EMPTY options array asking for the specific value (e.g. "What duration?"). Do NOT repeat the previous choice question. Do NOT guess values.`,
+        });
+        _pairIdx++;
+      }
+      logger.info(`[cli.agent] resume context (multi-pair) detected for ${agentId} — pre-seeded loopHistory with ${_pairIdx - 1} prior ask_user + user answer pair(s)`, { agentId });
     }
 
     // Load per-agent learned rules (saved by past ask_user save_rule events).
@@ -1198,9 +1226,49 @@ async function actionRun({ cli, argv = [], cwd, env, timeoutMs, stdin, agentId, 
           }
         }
 
+        // ── Duplicate question guard ─────────────────────────────────────────────
+        // If the LLM emits an ask_user with the same question text as one already
+        // in loopHistory (from resume context pre-seeding), don't surface it again.
+        // Instead, push a corrective observation and continue the loop so the LLM
+        // gets another chance to ask for the specific value. On the third repeat,
+        // force a free-text prompt so the user can type the value directly.
+        const _questionText = action.question || '';
+        const _normalizeQ = (s) => s.toLowerCase().replace(/[^\w\s]/g, '').replace(/\s+/g, ' ').trim();
+        const _priorQuestions = loopHistory
+          .filter(h => h.action === 'ask_user' && h.question)
+          .map(h => _normalizeQ(h.question));
+        const _normalizedNew = _normalizeQ(_questionText);
+        const _dupCount = _priorQuestions.filter(q => q === _normalizedNew).length;
+
+        if (_dupCount > 0 && _dupCount < 2) {
+          // First duplicate: push corrective observation and continue loop
+          logger.warn(`[cli.agent] duplicate ask_user detected (turn ${turn}) for ${agentId} — pushing corrective observation`, { agentId });
+          loopHistory.push({
+            turn,
+            action: 'ask_user',
+            question: _questionText,
+            observation: `You already asked this exact question and the user already answered it. Do NOT repeat it. Based on the user's previous answer, if a VALUE is still needed (e.g. duration, end time, date), emit ask_user with an EMPTY options array and a question asking specifically for that value. If enough information has been collected, proceed with run_cmd or done instead.`,
+          });
+          continue;
+        } else if (_dupCount >= 2) {
+          // Repeated duplicate after correction: force free-text prompt
+          logger.warn(`[cli.agent] duplicate ask_user persisted after correction (turn ${turn}) for ${agentId} — forcing free-text prompt`, { agentId });
+          return {
+            ok: false,
+            agentId,
+            task,
+            askUser: true,
+            question: `Could you provide the specific value needed to proceed?`,
+            options: [],
+            agentTurns: turn,
+            transcript,
+            savedRule: (action.save_rule || '').trim() || null,
+            freeText: true,
+          };
+        }
+
         // ── Credential-aware ask_user enhancement ────────────────────────────────
         // Detect missing credential questions and provide actionable options
-        const _questionText = action.question || '';
         const _credentialKeywords = /\b(client_id|client_secret|api_key|token|credential|password|secret|auth)\b/i;
         const _isCredentialQuestion = _credentialKeywords.test(_questionText);
         
@@ -1296,18 +1364,19 @@ async function actionRun({ cli, argv = [], cwd, env, timeoutMs, stdin, agentId, 
           //   ["compose", "up", "--no-deps"]               → fetch ["compose", "up", "--help"]
           //   ["api", "--method", "PUT", "/user/starred"]  → fetch ["api", "--help"]
           //   ["repo", "star", "owner/repo"]               → fetch ["repo", "star", "--help"]
-          if (/unknown command/i.test(cmdResult.stderr || '')) {
+          const syntaxFailure = /unknown command|usage:|unrecognized|invalid (?:choice|option)|unexpected argument|missing required/i.test(cmdResult.stderr || '');
+          if (syntaxFailure) {
             const argv = action.argv || [];
-            const subcmdPath = argv
-              .slice(0, 3) // depth cap — avoid absurdly nested CLIs (e.g. gcloud)
+            const unknownCommand = /unknown command/i.test(cmdResult.stderr || '');
+            const subcmdPath = (unknownCommand ? argv.slice(0, 3) : argv.slice(0, 1))
               .filter(a => !a.startsWith('-') && !/[/\\]/.test(a) && !/^[A-Z_]+=/.test(a));
             if (subcmdPath.length > 0) {
               const helpLabel = subcmdPath.join(' ');
               const helpR = await spawnCapture(currentBinPath, [...subcmdPath, '--help'], { timeoutMs: 4000 });
-              const helpText = (helpR.stdout || helpR.stderr || '').slice(0, OBSERVATION_CHARS);
-              observation = `exitCode=${cmdResult.exitCode} stderr="${(cmdResult.stderr || '').slice(0, 200)}"\n[auto-fetched help for "${helpLabel}"]:\n${helpText}`;
+              const helpText = (helpR.stdout || helpR.stderr || '').slice(0, RUN_HELP_CHARS);
+              observation = `exitCode=${cmdResult.exitCode} stderr="${(cmdResult.stderr || '').slice(0, 400)}"\n[authoritative help for "${helpLabel}" — use only this syntax on the next command]:\n${helpText}`;
             } else {
-              observation = `exitCode=${cmdResult.exitCode} stdout="${cmdResult.stdout.slice(0, 300)}" stderr="${(cmdResult.stderr || '').slice(0, 200)}"`;
+              observation = `exitCode=${cmdResult.exitCode} stdout="${cmdResult.stdout.slice(0, 300)}" stderr="${(cmdResult.stderr || '').slice(0, 400)}"`;
             }
           } else {
             // Extract WARNING: lines and surface them as top-priority actionable hints.
@@ -1529,6 +1598,265 @@ async function discoverAuthLoginCmd(binPath, cliName) {
   logger.info(`[cli.agent] discoverAuthLoginCmd: ${cliName} → not discoverable`);
   _authLoginCmdCache.set(cliName, null);
   return null;
+}
+
+// ---------------------------------------------------------------------------
+// _discoverVerifyCmd — scans --help output for a read-only subcommand that
+// makes an API call requiring valid auth. Uses heuristic pre-filter + LLM
+// classification (via skill-llm.cjs) to pick the best "verify auth" command.
+// Returns argv array (e.g. ['list']) or null if none found.
+// ---------------------------------------------------------------------------
+
+// Subcommand names that are likely read-only and API-backed, in priority order
+const VERIFY_CANDIDATES = ['list', 'status', 'whoami', 'info', 'show', 'agenda'];
+
+// Description keywords indicating the subcommand makes a remote API call
+const API_BACKED_KEYWORDS = /\bavailable\b|\byour\b|\bagenda\b|\bevents?\b|\brepos?\b|\bcalendars?\b|\baccount\b|\bremote\b|\bprojects?\b|\bdatabases?\b|\bclusters?\b|\bspaces?\b|\bteams?\b/i;
+
+// Description keywords indicating the subcommand is local-only (no auth needed)
+const LOCAL_ONLY_KEYWORDS = /\bconfig\b|\bprofile\b|\bversion\b|\bsettings?\b|\bbuild\b|\blocal\b|\bprint\b|\bhelp\b|\binit\b|\bsetup\b|\binstall\b/i;
+
+async function _discoverVerifyCmd(binPath, cliName, mainHelp, helpParts) {
+  // Parse positional arguments line: {init,list,search,edit,...}
+  // Some CLIs (e.g. gcalcli) also have option enums like --lineart {fancy,unicode,ascii},
+  // so we collect ALL {a,b,c} blocks and pick the one with the most items that contains
+  // at least one known verify candidate — that is the positional/subcommand list.
+  const allMatches = [];
+  const posRe = /\{([a-z][a-z0-9_,\s-]*(?:,\s*[a-z][a-z0-9_-]*)+)\}/gi;
+  let m;
+  while ((m = posRe.exec(mainHelp)) !== null) {
+    const items = m[1].split(/,\s*/).map(s => s.trim().toLowerCase()).filter(Boolean);
+    if (items.length > 0) allMatches.push({ raw: m[1], items });
+  }
+  if (allMatches.length === 0) {
+    logger.debug(`[cli.agent] _discoverVerifyCmd: ${cliName} — no {a,b,c} blocks found in --help`);
+    return null;
+  }
+
+  // Prefer blocks that contain at least one verify candidate; among those, pick the longest.
+  // If no block contains a verify candidate, pick the longest block overall.
+  const candidateMatches = allMatches.filter(match => VERIFY_CANDIDATES.some(v => match.items.includes(v)));
+  const bestMatch = (candidateMatches.length > 0 ? candidateMatches : allMatches)
+    .sort((a, b) => b.items.length - a.items.length)[0];
+
+  const allSubcmds = bestMatch.items;
+  logger.debug(`[cli.agent] _discoverVerifyCmd: ${cliName} — selected ${allSubcmds.length}-item block from ${allMatches.length} total {a,b,c} blocks`);
+
+  // Build subcommand → description map from aligned help text
+  const subcmdDescs = {};
+  for (const sub of allSubcmds) {
+    // Match lines like "    list                list available calendars"
+    const descMatch = mainHelp.match(new RegExp(`^\\s{2,8}${sub}\\s{2,}(.+)$`, 'im'));
+    if (descMatch) {
+      subcmdDescs[sub] = descMatch[1].trim();
+    } else {
+      subcmdDescs[sub] = '';
+    }
+  }
+
+  // Phase 1: Heuristic pre-filter
+  const heuristicCandidates = [];
+  for (const candidate of VERIFY_CANDIDATES) {
+    const sub = allSubcmds.find(s => s === candidate || s.startsWith(candidate));
+    if (!sub) continue;
+    const desc = subcmdDescs[sub] || '';
+    // Skip local-only subcommands
+    if (LOCAL_ONLY_KEYWORDS.test(desc) && !API_BACKED_KEYWORDS.test(desc)) {
+      logger.debug(`[cli.agent] _discoverVerifyCmd: skipping '${sub}' (local-only: "${desc}")`);
+      continue;
+    }
+    heuristicCandidates.push({ sub, desc, score: API_BACKED_KEYWORDS.test(desc) ? 2 : 1 });
+  }
+
+  // Also check subcommands not in VERIFY_CANDIDATES but with API-backed descriptions
+  for (const sub of allSubcmds) {
+    if (heuristicCandidates.some(c => c.sub === sub)) continue;
+    const desc = subcmdDescs[sub] || '';
+    if (API_BACKED_KEYWORDS.test(desc) && !LOCAL_ONLY_KEYWORDS.test(desc)) {
+      // Skip destructive subcommands
+      if (/\bdelete\b|\bremove\b|\bcreate\b|\badd\b|\bedit\b|\bupdate\b|\bimport\b|\bremind\b/i.test(sub)) continue;
+      heuristicCandidates.push({ sub, desc, score: 1 });
+    }
+  }
+
+  if (heuristicCandidates.length === 0) {
+    logger.debug(`[cli.agent] _discoverVerifyCmd: ${cliName} — no verify candidates found`);
+    return null;
+  }
+
+  // Sort by score (API-backed first) then by VERIFY_CANDIDATES priority
+  heuristicCandidates.sort((a, b) => {
+    if (b.score !== a.score) return b.score - a.score;
+    const aIdx = VERIFY_CANDIDATES.indexOf(a.sub) === -1 ? 99 : VERIFY_CANDIDATES.indexOf(a.sub);
+    const bIdx = VERIFY_CANDIDATES.indexOf(b.sub) === -1 ? 99 : VERIFY_CANDIDATES.indexOf(b.sub);
+    return aIdx - bIdx;
+  });
+
+  // If the top candidate has score 2 (clearly API-backed), use it directly
+  if (heuristicCandidates[0].score >= 2) {
+    const pick = heuristicCandidates[0];
+    logger.info(`[cli.agent] _discoverVerifyCmd: ${cliName} → ['${pick.sub}'] (heuristic: "${pick.desc}")`);
+    return [pick.sub];
+  }
+
+  // Phase 2: LLM classification when heuristics are ambiguous
+  try {
+    let llmModule = null;
+    try { llmModule = require('../skill-helpers/skill-llm.cjs'); } catch (_) {}
+
+    if (llmModule?.ask) {
+      const candidateList = heuristicCandidates.slice(0, 6).map(c => `- ${c.sub}: "${c.desc}"`).join('\n');
+      const prompt = `Given these CLI subcommands and their --help descriptions, which ONE subcommand makes a network/API call that requires valid authentication to succeed? Pick the best "verify auth" command. Return ONLY the subcommand name, nothing else.
+
+Subcommands:
+${candidateList}`;
+
+      const llmAnswer = await llmModule.ask(prompt, { timeoutMs: 10000 });
+      if (llmAnswer) {
+        const cleaned = llmAnswer.trim().toLowerCase().replace(/[^a-z0-9_-]/g, '');
+        // Verify the LLM pick exists in our candidates
+        const match = heuristicCandidates.find(c => c.sub === cleaned);
+        if (match) {
+          logger.info(`[cli.agent] _discoverVerifyCmd: ${cliName} → ['${cleaned}'] (LLM classified: "${match.desc}")`);
+          return [cleaned];
+        }
+      }
+    }
+  } catch (_) {}
+
+  // Fallback: use top heuristic candidate
+  const pick = heuristicCandidates[0];
+  logger.info(`[cli.agent] _discoverVerifyCmd: ${cliName} → ['${pick.sub}'] (fallback heuristic: "${pick.desc}")`);
+  return [pick.sub];
+}
+
+// ---------------------------------------------------------------------------
+// discoverSetupFromHelp — parses <cli> --help (and subcommand --help) to extract
+// structured setupInfo: authCmd, initCmd, credentials, instructions.
+// This is the primary setup discovery method when the CLI is installed.
+// Returns setupInfo object or null if --help doesn't contain setup-relevant info.
+// Caches results in-memory.
+// ---------------------------------------------------------------------------
+const _setupHelpCache = new Map(); // cliName → setupInfo | null
+
+async function discoverSetupFromHelp(binPath, cliName) {
+  if (_setupHelpCache.has(cliName)) {
+    return _setupHelpCache.get(cliName);
+  }
+
+  const setupInfo = {};
+  const helpParts = [];
+
+  // 1. Run <cli> --help
+  const r0 = await spawnCapture(binPath, ['--help'], { timeoutMs: 5000 });
+  const r0out = (r0.stdout || '') + (r0.stderr || '');
+  if (r0.exitCode !== 0 && !r0out) {
+    // Try -h as fallback
+    const r0b = await spawnCapture(binPath, ['-h'], { timeoutMs: 5000 });
+    const r0bout = (r0b.stdout || '') + (r0b.stderr || '');
+    if (r0b.exitCode !== 0 && !r0bout) {
+      _setupHelpCache.set(cliName, null);
+      return null;
+    }
+    helpParts.push({ subcmd: null, output: r0bout });
+  } else {
+    helpParts.push({ subcmd: null, output: r0out });
+  }
+
+  const mainHelp = helpParts[0].output;
+  const mainLower = mainHelp.toLowerCase();
+
+  // 2. Detect setup-related subcommands from main --help
+  const setupSubcmds = [];
+  const subcmdPatterns = [
+    { regex: /\b(init|setup|config(?:ure)?)\b/gi, field: 'initCmd' },
+    { regex: /\b(auth(?:enticate)?|login|signin|sign-in)\b/gi, field: 'authCmd' },
+  ];
+
+  for (const { regex, field } of subcmdPatterns) {
+    const matches = [...mainHelp.matchAll(regex)];
+    for (const m of matches) {
+      const subcmd = m[1].toLowerCase().replace(/-/g, '');
+      if (!setupSubcmds.some(s => s.subcmd === subcmd)) {
+        setupSubcmds.push({ subcmd, field, raw: m[1] });
+      }
+    }
+  }
+
+  // 3. For each found subcommand, run <cli> <subcmd> --help for details
+  for (const { subcmd, field, raw } of setupSubcmds.slice(0, 4)) {
+    try {
+      const rs = await spawnCapture(binPath, [subcmd, '--help'], { timeoutMs: 5000 });
+      const rsout = (rs.stdout || '') + (rs.stderr || '');
+      if (rsout) {
+        helpParts.push({ subcmd, output: rsout });
+
+        // Set the command (use the raw form from --help if it had a hyphen)
+        if (field === 'initCmd' && !setupInfo.initCmd) {
+          setupInfo.initCmd = `${cliName} ${raw.toLowerCase()}`;
+        } else if (field === 'authCmd' && !setupInfo.authCmd) {
+          // Check for --web/--browser flags
+          let authCmd = `${cliName} ${raw.toLowerCase()}`;
+          if (/--web\b/.test(rsout)) authCmd += ' --web';
+          else if (/--browser\b/.test(rsout)) authCmd += ' --browser';
+          setupInfo.authCmd = authCmd;
+        }
+
+        // Check for OAuth/client_id/client_secret in subcommand help
+        const subLower = rsout.toLowerCase();
+        if (/client.?id|client.?secret|oauth/.test(subLower) && !setupInfo.credentials) {
+          setupInfo.credentials = ['oauth'];
+        }
+        if (/api.?key|api-key/.test(subLower) && !setupInfo.credentials) {
+          setupInfo.credentials = ['api_key'];
+        }
+      }
+    } catch (_) {}
+  }
+
+  // 4. Also check main --help for OAuth/API key indicators
+  if (!setupInfo.credentials) {
+    if (/client.?id|client.?secret|oauth/.test(mainLower)) {
+      setupInfo.credentials = ['oauth'];
+    } else if (/api.?key|api-key/.test(mainLower)) {
+      setupInfo.credentials = ['api_key'];
+    }
+  }
+
+  // 4b. Discover verifyCmd — a read-only subcommand that makes an API call
+  // requiring valid auth. Used by actionPreflightCheck when tokenCmd is null.
+  if (!setupInfo.verifyCmd) {
+    setupInfo.verifyCmd = await _discoverVerifyCmd(binPath, cliName, mainHelp, helpParts);
+  }
+
+  // 5. Build instructions from what we found
+  if (setupInfo.initCmd || setupInfo.authCmd) {
+    const parts = [];
+    if (setupInfo.credentials?.includes('oauth')) {
+      parts.push('Requires OAuth client ID and secret.');
+    } else if (setupInfo.credentials?.includes('api_key')) {
+      parts.push('Requires API key.');
+    }
+    if (setupInfo.initCmd) {
+      parts.push(`Run \`${setupInfo.initCmd}\` to configure.`);
+    } else if (setupInfo.authCmd) {
+      parts.push(`Run \`${setupInfo.authCmd}\` to authenticate.`);
+    }
+    setupInfo.instructions = parts.join(' ');
+  }
+
+  // 6. If we found nothing useful, return null
+  if (!setupInfo.authCmd && !setupInfo.initCmd && !setupInfo.credentials && !setupInfo.instructions && !setupInfo.verifyCmd) {
+    _setupHelpCache.set(cliName, null);
+    return null;
+  }
+
+  // 7. Store help output (truncated) for debugging
+  setupInfo.helpOutput = helpParts.map(h => h.output).join('\n---\n').slice(0, 2000);
+
+  logger.info(`[cli.agent] discoverSetupFromHelp: ${cliName} → ${JSON.stringify({ authCmd: setupInfo.authCmd, initCmd: setupInfo.initCmd, credentials: setupInfo.credentials, verifyCmd: setupInfo.verifyCmd })}`);
+  _setupHelpCache.set(cliName, setupInfo);
+  return setupInfo;
 }
 
 // _registerCliInAllowlist — proactively register a CLI in shell.run's
@@ -2830,16 +3158,101 @@ const IDENTITY_COMMANDS = {
   wrangler:{ argv: ['whoami'],                                               extract: s => s.trim().match(/(\S+@\S+|\S+)/)?.[1] || null },
 };
 
+// ---------------------------------------------------------------------------
+// checkCredentialFiles — checks for known credential/token file paths that
+// indicate the CLI has been configured. Used as a final fallback when the
+// verify command couldn't determine auth status (unknown/no_auth_check).
+// Returns { found: true, path, size, mtime } or { found: false }.
+// ---------------------------------------------------------------------------
+function _expandCredPath(p, cliName) {
+  const home = os.homedir();
+  let resolved = p
+    .replace(/^~/, home)
+    .replace(/\{cli\}/g, cliName)
+    // Windows env var expansion: %APPDATA%, %LOCALAPPDATA%, %USERPROFILE%
+    .replace(/%APPDATA%/gi, process.env.APPDATA || '')
+    .replace(/%LOCALAPPDATA%/gi, process.env.LOCALAPPDATA || '')
+    .replace(/%USERPROFILE%/gi, process.env.USERPROFILE || home);
+  return resolved;
+}
+
+const CRED_FILE_PATTERNS = [
+  // gcalcli — OAuth token file (no .dat extension on modern installs)
+  { cli: 'gcalcli', paths: [
+    '~/Library/Application Support/gcalcli/oauth',
+    '~/.config/gcalcli/oauth',
+    '%APPDATA%\\gcalcli\\oauth',
+    '%LOCALAPPDATA%\\gcalcli\\oauth',
+    // Legacy/alternate names
+    '~/.config/gcalcli/oauth.dat',
+    '~/Library/Application Support/gcalcli/oauth.dat',
+  ]},
+  // gh
+  { cli: 'gh', paths: [
+    '~/.config/gh/hosts.yml',
+    '~/Library/Application Support/gh/hosts.yml',
+    '%APPDATA%\\gh\\hosts.yml',
+  ]},
+  // Generic patterns — checked for any CLI not matched above
+  { cli: null, paths: [
+    '~/.config/{cli}/credentials.json',
+    '~/.config/{cli}/token.json',
+    '~/.config/{cli}/.credentials',
+    '~/.config/{cli}/auth.json',
+    '~/.config/{cli}/oauth_token',
+    '~/.{cli}/credentials',
+    '~/.{cli}/.token',
+    '~/.{cli}/config/credentials',
+    '%APPDATA%\\{cli}\\credentials.json',
+    '%APPDATA%\\{cli}\\token.json',
+    '%LOCALAPPDATA%\\{cli}\\credentials.json',
+  ]},
+];
+
+async function checkCredentialFiles(cliName) {
+  for (const pattern of CRED_FILE_PATTERNS) {
+    if (pattern.cli && pattern.cli !== cliName) continue;
+    for (const p of pattern.paths) {
+      const resolved = _expandCredPath(p, cliName);
+      if (!resolved) continue;
+      try {
+        if (fs.existsSync(resolved)) {
+          const stat = fs.statSync(resolved);
+          if (stat.size > 0) {
+            logger.info(`[cli.agent] checkCredentialFiles: ${cliName} credential file found at ${resolved} (${stat.size} bytes)`);
+            return { found: true, path: resolved, size: stat.size, mtime: stat.mtime };
+          }
+        }
+      } catch (_) {}
+    }
+  }
+  return { found: false };
+}
+
 async function checkAuthStatus(binPath, tokenCmd, timeoutMs = 8000, serviceKey = null) {
   if (!binPath || !tokenCmd || tokenCmd.length === 0) {
     return { authed: null, authStatus: 'unknown', authUser: null };
   }
   const r = await spawnCapture(binPath, tokenCmd, { timeoutMs });
-  // A non-zero exit with "not logged in" / "unauthenticated" = clearly not authed
-  // A non-zero exit for other reasons (network, etc.) = unknown
   const combined = (r.stdout + r.stderr).toLowerCase();
+
+  // Auth-failure patterns — checked in BOTH exit 0 and non-zero cases to catch
+  // CLIs that exit 0 with auth warnings, expired tokens, or partial setup states
+  const AUTH_FAILURE_PATTERNS = /not logged in|not authenticated|unauthenticated|login required|run.*auth.*login|please login|please authenticate|no credentials|credentials expired|token expired|re-authenticate|access denied|permission denied|\b401\b|\b403\b|invalid_grant|invalid_token|expired|not configured|not authorized/i;
+
   if (r.ok) {
+    // Check for auth-failure signals even when exit 0 (false-positive guard)
+    if (AUTH_FAILURE_PATTERNS.test(combined)) {
+      logger.info(`[cli.agent] checkAuthStatus: ${serviceKey || '?'} exit 0 but auth-failure pattern detected → not_authenticated`);
+      return { authed: false, authStatus: 'not_authenticated', authUser: null };
+    }
     const tokenLike = r.stdout.trim().length > 4;
+    // Detect help/config text masquerading as valid output
+    const isHelpText = /^usage:|--help|show this help/i.test(r.stdout.trim());
+    if (isHelpText) {
+      logger.info(`[cli.agent] checkAuthStatus: ${serviceKey || '?'} exit 0 but output is help text → unknown`);
+      return { authed: null, authStatus: 'unknown', authUser: null };
+    }
     // Resolve authenticated user identity if we have a service-specific command
     let authUser = null;
     if (tokenLike && serviceKey && IDENTITY_COMMANDS[serviceKey]) {
@@ -2858,7 +3271,8 @@ async function checkAuthStatus(binPath, tokenCmd, timeoutMs = 8000, serviceKey =
     }
     return { authed: tokenLike, authStatus: tokenLike ? 'authenticated' : 'no_token_returned', authUser };
   }
-  if (/not logged in|not authenticated|unauthenticated|login required|run.*auth.*login|please login|please authenticate|no credentials/i.test(combined)) {
+  // Non-zero exit
+  if (AUTH_FAILURE_PATTERNS.test(combined)) {
     return { authed: false, authStatus: 'not_authenticated', authUser: null };
   }
   return { authed: null, authStatus: 'unknown', authUser: null };
@@ -3062,9 +3476,28 @@ async function actionPreflightCheck({ task, clis: explicitClis, agents: explicit
     const versionResult = await spawnCapture(binPath, ['--version'], { timeoutMs: 6000 });
     const version = (versionResult.stdout || versionResult.stderr).split('\n')[0].trim() || null;
 
-    let authResult = meta.tokenCmd
-      ? await checkAuthStatus(binPath, meta.tokenCmd, 8000, serviceKey)
+    // ── Layer 3: Determine effective token/verify command ──
+    // If no tokenCmd from KNOWN_CLI_MAP, discover verifyCmd from --help early
+    let _earlySetupInfo = null;
+    if (!meta.tokenCmd) {
+      try {
+        _earlySetupInfo = await discoverSetupFromHelp(binPath, cliName);
+      } catch (_) {}
+    }
+    const _effectiveTokenCmd = meta.tokenCmd || _earlySetupInfo?.verifyCmd || null;
+
+    let authResult = _effectiveTokenCmd
+      ? await checkAuthStatus(binPath, _effectiveTokenCmd, 8000, serviceKey)
       : { authed: null, authStatus: 'no_auth_check', authUser: null };
+
+    // ── Layer 4: Credential file check fallback ──
+    // If auth status is still unknown, check for credential files on disk
+    if (authResult.authStatus === 'unknown' || authResult.authStatus === 'no_auth_check') {
+      const credCheck = await checkCredentialFiles(cliName);
+      if (credCheck.found) {
+        authResult = { authed: true, authStatus: 'configured', authUser: null };
+      }
+    }
 
     // ── Proactive auto-auth: if not authenticated, attempt discoverAuthLoginCmd + run ──
     if (authResult.authStatus === 'not_authenticated') {
@@ -3074,9 +3507,9 @@ async function actionPreflightCheck({ task, clis: explicitClis, agents: explicit
           logger.info(`[cli.agent] preflight_check: ${cliName} not authenticated — running auto-auth: ${_authArgv.join(' ')}`);
           const _autoAuthR = await spawnCapture(binPath, _authArgv, { timeoutMs: 180000 });
           if (_autoAuthR.exitCode === 0) {
-            // Re-check auth after login
-            authResult = meta.tokenCmd
-              ? await checkAuthStatus(binPath, meta.tokenCmd, 8000, serviceKey)
+            // Re-check auth after login using effective token/verify command
+            authResult = _effectiveTokenCmd
+              ? await checkAuthStatus(binPath, _effectiveTokenCmd, 8000, serviceKey)
               : { authed: true, authStatus: 'authenticated', authUser: null };
             logger.info(`[cli.agent] preflight_check: ${cliName} auto-auth succeeded — authStatus=${authResult.authStatus}`);
           } else {
@@ -3088,6 +3521,38 @@ async function actionPreflightCheck({ task, clis: explicitClis, agents: explicit
       }
     }
 
+    // ── Discover setup info from --help when CLI is installed but not authenticated ──
+    // Reuse _earlySetupInfo if already discovered above
+    let _helpSetupInfo = _earlySetupInfo;
+    let _finalSetupInfo = meta.setupInfo || null;
+    let _finalAuthStatus = authResult.authStatus;
+    if (authResult.authed !== true && authResult.authStatus !== 'authenticated' && authResult.authStatus !== 'configured') {
+      if (!_helpSetupInfo) {
+        try {
+          _helpSetupInfo = await discoverSetupFromHelp(binPath, cliName);
+        } catch (_helpErr) {
+          logger.debug(`[cli.agent] preflight_check: ${cliName} discoverSetupFromHelp error: ${_helpErr.message}`);
+        }
+      }
+      if (_helpSetupInfo) {
+        // Merge: descriptor values take priority, --help fills missing fields
+        _finalSetupInfo = { ...(_helpSetupInfo || {}), ...((meta.setupInfo || {})) };
+        // Refine authStatus based on what --help revealed — only if we don't have a definitive status
+        if (authResult.authStatus !== 'not_authenticated') {
+          if (_helpSetupInfo.credentials?.includes('oauth')) {
+            _finalAuthStatus = 'oauth_required';
+          } else if (_helpSetupInfo.credentials?.includes('api_key')) {
+            _finalAuthStatus = 'api_key_required';
+          } else if (_helpSetupInfo.initCmd) {
+            _finalAuthStatus = 'init_required';
+          }
+        }
+      }
+    } else if (_helpSetupInfo) {
+      // Authenticated/configured — still merge setupInfo for setup guide display
+      _finalSetupInfo = { ...(_helpSetupInfo || {}), ...((meta.setupInfo || {})) };
+    }
+
     detectedClis.push({
       service:       serviceKey,
       cli:           cliName,
@@ -3095,7 +3560,7 @@ async function actionPreflightCheck({ task, clis: explicitClis, agents: explicit
       binPath,
       version,
       authed:        authResult.authed,
-      authStatus:    authResult.authStatus,
+      authStatus:    _finalAuthStatus,
       authUser:      authResult.authUser || null,
       installMethod: meta.method,
       installPkg:    meta.pkg,
@@ -3104,7 +3569,7 @@ async function actionPreflightCheck({ task, clis: explicitClis, agents: explicit
       isApiKey:      meta.isApiKey,
       isOAuth:       meta.isOAuth,
       agentId:       entry._agentId || null,
-      setupInfo:     meta.setupInfo || null,
+      setupInfo:     _finalSetupInfo,
     });
   }));
 
@@ -3130,6 +3595,9 @@ async function actionPreflightCheck({ task, clis: explicitClis, agents: explicit
     if (c.authStatus === 'authenticated') {
       const userNote = c.authUser ? ` as ${c.authUser}` : '';
       return `${c.cli} (${c.service}): installed (${c.version}) — authenticated${userNote} ✓`;
+    }
+    if (c.authStatus === 'configured') {
+      return `${c.cli} (${c.service}): installed (${c.version}) — configured (credentials found) ✓`;
     }
     return `${c.cli} (${c.service}): installed (${c.version}) — auth unknown`;
   });
@@ -3272,7 +3740,7 @@ async function cliAgent(args) {
   }
 }
 
-module.exports = { cliAgent, KNOWN_CLI_MAP, actionListAllAgents, resetDbCache };
+module.exports = { cliAgent, KNOWN_CLI_MAP, actionListAllAgents, resetDbCache, discoverSetupFromHelp };
 
 // ── One-shot startup migration: ensure ytdlp.agent has transcript capabilities ──
 // Runs 5s after module load to allow DuckDB init. No-ops if already patched.

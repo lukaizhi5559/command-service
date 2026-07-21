@@ -2149,6 +2149,22 @@ async function browserAct(args) {
       return { ok: res.ok, action, sessionId, executionTime: Date.now() - start, error: res.ok ? undefined : res.error };
     }
 
+    case 'close-all': {
+      const sessions = [...openSessions];
+      let closed = 0;
+      for (const sid of sessions) {
+        openSessions.delete(sid);
+        const S2 = sessionFlags(sid);
+        const res = await cliRun([...S2, 'close'], Math.min(timeoutMs, 8000)).catch(() => ({ ok: false }));
+        if (res.ok) closed++;
+        for (const k of snapshotCache.keys()) { if (k.startsWith(`${sid}:`)) snapshotCache.delete(k); }
+        currentTabIndex.delete(sid);
+        clearAdBlockSession(sid);
+      }
+      logger.info(`[browser.act] close-all: closed ${closed}/${sessions.length} sessions`);
+      return { ok: true, action, closed, total: sessions.length, executionTime: Date.now() - start };
+    }
+
     // ── Snapshot ─────────────────────────────────────────────────────────────
     case 'snapshot': {
       const res = await captureSnapshot(sessionId, headed, timeoutMs);
@@ -3697,13 +3713,14 @@ If no videos found, return []. Do not explain, only output the JSON array.`;
         if (!a || !b) return false;
         const ah = a.toLowerCase(), bh = b.toLowerCase();
         if (ah === bh) return true;
-        const ab = ah.split('.').slice(-2).join('.');
-        const bb = bh.split('.').slice(-2).join('.');
-        if (ab === bb) return true;
+        // Parent-domain check: www.example.com is equivalent to example.com,
+        // but accounts.google.com is NOT equivalent to myaccount.google.com
+        if (ah.endsWith(`.${bh}`) || bh.endsWith(`.${ah}`)) return true;
         for (const alias of _aliases) {
-          const alb = alias.split('.').slice(-2).join('.');
-          if (alb === ab || alb === bb) return true;
-          if (alias === ah || alias === bh) return true;
+          const alb = alias.toLowerCase();
+          if (alb === ah || alb === bh) return true;
+          if (ah.endsWith(`.${alb}`) || bh.endsWith(`.${alb}`)) return true;
+          if (alb.endsWith(`.${ah}`) || alb.endsWith(`.${bh}`)) return true;
         }
         return false;
       };
@@ -4033,6 +4050,13 @@ If no videos found, return []. Do not explain, only output the JSON array.`;
         if (!openSessions.has(sessionId)) {
           logger.info(`[browser.act] waitForAuth: session ${sessionId} closed externally — aborting poll`);
           return { ok: false, action, sessionId, authTimedOut: true, error: 'Session closed (cancelled)', executionTime: Date.now() - start };
+        }
+
+        // Manual auth completion — user clicked "I have signed in" button in UI
+        if (global.__manualAuthCompleteSessions && global.__manualAuthCompleteSessions.has(sessionId)) {
+          global.__manualAuthCompleteSessions.delete(sessionId);
+          logger.info(`[browser.act] waitForAuth: manual auth complete for session=${sessionId} — returning success`);
+          return { ok: true, action, sessionId, authResolved: true, manualConfirm: true, executionTime: Date.now() - start };
         }
 
         try {
