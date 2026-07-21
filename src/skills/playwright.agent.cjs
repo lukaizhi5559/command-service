@@ -3709,7 +3709,14 @@ async function playwrightAgent(args) {
         try {
           const _netRes = await browserAct({ action: 'evaluate', text: 'JSON.stringify(window.__tdNetLog || [])', sessionId, headed, timeoutMs: 3000 });
           if (_netRes?.ok && _netRes?.result) {
-            const _netLog = JSON.parse(String(_netRes.result).replace(/^"|"$/g, '') || '[]');
+            let _rawNetResult = String(_netRes.result);
+            let _netLogStr;
+            try {
+              _netLogStr = JSON.parse(_rawNetResult); // unwrap outer string encoding from evaluate
+            } catch(_) {
+              _netLogStr = _rawNetResult.replace(/^"|"$/g, ''); // fallback: strip quotes
+            }
+            const _netLog = JSON.parse(_netLogStr || '[]');
             const _relevant = _netLog.filter(e => e.ts >= _mutationClickTs - 500);
             if (_relevant.length > 0) {
               const _summarized = _relevant.map(e => `${e.method} ${e.url.slice(0, 80)} → ${e.status}`).join('\n');
@@ -3791,7 +3798,7 @@ Set canRetry:false only if the goal is fundamentally impossible on this page/sit
           };
         } else {
           // ── Non-recipe path: exhaust adaptive replanning until LLM says stuck ─
-          const _canRetry = _judgeResult.canRetry !== false; // default true unless LLM says false
+          let _canRetry = _judgeResult.canRetry !== false; // default true unless LLM says false
 
           // ── Hard guard against duplicate mutation (Issue 2d) ────────────────
           // If a mutation submit was detected (_mutationClickTs set) and network
