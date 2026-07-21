@@ -1979,14 +1979,33 @@ async function playwrightAgent(args) {
 
   // ── Pre-navigation ─────────────────────────────────────────────────────────
   if (url) {
-    logger.info(`[playwright.agent] navigating to: ${url}`);
-    const navResult = await browserAct({ action: 'navigate', sessionId, url, headed, timeoutMs: Math.max(timeoutMs, 30000) });
-    if (!navResult.ok) {
-      return {
-        ok: false, goal, sessionId, turns: 0, done: false,
-        result: `Failed to navigate to starting URL: ${navResult.error}`,
-        transcript: [], error: navResult.error, executionTime: Date.now() - start,
-      };
+    // Check if browser is already on the target URL — browser.agent may have already
+    // navigated there during the auth probe. Skip redundant re-navigation to avoid
+    // a full page reload (~8s saved) and preserve page state.
+    let _alreadyOnTarget = false;
+    try {
+      const _curUrlRes = await browserAct({ action: 'evaluate', text: 'window.location.href', sessionId, headed, timeoutMs: 5000 });
+      if (_curUrlRes?.ok && _curUrlRes?.result) {
+        const _curUrl = String(_curUrlRes.result).trim().replace(/^"|"$/g, '');
+        const _normCur = _curUrl.replace(/\/+$/, '').split('?')[0];
+        const _normTarget = url.replace(/\/+$/, '').split('?')[0];
+        if (_normCur === _normTarget) {
+          _alreadyOnTarget = true;
+          logger.info(`[playwright.agent] already on target URL ${_curUrl} — skipping redundant navigation`);
+        }
+      }
+    } catch (_) {}
+
+    if (!_alreadyOnTarget) {
+      logger.info(`[playwright.agent] navigating to: ${url}`);
+      const navResult = await browserAct({ action: 'navigate', sessionId, url, headed, timeoutMs: Math.max(timeoutMs, 30000) });
+      if (!navResult.ok) {
+        return {
+          ok: false, goal, sessionId, turns: 0, done: false,
+          result: `Failed to navigate to starting URL: ${navResult.error}`,
+          transcript: [], error: navResult.error, executionTime: Date.now() - start,
+        };
+      }
     }
   }
 
@@ -2433,6 +2452,8 @@ async function playwrightAgent(args) {
   const _typedTexts = new Set(); // Track typed texts to prevent duplicate typing in same session
   let _emailSendVerification = null; // captures verified email send outcome for the judge
   let _emailAlreadySent = false; // true once sendEmailWithVerification succeeds; prevents duplicate sends
+  let _mutationClickTs = null; // timestamp of last submit click after fill/type (mutation tracking)
+  let _hasFillOrType = false; // true if a fill/type step succeeded in the current plan iteration
 
   // Actions that can mutate the DOM structure (open modals, navigate pages, reveal
   // new elements via lazy-load, toggle conditional sections, etc.).  After any of these
@@ -2945,6 +2966,24 @@ async function playwrightAgent(args) {
       logger.info(`[playwright.agent] step ${stepIndex + 1} ok=${outcome.ok}${outcome.error ? ' err=' + outcome.error : ''}`);
       const thoughts = outcome.ok ? '' : (outcome.error || 'failed');
       transcript.push({ step: stepIndex + 1, action: step, outcome, thoughts });
+
+      // ── Mutation submit tracking (Issue 2b) ────────────────────────────────
+      // Record _mutationClickTs when a click with purpose:'submit' succeeds after
+      // a fill/type step. Used by the goal judge and replan guard to prevent
+      // duplicate mutations (e.g. double-posting a tweet).
+      if (outcome.ok) {
+        if (step.action === 'fill' || step.action === 'type') {
+          _hasFillOrType = true;
+        }
+        if (step.action === 'click' && _hasFillOrType) {
+          const _purpose = String(step.purpose || '').toLowerCase();
+          const _selHint = String(step.selector || step.ref || step['aria-label'] || '').toLowerCase();
+          if (_purpose === 'submit' || /post|submit|send|tweet|publish|create|save|reply/i.test(_selHint)) {
+            _mutationClickTs = Date.now();
+            logger.info(`[playwright.agent] mutation submit detected: click at ${_mutationClickTs} (purpose=${_purpose || 'inferred'}, selector=${_selHint.slice(0, 40)})`);
+          }
+        }
+      }
 
       // Notify frontend — step completed
       postProgress(_progressCallbackUrl, {
@@ -3662,6 +3701,31 @@ async function playwrightAgent(args) {
         }
       } catch (_) {}
 
+      // ── Network mutation evidence (Issue 2c) ────────────────────────────────
+      // Collect window.__tdNetLog entries that occurred after _mutationClickTs to
+      // provide ground-truth network evidence to the goal-achievement judge.
+      let _mutationNetEvidence = '';
+      if (_mutationClickTs) {
+        try {
+          const _netRes = await browserAct({ action: 'evaluate', text: 'JSON.stringify(window.__tdNetLog || [])', sessionId, headed, timeoutMs: 3000 });
+          if (_netRes?.ok && _netRes?.result) {
+            const _netLog = JSON.parse(String(_netRes.result).replace(/^"|"$/g, '') || '[]');
+            const _relevant = _netLog.filter(e => e.ts >= _mutationClickTs - 500);
+            if (_relevant.length > 0) {
+              const _summarized = _relevant.map(e => `${e.method} ${e.url.slice(0, 80)} → ${e.status}`).join('\n');
+              const _has2xx = _relevant.some(e => e.status >= 200 && e.status < 300);
+              const _has4xx = _relevant.some(e => e.status >= 400 && e.status < 600);
+              _mutationNetEvidence = `\nMUTATION_NETWORK_EVIDENCE:\n${_summarized}\nNetworkStatus: ${_has2xx ? '2xx-success' : _has4xx ? 'error-status' : 'no-clear-status'}`;
+              logger.info(`[playwright.agent] mutation network evidence: ${_relevant.length} entries, has2xx=${_has2xx}, has4xx=${_has4xx}`);
+            } else {
+              logger.info(`[playwright.agent] mutation network evidence: no entries after _mutationClickTs=${_mutationClickTs}`);
+            }
+          }
+        } catch (_netErr) {
+          logger.warn(`[playwright.agent] mutation network evidence collection failed (non-fatal): ${_netErr.message}`);
+        }
+      }
+
       const _stepSummary = transcript.map(t => `${t.action.action}:${t.outcome.ok ? 'ok' : 'fail'}`).join('; ');
       const _stepResults = transcript.slice(-3).map(t => {
         const _res = t.outcome.result || t.outcome.error || '';
@@ -3676,7 +3740,7 @@ async function playwrightAgent(args) {
       const _judgePrompt = `GOAL: ${goal}
 
 STEPS EXECUTED: ${_stepSummary}
-RECENT STEP RESULTS: ${_stepResults}${_emailVerifyBlock}
+RECENT STEP RESULTS: ${_stepResults}${_emailVerifyBlock}${_mutationNetEvidence}
 ${_judgeCurrentUrl ? `\nCURRENT URL: ${_judgeCurrentUrl}` : ''}
 ${_judgeContentSample ? `\nPAGE CONTENT (sample):\n${_judgeContentSample}` : ''}
 
@@ -3689,6 +3753,7 @@ IMPORTANT RULES:
 - PAGE CONTENT IS PRIMARY EVIDENCE: The page content/URL/snapshot must show evidence that the goal was achieved. Action history alone (e.g. "type:ok" or "click:ok") is NOT sufficient — a successful action does not mean the goal was accomplished. You must find concrete evidence in the page state.
 - If the action history includes ">sendEmailWithVerification:ok", the email was successfully sent and verified. This is conclusive evidence. The mail inbox is the expected page after a successful send. The absence of a compose window means the email was sent, not that it failed.
 - If EMAIL_SEND_VERIFICATION is provided, it is authoritative proof of completion.
+- MUTATION_NETWORK_EVIDENCE RULE: If MUTATION_NETWORK_EVIDENCE is provided with NetworkStatus=2xx-success, this is strong evidence that a mutation (post/create/submit) succeeded. Combined with the action history showing a fill+submit sequence, set achieved=true unless the page explicitly shows an error message. If NetworkStatus=error-status (4xx/5xx), set achieved=false and canRetry=true. If NetworkStatus=no-clear-status, fall back to page content analysis.
 - For non-mail tasks, focus on the END STATE — does the page content/URL show the goal was accomplished? If the page content does not contain expected text/elements matching the goal, achieved MUST be false.
 - RICH TEXT EDITOR RULE: Google Docs, Notion, Confluence, and similar editors use canvas/custom rendering. Content typed via a prior 'type' or 'fill' action may NOT appear in the DOM snapshot even though it was entered successfully. If the action history includes type:ok or fill:ok with text content matching the goal, and the page is a rich text editor / contenteditable, consider the content as entered even if it doesn't appear in the page snapshot.
 - AUTOSAVE RULE: Transient save/sync indicators ("Saving…", "Syncing…", "Uploading…") are NORMAL autosave states and are NOT evidence of goal non-achievement. A "Saving…" or "Saved" indicator on a document editor means the action was accepted and is being persisted.
@@ -3727,6 +3792,21 @@ Set canRetry:false only if the goal is fundamentally impossible on this page/sit
         } else {
           // ── Non-recipe path: exhaust adaptive replanning until LLM says stuck ─
           const _canRetry = _judgeResult.canRetry !== false; // default true unless LLM says false
+
+          // ── Hard guard against duplicate mutation (Issue 2d) ────────────────
+          // If a mutation submit was detected (_mutationClickTs set) and network
+          // evidence shows 2xx or no-clear-status (ambiguous), do NOT replan —
+          // the mutation likely succeeded and re-executing fill+submit risks
+          // duplicate posts/creates/submits. Surface ask_user instead.
+          if (_mutationClickTs && _canRetry && totalRepairs < maxRepairs) {
+            const _netStatus = _mutationNetEvidence.match(/NetworkStatus:\s*(\S+)/);
+            const _status = _netStatus ? _netStatus[1] : 'no-clear-status';
+            if (_status === '2xx-success' || _status === 'no-clear-status') {
+              logger.warn(`[playwright.agent] Mutation guard: _mutationClickTs set + network=${_status} — prohibiting replan to prevent duplicate mutation`);
+              _canRetry = false;
+            }
+          }
+
           if (_canRetry && totalRepairs < maxRepairs) {
             totalRepairs++;
             logger.warn(`[playwright.agent] Goal not achieved — adaptive replan ${totalRepairs}/${maxRepairs}: ${_judgeResult.reason}`);

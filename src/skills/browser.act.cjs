@@ -1848,7 +1848,7 @@ async function browserAct(args) {
     filePath,
     headed     = true,
     timeoutMs  = 15000,
-    authSuccessUrl,
+    authSuccessUrl: _authSuccessUrl,
     currentUrl,
     credentials,
     noAutofill = false,
@@ -1856,6 +1856,7 @@ async function browserAct(args) {
     postAuthUrl,
     _progressCallbackUrl,
   } = args || {};
+  let authSuccessUrl = _authSuccessUrl;
 
   const start = Date.now();
 
@@ -3770,6 +3771,34 @@ If no videos found, return []. Do not explain, only output the JSON array.`;
         }
       }
 
+      // ── Step 1c: Detect service-level domain redirect ─────────────────────
+      // After navigating to the sign-in URL, some services redirect to a different
+      // domain (e.g., twitter.com → x.com). Without detecting this, the state
+      // machine treats the new domain as "limbo" and loops navigating back to the
+      // original sign-in URL. This reads the actual URL after the redirect settles
+      // and, if the host changed before any user interaction, treats the new host
+      // as a runtime alias for the original auth origin host.
+      if (url && authOriginHost) {
+        await new Promise(r => setTimeout(r, 1500)); // allow redirect to settle
+        try {
+          const _postNavProbe = await cliRun([...S, 'eval', 'location.href'], 5000).catch(() => ({}));
+          const _postNavRaw = (_postNavProbe.stdout || '').trim();
+          const _postNavMatch = _postNavRaw.match(/###\s*Result\s*\n([\s\S]*?)(?=###|$)/i);
+          const _postNavUrl = (_postNavMatch ? _postNavMatch[1].trim().replace(/^"|"$/g, '') : _postNavRaw).trim();
+          if (_postNavUrl) {
+            const _postNavHost = getHost(_postNavUrl);
+            if (_postNavHost && _postNavHost !== authOriginHost && !isHostEquivalent(_postNavHost, authOriginHost)) {
+              _aliases.push(_postNavHost);
+              logger.info(`[browser.act] waitForAuth: service redirected ${authOriginHost} → ${_postNavHost} — adding as runtime alias for session=${sessionId}`);
+              if (authSuccessUrl && authSuccessUrl.includes(authOriginHost)) {
+                authSuccessUrl = authSuccessUrl.replace(authOriginHost, _postNavHost);
+                logger.info(`[browser.act] waitForAuth: updated authSuccessUrl to ${authSuccessUrl} for session=${sessionId}`);
+              }
+            }
+          }
+        } catch (_) {}
+      }
+
       // ── Step 1b: Agentic auth form loop ──────────────────────────────────
       // snapshot → LLM → execute → snapshot → LLM → repeat.
       // All page-transition waits are event-driven (URL change / element visibility)
@@ -3783,6 +3812,8 @@ If no videos found, return []. Do not explain, only output the JSON array.`;
         let _loopFilledPassword = false;
         const _actionHistory   = []; // actions completed this session
         let _stallCount        = 0;  // consecutive click_submit stalls
+        let _consecutiveInvisibleFailures = 0; // circuit breaker: too many invisible-input steps
+        let _doneWithoutAction = false; // circuit breaker: LLM said done but no creds filled
 
         // ── Helper: extract URL value from playwright-cli eval stdout
         const _parseUrl = (stdout) => {
@@ -3860,6 +3891,13 @@ If no videos found, return []. Do not explain, only output the JSON array.`;
           return (m ? m[1].trim().replace(/^"|"$/g, '') : raw) || 'unknown';
         };
 
+        // Capture initial URL for done-without-action circuit breaker
+        let _initialAuthUrl = '';
+        try {
+          const _initProbe = await cliRun([...S, 'eval', 'location.href'], 5000).catch(() => ({}));
+          _initialAuthUrl = _parseUrl(_initProbe.stdout) || '';
+        } catch (_) {}
+
         for (let _step = 0; _step < 8; _step++) {
           // 1. Inline text settle — waits for DOM text to stop changing
           await _textSettle();
@@ -3915,9 +3953,15 @@ If no videos found, return []. Do not explain, only output the JSON array.`;
             // Poll until email input is truly visible before clicking
             const _visSel = await _waitVisible('email', _sel || 'input[type="email"]');
             if (!_visSel) {
-              logger.warn(`[browser.act] waitForAuth: auth-loop step ${_step + 1} fill_email — email input not visible after 15s, re-snapshotting`);
+              _consecutiveInvisibleFailures++;
+              logger.warn(`[browser.act] waitForAuth: auth-loop step ${_step + 1} fill_email — email input not visible after 15s, re-snapshotting (invisible failures=${_consecutiveInvisibleFailures})`);
+              if (_consecutiveInvisibleFailures >= 3) {
+                logger.warn(`[browser.act] waitForAuth: auth-loop circuit breaker — 3 consecutive invisible-input failures, page is not a login form, stopping`);
+                break;
+              }
               continue;
             }
+            _consecutiveInvisibleFailures = 0;
             await cliRun([...S, 'click', _visSel], 5000).catch(() => {});
             await new Promise(r => setTimeout(r, 150));
             await cliRun([...S, 'press', 'Meta+a'], 3000).catch(() => {});
@@ -3932,9 +3976,15 @@ If no videos found, return []. Do not explain, only output the JSON array.`;
             // element (e.g. "#password"), not the generic css which would hit the hidden copy.
             const _visSel = await _waitVisible('password', _sel || 'input[type="password"]');
             if (!_visSel) {
-              logger.warn(`[browser.act] waitForAuth: auth-loop step ${_step + 1} fill_password — password input not visible after 15s, re-snapshotting`);
+              _consecutiveInvisibleFailures++;
+              logger.warn(`[browser.act] waitForAuth: auth-loop step ${_step + 1} fill_password — password input not visible after 15s, re-snapshotting (invisible failures=${_consecutiveInvisibleFailures})`);
+              if (_consecutiveInvisibleFailures >= 3) {
+                logger.warn(`[browser.act] waitForAuth: auth-loop circuit breaker — 3 consecutive invisible-input failures, page is not a login form, stopping`);
+                break;
+              }
               continue;
             }
+            _consecutiveInvisibleFailures = 0;
             await cliRun([...S, 'click', _visSel], 5000).catch(() => {});
             await new Promise(r => setTimeout(r, 150));
             await cliRun([...S, 'press', 'Meta+a'], 3000).catch(() => {});
@@ -3998,12 +4048,34 @@ If no videos found, return []. Do not explain, only output the JSON array.`;
 
           } else if (_dec.action === 'done') {
             logger.info(`[browser.act] waitForAuth: auth-loop done after ${_step + 1} step(s) for session=${sessionId}`);
+            if (!_loopFilledEmail && !_loopFilledPassword) {
+              _doneWithoutAction = true;
+            }
             break;
 
           } else {
             logger.warn(`[browser.act] waitForAuth: auth-loop step ${_step + 1} — action "${_dec.action}" skipped/unexpected, stopping`);
             break;
           }
+        }
+
+        // ── Done-without-action circuit breaker ─────────────────────────────
+        // If the LLM said "done" but no credentials were filled AND the URL hasn't
+        // changed from the initial URL, the page is likely already authenticated
+        // (the auth gate just couldn't prove it via pattern matching) or isn't a
+        // login form at all. Skip the OAuth fallback and the long poll loop —
+        // return a soft success so the caller can proceed to the task.
+        if (_doneWithoutAction) {
+          let _currentUrl = '';
+          try {
+            const _curProbe = await cliRun([...S, 'eval', 'location.href'], 5000).catch(() => ({}));
+            _currentUrl = _parseUrl(_curProbe.stdout) || '';
+          } catch (_) {}
+          if (_currentUrl === _initialAuthUrl) {
+            logger.info(`[browser.act] waitForAuth: done-without-action circuit breaker — URL unchanged (${_currentUrl}), no creds filled, skipping OAuth fallback and poll loop for session=${sessionId}`);
+            return { ok: true, action, sessionId, authResolved: true, authCircuitBreaker: true, executionTime: Date.now() - start };
+          }
+          logger.info(`[browser.act] waitForAuth: done-without-action but URL changed (${_initialAuthUrl} → ${_currentUrl}), proceeding to OAuth fallback for session=${sessionId}`);
         }
 
         // ── OAuth / SSO button fallback ────────────────────────────────────

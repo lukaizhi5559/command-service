@@ -609,6 +609,20 @@ function buildTurnPrompt(task, history) {
   return `## Task\n${task}\n\n## Turn History\n${histLines}\n\n## Next Action\nOutput a single JSON action object.`;
 }
 
+// Summarizes stderr for the LLM observation. Head-only truncation drops the
+// concrete error for argparse-style CLIs (Python/Go) which print the actual
+// "error: unrecognized arguments: --foo" line at the END, after a long usage
+// block. Always surface the last few error-bearing lines alongside the head.
+function summarizeStderr(stderr, headChars = 400) {
+  const s = stderr || '';
+  const head = s.slice(0, headChars);
+  const errLines = s.split('\n')
+    .filter(l => /\berror\b|invalid|unrecognized|unexpected|not recognized|missing required/i.test(l))
+    .slice(-3)
+    .join('\n');
+  return errLines && !head.includes(errLines) ? `${head}\n[KEY ERROR LINES]:\n${errLines}` : head;
+}
+
 const CLI_AGENTIC_LOOP_PROMPT = `You are an expert CLI automation agent executing a user task step-by-step.
 You have access to a CLI tool described in the Agent Descriptor below. The descriptor is the ONLY source of truth for what commands exist — do NOT invent or guess commands from training knowledge.
 Each turn you output exactly ONE JSON action object from this palette:
@@ -999,6 +1013,10 @@ async function actionRun({ cli, argv = [], cwd, env, timeoutMs, stdin, agentId, 
     const transcript = [];
     let currentBinPath = binPath;
     let loopMeta = null; // lazy-loaded on first run_update
+    // Loop guard: track exact failing argv signatures + total failed run_cmd turns
+    // so the LLM doesn't burn all turns re-running near-identical failing commands.
+    const failedArgvSigs = new Map(); // JSON.stringify(argv) → fail count
+    let totalFailedRunCmds = 0;
 
     // ── Resume context injection ──────────────────────────────────────────────
     // When main.js resumes after an ask_user pause, it appends a [Resume context:]
@@ -1374,9 +1392,9 @@ async function actionRun({ cli, argv = [], cwd, env, timeoutMs, stdin, agentId, 
               const helpLabel = subcmdPath.join(' ');
               const helpR = await spawnCapture(currentBinPath, [...subcmdPath, '--help'], { timeoutMs: 4000 });
               const helpText = (helpR.stdout || helpR.stderr || '').slice(0, RUN_HELP_CHARS);
-              observation = `exitCode=${cmdResult.exitCode} stderr="${(cmdResult.stderr || '').slice(0, 400)}"\n[authoritative help for "${helpLabel}" — use only this syntax on the next command]:\n${helpText}`;
+              observation = `exitCode=${cmdResult.exitCode} stderr="${summarizeStderr(cmdResult.stderr, 400)}"\n[authoritative help for "${helpLabel}" — use only this syntax on the next command]:\n${helpText}`;
             } else {
-              observation = `exitCode=${cmdResult.exitCode} stdout="${cmdResult.stdout.slice(0, 300)}" stderr="${(cmdResult.stderr || '').slice(0, 400)}"`;
+              observation = `exitCode=${cmdResult.exitCode} stdout="${cmdResult.stdout.slice(0, 300)}" stderr="${summarizeStderr(cmdResult.stderr, 400)}"`;
             }
           } else {
             // Extract WARNING: lines and surface them as top-priority actionable hints.
@@ -1389,8 +1407,21 @@ async function actionRun({ cli, argv = [], cwd, env, timeoutMs, stdin, agentId, 
             if (_warningLines) {
               observation = `exitCode=${cmdResult.exitCode}\n[ACTIONABLE WARNINGS — act on these]:\n${_warningLines.slice(0, 400)}\nstdout="${cmdResult.stdout.slice(0, 150)}"`;
             } else {
-              observation = `exitCode=${cmdResult.exitCode} stdout="${cmdResult.stdout.slice(0, 300)}" stderr="${(cmdResult.stderr || '').slice(0, 200)}"`;
+              observation = `exitCode=${cmdResult.exitCode} stdout="${cmdResult.stdout.slice(0, 300)}" stderr="${summarizeStderr(cmdResult.stderr, 200)}"`;
             }
+          }
+          // ── Loop guard ────────────────────────────────────────────────────
+          // Detect exact-argv repeat failures and excessive total failures so
+          // the LLM changes approach or asks the user instead of burning turns.
+          totalFailedRunCmds++;
+          const _argvSig = JSON.stringify(action.argv || []);
+          const _sigFails = (failedArgvSigs.get(_argvSig) || 0) + 1;
+          failedArgvSigs.set(_argvSig, _sigFails);
+          // Prepend (not append) so guards survive the OBSERVATION_CHARS head-truncation.
+          if (totalFailedRunCmds >= 6) {
+            observation = `[LOOP GUARD] ${totalFailedRunCmds} commands have failed in this session. STOP guessing. Your next action MUST be ask_user — summarize the last error and ask the user how to proceed.\n${observation}`;
+          } else if (_sigFails >= 2) {
+            observation = `[LOOP GUARD] You have run this EXACT command ${_sigFails} times and it failed the same way each time. Do NOT run it again. Fix the specific flag/value named in the error below, or call ask_user to ask the user for guidance.\n${observation}`;
           }
         }
 

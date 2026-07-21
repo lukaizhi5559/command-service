@@ -962,7 +962,7 @@ class CommandServiceMCPServer {
         req.on('data', chunk => { body += chunk; });
         req.on('end', async () => {
           try {
-            const { id, status, descriptor, failureLog } = JSON.parse(body || '{}');
+            const { id, status, descriptor, failureLog, authed_at, auth_expires_at } = JSON.parse(body || '{}');
             if (!id) { res.writeHead(400); res.end(JSON.stringify({ ok: false, error: 'id required' })); return; }
             const { withDb } = require('@thinkdrop/agents-db');
             await withDb(async (db) => {
@@ -972,6 +972,10 @@ class CommandServiceMCPServer {
               if (status !== undefined) {
                 const fl = failureLog !== undefined ? failureLog : null;
                 await db.run('UPDATE agents SET status = ?, failure_log = ?, last_validated = CURRENT_TIMESTAMP WHERE id = ?', status, fl, id);
+              }
+              if (authed_at !== undefined) {
+                const expires = auth_expires_at || null;
+                await db.run('UPDATE agents SET authed_at = ?, auth_expires_at = ? WHERE id = ?', authed_at, expires, id);
               }
             });
             res.writeHead(200);

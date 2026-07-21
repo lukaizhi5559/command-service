@@ -129,6 +129,53 @@ const _INIT_SCRIPT = `(function() {
     };
     return _origXhrSend.apply(this, arguments);
   };
+  // ── Network mutation observer ────────────────────────────────────────────
+  // Records mutation requests (POST/PUT/PATCH/DELETE) with status codes into
+  // window.__tdNetLog for the goal-achievement judge to use as ground truth.
+  // Telemetry/analytics URLs are filtered out.
+  if (!window.__tdNetLog) window.__tdNetLog = [];
+  var _telRe = /analytics|telemetry|beacon|metrics|sentry|collect|jot|log_event|track|amplitude|datadog|newrelic|rum|perf/i;
+  function _tdLogMut(method, url, status) {
+    try {
+      if (!method || !url) return;
+      if (!/^(POST|PUT|PATCH|DELETE)$/i.test(method)) return;
+      if (_telRe.test(url)) return;
+      window.__tdNetLog.push({ method: method.toUpperCase(), url: url, status: status, ts: Date.now() });
+      if (window.__tdNetLog.length > 50) window.__tdNetLog.shift();
+    } catch(e) {}
+  }
+
+  // Wrap fetch (which may already be ad-block-wrapped)
+  var _obsFetch = window.fetch;
+  window.fetch = function() {
+    var args = arguments;
+    var url = (typeof args[0] === 'string' ? args[0] : (args[0] && args[0].url)) || '';
+    var method = (args[1] && args[1].method) || (typeof args[0] === 'object' && args[0] && args[0].method) || 'GET';
+    return _obsFetch.apply(this, args).then(function(res) {
+      _tdLogMut(method, url, res.status);
+      return res;
+    });
+  };
+
+  // Wrap XHR (which may already be ad-block-wrapped)
+  var _obsXhrOpen = XMLHttpRequest.prototype.open;
+  XMLHttpRequest.prototype.open = function(method, url) {
+    this._tdObsMethod = method;
+    this._tdObsUrl = url;
+    return _obsXhrOpen.apply(this, arguments);
+  };
+  var _obsXhrSend = XMLHttpRequest.prototype.send;
+  XMLHttpRequest.prototype.send = function() {
+    var self = this;
+    var _prevReady = this.onreadystatechange;
+    this.onreadystatechange = function() {
+      if (self.readyState === 4) {
+        _tdLogMut(self._tdObsMethod, self._tdObsUrl, self.status);
+      }
+      if (_prevReady) _prevReady.apply(self, arguments);
+    };
+    return _obsXhrSend.apply(this, arguments);
+  };
 })();`;
 
 /**

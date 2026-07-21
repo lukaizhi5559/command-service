@@ -315,7 +315,7 @@ const KNOWN_BROWSER_SERVICES = {
   airtable:       { startUrl: 'https://airtable.com',                            signInUrl: 'https://airtable.com/login',                        authSuccessPattern: 'airtable.com/',                isOAuth: true  },
   hubspot:        { startUrl: 'https://app.hubspot.com',                         signInUrl: 'https://app.hubspot.com/login',                     authSuccessPattern: 'app.hubspot.com/',             isOAuth: true  },
   salesforce:     { startUrl: 'https://login.salesforce.com',                    signInUrl: 'https://login.salesforce.com',                      authSuccessPattern: 'lightning.force.com',          isOAuth: true  },
-  twitter:        { startUrl: 'https://twitter.com',                             signInUrl: 'https://twitter.com/i/flow/login',                  authSuccessPattern: 'twitter.com/home',             isOAuth: true  },
+  twitter:        { startUrl: 'https://twitter.com',                             signInUrl: 'https://twitter.com/i/flow/login',                  authSuccessPattern: 'twitter.com/home',             isOAuth: true, hostAliases: ['x.com'] },
   facebook:       { startUrl: 'https://www.facebook.com',                        signInUrl: 'https://www.facebook.com/login',                    authSuccessPattern: 'facebook.com/',                isOAuth: true  },
   instagram:      { startUrl: 'https://www.instagram.com',                       signInUrl: 'https://www.instagram.com/accounts/login',          authSuccessPattern: 'instagram.com/',               isOAuth: true  },
   linkedin:       { startUrl: 'https://www.linkedin.com',                        signInUrl: 'https://www.linkedin.com/login',                    authSuccessPattern: 'linkedin.com/feed',            isOAuth: true  },
@@ -625,6 +625,40 @@ function isHostAlias(currentHost, expectedHost, aliases) {
     }
   }
   return false;
+}
+
+// ---------------------------------------------------------------------------
+// Auth-success pattern matching — alias-aware URL comparison.
+// Parses each pattern as a URL; if it parses, compares hostname via isHostAlias
+// and checks the path component as a substring. Falls back to literal substring
+// for non-URL patterns (backward compatible).
+// ---------------------------------------------------------------------------
+function _authPatternMatches(href, pattern, hostAliases) {
+  if (!href || !pattern) return false;
+  const hrefLower = href.toLowerCase();
+
+  // Try to parse both as URLs for hostname-aware comparison
+  let hrefUrl, patternUrl;
+  try { hrefUrl = new URL(href); } catch (_) { hrefUrl = null; }
+  try { patternUrl = new URL(pattern.includes('://') ? pattern : `https://${pattern}`); } catch (_) { patternUrl = null; }
+
+  if (hrefUrl && patternUrl) {
+    const hrefHost = hrefUrl.hostname.replace(/^www\./, '');
+    const patternHost = patternUrl.hostname.replace(/^www\./, '');
+    if (isHostAlias(hrefHost, patternHost, hostAliases)) {
+      // Host matches (or is an alias) — check path component as substring
+      const patternPath = patternUrl.pathname || '/';
+      const hrefPath = hrefUrl.pathname || '/';
+      if (patternPath === '/' || hrefPath.includes(patternPath)) return true;
+      // Also check the raw pattern string against the full href for cases like
+      // "twitter.com/home" where the path is /home but pattern has no scheme
+      if (hrefLower.includes(pattern)) return true;
+    }
+    return false;
+  }
+
+  // Fallback: literal substring (backward compatible for non-URL patterns)
+  return hrefLower.includes(pattern);
 }
 
 // ---------------------------------------------------------------------------
@@ -3196,6 +3230,13 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
   // if/else branch that populates it.
   let _domainContinuitySkip = false;
 
+  // URL-first navigation flags: set in the playwright auth path, read later
+  // during deep-link discovery and playwright.agent delegation. Declared at
+  // function scope so they are visible outside the if/else branch that populates them.
+  let _urlFirstNavigationSelected = false;
+  let _deepLinkSource = null;
+  let _urlFirstProbeUsed = false;
+
   const _fs = require('fs');
 
   // ── AGENT THINKING PHASE ─────────────────────────────────────────────────
@@ -3777,6 +3818,25 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
         _skipNavigate = true;
       }
 
+      // ── URL-first: resolve caller-provided URL before auth probe ──────────
+      // When planSkills injects a deep-link URL (e.g. https://x.com/compose/post),
+      // navigate to the TASK URL for the auth probe instead of the service homepage.
+      // If the task URL loads without a login wall, the user is authenticated —
+      // skip waitForAuth entirely. This is the general override mechanism that
+      // prevents descriptor auth_success_pattern mismatches from blocking tasks.
+      if (url && !_skipNavigate && !_authOnly && !_silentPreflightProbe) {
+        try {
+          const _callerUrl = new URL(url, startUrl).href;
+          logger.info(`[browser.agent] run: URL-first auth probe — using caller URL ${_callerUrl} instead of ${startUrl} for ${agentId}`);
+          startUrl = _callerUrl;
+          _urlFirstNavigationSelected = true;
+          _deepLinkSource = 'caller';
+          _urlFirstProbeUsed = true;
+        } catch (_) {
+          logger.warn(`[browser.agent] run: caller-provided url "${url}" is invalid for auth probe — falling back to ${startUrl}`);
+        }
+      }
+
       if (!_skipNavigate) try {
         logger.info(`[browser.agent] run: playwright auth-check — navigating to ${startUrl} for ${agentId}`);
         const _probeNav = await callBrowserAct({ action: 'navigate', sessionId, url: startUrl, timeoutMs: 30000, headed: _silentPreflightProbe ? false : undefined }, 35000);
@@ -3826,9 +3886,8 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
           // the base domain is the same.
           let _authSuccessMismatch = false;
           if (authSuccessPattern && _curHref) {
-            const _curHrefLower = _curHref.toLowerCase();
             const _patterns = authSuccessPattern.split(/[,|]/).map(p => p.trim().toLowerCase()).filter(Boolean);
-            _authSuccessMismatch = !_patterns.some(p => _curHrefLower.includes(p));
+            _authSuccessMismatch = !_patterns.some(p => _authPatternMatches(_curHref, p, hostAliases));
             if (_authSuccessMismatch) {
               logger.info(`[browser.agent] run: auth-check: auth_success_pattern mismatch for ${agentId} (expected ${authSuccessPattern}, got ${_curHref})`);
             }
@@ -4013,12 +4072,17 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
               logger.info(`[browser.agent] self-heal: no better URL found for domain mismatch — falling back to waitForAuth`);
               _authNeeded = true;
             }
-          } else if (_onLoginPage || _wrongDomain || _authSuccessMismatch || _pageMetaLoginWall) {
+          } else if (_onLoginPage || _wrongDomain || _pageMetaLoginWall) {
             const _reason = _onLoginPage ? 'login redirect'
               : _wrongDomain ? `domain mismatch (expected ${(() => { try { return new URL(startUrl).hostname; } catch(_){return startUrl;} })()}, got ${_curHost || _curHref})`
-              : _authSuccessMismatch ? `auth_success_pattern mismatch (expected ${authSuccessPattern}, got ${_curHref})`
               : 'metadata login wall';
             logger.info(`[browser.agent] run: auth-check: ${_reason} — calling waitForAuth for ${agentId}`);
+            _authNeeded = true;
+          } else if (_authSuccessMismatch && _urlFirstProbeUsed && !_pageInfo.hasSignInButton) {
+            logger.info(`[browser.agent] run: auth-check: URL-first probe clean — ignoring auth_success_pattern mismatch (expected ${authSuccessPattern}, got ${_curHref}) for ${agentId}`);
+            _setCachedAuthCheck(agentId, false);
+          } else if (_authSuccessMismatch) {
+            logger.info(`[browser.agent] run: auth-check: auth_success_pattern mismatch (expected ${authSuccessPattern}, got ${_curHref}) — calling waitForAuth for ${agentId}`);
             _authNeeded = true;
           } else if (_pageMetaAuthed) {
             logger.info(`[browser.agent] run: auth-check: metadata indicates authenticated app — skipping waitForAuth for ${agentId}`);
@@ -4117,9 +4181,9 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
           postAuthUrl,
           credentials: _credentials,
           noAutofill: _manualLogin,
-          timeoutMs: 2 * 60 * 1000,
+          timeoutMs: _urlFirstProbeUsed ? 30 * 1000 : 2 * 60 * 1000,
           _progressCallbackUrl,
-        }, 3 * 60 * 1000);
+        }, _urlFirstProbeUsed ? 60 * 1000 : 3 * 60 * 1000);
       } catch (err) {
         const failureNote = `[${new Date().toISOString()}] waitForAuth threw: ${err.message} | url=${startUrl} | task=${task}`;
         logger.warn(`[browser.agent] run: waitForAuth threw for ${agentId}`);
@@ -4204,21 +4268,23 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
   }
 
   const _allowAutoGeneratedRecipes = process.env.THINKDROP_ALLOW_AUTOGENERATED_RECIPES === 'true';
-  let _urlFirstNavigationSelected = false;
-  let _deepLinkSource = null;
 
-  // ── Caller-provided direct URL takes priority (e.g. from planSkillsV2) ───────
-  if (url) {
-    try {
-      const _callerUrl = new URL(url, startUrl).href;
-      logger.info(`[browser.agent] run: using caller-provided url ${_callerUrl} for ${agentId}`);
-      startUrl = _callerUrl;
-      _urlFirstNavigationSelected = true;
-      _deepLinkSource = 'caller';
-    } catch (_) {
-      logger.warn(`[browser.agent] run: caller-provided url "${url}" is invalid — ignoring`);
-    }
-  } else {
+  // ── Caller-provided URL already resolved during auth probe (URL-first) ──────
+  // If _urlFirstNavigationSelected was set during the auth probe, skip the
+  // redundant caller URL / deep-link resolution here. Only run deep-link
+  // discovery when no caller URL was provided.
+  if (!_urlFirstNavigationSelected) {
+    if (url) {
+      try {
+        const _callerUrl = new URL(url, startUrl).href;
+        logger.info(`[browser.agent] run: using caller-provided url ${_callerUrl} for ${agentId} (post-auth path)`);
+        startUrl = _callerUrl;
+        _urlFirstNavigationSelected = true;
+        _deepLinkSource = 'caller';
+      } catch (_) {
+        logger.warn(`[browser.agent] run: caller-provided url "${url}" is invalid — ignoring`);
+      }
+    } else {
     // ── Task-specific deep-link resolution ─────────────────────────────────────
     const _deepLinkResult = await _resolveTaskDeepLink(agentId, _svcKey, startUrl, task, null, sessionId);
     const _deepLink = _deepLinkResult?.url || (typeof _deepLinkResult === 'string' ? _deepLinkResult : null);
@@ -4245,6 +4311,7 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
         };
       }
     }
+  }
   }
 
   // Phase 5: Recipe replay and URL-first navigation are no longer mutually exclusive.
