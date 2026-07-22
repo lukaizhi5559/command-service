@@ -2234,6 +2234,15 @@ async function browserAct(args) {
         logger.info(`[browser.act] click: synthetic ref "${finalRef}" (matched label="${finalLabel}") — using eval-click fallback for "${selector}"`);
       }
       if (!ref) {
+        // CSS selector path: try playwright-cli native click first.
+        // Playwright supports: button:has-text("Post"), [aria-label="Save"], #id, etc.
+        // resolveRefForClick already returns null for CSS selectors — this is the intended path.
+        if (/[[\]#.>:()"'=~^$*|]/.test(selector.trim())) {
+          logger.info(`[browser.act] click: trying native playwright selector "${selector}"`);
+          const nativeRes = await run(['click', selector], `click ${selector}`);
+          if (nativeRes.ok) return nativeRes;
+          logger.warn(`[browser.act] click: native selector "${selector}" failed — falling back to eval-click`);
+        }
         // No real eN ref — use eval fallback.
         // IMPORTANT: if resolveRefForClick already found a matched label (e.g. "Lemans" for selector "LeMans"),
         // use that as the first attempt so case/spacing differences don't cause miss.
@@ -2281,10 +2290,13 @@ async function browserAct(args) {
         const evalRaw = (evalRes.stdout || '').trim();
         // playwright-cli echoes back the script source in "### Ran Playwright code" block
         // so we must extract ONLY the ### Result section to avoid false-positive 'not-found' match
-        const resultMatch = evalRaw.match(/###\s*Result\s*\n([\s\S]*)(?=###\s*Ran Playwright|$)/i);
-        const evalResult = resultMatch ? resultMatch[1].trim().replace(/^["']|["']$/g, '') : evalRaw;
-        // 'clicked:form' and 'clicked:form-submit' were from the old fallback — treat as failure.
-        const clickSucceeded = (evalResult.startsWith('clicked:') || evalResult.includes('clicked:')) &&
+        // playwright-cli output format: <result>\n### Ran Playwright code\n...
+        // No "### Result" header exists — extract everything BEFORE the first ### header.
+        const resultMatch = evalRaw.match(/^([\s\S]*?)(?=###\s|$)/i);
+        const evalResult = resultMatch ? resultMatch[1].trim().replace(/^["']|["']$/g, '') : evalRaw.trim();
+        // Use startsWith only — the actual result is always "clicked:<text>" or "not-found".
+        // includes() would match the script source in the output (e.g. return 'clicked:' + t;).
+        const clickSucceeded = evalResult.startsWith('clicked:') &&
           evalResult !== 'clicked:form' && evalResult !== 'clicked:form-submit';
         if (!clickSucceeded) {
           logger.warn(`[browser.act] eval-click: element not found for "${selector}" — result: ${evalResult.slice(0, 80)}`);
@@ -3260,12 +3272,10 @@ If no videos found, return []. Do not explain, only output the JSON array.`;
       // playwright-cli treating multi-statement code as a syntax error.
       const evalExpr = '(function(){var b=document.body;return b?(b.innerText||b.textContent||"").slice(0,100000):"";})()';
       const res = await cliRun([...S, 'eval', evalExpr], Math.min(timeoutMs, 20000));
-      // playwright-cli eval wraps output as: ### Result\n"<value>"\n### Ran Playwright code...
-      // Extract just the bare value from the ### Result block
+      // playwright-cli output format: <result>\n### Ran Playwright code\n...
+      // No "### Result" header — extract everything BEFORE the first ### header.
       const rawOut = (res.stdout || '').trim();
-      // Use greedy match to capture everything until the LAST ### marker
-      // The ### marker appears at the end as "### Ran Playwright code..."
-      const resultMatch = rawOut.match(/###\s*Result\s*\n([\s\S]*)(?=###\s*Ran Playwright|$)/i);
+      const resultMatch = rawOut.match(/^([\s\S]*?)(?=###\s|$)/i);
       let pageText;
       if (resultMatch) {
         pageText = resultMatch[1].trim();
@@ -3344,9 +3354,10 @@ If no videos found, return []. Do not explain, only output the JSON array.`;
       const evalRes = await run(evalArgs, `eval "${expr.slice(0, 60)}"`);
       if (!evalRes.ok) return evalRes;
       
-      // Extract value from markdown wrapper: ### Result\n"value"\n### Ran...
+      // Extract value: playwright-cli output format is <result>\n### Ran Playwright code\n...
+      // No "### Result" header — extract everything BEFORE the first ### header.
       const stdout = evalRes.stdout || '';
-      const match = stdout.match(/###\s*Result\s*\n([\s\S]*?)(?=###|$)/i);
+      const match = stdout.match(/^([\s\S]*?)(?=###\s|$)/i);
       const rawResult = match ? match[1].trim().replace(/^["']|["']$/g, '') : stdout.trim();
       // Auto-parse JSON so IIFEs returning objects come back as objects (not strings).
       // Skills like ad-handler use result.result expecting an object — without this they
@@ -3384,9 +3395,10 @@ If no videos found, return []. Do not explain, only output the JSON array.`;
       }
       const rcRes = await cliRun([...S, 'run-code', '--', code], timeoutMs);
       logger.info(`[browser.act] run-code → exit ${rcRes.exitCode}`, { stderr: rcRes.stderr?.slice(0, 200) });
-      // Extract the result value from "### Result\n<value>" in stdout
+      // Extract the result value: playwright-cli output format is <result>\n### Ran Playwright code\n...
+      // No "### Result" header — extract everything BEFORE the first ### header.
       const rcStdout = rcRes.stdout || '';
-      const rcMatch = rcStdout.match(/###\s*Result\s*\n([\s\S]*?)(?=###|$)/i);
+      const rcMatch = rcStdout.match(/^([\s\S]*?)(?=###\s|$)/i);
       const rcResult = rcMatch ? rcMatch[1].trim().replace(/^"|"$/g, '') : rcStdout.trim();
       const PLAYWRIGHT_HARD_ERR = /^### Error/im;
       if (!rcRes.ok || PLAYWRIGHT_HARD_ERR.test(rcStdout)) {
@@ -3599,10 +3611,10 @@ If no videos found, return []. Do not explain, only output the JSON array.`;
 
           // Use lighter eval for non-Gmail pages to reduce timeout risk
           const r = await cliRun([...S, 'eval', 'document.body.innerText.slice(0,25000)'], 6000);
-          // playwright-cli eval wraps output as: ### Result\n"<value>"\n### Ran Playwright code...
-          // Extract just the bare innerText value
+          // playwright-cli output format: <result>\n### Ran Playwright code\n...
+          // No "### Result" header — extract everything BEFORE the first ### header.
           const rawOut = (r.stdout || '').trim();
-          const resultMatch = rawOut.match(/###\s*Result\s*\n([\s\S]*)(?=###\s*Ran Playwright|$)/i);
+          const resultMatch = rawOut.match(/^([\s\S]*?)(?=###\s|$)/i);
           const cur = resultMatch
             ? resultMatch[1].trim().replace(/^"|"$/g, '')
             : rawOut;
@@ -4747,12 +4759,12 @@ If no videos found, return []. Do not explain, only output the JSON array.`;
         snap = snapshotCache.get(_tabKey(sessionId)) || '';
       }
 
-      // playwright-cli eval returns markdown-wrapped output: "### Result\n\"value\"\n### Ran..."
-      // Strip everything except the quoted value on the second line
+      // playwright-cli output format: <result>\n### Ran Playwright code\n...
+      // Extract the value BEFORE the first ### header.
       function extractEvalValue(raw) {
-        const stripped = (raw || '').replace(/###[^\n]*\n?/g, '').replace(/```[^`]*```/g, '').trim();
-        // Remove surrounding quotes if present
-        return stripped.replace(/^["']|["']$/g, '').trim();
+        const m = (raw || '').match(/^([\s\S]*?)(?=###\s|$)/i);
+        const val = m ? m[1].trim() : (raw || '').trim();
+        return val.replace(/^["']|["']$/g, '').trim();
       }
 
       const urlRes = await cliRun([...S, 'eval', 'location.href'], 3000);

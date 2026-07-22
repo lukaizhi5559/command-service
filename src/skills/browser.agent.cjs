@@ -2478,12 +2478,12 @@ async function diagnoseAndPatchRecipe({ agentId, recipeName, recipe, failureReas
 
       const probeRes = await callBrowserAct({ action: 'evaluate', text: probeCode, sessionId }).catch(() => null);
       if (probeRes) {
-        // browser.act wraps eval output in "### Result\n<value>" markdown.
-        // For complex JSON strings the outer-quote strip in the evaluate handler
-        // can mangle content — extract directly from stdout as the reliable path.
+        // browser.act evaluate already extracts the result, but for complex JSON strings
+        // the outer-quote strip can mangle content — extract directly from stdout as the reliable path.
+        // playwright-cli output format: <result>\n### Ran Playwright code\n...
         let raw = '';
         if (probeRes.stdout) {
-          const _m = probeRes.stdout.match(/###\s*Result\s*\n([\s\S]*?)(?=###|$)/i);
+          const _m = probeRes.stdout.match(/^([\s\S]*?)(?=###\s|$)/i);
           raw = _m ? _m[1].trim() : probeRes.stdout.trim();
           if (raw.startsWith('"') && raw.endsWith('"')) raw = raw.slice(1, -1).replace(/\\"/g, '"');
         } else {

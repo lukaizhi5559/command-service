@@ -832,7 +832,7 @@ function _startTabWatcher(session) {
       const tabListResult = await browserAct({ action: 'tab-list', sessionId, headed: true, timeoutMs: 5000 });
       const tabListOutput = tabListResult.result || tabListResult.stdout || '';
 
-      const resultSectionMatch = tabListOutput.match(/### Result\n([\s\S]*?)(?:### |\n### |$)/);
+      const resultSectionMatch = tabListOutput.match(/^([\s\S]*?)(?=###\s|$)/i);
       const resultSection = resultSectionMatch ? resultSectionMatch[1] : tabListOutput;
       const tabMatches = [...resultSection.matchAll(/^\s*-\s+(\d+):\s+(?:\(current\)\s+)?\[([^\]]+)\]\(([^)]+)\)/gm)];
       const tabs = tabMatches.map(m => ({ index: parseInt(m[1]), title: m[2].trim(), url: m[3].trim() }));
@@ -1231,8 +1231,8 @@ function _startEventPoller(session) {
       // Debug logging to see raw tab-list output
       logger.info(`[trainer.agent] tab-list raw output (${tabListOutput.length} chars): ${JSON.stringify(tabListOutput.substring(0, 300))}`);
 
-      // Parse tab list: only from "### Result" section to avoid duplicates
-      const resultSectionMatch = tabListOutput.match(/### Result\n([\s\S]*?)(?:### |\n### |$)/);
+      // Parse tab list: extract content before first ### header to avoid duplicates
+      const resultSectionMatch = tabListOutput.match(/^([\s\S]*?)(?=###\s|$)/i);
       const resultSection = resultSectionMatch ? resultSectionMatch[1] : tabListOutput;
       const tabMatches = [...resultSection.matchAll(/^\s*-\s+(\d+):\s+(?:\(current\)\s+)?\[([^\]]+)\]\(([^)]+)\)/gm)];
       const tabs = tabMatches.map(m => ({ index: parseInt(m[1]), title: m[2].trim(), url: m[3].trim() }));

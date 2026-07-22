@@ -3513,6 +3513,17 @@ async function playwrightAgent(args) {
         // This prevents a "send without subject?" dialog from being counted as a failure.
         if (_verifyParsed && _verifyParsed.dialog_blocking === true) {
           logger.info(`[playwright.agent] verify: dialog blocking detected — auto-dismissing: "${(_verifyParsed.dialog_text || '').slice(0, 80)}"`);
+          // ── Duplicate-content rejection = proof of prior success ─────────────
+          // "Whoops! You already said that." / "duplicate" dialogs mean the exact
+          // content is ALREADY live — the original mutation succeeded. Treat as
+          // achieved; never modify the user's message and re-post.
+          const _dupDialogRe = /already said that|already posted|duplicate (content|post|tweet|message)|already exists|whoops!?\s*you already/i;
+          if (_mutationClickTs && _dupDialogRe.test(_verifyParsed.dialog_text || '')) {
+            logger.info(`[playwright.agent] verify: duplicate-content rejection detected — content is already live, treating as SUCCESS`);
+            await browserAct({ action: 'dialog-accept', sessionId, headed, timeoutMs: 3000 }).catch(() => {});
+            transcript.push({ step: transcript.length + 1, action: { action: 'verify' }, outcome: { ok: true, result: 'duplicate-content rejection — content already posted (prior mutation succeeded)' }, thoughts: 'duplicate dialog = idempotent success' });
+            break executionLoop; // Task done — the content is already posted
+          }
           await browserAct({ action: 'dialog-accept', sessionId, headed, timeoutMs: 3000 }).catch(() => {});
           // Brief settle then re-snapshot + re-verify (only once, non-fatal if it fails)
           await new Promise(r => setTimeout(r, 800));
@@ -3538,6 +3549,14 @@ async function playwrightAgent(args) {
 
         if (_verifyParsed && _verifyParsed.completed === false && (_verifyParsed.confidence ?? 1) >= 0.75) {
           logger.warn(`[playwright.agent] POST-TASK VERIFY FAILED (confidence=${_verifyParsed.confidence}): ${_verifyParsed.evidence || 'task incomplete'}`);
+
+          // ── Duplicate-content rejection in verify evidence = prior success ──
+          const _dupEvidenceRe = /already said that|already posted|duplicate (content|post|tweet|message)|whoops!?\s*you already/i;
+          if (_mutationClickTs && _dupEvidenceRe.test(_verifyParsed.evidence || '')) {
+            logger.info(`[playwright.agent] verify: duplicate-content rejection in evidence — content is already live, treating as SUCCESS`);
+            transcript.push({ step: transcript.length + 1, action: { action: 'verify' }, outcome: { ok: true, result: 'duplicate-content rejection — content already posted (prior mutation succeeded)' }, thoughts: 'duplicate evidence = idempotent success' });
+            break executionLoop; // Task done — the content is already posted
+          }
 
           // ── URL-based idempotency check ──────────────────────────────────────
           // Before re-planning, check if the current URL indicates the action already
@@ -3709,14 +3728,24 @@ async function playwrightAgent(args) {
         try {
           const _netRes = await browserAct({ action: 'evaluate', text: 'JSON.stringify(window.__tdNetLog || [])', sessionId, headed, timeoutMs: 3000 });
           if (_netRes?.ok && _netRes?.result) {
-            let _rawNetResult = String(_netRes.result);
-            let _netLogStr;
-            try {
-              _netLogStr = JSON.parse(_rawNetResult); // unwrap outer string encoding from evaluate
-            } catch(_) {
-              _netLogStr = _rawNetResult.replace(/^"|"$/g, ''); // fallback: strip quotes
+            let _rawNetResult = typeof _netRes.result === 'string' ? _netRes.result : JSON.stringify(_netRes.result);
+            let _netLog;
+            if (Array.isArray(_netRes.result)) {
+              // browser.act already auto-parsed the JSON — use it directly
+              _netLog = _netRes.result;
+              logger.info(`[playwright.agent] mutation net evidence: parsed via pre-parsed array`);
+            } else {
+              let _netLogStr = _rawNetResult.replace(/^"|"$/g, '');
+              try {
+                _netLog = JSON.parse(_netLogStr || '[]');
+                logger.info(`[playwright.agent] mutation net evidence: parsed directly`);
+              } catch (_) {
+                // playwright-cli prints the string result with escaped quotes:
+                // [{\"method\":\"POST\",...}] — unescape before parsing.
+                _netLog = JSON.parse(_netLogStr.replace(/\\"/g, '"').replace(/\\\\/g, '\\') || '[]');
+                logger.info(`[playwright.agent] mutation net evidence: parsed via unescape fallback`);
+              }
             }
-            const _netLog = JSON.parse(_netLogStr || '[]');
             const _relevant = _netLog.filter(e => e.ts >= _mutationClickTs - 500);
             if (_relevant.length > 0) {
               const _summarized = _relevant.map(e => `${e.method} ${e.url.slice(0, 80)} → ${e.status}`).join('\n');
@@ -3761,6 +3790,7 @@ IMPORTANT RULES:
 - If the action history includes ">sendEmailWithVerification:ok", the email was successfully sent and verified. This is conclusive evidence. The mail inbox is the expected page after a successful send. The absence of a compose window means the email was sent, not that it failed.
 - If EMAIL_SEND_VERIFICATION is provided, it is authoritative proof of completion.
 - MUTATION_NETWORK_EVIDENCE RULE: If MUTATION_NETWORK_EVIDENCE is provided with NetworkStatus=2xx-success, this is strong evidence that a mutation (post/create/submit) succeeded. Combined with the action history showing a fill+submit sequence, set achieved=true unless the page explicitly shows an error message. If NetworkStatus=error-status (4xx/5xx), set achieved=false and canRetry=true. If NetworkStatus=no-clear-status, fall back to page content analysis.
+- SUBMIT_CLICK_FAILED RULE: If the action history shows ANY click step with ok=false that has submit intent (selector/purpose containing post, submit, send, publish, create, save, reply), then MUTATION_NETWORK_EVIDENCE MUST be ignored entirely — 2xx responses may be autosave/draft-save, not the actual submission. In this case, set achieved=false and canRetry=true.
 - For non-mail tasks, focus on the END STATE — does the page content/URL show the goal was accomplished? If the page content does not contain expected text/elements matching the goal, achieved MUST be false.
 - RICH TEXT EDITOR RULE: Google Docs, Notion, Confluence, and similar editors use canvas/custom rendering. Content typed via a prior 'type' or 'fill' action may NOT appear in the DOM snapshot even though it was entered successfully. If the action history includes type:ok or fill:ok with text content matching the goal, and the page is a rich text editor / contenteditable, consider the content as entered even if it doesn't appear in the page snapshot.
 - AUTOSAVE RULE: Transient save/sync indicators ("Saving…", "Syncing…", "Uploading…") are NORMAL autosave states and are NOT evidence of goal non-achievement. A "Saving…" or "Saved" indicator on a document editor means the action was accepted and is being persisted.
@@ -3807,8 +3837,14 @@ Set canRetry:false only if the goal is fundamentally impossible on this page/sit
           // duplicate posts/creates/submits. Surface ask_user instead.
           if (_mutationClickTs && _canRetry && totalRepairs < maxRepairs) {
             const _netStatus = _mutationNetEvidence.match(/NetworkStatus:\s*(\S+)/);
-            const _status = _netStatus ? _netStatus[1] : 'no-clear-status';
-            if (_status === '2xx-success' || _status === 'no-clear-status') {
+            const _status = _netStatus ? _netStatus[1] : 'no-evidence';
+            if (_status === 'error-status') {
+              // Explicit 4xx/5xx — the mutation definitively failed, safe to retry
+              logger.info(`[playwright.agent] Mutation guard: network=${_status} — allowing replan (mutation definitively failed)`);
+            } else {
+              // 2xx-success, no-clear-status, or missing evidence: the mutation may
+              // have succeeded — NEVER blindly re-run fill+submit (duplicate risk).
+              // Surface ask_user instead.
               logger.warn(`[playwright.agent] Mutation guard: _mutationClickTs set + network=${_status} — prohibiting replan to prevent duplicate mutation`);
               _canRetry = false;
             }
@@ -3878,6 +3914,8 @@ Return JSON: { "thoughts": "strategy explanation", "plan": [...steps] }`;
       lastGetPageTextResult = null;
       lastRunCodeResult = null;
       _typedTexts.clear(); // Reset dedup set so re-fills on the new plan are not skipped
+      _mutationClickTs = null; // Reset mutation tracking so the guard doesn't block the retry
+      _hasFillOrType = false;
       replaceSendWithVerification(plan);
       _shouldReplan = false;
       _replanPlan = null;
