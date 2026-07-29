@@ -174,9 +174,10 @@ async function classifyTaskIntent(task) {
   const _scopedShort = _scopedFull.slice(0, 100);
   const _cacheKey = _scopedShort;
 
-  // Return cached result if available
+  // Return cached result if available (handle both old string and new {intent, keywords} formats)
   if (_intentCache.has(_cacheKey)) {
-    return _intentCache.get(_cacheKey);
+    const _cached = _intentCache.get(_cacheKey);
+    return typeof _cached === 'string' ? _cached : _cached.intent;
   }
 
   // Intra-app short-circuit
@@ -187,7 +188,7 @@ async function classifyTaskIntent(task) {
   // ── Primary: LLM classification ───────────────────────────────────────────
   if (_skillLlm && _scopedShort.trim().length > 3) {
     try {
-      const _llmPrompt = `Classify this browser task into exactly one of these categories. Return ONE word only.
+      const _llmPrompt = `Classify this browser task into exactly one of these categories. Return the category followed by a pipe and 3-5 keywords that characterize the task.
 
 Definitions and examples:
 - chat           : converse with an AI assistant. Examples: "ask ChatGPT", "talk to Claude", "start a conversation with Grok"
@@ -209,12 +210,19 @@ Definitions and examples:
 
 Task: ${_scopedShort}
 
-Category:`;
+Format: category|keyword1,keyword2,keyword3,keyword4,keyword5
+Answer:`;
       const _llmRaw = await _skillLlm.ask(_llmPrompt, { temperature: 0.0, responseTimeoutMs: 8000 });
-      const _llmIntent = (_llmRaw || '').trim().toLowerCase().replace(/[^a-z_]/g, '');
+      const _parts = (_llmRaw || '').trim().split('|');
+      const _llmIntent = (_parts[0] || '').trim().toLowerCase().replace(/[^a-z_]/g, '');
+      const _llmKeywords = (_parts[1] || '')
+        .split(/[,;]\s*/)
+        .map(k => k.trim().toLowerCase().replace(/[^a-z0-9\s]/g, ''))
+        .filter(k => k.length > 2)
+        .slice(0, 8);
       if (VALID_INTENTS.has(_llmIntent)) {
-        logger.debug(`[destination-resolver] LLM intent: "${_llmIntent}" for task: "${_scopedShort.slice(0, 60)}"`);
-        _intentCache.set(_cacheKey, _llmIntent);
+        logger.debug(`[destination-resolver] LLM intent: "${_llmIntent}" keywords: [${_llmKeywords.join(', ')}] for task: "${_scopedShort.slice(0, 60)}"`);
+        _intentCache.set(_cacheKey, { intent: _llmIntent, keywords: _llmKeywords });
         return _llmIntent;
       }
       logger.debug(`[destination-resolver] LLM returned non-enum "${_llmRaw?.trim()}" — falling back to regex`);
@@ -227,12 +235,12 @@ Category:`;
   const _text = _scopedFull.toLowerCase();
   for (const { intent, re } of INTENT_PATTERNS) {
     if (re.test(_text)) {
-      _intentCache.set(_cacheKey, intent);
+      _intentCache.set(_cacheKey, { intent, keywords: [] });
       return intent;
     }
   }
 
-  _intentCache.set(_cacheKey, INTENTS.HOME);
+  _intentCache.set(_cacheKey, { intent: INTENTS.HOME, keywords: [] });
   return INTENTS.HOME;
 }
 
@@ -746,14 +754,22 @@ async function suggestTaskUrl(serviceKey, startUrl, intent, task) {
 - task intent: ${intent}
 - task: ${_taskPreview}
 
-What is the single most direct URL to open in a browser to begin this task? Return ONLY the full absolute URL. If you cannot determine a direct URL, return exactly the word none (lowercase). Do not include any explanation, markdown, or trailing punctuation.`;
+What is the single most direct URL to open in a browser to begin this task? Also provide 3-5 keywords that characterize this task type.
+
+Format: URL|keyword1,keyword2,keyword3,keyword4,keyword5
+If you cannot determine a direct URL, return exactly: none
+Do not include any explanation, markdown, or trailing punctuation.`;
 
   try {
     const raw = await _skillLlm.ask(prompt, { temperature: 0.0, responseTimeoutMs: 6000 });
-    let candidate = String(raw || '').trim();
+    const _parts = String(raw || '').trim().split('|');
+    let candidate = _parts[0].replace(/^```[a-zA-Z]*\s*/i, '').replace(/\s*```$/i, '').trim();
+    const _suggestKeywords = (_parts[1] || '')
+      .split(/[,;]\s*/)
+      .map(k => k.trim().toLowerCase().replace(/[^a-z0-9\s]/g, ''))
+      .filter(k => k.length > 2)
+      .slice(0, 8);
 
-    // Strip markdown code fences or leading/trailing noise
-    candidate = candidate.replace(/^```[a-zA-Z]*\s*/i, '').replace(/\s*```$/i, '').trim();
     if (!candidate || candidate.toLowerCase() === 'none') {
       return { ok: false, error: 'LLM returned no URL' };
     }
@@ -775,14 +791,111 @@ What is the single most direct URL to open in a browser to begin this task? Retu
       // Don't reject — return with flag so caller can verify via navigation.
       // Shortcut domains (e.g. notion.new → app.notion.com) redirect to the canonical service.
       logger.info(`[destination-resolver] suggestTaskUrl: off-domain candidate for ${serviceKey}:${intent} → ${resolved} (needsVerification)`);
-      return { ok: true, url: resolved, needsVerification: true };
+      return { ok: true, url: resolved, needsVerification: true, keywords: _suggestKeywords };
     }
 
     logger.info(`[destination-resolver] suggestTaskUrl: ${serviceKey}:${intent} → ${resolved}`);
-    return { ok: true, url: resolved };
+    return { ok: true, url: resolved, keywords: _suggestKeywords };
   } catch (err) {
     logger.warn(`[destination-resolver] suggestTaskUrl failed: ${err.message}`);
     return { ok: false, error: err.message };
+  }
+}
+
+// ── Keyword-indexed deep-link cache ──────────────────────────────────────────
+// Stores multiple URLs per service, indexed by keyword overlap matching.
+// Separate namespace from nav-correction (which is for console→chat redirects).
+
+const DEEPLINK_NS = 'nav-deeplink';
+const KEYWORD_MATCH_THRESHOLD = 0.4;
+
+/**
+ * Retrieve keywords extracted by classifyTaskIntent for a given task.
+ * Returns [] if classifyTaskIntent hasn't been called or no keywords were extracted.
+ */
+function getTaskKeywords(task) {
+  const _scopedShort = _scopeTaskText(task, 100);
+  const _cached = _intentCache.get(_scopedShort);
+  if (_cached && typeof _cached === 'object' && Array.isArray(_cached.keywords)) {
+    return _cached.keywords;
+  }
+  return [];
+}
+
+async function _persistDeepLinkCache(serviceKey, entry) {
+  if (!skillDb) return false;
+  return skillDb.set(DEEPLINK_NS, serviceKey, entry);
+}
+
+/**
+ * Check the keyword-indexed deep-link cache for a matching URL.
+ * Returns { url, source, score } if a match is found, null otherwise.
+ */
+async function getCachedDeepLink(serviceKey, keywords) {
+  if (!skillDb || !keywords || keywords.length === 0) return null;
+  try {
+    const entry = await skillDb.get(DEEPLINK_NS, serviceKey);
+    if (!entry || !Array.isArray(entry.routes)) return null;
+
+    let bestMatch = null;
+    let bestScore = 0;
+
+    for (const route of entry.routes) {
+      const overlap = route.keywords.filter(k => keywords.includes(k));
+      const score = overlap.length / Math.max(route.keywords.length, keywords.length);
+      if (score > bestScore && score >= KEYWORD_MATCH_THRESHOLD) {
+        bestScore = score;
+        bestMatch = route;
+      }
+    }
+
+    if (bestMatch) {
+      bestMatch.hitCount = (bestMatch.hitCount || 0) + 1;
+      bestMatch.updatedAt = Date.now();
+      setImmediate(() => _persistDeepLinkCache(serviceKey, entry));
+      logger.info(`[destination-resolver] Deep-link cache hit: ${serviceKey} → ${bestMatch.url} (score=${bestScore.toFixed(2)})`);
+      return { url: bestMatch.url, source: 'keyword-cache', score: bestScore };
+    }
+
+    logger.debug(`[destination-resolver] Deep-link cache miss: ${serviceKey} (best score=${bestScore.toFixed(2)})`);
+    return null;
+  } catch (err) {
+    logger.warn(`[destination-resolver] getCachedDeepLink error: ${err.message}`);
+    return null;
+  }
+}
+
+/**
+ * Record a discovered deep-link URL with associated keywords for future cache matching.
+ */
+async function recordDeepLinkCache(serviceKey, url, keywords, intent) {
+  if (!skillDb || !keywords || keywords.length === 0) return false;
+  try {
+    let entry = await skillDb.get(DEEPLINK_NS, serviceKey);
+    if (!entry || !Array.isArray(entry.routes)) {
+      entry = { routes: [] };
+    }
+
+    const existing = entry.routes.find(r => r.url === url);
+    if (existing) {
+      existing.keywords = [...new Set([...existing.keywords, ...keywords])];
+      existing.hitCount = (existing.hitCount || 0) + 1;
+      existing.updatedAt = Date.now();
+    } else {
+      entry.routes.push({
+        url,
+        keywords,
+        intent,
+        hitCount: 1,
+        confidence: 0.70,
+        updatedAt: Date.now(),
+      });
+    }
+
+    return await _persistDeepLinkCache(serviceKey, entry);
+  } catch (err) {
+    logger.warn(`[destination-resolver] recordDeepLinkCache error: ${err.message}`);
+    return false;
   }
 }
 
@@ -794,5 +907,8 @@ module.exports = {
   getLearnedCorrection,
   deleteLearnedCorrection,
   suggestTaskUrl,
+  getTaskKeywords,
+  getCachedDeepLink,
+  recordDeepLinkCache,
   INTENTS,
 };

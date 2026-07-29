@@ -5376,6 +5376,26 @@ async function verifyAppFocused({ appName, waitMs = 5000 }) {
         return { focused: true, appName, waited: totalWaited, attempts, fallback: 'ocr-delta', deltaResult };
       }
     }
+
+    // Fallback 3: Browser window is blocking the foreground
+    // Headed Chrome automation windows can stay in front; open -a may not
+    // displace them. Use AppleScript activate, which brings the target app to
+    // the front even when a browser currently owns focus.
+    if (_isBrowserAppName(finalAppName) && !_isBrowserAppName(appName)) {
+      try {
+        const _safeAppName = (appName || '').replace(/"/g, '\\"');
+        execSync(`osascript -e 'tell application "${_safeAppName}" to activate'`, { timeout: 3000 });
+        logger.info(`[app.agent] verifyAppFocused: activated "${appName}" via AppleScript to displace browser`);
+        await _sleep(1500);
+        const after = await _getActiveAppBounds().catch(() => null);
+        if (after && _matches(after.appName, appName)) {
+          logger.info(`[app.agent] verifyAppFocused: SUCCESS via AppleScript - matched "${after.appName}"`);
+          return { focused: true, appName: after.appName, waited: totalWaited, attempts, fallback: 'applescript' };
+        }
+      } catch (err) {
+        logger.debug(`[app.agent] verifyAppFocused: AppleScript activation failed: ${err.message}`);
+      }
+    }
     
     return { focused: false, appName: finalAppName, waited: totalWaited, attempts };
   });

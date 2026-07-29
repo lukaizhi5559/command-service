@@ -257,7 +257,7 @@ function getContentExtractionConfig(hostname) {
 
 const { userAgent } = require('./user.agent.cjs');
 
-const { resolveDestination, recordCorrection, classifyTaskIntent, classifyUrlType, getLearnedCorrection, deleteLearnedCorrection, suggestTaskUrl, INTENTS } = require('../skill-helpers/destination-resolver.cjs');
+const { resolveDestination, recordCorrection, classifyTaskIntent, classifyUrlType, getLearnedCorrection, deleteLearnedCorrection, suggestTaskUrl, getTaskKeywords, getCachedDeepLink, recordDeepLinkCache, INTENTS } = require('../skill-helpers/destination-resolver.cjs');
 const { killExistingChromeForProfile, clearProfileLock, findCli, shortSessionId } = require('./browser.act.cjs');
 
 const BROWSER_ACT_PORT = parseInt(process.env.COMMAND_SERVICE_PORT || '3007', 10);
@@ -702,7 +702,7 @@ FORBIDDEN — OAuth parameters as authSuccessPattern:
 // ---------------------------------------------------------------------------
 // PLAYBOOK_SEED_MAP — battle-tested task playbooks for known services.
 // Keys match the serviceKey (lowercase, alphanumeric only).
-// Values are markdown strings using ONLY real playwright-cli action names.
+// Values are markdown strings using ONLY real action names.
 // Available actions (full vocabulary):
 //   INPUT:       fill (inputs), type (contenteditable), select (dropdowns),
 //                check, uncheck, upload
@@ -735,12 +735,13 @@ const PLAYBOOK_SEED_MAP = {
 Extract up to 15 inbox rows using page.evaluate with Gmail's stable CSS selectors:
 { "action": "run-code", "code": "async page => { return await page.evaluate(() => { const rows=Array.from(document.querySelectorAll('tr.zA')).slice(0,5); if(!rows.length) return 'No emails found'; return rows.map((r,i)=>{ const s=r.querySelector('.yX span,.zF')?.innerText||''; const sub=r.querySelector('.bog,.bqe')?.innerText||''; const snip=r.querySelector('.y2')?.innerText||''; const t=r.querySelector('.xW span')?.innerText||''; return 'Email '+(i+1)+': From='+s+' | Subject='+sub+' | Preview='+snip+' | Time='+t; }).join('\\n'); }); }" }
 
-### Search Emails (search, find, look for, from, subject, filter)
+### Search Emails (search, find, look for, from, subject, filter, count, unread)
+IMPORTANT: Type directly into the main search input at the top of the page. DO NOT click "Show search options" or "Advanced search options" — it opens a dropdown that changes the DOM and breaks subsequent steps.
 1. Click search box: { "action": "click", "selector": "input[aria-label*='Search']" }
 2. Type query: { "action": "type", "text": "<search query>" }
 3. Press Enter: { "action": "press", "key": "Enter" }
 4. Wait for results: { "action": "snapshot" }
-5. Extract results (same selectors as Read Inbox above)`,
+5. Extract results: { "action": "getPageText" }`,
 
   outlook: `### Compose & Send Email (compose, send, email, draft, write, message)
 1. Navigate to compose URL: { "action": "navigate", "url": "https://outlook.live.com/mail/0/deeplink/compose" }
@@ -886,7 +887,7 @@ INSTRUCTION: Use video.agent to find and watch tutorial videos, extracting actio
 // PLAYBOOK_BUILD_PROMPT — LLM prompt for generating playbooks for unknown
 // services at build time. Fires once, cached in DuckDB. ~600 tokens output.
 // ---------------------------------------------------------------------------
-const PLAYBOOK_BUILD_PROMPT = `You are a browser automation expert. Generate step-by-step playbooks for automating a web service using playwright-cli.
+const PLAYBOOK_BUILD_PROMPT = `You are a browser automation expert. Generate step-by-step playbooks for automating a web service using the Playwright Node API.
 
 URL-FIRST RULE: Prefer direct navigation when the service provides a known URL for the action. If a deepLinkUrl is provided in the agent context, use it as the first navigate step. Only fall back to clicks for navigation when no direct URL is known.
 
@@ -898,7 +899,7 @@ INPUT
   select      — { "action": "select", "selector": "...", "value": "..." }        — <select> dropdowns
   check       — { "action": "check", "selector": "..." }                         — checkboxes / radio buttons
   uncheck     — { "action": "uncheck", "selector": "..." }                       — uncheck a checkbox
-  upload      — { "action": "upload", "selector": "...", "files": ["/abs/path"] } — attach file(s): clicks selector to open the chooser, then uses playwright-cli upload command for each file. selector = attach button ref from snapshot; files = absolute local file paths array.
+  upload      — { "action": "upload", "selector": "...", "files": ["/abs/path"] } — attach file(s): clicks selector to open the chooser, then uses engine file chooser for each file. selector = attach button ref from snapshot; files = absolute local file paths array.
 
 DOM INTERACTION
   click       — { "action": "click", "selector": "..." }
@@ -981,7 +982,7 @@ You will receive:
 
 Your job: generate ONE new playbook for the GOAL using the exact same format and action vocabulary as the examples.
 
-You MUST use ONLY these action names (full playwright-cli vocabulary):
+You MUST use ONLY these action names (full action vocabulary):
   INPUT:       fill (inputs), type (contenteditable), select (dropdowns), check, uncheck, upload
   INTERACTION: click, dblclick, hover, drag
   KEYBOARD:    press, keydown, keyup
@@ -2769,6 +2770,17 @@ function _isUnsafeDeepLinkUrl(candidateUrl, expectedHost = '') {
   if (lower.includes('chrome-extension://') || lower.includes('chrome-extension%3a%2f%2f')) {
     return true;
   }
+  // Reject URLs containing PII redaction/placeholder tokens — these are search-index
+  // artifacts (e.g. %5BPII_EMAIL_...%5D) and are never valid deep-links.
+  if (/\bpii_|%5bpii|\[redacted\]|\[placeholder\]/i.test(candidate)) {
+    return true;
+  }
+  // Reject URLs with prefilled-message query params — discovered prefill URLs
+  // always carry stale third-party data (subjects, recipients, body text).
+  // Template deep-links like #inbox?compose=new use fragments, not query params.
+  if (/[?&](su|to|body|subject|bcc|cc)=/i.test(candidate) && /[?&](view=cm|tf=cm|tf=1)/i.test(candidate)) {
+    return true;
+  }
   if (String(expectedHost || '').replace(/^www\./, '') === 'mail.google.com') {
     if (/mail\.google\.com\/mail(?:\/u\/\d+)?\/?\?body=/i.test(candidate)) {
       return true;
@@ -2843,6 +2855,13 @@ function _isMutationIntent(intent) {
   return [INTENTS.CONTENT_CREATE, INTENTS.SOCIAL, INTENTS.MAIL, INTENTS.SCHEDULING, INTENTS.COMMERCE].includes(intent);
 }
 
+function _isReadOnlyMailTask(task) {
+  const t = String(task || '').toLowerCase();
+  const readKeywords = /\b(read|check|unread|inbox|list|count|how many|from|search|find|look\s*up|see|show|tell me|get|fetch|monitor|track|unread emails?|new emails?|recent emails?)\b/i;
+  const composeKeywords = /\b(send|compose|write|draft|forward|reply|new email|new message|email to)\b/i;
+  return readKeywords.test(t) && !composeKeywords.test(t);
+}
+
 function _canPromoteDeepLink(candidate, source, intent, baseHost, serviceKey = '') {
   if (!candidate || _isUnsafeDeepLinkUrl(candidate, baseHost)) return false;
   let parsed;
@@ -2884,7 +2903,15 @@ async function _resolveTaskDeepLink(agentId, serviceKey, baseStartUrl, task, exi
     }
 
     const intent = await classifyTaskIntent(task);
+    const _taskKeywords = getTaskKeywords(task); // LLM-extracted keywords from classifyTaskIntent
     const isSearchLike = intent === INTENTS.SEARCH || /\b(search|look\s*up|google|find)\b/i.test(task);
+
+    // Step 0: Check keyword-indexed deep-link cache
+    const _cachedDeepLink = await getCachedDeepLink(serviceKey, _taskKeywords);
+    if (_cachedDeepLink?.url) {
+      logger.info(`[browser.agent] deep-link: keyword cache hit for ${agentId}: ${_cachedDeepLink.url} (score=${_cachedDeepLink.score.toFixed(2)})`);
+      return { url: _cachedDeepLink.url, source: 'keyword-cache' };
+    }
 
     const baseHost = (() => {
       try { return new URL(baseStartUrl).hostname.replace(/^www\./, ''); }
@@ -2898,6 +2925,7 @@ async function _resolveTaskDeepLink(agentId, serviceKey, baseStartUrl, task, exi
       // ── MAIL ──────────────────────────────────────────────────────────────
       if (intent === INTENTS.MAIL) {
         if (svc === 'gmail' || baseHost === 'mail.google.com') {
+          if (_isReadOnlyMailTask(task)) return null; // let discovery pipeline run
           return 'https://mail.google.com/mail/u/0/#inbox?compose=new';
         }
         if (svc === 'outlook' || baseHost === 'outlook.live.com' || baseHost === 'outlook.office.com') {
@@ -3060,7 +3088,7 @@ async function _resolveTaskDeepLink(agentId, serviceKey, baseStartUrl, task, exi
     }
 
     // 2. Try web.agent discover_task_url
-    if (!candidate && !_isMutationIntent(intent)) {
+    if (!candidate && !(_isMutationIntent(intent) && !(intent === INTENTS.MAIL && _isReadOnlyMailTask(task)))) {
       try {
         const webResult = await callSkill('web.agent', {
           action: 'discover_task_url',
@@ -3071,6 +3099,8 @@ async function _resolveTaskDeepLink(agentId, serviceKey, baseStartUrl, task, exi
           candidate = webResult.taskUrl;
           candidateSource = 'search';
         }
+        // Collect keywords from web.agent result
+        var _webAgentKeywords = webResult?.taskKeywords || [];
       } catch (webErr) {
         logger.debug(`[browser.agent] deep-link: web.agent failed: ${webErr.message}`);
       }
@@ -3078,7 +3108,7 @@ async function _resolveTaskDeepLink(agentId, serviceKey, baseStartUrl, task, exi
 
     // 2.5. Try web.crawl link extraction — crawl the service's start URL and
     // extract <a href> links to discover action URLs not indexed by search engines.
-    if (!candidate && !_isMutationIntent(intent)) {
+    if (!candidate && !(_isMutationIntent(intent) && !(intent === INTENTS.MAIL && _isReadOnlyMailTask(task)))) {
       try {
         const crawlResult = await callSkill('web.crawl', {
           url: baseStartUrl,
@@ -3127,12 +3157,14 @@ async function _resolveTaskDeepLink(agentId, serviceKey, baseStartUrl, task, exi
     }
 
     // 3. Fallback to LLM-suggested URL
+    var _suggestKeywords = [];
     if (!candidate) {
       const suggestion = await suggestTaskUrl(serviceKey, baseStartUrl, intent, task);
       if (suggestion?.ok && suggestion?.url) {
         candidate = suggestion.url;
         candidateSource = 'suggestion';
       }
+      _suggestKeywords = suggestion?.keywords || [];
     }
 
     if (!candidate) return null;
@@ -3182,10 +3214,61 @@ async function _resolveTaskDeepLink(agentId, serviceKey, baseStartUrl, task, exi
     }
 
     logger.info(`[browser.agent] deep-link: ${agentId} → ${candidate} (source=${candidateSource})`);
+
+    // Merge keywords from all sources and cache
+    const _mergedKeywords = [...new Set([..._taskKeywords, ...(_webAgentKeywords || []), ..._suggestKeywords])].slice(0, 20);
+    if (_mergedKeywords.length > 0) {
+      setImmediate(() => {
+        recordDeepLinkCache(serviceKey, candidate, _mergedKeywords, intent).catch(() => {});
+      });
+    }
+
     return { url: candidate, source: candidateSource };
   } catch (err) {
     logger.warn(`[browser.agent] deep-link resolution error: ${err.message}`);
     return null;
+  }
+}
+
+// Matches tasks that involve searching/filtering content (check/count/find/unread/etc.)
+// where a service-specific query operator (e.g. Gmail's "is:unread") would help.
+const _SEARCH_SYNTAX_TASK_RE = /\b(search|filter|find|unread|read|starred|label|tag|has:|from:|to:|count|how many|list|check)\b/i;
+const SEARCH_OPERATOR_RULE_PREFIX = 'SEARCH OPERATOR:';
+
+/**
+ * Proactively discover a service's search/filter query operators (e.g. Gmail's
+ * "is:unread") via web.agent + web.crawl, and cache them as advisory context
+ * rules keyed by hostname. Mirrors the URL-first deep-link discovery pattern,
+ * but reuses the existing context_rule / learnedRulesBlock pipeline in
+ * playwright.agent.cjs for injection — no new cache or prompt-injection code needed.
+ *
+ * No-op (fast) once operators are cached for a given host.
+ */
+async function _discoverSearchSyntax(serviceKey, baseHost, task) {
+  if (!baseHost || !task || !_SEARCH_SYNTAX_TASK_RE.test(task)) return;
+  try {
+    const skillDb = require('../skill-helpers/skill-db.cjs');
+    const existingRules = await skillDb.getContextRulesByKeys([baseHost], 'site').catch(() => []);
+    const alreadyDiscovered = Array.isArray(existingRules) && existingRules.some(r => String(r).startsWith(SEARCH_OPERATOR_RULE_PREFIX));
+    if (alreadyDiscovered) return; // cache hit — nothing to do
+
+    logger.info(`[browser.agent] search-syntax: no cached operators for ${baseHost} — discovering via web.agent`);
+    const discoverResult = await callSkill('web.agent', { action: 'discover_search_syntax', domain: baseHost, task }, 25000).catch(err => {
+      logger.debug(`[browser.agent] search-syntax: discovery failed: ${err.message}`);
+      return null;
+    });
+
+    if (!discoverResult?.ok || !Array.isArray(discoverResult.operators) || discoverResult.operators.length === 0) {
+      logger.info(`[browser.agent] search-syntax: no operators discovered for ${baseHost}`);
+      return;
+    }
+
+    for (const op of discoverResult.operators.slice(0, 8)) {
+      await skillDb.setContextRule(baseHost, `${SEARCH_OPERATOR_RULE_PREFIX} ${op}`, 'site').catch(() => {});
+    }
+    logger.info(`[browser.agent] search-syntax: cached ${discoverResult.operators.length} operator(s) for ${baseHost} (source: ${discoverResult.sourceUrl || 'unknown'})`);
+  } catch (err) {
+    logger.debug(`[browser.agent] search-syntax discovery error (non-fatal): ${err.message}`);
   }
 }
 
@@ -3769,8 +3852,38 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
       logger.info(`[browser.agent] domain-continuity: user-memory query failed: ${_memErr.message}`);
     }
 
+    // ── Engine-level domain continuity check ─────────────────────────────
+    // User-memory OCR may be stale or unavailable, but the engine session is the
+    // authoritative source of the current URL. If the engine is already on the
+    // target domain, preserve it instead of restarting.
+    if (!_domainContinuitySkip) {
+      try {
+        const _engineHrefRes = await callBrowserAct({ action: 'evaluate', text: 'window.location.href', sessionId, timeoutMs: 5000 }, 8000).catch(() => ({ ok: false }));
+        if (_engineHrefRes?.ok && _engineHrefRes?.result) {
+          const _engineHref = String(_engineHrefRes.result).trim().replace(/^"|"$/g, '');
+          const _engineHost = (() => { try { return new URL(_engineHref).hostname.replace(/^www\./, '').toLowerCase(); } catch (_) { return ''; } })();
+          const _startHost = (() => { try { return new URL(startUrl).hostname.replace(/^www\./, '').toLowerCase(); } catch (_) { return ''; } })();
+          if (_engineHost && _startHost && isHostAlias(_engineHost, _startHost, hostAliases)) {
+            _domainContinuitySkip = true;
+            logger.info(`[browser.agent] domain-continuity: engine session already on ${_engineHref} for session=${sessionId} — skipping restart`);
+          }
+        }
+      } catch (_engineContinuityErr) {
+        logger.debug(`[browser.agent] domain-continuity: engine session check failed (non-fatal): ${_engineContinuityErr.message}`);
+      }
+    }
+
     // ── Skip browser restart if domain continuity detected ────────────────
     if (!_domainContinuitySkip) {
+      // ── Close any existing engine session for this session ──────────────
+      // Ensures the Playwright Node API engine's Chrome is properly closed,
+      // not just the CLI daemon. Prevents "Opening in existing browser session"
+      // when the engine tries to launch with the same profile.
+      try {
+        const _engineCloseRes = await callBrowserAct({ action: 'close', sessionId }, 8000).catch(() => ({ ok: false }));
+        if (_engineCloseRes?.ok) logger.info(`[browser.agent] closed existing engine session for session=${sessionId}`);
+      } catch (_) {}
+
       // ── Close any existing playwright-cli daemon for this session ──────────
       const _shortSid = shortSessionId(sessionId);
       try {
@@ -3975,6 +4088,143 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
                     _onLoginPage = true;
                     logger.info(`[browser.agent] LLM confirmed auth required — treating as login page`);
                   }
+                }
+              }
+
+              // ── Blank-page crash detection (SPA-aware) ──────────────────────────
+              // If the page loaded with zero content, it could be:
+              //   (a) a genuine Chrome crash — page is dead or truly blank, OR
+              //   (b) a client-side SPA (React/Vue/Next.js) that hasn't hydrated yet.
+              // We distinguish by checking for SPA mount points. If present, we poll
+              // for content before declaring a crash. If absent, instant crash.
+              if (!_pageInfo.body && Number(_pageInfo.links) === 0) {
+                // ── Tier 2: Check for SPA mount points ──
+                let _isSPA = false;
+                try {
+                  const _spaRes = await callBrowserAct({
+                    action: 'evaluate',
+                    text: `(() => {
+                      const mount = document.querySelector('#root, #app, #__next, [data-reactroot], #___gatsby');
+                      const scripts = document.querySelectorAll('script[src]').length;
+                      return JSON.stringify({ hasMount: !!mount, scriptCount: scripts });
+                    })()`,
+                    sessionId,
+                    timeoutMs: 5000,
+                    headed: _silentPreflightProbe ? false : undefined,
+                  }, 8000).catch(() => null);
+                  const _spaInfo = (_spaRes?.ok !== false)
+                    ? (typeof _spaRes?.result === 'object' && _spaRes?.result !== null)
+                      ? _spaRes.result
+                      : (() => { try { return JSON.parse(String(_spaRes?.result ?? '{}')); } catch (_) { return {}; } })()
+                    : {};
+                  _isSPA = !!(_spaInfo.hasMount || (Number(_spaInfo.scriptCount) > 0));
+                  logger.info(`[browser.agent] run: blank page SPA check for ${agentId} — hasMount=${_spaInfo.hasMount} scriptCount=${_spaInfo.scriptCount} isSPA=${_isSPA}`);
+                } catch (_) {}
+
+                if (!_isSPA) {
+                  // No SPA indicators — genuine blank page, declare crash immediately
+                  logger.warn(`[browser.agent] run: blank page after navigation for ${agentId} (href=${_curHref}) — no SPA indicators, flagging for retry`);
+                  return {
+                    ok: false,
+                    chromeCrash: true,
+                    agentId,
+                    task,
+                    error: 'Browser page blank after navigation, will retry once',
+                    result: null,
+                    stdout: null,
+                  };
+                }
+
+                // ── Tier 3: Poll for SPA hydration (up to 10s, 5 × 2s intervals) ──
+                logger.info(`[browser.agent] run: SPA detected for ${agentId} — polling for hydration (up to 10s)`);
+                let _hydrated = false;
+                for (let _poll = 0; _poll < 5; _poll++) {
+                  await new Promise(r => setTimeout(r, 2000));
+                  try {
+                    const _pollRes = await callBrowserAct({
+                      action: 'evaluate',
+                      text: `(() => {
+                        const bodyText = (document.body && document.body.innerText) ? document.body.innerText.trim() : '';
+                        const linkCount = document.querySelectorAll('a').length;
+                        return JSON.stringify({ hasContent: bodyText.length > 0, linkCount });
+                      })()`,
+                      sessionId,
+                      timeoutMs: 5000,
+                      headed: _silentPreflightProbe ? false : undefined,
+                    }, 8000);
+                    const _pollInfo = (_pollRes?.ok !== false)
+                      ? (typeof _pollRes?.result === 'object' && _pollRes?.result !== null)
+                        ? _pollRes.result
+                        : (() => { try { return JSON.parse(String(_pollRes?.result ?? '{}')); } catch (_) { return {}; } })()
+                      : {};
+                    if (_pollInfo.hasContent || Number(_pollInfo.linkCount) > 0) {
+                      _hydrated = true;
+                      logger.info(`[browser.agent] run: SPA hydrated for ${agentId} after ${(_poll + 1) * 2}s — body has content, links=${_pollInfo.linkCount}`);
+                      // Re-evaluate page info so downstream auth/parking checks use hydrated content
+                      const _reEvalRes = await callBrowserAct({
+                        action: 'evaluate',
+                        text: `(() => {
+                          const title = document.title || '';
+                          const body = (document.body && document.body.innerText) ? document.body.innerText.slice(0, 800) : '';
+                          const links = document.querySelectorAll('a').length;
+                          const titleLower = title.toLowerCase();
+                          const titleIsLogin = /sign.?in|log.?in|\\blogin\\b|authenticate|verify|two.factor|2fa/.test(titleLower);
+                          const robotsMeta = document.querySelector('meta[name="robots"]');
+                          const robotsContent = (robotsMeta ? robotsMeta.getAttribute('content') : '').toLowerCase();
+                          const isNoIndex = robotsContent.includes('noindex');
+                          const hasUserGlobal = !!(window.__user || window.currentUser ||
+                            (window.App && window.App.user) ||
+                            (window.__INITIAL_STATE__ && window.__INITIAL_STATE__.user));
+                          const signInLinks = document.querySelectorAll(
+                            'a[href*="login"], a[href*="signin"], a[href*="sign-in"], a[href*="signup"], a[href*="register"]'
+                          );
+                          const signInButtons = Array.from(
+                            document.querySelectorAll('button, a[role="button"], [data-testid]')
+                          ).filter(el => {
+                            const text = (el.textContent || el.innerText || '').toLowerCase().trim();
+                            return /^(sign\\s*in|log\\s*in|sign\\s*up|register)\\b/.test(text);
+                          });
+                          const hasSignInButton = signInLinks.length > 0 || signInButtons.length > 0;
+                          return JSON.stringify({ title, body, links, titleIsLogin, isNoIndex, hasUserGlobal, hasSignInButton });
+                        })()`,
+                        sessionId,
+                        timeoutMs: 5000,
+                        headed: _silentPreflightProbe ? false : undefined,
+                      }, 8000).catch(() => null);
+                      _pageInfo = (_reEvalRes?.ok !== false)
+                        ? (typeof _reEvalRes?.result === 'object' && _reEvalRes.result !== null)
+                          ? _reEvalRes.result
+                          : (() => { try { return JSON.parse(String(_reEvalRes?.result ?? '{}')); } catch (_) { return {}; } })()
+                        : _pageInfo;
+                      break;
+                    }
+                  } catch (_pollErr) {
+                    // Eval threw during polling — page died, genuine crash
+                    logger.warn(`[browser.agent] run: eval failed during SPA hydration poll for ${agentId} — ${_pollErr.message} — flagging crash`);
+                    return {
+                      ok: false,
+                      chromeCrash: true,
+                      agentId,
+                      task,
+                      error: 'Browser page crashed during SPA hydration wait, will retry once',
+                      result: null,
+                      stdout: null,
+                    };
+                  }
+                }
+
+                if (!_hydrated) {
+                  // SPA never hydrated within 10s — treat as crash
+                  logger.warn(`[browser.agent] run: SPA did not hydrate within 10s for ${agentId} (href=${_curHref}) — flagging for retry`);
+                  return {
+                    ok: false,
+                    chromeCrash: true,
+                    agentId,
+                    task,
+                    error: 'Browser page blank after 10s SPA hydration wait, will retry once',
+                    result: null,
+                    stdout: null,
+                  };
                 }
               }
             }
@@ -4312,6 +4562,21 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
       }
     }
   }
+  }
+
+  // ── Proactive search-syntax discovery ───────────────────────────────────────
+  // For search/filter/count-style tasks, discover the service's query operators
+  // (e.g. Gmail's "is:unread") ahead of planning so the LLM can compose an
+  // accurate filtered query instead of guessing read/unread state from text.
+  // No-op (fast) once cached for this hostname.
+  {
+    const _searchSyntaxHost = (() => {
+      try { return new URL(startUrl).hostname.replace(/^www\./, ''); }
+      catch (_) { return null; }
+    })();
+    if (_searchSyntaxHost) {
+      await _discoverSearchSyntax(_svcKey, _searchSyntaxHost, task);
+    }
   }
 
   // Phase 5: Recipe replay and URL-first navigation are no longer mutually exclusive.
@@ -5189,6 +5454,13 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
             setImmediate(() => {
               recordCorrection(_serviceKey, _intent, _bestUrl).catch(() => {});
             });
+            // Also record in keyword-indexed deep-link cache
+            const _secondaryKeywords = getTaskKeywords(task);
+            if (_secondaryKeywords.length > 0) {
+              setImmediate(() => {
+                recordDeepLinkCache(_serviceKey, _bestUrl, _secondaryKeywords, _intent).catch(() => {});
+              });
+            }
           } else {
             logger.warn(`[browser.agent] deep-link: candidate ${_bestUrl} failed validation — using startUrl ${startUrl}`);
             // If cached URL failed, clear it so we rediscover next time
@@ -5243,7 +5515,7 @@ When extracting page content with run-code, prioritize these selectors over gene
 
   try {
     // If recipe was successfully executed, we're already on the target page - don't navigate
-    const _playwrightUrl = _recipeExecutedOk ? undefined : ((_urlFirstNavigationSelected || _useAgentBrowser) ? startUrl : undefined);
+    const _playwrightUrl = _recipeExecutedOk ? undefined : (_useAgentBrowser ? startUrl : undefined);
     if (_recipeExecutedOk && url) {
         logger.info(`[browser.agent] run: recipe executed successfully - NOT passing URL to playwright.agent to stay on target page`);
     }
@@ -5259,15 +5531,15 @@ When extracting page content with run-code, prioritize these selectors over gene
         : (!_effectiveAutoConnect && _useAutoConnect ? 'Default' : undefined),
         headed: _usePersistentProfile ? true : undefined,
         maxTurns: 15,
-        timeoutMs: 120000,
+        timeoutMs: 30000,
         overallTimeoutMs: 120000,
         recipeWasUsed: _recipeExecutedOk,
         authConfirmedAt: (_getCachedAuthCheck(agentId)?.ts ?? null),
         _progressCallbackUrl,
         _stepIndex,
-    }, 130000));
+    }, 140000));
 
-    const agentResultText = agentResult?.result || agentResult?.stdout || '';
+    const agentResultText = String(agentResult?.result ?? agentResult?.stdout ?? '');
 
     // ── Bubble up askUser from playwright.agent ────────────────────────────────
     // If playwright.agent surfaced an ask_user (goal not achieved after recipe
@@ -5463,13 +5735,13 @@ When extracting page content with run-code, prioritize these selectors over gene
                 : (!_effectiveAutoConnect && _useAutoConnect ? 'Default' : undefined),
               headed: _usePersistentProfile ? true : undefined,
               maxTurns: 15,
-              timeoutMs: 120000,
+              timeoutMs: 30000,
               overallTimeoutMs: 120000,
               authConfirmedAt: Date.now(),
               _progressCallbackUrl,
               _stepIndex,
               _loginWallRetried: true,  // prevent recursive retry
-            }, 130000));
+            }, 140000));
             return {
               ok: _retryResult?.ok ?? false,
               agentId,

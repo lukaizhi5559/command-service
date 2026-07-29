@@ -46,7 +46,8 @@ const os     = require('os');
 const path   = require('path');
 const http   = require('http');
 const logger = require('../logger.cjs');
-const { browserAct, getDebuggingContext } = require('./browser.act.cjs');
+const { browserAct, getDebuggingContext, invalidateEngineSnapshot } = require('./browser.act.cjs');
+const engine = require('./browser-engine.cjs');
 const { askWithMessages } = require('../skill-helpers/skill-llm.cjs');
 const skillDb = require('../skill-helpers/skill-db.cjs');
 
@@ -80,6 +81,56 @@ function callExternalSkill(name, args = {}, timeoutMs = 30000) {
 }
 
 // ---------------------------------------------------------------------------
+// Engine fast-path helpers — use Playwright Node API directly when engine is
+// active, bypassing browserAct → cliRun subprocess overhead.
+// Falls back to browserAct (which has its own CLI fallback) on any error.
+// ---------------------------------------------------------------------------
+
+async function _engineEval(sessionId, expr, timeoutMs = 5000) {
+  const page = engine.getPage(sessionId);
+  if (!page) return null;
+  try {
+    const result = await page.evaluate(expr);
+    return { ok: true, result, stdout: typeof result === 'string' ? result : JSON.stringify(result) };
+  } catch (e) {
+    logger.debug(`[playwright.agent] _engineEval failed: ${e.message}`);
+    return null;
+  }
+}
+
+async function _engineNavigate(sessionId, url, timeoutMs = 30000) {
+  const page = engine.getPage(sessionId);
+  if (!page) return null;
+  try {
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: timeoutMs });
+    return { ok: true };
+  } catch (e) {
+    logger.debug(`[playwright.agent] _engineNavigate failed: ${e.message}`);
+    return null;
+  }
+}
+
+// Lightweight engine snapshot — returns yaml + refMap but does NOT populate
+// _engineSnapshots in browser.act.cjs. Use only when you need the yaml text
+// without ref binding (e.g., orientation steps). For action-bound refs, use
+// _fastSnapshot() which goes through browserAct({ action: 'snapshot' }).
+async function _engineSnapshot(sessionId) {
+  const page = engine.getPage(sessionId);
+  if (!page) return null;
+  try {
+    const { yaml, refMap } = await engine.buildRefTree(page);
+    return { ok: true, result: yaml, refMap };
+  } catch (e) {
+    logger.debug(`[playwright.agent] _engineSnapshot failed: ${e.message}`);
+    return null;
+  }
+}
+
+async function _fastSnapshot(sessionId, headed, timeoutMs = 15000) {
+  return browserAct({ action: 'snapshot', sessionId, headed, timeoutMs });
+}
+
+// ---------------------------------------------------------------------------
 // Shared action schema constants — injected into multiple prompts so all LLMs
 // use identical field names (selector not ref, etc.)
 // ---------------------------------------------------------------------------
@@ -98,11 +149,7 @@ const BROWSER_ACTIONS_FULL = `Available actions:
   hover           { selector }
   scroll          { direction, distance }
   drag            { selector, targetSelector }
-  find-role       { role, name?, findAction, value? } — find by ARIA role (e.g. "textbox") + optional name; findAction is "click"|"fill"
-  find-label      { label, findAction, value? }       — find by label text; findAction is "click"|"fill"
-  find-text       { text }                            — click the first visible element containing this text
-  wait            { ms }                              — pause execution for up to 5000ms (use sparingly)
-  // REMOVED: waitForSelector, waitForContent - not available in playwright-cli, implemented as compatibility layers in browser.act.cjs
+  // waitForSelector, waitForContent - implemented as compatibility layers in browser.act.cjs
   getPageText     {}                   — returns ALL visible text from the page (body.innerText, up to 50k chars). Use this as the universal, site-agnostic way to read any page. Works on ChatGPT, Perplexity, Claude, Grok, and any other site without knowing site-specific CSS. Result auto-captured as task output.
   evaluate        { text: "<JS expression>" }  — single-expression JS returning a primitive (e.g. document.title)
   run-code        { code: "async page => { return await page.evaluate(() => { ...browser JS... }); }" }
@@ -110,12 +157,12 @@ const BROWSER_ACTIONS_FULL = `Available actions:
                   ⚠ require() does NOT exist. Use dynamic import: const { fn } = await import('module')
                   ⚠ NEVER read files inside run-code — file content is already in the task as [DATA FROM PRIOR STEP].
                   ⚠ SCOPE: only \`page\` exists in the function — \`task\`, \`task.results\`, \`results\`, \`context\`, \`globalState\` do NOT exist and will throw ReferenceError.
-                  Gmail inbox example (sender=.yX span/.zF  subject=.bog/.bqe  snippet=.y2  time=.xW span):
-                  { "action": "run-code", "code": "async page => { return await page.evaluate(() => { const rows = Array.from(document.querySelectorAll('tr.zA')).slice(0,5); if(!rows.length) return 'No emails found'; return rows.map((r,i)=>{ const s=r.querySelector('.yX span,.zF')?.innerText||''; const sub=r.querySelector('.bog,.bqe')?.innerText||''; const snip=r.querySelector('.y2')?.innerText||''; const t=r.querySelector('.xW span')?.innerText||''; return 'Email '+(i+1)+': From='+s+' | Subject='+sub+' | Preview='+snip+' | Time='+t; }).join('\\n'); }); }" }
+                  Gmail inbox example (use getPageText — universal, no site-specific CSS):
+                  { "action": "getPageText" }
   external_skill  { name: "<skill-name>", args?: {...} } — run an installed atomic skill (e.g. mail_google_com_compose). The skill executes in the SAME browser session. Use ONLY when AVAILABLE ATOMIC SKILLS lists this exact name. Never guess a skill name.
   screenshot      { filePath }
   snapshot        {}                   — re-read the page (ONLY when page changes significantly)
-  upload          { selector, files }  — attach file(s): clicks selector to open chooser, then uses playwright-cli upload command. selector = button/input ref; files = array of real absolute paths from the task/request. IMPORTANT: always use "files" (array), NEVER use "path". NEVER invent placeholders like /path/to/file.pdf.
+  upload          { selector, files }  — attach file(s): clicks selector to open chooser, then uses engine file chooser. selector = button/input ref; files = array of real absolute paths from the task/request. IMPORTANT: always use "files" (array), NEVER use "path". NEVER invent placeholders like /path/to/file.pdf.
   pasteAttachment { selector?, uploadWaitMs? } — PREFERRED for Gmail/chat attachments. Assumes the file is already on the clipboard (a prior shell.run osascript step put it there). Finds the compose body textbox, focuses it, and presses Meta+V (macOS) / Ctrl+V (else). DO NOT click the paperclip/Attach button before this — the native file chooser modal blocks keyboard events. Optional selector pins the body ref if auto-detection picks the wrong textbox. uploadWaitMs overrides the upload settle timeout (default 120000ms/2min): pass uploadWaitMs:300000 for video files, uploadWaitMs:180000 for audio or multiple files.
   return          { data: "<string>" } — MUST be LAST step; plain string output, max 2000 chars.
   dialog-accept   { prompt? }
@@ -175,14 +222,14 @@ EXPECTATION FIELD (optional but recommended for critical steps):
 // ---------------------------------------------------------------------------
 // Phase 1 prompt — sent once, LLM returns the full step plan
 // ---------------------------------------------------------------------------
-const PLAN_SYSTEM_PROMPT = `You are a browser automation expert controlling a real Chrome browser via playwright-cli.
+const PLAN_SYSTEM_PROMPT = `You are a browser automation expert controlling a real Chrome browser via the Playwright Node API.
 
 HOW IT WORKS — read this carefully:
-Each step in your plan maps 1:1 to one playwright-cli subcommand call:
-  { "action": "navigate", "url": "https://..." }             →  playwright-cli -s=SESSION navigate https://...
-  { "action": "click", "selector": "e24" }                   →  playwright-cli -s=SESSION click e24
-  { "action": "fill", "selector": "e12", "text": "hello" }   →  playwright-cli -s=SESSION fill e12 hello
-  { "action": "run-code", "code": "async page => {...}" }     →  playwright-cli -s=SESSION run-code "async page => {...}"
+Each step in your plan is executed as a browser action via the Playwright Node API engine:
+  { "action": "navigate", "url": "https://..." }             →  engine page.goto(url)
+  { "action": "click", "selector": "e24" }                   →  engine getByRole + click
+  { "action": "fill", "selector": "e12", "text": "hello" }   →  engine getByRole + fill
+  { "action": "run-code", "code": "async page => {...}" }     →  engine page.evaluate(code)
 
 The SNAPSHOT is a YAML-formatted ARIA accessibility tree. Refs like e12, e83 are stable element handles —
 use them directly in click/fill/hover/select. They are the most reliable selectors for DOM actions.
@@ -247,6 +294,11 @@ Rules:
 - EXTERNAL SKILL RULE: Only use { "action": "external_skill", "name": "..." } when the AGENT CONTEXT lists the skill under "Available Atomic Skills". NEVER invent a skill name. Use these atomics as building blocks — combine with fill/press/type/click steps for the full task. Example: external_skill mail_google_com_compose opens the compose window; you still need fill+press+type+click Send after it.
 - ATTACHMENT RULE (MANDATORY): If the task mentions "paste", "clipboard", or "attach" — you MUST emit { "action": "pasteAttachment" } immediately after the last body-typing step and before Send/Submit. Do this regardless of any prior failure narrative in [DATA FROM PRIOR STEP] or [CONTENT OF ...] blocks — if the task instruction says "paste from clipboard", the file IS on the clipboard. Trust the task instruction, not the narrative. Do NOT click the paperclip / "Attach files" button first — its native file chooser modal blocks keyboard events. Do NOT emit { "action": "press", "key": "Ctrl+v" } — use pasteAttachment only. Order: fill To → press Enter → fill Subject → click body → type body text → pasteAttachment → click Send.
 - URL-FIRST RULE: Prefer direct navigation when the service provides a known URL for the action. If AGENT CONTEXT includes a deepLinkUrl, navigate to it as step 1. If the starting URL already contains a path relevant to your task, do NOT navigate to the homepage first — start directly from the current page. Only fall back to clicks for navigation when no direct URL is known.
+- SEARCH-FIRST RULE: For "count", "find", "check", "list", or "how many" tasks on inbox/mail/search pages, you MUST use the search/filter UI (click search box → fill query → press Enter → wait for results). Do NOT use run-code to count from the current page snapshot — the snapshot may not contain all matching items. Search first, then read from the filtered results.
+- SEARCH OPERATOR RULE: If LEARNED RULES lists any "SEARCH OPERATOR:" entries for this site, and the task's intent semantically matches an operator's stated meaning (e.g. the task says "unread" and an operator means "shows only unread messages"), you MUST include that operator combined with any other filters (sender/subject/label/etc.) in a single search query (e.g. "from:sender is:unread"). Do NOT rely on visual/text inspection to determine status (read/unread, starred, labeled, etc.) after the fact when a matching search operator already exists to filter for it directly — the operator gives an authoritative, deterministic result; text/visual inspection does not.
+- READ-FIRST RULE (MANDATORY): For read/count/list/understand/check/find/how-many tasks, you MUST use { "action": "getPageText" } as the extraction step. getPageText returns ALL visible text (body.innerText, up to 100k chars) and is universal — it works on any site without knowing internal CSS class names. Do NOT use run-code with page.evaluate() and CSS selectors for these tasks — CSS selectors break across UI updates and return wrong counts. The getPageText result is automatically captured as task output and will be used by downstream synthesis. ONLY use run-code with standard HTML tag selectors (article, h3, a[href], tr, td) when you need structured per-row data — NEVER use site-internal class names (.zA, .yX, .bog, .zE, .zF, .y2, .xW, aria-label*="unread") — these are fragile and will cause incorrect results.
+- INPUT-FIRST RULE: For any task involving search, filter, or query, your FIRST action MUST target a textbox, searchbox, or combobox element (fill or click). Never click auxiliary buttons (Refresh, Settings, Menu, etc.) before interacting with the input field. The input element ref is listed first in the snapshot.
+- RUN-CODE EXTRACTION RULE: For counting/reading tasks, use { "action": "getPageText" } — NOT run-code with CSS selectors. run-code with site-specific CSS selectors (tr.zA, .zE, aria-label*="unread") returns wrong counts when the DOM structure changes. getPageText captures all visible text reliably. Only use run-code AFTER a search/filter has been applied AND you need structured per-field extraction with standard HTML tag selectors. For counting tasks: search first → snapshot → getPageText to read visible results.
 - DUPLICATE GUARD: Before typing content into any field, check the current page snapshot. If text matching your planned content already exists on the page (e.g., the title is already typed, the body is already filled), do NOT type it again. Take a snapshot and verify the existing content instead. This prevents duplicate content from re-planning or verify-repair loops.
 - IDEMPOTENCY RULE: For create actions (new page, new post, new issue, new email), if the URL has already changed to a new entity URL (e.g., /p/<id>, /issues/<number>, /compose/<id>), the create action succeeded — do NOT click "New" or "Create" again. If a compose window or editor is already open with content matching what you planned to type, do NOT open a new one.
 - TAB STRATEGY RULE: You are a smart tabbing agent. Use as many tabs as the task requires to hold page state or extracted content while working across multiple pages WITHIN THE SAME AGENT SESSION (same domain/service). Open tabs dynamically, track them with tab-list, switch context with tab-select, and clean up with tab-close when a tab's work is done. 2-tab pattern (hold + act): tab 0 = Page A open (compose/form/draft/result); tab-new → Page B → getPageText → tab-select 0 → use extracted content in Page A → tab-close 1. 3-tab pattern (gather from multiple sources, act on one): tab 0 = destination; tab-new → Source B → getPageText; tab-new → Source C → getPageText; tab-select 0 → combine B+C → act → tab-close 2, tab-close 1. 5-tab pattern (parallel research, single synthesis): tab 0 = output/synthesis page; tabs 1–4 = tab-new per source → getPageText each; tab-select 0 → synthesize all results → act → close extra tabs in reverse order. Rules: (1) Always getPageText BEFORE switching away from a tab — result carries forward as [DATA FROM PRIOR STEP] context. (2) Use tab-list to audit open tabs when managing many. (3) tab-close completed tabs to keep the session clean. (4) NEVER use tabs to reach a different service — each agent owns its own Chrome session and cookie store.`;
@@ -661,7 +713,7 @@ async function verifyExpectation(step, sessionId, headed, timeoutMs) {
         return { satisfied: false, reason: 'Failed to check URL' };
 
       case 'text_present':
-        // Aria refs (e.g. e18, e3) are playwright-cli accessibility IDs, never visible page text
+        // Aria refs (e.g. e18, e3) are ARIA accessibility refs, never visible page text
         if (/^e\d+$/.test(selector)) {
           return { satisfied: true, reason: 'Aria ref selector — skipping text_present check' };
         }
@@ -689,7 +741,7 @@ async function verifyExpectation(step, sessionId, headed, timeoutMs) {
 
 // Tier 1: Safe pattern recognition (no URL patterns for login)
 function handleKnownFailures(step, currentState, snapshot) {
-  // Network-based error detection (from playwright-cli network command)
+  // Network-based error detection (from browser network monitoring)
   // Note: This would need to be implemented by calling browserAct with 'network' action
   // For now, we'll focus on content-based detection
   
@@ -899,7 +951,7 @@ async function orientPage({ goal, snapshot, sessionId, headed, timeoutMs, learne
 
     // Wait for navigation/animation to settle, then re-snapshot
     await browserAct({ action: 'waitForStableText', sessionId, headed, timeoutMs: Math.min(timeoutMs, 8000) }).catch(() => {});
-    const reSnap = await browserAct({ action: 'snapshot', sessionId, headed, timeoutMs });
+    const reSnap = await _fastSnapshot(sessionId, headed, timeoutMs);
     if (reSnap.ok && reSnap.result) {
       currentSnapshot = reSnap.result;
       const _newHash = snapshotHash(currentSnapshot);
@@ -1058,8 +1110,23 @@ function pruneSnapshot(snapshotText, maxRefs = 50) {
   }
 
   if (out.length === 0) return trimSnapshot(snapshotText, 8000);
+
+  // Boost input-like elements (textbox/searchbox/combobox) to the top so LLMs
+  // see actionable targets first — generic across all sites, not site-specific.
+  const INPUT_ROLE = /\b(textbox|searchbox|combobox)\b/i;
+  const boosted = [];
+  const rest = [];
+  for (const line of out) {
+    if (INPUT_ROLE.test(line) && HAS_REF.test(line)) {
+      boosted.push(line);
+    } else {
+      rest.push(line);
+    }
+  }
+  const sorted = [...boosted, ...rest];
+
   // Cap at maxRefs lines (not exact ref count, but close enough)
-  const capped = out.slice(0, maxRefs * 2); // ~2 lines per ref (parent + element)
+  const capped = sorted.slice(0, maxRefs * 2); // ~2 lines per ref (parent + element)
   return `[Pruned snapshot: ${countRefs(snapshotText)} refs → ${countRefs(capped.join('\n'))} meaningful refs]\n` + capped.join('\n');
 }
 
@@ -1210,6 +1277,104 @@ async function incrementScriptFailure(service, action) {
       await skillDb.set('_playwright_agent', key, existing);
     }
   } catch (_) {}
+}
+
+// ---------------------------------------------------------------------------
+// Tier 1.5: Deterministic selector maps for URL-first form interactions
+// Cached per hostname:pagePattern. LLM-generated, self-healing on failure.
+// ---------------------------------------------------------------------------
+const SELECTOR_MAP_KV_PREFIX = 'selector_map';
+
+async function getSelectorMap(hostname, pagePattern) {
+  try {
+    const key = `${SELECTOR_MAP_KV_PREFIX}:${hostname}:${pagePattern}`;
+    const existing = await skillDb.get('_playwright_agent', key);
+    if (existing && existing.fields && (existing.status === 'healthy' || existing.status === 'degraded')) {
+      logger.info(`[playwright.agent] selector map: cache hit for ${hostname}:${pagePattern} (status=${existing.status})`);
+      return existing;
+    }
+  } catch (err) {
+    logger.warn(`[playwright.agent] selector map lookup failed (non-fatal): ${err.message}`);
+  }
+  return null;
+}
+
+async function saveSelectorMap(hostname, pagePattern, map) {
+  try {
+    const key = `${SELECTOR_MAP_KV_PREFIX}:${hostname}:${pagePattern}`;
+    const entry = {
+      hostname,
+      pagePattern,
+      fields: map.fields,
+      submitSelectors: map.submitSelectors || [],
+      submitVerify: map.submitVerify || null,
+      status: 'healthy',
+      success_count: 0,
+      failure_count: 0,
+      last_validated: Date.now(),
+      created_at: Date.now(),
+    };
+    await skillDb.set('_playwright_agent', key, entry);
+    logger.info(`[playwright.agent] selector map: saved ${key} (status=healthy, ${entry.fields.length} fields)`);
+    return true;
+  } catch (err) {
+    logger.warn(`[playwright.agent] selector map save failed (non-fatal): ${err.message}`);
+    return false;
+  }
+}
+
+async function incrementSelectorMapSuccess(hostname, pagePattern) {
+  try {
+    const key = `${SELECTOR_MAP_KV_PREFIX}:${hostname}:${pagePattern}`;
+    const existing = await skillDb.get('_playwright_agent', key);
+    if (existing) {
+      existing.success_count = (existing.success_count || 0) + 1;
+      existing.last_validated = Date.now();
+      if (existing.status === 'degraded' && existing.success_count > existing.failure_count) {
+        existing.status = 'healthy';
+        logger.info(`[playwright.agent] selector map: ${key} restored to healthy`);
+      }
+      await skillDb.set('_playwright_agent', key, existing);
+    }
+  } catch (_) {}
+}
+
+async function incrementSelectorMapFailure(hostname, pagePattern) {
+  try {
+    const key = `${SELECTOR_MAP_KV_PREFIX}:${hostname}:${pagePattern}`;
+    const existing = await skillDb.get('_playwright_agent', key);
+    if (existing) {
+      existing.failure_count = (existing.failure_count || 0) + 1;
+      if (existing.failure_count > 2 && existing.status !== 'degraded') {
+        existing.status = 'degraded';
+        logger.warn(`[playwright.agent] selector map: ${key} marked degraded (failure_count=${existing.failure_count})`);
+      }
+      if (existing.failure_count > 4) {
+        existing.status = 'broken';
+        logger.warn(`[playwright.agent] selector map: ${key} marked broken — will regenerate on next run`);
+      }
+      await skillDb.set('_playwright_agent', key, existing);
+    }
+  } catch (_) {}
+}
+
+function derivePagePattern(url) {
+  try {
+    const u = new URL(url);
+    const path = u.pathname + u.search;
+    const composeMatch = path.match(/compose=new|compose\/post|\/compose\b|posting\?compose=true/i);
+    if (composeMatch) return composeMatch[0];
+    const segments = u.pathname.split('/').filter(Boolean);
+    if (segments.length > 0) return segments[segments.length - 1];
+    return 'root';
+  } catch (_) {
+    return 'unknown';
+  }
+}
+
+function isFormUrl(url) {
+  if (!url) return false;
+  return /compose=new|compose\/post|\/compose\b|posting\?compose=true|\/share\b|\/post\b|\/create\b/i.test(url);
 }
 
 // ---------------------------------------------------------------------------
@@ -1666,6 +1831,391 @@ async function syncScriptGeneration(goal, pageType, service, sessionId, headed, 
   }
 }
 
+// ---------------------------------------------------------------------------
+// Tier 1.5: LLM selector map generation + goal field extraction + execution
+// ---------------------------------------------------------------------------
+
+const SELECTOR_MAP_GEN_PROMPT = `You are a browser automation expert. Analyze the provided page HTML and generate a CSS selector map for form fields.
+
+Output ONLY a JSON object (no markdown, no explanation) with:
+- "fields": array of field objects, each with:
+  - "name": semantic field name (e.g. "to", "subject", "body", "title", "description", "content")
+  - "selectors": array of CSS selector strings to try in order (most specific first)
+  - "type": one of "input", "textarea", "contenteditable", "chip", "select"
+  - "verifySelector": CSS selector to check after typing (may differ from input selector)
+  - "verifyType": one of "value" (check .value), "innerText" (check .innerText), "chip_count" (count chip elements)
+- "submitSelectors": array of CSS selectors for submit/send buttons to try in order
+- "submitVerify": object with:
+  - "type": "compose_gone" (compose dialog disappeared), "snackbar" (success message appeared), "url_change" (URL changed away from compose)
+  - "pattern": regex string to match in page text for success confirmation (optional)
+
+Rules:
+- Use real CSS selectors that exist on the page. Prefer [name="..."], [aria-label="..."], [data-testid="..."] over generic tags.
+- For chip/badge fields (like Gmail To), set type="chip" and verifyType="chip_count".
+- For contenteditable bodies, set type="contenteditable" and verifyType="innerText".
+- Keep selectors robust: avoid nth-child, avoid auto-generated class names.
+- Output ONLY the JSON object.`;
+
+const FIELD_EXTRACTION_PROMPT = `You are a goal parser. Extract field values from the user's goal for form filling.
+
+Output ONLY a JSON object mapping field names to their values. Field names should match common form field names: "to", "subject", "body", "title", "description", "content", "cc", "bcc", "tags", "category".
+
+Rules:
+- Email addresses go in "to" (comma-separated if multiple).
+- Text after "subject" or "titled" goes in "subject".
+- Text after "body" or "message" or "saying" goes in "body".
+- If the goal is a single text with no clear field mapping, put it in "body".
+- Output ONLY the JSON object, no explanation.`;
+
+async function _generateSelectorMap(sessionId, hostname, goal, timeoutMs) {
+  try {
+    const page = engine.getPage(sessionId);
+    if (!page) return null;
+
+    // Gather page HTML structure for LLM analysis
+    const pageHtml = await page.evaluate(() => {
+      // Collect form-related elements with their attributes
+      const elements = [];
+      const inputs = document.querySelectorAll('input, textarea, select, [contenteditable], [role="combobox"], [role="textbox"]');
+      for (const el of inputs) {
+        if (el.offsetParent === null && el.getClientRects().length === 0) continue; // skip hidden
+        const info = {
+          tag: el.tagName.toLowerCase(),
+          type: el.getAttribute('type'),
+          name: el.getAttribute('name'),
+          id: el.getAttribute('id'),
+          ariaLabel: el.getAttribute('aria-label'),
+          placeholder: el.getAttribute('placeholder'),
+          role: el.getAttribute('role'),
+          contentEditable: el.isContentEditable,
+          className: (el.className || '').toString().slice(0, 100),
+          dataTestId: el.getAttribute('data-testid'),
+        };
+        elements.push(info);
+      }
+      // Also collect buttons that might be submit
+      const buttons = [];
+      const btns = document.querySelectorAll('button, [role="button"], div[aria-label*="send" i], div[aria-label*="submit" i], div[aria-label*="post" i], input[type="submit"]');
+      for (const btn of btns) {
+        if (btn.offsetParent === null && btn.getClientRects().length === 0) continue;
+        buttons.push({
+          tag: btn.tagName.toLowerCase(),
+          text: (btn.innerText || btn.textContent || '').slice(0, 50),
+          ariaLabel: btn.getAttribute('aria-label'),
+          type: btn.getAttribute('type'),
+          role: btn.getAttribute('role'),
+          dataTestId: btn.getAttribute('data-testid'),
+        });
+      }
+      return JSON.stringify({ url: location.href, title: document.title, fields: elements, buttons });
+    });
+
+    const raw = await askWithMessages([
+      { role: 'system', content: SELECTOR_MAP_GEN_PROMPT },
+      { role: 'user', content: `HOSTNAME: ${hostname}\nGOAL: ${goal}\n\nPAGE STRUCTURE:\n${pageHtml}\n\nGenerate the selector map JSON:` },
+    ], { temperature: 0.1, maxTokens: 1200, responseTimeoutMs: 20000 });
+
+    const parsed = parseJson(raw);
+    if (!parsed || !Array.isArray(parsed.fields) || parsed.fields.length === 0) {
+      logger.warn(`[playwright.agent] selector map gen: no valid map generated`);
+      return null;
+    }
+    logger.info(`[playwright.agent] selector map gen: ${parsed.fields.length} fields, ${parsed.submitSelectors?.length || 0} submit selectors`);
+    return parsed;
+  } catch (err) {
+    logger.warn(`[playwright.agent] selector map gen error: ${err.message}`);
+    return null;
+  }
+}
+
+async function _extractFieldValues(goal) {
+  try {
+    const raw = await askWithMessages([
+      { role: 'system', content: FIELD_EXTRACTION_PROMPT },
+      { role: 'user', content: `GOAL: ${goal}\n\nExtract field values JSON:` },
+    ], { temperature: 0.1, maxTokens: 600, responseTimeoutMs: 15000 });
+
+    const parsed = parseJson(raw);
+    if (!parsed || typeof parsed !== 'object') {
+      logger.warn(`[playwright.agent] field extraction: no valid JSON`);
+      return null;
+    }
+    logger.info(`[playwright.agent] field extraction: ${Object.keys(parsed).join(', ')}`);
+    return parsed;
+  } catch (err) {
+    logger.warn(`[playwright.agent] field extraction error: ${err.message}`);
+    return null;
+  }
+}
+
+// Verify a single field after typing (post-interaction verification)
+async function _verifyField(page, field, expectedValue) {
+  try {
+    if (!field.verifySelector) return { ok: true, reason: 'no verifySelector' };
+
+    if (field.verifyType === 'chip_count') {
+      // For chip fields: check that at least one chip element exists
+      const chipCount = await page.evaluate((sel) => {
+        return document.querySelectorAll(sel).length;
+      }, field.verifySelector);
+      if (chipCount > 0) {
+        return { ok: true, reason: `chip_count=${chipCount}` };
+      }
+      return { ok: false, reason: 'no chips found after typing' };
+    }
+
+    if (field.verifyType === 'value') {
+      const val = await page.evaluate((sel) => {
+        const el = document.querySelector(sel);
+        return el ? el.value : null;
+      }, field.verifySelector);
+      if (val && val.includes(expectedValue)) {
+        return { ok: true, reason: `value matches` };
+      }
+      return { ok: false, reason: `value="${val}" expected to contain "${expectedValue}"` };
+    }
+
+    if (field.verifyType === 'innerText') {
+      const text = await page.evaluate((sel) => {
+        const el = document.querySelector(sel);
+        return el ? (el.innerText || el.textContent || '') : null;
+      }, field.verifySelector);
+      if (text && text.includes(expectedValue)) {
+        return { ok: true, reason: 'innerText matches' };
+      }
+      return { ok: false, reason: `innerText does not contain expected value` };
+    }
+
+    // Default: just check element exists
+    const exists = await page.evaluate((sel) => !!document.querySelector(sel), field.verifySelector);
+    return { ok: exists, reason: exists ? 'element exists' : 'element not found' };
+  } catch (err) {
+    return { ok: false, reason: `verify error: ${err.message}` };
+  }
+}
+
+// Execute a selector map: type each field, verify, submit, verify submit
+async function _executeSelectorMap(sessionId, fieldValues, selectorMap, timeoutMs) {
+  const page = engine.getPage(sessionId);
+  if (!page) return { ok: false, error: 'no engine page' };
+
+  const transcript = [];
+  const fieldTimeout = Math.min(timeoutMs, 15000);
+
+  // Phase 1: Type each field and verify
+  for (const field of selectorMap.fields) {
+    const value = fieldValues[field.name];
+    if (!value) {
+      logger.info(`[playwright.agent] selector map: skipping field "${field.name}" — no value in goal`);
+      continue;
+    }
+
+    let typed = false;
+    for (const sel of field.selectors) {
+      try {
+        // Click to focus
+        await page.click(sel, { timeout: fieldTimeout });
+
+        // Detect chip/combobox field
+        const isChip = field.type === 'chip';
+        if (isChip) {
+          await page.keyboard.type(value, { timeout: fieldTimeout });
+          // Press Enter or Tab to confirm chip
+          await page.keyboard.press('Enter');
+        } else if (field.type === 'contenteditable') {
+          // Select all and replace
+          await page.keyboard.press('Meta+a');
+          await page.keyboard.type(value, { timeout: fieldTimeout });
+        } else {
+          // input/textarea/select
+          await page.keyboard.press('Meta+a');
+          await page.keyboard.type(value, { timeout: fieldTimeout });
+        }
+
+        typed = true;
+        logger.info(`[playwright.agent] selector map: typed "${field.name}" via "${sel}"`);
+        transcript.push({ action: { type: value }, outcome: { ok: true, field: field.name, selector: sel } });
+        break;
+      } catch (typeErr) {
+        logger.warn(`[playwright.agent] selector map: field "${field.name}" selector "${sel}" failed: ${typeErr.message}`);
+      }
+    }
+
+    if (!typed) {
+      logger.warn(`[playwright.agent] selector map: all selectors failed for field "${field.name}"`);
+      transcript.push({ action: { type: value }, outcome: { ok: false, field: field.name, error: 'all selectors failed' } });
+      return { ok: false, error: `field "${field.name}" could not be typed`, transcript, failedField: field.name };
+    }
+
+    // Post-interaction verification
+    if (field.verifySelector) {
+      await new Promise(r => setTimeout(r, 300)); // brief settle
+      const verifyResult = await _verifyField(page, field, value);
+      if (!verifyResult.ok) {
+        logger.warn(`[playwright.agent] selector map: field "${field.name}" verification failed: ${verifyResult.reason}`);
+        transcript.push({ action: { verify: field.name }, outcome: { ok: false, reason: verifyResult.reason } });
+        return { ok: false, error: `field "${field.name}" verification failed: ${verifyResult.reason}`, transcript, failedField: field.name };
+      }
+      logger.info(`[playwright.agent] selector map: field "${field.name}" verified — ${verifyResult.reason}`);
+      transcript.push({ action: { verify: field.name }, outcome: { ok: true, reason: verifyResult.reason } });
+    }
+  }
+
+  // Phase 2: Click submit
+  let submitted = false;
+  for (const sel of (selectorMap.submitSelectors || [])) {
+    try {
+      await page.click(sel, { timeout: fieldTimeout });
+      submitted = true;
+      logger.info(`[playwright.agent] selector map: submit clicked via "${sel}"`);
+      transcript.push({ action: { click: sel }, outcome: { ok: true, intent: 'submit' } });
+      break;
+    } catch (clickErr) {
+      logger.warn(`[playwright.agent] selector map: submit selector "${sel}" failed: ${clickErr.message}`);
+    }
+  }
+
+  if (!submitted) {
+    // Try Ctrl+Enter as fallback
+    try {
+      await page.keyboard.press('Control+Enter');
+      submitted = true;
+      logger.info(`[playwright.agent] selector map: submit via Ctrl+Enter`);
+      transcript.push({ action: { press: 'Control+Enter' }, outcome: { ok: true, intent: 'submit' } });
+    } catch (_) {}
+  }
+
+  if (!submitted) {
+    return { ok: false, error: 'could not click any submit selector', transcript };
+  }
+
+  // Phase 3: Verify submit success
+  if (selectorMap.submitVerify) {
+    await new Promise(r => setTimeout(r, 1000)); // wait for submit to take effect
+    const sv = selectorMap.submitVerify;
+
+    if (sv.type === 'compose_gone') {
+      // Check if compose dialog disappeared
+      const composeGone = await page.evaluate(() => {
+        const dialog = document.querySelector('[role="dialog"]');
+        const composeArea = document.querySelector('[aria-label*="Message Body" i], [aria-label*="Compose" i]');
+        return !dialog && !composeArea;
+      });
+      if (composeGone) {
+        logger.info(`[playwright.agent] selector map: submit verified — compose gone`);
+        return { ok: true, transcript, result: 'Submitted (compose dialog closed)' };
+      }
+      // Check snackbar as fallback
+      if (sv.pattern) {
+        const bodyText = await page.evaluate(() => document.body.innerText);
+        if (new RegExp(sv.pattern, 'i').test(bodyText)) {
+          logger.info(`[playwright.agent] selector map: submit verified — snackbar pattern matched`);
+          return { ok: true, transcript, result: 'Submitted (success message detected)' };
+        }
+      }
+      return { ok: false, error: 'submit verification failed: compose still visible', transcript };
+    }
+
+    if (sv.type === 'snackbar' && sv.pattern) {
+      const bodyText = await page.evaluate(() => document.body.innerText);
+      if (new RegExp(sv.pattern, 'i').test(bodyText)) {
+        logger.info(`[playwright.agent] selector map: submit verified — snackbar matched`);
+        return { ok: true, transcript, result: 'Submitted (success message detected)' };
+      }
+      return { ok: false, error: 'submit verification failed: no success message', transcript };
+    }
+
+    if (sv.type === 'url_change') {
+      const currentUrl = await page.evaluate(() => location.href);
+      if (isFormUrl(currentUrl)) {
+        return { ok: false, error: 'submit verification failed: still on compose URL', transcript };
+      }
+      logger.info(`[playwright.agent] selector map: submit verified — URL changed`);
+      return { ok: true, transcript, result: 'Submitted (URL changed)' };
+    }
+  }
+
+  // No submit verification configured — assume success
+  logger.info(`[playwright.agent] selector map: no submit verification configured — assuming success`);
+  return { ok: true, transcript, result: 'Submitted (no verification configured)' };
+}
+
+// Main Tier 1.5 entry point: try cached map, or generate + cache new one
+async function _deterministicSelectorPath(sessionId, url, goal, hostname, timeoutMs) {
+  if (!isFormUrl(url)) return null;
+
+  const pagePattern = derivePagePattern(url);
+  logger.info(`[playwright.agent] Tier 1.5: checking selector map for ${hostname}:${pagePattern}`);
+
+  // Try cached map first
+  let selectorMap = await getSelectorMap(hostname, pagePattern);
+
+  if (!selectorMap) {
+    logger.info(`[playwright.agent] Tier 1.5: no cached map — generating via LLM`);
+    const generated = await _generateSelectorMap(sessionId, hostname, goal, timeoutMs);
+    if (!generated) return null; // fall through to Tier 2/3
+    selectorMap = generated;
+    // Cache it
+    await saveSelectorMap(hostname, pagePattern, generated);
+  }
+
+  // Extract field values from goal
+  const fieldValues = await _extractFieldValues(goal);
+  if (!fieldValues || Object.keys(fieldValues).length === 0) {
+    logger.warn(`[playwright.agent] Tier 1.5: could not extract field values from goal — falling back`);
+    return null;
+  }
+
+  // Execute: type → verify → submit → verify
+  const result = await _executeSelectorMap(sessionId, fieldValues, selectorMap, timeoutMs);
+
+  if (result.ok) {
+    await incrementSelectorMapSuccess(hostname, pagePattern);
+    return {
+      ok: true,
+      goal,
+      sessionId,
+      turns: result.transcript.length,
+      done: true,
+      result: result.result || 'Completed via selector map',
+      transcript: result.transcript,
+      routingDecision: 'tier1_5_selector_map',
+      executionTime: 0, // set by caller
+    };
+  }
+
+  // Failure — increment failure count and fall through
+  await incrementSelectorMapFailure(hostname, pagePattern);
+  logger.warn(`[playwright.agent] Tier 1.5: selector map failed: ${result.error} — falling back to Tier 2/3`);
+
+  // If the map was cached and failed, try regenerating once
+  if (selectorMap.status === 'healthy' && selectorMap.failure_count === undefined) {
+    logger.info(`[playwright.agent] Tier 1.5: attempting one-shot regeneration`);
+    const regenerated = await _generateSelectorMap(sessionId, hostname, goal, timeoutMs);
+    if (regenerated) {
+      await saveSelectorMap(hostname, pagePattern, regenerated);
+      const retryResult = await _executeSelectorMap(sessionId, fieldValues, regenerated, timeoutMs);
+      if (retryResult.ok) {
+        await incrementSelectorMapSuccess(hostname, pagePattern);
+        return {
+          ok: true,
+          goal,
+          sessionId,
+          turns: retryResult.transcript.length,
+          done: true,
+          result: retryResult.result || 'Completed via regenerated selector map',
+          transcript: retryResult.transcript,
+          routingDecision: 'tier1_5_selector_map_regen',
+          executionTime: 0,
+        };
+      }
+      await incrementSelectorMapFailure(hostname, pagePattern);
+    }
+  }
+
+  return null; // fall through to Tier 2/3
+}
+
 // Simple heuristic param extraction from goal text
 function extractParamsFromGoal(goal) {
   const params = {};
@@ -1848,10 +2398,26 @@ async function verifyTierCompletion(goal, pageType, routingDecision, script, ses
       }
     }
   } else {
-    // Goal-derived eval: check if page text contains expected keywords from goal
+    // Goal-derived eval: check if page text, document.title, and contenteditable
+    // text contain expected keywords from goal. Combining all three signals is
+    // critical for canvas/contenteditable apps (e.g. Google Docs) where the
+    // document title lives in a separate input, not in document.body.innerText.
     try {
       const pageTextRes = await browserAct({ action: 'evaluate', text: 'document.body?.innerText?.slice(0, 2000) || ""', sessionId, headed, timeoutMs: 5000 });
       const pageText = pageTextRes.ok ? String(pageTextRes.result || '').toLowerCase() : '';
+
+      // Also check document.title and first contenteditable element's text
+      const _extraSignalsRes = await browserAct({ action: 'evaluate', text: `(() => {
+        const parts = [];
+        parts.push('title:' + (document.title || ''));
+        const ce = document.querySelector('[contenteditable="true"]') || document.querySelector('[contenteditable]');
+        if (ce) parts.push('ce:' + (ce.innerText || ce.textContent || '').slice(0, 500));
+        const ariaTitleEl = document.querySelector('[aria-label*="title" i], [aria-label*="document" i]');
+        if (ariaTitleEl) parts.push('aria:' + (ariaTitleEl.value || ariaTitleEl.innerText || ariaTitleEl.textContent || '').slice(0, 500));
+        return parts.join('\\n');
+      })()`, sessionId, headed, timeoutMs: 5000 }).catch(() => ({ ok: false }));
+      const _extraText = _extraSignalsRes.ok ? String(_extraSignalsRes.result || '').toLowerCase() : '';
+
       const goalKeywords = goal.toLowerCase()
         .replace(/[^a-z0-9\s]/g, ' ')
         .split(/\s+/)
@@ -1860,13 +2426,22 @@ async function verifyTierCompletion(goal, pageType, routingDecision, script, ses
       const matched = goalKeywords.filter(k => pageText.includes(k));
       const matchRatio = goalKeywords.length > 0 ? matched.length / goalKeywords.length : 0;
 
-      if (matchRatio >= 0.4) {
-        result.evalResults.push({ type: 'goal_keyword_match', ratio: matchRatio, matched });
+      // Check extra signals (document.title, contenteditable text, aria-label elements)
+      const _extraMatched = goalKeywords.filter(k => _extraText.includes(k));
+      const _extraMatchRatio = goalKeywords.length > 0 ? _extraMatched.length / goalKeywords.length : 0;
+
+      // Combined signal: best ratio across all sources
+      const _bestRatio = Math.max(matchRatio, _extraMatchRatio);
+      const _bestMatched = _extraMatchRatio > matchRatio ? _extraMatched : matched;
+      const _bestSource = _extraMatchRatio > matchRatio ? 'document.title/contenteditable' : 'page text';
+
+      if (_bestRatio >= 0.4) {
+        result.evalResults.push({ type: 'goal_keyword_match', ratio: _bestRatio, matched: _bestMatched, source: _bestSource });
         result.pass = true;
-        result.reason = `Goal keyword match: ${matched.join(', ')} (${(matchRatio * 100).toFixed(0)}%)`;
-      } else if (matchRatio > 0) {
+        result.reason = `Goal keyword match (${_bestSource}): ${_bestMatched.join(', ')} (${(_bestRatio * 100).toFixed(0)}%)`;
+      } else if (_bestRatio > 0) {
         result.warn = true;
-        result.reason = `Partial goal keyword match: ${matched.join(', ')} (${(matchRatio * 100).toFixed(0)}%)`;
+        result.reason = `Partial goal keyword match (${_bestSource}): ${_bestMatched.join(', ')} (${(_bestRatio * 100).toFixed(0)}%)`;
       } else {
         // For canvas apps, page text may not contain goal keywords (contenteditable)
         if (pageType === 'canvas' || pageType === 'hybrid') {
@@ -1874,7 +2449,7 @@ async function verifyTierCompletion(goal, pageType, routingDecision, script, ses
           result.reason = `Canvas app — page text doesn't contain goal keywords (expected for contenteditable)`;
         } else {
           result.fail = true;
-          result.reason = `No goal keywords found in page text`;
+          result.reason = `No goal keywords found in page text, document.title, or contenteditable`;
         }
       }
     } catch (err) {
@@ -1940,6 +2515,250 @@ async function verifyTierCompletion(goal, pageType, routingDecision, script, ses
 }
 
 // ---------------------------------------------------------------------------
+// Script-URL fast path — deterministic compose-and-submit (no LLM needed)
+// Called when URL matches a compose pattern and goal has extractable text.
+// Uses Playwright Node API directly for speed (2-5s vs 30-120s LLM path).
+// Returns a result object on success/failure, or null to fall through to LLM.
+// ---------------------------------------------------------------------------
+async function _scriptUrlFastPath(sessionId, text, goal, startTs, deadline) {
+  const page = engine.getPage(sessionId);
+  if (!page) return null;
+
+  const transcript = [];
+
+  // Step 1: Find and focus the compose area (contenteditable or textarea)
+  let composeLocator = null;
+  try {
+    // Prefer [contenteditable] (LinkedIn, Twitter, Facebook compose areas)
+    const ceCount = await page.locator('[contenteditable="true"]').count();
+    if (ceCount > 0) {
+      composeLocator = page.locator('[contenteditable="true"]').first();
+    } else {
+      const taCount = await page.locator('textarea:visible').count();
+      if (taCount > 0) {
+        composeLocator = page.locator('textarea:visible').first();
+      }
+    }
+  } catch (e) {
+    logger.debug(`[playwright.agent] fast path: could not find compose element: ${e.message}`);
+    return null;
+  }
+
+  if (!composeLocator) {
+    logger.info(`[playwright.agent] fast path: no compose element found — falling back to LLM`);
+    return null;
+  }
+
+  // Step 2: Click to focus, then type the text
+  try {
+    await composeLocator.click({ timeout: 5000 });
+    await page.waitForTimeout(300); // brief settle after focus
+
+    // Clear any existing content first
+    await page.keyboard.press('Meta+a');
+    await page.keyboard.press('Backspace');
+
+    // Type the text
+    await page.keyboard.type(text, { delay: 10 });
+    transcript.push({ step: 1, action: { action: 'type', text: text.slice(0, 80) + '...' }, outcome: { ok: true }, thoughts: 'fast path: typed into compose area' });
+    logger.info(`[playwright.agent] fast path: typed ${text.length} chars into compose element`);
+  } catch (e) {
+    logger.warn(`[playwright.agent] fast path: type failed: ${e.message}`);
+    transcript.push({ step: 1, action: { action: 'type' }, outcome: { ok: false, error: e.message }, thoughts: 'fast path: type failed' });
+    return null;
+  }
+
+  // Step 3: Verify content was entered
+  try {
+    const entered = await composeLocator.evaluate(el => el.textContent || el.value || '');
+    if (!entered || entered.trim().length < 3) {
+      logger.warn(`[playwright.agent] fast path: content verification failed — compose area empty after typing`);
+      return null;
+    }
+    logger.info(`[playwright.agent] fast path: content verified (${entered.length} chars in compose element)`);
+  } catch (e) {
+    logger.debug(`[playwright.agent] fast path: content verification error (non-fatal): ${e.message}`);
+  }
+
+  // Step 4: Clear net log and click submit button
+  engine.clearNetLog(sessionId);
+  const _submitTs = Date.now();
+
+  let submitted = false;
+  try {
+    // Try common submit button patterns
+    const submitPatterns = [
+      { role: 'button', name: /post|publish|send|submit|share|tweet/i },
+    ];
+    for (const pattern of submitPatterns) {
+      try {
+        const btn = page.getByRole(pattern.role, { name: pattern.name });
+        const btnCount = await btn.count();
+        if (btnCount > 0) {
+          await btn.first().click({ timeout: 5000 });
+          submitted = true;
+          logger.info(`[playwright.agent] fast path: clicked submit button (role=${pattern.role}, name=${pattern.name})`);
+          break;
+        }
+      } catch (_) {}
+    }
+
+    if (!submitted) {
+      // Fallback: try CSS selectors for common submit buttons
+      const cssSelectors = [
+        'button[data-testid*="post"]',
+        'button[data-testid*="tweet"]',
+        'button[aria-label*="Post"]',
+        'button[aria-label*="Publish"]',
+        'button[type="submit"]',
+        'div[role="button"][aria-label*="Post"]',
+      ];
+      for (const sel of cssSelectors) {
+        try {
+          const el = page.locator(sel).first();
+          if (await el.count() > 0) {
+            await el.click({ timeout: 5000 });
+            submitted = true;
+            logger.info(`[playwright.agent] fast path: clicked submit via CSS selector: ${sel}`);
+            break;
+          }
+        } catch (_) {}
+      }
+    }
+  } catch (e) {
+    logger.warn(`[playwright.agent] fast path: submit click failed: ${e.message}`);
+  }
+
+  if (!submitted) {
+    logger.info(`[playwright.agent] fast path: could not find/click submit button — falling back to LLM`);
+    transcript.push({ step: 2, action: { action: 'click', purpose: 'submit' }, outcome: { ok: false, error: 'submit button not found' }, thoughts: 'fast path: no submit button' });
+    return null;
+  }
+
+  transcript.push({ step: 2, action: { action: 'click', purpose: 'submit' }, outcome: { ok: true }, thoughts: 'fast path: clicked submit' });
+
+  // Step 5: Wait for network response (2xx POST/PUT) — up to 5s
+  let networkStatus = null;
+  let networkVerified = false;
+  const _netWaitEnd = Date.now() + 5000;
+  while (Date.now() < _netWaitEnd) {
+    if (Date.now() > deadline) break;
+    await page.waitForTimeout(200);
+    const log = engine.getNetLog(sessionId);
+    const relevant = log.filter(e => e.ts >= _submitTs && /^(POST|PUT|PATCH)$/.test(e.method));
+    if (relevant.length > 0) {
+      const last = relevant[relevant.length - 1];
+      networkStatus = last.status;
+      networkVerified = last.status >= 200 && last.status < 300;
+      logger.info(`[playwright.agent] fast path: network verified — ${last.method} ${last.url.slice(0, 60)} → ${last.status}`);
+      break;
+    }
+  }
+
+  if (!networkVerified) {
+    logger.warn(`[playwright.agent] fast path: no 2xx network response within 5s — checking page state`);
+    // Check if compose area is gone (indicates success even without network evidence)
+    try {
+      const ceStillVisible = await page.locator('[contenteditable="true"]').count();
+      if (ceStillVisible === 0) {
+        logger.info(`[playwright.agent] fast path: compose area disappeared — treating as success`);
+        networkVerified = true;
+      }
+    } catch (_) {}
+  }
+
+  const execTime = Date.now() - startTs;
+  const result = {
+    ok: networkVerified,
+    goal,
+    sessionId,
+    turns: transcript.length,
+    done: networkVerified,
+    result: networkVerified
+      ? `Completed via Script-URL fast path${networkStatus ? ` (network: ${networkStatus})` : ''}`
+      : `Script-URL fast path: submitted but could not verify network response`,
+    transcript,
+    routingDecision: 'script_url_fast_path',
+    executionTime: execTime,
+  };
+
+  logger.info(`[playwright.agent] fast path complete: ok=${result.ok} verified=${networkVerified} status=${networkStatus} time=${execTime}ms`);
+  return result;
+}
+
+// ---------------------------------------------------------------------------
+// Semantic plan validation guard — rejects plans that contradict the stated goal
+// ---------------------------------------------------------------------------
+function _validatePlanSemantics(goal, plan, planThoughts, currentUrl) {
+  const _isSearchCountTask = /\b(count|find|check|list|how many|search|filter|unread|look\s*up)\b/i.test(goal);
+  if (!_isSearchCountTask) return null;
+
+  const _EXTRACT_ACTIONS = new Set(['run-code', 'getPageText', 'evaluate', 'return']);
+  const _INPUT_ACTIONS = new Set(['fill', 'type', 'click', 'press']);
+
+  const _urlHasSearchQuery = (() => {
+    try {
+      const u = new URL(currentUrl || '');
+      const search = u.search + (u.hash || '');
+      return /[?&#]search=|[?&#]q=|[?&#]query=|from:|is:unread|is:read|#search\//i.test(search);
+    } catch { return false; }
+  })();
+
+  const _firstExtractIdx = plan.findIndex(s => _EXTRACT_ACTIONS.has(normalizeStep(s)?.action));
+  const _firstInputIdx = plan.findIndex(s => {
+    const a = normalizeStep(s)?.action;
+    return _INPUT_ACTIONS.has(a);
+  });
+
+  if (_firstExtractIdx >= 0 && _firstInputIdx < 0 && !_urlHasSearchQuery) {
+    return {
+      violated: 'extraction_without_search',
+      message: 'Plan extracts data before any search/filter interaction. For count/find/check tasks, you MUST first use the search/filter UI (fill search box → press Enter or click search) before extracting results. The current URL does not contain an active search query.',
+    };
+  }
+
+  if (_firstExtractIdx >= 0 && _firstInputIdx >= 0 && _firstExtractIdx < _firstInputIdx && !_urlHasSearchQuery) {
+    return {
+      violated: 'extraction_before_search',
+      message: 'Plan extracts data before the search/filter interaction. Move the search/filter steps (fill, press/click) before any extraction step.',
+    };
+  }
+
+  const _thoughtsLower = String(planThoughts || '').toLowerCase();
+  if (/search|filter|query/.test(_thoughtsLower)) {
+    const _hasInputStep = plan.some(s => {
+      const a = normalizeStep(s)?.action;
+      return a === 'fill' || a === 'type' || (a === 'click' && /search|filter|submit/i.test(String(s.purpose || s.selector || '')));
+    });
+    if (!_hasInputStep && !_urlHasSearchQuery) {
+      return {
+        violated: 'thoughts_search_no_action',
+        message: 'Plan thoughts mention search/filter but no step fills a search box or clicks a search button. Add a fill+press/click sequence to perform the search before extraction.',
+      };
+    }
+  }
+
+  // ── CSS selector ban for read/count tasks ──────────────────────────────────
+  // run-code with site-internal CSS selectors (tr.zA, .zE, aria-label*="unread")
+  // returns wrong counts when the DOM structure changes. Force getPageText instead.
+  const _SITE_CSS_PATTERN = /\.(zA|zE|yX|bog|bqe|zF|y2|xW)\b|aria-label\s*\*\s*=\s*["']unread/i;
+  for (const step of plan) {
+    const _norm = normalizeStep(step);
+    if (!_norm) continue;
+    if (_norm.action === 'run-code' && typeof step.code === 'string') {
+      if (_SITE_CSS_PATTERN.test(step.code)) {
+        return {
+          violated: 'brittle_css_selector',
+          message: 'Plan uses run-code with site-internal CSS selectors (e.g. tr.zA, .zE, .yX, aria-label*="unread") for a read/count task. These selectors break across UI updates and return wrong counts. Use { "action": "getPageText" } instead — it captures all visible text reliably without site-specific CSS.',
+        };
+      }
+    }
+  }
+
+  return null;
+}
+
+// ---------------------------------------------------------------------------
 // Main entry point
 // ---------------------------------------------------------------------------
 async function playwrightAgent(args) {
@@ -1977,66 +2796,126 @@ async function playwrightAgent(args) {
   const transcript = [];
   let finalResult = null; // set by a 'return' step if present
 
-  // ── Pre-navigation ─────────────────────────────────────────────────────────
+  // ── Pre-navigation (engine fast path first, CLI fallback) ──────────────────
   if (url) {
     // Check if browser is already on the target URL — browser.agent may have already
     // navigated there during the auth probe. Skip redundant re-navigation to avoid
     // a full page reload (~8s saved) and preserve page state.
     let _alreadyOnTarget = false;
     try {
-      const _curUrlRes = await browserAct({ action: 'evaluate', text: 'window.location.href', sessionId, headed, timeoutMs: 5000 });
-      if (_curUrlRes?.ok && _curUrlRes?.result) {
-        const _curUrl = String(_curUrlRes.result).trim().replace(/^"|"$/g, '');
+      const _engineUrlRes = await _engineEval(sessionId, 'window.location.href');
+      if (_engineUrlRes?.ok && _engineUrlRes.result) {
+        const _curUrl = String(_engineUrlRes.result).trim().replace(/^"|"$/g, '');
         const _normCur = _curUrl.replace(/\/+$/, '').split('?')[0];
         const _normTarget = url.replace(/\/+$/, '').split('?')[0];
         if (_normCur === _normTarget) {
           _alreadyOnTarget = true;
           logger.info(`[playwright.agent] already on target URL ${_curUrl} — skipping redundant navigation`);
         }
+      } else if (_engineUrlRes === null) {
+        // Engine is not active — do NOT fall back to CLI evaluate, which would
+        // launch a CLI Chrome with the same profile and conflict with the engine
+        // launch in navigate(). Just proceed to navigate which will start the engine.
+        logger.info(`[playwright.agent] engine not active for URL pre-check — skipping CLI fallback to avoid profile conflict`);
+      } else {
+        // Engine is active but eval failed — CLI fallback is safe (engine already holds the profile)
+        if (!_alreadyOnTarget) {
+          const _curUrlRes = await browserAct({ action: 'evaluate', text: 'window.location.href', sessionId, headed, timeoutMs: 5000 });
+          if (_curUrlRes?.ok && _curUrlRes?.result) {
+            const _curUrl = String(_curUrlRes.result).trim().replace(/^"|"$/g, '');
+            const _normCur = _curUrl.replace(/\/+$/, '').split('?')[0];
+            const _normTarget = url.replace(/\/+$/, '').split('?')[0];
+            if (_normCur === _normTarget) {
+              _alreadyOnTarget = true;
+              logger.info(`[playwright.agent] already on target URL ${_curUrl} — skipping redundant navigation`);
+            }
+          }
+        }
       }
     } catch (_) {}
 
     if (!_alreadyOnTarget) {
       logger.info(`[playwright.agent] navigating to: ${url}`);
-      const navResult = await browserAct({ action: 'navigate', sessionId, url, headed, timeoutMs: Math.max(timeoutMs, 30000) });
-      if (!navResult.ok) {
-        return {
-          ok: false, goal, sessionId, turns: 0, done: false,
-          result: `Failed to navigate to starting URL: ${navResult.error}`,
-          transcript: [], error: navResult.error, executionTime: Date.now() - start,
-        };
+      // Engine fast path: direct page.goto() — no subprocess
+      const _engineNav = await _engineNavigate(sessionId, url, Math.max(timeoutMs, 30000));
+      if (!_engineNav?.ok) {
+        // CLI fallback
+        const navResult = await browserAct({ action: 'navigate', sessionId, url, headed, timeoutMs: Math.max(timeoutMs, 30000) });
+        if (!navResult.ok) {
+          return {
+            ok: false, goal, sessionId, turns: 0, done: false,
+            result: `Failed to navigate to starting URL: ${navResult.error}`,
+            transcript: [], error: navResult.error, executionTime: Date.now() - start,
+          };
+        }
+      }
+    }
+  }
+
+  // ── Script-URL fast path: compose-and-submit tasks (no LLM needed) ──────────
+  // When the URL matches a compose pattern AND the goal contains text to post/type,
+  // execute a deterministic type → submit → verify-network flow (2-5s) instead of
+  // the full snapshot → LLM plan → execute loop (30-120s).
+  if (url && engine.isSessionActive(sessionId)) {
+    const _composeRe = /shareActive=true|compose\/post|compose=new|\/compose\b|posting\?compose=true/i;
+    if (_composeRe.test(url)) {
+      // Gmail multi-field compose is handled by Tier 1.5 selector map (below).
+      // The single-text fast path cannot handle it.
+      if (/mail\.google\.com.*compose=new/.test(url)) {
+        logger.info(`[playwright.agent] Script-URL fast path: skipping Gmail multi-field compose — Tier 1.5 selector map will handle`);
+      } else {
+        // Extract the text to type from the goal — look for quoted text or text after "post"/"type"
+        const _textMatch = goal.match(/["'](.{3,5000})["']/) || goal.match(/(?:post|type|write|share)[:\s]+(.{3,5000})$/i);
+        if (_textMatch) {
+          const _composeText = _textMatch[1].trim();
+          logger.info(`[playwright.agent] Script-URL fast path: compose URL detected + text extracted (${_composeText.length} chars) — deterministic flow`);
+          try {
+            const _fastResult = await _scriptUrlFastPath(sessionId, _composeText, goal, start, _deadline);
+            if (_fastResult) return _fastResult;
+            // If fast path returns null, fall through to normal LLM flow
+            logger.info(`[playwright.agent] Script-URL fast path: could not complete — falling back to LLM plan`);
+          } catch (_fastErr) {
+            logger.warn(`[playwright.agent] Script-URL fast path error (non-fatal): ${_fastErr.message} — falling back to LLM plan`);
+          }
+        }
       }
     }
   }
 
   // ── Phase 1: Wait for redirect to settle, then for SPA to stabilise ──────
-  // Shortcut URLs (e.g. notion.new) redirect through one or more intermediate URLs
-  // before landing on the final destination. If we snapshot during the redirect,
-  // we capture a blank/interstitial page and the LLM generates a plan against
-  // zero elements — causing wrong-element clicks and mistyped content.
+  // page.goto() with waitUntil:'domcontentloaded' already handles HTTP redirects.
+  // JS-based redirects (e.g. notion.new → notion.so/...) need a short settle.
+  // Reduced from 15×1s polls to 3×500ms — domcontentloaded covers most cases.
   if (url) {
     let _prevHref = '';
     let _hrefStable = false;
-    for (let _i = 0; _i < 15; _i++) {
+    for (let _i = 0; _i < 3; _i++) {
       _checkDeadline();
-      const _hrefRes = await browserAct({ action: 'evaluate', text: 'window.location.href', sessionId, headed, timeoutMs: 5000 }).catch(() => ({ ok: false }));
-      const _curHref = _hrefRes?.ok ? String(_hrefRes.result || '').replace(/^"|"$/g, '') : '';
+      // Engine fast path for URL check
+      const _engineHrefRes = await _engineEval(sessionId, 'window.location.href');
+      let _curHref = '';
+      if (_engineHrefRes?.ok && _engineHrefRes.result) {
+        _curHref = String(_engineHrefRes.result).trim().replace(/^"|"$/g, '');
+      } else {
+        const _hrefRes = await browserAct({ action: 'evaluate', text: 'window.location.href', sessionId, headed, timeoutMs: 5000 }).catch(() => ({ ok: false }));
+        _curHref = _hrefRes?.ok ? String(_hrefRes.result || '').replace(/^"|"$/g, '') : '';
+      }
       if (_curHref && _curHref === _prevHref) {
         _hrefStable = true;
         logger.info(`[playwright.agent] phase 1: redirect settled on ${_curHref} after ${_i + 1} check(s)`);
         break;
       }
       _prevHref = _curHref;
-      await new Promise(r => setTimeout(r, 1000));
+      await new Promise(r => setTimeout(r, 500));
     }
     if (!_hrefStable) {
-      logger.warn(`[playwright.agent] phase 1: redirect did not stabilize after 15s — proceeding with current page`);
+      logger.warn(`[playwright.agent] phase 1: redirect did not stabilize after 1.5s — proceeding with current page`);
     }
     logger.info(`[playwright.agent] phase 1: waiting for page to stabilise before snapshot`);
     await browserAct({ action: 'waitForStableText', sessionId, headed, timeoutMs: Math.min(timeoutMs, 15000) });
   }
   logger.info(`[playwright.agent] phase 1: snapshot`);
-  const initSnap = await browserAct({ action: 'snapshot', sessionId, headed, timeoutMs });
+  const initSnap = await _fastSnapshot(sessionId, headed, timeoutMs);
   let currentSnapshot = (initSnap.ok && initSnap.result) ? initSnap.result : '';
 
   // Compute hostname from the actual post-navigation browser URL.
@@ -2045,9 +2924,16 @@ async function playwrightAgent(args) {
   let hostname = null;
   if (url) {
     try {
-      const navResult = await browserAct({ action: 'evaluate', text: 'window.location.hostname', sessionId, headed, timeoutMs: 5000 });
-      if (navResult.ok && navResult.result) {
-        hostname = String(navResult.result).replace(/^www\./, '').toLowerCase();
+      // Engine fast path for hostname
+      const _engineHostRes = await _engineEval(sessionId, 'window.location.hostname');
+      if (_engineHostRes?.ok && _engineHostRes.result) {
+        hostname = String(_engineHostRes.result).trim().replace(/^"|"$/g, '').replace(/^www\./, '').toLowerCase();
+      }
+      if (!hostname) {
+        const navResult = await browserAct({ action: 'evaluate', text: 'window.location.hostname', sessionId, headed, timeoutMs: 5000 });
+        if (navResult.ok && navResult.result) {
+          hostname = String(navResult.result).replace(/^www\./, '').toLowerCase();
+        }
       }
     } catch (_) { /* fall back to URL-derived hostname */ }
     if (!hostname) {
@@ -2058,6 +2944,95 @@ async function playwrightAgent(args) {
   const domainLockBlock = hostname
     ? `\n\nDOMAIN LOCK — ABSOLUTE:\nYou are automating '${hostname}'. NEVER navigate to any external site (not Google, Bing, DuckDuckGo, or anywhere outside ${hostname}). Any navigate step MUST stay on '${hostname}'.`
     : '';
+
+  // ── Verify gate: deterministic checks before any routing/planning ──────────
+  // Ensures the page is actually loaded and on the right domain before we
+  // attempt Tier 1.5/2/2.5/3. Prevents planning against about:blank or broken pages.
+  if (url && hostname) {
+    let _verifyOk = false;
+    let _verifyRetry = false;
+    try {
+      const _vgUrl = await _engineEval(sessionId, 'window.location.href');
+      const _vgTextLen = await _engineEval(sessionId, '(document.body && document.body.innerText ? document.body.innerText.length : 0)');
+      const _vgActualUrl = _vgUrl?.ok ? String(_vgUrl.result).trim().replace(/^"|"$/g, '') : '';
+      const _vgTextNum = _vgTextLen?.ok ? Number(_vgTextLen.result) : 0;
+
+      if (/about:blank/i.test(_vgActualUrl)) {
+        logger.warn(`[playwright.agent] verify gate: page is about:blank — navigating back to ${url}`);
+        _verifyRetry = true;
+      } else if (_vgTextNum < 100) {
+        logger.warn(`[playwright.agent] verify gate: page has ${_vgTextNum} chars of text — waiting for stabilisation`);
+        _verifyRetry = true;
+      } else {
+        // Check hostname match
+        try {
+          const _vgHost = new URL(_vgActualUrl).hostname.replace(/^www\./, '').toLowerCase();
+          if (_vgHost !== hostname && !_vgHost.endsWith('.' + hostname) && !hostname.endsWith('.' + _vgHost)) {
+            logger.warn(`[playwright.agent] verify gate: hostname mismatch — expected ${hostname}, got ${_vgHost}`);
+            _verifyRetry = true;
+          } else {
+            _verifyOk = true;
+            logger.info(`[playwright.agent] verify gate: OK (host=${_vgHost}, textLen=${_vgTextNum})`);
+          }
+        } catch (_) {
+          _verifyOk = true; // URL parse failed — don't block on this
+        }
+      }
+
+      if (_verifyRetry) {
+        // Recovery: navigate back to start URL, wait for stabilisation, re-check
+        const _engineNav = await _engineNavigate(sessionId, url, Math.max(timeoutMs, 30000));
+        if (!_engineNav?.ok) {
+          await browserAct({ action: 'navigate', url, sessionId, headed, timeoutMs: Math.max(timeoutMs, 30000) }).catch(() => {});
+        }
+        await browserAct({ action: 'waitForStableText', sessionId, headed, timeoutMs: 10000 }).catch(() => {});
+        // Re-check
+        const _vgUrl2 = await _engineEval(sessionId, 'window.location.href');
+        const _vgTextLen2 = await _engineEval(sessionId, '(document.body && document.body.innerText ? document.body.innerText.length : 0)');
+        const _vgActualUrl2 = _vgUrl2?.ok ? String(_vgUrl2.result).trim().replace(/^"|"$/g, '') : '';
+        const _vgTextNum2 = _vgTextLen2?.ok ? Number(_vgTextLen2.result) : 0;
+
+        if (/about:blank/i.test(_vgActualUrl2) || _vgTextNum2 < 100) {
+          logger.error(`[playwright.agent] verify gate: page still broken after recovery — aborting`);
+          return {
+            ok: false, goal, sessionId,
+            turns: 0, done: false,
+            result: `Page verification failed — could not load ${url}`,
+            error: `Verify gate: page is about:blank or empty after recovery attempt`,
+            transcript: [],
+            executionTime: Date.now() - start,
+          };
+        }
+        // Re-snapshot after recovery
+        const _vgSnap = await _fastSnapshot(sessionId, headed, timeoutMs);
+        if (_vgSnap.ok && _vgSnap.result) currentSnapshot = _vgSnap.result;
+        logger.info(`[playwright.agent] verify gate: recovered after re-navigation (textLen=${_vgTextNum2})`);
+      }
+    } catch (_vgErr) {
+      logger.warn(`[playwright.agent] verify gate error (non-fatal): ${_vgErr.message} — proceeding`);
+    }
+  }
+
+  // ── Tier 1.5: Deterministic selector map for form/compose URLs ──────────────
+  // After URL-first navigation + waitForStableText, try cached or LLM-generated
+  // selector map for type→verify→submit→verify. Falls through to Tier 2/3 on failure.
+  if (url && hostname && engine.isSessionActive(sessionId)) {
+    try {
+      const _curUrl = await _engineEval(sessionId, 'window.location.href');
+      const _actualUrl = _curUrl?.ok ? String(_curUrl.result).trim().replace(/^"|"$/g, '') : url;
+      if (isFormUrl(url) || isFormUrl(_actualUrl)) {
+        logger.info(`[playwright.agent] Tier 1.5: form URL detected (url=${url} actualUrl=${_actualUrl}) — trying deterministic selector map`);
+        const _tier15Result = await _deterministicSelectorPath(sessionId, url, goal, hostname, timeoutMs);
+        if (_tier15Result) {
+          _tier15Result.executionTime = Date.now() - start;
+          return _tier15Result;
+        }
+        logger.info(`[playwright.agent] Tier 1.5: selector map did not complete — falling through to Tier 2/3`);
+      }
+    } catch (_tier15Err) {
+      logger.warn(`[playwright.agent] Tier 1.5 error (non-fatal): ${_tier15Err.message} — falling through`);
+    }
+  }
 
   // ── Phase 1.1: Page probe + intelligent routing ─────────────────────────────
   // Lightweight eval to classify page structure (canvas, traditional, hybrid, sparse).
@@ -2093,9 +3068,16 @@ async function playwrightAgent(args) {
 
     logger.info(`[playwright.agent] phase 1.1: page probe → type=${_pageType}, service=${_service || 'unknown'}, interactive=${_probeResult?.interactiveCount ?? '?'}, contentEditable=${_probeResult?.contentEditableCount ?? '?'}`);
 
-    // Script DB lookup for (service, page_type)
+    // Script DB lookup for (service, page_type) — SKIPPED when URL-first is used
+    // The script DB's service extraction is too coarse (mail.google.com → "google")
+    // and causes false matches. When URL-first already delivered us to the right page,
+    // we go directly to Tier 2.5 (canvas) or Tier 3 (LLM plan).
     const _taskKeywords = extractKeywordsFromGoal(goal);
-    const _matchedScript = _service ? await getInteractionScript(_service, _pageType, _taskKeywords) : null;
+    const _urlFirst = !!url;
+    const _matchedScript = (!_urlFirst && _service) ? await getInteractionScript(_service, _pageType, _taskKeywords) : null;
+    if (_urlFirst) {
+      logger.info(`[playwright.agent] routing: URL-first path — skipping Tier 2 script DB, using Tier 2.5 (canvas) or Tier 3 (LLM) directly`);
+    }
 
     if (_matchedScript && (_pageType === 'canvas' || _pageType === 'hybrid')) {
       // Tier 2: Script-first execution
@@ -2369,6 +3351,45 @@ async function playwrightAgent(args) {
   let plan = planParsed.plan;
   logger.info(`[playwright.agent] plan generated: ${plan.length} steps — ${planParsed.thoughts}`);
 
+  // ── Semantic plan validation guard ────────────────────────────────────────
+  // Reject plans that extract data before performing a search/filter for
+  // count/find/check tasks. Retry once with the violated invariant appended.
+  {
+    let _currentUrlForValidation = url || '';
+    try {
+      const _urlEval = await _engineEval(sessionId, 'window.location.href');
+      if (_urlEval?.ok && _urlEval.result) {
+        _currentUrlForValidation = String(_urlEval.result).trim().replace(/^"|"$/g, '');
+      }
+    } catch (_) {}
+
+    let _semViolation = _validatePlanSemantics(goal, plan, planParsed.thoughts, _currentUrlForValidation);
+    if (_semViolation) {
+      logger.warn(`[playwright.agent] semantic plan validation FAILED: ${_semViolation.violated} — retrying with invariant`);
+      try {
+        const _retryRaw = await askWithMessages([
+          ...planMessages,
+          { role: 'user', content: `PLAN VALIDATION ERROR: ${_semViolation.message}\n\nRegenerate the plan fixing this issue. Ensure search/filter steps come BEFORE any extraction step.` },
+        ], { temperature: 0.15, maxTokens: _planMaxTokens, responseTimeoutMs: 30000 });
+        const _retryParsed = parseJson(_retryRaw);
+        if (_retryParsed && Array.isArray(_retryParsed.plan) && _retryParsed.plan.length > 0) {
+          const _retryViolation = _validatePlanSemantics(goal, _retryParsed.plan, _retryParsed.thoughts, _currentUrlForValidation);
+          if (!_retryViolation) {
+            logger.info(`[playwright.agent] semantic plan validation PASSED on retry: ${_retryParsed.plan.length} steps`);
+            plan = _retryParsed.plan;
+            planParsed.thoughts = _retryParsed.thoughts;
+          } else {
+            logger.warn(`[playwright.agent] semantic plan validation FAILED on retry too: ${_retryViolation.violated} — proceeding with corrected plan anyway`);
+            plan = _retryParsed.plan;
+            planParsed.thoughts = _retryParsed.thoughts;
+          }
+        }
+      } catch (_retryErr) {
+        logger.warn(`[playwright.agent] semantic plan validation retry failed: ${_retryErr.message}`);
+      }
+    }
+  }
+
   // Emit initial plan thoughts so the UI can show them under the step card
   if (planParsed.thoughts && _progressCallbackUrl) {
     postProgress(_progressCallbackUrl, {
@@ -2475,6 +3496,17 @@ async function playwrightAgent(args) {
   executionLoop: while (true) {
     while (stepIndex < plan.length) {
       _checkDeadline();
+      // Circuit breaker: if remaining time < per-action timeout, don't start a doomed action
+      const _remaining = _deadline - Date.now();
+      if (_remaining < timeoutMs) {
+        logger.warn(`[playwright.agent] circuit breaker: remaining ${_remaining}ms < timeoutMs ${timeoutMs}ms — aborting before step ${stepIndex}`);
+        return {
+          ok: false, goal, sessionId,
+          turns: transcript.length, done: false,
+          result: `Circuit breaker: insufficient time (${_remaining}ms) for next action (needs ${timeoutMs}ms)`,
+          transcript, error: 'Circuit breaker tripped', executionTime: Date.now() - start,
+        };
+      }
       let step = normalizeStep(plan[stepIndex]);
 
       // Inline return step — LLM returns extracted data as the final result
@@ -2526,7 +3558,7 @@ async function playwrightAgent(args) {
       // We MUST re-plan the subsequent steps from the new snapshot or they will use stale refs.
       if (step.action === 'snapshot') {
         logger.info(`[playwright.agent] step ${stepIndex + 1}/${plan.length}: snapshot + re-plan`);
-        const snap = await browserAct({ action: 'snapshot', sessionId, headed, timeoutMs });
+        const snap = await _fastSnapshot(sessionId, headed, timeoutMs);
         if (snap.ok && snap.result) currentSnapshot = snap.result;
 
         const remainingAfterSnap = plan.slice(stepIndex + 1);
@@ -2663,7 +3695,7 @@ async function playwrightAgent(args) {
           totalRepairs++;
           logger.info(`[playwright.agent] external_skill ${skillName} failed — repair ${totalRepairs}/${maxRepairs}: ${outcome.error}`);
           // Take a fresh snapshot to give repair LLM current page state
-          const repairSnap = await browserAct({ action: 'snapshot', sessionId, headed, timeoutMs });
+          const repairSnap = await _fastSnapshot(sessionId, headed, timeoutMs);
           if (repairSnap.ok && repairSnap.result) currentSnapshot = repairSnap.result;
           try {
             const repairRaw = await askWithMessages([
@@ -2680,7 +3712,7 @@ async function playwrightAgent(args) {
           } catch (_) { stepIndex++; }
         } else {
           // Re-snapshot after a successful external_skill — DOM may have changed (e.g. compose window opened)
-          const postSnap = await browserAct({ action: 'snapshot', sessionId, headed, timeoutMs });
+          const postSnap = await _fastSnapshot(sessionId, headed, timeoutMs);
           if (postSnap.ok && postSnap.result) {
             currentSnapshot = postSnap.result;
             // Re-plan remaining steps with fresh refs if DOM changed significantly
@@ -2725,69 +3757,108 @@ async function playwrightAgent(args) {
         };
       }
 
-      // ── Page-ready pre-condition: verify page is not blank before type/fill ──
-      // Prevents typing into wrong element when page is still loading/about:blank.
-      // This was the root cause of "Item 1" being typed into the Notion title: the
-      // page was blank when the plan was generated, so the LLM picked the wrong ref.
+      // ── Page-ready pre-condition: lightweight about:blank check ──────────────
+      // page.goto() with waitUntil:'domcontentloaded' already ensures the page is loaded.
+      // With direct Playwright handles, wrong-element risk is eliminated — no need for
+      // body.innerText.length heuristic. Keep only about:blank detection as safety net.
       if ((step.action === 'fill' || step.action === 'type') && (step.text || step.value)) {
         _checkDeadline();
-        const _readyCheck = await browserAct({ action: 'evaluate', text: 'window.location.href + "|" + document.body.innerText.length', sessionId, headed, timeoutMs: 3000 }).catch(() => ({ ok: false }));
-        if (_readyCheck?.ok) {
-          const [_curHref, _bodyLen] = String(_readyCheck.result || '').split('|');
-          if (/about:blank/i.test(_curHref) || parseInt(_bodyLen || '0', 10) < 10) {
-            logger.warn(`[playwright.agent] page-ready guard: page is blank/about:blank before ${step.action} — waiting 3s and re-checking`);
-            await new Promise(r => setTimeout(r, 3000));
-            const _reCheck = await browserAct({ action: 'evaluate', text: 'window.location.href + "|" + document.body.innerText.length', sessionId, headed, timeoutMs: 3000 }).catch(() => ({ ok: false }));
-            if (_reCheck?.ok) {
-              const [_reHref, _reBodyLen] = String(_reCheck.result || '').split('|');
-              if (/about:blank/i.test(_reHref) || parseInt(_reBodyLen || '0', 10) < 10) {
-                logger.warn(`[playwright.agent] page-ready guard: page still blank after 3s wait — skipping ${step.action} to prevent wrong-element typing`);
-                outcome = { ok: false, error: `Page is blank/about:blank — cannot safely ${step.action} into unknown element` };
-                transcript.push({ step: stepIndex + 1, action: step, outcome, thoughts: 'page-ready guard: blank page' });
-                postProgress(_progressCallbackUrl, {
-                  type: 'agent:turn', stepIndex: _stepIndex,
-                  turn: stepIndex + 1, maxTurns: plan.length,
-                  action: step, outcome: { ok: false, error: outcome.error }, thoughts: 'page-ready guard: blank page',
-                });
-                // Force repair path
-                if (totalRepairs >= maxRepairs) {
-                  return { ok: false, goal, sessionId, turns: transcript.length, done: false, result: `Page stayed blank — cannot execute ${step.action}`, transcript, error: outcome.error, executionTime: Date.now() - start };
+        let _isBlank = false;
+        const _engineReady = await _engineEval(sessionId, 'window.location.href');
+        if (_engineReady?.ok && _engineReady.result) {
+          _isBlank = /about:blank/i.test(String(_engineReady.result));
+        } else {
+          const _readyCheck = await browserAct({ action: 'evaluate', text: 'window.location.href', sessionId, headed, timeoutMs: 3000 }).catch(() => ({ ok: false }));
+          _isBlank = _readyCheck?.ok && /about:blank/i.test(String(_readyCheck.result || ''));
+        }
+        if (_isBlank) {
+            logger.warn(`[playwright.agent] page-ready guard: page is about:blank before ${step.action} — recovering by navigating to ${url || 'start URL'}`);
+            // Recovery: navigate back to start URL, wait for stabilisation, re-snapshot
+            if (url) {
+              const _engineNav = await _engineNavigate(sessionId, url, Math.max(timeoutMs, 30000));
+              if (!_engineNav?.ok) {
+                await browserAct({ action: 'navigate', url, sessionId, headed, timeoutMs: Math.max(timeoutMs, 30000) }).catch(() => {});
+              }
+              await browserAct({ action: 'waitForStableText', sessionId, headed, timeoutMs: 10000 }).catch(() => {});
+              const _recoverSnap = await _fastSnapshot(sessionId, headed, timeoutMs);
+              if (_recoverSnap.ok && _recoverSnap.result) currentSnapshot = _recoverSnap.result;
+              // Check if page is still blank after recovery
+              const _recoverUrl = await _engineEval(sessionId, 'window.location.href');
+              const _stillBlank = _recoverUrl?.ok && /about:blank/i.test(String(_recoverUrl.result));
+              if (!_stillBlank) {
+                logger.info(`[playwright.agent] page-ready guard: recovered from about:blank — invalidating refs and re-planning`);
+                // Invalidate engine snapshot so stale refs are not reused
+                invalidateEngineSnapshot(sessionId);
+                // Re-plan from the fresh snapshot instead of retrying with potentially stale refs
+                if (totalRepairs < maxRepairs) {
+                  totalRepairs++;
+                  try {
+                    const _recoverRepairRaw = await askWithMessages([
+                      { role: 'system', content: REPAIR_SYSTEM_PROMPT + domainLockBlock },
+                      { role: 'user', content: [
+                        `GOAL: ${goal}`,
+                        `FAILED_STEP: ${JSON.stringify(step)}`,
+                        `ERROR: Page was about:blank but has been recovered. Re-plan from the current page state.`,
+                        `REMAINING_PLAN: ${JSON.stringify(plan.slice(stepIndex))}`,
+                        ``,
+                        `SNAPSHOT:`,
+                        trimSnapshot(currentSnapshot),
+                      ].join('\n') },
+                    ], { temperature: 0.1, maxTokens: 1024, responseTimeoutMs: 20000 });
+                    const _recoverRepairParsed = parseJson(_recoverRepairRaw);
+                    if (_recoverRepairParsed && Array.isArray(_recoverRepairParsed.repair) && _recoverRepairParsed.repair.length > 0) {
+                      plan = [...plan.slice(0, stepIndex), ..._recoverRepairParsed.repair, ...plan.slice(stepIndex + 1)];
+                      logger.info(`[playwright.agent] page-ready guard recovery re-plan: ${_recoverRepairParsed.repair.length} steps`);
+                    } else { stepIndex++; }
+                  } catch (_) { stepIndex++; }
+                } else {
+                  stepIndex++;
                 }
-                totalRepairs++;
-                const _guardSnap = await browserAct({ action: 'snapshot', sessionId, headed, timeoutMs });
-                if (_guardSnap.ok && _guardSnap.result) currentSnapshot = _guardSnap.result;
-                try {
-                  const _guardRepairRaw = await askWithMessages([
-                    { role: 'system', content: REPAIR_SYSTEM_PROMPT + domainLockBlock },
-                    { role: 'user', content: [`GOAL: ${goal}`, `FAILED_STEP: ${JSON.stringify(step)}`, `ERROR: Page was blank/about:blank — the page may still be loading or redirecting. Wait for the page to fully load before retrying.`, `REMAINING_PLAN: ${JSON.stringify(plan.slice(stepIndex + 1))}`, ``, `SNAPSHOT:`, trimSnapshot(currentSnapshot)].join('\n') },
-                  ], { temperature: 0.1, maxTokens: 1024, responseTimeoutMs: 20000 });
-                  const _guardRepairParsed = parseJson(_guardRepairRaw);
-                  if (_guardRepairParsed && Array.isArray(_guardRepairParsed.repair) && _guardRepairParsed.repair.length > 0) {
-                    plan = [...plan.slice(0, stepIndex), ..._guardRepairParsed.repair, ...plan.slice(stepIndex + 1)];
-                    logger.info(`[playwright.agent] page-ready guard repair: ${_guardRepairParsed.repair.length} corrective steps`);
-                  } else { stepIndex++; }
-                } catch (_) { stepIndex++; }
                 continue;
               }
             }
-          }
+            // Recovery failed or no URL — fall through to repair path
+            logger.warn(`[playwright.agent] page-ready guard: recovery failed — falling back to repair`);
+            outcome = { ok: false, error: `Page is about:blank — cannot safely ${step.action} into unknown element` };
+            transcript.push({ step: stepIndex + 1, action: step, outcome, thoughts: 'page-ready guard: blank page' });
+            postProgress(_progressCallbackUrl, {
+              type: 'agent:turn', stepIndex: _stepIndex,
+              turn: stepIndex + 1, maxTurns: plan.length,
+              action: step, outcome: { ok: false, error: outcome.error }, thoughts: 'page-ready guard: blank page',
+            });
+            // Force repair path
+            if (totalRepairs >= maxRepairs) {
+              return { ok: false, goal, sessionId, turns: transcript.length, done: false, result: `Page stayed blank — cannot execute ${step.action}`, transcript, error: outcome.error, executionTime: Date.now() - start };
+            }
+            totalRepairs++;
+            const _guardSnap = await _fastSnapshot(sessionId, headed, timeoutMs);
+            if (_guardSnap.ok && _guardSnap.result) currentSnapshot = _guardSnap.result;
+            try {
+              const _guardRepairRaw = await askWithMessages([
+                { role: 'system', content: REPAIR_SYSTEM_PROMPT + domainLockBlock },
+                { role: 'user', content: [`GOAL: ${goal}`, `FAILED_STEP: ${JSON.stringify(step)}`, `ERROR: Page was about:blank — the page may still be loading or redirecting. Wait for the page to fully load before retrying.`, `REMAINING_PLAN: ${JSON.stringify(plan.slice(stepIndex + 1))}`, ``, `SNAPSHOT:`, trimSnapshot(currentSnapshot)].join('\n') },
+              ], { temperature: 0.1, maxTokens: 1024, responseTimeoutMs: 20000 });
+              const _guardRepairParsed = parseJson(_guardRepairRaw);
+              if (_guardRepairParsed && Array.isArray(_guardRepairParsed.repair) && _guardRepairParsed.repair.length > 0) {
+                plan = [...plan.slice(0, stepIndex), ..._guardRepairParsed.repair, ...plan.slice(stepIndex + 1)];
+                logger.info(`[playwright.agent] page-ready guard repair: ${_guardRepairParsed.repair.length} corrective steps`);
+              } else { stepIndex++; }
+            } catch (_) { stepIndex++; }
+            continue;
         }
       }
 
       // ── Deduplication: skip redundant fill/type of same text ───────────────
       // Check both 'value' (fill) and 'text' (type) properties for deduplication
-      if ((step.action === 'fill' || step.action === 'type')) {
-        const textToType = step.value || step.text;
-        if (typeof textToType === 'string') {
-          // Normalize: trim whitespace and lowercase for comparison
-          const normalizedText = textToType.trim().toLowerCase();
-          if (normalizedText.length > 0 && _typedTexts.has(normalizedText)) {
-            logger.info(`[playwright.agent] deduplication: skipping duplicate ${step.action} for "${textToType.slice(0, 40)}..."`);
-            stepIndex++;
-            continue;
-          }
-          _typedTexts.add(normalizedText);
-        }
+      // NOTE: Text is only marked as typed AFTER a confirmed successful action.
+      // Marking before execution would prevent retries on failure.
+      const _pendingDedupText = (step.action === 'fill' || step.action === 'type') && typeof (step.value || step.text) === 'string'
+        ? (step.value || step.text).trim().toLowerCase()
+        : null;
+      if (_pendingDedupText && _pendingDedupText.length > 0 && _typedTexts.has(_pendingDedupText)) {
+        logger.info(`[playwright.agent] deduplication: skipping duplicate ${step.action} for "${(step.value || step.text).slice(0, 40)}..."`);
+        stepIndex++;
+        continue;
       }
 
       try {
@@ -2974,6 +4045,9 @@ async function playwrightAgent(args) {
       if (outcome.ok) {
         if (step.action === 'fill' || step.action === 'type') {
           _hasFillOrType = true;
+          if (_pendingDedupText) {
+            _typedTexts.add(_pendingDedupText);
+          }
         }
         if (step.action === 'click' && _hasFillOrType) {
           const _purpose = String(step.purpose || '').toLowerCase();
@@ -2997,8 +4071,8 @@ async function playwrightAgent(args) {
       });
 
       if (outcome.ok) {
-        if (step.action === 'run-code' && outcome.result) {
-          lastRunCodeResult = outcome.result;
+        if (step.action === 'run-code' && outcome.result != null) {
+          lastRunCodeResult = typeof outcome.result === 'string' ? outcome.result : (outcome.stdout || String(outcome.result));
         }
         if (step.action === 'getPageText' && outcome.result) {
           lastGetPageTextResult = outcome.result;
@@ -3016,7 +4090,7 @@ async function playwrightAgent(args) {
             try {
               await browserAct({ action: 'navigate', url, sessionId, headed, timeoutMs: Math.max(timeoutMs, 30000) });
               await browserAct({ action: 'waitForStableText', sessionId, headed, timeoutMs: 15000 });
-              const retrySnap = await browserAct({ action: 'snapshot', sessionId, headed, timeoutMs });
+              const retrySnap = await _fastSnapshot(sessionId, headed, timeoutMs);
               if (retrySnap.ok && retrySnap.result) currentSnapshot = retrySnap.result;
               // Build placeholder warning for self-healing feedback loop
               const httpPlaceholderWarning = placeholderWarnings.size > 0
@@ -3050,7 +4124,7 @@ async function playwrightAgent(args) {
         }
         if (step.action === 'sendEmailWithVerification' && !_emailAlreadySent) {
           _emailAlreadySent = true;
-          finalResult = outcome.result || 'Email sent and verified successfully';
+          finalResult = outcome.result != null ? String(outcome.result) : 'Email sent and verified successfully';
           const _emailRecipient = (goal.match(/\b([\w.+-]+@[\w.-]+\.[a-zA-Z]{2,})\b/) || [])[1] || null;
           const _emailSubjectMatch = goal.match(/subject\s*['"]\s*([^'"]+)['"]/i) || goal.match(/subject\s+([^,]+)/i);
           const _emailSubject = _emailSubjectMatch ? _emailSubjectMatch[1].trim() : null;
@@ -3096,6 +4170,13 @@ async function playwrightAgent(args) {
         // (recipient chip confirmation handled pre-emptively in the
         //  mail recipient fill interceptor above via click+type+Tab)
 
+        // ── Invalidate engine snapshot after DOM-mutating actions ──────────────
+        // The plan-bound refs are no longer valid after the DOM changes.
+        // The post-action snapshot below will create a fresh generation.
+        if (isDomMutating && outcome.ok) {
+          invalidateEngineSnapshot(sessionId);
+        }
+
         // ── Expectation-Driven Execution: Verify action achieved expected outcome ─────
         // Instead of blind DOM change detection, we verify that the action achieved its goal
         // For recipe-driven tasks, skip automatic post-snapshot for fill/type/press —
@@ -3105,7 +4186,7 @@ async function playwrightAgent(args) {
           // Capture pre-snapshot before updating currentSnapshot (used by confidence scoring below)
           const _preStepSnapshot = currentSnapshot;
           // Take a fresh snapshot after the action
-          const postSnap = await browserAct({ action: 'snapshot', sessionId, headed, timeoutMs });
+          const postSnap = await _fastSnapshot(sessionId, headed, timeoutMs);
           if (postSnap.ok && postSnap.result) {
             currentSnapshot = postSnap.result;
           }
@@ -3212,7 +4293,7 @@ async function playwrightAgent(args) {
           _stepConf = Math.max(0, _stepConf);
           if (_stepConf < 0.5 && totalRepairs < maxRepairs && stepIndex < plan.length - 1) {
             logger.warn(`[playwright.agent] step-confidence ${_stepConf.toFixed(2)} < 0.5 after step ${stepIndex + 1} (${step.action}) — triggering micro-replan for remaining ${plan.length - stepIndex - 1} step(s)`);
-            const _microSnap = await browserAct({ action: 'snapshot', sessionId, headed, timeoutMs }).catch(() => ({ ok: false }));
+            const _microSnap = await _fastSnapshot(sessionId, headed, timeoutMs).catch(() => ({ ok: false }));
             if (_microSnap.ok && _microSnap.result) {
               currentSnapshot = _microSnap.result;
               const _microRemaining = plan.slice(stepIndex + 1);
@@ -3295,6 +4376,51 @@ async function playwrightAgent(args) {
       totalRepairs++;
       logger.info(`[playwright.agent] step ${stepIndex + 1} failed — repair ${totalRepairs}/${maxRepairs}: ${outcome.error}`);
 
+      // ── Stale-ref fast-path: take a fresh snapshot and re-plan ──────────────
+      // When browser.act returns a staleRef failure, the plan-bound refs are no
+      // longer valid. Skip the generic repair LLM and directly re-plan from a
+      // fresh snapshot with the remaining steps.
+      if (outcome.staleRef) {
+        logger.info(`[playwright.agent] stale-ref detected — taking fresh snapshot and re-planning remaining steps`);
+        invalidateEngineSnapshot(sessionId);
+        const _staleSnap = await _fastSnapshot(sessionId, headed, timeoutMs);
+        if (_staleSnap.ok && _staleSnap.result) currentSnapshot = _staleSnap.result;
+        try {
+          const _staleRepairRaw = await askWithMessages([
+            { role: 'system', content: REPAIR_SYSTEM_PROMPT + domainLockBlock },
+            { role: 'user', content: [
+              `GOAL: ${goal}`,
+              `FAILED_STEP: ${JSON.stringify(step)}`,
+              `ERROR: Stale ref — the element ref from the previous snapshot no longer resolves. Re-plan from the current page state.`,
+              `REMAINING_PLAN: ${JSON.stringify(plan.slice(stepIndex))}`,
+              ``,
+              `SNAPSHOT:`,
+              trimSnapshot(currentSnapshot),
+            ].join('\n') },
+          ], { temperature: 0.1, maxTokens: 1024, responseTimeoutMs: 20000 });
+          const _staleRepairParsed = parseJson(_staleRepairRaw);
+          if (_staleRepairParsed && Array.isArray(_staleRepairParsed.repair) && _staleRepairParsed.repair.length > 0) {
+            plan = [...plan.slice(0, stepIndex), ..._staleRepairParsed.repair, ...plan.slice(stepIndex + 1)];
+            logger.info(`[playwright.agent] stale-ref re-plan: ${_staleRepairParsed.repair.length} corrective steps`);
+          } else {
+            stepIndex++;
+          }
+        } catch (_) { stepIndex++; }
+        continue;
+      }
+
+      // ── Engine-health failure: abort immediately, do not feed to LLM repair ──
+      if (outcome.engineHealthFailure) {
+        logger.error(`[playwright.agent] engine health failure — aborting: ${outcome.error}`);
+        return {
+          ok: false, goal, sessionId,
+          turns: transcript.length, done: false,
+          result: `Engine health failure: ${outcome.error}`,
+          transcript, error: outcome.error, executionTime: Date.now() - start,
+          engineHealthFailure: true,
+        };
+      }
+
       // ── Check for login wall on failure ─────────────────────────────────────
       // Only check for login walls when a step actually fails (not after every action)
       if (hasPasswordFields(currentSnapshot) && hasLoginButton(currentSnapshot)) {
@@ -3344,7 +4470,7 @@ async function playwrightAgent(args) {
       await browserAct({ action: 'dialog-accept', sessionId, headed, timeoutMs: 3000 }).catch(() => {});
 
       // Fresh snapshot for repair context
-      const repairSnap = await browserAct({ action: 'snapshot', sessionId, headed, timeoutMs });
+      const repairSnap = await _fastSnapshot(sessionId, headed, timeoutMs);
       if (repairSnap.ok && repairSnap.result) currentSnapshot = repairSnap.result;
 
       // Get debugging context for enhanced repair
@@ -3432,7 +4558,7 @@ async function playwrightAgent(args) {
       // and would poison future planning sessions (e.g. "use page.url() instead of task" is incorrect).
       const _skipRuleLearning = ['task is not defined', 'results is not defined', 'globalState'].some(
         s => (outcome.error || '').includes(s)
-      );
+      ) || (step.action === 'run-code' && typeof step.code === 'string' && /\.(zA|zE|yX|bog|bqe|zF|y2|xW)\b|aria-label\s*\*\s*=\s*["']unread/i.test(step.code));
       if (!_skipRuleLearning && !repairParsed.skip_original && repairParsed.repair.length > 0) {
         (async () => {
           try {
@@ -3492,7 +4618,7 @@ async function playwrightAgent(args) {
     if (!_emailAlreadySent && (!finalResult || finalResult.length <= 100)) {
     try {
       await new Promise(r => setTimeout(r, 1000)); // 1s post-action settle
-      const _verifySnap = await browserAct({ action: 'snapshot', sessionId, headed, timeoutMs: 10000 });
+      const _verifySnap = await _fastSnapshot(sessionId, headed, 10000);
       if (_verifySnap.ok && _verifySnap.result) {
         const _lastActions = transcript.slice(-5).map(t => JSON.stringify(t.action)).join('\n');
         const _verifyMsg = [
@@ -3528,7 +4654,7 @@ async function playwrightAgent(args) {
           // Brief settle then re-snapshot + re-verify (only once, non-fatal if it fails)
           await new Promise(r => setTimeout(r, 800));
           try {
-            const _reVerifySnap = await browserAct({ action: 'snapshot', sessionId, headed, timeoutMs: 8000 });
+            const _reVerifySnap = await _fastSnapshot(sessionId, headed, 8000);
             if (_reVerifySnap.ok && _reVerifySnap.result) {
               const _reVerifyRaw = await askWithMessages([
                 { role: 'system', content: VERIFY_SYSTEM_PROMPT },
@@ -3666,7 +4792,24 @@ async function playwrightAgent(args) {
                 }
                 const _vOut = await browserAct({ ...(_vNorm || {}), sessionId, headed, timeoutMs });
                 transcript.push({ step: transcript.length + 1, action: _vNorm, outcome: _vOut, thoughts: 'verify-repair' });
-                if (_vOut.ok) _verifyWarning = null; // repair step succeeded — clear warning
+                if (_vOut.ok) {
+                  _verifyWarning = null; // repair step succeeded — clear warning
+                  // ── Stale result propagation fix ──────────────────────────────
+                  // When a repair step produces extraction output, replace the stale
+                  // finalResult/lastRunCodeResult/lastGetPageTextResult so downstream
+                  // synthesis sees the corrected value, not the earlier wrong one.
+                  const _vAction = _vNorm?.action;
+                  const _vResultStr = _vOut.result != null ? String(_vOut.result) : '';
+                  if (_vResultStr && (_vAction === 'run-code' || _vAction === 'getPageText' || _vAction === 'evaluate')) {
+                    if (_vAction === 'getPageText') {
+                      lastGetPageTextResult = _vResultStr;
+                    } else {
+                      lastRunCodeResult = _vResultStr;
+                    }
+                    finalResult = _vResultStr;
+                    logger.info(`[playwright.agent] verify-repair: replaced stale finalResult with ${_vAction} output (${_vResultStr.length} chars)`);
+                  }
+                }
               }
             }
           } catch (_vRepairErr) {
@@ -3679,7 +4822,7 @@ async function playwrightAgent(args) {
             return {
               ok: false, goal, sessionId,
               turns: transcript.length, done: false,
-              result: finalResult !== null ? finalResult : `Completed: ${goal}`,
+              result: finalResult !== null ? String(finalResult) : `Completed: ${goal}`,
               transcript,
               executionTime: Date.now() - start,
               verificationWarning: _verifyWarning,
@@ -3706,46 +4849,87 @@ async function playwrightAgent(args) {
     let _shouldReplan = false;
     let _replanPlan = null;
     try {
-      const _judgeSnap = await browserAct({ action: 'snapshot', sessionId, headed, timeoutMs: 10000 });
+      const _judgeSnap = await _fastSnapshot(sessionId, headed, 10000);
       const _judgePageText = (_judgeSnap.ok && _judgeSnap.result) ? _judgeSnap.result : currentSnapshot;
       if (_judgeSnap.ok && _judgeSnap.result) currentSnapshot = _judgeSnap.result;
+
+      // ── For read/count tasks, fetch getPageText so the judge sees visible page text ──
+      // The ARIA snapshot is designed for interaction (refs), not content reading.
+      // Gmail email rows show as sparse generic elements without sender/subject text.
+      // getPageText captures body.innerText — all visible text the user can see.
+      const _isReadCountTask = /\b(count|find|check|list|how many|unread|read|search|filter|look\s*up)\b/i.test(goal);
+      let _judgeVisibleText = '';
+      if (_isReadCountTask) {
+        try {
+          const _judgeGpt = await browserAct({ action: 'getPageText', sessionId, headed, timeoutMs: 10000 });
+          if (_judgeGpt.ok && _judgeGpt.result) {
+            _judgeVisibleText = String(_judgeGpt.result);
+            // Also update lastGetPageTextResult so downstream synthesis has fresh text
+            lastGetPageTextResult = _judgeVisibleText;
+            if (finalResult === null || finalResult.length < 50) {
+              finalResult = _judgeVisibleText;
+            }
+            logger.info(`[playwright.agent] goal-judge: getPageText fetched (${_judgeVisibleText.length} chars) for read/count task`);
+          }
+        } catch (_gptErr) {
+          logger.warn(`[playwright.agent] goal-judge: getPageText fetch failed (non-fatal): ${_gptErr.message}`);
+        }
+      }
 
       // Fetch current URL — the most reliable signal for whether an action executed
       // (e.g. search_query param proves search ran regardless of which UI mechanism was used)
       let _judgeCurrentUrl = '';
       try {
-        const _urlRes = await browserAct({ action: 'evaluate', text: 'window.location.href', sessionId, headed, timeoutMs: 3000 });
-        if (_urlRes.ok && _urlRes.result) {
-          _judgeCurrentUrl = String(_urlRes.result).trim().replace(/^"|"$/g, '');
+        const _engineUrlRes = await _engineEval(sessionId, 'window.location.href');
+        if (_engineUrlRes?.ok && _engineUrlRes.result) {
+          _judgeCurrentUrl = String(_engineUrlRes.result).trim().replace(/^"|"$/g, '');
+        } else {
+          const _urlRes = await browserAct({ action: 'evaluate', text: 'window.location.href', sessionId, headed, timeoutMs: 3000 });
+          if (_urlRes.ok && _urlRes.result) {
+            _judgeCurrentUrl = String(_urlRes.result).trim().replace(/^"|"$/g, '');
+          }
         }
       } catch (_) {}
 
       // ── Network mutation evidence (Issue 2c) ────────────────────────────────
-      // Collect window.__tdNetLog entries that occurred after _mutationClickTs to
-      // provide ground-truth network evidence to the goal-achievement judge.
+      // Use engine.getNetLog() (Playwright response event listeners) instead of
+      // evaluating window.__tdNetLog in the browser. Falls back to eval if engine inactive.
       let _mutationNetEvidence = '';
       if (_mutationClickTs) {
         try {
-          const _netRes = await browserAct({ action: 'evaluate', text: 'JSON.stringify(window.__tdNetLog || [])', sessionId, headed, timeoutMs: 3000 });
-          if (_netRes?.ok && _netRes?.result) {
-            let _rawNetResult = typeof _netRes.result === 'string' ? _netRes.result : JSON.stringify(_netRes.result);
-            let _netLog;
-            if (Array.isArray(_netRes.result)) {
-              // browser.act already auto-parsed the JSON — use it directly
-              _netLog = _netRes.result;
-              logger.info(`[playwright.agent] mutation net evidence: parsed via pre-parsed array`);
-            } else {
-              let _netLogStr = _rawNetResult.replace(/^"|"$/g, '');
-              try {
-                _netLog = JSON.parse(_netLogStr || '[]');
-                logger.info(`[playwright.agent] mutation net evidence: parsed directly`);
-              } catch (_) {
-                // playwright-cli prints the string result with escaped quotes:
-                // [{\"method\":\"POST\",...}] — unescape before parsing.
-                _netLog = JSON.parse(_netLogStr.replace(/\\"/g, '"').replace(/\\\\/g, '\\') || '[]');
-                logger.info(`[playwright.agent] mutation net evidence: parsed via unescape fallback`);
+          let _netLog = null;
+
+          // Engine fast path: get net log from Playwright response listeners
+          if (engine.isSessionActive(sessionId)) {
+            const engineLog = engine.getNetLog(sessionId);
+            if (engineLog && engineLog.length > 0) {
+              _netLog = engineLog;
+              logger.info(`[playwright.agent] mutation net evidence: via engine.getNetLog (${engineLog.length} entries)`);
+            }
+          }
+
+          // CLI fallback: evaluate window.__tdNetLog in the browser
+          if (!_netLog) {
+            const _netRes = await browserAct({ action: 'evaluate', text: 'JSON.stringify(window.__tdNetLog || [])', sessionId, headed, timeoutMs: 3000 });
+            if (_netRes?.ok && _netRes?.result) {
+              let _rawNetResult = typeof _netRes.result === 'string' ? _netRes.result : JSON.stringify(_netRes.result);
+              if (Array.isArray(_netRes.result)) {
+                _netLog = _netRes.result;
+                logger.info(`[playwright.agent] mutation net evidence: parsed via pre-parsed array`);
+              } else {
+                let _netLogStr = _rawNetResult.replace(/^"|"$/g, '');
+                try {
+                  _netLog = JSON.parse(_netLogStr || '[]');
+                  logger.info(`[playwright.agent] mutation net evidence: parsed directly`);
+                } catch (_) {
+                  _netLog = JSON.parse(_netLogStr.replace(/\\"/g, '"').replace(/\\\\/g, '\\') || '[]');
+                  logger.info(`[playwright.agent] mutation net evidence: parsed via unescape fallback`);
+                }
               }
             }
+          }
+
+          if (_netLog && _netLog.length > 0) {
             const _relevant = _netLog.filter(e => e.ts >= _mutationClickTs - 500);
             if (_relevant.length > 0) {
               const _summarized = _relevant.map(e => `${e.method} ${e.url.slice(0, 80)} → ${e.status}`).join('\n');
@@ -3764,7 +4948,7 @@ async function playwrightAgent(args) {
 
       const _stepSummary = transcript.map(t => `${t.action.action}:${t.outcome.ok ? 'ok' : 'fail'}`).join('; ');
       const _stepResults = transcript.slice(-3).map(t => {
-        const _res = t.outcome.result || t.outcome.error || '';
+        const _res = String(t.outcome.result ?? t.outcome.error ?? '');
         return `${t.action.action}:${t.outcome.ok ? 'ok' : 'fail'}${_res ? ` (${_res.slice(0, 120)})` : ''}`;
       }).join('; ');
       // Page content (lastGetPageTextResult) is the strongest signal for goal relevance —
@@ -3779,6 +4963,7 @@ STEPS EXECUTED: ${_stepSummary}
 RECENT STEP RESULTS: ${_stepResults}${_emailVerifyBlock}${_mutationNetEvidence}
 ${_judgeCurrentUrl ? `\nCURRENT URL: ${_judgeCurrentUrl}` : ''}
 ${_judgeContentSample ? `\nPAGE CONTENT (sample):\n${_judgeContentSample}` : ''}
+${_judgeVisibleText ? `\nVISIBLE PAGE TEXT (body.innerText, first 2000 chars):\n${_judgeVisibleText.slice(0, 2000)}` : ''}
 
 CURRENT PAGE SNAPSHOT (first 800 chars):
 ${_judgePageText.slice(0, 800)}
@@ -3795,6 +4980,7 @@ IMPORTANT RULES:
 - RICH TEXT EDITOR RULE: Google Docs, Notion, Confluence, and similar editors use canvas/custom rendering. Content typed via a prior 'type' or 'fill' action may NOT appear in the DOM snapshot even though it was entered successfully. If the action history includes type:ok or fill:ok with text content matching the goal, and the page is a rich text editor / contenteditable, consider the content as entered even if it doesn't appear in the page snapshot.
 - AUTOSAVE RULE: Transient save/sync indicators ("Saving…", "Syncing…", "Uploading…") are NORMAL autosave states and are NOT evidence of goal non-achievement. A "Saving…" or "Saved" indicator on a document editor means the action was accepted and is being persisted.
 - CANVAS APP RULE: For canvas apps (Notion, Google Docs, etc.), if page content is sparse but action history shows successful type/press steps matching the goal text, AND the page type was classified as 'canvas' or 'hybrid', consider the goal achieved. The ARIA tree cannot represent canvas content.
+- VISIBLE PAGE TEXT RULE: For read/count/find/check/list tasks, if VISIBLE PAGE TEXT is provided, use it as the PRIMARY evidence source — not the ARIA snapshot. The ARIA snapshot is designed for interaction (element refs), not content reading. Email rows, search results, and list items may not appear in the ARIA tree with their full text. If the VISIBLE PAGE TEXT contains the data the user asked for (e.g. email subjects, sender names, counts), the goal IS achieved even if the ARIA snapshot is sparse.
 
 Respond with JSON only — no markdown, no explanation outside the JSON:
 { "achieved": true, "reason": "one sentence citing page evidence" }
@@ -3854,7 +5040,7 @@ Set canRetry:false only if the goal is fundamentally impossible on this page/sit
             totalRepairs++;
             logger.warn(`[playwright.agent] Goal not achieved — adaptive replan ${totalRepairs}/${maxRepairs}: ${_judgeResult.reason}`);
 
-            const _replanSnap = await browserAct({ action: 'snapshot', sessionId, headed, timeoutMs });
+            const _replanSnap = await _fastSnapshot(sessionId, headed, timeoutMs);
             if (_replanSnap.ok && _replanSnap.result) currentSnapshot = _replanSnap.result;
 
             const _replanPrompt = `ORIGINAL GOAL: ${goal}
@@ -3948,7 +5134,7 @@ Return JSON: { "thoughts": "strategy explanation", "plan": [...steps] }`;
     totalTurns: transcript.length,
     done: true,
     ok: true,
-    result: finalResult !== null ? finalResult : `Completed: ${goal}`,
+    result: finalResult !== null ? String(finalResult) : `Completed: ${goal}`,
   });
   // Phase 8: Verification layer for Tier 3
   let _tier3Verification = null;
@@ -3977,17 +5163,22 @@ Return JSON: { "thoughts": "strategy explanation", "plan": [...steps] }`;
   return {
     ok: true, goal, sessionId,
     turns: transcript.length, done: true,
-    result: finalResult !== null ? finalResult : `Completed: ${goal}`,
+    result: finalResult !== null ? String(finalResult) : `Completed: ${goal}`,
     transcript,
     routingDecision: _routingDecision,
     pageType: _pageType,
     verification: _tier3Verification,
     executionTime: Date.now() - start,
+    extractionProvenance: finalResult !== null ? {
+      source: lastGetPageTextResult === finalResult ? 'getPageText' : lastRunCodeResult === finalResult ? 'run-code' : 'return',
+      verifyRepaired: transcript.some(t => t.thoughts === 'verify-repair' && t.outcome?.ok),
+    } : null,
   };
 }
 
 module.exports = {
   playwrightAgent,
+  _validatePlanSemantics,
   // Exported for testing and Phase 8 verification layer
   pageProbe,
   classifyPageType,
@@ -4008,4 +5199,11 @@ module.exports = {
   deriveActionFromGoal,
   extractKeywordsFromGoal,
   queueAsyncScriptGeneration,
+  // Tier 1.5: Deterministic selector maps
+  getSelectorMap,
+  saveSelectorMap,
+  incrementSelectorMapSuccess,
+  incrementSelectorMapFailure,
+  derivePagePattern,
+  isFormUrl,
 };

@@ -3,13 +3,18 @@
 /**
  * skill: browser.act
  *
- * Pure terminal browser automation — 100% playwright-cli subprocess calls.
- * No Playwright Node API. No npm packages. Just playwright-cli + shell.
+ * Hybrid browser automation — engine-first via Playwright Node API, with
+ * playwright-cli as a fallback for sessions not owned by the engine.
  *
- * Binary: /opt/homebrew/bin/playwright-cli  (brew install playwright-cli)
- * Sessions: -s=<sessionId> keeps a browser alive between calls.
- * Snapshot: captures accessibility tree with numbered refs (e1, e21, …)
- *           used for ref-based click/fill/hover/select.
+ * Engine: Playwright Node API (browser-engine.cjs) — primary driver.
+ *   Sessions: engine.launch() keeps a browser context alive between calls.
+ *   Snapshot: ariaSnapshot() with numbered refs (e1, e21, …)
+ *             used for ref-based click/fill/hover/select via getByRole().
+ *   Refs: resolved through _engineSnapshots refMap, bound to snapshot generation.
+ *
+ * CLI fallback: playwright-cli subprocess — only for sessions NOT owned by engine.
+ *   Binary: /opt/homebrew/bin/playwright-cli  (brew install playwright-cli)
+ *   Sessions: -s=<sessionId> keeps a browser alive between calls.
  *
  * Actions supported:
  *   navigate | goto | back | forward | reload | close | snapshot
@@ -52,6 +57,7 @@ const shellRun = require('./shell.run.cjs');
 const { buildAdBlockScript } = require('../utils/ad-block-init.js');
 const { BASELINE_DOMAINS } = require('../utils/ad-block-updater.cjs');
 const { setupInterception, clearAdBlockSession } = require('../utils/ad-block-network.cjs');
+const engine = require('./browser-engine.cjs');
 
 // Build the ad-block script once at module load.
 // Use only BASELINE_DOMAINS (~30 top ad networks) — NOT the full 46K cached list.
@@ -71,7 +77,7 @@ try {
   logger.warn(`[browser.act] Could not write ad-block script file: ${e.message}`);
 }
 
-// Generic debugging control for all playwright-cli tools
+// Generic debugging control for all browser automation tools
 const playwrightDebugEnabled = process.env.PLAYWRIGHT_DEBUG === 'true' || 
                               process.env.PLAYWRIGHT_DEBUG === 'on' || 
                               process.env.PLAYWRIGHT_DEBUG === '1';
@@ -159,52 +165,71 @@ async function startSessionTracing(sessionId) {
   debuggingSessions.set(sessionId, debugSession);
   logger.info(`[browser.act] Started debugging session for ${sessionId}`);
 
-  // Start tracing
-  try {
-    const traceResult = await cliRun([...sessionFlags(sessionId), 'tracing-start'], 5000);
-    if (traceResult.ok) {
+  // Start tracing — engine path
+  const _ctx = engine.getContext(sessionId);
+  if (_ctx) {
+    try {
+      await _ctx.tracing.start({ screenshots: true, snapshots: true });
       debugSession.tracingActive = true;
-      logger.info(`[browser.act] Started tracing for session=${sessionId}`);
-    } else {
-      logger.warn(`[browser.act] Failed to start tracing for session=${sessionId}: ${traceResult.error}`);
-    }
-  } catch (error) {
-    logger.warn(`[browser.act] Failed to start tracing for session=${sessionId}: ${error.message}`);
-  }
-
-  // Start video recording
-  try {
-    const videoResult = await cliRun([...sessionFlags(sessionId), 'video-start'], 5000);
-    if (videoResult.ok) {
-      debugSession.videoActive = true;
-      logger.info(`[browser.act] Started video recording for session=${sessionId}`);
-    } else {
-      logger.warn(`[browser.act] Failed to start video recording for session=${sessionId}: ${videoResult.error}`);
-    }
-  } catch (error) {
-    logger.warn(`[browser.act] Failed to start video recording for session=${sessionId}: ${error.message}`);
-  }
-
-  // Start DevTools for enhanced debugging
-  try {
-    const devToolsResult = await cliRun([...sessionFlags(sessionId), 'devtools-start'], 5000);
-    if (devToolsResult.ok) {
-      // Extract WebSocket URL from DevTools output
-      const devToolsOutput = devToolsResult.stdout || '';
-      const urlMatch = devToolsOutput.match(/Server is listening on:\s*(ws:\/\/[^\s]+)/);
-      if (urlMatch) {
-        const devToolsUrl = urlMatch[1].trim();
-        debugSession.devToolsActive = true;
-        debugSession.devToolsUrl = devToolsUrl;
-        logger.info(`[browser.act] Started DevTools for session=${sessionId}, URL: ${devToolsUrl}`);
+      logger.info(`[browser.act] Started tracing (engine) for session=${sessionId}`);
+    } catch (e) { logger.warn(`[browser.act] Tracing start (engine) failed: ${e.message}`); }
+  } else {
+    try {
+      const traceResult = await cliRun([...sessionFlags(sessionId), 'tracing-start'], 5000);
+      if (traceResult.ok) {
+        debugSession.tracingActive = true;
+        logger.info(`[browser.act] Started tracing for session=${sessionId}`);
       } else {
-        logger.warn(`[browser.act] Could not extract DevTools URL from output: ${devToolsOutput.slice(0, 200)}`);
+        logger.warn(`[browser.act] Failed to start tracing for session=${sessionId}: ${traceResult.error}`);
       }
-    } else {
-      logger.warn(`[browser.act] Failed to start DevTools for session=${sessionId}: ${devToolsResult.error}`);
+    } catch (error) {
+      logger.warn(`[browser.act] Failed to start tracing for session=${sessionId}: ${error.message}`);
     }
-  } catch (error) {
-    logger.warn(`[browser.act] Failed to start DevTools for session=${sessionId}: ${error.message}`);
+  }
+
+  // Start video recording — engine handles via context options, skip for CLI
+  if (!_ctx) {
+    try {
+      const videoResult = await cliRun([...sessionFlags(sessionId), 'video-start'], 5000);
+      if (videoResult.ok) {
+        debugSession.videoActive = true;
+        logger.info(`[browser.act] Started video recording for session=${sessionId}`);
+      } else {
+        logger.warn(`[browser.act] Failed to start video recording for session=${sessionId}: ${videoResult.error}`);
+      }
+    } catch (error) {
+      logger.warn(`[browser.act] Failed to start video recording for session=${sessionId}: ${error.message}`);
+    }
+  }
+
+  // Start DevTools — engine path uses CDP session
+  if (_ctx) {
+    try {
+      const cdpSession = await _ctx.newCDPSession(_ctx.pages()[0] || await _ctx.newPage());
+      debugSession.devToolsActive = true;
+      debugSession.devToolsUrl = 'cdp-session';
+      logger.info(`[browser.act] Started CDP session (engine) for session=${sessionId}`);
+    } catch (e) { logger.warn(`[browser.act] DevTools start (engine) failed: ${e.message}`); }
+  } else {
+    try {
+      const devToolsResult = await cliRun([...sessionFlags(sessionId), 'devtools-start'], 5000);
+      if (devToolsResult.ok) {
+        const devToolsOutput = devToolsResult.stdout || '';
+        const urlMatch = devToolsOutput.match(/Server is listening on:\s*(ws:\/\/[^\s]+)/);
+        if (urlMatch) {
+          const devToolsUrl = urlMatch[1].trim();
+          debugSession.devToolsActive = true;
+          debugSession.devToolsUrl = devToolsUrl;
+          logger.info(`[browser.act] Started DevTools for session=${sessionId}, URL: ${devToolsUrl}`);
+        } else {
+          logger.warn(`[browser.act] Could not extract DevTools URL from output: ${devToolsOutput.slice(0, 200)}`);
+        }
+      } else {
+        logger.warn(`[browser.act] Failed to start DevTools for session=${sessionId}: ${devToolsResult.error}`);
+      }
+    } catch (error) {
+      logger.warn(`[browser.act] Failed to start DevTools for session=${sessionId}: ${error.message}`);
+    }
   }
 }
 
@@ -223,47 +248,63 @@ async function stopSessionTracing(sessionId) {
   };
   
   if (debugSession.tracingActive) {
-    try {
-      const traceResult = await cliRun([...sessionFlags(sessionId), 'tracing-stop'], 5000);
-      if (traceResult.ok) {
-        // Extract trace file path from playwright-cli output
-        const traceOutput = traceResult.stdout || '';
-        const traceMatch = traceOutput.match(/\[Trace\]\(([^)]+)\)/);
-        if (traceMatch) {
-          const traceFile = traceMatch[1].trim();
-          debugSession.traceFile = traceFile;
-          traceData.traceFile = traceFile;
-          logger.info(`[browser.act] Stopped tracing for session=${sessionId}, trace file: ${traceFile}`);
-        } else {
-          logger.warn(`[browser.act] Could not extract trace file path from output: ${traceOutput.slice(0, 200)}`);
-        }
+    const _ctx = engine.getContext(sessionId);
+    if (_ctx) {
+      try {
+        const tracePath = path.join(os.homedir(), '.thinkdrop', 'traces', `${sessionId}-${Date.now()}.zip`);
+        fs.mkdirSync(path.dirname(tracePath), { recursive: true });
+        await _ctx.tracing.stop({ path: tracePath });
+        debugSession.traceFile = tracePath;
+        traceData.traceFile = tracePath;
         debugSession.tracingActive = false;
+        logger.info(`[browser.act] Stopped tracing (engine) for session=${sessionId}, trace file: ${tracePath}`);
+      } catch (e) { logger.warn(`[browser.act] Failed to stop tracing (engine): ${e.message}`); }
+    } else {
+      try {
+        const traceResult = await cliRun([...sessionFlags(sessionId), 'tracing-stop'], 5000);
+        if (traceResult.ok) {
+          const traceOutput = traceResult.stdout || '';
+          const traceMatch = traceOutput.match(/\[Trace\]\(([^)]+)\)/);
+          if (traceMatch) {
+            const traceFile = traceMatch[1].trim();
+            debugSession.traceFile = traceFile;
+            traceData.traceFile = traceFile;
+            logger.info(`[browser.act] Stopped tracing for session=${sessionId}, trace file: ${traceFile}`);
+          } else {
+            logger.warn(`[browser.act] Could not extract trace file path from output: ${traceOutput.slice(0, 200)}`);
+          }
+          debugSession.tracingActive = false;
+        }
+      } catch (error) {
+        logger.warn(`[browser.act] Failed to stop tracing for session=${sessionId}: ${error.message}`);
       }
-    } catch (error) {
-      logger.warn(`[browser.act] Failed to stop tracing for session=${sessionId}: ${error.message}`);
     }
   }
   
   if (debugSession.videoActive) {
-    try {
-      const videoResult = await cliRun([...sessionFlags(sessionId), 'video-stop'], 5000);
-      if (videoResult.ok) {
-        // Extract video file path from playwright-cli output
-        const videoOutput = videoResult.stdout || '';
-        const videoMatch = videoOutput.match(/\[Video\]\(([^)]+)\)/);
-        if (videoMatch) {
-          const videoFile = videoMatch[1].trim();
-          debugSession.videoFile = videoFile;
-          traceData.videoFile = videoFile;
-          logger.info(`[browser.act] Stopped video recording for session=${sessionId}, video file: ${videoFile}`);
-        } else {
-          // Video recording might not be available or failed to start - this is non-fatal
-          logger.debug(`[browser.act] Video recording not available or failed for session=${sessionId}`);
+    const _ctx = engine.getContext(sessionId);
+    if (_ctx) {
+      // Engine video is handled by context options — nothing to stop
+      debugSession.videoActive = false;
+    } else {
+      try {
+        const videoResult = await cliRun([...sessionFlags(sessionId), 'video-stop'], 5000);
+        if (videoResult.ok) {
+          const videoOutput = videoResult.stdout || '';
+          const videoMatch = videoOutput.match(/\[Video\]\(([^)]+)\)/);
+          if (videoMatch) {
+            const videoFile = videoMatch[1].trim();
+            debugSession.videoFile = videoFile;
+            traceData.videoFile = videoFile;
+            logger.info(`[browser.act] Stopped video recording for session=${sessionId}, video file: ${videoFile}`);
+          } else {
+            logger.debug(`[browser.act] Video recording not available or failed for session=${sessionId}`);
+          }
+          debugSession.videoActive = false;
         }
-        debugSession.videoActive = false;
+      } catch (error) {
+        logger.warn(`[browser.act] Failed to stop video recording for session=${sessionId}: ${error.message}`);
       }
-    } catch (error) {
-      logger.warn(`[browser.act] Failed to stop video recording for session=${sessionId}: ${error.message}`);
     }
   }
   
@@ -334,8 +375,16 @@ async function detectAndHandleChromeCrash(sessionId, action, args, error) {
   }
   try {
     // Check if current page is about:blank (indicates Chrome crash)
-    const checkResult = await cliRun([...sessionFlags(sessionId), 'eval', 'window.location.href'], 3000);
-    if (checkResult.ok && checkResult.stdout && checkResult.stdout.includes('about:blank')) {
+    const _ePage = engine.getPage(sessionId);
+    let isAboutBlank = false;
+    if (_ePage) {
+      try { isAboutBlank = String(await _ePage.evaluate('window.location.href')).includes('about:blank'); }
+      catch (_) {}
+    } else {
+      const checkResult = await cliRun([...sessionFlags(sessionId), 'eval', 'window.location.href'], 3000);
+      isAboutBlank = checkResult.ok && checkResult.stdout && checkResult.stdout.includes('about:blank');
+    }
+    if (isAboutBlank) {
       logger.error(`[browser.act] Chrome crash detected for session=${sessionId} - page is about:blank`);
       
       // Capture debugging context before recovery
@@ -427,7 +476,7 @@ async function handleDetectCrash(sessionId, step, error) {
   };
 }
 
-// Handle file upload using playwright-cli upload command
+// Handle file upload using engine file chooser
 async function handleUpload(sessionId, filePath, headed, timeoutMs) {
   const start = Date.now();
   
@@ -459,7 +508,17 @@ async function handleUpload(sessionId, filePath, headed, timeoutMs) {
     
     logger.info(`[browser.act] Uploading file: ${filePath} for session=${sessionId}`);
     
-    // Use playwright-cli upload command - requires file chooser modal to be active
+    // ── Engine path ──
+    const _ePage = engine.getPage(sessionId);
+    if (_ePage) {
+      try {
+        const fileInput = await _ePage.locator('input[type="file"]').first();
+        await fileInput.setInputFiles(filePath);
+        logger.info(`[browser.act] File upload successful (engine): ${filePath} for session=${sessionId}`);
+        return { ok: true, action: 'upload', sessionId, filePath, executionTime: Date.now() - start, result: 'File uploaded successfully' };
+      } catch (e) { logger.warn(`[browser.act] uploadFileToGmail (engine) failed: ${e.message} — falling back to CLI`); }
+    }
+    // ── CLI fallback ──
     const S = sessionFlags(sessionId, headed);
     const uploadResult = await cliRun([...S, 'upload', filePath], timeoutMs);
     
@@ -519,7 +578,30 @@ async function collectDevToolsData(sessionId, action, result) {
   if (!debugSession || !debugSession.devToolsActive) return;
 
   try {
-    // Collect network requests and console logs via eval commands
+    // ── Engine path ──
+    const _ePage = engine.getPage(sessionId);
+    if (_ePage) {
+      const data = await _ePage.evaluate(() => {
+        const requests = [];
+        const logs = [];
+        if (window.performance && window.performance.getEntriesByType) {
+          const entries = window.performance.getEntriesByType('resource');
+          entries.forEach(entry => {
+            if (entry.initiatorType !== 'script' || entry.name.includes('.js')) {
+              requests.push({ url: entry.name, method: 'GET', status: entry.responseStatus || 200, duration: Math.round(entry.duration), size: entry.transferSize || 0 });
+            }
+          });
+        }
+        if (window.console && window.console.logs) { logs.push(...window.console.logs.slice(-10)); }
+        return { requests: requests.slice(-20), logs };
+      });
+      debugSession.devToolsData.networkRequests.push(...(data.requests || []));
+      debugSession.devToolsData.consoleLogs.push(...(data.logs || []));
+      debugSession.devToolsData.networkRequests = debugSession.devToolsData.networkRequests.slice(-50);
+      debugSession.devToolsData.consoleLogs = debugSession.devToolsData.consoleLogs.slice(-20);
+      return;
+    }
+    // ── CLI fallback ──
     const networkData = await cliRun([...sessionFlags(sessionId), 'eval', `
       (function() {
         const requests = [];
@@ -552,7 +634,9 @@ async function collectDevToolsData(sessionId, action, result) {
 
     if (networkData.ok && networkData.stdout) {
       try {
-        const data = JSON.parse(networkData.stdout.replace(/###\s*Result\s*\n([\s\S]*?)\n###.*$/, '$1').replace(/^"|"$/g, ''));
+        const rawMatch = networkData.stdout.match(/^([\s\S]*?)(?=###\s|$)/i);
+        const rawJson = (rawMatch ? rawMatch[1] : networkData.stdout).trim().replace(/^"|"$/g, '');
+        const data = JSON.parse(rawJson);
         debugSession.devToolsData.networkRequests.push(...data.requests);
         debugSession.devToolsData.consoleLogs.push(...data.logs);
         
@@ -660,6 +744,14 @@ const PLAYWRIGHT_CLI_AVAILABLE = (() => {
 // ---------------------------------------------------------------------------
 
 function cliRun(args, timeoutMs = 15000) {
+  const sessionFlag = args.find((arg) => typeof arg === 'string' && arg.startsWith('-s='));
+  const shortId = sessionFlag ? sessionFlag.slice(3) : null;
+  const sessionId = shortId ? (_sidCache.get(shortId) || shortId) : null;
+  if (sessionId && engine.isSessionActive(sessionId)) {
+    const error = `Engine owns session ${sessionId}; playwright-cli execution is blocked`;
+    logger.warn(`[browser.act] ${error}`);
+    return Promise.resolve({ ok: false, stdout: '', stderr: error, exitCode: -1, executionTime: 0, error, engineOwned: true });
+  }
   return new Promise((resolve) => {
     const start = Date.now();
 
@@ -766,7 +858,24 @@ const _AD_DISMISS_CODE = `async (page) => {
 
 async function injectAdBlock(sessionId, headed) {
   try {
-    // Layer 3a: CSS cosmetic hiding — hides sidebar/banner ads via injected IIFE.
+    // ── Engine path ──
+    const _ePage = engine.getPage(sessionId);
+    if (_ePage) {
+      try {
+        await _ePage.evaluate(_AD_BLOCK_SCRIPT);
+        logger.info(`[browser.act] injectAdBlock: ✓ CSS cosmetics injected (engine, session=${sessionId})`);
+      } catch (e) {
+        logger.warn(`[browser.act] injectAdBlock: engine eval failed (session=${sessionId}): ${e.message}`);
+      }
+      try {
+        const dismissOutcome = await _ePage.evaluate(_AD_DISMISS_CODE);
+        logger.info(`[browser.act] injectAdBlock: ad dismiss → ${dismissOutcome} (engine, session=${sessionId})`);
+      } catch (e) {
+        logger.warn(`[browser.act] injectAdBlock: engine dismiss failed (session=${sessionId}): ${e.message}`);
+      }
+      return;
+    }
+    // ── CLI fallback ──
     const injectResult = await cliRun(
       [...sessionFlags(sessionId, headed), 'eval', _AD_BLOCK_SCRIPT],
       8000
@@ -778,8 +887,6 @@ async function injectAdBlock(sessionId, headed) {
       logger.warn(`[browser.act] injectAdBlock: eval failed (session=${sessionId}) exitCode=${injectResult?.exitCode} stderr=${(injectResult?.stderr || '').slice(0, 200)}`);
     }
 
-    // Layer 3b: Click skip button or dismiss stuck ad overlay (non-fatal).
-    // Handles the case where route blocking froze the ad stream but the overlay lingers.
     const dismissResult = await cliRun(
       [...sessionFlags(sessionId, headed), 'run-code', _AD_DISMISS_CODE],
       5000
@@ -800,37 +907,42 @@ async function injectAdBlock(sessionId, headed) {
 // Lightweight content detection for Gmail pages to avoid timeout crashes
 async function getGmailPageContent(sessionId, timeoutMs = 5000) {
   try {
-    // Try multiple lightweight strategies in order of preference
-    const strategies = [
-      {
-        name: 'title',
-        fn: () => cliRun([...sessionFlags(sessionId), 'eval', 'document.title'], 2000)
-      },
-      {
-        name: 'url',
-        fn: () => cliRun([...sessionFlags(sessionId), 'eval', 'window.location.href'], 2000)
-      },
-      {
-        name: 'minimal-content',
-        fn: () => cliRun([...sessionFlags(sessionId), 'eval', 'document.body.innerText.slice(0,1000)'], 3000)
-      },
-      {
-        name: 'gmail-main',
-        fn: () => cliRun([...sessionFlags(sessionId), 'eval', 'document.querySelector("[role=main]")?.innerText.slice(0,2000) || ""'], 3000)
-      },
-      {
-        name: 'gmail-compose',
-        fn: () => cliRun([...sessionFlags(sessionId), 'eval', 'document.querySelector("div[role=dialog]")?.innerText.slice(0,1500) || ""'], 3000)
+    // ── Engine path ──
+    const _ePage = engine.getPage(sessionId);
+    if (_ePage) {
+      const exprs = [
+        ['title', 'document.title'],
+        ['url', 'window.location.href'],
+        ['minimal-content', 'document.body.innerText.slice(0,1000)'],
+        ['gmail-main', 'document.querySelector("[role=main]")?.innerText.slice(0,2000) || ""'],
+        ['gmail-compose', 'document.querySelector("div[role=dialog]")?.innerText.slice(0,1500) || ""'],
+      ];
+      for (const [name, expr] of exprs) {
+        try {
+          const content = await _ePage.evaluate(expr);
+          if (content && content !== '' && content !== 'null') {
+            logger.debug(`[browser.act] Gmail content detected via ${name} (engine): ${String(content).length} chars`);
+            return String(content);
+          }
+        } catch (_) { continue; }
       }
+      return '';
+    }
+    // ── CLI fallback ──
+    const strategies = [
+      { name: 'title', fn: () => cliRun([...sessionFlags(sessionId), 'eval', 'document.title'], 2000) },
+      { name: 'url', fn: () => cliRun([...sessionFlags(sessionId), 'eval', 'window.location.href'], 2000) },
+      { name: 'minimal-content', fn: () => cliRun([...sessionFlags(sessionId), 'eval', 'document.body.innerText.slice(0,1000)'], 3000) },
+      { name: 'gmail-main', fn: () => cliRun([...sessionFlags(sessionId), 'eval', 'document.querySelector("[role=main]")?.innerText.slice(0,2000) || ""'], 3000) },
+      { name: 'gmail-compose', fn: () => cliRun([...sessionFlags(sessionId), 'eval', 'document.querySelector("div[role=dialog]")?.innerText.slice(0,1500) || ""'], 3000) },
     ];
 
     for (const strategy of strategies) {
       try {
         const result = await strategy.fn();
         if (result.ok && result.stdout) {
-          const match = result.stdout.match(/###\s*Result\s*\n([\s\S]*?)(?=###|$)/i);
+          const match = result.stdout.match(/^([\s\S]*?)(?=###\s|$)/i);
           const content = match ? match[1].trim().replace(/^"|"$/g, '') : result.stdout.trim();
-          
           if (content && content !== '' && content !== 'null') {
             logger.debug(`[browser.act] Gmail content detected via ${strategy.name}: ${content.length} chars`);
             return content;
@@ -838,12 +950,12 @@ async function getGmailPageContent(sessionId, timeoutMs = 5000) {
         }
       } catch (error) {
         logger.debug(`[browser.act] Gmail content strategy ${strategy.name} failed: ${error.message}`);
-        continue; // Try next strategy
+        continue;
       }
     }
     
     logger.debug(`[browser.act] All Gmail content strategies failed, returning empty string`);
-    return ''; // All strategies failed
+    return '';
   } catch (error) {
     logger.warn(`[browser.act] Gmail page content detection failed: ${error.message}`);
     return '';
@@ -863,10 +975,21 @@ async function waitForGmailStableText(sessionId, timeoutMs = 15000) {
   while (Date.now() - start < timeoutMs) {
     try {
       // Check for about:blank first (fast check)
-      const urlCheck = await cliRun([...sessionFlags(sessionId), 'eval', 'window.location.href'], 2000);
-      if (urlCheck.ok && urlCheck.stdout.includes('about:blank')) {
-        logger.warn(`[browser.act] waitForGmailStableText: about:blank detected for session=${sessionId}`);
-        return { ok: true, result: '', aboutBlankDetected: true, executionTime: Date.now() - start };
+      const _ePage = engine.getPage(sessionId);
+      if (_ePage) {
+        try {
+          const _url = await _ePage.evaluate('window.location.href');
+          if (String(_url).includes('about:blank')) {
+            logger.warn(`[browser.act] waitForGmailStableText: about:blank detected for session=${sessionId}`);
+            return { ok: true, result: '', aboutBlankDetected: true, executionTime: Date.now() - start };
+          }
+        } catch (_) {}
+      } else {
+        const urlCheck = await cliRun([...sessionFlags(sessionId), 'eval', 'window.location.href'], 2000);
+        if (urlCheck.ok && urlCheck.stdout.includes('about:blank')) {
+          logger.warn(`[browser.act] waitForGmailStableText: about:blank detected for session=${sessionId}`);
+          return { ok: true, result: '', aboutBlankDetected: true, executionTime: Date.now() - start };
+        }
       }
 
       // Use Gmail-optimized content detection
@@ -903,11 +1026,20 @@ async function recoverFromAboutBlank(sessionId, originalUrl = 'https://mail.goog
     logger.info(`[browser.act] Recovering from about:blank for session=${sessionId}`);
     
     // Step 1: Check if browser window is still responsive
+    const _ePage = engine.getPage(sessionId);
+    if (_ePage) {
+      try {
+        await _ePage.evaluate('window.navigator.userAgent');
+        logger.info(`[browser.act] Browser responsive, navigating back (engine) for session=${sessionId}`);
+        await _ePage.goto(originalUrl, { waitUntil: 'domcontentloaded', timeout: 10000 });
+        await new Promise(resolve => setTimeout(resolve, 3000));
+        logger.info(`[browser.act] Recovery successful via navigation (engine) for session=${sessionId}`);
+        return { recovered: true, method: 'navigate' };
+      } catch (e) { logger.warn(`[browser.act] recoverFromAboutBlank (engine) failed: ${e.message} — falling back to CLI`); }
+    }
     const ping = await cliRun([...sessionFlags(sessionId), 'eval', 'window.navigator.userAgent'], 3000);
-    
     if (ping.ok && ping.stdout) {
       logger.info(`[browser.act] Browser responsive, navigating back to Gmail for session=${sessionId}`);
-      // Browser is responsive, just navigate back
       const navResult = await cliRun([...sessionFlags(sessionId), 'goto', originalUrl], 10000);
       if (navResult.ok) {
         // Wait for page to load
@@ -1054,6 +1186,24 @@ function killExistingChromeForProfile(sessionId) {
 // Close any about:blank / chrome://newtab tabs that accumulated from failed navigations.
 // Called after a successful navigate to clean up ghost tabs.
 async function closeBlankTabs(sessionId, headed = true) {
+  // ── Engine path ──
+  const _ctx = engine.getContext(sessionId);
+  if (_ctx) {
+    try {
+      const pages = _ctx.pages();
+      let closed = 0;
+      for (let i = pages.length - 1; i >= 0; i--) {
+        const url = pages[i].url();
+        if (url === 'about:blank' || url === 'chrome://newtab/') {
+          await pages[i].close();
+          closed++;
+        }
+      }
+      if (closed > 0) logger.info(`[browser.act] closeBlankTabs: closed ${closed} blank tab(s) (engine, session=${sessionId})`);
+      return closed;
+    } catch (e) { logger.warn(`[browser.act] closeBlankTabs (engine) failed: ${e.message} — falling back to CLI`); }
+  }
+  // ── CLI fallback ──
   const S = sessionFlags(sessionId, headed);
   try {
     const listRes = await cliRun([...S, 'tab-list'], 5000);
@@ -1065,7 +1215,6 @@ async function closeBlankTabs(sessionId, headed = true) {
       if (m) blankIndices.push(parseInt(m[1], 10));
     }
     if (blankIndices.length === 0) return 0;
-    // Close from highest index down to preserve tab ordering
     for (const idx of blankIndices.sort((a, b) => b - a)) {
       await cliRun([...S, 'tab-select', String(idx)], 3000);
       await cliRun([...S, 'tab-close'], 3000);
@@ -1143,6 +1292,81 @@ function _tabKeyFor(sessionId, idx) {
 // Track which sessions have been opened (daemon started)
 const openSessions = new Set();
 
+// ── Engine helpers ──────────────────────────────────────────────────────────
+// Check if the Node API engine is managing this session (vs playwright-cli daemon).
+function _engineActive(sessionId) {
+  return engine.isSessionActive(sessionId);
+}
+
+// Ensure engine session is launched. Returns the Page or null on failure.
+async function _ensureEngine(sessionId, headed) {
+  if (engine.isSessionActive(sessionId)) {
+    return engine.getPage(sessionId);
+  }
+  try {
+    await engine.launch(sessionId, { headed });
+    openSessions.add(sessionId);
+    return engine.getPage(sessionId);
+  } catch (err) {
+    logger.warn(`[browser.act] engine launch failed for session=${sessionId}: ${err.message}`);
+    return null;
+  }
+}
+
+// Store the current refMap per session (from the last snapshot via engine)
+const _engineRefMaps = new Map(); // sessionId → refMap (Map: ref → { role, name, ... })
+const _engineSnapshots = new Map();
+
+async function _captureEngineSnapshot(sessionId, page) {
+  const { yaml, refMap, lowConfidenceRefs } = await engine.buildRefTree(page);
+  if (!yaml) return null;
+  const previous = _engineSnapshots.get(sessionId);
+  const snapshot = {
+    generation: (previous?.generation || 0) + 1,
+    page,
+    url: page.url(),
+    yaml,
+    refMap,
+    lowConfidenceRefs: !!lowConfidenceRefs,
+  };
+  _engineSnapshots.set(sessionId, snapshot);
+  _engineRefMaps.set(sessionId, refMap);
+  snapshotCache.set(_tabKey(sessionId), yaml);
+  storeSnapshotForDebugging(sessionId, yaml);
+  return snapshot;
+}
+
+function _engineActionFailure(action, sessionId, error, extra = {}) {
+  return { ok: false, action, sessionId, error, engineOwned: true, ...extra };
+}
+
+function _engineRefEntry(sessionId, page, selector) {
+  const refMatch = selector?.trim().match(/^\[ref=(e\d+)\]$/i);
+  const ref = refMatch ? refMatch[1] : (/^e\d+$/i.test((selector || '').trim()) ? selector.trim() : null);
+  if (!ref) return { ref: null, entry: null, stale: false };
+  const snapshot = _engineSnapshots.get(sessionId);
+  if (!snapshot || snapshot.page !== page || snapshot.url !== page.url()) return { ref, entry: null, stale: true };
+  return { ref, entry: snapshot.refMap.get(ref) || null, stale: !snapshot.refMap.has(ref) };
+}
+
+async function _handoffEngineToCli(sessionId) {
+  if (!engine.isSessionActive(sessionId)) return { ok: true, handedOff: false };
+  try {
+    await engine.closeSession(sessionId);
+    _engineRefMaps.delete(sessionId);
+    _engineSnapshots.delete(sessionId);
+    snapshotCache.delete(_tabKey(sessionId));
+    return { ok: true, handedOff: true };
+  } catch (err) {
+    return { ok: false, error: err.message };
+  }
+}
+
+function invalidateEngineSnapshot(sessionId) {
+  _engineSnapshots.delete(sessionId);
+  _engineRefMaps.delete(sessionId);
+}
+
 // Probe whether a playwright-cli daemon is already alive for a session.
 // Used on navigate after app restart (openSessions cleared) to avoid cold-starting
 // a new Chrome tab when the browser is already open from a previous run.
@@ -1157,10 +1381,11 @@ const openSessions = new Set();
 // pointing to a live pid, a Chrome process is running against this profile,
 // which means a daemon is alive.
 async function isDaemonAlive(sessionId, headed) {
+  // ── Engine path: check if engine session is active ──
+  if (engine.isSessionActive(sessionId)) return true;
+  // ── CLI fallback: check SingletonLock ──
   try {
     if (!shouldUsePersistentProfile(sessionId)) {
-      // Fall back to a lightweight CLI probe (non-persistent sessions don't
-      // have a known-on-disk profile path to check).
       const probe = await cliRun([...sessionFlags(sessionId, false), 'eval', '1'], 4000);
       return probe.ok;
     }
@@ -1191,24 +1416,49 @@ async function isDaemonAlive(sessionId, headed) {
 // Used by press Enter to refocus the input before submitting.
 const lastFilledTarget = new Map(); // sessionId → { target, ref }
 
+// Batch probe — single page.evaluate returning multiple page properties.
+// Replaces 2-5 separate page.evaluate() calls with one round-trip.
+async function batchProbe(page, opts = {}) {
+  const sliceLen = opts.sliceLen || 25000;
+  try {
+    return await page.evaluate(`(() => ({
+      href: location.href,
+      title: document.title,
+      hostname: location.hostname,
+      bodyText: (document.body && document.body.innerText || '').slice(0, ${sliceLen}),
+      bodyLength: (document.body && document.body.innerText || '').length,
+      hasContentEditable: !!document.querySelector('[contenteditable], textarea'),
+      activeElement: document.activeElement ? document.activeElement.tagName : null
+    }))()`);
+  } catch (e) {
+    return null;
+  }
+}
+
 async function captureSnapshot(sessionId, headed, timeoutMs) {
+  // ── Engine path: use buildRefTree directly ──
+  const _ePage = engine.getPage(sessionId);
+  if (_ePage) {
+    try {
+      const snapshot = await _captureEngineSnapshot(sessionId, _ePage);
+      if (snapshot) return { ok: true, stdout: snapshot.yaml, snapshotText: snapshot.yaml, executionTime: 0, generation: snapshot.generation };
+    } catch (e) {
+      logger.warn(`[browser.act] captureSnapshot (engine) failed: ${e.message}`);
+      return _engineActionFailure('snapshot', sessionId, `Engine snapshot failed: ${e.message}`, { engineHealthFailure: true });
+    }
+  }
+  // ── CLI fallback ──
   const res = await cliRun([...sessionFlags(sessionId, headed), 'snapshot'], timeoutMs);
-  // playwright-cli snapshot writes the YAML tree to a .yml file and only
-  // prints the file path in stdout (e.g. "[Snapshot](.playwright-cli/page-xxx.yml)").
-  // We must read the file to get the actual accessibility tree with element refs.
   let snapshotText = res.stdout || '';
   const fileMatch = snapshotText.match(/\[Snapshot\]\(([^)]+\.yml)\)/);
   if (fileMatch) {
     try {
       const ymlPath = path.resolve(process.cwd(), fileMatch[1]);
       snapshotText = fs.readFileSync(ymlPath, 'utf8');
-    } catch (_) {
-      // fall back to stdout if file read fails
-    }
+    } catch (_) {}
   }
   if (snapshotText) {
     snapshotCache.set(_tabKey(sessionId), snapshotText);
-    // Store snapshot for debugging
     storeSnapshotForDebugging(sessionId, snapshotText);
   }
   res.snapshotText = snapshotText;
@@ -1222,7 +1472,7 @@ const INPUT_ROLES = new Set(['textbox', 'searchbox', 'combobox', 'input', 'texta
 const EXCLUDE_CONTEXT = /search.{0,20}(chat|history|conversation|message)|filter|sidebar|nav\b|navigation|recent|previous/i;
 
 // Parse snapshot YAML lines into structured candidate objects.
-// Handles two formats emitted by playwright-cli:
+// Handles two formats emitted by ariaSnapshot:
 //   Format A (old stdout):  "  - [e12] link "Bible Study" [href=...]"
 //   Format B (.yml file):   "    - link "Bible Study" [ref=e52] [cursor=pointer]:"
 //   Format C (no label):    "    - textbox [ref=e52]"
@@ -1410,7 +1660,7 @@ function resolveRefForClick(sessionId, labelOrRef) {
   if (refBracketMatch) return { ref: refBracketMatch[1], label: refBracketMatch[1] };
   if (/^e\d+$/i.test(labelOrRef.trim())) return { ref: labelOrRef.trim(), label: labelOrRef.trim() };
   // CSS attribute/pseudo selectors (e.g. div[aria-label='Message Body'], button.send, #id)
-  // must be passed directly to playwright-cli — fuzzy scoring against snapshot text
+  // must be passed directly to the engine — fuzzy scoring against snapshot text
   // will mis-resolve them (e.g. matching 'body' in 'Message Body' to 'Create new label').
   if (/[\[\]#.>:()"'=~^$*|]/.test(labelOrRef.trim())) return { ref: null, label: null };
 
@@ -1428,6 +1678,80 @@ function resolveRefForClick(sessionId, labelOrRef) {
     return { ref: best.ref, label: best.label };
   }
   return { ref: null, label: null };
+}
+
+// ── Semantic selector derivation + probe-then-commit ──────────────────────────
+// Derives stable CSS selectors from a refMap entry's name/role.
+// These often work better than getByRole for contenteditable hybrids, custom
+// widgets, and shadow DOM elements where the ARIA snapshot ref is unreliable.
+function _deriveSemanticSelectors(entry, action) {
+  if (!entry) return [];
+  const selectors = [];
+  const name = entry.name || '';
+  const role = (entry.role || '').toLowerCase();
+  const isInputRole = INPUT_ROLES.has(role) || role === 'generic' || role === 'unknown';
+
+  // Extract key words from the entry name (skip common noise words)
+  const STOP_WORDS = new Set(['the', 'a', 'an', 'your', 'enter', 'type', 'click', 'here', 'this', 'field', 'input', 'box', 'text', 'area']);
+  const keyWords = (name || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .split(/\s+/)
+    .filter(w => w.length > 2 && !STOP_WORDS.has(w))
+    .slice(0, 3);
+
+  // Build aria-label selectors from key words
+  for (const kw of keyWords) {
+    selectors.push(`[aria-label*="${kw}" i]`);
+  }
+  // Build placeholder selectors from key words
+  for (const kw of keyWords) {
+    selectors.push(`[placeholder*="${kw}" i]`);
+  }
+  // Build title attribute selectors from key words
+  for (const kw of keyWords) {
+    selectors.push(`[title*="${kw}" i]`);
+  }
+
+  // Contenteditable selectors for textbox/editable roles
+  if (isInputRole) {
+    selectors.push('[contenteditable="true"]:visible');
+    selectors.push('[contenteditable]:visible');
+  }
+
+  // De-duplicate
+  return [...new Set(selectors)];
+}
+
+// Probe: check which semantic selectors match ≥1 visible element on the page.
+// Returns an array of matching selectors (in priority order) or empty array.
+// Runs in a single page.evaluate — near-instant, no timeout risk.
+async function _probeSemanticSelectors(page, selectors) {
+  if (!page || !selectors || selectors.length === 0) return [];
+  try {
+    const probeCode = `(() => {
+      const sels = ${JSON.stringify(selectors)};
+      const results = [];
+      for (const sel of sels) {
+        try {
+          const els = document.querySelectorAll(sel);
+          let visibleCount = 0;
+          for (const el of els) {
+            const rect = el.getBoundingClientRect();
+            if (rect.width > 0 && rect.height > 0) { visibleCount++; break; }
+          }
+          if (visibleCount > 0) results.push(sel);
+        } catch (_) {}
+      }
+      return JSON.stringify(results);
+    })()`;
+    const result = await page.evaluate(probeCode, { timeout: 3000 }).catch(() => null);
+    if (!result) return [];
+    const matched = JSON.parse(String(result).replace(/^"|"$/g, '').replace(/\\"/g, '"'));
+    return Array.isArray(matched) ? matched : [];
+  } catch (_) {
+    return [];
+  }
 }
 
 // Detect if an element is a microphone/voice search button based on its properties
@@ -1501,7 +1825,7 @@ async function waitForAttachmentProcessing(sessionId, fileName) {
   
   while (attempts < maxAttempts) {
     try {
-      const snapshot = await cliRun([...sessionFlags(sessionId, false), 'snapshot'], 5000);
+      const snapshot = await captureSnapshot(sessionId, false, 5000);
       
       if (!snapshot.ok) {
         logger.warn(`[browser.act] waitForAttachmentProcessing: snapshot failed, retrying...`);
@@ -1577,7 +1901,7 @@ async function waitForAttachmentProcessing(sessionId, fileName) {
   
   // Log debug information for troubleshooting
   try {
-    const debugSnapshot = await cliRun([...sessionFlags(sessionId, false), 'snapshot'], 5000);
+    const debugSnapshot = await captureSnapshot(sessionId, false, 5000);
     const preview = debugSnapshot.stdout?.substring(0, 500) || 'No content';
     logger.warn(`[browser.act] waitForAttachmentProcessing: timeout waiting for Gmail attachment ${fileName}. Content preview: ${preview}`);
   } catch (debugError) {
@@ -1589,7 +1913,7 @@ async function waitForAttachmentProcessing(sessionId, fileName) {
 
 async function verifyAttachmentPresent(sessionId, fileName) {
   try {
-    const snapshot = await cliRun([...sessionFlags(sessionId, false), 'snapshot'], 5000);
+    const snapshot = await captureSnapshot(sessionId, false, 5000);
     
     if (!snapshot.ok) {
       logger.warn(`[browser.act] verifyAttachmentPresent: snapshot failed`);
@@ -1663,7 +1987,7 @@ async function verifyAttachmentPresent(sessionId, fileName) {
 
 async function checkForGmailErrors(sessionId) {
   try {
-    const snapshot = await cliRun([...sessionFlags(sessionId, false), 'snapshot'], 5000);
+    const snapshot = await captureSnapshot(sessionId, false, 5000);
     
     if (!snapshot.ok) {
       return 'snapshot_failed';
@@ -1704,6 +2028,33 @@ async function sendEmailWithVerification(sessionId, sendSelector) {
   // Run page.evaluate to verify: (a) at least 1 recipient chip, (b) subject non-empty,
   // (c) compose window is visible. Surface actionable errors before clicking Send.
   try {
+    // ── Engine path ──
+    const _ePage = engine.getPage(sessionId);
+    if (_ePage) {
+      const valData = await _ePage.evaluate(() => {
+        const chips = document.querySelectorAll('[data-hovercard-id],[email],[data-name].vM,.vR,.afV');
+        const recipientInput = document.querySelector('input[name="to"],textarea[name="to"]');
+        const rawToText = (recipientInput?.value || '').trim();
+        const hasChip = chips.length > 0;
+        const hasRawTo = rawToText.length > 3 && rawToText.includes('@');
+        const subject = (document.querySelector('input[name="subjectbox"]')?.value || '').trim();
+        const body = (document.querySelector('div[aria-label="Message Body"]')?.innerText || '').trim();
+        const composeVisible = !!document.querySelector('div[gh="cm"] + div, .T-I-KE, div[aria-label="New Message"], div[aria-label="Message"]');
+        return { hasChip, hasRawTo, rawToText: rawToText.slice(0,50), subject: subject.slice(0,50), bodyLen: body.length, composeVisible };
+      });
+      if (valData) {
+        if (!valData.hasChip && !valData.hasRawTo) {
+          throw new Error('sendEmailWithVerification: No recipient chip confirmed — fill the To field and press Enter to create a chip before sending');
+        }
+        if (valData.hasRawTo && !valData.hasChip) {
+          logger.warn(`[browser.act] sendEmailWithVerification: recipient "${valData.rawToText}" is raw text, not chip — pressing Enter to confirm`);
+          await _ePage.keyboard.press('Enter').catch(() => {});
+          await new Promise(r => setTimeout(r, 500));
+        }
+        logger.info(`[browser.act] sendEmailWithVerification: validation ok (engine) — chips=${valData.hasChip}, subject="${valData.subject}", bodyLen=${valData.bodyLen}`);
+      }
+    } else {
+    // ── CLI fallback ──
     const S = sessionFlags(sessionId, false);
     const validationCode = `async page => {
       return await page.evaluate(() => {
@@ -1727,7 +2078,6 @@ async function sendEmailWithVerification(sessionId, sendSelector) {
           throw new Error('sendEmailWithVerification: No recipient chip confirmed — fill the To field and press Enter to create a chip before sending');
         }
         if (valData.hasRawTo && !valData.hasChip) {
-          // Address is still raw text, not a chip — press Enter to confirm it then continue
           logger.warn(`[browser.act] sendEmailWithVerification: recipient "${valData.rawToText}" is raw text, not chip — pressing Enter to confirm`);
           await cliRun([...S, 'press', 'Enter'], 3000).catch(() => {});
           await new Promise(r => setTimeout(r, 500));
@@ -1735,18 +2085,43 @@ async function sendEmailWithVerification(sessionId, sendSelector) {
         logger.info(`[browser.act] sendEmailWithVerification: validation ok — chips=${valData.hasChip}, subject="${valData.subject}", bodyLen=${valData.bodyLen}`);
       }
     }
+    } // end CLI fallback
   } catch (valErr) {
     if (valErr.message.startsWith('sendEmailWithVerification:')) throw valErr; // re-throw actionable errors
     logger.warn(`[browser.act] sendEmailWithVerification: pre-send validation failed (non-fatal): ${valErr.message}`);
   }
 
   // ── Step 2: Click Send — multi-strategy ──────────────────────────────────
-  // Strategy 1: use the provided selector (ARIA ref or CSS)
-  // Strategy 2: fallback CSS selectors for Gmail send button
-  // Strategy 3: keyboard shortcut Ctrl+Enter
-  const S = sessionFlags(sessionId, false);
+  const _ePage2 = engine.getPage(sessionId);
   let sendClicked = false;
 
+  if (_ePage2) {
+    // ── Engine path: try CSS selectors directly ──
+    const sendSelectors = [
+      sendSelector,
+      'div[data-tooltip*="Send"]',
+      'div[aria-label*="Send"]',
+    ];
+    for (const sel of sendSelectors) {
+      if (!sel) continue;
+      try {
+        await _ePage2.click(sel, { timeout: 4000 });
+        logger.info(`[browser.act] sendEmailWithVerification: send clicked (engine) via selector: ${sel}`);
+        sendClicked = true;
+        break;
+      } catch (_) {}
+    }
+    if (!sendClicked) {
+      try {
+        await _ePage2.click('div[aria-label="Message Body"]', { timeout: 2000 }).catch(() => {});
+        await _ePage2.keyboard.press('Control+Enter');
+        logger.info(`[browser.act] sendEmailWithVerification: send clicked (engine) via Ctrl+Enter`);
+        sendClicked = true;
+      } catch (_) {}
+    }
+  } else {
+  // ── CLI fallback ──
+  const S = sessionFlags(sessionId, false);
   const sendStrategies = [
     { label: 'selector', fn: () => cliRun([...S, 'click', sendSelector], 5000) },
     { label: 'css-tooltip', fn: () => cliRun([...S, 'click', 'div[data-tooltip*="Send"]'], 4000) },
@@ -1769,6 +2144,7 @@ async function sendEmailWithVerification(sessionId, sendSelector) {
       logger.warn(`[browser.act] sendEmailWithVerification: strategy "${strategy.label}" failed — trying next`);
     } catch (_) {}
   }
+  } // end CLI fallback
 
   if (!sendClicked) {
     throw new Error('sendEmailWithVerification: all send strategies failed — could not locate or click Send button');
@@ -1776,7 +2152,7 @@ async function sendEmailWithVerification(sessionId, sendSelector) {
 
   // ── Step 3: Wait for result — compose close OR dialog ───────────────────
   await new Promise(r => setTimeout(r, 1500));
-  const postSnap = await cliRun([...S, 'snapshot'], 8000);
+  const postSnap = await captureSnapshot(sessionId, false, 8000);
   if (!postSnap.ok) {
     // Can't verify — assume sent since click succeeded
     logger.warn(`[browser.act] sendEmailWithVerification: post-send snapshot failed — assuming sent`);
@@ -1790,14 +2166,19 @@ async function sendEmailWithVerification(sessionId, sendSelector) {
   const isSendAnywayDialog = /send\s*anyway|send\s*without\s*(subject|text|body)|missing\s*subject|no\s*subject/i.test(postSnap.stdout || '');
   if (isSendAnywayDialog) {
     logger.info(`[browser.act] sendEmailWithVerification: "send anyway" dialog detected — auto-accepting`);
-    const acceptRes = await cliRun([...S, 'dialog-accept'], 3000).catch(() => ({ ok: false }));
+    // ── Engine path: accept dialog via page ──
+    if (_ePage2) {
+      _ePage2.once('dialog', async d => { await d.accept(); });
+    }
+    const acceptRes = _ePage2 ? { ok: true } : await cliRun([...sessionFlags(sessionId, false), 'dialog-accept'], 3000).catch(() => ({ ok: false }));
     if (!acceptRes.ok) {
       // Try clicking "Send" in the dialog text
-      await cliRun([...S, 'find-text', 'Send anyway'], 3000).catch(() => {});
-      await cliRun([...S, 'find-text', 'OK'], 3000).catch(() => {});
+      const _S = sessionFlags(sessionId, false);
+      await cliRun([..._S, 'find-text', 'Send anyway'], 3000).catch(() => {});
+      await cliRun([..._S, 'find-text', 'OK'], 3000).catch(() => {});
     }
     await new Promise(r => setTimeout(r, 1500));
-    const afterAcceptSnap = await cliRun([...S, 'snapshot'], 5000).catch(() => ({ ok: false }));
+    const afterAcceptSnap = await captureSnapshot(sessionId, false, 5000).catch(() => ({ ok: false }));
     const afterText = ((afterAcceptSnap.ok && afterAcceptSnap.stdout) || '').toLowerCase();
     const sentAfterAccept = /message sent|email sent|sent successfully/i.test(afterText) ||
       !/compose|new message/i.test(afterText);
@@ -1876,6 +2257,9 @@ async function browserAct(args) {
   // Helper: run + return standardised result with debugging
   async function run(cmdArgs, label) {
     const actionStart = Date.now();
+    if (engine.isSessionActive(sessionId)) {
+      return _engineActionFailure(action, sessionId, `Engine owns session ${sessionId}; ${label} must use an engine-native action`, { executionTime: Date.now() - actionStart });
+    }
     const res = await cliRun([...S, ...cmdArgs], timeoutMs);
     const executionTime = Date.now() - actionStart;
     
@@ -1980,6 +2364,14 @@ async function browserAct(args) {
 
   switch (action) {
 
+    case 'engine-handoff': {
+      if (!args.engineHealthFailure) {
+        return _engineActionFailure(action, sessionId, 'Engine handoff requires a confirmed engine health failure', { executionTime: Date.now() - start });
+      }
+      const handoff = await _handoffEngineToCli(sessionId);
+      return { ...handoff, action, sessionId, executionTime: Date.now() - start };
+    }
+
     // ── Navigation ──────────────────────────────────────────────────────────
     case 'navigate':
     case 'goto': {
@@ -1993,65 +2385,83 @@ async function browserAct(args) {
       // Sanitize: extract bare URL in case caller passes "Best URL: https://... — title" formatted text
       const _m = /https?:\/\/[^\s"'\`>\),]+/.exec(url);
       const sanitizedUrl = _m ? _m[0] : url;
-      // Use 'open' to cold-start the daemon + navigate in one shot.
-      // Use 'goto' if daemon is already running — avoids spawning a new blank Chrome tab.
-      // After app restart openSessions is cleared, so probe the daemon directly with isDaemonAlive().
+
+      // Invalidate snapshot cache for current tab — the page is changing
+      snapshotCache.delete(_tabKey(sessionId));
+      lastFilledTarget.delete(sessionId);
+
+      // ── Engine path (Node API) ──────────────────────────────────────────
+      // Fast path: no subprocess, no daemon probing, no about:blank dance.
+      // Ad-block init script is registered at launch time via context.addInitScript()
+      // and persists automatically for all future navigations.
+      if (_engineActive(sessionId) || !openSessions.has(sessionId)) {
+        let page = await _ensureEngine(sessionId, headed);
+        if (!page) {
+          // Engine launch failed — likely "Opening in existing browser session".
+          // Kill any Chrome holding this profile, clear the lock, and retry once.
+          const _killed = killExistingChromeForProfile(sessionId);
+          if (_killed) {
+            logger.info(`[browser.act] navigate: killed conflicting Chrome for session=${sessionId} — retrying engine launch`);
+            clearProfileLock(sessionId);
+            await new Promise(r => setTimeout(r, 500));
+            page = await _ensureEngine(sessionId, headed);
+          }
+        }
+        if (page) {
+          try {
+            logger.info(`[browser.act] navigate (engine) ${sanitizedUrl} (session=${sessionId})`);
+            await page.goto(sanitizedUrl, { waitUntil: 'domcontentloaded', timeout: Math.max(timeoutMs, 30000) });
+            openSessions.add(sessionId);
+            // Inject CSS cosmetic ad-hiding (Layer 3) — non-blocking
+            try { await page.evaluate(_AD_BLOCK_SCRIPT); } catch (_) {}
+            return {
+              ok: true,
+              action,
+              sessionId,
+              url: sanitizedUrl,
+              result: undefined,
+              executionTime: Date.now() - start,
+            };
+          } catch (navErr) {
+            logger.warn(`[browser.act] navigate (engine) failed: ${navErr.message} — falling back to CLI`);
+            // Fall through to CLI path
+          }
+        }
+      }
+
+      // ── CLI fallback path (playwright-cli subprocess) ───────────────────
       const navTimeout = Math.max(timeoutMs, 30000);
       let alreadyOpen = openSessions.has(sessionId);
       if (!alreadyOpen) {
-        // Probe whether the daemon survived the app restart (Chrome still open from last run)
         alreadyOpen = await isDaemonAlive(sessionId, headed);
         if (alreadyOpen) {
           openSessions.add(sessionId);
           logger.info(`[browser.act] navigate: daemon alive for session=${sessionId} (post-restart probe) — using goto`);
         }
       }
-      // If not already open, kill any existing Chrome using this profile to prevent blank tabs
       if (!alreadyOpen) {
         const killed = killExistingChromeForProfile(sessionId);
-        if (killed) {
-          logger.info(`[browser.act] Killed existing Chrome for session=${sessionId}, will cold-start fresh`);
-        }
+        if (killed) logger.info(`[browser.act] Killed existing Chrome for session=${sessionId}, will cold-start fresh`);
       }
-      // Invalidate snapshot cache for current tab — the page is changing
-      snapshotCache.delete(_tabKey(sessionId));
-      lastFilledTarget.delete(sessionId);
-      // Before cold-starting, remove any stale SingletonLock from a previous crash
       if (!alreadyOpen) clearProfileLock(sessionId);
 
-      // Ad blocking strategy:
-      // - Cold-start: open about:blank (with --config for serviceWorkers:block), register
-      //   both route blocking AND page.addInitScript (strips YouTube adPlacements before
-      //   the player reads them), then goto the real URL.
-      // - Already open: register interception (idempotent), then goto the real URL.
-      // setupInterception() from ad-block-network.cjs handles both layers atomically.
       let res;
       if (!alreadyOpen) {
-        // Cold-start: open browser on a neutral page first so interception can be registered
         const openRes = await cliRun([...S, 'open', ...openFlags(), 'about:blank'], Math.min(navTimeout, 15000));
         if (openRes.ok) {
           openSessions.add(sessionId);
-          // Register route blocking (Layer 1) + init script (Layer 2) BEFORE navigating
           await setupInterception(cliRun, sessionFlags, sessionId, headed);
-          // Now navigate to the real URL
           res = await cliRun([...S, 'goto', sanitizedUrl], navTimeout);
         } else {
           res = openRes;
         }
       } else {
-        // Already open daemon: navigate to about:blank first to bust bfcache, then register
-        // context-level interception, then goto the real URL.
-        // Without the about:blank step, goto to the same YouTube URL can restore from bfcache
-        // which bypasses addInitScript entirely — the JSON.parse proxy never fires.
         await cliRun([...S, 'goto', 'about:blank'], 5000);
         await setupInterception(cliRun, sessionFlags, sessionId, headed);
         res = await cliRun([...S, 'goto', sanitizedUrl], navTimeout);
       }
       if (res.ok) {
         openSessions.add(sessionId);
-        // For cold-starts: Chrome may show a "Restore pages?" crash-recovery dialog.
-        // Only bypass it if we actually detect the dialog text — unconditionally sending
-        // a second goto clears the page mid-load and causes about:blank flicker.
         if (!alreadyOpen) {
           const probeSnap = await cliRun([...S, 'snapshot'], 4000).catch(() => null);
           const probeText = (probeSnap?.stdout || '').toLowerCase();
@@ -2061,47 +2471,33 @@ async function browserAct(args) {
             await cliRun([...S, 'goto', sanitizedUrl], navTimeout).catch(() => {});
           }
         }
-
-        // Handle permission popups (microphone, camera, etc.) that block page interaction
-        // These appear as native Chrome permission dialogs and must be dismissed
         const permissionProbe = await cliRun([...S, 'snapshot'], 3000).catch(() => null);
         const permissionText = (permissionProbe?.stdout || '').toLowerCase();
         const PERMISSION_DIALOG = /wants to|would like to|permission|microphone|camera|notifications/i;
         if (PERMISSION_DIALOG.test(permissionText)) {
           logger.info(`[browser.act] Permission dialog detected — dismissing with Escape`);
-          // Press Escape to dismiss permission dialog, then Tab to move focus away
           await cliRun([...S, 'press', 'Escape'], 2000).catch(() => {});
           await new Promise(r => setTimeout(r, 200));
           await cliRun([...S, 'press', 'Tab'], 2000).catch(() => {});
         }
-
-        // Non-blocking post-nav verification so we can detect successful command
-        // execution that still lands on about:blank during tab/session instability.
         try {
           const _urlProbe = await cliRun([...S, 'eval', 'window.location.href'], 3000);
           const _rawProbe = (_urlProbe.stdout || '').trim();
-          const _probeMatch = _rawProbe.match(/###\s*Result\s*\n([\s\S]*?)(?=###|$)/i);
+          const _probeMatch = _rawProbe.match(/^([\s\S]*?)(?=###\s|$)/i);
           const _curUrl = (_probeMatch ? _probeMatch[1] : _rawProbe).trim().replace(/^"|"$/g, '');
           if (/about:blank/i.test(_curUrl)) {
             logger.warn(`[browser.act] navigate: command succeeded but current URL is about:blank (session=${sessionId})`);
           }
-        } catch (_) {
-          // Probe failure is non-fatal — navigation result stands.
-        }
-
-        // Clean up any ghost about:blank tabs from prior failed attempts
+        } catch (_) {}
         closeBlankTabs(sessionId, headed).catch(() => {});
-        // Inject CSS cosmetic ad-hiding (Layer 3) — non-blocking cleanup
         injectAdBlock(sessionId, headed).catch(() => {});
       } else if (alreadyOpen && !res.ok) {
-        // goto failed (daemon may have died) — kill Chrome, clear profile lock, then retry with open
         logger.info(`[browser.act] goto failed, killing Chrome and retrying with open for session=${sessionId}`);
         killExistingChromeForProfile(sessionId);
         await new Promise(r => setTimeout(r, 1000));
         clearProfileLock(sessionId);
         openSessions.delete(sessionId);
         clearAdBlockSession(sessionId);
-        // Retry: open about:blank → register interception → goto real URL
         const retryOpenRes = await cliRun([...S, 'open', ...openFlags(), 'about:blank'], Math.min(navTimeout, 15000));
         let retryRes = retryOpenRes;
         if (retryOpenRes.ok) {
@@ -2110,56 +2506,83 @@ async function browserAct(args) {
           retryRes = await cliRun([...S, 'goto', url], navTimeout);
         }
         if (retryRes.ok) { openSessions.add(sessionId); }
-        logger.info(`[browser.act] open ${url} → exit ${retryRes.exitCode}`, { stderr: retryRes.stderr?.slice(0, 200) });
         return {
-          ok:            retryRes.ok,
-          action,
-          sessionId,
-          url:           retryRes.ok ? url : undefined,
-          result:        (retryRes.stdout || '').trim() || undefined,
+          ok: retryRes.ok, action, sessionId,
+          url: retryRes.ok ? url : undefined,
+          result: (retryRes.stdout || '').trim() || undefined,
           executionTime: Date.now() - start,
-          error:         retryRes.ok ? undefined : retryRes.error || retryRes.stderr?.trim(),
+          error: retryRes.ok ? undefined : retryRes.error || retryRes.stderr?.trim(),
         };
       }
       logger.info(`[browser.act] navigate ${url} → exit ${res.exitCode} (session=${sessionId})`, { stderr: res.stderr?.slice(0, 200) });
       return {
-        ok:            res.ok,
-        action,
-        sessionId,
-        url:           res.ok ? url : undefined,
-        result:        (res.stdout || '').trim() || undefined,
+        ok: res.ok, action, sessionId,
+        url: res.ok ? url : undefined,
+        result: (res.stdout || '').trim() || undefined,
         executionTime: Date.now() - start,
-        error:         res.ok ? undefined : res.error || res.stderr?.trim(),
+        error: res.ok ? undefined : res.error || res.stderr?.trim(),
       };
     }
 
-    case 'back':    return run(['go-back'],    'go-back');
-    case 'forward': return run(['go-forward'], 'go-forward');
-    case 'reload':  return run(['reload'],     'reload');
+    case 'back': {
+      const _ePage = engine.getPage(sessionId);
+      if (_ePage) {
+        try { await _ePage.goBack({ timeout: Math.max(timeoutMs, 15000) }); return { ok: true, action, sessionId, executionTime: Date.now() - start }; }
+        catch (e) { logger.warn(`[browser.act] back (engine) failed: ${e.message} — falling back to CLI`); }
+      }
+      return run(['go-back'], 'go-back');
+    }
+    case 'forward': {
+      const _ePage = engine.getPage(sessionId);
+      if (_ePage) {
+        try { await _ePage.goForward({ timeout: Math.max(timeoutMs, 15000) }); return { ok: true, action, sessionId, executionTime: Date.now() - start }; }
+        catch (e) { logger.warn(`[browser.act] forward (engine) failed: ${e.message} — falling back to CLI`); }
+      }
+      return run(['go-forward'], 'go-forward');
+    }
+    case 'reload': {
+      const _ePage = engine.getPage(sessionId);
+      if (_ePage) {
+        try { await _ePage.reload({ waitUntil: 'domcontentloaded', timeout: Math.max(timeoutMs, 15000) }); return { ok: true, action, sessionId, executionTime: Date.now() - start }; }
+        catch (e) { logger.warn(`[browser.act] reload (engine) failed: ${e.message} — falling back to CLI`); }
+      }
+      return run(['reload'], 'reload');
+    }
 
     case 'close': {
-      // Remove from openSessions FIRST so concurrent poll loops (e.g. waitForAuth)
-      // see the session as gone immediately and don't spawn a new daemon.
       openSessions.delete(sessionId);
-      const res = await cliRun([...S, 'close'], timeoutMs);
-      // Clear all per-tab cache entries for this session
+      // Close engine session if active
+      if (engine.isSessionActive(sessionId)) {
+        await engine.closeSession(sessionId);
+      }
+      // Also try CLI close (in case CLI daemon is running)
+      const res = await cliRun([...S, 'close'], timeoutMs).catch(() => ({ ok: false }));
       for (const k of snapshotCache.keys()) { if (k.startsWith(`${sessionId}:`)) snapshotCache.delete(k); }
       currentTabIndex.delete(sessionId);
-      // Reset ad-block interception guard so next open re-registers routes + init script
+      _engineRefMaps.delete(sessionId);
       clearAdBlockSession(sessionId);
-      return { ok: res.ok, action, sessionId, executionTime: Date.now() - start, error: res.ok ? undefined : res.error };
+      return { ok: true, action, sessionId, executionTime: Date.now() - start, error: undefined };
     }
 
     case 'close-all': {
       const sessions = [...openSessions];
+      // Also close engine sessions
+      for (const sid of engine.listSessions()) {
+        if (!sessions.includes(sid)) sessions.push(sid);
+      }
       let closed = 0;
       for (const sid of sessions) {
         openSessions.delete(sid);
+        if (engine.isSessionActive(sid)) {
+          await engine.closeSession(sid);
+          closed++;
+        }
         const S2 = sessionFlags(sid);
         const res = await cliRun([...S2, 'close'], Math.min(timeoutMs, 8000)).catch(() => ({ ok: false }));
-        if (res.ok) closed++;
+        if (res.ok && !engine.isSessionActive(sid)) closed++;
         for (const k of snapshotCache.keys()) { if (k.startsWith(`${sid}:`)) snapshotCache.delete(k); }
         currentTabIndex.delete(sid);
+        _engineRefMaps.delete(sid);
         clearAdBlockSession(sid);
       }
       logger.info(`[browser.act] close-all: closed ${closed}/${sessions.length} sessions`);
@@ -2168,6 +2591,28 @@ async function browserAct(args) {
 
     // ── Snapshot ─────────────────────────────────────────────────────────────
     case 'snapshot': {
+      // ── Engine path ──
+      const _enginePage = engine.getPage(sessionId);
+      if (_enginePage) {
+        try {
+          const snapshot = await _captureEngineSnapshot(sessionId, _enginePage);
+          if (snapshot) {
+            return {
+              ok: true,
+              action,
+              sessionId,
+              result: snapshot.yaml,
+              generation: snapshot.generation,
+              executionTime: Date.now() - start,
+            };
+          }
+        } catch (snapErr) {
+          logger.warn(`[browser.act] snapshot (engine) failed: ${snapErr.message}`);
+          return _engineActionFailure(action, sessionId, `Engine snapshot failed: ${snapErr.message}`, { engineHealthFailure: true, executionTime: Date.now() - start });
+        }
+      }
+
+      // ── CLI fallback ──
       const res = await captureSnapshot(sessionId, headed, timeoutMs);
       const content = res.snapshotText || res.stdout || '';
       return {
@@ -2184,9 +2629,154 @@ async function browserAct(args) {
     case 'click':
     case 'dblclick': {
       const cmd = action === 'dblclick' ? 'dblclick' : 'click';
-      // Extract purpose hint from args (e.g., "search", "voice-input", "navigate")
       const clickPurpose = args?.purpose || args?.intent || 'default';
-      // Ensure snapshot is fresh for ref resolution
+
+      // ── Engine path ──
+      const _ePage = engine.getPage(sessionId);
+      if (_ePage) {
+        const { ref: cleanRef, entry: plannedEntry, stale } = _engineRefEntry(sessionId, _ePage, selector);
+        if (stale) return _engineActionFailure(action, sessionId, `Stale ref ${cleanRef}: take a fresh snapshot and re-plan before clicking`, { staleRef: true, executionTime: Date.now() - start });
+        if (cleanRef && !plannedEntry) return _engineActionFailure(action, sessionId, `Unresolvable ref ${cleanRef}: take a fresh snapshot and re-plan before clicking`, { staleRef: true, executionTime: Date.now() - start });
+        const refMap = _engineSnapshots.get(sessionId)?.refMap || new Map();
+        const _lowConfRefs = _engineSnapshots.get(sessionId)?.lowConfidenceRefs || false;
+
+        if (cleanRef && refMap && !_lowConfRefs) {
+          const entry = refMap.get(cleanRef);
+          if (entry) {
+            // ── Probe-then-commit: try semantic CSS selectors before getByRole ──
+            const _semSels = _deriveSemanticSelectors(entry, 'click');
+            if (_semSels.length > 0) {
+              const _matched = await _probeSemanticSelectors(_ePage, _semSels);
+              if (_matched.length > 0) {
+                for (const _sel of _matched) {
+                  try {
+                    if (cmd === 'dblclick') {
+                      await _ePage.dblclick(_sel, { timeout: 5000 });
+                    } else {
+                      await _ePage.click(_sel, { timeout: 5000 });
+                    }
+                    logger.info(`[browser.act] click (engine) semantic="${_sel}" ok (ref=${cleanRef} bypassed)`);
+                    return { ok: true, action, sessionId, executionTime: Date.now() - start };
+                  } catch (_semErr) {
+                    logger.debug(`[browser.act] click (engine) semantic="${_sel}" failed: ${_semErr.message} — trying next`);
+                  }
+                }
+                logger.info(`[browser.act] click (engine) semantic selectors matched but click failed — falling through to getByRole`);
+              }
+            }
+            // ── Fall through to getByRole (existing path) ──
+            try {
+              // Cap per-click timeout to avoid multi-minute hangs on a bad locator
+              const clickTimeout = Math.min(timeoutMs, 15000);
+              let locator;
+              if ((entry.role === 'unknown' || entry.role === 'generic') && entry.name) {
+                // ariaSnapshot omitted the role token; fall back to visible text match
+                locator = _ePage.locator('*:visible').filter({ hasText: entry.name }).first();
+              } else if (entry.name) {
+                locator = _ePage.getByRole(entry.role, { name: entry.name }).first();
+              } else {
+                locator = _ePage.getByRole(entry.role).first();
+              }
+              if (cmd === 'dblclick') {
+                await locator.dblclick({ timeout: clickTimeout });
+              } else {
+                await locator.click({ timeout: clickTimeout });
+              }
+              logger.info(`[browser.act] click (engine) ref=${cleanRef} role=${entry.role} name="${entry.name}" ok`);
+              return { ok: true, action, sessionId, executionTime: Date.now() - start };
+            } catch (clickErr) {
+              logger.warn(`[browser.act] click (engine) ref=${cleanRef} failed: ${clickErr.message} — trying CSS/eval fallback`);
+            }
+          }
+        } else if (_lowConfRefs && cleanRef && refMap) {
+          const entry = refMap.get(cleanRef);
+          if (entry && entry.name) {
+            try {
+              const clickTimeout = Math.min(timeoutMs, 15000);
+              const locator = _ePage.locator('*:visible').filter({ hasText: entry.name }).first();
+              if (cmd === 'dblclick') {
+                await locator.dblclick({ timeout: clickTimeout });
+              } else {
+                await locator.click({ timeout: clickTimeout });
+              }
+              logger.info(`[browser.act] click (engine) ref=${cleanRef} text="${entry.name}" (lowConf) ok`);
+              return { ok: true, action, sessionId, executionTime: Date.now() - start };
+            } catch (textErr) {
+              logger.warn(`[browser.act] click (engine) ref=${cleanRef} text fallback failed: ${textErr.message}`);
+            }
+          }
+          logger.info(`[browser.act] click (engine) lowConfidenceRefs — no text fallback for ref=${cleanRef}, trying CSS/eval`);
+        } else if (_lowConfRefs) {
+          logger.info(`[browser.act] click (engine) lowConfidenceRefs — skipping role-based locators, using CSS/text fallback`);
+        }
+
+        // CSS selector path
+        if (selector && /[\[\]#.>:()"'=~^$*|]/.test(selector.trim())) {
+          try {
+            if (cmd === 'dblclick') {
+              await _ePage.dblclick(selector, { timeout: timeoutMs });
+            } else {
+              await _ePage.click(selector, { timeout: timeoutMs });
+            }
+            logger.info(`[browser.act] click (engine) CSS="${selector}" ok`);
+            return { ok: true, action, sessionId, executionTime: Date.now() - start };
+          } catch (cssErr) {
+            logger.warn(`[browser.act] click (engine) CSS="${selector}" failed: ${cssErr.message} — falling back to CLI`);
+          }
+        }
+
+        // Text-based click via page.evaluate (replaces eval-click CLI path)
+        if (selector && !cleanRef) {
+          try {
+            const words = selector.trim().split(/\s+/);
+            const tryTexts = [selector];
+            for (let len = words.length; len >= 1; len--) {
+              const t = words.slice(0, len).join(' ');
+              if (!tryTexts.includes(t)) tryTexts.push(t);
+            }
+            const textsJson = JSON.stringify(tryTexts);
+            const isSearchPurpose = clickPurpose === 'search' || clickPurpose === 'find' || clickPurpose === 'submit';
+            const evalResult = await _ePage.evaluate(`(() => {
+              const texts = ${textsJson};
+              const CANDIDATES = 'a,button,input[type=submit],[role=button],[role=link],[role=menuitem],li';
+              const isSearch = ${isSearchPurpose};
+              const isMic = (el) => {
+                const al = (el.getAttribute('aria-label') || '').toLowerCase();
+                return ['microphone','mic','voice','audio','speak','speech'].some(k => al.includes(k));
+              };
+              for (const t of texts) {
+                const tl = t.toLowerCase();
+                const all = [...document.querySelectorAll(CANDIDATES)];
+                const candidates = isSearch ? all.filter(e => !isMic(e)) : all;
+                const el = candidates.find(e =>
+                  (e.getAttribute('aria-label') || '').toLowerCase() === tl ||
+                  e.textContent.trim().toLowerCase() === tl ||
+                  e.textContent.trim().toLowerCase().startsWith(tl) ||
+                  e.getAttribute('data-testid') === t ||
+                  (e.getAttribute('name') || '').toLowerCase() === tl ||
+                  (e.getAttribute('value') || '').toLowerCase() === tl
+                ) || candidates.find(e => e.textContent.trim().length <= 50 && e.textContent.trim().toLowerCase().includes(tl));
+                if (el) { el.click(); return 'clicked:' + t; }
+              }
+              return 'not-found';
+            })()`);
+            if (evalResult && evalResult.startsWith('clicked:') && evalResult !== 'clicked:form') {
+              logger.info(`[browser.act] click (engine) eval → ${evalResult}`);
+              return { ok: true, action, sessionId, result: evalResult, executionTime: Date.now() - start };
+            }
+            logger.warn(`[browser.act] click (engine) eval: not found for "${selector}" — falling back to CLI`);
+          } catch (evalErr) {
+            logger.warn(`[browser.act] click (engine) eval failed: ${evalErr.message} — falling back to CLI`);
+          }
+        }
+      }
+
+      // Engine owns session — no CLI fallback
+      if (engine.isSessionActive(sessionId)) {
+        return _engineActionFailure(action, sessionId, `Engine click failed for selector="${selector}": take a fresh snapshot and re-plan`, { executionTime: Date.now() - start });
+      }
+
+      // ── CLI fallback (full original path) ──
       await captureSnapshot(sessionId, headed, timeoutMs);
       
       // Get all candidates and filter out microphone buttons if purpose is search
@@ -2317,26 +2907,13 @@ async function browserAct(args) {
 
     // ── Fill / Type ─────────────────────────────────────────────────────────
     case 'fill': {
-      // Always use click → select-all → type (real keyboard events) rather than
-      // playwright-cli's native 'fill' which sets element.value directly. React,
-      // Vue, and other framework-controlled inputs (e.g. Google's sign-in page)
-      // ignore programmatic .value assignments — only actual keyboard events
-      // trigger their internal state updates and allow the form to submit correctly.
-      await captureSnapshot(sessionId, headed, timeoutMs);
-      const rawFillRef = resolveRef(sessionId, selector);
-      // Only use real eN refs — synthetic line_N refs from .yml format are rejected by playwright-cli
-      const ref = rawFillRef && /^e\d+$/i.test(rawFillRef) ? rawFillRef : null;
-      const fillTarget = ref || selector;
       const fillText = (text ?? value) || '';
       const unresolvedCred = fillText.match(/\{\{[a-z0-9_.-]+:[a-z0-9_]+\}\}/i);
       if (unresolvedCred) {
         logger.warn(`[browser.act] fill: refusing unresolved credential token ${unresolvedCred[0]}`);
         return {
-          ok: false,
-          action,
-          sessionId,
-          loginWallDetected: true,
-          needsCredentials: true,
+          ok: false, action, sessionId,
+          loginWallDetected: true, needsCredentials: true,
           executionTime: Date.now() - start,
           error: `Unresolved credential token ${unresolvedCred[0]} — credentials must be resolved before fill`,
         };
@@ -2345,20 +2922,163 @@ async function browserAct(args) {
       if (placeholderEmail) {
         logger.warn(`[browser.act] fill: refusing placeholder email value ${placeholderEmail[0]}`);
         return {
-          ok: false,
-          action,
-          sessionId,
+          ok: false, action, sessionId,
           executionTime: Date.now() - start,
           error: `Placeholder recipient value rejected: ${placeholderEmail[0]}`,
         };
       }
+
+      // ── Engine path ──
+      const _ePage = engine.getPage(sessionId);
+      if (_ePage) {
+        const { ref: cleanRef, entry: plannedEntry, stale } = _engineRefEntry(sessionId, _ePage, selector);
+        if (stale) return _engineActionFailure(action, sessionId, `Stale ref ${cleanRef}: take a fresh snapshot and re-plan before filling`, { staleRef: true, executionTime: Date.now() - start });
+        if (cleanRef && !plannedEntry) return _engineActionFailure(action, sessionId, `Unresolvable ref ${cleanRef}: take a fresh snapshot and re-plan before filling`, { staleRef: true, executionTime: Date.now() - start });
+        const refMap = _engineSnapshots.get(sessionId)?.refMap || new Map();
+        const _fillLowConf = _engineSnapshots.get(sessionId)?.lowConfidenceRefs || false;
+
+        try {
+          // Click to focus
+          const fillClickTimeout = Math.min(timeoutMs, 15000);
+          if (cleanRef && refMap && !_fillLowConf) {
+            const entry = refMap.get(cleanRef);
+            // ── Probe-then-commit: try semantic CSS selectors before getByRole ──
+            if (entry) {
+              const _semSels = _deriveSemanticSelectors(entry, 'fill');
+              if (_semSels.length > 0) {
+                const _matched = await _probeSemanticSelectors(_ePage, _semSels);
+                if (_matched.length > 0) {
+                  let _semClicked = false;
+                  for (const _sel of _matched) {
+                    try {
+                      await _ePage.click(_sel, { timeout: 5000 });
+                      logger.info(`[browser.act] fill (engine) semantic click="${_sel}" ok (ref=${cleanRef} bypassed)`);
+                      _semClicked = true;
+                      break;
+                    } catch (_semErr) {
+                      logger.debug(`[browser.act] fill (engine) semantic click="${_sel}" failed: ${_semErr.message} — trying next`);
+                    }
+                  }
+                  if (_semClicked) {
+                    // Skip getByRole focus — semantic click already focused the element
+                    // Jump directly to chip detection + type
+                    const isChip = await _ePage.evaluate(
+                      'document.activeElement && ' +
+                      'document.activeElement.tagName !== "TEXTAREA" && ' +
+                      'document.activeElement.tagName !== "INPUT" && ' +
+                      'document.activeElement.getAttribute("aria-multiline") !== "true" && ' +
+                      '(document.activeElement.isContentEditable || ' +
+                      'document.activeElement.getAttribute("role") === "combobox" || ' +
+                      'document.activeElement.getAttribute("aria-autocomplete") !== null || ' +
+                      '!!document.activeElement.closest("[role=combobox]")) ? "chip" : "normal"'
+                    );
+                    if (isChip === 'chip') {
+                      logger.info(`[browser.act] fill (engine) chip-detect: chip/combobox — skipping Meta+a`);
+                      await _ePage.keyboard.type(fillText, { timeout: timeoutMs });
+                      await _ePage.keyboard.press('Tab');
+                    } else {
+                      await _ePage.keyboard.press('Meta+a');
+                      await _ePage.keyboard.type(fillText, { timeout: timeoutMs });
+                    }
+                    logger.info(`[browser.act] fill (engine) semantic path ok`);
+                    lastFilledTarget.delete(sessionId);
+                    return { ok: true, action, sessionId, executionTime: Date.now() - start };
+                  }
+                  logger.info(`[browser.act] fill (engine) semantic selectors matched but click failed — falling through to getByRole`);
+                }
+              }
+            }
+            // ── Fall through to getByRole (existing path) ──
+            if (entry && entry.name) {
+              let clickLocator;
+              if (entry.role === 'unknown' || entry.role === 'generic') {
+                clickLocator = _ePage.locator('*:visible').filter({ hasText: entry.name }).first();
+              } else {
+                clickLocator = _ePage.getByRole(entry.role, { name: entry.name }).first();
+              }
+              await clickLocator.click({ timeout: fillClickTimeout });
+            } else if (entry) {
+              await _ePage.getByRole(entry.role).first().click({ timeout: fillClickTimeout });
+            } else {
+              await _ePage.click(selector, { timeout: fillClickTimeout });
+            }
+          } else {
+            if (_fillLowConf && cleanRef && refMap) {
+              const entry = refMap.get(cleanRef);
+              if (entry && entry.name) {
+                try {
+                  const clickLocator = _ePage.locator('*:visible').filter({ hasText: entry.name }).first();
+                  await clickLocator.click({ timeout: fillClickTimeout });
+                  logger.info(`[browser.act] fill (engine) click ref=${cleanRef} text="${entry.name}" (lowConf) ok`);
+                } catch (textErr) {
+                  logger.warn(`[browser.act] fill (engine) text fallback failed: ${textErr.message} — trying CSS selector`);
+                  await _ePage.click(selector, { timeout: fillClickTimeout });
+                }
+              } else {
+                await _ePage.click(selector, { timeout: fillClickTimeout });
+              }
+            } else {
+              if (_fillLowConf) logger.info(`[browser.act] fill (engine) lowConfidenceRefs — skipping role-based locators, using CSS selector`);
+              await _ePage.click(selector, { timeout: fillClickTimeout });
+            }
+          }
+
+          // Detect chip/combobox field
+          const isChip = await _ePage.evaluate(
+            'document.activeElement && ' +
+            'document.activeElement.tagName !== "TEXTAREA" && ' +
+            'document.activeElement.tagName !== "INPUT" && ' +
+            'document.activeElement.getAttribute("aria-multiline") !== "true" && ' +
+            '(document.activeElement.isContentEditable || ' +
+            'document.activeElement.getAttribute("role") === "combobox" || ' +
+            'document.activeElement.getAttribute("aria-autocomplete") !== null || ' +
+            '!!document.activeElement.closest("[role=combobox]")) ? "chip" : "normal"'
+          );
+
+          if (isChip === 'chip') {
+            logger.info(`[browser.act] fill (engine) chip-detect: chip/combobox — skipping Meta+a`);
+            await _ePage.keyboard.type(fillText, { timeout: timeoutMs });
+            await _ePage.keyboard.press('Tab');
+          } else {
+            await _ePage.keyboard.press('Meta+a');
+            await _ePage.keyboard.type(fillText, { timeout: timeoutMs });
+          }
+
+          logger.info(`[browser.act] fill (engine) "${selector}" → ok`);
+          lastFilledTarget.delete(sessionId);
+          return { ok: true, action, sessionId, executionTime: Date.now() - start };
+        } catch (fillErr) {
+          logger.warn(`[browser.act] fill (engine) click failed: ${fillErr.message} — trying visible-input fallback`);
+          try {
+            const _fallbackInput = _ePage.locator('input[type="text"]:visible, input[role="searchbox"]:visible, input[aria-label*="Search"]:visible, textarea:visible, [contenteditable="true"]:visible, [contenteditable]:visible, [role="textbox"]:visible').first();
+            await _fallbackInput.click({ timeout: 5000 });
+            logger.info(`[browser.act] fill (engine) visible-input fallback click ok`);
+            await _ePage.keyboard.press('Meta+a');
+            await _ePage.keyboard.type(fillText, { timeout: timeoutMs });
+            logger.info(`[browser.act] fill (engine) fallback type ok`);
+            lastFilledTarget.delete(sessionId);
+            return { ok: true, action, sessionId, executionTime: Date.now() - start };
+          } catch (fallbackErr) {
+            logger.warn(`[browser.act] fill (engine) visible-input fallback also failed: ${fallbackErr.message}`);
+          }
+        }
+        // Engine owns session — no CLI fallback
+        if (engine.isSessionActive(sessionId)) {
+          return _engineActionFailure(action, sessionId, `Engine fill failed for selector="${selector}": take a fresh snapshot and re-plan`, { executionTime: Date.now() - start });
+        }
+      }
+
+      // ── CLI fallback (full original path) ──
+      await captureSnapshot(sessionId, headed, timeoutMs);
+      const rawFillRef = resolveRef(sessionId, selector);
+      const ref = rawFillRef && /^e\d+$/i.test(rawFillRef) ? rawFillRef : null;
+      const fillTarget = ref || selector;
       logger.info(`[browser.act] fill resolved: "${selector}" → ${ref ? `ref ${ref}` : `direct selector "${selector}"`} (click+type strategy)`);
 
       // Step 1: click to focus
       const clickRes = await cliRun([...S, 'click', fillTarget], timeoutMs);
       logger.info(`[browser.act] fill click ${fillTarget} → exit ${clickRes.exitCode}`, { stderr: clickRes.stderr?.slice(0, 200) });
 
-      // Hard error on click (element not found / timeout) — abort early
       const PLAYWRIGHT_HARD_ERR = /^### Error|TimeoutError:/im;
       if (PLAYWRIGHT_HARD_ERR.test(clickRes.stdout || '')) {
         const errMatch = (clickRes.stdout || '').match(/([A-Za-z]*Error:[^\n]+)/);
@@ -2373,9 +3093,7 @@ async function browserAct(args) {
         };
       }
 
-      // Step 2: detect chip/combobox fields (Gmail To, Outlook To, tag inputs, etc.)
-      // Meta+a triggers "Select All" globally in some SPAs (e.g. Gmail) which kills
-      // focus on contenteditable chip fields — skip it for those field types.
+      // Step 2: detect chip/combobox fields
       await new Promise(r => setTimeout(r, 100));
       const _chipProbe = await cliRun([...S, 'eval',
         'document.activeElement && ' +
@@ -2388,25 +3106,20 @@ async function browserAct(args) {
         '!!document.activeElement.closest("[role=combobox]")) ? "chip" : "normal"'
       ], 2000).catch(() => null);
       const _chipRaw = (_chipProbe?.stdout || '').trim();
-      const _chipResultMatch = _chipRaw.match(/###\s*Result\s*\n([\s\S]*?)(?=###|$)/i);
-      const _isChipField = (_chipResultMatch ? _chipResultMatch[1].trim() : _chipRaw).replace(/^["']|["']$/g, '') === 'chip';
+      const _chipResultMatch = _chipRaw.match(/^([\s\S]*?)(?=###\s|$)/i);
+      const _isChipField = (_chipResultMatch ? _chipResultMatch[1] : _chipRaw).replace(/^["']|["']$/g, '') === 'chip';
       logger.info(`[browser.act] fill chip-detect: ${_isChipField ? 'chip/combobox — skipping Meta+a' : 'normal input'}`);
 
       let typeRes;
       if (_isChipField) {
-        // Chip/combobox: type directly + Tab to confirm the chip (no Meta+a)
         typeRes = await cliRun([...S, 'type', '--', fillText], timeoutMs);
         await cliRun([...S, 'press', 'Tab'], 2000).catch(() => {});
       } else {
-        // Normal input: select-all to clear existing value, then type
         await cliRun([...S, 'press', 'Meta+a'], 3000).catch(() => {});
         typeRes = await cliRun([...S, 'type', '--', fillText], timeoutMs);
       }
       logger.info(`[browser.act] fill type → exit ${typeRes.exitCode}`, { stderr: typeRes.stderr?.slice(0, 200) });
 
-      // After click+type the keyboard focus is already on the correct element.
-      // Do NOT store ref in lastFilledTarget for contenteditable containers — if press
-      // Enter later re-clicks that element it can navigate away unexpectedly.
       if (typeRes.ok) lastFilledTarget.delete(sessionId);
       return {
         ok: typeRes.ok,
@@ -2419,11 +3132,58 @@ async function browserAct(args) {
     }
 
     case 'type': {
+      // ── Engine path ──
+      const _ePage = engine.getPage(sessionId);
+      if (_ePage) {
+        let _typeErr = null;
+        try {
+          await _ePage.keyboard.type(text || '', { timeout: timeoutMs });
+          return { ok: true, action, sessionId, executionTime: Date.now() - start };
+        } catch (typeErr) {
+          _typeErr = typeErr;
+          logger.warn(`[browser.act] type (engine) failed: ${typeErr.message}`);
+        }
+        if (engine.isSessionActive(sessionId)) {
+          return _engineActionFailure(action, sessionId, `Engine type failed: ${_typeErr?.message || 'unknown error'}`, { executionTime: Date.now() - start });
+        }
+      }
+      // ── CLI fallback ──
       return run(['type', '--', text || ''], `type "${text}"`);
     }
 
     // ── Hover ────────────────────────────────────────────────────────────────
     case 'hover': {
+      // ── Engine path ──
+      const _ePage = engine.getPage(sessionId);
+      if (_ePage) {
+        const { ref: cleanRef, entry: plannedEntry, stale } = _engineRefEntry(sessionId, _ePage, selector);
+        if (stale) return _engineActionFailure(action, sessionId, `Stale ref ${cleanRef}: take a fresh snapshot and re-plan before hovering`, { staleRef: true, executionTime: Date.now() - start });
+        if (cleanRef && !plannedEntry) return _engineActionFailure(action, sessionId, `Unresolvable ref ${cleanRef}: take a fresh snapshot and re-plan before hovering`, { staleRef: true, executionTime: Date.now() - start });
+        const refMap = _engineSnapshots.get(sessionId)?.refMap || new Map();
+        const _lowConfRefs = _engineSnapshots.get(sessionId)?.lowConfidenceRefs || false;
+
+        if (cleanRef && refMap && !_lowConfRefs) {
+          const entry = refMap.get(cleanRef);
+          if (entry) {
+            try {
+              const locator = entry.name
+                ? _ePage.getByRole(entry.role, { name: entry.name }).first()
+                : _ePage.getByRole(entry.role).first();
+              await locator.hover({ timeout: timeoutMs });
+              return { ok: true, action, sessionId, executionTime: Date.now() - start };
+            } catch (e) { logger.warn(`[browser.act] hover (engine) ref=${cleanRef} failed: ${e.message}`); }
+          }
+        }
+        // CSS selector path (only for genuine CSS selectors, not eN refs)
+        if (selector && !cleanRef && /[[\]#.>:()"'=~^$*|]/.test(selector.trim())) {
+          try { await _ePage.hover(selector, { timeout: timeoutMs }); return { ok: true, action, sessionId, executionTime: Date.now() - start }; }
+          catch (e) { logger.warn(`[browser.act] hover (engine) CSS="${selector}" failed: ${e.message}`); }
+        }
+        if (engine.isSessionActive(sessionId)) {
+          return _engineActionFailure(action, sessionId, `Engine hover failed for selector="${selector}": take a fresh snapshot and re-plan`, { executionTime: Date.now() - start });
+        }
+      }
+      // ── CLI fallback ──
       await captureSnapshot(sessionId, headed, timeoutMs);
       const rawHoverRef = resolveRef(sessionId, selector);
       const hoverTarget = (rawHoverRef && /^e\d+$/i.test(rawHoverRef) ? rawHoverRef : null) || selector;
@@ -2432,6 +3192,37 @@ async function browserAct(args) {
 
     // ── Select ───────────────────────────────────────────────────────────────
     case 'select': {
+      // ── Engine path ──
+      const _ePage = engine.getPage(sessionId);
+      if (_ePage) {
+        const { ref: cleanRef, entry: plannedEntry, stale } = _engineRefEntry(sessionId, _ePage, selector);
+        if (stale) return _engineActionFailure(action, sessionId, `Stale ref ${cleanRef}: take a fresh snapshot and re-plan before selecting`, { staleRef: true, executionTime: Date.now() - start });
+        if (cleanRef && !plannedEntry) return _engineActionFailure(action, sessionId, `Unresolvable ref ${cleanRef}: take a fresh snapshot and re-plan before selecting`, { staleRef: true, executionTime: Date.now() - start });
+        const refMap = _engineSnapshots.get(sessionId)?.refMap || new Map();
+        const _lowConfRefs = _engineSnapshots.get(sessionId)?.lowConfidenceRefs || false;
+
+        if (cleanRef && refMap && !_lowConfRefs) {
+          const entry = refMap.get(cleanRef);
+          if (entry) {
+            try {
+              const locator = entry.name
+                ? _ePage.getByRole(entry.role, { name: entry.name }).first()
+                : _ePage.getByRole(entry.role).first();
+              await locator.selectOption(value || '', { timeout: timeoutMs });
+              return { ok: true, action, sessionId, executionTime: Date.now() - start };
+            } catch (e) { logger.warn(`[browser.act] select (engine) ref=${cleanRef} failed: ${e.message}`); }
+          }
+        }
+        // CSS selector path (only for genuine CSS selectors, not eN refs)
+        if (selector && !cleanRef && /[[\]#.>:()"'=~^$*|]/.test(selector.trim())) {
+          try { await _ePage.selectOption(selector, value || '', { timeout: timeoutMs }); return { ok: true, action, sessionId, executionTime: Date.now() - start }; }
+          catch (e) { logger.warn(`[browser.act] select (engine) CSS="${selector}" failed: ${e.message}`); }
+        }
+        if (engine.isSessionActive(sessionId)) {
+          return _engineActionFailure(action, sessionId, `Engine select failed for selector="${selector}": take a fresh snapshot and re-plan`, { executionTime: Date.now() - start });
+        }
+      }
+      // ── CLI fallback ──
       await captureSnapshot(sessionId, headed, timeoutMs);
       const rawSelRef = resolveRef(sessionId, selector);
       const selTarget = (rawSelRef && /^e\d+$/i.test(rawSelRef) ? rawSelRef : null) || selector;
@@ -2440,6 +3231,37 @@ async function browserAct(args) {
 
     // ── Check / Uncheck ──────────────────────────────────────────────────────
     case 'check': {
+      // ── Engine path ──
+      const _ePage = engine.getPage(sessionId);
+      if (_ePage) {
+        const { ref: cleanRef, entry: plannedEntry, stale } = _engineRefEntry(sessionId, _ePage, selector);
+        if (stale) return _engineActionFailure(action, sessionId, `Stale ref ${cleanRef}: take a fresh snapshot and re-plan before checking`, { staleRef: true, executionTime: Date.now() - start });
+        if (cleanRef && !plannedEntry) return _engineActionFailure(action, sessionId, `Unresolvable ref ${cleanRef}: take a fresh snapshot and re-plan before checking`, { staleRef: true, executionTime: Date.now() - start });
+        const refMap = _engineSnapshots.get(sessionId)?.refMap || new Map();
+        const _lowConfRefs = _engineSnapshots.get(sessionId)?.lowConfidenceRefs || false;
+
+        if (cleanRef && refMap && !_lowConfRefs) {
+          const entry = refMap.get(cleanRef);
+          if (entry) {
+            try {
+              const locator = entry.name
+                ? _ePage.getByRole(entry.role, { name: entry.name }).first()
+                : _ePage.getByRole(entry.role).first();
+              await locator.check({ timeout: timeoutMs });
+              return { ok: true, action, sessionId, executionTime: Date.now() - start };
+            } catch (e) { logger.warn(`[browser.act] check (engine) ref=${cleanRef} failed: ${e.message}`); }
+          }
+        }
+        // CSS selector path (only for genuine CSS selectors, not eN refs)
+        if (selector && !cleanRef && /[[\]#.>:()"'=~^$*|]/.test(selector.trim())) {
+          try { await _ePage.check(selector, { timeout: timeoutMs }); return { ok: true, action, sessionId, executionTime: Date.now() - start }; }
+          catch (e) { logger.warn(`[browser.act] check (engine) CSS="${selector}" failed: ${e.message}`); }
+        }
+        if (engine.isSessionActive(sessionId)) {
+          return _engineActionFailure(action, sessionId, `Engine check failed for selector="${selector}": take a fresh snapshot and re-plan`, { executionTime: Date.now() - start });
+        }
+      }
+      // ── CLI fallback ──
       await captureSnapshot(sessionId, headed, timeoutMs);
       const rawCheckRef = resolveRef(sessionId, selector);
       const checkTarget = (rawCheckRef && /^e\d+$/i.test(rawCheckRef) ? rawCheckRef : null) || selector;
@@ -2573,11 +3395,35 @@ async function browserAct(args) {
         }
       }
 
-      // Step 1: click the selector to open the file chooser (if selector provided)
+      // ── Engine path: use Playwright file chooser API ──
+      const _ePage = engine.getPage(sessionId);
+      if (_ePage) {
+        try {
+          if (selector) {
+            logger.info(`[browser.act] upload: clicking attach button (engine): ${selector}`);
+            const [fileChooser] = await Promise.all([
+              _ePage.waitForFileChooser({ timeout: timeoutMs }),
+              _ePage.click(selector),
+            ]);
+            await fileChooser.setFiles(uploadFiles);
+          } else {
+            const fileInput = await _ePage.locator('input[type="file"]').first();
+            await fileInput.setInputFiles(uploadFiles);
+          }
+          logger.info(`[browser.act] upload: files set successfully (engine): ${uploadFiles.join(', ')}`);
+          if (sessionId.includes('gmail') || sessionId.includes('mail')) {
+            for (const _f of uploadFiles) { await waitForAttachmentProcessing(sessionId, _f); }
+          }
+          return { ok: true, action, sessionId, files: uploadFiles, result: `Successfully uploaded ${uploadFiles.length} file(s)`, executionTime: Date.now() - start };
+        } catch (e) {
+          logger.warn(`[browser.act] upload (engine) failed: ${e.message} — falling back to CLI`);
+        }
+      }
+
+      // ── CLI fallback ──
       if (selector) {
         logger.info(`[browser.act] upload: clicking attach button: ${selector}`);
-        // Direct CLI call without debugging infrastructure
-        const clickFlags = sessionFlags(sessionId, false); // Force headed=false to avoid DevTools
+        const clickFlags = sessionFlags(sessionId, false);
         const _triggerRes = await cliRun([...clickFlags, 'click', selector], timeoutMs);
         if (!_triggerRes.ok) {
           return {
@@ -2588,13 +3434,11 @@ async function browserAct(args) {
             executionTime: Date.now() - start,
           };
         }
-        // Brief wait to let file chooser initialize
-        logger.info(`[browser.act] upload: waiting 500ms for file chooser`);
         await cliRun([...clickFlags, 'wait', '500'], timeoutMs);
       }
 
       // Step 2: upload files using playwright-cli upload command (direct CLI only)
-      const uploadFlags = sessionFlags(sessionId, false); // Force headed=false to avoid DevTools
+      const uploadFlags = sessionFlags(sessionId, false);
       for (const _f of uploadFiles) {
         logger.info(`[browser.act] upload: attempting playwright-cli upload for: ${_f}`);
         const _uploadResult = await cliRun([...uploadFlags, 'upload', _f], timeoutMs);
@@ -2646,35 +3490,19 @@ async function browserAct(args) {
     // attachments because it focuses the compose body first.
     case 'paste': {
       logger.info(`[browser.act] Pasting clipboard content for session=${sessionId}`);
-
+      const pasteKey = process.platform === 'darwin' ? 'Meta+v' : 'Control+v';
+      const _ePage = engine.getPage(sessionId);
+      if (_ePage) {
+        try { await _ePage.keyboard.press(pasteKey); return { ok: true, action, sessionId, executionTime: Date.now() - start, result: 'Clipboard content pasted successfully' }; }
+        catch (e) { logger.warn(`[browser.act] paste (engine) failed: ${e.message} — falling back to CLI`); }
+      }
       try {
-        const pasteKey = process.platform === 'darwin' ? 'Meta+v' : 'Control+v';
-
         const pasteResult = await run(['press', pasteKey], `paste ${pasteKey}`);
-
-        if (!pasteResult.ok) {
-          throw new Error(`Failed to paste: ${pasteResult.error || pasteResult.stderr}`);
-        }
-
-        logger.info(`[browser.act] Paste completed successfully`);
-
-        return {
-          ok: true,
-          action,
-          sessionId,
-          executionTime: Date.now() - start,
-          result: 'Clipboard content pasted successfully'
-        };
-
+        if (!pasteResult.ok) throw new Error(`Failed to paste: ${pasteResult.error || pasteResult.stderr}`);
+        return { ok: true, action, sessionId, executionTime: Date.now() - start, result: 'Clipboard content pasted successfully' };
       } catch (error) {
         logger.error(`[browser.act] Paste failed: ${error.message}`);
-        return {
-          ok: false,
-          action,
-          sessionId,
-          executionTime: Date.now() - start,
-          error: error.message
-        };
+        return { ok: false, action, sessionId, executionTime: Date.now() - start, error: error.message };
       }
     }
 
@@ -2736,6 +3564,40 @@ async function browserAct(args) {
         }
 
         // Focus the body by clicking it, then paste.
+        // ── Engine path ──
+        const _ePagePaste = engine.getPage(sessionId);
+        if (_ePagePaste) {
+          const refMap = _engineRefMaps.get(sessionId);
+          if (refMap && refMap.has(bodyRef)) {
+            const entry = refMap.get(bodyRef);
+            try {
+              const locator = entry.name
+                ? _ePagePaste.getByRole(entry.role, { name: entry.name }).first()
+                : _ePagePaste.getByRole(entry.role).first();
+              await locator.click({ timeout: 5000 });
+              logger.info(`[browser.act] pasteAttachment: clicked body ref ${bodyRef} (engine) ok`);
+            } catch (clickErr) {
+              logger.warn(`[browser.act] pasteAttachment: click on body ref ${bodyRef} (engine) failed: ${clickErr.message} — continuing to paste anyway`);
+            }
+          } else {
+            logger.warn(`[browser.act] pasteAttachment: ref ${bodyRef} not in refMap — trying CSS click`);
+            try { await _ePagePaste.click(`[aria-label="${bodyLabel || 'Message Body'}"]`, { timeout: 5000 }).catch(() => {}); }
+            catch (_) {}
+          }
+
+          await new Promise(r => setTimeout(r, 150));
+
+          const pasteKey = process.platform === 'darwin' ? 'Meta+v' : 'Control+v';
+          try {
+            await _ePagePaste.keyboard.press(pasteKey);
+            logger.info(`[browser.act] pasteAttachment: paste key pressed (engine) ok`);
+            return { ok: true, action, sessionId, executionTime: Date.now() - start, result: 'Pasted into compose body' };
+          } catch (pressErr) {
+            logger.warn(`[browser.act] pasteAttachment: paste key (engine) failed: ${pressErr.message} — falling back to CLI`);
+          }
+        }
+
+        // ── CLI fallback ──
         const clickRes = await run(['click', bodyRef], `pasteAttachment focus ${bodyRef}`);
         if (!clickRes.ok) {
           logger.warn(`[browser.act] pasteAttachment: click on body ref ${bodyRef} failed — continuing to paste anyway`);
@@ -2856,9 +3718,50 @@ async function browserAct(args) {
     case 'keyboard':
     case 'press': {
       const pressKey = key || text || '';
-      // For Enter/Return: refocus the last filled input first so the form submits correctly.
-      // After fill+click+type fallback, focus may have drifted — this guarantees the
-      // keypress lands on the right element and triggers form submission.
+
+      // ── Engine path ──
+      const _ePage = engine.getPage(sessionId);
+      if (_ePage) {
+        try {
+          // For Enter/Return: refocus last filled input before submit
+          if (/^(Enter|Return)$/i.test(pressKey)) {
+            const lastFill = lastFilledTarget.get(sessionId);
+            if (lastFill) {
+              const refocusTarget = lastFill.ref || lastFill.target;
+              logger.info(`[browser.act] press Enter (engine): refocusing "${refocusTarget}"`);
+              // Try clicking by ref or CSS selector
+              try {
+                const refMap = _engineRefMaps.get(sessionId);
+                const loc = refMap?.get(refocusTarget);
+                if (loc) {
+                  await _ePage.getByRole(loc.role, { name: loc.name }).first().click({ timeout: 3000 }).catch(() => {});
+                } else {
+                  await _ePage.click(refocusTarget, { timeout: 3000 }).catch(() => {});
+                }
+              } catch (_) {}
+              await new Promise(r => setTimeout(r, 150));
+            }
+            snapshotCache.delete(_tabKey(sessionId));
+            lastFilledTarget.delete(sessionId);
+          }
+
+          await _ePage.keyboard.press(pressKey);
+          logger.info(`[browser.act] press ${pressKey} (engine) ok`);
+
+          // For Enter: wait for potential navigation
+          if (/^(Enter|Return)$/i.test(pressKey)) {
+            try {
+              await _ePage.waitForLoadState('domcontentloaded', { timeout: 3000 });
+            } catch (_) {}
+            snapshotCache.delete(_tabKey(sessionId));
+          }
+          return { ok: true, action, sessionId, executionTime: Date.now() - start };
+        } catch (pressErr) {
+          logger.warn(`[browser.act] press (engine) failed: ${pressErr.message} — falling back to CLI`);
+        }
+      }
+
+      // ── CLI fallback ──
       if (/^(Enter|Return)$/i.test(pressKey)) {
         const lastFill = lastFilledTarget.get(sessionId);
         if (lastFill) {
@@ -2867,26 +3770,15 @@ async function browserAct(args) {
           await cliRun([...S, 'click', refocusTarget], 3000).catch(() => {});
           await new Promise(r => setTimeout(r, 150));
         }
-        // Enter triggers navigation — invalidate per-tab snapshot cache and lastFilledTarget
-        // so any subsequent fill/click gets a fresh snapshot with valid refs.
         snapshotCache.delete(_tabKey(sessionId));
         lastFilledTarget.delete(sessionId);
 
-        // Run press and treat navigation-kill exits as success.
-        // playwright-cli exits with -1 or null when the page navigates away mid-keypress —
-        // that is the expected outcome of a form submit via Enter.
         const pressRes = await cliRun([...S, 'press', pressKey], timeoutMs);
         logger.info(`[browser.act] press ${pressKey} → exit ${pressRes.exitCode}`, { stderr: pressRes.stderr?.slice(0, 200) });
         const navigationKill = pressRes.exitCode === -1 || pressRes.exitCode === null;
         if (navigationKill) {
-          // Daemon process was killed by the navigation. Remove from openSessions so the
-          // next navigate re-probes the daemon (isDaemonAlive) rather than blindly using
-          // goto on a dead session — which would succeed but leave the tab on about:blank.
           openSessions.delete(sessionId);
-          // Give the browser ~2s to finish loading the new page before the next action.
           await new Promise(r => setTimeout(r, 2000));
-          // Re-add to openSessions: the browser window is still open, just the session
-          // daemon needs a fresh probe. isDaemonAlive will confirm on next navigate call.
         }
         return {
           ok:            pressRes.ok || navigationKill,
@@ -2898,8 +3790,6 @@ async function browserAct(args) {
           error:         (pressRes.ok || navigationKill) ? undefined : pressRes.error || pressRes.stderr?.trim(),
         };
       }
-      // playwright-cli exits 0 even for invalid keys but writes the error into stdout.
-      // Detect and surface those as failures so plan repair fires instead of silently continuing.
       const _pressRes = await run(['press', pressKey], `press ${pressKey}`);
       if (_pressRes.ok && /\bError\b/i.test(_pressRes.stdout || '')) {
         const _pressErr = (_pressRes.stdout || '').match(/Error[:\s].+/i)?.[0]?.trim() || `press failed: unknown key '${pressKey}'`;
@@ -2913,8 +3803,6 @@ async function browserAct(args) {
 
     // ── Drag ─────────────────────────────────────────────────────────────────
     // Drags the source element (selector/ref) to the targetSelector element.
-    // Uses playwright-cli drag-and-drop command when available, falls back to
-    // a mouse-based drag sequence via evaluate.
     case 'drag': {
       const targetSel = args.targetSelector || args.target;
       if (!targetSel) {
@@ -2925,7 +3813,17 @@ async function browserAct(args) {
         return { ok: false, action, sessionId, error: 'drag requires a source selector or ref', executionTime: Date.now() - start };
       }
       logger.info(`[browser.act] drag from="${sourceSel}" to="${targetSel}"`);
-      // Try playwright-cli drag-and-drop (available in recent playwright-cli versions)
+      // ── Engine path ──
+      const _ePage = engine.getPage(sessionId);
+      if (_ePage) {
+        try {
+          await _ePage.dragAndDrop(sourceSel, targetSel, { timeout: timeoutMs });
+          return { ok: true, action, sessionId, executionTime: Date.now() - start };
+        } catch (dragErr) {
+          logger.warn(`[browser.act] drag (engine) failed: ${dragErr.message} — falling back to CLI`);
+        }
+      }
+      // ── CLI fallback ──
       const dragRes = await cliRun([...S, 'drag-and-drop', sourceSel, targetSel], timeoutMs);
       if (dragRes.ok) return { ok: true, action, sessionId, executionTime: Date.now() - start };
       // Fallback: mouse-based drag via evaluate
@@ -2955,7 +3853,7 @@ async function browserAct(args) {
 
     // ── Scroll ───────────────────────────────────────────────────────────────
     // Accepts: direction ('up'|'down'|'left'|'right'), distance ('100%'|number px),
-    // dx/dy raw pixels (legacy). Maps to playwright-cli mousewheel <dx> <dy>.
+    // dx/dy raw pixels (legacy).
     case 'scroll': {
       const direction = args.direction || 'down';
       const distance  = args.distance;
@@ -2964,7 +3862,6 @@ async function browserAct(args) {
       // Parse distance: '100%' → full document height, numeric string → pixels
       if (distance !== undefined) {
         if (String(distance) === '100%' || String(distance).toLowerCase() === 'bottom') {
-          // Scroll to absolute bottom via eval, then mousewheel a large value
           scrollDy = 99999;
         } else if (String(distance) === '0%' || String(distance).toLowerCase() === 'top') {
           scrollDy = -99999;
@@ -2979,12 +3876,36 @@ async function browserAct(args) {
       if (direction === 'left')  { scrollDx = -Math.abs(scrollDy); scrollDy = 0; }
       if (direction === 'right') { scrollDx =  Math.abs(scrollDy); scrollDy = 0; }
       logger.info(`[browser.act] scroll dx=${scrollDx} dy=${scrollDy} (direction=${direction} distance=${distance ?? 'default'})`);
+      // ── Engine path ──
+      const _ePage = engine.getPage(sessionId);
+      if (_ePage) {
+        try {
+          await _ePage.mouse.wheel(scrollDx || 0, scrollDy || 0);
+          return { ok: true, action, sessionId, executionTime: Date.now() - start };
+        } catch (scrollErr) {
+          logger.warn(`[browser.act] scroll (engine) failed: ${scrollErr.message} — falling back to CLI`);
+        }
+      }
+      // ── CLI fallback ──
       return run(['mousewheel', String(scrollDx), String(scrollDy)], `scroll dx=${scrollDx} dy=${scrollDy}`);
     }
 
     // ── Screenshot ───────────────────────────────────────────────────────────
     case 'screenshot': {
       const outPath = filePath || path.join(os.tmpdir(), `screenshot_${sessionId}_${Date.now()}.png`);
+
+      // ── Engine path ──
+      const _ePage = engine.getPage(sessionId);
+      if (_ePage) {
+        try {
+          await _ePage.screenshot({ path: outPath, fullPage: false });
+          return { ok: true, action, sessionId, result: outPath, executionTime: Date.now() - start };
+        } catch (ssErr) {
+          logger.warn(`[browser.act] screenshot (engine) failed: ${ssErr.message} — falling back to CLI`);
+        }
+      }
+
+      // ── CLI fallback ──
       const res = await cliRun([...S, 'screenshot', outPath], timeoutMs);
       return {
         ok:            res.ok,
@@ -3093,8 +4014,7 @@ async function browserAct(args) {
       
       const res = await cliRun([...S, 'eval', evalExpr], Math.min(timeoutMs, 20000));
       const rawOut = (res.stdout || '').trim();
-      // Use greedy match to capture everything until the LAST ### marker
-      const resultMatch = rawOut.match(/###\s*Result\s*\n([\s\S]*)(?=###\s*Ran Playwright|$)/i);
+      const resultMatch = rawOut.match(/^([\s\S]*?)(?=###\s|$)/i);
       let jsonStr;
       if (resultMatch) {
         jsonStr = resultMatch[1].trim().replace(/^["']|["']$/g, '');
@@ -3114,7 +4034,7 @@ async function browserAct(args) {
       const pageTextRes = await cliRun([...S, 'eval', '(function(){var b=document.body;return b?(b.innerText||b.textContent||"").slice(0,50000):"";})()'], Math.min(timeoutMs, 10000));
       const pageRawOut = (pageTextRes.stdout || '').trim();
       // Use greedy match to capture everything until the LAST ### marker
-      const pageResultMatch = pageRawOut.match(/###\s*Result\s*\n([\s\S]*)(?=###\s*Ran Playwright|$)/i);
+      const pageResultMatch = pageRawOut.match(/^([\s\S]*?)(?=###\s|$)/i);
       let pageText;
       if (pageResultMatch) {
         pageText = pageResultMatch[1].trim().replace(/^"/, '').replace(/"$/, '');
@@ -3267,34 +4187,43 @@ If no videos found, return []. Do not explain, only output the JSON array.`;
     // ── getText / getPageText ─────────────────────────────────────────────────
     case 'getText':
     case 'getPageText': {
-      // Eval expression: wait for readyState complete, then grab innerText (fall back to textContent).
-      // Truncated to 100k to avoid timeout on large pages. Wrapping in an IIFE avoids
-      // playwright-cli treating multi-statement code as a syntax error.
+      // ── Engine path ──
+      const _ePage = engine.getPage(sessionId);
+      if (_ePage) {
+        try {
+          const pageText = await _ePage.evaluate(
+            '(function(){var b=document.body;return b?(b.innerText||b.textContent||"").slice(0,100000):"";})()'
+          );
+          if (pageText.length < 200) {
+            logger.info(`[browser.act] getPageText (engine): short content (${pageText.length} chars)`);
+          }
+          return {
+            ok: true,
+            action,
+            sessionId,
+            stdout: pageText,
+            result: pageText,
+            executionTime: Date.now() - start,
+          };
+        } catch (gtErr) {
+          logger.warn(`[browser.act] getPageText (engine) failed: ${gtErr.message} — falling back to CLI`);
+        }
+      }
+
+      // ── CLI fallback ──
       const evalExpr = '(function(){var b=document.body;return b?(b.innerText||b.textContent||"").slice(0,100000):"";})()';
       const res = await cliRun([...S, 'eval', evalExpr], Math.min(timeoutMs, 20000));
-      // playwright-cli output format: <result>\n### Ran Playwright code\n...
-      // No "### Result" header — extract everything BEFORE the first ### header.
       const rawOut = (res.stdout || '').trim();
       const resultMatch = rawOut.match(/^([\s\S]*?)(?=###\s|$)/i);
       let pageText;
       if (resultMatch) {
-        pageText = resultMatch[1].trim();
-        // Remove surrounding quotes if present
-        pageText = pageText.replace(/^"/, '').replace(/"$/, '');
+        pageText = resultMatch[1].trim().replace(/^"/, '').replace(/"$/, '');
       } else {
-        // Fallback: try to extract from raw output
         pageText = rawOut;
       }
-      
-      // Log for debugging
       if (pageText.length < 200) {
         logger.info(`[browser.act] getPageText: short content (${pageText.length} chars), raw: ${rawOut.slice(0,200)}`);
       }
-
-      // Non-ok with partial stdout: the eval ran but exited non-zero (common on SPA pages
-      // with pending microtasks). If we got usable text, treat as ok.
-      // Non-ok with empty stdout: page not ready — return soft-pass with empty string so
-      // the synthesize step can still work with whatever prior steps collected.
       const effectiveOk = res.ok || pageText.length > 0;
       return {
         ok:            effectiveOk,
@@ -3319,8 +4248,7 @@ If no videos found, return []. Do not explain, only output the JSON array.`;
       })()`;
       const res = await cliRun([...S, 'eval', evalExpr], Math.min(timeoutMs, 20000));
       const rawOut = (res.stdout || '').trim();
-      // Use greedy match to capture everything until the LAST ### marker
-      const resultMatch = rawOut.match(/###\s*Result\s*\n([\s\S]*)(?=###\s*Ran Playwright|$)/i);
+      const resultMatch = rawOut.match(/^([\s\S]*?)(?=###\s|$)/i);
       let jsonStr;
       if (resultMatch) {
         jsonStr = resultMatch[1].trim().replace(/^["']|["']$/g, '');
@@ -3349,19 +4277,42 @@ If no videos found, return []. Do not explain, only output the JSON array.`;
     // ── evaluate ─────────────────────────────────────────────────────────────
     case 'evaluate': {
       const expr = text || selector || args.expression || '';
+
+      // ── Engine path ──
+      const _ePage = engine.getPage(sessionId);
+      if (_ePage) {
+        try {
+          // page.evaluate returns JS values directly — no regex parsing needed.
+          // Wrap in IIFE if the expression isn't already a function.
+          let evalResult;
+          if (/^(async\s*)?\(/.test(expr.trim()) || /^(async\s*)?function/.test(expr.trim())) {
+            evalResult = await _ePage.evaluate(expr);
+          } else {
+            // Wrap raw expression in an IIFE for multi-statement support
+            evalResult = await _ePage.evaluate(`(() => { return ${expr}; })()`);
+          }
+          return {
+            ok: true,
+            action,
+            sessionId,
+            result: evalResult,
+            stdout: String(evalResult ?? ''),
+            executionTime: Date.now() - start,
+          };
+        } catch (evalErr) {
+          logger.warn(`[browser.act] evaluate (engine) failed: ${evalErr.message} — falling back to CLI`);
+        }
+      }
+
+      // ── CLI fallback ──
       const evalRef = args.ref || null;
       const evalArgs = evalRef ? ['eval', '--', expr, evalRef] : ['eval', '--', expr];
       const evalRes = await run(evalArgs, `eval "${expr.slice(0, 60)}"`);
       if (!evalRes.ok) return evalRes;
       
-      // Extract value: playwright-cli output format is <result>\n### Ran Playwright code\n...
-      // No "### Result" header — extract everything BEFORE the first ### header.
       const stdout = evalRes.stdout || '';
       const match = stdout.match(/^([\s\S]*?)(?=###\s|$)/i);
       const rawResult = match ? match[1].trim().replace(/^["']|["']$/g, '') : stdout.trim();
-      // Auto-parse JSON so IIFEs returning objects come back as objects (not strings).
-      // Skills like ad-handler use result.result expecting an object — without this they
-      // always get undefined → {}, making all detection signals false.
       let result = rawResult;
       if (typeof rawResult === 'string' && (rawResult.startsWith('{') || rawResult.startsWith('['))) {
         try { result = JSON.parse(rawResult); } catch { /* keep as string */ }
@@ -3386,17 +4337,27 @@ If no videos found, return []. Do not explain, only output the JSON array.`;
       if (!code) {
         return { ok: false, action, sessionId, error: 'run-code: code is required', executionTime: Date.now() - start };
       }
-      // playwright-cli run-code requires: async page => { ... }
-      // Auto-wrap raw statement snippets — top-level const/let are invalid in the
-      // Function() context playwright-cli uses internally.
+      // ── Engine path: evaluate the code with page context ──
+      const _ePage = engine.getPage(sessionId);
+      if (_ePage) {
+        try {
+          // Build an async function that receives the page object
+          const isWrapped = /^async\s+page\s*=>/.test(code) || /^async\s*\(/.test(code);
+          const wrappedCode = isWrapped ? code : `async page => {\n${code}\n}`;
+          const fn = eval(wrappedCode);
+          const result = await fn(_ePage);
+          return { ok: true, action, sessionId, result: result, stdout: String(result ?? ''), executionTime: Date.now() - start };
+        } catch (e) {
+          logger.warn(`[browser.act] run-code (engine) failed: ${e.message} — falling back to CLI`);
+        }
+      }
+      // ── CLI fallback ──
       const isWrapped = /^async\s+page\s*=>/.test(code) || /^async\s*\(/.test(code);
       if (!isWrapped) {
         code = `async page => {\n${code}\n}`;
       }
       const rcRes = await cliRun([...S, 'run-code', '--', code], timeoutMs);
       logger.info(`[browser.act] run-code → exit ${rcRes.exitCode}`, { stderr: rcRes.stderr?.slice(0, 200) });
-      // Extract the result value: playwright-cli output format is <result>\n### Ran Playwright code\n...
-      // No "### Result" header — extract everything BEFORE the first ### header.
       const rcStdout = rcRes.stdout || '';
       const rcMatch = rcStdout.match(/^([\s\S]*?)(?=###\s|$)/i);
       const rcResult = rcMatch ? rcMatch[1].trim().replace(/^"|"$/g, '') : rcStdout.trim();
@@ -3413,9 +4374,24 @@ If no videos found, return []. Do not explain, only output the JSON array.`;
     // ── dialog-accept / dialog-dismiss ────────────────────────────────────────
     case 'dialog-accept': {
       const prompt = args.prompt || text || undefined;
+      // ── Engine path ──
+      const _ePage = engine.getPage(sessionId);
+      if (_ePage) {
+        try {
+          _ePage.once('dialog', async d => { await d.accept(prompt); });
+          return { ok: true, action, sessionId, executionTime: Date.now() - start };
+        } catch (e) { logger.warn(`[browser.act] dialog-accept (engine) failed: ${e.message} — falling back to CLI`); }
+      }
       return run(prompt ? ['dialog-accept', '--', prompt] : ['dialog-accept'], 'dialog-accept');
     }
     case 'dialog-dismiss': {
+      const _ePage = engine.getPage(sessionId);
+      if (_ePage) {
+        try {
+          _ePage.once('dialog', async d => { await d.dismiss(); });
+          return { ok: true, action, sessionId, executionTime: Date.now() - start };
+        } catch (e) { logger.warn(`[browser.act] dialog-dismiss (engine) failed: ${e.message} — falling back to CLI`); }
+      }
       return run(['dialog-dismiss'], 'dialog-dismiss');
     }
 
@@ -3427,7 +4403,17 @@ If no videos found, return []. Do not explain, only output the JSON array.`;
         await new Promise(r => setTimeout(r, 1500));
         return { ok: true, action, sessionId, result: 'body', executionTime: Date.now() - start };
       }
-      // Poll snapshot until ref matching selector appears
+      // ── Engine path: page.waitForSelector ──
+      const _ePage = engine.getPage(sessionId);
+      if (_ePage) {
+        try {
+          await _ePage.waitForSelector(selector, { timeout: Math.min(timeoutMs, 30000) });
+          return { ok: true, action, sessionId, result: selector, executionTime: Date.now() - start };
+        } catch (waitErr) {
+          logger.warn(`[browser.act] waitForSelector (engine) failed: ${waitErr.message} — falling back to CLI`);
+        }
+      }
+      // ── CLI fallback: poll snapshot until ref matching selector appears ──
       const deadline = Date.now() + timeoutMs;
       while (Date.now() < deadline) {
         await captureSnapshot(sessionId, headed, 5000);
@@ -3441,14 +4427,29 @@ If no videos found, return []. Do not explain, only output the JSON array.`;
     }
 
     // ── waitForContent ────────────────────────────────────────────────────────
-    // COMPATIBILITY: Uses eval + polling since waitForContent not available in playwright-cli
     case 'waitForContent': {
       const needle = text || selector || '';
+      // ── Engine path ──
+      const _ePage = engine.getPage(sessionId);
+      if (_ePage) {
+        const deadline = Date.now() + timeoutMs;
+        while (Date.now() < deadline) {
+          try {
+            const pageText = await _ePage.evaluate('document.body.innerText.slice(0,50000)');
+            if (String(pageText || '').includes(needle)) {
+              return { ok: true, action, sessionId, result: needle, executionTime: Date.now() - start };
+            }
+          } catch (_) {}
+          await new Promise(r => setTimeout(r, 1500));
+        }
+        return { ok: false, action, sessionId, error: `Timeout waiting for content: "${needle}"`, executionTime: Date.now() - start };
+      }
+      // ── CLI fallback ──
       const deadline = Date.now() + timeoutMs;
       while (Date.now() < deadline) {
         const evalRes = await cliRun([...S, 'eval', 'document.body.innerText.slice(0,50000)'], 8000);
         if (evalRes.ok) {
-          const pageText = evalRes.stdout.match(/###\s*Result\s*\n([\s\S]*?)(?=###|$)/i);
+          const pageText = evalRes.stdout.match(/^([\s\S]*?)(?=###\s|$)/i);
           const textContent = pageText ? pageText[1].trim() : evalRes.stdout.trim();
           if (textContent.includes(needle)) {
             return { ok: true, action, sessionId, result: needle, executionTime: Date.now() - start };
@@ -3465,17 +4466,68 @@ If no videos found, return []. Do not explain, only output the JSON array.`;
     // user actually clicks, types, or submits something on the page.
     case 'waitForTrigger': {
       // Minified inject script — registers a trusted-click-only listener on the page.
-      // isTrusted=false for synthetic JS-dispatched events (framework side-effects,
-      // mouse move events that bubble as clicks, etc.) — only real user clicks advance.
       const injectScript = `(function(){if(window.__tdListenerAttached)return;window.__tdTriggered=false;window.__tdListenerAttached=true;document.addEventListener('click',function h(e){if(!e.isTrusted)return;window.__tdTriggered=true;document.removeEventListener('click',h,true);},{capture:true});})()`;
-      await cliRun([...S, 'eval', injectScript], 5000).catch(() => {});
 
       const TRG_AUTH_WALL_FIRST = /^(sign in|log in|sign up|create account|join today|continue with google|continue with apple)\b/i;
       const TRG_AUTH_WALL_BODY  = /\b(sign in|log in|sign up)\b[\s\S]{0,400}\b(google|apple|email|phone|username|password)\b/i;
 
+      // ── Engine path ──
+      const _ePage = engine.getPage(sessionId);
+      if (_ePage) {
+        try { await _ePage.evaluate(injectScript); } catch (_) {}
+
+        let prevUrl = '';
+        try { prevUrl = String(await _ePage.evaluate('location.href') || ''); } catch (_) {}
+
+        const effectiveTriggerTimeout = Math.min(timeoutMs, 300000);
+        const triggerDeadline = Date.now() + effectiveTriggerTimeout;
+        let authCheckCounter = 0;
+
+        while (Date.now() < triggerDeadline) {
+          await new Promise(r => setTimeout(r, 1200));
+          try {
+            // 1. Batch check: interaction flag + URL in one evaluate
+            const pollResult = await _ePage.evaluate(() => ({
+              triggered: !!(window.__tdTriggered),
+              href: location.href,
+              bodySnippet: (document.body && document.body.innerText || '').slice(0, 800)
+            }));
+
+            if (pollResult.triggered) {
+              try { await _ePage.evaluate('window.__tdTriggered=false;window.__tdListenerAttached=false;'); } catch (_) {}
+              return { ok: true, action, sessionId, result: 'triggered', executionTime: Date.now() - start };
+            }
+
+            // 2. Check URL change
+            const curUrl = String(pollResult.href || '');
+            if (prevUrl && curUrl && curUrl !== prevUrl && !curUrl.startsWith('about:')) {
+              return { ok: true, action, sessionId, result: 'navigation', currentUrl: curUrl, executionTime: Date.now() - start };
+            }
+            if (curUrl && !curUrl.startsWith('about:')) prevUrl = curUrl;
+
+            // 3. Auth-wall check every 3 polls (uses bodySnippet from batch)
+            authCheckCounter++;
+            if (authCheckCounter % 3 === 0) {
+              const curTxt = String(pollResult.bodySnippet || '');
+              const firstLine = curTxt.split('\n')[0].trim();
+              if (TRG_AUTH_WALL_FIRST.test(firstLine) || TRG_AUTH_WALL_BODY.test(curTxt.slice(0, 500))) {
+                return { ok: true, action, sessionId, result: '', stdout: '', authRequired: true, authWallText: curTxt.slice(0, 100), executionTime: Date.now() - start };
+              }
+              try { await _ePage.evaluate(injectScript); } catch (_) {}
+            }
+          } catch (pollErr) {
+            logger.debug?.(`[browser.act] waitForTrigger (engine): poll error — ${pollErr.message?.slice(0, 60)}`);
+          }
+        }
+        return { ok: false, action, sessionId, error: `waitForTrigger: timeout after ${timeoutMs}ms — no user interaction detected`, executionTime: Date.now() - start };
+      }
+
+      // ── CLI fallback ──
+      await cliRun([...S, 'eval', injectScript], 5000).catch(() => {});
+
       // Capture initial URL so we can detect navigation
       const extractResult = (stdout) => {
-        const m = stdout.trim().match(/###\s*Result\s*\n([\s\S]*?)(?=###|$)/i);
+        const m = stdout.trim().match(/^([\s\S]*?)(?=###\s|$)/i);
         return (m ? m[1].trim() : stdout.trim()).replace(/^"|"$/g, '');
       };
       let prevUrl = '';
@@ -3536,12 +4588,213 @@ If no videos found, return []. Do not explain, only output the JSON array.`;
     case 'waitForNavigation':
     // ── waitForStableText ─────────────────────────────────────────────────────
     case 'waitForStableText': {
+      // ── Engine path: use page.evaluate() for all polling ──
+      const _ePage = engine.getPage(sessionId);
+      if (_ePage) {
+        // Batch probe: get hostname + initial page state in one call
+        const initialProbe = await batchProbe(_ePage);
+        const isGmailSession = initialProbe
+          ? (initialProbe.hostname || '').includes('mail.google.com')
+          : sessionId.includes('gmail');
+
+        if (isGmailSession) {
+          logger.info(`[browser.act] Using Gmail-optimized waitForStableText (engine) for session=${sessionId}`);
+          // Engine path for Gmail: change-then-stable two-phase polling
+          const effectiveTimeout = Math.min(timeoutMs, 30000);
+          const deadline = Date.now() + effectiveTimeout;
+          const isComposeUrl = (u) => /compose=new/.test(String(u));
+
+          // Change-then-stable: Phase 1 waits for content to change from baseline,
+          // Phase 2 waits for 2 consecutive stable reads. No fixed delays.
+          let baselineText = null;
+          let baselineHref = null;
+          let phase = 1; // 1 = waiting for change, 2 = waiting for stability
+          let prev = '';
+          let stableCount = 0;
+          const maxStableCount = 2;
+          let lastContent = '';
+
+          while (Date.now() < deadline) {
+            if (deadline - Date.now() < 3000) break;
+            const probe = await batchProbe(_ePage);
+            if (probe) {
+              if (/about:blank/i.test(String(probe.href))) {
+                return { ok: true, action, sessionId, result: '', stdout: '', aboutBlankDetected: true, executionTime: Date.now() - start };
+              }
+
+              // For compose=new deep-link, wait for the compose modal to actually render
+              if (isComposeUrl(probe.href)) {
+                try {
+                  const composeState = await _ePage.evaluate(() => {
+                    const dialog = document.querySelector('div[role="dialog"]');
+                    const text = (dialog ? dialog.innerText : document.body ? document.body.innerText : '') || '';
+                    const hasContentEditable = [...document.querySelectorAll('[contenteditable="true"]')].some(el => el.offsetParent !== null);
+                    return { text: text.slice(0, 2000), hasContentEditable, hasCompose: /new message|subject|to/i.test(text) };
+                  });
+                  if (composeState && composeState.hasContentEditable && composeState.hasCompose) {
+                    logger.info(`[browser.act] waitForStableText (engine): Gmail compose modal ready (${composeState.text.length} chars)`);
+                    return { ok: true, action, sessionId, result: composeState.text, executionTime: Date.now() - start };
+                  }
+                } catch (_) {}
+              } else {
+                const cur = String(probe.bodyText || '');
+                const curHref = String(probe.href || '');
+                lastContent = cur;
+
+                if (phase === 1) {
+                  // Phase 1 — Wait for change from baseline
+                  if (baselineText === null) {
+                    baselineText = cur;
+                    baselineHref = curHref;
+                    logger.info(`[browser.act] waitForStableText (engine): Gmail baseline captured (${cur.length} chars, href=${curHref})`);
+                  } else {
+                    const hrefChanged = curHref !== baselineHref;
+                    const textChanged = cur.length > 100 && Math.abs(cur.length - baselineText.length) / Math.max(cur.length, baselineText.length, 1) > 0.2;
+                    if (hrefChanged || textChanged) {
+                      phase = 2;
+                      prev = cur;
+                      stableCount = 0;
+                      logger.info(`[browser.act] waitForStableText (engine): Gmail content changed (hrefChanged=${hrefChanged}, textLen ${baselineText.length}→${cur.length}) — entering stability phase`);
+                    }
+                  }
+                } else {
+                  // Phase 2 — Wait for stability (2 consecutive matching reads)
+                  if (cur === prev) {
+                    stableCount++;
+                    logger.debug(`[browser.act] waitForStableText (engine): Gmail stable count ${stableCount}/${maxStableCount}`);
+                    if (stableCount >= maxStableCount) {
+                      logger.info(`[browser.act] waitForStableText (engine): Gmail content stabilized after ${Date.now() - start}ms (${cur.length} chars)`);
+                      return { ok: true, action, sessionId, result: cur, executionTime: Date.now() - start };
+                    }
+                  } else {
+                    // Near-stable: <5% change ratio counts as stable
+                    const longer = Math.max(prev.length, cur.length);
+                    const changeRatio = Math.abs(cur.length - prev.length) / longer;
+                    if (changeRatio < 0.05) {
+                      stableCount++;
+                      logger.debug(`[browser.act] waitForStableText (engine): Gmail near-stable (${(changeRatio * 100).toFixed(1)}% change) count ${stableCount}/${maxStableCount}`);
+                      if (stableCount >= maxStableCount) {
+                        logger.info(`[browser.act] waitForStableText (engine): Gmail content near-stable after ${Date.now() - start}ms (${cur.length} chars)`);
+                        return { ok: true, action, sessionId, result: cur, executionTime: Date.now() - start };
+                      }
+                    } else {
+                      stableCount = 0;
+                    }
+                    prev = cur;
+                  }
+                }
+              }
+            }
+            await new Promise(r => setTimeout(r, 1500));
+          }
+          // Timeout — return last known content (graceful degradation)
+          logger.info(`[browser.act] waitForStableText (engine): Gmail timeout after ${Date.now() - start}ms — returning last content (${lastContent.length} chars, phase=${phase})`);
+          return { ok: true, action, sessionId, result: lastContent, executionTime: Date.now() - start };
+        }
+
+        // Standard waitForStableText with engine polling
+        logger.info(`[browser.act] Using standard waitForStableText (engine) for session=${sessionId}`);
+
+        const AUTH_WALL_FIRST = /^(sign in|log in|sign up|create account|join today|continue with google|continue with apple|sign in to x|sign in with google|sign in with apple|login to|log into|happening now|where should we begin)\b/i;
+        const AUTH_WALL_BODY = /\b(sign in|log in|sign up|join today|create account)\b[\s\S]{0,400}\b(google|apple|email|phone|username|password|sign up with|continue with)\b/i;
+        const AUTH_WALL_LOGGEDOUT = /\b(log in|sign in|sign up for free)\b[\s\S]{0,200}\b(where should we begin|get started|create account|free account|try for free)\b/i;
+        const RESTORE_DIALOG = /restore pages?\?|chrome didn't shut down correctly|help make google chrome better/i;
+
+        const effectiveTimeout = Math.min(timeoutMs, 30000);
+        let prev = '';
+        let nearStableCount = 0;
+        const loopStart = Date.now();
+        const deadline = loopStart + effectiveTimeout;
+
+        while (Date.now() < deadline) {
+          if (deadline - Date.now() < 3000) break;
+
+          // Batch probe: single evaluate for URL + body text
+          const probe = await batchProbe(_ePage);
+          if (!probe) { await new Promise(r => setTimeout(r, 200)); continue; }
+
+          // Fail fast on about:blank
+          if (/about:blank/i.test(String(probe.href))) {
+            logger.warn(`[browser.act] waitForStableText (engine): page is about:blank for session=${sessionId}`);
+            return { ok: true, action, sessionId, result: '', stdout: '', aboutBlankDetected: true, executionTime: Date.now() - start };
+          }
+
+          const cur = String(probe.bodyText || '');
+
+          // Detect Chrome restore dialog
+          if (RESTORE_DIALOG.test(cur)) {
+            logger.info(`[browser.act] waitForStableText (engine): Chrome restore dialog detected — pressing Escape`);
+            try { await _ePage.keyboard.press('Escape'); } catch (_) {}
+            await new Promise(r => setTimeout(r, 600));
+            try { await _ePage.keyboard.press('Escape'); } catch (_) {}
+            await new Promise(r => setTimeout(r, 600));
+            prev = '';
+            continue;
+          }
+
+          // Universal skeleton content detection
+          const wordCount = cur.split(/\s+/).filter(w => w.length > 0).length;
+          if (wordCount < 20 && !cur.includes('about:blank')) {
+            nearStableCount = 0;
+            prev = cur;
+            await new Promise(r => setTimeout(r, 200));
+            continue;
+          }
+
+          if (cur && cur === prev) {
+            const firstLine = cur.split('\n')[0].trim();
+            const isAuthWall = AUTH_WALL_FIRST.test(firstLine) || AUTH_WALL_BODY.test(cur.slice(0, 500)) || AUTH_WALL_LOGGEDOUT.test(cur.slice(0, 600));
+            if (isAuthWall) {
+              const wc = cur.trim().split(/\s+/).filter(Boolean).length;
+              if (wc > 100) {
+                logger.info(`[browser.act] waitForStableText (engine): auth overlay detected but page has ${wc} words — returning content`);
+                return { ok: true, action, sessionId, result: cur, executionTime: Date.now() - start };
+              }
+              logger.info(`[browser.act] waitForStableText (engine): auth wall detected for session=${sessionId}`);
+              return { ok: true, action, sessionId, result: '', stdout: '', authRequired: true, authWallText: cur.slice(0, 100), executionTime: Date.now() - start };
+            }
+            return { ok: true, action, sessionId, result: cur, executionTime: Date.now() - start };
+          }
+
+          // Near-stable exit (reduced from 2 to 1 consecutive reads)
+          if (prev && cur && cur.length > 3000) {
+            const longer = Math.max(prev.length, cur.length);
+            const changeRatio = Math.abs(cur.length - prev.length) / longer;
+            if (changeRatio < 0.05) {
+              nearStableCount++;
+              if (nearStableCount >= 1) {
+                logger.info(`[browser.act] waitForStableText (engine): near-stable (${(changeRatio * 100).toFixed(1)}% change, ${cur.length} chars) — returning early`);
+                return { ok: true, action, sessionId, result: cur, executionTime: Date.now() - start };
+              }
+            } else {
+              nearStableCount = 0;
+            }
+            const elapsed = Date.now() - loopStart;
+            if (elapsed > 15000 && cur.length > 1500) {
+              logger.info(`[browser.act] waitForStableText (engine): streaming page, ${elapsed}ms elapsed with ${cur.length} chars — accepting`);
+              return { ok: true, action, sessionId, result: cur, executionTime: Date.now() - start };
+            }
+          }
+          prev = cur;
+          await new Promise(r => setTimeout(r, 200));
+        }
+
+        // Timeout — return ok:false instead of stale content
+        logger.info(`[browser.act] waitForStableText (engine): timeout after ${Date.now() - start}ms — page did not stabilize`);
+        const finalProbe = await batchProbe(_ePage);
+        if (finalProbe && finalProbe.bodyText && finalProbe.bodyText.length > 100) {
+          return { ok: true, action, sessionId, result: String(finalProbe.bodyText), executionTime: Date.now() - start };
+        }
+        return { ok: false, action, sessionId, error: `waitForStableText: page did not stabilize within ${timeoutMs}ms`, executionTime: Date.now() - start };
+      }
+
+      // ── CLI fallback (original path) ──
       // Check if this is a Gmail session - use Gmail-optimized version if so
       let isGmailSession = false;
       try {
         const hostnameCheck = await cliRun([...S, 'eval', 'window.location.hostname'], 2000);
         if (hostnameCheck.ok && hostnameCheck.stdout) {
-          const hostname = hostnameCheck.stdout.match(/###\s*Result\s*\n([\s\S]*?)(?=###|$)/i);
+          const hostname = hostnameCheck.stdout.match(/^([\s\S]*?)(?=###\s|$)/i);
           isGmailSession = hostname && hostname[1] && hostname[1].includes('mail.google.com');
         }
       } catch (error) {
@@ -3591,7 +4844,7 @@ If no videos found, return []. Do not explain, only output the JSON array.`;
           try {
             const urlProbe = await cliRun([...S, 'eval', 'window.location.href'], 2000);
             const urlRaw = (urlProbe.stdout || '').trim();
-            const urlMatch = urlRaw.match(/###\s*Result\s*\n([\s\S]*?)(?=###|$)/i);
+            const urlMatch = urlRaw.match(/^([\s\S]*?)(?=###\s|$)/i);
             const curUrl = (urlMatch ? urlMatch[1] : urlRaw).trim().replace(/^"|"$/g, '');
             if (/about:blank/i.test(curUrl)) {
               logger.warn(`[browser.act] waitForStableText: page is about:blank for session=${sessionId}`);
@@ -3695,7 +4948,7 @@ If no videos found, return []. Do not explain, only output the JSON array.`;
         logger.info(`[browser.act] waitForStableText: timeout after ${Date.now() - start}ms — doing final content fetch`);
         const lastRes = await cliRun([...S, 'eval', 'document.body.innerText.slice(0,25000)'], 6000);
         const lastRaw = (lastRes.stdout || '').trim();
-        const lastMatch = lastRaw.match(/###\s*Result\s*\n([\s\S]*?)(?=###|$)/i);
+        const lastMatch = lastRaw.match(/^([\s\S]*?)(?=###\s|$)/i);
         const finalText = lastMatch ? lastMatch[1].trim().replace(/^"|"$/g, '') : lastRaw;
         const wordCount = finalText.trim().split(/\s+/).filter(Boolean).length;
         logger.info(`[browser.act] waitForStableText: final fetch returned ${finalText.length} chars, ${wordCount} words`);
@@ -3713,6 +4966,44 @@ If no videos found, return []. Do not explain, only output the JSON array.`;
     //   { ok: false, authTimedOut: true }   — timed out still on login page
     //   { ok: false, authFailed: true }     — explicit error/redirect detected
     case 'waitForAuth': {
+      // ── Engine-aware local helpers ──
+      const _ePage = engine.getPage(sessionId);
+      const _authEval = async (expr, tMs = 5000) => {
+        if (_ePage) {
+          try { return { ok: true, val: await _ePage.evaluate(expr), stdout: '' }; }
+          catch (e) { return { ok: false, val: null, stdout: '', error: e.message }; }
+        }
+        const r = await cliRun([...S, 'eval', expr], tMs).catch(() => ({}));
+        const raw = (r.stdout || '').trim();
+        const m = raw.match(/^([\s\S]*?)(?=###\s|$)/i);
+        return { ok: r.ok, val: m ? m[1].trim().replace(/^"|"$/g, '') : raw, stdout: r.stdout || '' };
+      };
+      const _authClick = async (sel, tMs = 5000) => {
+        if (_ePage) { try { await _ePage.click(sel, { timeout: tMs }); return { ok: true }; } catch (_) {} }
+        return cliRun([...S, 'click', sel], tMs).catch(() => ({ ok: false }));
+      };
+      const _authType = async (txt, tMs = 8000) => {
+        if (_ePage) { try { await _ePage.keyboard.type(txt, { timeout: tMs }); return { ok: true }; } catch (_) {} }
+        return cliRun([...S, 'type', '--', txt], tMs).catch(() => ({ ok: false }));
+      };
+      const _authPress = async (key, tMs = 3000) => {
+        if (_ePage) { try { await _ePage.keyboard.press(key); return { ok: true }; } catch (_) {} }
+        return cliRun([...S, 'press', key], tMs).catch(() => ({ ok: false }));
+      };
+      const _authGoto = async (url, tMs = 15000) => {
+        if (_ePage) { try { await _ePage.goto(url, { waitUntil: 'domcontentloaded', timeout: tMs }); return { ok: true }; } catch (_) {} }
+        return cliRun([...S, 'goto', url], tMs).catch(() => ({ ok: false }));
+      };
+      const _authSnapshot = async (tMs = 8000) => {
+        if (_ePage) {
+          try {
+            const { yaml } = await engine.buildRefTree(_ePage);
+            if (yaml) { snapshotCache.set(_tabKey(sessionId), yaml); return { ok: true, stdout: yaml }; }
+          } catch (_) {}
+        }
+        return cliRun([...S, 'snapshot'], tMs).catch(() => ({ ok: false, stdout: '' }));
+      };
+
       // URL-host state machine — no hardcoded domain lists.
       // authOriginHost = hostname of the sign-in URL (e.g. 'accounts.google.com').
       // Derived dynamically at runtime so any OAuth provider works automatically.
@@ -3774,12 +5065,18 @@ If no videos found, return []. Do not explain, only output the JSON array.`;
           } catch (_) { /* URL parse failed — proceed with navigation */ }
         }
         if (!_skipNav) {
-          const navCmd = alreadyOpen ? 'goto' : 'open';
           if (!alreadyOpen) clearProfileLock(sessionId);
           snapshotCache.delete(_tabKey(sessionId));
-          const navRes = await cliRun([...S, navCmd, ...(navCmd === 'open' ? openFlags() : []), url], navTimeout);
-          if (navRes.ok) openSessions.add(sessionId);
-          logger.info(`[browser.act] waitForAuth: navigated to ${url} on session=${sessionId} (cmd=${navCmd}, ok=${navRes.ok})`);
+          let navOk = false;
+          if (_ePage && alreadyOpen) {
+            navOk = (await _authGoto(url, navTimeout)).ok;
+          } else {
+            const navCmd = alreadyOpen ? 'goto' : 'open';
+            const navRes = await cliRun([...S, navCmd, ...(navCmd === 'open' ? openFlags() : []), url], navTimeout);
+            navOk = navRes.ok;
+          }
+          if (navOk) openSessions.add(sessionId);
+          logger.info(`[browser.act] waitForAuth: navigated to ${url} on session=${sessionId} (ok=${navOk})`);
         }
       }
 
@@ -3793,10 +5090,8 @@ If no videos found, return []. Do not explain, only output the JSON array.`;
       if (url && authOriginHost) {
         await new Promise(r => setTimeout(r, 1500)); // allow redirect to settle
         try {
-          const _postNavProbe = await cliRun([...S, 'eval', 'location.href'], 5000).catch(() => ({}));
-          const _postNavRaw = (_postNavProbe.stdout || '').trim();
-          const _postNavMatch = _postNavRaw.match(/###\s*Result\s*\n([\s\S]*?)(?=###|$)/i);
-          const _postNavUrl = (_postNavMatch ? _postNavMatch[1].trim().replace(/^"|"$/g, '') : _postNavRaw).trim();
+          const _postNavProbe = await _authEval('location.href', 5000);
+          const _postNavUrl = String(_postNavProbe.val || '').trim();
           if (_postNavUrl) {
             const _postNavHost = getHost(_postNavUrl);
             if (_postNavHost && _postNavHost !== authOriginHost && !isHostEquivalent(_postNavHost, authOriginHost)) {
@@ -3827,27 +5122,16 @@ If no videos found, return []. Do not explain, only output the JSON array.`;
         let _consecutiveInvisibleFailures = 0; // circuit breaker: too many invisible-input steps
         let _doneWithoutAction = false; // circuit breaker: LLM said done but no creds filled
 
-        // ── Helper: extract URL value from playwright-cli eval stdout
-        const _parseUrl = (stdout) => {
-          const raw = (stdout || '').trim();
-          const m = raw.match(/###\s*Result\s*\n([\s\S]*?)(?=###|$)/i);
-          return (m ? m[1].trim().replace(/^"|"$/g, '') : raw).trim();
-        };
-
         // ── Helper: inline 2-poll text settle (~600–1200ms).
-        // waitForStableText exits immediately on auth pages (auth-wall early-exit pattern)
-        // so we do our own lightweight settle: two eval polls 600ms apart.
         const _textSettle = async () => {
           const _et = async () => {
-            const r = await cliRun([...S, 'eval', 'document.body.innerText.slice(0,500)'], 5000).catch(() => ({}));
-            const raw = (r.stdout || '').trim();
-            const m = raw.match(/###\s*Result\s*\n([\s\S]*?)(?=###|$)/i);
-            return m ? m[1].trim().replace(/^"|"$/g, '') : raw;
+            const r = await _authEval('document.body.innerText.slice(0,500)', 5000);
+            return String(r.val || '').trim();
           };
           const t1 = await _et();
           await new Promise(r => setTimeout(r, 600));
           const t2 = await _et();
-          if (t1 !== t2) await new Promise(r => setTimeout(r, 600)); // still changing — one more pause
+          if (t1 !== t2) await new Promise(r => setTimeout(r, 600));
         };
 
         // ── Helper: poll until a matching input is fully visible on screen.
@@ -3875,10 +5159,8 @@ If no videos found, return []. Do not explain, only output the JSON array.`;
           }`;
           const deadline = Date.now() + timeoutMs;
           while (Date.now() < deadline) {
-            const r = await cliRun([...S, 'eval', jsCheck], 5000).catch(() => ({}));
-            const raw = (r.stdout || '').trim();
-            const m = raw.match(/###\s*Result\s*\n([\s\S]*?)(?=###|$)/i);
-            const val = (m ? m[1].trim().replace(/^"|"$/g, '') : raw).trim();
+            const r = await _authEval(jsCheck, 5000);
+            const val = String(r.val || '').trim();
             if (val && val !== 'null' && val !== '') {
               await new Promise(r2 => setTimeout(r2, 500)); // 500ms buffer: animation completing
               return val; // specific selector of the visible element
@@ -3897,17 +5179,15 @@ If no videos found, return []. Do not explain, only output the JSON array.`;
             return cs.display !== 'none' && cs.visibility !== 'hidden'
               && parseFloat(cs.opacity || '1') >= 0.9 && el.offsetHeight > 0;
           }).map(el => el.type + (el.id ? '#' + el.id : (el.name ? '[' + el.name + ']' : ''))).join(',') || 'none'`;
-          const r = await cliRun([...S, 'eval', jsVis], 5000).catch(() => ({}));
-          const raw = (r.stdout || '').trim();
-          const m = raw.match(/###\s*Result\s*\n([\s\S]*?)(?=###|$)/i);
-          return (m ? m[1].trim().replace(/^"|"$/g, '') : raw) || 'unknown';
+          const r = await _authEval(jsVis, 5000);
+          return String(r.val || '') || 'unknown';
         };
 
         // Capture initial URL for done-without-action circuit breaker
         let _initialAuthUrl = '';
         try {
-          const _initProbe = await cliRun([...S, 'eval', 'location.href'], 5000).catch(() => ({}));
-          _initialAuthUrl = _parseUrl(_initProbe.stdout) || '';
+          const _initProbe = await _authEval('location.href', 5000);
+          _initialAuthUrl = String(_initProbe.val || '').trim();
         } catch (_) {}
 
         for (let _step = 0; _step < 8; _step++) {
@@ -3915,14 +5195,14 @@ If no videos found, return []. Do not explain, only output the JSON array.`;
           await _textSettle();
 
           // 2. Snapshot (ARIA accessibility tree)
-          const _snapRes = await cliRun([...S, 'snapshot'], 8000).catch(() => ({}));
+          const _snapRes = await _authSnapshot(8000);
           const _snapText = (_snapRes.stdout || '').trim();
           if (!_snapText) { logger.warn(`[browser.act] waitForAuth: auth-loop step ${_step + 1} — empty snapshot, stopping`); break; }
           snapshotCache.set(_tabKey(sessionId), _snapText);
 
           // 3. Check if URL has left auth domain
-          const _luProbe = await cliRun([...S, 'eval', 'location.href'], 5000).catch(() => ({}));
-          const _luUrl   = _parseUrl(_luProbe.stdout);
+          const _luProbe = await _authEval('location.href', 5000);
+          const _luUrl   = String(_luProbe.val || '').trim();
           const _luHost  = _luUrl ? (() => { try { return new URL(_luUrl).hostname; } catch (_) { return ''; } })() : '';
           if (authOriginHost && _luHost && !isHostEquivalent(_luHost, authOriginHost)) {
             logger.info(`[browser.act] waitForAuth: auth-loop step ${_step + 1} — navigated away from auth domain (${_luHost}), done`);
@@ -3974,10 +5254,10 @@ If no videos found, return []. Do not explain, only output the JSON array.`;
               continue;
             }
             _consecutiveInvisibleFailures = 0;
-            await cliRun([...S, 'click', _visSel], 5000).catch(() => {});
+            await _authClick(_visSel, 5000);
             await new Promise(r => setTimeout(r, 150));
-            await cliRun([...S, 'press', 'Meta+a'], 3000).catch(() => {});
-            await cliRun([...S, 'type', '--', _credentials.email], 8000).catch(() => {});
+            await _authPress('Meta+a', 3000);
+            await _authType(_credentials.email, 8000);
             _loopFilledEmail = true;
             _actionHistory.push('fill_email');
 
@@ -3997,10 +5277,10 @@ If no videos found, return []. Do not explain, only output the JSON array.`;
               continue;
             }
             _consecutiveInvisibleFailures = 0;
-            await cliRun([...S, 'click', _visSel], 5000).catch(() => {});
+            await _authClick(_visSel, 5000);
             await new Promise(r => setTimeout(r, 150));
-            await cliRun([...S, 'press', 'Meta+a'], 3000).catch(() => {});
-            await cliRun([...S, 'type', '--', _credentials.password], 8000).catch(() => {});
+            await _authPress('Meta+a', 3000);
+            await _authType(_credentials.password, 8000);
             _loopFilledPassword = true;
             _actionHistory.push('fill_password');
 
@@ -4013,10 +5293,10 @@ If no videos found, return []. Do not explain, only output the JSON array.`;
             const _preClickUrl = _luUrl;
             const _preVisHint  = _visHint; // captured earlier this iteration, free re-use
             if (_sel) {
-              const _cr = await cliRun([...S, 'click', _sel], 5000).catch(() => ({ ok: false }));
-              if (!_cr?.ok) await cliRun([...S, 'press', 'Return'], 3000).catch(() => {});
+              const _cr = await _authClick(_sel, 5000);
+              if (!_cr?.ok) await _authPress('Return', 3000);
             } else {
-              await cliRun([...S, 'press', 'Return'], 3000).catch(() => {});
+              await _authPress('Return', 3000);
             }
             // Poll until URL OR visible-inputs changes — whichever fires first confirms transition.
             // 12s deadline: Google CSS slide animation + network round-trip can take 2-3s.
@@ -4026,8 +5306,8 @@ If no videos found, return []. Do not explain, only output the JSON array.`;
             while (Date.now() < _navDeadline) {
               await new Promise(r => setTimeout(r, 500));
               // Signal 1: URL change (traditional multi-page + SPA pushState)
-              const _postProbe = await cliRun([...S, 'eval', 'location.href'], 5000).catch(() => ({}));
-              const _postUrl   = _parseUrl(_postProbe.stdout);
+              const _postProbe = await _authEval('location.href', 5000);
+              const _postUrl   = String(_postProbe.val || '').trim();
               if (_postUrl && _postUrl !== _preClickUrl) {
                 _transitionReason = `URL: ${_preClickUrl} → ${_postUrl}`;
                 _navConfirmed = true;
@@ -4051,7 +5331,7 @@ If no videos found, return []. Do not explain, only output the JSON array.`;
               if (_stallCount >= 1) {
                 // First stall: press Return as keyboard-submit fallback
                 logger.info(`[browser.act] waitForAuth: auth-loop stall fallback — pressing Return`);
-                await cliRun([...S, 'press', 'Return'], 3000).catch(() => {});
+                await _authPress('Return', 3000);
                 _stallCount = 0;
                 await new Promise(r => setTimeout(r, 1500));
               }
@@ -4080,8 +5360,8 @@ If no videos found, return []. Do not explain, only output the JSON array.`;
         if (_doneWithoutAction) {
           let _currentUrl = '';
           try {
-            const _curProbe = await cliRun([...S, 'eval', 'location.href'], 5000).catch(() => ({}));
-            _currentUrl = _parseUrl(_curProbe.stdout) || '';
+            const _curProbe = await _authEval('location.href', 5000);
+            _currentUrl = String(_curProbe.val || '').trim();
           } catch (_) {}
           if (_currentUrl === _initialAuthUrl) {
             logger.info(`[browser.act] waitForAuth: done-without-action circuit breaker — URL unchanged (${_currentUrl}), no creds filled, skipping OAuth fallback and poll loop for session=${sessionId}`);
@@ -4101,8 +5381,8 @@ If no videos found, return []. Do not explain, only output the JSON array.`;
             if (btn) { btn.click(); return 'clicked'; }
             return 'not-found';
           }`;
-          const _oauthRes = await cliRun([...S, 'eval', _oauthEval], 6000).catch(() => ({}));
-          if ((_oauthRes.stdout || '').includes('clicked')) {
+          const _oauthRes = await _authEval(_oauthEval, 6000);
+          if (String(_oauthRes.val || '').includes('clicked') || (_oauthRes.stdout || '').includes('clicked')) {
             logger.info(`[browser.act] waitForAuth: OAuth button clicked for session=${sessionId}`);
             await new Promise(r => setTimeout(r, 2000));
           } else {
@@ -4144,13 +5424,8 @@ If no videos found, return []. Do not explain, only output the JSON array.`;
         }
 
         try {
-          // Two separate evals — playwright-cli JSON-stringifies results so \n in a
-          // JS string literal becomes the two chars \ and n in stdout; combined eval
-          // separator indexOf always returns -1 and currentUrl silently stays empty.
-          const urlRes = await cliRun([...S, 'eval', 'location.href'], 5000);
-          const urlRaw = (urlRes.stdout || '').trim();
-          const urlMatch = urlRaw.match(/###\s*Result\s*\n([\s\S]*?)(?=###|$)/i);
-          const currentUrl = (urlMatch ? urlMatch[1].trim().replace(/^"|"$/g, '') : urlRaw).trim();
+          const urlRes = await _authEval('location.href', 5000);
+          const currentUrl = String(urlRes.val || '').trim();
 
           if (!currentUrl) continue;
 
@@ -4183,7 +5458,7 @@ If no videos found, return []. Do not explain, only output the JSON array.`;
             let _pageMetaAuthed = false;
             let _pageTitle = '';
             try {
-              const _metaRes = await cliRun([...S, 'eval', `(() => {
+              const _metaExpr = `(() => {
   const title = document.title || '';
   const titleLower = title.toLowerCase();
   const titleIsLogin = /sign.?in|log.?in|\\blogin\\b|authenticate|verify|two.factor|2fa/.test(titleLower);
@@ -4203,10 +5478,9 @@ If no videos found, return []. Do not explain, only output the JSON array.`;
   });
   const hasSignInButton = signInLinks.length > 0 || signInButtons.length > 0;
   return JSON.stringify({ titleIsLogin, isNoIndex, hasUserGlobal, title, hasSignInButton });
-})()`], 3000);
-              const _metaRaw = (_metaRes.stdout || '').trim();
-              const _metaMatch = _metaRaw.match(/###\s*Result\s*\n([\s\S]*?)(?=###|$)/i);
-              const _metaStr = (_metaMatch ? _metaMatch[1].trim().replace(/^"|"$/g, '') : _metaRaw).trim();
+})()`;
+              const _metaRes = await _authEval(_metaExpr, 3000);
+              const _metaStr = String(_metaRes.val || '').trim();
               const _meta = JSON.parse(_metaStr);
               _pageTitle = _meta.title || '';
               let _hasSignInButton = !!_meta.hasSignInButton;
@@ -4250,10 +5524,8 @@ If no videos found, return []. Do not explain, only output the JSON array.`;
             }
             // Spot-check for error signals every 5th poll (wrong password, account locked, etc.)
             if (authWallDetections % 5 === 0) {
-              const errRes = await cliRun([...S, 'eval', 'document.body.innerText.slice(0,600)'], 5000);
-              const errRaw = (errRes.stdout || '').trim();
-              const errMatch = errRaw.match(/###\s*Result\s*\n([\s\S]*?)(?=###|$)/i);
-              const errText = (errMatch ? errMatch[1].trim().replace(/^"|"$/g, '') : errRaw).trim();
+              const errRes = await _authEval('document.body.innerText.slice(0,600)', 5000);
+              const errText = String(errRes.val || '').trim();
               const errorSignals = /wrong password|incorrect password|invalid credentials|account locked|too many attempts|verify it's you/i;
               if (errorSignals.test(errText)) {
                 logger.warn(`[browser.act] waitForAuth: auth error detected on session=${sessionId}`);
@@ -4361,7 +5633,7 @@ If no videos found, return []. Do not explain, only output the JSON array.`;
             }
             // Stuck in same limbo URL — navigate back to sign-in URL
             logger.info(`[browser.act] waitForAuth: limbo stuck at ${currentUrl} (back-to-sign-in attempt ${backToSignInCount}/3) — navigating back to sign-in`);
-            if (url) await cliRun([...S, 'goto', url], 15000).catch(() => {});
+            if (url) await _authGoto(url, 15000);
             lastLimboUrl = null;
           } else {
             // First time at this intermediate URL — navigate toward the canonical post-auth URL.
@@ -4369,10 +5641,10 @@ If no videos found, return []. Do not explain, only output the JSON array.`;
             lastLimboUrl = currentUrl;
             if (postAuthUrl && /^https?:\/\//i.test(postAuthUrl)) {
               logger.info(`[browser.act] waitForAuth: limbo state (${currentUrl}) — navigating to postAuthUrl=${postAuthUrl} for session=${sessionId}`);
-              await cliRun([...S, 'goto', postAuthUrl], 15000).catch(() => {});
+              await _authGoto(postAuthUrl, 15000);
             } else if (/^https?:\/\//i.test(authSuccessUrl)) {
               logger.info(`[browser.act] waitForAuth: limbo state (${currentUrl}) — navigating to authSuccessUrl=${authSuccessUrl} for session=${sessionId}`);
-              await cliRun([...S, 'goto', authSuccessUrl], 15000).catch(() => {});
+              await _authGoto(authSuccessUrl, 15000);
             } else {
               // authSuccessUrl is a bare hostname pattern (e.g. 'mail.google.com', 'notion.com').
               // Construct a navigable https:// URL from it so we can drive the browser there.
@@ -4382,7 +5654,7 @@ If no videos found, return []. Do not explain, only output the JSON array.`;
               if (bareHostMatch) {
                 const gotoUrl = `https://${bareHostMatch[1]}`;
                 logger.info(`[browser.act] waitForAuth: limbo state (${currentUrl}) — authSuccessUrl is a pattern, constructing goto=${gotoUrl} for session=${sessionId}`);
-                await cliRun([...S, 'goto', gotoUrl], 15000).catch(() => {});
+                await _authGoto(gotoUrl, 15000);
               } else {
                 logger.info(`[browser.act] waitForAuth: limbo state (${currentUrl}) — authSuccessUrl is a pattern (not a URL), waiting for redirect for session=${sessionId}`);
               }
@@ -4400,9 +5672,24 @@ If no videos found, return []. Do not explain, only output the JSON array.`;
     // ── scanCurrentPage ───────────────────────────────────────────────────────
     // Returns elements array parsed from snapshot for planSkills pre-scan
     case 'scanCurrentPage': {
+      // ── Engine path ──
+      const _ePage = engine.getPage(sessionId);
+      if (_ePage) {
+        try {
+          const { yaml } = await engine.buildRefTree(_ePage);
+          if (yaml) { snapshotCache.set(_tabKey(sessionId), yaml); }
+          const elements = parseSnapshotToElements(yaml || '');
+          const pageUrl = await _ePage.evaluate('location.href');
+          return {
+            ok: true, action, sessionId,
+            result: { url: String(pageUrl || ''), elements, snapshot: yaml || '' },
+            executionTime: Date.now() - start,
+          };
+        } catch (e) { logger.warn(`[browser.act] scanCurrentPage (engine) failed: ${e.message} — falling back to CLI`); }
+      }
+      // ── CLI fallback ──
       const snapRes = await captureSnapshot(sessionId, headed, timeoutMs);
       const elements = parseSnapshotToElements(snapRes.stdout);
-      // Also grab current URL via eval
       const urlRes = await cliRun([...S, 'eval', 'location.href'], 5000);
       return {
         ok:            true,
@@ -4421,6 +5708,24 @@ If no videos found, return []. Do not explain, only output the JSON array.`;
     // tab-new: opens a new tab; if url provided, navigates to it in the new tab.
     // Tracks the new tab index in currentTabIndex so per-tab snapshot cache works.
     case 'tab-new': {
+      // ── Engine fast-path ──
+      const _ctx = engine.getContext(sessionId);
+      if (_ctx) {
+        try {
+          const newPage = await _ctx.newPage();
+          const pages = _ctx.pages();
+          const newIdx = pages.length - 1;
+          currentTabIndex.set(sessionId, newIdx);
+          snapshotCache.delete(_tabKeyFor(sessionId, newIdx));
+          if (url) {
+            await newPage.goto(url, { waitUntil: 'domcontentloaded', timeout: Math.max(timeoutMs, 30000) });
+            await new Promise(r => setTimeout(r, 400));
+          }
+          logger.info(`[browser.act] tab-new (engine): created tab ${newIdx} for session=${sessionId}`);
+          return { ok: true, action, sessionId, tabIndex: newIdx, executionTime: Date.now() - start };
+        } catch (e) { logger.warn(`[browser.act] tab-new (engine) failed: ${e.message} — falling back to CLI`); }
+      }
+      // ── CLI fallback ──
       // Check if daemon is alive (like navigate does) — tab-new requires running browser
       let alreadyOpen = openSessions.has(sessionId);
       if (!alreadyOpen) {
@@ -4503,7 +5808,7 @@ If no videos found, return []. Do not explain, only output the JSON array.`;
           let actualUrl = '';
           try {
             const urlProbe = await cliRun([...S, 'eval', 'window.location.href'], 3000);
-            const probeMatch = urlProbe.stdout?.match(/###\s*Result\s*\n([\s\S]*?)(?=###|$)/i);
+            const probeMatch = urlProbe.stdout?.match(/^([\s\S]*?)(?=###\s|$)/i);
             actualUrl = (probeMatch ? probeMatch[1] : urlProbe.stdout || '').trim().replace(/^"|"$/g, '');
             logger.info(`[browser.act] tab-new cold-start: current URL is ${actualUrl}`);
           } catch (e) {
@@ -4618,23 +5923,47 @@ If no videos found, return []. Do not explain, only output the JSON array.`;
         executionTime: Date.now() - start,
       };
     }
-    case 'tab-list':   return run(['tab-list'], 'tab-list');
+    case 'tab-list': {
+      // ── Engine path ──
+      const _ctx = engine.getContext(sessionId);
+      if (_ctx) {
+        try {
+          const _pages = _ctx.pages();
+          const _lines = _pages.map((p, i) => `  - ${i}: ${p.url()}`);
+          return { ok: true, action, sessionId, result: _lines.join('\n'), stdout: _lines.join('\n'), executionTime: Date.now() - start };
+        } catch (e) { logger.warn(`[browser.act] tab-list (engine) failed: ${e.message} — falling back to CLI`); }
+      }
+      return run(['tab-list'], 'tab-list');
+    }
     // Accept tabIndex (LLM convention) or index (legacy)
     case 'tab-close': {
       const idx = args.tabIndex ?? args.index ?? 0;
-      // Delete per-tab snapshot cache entry for the closed tab
       snapshotCache.delete(_tabKeyFor(sessionId, idx));
-      // If the closed tab was the active one, switch tracker back to tab 0
       if ((currentTabIndex.get(sessionId) || 0) === idx) {
         currentTabIndex.set(sessionId, 0);
+      }
+      // ── Engine path ──
+      const _ctx = engine.getContext(sessionId);
+      if (_ctx) {
+        try {
+          const _pages = _ctx.pages();
+          if (_pages[idx]) { await _pages[idx].close(); return { ok: true, action, sessionId, executionTime: Date.now() - start }; }
+        } catch (e) { logger.warn(`[browser.act] tab-close (engine) failed: ${e.message} — falling back to CLI`); }
       }
       return run(['tab-close', String(idx)], `tab-close ${idx}`);
     }
     case 'tab-select': {
       const idx = args.tabIndex ?? args.index ?? 0;
-      // Update current tab tracker — restore cached snapshot for this tab if available
       currentTabIndex.set(sessionId, idx);
       logger.info(`[browser.act] tab-select ${idx}: switched active tab for session=${sessionId}`);
+      // ── Engine path ──
+      const _ctx = engine.getContext(sessionId);
+      if (_ctx) {
+        try {
+          const _pages = _ctx.pages();
+          if (_pages[idx]) { await _pages[idx].bringToFront(); return { ok: true, action, sessionId, executionTime: Date.now() - start }; }
+        } catch (e) { logger.warn(`[browser.act] tab-select (engine) failed: ${e.message} — falling back to CLI`); }
+      }
       return run(['tab-select', String(idx)], `tab-select ${idx}`);
     }
 
@@ -4642,20 +5971,46 @@ If no videos found, return []. Do not explain, only output the JSON array.`;
     case 'state-save': {
       const p = filePath || path.join(os.homedir(), '.thinkdrop', 'browser-sessions', `${sessionId}.json`);
       fs.mkdirSync(path.dirname(p), { recursive: true });
+      // Engine path: use context.storageState()
+      const _ctx = engine.getContext(sessionId);
+      if (_ctx) {
+        try { await _ctx.storageState({ path: p }); return { ok: true, action, sessionId, executionTime: Date.now() - start }; }
+        catch (e) { logger.warn(`[browser.act] state-save (engine) failed: ${e.message} — falling back to CLI`); }
+      }
       return run(['state-save', p], `state-save ${p}`);
     }
     case 'state-load': {
       const p = filePath || path.join(os.homedir(), '.thinkdrop', 'browser-sessions', `${sessionId}.json`);
+      // Engine path: persistent context already restores state — no-op if engine active
+      if (engine.isSessionActive(sessionId)) {
+        logger.info(`[browser.act] state-load: engine active, state already persisted in profile dir`);
+        return { ok: true, action, sessionId, executionTime: Date.now() - start };
+      }
       return run(['state-load', p], `state-load ${p}`);
     }
 
     // ── Resize ────────────────────────────────────────────────────────────────
     case 'resize': {
+      const _ePage = engine.getPage(sessionId);
+      if (_ePage) {
+        try { await _ePage.setViewportSize({ width: width || 1280, height: height || 800 }); return { ok: true, action, sessionId, executionTime: Date.now() - start }; }
+        catch (e) { logger.warn(`[browser.act] resize (engine) failed: ${e.message} — falling back to CLI`); }
+      }
       return run(['resize', String(width || 1280), String(height || 800)], 'resize');
     }
 
     // ── newPage (alias tab-new) ───────────────────────────────────────────────
     case 'newPage': {
+      const _ctx = engine.getContext(sessionId);
+      if (_ctx) {
+        try {
+          const newPage = await _ctx.newPage();
+          if (url) await newPage.goto(url, { waitUntil: 'domcontentloaded', timeout: Math.max(timeoutMs, 30000) });
+          const newIdx = _ctx.pages().length - 1;
+          currentTabIndex.set(sessionId, newIdx);
+          return { ok: true, action, sessionId, tabIndex: newIdx, executionTime: Date.now() - start };
+        } catch (e) { logger.warn(`[browser.act] newPage (engine) failed: ${e.message} — falling back to CLI`); }
+      }
       return run(['tab-new', url || ''], 'newPage');
     }
 
@@ -5017,4 +6372,6 @@ module.exports = {
   shortSessionId,
   injectAdBlock,
   PLAYWRIGHT_CLI_AVAILABLE,
+  engine,
+  invalidateEngineSnapshot,
 };

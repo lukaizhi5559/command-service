@@ -11,6 +11,7 @@
  *   get_tutorial_steps   { query }                       → extracts step-by-step instructions from search results
  *   search_and_navigate  { query, preferDomain? }        → searches web, picks best URL to navigate to directly
  *   discover_task_url   { domain, task }                → dual search (site-scoped + broad) to find the most direct deep-link URL for a task
+ *   discover_search_syntax { domain, task }              → search + crawl official docs to extract a service's search/filter query operators
  */
 
 const http   = require('http');
@@ -541,9 +542,23 @@ async function actionDiscoverTaskUrl({ domain, task, maxResults = 5, candidateUr
   }
 
   // ── Score all candidates ────────────────────────────────────────────────
+  const _isComposeTask = /\b(compose|send|write|draft|create|new email|new message|email to|reply|forward)\b/i.test(task);
   const scored = allCandidates.map(c => {
     let score = 10; // baseline
     try {
+      const fullUrl = c.url.toLowerCase();
+
+      // Reject PII redaction/placeholder tokens outright — search-index artifacts
+      if (/\bpii_|%5bpii|\[redacted\]|\[placeholder\]/i.test(c.url)) {
+        return { ...c, _score: 0 };
+      }
+
+      // Heavy penalty for prefilled-message query params on non-compose tasks
+      // (stale subject/recipient/body from search index, never valid for read/search)
+      if (!_isComposeTask && /[?&](su|to|body|subject|bcc|cc)=/i.test(c.url) && /[?&](view=cm|tf=cm|tf=1)/i.test(c.url)) {
+        score -= 60;
+      }
+
       const parsed = new URL(c.url);
       const host = parsed.hostname.replace(/^www\./, '');
       const path = parsed.pathname.toLowerCase();
@@ -580,7 +595,6 @@ async function actionDiscoverTaskUrl({ domain, task, maxResults = 5, candidateUr
       if (path.split('/').length > 5) score -= 10;
 
       // Penalize help/support/community pages — these are never app deep links
-      const fullUrl = c.url.toLowerCase();
       const titleLower = (c.title || '').toLowerCase();
       if (/\/(support|help|helpcenter|topic|community|forum|answers|thread)\b/i.test(fullUrl) ||
           /\b(support|help)\b/i.test(host) ||
@@ -631,7 +645,80 @@ async function actionDiscoverTaskUrl({ domain, task, maxResults = 5, candidateUr
     trust: 'search',
     candidate: best,
     allCandidates: candidates,
+    taskKeywords,
   };
+}
+
+/**
+ * Discover a service's search/filter query operators (e.g. Gmail's "is:unread",
+ * "has:attachment") by searching for and crawling its official help documentation,
+ * then using an LLM to extract a concise operator → meaning list. Mirrors
+ * actionDiscoverTaskUrl's search+crawl pattern but targets query syntax instead
+ * of deep-link URLs.
+ *
+ * @param {string} domain - service hostname, e.g. "mail.google.com"
+ * @param {string} task   - the user's task text, used only for logging/context
+ * @returns {Promise<{ok, service, operators: string[], sourceUrl}>}
+ */
+async function actionDiscoverSearchSyntax({ domain, task }) {
+  if (!domain) return { ok: false, error: 'domain is required' };
+
+  const cleanDomain = domain.replace(/^https?:\/\//, '').replace(/^www\./, '').replace(/\/$/, '');
+  const serviceName = cleanDomain.split('.')[0];
+  logger.info(`[web.agent] discover_search_syntax: domain=${cleanDomain} task="${(task || '').slice(0, 80)}"`);
+
+  const query = `${serviceName} advanced search operators syntax`;
+  const searchResult = await searchWeb(query, 5).catch(() => ({ ok: false }));
+  if (!searchResult.ok || !Array.isArray(searchResult.results) || searchResult.results.length === 0) {
+    logger.info('[web.agent] discover_search_syntax: no search results found');
+    return { ok: false, error: 'No search results found' };
+  }
+
+  // Prefer official help/support docs for the service (most reliable operator listings)
+  const officialDoc = searchResult.results.find(r => {
+    try {
+      const h = new URL(r.url).hostname.replace(/^www\./, '');
+      return h.includes(serviceName) || h.includes(cleanDomain.split('.').slice(-2).join('.'));
+    } catch (_) { return false; }
+  }) || searchResult.results[0];
+
+  logger.info(`[web.agent] discover_search_syntax: crawling ${officialDoc.url}`);
+  const { webCrawl } = require('./web.crawl.cjs');
+  const crawlResult = await webCrawl({ url: officialDoc.url, maxChars: 4000, timeoutMs: 20000 }).catch(() => ({ ok: false }));
+  if (!crawlResult.ok || !crawlResult.content) {
+    logger.info('[web.agent] discover_search_syntax: crawl failed or returned no content');
+    return { ok: false, error: 'Crawl failed to extract documentation content' };
+  }
+
+  const { ask } = require('../skill-helpers/skill-llm.cjs');
+  const extractPrompt = `The following is text crawled from a help page about "${serviceName}" search/query syntax.
+
+Extract a concise list of search operators and what each one filters or means. Only include operators clearly documented in this text — do not invent any. Respond with ONLY a JSON array of strings, each formatted as "operator — meaning" (e.g. "is:unread — shows only unread messages"). If no operators are found, respond with [].
+
+TEXT:
+${crawlResult.content.slice(0, 3500)}`;
+
+  let operators = [];
+  try {
+    const raw = await ask(extractPrompt, { maxTokens: 500, temperature: 0 });
+    const jsonMatch = raw.match(/\[[\s\S]*\]/);
+    if (jsonMatch) {
+      const parsed = JSON.parse(jsonMatch[0]);
+      if (Array.isArray(parsed)) {
+        operators = parsed.filter(o => typeof o === 'string' && o.trim().length > 0).slice(0, 12);
+      }
+    }
+  } catch (err) {
+    logger.warn(`[web.agent] discover_search_syntax: LLM extraction failed: ${err.message}`);
+  }
+
+  if (operators.length === 0) {
+    logger.info('[web.agent] discover_search_syntax: no operators extracted');
+    return { ok: false, error: 'No operators extracted from documentation' };
+  }
+
+  logger.info(`[web.agent] discover_search_syntax: extracted ${operators.length} operator(s) for ${serviceName} from ${officialDoc.url}`);
+  return { ok: true, service: serviceName, operators, sourceUrl: officialDoc.url };
 }
 
 /**
@@ -752,6 +839,8 @@ module.exports = async function webAgent(args) {
       return await actionSearchAndNavigate(params);
     case 'discover_task_url':
       return await actionDiscoverTaskUrl(params);
+    case 'discover_search_syntax':
+      return await actionDiscoverSearchSyntax(params);
     case 'discover_setup':
       return await actionDiscoverSetup(params);
     default:
@@ -763,5 +852,6 @@ module.exports.actionResearchDomain    = actionResearchDomain;
 module.exports.actionGetTutorialSteps  = actionGetTutorialSteps;
 module.exports.actionSearchAndNavigate = actionSearchAndNavigate;
 module.exports.actionDiscoverTaskUrl  = actionDiscoverTaskUrl;
+module.exports.actionDiscoverSearchSyntax = actionDiscoverSearchSyntax;
 module.exports.actionDiscoverSetup    = actionDiscoverSetup;
 module.exports._classifyDiscoveryCandidate = _classifyDiscoveryCandidate;

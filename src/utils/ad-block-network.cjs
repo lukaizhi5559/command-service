@@ -178,6 +178,54 @@ const _INIT_SCRIPT = `(function() {
   };
 })();`;
 
+// Node API path: YouTube ad-stripping only — no __tdNetLog observer.
+// Mutation logging is handled by page.on('response') in browser-engine.cjs.
+const _INIT_SCRIPT_NODE = _INIT_SCRIPT.replace(
+  /\s*\/\/ ── Network mutation observer[\s\S]*$/,
+  '\n})();'
+);
+
+/**
+ * Register both Layer 1 (network route blocking) and Layer 2 (document-start init script)
+ * using the Playwright Node.js API directly — no subprocess, no cliRun.
+ *
+ * @param {import('playwright').BrowserContext} context - Playwright browser context
+ * @param {string} sessionId - For tracking/idempotency
+ * @returns {Promise<boolean>}
+ */
+async function setupInterceptionNode(context, sessionId) {
+  if (_activeSessions.has(sessionId)) {
+    logger.debug(`[ad-block-network] Interception already active for session=${sessionId}`);
+    return true;
+  }
+
+  try {
+    // Layer 1: Single catch-all route handler with ad domains
+    await context.route('**/*', (route) => {
+      try {
+        const h = new URL(route.request().url()).hostname;
+        for (const d of AD_NETWORK_DOMAINS) {
+          if (h === d || h.endsWith('.' + d)) {
+            return route.abort();
+          }
+        }
+      } catch (e) {}
+      return route.continue();
+    });
+
+    // Layer 2: Document-start init script — strips YouTube ad data before player reads it
+    // Uses _INIT_SCRIPT_NODE (no __tdNetLog observer — page.on('response') handles mutation logging)
+    await context.addInitScript(_INIT_SCRIPT_NODE);
+
+    _activeSessions.add(sessionId);
+    logger.info(`[ad-block-network] Interception registered (Node API): route handler (${AD_NETWORK_DOMAINS.length} domains) + init script (session=${sessionId})`);
+    return true;
+  } catch (err) {
+    logger.warn(`[ad-block-network] setupInterceptionNode error: ${err.message}`);
+    return false;
+  }
+}
+
 /**
  * Register both Layer 1 (network route blocking) and Layer 2 (document-start init script)
  * in a single run-code call. This must be called BEFORE navigating to the target URL.
@@ -258,7 +306,10 @@ function clearSession(sessionId) {
 
 module.exports = {
   setupInterception,
+  setupInterceptionNode,
   clearAdBlockSession: clearSession,
   clearSession,
   AD_NETWORK_DOMAINS,
+  _INIT_SCRIPT,
+  _INIT_SCRIPT_NODE,
 };
