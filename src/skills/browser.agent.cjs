@@ -4551,17 +4551,117 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
           ok: false,
           agentId,
           task,
+          sessionId,
           askUser: true,
           trainingHandoff: true,
           question: `I couldn't find a direct route for this task in ${_svcKey}. Would you like to train a recipe?`,
           options: [
-            { label: `Open ${_svcKey} agent training`, value: 'open_agents_training' },
+            { label: `Record ${_svcKey} recipe from beginning`, value: 'record_recipe' },
             { label: 'Cancel', value: 'cancel' },
           ],
         };
       }
     }
   }
+  }
+
+  // ── URL-first: enforce navigation to resolved deep-link ──────────────────────
+  // After the auth probe + deep-link resolution, the browser may still be on the
+  // auth-probe URL (e.g. app.notion.com) instead of the resolved deep-link (e.g.
+  // notion.new). If URL-first was selected, check the current URL and navigate to
+  // startUrl unless the current page is genuinely a fresh redirect from the shortcut.
+  let _postEnforcementUrl = undefined;
+  if (_urlFirstNavigationSelected && startUrl) {
+    try {
+      const _curUrlRes = await callBrowserAct({ action: 'evaluate', text: 'window.location.href', sessionId, timeoutMs: 5000 }, 8000).catch(() => ({ ok: false }));
+      const _curUrl = _curUrlRes?.ok ? String(_curUrlRes.result || _curUrlRes.stdout || '').trim().replace(/^"|"$/g, '') : '';
+
+      if (_curUrl) {
+        let _isCanonicalRedirect = false;
+        try {
+          const _startU = new URL(startUrl);
+          const _curU = new URL(_curUrl);
+          // Exact match
+          if (_startU.hostname === _curU.hostname && _startU.pathname === _curU.pathname) {
+            _isCanonicalRedirect = true;
+          } else if (_startU.hostname.endsWith('.new') || _startU.hostname === 'new') {
+            // *.new shortcut domains (notion.new → app.notion.com/<page-id>)
+            // Must verify this is actually a fresh page from the shortcut, not an
+            // existing page the auth probe happened to land on.
+            const _brand = _startU.hostname.split('.').slice(-2, -1)[0];
+            if (_brand && _curU.hostname.includes(_brand)) {
+              // URL-shape check: existing pages have readable slugs (e.g., /p/Yearly-Goals-<id>)
+              // Fresh pages have raw IDs or "Untitled" in the path
+              const _lastSegment = _curU.pathname.split('/').pop() || '';
+              const _slugParts = _lastSegment.split('-');
+              const _hasReadableSlug = _slugParts.length >= 2
+                && /^[a-z]{4,}$/i.test(_slugParts[0])
+                && _slugParts[0].toLowerCase() !== 'untitled';
+              if (_hasReadableSlug) {
+                _isCanonicalRedirect = false;
+                logger.info(`[browser.agent] run: URL-first enforcement — current URL has readable slug "${_slugParts[0]}", not a fresh redirect from ${startUrl}`);
+              } else {
+                // URL looks like a fresh page, but also check the page title to be sure
+                const _titleRes = await callBrowserAct({ action: 'evaluate', text: '(document.title || "")', sessionId, timeoutMs: 5000 }, 8000).catch(() => ({ ok: false }));
+                const _pageTitle = _titleRes?.ok ? String(_titleRes.result || '').trim().replace(/^"|"$/g, '') : '';
+                const _isFreshTitle = !_pageTitle
+                  || _pageTitle.toLowerCase() === 'untitled'
+                  || _pageTitle.toLowerCase() === 'new page'
+                  || _pageTitle.toLowerCase() === _brand;
+                _isCanonicalRedirect = _isFreshTitle;
+                if (!_isFreshTitle) {
+                  logger.info(`[browser.agent] run: URL-first enforcement — page title "${_pageTitle}" indicates existing page, not a fresh redirect from ${startUrl}`);
+                }
+              }
+            }
+          } else {
+            const _startBase = _startU.hostname.split('.').slice(-2).join('.');
+            const _curBase = _curU.hostname.split('.').slice(-2).join('.');
+            if (_startBase === _curBase) {
+              if (_startU.hostname !== _curU.hostname) {
+                _isCanonicalRedirect = true;
+              } else if (_curU.pathname.length > _startU.pathname.length) {
+                _isCanonicalRedirect = true;
+              }
+            }
+          }
+        } catch (_) {}
+
+        // Check if already on target (exact match after normalizing trailing slashes)
+        const _normCur = _curUrl.replace(/\/+$/, '').split('?')[0];
+        const _normStart = startUrl.replace(/\/+$/, '').split('?')[0];
+        if (_normCur === _normStart) {
+          _isCanonicalRedirect = true;
+        }
+
+        if (!_isCanonicalRedirect) {
+          logger.info(`[browser.agent] run: URL-first enforcement — navigating from ${_curUrl} to ${startUrl} for ${agentId}`);
+          const _enforceNav = await callBrowserAct({ action: 'navigate', sessionId, url: startUrl, timeoutMs: 30000 }, 35000);
+          if (_enforceNav?.ok !== false) {
+            // Wait for SPA hydration (up to 6s, 3 × 2s polls)
+            let _hydrated = false;
+            for (let _poll = 0; _poll < 3; _poll++) {
+              await new Promise(r => setTimeout(r, 2000));
+              const _pollTextRes = await callBrowserAct({ action: 'evaluate', text: '(document.body && document.body.innerText ? document.body.innerText.length : 0)', sessionId, timeoutMs: 5000 }, 8000).catch(() => ({ ok: false }));
+              const _pollTextLen = _pollTextRes?.ok ? Number(_pollTextRes.result) : 0;
+              if (_pollTextLen > 50) { _hydrated = true; break; }
+            }
+            logger.info(`[browser.agent] run: URL-first enforcement — navigation complete${_hydrated ? ' (SPA hydrated)' : ' (hydration uncertain)'} for ${agentId}`);
+            // Read the actual post-navigation URL (may differ from startUrl due to redirect)
+            const _postUrlRes = await callBrowserAct({ action: 'evaluate', text: 'window.location.href', sessionId, timeoutMs: 5000 }, 8000).catch(() => ({ ok: false }));
+            _postEnforcementUrl = _postUrlRes?.ok ? String(_postUrlRes.result || _postUrlRes.stdout || '').trim().replace(/^"|"$/g, '') : startUrl;
+          } else {
+            logger.warn(`[browser.agent] run: URL-first enforcement — navigation to ${startUrl} failed for ${agentId}`);
+            _postEnforcementUrl = startUrl;
+          }
+        } else {
+          logger.info(`[browser.agent] run: URL-first enforcement — already on canonical URL ${_curUrl} (startUrl=${startUrl}) — skipping re-navigation for ${agentId}`);
+          _postEnforcementUrl = _curUrl;
+        }
+      }
+    } catch (_enforceErr) {
+      logger.warn(`[browser.agent] run: URL-first enforcement error (non-fatal): ${_enforceErr.message}`);
+    }
   }
 
   // ── Proactive search-syntax discovery ───────────────────────────────────────
@@ -4798,7 +4898,7 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
     if (!recipe) {
       // Fallback: if this agent has exactly 1 trained recipe, auto-inject it
       const allSkills = trainerAgent.actionListSkills({ agentId: _agentIdClean });
-      const eligibleSkills = (allSkills?.skills || []).filter(s => _allowAutoGeneratedRecipes || s?.autoGenerated !== true);
+      const eligibleSkills = (allSkills?.skills || []).filter(s => _allowAutoGeneratedRecipes || s?.userConfirmed === true || s?.autoGenerated !== true);
       if (allSkills.ok && eligibleSkills.length === 1) {
         recipe = trainerAgent.loadRecipe(_agentIdClean, eligibleSkills[0].name);
         if (recipe) logger.info(`[browser.agent] run: auto-injecting sole trained recipe "${recipe.name}" for ${agentId}`);
@@ -5508,16 +5608,48 @@ When extracting page content with run-code, prioritize these selectors over gene
   // so the planner doesn't second-guess the navigation or try to re-discover it.
   if (_urlFirstNavigationSelected && !_recipeExecutedOk) {
     const _provenanceSource = _deepLinkSource || (url ? 'caller' : 'resolved');
-    const _provenanceNote = `\n\n## Verified Destination URL\nThe navigation URL (${startUrl}) has been verified (source: ${_provenanceSource}).\nDo NOT search for or navigate to alternative URLs. Use this URL as the first navigation step. If the page loads correctly, proceed directly with the user's task.`;
-    _agentContext = (_agentContext + _provenanceNote).slice(0, 5500);
+    let _provenanceNote = `\n\n## Verified Destination URL\nThe navigation URL (${startUrl}) has been verified (source: ${_provenanceSource}).\nDo NOT search for or navigate to alternative URLs. Use this URL as the first navigation step. If the page loads correctly, proceed directly with the user's task.`;
+
+    // ── Creation deep-link detection ────────────────────────────────────────
+    // When the resolved URL is a creation deep-link (e.g. notion.new, docs.google.com/document/create),
+    // the entity has ALREADY been created by navigating to it. Append a note so downstream
+    // tiers don't try to create another entity (pressing Ctrl+N, clicking "New page", etc.).
+    // Generic pattern-based detection — no app-specific hardcoding.
+    const _isCreationDeepLink = (() => {
+      try {
+        const _u = new URL(startUrl);
+        const _host = _u.hostname.replace(/^www\./, '');
+        // *.new shortcut domains (notion.new, docs.new, sheets.new, slides.new, etc.)
+        if (_host.endsWith('.new') || _host === 'new') return true;
+        // Paths containing /new, /create, /compose
+        if (/\/(new|create|compose)(\/|$|\?)/i.test(_u.pathname)) return true;
+        return false;
+      } catch (_) { return false; }
+    })();
+
+    if (_isCreationDeepLink) {
+      _provenanceNote += `\n\n## URL-FIRST NOTE: Creation Deep-Link\nNavigation to this creation URL has ALREADY created the new entity (page/document/draft). Do NOT create another one — do NOT press New/Create buttons or shortcuts (Ctrl+N, Cmd+N). The entity is ready for input — begin typing into the focused field, or click the appropriate field first if focus is not yet in an editor.`;
+      logger.info(`[browser.agent] run: injected creation deep-link note for ${agentId} (URL=${startUrl})`);
+    }
+
+    _agentContext = (_agentContext + _provenanceNote).slice(0, 5800);
     logger.info(`[browser.agent] run: injected deep-link provenance for ${agentId} (source=${_provenanceSource})`);
   }
 
   try {
-    // If recipe was successfully executed, we're already on the target page - don't navigate
-    const _playwrightUrl = _recipeExecutedOk ? undefined : (_useAgentBrowser ? startUrl : undefined);
+    // If recipe was successfully executed, we're already on the target page - don't navigate.
+    // When URL-first is selected, pass the actual post-enforcement URL (which may be a
+    // redirect from startUrl, e.g. notion.new → app.notion.com/<new-page-id>) so
+    // playwright.agent can recognize it's already on the right page and skip navigation.
+    // The recovery anchor in the goal still uses startUrl for blank-page recovery.
+    const _playwrightUrl = _recipeExecutedOk
+      ? undefined
+      : (_useAgentBrowser ? startUrl : (_urlFirstNavigationSelected ? (_postEnforcementUrl || startUrl) : undefined));
     if (_recipeExecutedOk && url) {
         logger.info(`[browser.agent] run: recipe executed successfully - NOT passing URL to playwright.agent to stay on target page`);
+    }
+    if (!_recipeExecutedOk && _urlFirstNavigationSelected && !_useAgentBrowser) {
+        logger.info(`[browser.agent] run: passing URL-first post-enforcement URL ${_playwrightUrl} to playwright.agent for ${agentId}`);
     }
     const agentResult = await _withSessionMutex(sessionId, () => callSkill(_agentSkill, {
         goal: _effectiveTask,
@@ -5580,16 +5712,30 @@ When extracting page content with run-code, prioritize these selectors over gene
         ? ['Try again with patched recipe', ...( agentResult.options || []).filter(o => !/try again/i.test(o))]
         : (agentResult.options || []);
 
+        // Capture current page URL so "Train from current page" can attach to
+        // the exact page the failure occurred on (e.g. the LinkedIn composer).
+        let _currentUrl = null;
+        try {
+          const _hrefRes = await callBrowserAct({ action: 'evaluate', text: 'window.location.href', sessionId, timeoutMs: 5000 }, 8000).catch(() => ({ ok: false }));
+          if (_hrefRes?.ok && _hrefRes.result) _currentUrl = String(_hrefRes.result).replace(/^"|"$/g, '');
+        } catch (_) { /* non-fatal */ }
+
         return {
         ok: false,
         agentId,
         task,
+        sessionId,
         askUser: true,
         trainingHandoff: agentResult.trainingHandoff === true,
         question: _questionText,
         options: _options,
         recipeWasUsed: _recipeExecutedOk,
         recipePatched: !!_doctorSummary,
+        // Preserve session for train-from-current-page; pass current URL + the
+        // original task so the trainer can attach in-place and distill later.
+        keepSession: agentResult.keepSession === true,
+        currentUrl: _currentUrl,
+        originalTask: task,
         };
     }
 
@@ -5860,6 +6006,13 @@ When extracting page content with run-code, prioritize these selectors over gene
     }
     // ─────────────────────────────────────────────────────────────────────────
 
+    // Declare _saveSkillOffer and _autoRecipeCreated BEFORE _runResult construction
+    // to avoid a TDZ (Temporal Dead Zone) crash: _runResult references _saveSkillOffer
+    // but the offer logic that sets it runs AFTER _runResult is built. We set
+    // _runResult.saveSkillOffer after the offer block completes.
+    let _autoRecipeCreated = false;
+    let _saveSkillOffer = null;
+
     const _runResult = {
         ok: agentResult?.ok ?? false,
         agentId,
@@ -5872,24 +6025,48 @@ When extracting page content with run-code, prioritize these selectors over gene
         done: agentResult?.done,
         httpStatus: Number.isInteger(agentResult?.httpStatus) ? agentResult.httpStatus : undefined,
         error: agentResult?.error,
+        // Phase 3: set below after the offer block computes _saveSkillOffer
+        saveSkillOffer: null,
     };
 
-    // ── Auto-recipe generation from successful run ─────────────────────────────
-    // After a successful run that was NOT recipe-driven, auto-generate a recipe
-    // from the execution transcript so subsequent identical tasks replay
-    // deterministically without LLM planning, web-search discovery, or re-plans.
-    let _autoRecipeCreated = false;
+    // ── Save-as-named-skill offer (Phase 3) ────────────────────────────────────
+    // After a successful mutation run that was NOT recipe-driven, offer to save
+    // the flow as a named, URL-first recipe — but ASK the user first (don't
+    // auto-save, which risks cementing hollow successes). The user confirms +
+    // names it (e.g. linkedin.post.update); on resume, main.js calls
+    // trainerAgent.saveAutoRecipe with the chosen name.
     if (_runResult.ok === true && !_trainedRecipeInjected && _runResult.transcript.length >= 2) {
-        try {
-        const trainerAgent = require('./trainer.agent.cjs');
-        const _autoRecipe = await trainerAgent.saveAutoRecipe(
-          agentId, task, _runResult.transcript, startUrl, _agentContext
-        );
-        if (_autoRecipe) _autoRecipeCreated = true;
-        } catch (_autoRecipeErr) {
-        logger.warn(`[browser.agent] auto-recipe generation failed (non-fatal): ${_autoRecipeErr.message}`);
+        // Only offer for mutation runs (click/submit/fill), not pure extractions
+        const _isMutationRun = _runResult.transcript.some(t => {
+          const _a = t.action?.action || t.step?.action || '';
+          return /click|submit|fill|check|select/i.test(typeof _a === 'string' ? _a : '');
+        });
+        if (_isMutationRun) {
+          // Stash the transcript to a temp file so it survives the ASK_USER pause.
+          // The resume handler reads it back when the user confirms a name.
+          try {
+            const _os = require('os');
+            const _stashPath = path.join(_os.tmpdir(), `thinkdrop-recipe-${agentId}-${Date.now()}.json`);
+            fs.writeFileSync(_stashPath, JSON.stringify({
+              transcript: _runResult.transcript,
+              task,
+              targetUrl: startUrl,
+              agentContext: _agentContext,
+            }), 'utf8');
+            // Suggest a dot-name from the agentId + task keywords
+            const _svc = (agentId || '').replace(/\.agent$/, '').replace(/[^a-z0-9]/gi, '').toLowerCase() || 'agent';
+            const _goalWords = (task || '').toLowerCase().replace(/[^a-z0-9\s]/g, '').split(/\s+/)
+              .filter(w => w.length > 2 && !['the','and','for','with','from','your','this','that','into','open','send','post','create'].includes(w)).slice(0, 2);
+            const _suggestedName = _goalWords.length > 0 ? `${_svc}.${_goalWords.join('.')}` : `${_svc}.custom`;
+            _saveSkillOffer = { suggestedName: _suggestedName, transcriptPath: _stashPath, task, agentId };
+            logger.info(`[browser.agent] Phase 3: saveSkillOffer — suggested "${_suggestedName}" (transcript stashed at ${_stashPath})`);
+          } catch (_stashErr) {
+            logger.warn(`[browser.agent] saveSkillOffer stash failed (non-fatal): ${_stashErr.message}`);
+          }
         }
     }
+    // Now that _saveSkillOffer is computed, attach it to _runResult
+    _runResult.saveSkillOffer = _saveSkillOffer;
 
     // ── Post-run background rescan ────────────────────────────────────────────
     // After a successful run, enqueue a background scan to rebuild domain maps

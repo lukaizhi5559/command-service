@@ -19,6 +19,7 @@
  * Actions supported:
  *   navigate | goto | back | forward | reload | close | snapshot
  *   click | dblclick | fill | type | hover | select | check | uncheck | upload
+ *   reactFill | clickByText | clickBySelector  (injection-first, React-aware)
  *   keyboard | press | scroll | screenshot | pdf
  *   getText | getPageText | evaluate | scanCurrentPage
  *   waitForSelector | waitForContent | waitForStableText
@@ -1318,7 +1319,7 @@ const _engineRefMaps = new Map(); // sessionId → refMap (Map: ref → { role, 
 const _engineSnapshots = new Map();
 
 async function _captureEngineSnapshot(sessionId, page) {
-  const { yaml, refMap, lowConfidenceRefs } = await engine.buildRefTree(page);
+  const { yaml, refMap, lowConfidenceRefs, activeElement, scannerUsed } = await engine.buildRefTree(page);
   if (!yaml) return null;
   const previous = _engineSnapshots.get(sessionId);
   const snapshot = {
@@ -1328,6 +1329,8 @@ async function _captureEngineSnapshot(sessionId, page) {
     yaml,
     refMap,
     lowConfidenceRefs: !!lowConfidenceRefs,
+    activeElement: activeElement || null,
+    scannerUsed: !!scannerUsed,
   };
   _engineSnapshots.set(sessionId, snapshot);
   _engineRefMaps.set(sessionId, refMap);
@@ -1341,12 +1344,148 @@ function _engineActionFailure(action, sessionId, error, extra = {}) {
 }
 
 function _engineRefEntry(sessionId, page, selector) {
-  const refMatch = selector?.trim().match(/^\[ref=(e\d+)\]$/i);
-  const ref = refMatch ? refMatch[1] : (/^e\d+$/i.test((selector || '').trim()) ? selector.trim() : null);
+  // Accept ref formats: [ref=e93], [e93], bare e93 (ARIA) AND [ref=td93], [td93], bare td93 (DOM scanner)
+  // (repair LLMs sometimes emit [e93] instead of [ref=e93] or e93)
+  const refMatch = selector?.trim().match(/^\[ref=(e\d+)\]$/i) || selector?.trim().match(/^\[(e\d+)\]$/i)
+    || selector?.trim().match(/^\[ref=(td\d+)\]$/i) || selector?.trim().match(/^\[(td\d+)\]$/i);
+  const ref = refMatch ? refMatch[1] : (/^(?:e|td)\d+$/i.test((selector || '').trim()) ? selector.trim() : null);
   if (!ref) return { ref: null, entry: null, stale: false };
   const snapshot = _engineSnapshots.get(sessionId);
   if (!snapshot || snapshot.page !== page || snapshot.url !== page.url()) return { ref, entry: null, stale: true };
   return { ref, entry: snapshot.refMap.get(ref) || null, stale: !snapshot.refMap.has(ref) };
+}
+
+// Check if a ref is a DOM scanner ref (tdN) vs ARIA ref (eN)
+function _isTdRef(ref) {
+  return /^td\d+$/i.test(ref || '');
+}
+
+// Re-tag-on-miss: when [data-td-ref="tdN"] doesn't resolve (SPA re-rendered),
+// re-run a lightweight scan to re-tag visible interactive elements.
+// Returns the new ref matching the original element's characteristics, or null.
+async function _reTagAndResolve(page, originalRef, originalEntry) {
+  if (!page || !originalEntry) return null;
+  logger.info(`[browser.act] re-tag-on-miss: [data-td-ref="${originalRef}"] not found — re-scanning DOM`);
+  try {
+    const raw = await page.evaluate(engine._DOM_SCANNER_SCRIPT);
+    if (!raw) return null;
+    const result = JSON.parse(raw);
+    // Find a matching element by comparing key characteristics
+    const match = result.elements.find(el =>
+      el.role === originalEntry.role &&
+      el.label === originalEntry.name &&
+      el.tag === originalEntry.tag &&
+      el.type === originalEntry.type
+    );
+    if (match) {
+      logger.info(`[browser.act] re-tag-on-miss: matched element found as ${match.ref} (role=${match.role}, label="${match.label}")`);
+      return match.ref;
+    }
+    // Fallback: match by label + role only
+    const looseMatch = result.elements.find(el =>
+      el.label === originalEntry.name && el.role === originalEntry.role
+    );
+    if (looseMatch) {
+      logger.info(`[browser.act] re-tag-on-miss: loose match found as ${looseMatch.ref} (role=${looseMatch.role}, label="${looseMatch.label}")`);
+      return looseMatch.ref;
+    }
+    logger.warn(`[browser.act] re-tag-on-miss: no matching element found after re-scan`);
+    return null;
+  } catch (err) {
+    logger.warn(`[browser.act] re-tag-on-miss: re-scan failed: ${err.message}`);
+    return null;
+  }
+}
+
+// Pre-click occlusion check + coordinate-click fallback
+// Returns true if click was handled (either succeeded or failed definitively),
+// false if caller should continue with other fallback paths.
+async function _tdRefClick(page, ref, entry, cmd, forceClick, timeoutMs) {
+  const selector = `[data-td-ref="${ref}"]`;
+  const clickTimeout = Math.min(timeoutMs, 15000);
+
+  // Step 1: Try direct locator click
+  try {
+    const locator = page.locator(selector);
+    if (cmd === 'dblclick') {
+      await locator.dblclick({ timeout: clickTimeout, force: forceClick });
+    } else {
+      await locator.click({ timeout: clickTimeout, force: forceClick });
+    }
+    logger.info(`[browser.act] click (engine) tdRef=${ref} ok${forceClick ? ' (force)' : ''}`);
+    return true;
+  } catch (clickErr) {
+    logger.warn(`[browser.act] click (engine) tdRef=${ref} failed: ${clickErr.message.slice(0, 80)}`);
+  }
+
+  // Step 2: Re-tag-on-miss (SPA may have re-rendered and destroyed the tag)
+  const reTaggedRef = await _reTagAndResolve(page, ref, entry);
+  if (reTaggedRef && reTaggedRef !== ref) {
+    const reTagSelector = `[data-td-ref="${reTaggedRef}"]`;
+    try {
+      const locator = page.locator(reTagSelector);
+      if (cmd === 'dblclick') {
+        await locator.dblclick({ timeout: clickTimeout, force: forceClick });
+      } else {
+        await locator.click({ timeout: clickTimeout, force: forceClick });
+      }
+      logger.info(`[browser.act] click (engine) re-tagged tdRef=${reTaggedRef} ok${forceClick ? ' (force)' : ''}`);
+      return true;
+    } catch (reTagErr) {
+      logger.warn(`[browser.act] click (engine) re-tagged tdRef=${reTaggedRef} failed: ${reTagErr.message.slice(0, 80)}`);
+    }
+  }
+
+  // Step 3: Occlusion re-check + scroll-into-view retry
+  if (entry && entry.rect) {
+    const occluded = await page.evaluate((sel) => {
+      const el = document.querySelector(sel);
+      if (!el) return { exists: false };
+      el.scrollIntoViewIfNeeded ? el.scrollIntoViewIfNeeded() : el.scrollIntoView({ block: 'center' });
+      const rect = el.getBoundingClientRect();
+      const cx = rect.x + rect.width / 2;
+      const cy = rect.y + rect.height / 2;
+      const top = document.elementFromPoint(cx, cy);
+      return {
+        exists: true,
+        rect: { x: Math.round(rect.x), y: Math.round(rect.y), width: Math.round(rect.width), height: Math.round(rect.height) },
+        occluded: top && top !== el && !el.contains(top) && !top.contains(el),
+      };
+    }, selector).catch(() => null);
+
+    if (occluded && occluded.exists) {
+      // Wait briefly after scroll, then try again
+      await new Promise(r => setTimeout(r, 300));
+      try {
+        const locator = page.locator(selector);
+        if (cmd === 'dblclick') {
+          await locator.dblclick({ timeout: 5000, force: forceClick });
+        } else {
+          await locator.click({ timeout: 5000, force: forceClick });
+        }
+        logger.info(`[browser.act] click (engine) tdRef=${ref} ok after scroll${forceClick ? ' (force)' : ''}`);
+        return true;
+      } catch (scrollErr) {
+        logger.warn(`[browser.act] click (engine) tdRef=${ref} scroll-retry failed: ${scrollErr.message.slice(0, 80)}`);
+      }
+
+      // Step 4: Trusted coordinate click (bypasses Playwright actionability gate)
+      if (occluded.rect && occluded.rect.width > 0 && occluded.rect.height > 0) {
+        const cx = occluded.rect.x + occluded.rect.width / 2;
+        const cy = occluded.rect.y + occluded.rect.height / 2;
+        logger.info(`[browser.act] click (engine) tdRef=${ref} coordinate-click at (${cx}, ${cy})${occluded.occluded ? ' [occluded]' : ''}`);
+        try {
+          await page.mouse.click(cx, cy);
+          logger.info(`[browser.act] click (engine) tdRef=${ref} coordinate-click ok`);
+          return true;
+        } catch (coordErr) {
+          logger.warn(`[browser.act] click (engine) tdRef=${ref} coordinate-click failed: ${coordErr.message}`);
+        }
+      }
+    }
+  }
+
+  return false;
 }
 
 async function _handoffEngineToCli(sessionId) {
@@ -1441,7 +1580,7 @@ async function captureSnapshot(sessionId, headed, timeoutMs) {
   if (_ePage) {
     try {
       const snapshot = await _captureEngineSnapshot(sessionId, _ePage);
-      if (snapshot) return { ok: true, stdout: snapshot.yaml, snapshotText: snapshot.yaml, executionTime: 0, generation: snapshot.generation };
+      if (snapshot) return { ok: true, stdout: snapshot.yaml, snapshotText: snapshot.yaml, executionTime: 0, generation: snapshot.generation, activeElement: snapshot.activeElement || null, scannerUsed: snapshot.scannerUsed || false };
     } catch (e) {
       logger.warn(`[browser.act] captureSnapshot (engine) failed: ${e.message}`);
       return _engineActionFailure('snapshot', sessionId, `Engine snapshot failed: ${e.message}`, { engineHealthFailure: true });
@@ -2603,6 +2742,8 @@ async function browserAct(args) {
               sessionId,
               result: snapshot.yaml,
               generation: snapshot.generation,
+              activeElement: snapshot.activeElement || null,
+              scannerUsed: snapshot.scannerUsed || false,
               executionTime: Date.now() - start,
             };
           }
@@ -2630,6 +2771,7 @@ async function browserAct(args) {
     case 'dblclick': {
       const cmd = action === 'dblclick' ? 'dblclick' : 'click';
       const clickPurpose = args?.purpose || args?.intent || 'default';
+      const forceClick = args?.force === true;  // bypass actionability checks (overlay recovery)
 
       // ── Engine path ──
       const _ePage = engine.getPage(sessionId);
@@ -2640,7 +2782,22 @@ async function browserAct(args) {
         const refMap = _engineSnapshots.get(sessionId)?.refMap || new Map();
         const _lowConfRefs = _engineSnapshots.get(sessionId)?.lowConfidenceRefs || false;
 
-        if (cleanRef && refMap && !_lowConfRefs) {
+        // ── DOM scanner ref (tdN): use _tdRefClick with occlusion check + coordinate fallback ──
+        if (cleanRef && _isTdRef(cleanRef) && refMap.has(cleanRef)) {
+          const entry = refMap.get(cleanRef);
+          if (entry) {
+            if (entry.occluded) {
+              logger.info(`[browser.act] click (engine) tdRef=${cleanRef} is marked occluded — trying _tdRefClick with fallbacks`);
+            }
+            const _tdClickOk = await _tdRefClick(_ePage, cleanRef, entry, cmd, forceClick, timeoutMs);
+            if (_tdClickOk) {
+              return { ok: true, action, sessionId, executionTime: Date.now() - start };
+            }
+            logger.warn(`[browser.act] click (engine) tdRef=${cleanRef} all strategies failed — falling through to CSS/eval`);
+          }
+        }
+
+        if (cleanRef && refMap && !_lowConfRefs && !_isTdRef(cleanRef)) {
           const entry = refMap.get(cleanRef);
           if (entry) {
             // ── Probe-then-commit: try semantic CSS selectors before getByRole ──
@@ -2651,11 +2808,11 @@ async function browserAct(args) {
                 for (const _sel of _matched) {
                   try {
                     if (cmd === 'dblclick') {
-                      await _ePage.dblclick(_sel, { timeout: 5000 });
+                      await _ePage.dblclick(_sel, { timeout: 5000, force: forceClick });
                     } else {
-                      await _ePage.click(_sel, { timeout: 5000 });
+                      await _ePage.click(_sel, { timeout: 5000, force: forceClick });
                     }
-                    logger.info(`[browser.act] click (engine) semantic="${_sel}" ok (ref=${cleanRef} bypassed)`);
+                    logger.info(`[browser.act] click (engine) semantic="${_sel}" ok (ref=${cleanRef} bypassed${forceClick ? ' force' : ''})`);
                     return { ok: true, action, sessionId, executionTime: Date.now() - start };
                   } catch (_semErr) {
                     logger.debug(`[browser.act] click (engine) semantic="${_sel}" failed: ${_semErr.message} — trying next`);
@@ -2678,11 +2835,11 @@ async function browserAct(args) {
                 locator = _ePage.getByRole(entry.role).first();
               }
               if (cmd === 'dblclick') {
-                await locator.dblclick({ timeout: clickTimeout });
+                await locator.dblclick({ timeout: clickTimeout, force: forceClick });
               } else {
-                await locator.click({ timeout: clickTimeout });
+                await locator.click({ timeout: clickTimeout, force: forceClick });
               }
-              logger.info(`[browser.act] click (engine) ref=${cleanRef} role=${entry.role} name="${entry.name}" ok`);
+              logger.info(`[browser.act] click (engine) ref=${cleanRef} role=${entry.role} name="${entry.name}" ok${forceClick ? ' (force)' : ''}`);
               return { ok: true, action, sessionId, executionTime: Date.now() - start };
             } catch (clickErr) {
               logger.warn(`[browser.act] click (engine) ref=${cleanRef} failed: ${clickErr.message} — trying CSS/eval fallback`);
@@ -2695,11 +2852,11 @@ async function browserAct(args) {
               const clickTimeout = Math.min(timeoutMs, 15000);
               const locator = _ePage.locator('*:visible').filter({ hasText: entry.name }).first();
               if (cmd === 'dblclick') {
-                await locator.dblclick({ timeout: clickTimeout });
+                await locator.dblclick({ timeout: clickTimeout, force: forceClick });
               } else {
-                await locator.click({ timeout: clickTimeout });
+                await locator.click({ timeout: clickTimeout, force: forceClick });
               }
-              logger.info(`[browser.act] click (engine) ref=${cleanRef} text="${entry.name}" (lowConf) ok`);
+              logger.info(`[browser.act] click (engine) ref=${cleanRef} text="${entry.name}" (lowConf) ok${forceClick ? ' (force)' : ''}`);
               return { ok: true, action, sessionId, executionTime: Date.now() - start };
             } catch (textErr) {
               logger.warn(`[browser.act] click (engine) ref=${cleanRef} text fallback failed: ${textErr.message}`);
@@ -2713,13 +2870,101 @@ async function browserAct(args) {
         // CSS selector path
         if (selector && /[\[\]#.>:()"'=~^$*|]/.test(selector.trim())) {
           try {
-            if (cmd === 'dblclick') {
-              await _ePage.dblclick(selector, { timeout: timeoutMs });
+            // ── Try all matches + verify state change ──────────────────────────
+            // When a CSS selector matches multiple elements (e.g. button:has-text('Post')
+            // matches 3 Post buttons on LinkedIn), Playwright picks the first which may
+            // be hidden. Instead: get all matches, force-click each, verify ANY state
+            // change (URL, modal count, body text). First one that causes a state
+            // change is the right button.
+            const _cssLocator = _ePage.locator(selector);
+            const _cssCount = await _cssLocator.count();
+            if (_cssCount > 1 && cmd === 'click') {
+              // Capture state before clicking
+              const _stateBefore = await _ePage.evaluate(() => ({
+                url: window.location.href,
+                modalCount: document.querySelectorAll('[role="dialog"], #interop-outlet, .share-creation, [data-testid*="modal"], [data-testid*="share"]').length,
+                bodyLen: (document.body?.innerText || '').length,
+              })).catch(() => ({ url: '', modalCount: 0, bodyLen: 0 }));
+              logger.info(`[browser.act] click (engine) CSS="${selector}" matched ${_cssCount} elements — trying each with force + state verification`);
+
+              let _clickedIdx = -1;
+              for (let _ci = 0; _ci < _cssCount; _ci++) {
+                try {
+                  await _cssLocator.nth(_ci).click({ timeout: 5000, force: true });
+                  // Wait briefly for state change to manifest
+                  await new Promise(r => setTimeout(r, 500));
+                  const _stateAfter = await _ePage.evaluate(() => ({
+                    url: window.location.href,
+                    modalCount: document.querySelectorAll('[role="dialog"], #interop-outlet, .share-creation, [data-testid*="modal"], [data-testid*="share"]').length,
+                    bodyLen: (document.body?.innerText || '').length,
+                  })).catch(() => null);
+                  if (_stateAfter) {
+                    const _urlChanged = _stateAfter.url !== _stateBefore.url;
+                    const _modalClosed = _stateAfter.modalCount < _stateBefore.modalCount;
+                    const _contentChanged = Math.abs(_stateAfter.bodyLen - _stateBefore.bodyLen) > 50;
+                    if (_urlChanged || _modalClosed || _contentChanged) {
+                      _clickedIdx = _ci;
+                      logger.info(`[browser.act] click (engine) CSS="${selector}" nth=${_ci} caused state change (url=${_urlChanged}, modal=${_modalClosed}, content=${_contentChanged}) — success`);
+                      break;
+                    }
+                    logger.debug(`[browser.act] click (engine) CSS="${selector}" nth=${_ci} — no state change, trying next`);
+                  }
+                } catch (_nthErr) {
+                  logger.debug(`[browser.act] click (engine) CSS="${selector}" nth=${_ci} click failed: ${_nthErr.message} — trying next`);
+                }
+              }
+              if (_clickedIdx >= 0) {
+                return { ok: true, action, sessionId, executionTime: Date.now() - start };
+              }
+              // All matches exhausted — fall through to error
+              logger.warn(`[browser.act] click (engine) CSS="${selector}" — all ${_cssCount} matches clicked but no state change — falling back to CLI`);
             } else {
-              await _ePage.click(selector, { timeout: timeoutMs });
+              // Single match (or dblclick) — cap visibility-wait to 8s, then force retry
+              const _singleTimeout = Math.min(timeoutMs, 8000);
+              try {
+                if (cmd === 'dblclick') {
+                  await _ePage.dblclick(selector, { timeout: _singleTimeout, force: forceClick });
+                } else {
+                  await _ePage.click(selector, { timeout: _singleTimeout, force: forceClick });
+                }
+                logger.info(`[browser.act] click (engine) CSS="${selector}" ok${forceClick ? ' (force)' : ''}`);
+                return { ok: true, action, sessionId, executionTime: Date.now() - start };
+              } catch (_singleErr) {
+                // On "not visible"/timeout: retry with force:true + state-change verification
+                if (cmd === 'click' && /not visible|not stable|timeout/i.test(_singleErr.message)) {
+                  logger.info(`[browser.act] click (engine) CSS="${selector}" single-match failed (${_singleErr.message.slice(0, 60)}) — retrying with force + state verification`);
+                  try {
+                    // Capture state before force-click
+                    const _stateBefore = await _ePage.evaluate(() => ({
+                      url: window.location.href,
+                      modalCount: document.querySelectorAll('[role="dialog"], #interop-outlet, .share-creation, [data-testid*="modal"], [data-testid*="share"]').length,
+                      bodyLen: (document.body?.innerText || '').length,
+                    })).catch(() => ({ url: '', modalCount: 0, bodyLen: 0 }));
+                    await _ePage.click(selector, { timeout: 3000, force: true });
+                    await new Promise(r => setTimeout(r, 500));
+                    const _stateAfter = await _ePage.evaluate(() => ({
+                      url: window.location.href,
+                      modalCount: document.querySelectorAll('[role="dialog"], #interop-outlet, .share-creation, [data-testid*="modal"], [data-testid*="share"]').length,
+                      bodyLen: (document.body?.innerText || '').length,
+                    })).catch(() => null);
+                    if (_stateAfter) {
+                      const _urlChanged = _stateAfter.url !== _stateBefore.url;
+                      const _modalClosed = _stateAfter.modalCount < _stateBefore.modalCount;
+                      const _contentChanged = Math.abs(_stateAfter.bodyLen - _stateBefore.bodyLen) > 50;
+                      if (_urlChanged || _modalClosed || _contentChanged) {
+                        logger.info(`[browser.act] click (engine) CSS="${selector}" force-click caused state change (url=${_urlChanged}, modal=${_modalClosed}, content=${_contentChanged}) — success`);
+                        return { ok: true, action, sessionId, executionTime: Date.now() - start };
+                      }
+                    }
+                    logger.warn(`[browser.act] click (engine) CSS="${selector}" force-click succeeded but no state change — falling back to CLI`);
+                  } catch (_forceErr) {
+                    logger.warn(`[browser.act] click (engine) CSS="${selector}" force-click failed: ${_forceErr.message} — falling back to CLI`);
+                  }
+                } else {
+                  throw _singleErr;
+                }
+              }
             }
-            logger.info(`[browser.act] click (engine) CSS="${selector}" ok`);
-            return { ok: true, action, sessionId, executionTime: Date.now() - start };
           } catch (cssErr) {
             logger.warn(`[browser.act] click (engine) CSS="${selector}" failed: ${cssErr.message} — falling back to CLI`);
           }
@@ -2937,10 +3182,66 @@ async function browserAct(args) {
         const refMap = _engineSnapshots.get(sessionId)?.refMap || new Map();
         const _fillLowConf = _engineSnapshots.get(sessionId)?.lowConfidenceRefs || false;
 
+        // ── DOM scanner ref (tdN): click via [data-td-ref] then type ──
+        if (cleanRef && _isTdRef(cleanRef) && refMap.has(cleanRef)) {
+          const entry = refMap.get(cleanRef);
+          if (entry) {
+            try {
+              const fillClickTimeout = Math.min(timeoutMs, 15000);
+              const tdSelector = `[data-td-ref="${cleanRef}"]`;
+              // Click to focus
+              try {
+                await _ePage.click(tdSelector, { timeout: fillClickTimeout });
+                logger.info(`[browser.act] fill (engine) tdRef=${cleanRef} click ok`);
+              } catch (tdClickErr) {
+                // Re-tag-on-miss
+                const reTaggedRef = await _reTagAndResolve(_ePage, cleanRef, entry);
+                if (reTaggedRef && reTaggedRef !== cleanRef) {
+                  await _ePage.click(`[data-td-ref="${reTaggedRef}"]`, { timeout: fillClickTimeout });
+                  logger.info(`[browser.act] fill (engine) re-tagged tdRef=${reTaggedRef} click ok`);
+                } else {
+                  throw tdClickErr;
+                }
+              }
+              // Detect field type and type accordingly
+              const fieldType = await _ePage.evaluate(() => {
+                const ae = document.activeElement;
+                if (!ae) return 'normal';
+                if (ae.tagName !== 'TEXTAREA' && ae.tagName !== 'INPUT' &&
+                    ae.getAttribute('aria-multiline') !== 'true' &&
+                    (ae.isContentEditable ||
+                     ae.getAttribute('role') === 'combobox' ||
+                     ae.getAttribute('aria-autocomplete') !== null ||
+                     !!ae.closest('[role=combobox]'))) {
+                  if (ae.isContentEditable || ae.getAttribute('aria-multiline') === 'true') return 'rich-text';
+                  return 'chip';
+                }
+                return 'normal';
+              });
+              if (fieldType === 'chip') {
+                logger.info(`[browser.act] fill (engine) tdRef chip-detect: chip/combobox — skipping Meta+a`);
+                await _ePage.keyboard.type(fillText, { timeout: timeoutMs });
+                await _ePage.keyboard.press('Tab');
+              } else if (fieldType === 'rich-text') {
+                logger.info(`[browser.act] fill (engine) tdRef rich-text-detect: contenteditable — typing without Meta+a`);
+                await _ePage.keyboard.pressSequentially(fillText, { delay: 10 });
+              } else {
+                await _ePage.keyboard.press('Meta+a');
+                await _ePage.keyboard.type(fillText, { timeout: timeoutMs });
+              }
+              logger.info(`[browser.act] fill (engine) tdRef=${cleanRef} type ok`);
+              lastFilledTarget.delete(sessionId);
+              return { ok: true, action, sessionId, executionTime: Date.now() - start };
+            } catch (tdFillErr) {
+              logger.warn(`[browser.act] fill (engine) tdRef=${cleanRef} failed: ${tdFillErr.message} — falling through to ARIA/CSS`);
+            }
+          }
+        }
+
         try {
           // Click to focus
           const fillClickTimeout = Math.min(timeoutMs, 15000);
-          if (cleanRef && refMap && !_fillLowConf) {
+          if (cleanRef && refMap && !_fillLowConf && !_isTdRef(cleanRef)) {
             const entry = refMap.get(cleanRef);
             // ── Probe-then-commit: try semantic CSS selectors before getByRole ──
             if (entry) {
@@ -2961,21 +3262,30 @@ async function browserAct(args) {
                   }
                   if (_semClicked) {
                     // Skip getByRole focus — semantic click already focused the element
-                    // Jump directly to chip detection + type
-                    const isChip = await _ePage.evaluate(
-                      'document.activeElement && ' +
-                      'document.activeElement.tagName !== "TEXTAREA" && ' +
-                      'document.activeElement.tagName !== "INPUT" && ' +
-                      'document.activeElement.getAttribute("aria-multiline") !== "true" && ' +
-                      '(document.activeElement.isContentEditable || ' +
-                      'document.activeElement.getAttribute("role") === "combobox" || ' +
-                      'document.activeElement.getAttribute("aria-autocomplete") !== null || ' +
-                      '!!document.activeElement.closest("[role=combobox]")) ? "chip" : "normal"'
-                    );
-                    if (isChip === 'chip') {
+                    // Jump directly to field-type detection + type
+                    const fieldType = await _ePage.evaluate(() => {
+                      const ae = document.activeElement;
+                      if (!ae) return 'normal';
+                      if (ae.tagName !== 'TEXTAREA' && ae.tagName !== 'INPUT' &&
+                          ae.getAttribute('aria-multiline') !== 'true' &&
+                          (ae.isContentEditable ||
+                           ae.getAttribute('role') === 'combobox' ||
+                           ae.getAttribute('aria-autocomplete') !== null ||
+                           !!ae.closest('[role=combobox]'))) {
+                        if (ae.isContentEditable || ae.getAttribute('aria-multiline') === 'true') {
+                          return 'rich-text';
+                        }
+                        return 'chip';
+                      }
+                      return 'normal';
+                    });
+                    if (fieldType === 'chip') {
                       logger.info(`[browser.act] fill (engine) chip-detect: chip/combobox — skipping Meta+a`);
                       await _ePage.keyboard.type(fillText, { timeout: timeoutMs });
                       await _ePage.keyboard.press('Tab');
+                    } else if (fieldType === 'rich-text') {
+                      logger.info(`[browser.act] fill (engine) rich-text-detect: contenteditable — typing without Meta+a`);
+                      await _ePage.keyboard.pressSequentially(fillText, { delay: 10 });
                     } else {
                       await _ePage.keyboard.press('Meta+a');
                       await _ePage.keyboard.type(fillText, { timeout: timeoutMs });
@@ -3023,22 +3333,41 @@ async function browserAct(args) {
             }
           }
 
-          // Detect chip/combobox field
-          const isChip = await _ePage.evaluate(
-            'document.activeElement && ' +
-            'document.activeElement.tagName !== "TEXTAREA" && ' +
-            'document.activeElement.tagName !== "INPUT" && ' +
-            'document.activeElement.getAttribute("aria-multiline") !== "true" && ' +
-            '(document.activeElement.isContentEditable || ' +
-            'document.activeElement.getAttribute("role") === "combobox" || ' +
-            'document.activeElement.getAttribute("aria-autocomplete") !== null || ' +
-            '!!document.activeElement.closest("[role=combobox]")) ? "chip" : "normal"'
-          );
+          // Detect chip/combobox field AND contenteditable rich-text editors.
+          // For contenteditable (LinkedIn/Gmail composers), skip Meta+a — it can
+          // select text outside the editor (e.g. the entire page) and cause the
+          // typed text to replace the wrong content. Instead, focus and type directly.
+          const fieldType = await _ePage.evaluate(() => {
+            const ae = document.activeElement;
+            if (!ae) return 'normal';
+            // Chip/combobox: non-standard input that needs Tab to commit
+            if (ae.tagName !== 'TEXTAREA' && ae.tagName !== 'INPUT' &&
+                ae.getAttribute('aria-multiline') !== 'true' &&
+                (ae.isContentEditable ||
+                 ae.getAttribute('role') === 'combobox' ||
+                 ae.getAttribute('aria-autocomplete') !== null ||
+                 !!ae.closest('[role=combobox]'))) {
+              // Distinguish: contenteditable rich-text editor vs chip/combobox
+              if (ae.isContentEditable || ae.getAttribute('aria-multiline') === 'true') {
+                return 'rich-text';
+              }
+              return 'chip';
+            }
+            return 'normal';
+          });
 
-          if (isChip === 'chip') {
+          if (fieldType === 'chip') {
             logger.info(`[browser.act] fill (engine) chip-detect: chip/combobox — skipping Meta+a`);
             await _ePage.keyboard.type(fillText, { timeout: timeoutMs });
             await _ePage.keyboard.press('Tab');
+          } else if (fieldType === 'rich-text') {
+            // Contenteditable rich-text editor (LinkedIn, Gmail, Quill, DraftJS):
+            // Focus is already set by the click. Type directly without Meta+a —
+            // Meta+a can select text outside the editor on some sites.
+            // Use pressSequentially for reliable character-by-character input
+            // that respects the editor's input handling (draft-js, prosemirror).
+            logger.info(`[browser.act] fill (engine) rich-text-detect: contenteditable — typing without Meta+a`);
+            await _ePage.keyboard.pressSequentially(fillText, { delay: 10 });
           } else {
             await _ePage.keyboard.press('Meta+a');
             await _ePage.keyboard.type(fillText, { timeout: timeoutMs });
@@ -3138,7 +3467,30 @@ async function browserAct(args) {
         let _typeErr = null;
         try {
           await _ePage.keyboard.type(text || '', { timeout: timeoutMs });
-          return { ok: true, action, sessionId, executionTime: Date.now() - start };
+          // Verify the text was actually typed by checking the focused element's value
+          const _typedText = text || '';
+          if (_typedText.length > 0) {
+            const _verify = await _ePage.evaluate(() => {
+              const el = document.activeElement;
+              if (!el) return { hasFocus: false, value: '' };
+              const val = el.value || el.textContent || el.innerText || '';
+              return { hasFocus: true, value: val.slice(0, 500), tag: el.tagName, editable: el.isContentEditable };
+            }).catch(() => null);
+            if (_verify) {
+              const _typedOk = _verify.value && _verify.value.includes(_typedText.slice(0, 50));
+              if (!_typedOk) {
+                logger.warn(`[browser.act] type (engine) verification failed — focused <${_verify.tag}> editable=${_verify.editable} value="${_verify.value.slice(0, 80)}" does not contain typed text`);
+                return {
+                  ok: false, action, sessionId,
+                  error: `type verification failed: focused element (${_verify.tag}) does not contain typed text. Use reactFill with a selector instead.`,
+                  verified: false,
+                  executionTime: Date.now() - start,
+                };
+              }
+              logger.info(`[browser.act] type (engine) verified — focused <${_verify.tag}> contains text`);
+            }
+          }
+          return { ok: true, action, sessionId, verified: true, executionTime: Date.now() - start };
         } catch (typeErr) {
           _typeErr = typeErr;
           logger.warn(`[browser.act] type (engine) failed: ${typeErr.message}`);
@@ -3149,6 +3501,282 @@ async function browserAct(args) {
       }
       // ── CLI fallback ──
       return run(['type', '--', text || ''], `type "${text}"`);
+    }
+
+    // ── reactFill ────────────────────────────────────────────────────────────
+    // React-aware fill: sets value on React-controlled inputs/textareas via the
+    // native setter + input event dispatch technique, and on contenteditable
+    // elements via focus + execCommand('insertText'). Bypasses snapshot-ref
+    // resolution entirely — queries by CSS selector directly. Returns a
+    // deterministic verification result (did the value get set?).
+    //
+    // Args: { selector, text, clearFirst? }
+    //   selector    — CSS selector for the target element (e.g. '[role="textbox"]',
+    //                 'textarea[name="body"]', 'div[contenteditable="true"]')
+    //   text        — text to set
+    //   clearFirst  — if true (default), clear existing content before setting
+    case 'reactFill': {
+      const fillText = (text ?? value) || '';
+      const clearFirst = args.clearFirst !== false; // default true
+      const _ePage = engine.getPage(sessionId);
+      if (!_ePage) {
+        return _engineActionFailure(action, sessionId,
+          `reactFill requires an engine-owned session (got none for ${sessionId})`,
+          { executionTime: Date.now() - start });
+      }
+      try {
+        const result = await _ePage.evaluate(({ selector, text, clearFirst }) => {
+          const el = document.querySelector(selector);
+          if (!el) return { ok: false, error: `Element not found: ${selector}` };
+
+          // ── Path 1: <input> / <textarea> — native setter + input event ──
+          if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') {
+            const proto = el.tagName === 'INPUT'
+              ? window.HTMLInputElement.prototype
+              : window.HTMLTextAreaElement.prototype;
+            const setter = Object.getOwnPropertyDescriptor(proto, 'value');
+            if (setter && setter.set) {
+              setter.set.call(el, clearFirst ? text : (el.value + text));
+            } else {
+              el.value = clearFirst ? text : (el.value + text);
+            }
+            el.dispatchEvent(new Event('input', { bubbles: true }));
+            el.dispatchEvent(new Event('change', { bubbles: true }));
+            // Verify
+            const actual = el.value || '';
+            return {
+              ok: true,
+              method: 'native-setter',
+              verified: actual.includes(text),
+              actualValue: actual.slice(0, 200),
+            };
+          }
+
+          // ── Path 2: contenteditable — focus + execCommand insertText ──
+          if (el.isContentEditable || el.getAttribute('contenteditable') === 'true' ||
+              el.getAttribute('role') === 'textbox') {
+            el.focus();
+            if (clearFirst) {
+              // Select all + delete
+              const range = document.createRange();
+              range.selectNodeContents(el);
+              const sel = window.getSelection();
+              sel.removeAllRanges();
+              sel.addRange(range);
+              document.execCommand('delete');
+            }
+            // Try execCommand insertText (works in Chrome/Edge)
+            const inserted = document.execCommand('insertText', false, text);
+            if (!inserted) {
+              // Fallback: dispatch InputEvent (React 16+ listens for 'beforeinput'/'input')
+              el.dispatchEvent(new InputEvent('beforeinput', {
+                data: text, inputType: 'insertText', bubbles: true, cancelable: true,
+              }));
+              el.dispatchEvent(new InputEvent('input', {
+                data: text, inputType: 'insertText', bubbles: true,
+              }));
+              // Last resort: textContent (may not trigger React state update)
+              if (!el.textContent || el.textContent.length === 0) {
+                el.textContent = text;
+                el.dispatchEvent(new Event('input', { bubbles: true }));
+              }
+            }
+            const actual = el.textContent || el.innerText || '';
+            return {
+              ok: true,
+              method: 'contenteditable',
+              verified: actual.includes(text),
+              actualValue: actual.slice(0, 200),
+            };
+          }
+
+          // ── Path 3: unknown element type — try native setter, fall back to textContent ──
+          el.focus();
+          if (clearFirst) el.textContent = '';
+          el.textContent = (clearFirst ? '' : (el.textContent || '')) + text;
+          el.dispatchEvent(new Event('input', { bubbles: true }));
+          const actual = el.textContent || '';
+          return {
+            ok: true,
+            method: 'textcontent-fallback',
+            verified: actual.includes(text),
+            actualValue: actual.slice(0, 200),
+          };
+        }, { selector: selector || args.selector, text: fillText, clearFirst });
+        logger.info(`[browser.act] reactFill selector="${selector}" method=${result.method} verified=${result.verified}`);
+        if (!result.ok) {
+          return { ok: false, action, sessionId, error: result.error, executionTime: Date.now() - start };
+        }
+        return {
+          ok: true, action, sessionId,
+          result: result.actualValue,
+          verified: result.verified,
+          method: result.method,
+          executionTime: Date.now() - start,
+        };
+      } catch (fillErr) {
+        logger.warn(`[browser.act] reactFill failed: ${fillErr.message}`);
+        return _engineActionFailure(action, sessionId, `reactFill error: ${fillErr.message}`, { executionTime: Date.now() - start });
+      }
+    }
+
+    // ── clickByText ──────────────────────────────────────────────────────────
+    // Click an element by its visible text content. Bypasses snapshot-ref
+    // resolution — queries the DOM directly. Useful for buttons whose text
+    // is stable ("Post", "Send", "Submit") even when CSS classes/refs change.
+    //
+    // Args: { text, tag?, exact?, shadow?, scope? }
+    //   text   — visible text to match (case-insensitive substring by default)
+    //   tag    — optional tag filter (e.g. 'button', 'a', 'div')
+    //   exact  — if true, require exact text match (default false)
+    //   shadow — if true, search shadow DOM roots too (default false)
+    //   scope  — optional CSS selector to limit search to a container (e.g. modal)
+    case 'clickByText': {
+      const targetText = (text || '').trim();
+      const tagFilter = args.tag || args.tagName || null;
+      const exact = args.exact === true;
+      const searchShadow = args.shadow === true;
+      const scopeSelector = args.scope || null;
+      if (!targetText) {
+        return { ok: false, action, sessionId, error: 'clickByText: text is required', executionTime: Date.now() - start };
+      }
+      const _ePage = engine.getPage(sessionId);
+      if (!_ePage) {
+        return _engineActionFailure(action, sessionId,
+          `clickByText requires an engine-owned session (got none for ${sessionId})`,
+          { executionTime: Date.now() - start });
+      }
+      try {
+        const result = await _ePage.evaluate(({ text, tag, exact, shadow, scope }) => {
+          const lower = text.toLowerCase();
+          // Build candidate list: tag filter + visible elements
+          const candidates = [];
+          const baseSelector = tag ? tag.toLowerCase() : 'button, a, [role="button"], [role="link"], input[type="submit"], input[type="button"], div, span';
+          const root = scope ? document.querySelector(scope) : document;
+          if (!root) return { ok: false, error: `Scope element not found: ${scope}` };
+          const els = Array.from(root.querySelectorAll(baseSelector));
+          for (const el of els) {
+            // Skip hidden / display:none
+            const rect = el.getBoundingClientRect();
+            if (rect.width === 0 && rect.height === 0) continue;
+            const style = window.getComputedStyle(el);
+            if (style.display === 'none' || style.visibility === 'hidden') continue;
+            const elText = (el.innerText || el.textContent || '').trim();
+            if (!elText) continue;
+            const isExact = elText.toLowerCase() === lower;
+            const isSub = elText.toLowerCase().includes(lower);
+            if (exact ? isExact : isSub) candidates.push({ el, text: elText, len: elText.length, isExact });
+          }
+          // Search shadow DOM if requested
+          if (shadow && candidates.length === 0) {
+            for (const host of document.querySelectorAll('*')) {
+              if (host.shadowRoot) {
+                const shadowEls = Array.from(host.shadowRoot.querySelectorAll(baseSelector));
+                for (const el of shadowEls) {
+                  const elText = (el.innerText || el.textContent || '').trim();
+                  if (!elText) continue;
+                  const isExact = elText.toLowerCase() === lower;
+                  const isSub = elText.toLowerCase().includes(lower);
+                  if (exact ? isExact : isSub) candidates.push({ el, text: elText, len: elText.length, isExact });
+                }
+              }
+            }
+          }
+          if (candidates.length === 0) return { ok: false, error: `No visible element with text "${text}"` };
+          // Sort: exact match first, then button/submit, then shortest length
+          candidates.sort((a, b) => {
+            if (a.isExact && !b.isExact) return -1;
+            if (!a.isExact && b.isExact) return 1;
+            const aIsButton = a.el.tagName === 'BUTTON' || a.el.getAttribute('role') === 'button' || (a.el.tagName === 'INPUT' && (a.el.type === 'submit' || a.el.type === 'button'));
+            const bIsButton = b.el.tagName === 'BUTTON' || b.el.getAttribute('role') === 'button' || (b.el.tagName === 'INPUT' && (b.el.type === 'submit' || b.el.type === 'button'));
+            if (aIsButton && !bIsButton) return -1;
+            if (!aIsButton && bIsButton) return 1;
+            return a.len - b.len;
+          });
+          const target = candidates[0].el;
+          target.scrollIntoView({ block: 'center', behavior: 'instant' });
+          target.click();
+          return { ok: true, clickedText: candidates[0].text, tag: target.tagName, matchCount: candidates.length };
+        }, { text: targetText, tag: tagFilter, exact, shadow: searchShadow, scope: scopeSelector });
+        if (!result.ok) {
+          logger.warn(`[browser.act] clickByText "${targetText}" failed: ${result.error}`);
+          return { ok: false, action, sessionId, error: result.error, executionTime: Date.now() - start };
+        }
+        logger.info(`[browser.act] clickByText "${targetText}" -> clicked <${result.tag}> "${result.clickedText}" (${result.matchCount} matches)`);
+        return {
+          ok: true, action, sessionId,
+          result: `Clicked <${result.tag}> "${result.clickedText}"`,
+          clickedText: result.clickedText,
+          matchCount: result.matchCount,
+          executionTime: Date.now() - start,
+        };
+      } catch (clickErr) {
+        logger.warn(`[browser.act] clickByText failed: ${clickErr.message}`);
+        return _engineActionFailure(action, sessionId, `clickByText error: ${clickErr.message}`, { executionTime: Date.now() - start });
+      }
+    }
+
+    // ── clickBySelector ──────────────────────────────────────────────────────
+    // Click an element by a direct CSS selector. Bypasses snapshot-ref
+    // resolution. Use when a stable CSS selector is known (e.g. from a
+    // playbook or from inspecting the page). More reliable than ref-based
+    // click for elements inside modals/overlays where refs go stale.
+    //
+    // Args: { selector, force?, waitForVisible? }
+    //   selector       — CSS selector for the target element
+    //   force          — if true, bypass actionability checks (default false)
+    //   waitForVisible — if true, wait for element to be visible before clicking (default true)
+    case 'clickBySelector': {
+      const cssSelector = selector || args.selector;
+      if (!cssSelector) {
+        return { ok: false, action, sessionId, error: 'clickBySelector: selector is required', executionTime: Date.now() - start };
+      }
+      const forceClick = args.force === true;
+      const waitForVisible = args.waitForVisible !== false; // default true
+      const _ePage = engine.getPage(sessionId);
+      if (!_ePage) {
+        return _engineActionFailure(action, sessionId,
+          `clickBySelector requires an engine-owned session (got none for ${sessionId})`,
+          { executionTime: Date.now() - start });
+      }
+      try {
+        const clickTimeout = Math.min(timeoutMs, 15000);
+        if (waitForVisible) {
+          await _ePage.waitForSelector(cssSelector, { state: 'visible', timeout: clickTimeout });
+        }
+        await _ePage.click(cssSelector, { timeout: clickTimeout, force: forceClick });
+        logger.info(`[browser.act] clickBySelector "${cssSelector}" ok${forceClick ? ' (force)' : ''}`);
+        return {
+          ok: true, action, sessionId,
+          result: `Clicked selector "${cssSelector}"`,
+          executionTime: Date.now() - start,
+        };
+      } catch (clickErr) {
+        // Fallback: direct DOM click via evaluate (bypasses Playwright actionability)
+        logger.info(`[browser.act] clickBySelector Playwright click failed: ${clickErr.message} — trying eval click`);
+        try {
+          const evalResult = await _ePage.evaluate((sel) => {
+            const el = document.querySelector(sel);
+            if (!el) return { ok: false, error: `Element not found: ${sel}` };
+            el.scrollIntoView({ block: 'center', behavior: 'instant' });
+            el.click();
+            return { ok: true, tag: el.tagName };
+          }, cssSelector);
+          if (evalResult.ok) {
+            logger.info(`[browser.act] clickBySelector eval-click "${cssSelector}" ok (<${evalResult.tag}>)`);
+            return {
+              ok: true, action, sessionId,
+              result: `Clicked selector "${cssSelector}" (eval)`,
+              method: 'eval-click',
+              executionTime: Date.now() - start,
+            };
+          }
+          return { ok: false, action, sessionId, error: evalResult.error, executionTime: Date.now() - start };
+        } catch (evalErr) {
+          logger.warn(`[browser.act] clickBySelector eval-click failed: ${evalErr.message}`);
+          return _engineActionFailure(action, sessionId, `clickBySelector error: ${clickErr.message}`, { executionTime: Date.now() - start });
+        }
+      }
     }
 
     // ── Hover ────────────────────────────────────────────────────────────────
@@ -3162,7 +3790,18 @@ async function browserAct(args) {
         const refMap = _engineSnapshots.get(sessionId)?.refMap || new Map();
         const _lowConfRefs = _engineSnapshots.get(sessionId)?.lowConfidenceRefs || false;
 
-        if (cleanRef && refMap && !_lowConfRefs) {
+        // ── DOM scanner ref (tdN): hover via [data-td-ref] locator ──
+        if (cleanRef && _isTdRef(cleanRef) && refMap.has(cleanRef)) {
+          try {
+            await _ePage.locator(`[data-td-ref="${cleanRef}"]`).hover({ timeout: Math.min(timeoutMs, 15000) });
+            logger.info(`[browser.act] hover (engine) tdRef=${cleanRef} ok`);
+            return { ok: true, action, sessionId, executionTime: Date.now() - start };
+          } catch (tdHoverErr) {
+            logger.warn(`[browser.act] hover (engine) tdRef=${cleanRef} failed: ${tdHoverErr.message} — falling through`);
+          }
+        }
+
+        if (cleanRef && refMap && !_lowConfRefs && !_isTdRef(cleanRef)) {
           const entry = refMap.get(cleanRef);
           if (entry) {
             try {
@@ -3201,7 +3840,18 @@ async function browserAct(args) {
         const refMap = _engineSnapshots.get(sessionId)?.refMap || new Map();
         const _lowConfRefs = _engineSnapshots.get(sessionId)?.lowConfidenceRefs || false;
 
-        if (cleanRef && refMap && !_lowConfRefs) {
+        // ── DOM scanner ref (tdN): select via [data-td-ref] locator ──
+        if (cleanRef && _isTdRef(cleanRef) && refMap.has(cleanRef)) {
+          try {
+            await _ePage.locator(`[data-td-ref="${cleanRef}"]`).selectOption(value || '', { timeout: Math.min(timeoutMs, 15000) });
+            logger.info(`[browser.act] select (engine) tdRef=${cleanRef} ok`);
+            return { ok: true, action, sessionId, executionTime: Date.now() - start };
+          } catch (tdSelectErr) {
+            logger.warn(`[browser.act] select (engine) tdRef=${cleanRef} failed: ${tdSelectErr.message} — falling through`);
+          }
+        }
+
+        if (cleanRef && refMap && !_lowConfRefs && !_isTdRef(cleanRef)) {
           const entry = refMap.get(cleanRef);
           if (entry) {
             try {
@@ -3240,7 +3890,18 @@ async function browserAct(args) {
         const refMap = _engineSnapshots.get(sessionId)?.refMap || new Map();
         const _lowConfRefs = _engineSnapshots.get(sessionId)?.lowConfidenceRefs || false;
 
-        if (cleanRef && refMap && !_lowConfRefs) {
+        // ── DOM scanner ref (tdN): check via [data-td-ref] locator ──
+        if (cleanRef && _isTdRef(cleanRef) && refMap.has(cleanRef)) {
+          try {
+            await _ePage.locator(`[data-td-ref="${cleanRef}"]`).check({ timeout: Math.min(timeoutMs, 15000) });
+            logger.info(`[browser.act] check (engine) tdRef=${cleanRef} ok`);
+            return { ok: true, action, sessionId, executionTime: Date.now() - start };
+          } catch (tdCheckErr) {
+            logger.warn(`[browser.act] check (engine) tdRef=${cleanRef} failed: ${tdCheckErr.message} — falling through`);
+          }
+        }
+
+        if (cleanRef && refMap && !_lowConfRefs && !_isTdRef(cleanRef)) {
           const entry = refMap.get(cleanRef);
           if (entry) {
             try {
@@ -3745,8 +4406,20 @@ async function browserAct(args) {
             lastFilledTarget.delete(sessionId);
           }
 
-          await _ePage.keyboard.press(pressKey);
-          logger.info(`[browser.act] press ${pressKey} (engine) ok`);
+          // ── Normalize LLM-style key names to Playwright key names ──────────
+          // LLMs often generate "Ctrl" instead of "Control", "Cmd" instead of "Meta",
+          // "Option" instead of "Alt", "Esc" instead of "Escape". Normalize each
+          // +-separated segment before passing to _ePage.keyboard.press().
+          const _KEY_NORMALIZE_MAP = { 'ctrl': 'Control', 'cmd': 'Meta', 'command': 'Meta', 'option': 'Alt', 'opt': 'Alt', 'esc': 'Escape', 'return': 'Enter', 'del': 'Delete', 'ins': 'Insert', 'pgup': 'PageUp', 'pgdn': 'PageDown', 'home': 'Home', 'end': 'End', 'space': 'Space' };
+          const _normalizedKey = pressKey.split('+').map(seg => {
+            const _lower = seg.trim().toLowerCase();
+            return _KEY_NORMALIZE_MAP[_lower] || seg.trim();
+          }).join('+');
+          if (_normalizedKey !== pressKey) {
+            logger.info(`[browser.act] press: normalized "${pressKey}" → "${_normalizedKey}"`);
+          }
+          await _ePage.keyboard.press(_normalizedKey);
+          logger.info(`[browser.act] press ${_normalizedKey} (engine) ok`);
 
           // For Enter: wait for potential navigation
           if (/^(Enter|Return)$/i.test(pressKey)) {
@@ -4192,7 +4865,7 @@ If no videos found, return []. Do not explain, only output the JSON array.`;
       if (_ePage) {
         try {
           const pageText = await _ePage.evaluate(
-            '(function(){var b=document.body;return b?(b.innerText||b.textContent||"").slice(0,100000):"";})()'
+            '(function(){var b=document.body;var t=document.title||"";var text=b?(b.innerText||b.textContent||"").slice(0,100000):"";return t?"[Page Title: "+t+"]\\n"+text:text;})()'
           );
           if (pageText.length < 200) {
             logger.info(`[browser.act] getPageText (engine): short content (${pageText.length} chars)`);
@@ -4211,7 +4884,7 @@ If no videos found, return []. Do not explain, only output the JSON array.`;
       }
 
       // ── CLI fallback ──
-      const evalExpr = '(function(){var b=document.body;return b?(b.innerText||b.textContent||"").slice(0,100000):"";})()';
+      const evalExpr = '(function(){var b=document.body;var t=document.title||"";var text=b?(b.innerText||b.textContent||"").slice(0,100000):"";return t?"[Page Title: "+t+"]\\n"+text:text;})()';
       const res = await cliRun([...S, 'eval', evalExpr], Math.min(timeoutMs, 20000));
       const rawOut = (res.stdout || '').trim();
       const resultMatch = rawOut.match(/^([\s\S]*?)(?=###\s|$)/i);
@@ -4403,14 +5076,42 @@ If no videos found, return []. Do not explain, only output the JSON array.`;
         await new Promise(r => setTimeout(r, 1500));
         return { ok: true, action, sessionId, result: 'body', executionTime: Date.now() - start };
       }
-      // ── Engine path: page.waitForSelector ──
+      // ── Engine path: page.waitForSelector with visible-element fallback ──
       const _ePage = engine.getPage(sessionId);
       if (_ePage) {
         try {
-          await _ePage.waitForSelector(selector, { timeout: Math.min(timeoutMs, 30000) });
+          await _ePage.waitForSelector(selector, { timeout: Math.min(timeoutMs, 30000), state: 'visible' });
           return { ok: true, action, sessionId, result: selector, executionTime: Date.now() - start };
         } catch (waitErr) {
-          logger.warn(`[browser.act] waitForSelector (engine) failed: ${waitErr.message} — falling back to CLI`);
+          // Playwright's waitForSelector picks the FIRST matching element and waits
+          // for it to become visible. When multiple elements match (e.g. LinkedIn has
+          // hidden [role="dialog"] video.js modals), it may wait on a permanently-hidden
+          // element. Fall back to a custom poll that checks if ANY matching element is visible.
+          logger.warn(`[browser.act] waitForSelector (engine) failed: ${waitErr.message.slice(0, 120)} — trying visible-element poll`);
+          const _pollDeadline = Date.now() + Math.min(timeoutMs, 10000);
+          while (Date.now() < _pollDeadline) {
+            try {
+              const _visibleMatch = await _ePage.evaluate((sel) => {
+                const els = document.querySelectorAll(sel);
+                for (const el of els) {
+                  if (el.getAttribute('aria-hidden') === 'true') continue;
+                  if (el.classList?.contains('vjs-hidden') || el.classList?.contains('hidden')) continue;
+                  const rect = el.getBoundingClientRect();
+                  if (rect.width === 0 && rect.height === 0) continue;
+                  const style = window.getComputedStyle(el);
+                  if (style.display === 'none' || style.visibility === 'hidden') continue;
+                  return { found: true, tag: el.tagName, text: (el.innerText || '').slice(0, 80) };
+                }
+                return { found: false };
+              }, selector);
+              if (_visibleMatch?.found) {
+                logger.info(`[browser.act] waitForSelector visible-poll found <${_visibleMatch.tag}> "${_visibleMatch.text}"`);
+                return { ok: true, action, sessionId, result: selector, executionTime: Date.now() - start };
+              }
+            } catch (_) {}
+            await new Promise(r => setTimeout(r, 1000));
+          }
+          logger.warn(`[browser.act] waitForSelector visible-poll also failed — falling back to CLI`);
         }
       }
       // ── CLI fallback: poll snapshot until ref matching selector appears ──

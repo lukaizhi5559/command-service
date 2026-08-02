@@ -149,6 +149,7 @@ const KNOWN_CLI_MAP = {
   cohere:      { cli: null, method: null, pkg: null, tokenCmd: null, isApiKey: true,  apiKeyUrl: 'https://dashboard.cohere.com/api-keys',              apiKeyEnvVar: 'COHERE_API_KEY' },
   huggingface: { cli: null, method: null, pkg: null, tokenCmd: null, isApiKey: true,  apiKeyUrl: 'https://huggingface.co/settings/tokens',             apiKeyEnvVar: 'HF_TOKEN' },
   google:      { cli: 'gcloud',      method: 'brew', pkg: 'google-cloud-sdk',             tokenCmd: ['auth', 'print-access-token'] },
+  gcalcli:     { cli: 'gcalcli',     method: 'pip',  pkg: 'gcalcli',                       tokenCmd: ['agenda'], isOAuth: true, _keywords: ['calendar', 'google calendar', 'gcal'] },
 };
 
 // ---------------------------------------------------------------------------
@@ -3240,6 +3241,70 @@ const CRED_FILE_PATTERNS = [
   ]},
 ];
 
+async function _checkCredentialExpiry(filePath, cliName) {
+  let raw;
+  try {
+    raw = fs.readFileSync(filePath, 'utf8');
+  } catch (_) {
+    return { expired: null };
+  }
+
+  // ── Try JSON parse ──
+  try {
+    const data = JSON.parse(raw);
+    const now = Date.now();
+    // Check common expiry field names
+    const expiryFields = ['expiry', 'expires_at', 'exp', 'token_expiry', 'expires', 'expire_time'];
+    for (const field of expiryFields) {
+      if (data[field] != null) {
+        const expiryVal = typeof data[field] === 'number' ? data[field] * 1000 : Date.parse(data[field]);
+        if (!isNaN(expiryVal)) {
+          const expired = expiryVal < now;
+          logger.info(`[cli.agent] _checkCredentialExpiry: ${cliName} JSON field '${field}' → ${expired ? 'EXPIRED' : 'VALID'}`);
+          return { expired };
+        }
+      }
+    }
+    // JSON parsed but no expiry field found — can't determine
+    logger.debug(`[cli.agent] _checkCredentialExpiry: ${cliName} JSON parsed but no expiry field found`);
+    return { expired: null };
+  } catch (_) {
+    // Not JSON — continue to pickle check
+  }
+
+  // ── Try pickle (Python-based CLIs like gcalcli) ──
+  try {
+    const script = `import pickle,sys
+try:
+    with open('${filePath.replace(/'/g, "'\\''")}', 'rb') as f:
+        c = pickle.load(f)
+    expired = getattr(c, 'expired', None)
+    if expired is None:
+        print('UNKNOWN')
+    elif expired:
+        print('EXPIRED')
+    else:
+        print('VALID')
+except Exception:
+    print('UNKNOWN')
+`;
+    const r = await spawnCapture('python3', ['-c', script], { timeoutMs: 5000, rejectOnNonZeroExit: false });
+    const out = r.stdout.trim().toUpperCase();
+    if (out === 'EXPIRED') {
+      logger.info(`[cli.agent] _checkCredentialExpiry: ${cliName} pickle check → EXPIRED`);
+      return { expired: true };
+    } else if (out === 'VALID') {
+      logger.info(`[cli.agent] _checkCredentialExpiry: ${cliName} pickle check → VALID`);
+      return { expired: false };
+    }
+    logger.debug(`[cli.agent] _checkCredentialExpiry: ${cliName} pickle check → UNKNOWN (${out || r.stderr.slice(0, 100)})`);
+    return { expired: null };
+  } catch (_) {
+    logger.debug(`[cli.agent] _checkCredentialExpiry: ${cliName} pickle check failed (python3 not available?)`);
+    return { expired: null };
+  }
+}
+
 async function checkCredentialFiles(cliName) {
   for (const pattern of CRED_FILE_PATTERNS) {
     if (pattern.cli && pattern.cli !== cliName) continue;
@@ -3251,7 +3316,8 @@ async function checkCredentialFiles(cliName) {
           const stat = fs.statSync(resolved);
           if (stat.size > 0) {
             logger.info(`[cli.agent] checkCredentialFiles: ${cliName} credential file found at ${resolved} (${stat.size} bytes)`);
-            return { found: true, path: resolved, size: stat.size, mtime: stat.mtime };
+            const expiryCheck = await _checkCredentialExpiry(resolved, cliName);
+            return { found: true, path: resolved, size: stat.size, mtime: stat.mtime, ...expiryCheck };
           }
         }
       } catch (_) {}
@@ -3521,12 +3587,23 @@ async function actionPreflightCheck({ task, clis: explicitClis, agents: explicit
       ? await checkAuthStatus(binPath, _effectiveTokenCmd, 8000, serviceKey)
       : { authed: null, authStatus: 'no_auth_check', authUser: null };
 
+    // ── Post-verify credential expiry guard ──
+    // If verify says authenticated, check credential file for token expiry.
+    // This catches false positives where verify commands use cached data (e.g. gcalcli list).
+    if (authResult.authed === true || authResult.authStatus === 'authenticated') {
+      const credCheck = await checkCredentialFiles(cliName);
+      if (credCheck.found && credCheck.expired === true) {
+        logger.info(`[cli.agent] preflight_check: ${cliName} verify said authenticated but credential file shows expired token → overriding to token_expired`);
+        authResult = { authed: false, authStatus: 'token_expired', authUser: null };
+      }
+    }
+
     // ── Layer 4: Credential file check fallback ──
     // If auth status is still unknown, check for credential files on disk
     if (authResult.authStatus === 'unknown' || authResult.authStatus === 'no_auth_check') {
       const credCheck = await checkCredentialFiles(cliName);
       if (credCheck.found) {
-        authResult = { authed: true, authStatus: 'configured', authUser: null };
+        authResult = { authed: false, authStatus: 'configured_unverified', authUser: null };
       }
     }
 
@@ -3629,6 +3706,12 @@ async function actionPreflightCheck({ task, clis: explicitClis, agents: explicit
     }
     if (c.authStatus === 'configured') {
       return `${c.cli} (${c.service}): installed (${c.version}) — configured (credentials found) ✓`;
+    }
+    if (c.authStatus === 'configured_unverified') {
+      return `${c.cli} (${c.service}): installed (${c.version}) — credentials found but UNVERIFIED (token may be expired)`;
+    }
+    if (c.authStatus === 'token_expired') {
+      return `${c.cli} (${c.service}): installed (${c.version}) — TOKEN EXPIRED (re-authentication required)`;
     }
     return `${c.cli} (${c.service}): installed (${c.version}) — auth unknown`;
   });

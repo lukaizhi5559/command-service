@@ -536,7 +536,7 @@ const CDP_RECORDER_SCRIPT = `
 // Main training action — start CDP recording session
 // ---------------------------------------------------------------------------
 async function actionTrain(args) {
-  const { agentId } = args || {};
+  const { agentId, mode = 'fresh', task = null, startUrl: startUrlOverride = null, keepSession = false, browserSessionId = null } = args || {};
 
   if (!agentId) return { ok: false, error: 'agentId is required' };
   if (activeSessions.has(agentId)) return { ok: false, error: 'Training already in progress' };
@@ -582,12 +582,20 @@ async function actionTrain(args) {
   const startUrlMatch = descriptor.match(/^start_url:\s*(.+)$/m);
   if (!startUrlMatch) return { ok: false, error: 'Agent missing start_url' };
 
-  const startUrl = startUrlMatch[1].trim();
-  const hostname = new URL(startUrl).hostname.replace(/^www\./, '');
-  const sessionId = `${agentId}_train`;
+  const descriptorStartUrl = startUrlMatch[1].trim();
+  const hostname = new URL(descriptorStartUrl).hostname.replace(/^www\./, '');
+
+  // ── Train-from-current-page (mode='here') ──────────────────────────────────
+  // Attach the recorder to the live browser session from the failed run instead
+  // of navigating to the agent's start_url. The user demonstrates only the
+  // missing steps (e.g. type the update + click Post) on the page they're
+  // already on. Distillation prepends the deep-link navigate automatically.
+  const isHereMode = mode === 'here' && (browserSessionId || startUrlOverride);
+  const sessionId = isHereMode ? browserSessionId : `${agentId}_train`;
+  const effectiveStartUrl = isHereMode ? (startUrlOverride || descriptorStartUrl) : descriptorStartUrl;
 
   const session = {
-    agentId, hostname, startUrl, sessionId,
+    agentId, hostname, startUrl: effectiveStartUrl, sessionId,
     rawEvents: [],
     startTime: Date.now(),
     pollInterval: null,
@@ -595,40 +603,67 @@ async function actionTrain(args) {
     injectedTabs: new Set(), // tab indices where recorder script has been injected
     httpServer: null,        // local HTTP event-push server
     httpPort: null,
+    // Failure-handoff context — used by distillation to convert the demo into a
+    // URL-first recipe keyed to the original task.
+    trainMode: mode,
+    trainTask: task,
+    isHereMode,
+    ownsSession: !isHereMode, // 'here' mode borrows the live session — don't close it on save/cancel
   };
   activeSessions.set(agentId, session);
 
-  logger.info(`[trainer.agent] Starting real-time training for ${agentId} at ${startUrl}`);
+  logger.info(`[trainer.agent] Starting real-time training for ${agentId} at ${effectiveStartUrl} (mode=${mode}${isHereMode ? ', attach to live session' : ''})`);
 
   try {
     const { browserAct } = require('./browser.act.cjs');
 
-    _postProgress(agentId, { type: 'training:start', hostname, startUrl });
+    _postProgress(agentId, { type: 'training:start', hostname, startUrl: effectiveStartUrl });
 
     // Start local HTTP server that receives events pushed via fetch() from the page
     await _startEventHttpServer(session);
     logger.info(`[trainer.agent] Event HTTP server ready on port ${session.httpPort}`);
 
-    // Navigate to start URL
-    await browserAct({ action: 'navigate', url: startUrl, sessionId, headed: true, timeoutMs: 30000 });
-    await browserAct({ action: 'waitForStableText', sessionId, headed: true, timeoutMs: 8000 }).catch(() => {});
+    if (isHereMode) {
+      // Attach recorder to the existing page — no navigation. The user is already
+      // on the failure page (e.g. LinkedIn composer). Just inject the recorder.
+      // Check the current URL to confirm we're attached.
+      let _currentUrl = effectiveStartUrl;
+      try {
+        const _urlRes = await browserAct({ action: 'evaluate', text: 'window.location.href', sessionId, headed: true, timeoutMs: 5000 }).catch(() => ({ ok: false }));
+        if (_urlRes?.ok && _urlRes.result) _currentUrl = String(_urlRes.result).replace(/^"|"$/g, '');
+      } catch (_) {}
+      logger.info(`[trainer.agent] train-from-here: attached to session ${sessionId} at ${_currentUrl}`);
+      await _injectRecorderScript(session, 0);
+      _startTabWatcher(session);
+      _postProgress(agentId, {
+        type: 'training:step-recorded',
+        stepType: 'url',
+        target: `${hostname} \u2192 (current page)`,
+        url: _currentUrl,
+        pageTitle: hostname,
+      });
+    } else {
+      // Navigate to start URL (fresh mode — existing behavior)
+      await browserAct({ action: 'navigate', url: effectiveStartUrl, sessionId, headed: true, timeoutMs: 30000 });
+      await browserAct({ action: 'waitForStableText', sessionId, headed: true, timeoutMs: 8000 }).catch(() => {});
 
-    // Inject recorder script on tab 0 and start tab-watcher loop
-    await _injectRecorderScript(session, 0);
-    _startTabWatcher(session);
+      // Inject recorder script on tab 0 and start tab-watcher loop
+      await _injectRecorderScript(session, 0);
+      _startTabWatcher(session);
 
-    logger.info(`[trainer.agent] HTTP-push recorder active on tab 0`);
+      logger.info(`[trainer.agent] HTTP-push recorder active on tab 0`);
 
-    // Emit initial step to UI
-    _postProgress(agentId, {
-      type: 'training:step-recorded',
-      stepType: 'url',
-      target: `${hostname} \u2192 Landing`,
-      url: startUrl,
-      pageTitle: hostname,
-    });
+      // Emit initial step to UI
+      _postProgress(agentId, {
+        type: 'training:step-recorded',
+        stepType: 'url',
+        target: `${hostname} \u2192 Landing`,
+        url: effectiveStartUrl,
+        pageTitle: hostname,
+      });
+    }
 
-    return { ok: true, agentId, message: 'Training recording started (HTTP push).' };
+    return { ok: true, agentId, message: `Training recording started (HTTP push, mode=${mode}).` };
   } catch (err) {
     logger.error(`[trainer.agent] Start failed: ${err.message}`);
     activeSessions.delete(agentId);
@@ -1630,8 +1665,13 @@ async function actionSaveTraining(args) {
         logger.info(`[trainer.agent] Event HTTP server closed after save (port ${session.httpPort})`);
       });
     }
-    const { browserAct } = require('./browser.act.cjs');
-    browserAct({ action: 'close', sessionId: session.sessionId }).catch(() => {});
+    // Only close the browser session if we own it. In 'here' mode (train-from-
+    // current-page) we borrowed the live session from the failed run — don't
+    // close it; the user may want to retry or it'll be cleaned up by the caller.
+    if (session.ownsSession !== false) {
+      const { browserAct } = require('./browser.act.cjs');
+      browserAct({ action: 'close', sessionId: session.sessionId }).catch(() => {});
+    }
     activeSessions.delete(agentId);
 
     logger.info(`[trainer.agent] Recipe saved: ${recipePath}`);
@@ -1687,18 +1727,21 @@ async function _buildRecipe(session, skillName) {
 AGENT: ${agentId}
 START URL: ${startUrl}
 SKILL NAME: ${skillName}
+${session.trainTask ? `ORIGINAL TASK: ${session.trainTask}` : ''}
 
 RAW EVENTS (in order):
 ${eventSummary}
 
 Create a MINIMAL waypoint recipe. Rules:
-1. Merge consecutive clicks that lead to the same page into a single navigate waypoint
-2. Remove noise (duplicate navigations, insignificant clicks)
-3. Each waypoint should represent a meaningful navigation step
-4. The LAST waypoint is the TARGET — where the user wants the AI to start working
-5. Include the primary CSS selector AND alternative selectors for each click waypoint
-6. Include URL checkpoints for navigation waypoints
-7. EXTRACT waypoints capture data from the page - preserve them for WALT tool returns
+1. URL-FIRST: If a click has an href that is a full http(s) URL and opens a form/composer, replace the click chain (navigate + opening clicks) with a SINGLE navigate waypoint to that href URL. This makes the recipe deterministic — next run skips the brittle click selectors entirely.
+2. Merge consecutive clicks that lead to the same page into a single navigate waypoint
+3. Remove noise (duplicate navigations, insignificant clicks)
+4. Each waypoint should represent a meaningful navigation step
+5. The LAST waypoint is the TARGET — where the user wants the AI to start working
+6. Include the primary CSS selector AND alternative selectors for each click waypoint
+7. Include URL checkpoints for navigation waypoints
+8. EXTRACT waypoints capture data from the page - preserve them for WALT tool returns
+9. For fill waypoints that contain task-specific text (email body, post text, etc.), set value to "" (empty) — the runtime will fill from the task. Only keep static values (e.g. a fixed subject line).
 
 WAYPOINT TYPE CATALOG (use only what the workflow needs):
 - navigate: { step, type: "navigate", url, pageTitle?, checkpoint? }
@@ -1760,6 +1803,24 @@ Map each RAW EVENT to the appropriate waypoint type from the catalog. Output ONL
     recipe.agentId = agentId;
     recipe.startUrl = startUrl;
     recipe.created = recipe.created || new Date().toISOString();
+
+    // ── URL-first post-processing ──────────────────────────────────────────
+    // Convert any click waypoint with a full http(s) href that precedes a form
+    // step (fill/submit/press) into a navigate waypoint — deterministic deep-link
+    // instead of a brittle selector click.
+    if (Array.isArray(recipe.waypoints)) {
+      recipe.waypoints = recipe.waypoints.map((w, i) => {
+        if (w.type === 'click' && w.href && /^https?:\/\//i.test(w.href)) {
+          const _next = recipe.waypoints[i + 1];
+          if (_next && /fill|submit|press|check|select/i.test(_next.type)) {
+            logger.info(`[trainer.agent] _buildRecipe: URL-first — converting click with href ${w.href} to navigate`);
+            return { ...w, type: 'navigate', url: w.href, checkpoint: w.elementText || 'form page' };
+          }
+        }
+        return w;
+      });
+    }
+
     return recipe;
   } catch (e) {
     // Fallback: build a simple recipe from raw events
@@ -1879,9 +1940,11 @@ function actionCancelTraining(args) {
     });
   }
 
-  // Close browser session
-  const { browserAct } = require('./browser.act.cjs');
-  browserAct({ action: 'close', sessionId: session.sessionId }).catch(() => {});
+  // Close browser session — only if we own it (not borrowed in 'here' mode)
+  if (session.ownsSession !== false) {
+    const { browserAct } = require('./browser.act.cjs');
+    browserAct({ action: 'close', sessionId: session.sessionId }).catch(() => {});
+  }
 
   activeSessions.delete(agentId);
   _postProgress(agentId, { type: 'training:cancelled', message: 'Training cancelled' });
@@ -1904,13 +1967,15 @@ function actionListSkills(args) {
     try {
       const recipe = JSON.parse(fs.readFileSync(path.join(skillDir, f), 'utf8'));
       const autoGenerated = recipe?.autoGenerated === true;
+      const userConfirmed = recipe?.userConfirmed === true;
       return {
         name: recipe.name,
         target: recipe.targetDescription,
         waypoints: recipe.waypoints?.length || 0,
         created: recipe.created,
         autoGenerated,
-        origin: autoGenerated ? 'auto' : 'user',
+        userConfirmed,
+        origin: userConfirmed ? 'user' : (autoGenerated ? 'auto' : 'user'),
       };
     } catch { return null; }
   }).filter(Boolean);
@@ -1939,6 +2004,8 @@ function findMatchingRecipe(agentId, taskText, opts = {}) {
   const allowAutoGenerated = opts.allowAutoGenerated === true;
   const _isEligibleRecipe = (recipe) => {
     if (!recipe || typeof recipe !== 'object') return false;
+    // User-confirmed recipes (saved via saveSkillOffer) are always eligible
+    if (recipe.userConfirmed === true) return true;
     if (!allowAutoGenerated && recipe.autoGenerated === true) return false;
     return true;
   };
@@ -1988,26 +2055,31 @@ function findMatchingRecipe(agentId, taskText, opts = {}) {
 // ---------------------------------------------------------------------------
 // Auto-recipe: convert a successful playwright.agent transcript into a recipe
 // ---------------------------------------------------------------------------
-async function saveAutoRecipe(agentId, task, transcript, targetUrl, playbookContext) {
+async function saveAutoRecipe(agentId, task, transcript, targetUrl, playbookContext, skillNameOverride) {
   if (!agentId || !task || !Array.isArray(transcript) || transcript.length < 2) return null;
 
   const _agentIdClean = _skillDirId(agentId);
   const skillDir = path.join(SKILLS_DIR, _agentIdClean);
 
-  // Derive a skill name from the task — normalize to dot-separated
-  const _intentName = task.toLowerCase()
-    .replace(/[^a-z0-9\s]/g, '')
-    .trim()
-    .split(/\s+/)
-    .slice(0, 4)
-    .join('.');
-  const skillName = `${_agentIdClean}.${_intentName}`;
+  // Use the user-provided name (Phase 3 saveSkillOffer) or derive one from the task
+  const skillName = skillNameOverride || (() => {
+    const _intentName = task.toLowerCase()
+      .replace(/[^a-z0-9\s]/g, '')
+      .trim()
+      .split(/\s+/)
+      .slice(0, 4)
+      .join('.');
+    return `${_agentIdClean}.${_intentName}`;
+  })();
 
-  // Check if a recipe already exists for this task (fuzzy match)
-  const existing = findMatchingRecipe(_agentIdClean, task, { allowAutoGenerated: true });
-  if (existing) {
-    logger.info(`[trainer.agent] auto-recipe: recipe "${existing.name}" already exists for task — skipping`);
-    return null;
+  // Check if a recipe already exists for this task (fuzzy match) — skip when
+  // the user explicitly named it (they may want to overwrite)
+  if (!skillNameOverride) {
+    const existing = findMatchingRecipe(_agentIdClean, task, { allowAutoGenerated: true });
+    if (existing) {
+      logger.info(`[trainer.agent] auto-recipe: recipe "${existing.name}" already exists for task — skipping`);
+      return null;
+    }
   }
 
   // Build waypoints from transcript
@@ -2071,15 +2143,58 @@ async function saveAutoRecipe(agentId, task, transcript, targetUrl, playbookCont
     return null;
   }
 
+  // ── URL-first optimization ────────────────────────────────────────────────
+  // Collapse click chains that open a form/composer into a single navigate to
+  // the deep-link URL. If targetUrl (from URL-first discovery) is set and differs
+  // from the initial navigate, replace the prefix (navigate + opening clicks
+  // that just lead to the form page) with a single navigate to targetUrl.
+  // This makes the recipe deterministic — next run skips the click chain entirely.
+  let _urlFirstWaypoints = waypoints;
+  let _urlFirstStartUrl = transcript[0]?.action?.url || targetUrl || '';
+  if (targetUrl && targetUrl !== _urlFirstStartUrl) {
+    // Find the first fill/submit/press step — everything before it is just navigation
+    // to get to the form. Replace that prefix with a single navigate to targetUrl.
+    const _firstFormIdx = waypoints.findIndex(w => /fill|submit|press|check|select/i.test(w.type));
+    if (_firstFormIdx > 0) {
+      const _prefix = waypoints.slice(0, _firstFormIdx);
+      // Only collapse if the prefix is all navigate/click (no fill/submit)
+      const _isAllNav = _prefix.every(w => /navigate|click|scroll/i.test(w.type));
+      if (_isAllNav) {
+        _urlFirstWaypoints = [
+          { step: 1, type: 'navigate', url: targetUrl, checkpoint: 'form page' },
+          ...waypoints.slice(_firstFormIdx).map((w, i) => ({ ...w, step: i + 2 })),
+        ];
+        _urlFirstStartUrl = targetUrl;
+        logger.info(`[trainer.agent] auto-recipe: URL-first collapse — replaced ${_prefix.length} prefix step(s) with navigate to ${targetUrl}`);
+      }
+    }
+  }
+  // Also: if any click step has a full http(s) href and is followed by form steps,
+  // convert it to a navigate (deep-link) — avoids brittle selector clicks.
+  _urlFirstWaypoints = _urlFirstWaypoints.map((w, i) => {
+    if (w.type === 'click' && w.href && /^https?:\/\//i.test(w.href)) {
+      const _next = _urlFirstWaypoints[i + 1];
+      if (_next && /fill|submit|press|check|select/i.test(_next.type)) {
+        logger.info(`[trainer.agent] auto-recipe: URL-first — converting click with href ${w.href} to navigate`);
+        return { ...w, type: 'navigate', url: w.href, checkpoint: w.elementText || 'form page' };
+      }
+    }
+    return w;
+  });
+
   const recipe = {
     name: skillName,
     agentId: _agentIdClean,
-    startUrl: transcript[0]?.action?.url || targetUrl || '',
+    startUrl: _urlFirstStartUrl,
     targetUrl: targetUrl || '',
-    waypoints,
+    waypoints: _urlFirstWaypoints,
     targetDescription: task.slice(0, 200),
     created: new Date().toISOString(),
     autoGenerated: true,
+    // User-confirmed recipes (via saveSkillOffer) are always eligible for matching,
+    // even without the THINKDROP_ALLOW_AUTOGENERATED_RECIPES env var.
+    userConfirmed: !!skillNameOverride,
+    urlFirst: targetUrl && targetUrl !== _urlFirstStartUrl ? false : true, // true when we collapsed to the deep-link
   };
 
   // Save recipe file

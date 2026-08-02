@@ -118,8 +118,8 @@ async function _engineSnapshot(sessionId) {
   const page = engine.getPage(sessionId);
   if (!page) return null;
   try {
-    const { yaml, refMap } = await engine.buildRefTree(page);
-    return { ok: true, result: yaml, refMap };
+    const { yaml, refMap, activeElement, scannerUsed } = await engine.buildRefTree(page);
+    return { ok: true, result: yaml, refMap, activeElement, scannerUsed };
   } catch (e) {
     logger.debug(`[playwright.agent] _engineSnapshot failed: ${e.message}`);
     return null;
@@ -128,6 +128,101 @@ async function _engineSnapshot(sessionId) {
 
 async function _fastSnapshot(sessionId, headed, timeoutMs = 15000) {
   return browserAct({ action: 'snapshot', sessionId, headed, timeoutMs });
+}
+
+// ---------------------------------------------------------------------------
+// Hybrid scoped snapshot — DOM query confirms modal, then text filter on the
+// full-page ARIA snapshot (which HAS refs from buildRefTree) extracts only the
+// dialog section by tracking YAML indentation. Preserves refs (e24, e93) so
+// the click engine resolves them correctly. Replaces the old _scopedModalSnapshot
+// which used locator.ariaSnapshot() (no refs → LLM emitted CSS selectors).
+// Returns { ok, result, hasCompose } or { ok: false } if no modal/no interactive.
+// ---------------------------------------------------------------------------
+async function _filterSnapshotToModal(sessionId, fullSnapshot) {
+  if (!fullSnapshot) return { ok: false, error: 'no snapshot provided' };
+  const page = engine.getPage(sessionId);
+  if (!page) return { ok: false, error: 'no engine page' };
+
+  // ── Step 1: DOM query to confirm modal exists and check for compose element ──
+  let _modalInfo = null;
+  try {
+    _modalInfo = await page.evaluate(() => {
+      const modal = document.querySelector('[role="dialog"], #interop-outlet, .share-creation, [data-testid*="modal"], [data-testid*="share"]');
+      if (!modal) return null;
+      const hasCompose = !!modal.querySelector('[contenteditable], [role="textbox"], textarea');
+      const interactiveCount = modal.querySelectorAll('button, [role="button"], [contenteditable], [role="textbox"], textarea, input, select, a[href]').length;
+      return { hasCompose, interactiveCount };
+    });
+  } catch (err) {
+    logger.debug(`[playwright.agent] filterSnapshotToModal: DOM query failed: ${err.message}`);
+    return { ok: false, error: err.message };
+  }
+  if (!_modalInfo) return { ok: false, error: 'no modal/dialog found in DOM' };
+
+  // ── Step 2: Text filter on the full-page snapshot to extract the dialog section ──
+  // If the snapshot is from the DOM scanner (tdN refs, flat list), the scanner already
+  // filters by visibility and occlusion — elements behind the modal are flagged occluded.
+  // Skip indentation-based filtering and return the snapshot as-is.
+  if (/\[td\d+\]/.test(fullSnapshot)) {
+    logger.info(`[playwright.agent] filterSnapshotToModal: scanner format detected — skipping YAML indent filter (scanner handles visibility)`);
+    return { ok: true, result: fullSnapshot, hasCompose: _modalInfo.hasCompose };
+  }
+
+  // The ARIA snapshot is YAML-like with indentation. Find the LAST dialog/alertdialog
+  // line (topmost modal = highest z-index = last in DOM order), then include it + all
+  // lines with deeper indentation (children). Stop at same/shallower indentation.
+  const lines = fullSnapshot.split('\n');
+  let _dialogLineIdx = -1;
+  let _dialogIndent = -1;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i];
+    const _indentMatch = line.match(/^(\s*)-/);
+    if (!_indentMatch) continue;
+    const _rest = line.slice(_indentMatch[0].length).trimStart();
+    if (/^(dialog|alertdialog)\b/i.test(_rest)) {
+      _dialogLineIdx = i;
+      _dialogIndent = _indentMatch[1].length;
+      break;
+    }
+  }
+  if (_dialogLineIdx < 0) {
+    logger.info(`[playwright.agent] filterSnapshotToModal: modal in DOM but no dialog/alertdialog line in snapshot — using full snapshot`);
+    return { ok: false, error: 'dialog not found in snapshot text' };
+  }
+
+  // Collect the dialog line + all deeper-indented children
+  const _scopedLines = [];
+  for (let i = _dialogLineIdx; i < lines.length; i++) {
+    const line = lines[i];
+    if (i === _dialogLineIdx) {
+      _scopedLines.push(line);
+      continue;
+    }
+    const _indentMatch = line.match(/^(\s*)-/);
+    if (!_indentMatch) {
+      // Continuation lines (e.g. "  /url: ...") — include if we're still inside the dialog
+      if (line.trim() && _scopedLines.length > 0) _scopedLines.push(line);
+      continue;
+    }
+    const _indent = _indentMatch[1].length;
+    if (_indent > _dialogIndent) {
+      _scopedLines.push(line);
+    } else {
+      break; // same or shallower indent — we've exited the dialog
+    }
+  }
+
+  const _scopedText = _scopedLines.join('\n');
+  // Check if the scoped section has interactive elements with refs
+  const _hasInteractive = /\b(textbox|searchbox|combobox|input|textarea|button|link|checkbox|radio|menuitem|option|tab|switch|contenteditable)\b/i.test(_scopedText);
+  const _hasRefs = /\[e\d+\]/.test(_scopedText);
+  if (!_hasInteractive || !_hasRefs) {
+    logger.info(`[playwright.agent] filterSnapshotToModal: scoped section has no interactive elements or no refs — using full snapshot`);
+    return { ok: false, error: 'scoped section has no interactive refs' };
+  }
+
+  logger.info(`[playwright.agent] filterSnapshotToModal: ${_scopedText.length} chars, ${_scopedLines.length} lines, hasCompose=${_modalInfo.hasCompose}, interactive=${_modalInfo.interactiveCount} — refs preserved`);
+  return { ok: true, result: _scopedText, hasCompose: _modalInfo.hasCompose, scoped: true };
 }
 
 // ---------------------------------------------------------------------------
@@ -171,6 +266,11 @@ const BROWSER_ACTIONS_FULL = `Available actions:
   tab-list        {}                   — list all open tabs with their indices and URLs. Use to audit tabs.
   tab-select      { tabIndex }         — switch active focus to the tab at tabIndex
   tab-close       { tabIndex }         — close tab at tabIndex and free its resources. NEVER close tab 0.
+
+INJECTION ACTIONS (React-aware — PREFERRED for compose boxes, modals, React-controlled inputs):
+  reactFill       { selector, text, clearFirst? }  — set text on React inputs/textareas/contenteditable via native setter + event dispatch. selector = CSS selector (NOT ref). PREFERRED over fill/type for compose boxes.
+  clickByText     { text, tag?, exact? }            — click visible element by text (e.g. "Post", "Send"). PREFERRED over click for submit buttons — no ref dependency.
+  clickBySelector { selector, force? }              — click by CSS selector directly. Bypasses ref resolution. Use when stable CSS selector is known.
 
 PURPOSE FIELD GUIDE (for click action):
 When including a click step, ALWAYS specify the purpose to help the browser automation avoid clicking the wrong element:
@@ -227,13 +327,15 @@ const PLAN_SYSTEM_PROMPT = `You are a browser automation expert controlling a re
 HOW IT WORKS — read this carefully:
 Each step in your plan is executed as a browser action via the Playwright Node API engine:
   { "action": "navigate", "url": "https://..." }             →  engine page.goto(url)
-  { "action": "click", "selector": "e24" }                   →  engine getByRole + click
-  { "action": "fill", "selector": "e12", "text": "hello" }   →  engine getByRole + fill
+  { "action": "click", "selector": "td5" }                   →  engine [data-td-ref] + click (with occlusion check)
+  { "action": "fill", "selector": "td3", "text": "hello" }   →  engine [data-td-ref] + fill
   { "action": "run-code", "code": "async page => {...}" }     →  engine page.evaluate(code)
 
-The SNAPSHOT is a YAML-formatted ARIA accessibility tree. Refs like e12, e83 are stable element handles —
+The SNAPSHOT is a filtered list of real interactive DOM elements. Refs like td5, td12 are stable element handles tagged with data-td-ref attributes —
 use them directly in click/fill/hover/select. They are the most reliable selectors for DOM actions.
+If the snapshot shows refs like e12, e83 (ARIA fallback), those also work — use them the same way.
 For run-code + page.evaluate(), refs do NOT exist in the browser — use real CSS selectors (e.g. 'tr.zA', '.bog').
+If the snapshot includes an "# Active element" line with [primary-input], the page already has focus in an input field — you can type directly without clicking first.
 
 ⚠ FORBIDDEN inside page.evaluate() — Playwright pseudo-selectors CRASH native browser querySelector:
   NEVER use: :has-text("...")  :text("...")  :contains("...")  :visible  :enabled  :checked
@@ -273,7 +375,7 @@ ${STEP_FORMAT_CRITICAL}
 
 Rules:
 - PAGE ORIENTATION RULE: Before writing any task steps, assess the snapshot — ask "Is this page where I can accomplish the goal?" If blocked by an interstitial (onboarding, cookie wall, paywall, 404, setup screen, or anything that prevents completing the task), FIRST ask: "Is there a clickable element in this snapshot that moves me TOWARD the goal?" — e.g. 'Continue', 'Skip', 'Get started', 'Go to my workspace', 'Accept', 'Dismiss', 'Enter workspace'. If YES, your FIRST step MUST be a click on that element, immediately followed by { "action": "snapshot" }. Only use navigate as a last resort when no bypass element exists in the snapshot. STAY ON SERVICE: any navigate MUST stay within the same service domain — never navigate to Google or external sites.
-- Use element refs (e12, e83) from the snapshot for click/fill/hover — most reliable for DOM actions. Not valid inside page.evaluate().
+- Use element refs (td5, e12, etc.) from the snapshot for click/fill/hover — most reliable for DOM actions. Not valid inside page.evaluate(). If an element is marked [occluded], it is blocked by another element — try a different element or use force:true.
 - Autocomplete inputs (e.g. Gmail To:, CC:, BCC:): fill then press Enter to confirm the recipient as a chip. Do NOT use Tab — Tab moves focus without creating the chip.
 - Contenteditable areas: click first, then type (not fill).
 - CODE_EDITOR_RULE: When writing into a code editor (CodeMirror, Monaco, ACE, textareawrapper, or any editor where clicking places a cursor rather than selecting all), ALWAYS clear existing content first before typing. Preferred approach: use run-code with page.evaluate() to call the editor's JS API (e.g. editor.setValue(newHtml) for CodeMirror, monaco.editor.getModels()[0].setValue(content) for Monaco). If no JS API is available: click the editor → press Meta+a → press Delete → then type. NEVER type directly into a code editor without clearing first — the cursor position appends text rather than replacing.
@@ -345,7 +447,7 @@ Respond with EXACTLY ONE JSON object (no markdown fences, no explanation):
   "rightPage": true | false,
   "confidence": 0.0,
   "keyElements": [
-    { "ref": "e42", "role": "textbox", "label": "Primary input", "purpose": "where main content/prompt goes" }
+    { "ref": "td5", "role": "textbox", "label": "Primary input", "purpose": "where main content/prompt goes" }
   ],
   "expectedFlow": ["fill primary input", "select options", "click submit/generate", "wait for result"],
   "potentialBlockers": ["may require option selection", "may show confirmation dialog"],
@@ -421,6 +523,7 @@ You will receive:
 - COMPLETED_STEPS: steps already executed successfully
 - STALE_REMAINING_PLAN: remaining steps from original plan (refs are stale — do NOT reuse them)
 - FRESH_SNAPSHOT: current accessible DOM with new valid refs
+- CURRENT_PAGE_CONTENT: existing text content already on the page (if any)
 
 Your job: re-generate the remaining steps using ONLY refs from FRESH_SNAPSHOT.
 
@@ -436,7 +539,8 @@ Respond with EXACTLY ONE JSON object (no markdown fences, no explanation):
 
 Rules:
 - Preserve the original INTENT of each stale step — just use correct fresh refs
-- Use element refs (e12, e83) from FRESH_SNAPSHOT for click/fill/hover
+- Use element refs (td5, e12, etc.) from FRESH_SNAPSHOT for click/fill/hover
+- EXISTING CONTENT RULE: If CURRENT_PAGE_CONTENT shows that the goal's target content already exists on the page (e.g. title, list items, form fields), do NOT recreate or duplicate it. Only fix what is missing or incorrect. Never navigate to a new page or click "New" if the current page already has the content being created.
 - CHIP INPUT RULE (MANDATORY): For any To:, CC:, BCC:, recipient, tag, label, or assignee field that creates chips/tokens — the correct sequence is ALWAYS: fill → press Enter → snapshot → VERIFY chip appeared. NEVER use Tab to confirm (Tab moves focus without creating the chip). If chip not confirmed in snapshot, press Enter again. Never skip the verify snapshot step.
 - Contenteditable areas: click first, then type (not fill)
 - CREDENTIALS RULE: NEVER use placeholder text like 'your-email@gmail.com', 'user@example.com', '<email>', '<password>' in fill/type steps.
@@ -517,6 +621,25 @@ function stripJsonComments(s) {
 }
 
 // ---------------------------------------------------------------------------
+// Normalize smart/curly quotes in verify eval expressions.
+// Many rich-text editors (Notion, Google Docs, etc.) auto-convert straight
+// quotes (' ") to typographic quotes (' ' " ") as the user types. LLM-generated
+// verify evals embed the ORIGINAL straight-quote text as the expected substring,
+// so a literal document.body.innerText.includes("...") comparison falsely fails
+// for any content containing an apostrophe or quote. Rewrite the eval so the
+// PAGE TEXT side of the comparison is normalized back to straight quotes before
+// the substring check — the expected literal is left untouched since it already
+// came from the user's original (straight-quote) text.
+// ---------------------------------------------------------------------------
+function normalizeQuotesInEvalExpr(evalStr) {
+  if (!evalStr || typeof evalStr !== 'string') return evalStr;
+  const NORMALIZE_SUFFIX = `.replace(/[\\u2018\\u2019]/g,"'").replace(/[\\u201C\\u201D]/g,'"')`;
+  return evalStr
+    .replace(/document\.body\.innerText/g, `document.body.innerText${NORMALIZE_SUFFIX}`)
+    .replace(/document\.title/g, `document.title${NORMALIZE_SUFFIX}`);
+}
+
+// ---------------------------------------------------------------------------
 // Parse LLM JSON response — tolerant of markdown fences, prose wrappers, and
 // JS-style // comments that some models emit inside plan arrays.
 // ---------------------------------------------------------------------------
@@ -582,7 +705,7 @@ function extractInteractiveRefs(snapshotText) {
   // Also capture contenteditable divs (Gmail body, rich-text editors) whose ARIA role is
   // "generic" — they won't match INTERACTIVE but they DO have a ref and are fillable via type.
   const CONTENTEDITABLE = /\[contenteditable\]|contenteditable=["']?true/i;
-  const HAS_REF         = /\[?e\d+\]|\[ref=e\d+\]/;
+  const HAS_REF         = /\[?(?:e|td)\d+\]|\[ref=(?:e|td)\d+\]/;
   const lines = snapshotText.split('\n');
   const added = new Set(); // track all pushed lines to prevent any duplicate
   const out   = [];
@@ -618,7 +741,7 @@ function extractInteractiveRefs(snapshotText) {
 // ---------------------------------------------------------------------------
 function countRefs(snapshotText) {
   if (!snapshotText) return 0;
-  return (snapshotText.match(/\bref=e\d+\b|\[e\d+\]/g) || []).length;
+  return (snapshotText.match(/\bref=(?:e|td)\d+\b|\[(?:e|td)\d+\]/g) || []).length;
 }
 
 function isAboutBlankSnapshot(snapshotText) {
@@ -686,12 +809,12 @@ async function verifyExpectation(step, sessionId, headed, timeoutMs) {
         if (/^e\d+$/i.test((selector || '').trim())) {
           return { satisfied: true, reason: 'Aria ref selector — skipping element_gone querySelector check' };
         }
-        const goneResult = await browserAct({ 
-          action: 'evaluate', 
-          text: `!document.querySelector('${selector}')`, 
-          sessionId, 
-          headed, 
-          timeoutMs: Math.min(timeout, timeoutMs) 
+        const goneResult = await browserAct({
+          action: 'evaluate',
+          text: `!document.querySelector(${JSON.stringify(selector)})`,
+          sessionId,
+          headed,
+          timeoutMs: Math.min(timeout, timeoutMs)
         });
         return { 
           satisfied: goneResult.ok && goneResult.result === 'true', 
@@ -717,12 +840,12 @@ async function verifyExpectation(step, sessionId, headed, timeoutMs) {
         if (/^e\d+$/.test(selector)) {
           return { satisfied: true, reason: 'Aria ref selector — skipping text_present check' };
         }
-        const textResult = await browserAct({ 
-          action: 'evaluate', 
-          text: `document.body.innerText.includes('${selector.replace(/'/g, "\\'")}')`, 
-          sessionId, 
-          headed, 
-          timeoutMs: 3000 
+        const textResult = await browserAct({
+          action: 'evaluate',
+          text: `document.body.innerText.includes(${JSON.stringify(selector)})`,
+          sessionId,
+          headed,
+          timeoutMs: 3000
         });
         return { 
           satisfied: textResult.ok && textResult.result === 'true', 
@@ -736,6 +859,81 @@ async function verifyExpectation(step, sessionId, headed, timeoutMs) {
     return { satisfied: false, reason: `Expectation verification failed: ${error.message}` };
   } finally {
     logger.debug(`[playwright.agent] Expectation verification for ${type} took ${Date.now() - startTime}ms`);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Auto-verify submit-like clicks via state change detection (deterministic)
+// ---------------------------------------------------------------------------
+
+// Detect if a click step is a "submit-like" action that should be verified.
+// Uses the LLM-provided purpose field, selector text, and whether it follows
+// a fill/type step (the _hasFillOrType flag from the execution loop).
+function _isSubmitLikeClick(step, hasFillOrType) {
+  if (!step || step.action !== 'click') return false;
+  const _purpose = String(step.purpose || '').toLowerCase();
+  if (_purpose === 'submit') return true;
+  const _selHint = String(step.selector || step.ref || step['aria-label'] || '').toLowerCase();
+  if (/post|submit|send|tweet|publish|create|save|reply|share|confirm|apply|update|delete|remove/i.test(_selHint)) return true;
+  // If a fill/type preceded this click and the selector hints at an action button,
+  // treat it as submit-like. Don't trigger on ALL clicks after fill/type — only
+  // those whose selector contains action-like text.
+  if (hasFillOrType && /post|submit|send|tweet|publish|reply|share|confirm|apply/i.test(_selHint)) return true;
+  return false;
+}
+
+// Verify that a submit-like click caused an observable state change.
+// Uses page.waitForFunction (MutationObserver-based) — fires instantly when
+// state changes, timeout is the max wait (not the actual wait).
+// preClickState: { url, modalCount, bodyLen } captured BEFORE the click.
+// Returns { verified: boolean, reason: string }.
+async function _verifySubmitStateChange(sessionId, preClickState, timeoutMs = 3000) {
+  const page = engine.getPage(sessionId);
+  if (!page) return { verified: true, reason: 'No engine page — skipping verification' };
+
+  // If no pre-click state was captured, we can't verify — skip (don't false-positive)
+  if (!preClickState || (!preClickState.url && preClickState.modalCount === 0 && preClickState.bodyLen === 0)) {
+    return { verified: true, reason: 'No before-state captured — skipping verification' };
+  }
+
+  // Wait for state change using waitForFunction (event-based, not polling)
+  try {
+    const _before = {
+      url: preClickState.url || '',
+      modalCount: preClickState.modalCount || 0,
+      bodyLen: preClickState.bodyLen || 0,
+    };
+    const _changed = await page.waitForFunction((before) => {
+      const modalCount = document.querySelectorAll('[role="dialog"], #interop-outlet, .share-creation, [data-testid*="modal"], [data-testid*="share"]').length;
+      const url = window.location.href;
+      const bodyLen = (document.body?.innerText || '').length;
+      return url !== before.url                    // URL changed (navigation)
+        || modalCount < before.modalCount          // modal/dialog closed
+        || Math.abs(bodyLen - before.bodyLen) > 50; // content changed significantly
+    }, _before, { timeout: timeoutMs }).then(() => true).catch(() => false);
+
+    if (_changed) {
+      // Determine what changed for logging
+      const _afterState = await page.evaluate(() => ({
+        url: window.location.href,
+        modalCount: document.querySelectorAll('[role="dialog"], #interop-outlet, .share-creation, [data-testid*="modal"], [data-testid*="share"]').length,
+        bodyLen: (document.body?.innerText || '').length,
+      })).catch(() => null);
+      if (_afterState) {
+        const _urlChanged = _afterState.url !== _before.url;
+        const _modalClosed = _afterState.modalCount < _before.modalCount;
+        const _contentChanged = Math.abs(_afterState.bodyLen - _before.bodyLen) > 50;
+        const _reasons = [];
+        if (_urlChanged) _reasons.push('URL changed');
+        if (_modalClosed) _reasons.push('modal closed');
+        if (_contentChanged) _reasons.push('content changed');
+        return { verified: true, reason: _reasons.join(', ') || 'state changed' };
+      }
+      return { verified: true, reason: 'state changed' };
+    }
+    return { verified: false, reason: 'no observable state change within timeout — the button may be disabled, the form may have validation errors, or the wrong button was clicked' };
+  } catch (err) {
+    return { verified: false, reason: `verification error: ${err.message}` };
   }
 }
 
@@ -1057,9 +1255,9 @@ function validateSelector(selector) {
   if (!selector || typeof selector !== 'string') return { valid: false, reason: 'missing or non-string selector' };
   const s = selector.trim();
   if (!s) return { valid: false, reason: 'empty selector' };
-  // Reject button[ref=eN] — ref/CSS syntax confusion
-  if (/button\[ref=e\d+\]|\[ref=e\d+\]/i.test(s)) {
-    return { valid: false, reason: `malformed ref/CSS hybrid selector: "${s}" — refs should be bare (e.g. "e24"), not wrapped in CSS attribute selectors` };
+  // Reject button[ref=eN] or button[ref=tdN] — ref/CSS syntax confusion
+  if (/button\[ref=(?:e|td)\d+\]|\[ref=(?:e|td)\d+\]/i.test(s)) {
+    return { valid: false, reason: `malformed ref/CSS hybrid selector: "${s}" — refs should be bare (e.g. "e24" or "td5"), not wrapped in CSS attribute selectors` };
   }
   return { valid: true };
 }
@@ -1073,7 +1271,7 @@ function pruneSnapshot(snapshotText, maxRefs = 50) {
   const lines = snapshotText.split('\n');
   const INTERACTIVE = /\b(textbox|searchbox|combobox|input|textarea|button|link|checkbox|radio|menuitem|option|tab|treeitem|switch|dialog|alertdialog)\b/i;
   const CONTENTEDITABLE = /\[contenteditable\]|contenteditable=["']?true/i;
-  const HAS_REF = /\[?e\d+\]|\[ref=e\d+\]/;
+  const HAS_REF = /\[?(?:e|td)\d+\]|\[ref=(?:e|td)\d+\]/;
   const GENERIC = /\bgeneric\b/i;
   const added = new Set();
   const out = [];
@@ -1138,14 +1336,40 @@ async function pageProbe(sessionId, headed, timeoutMs = 5000) {
   const probeCode = `JSON.stringify({
     hasContentEditable: document.querySelector('[contenteditable]') !== null,
     contentEditableCount: document.querySelectorAll('[contenteditable]').length,
+    hasRoleTextbox: document.querySelector('[role="textbox"]') !== null,
+    roleTextboxCount: document.querySelectorAll('[role="textbox"]').length,
+    hasTextarea: document.querySelector('textarea') !== null,
+    textareaCount: document.querySelectorAll('textarea').length,
+    hasTextInput: document.querySelector('input[type="text"], input[type="search"], input[type="email"], input[type="url"], input[type="password"], input[type="number"]') !== null,
+    textInputCount: document.querySelectorAll('input[type="text"], input[type="search"], input[type="email"], input[type="url"], input[type="password"], input[type="number"]').length,
+    hasPlaceholder: document.querySelector('[placeholder]') !== null,
+    hasAriaPlaceholder: document.querySelector('[aria-placeholder]') !== null,
+    composeElementCount: document.querySelectorAll('[contenteditable], [role="textbox"], textarea, input[type="text"], input[type="search"]').length,
+    hasComposeInModal: document.querySelector('[role="dialog"] [contenteditable], [role="dialog"] [role="textbox"], [role="dialog"] textarea, [role="dialog"] input[type="text"]') !== null,
     activeElementEditable: document.activeElement?.isContentEditable || false,
     activeElementTag: document.activeElement?.tagName || null,
     activeElementRole: document.activeElement?.getAttribute('role') || null,
-    interactiveCount: document.querySelectorAll('button, input, select, textarea, a[href]').length,
+    activeElementIsInput: ['INPUT','TEXTAREA'].includes(document.activeElement?.tagName) || document.activeElement?.isContentEditable || ['textbox','searchbox','combobox'].includes(document.activeElement?.getAttribute('role')),
+    buttonCount: document.querySelectorAll('button, [role="button"]').length,
+    linkCount: document.querySelectorAll('a[href], [role="link"]').length,
+    tabCount: document.querySelectorAll('[role="tab"]').length,
+    checkboxCount: document.querySelectorAll('input[type="checkbox"], [role="checkbox"]').length,
+    radioCount: document.querySelectorAll('input[type="radio"], [role="radio"]').length,
+    switchCount: document.querySelectorAll('[role="switch"]').length,
+    selectCount: document.querySelectorAll('select, [role="combobox"], [role="listbox"]').length,
+    menuitemCount: document.querySelectorAll('[role="menuitem"], [role="menuitemcheckbox"], [role="menuitemradio"]').length,
+    optionCount: document.querySelectorAll('[role="option"]').length,
+    sliderCount: document.querySelectorAll('input[type="range"], [role="slider"]').length,
+    interactiveCount: document.querySelectorAll('button, input, select, textarea, a[href], [role="button"], [role="link"], [role="tab"], [role="menuitem"], [role="checkbox"], [role="radio"], [role="switch"], [role="combobox"], [role="searchbox"], [role="textbox"], [contenteditable], [onclick], [tabindex]:not([tabindex="-1"])').length,
     ariaGenericCount: document.querySelectorAll('[role="generic"], div:not([role])').length,
     hasCanvas: document.querySelector('canvas') !== null,
     bodyTextLength: document.body?.innerText?.length || 0,
-    hostname: window.location.hostname
+    hostname: window.location.hostname,
+    hasModalDialog: document.querySelector('[role="dialog"], [data-testid*="modal"], [data-testid*="share"], [aria-modal="true"]') !== null,
+    modalCount: document.querySelectorAll('[role="dialog"], [aria-modal="true"]').length,
+    hasDraggable: document.querySelector('[draggable="true"]') !== null,
+    hasTabindex: document.querySelector('[tabindex]:not([tabindex="-1"])') !== null,
+    hasContentEditableTrue: document.querySelector('[contenteditable="true"], [contenteditable="plaintext-only"]') !== null
   })`;
   try {
     const result = await browserAct({ action: 'evaluate', text: probeCode, sessionId, headed, timeoutMs });
@@ -1531,6 +1755,31 @@ async function ensureSeedScripts() {
   }
 }
 
+// ── Slash-command settle wait ──────────────────────────────────────────────
+// After pressing Enter to confirm a slash command (e.g. "/todo" in Notion),
+// the app unmounts the slash-menu popup and remounts a new contenteditable block.
+// If the next step types immediately, the first character can be dropped because
+// the new block isn't ready yet. This polls until activeElement is contenteditable
+// (meaning focus has returned to the editor) or times out as a safety net.
+async function _waitForSlashCommandSettled(sessionId, headed) {
+  const _SLASH_SETTLE_EVAL = 'document.activeElement && document.activeElement.isContentEditable';
+  const _POLL_INTERVAL = 50;
+  const _MAX_WAIT = 500;
+  try {
+    let _elapsed = 0;
+    while (_elapsed < _MAX_WAIT) {
+      const _r = await browserAct({ action: 'evaluate', text: _SLASH_SETTLE_EVAL, sessionId, headed, timeoutMs: 2000 });
+      if (_r.ok && (_r.result === true || _r.result === 'true')) {
+        logger.info(`[playwright.agent] slash-command settle: activeElement editable after ${_elapsed}ms`);
+        return;
+      }
+      await new Promise(r => setTimeout(r, _POLL_INTERVAL));
+      _elapsed += _POLL_INTERVAL;
+    }
+    logger.info(`[playwright.agent] slash-command settle: timeout after ${_MAX_WAIT}ms — proceeding anyway`);
+  } catch (_) { /* non-fatal */ }
+}
+
 // ---------------------------------------------------------------------------
 // Phase 2: Script-first executor — runs script steps deterministically
 // ---------------------------------------------------------------------------
@@ -1551,9 +1800,21 @@ async function executeScript(script, params, sessionId, headed, timeoutMs) {
     return result;
   }
 
+  let _awaitSlashSettle = false;
+
   for (let i = 0; i < steps.length; i++) {
     const step = steps[i];
     logger.info(`[playwright.agent] script step ${i + 1}/${steps.length}: ${JSON.stringify(step)}`);
+
+    // Detect slash-command pattern: type "/..." followed by press Enter
+    // After that Enter confirms the slash command, the app remounts a new block —
+    // we must wait for it to be ready before the next step types into it.
+    if (step.type && typeof step.type === 'string' && step.type.trim().startsWith('/')) {
+      const _nextStep = steps[i + 1];
+      if (_nextStep && _nextStep.press && String(_nextStep.press).toLowerCase() === 'enter') {
+        _awaitSlashSettle = true;
+      }
+    }
 
     // Handle for_each loops
     if (step.for_each) {
@@ -1602,16 +1863,22 @@ async function executeScript(script, params, sessionId, headed, timeoutMs) {
     if (!result.ok) {
       return { ok: false, error: `Script step ${i + 1} failed: ${result.error}`, transcript, stepIndex: i };
     }
+
+    // After a slash-command-confirming Enter, wait for the new block to be ready
+    if (_awaitSlashSettle && step.press && String(step.press).toLowerCase() === 'enter') {
+      _awaitSlashSettle = false;
+      await _waitForSlashCommandSettled(sessionId, headed);
+    }
   }
 
   // Run verify block if present
   if (yaml.verify) {
     for (const vStep of yaml.verify) {
       if (vStep.eval) {
-        const evalCode = substitute(vStep.eval);
+        const evalCode = normalizeQuotesInEvalExpr(substitute(vStep.eval));
         try {
           const vResult = await browserAct({ action: 'evaluate', text: evalCode, sessionId, headed, timeoutMs: 5000 });
-          if (!vResult.ok || vResult.result !== 'true') {
+          if (!vResult.ok || (vResult.result !== true && vResult.result !== 'true')) {
             logger.warn(`[playwright.agent] script verify failed: ${evalCode} → ${vResult.result}`);
             return { ok: false, error: `Verification failed: ${evalCode}`, transcript, verified: false };
           }
@@ -1700,6 +1967,20 @@ async function executeScriptStep(step, params, sessionId, headed, timeoutMs, sub
 }
 
 // ---------------------------------------------------------------------------
+// Shared, app-agnostic behavior patterns for keyboard-only interaction.
+// Named apps are deliberately excluded — these describe structural/behavioral
+// patterns common across many editors and chat UIs, so the LLM can apply them
+// to any service based on page context rather than a hardcoded per-app list.
+// ---------------------------------------------------------------------------
+const GENERIC_EDITOR_PATTERNS = `MARKDOWN-SHORTCUT LIST PATTERN:
+- Many rich-text editors auto-convert a markdown shortcut ("[] ", "# ", "- ", "1. ", "> ") typed at the START of an empty line into a formatted block (checkbox, heading, bullet, numbered, quote).
+- Once that block is created, pressing Enter typically continues the SAME block type automatically for the next line — do NOT repeat the shortcut prefix on subsequent items, it will appear as literal unconverted text instead of being interpreted.
+- Use the shortcut ONCE (for the first item only) if no explicit slash-command / toolbar action already created the block. If a slash-command equivalent (e.g. "/todo", "/checklist") was already used to create the block, never type the shortcut at all — just type item text and press Enter between items.
+
+CHAT-SUBMIT PATTERN:
+- Many chat-style inputs (AI assistants, messaging apps) submit the message on Enter and insert a newline on Shift+Enter (or vice versa depending on the app). Default to Enter to submit unless page context indicates otherwise.`;
+
+// ---------------------------------------------------------------------------
 // Phase 3: Tier 2.5 — Best-effort keyboard mode
 // LLM generates keyboard-only steps (type/press, no clicks/refs) from goal
 // ---------------------------------------------------------------------------
@@ -1717,10 +1998,9 @@ Respond with EXACTLY ONE JSON object (no markdown fences):
 Rules:
 - Use ONLY type and press steps — no clicks, no selectors, no refs
 - Assume focus is already in the right place (URL-first navigation handled targeting)
-- For Notion: type title, press Enter (moves to body), type "[] item" for todos, press Enter between items
-- For ChatGPT/Gemini: type the message, press Enter to send
 - Keep steps minimal — just the keyboard sequence needed
-- For markdown shortcuts: "[]" for todo checkbox, "# " for heading, "- " for bullet, "> " for quote`;
+
+${GENERIC_EDITOR_PATTERNS}`;
 
 async function bestEffortKeyboard(goal, pageType, sessionId, headed, timeoutMs) {
   try {
@@ -1787,11 +2067,10 @@ Respond with EXACTLY ONE JSON object (no markdown fences):
 Rules:
 - Use type/press for keyboard input — these go to whatever has focus
 - Use assert_focus ONLY when you need to verify focus before typing
-- For Notion: "[]" creates a todo checkbox, Enter after title moves to body, "/todo" creates a todo block
-- For ChatGPT: type message, press Enter to send
-- For Gemini: type message, press Enter to send
 - Verify should check page content (document.body.innerText.includes(...))
-- Keep steps minimal and deterministic`;
+- Keep steps minimal and deterministic
+
+${GENERIC_EDITOR_PATTERNS}`;
 
 async function syncScriptGeneration(goal, pageType, service, sessionId, headed, timeoutMs) {
   try {
@@ -2382,7 +2661,7 @@ async function verifyTierCompletion(goal, pageType, routingDecision, script, ses
     for (const vStep of script.script_yaml.verify) {
       if (vStep.eval) {
         try {
-          const vRes = await browserAct({ action: 'evaluate', text: vStep.eval, sessionId, headed, timeoutMs: 5000 });
+          const vRes = await browserAct({ action: 'evaluate', text: normalizeQuotesInEvalExpr(vStep.eval), sessionId, headed, timeoutMs: 5000 });
           const passed = vRes.ok && (vRes.result === 'true' || vRes.result === true);
           result.evalResults.push({ eval: vStep.eval, passed });
           if (!passed) {
@@ -2520,169 +2799,165 @@ async function verifyTierCompletion(goal, pageType, routingDecision, script, ses
 // Uses Playwright Node API directly for speed (2-5s vs 30-120s LLM path).
 // Returns a result object on success/failure, or null to fall through to LLM.
 // ---------------------------------------------------------------------------
-async function _scriptUrlFastPath(sessionId, text, goal, startTs, deadline) {
+// ---------------------------------------------------------------------------
+// OCR-based verification — uses screen-intelligence-service (screen.analyze)
+// and user-memory-service (getRecentOcr) to verify what's visible on screen.
+// Two-tier: getRecentOcr (free, may be stale) → screen.analyze (fresh, 2-5s).
+// ---------------------------------------------------------------------------
+async function _ocrVerify(expectText, typeTs) {
+  const _expectSnippet = expectText.slice(0, 30).toLowerCase();
+  const _composeIndicators = ['create a post', 'what do you want to talk about', 'start a post', 'write a post'];
+
+  // Tier 1: Quick check getRecentOcr — maybe monitor already captured Chrome with our text
+  try {
+    const memHost = process.env.MEMORY_SERVICE_HOST || '127.0.0.1';
+    const memPort = parseInt(process.env.MEMORY_SERVICE_PORT || '3001', 10);
+    const http = require('http');
+    const body = JSON.stringify({
+      version: 'mcp.v1', service: 'user-memory',
+      action: 'memory.getRecentOcr',
+      payload: { maxAgeSeconds: 15 },
+      context: { userId: 'local_user' }
+    });
+    const result = await new Promise((resolve) => {
+      const req = http.request({ hostname: memHost, port: memPort, path: '/memory.getRecentOcr',
+        method: 'POST', headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
+        timeout: 3000 }, res => { let raw = ''; res.on('data', c => raw += c); res.on('end', () => { try { resolve(JSON.parse(raw)); } catch (e) { resolve({}); } }); });
+      req.on('error', () => resolve({})); req.on('timeout', () => { req.destroy(); resolve({}); });
+      req.write(body); req.end();
+    });
+    const capture = result?.data?.capture || result?.result?.capture;
+    if (capture && capture.url && capture.url.includes('linkedin.com')) {
+      const capturedAtTs = new Date(capture.capturedAt).getTime();
+      const isFresh = capturedAtTs > typeTs;
+      const ocrText = (capture.text || '').toLowerCase();
+      const hasText = ocrText.includes(_expectSnippet);
+      const hasModal = _composeIndicators.some(ind => ocrText.includes(ind));
+      logger.info(`[playwright.agent] OCR verify (getRecentOcr): fresh=${isFresh} hasText=${hasText} hasModal=${hasModal} ocrLen=${ocrText.length} url=${capture.url}`);
+      if (isFresh && hasText) {
+        return { success: true, verified: true, hasText: true, hasModal, source: 'getRecentOcr' };
+      }
+    }
+  } catch (e) { /* non-fatal — fall through to screen.analyze */ }
+
+  // Tier 2: Fresh screen.analyze with overlay hidden
+  try {
+    const { hideOverlay, showOverlay } = require('./deprecated/overlayControl.cjs');
+    const SCREEN_HOST = process.env.SCREEN_SERVICE_HOST || '127.0.0.1';
+    const SCREEN_PORT = parseInt(process.env.SCREEN_INTEL_PORT || '3008', 10);
+    const http = require('http');
+    await hideOverlay();
+    await new Promise(r => setTimeout(r, 80)); // wait for OS to composite
+    try {
+      const body = JSON.stringify({});
+      const result = await new Promise((resolve, reject) => {
+        const req = http.request({ hostname: SCREEN_HOST, port: SCREEN_PORT, path: '/screen.analyze',
+          method: 'POST', headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
+          timeout: 15000 }, res => { let raw = ''; res.on('data', c => raw += c); res.on('end', () => { try { resolve(JSON.parse(raw)); } catch (e) { reject(e); } }); });
+        req.on('error', reject); req.on('timeout', () => { req.destroy(); reject(new Error('screen.analyze timeout')); });
+        req.write(body); req.end();
+      });
+      if (!result?.success) return { success: false, error: result?.error || 'screen.analyze failed' };
+      const text = (result.text || '').toLowerCase();
+      const hasText = text.includes(_expectSnippet);
+      const hasModal = _composeIndicators.some(ind => text.includes(ind));
+      logger.info(`[playwright.agent] OCR verify (screen.analyze): hasText=${hasText} hasModal=${hasModal} app=${result.appName} url=${result.url} conf=${result.confidence} textLen=${text.length}`);
+      return { success: true, verified: hasText, hasText, hasModal, source: 'screen.analyze' };
+    } finally {
+      await showOverlay();
+    }
+  } catch (e) {
+    logger.warn(`[playwright.agent] OCR verify (screen.analyze) failed: ${e.message}`);
+    return { success: false, error: e.message };
+  }
+}
+
+async function _scriptUrlFastPath(sessionId, text, goal, startTs, deadline, heartbeat) {
   const page = engine.getPage(sessionId);
   if (!page) return null;
 
   const transcript = [];
+  const MODAL_SEL = '[role="dialog"], #interop-outlet, .share-creation, [data-testid*="modal"], [data-testid*="share"]';
 
-  // Step 1: Find and focus the compose area (contenteditable or textarea)
-  let composeLocator = null;
-  try {
-    // Prefer [contenteditable] (LinkedIn, Twitter, Facebook compose areas)
-    const ceCount = await page.locator('[contenteditable="true"]').count();
-    if (ceCount > 0) {
-      composeLocator = page.locator('[contenteditable="true"]').first();
-    } else {
-      const taCount = await page.locator('textarea:visible').count();
-      if (taCount > 0) {
-        composeLocator = page.locator('textarea:visible').first();
-      }
-    }
-  } catch (e) {
-    logger.debug(`[playwright.agent] fast path: could not find compose element: ${e.message}`);
-    return null;
-  }
+  // ── OCR-based fast path ──
+  // Instead of polling for DOM compose elements (which fails because LinkedIn's
+  // SPA dismisses modals and uses non-standard selectors), we:
+  // 1. Wait 8s for the modal to load
+  // 2. Type text via keyboard.type() (deterministic — types into focused element)
+  // 3. Verify via OCR (getRecentOcr first, then screen.analyze with overlay hidden)
+  // 4. If verified → return _textEntered:true → fall through to turn-loop for submit
 
-  if (!composeLocator) {
-    logger.info(`[playwright.agent] fast path: no compose element found — falling back to LLM`);
-    return null;
-  }
+  logger.info(`[playwright.agent] fast path: waiting 8s for modal to load`);
+  await page.waitForTimeout(8000);
 
-  // Step 2: Click to focus, then type the text
-  try {
-    await composeLocator.click({ timeout: 5000 });
-    await page.waitForTimeout(300); // brief settle after focus
+  let _textVerified = false;
+  const MAX_TYPE_ATTEMPTS = 3;
 
-    // Clear any existing content first
-    await page.keyboard.press('Meta+a');
-    await page.keyboard.press('Backspace');
-
-    // Type the text
-    await page.keyboard.type(text, { delay: 10 });
-    transcript.push({ step: 1, action: { action: 'type', text: text.slice(0, 80) + '...' }, outcome: { ok: true }, thoughts: 'fast path: typed into compose area' });
-    logger.info(`[playwright.agent] fast path: typed ${text.length} chars into compose element`);
-  } catch (e) {
-    logger.warn(`[playwright.agent] fast path: type failed: ${e.message}`);
-    transcript.push({ step: 1, action: { action: 'type' }, outcome: { ok: false, error: e.message }, thoughts: 'fast path: type failed' });
-    return null;
-  }
-
-  // Step 3: Verify content was entered
-  try {
-    const entered = await composeLocator.evaluate(el => el.textContent || el.value || '');
-    if (!entered || entered.trim().length < 3) {
-      logger.warn(`[playwright.agent] fast path: content verification failed — compose area empty after typing`);
-      return null;
-    }
-    logger.info(`[playwright.agent] fast path: content verified (${entered.length} chars in compose element)`);
-  } catch (e) {
-    logger.debug(`[playwright.agent] fast path: content verification error (non-fatal): ${e.message}`);
-  }
-
-  // Step 4: Clear net log and click submit button
-  engine.clearNetLog(sessionId);
-  const _submitTs = Date.now();
-
-  let submitted = false;
-  try {
-    // Try common submit button patterns
-    const submitPatterns = [
-      { role: 'button', name: /post|publish|send|submit|share|tweet/i },
-    ];
-    for (const pattern of submitPatterns) {
-      try {
-        const btn = page.getByRole(pattern.role, { name: pattern.name });
-        const btnCount = await btn.count();
-        if (btnCount > 0) {
-          await btn.first().click({ timeout: 5000 });
-          submitted = true;
-          logger.info(`[playwright.agent] fast path: clicked submit button (role=${pattern.role}, name=${pattern.name})`);
-          break;
-        }
-      } catch (_) {}
-    }
-
-    if (!submitted) {
-      // Fallback: try CSS selectors for common submit buttons
-      const cssSelectors = [
-        'button[data-testid*="post"]',
-        'button[data-testid*="tweet"]',
-        'button[aria-label*="Post"]',
-        'button[aria-label*="Publish"]',
-        'button[type="submit"]',
-        'div[role="button"][aria-label*="Post"]',
-      ];
-      for (const sel of cssSelectors) {
-        try {
-          const el = page.locator(sel).first();
-          if (await el.count() > 0) {
-            await el.click({ timeout: 5000 });
-            submitted = true;
-            logger.info(`[playwright.agent] fast path: clicked submit via CSS selector: ${sel}`);
-            break;
-          }
-        } catch (_) {}
-      }
-    }
-  } catch (e) {
-    logger.warn(`[playwright.agent] fast path: submit click failed: ${e.message}`);
-  }
-
-  if (!submitted) {
-    logger.info(`[playwright.agent] fast path: could not find/click submit button — falling back to LLM`);
-    transcript.push({ step: 2, action: { action: 'click', purpose: 'submit' }, outcome: { ok: false, error: 'submit button not found' }, thoughts: 'fast path: no submit button' });
-    return null;
-  }
-
-  transcript.push({ step: 2, action: { action: 'click', purpose: 'submit' }, outcome: { ok: true }, thoughts: 'fast path: clicked submit' });
-
-  // Step 5: Wait for network response (2xx POST/PUT) — up to 5s
-  let networkStatus = null;
-  let networkVerified = false;
-  const _netWaitEnd = Date.now() + 5000;
-  while (Date.now() < _netWaitEnd) {
-    if (Date.now() > deadline) break;
-    await page.waitForTimeout(200);
-    const log = engine.getNetLog(sessionId);
-    const relevant = log.filter(e => e.ts >= _submitTs && /^(POST|PUT|PATCH)$/.test(e.method));
-    if (relevant.length > 0) {
-      const last = relevant[relevant.length - 1];
-      networkStatus = last.status;
-      networkVerified = last.status >= 200 && last.status < 300;
-      logger.info(`[playwright.agent] fast path: network verified — ${last.method} ${last.url.slice(0, 60)} → ${last.status}`);
+  for (let _attempt = 1; _attempt <= MAX_TYPE_ATTEMPTS; _attempt++) {
+    if (Date.now() > deadline) {
+      logger.warn(`[playwright.agent] fast path: deadline exceeded during type retry loop`);
       break;
     }
-  }
+    logger.info(`[playwright.agent] fast path: type attempt ${_attempt}/${MAX_TYPE_ATTEMPTS} via keyboard.type`);
 
-  if (!networkVerified) {
-    logger.warn(`[playwright.agent] fast path: no 2xx network response within 5s — checking page state`);
-    // Check if compose area is gone (indicates success even without network evidence)
+    // Click center of modal (if visible) to ensure focus is in compose box
     try {
-      const ceStillVisible = await page.locator('[contenteditable="true"]').count();
-      if (ceStillVisible === 0) {
-        logger.info(`[playwright.agent] fast path: compose area disappeared — treating as success`);
-        networkVerified = true;
+      const _modalBox = await page.locator(MODAL_SEL).last().boundingBox().catch(() => null);
+      if (_modalBox) {
+        await page.mouse.click(_modalBox.x + _modalBox.width / 2, _modalBox.y + 100);
+        await page.waitForTimeout(200);
+      } else {
+        // No modal found via selector — click center of viewport as fallback
+        const _vp = page.viewportSize();
+        if (_vp) await page.mouse.click(_vp.width / 2, _vp.height / 3);
+        await page.waitForTimeout(200);
       }
     } catch (_) {}
+
+    // Clear any existing text (Cmd+A, Delete — works on macOS; Ctrl+A on other OS)
+    await page.keyboard.press('Meta+A').catch(() => {});
+    await page.keyboard.press('Delete').catch(() => {});
+
+    // Type the text — keyboard.type types into whatever element has focus
+    await page.keyboard.type(text, { delay: 5 });
+    await page.waitForTimeout(1000);
+
+    // ── OCR verify: is the typed text visible on screen? ──
+    const _typeTs = Date.now();
+    const _ocrResult = await _ocrVerify(text, _typeTs);
+    if (_ocrResult.verified) {
+      logger.info(`[playwright.agent] fast path: text verified via OCR (source=${_ocrResult.source}, hasModal=${_ocrResult.hasModal}) — falling through to turn-loop for submit`);
+      _textVerified = true;
+      transcript.push({ step: 1, action: { action: 'type', text: text.slice(0, 80) + '...' }, outcome: { ok: true }, thoughts: `fast path: keyboard.type attempt ${_attempt} verified via OCR (${_ocrResult.source})` });
+      break;
+    }
+    logger.warn(`[playwright.agent] fast path: text not verified via OCR (attempt ${_attempt}) — retrying`);
+    if (_attempt < MAX_TYPE_ATTEMPTS) await page.waitForTimeout(2000);
   }
 
+  if (!_textVerified) {
+    logger.warn(`[playwright.agent] fast path: could not type+verify via OCR after ${MAX_TYPE_ATTEMPTS} attempts — falling back to LLM`);
+    transcript.push({ step: 1, action: { action: 'type' }, outcome: { ok: false, error: 'OCR verify failed' }, thoughts: 'fast path: all retries failed' });
+    return null;
+  }
+
+  // Return _textEntered:true — tells playwrightAgent() to fall through to turn-loop
+  // The turn-loop LLM will see the text is entered (via heartbeat + page state) and click "Post"
   const execTime = Date.now() - startTs;
   const result = {
-    ok: networkVerified,
+    ok: true,
+    _textEntered: true,
     goal,
     sessionId,
     turns: transcript.length,
-    done: networkVerified,
-    result: networkVerified
-      ? `Completed via Script-URL fast path${networkStatus ? ` (network: ${networkStatus})` : ''}`
-      : `Script-URL fast path: submitted but could not verify network response`,
+    done: false, // not done — turn-loop still needs to click submit
+    result: `Text entered via keyboard.type and verified via OCR — falling through to turn-loop for submit`,
     transcript,
-    routingDecision: 'script_url_fast_path',
+    routingDecision: 'fast_path_ocr',
     executionTime: execTime,
   };
 
-  logger.info(`[playwright.agent] fast path complete: ok=${result.ok} verified=${networkVerified} status=${networkStatus} time=${execTime}ms`);
+  logger.info(`[playwright.agent] fast path: text entered + OCR verified — returning _textEntered=true for turn-loop fallback (time=${execTime}ms)`);
   return result;
 }
 
@@ -2759,6 +3034,1002 @@ function _validatePlanSemantics(goal, plan, planThoughts, currentUrl) {
 }
 
 // ---------------------------------------------------------------------------
+// Canonical redirect detection — prevents double-navigation when a shortcut URL
+// (e.g. notion.new) has already redirected to the final URL (e.g. app.notion.com/<page-id>).
+// Returns true if currentUrl is a canonical redirect from targetUrl.
+// ---------------------------------------------------------------------------
+function _isCanonicalRedirect(targetUrl, currentUrl) {
+  if (!targetUrl || !currentUrl) return false;
+  try {
+    const _t = new URL(targetUrl);
+    const _c = new URL(currentUrl);
+    // Exact match is trivially canonical
+    if (_t.hostname === _c.hostname && _t.pathname === _c.pathname) return true;
+
+    // *.new shortcut domains (e.g., notion.new, docs.new, sheets.new)
+    // These redirect to the brand's main domain (notion.new → app.notion.com/<page-id>).
+    // BUT: existing pages on the same domain (e.g. app.notion.com/p/Yearly-Goals-<id>)
+    // must NOT be treated as canonical redirects — only fresh pages with raw IDs or
+    // "Untitled" slugs qualify.
+    if (_t.hostname.endsWith('.new') || _t.hostname === 'new') {
+      const _brand = _t.hostname.split('.').slice(-2, -1)[0]; // "notion" from "notion.new"
+      if (!_brand || !_c.hostname.includes(_brand)) return false;
+      // Check the last path segment for a readable slug
+      const _lastSegment = _c.pathname.split('/').pop() || '';
+      const _slugParts = _lastSegment.split('-');
+      const _hasReadableSlug = _slugParts.length >= 2
+        && /^[a-z]{4,}$/i.test(_slugParts[0])
+        && _slugParts[0].toLowerCase() !== 'untitled';
+      if (_hasReadableSlug) {
+        // Existing page with a human-readable title in the URL — NOT a fresh redirect
+        return false;
+      }
+      // Path looks like a raw ID or "Untitled" — treat as canonical redirect
+      return true;
+    }
+
+    // Regular URLs: same hostname + deeper path = canonical (e.g. /create → /document/d/<id>)
+    if (_t.hostname === _c.hostname && _c.pathname.length > _t.pathname.length) {
+      return true;
+    }
+
+    // Same base domain (last 2 labels), different hostname (e.g. mail.google.com → accounts.google.com)
+    const _tBase = _t.hostname.split('.').slice(-2).join('.');
+    const _cBase = _c.hostname.split('.').slice(-2).join('.');
+    if (_tBase === _cBase && _t.hostname !== _c.hostname) {
+      return true;
+    }
+
+    return false;
+  } catch (_) {
+    return false;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Script-Generation Mode — injection-first execution for compose/post/form tasks
+//
+// Instead of Plan-Execute (one snapshot → one plan → blind execution), this mode
+// asks the LLM to generate a single run-code script that programmatically
+// completes the task using the React-aware action types (reactFill, clickByText,
+// clickBySelector). The script includes waitForElement guards and deterministic
+// verification after each sub-step.
+//
+// Falls through to Plan-Execute on failure.
+// ---------------------------------------------------------------------------
+
+const SCRIPT_GEN_SYSTEM_PROMPT = `You are a browser automation expert. Generate a SINGLE JavaScript function that completes the user's task.
+
+You have access to the Playwright page object AND helper functions. Your function receives page and must return a result string.
+
+AVAILABLE HELPER FUNCTIONS (call these directly as regular function calls - they are Node-side functions that close over page and internally call page.evaluate() for DOM manipulation. Do NOT wrap them inside page.evaluate() - call them directly.):
+
+  reactFill(selector, text, clearFirst=true)
+    - Sets text on React-controlled inputs/textareas (native setter + input event)
+      AND contenteditable divs (focus + execCommand insertText).
+      Use for compose boxes, post textareas, message inputs.
+      ALWAYS prefer this over page.keyboard.type() for setting known text.
+      selector = CSS selector (e.g. '[role="textbox"]', 'textarea[name="body"]')
+      Returns { ok, method, verified, actualValue }
+
+  clickByText(text, tag=null, exact=false, scope=null)
+    - Clicks a visible element matching visible text (case-insensitive substring).
+      Use for buttons whose text is stable: "Post", "Send", "Submit", "Tweet".
+      tag = optional tag filter ('button', 'a'); exact = require exact match.
+      scope = optional CSS selector to limit search to a container (e.g. '[role="dialog"]').
+      Returns { ok, clickedText, tag, matchCount }
+
+  clickBySelector(selector, force=false)
+    - Clicks by CSS selector directly. Bypasses ref resolution.
+      Use when a stable CSS selector is known.
+      Returns { ok, result, method? }
+
+  waitForElement(selector, timeoutMs=10000)
+    - Polls until selector exists in DOM. Use before interacting with modals/dynamic content.
+      Returns { ok, error? }
+
+CORRECT example (call helpers directly):
+  async page => {
+    await waitForElement('[role="textbox"]', 5000);
+    const result = await reactFill('[role="textbox"]', 'Hello world!');
+    if (!result.verified) throw new Error('Text not set');
+    await clickByText('Post', 'button', true, '[role="dialog"]');
+    return 'Posted successfully';
+  }
+
+WRONG (helpers are NOT available inside page.evaluate - they are Node-side):
+  async page => {
+    await page.evaluate(() => {
+      reactFill(...)  // ReferenceError! reactFill is not in browser scope
+    });
+  }
+
+PATTERN FOR COMPOSE/POST TASKS:
+  1. waitForElement for the compose box selector
+  2. reactFill to set the text content
+  3. Verify the text was set (check return.verified or query the element)
+  4. clickByText or clickBySelector to click the submit button
+  5. Verify submission (modal closed, URL changed, or success message appeared)
+  6. return a result string
+
+CRITICAL RULES:
+- Call helper functions DIRECTLY - do NOT wrap them inside page.evaluate().
+- Use REAL CSS selectors - NOT Playwright pseudo-selectors.
+  SAFE: '[role="textbox"]', 'textarea[name="body"]', 'div[contenteditable="true"]', 'button[type="submit"]'
+  FORBIDDEN: :has-text(), :text(), :contains(), :visible
+- For contenteditable compose boxes (LinkedIn, Twitter, Facebook), use reactFill with
+  selector '[role="textbox"], div[contenteditable="true"]'.
+- For submit buttons inside modals, use clickByText with scope='[role="dialog"]' to
+  avoid matching buttons outside the modal (e.g. "Repost" on the feed).
+- The function signature MUST be: async page => { ... return "result string"; }
+- Keep the script focused - do NOT add navigation steps (the URL-first path already navigated).
+- If an element might not be ready, wrap in waitForElement first.
+- Return a human-readable result string describing what happened.
+
+Output ONLY the JavaScript function, no markdown fences, no explanation.`;
+
+// ---------------------------------------------------------------------------
+// Script-Gen Helper Injection
+//
+// The LLM generates `async page => { reactFill(...); clickByText(...); ... }`,
+// but run-code evals that function in Node.js scope where reactFill/clickByText
+// don't exist. This wrapper injects Node-side helper definitions that close over
+// `page` and internally call page.evaluate() with the browser-side DOM code.
+// The browser-side code is identical to the action handlers in browser.act.cjs.
+// ---------------------------------------------------------------------------
+
+// Browser-side code for reactFill (runs inside page.evaluate)
+const _REACT_FILL_BROWSER_FN = `({ selector, text, clearFirst }) => {
+  const el = document.querySelector(selector);
+  if (!el) return { ok: false, error: 'Element not found: ' + selector };
+
+  // Path 1: <input> / <textarea> — native setter + input event
+  if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') {
+    const proto = el.tagName === 'INPUT'
+      ? window.HTMLInputElement.prototype
+      : window.HTMLTextAreaElement.prototype;
+    const setter = Object.getOwnPropertyDescriptor(proto, 'value');
+    if (setter && setter.set) {
+      setter.set.call(el, clearFirst ? text : (el.value + text));
+    } else {
+      el.value = clearFirst ? text : (el.value + text);
+    }
+    el.dispatchEvent(new Event('input', { bubbles: true }));
+    el.dispatchEvent(new Event('change', { bubbles: true }));
+    const actual = el.value || '';
+    return { ok: true, method: 'native-setter', verified: actual.includes(text), actualValue: actual.slice(0, 200) };
+  }
+
+  // Path 2: contenteditable — focus + execCommand insertText
+  if (el.isContentEditable || el.getAttribute('contenteditable') === 'true' ||
+      el.getAttribute('role') === 'textbox') {
+    el.focus();
+    if (clearFirst) {
+      const range = document.createRange();
+      range.selectNodeContents(el);
+      const sel = window.getSelection();
+      sel.removeAllRanges();
+      sel.addRange(range);
+      document.execCommand('delete');
+    }
+    const inserted = document.execCommand('insertText', false, text);
+    if (!inserted) {
+      el.dispatchEvent(new InputEvent('beforeinput', {
+        data: text, inputType: 'insertText', bubbles: true, cancelable: true,
+      }));
+      el.dispatchEvent(new InputEvent('input', {
+        data: text, inputType: 'insertText', bubbles: true,
+      }));
+      if (!el.textContent || el.textContent.length === 0) {
+        el.textContent = text;
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+      }
+    }
+    const actual = el.textContent || el.innerText || '';
+    return { ok: true, method: 'contenteditable', verified: actual.includes(text), actualValue: actual.slice(0, 200) };
+  }
+
+  // Path 3: unknown element type — textContent fallback
+  el.focus();
+  if (clearFirst) el.textContent = '';
+  el.textContent = (clearFirst ? '' : (el.textContent || '')) + text;
+  el.dispatchEvent(new Event('input', { bubbles: true }));
+  const actual = el.textContent || '';
+  return { ok: true, method: 'textcontent-fallback', verified: actual.includes(text), actualValue: actual.slice(0, 200) };
+}`;
+
+// Browser-side code for clickByText (runs inside page.evaluate)
+const _CLICK_BY_TEXT_BROWSER_FN = `({ text, tag, exact, scope }) => {
+  const lower = text.toLowerCase();
+  const candidates = [];
+  const baseSelector = tag ? tag.toLowerCase() : 'button, a, [role="button"], [role="link"], input[type="submit"], input[type="button"], div, span';
+  const root = scope ? document.querySelector(scope) : document;
+  if (!root) return { ok: false, error: 'Scope element not found: ' + scope };
+  const els = Array.from(root.querySelectorAll(baseSelector));
+  for (const el of els) {
+    const rect = el.getBoundingClientRect();
+    if (rect.width === 0 && rect.height === 0) continue;
+    const style = window.getComputedStyle(el);
+    if (style.display === 'none' || style.visibility === 'hidden') continue;
+    const elText = (el.innerText || el.textContent || '').trim();
+    if (!elText) continue;
+    const isExact = elText.toLowerCase() === lower;
+    const isSub = elText.toLowerCase().includes(lower);
+    if (exact ? isExact : isSub) candidates.push({ el, text: elText, len: elText.length, isExact });
+  }
+  if (candidates.length === 0) return { ok: false, error: 'No visible element with text "' + text + '"' };
+  // Sort: exact match first, then button/submit, then shortest length
+  candidates.sort((a, b) => {
+    if (a.isExact && !b.isExact) return -1;
+    if (!a.isExact && b.isExact) return 1;
+    const aIsButton = a.el.tagName === 'BUTTON' || a.el.getAttribute('role') === 'button' || (a.el.tagName === 'INPUT' && (a.el.type === 'submit' || a.el.type === 'button'));
+    const bIsButton = b.el.tagName === 'BUTTON' || b.el.getAttribute('role') === 'button' || (b.el.tagName === 'INPUT' && (b.el.type === 'submit' || b.el.type === 'button'));
+    if (aIsButton && !bIsButton) return -1;
+    if (!aIsButton && bIsButton) return 1;
+    return a.len - b.len;
+  });
+  const target = candidates[0].el;
+  target.scrollIntoView({ block: 'center', behavior: 'instant' });
+  target.click();
+  return { ok: true, clickedText: candidates[0].text, tag: target.tagName, matchCount: candidates.length };
+}`;
+
+// Build the wrapped script with injected helper functions.
+// Takes the LLM-generated `async page => { ... }` code, extracts the body,
+// and wraps it with Node-side helper definitions that close over `page`.
+function _buildScriptGenWrapper(llmCode) {
+  // Extract the body from `async page => { ... }`, `async (page) => { ... }`,
+  // or `async function(page) { ... }` / `async function (page) { ... }`
+  let body = llmCode;
+  // Match any of the supported function signatures
+  const sigMatch = body.match(/^async\s+(?:\(\s*page\s*\)|page)\s*=>\s*\{/) ||
+                   body.match(/^async\s+function\s*\(\s*page\s*\)\s*\{/);
+  if (sigMatch) {
+    const startIdx = sigMatch[0].length - 1; // index of the opening `{`
+    let depth = 0;
+    let endIdx = -1;
+    for (let i = startIdx; i < body.length; i++) {
+      if (body[i] === '{') depth++;
+      else if (body[i] === '}') {
+        depth--;
+        if (depth === 0) { endIdx = i; break; }
+      }
+    }
+    if (endIdx > startIdx) {
+      body = body.slice(startIdx + 1, endIdx);
+    }
+    // If brace matching failed, just strip the signature and use the rest
+    else {
+      body = body.replace(/^async\s+(?:\(\s*page\s*\)|page)\s*=>\s*\{/, '')
+                 .replace(/^async\s+function\s*\(\s*page\s*\)\s*\{/, '')
+                 .replace(/\}\s*$/, '');
+    }
+  }
+
+  // Build the wrapped function with injected helpers
+  return `async page => {
+  // === AUTO-INJECTED HELPERS (close over page) ===
+  const _REACT_FILL_FN = ${_REACT_FILL_BROWSER_FN};
+  async function reactFill(selector, text, clearFirst = true) {
+    return await page.evaluate(_REACT_FILL_FN, { selector, text, clearFirst });
+  }
+  const _CLICK_BY_TEXT_FN = ${_CLICK_BY_TEXT_BROWSER_FN};
+  async function clickByText(text, tag = null, exact = false, scope = null) {
+    return await page.evaluate(_CLICK_BY_TEXT_FN, { text, tag, exact, scope });
+  }
+  async function clickBySelector(selector, force = false) {
+    if (force) {
+      return await page.evaluate((sel) => {
+        const el = document.querySelector(sel);
+        if (!el) return { ok: false, error: 'Element not found: ' + sel };
+        el.scrollIntoView({ block: 'center' });
+        el.click();
+        return { ok: true, method: 'eval-click' };
+      }, selector);
+    }
+    try {
+      await page.click(selector, { timeout: 5000 });
+      return { ok: true, method: 'playwright-click' };
+    } catch (e) {
+      // Fallback: eval-click
+      return await page.evaluate((sel) => {
+        const el = document.querySelector(sel);
+        if (!el) return { ok: false, error: 'Element not found: ' + sel };
+        el.scrollIntoView({ block: 'center' });
+        el.click();
+        return { ok: true, method: 'eval-click' };
+      }, selector);
+    }
+  }
+  async function waitForElement(selector, timeoutMs = 10000) {
+    try {
+      await page.waitForSelector(selector, { timeout: timeoutMs, state: 'visible' });
+      return { ok: true };
+    } catch (e) {
+      return { ok: false, error: e.message };
+    }
+  }
+  // === USER SCRIPT BODY BELOW ===
+${body}
+}`;
+}
+
+// Detect whether a task is a compose/post/form task suitable for script-generation.
+function _isInjectionCandidate(goal, probeResult) {
+  if (!goal) return false;
+  const _goalLower = goal.toLowerCase();
+  // Compose/post/share/tweet/publish tasks
+  const _composePatterns = [
+    /\bpost\b/, /\bshare\b/, /\btweet\b/, /\bpublish\b/, /\bcompose\b/,
+    /\bsend\s+(?:a\s+)?(?:email|mail|message)\b/, /\bwrite\s+(?:a\s+)?(?:email|message|post|tweet)\b/,
+    /\bsubmit\b/, /\bcreate\s+(?:a\s+)?(?:post|update|tweet|message)\b/,
+    /\bupdate\b.*\b(?:post|share|status)\b/,
+  ];
+  const _isCompose = _composePatterns.some(re => re.test(_goalLower));
+  // Form submission tasks
+  const _isForm = /\bfill\s+(?:out|in)\s+(?:the\s+)?form|\bsubmit\s+(?:the\s+)?form\b/.test(_goalLower);
+  // Modal/compose element present in probe
+  const _hasComposeElement = probeResult?.hasContentEditable || probeResult?.hasRoleTextbox ||
+    probeResult?.hasTextarea || probeResult?.hasComposeInModal || probeResult?.hasModalDialog;
+  return _isCompose || _isForm || (_hasComposeElement && /\b(?:type|write|enter|fill)\b/.test(_goalLower));
+}
+
+// Execute the script-generation mode.
+// Returns { ok, result, script } on success, or { ok: false, error } on failure (caller falls through).
+async function _executeScriptGeneration({ goal, sessionId, headed, timeoutMs, agentContext, probeResult, pageStudy, deadline }) {
+  const _start = Date.now();
+  logger.info(`[playwright.agent] script-gen: starting for goal="${goal.slice(0, 80)}"`);
+
+  // Build a lightweight page context for the LLM (probe data + key selectors)
+  const _probeBlock = probeResult
+    ? `PAGE PROBE:
+- contentEditable elements: ${probeResult.contentEditableCount || 0}
+- role=textbox elements: ${probeResult.roleTextboxCount || 0}
+- textarea elements: ${probeResult.textareaCount || 0}
+- text inputs: ${probeResult.textInputCount || 0}
+- modal dialog open: ${probeResult.hasModalDialog || false}
+- compose element in modal: ${probeResult.hasComposeInModal || false}
+- active element editable: ${probeResult.activeElementEditable || false}
+- active element tag: ${probeResult.activeElementTag || 'unknown'}
+- buttons on page: ${probeResult.buttonCount || 0}`
+    : 'PAGE PROBE: unavailable';
+
+  // Try to extract key selectors from the page for the LLM
+  let _selectorHints = '';
+  try {
+    const _ePage = engine.getPage(sessionId);
+    if (_ePage) {
+      const _hints = await _ePage.evaluate(() => {
+        const hints = [];
+        // Compose boxes
+        const compose = document.querySelector('[role="textbox"], div[contenteditable="true"], textarea[name="body"], textarea[name="message"]');
+        if (compose) {
+          const sel = compose.getAttribute('role') === 'textbox'
+            ? '[role="textbox"]'
+            : compose.tagName === 'TEXTAREA'
+              ? `textarea[name="${compose.name || 'body'}"]`
+              : 'div[contenteditable="true"]';
+          hints.push(`COMPOSE_BOX: ${sel}`);
+        }
+        // Submit buttons (by text)
+        const buttons = Array.from(document.querySelectorAll('button, [role="button"]'));
+        const submitBtn = buttons.find(b => {
+          const t = (b.innerText || b.textContent || '').trim().toLowerCase();
+          return /^(post|send|submit|tweet|publish|share|reply|comment)$/i.test(t);
+        });
+        if (submitBtn) {
+          hints.push(`SUBMIT_BUTTON_TEXT: "${(submitBtn.innerText || submitBtn.textContent || '').trim()}"`);
+        }
+        // Modal presence
+        const modal = document.querySelector('[role="dialog"], [aria-modal="true"]');
+        if (modal) hints.push('MODAL_OPEN: true');
+        return hints.join('\n');
+      }).catch(() => '');
+      if (_hints) _selectorHints = `\nSELECTOR HINTS (from live DOM):\n${_hints}`;
+    }
+  } catch (_) { /* non-fatal */ }
+
+  const _userContent = `GOAL: ${goal}
+
+${_probeBlock}${_selectorHints}
+${pageStudy ? `\nPAGE ANALYSIS:\n- Page type: ${pageStudy.pageType || 'unknown'}\n- Key elements: ${JSON.stringify((pageStudy.keyElements || []).slice(0, 8))}` : ''}
+${agentContext ? `\nAGENT CONTEXT:\n${agentContext}` : ''}
+
+Generate the JavaScript function to complete this task:`;
+
+  let _scriptRaw;
+  try {
+    _scriptRaw = await askWithMessages([
+      { role: 'system', content: SCRIPT_GEN_SYSTEM_PROMPT },
+      { role: 'user', content: _userContent },
+    ], { temperature: 0.1, maxTokens: 1200, responseTimeoutMs: 30000 });
+  } catch (_llmErr) {
+    logger.warn(`[playwright.agent] script-gen: LLM call failed: ${_llmErr.message}`);
+    return { ok: false, error: `script-gen LLM error: ${_llmErr.message}` };
+  }
+
+  if (!_scriptRaw || _scriptRaw.trim().length < 20) {
+    logger.warn(`[playwright.agent] script-gen: empty or too-short LLM response`);
+    return { ok: false, error: 'script-gen: empty LLM response' };
+  }
+
+  // Extract the function from the response (strip markdown fences if present)
+  let _scriptCode = _scriptRaw.trim();
+  const _fenceMatch = _scriptCode.match(/```(?:javascript|js)?\s*\n?([\s\S]*?)\n?```/);
+  if (_fenceMatch) _scriptCode = _fenceMatch[1].trim();
+  // Ensure it starts with async page =>
+  if (!/^async\s+page\s*=>/.test(_scriptCode) && !/^async\s+function\s*\(\s*page\s*\)/.test(_scriptCode)) {
+    // Try to extract just the function part
+    const _fnMatch = _scriptCode.match(/(async\s+page\s*=>\s*\{[\s\S]*\})/);
+    if (_fnMatch) {
+      _scriptCode = _fnMatch[1];
+    } else {
+      logger.warn(`[playwright.agent] script-gen: LLM response is not a valid async function — falling through`);
+      return { ok: false, error: 'script-gen: invalid function format' };
+    }
+  }
+
+  // Wrap the LLM script with injected helper functions (reactFill, clickByText, etc.)
+  // so they're in scope when run-code evals the function in Node.js context.
+  const _wrappedCode = _buildScriptGenWrapper(_scriptCode);
+  logger.info(`[playwright.agent] script-gen: generated ${_scriptCode.length} chars (wrapped: ${_wrappedCode.length} chars), executing...`);
+
+  // Execute the script via browserAct run-code
+  let _execResult;
+  try {
+    _execResult = await browserAct({
+      action: 'run-code',
+      code: _wrappedCode,
+      sessionId,
+      headed,
+      timeoutMs: Math.min(timeoutMs * 4, 60000), // scripts need more time
+    });
+  } catch (_execErr) {
+    logger.warn(`[playwright.agent] script-gen: execution threw: ${_execErr.message}`);
+    return { ok: false, error: `script-gen execution error: ${_execErr.message}`, script: _scriptCode };
+  }
+
+  if (!_execResult.ok) {
+    logger.warn(`[playwright.agent] script-gen: execution failed: ${_execResult.error || 'unknown'}`);
+    return { ok: false, error: _execResult.error || 'script-gen execution failed', script: _scriptCode };
+  }
+
+  const _result = String(_execResult.result || _execResult.stdout || '').slice(0, 2000);
+  logger.info(`[playwright.agent] script-gen: succeeded in ${Date.now() - _start}ms — result="${_result.slice(0, 100)}"`);
+
+  // Deterministic post-execution verification: check if the goal was likely achieved
+  // by probing for common success indicators (modal closed, success text, etc.)
+  let _verified = false;
+  try {
+    const _ePage = engine.getPage(sessionId);
+    if (_ePage) {
+      const _verifyResult = await _ePage.evaluate(() => {
+        // Modal closed = success for compose/post tasks
+        const _modal = document.querySelector('[role="dialog"], [aria-modal="true"]');
+        if (!_modal) return { verified: true, reason: 'modal closed' };
+        // Success toast/message
+        const _successText = document.body?.innerText?.match(/posted|shared|sent|published|submitted/i);
+        if (_successText) return { verified: true, reason: `success text: ${_successText[0]}` };
+        return { verified: false, reason: 'modal still open and no success text' };
+      }).catch(() => null);
+      if (_verifyResult) {
+        _verified = _verifyResult.verified;
+        logger.info(`[playwright.agent] script-gen: deterministic verify=${_verified} (${_verifyResult.reason})`);
+      }
+    }
+  } catch (_) { /* non-fatal */ }
+
+  return {
+    ok: true,
+    result: _result,
+    script: _scriptCode,
+    verified: _verified,
+    routingDecision: 'script_gen',
+    executionTime: Date.now() - _start,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Turn Loop Fallback — observe→act→verify recovery when Plan-Execute fails
+//
+// When the Plan-Execute repair limit is reached, instead of immediately surfacing
+// ask_user, run a lightweight turn loop: take a fresh snapshot, ask the LLM for
+// ONE action (from the injection action vocabulary), execute it, verify, repeat.
+// Max 8 turns. Uses the new reactFill/clickByText/clickBySelector actions for
+// deterministic interaction.
+// ---------------------------------------------------------------------------
+
+const TURN_LOOP_SYSTEM_PROMPT = `You are a browser automation agent recovering from a failed plan. The previous plan failed partway. You are now in a turn-by-turn mode: output ONE action per turn, observe the result, then output the next.
+
+AVAILABLE ACTIONS (injection-first - prefer these over snapshot-ref actions):
+  reactFill       { "action": "reactFill", "selector": "[role='textbox']", "text": "..." }
+                  - Sets text on React-controlled inputs/contenteditable. PREFERRED for compose boxes.
+                    Uses native setter + event dispatch to trigger React state updates.
+  clickByText     { "action": "clickByText", "text": "Post", "tag": "button", "exact": true, "scope": "[role='dialog']" }
+                  - Click by visible button text. PREFERRED for submit buttons.
+                    Use scope to limit search to a container (e.g. modal) to avoid wrong matches.
+  clickBySelector { "action": "clickBySelector", "selector": "button[type='submit']" }
+                  - Click by CSS selector directly.
+  waitForElement  { "action": "waitForSelector", "selector": "..." }
+                  - Wait for an element to appear.
+  snapshot        { "action": "snapshot" }
+                  - Re-read the page if you need to see updated state. RARELY needed.
+  navigate        { "action": "navigate", "url": "..." }
+                  - Only if you're on the wrong page.
+  return          { "action": "return", "data": "result summary" }
+                  - When the goal is achieved. MUST be the last action.
+
+RULES:
+- Output ONE action per turn as JSON: { "action": "...", ... }
+- DO NOT output snapshot unless you need to reassess. Snapshot wastes a turn.
+- If the goal involves typing, use reactFill FIRST. Do NOT wait or snapshot first.
+- If the goal involves clicking a button, use clickByText FIRST.
+- Use reactFill for compose boxes (NOT type or fill - those depend on focus state).
+- Use clickByText for submit buttons (NOT click with refs - refs may be stale).
+- For submit buttons inside modals, use scope='[role="dialog"]' to avoid matching
+  buttons outside the modal (e.g. "Repost" on a feed when you want "Post" in the modal).
+- After each action, you'll see the result. Adapt based on what happened.
+- When the goal is achieved, output { "action": "return", "data": "what you did" }.
+- The ARIA snapshot may NOT show contenteditable elements. If the PAGE TEXT or PROBE
+  shows a compose box (contenteditable=true, role=textbox), use reactFill with the
+  indicated selector even if it's not in the ARIA snapshot.
+
+Output ONLY the JSON action object, no markdown, no explanation.`;
+
+async function _executeTurnLoopFallback({ goal, sessionId, headed, timeoutMs, agentContext, transcript, deadline, start, extractedText, heartbeat, textAlreadyEntered }) {
+  const MAX_TURNS = 12;
+  const _loopTranscript = [...transcript];
+  logger.info(`[playwright.agent] turn-loop fallback: starting (max ${MAX_TURNS} turns) for goal="${goal.slice(0, 80)}"`);
+
+  for (let turn = 1; turn <= MAX_TURNS; turn++) {
+    if (Date.now() > deadline) {
+      logger.warn(`[playwright.agent] turn-loop: deadline exceeded at turn ${turn}`);
+      break;
+    }
+
+    // ── Observe: take a fresh snapshot + page text + probe ──
+    const _snap = await _fastSnapshot(sessionId, headed, timeoutMs);
+    let _currentSnapshot = '';
+    if (_snap.ok && _snap.result) {
+      _currentSnapshot = _snap.result;
+    }
+    const _prunedSnap = pruneSnapshot(extractInteractiveRefs(_currentSnapshot));
+
+    // Get visible page text (ARIA snapshot may not show contenteditable elements)
+    let _pageText = '';
+    try {
+      const _ePage = engine.getPage(sessionId);
+      if (_ePage) {
+        _pageText = await _ePage.evaluate(() => document.body.innerText.slice(0, 2000)).catch(() => '');
+      }
+    } catch (_) {}
+
+    // Get probe data for compose elements
+    let _probeInfo = '';
+    try {
+      const _ePage = engine.getPage(sessionId);
+      if (_ePage) {
+        const _probe = await _ePage.evaluate(() => {
+          // Iterate ALL dialogs — querySelector returns the first (may be hidden video.js)
+          const _modals = document.querySelectorAll('[role="dialog"], [aria-modal="true"]');
+          let _hasVisibleModal = false;
+          let _hasModal = false;
+          for (const m of _modals) {
+            _hasModal = true;
+            if (m.getAttribute('aria-hidden') === 'true') continue;
+            if (m.classList.contains('vjs-hidden')) continue;
+            const rect = m.getBoundingClientRect();
+            if (rect.width > 0 && rect.height > 0) _hasVisibleModal = true;
+          }
+          // Check for compose element inside a VISIBLE modal only
+          let _composeInVisibleModal = false;
+          if (_hasVisibleModal) {
+            for (const m of _modals) {
+              if (m.getAttribute('aria-hidden') === 'true') continue;
+              if (m.classList.contains('vjs-hidden')) continue;
+              const rect = m.getBoundingClientRect();
+              if (rect.width > 0 && rect.height > 0) {
+                if (m.querySelector('[contenteditable="true"], [role="textbox"], textarea')) {
+                  _composeInVisibleModal = true;
+                  break;
+                }
+              }
+            }
+          }
+          return {
+            hasContentEditable: document.querySelector('[contenteditable="true"]') !== null,
+            hasRoleTextbox: document.querySelector('[role="textbox"]') !== null,
+            hasTextarea: document.querySelector('textarea') !== null,
+            hasModal: _hasVisibleModal,  // only count visible modals
+            hasAnyModal: _hasModal,  // for debugging
+            composeInModal: _composeInVisibleModal,
+            activeElementTag: document.activeElement?.tagName || 'unknown',
+            activeElementEditable: document.activeElement?.isContentEditable || false,
+            activeElementRole: document.activeElement?.getAttribute('role') || null,
+          };
+        }).catch(() => null);
+        if (_probe) {
+          const _composeSel = _probe.hasContentEditable ? 'div[contenteditable="true"]'
+            : _probe.hasRoleTextbox ? '[role="textbox"]'
+            : _probe.hasTextarea ? 'textarea' : null;
+          _probeInfo = `PAGE PROBE:
+- Modal open: ${_probe.hasModal}
+- Contenteditable: ${_probe.hasContentEditable}
+- Role textbox: ${_probe.hasRoleTextbox}
+- Textarea: ${_probe.hasTextarea}
+- Compose in modal: ${_probe.composeInModal}
+- Active element: <${_probe.activeElementTag}> editable=${_probe.activeElementEditable} role=${_probe.activeElementRole}
+${_composeSel ? `- SUGGESTED COMPOSE SELECTOR: ${_composeSel}` : ''}`;
+        }
+      }
+    } catch (_) {}
+
+    // Build action history summary (last 5 actions)
+    const _recentActions = _loopTranscript.slice(-5).map((t, i) => {
+      const a = t.action?.action || 'unknown';
+      const ok = t.outcome?.ok ? 'ok' : 'FAIL';
+      const err = t.outcome?.error ? ` (${t.outcome.error.slice(0, 60)})` : '';
+      return `${i + 1}. ${a} -> ${ok}${err}`;
+    }).join('\n');
+
+    // ── Check if we're already on the target page ──
+    // If so, inject a "DO NOT NAVIGATE" note so the LLM doesn't waste turns
+    // re-navigating to the same URL (which reloads the page and dismisses modals).
+    let _onTargetPage = false;
+    try {
+      const _curUrl = await _engineEval(sessionId, 'window.location.href');
+      if (_curUrl?.ok) {
+        const _cur = String(_curUrl.result).trim().replace(/^"|"$/g, '');
+        const _urlMatch = goal.match(/https?:\/\/[^\s"')]+/);
+        if (_urlMatch) {
+          // Compare base URL (strip query params and hash)
+          const _targetBase = _urlMatch[0].replace(/[?#].*$/, '').replace(/\/$/, '');
+          const _curBase = _cur.replace(/[?#].*$/, '').replace(/\/$/, '');
+          if (_curBase === _targetBase || _cur.startsWith(_targetBase)) {
+            _onTargetPage = true;
+          }
+        }
+      }
+    } catch (_) {}
+
+    // ── Strip "Navigate to..." prefix from goal ──
+    // The goal often starts with "Navigate to the LinkedIn homepage..." — the LLM
+    // sees this as step 1 and keeps navigating. Strip it so the LLM focuses on the
+    // actual task (type, click, etc.).
+    const _actionGoal = goal
+      .replace(/^.*?Navigate to .*?(?:homepage|page|site|dashboard|feed|inbox)\b[^.]*\.\s*/i, '')
+      .replace(/^.*?Open (?:LinkedIn|Twitter|Gmail|ChatGPT|Claude|Bluesky|Threads|Facebook|Instagram)\b[^.]*\.\s*/i, '')
+      .replace(/^.*?Go to (?:LinkedIn|Twitter|Gmail|ChatGPT|Claude|Bluesky|Threads|Facebook|Instagram)\b[^.]*\.\s*/i, '')
+      .trim();
+    // If stripping removed everything, use the original goal
+    const _effectiveGoal = _actionGoal.length > 10 ? _actionGoal : goal;
+
+    // ── Build turn prompt ──
+    const _heartbeatHistory = heartbeat ? heartbeat.getHistoryString(10) : '';
+    // Build selector hints based on what the heartbeat detected
+    let _selectorHints = '';
+    if (heartbeat && heartbeat.buffer.length > 0) {
+      const _hasPostBtn = heartbeat.buffer.some(t => t.postButtonCount > 0);
+      const _hasAriaPost = heartbeat.buffer.some(t => t.ariaPostEls && t.ariaPostEls.length > 0);
+      const _lastWithCompose = heartbeat.getLastComposeTick();
+      if (_hasPostBtn || _hasAriaPost || _lastWithCompose) {
+        const _hints = [];
+        if (_lastWithCompose && _lastWithCompose.composeDetails[0]) {
+          const c = _lastWithCompose.composeDetails[0];
+          if (c.ariaLabel) _hints.push(`reactFill { "action": "reactFill", "selector": "[aria-label='${c.ariaLabel}']", "text": "<TEXT>" }`);
+          if (c.role) _hints.push(`reactFill { "action": "reactFill", "selector": "[role='${c.role}']", "text": "<TEXT>" }`);
+          if (c.ce) _hints.push(`reactFill { "action": "reactFill", "selector": "[contenteditable='${c.ce}']", "text": "<TEXT>" }`);
+        }
+        if (_hasAriaPost) {
+          const _ariaLabels = [...new Set(heartbeat.buffer.flatMap(t => (t.ariaPostEls || []).map(e => e.label)))].slice(0, 3);
+          for (const label of _ariaLabels) {
+            _hints.push(`clickBySelector { "action": "clickBySelector", "selector": "[aria-label='${label}']" }`);
+          }
+        }
+        if (_hasPostBtn) {
+          const _btnTexts = [...new Set(heartbeat.buffer.flatMap(t => t.postButtonTexts || []))].slice(0, 3);
+          for (const text of _btnTexts) {
+            _hints.push(`clickByText { "action": "clickByText", "text": "${text}" }`);
+          }
+        }
+        // Always include generic fallbacks
+        _hints.push(`clickBySelector { "action": "clickBySelector", "selector": "button[aria-label*='post' i]" }`);
+        _hints.push(`clickByText { "action": "clickByText", "text": "Post" }`);
+        _hints.push(`clickByText { "action": "clickByText", "text": "Write a post" }`);
+        _hints.push(`clickByText { "action": "clickByText", "text": "Create a post" }`);
+        _selectorHints = `\nSELECTOR HINTS (based on heartbeat detection — try these):\n${_hints.map(h => '  ' + h).join('\n')}\n`;
+      }
+    }
+    const _turnUser = `GOAL: ${_effectiveGoal}
+${agentContext ? `\nAGENT CONTEXT:\n${agentContext}` : ''}
+${_onTargetPage ? '\n⚠️ YOU ARE ALREADY ON THE CORRECT PAGE. DO NOT navigate. Start typing or clicking NOW.\n' : ''}
+${textAlreadyEntered ? '\n✅ TEXT ALREADY ENTERED via keyboard.type and verified via OCR. Do NOT type again. Just click the submit/Post button NOW.\n' : ''}
+${extractedText && !textAlreadyEntered ? `\n📝 TEXT TO TYPE (use this EXACT text in reactFill): "${extractedText}"\n` : ''}
+${_probeInfo ? _probeInfo + '\n' : ''}
+${_heartbeatHistory ? `\nPAGE STATE HISTORY (last ${Math.min(10, heartbeat.buffer.length)} heartbeat ticks, oldest first — use this to see what appeared/disappeared on the page):\n${_heartbeatHistory}\n` : ''}
+${_selectorHints}
+VISIBLE PAGE TEXT (first 2000 chars):
+${_pageText.slice(0, 2000)}
+
+CURRENT SNAPSHOT (ARIA - may not show contenteditable elements):
+${_prunedSnap}
+
+${_recentActions ? `RECENT ACTIONS:\n${_recentActions}\n` : ''}
+Turn ${turn}/${MAX_TURNS}. What is your next action? (DO NOT snapshot - act directly)`;
+
+    let _actionRaw;
+    try {
+      _actionRaw = await askWithMessages([
+        { role: 'system', content: TURN_LOOP_SYSTEM_PROMPT },
+        { role: 'user', content: _turnUser },
+      ], { temperature: 0.1, maxTokens: 400, responseTimeoutMs: 20000 });
+    } catch (_llmErr) {
+      logger.warn(`[playwright.agent] turn-loop: LLM call failed at turn ${turn}: ${_llmErr.message}`);
+      break;
+    }
+
+    // Parse the action
+    let _action = null;
+    if (_actionRaw) {
+      try {
+        const _m = _actionRaw.match(/\{[\s\S]*\}/);
+        if (_m) _action = JSON.parse(_m[0]);
+      } catch (_) { /* parse error */ }
+    }
+
+    if (!_action || !_action.action) {
+      logger.warn(`[playwright.agent] turn-loop: unparseable action at turn ${turn}: ${(_actionRaw || '').slice(0, 100)}`);
+      _loopTranscript.push({ action: { action: 'parse_error' }, outcome: { ok: false, error: 'unparseable' } });
+      continue;
+    }
+
+    logger.info(`[playwright.agent] turn-loop turn ${turn}/${MAX_TURNS}: action=${_action.action}`);
+
+    // ── Done check ──
+    if (_action.action === 'return') {
+      const _result = String(_action.data || '').slice(0, 2000);
+      logger.info(`[playwright.agent] turn-loop: done at turn ${turn} — result="${_result.slice(0, 100)}"`);
+      return {
+        ok: true,
+        goal,
+        sessionId,
+        turns: _loopTranscript.length,
+        done: true,
+        result: _result || 'Completed via turn-loop fallback',
+        transcript: _loopTranscript,
+        routingDecision: 'turn_loop_fallback',
+        executionTime: Date.now() - start,
+      };
+    }
+
+    // ── Anti-repeat: skip duplicate actions ──
+    // If the last action was the same type and succeeded, skip this one.
+    // This prevents the LLM from navigating 12 times to the same URL.
+    if (_loopTranscript.length > 0) {
+      const _last = _loopTranscript[_loopTranscript.length - 1];
+      if (_last.action?.action === _action.action && _last.outcome?.ok) {
+        // For navigate: skip if same URL
+        if (_action.action === 'navigate' && _last.action?.url === _action.url) {
+          logger.warn(`[playwright.agent] turn-loop: skipping duplicate navigate to ${_action.url} — already done`);
+          _loopTranscript.push({ action: _action, outcome: { ok: false, error: 'skipped duplicate navigate' } });
+          continue;
+        }
+        // For snapshot: skip if last was also snapshot
+        if (_action.action === 'snapshot') {
+          logger.warn(`[playwright.agent] turn-loop: skipping duplicate snapshot`);
+          _loopTranscript.push({ action: _action, outcome: { ok: false, error: 'skipped duplicate snapshot' } });
+          continue;
+        }
+      }
+    }
+
+    // ── Execute the action ──
+    let _outcome;
+    try {
+      _outcome = await browserAct({ ..._action, sessionId, headed, timeoutMs });
+    } catch (_execErr) {
+      _outcome = { ok: false, error: _execErr.message };
+    }
+
+    _loopTranscript.push({ action: _action, outcome: _outcome });
+
+    if (!_outcome.ok) {
+      logger.warn(`[playwright.agent] turn-loop: action ${_action.action} failed at turn ${turn}: ${_outcome.error}`);
+      // Continue to next turn — the loop will reassess from a fresh snapshot
+    } else {
+      logger.info(`[playwright.agent] turn-loop: action ${_action.action} succeeded at turn ${turn}`);
+      // Invalidate snapshot cache after DOM-mutating actions
+      const _domMutating = ['reactFill', 'clickByText', 'clickBySelector', 'click', 'fill', 'type', 'navigate', 'press'].includes(_action.action);
+      if (_domMutating) {
+        invalidateEngineSnapshot(sessionId);
+      }
+
+      // ── Wait for page to stabilize after navigate ──
+      // Navigating reloads the page, which dismisses modals and resets SPA state.
+      // Wait for networkidle + a short settle delay so the next snapshot sees the
+      // settled page (with modal/compose element if applicable).
+      if (_action.action === 'navigate') {
+        try {
+          const _page = engine.getPage(sessionId);
+          if (_page) {
+            logger.info(`[playwright.agent] turn-loop: waiting for page to stabilize after navigate`);
+            await _page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
+            await _page.waitForTimeout(2000);  // SPA settle time
+          }
+        } catch (_) {}
+      }
+    }
+  }
+
+  // Max turns reached without completion
+  logger.warn(`[playwright.agent] turn-loop: reached max turns (${MAX_TURNS}) without completing`);
+  return {
+    ok: false,
+    goal,
+    sessionId,
+    turns: _loopTranscript.length,
+    done: false,
+    result: `Turn-loop fallback exhausted (${MAX_TURNS} turns) without completing the goal`,
+    transcript: _loopTranscript,
+    error: 'turn_loop_exhausted',
+    routingDecision: 'turn_loop_fallback',
+    executionTime: Date.now() - start,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Page Heartbeat — continuous page state capture (inspired by monitorService.js tick())
+// Runs a setInterval every 2s, captures lightweight page state into a rolling buffer.
+// The buffer is fed to the turn-loop LLM so it can see the TIMELINE of page changes
+// (e.g., "modal appeared at t=3, dismissed at t=5") instead of a single snapshot.
+// The fast path also checks the buffer to detect compose elements that appeared
+// and disappeared during polling.
+// ---------------------------------------------------------------------------
+class _PageHeartbeat {
+  constructor(sessionId, intervalMs = 2000, maxTicks = 15) {
+    this.sessionId = sessionId;
+    this.intervalMs = intervalMs;
+    this.maxTicks = maxTicks;
+    this.buffer = [];
+    this.intervalId = null;
+    this.tickCount = 0;
+  }
+
+  start() {
+    if (this.intervalId) return;
+    this._tick().catch(() => {});
+    this.intervalId = setInterval(() => this._tick().catch(() => {}), this.intervalMs);
+  }
+
+  stop() {
+    if (this.intervalId) {
+      clearInterval(this.intervalId);
+      this.intervalId = null;
+    }
+  }
+
+  async _tick() {
+    const page = engine.getPage(this.sessionId);
+    if (!page) return;
+    this.tickCount++;
+    const _tickNum = this.tickCount;
+    try {
+      const state = await page.evaluate(() => {
+        // Broadened modal detection — LinkedIn may use various selectors
+        const modals = Array.from(document.querySelectorAll(
+          '[role="dialog"], [aria-modal="true"], [data-testid*="modal"], [data-testid*="share"], ' +
+          '[class*="modal"][class*="share"], [class*="compose"][class*="modal"], .share-creation, ' +
+          '#interop-outlet > div, [aria-labelledby*="share"], [aria-labelledby*="compose"]'
+        ));
+        const visibleModals = modals.filter(m => {
+          if (m.getAttribute('aria-hidden') === 'true') return false;
+          const r = m.getBoundingClientRect();
+          return r.width > 0 && r.height > 0;
+        });
+        const composeEls = Array.from(document.querySelectorAll(
+          '[contenteditable], .ql-editor, [role="textbox"], [role="combobox"], [role="searchbox"], textarea, input[type="text"], input[type="search"]'
+        ));
+        const visibleCompose = composeEls.filter(el => {
+          if (el.getAttribute('aria-hidden') === 'true') return false;
+          const r = el.getBoundingClientRect();
+          return r.width > 0 && r.height > 0;
+        });
+        const postButtons = Array.from(document.querySelectorAll(
+          'button, [role="button"], a[role="button"]'
+        )).filter(b => {
+          const r = b.getBoundingClientRect();
+          if (r.width === 0 && r.height === 0) return false;
+          const text = (b.innerText || b.textContent || '').toLowerCase().trim();
+          return /^(start a post|post|share|compose|create.*post|write.*post)\b/.test(text);
+        });
+        const ariaPostEls = Array.from(document.querySelectorAll('[aria-label]')).filter(el => {
+          const r = el.getBoundingClientRect();
+          if (r.width === 0 && r.height === 0) return false;
+          const label = (el.getAttribute('aria-label') || '').toLowerCase();
+          return /\b(post|compose|write|share|what.*mind)\b/.test(label);
+        }).slice(0, 5).map(el => ({
+          tag: el.tagName,
+          label: el.getAttribute('aria-label'),
+          role: el.getAttribute('role'),
+          ce: el.getAttribute('contenteditable'),
+        }));
+        return {
+          t: 0, // placeholder — set by caller (page.evaluate can't access outer scope)
+          url: window.location.href.slice(0, 100),
+          bodyLen: (document.body?.innerText || '').length,
+          modalCount: modals.length,
+          visibleModalCount: visibleModals.length,
+          modalTexts: visibleModals.slice(0, 2).map(m => (m.innerText || '').slice(0, 150)),
+          composeCount: composeEls.length,
+          visibleComposeCount: visibleCompose.length,
+          composeDetails: visibleCompose.slice(0, 3).map(el => ({
+            tag: el.tagName,
+            ce: el.getAttribute('contenteditable'),
+            role: el.getAttribute('role'),
+            ariaLabel: el.getAttribute('aria-label'),
+            placeholder: el.getAttribute('placeholder') || el.getAttribute('aria-placeholder'),
+          })),
+          postButtonCount: postButtons.length,
+          postButtonTexts: postButtons.slice(0, 3).map(b => (b.innerText || '').trim().slice(0, 50)),
+          ariaPostEls,
+        };
+      });
+      state.t = _tickNum;
+      this.buffer.push(state);
+      if (this.buffer.length > this.maxTicks) this.buffer.shift();
+      // Log summary on every tick
+      const _summary = `modals=${state.visibleModalCount} compose=${state.visibleComposeCount} postBtns=${state.postButtonCount} bodyLen=${state.bodyLen}`;
+      // Log full details on first 3 ticks and when state changes
+      const _prev = this.buffer[this.buffer.length - 2];
+      const _changed = !_prev || _prev.visibleModalCount !== state.visibleModalCount ||
+        _prev.visibleComposeCount !== state.visibleComposeCount || _prev.postButtonCount !== state.postButtonCount ||
+        _prev.bodyLen !== state.bodyLen;
+      if (this.tickCount <= 3 || _changed) {
+        logger.info(`[playwright.agent] heartbeat tick ${_tickNum} DETAIL: ${JSON.stringify({
+          postButtonTexts: state.postButtonTexts,
+          ariaPostEls: state.ariaPostEls,
+          composeDetails: state.composeDetails,
+          modalTexts: state.modalTexts,
+          url: state.url,
+          modalCount: state.modalCount,
+        })}`);
+      }
+      logger.info(`[playwright.agent] heartbeat tick ${_tickNum}: ${_summary}`);
+    } catch (e) {
+      // Non-fatal — page may be navigating
+    }
+  }
+
+  getHistoryString(maxTicks = 10) {
+    if (this.buffer.length === 0) return '';
+    const ticks = this.buffer.slice(-maxTicks);
+    const lines = ticks.map(t => {
+      const parts = [`t=${t.t}: modals=${t.visibleModalCount} compose=${t.visibleComposeCount} postBtns=${t.postButtonCount} bodyLen=${t.bodyLen}`];
+      if (t.visibleModalCount > 0 && t.modalTexts[0]) parts.push(`  modal: "${t.modalTexts[0].slice(0, 100)}"`);
+      if (t.visibleComposeCount > 0 && t.composeDetails[0]) {
+        const c = t.composeDetails[0];
+        parts.push(`  compose: <${c.tag}> ce=${c.ce} role=${c.role} label="${c.ariaLabel || c.placeholder || ''}"`);
+      }
+      if (t.postButtonCount > 0) parts.push(`  postButtons: ${JSON.stringify(t.postButtonTexts)}`);
+      if (t.ariaPostEls.length > 0) parts.push(`  ariaPostEls: ${JSON.stringify(t.ariaPostEls)}`);
+      return parts.join('\n');
+    });
+    return lines.join('\n');
+  }
+
+  sawComposeElement() {
+    return this.buffer.some(t => t.visibleComposeCount > 0);
+  }
+
+  getLastComposeTick() {
+    for (let i = this.buffer.length - 1; i >= 0; i--) {
+      if (this.buffer[i].visibleComposeCount > 0) return this.buffer[i];
+    }
+    return null;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Main entry point
 // ---------------------------------------------------------------------------
 async function playwrightAgent(args) {
@@ -2793,8 +4064,40 @@ async function playwrightAgent(args) {
 
   logger.info(`[playwright.agent] start goal="${goal}" session=${sessionId} maxRepairs=${maxRepairs}`);
 
+  // Start page heartbeat — continuous page state capture for LLM context
+  const _heartbeat = new _PageHeartbeat(sessionId, 1000, 30);
+  _heartbeat.start();
+
   const transcript = [];
   let finalResult = null; // set by a 'return' step if present
+
+  // ── Failure → askUser helper ──────────────────────────────────────────────
+  // Surfaces a hard failure as an agent-aware ask_user so the user can either
+  // retry, train from the current page, or train from the beginning. Keeps the
+  // browser session alive so "train from current page" can attach to it.
+  // Mirrors the goal-judge askUser shape (see ~line 5379) so executeCommand and
+  // main.js route free-text answers through the _isAgentAskUser resume path
+  // (re-running the SAME agent step with [Resume context: Q&A]) instead of
+  // treating the answer as a brand-new task.
+  function _failureAskUser(reason) {
+    return {
+      ok: false,
+      askUser: true,
+      trainingHandoff: true,
+      question: `I wasn't able to complete this step automatically.\n\nReason: ${reason}\n\nWhat would you like to do? You can also type what went wrong and I'll retry with your correction.`,
+      options: [
+        { label: 'Try again', value: 'try_again' },
+        { label: 'Correct and retry (tell me what was missed)', value: 'correct_and_retry' },
+        { label: 'Record recipe from beginning', value: 'record_recipe' },
+      ],
+      goal,
+      agentId,
+      sessionId,
+      // Keep the session alive so train-from-current-page can attach.
+      keepSession: true,
+      executionTime: Date.now() - start,
+    };
+  }
 
   // ── Pre-navigation (engine fast path first, CLI fallback) ──────────────────
   if (url) {
@@ -2811,6 +4114,9 @@ async function playwrightAgent(args) {
         if (_normCur === _normTarget) {
           _alreadyOnTarget = true;
           logger.info(`[playwright.agent] already on target URL ${_curUrl} — skipping redundant navigation`);
+        } else if (_isCanonicalRedirect(url, _curUrl)) {
+          _alreadyOnTarget = true;
+          logger.info(`[playwright.agent] on canonical redirect of target URL — ${_curUrl} (target=${url}) — skipping redundant navigation`);
         }
       } else if (_engineUrlRes === null) {
         // Engine is not active — do NOT fall back to CLI evaluate, which would
@@ -2828,6 +4134,9 @@ async function playwrightAgent(args) {
             if (_normCur === _normTarget) {
               _alreadyOnTarget = true;
               logger.info(`[playwright.agent] already on target URL ${_curUrl} — skipping redundant navigation`);
+            } else if (_isCanonicalRedirect(url, _curUrl)) {
+              _alreadyOnTarget = true;
+              logger.info(`[playwright.agent] on canonical redirect of target URL — ${_curUrl} (target=${url}) — skipping redundant navigation`);
             }
           }
         }
@@ -2856,6 +4165,9 @@ async function playwrightAgent(args) {
   // When the URL matches a compose pattern AND the goal contains text to post/type,
   // execute a deterministic type → submit → verify-network flow (2-5s) instead of
   // the full snapshot → LLM plan → execute loop (30-120s).
+  let _composerModalOpen = false;  // set by fast path when modal opened but no compose element
+  let _extractedComposeText = null;  // set by fast path text extraction (for turn-loop fallback)
+  let _textAlreadyEntered = false;  // set by fast path when text was typed + OCR verified (turn-loop just needs to click submit)
   if (url && engine.isSessionActive(sessionId)) {
     const _composeRe = /shareActive=true|compose\/post|compose=new|\/compose\b|posting\?compose=true/i;
     if (_composeRe.test(url)) {
@@ -2864,16 +4176,43 @@ async function playwrightAgent(args) {
       if (/mail\.google\.com.*compose=new/.test(url)) {
         logger.info(`[playwright.agent] Script-URL fast path: skipping Gmail multi-field compose — Tier 1.5 selector map will handle`);
       } else {
-        // Extract the text to type from the goal — look for quoted text or text after "post"/"type"
-        const _textMatch = goal.match(/["'](.{3,5000})["']/) || goal.match(/(?:post|type|write|share)[:\s]+(.{3,5000})$/i);
-        if (_textMatch) {
-          const _composeText = _textMatch[1].trim();
+        // Extract the text to type from the goal.
+        // Strategy: find the LAST quoted string in the goal — the post text is
+        // always at the end (e.g., "...with the text: 'Thank you to my amazing team...'")
+        // The old regex `goal.match(/["'](.{3,5000})["']/)` was greedy and matched
+        // from the first quote ('Start a post') to the last quote, capturing
+        // everything in between — including button labels and navigation instructions.
+        let _composeText = null;
+        const _allQuotes = [...goal.matchAll(/["']([^"']{3,5000})["']/g)].map(m => m[1]);
+        if (_allQuotes.length > 0) {
+          // Use the last quoted string — it's the actual post text
+          _composeText = _allQuotes[_allQuotes.length - 1].trim();
+        } else {
+          // Fallback: text after "post:" / "type:" / "write:" / "share:"
+          const _textMatch = goal.match(/(?:post|type|write|share)[:\s]+(.{3,5000})$/i);
+          if (_textMatch) _composeText = _textMatch[1].trim();
+        }
+        if (_composeText) {
           logger.info(`[playwright.agent] Script-URL fast path: compose URL detected + text extracted (${_composeText.length} chars) — deterministic flow`);
+          // Store extracted text for turn-loop fallback (in case fast path fails)
+          _extractedComposeText = _composeText;
           try {
-            const _fastResult = await _scriptUrlFastPath(sessionId, _composeText, goal, start, _deadline);
-            if (_fastResult) return _fastResult;
-            // If fast path returns null, fall through to normal LLM flow
-            logger.info(`[playwright.agent] Script-URL fast path: could not complete — falling back to LLM plan`);
+            const _fastResult = await _scriptUrlFastPath(sessionId, _composeText, goal, start, _deadline, _heartbeat);
+            if (_fastResult && _fastResult._textEntered) {
+              // Text was entered + OCR verified — fall through to turn-loop for submit
+              _textAlreadyEntered = true;
+              logger.info(`[playwright.agent] Script-URL fast path: text entered + OCR verified — falling through to turn-loop for submit click`);
+            } else if (_fastResult && !_fastResult._modalOpenNoCompose) {
+              _heartbeat.stop(); return _fastResult;
+            } else {
+              // If fast path returns null or _modalOpenNoCompose, fall through to normal LLM flow.
+              // _modalOpenNoCompose signals the modal IS open but no compose element was found —
+              // the LLM should NOT click "Start a post" (handled by the compose-open note below).
+              if (_fastResult?._modalOpenNoCompose) {
+                _composerModalOpen = true;  // flag for the planning note
+              }
+              logger.info(`[playwright.agent] Script-URL fast path: could not complete — falling back to LLM plan${_fastResult?._modalOpenNoCompose ? ' (modal is open)' : ''}`);
+            }
           } catch (_fastErr) {
             logger.warn(`[playwright.agent] Script-URL fast path error (non-fatal): ${_fastErr.message} — falling back to LLM plan`);
           }
@@ -2917,6 +4256,7 @@ async function playwrightAgent(args) {
   logger.info(`[playwright.agent] phase 1: snapshot`);
   const initSnap = await _fastSnapshot(sessionId, headed, timeoutMs);
   let currentSnapshot = (initSnap.ok && initSnap.result) ? initSnap.result : '';
+  let _activeElementInfo = initSnap.activeElement || null;
 
   // Compute hostname from the actual post-navigation browser URL.
   // This handles shortcut domains (e.g. notion.new → app.notion.com) generically —
@@ -2964,10 +4304,11 @@ async function playwrightAgent(args) {
         logger.warn(`[playwright.agent] verify gate: page has ${_vgTextNum} chars of text — waiting for stabilisation`);
         _verifyRetry = true;
       } else {
-        // Check hostname match
+        // Check hostname match (or canonical redirect from target URL)
         try {
           const _vgHost = new URL(_vgActualUrl).hostname.replace(/^www\./, '').toLowerCase();
-          if (_vgHost !== hostname && !_vgHost.endsWith('.' + hostname) && !hostname.endsWith('.' + _vgHost)) {
+          if (_vgHost !== hostname && !_vgHost.endsWith('.' + hostname) && !hostname.endsWith('.' + _vgHost)
+              && !_isCanonicalRedirect(url, _vgActualUrl)) {
             logger.warn(`[playwright.agent] verify gate: hostname mismatch — expected ${hostname}, got ${_vgHost}`);
             _verifyRetry = true;
           } else {
@@ -3032,6 +4373,280 @@ async function playwrightAgent(args) {
     } catch (_tier15Err) {
       logger.warn(`[playwright.agent] Tier 1.5 error (non-fatal): ${_tier15Err.message} — falling through`);
     }
+  }
+
+  // ── Tier 1.7: Focus-aware fast-path (no LLM for simple goals) ──────────────
+  // When URL-first navigation already focused the primary input (Gmail compose body,
+  // ChatGPT prompt, LinkedIn compose area), and the goal is a simple single-action
+  // (post a message, ask a question, search for X), skip the LLM plan entirely:
+  // type → find submit button → click → verify. Saves 5-15s of LLM plan generation.
+  try {
+    const _tier17Snap = await _fastSnapshot(sessionId, headed, timeoutMs);
+    const _activeEl = _tier17Snap?.activeElement;
+    if (_activeEl && _activeEl.isPrimaryInput) {
+      logger.info(`[playwright.agent] Tier 1.7: activeElement is primary input (tag=${_activeEl.tag}, type=${_activeEl.type}, placeholder="${_activeEl.placeholder}") — checking if goal is simple single-action`);
+
+      // Extract the text payload from the goal — strip action verbs and service context
+      // to find the actual content to type. This is intentionally conservative: only
+      // trigger for goals that look like "post: <text>", "ask <AI> about <text>", "search for <text>"
+      const _goalLower = goal.toLowerCase();
+      const _isSimpleGoal = !/\bto\s+[\w.+-]+@|subject|recipient|cc|bcc|attach|file|upload\b/i.test(goal) &&
+        (/\b(post|share|update|tweet|send|write|say|ask|tell|search|query|look\s+up|find|message)\b/i.test(_goalLower));
+
+      if (_isSimpleGoal) {
+        // Extract text payload: remove leading action verbs and service names
+        let _textPayload = goal
+          .replace(/^(?:please\s+)?(?:can\s+you\s+)?(?:I\s+want\s+to\s+|I'd\s+like\s+to\s+)?/i, '')
+          .replace(/^(?:post|share|update|tweet|send|write|say|ask|tell|search\s+for|query|look\s+up|find|message)\s+/i, '')
+          .replace(/^(?:on\s+|to\s+|in\s+)?(?:linkedin|twitter|x\.com|chatgpt|claude|grok|perplexity|gmail|outlook|notion|slack|discord|bluesky|threads|facebook|instagram)\s+/i, '')
+          .replace(/^(?:that|about|regarding|saying)\s+/i, '')
+          .replace(/^(?:to\s+|with\s+|for\s+)/i, '')
+          .trim();
+
+        // If the payload is too short or looks like it has multi-field intent, skip
+        if (_textPayload.length >= 3 && _textPayload.length <= 2000) {
+          logger.info(`[playwright.agent] Tier 1.7: simple goal detected — text payload="${_textPayload.slice(0, 80)}..." — attempting type→submit→verify without LLM`);
+
+          const _tier17Transcript = [];
+          const _tier17Start = Date.now();
+
+          // Step 1: Type the text payload
+          const _typeRes = await browserAct({ action: 'type', text: _textPayload, sessionId, headed, timeoutMs: Math.min(timeoutMs, 30000) });
+          _tier17Transcript.push({ action: { type: _textPayload.slice(0, 100) }, outcome: { ok: _typeRes.ok, error: _typeRes.error } });
+
+          if (!_typeRes.ok) {
+            logger.warn(`[playwright.agent] Tier 1.7: type failed (${_typeRes.error}) — falling through to Tier 3`);
+          } else {
+            // Step 2: Find and click the submit button
+            // Look for buttons with submit-like text in the scanner's element list
+            const _snapResult = await _fastSnapshot(sessionId, headed, timeoutMs);
+            const _snapYaml = _snapResult?.result || _snapResult?.stdout || '';
+            let _submitRef = null;
+
+            // Parse the snapshot text for buttons with submit-like labels
+            const _submitRe = /\[(td\d+|e\d+)\]\s+(?:button|link|generic)\s+"([^"]*(?:post|send|submit|ask|search|share|tweet|publish|create|go|enter|continue)[^"]*)"/gi;
+            let _m;
+            while ((_m = _submitRe.exec(_snapYaml)) !== null) {
+              _submitRef = _m[1];
+              logger.info(`[playwright.agent] Tier 1.7: found submit button ref=${_submitRef} label="${_m[2]}"`);
+              break;
+            }
+
+            if (_submitRef) {
+              // Step 3: Click submit
+              const _clickRes = await browserAct({ action: 'click', selector: _submitRef, sessionId, headed, timeoutMs: Math.min(timeoutMs, 15000) });
+              _tier17Transcript.push({ action: { click: _submitRef }, outcome: { ok: _clickRes.ok, error: _clickRes.error } });
+
+              if (_clickRes.ok) {
+                // Step 4: Verify — wait for state change
+                await new Promise(r => setTimeout(r, 1500));
+                const _verifyUrlRes = await browserAct({ action: 'evaluate', text: 'window.location.href', sessionId, headed, timeoutMs: 3000 }).catch(() => ({ ok: false }));
+                const _verifyTextRes = await browserAct({ action: 'getPageText', sessionId, headed, timeoutMs: 10000 }).catch(() => ({ ok: false }));
+
+                // Check if the typed text appears in the page (post was created)
+                const _pageText = _verifyTextRes?.ok ? String(_verifyTextRes.result || '') : '';
+                const _textOnPage = _pageText.includes(_textPayload.slice(0, 50));
+                const _urlChanged = _verifyUrlRes?.ok && String(_verifyUrlRes.result || '').replace(/^"|"$/g, '') !== url;
+
+                if (_textOnPage || _urlChanged) {
+                  logger.info(`[playwright.agent] Tier 1.7: SUCCESS — textOnPage=${_textOnPage}, urlChanged=${_urlChanged}`);
+                  return {
+                    ok: true, goal, sessionId,
+                    turns: 2, done: true,
+                    result: `Completed via Tier 1.7 fast-path (type→submit→verify)${_textOnPage ? ' — content verified on page' : ' — URL changed'}`,
+                    transcript: _tier17Transcript,
+                    routingDecision: 'tier1_7_fastpath',
+                    pageType: _pageType,
+                    executionTime: Date.now() - start,
+                  };
+                } else {
+                  logger.warn(`[playwright.agent] Tier 1.7: submit clicked but no verification — falling through to Tier 3`);
+                }
+              } else {
+                logger.warn(`[playwright.agent] Tier 1.7: submit click failed (${_clickRes.error}) — falling through to Tier 3`);
+              }
+            } else {
+              // No submit button found — try pressing Enter
+              logger.info(`[playwright.agent] Tier 1.7: no submit button found — trying Enter key`);
+              const _enterRes = await browserAct({ action: 'press', key: 'Enter', sessionId, headed, timeoutMs: 5000 });
+              _tier17Transcript.push({ action: { press: 'Enter' }, outcome: { ok: _enterRes.ok } });
+
+              if (_enterRes.ok) {
+                await new Promise(r => setTimeout(r, 1500));
+                const _verifyTextRes = await browserAct({ action: 'getPageText', sessionId, headed, timeoutMs: 10000 }).catch(() => ({ ok: false }));
+                const _pageText = _verifyTextRes?.ok ? String(_verifyTextRes.result || '') : '';
+                const _textOnPage = _pageText.includes(_textPayload.slice(0, 50));
+
+                if (_textOnPage) {
+                  logger.info(`[playwright.agent] Tier 1.7: SUCCESS via Enter — content verified on page`);
+                  return {
+                    ok: true, goal, sessionId,
+                    turns: 2, done: true,
+                    result: 'Completed via Tier 1.7 fast-path (type→Enter→verify)',
+                    transcript: _tier17Transcript,
+                    routingDecision: 'tier1_7_fastpath',
+                    pageType: _pageType,
+                    executionTime: Date.now() - start,
+                  };
+                }
+              }
+              logger.warn(`[playwright.agent] Tier 1.7: Enter key did not produce verifiable result — falling through to Tier 3`);
+            }
+          }
+        } else {
+          logger.info(`[playwright.agent] Tier 1.7: text payload too short/long or multi-field — falling through to Tier 3 (payload length=${_textPayload.length})`);
+        }
+      } else {
+        logger.info(`[playwright.agent] Tier 1.7: goal does not match simple single-action pattern — falling through to Tier 3`);
+      }
+    } else if (_tier17Snap?.ok) {
+      // ── Tier 1.7 secondary trigger: compose URL + text input detected but not focused ──
+      // If the URL is a compose URL and the snapshot contains text input elements,
+      // try clicking the compose element to focus it, then proceed with type→submit→verify.
+      const _snapYaml = _tier17Snap?.result || _tier17Snap?.stdout || '';
+      const _curUrl = await _engineEval(sessionId, 'window.location.href').catch(() => null);
+      const _actualUrl = _curUrl?.ok ? String(_curUrl.result).trim().replace(/^"|"$/g, '') : url;
+      const _isComposeUrl = isFormUrl(url) || isFormUrl(_actualUrl) ||
+        /shareActive=true|compose\/post|compose=new|\/compose\b|posting\?compose=true/i.test(_actualUrl || url || '');
+
+      if (_isComposeUrl) {
+        // Find text input elements in the snapshot YAML
+        const _composeRe = /\[(td\d+|e\d+)\]\s+(?:textbox|combobox|searchbox)\s+"([^"]*)"/gi;
+        let _composeRef = null;
+        let _composeLabel = '';
+        let _m;
+        while ((_m = _composeRe.exec(_snapYaml)) !== null) {
+          // Prefer elements with placeholder/label that look like compose areas
+          const _label = _m[2].toLowerCase();
+          if (!/_composeRef/.length || /post|share|write|compose|message|what|comment|reply|ask|search|type/i.test(_label) || _m[1].startsWith('td')) {
+            _composeRef = _m[1];
+            _composeLabel = _m[2];
+            break;
+          }
+        }
+        // Also try contenteditable elements
+        if (!_composeRef) {
+          const _ceRe = /\[(td\d+|e\d+)\]\s+\w+\s+"[^"]*"\s*\[contenteditable\]/i;
+          const _ceM = _ceRe.exec(_snapYaml);
+          if (_ceM) {
+            _composeRef = _ceM[1];
+            _composeLabel = '(contenteditable)';
+          }
+        }
+
+        if (_composeRef) {
+          logger.info(`[playwright.agent] Tier 1.7 secondary: compose URL detected, clicking compose element ref=${_composeRef} label="${_composeLabel}" to focus it`);
+
+          // Click the compose element to focus it
+          const _focusClick = await browserAct({ action: 'click', selector: _composeRef, sessionId, headed, timeoutMs: Math.min(timeoutMs, 10000) });
+          if (_focusClick?.ok) {
+            // Take a fresh snapshot to check if focus shifted to the compose element
+            await new Promise(r => setTimeout(r, 500));
+            const _reSnap = await _fastSnapshot(sessionId, headed, timeoutMs);
+            const _reActiveEl = _reSnap?.activeElement;
+            if (_reActiveEl && _reActiveEl.isPrimaryInput) {
+              logger.info(`[playwright.agent] Tier 1.7 secondary: focus shifted to primary input (tag=${_reActiveEl.tag}, role=${_reActiveEl.role}) — proceeding with type→submit→verify`);
+
+              // Now run the same type→submit→verify logic as the primary path
+              const _goalLower = goal.toLowerCase();
+              const _isSimpleGoal = !/\bto\s+[\w.+-]+@|subject|recipient|cc|bcc|attach|file|upload\b/i.test(goal) &&
+                (/\b(post|share|update|tweet|send|write|say|ask|tell|search|query|look\s+up|find|message)\b/i.test(_goalLower));
+
+              if (_isSimpleGoal) {
+                let _textPayload = goal
+                  .replace(/^(?:please\s+)?(?:can\s+you\s+)?(?:I\s+want\s+to\s+|I'd\s+like\s+to\s+)?/i, '')
+                  .replace(/^(?:post|share|update|tweet|send|write|say|ask|tell|search\s+for|query|look\s+up|find|message)\s+/i, '')
+                  .replace(/^(?:on\s+|to\s+|in\s+)?(?:linkedin|twitter|x\.com|chatgpt|claude|grok|perplexity|gmail|outlook|notion|slack|discord|bluesky|threads|facebook|instagram)\s+/i, '')
+                  .replace(/^(?:that|about|regarding|saying)\s+/i, '')
+                  .replace(/^(?:to\s+|with\s+|for\s+)/i, '')
+                  .trim();
+
+                if (_textPayload.length >= 3 && _textPayload.length <= 2000) {
+                  logger.info(`[playwright.agent] Tier 1.7 secondary: simple goal — text payload="${_textPayload.slice(0, 80)}..." — attempting type→submit→verify`);
+
+                  const _tier17Transcript = [];
+                  const _typeRes = await browserAct({ action: 'type', text: _textPayload, sessionId, headed, timeoutMs: Math.min(timeoutMs, 30000) });
+                  _tier17Transcript.push({ action: { type: _textPayload.slice(0, 100) }, outcome: { ok: _typeRes.ok, error: _typeRes.error } });
+
+                  if (_typeRes.ok) {
+                    const _snapResult2 = await _fastSnapshot(sessionId, headed, timeoutMs);
+                    const _snapYaml2 = _snapResult2?.result || _snapResult2?.stdout || '';
+                    let _submitRef = null;
+                    const _submitRe = /\[(td\d+|e\d+)\]\s+(?:button|link|generic)\s+"([^"]*(?:post|send|submit|ask|search|share|tweet|publish|create|go|enter|continue)[^"]*)"/gi;
+                    let _m2;
+                    while ((_m2 = _submitRe.exec(_snapYaml2)) !== null) {
+                      _submitRef = _m2[1];
+                      logger.info(`[playwright.agent] Tier 1.7 secondary: found submit button ref=${_submitRef} label="${_m2[2]}"`);
+                      break;
+                    }
+
+                    if (_submitRef) {
+                      const _clickRes = await browserAct({ action: 'click', selector: _submitRef, sessionId, headed, timeoutMs: Math.min(timeoutMs, 15000) });
+                      _tier17Transcript.push({ action: { click: _submitRef }, outcome: { ok: _clickRes.ok, error: _clickRes.error } });
+
+                      if (_clickRes.ok) {
+                        await new Promise(r => setTimeout(r, 1500));
+                        const _verifyUrlRes = await browserAct({ action: 'evaluate', text: 'window.location.href', sessionId, headed, timeoutMs: 3000 }).catch(() => ({ ok: false }));
+                        const _verifyTextRes = await browserAct({ action: 'getPageText', sessionId, headed, timeoutMs: 10000 }).catch(() => ({ ok: false }));
+                        const _pageText = _verifyTextRes?.ok ? String(_verifyTextRes.result || '') : '';
+                        const _textOnPage = _pageText.includes(_textPayload.slice(0, 50));
+                        const _urlChanged = _verifyUrlRes?.ok && String(_verifyUrlRes.result || '').replace(/^"|"$/g, '') !== url;
+
+                        if (_textOnPage || _urlChanged) {
+                          logger.info(`[playwright.agent] Tier 1.7 secondary: SUCCESS — textOnPage=${_textOnPage}, urlChanged=${_urlChanged}`);
+                          return {
+                            ok: true, goal, sessionId,
+                            turns: 2, done: true,
+                            result: `Completed via Tier 1.7 secondary fast-path (click-compose→type→submit→verify)${_textOnPage ? ' — content verified on page' : ' — URL changed'}`,
+                            transcript: _tier17Transcript,
+                            routingDecision: 'tier1_7_secondary',
+                            pageType: _pageType,
+                            executionTime: Date.now() - start,
+                          };
+                        }
+                      }
+                    } else {
+                      logger.info(`[playwright.agent] Tier 1.7 secondary: no submit button found — trying Enter key`);
+                      const _enterRes = await browserAct({ action: 'press', key: 'Enter', sessionId, headed, timeoutMs: 5000 });
+                      if (_enterRes?.ok) {
+                        await new Promise(r => setTimeout(r, 1500));
+                        const _verifyTextRes = await browserAct({ action: 'getPageText', sessionId, headed, timeoutMs: 10000 }).catch(() => ({ ok: false }));
+                        const _pageText = _verifyTextRes?.ok ? String(_verifyTextRes.result || '') : '';
+                        if (_pageText.includes(_textPayload.slice(0, 50))) {
+                          logger.info(`[playwright.agent] Tier 1.7 secondary: SUCCESS via Enter — content verified on page`);
+                          return {
+                            ok: true, goal, sessionId,
+                            turns: 2, done: true,
+                            result: 'Completed via Tier 1.7 secondary fast-path (click-compose→type→Enter→verify)',
+                            transcript: _tier17Transcript,
+                            routingDecision: 'tier1_7_secondary',
+                            pageType: _pageType,
+                            executionTime: Date.now() - start,
+                          };
+                        }
+                      }
+                    }
+                  }
+                  logger.warn(`[playwright.agent] Tier 1.7 secondary: type→submit→verify did not complete — falling through to Tier 3`);
+                } else {
+                  logger.info(`[playwright.agent] Tier 1.7 secondary: text payload too short/long (length=${_textPayload.length}) — falling through`);
+                }
+              } else {
+                logger.info(`[playwright.agent] Tier 1.7 secondary: goal does not match simple single-action — falling through`);
+              }
+            } else {
+              logger.info(`[playwright.agent] Tier 1.7 secondary: click did not focus a primary input — falling through to Tier 3`);
+            }
+          } else {
+            logger.info(`[playwright.agent] Tier 1.7 secondary: click on compose element failed (${_focusClick?.error}) — falling through to Tier 3`);
+          }
+        } else {
+          logger.info(`[playwright.agent] Tier 1.7 secondary: compose URL but no text input element found in snapshot — falling through to Tier 3`);
+        }
+      }
+    }
+  } catch (_tier17Err) {
+    logger.warn(`[playwright.agent] Tier 1.7 error (non-fatal): ${_tier17Err.message} — falling through`);
   }
 
   // ── Phase 1.1: Page probe + intelligent routing ─────────────────────────────
@@ -3154,6 +4769,16 @@ async function playwrightAgent(args) {
       }
 
       // Fall back to best-effort keyboard
+      // ── Fresh-line guard: if this is a retry continuing a prior partial attempt,
+      // the cursor may be left mid-line (prior tier's last typed step had no
+      // trailing Enter). Typing here would concatenate onto that existing text,
+      // producing corrupted merged lines. Press Enter first to guarantee a fresh
+      // line — a safe no-op if the cursor is already on an empty line (list-style
+      // blocks in most editors collapse/ignore a stray empty trailing item).
+      if (_partialProgressNote) {
+        logger.info(`[playwright.agent] fresh-line guard: continuing prior partial attempt — pressing Enter before best-effort retry`);
+        await browserAct({ action: 'press', key: 'Enter', sessionId, headed, timeoutMs: 5000 }).catch(() => {});
+      }
       const _bestEffort = await bestEffortKeyboard(goal + _partialProgressNote, _pageType, sessionId, headed, timeoutMs);
       if (_bestEffort.ok) {
         logger.info(`[playwright.agent] Tier 2.5 best-effort keyboard succeeded — ${_bestEffort.transcript.length} steps`);
@@ -3192,7 +4817,13 @@ async function playwrightAgent(args) {
   // Fires ONLY when the snapshot matches a known interstitial pattern (zero LLM
   // calls on normal pages). Clicks past onboarding, cookie walls, setup wizards,
   // etc. so Phase 2 plan generation always sees a clean starting page.
-  if (looksLikeInterstitial(currentSnapshot)) {
+  // Skip orientation if the page probe showed an active editable element — if focus is
+  // already inside an editor (contenteditable, textarea, input), the page is not blocked
+  // by an interstitial by definition. This prevents false positives on ready editor pages
+  // (e.g. Notion's "Get started with..." text matching interstitial regex on a blank page).
+  const _skipOrientationForEditable = _probeResult?.activeElementEditable === true;
+
+  if (!_skipOrientationForEditable && looksLikeInterstitial(currentSnapshot)) {
     logger.info(`[playwright.agent] phase 1.2: interstitial detected — running orientation loop (up to ${MAX_ORIENT_STEPS} steps)`);
     currentSnapshot = await orientPage({ goal, snapshot: currentSnapshot, sessionId, headed, timeoutMs, learnedRulesBlock: '', domainLockBlock });
 
@@ -3215,14 +4846,42 @@ async function playwrightAgent(args) {
   }
 
   // ── Phase 1.5: Load learned rules for this agent/hostname ──────────────────
+  // First, purge any existing ref-based learned rules (e.g. "click e12 instead of e5")
+  // that were saved by a bug in prior runs. These rules contain ephemeral element refs
+  // that are snapshot-specific and will be wrong on every future page load.
   let learnedRulesBlock = '';
   try {
     const ruleKeys = [agentId];
     if (hostname) ruleKeys.push(hostname);
+    // Purge ref-based rules fire-and-forget
+    (async () => {
+      try {
+        const _allRules = await skillDb.listAllContextRules();
+        const _refRuleRe = /\be\d+\b/i;
+        let _purgedCount = 0;
+        for (const [_ctxKey, _rules] of Object.entries(_allRules || {})) {
+          if (!ruleKeys.includes(_ctxKey)) continue;
+          if (!Array.isArray(_rules)) continue;
+          for (const _rule of _rules) {
+            const _text = _rule.ruleText || _rule.rule_text || '';
+            if (_refRuleRe.test(_text) && _rule.id) {
+              await skillDb.deleteContextRuleById(_rule.id);
+              _purgedCount++;
+              logger.info(`[playwright.agent] purged ref-based learned rule for ${_ctxKey}: "${_text.slice(0, 80)}"`);
+            }
+          }
+        }
+        if (_purgedCount > 0) {
+          logger.info(`[playwright.agent] purged ${_purgedCount} ref-based learned rule(s) for [${ruleKeys.join(', ')}]`);
+        }
+      } catch (_) { /* non-fatal */ }
+    })();
     const rules = await skillDb.getContextRulesByKeys(ruleKeys);
-    if (rules.length > 0) {
-      learnedRulesBlock = `\n\nLEARNED RULES (from prior runs — advisory, not absolute):\n${rules.map(r => `- ${r}`).join('\n')}\n- Never use tutorial placeholders (example@domain.com, /path/to/...) unless the user explicitly asked for an example.`;
-      logger.info(`[playwright.agent] ${rules.length} learned rule(s) injected for [${ruleKeys.join(', ')}]`);
+    // Double-filter: also skip any ref-based rules that slip through between purge and read
+    const _safeRules = rules.filter(r => !/\be\d+\b/i.test(r));
+    if (_safeRules.length > 0) {
+      learnedRulesBlock = `\n\nLEARNED RULES (from prior runs — advisory, not absolute):\n${_safeRules.map(r => `- ${r}`).join('\n')}\n- Never use tutorial placeholders (example@domain.com, /path/to/...) unless the user explicitly asked for an example.`;
+      logger.info(`[playwright.agent] ${_safeRules.length} learned rule(s) injected for [${ruleKeys.join(', ')}]${rules.length !== _safeRules.length ? ` (${rules.length - _safeRules.length} ref-based rules filtered)` : ''}`);
     }
   } catch (_) { /* non-fatal — proceed without rules */ }
 
@@ -3243,6 +4902,20 @@ async function playwrightAgent(args) {
   // when results are already displayed, re-navigating when already on target URL.
   // Injected as a NOTE in effectiveGoal so the LLM skips already-done steps.
   let _goalStateNote = '';
+
+  // ── Compose-URL note: prevent LLM from clicking "Start a post" behind an open modal ──
+  // When the URL contains a compose param (shareActive=true, compose/post, etc.) OR
+  // the fast path detected an open modal OR the page probe detected a modal dialog,
+  // inject an imperative note so the LLM types directly into the composer instead
+  // of planning a click to open it.
+  if (url && /shareActive=true|compose\/post|compose=new|\/compose\b|posting\?compose=true/i.test(url)) {
+    _goalStateNote = '\n\nIMPORTANT: The composer/modal is ALREADY OPEN (opened by the URL deep-link). Do NOT click "Start a post" or any button to open a composer — it is already open. Type directly into the composer text area (contenteditable or textarea) using refs from the snapshot above.';
+    logger.info(`[playwright.agent] goal-state: compose URL detected — injecting "composer already open" note`);
+  } else if (_composerModalOpen || _probeResult?.hasModalDialog) {
+    _goalStateNote = '\n\nIMPORTANT: A composer/modal is ALREADY OPEN on the page. Do NOT click "Start a post" or any button to open a composer — it is already open. Type directly into the composer text area (contenteditable or textarea) using refs from the snapshot above.';
+    logger.info(`[playwright.agent] goal-state: modal open (${_composerModalOpen ? 'fast-path' : 'page-probe'}) — injecting "composer already open" note`);
+  }
+
   try {
     if (_isComposeTask && _isMailAgentTask) {
       // Require a real compose form, not just the sidebar "Compose" button. The inbox has a Compose
@@ -3315,11 +4988,156 @@ async function playwrightAgent(args) {
     logger.warn(`[playwright.agent] phase 1.7: page study failed (non-fatal): ${_studyErr.message}`);
   }
 
+  // ── Phase 2: Turn-loop (URL-first tiers did not complete) ──────────────
+  // NOTE: Script-gen (phase 1.9) and Plan-Execute (phase 2+3) are commented out
+  // below. They had too many failure modes (false success reporting, stale refs,
+  // blind to contenteditable elements, LLM making wrong decisions about modal state).
+  // The turn-loop is more robust: fresh snapshot + page text + probe each turn,
+  // adapts after each action. Uses reactFill/clickByText/clickBySelector.
+  // If simple tasks are too slow (too many LLM calls per turn), we can re-enable
+  // Plan-Execute with a simple-task router for type→submit→read tasks.
+  logger.info(`[playwright.agent] phase 2: URL-first tiers did not complete - starting turn-loop`);
+  try {
+    const _turnLoopResult = await _executeTurnLoopFallback({
+      goal: _finalGoal,
+      extractedText: _extractedComposeText,
+      textAlreadyEntered: _textAlreadyEntered,
+      heartbeat: _heartbeat,
+      sessionId,
+      headed,
+      timeoutMs,
+      agentContext,
+      transcript: [],
+      deadline: _deadline,
+      start,
+    });
+    if (_turnLoopResult.ok) {
+      _turnLoopResult.executionTime = Date.now() - start;
+      _heartbeat.stop();
+      return _turnLoopResult;
+    }
+    logger.warn(`[playwright.agent] turn-loop failed: ${_turnLoopResult.error || 'unknown'} - surfacing ask_user`);
+    _heartbeat.stop();
+    return { ..._failureAskUser(`Turn-loop failed: ${_turnLoopResult.error || 'could not complete task'}`), executionTime: Date.now() - start };
+  } catch (_turnLoopErr) {
+    logger.warn(`[playwright.agent] turn-loop threw: ${_turnLoopErr.message} - surfacing ask_user`);
+    _heartbeat.stop();
+    return { ..._failureAskUser(`Turn-loop error: ${_turnLoopErr.message}`), executionTime: Date.now() - start };
+  }
+
+  // ── [DISABLED] Phase 1.9: Script-Generation Mode ───────────────────────
+  // For compose/post/form tasks, try the injection-first path BEFORE Plan-Execute.
+  // The LLM generates a single run-code script using reactFill/clickByText/clickBySelector
+  // that programmatically completes the task. More deterministic than snapshot-ref planning
+  // for modal interactions. Falls through to Plan-Execute on failure.
+  // DISABLED — see note above. This code is unreachable because the turn-loop
+  // call above returns before reaching here. Kept for potential future re-enablement.
+  if (false && _isInjectionCandidate(_finalGoal, _probeResult)) {
+    logger.info(`[playwright.agent] phase 1.9: task is injection candidate — trying script-generation mode`);
+    try {
+      const _scriptResult = await _executeScriptGeneration({
+        goal: _finalGoal,
+        sessionId,
+        headed,
+        timeoutMs,
+        agentContext,
+        probeResult: _probeResult,
+        pageStudy: _pageStudy,
+        deadline: _deadline,
+      });
+      if (_scriptResult.ok) {
+        logger.info(`[playwright.agent] script-gen succeeded — returning early (verified=${_scriptResult.verified})`);
+        return {
+          ok: true,
+          goal,
+          sessionId,
+          turns: 1,
+          done: true,
+          result: _scriptResult.result || 'Completed via script-generation',
+          transcript: [{
+            action: 'script-gen',
+            outcome: { ok: true, verified: _scriptResult.verified },
+            script: _scriptResult.script,
+          }],
+          routingDecision: 'script_gen',
+          pageType: _pageType,
+          executionTime: Date.now() - start,
+        };
+      }
+      logger.warn(`[playwright.agent] script-gen failed: ${_scriptResult.error} — falling through to Plan-Execute`);
+      _partialProgressNote = `\n\nNOTE: A script-generation attempt was made but failed (${_scriptResult.error}). Inspect the current page state — the script may have partially executed. Do NOT repeat completed actions.`;
+    } catch (_scriptGenErr) {
+      logger.warn(`[playwright.agent] script-gen threw: ${_scriptGenErr.message} — falling through to Plan-Execute`);
+    }
+  } else {
+    logger.info(`[playwright.agent] phase 1.9: task is not an injection candidate — using Plan-Execute`);
+  }
+
   // ── Phase 2: Plan generation ───────────────────────────────────────────────
   logger.info(`[playwright.agent] phase 2: generating plan`);
+
+  // ── Scoped snapshot: when a modal/dialog is open, filter the full-page snapshot
+  // (which HAS refs from buildRefTree) to only show the dialog section. This
+  // prevents the LLM from planning clicks on elements behind the modal (e.g.
+  // "Start a post" behind the composer) while preserving refs for the click engine.
+  let _planningSnapshot = currentSnapshot;
+  let _useConstrainedComposePrompt = false;
+  if (_probeResult?.hasModalDialog) {
+    const _scopedSnap = await _filterSnapshotToModal(sessionId, currentSnapshot);
+    if (_scopedSnap.ok && _scopedSnap.result) {
+      _planningSnapshot = _scopedSnap.result;
+      // Use the constrained compose prompt when the modal has a compose element
+      // AND the task is a compose/post/update task (detected via URL pattern or goal text)
+      const _composeUrl = /shareActive=true|compose\/post|compose=new|\/compose\b|posting\?compose=true/i.test(url || '');
+      const _composeGoal = /post|update|share|tweet|publish|send|write|message/i.test(_finalGoal || '');
+      if (_scopedSnap.hasCompose && (_composeUrl || _composeGoal)) {
+        _useConstrainedComposePrompt = true;
+      }
+      logger.info(`[playwright.agent] phase 2: using scoped modal snapshot for planning (${_planningSnapshot.length} chars, constrained=${_useConstrainedComposePrompt})`);
+    } else {
+      logger.info(`[playwright.agent] phase 2: scoped snapshot unavailable — using full snapshot`);
+    }
+  }
+
+  // ── Constrained compose prompt: when a composer modal is open with a text input,
+  // use a simpler prompt that constrains the LLM to type + click submit. This
+  // reduces the LLM's degrees of freedom and prevents it from planning wrong
+  // actions (navigate, click "Start a post", etc.).
+  const COMPOSE_PLAN_PROMPT = `You are a browser automation expert. A COMPOSER MODAL IS OPEN on the page.
+The snapshot below shows ONLY the interactive elements inside the modal — they all have refs (e1, e2, etc.).
+
+Your task is simple:
+1. Find the text input (textbox, contenteditable, or textarea) in the snapshot — type the update text into it
+2. Find the submit button (Post, Publish, Send, Share, Tweet) in the snapshot — click it to submit
+
+DO NOT navigate anywhere. DO NOT click "Start a post" or any button to open a composer — it is ALREADY OPEN.
+DO NOT click elements outside the modal — the snapshot only shows modal elements.
+Use refs (e1, e2, etc.) from the snapshot for all actions.
+
+Output a JSON plan: { "plan": [ { "action": "type", "selector": "eXX", "text": "..." }, { "action": "click", "selector": "eYY" } ] }`;
+
+  const _planSystemPrompt = _useConstrainedComposePrompt
+    ? COMPOSE_PLAN_PROMPT + domainLockBlock
+    : PLAN_SYSTEM_PROMPT + learnedRulesBlock + domainLockBlock;
+
+  // Build active element context block for the plan prompt
+  let _activeElBlock = '';
+  if (_activeElementInfo) {
+    const _aeTag = _activeElementInfo.tag || 'unknown';
+    const _aeType = _activeElementInfo.type || '';
+    const _aePlaceholder = _activeElementInfo.placeholder || '';
+    const _aeRole = _activeElementInfo.role || '';
+    const _aePrimary = _activeElementInfo.isPrimaryInput;
+    if (_aePrimary) {
+      _activeElBlock = `\n# Active element: <${_aeTag}${_aeType ? ` type="${_aeType}"` : ''}${_aeRole ? ` role="${_aeRole}"` : ''}${_aePlaceholder ? ` placeholder="${_aePlaceholder}"` : ''}> [primary-input] — focus is already in this input; type directly without clicking first.\n`;
+    } else if (_aeTag && _aeTag !== 'body') {
+      _activeElBlock = `\n# Active element: <${_aeTag}${_aeType ? ` type="${_aeType}"` : ''}${_aeRole ? ` role="${_aeRole}"` : ''}>\n`;
+    }
+  }
+
   const planMessages = [
-    { role: 'system', content: PLAN_SYSTEM_PROMPT + learnedRulesBlock + domainLockBlock },
-    { role: 'user',   content: `GOAL: ${_finalGoal}${_studyBlock}\n\nSNAPSHOT:\n${pruneSnapshot(extractInteractiveRefs(currentSnapshot))}${agentContext ? `\n\nAGENT CONTEXT (agent instructions — follow these for site-specific behaviour):\n${agentContext}` : ''}` },
+    { role: 'system', content: _planSystemPrompt },
+    { role: 'user',   content: `GOAL: ${_finalGoal}${_studyBlock}${_activeElBlock}\n\nSNAPSHOT:\n${pruneSnapshot(extractInteractiveRefs(_planningSnapshot))}${agentContext ? `\n\nAGENT CONTEXT (agent instructions — follow these for site-specific behaviour):\n${agentContext}` : ''}` },
   ];
   // Dynamic token cap: short focused tasks (< 400 chars) seldom produce > 3 steps
   // so 800 tokens avoids wasting 1-2s on padding. Complex multi-site goals get 2048.
@@ -3476,6 +5294,21 @@ async function playwrightAgent(args) {
   let _mutationClickTs = null; // timestamp of last submit click after fill/type (mutation tracking)
   let _hasFillOrType = false; // true if a fill/type step succeeded in the current plan iteration
 
+  // ── Page-content fetcher for re-plan prompts ──────────────────────────────
+  // Fetches document.body.innerText (truncated) so the re-plan LLM can see what
+  // content already exists on the page. Without this, the LLM only sees interactive
+  // element refs and may hallucinate "create new page" instead of fixing in-place.
+  async function _fetchPageContentForReplan() {
+    try {
+      const _pc = await browserAct({ action: 'getPageText', sessionId, headed, timeoutMs: 5000 });
+      if (_pc.ok && _pc.result) {
+        const text = String(_pc.result).slice(0, 1000);
+        return `\nCURRENT_PAGE_CONTENT (first 1000 chars of existing page text — use this to avoid recreating content that already exists):\n${text}\n`;
+      }
+    } catch (_) { /* non-fatal — re-plan proceeds without content */ }
+    return '';
+  }
+
   // Actions that can mutate the DOM structure (open modals, navigate pages, reveal
   // new elements via lazy-load, toggle conditional sections, etc.).  After any of these
   // succeeds we automatically re-snapshot so snapshotCache stays current, and if ≥30%
@@ -3595,16 +5428,18 @@ async function playwrightAgent(args) {
           const placeholderWarningBlock = placeholderWarnings.size > 0
             ? `\n\n⚠️ PLACEHOLDER VIOLATION WARNING: The previous plan used bracketed placeholders like [${Array.from(placeholderWarnings).join('], [')}]. These placeholders cause catastrophic failures because they return literal text instead of actual content. NEVER use bracketed placeholders like [SEARCH RESULTS], [CONTENT], [DATA], etc. Use getPageText or run-code and let the result flow through automatically. Do NOT add a return step with placeholder text.`
             : '';
+          const _snapReplanContent = await _fetchPageContentForReplan();
           try {
             const snapReplanRaw = await askWithMessages([
               { role: 'system', content: REPLAN_SYSTEM_PROMPT },
               { role: 'user', content: [
-                `GOAL: ${goal}`,
+                `GOAL: ${_finalGoal || effectiveGoal}`,
                 `COMPLETED_STEPS: ${JSON.stringify(plan.slice(0, stepIndex + 1))}`,
                 `STALE_REMAINING_PLAN: ${JSON.stringify(remainingAfterSnap)}`,
                 ``,
                 `FRESH_SNAPSHOT (interactive elements only — full ${countRefs(currentSnapshot)}-ref page):`,
                 pruneSnapshot(extractInteractiveRefs(currentSnapshot)),
+                _snapReplanContent,
                 learnedRulesBlock,
                 placeholderWarningBlock,
                 ...(agentContext ? [
@@ -3690,7 +5525,8 @@ async function playwrightAgent(args) {
         });
         if (!outcome.ok) {
           if (totalRepairs >= maxRepairs) {
-            return { ok: false, goal, sessionId, turns: transcript.length, done: false, result: `external_skill ${skillName} failed: ${outcome.error}`, transcript, error: outcome.error, executionTime: Date.now() - start };
+            logger.warn(`[playwright.agent] external_skill ${skillName} failed — repair limit (${maxRepairs}) reached; surfacing ask_user`);
+            return { ..._failureAskUser(`External skill "${skillName}" failed: ${outcome.error}`), transcript };
           }
           totalRepairs++;
           logger.info(`[playwright.agent] external_skill ${skillName} failed — repair ${totalRepairs}/${maxRepairs}: ${outcome.error}`);
@@ -3700,7 +5536,7 @@ async function playwrightAgent(args) {
           try {
             const repairRaw = await askWithMessages([
               { role: 'system', content: REPAIR_SYSTEM_PROMPT + domainLockBlock },
-              { role: 'user', content: [`GOAL: ${goal}`, `FAILED_STEP: ${JSON.stringify(step)}`, `ERROR: ${outcome.error}`, `REMAINING_PLAN: ${JSON.stringify(plan.slice(stepIndex + 1))}`, ``, `SNAPSHOT:`, trimSnapshot(currentSnapshot)].join('\n') },
+              { role: 'user', content: [`GOAL: ${_finalGoal || effectiveGoal}`, `FAILED_STEP: ${JSON.stringify(step)}`, `ERROR: ${outcome.error}`, `REMAINING_PLAN: ${JSON.stringify(plan.slice(stepIndex + 1))}`, ``, `SNAPSHOT:`, trimSnapshot(currentSnapshot)].join('\n') },
             ], { temperature: 0.1, maxTokens: 1024, responseTimeoutMs: 20000 });
             const repairParsed = parseJson(repairRaw);
             if (repairParsed && Array.isArray(repairParsed.repair) && repairParsed.repair.length > 0) {
@@ -3725,7 +5561,7 @@ async function playwrightAgent(args) {
                   : '';
                 const snapReplanRaw = await askWithMessages([
                   { role: 'system', content: REPLAN_SYSTEM_PROMPT },
-                  { role: 'user', content: [`GOAL: ${goal}`, `COMPLETED_STEPS: ${JSON.stringify(plan.slice(0, stepIndex + 1))}`, `STALE_REMAINING_PLAN: ${JSON.stringify(remaining)}`, ``, `FRESH_SNAPSHOT (interactive elements only — full ${countRefs(currentSnapshot)}-ref page):`, extractInteractiveRefs(currentSnapshot), learnedRulesBlock, extPlaceholderWarning, ...(agentContext ? [``, `AGENT CONTEXT (site-specific instructions — follow these for this service):`, agentContext] : [])].join('\n') },
+                  { role: 'user', content: [`GOAL: ${_finalGoal || effectiveGoal}`, `COMPLETED_STEPS: ${JSON.stringify(plan.slice(0, stepIndex + 1))}`, `STALE_REMAINING_PLAN: ${JSON.stringify(remaining)}`, ``, `FRESH_SNAPSHOT (interactive elements only — full ${countRefs(currentSnapshot)}-ref page):`, extractInteractiveRefs(currentSnapshot), learnedRulesBlock, extPlaceholderWarning, ...(agentContext ? [``, `AGENT CONTEXT (site-specific instructions — follow these for this service):`, agentContext] : [])].join('\n') },
                 ], { temperature: 0.1, maxTokens: 1024, responseTimeoutMs: 20000 });
                 const snapReplanParsed = parseJson(snapReplanRaw);
                 if (snapReplanParsed && Array.isArray(snapReplanParsed.plan) && snapReplanParsed.plan.length > 0) {
@@ -3796,7 +5632,7 @@ async function playwrightAgent(args) {
                     const _recoverRepairRaw = await askWithMessages([
                       { role: 'system', content: REPAIR_SYSTEM_PROMPT + domainLockBlock },
                       { role: 'user', content: [
-                        `GOAL: ${goal}`,
+                        `GOAL: ${_finalGoal || effectiveGoal}`,
                         `FAILED_STEP: ${JSON.stringify(step)}`,
                         `ERROR: Page was about:blank but has been recovered. Re-plan from the current page state.`,
                         `REMAINING_PLAN: ${JSON.stringify(plan.slice(stepIndex))}`,
@@ -3828,7 +5664,8 @@ async function playwrightAgent(args) {
             });
             // Force repair path
             if (totalRepairs >= maxRepairs) {
-              return { ok: false, goal, sessionId, turns: transcript.length, done: false, result: `Page stayed blank — cannot execute ${step.action}`, transcript, error: outcome.error, executionTime: Date.now() - start };
+              logger.warn(`[playwright.agent] page-ready guard: repair limit (${maxRepairs}) reached; surfacing ask_user`);
+              return { ..._failureAskUser(`Page stayed blank — cannot execute ${step.action}`), transcript };
             }
             totalRepairs++;
             const _guardSnap = await _fastSnapshot(sessionId, headed, timeoutMs);
@@ -3836,7 +5673,7 @@ async function playwrightAgent(args) {
             try {
               const _guardRepairRaw = await askWithMessages([
                 { role: 'system', content: REPAIR_SYSTEM_PROMPT + domainLockBlock },
-                { role: 'user', content: [`GOAL: ${goal}`, `FAILED_STEP: ${JSON.stringify(step)}`, `ERROR: Page was about:blank — the page may still be loading or redirecting. Wait for the page to fully load before retrying.`, `REMAINING_PLAN: ${JSON.stringify(plan.slice(stepIndex + 1))}`, ``, `SNAPSHOT:`, trimSnapshot(currentSnapshot)].join('\n') },
+                { role: 'user', content: [`GOAL: ${_finalGoal || effectiveGoal}`, `FAILED_STEP: ${JSON.stringify(step)}`, `ERROR: Page was about:blank — the page may still be loading or redirecting. Wait for the page to fully load before retrying.`, `REMAINING_PLAN: ${JSON.stringify(plan.slice(stepIndex + 1))}`, ``, `SNAPSHOT:`, trimSnapshot(currentSnapshot)].join('\n') },
               ], { temperature: 0.1, maxTokens: 1024, responseTimeoutMs: 20000 });
               const _guardRepairParsed = parseJson(_guardRepairRaw);
               if (_guardRepairParsed && Array.isArray(_guardRepairParsed.repair) && _guardRepairParsed.repair.length > 0) {
@@ -3983,7 +5820,23 @@ async function playwrightAgent(args) {
               }
             }
           }
+          // Capture pre-click state for submit verification (used after click succeeds)
+          let _preClickState = null;
+          if (step.action === 'click' && _isSubmitLikeClick(step, _hasFillOrType)) {
+            try {
+              const _page = engine.getPage(sessionId);
+              if (_page) {
+                _preClickState = await _page.evaluate(() => ({
+                  url: window.location.href,
+                  modalCount: document.querySelectorAll('[role="dialog"], #interop-outlet, .share-creation, [data-testid*="modal"], [data-testid*="share"]').length,
+                  bodyLen: (document.body?.innerText || '').length,
+                }));
+              }
+            } catch (_) {}
+          }
           outcome = await browserAct({ ...step, sessionId, headed, timeoutMs });
+          // Attach pre-click state for submit verification below
+          if (_preClickState) outcome._preClickState = _preClickState;
         }
       } catch (err) {
         outcome = { ok: false, error: err.message };
@@ -4038,10 +5891,16 @@ async function playwrightAgent(args) {
       const thoughts = outcome.ok ? '' : (outcome.error || 'failed');
       transcript.push({ step: stepIndex + 1, action: step, outcome, thoughts });
 
-      // ── Mutation submit tracking (Issue 2b) ────────────────────────────────
+      // ── Mutation submit tracking + auto-verify state change ────────────────
       // Record _mutationClickTs when a click with purpose:'submit' succeeds after
       // a fill/type step. Used by the goal judge and replan guard to prevent
       // duplicate mutations (e.g. double-posting a tweet).
+      //
+      // AUTO-VERIFY: For submit-like clicks, verify the action actually happened
+      // by checking for observable state change (modal closed, URL changed, content
+      // changed). If no state change within 3s, mark as failed — the button may be
+      // disabled, form may have validation errors, or wrong button was clicked.
+      // This is deterministic — no LLM-generated "expected" field needed.
       if (outcome.ok) {
         if (step.action === 'fill' || step.action === 'type') {
           _hasFillOrType = true;
@@ -4049,12 +5908,20 @@ async function playwrightAgent(args) {
             _typedTexts.add(_pendingDedupText);
           }
         }
-        if (step.action === 'click' && _hasFillOrType) {
+        if (step.action === 'click' && _isSubmitLikeClick(step, _hasFillOrType)) {
           const _purpose = String(step.purpose || '').toLowerCase();
           const _selHint = String(step.selector || step.ref || step['aria-label'] || '').toLowerCase();
-          if (_purpose === 'submit' || /post|submit|send|tweet|publish|create|save|reply/i.test(_selHint)) {
+          // Capture state before verification (the click already happened,
+          // so we read current state as "before" — the verification function
+          // will wait for FURTHER state change from this point)
+          const _verifyResult = await _verifySubmitStateChange(sessionId, outcome._preClickState, 3000);
+          if (_verifyResult.verified) {
             _mutationClickTs = Date.now();
-            logger.info(`[playwright.agent] mutation submit detected: click at ${_mutationClickTs} (purpose=${_purpose || 'inferred'}, selector=${_selHint.slice(0, 40)})`);
+            logger.info(`[playwright.agent] mutation submit verified: click at ${_mutationClickTs} (purpose=${_purpose || 'inferred'}, selector=${_selHint.slice(0, 40)}, change=${_verifyResult.reason})`);
+          } else {
+            // Submit click succeeded but no state change — likely a false positive
+            outcome = { ok: false, error: `Submit verification failed: ${_verifyResult.reason}` };
+            logger.warn(`[playwright.agent] submit verification FAILED: click succeeded but no state change — ${_verifyResult.reason} (purpose=${_purpose || 'inferred'}, selector=${_selHint.slice(0, 40)})`);
           }
         }
       }
@@ -4297,9 +6164,10 @@ async function playwrightAgent(args) {
             if (_microSnap.ok && _microSnap.result) {
               currentSnapshot = _microSnap.result;
               const _microRemaining = plan.slice(stepIndex + 1);
+              const _microContent = await _fetchPageContentForReplan();
               const _microRaw = await askWithMessages([
                 { role: 'system', content: REPLAN_SYSTEM_PROMPT + domainLockBlock },
-                { role: 'user', content: `GOAL: ${_finalGoal || effectiveGoal}\nSTALE_REMAINING:\n${JSON.stringify(_microRemaining)}\nFRESH_SNAPSHOT:\n${pruneSnapshot(extractInteractiveRefs(currentSnapshot))}${agentContext ? `\n\nAGENT CONTEXT (site-specific instructions — follow these for this service):\n${agentContext}` : ''}` },
+                { role: 'user', content: `GOAL: ${_finalGoal || effectiveGoal}\nSTALE_REMAINING:\n${JSON.stringify(_microRemaining)}\nFRESH_SNAPSHOT:\n${pruneSnapshot(extractInteractiveRefs(currentSnapshot))}${_microContent}${agentContext ? `\n\nAGENT CONTEXT (site-specific instructions — follow these for this service):\n${agentContext}` : ''}` },
               ], { temperature: 0.1, maxTokens: 800, responseTimeoutMs: 20000 }).catch(() => null);
               const _microParsed = _microRaw ? parseJson(_microRaw) : null;
               if (_microParsed && Array.isArray(_microParsed.plan) && _microParsed.plan.length > 0) {
@@ -4364,17 +6232,123 @@ async function playwrightAgent(args) {
       }
 
       if (totalRepairs >= maxRepairs) {
-        logger.warn(`[playwright.agent] step ${stepIndex + 1} failed — repair limit (${maxRepairs}) reached`);
-        return {
-          ok: false, goal, sessionId,
-          turns: transcript.length, done: false,
-          result: `Step ${stepIndex + 1} (${step.action}) failed: ${outcome.error}`,
-          transcript, error: outcome.error, executionTime: Date.now() - start,
-        };
+        logger.warn(`[playwright.agent] step ${stepIndex + 1} failed — repair limit (${maxRepairs}) reached; trying turn-loop fallback before ask_user`);
+        // ── Turn-loop fallback: observe→act→verify recovery ──
+        // Instead of immediately surfacing ask_user, try a lightweight turn loop
+        // that uses the injection action types (reactFill, clickByText, etc.)
+        // for more deterministic interaction. Falls back to ask_user if it fails.
+        try {
+          const _turnLoopResult = await _executeTurnLoopFallback({
+            goal: _finalGoal,
+            sessionId,
+            headed,
+            timeoutMs,
+            agentContext,
+            transcript,
+            deadline: _deadline,
+            start,
+          });
+          if (_turnLoopResult.ok) {
+            logger.info(`[playwright.agent] turn-loop fallback succeeded — returning`);
+            return _turnLoopResult;
+          }
+          logger.warn(`[playwright.agent] turn-loop fallback failed: ${_turnLoopResult.error} — surfacing ask_user`);
+        } catch (_turnLoopErr) {
+          logger.warn(`[playwright.agent] turn-loop fallback threw: ${_turnLoopErr.message} — surfacing ask_user`);
+        }
+        return { ..._failureAskUser(`Step ${stepIndex + 1} (${step.action}) failed: ${outcome.error}`), transcript };
       }
 
       totalRepairs++;
       logger.info(`[playwright.agent] step ${stepIndex + 1} failed — repair ${totalRepairs}/${maxRepairs}: ${outcome.error}`);
+
+      // ── Overlay-blocked click recovery (force-click → eval-click → Escape) ────
+      // When a click fails because another element intercepts pointer events, try
+      // in order:
+      //   1. Force-click: bypass Playwright's pointer-events check, dispatch click
+      //      event directly. Works when the overlay is a transparent Shadow DOM host
+      //      (e.g. LinkedIn's #interop-outlet) that doesn't actually block the click.
+      //   2. Eval-click: dispatch a synthetic click() via page.evaluate. Works even
+      //      when force-click fails (e.g. element is covered by a real overlay).
+      //   3. Escape: ONLY if no modal/dialog is present. Pressing Escape closes
+      //      modals — which is catastrophic when the "overlay" IS the composer modal
+      //      we want to interact with (the root cause of the LinkedIn whack-a-mole).
+      if (/intercepts pointer events/i.test(outcome.error || '') && (step.action === 'click' || step.action === 'fill')) {
+        logger.info(`[playwright.agent] overlay-blocked click detected — trying force-click/eval before Escape`);
+        const _overlaySelector = step.selector || step.ref || '';
+        try {
+          // ── Step 1: Force-click via engine ──────────────────────────────────
+          // Retry the same action with force:true — bypasses actionability checks.
+          const _forceOutcome = await browserAct({ ...step, action: step.action, sessionId, headed, timeoutMs, snapshot: currentSnapshot, force: true }).catch(e => ({ ok: false, error: e.message }));
+          if (_forceOutcome.ok) {
+            logger.info(`[playwright.agent] overlay recovery: force-click succeeded — continuing without LLM repair`);
+            transcript.push({ step, result: 'ok (force-click bypassed overlay)', phase: 'repair' });
+            stepIndex++;
+            continue;
+          }
+          logger.info(`[playwright.agent] overlay recovery: force-click failed — trying eval-click`);
+
+          // ── Step 2: Eval-click via page.evaluate ────────────────────────────
+          // Dispatch a synthetic click event on the resolved element. This bypasses
+          // all Playwright actionability checks and works even when the element is
+          // fully covered by an overlay.
+          const _ePage = engine.getPage(sessionId);
+          if (_ePage && _overlaySelector) {
+            // Resolve the ref to a DOM element and click it via JS
+            const _evalClickRes = await _ePage.evaluate((sel) => {
+              // Try ariaSnapshot ref → element via aria-ref attribute
+              let el = document.querySelector(`[aria-ref="${sel}"]`);
+              // Try by ref number in snapshot (Playwright aria refs)
+              if (!el && /^e\d+$/i.test(sel)) {
+                // Walk interactive elements and try to match by ref order
+                const interactive = document.querySelectorAll('[role="button"], [role="link"], [role="textbox"], button, a, input, [contenteditable="true"]');
+                // Playwright aria refs are assigned in DOM order — try to find by data-testid or aria-label match
+                // Fallback: try clicking the element directly via document.elementFromPoint or known selectors
+              }
+              if (el) { el.click(); return 'clicked:' + sel; }
+              return 'not-found:' + sel;
+            }, _overlaySelector).catch(() => null);
+            if (_evalClickRes && _evalClickRes.startsWith('clicked:')) {
+              logger.info(`[playwright.agent] overlay recovery: eval-click succeeded (${_evalClickRes}) — continuing`);
+              transcript.push({ step, result: 'ok (eval-click bypassed overlay)', phase: 'repair' });
+              stepIndex++;
+              continue;
+            }
+          }
+
+          // ── Step 3: Escape — ONLY if no modal/dialog is present ─────────────
+          // Pressing Escape closes modals. When the "overlay" IS the composer modal
+          // (e.g. LinkedIn's #interop-outlet), Escape destroys the very modal we
+          // want to interact with — causing the whack-a-mole loop.
+          const _ePage2 = engine.getPage(sessionId);
+          let _hasModal = false;
+          if (_ePage2) {
+            try {
+              _hasModal = await _ePage2.evaluate(() => !!document.querySelector('[role="dialog"], #interop-outlet, .share-creation, [data-testid*="modal"], [data-testid*="share"]'));
+            } catch (_) {}
+          }
+          if (_hasModal) {
+            logger.warn(`[playwright.agent] overlay recovery: modal/dialog detected — NOT pressing Escape (would close the composer). Falling through to LLM repair.`);
+          } else {
+            logger.info(`[playwright.agent] overlay recovery: no modal — pressing Escape and retrying once`);
+            await browserAct({ action: 'press', key: 'Escape', sessionId, headed, timeoutMs: 3000 }).catch(() => {});
+            await new Promise(r => setTimeout(r, 300));
+            invalidateEngineSnapshot(sessionId);
+            const _overlaySnap = await _fastSnapshot(sessionId, headed, timeoutMs);
+            if (_overlaySnap.ok && _overlaySnap.result) currentSnapshot = _overlaySnap.result;
+            const _retryOutcome = await browserAct({ ...step, action: step.action, sessionId, headed, timeoutMs, snapshot: currentSnapshot }).catch(e => ({ ok: false, error: e.message }));
+            if (_retryOutcome.ok) {
+              logger.info(`[playwright.agent] overlay recovery: retry succeeded after Escape — continuing without LLM repair`);
+              transcript.push({ step, result: 'ok (retried after Escape)', phase: 'repair' });
+              stepIndex++;
+              continue;
+            }
+            logger.warn(`[playwright.agent] overlay recovery: retry still failed — falling through to LLM repair`);
+          }
+        } catch (_overlayErr) {
+          logger.warn(`[playwright.agent] overlay recovery failed: ${_overlayErr.message} — falling through`);
+        }
+      }
 
       // ── Stale-ref fast-path: take a fresh snapshot and re-plan ──────────────
       // When browser.act returns a staleRef failure, the plan-bound refs are no
@@ -4385,6 +6359,7 @@ async function playwrightAgent(args) {
         invalidateEngineSnapshot(sessionId);
         const _staleSnap = await _fastSnapshot(sessionId, headed, timeoutMs);
         if (_staleSnap.ok && _staleSnap.result) currentSnapshot = _staleSnap.result;
+        const _staleContent = await _fetchPageContentForReplan();
         try {
           const _staleRepairRaw = await askWithMessages([
             { role: 'system', content: REPAIR_SYSTEM_PROMPT + domainLockBlock },
@@ -4396,6 +6371,7 @@ async function playwrightAgent(args) {
               ``,
               `SNAPSHOT:`,
               trimSnapshot(currentSnapshot),
+              _staleContent,
             ].join('\n') },
           ], { temperature: 0.1, maxTokens: 1024, responseTimeoutMs: 20000 });
           const _staleRepairParsed = parseJson(_staleRepairRaw);
@@ -4536,7 +6512,27 @@ async function playwrightAgent(args) {
 
       const repairParsed = parseJson(repairRaw);
       if (!repairParsed || !Array.isArray(repairParsed.repair)) {
-        logger.warn(`[playwright.agent] repair response unparseable — aborting`);
+        logger.warn(`[playwright.agent] repair response unparseable — trying turn-loop fallback before aborting`);
+        // ── Turn-loop fallback for unparseable repair ──
+        try {
+          const _turnLoopResult = await _executeTurnLoopFallback({
+            goal: _finalGoal,
+            sessionId,
+            headed,
+            timeoutMs,
+            agentContext,
+            transcript,
+            deadline: _deadline,
+            start,
+          });
+          if (_turnLoopResult.ok) {
+            logger.info(`[playwright.agent] turn-loop fallback succeeded after unparseable repair — returning`);
+            return _turnLoopResult;
+          }
+          logger.warn(`[playwright.agent] turn-loop fallback failed after unparseable repair: ${_turnLoopResult.error}`);
+        } catch (_turnLoopErr) {
+          logger.warn(`[playwright.agent] turn-loop fallback threw: ${_turnLoopErr.message}`);
+        }
         return { ok: false, goal, sessionId, turns: transcript.length, done: false, result: `Step ${stepIndex + 1} failed and repair was unparseable`, transcript, error: outcome.error, executionTime: Date.now() - start };
       }
 
@@ -4559,7 +6555,11 @@ async function playwrightAgent(args) {
       const _skipRuleLearning = ['task is not defined', 'results is not defined', 'globalState'].some(
         s => (outcome.error || '').includes(s)
       ) || (step.action === 'run-code' && typeof step.code === 'string' && /\.(zA|zE|yX|bog|bqe|zF|y2|xW)\b|aria-label\s*\*\s*=\s*["']unread/i.test(step.code));
-      if (!_skipRuleLearning && !repairParsed.skip_original && repairParsed.repair.length > 0) {
+      // Also skip rule learning when the derived rule would contain ephemeral element refs
+      // (e.g. "click e12 instead of e5") — these refs are snapshot-specific and will be
+      // wrong on every future page load, poisoning plan generation with stale instructions.
+      const _refInError = /\be\d+\b/i.test(outcome.error || '') || /\be\d+\b/i.test(JSON.stringify(repairParsed?.repair || []));
+      if (!_skipRuleLearning && !_refInError && !repairParsed.skip_original && repairParsed.repair.length > 0) {
         (async () => {
           try {
             const ruleRaw = await askWithMessages([
@@ -5077,13 +7077,16 @@ Return JSON: { "thoughts": "strategy explanation", "plan": [...steps] }`;
               ok: false,
               askUser: true,
               trainingHandoff: true,
-              question: `I wasn't able to complete the task after ${totalRepairs} attempt(s).\n\nReason: ${_judgeResult.reason}\n\nWhat would you like to do?`,
+              question: `I wasn't able to complete the task after ${totalRepairs} attempt(s).\n\nReason: ${_judgeResult.reason}\n\nWhat would you like to do? You can also type what went wrong and I'll retry with your correction.`,
               options: [
                 { label: 'Try again', value: 'try_again' },
-                { label: 'Train me to navigate this path', value: 'open_agents_training' },
+                { label: 'Correct and retry (tell me what was missed)', value: 'correct_and_retry' },
+                { label: 'Record recipe from beginning', value: 'record_recipe' },
               ],
               goal,
+              agentId,
               sessionId,
+              keepSession: true,
               executionTime: Date.now() - start,
             };
           }
@@ -5113,13 +7116,29 @@ Return JSON: { "thoughts": "strategy explanation", "plan": [...steps] }`;
   } // end executionLoop
   } catch (_deadlineErr) {
     if (/Overall timeout/.test(_deadlineErr.message)) {
-      logger.warn(`[playwright.agent] aborted due to overall timeout — returning partial result`);
-      return {
-        ok: false, goal, sessionId,
-        turns: transcript.length, done: false,
-        result: `Task timed out after ${overallTimeoutMs}ms`,
-        transcript, error: _deadlineErr.message, executionTime: Date.now() - start,
-      };
+      logger.warn(`[playwright.agent] aborted due to overall timeout — trying turn-loop fallback before ask_user`);
+      // Give the turn-loop a fresh 30s budget regardless of the overall timeout
+      try {
+        const _turnLoopResult = await _executeTurnLoopFallback({
+          goal: _finalGoal || goal,
+          sessionId,
+          headed,
+          timeoutMs: 30000,
+          agentContext,
+          transcript,
+          deadline: Date.now() + 30000,
+          start,
+        });
+        if (_turnLoopResult.ok) {
+          logger.info(`[playwright.agent] turn-loop fallback succeeded after overall timeout — returning`);
+          return _turnLoopResult;
+        }
+        logger.warn(`[playwright.agent] turn-loop fallback failed after timeout: ${_turnLoopResult.error} — surfacing ask_user`);
+      } catch (_turnLoopErr) {
+        logger.warn(`[playwright.agent] turn-loop fallback threw after timeout: ${_turnLoopErr.message} — surfacing ask_user`);
+      }
+      _heartbeat.stop();
+      return { ..._failureAskUser(`Task timed out after ${overallTimeoutMs}ms`), transcript };
     }
     throw _deadlineErr;
   }
@@ -5160,6 +7179,34 @@ Return JSON: { "thoughts": "strategy explanation", "plan": [...steps] }`;
     }
   }
 
+  // ── Save-as-named-skill offer (Phase 3) ────────────────────────────────────
+  // After a verified-successful mutation run that wasn't already recipe-driven,
+  // offer to save the flow as a named, URL-first recipe (e.g. linkedin.post.update)
+  // so the next invocation is deterministic. The user confirms + names it; we don't
+  // auto-save (avoids cementing hollow successes). Only for runs that performed a
+  // DOM mutation (click/submit/fill) — pure extractions don't benefit from recipes.
+  let _saveSkillOffer = null;
+  const _isMutationRun = !recipeWasUsed
+    && transcript.length >= 2
+    && !_tier3Verification?.fail
+    && transcript.some(t => {
+      const _a = t.action?.action || t.action?.type || t.step?.action || '';
+      return /click|submit|fill|check|select/i.test(typeof _a === 'string' ? _a : '');
+    });
+  if (_isMutationRun) {
+    // Suggest a dot-name from the agentId + goal keywords (e.g. linkedin.post.update)
+    const _svc = (agentId || '').replace(/\.agent$/, '').replace(/[^a-z0-9]/gi, '').toLowerCase() || 'agent';
+    const _goalWords = (goal || '').toLowerCase().replace(/[^a-z0-9\s]/g, '').split(/\s+/).filter(w => w.length > 2 && !['the','and','for','with','from','your','this','that','into','open','send','post','create'].includes(w)).slice(0, 2);
+    const _suggestedName = _goalWords.length > 0 ? `${_svc}.${_goalWords.join('.')}` : `${_svc}.custom`;
+    _saveSkillOffer = {
+      suggestedName: _suggestedName,
+      task: goal,
+      transcriptLength: transcript.length,
+    };
+    logger.info(`[playwright.agent] Phase 3: saveSkillOffer — suggested "${_suggestedName}" (${transcript.length} steps)`);
+  }
+
+  _heartbeat.stop();
   return {
     ok: true, goal, sessionId,
     turns: transcript.length, done: true,
@@ -5169,11 +7216,13 @@ Return JSON: { "thoughts": "strategy explanation", "plan": [...steps] }`;
     pageType: _pageType,
     verification: _tier3Verification,
     executionTime: Date.now() - start,
+    saveSkillOffer: _saveSkillOffer,
     extractionProvenance: finalResult !== null ? {
       source: lastGetPageTextResult === finalResult ? 'getPageText' : lastRunCodeResult === finalResult ? 'run-code' : 'return',
       verifyRepaired: transcript.some(t => t.thoughts === 'verify-repair' && t.outcome?.ok),
     } : null,
   };
+  // END DISABLED — script-gen + Plan-Execute (unreachable: turn-loop returns above)
 }
 
 module.exports = {

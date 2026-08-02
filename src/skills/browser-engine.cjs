@@ -147,46 +147,303 @@ function clearNetLog(sessionId) {
   if (s?.netLog) s.netLog.length = 0;
 }
 
-// ── Ref tree: ariaSnapshot() → e1/e2/... refs + YAML ──────────────────────
-// page.ariaSnapshot() returns a YAML-like string:
-//   - heading "Example Domain" [level=1]
-//   - paragraph:
-//     - link "Learn more":
-//       - /url: https://...
-// We parse it, assign e1/e2/... refs, and build a refMap for locator resolution.
+// ── DOM Scanner: tags real interactive elements with data-td-ref ─────────
+// Replaces the ARIA-snapshot-based buildRefTree. Scans the DOM for interactive
+// elements, checks visibility/occlusion, assigns stable refs, and produces a
+// YAML-like text for LLM consumption. Falls back to page.ariaSnapshot() when
+// the scanner finds 0 candidates (shadow DOM, canvas, SPA not yet rendered).
+
+const _DOM_SCANNER_SCRIPT = `(() => {
+  const EXCLUDE_CONTEXT = /\\b(search|filter|sort|history|recent|sidebar|nav|footer|breadcrumb|pagination|prev|next|page-?number|load-?more|show-?more|sign-?up|sign-?in|log-?in|subscribe|newsletter|cookie|accept|reject|settings|preferences|privacy|terms|about|help|support|contact|feedback|share|follow|social|footer-?link|copyright|skip-?to-?content|skip-?link|screen-?reader|sr-?only|aria-?hidden|hidden|back-?to-?top|scroll-?to-?top|menu-?bar|profile-?menu|account-?menu|user-?menu|avatar|notification|bell-?icon|inbox-?count|message-?count|unread|badge|tooltip|popover|dropdown-?menu|context-?menu|right-?click|hover-?menu|fly-?out|mega-?menu|tab-?list|tab-?panel|carousel|slider|banner|promo|ad-?container|sponsor|advertisement|google-?ads|adsense|doubleclick)\\b/i;
+
+  const SEMANTIC_SELECTOR = 'button, a[href], input, textarea, select, [role="button"], [role="link"], [role="menuitem"], [role="menuitemcheckbox"], [role="menuitemradio"], [role="tab"], [role="option"], [role="checkbox"], [role="radio"], [role="switch"], [role="combobox"], [role="searchbox"], [role="textbox"], [contenteditable], [onclick], [tabindex]:not([tabindex="-1"])';
+  const CLASS_HEURISTIC = /\\b(btn|button|clickable|toggle|switch|tab|link|action|submit|send|post|share|reply|compose|edit|delete|remove|close|cancel|save|confirm|apply|select|choose|pick|upload|attach|download|play|pause|next|prev|previous|forward|back|expand|collapse|open|show|hide|reveal|more|menu|dropdown|filter|search|sort|clear|reset|refresh|reload|star|like|follow|unfollow|subscribe|unsubscribe|join|leave|add|create|new|delete|archive|move|copy|cut|paste|undo|redo|zoom|fit|fullscreen|exit-?fullscreen)\\b/i;
+
+  function isVisible(el) {
+    if (!el || !el.getBoundingClientRect) return false;
+    const rect = el.getBoundingClientRect();
+    if (rect.width < 2 || rect.height < 2) return false;
+    const style = window.getComputedStyle(el);
+    if (style.display === 'none' || style.visibility === 'hidden') return false;
+    if (parseFloat(style.opacity) === 0) return false;
+    if (style.position === 'fixed' && rect.width < 3 && rect.height < 3) return false;
+    // offsetParent check — but skip for fixed-position elements
+    if (style.position !== 'fixed' && !el.offsetParent) return false;
+    return true;
+  }
+
+  function getRect(el) {
+    const r = el.getBoundingClientRect();
+    return { x: Math.round(r.x), y: Math.round(r.y), width: Math.round(r.width), height: Math.round(r.height) };
+  }
+
+  function isOccluded(el) {
+    const rect = el.getBoundingClientRect();
+    if (rect.width < 2 || rect.height < 2) return false;
+    const cx = rect.x + rect.width / 2;
+    const cy = rect.y + rect.height / 2;
+    try {
+      const top = document.elementFromPoint(cx, cy);
+      if (!top) return false;
+      if (top === el) return false;
+      // Check if top is a descendant of el (e.g. span inside button)
+      if (el.contains(top)) return false;
+      // Check if el is inside the top element (e.g. button inside a container)
+      if (top.contains(el)) return false;
+      // Check if top is a known overlay pattern (transparent, full-viewport)
+      const topStyle = window.getComputedStyle(top);
+      const topRect = top.getBoundingClientRect();
+      const isFullViewport = topRect.width >= window.innerWidth * 0.9 && topRect.height >= window.innerHeight * 0.9;
+      const isTransparent = parseFloat(topStyle.opacity) < 0.3 || topStyle.backgroundColor === 'transparent' || topStyle.backgroundColor === 'rgba(0, 0, 0, 0)';
+      if (isFullViewport && isTransparent) return false; // skip known overlay pattern
+      return true;
+    } catch (_) { return false; }
+  }
+
+  function getLabel(el) {
+    return el.getAttribute('aria-label') ||
+           el.getAttribute('title') ||
+           el.getAttribute('placeholder') ||
+           el.getAttribute('alt') ||
+           (el.innerText || el.textContent || '').trim().slice(0, 80) ||
+           '';
+  }
+
+  function getRole(el) {
+    const explicit = el.getAttribute('role');
+    if (explicit) return explicit;
+    const tag = el.tagName.toLowerCase();
+    if (tag === 'button' || tag === 'input' && (el.type === 'button' || el.type === 'submit' || el.type === 'reset')) return 'button';
+    if (tag === 'a') return 'link';
+    if (tag === 'input' || tag === 'textarea') return 'textbox';
+    if (tag === 'select') return 'combobox';
+    if (el.isContentEditable) return 'textbox';
+    return 'generic';
+  }
+
+  function getType(el) {
+    if (el.tagName === 'INPUT') return el.type || 'text';
+    if (el.tagName === 'TEXTAREA') return 'textarea';
+    if (el.isContentEditable) return 'contenteditable';
+    if (el.tagName === 'SELECT') return 'select';
+    return null;
+  }
+
+  function getContext(el) {
+    // Walk up to find a meaningful context label
+    let parent = el.parentElement;
+    for (let i = 0; i < 3 && parent; i++) {
+      const label = parent.getAttribute('aria-label') || parent.getAttribute('data-testid') || '';
+      if (label) return label;
+      parent = parent.parentElement;
+    }
+    return '';
+  }
+
+  // Gather candidates
+  const seen = new Set();
+  const candidates = [];
+
+  // Pass 1: semantic selectors
+  for (const el of document.querySelectorAll(SEMANTIC_SELECTOR)) {
+    if (seen.has(el)) continue;
+    seen.add(el);
+    candidates.push({ el, source: 'semantic' });
+  }
+
+  // Pass 2: class-name heuristic (catch div-wrapped custom controls)
+  for (const el of document.querySelectorAll('div, span, li')) {
+    if (seen.has(el)) continue;
+    const cls = el.className || '';
+    if (typeof cls === 'string' && CLASS_HEURISTIC.test(cls)) {
+      // Only add if it looks interactive (has role, onclick, tabindex, or cursor pointer)
+      const style = window.getComputedStyle(el);
+      if (el.getAttribute('role') || el.getAttribute('onclick') || el.getAttribute('tabindex') || style.cursor === 'pointer') {
+        seen.add(el);
+        candidates.push({ el, source: 'heuristic' });
+      }
+    }
+  }
+
+  // Filter and build element list
+  const elements = [];
+  let counter = 1;
+
+  for (const { el, source } of candidates) {
+    if (!isVisible(el)) continue;
+    const label = getLabel(el);
+    const context = getContext(el);
+    // Exclude nav/sidebar noise
+    if (EXCLUDE_CONTEXT.test(label) && EXCLUDE_CONTEXT.test(context) && !el.matches('input, textarea, [contenteditable], select')) continue;
+    // Skip option elements inside selects (they're not independently interactive)
+    if (el.tagName === 'OPTION') continue;
+
+    const ref = 'td' + counter++;
+    el.setAttribute('data-td-ref', ref);
+
+    const rect = getRect(el);
+    const occluded = isOccluded(el);
+    const role = getRole(el);
+    const type = getType(el);
+    const tag = el.tagName.toLowerCase();
+
+    elements.push({
+      ref, tag, role, type, label,
+      visible: true,
+      occluded,
+      rect,
+      source,
+      placeholder: el.getAttribute('placeholder') || '',
+      ariaLabel: el.getAttribute('aria-label') || '',
+      name: el.getAttribute('name') || '',
+      contenteditable: el.isContentEditable,
+      context,
+    });
+  }
+
+  // Detect activeElement
+  const ae = document.activeElement;
+  let activeElement = null;
+  if (ae && ae !== document.body && ae !== document.documentElement) {
+    const aeTag = ae.tagName.toLowerCase();
+    const aeType = getType(ae);
+    const aeRect = ae.getBoundingClientRect();
+    const aeRole = ae.getAttribute('role');
+    const aeAriaPlaceholder = ae.getAttribute('aria-placeholder');
+    const isInput = aeTag === 'input' || aeTag === 'textarea' || ae.isContentEditable ||
+      aeRole === 'textbox' || aeRole === 'searchbox' || aeRole === 'combobox' ||
+      !!aeAriaPlaceholder;
+    const hasRect = aeRect.width > 5 && aeRect.height > 5;
+    const aeRef = ae.getAttribute('data-td-ref') || null;
+    // isPrimaryInput: focused element is a visible textarea/contenteditable/input
+    // with a meaningful rect (not hidden/button/checkbox/radio)
+    const isPrimaryInput = isInput && hasRect &&
+      !['button', 'submit', 'reset', 'checkbox', 'radio', 'file', 'hidden', 'image'].includes(aeType);
+    activeElement = {
+      tag: aeTag,
+      type: aeType,
+      role: aeRole || '',
+      placeholder: ae.getAttribute('placeholder') || '',
+      ariaPlaceholder: aeAriaPlaceholder || '',
+      ref: aeRef,
+      isPrimaryInput,
+      isContentEditable: ae.isContentEditable,
+      ariaLabel: ae.getAttribute('aria-label') || '',
+    };
+  }
+
+  // Build YAML-like text for LLM consumption
+  const lines = [];
+  if (activeElement) {
+    lines.push('# Active element: ' + activeElement.tag + (activeElement.type ? ' (' + activeElement.type + ')' : '') + (activeElement.placeholder ? ' placeholder="' + activeElement.placeholder + '"' : '') + (activeElement.ref ? ' ref=' + activeElement.ref : '') + (activeElement.isPrimaryInput ? ' [primary-input]' : ''));
+    lines.push('');
+  }
+
+  // Sort: inputs first, then buttons/links, then rest
+  const inputType = el => (el.role === 'textbox' || el.role === 'combobox' || el.role === 'searchbox' || el.contenteditable || el.tag === 'input' || el.tag === 'textarea' || el.tag === 'select');
+  const sorted = [...elements].sort((a, b) => {
+    if (inputType(a) && !inputType(b)) return -1;
+    if (!inputType(a) && inputType(b)) return 1;
+    return 0;
+  });
+
+  // Cap at 80 elements
+  const capped = sorted.slice(0, 80);
+  for (const el of capped) {
+    const flags = [];
+    if (el.occluded) flags.push('occluded');
+    if (el.contenteditable) flags.push('contenteditable');
+    if (el.source === 'heuristic') flags.push('heuristic');
+    const flagStr = flags.length > 0 ? ' [' + flags.join(', ') + ']' : '';
+    const typeStr = el.type ? ' type=' + el.type : '';
+    const ctxStr = el.context ? ' context="' + el.context.slice(0, 40) + '"' : '';
+    lines.push('- [' + el.ref + '] ' + el.role + ' "' + el.label + '"' + typeStr + ctxStr + flagStr);
+  }
+
+  return JSON.stringify({
+    elements: capped,
+    activeElement,
+    yaml: lines.join('\\n'),
+    count: capped.length,
+  });
+})()`;
+
+// ── buildRefTree: DOM scanner (primary) → ARIA snapshot (fallback) ──────────
+// Returns { yaml, refMap, lowConfidenceRefs, activeElement, scannerUsed }
+// - scannerUsed: true when DOM scanner produced refs (tdN), false for ARIA (eN)
+// - activeElement: { tag, type, placeholder, ref, isPrimaryInput } or null
 
 async function buildRefTree(page) {
+  let scannerResult = null;
+  try {
+    const raw = await page.evaluate(_DOM_SCANNER_SCRIPT);
+    if (raw) {
+      scannerResult = JSON.parse(raw);
+    }
+  } catch (scannerErr) {
+    logger.warn(`[browser-engine] DOM scanner failed: ${scannerErr.message} — falling back to ARIA`);
+  }
+
+  // If scanner found elements, build refMap from scanner output
+  if (scannerResult && scannerResult.count > 0) {
+    const refMap = new Map();
+    for (const el of scannerResult.elements) {
+      refMap.set(el.ref, {
+        role: el.role,
+        name: el.label,
+        tag: el.tag,
+        type: el.type,
+        visible: el.visible,
+        occluded: el.occluded,
+        rect: el.rect,
+        source: el.source,
+        placeholder: el.placeholder,
+        contenteditable: el.contenteditable,
+        context: el.context,
+      });
+    }
+    // Low-confidence: if >50% of elements are occluded or from heuristic source
+    let _lowConf = 0;
+    for (const [, v] of refMap) {
+      if (v.source === 'heuristic') _lowConf++;
+    }
+    const lowConfidenceRefs = refMap.size > 0 && (_lowConf / refMap.size) > 0.5;
+
+    logger.info(`[browser-engine] DOM scanner: ${refMap.size} elements tagged${scannerResult.activeElement ? ', activeElement=' + scannerResult.activeElement.tag + (scannerResult.activeElement.isPrimaryInput ? ' [primary-input]' : '') : ''}${lowConfidenceRefs ? ' (low-confidence)' : ''}`);
+    return {
+      yaml: scannerResult.yaml,
+      refMap,
+      lowConfidenceRefs,
+      activeElement: scannerResult.activeElement || null,
+      scannerUsed: true,
+    };
+  }
+
+  // Fallback: ARIA snapshot (shadow DOM, canvas, SPA not yet rendered)
+  logger.info(`[browser-engine] DOM scanner found ${scannerResult?.count || 0} elements — falling back to ARIA snapshot`);
   const raw = await page.ariaSnapshot();
   const refMap = new Map();
   let counter = 1;
   const outLines = [];
 
-  // Parse each line: extract indent depth, role, name, attributes
   for (const line of raw.split('\n')) {
     if (!line.trim()) continue;
-    // Measure indent (spaces before the leading dash)
     const indentMatch = line.match(/^(\s*)-/);
     if (!indentMatch) {
-      // Continuation lines (e.g. "  - /url: ...") — pass through without ref
       outLines.push(line);
       continue;
     }
     const indent = indentMatch[1];
-    const rest = line.slice(indentMatch[0].length).trimStart(); // after "- " (trimStart handles the space after dash)
+    const rest = line.slice(indentMatch[0].length).trimStart();
 
-    // Extract role and name: "heading \"Example Domain\" [level=1]" or "paragraph:" or "link \"Learn more\":"
     const ref = `e${counter++}`;
-    // Insert [ref=eN] right after the dash
     outLines.push(`${indent}- [${ref}] ${rest}`);
 
-    // Parse role and name for refMap
     const roleMatch = rest.match(/^(\w[\w-]*)/);
     const nameMatch = rest.match(/"([^"]*)"/);
     const name = nameMatch ? nameMatch[1] : '';
     let role = roleMatch ? roleMatch[1] : 'unknown';
-    // If ariaSnapshot omitted the role token but gave a name, default to generic
     if (!roleMatch && name) role = 'generic';
-    // Extract key attributes
     const levelMatch = rest.match(/\[level=(\d+)\]/);
     refMap.set(ref, {
       role,
@@ -195,19 +452,23 @@ async function buildRefTree(page) {
     });
   }
 
-  // Low-confidence flag: if >50% of refs have unknown/generic roles, role-based
-  // locators are unreliable. Callers should skip role locators and use CSS/text fallback.
   let _lowConf = 0;
   for (const [, v] of refMap) {
     if (v.role === 'unknown' || v.role === 'generic') _lowConf++;
   }
   const lowConfidenceRefs = refMap.size > 0 && (_lowConf / refMap.size) > 0.5;
 
-  return { yaml: outLines.join('\n'), refMap, lowConfidenceRefs };
+  return {
+    yaml: outLines.join('\n'),
+    refMap,
+    lowConfidenceRefs,
+    activeElement: null,
+    scannerUsed: false,
+  };
 }
 
 module.exports = {
   launch, getPage, setActivePage, getContext, closeSession, listSessions, isSessionActive,
-  getNetLog, clearNetLog, buildRefTree,
+  getNetLog, clearNetLog, buildRefTree, _DOM_SCANNER_SCRIPT,
   sessionProfileDir, clearProfileLock,
 };

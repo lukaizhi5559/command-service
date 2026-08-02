@@ -144,7 +144,7 @@ async function _askWithMessagesOnce(messages, opts = {}) {
   const url = new URL(WS_URL);
   if (WS_API_KEY) url.searchParams.set('apiKey', WS_API_KEY);
   url.searchParams.set('userId', 'command_service');
-  url.searchParams.set('clientId', `skill_${Date.now()}`);
+  url.searchParams.set('clientId', `skill_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`);
 
   const ws = new WebSocket(url.toString());
 
