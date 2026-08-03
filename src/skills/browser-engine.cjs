@@ -13,7 +13,7 @@ function getChromium() {
 }
 
 const _sessions = new Map();
-const _telRe = /analytics|telemetry|beacon|metrics|sentry|collect|jot|log_event|track|amplitude|datadog|newrelic|rum|perf/i;
+const _telRe = /analytics|telemetry|beacon|metrics|sentry|collect|jot|log_event|track|amplitude|datadog|newrelic|rum|perf|\btapi\b|gen_?204|pixel|csp-report|\/li\/track|clienttelemetry|ingraph/i;
 
 function sessionProfileDir(sessionId) {
   const dir = path.join(os.homedir(), '.thinkdrop', 'browser-profiles', sessionId);
@@ -45,7 +45,10 @@ function _attachNetLog(page, netLog) {
       if (!/^(POST|PUT|PATCH|DELETE)$/i.test(m)) return;
       const u = res.url();
       if (_telRe.test(u)) return;
-      netLog.push({ method: m.toUpperCase(), url: u, status: res.status(), ts: Date.now() });
+      let _payload = null;
+      try { _payload = res.request().postData() || null; } catch (_) {}
+      if (_payload && _payload.length > 2000) _payload = _payload.slice(0, 2000);
+      netLog.push({ method: m.toUpperCase(), url: u, status: res.status(), ts: Date.now(), payload: _payload });
       if (netLog.length > 100) netLog.shift();
     } catch (_) {}
   });
@@ -90,6 +93,10 @@ async function launch(sessionId, opts = {}) {
   const ctx = await getChromium().launchPersistentContext(profileDir, {
     headless: !headed,
     viewport: { width: 1280, height: 800 },
+    // deviceScaleFactor is a CONTEXT option, not a viewport property. At 1x, screenshots
+    // are 1280x800 and LiteParse/OCR can barely read the small UI text; at 2x they are
+    // 2560x1600 which reads cleanly. Coordinate scaling reads the real PNG dimensions.
+    deviceScaleFactor: 2,
     args: ['--disable-blink-features=AutomationControlled', '--no-first-run', '--no-default-browser-check'],
   });
 

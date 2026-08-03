@@ -257,7 +257,7 @@ function getContentExtractionConfig(hostname) {
 
 const { userAgent } = require('./user.agent.cjs');
 
-const { resolveDestination, recordCorrection, classifyTaskIntent, classifyUrlType, getLearnedCorrection, deleteLearnedCorrection, suggestTaskUrl, getTaskKeywords, getCachedDeepLink, recordDeepLinkCache, INTENTS } = require('../skill-helpers/destination-resolver.cjs');
+const { resolveDestination, recordCorrection, classifyTaskIntent, classifyUrlType, getLearnedCorrection, deleteLearnedCorrection, suggestTaskUrl, getTaskKeywords, getCachedDeepLink, recordDeepLinkCache, getSearchUrlPattern, recordSearchUrlPattern, INTENTS } = require('../skill-helpers/destination-resolver.cjs');
 const { killExistingChromeForProfile, clearProfileLock, findCli, shortSessionId } = require('./browser.act.cjs');
 
 const BROWSER_ACT_PORT = parseInt(process.env.COMMAND_SERVICE_PORT || '3007', 10);
@@ -2855,11 +2855,193 @@ function _isMutationIntent(intent) {
   return [INTENTS.CONTENT_CREATE, INTENTS.SOCIAL, INTENTS.MAIL, INTENTS.SCHEDULING, INTENTS.COMMERCE].includes(intent);
 }
 
-function _isReadOnlyMailTask(task) {
+// ── Read-only task detection (generalized across all mutation intents) ───────
+// A mutation-intent task (MAIL, SOCIAL, CONTENT_CREATE, SCHEDULING, COMMERCE)
+// can be either a read-only operation (check, list, show, count, search) or an
+// actual mutation (send, compose, create, post, book). This function detects
+// read-only tasks so they can go through URL-first discovery (e.g., to find a
+// search/filter URL) instead of getting a compose/create template URL.
+
+// Per-intent mutation verbs — if any of these are present, the task is NOT read-only.
+const _MUTATION_VERBS = {
+  [INTENTS.MAIL]:           /\b(send|compose|write|draft|forward|reply|new email|new message|email to|newsletter)\b/i,
+  [INTENTS.SOCIAL]:         /\b(post|tweet|retweet|share|comment|like|follow|message|dm|reply|respond)\b/i,
+  [INTENTS.CONTENT_CREATE]: /\b(create|new|upload|publish|write|edit|update|delete|remove|add|submit|post)\b/i,
+  [INTENTS.SCHEDULING]:     /\b(book|schedule|add event|create event|cancel|reschedule|invite|set up)\b/i,
+  [INTENTS.COMMERCE]:       /\b(add to cart|checkout|buy|purchase|order|place order|pay for)\b/i,
+};
+
+// Read verbs (intent-agnostic) — if present and no mutation verbs, the task IS read-only.
+const _READ_VERBS = /\b(read|check|list|show|show me|count|how many|see|get|fetch|find|search|look\s*up|browse|summarize|extract|monitor|track|unread|recent|latest|view|scan|review|tell me|what are|what's on)\b/i;
+
+function _isReadOnlyTask(task, intent) {
   const t = String(task || '').toLowerCase();
-  const readKeywords = /\b(read|check|unread|inbox|list|count|how many|from|search|find|look\s*up|see|show|tell me|get|fetch|monitor|track|unread emails?|new emails?|recent emails?)\b/i;
-  const composeKeywords = /\b(send|compose|write|draft|forward|reply|new email|new message|email to)\b/i;
-  return readKeywords.test(t) && !composeKeywords.test(t);
+  if (!t) return false;
+  const mutationRe = _MUTATION_VERBS[intent];
+  const hasMutation = mutationRe ? mutationRe.test(t) : false;
+  const hasRead = _READ_VERBS.test(t);
+  return hasRead && !hasMutation;
+}
+
+// ── Sub-class: passive read (extract content from current page, no search needed) ──
+// True for "read", "summarize this page", "how many", "count" — no filter criteria.
+// These should use the browse shortcut (extract body.innerText, return done).
+const _PASSIVE_READ_VERBS = /\b(summarize|read|how many|count|tell me what's on|tell me what is on|what's on this page|what is on this page|extract content|get page text)\b/i;
+
+function _isPassiveReadTask(task) {
+  const t = String(task || '').toLowerCase();
+  if (!t) return false;
+  return _PASSIVE_READ_VERBS.test(t);
+}
+
+// ── Sub-class: search-criteria task (needs a search URL or search-box interaction) ──
+// True when the task names filter criteria: unread, from:X, subject:X, label:X,
+// starred, is:unread, "from X", "not from Y", date ranges, etc.
+// These should NOT use the browse shortcut — they need to apply the filter first.
+const _SEARCH_CRITERIA_RE = /\b(unread|read|starred|label|tag|from:|to:|subject:|is:unread|is:read|has:|since:|before:|after:|category:|size:|attachment|filename|cc:|bcc:|not from|doesn't have|exclude)\b/i;
+const _SEARCH_CRITERIA_PHRASE_RE = /\b(?:from|by|sent by|written by|about|regarding|with subject|containing|matching)\s+[A-Z]/i;
+
+/**
+ * Strip payload noise from task string before regex extraction.
+ * Removes (Context from prior turn: ...), [DATA FROM PRIOR STEP], [CONTENT OF],
+ * body: blocks, [Resume context: ...] — these contain arbitrary text that
+ * confuses the from:/subject:/etc. regexes (e.g., the `(` in the context suffix
+ * breaks the from: character class and causes the entire match to fail).
+ */
+function _stripTaskNoise(task) {
+  let t = String(task || '');
+  // Strip "(Context from prior turn: ...)" suffix (injected by preflightAgents.js)
+  t = t.replace(/\n*\(Context from prior turn:[^)]*\)\s*$/i, ' ');
+  // Strip [Resume context: ...] blocks
+  t = t.replace(/\[Resume context:[^\]]*\]/gi, ' ');
+  // Strip [DATA FROM PRIOR STEP] ... [/DATA FROM PRIOR STEP] blocks
+  t = t.replace(/\[DATA FROM PRIOR STEP\][\s\S]*?(?:\[\/DATA FROM PRIOR STEP\]|$)/gi, ' ');
+  // Strip [CONTENT OF ...] blocks
+  t = t.replace(/\[CONTENT OF[^\]]*\][\s\S]*?(?=\[|$)/gi, ' ');
+  // Strip body: ... multiline blocks
+  t = t.replace(/\bbody:\s*[\s\S]{0,3000}/gi, ' ');
+  return t.replace(/\s+/g, ' ').trim();
+}
+
+function _isSearchCriteriaTask(task) {
+  const t = _stripTaskNoise(task);
+  if (!t) return false;
+  return _SEARCH_CRITERIA_RE.test(t) || _SEARCH_CRITERIA_PHRASE_RE.test(t);
+}
+
+// Backward-compat alias (used by any callers that haven't been updated yet)
+function _isReadOnlyMailTask(task) {
+  return _isReadOnlyTask(task, INTENTS.MAIL);
+}
+
+// ── Search query extraction ──────────────────────────────────────────────────
+// Parse filter criteria from a task string and build a service-appropriate
+// search query. Maps common criteria patterns (unread, from:X, not from:Y,
+// subject:X, label:X, starred) to the service's query operators.
+//
+// For Gmail: is:unread from:wendall -from:boss
+// For GitHub: is:open <keywords>
+// For generic services: raw keywords (unread pastor wendall) — no operator prefixes
+//
+// Returns { query: string, hasCriteria: boolean }.
+
+// Regex for "from X" / "sent by X" / "written by X" → captures the sender name.
+// Limits name to 1-5 words (typical name length) and uses a negative lookahead
+// to stop capturing at common action verbs / prepositions (give, show, tell,
+// extract, summarize, and, then, on, with, for, about, ...) so we don't capture
+// the action phrase along with the name.
+// Negative lookbehind on "from" prevents matching "not from X" / "but not from X"
+// (those are handled by _NOT_FROM_RE separately).
+const _FROM_TERMINATORS = 'give|show|tell|extract|summarize|and|then|with|for|about|regarding|please|also|now|just|only|but|not|excluding|or|so|because|if|when|while|after|before|since|until|on|in|at|from|to|by';
+const _FROM_RE = new RegExp('(?<!not |but not )\\b(?:from|sent by|written by)\\s+([A-Za-z][\\w.-]*(?:\\s+(?!' + _FROM_TERMINATORS + '\\b)[A-Za-z][\\w.-]*){0,4})(?:\\s|$|[,.;])', 'i');
+
+// Regex for "not from X" / "but not from X" / "excluding X" → captures excluded name.
+const _NOT_FROM_RE = new RegExp('\\b(?:not from|but not from|excluding|but not|not boss)\\s+([A-Za-z][\\w.-]*(?:\\s+(?!' + _FROM_TERMINATORS + '\\b)[A-Za-z][\\w.-]*){0,4})(?:\\s|$|[,.;])', 'i');
+
+function _extractSearchQuery(task, serviceKey) {
+  const t = _stripTaskNoise(task);
+  if (!t) return { query: '', hasCriteria: false };
+
+  const svc = String(serviceKey || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+  const parts = [];
+
+  // ── Common criteria extraction ──
+  // "unread" / "read" → is:unread / is:read
+  if (/\bunread\b/i.test(t)) parts.push('is:unread');
+  else if (/\bread\b/i.test(t) && !/\breading\b/i.test(t)) parts.push('is:read');
+
+  // "starred" → is:starred
+  if (/\bstarred\b/i.test(t)) parts.push('is:starred');
+
+  // "from X" / "sent by X" → from:X
+  const fromMatch = t.match(_FROM_RE);
+  if (fromMatch) {
+    const sender = fromMatch[1].trim().replace(/\s+/g, ' ');
+    parts.push(`from:${sender}`);
+  }
+
+  // "not from X" / "but not from X" / "excluding X" → -from:X
+  const notFromMatch = t.match(_NOT_FROM_RE);
+  if (notFromMatch) {
+    const excluded = notFromMatch[1].trim().replace(/\s+/g, ' ');
+    parts.push(`-from:${excluded}`);
+  }
+
+  // "subject X" / "with subject X" → subject:X
+  const subjectMatch = t.match(/\b(?:subject|with subject|re:)\s*[:\-]?\s*(.+?)(?:\s+from\s|[,.;]|$)/i);
+  if (subjectMatch) {
+    parts.push(`subject:${subjectMatch[1].trim()}`);
+  }
+
+  // "label X" / "in X" → label:X
+  const labelMatch = t.match(/\b(?:label|in)\s+([A-Za-z][\w-]+)(?:\s|$|[,.;])/i);
+  if (labelMatch) {
+    parts.push(`label:${labelMatch[1].trim()}`);
+  }
+
+  // "has attachment" → has:attachment
+  if (/\bhas\s+attachment\b/i.test(t)) parts.push('has:attachment');
+
+  // ── Service-specific formatting ──
+  if (svc === 'gmail' || svc === 'mailgooglecom') {
+    // Gmail uses space-separated operators
+    return { query: parts.join(' '), hasCriteria: parts.length > 0 };
+  }
+
+  if (svc === 'github') {
+    // GitHub: is:open + keywords
+    const ghParts = [];
+    if (/\bopen\b/i.test(t)) ghParts.push('is:open');
+    if (/\bclosed\b/i.test(t)) ghParts.push('is:closed');
+    // Extract general keywords (words after "about" or "for")
+    const kwMatch = t.match(/\b(?:about|for|regarding)\s+(.+?)(?:\s+from\s|[,.;]|$)/i);
+    if (kwMatch) ghParts.push(kwMatch[1].trim());
+    return { query: ghParts.join(' '), hasCriteria: ghParts.length > 0 };
+  }
+
+  // Generic (non-mail, non-GitHub): extract raw keywords without mail-specific
+  // operator prefixes. A generic site's search form doesn't understand "is:unread"
+  // or "from:X" — it just wants the search terms (e.g., "pastor wendall unread").
+  const _genericParts = [];
+
+  // "unread" → just the word "unread" (not "is:unread")
+  if (/\bunread\b/i.test(t)) _genericParts.push('unread');
+
+  // "from X" → just the name "X" (not "from:X")
+  if (fromMatch) _genericParts.push(fromMatch[1].trim().replace(/\s+/g, ' '));
+
+  // "subject X" → just "X"
+  if (subjectMatch) _genericParts.push(subjectMatch[1].trim());
+
+  // "about X" / "for X" / "regarding X" → just "X"
+  // Only add if we don't already have enough criteria (avoids duplicates like
+  // "unread pastor wendall unread messages" when "for" matches "search for ...")
+  if (_genericParts.length === 0) {
+    const kwMatch = t.match(/\b(?:about|for|regarding)\s+(.+?)(?:\s+from\s|[,.;]|$)/i);
+    if (kwMatch) _genericParts.push(kwMatch[1].trim());
+  }
+
+  return { query: _genericParts.join(' '), hasCriteria: _genericParts.length > 0 };
 }
 
 function _canPromoteDeepLink(candidate, source, intent, baseHost, serviceKey = '') {
@@ -2884,6 +3066,57 @@ function _canPromoteDeepLink(candidate, source, intent, baseHost, serviceKey = '
   return true;
 }
 
+/**
+ * Build a deterministic search-criteria URL for a task that names filter criteria
+ * (unread, from:X, subject:X, etc.). Extracted from _buildIntentTemplateUrl so it
+ * can be called BEFORE the keyword-cache check in _resolveTaskDeepLink (defense-in-depth:
+ * a generic cached destination like the inbox can't encode filter criteria, so the
+ * template must win for criteria tasks).
+ *
+ * Returns the search URL string, or null if the task has no extractable criteria or
+ * the service doesn't support URL-based search.
+ */
+function _buildSearchCriteriaUrl(intent, serviceKey, baseStartUrl, baseHost, task) {
+  if (!_isSearchCriteriaTask(task)) return null;
+  const svc = String(serviceKey || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+  const _sq = _extractSearchQuery(task, svc);
+  if (!_sq.hasCriteria) return null;
+
+  // ── MAIL ──
+  if (intent === INTENTS.MAIL) {
+    if (svc === 'gmail' || baseHost === 'mail.google.com') {
+      return `https://mail.google.com/mail/u/0/#search/${encodeURIComponent(_sq.query)}`;
+    }
+    if (svc === 'outlook' || baseHost === 'outlook.live.com' || baseHost === 'outlook.office.com') {
+      return `https://outlook.live.com/mail/0/deeplink/search?q=${encodeURIComponent(_sq.query)}`;
+    }
+  }
+  // Future: add search-criteria URL templates for other services here.
+  return null;
+}
+
+/**
+ * Build a search URL from a cached search URL pattern + the task's extracted criteria.
+ * The pattern cache stores URL templates with a {query} placeholder per service
+ * (e.g., "https://example.com/search?q={query}"), discovered by the form-extraction
+ * / web.agent / web.crawl steps. This lets any site reuse a previously discovered
+ * search URL pattern without re-running the full discovery pipeline.
+ *
+ * Returns the search URL string, or null if no pattern is cached or the task has
+ * no extractable criteria.
+ */
+async function _buildSearchUrlFromPattern(serviceKey, task) {
+  if (!_isSearchCriteriaTask(task)) return null;
+  const pattern = await getSearchUrlPattern(serviceKey);
+  if (!pattern?.urlTemplate) return null;
+  const svc = String(serviceKey || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+  const _sq = _extractSearchQuery(task, svc);
+  if (!_sq.hasCriteria) return null;
+  const _url = pattern.urlTemplate.replace('{query}', encodeURIComponent(_sq.query));
+  logger.info(`[browser.agent] search-pattern cache hit for ${serviceKey}: ${_url} (pattern hitCount=${pattern.hitCount || 1})`);
+  return _url;
+}
+
 async function _resolveTaskDeepLink(agentId, serviceKey, baseStartUrl, task, existingDeepLinkUrl, sessionId) {
   try {
     // If a deep-link was already resolved (e.g., by preflight), skip resolution.
@@ -2906,17 +3139,46 @@ async function _resolveTaskDeepLink(agentId, serviceKey, baseStartUrl, task, exi
     const _taskKeywords = getTaskKeywords(task); // LLM-extracted keywords from classifyTaskIntent
     const isSearchLike = intent === INTENTS.SEARCH || /\b(search|look\s*up|google|find)\b/i.test(task);
 
-    // Step 0: Check keyword-indexed deep-link cache
-    const _cachedDeepLink = await getCachedDeepLink(serviceKey, _taskKeywords);
-    if (_cachedDeepLink?.url) {
-      logger.info(`[browser.agent] deep-link: keyword cache hit for ${agentId}: ${_cachedDeepLink.url} (score=${_cachedDeepLink.score.toFixed(2)})`);
-      return { url: _cachedDeepLink.url, source: 'keyword-cache' };
-    }
-
     const baseHost = (() => {
       try { return new URL(baseStartUrl).hostname.replace(/^www\./, ''); }
       catch (_) { return serviceKey; }
     })();
+
+    // Step 0: For search-criteria tasks, build the deterministic search URL FIRST —
+    // before checking the keyword cache. A generic cached destination (e.g. the inbox)
+    // can't encode filter criteria (unread, from:X, subject:X), so letting the cache win
+    // would land the agent on the wrong page. The template must win for criteria tasks.
+    // (Defense-in-depth: protects against stale/polluted cache entries.)
+    const _isCriteriaTask = _isSearchCriteriaTask(task);
+    const _criteriaUrl = _buildSearchCriteriaUrl(intent, serviceKey, baseStartUrl, baseHost, task);
+    if (_criteriaUrl) {
+      logger.info(`[browser.agent] deep-link: search-criteria template for ${agentId}: ${_criteriaUrl}`);
+      return { url: _criteriaUrl, source: 'template' };
+    }
+
+    // Step 0.5: Search URL pattern cache — for criteria tasks on sites without a hardcoded
+    // template, check if we've previously discovered a search URL pattern (e.g., via form
+    // extraction or web.agent). This lets any site reuse a discovered search form pattern
+    // without re-running the full discovery pipeline.
+    if (_isCriteriaTask) {
+      const _patternUrl = await _buildSearchUrlFromPattern(serviceKey, task);
+      if (_patternUrl) {
+        logger.info(`[browser.agent] deep-link: search-pattern cache hit for ${agentId}: ${_patternUrl}`);
+        return { url: _patternUrl, source: 'search-pattern' };
+      }
+    }
+
+    // Step 1: Check keyword-indexed deep-link cache.
+    // For search-criteria tasks, SKIP the keyword cache — a generic cached destination
+    // (e.g. inbox) can't encode filter criteria, and the discovery pipeline below will
+    // find the site's search form/URL pattern (and cache it for future use).
+    if (!_isCriteriaTask) {
+      const _cachedDeepLink = await getCachedDeepLink(serviceKey, _taskKeywords);
+      if (_cachedDeepLink?.url) {
+        logger.info(`[browser.agent] deep-link: keyword cache hit for ${agentId}: ${_cachedDeepLink.url} (score=${_cachedDeepLink.score.toFixed(2)})`);
+        return { url: _cachedDeepLink.url, source: 'keyword-cache' };
+      }
+    }
 
     const _buildIntentTemplateUrl = () => {
       const svc = String(serviceKey || '').toLowerCase().replace(/[^a-z0-9]/g, '');
@@ -2925,15 +3187,95 @@ async function _resolveTaskDeepLink(agentId, serviceKey, baseStartUrl, task, exi
       // ── MAIL ──────────────────────────────────────────────────────────────
       if (intent === INTENTS.MAIL) {
         if (svc === 'gmail' || baseHost === 'mail.google.com') {
-          if (_isReadOnlyMailTask(task)) return null; // let discovery pipeline run
+          if (_isReadOnlyTask(task, intent)) {
+            // Read-only mail task: try to build a search URL from criteria
+            const _searchUrl = _buildSearchCriteriaUrl(intent, serviceKey, baseStartUrl, baseHost, task);
+            if (_searchUrl) return _searchUrl;
+            return null; // no criteria — let discovery pipeline find a search/filter URL
+          }
           return 'https://mail.google.com/mail/u/0/#inbox?compose=new';
         }
         if (svc === 'outlook' || baseHost === 'outlook.live.com' || baseHost === 'outlook.office.com') {
+          if (_isReadOnlyTask(task, intent)) {
+            const _searchUrl = _buildSearchCriteriaUrl(intent, serviceKey, baseStartUrl, baseHost, task);
+            if (_searchUrl) return _searchUrl;
+            return null; // let discovery pipeline find a search/filter URL
+          }
           return 'https://outlook.live.com/mail/0/deeplink/compose';
         }
       }
 
-      // ── CONTENT_CREATE ────────────────────────────────────────────────────
+      // ── SOCIAL (read-only check) ──────────────────────────────────────────
+      // "show me tweets from @user" is read-only — don't return compose URL.
+      if (intent === INTENTS.SOCIAL) {
+        if (_isReadOnlyTask(task, intent)) return null; // let discovery pipeline run
+        if (svc === 'twitter' || svc === 'x' || baseHost === 'x.com') {
+          return 'https://x.com/compose/post';
+        }
+        if (svc === 'linkedin' || baseHost === 'linkedin.com') {
+          return 'https://www.linkedin.com/feed/?shareActive=true';
+        }
+        if (svc === 'reddit' || baseHost === 'reddit.com') {
+          const subMatch = task.match(/r\/([\w-]+)/i);
+          if (subMatch) return `https://www.reddit.com/r/${subMatch[1]}/submit`;
+          return 'https://www.reddit.com/submit';
+        }
+      }
+
+      // ── CONTENT_CREATE (read-only check) ──────────────────────────────────
+      // "list my open issues" or "show my documents" is read-only — don't return create URL.
+      if (intent === INTENTS.CONTENT_CREATE) {
+        if (_isReadOnlyTask(task, intent)) return null; // let discovery pipeline run
+        if (svc === 'googledocs' || baseHost === 'docs.google.com') {
+          return 'https://docs.google.com/document/create';
+        }
+        if (svc === 'googlesheets' || baseHost === 'sheets.google.com') {
+          return 'https://docs.google.com/spreadsheets/create';
+        }
+        if (svc === 'github' || baseHost === 'github.com') {
+          const repoMatch = task.match(/(?:in|on)\s+([\w-]+\/[\w-]+)/i);
+          if (repoMatch) return `https://github.com/${repoMatch[1]}/issues/new`;
+          return null;
+        }
+        if (svc === 'twitter' || svc === 'x' || baseHost === 'x.com') {
+          return 'https://x.com/compose/post';
+        }
+        if (svc === 'reddit' || baseHost === 'reddit.com') {
+          const subMatch = task.match(/r\/([\w-]+)/i);
+          if (subMatch) return `https://www.reddit.com/r/${subMatch[1]}/submit`;
+          return 'https://www.reddit.com/submit';
+        }
+        if (svc === 'medium' || baseHost === 'medium.com') {
+          return 'https://medium.com/new-story';
+        }
+        if (svc === 'youtube' || baseHost === 'youtube.com' || baseHost === 'studio.youtube.com') {
+          return 'https://studio.youtube.com/videos/upload';
+        }
+        if (svc === 'linkedin' || baseHost === 'linkedin.com') {
+          return 'https://www.linkedin.com/post/new';
+        }
+        if (svc === 'notion' || baseHost === 'app.notion.com') {
+          return 'https://notion.new';
+        }
+      }
+
+      // ── SCHEDULING (read-only check) ──────────────────────────────────────
+      // "check my calendar" or "what's on my schedule" is read-only — don't return calendar URL.
+      if (intent === INTENTS.SCHEDULING) {
+        if (_isReadOnlyTask(task, intent)) return null; // let discovery pipeline run
+        if (svc === 'googlecalendar' || svc === 'calendar' || baseHost === 'calendar.google.com') {
+          return 'https://calendar.google.com/calendar/u/0/r';
+        }
+        if (svc === 'calendly' || baseHost === 'calendly.com') {
+          return 'https://calendly.com/events/new';
+        }
+      }
+
+      // ── COMMERCE (read-only check) ────────────────────────────────────────
+      // "show my orders" or "check my cart" is read-only — don't return checkout URL.
+      if (intent === INTENTS.COMMERCE) {
+        if (_isReadOnlyTask(task, intent)) return null; // let discovery pipeline run
+      }
       if (intent === INTENTS.CONTENT_CREATE) {
         if (svc === 'googledocs' || baseHost === 'docs.google.com') {
           return 'https://docs.google.com/document/create';
@@ -2968,39 +3310,31 @@ async function _resolveTaskDeepLink(agentId, serviceKey, baseStartUrl, task, exi
         }
       }
 
-      // ── SOCIAL ────────────────────────────────────────────────────────────
-      if (intent === INTENTS.SOCIAL) {
-        if (svc === 'twitter' || svc === 'x' || baseHost === 'x.com') {
-          return 'https://x.com/compose/post';
-        }
-        if (svc === 'linkedin' || baseHost === 'linkedin.com') {
-          return 'https://www.linkedin.com/feed/?shareActive=true';
-        }
-        if (svc === 'reddit' || baseHost === 'reddit.com') {
-          const subMatch = task.match(/r\/([\w-]+)/i);
-          if (subMatch) return `https://www.reddit.com/r/${subMatch[1]}/submit`;
-          return 'https://www.reddit.com/submit';
-        }
-      }
-
-      // ── SCHEDULING ────────────────────────────────────────────────────────
-      if (intent === INTENTS.SCHEDULING) {
-        if (svc === 'googlecalendar' || svc === 'calendar' || baseHost === 'calendar.google.com') {
-          return 'https://calendar.google.com/calendar/u/0/r';
-        }
-        if (svc === 'calendly' || baseHost === 'calendly.com') {
-          return 'https://calendly.com/events/new';
-        }
-      }
-
       // ── SEARCH ────────────────────────────────────────────────────────────
       if (intent === INTENTS.SEARCH || isSearchLike) {
+        // Try extracting structured search criteria first (e.g., "unread from X not from Y")
+        const _sq = _extractSearchQuery(task, svc);
+        const _sqEncoded = _sq.hasCriteria ? encodeURIComponent(_sq.query) : '';
+
+        // Fall back to raw query text
         const qMatch = task.match(/\b(?:search|find|look\s*up|google)\s+(?:for\s+)?(.+?)$/i);
-        const q = qMatch?.[1] ? encodeURIComponent(String(qMatch[1]).trim().replace(/[?.!]+$/g, '')) : '';
+        const q = _sqEncoded || (qMatch?.[1] ? encodeURIComponent(String(qMatch[1]).trim().replace(/[?.!]+$/g, '')) : '');
         if (!q) return null;
+
+        // Known search URL patterns per service
         if (baseHost === 'google.com') return `https://www.google.com/search?q=${q}`;
         if (baseHost === 'youtube.com') return `https://www.youtube.com/results?search_query=${q}`;
         if (baseHost === 'w3schools.com') return `https://www.w3schools.com/search/search.asp?q=${q}`;
+        if (svc === 'gmail' || baseHost === 'mail.google.com') return `https://mail.google.com/mail/u/0/#search/${q}`;
+        if (svc === 'github' || baseHost === 'github.com') {
+          const repoMatch = task.match(/(?:in|on)\s+([\w-]+\/[\w-]+)/i);
+          if (repoMatch) return `https://github.com/${repoMatch[1]}/issues?q=${q}`;
+          return `https://github.com/search?q=${q}`;
+        }
+        if (svc === 'reddit' || baseHost === 'reddit.com') return `https://www.reddit.com/search/?q=${q}`;
+        // Generic: if the service has a /search path, use it with ?q=
+        // (discovery pipeline will verify this exists)
+        return null; // let discovery pipeline find the search URL pattern
       }
 
       // ── SETTINGS ──────────────────────────────────────────────────────────
@@ -3041,6 +3375,7 @@ async function _resolveTaskDeepLink(agentId, serviceKey, baseStartUrl, task, exi
 
     // 1.5. Authenticated eval — extract <a href> links from the live browser session.
     // This discovers action URLs only visible to logged-in users (e.g., app menus, dashboards).
+    // Also extracts <form> search patterns for read-only/search-criteria tasks.
     if (!candidate && sessionId) {
       try {
         const evalResult = await callSkill('browser.act', {
@@ -3082,13 +3417,65 @@ async function _resolveTaskDeepLink(agentId, serviceKey, baseStartUrl, task, exi
             }
           }
         }
+
+        // 1.5b. Search form extraction — for read-only/search-criteria tasks, look for
+        // <form> elements with search role/action and extract the search URL pattern.
+        // This catches ?q=, ?filter=, #search/ style search URLs that aren't in <a href> links.
+        if (!candidate && _isReadOnlyTask(task, intent) && _isSearchCriteriaTask(task)) {
+          try {
+            const formEvalResult = await callSkill('browser.act', {
+              action: 'evaluate',
+              sessionId,
+              text: 'JSON.stringify(Array.from(document.querySelectorAll("form")).map(f=>({action:f.action,method:f.method,role:f.getAttribute("role"),ariaLabel:f.getAttribute("aria-label"),inputs:Array.from(f.querySelectorAll("input,textarea")).map(i=>({name:i.name,type:i.type,placeholder:i.placeholder,role:i.getAttribute("role")}))})).filter(f=>f.action&&f.action.startsWith("http")).slice(0,30))',
+            }, 8000);
+            const formRaw = String(formEvalResult?.result || formEvalResult?.stdout || '').trim();
+            let formList = null;
+            try { formList = JSON.parse(formRaw); } catch (_) { const fm = formRaw.match(/\[[\s\S]*\]/); if (fm) try { formList = JSON.parse(fm[0]); } catch (_) {} }
+            if (Array.isArray(formList) && formList.length > 0) {
+              // Look for search-like forms: role=search, aria-label contains "search", or inputs named q/query/search/filter
+              const _searchForms = formList.filter(f => {
+                if (f.role === 'search' || /search/i.test(f.ariaLabel || '')) return true;
+                if (Array.isArray(f.inputs) && f.inputs.some(i => /^(q|query|search|filter|s|term|keywords?)$/i.test(i.name || ''))) return true;
+                return false;
+              });
+              if (_searchForms.length > 0) {
+                const _sf = _searchForms[0];
+                // Build a search URL from the form action + the first search input name
+                const _searchInput = Array.isArray(_sf.inputs) ? _sf.inputs.find(i => /^(q|query|search|filter|s|term|keywords?)$/i.test(i.name || '')) : null;
+                if (_searchInput) {
+                  const _sq = _extractSearchQuery(task, String(serviceKey || '').toLowerCase().replace(/[^a-z0-9]/g, ''));
+                  const _queryVal = _sq.hasCriteria ? _sq.query : '';
+                  const _searchUrl = `${_sf.action}${_sf.action.includes('?') ? '&' : '?'}${_searchInput.name}=${encodeURIComponent(_queryVal)}`;
+                  // Verify the form action is on-domain
+                  try {
+                    const formHost = new URL(_sf.action).hostname.replace(/^www\./, '');
+                    if (formHost === baseHost || formHost.endsWith('.' + baseHost)) {
+                      candidate = _searchUrl;
+                      candidateSource = 'authenticated-form';
+                      logger.info(`[browser.agent] deep-link: search form discovered ${candidate} (input=${_searchInput.name}, label="${_sf.ariaLabel || ''}") for ${agentId}`);
+                      // Part C: Record the search URL pattern (with {query} placeholder)
+                      // for future criteria tasks on this service — avoids re-running
+                      // the full discovery pipeline next time.
+                      const _patternTemplate = `${_sf.action}${_sf.action.includes('?') ? '&' : '?'}${_searchInput.name}={query}`;
+                      setImmediate(() => {
+                        recordSearchUrlPattern(serviceKey, _patternTemplate, _searchInput.name, 'form-extraction').catch(() => {});
+                      });
+                    }
+                  } catch (_) {}
+                }
+              }
+            }
+          } catch (formErr) {
+            logger.debug(`[browser.agent] deep-link: search form eval failed: ${formErr.message}`);
+          }
+        }
       } catch (evalErr) {
         logger.debug(`[browser.agent] deep-link: authenticated eval failed: ${evalErr.message}`);
       }
     }
 
     // 2. Try web.agent discover_task_url
-    if (!candidate && !(_isMutationIntent(intent) && !(intent === INTENTS.MAIL && _isReadOnlyMailTask(task)))) {
+    if (!candidate && !(_isMutationIntent(intent) && !_isReadOnlyTask(task, intent))) {
       try {
         const webResult = await callSkill('web.agent', {
           action: 'discover_task_url',
@@ -3108,7 +3495,7 @@ async function _resolveTaskDeepLink(agentId, serviceKey, baseStartUrl, task, exi
 
     // 2.5. Try web.crawl link extraction — crawl the service's start URL and
     // extract <a href> links to discover action URLs not indexed by search engines.
-    if (!candidate && !(_isMutationIntent(intent) && !(intent === INTENTS.MAIL && _isReadOnlyMailTask(task)))) {
+    if (!candidate && !(_isMutationIntent(intent) && !_isReadOnlyTask(task, intent))) {
       try {
         const crawlResult = await callSkill('web.crawl', {
           url: baseStartUrl,
@@ -3215,12 +3602,51 @@ async function _resolveTaskDeepLink(agentId, serviceKey, baseStartUrl, task, exi
 
     logger.info(`[browser.agent] deep-link: ${agentId} → ${candidate} (source=${candidateSource})`);
 
-    // Merge keywords from all sources and cache
+    // Merge keywords from all sources and cache.
+    // Layer 2: Skip caching for search-criteria tasks — the resolved URL is either too
+    // specific (encodes the exact query, won't match future tasks) or too generic (inbox
+    // fallback, harmful). Criteria tasks should always re-derive their #search/ URL.
     const _mergedKeywords = [...new Set([..._taskKeywords, ...(_webAgentKeywords || []), ..._suggestKeywords])].slice(0, 20);
-    if (_mergedKeywords.length > 0) {
+    if (_mergedKeywords.length > 0 && !_isSearchCriteriaTask(task)) {
       setImmediate(() => {
         recordDeepLinkCache(serviceKey, candidate, _mergedKeywords, intent).catch(() => {});
       });
+    }
+
+    // Part C: For criteria tasks, if the discovered candidate is a search URL (has a
+    // query param like ?q=, ?query=, ?search=, ?filter=, or #search/), extract and cache
+    // the URL pattern (with {query} placeholder) for future criteria tasks on this service.
+    // This lets any site reuse a discovered search URL pattern without re-running discovery.
+    // (Form-extraction already records its own pattern above — this covers web.agent/web.crawl.)
+    if (_isCriteriaTask && candidateSource !== 'authenticated-form') {
+      try {
+        const _cUrl = new URL(candidate);
+        // Check if the URL has a search query parameter
+        const _searchParams = ['q', 'query', 'search', 'filter', 's', 'term', 'keywords'];
+        let _searchParamName = null;
+        for (const _p of _searchParams) {
+          if (_cUrl.searchParams.has(_p)) { _searchParamName = _p; break; }
+        }
+        // Also check for #search/ hash pattern (Gmail-style)
+        const _hashSearchMatch = _cUrl.hash.match(/^#search\/(.+)$/);
+        if (_searchParamName) {
+          // Build pattern: replace the query value with {query} placeholder
+          const _patternUrl = new URL(candidate);
+          _patternUrl.searchParams.set(_searchParamName, '{query}');
+          const _patternTemplate = _patternUrl.toString();
+          setImmediate(() => {
+            recordSearchUrlPattern(serviceKey, _patternTemplate, _searchParamName, candidateSource).catch(() => {});
+          });
+          logger.info(`[browser.agent] deep-link: recording search URL pattern for ${serviceKey}: ${_patternTemplate} (source=${candidateSource})`);
+        } else if (_hashSearchMatch) {
+          // Gmail-style #search/{query} — build pattern by replacing the hash content
+          const _patternTemplate = `${_cUrl.origin}${_cUrl.pathname}#search/{query}`;
+          setImmediate(() => {
+            recordSearchUrlPattern(serviceKey, _patternTemplate, 'hash', candidateSource).catch(() => {});
+          });
+          logger.info(`[browser.agent] deep-link: recording hash search URL pattern for ${serviceKey}: ${_patternTemplate} (source=${candidateSource})`);
+        }
+      } catch (_) {}
     }
 
     return { url: candidate, source: candidateSource };
@@ -5502,7 +5928,9 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
             if (_llmValid) {
             _deepLinkOverride = _llmSuggest.url;
             logger.info(`[browser.agent] deep-link: verified LLM URL ${_llmSuggest.url} — overriding startUrl from ${startUrl}`);
-            setImmediate(() => { recordCorrection(_serviceKey, _intent, _llmSuggest.url).catch(() => {}); });
+            if (!_isSearchCriteriaTask(task)) {
+              setImmediate(() => { recordCorrection(_serviceKey, _intent, _llmSuggest.url).catch(() => {}); });
+            }
             } else {
               logger.warn(`[browser.agent] deep-link: LLM URL ${_llmSuggest.url} failed validation — falling through to web search`);
             }
@@ -5550,13 +5978,19 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
           if (_valid) {
             _deepLinkOverride = _bestUrl;
             logger.info(`[browser.agent] deep-link: verified ${_bestUrl} (source=${_bestSource}, score=${_bestScore}) for task "${task.slice(0, 60)}" — overriding startUrl from ${startUrl}`);
-            // Record this working URL so future runs benefit immediately
-            setImmediate(() => {
-              recordCorrection(_serviceKey, _intent, _bestUrl).catch(() => {});
-            });
-            // Also record in keyword-indexed deep-link cache
+            // Record this working URL so future runs benefit immediately.
+            // Skip for search-criteria tasks — criteria URLs are too specific to be
+            // useful as generic intent corrections (see _resolveTaskDeepLink).
+            if (!_isSearchCriteriaTask(task)) {
+              setImmediate(() => {
+                recordCorrection(_serviceKey, _intent, _bestUrl).catch(() => {});
+              });
+            }
+            // Also record in keyword-indexed deep-link cache.
+            // Layer 2: Skip for search-criteria tasks — criteria URLs are too specific
+            // or too generic to be useful for keyword matching (see _resolveTaskDeepLink).
             const _secondaryKeywords = getTaskKeywords(task);
-            if (_secondaryKeywords.length > 0) {
+            if (_secondaryKeywords.length > 0 && !_isSearchCriteriaTask(task)) {
               setImmediate(() => {
                 recordDeepLinkCache(_serviceKey, _bestUrl, _secondaryKeywords, _intent).catch(() => {});
               });
@@ -5927,7 +6361,11 @@ When extracting page content with run-code, prioritize these selectors over gene
 
     // When the run succeeded and startUrl was auto-corrected by the destination resolver,
     // reinforce the correction memory so future runs auto-correct with full confidence.
-    if (agentResult?.ok === true) {
+    // Skip for search-criteria tasks — the startUrl encodes task-specific filter criteria
+    // (e.g., #search/is:unread from:pastor wendall) and should NOT be recorded as a
+    // generic intent correction. Otherwise future "check gmail" tasks (without criteria)
+    // would be auto-corrected to the criteria-specific search URL.
+    if (agentResult?.ok === true && !_isSearchCriteriaTask(task)) {
         try {
         const _confirmedIntent = await classifyTaskIntent(task);
         const _origUrl = extractDescriptorUrl(existing.descriptor, 'start_url');
@@ -5975,6 +6413,21 @@ When extracting page content with run-code, prioritize these selectors over gene
         const _longLines = _lines.filter(l => l.trim().split(/\s+/).length > 6).length;
         const _totalWords = agentResultText.trim().split(/\s+/).filter(Boolean).length;
         const _isSparse = _longLines < 3 && _totalWords < 60;
+        // URL-based no-results detection — a search URL with sparse content is a
+        // legitimate "no results" page, NOT a navigation/welcome page. This is more
+        // robust than regex-matching phrases because the URL is deterministic.
+        const _currentUrl = (() => {
+          try { return new URL(startUrl || '').href.toLowerCase(); } catch (_) { return ''; }
+        })();
+        const _isSearchUrl = /#search\/|\?q=|\?search=|\?filter=|\?query=|\/search\?/i.test(_currentUrl);
+        // Transcript-based fallback — check if any getPageText result contains
+        // "no results" text. Catches cases where the URL check doesn't apply but
+        // the transcript has the actual page text.
+        const _transcriptHasNoResults = agentResult?.transcript?.some(step => {
+          const stepResult = step.outcome?.result || step.result?.text || step.result;
+          const text = String(stepResult || '').toLowerCase();
+          return /\b(no messages matched|no results?\s*(?:found|matched)?|nothing (?:found|matched)|no matching)\b/i.test(text);
+        });
         // Navigation/action tasks (goto, click, open, navigate to, go to history, etc.)
         // and email tasks (send, compose, draft) produce sparse output by design.
         // Only apply the quality gate to research/lookup tasks.
@@ -5992,7 +6445,7 @@ When extracting page content with run-code, prioritize these selectors over gene
           (step.result.text || step.result.links) && 
           ((step.result.text?.length || 0) > 100 || (step.result.links?.length || 0) > 0)
         );
-        if (_isSparse && !_skipQualityGate && !_hasVideoLinks && !_hasExtractedContent) {
+        if (_isSparse && !_skipQualityGate && !_hasVideoLinks && !_hasExtractedContent && !_isSearchUrl && !_transcriptHasNoResults) {
           logger.warn(`[browser.agent] Research quality gate: sparse content for ${agentId} (longLines=${_longLines}, totalWords=${_totalWords}) — marking researchContentEmpty`);
           return {
             ok: false,
@@ -6702,6 +7155,646 @@ function _generateAgentThinking(agentType, context) {
   return thoughts.join(' ');
 }
 
+// ---------------------------------------------------------------------------
+// LiteParse CLI resolution + auto-install
+// (follows the playwright-cli pattern in browser.act.cjs)
+// ---------------------------------------------------------------------------
+const LIT_CANDIDATES = [
+  '/opt/homebrew/bin/lit',
+  '/usr/local/bin/lit',
+  path.join(os.homedir(), '.npm-global', 'bin', 'lit'),
+  path.join(os.homedir(), '.nvm', 'versions', 'node', process.version, 'bin', 'lit'),
+];
+
+function _findLitCli() {
+  for (const c of LIT_CANDIDATES) {
+    try { fs.accessSync(c, fs.constants.X_OK); return c; } catch (_) {}
+  }
+  try {
+    const { execSync } = require('child_process');
+    execSync('which lit', { timeout: 3000, stdio: 'pipe' });
+    return 'lit';
+  } catch (_) {}
+  return null;
+}
+
+let LIT_BIN = _findLitCli();
+let LIT_AVAILABLE = !!LIT_BIN;
+logger.info(`[browser.agent] LiteParse CLI: ${LIT_BIN || 'not found'} (available=${LIT_AVAILABLE})`);
+
+async function ensureLitAvailable() {
+  if (LIT_AVAILABLE) return true;
+  logger.info('[browser.agent] LiteParse CLI not found — attempting auto-install');
+  try {
+    const { execSync } = require('child_process');
+    execSync('npm i -g @llamaindex/liteparse', { timeout: 60000, stdio: 'pipe' });
+    LIT_BIN = _findLitCli();
+    LIT_AVAILABLE = !!LIT_BIN;
+    if (LIT_AVAILABLE) logger.info('[browser.agent] LiteParse CLI installed successfully');
+    return LIT_AVAILABLE;
+  } catch (e) {
+    logger.warn(`[browser.agent] LiteParse auto-install failed: ${e.message}`);
+    return false;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Web-specific UI element inference (separate from app.agent.cjs desktop schemas)
+// ---------------------------------------------------------------------------
+const ACTION_TYPES = {
+  // Submit actions — complete the task (final action)
+  submit: [
+    'post', 'share', 'tweet', 'publish',                 // social media
+    'send', 'reply', 'forward',                          // email/messaging
+    'submit', 'apply', 'confirm', 'update', 'save changes',  // forms
+    'create', 'save',                                    // docs/productivity
+    'add to cart', 'checkout', 'buy now', 'purchase', 'place order',  // shopping
+    'book', 'reserve', 'schedule',                       // booking
+    'invite', 'join', 'register', 'sign up',             // membership
+    'play', 'like', 'follow', 'subscribe',               // media/social
+    'comment', 'react', 'vote', 'rate',                  // engagement
+    'download', 'export',                                // data
+    'delete', 'archive', 'remove', 'cancel',             // destructive (still submit)
+    'log in', 'sign in', 'log out',                      // auth
+  ],
+  // Start/navigation actions — open something (NOT final action)
+  start: [
+    'start', 'new', 'open', 'compose', 'begin',
+    'add', 'create new', 'new post', 'new message',      // navigation to compose
+    'browse', 'view', 'show', 'see',                     // navigation to view
+    'edit', 'modify', 'change',                          // navigation to edit
+  ],
+  // Draft/intermediate actions — save progress but don't complete
+  draft: [
+    'draft', 'preview', 'save draft', 'save as draft',
+  ],
+};
+
+// Classify a text item as submit/start/draft/unknown action
+// Matches longest phrases first to handle ambiguity ("add to cart" before "add")
+function classifyAction(text, goal) {
+  const _text = text.trim().toLowerCase();
+  const _goal = (goal || '').toLowerCase();
+  if (!_text || _text.length > 30) return { type: 'unknown', confidence: 0.3 };
+
+  // Build sorted keyword list (longest first) so "add to cart" matches before "add"
+  const _allKeywords = [
+    ...ACTION_TYPES.submit.map(kw => ({ kw, type: 'submit' })),
+    ...ACTION_TYPES.start.map(kw => ({ kw, type: 'start' })),
+    ...ACTION_TYPES.draft.map(kw => ({ kw, type: 'draft' })),
+  ].sort((a, b) => b.kw.length - a.kw.length);
+
+  for (const { kw, type } of _allKeywords) {
+    if (_text === kw) {
+      const _goalMatch = _goal.includes(kw) ? 0.95 : 0.7;
+      return { type, confidence: _goalMatch, keyword: kw };
+    }
+    // Only match startsWith for short keywords (<= 10 chars) to avoid false positives
+    if (kw.length <= 10 && _text.startsWith(kw + ' ')) {
+      const _goalMatch = _goal.includes(kw) ? 0.85 : 0.6;
+      return { type, confidence: _goalMatch, keyword: kw };
+    }
+  }
+
+  return { type: 'unknown', confidence: 0.3 };
+}
+
+// Web-specific UI element schemas with comprehensive element type inference
+const BROWSER_CATEGORY_SCHEMAS = {
+  // Generic web element inference (applies to all pages)
+  web_generic: {
+    inferElementType: (textItem, allItems, viewport) => {
+      const _w = textItem.width;
+      const _h = textItem.height;
+      const _text = textItem.text || '';
+      const _textLen = _text.length;
+      const _area = _w * _h;
+
+      // Button: small text, short text, not full width
+      if (_w < 250 && _h < 60 && _textLen <= 30 && _textLen > 0) {
+        return { type: 'button', confidence: 0.7 };
+      }
+
+      // Input field: wide, short, empty or placeholder text
+      if (_w > 200 && _h < 50 && (_textLen < 20 || /^(enter|type|search|placeholder)/i.test(_text))) {
+        return { type: 'input', confidence: 0.6 };
+      }
+
+      // Dropdown/select: small width, contains ▼ or "select"
+      if (_w < 300 && _h < 50 && (/▼|▾|select|choose|dropdown/i.test(_text))) {
+        return { type: 'dropdown', confidence: 0.7 };
+      }
+
+      // Tab: short text, top of page, in a row with other tabs
+      if (_h < 40 && textItem.y < viewport.height * 0.15 && _textLen < 20) {
+        const _siblings = allItems.filter(i => Math.abs(i.y - textItem.y) < 20 && i !== textItem);
+        if (_siblings.length >= 1) {
+          return { type: 'tab', confidence: 0.6 };
+        }
+      }
+
+      // Menu item: short text, in a vertical list
+      if (_textLen < 40 && _h < 40) {
+        const _verticalNeighbors = allItems.filter(i =>
+          Math.abs(i.x - textItem.x) < 50 &&
+          Math.abs(i.y - textItem.y) > 20 && Math.abs(i.y - textItem.y) < 80
+        );
+        if (_verticalNeighbors.length >= 2) {
+          return { type: 'menu_item', confidence: 0.5 };
+        }
+      }
+
+      // Toolbar: top of page, wide
+      if (textItem.y < 80 && _w > 400) {
+        return { type: 'toolbar', confidence: 0.6 };
+      }
+
+      // Card: medium size, contains multiple text lines
+      if (_w > 200 && _h > 100 && _area > 20000) {
+        const _contained = allItems.filter(i =>
+          i.x >= textItem.x && i.x + i.width <= textItem.x + _w &&
+          i.y >= textItem.y && i.y + i.height <= textItem.y + _h && i !== textItem
+        );
+        if (_contained.length >= 2) {
+          return { type: 'card', confidence: 0.5 };
+        }
+      }
+
+      // List item: medium width, in a vertical sequence
+      if (_w > 100 && _h > 30 && _h < 100) {
+        const _verticalSequence = allItems.filter(i =>
+          Math.abs(i.x - textItem.x) < 100 &&
+          Math.abs(i.y - textItem.y) > 50 && Math.abs(i.y - textItem.y) < 200
+        );
+        if (_verticalSequence.length >= 2) {
+          return { type: 'list_item', confidence: 0.5 };
+        }
+      }
+
+      // Heading: larger text, short
+      if (_textLen < 80 && _h > 25 && _h < 60 && _w > 100) {
+        if (textItem.fontSize && textItem.fontSize > 16) {
+          return { type: 'heading', confidence: 0.7 };
+        }
+      }
+
+      // Link: short text, small width
+      if (_textLen < 60 && _w < 400 && _h < 30) {
+        return { type: 'link', confidence: 0.4 };
+      }
+
+      return { type: 'text', confidence: 0.3 };
+    },
+
+    // Infer modal/container from a group of items
+    inferContainer: (items, viewport) => {
+      if (items.length < 2) return null;
+      const _minX = Math.min(...items.map(i => i.x));
+      const _minY = Math.min(...items.map(i => i.y));
+      const _maxX = Math.max(...items.map(i => i.x + i.width));
+      const _maxY = Math.max(...items.map(i => i.y + i.height));
+      const _width = _maxX - _minX;
+      const _height = _maxY - _minY;
+
+      // Modal: centered, smaller than viewport, has padding from edges
+      const _centered = _minX > viewport.width * 0.1 && _minY > viewport.height * 0.1;
+      const _smallerThanViewport = _width < viewport.width * 0.9 && _height < viewport.height * 0.9;
+      const _hasPadding = _minX > 50 && _minY > 50;
+
+      if (_centered && _smallerThanViewport && _hasPadding && items.length >= 3) {
+        return { type: 'modal', x: _minX, y: _minY, width: _width, height: _height, confidence: 0.7 };
+      }
+
+      // Sidebar: left side, tall, narrow
+      if (_minX < viewport.width * 0.25 && _height > viewport.height * 0.5 && _width < viewport.width * 0.3) {
+        return { type: 'sidebar', x: _minX, y: _minY, width: _width, height: _height, confidence: 0.7 };
+      }
+
+      // Header/toolbar: top, wide, short
+      if (_minY < viewport.height * 0.15 && _width > viewport.width * 0.5 && _height < viewport.height * 0.2) {
+        return { type: 'header', x: _minX, y: _minY, width: _width, height: _height, confidence: 0.7 };
+      }
+
+      return null;
+    }
+  },
+
+  // Social media feed (LinkedIn, Twitter, Facebook, Reddit)
+  social_feed: {
+    inferElementType: (textItem, allItems, viewport) => {
+      const _generic = BROWSER_CATEGORY_SCHEMAS.web_generic.inferElementType(textItem, allItems, viewport);
+      if (_generic.type === 'button' && /like|comment|share|react|vote/i.test(textItem.text)) {
+        return { type: 'engagement_button', confidence: 0.8 };
+      }
+      return _generic;
+    }
+  },
+
+  // Email compose (Gmail, Outlook, ProtonMail)
+  email_compose: {
+    inferElementType: (textItem, allItems, viewport) => {
+      const _generic = BROWSER_CATEGORY_SCHEMAS.web_generic.inferElementType(textItem, allItems, viewport);
+      if (_generic.type === 'button' && /send|reply|forward|attach|discard/i.test(textItem.text)) {
+        return { type: 'email_action_button', confidence: 0.85 };
+      }
+      if (_generic.type === 'input' && /^(to|cc|bcc|subject|from)/i.test(textItem.text)) {
+        return { type: 'email_field', confidence: 0.8 };
+      }
+      return _generic;
+    }
+  },
+
+  // Document editor (Google Docs, Notion, Word Online)
+  document_editor: {
+    inferElementType: (textItem, allItems, viewport) => {
+      const _generic = BROWSER_CATEGORY_SCHEMAS.web_generic.inferElementType(textItem, allItems, viewport);
+      if (_generic.type === 'button' && /save|create|share|export|download|print/i.test(textItem.text)) {
+        return { type: 'doc_action_button', confidence: 0.85 };
+      }
+      if (textItem.width > 400 && textItem.height > 200) {
+        return { type: 'editor_body', confidence: 0.7 };
+      }
+      return _generic;
+    }
+  },
+
+  // Calendar (Google Calendar, Outlook Calendar)
+  calendar: {
+    inferElementType: (textItem, allItems, viewport) => {
+      const _generic = BROWSER_CATEGORY_SCHEMAS.web_generic.inferElementType(textItem, allItems, viewport);
+      if (_generic.type === 'button' && /save|create|add|delete|yes|no|maybe/i.test(textItem.text)) {
+        return { type: 'calendar_action_button', confidence: 0.85 };
+      }
+      if (/^\d{1,2}:\d{2}\s*(am|pm)?$/i.test(textItem.text)) {
+        return { type: 'time_slot', confidence: 0.8 };
+      }
+      return _generic;
+    }
+  },
+
+  // Shopping (Amazon, eBay, Etsy)
+  shopping: {
+    inferElementType: (textItem, allItems, viewport) => {
+      const _generic = BROWSER_CATEGORY_SCHEMAS.web_generic.inferElementType(textItem, allItems, viewport);
+      if (_generic.type === 'button' && /add to cart|buy now|checkout|purchase|place order/i.test(textItem.text)) {
+        return { type: 'shopping_action_button', confidence: 0.9 };
+      }
+      if (/^\$?\d+\.?\d*$/.test(textItem.text)) {
+        return { type: 'price', confidence: 0.7 };
+      }
+      return _generic;
+    }
+  },
+
+  // AI chat (ChatGPT, Claude, Perplexity)
+  ai_chat: {
+    inferElementType: (textItem, allItems, viewport) => {
+      const _generic = BROWSER_CATEGORY_SCHEMAS.web_generic.inferElementType(textItem, allItems, viewport);
+      if (textItem.y > viewport.height * 0.7 && textItem.width > 300) {
+        return { type: 'chat_input', confidence: 0.8 };
+      }
+      return _generic;
+    }
+  },
+
+  // Music/media player (Spotify, YouTube, Apple Music)
+  media_player: {
+    inferElementType: (textItem, allItems, viewport) => {
+      const _generic = BROWSER_CATEGORY_SCHEMAS.web_generic.inferElementType(textItem, allItems, viewport);
+      if (_generic.type === 'button' && /play|pause|next|previous|shuffle|repeat/i.test(textItem.text)) {
+        return { type: 'media_control', confidence: 0.85 };
+      }
+      return _generic;
+    }
+  },
+};
+
+// ---------------------------------------------------------------------------
+// LiteParse capture + verify + submit (Playwright screenshot → LiteParse → coordinates)
+// ---------------------------------------------------------------------------
+
+// Capture Playwright screenshot + run LiteParse → text items with bounding boxes
+async function _liteparseCapture(page) {
+  if (!LIT_AVAILABLE) {
+    const _ok = await ensureLitAvailable();
+    if (!_ok) return { ok: false, error: 'LiteParse CLI not available' };
+  }
+
+  const _screenshotPath = path.join(os.tmpdir(), `playwright_${Date.now()}.png`);
+  try {
+    await page.screenshot({ path: _screenshotPath, fullPage: false });
+  } catch (e) {
+    return { ok: false, error: `screenshot failed: ${e.message}` };
+  }
+
+  const _outputPath = path.join(os.tmpdir(), `liteparse_${Date.now()}.json`);
+  const { spawn } = require('child_process');
+
+  return new Promise((resolve) => {
+    const lit = spawn(LIT_BIN, ['parse', _screenshotPath, '--format', 'json', '-o', _outputPath], { timeout: 30000 });
+    let stderr = '';
+    lit.stderr.on('data', (d) => { stderr += d.toString(); });
+
+    lit.on('close', (code) => {
+      if (code !== 0) {
+        try { fs.unlinkSync(_screenshotPath); } catch (_) {}
+        resolve({ ok: false, error: `LiteParse exit ${code}: ${stderr.slice(0, 200)}` });
+        return;
+      }
+      try {
+        if (!fs.existsSync(_outputPath)) {
+          resolve({ ok: false, error: 'LiteParse output file not created' });
+          return;
+        }
+        const output = JSON.parse(fs.readFileSync(_outputPath, 'utf8'));
+
+        // Extract text items with bounding boxes (handle both LiteParse and Docling formats)
+        const textItems = [];
+        const _rawItems = output.pages?.[0]?.textItems || output.texts || [];
+        for (const item of _rawItems) {
+          if (!item.text) continue;
+          // LiteParse format: { text, x, y, width, height }
+          if (item.x !== undefined && item.y !== undefined) {
+            textItems.push({
+              text: item.text,
+              x: item.x || 0,
+              y: item.y || 0,
+              width: item.width || 0,
+              height: item.height || 0,
+              confidence: item.confidence || 1.0
+            });
+          }
+          // Docling format: { text, prov: [{ bbox: { l, t, r, b } }] }
+          else if (item.prov && item.prov[0] && item.prov[0].bbox) {
+            const bbox = item.prov[0].bbox;
+            textItems.push({
+              text: item.text,
+              x: bbox.l,
+              y: bbox.t,
+              width: bbox.r - bbox.l,
+              height: bbox.b - bbox.t,
+              confidence: 1.0
+            });
+          }
+        }
+
+        // Get screenshot dimensions for coordinate calibration
+        let imageWidth = 1280, imageHeight = 800;
+        try {
+          const { PNG } = require('pngjs');
+          const png = PNG.sync.read(fs.readFileSync(_screenshotPath));
+          imageWidth = png.width;
+          imageHeight = png.height;
+        } catch (_) {}
+
+        // Clean up temp files
+        try { fs.unlinkSync(_screenshotPath); fs.unlinkSync(_outputPath); } catch (_) {}
+
+        const fullText = textItems.map(i => i.text).join(' ');
+        logger.info(`[browser.agent] LiteParse capture: ${textItems.length} text items, ${imageWidth}x${imageHeight}, ${fullText.length} chars`);
+        resolve({ ok: true, textItems, imageWidth, imageHeight, fullText });
+      } catch (e) {
+        try { fs.unlinkSync(_screenshotPath); fs.unlinkSync(_outputPath); } catch (_) {}
+        resolve({ ok: false, error: `parse failed: ${e.message}` });
+      }
+    });
+
+    lit.on('error', () => {
+      try { fs.unlinkSync(_screenshotPath); } catch (_) {}
+      resolve({ ok: false, error: 'LiteParse spawn failed' });
+    });
+  });
+}
+
+// Verify typed text appears in LiteParse output
+async function _liteparseVerify(page, expectText) {
+  const _cap = await _liteparseCapture(page);
+  if (!_cap.ok) return { verified: false, error: _cap.error };
+
+  const _fullText = (_cap.fullText || '').toLowerCase();
+  const _expectSnippet = expectText.slice(0, 30).toLowerCase();
+
+  // Exact snippet match
+  if (_fullText.includes(_expectSnippet)) {
+    logger.info(`[browser.agent] LiteParse verify: exact match — verified`);
+    return { verified: true, source: 'exact', textItems: _cap.textItems, imageWidth: _cap.imageWidth, imageHeight: _cap.imageHeight };
+  }
+
+  // Fuzzy word matching (>40% of significant words)
+  const _words = expectText.toLowerCase().split(/\s+/).filter(w => w.length > 4);
+  if (_words.length > 0) {
+    const _matched = _words.filter(w => _fullText.includes(w));
+    const _ratio = _matched.length / _words.length;
+    if (_ratio > 0.4) {
+      logger.info(`[browser.agent] LiteParse verify: fuzzy match ${_matched.length}/${_words.length} (${Math.round(_ratio * 100)}%) — verified`);
+      return { verified: true, source: 'fuzzy', textItems: _cap.textItems, imageWidth: _cap.imageWidth, imageHeight: _cap.imageHeight };
+    }
+  }
+
+  // Note: Modal presence is now detected via DOM (in _ocrVerify), not OCR text patterns.
+  // LiteParse verify relies on text matching only — site-agnostic.
+
+  logger.info(`[browser.agent] LiteParse verify: not verified (textLen=${_fullText.length})`);
+  return { verified: false, source: 'none', textItems: _cap.textItems, imageWidth: _cap.imageWidth, imageHeight: _cap.imageHeight };
+}
+
+// DOM-first submit button finder. Collects visible button-like elements, scopes to the
+// modal if one is open, classifies each via classifyAction, and ranks by exact match >
+// bottom-right-most (submit buttons sit at the modal footer) > shorter text.
+// Returns { ok, x, y, text, rect, method } or { ok: false, reason }.
+// `frameOrPage` may be a Page or a Frame — both expose .evaluate with the same signature.
+async function _domFindSubmitTarget(frameOrPage, goal) {
+  const _goalLower = (goal || '').toLowerCase();
+  try {
+    const _result = await frameOrPage.evaluate((goalLower) => {
+      const _modalSel = '[role="dialog"], [aria-modal="true"], [role="alertdialog"], .artdeco-modal, [data-testid*="modal"], [data-testid*="share"], .share-creation, #interop-outlet';
+      const modals = Array.from(document.querySelectorAll(_modalSel)).filter(m => {
+        const r = m.getBoundingClientRect();
+        return r.width > 0 && r.height > 0 && m.getAttribute('aria-hidden') !== 'true';
+      });
+      const modal = modals[0];
+      const modalRect = modal ? modal.getBoundingClientRect() : null;
+
+      // Collect button-like elements
+      const _btnSel = 'button, [role="button"], a[role="button"], input[type="submit"]';
+      let candidates = Array.from(document.querySelectorAll(_btnSel));
+      // Scope to modal if present
+      if (modal) {
+        candidates = candidates.filter(b => {
+          const r = b.getBoundingClientRect();
+          if (r.width <= 0 || r.height <= 0) return false;
+          if (b.getAttribute('aria-hidden') === 'true') return false;
+          const cs = getComputedStyle(b);
+          if (cs.visibility === 'hidden' || parseFloat(cs.opacity || '1') < 0.1) return false;
+          // Inside modal rect?
+          return r.x >= modalRect.x - 2 && r.y >= modalRect.y - 2 &&
+                 (r.x + r.width) <= (modalRect.x + modalRect.width + 2) &&
+                 (r.y + r.height) <= (modalRect.y + modalRect.height + 2);
+        });
+      } else {
+        candidates = candidates.filter(b => {
+          const r = b.getBoundingClientRect();
+          if (r.width <= 0 || r.height <= 0) return false;
+          if (b.getAttribute('aria-hidden') === 'true') return false;
+          const cs = getComputedStyle(b);
+          if (cs.visibility === 'hidden' || parseFloat(cs.opacity || '1') < 0.1) return false;
+          return true;
+        });
+      }
+
+      // Classify each candidate. We can't call classifyAction (it's in Node), so we
+      // replicate the keyword matching inline. The caller will re-validate via
+      // classifyAction on the chosen text.
+      const _submitKw = ['post', 'share', 'tweet', 'publish', 'send', 'submit', 'create', 'save', 'add to cart', 'add', 'reply', 'comment'];
+      const _startKw = ['start a post', 'start', 'new', 'compose', 'write', 'log in', 'sign in', 'cancel', 'close', 'discard', 'go back'];
+      const scored = [];
+      for (const b of candidates) {
+        const text = ((b.innerText || b.textContent || b.value || '').trim() || (b.getAttribute('aria-label') || '').trim()).toLowerCase();
+        if (!text || text.length > 30) continue;
+        if (b.disabled) continue;
+        // Exclude start/navigation actions
+        if (_startKw.some(kw => text === kw || text.startsWith(kw))) continue;
+        // Match submit keywords
+        let isExact = false, keyword = null;
+        for (const kw of _submitKw) {
+          if (text === kw) { isExact = true; keyword = kw; break; }
+          if (text.includes(kw) || text.startsWith(kw)) { keyword = kw; }
+        }
+        if (!keyword) continue;
+        const r = b.getBoundingClientRect();
+        scored.push({ text, keyword, isExact, x: r.x + r.width / 2, y: r.y + r.height / 2, rect: { x: r.x, y: r.y, w: r.width, h: r.height }, inModal: !!modal });
+      }
+      if (scored.length === 0) return { ok: false, reason: 'no-submit-candidate', inModal: !!modal };
+      // Rank: exact first, then bottom-right-most (highest y, then highest x), then shorter text
+      scored.sort((a, b) => {
+        if (a.isExact !== b.isExact) return b.isExact - a.isExact;
+        if (Math.abs(a.y - b.y) > 20) return b.y - a.y; // lower (higher y) first
+        if (Math.abs(a.x - b.x) > 20) return b.x - a.x; // righter first
+        return a.text.length - b.text.length;
+      });
+      const best = scored[0];
+      return { ok: true, x: best.x, y: best.y, text: best.text, keyword: best.keyword, isExact: best.isExact, rect: best.rect, inModal: best.inModal, method: 'dom-find', candidateCount: scored.length };
+    }, _goalLower);
+    if (_result?.ok) {
+      logger.info(`[browser.agent] DOM find submit: found "${_result.text}" at (${Math.round(_result.x)}, ${Math.round(_result.y)}) keyword="${_result.keyword}" exact=${_result.isExact} inModal=${_result.inModal} candidates=${_result.candidateCount}`);
+    } else {
+      logger.info(`[browser.agent] DOM find submit: ${_result?.reason || 'no match'} inModal=${_result?.inModal}`);
+    }
+    return _result || { ok: false, reason: 'evaluate-failed' };
+  } catch (e) {
+    logger.warn(`[browser.agent] DOM find submit error: ${e.message}`);
+    return { ok: false, reason: 'error', error: e.message };
+  }
+}
+
+// Validate that a click point actually hits a button-like element matching expectedText.
+// Uses document.elementFromPoint, walks up to nearest button/[role=button], checks text.
+// Rejects if nothing button-like is found, text doesn't match, or element is outside modal.
+// `frameOrPage` may be a Page or a Frame — coordinates must be in that frame's space.
+async function _validateClickPoint(frameOrPage, x, y, expectedText) {
+  const _expectedLower = (expectedText || '').toLowerCase();
+  try {
+    const _valid = await frameOrPage.evaluate(({ px, py, expectedLower }) => {
+      const el = document.elementFromPoint(px, py);
+      if (!el) return { ok: false, reason: 'no-element-at-point' };
+      // Walk up to nearest button-like element
+      let node = el;
+      for (let i = 0; i < 5 && node; i++) {
+        if (node.tagName === 'BUTTON' || node.getAttribute('role') === 'button' ||
+            (node.tagName === 'A' && node.getAttribute('role') === 'button') ||
+            (node.tagName === 'INPUT' && node.type === 'submit')) break;
+        node = node.parentElement;
+      }
+      if (!node || (node.tagName !== 'BUTTON' && node.getAttribute('role') !== 'button' &&
+          !(node.tagName === 'A' && node.getAttribute('role') === 'button') &&
+          !(node.tagName === 'INPUT' && node.type === 'submit'))) {
+        return { ok: false, reason: 'no-button-at-point', actualTag: el.tagName };
+      }
+      const text = ((node.innerText || node.textContent || node.value || '').trim() || (node.getAttribute('aria-label') || '').trim()).toLowerCase();
+      if (expectedLower && text !== expectedLower && !text.includes(expectedLower) && !expectedLower.includes(text)) {
+        return { ok: false, reason: 'text-mismatch', actualText: text, expectedText: expectedLower };
+      }
+      // Check modal containment
+      const _modalSel = '[role="dialog"], [aria-modal="true"], [role="alertdialog"], .artdeco-modal, [data-testid*="modal"], [data-testid*="share"], .share-creation, #interop-outlet';
+      const modal = document.querySelector(_modalSel);
+      if (modal) {
+        const mR = modal.getBoundingClientRect();
+        const nR = node.getBoundingClientRect();
+        const inside = nR.x >= mR.x - 2 && nR.y >= mR.y - 2 &&
+                       (nR.x + nR.width) <= (mR.x + mR.width + 2) &&
+                       (nR.y + nR.height) <= (mR.y + mR.height + 2);
+        if (!inside) return { ok: false, reason: 'outside-modal', actualText: text };
+      }
+      if (node.disabled) return { ok: false, reason: 'disabled', actualText: text };
+      return { ok: true, text, tag: node.tagName };
+    }, { px: x, py: y, expectedLower: _expectedLower });
+    if (_valid?.ok) {
+      logger.info(`[browser.agent] validate click point (${Math.round(x)}, ${Math.round(y)}): OK text="${_valid.text}" tag=${_valid.tag}`);
+    } else {
+      logger.warn(`[browser.agent] validate click point (${Math.round(x)}, ${Math.round(y)}): REJECTED reason=${_valid?.reason} actual="${_valid?.actualText || 'n/a'}" expected="${_expectedLower}"`);
+    }
+    return _valid || { ok: false, reason: 'evaluate-failed' };
+  } catch (e) {
+    logger.warn(`[browser.agent] validate click point error: ${e.message}`);
+    return { ok: false, reason: 'error', error: e.message };
+  }
+}
+
+// Find submit button in LiteParse text items + click at its coordinates
+async function _liteparseSubmit(page, goal, textItems, imageWidth, imageHeight) {
+  const _goalLower = (goal || '').toLowerCase();
+
+  // Scale factor: LiteParse coordinates are in screenshot pixels.
+  // Playwright screenshot defaults to viewport size.
+  // page.mouse.click uses viewport coordinates.
+  const _viewportWidth = page.viewportSize()?.width || 1280;
+  const _viewportHeight = page.viewportSize()?.height || 800;
+  const _scaleX = _viewportWidth / imageWidth;
+  const _scaleY = _viewportHeight / imageHeight;
+
+  // Find text items that classify as submit actions (NOT start/navigation)
+  const _matches = [];
+  for (const item of textItems) {
+    const _text = (item.text || '').trim().toLowerCase();
+    if (!_text || _text.length > 30) continue; // submit buttons are short
+    const _action = classifyAction(_text, _goalLower);
+    if (_action.type === 'submit') {
+      const _isExact = _text === _action.keyword;
+      _matches.push({
+        ...item,
+        keyword: _action.keyword,
+        confidence: _action.confidence,
+        isExact: _isExact,
+        actionType: 'submit'
+      });
+    }
+  }
+
+  if (_matches.length === 0) {
+    logger.info(`[browser.agent] LiteParse submit: no submit-action text items found`);
+    return { ok: false, reason: 'no-submit-action-found' };
+  }
+
+  // Sort by: exact match first, then shorter text wins (submit buttons are short)
+  _matches.sort((a, b) => {
+    if (a.isExact !== b.isExact) return b.isExact - a.isExact;
+    return a.text.length - b.text.length;
+  });
+
+  const _best = _matches[0];
+  const _clickX = Math.round((_best.x + _best.width / 2) * _scaleX);
+  const _clickY = Math.round((_best.y + _best.height / 2) * _scaleY);
+
+  logger.info(`[browser.agent] LiteParse submit: clicking "${_best.text}" at (${_clickX}, ${_clickY}) — actionType=submit keyword="${_best.keyword}" exact=${_best.isExact} (scaled from ${_best.x + _best.width / 2},${_best.y + _best.height / 2} scaleX=${_scaleX} scaleY=${_scaleY})`);
+
+  try {
+    await page.mouse.click(_clickX, _clickY);
+    return { ok: true, text: _best.text, x: _clickX, y: _clickY, keyword: _best.keyword };
+  } catch (e) {
+    return { ok: false, error: `click failed: ${e.message}` };
+  }
+}
+
 module.exports = { browserAgent, KNOWN_BROWSER_SERVICES, actionDeleteAgent, _generateAgentThinking, clearAuthCaches: (agentId) => {
   _authCheckCache.delete((agentId || '').toLowerCase());
 } };
@@ -6713,3 +7806,13 @@ module.exports._canPromoteDeepLink = _canPromoteDeepLink;
 module.exports._isMutationIntent = _isMutationIntent;
 module.exports._isUnsafeDeepLinkUrl = _isUnsafeDeepLinkUrl;
 module.exports._resolvePlaybook = _resolvePlaybook;
+// LiteParse-based verify + submit
+module.exports.ensureLitAvailable = ensureLitAvailable;
+module.exports.classifyAction = classifyAction;
+module.exports.BROWSER_CATEGORY_SCHEMAS = BROWSER_CATEGORY_SCHEMAS;
+module.exports.ACTION_TYPES = ACTION_TYPES;
+module.exports._liteparseCapture = _liteparseCapture;
+module.exports._liteparseVerify = _liteparseVerify;
+module.exports._liteparseSubmit = _liteparseSubmit;
+module.exports._domFindSubmitTarget = _domFindSubmitTarget;
+module.exports._validateClickPoint = _validateClickPoint;

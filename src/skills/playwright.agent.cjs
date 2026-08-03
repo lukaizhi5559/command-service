@@ -50,6 +50,7 @@ const { browserAct, getDebuggingContext, invalidateEngineSnapshot } = require('.
 const engine = require('./browser-engine.cjs');
 const { askWithMessages } = require('../skill-helpers/skill-llm.cjs');
 const skillDb = require('../skill-helpers/skill-db.cjs');
+const { _liteparseVerify, _liteparseSubmit, _liteparseCapture, _domFindSubmitTarget, _validateClickPoint, ensureLitAvailable } = require('./browser.agent.cjs');
 
 const _COMMAND_PORT = parseInt(process.env.COMMAND_SERVICE_PORT || '3007', 10);
 
@@ -2800,15 +2801,604 @@ async function verifyTierCompletion(goal, pageType, routingDecision, script, ses
 // Returns a result object on success/failure, or null to fall through to LLM.
 // ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
+// OCR helpers — hide/show ThinkDrop overlay + capture screen via screen.analyze
+// Inlined (not requiring deprecated/overlayControl.cjs) to avoid module path issues.
+// ---------------------------------------------------------------------------
+async function _hideOverlay() {
+  const http = require('http');
+  return new Promise((resolve) => {
+    const req = http.request({ hostname: '127.0.0.1', port: 3010, path: '/overlay/hide', method: 'POST', timeout: 2000, headers: { 'Content-Length': '0' } }, res => { res.resume(); resolve(true); });
+    req.on('error', () => resolve(false)); req.on('timeout', () => { req.destroy(); resolve(false); });
+    req.end();
+  });
+}
+async function _showOverlay() {
+  const http = require('http');
+  return new Promise((resolve) => {
+    const req = http.request({ hostname: '127.0.0.1', port: 3010, path: '/overlay/show', method: 'POST', timeout: 2000, headers: { 'Content-Length': '0' } }, res => { res.resume(); resolve(true); });
+    req.on('error', () => resolve(false)); req.on('timeout', () => { req.destroy(); resolve(false); });
+    req.end();
+  });
+}
+
+// Capture screen via screen.analyze (port 3008) with overlay hidden.
+// Returns { ok, text, appName, url, confidence } or { ok:false, error }.
+async function _ocrCapture() {
+  const SCREEN_HOST = process.env.SCREEN_SERVICE_HOST || '127.0.0.1';
+  const SCREEN_PORT = parseInt(process.env.SCREEN_INTEL_PORT || '3008', 10);
+  const http = require('http');
+  await _hideOverlay();
+  await new Promise(r => setTimeout(r, 80)); // wait for OS to composite
+  try {
+    const body = JSON.stringify({});
+    const result = await new Promise((resolve, reject) => {
+      const req = http.request({ hostname: SCREEN_HOST, port: SCREEN_PORT, path: '/screen.analyze',
+        method: 'POST', headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
+        timeout: 15000 }, res => { let raw = ''; res.on('data', c => raw += c); res.on('end', () => { try { resolve(JSON.parse(raw)); } catch (e) { reject(e); } }); });
+      req.on('error', reject); req.on('timeout', () => { req.destroy(); reject(new Error('screen.analyze timeout')); });
+      req.write(body); req.end();
+    });
+    if (!result?.success) return { ok: false, error: result?.error || 'screen.analyze failed' };
+    return { ok: true, text: result.text || '', appName: result.appName, url: result.url, confidence: result.confidence };
+  } finally {
+    await _showOverlay();
+  }
+}
+
+// ---------------------------------------------------------------------------
 // OCR-based verification — uses screen-intelligence-service (screen.analyze)
 // and user-memory-service (getRecentOcr) to verify what's visible on screen.
 // Two-tier: getRecentOcr (free, may be stale) → screen.analyze (fresh, 2-5s).
 // ---------------------------------------------------------------------------
-async function _ocrVerify(expectText, typeTs) {
-  const _expectSnippet = expectText.slice(0, 30).toLowerCase();
-  const _composeIndicators = ['create a post', 'what do you want to talk about', 'start a post', 'write a post'];
 
-  // Tier 1: Quick check getRecentOcr — maybe monitor already captured Chrome with our text
+// Shared selectors — used by every frame-aware DOM helper below.
+const _MODAL_SEL = '[role="dialog"], [aria-modal="true"], [role="alertdialog"], .artdeco-modal, [data-testid*="modal"], [data-testid*="share"], .share-creation, #interop-outlet';
+const _COMPOSE_SEL = '[contenteditable="true"], [contenteditable=""], .ql-editor, [role="textbox"], [role="searchbox"], [role="combobox"], textarea, input[type="text"], input[type="search"]';
+// Labels that START a flow (or cancel it) and must never be clicked as a submit.
+const _START_LABEL_RE = /^(start a post|start|new|compose|write|log ?in|sign ?in|cancel|close|discard|go back|back|dismiss|next|add a photo|add media)\b/i;
+
+// Log a one-shot diagnostic of every frame so we can see WHERE the compose surface lives.
+// This is what identifies "the composer is in a child frame" in a single run.
+async function _logFrameDiagnostic(page, label = '') {
+  try {
+    const _frames = page.frames();
+    logger.info(`[playwright.agent] frame diagnostic${label ? ` (${label})` : ''}: ${_frames.length} frame(s)`);
+    for (let i = 0; i < _frames.length; i++) {
+      const f = _frames[i];
+      const _info = await f.evaluate(({ composeSel, modalSel }) => {
+        const compose = Array.from(document.querySelectorAll(composeSel));
+        const visibleCompose = compose.filter(el => {
+          const r = el.getBoundingClientRect();
+          return r.width > 0 && r.height > 0;
+        });
+        const btns = Array.from(document.querySelectorAll('button, [role="button"], input[type="submit"]')).filter(b => {
+          const r = b.getBoundingClientRect();
+          return r.width > 0 && r.height > 0;
+        });
+        return {
+          composeCount: compose.length,
+          visibleComposeCount: visibleCompose.length,
+          composeText: visibleCompose.slice(0, 2).map(el => (el.innerText || el.value || '').slice(0, 40)),
+          modalCount: document.querySelectorAll(modalSel).length,
+          bodyLen: (document.body?.innerText || '').length,
+          buttonLabels: btns.slice(0, 12).map(b => ((b.innerText || b.value || '').trim() || b.getAttribute('aria-label') || '').slice(0, 25)).filter(Boolean),
+        };
+      }, { composeSel: _COMPOSE_SEL, modalSel: _MODAL_SEL }).catch((e) => ({ error: e.message }));
+      logger.info(`[playwright.agent]   frame[${i}]${f === page.mainFrame() ? ' (main)' : ''} url=${(f.url() || '').slice(0, 80)} ${JSON.stringify(_info)}`);
+    }
+  } catch (e) {
+    logger.warn(`[playwright.agent] frame diagnostic failed: ${e.message}`);
+  }
+}
+
+// Find the frame that owns the compose surface. Returns { frame, isMain, reason }.
+// Prefers a frame with a visible compose element containing `expectText` (when given),
+// then any frame with a visible compose element, then the main frame.
+async function _findComposeFrame(page, expectText = null) {
+  const _snippet = expectText ? expectText.slice(0, 20).toLowerCase() : null;
+  let _best = null;
+  try {
+    for (const f of page.frames()) {
+      const _info = await f.evaluate(({ composeSel, snippet }) => {
+        const compose = Array.from(document.querySelectorAll(composeSel)).filter(el => {
+          const r = el.getBoundingClientRect();
+          return r.width > 0 && r.height > 0 && el.getAttribute('aria-hidden') !== 'true';
+        });
+        let withText = 0;
+        for (const el of compose) {
+          const t = (el.innerText || el.textContent || el.value || '').toLowerCase();
+          if (snippet && t.includes(snippet)) withText++;
+        }
+        return { visibleCompose: compose.length, withText };
+      }, { composeSel: _COMPOSE_SEL, snippet: _snippet }).catch(() => null);
+      if (!_info) continue;
+      // Highest priority: a frame whose compose element already holds our text
+      if (_info.withText > 0) {
+        logger.info(`[playwright.agent] compose frame: found text in frame url=${(f.url() || '').slice(0, 70)} (isMain=${f === page.mainFrame()})`);
+        return { frame: f, isMain: f === page.mainFrame(), reason: 'has-text' };
+      }
+      if (_info.visibleCompose > 0 && (!_best || _info.visibleCompose > _best.count)) {
+        _best = { frame: f, count: _info.visibleCompose };
+      }
+    }
+  } catch (e) {
+    logger.warn(`[playwright.agent] compose frame search error: ${e.message}`);
+  }
+  if (_best) {
+    logger.info(`[playwright.agent] compose frame: using frame with ${_best.count} visible compose el(s) url=${(_best.frame.url() || '').slice(0, 70)} (isMain=${_best.frame === page.mainFrame()})`);
+    return { frame: _best.frame, isMain: _best.frame === page.mainFrame(), reason: 'has-compose' };
+  }
+  logger.warn(`[playwright.agent] compose frame: no frame has a visible compose element — falling back to main frame`);
+  return { frame: page.mainFrame(), isMain: true, reason: 'fallback-main' };
+}
+
+// Capture pre-click UI state for comparison after submit.
+// Returns { url, modalCount, visibleModalCount, modalTexts, bodyLen, composeText }.
+// `frameOrPage` may be a Frame — the composer often lives in a child frame.
+async function _captureUiState(page, frameOrPage = null) {
+  const _target = frameOrPage || page;
+  const _empty = { url: '', modalCount: 0, visibleModalCount: 0, modalTexts: [], bodyLen: 0, composeCount: 0, composeTexts: [] };
+  try {
+    const _state = await _target.evaluate(({ modalSel, composeSel }) => {
+      const modals = Array.from(document.querySelectorAll(modalSel));
+      const visibleModals = modals.filter(m => {
+        if (m.getAttribute('aria-hidden') === 'true') return false;
+        const r = m.getBoundingClientRect();
+        return r.width > 0 && r.height > 0;
+      });
+      const compose = Array.from(document.querySelectorAll(composeSel)).filter(el => {
+        const r = el.getBoundingClientRect();
+        return r.width > 0 && r.height > 0 && el.getAttribute('aria-hidden') !== 'true';
+      });
+      return {
+        url: window.location.href.slice(0, 100),
+        bodyLen: (document.body?.innerText || '').length,
+        modalCount: modals.length,
+        visibleModalCount: visibleModals.length,
+        modalTexts: visibleModals.slice(0, 3).map(m => (m.innerText || '').slice(0, 200).trim()),
+        composeCount: compose.length,
+        // Compose contents are the primary success signal: a successful post clears them.
+        composeTexts: compose.slice(0, 3).map(el => (el.innerText || el.textContent || el.value || '').trim()),
+      };
+    }, { modalSel: _MODAL_SEL, composeSel: _COMPOSE_SEL });
+    return _state || _empty;
+  } catch (e) {
+    return { ..._empty, error: e.message };
+  }
+}
+
+// Verify submit via UI state change. Polled for up to timeoutMs.
+// - Failure (hard): a NEW dialog appeared matching discard/unsaved/leave patterns → click hit backdrop.
+// - Success: our text is gone from the composer (cleared) or the compose surface closed.
+//   Composer-cleared is the strongest universal signal — every site clears/closes on success.
+// - Inconclusive: composer still holds our text.
+// `frameOrPage` must be the frame that owns the composer (see _findComposeFrame).
+async function _verifySubmitViaUiState(page, preClickState, timeoutMs = 6000, frameOrPage = null, expectText = null) {
+  const _discardRe = /discard|are you sure|unsaved|leave.*(page|draft)|go back|cancel.*post/i;
+  const _snippet = expectText ? expectText.slice(0, 20).toLowerCase() : null;
+  // Did the composer hold our text before the click? Only then can "cleared" mean anything.
+  const _hadText = _snippet ? (preClickState.composeTexts || []).some(t => (t || '').toLowerCase().includes(_snippet)) : false;
+  const _start = Date.now();
+  while (Date.now() - _start < timeoutMs) {
+    try {
+      const _after = await _captureUiState(page, frameOrPage);
+      // Hard failure: a NEW dialog matching discard/unsaved appeared
+      const _newModalTexts = (_after.modalTexts || []).filter(t => !(preClickState.modalTexts || []).includes(t));
+      const _discardDialog = _newModalTexts.find(t => _discardRe.test(t));
+      if (_discardDialog) {
+        return { ok: false, reason: 'confirm-dialog-appeared', dialogText: _discardDialog.slice(0, 150) };
+      }
+      // Primary success signal: the composer held our text and no longer does.
+      if (_hadText) {
+        const _stillHasText = (_after.composeTexts || []).some(t => (t || '').toLowerCase().includes(_snippet));
+        if (!_stillHasText) {
+          return { ok: true, reason: 'composer-cleared', composeCount: _after.composeCount };
+        }
+      }
+      // Secondary: the compose surface itself disappeared (modal closed / composer unmounted)
+      if (preClickState.composeCount > 0 && _after.composeCount === 0) {
+        return { ok: true, reason: 'composer-closed', before: preClickState.composeCount, after: 0 };
+      }
+      if (preClickState.visibleModalCount > 0 && _after.visibleModalCount < preClickState.visibleModalCount) {
+        return { ok: true, reason: 'modal-closed', before: preClickState.visibleModalCount, after: _after.visibleModalCount };
+      }
+    } catch (e) {
+      // Page may be navigating — keep polling
+    }
+    await page.waitForTimeout(300);
+  }
+  return { ok: null, reason: _hadText ? 'inconclusive-text-still-present' : 'inconclusive-no-baseline-text' };
+}
+
+// Recovery from a confirm/discard dialog — press the non-destructive option so the draft survives.
+async function _recoverFromConfirmDialog(page, frameOrPage = null) {
+  const _target = frameOrPage || page;
+  try {
+    // Try to click a "Go back" / "Cancel" / "Keep" button first
+    const _recovered = await _target.evaluate(() => {
+      const _btnSel = 'button, [role="button"]';
+      const btns = Array.from(document.querySelectorAll(_btnSel));
+      const _keepRe = /^(go back|cancel|keep|don.?t discard|keep editing|stay)$/i;
+      for (const b of btns) {
+        const text = (b.innerText || b.textContent || '').trim().toLowerCase();
+        const r = b.getBoundingClientRect();
+        if (r.width > 0 && r.height > 0 && _keepRe.test(text)) {
+          b.click();
+          return { ok: true, method: 'click', text };
+        }
+      }
+      return { ok: false };
+    });
+    if (_recovered.ok) {
+      logger.info(`[playwright.agent] recovery: clicked "${_recovered.text}" to dismiss discard dialog`);
+      return;
+    }
+    // Fallback: press Escape
+    await page.keyboard.press('Escape').catch(() => {});
+    logger.info(`[playwright.agent] recovery: pressed Escape to dismiss discard dialog`);
+  } catch (e) {
+    logger.warn(`[playwright.agent] recovery error: ${e.message}`);
+  }
+}
+
+// Network-based submit verification — check if POST/PUT/PATCH/DELETE with 2xx + payload contains text
+// Strict version: does NOT accept "payload doesn't contain text — accepting".
+// Requires: payload contains the first 20 chars of expected text, OR the URL looks like a content
+// mutation endpoint AND is not telemetry.
+async function _verifySubmitViaNetwork(sessionId, submitClickTs, expectedText) {
+  try {
+    const _netLog = engine.getNetLog(sessionId);
+    const _relevant = _netLog.filter(e => e.ts >= submitClickTs - 500 && /^(POST|PUT|PATCH|DELETE)$/.test(e.method));
+    if (_relevant.length === 0) {
+      logger.info(`[playwright.agent] network verify: no mutation requests after submit click`);
+      return { ok: false, reason: 'no-mutation-requests' };
+    }
+    const _success = _relevant.find(e => e.status >= 200 && e.status < 300);
+    if (!_success) {
+      const _errors = _relevant.filter(e => e.status >= 400);
+      logger.info(`[playwright.agent] network verify: ${_relevant.length} requests, no 2xx, ${_errors.length} errors`);
+      return { ok: false, reason: 'no-success-status', requests: _relevant.map(e => `${e.method} ${e.url.slice(0, 60)} → ${e.status}`) };
+    }
+    // Path 1: payload contains the first 20 chars of our text → strong evidence of content submission
+    if (expectedText && _success.payload) {
+      const _snippet = expectedText.slice(0, 20).toLowerCase();
+      if (_success.payload.toLowerCase().includes(_snippet)) {
+        logger.info(`[playwright.agent] network verify: 2xx + payload contains text — verified`);
+        return { ok: true, reason: '2xx-with-text', method: _success.method, url: _success.url.slice(0, 80), status: _success.status };
+      }
+    }
+    // Path 2: URL looks like a content mutation endpoint (not telemetry) → accept
+    const _mutationRe = /\/graphql|\/voyager\/api|\/api\/|create|share|post|submit|send/i;
+    const _telCheckRe = /analytics|telemetry|beacon|metrics|sentry|collect|track|amplitude|datadog|newrelic|rum|perf|\btapi\b|gen_?204|pixel|csp-report|\/li\/track|clienttelemetry|ingraph/i;
+    if (_mutationRe.test(_success.url) && !_telCheckRe.test(_success.url)) {
+      logger.info(`[playwright.agent] network verify: 2xx + mutation URL (no payload match) — verified (${_success.method} ${_success.url.slice(0, 60)} → ${_success.status})`);
+      return { ok: true, reason: '2xx-mutation-url', method: _success.method, url: _success.url.slice(0, 80), status: _success.status };
+    }
+    // Otherwise: only telemetry or unrelated 2xx — NOT verified
+    logger.info(`[playwright.agent] network verify: 2xx but only telemetry/unrelated URL — NOT verified (${_success.method} ${_success.url.slice(0, 60)} → ${_success.status})`);
+    return { ok: false, reason: 'only-telemetry-or-unrelated-2xx', method: _success.method, url: _success.url.slice(0, 80), status: _success.status };
+  } catch (e) {
+    logger.warn(`[playwright.agent] network verify error: ${e.message}`);
+    return { ok: false, reason: 'error', error: e.message };
+  }
+}
+
+// Wait for a compose element (contenteditable / textarea / input / role=textbox) to be
+// focused and visible. Replaces the old fixed `waitForTimeout(2000)` which returned before
+// the modal/compose box existed, causing a lost-prefix typing race.
+//
+// If a modal is present but nothing inside it is focused, click the first visible compose
+// element to focus it, then re-check. Returns { focused, tag, role, inModal, focusTimeout }.
+// `frameOrPage` may be a Page or a Frame — the compose surface often lives in a child frame.
+async function _waitForComposeFocus(page, timeoutMs = 12000, frameOrPage = null) {
+  const _target = frameOrPage || page;
+  const _start = Date.now();
+  let _lastLog = 0;
+  let _evalErrLogged = false;
+  while (Date.now() - _start < timeoutMs) {
+    try {
+      // NOTE: page.evaluate accepts exactly ONE argument — always pass a single object.
+      const _state = await _target.evaluate(({ modalSel, composeSel }) => {
+        const modal = document.querySelector(modalSel);
+        const modalRect = modal ? modal.getBoundingClientRect() : null;
+        const inModal = !!modal && modalRect.width > 0 && modalRect.height > 0;
+        const ae = document.activeElement;
+        if (!ae) return { focused: false, inModal };
+        const aeRect = ae.getBoundingClientRect();
+        const aeVisible = aeRect.width > 0 && aeRect.height > 0;
+        const isCompose = ae.matches(composeSel) || ae.getAttribute('contenteditable') === 'true' ||
+          ae.getAttribute('role') === 'textbox' || ae.getAttribute('role') === 'searchbox' ||
+          ae.getAttribute('role') === 'combobox' || ae.tagName === 'TEXTAREA' ||
+          (ae.tagName === 'INPUT' && /^(text|search|email|url)$/i.test(ae.type || ''));
+        if (isCompose && aeVisible) {
+          return { focused: true, tag: ae.tagName, role: ae.getAttribute('role'), inModal,
+            ce: ae.getAttribute('contenteditable'), rect: { x: aeRect.x, y: aeRect.y, w: aeRect.width, h: aeRect.height } };
+        }
+        // Nothing compose-like focused — find a visible compose element to click. Prefer one
+        // inside the modal, but fall back to any visible compose element in this document
+        // (the composer may not be wrapped in a detectable modal container).
+        const scope = inModal ? modal : document;
+        const visible = Array.from(scope.querySelectorAll(composeSel)).find(el => {
+          const r = el.getBoundingClientRect();
+          return r.width > 0 && r.height > 0 && el.getAttribute('aria-hidden') !== 'true';
+        });
+        if (visible) return { focused: false, inModal, needsClick: true };
+        return { focused: false, inModal };
+      }, { modalSel: _MODAL_SEL, composeSel: _COMPOSE_SEL });
+
+      if (_state.focused) {
+        logger.info(`[playwright.agent] waiting for compose focus: focused=true tag=${_state.tag} role=${_state.role || 'n/a'} inModal=${_state.inModal} (${Date.now() - _start}ms)`);
+        // Settle delay — LinkedIn re-mounts the Quill editor right after focus.
+        await page.waitForTimeout(400);
+        return _state;
+      }
+      if (_state.needsClick) {
+        // Click the first visible compose element to focus it.
+        const _clicked = await _target.evaluate(({ modalSel, composeSel }) => {
+          const modal = document.querySelector(modalSel);
+          const mR = modal ? modal.getBoundingClientRect() : null;
+          const scope = (modal && mR.width > 0 && mR.height > 0) ? modal : document;
+          const cand = Array.from(scope.querySelectorAll(composeSel)).find(el => {
+            const r = el.getBoundingClientRect();
+            return r.width > 0 && r.height > 0 && el.getAttribute('aria-hidden') !== 'true';
+          });
+          if (cand) { cand.focus(); cand.click(); return true; }
+          return false;
+        }, { modalSel: _MODAL_SEL, composeSel: _COMPOSE_SEL }).catch((e) => {
+          logger.warn(`[playwright.agent] waiting for compose focus: focus-click evaluate failed: ${e.message}`);
+          return false;
+        });
+        if (_clicked) logger.info(`[playwright.agent] waiting for compose focus: clicked compose element to focus`);
+      }
+      if (Date.now() - _lastLog > 1000) {
+        logger.info(`[playwright.agent] waiting for compose focus: focused=false inModal=${_state.inModal} needsClick=${!!_state.needsClick} (${Date.now() - _start}ms)`);
+        _lastLog = Date.now();
+      }
+    } catch (e) {
+      // Do NOT swallow silently — a broken probe must not masquerade as "not ready yet".
+      if (!_evalErrLogged) {
+        logger.warn(`[playwright.agent] waiting for compose focus: evaluate error (will keep polling): ${e.message}`);
+        _evalErrLogged = true;
+      }
+    }
+    await page.waitForTimeout(250);
+  }
+  logger.warn(`[playwright.agent] waiting for compose focus: TIMEOUT after ${timeoutMs}ms — proceeding anyway`);
+  return { focused: false, focusTimeout: true, inModal: false };
+}
+
+// Generalized DOM verify — check if ANY field contains expected text
+// Checks contenteditable (innerText), inputs/textareas (.value), role=textbox
+// Returns { ok, fieldFound, fieldText, type, tag }:
+//   ok=true         — a field's text contains the snippet (verified)
+//   fieldFound=true, ok=false — a compose field exists but its text is WRONG (truncation)
+//   fieldFound=false — no compose field readable at all (OCR fallback is legitimate)
+// Searches EVERY frame — the compose surface is frequently in a child frame, and querying
+// only the main frame reports a false "no compose field found".
+// Also returns `frame` so callers can reuse the frame that owns the composer.
+async function _domVerify(page, expectText) {
+  const _snippet = expectText.slice(0, 20).toLowerCase();
+  const _probe = (snippet) => {
+    // contenteditable + role=textbox + .ql-editor (use innerText)
+    const editable = document.querySelectorAll('[contenteditable], [role="textbox"], .ql-editor');
+    let _firstFieldText = null, _firstFieldTag = null;
+    for (const el of editable) {
+      const _t = (el.innerText || el.textContent || '');
+      if (_t.toLowerCase().includes(snippet)) return { ok: true, fieldFound: true, fieldText: _t, type: 'contenteditable', tag: el.tagName };
+      if (_firstFieldText === null && _t.trim().length > 0) { _firstFieldText = _t; _firstFieldTag = el.tagName; }
+    }
+    // input + textarea (use .value)
+    const inputs = document.querySelectorAll('input[type="text"], input[type="search"], input[type="email"], input[type="url"], input:not([type]), textarea');
+    for (const el of inputs) {
+      const _t = (el.value || '');
+      if (_t.toLowerCase().includes(snippet)) return { ok: true, fieldFound: true, fieldText: _t, type: 'input', tag: el.tagName };
+      if (_firstFieldText === null && _t.trim().length > 0) { _firstFieldText = _t; _firstFieldTag = el.tagName; }
+    }
+    // fieldFound=true if we found a compose field with any text (even if it didn't match)
+    if (_firstFieldText !== null) return { ok: false, fieldFound: true, fieldText: _firstFieldText, type: 'contenteditable', tag: _firstFieldTag };
+    return { ok: false, fieldFound: false };
+  };
+
+  let _bestPartial = null;
+  try {
+    for (const f of page.frames()) {
+      const _found = await f.evaluate(_probe, _snippet).catch(() => null);
+      if (!_found) continue;
+      if (_found.ok) {
+        logger.info(`[playwright.agent] DOM verify: found text in ${_found.type} <${_found.tag}> — verified (frame=${f === page.mainFrame() ? 'main' : (f.url() || '').slice(0, 50)})`);
+        return { ..._found, frame: f };
+      }
+      if (_found.fieldFound && !_bestPartial) _bestPartial = { ..._found, frame: f };
+    }
+  } catch (e) {
+    logger.warn(`[playwright.agent] DOM verify error: ${e.message}`);
+    return { ok: false, fieldFound: false, error: e.message };
+  }
+  if (_bestPartial) {
+    logger.info(`[playwright.agent] DOM verify: field found but text does not match (fieldLen=${(_bestPartial.fieldText||'').length}, frame=${_bestPartial.frame === page.mainFrame() ? 'main' : (_bestPartial.frame.url() || '').slice(0, 50)})`);
+    return _bestPartial;
+  }
+  logger.info(`[playwright.agent] DOM verify: no compose field found in any of ${page.frames().length} frame(s)`);
+  return { ok: false, fieldFound: false };
+}
+
+// Generalized deterministic action — try to click submit/post/send/create button
+// Uses fuzzy matching (includes/startsWith) so "Submit Application", "Post Check", etc. match
+async function _deterministicAction(page, goal, frameOrPage = null) {
+  const _target = frameOrPage || page;
+  // Labels that START/cancel a flow must never be clicked as a submit. Without this,
+  // keyword "post" fuzzy-matched "Start a post" and re-opened the composer.
+  const _startLabelSrc = _START_LABEL_RE.source;
+  const _goalLower = goal.toLowerCase();
+  // Determine action keywords from goal
+  const _actionKeywords = [];
+  if (/\bpost\b|\bshare\b|\btweet\b|\bpublish\b/.test(_goalLower)) _actionKeywords.push('post', 'share', 'tweet', 'publish');
+  if (/\bsend\b|\bemail\b|\bmessage\b|\bdraft\b/.test(_goalLower)) _actionKeywords.push('send', 'send email', 'send message');
+  if (/\bcreate\b|\bnew\b|\bsave\b/.test(_goalLower)) _actionKeywords.push('create', 'save', 'new', 'create document', 'create page');
+  if (/\badd\b.*\bcart\b|\badd\b.*\bto\b.*\bcart\b/.test(_goalLower)) _actionKeywords.push('add to cart', 'add');
+  if (/\bsubmit\b/.test(_goalLower)) _actionKeywords.push('submit', 'submit issue', 'create issue');
+  if (/\bplay\b/.test(_goalLower)) _actionKeywords.push('play', 'play all', 'shuffle', 'play song');
+  if (/\blike\b/.test(_goalLower)) _actionKeywords.push('like');
+  if (_actionKeywords.length === 0) _actionKeywords.push('post', 'send', 'submit', 'create', 'save'); // fallback
+
+  logger.info(`[playwright.agent] deterministic action: keywords=[${_actionKeywords.join(', ')}]`);
+
+  // Try by button text (fuzzy — includes/startsWith matching)
+  for (const keyword of _actionKeywords) {
+    try {
+      const _clicked = await _target.evaluate(({ kw, startSrc }) => {
+        const startRe = new RegExp(startSrc, 'i');
+        const btns = document.querySelectorAll('button, [role="button"], a[role="button"], input[type="submit"]');
+        for (const btn of btns) {
+          const text = (btn.innerText || btn.value || '').trim().toLowerCase();
+          // Never click a start/cancel action (e.g. "Start a post") as a submit
+          if (startRe.test(text)) continue;
+          // Fuzzy: button text includes keyword OR starts with keyword
+          if ((text.includes(kw) || text.startsWith(kw)) && !btn.disabled) {
+            btn.click();
+            return { ok: true, text: btn.innerText || btn.value };
+          }
+        }
+        return { ok: false };
+      }, { kw: keyword, startSrc: _startLabelSrc });
+      if (_clicked?.ok) {
+        logger.info(`[playwright.agent] deterministic action: clicked button "${_clicked.text}" (matched keyword "${keyword}")`);
+        return { ok: true, method: 'text-fuzzy', keyword, text: _clicked.text };
+      }
+    } catch (_) {}
+  }
+
+  // Try by aria-label (fuzzy)
+  for (const keyword of _actionKeywords) {
+    try {
+      const _clicked = await _target.evaluate(({ kw, startSrc }) => {
+        const startRe = new RegExp(startSrc, 'i');
+        const els = document.querySelectorAll('[aria-label]');
+        for (const el of els) {
+          const label = (el.getAttribute('aria-label') || '').toLowerCase();
+          if (startRe.test(label)) continue; // never click a start/cancel action as submit
+          if (label.includes(kw) && !el.disabled) { el.click(); return { ok: true, label }; }
+        }
+        return { ok: false };
+      }, { kw: keyword, startSrc: _startLabelSrc });
+      if (_clicked?.ok) {
+        logger.info(`[playwright.agent] deterministic action: clicked aria-label="${_clicked.label}" (matched keyword "${keyword}")`);
+        return { ok: true, method: 'aria-label-fuzzy', keyword, label: _clicked.label };
+      }
+    } catch (_) {}
+  }
+
+  // Try generic submit selectors
+  const _genericSelectors = [
+    'button[type="submit"]:not([disabled])',
+    'button.share-actions__primary-button:not([disabled])',
+    'input[type="submit"]:not([disabled])',
+  ];
+  for (const sel of _genericSelectors) {
+    try {
+      const _clicked = await _target.evaluate((s) => {
+        const e = document.querySelector(s);
+        if (e && !e.disabled) { e.click(); return true; }
+        return false;
+      }, sel);
+      if (_clicked) {
+        logger.info(`[playwright.agent] deterministic action: clicked generic selector ${sel}`);
+        return { ok: true, method: 'selector', selector: sel };
+      }
+    } catch (_) {}
+  }
+
+  logger.warn(`[playwright.agent] deterministic action: no matching button found`);
+  return { ok: false };
+}
+
+// Submit via Playwright Locators — the primary submit path.
+// Locators handle frame offsets, scrolling, actionability and occlusion automatically, which
+// eliminates the whole class of "clicked the dimmed backdrop instead of the button" bugs that
+// raw mouse.click(x, y) produced. Searches every frame, preferring the composer's frame.
+// Returns { ok, text, method, frame } or { ok: false, reason }.
+async function _locatorSubmit(page, goal, preferredFrame = null) {
+  const _goalLower = (goal || '').toLowerCase();
+  // Ordered submit labels — most specific/likely first, derived from the goal.
+  const _labels = [];
+  if (/\bpost\b|\bshare\b|\btweet\b|\bpublish\b/.test(_goalLower)) _labels.push('Post', 'Share', 'Publish', 'Tweet');
+  if (/\bsend\b|\bemail\b|\bmessage\b/.test(_goalLower)) _labels.push('Send');
+  if (/\bcomment\b|\breply\b/.test(_goalLower)) _labels.push('Reply', 'Comment');
+  if (/\bsubmit\b/.test(_goalLower)) _labels.push('Submit');
+  if (/\bcreate\b|\bsave\b/.test(_goalLower)) _labels.push('Create', 'Save');
+  if (_labels.length === 0) _labels.push('Post', 'Send', 'Submit', 'Save');
+
+  // Try the composer's frame first, then all others.
+  const _frames = [];
+  if (preferredFrame) _frames.push(preferredFrame);
+  for (const f of page.frames()) if (f !== preferredFrame) _frames.push(f);
+
+  for (const f of _frames) {
+    const _isMain = f === page.mainFrame();
+    for (const label of _labels) {
+      try {
+        // Exact, case-insensitive name match — excludes "Start a post" (which would only
+        // match a non-exact/substring query).
+        const _loc = f.getByRole('button', { name: new RegExp(`^\\s*${label}\\s*$`, 'i') });
+        const _count = await _loc.count().catch(() => 0);
+        if (_count === 0) continue;
+        // Prefer the LAST match — submit buttons sit at the modal/form footer.
+        const _btn = _loc.last();
+        const _visible = await _btn.isVisible().catch(() => false);
+        const _enabled = await _btn.isEnabled().catch(() => false);
+        if (!_visible || !_enabled) {
+          logger.info(`[playwright.agent] locator submit: "${label}" found (${_count}) but visible=${_visible} enabled=${_enabled} — skipping`);
+          continue;
+        }
+        await _btn.click({ timeout: 5000 });
+        logger.info(`[playwright.agent] locator submit: clicked "${label}" (${_count} match(es), frame=${_isMain ? 'main' : (f.url() || '').slice(0, 50)})`);
+        return { ok: true, text: label, method: 'locator', keyword: label.toLowerCase(), frame: f };
+      } catch (e) {
+        logger.info(`[playwright.agent] locator submit: "${label}" click failed: ${e.message.split('\n')[0].slice(0, 120)}`);
+      }
+    }
+  }
+  logger.warn(`[playwright.agent] locator submit: no enabled submit button found for labels [${_labels.join(', ')}] across ${_frames.length} frame(s)`);
+  return { ok: false, reason: 'no-locator-match' };
+}
+
+async function _ocrVerify(expectText, typeTs, page) {
+  const _expectSnippet = expectText.slice(0, 30).toLowerCase();
+  // Key words for fuzzy matching (>4 chars, significant)
+  const _words = expectText.toLowerCase().split(/\s+/).filter(w => w.length > 4);
+
+  // DOM-based modal detection (site-agnostic — replaces LinkedIn-specific regex)
+  let _modalPresent = false;
+  if (page) {
+    try {
+      _modalPresent = await page.evaluate(() => {
+        const _modalSelectors = [
+          '[role="dialog"]', '[aria-modal="true"]', '[role="alertdialog"]',
+          '[data-testid*="modal"]', '[data-testid*="dialog"]', '[data-testid*="share"]',
+          '.modal', '.dialog', '.overlay', '[class*="modal"]', '[class*="dialog"]',
+          '#interop-outlet', '.share-creation'
+        ];
+        for (const sel of _modalSelectors) {
+          if (document.querySelector(sel)) return true;
+        }
+        return false;
+      }).catch(() => false);
+    } catch (_) {}
+  }
+
+  function _fuzzyMatch(ocrLower) {
+    // Exact snippet match (30 chars)
+    if (ocrLower.includes(_expectSnippet)) return { match: true, source: 'exact' };
+    // Key word matching (>40% of significant words)
+    if (_words.length > 0) {
+      const matched = _words.filter(w => ocrLower.includes(w));
+      const ratio = matched.length / _words.length;
+      if (ratio > 0.4) return { match: true, source: `fuzzy-${Math.round(ratio * 100)}pct` };
+    }
+    return { match: false };
+  }
+
+  // Tier 1: Quick check getRecentOcr — maybe monitor already captured the browser with our text
   try {
     const memHost = process.env.MEMORY_SERVICE_HOST || '127.0.0.1';
     const memPort = parseInt(process.env.MEMORY_SERVICE_PORT || '3001', 10);
@@ -2827,68 +3417,62 @@ async function _ocrVerify(expectText, typeTs) {
       req.write(body); req.end();
     });
     const capture = result?.data?.capture || result?.result?.capture;
-    if (capture && capture.url && capture.url.includes('linkedin.com')) {
+    if (capture) {
       const capturedAtTs = new Date(capture.capturedAt).getTime();
       const isFresh = capturedAtTs > typeTs;
       const ocrText = (capture.text || '').toLowerCase();
-      const hasText = ocrText.includes(_expectSnippet);
-      const hasModal = _composeIndicators.some(ind => ocrText.includes(ind));
-      logger.info(`[playwright.agent] OCR verify (getRecentOcr): fresh=${isFresh} hasText=${hasText} hasModal=${hasModal} ocrLen=${ocrText.length} url=${capture.url}`);
-      if (isFresh && hasText) {
-        return { success: true, verified: true, hasText: true, hasModal, source: 'getRecentOcr' };
+      const _fuzzy = _fuzzyMatch(ocrText);
+      logger.info(`[playwright.agent] OCR verify (getRecentOcr): fresh=${isFresh} fuzzy=${_fuzzy.match} modalPresent=${_modalPresent} ocrLen=${ocrText.length} url=${capture.url || 'n/a'}`);
+      if (isFresh && (_fuzzy.match || _modalPresent)) {
+        return { success: true, verified: true, hasText: true, source: `getRecentOcr-${_fuzzy.source || 'modal'}` };
       }
     }
   } catch (e) { /* non-fatal — fall through to screen.analyze */ }
 
-  // Tier 2: Fresh screen.analyze with overlay hidden
+  // Tier 2: Fresh screen.analyze via _ocrCapture
   try {
-    const { hideOverlay, showOverlay } = require('./deprecated/overlayControl.cjs');
-    const SCREEN_HOST = process.env.SCREEN_SERVICE_HOST || '127.0.0.1';
-    const SCREEN_PORT = parseInt(process.env.SCREEN_INTEL_PORT || '3008', 10);
-    const http = require('http');
-    await hideOverlay();
-    await new Promise(r => setTimeout(r, 80)); // wait for OS to composite
-    try {
-      const body = JSON.stringify({});
-      const result = await new Promise((resolve, reject) => {
-        const req = http.request({ hostname: SCREEN_HOST, port: SCREEN_PORT, path: '/screen.analyze',
-          method: 'POST', headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
-          timeout: 15000 }, res => { let raw = ''; res.on('data', c => raw += c); res.on('end', () => { try { resolve(JSON.parse(raw)); } catch (e) { reject(e); } }); });
-        req.on('error', reject); req.on('timeout', () => { req.destroy(); reject(new Error('screen.analyze timeout')); });
-        req.write(body); req.end();
-      });
-      if (!result?.success) return { success: false, error: result?.error || 'screen.analyze failed' };
-      const text = (result.text || '').toLowerCase();
-      const hasText = text.includes(_expectSnippet);
-      const hasModal = _composeIndicators.some(ind => text.includes(ind));
-      logger.info(`[playwright.agent] OCR verify (screen.analyze): hasText=${hasText} hasModal=${hasModal} app=${result.appName} url=${result.url} conf=${result.confidence} textLen=${text.length}`);
-      return { success: true, verified: hasText, hasText, hasModal, source: 'screen.analyze' };
-    } finally {
-      await showOverlay();
-    }
+    const _cap = await _ocrCapture();
+    if (!_cap.ok) return { success: false, error: _cap.error };
+    const _ocrLower = _cap.text.toLowerCase();
+    const _fuzzy = _fuzzyMatch(_ocrLower);
+    const _verified = _fuzzy.match || _modalPresent;
+    logger.info(`[playwright.agent] OCR verify (screen.analyze): verified=${_verified} fuzzy=${_fuzzy.match}(${_fuzzy.source}) modalPresent=${_modalPresent} app=${_cap.appName} url=${_cap.url} conf=${_cap.confidence} textLen=${_cap.text.length} textPreview="${_cap.text.slice(0, 200).replace(/\n/g, ' ')}..."`);
+    return { success: true, verified: _verified, hasText: _verified, source: `screen.analyze-${_fuzzy.source || (_modalPresent ? 'modal' : 'none')}` };
   } catch (e) {
     logger.warn(`[playwright.agent] OCR verify (screen.analyze) failed: ${e.message}`);
     return { success: false, error: e.message };
   }
 }
 
-async function _scriptUrlFastPath(sessionId, text, goal, startTs, deadline, heartbeat) {
+async function _scriptUrlFastPath(sessionId, text, goal, startTs, deadline, heartbeat, headed) {
   const page = engine.getPage(sessionId);
   if (!page) return null;
 
   const transcript = [];
-  const MODAL_SEL = '[role="dialog"], #interop-outlet, .share-creation, [data-testid*="modal"], [data-testid*="share"]';
 
-  // ── OCR-based fast path ──
-  // Instead of polling for DOM compose elements (which fails because LinkedIn's
-  // SPA dismisses modals and uses non-standard selectors), we:
-  // 1. Wait 8s for the modal to load
-  // 2. Type text via keyboard.type() (deterministic — types into focused element)
-  // 3. Verify via OCR (getRecentOcr first, then screen.analyze with overlay hidden)
-  // 4. If verified → return _textEntered:true → fall through to turn-loop for submit
+  // ── Deterministic fast path ──
+  // 1. Wait for page to stabilize
+  // 2. Wait for compose focus (replaces fixed waitForTimeout — fixes lost-prefix typing race)
+  // 3. Type text via keyboard.type()
+  // 4. Verify via DOM (authoritative). Only fall back to OCR when NO compose field is readable.
+  // 5. If verified → submit via DOM-first + LiteParse cross-check
 
-  logger.info(`[playwright.agent] fast path: waiting 8s for modal to load`);
-  await page.waitForTimeout(8000);
+  logger.info(`[playwright.agent] fast path: waiting for page to stabilize (up to 15s)`);
+  await browserAct({ action: 'waitForStableText', sessionId, headed, timeoutMs: 15000 }).catch(() => {});
+
+  // Diagnostic: enumerate every frame so we can see WHERE the compose surface lives.
+  // The composer is frequently in a child frame; querying only the main frame reports
+  // "no compose field found" while OCR clearly sees the text.
+  await _logFrameDiagnostic(page, 'after-stabilize');
+
+  // Resolve the frame that owns the composer, then use it for all DOM work.
+  let _composeFrame = (await _findComposeFrame(page)).frame;
+
+  // Wait for the compose element to actually be focused (not a fixed timeout).
+  // The old `waitForTimeout(2000)` returned before the modal existed, causing typing
+  // to start on a not-yet-focused contenteditable → lost the first 4 chars.
+  const _focusState = await _waitForComposeFocus(page, 12000, _composeFrame);
+  logger.info(`[playwright.agent] fast path: compose focus ready (focused=${_focusState.focused} inModal=${_focusState.inModal}) — typing`);
 
   let _textVerified = false;
   const MAX_TYPE_ATTEMPTS = 3;
@@ -2900,49 +3484,187 @@ async function _scriptUrlFastPath(sessionId, text, goal, startTs, deadline, hear
     }
     logger.info(`[playwright.agent] fast path: type attempt ${_attempt}/${MAX_TYPE_ATTEMPTS} via keyboard.type`);
 
-    // Click center of modal (if visible) to ensure focus is in compose box
-    try {
-      const _modalBox = await page.locator(MODAL_SEL).last().boundingBox().catch(() => null);
-      if (_modalBox) {
-        await page.mouse.click(_modalBox.x + _modalBox.width / 2, _modalBox.y + 100);
-        await page.waitForTimeout(200);
-      } else {
-        // No modal found via selector — click center of viewport as fallback
-        const _vp = page.viewportSize();
-        if (_vp) await page.mouse.click(_vp.width / 2, _vp.height / 3);
-        await page.waitForTimeout(200);
-      }
-    } catch (_) {}
+    // Ensure compose focus before each attempt (re-focus if lost)
+    if (_attempt > 1 || !_focusState.focused) {
+      await _waitForComposeFocus(page, 6000, _composeFrame).catch(() => {});
+    }
 
-    // Clear any existing text (Cmd+A, Delete — works on macOS; Ctrl+A on other OS)
-    await page.keyboard.press('Meta+A').catch(() => {});
+    // Clear any existing text (Cmd+A on macOS, Ctrl+A on Windows/Linux)
+    const _clearMod = process.platform === 'darwin' ? 'Meta+A' : 'Control+A';
+    await page.keyboard.press(_clearMod).catch(() => {});
     await page.keyboard.press('Delete').catch(() => {});
 
-    // Type the text — keyboard.type types into whatever element has focus
+    // Type the text — keyboard.type types into whatever element has focus (auto-focused compose box)
     await page.keyboard.type(text, { delay: 5 });
     await page.waitForTimeout(1000);
 
-    // ── OCR verify: is the typed text visible on screen? ──
+    // ── DOM verify (authoritative, searches all frames) — { ok, fieldFound, fieldText, frame } ──
+    const _domResult = await _domVerify(page, text);
+    // Adopt the frame that actually holds the text — this is the authoritative composer frame.
+    if (_domResult.frame) _composeFrame = _domResult.frame;
+    if (_domResult.ok) {
+      logger.info(`[playwright.agent] fast path: text verified via DOM — proceeding to submit`);
+      _textVerified = true;
+      transcript.push({ step: 1, action: { action: 'type', text: text.slice(0, 80) + '...' }, outcome: { ok: true }, thoughts: `fast path: keyboard.type attempt ${_attempt} verified via DOM` });
+      break;
+    }
+
+    if (_domResult.fieldFound) {
+      // A compose field exists but its text does NOT contain the snippet → truncation.
+      // This is authoritative — do NOT fall back to fuzzy OCR (which falsely accepted
+      // an 80% word match on truncated text in the bug report).
+      const _fieldText = _domResult.fieldText || '';
+      const _expectText = text;
+      // Detect lost-prefix: field text is a suffix of the expected text
+      const _isSuffix = _expectText.toLowerCase().endsWith(_fieldText.toLowerCase().trim()) && _fieldText.trim().length > 0;
+      logger.warn(`[playwright.agent] fast path: DOM verify fieldFound=true ok=false${_isSuffix ? ' (field text is a SUFFIX of expected — lost-prefix focus race)' : ''} fieldLen=${_fieldText.length} expectLen=${_expectText.length} fieldPreview="${_fieldText.slice(0, 60).replace(/\n/g, ' ')}" — re-focusing and retyping (NO OCR fallback)`);
+      // Clear, re-focus, and retry — do NOT call _ocrVerify here.
+      if (_attempt < MAX_TYPE_ATTEMPTS) await page.waitForTimeout(500);
+      continue;
+    }
+
+    // No compose field readable at all (canvas / shadow DOM) → OCR fallback is legitimate
+    logger.info(`[playwright.agent] fast path: DOM verify fieldFound=false — falling back to OCR verify`);
     const _typeTs = Date.now();
-    const _ocrResult = await _ocrVerify(text, _typeTs);
+    const _ocrResult = await _ocrVerify(text, _typeTs, page);
     if (_ocrResult.verified) {
-      logger.info(`[playwright.agent] fast path: text verified via OCR (source=${_ocrResult.source}, hasModal=${_ocrResult.hasModal}) — falling through to turn-loop for submit`);
+      logger.info(`[playwright.agent] fast path: text verified via OCR (source=${_ocrResult.source}) — proceeding to submit`);
       _textVerified = true;
       transcript.push({ step: 1, action: { action: 'type', text: text.slice(0, 80) + '...' }, outcome: { ok: true }, thoughts: `fast path: keyboard.type attempt ${_attempt} verified via OCR (${_ocrResult.source})` });
       break;
     }
-    logger.warn(`[playwright.agent] fast path: text not verified via OCR (attempt ${_attempt}) — retrying`);
+    logger.warn(`[playwright.agent] fast path: text not verified via DOM or OCR (attempt ${_attempt}) — retrying`);
     if (_attempt < MAX_TYPE_ATTEMPTS) await page.waitForTimeout(2000);
   }
 
   if (!_textVerified) {
-    logger.warn(`[playwright.agent] fast path: could not type+verify via OCR after ${MAX_TYPE_ATTEMPTS} attempts — falling back to LLM`);
-    transcript.push({ step: 1, action: { action: 'type' }, outcome: { ok: false, error: 'OCR verify failed' }, thoughts: 'fast path: all retries failed' });
+    logger.warn(`[playwright.agent] fast path: could not type+verify after ${MAX_TYPE_ATTEMPTS} attempts — falling back to LLM`);
+    transcript.push({ step: 1, action: { action: 'type' }, outcome: { ok: false, error: 'verify failed' }, thoughts: 'fast path: all retries failed' });
     return null;
   }
 
-  // Return _textEntered:true — tells playwrightAgent() to fall through to turn-loop
-  // The turn-loop LLM will see the text is entered (via heartbeat + page state) and click "Post"
+  // ── Submit: Locator-first (frame-aware, actionability-checked), then DOM/LiteParse fallbacks ──
+  logger.info(`[playwright.agent] fast path: text verified — attempting Locator submit`);
+  await page.waitForTimeout(500); // brief pause for UI to settle
+
+  // Capture pre-click state IN THE COMPOSER'S FRAME. composeTexts is the baseline for the
+  // primary success signal (a successful post clears the composer).
+  const _preClickState = await _captureUiState(page, _composeFrame);
+  logger.info(`[playwright.agent] fast path: pre-click state: modals=${_preClickState.visibleModalCount} compose=${_preClickState.composeCount} composeTextLen=${(_preClickState.composeTexts || []).join('').length} bodyLen=${_preClickState.bodyLen}`);
+
+  let _submitResult = null;
+
+  // Step 1: Locator-based submit — handles frame offsets, scrolling, actionability, occlusion.
+  _submitResult = await _locatorSubmit(page, goal, _composeFrame);
+
+  // Step 2: DOM coordinate fallback (scoped to modal + elementFromPoint validated)
+  if (!_submitResult.ok) {
+    const _domTarget = await _domFindSubmitTarget(_composeFrame, goal);
+    if (_domTarget.ok) {
+      const _valid = await _validateClickPoint(_composeFrame, _domTarget.x, _domTarget.y, _domTarget.text);
+      if (_valid.ok) {
+        try {
+          await _composeFrame.evaluate(({ px, py }) => {
+            const el = document.elementFromPoint(px, py);
+            if (el) el.click();
+          }, { px: _domTarget.x, py: _domTarget.y });
+          _submitResult = { ok: true, text: _domTarget.text, keyword: _domTarget.keyword, method: 'dom-find' };
+          logger.info(`[playwright.agent] fast path: clicked DOM-validated submit "${_domTarget.text}"`);
+        } catch (e) {
+          logger.warn(`[playwright.agent] fast path: DOM click failed: ${e.message}`);
+        }
+      } else {
+        logger.warn(`[playwright.agent] fast path: DOM target validation failed (${_valid.reason}) — trying LiteParse fallback`);
+      }
+    } else {
+      logger.info(`[playwright.agent] fast path: DOM find submit: ${_domTarget.reason} — trying LiteParse fallback`);
+    }
+  }
+
+  // Step 3: LiteParse fallback (coordinates are page-level, so only valid for the main frame)
+  if (!_submitResult.ok) {
+    try {
+      const _cap = await _liteparseCapture(page);
+      if (_cap.ok && _cap.textItems.length > 0) {
+        const _bodyLen = await page.evaluate(() => (document.body?.innerText || '').length).catch(() => 0);
+        if (_cap.fullText && _cap.fullText.length < 200 && _bodyLen > 1000) {
+          logger.warn(`[playwright.agent] fast path: LiteParse read only ${_cap.fullText.length} chars from ${_bodyLen}-char page — skipping LiteParse coordinates`);
+        } else {
+          const _lpResult = await _liteparseSubmit(page, goal, _cap.textItems, _cap.imageWidth, _cap.imageHeight);
+          if (_lpResult?.ok && _lpResult.x !== undefined) {
+            const _lpValid = await _validateClickPoint(page, _lpResult.x, _lpResult.y, _lpResult.text);
+            if (_lpValid.ok) _submitResult = _lpResult;
+            else logger.warn(`[playwright.agent] fast path: LiteParse click point validation failed (${_lpValid.reason}) — discarding`);
+          }
+        }
+      } else {
+        logger.warn(`[playwright.agent] fast path: LiteParse capture failed (${_cap.error || 'no text items'})`);
+      }
+    } catch (_lpErr) {
+      logger.warn(`[playwright.agent] fast path: LiteParse submit error: ${_lpErr.message}`);
+    }
+  }
+
+  // Step 4: Last-resort — legacy deterministic action (now excludes "Start a post")
+  if (!_submitResult.ok) {
+    _submitResult = await _deterministicAction(page, goal, _composeFrame);
+  }
+
+  if (_submitResult.ok) {
+    const _submitClickTs = Date.now();
+    logger.info(`[playwright.agent] fast path: clicked submit (${_submitResult.method || 'unknown'} text="${_submitResult.text || _submitResult.label || 'n/a'}") — verifying`);
+    transcript.push({ step: 2, action: { action: 'click', text: _submitResult.text || _submitResult.label || _submitResult.selector }, outcome: { ok: true }, thoughts: `submit via ${_submitResult.method || 'unknown'}` });
+
+    // Primary verification: did the composer clear/close in its own frame?
+    const _uiVerify = await _verifySubmitViaUiState(page, _preClickState, 8000, _composeFrame, text);
+    if (_uiVerify.ok === false && _uiVerify.reason === 'confirm-dialog-appeared') {
+      // Hard failure — the click hit a destructive path. Recover so the draft survives.
+      logger.error(`[playwright.agent] fast path: HARD FAILURE — confirm dialog appeared: "${_uiVerify.dialogText}" — attempting recovery`);
+      await _recoverFromConfirmDialog(page, _composeFrame);
+      transcript.push({ step: 3, action: { action: 'verify' }, outcome: { ok: false, error: `confirm dialog: ${_uiVerify.dialogText}` }, thoughts: 'submit hit destructive path — recovered draft, falling through' });
+      // Fall through to Plan-Execute (never done:true)
+    } else if (_uiVerify.ok === true) {
+      logger.info(`[playwright.agent] fast path: UI state verify: ${_uiVerify.reason} — verified`);
+      const execTime = Date.now() - startTs;
+      return {
+        ok: true,
+        done: true,
+        goal,
+        sessionId,
+        turns: transcript.length,
+        result: `Text entered + submitted + UI verified (${_uiVerify.reason})`,
+        transcript,
+        routingDecision: 'fast_path_locator_submit_ui_verified',
+        executionTime: execTime,
+      };
+    } else {
+      // UI state inconclusive. Only a payload-level network match counts as proof here —
+      // an opaque 2xx (e.g. LinkedIn's rsc-action RPC) is NOT evidence of a post.
+      logger.info(`[playwright.agent] fast path: UI state ${_uiVerify.reason} — checking network for payload-level proof`);
+      await page.waitForTimeout(3000);
+      const _netVerify = await _verifySubmitViaNetwork(sessionId, _submitClickTs, text);
+      if (_netVerify.ok && _netVerify.reason === '2xx-with-text') {
+        logger.info(`[playwright.agent] fast path: submit verified via network payload — task complete`);
+        const execTime = Date.now() - startTs;
+        return {
+          ok: true,
+          done: true,
+          goal,
+          sessionId,
+          turns: transcript.length,
+          result: `Text entered + submitted + network payload verified`,
+          transcript,
+          routingDecision: 'fast_path_locator_submit_network_verified',
+          executionTime: execTime,
+        };
+      }
+      logger.warn(`[playwright.agent] fast path: NOT verified (ui=${_uiVerify.reason}, net=${_netVerify.reason}) — composer still holds the text, falling through to Plan-Execute`);
+    }
+  } else {
+    logger.warn(`[playwright.agent] fast path: submit button not found — falling through to Plan-Execute`);
+  }
+
+  // Submit failed or not verified — fall through with _textEntered=true
   const execTime = Date.now() - startTs;
   const result = {
     ok: true,
@@ -2950,14 +3672,14 @@ async function _scriptUrlFastPath(sessionId, text, goal, startTs, deadline, hear
     goal,
     sessionId,
     turns: transcript.length,
-    done: false, // not done — turn-loop still needs to click submit
-    result: `Text entered via keyboard.type and verified via OCR — falling through to turn-loop for submit`,
+    done: false, // not done — Plan-Execute/turn-loop still needs to click submit
+    result: `Text entered via keyboard.type and verified — falling through for submit`,
     transcript,
     routingDecision: 'fast_path_ocr',
     executionTime: execTime,
   };
 
-  logger.info(`[playwright.agent] fast path: text entered + OCR verified — returning _textEntered=true for turn-loop fallback (time=${execTime}ms)`);
+  logger.info(`[playwright.agent] fast path: text entered + verified — returning _textEntered=true for fallback (time=${execTime}ms)`);
   return result;
 }
 
@@ -3576,9 +4298,122 @@ RULES:
 
 Output ONLY the JSON action object, no markdown, no explanation.`;
 
-async function _executeTurnLoopFallback({ goal, sessionId, headed, timeoutMs, agentContext, transcript, deadline, start, extractedText, heartbeat, textAlreadyEntered }) {
-  const MAX_TURNS = 12;
+// ── Focused Plan-Execute: ONE LLM call → 3-5 steps → verify each ──────────
+// Handles ALL browser interaction types (click, fill, type, press, hover, select,
+// scroll, drag, upload, check, tab-select, getPageText, etc.)
+// Key improvements over old Plan-Execute: OCR + DOM signals included, fresh snapshot,
+// verification after each step, limited to 3-5 steps.
+const FOCUSED_PLAN_EXECUTE_PROMPT = `You are a browser automation expert. Given the page state and task goal, generate 3-5 steps to complete the task.
+
+AVAILABLE ACTIONS (use these exact action names):
+  click        — {"action": "click", "selector": "e12"} (use refs from snapshot)
+  fill         — {"action": "fill", "selector": "e12", "text": "hello"} (React-aware fill)
+  type         — {"action": "type", "text": "hello"} (types into focused element)
+  press        — {"action": "press", "key": "Enter"}
+  hover        — {"action": "hover", "selector": "e12"}
+  select       — {"action": "select", "selector": "e12", "value": "option"}
+  scroll       — {"action": "scroll", "dy": 500}
+  drag         — {"action": "drag", "selector": "e12", "target": "e15"}
+  check        — {"action": "check", "selector": "e12"}
+  uncheck      — {"action": "uncheck", "selector": "e12"}
+  upload       — {"action": "upload", "selector": "e12", "files": ["/path/to/file"]}
+  tab-select   — {"action": "tab-select", "index": 0}
+  getPageText  — {"action": "getPageText"} (reads all visible text — use for read tasks)
+  waitForStableText — {"action": "waitForStableText"} (wait for page to settle)
+
+RULES:
+- Use element refs (e12, td5) from the ARIA snapshot for selectors — most reliable.
+- Maximum 5 steps. If the task needs more, prioritize the most critical steps.
+- For read/count/list tasks, end with getPageText.
+- For compose tasks, fill the compose box then click the submit button.
+- Do NOT include navigate steps — we're already on the right page.
+
+Return JSON: {"steps": [...], "thoughts": "brief explanation"}`;
+
+async function _focusedPlanExecute({ goal, sessionId, headed, timeoutMs, agentContext, deadline, start, heartbeat, _ocrText, _domSignals }) {
+  const _peStart = Date.now();
+  logger.info(`[playwright.agent] focused Plan-Execute: starting for goal="${goal.slice(0, 80)}"`);
+
+  try {
+    const page = engine.getPage(sessionId);
+    if (!page) return { ok: false, error: 'no page' };
+
+    // 1. Get fresh snapshot + page text
+    const _snapResult = await browserAct({ action: 'snapshot', sessionId, headed, timeoutMs: 10000 }).catch(() => ({ ok: false }));
+    const _snap = _snapResult?.ok ? String(_snapResult.result || '') : '';
+    const _pageText = await page.evaluate(() => document.body.innerText.slice(0, 3000)).catch(() => '');
+
+    // 2. ONE LLM call with full context
+    const _userPrompt = `GOAL: ${goal}
+${agentContext ? `\nAGENT CONTEXT:\n${agentContext}` : ''}
+${_ocrText ? `\nOCR SCREEN CAPTURE:\n${_ocrText.slice(0, 1000)}\n` : ''}
+${_domSignals ? `\nDOM STATE SIGNALS:\n${_domSignals.slice(0, 1000)}\n` : ''}
+VISIBLE PAGE TEXT (first 2000 chars):
+${_pageText.slice(0, 2000)}
+
+ARIA SNAPSHOT (first 3000 chars):
+${_snap.slice(0, 3000)}
+
+Generate 3-5 steps to complete this task.`;
+
+    const _response = await askWithMessages([
+      { role: 'system', content: FOCUSED_PLAN_EXECUTE_PROMPT },
+      { role: 'user', content: _userPrompt },
+    ], { temperature: 0.1, maxTokens: 800, responseTimeoutMs: 20000 });
+
+    const _parsed = parseJson(_response);
+    if (!_parsed || !Array.isArray(_parsed.steps) || _parsed.steps.length === 0) {
+      logger.warn(`[playwright.agent] focused Plan-Execute: invalid response — no steps`);
+      return { ok: false, error: 'no steps in response' };
+    }
+
+    const _steps = _parsed.steps.slice(0, 5); // max 5 steps
+    logger.info(`[playwright.agent] focused Plan-Execute: ${_steps.length} steps — ${_parsed.thoughts || 'no thoughts'}`);
+
+    // 3. Execute with verification
+    const _peTranscript = [];
+    for (let _i = 0; _i < _steps.length; _i++) {
+      if (Date.now() > deadline) {
+        logger.warn(`[playwright.agent] focused Plan-Execute: deadline exceeded at step ${_i + 1}`);
+        return { ok: false, error: 'deadline exceeded', transcript: _peTranscript };
+      }
+      const _step = _steps[_i];
+      logger.info(`[playwright.agent] focused Plan-Execute: step ${_i + 1}/${_steps.length} — ${_step.action}`);
+
+      const _result = await browserAct({ ..._step, sessionId, headed, timeoutMs: timeoutMs || 15000 });
+      _peTranscript.push({ step: _i + 1, action: _step, outcome: { ok: _result.ok, error: _result.error, result: _result.result }, thoughts: `Plan-Execute step ${_i + 1}` });
+
+      if (!_result.ok) {
+        logger.warn(`[playwright.agent] focused Plan-Execute: step ${_i + 1} failed — ${_result.error} — stopping`);
+        return { ok: false, error: `step ${_i + 1} failed: ${_result.error}`, transcript: _peTranscript };
+      }
+
+      // Brief pause for UI to settle
+      await page.waitForTimeout(1000);
+    }
+
+    // 4. All steps succeeded — extract result if last step was getPageText
+    let _resultText = 'Completed via focused Plan-Execute';
+    if (_steps[_steps.length - 1].action === 'getPageText') {
+      const _lastResult = _peTranscript[_peTranscript.length - 1];
+      if (_lastResult.outcome?.result) _resultText = String(_lastResult.outcome.result);
+    }
+
+    const _execTime = Date.now() - _peStart;
+    logger.info(`[playwright.agent] focused Plan-Execute: completed in ${_execTime}ms`);
+    return { ok: true, result: _resultText, transcript: _peTranscript, routingDecision: 'focused_plan_execute' };
+
+  } catch (e) {
+    logger.warn(`[playwright.agent] focused Plan-Execute error: ${e.message}`);
+    return { ok: false, error: e.message };
+  }
+}
+
+async function _executeTurnLoopFallback({ goal, sessionId, headed, timeoutMs, agentContext, transcript, deadline, start, extractedText, heartbeat, textAlreadyEntered, maxTurns = 8 }) {
+  const MAX_TURNS = maxTurns;
   const _loopTranscript = [...transcript];
+  let _lastActionSignature = null; // for duplicate detection
+  let _lastStateHash = null;       // page state hash for no-op detection
   logger.info(`[playwright.agent] turn-loop fallback: starting (max ${MAX_TURNS} turns) for goal="${goal.slice(0, 80)}"`);
 
   for (let turn = 1; turn <= MAX_TURNS; turn++) {
@@ -3606,10 +4441,11 @@ async function _executeTurnLoopFallback({ goal, sessionId, headed, timeoutMs, ag
 
     // Get probe data for compose elements
     let _probeInfo = '';
+    let _probe = null;
     try {
       const _ePage = engine.getPage(sessionId);
       if (_ePage) {
-        const _probe = await _ePage.evaluate(() => {
+        _probe = await _ePage.evaluate(() => {
           // Iterate ALL dialogs — querySelector returns the first (may be hidden video.js)
           const _modals = document.querySelectorAll('[role="dialog"], [aria-modal="true"]');
           let _hasVisibleModal = false;
@@ -3663,6 +4499,125 @@ ${_composeSel ? `- SUGGESTED COMPOSE SELECTOR: ${_composeSel}` : ''}`;
         }
       }
     } catch (_) {}
+
+    // ── DOM STATE SIGNALS (5th signal: active UI elements + ready-made selectors) ──
+    // Dumps elements with state-like attributes (contenteditable, aria-expanded, aria-modal,
+    // state classes, placeholder text, shadow DOM hosts). Each signal includes a CSS selector
+    // the LLM can use directly in clickBySelector/reactFill.
+    let _domSignals = '';
+    try {
+      const _ePage = engine.getPage(sessionId);
+      if (_ePage) {
+        const _signals = await _ePage.evaluate(() => {
+          const signals = [];
+          function makeSelector(el) {
+            if (el.id) return `#${el.id}`;
+            const parts = [el.tagName.toLowerCase()];
+            if (el.getAttribute('aria-label')) parts.push(`[aria-label='${el.getAttribute('aria-label')}']`);
+            else if (el.getAttribute('placeholder')) parts.push(`[placeholder='${el.getAttribute('placeholder')}']`);
+            else if (el.getAttribute('aria-placeholder')) parts.push(`[aria-placeholder='${el.getAttribute('aria-placeholder')}']`);
+            else if (el.getAttribute('contenteditable')) parts.push(`[contenteditable='${el.getAttribute('contenteditable')}']`);
+            else if (el.getAttribute('role')) parts.push(`[role='${el.getAttribute('role')}']`);
+            else if (el.getAttribute('data-testid')) parts.push(`[data-testid='${el.getAttribute('data-testid')}']`);
+            return parts.join('');
+          }
+          // 1. contenteditable (any value)
+          document.querySelectorAll('[contenteditable]').forEach(el => {
+            signals.push({ selector: makeSelector(el), tag: el.tagName, ce: el.getAttribute('contenteditable'), label: el.getAttribute('aria-label'), text: (el.innerText || '').slice(0, 50) });
+          });
+          // 2. aria-expanded/aria-haspopup/aria-modal
+          document.querySelectorAll('[aria-expanded], [aria-haspopup], [aria-modal]').forEach(el => {
+            signals.push({ selector: makeSelector(el), tag: el.tagName, expanded: el.getAttribute('aria-expanded'), modal: el.getAttribute('aria-modal'), label: el.getAttribute('aria-label') });
+          });
+          // 3. State-like classes (compose/share/editor/modal)
+          document.querySelectorAll('[class*="modal" i], [class*="compose" i], [class*="share" i], [class*="editor" i]').forEach(el => {
+            if (el.children.length < 10) {
+              signals.push({ selector: makeSelector(el), tag: el.tagName, class: (el.className || '').slice(0, 100), label: el.getAttribute('aria-label'), ce: el.getAttribute('contenteditable') });
+            }
+          });
+          // 4. Elements with placeholder text (compose boxes often have these)
+          document.querySelectorAll('[placeholder], [aria-placeholder]').forEach(el => {
+            signals.push({ selector: makeSelector(el), tag: el.tagName, placeholder: el.getAttribute('placeholder') || el.getAttribute('aria-placeholder'), ce: el.getAttribute('contenteditable') });
+          });
+          // 5. Shadow DOM hosts
+          document.querySelectorAll('*').forEach(el => {
+            if (el.shadowRoot) {
+              signals.push({ selector: makeSelector(el), tag: el.tagName, shadow: true, label: el.getAttribute('aria-label') });
+            }
+          });
+          return signals.slice(0, 25);
+        }).catch(() => []);
+        if (_signals.length > 0) {
+          _domSignals = _signals.map(s => {
+            const parts = [s.selector];
+            if (s.tag) parts.push(`<${s.tag}>`);
+            if (s.ce) parts.push(`contenteditable=${s.ce}`);
+            if (s.label) parts.push(`label="${s.label}"`);
+            if (s.placeholder) parts.push(`placeholder="${s.placeholder}"`);
+            if (s.expanded) parts.push(`expanded=${s.expanded}`);
+            if (s.modal) parts.push(`modal=${s.modal}`);
+            if (s.text) parts.push(`text="${s.text}"`);
+            if (s.shadow) parts.push(`shadowDOM=true`);
+            return '  ' + parts.join(' ');
+          }).join('\n');
+          logger.info(`[playwright.agent] turn-loop: DOM signals dump (${_signals.length} signals):\n${_domSignals}`);
+        }
+      }
+    } catch (_) {}
+
+    // ── OCR capture (B+ trigger: first turn, DOM disagrees, or last action failed) ──
+    // The DOM-based sources (heartbeat, page text, ARIA snapshot) can miss modals
+    // that use CSS transforms or shadow DOM (getBoundingClientRect returns 0).
+    // OCR captures what's actually visible on screen — ground truth.
+    let _ocrText = '';
+    const _isFirstTurn = turn === 1;
+    // DOM disagrees: heartbeat says visibleModalCount=0 but probe found hasAnyModal=true
+    const _lastTick = heartbeat?.buffer?.[heartbeat.buffer.length - 1];
+    const _domDisagrees = _lastTick && _lastTick.visibleModalCount === 0 &&
+      _probe && _probe.hasAnyModal === true;
+    // Last action failed
+    const _lastAction = _loopTranscript[_loopTranscript.length - 1];
+    const _actionFailed = _lastAction && _lastAction.outcome && !_lastAction.outcome.ok;
+    if (_isFirstTurn || _domDisagrees || _actionFailed) {
+      logger.info(`[playwright.agent] turn-loop: OCR capture triggered (firstTurn=${_isFirstTurn} domDisagrees=${!!_domDisagrees} actionFailed=${!!_actionFailed})`);
+      try {
+        const _cap = await _ocrCapture();
+        if (_cap.ok) {
+          _ocrText = _cap.text.slice(0, 1500);
+          logger.info(`[playwright.agent] turn-loop: OCR captured ${_ocrText.length} chars (app=${_cap.appName} conf=${_cap.confidence}) textPreview="${_ocrText.slice(0, 300).replace(/\n/g, ' ')}..."`);
+        } else {
+          logger.warn(`[playwright.agent] turn-loop: OCR capture failed: ${_cap.error}`);
+        }
+      } catch (e) {
+        logger.warn(`[playwright.agent] turn-loop: OCR capture error: ${e.message}`);
+      }
+    }
+
+    // ── OCR-triggered type (just type + OCR verify, no focus-finding) ──
+    // If OCR shows compose modal text, just keyboard.type into whatever has focus
+    // (compose URLs auto-focus the compose box). Then OCR verify.
+    if (_ocrText && !textAlreadyEntered && extractedText &&
+        /create a post|what do you want to talk about|compose|share a post|what's on your mind/i.test(_ocrText)) {
+      logger.info(`[playwright.agent] turn-loop: OCR shows compose modal — typing into focused element`);
+      const _ePage = engine.getPage(sessionId);
+      if (_ePage) {
+        const _clearMod = process.platform === 'darwin' ? 'Meta+A' : 'Control+A';
+        await _ePage.keyboard.press(_clearMod).catch(() => {});
+        await _ePage.keyboard.press('Delete').catch(() => {});
+        await _ePage.keyboard.type(extractedText, { delay: 5 });
+        await _ePage.waitForTimeout(1000);
+        // Verify via OCR
+        const _typeTs = Date.now();
+        const _ocrResult = await _ocrVerify(extractedText, _typeTs, _ePage);
+        if (_ocrResult.verified) {
+          logger.info(`[playwright.agent] turn-loop: text typed + verified via OCR (source=${_ocrResult.source}) — next turn will click Post`);
+          textAlreadyEntered = true;
+          _loopTranscript.push({ step: turn, action: { action: 'type', text: extractedText.slice(0, 80) + '...' }, outcome: { ok: true }, thoughts: `OCR-triggered type verified via OCR (${_ocrResult.source})` });
+        } else {
+          logger.warn(`[playwright.agent] turn-loop: text typed but not verified via OCR — will let LLM handle`);
+        }
+      }
+    }
 
     // Build action history summary (last 5 actions)
     const _recentActions = _loopTranscript.slice(-5).map((t, i) => {
@@ -3746,6 +4701,8 @@ ${_onTargetPage ? '\n⚠️ YOU ARE ALREADY ON THE CORRECT PAGE. DO NOT navigate
 ${textAlreadyEntered ? '\n✅ TEXT ALREADY ENTERED via keyboard.type and verified via OCR. Do NOT type again. Just click the submit/Post button NOW.\n' : ''}
 ${extractedText && !textAlreadyEntered ? `\n📝 TEXT TO TYPE (use this EXACT text in reactFill): "${extractedText}"\n` : ''}
 ${_probeInfo ? _probeInfo + '\n' : ''}
+${_ocrText ? `\nOCR SCREEN CAPTURE (what's actually visible on screen — TRUST THIS over DOM snapshot. If OCR shows a compose modal with "Create a post" or "What do you want to talk about?", the modal IS open even if the DOM says otherwise. Type text into the compose box or click Post.):\n${_ocrText}\n` : ''}
+${_domSignals ? `\nDOM STATE SIGNALS (active UI elements + ready-made selectors — use these selectors in clickBySelector/reactFill):\n${_domSignals}\n` : ''}
 ${_heartbeatHistory ? `\nPAGE STATE HISTORY (last ${Math.min(10, heartbeat.buffer.length)} heartbeat ticks, oldest first — use this to see what appeared/disappeared on the page):\n${_heartbeatHistory}\n` : ''}
 ${_selectorHints}
 VISIBLE PAGE TEXT (first 2000 chars):
@@ -3803,11 +4760,15 @@ Turn ${turn}/${MAX_TURNS}. What is your next action? (DO NOT snapshot - act dire
     }
 
     // ── Anti-repeat: skip duplicate actions ──
-    // If the last action was the same type and succeeded, skip this one.
-    // This prevents the LLM from navigating 12 times to the same URL.
+    // Extended to ALL action types, not just navigate/snapshot.
+    // If the last action was identical (same action + selector + text + url)
+    // and the page state hasn't changed, skip it and inject a hint.
     if (_loopTranscript.length > 0) {
       const _last = _loopTranscript[_loopTranscript.length - 1];
-      if (_last.action?.action === _action.action && _last.outcome?.ok) {
+      const _lastSig = JSON.stringify({ a: _last.action?.action, s: _last.action?.selector, t: _last.action?.text, u: _last.action?.url });
+      const _curSig = JSON.stringify({ a: _action.action, s: _action.selector, t: _action.text, u: _action.url });
+
+      if (_lastSig === _curSig && _last.outcome?.ok) {
         // For navigate: skip if same URL
         if (_action.action === 'navigate' && _last.action?.url === _action.url) {
           logger.warn(`[playwright.agent] turn-loop: skipping duplicate navigate to ${_action.url} — already done`);
@@ -3818,6 +4779,22 @@ Turn ${turn}/${MAX_TURNS}. What is your next action? (DO NOT snapshot - act dire
         if (_action.action === 'snapshot') {
           logger.warn(`[playwright.agent] turn-loop: skipping duplicate snapshot`);
           _loopTranscript.push({ action: _action, outcome: { ok: false, error: 'skipped duplicate snapshot' } });
+          continue;
+        }
+        // For all other actions: check if page state changed since last action
+        // If state is unchanged, the action was a no-op — skip and inject hint
+        let _currentStateHash = null;
+        try {
+          const _ePage = engine.getPage(sessionId);
+          if (_ePage) {
+            _currentStateHash = await _ePage.evaluate(() => (document.body?.innerText || '').length + ':' + (document.body?.innerText || '').slice(0, 200)).catch(() => null);
+          }
+        } catch (_) {}
+        if (_lastStateHash && _currentStateHash && _lastStateHash === _currentStateHash) {
+          logger.warn(`[playwright.agent] turn-loop: skipping duplicate ${_action.action} (identical action + unchanged page state) — inject hint to try different approach`);
+          _loopTranscript.push({ action: _action, outcome: { ok: false, error: 'skipped duplicate — page state unchanged, try a different approach or return done' } });
+          // Inject hint into next turn by modifying the goal temporarily
+          _lastActionSignature = 'duplicate_noop';
           continue;
         }
       }
@@ -3831,13 +4808,25 @@ Turn ${turn}/${MAX_TURNS}. What is your next action? (DO NOT snapshot - act dire
       _outcome = { ok: false, error: _execErr.message };
     }
 
-    _loopTranscript.push({ action: _action, outcome: _outcome });
+    _loopTranscript.push({ action: _action, outcome: _outcome, verified: _outcome.verified });
 
     if (!_outcome.ok) {
       logger.warn(`[playwright.agent] turn-loop: action ${_action.action} failed at turn ${turn}: ${_outcome.error}`);
       // Continue to next turn — the loop will reassess from a fresh snapshot
     } else {
-      logger.info(`[playwright.agent] turn-loop: action ${_action.action} succeeded at turn ${turn}`);
+      // Surface verified status — ok && !verified means "unconfirmed", not "succeeded"
+      if (_outcome.verified === false) {
+        logger.info(`[playwright.agent] turn-loop: action ${_action.action} unconfirmed at turn ${turn} (ok but verified=false) — goal may already be met`);
+      } else {
+        logger.info(`[playwright.agent] turn-loop: action ${_action.action} succeeded at turn ${turn}`);
+      }
+      // Track state hash for duplicate detection
+      try {
+        const _ePage = engine.getPage(sessionId);
+        if (_ePage) {
+          _lastStateHash = await _ePage.evaluate(() => (document.body?.innerText || '').length + ':' + (document.body?.innerText || '').slice(0, 200)).catch(() => null);
+        }
+      } catch (_) {}
       // Invalidate snapshot cache after DOM-mutating actions
       const _domMutating = ['reactFill', 'clickByText', 'clickBySelector', 'click', 'fill', 'type', 'navigate', 'press'].includes(_action.action);
       if (_domMutating) {
@@ -3861,8 +4850,49 @@ Turn ${turn}/${MAX_TURNS}. What is your next action? (DO NOT snapshot - act dire
     }
   }
 
-  // Max turns reached without completion
-  logger.warn(`[playwright.agent] turn-loop: reached max turns (${MAX_TURNS}) without completing`);
+  // Max turns reached — run a pre-exhaustion completion check before declaring failure.
+  // The goal may already be satisfied (e.g., text was typed but the LLM never emitted
+  // a 'return' action). Check page text against goal keywords.
+  logger.warn(`[playwright.agent] turn-loop: reached max turns (${MAX_TURNS}) — running pre-exhaustion completion check`);
+  try {
+    const _ePage = engine.getPage(sessionId);
+    if (_ePage) {
+      const _finalPageText = await _ePage.evaluate(() => document.body.innerText.slice(0, 3000)).catch(() => '');
+      // Extract key phrases from the goal (text in quotes, or significant words)
+      const _goalPhrases = [];
+      const _quotedPhrases = goal.match(/["']([^"']+)["']/g);
+      if (_quotedPhrases) _goalPhrases.push(..._quotedPhrases.map(p => p.replace(/["']/g, '')));
+      // Also extract words after "titled", "called", "named", "add"
+      const _titledMatch = goal.match(/\b(?:titled|called|named|add)\s+["']?([^"'.\n]+?)["']?(?:\s+(?:and|then|with|to|under)|$)/i);
+      if (_titledMatch) _goalPhrases.push(_titledMatch[1].trim());
+      // Check if all key phrases appear in the page text
+      if (_goalPhrases.length > 0) {
+        const _pageLower = _finalPageText.toLowerCase();
+        const _matchedPhrases = _goalPhrases.filter(p => p.length > 2 && _pageLower.includes(p.toLowerCase()));
+        const _matchRatio = _matchedPhrases.length / _goalPhrases.length;
+        if (_matchRatio >= 0.5) {
+          logger.info(`[playwright.agent] turn-loop: pre-exhaustion check PASSED — ${_matchedPhrases.length}/${_goalPhrases.length} goal phrases found in page text (ratio=${_matchRatio.toFixed(2)})`);
+          return {
+            ok: true,
+            goal,
+            sessionId,
+            turns: _loopTranscript.length,
+            done: true,
+            result: `Goal appears satisfied — ${_matchedPhrases.length}/${_goalPhrases.length} key phrases found in page text. Page content: ${_finalPageText.slice(0, 500)}`,
+            transcript: _loopTranscript,
+            routingDecision: 'turn_loop_pre_exhaustion_pass',
+            executionTime: Date.now() - start,
+          };
+        } else {
+          logger.info(`[playwright.agent] turn-loop: pre-exhaustion check FAILED — only ${_matchedPhrases.length}/${_goalPhrases.length} goal phrases found (ratio=${_matchRatio.toFixed(2)})`);
+        }
+      }
+    }
+  } catch (_checkErr) {
+    logger.warn(`[playwright.agent] turn-loop: pre-exhaustion check error (non-fatal): ${_checkErr.message}`);
+  }
+
+  logger.warn(`[playwright.agent] turn-loop: exhausted (${MAX_TURNS} turns) without completing the goal`);
   return {
     ok: false,
     goal,
@@ -4039,6 +5069,7 @@ async function playwrightAgent(args) {
     agentId               = sessionId,
     agentContext,
     maxRepairs            = 2,
+    maxTurns              = 8,
     timeoutMs             = 15000,
     headed                = true,
     url,
@@ -4197,7 +5228,7 @@ async function playwrightAgent(args) {
           // Store extracted text for turn-loop fallback (in case fast path fails)
           _extractedComposeText = _composeText;
           try {
-            const _fastResult = await _scriptUrlFastPath(sessionId, _composeText, goal, start, _deadline, _heartbeat);
+            const _fastResult = await _scriptUrlFastPath(sessionId, _composeText, goal, start, _deadline, _heartbeat, headed);
             if (_fastResult && _fastResult._textEntered) {
               // Text was entered + OCR verified — fall through to turn-loop for submit
               _textAlreadyEntered = true;
@@ -4218,6 +5249,67 @@ async function playwrightAgent(args) {
           }
         }
       }
+    }
+  }
+
+  // ── Browse/read task: extract content + return (no turn-loop needed) ──────
+  // For passive read-only tasks (summarize, read, how many, count), just extract
+  // page content. Query verbs (search for, find, look up, check) are NOT passive
+  // reads — they require interaction (search box or search URL) and fall through
+  // to Plan-Execute. Search-criteria tasks (unread, from:X, subject:X) also fall
+  // through so the filter can be applied before extraction.
+  if (url && engine.isSessionActive(sessionId)) {
+    // Passive read verbs — extract content from the current page without interaction
+    const _browseRe = /\bsummarize\b|\bread\b|\bshow me\b|\bbrowse\b|\bhow many\b|\bcount\b|\btell me what's on\b|\btell me what is on\b|\bwhat's on this page\b|\bwhat is on this page\b|\bextract content\b|\bget page text\b/i;
+    // Mutation verbs — if present, don't take the browse shortcut
+    const _composeRe2 = /\bpost\b|\bsend\b|\bcompose\b|\btweet\b|\bshare\b|\bwrite\b|\bcreate\b|\bsubmit\b|\bemail\b|\bmessage\b|\bdraft\b/i;
+    // Search-criteria patterns — if present, the task needs a search/filter applied first
+    const _searchCriteriaRe = /\bunread|starred|label:|tag:|from:|to:|subject:|is:unread|is:read|has:|since:|before:|after:|category:|not from|but not from|excluding\b/i;
+    // Check if the current URL already has a search query applied
+    let _urlHasSearchQuery = false;
+    try {
+      const _curUrl = await _engineEval(sessionId, 'window.location.href');
+      if (_curUrl?.ok && _curUrl.result) {
+        const _u = String(_curUrl.result).trim().replace(/^"|"$/g, '');
+        _urlHasSearchQuery = /#search\/|[?&](q|query|filter|search)=/i.test(_u);
+      }
+    } catch (_) {}
+
+    const _isBrowseMatch = _browseRe.test(goal);
+    const _hasMutation = _composeRe2.test(goal);
+    const _hasSearchCriteria = _searchCriteriaRe.test(goal);
+    // Take the browse shortcut only if: passive read verb AND no mutation AND
+    // (no search criteria OR the URL already has a search query applied)
+    if (_isBrowseMatch && !_hasMutation && (!_hasSearchCriteria || _urlHasSearchQuery)) {
+      logger.info(`[playwright.agent] browse/read task detected — extracting content (no turn-loop) [searchCriteria=${_hasSearchCriteria} urlHasQuery=${_urlHasSearchQuery}]`);
+      try {
+        const _browsePage = engine.getPage(sessionId);
+        if (_browsePage) {
+          await browserAct({ action: 'waitForStableText', sessionId, headed, timeoutMs: 15000 }).catch(() => {});
+          await _browsePage.waitForTimeout(2000); // extra settle for dynamic content
+          const _pageText = await _browsePage.evaluate(() => document.body.innerText.slice(0, 8000)).catch(() => '');
+          let _ocrText = '';
+          try { const _cap = await _ocrCapture(); if (_cap.ok) _ocrText = _cap.text.slice(0, 3000); } catch (_) {}
+          const _content = _pageText || _ocrText || '(no content extracted)';
+          logger.info(`[playwright.agent] browse/read: extracted ${_pageText.length} chars DOM + ${_ocrText.length} chars OCR`);
+          _heartbeat.stop();
+          return {
+            ok: true,
+            done: true,
+            goal,
+            sessionId,
+            turns: 1,
+            result: _content,
+            transcript: [{ step: 1, action: { action: 'getPageText' }, outcome: { ok: true }, thoughts: 'browse/read task — content extracted' }],
+            routingDecision: 'browse_read_extract',
+            executionTime: Date.now() - start,
+          };
+        }
+      } catch (_browseErr) {
+        logger.warn(`[playwright.agent] browse/read task error (non-fatal): ${_browseErr.message} — falling through`);
+      }
+    } else if (_hasSearchCriteria && !_urlHasSearchQuery) {
+      logger.info(`[playwright.agent] search-criteria task detected but URL has no search query — falling through to Plan-Execute (not taking browse shortcut)`);
     }
   }
 
@@ -4988,15 +6080,66 @@ async function playwrightAgent(args) {
     logger.warn(`[playwright.agent] phase 1.7: page study failed (non-fatal): ${_studyErr.message}`);
   }
 
-  // ── Phase 2: Turn-loop (URL-first tiers did not complete) ──────────────
-  // NOTE: Script-gen (phase 1.9) and Plan-Execute (phase 2+3) are commented out
-  // below. They had too many failure modes (false success reporting, stale refs,
-  // blind to contenteditable elements, LLM making wrong decisions about modal state).
-  // The turn-loop is more robust: fresh snapshot + page text + probe each turn,
-  // adapts after each action. Uses reactFill/clickByText/clickBySelector.
-  // If simple tasks are too slow (too many LLM calls per turn), we can re-enable
-  // Plan-Execute with a simple-task router for type→submit→read tasks.
-  logger.info(`[playwright.agent] phase 2: URL-first tiers did not complete - starting turn-loop`);
+  // ── Phase 2: Focused Plan-Execute (one LLM call, 3-5 steps, verify each) ──
+  // Handles ALL interaction types: click, fill, type, press, hover, select, scroll,
+  // drag, upload, check, tab-select, getPageText. Falls back to mini turn-loop on failure.
+  logger.info(`[playwright.agent] phase 2: URL-first tiers did not complete - trying focused Plan-Execute`);
+  let _ocrTextForPE = '';
+  let _domSignalsForPE = '';
+  try {
+    const _pePage = engine.getPage(sessionId);
+    if (_pePage) {
+      const _cap = await _ocrCapture().catch(() => ({ ok: false }));
+      if (_cap.ok) _ocrTextForPE = _cap.text.slice(0, 1500);
+      // Reuse DOM signals logic
+      const _signals = await _pePage.evaluate(() => {
+        const signals = [];
+        function makeSelector(el) {
+          if (el.id) return `#${el.id}`;
+          const parts = [el.tagName.toLowerCase()];
+          if (el.getAttribute('aria-label')) parts.push(`[aria-label='${el.getAttribute('aria-label')}']`);
+          else if (el.getAttribute('contenteditable')) parts.push(`[contenteditable='${el.getAttribute('contenteditable')}']`);
+          else if (el.getAttribute('role')) parts.push(`[role='${el.getAttribute('role')}']`);
+          return parts.join('');
+        }
+        document.querySelectorAll('[contenteditable], [aria-expanded], [aria-modal], [placeholder], [aria-placeholder]').forEach(el => {
+          signals.push({ selector: makeSelector(el), tag: el.tagName, ce: el.getAttribute('contenteditable'), label: el.getAttribute('aria-label'), text: (el.innerText || '').slice(0, 40) });
+        });
+        return signals.slice(0, 15);
+      }).catch(() => []);
+      if (_signals.length > 0) {
+        _domSignalsForPE = _signals.map(s => `${s.selector} <${s.tag}>${s.ce ? ' ce=' + s.ce : ''}${s.label ? ' label="' + s.label + '"' : ''}${s.text ? ' text="' + s.text + '"' : ''}`).join('\n  ');
+      }
+    }
+  } catch (_) {}
+
+  try {
+    const _peResult = await _focusedPlanExecute({
+      goal: _finalGoal,
+      sessionId,
+      headed,
+      timeoutMs,
+      agentContext,
+      deadline: _deadline,
+      start,
+      heartbeat: _heartbeat,
+      _ocrText: _ocrTextForPE,
+      _domSignals: _domSignalsForPE,
+    });
+    if (_peResult.ok) {
+      _peResult.executionTime = Date.now() - start;
+      _heartbeat.stop();
+      return _peResult;
+    }
+    logger.warn(`[playwright.agent] focused Plan-Execute failed: ${_peResult.error || 'unknown'} — falling back to mini turn-loop`);
+  } catch (_peErr) {
+    logger.warn(`[playwright.agent] focused Plan-Execute error: ${_peErr.message} — falling back to mini turn-loop`);
+  }
+
+  // ── Phase 2b: Mini turn-loop (2-3 turns, last resort) ──────────────────
+  // Focused prompt: "step X failed, what's the ONE action to take?"
+  // Only triggered when Plan-Execute fails.
+  logger.info(`[playwright.agent] phase 2b: Plan-Execute did not complete - starting turn-loop (max ${maxTurns} turns)`);
   try {
     const _turnLoopResult = await _executeTurnLoopFallback({
       goal: _finalGoal,
@@ -5009,6 +6152,7 @@ async function playwrightAgent(args) {
       agentContext,
       transcript: [],
       deadline: _deadline,
+      maxTurns,
       start,
     });
     if (_turnLoopResult.ok) {
@@ -6247,6 +7391,7 @@ Output a JSON plan: { "plan": [ { "action": "type", "selector": "eXX", "text": "
             transcript,
             deadline: _deadline,
             start,
+            maxTurns,
           });
           if (_turnLoopResult.ok) {
             logger.info(`[playwright.agent] turn-loop fallback succeeded — returning`);
@@ -6524,6 +7669,7 @@ Output a JSON plan: { "plan": [ { "action": "type", "selector": "eXX", "text": "
             transcript,
             deadline: _deadline,
             start,
+            maxTurns,
           });
           if (_turnLoopResult.ok) {
             logger.info(`[playwright.agent] turn-loop fallback succeeded after unparseable repair — returning`);
@@ -7128,6 +8274,7 @@ Return JSON: { "thoughts": "strategy explanation", "plan": [...steps] }`;
           transcript,
           deadline: Date.now() + 30000,
           start,
+          maxTurns,
         });
         if (_turnLoopResult.ok) {
           logger.info(`[playwright.agent] turn-loop fallback succeeded after overall timeout — returning`);

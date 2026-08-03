@@ -536,6 +536,45 @@ async function actionDiscoverTaskUrl({ domain, task, maxResults = 5, candidateUr
     }
   }
 
+  // ── Strategy D: search URL syntax discovery ────────────────────────────
+  // For search/filter tasks, search for "<service> search URL syntax" or
+  // "<service> filter URL parameters" to find documentation about the service's
+  // search URL format. Extract URL patterns from the results.
+  const _isSearchTask = /\b(search|find|look\s*up|filter|unread|from:|subject:|label:|starred|is:unread|check.*for|show.*from|list.*from)\b/i.test(task);
+  if (_isSearchTask) {
+    const queryD = `${serviceName} search URL syntax filter parameters`;
+    logger.info(`[web.agent] discover_task_url: strategy D (search syntax): "${queryD.slice(0, 80)}"`);
+    const resultD = await searchWeb(queryD, maxResults).catch(() => ({ ok: false }));
+    if (resultD.ok && resultD.results) {
+      for (const r of resultD.results) {
+        if (!_isParkingContent(r.title, r.snippet, r.url)) {
+          // Extract search URL patterns from snippets — look for URLs with search/query params
+          const searchPatternUrls = (r.snippet || '').match(new RegExp(
+            cleanDomain.replace(/\./g, '\\.') + '\\/[a-z0-9\/_]*[#?]?(?:search|q|filter|query)=[a-z0-9\/_#?=&.~%+-]*', 'gi'
+          ));
+          if (searchPatternUrls) {
+            for (const su of searchPatternUrls) {
+              const fullUrl = su.startsWith('http') ? su : `https://${su}`;
+              if (!allCandidates.some(c => c.url === fullUrl)) {
+                allCandidates.push({ url: fullUrl, title: r.title, snippet: r.snippet, source: 'search-syntax' });
+              }
+            }
+          }
+          // Also check if the result URL itself is a search URL
+          try {
+            const rHost = new URL(r.url).hostname.replace(/^www\./, '');
+            if ((rHost === cleanDomain || rHost.endsWith('.' + cleanDomain)) &&
+                /[#?](search|q|filter|query)=/i.test(r.url)) {
+              if (!allCandidates.some(c => c.url === r.url)) {
+                allCandidates.push({ url: r.url, title: r.title, snippet: r.snippet, source: 'search-syntax-result' });
+              }
+            }
+          } catch (_) {}
+        }
+      }
+    }
+  }
+
   if (allCandidates.length === 0) {
     logger.info('[web.agent] discover_task_url: no candidates found from any strategy');
     return { ok: false, error: 'No deep-link candidates found' };
@@ -605,6 +644,13 @@ async function actionDiscoverTaskUrl({ domain, task, maxResults = 5, candidateUr
       // Boost app-like URLs with deep-link markers (#, ?, compose, draft, new, create)
       if (/[#?]/.test(fullUrl) && host === cleanDomain) score += 15;
       if (/\b(compose|draft|new|create|inbox|mail|message)\b/i.test(path) && host === cleanDomain) score += 20;
+
+      // Boost search URLs for search tasks — #search/, ?q=, ?filter=, /search?q=
+      if (_isSearchTask && host === cleanDomain) {
+        if (/#search\//i.test(fullUrl)) score += 40;
+        if (/[?&](q|query|filter|search)=/i.test(fullUrl)) score += 30;
+        if (/\/search\b/i.test(path)) score += 25;
+      }
 
     } catch (_) { score = 0; }
     return { ...c, _score: Math.round(score) };

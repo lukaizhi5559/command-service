@@ -150,6 +150,8 @@ const VALID_INTENTS = new Set(Object.values(INTENTS));
  */
 function _scopeTaskText(task, maxChars = 280) {
   let text = String(task || '');
+  // Strip "(Context from prior turn: ...)" suffix (injected by preflightAgents.js)
+  text = text.replace(/\n*\(Context from prior turn:[^)]*\)\s*$/i, ' ');
   // Strip [DATA FROM PRIOR STEP] ... [/DATA FROM PRIOR STEP] blocks
   text = text.replace(/\[DATA FROM PRIOR STEP\][\s\S]*?(?:\[\/DATA FROM PRIOR STEP\]|$)/gi, ' ');
   // Strip [CONTENT OF ...] blocks
@@ -748,11 +750,19 @@ async function suggestTaskUrl(serviceKey, startUrl, intent, task) {
   }
 
   const _taskPreview = _scopeTaskText(task, 200);
+
+  // Detect if this is a search/filter task that needs a search URL
+  const _isSearchTask = /\b(search|find|look\s*up|filter|unread|from:|subject:|label:|starred|is:unread|check.*for|show.*from|list.*from)\b/i.test(_taskPreview);
+
+  const _searchHint = _isSearchTask
+    ? `\nIMPORTANT: This task requires searching or filtering. If the service supports URL-based search (e.g., #search/query, ?q=query, ?filter=query, /search?q=query), provide the search URL with the query embedded. For email services, use the service's search operators (e.g., is:unread from:sender). If the service does not support URL-based search, return: none`
+    : '';
+
   const prompt = `You are a browser automation assistant. Given:
 - service: ${serviceKey}
 - base URL: ${cleanStartUrl}
 - task intent: ${intent}
-- task: ${_taskPreview}
+- task: ${_taskPreview}${_searchHint}
 
 What is the single most direct URL to open in a browser to begin this task? Also provide 3-5 keywords that characterize this task type.
 
@@ -807,7 +817,92 @@ Do not include any explanation, markdown, or trailing punctuation.`;
 // Separate namespace from nav-correction (which is for console→chat redirects).
 
 const DEEPLINK_NS = 'nav-deeplink';
-const KEYWORD_MATCH_THRESHOLD = 0.4;
+const KEYWORD_MATCH_THRESHOLD = 0.5; // raised from 0.4 — 40% overlap was too loose
+const MAX_ROUTE_KEYWORDS = 8; // cap per-route keyword accumulation (LRU) — prevents keyword sponge
+
+/**
+ * Validate a deep-link URL before caching it.
+ * Rejects malformed URLs with duplicated leading labels (docs.docs., mail.mail., www.www.),
+ * unparseable URLs, and other obvious corruption.
+ */
+function _isValidDeepLinkUrl(url) {
+  if (!url || typeof url !== 'string') return false;
+  let parsed;
+  try { parsed = new URL(url); } catch (_) { return false; }
+  const host = parsed.hostname.replace(/^www\./, '');
+  // Reject duplicated leading labels (e.g., docs.docs.google.com, mail.mail.google.com)
+  const labels = host.split('.');
+  for (let i = 0; i < labels.length - 1; i++) {
+    if (labels[i] === labels[i + 1] && labels[i].length > 0) {
+      logger.warn(`[destination-resolver] rejecting deep-link with duplicated label: ${url} (host=${host})`);
+      return false;
+    }
+  }
+  // Reject chrome-extension URLs
+  if (/^chrome-extension:/i.test(url)) return false;
+  // Reject about:blank and other non-http(s) URLs
+  if (!/^https?:/i.test(url)) return false;
+  return true;
+}
+
+/**
+ * Detect generic/landing URLs that should never be cached as deep-links.
+ * These are the service's default destinations (inbox, dashboard, home) —
+ * caching them adds no value (they're already the startUrl fallback) and
+ * pollutes the keyword index because every task that lands there gets its
+ * task keywords absorbed onto the generic URL.
+ *
+ * Returns true if the URL is a generic landing page with no meaningful
+ * action-specific path/hash/query.
+ */
+function _isGenericLandingUrl(url, serviceKey = '') {
+  if (!url || typeof url !== 'string') return false;
+  let parsed;
+  try { parsed = new URL(url); } catch (_) { return false; }
+  const svc = String(serviceKey || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+  const host = parsed.hostname.replace(/^www\./, '');
+  const path = parsed.pathname.replace(/\/+$/, ''); // strip trailing slashes
+  const hash = parsed.hash || '';
+  const hasQuery = parsed.search.length > 0;
+
+  // ── Service-specific generic patterns ──
+  // Gmail: bare inbox / mail root — generic. #search/, #compose, #inbox/<id> are specific.
+  if (svc === 'gmail' || host === 'mail.google.com') {
+    // /mail/u/0/ or /mail/u/0/#inbox → generic
+    if (/^\/mail\/u\/\d+\/?$/.test(path) && (!hash || /^#(inbox|home)?$/i.test(hash)) && !hasQuery) return true;
+    return false;
+  }
+  // Outlook: root or /mail/ → generic
+  if (svc === 'outlook' || /outlook\.(live|office)\.com/.test(host)) {
+    if ((!path || path === '/mail' || path === '/mail/') && !hash && !hasQuery) return true;
+    return false;
+  }
+  // LinkedIn: bare feed root → generic (feed?shareActive=true etc. are specific)
+  if (svc === 'linkedin' || host === 'linkedin.com') {
+    if ((!path || path === '/feed' || path === '/feed/') && !hasQuery && (!hash || hash === '#')) return true;
+    return false;
+  }
+
+  // ── Generic rule: no path (or just "/"), no hash (or #inbox/#home), no query ──
+  if (!path && (!hash || /^#(inbox|home)?$/i.test(hash)) && !hasQuery) return true;
+  return false;
+}
+
+/**
+ * Clean up existing cache entries that fail validation or contain generic-landing URLs.
+ * Called lazily on first cache access after module load.
+ */
+let _deepLinkCleanupDone = false;
+async function _cleanupDeepLinkCache() {
+  if (_deepLinkCleanupDone || !skillDb) return;
+  _deepLinkCleanupDone = true;
+  try {
+    // We can't enumerate all keys in skillDb easily, so this is a no-op for now.
+    // Individual entries are cleaned up when they're accessed in getCachedDeepLink
+    // (which filters out invalid + generic-landing routes on every read).
+    // The validation in recordDeepLinkCache prevents new bad entries from being stored.
+  } catch (_) {}
+}
 
 /**
  * Retrieve keywords extracted by classifyTaskIntent for a given task.
@@ -833,14 +928,29 @@ async function _persistDeepLinkCache(serviceKey, entry) {
  */
 async function getCachedDeepLink(serviceKey, keywords) {
   if (!skillDb || !keywords || keywords.length === 0) return null;
+  // Lazy cleanup on first access
+  if (!_deepLinkCleanupDone) setImmediate(() => _cleanupDeepLinkCache().catch(() => {}));
   try {
     const entry = await skillDb.get(DEEPLINK_NS, serviceKey);
     if (!entry || !Array.isArray(entry.routes)) return null;
 
+    // Clean up invalid routes AND generic-landing routes from existing cache entries.
+    // Generic-landing URLs (bare inbox/dashboard) are the startUrl fallback — caching
+    // them pollutes the keyword index because every task that lands there gets its
+    // task keywords absorbed onto the generic URL. Filter them out on read and persist
+    // the cleaned entry so the pollution doesn't recur.
+    const _validRoutes = entry.routes.filter(r => _isValidDeepLinkUrl(r.url) && !_isGenericLandingUrl(r.url, serviceKey));
+    if (_validRoutes.length < entry.routes.length) {
+      const _removed = entry.routes.length - _validRoutes.length;
+      logger.info(`[destination-resolver] cleaning ${_removed} invalid/generic cached route(s) for ${serviceKey}`);
+      entry.routes = _validRoutes;
+      setImmediate(() => _persistDeepLinkCache(serviceKey, entry).catch(() => {}));
+    }
+
     let bestMatch = null;
     let bestScore = 0;
 
-    for (const route of entry.routes) {
+    for (const route of _validRoutes) {
       const overlap = route.keywords.filter(k => keywords.includes(k));
       const score = overlap.length / Math.max(route.keywords.length, keywords.length);
       if (score > bestScore && score >= KEYWORD_MATCH_THRESHOLD) {
@@ -867,9 +977,23 @@ async function getCachedDeepLink(serviceKey, keywords) {
 
 /**
  * Record a discovered deep-link URL with associated keywords for future cache matching.
+ * Validates the URL before storing to prevent cache pollution.
  */
 async function recordDeepLinkCache(serviceKey, url, keywords, intent) {
   if (!skillDb || !keywords || keywords.length === 0) return false;
+  // Validate URL before storing — prevents cache pollution from malformed URLs
+  if (!_isValidDeepLinkUrl(url)) {
+    logger.warn(`[destination-resolver] recordDeepLinkCache: rejecting invalid URL for ${serviceKey}: ${url}`);
+    return false;
+  }
+  // Layer 1: Don't cache generic/landing URLs (bare inbox, dashboard, home).
+  // These are the service's startUrl fallback — caching them adds no value and
+  // pollutes the keyword index because every task that lands there gets its
+  // task keywords absorbed onto the generic URL.
+  if (_isGenericLandingUrl(url, serviceKey)) {
+    logger.info(`[destination-resolver] recordDeepLinkCache: skipping generic-landing URL for ${serviceKey}: ${url}`);
+    return false;
+  }
   try {
     let entry = await skillDb.get(DEEPLINK_NS, serviceKey);
     if (!entry || !Array.isArray(entry.routes)) {
@@ -878,13 +1002,18 @@ async function recordDeepLinkCache(serviceKey, url, keywords, intent) {
 
     const existing = entry.routes.find(r => r.url === url);
     if (existing) {
-      existing.keywords = [...new Set([...existing.keywords, ...keywords])];
+      // Layer 3: Cap keyword accumulation per route at MAX_ROUTE_KEYWORDS (8) with LRU.
+      // Without this, a URL hit N times absorbs N tasks' worth of keywords, making the
+      // keyword overlap score meaningless (matches on coincidental task vocabulary).
+      // New keywords first (most recently used), then existing, sliced to the cap.
+      const _merged = [...new Set([...keywords, ...existing.keywords])].slice(0, MAX_ROUTE_KEYWORDS);
+      existing.keywords = _merged;
       existing.hitCount = (existing.hitCount || 0) + 1;
       existing.updatedAt = Date.now();
     } else {
       entry.routes.push({
         url,
-        keywords,
+        keywords: keywords.slice(0, MAX_ROUTE_KEYWORDS),
         intent,
         hitCount: 1,
         confidence: 0.70,
@@ -895,6 +1024,74 @@ async function recordDeepLinkCache(serviceKey, url, keywords, intent) {
     return await _persistDeepLinkCache(serviceKey, entry);
   } catch (err) {
     logger.warn(`[destination-resolver] recordDeepLinkCache error: ${err.message}`);
+    return false;
+  }
+}
+
+// ── Search URL pattern cache ─────────────────────────────────────────────────
+// Separate from the keyword-indexed deep-link cache. This caches the *search URL
+// pattern* per service (e.g., "https://example.com/search?q={query}"), keyed by
+// serviceKey — NOT by task keywords. This avoids the keyword-sponge problem and
+// lets any future criteria task on the same service reuse the discovered pattern
+// without re-running the full discovery pipeline.
+//
+// The pattern is discovered by the form-extraction / web.agent / web.crawl steps
+// in _resolveTaskDeepLink, then cached here for future use.
+
+const SEARCH_PATTERN_NS = 'search-pattern';
+const SEARCH_PATTERN_TTL = 7 * 24 * 60 * 60 * 1000; // 7 days — search URL patterns rarely change
+
+/**
+ * Retrieve the best (highest hitCount, non-expired) search URL pattern for a service.
+ * Returns { urlTemplate, inputName, source, hitCount, updatedAt } or null.
+ */
+async function getSearchUrlPattern(serviceKey) {
+  if (!skillDb || !serviceKey) return null;
+  try {
+    const entry = await skillDb.get(SEARCH_PATTERN_NS, serviceKey);
+    if (!entry || !Array.isArray(entry.patterns)) return null;
+    const _now = Date.now();
+    const _valid = entry.patterns.filter(p => _now - (p.updatedAt || 0) < SEARCH_PATTERN_TTL);
+    if (_valid.length === 0) return null;
+    // Sort by hitCount descending — most-used pattern first
+    _valid.sort((a, b) => (b.hitCount || 0) - (a.hitCount || 0));
+    return _valid[0];
+  } catch (err) {
+    logger.warn(`[destination-resolver] getSearchUrlPattern error: ${err.message}`);
+    return null;
+  }
+}
+
+/**
+ * Record a discovered search URL pattern for a service.
+ * The urlTemplate should contain a {query} placeholder where the task's search
+ * criteria will be substituted (e.g., "https://example.com/search?q={query}").
+ */
+async function recordSearchUrlPattern(serviceKey, urlTemplate, inputName, source) {
+  if (!skillDb || !serviceKey || !urlTemplate) return false;
+  if (!urlTemplate.includes('{query}')) {
+    logger.warn(`[destination-resolver] recordSearchUrlPattern: urlTemplate missing {query} placeholder: ${urlTemplate}`);
+    return false;
+  }
+  try {
+    let entry = await skillDb.get(SEARCH_PATTERN_NS, serviceKey);
+    if (!entry || !Array.isArray(entry.patterns)) entry = { patterns: [] };
+    const existing = entry.patterns.find(p => p.urlTemplate === urlTemplate);
+    if (existing) {
+      existing.hitCount = (existing.hitCount || 0) + 1;
+      existing.updatedAt = Date.now();
+    } else {
+      entry.patterns.push({
+        urlTemplate,
+        inputName: inputName || null,
+        source: source || 'discovery',
+        hitCount: 1,
+        updatedAt: Date.now(),
+      });
+    }
+    return await skillDb.set(SEARCH_PATTERN_NS, serviceKey, entry);
+  } catch (err) {
+    logger.warn(`[destination-resolver] recordSearchUrlPattern error: ${err.message}`);
     return false;
   }
 }
@@ -910,5 +1107,7 @@ module.exports = {
   getTaskKeywords,
   getCachedDeepLink,
   recordDeepLinkCache,
+  getSearchUrlPattern,
+  recordSearchUrlPattern,
   INTENTS,
 };

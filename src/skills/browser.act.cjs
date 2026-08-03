@@ -3240,7 +3240,10 @@ async function browserAct(args) {
 
         try {
           // Click to focus
-          const fillClickTimeout = Math.min(timeoutMs, 15000);
+          // Use a shorter timeout when the selector was inferred/hallucinated (no snapshot ref)
+          // — 15s on a nonexistent element wastes budget. 4s is enough for a real element.
+          const _isInferredSelector = !cleanRef || (cleanRef && !refMap?.has(cleanRef) && !_isTdRef(cleanRef));
+          const fillClickTimeout = _isInferredSelector ? Math.min(timeoutMs, 4000) : Math.min(timeoutMs, 15000);
           if (cleanRef && refMap && !_fillLowConf && !_isTdRef(cleanRef)) {
             const entry = refMap.get(cleanRef);
             // ── Probe-then-commit: try semantic CSS selectors before getByRole ──
@@ -3377,18 +3380,85 @@ async function browserAct(args) {
           lastFilledTarget.delete(sessionId);
           return { ok: true, action, sessionId, executionTime: Date.now() - start };
         } catch (fillErr) {
-          logger.warn(`[browser.act] fill (engine) click failed: ${fillErr.message} — trying visible-input fallback`);
+          logger.warn(`[browser.act] fill (engine) click failed: ${fillErr.message} — trying gated visible-input fallback`);
+          // ── Gated visible-input fallback ──────────────────────────────────────
+          // Only accept a candidate whose aria-label/placeholder/name shares a
+          // meaningful token with the intended field (extracted from the selector).
+          // Never accept "first visible editable" blindly — that caused the Google
+          // Docs title to be typed into the document body.
           try {
-            const _fallbackInput = _ePage.locator('input[type="text"]:visible, input[role="searchbox"]:visible, input[aria-label*="Search"]:visible, textarea:visible, [contenteditable="true"]:visible, [contenteditable]:visible, [role="textbox"]:visible').first();
-            await _fallbackInput.click({ timeout: 5000 });
-            logger.info(`[browser.act] fill (engine) visible-input fallback click ok`);
-            await _ePage.keyboard.press('Meta+a');
-            await _ePage.keyboard.type(fillText, { timeout: timeoutMs });
-            logger.info(`[browser.act] fill (engine) fallback type ok`);
-            lastFilledTarget.delete(sessionId);
-            return { ok: true, action, sessionId, executionTime: Date.now() - start };
+            // Extract intent tokens from the requested selector (e.g., "title", "search", "name")
+            const _intentTokens = (selector || '')
+              .replace(/[[\]'"=*]/g, ' ')
+              .split(/[\s,]+/)
+              .map(w => w.toLowerCase().trim())
+              .filter(w => w.length > 2 && !['input', 'textarea', 'text', 'type', 'role', 'aria', 'label', 'placeholder', 'contenteditable', 'true', 'false', 'visible', 'class', 'data', 'td', 'ref'].includes(w));
+
+            // Find all visible editables and score them by token overlap with the intent
+            const _candidates = await _ePage.evaluate((tokens) => {
+              const editables = Array.from(document.querySelectorAll('input[type="text"], input[role="searchbox"], input[aria-label*="Search"], textarea, [contenteditable="true"], [contenteditable], [role="textbox"]'));
+              return editables.map(el => {
+                const rect = el.getBoundingClientRect();
+                if (rect.width === 0 || rect.height === 0) return null; // not visible
+                const attrs = [
+                  el.getAttribute('aria-label') || '',
+                  el.getAttribute('placeholder') || '',
+                  el.getAttribute('aria-placeholder') || '',
+                  el.getAttribute('name') || '',
+                  el.getAttribute('id') || '',
+                  el.getAttribute('title') || '',
+                ].join(' ').toLowerCase();
+                const overlap = tokens.filter(t => attrs.includes(t));
+                return {
+                  selector: el.id ? `#${el.id}` :
+                    el.getAttribute('aria-label') ? `[aria-label="${el.getAttribute('aria-label')}"]` :
+                    el.getAttribute('placeholder') ? `[placeholder="${el.getAttribute('placeholder')}"]` :
+                    el.getAttribute('name') ? `[name="${el.getAttribute('name')}"]` :
+                    el.tagName.toLowerCase(),
+                  tag: el.tagName,
+                  isInput: el.tagName === 'INPUT',
+                  score: overlap.length,
+                  label: el.getAttribute('aria-label') || el.getAttribute('placeholder') || '',
+                };
+              }).filter(Boolean);
+            }, _intentTokens).catch(() => []);
+
+            // Only proceed if we have a candidate with at least 1 token overlap
+            const _bestCandidate = Array.isArray(_candidates) && _candidates.length > 0
+              ? _candidates.sort((a, b) => b.score - a.score)[0]
+              : null;
+
+            if (_bestCandidate && _bestCandidate.score > 0) {
+              logger.info(`[browser.act] fill (engine) gated fallback: candidate="${_bestCandidate.selector}" label="${_bestCandidate.label}" score=${_bestCandidate.score}/${_intentTokens.length}`);
+              await _ePage.click(_bestCandidate.selector, { timeout: 5000 });
+              // Use fill() for input fields (more reliable than Meta+a + type)
+              if (_bestCandidate.isInput) {
+                await _ePage.fill(_bestCandidate.selector, fillText, { timeout: timeoutMs });
+              } else {
+                await _ePage.keyboard.press('Meta+a');
+                await _ePage.keyboard.type(fillText, { timeout: timeoutMs });
+              }
+              // ── Verify the text landed ───────────────────────────────────────
+              const _verifyResult = await _ePage.evaluate((sel) => {
+                const el = document.querySelector(sel);
+                if (!el) return { verified: false, actual: '' };
+                const actual = el.value || el.innerText || el.textContent || '';
+                return { verified: actual.length > 0, actual: actual.slice(0, 200) };
+              }, _bestCandidate.selector).catch(() => ({ verified: false, actual: '' }));
+
+              if (_verifyResult.verified) {
+                logger.info(`[browser.act] fill (engine) gated fallback verified: actual="${_verifyResult.actual.slice(0, 60)}"`);
+                lastFilledTarget.delete(sessionId);
+                return { ok: true, action, sessionId, verified: true, executionTime: Date.now() - start };
+              } else {
+                logger.warn(`[browser.act] fill (engine) gated fallback typed but verification failed — returning ok:false to trigger re-plan`);
+                return _engineActionFailure(action, sessionId, `Fill fallback typed but could not verify text landed in "${_bestCandidate.selector}": take a fresh snapshot and re-plan`, { executionTime: Date.now() - start });
+              }
+            } else {
+              logger.warn(`[browser.act] fill (engine) no gated fallback candidate with token overlap (intent tokens: ${_intentTokens.join(', ')}) — falling through`);
+            }
           } catch (fallbackErr) {
-            logger.warn(`[browser.act] fill (engine) visible-input fallback also failed: ${fallbackErr.message}`);
+            logger.warn(`[browser.act] fill (engine) gated visible-input fallback failed: ${fallbackErr.message}`);
           }
         }
         // Engine owns session — no CLI fallback
@@ -3582,10 +3652,27 @@ async function browserAct(args) {
               }
             }
             const actual = el.textContent || el.innerText || '';
+            // Normalize for verification: contenteditable editors (Notion, DraftJS,
+            // ProseMirror) re-render text into block structure with different whitespace,
+            // line breaks, and block-level formatting. Strip whitespace and check if
+            // the key phrases from the fill text are present.
+            const _normalize = (s) => s.replace(/\s+/g, ' ').replace(/[\u200B-\u200D\uFEFF]/g, '').trim().toLowerCase();
+            const _actualNorm = _normalize(actual);
+            const _textNorm = _normalize(text);
+            // Check if the full text is present (exact match after normalization)
+            let _verified = _actualNorm.includes(_textNorm);
+            // If not, check if key phrases (lines/sentences from the fill text) are present
+            if (!_verified && text.length > 5) {
+              const _phrases = text.split(/[\n.!?;]+/).map(p => _normalize(p)).filter(p => p.length > 3);
+              if (_phrases.length > 0) {
+                const _matched = _phrases.filter(p => _actualNorm.includes(p));
+                _verified = _matched.length >= Math.ceil(_phrases.length * 0.5);
+              }
+            }
             return {
               ok: true,
               method: 'contenteditable',
-              verified: actual.includes(text),
+              verified: _verified,
               actualValue: actual.slice(0, 200),
             };
           }
@@ -3596,10 +3683,22 @@ async function browserAct(args) {
           el.textContent = (clearFirst ? '' : (el.textContent || '')) + text;
           el.dispatchEvent(new Event('input', { bubbles: true }));
           const actual = el.textContent || '';
+          // Same normalized verification as contenteditable
+          const _normalize3 = (s) => s.replace(/\s+/g, ' ').replace(/[\u200B-\u200D\uFEFF]/g, '').trim().toLowerCase();
+          const _actualNorm3 = _normalize3(actual);
+          const _textNorm3 = _normalize3(text);
+          let _verified3 = _actualNorm3.includes(_textNorm3);
+          if (!_verified3 && text.length > 5) {
+            const _phrases3 = text.split(/[\n.!?;]+/).map(p => _normalize3(p)).filter(p => p.length > 3);
+            if (_phrases3.length > 0) {
+              const _matched3 = _phrases3.filter(p => _actualNorm3.includes(p));
+              _verified3 = _matched3.length >= Math.ceil(_phrases3.length * 0.5);
+            }
+          }
           return {
             ok: true,
             method: 'textcontent-fallback',
-            verified: actual.includes(text),
+            verified: _verified3,
             actualValue: actual.slice(0, 200),
           };
         }, { selector: selector || args.selector, text: fillText, clearFirst });
@@ -5341,6 +5440,14 @@ If no videos found, return []. Do not explain, only output the JSON array.`;
                 const cur = String(probe.bodyText || '');
                 const curHref = String(probe.href || '');
                 lastContent = cur;
+
+                // Early exit: "no results" pages are already stable — no need to wait
+                // for content to change. This avoids a 27s timeout when a search returns
+                // zero matches (e.g., Gmail "No messages matched your search").
+                if (/\b(no messages matched|no results?\s*(?:found|matched)?|nothing (?:found|matched)|no matching)\b/i.test(cur)) {
+                  logger.info(`[browser.act] waitForStableText (engine): Gmail "no results" detected (${cur.length} chars) — returning immediately`);
+                  return { ok: true, action, sessionId, result: cur, executionTime: Date.now() - start };
+                }
 
                 if (phase === 1) {
                   // Phase 1 — Wait for change from baseline
