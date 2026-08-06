@@ -32,6 +32,30 @@ try { _skillLlm = require('./skill-llm.cjs'); } catch (_) {}
 // ── LLM intent classification cache (keyed on first 100 chars of cleaned task) ─
 const _intentCache = new Map();
 
+// ── Auth-flow URL detection ───────────────────────────────────────────────────
+// A URL whose path matches one of these segments is an authentication/identity
+// flow page (login, magic-link, OAuth callback, signup, verify, logout, …) —
+// NEVER a valid task deep-link. Promoting such a URL as the task's start page
+// sends the agent to an auth error/landing page instead of the app surface
+// (e.g. claude.ai/magic-link instead of claude.ai/new). Path-segment-anchored
+// to avoid false positives on legit app pages that merely contain "auth".
+const AUTH_FLOW_PATH_RE = /\/(?:login|signin|sign-in|sign_in|signup|sign-up|register|registration|logout|signout|sign-out|magic[-_]?link|verify|verification|oauth2?|authorize|authorise|deauthorize|auth(?:\/(?:callback|session|login|verify|new|start|finish|complete))?|session\/new|connect\/oauth|api\/auth\/callback|sso\/(?:login|callback))\b/i;
+
+/**
+ * Returns true if the URL's path is an authentication/identity-flow endpoint
+ * (login, magic-link, oauth, authorize, callback, signup, verify, logout, …).
+ * Such URLs must never be promoted as a task deep-link start page.
+ */
+function isAuthFlowUrl(url) {
+  if (!url) return false;
+  try {
+    const parsed = new URL(url);
+    return AUTH_FLOW_PATH_RE.test(parsed.pathname || '/');
+  } catch (_) {
+    return false;
+  }
+}
+
 // ── Intent constants ──────────────────────────────────────────────────────────
 // Derived from common web-agent benchmarks (Mind2Web, WebArena, WebVoyager).
 // Intents are used to decide whether a planned start URL matches the user's task.
@@ -525,6 +549,14 @@ async function deleteLearnedCorrection(serviceKey, intent) {
  */
 async function recordCorrection(serviceKey, intent, correctedUrl) {
   if (!skillDb) return false;
+  // Defense-in-depth: never persist an auth-flow URL (login, magic-link, oauth,
+  // callback, signup, verify, logout, …) as a task destination correction.
+  // Such URLs are auth/identity flow pages, not app surfaces — caching them
+  // poisons future runs (e.g. claude.ai/magic-link instead of claude.ai/new).
+  if (isAuthFlowUrl(correctedUrl)) {
+    logger.warn(`[destination-resolver] Refusing to record auth-flow URL as correction for ${serviceKey}:${intent}: ${correctedUrl}`);
+    return false;
+  }
   try {
     const existing = await skillDb.get(CORRECTION_NS, `${serviceKey}:${intent}`);
     const prevHits  = existing?.hitCount || 0;
@@ -842,6 +874,12 @@ function _isValidDeepLinkUrl(url) {
   if (/^chrome-extension:/i.test(url)) return false;
   // Reject about:blank and other non-http(s) URLs
   if (!/^https?:/i.test(url)) return false;
+  // Reject auth-flow URLs (login, magic-link, oauth, authorize, callback, signup,
+  // verify, logout, …). These are identity-flow pages, never valid task deep-links.
+  if (isAuthFlowUrl(url)) {
+    logger.warn(`[destination-resolver] rejecting auth-flow deep-link URL: ${url}`);
+    return false;
+  }
   return true;
 }
 
@@ -1110,4 +1148,6 @@ module.exports = {
   getSearchUrlPattern,
   recordSearchUrlPattern,
   INTENTS,
+  isAuthFlowUrl,
+  AUTH_FLOW_PATH_RE,
 };

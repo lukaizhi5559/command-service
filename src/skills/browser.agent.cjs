@@ -257,8 +257,9 @@ function getContentExtractionConfig(hostname) {
 
 const { userAgent } = require('./user.agent.cjs');
 
-const { resolveDestination, recordCorrection, classifyTaskIntent, classifyUrlType, getLearnedCorrection, deleteLearnedCorrection, suggestTaskUrl, getTaskKeywords, getCachedDeepLink, recordDeepLinkCache, getSearchUrlPattern, recordSearchUrlPattern, INTENTS } = require('../skill-helpers/destination-resolver.cjs');
+const { resolveDestination, recordCorrection, classifyTaskIntent, classifyUrlType, getLearnedCorrection, deleteLearnedCorrection, suggestTaskUrl, getTaskKeywords, getCachedDeepLink, recordDeepLinkCache, getSearchUrlPattern, recordSearchUrlPattern, INTENTS, isAuthFlowUrl } = require('../skill-helpers/destination-resolver.cjs');
 const { killExistingChromeForProfile, clearProfileLock, findCli, shortSessionId } = require('./browser.act.cjs');
+const { loadAppKnowledge, saveAppKnowledge, loadAndFormat, isCacheStale, recordVerification } = require('./lib/appKnowledge.cjs');
 
 const BROWSER_ACT_PORT = parseInt(process.env.COMMAND_SERVICE_PORT || '3007', 10);
 
@@ -2786,6 +2787,13 @@ function _isUnsafeDeepLinkUrl(candidateUrl, expectedHost = '') {
       return true;
     }
   }
+  // Reject auth-flow URLs (login, magic-link, oauth, authorize, callback, signup,
+  // verify, logout, …). These are identity-flow pages, never valid task deep-links —
+  // promoting them sends the agent to an auth error/landing page instead of the app
+  // surface (e.g. claude.ai/magic-link instead of claude.ai/new).
+  if (isAuthFlowUrl(candidate)) {
+    return true;
+  }
   return false;
 }
 
@@ -4076,6 +4084,41 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
     logger.warn(`[browser.agent] run: destination-resolver error (non-fatal): ${_destErr.message}`);
   }
 
+  // ── App Knowledge: start research in parallel with auth check ─────────────
+  // The research uses web search + separate crawl browsers (independent from the
+  // auth check's browser session), so it can run concurrently. By the time we
+  // await the promise (after auth + nav hints), it's likely already resolved.
+  // No artificial timeout — each operation has its own internal timeout.
+  let _appKnowledgePromise = null;
+  let _appKnowledgeHost = null;
+  let _appKnowledgeEntries = [];
+  try {
+    _appKnowledgeHost = (() => { try { return new URL(startUrl).hostname.replace(/^www\./, ''); } catch (_) { return ''; } })();
+    if (_appKnowledgeHost) {
+      const _cachedEntries = loadAppKnowledge(_appKnowledgeHost);
+      // Use isCacheStale to detect worthless caches (all low-confidence snippet-based entries).
+      // This triggers re-research when LLM synthesis previously failed and fell back to snippets.
+      if (_cachedEntries.length > 0 && !isCacheStale(_appKnowledgeHost)) {
+        _appKnowledgeEntries = _cachedEntries;
+        logger.info(`[browser.agent] app-knowledge: loaded ${_cachedEntries.length} cached entries for ${_appKnowledgeHost}`);
+      } else {
+        // Cache empty or stale (all low-confidence) — start research now (parallel with auth check below)
+        const _akDomain = existing?.service || _appKnowledgeHost;
+        const _akQuery = task ? task.slice(0, 80) : null;
+        _appKnowledgePromise = callSkill('web.agent', {
+          action: 'research_app_behavior',
+          domain: _akDomain,
+          query: _akQuery,
+          maxResults: 4,
+        }).catch(() => null);
+        const _staleReason = _cachedEntries.length > 0 ? 'stale (all low-confidence snippet entries)' : 'empty';
+        logger.info(`[browser.agent] app-knowledge: cache ${_staleReason} for ${_appKnowledgeHost} — research started in parallel with auth check`);
+      }
+    }
+  } catch (_akEarlyErr) {
+    logger.warn(`[browser.agent] app-knowledge: early init failed (non-fatal): ${_akEarlyErr.message}`);
+  }
+
   // Use the registered Playwright driver until an agent-browser agent implementation is available.
   const _useAgentBrowser = false;
   const _agentSkill = 'playwright.agent';
@@ -5030,10 +5073,21 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
                 // URL looks like a fresh page, but also check the page title to be sure
                 const _titleRes = await callBrowserAct({ action: 'evaluate', text: '(document.title || "")', sessionId, timeoutMs: 5000 }, 8000).catch(() => ({ ok: false }));
                 const _pageTitle = _titleRes?.ok ? String(_titleRes.result || '').trim().replace(/^"|"$/g, '') : '';
+                // Browser tab titles often include the app name suffix: "New page | Notion",
+                // "Untitled document - Google Docs", "Untitled spreadsheet - Google Sheets".
+                // Match the prefix, not the full title.
+                const _titleLower = _pageTitle.toLowerCase();
                 const _isFreshTitle = !_pageTitle
-                  || _pageTitle.toLowerCase() === 'untitled'
-                  || _pageTitle.toLowerCase() === 'new page'
-                  || _pageTitle.toLowerCase() === _brand;
+                  || _titleLower === 'untitled'
+                  || _titleLower === 'new page'
+                  || _titleLower.startsWith('new page ')
+                  || _titleLower.startsWith('new page|')
+                  || _titleLower.startsWith('new page |')
+                  || _titleLower.startsWith('untitled ')        // "Untitled document - Google Docs"
+                  || _titleLower.startsWith('untitled-')        // "Untitled-document"
+                  || _titleLower.startsWith('untitled|')        // "Untitled|Google Docs"
+                  || _titleLower.startsWith('untitled |')       // "Untitled | Google Docs"
+                  || _titleLower === _brand;
                 _isCanonicalRedirect = _isFreshTitle;
                 if (!_isFreshTitle) {
                   logger.info(`[browser.agent] run: URL-first enforcement — page title "${_pageTitle}" indicates existing page, not a fresh redirect from ${startUrl}`);
@@ -5877,6 +5931,67 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
     }
   }
 
+  // ── App Knowledge: await the research started in parallel with auth ───────
+  // The research promise was started before the auth check. By now it's likely
+  // already resolved (auth + nav hints took ~10-13s, research takes ~17s).
+  // Await here to get the results, then inject into _agentContext.
+  try {
+    let _usedSnippetEntries = false;
+    if (_appKnowledgePromise) {
+      const _research = await _appKnowledgePromise;
+      if (_research?.ok && Array.isArray(_research.entries) && _research.entries.length > 0) {
+        // Cache LLM-synthesized entries (confidence >= 0.7) AND snippet entries
+        // that have actionable details (shortcut or selector). Snippet entries
+        // without shortcut/selector are just article titles — not actionable, so
+        // they're used for this run only (not saved to disk).
+        const _cacheableEntries = _research.entries.filter(e =>
+          (e.confidence || 0) >= 0.7 || (e.details?.shortcut || e.details?.selector)
+        );
+        const _snippetOnlyEntries = _research.entries.filter(e =>
+          (e.confidence || 0) < 0.7 && !(e.details?.shortcut || e.details?.selector)
+        );
+        if (_cacheableEntries.length > 0) {
+          saveAppKnowledge(_appKnowledgeHost, _cacheableEntries);
+          _appKnowledgeEntries = loadAppKnowledge(_appKnowledgeHost);
+          // If there are also non-cacheable snippet entries, merge them in-memory
+          if (_snippetOnlyEntries.length > 0) {
+            _appKnowledgeEntries = [..._appKnowledgeEntries, ..._snippetOnlyEntries];
+            _usedSnippetEntries = true;
+          }
+          const _cachedCount = _cacheableEntries.length;
+          const _snippetCachedCount = _cacheableEntries.filter(e => (e.confidence || 0) < 0.7).length;
+          logger.info(`[browser.agent] app-knowledge: researched + cached ${_cachedCount} entries for ${_appKnowledgeHost} (LLM: ${_cachedCount - _snippetCachedCount}, snippet-with-shortcut: ${_snippetCachedCount}, confidence=${_research.confidence})${_snippetOnlyEntries.length > 0 ? `, ${_snippetOnlyEntries.length} snippet-only entries in-memory` : ''}`);
+        } else {
+          // Use snippet-based entries for this run only (don't cache — they're not actionable)
+          _appKnowledgeEntries = _research.entries;
+          _usedSnippetEntries = true;
+          logger.info(`[browser.agent] app-knowledge: ${_research.entries.length} snippet entries for ${_appKnowledgeHost} (NOT cached — no actionable shortcut/selector, will re-research next run)`);
+        }
+      } else {
+        logger.info(`[browser.agent] app-knowledge: research returned no entries for ${_appKnowledgeHost} — proceeding without`);
+      }
+    }
+
+    if (_appKnowledgeEntries.length > 0) {
+      let _akBlock;
+      if (_usedSnippetEntries) {
+        // Snippet-based entries not in cache — format directly
+        const { formatForContext } = require('./lib/appKnowledge.cjs');
+        const _h = _appKnowledgeHost || '';
+        _appKnowledgeEntries.forEach(e => { e._hostname = _h; });
+        _akBlock = formatForContext(_appKnowledgeEntries, 1200);
+      } else {
+        _akBlock = loadAndFormat(_appKnowledgeHost, 1200);
+      }
+      if (_akBlock) {
+        _agentContext = (_agentContext + `\n\n${_akBlock}`).slice(0, 5800);
+        logger.info(`[browser.agent] app-knowledge: injected ${_appKnowledgeEntries.length} entries into _agentContext for ${agentId}`);
+      }
+    }
+  } catch (_akErr) {
+    logger.warn(`[browser.agent] app-knowledge: enrichment failed (non-fatal): ${_akErr.message}`);
+  }
+
   // ── Deep-link discovery: find the most direct URL for this task ────────────
   // Three-layer URL-first approach:
   //   Layer 0: Cached verified correction (from prior successful runs)
@@ -6088,6 +6203,7 @@ When extracting page content with run-code, prioritize these selectors over gene
     const agentResult = await _withSessionMutex(sessionId, () => callSkill(_agentSkill, {
         goal: _effectiveTask,
         agentContext: _agentContext,
+        appKnowledgeEntries: _appKnowledgeEntries,
         url: _playwrightUrl,
         authSignInUrl: _useAgentBrowser ? (signInUrl || undefined) : undefined,
         sessionId,
@@ -6389,8 +6505,16 @@ When extracting page content with run-code, prioritize these selectors over gene
     // can surface ASK_USER with alternative source options instead of silently
     // passing an empty result to the synthesize step.
     if (agentResult?.ok === true) {
-        const _researchIntents = /\b(research|find|look\s+up|search|get\s+info|learn\s+about|tell\s+me\s+about|summarize|what\s+is|who\s+is|how\s+does|explain)\b/i;
-        const _taskIsResearch = _researchIntents.test(task);
+        // Use classifyTaskIntent (LLM + ordered regex) instead of a single regex.
+        // A single regex like /\bwhat\s+is\b/i matches "what is" inside post titles
+        // (e.g. "Create a post with title 'What is a favorite tradition?'") and
+        // falsely classifies a CONTENT_CREATE/SOCIAL task as research → false
+        // positive quality-gate failure. classifyTaskIntent properly prioritizes
+        // "create a post" (CONTENT_CREATE) over "what is" (RESEARCH) in the title.
+        const _MUTATION_INTENTS = new Set([INTENTS.CONTENT_CREATE, INTENTS.SOCIAL, INTENTS.MAIL, INTENTS.SCHEDULING, INTENTS.COMMERCE]);
+        const _taskIntent = await classifyTaskIntent(task).catch(() => INTENTS.HOME);
+        const _taskIsResearch = !_MUTATION_INTENTS.has(_taskIntent);
+        logger.info(`[browser.agent] Research quality gate: intent=${_taskIntent} isResearch=${_taskIsResearch} for task="${String(task).slice(0, 60)}"`);
         if (_taskIsResearch) {
         const _httpStatus = Number.isInteger(agentResult?.httpStatus) ? agentResult.httpStatus : null;
         if (_httpStatus !== null && _httpStatus >= 400) {
@@ -6428,14 +6552,6 @@ When extracting page content with run-code, prioritize these selectors over gene
           const text = String(stepResult || '').toLowerCase();
           return /\b(no messages matched|no results?\s*(?:found|matched)?|nothing (?:found|matched)|no matching)\b/i.test(text);
         });
-        // Navigation/action tasks (goto, click, open, navigate to, go to history, etc.)
-        // and email tasks (send, compose, draft) produce sparse output by design.
-        // Only apply the quality gate to research/lookup tasks.
-        const _taskLower = (task || '').toLowerCase();
-        const _isNavTask = /\b(goto|go to|navigate|click|open|visit|go back|return to|scroll|history|previous|close|dismiss)\b/.test(_taskLower);
-        const _isEmailTask = /\b(send|email|mail|compose|draft|message)\b/.test(_taskLower);
-        const _isResearchTask = /\b(search|find|look up|lookup|research|what is|summarize|compare|list|show me|tell me|fetch|get me)\b/.test(_taskLower);
-        const _skipQualityGate = (_isNavTask || _isEmailTask) && !_isResearchTask;
         // Check if we have video links or comprehensive content extracted - if so, don't fail on sparse content
         const _hasVideoLinks = agentResult?.transcript?.some(step => 
           step.action === 'getPageLinks' && step.result && step.result.length > 0
@@ -6445,7 +6561,7 @@ When extracting page content with run-code, prioritize these selectors over gene
           (step.result.text || step.result.links) && 
           ((step.result.text?.length || 0) > 100 || (step.result.links?.length || 0) > 0)
         );
-        if (_isSparse && !_skipQualityGate && !_hasVideoLinks && !_hasExtractedContent && !_isSearchUrl && !_transcriptHasNoResults) {
+        if (_isSparse && !_hasVideoLinks && !_hasExtractedContent && !_isSearchUrl && !_transcriptHasNoResults) {
           logger.warn(`[browser.agent] Research quality gate: sparse content for ${agentId} (longLines=${_longLines}, totalWords=${_totalWords}) — marking researchContentEmpty`);
           return {
             ok: false,
@@ -6481,6 +6597,26 @@ When extracting page content with run-code, prioritize these selectors over gene
         // Phase 3: set below after the offer block computes _saveSkillOffer
         saveSkillOffer: null,
     };
+
+    // ── App Knowledge: success verification write-back ──────────────────────
+    // On a successful run, bump verifiedRuns for any app-knowledge entries whose
+    // shortcut/selector appeared in the transcript. This reinforces high-quality
+    // entries and lets bad entries decay via recordVerification(false) on failure.
+    if (_runResult.ok === true && _appKnowledgeEntries.length > 0) {
+        try {
+            const _akHost = (() => { try { return new URL(startUrl).hostname.replace(/^www\./, ''); } catch (_) { return ''; } })();
+            if (_akHost) {
+                const _transcriptText = JSON.stringify(_runResult.transcript || []).toLowerCase();
+                for (const _entry of _appKnowledgeEntries) {
+                    const _sig = (_entry.details?.shortcut || '').toLowerCase()
+                        + ' ' + (_entry.details?.selector || '').toLowerCase();
+                    if (_sig.trim() && _transcriptText.includes(_sig.trim().split(/\s+/)[0])) {
+                        setImmediate(() => recordVerification(_akHost, _entry.id, true).catch(() => {}));
+                    }
+                }
+            }
+        } catch (_) { /* non-fatal */ }
+    }
 
     // ── Save-as-named-skill offer (Phase 3) ────────────────────────────────────
     // After a successful mutation run that was NOT recipe-driven, offer to save

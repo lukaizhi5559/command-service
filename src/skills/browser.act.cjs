@@ -1416,23 +1416,22 @@ async function _tdRefClick(page, ref, entry, cmd, forceClick, timeoutMs) {
     return true;
   } catch (clickErr) {
     logger.warn(`[browser.act] click (engine) tdRef=${ref} failed: ${clickErr.message.slice(0, 80)}`);
-  }
-
-  // Step 2: Re-tag-on-miss (SPA may have re-rendered and destroyed the tag)
-  const reTaggedRef = await _reTagAndResolve(page, ref, entry);
-  if (reTaggedRef && reTaggedRef !== ref) {
-    const reTagSelector = `[data-td-ref="${reTaggedRef}"]`;
-    try {
-      const locator = page.locator(reTagSelector);
-      if (cmd === 'dblclick') {
-        await locator.dblclick({ timeout: clickTimeout, force: forceClick });
-      } else {
-        await locator.click({ timeout: clickTimeout, force: forceClick });
+    // Step 2: Re-tag-on-miss (element exists but click failed — try re-tag)
+    const reTaggedRef = await _reTagAndResolve(page, ref, entry);
+    if (reTaggedRef && reTaggedRef !== ref) {
+      const reTagSelector = `[data-td-ref="${reTaggedRef}"]`;
+      try {
+        const locator = page.locator(reTagSelector);
+        if (cmd === 'dblclick') {
+          await locator.dblclick({ timeout: clickTimeout, force: forceClick });
+        } else {
+          await locator.click({ timeout: clickTimeout, force: forceClick });
+        }
+        logger.info(`[browser.act] click (engine) re-tagged tdRef=${reTaggedRef} ok${forceClick ? ' (force)' : ''}`);
+        return true;
+      } catch (reTagErr) {
+        logger.warn(`[browser.act] click (engine) re-tagged tdRef=${reTaggedRef} failed: ${reTagErr.message.slice(0, 80)}`);
       }
-      logger.info(`[browser.act] click (engine) re-tagged tdRef=${reTaggedRef} ok${forceClick ? ' (force)' : ''}`);
-      return true;
-    } catch (reTagErr) {
-      logger.warn(`[browser.act] click (engine) re-tagged tdRef=${reTaggedRef} failed: ${reTagErr.message.slice(0, 80)}`);
     }
   }
 
@@ -2501,6 +2500,79 @@ async function browserAct(args) {
 
   // ── Routing ──────────────────────────────────────────────────────────────
 
+  // Fix 34/36: Placeholder-verify helper for fill action.
+  // Declared outside the switch to avoid temporal dead zone errors when the
+  // switch jumps directly to `case 'fill':` (const declarations before a case
+  // label are not executed when the switch matches a later case).
+  // Captures pre-snapshot (placeholder, pseudo-placeholder, value-before),
+  // then post-snapshot (value-after), and checks all 3 PASS conditions:
+  //   (a) text present in value/textContent
+  //   (b) placeholder gone (attr removed / ql-blank removed / Draft.js placeholder gone)
+  //   (c) pseudo-placeholder replaced (pre-value "Untitled document" → post-value includes typed text)
+  // Returns { verified, actualValue, reason }
+  const _fillPlaceholderVerify = async (_ePage, _typedText) => {
+    try {
+      const _preSnap = await _ePage.evaluate(() => {
+        const el = document.activeElement;
+        if (!el) return null;
+        const ph = el.getAttribute('placeholder') ||
+          el.getAttribute('data-placeholder') ||
+          el.getAttribute('aria-placeholder') || '';
+        const draftPlaceholder = document.querySelector('.public-DraftEditorPlaceholder-inner');
+        const draftPlaceholderText = draftPlaceholder ? (draftPlaceholder.textContent || '').trim() : '';
+        const val = (el.value || '').trim();
+        const aria = el.getAttribute('aria-label') || '';
+        const tooltip = el.getAttribute('data-tooltip') || el.getAttribute('title') || '';
+        const pseudoPlaceholder = (val && (val === aria || val === tooltip)) ? val : '';
+        return {
+          placeholder: ph,
+          draftPlaceholderText,
+          hasBlankClass: el.classList.contains('ql-blank'),
+          pseudoPlaceholder,
+          valueBefore: (el.value || el.textContent || el.innerText || '').slice(0, 200),
+        };
+      }).catch(() => null);
+      if (!_preSnap) return { verified: false, actualValue: '', reason: 'no pre-snapshot' };
+      // Post-snapshot: re-read activeElement (fill already clicked, so focus is set)
+      const _postSnap = await _ePage.evaluate(() => {
+        const el = document.activeElement;
+        if (!el) return null;
+        const ph = el.getAttribute('placeholder') ||
+          el.getAttribute('data-placeholder') ||
+          el.getAttribute('aria-placeholder') || '';
+        const draftPlaceholder = document.querySelector('.public-DraftEditorPlaceholder-inner');
+        const val = el.value || el.textContent || el.innerText || '';
+        return {
+          placeholderAfter: ph,
+          hasBlankClass: el.classList.contains('ql-blank'),
+          draftPlaceholderGone: !draftPlaceholder,
+          valueAfter: val.slice(0, 500),
+        };
+      }).catch(() => null);
+      if (!_postSnap) return { verified: false, actualValue: '', reason: 'no post-snapshot' };
+      const _textPresent = _postSnap.valueAfter && _postSnap.valueAfter.includes(_typedText.slice(0, 50));
+      const _placeholderGone = !!(
+        (_preSnap.placeholder && _preSnap.placeholder.length > 0 && !_postSnap.placeholderAfter) ||
+        (_preSnap.hasBlankClass && !_postSnap.hasBlankClass) ||
+        (_preSnap.draftPlaceholderText && _postSnap.draftPlaceholderGone)
+      );
+      const _pseudoPlaceholderGone = !!(
+        _preSnap.pseudoPlaceholder &&
+        _preSnap.pseudoPlaceholder.length > 0 &&
+        _postSnap.valueAfter !== _preSnap.pseudoPlaceholder &&
+        _postSnap.valueAfter.includes(_typedText.slice(0, 50))
+      );
+      const _verified = _textPresent || _placeholderGone || _pseudoPlaceholderGone;
+      return {
+        verified: _verified,
+        actualValue: _postSnap.valueAfter,
+        reason: `textPresent=${_textPresent} placeholderGone=${_placeholderGone} pseudoPlaceholderGone=${_pseudoPlaceholderGone}`,
+      };
+    } catch (_err) {
+      return { verified: false, actualValue: '', reason: `verify error: ${_err.message}` };
+    }
+  };
+
   switch (action) {
 
     case 'engine-handoff': {
@@ -3194,7 +3266,7 @@ async function browserAct(args) {
                 await _ePage.click(tdSelector, { timeout: fillClickTimeout });
                 logger.info(`[browser.act] fill (engine) tdRef=${cleanRef} click ok`);
               } catch (tdClickErr) {
-                // Re-tag-on-miss
+                // Re-tag-on-miss (element may have been re-rendered)
                 const reTaggedRef = await _reTagAndResolve(_ePage, cleanRef, entry);
                 if (reTaggedRef && reTaggedRef !== cleanRef) {
                   await _ePage.click(`[data-td-ref="${reTaggedRef}"]`, { timeout: fillClickTimeout });
@@ -3224,14 +3296,17 @@ async function browserAct(args) {
                 await _ePage.keyboard.press('Tab');
               } else if (fieldType === 'rich-text') {
                 logger.info(`[browser.act] fill (engine) tdRef rich-text-detect: contenteditable — typing without Meta+a`);
-                await _ePage.keyboard.pressSequentially(fillText, { delay: 10 });
+                await _ePage.keyboard.type(fillText, { delay: 10 });
               } else {
                 await _ePage.keyboard.press('Meta+a');
                 await _ePage.keyboard.type(fillText, { timeout: timeoutMs });
               }
               logger.info(`[browser.act] fill (engine) tdRef=${cleanRef} type ok`);
+              // Fix 34: Placeholder-verify
+              const _tdVerify = await _fillPlaceholderVerify(_ePage, fillText);
+              logger.info(`[browser.act] fill (engine) tdRef=${cleanRef} verified=${_tdVerify.verified} (${_tdVerify.reason})`);
               lastFilledTarget.delete(sessionId);
-              return { ok: true, action, sessionId, executionTime: Date.now() - start };
+              return { ok: true, action, sessionId, verified: _tdVerify.verified, actualValue: _tdVerify.actualValue, executionTime: Date.now() - start };
             } catch (tdFillErr) {
               logger.warn(`[browser.act] fill (engine) tdRef=${cleanRef} failed: ${tdFillErr.message} — falling through to ARIA/CSS`);
             }
@@ -3288,14 +3363,17 @@ async function browserAct(args) {
                       await _ePage.keyboard.press('Tab');
                     } else if (fieldType === 'rich-text') {
                       logger.info(`[browser.act] fill (engine) rich-text-detect: contenteditable — typing without Meta+a`);
-                      await _ePage.keyboard.pressSequentially(fillText, { delay: 10 });
+                      await _ePage.keyboard.type(fillText, { delay: 10 });
                     } else {
                       await _ePage.keyboard.press('Meta+a');
                       await _ePage.keyboard.type(fillText, { timeout: timeoutMs });
                     }
                     logger.info(`[browser.act] fill (engine) semantic path ok`);
+                    // Fix 34: Placeholder-verify
+                    const _semVerify = await _fillPlaceholderVerify(_ePage, fillText);
+                    logger.info(`[browser.act] fill (engine) semantic path verified=${_semVerify.verified} (${_semVerify.reason})`);
                     lastFilledTarget.delete(sessionId);
-                    return { ok: true, action, sessionId, executionTime: Date.now() - start };
+                    return { ok: true, action, sessionId, verified: _semVerify.verified, actualValue: _semVerify.actualValue, executionTime: Date.now() - start };
                   }
                   logger.info(`[browser.act] fill (engine) semantic selectors matched but click failed — falling through to getByRole`);
                 }
@@ -3367,18 +3445,19 @@ async function browserAct(args) {
             // Contenteditable rich-text editor (LinkedIn, Gmail, Quill, DraftJS):
             // Focus is already set by the click. Type directly without Meta+a —
             // Meta+a can select text outside the editor on some sites.
-            // Use pressSequentially for reliable character-by-character input
-            // that respects the editor's input handling (draft-js, prosemirror).
             logger.info(`[browser.act] fill (engine) rich-text-detect: contenteditable — typing without Meta+a`);
-            await _ePage.keyboard.pressSequentially(fillText, { delay: 10 });
+            await _ePage.keyboard.type(fillText, { delay: 10 });
           } else {
             await _ePage.keyboard.press('Meta+a');
             await _ePage.keyboard.type(fillText, { timeout: timeoutMs });
           }
 
           logger.info(`[browser.act] fill (engine) "${selector}" → ok`);
+          // Fix 34: Placeholder-verify
+          const _mainVerify = await _fillPlaceholderVerify(_ePage, fillText);
+          logger.info(`[browser.act] fill (engine) "${selector}" verified=${_mainVerify.verified} (${_mainVerify.reason})`);
           lastFilledTarget.delete(sessionId);
-          return { ok: true, action, sessionId, executionTime: Date.now() - start };
+          return { ok: true, action, sessionId, verified: _mainVerify.verified, actualValue: _mainVerify.actualValue, executionTime: Date.now() - start };
         } catch (fillErr) {
           logger.warn(`[browser.act] fill (engine) click failed: ${fillErr.message} — trying gated visible-input fallback`);
           // ── Gated visible-input fallback ──────────────────────────────────────
@@ -3461,8 +3540,44 @@ async function browserAct(args) {
             logger.warn(`[browser.act] fill (engine) gated visible-input fallback failed: ${fallbackErr.message}`);
           }
         }
-        // Engine owns session — no CLI fallback
+
+        // ── Focus+type fallback: when click times out (React apps re-rendering,
+        // Notion, Linear, Figma), try focusing the element via JS and typing directly.
+        // This bypasses Playwright's actionability/stability checks which fail on
+        // dynamically re-rendered elements.
         if (engine.isSessionActive(sessionId)) {
+          try {
+            // Resolve td-refs to [data-td-ref="..."] CSS selectors.
+            const _rawSel = selector || args.selector;
+            const _fbSel = (cleanRef && _isTdRef(cleanRef)) ? `[data-td-ref="${cleanRef}"]` : _rawSel;
+            logger.info(`[browser.act] fill (engine) trying focus+type fallback for selector="${_fbSel}"`);
+            const _focused = await _ePage.evaluate((sel) => {
+              const el = document.querySelector(sel);
+              if (!el) return false;
+              el.focus();
+              return document.activeElement === el;
+            }, _fbSel).catch(() => false);
+            if (_focused) {
+              // Clear existing content (Meta+a + Delete) then type
+              await _ePage.keyboard.press('Meta+a').catch(() => {});
+              await _ePage.keyboard.press('Delete').catch(() => {});
+              await _ePage.keyboard.type(fillText, { delay: 20, timeout: Math.min(timeoutMs, 10000) });
+              // Verify by reading the element's own content (source of truth)
+              const _actualVal = await _ePage.evaluate((sel) => {
+                const el = document.querySelector(sel);
+                if (!el) return '';
+                return (el.value || el.textContent || el.innerText || '').slice(0, 200);
+              }, _fbSel).catch(() => '');
+              const _verified = _actualVal.toLowerCase().includes(fillText.toLowerCase());
+              logger.info(`[browser.act] fill (engine) focus+type fallback: typed ${fillText.length} chars, verified=${_verified}, actualValue="${_actualVal.slice(0, 80)}"`);
+              if (_verified) {
+                lastFilledTarget.delete(sessionId);
+                return { ok: true, action, sessionId, method: 'focus-type-fallback', verified: true, executionTime: Date.now() - start };
+              }
+            }
+          } catch (_focusTypeErr) {
+            logger.warn(`[browser.act] fill (engine) focus+type fallback failed: ${_focusTypeErr.message}`);
+          }
           return _engineActionFailure(action, sessionId, `Engine fill failed for selector="${selector}": take a fresh snapshot and re-plan`, { executionTime: Date.now() - start });
         }
       }
@@ -3536,28 +3651,149 @@ async function browserAct(args) {
       if (_ePage) {
         let _typeErr = null;
         try {
-          await _ePage.keyboard.type(text || '', { timeout: timeoutMs });
-          // Verify the text was actually typed by checking the focused element's value
           const _typedText = text || '';
+
+          // ── Snapshot-comparison verification (Fix 2) ──
+          // Before typing: capture the focused element's placeholder + position (rect).
+          // After typing: re-find the element at the SAME position and compare:
+          //   (a) text present in textContent/value (primary, universal)
+          //   (b) placeholder gone (bonus — Quill removes ql-blank class,
+          //       Draft.js removes the placeholder element, Notion keeps the
+          //       attribute but text replaces it).
+          // Position-aware — solves "same placeholder in multiple places"
+          // (e.g. Notion title "New Page" at top vs sidebar "New Page" at left).
+          let _preSnap = null;
           if (_typedText.length > 0) {
-            const _verify = await _ePage.evaluate(() => {
+            _preSnap = await _ePage.evaluate(() => {
               const el = document.activeElement;
-              if (!el) return { hasFocus: false, value: '' };
-              const val = el.value || el.textContent || el.innerText || '';
-              return { hasFocus: true, value: val.slice(0, 500), tag: el.tagName, editable: el.isContentEditable };
+              if (!el) return null;
+              const rect = el.getBoundingClientRect();
+              const ph = el.getAttribute('placeholder') ||
+                el.getAttribute('data-placeholder') ||
+                el.getAttribute('aria-placeholder') || '';
+              // Draft.js: check for sibling placeholder element
+              const draftPlaceholder = document.querySelector('.public-DraftEditorPlaceholder-inner');
+              const draftPlaceholderText = draftPlaceholder ? (draftPlaceholder.textContent || '').trim() : '';
+              // Fix 30c: Pseudo-placeholder detection — value matches aria-label or data-tooltip
+              // (Google Docs pattern: value="Untitled document" + aria-label="Untitled document")
+              const val = (el.value || '').trim();
+              const aria = el.getAttribute('aria-label') || '';
+              const tooltip = el.getAttribute('data-tooltip') || el.getAttribute('title') || '';
+              const pseudoPlaceholder = (val && (val === aria || val === tooltip)) ? val : '';
+              return {
+                tag: el.tagName.toLowerCase(),
+                role: el.getAttribute('role') || '',
+                editable: el.isContentEditable,
+                placeholder: ph,
+                draftPlaceholderText,
+                hasBlankClass: el.classList.contains('ql-blank'),
+                pseudoPlaceholder, // Fix 30c
+                rect: { top: rect.top, left: rect.left, width: rect.width, height: rect.height },
+                textBefore: (el.value || el.textContent || el.innerText || '').slice(0, 200),
+              };
             }).catch(() => null);
-            if (_verify) {
-              const _typedOk = _verify.value && _verify.value.includes(_typedText.slice(0, 50));
-              if (!_typedOk) {
-                logger.warn(`[browser.act] type (engine) verification failed — focused <${_verify.tag}> editable=${_verify.editable} value="${_verify.value.slice(0, 80)}" does not contain typed text`);
+          }
+
+          // Select all existing text before typing — prevents appending to
+          // already-filled elements (e.g. Reddit's <post-composer-title> where
+          // Tier 1.5 typed into a hidden syncing textarea, then Tier 2.5 types
+          // again here, doubling the title).
+          if (_typedText.length > 0 && _preSnap) {
+            await _ePage.keyboard.press('Meta+a').catch(() => {});
+          }
+          await _ePage.keyboard.type(_typedText, { timeout: timeoutMs });
+
+          // After typing: re-find element at same position, compare
+          if (_typedText.length > 0 && _preSnap) {
+            const _postSnap = await _ePage.evaluate((pre) => {
+              if (!pre) return null;
+              // Re-find by position (most stable — refs may change after re-scan,
+              // but position is stable). Find the editable element nearest the
+              // original rect.
+              const allEditables = Array.from(document.querySelectorAll(
+                '[contenteditable="true"], [role="textbox"], input, textarea'
+              ));
+              let bestMatch = null;
+              let bestDist = Infinity;
+              for (const el of allEditables) {
+                const r = el.getBoundingClientRect();
+                if (r.width === 0 || r.height === 0) continue;
+                const dist = Math.abs(r.top - pre.rect.top) + Math.abs(r.left - pre.rect.left);
+                if (dist < bestDist) {
+                  bestDist = dist;
+                  bestMatch = el;
+                }
+              }
+              // Fallback to activeElement if no position match
+              const el = bestMatch || document.activeElement;
+              if (!el) return null;
+              const rect = el.getBoundingClientRect();
+              const ph = el.getAttribute('placeholder') ||
+                el.getAttribute('data-placeholder') ||
+                el.getAttribute('aria-placeholder') || '';
+              const draftPlaceholder = document.querySelector('.public-DraftEditorPlaceholder-inner');
+              const val = el.value || el.textContent || el.innerText || '';
+              return {
+                tag: el.tagName.toLowerCase(),
+                role: el.getAttribute('role') || '',
+                editable: el.isContentEditable,
+                placeholderAfter: ph,
+                hasBlankClass: el.classList.contains('ql-blank'),
+                draftPlaceholderGone: !draftPlaceholder,
+                value: val.slice(0, 500),
+                rect: { top: rect.top, left: rect.left, width: rect.width, height: rect.height },
+                posMatch: bestDist < 50, // close to original position
+              };
+            }, _preSnap).catch(() => null);
+
+            if (_postSnap) {
+              const _textPresent = _postSnap.value && _postSnap.value.includes(_typedText.slice(0, 50));
+              // Placeholder gone: (a) attribute removed, (b) ql-blank removed, (c) Draft.js placeholder element removed
+              const _placeholderGone = !!(
+                (_preSnap.placeholder && _preSnap.placeholder.length > 0 && !_postSnap.placeholderAfter) ||
+                (_preSnap.hasBlankClass && !_postSnap.hasBlankClass) ||
+                (_preSnap.draftPlaceholderText && _postSnap.draftPlaceholderGone)
+              );
+              // Fix 30c: Pseudo-placeholder replaced — pre value (e.g. "Untitled document")
+              // changed to a different value that includes the typed text
+              const _pseudoPlaceholderGone = !!(
+                _preSnap.pseudoPlaceholder &&
+                _preSnap.pseudoPlaceholder.length > 0 &&
+                _postSnap.value !== _preSnap.pseudoPlaceholder &&
+                _postSnap.value.includes(_typedText.slice(0, 50))
+              );
+              // PASS: text present (primary) OR placeholder gone OR pseudo-placeholder replaced
+              if (!_textPresent && !_placeholderGone && !_pseudoPlaceholderGone) {
+                logger.warn(`[browser.act] type (engine) verification failed — textPresent=${_textPresent} placeholderGone=${_placeholderGone} pseudoPlaceholderGone=${_pseudoPlaceholderGone} value="${_postSnap.value.slice(0, 80)}" posMatch=${_postSnap.posMatch}`);
                 return {
                   ok: false, action, sessionId,
-                  error: `type verification failed: focused element (${_verify.tag}) does not contain typed text. Use reactFill with a selector instead.`,
+                  error: `type verification failed: text not present and placeholder still shown. Use reactFill with a selector instead.`,
                   verified: false,
                   executionTime: Date.now() - start,
                 };
               }
-              logger.info(`[browser.act] type (engine) verified — focused <${_verify.tag}> contains text`);
+              logger.info(`[browser.act] type (engine) verified — textPresent=${_textPresent} placeholderGone=${_placeholderGone} pseudoPlaceholderGone=${_pseudoPlaceholderGone} posMatch=${_postSnap.posMatch} tag=${_postSnap.tag}`);
+            } else {
+              // Post-snapshot failed — fall back to activeElement check
+              const _verify = await _ePage.evaluate(() => {
+                const el = document.activeElement;
+                if (!el) return { hasFocus: false, value: '' };
+                const val = el.value || el.textContent || el.innerText || '';
+                return { hasFocus: true, value: val.slice(0, 500), tag: el.tagName, editable: el.isContentEditable };
+              }).catch(() => null);
+              if (_verify) {
+                const _typedOk = _verify.value && _verify.value.includes(_typedText.slice(0, 50));
+                if (!_typedOk) {
+                  logger.warn(`[browser.act] type (engine) verification failed (fallback) — focused <${_verify.tag}> value="${_verify.value.slice(0, 80)}" does not contain typed text`);
+                  return {
+                    ok: false, action, sessionId,
+                    error: `type verification failed: focused element (${_verify.tag}) does not contain typed text. Use reactFill with a selector instead.`,
+                    verified: false,
+                    executionTime: Date.now() - start,
+                  };
+                }
+                logger.info(`[browser.act] type (engine) verified (fallback) — focused <${_verify.tag}> contains text`);
+              }
             }
           }
           return { ok: true, action, sessionId, verified: true, executionTime: Date.now() - start };
@@ -3596,11 +3832,29 @@ async function browserAct(args) {
       }
       try {
         const result = await _ePage.evaluate(({ selector, text, clearFirst }) => {
+          const matchCount = document.querySelectorAll(selector).length;
           const el = document.querySelector(selector);
           if (!el) return { ok: false, error: `Element not found: ${selector}` };
 
+          // ── Element info for disambiguation ──
+          // Returned in every path so the caller (LLM) can verify it filled
+          // the RIGHT element when multiple elements match the selector.
+          const _elementInfo = {
+            tag: el.tagName,
+            role: el.getAttribute('role'),
+            placeholder: el.getAttribute('placeholder') || el.getAttribute('aria-placeholder'),
+            ariaLabel: el.getAttribute('aria-label'),
+            matchCount,
+          };
+
           // ── Path 1: <input> / <textarea> — native setter + input event ──
           if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') {
+            // Fix 35: Capture pre-state for Placeholder-verify in delayed recheck
+            const _preValue = (el.value || '').slice(0, 200);
+            const _prePlaceholder = el.getAttribute('placeholder') || el.getAttribute('data-placeholder') || el.getAttribute('aria-placeholder') || '';
+            const _preAria = el.getAttribute('aria-label') || '';
+            const _preTooltip = el.getAttribute('data-tooltip') || el.getAttribute('title') || '';
+            const _prePseudoPlaceholder = (_preValue && (_preValue === _preAria || _preValue === _preTooltip)) ? _preValue : '';
             const proto = el.tagName === 'INPUT'
               ? window.HTMLInputElement.prototype
               : window.HTMLTextAreaElement.prototype;
@@ -3612,13 +3866,22 @@ async function browserAct(args) {
             }
             el.dispatchEvent(new Event('input', { bubbles: true }));
             el.dispatchEvent(new Event('change', { bubbles: true }));
-            // Verify
-            const actual = el.value || '';
+            // Sync verify (fast path) — reads el.value immediately after the setter.
+            // Some frameworks (Google Docs rename, controlled inputs that revert on
+            // blur) will overwrite this value on the next microtask, so the caller
+            // does a delayed re-read below to produce the honest `verified` signal.
+            const actualSync = el.value || '';
             return {
               ok: true,
               method: 'native-setter',
-              verified: actual.includes(text),
-              actualValue: actual.slice(0, 200),
+              verified: actualSync.includes(text),
+              actualValue: actualSync.slice(0, 200),
+              _needsDelayedRecheck: true,
+              _selector: selector,
+              _expectedText: text,
+              _elementInfo,
+              // Fix 35: pre-state for Placeholder-verify
+              _preValue, _prePlaceholder, _prePseudoPlaceholder,
             };
           }
 
@@ -3674,6 +3937,7 @@ async function browserAct(args) {
               method: 'contenteditable',
               verified: _verified,
               actualValue: actual.slice(0, 200),
+              _elementInfo,
             };
           }
 
@@ -3700,9 +3964,74 @@ async function browserAct(args) {
             method: 'textcontent-fallback',
             verified: _verified3,
             actualValue: actual.slice(0, 200),
+            _elementInfo,
           };
         }, { selector: selector || args.selector, text: fillText, clearFirst });
-        logger.info(`[browser.act] reactFill selector="${selector}" method=${result.method} verified=${result.verified}`);
+
+        // ── Delayed re-verification for INPUT/TEXTAREA ──
+        // The synchronous `verified` above reads el.value immediately after the native
+        // setter. Frameworks that only commit on focus+Enter/blur (Google Docs rename,
+        // some controlled inputs) revert the value on the next microtask, so the sync
+        // check reports verified=true while the page actually shows the OLD value.
+        // Re-read after a short settle and downgrade to verified=false if the value
+        // was reverted — callers (turn-loop, Plan-Execute) treat this as "unconfirmed"
+        // and can follow up with a press/Enter to commit.
+        // Fix 35: Upgraded to full Placeholder-verify — checks all 3 PASS conditions:
+        //   (a) text present, (b) placeholder gone, (c) pseudo-placeholder replaced
+        if (result.ok && result._needsDelayedRecheck) {
+          await _ePage.waitForTimeout(500).catch(() => {});
+          try {
+            const _recheck = await _ePage.evaluate(({ selector, expectedText }) => {
+              const el = document.querySelector(selector);
+              if (!el) return { reverted: true, actualValue: '', placeholderAfter: '', hasBlankClass: false, draftPlaceholderGone: false };
+              const actual = (el.value || '');
+              const ph = el.getAttribute('placeholder') || el.getAttribute('data-placeholder') || el.getAttribute('aria-placeholder') || '';
+              const draftPlaceholder = document.querySelector('.public-DraftEditorPlaceholder-inner');
+              return {
+                actualValue: actual.slice(0, 200),
+                placeholderAfter: ph,
+                hasBlankClass: el.classList.contains('ql-blank'),
+                draftPlaceholderGone: !draftPlaceholder,
+                // text present = value includes typed text
+                textPresent: actual.includes(expectedText),
+              };
+            }, { selector: result._selector, expectedText: result._expectedText });
+            // Fix 35: Full Placeholder-verify — all 3 PASS conditions
+            const _textPresent = _recheck.textPresent;
+            const _placeholderGone = !!(
+              (result._prePlaceholder && result._prePlaceholder.length > 0 && !_recheck.placeholderAfter) ||
+              (_recheck.hasBlankClass === false) || // ql-blank removed
+              (_recheck.draftPlaceholderGone) // Draft.js placeholder gone
+            );
+            const _pseudoPlaceholderGone = !!(
+              result._prePseudoPlaceholder &&
+              result._prePseudoPlaceholder.length > 0 &&
+              _recheck.actualValue !== result._prePseudoPlaceholder &&
+              _recheck.actualValue.includes(result._expectedText.slice(0, 50))
+            );
+            const _fullVerified = _textPresent || _placeholderGone || _pseudoPlaceholderGone;
+            if (!_fullVerified) {
+              logger.info(`[browser.act] reactFill selector="${selector}" delayed recheck: not verified (textPresent=${_textPresent} placeholderGone=${_placeholderGone} pseudoPlaceholderGone=${_pseudoPlaceholderGone}) actualValue="${_recheck.actualValue}"`);
+              result.verified = false;
+              result.actualValue = _recheck.actualValue;
+            } else {
+              // Confirmed — keep verified=true and refresh actualValue
+              result.verified = true;
+              result.actualValue = _recheck.actualValue;
+              if (!_textPresent) {
+                logger.info(`[browser.act] reactFill selector="${selector}" delayed recheck: verified via placeholder/pseudo-placeholder gone (textPresent=${_textPresent} placeholderGone=${_placeholderGone} pseudoPlaceholderGone=${_pseudoPlaceholderGone})`);
+              }
+            }
+          } catch (_) { /* non-fatal — keep sync result */ }
+        }
+
+        // ── Element info + multi-match warning ──
+        const _info = result._elementInfo || {};
+        const _multiMatch = _info.matchCount > 1;
+        if (_multiMatch) {
+          logger.warn(`[browser.act] reactFill: selector "${selector}" matched ${_info.matchCount} elements — filled the first (<${_info.tag} role=${_info.role} placeholder="${_info.placeholder}">) — may be wrong element, use a more specific selector`);
+        }
+        logger.info(`[browser.act] reactFill selector="${selector}" method=${result.method} verified=${result.verified} element=<${_info.tag} role=${_info.role} placeholder="${_info.placeholder}"> (${_info.matchCount} matches)`);
         if (!result.ok) {
           return { ok: false, action, sessionId, error: result.error, executionTime: Date.now() - start };
         }
@@ -3711,6 +4040,8 @@ async function browserAct(args) {
           result: result.actualValue,
           verified: result.verified,
           method: result.method,
+          elementInfo: _info,
+          ...( _multiMatch ? { warning: `Selector matched ${_info.matchCount} elements — filled first match (<${_info.tag}>). Use a more specific selector (e.g. by placeholder, aria-label, or tag) to target the correct element.` } : {}),
           executionTime: Date.now() - start,
         };
       } catch (fillErr) {
@@ -3967,7 +4298,42 @@ async function browserAct(args) {
           try { await _ePage.selectOption(selector, value || '', { timeout: timeoutMs }); return { ok: true, action, sessionId, executionTime: Date.now() - start }; }
           catch (e) { logger.warn(`[browser.act] select (engine) CSS="${selector}" failed: ${e.message}`); }
         }
+        // ── Custom dropdown fallback: when selectOption fails (element is not a
+        // native <select> — div-based React Select, MUI, etc.), try click-to-open
+        // then click the matching option by text.
         if (engine.isSessionActive(sessionId)) {
+          try {
+            logger.info(`[browser.act] select (engine) trying custom dropdown fallback for selector="${selector}" value="${value}"`);
+            const _selTarget = selector || (cleanRef && _isTdRef(cleanRef) ? `[data-td-ref="${cleanRef}"]` : null);
+            if (_selTarget) {
+              // Click to open the dropdown
+              await _ePage.click(_selTarget, { timeout: 5000 }).catch(() => {});
+              await _ePage.waitForTimeout(300);
+              // Find and click the option matching the value
+              const _optionClicked = await _ePage.evaluate(({ sel, val }) => {
+                const el = document.querySelector(sel);
+                if (!el) return false;
+                // Search for option-like elements in the dropdown or nearby
+                const container = el.closest('[role="listbox"], [role="menu"], .dropdown, .select') || el.parentElement || el;
+                const opts = container.querySelectorAll('[role="option"], [role="menuitem"], li, .option, [data-value]');
+                const _valLower = val.toLowerCase();
+                for (const opt of opts) {
+                  const _optText = (opt.textContent || opt.getAttribute('data-value') || '').trim().toLowerCase();
+                  if (_optText.includes(_valLower) || _valLower.includes(_optText)) {
+                    opt.click();
+                    return true;
+                  }
+                }
+                return false;
+              }, { sel: _selTarget, val: value || '' }).catch(() => false);
+              if (_optionClicked) {
+                logger.info(`[browser.act] select (engine) custom dropdown fallback: clicked option "${value}" ok`);
+                return { ok: true, action, sessionId, method: 'custom-dropdown-click', executionTime: Date.now() - start };
+              }
+            }
+          } catch (_customDropdownErr) {
+            logger.warn(`[browser.act] select (engine) custom dropdown fallback failed: ${_customDropdownErr.message}`);
+          }
           return _engineActionFailure(action, sessionId, `Engine select failed for selector="${selector}": take a fresh snapshot and re-plan`, { executionTime: Date.now() - start });
         }
       }
@@ -6239,6 +6605,53 @@ If no videos found, return []. Do not explain, only output the JSON array.`;
 
           const currentHost     = getHost(currentUrl);
           const urlWithoutQuery = currentUrl.split('?')[0];
+
+          // ── Popup / multi-page awareness ──────────────────────────────────────
+          // OAuth flows (Google, Apple, Microsoft, etc.) often open a popup window
+          // for the identity provider. The main page stays put while the popup
+          // handles the auth handshake. Without scanning all context pages, the
+          // state machine is blind to the popup and times out.
+          //
+          // Each poll: enumerate every open page, log URLs (diagnostic), and check
+          // whether any popup has reached the success host or is mid-OAuth.
+          const _ctx = engine.getContext(sessionId);
+          if (_ctx) {
+            try {
+              const _allPages = _ctx.pages();
+              if (_allPages.length > 1) {
+                const _popupUrls = [];
+                for (const _p of _allPages) {
+                  let _pUrl = '';
+                  try { _pUrl = _p.url(); } catch (_) { _pUrl = ''; }
+                  if (!_pUrl || _pUrl === currentUrl || _pUrl === 'about:blank') continue;
+                  _popupUrls.push(_pUrl);
+                  const _pHost = getHost(_pUrl);
+                  const _pUrlNoQuery = _pUrl.split('?')[0];
+                  // OAuth redirect in a popup → mark in-flight, never back-navigate
+                  const _oauthQueryRe2 = /[?&](redirect_uri|response_type=code|code_challenge|flowName=[^&]*[Oo]auth)=/i;
+                  const _oauthPathRe2  = /\/(oauth2?|authorize|login\/oauth|signin\/oauth|connect\/oauth|v\d+\/signin\/identifier|auth\/callback|api\/auth\/callback)\b/i;
+                  if (_oauthQueryRe2.test(_pUrl) || _oauthPathRe2.test(_pUrlNoQuery)) {
+                    _wasOnOAuthProvider = true;
+                  }
+                  // Popup landed on the success host → auth complete
+                  if (authSuccessUrl) {
+                    if (_pUrlNoQuery.includes(authSuccessUrl) && !isHostEquivalent(_pHost, authOriginHost)) {
+                      logger.info(`[browser.act] waitForAuth: popup reached success host (${_pUrl}) for session=${sessionId}`);
+                      return { ok: true, action, sessionId, authResolved: true, executionTime: Date.now() - start };
+                    }
+                  } else if (!!_pHost && !!authOriginHost && !isHostEquivalent(_pHost, authOriginHost) && _pUrl.startsWith('http')) {
+                    logger.info(`[browser.act] waitForAuth: popup left auth domain (${_pUrl}) for session=${sessionId}`);
+                    return { ok: true, action, sessionId, authResolved: true, executionTime: Date.now() - start };
+                  }
+                }
+                if (_popupUrls.length > 0) {
+                  logger.debug(`[browser.act] waitForAuth: ${_popupUrls.length} popup page(s) open: ${_popupUrls.join(' | ')} (session=${sessionId})`);
+                }
+              }
+            } catch (_popupErr) {
+              logger.debug(`[browser.act] waitForAuth: popup scan failed (non-fatal): ${_popupErr.message}`);
+            }
+          }
 
           // State 1: SUCCESS — different host from auth domain AND at success URL
           const atSuccess = authSuccessUrl

@@ -89,14 +89,27 @@ function callExternalSkill(name, args = {}, timeoutMs = 30000) {
 
 async function _engineEval(sessionId, expr, timeoutMs = 5000) {
   const page = engine.getPage(sessionId);
-  if (!page) return null;
-  try {
-    const result = await page.evaluate(expr);
-    return { ok: true, result, stdout: typeof result === 'string' ? result : JSON.stringify(result) };
-  } catch (e) {
-    logger.debug(`[playwright.agent] _engineEval failed: ${e.message}`);
-    return null;
+  if (page) {
+    try {
+      const result = await page.evaluate(expr);
+      return { ok: true, result, stdout: typeof result === 'string' ? result : JSON.stringify(result) };
+    } catch (e) {
+      logger.debug(`[playwright.agent] _engineEval failed (engine): ${e.message}`);
+    }
   }
+  // Fallback: session not engine-owned (e.g. turn-loop sessions created via browserAct).
+  // browserAct can interact with ANY session — send the eval expression to the browser.act layer.
+  try {
+    const _baRes = await browserAct({ action: 'evaluate', text: expr, sessionId, headed: true, timeoutMs });
+    if (_baRes?.ok) {
+      const _raw = _baRes.result ?? _baRes.stdout;
+      const _result = typeof _raw === 'string' ? _raw.replace(/^"|"$/g, '') : _raw;
+      return { ok: true, result: _result, stdout: typeof _raw === 'string' ? _raw : JSON.stringify(_raw) };
+    }
+  } catch (e) {
+    logger.debug(`[playwright.agent] _engineEval fallback (browserAct) failed: ${e.message}`);
+  }
+  return null;
 }
 
 async function _engineNavigate(sessionId, url, timeoutMs = 30000) {
@@ -148,7 +161,10 @@ async function _filterSnapshotToModal(sessionId, fullSnapshot) {
   let _modalInfo = null;
   try {
     _modalInfo = await page.evaluate(() => {
-      const modal = document.querySelector('[role="dialog"], #interop-outlet, .share-creation, [data-testid*="modal"], [data-testid*="share"]');
+      const modal = Array.from(document.querySelectorAll('[role="dialog"], [aria-modal="true"], [data-testid*="modal"], [data-testid*="share"]')).find(el => {
+        const r = el.getBoundingClientRect();
+        return r.width > 0 && r.height > 0;
+      });
       if (!modal) return null;
       const hasCompose = !!modal.querySelector('[contenteditable], [role="textbox"], textarea');
       const interactiveCount = modal.querySelectorAll('button, [role="button"], [contenteditable], [role="textbox"], textarea, input, select, a[href]').length;
@@ -404,6 +420,11 @@ Rules:
 - RUN-CODE EXTRACTION RULE: For counting/reading tasks, use { "action": "getPageText" } — NOT run-code with CSS selectors. run-code with site-specific CSS selectors (tr.zA, .zE, aria-label*="unread") returns wrong counts when the DOM structure changes. getPageText captures all visible text reliably. Only use run-code AFTER a search/filter has been applied AND you need structured per-field extraction with standard HTML tag selectors. For counting tasks: search first → snapshot → getPageText to read visible results.
 - DUPLICATE GUARD: Before typing content into any field, check the current page snapshot. If text matching your planned content already exists on the page (e.g., the title is already typed, the body is already filled), do NOT type it again. Take a snapshot and verify the existing content instead. This prevents duplicate content from re-planning or verify-repair loops.
 - IDEMPOTENCY RULE: For create actions (new page, new post, new issue, new email), if the URL has already changed to a new entity URL (e.g., /p/<id>, /issues/<number>, /compose/<id>), the create action succeeded — do NOT click "New" or "Create" again. If a compose window or editor is already open with content matching what you planned to type, do NOT open a new one.
+- HIDDEN ELEMENT RULE: If a fill or click action fails with "element is not visible" or "not interactable", the element exists in the DOM but is hidden by a UI mode (compact mode, collapsed toolbar, minimized section). Do NOT retry the same selector. Instead: (a) check the APP KNOWLEDGE block for known keyboard shortcuts or UI mode toggles for this app, (b) try pressing a keyboard shortcut to toggle the UI mode (e.g. Ctrl+Shift+F for compact mode in many editors), (c) look for a toggle/expand/collapse button in the snapshot, or (d) press Ctrl+/ or ? to open the app's shortcut help overlay. After revealing the element, retry the original action.
+- CLEAR-BEFORE-FILL RULE: When filling a title, rename, or any input field that already has a value (e.g. "Untitled document", "Untitled", existing text), NEVER use "type" — it appends to the existing value, producing garbage like "Untitled dQ3 Planning Notesocument". Instead use "fill" (which does Meta+A + type to replace) or "reactFill" (which replaces via native setter with clearFirst). If you must use "type", first press { "action": "press", "key": "Meta+a" } to select all existing text, then type the new value.
+- MULTI-CONTENTEDITABLE RULE: When the page has multiple contenteditable elements (e.g. title H1 + body DIV, or To/Subject/Body in email compose), do NOT use generic "[contenteditable='true']" — it matches the FIRST in document order, which may be the body, not the title. Use the SELECTOR HINTS which list each contenteditable with its distinguishing attribute (placeholder, aria-label, role, tag). For title/rename tasks, prefer "h1[contenteditable]", "[placeholder='New page']", or the tag-specific selector. For body/content tasks, target the body element specifically by role or aria-label. If reactFill returns a "warning" field, the selector matched multiple elements — switch to a more specific selector immediately.
+- SEARCH-THEN-CLICK RULE: After filling a search box and pressing Enter, ALWAYS run waitForStableText before clicking a result. Search results load dynamically — if you click before results settle, you may click a stale element or the search box itself. After results load, identify the first ORGANIC result (skip ads/sponsored) by its link/text and click it.
+- BLOCK-CREATION RULE: When creating lists/todos in block-based editors (Notion, Google Docs, Confluence), do NOT type raw markdown like "- Task 1\n- Task 2\n- Task 3" as a single type action — newlines inside a contenteditable do NOT create separate blocks. Instead, create each item as a separate step: (1) type the block-creation shortcut for the desired block type (e.g. "[]" + Space for todo, "-" + Space for bullet, "/todo" + Enter for slash command), (2) type the item text, (3) press Enter to create the next block, (4) repeat for each item. Check the APP KNOWLEDGE section for the app's specific block-creation shortcuts — if slash commands are available (e.g. "/todo"), prefer them over markdown shortcuts.
 - TAB STRATEGY RULE: You are a smart tabbing agent. Use as many tabs as the task requires to hold page state or extracted content while working across multiple pages WITHIN THE SAME AGENT SESSION (same domain/service). Open tabs dynamically, track them with tab-list, switch context with tab-select, and clean up with tab-close when a tab's work is done. 2-tab pattern (hold + act): tab 0 = Page A open (compose/form/draft/result); tab-new → Page B → getPageText → tab-select 0 → use extracted content in Page A → tab-close 1. 3-tab pattern (gather from multiple sources, act on one): tab 0 = destination; tab-new → Source B → getPageText; tab-new → Source C → getPageText; tab-select 0 → combine B+C → act → tab-close 2, tab-close 1. 5-tab pattern (parallel research, single synthesis): tab 0 = output/synthesis page; tabs 1–4 = tab-new per source → getPageText each; tab-select 0 → synthesize all results → act → close extra tabs in reverse order. Rules: (1) Always getPageText BEFORE switching away from a tab — result carries forward as [DATA FROM PRIOR STEP] context. (2) Use tab-list to audit open tabs when managing many. (3) tab-close completed tabs to keep the session clean. (4) NEVER use tabs to reach a different service — each agent owns its own Chrome session and cookie store.`;
 
 // ---------------------------------------------------------------------------
@@ -550,6 +571,11 @@ Rules:
 - Keep plan concise — no unnecessary waits or redundant snapshots
 - DIALOG RULE: If a confirmation dialog may appear, add dialog-accept/dismiss after the triggering action
 - AI CHAT EXTRACTION RULE: If ANY stale remaining step was waitForStableText or getPageText, you MUST preserve BOTH in the re-plan — in order: first { "action": "waitForStableText" }, then { "action": "getPageText" }. NEVER collapse them into a single getText or omit waitForStableText. The AI response is still streaming when the DOM changes; skipping waitForStableText captures an incomplete response.
+- HIDDEN ELEMENT RULE: If a step failed with "element is not visible" or "not interactable", the element exists in the DOM but is hidden by a UI mode (compact mode, collapsed toolbar). Do NOT retry the same selector. Instead: (a) check the APP KNOWLEDGE block for known keyboard shortcuts or UI mode toggles, (b) try pressing a keyboard shortcut to toggle the UI mode (e.g. Ctrl+Shift+F for compact mode), (c) look for a toggle/expand/collapse button in the snapshot, or (d) press Ctrl+/ to open shortcut help. After revealing the element, retry the original action with fresh refs.
+- CLEAR-BEFORE-FILL RULE: When filling a title, rename, or any input field that already has a value (e.g. "Untitled document", "Untitled", existing text), NEVER use "type" — it appends to the existing value, producing garbage like "Untitled dQ3 Planning Notesocument". Instead use "fill" (which does Meta+A + type to replace) or "reactFill" (which replaces via native setter with clearFirst). If you must use "type", first press { "action": "press", "key": "Meta+a" } to select all existing text, then type the new value.
+- MULTI-CONTENTEDITABLE RULE: When the page has multiple contenteditable elements (e.g. title H1 + body DIV, or To/Subject/Body in email compose), do NOT use generic "[contenteditable='true']" — it matches the FIRST in document order, which may be the body, not the title. Use the SELECTOR HINTS which list each contenteditable with its distinguishing attribute (placeholder, aria-label, role, tag). For title/rename tasks, prefer "h1[contenteditable]", "[placeholder='New page']", or the tag-specific selector. For body/content tasks, target the body element specifically by role or aria-label. If reactFill returns a "warning" field, the selector matched multiple elements — switch to a more specific selector immediately.
+- SEARCH-THEN-CLICK RULE: After filling a search box and pressing Enter, ALWAYS run waitForStableText before clicking a result. Search results load dynamically — if you click before results settle, you may click a stale element or the search box itself. After results load, identify the first ORGANIC result (skip ads/sponsored) by its link/text and click it.
+- BLOCK-CREATION RULE: When creating lists/todos in block-based editors (Notion, Google Docs, Confluence), do NOT type raw markdown like "- Task 1\n- Task 2\n- Task 3" as a single type action — newlines inside a contenteditable do NOT create separate blocks. Instead, create each item as a separate step: (1) type the block-creation shortcut for the desired block type (e.g. "[]" + Space for todo, "-" + Space for bullet, "/todo" + Enter for slash command), (2) type the item text, (3) press Enter to create the next block, (4) repeat for each item. Check the APP KNOWLEDGE section for the app's specific block-creation shortcuts — if slash commands are available (e.g. "/todo"), prefer them over markdown shortcuts.
 
 ${STEP_FORMAT_CRITICAL}`;
 
@@ -905,7 +931,7 @@ async function _verifySubmitStateChange(sessionId, preClickState, timeoutMs = 30
       bodyLen: preClickState.bodyLen || 0,
     };
     const _changed = await page.waitForFunction((before) => {
-      const modalCount = document.querySelectorAll('[role="dialog"], #interop-outlet, .share-creation, [data-testid*="modal"], [data-testid*="share"]').length;
+      const modalCount = document.querySelectorAll('[role="dialog"], [aria-modal="true"], [data-testid*="modal"], [data-testid*="share"]').length;
       const url = window.location.href;
       const bodyLen = (document.body?.innerText || '').length;
       return url !== before.url                    // URL changed (navigation)
@@ -917,7 +943,7 @@ async function _verifySubmitStateChange(sessionId, preClickState, timeoutMs = 30
       // Determine what changed for logging
       const _afterState = await page.evaluate(() => ({
         url: window.location.href,
-        modalCount: document.querySelectorAll('[role="dialog"], #interop-outlet, .share-creation, [data-testid*="modal"], [data-testid*="share"]').length,
+        modalCount: document.querySelectorAll('[role="dialog"], [aria-modal="true"], [data-testid*="modal"], [data-testid*="share"]').length,
         bodyLen: (document.body?.innerText || '').length,
       })).catch(() => null);
       if (_afterState) {
@@ -1366,8 +1392,14 @@ async function pageProbe(sessionId, headed, timeoutMs = 5000) {
     hasCanvas: document.querySelector('canvas') !== null,
     bodyTextLength: document.body?.innerText?.length || 0,
     hostname: window.location.hostname,
-    hasModalDialog: document.querySelector('[role="dialog"], [data-testid*="modal"], [data-testid*="share"], [aria-modal="true"]') !== null,
-    modalCount: document.querySelectorAll('[role="dialog"], [aria-modal="true"]').length,
+    hasModalDialog: Array.from(document.querySelectorAll('[role="dialog"], [data-testid*="modal"], [data-testid*="share"], [aria-modal="true"]')).some(el => {
+      const r = el.getBoundingClientRect();
+      return r.width > 0 && r.height > 0;
+    }),
+    modalCount: Array.from(document.querySelectorAll('[role="dialog"], [aria-modal="true"]')).filter(el => {
+      const r = el.getBoundingClientRect();
+      return r.width > 0 && r.height > 0;
+    }).length,
     hasDraggable: document.querySelector('[draggable="true"]') !== null,
     hasTabindex: document.querySelector('[tabindex]:not([tabindex="-1"])') !== null,
     hasContentEditableTrue: document.querySelector('[contenteditable="true"], [contenteditable="plaintext-only"]') !== null
@@ -1530,7 +1562,14 @@ async function saveSelectorMap(hostname, pagePattern, map) {
     const entry = {
       hostname,
       pagePattern,
-      fields: map.fields,
+      // Strip `text` from each field before saving — values are goal-specific
+      // (e.g. "Q3 Planning Notes") and should never be cached. Only STRUCTURE
+      // (selectors, placeholders, roles) should be cached. Caching values leads
+      // to stale values being reused on future runs with different goals.
+      fields: (map.fields || []).map(f => {
+        const { text, ...rest } = f;
+        return rest;
+      }),
       submitSelectors: map.submitSelectors || [],
       submitVerify: map.submitVerify || null,
       status: 'healthy',
@@ -1975,7 +2014,9 @@ async function executeScriptStep(step, params, sessionId, headed, timeoutMs, sub
 // ---------------------------------------------------------------------------
 const GENERIC_EDITOR_PATTERNS = `MARKDOWN-SHORTCUT LIST PATTERN:
 - Many rich-text editors auto-convert a markdown shortcut ("[] ", "# ", "- ", "1. ", "> ") typed at the START of an empty line into a formatted block (checkbox, heading, bullet, numbered, quote).
+- IMPORTANT: The "[] " shortcut requires a SPACE after the brackets to trigger. Typing "[]item" will NOT work — it must be "[] item".
 - Once that block is created, pressing Enter typically continues the SAME block type automatically for the next line — do NOT repeat the shortcut prefix on subsequent items, it will appear as literal unconverted text instead of being interpreted.
+- PREFER slash commands (e.g. "/todo", "/checklist") over markdown shortcuts when available — they're more reliable and don't depend on the space-after-shortcut timing.
 - Use the shortcut ONCE (for the first item only) if no explicit slash-command / toolbar action already created the block. If a slash-command equivalent (e.g. "/todo", "/checklist") was already used to create the block, never type the shortcut at all — just type item text and press Enter between items.
 
 CHAT-SUBMIT PATTERN:
@@ -2136,6 +2177,41 @@ Rules:
 - Keep selectors robust: avoid nth-child, avoid auto-generated class names.
 - Output ONLY the JSON object.`;
 
+// Unified field map prompt — placeholder primary, CSS selector fallback.
+// Used for both form URLs (Gmail, LinkedIn) and editor pages (Notion, Google Docs).
+// The LLM sees the actual page HTML (with real placeholders) and generates a map
+// with BOTH placeholder hints AND CSS selectors. The executor tries placeholder first.
+const FIELD_MAP_GEN_PROMPT = `You are a browser automation expert. Analyze the provided page fields and the user's goal, and generate a unified field map for form/editor filling.
+
+Output ONLY a JSON object (no markdown, no explanation) with:
+- "fields": array of field objects, each with:
+  - "name": semantic field name (e.g. "to", "subject", "body", "title", "description", "content", "item1", "item2", "item3")
+  - "role": one of "title", "body", "item", "input" (for finding by position when no placeholder)
+  - "placeholder": the placeholder text to look for (from the page fields), or "" if none
+  - "text": the text to type into this field (extracted from the goal)
+  - "selectors": array of CSS selector strings (fallback when no placeholder), most specific first, or [] if none
+  - "type": one of "input", "textarea", "contenteditable", "chip", "select"
+  - "verifySelector": CSS selector to check after typing (optional, for fallback verification), or null
+  - "verifyType": one of "value", "innerText", "chip_count"
+  - "pressAfter": key to press after typing (e.g. "Enter" to move to next field or create next list item), or null
+- "submitSelectors": array of CSS selectors for submit/send buttons (optional — null for auto-save pages)
+- "submitVerify": object with "type" ("compose_gone", "snackbar", "url_change") and "pattern" (regex string), or null
+- "autoSave": boolean — true if the page auto-saves (no submit button needed, e.g. Notion, Google Docs)
+
+Rules:
+- Include BOTH placeholder AND selectors when available — the executor tries placeholder first, falls back to selectors
+- For fields with placeholders (Notion title "New page", LinkedIn compose "What do you want to talk about?", Twitter "What's happening?"): include placeholder
+- For fields without placeholders but with stable selectors (Gmail To=[name="to"], Subject=[name="subjectbox"]): include selectors
+- PSEUDO-PLACEHOLDER FIELDS: Some fields use value="" instead of the placeholder attribute. The page fields now include "value", "dataTooltip", "title", "cssBeforeContent", and "hasBlankClass" signals. If a field has NO placeholder attr but has value matching aria-label (e.g. Google Docs title: value="Untitled document" + aria-label="Untitled document"), treat the value as the placeholder — set "placeholder" to the value text. Same for cssBeforeContent (CSS ::before content on empty contenteditable) and hasBlankClass (ql-blank, is-empty, etc.).
+- For contenteditable bodies: type="contenteditable", verifyType="innerText"
+- For chip/badge fields (Gmail To): type="chip", verifyType="chip_count"
+- For editor pages (Notion, Google Docs): autoSave=true, submitSelectors=null
+- For form/compose pages (Gmail, LinkedIn, Twitter): autoSave=false, include submitSelectors
+- For list items: role="item", pressAfter="Enter" (to create the next item automatically)
+- For slash commands (e.g. "/todo"): include as a separate field with text="/todo" and pressAfter="Enter"
+- Extract the text values from the goal (e.g. "Weekly Goals" from "create a page called 'Weekly Goals'")
+- Output ONLY the JSON object.`;
+
 const FIELD_EXTRACTION_PROMPT = `You are a goal parser. Extract field values from the user's goal for form filling.
 
 Output ONLY a JSON object mapping field names to their values. Field names should match common form field names: "to", "subject", "body", "title", "description", "content", "cc", "bcc", "tags", "category".
@@ -2204,6 +2280,94 @@ async function _generateSelectorMap(sessionId, hostname, goal, timeoutMs) {
     return parsed;
   } catch (err) {
     logger.warn(`[playwright.agent] selector map gen error: ${err.message}`);
+    return null;
+  }
+}
+
+// Unified field map generation — placeholder primary, CSS selector fallback.
+// Used for both form URLs (CSS selectors) and editor pages (placeholder + position).
+// Gathers page HTML with placeholders + positions, asks LLM for unified field map.
+async function _generateFieldMap(sessionId, hostname, goal, timeoutMs, options = {}) {
+  try {
+    const page = engine.getPage(sessionId);
+    if (!page) return null;
+
+    // Gather page HTML — include placeholders, positions, and CSS-relevant attributes
+    const pageHtml = await page.evaluate(() => {
+      const elements = [];
+      const inputs = document.querySelectorAll('input, textarea, select, [contenteditable], [role="combobox"], [role="textbox"]');
+      for (const el of inputs) {
+        // Don't skip hidden elements — mark them as hidden instead. The LLM needs
+        // to see hidden elements (e.g. Google Docs title input when header is
+        // collapsed) so it can generate a selector. The executor uses JS focus
+        // to interact with hidden elements.
+        const _isHidden = el.offsetParent === null && el.getClientRects().length === 0;
+        // Skip elements that are truly not in the DOM (display:none on parent with 0 size)
+        // but keep elements that are just visually hidden (can be focused via JS)
+        if (_isHidden && el.tagName !== 'INPUT' && !el.isContentEditable) continue;
+        const r = el.getBoundingClientRect();
+        const info = {
+          tag: el.tagName.toLowerCase(),
+          type: el.getAttribute('type'),
+          name: el.getAttribute('name'),
+          id: el.getAttribute('id'),
+          ariaLabel: el.getAttribute('aria-label'),
+          placeholder: el.getAttribute('placeholder') || el.getAttribute('data-placeholder') || el.getAttribute('aria-placeholder') || '',
+          role: el.getAttribute('role'),
+          contentEditable: el.isContentEditable,
+          className: (el.className || '').toString().slice(0, 100),
+          dataTestId: el.getAttribute('data-testid'),
+          hidden: _isHidden,
+          // Pseudo-placeholder signals (Fix 30a) — detect placeholder-like fields
+          // when the standard placeholder attr is absent. Google Docs title input
+          // uses value="Untitled document" + aria-label="Untitled document" +
+          // data-tooltip="Untitled document" as a pseudo-placeholder.
+          value: (el.value || '').slice(0, 200),
+          dataTooltip: el.getAttribute('data-tooltip') || '',
+          title: el.getAttribute('title') || '',
+          cssBeforeContent: (() => {
+            try {
+              const c = getComputedStyle(el, '::before').content;
+              return (c && c !== 'none' && c !== 'normal') ? c.replace(/^["']|["']$/g, '') : '';
+            } catch { return ''; }
+          })(),
+          hasBlankClass: /placeholder|blank|empty|watermark/i.test(el.className || ''),
+          rect: { top: Math.round(r.top), left: Math.round(r.left), width: Math.round(r.width), height: Math.round(r.height) },
+        };
+        elements.push(info);
+      }
+      const buttons = [];
+      const btns = document.querySelectorAll('button, [role="button"], div[aria-label*="send" i], div[aria-label*="submit" i], div[aria-label*="post" i], input[type="submit"]');
+      for (const btn of btns) {
+        if (btn.offsetParent === null && btn.getClientRects().length === 0) continue;
+        buttons.push({
+          tag: btn.tagName.toLowerCase(),
+          text: (btn.innerText || btn.textContent || '').slice(0, 50),
+          ariaLabel: btn.getAttribute('aria-label'),
+          type: btn.getAttribute('type'),
+          role: btn.getAttribute('role'),
+          dataTestId: btn.getAttribute('data-testid'),
+        });
+      }
+      return JSON.stringify({ url: location.href, title: document.title, fields: elements, buttons });
+    });
+
+    const prompt = options.hasEditableFields ? FIELD_MAP_GEN_PROMPT : SELECTOR_MAP_GEN_PROMPT;
+    const raw = await askWithMessages([
+      { role: 'system', content: prompt },
+      { role: 'user', content: `HOSTNAME: ${hostname}\nGOAL: ${goal}\n\nPAGE STRUCTURE:\n${pageHtml}${options.agentContext ? `\n\nAPP KNOWLEDGE (site-specific instructions — use these selectors/shortcuts when generating the field map):\n${options.agentContext}` : ''}\n\nGenerate the field map JSON:` },
+    ], { temperature: 0.1, maxTokens: 1200, responseTimeoutMs: 20000 });
+
+    const parsed = parseJson(raw);
+    if (!parsed || !Array.isArray(parsed.fields) || parsed.fields.length === 0) {
+      logger.warn(`[playwright.agent] field map gen: no valid map generated`);
+      return null;
+    }
+    logger.info(`[playwright.agent] field map gen: ${parsed.fields.length} fields, ${parsed.submitSelectors?.length || 0} submit selectors, autoSave=${!!parsed.autoSave}`);
+    logger.info(`[playwright.agent] field map gen JSON: ${JSON.stringify(parsed.fields.map(f => ({ name: f.name, text: f.text, role: f.role, selectors: f.selectors, pressAfter: f.pressAfter, placeholder: f.placeholder })))}`);
+    return parsed;
+  } catch (err) {
+    logger.warn(`[playwright.agent] field map gen error: ${err.message}`);
     return null;
   }
 }
@@ -2420,34 +2584,746 @@ async function _executeSelectorMap(sessionId, fieldValues, selectorMap, timeoutM
   return { ok: true, transcript, result: 'Submitted (no verification configured)' };
 }
 
+// Unified field map execution — placeholder + position primary, CSS selector fallback.
+// For each field: try placeholder + position first (JS focus, bypasses overlays),
+// fall back to CSS selector (page.click), fall back to role + position.
+// Verification: snapshot comparison (built into type action) for placeholder path,
+// ── App-Knowledge Entry Application Helpers ─────────────────────────────────
+// Used by _executeFieldMap to apply existing app-knowledge entries (ui_mode,
+// recovery_move) BEFORE triggering JIT research. This avoids redundant web
+// research when the fix is already cached (e.g. "Ctrl+Shift+F to toggle compact
+// mode" was already known but wasn't being used).
+
+// Apply an app-knowledge entry's fix (shortcut, menuPath, or selector).
+// Returns true if the fix was applied, false if it couldn't be applied.
+async function _applyAppKnowledgeEntry(entry, page, browserAct, sessionId) {
+  if (!entry?.details) return false;
+  const _d = entry.details;
+  try {
+    // Shortcut: press a keyboard shortcut (e.g. Ctrl+Shift+F to toggle compact mode)
+    if (_d.shortcut) {
+      logger.info(`[playwright.agent] app-knowledge: applying [${entry.type}] shortcut="${_d.shortcut}" — ${entry.summary}`);
+      await browserAct({ action: 'press', key: _d.shortcut, sessionId, headed: true, timeoutMs: 5000 });
+      await new Promise(r => setTimeout(r, 800)); // wait for UI to update
+      return true;
+    }
+    // Menu path: click through menu items (e.g. "File > Rename")
+    if (_d.menuPath) {
+      const _menuItems = _d.menuPath.split(/[>›\u203a]/).map(s => s.trim()).filter(Boolean);
+      logger.info(`[playwright.agent] app-knowledge: applying [${entry.type}] menuPath="${_d.menuPath}" — ${entry.summary}`);
+      for (const _menuItem of _menuItems) {
+        await page.evaluate((label) => {
+          const _els = Array.from(document.querySelectorAll('div[role="menuitem"], span, a, button'));
+          const _match = _els.find(el => (el.textContent || '').trim().toLowerCase() === label.toLowerCase());
+          if (_match) { _match.click(); return true; }
+          const _partial = _els.find(el => {
+            const t = (el.textContent || '').trim().toLowerCase();
+            return t.includes(label.toLowerCase()) && t.length < label.length + 20;
+          });
+          if (_partial) { _partial.click(); return true; }
+          return false;
+        }, _menuItem).catch(() => false);
+        await new Promise(r => setTimeout(r, 300));
+      }
+      await new Promise(r => setTimeout(r, 500));
+      return true;
+    }
+    // Selector: JS focus on the selector
+    if (_d.selector) {
+      logger.info(`[playwright.agent] app-knowledge: applying [${entry.type}] selector="${_d.selector}" — ${entry.summary}`);
+      const _jsFocus = await page.evaluate((selector) => {
+        const el = document.querySelector(selector);
+        if (!el) return false;
+        el.focus();
+        return true;
+      }, _d.selector).catch(() => false);
+      return !!_jsFocus;
+    }
+    logger.info(`[playwright.agent] app-knowledge: entry [${entry.type}] has no applicable fix (no shortcut/menuPath/selector)`);
+    return false;
+  } catch (_err) {
+    logger.warn(`[playwright.agent] app-knowledge: failed to apply [${entry.type}] entry: ${_err.message}`);
+    return false;
+  }
+}
+
+// Retry the normal fill path after applying an app-knowledge fix.
+// Fix 32: Path 1 now uses native setter with pre/post value snapshot verification
+//   (Placeholder-verify concept) instead of keyboard.type which routes to wrong element.
+// Fix 33: Path 2 now adds el.focus() for INPUT/TEXTAREA before native setter.
+// Verifies el.value contains expected text before returning filled=true.
+// Returns { filled: boolean, method: string }.
+async function _retryFieldFill(page, field, value, browserAct, sessionId, fieldTimeout, transcript) {
+  // Path 1: CSS selector with page.click + native setter (Fix 32: Placeholder-verify concept)
+  // After app-knowledge fix (e.g. Ctrl+Shift+F), element is visible. page.click focuses it,
+  // then native setter sets value directly (bypasses keyboard routing to body contenteditable).
+  // Pre/post value comparison = deterministic verification.
+  if (field.selectors && field.selectors.length > 0) {
+    for (const sel of field.selectors) {
+      try {
+        await page.click(sel, { timeout: Math.min(fieldTimeout, 5000) });
+        // Native setter with pre/post value snapshot (Fix 32)
+        const _setResult = await page.evaluate((selector, text) => {
+          const el = document.querySelector(selector);
+          if (!el) return null;
+          const preValue = (el.value || el.textContent || '').slice(0, 200);
+          el.focus();
+          if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') {
+            const proto = el.tagName === 'INPUT' ? window.HTMLInputElement.prototype : window.HTMLTextAreaElement.prototype;
+            const setter = Object.getOwnPropertyDescriptor(proto, 'value');
+            if (setter && setter.set) { setter.set.call(el, text); } else { el.value = text; }
+          } else if (el.isContentEditable) {
+            const range = document.createRange();
+            range.selectNodeContents(el);
+            const sel = window.getSelection();
+            sel.removeAllRanges();
+            sel.addRange(range);
+            document.execCommand('insertText', false, text);
+          } else { return null; }
+          el.dispatchEvent(new Event('input', { bubbles: true }));
+          el.dispatchEvent(new Event('change', { bubbles: true }));
+          const postValue = (el.value || el.textContent || '').slice(0, 200);
+          return { preValue, postValue, tag: el.tagName.toLowerCase(), changed: postValue !== preValue, contains: postValue.includes(text) };
+        }, sel, value).catch(() => null);
+        if (_setResult && (_setResult.contains || _setResult.changed)) {
+          logger.info(`[playwright.agent] app-knowledge retry: field "${field.name}" filled via native setter on "${sel}" (pre="${_setResult.preValue.slice(0, 40)}" post="${_setResult.postValue.slice(0, 40)}" changed=${_setResult.changed})`);
+          transcript.push({ action: { type: value }, outcome: { ok: true, field: field.name, selector: sel, method: 'app-knowledge-retry-native-setter', verified: true, preValue: _setResult.preValue, postValue: _setResult.postValue } });
+          if (field.pressAfter) { await page.keyboard.press(field.pressAfter); }
+          return { filled: true, method: 'native-setter' };
+        }
+        logger.warn(`[playwright.agent] app-knowledge retry: CSS selector "${sel}" click succeeded but value not set (pre="${_setResult?.preValue?.slice(0, 40) || ''}" post="${_setResult?.postValue?.slice(0, 40) || ''}")`);
+      } catch (_) { /* element still not visible — try next selector */ }
+    }
+  }
+  // Path 2: JS focus + native setter without page.click (for elements still hidden after fix)
+  // Fix 33: Add el.focus() for INPUT/TEXTAREA (was only done for contenteditable)
+  if (field.selectors && field.selectors.length > 0) {
+    for (const sel of field.selectors) {
+      const _setResult = await page.evaluate((selector, text) => {
+        const el = document.querySelector(selector);
+        if (!el) return null;
+        el.focus(); // Fix 33: focus before setter for ALL element types
+        if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') {
+          const proto = el.tagName === 'INPUT' ? window.HTMLInputElement.prototype : window.HTMLTextAreaElement.prototype;
+          const setter = Object.getOwnPropertyDescriptor(proto, 'value');
+          if (setter && setter.set) { setter.set.call(el, text); } else { el.value = text; }
+        } else if (el.isContentEditable) {
+          const range = document.createRange();
+          range.selectNodeContents(el);
+          const sel = window.getSelection();
+          sel.removeAllRanges();
+          sel.addRange(range);
+          document.execCommand('insertText', false, text);
+        } else { return null; }
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+        el.dispatchEvent(new Event('change', { bubbles: true }));
+        return { value: el.value || el.textContent || '', tag: el.tagName.toLowerCase() };
+      }, sel, value).catch(() => null);
+      if (_setResult?.value?.includes(value)) {
+        logger.info(`[playwright.agent] app-knowledge retry: field "${field.name}" filled via native setter (no click) on "${sel}" (verified: "${_setResult.value.slice(0, 50)}")`);
+        transcript.push({ action: { type: value }, outcome: { ok: true, field: field.name, selector: sel, method: 'app-knowledge-retry-native-setter-noclick', verified: true } });
+        if (field.pressAfter) { await page.keyboard.press(field.pressAfter); }
+        return { filled: true, method: 'native-setter' };
+      }
+    }
+  }
+  // Path 3: Placeholder (incl. pseudo-placeholder — element may now be visible)
+  const _hasPseudoPlaceholder = !!(
+    (field.value && field.value.length > 0 && field.value === field.ariaLabel) ||
+    (field.value && /^(untitled|new|empty|add|enter|placeholder|click to|type to|start (typing|writing))/i.test(field.value)) ||
+    (field.cssBeforeContent && field.cssBeforeContent.length > 0) ||
+    (field.hasBlankClass)
+  );
+  if ((field.placeholder && field.placeholder.length > 0) || _hasPseudoPlaceholder) {
+    const _placeholderText = field.placeholder || field.value || field.cssBeforeContent || '';
+    const _found = await page.evaluate((fieldInfo) => {
+      const _placeholder = fieldInfo.placeholder || fieldInfo.value || fieldInfo.cssBeforeContent || '';
+      const _hasPseudo = !fieldInfo.placeholder && !!(
+        (fieldInfo.value && fieldInfo.value === fieldInfo.ariaLabel) ||
+        (fieldInfo.value && /^(untitled|new|empty|add|enter|placeholder|click to|type to|start (typing|writing))/i.test(fieldInfo.value)) ||
+        (fieldInfo.cssBeforeContent && fieldInfo.cssBeforeContent.length > 0) ||
+        (fieldInfo.hasBlankClass)
+      );
+      const _candidates = Array.from(document.querySelectorAll(
+        '[contenteditable="true"], [role="textbox"], input[type="text"], input:not([type]), textarea'
+      )).filter(el => {
+        const r = el.getBoundingClientRect();
+        if (r.width === 0 || r.height === 0) return false;
+        const ph = el.getAttribute('placeholder') || el.getAttribute('data-placeholder') || el.getAttribute('aria-placeholder') || '';
+        if (ph && ph.toLowerCase().includes(_placeholder.toLowerCase())) return true;
+        if (_hasPseudo) {
+          const val = (el.value || '').trim();
+          const aria = el.getAttribute('aria-label') || '';
+          const tooltip = el.getAttribute('data-tooltip') || '';
+          if (val && val.toLowerCase().includes(_placeholder.toLowerCase())) return true;
+          if (val && aria && val === aria) return true;
+          if (val && tooltip && val === tooltip) return true;
+          if (fieldInfo.cssBeforeContent) {
+            try {
+              const c = getComputedStyle(el, '::before').content;
+              const beforeText = (c && c !== 'none' && c !== 'normal') ? c.replace(/^["']|["']$/g, '') : '';
+              if (beforeText && beforeText.toLowerCase().includes(_placeholder.toLowerCase())) return true;
+            } catch {}
+          }
+          if (fieldInfo.hasBlankClass && /placeholder|blank|empty|watermark/i.test(el.className || '')) return true;
+        }
+        return false;
+      });
+      if (_candidates.length === 0) return null;
+      const el = _candidates[0];
+      el.focus();
+      return { found: true, tag: el.tagName.toLowerCase(), method: _hasPseudo ? 'pseudo-placeholder' : 'placeholder' };
+    }, field).catch(() => null);
+    if (_found?.found) {
+      const _typeRes = await browserAct({ action: 'type', text: value, sessionId, headed: true, timeoutMs: 10000 });
+      if (_typeRes.ok) {
+        transcript.push({ action: { type: value }, outcome: { ok: true, field: field.name, method: `app-knowledge-retry-${_found.method}` } });
+        if (field.pressAfter) { await browserAct({ action: 'press', key: field.pressAfter, sessionId, headed: true, timeoutMs: 5000 }); }
+        return { filled: true, method: _found.method };
+      }
+    }
+  }
+  return { filled: false, method: null };
+}
+
+// CSS selector check for CSS fallback path.
+// Submit phase: skipped for autoSave pages (Notion, Google Docs).
+async function _executeFieldMap(sessionId, fieldValues, fieldMap, timeoutMs, options = {}) {
+  const page = engine.getPage(sessionId);
+  if (!page) return { ok: false, error: 'no engine page' };
+
+  const transcript = [];
+  const fieldTimeout = Math.min(timeoutMs, 15000);
+  const _hasEditableFields = !!options.hasEditableFields;
+
+  // Phase 1: Fill each field — placeholder first, CSS selector fallback, role+position fallback
+  for (const field of fieldMap.fields) {
+    const value = fieldValues[field.name] || field.text;
+    if (!value) {
+      logger.info(`[playwright.agent] field map: skipping field "${field.name}" — no value`);
+      continue;
+    }
+
+    let filled = false;
+
+    // ── Primary: Placeholder + position path (incl. pseudo-placeholder) ──
+    // Fix 30b: Also fire when pseudo-placeholder signals are present (value === aria-label,
+    // value matches default pattern, CSS ::before content, blank class). Google Docs title
+    // input uses value="Untitled document" + aria-label="Untitled document" — no placeholder attr.
+    const _hasPseudoPlaceholder = !!(
+      (field.value && field.value.length > 0 && field.value === field.ariaLabel) ||
+      (field.value && /^(untitled|new|empty|add|enter|placeholder|click to|type to|start (typing|writing))/i.test(field.value)) ||
+      (field.cssBeforeContent && field.cssBeforeContent.length > 0) ||
+      (field.hasBlankClass)
+    );
+    if ((field.placeholder && field.placeholder.length > 0) || _hasPseudoPlaceholder) {
+      const _placeholderText = field.placeholder || field.value || field.cssBeforeContent || '';
+      const _found = await page.evaluate((fieldInfo) => {
+        const _placeholder = fieldInfo.placeholder || fieldInfo.value || fieldInfo.cssBeforeContent || '';
+        const _isTitle = fieldInfo.role === 'title' || fieldInfo.name === 'title';
+        const _hasPseudo = !fieldInfo.placeholder && !!(
+          (fieldInfo.value && fieldInfo.value === fieldInfo.ariaLabel) ||
+          (fieldInfo.value && /^(untitled|new|empty|add|enter|placeholder|click to|type to|start (typing|writing))/i.test(fieldInfo.value)) ||
+          (fieldInfo.cssBeforeContent && fieldInfo.cssBeforeContent.length > 0) ||
+          (fieldInfo.hasBlankClass)
+        );
+        const _candidates = Array.from(document.querySelectorAll(
+          '[contenteditable="true"], [role="textbox"], input[type="text"], input:not([type]), textarea'
+        )).filter(el => {
+          const r = el.getBoundingClientRect();
+          if (r.width === 0 || r.height === 0) return false;
+          // Standard placeholder match
+          const ph = el.getAttribute('placeholder') || el.getAttribute('data-placeholder') || el.getAttribute('aria-placeholder') || '';
+          if (ph && ph.toLowerCase().includes(_placeholder.toLowerCase())) return true;
+          // Pseudo-placeholder: value matches aria-label or data-tooltip (Google Docs pattern)
+          if (_hasPseudo) {
+            const val = (el.value || '').trim();
+            const aria = el.getAttribute('aria-label') || '';
+            const tooltip = el.getAttribute('data-tooltip') || '';
+            if (val && val.toLowerCase().includes(_placeholder.toLowerCase())) return true;
+            if (val && aria && val === aria) return true;
+            if (val && tooltip && val === tooltip) return true;
+            // CSS ::before content on empty contenteditable
+            if (fieldInfo.cssBeforeContent) {
+              try {
+                const c = getComputedStyle(el, '::before').content;
+                const beforeText = (c && c !== 'none' && c !== 'normal') ? c.replace(/^["']|["']$/g, '') : '';
+                if (beforeText && beforeText.toLowerCase().includes(_placeholder.toLowerCase())) return true;
+              } catch {}
+            }
+            // Blank class
+            if (fieldInfo.hasBlankClass && /placeholder|blank|empty|watermark/i.test(el.className || '')) return true;
+          }
+          return false;
+        });
+        if (_candidates.length === 0) return null;
+        const _sorted = _candidates.sort((a, b) => {
+          const ra = a.getBoundingClientRect();
+          const rb = b.getBoundingClientRect();
+          return _isTitle ? ra.top - rb.top : (rb.width * rb.height) - (ra.width * ra.height);
+        });
+        const el = _sorted[0];
+        el.focus(); // JS focus — bypasses overlays
+        return { found: true, tag: el.tagName.toLowerCase(), placeholder: el.getAttribute('placeholder') || el.value || '', method: _hasPseudo ? 'pseudo-placeholder' : 'placeholder' };
+      }, field).catch(() => null);
+
+      if (_found?.found) {
+        logger.info(`[playwright.agent] field map: field "${field.name}" found by ${_found.method}="${_placeholderText}" tag=${_found.tag} — typing "${value}"`);
+        // Type — the type action's built-in snapshot comparison handles verification
+        const _typeRes = await browserAct({ action: 'type', text: value, sessionId, headed: true, timeoutMs: 10000 });
+        transcript.push({ action: { type: value }, outcome: { ok: _typeRes.ok, verified: _typeRes.verified, field: field.name, method: _found.method } });
+        if (_typeRes.ok) {
+          filled = true;
+          if (field.pressAfter) {
+            await browserAct({ action: 'press', key: field.pressAfter, sessionId, headed: true, timeoutMs: 5000 });
+          }
+        } else {
+          logger.warn(`[playwright.agent] field map: field "${field.name}" ${_found.method} type failed: ${_typeRes.error}`);
+        }
+      }
+    }
+
+    // ── Fallback: CSS selector path (existing logic) ──
+    if (!filled && field.selectors && field.selectors.length > 0) {
+      for (const sel of field.selectors) {
+        try {
+          await page.click(sel, { timeout: fieldTimeout });
+          const isChip = field.type === 'chip';
+          if (isChip) {
+            await page.keyboard.type(value, { timeout: fieldTimeout });
+            await page.keyboard.press('Enter');
+          } else if (field.type === 'contenteditable') {
+            await page.keyboard.press('Meta+a');
+            await page.keyboard.type(value, { timeout: fieldTimeout });
+          } else {
+            await page.keyboard.press('Meta+a');
+            await page.keyboard.type(value, { timeout: fieldTimeout });
+          }
+          filled = true;
+          logger.info(`[playwright.agent] field map: typed "${value}" (field="${field.name}") via CSS selector "${sel}"`);
+          transcript.push({ action: { type: value }, outcome: { ok: true, field: field.name, selector: sel, method: 'css' } });
+          // Post-interaction verification (CSS selector check)
+          if (field.verifySelector) {
+            await new Promise(r => setTimeout(r, 300));
+            const verifyResult = await _verifyField(page, field, value);
+            if (!verifyResult.ok) {
+              logger.warn(`[playwright.agent] field map: field "${field.name}" CSS verification failed: ${verifyResult.reason}`);
+              filled = false;
+              transcript.push({ action: { verify: field.name }, outcome: { ok: false, reason: verifyResult.reason } });
+              continue; // try next selector
+            }
+            logger.info(`[playwright.agent] field map: field "${field.name}" verified — ${verifyResult.reason}`);
+            transcript.push({ action: { verify: field.name }, outcome: { ok: true, reason: verifyResult.reason } });
+          }
+          if (filled && field.pressAfter) {
+            await page.keyboard.press(field.pressAfter);
+          }
+          break;
+        } catch (typeErr) {
+          // JS focus + native setter fallback — bypasses hidden elements and overlays
+          // (e.g. Google Docs title input when header collapsed). Runs in a SINGLE
+          // atomic page.evaluate: find, focus, set value, dispatch events. Previously
+          // these were two separate evaluates — the element could be re-rendered
+          // between them (Google Docs re-renders on focus), causing the second
+          // querySelector to return null or a different element.
+          const _setResult = await page.evaluate((selector, text) => {
+            const el = document.querySelector(selector);
+            if (!el) return null;
+            el.focus(); // JS focus first — works even when hidden/covered by overlay
+            if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') {
+              const proto = el.tagName === 'INPUT' ? window.HTMLInputElement.prototype : window.HTMLTextAreaElement.prototype;
+              const setter = Object.getOwnPropertyDescriptor(proto, 'value');
+              if (setter && setter.set) { setter.set.call(el, text); } else { el.value = text; }
+            } else if (el.isContentEditable) {
+              const range = document.createRange();
+              range.selectNodeContents(el);
+              const sel = window.getSelection();
+              sel.removeAllRanges();
+              sel.addRange(range);
+              document.execCommand('insertText', false, text);
+            } else { return null; }
+            el.dispatchEvent(new Event('input', { bubbles: true }));
+            el.dispatchEvent(new Event('change', { bubbles: true }));
+            return { value: el.value || el.textContent || '', tag: el.tagName.toLowerCase() };
+          }, sel, value).catch(() => null);
+          if (_setResult?.value?.includes(value)) {
+            filled = true;
+            logger.info(`[playwright.agent] field map: field "${field.name}" filled via JS focus + native setter on "${sel}" (page.click failed: ${typeErr.message}, verified: "${_setResult.value.slice(0, 50)}")`);
+            transcript.push({ action: { type: value }, outcome: { ok: true, field: field.name, selector: sel, method: 'css-jsfocus-native-setter', verified: true } });
+            if (field.verifySelector) {
+              await new Promise(r => setTimeout(r, 300));
+              const verifyResult = await _verifyField(page, field, value);
+              if (!verifyResult.ok) {
+                logger.warn(`[playwright.agent] field map: field "${field.name}" JS-focus verification failed: ${verifyResult.reason}`);
+                filled = false;
+                transcript.push({ action: { verify: field.name }, outcome: { ok: false, reason: verifyResult.reason } });
+                continue;
+              }
+              logger.info(`[playwright.agent] field map: field "${field.name}" JS-focus verified — ${verifyResult.reason}`);
+              transcript.push({ action: { verify: field.name }, outcome: { ok: true, reason: verifyResult.reason } });
+            }
+            if (filled && field.pressAfter) {
+              await page.keyboard.press(field.pressAfter);
+            }
+            break;
+          } else {
+            logger.warn(`[playwright.agent] field map: field "${field.name}" JS focus + native setter failed on "${sel}" (page.click failed: ${typeErr.message}, value="${_setResult?.value?.slice(0, 50) || 'null'}" expected to contain "${value.slice(0, 50)}")`);
+            // Fall through to try next selector
+          }
+        }
+      }
+    }
+
+    // ── Fallback: role + position (no placeholder, no selector) ──
+    if (!filled && field.role && _hasEditableFields) {
+      const _found = await page.evaluate((fieldInfo) => {
+        const _isTitle = fieldInfo.role === 'title';
+        const _isBody = fieldInfo.role === 'body';
+        const _candidates = Array.from(document.querySelectorAll(
+          '[contenteditable="true"], [role="textbox"], textarea, input[type="text"], input:not([type])'
+        )).filter(el => {
+          const r = el.getBoundingClientRect();
+          if (r.width === 0 || r.height === 0) return false;
+          // For title fields: only match elements with title-specific attributes.
+          // This excludes generic contenteditable/textbox elements like Google Docs'
+          // Gemini "Write a document about..." field, which has role="textbox" but
+          // no title-specific attributes (no aria-label with "Untitled"/"title",
+          // no class with "title-input").
+          if (_isTitle) {
+            const attrs = [
+              el.getAttribute('aria-label'),
+              el.getAttribute('placeholder'),
+              el.getAttribute('name'),
+              el.getAttribute('id'),
+              (el.className || '').toString(),
+            ].filter(Boolean).join(' ').toLowerCase();
+            return /title|name|subject|rename|document|untitled|title-input|docs-title/i.test(attrs);
+          }
+          return true;
+        });
+        if (_candidates.length === 0) return null;
+        const _sorted = _candidates.sort((a, b) => {
+          const ra = a.getBoundingClientRect();
+          const rb = b.getBoundingClientRect();
+          if (_isTitle) return ra.top - rb.top;
+          if (_isBody) return (rb.width * rb.height) - (ra.width * ra.height);
+          return 0;
+        });
+        const el = _sorted[0];
+        el.focus();
+        return { found: true, tag: el.tagName.toLowerCase() };
+      }, field).catch(() => null);
+
+      if (_found?.found) {
+        logger.info(`[playwright.agent] field map: field "${field.name}" found by role="${field.role}" tag=${_found.tag}`);
+        const _typeRes = await browserAct({ action: 'type', text: value, sessionId, headed: true, timeoutMs: 10000 });
+        if (_typeRes.ok) {
+          filled = true;
+          transcript.push({ action: { type: value }, outcome: { ok: true, field: field.name, method: 'role+position' } });
+          if (field.pressAfter) {
+            await browserAct({ action: 'press', key: field.pressAfter, sessionId, headed: true, timeoutMs: 5000 });
+          }
+        }
+      }
+    }
+
+    if (!filled) {
+      const _hostname = options.hostname;
+      const _goal = options.goal;
+
+      // ── Phase 0: Check existing app-knowledge entries (ui_mode, recovery_move)
+      // BEFORE triggering JIT research. The fix may already be cached from a
+      // prior run or from upfront web research. Try entries in priority order:
+      // ui_mode first (addresses root cause — e.g. toggle compact mode), then
+      // recovery_move (workaround — e.g. File > Rename). Try multiple entries
+      // if the first doesn't work.
+      if (_hostname) {
+        try {
+          const { loadAppKnowledge } = require('./lib/appKnowledge.cjs');
+          // Check BOTH disk AND in-memory entries (passed from browser.agent.cjs).
+          // In-memory entries are from the same run's upfront research — they may
+          // not be on disk yet if caching failed or is stale. Dedup by ID.
+          const _diskEntries = loadAppKnowledge(_hostname).filter(e =>
+            (e.type === 'ui_mode' || e.type === 'recovery_move') && (e.confidence || 0) >= 0.5
+          );
+          const _memEntries = (options.appKnowledgeEntries || []).filter(e =>
+            (e.type === 'ui_mode' || e.type === 'recovery_move') && (e.confidence || 0) >= 0.5
+          );
+          const _existingEntries = [..._diskEntries];
+          for (const _mem of _memEntries) {
+            if (!_existingEntries.some(e => e.id === _mem.id)) _existingEntries.push(_mem);
+          }
+          // Sort: ui_mode first (root cause), then recovery_move (workaround)
+          _existingEntries.sort((a, b) => {
+            const _order = { ui_mode: 0, recovery_move: 1 };
+            return (_order[a.type] ?? 9) - (_order[b.type] ?? 9);
+          });
+
+          for (const _entry of _existingEntries) {
+            logger.info(`[playwright.agent] field map: trying existing app-knowledge [${_entry.type}] for "${field.name}": ${_entry.summary}`);
+            const _applied = await _applyAppKnowledgeEntry(_entry, page, browserAct, sessionId);
+            if (!_applied) {
+              logger.info(`[playwright.agent] field map: app-knowledge [${_entry.type}] couldn't be applied — trying next entry`);
+              continue;
+            }
+            // Retry the normal fill path (element may now be visible/revealed)
+            const _retryResult = await _retryFieldFill(page, field, value, browserAct, sessionId, fieldTimeout, transcript);
+            if (_retryResult.filled) {
+              filled = true;
+              logger.info(`[playwright.agent] field map: existing app-knowledge [${_entry.type}] resolved "${field.name}" via ${_retryResult.method} — ${_entry.summary}`);
+              transcript.push({ action: { app_knowledge: _entry.type }, outcome: { ok: true, field: field.name, entry: _entry.id, method: _retryResult.method } });
+              break;
+            }
+            logger.info(`[playwright.agent] field map: app-knowledge [${_entry.type}] applied but didn't resolve "${field.name}" — trying next entry`);
+          }
+        } catch (_akErr) {
+          logger.warn(`[playwright.agent] field map: app-knowledge check failed (non-fatal): ${_akErr.message}`);
+        }
+      }
+
+      // ── Phase 1: JIT research — only if no existing app-knowledge entries worked
+      // Skip JIT research when the page has contenteditable elements — JIT research
+      // searches the web for CSS selectors, but custom elements (e.g. Reddit's
+      // <post-composer-title>) don't have standard CSS selectors. Tier 2.5's keyboard
+      // approach (type into focused element) is more reliable for contenteditable.
+      if (!filled && _hostname && _justInTimeResearch) {
+        const _hasContentEditable = await page.evaluate(() =>
+          document.querySelector('[contenteditable="true"], [contenteditable="plaintext-only"]') !== null
+        ).catch(() => false);
+        if (_hasContentEditable) {
+          logger.info(`[playwright.agent] field map: field "${field.name}" not found via CSS, but page has contenteditable — skipping JIT research, falling through to Tier 2.5`);
+          continue;
+        }
+        logger.info(`[playwright.agent] field map: field "${field.name}" not found — triggering JIT research on ${_hostname}`);
+        const _jitFix = await _justInTimeResearch({
+          hostname: _hostname,
+          field: field.name,
+          goal: _goal,
+          failureContext: `All fill methods failed (placeholder, CSS selector, role+position). The field may be hidden, collapsed, or require a specific action to reveal.`,
+          sessionId,
+        }).catch((_err) => { logger.warn(`[playwright.agent] JIT research error (non-fatal): ${_err.message}`); return null; });
+
+        if (_jitFix) {
+          transcript.push({ action: { jit_research: _jitFix.action }, outcome: { ok: true, field: field.name, fix: _jitFix.action } });
+
+          // Apply the fix based on its type
+          try {
+            // Shortcut: press a keyboard shortcut to toggle UI mode / reveal field
+            if (_jitFix.shortcut) {
+              logger.info(`[playwright.agent] field map: applying JIT fix — press ${_jitFix.shortcut}`);
+              await browserAct({ action: 'press', key: _jitFix.shortcut, sessionId, headed: true, timeoutMs: 5000 });
+              await new Promise(r => setTimeout(r, 500)); // wait for UI to update
+            }
+            // Menu path: click through menu items (e.g. "File > Rename")
+            if (_jitFix.menuPath) {
+              const _menuItems = _jitFix.menuPath.split(/[>›\u203a]/).map(s => s.trim()).filter(Boolean);
+              logger.info(`[playwright.agent] field map: applying JIT fix — click menu ${_jitFix.menuPath}`);
+              for (const _menuItem of _menuItems) {
+                await page.evaluate((label) => {
+                  const _els = Array.from(document.querySelectorAll('div[role="menuitem"], span, a, button'));
+                  const _match = _els.find(el => (el.textContent || '').trim().toLowerCase() === label.toLowerCase());
+                  if (_match) { _match.click(); return true; }
+                  const _partial = _els.find(el => {
+                    const t = (el.textContent || '').trim().toLowerCase();
+                    return t.includes(label.toLowerCase()) && t.length < label.length + 20;
+                  });
+                  if (_partial) { _partial.click(); return true; }
+                  return false;
+                }, _menuItem).catch(() => false);
+                await new Promise(r => setTimeout(r, 300));
+              }
+              await new Promise(r => setTimeout(r, 500));
+
+              // Fix 18: After menuPath (e.g. File > Rename), use native setter on
+              // document.activeElement (the now-focused rename dialog input) and
+              // press Enter to commit. keyboard.type() would route to the wrong
+              // element, and Ctrl+Enter doesn't commit the rename dialog.
+              const _activeSet = await page.evaluate((text) => {
+                const el = document.activeElement;
+                if (!el || el === document.body) return null;
+                if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') {
+                  const proto = el.tagName === 'INPUT' ? window.HTMLInputElement.prototype : window.HTMLTextAreaElement.prototype;
+                  const setter = Object.getOwnPropertyDescriptor(proto, 'value');
+                  if (setter && setter.set) { setter.set.call(el, text); } else { el.value = text; }
+                } else if (el.isContentEditable) {
+                  el.focus();
+                  const range = document.createRange();
+                  range.selectNodeContents(el);
+                  const sel = window.getSelection();
+                  sel.removeAllRanges();
+                  sel.addRange(range);
+                  document.execCommand('insertText', false, text);
+                } else { return null; }
+                el.dispatchEvent(new Event('input', { bubbles: true }));
+                el.dispatchEvent(new Event('change', { bubbles: true }));
+                return { value: el.value || el.textContent || '', tag: el.tagName.toLowerCase() };
+              }, value).catch(() => null);
+              if (_activeSet?.value?.includes(value)) {
+                await page.keyboard.press('Enter'); // commit (NOT Ctrl+Enter)
+                await new Promise(r => setTimeout(r, 500)); // wait for dialog to close
+                filled = true;
+                logger.info(`[playwright.agent] field map: JIT menuPath fix — set value via activeElement + Enter commit (verified: "${_activeSet.value.slice(0, 50)}")`);
+                transcript.push({ action: { type: value }, outcome: { ok: true, field: field.name, method: 'jit-menupath-activeelement', verified: true } });
+              } else {
+                logger.warn(`[playwright.agent] field map: JIT menuPath fix — activeElement set failed (value="${_activeSet?.value?.slice(0, 50) || 'null'}")`);
+              }
+            }
+            // Selector: use native setter on the revealed selector
+            if (!filled && _jitFix.selector) {
+              logger.info(`[playwright.agent] field map: applying JIT fix — native setter on ${_jitFix.selector}`);
+              const _setResult = await page.evaluate((selector, text) => {
+                const el = document.querySelector(selector);
+                if (!el) return null;
+                if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') {
+                  const proto = el.tagName === 'INPUT' ? window.HTMLInputElement.prototype : window.HTMLTextAreaElement.prototype;
+                  const setter = Object.getOwnPropertyDescriptor(proto, 'value');
+                  if (setter && setter.set) { setter.set.call(el, text); } else { el.value = text; }
+                } else if (el.isContentEditable) {
+                  el.focus();
+                  const range = document.createRange();
+                  range.selectNodeContents(el);
+                  const sel = window.getSelection();
+                  sel.removeAllRanges();
+                  sel.addRange(range);
+                  document.execCommand('insertText', false, text);
+                } else { return null; }
+                el.dispatchEvent(new Event('input', { bubbles: true }));
+                el.dispatchEvent(new Event('change', { bubbles: true }));
+                return { value: el.value || el.textContent || '', tag: el.tagName.toLowerCase() };
+              }, _jitFix.selector, value).catch(() => null);
+              if (_setResult?.value?.includes(value)) {
+                filled = true;
+                transcript.push({ action: { type: value }, outcome: { ok: true, field: field.name, selector: _jitFix.selector, method: 'jit-research-native-setter', verified: true } });
+                if (field.pressAfter) { await page.keyboard.press(field.pressAfter); }
+              }
+            }
+            // If still not filled, retry all methods after applying shortcut/menu
+            // (Fix 17: with verification — don't set filled=true without checking value)
+            if (!filled && (_jitFix.shortcut || _jitFix.menuPath)) {
+              const _retryResult = await _retryFieldFill(page, field, value, browserAct, sessionId, fieldTimeout, transcript);
+              if (_retryResult.filled) {
+                filled = true;
+                logger.info(`[playwright.agent] field map: JIT fix retry succeeded via ${_retryResult.method}`);
+              }
+            }
+          } catch (_applyErr) {
+            logger.warn(`[playwright.agent] field map: JIT fix application failed (non-fatal): ${_applyErr.message}`);
+          }
+        }
+      }
+
+      if (!filled) {
+        transcript.push({ action: { type: value }, outcome: { ok: false, field: field.name, error: 'all methods failed (including JIT research)' } });
+        return { ok: false, error: `field "${field.name}" could not be filled`, transcript, failedField: field.name };
+      }
+    }
+  }
+
+  // Phase 2: Submit (only if NOT autoSave)
+  if (fieldMap.autoSave) {
+    logger.info(`[playwright.agent] field map: autoSave=true — skipping submit phase`);
+    return { ok: true, transcript, result: 'Completed via field map (auto-save)' };
+  }
+
+  let submitted = false;
+  for (const sel of (fieldMap.submitSelectors || [])) {
+    try {
+      await page.click(sel, { timeout: fieldTimeout });
+      submitted = true;
+      logger.info(`[playwright.agent] field map: submit clicked via "${sel}"`);
+      transcript.push({ action: { click: sel }, outcome: { ok: true, intent: 'submit' } });
+      break;
+    } catch (clickErr) {
+      logger.warn(`[playwright.agent] field map: submit selector "${sel}" failed: ${clickErr.message}`);
+    }
+  }
+
+  if (!submitted) {
+    try {
+      await page.keyboard.press('Control+Enter');
+      submitted = true;
+      logger.info(`[playwright.agent] field map: submit via Ctrl+Enter`);
+      transcript.push({ action: { press: 'Control+Enter' }, outcome: { ok: true, intent: 'submit' } });
+    } catch (_) {}
+  }
+
+  if (!submitted) {
+    return { ok: false, error: 'could not click any submit selector', transcript };
+  }
+
+  // Phase 3: Verify submit success (if configured)
+  if (fieldMap.submitVerify) {
+    const sv = fieldMap.submitVerify;
+    await new Promise(r => setTimeout(r, 1000));
+    if (sv.type === 'compose_gone') {
+      const composeGone = await page.evaluate(() => {
+        const modal = document.querySelector('[role="dialog"], [aria-modal="true"]');
+        return !modal || modal.offsetParent === null;
+      });
+      if (composeGone) {
+        logger.info(`[playwright.agent] field map: submit verified — compose dialog gone`);
+        return { ok: true, transcript, result: 'Submitted (compose gone)' };
+      }
+      return { ok: false, error: 'compose dialog still visible after submit', transcript };
+    }
+    if (sv.type === 'url_change') {
+      const newUrl = await page.evaluate(() => location.href);
+      // Compare to the URL captured before submit — use page.url() as baseline
+      const preSubmitUrl = page.url();
+      if (newUrl !== preSubmitUrl) {
+        logger.info(`[playwright.agent] field map: submit verified — URL changed`);
+        return { ok: true, transcript, result: 'Submitted (URL changed)' };
+      }
+    }
+  }
+
+  logger.info(`[playwright.agent] field map: no submit verification configured — assuming success`);
+  return { ok: true, transcript, result: 'Submitted (no verification configured)' };
+}
+
 // Main Tier 1.5 entry point: try cached map, or generate + cache new one
-async function _deterministicSelectorPath(sessionId, url, goal, hostname, timeoutMs) {
-  if (!isFormUrl(url)) return null;
+// Extended: handles both form URLs (CSS selector path) AND editable pages
+// (placeholder + position path). options.hasEditableFields enables the extended path.
+async function _deterministicSelectorPath(sessionId, url, goal, hostname, timeoutMs, options = {}) {
+  const _isFormUrl = isFormUrl(url);
+  const _hasEditableFields = !!options.hasEditableFields;
+  if (!_isFormUrl && !_hasEditableFields) return null;
 
   const pagePattern = derivePagePattern(url);
-  logger.info(`[playwright.agent] Tier 1.5: checking selector map for ${hostname}:${pagePattern}`);
+  logger.info(`[playwright.agent] Tier 1.5: checking field map for ${hostname}:${pagePattern} (formUrl=${_isFormUrl}, editable=${_hasEditableFields})`);
 
   // Try cached map first
-  let selectorMap = await getSelectorMap(hostname, pagePattern);
+  let fieldMap = await getSelectorMap(hostname, pagePattern);
 
-  if (!selectorMap) {
+  if (!fieldMap) {
     logger.info(`[playwright.agent] Tier 1.5: no cached map — generating via LLM`);
-    const generated = await _generateSelectorMap(sessionId, hostname, goal, timeoutMs);
+    const generated = await _generateFieldMap(sessionId, hostname, goal, timeoutMs, { hasEditableFields: _hasEditableFields, agentContext: options.agentContext });
     if (!generated) return null; // fall through to Tier 2/3
-    selectorMap = generated;
+    fieldMap = generated;
     // Cache it
     await saveSelectorMap(hostname, pagePattern, generated);
   }
 
-  // Extract field values from goal
-  const fieldValues = await _extractFieldValues(goal);
+  // Extract field values from goal. Use regex-based extraction (deterministic)
+  // as the FIRST pass — it correctly extracts { title: "Q7 Planning Notes" } from
+  // "titled 'Q7 Planning Notes'". Then use LLM-based extraction as a SUPPLEMENT
+  // (may find additional fields the regex misses). Regex takes precedence on
+  // conflicts (more reliable for title extraction — LLM sometimes returns
+  // "subject" instead of "title", causing key mismatch with the field map).
+  const _regexParams = extractParamsFromGoal(goal);
+  const _llmValues = await _extractFieldValues(goal);
+  const fieldValues = { ...(_llmValues || {}), ...(_regexParams || {}) };
   if (!fieldValues || Object.keys(fieldValues).length === 0) {
-    logger.warn(`[playwright.agent] Tier 1.5: could not extract field values from goal — falling back`);
-    return null;
+    // For editable pages, values may be embedded in the field map (field.text)
+    if (!_hasEditableFields || !fieldMap.fields || !fieldMap.fields.some(f => f.text)) {
+      logger.warn(`[playwright.agent] Tier 1.5: could not extract field values from goal — falling back`);
+      return null;
+    }
+    logger.info(`[playwright.agent] Tier 1.5: using embedded field values from map (editable page)`);
   }
 
-  // Execute: type → verify → submit → verify
-  const result = await _executeSelectorMap(sessionId, fieldValues, selectorMap, timeoutMs);
+  // Execute: type → verify → submit → verify (or skip submit for autoSave pages)
+  const result = await _executeFieldMap(sessionId, fieldValues || {}, fieldMap, timeoutMs, { hasEditableFields: _hasEditableFields, hostname, goal, agentContext: options.agentContext, appKnowledgeEntries: options.appKnowledgeEntries });
 
   if (result.ok) {
     await incrementSelectorMapSuccess(hostname, pagePattern);
@@ -2457,24 +3333,24 @@ async function _deterministicSelectorPath(sessionId, url, goal, hostname, timeou
       sessionId,
       turns: result.transcript.length,
       done: true,
-      result: result.result || 'Completed via selector map',
+      result: result.result || 'Completed via field map',
       transcript: result.transcript,
-      routingDecision: 'tier1_5_selector_map',
+      routingDecision: _hasEditableFields ? 'tier1_5_field_map' : 'tier1_5_selector_map',
       executionTime: 0, // set by caller
     };
   }
 
   // Failure — increment failure count and fall through
   await incrementSelectorMapFailure(hostname, pagePattern);
-  logger.warn(`[playwright.agent] Tier 1.5: selector map failed: ${result.error} — falling back to Tier 2/3`);
+  logger.warn(`[playwright.agent] Tier 1.5: field map failed: ${result.error} — falling back to Tier 2/3`);
 
   // If the map was cached and failed, try regenerating once
-  if (selectorMap.status === 'healthy' && selectorMap.failure_count === undefined) {
+  if (fieldMap.status === 'healthy' && fieldMap.failure_count === undefined) {
     logger.info(`[playwright.agent] Tier 1.5: attempting one-shot regeneration`);
-    const regenerated = await _generateSelectorMap(sessionId, hostname, goal, timeoutMs);
+    const regenerated = await _generateFieldMap(sessionId, hostname, goal, timeoutMs, { hasEditableFields: _hasEditableFields, agentContext: options.agentContext });
     if (regenerated) {
       await saveSelectorMap(hostname, pagePattern, regenerated);
-      const retryResult = await _executeSelectorMap(sessionId, fieldValues, regenerated, timeoutMs);
+      const retryResult = await _executeFieldMap(sessionId, fieldValues || {}, regenerated, timeoutMs, { hasEditableFields: _hasEditableFields, hostname, goal, agentContext: options.agentContext, appKnowledgeEntries: options.appKnowledgeEntries });
       if (retryResult.ok) {
         await incrementSelectorMapSuccess(hostname, pagePattern);
         return {
@@ -2483,9 +3359,9 @@ async function _deterministicSelectorPath(sessionId, url, goal, hostname, timeou
           sessionId,
           turns: retryResult.transcript.length,
           done: true,
-          result: retryResult.result || 'Completed via regenerated selector map',
+          result: retryResult.result || 'Completed via regenerated field map',
           transcript: retryResult.transcript,
-          routingDecision: 'tier1_5_selector_map_regen',
+          routingDecision: _hasEditableFields ? 'tier1_5_field_map_regen' : 'tier1_5_selector_map_regen',
           executionTime: 0,
         };
       }
@@ -2654,6 +3530,359 @@ Look at the screenshot and determine if the goal appears to have been achieved. 
 // ---------------------------------------------------------------------------
 // Phase 8: Verification layer — eval check + screenshot after any tier
 // ---------------------------------------------------------------------------
+
+// ── Just-in-Time App-Knowledge Research ─────────────────────────────────────
+// When the agent can't find/fill a field or is stuck in a loop, do targeted web
+// research: "I can't find field 'title' on docs.google.com — how do I locate it?"
+// Search → crawl top result → LLM extracts actionable fix → return fix + cache it.
+// This is failure-driven learning — targeted, contextual, and always relevant.
+// Cached as `recovery_move` in app-knowledge (confidence 0.8 — higher than generic
+// research because it's specific to our problem).
+
+// Module-level flag — set to true when JIT research is attempted during a run.
+// Reset at the start of each playwrightAgent run. Included in ask_user message
+// so the user knows web research was already tried.
+let _jitResearchAttemptedFlag = false;
+
+async function _justInTimeResearch({ hostname, field, elementType, goal, failureContext, sessionId, headed }) {
+  if (!hostname || !field) return null;
+  _jitResearchAttemptedFlag = true; // track for ask_user enrichment
+  const _appName = hostname.replace(/^www\./, '').split('.')[0];
+  const _logTag = '[playwright.agent] JIT research';
+  const _type = elementType || 'field';
+
+  // Element-type-specific nouns and verbs for queries
+  const _typeNoun = {
+    field: 'field', button: 'button', dropdown: 'dropdown',
+    menu: 'menu', toggle: 'toggle', element: 'element',
+  }[_type] || 'element';
+  const _typeVerb = {
+    field: 'fill', button: 'click', dropdown: 'open',
+    menu: 'open', toggle: 'toggle', element: 'interact with',
+  }[_type] || 'interact with';
+
+  // Extract action phrase from goal for HOW-TO queries.
+  // Strip the "IMPORTANT: You are working on ... Task:" wrapper that browser.agent.cjs
+  // adds (line 5178) — otherwise the extraction picks up "important you are working
+  // https docs google com" instead of the actual task.
+  // e.g. "IMPORTANT: You are working on https://docs.google.com/...\n\nTask: Create a Google Doc titled 'Q7 Planning Notes'"
+  //    → "create a google doc titled"
+  const _taskPart = (goal || '').replace(/^IMPORTANT:.*?Task:\s*/si, '').trim();
+  const _goalAction = _taskPart.toLowerCase()
+    .replace(/['"]/g, '').replace(/[^a-z0-9\s]/g, ' ')
+    .split(/\s+/).filter(w => w.length > 2).slice(0, 8).join(' ');
+  const _goalActionShort = _goalAction.split(' ').slice(0, 4).join(' ');
+
+  // Multi-angle queries — each angle surfaces different kinds of help articles.
+  // Framing: the failure is always a VISIBILITY problem (element is hidden), not an
+  // INTERACTION problem (can't type). So queries focus on "why is it hidden / how to
+  // reveal" instead of "how to fill" — the latter surfaces workaround articles
+  // (e.g. "File > Rename") instead of root-cause articles (e.g. "Ctrl+Shift+F to
+  // toggle compact mode").
+  const _queries = [
+    // HOW-TO: re-framed as visibility, not interaction
+    `${_appName} ${field} ${_typeNoun} hidden why`,
+    `${_appName} compact mode hidden UI toolbar`,
+    // HAVING-ISSUE: keep existing good angles
+    `having issues ${_type === 'field' ? 'finding' : _typeVerb + 'ing'} ${field} on ${_appName}`,
+    `${_appName} ${field} ${_typeNoun} hidden missing not visible`,
+    // FINDING: re-framed as "how to show", not "where is it"
+    `${_appName} ${field} ${_typeNoun} collapsed not visible how to show`,
+    `${_appName} ${field} ${_typeNoun} not showing how to reveal`,
+    // SHORTCUT: re-framed to mention field + visibility, not vague action
+    `${_appName} keyboard shortcut show ${field} ${_typeNoun} reveal toggle`,
+  ];
+
+  logger.info(`${_logTag}: triggered for ${_type}="${field}" on ${hostname} — ${_queries.length} queries (${_queries.length} angles, parallel search)`);
+
+  // Lazy-load dependencies (avoid circular require issues)
+  let searchWeb, webCrawl, ask;
+  try {
+    ({ searchWeb } = require('./web.agent.cjs'));
+    ({ webCrawl } = require('./web.crawl.cjs'));
+    ({ ask } = require('../skill-helpers/skill-llm.cjs'));
+  } catch (_reqErr) {
+    logger.warn(`${_logTag}: dependency load failed: ${_reqErr.message}`);
+    return null;
+  }
+
+  if (!searchWeb || !webCrawl || !ask) {
+    logger.warn(`${_logTag}: dependencies not available`);
+    return null;
+  }
+
+  // Phase 1: Run all searches in parallel (~5-10s instead of ~20-40s sequential)
+  const _searchPromises = _queries.map(q =>
+    searchWeb(q, 3).catch(() => null)
+  );
+  const _searchResults = await Promise.all(_searchPromises);
+
+  // Phase 2: Process each query's results sequentially (crawl top 2, LLM extract, stop at first fix)
+  for (let _qi = 0; _qi < _queries.length; _qi++) {
+    const _results = _searchResults[_qi];
+    if (!_results?.ok || !Array.isArray(_results.results) || _results.results.length === 0) continue;
+
+    for (const _result of _results.results.slice(0, 2)) {
+      let _crawl;
+      try {
+        _crawl = await webCrawl({ url: _result.url, maxChars: 4000, timeoutMs: 15000 });
+      } catch (_) { continue; }
+      if (!_crawl?.ok || !_crawl.content || _crawl.content.length < 100) continue;
+
+      // LLM extract: "Given this help article, how do I find/show the {field} {type}?"
+      const _extractPrompt = `The agent is trying to ${_typeVerb} the "${field}" ${_typeNoun} on ${hostname} but cannot locate it (it may be hidden, collapsed, or require a specific action to reveal).
+
+Context: ${failureContext || `All methods failed. The ${_typeNoun} may be hidden, collapsed, or require a specific action to reveal.`}
+
+Help article content (from ${_result.url}):
+${_crawl.content.slice(0, 3000)}
+
+Extract the SPECIFIC action needed to find/show/access/${_typeVerb} the "${field}" ${_typeNoun} in ${hostname}. Return ONLY a JSON object:
+{
+  "action": "the specific action to take (e.g. 'click View menu > Show header' or 'press Ctrl+Shift+F1' or 'use JS focus on selector input.docs-title-input — it is hidden but focusable')",
+  "selector": "CSS selector if mentioned, or null",
+  "shortcut": "keyboard shortcut if mentioned, or null",
+  "menuPath": "menu path if mentioned (e.g. 'View > Show header & footer'), or null",
+  "reasoning": "one sentence explanation"
+}
+Return {} if no actionable answer found.`;
+
+      let _raw;
+      try {
+        _raw = await ask(_extractPrompt, { maxTokens: 300, temperature: 0, responseTimeoutMs: 15000 });
+      } catch (_) { continue; }
+      if (!_raw) continue;
+
+      const _jsonMatch = _raw.match(/\{[\s\S]*\}/);
+      if (!_jsonMatch) continue;
+
+      let _fix;
+      try { _fix = JSON.parse(_jsonMatch[0]); } catch (_) { continue; }
+      if (!_fix || !_fix.action) continue;
+
+      // Cache as recovery_move in app-knowledge
+      try {
+        const { saveAppKnowledge, loadAppKnowledge } = require('./lib/appKnowledge.cjs');
+        const _entry = {
+          id: `${_appName}.recovery_move.cant-find-${field}`,
+          type: 'recovery_move',
+          summary: `When "${field}" ${_typeNoun} is not found: ${_fix.action}`,
+          details: {
+            field,
+            elementType: _type,
+            action: _fix.action,
+            selector: _fix.selector || null,
+            shortcut: _fix.shortcut || null,
+            menuPath: _fix.menuPath || null,
+            sourceUrl: _result.url,
+          },
+          source: 'jit_research',
+          confidence: 0.8,
+        };
+        const _existing = loadAppKnowledge(hostname);
+        saveAppKnowledge(hostname, [..._existing.filter(e => e.id !== _entry.id), _entry]);
+        logger.info(`${_logTag}: found + cached fix for "${field}" (${_type}) on ${hostname}: ${_fix.action}`);
+      } catch (_cacheErr) {
+        logger.warn(`${_logTag}: cache failed (non-fatal): ${_cacheErr.message}`);
+      }
+
+      return _fix; // STOP at first actionable fix
+    }
+  }
+
+  logger.info(`${_logTag}: no actionable fix found for ${_type}="${field}" on ${hostname} (all ${_queries.length} angles exhausted)`);
+  return null;
+}
+
+// Signal collector D: Compose text disappearance — check if typed text is STILL
+// in any visible compose element. If text is gone → sent. If text still present →
+// authoritative FAIL (text wouldn't stay in compose after a successful send).
+async function _verifyComposeTextGone(sessionId, expectedText) {
+  try {
+    const _snippet = String(expectedText || '').slice(0, 30).toLowerCase();
+    if (!_snippet) return { gone: false, reason: 'no expected text' };
+
+    const page = engine.getPage(sessionId);
+    if (page) {
+      const _result = await page.evaluate((snippet) => {
+        const composeEls = Array.from(document.querySelectorAll(
+          '[contenteditable="true"], [role="textbox"], textarea, input[type="text"]'
+        )).filter(el => {
+          const r = el.getBoundingClientRect();
+          return r.width > 0 && r.height > 0;
+        });
+        for (const el of composeEls) {
+          const text = (el.innerText || el.textContent || el.value || '').toLowerCase();
+          if (text.includes(snippet)) {
+            return { gone: false, tag: el.tagName.toLowerCase(), textLen: text.length };
+          }
+        }
+        return { gone: true };
+      }, _snippet).catch(() => null);
+      if (_result) return _result;
+    }
+
+    // Fallback: session not engine-owned — use browserAct evaluate
+    try {
+      const _baRes = await browserAct({ action: 'evaluate', text: `(() => {
+        const snippet = ${JSON.stringify(_snippet)};
+        const composeEls = Array.from(document.querySelectorAll(
+          '[contenteditable="true"], [role="textbox"], textarea, input[type="text"]'
+        )).filter(el => {
+          const r = el.getBoundingClientRect();
+          return r.width > 0 && r.height > 0;
+        });
+        for (const el of composeEls) {
+          const text = (el.innerText || el.textContent || el.value || '').toLowerCase();
+          if (text.includes(snippet)) {
+            return JSON.stringify({ gone: false, tag: el.tagName.toLowerCase(), textLen: text.length });
+          }
+        }
+        return JSON.stringify({ gone: true });
+      })()`, sessionId, headed: true, timeoutMs: 5000 }).catch(() => ({ ok: false }));
+      if (_baRes?.ok) {
+        const _raw = typeof _baRes.result === 'string' ? _baRes.result.replace(/^"|"$/g, '') : String(_baRes.result || '{}');
+        try { return JSON.parse(_raw); } catch (_) {}
+      }
+    } catch (_) {}
+
+    return { gone: false, reason: 'evaluate failed' };
+  } catch (e) {
+    return { gone: false, reason: e.message };
+  }
+}
+
+// Signal collector A: DOM compose-gone — check if compose dialog/modal is gone
+// or no longer contains a compose element. Gone → PASS. Still open → WEAK FAIL.
+async function _verifyComposeGone(sessionId) {
+  try {
+    const page = engine.getPage(sessionId);
+    if (page) {
+      const _result = await page.evaluate(() => {
+        const modal = document.querySelector('[role="dialog"], [aria-modal="true"]');
+        if (!modal || modal.offsetParent === null) return { gone: null, hasModal: false, reason: 'no compose dialog present — full-page form, inconclusive' };
+        // Modal present — check if it still contains a compose element
+        const composeInModal = modal.querySelector('[contenteditable="true"], [role="textbox"], textarea');
+        return { gone: !composeInModal, hasModal: true };
+      }).catch(() => null);
+      if (_result) return _result;
+    }
+
+    // Fallback: session not engine-owned — use browserAct evaluate
+    try {
+      const _baRes = await browserAct({ action: 'evaluate', text: `(() => {
+        const modal = document.querySelector('[role="dialog"], [aria-modal="true"]');
+        if (!modal || modal.offsetParent === null) return JSON.stringify({ gone: null, hasModal: false, reason: 'no compose dialog present — full-page form, inconclusive' });
+        const composeInModal = modal.querySelector('[contenteditable="true"], [role="textbox"], textarea');
+        return JSON.stringify({ gone: !composeInModal, hasModal: true });
+      })()`, sessionId, headed: true, timeoutMs: 5000 }).catch(() => ({ ok: false }));
+      if (_baRes?.ok) {
+        const _raw = typeof _baRes.result === 'string' ? _baRes.result.replace(/^"|"$/g, '') : String(_baRes.result || '{}');
+        try { return JSON.parse(_raw); } catch (_) {}
+      }
+    } catch (_) {}
+
+    return { gone: false, reason: 'evaluate failed' };
+  } catch (e) {
+    return { gone: false, reason: e.message };
+  }
+}
+
+// Unified action verification — ALL tiers call this for send/submit/post goals.
+// Priority-based resolution: B (network) > D (compose text gone) > A (DOM compose-gone) > C (VLM).
+// Authoritative signals:
+//   - B-PASS-with-payload (network 2xx + payload contains text) → PASS (server confirmed receipt)
+//   - D-FAIL (text still in compose) → FAIL (text wouldn't stay if sent)
+// Existing functions become signal collectors orchestrated by this function.
+async function _verifyActionCompletion({ goal, sessionId, headed, pageType, submitClickTs, expectedText, isSendSubmitGoal }) {
+  const _logTag = '[playwright.agent] action verification';
+  const signals = {};
+
+  if (!isSendSubmitGoal) {
+    // Non-send/submit goal — defer to existing _verifyGoalCompletion (phrase matching)
+    return null;
+  }
+
+  logger.info(`${_logTag}: starting (submitClickTs=${submitClickTs}, expectedText="${String(expectedText || '').slice(0, 40)}")`);
+
+  // ── Signal D: Compose text disappearance (FIRST — most authoritative for FAIL) ──
+  // If text is still in compose → FAIL immediately, regardless of network requests.
+  // Network can be fooled by draft saves (Gmail auto-save), auto-saves (Outlook),
+  // and background sync requests — all fire 2xx POST with typed text in payload.
+  // DOM text presence is direct evidence: if text is still in compose, it was NOT sent.
+  if (expectedText) {
+    signals.D = await _verifyComposeTextGone(sessionId, expectedText);
+    // D-FAIL → authoritative FAIL (text still in compose = not sent)
+    if (signals.D && !signals.D.gone) {
+      logger.warn(`${_logTag}: FAIL (D-authoritative) — text still in compose element (tag=${signals.D.tag}, textLen=${signals.D.textLen}) — not sent`);
+      return { pass: false, reason: 'Text still in compose element — send/submit not completed', source: 'compose-text', signals };
+    }
+  }
+
+  // ── Signal B: Network (SECOND — can be fooled by draft saves) ──
+  // Only checked if D-PASS (text gone). B-PASS + D-PASS → both agree → PASS.
+  // B alone (without D confirmation) is NOT authoritative — could be draft save.
+  if (submitClickTs) {
+    try {
+      signals.B = await _verifySubmitViaNetwork(sessionId, submitClickTs, expectedText);
+    } catch (e) {
+      signals.B = { ok: false, reason: 'error', error: e.message };
+    }
+    // B-PASS-with-payload + D-PASS → authoritative PASS (both agree — sent)
+    if (signals.B.ok && signals.B.reason === '2xx-with-text' && signals.D?.gone) {
+      logger.info(`${_logTag}: PASS (B+D-authoritative) — network 2xx + payload contains text + compose text gone`);
+      return { pass: true, reason: `Network + compose text gone`, source: 'network+compose', signals };
+    }
+  }
+
+  // ── Signal A: DOM compose-gone ──
+  signals.A = await _verifyComposeGone(sessionId);
+
+  // ── Resolution: combine remaining signals ──
+  // B-PASS + D-PASS → already caught above
+  // B-PASS + A-PASS → PASS (network + compose gone)
+  // Require signals.A?.gone === true (not just truthy) — null means inconclusive
+  // (e.g. full-page forms like Reddit submit have no dialog to disappear).
+  if (signals.B?.ok && signals.A?.gone === true) {
+    logger.info(`${_logTag}: PASS (B+A) — network 2xx + compose dialog gone`);
+    return { pass: true, reason: `Network + compose gone`, source: 'network+dom', signals };
+  }
+  // D-PASS + A-PASS → PASS (no network but text gone + compose gone)
+  if (signals.D?.gone && signals.A?.gone === true) {
+    logger.info(`${_logTag}: PASS (D+A) — compose text gone + compose dialog gone`);
+    return { pass: true, reason: `Compose text + dialog gone`, source: 'compose', signals };
+  }
+  // B-FAIL + A-FAIL → FAIL (no network + compose still open)
+  // Only fail when A is definitively false (dialog still open), not null (no dialog = inconclusive)
+  if (signals.B && !signals.B.ok && signals.A && signals.A.gone === false) {
+    logger.warn(`${_logTag}: FAIL (B+A) — no network 2xx + compose dialog still open`);
+    return { pass: false, reason: `No network confirmation + compose still open`, source: 'network+dom', signals };
+  }
+
+  // ── Signal C: VLM screenshot (tiebreaker) ──
+  try {
+    const _ssRes = await browserAct({ action: 'screenshot', sessionId, headed, timeoutMs: 5000 }).catch(() => ({ ok: false }));
+    if (_ssRes.ok && _ssRes.result) {
+      const _vlm = await _vlmVerifyScreenshot(_ssRes.result, goal, pageType);
+      signals.C = _vlm;
+      if (_vlm?.verified === true) {
+        logger.info(`${_logTag}: PASS (C) — VLM verified send/submit`);
+        return { pass: true, reason: `VLM verified: ${_vlm.reasoning || 'screenshot matches'}`, source: 'vlm', signals };
+      }
+      if (_vlm?.verified === false) {
+        logger.warn(`${_logTag}: FAIL (C) — VLM says not sent: ${_vlm.reasoning || ''}`);
+        return { pass: false, reason: `VLM failed: ${_vlm.reasoning || 'screenshot does not match'}`, source: 'vlm', signals };
+      }
+    }
+  } catch (e) {
+    signals.C = { error: e.message };
+  }
+
+  // All inconclusive → FAIL (safer to fail than false positive)
+  logger.warn(`${_logTag}: INCONCLUSIVE — all signals inconclusive, defaulting to FAIL (signals=${JSON.stringify(Object.keys(signals))})`);
+  return { pass: false, reason: 'All verification signals inconclusive', source: 'inconclusive', signals };
+}
+
 async function verifyTierCompletion(goal, pageType, routingDecision, script, sessionId, headed, timeoutMs) {
   const result = { pass: false, warn: false, fail: false, reason: '', screenshot: null, evalResults: [] };
 
@@ -2795,6 +4024,418 @@ async function verifyTierCompletion(goal, pageType, routingDecision, script, ses
 }
 
 // ---------------------------------------------------------------------------
+// Goal-phrase extraction + location-aware goal verification (F7).
+// Used by _focusedPlanExecute (F7c) and the turn-loop return check (F7d) to
+// prevent false "completed successfully" when steps returned ok=true but the
+// goal wasn't actually achieved (e.g. Google Docs rename that typed the title
+// into the Find-and-replace dialog instead of the document title input).
+// ---------------------------------------------------------------------------
+
+// Extract goal phrases from a natural-language goal string.
+// Returns { phrases: string[], titledPhrases: string[] }.
+//   phrases        — all phrases that should appear somewhere on the page
+//                    (quoted phrases + titled/called/named X).
+//   titledPhrases  — subset extracted via `titled|called|named X`; these must
+//                    appear in document.title or a title-ish input value, NOT
+//                    just anywhere in body text (otherwise typing the title
+//                    into a modal input would falsely pass).
+// Shared by the turn-loop pre-exhaustion check (F7e) and _verifyGoalCompletion.
+function _extractGoalPhrases(goal) {
+  if (!goal || typeof goal !== 'string') return { phrases: [], titledPhrases: [] };
+
+  // ── Read/extract task detection ──────────────────────────────────────────
+  // For read/extract tasks, quoted strings in the goal are PARAMETERS (search
+  // queries, field names to extract), not goal-completion targets. Phrase-based
+  // verification is for WRITE tasks (verify typed text landed in the right
+  // field). For READ tasks, skip phrase extraction → verification falls through
+  // to VLM/inconclusive → return is accepted → captured data flows downstream
+  // to synthesize. This prevents false-negative goal verification when a quoted
+  // search query (e.g. "is:unread wendal") doesn't appear verbatim on the page.
+  // Mixed tasks (read + mutation verbs) still get phrase verification.
+  const _hasReadVerb = /\b(extract|read|search|find|check|list|show|display|look\s+up|pull\s+up|fetch|retrieve|count|how many|browse|summarize)\b/i.test(goal);
+  const _hasMutationVerb = /\b(send|post|compose|tweet|share|write|create|submit|publish|edit|update|delete|remove|add|fill|type|reply|comment|draft|rename|move|sort|format|forward)\b/i.test(goal);
+  if (_hasReadVerb && !_hasMutationVerb) {
+    logger.info(`[playwright.agent] _extractGoalPhrases: read/extract task detected — skipping phrase extraction (quoted strings are parameters, not goal targets)`);
+    return { phrases: [], titledPhrases: [] };
+  }
+
+  const phrases = [];
+  const titledPhrases = [];
+
+  // 0. Defense-in-depth: strip instruction notes before extracting phrases.
+  //    Notes like 'Do NOT click "Start a post"' or 'IMPORTANT: ... "X"' get
+  //    appended to the goal for the LLM but should NOT contribute verification
+  //    phrases. Strip text after common instruction markers.
+  //    Normalize Unicode quotes to ASCII so the regex below matches regardless
+  //    of whether the LLM used straight or curly quotes.
+  const _cleanGoal = goal
+    .replace(/[\u201C\u201D\u201E\u201F\u2033\u2036]/g, '"')  // curly double quotes → "
+    .replace(/[\u2018\u2019\u201A\u201B\u2032\u2035]/g, "'")  // curly single quotes → '
+    .replace(/^IMPORTANT:.*?(?=\n\n|\n[A-Z]|\n$|$)/is, '')  // strip IMPORTANT from START of goal
+    .replace(/\n\nIMPORTANT:.*$/is, '')   // strip IMPORTANT notes (mid-goal)
+    .replace(/\n\nNOTE:.*$/is, '')        // strip NOTE notes
+    .replace(/Do NOT click\s+["'][^"']+["']/gi, '') // strip "Do NOT click 'X'" patterns
+    .replace(/Do NOT\s+\w+\s+["'][^"']+["']/gi, ''); // strip "Do NOT <verb> 'X'" patterns
+
+  // 1. Quoted phrases — "Q3 Planning Notes" or 'Q3 Planning Notes'
+  const quoted = _cleanGoal.match(/["']([^"']{2,})["']/g);
+  if (quoted) {
+    for (const q of quoted) {
+      const cleaned = q.replace(/["']/g, '').trim();
+      if (cleaned.length > 2) phrases.push(cleaned);
+    }
+  }
+  // 2. titled|called|named X — these are title-targeted; must land in
+  //    document.title or a title-ish input, not just any input.
+  //    Stop at common conjunctions/punctuation so we don't swallow the rest
+  //    of the sentence ("titled 'X' and send to Y" → just X).
+  const titledRe = /\b(?:titled|called|named)\s+["']?([^"'.\n]+?)["']?(?:\s+(?:and|then|with|to|under|for|in|on|at|by)|[.,;\n]|$)/gi;
+  let m;
+  while ((m = titledRe.exec(_cleanGoal)) !== null) {
+    const p = m[1].trim();
+    if (p.length > 2) {
+      phrases.push(p);
+      titledPhrases.push(p);
+    }
+  }
+  // De-dup (case-sensitive — callers lower-case for comparison)
+  // Each array gets its OWN Set so phrases and titledPhrases are deduped
+  // independently — a phrase that appears in both arrays should survive
+  // in titledPhrases even if it was already seen in phrases.
+  const _dedup = arr => {
+    const seen = new Set();
+    return arr.filter(p => { const k = p.toLowerCase(); if (seen.has(k)) return false; seen.add(k); return true; });
+  };
+  const _result = { phrases: _dedup(phrases), titledPhrases: _dedup(titledPhrases) };
+  // Debug: log what was extracted so we can diagnose titled=0 cases
+  logger.info(`[playwright.agent] _extractGoalPhrases: phrases=${JSON.stringify(_result.phrases)} titledPhrases=${JSON.stringify(_result.titledPhrases)} goalSnippet="${(goal || '').slice(0, 200)}"`);
+  return _result;
+}
+
+// Verify that the goal was actually achieved on the current page.
+// Two tiers:
+//   Tier 1 (DOM, deterministic, ~50ms): one page.evaluate collecting
+//     - document.title
+//     - visible NON-MODAL input values (exclude inputs inside [role=dialog] /
+//       [aria-modal="true"]) — typing into a modal's input doesn't count
+//     - title-ish input values (inputs whose aria-label/placeholder/name/id
+//       matches /title|name|subject|rename/i) — these count even if inside a
+//       dialog, because some legit flows (calendar event, rename dialog) put
+//       the title input in a modal
+//     - body.innerText
+//   Then location-aware matching:
+//     - titledPhrases must be in document.title OR a title-ish input value
+//     - other phrases must be in body.innerText OR a non-modal input value
+//     - missing phrases → fail
+//   Tier 2 (VLM, only when no phrases extracted OR Tier 1 inconclusive):
+//     Playwright page.screenshot + _vlmVerifyScreenshot. VLM false → fail,
+//     true → pass, null (unavailable) → don't fail on VLM's account.
+//
+// Returns { pass: bool, reason: string, source: 'dom'|'vlm'|'inconclusive',
+//           matchedPhrases: string[], missingPhrases: string[] }.
+async function _verifyGoalCompletion({ goal, sessionId, headed, pageType }) {
+  const { phrases, titledPhrases } = _extractGoalPhrases(goal);
+  const _logTag = '[playwright.agent] goal verification';
+
+  let _page = null;
+  try { _page = engine.getPage(sessionId); } catch (_) {}
+
+  // ── Tier 1: DOM check ──
+  if (phrases.length > 0) {
+    let _dom = null;
+    if (_page) {
+      try {
+        _dom = await _page.evaluate(() => {
+          const isInsideModal = (el) => {
+            let cur = el;
+            while (cur) {
+              if (cur.getAttribute && (cur.getAttribute('role') === 'dialog' || cur.getAttribute('aria-modal') === 'true')) return true;
+              cur = cur.parentElement;
+            }
+            return false;
+          };
+          const isTitleish = (el) => {
+            const attrs = [el.getAttribute('aria-label'), el.getAttribute('placeholder'), el.getAttribute('name'), el.id].filter(Boolean).join(' ').toLowerCase();
+            return /title|name|subject|rename|document/i.test(attrs);
+          };
+          const parts = [];
+          parts.push('TITLE:' + (document.title || ''));
+          // Non-modal visible input values
+          const inputs = Array.from(document.querySelectorAll('input, textarea'));
+          for (const el of inputs) {
+            // Skip hidden/zero-size inputs (Google Docs carries hidden title input)
+            const rect = el.getBoundingClientRect();
+            if (rect.width === 0 && rect.height === 0) continue;
+            if (el.type === 'hidden' || el.disabled) continue;
+            const inModal = isInsideModal(el);
+            const titleish = isTitleish(el);
+            const val = (el.value || '').slice(0, 300);
+            if (!val) continue;
+            // Title-ish inputs count even in modals (rename dialog, event title).
+            // Non-title inputs only count when NOT in a modal.
+            if (titleish || !inModal) {
+              parts.push('INPUT:' + (titleish ? '[titleish]' : '[nonmodal]') + ' ' + val);
+            }
+          }
+          // Fix N: Contenteditable title elements — Notion's title is an H1 with
+          // role=textbox and placeholder="New page", NOT an <input>/<textarea>.
+          // Without this, titled phrases ("Weekly Goals") are never checked against
+          // the contenteditable title → verification fails even if title is correct.
+          const _ceTitleEls = Array.from(document.querySelectorAll('[contenteditable="true"], [role="textbox"]')).filter(el => {
+            const r = el.getBoundingClientRect();
+            if (r.width === 0 || r.height === 0) return false;
+            if (isInsideModal(el)) return false;
+            const tag = el.tagName.toLowerCase();
+            const attrs = [el.getAttribute('aria-label'), el.getAttribute('placeholder'), el.getAttribute('aria-placeholder')].filter(Boolean).join(' ').toLowerCase();
+            const isTitleTag = tag === 'h1' || tag === 'h2';
+            const isTitleAttr = /title|name|subject|rename|document|page title|untitled|new page/i.test(attrs);
+            return isTitleTag || isTitleAttr;
+          });
+          for (const el of _ceTitleEls) {
+            const val = (el.innerText || el.textContent || '').slice(0, 300);
+            if (val) parts.push('INPUT:[titleish] ' + val); // Reuse titleish format for titled-phrase matching
+          }
+          // Contenteditable text (first visible one)
+          const ce = Array.from(document.querySelectorAll('[contenteditable="true"]')).find(e => {
+            const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0;
+          });
+          if (ce) parts.push('CE:' + (ce.innerText || ce.textContent || '').slice(0, 1000));
+          // Body innerText
+          parts.push('BODY:' + (document.body?.innerText || '').slice(0, 3000));
+          return parts.join('\n');
+        }).catch(() => null);
+      } catch (_) {}
+    }
+    if (!_dom) {
+      // Fallback: session not engine-owned — use browserAct evaluate for the DOM check.
+      // The browser.act layer can interact with ANY session (engine-owned or not).
+      try {
+        const _baRes = await browserAct({ action: 'evaluate', text: `(() => {
+          const isInsideModal = (el) => {
+            let cur = el;
+            while (cur) {
+              if (cur.getAttribute && (cur.getAttribute('role') === 'dialog' || cur.getAttribute('aria-modal') === 'true')) return true;
+              cur = cur.parentElement;
+            }
+            return false;
+          };
+          const isTitleish = (el) => {
+            const attrs = [el.getAttribute('aria-label'), el.getAttribute('placeholder'), el.getAttribute('name'), el.id].filter(Boolean).join(' ').toLowerCase();
+            return /title|name|subject|rename|document/i.test(attrs);
+          };
+          const parts = [];
+          parts.push('TITLE:' + (document.title || ''));
+          const inputs = Array.from(document.querySelectorAll('input, textarea'));
+          for (const el of inputs) {
+            const rect = el.getBoundingClientRect();
+            if (rect.width === 0 && rect.height === 0) continue;
+            if (el.type === 'hidden' || el.disabled) continue;
+            const inModal = isInsideModal(el);
+            const titleish = isTitleish(el);
+            const val = (el.value || '').slice(0, 300);
+            if (!val) continue;
+            if (titleish || !inModal) {
+              parts.push('INPUT:' + (titleish ? '[titleish]' : '[nonmodal]') + ' ' + val);
+            }
+          }
+          const _ceTitleEls = Array.from(document.querySelectorAll('[contenteditable="true"], [role="textbox"]')).filter(el => {
+            const r = el.getBoundingClientRect();
+            if (r.width === 0 || r.height === 0) return false;
+            if (isInsideModal(el)) return false;
+            const tag = el.tagName.toLowerCase();
+            const attrs = [el.getAttribute('aria-label'), el.getAttribute('placeholder'), el.getAttribute('aria-placeholder')].filter(Boolean).join(' ').toLowerCase();
+            const isTitleTag = tag === 'h1' || tag === 'h2';
+            const isTitleAttr = /title|name|subject|rename|document|page title|untitled|new page/i.test(attrs);
+            return isTitleTag || isTitleAttr;
+          });
+          for (const el of _ceTitleEls) {
+            const val = (el.innerText || el.textContent || '').slice(0, 300);
+            if (val) parts.push('INPUT:[titleish] ' + val);
+          }
+          const ce = Array.from(document.querySelectorAll('[contenteditable="true"]')).find(e => {
+            const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0;
+          });
+          if (ce) parts.push('CE:' + (ce.innerText || ce.textContent || '').slice(0, 1000));
+          parts.push('BODY:' + (document.body?.innerText || '').slice(0, 3000));
+          return parts.join('\\n');
+        })()`, sessionId, headed, timeoutMs: 5000 }).catch(() => ({ ok: false }));
+        if (_baRes?.ok) {
+          _dom = typeof _baRes.result === 'string' ? _baRes.result.replace(/^"|"$/g, '') : String(_baRes.result || '');
+        }
+      } catch (_) {}
+    }
+
+    if (_dom) {
+      const _domLower = _dom.toLowerCase();
+      const _titleLower = ((_dom.match(/^TITLE:.*$/m) || [''])[0].slice(6) || '').toLowerCase();
+      // Pull title-ish input values as an array (trimmed) for exact-match checks
+      const _titleishArr = (_dom.split('\n')
+        .filter(l => l.startsWith('INPUT:[titleish]'))
+        .map(l => l.replace(/^INPUT:\[titleish\]\s*/, '').toLowerCase().trim())
+        .filter(Boolean));
+      // Joined version kept for backward-compat logging
+      const _titleishVals = _titleishArr.join(' ');
+      // Non-modal input values + CE + body
+      const _nonModalLower = _dom.split('\n')
+        .filter(l => l.startsWith('INPUT:[nonmodal]') || l.startsWith('CE:') || l.startsWith('BODY:'))
+        .map(l => l.replace(/^INPUT:\[nonmodal\]\s*|^CE:\s*|^BODY:\s*/, ''))
+        .join('\n')
+        .toLowerCase();
+
+      const matched = [];
+      const missing = [];
+      for (const p of phrases) {
+        const pLower = p.toLowerCase();
+        const isTitled = titledPhrases.some(tp => tp.toLowerCase() === pLower);
+        if (isTitled) {
+          // For titled phrases ("titled 'X'"), the title should BE X — not just
+          // contain X embedded in a default value. Containment (includes) would
+          // pass for "Untitled dQ3 Planning Notesocument" (append) and
+          // "Q3 Planning NotesUntitled document" (prepend). Instead:
+          //   - Input values: exact match (after trim)
+          //   - document.title: exact match OR starts with phrase + remainder
+          //     matches a separator pattern ( - , | , — , – ) to allow the common
+          //     "Title - AppName" suffix that browsers add to document.title.
+          // Language-agnostic — no hardcoded default-name or app-name patterns.
+          const _inputExact = _titleishArr.some(v => v === pLower);
+          const _titleTrim = _titleLower.trim();
+          const _titleExact = _titleTrim === pLower;
+          // Allow "Phrase - AppName" / "Phrase | AppName" / "Phrase — AppName" suffix
+          const _titleWithSuffix = _titleTrim.length > pLower.length &&
+            _titleTrim.startsWith(pLower) &&
+            /^\s*(?:-|\||—|–)\s+\S/.test(_titleTrim.slice(pLower.length));
+          if (_inputExact || _titleExact || _titleWithSuffix) {
+            matched.push(p);
+          } else {
+            missing.push(p);
+          }
+        } else {
+          // Must be in body text, contenteditable, or non-modal input value
+          if (_nonModalLower.includes(pLower)) {
+            matched.push(p);
+          } else {
+            missing.push(p);
+          }
+        }
+      }
+      if (missing.length === 0) {
+        // ── Structural completeness gate (Fix 3) ──
+        // Phrase matching found everything, but the goal may have unverified
+        // structural requirements (list with N items). Keep the turn-loop going
+        // until satisfied.
+        // Fix 37: Removed menuOpen gate — it produced false positives on apps
+        // with always-visible combobox/option elements (Google Docs toolbar).
+        // The list intent gate handles the Notion slash command case. If the
+        // text is in the DOM, it's committed — the goal is achieved.
+        let _gate = { listIntent: false, required: 0, found: 0 };
+        if (_page) {
+          _gate = await _page.evaluate((goalText) => {
+            // List/todo count — only when goal has list intent
+            const _numWords = { one:1, two:2, three:3, four:4, five:5, six:6, seven:7, eight:8, nine:9, ten:10 };
+            const _listIntent = /\b(to-?do\s+list|todo\s+list|checklist|task\s+list|to-?dos?|bullets?|numbered\s+list)\b/i.test(goalText);
+            let _required = 0;
+            if (_listIntent) {
+              const _cntRe = /\b(\d+|one|two|three|four|five|six|seven|eight|nine|ten)\s+(?:items?|todos?|to-dos?|tasks?|entries|things)/i;
+              const _cm = goalText.match(_cntRe);
+              if (_cm) {
+                const _w = _cm[1].toLowerCase();
+                _required = /^\d+$/.test(_w) ? parseInt(_w,10) : (_numWords[_w] || 0);
+              }
+              if (_required === 0) _required = 1; // list intent but no count → at least 1
+            }
+            let _found = 0;
+            if (_listIntent && _required > 0) {
+              const _root = document.querySelector('.notion-page-content') ||
+                document.querySelector('[data-content-editable-root]') ||
+                document.querySelector('main') || document.body;
+              if (_root) {
+                _found = _root.querySelectorAll('[role="checkbox"]').length;
+                if (_found === 0) _found = _root.querySelectorAll('li, [role="listitem"]').length;
+              }
+            }
+            return { listIntent: _listIntent, required: _required, found: _found };
+          }, goal || '').catch(() => ({ listIntent: false, required: 0, found: 0 }));
+        } else {
+          // Fallback: session not engine-owned — use browserAct evaluate for the structural gate
+          try {
+            const _baRes = await browserAct({ action: 'evaluate', text: `(() => {
+              const goalText = ${JSON.stringify(goal || '')};
+              const _numWords = { one:1, two:2, three:3, four:4, five:5, six:6, seven:7, eight:8, nine:9, ten:10 };
+              const _listIntent = /\\b(to-?do\\s+list|todo\\s+list|checklist|task\\s+list|to-?dos?|bullets?|numbered\\s+list)\\b/i.test(goalText);
+              let _required = 0;
+              if (_listIntent) {
+                const _cntRe = /\\b(\\d+|one|two|three|four|five|six|seven|eight|nine|ten)\\s+(?:items?|todos?|to-dos?|tasks?|entries|things)/i;
+                const _cm = goalText.match(_cntRe);
+                if (_cm) {
+                  const _w = _cm[1].toLowerCase();
+                  _required = /^\\d+$/.test(_w) ? parseInt(_w,10) : (_numWords[_w] || 0);
+                }
+                if (_required === 0) _required = 1;
+              }
+              let _found = 0;
+              if (_listIntent && _required > 0) {
+                const _root = document.querySelector('.notion-page-content') ||
+                  document.querySelector('[data-content-editable-root]') ||
+                  document.querySelector('main') || document.body;
+                if (_root) {
+                  _found = _root.querySelectorAll('[role="checkbox"]').length;
+                  if (_found === 0) _found = _root.querySelectorAll('li, [role="listitem"]').length;
+                }
+              }
+              return JSON.stringify({ listIntent: _listIntent, required: _required, found: _found });
+            })()`, sessionId, headed, timeoutMs: 5000 }).catch(() => ({ ok: false }));
+            if (_baRes?.ok) {
+              const _raw = typeof _baRes.result === 'string' ? _baRes.result.replace(/^"|"$/g, '') : String(_baRes.result || '{}');
+              try { _gate = JSON.parse(_raw); } catch (_) {}
+            }
+          } catch (_) {}
+        }
+
+        if (_gate.listIntent && _gate.found < _gate.required) {
+          logger.warn(`${_logTag}: BLOCKED (DOM) — all phrases found but list incomplete: found=${_gate.found} required=${_gate.required}`);
+          return { pass: false, reason: `List incomplete: found ${_gate.found} of ${_gate.required} required items`, source: 'dom', matchedPhrases: matched, missingPhrases: [] };
+        }
+
+        logger.info(`${_logTag}: PASS (DOM) — all ${phrases.length} phrase(s) found [titled=${titledPhrases.length}] matched=${JSON.stringify(matched)} gate=passed(list=${_gate.found}/${_gate.required})`);
+        return { pass: true, reason: `All ${phrases.length} goal phrase(s) found in expected locations`, source: 'dom', matchedPhrases: matched, missingPhrases: [] };
+      }
+      // Phrases extracted but some missing → FAIL (don't fall through to VLM,
+      // because the DOM check is authoritative when phrases exist).
+      logger.warn(`${_logTag}: FAIL (DOM) — ${missing.length}/${phrases.length} phrase(s) missing [titled=${titledPhrases.length}] missing=${JSON.stringify(missing)} title="${_titleLower.slice(0,80)}" titleishVals="${_titleishVals.slice(0,80)}"`);
+      return { pass: false, reason: `Goal phrases missing from expected locations: ${missing.join(', ')}`, source: 'dom', matchedPhrases: matched, missingPhrases: missing };
+    }
+    // DOM check errored → fall through to VLM
+    logger.warn(`${_logTag}: DOM check errored — falling back to VLM`);
+  } else {
+    logger.info(`${_logTag}: no phrases extracted from goal — using VLM only`);
+  }
+
+  // ── Tier 2: VLM screenshot grading ──
+  try {
+    const _ssRes = await browserAct({ action: 'screenshot', sessionId, headed, timeoutMs: 5000 }).catch(() => ({ ok: false }));
+    if (!_ssRes.ok || !_ssRes.result) {
+      logger.warn(`${_logTag}: VLM tier skipped — screenshot failed`);
+      return { pass: false, reason: 'goal verification inconclusive (no phrases, screenshot failed)', source: 'inconclusive', matchedPhrases: [], missingPhrases: phrases };
+    }
+    const _vlm = await _vlmVerifyScreenshot(_ssRes.result, goal, pageType);
+    if (_vlm && _vlm.verified === true) {
+      logger.info(`${_logTag}: PASS (VLM) — ${_vlm.reasoning || 'screenshot matches goal'} (conf=${_vlm.confidence})`);
+      return { pass: true, reason: `VLM verified: ${_vlm.reasoning || 'screenshot matches goal'}`, source: 'vlm', matchedPhrases: [], missingPhrases: [] };
+    }
+    if (_vlm && _vlm.verified === false) {
+      logger.warn(`${_logTag}: FAIL (VLM) — ${_vlm.reasoning || 'screenshot does not match goal'} (conf=${_vlm.confidence})`);
+      return { pass: false, reason: `VLM failed: ${_vlm.reasoning || 'screenshot does not match goal'}`, source: 'vlm', matchedPhrases: [], missingPhrases: phrases };
+    }
+    // VLM null/unavailable — can't confirm or deny
+    logger.warn(`${_logTag}: inconclusive (VLM unavailable/uncertain) — not failing on VLM's account`);
+    return { pass: false, reason: 'goal verification inconclusive (no phrases, VLM unavailable)', source: 'inconclusive', matchedPhrases: [], missingPhrases: phrases };
+  } catch (e) {
+    logger.warn(`${_logTag}: VLM tier error (non-fatal): ${e.message}`);
+    return { pass: false, reason: `goal verification error: ${e.message}`, source: 'inconclusive', matchedPhrases: [], missingPhrases: phrases };
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Script-URL fast path — deterministic compose-and-submit (no LLM needed)
 // Called when URL matches a compose pattern and goal has extractable text.
 // Uses Playwright Node API directly for speed (2-5s vs 30-120s LLM path).
@@ -2823,6 +4464,13 @@ async function _showOverlay() {
 
 // Capture screen via screen.analyze (port 3008) with overlay hidden.
 // Returns { ok, text, appName, url, confidence } or { ok:false, error }.
+//
+// NOTE: This is the OS-level capture path. It hides the ThinkDrop overlay (POST
+// /overlay/hide) before the screenshot and re-shows it after — which causes the
+// unified window to flicker. For browser.agent runs (where playwright owns the
+// page), prefer _ocrCaptureViaPage() which uses Playwright page.screenshot() +
+// LiteParse and never touches the overlay. This function is now only the fallback
+// for paths that have no engine page (rare).
 async function _ocrCapture() {
   const SCREEN_HOST = process.env.SCREEN_SERVICE_HOST || '127.0.0.1';
   const SCREEN_PORT = parseInt(process.env.SCREEN_INTEL_PORT || '3008', 10);
@@ -2845,14 +4493,64 @@ async function _ocrCapture() {
   }
 }
 
+// Page-level OCR capture: Playwright page.screenshot() → LiteParse CLI.
+// Returns the same shape as _ocrCapture ({ ok, text, appName?, url?, confidence? })
+// so callers can be swapped transparently. No overlay hide/show — the screenshot
+// is taken from inside the playwright-owned page, so the Electron overlay never
+// appears in it. Falls back to _ocrCapture() (OS-level, with overlay hide) only
+// when no engine page is available for the session.
+//
+// Accepts either a sessionId (string) or a Playwright page object. When given a
+// sessionId, resolves the engine page; when given a page, uses it directly.
+async function _ocrCaptureViaPage(sessionIdOrPage = 'playwright_agent') {
+  let _page = null;
+  if (sessionIdOrPage && typeof sessionIdOrPage === 'object' && typeof sessionIdOrPage.screenshot === 'function') {
+    _page = sessionIdOrPage;
+  } else {
+    try { _page = engine.getPage(sessionIdOrPage); } catch (_) {}
+  }
+  if (!_page) {
+    // No engine page — fall back to OS-level capture (rare; only outside browser.agent).
+    return _ocrCapture();
+  }
+  try {
+    const _cap = await _liteparseCapture(_page);
+    if (!_cap.ok) return { ok: false, error: _cap.error || 'liteparse capture failed' };
+    // Recover the live URL for callers that use it (e.g. _ocrVerify logging).
+    let _url = null;
+    try { _url = await _page.evaluate(() => window.location.href).catch(() => null); } catch (_) {}
+    return {
+      ok: true,
+      text: _cap.fullText || '',
+      // LiteParse doesn't surface appName/confidence — leave undefined so callers
+      // that log them degrade gracefully.
+      appName: undefined,
+      url: _url,
+      confidence: undefined,
+    };
+  } catch (e) {
+    return { ok: false, error: `liteparse capture error: ${e.message}` };
+  }
+}
+
 // ---------------------------------------------------------------------------
-// OCR-based verification — uses screen-intelligence-service (screen.analyze)
-// and user-memory-service (getRecentOcr) to verify what's visible on screen.
-// Two-tier: getRecentOcr (free, may be stale) → screen.analyze (fresh, 2-5s).
+// OCR-based verification — uses user-memory-service (getRecentOcr) and
+// page-level LiteParse capture (_ocrCaptureViaPage) to verify what's visible.
+// Two-tier: getRecentOcr (free, may be stale) → page LiteParse (fresh, no overlay hide).
 // ---------------------------------------------------------------------------
 
 // Shared selectors — used by every frame-aware DOM helper below.
-const _MODAL_SEL = '[role="dialog"], [aria-modal="true"], [role="alertdialog"], .artdeco-modal, [data-testid*="modal"], [data-testid*="share"], .share-creation, #interop-outlet';
+// _MODAL_SEL_GENERIC: standard ARIA modal selectors — work across all apps.
+// _MODAL_SEL_BROAD:   generic + app-specific extensions (.artdeco-modal for LinkedIn,
+//   .share-creation / #interop-outlet for LinkedIn share dialogs). Used in broadened
+//   detection where the extra selectors catch edge cases without false-positiving on
+//   apps that use standard ARIA dialogs.
+const _MODAL_SEL_GENERIC = '[role="dialog"], [aria-modal="true"], [role="alertdialog"], [data-testid*="modal"], [data-testid*="share"]';
+const _MODAL_SEL_BROAD = _MODAL_SEL_GENERIC + ', .artdeco-modal, .share-creation, #interop-outlet';
+// Default: use the broad selector for backward compatibility (existing callers expect
+// _MODAL_SEL to include the app-specific extensions). New code should prefer
+// _MODAL_SEL_GENERIC for standard detection, _MODAL_SEL_BROAD for fallback/broadened.
+const _MODAL_SEL = _MODAL_SEL_BROAD;
 const _COMPOSE_SEL = '[contenteditable="true"], [contenteditable=""], .ql-editor, [role="textbox"], [role="searchbox"], [role="combobox"], textarea, input[type="text"], input[type="search"]';
 // Labels that START a flow (or cancel it) and must never be clicked as a submit.
 const _START_LABEL_RE = /^(start a post|start|new|compose|write|log ?in|sign ?in|cancel|close|discard|go back|back|dismiss|next|add a photo|add media)\b/i;
@@ -3375,8 +5073,7 @@ async function _ocrVerify(expectText, typeTs, page) {
         const _modalSelectors = [
           '[role="dialog"]', '[aria-modal="true"]', '[role="alertdialog"]',
           '[data-testid*="modal"]', '[data-testid*="dialog"]', '[data-testid*="share"]',
-          '.modal', '.dialog', '.overlay', '[class*="modal"]', '[class*="dialog"]',
-          '#interop-outlet', '.share-creation'
+          '.modal', '.dialog', '.overlay', '[class*="modal"]', '[class*="dialog"]'
         ];
         for (const sel of _modalSelectors) {
           if (document.querySelector(sel)) return true;
@@ -3429,17 +5126,18 @@ async function _ocrVerify(expectText, typeTs, page) {
     }
   } catch (e) { /* non-fatal — fall through to screen.analyze */ }
 
-  // Tier 2: Fresh screen.analyze via _ocrCapture
+  // Tier 2: Fresh page-level capture via _ocrCaptureViaPage (Playwright screenshot → LiteParse).
+  // Falls back to OS-level _ocrCapture (screen.analyze + overlay hide) only when no page is available.
   try {
-    const _cap = await _ocrCapture();
+    const _cap = await _ocrCaptureViaPage(page);
     if (!_cap.ok) return { success: false, error: _cap.error };
     const _ocrLower = _cap.text.toLowerCase();
     const _fuzzy = _fuzzyMatch(_ocrLower);
     const _verified = _fuzzy.match || _modalPresent;
-    logger.info(`[playwright.agent] OCR verify (screen.analyze): verified=${_verified} fuzzy=${_fuzzy.match}(${_fuzzy.source}) modalPresent=${_modalPresent} app=${_cap.appName} url=${_cap.url} conf=${_cap.confidence} textLen=${_cap.text.length} textPreview="${_cap.text.slice(0, 200).replace(/\n/g, ' ')}..."`);
-    return { success: true, verified: _verified, hasText: _verified, source: `screen.analyze-${_fuzzy.source || (_modalPresent ? 'modal' : 'none')}` };
+    logger.info(`[playwright.agent] OCR verify (page-liteparse): verified=${_verified} fuzzy=${_fuzzy.match}(${_fuzzy.source}) modalPresent=${_modalPresent} app=${_cap.appName} url=${_cap.url} conf=${_cap.confidence} textLen=${_cap.text.length} textPreview="${_cap.text.slice(0, 200).replace(/\n/g, ' ')}..."`);
+    return { success: true, verified: _verified, hasText: _verified, source: `page-liteparse-${_fuzzy.source || (_modalPresent ? 'modal' : 'none')}` };
   } catch (e) {
-    logger.warn(`[playwright.agent] OCR verify (screen.analyze) failed: ${e.message}`);
+    logger.warn(`[playwright.agent] OCR verify (page-liteparse) failed: ${e.message}`);
     return { success: false, error: e.message };
   }
 }
@@ -4272,8 +5970,53 @@ AVAILABLE ACTIONS (injection-first - prefer these over snapshot-ref actions):
                     Use scope to limit search to a container (e.g. modal) to avoid wrong matches.
   clickBySelector { "action": "clickBySelector", "selector": "button[type='submit']" }
                   - Click by CSS selector directly.
+  press           { "action": "press", "key": "Enter" }
+                  - Press a keyboard key (Enter, Tab, Escape, ArrowDown, etc.). CRITICAL for
+                    committing inputs that only persist on Enter/blur (e.g. Google Docs rename,
+                    search bars). After reactFill on an <input>, press Enter to commit if the
+                    site requires it. Also use for dismissing modals (Escape) or navigating
+                    autocomplete (ArrowDown + Enter).
+  type            { "action": "type", "text": "hello" }
+                  - Type into the currently-focused element. Fallback when reactFill can't
+                    resolve a selector. Depends on focus state — focus the target first.
+  fill            { "action": "fill", "selector": "e12", "text": "hello" }
+                  - React-aware fill using a snapshot ref. Use when you have a ref from the snapshot.
+  click           { "action": "click", "selector": "e12" }
+                  - Click using a snapshot ref. Use refs from the ARIA snapshot.
+  dblclick        { "action": "dblclick", "selector": "e12" }
+                  - Double-click using a snapshot ref.
+  hover           { "action": "hover", "selector": "e12" }
+                  - Hover an element (to reveal menus/tooltips).
+  select          { "action": "select", "selector": "e12", "value": "option" }
+                  - Select an <option> in a <select>.
+  scroll          { "action": "scroll", "dy": 500 }
+                  - Scroll the page (dy in pixels; negative scrolls up).
+  check           { "action": "check", "selector": "e12" }
+  uncheck         { "action": "uncheck", "selector": "e12" }
+                  - Check/uncheck a checkbox.
+  getPageText     { "action": "getPageText" }
+                  - Read all visible text on the page. Use to verify content or for read tasks.
+  waitForStableText { "action": "waitForStableText" }
+                  - Wait for the page to stop mutating (streaming content, lazy load).
+  waitForContent  { "action": "waitForContent", "text": "Done" }
+                  - Wait until the given text appears on the page.
   waitForElement  { "action": "waitForSelector", "selector": "..." }
                   - Wait for an element to appear.
+  tab-select      { "action": "tab-select", "index": 0 }
+                  - Switch browser tab by index.
+  tab-new         { "action": "tab-new", "url": "..." }
+  tab-close       { "action": "tab-close" }
+                  - Open/close browser tabs.
+  back            { "action": "back" }
+  forward         { "action": "forward" }
+  reload          { "action": "reload" }
+                  - Browser history navigation / reload.
+  dialog-accept   { "action": "dialog-accept" }
+  dialog-dismiss  { "action": "dialog-dismiss" }
+                  - Accept/dismiss a native browser dialog (alert/confirm/prompt).
+  screenshot      { "action": "screenshot" }
+                  - Capture a screenshot (returned in the result). Rarely needed — the loop
+                    already captures OCR each turn when warranted.
   snapshot        { "action": "snapshot" }
                   - Re-read the page if you need to see updated state. RARELY needed.
   navigate        { "action": "navigate", "url": "..." }
@@ -4290,11 +6033,55 @@ RULES:
 - Use clickByText for submit buttons (NOT click with refs - refs may be stale).
 - For submit buttons inside modals, use scope='[role="dialog"]' to avoid matching
   buttons outside the modal (e.g. "Repost" on a feed when you want "Post" in the modal).
+- IMPORTANT: Some inputs (title fields, search bars, rename dialogs) only commit on
+  Enter or blur. If reactFill reports verified=true but the page text/OCR still shows
+  the OLD value on the next turn, follow reactFill with { "action": "press", "key": "Enter" }
+  to commit, then re-check. Do NOT repeat the same reactFill — it will not help.
 - After each action, you'll see the result. Adapt based on what happened.
 - When the goal is achieved, output { "action": "return", "data": "what you did" }.
 - The ARIA snapshot may NOT show contenteditable elements. If the PAGE TEXT or PROBE
   shows a compose box (contenteditable=true, role=textbox), use reactFill with the
   indicated selector even if it's not in the ARIA snapshot.
+- HIDDEN ELEMENT RULE: If an action fails with "element is not visible" or "not
+  interactable", OR if reactFill reports verified=true but the OCR/page text doesn't
+  show the expected change, the element is likely hidden by a UI mode (compact mode,
+  collapsed toolbar, minimized section). Do NOT repeat the same action. Instead:
+  (a) check the APP KNOWLEDGE block for known keyboard shortcuts or UI mode toggles,
+  (b) press a keyboard shortcut to toggle the UI mode (e.g. { "action": "press", "key": "Control+Shift+F" } for compact mode in many editors),
+  (c) look for a toggle/expand/collapse button in the snapshot and click it,
+  (d) press Ctrl+/ or ? to open the app's shortcut help overlay,
+  (e) check the OCR — if the expected UI area (title bar, toolbar) is missing from
+      the screen, a UI mode is hiding it. After revealing the element, retry the action.
+- CLEAR-BEFORE-FILL RULE: When filling a title, rename, or any input field that
+  already has a value (e.g. "Untitled document", "Untitled", existing text), NEVER
+  use "type" — it appends to the existing value, producing garbage like
+  "Untitled dQ3 Planning Notesocument". Instead use "fill" (which does Meta+A + type
+  to replace) or "reactFill" (which replaces via native setter with clearFirst). If
+  you must use "type", first press { "action": "press", "key": "Meta+a" } to select
+  all existing text, then type the new value.
+- MULTI-CONTENTEDITABLE RULE: When the page has multiple contenteditable elements (e.g.
+  title H1 + body DIV, or To/Subject/Body in email compose), do NOT use generic
+  "[contenteditable='true']" — it matches the FIRST in document order, which may be the
+  body, not the title. Use the SELECTOR HINTS which list each contenteditable with its
+  distinguishing attribute (placeholder, aria-label, role, tag). For title/rename tasks,
+  prefer "h1[contenteditable]", "[placeholder='New page']", or the tag-specific selector.
+  For body/content tasks, target the body element specifically by role or aria-label. If
+  reactFill returns a "warning" field, the selector matched multiple elements — switch to
+  a more specific selector immediately.
+- SEARCH-THEN-CLICK RULE: After filling a search box and pressing Enter, ALWAYS run
+  waitForStableText before clicking a result. Search results load dynamically — if you
+  click before results settle, you may click a stale element or the search box itself.
+  After results load, identify the first ORGANIC result (skip ads/sponsored) by its
+  link/text and click it.
+- BLOCK-CREATION RULE: When creating lists/todos in block-based editors (Notion, Google
+  Docs, Confluence), do NOT type raw markdown like "- Task 1\n- Task 2\n- Task 3" as a
+  single type action — newlines inside a contenteditable do NOT create separate blocks.
+  Instead, create each item as a separate step: (1) type the block-creation shortcut for
+  the desired block type (e.g. "[]" + Space for todo, "-" + Space for bullet, "/todo" +
+  Enter for slash command), (2) type the item text, (3) press Enter to create the next
+  block, (4) repeat for each item. Check the APP KNOWLEDGE section for the app's specific
+  block-creation shortcuts — if slash commands are available (e.g. "/todo"), prefer them
+  over markdown shortcuts.
 
 Output ONLY the JSON action object, no markdown, no explanation.`;
 
@@ -4330,7 +6117,7 @@ RULES:
 
 Return JSON: {"steps": [...], "thoughts": "brief explanation"}`;
 
-async function _focusedPlanExecute({ goal, sessionId, headed, timeoutMs, agentContext, deadline, start, heartbeat, _ocrText, _domSignals }) {
+async function _focusedPlanExecute({ goal, verificationGoal, sessionId, headed, timeoutMs, agentContext, deadline, start, heartbeat, _ocrText, _domSignals }) {
   const _peStart = Date.now();
   logger.info(`[playwright.agent] focused Plan-Execute: starting for goal="${goal.slice(0, 80)}"`);
 
@@ -4370,9 +6157,15 @@ Generate 3-5 steps to complete this task.`;
     const _steps = _parsed.steps.slice(0, 5); // max 5 steps
     logger.info(`[playwright.agent] focused Plan-Execute: ${_steps.length} steps — ${_parsed.thoughts || 'no thoughts'}`);
 
-    // 3. Execute with verification
+    // 3. Execute with verification, with ONE replan attempt on step failure.
+    // On a failed step: take a fresh snapshot and ask the LLM to re-plan only the
+    // REMAINING steps (1 attempt). If the repair also fails, fall through to the
+    // turn-loop as before. This avoids throwing away a good 5-step plan over a
+    // single transient click failure (e.g. stale-visibility read).
     const _peTranscript = [];
-    for (let _i = 0; _i < _steps.length; _i++) {
+    let _replanned = false;
+    let _i = 0;
+    while (_i < _steps.length) {
       if (Date.now() > deadline) {
         logger.warn(`[playwright.agent] focused Plan-Execute: deadline exceeded at step ${_i + 1}`);
         return { ok: false, error: 'deadline exceeded', transcript: _peTranscript };
@@ -4384,12 +6177,58 @@ Generate 3-5 steps to complete this task.`;
       _peTranscript.push({ step: _i + 1, action: _step, outcome: { ok: _result.ok, error: _result.error, result: _result.result }, thoughts: `Plan-Execute step ${_i + 1}` });
 
       if (!_result.ok) {
-        logger.warn(`[playwright.agent] focused Plan-Execute: step ${_i + 1} failed — ${_result.error} — stopping`);
+        logger.warn(`[playwright.agent] focused Plan-Execute: step ${_i + 1} failed — ${_result.error}`);
+        // One replan attempt: re-snapshot + re-plan remaining steps from the fresh state.
+        if (!_replanned) {
+          _replanned = true;
+          logger.info(`[playwright.agent] focused Plan-Execute: attempting one replan (fresh snapshot + re-plan remaining ${_steps.length - _i} step(s))`);
+          try {
+            const _replanSnapRes = await browserAct({ action: 'snapshot', sessionId, headed, timeoutMs: 10000 }).catch(() => ({ ok: false }));
+            const _replanSnap = _replanSnapRes?.ok ? String(_replanSnapRes.result || '') : '';
+            const _replanPageText = await page.evaluate(() => document.body.innerText.slice(0, 3000)).catch(() => '');
+            const _failedStepNote = `The previous plan failed at step ${_i + 1} (${_step.action}) with error: ${_result.error}. The page state below is a FRESH snapshot taken after that failure.`;
+            const _replanPrompt = `GOAL: ${goal}
+${agentContext ? `\nAGENT CONTEXT:\n${agentContext}` : ''}
+${_ocrText ? `\nOCR SCREEN CAPTURE:\n${_ocrText.slice(0, 1000)}\n` : ''}
+${_domSignals ? `\nDOM STATE SIGNALS:\n${_domSignals.slice(0, 1000)}\n` : ''}
+${_failedStepNote}
+
+VISIBLE PAGE TEXT (first 2000 chars):
+${_replanPageText.slice(0, 2000)}
+
+ARIA SNAPSHOT (first 3000 chars):
+${_replanSnap.slice(0, 3000)}
+
+Generate 3-5 steps to complete this task FROM THE CURRENT PAGE STATE. The prior steps ${_i > 0 ? `(steps 1-${_i}) already succeeded — do NOT repeat them. ` : ''}Re-plan from here.`;
+
+            const _replanResponse = await askWithMessages([
+              { role: 'system', content: FOCUSED_PLAN_EXECUTE_PROMPT },
+              { role: 'user', content: _replanPrompt },
+            ], { temperature: 0.1, maxTokens: 800, responseTimeoutMs: 20000 });
+
+            const _replanParsed = parseJson(_replanResponse);
+            if (_replanParsed && Array.isArray(_replanParsed.steps) && _replanParsed.steps.length > 0) {
+              // Replace remaining steps with the re-planned steps and continue the loop.
+              _steps.splice(_i, _steps.length - _i, ..._replanParsed.steps.slice(0, 5));
+              logger.info(`[playwright.agent] focused Plan-Execute: replan produced ${_replanParsed.steps.length} fresh step(s) — ${_replanParsed.thoughts || 'no thoughts'}`);
+              _peTranscript.push({ step: _i + 1, action: { action: 'replan' }, outcome: { ok: true, result: `replanned ${_replanParsed.steps.length} steps` }, thoughts: `replan after step ${_i + 1} failure: ${_result.error}` });
+              // Do NOT increment _i — re-enter the loop at the same index with the new first step.
+              continue;
+            } else {
+              logger.warn(`[playwright.agent] focused Plan-Execute: replan returned no steps — falling back to turn-loop`);
+            }
+          } catch (_replanErr) {
+            logger.warn(`[playwright.agent] focused Plan-Execute: replan error: ${_replanErr.message} — falling back to turn-loop`);
+          }
+        }
+        // Replan already used (or failed) — stop and fall through to turn-loop.
+        logger.warn(`[playwright.agent] focused Plan-Execute: stopping after step ${_i + 1} failure — ${_result.error}`);
         return { ok: false, error: `step ${_i + 1} failed: ${_result.error}`, transcript: _peTranscript };
       }
 
       // Brief pause for UI to settle
       await page.waitForTimeout(1000);
+      _i++;
     }
 
     // 4. All steps succeeded — extract result if last step was getPageText
@@ -4400,8 +6239,52 @@ Generate 3-5 steps to complete this task.`;
     }
 
     const _execTime = Date.now() - _peStart;
-    logger.info(`[playwright.agent] focused Plan-Execute: completed in ${_execTime}ms`);
-    return { ok: true, result: _resultText, transcript: _peTranscript, routingDecision: 'focused_plan_execute' };
+
+    // 5. Goal verification (F7c) — confirm the goal was actually achieved, not
+    // just that every step returned ok=true. Location-aware: phrases from
+    // "titled X" must land in document.title or a title-ish input, not in a
+    // modal's input (the Find-and-replace trap). On fail, return ok:false so
+    // the caller falls through to the turn-loop instead of falsely reporting
+    // success. VLM arbitrates when no phrases are extractable.
+    let _goalVerify = null;
+    try {
+      // For send/submit goals, use unified action verification (B>D>A>C).
+      // Phrase matching would false-negative: if email was sent, text is gone → FAIL.
+      const _isSendSubmitGoal = /\b(send|post|submit|publish|dispatch|email|tweet|share|reply|comment)\b/i.test(goal);
+      if (_isSendSubmitGoal) {
+        // Extract expected text from goal (text after "saying" or "message" or quoted text)
+        const _expectedText = (goal.match(/(?:saying|message|body|content)\s+["']?([^"'.\n]+)["']?/i) || [])[1] ||
+          (goal.match(/["']([^"']{5,})["']/) || [])[1] || '';
+        _goalVerify = await _verifyActionCompletion({
+          goal: verificationGoal || goal, sessionId, headed, pageType: undefined,
+          submitClickTs: null, // no precise timestamp in Plan-Execute
+          expectedText: _expectedText,
+          isSendSubmitGoal: true,
+        });
+        // If action verification is inconclusive, fall back to phrase matching
+        if (!_goalVerify) {
+          _goalVerify = await _verifyGoalCompletion({ goal: verificationGoal || goal, sessionId, headed, pageType: undefined });
+        }
+      } else {
+        _goalVerify = await _verifyGoalCompletion({ goal: verificationGoal || goal, sessionId, headed, pageType: undefined });
+      }
+    } catch (_gvErr) {
+      logger.warn(`[playwright.agent] focused Plan-Execute: goal verification error (non-fatal): ${_gvErr.message}`);
+    }
+    if (_goalVerify && !_goalVerify.pass && _goalVerify.source !== 'inconclusive') {
+      logger.warn(`[playwright.agent] focused Plan-Execute: goal verification FAILED — ${_goalVerify.reason} — falling back to turn-loop`);
+      return {
+        ok: false,
+        error: `goal verification failed: ${_goalVerify.reason}`,
+        result: _resultText,
+        transcript: _peTranscript,
+        routingDecision: 'focused_plan_execute_goal_verify_fail',
+        executionTime: _execTime,
+      };
+    }
+    const _verifyNote = _goalVerify ? ` verified=${_goalVerify.pass} (${_goalVerify.source})` : '';
+    logger.info(`[playwright.agent] focused Plan-Execute: completed in ${_execTime}ms${_replanned ? ' (after 1 replan)' : ''}${_verifyNote}`);
+    return { ok: true, result: _resultText, transcript: _peTranscript, routingDecision: 'focused_plan_execute', goalVerified: _goalVerify?.pass || false };
 
   } catch (e) {
     logger.warn(`[playwright.agent] focused Plan-Execute error: ${e.message}`);
@@ -4409,11 +6292,26 @@ Generate 3-5 steps to complete this task.`;
   }
 }
 
-async function _executeTurnLoopFallback({ goal, sessionId, headed, timeoutMs, agentContext, transcript, deadline, start, extractedText, heartbeat, textAlreadyEntered, maxTurns = 8 }) {
+async function _executeTurnLoopFallback({ goal, verificationGoal, sessionId, headed, timeoutMs, agentContext, transcript, deadline, start, extractedText, heartbeat, textAlreadyEntered, maxTurns = 8, hostname }) {
   const MAX_TURNS = maxTurns;
   const _loopTranscript = [...transcript];
   let _lastActionSignature = null; // for duplicate detection
   let _lastStateHash = null;       // page state hash for no-op detection
+  // Stash for LLM return data that was rejected by goal verification. If the
+  // pre-exhaustion check later passes, this content (which often contains the
+  // extracted data the user actually wants) is used as the result instead of a
+  // generic "Goal verified" string — preventing data loss downstream.
+  let _rejectedReturnData = null;
+  // Cross-transcript action-signature repeat counter for no-progress detection.
+  // Key: "{action}|{selector}|{text}|{url}". Value: count of prior attempts with
+  // ok=true outcomes. The body.innerText hash the old guard relies on is unreliable
+  // on apps with live regions (Google Docs' body text mutates constantly), so we
+  // additionally bail when the SAME action signature repeats ≥3× without the goal
+  // being met — this stops the 14×-identical-reactFill failure mode.
+  const _actionSignatureCounts = new Map();
+  const _NO_PROGRESS_THRESHOLD = 3;       // hint after this many identical unproductive attempts
+  const _NO_PROGRESS_BAIL_THRESHOLD = 4;  // bail to ask_user after this many
+  let _noProgressHintInjected = false;
   logger.info(`[playwright.agent] turn-loop fallback: starting (max ${MAX_TURNS} turns) for goal="${goal.slice(0, 80)}"`);
 
   for (let turn = 1; turn <= MAX_TURNS; turn++) {
@@ -4571,20 +6469,26 @@ ${_composeSel ? `- SUGGESTED COMPOSE SELECTOR: ${_composeSel}` : ''}`;
     // OCR captures what's actually visible on screen — ground truth.
     let _ocrText = '';
     const _isFirstTurn = turn === 1;
-    // DOM disagrees: heartbeat says visibleModalCount=0 but probe found hasAnyModal=true
+    // DOM disagrees: heartbeat says visibleModalCount=0 but probe found a VISIBLE modal.
+    // Use _probe.hasModal (visibility-filtered via getBoundingClientRect) — NOT
+    // _probe.hasAnyModal, which counts hidden [role="dialog"] elements that some
+    // apps (e.g. Google Docs) always carry in the DOM. Counting those caused OCR
+    // to fire every turn and (with the old OS-level capture) flicker the overlay.
     const _lastTick = heartbeat?.buffer?.[heartbeat.buffer.length - 1];
     const _domDisagrees = _lastTick && _lastTick.visibleModalCount === 0 &&
-      _probe && _probe.hasAnyModal === true;
+      _probe && _probe.hasModal === true;
     // Last action failed
     const _lastAction = _loopTranscript[_loopTranscript.length - 1];
     const _actionFailed = _lastAction && _lastAction.outcome && !_lastAction.outcome.ok;
     if (_isFirstTurn || _domDisagrees || _actionFailed) {
       logger.info(`[playwright.agent] turn-loop: OCR capture triggered (firstTurn=${_isFirstTurn} domDisagrees=${!!_domDisagrees} actionFailed=${!!_actionFailed})`);
       try {
-        const _cap = await _ocrCapture();
+        // Page-level capture (Playwright screenshot → LiteParse) — no overlay hide/show, no flicker.
+        // Falls back to OS-level screen.analyze only when no engine page is available.
+        const _cap = await _ocrCaptureViaPage(sessionId);
         if (_cap.ok) {
           _ocrText = _cap.text.slice(0, 1500);
-          logger.info(`[playwright.agent] turn-loop: OCR captured ${_ocrText.length} chars (app=${_cap.appName} conf=${_cap.confidence}) textPreview="${_ocrText.slice(0, 300).replace(/\n/g, ' ')}..."`);
+          logger.info(`[playwright.agent] turn-loop: OCR captured ${_ocrText.length} chars (app=${_cap.appName} conf=${_cap.confidence} url=${_cap.url}) textPreview="${_ocrText.slice(0, 300).replace(/\n/g, ' ')}..."`);
         } else {
           logger.warn(`[playwright.agent] turn-loop: OCR capture failed: ${_cap.error}`);
         }
@@ -4653,8 +6557,8 @@ ${_composeSel ? `- SUGGESTED COMPOSE SELECTOR: ${_composeSel}` : ''}`;
     // actual task (type, click, etc.).
     const _actionGoal = goal
       .replace(/^.*?Navigate to .*?(?:homepage|page|site|dashboard|feed|inbox)\b[^.]*\.\s*/i, '')
-      .replace(/^.*?Open (?:LinkedIn|Twitter|Gmail|ChatGPT|Claude|Bluesky|Threads|Facebook|Instagram)\b[^.]*\.\s*/i, '')
-      .replace(/^.*?Go to (?:LinkedIn|Twitter|Gmail|ChatGPT|Claude|Bluesky|Threads|Facebook|Instagram)\b[^.]*\.\s*/i, '')
+      .replace(/^.*?Open [A-Z][A-Za-z]+\b[^.]*\.\s*/i, '')
+      .replace(/^.*?Go to [A-Z][A-Za-z]+\b[^.]*\.\s*/i, '')
       .trim();
     // If stripping removed everything, use the original goal
     const _effectiveGoal = _actionGoal.length > 10 ? _actionGoal : goal;
@@ -4669,11 +6573,26 @@ ${_composeSel ? `- SUGGESTED COMPOSE SELECTOR: ${_composeSel}` : ''}`;
       const _lastWithCompose = heartbeat.getLastComposeTick();
       if (_hasPostBtn || _hasAriaPost || _lastWithCompose) {
         const _hints = [];
-        if (_lastWithCompose && _lastWithCompose.composeDetails[0]) {
-          const c = _lastWithCompose.composeDetails[0];
-          if (c.ariaLabel) _hints.push(`reactFill { "action": "reactFill", "selector": "[aria-label='${c.ariaLabel}']", "text": "<TEXT>" }`);
-          if (c.role) _hints.push(`reactFill { "action": "reactFill", "selector": "[role='${c.role}']", "text": "<TEXT>" }`);
-          if (c.ce) _hints.push(`reactFill { "action": "reactFill", "selector": "[contenteditable='${c.ce}']", "text": "<TEXT>" }`);
+        if (_lastWithCompose && _lastWithCompose.composeDetails.length > 0) {
+          const _composeEls = _lastWithCompose.composeDetails;
+          const _multiCompose = _composeEls.length > 1;
+          // Generate hints for EACH compose element, labeled by distinguishing attribute.
+          // When multiple contenteditable elements exist (e.g. title H1 + body DIV),
+          // generic "[contenteditable='true']" matches the FIRST in document order —
+          // which may be the body, not the title. Use placeholder/aria-label/tag-specific
+          // selectors to disambiguate.
+          for (const c of _composeEls) {
+            const _label = c.placeholder || c.ariaLabel || c.role || c.tag;
+            if (c.placeholder) _hints.push(`reactFill for "${_label}": { "action": "reactFill", "selector": "[placeholder='${c.placeholder}']", "text": "<TEXT>" }`);
+            if (c.ariaLabel) _hints.push(`reactFill for "${_label}": { "action": "reactFill", "selector": "[aria-label='${c.ariaLabel}']", "text": "<TEXT>" }`);
+            // Tag-specific selector (e.g. h1[contenteditable]) — more specific than generic
+            if (c.ce && c.tag) _hints.push(`reactFill for "${_label}": { "action": "reactFill", "selector": "${c.tag.toLowerCase()}[contenteditable='${c.ce}']", "text": "<TEXT>" }`);
+          }
+          // Only add generic [contenteditable] if there's just ONE compose element
+          if (!_multiCompose) {
+            const c = _composeEls[0];
+            if (c.ce) _hints.push(`reactFill { "action": "reactFill", "selector": "[contenteditable='${c.ce}']", "text": "<TEXT>" }`);
+          }
         }
         if (_hasAriaPost) {
           const _ariaLabels = [...new Set(heartbeat.buffer.flatMap(t => (t.ariaPostEls || []).map(e => e.label)))].slice(0, 3);
@@ -4712,6 +6631,11 @@ CURRENT SNAPSHOT (ARIA - may not show contenteditable elements):
 ${_prunedSnap}
 
 ${_recentActions ? `RECENT ACTIONS:\n${_recentActions}\n` : ''}
+${_lastActionSignature === 'duplicate_noop' ? '\n⚠️ NO-PROGRESS WARNING: Your last action was a no-op (page state unchanged). Try a COMPLETELY different approach — different selector, different action type, or press Enter/Escape to commit/dismiss. Do NOT repeat the same action.\n' : ''}
+${_lastActionSignature && _lastActionSignature.startsWith('no_progress:') ? `\n🚫 STUCK WARNING: You have already tried "${_lastActionSignature.slice('no_progress:'.length)}" multiple times with ok=true but the goal is NOT met. The site is likely reverting your change (e.g. the value only commits on Enter/blur) or the element is hidden by a UI mode (compact mode, collapsed section). Try a COMPLETELY different approach: (a) press Enter to commit ({ "action": "press", "key": "Enter" }), (b) click a different element first to focus it, (c) use a different selector, (d) press a keyboard shortcut to toggle the UI mode (e.g. { "action": "press", "key": "Control+Shift+F" } for compact mode), or (e) if the goal is genuinely already met, return done. Do NOT repeat the same action.\n` : ''}
+${_lastActionSignature === 'return_rejected' ? '\n❌ RETURN REJECTED: You declared the goal done, but verification found the goal was NOT actually achieved (expected text is missing from the page/title). Do NOT return again until you have actually completed the task. Look at the PAGE TEXT and OCR above — if the expected title/text is not there, you need to do more work. If you typed text into the wrong field (e.g. a Find/Replace dialog instead of the title), close the dialog (press Escape) and try the correct element.\n' : ''}
+${_lastActionSignature && _lastActionSignature.startsWith('hidden_element:') ? `\n🔍 HIDDEN ELEMENT: The element "${_lastActionSignature.slice('hidden_element:'.length)}" exists in the DOM but is NOT VISIBLE. It may be hidden by a UI mode (compact mode, collapsed toolbar, minimized section) or by a parent container. Try: (a) press a keyboard shortcut to toggle the UI mode (e.g. { "action": "press", "key": "Control+Shift+F" } for compact mode in many editors), (b) look for a toggle/expand/collapse button in the snapshot and click it to reveal the element, (c) press Ctrl+/ or ? to open the app's keyboard shortcut help overlay to find the right shortcut, or (d) check the OCR — if the expected UI area (e.g. title bar, toolbar section) is missing from the screen, a UI mode is likely hiding it. Also check the APP KNOWLEDGE block above for known shortcuts and UI mode toggles for this app.\n` : ''}
+${_lastActionSignature && _lastActionSignature.startsWith('jit_fix:') ? `\n💡 JIT RESEARCH FIX: Web research found this specific fix for the current issue: ${_lastActionSignature.slice('jit_fix:'.length)} — apply this fix now.\n` : ''}
 Turn ${turn}/${MAX_TURNS}. What is your next action? (DO NOT snapshot - act directly)`;
 
     let _actionRaw;
@@ -4745,7 +6669,54 @@ Turn ${turn}/${MAX_TURNS}. What is your next action? (DO NOT snapshot - act dire
     // ── Done check ──
     if (_action.action === 'return') {
       const _result = String(_action.data || '').slice(0, 2000);
-      logger.info(`[playwright.agent] turn-loop: done at turn ${turn} — result="${_result.slice(0, 100)}"`);
+      // F7d: Verify the goal was actually achieved before accepting the LLM's
+      // self-declared "done". The LLM may declare done based on per-step ok=true
+      // even when the goal wasn't met (e.g. typed the title into the wrong field).
+      // Same _verifyGoalCompletion helper as Plan-Execute (F7c): Tier-1 DOM phrase
+      // check (location-aware) → Tier-2 VLM. On fail, reject the return and push
+      // a transcript note so the loop continues with a hint.
+      let _returnVerify = null;
+      try {
+        // For send/submit goals, use unified action verification (B>D>A>C)
+        const _isSendSubmitGoal = /\b(send|post|submit|publish|dispatch|email|tweet|share|reply|comment)\b/i.test(goal);
+        if (_isSendSubmitGoal) {
+          const _expectedText = (goal.match(/(?:saying|message|body|content)\s+["']?([^"'.\n]+)["']?/i) || [])[1] ||
+            (goal.match(/["']([^"']{5,})["']/) || [])[1] || '';
+          _returnVerify = await _verifyActionCompletion({
+            goal: verificationGoal || goal, sessionId, headed, pageType: undefined,
+            submitClickTs: null, expectedText: _expectedText, isSendSubmitGoal: true,
+          });
+          if (!_returnVerify) {
+            _returnVerify = await _verifyGoalCompletion({ goal: verificationGoal || goal, sessionId, headed, pageType: undefined });
+          }
+        } else {
+          _returnVerify = await _verifyGoalCompletion({ goal: verificationGoal || goal, sessionId, headed, pageType: undefined });
+        }
+      } catch (_rvErr) {
+        logger.warn(`[playwright.agent] turn-loop: return verification error (non-fatal): ${_rvErr.message}`);
+      }
+      if (_returnVerify && !_returnVerify.pass && _returnVerify.source !== 'inconclusive') {
+        // Deterministic fail — reject the return and keep looping with a hint.
+        const _missing = _returnVerify.missingPhrases.length > 0 ? ` Missing phrases: ${_returnVerify.missingPhrases.join(', ')}` : '';
+        logger.warn(`[playwright.agent] turn-loop: return REJECTED at turn ${turn} — goal verification failed (${_returnVerify.source}): ${_returnVerify.reason}.${_missing} — continuing loop`);
+        // Stash the rejected return data — it often contains the extracted
+        // content the user wants. If the pre-exhaustion check later passes,
+        // this is preferred over a generic "Goal verified" string so the data
+        // flows downstream to synthesize instead of being lost.
+        if (_result && _result.trim().length > 0) {
+          _rejectedReturnData = _result;
+        }
+        _loopTranscript.push({
+          action: { action: 'return', data: _result },
+          outcome: { ok: false, error: `goal not yet met — ${_returnVerify.reason}${_missing}` },
+          thoughts: `return rejected: ${_returnVerify.reason}`,
+        });
+        // Inject a hard hint for the next turn so the LLM doesn't just re-return.
+        _lastActionSignature = 'return_rejected';
+        continue;
+      }
+      const _vNote = _returnVerify ? ` verified=${_returnVerify.pass} (${_returnVerify.source})` : ' (verification inconclusive — accepting)';
+      logger.info(`[playwright.agent] turn-loop: done at turn ${turn} — result="${_result.slice(0, 100)}"${_vNote}`);
       return {
         ok: true,
         goal,
@@ -4755,6 +6726,7 @@ Turn ${turn}/${MAX_TURNS}. What is your next action? (DO NOT snapshot - act dire
         result: _result || 'Completed via turn-loop fallback',
         transcript: _loopTranscript,
         routingDecision: 'turn_loop_fallback',
+        goalVerified: _returnVerify?.pass || false,
         executionTime: Date.now() - start,
       };
     }
@@ -4810,8 +6782,132 @@ Turn ${turn}/${MAX_TURNS}. What is your next action? (DO NOT snapshot - act dire
 
     _loopTranscript.push({ action: _action, outcome: _outcome, verified: _outcome.verified });
 
+    // ── Slash-command settle: after pressing Enter to confirm a slash command ──
+    // (e.g. "/todo" in Notion), the app unmounts the slash-menu popup and remounts a
+    // new contenteditable block. If the next step types immediately, the first
+    // character can be dropped. Detect the pattern: previous action was type/fill/
+    // reactFill with text starting with "/", current action is press Enter.
+    if (_outcome.ok && _action.action === 'press' && String(_action.key).toLowerCase() === 'enter') {
+      const _prev = _loopTranscript[_loopTranscript.length - 2];
+      if (_prev && _prev.outcome?.ok && ['type', 'fill', 'reactFill'].includes(_prev.action?.action)) {
+        const _prevText = _prev.action?.text || '';
+        if (_prevText.trim().startsWith('/')) {
+          logger.info(`[playwright.agent] turn-loop: slash-command detected ("${_prevText.trim().slice(0, 20)}" + Enter) — waiting for block to settle`);
+          await _waitForSlashCommandSettled(sessionId, headed);
+        }
+      }
+    }
+
+    // ── Cross-transcript no-progress detection ──
+    // Count this action signature across the whole transcript (only ok=true attempts
+    // count — failures are already handled by the actionFailed OCR trigger). When the
+    // same action repeats ≥3× without the goal being met, inject a hard hint; at 4×,
+    // bail to ask_user instead of burning the remaining turns. This catches the
+    // failure mode where reactFill reports verified=true but the framework reverts the
+    // value (Google Docs rename) and the loop spins 14× on the identical no-op.
+    if (_outcome.ok && _action.action !== 'return' && _action.action !== 'snapshot' &&
+        _action.action !== 'getPageText' && _action.action !== 'waitForStableText' &&
+        _action.action !== 'waitForSelector' && _action.action !== 'waitForContent') {
+      const _sig = `${_action.action}|${_action.selector || ''}|${_action.text || ''}|${_action.url || ''}`;
+      const _count = (_actionSignatureCounts.get(_sig) || 0) + 1;
+      _actionSignatureCounts.set(_sig, _count);
+      if (_count >= _NO_PROGRESS_BAIL_THRESHOLD) {
+        logger.warn(`[playwright.agent] turn-loop: no-progress bail — action "${_action.action}" repeated ${_count}× without completing the goal — surfacing ask_user`);
+        return {
+          ok: false,
+          goal,
+          sessionId,
+          turns: _loopTranscript.length,
+          done: false,
+          result: `Turn-loop stalled: action "${_action.action}" (${_action.selector || _action.text || _action.url || ''}) repeated ${_count}× without completing the goal. The site may require a different commit mechanism (e.g. Enter/blur) or the element may not be interactable.`,
+          transcript: _loopTranscript,
+          error: 'turn_loop_no_progress',
+          routingDecision: 'turn_loop_fallback',
+          executionTime: Date.now() - start,
+        };
+      }
+      if (_count >= _NO_PROGRESS_THRESHOLD && !_noProgressHintInjected) {
+        logger.warn(`[playwright.agent] turn-loop: no-progress hint — action "${_action.action}" repeated ${_count}× with ok=true but goal not met — injecting hard hint`);
+        _noProgressHintInjected = true;
+        // If the repeated action is a fill/reactFill on a specific selector, the
+        // element is likely hidden (fill "succeeds" via native setter but the
+        // value isn't visible/committed because the element is hidden by a UI
+        // mode). Use the hidden_element hint instead of the generic no_progress
+        // hint — it tells the LLM to try keyboard shortcuts / toggles to reveal.
+        if ((_action.action === 'reactFill' || _action.action === 'fill') && _action.selector) {
+          _lastActionSignature = `hidden_element:${_action.selector}`;
+          logger.info(`[playwright.agent] turn-loop: reactFill repeated ${_count}× on "${_action.selector}" with ok=true but goal not met — element likely hidden, injecting hidden-element hint`);
+        } else {
+          // Inject hint into next turn via _lastActionSignature (read by the goal builder below)
+          _lastActionSignature = `no_progress:${_action.action}`;
+        }
+
+        // Just-in-time app-knowledge research: the agent is stuck — search for
+        // how to resolve this specific issue. If a fix is found, inject it as
+        // an additional hint for the next turn.
+        if (hostname && _justInTimeResearch) {
+          const _jitFix = await _justInTimeResearch({
+            hostname,
+            field: _action.selector || _action.action || 'goal',
+            goal,
+            failureContext: `Action "${_action.action}" (selector="${_action.selector || ''}", text="${_action.text || ''}") repeated ${_count}× with ok=true but goal not met. The element may be hidden, require a commit mechanism (Enter/blur), or need a UI toggle to reveal.`,
+            sessionId,
+          }).catch((_err) => { logger.warn(`[playwright.agent] turn-loop: JIT research error (non-fatal): ${_err.message}`); return null; });
+          if (_jitFix?.action) {
+            _loopTranscript.push({
+              action: { jit_research: _jitFix.action },
+              outcome: { ok: true, hint: `JIT research suggests: ${_jitFix.action}` },
+            });
+            // Inject the JIT fix as a stronger hint — overrides the generic no_progress hint
+            _lastActionSignature = `jit_fix:${_jitFix.action}`;
+            logger.info(`[playwright.agent] turn-loop: JIT research found fix — injecting as hint: ${_jitFix.action}`);
+          }
+        }
+      }
+    }
+
     if (!_outcome.ok) {
       logger.warn(`[playwright.agent] turn-loop: action ${_action.action} failed at turn ${turn}: ${_outcome.error}`);
+      // Hidden-element detection: when an action fails with "not visible" or a
+      // visibility-related error, the element exists in the DOM but is hidden by
+      // a UI mode (compact mode, collapsed toolbar, minimized section). Flag it
+      // so the next turn injects a hidden-element hint telling the LLM to try
+      // keyboard shortcuts or toggle buttons to reveal it.
+      if (_outcome.error && /not visible|hidden|display.*none|visibility|not interactable|element.*not.*stable/i.test(_outcome.error)) {
+        const _hiddenSel = _action.selector || _action.action;
+        _lastActionSignature = `hidden_element:${_hiddenSel}`;
+        logger.info(`[playwright.agent] turn-loop: hidden-element detected — element "${_hiddenSel}" not visible (likely hidden by UI mode) — will inject hint next turn`);
+
+        // Just-in-time app-knowledge research: the element is hidden — search for
+        // how to reveal/locate it. Detect element type from the action and selector.
+        if (hostname && _justInTimeResearch && !_noProgressHintInjected) {
+          const _sel = _action.selector || '';
+          const _elementType = (() => {
+            if (/select|dropdown|combobox|listbox/i.test(_sel)) return 'dropdown';
+            if (/menu|menubar|menuitem/i.test(_sel)) return 'menu';
+            if (/button|btn|submit|send|post|save|click/i.test(_sel) || _action.action === 'click') return 'button';
+            if (/toggle|switch|checkbox|radio/i.test(_sel)) return 'toggle';
+            return 'element';
+          })();
+          const _jitFix = await _justInTimeResearch({
+            hostname,
+            field: _hiddenSel,
+            elementType: _elementType,
+            goal,
+            failureContext: `Action "${_action.action}" on selector "${_hiddenSel}" failed: ${_outcome.error}. The element exists in the DOM but is not visible/interactable — it may be hidden by a UI mode (compact mode, collapsed toolbar) or require a specific action to reveal.`,
+            sessionId,
+          }).catch((_err) => { logger.warn(`[playwright.agent] turn-loop: JIT research error (non-fatal): ${_err.message}`); return null; });
+          if (_jitFix?.action) {
+            _loopTranscript.push({
+              action: { jit_research: _jitFix.action },
+              outcome: { ok: true, hint: `JIT research suggests: ${_jitFix.action}` },
+            });
+            _lastActionSignature = `jit_fix:${_jitFix.action}`;
+            _noProgressHintInjected = true; // prevent duplicate JIT research on next turn
+            logger.info(`[playwright.agent] turn-loop: JIT research found fix for hidden ${_elementType} — injecting as hint: ${_jitFix.action}`);
+          }
+        }
+      }
       // Continue to next turn — the loop will reassess from a fresh snapshot
     } else {
       // Surface verified status — ok && !verified means "unconfirmed", not "succeeded"
@@ -4852,39 +6948,90 @@ Turn ${turn}/${MAX_TURNS}. What is your next action? (DO NOT snapshot - act dire
 
   // Max turns reached — run a pre-exhaustion completion check before declaring failure.
   // The goal may already be satisfied (e.g., text was typed but the LLM never emitted
-  // a 'return' action). Check page text against goal keywords.
+  // a 'return' action). Use the location-aware _verifyGoalCompletion first (same as
+  // the return-check), then fall back to the relaxed body.innerText check only if
+  // location-aware was inconclusive (e.g. no titled phrases, no title input found).
   logger.warn(`[playwright.agent] turn-loop: reached max turns (${MAX_TURNS}) — running pre-exhaustion completion check`);
   try {
     const _ePage = engine.getPage(sessionId);
     if (_ePage) {
-      const _finalPageText = await _ePage.evaluate(() => document.body.innerText.slice(0, 3000)).catch(() => '');
-      // Extract key phrases from the goal (text in quotes, or significant words)
-      const _goalPhrases = [];
-      const _quotedPhrases = goal.match(/["']([^"']+)["']/g);
-      if (_quotedPhrases) _goalPhrases.push(..._quotedPhrases.map(p => p.replace(/["']/g, '')));
-      // Also extract words after "titled", "called", "named", "add"
-      const _titledMatch = goal.match(/\b(?:titled|called|named|add)\s+["']?([^"'.\n]+?)["']?(?:\s+(?:and|then|with|to|under)|$)/i);
-      if (_titledMatch) _goalPhrases.push(_titledMatch[1].trim());
-      // Check if all key phrases appear in the page text
-      if (_goalPhrases.length > 0) {
-        const _pageLower = _finalPageText.toLowerCase();
-        const _matchedPhrases = _goalPhrases.filter(p => p.length > 2 && _pageLower.includes(p.toLowerCase()));
-        const _matchRatio = _matchedPhrases.length / _goalPhrases.length;
-        if (_matchRatio >= 0.5) {
-          logger.info(`[playwright.agent] turn-loop: pre-exhaustion check PASSED — ${_matchedPhrases.length}/${_goalPhrases.length} goal phrases found in page text (ratio=${_matchRatio.toFixed(2)})`);
-          return {
-            ok: true,
-            goal,
-            sessionId,
-            turns: _loopTranscript.length,
-            done: true,
-            result: `Goal appears satisfied — ${_matchedPhrases.length}/${_goalPhrases.length} key phrases found in page text. Page content: ${_finalPageText.slice(0, 500)}`,
-            transcript: _loopTranscript,
-            routingDecision: 'turn_loop_pre_exhaustion_pass',
-            executionTime: Date.now() - start,
-          };
+      // ── Tier 1: Location-aware verification (same as return-check) ──
+      // This catches false positives where the goal phrase appears in the wrong
+      // location (e.g. "Weekly Goals" typed into the body instead of the title).
+      let _preExhaustionVerify = null;
+      try {
+        // For send/submit goals, use unified action verification (B>D>A>C)
+        const _isSendSubmitGoal = /\b(send|post|submit|publish|dispatch|email|tweet|share|reply|comment)\b/i.test(goal);
+        if (_isSendSubmitGoal) {
+          const _expectedText = (goal.match(/(?:saying|message|body|content)\s+["']?([^"'.\n]+)["']?/i) || [])[1] ||
+            (goal.match(/["']([^"']{5,})["']/) || [])[1] || '';
+          _preExhaustionVerify = await _verifyActionCompletion({
+            goal: verificationGoal || goal, sessionId, headed, pageType: undefined,
+            submitClickTs: null, expectedText: _expectedText, isSendSubmitGoal: true,
+          });
+          if (!_preExhaustionVerify) {
+            _preExhaustionVerify = await _verifyGoalCompletion({ goal: verificationGoal || goal, sessionId, headed, pageType: undefined });
+          }
         } else {
-          logger.info(`[playwright.agent] turn-loop: pre-exhaustion check FAILED — only ${_matchedPhrases.length}/${_goalPhrases.length} goal phrases found (ratio=${_matchRatio.toFixed(2)})`);
+          _preExhaustionVerify = await _verifyGoalCompletion({ goal: verificationGoal || goal, sessionId, headed, pageType: undefined });
+        }
+      } catch (_veErr) {
+        logger.warn(`[playwright.agent] turn-loop: pre-exhaustion location-aware check error (non-fatal): ${_veErr.message}`);
+      }
+      if (_preExhaustionVerify && _preExhaustionVerify.pass) {
+        logger.info(`[playwright.agent] turn-loop: pre-exhaustion check PASSED (location-aware: ${_preExhaustionVerify.source}) — goal verified`);
+        // Capture actual page content so it flows downstream to synthesize
+        // instead of returning a generic "Goal verified" string with no data.
+        // Priority: fresh page text > rejected return data > generic string.
+        let _preExhaustionPageText = '';
+        try {
+          _preExhaustionPageText = await _ePage.evaluate(() => document.body.innerText.slice(0, 5000)).catch(() => '');
+        } catch (_) {}
+        const _preExhaustionResult = (_preExhaustionPageText && _preExhaustionPageText.trim().length > 0)
+          ? _preExhaustionPageText
+          : (_rejectedReturnData || `Goal verified via location-aware check (${_preExhaustionVerify.source}).`);
+        return {
+          ok: true,
+          goal,
+          sessionId,
+          turns: _loopTranscript.length,
+          done: true,
+          result: _preExhaustionResult,
+          transcript: _loopTranscript,
+          routingDecision: 'turn_loop_pre_exhaustion_pass',
+          goalVerified: true,
+          executionTime: Date.now() - start,
+        };
+      }
+      logger.info(`[playwright.agent] turn-loop: pre-exhaustion location-aware check: ${_preExhaustionVerify ? `FAIL (${_preExhaustionVerify.source}: ${_preExhaustionVerify.reason})` : 'inconclusive'} — trying relaxed body text check`);
+
+      // ── Tier 2: Relaxed body.innerText check (fallback) ──
+      // Only used when location-aware was inconclusive (no titled phrases, no title
+      // input found on page). Checks if 50%+ of goal phrases appear anywhere in
+      // body text — best-effort early-exit for goals without title-targeted phrases.
+      if (!_preExhaustionVerify || _preExhaustionVerify.source === 'inconclusive') {
+        const _finalPageText = await _ePage.evaluate(() => document.body.innerText.slice(0, 3000)).catch(() => '');
+        const { phrases: _goalPhrases } = _extractGoalPhrases(verificationGoal || goal);
+        if (_goalPhrases.length > 0) {
+          const _pageLower = _finalPageText.toLowerCase();
+          const _matchedPhrases = _goalPhrases.filter(p => p.length > 2 && _pageLower.includes(p.toLowerCase()));
+          const _matchRatio = _matchedPhrases.length / _goalPhrases.length;
+          if (_matchRatio >= 0.5) {
+            logger.info(`[playwright.agent] turn-loop: pre-exhaustion check PASSED (relaxed) — ${_matchedPhrases.length}/${_goalPhrases.length} goal phrases found in page text (ratio=${_matchRatio.toFixed(2)})`);
+            return {
+              ok: true,
+              goal,
+              sessionId,
+              turns: _loopTranscript.length,
+              done: true,
+              result: `Goal appears satisfied — ${_matchedPhrases.length}/${_goalPhrases.length} key phrases found in page text. Page content: ${_finalPageText.slice(0, 500)}`,
+              transcript: _loopTranscript,
+              routingDecision: 'turn_loop_pre_exhaustion_pass',
+              executionTime: Date.now() - start,
+            };
+          } else {
+            logger.info(`[playwright.agent] turn-loop: pre-exhaustion check FAILED — only ${_matchedPhrases.length}/${_goalPhrases.length} goal phrases found (ratio=${_matchRatio.toFixed(2)})`);
+          }
         }
       }
     }
@@ -4945,11 +7092,11 @@ class _PageHeartbeat {
     const _tickNum = this.tickCount;
     try {
       const state = await page.evaluate(() => {
-        // Broadened modal detection — LinkedIn may use various selectors
+        // Broadened modal detection — uses generic ARIA + class-based patterns
         const modals = Array.from(document.querySelectorAll(
           '[role="dialog"], [aria-modal="true"], [data-testid*="modal"], [data-testid*="share"], ' +
-          '[class*="modal"][class*="share"], [class*="compose"][class*="modal"], .share-creation, ' +
-          '#interop-outlet > div, [aria-labelledby*="share"], [aria-labelledby*="compose"]'
+          '[class*="modal"][class*="share"], [class*="compose"][class*="modal"], ' +
+          '[aria-labelledby*="share"], [aria-labelledby*="compose"]'
         ));
         const visibleModals = modals.filter(m => {
           if (m.getAttribute('aria-hidden') === 'true') return false;
@@ -5068,6 +7215,7 @@ async function playwrightAgent(args) {
     sessionId             = 'playwright_agent',
     agentId               = sessionId,
     agentContext,
+    appKnowledgeEntries,
     maxRepairs            = 2,
     maxTurns              = 8,
     timeoutMs             = 15000,
@@ -5082,6 +7230,9 @@ async function playwrightAgent(args) {
 
   const start = Date.now();
   const _deadline = start + overallTimeoutMs;
+  // Track whether JIT research was attempted during this run — included in ask_user message.
+  // Reset at the start of each playwrightAgent run (module-level var set by _justInTimeResearch).
+  _jitResearchAttemptedFlag = false;
   function _checkDeadline() {
     if (Date.now() > _deadline) {
       logger.warn(`[playwright.agent] overall timeout (${overallTimeoutMs}ms) exceeded — aborting`);
@@ -5111,11 +7262,14 @@ async function playwrightAgent(args) {
   // (re-running the SAME agent step with [Resume context: Q&A]) instead of
   // treating the answer as a brand-new task.
   function _failureAskUser(reason) {
+    const _jitNote = _jitResearchAttemptedFlag
+      ? `\n\nI also tried looking up how to resolve this on ${hostname || 'this site'} via web research, but didn't find a specific fix.`
+      : '';
     return {
       ok: false,
       askUser: true,
       trainingHandoff: true,
-      question: `I wasn't able to complete this step automatically.\n\nReason: ${reason}\n\nWhat would you like to do? You can also type what went wrong and I'll retry with your correction.`,
+      question: `I wasn't able to complete this step automatically.\n\nReason: ${reason}${_jitNote}\n\nWhat would you like to do? You can also type what went wrong and I'll retry with your correction.`,
       options: [
         { label: 'Try again', value: 'try_again' },
         { label: 'Correct and retry (tell me what was missed)', value: 'correct_and_retry' },
@@ -5262,7 +7416,11 @@ async function playwrightAgent(args) {
     // Passive read verbs — extract content from the current page without interaction
     const _browseRe = /\bsummarize\b|\bread\b|\bshow me\b|\bbrowse\b|\bhow many\b|\bcount\b|\btell me what's on\b|\btell me what is on\b|\bwhat's on this page\b|\bwhat is on this page\b|\bextract content\b|\bget page text\b/i;
     // Mutation verbs — if present, don't take the browse shortcut
-    const _composeRe2 = /\bpost\b|\bsend\b|\bcompose\b|\btweet\b|\bshare\b|\bwrite\b|\bcreate\b|\bsubmit\b|\bemail\b|\bmessage\b|\bdraft\b/i;
+    // "ask" is included because chatbot-prompt tasks ("Ask Claude to summarize X")
+    // require typing+submitting a prompt — they are NOT passive page reads even
+    // though they often contain passive verbs like "summarize" (that verb describes
+    // what the chatbot does, not what the agent does).
+    const _composeRe2 = /\bpost\b|\bsend\b|\bcompose\b|\btweet\b|\bshare\b|\bwrite\b|\bcreate\b|\bsubmit\b|\bemail\b|\bmessage\b|\bdraft\b|\bask\b/i;
     // Search-criteria patterns — if present, the task needs a search/filter applied first
     const _searchCriteriaRe = /\bunread|starred|label:|tag:|from:|to:|subject:|is:unread|is:read|has:|since:|before:|after:|category:|not from|but not from|excluding\b/i;
     // Check if the current URL already has a search query applied
@@ -5278,10 +7436,13 @@ async function playwrightAgent(args) {
     const _isBrowseMatch = _browseRe.test(goal);
     const _hasMutation = _composeRe2.test(goal);
     const _hasSearchCriteria = _searchCriteriaRe.test(goal);
-    // Take the browse shortcut only if: passive read verb AND no mutation AND
-    // (no search criteria OR the URL already has a search query applied)
-    if (_isBrowseMatch && !_hasMutation && (!_hasSearchCriteria || _urlHasSearchQuery)) {
-      logger.info(`[playwright.agent] browse/read task detected — extracting content (no turn-loop) [searchCriteria=${_hasSearchCriteria} urlHasQuery=${_urlHasSearchQuery}]`);
+    // Take the browse shortcut when: no mutation AND (passive read verb OR the
+    // URL already has a search query applied). When the deep-link URL already
+    // loaded the search results (e.g. #search/is:unread from:pastor wendal),
+    // just extract — don't fall through to Plan-Execute which would re-type the
+    // planner's (possibly worse) query and override the correct results.
+    if (!_hasMutation && (_isBrowseMatch || _urlHasSearchQuery)) {
+      logger.info(`[playwright.agent] browse/read task detected — extracting content (no turn-loop) [browseMatch=${_isBrowseMatch} searchCriteria=${_hasSearchCriteria} urlHasQuery=${_urlHasSearchQuery}]`);
       try {
         const _browsePage = engine.getPage(sessionId);
         if (_browsePage) {
@@ -5289,9 +7450,9 @@ async function playwrightAgent(args) {
           await _browsePage.waitForTimeout(2000); // extra settle for dynamic content
           const _pageText = await _browsePage.evaluate(() => document.body.innerText.slice(0, 8000)).catch(() => '');
           let _ocrText = '';
-          try { const _cap = await _ocrCapture(); if (_cap.ok) _ocrText = _cap.text.slice(0, 3000); } catch (_) {}
+          try { const _cap = await _ocrCaptureViaPage(_browsePage); if (_cap.ok) _ocrText = _cap.text.slice(0, 3000); } catch (_) {}
           const _content = _pageText || _ocrText || '(no content extracted)';
-          logger.info(`[playwright.agent] browse/read: extracted ${_pageText.length} chars DOM + ${_ocrText.length} chars OCR`);
+          logger.info(`[playwright.agent] browse/read: extracted ${_pageText.length} chars DOM + ${_ocrText.length} chars OCR (page-liteparse)`);
           _heartbeat.stop();
           return {
             ok: true,
@@ -5308,7 +7469,7 @@ async function playwrightAgent(args) {
       } catch (_browseErr) {
         logger.warn(`[playwright.agent] browse/read task error (non-fatal): ${_browseErr.message} — falling through`);
       }
-    } else if (_hasSearchCriteria && !_urlHasSearchQuery) {
+    } else if (_hasSearchCriteria && !_urlHasSearchQuery && !_isBrowseMatch) {
       logger.info(`[playwright.agent] search-criteria task detected but URL has no search query — falling through to Plan-Execute (not taking browse shortcut)`);
     }
   }
@@ -5446,21 +7607,46 @@ async function playwrightAgent(args) {
     }
   }
 
-  // ── Tier 1.5: Deterministic selector map for form/compose URLs ──────────────
+  // ── Tier 1.5: Deterministic field map for form/compose URLs AND editor pages ──
   // After URL-first navigation + waitForStableText, try cached or LLM-generated
-  // selector map for type→verify→submit→verify. Falls through to Tier 2/3 on failure.
+  // field map for type→verify→submit→verify. Falls through to Tier 2/3 on failure.
+  // Extended: also handles URL-first pages with editable fields (Notion, Google Docs,
+  // etc.) — uses placeholder + position as primary, CSS selectors as fallback.
   if (url && hostname && engine.isSessionActive(sessionId)) {
     try {
       const _curUrl = await _engineEval(sessionId, 'window.location.href');
       const _actualUrl = _curUrl?.ok ? String(_curUrl.result).trim().replace(/^"|"$/g, '') : url;
-      if (isFormUrl(url) || isFormUrl(_actualUrl)) {
-        logger.info(`[playwright.agent] Tier 1.5: form URL detected (url=${url} actualUrl=${_actualUrl}) — trying deterministic selector map`);
-        const _tier15Result = await _deterministicSelectorPath(sessionId, url, goal, hostname, timeoutMs);
+      const _isFormUrl = isFormUrl(url) || isFormUrl(_actualUrl);
+      // Structural editor page detection: editable fields (app-agnostic).
+      // _probeResult is not yet defined at this point (it's initialized later at line ~6977).
+      // Use a quick inline probe via _engineEval — just 3 DOM queries to check for editable fields.
+      const _quickProbeRes = await _engineEval(sessionId, `JSON.stringify({
+        hasContentEditable: document.querySelector('[contenteditable="true"]') !== null,
+        hasPlaceholder: document.querySelector('[placeholder]') !== null,
+        textInputCount: document.querySelectorAll('input[type="text"], input:not([type]), textarea').length,
+      })`);
+      let _quickProbe = null;
+      if (_quickProbeRes?.ok && _quickProbeRes.result) {
+        try { _quickProbe = JSON.parse(String(_quickProbeRes.result)); } catch (_) {}
+      }
+      const _hasEditableFields = _quickProbe &&
+        (_quickProbe.hasContentEditable || _quickProbe.hasPlaceholder || (_quickProbe.textInputCount || 0) > 0);
+      // Skip field map for read/extract tasks — no fields to fill.
+      // Read tasks (search, extract, check) don't need to type into fields;
+      // they need to READ content. Firing the field map on a search results
+      // page causes 15s timeouts trying to fill non-existent "body" fields.
+      const _hasReadVerbT15 = /\b(extract|read|search|find|check|list|show|display|look\s+up|pull\s+up|fetch|retrieve|count|how many|browse|summarize)\b/i.test(goal);
+      const _hasMutationVerbT15 = /\b(send|post|compose|tweet|share|write|create|submit|publish|edit|update|delete|remove|add|fill|type|reply|comment|draft|rename|move|sort|format|forward)\b/i.test(goal);
+      if (_hasReadVerbT15 && !_hasMutationVerbT15) {
+        logger.info(`[playwright.agent] Tier 1.5: read/extract task — skipping field map (no fields to fill)`);
+      } else if (_isFormUrl || _hasEditableFields) {
+        logger.info(`[playwright.agent] Tier 1.5: ${_isFormUrl ? 'form URL' : 'editable page'} detected (url=${url} actualUrl=${_actualUrl}) — trying deterministic field map`);
+        const _tier15Result = await _deterministicSelectorPath(sessionId, _actualUrl || url, goal, hostname, timeoutMs, { hasEditableFields: _hasEditableFields, agentContext, appKnowledgeEntries });
         if (_tier15Result) {
           _tier15Result.executionTime = Date.now() - start;
           return _tier15Result;
         }
-        logger.info(`[playwright.agent] Tier 1.5: selector map did not complete — falling through to Tier 2/3`);
+        logger.info(`[playwright.agent] Tier 1.5: field map did not complete — falling through to Tier 2/3`);
       }
     } catch (_tier15Err) {
       logger.warn(`[playwright.agent] Tier 1.5 error (non-fatal): ${_tier15Err.message} — falling through`);
@@ -5490,7 +7676,7 @@ async function playwrightAgent(args) {
         let _textPayload = goal
           .replace(/^(?:please\s+)?(?:can\s+you\s+)?(?:I\s+want\s+to\s+|I'd\s+like\s+to\s+)?/i, '')
           .replace(/^(?:post|share|update|tweet|send|write|say|ask|tell|search\s+for|query|look\s+up|find|message)\s+/i, '')
-          .replace(/^(?:on\s+|to\s+|in\s+)?(?:linkedin|twitter|x\.com|chatgpt|claude|grok|perplexity|gmail|outlook|notion|slack|discord|bluesky|threads|facebook|instagram)\s+/i, '')
+          .replace(/^(?:on\s+|to\s+|in\s+)?[a-z][a-z0-9.]+\s+/i, '')
           .replace(/^(?:that|about|regarding|saying)\s+/i, '')
           .replace(/^(?:to\s+|with\s+|for\s+)/i, '')
           .trim();
@@ -5648,7 +7834,7 @@ async function playwrightAgent(args) {
                 let _textPayload = goal
                   .replace(/^(?:please\s+)?(?:can\s+you\s+)?(?:I\s+want\s+to\s+|I'd\s+like\s+to\s+)?/i, '')
                   .replace(/^(?:post|share|update|tweet|send|write|say|ask|tell|search\s+for|query|look\s+up|find|message)\s+/i, '')
-                  .replace(/^(?:on\s+|to\s+|in\s+)?(?:linkedin|twitter|x\.com|chatgpt|claude|grok|perplexity|gmail|outlook|notion|slack|discord|bluesky|threads|facebook|instagram)\s+/i, '')
+                  .replace(/^(?:on\s+|to\s+|in\s+)?[a-z][a-z0-9.]+\s+/i, '')
                   .replace(/^(?:that|about|regarding|saying)\s+/i, '')
                   .replace(/^(?:to\s+|with\s+|for\s+)/i, '')
                   .trim();
@@ -5824,41 +8010,28 @@ async function playwrightAgent(args) {
       }
     }
 
-    if (_pageType === 'canvas' && !_scriptResult?.ok) {
+    // Structural pattern: "URL-first landed us on a page with a contenteditable textbox
+    // that has a placeholder" = "fresh editor page where keyboard-only is appropriate."
+    // App-agnostic — no app-name checks. Applies to ANY app matching this pattern:
+    // Notion (new page), LinkedIn (compose), X (compose), Google Docs (new doc), etc.
+    // Fallback safety: if the task needs clicks, bestEffortKeyboard fails → falls through to Tier 3.
+    const _keyboardEligible = _pageType === 'canvas' ||
+      (_pageType === 'hybrid' && _urlFirst && _probeResult?.hasContentEditable &&
+       _probeResult?.roleTextboxCount >= 1 && _probeResult?.hasPlaceholder);
+    if (_keyboardEligible && !_scriptResult?.ok) {
       // Tier 2.5: Best-effort keyboard mode (no script or script failed)
       _routingDecision = 'tier2_5_keyboard';
-      logger.info(`[playwright.agent] routing: Tier 2.5 (best-effort keyboard) — service=${_service || 'unknown'}, pageType=${_pageType}`);
+      logger.info(`[playwright.agent] routing: Tier 2.5 (best-effort keyboard) — service=${_service || 'unknown'}, pageType=${_pageType}, keyboardEligible=${_keyboardEligible}`);
 
       // Phase 10: Queue async script generation for this service so next run can use Tier 2
       if (_service && !_matchedScript) {
         queueAsyncScriptGeneration(_service, _pageType, goal, _taskKeywords);
       }
 
-      // Try sync script generation first (generates + caches a script)
-      if (_service) {
-        _scriptResult = await syncScriptGeneration(goal + _partialProgressNote, _pageType, _service, sessionId, headed, timeoutMs);
-        if (_scriptResult.ok) {
-          logger.info(`[playwright.agent] Tier 2.5 sync gen succeeded — ${_scriptResult.transcript?.length || 0} steps`);
-          // Phase 8: Verification layer
-          const _verify = await verifyTierCompletion(goal, _pageType, _routingDecision, null, sessionId, headed, timeoutMs);
-          if (_verify.fail) {
-            logger.warn(`[playwright.agent] verification layer: FAIL after Tier 2.5 sync gen — ${_verify.reason} — trying best-effort keyboard`);
-          } else {
-            return {
-              ok: true, goal, sessionId,
-              turns: _scriptResult.transcript?.length || 0, done: true,
-              result: `Completed via sync-generated script${_verify.warn ? ' (warning: ' + _verify.reason + ')' : ''}`,
-              transcript: _scriptResult.transcript || [],
-              routingDecision: _routingDecision,
-              pageType: _pageType,
-              verification: _verify,
-              executionTime: Date.now() - start,
-            };
-          }
-        }
-        logger.warn(`[playwright.agent] Tier 2.5 sync gen failed: ${_scriptResult.error} — trying best-effort keyboard`);
-        if (!_partialProgressNote) _partialProgressNote = _buildPartialProgressNote(_scriptResult?.transcript, 'keyboard-script');
-      }
+      // Sync script generation removed — it generated app-specific scripts with
+      // hardcoded placeholders that were often wrong (e.g. getByPlaceholder('Untitled')
+      // vs Notion's "New page"), wasting 30s. Tier 1.5 (field map) now handles
+      // form/editor pages deterministically. Go straight to best-effort keyboard.
 
       // Fall back to best-effort keyboard
       // ── Fresh-line guard: if this is a retry continuing a prior partial attempt,
@@ -5874,8 +8047,49 @@ async function playwrightAgent(args) {
       const _bestEffort = await bestEffortKeyboard(goal + _partialProgressNote, _pageType, sessionId, headed, timeoutMs);
       if (_bestEffort.ok) {
         logger.info(`[playwright.agent] Tier 2.5 best-effort keyboard succeeded — ${_bestEffort.transcript.length} steps`);
-        // Phase 8: Verification layer
-        const _verify = await verifyTierCompletion(goal, _pageType, _routingDecision, null, sessionId, headed, timeoutMs);
+
+        // Detect send/submit goals and extract verification signals from transcript
+        const _isSendSubmitGoal = /\b(send|post|submit|publish|dispatch|email|tweet|share|reply|comment)\b/i.test(goal);
+        let _verify = null;
+        if (_isSendSubmitGoal) {
+          // Extract submit click timestamp: find the last Control+Enter / Enter press in transcript
+          let _submitClickTs = null;
+          let _expectedText = '';
+          for (const entry of _bestEffort.transcript || []) {
+            if (entry.action?.press && /enter/i.test(entry.action.press)) {
+              _submitClickTs = entry.outcome?.ts || Date.now();
+            }
+            if (entry.action?.type) {
+              _expectedText = entry.action.type; // last typed text (usually the body/message)
+            }
+          }
+          // Wait briefly for network requests to complete after submit
+          await new Promise(r => setTimeout(r, 2000));
+          _verify = await _verifyActionCompletion({
+            goal, sessionId, headed, pageType: _pageType,
+            submitClickTs: _submitClickTs,
+            expectedText: _expectedText,
+            isSendSubmitGoal: true,
+          });
+          if (_verify && _verify.pass === false) {
+            logger.warn(`[playwright.agent] action verification: FAIL after Tier 2.5 best-effort — ${_verify.reason} — falling back to Tier 3 (LLM)`);
+          } else if (_verify && _verify.pass === true) {
+            return {
+              ok: true, goal, sessionId,
+              turns: _bestEffort.transcript.length, done: true,
+              result: `Completed via best-effort keyboard (${_verify.source} verified)`,
+              transcript: _bestEffort.transcript,
+              routingDecision: _routingDecision,
+              pageType: _pageType,
+              verification: _verify,
+              executionTime: Date.now() - start,
+            };
+          }
+          // _verify returned null (shouldn't happen for send/submit) — fall through to legacy
+        }
+
+        // Phase 8: Verification layer (legacy — for non-send/submit goals or fallback)
+        _verify = _verify || await verifyTierCompletion(goal, _pageType, _routingDecision, null, sessionId, headed, timeoutMs);
         if (_verify.fail) {
           logger.warn(`[playwright.agent] verification layer: FAIL after Tier 2.5 best-effort — ${_verify.reason} — falling back to Tier 3 (LLM)`);
         } else {
@@ -6001,10 +8215,10 @@ async function playwrightAgent(args) {
   // inject an imperative note so the LLM types directly into the composer instead
   // of planning a click to open it.
   if (url && /shareActive=true|compose\/post|compose=new|\/compose\b|posting\?compose=true/i.test(url)) {
-    _goalStateNote = '\n\nIMPORTANT: The composer/modal is ALREADY OPEN (opened by the URL deep-link). Do NOT click "Start a post" or any button to open a composer — it is already open. Type directly into the composer text area (contenteditable or textarea) using refs from the snapshot above.';
+    _goalStateNote = '\n\nIMPORTANT: The composer/modal is ALREADY OPEN (opened by the URL deep-link). Do NOT click any button to open a composer — it is already open. Type directly into the composer text area (contenteditable or textarea) using refs from the snapshot above.';
     logger.info(`[playwright.agent] goal-state: compose URL detected — injecting "composer already open" note`);
   } else if (_composerModalOpen || _probeResult?.hasModalDialog) {
-    _goalStateNote = '\n\nIMPORTANT: A composer/modal is ALREADY OPEN on the page. Do NOT click "Start a post" or any button to open a composer — it is already open. Type directly into the composer text area (contenteditable or textarea) using refs from the snapshot above.';
+    _goalStateNote = '\n\nIMPORTANT: A composer/modal is ALREADY OPEN on the page. Do NOT click any button to open a composer — it is already open. Type directly into the composer text area (contenteditable or textarea) using refs from the snapshot above.';
     logger.info(`[playwright.agent] goal-state: modal open (${_composerModalOpen ? 'fast-path' : 'page-probe'}) — injecting "composer already open" note`);
   }
 
@@ -6089,7 +8303,8 @@ async function playwrightAgent(args) {
   try {
     const _pePage = engine.getPage(sessionId);
     if (_pePage) {
-      const _cap = await _ocrCapture().catch(() => ({ ok: false }));
+      // Page-level capture (Playwright screenshot → LiteParse) — no overlay hide/show.
+      const _cap = await _ocrCaptureViaPage(sessionId).catch(() => ({ ok: false }));
       if (_cap.ok) _ocrTextForPE = _cap.text.slice(0, 1500);
       // Reuse DOM signals logic
       const _signals = await _pePage.evaluate(() => {
@@ -6116,6 +8331,7 @@ async function playwrightAgent(args) {
   try {
     const _peResult = await _focusedPlanExecute({
       goal: _finalGoal,
+      verificationGoal: effectiveGoal,
       sessionId,
       headed,
       timeoutMs,
@@ -6143,6 +8359,7 @@ async function playwrightAgent(args) {
   try {
     const _turnLoopResult = await _executeTurnLoopFallback({
       goal: _finalGoal,
+      verificationGoal: effectiveGoal,
       extractedText: _extractedComposeText,
       textAlreadyEntered: _textAlreadyEntered,
       heartbeat: _heartbeat,
@@ -6154,6 +8371,7 @@ async function playwrightAgent(args) {
       deadline: _deadline,
       maxTurns,
       start,
+      hostname,
     });
     if (_turnLoopResult.ok) {
       _turnLoopResult.executionTime = Date.now() - start;
@@ -6254,7 +8472,7 @@ Your task is simple:
 1. Find the text input (textbox, contenteditable, or textarea) in the snapshot — type the update text into it
 2. Find the submit button (Post, Publish, Send, Share, Tweet) in the snapshot — click it to submit
 
-DO NOT navigate anywhere. DO NOT click "Start a post" or any button to open a composer — it is ALREADY OPEN.
+DO NOT navigate anywhere. DO NOT click any button to open a composer — it is ALREADY OPEN.
 DO NOT click elements outside the modal — the snapshot only shows modal elements.
 Use refs (e1, e2, etc.) from the snapshot for all actions.
 
@@ -6972,7 +9190,7 @@ Output a JSON plan: { "plan": [ { "action": "type", "selector": "eXX", "text": "
               if (_page) {
                 _preClickState = await _page.evaluate(() => ({
                   url: window.location.href,
-                  modalCount: document.querySelectorAll('[role="dialog"], #interop-outlet, .share-creation, [data-testid*="modal"], [data-testid*="share"]').length,
+                  modalCount: document.querySelectorAll('[role="dialog"], [aria-modal="true"], [data-testid*="modal"], [data-testid*="share"]').length,
                   bodyLen: (document.body?.innerText || '').length,
                 }));
               }
@@ -7392,6 +9610,7 @@ Output a JSON plan: { "plan": [ { "action": "type", "selector": "eXX", "text": "
             deadline: _deadline,
             start,
             maxTurns,
+            hostname,
           });
           if (_turnLoopResult.ok) {
             logger.info(`[playwright.agent] turn-loop fallback succeeded — returning`);
@@ -7469,7 +9688,7 @@ Output a JSON plan: { "plan": [ { "action": "type", "selector": "eXX", "text": "
           let _hasModal = false;
           if (_ePage2) {
             try {
-              _hasModal = await _ePage2.evaluate(() => !!document.querySelector('[role="dialog"], #interop-outlet, .share-creation, [data-testid*="modal"], [data-testid*="share"]'));
+              _hasModal = await _ePage2.evaluate(() => !!document.querySelector('[role="dialog"], [aria-modal="true"], [data-testid*="modal"], [data-testid*="share"]'));
             } catch (_) {}
           }
           if (_hasModal) {
@@ -7670,6 +9889,7 @@ Output a JSON plan: { "plan": [ { "action": "type", "selector": "eXX", "text": "
             deadline: _deadline,
             start,
             maxTurns,
+            hostname,
           });
           if (_turnLoopResult.ok) {
             logger.info(`[playwright.agent] turn-loop fallback succeeded after unparseable repair — returning`);
@@ -8275,6 +10495,7 @@ Return JSON: { "thoughts": "strategy explanation", "plan": [...steps] }`;
           deadline: Date.now() + 30000,
           start,
           maxTurns,
+          hostname,
         });
         if (_turnLoopResult.ok) {
           logger.info(`[playwright.agent] turn-loop fallback succeeded after overall timeout — returning`);

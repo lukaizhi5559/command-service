@@ -12,10 +12,12 @@
  *   search_and_navigate  { query, preferDomain? }        → searches web, picks best URL to navigate to directly
  *   discover_task_url   { domain, task }                → dual search (site-scoped + broad) to find the most direct deep-link URL for a task
  *   discover_search_syntax { domain, task }              → search + crawl official docs to extract a service's search/filter query operators
+ *   research_app_behavior { domain, query? }            → targeted web research for app-level operational knowledge (shortcuts, UI modes, quirks)
  */
 
 const http   = require('http');
 const logger = require('../logger.cjs');
+const { isAuthFlowUrl } = require('../skill-helpers/destination-resolver.cjs');
 
 // Web Search MCP configuration from environment
 const WEB_SEARCH_API_URL = process.env.MCP_WEB_SEARCH_API_URL;
@@ -121,6 +123,9 @@ function _classifyDiscoveryCandidate({ url, title, snippet }, serviceDomain) {
 
   const normalizedServiceDomain = String(serviceDomain || '').replace(/^www\./, '').toLowerCase();
   const onServiceDomain = host === normalizedServiceDomain || host.endsWith(`.${normalizedServiceDomain}`);
+  if (isAuthFlowUrl(url)) {
+    return { pageClass: 'auth', onServiceDomain };
+  }
   if (/\b(help|support|documentation|docs|guide|tutorial|community|forum)\b/.test(text)) {
     return { pageClass: 'documentation', onServiceDomain };
   }
@@ -592,6 +597,14 @@ async function actionDiscoverTaskUrl({ domain, task, maxResults = 5, candidateUr
         return { ...c, _score: 0 };
       }
 
+      // Reject auth-flow URLs outright (login, magic-link, oauth, authorize,
+      // callback, signup, verify, logout, …). These are identity-flow pages,
+      // never valid task deep-links — promoting them sends the agent to an auth
+      // error/landing page instead of the app surface (e.g. claude.ai/magic-link).
+      if (isAuthFlowUrl(c.url)) {
+        return { ...c, _score: 0 };
+      }
+
       // Heavy penalty for prefilled-message query params on non-compose tasks
       // (stale subject/recipient/body from search index, never valid for read/search)
       if (!_isComposeTask && /[?&](su|to|body|subject|bcc|cc)=/i.test(c.url) && /[?&](view=cm|tf=cm|tf=1)/i.test(c.url)) {
@@ -872,6 +885,300 @@ async function actionDiscoverSetup({ service, cliTool, maxResults = 5 }) {
   };
 }
 
+// ── research_app_behavior ───────────────────────────────────────────────────
+// Targeted web research for app-level operational knowledge: shortcuts, UI modes,
+// element semantics, quirks. Unlike research_domain (generic nav hints), this runs
+// multiple query templates designed to surface app behaviors and classifies the
+// results into structured knowledge entries matching the appKnowledge.cjs schema.
+
+// Classify a snippet/title into a knowledge entry type
+// Order matters: more specific types are checked before generic "shortcut"
+function _classifyBehaviorType(text) {
+  const t = String(text || '').toLowerCase();
+  if (/(recover|undo|fix|restore|revert)/i.test(t)) return 'recovery_move';
+  if (/(verify|confirm|check|signal|indicator|status)/i.test(t)) return 'verification_signal';
+  if (/(compact|hidden|not visible|toggle|hide|show|sidebar|toolbar|menu bar|view mode)/i.test(t)) return 'ui_mode';
+  if (/(rename|commit|save|persist|enter|blur|focus|input|field|submit|apply)/i.test(t)) return 'element_semantics';
+  if (/(quirk|bug|workaround|gotcha|caveat|pitfall|unexpected)/i.test(t)) return 'quirk';
+  if (/(ctrl|cmd|⌘|shortcut|keyboard|hotkey|key binding|keystroke)/i.test(t)) return 'shortcut';
+  return 'quirk'; // default — still useful operational knowledge
+}
+
+// Extract a shortcut combo from text (e.g. "Ctrl+Shift+F", "Cmd+B")
+function _extractShortcut(text) {
+  const m = String(text || '').match(/(?:Ctrl|Control|Cmd|Command|⌘|Alt|Option|Shift|Win|Meta)\s*\+\s*(?:Ctrl|Control|Cmd|Command|⌘|Alt|Option|Shift|Win|Meta\s*\+\s*)?[A-Z0-9]/i);
+  return m ? m[0].replace(/\s+/g, '').replace(/^Ctrl$/i, 'Ctrl').replace(/^Cmd$/i, 'Cmd') : null;
+}
+
+// Extract a CSS-selector-like reference from text (e.g. "input.docs-title-input")
+function _extractSelector(text) {
+  const m = String(text || '').match(/\b[a-z][a-z0-9-]*(?:\.[a-z0-9_-]+)+(?:\[[^\]]+\])?/i);
+  return m ? m[0] : null;
+}
+
+/**
+ * Research app-level behaviors (shortcuts, UI modes, element semantics, quirks)
+ * for a given domain/app. Runs targeted query templates and synthesizes structured
+ * knowledge entries suitable for caching in appKnowledge.cjs.
+ *
+ * @param {string} domain   - app hostname or service name (e.g. "docs.google.com" or "google docs")
+ * @param {string} [query]  - optional task-specific query (e.g. "rename document")
+ * @param {number} [maxResults=4] - results per query template
+ * @returns {Promise<{ok, entries, confidence, sourceCount, query}>}
+ */
+async function actionResearchAppBehavior({ domain, query, maxResults = 4 }) {
+  if (!domain) return { ok: false, error: 'domain is required' };
+
+  // Normalize domain to a readable app name for queries
+  const appName = String(domain)
+    .replace(/^https?:\/\//, '')
+    .replace(/^www\./, '')
+    .replace(/\.[a-z]{2,}.*$/i, '')
+    .replace(/[._-]+/g, ' ')
+    .trim() || domain;
+  const hostForId = String(domain).replace(/^https?:\/\//, '').replace(/^www\./, '').split('/')[0] || domain;
+  const taskVerb = query ? ` ${query}` : '';
+
+  // Targeted query templates designed to surface app behaviors.
+  // The command-system queries are generic — they work for any app:
+  //   - "slash commands" surfaces Notion/Slack/Discord/Google Docs slash commands
+  //   - "command palette" surfaces Linear (C key), VS Code (Cmd+Shift+P), Figma (/)
+  //   - Apps with no command system (Spotify, Amazon) return nothing — also useful
+  const queries = [
+    `${appName} keyboard shortcuts cheat sheet`,
+    `${appName} compact mode toggle hidden UI toolbar`,
+    `${appName} slash commands blocks insert create`,
+    `${appName} command palette quick actions`,
+    `${appName}${taskVerb} how to`,
+    `${appName} tips tricks quirks hidden features`,
+  ].filter(Boolean);
+
+  logger.info(`[web.agent] research_app_behavior: ${queries.length} queries for "${appName}" (task="${query || 'none'}")`);
+
+  // ── Phase 1: Search — run all queries in parallel ──
+  const searchResults = [];
+  let totalSources = 0;
+  const searchPromises = queries.map(q =>
+    searchWeb(q, maxResults).catch(err => {
+      logger.warn(`[web.agent] research_app_behavior: query "${q.slice(0, 50)}" failed: ${err.message}`);
+      return null;
+    })
+  );
+  const searchResponses = await Promise.all(searchPromises);
+  for (const res of searchResponses) {
+    if (!res?.ok || !Array.isArray(res.results)) continue;
+    totalSources += res.results.length;
+    for (const r of res.results) {
+      if (_isParkingContent(r.title, r.snippet, r.url)) continue;
+      searchResults.push(r);
+    }
+  }
+
+  if (searchResults.length === 0) {
+    logger.info(`[web.agent] research_app_behavior: no search results for "${appName}"`);
+    return { ok: true, query: queries.join(' | '), entries: [], confidence: 0, sourceCount: 0 };
+  }
+
+  // ── Phase 2: Crawl best pages + LLM-synthesize actionable knowledge ──
+  // Pick the best 1-2 pages to crawl. Prefer official help/support docs for the
+  // service (most reliable), then fall back to high-quality third-party results.
+  const serviceHost = hostForId.split('.').slice(-2).join('.');
+  const crawlCandidates = [];
+  const seenUrls = new Set();
+  // First: official docs (hostname contains the service domain)
+  for (const r of searchResults) {
+    try {
+      const h = new URL(r.url).hostname.replace(/^www\./, '');
+      if ((h.includes(serviceHost) || h.includes(appName.toLowerCase().replace(/\s+/g, ''))) && !seenUrls.has(r.url)) {
+        crawlCandidates.push(r);
+        seenUrls.add(r.url);
+      }
+    } catch (_) {}
+  }
+  // Then: other results (cheat sheets, tutorials) — but only if they look substantive
+  for (const r of searchResults) {
+    if (crawlCandidates.length >= 2) break;
+    if (seenUrls.has(r.url)) continue;
+    const text = `${r.title || ''} ${r.snippet || ''}`;
+    if (text.length > 50 && /shortcut|keyboard|how to|guide|tutorial|tip|slash|command|block|insert/i.test(text)) {
+      crawlCandidates.push(r);
+      seenUrls.add(r.url);
+    }
+  }
+
+  logger.info(`[web.agent] research_app_behavior: ${crawlCandidates.length} crawl candidates for "${appName}"`);
+
+  // Crawl each candidate in parallel — each crawl uses its own browser session
+  // (_crawl_<hash>), so they're fully independent and can run concurrently.
+  let { webCrawl } = require('./web.crawl.cjs');
+  const crawledContents = [];
+  const crawlPromises = crawlCandidates.slice(0, 3).map(c =>
+    webCrawl({ url: c.url, maxChars: 6000, timeoutMs: 15000 })
+      .then(result => ({ ok: true, ...result, _url: c.url, _title: c.title }))
+      .catch(err => {
+        logger.warn(`[web.agent] research_app_behavior: crawl failed for ${c.url}: ${err.message}`);
+        return { ok: false, _url: c.url };
+      })
+  );
+  const crawlResults = await Promise.all(crawlPromises);
+  for (const result of crawlResults) {
+    if (result.ok && result.content && result.content.length > 100) {
+      crawledContents.push({ url: result._url, content: result.content, title: result._title });
+      logger.info(`[web.agent] research_app_behavior: crawled ${result._url} (${result.content.length} chars)`);
+    }
+  }
+
+  // ── Phase 3: LLM synthesis ──
+  let entries = [];
+  if (crawledContents.length > 0) {
+    try {
+      const { ask } = require('../skill-helpers/skill-llm.cjs');
+      const combinedContent = crawledContents
+        .map(c => `--- ${c.title} (${c.url}) ---\n${c.content.slice(0, 3000)}`)
+        .join('\n\n')
+        .slice(0, 10000);
+
+      const extractPrompt = `The following is text crawled from help/documentation pages about "${appName}".
+
+Extract operational knowledge that would help an automation agent interact with this app. Focus on:
+1. Keyboard shortcuts (extract the exact key combo, e.g. "Ctrl+Shift+F" or "Cmd+Shift+F")
+2. Slash commands / block creation (does the app use "/" prefix? "#" prefix? Cmd+K? What commands are available — /todo, /heading, /bullet, /code, etc.? How does the user insert/create blocks?)
+3. UI modes / toggles (compact mode, sidebar collapse, hidden toolbars, fullscreen, etc. — what hides UI elements and how to reveal them)
+4. Element semantics (how to rename, commit, save — does it need Enter? blur? click? where is the title input? what placeholder does it use?)
+5. Workflow patterns (step-by-step: how to create a page, how to set a title, how to add a block, how to insert a todo list — include the selector or key sequence for each step)
+6. Element disambiguation (if multiple contenteditable/textbox elements exist, which is the title vs body? what placeholder/aria-label/tag distinguishes them?)
+7. Quirks / gotchas / workarounds (things that commonly trip up automation)
+8. Hidden element behaviors (what causes elements to be hidden, how to reveal them)
+
+Return ONLY a JSON array of objects, each with:
+- "type": one of "shortcut", "slash_command", "command_system", "ui_mode", "element_semantics", "workflow", "quirk", "recovery_move"
+- "summary": one-sentence actionable description (include the key combo, selector, or command prefix if known)
+- "details": object with optional fields:
+  - "shortcut" (e.g. "Ctrl+Shift+F")
+  - "prefix" (e.g. "/" or "#" — the command prefix if any)
+  - "commands" (array of known commands, e.g. ["/todo", "/heading", "/bullet"])
+  - "selector" (e.g. "input.docs-title-input", "h1[contenteditable]")
+  - "steps" (array of step strings for workflow entries, e.g. ["Click H1 placeholder", "Type title", "Press Enter"])
+  - "titleElement" (e.g. "h1[placeholder='New page']" — how to identify the title input)
+  - "bodyElement" (e.g. "div[role='group']" — how to identify the body editor)
+  - "sourceUrl"
+
+Return [] if no operational knowledge is found. Do NOT include generic descriptions like "learn more about X" — only include entries that tell the agent HOW to do something specific.
+
+TEXT:
+${combinedContent}`;
+
+      const raw = await ask(extractPrompt, { maxTokens: 1200, temperature: 0, responseTimeoutMs: 30000 });
+      const jsonMatch = raw && raw.match(/\[[\s\S]*\]/);
+      if (jsonMatch) {
+        const parsed = JSON.parse(jsonMatch[0]);
+        if (Array.isArray(parsed)) {
+          const seenIds = new Set();
+          for (const item of parsed) {
+            if (!item || typeof item.summary !== 'string' || item.summary.length < 10) continue;
+            const type = ['shortcut', 'slash_command', 'command_system', 'ui_mode', 'element_semantics', 'workflow', 'quirk', 'recovery_move'].includes(item.type) ? item.type : 'quirk';
+            const summary = item.summary.trim().replace(/\s+/g, ' ').slice(0, 220);
+            const id = `${hostForId.replace(/^www\./, '').split('.')[0]}.${type}.${(summary.toLowerCase().replace(/[^a-z0-9]+/g, '-').slice(0, 30))}`;
+            if (seenIds.has(id)) continue;
+            seenIds.add(id);
+            const details = item.details && typeof item.details === 'object' ? item.details : {};
+            // Ensure sourceUrl is set from the crawl if not provided by the LLM
+            if (!details.sourceUrl && crawledContents.length > 0) details.sourceUrl = crawledContents[0].url;
+            entries.push({
+              id,
+              type,
+              summary,
+              details,
+              source: 'web_research_llm',
+              confidence: 0.7, // LLM-synthesized from authoritative docs — higher than snippet-only
+            });
+          }
+          logger.info(`[web.agent] research_app_behavior: LLM extracted ${entries.length} actionable entries for "${appName}"`);
+        }
+      }
+    } catch (llmErr) {
+      logger.warn(`[web.agent] research_app_behavior: LLM synthesis failed: ${llmErr.message} — falling back to snippet-based entries`);
+    }
+  }
+
+  // ── Phase 4: Snippet-based extraction — ALWAYS run as supplement to LLM ──
+  // Previously this only ran as a fallback when LLM synthesis produced nothing.
+  // But LLM synthesis can succeed yet MISS important entries (e.g. produce a
+  // `shortcut` entry but miss the `ui_mode` entry for compact mode). Running
+  // snippet extraction always and merging with LLM entries (dedup by type+summary
+  // prefix, LLM entries take precedence with 0.7 > 0.5) ensures snippet-discovered
+  // knowledge like "Ctrl+Shift+F to toggle compact mode" is never lost.
+  {
+    const _snippetEntries = [];
+    const _seenSnippetIds = new Set();
+    for (const r of searchResults.slice(0, 8)) {
+      const text = `${r.title || ''} ${r.snippet || ''}`.trim();
+      if (text.length < 15) continue;
+      const type = _classifyBehaviorType(text);
+      const shortcut = _extractShortcut(text);
+      const selector = _extractSelector(text);
+      let summary = (r.snippet || r.title || '').trim().replace(/\s+/g, ' ');
+      if (summary.length > 220) summary = summary.slice(0, 219) + '\u2026';
+      if (!summary) continue;
+      if (shortcut && !summary.toLowerCase().includes(shortcut.toLowerCase())) {
+        summary = `${summary} (Shortcut: ${shortcut})`;
+      }
+      const id = `${hostForId.replace(/^www\./, '').split('.')[0]}.${type}.${(summary.toLowerCase().replace(/[^a-z0-9]+/g, '-').slice(0, 30))}`;
+      if (_seenSnippetIds.has(id)) continue;
+      _seenSnippetIds.add(id);
+      _snippetEntries.push({
+        id,
+        type,
+        summary,
+        details: {
+          ...(shortcut ? { shortcut } : {}),
+          ...(selector ? { selector } : {}),
+          sourceUrl: r.url,
+        },
+        source: 'web_research_snippet',
+        confidence: 0.5,
+      });
+    }
+    // Merge: only add snippet entries whose type+summary prefix isn't already covered by LLM
+    let _addedFromSnippet = 0;
+    for (const _snip of _snippetEntries) {
+      const _covered = entries.some(e => e.type === _snip.type
+        && e.summary.toLowerCase().slice(0, 40) === _snip.summary.toLowerCase().slice(0, 40));
+      if (!_covered) { entries.push(_snip); _addedFromSnippet++; }
+    }
+    logger.info(`[web.agent] research_app_behavior: ${_snippetEntries.length} snippet entries extracted, ${_addedFromSnippet} added (LLM had ${entries.length - _addedFromSnippet}), ${entries.length} total for "${appName}"`);
+  }
+
+  // Deduplicate by summary similarity (keep highest-confidence)
+  const deduped = [];
+  for (const e of entries) {
+    const similar = deduped.find(d => d.type === e.type && d.summary.toLowerCase().slice(0, 60) === e.summary.toLowerCase().slice(0, 60));
+    if (similar) {
+      if ((e.confidence || 0) > (similar.confidence || 0)) {
+        Object.assign(similar, e);
+      }
+    } else {
+      deduped.push(e);
+    }
+  }
+
+  // Cap entries to keep context lean
+  const finalEntries = deduped.slice(0, 12);
+
+  // Confidence: based on entry count and source diversity
+  const confidence = finalEntries.length >= 5 ? 0.7 : finalEntries.length >= 3 ? 0.5 : finalEntries.length >= 1 ? 0.3 : 0;
+
+  logger.info(`[web.agent] research_app_behavior: ${finalEntries.length} entries (confidence=${confidence.toFixed(2)}, sources=${totalSources}, crawled=${crawledContents.length}) for "${appName}"`);
+
+  return {
+    ok: true,
+    query: queries.join(' | '),
+    entries: finalEntries,
+    confidence,
+    sourceCount: totalSources,
+  };
+}
+
 // Main export handler
 module.exports = async function webAgent(args) {
   const { action, ...params } = args || {};
@@ -889,6 +1196,8 @@ module.exports = async function webAgent(args) {
       return await actionDiscoverSearchSyntax(params);
     case 'discover_setup':
       return await actionDiscoverSetup(params);
+    case 'research_app_behavior':
+      return await actionResearchAppBehavior(params);
     default:
       return { ok: false, error: `Unknown action: ${action}` };
   }
@@ -900,4 +1209,6 @@ module.exports.actionSearchAndNavigate = actionSearchAndNavigate;
 module.exports.actionDiscoverTaskUrl  = actionDiscoverTaskUrl;
 module.exports.actionDiscoverSearchSyntax = actionDiscoverSearchSyntax;
 module.exports.actionDiscoverSetup    = actionDiscoverSetup;
+module.exports.actionResearchAppBehavior = actionResearchAppBehavior;
 module.exports._classifyDiscoveryCandidate = _classifyDiscoveryCandidate;
+module.exports.searchWeb = searchWeb;
