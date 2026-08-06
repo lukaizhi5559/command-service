@@ -1259,6 +1259,14 @@ function sessionFlags(sessionId, headed = true) {
   const flags = [`-s=${shortSessionId(sessionId)}`];
   if (headed) flags.push('--headed');
 
+  // Use real Chrome by default — bundled Chrome for Testing is bot-detected by
+  // Google OAuth / Cloudflare Turnstile (ChatGPT login spinner issue).
+  // Override with THINKDROP_BROWSER_CHANNEL=cft for bundled Chromium.
+  const _envChannel = String(process.env.THINKDROP_BROWSER_CHANNEL || '').toLowerCase();
+  if (_envChannel !== 'cft') {
+    flags.push('--browser=chrome');
+  }
+
   if (shouldUsePersistentProfile(sessionId)) {
     const profileDir = sessionProfileDir(sessionId);
     flags.push(`--profile=${profileDir}`);
@@ -1271,7 +1279,13 @@ function sessionFlags(sessionId, headed = true) {
 // Returns ['--config=<path>'] to be inserted after 'open' subcommand.
 // --config is an open-subcommand flag in playwright-cli — it MUST come after 'open',
 // not in the pre-subcommand session flags. Returns [] if config file is missing.
-function openFlags() {
+//
+// When isAuth=true, returns [] — auth/OAuth flows need service workers enabled
+// (Google FedCM API requires SW registration). cli.config.json sets
+// serviceWorkers:"block" which silently hangs Google OAuth. Ad blocking is not
+// needed during the short auth flow.
+function openFlags(isAuth = false) {
+  if (isAuth) return [];
   const cliConfig = path.join(os.homedir(), '.thinkdrop', 'cli.config.json');
   return fs.existsSync(cliConfig) ? [`--config=${cliConfig}`] : [];
 }
@@ -6246,7 +6260,7 @@ If no videos found, return []. Do not explain, only output the JSON array.`;
             navOk = (await _authGoto(url, navTimeout)).ok;
           } else {
             const navCmd = alreadyOpen ? 'goto' : 'open';
-            const navRes = await cliRun([...S, navCmd, ...(navCmd === 'open' ? openFlags() : []), url], navTimeout);
+            const navRes = await cliRun([...S, navCmd, ...(navCmd === 'open' ? openFlags(true) : []), url], navTimeout);
             navOk = navRes.ok;
           }
           if (navOk) openSessions.add(sessionId);

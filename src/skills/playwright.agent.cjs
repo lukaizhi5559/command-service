@@ -2206,6 +2206,7 @@ Rules:
 - For contenteditable bodies: type="contenteditable", verifyType="innerText"
 - For chip/badge fields (Gmail To): type="chip", verifyType="chip_count"
 - For editor pages (Notion, Google Docs): autoSave=true, submitSelectors=null
+- For AI chat pages (a message box that streams a reply — ChatGPT, Claude, Gemini, Grok, Perplexity, etc.): autoSave=false, submitSelectors=null, pressAfter="Enter" on the message field. The Enter key submits the prompt; the system will wait for the streamed response automatically.
 - For form/compose pages (Gmail, LinkedIn, Twitter): autoSave=false, include submitSelectors
 - For list items: role="item", pressAfter="Enter" (to create the next item automatically)
 - For slash commands (e.g. "/todo"): include as a separate field with text="/todo" and pressAfter="Enter"
@@ -2786,6 +2787,64 @@ async function _retryFieldFill(page, field, value, browserAct, sessionId, fieldT
   return { filled: false, method: null };
 }
 
+// ── Streaming response detection ────────────────────────────────────────────
+// After pressing Enter on an AI chat / search page, the response streams via SSE
+// (text/event-stream) or WebSocket. Auto-save editors (Notion, Google Docs) NEVER
+// use these protocols — they use regular fetch POST with JSON. So detecting them
+// is a definitive signal that a streamed response is in progress.
+//
+// Multi-signal: network protocol (strongest) + content growth (behavioral fallback).
+// Handles variable response timing: up to maxWait for streaming to start (5s preload
+// case), early exit after earlyExit ms if no activity (true autoSave).
+//
+// NOTE: Listeners are set up BEFORE the field loop by the caller (so they catch the
+// SSE event when Enter is pressed during typing). This function only polls content
+// growth + checks the pre-set streamingSeen flag, then runs cleanup in finally.
+async function _detectStreamingResponse(page, baselineTextLen, streamingSeen, cleanup, maxWait = 10000, earlyExit = 3000) {
+  let _contentGrew = false;
+  try {
+    const deadline = Date.now() + maxWait;
+    const earlyDeadline = Date.now() + earlyExit;
+
+    while (Date.now() < deadline) {
+      await new Promise(r => setTimeout(r, 500));
+
+      if (streamingSeen || _contentGrew) return true;
+
+      // Behavioral: check content growth
+      const currentLen = await page.evaluate(() => (document.body?.innerText || '').length).catch(() => 0);
+      if (currentLen > baselineTextLen + 200) {
+        _contentGrew = true;
+        return true;
+      }
+
+      // Early exit: no network streaming AND no content growth → true autoSave
+      if (Date.now() > earlyDeadline && !streamingSeen && !_contentGrew) return false;
+    }
+
+    return streamingSeen || _contentGrew;
+  } finally {
+    if (cleanup) cleanup();
+  }
+}
+
+// Capture a streaming response: detect → waitForStableText → getPageText.
+// Returns the extracted text on success, or null if no streaming detected.
+async function _captureStreamingResponse(sessionId, page, baselineTextLen, streamingSeen, cleanup, timeoutMs) {
+  const _streaming = await _detectStreamingResponse(page, baselineTextLen, streamingSeen, cleanup, 10000, 3000);
+  if (!_streaming) return null;
+  logger.info(`[playwright.agent] field map: streaming response detected — waiting for stable text (up to 60s)`);
+  await browserAct({ action: 'waitForStableText', sessionId, headed: true, timeoutMs: Math.min(timeoutMs, 60000) }).catch(() => {});
+  const _textRes = await browserAct({ action: 'getPageText', sessionId, headed: true, timeoutMs: 10000 }).catch(() => null);
+  const _text = String(_textRes?.result || '').trim();
+  if (_text) {
+    logger.info(`[playwright.agent] field map: streaming response captured (${_text.length} chars)`);
+    return _text;
+  }
+  logger.warn(`[playwright.agent] field map: streaming detected but getPageText returned empty`);
+  return 'Completed via field map (streaming response — extraction failed)';
+}
+
 // CSS selector check for CSS fallback path.
 // Submit phase: skipped for autoSave pages (Notion, Google Docs).
 async function _executeFieldMap(sessionId, fieldValues, fieldMap, timeoutMs, options = {}) {
@@ -2795,6 +2854,37 @@ async function _executeFieldMap(sessionId, fieldValues, fieldMap, timeoutMs, opt
   const transcript = [];
   const fieldTimeout = Math.min(timeoutMs, 15000);
   const _hasEditableFields = !!options.hasEditableFields;
+
+  // ── Streaming detection setup ──────────────────────────────────────
+  // Structural signal: pressAfter="Enter" on body/message + no submitSelectors
+  // → Enter is the submit mechanism, a streamed response may follow.
+  // True autoSave editors (Notion, Google Docs) don't use pressAfter="Enter" on body.
+  // NOTE: autoSave is NOT required — AI chat maps may have autoSave=true OR false.
+  const _hasEnterSubmit = !(fieldMap.submitSelectors?.length) &&
+    fieldMap.fields?.some(f => f.pressAfter === 'Enter' && (f.role === 'body' || f.role === 'message'));
+  let _baselineTextLen = 0;
+  let _streamingSeen = false;
+  let _streamingCleanup = null;
+  if (_hasEnterSubmit) {
+    _baselineTextLen = await page.evaluate(() => (document.body?.innerText || '').length).catch(() => 0);
+    // Set up listeners BEFORE field loop — Enter is pressed during typing, SSE starts immediately
+    const _onResponse = (res) => {
+      try {
+        const ct = (res.headers()['content-type'] || '').toLowerCase();
+        if (ct.includes('text/event-stream') || ct.includes('application/stream') || ct.includes('x-ndjson')) {
+          _streamingSeen = true;
+        }
+      } catch (_) {}
+    };
+    const _onWebSocket = () => { _streamingSeen = true; };
+    page.on('response', _onResponse);
+    page.on('websocket', _onWebSocket);
+    _streamingCleanup = () => {
+      page.removeListener('response', _onResponse);
+      page.removeListener('websocket', _onWebSocket);
+    };
+    logger.info(`[playwright.agent] field map: Enter-submit detected (pressAfter=Enter, no submitSelectors) — listeners armed for streaming detection`);
+  }
 
   // Phase 1: Fill each field — placeholder first, CSS selector fallback, role+position fallback
   for (const field of fieldMap.fields) {
@@ -3221,7 +3311,19 @@ async function _executeFieldMap(sessionId, fieldValues, fieldMap, timeoutMs, opt
 
   // Phase 2: Submit (only if NOT autoSave)
   if (fieldMap.autoSave) {
-    logger.info(`[playwright.agent] field map: autoSave=true — skipping submit phase`);
+    if (!_hasEnterSubmit) {
+      // True autoSave (Notion, Google Docs) — no Enter submit, no response to wait for
+      logger.info(`[playwright.agent] field map: autoSave=true — skipping submit phase`);
+      return { ok: true, transcript, result: 'Completed via field map (auto-save)' };
+    }
+
+    // Enter was the submit — check for streaming response (AI chat, search, etc.)
+    logger.info(`[playwright.agent] field map: autoSave=true but Enter-submit detected — checking for streaming response`);
+    const _text = await _captureStreamingResponse(sessionId, page, _baselineTextLen, _streamingSeen, _streamingCleanup, timeoutMs);
+    if (_text) return { ok: true, transcript, result: _text };
+
+    // No streaming detected — true autoSave or response already complete
+    logger.info(`[playwright.agent] field map: no streaming detected — treating as true autoSave`);
     return { ok: true, transcript, result: 'Completed via field map (auto-save)' };
   }
 
@@ -3275,6 +3377,16 @@ async function _executeFieldMap(sessionId, fieldValues, fieldMap, timeoutMs, opt
         return { ok: true, transcript, result: 'Submitted (URL changed)' };
       }
     }
+  }
+
+  // Phase 4: AI chat streaming detection (if Enter was the submit mechanism)
+  // For non-autoSave maps with pressAfter=Enter + no submitSelectors (AI chat pages),
+  // the response streams after Enter. Wait for it to settle, then extract page text.
+  if (_hasEnterSubmit) {
+    logger.info(`[playwright.agent] field map: Enter-submit detected post-submit — checking for streaming response`);
+    const _text = await _captureStreamingResponse(sessionId, page, _baselineTextLen, _streamingSeen, _streamingCleanup, timeoutMs);
+    if (_text) return { ok: true, transcript, result: _text };
+    logger.info(`[playwright.agent] field map: no streaming detected post-submit`);
   }
 
   logger.info(`[playwright.agent] field map: no submit verification configured — assuming success`);

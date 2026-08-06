@@ -257,7 +257,7 @@ function getContentExtractionConfig(hostname) {
 
 const { userAgent } = require('./user.agent.cjs');
 
-const { resolveDestination, recordCorrection, classifyTaskIntent, classifyUrlType, getLearnedCorrection, deleteLearnedCorrection, suggestTaskUrl, getTaskKeywords, getCachedDeepLink, recordDeepLinkCache, getSearchUrlPattern, recordSearchUrlPattern, INTENTS, isAuthFlowUrl } = require('../skill-helpers/destination-resolver.cjs');
+const { resolveDestination, recordCorrection, classifyTaskIntent, classifyUrlType, getLearnedCorrection, deleteLearnedCorrection, suggestTaskUrl, getTaskKeywords, getCachedDeepLink, recordDeepLinkCache, getSearchUrlPattern, recordSearchUrlPattern, INTENTS, SERVICE_CHAT_URLS, isAuthFlowUrl } = require('../skill-helpers/destination-resolver.cjs');
 const { killExistingChromeForProfile, clearProfileLock, findCli, shortSessionId } = require('./browser.act.cjs');
 const { loadAppKnowledge, saveAppKnowledge, loadAndFormat, isCacheStale, recordVerification } = require('./lib/appKnowledge.cjs');
 
@@ -3192,6 +3192,53 @@ async function _resolveTaskDeepLink(agentId, serviceKey, baseStartUrl, task, exi
       const svc = String(serviceKey || '').toLowerCase().replace(/[^a-z0-9]/g, '');
       const startUrlBase = baseStartUrl.replace(/\/$/, '');
 
+      // ── CHAT / RESEARCH ──────────────────────────────────────────────────
+      // Chatbot services: go directly to chat interface URL. Without this,
+      // CHAT/RESEARCH intent falls through to discover_task_url (web search)
+      // which finds random public pages like claude.ai/public/artifacts/...
+      if (intent === INTENTS.CHAT || intent === INTENTS.RESEARCH) {
+        const _chatUrl = SERVICE_CHAT_URLS[svc];
+        if (_chatUrl) return _chatUrl;
+        // Fallback: if the service startUrl IS a chat URL, use it directly
+        if (/chat\.|claude\.ai|chatgpt\.com|gemini\.google|grok\.com/i.test(baseStartUrl)) {
+          return baseStartUrl;
+        }
+      }
+
+      // ── MAPS ─────────────────────────────────────────────────────────────
+      if (intent === INTENTS.MAPS) {
+        const _destMatch = task.match(/(?:directions\s+to|navigate\s+to|find\s+nearby|locate(?:\s+a|\s+the)?|route\s+to)\s+(.+)/i);
+        const _dest = _destMatch?.[1]?.trim().replace(/[?.!]+$/g, '');
+        if (_dest) {
+          if (svc === 'googlemaps' || baseHost === 'google.com' || baseStartUrl.includes('google.com/maps')) {
+            return `https://www.google.com/maps/search/${encodeURIComponent(_dest)}`;
+          }
+          if (svc === 'applemaps' || baseHost === 'apple.com') {
+            return `https://maps.apple.com/?q=${encodeURIComponent(_dest)}`;
+          }
+        }
+        if (svc === 'googlemaps' || baseStartUrl.includes('google.com/maps')) return baseStartUrl;
+      }
+
+      // ── MEDIA_PLAY ───────────────────────────────────────────────────────
+      // Play/stream music or video — go to the player/search URL, not the homepage.
+      if (intent === INTENTS.MEDIA_PLAY) {
+        if (svc === 'spotify') return 'https://open.spotify.com';
+        if (svc === 'youtube' || baseHost === 'youtube.com') {
+          const _playMatch = task.match(/(?:play|watch|search)\s+(?:for\s+)?(.+)/i);
+          if (_playMatch) return `https://www.youtube.com/results?search_query=${encodeURIComponent(_playMatch[1].trim())}`;
+          return 'https://www.youtube.com';
+        }
+        if (svc === 'youtubemusic' || baseHost === 'music.youtube.com') {
+          const _playMatch = task.match(/(?:play|search)\s+(?:for\s+)?(.+)/i);
+          if (_playMatch) return `https://music.youtube.com/search?q=${encodeURIComponent(_playMatch[1].trim())}`;
+          return 'https://music.youtube.com';
+        }
+        if (svc === 'applemusic' || baseHost === 'music.apple.com') return 'https://music.apple.com';
+        if (svc === 'youtubekids' || baseHost === 'youtubekids.com') return 'https://www.youtubekids.com';
+        // Generic: fall through to layer 2/3 for unknown media services
+      }
+
       // ── MAIL ──────────────────────────────────────────────────────────────
       if (intent === INTENTS.MAIL) {
         if (svc === 'gmail' || baseHost === 'mail.google.com') {
@@ -3396,16 +3443,21 @@ async function _resolveTaskDeepLink(agentId, serviceKey, baseStartUrl, task, exi
         try { evalLinks = JSON.parse(evalRaw); } catch (_) { const m = evalRaw.match(/\[[\s\S]*\]/); if (m) try { evalLinks = JSON.parse(m[0]); } catch (_) {} }
         if (Array.isArray(evalLinks) && evalLinks.length > 0) {
           const _INTENT_EVAL_PATTERNS = {
-            [INTENTS.CONTENT_CREATE]: /\/(new|create|compose|upload|publish|submit|add)/i,
-            [INTENTS.SOCIAL]:         /\/(compose|post|share|submit|tweet)/i,
+            [INTENTS.CONTENT_CREATE]: /\/(new|create|compose|upload|publish|submit|add|draft|editor|write)/i,
+            [INTENTS.SOCIAL]:         /\/(compose|post|share|submit|tweet|message|comment|reply|feed)/i,
             [INTENTS.MAIL]:           /\/(compose|draft|new|mail)/i,
-            [INTENTS.SETTINGS]:       /\/(settings|account|preferences|profile)/i,
-            [INTENTS.SUPPORT]:        /\/(help|support|contact|ticket)/i,
-            [INTENTS.DASHBOARD]:      /\/(dashboard|admin|overview|home|console)/i,
-            [INTENTS.DOCS]:           /\/(docs|documentation|guide|tutorial|help)/i,
-            [INTENTS.CONSOLE]:        /\/(console|developer|api|platform|settings)/i,
-            [INTENTS.SCHEDULING]:     /\/(calendar|schedule|book|event|new)/i,
-            [INTENTS.SEARCH]:         /\/(search|find)/i,
+            [INTENTS.SETTINGS]:       /\/(settings|account|preferences|profile|billing|subscription|security|privacy)/i,
+            [INTENTS.SUPPORT]:        /\/(help|support|contact|ticket|faq|community|forum)/i,
+            [INTENTS.DASHBOARD]:      /\/(dashboard|admin|overview|home|console|analytics|stats|reports)/i,
+            [INTENTS.DOCS]:           /\/(docs|documentation|guide|tutorial|help|reference|manual|learn|wiki)/i,
+            [INTENTS.CONSOLE]:        /\/(console|developer|api|platform|settings|keys|tokens)/i,
+            [INTENTS.SCHEDULING]:     /\/(calendar|schedule|book|event|new|appointment|reserve|meeting)/i,
+            [INTENTS.SEARCH]:         /\/(search|find|browse|explore|discover)/i,
+            [INTENTS.CHAT]:           /\/(chat|conversation|prompt|ask|new)/i,
+            [INTENTS.RESEARCH]:       /\/(chat|conversation|prompt|ask|new|search)/i,
+            [INTENTS.DOWNLOAD]:       /\/(download|export|save|archive)/i,
+            [INTENTS.COMMERCE]:       /\/(cart|checkout|order|product|buy|shop|store|wishlist)/i,
+            [INTENTS.MEDIA_PLAY]:     /\/(watch|listen|player|now-playing|queue|album|track|playlist|episode|stream)/i,
           };
           const _evalPattern = _INTENT_EVAL_PATTERNS[intent];
           if (_evalPattern) {

@@ -73,6 +73,7 @@ const INTENTS = {
   SCHEDULING:     'scheduling',     // book, schedule, reserve, appointment, calendar
   MAPS:           'maps',           // directions, nearby, navigate, locate
   DOWNLOAD:       'download',       // download, export, save a file
+  MEDIA_PLAY:     'media_play',     // play, stream, or watch music/video/media
   SUPPORT:        'support',        // contact support, help center, ticket
   DASHBOARD:      'dashboard',      // analytics, stats, admin, overview
   HOME:           'home',           // generic visit — open the site's landing page
@@ -141,6 +142,11 @@ const INTENT_PATTERNS = [
   {
     intent: INTENTS.DOWNLOAD,
     re: /\b(download[\s_-].*(?:file|pdf|image|video|report)|export[\s_-].*(?:data|report|list|file)|save[\s_-].*(?:file|pdf|image))\b/i,
+  },
+  // MEDIA_PLAY — play, stream, or watch music/video/media
+  {
+    intent: INTENTS.MEDIA_PLAY,
+    re: /\b(play\s+(?:\w+\s+)*(?:playlist|song|track|album|music|video|movie|show|episode|first\s+result)|stream\s+(?:\w+\s+)*(?:video|movie|show|song|track|music)|watch\s+(?:\w+\s+)*(?:video|movie|show|episode|first\s+result))\b/i,
   },
   // SUPPORT — help / contact / ticket
   {
@@ -230,6 +236,7 @@ Definitions and examples:
 - scheduling     : book, schedule, reserve, appointment, calendar. Examples: "book a table on OpenTable", "schedule a Zoom meeting", "reserve a room"
 - maps           : directions, nearby, navigate, locate. Examples: "directions to the airport", "find nearby gas stations", "navigate to Times Square"
 - download       : download, export, or save a file. Examples: "download the PDF", "export the report", "save the image"
+- media_play     : play, stream, or watch media. Examples: "play my Spotify playlist", "watch a YouTube video", "play the first result on YouTube Music"
 - support        : contact support, help center, ticket. Examples: "open a support ticket", "contact customer support"
 - dashboard      : analytics, stats, admin, overview. Examples: "show my dashboard", "view analytics", "open admin panel"
 - home           : any other generic navigation, visiting a site, opening a page, clicking elements. Examples: "go to github.com", "open Slack", "visit the homepage"
@@ -468,9 +475,10 @@ const INTENT_ACCEPTED_URL_TYPES = {
   [INTENTS.SCHEDULING]:     [INTENTS.SCHEDULING, INTENTS.HOME],
   [INTENTS.MAPS]:           [INTENTS.MAPS, INTENTS.HOME],
   [INTENTS.DOWNLOAD]:       [INTENTS.DOWNLOAD, INTENTS.HOME, INTENTS.DOCS],
+  [INTENTS.MEDIA_PLAY]:     [INTENTS.MEDIA_PLAY, INTENTS.HOME, INTENTS.SEARCH],
   [INTENTS.SUPPORT]:        [INTENTS.SUPPORT, INTENTS.HOME],
   [INTENTS.DASHBOARD]:      [INTENTS.DASHBOARD, INTENTS.HOME, INTENTS.CONSOLE, INTENTS.SETTINGS],
-  [INTENTS.HOME]:           [INTENTS.HOME, INTENTS.CHAT, INTENTS.DOCS, INTENTS.CONSOLE, INTENTS.SETTINGS, INTENTS.SOCIAL, INTENTS.COMMERCE, INTENTS.CONTENT_CREATE, INTENTS.SCHEDULING, INTENTS.MAPS, INTENTS.DOWNLOAD, INTENTS.SUPPORT, INTENTS.DASHBOARD],
+  [INTENTS.HOME]:           [INTENTS.HOME, INTENTS.CHAT, INTENTS.DOCS, INTENTS.CONSOLE, INTENTS.SETTINGS, INTENTS.SOCIAL, INTENTS.COMMERCE, INTENTS.CONTENT_CREATE, INTENTS.SCHEDULING, INTENTS.MAPS, INTENTS.DOWNLOAD, INTENTS.MEDIA_PLAY, INTENTS.SUPPORT, INTENTS.DASHBOARD],
 };
 
 // ── Per-service fallback chat/home URLs ───────────────────────────────────────
@@ -479,6 +487,7 @@ const INTENT_ACCEPTED_URL_TYPES = {
 // are checked first.
 
 const SERVICE_CHAT_URLS = {
+  // API console keys (used by resolveDestination for console→chat correction)
   deepseek:   'https://chat.deepseek.com/',
   perplexity: 'https://www.perplexity.ai/',
   mistral:    'https://chat.mistral.ai/',
@@ -490,6 +499,16 @@ const SERVICE_CHAT_URLS = {
   groq:       'https://groq.com/',
   huggingface:'https://huggingface.co/chat/',
   together:   'https://api.together.ai/playground',
+  // Consumer chat app keys (matching KNOWN_BROWSER_SERVICES in browser.agent.cjs)
+  claude:           'https://claude.ai/new',
+  perplexitychat:   'https://www.perplexity.ai/',
+  grok:             'https://grok.com/',
+  deepseekchat:     'https://chat.deepseek.com/',
+  mistralchat:      'https://chat.mistral.ai/',
+  copilotmsft:      'https://copilot.microsoft.com/',
+  geminiai:         'https://gemini.google.com',
+  gemini:           'https://gemini.google.com',
+  googleai:         'https://gemini.google.com',
 };
 
 // ── Correction memory ─────────────────────────────────────────────────────────
@@ -1148,6 +1167,7 @@ module.exports = {
   getSearchUrlPattern,
   recordSearchUrlPattern,
   INTENTS,
+  SERVICE_CHAT_URLS,
   isAuthFlowUrl,
   AUTH_FLOW_PATH_RE,
 };

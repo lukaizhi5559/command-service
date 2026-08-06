@@ -12,6 +12,43 @@ function getChromium() {
   return _chromium;
 }
 
+// Cached result of whether the user's real Google Chrome is installed.
+// null = not yet checked; true/false = checked. When real Chrome launch fails,
+// this is set to false so subsequent launches skip straight to bundled CfT.
+let _realChromeAvailable = null;
+
+/**
+ * Detect whether the user's real Google Chrome is installed.
+ * Checks common install paths per platform. Returns true/false.
+ */
+function _detectRealChrome() {
+  try {
+    const platform = process.platform;
+    const fsLocal = require('fs');
+    if (platform === 'darwin') {
+      const osLocal = require('os');
+      const home = osLocal.homedir();
+      return fsLocal.existsSync('/Applications/Google Chrome.app/Contents/MacOS/Google Chrome') ||
+             fsLocal.existsSync(`${home}/Applications/Google Chrome.app/Contents/MacOS/Google Chrome`);
+    }
+    if (platform === 'win32') {
+      const path = require('path');
+      const pf = process.env['ProgramFiles'] || 'C:\\Program Files';
+      const pf86 = process.env['ProgramFiles(x86)'] || 'C:\\Program Files (x86)';
+      const localAppData = process.env['LOCALAPPDATA'] || '';
+      return fsLocal.existsSync(path.join(pf, 'Google', 'Chrome', 'Application', 'chrome.exe')) ||
+             fsLocal.existsSync(path.join(pf86, 'Google', 'Chrome', 'Application', 'chrome.exe')) ||
+             (localAppData && fsLocal.existsSync(path.join(localAppData, 'Google', 'Chrome', 'Application', 'chrome.exe')));
+    }
+    // Linux: check common binary locations
+    if (platform === 'linux') {
+      return ['/usr/bin/google-chrome', '/usr/bin/google-chrome-stable', '/usr/bin/chromium', '/usr/bin/chromium-browser']
+        .some(p => fsLocal.existsSync(p));
+    }
+  } catch (_) {}
+  return false;
+}
+
 const _sessions = new Map();
 const _telRe = /analytics|telemetry|beacon|metrics|sentry|collect|jot|log_event|track|amplitude|datadog|newrelic|rum|perf|\btapi\b|gen_?204|pixel|csp-report|\/li\/track|clienttelemetry|ingraph/i;
 
@@ -90,7 +127,17 @@ async function launch(sessionId, opts = {}) {
 
   clearProfileLock(sessionId);
 
-  const ctx = await getChromium().launchPersistentContext(profileDir, {
+  // ── Browser channel selection ──────────────────────────────────────────────
+  // Default to the user's installed Google Chrome (channel: 'chrome') instead of
+  // Playwright's bundled "Chrome for Testing". Real Chrome is required for OAuth
+  // flows — Google and Cloudflare bot-detect CDP-controlled Chrome for Testing and
+  // silently hang/refuse the OAuth handshake (e.g. ChatGPT "Continue with Google").
+  //
+  // Override via env:
+  //   THINKDROP_BROWSER_CHANNEL=chrome  → force real Chrome (default)
+  //   THINKDROP_BROWSER_CHANNEL=cft     → force bundled Chrome for Testing
+  // If real Chrome is not installed, gracefully fall back to bundled CfT.
+  const launchOpts = {
     headless: !headed,
     viewport: { width: 1280, height: 800 },
     // deviceScaleFactor is a CONTEXT option, not a viewport property. At 1x, screenshots
@@ -98,7 +145,34 @@ async function launch(sessionId, opts = {}) {
     // 2560x1600 which reads cleanly. Coordinate scaling reads the real PNG dimensions.
     deviceScaleFactor: 2,
     args: ['--disable-blink-features=AutomationControlled', '--no-first-run', '--no-default-browser-check'],
-  });
+  };
+
+  const _envChannel = String(process.env.THINKDROP_BROWSER_CHANNEL || '').toLowerCase();
+  const _wantChrome = _envChannel !== 'cft'; // default: real Chrome; 'cft' opts out
+  let _usedChannel = null;
+  let ctx = null;
+
+  if (_wantChrome) {
+    // Check if real Chrome is available (cached after first check).
+    if (_realChromeAvailable === null) {
+      _realChromeAvailable = _detectRealChrome();
+      logger.info(`[browser-engine] real Chrome available: ${_realChromeAvailable}`);
+    }
+    if (_realChromeAvailable) {
+      try {
+        ctx = await getChromium().launchPersistentContext(profileDir, { ...launchOpts, channel: 'chrome' });
+        _usedChannel = 'chrome';
+      } catch (chromeErr) {
+        logger.warn(`[browser-engine] real Chrome launch failed (${chromeErr.message}) — falling back to bundled Chrome for Testing`);
+        _realChromeAvailable = false; // don't retry real Chrome on subsequent launches
+      }
+    }
+  }
+
+  if (!ctx) {
+    ctx = await getChromium().launchPersistentContext(profileDir, launchOpts);
+    _usedChannel = 'cft';
+  }
 
   const netLog = [];
   const pages = ctx.pages();
@@ -109,7 +183,7 @@ async function launch(sessionId, opts = {}) {
   await setupInterceptionNode(ctx, sessionId);
 
   _sessions.set(sessionId, { context: ctx, netLog, refMaps: new Map(), activePage: pages.find((p) => !/^about:blank$/i.test(p.url())) || pages[0] || null });
-  logger.info(`[browser-engine] session=${sessionId} launched (${pages.length} page(s))`);
+  logger.info(`[browser-engine] session=${sessionId} launched (channel=${_usedChannel}, ${pages.length} page(s))`);
   return ctx;
 }
 
@@ -246,6 +320,12 @@ const _DOM_SCANNER_SCRIPT = `(() => {
     }
     return '';
   }
+
+  // Clear stale data-td-ref attributes from previous scans before re-tagging.
+  // Without this, re-scans assign the same refs (td1, td2, ...) to new elements
+  // while old elements keep their stale tags → duplicate refs → querySelector
+  // returns the wrong element (e.g. a button instead of the title textbox).
+  document.querySelectorAll('[data-td-ref]').forEach(el => el.removeAttribute('data-td-ref'));
 
   // Gather candidates
   const seen = new Set();
