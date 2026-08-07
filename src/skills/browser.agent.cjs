@@ -3176,6 +3176,27 @@ async function _resolveTaskDeepLink(agentId, serviceKey, baseStartUrl, task, exi
       }
     }
 
+    // Step 0.7: CHAT/RESEARCH intent template — for chatbot services, go directly to
+    // the chat interface URL BEFORE consulting the keyword cache. The keyword cache can
+    // hold polluted entries (e.g. claude.ai/public/artifacts/<id> from a previous run that
+    // ended on a view-only public page), and for "ask the AI" tasks the chat URL is always
+    // the correct starting point. Without this pre-cache check, a cache hit short-circuits
+    // and the template below (_buildIntentTemplateUrl) is never reached.
+    // (Only CHAT/RESEARCH is hoisted; other intents still consult the cache first.)
+    if (intent === INTENTS.CHAT || intent === INTENTS.RESEARCH) {
+      const _svc = String(serviceKey || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+      const _chatUrl = SERVICE_CHAT_URLS[_svc];
+      if (_chatUrl) {
+        logger.info(`[browser.agent] deep-link: CHAT/RESEARCH template (pre-cache) for ${agentId}: ${_chatUrl}`);
+        return { url: _chatUrl, source: 'template' };
+      }
+      // Fallback: if the service startUrl IS a chat URL, use it directly
+      if (/chat\.|claude\.ai|chatgpt\.com|gemini\.google|grok\.com/i.test(baseStartUrl)) {
+        logger.info(`[browser.agent] deep-link: CHAT/RESEARCH startUrl fallback (pre-cache) for ${agentId}: ${baseStartUrl}`);
+        return { url: baseStartUrl, source: 'template' };
+      }
+    }
+
     // Step 1: Check keyword-indexed deep-link cache.
     // For search-criteria tasks, SKIP the keyword cache — a generic cached destination
     // (e.g. inbox) can't encode filter criteria, and the discovery pipeline below will
@@ -3183,8 +3204,18 @@ async function _resolveTaskDeepLink(agentId, serviceKey, baseStartUrl, task, exi
     if (!_isCriteriaTask) {
       const _cachedDeepLink = await getCachedDeepLink(serviceKey, _taskKeywords);
       if (_cachedDeepLink?.url) {
-        logger.info(`[browser.agent] deep-link: keyword cache hit for ${agentId}: ${_cachedDeepLink.url} (score=${_cachedDeepLink.score.toFixed(2)})`);
-        return { url: _cachedDeepLink.url, source: 'keyword-cache' };
+        // Guard: skip cached Messenger URLs for post/share tasks (not message tasks).
+        // A stale cached Messenger URL (e.g. facebook.com/messages/t/...) causes the
+        // agent to post into a chat instead of the feed. Fall through to discovery.
+        const _taskLower = String(task || '').toLowerCase();
+        const _isPostShareTask = /\b(post|share|publish|update|tweet|feed|status)\b/i.test(_taskLower);
+        const _isMessageTask = /\b(message|msg|dm|direct message|chat|reply|respond|inbox)\b/i.test(_taskLower);
+        if (_isPostShareTask && !_isMessageTask && /\/(messages|messenger)\b/i.test(_cachedDeepLink.url)) {
+          logger.warn(`[browser.agent] deep-link: skipping cached Messenger URL for post/share task: ${_cachedDeepLink.url} — falling through to discovery`);
+        } else {
+          logger.info(`[browser.agent] deep-link: keyword cache hit for ${agentId}: ${_cachedDeepLink.url} (score=${_cachedDeepLink.score.toFixed(2)})`);
+          return { url: _cachedDeepLink.url, source: 'keyword-cache' };
+        }
       }
     }
 
@@ -3461,11 +3492,22 @@ async function _resolveTaskDeepLink(agentId, serviceKey, baseStartUrl, task, exi
           };
           const _evalPattern = _INTENT_EVAL_PATTERNS[intent];
           if (_evalPattern) {
+            // For SOCIAL intent, exclude Messenger/messages paths when the task is about
+            // posting/sharing (not messaging). Otherwise the deep-link resolver picks
+            // facebook.com/messages/t/... (Messenger) instead of the feed composer.
+            const _taskLower = String(task || '').toLowerCase();
+            const _isPostShareTask = /\b(post|share|publish|update|tweet|feed|status)\b/i.test(_taskLower);
+            const _isMessageTask = /\b(message|msg|dm|direct message|chat|reply|respond|inbox)\b/i.test(_taskLower);
+            const _excludeMessenger = intent === INTENTS.SOCIAL && _isPostShareTask && !_isMessageTask;
             const _evalMatches = evalLinks
               .filter(l => {
                 try {
                   const linkHost = new URL(l.href).hostname.replace(/^www\./, '');
-                  return (linkHost === baseHost || linkHost.endsWith('.' + baseHost)) && _evalPattern.test(l.href);
+                  if (!(linkHost === baseHost || linkHost.endsWith('.' + baseHost))) return false;
+                  if (!_evalPattern.test(l.href)) return false;
+                  // Exclude Messenger/messages paths for post/share tasks
+                  if (_excludeMessenger && /\/(messages|messenger)\b/i.test(l.href)) return false;
+                  return true;
                 } catch (_) { return false; }
               })
               .map(l => ({ ...l, _score: (l.text || '').toLowerCase().split(/\s+/).filter(w => w.length > 2 && task.toLowerCase().includes(w)).length }))
@@ -3580,12 +3622,20 @@ async function _resolveTaskDeepLink(agentId, serviceKey, baseStartUrl, task, exi
           };
           const _linkPattern = _INTENT_LINK_PATTERNS[intent];
           if (_linkPattern) {
+            // Reuse the same Messenger-exclusion heuristic as the eval path above
+            const _taskLower2 = String(task || '').toLowerCase();
+            const _isPostShareTask2 = /\b(post|share|publish|update|tweet|feed|status)\b/i.test(_taskLower2);
+            const _isMessageTask2 = /\b(message|msg|dm|direct message|chat|reply|respond|inbox)\b/i.test(_taskLower2);
+            const _excludeMessenger2 = intent === INTENTS.SOCIAL && _isPostShareTask2 && !_isMessageTask2;
             // Filter on-domain links matching the intent pattern
             const _matchingLinks = crawlResult.links
               .filter(l => {
                 try {
                   const linkHost = new URL(l.href).hostname.replace(/^www\./, '');
-                  return (linkHost === baseHost || linkHost.endsWith('.' + baseHost)) && _linkPattern.test(l.href);
+                  if (!(linkHost === baseHost || linkHost.endsWith('.' + baseHost))) return false;
+                  if (!_linkPattern.test(l.href)) return false;
+                  if (_excludeMessenger2 && /\/(messages|messenger)\b/i.test(l.href)) return false;
+                  return true;
                 } catch (_) { return false; }
               })
               .map(l => ({ ...l, _score: (l.text || '').toLowerCase().split(/\s+/).filter(w => task.toLowerCase().includes(w)).length }))
@@ -3666,8 +3716,14 @@ async function _resolveTaskDeepLink(agentId, serviceKey, baseStartUrl, task, exi
     // Layer 2: Skip caching for search-criteria tasks — the resolved URL is either too
     // specific (encodes the exact query, won't match future tasks) or too generic (inbox
     // fallback, harmful). Criteria tasks should always re-derive their #search/ URL.
+    // Also skip caching Messenger URLs for post/share tasks — they're the wrong destination
+    // (chat instead of feed) and would pollute the cache for future post/share tasks.
     const _mergedKeywords = [...new Set([..._taskKeywords, ...(_webAgentKeywords || []), ..._suggestKeywords])].slice(0, 20);
-    if (_mergedKeywords.length > 0 && !_isSearchCriteriaTask(task)) {
+    const _taskLowerCache = String(task || '').toLowerCase();
+    const _isPostShareTaskCache = /\b(post|share|publish|update|tweet|feed|status)\b/i.test(_taskLowerCache);
+    const _isMessageTaskCache = /\b(message|msg|dm|direct message|chat|reply|respond|inbox)\b/i.test(_taskLowerCache);
+    const _skipCacheForMessenger = _isPostShareTaskCache && !_isMessageTaskCache && /\/(messages|messenger)\b/i.test(candidate);
+    if (_mergedKeywords.length > 0 && !_isSearchCriteriaTask(task) && !_skipCacheForMessenger) {
       setImmediate(() => {
         recordDeepLinkCache(serviceKey, candidate, _mergedKeywords, intent).catch(() => {});
       });
@@ -6064,7 +6120,16 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
       const _cached = await getLearnedCorrection(_serviceKey, _intent);
       if (_cached?.correctedUrl) {
         logger.info(`[browser.agent] deep-link: cached correction ${_cached.correctedUrl} (conf=${_cached.confidence.toFixed(2)}) for ${_serviceKey}:${_intent}`);
-        if (_isUnsafeDeepLinkUrl(_cached.correctedUrl, _baseHost)) {
+        // Guard: skip cached Messenger URLs for post/share tasks (not message tasks)
+        const _taskLower0 = String(task || '').toLowerCase();
+        const _isPostShareTask0 = /\b(post|share|publish|update|tweet|feed|status)\b/i.test(_taskLower0);
+        const _isMessageTask0 = /\b(message|msg|dm|direct message|chat|reply|respond|inbox)\b/i.test(_taskLower0);
+        if (_isPostShareTask0 && !_isMessageTask0 && /\/(messages|messenger)\b/i.test(_cached.correctedUrl)) {
+          logger.warn(`[browser.agent] deep-link: dropping cached Messenger correction for post/share task ${_serviceKey}:${_intent}: ${_cached.correctedUrl}`);
+          setImmediate(() => {
+            deleteLearnedCorrection(_serviceKey, _intent).catch(() => {});
+          });
+        } else if (_isUnsafeDeepLinkUrl(_cached.correctedUrl, _baseHost)) {
           logger.warn(`[browser.agent] deep-link: dropping unsafe cached correction for ${_serviceKey}:${_intent}: ${_cached.correctedUrl}`);
           setImmediate(() => {
             deleteLearnedCorrection(_serviceKey, _intent).catch(() => {});
@@ -6156,8 +6221,13 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
             // Also record in keyword-indexed deep-link cache.
             // Layer 2: Skip for search-criteria tasks — criteria URLs are too specific
             // or too generic to be useful for keyword matching (see _resolveTaskDeepLink).
+            // Also skip Messenger URLs for post/share tasks — they're the wrong destination.
             const _secondaryKeywords = getTaskKeywords(task);
-            if (_secondaryKeywords.length > 0 && !_isSearchCriteriaTask(task)) {
+            const _taskLowerSec = String(task || '').toLowerCase();
+            const _isPostShareSec = /\b(post|share|publish|update|tweet|feed|status)\b/i.test(_taskLowerSec);
+            const _isMessageSec = /\b(message|msg|dm|direct message|chat|reply|respond|inbox)\b/i.test(_taskLowerSec);
+            const _skipCacheMsgSec = _isPostShareSec && !_isMessageSec && /\/(messages|messenger)\b/i.test(_bestUrl);
+            if (_secondaryKeywords.length > 0 && !_isSearchCriteriaTask(task) && !_skipCacheMsgSec) {
               setImmediate(() => {
                 recordDeepLinkCache(_serviceKey, _bestUrl, _secondaryKeywords, _intent).catch(() => {});
               });
@@ -6273,7 +6343,7 @@ When extracting page content with run-code, prioritize these selectors over gene
         _stepIndex,
     }, 140000));
 
-    const agentResultText = String(agentResult?.result ?? agentResult?.stdout ?? '');
+    let agentResultText = String(agentResult?.result ?? agentResult?.stdout ?? '');
 
     // ── Bubble up askUser from playwright.agent ────────────────────────────────
     // If playwright.agent surfaced an ask_user (goal not achieved after recipe
@@ -6614,14 +6684,82 @@ When extracting page content with run-code, prioritize these selectors over gene
           ((step.result.text?.length || 0) > 100 || (step.result.links?.length || 0) > 0)
         );
         if (_isSparse && !_hasVideoLinks && !_hasExtractedContent && !_isSearchUrl && !_transcriptHasNoResults) {
-          logger.warn(`[browser.agent] Research quality gate: sparse content for ${agentId} (longLines=${_longLines}, totalWords=${_totalWords}) — marking researchContentEmpty`);
-          return {
-            ok: false,
-            agentId,
-            task,
-            error: `${agentId} returned navigation/welcome content instead of research data (${_longLines} content lines, ${_totalWords} total words). The service may require login or the URL landed on the wrong page.`,
-            researchContentEmpty: true,
-          };
+          // ── Capture-timing miss retry ────────────────────────────────────────
+          // If the result looks like a premature capture (sentinel string from
+          // playwright.agent's "assuming success" fallback, or generic sparse text),
+          // the AI response may still be streaming. Do ONE bounded re-extraction:
+          // wait for text stability on the live session, then re-check.
+          const _looksLikeCaptureMiss = /^Submitted \(|Completed via field map|no verification configured/i.test(agentResultText)
+            || agentResultText.trim().split(/\s+/).filter(Boolean).length < 10;
+          if (_looksLikeCaptureMiss && sessionId) {
+            logger.info(`[browser.agent] Research quality gate: sparse result looks like capture-timing miss — re-extracting from live session (up to 15s)`);
+            try {
+              // Wait for text stability: poll innerText length, exit after 2s no-growth
+              const _reExtractDeadline = Date.now() + 15000;
+              let _prevLen = 0;
+              let _lastChange = Date.now();
+              while (Date.now() < _reExtractDeadline) {
+                const _lenRes = await callBrowserAct({ action: 'evaluate', text: '(document.body?.innerText || "").length', sessionId, headed: true }, 10000).catch(() => null);
+                const _curLen = Number(_lenRes?.result ?? _lenRes?.ok ?? 0) || 0;
+                if (_curLen !== _prevLen) { _lastChange = Date.now(); _prevLen = _curLen; }
+                if (_prevLen > 200 && (Date.now() - _lastChange) > 2000) break;
+                await new Promise(r => setTimeout(r, 500));
+              }
+              // Re-extract page text
+              const _freshRes = await callBrowserAct({ action: 'getPageText', sessionId, headed: true, timeoutMs: 10000 }).catch(() => null);
+              const _freshText = String(_freshRes?.result || '').trim();
+              if (_freshText) {
+                const _freshLines = _freshText.trim().split(/\n+/).filter(l => l.trim().length > 2);
+                const _freshLongLines = _freshLines.filter(l => l.trim().split(/\s+/).length > 6).length;
+                const _freshTotalWords = _freshText.trim().split(/\s+/).filter(Boolean).length;
+                const _freshIsSparse = _freshLongLines < 3 && _freshTotalWords < 60;
+                logger.info(`[browser.agent] Research quality gate: re-extraction got ${_freshText.length} chars (longLines=${_freshLongLines}, totalWords=${_freshTotalWords}, sparse=${_freshIsSparse})`);
+                if (!_freshIsSparse) {
+                  // Substantive content found — update result and skip the failure
+                  agentResultText = _freshText;
+                  if (agentResult) agentResult.result = _freshText;
+                  logger.info(`[browser.agent] Research quality gate: re-extraction recovered substantive content — proceeding`);
+                  // Skip the sparse failure below by re-evaluating
+                } else {
+                  logger.warn(`[browser.agent] Research quality gate: sparse content for ${agentId} (longLines=${_longLines}, totalWords=${_totalWords}) — marking researchContentEmpty`);
+                  return {
+                    ok: false,
+                    agentId,
+                    task,
+                    error: `${agentId} returned navigation/welcome content instead of research data (${_longLines} content lines, ${_totalWords} total words). The service may require login or the URL landed on the wrong page.`,
+                    researchContentEmpty: true,
+                  };
+                }
+              } else {
+                logger.warn(`[browser.agent] Research quality gate: re-extraction returned empty — marking researchContentEmpty`);
+                return {
+                  ok: false,
+                  agentId,
+                  task,
+                  error: `${agentId} returned navigation/welcome content instead of research data (${_longLines} content lines, ${_totalWords} total words). The service may require login or the URL landed on the wrong page.`,
+                  researchContentEmpty: true,
+                };
+              }
+            } catch (_reExtractErr) {
+              logger.warn(`[browser.agent] Research quality gate: re-extraction failed: ${_reExtractErr.message} — marking researchContentEmpty`);
+              return {
+                ok: false,
+                agentId,
+                task,
+                error: `${agentId} returned navigation/welcome content instead of research data (${_longLines} content lines, ${_totalWords} total words). The service may require login or the URL landed on the wrong page.`,
+                researchContentEmpty: true,
+              };
+            }
+          } else {
+            logger.warn(`[browser.agent] Research quality gate: sparse content for ${agentId} (longLines=${_longLines}, totalWords=${_totalWords}) — marking researchContentEmpty`);
+            return {
+              ok: false,
+              agentId,
+              task,
+              error: `${agentId} returned navigation/welcome content instead of research data (${_longLines} content lines, ${_totalWords} total words). The service may require login or the URL landed on the wrong page.`,
+              researchContentEmpty: true,
+            };
+          }
         }
         }
     }
@@ -6663,7 +6801,10 @@ When extracting page content with run-code, prioritize these selectors over gene
                     const _sig = (_entry.details?.shortcut || '').toLowerCase()
                         + ' ' + (_entry.details?.selector || '').toLowerCase();
                     if (_sig.trim() && _transcriptText.includes(_sig.trim().split(/\s+/)[0])) {
-                        setImmediate(() => recordVerification(_akHost, _entry.id, true).catch(() => {}));
+                        // recordVerification is synchronous (returns undefined, not a Promise),
+                        // so .catch() must NOT be used — wrap in try/catch inside setImmediate
+                        // so a failure here can never crash the command-service process.
+                        setImmediate(() => { try { recordVerification(_akHost, _entry.id, true); } catch (_) { /* non-fatal */ } });
                     }
                 }
             }

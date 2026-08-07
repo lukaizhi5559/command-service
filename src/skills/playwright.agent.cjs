@@ -1392,6 +1392,7 @@ async function pageProbe(sessionId, headed, timeoutMs = 5000) {
     hasCanvas: document.querySelector('canvas') !== null,
     bodyTextLength: document.body?.innerText?.length || 0,
     hostname: window.location.hostname,
+    url: window.location.href,
     hasModalDialog: Array.from(document.querySelectorAll('[role="dialog"], [data-testid*="modal"], [data-testid*="share"], [aria-modal="true"]')).some(el => {
       const r = el.getBoundingClientRect();
       return r.width > 0 && r.height > 0;
@@ -2058,6 +2059,14 @@ async function bestEffortKeyboard(goal, pageType, sessionId, headed, timeoutMs) 
 
     logger.info(`[playwright.agent] Tier 2.5 best-effort: ${parsed.steps.length} keyboard steps — ${parsed.thoughts}`);
     const transcript = [];
+
+    // Clear existing content before typing — prevents duplicate text from prior
+    // failed attempts (e.g. Tier 1.7 typed but failed to submit, leaving text in
+    // the compose box). Meta+A selects all; the first type step then replaces it.
+    const _hasTypeStep = parsed.steps.some(s => s.type);
+    if (_hasTypeStep) {
+      await browserAct({ action: 'press', key: 'Meta+a', sessionId, headed, timeoutMs: 3000 }).catch(() => {});
+    }
 
     for (let i = 0; i < parsed.steps.length; i++) {
       const step = parsed.steps[i];
@@ -2793,15 +2802,23 @@ async function _retryFieldFill(page, field, value, browserAct, sessionId, fieldT
 // use these protocols — they use regular fetch POST with JSON. So detecting them
 // is a definitive signal that a streamed response is in progress.
 //
-// Multi-signal: network protocol (strongest) + content growth (behavioral fallback).
+// Multi-signal: network protocol (strongest) + content growth/URL change (behavioral).
 // Handles variable response timing: up to maxWait for streaming to start (5s preload
 // case), early exit after earlyExit ms if no activity (true autoSave).
 //
+// Activity signals (any one keeps us waiting):
+//   - streamingSeen (network flag from listeners)
+//   - URL changed from preSubmitUrl (ChatGPT navigates / → /c/<id> on first message)
+//   - innerText changed materially in EITHER direction vs postSubmitBaseline (|Δ| > 100)
+//     — catches the shrink-then-grow pattern during page transition mid-stream
+//   - innerText grew > 200 vs postSubmitBaseline (original growth check, now vs right baseline)
+//
 // NOTE: Listeners are set up BEFORE the field loop by the caller (so they catch the
 // SSE event when Enter is pressed during typing). This function only polls content
-// growth + checks the pre-set streamingSeen flag, then runs cleanup in finally.
-async function _detectStreamingResponse(page, baselineTextLen, streamingSeen, cleanup, maxWait = 10000, earlyExit = 3000) {
+// growth + URL + checks the pre-set streamingSeen flag, then runs cleanup in finally.
+async function _detectStreamingResponse(page, postSubmitBaselineTextLen, preSubmitUrl, streamingSeen, cleanup, maxWait = 10000, earlyExit = 8000) {
   let _contentGrew = false;
+  let _urlChanged = false;
   try {
     const deadline = Date.now() + maxWait;
     const earlyDeadline = Date.now() + earlyExit;
@@ -2809,32 +2826,93 @@ async function _detectStreamingResponse(page, baselineTextLen, streamingSeen, cl
     while (Date.now() < deadline) {
       await new Promise(r => setTimeout(r, 500));
 
-      if (streamingSeen || _contentGrew) return true;
+      if (streamingSeen || _contentGrew || _urlChanged) return true;
 
-      // Behavioral: check content growth
-      const currentLen = await page.evaluate(() => (document.body?.innerText || '').length).catch(() => 0);
-      if (currentLen > baselineTextLen + 200) {
-        _contentGrew = true;
+      // Behavioral: check URL change (strong signal — ChatGPT/Claude navigate on first message)
+      const currentUrl = await page.evaluate(() => location.href).catch(() => '');
+      if (preSubmitUrl && currentUrl && currentUrl !== preSubmitUrl) {
+        _urlChanged = true;
+        logger.info(`[playwright.agent] field map: URL changed post-submit (${preSubmitUrl} → ${currentUrl}) — treating as streaming activity`);
         return true;
       }
 
-      // Early exit: no network streaming AND no content growth → true autoSave
-      if (Date.now() > earlyDeadline && !streamingSeen && !_contentGrew) return false;
+      // Behavioral: check content growth OR shrink (page transition causes shrink-then-grow)
+      const currentLen = await page.evaluate(() => (document.body?.innerText || '').length).catch(() => 0);
+      if (Math.abs(currentLen - postSubmitBaselineTextLen) > 100) {
+        _contentGrew = true;
+        logger.info(`[playwright.agent] field map: text length changed post-submit (baseline=${postSubmitBaselineTextLen} current=${currentLen} Δ=${currentLen - postSubmitBaselineTextLen}) — treating as streaming activity`);
+        return true;
+      }
+
+      // Early exit: no network streaming AND no URL change AND no content movement → true autoSave
+      if (Date.now() > earlyDeadline && !streamingSeen && !_contentGrew && !_urlChanged) return false;
     }
 
-    return streamingSeen || _contentGrew;
+    return streamingSeen || _contentGrew || _urlChanged;
   } finally {
     if (cleanup) cleanup();
   }
 }
 
-// Capture a streaming response: detect → waitForStableText → getPageText.
+// Capture a streaming response: detect → dual-signal completion wait → getPageText.
 // Returns the extracted text on success, or null if no streaming detected.
-async function _captureStreamingResponse(sessionId, page, baselineTextLen, streamingSeen, cleanup, timeoutMs) {
-  const _streaming = await _detectStreamingResponse(page, baselineTextLen, streamingSeen, cleanup, 10000, 3000);
+//
+// Completion signals (any one):
+//   Signal 1: SSE requestfinished event (definitive — fires when the stream ends)
+//   Signal 2: Sliding window — 3s of no text growth (fallback for non-SSE sites)
+//   Signal 3: Stop button disappearance (ChatGPT/Claude show a Stop button while
+//             streaming; its disappearance means the response is complete)
+// This replaces waitForStableText which returns immediately on stable page text
+// before the AI starts generating (its exact-match exit fires on pre-streaming text).
+//
+// postSubmitBaselineTextLen: captured by the caller ~500ms after submit (not before!)
+//   — a pre-submit baseline is defeated by the page transition on submit.
+// preSubmitUrl: captured before the field loop — used to detect URL change as activity.
+async function _captureStreamingResponse(sessionId, page, postSubmitBaselineTextLen, preSubmitUrl, streamingSeen, cleanup, timeoutMs) {
+  const _streaming = await _detectStreamingResponse(page, postSubmitBaselineTextLen, preSubmitUrl, streamingSeen, cleanup, 10000, 8000);
   if (!_streaming) return null;
-  logger.info(`[playwright.agent] field map: streaming response detected — waiting for stable text (up to 60s)`);
-  await browserAct({ action: 'waitForStableText', sessionId, headed: true, timeoutMs: Math.min(timeoutMs, 60000) }).catch(() => {});
+  logger.info(`[playwright.agent] field map: streaming response detected — waiting for completion (up to 60s)`);
+
+  // Triple-signal completion wait
+  const _sseFinished = (typeof cleanup?._sseRequestFinished === 'function') ? cleanup._sseRequestFinished : () => false;
+  const deadline = Date.now() + Math.min(timeoutMs, 60000);
+  let prevLen = 0;
+  let lastChangeTime = Date.now();
+  const startTime = Date.now();
+  let _stopButtonWasVisible = false;
+
+  while (Date.now() < deadline) {
+    // Signal 1: SSE request finished — definitive completion
+    if (_sseFinished()) {
+      logger.info(`[playwright.agent] field map: SSE completion signal — capturing text`);
+      break;
+    }
+    // Signal 3: Stop button disappearance (ChatGPT/Claude DOM-based completion)
+    const _stopVisible = await page.evaluate(() => {
+      const sel = '[data-testid="stop-button"], button[aria-label*="Stop" i], button[aria-label*="stop" i]';
+      const el = document.querySelector(sel);
+      return !!(el && el.offsetParent !== null);
+    }).catch(() => false);
+    if (_stopVisible) {
+      _stopButtonWasVisible = true;
+    } else if (_stopButtonWasVisible) {
+      // Stop button was visible and is now gone → response complete
+      logger.info(`[playwright.agent] field map: Stop button disappeared — capturing text`);
+      break;
+    }
+    // Signal 2: Sliding window — 3s of no text growth (fallback)
+    const curLen = await page.evaluate(() => (document.body?.innerText || '').length).catch(() => 0);
+    if (curLen !== prevLen) {
+      lastChangeTime = Date.now();
+    }
+    if (prevLen > 0 && (Date.now() - lastChangeTime) > 3000 && (Date.now() - startTime) > 3000) {
+      logger.info(`[playwright.agent] field map: text stable for 3s — capturing text`);
+      break;
+    }
+    prevLen = curLen;
+    await new Promise(r => setTimeout(r, 200));
+  }
+
   const _textRes = await browserAct({ action: 'getPageText', sessionId, headed: true, timeoutMs: 10000 }).catch(() => null);
   const _text = String(_textRes?.result || '').trim();
   if (_text) {
@@ -2861,34 +2939,121 @@ async function _executeFieldMap(sessionId, fieldValues, fieldMap, timeoutMs, opt
   // True autoSave editors (Notion, Google Docs) don't use pressAfter="Enter" on body.
   // NOTE: autoSave is NOT required — AI chat maps may have autoSave=true OR false.
   const _hasEnterSubmit = !(fieldMap.submitSelectors?.length) &&
-    fieldMap.fields?.some(f => f.pressAfter === 'Enter' && (f.role === 'body' || f.role === 'message'));
+    fieldMap.fields?.some(f => f.pressAfter === 'Enter');
   let _baselineTextLen = 0;
+  let _preSubmitUrl = '';
   let _streamingSeen = false;
   let _streamingCleanup = null;
   if (_hasEnterSubmit) {
     _baselineTextLen = await page.evaluate(() => (document.body?.innerText || '').length).catch(() => 0);
-    // Set up listeners BEFORE field loop — Enter is pressed during typing, SSE starts immediately
-    const _onResponse = (res) => {
+    _preSubmitUrl = await page.evaluate(() => location.href).catch(() => '');
+    // Target hostname for diagnostic filtering — only log non-matching stream
+    // candidates on the same host as the page (avoids noise from CDNs/analytics).
+    let _targetHost = '';
+    try { _targetHost = _preSubmitUrl ? new URL(_preSubmitUrl).hostname : ''; } catch (_) {}
+    // Static asset extensions to skip in the non-matching diagnostic log.
+    const _STATIC_ASSET_RE = /\.(?:js|css|png|jpe?g|gif|svg|woff2?|ttf|ico|map|wasm)(?:\?|#|$)/i;
+    // Set up listeners BEFORE field loop — Enter is pressed during typing, SSE starts immediately.
+    // Multi-signal network detection: content-type (original) + URL pattern (robust against
+    // content-type changes) + chunked transfer-encoding. Listeners attached at BOTH page and
+    // context level so engine wrappers / service workers can't swallow events.
+    let _sseRequestFinished = false;
+    const _STREAM_URL_RE = /\/backend-api\/conver|\/api\/chat|\/api\/conversation|\/completions|\/conversation|\/messages|\/stream|\/sse/i;
+    const _isStreamResponse = (res) => {
       try {
         const ct = (res.headers()['content-type'] || '').toLowerCase();
-        if (ct.includes('text/event-stream') || ct.includes('application/stream') || ct.includes('x-ndjson')) {
-          _streamingSeen = true;
+        const te = (res.headers()['transfer-encoding'] || '').toLowerCase();
+        const url = res.url() || '';
+        const ctMatch = ct.includes('text/event-stream') || ct.includes('application/stream') || ct.includes('x-ndjson');
+        const urlMatch = _STREAM_URL_RE.test(url);
+        const chunked = te.includes('chunked');
+        return { ctMatch, urlMatch, chunked, ct, url };
+      } catch (_) {
+        return null;
+      }
+    };
+    const _onResponse = (res) => {
+      const info = _isStreamResponse(res);
+      if (!info) return;
+      if (info.ctMatch || info.urlMatch) {
+        if (!_streamingSeen) {
+          logger.info(`[playwright.agent] field map: stream response detected (ct="${info.ct}" url="${info.url}")`);
+        }
+        _streamingSeen = true;
+        return;
+      }
+      // Diagnostic: log non-matching responses that are likely stream candidates.
+      // If the network signal misses, this shows exactly what the service sent so
+      // we can extend the matcher instead of guessing.
+      try {
+        const resUrl = info.url || '';
+        // Filter: only same-host responses (skip CDNs, analytics, etc.)
+        let resHost = '';
+        try { resHost = resUrl ? new URL(resUrl).hostname : ''; } catch (_) {}
+        if (!_targetHost || !resHost || resHost !== _targetHost) return;
+        // Filter: skip obvious static assets
+        if (_STATIC_ASSET_RE.test(resUrl)) return;
+        // Get method + status for diagnostic context
+        const method = res.request()?.method?.() || res.request()?.method || '?';
+        const status = res.status();
+        const ct = info.ct || '';
+        const te = (res.headers()['transfer-encoding'] || '').toLowerCase();
+        // Log candidate: POST to target host, OR chunked, OR non-HTML text/*
+        const isPost = String(method).toUpperCase() === 'POST';
+        const isChunked = te.includes('chunked');
+        const isNonHtmlText = ct.startsWith('text/') && !ct.includes('text/html');
+        if (isPost || isChunked || isNonHtmlText) {
+          logger.info(`[playwright.agent] field map: non-matching stream candidate (method=${method} ct="${ct}" url="${resUrl}" status=${status} te="${te}")`);
+        }
+      } catch (_) {}
+    };
+    const _onRequestFinished = (req) => {
+      try {
+        const res = req.response();
+        if (!res) return;
+        const info = _isStreamResponse(res);
+        if (!info) return;
+        if (info.ctMatch || info.urlMatch) {
+          _sseRequestFinished = true;
+          logger.info(`[playwright.agent] field map: stream request finished — streaming response complete (ct="${info.ct}" url="${info.url}")`);
         }
       } catch (_) {}
     };
     const _onWebSocket = () => { _streamingSeen = true; };
+    // Page-level listeners (existing)
     page.on('response', _onResponse);
+    page.on('requestfinished', _onRequestFinished);
     page.on('websocket', _onWebSocket);
+    // Context-level listeners (new — catches events that page-level misses)
+    const _ctx = engine.getContext(sessionId);
+    if (_ctx) {
+      _ctx.on('response', _onResponse);
+      _ctx.on('requestfinished', _onRequestFinished);
+    }
     _streamingCleanup = () => {
       page.removeListener('response', _onResponse);
+      page.removeListener('requestfinished', _onRequestFinished);
       page.removeListener('websocket', _onWebSocket);
+      if (_ctx) {
+        try { _ctx.removeListener('response', _onResponse); } catch (_) {}
+        try { _ctx.removeListener('requestfinished', _onRequestFinished); } catch (_) {}
+      }
     };
-    logger.info(`[playwright.agent] field map: Enter-submit detected (pressAfter=Enter, no submitSelectors) — listeners armed for streaming detection`);
+    // Expose _sseRequestFinished via closure — _captureStreamingResponse reads it
+    _streamingCleanup._sseRequestFinished = () => _sseRequestFinished;
+    logger.info(`[playwright.agent] field map: Enter-submit detected (pressAfter=Enter, no submitSelectors) — listeners armed (page+context) for streaming detection (preSubmitUrl=${_preSubmitUrl})`);
   }
 
   // Phase 1: Fill each field — placeholder first, CSS selector fallback, role+position fallback
   for (const field of fieldMap.fields) {
-    const value = fieldValues[field.name] || field.text;
+    let value = fieldValues[field.name] || field.text;
+    // Fallback: cached field name may not match the extraction (e.g. cache has
+    // "prompt" but extraction returns "body"). When there's exactly one field in
+    // the map and exactly one extracted value, use it regardless of name mismatch.
+    // This is the common case for AI chat prompts (single field, single value).
+    if (!value && fieldMap.fields.length === 1 && fieldValues && Object.keys(fieldValues).length > 0) {
+      value = Object.values(fieldValues)[0];
+    }
     if (!value) {
       logger.info(`[playwright.agent] field map: skipping field "${field.name}" — no value`);
       continue;
@@ -3319,7 +3484,11 @@ async function _executeFieldMap(sessionId, fieldValues, fieldMap, timeoutMs, opt
 
     // Enter was the submit — check for streaming response (AI chat, search, etc.)
     logger.info(`[playwright.agent] field map: autoSave=true but Enter-submit detected — checking for streaming response`);
-    const _text = await _captureStreamingResponse(sessionId, page, _baselineTextLen, _streamingSeen, _streamingCleanup, timeoutMs);
+    // Re-baseline AFTER submit — a pre-submit baseline is defeated by the page transition
+    // (ChatGPT navigates / → /c/<id>, innerText shrinks then grows).
+    await new Promise(r => setTimeout(r, 500));
+    const _postSubmitBaseline = await page.evaluate(() => (document.body?.innerText || '').length).catch(() => 0);
+    const _text = await _captureStreamingResponse(sessionId, page, _postSubmitBaseline, _preSubmitUrl, _streamingSeen, _streamingCleanup, timeoutMs);
     if (_text) return { ok: true, transcript, result: _text };
 
     // No streaming detected — true autoSave or response already complete
@@ -3384,7 +3553,11 @@ async function _executeFieldMap(sessionId, fieldValues, fieldMap, timeoutMs, opt
   // the response streams after Enter. Wait for it to settle, then extract page text.
   if (_hasEnterSubmit) {
     logger.info(`[playwright.agent] field map: Enter-submit detected post-submit — checking for streaming response`);
-    const _text = await _captureStreamingResponse(sessionId, page, _baselineTextLen, _streamingSeen, _streamingCleanup, timeoutMs);
+    // Re-baseline AFTER submit — a pre-submit baseline is defeated by the page transition
+    // (ChatGPT navigates / → /c/<id>, innerText shrinks then grows).
+    await new Promise(r => setTimeout(r, 500));
+    const _postSubmitBaseline = await page.evaluate(() => (document.body?.innerText || '').length).catch(() => 0);
+    const _text = await _captureStreamingResponse(sessionId, page, _postSubmitBaseline, _preSubmitUrl, _streamingSeen, _streamingCleanup, timeoutMs);
     if (_text) return { ok: true, transcript, result: _text };
     logger.info(`[playwright.agent] field map: no streaming detected post-submit`);
   }
@@ -4905,6 +5078,8 @@ async function _waitForComposeFocus(page, timeoutMs = 12000, frameOrPage = null)
   const _start = Date.now();
   let _lastLog = 0;
   let _evalErrLogged = false;
+  let _clickAttempts = 0;
+  let _triggerClickedOnce = false;
   while (Date.now() - _start < timeoutMs) {
     try {
       // NOTE: page.evaluate accepts exactly ONE argument — always pass a single object.
@@ -4959,6 +5134,32 @@ async function _waitForComposeFocus(page, timeoutMs = 12000, frameOrPage = null)
           return false;
         });
         if (_clicked) logger.info(`[playwright.agent] waiting for compose focus: clicked compose element to focus`);
+        _clickAttempts++;
+      }
+      // After 3 unsuccessful click attempts on compose elements, try clicking the
+      // post-composer trigger (e.g. "What's on your mind?" on Facebook feed).
+      // The compose element found by _COMPOSE_SEL may be the search box (role=combobox),
+      // not the actual post composer trigger.
+      if (!_state.focused && _clickAttempts >= 3 && !_triggerClickedOnce) {
+        _triggerClickedOnce = true;
+        const _triggerClicked = await _target.evaluate(() => {
+          // Look for common post-composer triggers across social platforms
+          const candidates = Array.from(document.querySelectorAll('div[role="button"], button, [role="button"]')).filter(el => {
+            const text = (el.innerText || el.getAttribute('aria-label') || '').toLowerCase();
+            const r = el.getBoundingClientRect();
+            if (r.width === 0 || r.height === 0) return false;
+            return /what'?s on your mind|create (a )?post|start a post|write something|share what|new post/i.test(text);
+          });
+          if (candidates.length > 0) {
+            candidates[0].click();
+            return (candidates[0].innerText || candidates[0].getAttribute('aria-label') || '').slice(0, 40);
+          }
+          return null;
+        }).catch(() => null);
+        if (_triggerClicked) {
+          logger.info(`[playwright.agent] waiting for compose focus: clicked post-composer trigger "${_triggerClicked}" after ${_clickAttempts} failed compose clicks`);
+          await page.waitForTimeout(800); // let the modal open
+        }
       }
       if (Date.now() - _lastLog > 1000) {
         logger.info(`[playwright.agent] waiting for compose focus: focused=false inModal=${_state.inModal} needsClick=${!!_state.needsClick} (${Date.now() - _start}ms)`);
@@ -7719,6 +7920,13 @@ async function playwrightAgent(args) {
     }
   }
 
+  // ── Phase 1.1 variables (declared early to avoid TDZ in Tier 1.7) ──────────
+  // These are set in Phase 1.1 below but referenced by Tier 1.7's return path.
+  let _pageType = 'sparse';
+  let _routingDecision = 'tier3_llm';
+  let _probeResult = null;
+  let _scriptResult = null;
+
   // ── Tier 1.5: Deterministic field map for form/compose URLs AND editor pages ──
   // After URL-first navigation + waitForStableText, try cached or LLM-generated
   // field map for type→verify→submit→verify. Falls through to Tier 2/3 on failure.
@@ -7743,15 +7951,14 @@ async function playwrightAgent(args) {
       }
       const _hasEditableFields = _quickProbe &&
         (_quickProbe.hasContentEditable || _quickProbe.hasPlaceholder || (_quickProbe.textInputCount || 0) > 0);
-      // Skip field map for read/extract tasks — no fields to fill.
-      // Read tasks (search, extract, check) don't need to type into fields;
-      // they need to READ content. Firing the field map on a search results
-      // page causes 15s timeouts trying to fill non-existent "body" fields.
-      const _hasReadVerbT15 = /\b(extract|read|search|find|check|list|show|display|look\s+up|pull\s+up|fetch|retrieve|count|how many|browse|summarize)\b/i.test(goal);
-      const _hasMutationVerbT15 = /\b(send|post|compose|tweet|share|write|create|submit|publish|edit|update|delete|remove|add|fill|type|reply|comment|draft|rename|move|sort|format|forward)\b/i.test(goal);
-      if (_hasReadVerbT15 && !_hasMutationVerbT15) {
-        logger.info(`[playwright.agent] Tier 1.5: read/extract task — skipping field map (no fields to fill)`);
-      } else if (_isFormUrl || _hasEditableFields) {
+      // Page-structure-based skip: if the page has NO editable fields, it's a
+      // read/extract task — skip the field map. If the page HAS editable fields,
+      // always try the field map regardless of goal verbs — the page structure is
+      // the ground truth, not the goal text. (Previously used a verb list which
+      // falsely skipped "Ask Claude to summarize X" because "summarize" matched.)
+      if (!_hasEditableFields && !_isFormUrl) {
+        logger.info(`[playwright.agent] Tier 1.5: no editable fields on page — skipping field map (read/extract task)`);
+      } else {
         logger.info(`[playwright.agent] Tier 1.5: ${_isFormUrl ? 'form URL' : 'editable page'} detected (url=${url} actualUrl=${_actualUrl}) — trying deterministic field map`);
         const _tier15Result = await _deterministicSelectorPath(sessionId, _actualUrl || url, goal, hostname, timeoutMs, { hasEditableFields: _hasEditableFields, agentContext, appKnowledgeEntries });
         if (_tier15Result) {
@@ -7786,6 +7993,12 @@ async function playwrightAgent(args) {
       if (_isSimpleGoal) {
         // Extract text payload: remove leading action verbs and service names
         let _textPayload = goal
+          // Strip the guard preamble (recovery anchor) — extract just the "Task: ..." part.
+          // The preamble is constructed at browser.agent.cjs:5253 as:
+          //   "IMPORTANT: You are working on <url> (browser session: <id>). If the page ever shows about:blank..."
+          // followed by "\n\nTask: <actual task>". Without this strip, the entire preamble
+          // gets typed into the compose box.
+          .replace(/^IMPORTANT: You are working on .+?\n\nTask:\s*/is, '')
           .replace(/^(?:please\s+)?(?:can\s+you\s+)?(?:I\s+want\s+to\s+|I'd\s+like\s+to\s+)?/i, '')
           .replace(/^(?:post|share|update|tweet|send|write|say|ask|tell|search\s+for|query|look\s+up|find|message)\s+/i, '')
           .replace(/^(?:on\s+|to\s+|in\s+)?[a-z][a-z0-9.]+\s+/i, '')
@@ -7807,80 +8020,156 @@ async function playwrightAgent(args) {
           if (!_typeRes.ok) {
             logger.warn(`[playwright.agent] Tier 1.7: type failed (${_typeRes.error}) — falling through to Tier 3`);
           } else {
-            // Step 2: Find and click the submit button
-            // Look for buttons with submit-like text in the scanner's element list
-            const _snapResult = await _fastSnapshot(sessionId, headed, timeoutMs);
-            const _snapYaml = _snapResult?.result || _snapResult?.stdout || '';
-            let _submitRef = null;
+            // Step 2: Universal layered submit detection
+            // Uses compose element type + DOM structure + positional proximity.
+            // No text regex — element type and position are the truth.
+            const _activeElInfo = _tier17Snap?.activeElement;
+            const _isChatCompose = _activeElInfo?.isContentEditable === true ||
+              (_activeElInfo?.tag === 'div' && _activeElInfo?.role === 'textbox');
 
-            // Parse the snapshot text for buttons with submit-like labels
-            const _submitRe = /\[(td\d+|e\d+)\]\s+(?:button|link|generic)\s+"([^"]*(?:post|send|submit|ask|search|share|tweet|publish|create|go|enter|continue)[^"]*)"/gi;
-            let _m;
-            while ((_m = _submitRe.exec(_snapYaml)) !== null) {
-              _submitRef = _m[1];
-              logger.info(`[playwright.agent] Tier 1.7: found submit button ref=${_submitRef} label="${_m[2]}"`);
-              break;
-            }
+            // Helper: verify submit succeeded (URL changed or text on page)
+            const _verifySubmit = async (_method) => {
+              await new Promise(r => setTimeout(r, 1500));
+              const _verifyUrlRes = await browserAct({ action: 'evaluate', text: 'window.location.href', sessionId, headed, timeoutMs: 3000 }).catch(() => ({ ok: false }));
+              const _verifyTextRes = await browserAct({ action: 'getPageText', sessionId, headed, timeoutMs: 10000 }).catch(() => ({ ok: false }));
+              const _pageText = _verifyTextRes?.ok ? String(_verifyTextRes.result || '') : '';
+              const _textOnPage = _pageText.includes(_textPayload.slice(0, 50));
+              const _urlChanged = _verifyUrlRes?.ok && String(_verifyUrlRes.result || '').replace(/^"|"$/g, '') !== url;
+              return { textOnPage: _textOnPage, urlChanged: _urlChanged, pageText: _pageText };
+            };
 
-            if (_submitRef) {
-              // Step 3: Click submit
-              const _clickRes = await browserAct({ action: 'click', selector: _submitRef, sessionId, headed, timeoutMs: Math.min(timeoutMs, 15000) });
-              _tier17Transcript.push({ action: { click: _submitRef }, outcome: { ok: _clickRes.ok, error: _clickRes.error } });
+            // Helper: return success result
+            const _returnSuccess = (_method, _verifyResult) => {
+              logger.info(`[playwright.agent] Tier 1.7: SUCCESS via ${_method} — textOnPage=${_verifyResult.textOnPage}, urlChanged=${_verifyResult.urlChanged}`);
+              return {
+                ok: true, goal, sessionId,
+                turns: 2, done: true,
+                result: `Completed via Tier 1.7 fast-path (${_method})${_verifyResult.textOnPage ? ' — content verified on page' : _verifyResult.urlChanged ? ' — URL changed' : ''}`,
+                transcript: _tier17Transcript,
+                routingDecision: 'tier1_7_fastpath',
+                pageType: _pageType,
+                executionTime: Date.now() - start,
+              };
+            };
 
-              if (_clickRes.ok) {
-                // Step 4: Verify — wait for state change
-                await new Promise(r => setTimeout(r, 1500));
-                const _verifyUrlRes = await browserAct({ action: 'evaluate', text: 'window.location.href', sessionId, headed, timeoutMs: 3000 }).catch(() => ({ ok: false }));
-                const _verifyTextRes = await browserAct({ action: 'getPageText', sessionId, headed, timeoutMs: 10000 }).catch(() => ({ ok: false }));
+            let _submitHandled = false;
 
-                // Check if the typed text appears in the page (post was created)
-                const _pageText = _verifyTextRes?.ok ? String(_verifyTextRes.result || '') : '';
-                const _textOnPage = _pageText.includes(_textPayload.slice(0, 50));
-                const _urlChanged = _verifyUrlRes?.ok && String(_verifyUrlRes.result || '').replace(/^"|"$/g, '') !== url;
-
-                if (_textOnPage || _urlChanged) {
-                  logger.info(`[playwright.agent] Tier 1.7: SUCCESS — textOnPage=${_textOnPage}, urlChanged=${_urlChanged}`);
-                  return {
-                    ok: true, goal, sessionId,
-                    turns: 2, done: true,
-                    result: `Completed via Tier 1.7 fast-path (type→submit→verify)${_textOnPage ? ' — content verified on page' : ' — URL changed'}`,
-                    transcript: _tier17Transcript,
-                    routingDecision: 'tier1_7_fastpath',
-                    pageType: _pageType,
-                    executionTime: Date.now() - start,
-                  };
-                } else {
-                  logger.warn(`[playwright.agent] Tier 1.7: submit clicked but no verification — falling through to Tier 3`);
-                }
-              } else {
-                logger.warn(`[playwright.agent] Tier 1.7: submit click failed (${_clickRes.error}) — falling through to Tier 3`);
-              }
-            } else {
-              // No submit button found — try pressing Enter
-              logger.info(`[playwright.agent] Tier 1.7: no submit button found — trying Enter key`);
+            // ── Layer 1: Chat compose (contenteditable div) → press Enter ────────
+            // Chat interfaces (Claude, ChatGPT, Grok, etc.) universally use Enter
+            // to submit. No button search needed — eliminates false matches.
+            if (_isChatCompose) {
+              logger.info(`[playwright.agent] Tier 1.7: chat compose detected (contenteditable div) — pressing Enter to submit`);
               const _enterRes = await browserAct({ action: 'press', key: 'Enter', sessionId, headed, timeoutMs: 5000 });
               _tier17Transcript.push({ action: { press: 'Enter' }, outcome: { ok: _enterRes.ok } });
 
               if (_enterRes.ok) {
-                await new Promise(r => setTimeout(r, 1500));
-                const _verifyTextRes = await browserAct({ action: 'getPageText', sessionId, headed, timeoutMs: 10000 }).catch(() => ({ ok: false }));
-                const _pageText = _verifyTextRes?.ok ? String(_verifyTextRes.result || '') : '';
-                const _textOnPage = _pageText.includes(_textPayload.slice(0, 50));
+                const _vResult = await _verifySubmit('Enter');
+                if (_vResult.textOnPage || _vResult.urlChanged) {
+                  return _returnSuccess('type→Enter→verify', _vResult);
+                }
+                logger.info(`[playwright.agent] Tier 1.7: Enter did not produce verifiable result — trying positional button search`);
+              }
+            }
 
-                if (_textOnPage) {
-                  logger.info(`[playwright.agent] Tier 1.7: SUCCESS via Enter — content verified on page`);
-                  return {
-                    ok: true, goal, sessionId,
-                    turns: 2, done: true,
-                    result: 'Completed via Tier 1.7 fast-path (type→Enter→verify)',
-                    transcript: _tier17Transcript,
-                    routingDecision: 'tier1_7_fastpath',
-                    pageType: _pageType,
-                    executionTime: Date.now() - start,
-                  };
+            // ── Layer 2: DOM structure — find <button> in same form/container ──
+            // Traditional forms have <button> inside <form>. SPAs may not have
+            // <form> but the button is in a nearby container.
+            if (!_submitHandled) {
+              const _domBtnRes = await browserAct({ action: 'evaluate', sessionId, headed, timeoutMs: 5000,
+                text: `(() => {
+                  const compose = document.activeElement;
+                  if (!compose) return null;
+                  // Walk up to find form, dialog, or section containing the compose element
+                  let container = compose.closest('form') || compose.closest('[role="dialog"]') || compose.closest('section');
+                  for (let i = 0; i < 3 && container; i++) {
+                    const btn = container.querySelector('button:not([disabled])');
+                    if (btn) return btn.getAttribute('data-td-ref') || null;
+                    container = container.parentElement;
+                  }
+                  return null;
+                })()` });
+              const _domBtnRef = _domBtnRes?.ok ? String(_domBtnRes.result || '').replace(/^"|"$/g, '') : null;
+              if (_domBtnRef && _domBtnRef !== 'null') {
+                logger.info(`[playwright.agent] Tier 1.7: found submit button via DOM structure ref=${_domBtnRef}`);
+                const _clickRes = await browserAct({ action: 'click', selector: _domBtnRef, sessionId, headed, timeoutMs: Math.min(timeoutMs, 15000) });
+                _tier17Transcript.push({ action: { click: _domBtnRef }, outcome: { ok: _clickRes.ok, error: _clickRes.error } });
+
+                if (_clickRes.ok) {
+                  const _vResult = await _verifySubmit('type→click→verify');
+                  if (_vResult.textOnPage || _vResult.urlChanged) {
+                    return _returnSuccess('type→click(DOM)→verify', _vResult);
+                  }
+                  logger.warn(`[playwright.agent] Tier 1.7: DOM button clicked but no verification — trying positional`);
+                } else {
+                  logger.warn(`[playwright.agent] Tier 1.7: DOM button click failed — trying positional`);
                 }
               }
-              logger.warn(`[playwright.agent] Tier 1.7: Enter key did not produce verifiable result — falling through to Tier 3`);
+            }
+
+            // ── Layer 3: Positional proximity — nearest <button> by rect coords ──
+            // Universal fallback: finds the nearest visible <button> to the compose
+            // element, penalizing buttons ABOVE or LEFT (submit buttons are below/right).
+            // Only matches <button> elements — never <a> links or sidebar items.
+            if (!_submitHandled) {
+              const _posBtnRes = await browserAct({ action: 'evaluate', sessionId, headed, timeoutMs: 5000,
+                text: `(() => {
+                  const compose = document.activeElement;
+                  if (!compose) return null;
+                  const cr = compose.getBoundingClientRect();
+                  if (cr.width < 5) return null;
+                  const buttons = Array.from(document.querySelectorAll('button[data-td-ref]:not([disabled])'))
+                    .filter(btn => {
+                      const r = btn.getBoundingClientRect();
+                      if (r.width < 2 || r.height < 2) return false;
+                      const s = window.getComputedStyle(btn);
+                      return s.display !== 'none' && s.visibility !== 'hidden' && parseFloat(s.opacity) > 0;
+                    });
+                  if (buttons.length === 0) return null;
+                  let best = null, bestScore = Infinity;
+                  for (const btn of buttons) {
+                    const r = btn.getBoundingClientRect();
+                    const dx = (r.x + r.width/2) - (cr.x + cr.width/2);
+                    const dy = (r.y + r.height/2) - (cr.y + cr.height/2);
+                    let score = Math.sqrt(dx*dx + dy*dy);
+                    if (dy < -10) score += 500;
+                    if (dx < -10) score += 200;
+                    if (score < bestScore) { bestScore = score; best = btn; }
+                  }
+                  return best ? best.getAttribute('data-td-ref') : null;
+                })()` });
+              const _posBtnRef = _posBtnRes?.ok ? String(_posBtnRes.result || '').replace(/^"|"$/g, '') : null;
+              if (_posBtnRef && _posBtnRef !== 'null') {
+                logger.info(`[playwright.agent] Tier 1.7: found submit button via positional proximity ref=${_posBtnRef}`);
+                const _clickRes = await browserAct({ action: 'click', selector: _posBtnRef, sessionId, headed, timeoutMs: Math.min(timeoutMs, 15000) });
+                _tier17Transcript.push({ action: { click: _posBtnRef }, outcome: { ok: _clickRes.ok, error: _clickRes.error } });
+
+                if (_clickRes.ok) {
+                  const _vResult = await _verifySubmit('type→click→verify');
+                  if (_vResult.textOnPage || _vResult.urlChanged) {
+                    return _returnSuccess('type→click(positional)→verify', _vResult);
+                  }
+                  logger.warn(`[playwright.agent] Tier 1.7: positional button clicked but no verification — trying Enter fallback`);
+                } else {
+                  logger.warn(`[playwright.agent] Tier 1.7: positional button click failed — trying Enter fallback`);
+                }
+              }
+            }
+
+            // ── Layer 4: Enter fallback (universal) ─────────────────────────────
+            // If no button was found or clicked successfully, press Enter as a
+            // last resort. Works for chat interfaces and many form types.
+            if (!_submitHandled) {
+              logger.info(`[playwright.agent] Tier 1.7: no button found/clicked — trying Enter key as fallback`);
+              const _enterRes = await browserAct({ action: 'press', key: 'Enter', sessionId, headed, timeoutMs: 5000 });
+              _tier17Transcript.push({ action: { press: 'Enter' }, outcome: { ok: _enterRes.ok } });
+
+              if (_enterRes.ok) {
+                const _vResult = await _verifySubmit('Enter');
+                if (_vResult.textOnPage || _vResult.urlChanged) {
+                  return _returnSuccess('type→Enter(fallback)→verify', _vResult);
+                }
+              }
+              logger.warn(`[playwright.agent] Tier 1.7: Enter fallback did not produce verifiable result — falling through to Tier 3`);
             }
           }
         } else {
@@ -8042,10 +8331,7 @@ async function playwrightAgent(args) {
   // ── Phase 1.1: Page probe + intelligent routing ─────────────────────────────
   // Lightweight eval to classify page structure (canvas, traditional, hybrid, sparse).
   // Routes to Tier 2 (script-first), Tier 2.5 (best-effort keyboard), or Tier 3 (LLM).
-  let _pageType = 'sparse';
-  let _routingDecision = 'tier3_llm';
-  let _probeResult = null;
-  let _scriptResult = null;
+  // (_pageType, _routingDecision, _probeResult, _scriptResult declared above Tier 1.5)
   let _partialProgressNote = '';
   // Build a generic note from a failed tier's transcript so the next tier
   // doesn't repeat actions that already executed (e.g. re-type a title).
@@ -8072,6 +8358,73 @@ async function playwrightAgent(args) {
     const _service = serviceFromHostname(hostname) || serviceFromHostname(_probeResult?.hostname);
 
     logger.info(`[playwright.agent] phase 1.1: page probe → type=${_pageType}, service=${_service || 'unknown'}, interactive=${_probeResult?.interactiveCount ?? '?'}, contentEditable=${_probeResult?.contentEditableCount ?? '?'}`);
+
+    // ── Blocking-modal guard for post/share tasks ──────────────────────────────
+    // If the page has a visible modal dialog AND no compose area (contentEditable=0,
+    // roleTextbox=0, textarea=0), the task cannot proceed. The agent would click
+    // around the modal and falsely report success. Instead, return a failure with
+    // askUser so the user can dismiss the modal manually.
+    // Only applies to mutation tasks (post/share/send/submit) — read tasks can
+    // still extract content from behind modals via getPageText.
+    const _isMutationTask = /\b(post|share|publish|submit|send|tweet|comment|reply|update|create|write|compose)\b/i.test(goal);
+    const _hasBlockingModal = _probeResult?.hasModalDialog === true || (_probeResult?.modalCount || 0) > 0;
+    const _hasNoCompose = (_probeResult?.contentEditableCount || 0) === 0 &&
+                          (_probeResult?.roleTextboxCount || 0) === 0 &&
+                          (_probeResult?.textareaCount || 0) === 0;
+    if (_isMutationTask && _hasBlockingModal && _hasNoCompose) {
+      // Extract modal text for the user-facing message
+      let _modalText = '';
+      try {
+        const _modalInfo = await _engineEval(sessionId, `(() => {
+          const sel = '[role="dialog"], [aria-modal="true"], [data-testid*="modal"]';
+          const modals = Array.from(document.querySelectorAll(sel)).filter(m => {
+            const r = m.getBoundingClientRect();
+            return r.width > 0 && r.height > 0 && m.getAttribute('aria-hidden') !== 'true';
+          });
+          return (modals[0]?.innerText || '').slice(0, 200).trim();
+        })()`, 5000);
+        _modalText = String(_modalInfo?.result || '').trim();
+      } catch (_) {}
+      const _blockReason = _modalText
+        ? `Blocked by dialog: "${_modalText.slice(0, 120)}"`
+        : 'Blocked by a modal dialog — no compose area available';
+      logger.warn(`[playwright.agent] BLOCKING-MODAL GUARD: mutation task + modal + no compose — aborting: ${_blockReason}`);
+      _heartbeat.stop();
+      return {
+        ok: false, done: false, goal, sessionId,
+        turns: 0,
+        result: _blockReason,
+        transcript: [],
+        executionTime: Date.now() - start,
+        error: _blockReason,
+        askUser: true,
+        askUserPrompt: `${_blockReason}. Please dismiss the dialog on the ${_service || 'target'} page and try again.`,
+      };
+    }
+
+    // ── URL-vs-task mismatch guard for post/share tasks ─────────────────────────
+    // If the current URL contains /messages/ or /messenger/ but the task is a
+    // post/share task (not a message task), the agent is on the wrong page (Messenger
+    // instead of the feed composer). It would type into the chat compose area and
+    // falsely report success. Return failure with askUser instead.
+    const _currentUrl = _probeResult?.url || _probeResult?.hostname || '';
+    const _isPostShareTaskUrl = /\b(post|share|publish|update|tweet|feed|status)\b/i.test(goal);
+    const _isMessageTaskUrl = /\b(message|msg|dm|direct message|chat|reply|respond|inbox)\b/i.test(goal);
+    if (_isPostShareTaskUrl && !_isMessageTaskUrl && /\/(messages|messenger)\b/i.test(_currentUrl)) {
+      const _mismatchReason = `Wrong page for post/share task: current URL is ${_currentUrl.slice(0, 100)} (Messenger), but the task requires the feed composer. The agent would post into a chat instead of the feed.`;
+      logger.warn(`[playwright.agent] URL-MISMATCH GUARD: ${_mismatchReason}`);
+      _heartbeat.stop();
+      return {
+        ok: false, done: false, goal, sessionId,
+        turns: 0,
+        result: _mismatchReason,
+        transcript: [],
+        executionTime: Date.now() - start,
+        error: _mismatchReason,
+        askUser: true,
+        askUserPrompt: `The agent was directed to Messenger instead of the Facebook feed. Please check the agent's deep-link configuration and try again.`,
+      };
+    }
 
     // Script DB lookup for (service, page_type) — SKIPPED when URL-first is used
     // The script DB's service extraction is too coarse (mail.google.com → "google")
@@ -8186,10 +8539,24 @@ async function playwrightAgent(args) {
           if (_verify && _verify.pass === false) {
             logger.warn(`[playwright.agent] action verification: FAIL after Tier 2.5 best-effort — ${_verify.reason} — falling back to Tier 3 (LLM)`);
           } else if (_verify && _verify.pass === true) {
+            // For CHAT/RESEARCH goals, capture the actual response content
+            // (not just a status message) so the quality gate and synthesis
+            // step can see the real AI response.
+            const _isChatResearch = /\b(ask|summarize|what\s+is|tell\s+me|explain|describe|write|generate|create|compose|draft)\b/i.test(goal);
+            let _responseContent = null;
+            if (_isChatResearch) {
+              logger.info(`[playwright.agent] Tier 2.5: CHAT/RESEARCH goal detected — capturing response content`);
+              await browserAct({ action: 'waitForStableText', sessionId, headed, timeoutMs: Math.min(timeoutMs, 30000) }).catch(() => {});
+              const _textRes = await browserAct({ action: 'getPageText', sessionId, headed, timeoutMs: 10000 }).catch(() => null);
+              _responseContent = String(_textRes?.result || '').trim();
+              if (_responseContent) {
+                logger.info(`[playwright.agent] Tier 2.5: response captured (${_responseContent.length} chars)`);
+              }
+            }
             return {
               ok: true, goal, sessionId,
               turns: _bestEffort.transcript.length, done: true,
-              result: `Completed via best-effort keyboard (${_verify.source} verified)`,
+              result: _responseContent || `Completed via best-effort keyboard (${_verify.source} verified)`,
               transcript: _bestEffort.transcript,
               routingDecision: _routingDecision,
               pageType: _pageType,
@@ -8205,10 +8572,22 @@ async function playwrightAgent(args) {
         if (_verify.fail) {
           logger.warn(`[playwright.agent] verification layer: FAIL after Tier 2.5 best-effort — ${_verify.reason} — falling back to Tier 3 (LLM)`);
         } else {
+          // For CHAT/RESEARCH goals, capture the actual response content
+          const _isChatResearchLegacy = /\b(ask|summarize|what\s+is|tell\s+me|explain|describe|write|generate|create|compose|draft)\b/i.test(goal);
+          let _responseContentLegacy = null;
+          if (_isChatResearchLegacy) {
+            logger.info(`[playwright.agent] Tier 2.5 (legacy): CHAT/RESEARCH goal detected — capturing response content`);
+            await browserAct({ action: 'waitForStableText', sessionId, headed, timeoutMs: Math.min(timeoutMs, 30000) }).catch(() => {});
+            const _textResLegacy = await browserAct({ action: 'getPageText', sessionId, headed, timeoutMs: 10000 }).catch(() => null);
+            _responseContentLegacy = String(_textResLegacy?.result || '').trim();
+            if (_responseContentLegacy) {
+              logger.info(`[playwright.agent] Tier 2.5 (legacy): response captured (${_responseContentLegacy.length} chars)`);
+            }
+          }
           return {
             ok: true, goal, sessionId,
             turns: _bestEffort.transcript.length, done: true,
-            result: `Completed via best-effort keyboard${_verify.warn ? ' (warning: ' + _verify.reason + ')' : ''}`,
+            result: _responseContentLegacy || `Completed via best-effort keyboard${_verify.warn ? ' (warning: ' + _verify.reason + ')' : ''}`,
             transcript: _bestEffort.transcript,
             routingDecision: _routingDecision,
             pageType: _pageType,
@@ -10092,8 +10471,14 @@ Output a JSON plan: { "plan": [ { "action": "type", "selector": "eXX", "text": "
     // already captured explicit content — verify would re-trigger a 9-39s LLM round-trip
     // for no benefit. Only run for short/absent results (action tasks, form submits, etc.).
     // Also skip when the email has already been verified sent via sendEmailWithVerification.
+    // EXCEPTION: For mutation tasks (post/share/send/submit), ALWAYS run verification —
+    // even if finalResult is long (e.g. from getPageText on the wrong page). This catches
+    // false-positive completions where the agent declared done without actually performing
+    // the mutation (e.g. blocked by a modal, navigated to wrong page).
     // ---------------------------------------------------------------------------
-    if (!_emailAlreadySent && (!finalResult || finalResult.length <= 100)) {
+    const _isMutationGoal = /\b(post|share|publish|submit|send|tweet|comment|reply)\b/i.test(goal);
+    const _shouldVerify = !_emailAlreadySent && (_isMutationGoal || !finalResult || finalResult.length <= 100);
+    if (_shouldVerify) {
     try {
       await new Promise(r => setTimeout(r, 1000)); // 1s post-action settle
       const _verifySnap = await _fastSnapshot(sessionId, headed, 10000);

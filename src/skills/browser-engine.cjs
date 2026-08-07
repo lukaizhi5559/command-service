@@ -163,8 +163,41 @@ async function launch(sessionId, opts = {}) {
         ctx = await getChromium().launchPersistentContext(profileDir, { ...launchOpts, channel: 'chrome' });
         _usedChannel = 'chrome';
       } catch (chromeErr) {
-        logger.warn(`[browser-engine] real Chrome launch failed (${chromeErr.message}) — falling back to bundled Chrome for Testing`);
-        _realChromeAvailable = false; // don't retry real Chrome on subsequent launches
+        // Profile lock error: a zombie Chrome process from a previous run holds the profile
+        // directory. Kill it and retry real Chrome once before falling back to CfT.
+        if (/already in use|profile.*lock|Opening in existing browser session/i.test(chromeErr.message)) {
+          logger.warn(`[browser-engine] real Chrome launch failed (${chromeErr.message}) — attempting zombie cleanup + retry`);
+          try {
+            // Kill any zombie Chrome process holding this profile directory
+            // via the SingletonLock file (PID is embedded in the symlink target).
+            try {
+              const lockPath = path.join(profileDir, 'SingletonLock');
+              if (fs.existsSync(lockPath)) {
+                const target = fs.readlinkSync(lockPath);
+                const m = String(target).match(/-(\d+)$/);
+                if (m) {
+                  const pid = parseInt(m[1], 10);
+                  if (pid) {
+                    try { process.kill(pid, 0); } catch (_) {}
+                    try { process.kill(pid, 'SIGTERM'); } catch (_) {}
+                    await new Promise(r => setTimeout(r, 1500));
+                  }
+                }
+              }
+            } catch (_) {}
+            clearProfileLock(sessionId);
+            // Retry real Chrome after zombie cleanup
+            ctx = await getChromium().launchPersistentContext(profileDir, { ...launchOpts, channel: 'chrome' });
+            _usedChannel = 'chrome';
+            logger.info(`[browser-engine] real Chrome launch succeeded after zombie cleanup`);
+          } catch (retryErr) {
+            logger.warn(`[browser-engine] real Chrome retry failed (${retryErr.message}) — falling back to bundled Chrome for Testing`);
+            _realChromeAvailable = false; // don't retry real Chrome on subsequent launches
+          }
+        } else {
+          logger.warn(`[browser-engine] real Chrome launch failed (${chromeErr.message}) — falling back to bundled Chrome for Testing`);
+          _realChromeAvailable = false; // don't retry real Chrome on subsequent launches
+        }
       }
     }
   }

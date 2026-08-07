@@ -3309,8 +3309,18 @@ async function browserAct(args) {
                 await _ePage.keyboard.type(fillText, { timeout: timeoutMs });
                 await _ePage.keyboard.press('Tab');
               } else if (fieldType === 'rich-text') {
-                logger.info(`[browser.act] fill (engine) tdRef rich-text-detect: contenteditable — typing without Meta+a`);
-                await _ePage.keyboard.type(fillText, { delay: 10 });
+                // Use insertText for long text containing hashtags/mentions — character-by-character
+                // typing triggers autocomplete popups (e.g. Facebook #hashtag suggestions) which
+                // intercept keystrokes and cause the fill to fail verification.
+                const _hasHashtags = /#\w{2,}/.test(fillText);
+                const _isLongText = fillText.length > 200;
+                if (_hasHashtags || _isLongText) {
+                  logger.info(`[browser.act] fill (engine) tdRef rich-text-detect: contenteditable — using insertText (hashtags=${_hasHashtags}, len=${fillText.length})`);
+                  await _ePage.keyboard.insertText(fillText);
+                } else {
+                  logger.info(`[browser.act] fill (engine) tdRef rich-text-detect: contenteditable — typing without Meta+a`);
+                  await _ePage.keyboard.type(fillText, { delay: 10 });
+                }
               } else {
                 await _ePage.keyboard.press('Meta+a');
                 await _ePage.keyboard.type(fillText, { timeout: timeoutMs });
@@ -3527,6 +3537,10 @@ async function browserAct(args) {
               // Use fill() for input fields (more reliable than Meta+a + type)
               if (_bestCandidate.isInput) {
                 await _ePage.fill(_bestCandidate.selector, fillText, { timeout: timeoutMs });
+              } else if (/#\w{2,}/.test(fillText) || fillText.length > 200) {
+                // insertText for long/hashtag text — avoids autocomplete popup interception
+                await _ePage.keyboard.press('Meta+a');
+                await _ePage.keyboard.insertText(fillText);
               } else {
                 await _ePage.keyboard.press('Meta+a');
                 await _ePage.keyboard.type(fillText, { timeout: timeoutMs });
@@ -3575,7 +3589,12 @@ async function browserAct(args) {
               // Clear existing content (Meta+a + Delete) then type
               await _ePage.keyboard.press('Meta+a').catch(() => {});
               await _ePage.keyboard.press('Delete').catch(() => {});
-              await _ePage.keyboard.type(fillText, { delay: 20, timeout: Math.min(timeoutMs, 10000) });
+              // insertText for long/hashtag text — avoids autocomplete popup interception
+              if (/#\w{2,}/.test(fillText) || fillText.length > 200) {
+                await _ePage.keyboard.insertText(fillText);
+              } else {
+                await _ePage.keyboard.type(fillText, { delay: 20, timeout: Math.min(timeoutMs, 10000) });
+              }
               // Verify by reading the element's own content (source of truth)
               const _actualVal = await _ePage.evaluate((sel) => {
                 const el = document.querySelector(sel);
@@ -3715,7 +3734,12 @@ async function browserAct(args) {
           if (_typedText.length > 0 && _preSnap) {
             await _ePage.keyboard.press('Meta+a').catch(() => {});
           }
-          await _ePage.keyboard.type(_typedText, { timeout: timeoutMs });
+          // insertText for long/hashtag text — avoids autocomplete popup interception
+          if (/#\w{2,}/.test(_typedText) || _typedText.length > 200) {
+            await _ePage.keyboard.insertText(_typedText);
+          } else {
+            await _ePage.keyboard.type(_typedText, { timeout: timeoutMs });
+          }
 
           // After typing: re-find element at same position, compare
           if (_typedText.length > 0 && _preSnap) {
@@ -5944,20 +5968,24 @@ If no videos found, return []. Do not explain, only output the JSON array.`;
             return { ok: true, action, sessionId, result: cur, executionTime: Date.now() - start };
           }
 
-          // Near-stable exit (reduced from 2 to 1 consecutive reads)
+          // Near-stable exit — requires 3 consecutive reads with < 5% change
+          // AND at least 3 seconds elapsed (prevents premature exit before AI
+          // response streaming starts — bodyLen can be > 3000 from page chrome alone).
+          // Previously was 1 consecutive read which exited during natural 200ms
+          // pauses in LLM streaming, truncating the captured response.
           if (prev && cur && cur.length > 3000) {
             const longer = Math.max(prev.length, cur.length);
             const changeRatio = Math.abs(cur.length - prev.length) / longer;
+            const elapsed = Date.now() - loopStart;
             if (changeRatio < 0.05) {
               nearStableCount++;
-              if (nearStableCount >= 1) {
-                logger.info(`[browser.act] waitForStableText (engine): near-stable (${(changeRatio * 100).toFixed(1)}% change, ${cur.length} chars) — returning early`);
+              if (nearStableCount >= 3 && elapsed > 3000) {
+                logger.info(`[browser.act] waitForStableText (engine): near-stable (${(changeRatio * 100).toFixed(1)}% change, ${cur.length} chars, ${nearStableCount} consecutive, ${elapsed}ms elapsed) — returning`);
                 return { ok: true, action, sessionId, result: cur, executionTime: Date.now() - start };
               }
             } else {
               nearStableCount = 0;
             }
-            const elapsed = Date.now() - loopStart;
             if (elapsed > 15000 && cur.length > 1500) {
               logger.info(`[browser.act] waitForStableText (engine): streaming page, ${elapsed}ms elapsed with ${cur.length} chars — accepting`);
               return { ok: true, action, sessionId, result: cur, executionTime: Date.now() - start };

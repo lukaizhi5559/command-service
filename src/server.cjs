@@ -14,6 +14,18 @@ const os   = require('os');
 const path = require('path');
 const http = require('http');
 const logger = require('./logger.cjs');
+
+// ── Defense-in-depth: keep a single bad deferred callback from killing the
+//    whole command-service (port 3007). These only LOG; they do not mask the
+//    underlying bug. Watch the logs for "[server] uncaughtException (suppressed)"
+//    as a signal of latent bugs to fix at their source.
+process.on('uncaughtException', (err) => {
+  logger.warn(`[server] uncaughtException (suppressed): ${err && err.stack ? err.stack : err}`);
+});
+process.on('unhandledRejection', (reason) => {
+  logger.warn(`[server] unhandledRejection (suppressed): ${reason}`);
+});
+
 // Shared infrastructure for skills — intelligence + storage
 // Any skill can require these directly:
 //   const { ask } = require('../skill-llm.cjs');
