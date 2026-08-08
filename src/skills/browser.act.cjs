@@ -78,9 +78,109 @@ try {
   logger.warn(`[browser.act] Could not write ad-block script file: ${e.message}`);
 }
 
+// ── Auth-cookie sniffing via CDP (Chrome DevTools Protocol) ──────────────────
+// Used by waitForAuth (interactive login wait) and the browser.agent preflight
+// probe to auto-detect that the user has signed in, so the manual "I've signed
+// in" button is rarely needed. Reads HttpOnly session cookies that document.cookie
+// cannot see. Only the Playwright engine path exposes CDP; the CLI fallback path
+// returns { ok: false } and existing heuristics + the manual button remain.
+
+// Cookie-name stems that strongly indicate an authenticated session.
+// Matched as a case-insensitive substring — real cookie names embed stems in
+// varied ways (connect.sid, __Secure-1PSIDTS, sessionid, JWT_TOKEN) so we rely
+// on the exclude list + httpOnly/strong-name gate for false-positive control.
+const _AUTH_COOKIE_NAME_RE = /(sid|sess|session|token|jwt|auth|login|user|acct|account|remember|passport|phpsessid|jsessionid|sails\.sid|koa:sess)/i;
+// Cookies that look auth-like but are NOT authentication (pre-auth / analytics /
+// prefs). Excluded even when their name matches an auth stem.
+const _AUTH_COOKIE_EXCLUDE_RE = /(csrf|xsrf|locale|lang|theme|mode|guest|anonymous|_ga|_gid|_gat|ab[_-]?test|opt[_-]?out|consent|cookie[_-]?consent|pref|currency|cart|wishlist|recently[_-]?viewed)/i;
+// Strong session indicators — a cookie counts as an auth signal only if it is
+// non-empty AND (httpOnly === true OR its name matches this pattern).
+const _STRONG_SESSION_NAME_RE = /(sid|sess|session|token|jwt|auth)/i;
+
+// Pure classifier — unit-testable without a browser.
+// cookies: array of { name, value, domain, httpOnly, ... } (CDP/Playwright shape)
+// targetDomain: e.g. 'slack.com' (leading 'www.' stripped by caller)
+// Returns: { authed: boolean, cookies: string[], reason: string }
+function _classifyAuthCookies(cookies, targetDomain) {
+  if (!Array.isArray(cookies) || !targetDomain) return { authed: false, cookies: [], reason: 'no-input' };
+  const target = targetDomain.toLowerCase().replace(/^www\./, '');
+  const matched = [];
+  for (const c of cookies) {
+    if (!c || typeof c.name !== 'string') continue;
+    const name = c.name;
+    if (!c.value) continue;                       // empty value → not a live session
+    if (_AUTH_COOKIE_EXCLUDE_RE.test(name)) continue;
+    if (!_AUTH_COOKIE_NAME_RE.test(name)) continue;
+    // Domain filter: cookie domain '.slack.com' matches target 'slack.com' and
+    // any subdomain; exact 'slack.com' also matches. Subdomain-only cookies
+    // (e.g. domain='app.slack.com' when target='slack.com') are still relevant
+    // because the browser is on that subdomain during auth.
+    const cDomain = String(c.domain || '').toLowerCase().replace(/^\./, '');
+    if (cDomain && cDomain !== target && !cDomain.endsWith(`.${target}`) && !target.endsWith(`.${cDomain}`)) {
+      // Allow when the cookie domain is a subdomain of the target (common during
+      // auth flows that set the session cookie on the app subdomain).
+      continue;
+    }
+    // Require httpOnly OR a strong session-name pattern — defence against
+    // non-HttpOnly prefs cookies that happen to match a stem (e.g. "user_lang").
+    const isHttpOnly = c.httpOnly === true;
+    const isStrongName = _STRONG_SESSION_NAME_RE.test(name);
+    if (!isHttpOnly && !isStrongName) continue;
+    matched.push(name);
+  }
+  if (matched.length === 0) return { authed: false, cookies: [], reason: 'no-auth-cookies' };
+  return { authed: true, cookies: matched, reason: `auth-cookies:${matched.join(',')}` };
+}
+
+// Per-page CDP session cache for cookie sniffing (WeakMap so it GCs with the page).
+const _cookieSniffCdpSessions = new WeakMap();
+
+// Sniff auth cookies via CDP. Never throws.
+// engine: the browser-engine module (required at top of file)
+// sessionId, page: the active Playwright page
+// targetDomain: e.g. 'slack.com'
+// Returns: { ok, authed, cookies, reason } — ok:false means CDP unavailable
+// (CLI path or browser blocks CDP); caller falls back to existing heuristics.
+async function _sniffAuthCookies(engine, sessionId, page, targetDomain) {
+  if (!page || !targetDomain) return { ok: false, authed: false, cookies: [], reason: 'missing-args' };
+  const ctx = engine && typeof engine.getContext === 'function' ? engine.getContext(sessionId) : null;
+  if (!ctx) return { ok: false, authed: false, cookies: [], reason: 'no-engine-context' };
+  let cdp = _cookieSniffCdpSessions.get(page);
+  try {
+    if (!cdp) {
+      cdp = await ctx.newCDPSession(page);
+      _cookieSniffCdpSessions.set(page, cdp);
+    }
+    let cookies = null;
+    // Network.getCookies is deprecated in newer Chrome → fall back to Storage.getCookies.
+    try {
+      const res = await cdp.send('Network.getCookies');
+      cookies = res && Array.isArray(res.cookies) ? res.cookies : null;
+    } catch (_) {
+      const res2 = await cdp.send('Storage.getCookies');
+      cookies = res2 && Array.isArray(res2.cookies) ? res2.cookies : null;
+    }
+    if (!cookies) return { ok: false, authed: false, cookies: [], reason: 'no-cookies-returned' };
+    const cls = _classifyAuthCookies(cookies, targetDomain);
+    return { ok: true, ...cls };
+  } catch (err) {
+    return { ok: false, authed: false, cookies: [], reason: `cdp-error:${(err && err.message) || 'unknown'}` };
+  }
+}
+
+// Detach a cached CDP sniff session for a page (call on waitForAuth exit).
+function _detachCookieSniffCdp(page) {
+  if (!page) return;
+  const cdp = _cookieSniffCdpSessions.get(page);
+  if (cdp) {
+    _cookieSniffCdpSessions.delete(page);
+    try { cdp.detach(); } catch (_) {}
+  }
+}
+
 // Generic debugging control for all browser automation tools
-const playwrightDebugEnabled = process.env.PLAYWRIGHT_DEBUG === 'true' || 
-                              process.env.PLAYWRIGHT_DEBUG === 'on' || 
+const playwrightDebugEnabled = process.env.PLAYWRIGHT_DEBUG === 'true' ||
+                              process.env.PLAYWRIGHT_DEBUG === 'on' ||
                               process.env.PLAYWRIGHT_DEBUG === '1';
 
 function shouldEnableDebugging(sessionId, action = null) {
@@ -6252,6 +6352,21 @@ If no videos found, return []. Do not explain, only output the JSON array.`;
       let backToSignInCount = 0;   // RC2: hard stop — max 3 code-triggered back-to-sign-in navigations
       let _wasOnOAuthProvider = false; // tracks that user visited a 3rd-party OAuth provider this session
 
+      // ── CDP cookie-sniff baseline (auth auto-detection) ───────────────────
+      // On the first poll inside the auth flow, snapshot existing auth-cookie
+      // names so we only declare success when NEW auth cookies appear (defence
+      // against pre-existing CSRF/locale cookies that survived the exclude rules).
+      let _authCookieBaseline = null;   // Set<string> | null
+      // Target domain for cookie sniffing: prefer authSuccessUrl host (the
+      // authenticated app host), else authOriginHost. Strip leading 'www.'.
+      let _cookieSniffDomain = null;
+      try {
+        const _csHost = authSuccessUrl
+          ? (new URL(authSuccessUrl.includes('://') ? authSuccessUrl : `https://${authSuccessUrl}`).hostname || '')
+          : authOriginHost;
+        _cookieSniffDomain = String(_csHost || '').replace(/^www\./, '');
+      } catch (_) {}
+
       // Default timeout: 120s — enough for a human to complete 2FA or MFA
       const effectiveTimeout = Math.min(timeoutMs || 120000, 120000);
       const pollInterval = 2000;
@@ -6849,6 +6964,33 @@ If no videos found, return []. Do not explain, only output the JSON array.`;
                   return { ok: true, action, sessionId, authResolved: true, executionTime: Date.now() - start };
                 }
               } catch (_) {}
+            }
+            // ── CDP cookie-sniff auth detection ───────────────────────────────
+            // Catches same-domain SPAs that don't change URL and don't expose a
+            // JS user global — the case the manual "I've signed in" button was
+            // built for. On the first in-auth-flow poll we snapshot the existing
+            // auth-cookie names as a baseline; on subsequent polls we declare
+            // success only when NEW auth cookies appear. Non-fatal on any CDP
+            // failure — falls through to the manual button.
+            if (_cookieSniffDomain && _ePage) {
+              try {
+                if (_authCookieBaseline === null) {
+                  const _baseSniff = await _sniffAuthCookies(engine, sessionId, _ePage, _cookieSniffDomain);
+                  _authCookieBaseline = new Set(_baseSniff.ok && _baseSniff.authed ? _baseSniff.cookies : []);
+                  logger.debug(`[browser.act] waitForAuth: cookie baseline captured (${_authCookieBaseline.size} cookies) for session=${sessionId}`);
+                } else {
+                  const _sniff = await _sniffAuthCookies(engine, sessionId, _ePage, _cookieSniffDomain);
+                  if (_sniff.ok && _sniff.authed) {
+                    const _newCookies = _sniff.cookies.filter(n => !_authCookieBaseline.has(n));
+                    if (_newCookies.length > 0) {
+                      logger.info(`[browser.act] waitForAuth: CDP auth cookies detected (new: ${_newCookies.join(',')}) — auth complete for session=${sessionId}`);
+                      return { ok: true, action, sessionId, authResolved: true, detectedVia: 'cdp_cookies', executionTime: Date.now() - start };
+                    }
+                  }
+                }
+              } catch (_sniffErr) {
+                logger.debug(`[browser.act] waitForAuth: cookie sniff failed (non-fatal): ${_sniffErr.message}`);
+              }
             }
             logger.debug(`[browser.act] waitForAuth: in auth flow at ${currentUrl} (${authWallDetections} polls), ${Math.round((deadline - Date.now()) / 1000)}s remaining`);
             continue;
@@ -7623,8 +7765,8 @@ function parseSnapshotToElements(snapshotText) {
 }
 
 // Export for use by playwright.agent and other debugging tools
-module.exports = { 
-  browserAct, 
+module.exports = {
+  browserAct,
   getDebuggingContext,
   captureDebugContext,
   stopSessionTracing,
@@ -7637,4 +7779,7 @@ module.exports = {
   PLAYWRIGHT_CLI_AVAILABLE,
   engine,
   invalidateEngineSnapshot,
+  _classifyAuthCookies,
+  _sniffAuthCookies,
+  _detachCookieSniffCdp,
 };

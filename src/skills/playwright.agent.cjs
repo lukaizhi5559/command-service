@@ -3046,7 +3046,22 @@ async function _executeFieldMap(sessionId, fieldValues, fieldMap, timeoutMs, opt
 
   // Phase 1: Fill each field — placeholder first, CSS selector fallback, role+position fallback
   for (const field of fieldMap.fields) {
-    let value = fieldValues[field.name] || field.text;
+    // Guard: if the extracted value looks like the entire goal string (not actual
+    // content to type), prefer field.text (which the field-map-gen LLM picked).
+    // This happens when the goal is a task description ("select a verse and post it")
+    // rather than the content itself ("post 'John 3:16'"). The field extraction LLM
+    // extracts the entire goal as "body" because it has "no clear field mapping".
+    let _useFieldText = false;
+    if (field.text && fieldValues[field.name]) {
+      const _extracted = String(fieldValues[field.name]);
+      const _isGoalLike = _extracted.length > 200 ||
+        /\b(IMPORTANT:|Task:|browser session|you are working on|If the page ever shows)\b/i.test(_extracted);
+      if (_isGoalLike) {
+        logger.warn(`[playwright.agent] field map: extracted value for "${field.name}" looks like goal string (${_extracted.length} chars) — preferring field.text`);
+        _useFieldText = true;
+      }
+    }
+    let value = _useFieldText ? field.text : (fieldValues[field.name] || field.text);
     // Fallback: cached field name may not match the extraction (e.g. cache has
     // "prompt" but extraction returns "body"). When there's exactly one field in
     // the map and exactly one extracted value, use it regardless of name mismatch.
@@ -5079,7 +5094,8 @@ async function _waitForComposeFocus(page, timeoutMs = 12000, frameOrPage = null)
   let _lastLog = 0;
   let _evalErrLogged = false;
   let _clickAttempts = 0;
-  let _triggerClickedOnce = false;
+  let _triggerClickAttempts = 0;
+  let _urlRetryDone = false;
   while (Date.now() - _start < timeoutMs) {
     try {
       // NOTE: page.evaluate accepts exactly ONE argument — always pass a single object.
@@ -5136,12 +5152,33 @@ async function _waitForComposeFocus(page, timeoutMs = 12000, frameOrPage = null)
         if (_clicked) logger.info(`[playwright.agent] waiting for compose focus: clicked compose element to focus`);
         _clickAttempts++;
       }
-      // After 3 unsuccessful click attempts on compose elements, try clicking the
-      // post-composer trigger (e.g. "What's on your mind?" on Facebook feed).
-      // The compose element found by _COMPOSE_SEL may be the search box (role=combobox),
-      // not the actual post composer trigger.
-      if (!_state.focused && _clickAttempts >= 3 && !_triggerClickedOnce) {
-        _triggerClickedOnce = true;
+      // Recovery: when no compose element is found and no modal is open, try in order:
+      // 1. URL-first retry (re-navigate to shareActive=true URL) — most deterministic.
+      //    The URL parameter is the canonical way to open the share modal. If it failed
+      //    once, it may have been a transient render race. Only fires once, and only
+      //    when the URL matches a compose pattern.
+      // 2. Trigger-click fallback ("Start a post", "What's on your mind?") — less
+      //    deterministic but reliable. Up to 2 attempts.
+      const _noComposeFound = !_state.focused && !_state.needsClick && !_state.inModal;
+      if (_noComposeFound && !_urlRetryDone) {
+        _urlRetryDone = true;
+        const _curUrl = await page.url().catch(() => '');
+        if (/shareActive=true|compose\/post|compose=new|\/compose\b/i.test(_curUrl)) {
+          logger.info(`[playwright.agent] waiting for compose focus: no modal — retrying URL-first navigation to ${_curUrl}`);
+          try {
+            await page.goto(_curUrl, { waitUntil: 'domcontentloaded', timeout: 15000 });
+            await page.waitForTimeout(2000); // let SPA hydrate + modal render
+          } catch (_navErr) {
+            logger.warn(`[playwright.agent] waiting for compose focus: URL retry failed: ${_navErr.message}`);
+          }
+          continue; // re-check state after navigation
+        }
+      }
+      // Trigger-click fallback: fire immediately when no compose found (after URL retry),
+      // or after 3 unsuccessful compose clicks (the original gate for the case where
+      // compose elements ARE found but clicking them doesn't focus them).
+      if (!_state.focused && (_noComposeFound || _clickAttempts >= 3) && _triggerClickAttempts < 2) {
+        _triggerClickAttempts++;
         const _triggerClicked = await _target.evaluate(() => {
           // Look for common post-composer triggers across social platforms
           const candidates = Array.from(document.querySelectorAll('div[role="button"], button, [role="button"]')).filter(el => {
@@ -5157,7 +5194,7 @@ async function _waitForComposeFocus(page, timeoutMs = 12000, frameOrPage = null)
           return null;
         }).catch(() => null);
         if (_triggerClicked) {
-          logger.info(`[playwright.agent] waiting for compose focus: clicked post-composer trigger "${_triggerClicked}" after ${_clickAttempts} failed compose clicks`);
+          logger.info(`[playwright.agent] waiting for compose focus: clicked post-composer trigger "${_triggerClicked}" (attempt ${_triggerClickAttempts}, clickAttempts=${_clickAttempts})`);
           await page.waitForTimeout(800); // let the modal open
         }
       }
@@ -5643,7 +5680,7 @@ async function _scriptUrlFastPath(sessionId, text, goal, startTs, deadline, hear
         goal,
         sessionId,
         turns: transcript.length,
-        result: `Text entered + submitted + UI verified (${_uiVerify.reason})`,
+        result: `Posted: "${text}" (verified via UI: ${_uiVerify.reason})`,
         transcript,
         routingDecision: 'fast_path_locator_submit_ui_verified',
         executionTime: execTime,
@@ -5663,7 +5700,7 @@ async function _scriptUrlFastPath(sessionId, text, goal, startTs, deadline, hear
           goal,
           sessionId,
           turns: transcript.length,
-          result: `Text entered + submitted + network payload verified`,
+          result: `Posted: "${text}" (verified via network payload)`,
           transcript,
           routingDecision: 'fast_path_locator_submit_network_verified',
           executionTime: execTime,
@@ -5684,7 +5721,7 @@ async function _scriptUrlFastPath(sessionId, text, goal, startTs, deadline, hear
     sessionId,
     turns: transcript.length,
     done: false, // not done — Plan-Execute/turn-loop still needs to click submit
-    result: `Text entered via keyboard.type and verified — falling through for submit`,
+    result: `Text entered: "${text}" — falling through for submit`,
     transcript,
     routingDecision: 'fast_path_ocr',
     executionTime: execTime,
@@ -6478,6 +6515,10 @@ Generate 3-5 steps to complete this task.`;
     const _peTranscript = [];
     let _replanned = false;
     let _i = 0;
+    // Track timestamp of the last DOM-mutating step (the likely submit action).
+    // Used to (1) poll the netlog for the mutation response before verification,
+    // and (2) pass to _verifyActionCompletion so Signal B (network) can run.
+    let _lastMutatingStepTs = null;
     while (_i < _steps.length) {
       if (Date.now() > deadline) {
         logger.warn(`[playwright.agent] focused Plan-Execute: deadline exceeded at step ${_i + 1}`);
@@ -6488,6 +6529,12 @@ Generate 3-5 steps to complete this task.`;
 
       const _result = await browserAct({ ..._step, sessionId, headed, timeoutMs: timeoutMs || 15000 });
       _peTranscript.push({ step: _i + 1, action: _step, outcome: { ok: _result.ok, error: _result.error, result: _result.result }, thoughts: `Plan-Execute step ${_i + 1}` });
+
+      // Track timestamp of last DOM-mutating step for network verification (Signal B).
+      // The netlog logs on 'response' event, so we need the timestamp to filter requests.
+      if (_result.ok && ['click', 'press', 'fill', 'type', 'reactFill'].includes(_step.action)) {
+        _lastMutatingStepTs = Date.now();
+      }
 
       if (!_result.ok) {
         logger.warn(`[playwright.agent] focused Plan-Execute: step ${_i + 1} failed — ${_result.error}`);
@@ -6553,6 +6600,38 @@ Generate 3-5 steps to complete this task FROM THE CURRENT PAGE STATE. The prior 
 
     const _execTime = Date.now() - _peStart;
 
+    // 4b. For send/submit goals, poll the netlog for the mutation response before
+    // running verification. Signal B (network) is the universal verification signal
+    // but it needs the response to be logged. The netlog logs on 'response' event
+    // (browser-engine.cjs), so we must wait for the server to respond.
+    // Poll for up to 8 seconds (same budget as fast path's _verifySubmitViaUiState).
+    // Returns early when a 2xx mutation response appears — no unnecessary latency
+    // for fast-responding sites (Facebook ~500ms). Waits longer for slow sites
+    // (LinkedIn rsc-action can take 3-5s).
+    const _isSendSubmitGoal = /\b(send|post|submit|publish|dispatch|email|tweet|share|reply|comment)\b/i.test(goal);
+    if (_isSendSubmitGoal && _lastMutatingStepTs) {
+      const _netSettleStart = Date.now();
+      const _NET_SETTLE_TIMEOUT = 8000;
+      const _netLog = engine.getNetLog(sessionId);
+      const _preClickNetLogLen = _netLog.length;
+      while (Date.now() - _netSettleStart < _NET_SETTLE_TIMEOUT) {
+        const _newEntries = _netLog.slice(_preClickNetLogLen);
+        const _mutationResponse = _newEntries.find(e =>
+          e.ts >= _lastMutatingStepTs - 500 &&
+          /^(POST|PUT|PATCH|DELETE)$/.test(e.method) &&
+          e.status >= 200 && e.status < 300
+        );
+        if (_mutationResponse) {
+          logger.info(`[playwright.agent] Plan-Execute: network settle detected ${_mutationResponse.method} ${_mutationResponse.url.slice(0, 60)} → ${_mutationResponse.status} after ${Date.now() - _netSettleStart}ms`);
+          break;
+        }
+        await page.waitForTimeout(300);
+      }
+      if (Date.now() - _netSettleStart >= _NET_SETTLE_TIMEOUT) {
+        logger.info(`[playwright.agent] Plan-Execute: network settle timed out after ${_NET_SETTLE_TIMEOUT}ms — proceeding with verification anyway`);
+      }
+    }
+
     // 5. Goal verification (F7c) — confirm the goal was actually achieved, not
     // just that every step returned ok=true. Location-aware: phrases from
     // "titled X" must land in document.title or a title-ish input, not in a
@@ -6570,7 +6649,7 @@ Generate 3-5 steps to complete this task FROM THE CURRENT PAGE STATE. The prior 
           (goal.match(/["']([^"']{5,})["']/) || [])[1] || '';
         _goalVerify = await _verifyActionCompletion({
           goal: verificationGoal || goal, sessionId, headed, pageType: undefined,
-          submitClickTs: null, // no precise timestamp in Plan-Execute
+          submitClickTs: _lastMutatingStepTs || Date.now() - 5000, // last mutating step, or 5s ago as fallback
           expectedText: _expectedText,
           isSendSubmitGoal: true,
         });
@@ -6807,6 +6886,32 @@ ${_composeSel ? `- SUGGESTED COMPOSE SELECTOR: ${_composeSel}` : ''}`;
         }
       } catch (e) {
         logger.warn(`[playwright.agent] turn-loop: OCR capture error: ${e.message}`);
+      }
+    }
+
+    // ── Text-already-entered detection (DOM + OCR) ──
+    // If text was typed by Plan-Execute or a prior phase but verification failed
+    // (e.g. "text still in compose — not sent"), detect it here so the turn-loop
+    // doesn't re-type. DOM check is authoritative; OCR is fallback for canvas/shadow DOM.
+    if (!textAlreadyEntered && extractedText) {
+      const _ePage = engine.getPage(sessionId);
+      if (_ePage) {
+        const _domCheck = await _domVerify(_ePage, extractedText).catch(() => null);
+        if (_domCheck?.ok) {
+          textAlreadyEntered = true;
+          logger.info(`[playwright.agent] turn-loop: text already in compose box (DOM verify ok) — setting textAlreadyEntered=true, will NOT re-type`);
+        } else if (_ocrText) {
+          // OCR fallback: check if expected text is visible in a compose context
+          const _words = extractedText.toLowerCase().split(/\s+/).filter(w => w.length > 4);
+          const _ocrLower = _ocrText.toLowerCase();
+          const _matchedWords = _words.filter(w => _ocrLower.includes(w));
+          const _wordRatio = _words.length > 0 ? _matchedWords.length / _words.length : 0;
+          if ((_wordRatio > 0.5 || _ocrLower.includes(extractedText.slice(0, 40).toLowerCase())) &&
+              /create post|what's on your mind|compose|share a post|post to|dialog/i.test(_ocrText)) {
+            textAlreadyEntered = true;
+            logger.info(`[playwright.agent] turn-loop: text already in compose box (OCR wordRatio=${_wordRatio.toFixed(2)}) — setting textAlreadyEntered=true, will NOT re-type`);
+          }
+        }
       }
     }
 
@@ -7082,6 +7187,25 @@ Turn ${turn}/${MAX_TURNS}. What is your next action? (DO NOT snapshot - act dire
           _lastActionSignature = 'duplicate_noop';
           continue;
         }
+      }
+    }
+
+    // ── Anti-repeat for type/fill/reactFill: same text, different selector ──
+    // The exact-match check above compares selector strings, so the same text typed
+    // via a different selector (e.g. `div[contenteditable='true']` vs
+    // `[role='dialog'] div[contenteditable='true']`) bypasses it. This catches that
+    // case by comparing the TEXT only — re-typing the same text into a different
+    // selector for the same compose element is a no-op that causes triple-typing.
+    if (['type', 'fill', 'reactFill'].includes(_action.action) && _action.text) {
+      const _lastTypeFill = [..._loopTranscript].reverse().find(t =>
+        t.outcome?.ok && ['type', 'fill', 'reactFill'].includes(t.action?.action) &&
+        t.action?.text === _action.text
+      );
+      if (_lastTypeFill) {
+        logger.warn(`[playwright.agent] turn-loop: skipping duplicate ${_action.action} (same text "${(_action.text || '').slice(0, 40)}..." already typed via ${_lastTypeFill.action?.selector || 'n/a'}) — inject hint`);
+        _loopTranscript.push({ action: _action, outcome: { ok: false, error: 'skipped duplicate type/fill — same text already entered via different selector' } });
+        _lastActionSignature = 'duplicate_noop';
+        continue;
       }
     }
 
@@ -7666,6 +7790,16 @@ async function playwrightAgent(args) {
   let _composerModalOpen = false;  // set by fast path when modal opened but no compose element
   let _extractedComposeText = null;  // set by fast path text extraction (for turn-loop fallback)
   let _textAlreadyEntered = false;  // set by fast path when text was typed + OCR verified (turn-loop just needs to click submit)
+  // Extract compose text from goal for ALL compose/post tasks (not just fast path).
+  // This makes it available to the turn-loop for text-already-entered detection even
+  // when the fast path isn't taken (e.g. Facebook homepage requires a click to open
+  // the compose modal, so its URL doesn't match the compose regex).
+  if (!_extractedComposeText) {
+    const _goalQuotes = [...goal.matchAll(/["']([^"']{3,5000})["']/g)].map(m => m[1]);
+    if (_goalQuotes.length > 0) {
+      _extractedComposeText = _goalQuotes[_goalQuotes.length - 1].trim();
+    }
+  }
   if (url && engine.isSessionActive(sessionId)) {
     const _composeRe = /shareActive=true|compose\/post|compose=new|\/compose\b|posting\?compose=true/i;
     if (_composeRe.test(url)) {
@@ -7675,20 +7809,39 @@ async function playwrightAgent(args) {
         logger.info(`[playwright.agent] Script-URL fast path: skipping Gmail multi-field compose — Tier 1.5 selector map will handle`);
       } else {
         // Extract the text to type from the goal.
-        // Strategy: find the LAST quoted string in the goal — the post text is
-        // always at the end (e.g., "...with the text: 'Thank you to my amazing team...'")
-        // The old regex `goal.match(/["'](.{3,5000})["']/)` was greedy and matched
-        // from the first quote ('Start a post') to the last quote, capturing
-        // everything in between — including button labels and navigation instructions.
+        // Strategy:
+        // 1. If the goal contains {{synthesisAnswer}} (unsubstituted — group execution path
+        //    passes content via [DATA FROM PRIOR STEP] instead), use the [DATA FROM PRIOR
+        //    STEP] content as the text to type.
+        // 2. Otherwise, find the LAST quoted string in the goal (after stripping [DATA FROM
+        //    PRIOR STEP] diagnostic blocks) — the post text is always at the end.
+        // 3. Fallback: text after "post:" / "type:" / "write:" / "share:"
         let _composeText = null;
-        const _allQuotes = [...goal.matchAll(/["']([^"']{3,5000})["']/g)].map(m => m[1]);
-        if (_allQuotes.length > 0) {
-          // Use the last quoted string — it's the actual post text
-          _composeText = _allQuotes[_allQuotes.length - 1].trim();
+
+        // Extract [DATA FROM PRIOR STEP] content (if present) and strip it from the goal
+        let _priorStepContent = null;
+        const _priorStepMatch = goal.match(/\[DATA FROM PRIOR STEP\][\s\S]*?(?:\[\/DATA FROM PRIOR STEP\]|$)/i);
+        if (_priorStepMatch) {
+          _priorStepContent = _priorStepMatch[0].replace(/\[DATA FROM PRIOR STEP\]\s*/i, '').replace(/\[\/DATA FROM PRIOR STEP\]/i, '').trim();
+        }
+        const _goalWithoutPriorStep = goal.replace(/\[DATA FROM PRIOR STEP\][\s\S]*?(?:\[\/DATA FROM PRIOR STEP\]|$)/i, ' ').trim();
+
+        // If the goal contains {{synthesisAnswer}} (unsubstituted token — group execution path),
+        // use the [DATA FROM PRIOR STEP] content as the text to type
+        if (/\{\{synthesisAnswer\}\}/.test(_goalWithoutPriorStep) && _priorStepContent) {
+          _composeText = _priorStepContent;
+          logger.info(`[playwright.agent] Script-URL fast path: using [DATA FROM PRIOR STEP] content for {{synthesisAnswer}} (${_composeText.length} chars)`);
         } else {
-          // Fallback: text after "post:" / "type:" / "write:" / "share:"
-          const _textMatch = goal.match(/(?:post|type|write|share)[:\s]+(.{3,5000})$/i);
-          if (_textMatch) _composeText = _textMatch[1].trim();
+          // Search for quoted strings in the goal WITHOUT [DATA FROM PRIOR STEP] noise
+          const _allQuotes = [..._goalWithoutPriorStep.matchAll(/["']([^"']{3,5000})["']/g)].map(m => m[1]);
+          if (_allQuotes.length > 0) {
+            // Use the last quoted string — it's the actual post text
+            _composeText = _allQuotes[_allQuotes.length - 1].trim();
+          } else {
+            // Fallback: text after "post:" / "type:" / "write:" / "share:"
+            const _textMatch = _goalWithoutPriorStep.match(/(?:post|type|write|share)[:\s]+(.{3,5000})$/i);
+            if (_textMatch) _composeText = _textMatch[1].trim();
+          }
         }
         if (_composeText) {
           logger.info(`[playwright.agent] Script-URL fast path: compose URL detected + text extracted (${_composeText.length} chars) — deterministic flow`);
@@ -8839,6 +8992,21 @@ async function playwrightAgent(args) {
       return _peResult;
     }
     logger.warn(`[playwright.agent] focused Plan-Execute failed: ${_peResult.error || 'unknown'} — falling back to mini turn-loop`);
+    // If Plan-Execute typed text but failed verification because the text is still
+    // in the compose element (not yet submitted), signal to the turn-loop that text
+    // is already entered. Only applies when the failure reason explicitly indicates
+    // text was found but not sent — avoids false positives when text was typed into
+    // the wrong field.
+    if (_peResult?.transcript) {
+      const _typedText = _peResult.transcript.some(t =>
+        t.outcome?.ok && ['type', 'fill', 'reactFill'].includes(t.action?.action)
+      );
+      const _failReason = String(_peResult.error || '');
+      if (_typedText && /text still in compose|not sent|not completed/i.test(_failReason)) {
+        _textAlreadyEntered = true;
+        logger.info(`[playwright.agent] Plan-Execute typed text but failed verification (${_failReason.slice(0, 60)}) — setting _textAlreadyEntered=true for turn-loop`);
+      }
+    }
   } catch (_peErr) {
     logger.warn(`[playwright.agent] focused Plan-Execute error: ${_peErr.message} — falling back to mini turn-loop`);
   }

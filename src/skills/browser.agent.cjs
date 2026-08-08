@@ -258,7 +258,7 @@ function getContentExtractionConfig(hostname) {
 const { userAgent } = require('./user.agent.cjs');
 
 const { resolveDestination, recordCorrection, classifyTaskIntent, classifyUrlType, getLearnedCorrection, deleteLearnedCorrection, suggestTaskUrl, getTaskKeywords, getCachedDeepLink, recordDeepLinkCache, getSearchUrlPattern, recordSearchUrlPattern, INTENTS, SERVICE_CHAT_URLS, isAuthFlowUrl } = require('../skill-helpers/destination-resolver.cjs');
-const { killExistingChromeForProfile, clearProfileLock, findCli, shortSessionId } = require('./browser.act.cjs');
+const { killExistingChromeForProfile, clearProfileLock, findCli, shortSessionId, _sniffAuthCookies, engine: browserEngine } = require('./browser.act.cjs');
 const { loadAppKnowledge, saveAppKnowledge, loadAndFormat, isCacheStale, recordVerification } = require('./lib/appKnowledge.cjs');
 
 const BROWSER_ACT_PORT = parseInt(process.env.COMMAND_SERVICE_PORT || '3007', 10);
@@ -4899,10 +4899,44 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
               logger.info(`[browser.agent] self-heal: no better URL found for domain mismatch — falling back to waitForAuth`);
               _authNeeded = true;
             }
-          } else if (_onLoginPage || _wrongDomain || _pageMetaLoginWall) {
+          } else if ((_onLoginPage || _pageMetaLoginWall) && !_wrongDomain) {
+            // ── CDP cookie-sniff tiebreaker ───────────────────────────────────
+            // URL/title heuristics say "login wall", but the persistent profile
+            // may already have valid session cookies (e.g. SPA that renders a
+            // sign-in button on the dashboard even when authenticated). Sniff
+            // HttpOnly cookies via CDP before declaring auth_required — avoids
+            // spurious "needs login" banners. Skipped on _wrongDomain (cookies
+            // for the wrong domain are irrelevant). Non-fatal on any CDP failure.
+            let _cookieOverride = false;
+            try {
+              const _csPage = browserEngine && typeof browserEngine.getPage === 'function' ? browserEngine.getPage(sessionId) : null;
+              let _csDomain = '';
+              try { _csDomain = new URL(startUrl).hostname.replace(/^www\./, ''); } catch (_) {}
+              if (_csPage && _csDomain) {
+                const _csResult = await _sniffAuthCookies(browserEngine, sessionId, _csPage, _csDomain);
+                if (_csResult.ok && _csResult.authed) {
+                  logger.info(`[browser.agent] run: auth-check: CDP auth cookies detected (${_csResult.cookies.join(',')}) — overriding login-wall heuristic for ${agentId}`);
+                  _cookieOverride = true;
+                  _pageMetaAuthed = true;
+                  _onLoginPage = false;
+                  _pageMetaLoginWall = false;
+                }
+              }
+            } catch (_csErr) {
+              logger.debug(`[browser.agent] run: auth-check: cookie sniff failed (non-fatal): ${_csErr.message}`);
+            }
+            if (_cookieOverride) {
+              logger.info(`[browser.agent] run: auth-check: cookie override — skipping waitForAuth for ${agentId}`);
+              _setCachedAuthCheck(agentId, false);
+            } else {
+              const _reason = _onLoginPage ? 'login redirect'
+                : 'metadata login wall';
+              logger.info(`[browser.agent] run: auth-check: ${_reason} — calling waitForAuth for ${agentId}`);
+              _authNeeded = true;
+            }
+          } else if (_wrongDomain) {
             const _reason = _onLoginPage ? 'login redirect'
-              : _wrongDomain ? `domain mismatch (expected ${(() => { try { return new URL(startUrl).hostname; } catch(_){return startUrl;} })()}, got ${_curHost || _curHref})`
-              : 'metadata login wall';
+              : `domain mismatch (expected ${(() => { try { return new URL(startUrl).hostname; } catch(_){return startUrl;} })()}, got ${_curHost || _curHref})`;
             logger.info(`[browser.agent] run: auth-check: ${_reason} — calling waitForAuth for ${agentId}`);
             _authNeeded = true;
           } else if (_authSuccessMismatch && _urlFirstProbeUsed && !_pageInfo.hasSignInButton) {
