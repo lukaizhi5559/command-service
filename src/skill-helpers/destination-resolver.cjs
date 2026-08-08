@@ -200,11 +200,23 @@ function _scopeTaskText(task, maxChars = 280) {
  * Primary: LLM classification on first 100 chars of stripped task.
  * Fallback: hardened regex on first 280 chars of stripped task.
  * Returns one of the INTENTS values, or INTENTS.HOME as fallback.
+ *
+ * When serviceKey is provided, the LLM prompt is augmented with service context
+ * so that for multi-step prompts (e.g. "Ask ChatGPT to write a note. Then send a
+ * Gmail message.") the LLM classifies the intent IN THE CONTEXT OF the given
+ * service rather than holistically for the entire prompt. The cache key also
+ * includes serviceKey so different agents get different cached intents.
+ *
+ * @param {string} task       - The task text to classify.
+ * @param {string} [serviceKey] - The service being resolved (e.g. "gmail",
+ *                                "twitter", "chatgpt"). Optional for backward
+ *                                compatibility.
  */
-async function classifyTaskIntent(task) {
+async function classifyTaskIntent(task, serviceKey) {
   const _scopedFull = _scopeTaskText(task, 280);
-  const _scopedShort = _scopedFull.slice(0, 100);
-  const _cacheKey = _scopedShort;
+  const _scopedShort = _scopedFull;
+  const _svc = String(serviceKey || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+  const _cacheKey = _svc ? `${_svc}:${_scopedShort}` : _scopedShort;
 
   // Return cached result if available (handle both old string and new {intent, keywords} formats)
   if (_intentCache.has(_cacheKey)) {
@@ -212,14 +224,17 @@ async function classifyTaskIntent(task) {
     return typeof _cached === 'string' ? _cached : _cached.intent;
   }
 
-  // Intra-app short-circuit
-  if (_scopedFull.includes('openai') || _scopedFull.includes('chatgpt')) {
-    return INTENTS.CHAT;
-  }
-
   // ── Primary: LLM classification ───────────────────────────────────────────
   if (_skillLlm && _scopedShort.trim().length > 3) {
     try {
+      // Dynamically inject service context so the LLM focuses on the relevant
+      // portion of a multi-step task for the specific service being resolved.
+      // This is NOT a hardcoded prompt for any single service — the serviceKey
+      // is interpolated at runtime for whatever service is being resolved
+      // (gmail, twitter, linkedin, chatgpt, outlook, etc.).
+      const _serviceContext = _svc
+        ? `\n\nNOTE: The user is performing this task using the "${_svc}" service. Classify the intent IN THE CONTEXT OF what the user wants to do with ${_svc}, not other services mentioned in the task.`
+        : '';
       const _llmPrompt = `Classify this browser task into exactly one of these categories. Return the category followed by a pipe and 3-5 keywords that characterize the task.
 
 Definitions and examples:
@@ -240,7 +255,7 @@ Definitions and examples:
 - support        : contact support, help center, ticket. Examples: "open a support ticket", "contact customer support"
 - dashboard      : analytics, stats, admin, overview. Examples: "show my dashboard", "view analytics", "open admin panel"
 - home           : any other generic navigation, visiting a site, opening a page, clicking elements. Examples: "go to github.com", "open Slack", "visit the homepage"
-
+${_serviceContext}
 Task: ${_scopedShort}
 
 Format: category|keyword1,keyword2,keyword3,keyword4,keyword5
@@ -703,7 +718,7 @@ async function resolveDestination(serviceKey, task, plannedUrl, agentId) {
   }
 
   // ── Classify intent and check planned URL ─────────────────────────────────
-  const intent      = await classifyTaskIntent(task);
+  const intent      = await classifyTaskIntent(task, serviceKey);
   const plannedType = classifyUrlType(plannedUrl);
   const accepted    = INTENT_ACCEPTED_URL_TYPES[intent]
     || [INTENTS.HOME, INTENTS.CHAT, INTENTS.DOCS, INTENTS.CONSOLE, INTENTS.SETTINGS];
@@ -964,10 +979,17 @@ async function _cleanupDeepLinkCache() {
 /**
  * Retrieve keywords extracted by classifyTaskIntent for a given task.
  * Returns [] if classifyTaskIntent hasn't been called or no keywords were extracted.
+ *
+ * @param {string} task       - The task text.
+ * @param {string} [serviceKey] - The service being resolved. Must match the
+ *                                serviceKey passed to classifyTaskIntent for the
+ *                                same task so the cache key aligns.
  */
-function getTaskKeywords(task) {
+function getTaskKeywords(task, serviceKey) {
   const _scopedShort = _scopeTaskText(task, 100);
-  const _cached = _intentCache.get(_scopedShort);
+  const _svc = String(serviceKey || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+  const _cacheKey = _svc ? `${_svc}:${_scopedShort}` : _scopedShort;
+  const _cached = _intentCache.get(_cacheKey);
   if (_cached && typeof _cached === 'object' && Array.isArray(_cached.keywords)) {
     return _cached.keywords;
   }

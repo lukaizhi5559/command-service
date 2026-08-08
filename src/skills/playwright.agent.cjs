@@ -82,6 +82,29 @@ function callExternalSkill(name, args = {}, timeoutMs = 30000) {
 }
 
 // ---------------------------------------------------------------------------
+// URL equality check — preserves hash fragments (critical for SPA hash-routers
+// like Gmail where #inbox?compose=new is a different page state than #inbox).
+// Stripping all query strings via split('?')[0] would incorrectly treat these
+// as identical, skipping navigation to the compose view.
+// Compares origin + pathname + hash, ignoring only top-level search params
+// (tracking tokens, session params) that don't affect page state.
+// ---------------------------------------------------------------------------
+function _urlsEqual(urlA, urlB) {
+  if (!urlA || !urlB) return false;
+  try {
+    const _a = new URL(urlA);
+    const _b = new URL(urlB);
+    const _normPath = (u) => u.pathname.replace(/\/+$/, '') || '/';
+    return _a.origin === _b.origin
+      && _normPath(_a) === _normPath(_b)
+      && _a.hash === _b.hash;
+  } catch (_) {
+    if (!urlA || !urlB) return false;
+    return urlA.replace(/\/+$/, '') === urlB.replace(/\/+$/, '');
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Engine fast-path helpers — use Playwright Node API directly when engine is
 // active, bypassing browserAct → cliRun subprocess overhead.
 // Falls back to browserAct (which has its own CLI fallback) on any error.
@@ -2224,13 +2247,14 @@ Rules:
 
 const FIELD_EXTRACTION_PROMPT = `You are a goal parser. Extract field values from the user's goal for form filling.
 
-Output ONLY a JSON object mapping field names to their values. Field names should match common form field names: "to", "subject", "body", "title", "description", "content", "cc", "bcc", "tags", "category".
+Output ONLY a JSON object mapping field names to their values. Field names should match common form field names: "to", "subject", "body", "title", "description", "content", "cc", "bcc", "tags", "category", "prompt".
 
 Rules:
 - Email addresses go in "to" (comma-separated if multiple).
 - Text after "subject" or "titled" goes in "subject".
 - Text after "body" or "message" or "saying" goes in "body".
 - If the goal is a single text with no clear field mapping, put it in "body".
+- For AI chat / conversation tasks (ask, tell, prompt, proofread, polish, summarize, rewrite, improve, edit, review, translate, explain, analyze, etc.): put the FULL instruction text (including the verb and any instruction prefix like "Proofread and polish the following...") in "body". Do NOT strip the instruction prefix — the entire instruction is the prompt that should be pasted into the AI chat box. For example, "Proofread and polish the following thank-you note: 'Dear Bob, thanks...'" → body: "Proofread and polish the following thank-you note: 'Dear Bob, thanks...'" (the full text).
 - Output ONLY the JSON object, no explanation.`;
 
 async function _generateSelectorMap(sessionId, hostname, goal, timeoutMs) {
@@ -2897,7 +2921,23 @@ async function _captureStreamingResponse(sessionId, page, postSubmitBaselineText
       _stopButtonWasVisible = true;
     } else if (_stopButtonWasVisible) {
       // Stop button was visible and is now gone → response complete
-      logger.info(`[playwright.agent] field map: Stop button disappeared — capturing text`);
+      // BUT: on Claude.ai the Stop button briefly appears during request setup
+      // and disappears BEFORE streaming begins. Require a 2s text-stability
+      // confirmation before accepting this as a completion signal. If the text
+      // is still growing, keep waiting (the 2s window keeps resetting on growth).
+      logger.info(`[playwright.agent] field map: Stop button disappeared — confirming text stability (2s)`);
+      let _stableStart = Date.now();
+      let _stablePrevLen = await page.evaluate(() => (document.body?.innerText || '').length).catch(() => 0);
+      while (Date.now() - _stableStart < 2000 && Date.now() < deadline) {
+        const _checkLen = await page.evaluate(() => (document.body?.innerText || '').length).catch(() => 0);
+        if (_checkLen !== _stablePrevLen) {
+          // Text still growing — not stable yet, reset window
+          _stablePrevLen = _checkLen;
+          _stableStart = Date.now();
+        }
+        await new Promise(r => setTimeout(r, 300));
+      }
+      logger.info(`[playwright.agent] field map: Stop button disappeared + text stable — capturing text`);
       break;
     }
     // Signal 2: Sliding window — 3s of no text growth (fallback)
@@ -5813,8 +5853,9 @@ function _isCanonicalRedirect(targetUrl, currentUrl) {
   try {
     const _t = new URL(targetUrl);
     const _c = new URL(currentUrl);
-    // Exact match is trivially canonical
-    if (_t.hostname === _c.hostname && _t.pathname === _c.pathname) return true;
+    // Exact match is trivially canonical (include hash — SPA hash-routers like
+    // Gmail use #inbox vs #inbox?compose=new to distinguish different page states)
+    if (_t.hostname === _c.hostname && _t.pathname === _c.pathname && _t.hash === _c.hash) return true;
 
     // *.new shortcut domains (e.g., notion.new, docs.new, sheets.new)
     // These redirect to the brand's main domain (notion.new → app.notion.com/<page-id>).
@@ -7731,9 +7772,7 @@ async function playwrightAgent(args) {
       const _engineUrlRes = await _engineEval(sessionId, 'window.location.href');
       if (_engineUrlRes?.ok && _engineUrlRes.result) {
         const _curUrl = String(_engineUrlRes.result).trim().replace(/^"|"$/g, '');
-        const _normCur = _curUrl.replace(/\/+$/, '').split('?')[0];
-        const _normTarget = url.replace(/\/+$/, '').split('?')[0];
-        if (_normCur === _normTarget) {
+        if (_urlsEqual(_curUrl, url)) {
           _alreadyOnTarget = true;
           logger.info(`[playwright.agent] already on target URL ${_curUrl} — skipping redundant navigation`);
         } else if (_isCanonicalRedirect(url, _curUrl)) {
@@ -7751,9 +7790,7 @@ async function playwrightAgent(args) {
           const _curUrlRes = await browserAct({ action: 'evaluate', text: 'window.location.href', sessionId, headed, timeoutMs: 5000 });
           if (_curUrlRes?.ok && _curUrlRes?.result) {
             const _curUrl = String(_curUrlRes.result).trim().replace(/^"|"$/g, '');
-            const _normCur = _curUrl.replace(/\/+$/, '').split('?')[0];
-            const _normTarget = url.replace(/\/+$/, '').split('?')[0];
-            if (_normCur === _normTarget) {
+            if (_urlsEqual(_curUrl, url)) {
               _alreadyOnTarget = true;
               logger.info(`[playwright.agent] already on target URL ${_curUrl} — skipping redundant navigation`);
             } else if (_isCanonicalRedirect(url, _curUrl)) {
@@ -8090,6 +8127,45 @@ async function playwrightAgent(args) {
       const _curUrl = await _engineEval(sessionId, 'window.location.href');
       const _actualUrl = _curUrl?.ok ? String(_curUrl.result).trim().replace(/^"|"$/g, '') : url;
       const _isFormUrl = isFormUrl(url) || isFormUrl(_actualUrl);
+
+      // ── Gmail compose dialog guard ───────────────────────────────────────────
+      // If this is a Gmail compose task (URL contains compose=new) but the compose
+      // dialog is NOT open on the page, do NOT proceed to the field map. The field
+      // map will try to fill a To field that doesn't exist on the inbox view and
+      // burn the entire timeout. Instead, attempt one navigation retry; if the
+      // dialog still isn't open, fall through to Tier 2/3 (LLM planning) which can
+      // click the Compose button as a fallback.
+      const _isGmailComposeUrl = /mail\.google\.com.*compose=new/.test(url)
+        || /mail\.google\.com.*compose=new/.test(_actualUrl);
+      let _gmailComposeDialogOpen = true; // assume open unless proven otherwise
+      if (_isGmailComposeUrl) {
+        const _composeDialogExpr = "(!!(document.querySelector('div[role=dialog] [contenteditable], div[role=dialog] [role=textbox], div[role=dialog] textarea, div[role=dialog] input[name=to], textarea[name=to]') || document.querySelector('div[role=dialog] form')))";
+        const _composeCheckRes = await _engineEval(sessionId, _composeDialogExpr).catch(() => ({ ok: false }));
+        const _composeDialogOpen = _composeCheckRes?.ok
+          && (_composeCheckRes.result === true || _composeCheckRes.result === 'true');
+        if (!_composeDialogOpen) {
+          logger.warn(`[playwright.agent] Tier 1.5: Gmail compose URL detected but compose dialog NOT open — attempting navigation retry before field map (url=${url} actualUrl=${_actualUrl})`);
+          // Retry navigation to the compose URL once
+          const _retryNav = await _engineNavigate(sessionId, url, Math.max(timeoutMs, 30000));
+          if (_retryNav?.ok) {
+            await new Promise(r => setTimeout(r, 3000));
+            const _recheckRes = await _engineEval(sessionId, _composeDialogExpr).catch(() => ({ ok: false }));
+            const _recheckOpen = _recheckRes?.ok
+              && (_recheckRes.result === true || _recheckRes.result === 'true');
+            if (_recheckOpen) {
+              logger.info(`[playwright.agent] Tier 1.5: Gmail compose dialog open after retry — proceeding to field map`);
+              _gmailComposeDialogOpen = true;
+            } else {
+              logger.warn(`[playwright.agent] Tier 1.5: Gmail compose dialog still NOT open after retry — skipping field map, falling through to Tier 2/3 (LLM will click Compose)`);
+              _gmailComposeDialogOpen = false;
+            }
+          } else {
+            logger.warn(`[playwright.agent] Tier 1.5: Gmail compose navigation retry failed — skipping field map, falling through to Tier 2/3`);
+            _gmailComposeDialogOpen = false;
+          }
+        }
+      }
+
       // Structural editor page detection: editable fields (app-agnostic).
       // _probeResult is not yet defined at this point (it's initialized later at line ~6977).
       // Use a quick inline probe via _engineEval — just 3 DOM queries to check for editable fields.
@@ -8111,6 +8187,8 @@ async function playwrightAgent(args) {
       // falsely skipped "Ask Claude to summarize X" because "summarize" matched.)
       if (!_hasEditableFields && !_isFormUrl) {
         logger.info(`[playwright.agent] Tier 1.5: no editable fields on page — skipping field map (read/extract task)`);
+      } else if (_isGmailComposeUrl && !_gmailComposeDialogOpen) {
+        logger.info(`[playwright.agent] Tier 1.5: Gmail compose dialog not open — skipping field map (falling through to Tier 2/3 for Compose click)`);
       } else {
         logger.info(`[playwright.agent] Tier 1.5: ${_isFormUrl ? 'form URL' : 'editable page'} detected (url=${url} actualUrl=${_actualUrl}) — trying deterministic field map`);
         const _tier15Result = await _deterministicSelectorPath(sessionId, _actualUrl || url, goal, hostname, timeoutMs, { hasEditableFields: _hasEditableFields, agentContext, appKnowledgeEntries });
@@ -11288,4 +11366,7 @@ module.exports = {
   incrementSelectorMapFailure,
   derivePagePattern,
   isFormUrl,
+  // URL comparison helpers (exported for testing)
+  _urlsEqual,
+  _isCanonicalRedirect,
 };

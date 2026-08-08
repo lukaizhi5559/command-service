@@ -6977,7 +6977,7 @@ If no videos found, return []. Do not explain, only output the JSON array.`;
                 if (_authCookieBaseline === null) {
                   const _baseSniff = await _sniffAuthCookies(engine, sessionId, _ePage, _cookieSniffDomain);
                   _authCookieBaseline = new Set(_baseSniff.ok && _baseSniff.authed ? _baseSniff.cookies : []);
-                  logger.debug(`[browser.act] waitForAuth: cookie baseline captured (${_authCookieBaseline.size} cookies) for session=${sessionId}`);
+                  logger.info(`[browser.act] waitForAuth: cookie baseline captured (${_authCookieBaseline.size} cookies, domain=${_cookieSniffDomain}) for session=${sessionId}`);
                 } else {
                   const _sniff = await _sniffAuthCookies(engine, sessionId, _ePage, _cookieSniffDomain);
                   if (_sniff.ok && _sniff.authed) {
@@ -6986,10 +6986,18 @@ If no videos found, return []. Do not explain, only output the JSON array.`;
                       logger.info(`[browser.act] waitForAuth: CDP auth cookies detected (new: ${_newCookies.join(',')}) — auth complete for session=${sessionId}`);
                       return { ok: true, action, sessionId, authResolved: true, detectedVia: 'cdp_cookies', executionTime: Date.now() - start };
                     }
+                  } else if (!_sniff.ok) {
+                    logger.info(`[browser.act] waitForAuth: cookie sniff unavailable (reason: ${_sniff.reason}) — relying on URL/JS heuristics for session=${sessionId}`);
                   }
                 }
               } catch (_sniffErr) {
-                logger.debug(`[browser.act] waitForAuth: cookie sniff failed (non-fatal): ${_sniffErr.message}`);
+                logger.info(`[browser.act] waitForAuth: cookie sniff failed (non-fatal): ${_sniffErr.message}`);
+              }
+            } else {
+              // Only log once when entering the in-auth-flow branch without
+              // cookie sniff capability (avoids spamming every poll).
+              if (authWallDetections === 1) {
+                logger.info(`[browser.act] waitForAuth: cookie sniff skipped (domain=${_cookieSniffDomain || 'null'}, hasPage=${!!_ePage}) for session=${sessionId}`);
               }
             }
             logger.debug(`[browser.act] waitForAuth: in auth flow at ${currentUrl} (${authWallDetections} polls), ${Math.round((deadline - Date.now()) / 1000)}s remaining`);

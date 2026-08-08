@@ -14,8 +14,12 @@ function getChromium() {
 
 // Cached result of whether the user's real Google Chrome is installed.
 // null = not yet checked; true/false = checked. When real Chrome launch fails,
-// this is set to false so subsequent launches skip straight to bundled CfT.
+// a cooldown timestamp is recorded so we skip real Chrome for a while but
+// retry it again after the cooldown expires (transient failures like profile
+// locks shouldn't permanently disable real Chrome).
 let _realChromeAvailable = null;
+let _realChromeCooldownUntil = 0;
+const _REAL_CHROME_COOLDOWN_MS = 60 * 1000; // 1 minute cooldown after a launch failure
 
 /**
  * Detect whether the user's real Google Chrome is installed.
@@ -154,11 +158,18 @@ async function launch(sessionId, opts = {}) {
 
   if (_wantChrome) {
     // Check if real Chrome is available (cached after first check).
+    // If a previous launch failed and we're in a cooldown period, skip real
+    // Chrome for now but retry after the cooldown expires (transient failures
+    // like profile locks shouldn't permanently disable real Chrome).
     if (_realChromeAvailable === null) {
       _realChromeAvailable = _detectRealChrome();
       logger.info(`[browser-engine] real Chrome available: ${_realChromeAvailable}`);
     }
-    if (_realChromeAvailable) {
+    const _inCooldown = _realChromeAvailable && Date.now() < _realChromeCooldownUntil;
+    if (_inCooldown) {
+      logger.info(`[browser-engine] real Chrome in cooldown (until ${new Date(_realChromeCooldownUntil).toISOString()}) — using bundled CfT`);
+    }
+    if (_realChromeAvailable && !_inCooldown) {
       try {
         ctx = await getChromium().launchPersistentContext(profileDir, { ...launchOpts, channel: 'chrome' });
         _usedChannel = 'chrome';
@@ -191,12 +202,12 @@ async function launch(sessionId, opts = {}) {
             _usedChannel = 'chrome';
             logger.info(`[browser-engine] real Chrome launch succeeded after zombie cleanup`);
           } catch (retryErr) {
-            logger.warn(`[browser-engine] real Chrome retry failed (${retryErr.message}) — falling back to bundled Chrome for Testing`);
-            _realChromeAvailable = false; // don't retry real Chrome on subsequent launches
+            logger.warn(`[browser-engine] real Chrome retry failed (${retryErr.message}) — falling back to bundled Chrome for Testing (cooldown ${_REAL_CHROME_COOLDOWN_MS}ms)`);
+            _realChromeCooldownUntil = Date.now() + _REAL_CHROME_COOLDOWN_MS;
           }
         } else {
-          logger.warn(`[browser-engine] real Chrome launch failed (${chromeErr.message}) — falling back to bundled Chrome for Testing`);
-          _realChromeAvailable = false; // don't retry real Chrome on subsequent launches
+          logger.warn(`[browser-engine] real Chrome launch failed (${chromeErr.message}) — falling back to bundled Chrome for Testing (cooldown ${_REAL_CHROME_COOLDOWN_MS}ms)`);
+          _realChromeCooldownUntil = Date.now() + _REAL_CHROME_COOLDOWN_MS;
         }
       }
     }
