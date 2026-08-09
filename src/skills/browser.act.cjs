@@ -4208,7 +4208,7 @@ async function browserAct(args) {
       const targetText = (text || '').trim();
       const tagFilter = args.tag || args.tagName || null;
       const exact = args.exact === true;
-      const searchShadow = args.shadow === true;
+      const searchShadow = args.shadow !== false; // default: search shadow DOM (Spotify and other web components hide buttons in shadow roots)
       const scopeSelector = args.scope || null;
       if (!targetText) {
         return { ok: false, action, sessionId, error: 'clickByText: text is required', executionTime: Date.now() - start };

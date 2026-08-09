@@ -217,6 +217,11 @@ async function _askWithMessagesOnce(messages, opts = {}) {
         } else if (msg.type === 'llm_stream_fallback') {
           resetTimeout();
         } else if (msg.type === 'llm_stream_chunk') {
+          // Reset the response timeout on each chunk so a slow-but-progressing
+          // stream doesn't get killed. Without this, llm_stream_start clears the
+          // timeout and chunks never reset it — a stalled stream hangs forever
+          // (observed: 63-second calls burning 70% of the turn-loop budget).
+          resetTimeout();
           const chunk = msg.payload?.chunk || msg.payload?.text || '';
           if (chunk) {
             accumulated += chunk;

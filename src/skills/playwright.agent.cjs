@@ -2244,7 +2244,7 @@ Rules:
 - For list items: role="item", pressAfter="Enter" (to create the next item automatically)
 - For slash commands (e.g. "/todo"): include as a separate field with text="/todo" and pressAfter="Enter"
 - Extract the text values from the goal (e.g. "Weekly Goals" from "create a page called 'Weekly Goals'")
-- MULTI-STEP DETECTION: Set "multiStep": true ONLY when the goal requires actions across MULTIPLE different UI contexts/pages (e.g. create a playlist on one page, then search on another page, then add songs from a third context). Do NOT set multiStep=true when all actions target the same form/input on the current page (e.g. "click the search box, type 'Lecrae', press Enter" is single-step — all actions target the search input). When in doubt, set multiStep=false.
+- MULTI-STEP DETECTION: Set "multiStep": true ONLY when the goal requires actions across MULTIPLE different UI contexts/pages (e.g. create a playlist on one page, then search on another page, then add songs from a third context). Do NOT set multiStep=true when all actions target the same form/input on the current page (e.g. "click the search box, type 'Lecrae', press Enter" is single-step — all actions target the search input). When the goal describes more than 2 sequential actions across different pages (e.g. "create X, then search Y, then add Z"), set multiStep=true. If the goal contains sequential markers like "then", "next", "finally" connecting different actions, set multiStep=true.
 - Output ONLY the JSON object.`;
 
 const FIELD_EXTRACTION_PROMPT = `You are a goal parser. Extract field values from the user's goal for form filling.
@@ -2403,6 +2403,14 @@ async function _generateFieldMap(sessionId, hostname, goal, timeoutMs, options =
     // UI contexts that a single field map cannot handle. Fall through to Tier 2/3.
     if (parsed.multiStep === true) {
       logger.info(`[playwright.agent] field map gen: LLM detected multi-step goal — skipping field map (falling through to Tier 2/3)`);
+      return { multiStep: true };
+    }
+    // Structural sanity check: if the LLM generated only 1 field with very long
+    // text (>100 chars), it has misrouted a multi-step task into a single field.
+    // This catches cases where the LLM's multiStep flag failed but the field map
+    // is clearly wrong (e.g. entire 500-char goal typed into a search box).
+    if (parsed.fields.length === 1 && (parsed.fields[0].text || '').length > 100) {
+      logger.info(`[playwright.agent] field map gen: single field "${parsed.fields[0].name}" with long text (${(parsed.fields[0].text || '').length} chars) — treating as multi-step (falling through to Tier 2/3)`);
       return { multiStep: true };
     }
     logger.info(`[playwright.agent] field map gen: ${parsed.fields.length} fields, ${parsed.submitSelectors?.length || 0} submit selectors, autoSave=${!!parsed.autoSave}, multiStep=${!!parsed.multiStep}`);
@@ -4697,6 +4705,394 @@ async function verifyTierCompletion(goal, pageType, routingDecision, script, ses
 // goal wasn't actually achieved (e.g. Google Docs rename that typed the title
 // into the Find-and-replace dialog instead of the document title input).
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// LLM goal decomposition: break the goal into sub-tasks with semantic
+// verification criteria. This replaces the fragile regex-based phrase
+// extraction as the PRIMARY verification mechanism. Falls back to regex
+// (_extractGoalPhrases) if decomposition fails.
+// ---------------------------------------------------------------------------
+
+// Extract entities (proper nouns + quoted phrases) from a goal string.
+// Used to ensure the LLM decomposition doesn't silently drop entities like
+// "KB" or "Newsboys" when collapsing a multi-entity task into sub-tasks.
+function _extractGoalEntities(goal) {
+  if (!goal || typeof goal !== 'string') return [];
+  const _stop = new Set([
+    'The', 'And', 'Then', 'Create', 'Search', 'Add', 'Click', 'Open', 'New',
+    'Page', 'Playlist', 'Repeat', 'Process', 'Find', 'Top', 'Songs', 'Track',
+    'Tracks', 'Menu', 'Button', 'Sidebar', 'Left', 'Right', 'URL', 'Go',
+    'Make', 'Use', 'Get', 'Set', 'Put', 'Show', 'List', 'Name', 'Rename',
+    'Music', 'Artist', 'Artists', 'Album', 'Song', 'Spotify', 'YouTube',
+    'Google', 'Chrome', 'Safari', 'Firefox', 'Edge', 'Browser', 'Tab',
+    'Window', 'Screen', 'App', 'Application', 'Desktop', 'Mobile',
+  ]);
+  const entities = new Set();
+  // Quoted phrases (single + double quotes) — these are the most reliable
+  const _quoted = goal.match(/['"]([^'"]{2,50})['"]/g) || [];
+  for (const q of _quoted) {
+    const t = q.replace(/['"]/g, '').trim();
+    if (t.length > 1 && !/^\+|\.\.\.$|^Save$|^Enter$|^Cancel$|^OK$|^Yes$|^No$/i.test(t)) {
+      entities.add(t);
+    }
+  }
+  // Capitalized proper nouns (2+ chars, not in stoplist)
+  const _caps = goal.match(/\b[A-Z][a-zA-Z]{1,}\b/g) || [];
+  for (const c of _caps) {
+    if (!_stop.has(c) && c.length > 1) {
+      entities.add(c);
+    }
+  }
+  const result = Array.from(entities);
+  logger.info(`[playwright.agent] entity extraction from goal: ${result.length} entities: ${result.join(', ')}`);
+  return result;
+}
+
+async function _decomposeGoalIntoSubTasks(goal, sessionId) {
+  if (!goal || goal.length < 10) return { ok: false, error: 'goal too short' };
+  // Don't decompose if the goal already has a [DISCOVERED PROCEDURE] block —
+  // the procedure is already step-by-step.
+  if (/\[DISCOVERED PROCEDURE/.test(goal)) return { ok: false, error: 'goal has procedure block' };
+
+  // ── Entity preservation: extract entities before LLM call ──
+  const _entities = _extractGoalEntities(goal);
+  const _entityList = _entities.length > 0
+    ? `\n\nCRITICAL — ENTITY PRESERVATION:\nThe following entities are mentioned in the goal and MUST each appear in at least one sub-task description: ${_entities.map(e => `"${e}"`).join(', ')}\nDo NOT collapse multiple entities into a single sub-task unless the verification criterion covers ALL of them. If there are 3 artists, create separate sub-tasks for each artist's songs being added (or one sub-task whose verification checks for ALL 3 artists on the destination page).\n`
+    : '';
+
+  const _prompt = `Decompose this browser automation goal into ordered sub-tasks. For each sub-task, provide a specific, checkable verification criterion.
+
+Goal: "${goal.slice(0, 1000)}"
+${_entityList}
+Return JSON only:
+{
+  "subTasks": [
+    {
+      "id": 1,
+      "description": "what to do (imperative, e.g. 'Create a new playlist')",
+      "verification": "how to check if done (specific, e.g. 'URL contains /playlist/' or 'input with placeholder Add a name contains Christian Music')"
+    }
+  ]
+}
+
+Rules:
+- 2-8 sub-tasks (merge trivial steps, but preserve all entities)
+- verification must be checkable from URL, DOM, or visible text — NOT from "the action succeeded"
+- Each sub-task should be independently verifiable
+- Order matters — earlier sub-tasks are prerequisites for later ones
+- CRITICAL: verification must check the FINAL page state after ALL sub-tasks are complete, NOT intermediate states. For "add X to Y" tasks, use "page text contains X" (the final destination page), NOT "search results show X" (intermediate). For "create playlist named Z", use "URL contains /playlist/ and page text contains Z".
+- For "add/search" sub-tasks, the verification should check that the ADDED ITEM appears on the DESTINATION page (e.g. playlist page text contains the artist name), not that search results are visible.`;
+
+  try {
+    const _raw = await askWithMessages([
+      { role: 'system', content: 'You are a browser automation task planner. Output valid JSON only.' },
+      { role: 'user', content: _prompt },
+    ], { temperature: 0.1, maxTokens: 800, responseTimeoutMs: 15000 });
+
+    if (!_raw) return { ok: false, error: 'empty response' };
+    const _m = _raw.match(/\{[\s\S]*\}/);
+    if (!_m) return { ok: false, error: 'no JSON in response' };
+    const _parsed = JSON.parse(_m[0]);
+    if (!_parsed.subTasks || !Array.isArray(_parsed.subTasks) || _parsed.subTasks.length === 0) {
+      return { ok: false, error: 'no subTasks array' };
+    }
+    // Normalize
+    let subTasks = _parsed.subTasks.map((s, i) => ({
+      id: s.id || (i + 1),
+      description: String(s.description || '').slice(0, 200),
+      verification: String(s.verification || '').slice(0, 300),
+      completed: false,
+    }));
+
+    // ── Entity preservation validation: check all entities are covered ──
+    if (_entities.length > 0) {
+      const _allDesc = subTasks.map(s => s.description).join(' ').toLowerCase();
+      const _missing = _entities.filter(e => !_allDesc.includes(e.toLowerCase()));
+      if (_missing.length > 0) {
+        logger.warn(`[playwright.agent] entity preservation: ${_missing.length} entities missing from sub-tasks: ${_missing.join(', ')} — adding fallback sub-tasks`);
+        const _hasPlaylist = /playlist/i.test(_allDesc);
+        const _destination = _hasPlaylist ? 'the playlist' : 'the destination';
+        for (const entity of _missing) {
+          const _nextId = Math.max(...subTasks.map(s => s.id)) + 1;
+          subTasks.push({
+            id: _nextId,
+            description: `Add songs by ${entity} to ${_destination}`,
+            verification: `${_destination} page text contains "${entity}"`,
+            completed: false,
+          });
+        }
+      }
+    }
+
+    logger.info(`[playwright.agent] goal decomposition: ${subTasks.length} sub-tasks: ${subTasks.map(s => `#${s.id} ${s.description} [verify: ${s.verification}]`).join(' | ')}`);
+    return { ok: true, subTasks };
+  } catch (e) {
+    logger.warn(`[playwright.agent] goal decomposition failed (non-fatal, will use regex fallback): ${e.message}`);
+    return { ok: false, error: e.message };
+  }
+}
+
+// Check if a single sub-task is completed based on its verification criterion.
+// Uses lightweight DOM/URL checks — not another LLM call.
+// Returns true if the verification criterion is met.
+async function _checkSubTaskCompletion(subTask, page, pageUrl, pageText) {
+  if (!subTask || subTask.completed) return true;
+  const v = (subTask.verification || '').toLowerCase();
+  if (!v) return false;
+  const url = (pageUrl || '').toLowerCase();
+  const text = (pageText || '').toLowerCase().slice(0, 5000);
+
+  // Pattern: "URL contains X" or "url contains X"
+  const urlMatch = v.match(/url contains ['"]?([^'"\n]+?)['"]?(?:\s|$)/);
+  if (urlMatch) {
+    const frag = urlMatch[1].toLowerCase().trim();
+    if (frag && url.includes(frag)) {
+      logger.info(`[playwright.agent] sub-task #${subTask.id} verified: URL contains "${frag}"`);
+      return true;
+    }
+  }
+
+  // Pattern: "input ... contains X" or "field ... contains X"
+  const inputMatch = v.match(/(?:input|field)(?:.*?)(?:contains|has|shows?)\s+['"]?([^'"\n]+?)['"]?(?:\s|$)/);
+  if (inputMatch && page) {
+    const target = inputMatch[1].toLowerCase().trim();
+    try {
+      const _found = await page.evaluate((t) => {
+        const els = Array.from(document.querySelectorAll('input, textarea, [contenteditable="true"]'));
+        for (const el of els) {
+          const val = (el.value || el.innerText || el.textContent || '').toLowerCase();
+          if (val.includes(t)) return true;
+        }
+        return false;
+      }, target).catch(() => false);
+      if (_found) {
+        logger.info(`[playwright.agent] sub-task #${subTask.id} verified: input contains "${target}"`);
+        return true;
+      }
+    } catch (_) {}
+  }
+
+  // Pattern: "page shows X" or "text X visible" or "X appears"
+  const textMatch = v.match(/(?:page shows?|text|visible|appears?|displays?)\s+['"]?([^'"\n]+?)['"]?(?:\s|$)/);
+  if (textMatch) {
+    const target = textMatch[1].toLowerCase().trim();
+    if (target && text.includes(target)) {
+      logger.info(`[playwright.agent] sub-task #${subTask.id} verified: page text contains "${target}"`);
+      return true;
+    }
+  }
+
+  // Pattern: "search results" — check if there are list-like elements with the search term
+  const searchMatch = v.match(/search results?(?:.*?)(?:show|contain|visible|display)\s+['"]?([^'"\n]+?)['"]?(?:\s|$)/);
+  if (searchMatch && page) {
+    const term = searchMatch[1].toLowerCase().trim();
+    if (term && text.includes(term)) {
+      try {
+        const _hasResults = await page.evaluate(() => {
+          return document.querySelectorAll('[role="listitem"], [data-testid*="track"], [data-testid*="card"], li, .search-result').length > 0;
+        }).catch(() => false);
+        if (_hasResults) {
+          logger.info(`[playwright.agent] sub-task #${subTask.id} verified: search results for "${term}" visible`);
+          return true;
+        }
+      } catch (_) {}
+    }
+  }
+
+  // Fallback: just check if the verification text appears in page text
+  if (v.length > 5 && v.length < 100) {
+    const keyPhrase = v.replace(/^(url contains|input.*?contains|page shows?|text|visible|appears?|displays?|search results?.*?)\s+/i, '').replace(/['"]/g, '').trim();
+    if (keyPhrase.length > 3 && text.includes(keyPhrase.toLowerCase())) {
+      logger.info(`[playwright.agent] sub-task #${subTask.id} verified: page contains "${keyPhrase}"`);
+      return true;
+    }
+  }
+
+  return false;
+}
+
+// Build the sub-task progress block for injection into the turn-loop LLM prompt.
+function _buildSubTaskProgressBlock(subTasks) {
+  if (!subTasks || subTasks.length === 0) return '';
+  const lines = subTasks.map(s => {
+    const mark = s.completed ? '[✓]' : '[ ]';
+    const status = s.completed ? 'DONE' : 'NOT DONE';
+    return `${mark} ${s.id}. ${s.description} — ${status}`;
+  });
+  const _current = subTasks.find(s => !s.completed);
+  const currentLine = _current
+    ? `\nCURRENT SUB-TASK: #${_current.id} — ${_current.description}\nDo NOT repeat completed sub-tasks. Focus on the current sub-task.`
+    : '\nALL SUB-TASKS COMPLETE — output { "action": "return", "data": "all sub-tasks completed" }';
+  return `\nSUB-TASK PROGRESS:\n${lines.join('\n')}${currentLine}\n`;
+}
+
+// ---------------------------------------------------------------------------
+// 3-gate structural verification — used when the LLM emits "return" or the
+// turn-loop exhausts, to verify that incomplete sub-tasks were ACTUALLY
+// completed (not just "entity name appears somewhere on the page").
+//
+// Gate 1: Action transcript check — did the agent perform an "add" action
+//         matching the entity? (fast, deterministic)
+// Gate 2: Container check — does the entity appear in a track-list-like
+//         container but NOT in search results? (fast, deterministic)
+// Gate 3: LLM verification — ask the LLM with page state + transcript
+//         (only when gates 1 & 2 are inconclusive; ~3-5s latency)
+//
+// Returns { verified: boolean, gate: string, reason: string }
+// ---------------------------------------------------------------------------
+async function _structuralVerifySubTask(subTask, { page, pageUrl, pageText, transcript, sessionId }) {
+  if (!subTask || subTask.completed) return { verified: true, gate: 'already_completed', reason: 'sub-task already marked complete' };
+  const _desc = (subTask.description || '').toLowerCase();
+  const _verification = (subTask.verification || '').toLowerCase();
+  const _url = (pageUrl || '').toLowerCase();
+  const _text = (pageText || '').toLowerCase().slice(0, 8000);
+
+  // Extract key entities from the sub-task description + verification
+  const _entityTerms = new Set();
+  const _quoted = (subTask.description + ' ' + subTask.verification).match(/['"]([^'"]{2,50})['"]/g) || [];
+  for (const q of _quoted) {
+    const t = q.replace(/['"]/g, '').trim();
+    if (t.length > 1 && !/^\+|\.\.\.$|^save$|^enter$|^cancel$/i.test(t)) _entityTerms.add(t.toLowerCase());
+  }
+  const _caps = (subTask.description + ' ' + subTask.verification).match(/\b[A-Z][a-zA-Z]{2,}\b/g) || [];
+  const _stop = new Set(['The', 'And', 'Then', 'Create', 'Search', 'Add', 'Click', 'Open', 'New', 'Page', 'Playlist', 'Repeat', 'Process', 'Find', 'Top', 'Songs', 'Track', 'Tracks', 'Menu', 'Button', 'Sidebar', 'URL', 'Music', 'Artist', 'Artists', 'Album', 'Song']);
+  for (const c of _caps) {
+    if (!_stop.has(c)) _entityTerms.add(c.toLowerCase());
+  }
+  const _terms = Array.from(_entityTerms);
+  if (_terms.length === 0) {
+    return { verified: false, gate: 'no_terms', reason: 'no entity terms extracted from sub-task description' };
+  }
+
+  // Determine if this is an "add" sub-task
+  const _isAddTask = /\b(add|insert|include|put|append)\b/.test(_desc) || /\b(add|insert|include|put|append)\b/.test(_verification);
+
+  // ── Gate 1: Action transcript check ──────────────────────────────────
+  if (_isAddTask && Array.isArray(transcript) && transcript.length > 0) {
+    for (const t of transcript) {
+      const _a = t.action || {};
+      const _o = t.outcome || {};
+      if (!_o.ok) continue;
+      const _actionText = ((_a.text || '') + ' ' + (_a.selector || '') + ' ' + (_a.label || '') + ' ' + (_a.value || '')).toLowerCase();
+      const _hasAddVerb = /\b(add|add to|include|insert|append)\b/.test(_actionText);
+      const _matchesEntity = _terms.some(term => _actionText.includes(term));
+      if (_hasAddVerb && _matchesEntity) {
+        logger.info(`[playwright.agent] structural verify sub-task #${subTask.id}: Gate 1 PASSED — add action found in transcript: ${_a.action}(${_a.text || _a.selector || ''})`);
+        return { verified: true, gate: 'transcript', reason: `add action found in transcript matching entity: ${_terms.filter(t => _actionText.includes(t)).join(', ')}` };
+      }
+    }
+    logger.info(`[playwright.agent] structural verify sub-task #${subTask.id}: Gate 1 FAILED — no add action matching entity in transcript (${transcript.length} actions scanned)`);
+  } else if (!_isAddTask) {
+    logger.info(`[playwright.agent] structural verify sub-task #${subTask.id}: Gate 1 SKIPPED — not an add task`);
+  } else {
+    logger.info(`[playwright.agent] structural verify sub-task #${subTask.id}: Gate 1 SKIPPED — no transcript`);
+  }
+
+  // ── Gate 2: Container check ──────────────────────────────────────────
+  if (page) {
+    try {
+      const _containerResult = await page.evaluate((terms) => {
+        const _trackListSelectors = [
+          '[data-testid="track-list"]', '[data-testid*="track-list"]',
+          '[data-testid*="playlist-track"]', '[role="listitem"]',
+          '.track-list', '.playlist-tracks',
+          '[aria-label*="Track"]', '[aria-label*="Content of"]',
+        ];
+        const _searchSelectors = [
+          '[data-testid*="search"]', '[data-testid*="search-result"]',
+          '.search-result', '[role="search"]', '[aria-label*="Search result"]',
+        ];
+        let _trackListText = '';
+        for (const sel of _trackListSelectors) {
+          for (const el of document.querySelectorAll(sel)) _trackListText += ' ' + (el.innerText || el.textContent || '');
+        }
+        let _searchText = '';
+        for (const sel of _searchSelectors) {
+          for (const el of document.querySelectorAll(sel)) _searchText += ' ' + (el.innerText || el.textContent || '');
+        }
+        _trackListText = _trackListText.toLowerCase();
+        _searchText = _searchText.toLowerCase();
+        const _results = [];
+        for (const term of terms) {
+          _results.push({ term, inTrackList: _trackListText.includes(term), inSearch: _searchText.includes(term) });
+        }
+        return { results: _results, hasTrackListContainer: _trackListText.length > 0, hasSearchContainer: _searchText.length > 0 };
+      }, _terms).catch(() => null);
+
+      if (_containerResult && _containerResult.results) {
+        const _inTrackListOnly = _containerResult.results.filter(r => r.inTrackList && !r.inSearch);
+        const _inSearchOnly = _containerResult.results.filter(r => r.inSearch && !r.inTrackList);
+        const _inBoth = _containerResult.results.filter(r => r.inTrackList && r.inSearch);
+
+        if (_inTrackListOnly.length > 0) {
+          logger.info(`[playwright.agent] structural verify sub-task #${subTask.id}: Gate 2 PASSED — entity in track-list, not in search: ${_inTrackListOnly.map(r => r.term).join(', ')}`);
+          return { verified: true, gate: 'container', reason: `entity in track-list container, not in search: ${_inTrackListOnly.map(r => r.term).join(', ')}` };
+        }
+        if (_inSearchOnly.length > 0 && _containerResult.results.every(r => !r.inTrackList)) {
+          logger.info(`[playwright.agent] structural verify sub-task #${subTask.id}: Gate 2 FAILED — entity only in search results: ${_inSearchOnly.map(r => r.term).join(', ')}`);
+          return { verified: false, gate: 'container', reason: `entity only in search results, not in track list: ${_inSearchOnly.map(r => r.term).join(', ')}` };
+        }
+        logger.info(`[playwright.agent] structural verify sub-task #${subTask.id}: Gate 2 INCONCLUSIVE — falling through to Gate 3`);
+      } else {
+        logger.info(`[playwright.agent] structural verify sub-task #${subTask.id}: Gate 2 INCONCLUSIVE — container check returned null — falling through to Gate 3`);
+      }
+    } catch (e) {
+      logger.info(`[playwright.agent] structural verify sub-task #${subTask.id}: Gate 2 ERROR — ${e.message} — falling through to Gate 3`);
+    }
+  } else {
+    logger.info(`[playwright.agent] structural verify sub-task #${subTask.id}: Gate 2 SKIPPED — no page object`);
+  }
+
+  // ── Gate 3: LLM verification ─────────────────────────────────────────
+  try {
+    let ask;
+    try { ({ ask } = require('../skill-helpers/skill-llm.cjs')); } catch (_) {}
+    if (!ask) {
+      return { verified: false, gate: 'no_llm', reason: 'gates 1 & 2 inconclusive and LLM not available' };
+    }
+    const _transcriptSummary = (transcript || []).slice(-10).map((t, i) => {
+      const _a = t.action || {};
+      const _o = t.outcome || {};
+      const _actionDesc = _a.action ? `${_a.action}(${_a.text || _a.selector || _a.url || ''})` : JSON.stringify(_a).slice(0, 60);
+      const _outcomeDesc = _o.ok ? 'ok' : `fail: ${(_o.error || '').slice(0, 40)}`;
+      return `${i + 1}. ${_actionDesc} → ${_outcomeDesc}`;
+    }).join('\n');
+
+    const _llmPrompt = `You are verifying whether a browser automation sub-task was completed. Base your assessment ONLY on the evidence below.
+
+SUB-TASK DESCRIPTION: ${subTask.description}
+VERIFICATION CRITERION: ${subTask.verification}
+
+CURRENT PAGE URL: ${pageUrl || '(unknown)'}
+CURRENT PAGE TEXT (first 500 chars): ${(pageText || '').slice(0, 500)}
+
+ACTIONS TAKEN (last ${Math.min(10, (transcript || []).length)} of ${(transcript || []).length}):
+${_transcriptSummary || '(no actions)'}
+
+Was this sub-task completed? Consider:
+- Does the current page show evidence that the sub-task's goal was achieved?
+- Were the actions taken consistent with completing the sub-task?
+- For "add X to Y" tasks: is X actually IN Y (the destination), not just visible on a search page?
+
+Return ONLY valid JSON:
+{"completed": true/false, "reasoning": "1-2 sentence explanation"}`;
+
+    const _raw = await ask(_llmPrompt, { maxTokens: 150, temperature: 0, responseTimeoutMs: 10000 });
+    const _text2 = (typeof _raw === 'string' ? _raw : _raw?.text || _raw?.content || '').trim();
+    const _stripped = _text2.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '').trim();
+    const _jsonMatch = _stripped.match(/\{[\s\S]*\}/);
+    if (_jsonMatch) {
+      const _parsed = JSON.parse(_jsonMatch[0]);
+      const _verified = _parsed.completed === true;
+      logger.info(`[playwright.agent] structural verify sub-task #${subTask.id}: Gate 3 ${_verified ? 'PASSED' : 'FAILED'} — LLM says: ${String(_parsed.reasoning || '').slice(0, 100)}`);
+      return { verified: _verified, gate: 'llm', reason: String(_parsed.reasoning || '').slice(0, 200) };
+    }
+    return { verified: false, gate: 'llm_parse_fail', reason: 'LLM response did not contain valid JSON' };
+  } catch (e) {
+    logger.warn(`[playwright.agent] structural verify sub-task #${subTask.id}: Gate 3 ERROR — ${e.message}`);
+    return { verified: false, gate: 'llm_error', reason: e.message };
+  }
+}
 
 // Extract goal phrases from a natural-language goal string.
 // Returns { phrases: string[], titledPhrases: string[] }.
@@ -7052,7 +7448,7 @@ Generate 3-5 steps to complete this task FROM THE CURRENT PAGE STATE. The prior 
   }
 }
 
-async function _executeTurnLoopFallback({ goal, verificationGoal, sessionId, headed, timeoutMs, agentContext, transcript, deadline, start, extractedText, heartbeat, textAlreadyEntered, maxTurns = 8, hostname, _discoveryAlreadyAttempted = false }) {
+async function _executeTurnLoopFallback({ goal, verificationGoal, sessionId, headed, timeoutMs, agentContext, transcript, deadline, start, extractedText, heartbeat, textAlreadyEntered, maxTurns = 8, hostname, _discoveryAlreadyAttempted = false, _preDecomposedSubTasks = null }) {
   const MAX_TURNS = maxTurns;
   const _loopTranscript = [...transcript];
   let _lastActionSignature = null; // for duplicate detection
@@ -7076,7 +7472,24 @@ async function _executeTurnLoopFallback({ goal, verificationGoal, sessionId, hea
   const _NO_PROGRESS_THRESHOLD = 3;       // hint after this many identical unproductive attempts
   const _NO_PROGRESS_BAIL_THRESHOLD = 4;  // bail to ask_user after this many
   let _noProgressHintInjected = false;
-  logger.info(`[playwright.agent] turn-loop fallback: starting (max ${MAX_TURNS} turns) for goal="${goal.slice(0, 80)}"`);
+  // ── LLM goal decomposition: break the goal into sub-tasks with semantic
+  // verification criteria. This replaces the fragile regex-based phrase
+  // extraction as the PRIMARY verification mechanism. Falls back to regex
+  // (_extractGoalPhrases) if decomposition fails.
+  let _subTasks = _preDecomposedSubTasks;
+  if (_subTasks) {
+    logger.info(`[playwright.agent] turn-loop: using pre-decomposed sub-tasks (${_subTasks.length} sub-tasks, cached from pre-check)`);
+  } else if (!_discoveryAlreadyAttempted) {
+    try {
+      const _decomp = await _decomposeGoalIntoSubTasks(goal, sessionId);
+      if (_decomp.ok && _decomp.subTasks && _decomp.subTasks.length > 0) {
+        _subTasks = _decomp.subTasks;
+      }
+    } catch (e) {
+      logger.warn(`[playwright.agent] turn-loop: goal decomposition error (non-fatal): ${e.message}`);
+    }
+  }
+  logger.info(`[playwright.agent] turn-loop fallback: starting (max ${MAX_TURNS} turns) for goal="${goal.slice(0, 80)}"${_subTasks ? ` [decomposed: ${_subTasks.length} sub-tasks]` : ''}`);
 
   for (let turn = 1; turn <= MAX_TURNS; turn++) {
     if (Date.now() > deadline) {
@@ -7405,6 +7818,7 @@ ${_composeSel ? `- SUGGESTED COMPOSE SELECTOR: ${_composeSel}` : ''}`;
       }
     }
     const _turnUser = `GOAL: ${_effectiveGoal}
+${_subTasks && _subTasks.length > 0 ? _buildSubTaskProgressBlock(_subTasks) : ''}
 ${agentContext ? `\nAGENT CONTEXT:\n${agentContext}` : ''}
 ${_onTargetPage ? '\n⚠️ YOU ARE ALREADY ON THE CORRECT PAGE. DO NOT navigate. Start typing or clicking NOW.\n' : ''}
 ${textAlreadyEntered ? '\n✅ TEXT ALREADY ENTERED via keyboard.type and verified via OCR. Do NOT type again. Just click the submit/Post button NOW.\n' : ''}
@@ -7459,6 +7873,77 @@ Turn ${turn}/${MAX_TURNS}. What is your next action? (DO NOT snapshot - act dire
     // ── Done check ──
     if (_action.action === 'return') {
       const _result = String(_action.data || '').slice(0, 2000);
+      // ── Sub-task-aware early exit: if LLM decomposition was used and ALL
+      // sub-tasks are marked completed via strict verification, accept the
+      // return without falling through to the fragile regex-based verification.
+      if (_subTasks && _subTasks.length > 0 && _subTasks.every(s => s.completed)) {
+        logger.info(`[playwright.agent] turn-loop: return accepted at turn ${turn} — all ${_subTasks.length} sub-tasks verified complete`);
+        return {
+          ok: true,
+          routingDecision: 'turn_loop_subtask_complete',
+          result: _result || `All ${_subTasks.length} sub-tasks completed`,
+          transcript: _loopTranscript,
+          sessionId,
+        };
+      }
+      // ── 3-gate structural verification for incomplete sub-tasks ────────
+      // If sub-tasks exist but not all are marked completed, re-check incomplete
+      // sub-tasks using the 3-gate structural verification (action transcript +
+      // container check + LLM). This catches cases where the strict per-turn
+      // check missed a completion (e.g., verification criteria checked
+      // intermediate states).
+      if (_subTasks && _subTasks.length > 0) {
+        const _incomplete = _subTasks.filter(s => !s.completed);
+        if (_incomplete.length > 0) {
+          let _structPageText = '';
+          let _structPageUrl = '';
+          let _structPage = null;
+          try {
+            _structPage = engine.getPage(sessionId);
+            if (_structPage) {
+              _structPageText = await _structPage.evaluate(() => document.body.innerText.slice(0, 8000)).catch(() => '');
+              _structPageUrl = await _structPage.url().catch(() => '');
+            }
+          } catch (_) {}
+          let _structPassed = 0;
+          const _structDetails = [];
+          for (const _st of _incomplete) {
+            const _sv = await _structuralVerifySubTask(_st, {
+              page: _structPage, pageUrl: _structPageUrl, pageText: _structPageText,
+              transcript: _loopTranscript, sessionId,
+            });
+            if (_sv.verified) {
+              _st.completed = true;
+              _structPassed++;
+              _structDetails.push(`#${_st.id} verified via ${_sv.gate}: ${_sv.reason}`);
+            } else {
+              _structDetails.push(`#${_st.id} NOT verified (${_sv.gate}): ${_sv.reason}`);
+            }
+          }
+          logger.info(`[playwright.agent] turn-loop: structural re-check — ${_structPassed}/${_incomplete.length} incomplete sub-tasks now verified. Details: ${_structDetails.join('; ')}`);
+          // If ALL sub-tasks are now completed, accept the return
+          if (_subTasks.every(s => s.completed)) {
+            logger.info(`[playwright.agent] turn-loop: return accepted at turn ${turn} — all ${_subTasks.length} sub-tasks verified (structural re-check passed)`);
+            return {
+              ok: true,
+              routingDecision: 'turn_loop_subtask_complete_structural',
+              result: _result || `All ${_subTasks.length} sub-tasks completed (structural verification)`,
+              transcript: _loopTranscript,
+              sessionId,
+            };
+          }
+          // Not all sub-tasks verified — reject the return and continue the loop
+          const _stillIncomplete = _subTasks.filter(s => !s.completed).map(s => `#${s.id} ${s.description}`);
+          logger.warn(`[playwright.agent] turn-loop: return REJECTED at turn ${turn} — ${_stillIncomplete.length} sub-tasks not verified: ${_stillIncomplete.join(', ')} — continuing loop`);
+          _loopTranscript.push({
+            action: { jit_research: `Goal verification: sub-tasks not yet verified: ${_stillIncomplete.join('; ')}. Focus on completing these.` },
+            outcome: { ok: true, note: 'structural verification hint' },
+          });
+          _lastActionSignature = 'return_rejected';
+          if (_result && _result.trim().length > 0) _rejectedReturnData = _result;
+          continue;
+        }
+      }
       // F7d: Verify the goal was actually achieved before accepting the LLM's
       // self-declared "done". The LLM may declare done based on per-step ok=true
       // even when the goal wasn't met (e.g. typed the title into the wrong field).
@@ -7752,6 +8237,41 @@ Turn ${turn}/${MAX_TURNS}. What is your next action? (DO NOT snapshot - act dire
           }
         } catch (_) {}
       }
+
+      // ── Sub-task completion check after each turn ──
+      // After DOM-mutating actions, check if any incomplete sub-tasks are now
+      // verified via their strict verification criteria. This provides early
+      // exit when all sub-tasks are done (without waiting for LLM 'return').
+      if (_subTasks && _subTasks.length > 0 && _domMutating) {
+        try {
+          const _stPage = engine.getPage(sessionId);
+          if (_stPage) {
+            const _stUrl = await _stPage.url().catch(() => '');
+            const _stText = await _stPage.evaluate(() => document.body.innerText.slice(0, 5000)).catch(() => '');
+            let _newlyCompleted = 0;
+            for (const _st of _subTasks) {
+              if (!_st.completed) {
+                const _done = await _checkSubTaskCompletion(_st, _stPage, _stUrl, _stText);
+                if (_done) { _st.completed = true; _newlyCompleted++; }
+              }
+            }
+            if (_newlyCompleted > 0) {
+              logger.info(`[playwright.agent] turn-loop: ${_newlyCompleted} sub-task(s) newly completed at turn ${turn} (${_subTasks.filter(s => s.completed).length}/${_subTasks.length} total)`);
+            }
+            // Early exit: if ALL sub-tasks are completed, return success
+            if (_subTasks.every(s => s.completed)) {
+              logger.info(`[playwright.agent] turn-loop: all ${_subTasks.length} sub-tasks completed at turn ${turn} — exiting loop early`);
+              return {
+                ok: true,
+                routingDecision: 'turn_loop_subtask_complete_early',
+                result: _stText.slice(0, 2000) || `All ${_subTasks.length} sub-tasks completed`,
+                transcript: _loopTranscript,
+                sessionId,
+              };
+            }
+          }
+        } catch (_) {}
+      }
     }
   }
 
@@ -7761,6 +8281,62 @@ Turn ${turn}/${MAX_TURNS}. What is your next action? (DO NOT snapshot - act dire
   // the return-check), then fall back to the relaxed body.innerText check only if
   // location-aware was inconclusive (e.g. no titled phrases, no title input found).
   logger.warn(`[playwright.agent] turn-loop: reached max turns (${MAX_TURNS}) — running pre-exhaustion completion check`);
+  // ── Sub-task-aware pre-exhaustion: if all sub-tasks are completed (either
+  // via strict per-turn checks or via 3-gate structural verification), exit
+  // successfully without needing the regex-based verification.
+  if (_subTasks && _subTasks.length > 0) {
+    // Run structural verification on any incomplete sub-tasks
+    const _incompletePre = _subTasks.filter(s => !s.completed);
+    if (_incompletePre.length > 0) {
+      let _preStructPage = null;
+      let _preStructText = '';
+      let _preStructUrl = '';
+      try {
+        _preStructPage = engine.getPage(sessionId);
+        if (_preStructPage) {
+          _preStructText = await _preStructPage.evaluate(() => document.body.innerText.slice(0, 8000)).catch(() => '');
+          _preStructUrl = await _preStructPage.url().catch(() => '');
+        }
+      } catch (_) {}
+      let _preStructPassed = 0;
+      const _preStructDetails = [];
+      for (const _st of _incompletePre) {
+        const _sv = await _structuralVerifySubTask(_st, {
+          page: _preStructPage, pageUrl: _preStructUrl, pageText: _preStructText,
+          transcript: _loopTranscript, sessionId,
+        });
+        if (_sv.verified) {
+          _st.completed = true;
+          _preStructPassed++;
+          _preStructDetails.push(`#${_st.id} verified via ${_sv.gate}: ${_sv.reason}`);
+        } else {
+          _preStructDetails.push(`#${_st.id} NOT verified (${_sv.gate}): ${_sv.reason}`);
+        }
+      }
+      logger.info(`[playwright.agent] turn-loop: pre-exhaustion structural re-check — ${_preStructPassed}/${_incompletePre.length} incomplete sub-tasks now verified. Details: ${_preStructDetails.join('; ')}`);
+    }
+    // All complete?
+    if (_subTasks.every(s => s.completed)) {
+      logger.info(`[playwright.agent] turn-loop: pre-exhaustion check — all ${_subTasks.length} sub-tasks verified complete`);
+      let _stPageText = '';
+      try {
+        const _ePage = engine.getPage(sessionId);
+        if (_ePage) _stPageText = await _ePage.evaluate(() => document.body.innerText.slice(0, 5000)).catch(() => '');
+      } catch (_) {}
+      return {
+        ok: true,
+        goal,
+        sessionId,
+        routingDecision: 'turn_loop_subtask_complete_pre_exhaustion',
+        result: _stPageText || `All ${_subTasks.length} sub-tasks completed`,
+        transcript: _loopTranscript,
+      };
+    }
+    // Not all sub-tasks verified — log what's missing and fall through to
+    // the regex-based verification as a last resort.
+    const _stillIncompletePre = _subTasks.filter(s => !s.completed).map(s => `#${s.id} ${s.description}`);
+    logger.warn(`[playwright.agent] turn-loop: pre-exhaustion — ${_stillIncompletePre.length} sub-tasks NOT verified: ${_stillIncompletePre.join(', ')} — falling through to regex verification`);
+  }
   try {
     const _ePage = engine.getPage(sessionId);
     if (_ePage) {
@@ -7869,10 +8445,14 @@ Turn ${turn}/${MAX_TURNS}. What is your next action? (DO NOT snapshot - act dire
         goal: `${goal}${_procedureBlock}`,
         verificationGoal,
         sessionId, headed, timeoutMs, agentContext,
-        transcript: _loopTranscript, deadline, start,
+        transcript: _loopTranscript,
+        deadline: Date.now() + 120000,  // FRESH 120s budget — don't inherit consumed deadline
+        start: Date.now(),               // fresh start for the retry
         extractedText, heartbeat, textAlreadyEntered,
         maxTurns, hostname,
         _discoveryAlreadyAttempted: true,
+        // NOTE: no _preDecomposedSubTasks — the goal now has a [DISCOVERED PROCEDURE] block
+        // which _decomposeGoalIntoSubTasks will skip (it checks for [DISCOVERED PROCEDURE)
       }).catch((e) => { logger.warn(`[playwright.agent] turn-loop: discovery retry error (non-fatal): ${e.message}`); return null; });
 
       if (_retryResult?.ok) {
@@ -8101,6 +8681,26 @@ async function playwrightAgent(args) {
       goal = _rawGoal.slice(_preambleMatch[0].length);
       logger.info(`[playwright.agent] stripped recovery preamble from goal — recoveryUrl=${_recoveryUrl}, cleanGoal="${goal.slice(0, 80)}"`);
     }
+  }
+
+  // ── LLM goal decomposition pre-check ─────────────────────────────────────
+  // Decompose the goal into sub-tasks ONCE, early. This serves two purposes:
+  //   1. Multi-step detection: if >1 sub-task, skip the Tier 1.5 field map
+  //      (the goal is a multi-step task, not a single form fill).
+  //   2. Cached sub-tasks: passed to _executeTurnLoopFallback via the
+  //      _preDecomposedSubTasks param, avoiding a second decomposition call.
+  // This is LLM-based — no regex. Falls back gracefully if decomposition fails.
+  let _preDecomposedSubTasks = null;
+  try {
+    const _decomp = await _decomposeGoalIntoSubTasks(goal, sessionId);
+    if (_decomp.ok && _decomp.subTasks && _decomp.subTasks.length > 1) {
+      _preDecomposedSubTasks = _decomp.subTasks;
+      logger.info(`[playwright.agent] pre-check: goal decomposed into ${_preDecomposedSubTasks.length} sub-tasks — will skip field map (multi-step task)`);
+    } else if (_decomp.ok && _decomp.subTasks && _decomp.subTasks.length === 1) {
+      logger.info(`[playwright.agent] pre-check: goal decomposed into 1 sub-task — single-step, field map eligible`);
+    }
+  } catch (e) {
+    logger.warn(`[playwright.agent] pre-check: decomposition error (non-fatal): ${e.message}`);
   }
 
   const start = Date.now();
@@ -8602,6 +9202,8 @@ async function playwrightAgent(args) {
         logger.info(`[playwright.agent] Tier 1.5: Gmail compose dialog not open — skipping field map (falling through to Tier 2/3 for Compose click)`);
       } else if (_isMultiStepGoal(goal)) {
         logger.info(`[playwright.agent] Tier 1.5: multi-step goal detected (for-each loop) — skipping field map (falling through to Tier 2/3 for full LLM plan)`);
+      } else if (_preDecomposedSubTasks && _preDecomposedSubTasks.length > 1) {
+        logger.info(`[playwright.agent] Tier 1.5: LLM decomposition detected ${_preDecomposedSubTasks.length} sub-tasks — skipping field map (falling through to Tier 2/3)`);
       } else {
         logger.info(`[playwright.agent] Tier 1.5: ${_isFormUrl ? 'form URL' : 'editable page'} detected (url=${url} actualUrl=${_actualUrl}) — trying deterministic field map`);
         const _tier15Result = await _deterministicSelectorPath(sessionId, _actualUrl || url, goal, hostname, timeoutMs, { hasEditableFields: _hasEditableFields, agentContext, appKnowledgeEntries });
@@ -9524,6 +10126,7 @@ async function playwrightAgent(args) {
       maxTurns,
       start,
       hostname,
+      _preDecomposedSubTasks,
     });
     if (_turnLoopResult.ok) {
       _turnLoopResult.executionTime = Date.now() - start;
@@ -10763,6 +11366,7 @@ Output a JSON plan: { "plan": [ { "action": "type", "selector": "eXX", "text": "
             start,
             maxTurns,
             hostname,
+            _preDecomposedSubTasks,
           });
           if (_turnLoopResult.ok) {
             logger.info(`[playwright.agent] turn-loop fallback succeeded — returning`);
@@ -11042,6 +11646,7 @@ Output a JSON plan: { "plan": [ { "action": "type", "selector": "eXX", "text": "
             start,
             maxTurns,
             hostname,
+            _preDecomposedSubTasks,
           });
           if (_turnLoopResult.ok) {
             logger.info(`[playwright.agent] turn-loop fallback succeeded after unparseable repair — returning`);
@@ -11654,6 +12259,7 @@ Return JSON: { "thoughts": "strategy explanation", "plan": [...steps] }`;
           start,
           maxTurns,
           hostname,
+          _preDecomposedSubTasks,
         });
         if (_turnLoopResult.ok) {
           logger.info(`[playwright.agent] turn-loop fallback succeeded after overall timeout — returning`);

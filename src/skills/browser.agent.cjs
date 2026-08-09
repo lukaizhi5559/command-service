@@ -6557,7 +6557,7 @@ When extracting page content with run-code, prioritize these selectors over gene
         authConfirmedAt: (_getCachedAuthCheck(agentId)?.ts ?? null),
         _progressCallbackUrl,
         _stepIndex,
-    }, 140000));
+    }, 300000));
 
     let agentResultText = String(agentResult?.result ?? agentResult?.stdout ?? '');
 
@@ -6780,7 +6780,7 @@ When extracting page content with run-code, prioritize these selectors over gene
               _progressCallbackUrl,
               _stepIndex,
               _loginWallRetried: true,  // prevent recursive retry
-            }, 140000));
+            }, 300000));
             return {
               ok: _retryResult?.ok ?? false,
               agentId,
