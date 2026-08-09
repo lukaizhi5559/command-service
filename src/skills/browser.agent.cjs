@@ -336,6 +336,8 @@ const KNOWN_BROWSER_SERVICES = {
   threads:        { startUrl: 'https://www.threads.net',                         signInUrl: 'https://www.threads.net/login',                     authSuccessPattern: 'threads.net',                  isOAuth: true  },
   youtube:        { startUrl: 'https://www.youtube.com',                         signInUrl: 'https://accounts.google.com/signin/v2/identifier',  authSuccessPattern: 'youtube.com',                  isOAuth: false },
   twitch:         { startUrl: 'https://www.twitch.tv',                           signInUrl: 'https://www.twitch.tv/login',                       authSuccessPattern: 'twitch.tv',                    isOAuth: true  },
+  // ── Music streaming ──────────────────────────────────────────────────────────────────────────────────
+  spotify:        { startUrl: 'https://open.spotify.com',                        signInUrl: 'https://accounts.spotify.com/en/login',             authSuccessPattern: 'open.spotify.com/collection,open.spotify.com/playlist,open.spotify.com/album,open.spotify.com/artist',  isOAuth: true },
   // ── Developer tools ─────────────────────────────────────────────────────────────────────────────────
   github:         { startUrl: 'https://github.com',                              signInUrl: 'https://github.com/login',                          authSuccessPattern: 'github.com/',                  isOAuth: true  },
   gitlab:         { startUrl: 'https://gitlab.com',                              signInUrl: 'https://gitlab.com/users/sign_in',                  authSuccessPattern: 'gitlab.com/',                  isOAuth: true  },
@@ -3831,7 +3833,7 @@ function _isSigninWall(href) {
   return false;
 }
 
-async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAuth, skipAuth, manualLogin = false, preflightProbe = false, forceAuthProbe = false, requireCookieConfirmation = false, _progressCallbackUrl, _stepIndex, _loginWallRetried = false, _emitThinking = null, _authOnly = false }) {
+async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAuth, skipAuth, manualLogin = false, preflightProbe = false, forceAuthProbe = false, requireCookieConfirmation = false, _progressCallbackUrl, _stepIndex, _loginWallRetried = false, _emitThinking = null, _authOnly = false, planExtend = false, sessionId: _planExtendSessionId = null }) {
   // Derive agentId from url hostname when caller omits it (LLM sometimes emits only url)
   let agentId = _agentIdArg;
   if (!agentId && url) {
@@ -3849,6 +3851,35 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
   }
   if (!agentId) return { ok: false, error: 'agentId is required' };
   if (!task)    return { ok: false, error: 'task is required' };
+
+  // ── Plan Extension: "Try to finish" from partial-failure QuestionCard ──────
+  // When the user clicks "Try to finish", main.js re-invokes browser.agent with
+  // planExtend: true and the existing sessionId. Skip the full auth/probe/deeplink
+  // flow (the session is already authed and on the target page) and go directly
+  // to playwright.agent with a focused goal built from the remaining work.
+  if (planExtend && _planExtendSessionId) {
+    logger.info(`[browser.agent] run: planExtend mode — skipping auth/probe/deeplink, delegating to playwright.agent on existing session ${_planExtendSessionId}`);
+    try {
+      const { playwrightAgent } = require('./playwright.agent.cjs');
+      const _extendResult = await playwrightAgent({
+        agentId,
+        goal: task,            // playwrightAgent expects `goal`, not `task`
+        sessionId: _planExtendSessionId,
+        url: null,             // don't navigate — stay on current page
+        skipAuth: true,
+        headed: true,
+        timeoutMs: 120000,
+        overallTimeoutMs: 120000,
+        _progressCallbackUrl,
+        _stepIndex,
+      });
+      logger.info(`[browser.agent] run: planExtend result — ok=${_extendResult?.ok}, error=${_extendResult?.error || 'n/a'}`);
+      return _extendResult;
+    } catch (_extendErr) {
+      logger.warn(`[browser.agent] run: planExtend error: ${_extendErr.message}`);
+      return { ok: false, error: `Plan extension failed: ${_extendErr.message}`, agentId, task };
+    }
+  }
 
   // Domain-continuity flag: set in the playwright auth path, read later during
   // deep-link discovery. Declared at function scope so it is visible outside the
@@ -4642,13 +4673,18 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
               // title keywords + robots:noindex strongly indicate a login wall; a JS user
               // global strongly indicates an authenticated app. This catches marketing
               // homepages that redirect within the same base domain (e.g. Slack).
+              // NOTE: This is the FALLBACK path (CDP cookie sniff unavailable). When
+              // cookies are available, the cookie-first check above is authoritative.
               if (!_onLoginPage && !_wrongDomain) {
-                if (_pageInfo.hasUserGlobal) {
+                if (_pageInfo.hasUserGlobal && !_pageInfo.hasSignInButton) {
+                  // JS user global is only trustworthy when there's no "Log in" button visible.
+                  // Some sites (e.g. Spotify) expose an anonymous/guest user object in
+                  // __INITIAL_STATE__ even when logged out, while showing "Log in" buttons.
                   _pageMetaAuthed = true;
-                  logger.info(`[browser.agent] run: auth-check JS user global detected — authenticated for ${agentId}`);
-                } else if (_pageInfo.titleIsLogin || _pageInfo.isNoIndex) {
+                  logger.info(`[browser.agent] run: auth-check JS user global detected (no sign-in button) — authenticated for ${agentId}`);
+                } else if (_pageInfo.titleIsLogin || _pageInfo.isNoIndex || _pageInfo.hasSignInButton) {
                   _pageMetaLoginWall = true;
-                  logger.info(`[browser.agent] run: auth-check metadata login wall for ${agentId} (title="${_pageInfo.title}" titleIsLogin=${_pageInfo.titleIsLogin} isNoIndex=${_pageInfo.isNoIndex})`);
+                  logger.info(`[browser.agent] run: auth-check metadata login wall for ${agentId} (title="${_pageInfo.title}" titleIsLogin=${_pageInfo.titleIsLogin} isNoIndex=${_pageInfo.isNoIndex} hasSignInButton=${_pageInfo.hasSignInButton})`);
                 }
               }
 
@@ -4809,6 +4845,55 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
             logger.warn(`[browser.agent] run: parking content check failed (non-fatal): ${_pageErr.message}`);
           }
 
+          // ── PRIMARY: CDP cookie sniff (ground truth) ──────────────────────────
+          // Cookies are the authoritative signal for "is the user logged in?".
+          // DOM heuristics (hasSignInButton, titleIsLogin, hasUserGlobal, authSuccessPattern)
+          // are fallible — e.g. Spotify's landing page exposes a guest __INITIAL_STATE__.user
+          // and has no "login" in the URL, but shows "Log in" buttons and has no session cookies.
+          // Run the cookie sniff FIRST; only fall back to DOM heuristics if CDP is unavailable.
+          let _cookieAuthed = null; // null = unknown (CDP unavailable), true/false = result
+          try {
+            const _csPage = browserEngine && typeof browserEngine.getPage === 'function' ? browserEngine.getPage(sessionId) : null;
+            let _csDomain = '';
+            try { _csDomain = new URL(startUrl).hostname.replace(/^www\./, ''); } catch (_) {}
+            if (_csPage && _csDomain) {
+              const _csResult = await _sniffAuthCookies(browserEngine, sessionId, _csPage, _csDomain);
+              if (_csResult.ok) {
+                _cookieAuthed = _csResult.authed;
+                if (_cookieAuthed) {
+                  logger.info(`[browser.agent] run: auth-check: CDP auth cookies detected (${_csResult.cookies.join(',')}) — authenticated for ${agentId}`);
+                } else {
+                  logger.info(`[browser.agent] run: auth-check: no auth cookies found (${_csResult.reason}) — auth needed for ${agentId}`);
+                }
+              } else {
+                logger.info(`[browser.agent] run: auth-check: CDP unavailable (${_csResult.reason}) — falling back to DOM heuristics for ${agentId}`);
+              }
+            }
+          } catch (_csErr) {
+            logger.debug(`[browser.agent] run: auth-check: cookie sniff failed (non-fatal): ${_csErr.message}`);
+          }
+
+          if (_cookieAuthed === true) {
+            // DOM cross-check: if the page shows a sign-in button AND no user global,
+            // the HttpOnly cookies may be an anonymous session (Django sessionid, load
+            // balancer sticky cookie) rather than a real auth session. Don't override
+            // DOM signals — fall through to the DOM heuristic decision tree below.
+            if (_pageInfo.hasSignInButton && !_pageInfo.hasUserGlobal) {
+              logger.info(`[browser.agent] run: auth-check: HttpOnly cookies found but sign-in button visible (no user global) — deferring to DOM heuristics for ${agentId}`);
+              // Don't set _cookieAuthed override; fall through to DOM decision tree
+            } else {
+              // Ground truth: auth cookies present — skip waitForAuth regardless of DOM signals.
+              _pageMetaAuthed = true;
+              _onLoginPage = false;
+              _pageMetaLoginWall = false;
+              _setCachedAuthCheck(agentId, false);
+            }
+          } else if (_cookieAuthed === false) {
+            // Ground truth: no auth cookies — auth needed, regardless of what DOM heuristics say.
+            _authNeeded = true;
+          } else
+          // ── FALLBACK: DOM heuristic decision tree (CDP unavailable) ──────────
+          {
           // ── Internal web.agent self-heal ───────────────────────────────────────
           // Trigger ONLY for parking/squatter pages — domain mismatch (cross-domain redirect)
           // is treated as an auth redirect and goes to waitForAuth instead.
@@ -4963,6 +5048,7 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
             logger.info(`[browser.agent] run: auth-check: no login redirect${_curHref ? ` (${_curHref})` : ''} — skipping waitForAuth for ${agentId}`);
             _setCachedAuthCheck(agentId, false);
           }
+          } // end DOM heuristic fallback (else block of cookie-first check)
         }
       } catch (_probeErr) {
         // Check if the thrown error is a Chrome conflict — fail fast instead of falling to waitForAuth
@@ -6531,6 +6617,11 @@ When extracting page content with run-code, prioritize these selectors over gene
         trainingHandoff: agentResult.trainingHandoff === true,
         question: _questionText,
         options: _options,
+        // Partial-progress summary (from playwright.agent's _summarizePartialProgress).
+        // When present, the renderer shows a partial-failure QuestionCard with
+        // "Try to finish" / "Train me with a recipe" / "Other" instead of the
+        // generic failure banner.
+        partialProgress: agentResult.partialProgress || null,
         recipeWasUsed: _recipeExecutedOk,
         recipePatched: !!_doctorSummary,
         // Preserve session for train-from-current-page; pass current URL + the

@@ -2229,6 +2229,7 @@ Output ONLY a JSON object (no markdown, no explanation) with:
 - "submitSelectors": array of CSS selectors for submit/send buttons (optional — null for auto-save pages)
 - "submitVerify": object with "type" ("compose_gone", "snackbar", "url_change") and "pattern" (regex string), or null
 - "autoSave": boolean — true if the page auto-saves (no submit button needed, e.g. Notion, Google Docs)
+- "multiStep": boolean — true if the goal is a multi-step sequential task that CANNOT be accomplished by filling form fields on the CURRENT page (e.g. "create a playlist, then search for each artist and add songs" requires clicking buttons and navigating between pages, not just filling fields). false for single-action form fills (even if described with multiple micro-steps like "click search, type X, press Enter" — all target the same input).
 
 Rules:
 - Include BOTH placeholder AND selectors when available — the executor tries placeholder first, falls back to selectors
@@ -2243,6 +2244,7 @@ Rules:
 - For list items: role="item", pressAfter="Enter" (to create the next item automatically)
 - For slash commands (e.g. "/todo"): include as a separate field with text="/todo" and pressAfter="Enter"
 - Extract the text values from the goal (e.g. "Weekly Goals" from "create a page called 'Weekly Goals'")
+- MULTI-STEP DETECTION: Set "multiStep": true ONLY when the goal requires actions across MULTIPLE different UI contexts/pages (e.g. create a playlist on one page, then search on another page, then add songs from a third context). Do NOT set multiStep=true when all actions target the same form/input on the current page (e.g. "click the search box, type 'Lecrae', press Enter" is single-step — all actions target the search input). When in doubt, set multiStep=false.
 - Output ONLY the JSON object.`;
 
 const FIELD_EXTRACTION_PROMPT = `You are a goal parser. Extract field values from the user's goal for form filling.
@@ -2397,7 +2399,13 @@ async function _generateFieldMap(sessionId, hostname, goal, timeoutMs, options =
       logger.warn(`[playwright.agent] field map gen: no valid map generated`);
       return null;
     }
-    logger.info(`[playwright.agent] field map gen: ${parsed.fields.length} fields, ${parsed.submitSelectors?.length || 0} submit selectors, autoSave=${!!parsed.autoSave}`);
+    // LLM multi-step detection — goal requires sequential actions across multiple
+    // UI contexts that a single field map cannot handle. Fall through to Tier 2/3.
+    if (parsed.multiStep === true) {
+      logger.info(`[playwright.agent] field map gen: LLM detected multi-step goal — skipping field map (falling through to Tier 2/3)`);
+      return { multiStep: true };
+    }
+    logger.info(`[playwright.agent] field map gen: ${parsed.fields.length} fields, ${parsed.submitSelectors?.length || 0} submit selectors, autoSave=${!!parsed.autoSave}, multiStep=${!!parsed.multiStep}`);
     logger.info(`[playwright.agent] field map gen JSON: ${JSON.stringify(parsed.fields.map(f => ({ name: f.name, text: f.text, role: f.role, selectors: f.selectors, pressAfter: f.pressAfter, placeholder: f.placeholder })))}`);
     return parsed;
   } catch (err) {
@@ -3621,6 +3629,16 @@ async function _executeFieldMap(sessionId, fieldValues, fieldMap, timeoutMs, opt
   return { ok: true, transcript, result: 'Submitted (no verification configured)' };
 }
 
+// Conservative multi-step detector — only triggers on explicit loop constructs.
+// This is the FAST pre-check: skips the LLM field-map call entirely for obvious
+// multi-step goals. The LLM field-map itself has a secondary multiStep flag (below)
+// for subtler cases. "for each"/"for every" has near-zero false-positive risk
+// because single-action goals never use loop language.
+function _isMultiStepGoal(goal) {
+  if (!goal || typeof goal !== 'string') return false;
+  return /\bfor each\b|\bfor every\b|\bfor all of\b/i.test(goal);
+}
+
 // Main Tier 1.5 entry point: try cached map, or generate + cache new one
 // Extended: handles both form URLs (CSS selector path) AND editable pages
 // (placeholder + position path). options.hasEditableFields enables the extended path.
@@ -3639,6 +3657,7 @@ async function _deterministicSelectorPath(sessionId, url, goal, hostname, timeou
     logger.info(`[playwright.agent] Tier 1.5: no cached map — generating via LLM`);
     const generated = await _generateFieldMap(sessionId, hostname, goal, timeoutMs, { hasEditableFields: _hasEditableFields, agentContext: options.agentContext });
     if (!generated) return null; // fall through to Tier 2/3
+    if (generated.multiStep === true) return null; // LLM says multi-step — fall through to Tier 2/3
     fieldMap = generated;
     // Cache it
     await saveSelectorMap(hostname, pagePattern, generated);
@@ -4032,6 +4051,314 @@ Return {} if no actionable answer found.`;
 
   logger.info(`${_logTag}: no actionable fix found for ${_type}="${field}" on ${hostname} (all ${_queries.length} angles exhausted)`);
   return null;
+}
+
+// ---------------------------------------------------------------------------
+// Task-level discovery: when the turn-loop exhausts on a complex UI site,
+// search the web for how-to articles about the overall goal, crawl top
+// results, and LLM-extract a step-by-step procedure. Mirrors what a human
+// would do (e.g. "in spotify how do i add music to my playlist"). The
+// procedure is injected into a second turn-loop attempt and cached as
+// app-knowledge (type: task_procedure) for future runs of the same task.
+// ---------------------------------------------------------------------------
+
+async function _discoverTaskProcedure({ hostname, goal, transcript, sessionId, headed }) {
+  if (!hostname || !goal) return { discovered: false, reason: 'missing hostname or goal' };
+  const _logTag = '[playwright.agent] task-discovery';
+  const _appName = hostname.replace(/^www\./, '').split('.')[0];
+
+  // Strip the "IMPORTANT: You are working on ... Task:" wrapper that browser.agent.cjs
+  // adds so the LLM sees the actual task, not the routing preamble.
+  const _cleanGoal = String(goal).replace(/^IMPORTANT:.*?Task:\s*/si, '').trim();
+
+  // Lazy-load dependencies (same as _justInTimeResearch)
+  let searchWeb, webCrawl, ask;
+  try {
+    ({ searchWeb } = require('./web.agent.cjs'));
+    ({ webCrawl } = require('./web.crawl.cjs'));
+    ({ ask } = require('../skill-helpers/skill-llm.cjs'));
+  } catch (_reqErr) {
+    logger.warn(`${_logTag}: dependency load failed: ${_reqErr.message}`);
+    return { discovered: false, reason: 'dependencies unavailable' };
+  }
+  if (!searchWeb || !webCrawl || !ask) {
+    logger.warn(`${_logTag}: dependencies not available`);
+    return { discovered: false, reason: 'dependencies unavailable' };
+  }
+
+  // ── Phase 1: Check cached task_procedure in app-knowledge ────────────────
+  // Avoids redundant web research on repeated runs of the same task type.
+  try {
+    const { loadAppKnowledge } = require('./lib/appKnowledge.cjs');
+    const _existing = loadAppKnowledge(hostname);
+    const _goalActionHash = _hashGoalAction(_cleanGoal);
+    const _cached = _existing.find(e =>
+      e.type === 'task_procedure' && e.id?.endsWith(`:${_goalActionHash}`)
+    );
+    if (_cached?.details?.procedure) {
+      logger.info(`${_logTag}: cache hit for ${hostname} (hash=${_goalActionHash}) — reusing cached procedure`);
+      return {
+        discovered: true,
+        procedure: _cached.details.procedure,
+        keyUiElements: _cached.details.keyUiElements || [],
+        sourceUrls: _cached.details.sourceUrls || [],
+        queries: [],
+        fromCache: true,
+      };
+    }
+  } catch (_cacheErr) {
+    logger.debug(`${_logTag}: cache lookup failed (non-fatal): ${_cacheErr.message}`);
+  }
+
+  // ── Phase 2: LLM-generate search queries from the goal ───────────────────
+  const _queryGenPrompt = `Convert this automation goal into 3 web-search queries a human would type to find a how-to article. The queries should target official help docs, community forums, or tutorials.
+
+Goal: "${_cleanGoal}"
+Site: ${hostname}
+
+Return ONLY valid JSON: { "queries": ["query 1", "query 2", "query 3"] }
+Rules:
+- Each query should be 4-10 words, natural language.
+- Include the site/app name in at least one query.
+- Focus on the ACTION the user wants to accomplish, not on the agent's internal state.
+- Do NOT include words like "automation", "agent", "playwright" — these are human how-to queries.`;
+
+  let _queries = [];
+  try {
+    const _raw = await ask(_queryGenPrompt, { maxTokens: 200, temperature: 0, responseTimeoutMs: 15000 });
+    const _text = (typeof _raw === 'string' ? _raw : _raw?.text || _raw?.content || '').trim();
+    const _stripped = _text.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '').trim();
+    const _jsonMatch = _stripped.match(/\{[\s\S]*\}/);
+    if (_jsonMatch) {
+      const _parsed = JSON.parse(_jsonMatch[0]);
+      if (Array.isArray(_parsed.queries)) {
+        _queries = _parsed.queries.filter(q => typeof q === 'string' && q.trim().length > 0).slice(0, 5);
+      }
+    }
+  } catch (_qErr) {
+    logger.warn(`${_logTag}: query generation failed: ${_qErr.message}`);
+  }
+  if (_queries.length === 0) {
+    // Fallback: simple deterministic queries from the goal + app name
+    const _goalWords = _cleanGoal.toLowerCase().replace(/[^a-z0-9\s]/g, ' ').split(/\s+/).filter(w => w.length > 2).slice(0, 6).join(' ');
+    _queries = [
+      `${_appName} ${_goalWords}`,
+      `how to ${_goalWords} on ${_appName}`,
+      `${_appName} tutorial ${_goalWords}`,
+    ];
+  }
+  logger.info(`${_logTag}: generated ${_queries.length} queries for ${hostname}: ${_queries.map(q => `"${q}"`).join(', ')}`);
+
+  // ── Phase 3: Parallel web search ─────────────────────────────────────────
+  const _searchPromises = _queries.map(q => searchWeb(q, 3).catch(() => null));
+  const _searchResults = await Promise.all(_searchPromises);
+
+  // ── Phase 4: Crawl top results per query (sequential per query, parallel within) ──
+  // Stop at the first article that yields a high-confidence procedure.
+  const _sourceUrls = [];
+  for (let _qi = 0; _qi < _queries.length; _qi++) {
+    const _results = _searchResults[_qi];
+    if (!_results?.ok || !Array.isArray(_results.results) || _results.results.length === 0) continue;
+
+    for (const _result of _results.results.slice(0, 2)) {
+      let _crawl;
+      try {
+        _crawl = await webCrawl({ url: _result.url, maxChars: 5000, timeoutMs: 15000 });
+      } catch (_) { continue; }
+      if (!_crawl?.ok || !_crawl.content || _crawl.content.length < 100) continue;
+      _sourceUrls.push(_result.url);
+
+      // LLM-extract a procedural summary from the crawled help article
+      const _extractPrompt = `You are reading help articles for an automation agent. The agent is trying to accomplish this goal on ${hostname}:
+
+GOAL: ${_cleanGoal}
+
+Here is an excerpt from a help article (from ${_result.url}):
+${_crawl.content.slice(0, 4000)}
+
+Extract a CONCISE step-by-step procedure the agent should follow on the actual site UI. Mention specific buttons, menus, keyboard shortcuts, and UI element labels (e.g. "click the ••• button on the song row", "select 'Add to playlist' from the menu", "press the (+) Plus button").
+
+Return ONLY valid JSON:
+{
+  "procedure": "1. ...\\n2. ...\\n3. ...",
+  "keyUiElements": ["button label", "menu item", ...],
+  "confidence": 0.0-1.0
+}
+Return { "procedure": "", "confidence": 0.0 } if the article is not relevant.`;
+
+      let _raw;
+      try {
+        _raw = await ask(_extractPrompt, { maxTokens: 500, temperature: 0, responseTimeoutMs: 15000 });
+      } catch (_) { continue; }
+      if (!_raw) continue;
+      const _text = (typeof _raw === 'string' ? _raw : _raw?.text || _raw?.content || '').trim();
+      const _stripped = _text.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '').trim();
+      const _jsonMatch = _stripped.match(/\{[\s\S]*\}/);
+      if (!_jsonMatch) continue;
+
+      let _extracted;
+      try { _extracted = JSON.parse(_jsonMatch[0]); } catch (_) { continue; }
+      if (!_extracted?.procedure || _extracted.procedure.length < 20) continue;
+
+      const _confidence = Number(_extracted.confidence) || 0;
+      if (_confidence < 0.5) {
+        logger.info(`${_logTag}: article ${_result.url} yielded low-confidence procedure (${_confidence.toFixed(2)}) — continuing search`);
+        continue;
+      }
+
+      logger.info(`${_logTag}: found procedure (confidence=${_confidence.toFixed(2)}) from ${_result.url} — ${_extracted.procedure.slice(0, 80)}...`);
+
+      // ── Phase 5: Cache as task_procedure in app-knowledge ─────────────────
+      try {
+        const { saveAppKnowledge, loadAppKnowledge } = require('./lib/appKnowledge.cjs');
+        const _goalActionHash = _hashGoalAction(_cleanGoal);
+        const _entry = {
+          id: `${_appName}.task_procedure:${_goalActionHash}`,
+          type: 'task_procedure',
+          summary: `How to "${_cleanGoal.slice(0, 60)}" on ${hostname}`,
+          details: {
+            goal: _cleanGoal,
+            procedure: _extracted.procedure,
+            keyUiElements: _extracted.keyUiElements || [],
+            sourceUrls: _sourceUrls,
+            confidence: _confidence,
+          },
+          source: 'task_discovery',
+          confidence: _confidence,
+        };
+        const _existing = loadAppKnowledge(hostname);
+        saveAppKnowledge(hostname, [..._existing.filter(e => e.id !== _entry.id), _entry]);
+        logger.info(`${_logTag}: cached procedure for ${hostname} (hash=${_goalActionHash})`);
+      } catch (_cacheErr) {
+        logger.warn(`${_logTag}: cache save failed (non-fatal): ${_cacheErr.message}`);
+      }
+
+      return {
+        discovered: true,
+        procedure: _extracted.procedure,
+        keyUiElements: _extracted.keyUiElements || [],
+        sourceUrls: _sourceUrls,
+        queries: _queries,
+        fromCache: false,
+      };
+    }
+  }
+
+  logger.info(`${_logTag}: no actionable procedure found for goal on ${hostname} (${_queries.length} queries, ${_sourceUrls.length} articles crawled)`);
+  return { discovered: false, reason: 'no actionable procedure found', queries: _queries, sourceUrls: _sourceUrls };
+}
+
+// Simple hash of the goal's action phrase for cache keying.
+// Strips filler words so "Add songs to my Spotify playlist" and
+// "Add music to a Spotify playlist" hash to the same key.
+function _hashGoalAction(goal) {
+  const _stop = new Set(['the', 'a', 'an', 'my', 'your', 'to', 'on', 'in', 'for', 'and', 'or', 'of', 'with', 'from', 'by', 'is', 'are', 'was', 'were', 'be', 'been', 'being', 'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'could', 'should', 'may', 'might', 'must', 'can', 'this', 'that', 'these', 'those', 'i', 'you', 'he', 'she', 'it', 'we', 'they', 'me', 'him', 'her', 'us', 'them']);
+  const _words = String(goal || '').toLowerCase()
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .split(/\s+/)
+    .filter(w => w.length > 2 && !_stop.has(w))
+    .slice(0, 8)
+    .sort();
+  // Simple djb2 hash
+  let _hash = 5381;
+  for (const w of _words) {
+    for (let i = 0; i < w.length; i++) {
+      _hash = ((_hash << 5) + _hash) + w.charCodeAt(i);
+      _hash = _hash & 0xffffffff;
+    }
+  }
+  return (_hash >>> 0).toString(36);
+}
+
+// ---------------------------------------------------------------------------
+// Partial-progress summary: when the turn-loop exhausts (after discovery retry
+// also fails), ask the LLM to summarize what was completed vs. what remains,
+// using the action transcript + current page state as ground truth. The
+// summary is surfaced to the user via the partial-failure QuestionCard so they
+// can decide whether to "Try to finish" (plan extension), train a recipe, or
+// type a correction.
+// ---------------------------------------------------------------------------
+
+async function _summarizePartialProgress({ goal, transcript, sessionId, hostname }) {
+  if (!goal || !Array.isArray(transcript) || transcript.length === 0) return null;
+
+  let ask;
+  try {
+    ({ ask } = require('../skill-helpers/skill-llm.cjs'));
+  } catch (_) { return null; }
+  if (!ask) return null;
+
+  // Build a compact transcript summary (actions + outcomes, no full DOM dumps)
+  const _transcriptSummary = transcript
+    .slice(-20) // last 20 actions are most relevant
+    .map((t, i) => {
+      const _a = t.action || {};
+      const _o = t.outcome || {};
+      const _actionDesc = _a.action
+        ? `${_a.action}(${_a.selector || _a.text || _a.url || ''})`
+        : (_a.jit_research ? `jit_research: ${_a.jit_research}` : JSON.stringify(_a).slice(0, 80));
+      const _outcomeDesc = _o.ok ? 'ok' : `fail: ${(_o.error || '').slice(0, 60)}`;
+      return `${i + 1}. ${_actionDesc} → ${_outcomeDesc}`;
+    })
+    .join('\n');
+
+  // Capture current page state (URL + first 500 chars of body text)
+  let _pageState = '';
+  try {
+    const engine = require('./browser.engine.cjs');
+    const page = engine.getPage(sessionId);
+    if (page) {
+      const _url = await page.url().catch(() => '');
+      const _text = await page.evaluate(() => document.body.innerText.slice(0, 500)).catch(() => '');
+      _pageState = `Current URL: ${_url}\nPage text (first 500 chars): ${_text}`;
+    }
+  } catch (_) { /* non-fatal */ }
+
+  const _prompt = `You are analyzing a partially-completed browser automation task. The agent ran out of turns before finishing.
+
+ORIGINAL GOAL:
+${String(goal).replace(/^IMPORTANT:.*?Task:\s*/si, '').trim()}
+
+ACTIONS TAKEN (last ${Math.min(20, transcript.length)} of ${transcript.length}):
+${_transcriptSummary}
+
+CURRENT PAGE STATE:
+${_pageState || '(could not capture page state)'}
+
+Determine what was COMPLETED and what REMAINS. Be specific and accurate — base your assessment only on the evidence above (actions taken + current page state), not on assumptions.
+
+Return ONLY valid JSON:
+{
+  "completed": ["specific thing that was achieved", ...],
+  "remaining": ["specific thing that still needs to be done", ...],
+  "summary": "one-paragraph user-facing summary (2-3 sentences) explaining what happened and what's left"
+}
+Rules:
+- "completed" should list concrete achievements (e.g. "Created a Spotify playlist named 'Christian Music'").
+- "remaining" should list concrete outstanding work (e.g. "Add songs from Lecrae, KB, and Newsboys to the playlist").
+- If nothing was completed, return an empty "completed" array.
+- If the task is fully done (shouldn't happen on exhaust, but defensively), return an empty "remaining" array.
+- "summary" should be friendly and actionable — the user will read it in a UI card.`;
+
+  try {
+    const _raw = await ask(_prompt, { maxTokens: 400, temperature: 0, responseTimeoutMs: 15000 });
+    const _text = (typeof _raw === 'string' ? _raw : _raw?.text || _raw?.content || '').trim();
+    const _stripped = _text.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '').trim();
+    const _jsonMatch = _stripped.match(/\{[\s\S]*\}/);
+    if (!_jsonMatch) return null;
+    const _parsed = JSON.parse(_jsonMatch[0]);
+    if (!Array.isArray(_parsed.completed) || !Array.isArray(_parsed.remaining)) return null;
+    logger.info(`[playwright.agent] partial-progress: completed=${_parsed.completed.length}, remaining=${_parsed.remaining.length}, summary="${String(_parsed.summary || '').slice(0, 80)}"`);
+    return {
+      completed: _parsed.completed,
+      remaining: _parsed.remaining,
+      summary: _parsed.summary || '',
+      currentUrl: _pageState.match(/Current URL: (.+)/)?.[1] || null,
+    };
+  } catch (e) {
+    logger.warn(`[playwright.agent] partial-progress: LLM summary failed: ${e.message}`);
+    return null;
+  }
 }
 
 // Signal collector D: Compose text disappearance — check if typed text is STILL
@@ -6725,7 +7052,7 @@ Generate 3-5 steps to complete this task FROM THE CURRENT PAGE STATE. The prior 
   }
 }
 
-async function _executeTurnLoopFallback({ goal, verificationGoal, sessionId, headed, timeoutMs, agentContext, transcript, deadline, start, extractedText, heartbeat, textAlreadyEntered, maxTurns = 8, hostname }) {
+async function _executeTurnLoopFallback({ goal, verificationGoal, sessionId, headed, timeoutMs, agentContext, transcript, deadline, start, extractedText, heartbeat, textAlreadyEntered, maxTurns = 8, hostname, _discoveryAlreadyAttempted = false }) {
   const MAX_TURNS = maxTurns;
   const _loopTranscript = [...transcript];
   let _lastActionSignature = null; // for duplicate detection
@@ -6735,6 +7062,10 @@ async function _executeTurnLoopFallback({ goal, verificationGoal, sessionId, hea
   // extracted data the user actually wants) is used as the result instead of a
   // generic "Goal verified" string — preventing data loss downstream.
   let _rejectedReturnData = null;
+  // Discovery-on-exhaust: set to true on the first exhaust so the retry
+  // (re-entering this function with the discovered procedure) does not
+  // trigger another discovery, preventing infinite recursion.
+  let _discoveryAttempted = _discoveryAlreadyAttempted;
   // Cross-transcript action-signature repeat counter for no-progress detection.
   // Key: "{action}|{selector}|{text}|{url}". Value: count of prior attempts with
   // ok=true outcomes. The body.innerText hash the old guard relies on is unreliable
@@ -7518,6 +7849,55 @@ Turn ${turn}/${MAX_TURNS}. What is your next action? (DO NOT snapshot - act dire
   }
 
   logger.warn(`[playwright.agent] turn-loop: exhausted (${MAX_TURNS} turns) without completing the goal`);
+
+  // ── Discovery-on-exhaust: one-shot task-level research + retry ────────────
+  // When the turn-loop exhausts on a complex UI site, search the web for how-to
+  // articles about the overall goal, crawl top results, LLM-extract a step-by-step
+  // procedure, and re-enter the turn-loop with that procedure injected as context.
+  // Only fires once (prevented by _discoveryAttempted) — never recurses.
+  if (!_discoveryAttempted && hostname && _discoverTaskProcedure) {
+    _discoveryAttempted = true;
+    logger.info(`[playwright.agent] turn-loop: exhausted — triggering task-procedure discovery for ${hostname}`);
+    const _discovery = await _discoverTaskProcedure({
+      hostname, goal, transcript: _loopTranscript, sessionId, headed,
+    }).catch((e) => { logger.warn(`[playwright.agent] turn-loop: discovery error (non-fatal): ${e.message}`); return null; });
+
+    if (_discovery?.discovered && _discovery.procedure) {
+      logger.info(`[playwright.agent] turn-loop: discovery found procedure (sources: ${_discovery.sourceUrls?.length || 0}, fromCache: ${!!_discovery.fromCache}) — re-entering turn-loop with injected knowledge`);
+      const _procedureBlock = `\n\n[DISCOVERED PROCEDURE for ${hostname}:\n${_discovery.procedure}\nKey UI elements to look for: ${(_discovery.keyUiElements || []).join(', ') || 'n/a'}\nFollow these steps. Look for the specific UI elements mentioned above.]`;
+      const _retryResult = await _executeTurnLoopFallback({
+        goal: `${goal}${_procedureBlock}`,
+        verificationGoal,
+        sessionId, headed, timeoutMs, agentContext,
+        transcript: _loopTranscript, deadline, start,
+        extractedText, heartbeat, textAlreadyEntered,
+        maxTurns, hostname,
+        _discoveryAlreadyAttempted: true,
+      }).catch((e) => { logger.warn(`[playwright.agent] turn-loop: discovery retry error (non-fatal): ${e.message}`); return null; });
+
+      if (_retryResult?.ok) {
+        _retryResult.routingDecision = 'turn_loop_discovery_retry_pass';
+        _retryResult.discoveryUsed = true;
+        _retryResult.discoverySources = _discovery.sourceUrls || [];
+        return _retryResult;
+      }
+      logger.warn(`[playwright.agent] turn-loop: discovery retry also exhausted — surfacing to user with partial progress`);
+    } else {
+      logger.info(`[playwright.agent] turn-loop: discovery found no procedure — surfacing to user with partial progress`);
+    }
+  }
+
+  // ── Partial-progress summary (LLM-generated) ──────────────────────────────
+  // Before surfacing the failure to the user, ask the LLM to summarize what was
+  // completed vs. what remains — so the user can decide whether to "Try to
+  // finish" (plan extension) or take another action.
+  let _partialProgress = null;
+  try {
+    _partialProgress = await _summarizePartialProgress({
+      goal, transcript: _loopTranscript, sessionId, hostname,
+    }).catch((e) => { logger.warn(`[playwright.agent] partial-progress summary error (non-fatal): ${e.message}`); return null; });
+  } catch (_) { /* non-fatal */ }
+
   return {
     ok: false,
     goal,
@@ -7529,6 +7909,7 @@ Turn ${turn}/${MAX_TURNS}. What is your next action? (DO NOT snapshot - act dire
     error: 'turn_loop_exhausted',
     routingDecision: 'turn_loop_fallback',
     executionTime: Date.now() - start,
+    partialProgress: _partialProgress,
   };
 }
 
@@ -7689,7 +8070,7 @@ class _PageHeartbeat {
 // ---------------------------------------------------------------------------
 async function playwrightAgent(args) {
   const {
-    goal,
+    goal: _rawGoal,
     sessionId             = 'playwright_agent',
     agentId               = sessionId,
     agentContext,
@@ -7705,6 +8086,22 @@ async function playwrightAgent(args) {
     _progressCallbackUrl,
     _stepIndex            = 0,
   } = args || {};
+
+  // ── Strip recovery-anchor preamble from goal ──────────────────────────────
+  // browser.agent.cjs:5418 prepends "IMPORTANT: You are working on <url>..." to the
+  // task. Without stripping it here, the LLM types the preamble into the first input
+  // field it finds (e.g. Spotify search bar). Extract the recovery URL for navigation
+  // fallback, then use only the clean task text as `goal` for the rest of the function.
+  let _recoveryUrl = null;
+  let goal = _rawGoal;
+  if (_rawGoal && typeof _rawGoal === 'string') {
+    const _preambleMatch = _rawGoal.match(/^IMPORTANT: You are working on (\S+?) \(browser session: .+?\)\..+?\n\nTask:\s*/is);
+    if (_preambleMatch) {
+      _recoveryUrl = _preambleMatch[1];
+      goal = _rawGoal.slice(_preambleMatch[0].length);
+      logger.info(`[playwright.agent] stripped recovery preamble from goal — recoveryUrl=${_recoveryUrl}, cleanGoal="${goal.slice(0, 80)}"`);
+    }
+  }
 
   const start = Date.now();
   const _deadline = start + overallTimeoutMs;
@@ -7739,20 +8136,34 @@ async function playwrightAgent(args) {
   // main.js route free-text answers through the _isAgentAskUser resume path
   // (re-running the SAME agent step with [Resume context: Q&A]) instead of
   // treating the answer as a brand-new task.
-  function _failureAskUser(reason) {
+  function _failureAskUser(reason, partialProgress = null) {
     const _jitNote = _jitResearchAttemptedFlag
       ? `\n\nI also tried looking up how to resolve this on ${hostname || 'this site'} via web research, but didn't find a specific fix.`
       : '';
+    // When partialProgress is available, the failure UI shows a partial-completion
+    // QuestionCard with "Try to finish" (plan extension), "Train me with a recipe",
+    // and a free-text "Other" option. When partialProgress is null (e.g. a login
+    // wall or early failure), fall back to the original options.
+    const _options = partialProgress
+      ? [
+          { label: 'Try to finish', value: 'try_to_finish', primary: true },
+          { label: 'Train me with a recipe', value: 'record_recipe' },
+        ]
+      : [
+          { label: 'Try again', value: 'try_again' },
+          { label: 'Correct and retry (tell me what was missed)', value: 'correct_and_retry' },
+          { label: 'Record recipe from beginning', value: 'record_recipe' },
+        ];
+    const _question = partialProgress
+      ? partialProgress.summary || `I partially completed this step but couldn't finish it.\n\nReason: ${reason}${_jitNote}`
+      : `I wasn't able to complete this step automatically.\n\nReason: ${reason}${_jitNote}\n\nWhat would you like to do? You can also type what went wrong and I'll retry with your correction.`;
     return {
       ok: false,
       askUser: true,
       trainingHandoff: true,
-      question: `I wasn't able to complete this step automatically.\n\nReason: ${reason}${_jitNote}\n\nWhat would you like to do? You can also type what went wrong and I'll retry with your correction.`,
-      options: [
-        { label: 'Try again', value: 'try_again' },
-        { label: 'Correct and retry (tell me what was missed)', value: 'correct_and_retry' },
-        { label: 'Record recipe from beginning', value: 'record_recipe' },
-      ],
+      question: _question,
+      options: _options,
+      partialProgress,
       goal,
       agentId,
       sessionId,
@@ -8189,6 +8600,8 @@ async function playwrightAgent(args) {
         logger.info(`[playwright.agent] Tier 1.5: no editable fields on page — skipping field map (read/extract task)`);
       } else if (_isGmailComposeUrl && !_gmailComposeDialogOpen) {
         logger.info(`[playwright.agent] Tier 1.5: Gmail compose dialog not open — skipping field map (falling through to Tier 2/3 for Compose click)`);
+      } else if (_isMultiStepGoal(goal)) {
+        logger.info(`[playwright.agent] Tier 1.5: multi-step goal detected (for-each loop) — skipping field map (falling through to Tier 2/3 for full LLM plan)`);
       } else {
         logger.info(`[playwright.agent] Tier 1.5: ${_isFormUrl ? 'form URL' : 'editable page'} detected (url=${url} actualUrl=${_actualUrl}) — trying deterministic field map`);
         const _tier15Result = await _deterministicSelectorPath(sessionId, _actualUrl || url, goal, hostname, timeoutMs, { hasEditableFields: _hasEditableFields, agentContext, appKnowledgeEntries });
@@ -8218,7 +8631,8 @@ async function playwrightAgent(args) {
       // to find the actual content to type. This is intentionally conservative: only
       // trigger for goals that look like "post: <text>", "ask <AI> about <text>", "search for <text>"
       const _goalLower = goal.toLowerCase();
-      const _isSimpleGoal = !/\bto\s+[\w.+-]+@|subject|recipient|cc|bcc|attach|file|upload\b/i.test(goal) &&
+      const _isSimpleGoal = !_isMultiStepGoal(goal) &&
+        !/\bto\s+[\w.+-]+@|subject|recipient|cc|bcc|attach|file|upload\b/i.test(goal) &&
         (/\b(post|share|update|tweet|send|write|say|ask|tell|search|query|look\s+up|find|message)\b/i.test(_goalLower));
 
       if (_isSimpleGoal) {
@@ -8459,7 +8873,8 @@ async function playwrightAgent(args) {
 
               // Now run the same type→submit→verify logic as the primary path
               const _goalLower = goal.toLowerCase();
-              const _isSimpleGoal = !/\bto\s+[\w.+-]+@|subject|recipient|cc|bcc|attach|file|upload\b/i.test(goal) &&
+              const _isSimpleGoal = !_isMultiStepGoal(goal) &&
+                !/\bto\s+[\w.+-]+@|subject|recipient|cc|bcc|attach|file|upload\b/i.test(goal) &&
                 (/\b(post|share|update|tweet|send|write|say|ask|tell|search|query|look\s+up|find|message)\b/i.test(_goalLower));
 
               if (_isSimpleGoal) {
@@ -9117,7 +9532,7 @@ async function playwrightAgent(args) {
     }
     logger.warn(`[playwright.agent] turn-loop failed: ${_turnLoopResult.error || 'unknown'} - surfacing ask_user`);
     _heartbeat.stop();
-    return { ..._failureAskUser(`Turn-loop failed: ${_turnLoopResult.error || 'could not complete task'}`), executionTime: Date.now() - start };
+    return { ..._failureAskUser(`Turn-loop failed: ${_turnLoopResult.error || 'could not complete task'}`, _turnLoopResult.partialProgress), executionTime: Date.now() - start };
   } catch (_turnLoopErr) {
     logger.warn(`[playwright.agent] turn-loop threw: ${_turnLoopErr.message} - surfacing ask_user`);
     _heartbeat.stop();
@@ -10357,7 +10772,7 @@ Output a JSON plan: { "plan": [ { "action": "type", "selector": "eXX", "text": "
         } catch (_turnLoopErr) {
           logger.warn(`[playwright.agent] turn-loop fallback threw: ${_turnLoopErr.message} — surfacing ask_user`);
         }
-        return { ..._failureAskUser(`Step ${stepIndex + 1} (${step.action}) failed: ${outcome.error}`), transcript };
+        return { ..._failureAskUser(`Step ${stepIndex + 1} (${step.action}) failed: ${outcome.error}`, _turnLoopResult?.partialProgress), transcript };
       }
 
       totalRepairs++;

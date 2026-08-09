@@ -234,6 +234,80 @@ it('handles __Host- prefixed token cookie', () => {
 });
 
 // ════════════════════════════════════════════════════════════════════════════
+section('HttpOnly bypass — non-generic cookie names (Issue 5 fix)');
+// ════════════════════════════════════════════════════════════════════════════
+
+it('detects Spotify sp_dc (HttpOnly, non-generic name)', () => {
+  const result = _classifyAuthCookies([
+    cookie('sp_dc', { domain: '.spotify.com', httpOnly: true }),
+  ], 'spotify.com');
+  assertAuthed(result, ['sp_dc'], 'sp_dc HttpOnly');
+});
+
+it('detects Spotify sp_key (HttpOnly, non-generic name)', () => {
+  const result = _classifyAuthCookies([
+    cookie('sp_key', { domain: '.spotify.com', httpOnly: true }),
+  ], 'spotify.com');
+  assertAuthed(result, ['sp_key'], 'sp_key HttpOnly');
+});
+
+it('does NOT count Spotify sp_t (non-HttpOnly, non-generic name)', () => {
+  // sp_t is a tracking/prefs cookie — not HttpOnly, name doesn't match any stem
+  const result = _classifyAuthCookies([
+    cookie('sp_t', { domain: '.spotify.com', httpOnly: false }),
+  ], 'spotify.com');
+  assertNotAuthed(result, 'sp_t should not count (non-HttpOnly, no stem match)');
+});
+
+it('Spotify logged-in mix: sp_dc + sp_t + _ga → authed (sp_dc only)', () => {
+  const result = _classifyAuthCookies([
+    cookie('sp_dc', { domain: '.spotify.com', httpOnly: true }),
+    cookie('sp_t', { domain: '.spotify.com', httpOnly: false }),
+    cookie('_ga', { domain: '.spotify.com', httpOnly: false }),
+  ], 'spotify.com');
+  assertAuthed(result, ['sp_dc'], 'Spotify logged-in mix');
+  assert(result.cookies.length === 1, `expected only sp_dc, got [${result.cookies.join(',')}]`);
+});
+
+it('Spotify logged-out: only sp_t + _ga → NOT authed', () => {
+  const result = _classifyAuthCookies([
+    cookie('sp_t', { domain: '.spotify.com', httpOnly: false }),
+    cookie('_ga', { domain: '.spotify.com', httpOnly: false }),
+  ], 'spotify.com');
+  assertNotAuthed(result, 'Spotify logged-out (no HttpOnly auth cookies)');
+});
+
+it('detects Slack d cookie (HttpOnly, single-letter name)', () => {
+  const result = _classifyAuthCookies([
+    cookie('d', { domain: '.slack.com', httpOnly: true }),
+  ], 'slack.com');
+  assertAuthed(result, ['d'], 'Slack d HttpOnly');
+});
+
+it('excludes load-balancer sticky cookies (SERVERID, route)', () => {
+  const result = _classifyAuthCookies([
+    cookie('SERVERID', { domain: '.slack.com', httpOnly: true }),
+    cookie('route', { domain: '.slack.com', httpOnly: true }),
+  ], 'slack.com');
+  assertNotAuthed(result, 'SERVERID/route should be excluded');
+});
+
+it('excludes GDPR/consent HttpOnly cookies', () => {
+  const result = _classifyAuthCookies([
+    cookie('gdpr_consent', { domain: '.slack.com', httpOnly: true }),
+    cookie('euconsent', { domain: '.slack.com', httpOnly: true }),
+  ], 'slack.com');
+  assertNotAuthed(result, 'gdpr/euconsent should be excluded even when HttpOnly');
+});
+
+it('excludes visitor/anon HttpOnly cookies', () => {
+  const result = _classifyAuthCookies([
+    cookie('visitor_id', { domain: '.slack.com', httpOnly: true }),
+  ], 'slack.com');
+  assertNotAuthed(result, 'visitor_id should be excluded even when HttpOnly');
+});
+
+// ════════════════════════════════════════════════════════════════════════════
 // Summary
 // ════════════════════════════════════════════════════════════════════════════
 console.log(`\n${'─'.repeat(72)}`);

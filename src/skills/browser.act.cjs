@@ -92,7 +92,7 @@ try {
 const _AUTH_COOKIE_NAME_RE = /(sid|sess|session|token|jwt|auth|login|user|acct|account|remember|passport|phpsessid|jsessionid|sails\.sid|koa:sess)/i;
 // Cookies that look auth-like but are NOT authentication (pre-auth / analytics /
 // prefs). Excluded even when their name matches an auth stem.
-const _AUTH_COOKIE_EXCLUDE_RE = /(csrf|xsrf|locale|lang|theme|mode|guest|anonymous|_ga|_gid|_gat|ab[_-]?test|opt[_-]?out|consent|cookie[_-]?consent|pref|currency|cart|wishlist|recently[_-]?viewed)/i;
+const _AUTH_COOKIE_EXCLUDE_RE = /(csrf|xsrf|locale|lang|theme|mode|guest|anonymous|_ga|_gid|_gat|ab[_-]?test|opt[_-]?out|consent|cookie[_-]?consent|pref|currency|cart|wishlist|recently[_-]?viewed|server|route|sticky|hsession|gdpr|ccpa|euconsent|visitor|anon|feature[_-]?flag)/i;
 // Strong session indicators — a cookie counts as an auth signal only if it is
 // non-empty AND (httpOnly === true OR its name matches this pattern).
 const _STRONG_SESSION_NAME_RE = /(sid|sess|session|token|jwt|auth)/i;
@@ -110,7 +110,6 @@ function _classifyAuthCookies(cookies, targetDomain) {
     const name = c.name;
     if (!c.value) continue;                       // empty value → not a live session
     if (_AUTH_COOKIE_EXCLUDE_RE.test(name)) continue;
-    if (!_AUTH_COOKIE_NAME_RE.test(name)) continue;
     // Domain filter: cookie domain '.slack.com' matches target 'slack.com' and
     // any subdomain; exact 'slack.com' also matches. Subdomain-only cookies
     // (e.g. domain='app.slack.com' when target='slack.com') are still relevant
@@ -121,12 +120,18 @@ function _classifyAuthCookies(cookies, targetDomain) {
       // auth flows that set the session cookie on the app subdomain).
       continue;
     }
-    // Require httpOnly OR a strong session-name pattern — defence against
-    // non-HttpOnly prefs cookies that happen to match a stem (e.g. "user_lang").
     const isHttpOnly = c.httpOnly === true;
     const isStrongName = _STRONG_SESSION_NAME_RE.test(name);
-    if (!isHttpOnly && !isStrongName) continue;
-    matched.push(name);
+    // HttpOnly cookies are universally server-set session/auth state — JS cannot
+    // read them, so analytics/tracking cookies are never HttpOnly. Trust HttpOnly
+    // as an auth signal regardless of name (e.g. Spotify's sp_dc, Slack's d).
+    // Non-HttpOnly cookies must match a strong session-name stem to avoid counting
+    // analytics/prefs cookies that happen to be on the target domain.
+    if (isHttpOnly) {
+      matched.push(name);
+    } else if (isStrongName && _AUTH_COOKIE_NAME_RE.test(name)) {
+      matched.push(name);
+    }
   }
   if (matched.length === 0) return { authed: false, cookies: [], reason: 'no-auth-cookies' };
   return { authed: true, cookies: matched, reason: `auth-cookies:${matched.join(',')}` };
