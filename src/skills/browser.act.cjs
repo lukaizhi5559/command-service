@@ -60,6 +60,112 @@ const { BASELINE_DOMAINS } = require('../utils/ad-block-updater.cjs');
 const { setupInterception, clearAdBlockSession } = require('../utils/ad-block-network.cjs');
 const engine = require('./browser-engine.cjs');
 
+// ── LiteParse CLI resolution (for clickByText coordinate fallback) ──
+const _LIT_CANDIDATES = [
+  '/opt/homebrew/bin/lit',
+  '/usr/local/bin/lit',
+  path.join(os.homedir(), '.npm-global', 'bin', 'lit'),
+  path.join(os.homedir(), '.nvm', 'versions', 'node', process.version, 'bin', 'lit'),
+];
+function _findLitCli() {
+  for (const c of _LIT_CANDIDATES) {
+    try { fs.accessSync(c, fs.constants.X_OK); return c; } catch (_) {}
+  }
+  try { exec('which lit', { timeout: 3000, stdio: 'pipe' }); return 'lit'; } catch (_) {}
+  return null;
+}
+let _LIT_BIN = _findLitCli();
+
+// LiteParser coordinate fallback for clickByText:
+// When DOM-based clickByText fails (shadow DOM, zero-size elements, etc.),
+// take a screenshot, run LiteParse to find text items with bounding boxes,
+// and click at the center coordinates. This is deterministic — LiteParse
+// sees what the user sees, bypassing all CSS/shadow DOM visibility issues.
+async function _clickByTextViaLiteParse(page, targetText, exact) {
+  if (!_LIT_BIN) {
+    // Try to find it again (may have been installed since module load)
+    _LIT_BIN = _findLitCli();
+    if (!_LIT_BIN) return { ok: false, error: 'LiteParse CLI not available' };
+  }
+  const _screenshotPath = path.join(os.tmpdir(), `clickbytext_${Date.now()}.png`);
+  try { await page.screenshot({ path: _screenshotPath, fullPage: false }); }
+  catch (e) { return { ok: false, error: `screenshot failed: ${e.message}` }; }
+
+  const _outputPath = path.join(os.tmpdir(), `litparse_${Date.now()}.json`);
+  return new Promise((resolve) => {
+    const lit = spawn(_LIT_BIN, ['parse', _screenshotPath, '--format', 'json', '-o', _outputPath], { timeout: 30000 });
+    let stderr = '';
+    lit.stderr.on('data', (d) => { stderr += d.toString(); });
+    lit.on('close', (code) => {
+      if (code !== 0) {
+        try { fs.unlinkSync(_screenshotPath); } catch (_) {}
+        resolve({ ok: false, error: `LiteParse exit ${code}: ${stderr.slice(0, 200)}` });
+        return;
+      }
+      try {
+        if (!fs.existsSync(_outputPath)) { resolve({ ok: false, error: 'LiteParse output not created' }); return; }
+        const output = JSON.parse(fs.readFileSync(_outputPath, 'utf8'));
+        const textItems = [];
+        const _rawItems = output.pages?.[0]?.textItems || output.texts || [];
+        for (const item of _rawItems) {
+          if (!item.text) continue;
+          if (item.x !== undefined && item.y !== undefined) {
+            textItems.push({ text: item.text, x: item.x || 0, y: item.y || 0, width: item.width || 0, height: item.height || 0 });
+          } else if (item.prov && item.prov[0] && item.prov[0].bbox) {
+            const b = item.prov[0].bbox;
+            textItems.push({ text: item.text, x: b.l, y: b.t, width: b.r - b.l, height: b.b - b.t });
+          }
+        }
+        // Get screenshot dimensions for scaling
+        let imgW = 1280, imgH = 800;
+        try {
+          const { PNG } = require('pngjs');
+          const png = PNG.sync.read(fs.readFileSync(_screenshotPath));
+          imgW = png.width; imgH = png.height;
+        } catch (_) {}
+        try { fs.unlinkSync(_screenshotPath); fs.unlinkSync(_outputPath); } catch (_) {}
+
+        // Find best match for target text
+        const lower = targetText.toLowerCase();
+        const matches = [];
+        for (const item of textItems) {
+          const it = (item.text || '').trim().toLowerCase();
+          if (!it) continue;
+          const isExact = it === lower;
+          const isSub = it.includes(lower) || lower.includes(it);
+          if (exact ? isExact : isSub) {
+            matches.push({ ...item, isExact, len: it.length });
+          }
+        }
+        if (matches.length === 0) { resolve({ ok: false, error: `LiteParse: no text match for "${targetText}"` }); return; }
+        // Sort: exact first, then shortest (buttons are short)
+        matches.sort((a, b) => {
+          if (a.isExact !== b.isExact) return b.isExact - a.isExact;
+          return a.len - b.len;
+        });
+        const best = matches[0];
+        // Scale from screenshot coords to viewport coords
+        const vpW = page.viewportSize()?.width || 1280;
+        const vpH = page.viewportSize()?.height || 800;
+        const scaleX = vpW / imgW;
+        const scaleY = vpH / imgH;
+        const clickX = Math.round((best.x + best.width / 2) * scaleX);
+        const clickY = Math.round((best.y + best.height / 2) * scaleY);
+        logger.info(`[browser.act] clickByText LiteParse fallback: clicking "${best.text}" at (${clickX}, ${clickY}) (scaled from ${best.x + best.width / 2},${best.y + best.height / 2} scaleX=${scaleX.toFixed(2)} scaleY=${scaleY.toFixed(2)})`);
+        page.mouse.click(clickX, clickY).then(() => {
+          resolve({ ok: true, clickedText: best.text, x: clickX, y: clickY, matchCount: matches.length });
+        }).catch((e) => {
+          resolve({ ok: false, error: `LiteParse click failed: ${e.message}` });
+        });
+      } catch (e) {
+        try { fs.unlinkSync(_screenshotPath); fs.unlinkSync(_outputPath); } catch (_) {}
+        resolve({ ok: false, error: `LiteParse parse error: ${e.message}` });
+      }
+    });
+    lit.on('error', () => resolve({ ok: false, error: 'LiteParse spawn failed' }));
+  });
+}
+
 // Build the ad-block script once at module load.
 // Use only BASELINE_DOMAINS (~30 top ad networks) — NOT the full 46K cached list.
 // The full list inflates the script to ~971KB which exceeds macOS ARG_MAX when
@@ -4210,6 +4316,11 @@ async function browserAct(args) {
       const exact = args.exact === true;
       const searchShadow = args.shadow !== false; // default: search shadow DOM (Spotify and other web components hide buttons in shadow roots)
       const scopeSelector = args.scope || null;
+      // menuScope: when an open menu is detected, scope candidates to that menu
+      // container. This prevents clickByText "Christian Music" from hitting a
+      // sidebar SPAN when the intended target is a menu item inside an open
+      // "Add to playlist" submenu. General — works for any open menu/dialog.
+      const menuScope = args.menuScope || null;
       if (!targetText) {
         return { ok: false, action, sessionId, error: 'clickByText: text is required', executionTime: Date.now() - start };
       }
@@ -4220,14 +4331,36 @@ async function browserAct(args) {
           { executionTime: Date.now() - start });
       }
       try {
-        const result = await _ePage.evaluate(({ text, tag, exact, shadow, scope }) => {
+        const result = await _ePage.evaluate(({ text, tag, exact, shadow, scope, menuScope }) => {
           const lower = text.toLowerCase();
           // Build candidate list: tag filter + visible elements
           const candidates = [];
           const baseSelector = tag ? tag.toLowerCase() : 'button, a, [role="button"], [role="link"], input[type="submit"], input[type="button"], div, span';
           const root = scope ? document.querySelector(scope) : document;
           if (!root) return { ok: false, error: `Scope element not found: ${scope}` };
-          const els = Array.from(root.querySelectorAll(baseSelector));
+          let els = Array.from(root.querySelectorAll(baseSelector));
+          // ── Menu scope filtering ──
+          // When menuScope is provided (an open menu was detected), restrict
+          // candidates to elements inside the menu container. This prevents
+          // clickByText from hitting sidebar/header elements when the intended
+          // target is a menu item. Only applies if the menu element exists and
+          // has visible children — otherwise fall through to normal behavior.
+          if (menuScope) {
+            const menuEl = document.querySelector(menuScope);
+            if (menuEl) {
+              const menuRect = menuEl.getBoundingClientRect();
+              const menuStyle = window.getComputedStyle(menuEl);
+              if (menuRect.width > 2 && menuRect.height > 2 && menuStyle.display !== 'none' && menuStyle.visibility !== 'hidden') {
+                // Filter candidates to those inside the menu
+                const menuEls = Array.from(menuEl.querySelectorAll(baseSelector));
+                // If the menu has matching candidates, use ONLY those
+                const _menuMatched = els.filter(el => menuEl.contains(el));
+                if (_menuMatched.length > 0) {
+                  els = _menuMatched;
+                }
+              }
+            }
+          }
           for (const el of els) {
             // Skip hidden / display:none
             const rect = el.getBoundingClientRect();
@@ -4256,10 +4389,33 @@ async function browserAct(args) {
             }
           }
           if (candidates.length === 0) return { ok: false, error: `No visible element with text "${text}"` };
-          // Sort: exact match first, then button/submit, then shortest length
+          // When many matches exist (>5), prefer elements inside a menu/dialog/
+          // listbox container or with role='menuitem'. This fixes the case where
+          // clickByText "Christian Music" matches 43 elements (sidebar, playlist
+          // header, etc.) but the intended target is a submenu item inside an
+          // "Add to playlist" menu that was just opened.
+          const _inMenuOrDialog = (el) => {
+            if (el.getAttribute('role') === 'menuitem' || el.getAttribute('role') === 'menuitemcheckbox' || el.getAttribute('role') === 'menuitemradio') return true;
+            let parent = el.parentElement;
+            for (let i = 0; i < 5 && parent; i++) {
+              const role = parent.getAttribute('role');
+              if (role === 'menu' || role === 'dialog' || role === 'listbox' || role === 'menu') return true;
+              parent = parent.parentElement;
+            }
+            return false;
+          };
+          const _manyMatches = candidates.length > 5;
+          // Sort: exact match first, then (if many matches) menu/dialog preference,
+          // then button/submit, then shortest length
           candidates.sort((a, b) => {
             if (a.isExact && !b.isExact) return -1;
             if (!a.isExact && b.isExact) return 1;
+            if (_manyMatches) {
+              const aInMenu = _inMenuOrDialog(a.el);
+              const bInMenu = _inMenuOrDialog(b.el);
+              if (aInMenu && !bInMenu) return -1;
+              if (!aInMenu && bInMenu) return 1;
+            }
             const aIsButton = a.el.tagName === 'BUTTON' || a.el.getAttribute('role') === 'button' || (a.el.tagName === 'INPUT' && (a.el.type === 'submit' || a.el.type === 'button'));
             const bIsButton = b.el.tagName === 'BUTTON' || b.el.getAttribute('role') === 'button' || (b.el.tagName === 'INPUT' && (b.el.type === 'submit' || b.el.type === 'button'));
             if (aIsButton && !bIsButton) return -1;
@@ -4270,9 +4426,24 @@ async function browserAct(args) {
           target.scrollIntoView({ block: 'center', behavior: 'instant' });
           target.click();
           return { ok: true, clickedText: candidates[0].text, tag: target.tagName, matchCount: candidates.length };
-        }, { text: targetText, tag: tagFilter, exact, shadow: searchShadow, scope: scopeSelector });
+        }, { text: targetText, tag: tagFilter, exact, shadow: searchShadow, scope: scopeSelector, menuScope });
         if (!result.ok) {
-          logger.warn(`[browser.act] clickByText "${targetText}" failed: ${result.error}`);
+          logger.warn(`[browser.act] clickByText "${targetText}" failed (DOM): ${result.error} — trying LiteParser coordinate fallback`);
+          // LiteParser fallback: screenshot → OCR text → click at coordinates
+          // This catches elements in shadow DOM, zero-size bounding boxes, etc.
+          const _litResult = await _clickByTextViaLiteParse(_ePage, targetText, exact);
+          if (_litResult.ok) {
+            logger.info(`[browser.act] clickByText "${targetText}" -> clicked via LiteParse at (${_litResult.x}, ${_litResult.y}) "${_litResult.clickedText}" (${_litResult.matchCount} matches)`);
+            return {
+              ok: true, action, sessionId,
+              result: `Clicked via LiteParse at (${_litResult.x}, ${_litResult.y}) "${_litResult.clickedText}"`,
+              clickedText: _litResult.clickedText,
+              matchCount: _litResult.matchCount,
+              clickedViaLiteParse: true,
+              executionTime: Date.now() - start,
+            };
+          }
+          logger.warn(`[browser.act] clickByText "${targetText}" LiteParse fallback also failed: ${_litResult.error}`);
           return { ok: false, action, sessionId, error: result.error, executionTime: Date.now() - start };
         }
         logger.info(`[browser.act] clickByText "${targetText}" -> clicked <${result.tag}> "${result.clickedText}" (${result.matchCount} matches)`);

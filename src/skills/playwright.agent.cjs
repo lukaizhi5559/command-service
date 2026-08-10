@@ -168,6 +168,140 @@ async function _fastSnapshot(sessionId, headed, timeoutMs = 15000) {
 }
 
 // ---------------------------------------------------------------------------
+// _detectOpenMenus — detect open menus/dialogs and capture their contents.
+// Uses standard ARIA roles (role='menu', role='dialog', role='listbox') plus
+// class-name heuristics (menu, dropdown, popover) for non-ARIA sites.
+// Returns an array of { selector, role, label, class, items: [{tag, text, role}] }
+// General — works for any website with menus/dialogs.
+// ---------------------------------------------------------------------------
+async function _detectOpenMenus(sessionId, headed, timeoutMs = 5000) {
+  try {
+    const _page = engine?.getPage?.(sessionId);
+    if (!_page) return [];
+    const _menus = await _page.evaluate(() => {
+      function isVisible(el) {
+        if (!el || !el.getBoundingClientRect) return false;
+        const r = el.getBoundingClientRect();
+        if (r.width < 2 || r.height < 2) return false;
+        const s = window.getComputedStyle(el);
+        if (s.display === 'none' || s.visibility === 'hidden') return false;
+        if (parseFloat(s.opacity) === 0) return false;
+        // Must be in viewport (at least partially)
+        if (r.bottom < 0 || r.top > window.innerHeight) return false;
+        if (r.right < 0 || r.left > window.innerWidth) return false;
+        // Must be interactive (not behind pointer-events: none)
+        if (s.pointerEvents === 'none') return false;
+        return true;
+      }
+      // Check if element is actually visible to the user (not just in DOM).
+      // Uses elementFromPoint to verify the element is on top at its center.
+      function isOnTop(el) {
+        const r = el.getBoundingClientRect();
+        const cx = r.left + r.width / 2;
+        const cy = r.top + r.height / 2;
+        if (cx < 0 || cy < 0 || cx > window.innerWidth || cy > window.innerHeight) return false;
+        const top = document.elementFromPoint(cx, cy);
+        if (!top) return false;
+        // The element itself or a descendant should be on top
+        return top === el || el.contains(top);
+      }
+      // Compliance / non-interactive dialog exclusion patterns.
+      // These are dialogs that exist in the DOM but are NOT interactive menus —
+      // they're cookie consent, language selectors, advertising opt-out, privacy
+      // notices, etc. They should never trigger the menu guard.
+      const _compliancePatterns = [
+        'cookie', 'consent', 'advertis', 'privacy', 'gdpr', 'language',
+        'location', 'region', 'country', 'opt-out', 'opt out', 'tailored',
+        'your privacy choices', 'do not sell', 'ccpa',
+      ];
+      function isComplianceDialog(el) {
+        const _label = (el.getAttribute('aria-label') || '').toLowerCase();
+        const _cls = (el.className || '').toLowerCase();
+        const _text = ((el.innerText || el.textContent || '').slice(0, 200) || '').toLowerCase();
+        for (const p of _compliancePatterns) {
+          if (_label.includes(p)) return true;
+          if (_cls.includes(p)) return true;
+          if (_text.includes(p) && _text.length < 300) return true;
+        }
+        return false;
+      }
+      const menus = [];
+      // Standard ARIA containers + class-name fallbacks for non-ARIA sites.
+      // NOTE: [role="dialog"] and [aria-modal="true"] are included but will be
+      // filtered by isComplianceDialog and the clickable-items requirement.
+      const _selector = '[role="menu"], [role="listbox"], [aria-modal="true"], ' +
+        '[class*="dropdown" i]:not([class*="menubar" i]), [class*="popover" i], ' +
+        '[class*="context-menu" i], [class*="popup" i]:not([class*="popup-" i])';
+      // Also include [role="dialog"] but only if it has clickable menu items
+      // (not just text content like cookie consent)
+      const _seen = new Set();
+      const _candidates = Array.from(document.querySelectorAll(_selector));
+      // Add role="dialog" separately for special handling
+      _candidates.push(...Array.from(document.querySelectorAll('[role="dialog"]')));
+      for (const c of _candidates) {
+        if (_seen.has(c)) continue;
+        _seen.add(c);
+        if (!isVisible(c)) continue;
+        // Skip compliance/cookie/privacy dialogs
+        if (isComplianceDialog(c)) continue;
+        // Capture ONLY actual clickable menu items — buttons, links, menuitem
+        // roles, options. NOT generic div/span (which match cookie consent text).
+        const _itemEls = Array.from(c.querySelectorAll(
+          'button, a, [role="menuitem"], [role="menuitemcheckbox"], [role="menuitemradio"], ' +
+          '[role="option"], [role="button"], input[type="submit"], input[type="button"]'
+        ));
+        const items = [];
+        for (const el of _itemEls) {
+          if (!isVisible(el)) continue;
+          const _t = (el.innerText || el.textContent || '').trim();
+          if (!_t || _t.length < 1) continue;
+          // Skip generic buttons with no text (icon-only)
+          if (_t.length > 60) continue;
+          // Skip duplicates
+          if (items.some(i => i.text === _t.slice(0, 60))) continue;
+          items.push({
+            tag: el.tagName,
+            text: _t.slice(0, 60),
+            role: el.getAttribute('role') || '',
+          });
+          if (items.length >= 20) break; // cap
+        }
+        // CRITICAL: Only treat as a menu if it has at least 2 clickable items.
+        // A dialog with 0-1 clickable items is likely a compliance popup or
+        // a text-only overlay, not an interactive menu. This prevents false
+        // positives from cookie consent / language selectors / advertising opt-out.
+        if (items.length < 2) continue;
+        // For [role="dialog"], require that it's actually on top (not a hidden
+        // background dialog). This catches Spotify's compliance dialogs that
+        // are in the DOM but not visually on top.
+        if (c.getAttribute('role') === 'dialog' && !isOnTop(c)) continue;
+        // Build a selector for this container
+        let _sel = '';
+        if (c.id) _sel = `#${c.id}`;
+        else if (c.getAttribute('role')) _sel = `[role="${c.getAttribute('role')}"]`;
+        else if (c.getAttribute('aria-label')) _sel = `[aria-label="${c.getAttribute('aria-label')}"]`;
+        else _sel = `[class*="${(c.className || '').split(' ')[0] || 'menu'}"]`;
+        menus.push({
+          selector: _sel,
+          role: c.getAttribute('role') || '',
+          label: c.getAttribute('aria-label') || '',
+          class: (c.className || '').slice(0, 80),
+          itemcount: items.length,
+          items: items.slice(0, 15),
+        });
+      }
+      // Sort: menus with more items first (likely the active menu)
+      menus.sort((a, b) => b.itemcount - a.itemcount);
+      return menus;
+    }).catch(() => []);
+    return _menus || [];
+  } catch (e) {
+    logger.debug(`[playwright.agent] _detectOpenMenus error (non-fatal): ${e.message}`);
+    return [];
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Hybrid scoped snapshot — DOM query confirms modal, then text filter on the
 // full-page ARIA snapshot (which HAS refs from buildRefTree) extracts only the
 // dialog section by tracking YAML indentation. Preserves refs (e24, e93) so
@@ -4781,7 +4915,9 @@ Rules:
 - Each sub-task should be independently verifiable
 - Order matters — earlier sub-tasks are prerequisites for later ones
 - CRITICAL: verification must check the FINAL page state after ALL sub-tasks are complete, NOT intermediate states. For "add X to Y" tasks, use "page text contains X" (the final destination page), NOT "search results show X" (intermediate). For "create playlist named Z", use "URL contains /playlist/ and page text contains Z".
-- For "add/search" sub-tasks, the verification should check that the ADDED ITEM appears on the DESTINATION page (e.g. playlist page text contains the artist name), not that search results are visible.`;
+- For "add/search" sub-tasks, the verification should check that the ADDED ITEM appears on the DESTINATION page (e.g. playlist page text contains the artist name), not that search results are visible.
+- ELEMENT DISAMBIGUATION: When a sub-task involves typing, searching, or clicking, and the page may have MULTIPLE similar elements (e.g. two search boxes, multiple "Add" buttons), include a distinguishing hint in the description. Specify the target element's placeholder text, aria-label, nearby heading, or section context. Example: "Search for 'Lecrae' in the playlist's 'Search for songs or episodes' input (under 'Let's find something for your playlist'), NOT the top global search bar". This helps the agent pick the right element when multiple candidates exist.
+- WORKFLOW SELECTION (general — applies to all sites): When a task involves interacting within a specific section/container of a page (e.g., a playlist, a project board, a document editor, a chat thread), prefer using that section's built-in inputs over global page-level inputs. The DOM signals will show inputs with \`context="..."\` attributes — choose the input whose context matches the section you're working in. Prefer the SIMPLEST workflow: if a section has its own search/add input, use it directly rather than navigating elsewhere and using a global search + multi-step menu navigation. Sub-task descriptions should reference the context attribute or nearby heading of the correct input (e.g., "use the input under the 'Let's find something for your playlist' heading") rather than naming a specific input by aria-label (which may be ambiguous).`;
 
   try {
     const _raw = await askWithMessages([
@@ -4966,19 +5102,93 @@ async function _structuralVerifySubTask(subTask, { page, pageUrl, pageText, tran
 
   // Determine if this is an "add" sub-task
   const _isAddTask = /\b(add|insert|include|put|append)\b/.test(_desc) || /\b(add|insert|include|put|append)\b/.test(_verification);
+  // Determine if this is a "create" sub-task (e.g. create playlist, create document,
+  // create project). These tasks produce a one-time creation action in the transcript
+  // (typing a name, clicking "Create") that persists even after the agent navigates
+  // away. Verifying by current page URL fails when the agent moves to another page,
+  // but the creation action in the transcript is durable evidence.
+  const _isCreateTask = /\b(create|make|new|rename)\b/.test(_desc) || /\b(create|make|new|rename)\b/.test(_verification);
+
+  // Generic UI labels that appear in sub-task descriptions as quoted terms but
+  // are just button labels — clicking them opens a menu/dialog and does NOT
+  // complete the action. Used by Gate 0 and Gate 1 to avoid false positives.
+  const _genericUiLabels = new Set([
+    'add to playlist', 'add to cart', 'add to favorites', 'add to list',
+    'save', 'cancel', 'done', 'close', 'ok', 'yes', 'no', 'submit', 'post',
+    'send', 'share', 'more options', 'options', 'menu', 'edit', 'delete',
+    'remove', 'create', 'new', 'add', 'select', 'choose', 'pick',
+  ]);
+
+  // ── Gate 0: Transcript history check for "create" tasks ──────────────
+  // For create tasks, check if a creation action was performed in the transcript
+  // (e.g. typing the entity name into a name/title field). This catches the case
+  // where the agent created the item successfully but then navigated away —
+  // the current page URL won't match, but the transcript has durable evidence.
+  if (_isCreateTask && Array.isArray(transcript) && transcript.length > 0) {
+    // Filter entity terms to exclude generic UI labels
+    const _contentTerms = _terms.filter(term => !_genericUiLabels.has(term));
+    const _searchTerms = _contentTerms.length > 0 ? _contentTerms : _terms;
+    for (const t of transcript) {
+      const _a = t.action || {};
+      const _o = t.outcome || {};
+      if (!_o.ok) continue;
+      // Look for type/fill/reactFill actions where the text matches an entity term
+      if (['type', 'fill', 'reactFill'].includes(_a.action) && _a.text) {
+        const _typedText = _a.text.toLowerCase();
+        if (_searchTerms.some(term => _typedText.includes(term))) {
+          logger.info(`[playwright.agent] structural verify sub-task #${subTask.id}: Gate 0 PASSED — create action found in transcript: ${_a.action}("${_a.text}")`);
+          return { verified: true, gate: 'history', reason: `create action found in transcript: typed "${_a.text}" matching entity` };
+        }
+      }
+      // Also look for clickByText actions that match create-like verbs + entity
+      if (_a.action === 'clickByText' && _a.text) {
+        const _clickText = _a.text.toLowerCase();
+        if (/\b(create|new|add|make)\b/.test(_clickText) && _searchTerms.some(term => _clickText.includes(term))) {
+          logger.info(`[playwright.agent] structural verify sub-task #${subTask.id}: Gate 0 PASSED — create click found in transcript: clickByText("${_a.text}")`);
+          return { verified: true, gate: 'history', reason: `create click found in transcript: clicked "${_a.text}"` };
+        }
+      }
+    }
+    logger.info(`[playwright.agent] structural verify sub-task #${subTask.id}: Gate 0 FAILED — no create action matching entity in transcript (${transcript.length} actions scanned)`);
+  }
 
   // ── Gate 1: Action transcript check ──────────────────────────────────
+  // Checks if the agent performed an "add" action matching the entity.
+  // IMPORTANT: Only check text/label/value for the add verb and entity match —
+  // NOT the selector. Selectors often contain placeholder text like "Add a name"
+  // which falsely matches the add verb, and entity names like "Christian" from
+  // the playlist name field match entities from the sub-task description, causing
+  // false positives (e.g. typing "Christian Music" in the playlist name field
+  // was counted as "adding Christian songs to the playlist").
+  // ALSO: exclude generic UI labels (e.g. "Add to playlist", "Save", "Submit")
+  // from entity matching — these are button labels that appear in sub-task
+  // descriptions as quoted terms, but clicking them just opens a menu/dialog
+  // and does NOT complete the add action.
   if (_isAddTask && Array.isArray(transcript) && transcript.length > 0) {
     for (const t of transcript) {
       const _a = t.action || {};
       const _o = t.outcome || {};
       if (!_o.ok) continue;
-      const _actionText = ((_a.text || '') + ' ' + (_a.selector || '') + ' ' + (_a.label || '') + ' ' + (_a.value || '')).toLowerCase();
-      const _hasAddVerb = /\b(add|add to|include|insert|append)\b/.test(_actionText);
-      const _matchesEntity = _terms.some(term => _actionText.includes(term));
-      if (_hasAddVerb && _matchesEntity) {
-        logger.info(`[playwright.agent] structural verify sub-task #${subTask.id}: Gate 1 PASSED — add action found in transcript: ${_a.action}(${_a.text || _a.selector || ''})`);
-        return { verified: true, gate: 'transcript', reason: `add action found in transcript matching entity: ${_terms.filter(t => _actionText.includes(t)).join(', ')}` };
+      // Build action text from text/label/value ONLY — exclude selector to avoid
+      // false positives from placeholder text in selectors (e.g. "Add a name").
+      const _actionContent = ((_a.text || '') + ' ' + (_a.label || '') + ' ' + (_a.value || '')).toLowerCase().trim();
+      // Skip generic UI label actions — clicking "Add to playlist" just opens a
+      // menu, it doesn't complete the add. The entity match must be on the
+      // actual content being added (artist name, song name), not the button label.
+      if (_genericUiLabels.has(_actionContent)) {
+        continue;
+      }
+      const _hasAddVerb = /\b(add|add to|include|insert|append)\b/.test(_actionContent);
+      // Filter entity terms to exclude generic UI labels — only match on real
+      // content entities (artist names, song names, etc.)
+      const _contentTerms = _terms.filter(term => !_genericUiLabels.has(term));
+      const _matchesEntity = _contentTerms.some(term => _actionContent.includes(term));
+      // Also check the action name itself for add-like verbs (clickByText "Add to playlist")
+      const _actionName = (_a.action || '').toLowerCase();
+      const _actionNameHasAdd = /add/.test(_actionName);
+      if ((_hasAddVerb || _actionNameHasAdd) && _matchesEntity) {
+        logger.info(`[playwright.agent] structural verify sub-task #${subTask.id}: Gate 1 PASSED — add action found in transcript: ${_a.action}(${_a.text || _a.label || _a.value || ''})`);
+        return { verified: true, gate: 'transcript', reason: `add action found in transcript matching entity: ${_contentTerms.filter(t => _actionContent.includes(t)).join(', ')}` };
       }
     }
     logger.info(`[playwright.agent] structural verify sub-task #${subTask.id}: Gate 1 FAILED — no add action matching entity in transcript (${transcript.length} actions scanned)`);
@@ -7448,7 +7658,7 @@ Generate 3-5 steps to complete this task FROM THE CURRENT PAGE STATE. The prior 
   }
 }
 
-async function _executeTurnLoopFallback({ goal, verificationGoal, sessionId, headed, timeoutMs, agentContext, transcript, deadline, start, extractedText, heartbeat, textAlreadyEntered, maxTurns = 8, hostname, _discoveryAlreadyAttempted = false, _preDecomposedSubTasks = null }) {
+async function _executeTurnLoopFallback({ goal, verificationGoal, sessionId, headed, timeoutMs, agentContext, transcript, deadline, start, extractedText, heartbeat, textAlreadyEntered, maxTurns = 8, hostname, _discoveryAlreadyAttempted = false, _preDecomposedSubTasks = null, _inheritedActionSignatureCounts = null, _inheritedJitDiscoveryFired = null }) {
   const MAX_TURNS = maxTurns;
   const _loopTranscript = [...transcript];
   let _lastActionSignature = null; // for duplicate detection
@@ -7468,10 +7678,24 @@ async function _executeTurnLoopFallback({ goal, verificationGoal, sessionId, hea
   // on apps with live regions (Google Docs' body text mutates constantly), so we
   // additionally bail when the SAME action signature repeats ≥3× without the goal
   // being met — this stops the 14×-identical-reactFill failure mode.
-  const _actionSignatureCounts = new Map();
+  const _actionSignatureCounts = _inheritedActionSignatureCounts ? new Map(_inheritedActionSignatureCounts) : new Map();
   const _NO_PROGRESS_THRESHOLD = 3;       // hint after this many identical unproductive attempts
   const _NO_PROGRESS_BAIL_THRESHOLD = 4;  // bail to ask_user after this many
   let _noProgressHintInjected = false;
+  // JIT sub-task discovery: when the agent gets stuck (3+ duplicate/blocked
+  // attempts on the same action), trigger _discoverTaskProcedure for the
+  // CURRENT sub-task only (not the whole goal). This is faster and more
+  // targeted than on-exhaust discovery. Tracks which sub-task IDs have
+  // already been discovered so we don't re-discover the same sub-task.
+  const _jitDiscoveryFiredForSubTask = _inheritedJitDiscoveryFired ? new Set(_inheritedJitDiscoveryFired) : new Set();
+  // URL-drift tracking: records the page URL when each sub-task STARTED being
+  // worked on. If the agent navigates away from that URL while the sub-task is
+  // still incomplete, a hint is injected telling the agent to navigate back.
+  // This is general — works for any site where a sub-task starts on one page
+  // and the agent drifts to another (e.g. searching on a global page instead
+  // of the section-specific page).
+  const _subTaskStartUrls = new Map(); // subTaskId → URL path when sub-task started
+  const _urlDriftFiredFor = new Set(); // subTaskIds where drift hint was already fired
   // ── LLM goal decomposition: break the goal into sub-tasks with semantic
   // verification criteria. This replaces the fragile regex-based phrase
   // extraction as the PRIMARY verification mechanism. Falls back to regex
@@ -7579,12 +7803,18 @@ ${_composeSel ? `- SUGGESTED COMPOSE SELECTOR: ${_composeSel}` : ''}`;
     // Dumps elements with state-like attributes (contenteditable, aria-expanded, aria-modal,
     // state classes, placeholder text, shadow DOM hosts). Each signal includes a CSS selector
     // the LLM can use directly in clickBySelector/reactFill.
+    // PRIORITIZED: text inputs (input/textarea/contenteditable/role=textbox|searchbox|combobox)
+    // are collected FIRST with parent context (nearest heading/aria-label/section), so the LLM
+    // can disambiguate when multiple similar inputs exist (e.g. Spotify's global search vs.
+    // playlist's "Search for songs or episodes"). Other signals fill the remaining slots.
     let _domSignals = '';
+    let _signals = [];  // declared outside try so search disambiguation can access it
     try {
       const _ePage = engine.getPage(sessionId);
       if (_ePage) {
-        const _signals = await _ePage.evaluate(() => {
-          const signals = [];
+        _signals = await _ePage.evaluate(() => {
+          const inputSignals = [];
+          const otherSignals = [];
           function makeSelector(el) {
             if (el.id) return `#${el.id}`;
             const parts = [el.tagName.toLowerCase()];
@@ -7596,31 +7826,95 @@ ${_composeSel ? `- SUGGESTED COMPOSE SELECTOR: ${_composeSel}` : ''}`;
             else if (el.getAttribute('data-testid')) parts.push(`[data-testid='${el.getAttribute('data-testid')}']`);
             return parts.join('');
           }
-          // 1. contenteditable (any value)
-          document.querySelectorAll('[contenteditable]').forEach(el => {
-            signals.push({ selector: makeSelector(el), tag: el.tagName, ce: el.getAttribute('contenteditable'), label: el.getAttribute('aria-label'), text: (el.innerText || '').slice(0, 50) });
+          function isVisible(el) {
+            if (!el || !el.getBoundingClientRect) return false;
+            const r = el.getBoundingClientRect();
+            if (r.width < 2 || r.height < 2) return false;
+            const s = window.getComputedStyle(el);
+            if (s.display === 'none' || s.visibility === 'hidden') return false;
+            if (parseFloat(s.opacity) === 0) return false;
+            return true;
+          }
+          // getParentContext: walk up to 4 parents to find a distinguishing label —
+          // nearest heading text, aria-label, data-testid, or section title.
+          // This lets the LLM tell apart inputs like "Search for songs or episodes"
+          // (context: "Let's find something for your playlist") from "What do you want
+          // to play?" (context: "Your Library").
+          function getParentContext(el) {
+            let parent = el.parentElement;
+            for (let i = 0; i < 4 && parent; i++) {
+              // Heading text (h1-h6)
+              const heading = parent.querySelector('h1, h2, h3, h4, h5, h6');
+              if (heading && (heading.innerText || '').trim()) {
+                return (heading.innerText || '').trim().slice(0, 60);
+              }
+              // aria-label on this parent
+              const al = parent.getAttribute('aria-label');
+              if (al) return al.slice(0, 60);
+              // data-testid as fallback
+              const dt = parent.getAttribute('data-testid');
+              if (dt) return dt.slice(0, 60);
+              parent = parent.parentElement;
+            }
+            return '';
+          }
+          const INPUT_SELECTOR = 'input, textarea, [contenteditable], [role="textbox"], [role="searchbox"], [role="combobox"]';
+          // 1. PRIORITIZED: All visible text inputs with parent context (no cap)
+          document.querySelectorAll(INPUT_SELECTOR).forEach(el => {
+            if (!isVisible(el)) return;
+            inputSignals.push({
+              selector: makeSelector(el),
+              tag: el.tagName,
+              ce: el.getAttribute('contenteditable') || '',
+              label: el.getAttribute('aria-label') || '',
+              placeholder: el.getAttribute('placeholder') || el.getAttribute('aria-placeholder') || '',
+              role: el.getAttribute('role') || '',
+              context: getParentContext(el),
+              text: (el.innerText || el.value || '').slice(0, 50),
+              isInput: true,
+            });
           });
-          // 2. aria-expanded/aria-haspopup/aria-modal
+          // 2. aria-expanded/aria-haspopup/aria-modal — capture text content too
           document.querySelectorAll('[aria-expanded], [aria-haspopup], [aria-modal]').forEach(el => {
-            signals.push({ selector: makeSelector(el), tag: el.tagName, expanded: el.getAttribute('aria-expanded'), modal: el.getAttribute('aria-modal'), label: el.getAttribute('aria-label') });
+            const _t = (el.innerText || el.textContent || '').trim();
+            otherSignals.push({ selector: makeSelector(el), tag: el.tagName, expanded: el.getAttribute('aria-expanded'), modal: el.getAttribute('aria-modal'), label: el.getAttribute('aria-label'), text: _t ? _t.slice(0, 80) : '' });
           });
-          // 3. State-like classes (compose/share/editor/modal)
+          // 3. State-like classes (compose/share/editor/modal) — capture text content
           document.querySelectorAll('[class*="modal" i], [class*="compose" i], [class*="share" i], [class*="editor" i]').forEach(el => {
             if (el.children.length < 10) {
-              signals.push({ selector: makeSelector(el), tag: el.tagName, class: (el.className || '').slice(0, 100), label: el.getAttribute('aria-label'), ce: el.getAttribute('contenteditable') });
+              const _t = (el.innerText || el.textContent || '').trim();
+              otherSignals.push({ selector: makeSelector(el), tag: el.tagName, class: (el.className || '').slice(0, 100), label: el.getAttribute('aria-label'), ce: el.getAttribute('contenteditable'), text: _t ? _t.slice(0, 80) : '' });
             }
           });
-          // 4. Elements with placeholder text (compose boxes often have these)
+          // 4. Elements with placeholder text (already captured in input pass if they're inputs;
+          //    this catches non-input elements with placeholders, e.g. div[role='combobox'])
           document.querySelectorAll('[placeholder], [aria-placeholder]').forEach(el => {
-            signals.push({ selector: makeSelector(el), tag: el.tagName, placeholder: el.getAttribute('placeholder') || el.getAttribute('aria-placeholder'), ce: el.getAttribute('contenteditable') });
+            if (el.matches(INPUT_SELECTOR)) return; // already in inputSignals
+            const _t = (el.innerText || el.textContent || '').trim();
+            otherSignals.push({ selector: makeSelector(el), tag: el.tagName, placeholder: el.getAttribute('placeholder') || el.getAttribute('aria-placeholder'), ce: el.getAttribute('contenteditable'), text: _t ? _t.slice(0, 80) : '' });
           });
-          // 5. Shadow DOM hosts
+          // 5. Menu items, buttons with role, and clickable elements with text —
+          //    CRITICAL: capture text content so the LLM can see what menu items say.
+          //    Without this, the LLM sees button[role='menuitem'] but doesn't know
+          //    if it says "Christian Music" or "Accept cookies".
+          document.querySelectorAll('[role="menuitem"], [role="menuitemcheckbox"], [role="menuitemradio"], [role="option"], [role="button"], button[type="submit"], button[type="button"]').forEach(el => {
+            if (!isVisible(el)) return;
+            const _t = (el.innerText || el.textContent || '').trim();
+            if (!_t) return; // skip elements with no text
+            // Skip if already captured (avoid duplicates)
+            const _sel = makeSelector(el);
+            if (otherSignals.some(s => s.selector === _sel && s.text === _t.slice(0, 80))) return;
+            otherSignals.push({ selector: _sel, tag: el.tagName, role: el.getAttribute('role') || '', label: el.getAttribute('aria-label') || '', text: _t.slice(0, 80), expanded: el.getAttribute('aria-expanded') || '' });
+          });
+          // 6. Shadow DOM hosts
           document.querySelectorAll('*').forEach(el => {
             if (el.shadowRoot) {
-              signals.push({ selector: makeSelector(el), tag: el.tagName, shadow: true, label: el.getAttribute('aria-label') });
+              otherSignals.push({ selector: makeSelector(el), tag: el.tagName, shadow: true, label: el.getAttribute('aria-label') });
             }
           });
-          return signals.slice(0, 25);
+          // Inputs first (all of them), then others up to 25 total
+          const others = otherSignals.slice(0, Math.max(0, 25 - inputSignals.length));
+          return [...inputSignals, ...others];
         }).catch(() => []);
         if (_signals.length > 0) {
           _domSignals = _signals.map(s => {
@@ -7629,13 +7923,97 @@ ${_composeSel ? `- SUGGESTED COMPOSE SELECTOR: ${_composeSel}` : ''}`;
             if (s.ce) parts.push(`contenteditable=${s.ce}`);
             if (s.label) parts.push(`label="${s.label}"`);
             if (s.placeholder) parts.push(`placeholder="${s.placeholder}"`);
+            if (s.role) parts.push(`role="${s.role}"`);
+            if (s.context) parts.push(`context="${s.context}"`);
             if (s.expanded) parts.push(`expanded=${s.expanded}`);
             if (s.modal) parts.push(`modal=${s.modal}`);
+            if (s.class) parts.push(`class="${s.class}"`);
             if (s.text) parts.push(`text="${s.text}"`);
             if (s.shadow) parts.push(`shadowDOM=true`);
             return '  ' + parts.join(' ');
           }).join('\n');
-          logger.info(`[playwright.agent] turn-loop: DOM signals dump (${_signals.length} signals):\n${_domSignals}`);
+          const _inputCount = _signals.filter(s => s.isInput).length;
+          logger.info(`[playwright.agent] turn-loop: DOM signals dump (${_signals.length} signals, ${_inputCount} inputs prioritized):\n${_domSignals}`);
+        }
+      }
+    } catch (_) {}
+
+    // ── Search input disambiguation hint ──
+    // When DOM signals show 2+ search inputs with different contexts, inject a
+    // hint so the LLM picks the right one. Without this, the LLM defaults to the
+    // most prominent search input (e.g. Spotify's top global search) even when
+    // a context-specific search input is the correct target (e.g. playlist's
+    // "Search for songs or episodes" under "Let's find something for your playlist").
+    let _searchDisambiguationHint = '';
+    try {
+      const _searchInputs = _signals.filter(s =>
+        s.isInput && (
+          (s.placeholder && /search|find|what do you want/i.test(s.placeholder)) ||
+          (s.label && /search|find|what do you want/i.test(s.label)) ||
+          (s.role === 'searchbox') || (s.role === 'combobox')
+        )
+      );
+      if (_searchInputs.length >= 2) {
+        const _lines = _searchInputs.map((s, i) => {
+          const _id = s.label ? `[aria-label='${s.label}']` : `[placeholder='${s.placeholder}']`;
+          const _ctx = s.context ? ` context="${s.context}"` : '';
+          return `  ${i + 1}. ${_id}${_ctx}`;
+        });
+        _searchDisambiguationHint = `\n⚠️ MULTIPLE SEARCH INPUTS DETECTED (${_searchInputs.length}):\n${_lines.join('\n')}\nChoose the input whose context matches the current sub-task. Prefer the input whose context relates to the section you're working in (e.g. a playlist, board, or document), NOT the global/top search bar.\n`;
+        logger.info(`[playwright.agent] turn-loop: search disambiguation hint injected (${_searchInputs.length} search inputs)`);
+      }
+    } catch (_) {}
+
+    // ── URL-drift detection hint ──
+    // General: if the current sub-task started on URL X and the agent is now on
+    // URL Y (different path), inject a hint to navigate back. This catches the
+    // case where the agent navigated away from the section it was working in
+    // (e.g. navigated to an artist page instead of staying on the playlist page).
+    let _urlDriftHint = '';
+    try {
+      if (_subTasks && _subTasks.length > 0) {
+        const _currentST = _subTasks.find(s => !s.completed);
+        if (_currentST) {
+          const _curUrlRes = await _engineEval(sessionId, 'window.location.href');
+          if (_curUrlRes?.ok) {
+            const _curUrl = String(_curUrlRes.result).trim().replace(/^"|"$/g, '');
+            const _curPath = (() => { try { return new URL(_curUrl).pathname; } catch (_) { return _curUrl; } })();
+            // Record the start URL for this sub-task if not already recorded
+            if (!_subTaskStartUrls.has(_currentST.id)) {
+              _subTaskStartUrls.set(_currentST.id, _curPath);
+            }
+            const _startPath = _subTaskStartUrls.get(_currentST.id);
+            // If the path changed (ignoring query params/hash), inject drift hint
+            // BUT only fire once per sub-task to avoid spamming the prompt every turn
+            if (_startPath && _curPath !== _startPath && !_urlDriftFiredFor.has(_currentST.id)) {
+              _urlDriftHint = `\n⚠️ URL DRIFT DETECTED: This sub-task started on path "${_startPath}" but you are now on path "${_curPath}". If this sub-task requires being on the original page, navigate back to it first (e.g., click the back button, or click the relevant item in the sidebar/navigation).\n`;
+              _urlDriftFiredFor.add(_currentST.id);
+              logger.info(`[playwright.agent] turn-loop: URL drift hint injected (sub-task #${_currentST.id}: "${_startPath}" → "${_curPath}") [once]`);
+            }
+          }
+        }
+      }
+    } catch (_) {}
+
+    // ── Open menu detection (general — uses ARIA roles + class heuristics) ──
+    // Detect open menus/dialogs and capture their contents. When a menu is open,
+    // the agent MUST complete or dismiss it before taking any other action.
+    // This prevents the agent from abandoning an open "Add to playlist" menu to
+    // search for the next artist. Works for any site with menus/dialogs.
+    let _openMenuHint = '';
+    let _activeMenuScope = null; // selector for the most prominent open menu
+    let _activeMenuItems = []; // text of items in the active menu
+    try {
+      const _openMenus = await _detectOpenMenus(sessionId, headed, 5000);
+      if (_openMenus.length > 0) {
+        // Pick the most prominent menu (most items, excluding cookie consent)
+        const _activeMenu = _openMenus[0];
+        _activeMenuScope = _activeMenu.selector;
+        _activeMenuItems = _activeMenu.items.map(i => i.text).filter(Boolean);
+        if (_activeMenuItems.length > 0) {
+          const _itemsList = _activeMenuItems.map(t => `    - "${t}"`).join('\n');
+          _openMenuHint = `\n⚠️ OPEN MENU DETECTED (${_activeMenu.role || 'menu'}${_activeMenu.label ? ', label="' + _activeMenu.label + '"' : ''}):\n${_itemsList}\nYou MUST complete or dismiss this menu before taking any other action. Do NOT search, navigate, or type into other fields while this menu is open.\nTo complete: clickByText one of the menu items listed above.\nTo dismiss: press Escape.\n`;
+          logger.info(`[playwright.agent] turn-loop: open menu hint injected (${_activeMenuItems.length} items, scope=${_activeMenuScope})`);
         }
       }
     } catch (_) {}
@@ -7678,7 +8056,12 @@ ${_composeSel ? `- SUGGESTED COMPOSE SELECTOR: ${_composeSel}` : ''}`;
     // If text was typed by Plan-Execute or a prior phase but verification failed
     // (e.g. "text still in compose — not sent"), detect it here so the turn-loop
     // doesn't re-type. DOM check is authoritative; OCR is fallback for canvas/shadow DOM.
-    if (!textAlreadyEntered && extractedText) {
+    // NOTE: Only run for compose/post/share tasks. For search/navigation tasks (e.g.
+    // "search for Lecrae"), extractedText is the last quoted string which may not
+    // match any compose field, causing false "field found but text does not match"
+    // logs every turn. Skip DOM verify entirely for non-compose tasks.
+    const _isComposeTask = /\bpost\b|\bshare\b|\btweet\b|\bcompose\b|\bwrite\b|\bmessage\b|\bsend\b|\bemail\b/i.test(goal);
+    if (!textAlreadyEntered && extractedText && _isComposeTask) {
       const _ePage = engine.getPage(sessionId);
       if (_ePage) {
         const _domCheck = await _domVerify(_ePage, extractedText).catch(() => null);
@@ -7726,12 +8109,17 @@ ${_composeSel ? `- SUGGESTED COMPOSE SELECTOR: ${_composeSel}` : ''}`;
       }
     }
 
-    // Build action history summary (last 5 actions)
+    // Build action history summary (last 5 actions) — enriched with
+    // selector/text/label details so the LLM has better context about what
+    // was actually done (e.g. "reactFill([role='textbox']) text='Lecrae' -> ok"
+    // instead of just "reactFill -> ok").
     const _recentActions = _loopTranscript.slice(-5).map((t, i) => {
       const a = t.action?.action || 'unknown';
       const ok = t.outcome?.ok ? 'ok' : 'FAIL';
       const err = t.outcome?.error ? ` (${t.outcome.error.slice(0, 60)})` : '';
-      return `${i + 1}. ${a} -> ${ok}${err}`;
+      const sel = t.action?.selector || t.action?.text || t.action?.label || t.action?.url || '';
+      const selStr = sel ? `(${String(sel).slice(0, 40)})` : '';
+      return `${i + 1}. ${a}${selStr ? ' ' + selStr : ''} -> ${ok}${err}`;
     }).join('\n');
 
     // ── Check if we're already on the target page ──
@@ -7825,7 +8213,7 @@ ${textAlreadyEntered ? '\n✅ TEXT ALREADY ENTERED via keyboard.type and verifie
 ${extractedText && !textAlreadyEntered ? `\n📝 TEXT TO TYPE (use this EXACT text in reactFill): "${extractedText}"\n` : ''}
 ${_probeInfo ? _probeInfo + '\n' : ''}
 ${_ocrText ? `\nOCR SCREEN CAPTURE (what's actually visible on screen — TRUST THIS over DOM snapshot. If OCR shows a compose modal with "Create a post" or "What do you want to talk about?", the modal IS open even if the DOM says otherwise. Type text into the compose box or click Post.):\n${_ocrText}\n` : ''}
-${_domSignals ? `\nDOM STATE SIGNALS (active UI elements + ready-made selectors — use these selectors in clickBySelector/reactFill):\n${_domSignals}\n` : ''}
+${_domSignals ? `\nDOM STATE SIGNALS (active UI elements + ready-made selectors — use these selectors in clickBySelector/reactFill):\n${_domSignals}\n` : ''}${_searchDisambiguationHint || ''}${_urlDriftHint || ''}${_openMenuHint || ''}
 ${_heartbeatHistory ? `\nPAGE STATE HISTORY (last ${Math.min(10, heartbeat.buffer.length)} heartbeat ticks, oldest first — use this to see what appeared/disappeared on the page):\n${_heartbeatHistory}\n` : ''}
 ${_selectorHints}
 VISIBLE PAGE TEXT (first 2000 chars):
@@ -8010,6 +8398,60 @@ Turn ${turn}/${MAX_TURNS}. What is your next action? (DO NOT snapshot - act dire
     // Extended to ALL action types, not just navigate/snapshot.
     // If the last action was identical (same action + selector + text + url)
     // and the page state hasn't changed, skip it and inject a hint.
+    // IMPORTANT: Blocked duplicates count toward the no-progress bail threshold
+    // (_NO_PROGRESS_BAIL_THRESHOLD) so the agent doesn't loop 15× on the same
+    // blocked action. Without this, the duplicate detector short-circuits the
+    // bail mechanism — the action signature counter at line ~8160 only runs
+    // after successful execution, so blocked actions never increment it.
+    // After counting, check the threshold: at 3, trigger JIT sub-task
+    // discovery + inject hint; at 4, bail to ask_user.
+    const _countBlockedDuplicate = (act) => {
+      const _sig = `${act.action}|${act.selector || ''}|${act.text || ''}|${act.url || ''}`;
+      const _count = (_actionSignatureCounts.get(_sig) || 0) + 1;
+      _actionSignatureCounts.set(_sig, _count);
+      return _count;
+    };
+    // Check blocked-duplicate threshold and take action (hint or bail).
+    // Returns true if the loop should bail (caller should return).
+    const _checkBlockedDuplicateThreshold = async (act, blockedCount) => {
+      if (blockedCount >= _NO_PROGRESS_BAIL_THRESHOLD) {
+        logger.warn(`[playwright.agent] turn-loop: no-progress bail — blocked action "${act.action}" (${act.selector || act.text || act.url || ''}) repeated ${blockedCount}× — surfacing ask_user`);
+        return true; // signal bail
+      }
+      if (blockedCount >= _NO_PROGRESS_THRESHOLD && !_noProgressHintInjected) {
+        _noProgressHintInjected = true;
+        _lastActionSignature = `no_progress:${act.action}`;
+        logger.warn(`[playwright.agent] turn-loop: no-progress hint — blocked action "${act.action}" repeated ${blockedCount}× — injecting hint`);
+
+        // JIT sub-task discovery for the current sub-task
+        if (hostname && _discoverTaskProcedure && _subTasks && _subTasks.length > 0) {
+          const _currentST = _subTasks.find(s => !s.completed);
+          if (_currentST && !_jitDiscoveryFiredForSubTask.has(_currentST.id)) {
+            _jitDiscoveryFiredForSubTask.add(_currentST.id);
+            logger.info(`[playwright.agent] turn-loop: JIT sub-task discovery (blocked) — searching for procedure for sub-task #${_currentST.id}: "${_currentST.description.slice(0, 80)}"`);
+            const _jitDiscovery = await _discoverTaskProcedure({
+              hostname,
+              goal: _currentST.description,
+              transcript: _loopTranscript,
+              sessionId,
+              headed,
+            }).catch((e) => { logger.warn(`[playwright.agent] turn-loop: JIT sub-task discovery error (non-fatal): ${e.message}`); return null; });
+            if (_jitDiscovery?.discovered && _jitDiscovery.procedure) {
+              logger.info(`[playwright.agent] turn-loop: JIT sub-task discovery found procedure (sources: ${_jitDiscovery.sourceUrls?.length || 0}, fromCache: ${!!_jitDiscovery.fromCache}) — injecting as hint`);
+              _loopTranscript.push({
+                action: { jit_subtask_discovery: _jitDiscovery.procedure },
+                outcome: { ok: true, hint: `Discovered procedure for sub-task #${_currentST.id}: ${_jitDiscovery.procedure.slice(0, 200)}` },
+              });
+              const _procSummary = _jitDiscovery.procedure.slice(0, 300);
+              _lastActionSignature = `jit_fix:Sub-task procedure discovered — follow these steps:\n${_procSummary}\nKey UI elements: ${(_jitDiscovery.keyUiElements || []).join(', ') || 'n/a'}`;
+            } else {
+              logger.info(`[playwright.agent] turn-loop: JIT sub-task discovery found no procedure for sub-task #${_currentST.id}`);
+            }
+          }
+        }
+      }
+      return false; // don't bail
+    };
     if (_loopTranscript.length > 0) {
       const _last = _loopTranscript[_loopTranscript.length - 1];
       const _lastSig = JSON.stringify({ a: _last.action?.action, s: _last.action?.selector, t: _last.action?.text, u: _last.action?.url });
@@ -8019,12 +8461,20 @@ Turn ${turn}/${MAX_TURNS}. What is your next action? (DO NOT snapshot - act dire
         // For navigate: skip if same URL
         if (_action.action === 'navigate' && _last.action?.url === _action.url) {
           logger.warn(`[playwright.agent] turn-loop: skipping duplicate navigate to ${_action.url} — already done`);
+          const _bc = _countBlockedDuplicate(_action);
+          if (await _checkBlockedDuplicateThreshold(_action, _bc)) {
+            return { ok: false, goal, sessionId, turns: _loopTranscript.length, done: false, result: `Turn-loop stalled: blocked navigate to "${_action.url}" repeated ${_bc}×.`, transcript: _loopTranscript, error: 'turn_loop_no_progress', routingDecision: 'turn_loop_fallback', executionTime: Date.now() - start };
+          }
           _loopTranscript.push({ action: _action, outcome: { ok: false, error: 'skipped duplicate navigate' } });
           continue;
         }
         // For snapshot: skip if last was also snapshot
         if (_action.action === 'snapshot') {
           logger.warn(`[playwright.agent] turn-loop: skipping duplicate snapshot`);
+          const _bc = _countBlockedDuplicate(_action);
+          if (await _checkBlockedDuplicateThreshold(_action, _bc)) {
+            return { ok: false, goal, sessionId, turns: _loopTranscript.length, done: false, result: `Turn-loop stalled: blocked snapshot repeated ${_bc}×.`, transcript: _loopTranscript, error: 'turn_loop_no_progress', routingDecision: 'turn_loop_fallback', executionTime: Date.now() - start };
+          }
           _loopTranscript.push({ action: _action, outcome: { ok: false, error: 'skipped duplicate snapshot' } });
           continue;
         }
@@ -8039,6 +8489,10 @@ Turn ${turn}/${MAX_TURNS}. What is your next action? (DO NOT snapshot - act dire
         } catch (_) {}
         if (_lastStateHash && _currentStateHash && _lastStateHash === _currentStateHash) {
           logger.warn(`[playwright.agent] turn-loop: skipping duplicate ${_action.action} (identical action + unchanged page state) — inject hint to try different approach`);
+          const _bc = _countBlockedDuplicate(_action);
+          if (await _checkBlockedDuplicateThreshold(_action, _bc)) {
+            return { ok: false, goal, sessionId, turns: _loopTranscript.length, done: false, result: `Turn-loop stalled: action "${_action.action}" (${_action.selector || _action.text || _action.url || ''}) blocked ${_bc}× with unchanged page state.`, transcript: _loopTranscript, error: 'turn_loop_no_progress', routingDecision: 'turn_loop_fallback', executionTime: Date.now() - start };
+          }
           _loopTranscript.push({ action: _action, outcome: { ok: false, error: 'skipped duplicate — page state unchanged, try a different approach or return done' } });
           // Inject hint into next turn by modifying the goal temporarily
           _lastActionSignature = 'duplicate_noop';
@@ -8060,6 +8514,10 @@ Turn ${turn}/${MAX_TURNS}. What is your next action? (DO NOT snapshot - act dire
       );
       if (_lastTypeFill) {
         logger.warn(`[playwright.agent] turn-loop: skipping duplicate ${_action.action} (same text "${(_action.text || '').slice(0, 40)}..." already typed via ${_lastTypeFill.action?.selector || 'n/a'}) — inject hint`);
+        const _bc = _countBlockedDuplicate(_action);
+        if (await _checkBlockedDuplicateThreshold(_action, _bc)) {
+          return { ok: false, goal, sessionId, turns: _loopTranscript.length, done: false, result: `Turn-loop stalled: action "${_action.action}" (text="${_action.text || ''}") blocked ${_bc}× — same text already typed via different selector.`, transcript: _loopTranscript, error: 'turn_loop_no_progress', routingDecision: 'turn_loop_fallback', executionTime: Date.now() - start };
+        }
         _loopTranscript.push({ action: _action, outcome: { ok: false, error: 'skipped duplicate type/fill — same text already entered via different selector' } });
         _lastActionSignature = 'duplicate_noop';
         continue;
@@ -8067,9 +8525,21 @@ Turn ${turn}/${MAX_TURNS}. What is your next action? (DO NOT snapshot - act dire
     }
 
     // ── Execute the action ──
+    // If the action is clickByText and an open menu was detected, inject menuScope
+    // so clickByText scopes candidates to the open menu container. This prevents
+    // clicking sidebar/header elements when the intended target is a menu item.
+    // NOTE: The menu guard was removed — it caused false positives on form dialogs
+    // (e.g., Spotify's "Edit details" dialog with name/description inputs was
+    // detected as a menu, blocking reactFill/fill). The open-menu hint in the
+    // prompt + menuScope injection are sufficient to guide the agent.
     let _outcome;
     try {
-      _outcome = await browserAct({ ..._action, sessionId, headed, timeoutMs });
+      const _execAction = { ..._action, sessionId, headed, timeoutMs };
+      if (_action.action === 'clickByText' && _activeMenuScope && !_action.scope && !_action.menuScope) {
+        _execAction.menuScope = _activeMenuScope;
+        logger.info(`[playwright.agent] turn-loop: injecting menuScope="${_activeMenuScope}" into clickByText("${_action.text}")`);
+      }
+      _outcome = await browserAct(_execAction);
     } catch (_execErr) {
       _outcome = { ok: false, error: _execErr.message };
     }
@@ -8155,6 +8625,37 @@ Turn ${turn}/${MAX_TURNS}. What is your next action? (DO NOT snapshot - act dire
             // Inject the JIT fix as a stronger hint — overrides the generic no_progress hint
             _lastActionSignature = `jit_fix:${_jitFix.action}`;
             logger.info(`[playwright.agent] turn-loop: JIT research found fix — injecting as hint: ${_jitFix.action}`);
+          }
+        }
+
+        // ── JIT sub-task discovery: search for a how-to procedure for the
+        // CURRENT sub-task only (not the whole goal). More targeted than
+        // on-exhaust discovery, fires at 3 stuck attempts instead of 15
+        // exhausted turns. Only fires once per sub-task ID.
+        if (hostname && _discoverTaskProcedure && _subTasks && _subTasks.length > 0) {
+          const _currentST = _subTasks.find(s => !s.completed);
+          if (_currentST && !_jitDiscoveryFiredForSubTask.has(_currentST.id)) {
+            _jitDiscoveryFiredForSubTask.add(_currentST.id);
+            logger.info(`[playwright.agent] turn-loop: JIT sub-task discovery — searching for procedure for sub-task #${_currentST.id}: "${_currentST.description.slice(0, 80)}"`);
+            const _jitDiscovery = await _discoverTaskProcedure({
+              hostname,
+              goal: _currentST.description,
+              transcript: _loopTranscript,
+              sessionId,
+              headed,
+            }).catch((e) => { logger.warn(`[playwright.agent] turn-loop: JIT sub-task discovery error (non-fatal): ${e.message}`); return null; });
+            if (_jitDiscovery?.discovered && _jitDiscovery.procedure) {
+              logger.info(`[playwright.agent] turn-loop: JIT sub-task discovery found procedure (sources: ${_jitDiscovery.sourceUrls?.length || 0}, fromCache: ${!!_jitDiscovery.fromCache}) — injecting as hint`);
+              _loopTranscript.push({
+                action: { jit_subtask_discovery: _jitDiscovery.procedure },
+                outcome: { ok: true, hint: `Discovered procedure for sub-task #${_currentST.id}: ${_jitDiscovery.procedure.slice(0, 200)}` },
+              });
+              // Inject as a strong hint — overrides the generic no_progress / hidden_element hint
+              const _procSummary = _jitDiscovery.procedure.slice(0, 300);
+              _lastActionSignature = `jit_fix:Sub-task procedure discovered — follow these steps:\n${_procSummary}\nKey UI elements: ${(_jitDiscovery.keyUiElements || []).join(', ') || 'n/a'}`;
+            } else {
+              logger.info(`[playwright.agent] turn-loop: JIT sub-task discovery found no procedure for sub-task #${_currentST.id}`);
+            }
           }
         }
       }
@@ -8431,9 +8932,16 @@ Turn ${turn}/${MAX_TURNS}. What is your next action? (DO NOT snapshot - act dire
   // articles about the overall goal, crawl top results, LLM-extract a step-by-step
   // procedure, and re-enter the turn-loop with that procedure injected as context.
   // Only fires once (prevented by _discoveryAttempted) — never recurses.
-  if (!_discoveryAttempted && hostname && _discoverTaskProcedure) {
+  // SKIP if JIT sub-task discovery already fired for ALL incomplete sub-tasks
+  // (those procedures were already injected as hints — a full re-entry with the
+  // whole-goal procedure would be redundant). Still fires if JIT didn't fire for
+  // any sub-task, or if there are incomplete sub-tasks JIT didn't cover.
+  const _incompleteSubTaskIds = _subTasks ? _subTasks.filter(s => !s.completed).map(s => s.id) : [];
+  const _allIncompleteAlreadyDiscovered = _incompleteSubTaskIds.length > 0 &&
+    _incompleteSubTaskIds.every(id => _jitDiscoveryFiredForSubTask.has(id));
+  if (!_discoveryAttempted && hostname && _discoverTaskProcedure && !_allIncompleteAlreadyDiscovered) {
     _discoveryAttempted = true;
-    logger.info(`[playwright.agent] turn-loop: exhausted — triggering task-procedure discovery for ${hostname}`);
+    logger.info(`[playwright.agent] turn-loop: exhausted — triggering task-procedure discovery for ${hostname}${_jitDiscoveryFiredForSubTask.size > 0 ? ` (JIT already fired for ${_jitDiscoveryFiredForSubTask.size} sub-task(s), but not all incomplete ones)` : ''}`);
     const _discovery = await _discoverTaskProcedure({
       hostname, goal, transcript: _loopTranscript, sessionId, headed,
     }).catch((e) => { logger.warn(`[playwright.agent] turn-loop: discovery error (non-fatal): ${e.message}`); return null; });
@@ -8451,8 +8959,13 @@ Turn ${turn}/${MAX_TURNS}. What is your next action? (DO NOT snapshot - act dire
         extractedText, heartbeat, textAlreadyEntered,
         maxTurns, hostname,
         _discoveryAlreadyAttempted: true,
-        // NOTE: no _preDecomposedSubTasks — the goal now has a [DISCOVERED PROCEDURE] block
-        // which _decomposeGoalIntoSubTasks will skip (it checks for [DISCOVERED PROCEDURE)
+        // Pass sub-tasks with completion status so JIT discovery and structural
+        // verification continue to work in the re-entered turn-loop. Without this,
+        // the re-entered loop has no sub-task structure and can't detect stuck
+        // sub-tasks or verify completion.
+        _preDecomposedSubTasks: _subTasks,
+        _inheritedActionSignatureCounts: _actionSignatureCounts,
+        _inheritedJitDiscoveryFired: _jitDiscoveryFiredForSubTask,
       }).catch((e) => { logger.warn(`[playwright.agent] turn-loop: discovery retry error (non-fatal): ${e.message}`); return null; });
 
       if (_retryResult?.ok) {

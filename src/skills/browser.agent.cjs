@@ -5495,6 +5495,26 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
   // Step 2: delegate to playwright.agent or agentbrowser.agent with the authenticated session
   logger.info(`[browser.agent] run: auth ok — delegating to ${_agentSkill} for "${task}"`);
 
+  // ── Dynamic turn budget ──────────────────────────────────────────────────────
+  // Calculate maxTurns based on task complexity instead of a hardcoded 15.
+  // Formula: base 8 + (sub-task indicators × 6) + (quoted search terms × 4), capped at 40.
+  // Sub-task indicators: "then", "next", "finally", numbered steps, semicolons in instructions.
+  // Quoted terms: each quoted string is a search/entry action needing ~4 turns.
+  function _calcMaxTurns(taskText) {
+    const _base = 8;
+    // Count sub-task indicators (transition words + semicolons + numbered steps)
+    const _transitionWords = (taskText.match(/\bthen\b|\bnext\b|\bfinally\b|\bafter\b/gi) || []).length;
+    const _semicolons = (taskText.match(/;/g) || []).length;
+    const _numberedSteps = (taskText.match(/\b\d+\.\s/g) || []).length;
+    const _subTaskIndicators = Math.max(_transitionWords, _semicolons, _numberedSteps);
+    // Count quoted search terms (each needs ~4 turns: type, enter, click result, interact)
+    const _quotedTerms = (taskText.match(/["'][^"']{2,80}["']/g) || []).length;
+    const _turns = Math.min(_base + (_subTaskIndicators * 6) + (_quotedTerms * 4), 40);
+    logger.info(`[browser.agent] dynamic turn budget: base=${_base} subTasks=${_subTaskIndicators} quotedTerms=${_quotedTerms} → maxTurns=${_turns}`);
+    return _turns;
+  }
+  const _dynamicMaxTurns = _calcMaxTurns(task);
+
   // ── preTaskGoal injection + startUrl recovery anchor ────────────────────────
   // Some services (e.g. googleaimode) require a UI interaction BEFORE the main task.
   // All services get a recovery anchor so playwright.agent knows where to return if
@@ -6550,7 +6570,7 @@ When extracting page content with run-code, prioritize these selectors over gene
         chromeProfile: _usePersistentProfile ? AGENT_BROWSER_PROFILE
         : (!_effectiveAutoConnect && _useAutoConnect ? 'Default' : undefined),
         headed: _usePersistentProfile ? true : undefined,
-        maxTurns: 15,
+        maxTurns: _dynamicMaxTurns,
         timeoutMs: 30000,
         overallTimeoutMs: 120000,
         recipeWasUsed: _recipeExecutedOk,
@@ -6773,7 +6793,7 @@ When extracting page content with run-code, prioritize these selectors over gene
               chromeProfile: _usePersistentProfile ? AGENT_BROWSER_PROFILE
                 : (!_effectiveAutoConnect && _useAutoConnect ? 'Default' : undefined),
               headed: _usePersistentProfile ? true : undefined,
-              maxTurns: 15,
+              maxTurns: _dynamicMaxTurns,
               timeoutMs: 30000,
               overallTimeoutMs: 120000,
               authConfirmedAt: Date.now(),
