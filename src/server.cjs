@@ -59,6 +59,7 @@ const skillScheduler = require('./skill-helpers/skill-scheduler.cjs');
 const { startIdleWatcher, stopIdleWatcher, startScanScheduler, runMaintenanceScan, cancelMaintenanceScan, getScanStatus } = require('./skills/explore.agent.cjs');
 const { systemIntrospect } = require('./skills/system.introspect.cjs');
 const toolDiscoverAgent = require('./skills/tool.discover.agent.cjs');
+const providerDiscoveryAgent = require('./skills/provider.discovery.agent.cjs');
 
 class CommandServiceMCPServer {
   constructor() {
@@ -162,6 +163,9 @@ class CommandServiceMCPServer {
 
       case 'tool.discover':
         return await this._skillToolDiscover(args);
+
+      case 'provider.discovery':
+        return await this._skillProviderDiscovery(args);
 
       default:
         return {
@@ -271,6 +275,10 @@ class CommandServiceMCPServer {
     return await toolDiscoverAgent(args);
   }
 
+  async _skillProviderDiscovery(args) {
+    return await providerDiscoveryAgent(args);
+  }
+
   async _skillAppAgent(args, opts = {}) {
     const { action, ...rest } = args || {};
     // Long-running monitor actions honor an AbortSignal so the server-side loop
@@ -350,7 +358,7 @@ class CommandServiceMCPServer {
       success: true,
       service: this.serviceName,
       status: 'healthy',
-      skills: ['shell.run', 'browser.act', 'web.crawl', 'image.analyze', 'fs.read', 'file.watch', 'file.bridge', 'screen.capture', 'external.skill', 'cli.agent', 'browser.agent', 'playwright.agent', 'creator.agent', 'reviewer.agent', 'skillCreator.skill', 'project.builder', 'project.launcher', 'project.editor', 'project.stopper', 'app.agent', 'system.introspect']
+      skills: ['shell.run', 'browser.act', 'web.crawl', 'image.analyze', 'fs.read', 'file.watch', 'file.bridge', 'screen.capture', 'external.skill', 'cli.agent', 'browser.agent', 'playwright.agent', 'creator.agent', 'reviewer.agent', 'skillCreator.skill', 'project.builder', 'project.launcher', 'project.editor', 'project.stopper', 'app.agent', 'system.introspect', 'provider.discovery']
     };
   }
 
@@ -481,7 +489,7 @@ class CommandServiceMCPServer {
         res.end(JSON.stringify({
           status: 'healthy',
           service: this.serviceName,
-          skills: ['shell.run', 'browser.act', 'web.crawl', 'image.analyze', 'fs.read', 'file.watch', 'file.bridge', 'screen.capture', 'external.skill', 'cli.agent', 'browser.agent', 'playwright.agent', 'creator.agent', 'reviewer.agent', 'skillCreator.skill', 'project.builder', 'project.launcher', 'project.editor', 'project.stopper', 'app.agent', 'system.introspect']
+          skills: ['shell.run', 'browser.act', 'web.crawl', 'image.analyze', 'fs.read', 'file.watch', 'file.bridge', 'screen.capture', 'external.skill', 'cli.agent', 'browser.agent', 'playwright.agent', 'creator.agent', 'reviewer.agent', 'skillCreator.skill', 'project.builder', 'project.launcher', 'project.editor', 'project.stopper', 'app.agent', 'system.introspect', 'provider.discovery']
         }));
         return;
       }

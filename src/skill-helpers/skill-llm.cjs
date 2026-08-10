@@ -2,7 +2,7 @@
  * skill-llm.cjs — LLM access for command-service skills
  *
  * Connects to ws://localhost:4000/ws/stream using the same protocol as
- * VSCodeLLMBackend in the stategraph. Any skill in command-service can:
+ * ThinkDropLLMBackend in the stategraph. Any skill in command-service can:
  *
  *   const { ask } = require('../skill-llm.cjs');
  *   const answer = await ask('Pick the best element: ...');
@@ -89,7 +89,7 @@ async function askWithMessages(messages, opts = {}) {
     throw new Error('[skill-llm] Circuit breaker open - service temporarily unavailable');
   }
 
-  const MAX_RETRIES = 3;
+  const MAX_RETRIES = 1;
   const RETRY_BASE_MS = 600;
   let lastErr;
   let errorType = 'unknown';
@@ -170,11 +170,11 @@ async function _askWithMessagesOnce(messages, opts = {}) {
     type: 'llm_request',
     payload: {
       prompt: promptText,
-      provider: 'openai',
+      provider: 'auto',
       options: {
         temperature: opts.temperature ?? 0.2,
         stream: true,
-        taskType: opts.taskType || 'ask',
+        taskType: opts.taskType || 'skill_step',
         ...(opts.maxTokens != null ? { max_tokens: opts.maxTokens } : {}),
       },
       context: {

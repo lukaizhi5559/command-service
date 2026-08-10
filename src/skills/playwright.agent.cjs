@@ -7860,8 +7860,10 @@ ${_composeSel ? `- SUGGESTED COMPOSE SELECTOR: ${_composeSel}` : ''}`;
           }
           const INPUT_SELECTOR = 'input, textarea, [contenteditable], [role="textbox"], [role="searchbox"], [role="combobox"]';
           // 1. PRIORITIZED: All visible text inputs with parent context (no cap)
+          //    Capture y-coordinate for positional search disambiguation.
           document.querySelectorAll(INPUT_SELECTOR).forEach(el => {
             if (!isVisible(el)) return;
+            const _rect = el.getBoundingClientRect();
             inputSignals.push({
               selector: makeSelector(el),
               tag: el.tagName,
@@ -7871,6 +7873,7 @@ ${_composeSel ? `- SUGGESTED COMPOSE SELECTOR: ${_composeSel}` : ''}`;
               role: el.getAttribute('role') || '',
               context: getParentContext(el),
               text: (el.innerText || el.value || '').slice(0, 50),
+              y: Math.round(_rect.y),
               isInput: true,
             });
           });
@@ -7925,6 +7928,7 @@ ${_composeSel ? `- SUGGESTED COMPOSE SELECTOR: ${_composeSel}` : ''}`;
             if (s.placeholder) parts.push(`placeholder="${s.placeholder}"`);
             if (s.role) parts.push(`role="${s.role}"`);
             if (s.context) parts.push(`context="${s.context}"`);
+            if (s.y !== undefined) parts.push(`y=${s.y}`);
             if (s.expanded) parts.push(`expanded=${s.expanded}`);
             if (s.modal) parts.push(`modal=${s.modal}`);
             if (s.class) parts.push(`class="${s.class}"`);
@@ -7939,11 +7943,13 @@ ${_composeSel ? `- SUGGESTED COMPOSE SELECTOR: ${_composeSel}` : ''}`;
     } catch (_) {}
 
     // ── Search input disambiguation hint ──
-    // When DOM signals show 2+ search inputs with different contexts, inject a
-    // hint so the LLM picks the right one. Without this, the LLM defaults to the
-    // most prominent search input (e.g. Spotify's top global search) even when
-    // a context-specific search input is the correct target (e.g. playlist's
-    // "Search for songs or episodes" under "Let's find something for your playlist").
+    // When DOM signals show 2+ search inputs, inject a hint so the LLM picks the
+    // right one. Uses positional heuristic: the topmost search input (lowest y) is
+    // typically the global search — mark it as [AVOID for context-specific tasks].
+    // Don't mark any as PREFERRED — there may be sidebar/footer searches that are
+    // also not relevant. Let the LLM pick among the non-topmost ones using context.
+    // Also add URL-first guidance: for global searches, navigate to the URL directly
+    // instead of typing in the top search field.
     let _searchDisambiguationHint = '';
     try {
       const _searchInputs = _signals.filter(s =>
@@ -7954,13 +7960,17 @@ ${_composeSel ? `- SUGGESTED COMPOSE SELECTOR: ${_composeSel}` : ''}`;
         )
       );
       if (_searchInputs.length >= 2) {
-        const _lines = _searchInputs.map((s, i) => {
+        // Sort by y ascending (topmost first)
+        const _sorted = [..._searchInputs].sort((a, b) => (a.y ?? 0) - (b.y ?? 0));
+        const _topY = _sorted[0].y;
+        const _lines = _sorted.map((s, i) => {
           const _id = s.label ? `[aria-label='${s.label}']` : `[placeholder='${s.placeholder}']`;
           const _ctx = s.context ? ` context="${s.context}"` : '';
-          return `  ${i + 1}. ${_id}${_ctx}`;
+          const _avoid = (i === 0) ? ` [AVOID for context-specific tasks — likely global search]` : '';
+          return `  ${i + 1}. ${_id} (y=${s.y ?? '?'})${_ctx}${_avoid}`;
         });
-        _searchDisambiguationHint = `\n⚠️ MULTIPLE SEARCH INPUTS DETECTED (${_searchInputs.length}):\n${_lines.join('\n')}\nChoose the input whose context matches the current sub-task. Prefer the input whose context relates to the section you're working in (e.g. a playlist, board, or document), NOT the global/top search bar.\n`;
-        logger.info(`[playwright.agent] turn-loop: search disambiguation hint injected (${_searchInputs.length} search inputs)`);
+        _searchDisambiguationHint = `\n⚠️ MULTIPLE SEARCH INPUTS DETECTED (${_searchInputs.length}):\n${_lines.join('\n')}\nFor context-specific tasks, AVOID the topmost search input (lowest y). Pick the input whose context matches the section you're working in.\nFor global searches, prefer URL navigation instead of typing in the top search field (e.g., https://[site]/search/{query} or https://[site]/search?q={query}).\n`;
+        logger.info(`[playwright.agent] turn-loop: search disambiguation hint injected (${_searchInputs.length} search inputs, topmost y=${_topY} marked AVOID)`);
       }
     } catch (_) {}
 
@@ -8609,7 +8619,9 @@ Turn ${turn}/${MAX_TURNS}. What is your next action? (DO NOT snapshot - act dire
         // Just-in-time app-knowledge research: the agent is stuck — search for
         // how to resolve this specific issue. If a fix is found, inject it as
         // an additional hint for the next turn.
-        if (hostname && _justInTimeResearch) {
+        // SKIP for UI click actions (clickByText, click, clickBySelector) — web research
+        // won't help with UI element visibility issues, and wastes ~10s per crawl.
+        if (hostname && _justInTimeResearch && !/clickByText|clickBySelector|^click$/.test(_action.action)) {
           const _jitFix = await _justInTimeResearch({
             hostname,
             field: _action.selector || _action.action || 'goal',
@@ -8675,7 +8687,9 @@ Turn ${turn}/${MAX_TURNS}. What is your next action? (DO NOT snapshot - act dire
 
         // Just-in-time app-knowledge research: the element is hidden — search for
         // how to reveal/locate it. Detect element type from the action and selector.
-        if (hostname && _justInTimeResearch && !_noProgressHintInjected) {
+        // SKIP for clickByText/clickBySelector — web research won't help with UI
+        // element visibility issues, and wastes ~10s per crawl.
+        if (hostname && _justInTimeResearch && !_noProgressHintInjected && !/clickByText|clickBySelector/.test(_action.action)) {
           const _sel = _action.selector || '';
           const _elementType = (() => {
             if (/select|dropdown|combobox|listbox/i.test(_sel)) return 'dropdown';

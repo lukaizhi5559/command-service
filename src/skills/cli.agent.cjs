@@ -2562,8 +2562,8 @@ async function callLLM(systemPrompt, userQuery, { temperature = 0.2, maxTokens =
         type: 'llm_request',
         payload: {
           prompt: userQuery,
-          provider: 'openai',
-          options: { temperature, stream: true, taskType: 'ask' },
+          provider: 'auto',
+          options: { temperature, stream: true, taskType: 'skill_step' },
           context: { systemInstructions: systemPrompt, recentContext: [], sessionFacts: [], memories: [] },
         },
         timestamp: Date.now(),

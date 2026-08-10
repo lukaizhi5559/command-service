@@ -137,7 +137,7 @@ async function callLLM(systemPrompt, userPrompt, timeoutMs) {
     const timer = setTimeout(() => { ws.close(); reject(new Error('LLM timeout')); }, timeoutMs);
     ws.on('open', () => ws.send(JSON.stringify({
       id: 'sc_' + Date.now(), type: 'llm_request',
-      payload: { prompt: userPrompt, provider: 'openai', options: { temperature: 0.2, stream: true, taskType: 'ask' },
+      payload: { prompt: userPrompt, provider: 'auto', options: { temperature: 0.2, stream: true, taskType: 'skill_step' },
         context: { systemInstructions: systemPrompt, recentContext: [], sessionFacts: [], memories: [] } },
       timestamp: Date.now(), metadata: { source: 'skill_creator' },
     })));
