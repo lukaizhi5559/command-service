@@ -1107,6 +1107,32 @@ async function recordDeepLinkCache(serviceKey, url, keywords, intent) {
   }
 }
 
+/**
+ * Remove a single URL from the keyword-indexed deep-link cache for a service.
+ * Called when the browser agent detects a 404 / verify-gate failure on a URL
+ * that came from the keyword cache, so the next run falls back to the start
+ * URL or re-discovers a working deep-link instead of re-using the broken one.
+ *
+ * @param {string} serviceKey - normalised service key (e.g. "spotify")
+ * @param {string} url        - the cached URL that led to a broken/404 page
+ * @returns {Promise<boolean>} true if a route was removed, false otherwise
+ */
+async function deleteDeepLinkCache(serviceKey, url) {
+  if (!skillDb || !serviceKey || !url) return false;
+  try {
+    const entry = await skillDb.get(DEEPLINK_NS, serviceKey);
+    if (!entry || !Array.isArray(entry.routes) || entry.routes.length === 0) return false;
+    const _before = entry.routes.length;
+    entry.routes = entry.routes.filter(r => r.url !== url);
+    if (entry.routes.length === _before) return false; // nothing matched
+    logger.info(`[destination-resolver] Deep-link cache invalidated: ${serviceKey} → ${url} (verify-gate/404 failure)`);
+    return await _persistDeepLinkCache(serviceKey, entry);
+  } catch (err) {
+    logger.warn(`[destination-resolver] deleteDeepLinkCache error: ${err.message}`);
+    return false;
+  }
+}
+
 // ── Search URL pattern cache ─────────────────────────────────────────────────
 // Separate from the keyword-indexed deep-link cache. This caches the *search URL
 // pattern* per service (e.g., "https://example.com/search?q={query}"), keyed by
@@ -1186,6 +1212,7 @@ module.exports = {
   getTaskKeywords,
   getCachedDeepLink,
   recordDeepLinkCache,
+  deleteDeepLinkCache,
   getSearchUrlPattern,
   recordSearchUrlPattern,
   INTENTS,

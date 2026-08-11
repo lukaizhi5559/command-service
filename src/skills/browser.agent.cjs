@@ -257,7 +257,7 @@ function getContentExtractionConfig(hostname) {
 
 const { userAgent } = require('./user.agent.cjs');
 
-const { resolveDestination, recordCorrection, classifyTaskIntent, classifyUrlType, getLearnedCorrection, deleteLearnedCorrection, suggestTaskUrl, getTaskKeywords, getCachedDeepLink, recordDeepLinkCache, getSearchUrlPattern, recordSearchUrlPattern, INTENTS, SERVICE_CHAT_URLS, isAuthFlowUrl } = require('../skill-helpers/destination-resolver.cjs');
+const { resolveDestination, recordCorrection, classifyTaskIntent, classifyUrlType, getLearnedCorrection, deleteLearnedCorrection, suggestTaskUrl, getTaskKeywords, getCachedDeepLink, recordDeepLinkCache, deleteDeepLinkCache, getSearchUrlPattern, recordSearchUrlPattern, INTENTS, SERVICE_CHAT_URLS, isAuthFlowUrl } = require('../skill-helpers/destination-resolver.cjs');
 const { killExistingChromeForProfile, clearProfileLock, findCli, shortSessionId, _sniffAuthCookies, engine: browserEngine } = require('./browser.act.cjs');
 const { loadAppKnowledge, saveAppKnowledge, loadAndFormat, isCacheStale, recordVerification } = require('./lib/appKnowledge.cjs');
 
@@ -6580,6 +6580,27 @@ When extracting page content with run-code, prioritize these selectors over gene
     }, 300000));
 
     let agentResultText = String(agentResult?.result ?? agentResult?.stdout ?? '');
+
+    // ── Deep-link cache invalidation on verify-gate / 404 failure ───────────────
+    // If the run failed because the page was broken (about:blank, empty after
+    // recovery, or a 404 "page not found") AND the navigation URL came from the
+    // keyword deep-link cache, remove that cached entry so the next run falls
+    // back to the start URL or re-discovers a working deep-link. This is generic
+    // for ALL browser agents — not just Spotify — so any stale cached URL that
+    // leads to a broken page gets purged automatically.
+    if (agentResult?.ok === false && _deepLinkSource === 'keyword-cache' && startUrl && _svcKey) {
+      const _errText = String(agentResult?.error || '');
+      const _resultText = agentResultText || '';
+      const _verifyGateFailed = /verify gate|about:blank|page is about:blank|empty after recovery/i.test(_errText)
+        || /404|page not found/i.test(_errText)
+        || /404|page not found/i.test(_resultText);
+      if (_verifyGateFailed) {
+        logger.info(`[browser.agent] deep-link: invalidating cached URL ${startUrl} for ${agentId} after verify-gate/404 failure (source=${_deepLinkSource})`);
+        deleteDeepLinkCache(_svcKey, startUrl).catch(_e => {
+          logger.warn(`[browser.agent] deep-link: cache invalidation failed for ${_svcKey} → ${startUrl}: ${_e.message}`);
+        });
+      }
+    }
 
     // ── Bubble up askUser from playwright.agent ────────────────────────────────
     // If playwright.agent surfaced an ask_user (goal not achieved after recipe
