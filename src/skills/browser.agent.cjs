@@ -6572,12 +6572,12 @@ When extracting page content with run-code, prioritize these selectors over gene
         headed: _usePersistentProfile ? true : undefined,
         maxTurns: _dynamicMaxTurns,
         timeoutMs: 30000,
-        overallTimeoutMs: Math.max(120000, _dynamicMaxTurns * 5000),
+        overallTimeoutMs: Math.max(180000, _dynamicMaxTurns * 10000),
         recipeWasUsed: _recipeExecutedOk,
         authConfirmedAt: (_getCachedAuthCheck(agentId)?.ts ?? null),
         _progressCallbackUrl,
         _stepIndex,
-    }, 300000));
+    }, 600000));
 
     let agentResultText = String(agentResult?.result ?? agentResult?.stdout ?? '');
 
@@ -6816,12 +6816,12 @@ When extracting page content with run-code, prioritize these selectors over gene
               headed: _usePersistentProfile ? true : undefined,
               maxTurns: _dynamicMaxTurns,
               timeoutMs: 30000,
-              overallTimeoutMs: Math.max(120000, _dynamicMaxTurns * 5000),
+              overallTimeoutMs: Math.max(180000, _dynamicMaxTurns * 10000),
               authConfirmedAt: Date.now(),
               _progressCallbackUrl,
               _stepIndex,
               _loginWallRetried: true,  // prevent recursive retry
-            }, 300000));
+            }, 600000));
             return {
               ok: _retryResult?.ok ?? false,
               agentId,
