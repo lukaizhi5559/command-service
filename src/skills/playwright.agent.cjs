@@ -302,7 +302,501 @@ async function _detectOpenMenus(sessionId, headed, timeoutMs = 5000) {
 }
 
 // ---------------------------------------------------------------------------
-// Hybrid scoped snapshot — DOM query confirms modal, then text filter on the
+// _captureState — capture the current page state for the state-diff loop.
+//   captureMode='full'  → DOM snapshot + LiteParser OCR + URL + openMenus + modalCount
+//                         (used at sub-task boundaries: start + end)
+//   captureMode='cheap' → DOM hash + page text + URL + modalCount
+//                         (used between actions to detect no-ops — no LiteParser)
+// Returns { url, domHash, pageText, ocrText?, openMenus?, modalCount, timestamp }
+// ---------------------------------------------------------------------------
+async function _captureState(sessionId, headed, captureMode = 'cheap') {
+  const _ts = Date.now();
+  let _url = '';
+  let _domHash = '';
+  let _pageText = '';
+  let _ocrText = '';
+  let _openMenus = [];
+  let _modalCount = 0;
+
+  try {
+    const _page = engine?.getPage?.(sessionId);
+    if (!_page) return { url: '', domHash: '', pageText: '', modalCount: 0, timestamp: _ts, ok: false };
+
+    // URL
+    try { _url = _page.url(); } catch (_) {}
+
+    // Page text (always capture — cheap)
+    try {
+      _pageText = await _page.evaluate(() => (document.body?.innerText || '').slice(0, 3000)).catch(() => '');
+    } catch (_) {}
+
+    // DOM hash: hash of interactive elements' signatures (tag + role + text + rect)
+    // This is cheaper than a full ARIA snapshot and stable across non-meaningful changes
+    try {
+      _domHash = await _page.evaluate(() => {
+        const els = document.querySelectorAll('button, a, [role="button"], [role="link"], input, [contenteditable], [role="dialog"], [aria-modal="true"], [role="menu"], [role="listbox"]');
+        const sigs = [];
+        for (const el of els) {
+          const r = el.getBoundingClientRect();
+          if (r.width === 0 && r.height === 0) continue;
+          const s = window.getComputedStyle(el);
+          if (s.display === 'none' || s.visibility === 'hidden') continue;
+          const t = (el.innerText || el.textContent || el.value || el.getAttribute('aria-label') || '').trim().slice(0, 40);
+          sigs.push(`${el.tagName}|${el.getAttribute('role') || ''}|${t}|${Math.round(r.x)},${Math.round(r.y)},${Math.round(r.width)},${Math.round(r.height)}`);
+        }
+        // Simple hash: join + length-based hash (fast, no crypto needed)
+        const joined = sigs.join('§');
+        let h = 0;
+        for (let i = 0; i < joined.length; i++) {
+          h = ((h << 5) - h + joined.charCodeAt(i)) | 0;
+        }
+        return `${h}_${sigs.length}`;
+      }).catch(() => '');
+    } catch (_) {}
+
+    // Modal count (always capture — cheap)
+    try {
+      _modalCount = await _page.evaluate(() => {
+        let count = 0;
+        for (const m of document.querySelectorAll('[role="dialog"], [aria-modal="true"]')) {
+          const r = m.getBoundingClientRect();
+          if (r.width > 2 && r.height > 2) {
+            const s = window.getComputedStyle(m);
+            if (s.display !== 'none' && s.visibility !== 'hidden' && parseFloat(s.opacity) > 0) count++;
+          }
+        }
+        return count;
+      }).catch(() => 0);
+    } catch (_) {}
+
+    // Full capture: LiteParser OCR + openMenus
+    if (captureMode === 'full') {
+      try {
+        const _cap = await _ocrCaptureViaPage(_page);
+        if (_cap.ok) _ocrText = (_cap.text || '').slice(0, 2000);
+      } catch (_) {}
+      try {
+        _openMenus = await _detectOpenMenus(sessionId, headed, 5000);
+      } catch (_) {}
+    }
+  } catch (e) {
+    logger.debug(`[playwright.agent] _captureState error (non-fatal): ${e.message}`);
+  }
+
+  return { url: _url, domHash: _domHash, pageText: _pageText, ocrText: _ocrText, openMenus: _openMenus, modalCount: _modalCount, timestamp: _ts, ok: true };
+}
+
+// ---------------------------------------------------------------------------
+// _diffStates — compare two captured states to detect if the page changed.
+// Returns { changed: bool, changes: string[] }
+// Used between actions in the state-diff loop to detect no-ops.
+// ---------------------------------------------------------------------------
+function _diffStates(before, after) {
+  if (!before || !after) return { changed: true, changes: ['state-unavailable'] };
+  const changes = [];
+
+  // DOM hash changed → structural change
+  if (before.domHash && after.domHash && before.domHash !== after.domHash) {
+    changes.push('dom-changed');
+  }
+
+  // URL changed → navigation
+  if (before.url && after.url && before.url !== after.url) {
+    changes.push(`url-changed: ${before.url.slice(0, 60)} → ${after.url.slice(0, 60)}`);
+  }
+
+  // Modal count changed → dialog opened/closed
+  if (before.modalCount !== after.modalCount) {
+    changes.push(`modal-count-changed: ${before.modalCount} → ${after.modalCount}`);
+  }
+
+  // Page text changed (compare first 500 chars for cheap diff)
+  const _beforeText = (before.pageText || '').slice(0, 500);
+  const _afterText = (after.pageText || '').slice(0, 500);
+  if (_beforeText !== _afterText) {
+    changes.push('page-text-changed');
+  }
+
+  return { changed: changes.length > 0, changes };
+}
+
+// ---------------------------------------------------------------------------
+// Fuzzy text matching helpers — handle OCR misreads (e.g. "Save" → "sve")
+// ---------------------------------------------------------------------------
+
+// Levenshtein distance between two short strings (button labels are ≤ 30 chars)
+function _levenshtein(a, b) {
+  const m = a.length, n = b.length;
+  if (m === 0) return n;
+  if (n === 0) return m;
+  const dp = Array(n + 1).fill(0).map((_, i) => i);
+  for (let i = 1; i <= m; i++) {
+    let prev = dp[0]; dp[0] = i;
+    for (let j = 1; j <= n; j++) {
+      const tmp = dp[j];
+      dp[j] = Math.min(dp[j] + 1, dp[j - 1] + 1, prev + (a[i - 1] === b[j - 1] ? 0 : 1));
+      prev = tmp;
+    }
+  }
+  return dp[n];
+}
+
+// Fuzzy match: exact → substring (with length-ratio guard) → Levenshtein (for short strings only)
+// Guards against the bug where a 1-char candidate ("a") substring-matches a
+// multi-char target ("search") via t.includes(c). Both strings must be ≥ 3 chars
+// for fuzzy matching, and substring matches require the shorter string to be at
+// least 60% of the longer string's length.
+function _fuzzyMatchText(target, candidate, maxDistance = 2) {
+  const t = (target || '').toLowerCase().trim();
+  const c = (candidate || '').toLowerCase().trim();
+  if (!t || !c) return { match: false, exact: false, distance: -1 };
+  if (t === c) return { match: true, exact: true, distance: 0 };
+  // Substring match — but only when the strings are close in length (≥ 60% ratio).
+  // This prevents "a" matching "search" via t.includes("a").
+  const _shorter = Math.min(t.length, c.length);
+  const _longer = Math.max(t.length, c.length);
+  if (_shorter >= 3 && _shorter / _longer >= 0.6) {
+    if (c.includes(t) || t.includes(c)) {
+      // Add a small length-difference penalty so closer-length matches win ties.
+      const _lenPenalty = Math.round((_longer - _shorter) / 3);
+      return { match: true, exact: false, distance: _lenPenalty };
+    }
+  }
+  // Only fuzzy-match short strings (buttons/labels are ≤ 30 chars), and require
+  // both strings to be ≥ 3 chars so 1-2 char fragments never fuzzy-match.
+  if (t.length >= 3 && t.length <= 30 && c.length >= 3 && c.length <= 30) {
+    const d = _levenshtein(t, c);
+    if (d <= maxDistance) return { match: true, exact: false, distance: d };
+  }
+  return { match: false, exact: false, distance: -1 };
+}
+
+// Diff OCR text items before vs after an action
+function _diffOcrText(beforeItems, afterItems) {
+  const _beforeSet = new Set((beforeItems || []).map(i => (i.text || '').toLowerCase().trim()));
+  const _afterSet = new Set((afterItems || []).map(i => (i.text || '').toLowerCase().trim()));
+  const _added = (afterItems || []).filter(i => !_beforeSet.has((i.text || '').toLowerCase().trim()));
+  const _removed = (beforeItems || []).filter(i => !_afterSet.has((i.text || '').toLowerCase().trim()));
+  return {
+    changed: _added.length > 0 || _removed.length > 0,
+    added: _added.map(i => i.text),
+    removed: _removed.map(i => i.text),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// _filterOcrForPrompt — filter + classify + structure OCR text items so the
+// LLM receives a clean, organized view of what's visible on screen instead of
+// a raw dump of 100+ noisy fragments (1-char items, cookie consent text, etc.).
+//
+// Steps:
+//   1. Drop noise: <2 char text, very low confidence, pure punctuation
+//   2. Drop items inside cookie/consent/language/advertising dialogs
+//   3. Classify each item as button / input / heading / link / text based on
+//      dimensions and text characteristics
+//   4. Sort: interactive elements (button, input, link) first, then headings,
+//      then plain text — so the LLM sees actionable items at the top
+//   5. Group by vertical band: top bar, main content, sidebar, bottom
+//
+// Returns a formatted string ready to inject into the LLM prompt.
+// ---------------------------------------------------------------------------
+const _NOISE_DIALOG_RE = /cookie|consent|privacy|language|advertising|tailored|opt.?out|gdpr|do not sell/i;
+const _PUNCT_ONLY_RE = /^[^\w]+$/;
+
+function _classifyOcrItem(item) {
+  const _text = (item.text || '').trim();
+  const _w = item.width || 0;
+  const _h = item.height || 0;
+  const _len = _text.length;
+  // Input fields: typically placeholder text, wider than tall, often ends with "?"
+  if (_len > 3 && _len < 60 && _w > 150 && _h < 40 && /[?]/.test(_text)) return 'input';
+  if (_len > 3 && _len < 50 && _w > 200 && _h < 35 && /^(search|what|enter|add|type|find)/i.test(_text)) return 'input';
+  // Buttons: short text, small-to-medium box
+  if (_len >= 2 && _len <= 30 && _w < 200 && _h < 50) return 'button';
+  // Headings: larger height (bigger font)
+  if (_h > 28 && _len > 3 && _len < 80) return 'heading';
+  // Links: medium length, often single line
+  if (_len >= 3 && _len <= 60 && _h < 30) return 'link';
+  return 'text';
+}
+
+function _filterOcrForPrompt(items, opts = {}) {
+  if (!items || items.length === 0) return { formatted: '', filtered: [], noise: 0 };
+  const _imgW = opts.imageWidth || 1280;
+  const _imgH = opts.imageHeight || 800;
+  const _page = opts.page;
+  let _noiseDialogRects = null;
+
+  // Resolve cookie/consent dialog bounding rects from the DOM (cheap, one-time)
+  if (_page) {
+    try {
+      // Synchronous-ish: we accept this may be null if the page is unavailable
+      // (the caller can pre-compute and pass via opts.noiseDialogRects instead)
+      _noiseDialogRects = opts.noiseDialogRects || null;
+    } catch (_) {}
+  }
+
+  const _filtered = [];
+  let _noiseCount = 0;
+  for (const item of items) {
+    const _text = (item.text || '').trim();
+    // 1. Drop noise: <2 chars, pure punctuation, very low confidence
+    if (_text.length < 2) { _noiseCount++; continue; }
+    if (_PUNCT_ONLY_RE.test(_text)) { _noiseCount++; continue; }
+    if ((item.confidence || 1.0) < 0.5) { _noiseCount++; continue; }
+    // 2. Drop items inside known noise dialogs (if rect info available)
+    let _inNoiseDialog = false;
+    if (_noiseDialogRects && item.x !== undefined) {
+      const _cx = item.x + (item.width || 0) / 2;
+      const _cy = item.y + (item.height || 0) / 2;
+      for (const r of _noiseDialogRects) {
+        if (_cx >= r.x && _cx <= r.x + r.w && _cy >= r.y && _cy <= r.y + r.h) {
+          _inNoiseDialog = true;
+          break;
+        }
+      }
+    }
+    if (_inNoiseDialog) { _noiseCount++; continue; }
+    _filtered.push(item);
+  }
+
+  // 3. Classify
+  const _classified = _filtered.map(item => ({
+    ...item,
+    _type: _classifyOcrItem(item),
+  }));
+
+  // 4. Sort: interactive first (button, input, link), then heading, then text
+  const _typePriority = { input: 0, button: 1, link: 2, heading: 3, text: 4 };
+  _classified.sort((a, b) => {
+    const _pa = _typePriority[a._type] !== undefined ? _typePriority[a._type] : 5;
+    const _pb = _typePriority[b._type] !== undefined ? _typePriority[b._type] : 5;
+    if (_pa !== _pb) return _pa - _pb;
+    // Within same type, sort by vertical position (top to bottom)
+    return (a.y || 0) - (b.y || 0);
+  });
+
+  // 5. Format with type labels and coordinates
+  const _lines = _classified.map(i => {
+    const _x = Math.round(i.x || 0);
+    const _y = Math.round(i.y || 0);
+    const _w = Math.round(i.width || 0);
+    const _h = Math.round(i.height || 0);
+    return `  [${i._type}] "${i.text}" at (${_x},${_y}) ${_w}x${_h}`;
+  });
+
+  return {
+    formatted: _lines.join('\n'),
+    filtered: _classified,
+    noise: _noiseCount,
+  };
+}
+
+// Async helper: query the DOM for cookie/consent dialog rects so we can filter
+// OCR items that fall inside them. Returns an array of {x, y, w, h} in image
+// coordinates (scaled to the screenshot, not CSS pixels).
+async function _getNoiseDialogRects(page, imgW, imgH) {
+  if (!page) return [];
+  const _vpW = page.viewportSize()?.width || 1280;
+  const _vpH = page.viewportSize()?.height || 800;
+  const _scaleX = imgW / _vpW;
+  const _scaleY = imgH / _vpH;
+  try {
+    const _rects = await page.evaluate(() => {
+      const _out = [];
+      const _dialogs = document.querySelectorAll('[role="dialog"], [aria-modal="true"], div');
+      for (const d of _dialogs) {
+        const _t = (d.innerText || d.textContent || '').trim().slice(0, 200);
+        if (!_t) continue;
+        if (!_NOISE_DIALOG_RE.test(_t)) continue;
+        const r = d.getBoundingClientRect();
+        if (r.width === 0 || r.height === 0) continue;
+        _out.push({ x: r.left, y: r.top, w: r.width, h: r.height, text: _t.slice(0, 60) });
+      }
+      return _out;
+    }).catch(() => []);
+    return _rects.map(r => ({
+      x: r.x * _scaleX, y: r.y * _scaleY,
+      w: r.w * _scaleX, h: r.h * _scaleY,
+    }));
+  } catch (_) { return []; }
+}
+
+// ---------------------------------------------------------------------------
+// _resolveActionTarget — disambiguate clickByText targets when multiple DOM
+// candidates share the same text (e.g. "Save" in "Edit details" dialog vs
+// "Save" in a cookie consent dialog). Combines DOM bounding boxes with
+// LiteParser text coordinates to pick the correct target.
+//
+// Returns { ok, resolved: bool, bestSelector?: string, candidates?: array, reason: string }
+//   - resolved=true + bestSelector: a single best candidate was found
+//   - resolved=false + candidates: still ambiguous, return all for LLM to decide
+// ---------------------------------------------------------------------------
+async function _resolveActionTarget({ sessionId, text, subTaskContext, liteparseCache }) {
+  const _targetText = (text || '').trim().toLowerCase();
+  if (!_targetText) return { ok: false, resolved: false, reason: 'no text provided' };
+
+  const _page = engine?.getPage?.(sessionId);
+  if (!_page) return { ok: false, resolved: false, reason: 'no page' };
+
+  // 1. Get DOM candidates with bounding boxes + dialog containment info
+  let _candidates = [];
+  try {
+    _candidates = await _page.evaluate((targetText) => {
+      const lower = targetText.toLowerCase();
+      const baseSelector = 'button, a, [role="button"], [role="link"], input[type="submit"], input[type="button"], div, span';
+      const els = Array.from(document.querySelectorAll(baseSelector));
+      const results = [];
+      // Compliance dialog patterns (same as _detectOpenMenus)
+      const _compliancePatterns = ['cookie', 'consent', 'advertis', 'privacy', 'gdpr', 'language', 'location', 'region', 'country', 'opt-out', 'opt out', 'tailored', 'your privacy choices', 'do not sell', 'ccpa'];
+      function isComplianceDialog(el) {
+        const _label = (el.getAttribute('aria-label') || '').toLowerCase();
+        const _cls = (el.className || '').toLowerCase();
+        const _text = ((el.innerText || el.textContent || '').slice(0, 200) || '').toLowerCase();
+        for (const p of _compliancePatterns) {
+          if (_label.includes(p) || _cls.includes(p)) return true;
+          if (_text.includes(p) && _text.length < 300) return true;
+        }
+        return false;
+      }
+      // Find which dialog each candidate is inside
+      function getDialogInfo(el) {
+        let node = el.parentElement;
+        for (let i = 0; i < 8 && node; i++) {
+          const role = node.getAttribute('role');
+          if (role === 'dialog' || role === 'alertdialog' || node.getAttribute('aria-modal') === 'true') {
+            return {
+              inDialog: true,
+              dialogLabel: node.getAttribute('aria-label') || '',
+              dialogRole: role || 'dialog',
+              isCompliance: isComplianceDialog(node),
+            };
+          }
+          if (role === 'menu' || role === 'listbox') {
+            return { inDialog: true, dialogLabel: node.getAttribute('aria-label') || '', dialogRole: role, isCompliance: isComplianceDialog(node) };
+          }
+          node = node.parentElement;
+        }
+        return { inDialog: false, dialogLabel: '', dialogRole: '', isCompliance: false };
+      }
+      for (const el of els) {
+        const r = el.getBoundingClientRect();
+        if (r.width === 0 && r.height === 0) continue;
+        const s = window.getComputedStyle(el);
+        if (s.display === 'none' || s.visibility === 'hidden') continue;
+        const elText = (el.innerText || el.textContent || '').trim();
+        if (!elText) continue;
+        const isExact = elText.toLowerCase() === lower;
+        const isSub = elText.toLowerCase().includes(lower);
+        if (!isExact && !isSub) continue;
+        const dlg = getDialogInfo(el);
+        // Build a selector for this element
+        let sel = '';
+        if (el.id) sel = `#${el.id}`;
+        else if (el.getAttribute('role')) sel = `[role="${el.getAttribute('role')}"]`;
+        else sel = el.tagName.toLowerCase();
+        results.push({
+          selector: sel,
+          tag: el.tagName,
+          text: elText.slice(0, 60),
+          isExact,
+          rect: { x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height) },
+          cx: Math.round(r.x + r.width / 2),
+          cy: Math.round(r.y + r.height / 2),
+          inDialog: dlg.inDialog,
+          dialogLabel: dlg.dialogLabel,
+          dialogRole: dlg.dialogRole,
+          isCompliance: dlg.isCompliance,
+        });
+      }
+      return results;
+    }, _targetText);
+  } catch (e) {
+    return { ok: false, resolved: false, reason: `DOM candidate query failed: ${e.message}` };
+  }
+
+  if (_candidates.length === 0) return { ok: false, resolved: false, reason: 'no DOM candidates' };
+  if (_candidates.length === 1) return { ok: true, resolved: true, bestSelector: _candidates[0].selector, reason: 'single candidate' };
+
+  // 2. Multiple candidates — get LiteParser text items (use cache if fresh < 3s)
+  let _lpItems = null;
+  let _imgW = 1280, _imgH = 800;
+  const _now = Date.now();
+  if (liteparseCache && liteparseCache.textItems && (_now - liteparseCache.timestamp) < 3000) {
+    _lpItems = liteparseCache.textItems;
+    _imgW = liteparseCache.imageWidth || 1280;
+    _imgH = liteparseCache.imageHeight || 800;
+  } else {
+    try {
+      const _cap = await _liteparseCapture(_page);
+      if (_cap.ok) {
+        _lpItems = _cap.textItems || [];
+        _imgW = _cap.imageWidth || 1280;
+        _imgH = _cap.imageHeight || 800;
+      }
+    } catch (_) {}
+  }
+
+  // Viewport for coordinate scaling
+  const _vpW = _page.viewportSize()?.width || 1280;
+  const _vpH = _page.viewportSize()?.height || 800;
+  const _scaleX = _vpW / _imgW;
+  const _scaleY = _vpH / _imgH;
+
+  // 3. Score each candidate
+  const _subTaskLower = (subTaskContext || '').toLowerCase();
+  for (const c of _candidates) {
+    let score = 0;
+    // +3 exact text match
+    if (c.isExact) score += 3;
+    // +2 button tag
+    if (c.tag === 'BUTTON' || c.selector.includes('button')) score += 2;
+    // -5 compliance dialog
+    if (c.isCompliance) score -= 5;
+    // +5 inside a dialog whose label matches sub-task context
+    if (c.inDialog && c.dialogLabel && _subTaskLower) {
+      const _dlgLower = c.dialogLabel.toLowerCase();
+      // Check if any word from the sub-task context appears in the dialog label
+      const _ctxWords = _subTaskLower.split(/\s+/).filter(w => w.length > 3);
+      if (_ctxWords.some(w => _dlgLower.includes(w))) score += 5;
+    }
+    // +10 LiteParser coordinate overlap
+    if (_lpItems && _lpItems.length > 0) {
+      for (const item of _lpItems) {
+        const _itemText = (item.text || '').trim().toLowerCase();
+        if (!_itemText) continue;
+        // Text match (exact or substring)
+        if (_itemText === _targetText || _itemText.includes(_targetText) || _targetText.includes(_itemText)) {
+          // Scale LiteParser coords to viewport coords
+          const _lpCx = (item.x + (item.width || 0) / 2) * _scaleX;
+          const _lpCy = (item.y + (item.height || 0) / 2) * _scaleY;
+          // Check overlap: DOM center within 20px of LiteParser center
+          const _dx = Math.abs(c.cx - _lpCx);
+          const _dy = Math.abs(c.cy - _lpCy);
+          if (_dx < 20 && _dy < 20) {
+            score += 10;
+            break; // only count one match
+          }
+        }
+      }
+    }
+    c.score = score;
+  }
+
+  // 4. Sort by score descending
+  _candidates.sort((a, b) => b.score - a.score);
+
+  // 5. Pick highest, or return all if top two are within 2 points
+  const _top = _candidates[0];
+  const _second = _candidates[1];
+  if (_second && (_top.score - _second.score) < 2) {
+    logger.warn(`[playwright.agent] _resolveActionTarget: ambiguous — top candidates "${_top.text}" (score=${_top.score}) and "${_second.text}" (score=${_second.score}) for text="${text}" — returning all for LLM`);
+    return { ok: true, resolved: false, candidates: _candidates.slice(0, 5), reason: 'ambiguous — top scores within 2 points' };
+  }
+
+  logger.info(`[playwright.agent] _resolveActionTarget: resolved "${text}" → "${_top.text}" (score=${_top.score}, dialog="${_top.dialogLabel}", compliance=${_top.isCompliance}) out of ${_candidates.length} candidates`);
+  return { ok: true, resolved: true, bestSelector: _top.selector, bestCandidate: _top, candidates: _candidates.slice(0, 5), reason: `highest score=${_top.score}` };
+}
 // full-page ARIA snapshot (which HAS refs from buildRefTree) extracts only the
 // dialog section by tracking YAML indentation. Preserves refs (e24, e93) so
 // the click engine resolves them correctly. Replaces the old _scopedModalSnapshot
@@ -4450,7 +4944,8 @@ async function _summarizePartialProgress({ goal, transcript, sessionId, hostname
     const engine = require('./browser.engine.cjs');
     const page = engine.getPage(sessionId);
     if (page) {
-      const _url = await page.url().catch(() => '');
+      let _url = '';
+      try { _url = page.url(); } catch (_) {}
       const _text = await page.evaluate(() => document.body.innerText.slice(0, 500)).catch(() => '');
       _pageState = `Current URL: ${_url}\nPage text (first 500 chars): ${_text}`;
     }
@@ -4894,7 +5389,7 @@ async function _decomposeGoalIntoSubTasks(goal, sessionId) {
     ? `\n\nCRITICAL — ENTITY PRESERVATION:\nThe following entities are mentioned in the goal and MUST each appear in at least one sub-task description: ${_entities.map(e => `"${e}"`).join(', ')}\nDo NOT collapse multiple entities into a single sub-task unless the verification criterion covers ALL of them. If there are 3 artists, create separate sub-tasks for each artist's songs being added (or one sub-task whose verification checks for ALL 3 artists on the destination page).\n`
     : '';
 
-  const _prompt = `Decompose this browser automation goal into ordered sub-tasks. For each sub-task, provide a specific, checkable verification criterion.
+  const _prompt = `Decompose this browser automation goal into ordered sub-tasks. For each sub-task, provide a specific, checkable verification criterion AND a description of the expected page state after the sub-task completes.
 
 Goal: "${goal.slice(0, 1000)}"
 ${_entityList}
@@ -4904,7 +5399,8 @@ Return JSON only:
     {
       "id": 1,
       "description": "what to do (imperative, e.g. 'Create a new playlist')",
-      "verification": "how to check if done (specific, e.g. 'URL contains /playlist/' or 'input with placeholder Add a name contains Christian Music')"
+      "verification": "how to check if done (specific, e.g. 'URL contains /playlist/' or 'input with placeholder Add a name contains Christian Music')",
+      "expectedState": "what the page should look like AFTER this sub-task (e.g. 'A new playlist card appears in the sidebar with a default name. The main panel shows an empty playlist with an Edit details button.')"
     }
   ]
 }
@@ -4912,6 +5408,7 @@ Return JSON only:
 Rules:
 - 2-8 sub-tasks (merge trivial steps, but preserve all entities)
 - verification must be checkable from URL, DOM, or visible text — NOT from "the action succeeded"
+- expectedState must describe VISIBLE page elements (text, dialogs, buttons, URL) that would be present after the sub-task completes — this is used as a visual verification gate
 - Each sub-task should be independently verifiable
 - Order matters — earlier sub-tasks are prerequisites for later ones
 - CRITICAL: verification must check the FINAL page state after ALL sub-tasks are complete, NOT intermediate states. For "add X to Y" tasks, use "page text contains X" (the final destination page), NOT "search results show X" (intermediate). For "create playlist named Z", use "URL contains /playlist/ and page text contains Z".
@@ -4923,7 +5420,7 @@ Rules:
     const _raw = await askWithMessages([
       { role: 'system', content: 'You are a browser automation task planner. Output valid JSON only.' },
       { role: 'user', content: _prompt },
-    ], { temperature: 0.1, maxTokens: 800, responseTimeoutMs: 15000 });
+    ], { temperature: 0.1, maxTokens: 1000, responseTimeoutMs: 15000 });
 
     if (!_raw) return { ok: false, error: 'empty response' };
     const _m = _raw.match(/\{[\s\S]*\}/);
@@ -4937,6 +5434,7 @@ Rules:
       id: s.id || (i + 1),
       description: String(s.description || '').slice(0, 200),
       verification: String(s.verification || '').slice(0, 300),
+      expectedState: String(s.expectedState || '').slice(0, 300),
       completed: false,
     }));
 
@@ -4954,13 +5452,14 @@ Rules:
             id: _nextId,
             description: `Add songs by ${entity} to ${_destination}`,
             verification: `${_destination} page text contains "${entity}"`,
+            expectedState: `${_destination} page shows songs by ${entity} in the track list`,
             completed: false,
           });
         }
       }
     }
 
-    logger.info(`[playwright.agent] goal decomposition: ${subTasks.length} sub-tasks: ${subTasks.map(s => `#${s.id} ${s.description} [verify: ${s.verification}]`).join(' | ')}`);
+    logger.info(`[playwright.agent] goal decomposition: ${subTasks.length} sub-tasks: ${subTasks.map(s => `#${s.id} ${s.description} [verify: ${s.verification}] [expected: ${s.expectedState.slice(0, 60)}]`).join(' | ')}`);
     return { ok: true, subTasks };
   } catch (e) {
     logger.warn(`[playwright.agent] goal decomposition failed (non-fatal, will use regex fallback): ${e.message}`);
@@ -4968,22 +5467,15 @@ Rules:
   }
 }
 
-// Check if a single sub-task is completed based on its verification criterion.
-// Uses lightweight DOM/URL checks — not another LLM call.
-// Returns true if the verification criterion is met.
-async function _checkSubTaskCompletion(subTask, page, pageUrl, pageText) {
-  if (!subTask || subTask.completed) return true;
-  const v = (subTask.verification || '').toLowerCase();
-  if (!v) return false;
-  const url = (pageUrl || '').toLowerCase();
-  const text = (pageText || '').toLowerCase().slice(0, 5000);
-
+// Check a SINGLE verification condition (no " and " splitting).
+// Returns true if this one condition is met.
+async function _checkSingleVerificationCondition(v, page, url, text, subTaskId) {
   // Pattern: "URL contains X" or "url contains X"
   const urlMatch = v.match(/url contains ['"]?([^'"\n]+?)['"]?(?:\s|$)/);
   if (urlMatch) {
     const frag = urlMatch[1].toLowerCase().trim();
     if (frag && url.includes(frag)) {
-      logger.info(`[playwright.agent] sub-task #${subTask.id} verified: URL contains "${frag}"`);
+      logger.info(`[playwright.agent] sub-task #${subTaskId} verified: URL contains "${frag}"`);
       return true;
     }
   }
@@ -5002,7 +5494,7 @@ async function _checkSubTaskCompletion(subTask, page, pageUrl, pageText) {
         return false;
       }, target).catch(() => false);
       if (_found) {
-        logger.info(`[playwright.agent] sub-task #${subTask.id} verified: input contains "${target}"`);
+        logger.info(`[playwright.agent] sub-task #${subTaskId} verified: input contains "${target}"`);
         return true;
       }
     } catch (_) {}
@@ -5013,7 +5505,7 @@ async function _checkSubTaskCompletion(subTask, page, pageUrl, pageText) {
   if (textMatch) {
     const target = textMatch[1].toLowerCase().trim();
     if (target && text.includes(target)) {
-      logger.info(`[playwright.agent] sub-task #${subTask.id} verified: page text contains "${target}"`);
+      logger.info(`[playwright.agent] sub-task #${subTaskId} verified: page text contains "${target}"`);
       return true;
     }
   }
@@ -5028,7 +5520,7 @@ async function _checkSubTaskCompletion(subTask, page, pageUrl, pageText) {
           return document.querySelectorAll('[role="listitem"], [data-testid*="track"], [data-testid*="card"], li, .search-result').length > 0;
         }).catch(() => false);
         if (_hasResults) {
-          logger.info(`[playwright.agent] sub-task #${subTask.id} verified: search results for "${term}" visible`);
+          logger.info(`[playwright.agent] sub-task #${subTaskId} verified: search results for "${term}" visible`);
           return true;
         }
       } catch (_) {}
@@ -5039,12 +5531,42 @@ async function _checkSubTaskCompletion(subTask, page, pageUrl, pageText) {
   if (v.length > 5 && v.length < 100) {
     const keyPhrase = v.replace(/^(url contains|input.*?contains|page shows?|text|visible|appears?|displays?|search results?.*?)\s+/i, '').replace(/['"]/g, '').trim();
     if (keyPhrase.length > 3 && text.includes(keyPhrase.toLowerCase())) {
-      logger.info(`[playwright.agent] sub-task #${subTask.id} verified: page contains "${keyPhrase}"`);
+      logger.info(`[playwright.agent] sub-task #${subTaskId} verified: page contains "${keyPhrase}"`);
       return true;
     }
   }
 
   return false;
+}
+
+// Check if a single sub-task is completed based on its verification criterion.
+// Uses lightweight DOM/URL checks — not another LLM call.
+// Returns true if the verification criterion is met.
+// If the verification contains " and ", ALL parts must pass (compound verification).
+async function _checkSubTaskCompletion(subTask, page, pageUrl, pageText) {
+  if (!subTask || subTask.completed) return true;
+  const v = (subTask.verification || '').toLowerCase();
+  if (!v) return false;
+  const url = (pageUrl || '').toLowerCase();
+  const text = (pageText || '').toLowerCase().slice(0, 5000);
+
+  // Split on " and " for compound verification (e.g. "URL contains /playlist/ and page text contains 'Christian Music'")
+  // Only split when " and " is between two verification-like phrases (not inside quotes)
+  const _parts = v.split(/\s+and\s+/).map(s => s.trim()).filter(s => s.length > 0);
+  if (_parts.length <= 1) {
+    // Single condition — check directly
+    return _checkSingleVerificationCondition(v, page, url, text, subTask.id);
+  }
+  // Compound verification — ALL parts must pass
+  for (const _part of _parts) {
+    const _passed = await _checkSingleVerificationCondition(_part, page, url, text, subTask.id);
+    if (!_passed) {
+      logger.info(`[playwright.agent] sub-task #${subTask.id} NOT verified: compound part failed — "${_part.slice(0, 80)}"`);
+      return false;
+    }
+  }
+  logger.info(`[playwright.agent] sub-task #${subTask.id} verified: all ${_parts.length} compound parts passed`);
+  return true;
 }
 
 // Build the sub-task progress block for injection into the turn-loop LLM prompt.
@@ -5404,14 +5926,99 @@ function _extractGoalPhrases(goal) {
 //     Playwright page.screenshot + _vlmVerifyScreenshot. VLM false → fail,
 //     true → pass, null (unavailable) → don't fail on VLM's account.
 //
-// Returns { pass: bool, reason: string, source: 'dom'|'vlm'|'inconclusive',
+// Returns { pass: bool, reason: string, source: 'dom'|'vlm'|'inconclusive'|'llm'|'unavailable',
 //           matchedPhrases: string[], missingPhrases: string[] }.
-async function _verifyGoalCompletion({ goal, sessionId, headed, pageType }) {
+async function _verifyGoalCompletion({ goal, sessionId, headed, pageType, transcript }) {
   const { phrases, titledPhrases } = _extractGoalPhrases(goal);
   const _logTag = '[playwright.agent] goal verification';
 
   let _page = null;
   try { _page = engine.getPage(sessionId); } catch (_) {}
+
+  // ── Tier 0: LLM semantic verification for goals with no extractable phrases ──
+  // Phrase extraction yields nothing when the goal's target is a parameter rather
+  // than a goal-completion phrase — most commonly "add/move/save X to Y" goals
+  // where Y (the destination) is a parameter. Previously this fell through to
+  // VLM-only → 'inconclusive' → false success (the root cause of "add songs to
+  // playlist" tasks reporting success after only doing a search). Instead, ask
+  // the LLM directly with the current page text + action transcript: "was this
+  // goal achieved?" This is site-agnostic (the LLM reads the actual page) and
+  // reuses the proven Gate 3 prompt pattern from _structuralVerifySubTask.
+  if (phrases.length === 0) {
+    let _ask = null;
+    try { ({ ask: _ask } = require('../skill-helpers/skill-llm.cjs')); } catch (_) {}
+    if (_ask) {
+      try {
+        const _transcriptSummary = (Array.isArray(transcript) ? transcript : []).slice(-10).map((t, i) => {
+          const _a = t.action || {};
+          const _o = t.outcome || {};
+          const _actionDesc = _a.action ? `${_a.action}(${_a.text || _a.selector || _a.url || ''})` : JSON.stringify(_a).slice(0, 60);
+          const _outcomeDesc = _o.ok ? 'ok' : `fail: ${(_o.error || '').slice(0, 40)}`;
+          return `${i + 1}. ${_actionDesc} → ${_outcomeDesc}`;
+        }).join('\n');
+
+        let _pageTextForLlm = '';
+        try {
+          if (_page) {
+            _pageTextForLlm = await _page.evaluate(() => (document.body?.innerText || '').slice(0, 1500)).catch(() => '');
+          }
+        } catch (_) {}
+        if (!_pageTextForLlm) {
+          try {
+            const _baRes = await browserAct({ action: 'evaluate', text: `(document.body?.innerText || '').slice(0, 1500)`, sessionId, headed, timeoutMs: 5000 }).catch(() => ({ ok: false }));
+            if (_baRes?.ok) _pageTextForLlm = typeof _baRes.result === 'string' ? _baRes.result.replace(/^"|"$/g, '') : String(_baRes.result || '');
+          } catch (_) {}
+        }
+
+        let _pageUrlForLlm = '';
+        try {
+          if (_page) _pageUrlForLlm = _page.url();
+        } catch (_) {}
+
+        const _llmPrompt = `You are verifying whether a browser automation goal was achieved. Base your assessment ONLY on the evidence below — do not assume actions succeeded just because they returned ok.
+
+GOAL: ${goal}
+
+CURRENT PAGE URL: ${_pageUrlForLlm || '(unknown)'}
+CURRENT PAGE TEXT (first 1500 chars):
+${_pageTextForLlm || '(unavailable)'}
+
+ACTIONS TAKEN (last ${Math.min(10, (Array.isArray(transcript) ? transcript : []).length)} of ${(Array.isArray(transcript) ? transcript : []).length}):
+${_transcriptSummary || '(no actions)'}
+
+Was this goal achieved? Consider:
+- Does the current page show evidence that the goal was completed?
+- Were the actions taken consistent with completing the goal — or did the agent stop at an intermediate step (e.g. only searched for X but never added/moved/saved it to Y)?
+- For "add/move/save X to Y" goals: is X actually IN Y now (visible on the destination page/section), not just visible in search results?
+- For "create X" goals: does the page show X was created (e.g. URL contains the new item, page text contains the name)?
+
+Return ONLY valid JSON:
+{"achieved": true/false, "reasoning": "1-2 sentence explanation citing the evidence"}`;
+
+        const _raw = await _ask(_llmPrompt, { maxTokens: 150, temperature: 0, responseTimeoutMs: 15000 });
+        const _text = (typeof _raw === 'string' ? _raw : _raw?.text || _raw?.content || '').trim();
+        const _stripped = _text.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '').trim();
+        const _jsonMatch = _stripped.match(/\{[\s\S]*\}/);
+        if (_jsonMatch) {
+          try {
+            const _parsed = JSON.parse(_jsonMatch[0]);
+            const _achieved = _parsed.achieved === true;
+            const _reasoning = String(_parsed.reasoning || '').slice(0, 200);
+            logger.info(`${_logTag}: ${_achieved ? 'PASS' : 'FAIL'} (LLM Tier 0) — ${_reasoning}`);
+            return { pass: _achieved, reason: _achieved ? `LLM verified: ${_reasoning}` : `LLM rejected: ${_reasoning}`, source: 'llm', matchedPhrases: [], missingPhrases: [] };
+          } catch (_parseErr) {
+            logger.warn(`${_logTag}: LLM Tier 0 response unparseable — falling through to VLM`);
+          }
+        } else {
+          logger.warn(`${_logTag}: LLM Tier 0 returned no JSON — falling through to VLM`);
+        }
+      } catch (_llmErr) {
+        logger.warn(`${_logTag}: LLM Tier 0 error (non-fatal): ${_llmErr.message} — falling through to VLM`);
+      }
+    } else {
+      logger.info(`${_logTag}: LLM unavailable for Tier 0 — falling through to VLM`);
+    }
+  }
 
   // ── Tier 1: DOM check ──
   if (phrases.length > 0) {
@@ -5684,11 +6291,17 @@ async function _verifyGoalCompletion({ goal, sessionId, headed, pageType }) {
   }
 
   // ── Tier 2: VLM screenshot grading ──
+  // Fallback when Tier 0 (LLM) and Tier 1 (DOM phrases) both yielded nothing.
+  // If VLM is also unavailable, return source:'unavailable' (NOT 'inconclusive')
+  // so the caller's `source !== 'inconclusive'` check treats it as a hard fail
+  // and falls through to the turn-loop. This prevents false-success when all
+  // verification paths are down (the root cause of add-to-playlist tasks that
+  // only searched then reported success).
   try {
     const _ssRes = await browserAct({ action: 'screenshot', sessionId, headed, timeoutMs: 5000 }).catch(() => ({ ok: false }));
     if (!_ssRes.ok || !_ssRes.result) {
       logger.warn(`${_logTag}: VLM tier skipped — screenshot failed`);
-      return { pass: false, reason: 'goal verification inconclusive (no phrases, screenshot failed)', source: 'inconclusive', matchedPhrases: [], missingPhrases: phrases };
+      return { pass: false, reason: 'goal verification unavailable (no phrases, screenshot failed)', source: 'unavailable', matchedPhrases: [], missingPhrases: phrases };
     }
     const _vlm = await _vlmVerifyScreenshot(_ssRes.result, goal, pageType);
     if (_vlm && _vlm.verified === true) {
@@ -5699,12 +6312,13 @@ async function _verifyGoalCompletion({ goal, sessionId, headed, pageType }) {
       logger.warn(`${_logTag}: FAIL (VLM) — ${_vlm.reasoning || 'screenshot does not match goal'} (conf=${_vlm.confidence})`);
       return { pass: false, reason: `VLM failed: ${_vlm.reasoning || 'screenshot does not match goal'}`, source: 'vlm', matchedPhrases: [], missingPhrases: phrases };
     }
-    // VLM null/unavailable — can't confirm or deny
-    logger.warn(`${_logTag}: inconclusive (VLM unavailable/uncertain) — not failing on VLM's account`);
-    return { pass: false, reason: 'goal verification inconclusive (no phrases, VLM unavailable)', source: 'inconclusive', matchedPhrases: [], missingPhrases: phrases };
+    // VLM null/unavailable — can't confirm or deny. Return 'unavailable' so the
+    // caller treats this as a fail (not a false-success 'inconclusive').
+    logger.warn(`${_logTag}: unavailable (VLM unavailable/uncertain) — returning fail to avoid false positive`);
+    return { pass: false, reason: 'goal verification unavailable (no phrases, VLM unavailable)', source: 'unavailable', matchedPhrases: [], missingPhrases: phrases };
   } catch (e) {
     logger.warn(`${_logTag}: VLM tier error (non-fatal): ${e.message}`);
-    return { pass: false, reason: `goal verification error: ${e.message}`, source: 'inconclusive', matchedPhrases: [], missingPhrases: phrases };
+    return { pass: false, reason: `goal verification error: ${e.message}`, source: 'unavailable', matchedPhrases: [], missingPhrases: phrases };
   }
 }
 
@@ -6135,7 +6749,8 @@ async function _waitForComposeFocus(page, timeoutMs = 12000, frameOrPage = null)
       const _noComposeFound = !_state.focused && !_state.needsClick && !_state.inModal;
       if (_noComposeFound && !_urlRetryDone) {
         _urlRetryDone = true;
-        const _curUrl = await page.url().catch(() => '');
+        let _curUrl = '';
+        try { _curUrl = page.url(); } catch (_) {}
         if (/shareActive=true|compose\/post|compose=new|\/compose\b/i.test(_curUrl)) {
           logger.info(`[playwright.agent] waiting for compose focus: no modal — retrying URL-first navigation to ${_curUrl}`);
           try {
@@ -7438,6 +8053,23 @@ RULES:
 - For read/count/list tasks, end with getPageText.
 - For compose tasks, fill the compose box then click the submit button.
 - Do NOT include navigate steps — we're already on the right page.
+- ADD/MOVE/SAVE RULE: For goals like "add X to Y", "move X to Y", "save X to Y",
+  "insert X into Y", "assign X to Y", the steps MUST include the action that
+  actually places X into Y — not just searching for or reading X. Searching is
+  only an intermediate step. The plan is incomplete if it stops after search or
+  getPageText without performing the destination action.
+- OVERFLOW-MENU RULE: When the goal requires acting on a specific item (add/move/
+  save/share/delete a row, track, card, file, message) and the page does NOT show
+  a direct "Add"/"Move"/"Save" button for that item, use the item's overflow /
+  "more options" / "..." button on its row (often an icon button on the right side
+  of the row). Click it, then choose the matching menu item (e.g. "Add to ...",
+  "Move to ...", "Save to ..."). Do NOT clickByText "Add" globally — there is
+  usually no such top-level element.
+- DESTINATION-CONTAINER RULE: When the target Y has its own built-in search/add
+  input (e.g. a section-specific "Search" or "Add" input under a heading), prefer
+  using that input over a global page-level search. The DOM signals list inputs
+  with context attributes — pick the input whose context matches the destination
+  section.
 
 Return JSON: {"steps": [...], "thoughts": "brief explanation"}`;
 
@@ -7629,14 +8261,19 @@ Generate 3-5 steps to complete this task FROM THE CURRENT PAGE STATE. The prior 
         });
         // If action verification is inconclusive, fall back to phrase matching
         if (!_goalVerify) {
-          _goalVerify = await _verifyGoalCompletion({ goal: verificationGoal || goal, sessionId, headed, pageType: undefined });
+          _goalVerify = await _verifyGoalCompletion({ goal: verificationGoal || goal, sessionId, headed, pageType: undefined, transcript: _peTranscript });
         }
       } else {
-        _goalVerify = await _verifyGoalCompletion({ goal: verificationGoal || goal, sessionId, headed, pageType: undefined });
+        _goalVerify = await _verifyGoalCompletion({ goal: verificationGoal || goal, sessionId, headed, pageType: undefined, transcript: _peTranscript });
       }
     } catch (_gvErr) {
       logger.warn(`[playwright.agent] focused Plan-Execute: goal verification error (non-fatal): ${_gvErr.message}`);
     }
+    // On verification fail, fall through to the turn-loop. The 'unavailable'
+    // source (returned when both LLM and VLM are down) is NOT 'inconclusive',
+    // so it triggers the fail path — preventing false-success when all
+    // verification paths are unavailable (e.g. add-to-playlist tasks that
+    // only searched then reported success with no verification possible).
     if (_goalVerify && !_goalVerify.pass && _goalVerify.source !== 'inconclusive') {
       logger.warn(`[playwright.agent] focused Plan-Execute: goal verification FAILED — ${_goalVerify.reason} — falling back to turn-loop`);
       return {
@@ -7658,9 +8295,715 @@ Generate 3-5 steps to complete this task FROM THE CURRENT PAGE STATE. The prior 
   }
 }
 
-async function _executeTurnLoopFallback({ goal, verificationGoal, sessionId, headed, timeoutMs, agentContext, transcript, deadline, start, extractedText, heartbeat, textAlreadyEntered, maxTurns = 8, hostname, _discoveryAlreadyAttempted = false, _preDecomposedSubTasks = null, _inheritedActionSignatureCounts = null, _inheritedJitDiscoveryFired = null }) {
+// ---------------------------------------------------------------------------
+// _executeStateDiffLoop — Phase 2a: state-aware action loop.
+// For each sub-task: capture beforeState (full) → ask LLM for ONE action →
+// execute → capture afterState (cheap) → diff → verify → repeat or move on.
+// Uses _resolveActionTarget for ambiguous clickByText targets.
+// Falls back to _executeTurnLoopFallback if it can't complete.
+// ---------------------------------------------------------------------------
+const STATE_DIFF_LOOP_SYSTEM_PROMPT = `You are a browser automation agent. You receive the current page state (DOM snapshot + visible text) and a sub-task to complete. You must output ONE action as JSON.
+
+Available actions:
+  clickByText     { "action": "clickByText", "text": "Save", "tag": "button", "exact": true }
+  clickBySelector { "action": "clickBySelector", "selector": "#save-btn" }
+  click           { "action": "click", "selector": "td20" }
+  type            { "action": "type", "selector": "input[name='title']", "text": "Christian Music" }
+  fill            { "action": "fill", "selector": "input[name='title']", "text": "Christian Music" }
+  reactFill       { "action": "reactFill", "selector": "input[name='title']", "text": "Christian Music" }
+  press           { "action": "press", "key": "Enter" }
+  navigate        { "action": "navigate", "url": "https://..." }
+  return          { "action": "return", "data": "done" }
+
+Rules:
+- Output ONLY the JSON action, no explanation.
+- If the sub-task is already complete based on the page state, return done.
+- If a dialog/menu is open that is NOT related to the sub-task, press Escape to dismiss it first.
+- Do NOT click elements inside cookie/consent/language dialogs — dismiss them with Escape.
+- Use the DOM STATE SIGNALS and OCR text to identify the correct element.
+- If multiple elements have the same text, use the one inside the dialog/section relevant to the sub-task.`;
+
+// ---------------------------------------------------------------------------
+// Tier 1.9: LiteParser-First Action Loop
+// Uses Playwright screenshot + LiteParser OCR as the PRIMARY source of truth.
+// Clicks at OCR coordinates (deterministic, shadow-DOM-proof).
+// Middle-ground state-diff: DOM hash for cheap change detection, OCR re-capture
+// only when DOM hash is unchanged (possible no-op) or verification fails.
+// ---------------------------------------------------------------------------
+const LITEPARSE_FIRST_SYSTEM_PROMPT = `You are a browser automation agent. You receive OCR text items with screen coordinates and a sub-task to complete. You must output ONE action as JSON.
+
+Available actions:
+  clickByText  { "action": "clickByText", "text": "Save" }
+  type         { "action": "type", "text": "Christian Music", "fieldText": "Add a name" }
+  press        { "action": "press", "key": "Enter" }
+  pressEscape  { "action": "pressEscape" }
+  return       { "action": "return", "data": "done" }
+
+Rules:
+- Output ONLY the JSON action, no explanation.
+- For clickByText: pick the text of the button/link you want to click. The system will find it on screen via fuzzy matching and click at its coordinates.
+- For type: provide "fieldText" = the placeholder/label of the input field to click first, and "text" = the text to type.
+- If the sub-task is already complete based on the OCR text, return done.
+- If a dialog/menu is open that is NOT related to the sub-task, pressEscape to dismiss it first.
+- Do NOT click elements inside cookie/consent/language dialogs — dismiss them with Escape.
+- Use the OCR TEXT ITEMS with coordinates to identify what's visible on screen.`;
+
+async function _executeLiteparseFirstLoop({ goal, verificationGoal, sessionId, headed, timeoutMs, deadline, start, heartbeat, hostname, _preDecomposedSubTasks = null, _progressCallbackUrl, _stepIndex }) {
+  const _lpStart = Date.now();
+  logger.info(`[playwright.agent] Tier 1.9 (LiteParser-first): starting for goal="${goal.slice(0, 80)}"`);
+
+  try {
+    const page = engine.getPage(sessionId);
+    if (!page) return { ok: false, error: 'no page' };
+
+    // Decompose goal into sub-tasks (with expectedState)
+    let _subTasks = _preDecomposedSubTasks;
+    if (!_subTasks) {
+      const _decomp = await _decomposeGoalIntoSubTasks(goal, sessionId);
+      if (_decomp.ok && _decomp.subTasks) {
+        _subTasks = _decomp.subTasks;
+      }
+    }
+    if (!_subTasks || _subTasks.length === 0) {
+      logger.warn(`[playwright.agent] Tier 1.9: no sub-tasks — falling through`);
+      return { ok: false, error: 'no sub-tasks available' };
+    }
+    logger.info(`[playwright.agent] Tier 1.9: ${_subTasks.length} sub-tasks`);
+
+    const _lpTranscript = [];
+    const MAX_ACTIONS_PER_SUBTASK = 5;
+    let _prevOcrItems = null; // carry across sub-task boundaries (optimization #2)
+
+    // Emit tier progress
+    postProgress(_progressCallbackUrl, {
+      type: 'agent:tier',
+      stepIndex: _stepIndex,
+      tier: 'liteparse-first',
+      message: `LiteParser-first loop: ${_subTasks.length} sub-tasks`,
+    });
+
+    for (let _stIdx = 0; _stIdx < _subTasks.length; _stIdx++) {
+      const _st = _subTasks[_stIdx];
+      if (_st.completed) continue;
+      if (Date.now() > deadline) {
+        logger.warn(`[playwright.agent] Tier 1.9: deadline exceeded at sub-task #${_st.id}`);
+        return { ok: false, error: 'deadline exceeded', transcript: _lpTranscript };
+      }
+
+      logger.info(`[playwright.agent] Tier 1.9: sub-task #${_st.id}/${_subTasks.length} — "${_st.description.slice(0, 80)}"`);
+
+      // Emit sub-task progress
+      postProgress(_progressCallbackUrl, {
+        type: 'agent:tier',
+        stepIndex: _stepIndex,
+        tier: 'liteparse-first',
+        message: `Sub-task ${_st.id}/${_subTasks.length}: ${_st.description.slice(0, 80)}`,
+      });
+
+      // 1. Capture beforeState: OCR + DOM hash
+      // Reuse previous OCR if available and fresh (optimization #2: cache across sub-task boundaries)
+      let _beforeOcr = null;
+      let _beforeDomHash = '';
+      if (_prevOcrItems && (Date.now() - (_prevOcrItems._ts || 0)) < 3000) {
+        _beforeOcr = _prevOcrItems;
+        logger.info(`[playwright.agent] Tier 1.9: reusing cached OCR from previous sub-task (${_beforeOcr.length} items)`);
+      } else {
+        const _cap = await _liteparseCapture(page);
+        if (!_cap.ok) {
+          logger.warn(`[playwright.agent] Tier 1.9: LiteParser capture failed — falling through`);
+          return { ok: false, error: 'LiteParser capture failed', transcript: _lpTranscript };
+        }
+        _beforeOcr = _cap.textItems || [];
+        _beforeOcr._ts = Date.now();
+        _beforeOcr._imgW = _cap.imageWidth;
+        _beforeOcr._imgH = _cap.imageHeight;
+      }
+      // DOM hash (cheap)
+      try {
+        _beforeDomHash = await page.evaluate(() => {
+          const els = document.querySelectorAll('button, a, [role="button"], [role="link"], input, [contenteditable], [role="dialog"], [aria-modal="true"]');
+          const sigs = [];
+          for (const el of els) {
+            const r = el.getBoundingClientRect();
+            if (r.width === 0 && r.height === 0) continue;
+            const s = window.getComputedStyle(el);
+            if (s.display === 'none' || s.visibility === 'hidden') continue;
+            const t = (el.innerText || el.textContent || el.value || el.getAttribute('aria-label') || '').trim().slice(0, 40);
+            sigs.push(`${el.tagName}|${el.getAttribute('role') || ''}|${t}`);
+          }
+          let h = 0;
+          const joined = sigs.join('§');
+          for (let i = 0; i < joined.length; i++) { h = ((h << 5) - h + joined.charCodeAt(i)) | 0; }
+          return `${h}_${sigs.length}`;
+        }).catch(() => '');
+      } catch (_) {}
+
+      let _actionCount = 0;
+      let _noOpCount = 0;
+
+      // Pre-compute noise dialog rects (cookie/consent/language) so we can filter
+      // OCR items that fall inside them. Computed once per sub-task.
+      const _imgW0 = _beforeOcr._imgW || 1280;
+      const _imgH0 = _beforeOcr._imgH || 800;
+      const _noiseRects = await _getNoiseDialogRects(page, _imgW0, _imgH0);
+
+      // 2. Action loop for this sub-task
+      while (_actionCount < MAX_ACTIONS_PER_SUBTASK) {
+        if (Date.now() > deadline) break;
+
+        // Build filtered + structured OCR text items list for the LLM prompt
+        const _ocrFiltered = _filterOcrForPrompt(_beforeOcr, {
+          imageWidth: _beforeOcr._imgW || 1280,
+          imageHeight: _beforeOcr._imgH || 800,
+          noiseDialogRects: _noiseRects,
+        });
+        const _ocrForPrompt = _ocrFiltered.formatted;
+        const _ocrFullText = _ocrFiltered.filtered.map(i => i.text).join(' ');
+        if (_actionCount === 0 && _ocrFiltered.noise > 0) {
+          logger.info(`[playwright.agent] Tier 1.9: filtered ${_ocrFiltered.noise} noise OCR items (cookie/consent/short) — ${_ocrFiltered.filtered.length} remaining`);
+        }
+
+        // Build the LLM prompt
+        const _turnUser = `SUB-TASK #${_st.id}: ${_st.description}
+VERIFICATION: ${_st.verification}
+EXPECTED STATE AFTER: ${_st.expectedState || '(not specified)'}
+
+OCR TEXT ITEMS (what's actually visible on screen, classified + sorted — interactive first):
+${_ocrForPrompt.slice(0, 3000)}
+
+${_noOpCount > 0 ? `\n⚠️ LAST ACTION HAD NO EFFECT (no-op #${_noOpCount}). Try a COMPLETELY different approach.\n` : ''}
+${_actionCount === 0 ? 'What is your first action to complete this sub-task?' : `Action ${_actionCount + 1}/${MAX_ACTIONS_PER_SUBTASK}. What is your next action?`}
+
+Output ONLY the JSON action:`;
+
+        let _actionRaw;
+        try {
+          _actionRaw = await askWithMessages([
+            { role: 'system', content: LITEPARSE_FIRST_SYSTEM_PROMPT },
+            { role: 'user', content: _turnUser },
+          ], { temperature: 0.1, maxTokens: 300, responseTimeoutMs: 20000 });
+        } catch (_llmErr) {
+          logger.warn(`[playwright.agent] Tier 1.9: LLM call failed: ${_llmErr.message}`);
+          break;
+        }
+
+        const _action = parseJson(_actionRaw);
+        if (!_action || !_action.action) {
+          logger.warn(`[playwright.agent] Tier 1.9: unparseable action: ${(_actionRaw || '').slice(0, 100)}`);
+          break;
+        }
+
+        // Return = sub-task done
+        if (_action.action === 'return') {
+          let _retUrl = '';
+          try { _retUrl = page.url(); } catch (_) {}
+          const _verifyResult = await _checkSubTaskCompletion(_st, page, _retUrl, await page.evaluate(() => document.body.innerText.slice(0, 8000)).catch(() => ''));
+          if (_verifyResult) {
+            _st.completed = true;
+            logger.info(`[playwright.agent] Tier 1.9: sub-task #${_st.id} completed (return + verification passed)`);
+            _lpTranscript.push({ action: _action, outcome: { ok: true }, subTask: _st.id });
+            break;
+          } else {
+            logger.warn(`[playwright.agent] Tier 1.9: sub-task #${_st.id} return rejected — verification not met`);
+            _actionCount++;
+            continue;
+          }
+        }
+
+        // 3. Execute the action via OCR coordinates
+        let _outcome;
+        const _imgW = _beforeOcr._imgW || 1280;
+        const _imgH = _beforeOcr._imgH || 800;
+        const _vpW = page.viewportSize()?.width || 1280;
+        const _vpH = page.viewportSize()?.height || 800;
+        const _scaleX = _vpW / _imgW;
+        const _scaleY = _vpH / _imgH;
+
+        try {
+          if (_action.action === 'pressEscape') {
+            await page.keyboard.press('Escape');
+            _outcome = { ok: true, result: 'Escape pressed' };
+            logger.info(`[playwright.agent] Tier 1.9: pressed Escape`);
+          } else if (_action.action === 'press') {
+            await page.keyboard.press(_action.key || 'Enter');
+            _outcome = { ok: true, result: `Pressed ${_action.key || 'Enter'}` };
+            logger.info(`[playwright.agent] Tier 1.9: pressed ${_action.key || 'Enter'}`);
+          } else if (_action.action === 'clickByText') {
+            // Find the OCR text item matching the target text (fuzzy)
+            // Use the filtered list (noise removed) for cleaner matching
+            const _target = _action.text || '';
+            const _candidates = _ocrFiltered.filtered.length > 0 ? _ocrFiltered.filtered : _beforeOcr;
+            let _bestItem = null;
+            let _bestScore = Infinity;
+            for (const item of _candidates) {
+              const _m = _fuzzyMatchText(_target, item.text, 2);
+              if (_m.match) {
+                // Prefer items in the dialog/modal region (center of screen, not top bar)
+                const _cy = item.y + (item.height || 0) / 2;
+                const _isInDialog = _cy > 80 && _cy < _imgH - 50;
+                // Prefer items classified as button/link (interactive) over plain text
+                const _typeBonus = (item._type === 'button' || item._type === 'link') ? -1 : 0;
+                const _score = _m.distance + (_isInDialog ? 0 : 5) + (_m.exact ? -1 : 0) + _typeBonus;
+                if (_score < _bestScore) { _bestScore = _score; _bestItem = item; }
+              }
+            }
+            if (_bestItem) {
+              const _clickX = Math.round((_bestItem.x + (_bestItem.width || 0) / 2) * _scaleX);
+              const _clickY = Math.round((_bestItem.y + (_bestItem.height || 0) / 2) * _scaleY);
+              logger.info(`[playwright.agent] Tier 1.9: clicking "${_bestItem.text}" at (${_clickX}, ${_clickY}) — fuzzy match for "${_target}" (score=${_bestScore} type=${_bestItem._type || '?'})`);
+              await page.mouse.click(_clickX, _clickY);
+              _outcome = { ok: true, result: `Clicked "${_bestItem.text}" at (${_clickX}, ${_clickY})` };
+            } else {
+              _outcome = { ok: false, error: `No OCR text item matching "${_target}" (fuzzy)` };
+              logger.warn(`[playwright.agent] Tier 1.9: no OCR match for "${_target}"`);
+            }
+          } else if (_action.action === 'type') {
+            // Click the field first, then type
+            const _fieldTarget = _action.fieldText || '';
+            const _candidates = _ocrFiltered.filtered.length > 0 ? _ocrFiltered.filtered : _beforeOcr;
+            let _fieldItem = null;
+            let _fieldScore = Infinity;
+            for (const item of _candidates) {
+              const _m = _fuzzyMatchText(_fieldTarget, item.text, 2);
+              if (_m.match) {
+                // Prefer items classified as input fields
+                const _typeBonus = item._type === 'input' ? -2 : 0;
+                const _score = _m.distance + (_m.exact ? -1 : 0) + _typeBonus;
+                if (_score < _fieldScore) { _fieldScore = _score; _fieldItem = item; }
+              }
+            }
+            if (_fieldItem) {
+              const _clickX = Math.round((_fieldItem.x + (_fieldItem.width || 0) / 2) * _scaleX);
+              const _clickY = Math.round((_fieldItem.y + (_fieldItem.height || 0) / 2) * _scaleY);
+              logger.info(`[playwright.agent] Tier 1.9: clicking field "${_fieldItem.text}" at (${_clickX}, ${_clickY}) then typing "${_action.text}"`);
+              await page.mouse.click(_clickX, _clickY);
+              await page.waitForTimeout(200);
+              await page.keyboard.type(_action.text || '', { delay: 50 });
+              _outcome = { ok: true, result: `Typed "${_action.text}" into "${_fieldItem.text}"` };
+            } else {
+              _outcome = { ok: false, error: `No OCR text item matching field "${_fieldTarget}"` };
+              logger.warn(`[playwright.agent] Tier 1.9: no OCR match for field "${_fieldTarget}"`);
+            }
+          } else {
+            _outcome = { ok: false, error: `Unknown action: ${_action.action}` };
+          }
+        } catch (_execErr) {
+          _outcome = { ok: false, error: _execErr.message };
+        }
+        _lpTranscript.push({ action: _action, outcome: _outcome, subTask: _st.id });
+        _actionCount++;
+
+        // Emit turn progress
+        postProgress(_progressCallbackUrl, {
+          type: 'agent:turn',
+          stepIndex: _stepIndex,
+          turn: _actionCount,
+          maxTurns: MAX_ACTIONS_PER_SUBTASK,
+          action: _action,
+          outcome: _outcome,
+          thoughts: '',
+        });
+
+        if (!_outcome.ok) {
+          logger.warn(`[playwright.agent] Tier 1.9: action failed: ${_outcome.error}`);
+          continue;
+        }
+
+        // 4. State-diff: middle-ground optimization
+        // Cheap DOM hash first — only re-capture OCR if DOM hash is unchanged
+        let _afterDomHash = '';
+        try {
+          _afterDomHash = await page.evaluate(() => {
+            const els = document.querySelectorAll('button, a, [role="button"], [role="link"], input, [contenteditable], [role="dialog"], [aria-modal="true"]');
+            const sigs = [];
+            for (const el of els) {
+              const r = el.getBoundingClientRect();
+              if (r.width === 0 && r.height === 0) continue;
+              const s = window.getComputedStyle(el);
+              if (s.display === 'none' || s.visibility === 'hidden') continue;
+              const t = (el.innerText || el.textContent || el.value || el.getAttribute('aria-label') || '').trim().slice(0, 40);
+              sigs.push(`${el.tagName}|${el.getAttribute('role') || ''}|${t}`);
+            }
+            let h = 0;
+            const joined = sigs.join('§');
+            for (let i = 0; i < joined.length; i++) { h = ((h << 5) - h + joined.charCodeAt(i)) | 0; }
+            return `${h}_${sigs.length}`;
+          }).catch(() => '');
+        } catch (_) {}
+
+        const _domChanged = _beforeDomHash && _afterDomHash && _beforeDomHash !== _afterDomHash;
+
+        if (_domChanged) {
+          // DOM changed — something happened. Check verification.
+          _noOpCount = 0;
+          logger.info(`[playwright.agent] Tier 1.9: DOM hash changed — checking verification`);
+        } else {
+          // DOM unchanged — re-capture OCR to check for shadow-DOM-only change
+          logger.info(`[playwright.agent] Tier 1.9: DOM hash unchanged — re-capturing OCR to check for shadow-DOM change`);
+          const _reCap = await _liteparseCapture(page);
+          if (_reCap.ok) {
+            const _ocrDiff = _diffOcrText(_beforeOcr, _reCap.textItems || []);
+            if (_ocrDiff.changed) {
+              _noOpCount = 0;
+              logger.info(`[playwright.agent] Tier 1.9: OCR text changed (${_ocrDiff.added.length} added, ${_ocrDiff.removed.length} removed) — progress`);
+              // Update beforeOcr for next iteration
+              _beforeOcr = _reCap.textItems || [];
+              _beforeOcr._ts = Date.now();
+              _beforeOcr._imgW = _reCap.imageWidth;
+              _beforeOcr._imgH = _reCap.imageHeight;
+            } else {
+              _noOpCount++;
+              logger.warn(`[playwright.agent] Tier 1.9: no-op detected (DOM + OCR unchanged) — noOpCount=${_noOpCount}`);
+              // Update beforeOcr anyway (page may have scrolled)
+              _beforeOcr = _reCap.textItems || [];
+              _beforeOcr._ts = Date.now();
+              _beforeOcr._imgW = _reCap.imageWidth;
+              _beforeOcr._imgH = _reCap.imageHeight;
+            }
+          }
+        }
+
+        // 5. Check verification
+        let _pageUrl = '', _pageText = '';
+        try { _pageUrl = page.url(); } catch (_) {}
+        _pageText = await page.evaluate(() => document.body.innerText.slice(0, 8000)).catch(() => '');
+
+        const _verified = await _checkSubTaskCompletion(_st, page, _pageUrl, _pageText);
+        if (_verified) {
+          _st.completed = true;
+          logger.info(`[playwright.agent] Tier 1.9: sub-task #${_st.id} completed (verification passed after ${_actionCount} action(s))`);
+
+          // If DOM changed but we didn't re-capture OCR, capture now for the next sub-task
+          if (_domChanged && !_prevOcrItems) {
+            const _finalCap = await _liteparseCapture(page);
+            if (_finalCap.ok) {
+              _prevOcrItems = _finalCap.textItems || [];
+              _prevOcrItems._ts = Date.now();
+              _prevOcrItems._imgW = _finalCap.imageWidth;
+              _prevOcrItems._imgH = _finalCap.imageHeight;
+            }
+          } else {
+            _prevOcrItems = _beforeOcr;
+          }
+          break;
+        }
+
+        // If DOM changed but verification failed, re-capture OCR to investigate
+        if (_domChanged) {
+          logger.info(`[playwright.agent] Tier 1.9: DOM changed but verification not met — re-capturing OCR to investigate`);
+          const _reCap = await _liteparseCapture(page);
+          if (_reCap.ok) {
+            _beforeOcr = _reCap.textItems || [];
+            _beforeOcr._ts = Date.now();
+            _beforeOcr._imgW = _reCap.imageWidth;
+            _beforeOcr._imgH = _reCap.imageHeight;
+          }
+        }
+
+        // Update DOM hash for next iteration
+        _beforeDomHash = _afterDomHash;
+      } // end action loop
+
+      if (!_st.completed) {
+        // Try structural verification as fallback
+        let _structPageText = '', _structPageUrl = '';
+        try { _structPageText = await page.evaluate(() => document.body.innerText.slice(0, 8000)).catch(() => ''); } catch (_) {}
+        try { _structPageUrl = page.url(); } catch (_) {}
+        const _sv = await _structuralVerifySubTask(_st, { page, pageUrl: _structPageUrl, pageText: _structPageText, transcript: _lpTranscript, sessionId });
+        if (_sv.verified) {
+          _st.completed = true;
+          logger.info(`[playwright.agent] Tier 1.9: sub-task #${_st.id} completed via structural verification (${_sv.gate}: ${_sv.reason})`);
+        } else {
+          logger.warn(`[playwright.agent] Tier 1.9: sub-task #${_st.id} NOT verified (${_sv.gate}: ${_sv.reason}) — falling through to Tier 2`);
+          break;
+        }
+      }
+    } // end sub-task loop
+
+    // Check if all sub-tasks are complete
+    const _allComplete = _subTasks.every(s => s.completed);
+    if (_allComplete) {
+      const _execTime = Date.now() - _lpStart;
+      logger.info(`[playwright.agent] Tier 1.9: all ${_subTasks.length} sub-tasks completed in ${_execTime}ms`);
+      return {
+        ok: true,
+        result: `All ${_subTasks.length} sub-tasks completed (Tier 1.9 LiteParser-first)`,
+        transcript: _lpTranscript,
+        routingDecision: 'liteparse_first',
+        sessionId,
+      };
+    }
+
+    const _incomplete = _subTasks.filter(s => !s.completed).map(s => `#${s.id} ${s.description}`);
+    logger.warn(`[playwright.agent] Tier 1.9: ${_incomplete.length} sub-tasks incomplete: ${_incomplete.join(', ')}`);
+    return { ok: false, error: `Tier 1.9: ${_incomplete.length} sub-tasks incomplete`, transcript: _lpTranscript, subTasks: _subTasks };
+  } catch (e) {
+    logger.warn(`[playwright.agent] Tier 1.9 error: ${e.message}`);
+    return { ok: false, error: e.message };
+  }
+}
+
+async function _executeStateDiffLoop({ goal, verificationGoal, sessionId, headed, timeoutMs, agentContext, deadline, start, heartbeat, hostname, _preDecomposedSubTasks = null, _progressCallbackUrl = null, _stepIndex = null }) {
+  const _sdStart = Date.now();
+  logger.info(`[playwright.agent] state-diff loop: starting for goal="${goal.slice(0, 80)}"`);
+
+  try {
+    const page = engine.getPage(sessionId);
+    if (!page) return { ok: false, error: 'no page' };
+
+    // Decompose goal into sub-tasks (with expectedState)
+    let _subTasks = _preDecomposedSubTasks;
+    if (!_subTasks) {
+      const _decomp = await _decomposeGoalIntoSubTasks(goal, sessionId);
+      if (_decomp.ok && _decomp.subTasks) {
+        _subTasks = _decomp.subTasks;
+      }
+    }
+    if (!_subTasks || _subTasks.length === 0) {
+      logger.warn(`[playwright.agent] state-diff loop: no sub-tasks — falling back`);
+      return { ok: false, error: 'no sub-tasks available' };
+    }
+    logger.info(`[playwright.agent] state-diff loop: ${_subTasks.length} sub-tasks`);
+
+    const _sdTranscript = [];
+    const MAX_ACTIONS_PER_SUBTASK = 5;
+    let _liteparseCache = null; // { textItems, imageWidth, imageHeight, timestamp }
+
+    // Emit tier progress so the frontend shows state-diff loop activity
+    postProgress(_progressCallbackUrl, {
+      type: 'agent:tier',
+      stepIndex: _stepIndex,
+      tier: 'state-diff',
+      message: `State-diff loop: ${_subTasks.length} sub-tasks`,
+    });
+
+    for (let _stIdx = 0; _stIdx < _subTasks.length; _stIdx++) {
+      const _st = _subTasks[_stIdx];
+      if (_st.completed) continue;
+      if (Date.now() > deadline) {
+        logger.warn(`[playwright.agent] state-diff loop: deadline exceeded at sub-task #${_st.id}`);
+        return { ok: false, error: 'deadline exceeded', transcript: _sdTranscript, partialProgress: await _summarizePartialProgress({ goal, transcript: _sdTranscript, sessionId, hostname }) };
+      }
+
+      logger.info(`[playwright.agent] state-diff loop: sub-task #${_st.id}/${_subTasks.length} — "${_st.description.slice(0, 80)}"`);
+
+      // 1. Capture beforeState (full: DOM + LiteParser + openMenus)
+      const _beforeState = await _captureState(sessionId, headed, 'full');
+      // Cache the LiteParser capture for _resolveActionTarget
+      if (_beforeState.ocrText) {
+        // Re-capture textItems for coordinate matching (ocrText is just the string)
+        try {
+          const _cap = await _liteparseCapture(page);
+          if (_cap.ok) _liteparseCache = { textItems: _cap.textItems, imageWidth: _cap.imageWidth, imageHeight: _cap.imageHeight, timestamp: Date.now() };
+        } catch (_) {}
+      }
+
+      let _actionCount = 0;
+      let _noOpCount = 0;
+      let _lastDiff = null;
+
+      // 2. Action loop for this sub-task
+      while (_actionCount < MAX_ACTIONS_PER_SUBTASK) {
+        if (Date.now() > deadline) break;
+
+        // Get fresh DOM snapshot for the LLM prompt
+        const _snap = await _fastSnapshot(sessionId, headed, timeoutMs);
+        let _currentSnapshot = _snap?.ok ? String(_snap.result || '') : '';
+        const _prunedSnap = pruneSnapshot(extractInteractiveRefs(_currentSnapshot));
+
+        // Build the LLM prompt
+        const _turnUser = `SUB-TASK #${_st.id}: ${_st.description}
+VERIFICATION: ${_st.verification}
+EXPECTED STATE AFTER: ${_st.expectedState || '(not specified)'}
+
+CURRENT PAGE URL: ${_beforeState.url}
+${_beforeState.ocrText ? `OCR SCREEN CAPTURE (what's actually visible):\n${_beforeState.ocrText.slice(0, 1500)}\n` : ''}
+CURRENT SNAPSHOT (ARIA):
+${_prunedSnap.slice(0, 3000)}
+${_lastDiff ? `\nLAST ACTION RESULT: ${_lastDiff.changed ? `State changed (${_lastDiff.changes.join(', ')})` : 'State UNCHANGED — your last action was a no-op. Try a COMPLETELY different approach.'}\n` : ''}
+${_actionCount === 0 ? 'What is your first action to complete this sub-task?' : `Action ${_actionCount + 1}/${MAX_ACTIONS_PER_SUBTASK}. What is your next action?`}
+
+Output ONLY the JSON action:`;
+
+        let _actionRaw;
+        try {
+          _actionRaw = await askWithMessages([
+            { role: 'system', content: STATE_DIFF_LOOP_SYSTEM_PROMPT },
+            { role: 'user', content: _turnUser },
+          ], { temperature: 0.1, maxTokens: 400, responseTimeoutMs: 20000 });
+        } catch (_llmErr) {
+          logger.warn(`[playwright.agent] state-diff loop: LLM call failed: ${_llmErr.message}`);
+          break;
+        }
+
+        const _action = parseJson(_actionRaw);
+        if (!_action || !_action.action) {
+          logger.warn(`[playwright.agent] state-diff loop: unparseable action: ${(_actionRaw || '').slice(0, 100)}`);
+          break;
+        }
+
+        // Return = sub-task done
+        if (_action.action === 'return') {
+          // Verify the sub-task is actually complete
+          let _retUrl = '';
+          try { _retUrl = page.url(); } catch (_) {}
+          const _verifyResult = await _checkSubTaskCompletion(_st, page, _retUrl, await page.evaluate(() => document.body.innerText.slice(0, 8000)).catch(() => ''));
+          if (_verifyResult) {
+            _st.completed = true;
+            logger.info(`[playwright.agent] state-diff loop: sub-task #${_st.id} completed (return + verification passed)`);
+            _sdTranscript.push({ action: _action, outcome: { ok: true }, subTask: _st.id, note: 'completed via return' });
+            break;
+          } else {
+            // Verification failed — continue loop with a hint
+            logger.warn(`[playwright.agent] state-diff loop: sub-task #${_st.id} return rejected — verification not met`);
+            _sdTranscript.push({ action: _action, outcome: { ok: false, error: 'return rejected — verification not met' }, subTask: _st.id });
+            _lastDiff = { changed: false, changes: ['return-rejected'] };
+            _actionCount++;
+            continue;
+          }
+        }
+
+        // 3. Resolve ambiguous clickByText targets
+        if (_action.action === 'clickByText' && _action.text) {
+          const _resolution = await _resolveActionTarget({
+            sessionId,
+            text: _action.text,
+            subTaskContext: _st.description + ' ' + (_st.expectedState || ''),
+            liteparseCache: _liteparseCache,
+          });
+          if (_resolution.ok && _resolution.resolved && _resolution.bestSelector) {
+            // Convert to clickBySelector for precise targeting
+            _action.action = 'clickBySelector';
+            _action.selector = _resolution.bestSelector;
+            logger.info(`[playwright.agent] state-diff loop: resolved clickByText "${_action.text}" → clickBySelector "${_resolution.bestSelector}"`);
+          } else if (_resolution.ok && !_resolution.resolved && _resolution.candidates) {
+            // Still ambiguous — include candidates in next prompt
+            const _candList = _resolution.candidates.map(c => `  - "${c.text}" at (${c.cx},${c.cy}) score=${c.score} dialog="${c.dialogLabel}" compliance=${c.isCompliance}`).join('\n');
+            _lastDiff = { changed: false, changes: [`AMBIGUOUS TARGET: Multiple elements match "${_action.text}":\n${_candList}\nUse clickBySelector with a more specific selector, or press Escape to dismiss irrelevant dialogs first.`] };
+            _actionCount++;
+            continue; // skip execution, re-prompt with ambiguity info
+          }
+        }
+
+        // 4. Execute the action
+        logger.info(`[playwright.agent] state-diff loop: sub-task #${_st.id} action ${_actionCount + 1}/${MAX_ACTIONS_PER_SUBTASK}: ${_action.action}`);
+        let _outcome;
+        try {
+          _outcome = await browserAct({ ..._action, sessionId, headed, timeoutMs: timeoutMs || 15000 });
+        } catch (_execErr) {
+          _outcome = { ok: false, error: _execErr.message };
+        }
+        _sdTranscript.push({ action: _action, outcome: _outcome, subTask: _st.id });
+        _actionCount++;
+
+        // Emit per-turn progress so the frontend shows state-diff loop activity
+        postProgress(_progressCallbackUrl, {
+          type: 'agent:turn',
+          stepIndex: _stepIndex,
+          turn: _actionCount,
+          maxTurns: MAX_ACTIONS_PER_SUBTASK,
+          action: _action,
+          outcome: _outcome,
+          thoughts: '',
+        });
+
+        if (!_outcome.ok) {
+          logger.warn(`[playwright.agent] state-diff loop: action failed: ${_outcome.error}`);
+          _lastDiff = { changed: false, changes: [`action failed: ${_outcome.error}`] };
+          continue;
+        }
+
+        // 5. Capture afterState (cheap) and diff
+        const _afterState = await _captureState(sessionId, headed, 'cheap');
+        _lastDiff = _diffStates(_beforeState, _afterState);
+
+        if (!_lastDiff.changed) {
+          _noOpCount++;
+          logger.warn(`[playwright.agent] state-diff loop: no-op detected (action had no effect) — noOpCount=${_noOpCount}`);
+          if (_noOpCount >= 2) {
+            // Two consecutive no-ops — inject a strong hint and try a different approach
+            _lastDiff = { changed: false, changes: ['Two consecutive no-ops. The element may be hidden, in the wrong dialog, or require a different action type. Try: (a) press Escape to dismiss irrelevant dialogs, (b) use a different selector, (c) try a keyboard shortcut, (d) return done if the sub-task is already complete.'] };
+          }
+        } else {
+          _noOpCount = 0;
+          logger.info(`[playwright.agent] state-diff loop: state changed (${_lastDiff.changes.join(', ')})`);
+        }
+
+        // 6. Check verification
+        let _pageUrl = '', _pageText = '';
+        try {
+          try { _pageUrl = page.url(); } catch (_) {}
+          _pageText = await page.evaluate(() => document.body.innerText.slice(0, 8000)).catch(() => '');
+        } catch (_) {}
+
+        const _verified = await _checkSubTaskCompletion(_st, page, _pageUrl, _pageText);
+        if (_verified) {
+          _st.completed = true;
+          logger.info(`[playwright.agent] state-diff loop: sub-task #${_st.id} completed (verification passed after ${_actionCount} action(s))`);
+          // 7. Capture final afterState (full) and compare with expectedState
+          const _finalState = await _captureState(sessionId, headed, 'full');
+          logger.info(`[playwright.agent] state-diff loop: sub-task #${_st.id} final state — url=${_finalState.url}, modalCount=${_finalState.modalCount}, ocrPreview="${(_finalState.ocrText || '').slice(0, 100).replace(/\n/g, ' ')}..."`);
+          break;
+        }
+      } // end action loop
+
+      if (!_st.completed) {
+        logger.warn(`[playwright.agent] state-diff loop: sub-task #${_st.id} not completed after ${_actionCount} actions — trying structural verification`);
+        // Try structural verification as a fallback
+        let _structPageText = '', _structPageUrl = '';
+        try {
+          _structPageText = await page.evaluate(() => document.body.innerText.slice(0, 8000)).catch(() => '');
+          try { _structPageUrl = page.url(); } catch (_) {}
+        } catch (_) {}
+        const _sv = await _structuralVerifySubTask(_st, { page, pageUrl: _structPageUrl, pageText: _structPageText, transcript: _sdTranscript, sessionId });
+        if (_sv.verified) {
+          _st.completed = true;
+          logger.info(`[playwright.agent] state-diff loop: sub-task #${_st.id} completed via structural verification (${_sv.gate}: ${_sv.reason})`);
+        } else {
+          logger.warn(`[playwright.agent] state-diff loop: sub-task #${_st.id} NOT verified (${_sv.gate}: ${_sv.reason}) — falling back to turn-loop`);
+          // Don't try remaining sub-tasks — fall back to turn-loop for the whole goal
+          break;
+        }
+      }
+    } // end sub-task loop
+
+    // Check if all sub-tasks are complete
+    const _allComplete = _subTasks.every(s => s.completed);
+    if (_allComplete) {
+      const _execTime = Date.now() - _sdStart;
+      logger.info(`[playwright.agent] state-diff loop: all ${_subTasks.length} sub-tasks completed in ${_execTime}ms`);
+      return {
+        ok: true,
+        result: `All ${_subTasks.length} sub-tasks completed (state-diff loop)`,
+        transcript: _sdTranscript,
+        routingDecision: 'state_diff_loop',
+        sessionId,
+      };
+    }
+
+    // Not all complete — return failure with partial progress
+    const _incomplete = _subTasks.filter(s => !s.completed).map(s => `#${s.id} ${s.description}`);
+    logger.warn(`[playwright.agent] state-diff loop: ${_incomplete.length} sub-tasks incomplete: ${_incomplete.join(', ')}`);
+    const _partialProgress = await _summarizePartialProgress({ goal, transcript: _sdTranscript, sessionId, hostname });
+    return { ok: false, error: `state-diff loop: ${_incomplete.length} sub-tasks incomplete`, transcript: _sdTranscript, partialProgress: _partialProgress, subTasks: _subTasks };
+  } catch (e) {
+    logger.warn(`[playwright.agent] state-diff loop error: ${e.message}`);
+    return { ok: false, error: e.message };
+  }
+}
+
+async function _executeTurnLoopFallback({ goal, verificationGoal, sessionId, headed, timeoutMs, agentContext, transcript, deadline, start, extractedText, heartbeat, textAlreadyEntered, maxTurns = 8, hostname, _discoveryAlreadyAttempted = false, _preDecomposedSubTasks = null, _inheritedActionSignatureCounts = null, _inheritedJitDiscoveryFired = null, _progressCallbackUrl, _stepIndex }) {
   const MAX_TURNS = maxTurns;
   const _loopTranscript = [...transcript];
+
+  // Emit tier progress so the frontend shows turn-loop activity
+  postProgress(_progressCallbackUrl, {
+    type: 'agent:tier',
+    stepIndex: _stepIndex,
+    tier: 'turn-loop',
+    message: `Turn-loop fallback starting (max ${MAX_TURNS} turns)`,
+  });
+
   let _lastActionSignature = null; // for duplicate detection
   let _lastStateHash = null;       // page state hash for no-op detection
   // Stash for LLM return data that was rejected by goal verification. If the
@@ -8011,10 +9354,11 @@ ${_composeSel ? `- SUGGESTED COMPOSE SELECTOR: ${_composeSel}` : ''}`;
     // This prevents the agent from abandoning an open "Add to playlist" menu to
     // search for the next artist. Works for any site with menus/dialogs.
     let _openMenuHint = '';
+    let _openMenus = []; // all visible non-compliance menus/dialogs
     let _activeMenuScope = null; // selector for the most prominent open menu
     let _activeMenuItems = []; // text of items in the active menu
     try {
-      const _openMenus = await _detectOpenMenus(sessionId, headed, 5000);
+      _openMenus = await _detectOpenMenus(sessionId, headed, 5000);
       if (_openMenus.length > 0) {
         // Pick the most prominent menu (most items, excluding cookie consent)
         const _activeMenu = _openMenus[0];
@@ -8022,8 +9366,9 @@ ${_composeSel ? `- SUGGESTED COMPOSE SELECTOR: ${_composeSel}` : ''}`;
         _activeMenuItems = _activeMenu.items.map(i => i.text).filter(Boolean);
         if (_activeMenuItems.length > 0) {
           const _itemsList = _activeMenuItems.map(t => `    - "${t}"`).join('\n');
-          _openMenuHint = `\n⚠️ OPEN MENU DETECTED (${_activeMenu.role || 'menu'}${_activeMenu.label ? ', label="' + _activeMenu.label + '"' : ''}):\n${_itemsList}\nYou MUST complete or dismiss this menu before taking any other action. Do NOT search, navigate, or type into other fields while this menu is open.\nTo complete: clickByText one of the menu items listed above.\nTo dismiss: press Escape.\n`;
-          logger.info(`[playwright.agent] turn-loop: open menu hint injected (${_activeMenuItems.length} items, scope=${_activeMenuScope})`);
+          const _multiModal = _openMenus.length > 1 ? ` Multiple dialogs are open. If the element you need is NOT inside this menu, DISMISS the others first (press Escape or click their Cancel/Close) before interacting with it.` : '';
+          _openMenuHint = `\n⚠️ OPEN MENU DETECTED (${_activeMenu.role || 'menu'}${_activeMenu.label ? ', label="' + _activeMenu.label + '"' : ''}):\n${_itemsList}\nYou MUST complete or dismiss this menu before taking any other action. Do NOT search, navigate, or type into other fields while this menu is open.${_multiModal}\nTo complete: clickByText one of the menu items listed above.\nTo dismiss: press Escape.\n`;
+          logger.info(`[playwright.agent] turn-loop: open menu hint injected (${_activeMenuItems.length} items, scope=${_activeMenuScope}, totalMenus=${_openMenus.length})`);
         }
       }
     } catch (_) {}
@@ -8235,9 +9580,9 @@ ${_prunedSnap}
 ${_recentActions ? `RECENT ACTIONS:\n${_recentActions}\n` : ''}
 ${_lastActionSignature === 'duplicate_noop' ? '\n⚠️ NO-PROGRESS WARNING: Your last action was a no-op (page state unchanged). Try a COMPLETELY different approach — different selector, different action type, or press Enter/Escape to commit/dismiss. Do NOT repeat the same action.\n' : ''}
 ${_lastActionSignature && _lastActionSignature.startsWith('no_progress:') ? `\n🚫 STUCK WARNING: You have already tried "${_lastActionSignature.slice('no_progress:'.length)}" multiple times with ok=true but the goal is NOT met. The site is likely reverting your change (e.g. the value only commits on Enter/blur) or the element is hidden by a UI mode (compact mode, collapsed section). Try a COMPLETELY different approach: (a) press Enter to commit ({ "action": "press", "key": "Enter" }), (b) click a different element first to focus it, (c) use a different selector, (d) press a keyboard shortcut to toggle the UI mode (e.g. { "action": "press", "key": "Control+Shift+F" } for compact mode), or (e) if the goal is genuinely already met, return done. Do NOT repeat the same action.\n` : ''}
-${_lastActionSignature === 'return_rejected' ? '\n❌ RETURN REJECTED: You declared the goal done, but verification found the goal was NOT actually achieved (expected text is missing from the page/title). Do NOT return again until you have actually completed the task. Look at the PAGE TEXT and OCR above — if the expected title/text is not there, you need to do more work. If you typed text into the wrong field (e.g. a Find/Replace dialog instead of the title), close the dialog (press Escape) and try the correct element.\n' : ''}
+${_lastActionSignature === 'return_rejected' || (_lastActionSignature && _lastActionSignature.startsWith('return_rejected:')) ? `\n❌ RETURN REJECTED: You declared the goal done, but verification found the goal was NOT actually achieved.${_lastActionSignature && _lastActionSignature.startsWith('return_rejected:') ? ` Verification reason: "${_lastActionSignature.slice('return_rejected:'.length)}"` : ' (expected text is missing from the page/title).'} Do NOT return again until you have actually completed the task. Look at the PAGE TEXT, OCR, and DOM STATE SIGNALS above — identify what the verification reason says is missing, then perform the action that actually completes the goal. For example: if you only searched for X but the goal was to add X to Y, you need to perform the add action (e.g. open the item's overflow/.../more-options button on its row and choose "Add to Y"), not just search. If you typed text into the wrong field, close the dialog (press Escape) and try the correct element.\n` : ''}
 ${_lastActionSignature && _lastActionSignature.startsWith('hidden_element:') ? `\n🔍 HIDDEN ELEMENT: The element "${_lastActionSignature.slice('hidden_element:'.length)}" exists in the DOM but is NOT VISIBLE. It may be hidden by a UI mode (compact mode, collapsed toolbar, minimized section) or by a parent container. Try: (a) press a keyboard shortcut to toggle the UI mode (e.g. { "action": "press", "key": "Control+Shift+F" } for compact mode in many editors), (b) look for a toggle/expand/collapse button in the snapshot and click it to reveal the element, (c) press Ctrl+/ or ? to open the app's keyboard shortcut help overlay to find the right shortcut, or (d) check the OCR — if the expected UI area (e.g. title bar, toolbar section) is missing from the screen, a UI mode is likely hiding it. Also check the APP KNOWLEDGE block above for known shortcuts and UI mode toggles for this app.\n` : ''}
-${_lastActionSignature && _lastActionSignature.startsWith('jit_fix:') ? `\n💡 JIT RESEARCH FIX: Web research found this specific fix for the current issue: ${_lastActionSignature.slice('jit_fix:'.length)} — apply this fix now.\n` : ''}
+${_lastActionSignature === 'multiple_modals' ? '\n🪟 MULTIPLE DIALOGS OPEN: Several dialogs/menus are on screen at once (e.g. cookie/language/location/privacy on top of the task dialog). The same click keeps being applied to the WRONG dialog. You must FIRST dismiss the irrelevant dialogs — press Escape or click their Cancel/Close/Not now/Done button. Then perform the click inside the correct dialog (e.g. the "Edit details" dialog or the "Add to playlist" dialog). If a clickByText would match several dialogs, use clickBySelector with a ref id from the specific dialog you want, or press Escape to clear the non-goal modals first.\n' : ''}${_lastActionSignature && _lastActionSignature.startsWith('jit_fix:') ? `\n💡 JIT RESEARCH FIX: Web research found this specific fix for the current issue: ${_lastActionSignature.slice('jit_fix:'.length)} — apply this fix now.\n` : ''}
 Turn ${turn}/${MAX_TURNS}. What is your next action? (DO NOT snapshot - act directly)`;
 
     let _actionRaw;
@@ -8300,7 +9645,7 @@ Turn ${turn}/${MAX_TURNS}. What is your next action? (DO NOT snapshot - act dire
             _structPage = engine.getPage(sessionId);
             if (_structPage) {
               _structPageText = await _structPage.evaluate(() => document.body.innerText.slice(0, 8000)).catch(() => '');
-              _structPageUrl = await _structPage.url().catch(() => '');
+              try { _structPageUrl = _structPage.url(); } catch (_) {}
             }
           } catch (_) {}
           let _structPassed = 0;
@@ -8360,10 +9705,10 @@ Turn ${turn}/${MAX_TURNS}. What is your next action? (DO NOT snapshot - act dire
             submitClickTs: null, expectedText: _expectedText, isSendSubmitGoal: true,
           });
           if (!_returnVerify) {
-            _returnVerify = await _verifyGoalCompletion({ goal: verificationGoal || goal, sessionId, headed, pageType: undefined });
+            _returnVerify = await _verifyGoalCompletion({ goal: verificationGoal || goal, sessionId, headed, pageType: undefined, transcript: _loopTranscript });
           }
         } else {
-          _returnVerify = await _verifyGoalCompletion({ goal: verificationGoal || goal, sessionId, headed, pageType: undefined });
+          _returnVerify = await _verifyGoalCompletion({ goal: verificationGoal || goal, sessionId, headed, pageType: undefined, transcript: _loopTranscript });
         }
       } catch (_rvErr) {
         logger.warn(`[playwright.agent] turn-loop: return verification error (non-fatal): ${_rvErr.message}`);
@@ -8385,7 +9730,9 @@ Turn ${turn}/${MAX_TURNS}. What is your next action? (DO NOT snapshot - act dire
           thoughts: `return rejected: ${_returnVerify.reason}`,
         });
         // Inject a hard hint for the next turn so the LLM doesn't just re-return.
-        _lastActionSignature = 'return_rejected';
+        // Carry the verification reason so the hint can tell the LLM *what* it did
+        // wrong (e.g. "only searched, didn't add") instead of a generic "not done".
+        _lastActionSignature = `return_rejected:${_returnVerify.reason.slice(0, 200)}`;
         continue;
       }
       const _vNote = _returnVerify ? ` verified=${_returnVerify.pass} (${_returnVerify.source})` : ' (verification inconclusive — accepting)';
@@ -8546,8 +9893,19 @@ Turn ${turn}/${MAX_TURNS}. What is your next action? (DO NOT snapshot - act dire
     try {
       const _execAction = { ..._action, sessionId, headed, timeoutMs };
       if (_action.action === 'clickByText' && _activeMenuScope && !_action.scope && !_action.menuScope) {
-        _execAction.menuScope = _activeMenuScope;
-        logger.info(`[playwright.agent] turn-loop: injecting menuScope="${_activeMenuScope}" into clickByText("${_action.text}")`);
+        // Only scope the click to the active menu if the target text actually
+        // looks like a menu item. If the agent is trying to click a button in a
+        // different dialog (e.g. "Save" in the "Edit details" dialog while a
+        // cookie/language menu is also open), forcing scope to the active menu
+        // will click the wrong "Save" and loop forever.
+        const _clickText = (_action.text || '').toLowerCase().trim();
+        const _matchesMenuItem = _activeMenuItems.some(i => i.toLowerCase().includes(_clickText) || _clickText.includes(i.toLowerCase()));
+        if (_matchesMenuItem) {
+          _execAction.menuScope = _activeMenuScope;
+          logger.info(`[playwright.agent] turn-loop: injecting menuScope="${_activeMenuScope}" into clickByText("${_action.text}") because it matches an active menu item`);
+        } else if (_openMenus.length > 1) {
+          logger.warn(`[playwright.agent] turn-loop: clickByText("${_action.text}") does NOT match active menu items (${_activeMenuItems.join(', ')}) and ${_openMenus.length} dialogs are open — leaving unscoped so it can target the correct dialog`);
+        }
       }
       _outcome = await browserAct(_execAction);
     } catch (_execErr) {
@@ -8611,6 +9969,12 @@ Turn ${turn}/${MAX_TURNS}. What is your next action? (DO NOT snapshot - act dire
         if ((_action.action === 'reactFill' || _action.action === 'fill') && _action.selector) {
           _lastActionSignature = `hidden_element:${_action.selector}`;
           logger.info(`[playwright.agent] turn-loop: reactFill repeated ${_count}× on "${_action.selector}" with ok=true but goal not met — element likely hidden, injecting hidden-element hint`);
+        } else if (_openMenus.length > 1 && /click/.test(_action.action)) {
+          // Multiple overlapping dialogs and the same click is going nowhere —
+          // the agent is likely clicking inside the wrong dialog. Tell it to
+          // dismiss non-goal modals and scope the next click to the correct one.
+          _lastActionSignature = 'multiple_modals';
+          logger.info(`[playwright.agent] turn-loop: ${_openMenus.length} open dialogs and click repeated ${_count}× — injecting multiple-modals hint`);
         } else {
           // Inject hint into next turn via _lastActionSignature (read by the goal builder below)
           _lastActionSignature = `no_progress:${_action.action}`;
@@ -8732,6 +10096,17 @@ Turn ${turn}/${MAX_TURNS}. What is your next action? (DO NOT snapshot - act dire
           _lastStateHash = await _ePage.evaluate(() => (document.body?.innerText || '').length + ':' + (document.body?.innerText || '').slice(0, 200)).catch(() => null);
         }
       } catch (_) {}
+
+      // Emit per-turn progress so the frontend shows turn-loop activity
+      postProgress(_progressCallbackUrl, {
+        type: 'agent:turn',
+        stepIndex: _stepIndex,
+        turn: turn,
+        maxTurns: MAX_TURNS,
+        action: _action,
+        outcome: _outcome,
+        thoughts: '',
+      });
       // Invalidate snapshot cache after DOM-mutating actions
       const _domMutating = ['reactFill', 'clickByText', 'clickBySelector', 'click', 'fill', 'type', 'navigate', 'press'].includes(_action.action);
       if (_domMutating) {
@@ -8761,7 +10136,8 @@ Turn ${turn}/${MAX_TURNS}. What is your next action? (DO NOT snapshot - act dire
         try {
           const _stPage = engine.getPage(sessionId);
           if (_stPage) {
-            const _stUrl = await _stPage.url().catch(() => '');
+            let _stUrl = '';
+            try { _stUrl = _stPage.url(); } catch (_) {}
             const _stText = await _stPage.evaluate(() => document.body.innerText.slice(0, 5000)).catch(() => '');
             let _newlyCompleted = 0;
             for (const _st of _subTasks) {
@@ -8810,7 +10186,7 @@ Turn ${turn}/${MAX_TURNS}. What is your next action? (DO NOT snapshot - act dire
         _preStructPage = engine.getPage(sessionId);
         if (_preStructPage) {
           _preStructText = await _preStructPage.evaluate(() => document.body.innerText.slice(0, 8000)).catch(() => '');
-          _preStructUrl = await _preStructPage.url().catch(() => '');
+          try { _preStructUrl = _preStructPage.url(); } catch (_) {}
         }
       } catch (_) {}
       let _preStructPassed = 0;
@@ -8870,10 +10246,10 @@ Turn ${turn}/${MAX_TURNS}. What is your next action? (DO NOT snapshot - act dire
             submitClickTs: null, expectedText: _expectedText, isSendSubmitGoal: true,
           });
           if (!_preExhaustionVerify) {
-            _preExhaustionVerify = await _verifyGoalCompletion({ goal: verificationGoal || goal, sessionId, headed, pageType: undefined });
+            _preExhaustionVerify = await _verifyGoalCompletion({ goal: verificationGoal || goal, sessionId, headed, pageType: undefined, transcript: _loopTranscript });
           }
         } else {
-          _preExhaustionVerify = await _verifyGoalCompletion({ goal: verificationGoal || goal, sessionId, headed, pageType: undefined });
+          _preExhaustionVerify = await _verifyGoalCompletion({ goal: verificationGoal || goal, sessionId, headed, pageType: undefined, transcript: _loopTranscript });
         }
       } catch (_veErr) {
         logger.warn(`[playwright.agent] turn-loop: pre-exhaustion location-aware check error (non-fatal): ${_veErr.message}`);
@@ -9581,17 +10957,32 @@ async function playwrightAgent(args) {
 
   // ── Verify gate: deterministic checks before any routing/planning ──────────
   // Ensures the page is actually loaded and on the right domain before we
-  // attempt Tier 1.5/2/2.5/3. Prevents planning against about:blank or broken pages.
+  // attempt Tier 1.5/2/2.5/3. Prevents planning against about:blank, 404s, or
+  // broken pages. If the deep-link URL is a 404, falls back to _recoveryUrl
+  // (browser.agent's startUrl) or the URL's origin.
   if (url && hostname) {
     let _verifyOk = false;
     let _verifyRetry = false;
+    let _verifyIs404 = false;
+    let _recoveryUrls = [];
     try {
       const _vgUrl = await _engineEval(sessionId, 'window.location.href');
       const _vgTextLen = await _engineEval(sessionId, '(document.body && document.body.innerText ? document.body.innerText.length : 0)');
+      const _vgTitle = await _engineEval(sessionId, 'document.title');
       const _vgActualUrl = _vgUrl?.ok ? String(_vgUrl.result).trim().replace(/^"|"$/g, '') : '';
       const _vgTextNum = _vgTextLen?.ok ? Number(_vgTextLen.result) : 0;
+      const _vgTitleText = _vgTitle?.ok ? String(_vgTitle.result).trim().replace(/^"|"$/g, '') : '';
+      const _vgPageText = (_vgTextNum > 0)
+        ? await _engineEval(sessionId, '(document.body && document.body.innerText ? document.body.innerText : "").toLowerCase().slice(0, 1500)').then(r => String(r?.ok ? r.result : '').replace(/^"|"$/g, '')).catch(() => '')
+        : '';
 
-      if (/about:blank/i.test(_vgActualUrl)) {
+      // 404 / not-found detection (case-insensitive)
+      const _is404 = /\b404\b|page not found|we can('t|t) seem to find|we can('t|t) find|this page( does)?n'?t exist|does not exist|not available|couldn('t|t) find the page|the page you'?re looking for/i.test(`${_vgPageText} ${_vgTitleText}`);
+      if (_is404) {
+        logger.warn(`[playwright.agent] verify gate: page appears to be a 404 / not-found — will try recovery URLs`);
+        _verifyIs404 = true;
+        _verifyRetry = true;
+      } else if (/about:blank/i.test(_vgActualUrl)) {
         logger.warn(`[playwright.agent] verify gate: page is about:blank — navigating back to ${url}`);
         _verifyRetry = true;
       } else if (_vgTextNum < 100) {
@@ -9615,25 +11006,62 @@ async function playwrightAgent(args) {
       }
 
       if (_verifyRetry) {
-        // Recovery: navigate back to start URL, wait for stabilisation, re-check
-        const _engineNav = await _engineNavigate(sessionId, url, Math.max(timeoutMs, 30000));
-        if (!_engineNav?.ok) {
-          await browserAct({ action: 'navigate', url, sessionId, headed, timeoutMs: Math.max(timeoutMs, 30000) }).catch(() => {});
-        }
-        await browserAct({ action: 'waitForStableText', sessionId, headed, timeoutMs: 10000 }).catch(() => {});
-        // Re-check
-        const _vgUrl2 = await _engineEval(sessionId, 'window.location.href');
-        const _vgTextLen2 = await _engineEval(sessionId, '(document.body && document.body.innerText ? document.body.innerText.length : 0)');
-        const _vgActualUrl2 = _vgUrl2?.ok ? String(_vgUrl2.result).trim().replace(/^"|"$/g, '') : '';
-        const _vgTextNum2 = _vgTextLen2?.ok ? Number(_vgTextLen2.result) : 0;
+        // Build a list of recovery URLs to try in order:
+        // 1. The original deep-link URL (transient failures / race conditions)
+        // 2. The recovery URL from browser.agent (service startUrl, e.g. https://open.spotify.com)
+        // 3. The origin of the deep-link URL (e.g. https://open.spotify.com/)
+        _recoveryUrls.push(url);
+        if (_recoveryUrl && _recoveryUrl !== url) _recoveryUrls.push(_recoveryUrl);
+        try {
+          const _origin = new URL(url).origin + '/';
+          if (_origin !== url && _origin !== _recoveryUrl) _recoveryUrls.push(_origin);
+        } catch (_) {}
 
-        if (/about:blank/i.test(_vgActualUrl2) || _vgTextNum2 < 100) {
-          logger.error(`[playwright.agent] verify gate: page still broken after recovery — aborting`);
+        let _lastRecoveryError = null;
+        let _recoveredTextLen = 0;
+        let _recoveredUrl = '';
+
+        for (const _tryUrl of _recoveryUrls) {
+          logger.info(`[playwright.agent] verify gate: recovery — navigating to ${_tryUrl}`);
+          const _engineNav = await _engineNavigate(sessionId, _tryUrl, Math.max(timeoutMs, 30000));
+          if (!_engineNav?.ok) {
+            await browserAct({ action: 'navigate', url: _tryUrl, sessionId, headed, timeoutMs: Math.max(timeoutMs, 30000) }).catch(() => {});
+          }
+          await browserAct({ action: 'waitForStableText', sessionId, headed, timeoutMs: 10000 }).catch(() => {});
+          // Re-check
+          const _vgUrl2 = await _engineEval(sessionId, 'window.location.href');
+          const _vgTextLen2 = await _engineEval(sessionId, '(document.body && document.body.innerText ? document.body.innerText.length : 0)');
+          const _vgActualUrl2 = _vgUrl2?.ok ? String(_vgUrl2.result).trim().replace(/^"|"$/g, '') : '';
+          const _vgTextNum2 = _vgTextLen2?.ok ? Number(_vgTextLen2.result) : 0;
+
+          if (/about:blank/i.test(_vgActualUrl2) || _vgTextNum2 < 100) {
+            _lastRecoveryError = 'about:blank or empty page';
+            continue; // try next recovery URL
+          }
+
+          // Also re-check for 404 on the recovery URL (could still be broken)
+          const _vgTitle2 = await _engineEval(sessionId, 'document.title');
+          const _vgTitleText2 = _vgTitle2?.ok ? String(_vgTitle2.result).trim().replace(/^"|"$/g, '') : '';
+          const _vgPageText2 = await _engineEval(sessionId, '(document.body && document.body.innerText ? document.body.innerText : "").toLowerCase().slice(0, 1500)').then(r => String(r?.ok ? r.result : '').replace(/^"|"$/g, '')).catch(() => '');
+          const _is404Recovery = /\b404\b|page not found|we can('t|t) seem to find|we can('t|t) find|this page( does)?n'?t exist|does not exist|not available|couldn('t|t) find the page|the page you'?re looking for/i.test(`${_vgPageText2} ${_vgTitleText2}`);
+          if (_is404Recovery) {
+            _lastRecoveryError = 'page not found / 404';
+            continue;
+          }
+
+          _recoveredTextLen = _vgTextNum2;
+          _recoveredUrl = _vgActualUrl2;
+          _verifyOk = true;
+          break; // success
+        }
+
+        if (!_verifyOk) {
+          logger.error(`[playwright.agent] verify gate: page still broken after recovery — attempted ${_recoveryUrls.length} URL(s) — aborting`);
           return {
             ok: false, goal, sessionId,
             turns: 0, done: false,
             result: `Page verification failed — could not load ${url}`,
-            error: `Verify gate: page is about:blank or empty after recovery attempt`,
+            error: `Verify gate: page is about:blank, 404, or empty after recovery attempt`,
             transcript: [],
             executionTime: Date.now() - start,
           };
@@ -9641,7 +11069,7 @@ async function playwrightAgent(args) {
         // Re-snapshot after recovery
         const _vgSnap = await _fastSnapshot(sessionId, headed, timeoutMs);
         if (_vgSnap.ok && _vgSnap.result) currentSnapshot = _vgSnap.result;
-        logger.info(`[playwright.agent] verify gate: recovered after re-navigation (textLen=${_vgTextNum2})`);
+        logger.info(`[playwright.agent] verify gate: recovered after re-navigation to ${_recoveredUrl} (textLen=${_recoveredTextLen})`);
       }
     } catch (_vgErr) {
       logger.warn(`[playwright.agent] verify gate error (non-fatal): ${_vgErr.message} — proceeding`);
@@ -10560,6 +11988,45 @@ async function playwrightAgent(args) {
     logger.warn(`[playwright.agent] phase 1.7: page study failed (non-fatal): ${_studyErr.message}`);
   }
 
+  // ── Tier 1.9: LiteParser-First Action Loop ────────────────────────────────
+  // Screenshot + OCR coordinates for deterministic, shadow-DOM-proof clicking.
+  // Runs before Tier 2 (Focused Plan-Execute) for multi-step goals.
+  // Falls through to Tier 2 if it can't complete.
+  if (_preDecomposedSubTasks && _preDecomposedSubTasks.length > 1) {
+    logger.info(`[playwright.agent] Tier 1.9: multi-step goal detected (${_preDecomposedSubTasks.length} sub-tasks) — trying LiteParser-first loop`);
+    try {
+      const _lpResult = await _executeLiteparseFirstLoop({
+        goal: _finalGoal,
+        verificationGoal: effectiveGoal,
+        sessionId,
+        headed,
+        timeoutMs,
+        agentContext,
+        deadline: _deadline,
+        start,
+        heartbeat: _heartbeat,
+        hostname,
+        _preDecomposedSubTasks,
+        _progressCallbackUrl,
+        _stepIndex,
+      });
+      if (_lpResult.ok) {
+        _lpResult.executionTime = Date.now() - start;
+        _heartbeat.stop();
+        return _lpResult;
+      }
+      logger.warn(`[playwright.agent] Tier 1.9 failed: ${_lpResult.error || 'unknown'} — falling through to Phase 2`);
+      // Pass sub-tasks + transcript to Tier 2 so it doesn't re-decompose
+      if (_lpResult.subTasks) {
+        _preDecomposedSubTasks = _lpResult.subTasks;
+      }
+    } catch (_lpErr) {
+      logger.warn(`[playwright.agent] Tier 1.9 error: ${_lpErr.message} — falling through to Phase 2`);
+    }
+  } else {
+    logger.info(`[playwright.agent] Tier 1.9: skipping (single-step or no sub-tasks) — falling through to Phase 2`);
+  }
+
   // ── Phase 2: Focused Plan-Execute (one LLM call, 3-5 steps, verify each) ──
   // Handles ALL interaction types: click, fill, type, press, hover, select, scroll,
   // drag, upload, check, tab-select, getPageText. Falls back to mini turn-loop on failure.
@@ -10630,7 +12097,50 @@ async function playwrightAgent(args) {
       }
     }
   } catch (_peErr) {
-    logger.warn(`[playwright.agent] focused Plan-Execute error: ${_peErr.message} — falling back to mini turn-loop`);
+    logger.warn(`[playwright.agent] focused Plan-Execute error: ${_peErr.message} — falling back to state-diff loop`);
+  }
+
+  // ── Phase 2a: State-Diff Loop (gated behind flag) ────────────────────────
+  // State-aware loop: captures DOM+LiteParser at sub-task boundaries, uses
+  // cheap DOM-hash diffs between actions to detect no-ops, and verifies the
+  // expected after-state before moving on. Falls back to the turn-loop if it
+  // can't complete. Uses _resolveActionTarget for ambiguous clickByText targets.
+  // Disabled by default — set ENABLE_STATE_DIFF_LOOP=true to enable.
+  const _stateDiffLoopEnabled = process.env.ENABLE_STATE_DIFF_LOOP !== 'false';
+  if (_stateDiffLoopEnabled) {
+    logger.info(`[playwright.agent] phase 2a: Plan-Execute did not complete - trying state-diff loop`);
+    try {
+      const _sdResult = await _executeStateDiffLoop({
+        goal: _finalGoal,
+        verificationGoal: effectiveGoal,
+        sessionId,
+        headed,
+        timeoutMs,
+        agentContext,
+        deadline: _deadline,
+        start,
+        heartbeat: _heartbeat,
+        hostname,
+        _preDecomposedSubTasks,
+        _progressCallbackUrl,
+        _stepIndex,
+      });
+      if (_sdResult.ok) {
+        _sdResult.executionTime = Date.now() - start;
+        _heartbeat.stop();
+        return _sdResult;
+      }
+      logger.warn(`[playwright.agent] state-diff loop failed: ${_sdResult.error || 'unknown'} — falling back to turn-loop`);
+      // Pass state-diff sub-tasks + transcript to the turn-loop so it doesn't
+      // re-decompose or re-do completed sub-tasks.
+      if (_sdResult.subTasks) {
+        _preDecomposedSubTasks = _sdResult.subTasks;
+      }
+    } catch (_sdErr) {
+      logger.warn(`[playwright.agent] state-diff loop error: ${_sdErr.message} — falling back to turn-loop`);
+    }
+  } else {
+    logger.info(`[playwright.agent] phase 2a: state-diff loop disabled (set ENABLE_STATE_DIFF_LOOP=false to disable)`);
   }
 
   // ── Phase 2b: Mini turn-loop (2-3 turns, last resort) ──────────────────
@@ -10654,6 +12164,8 @@ async function playwrightAgent(args) {
       start,
       hostname,
       _preDecomposedSubTasks,
+      _progressCallbackUrl,
+      _stepIndex,
     });
     if (_turnLoopResult.ok) {
       _turnLoopResult.executionTime = Date.now() - start;

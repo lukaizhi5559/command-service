@@ -76,6 +76,39 @@ function _findLitCli() {
 }
 let _LIT_BIN = _findLitCli();
 
+// ── CSS selector sanitizer ──────────────────────────────────────────────────
+// Fixes selectors like button[aria-label='God's Not Dead'] where the single
+// quote inside the attribute value breaks the CSS parser. Rewrites
+// attr='value with ' inside' to attr="value with ' inside" (and escapes any
+// inner double quotes). Also handles the reverse case (double-quote wrapper
+// with inner double quotes).
+function _sanitizeCssSelector(sel) {
+  if (!sel || typeof sel !== 'string') return sel;
+  // Match attr='...' patterns. The value may contain embedded single quotes,
+  // so we use non-greedy .+? to match up to the LAST ' before ].
+  // This handles: [aria-label='God's Not Dead'] → value = "God's Not Dead"
+  // Edge case: multiple attributes in one selector may mismatch, but LLM-generated
+  // selectors for our use case are typically single-attribute.
+  let _out = sel.replace(/\[([\w-]+)='(.+?)'\]/g, (match, attr, value) => {
+    // If the value contains a single quote, rewrite using double quotes as wrapper
+    if (value.includes("'")) {
+      const _escaped = value.replace(/"/g, '\\"');
+      return `[${attr}="${_escaped}"]`;
+    }
+    return match;
+  });
+  // Same for double-quote wrappers with inner double quotes
+  _out = _out.replace(/\[([\w-]+)="(.+?)"\]/g, (match, attr, value) => {
+    if (value.includes('"')) {
+      const _escaped = value.replace(/'/g, "\\'");
+      return `[${attr}='${_escaped}"]`;
+    }
+    return match;
+  });
+  return _out;
+}
+
+
 // LiteParser coordinate fallback for clickByText:
 // When DOM-based clickByText fails (shadow DOM, zero-size elements, etc.),
 // take a screenshot, run LiteParse to find text items with bounding boxes,
@@ -134,13 +167,42 @@ async function _clickByTextViaLiteParse(page, targetText, exact) {
           const isExact = it === lower;
           const isSub = it.includes(lower) || lower.includes(it);
           if (exact ? isExact : isSub) {
-            matches.push({ ...item, isExact, len: it.length });
+            matches.push({ ...item, isExact, len: it.length, fuzzy: false, distance: 0 });
+          }
+        }
+        // Fuzzy matching fallback: if no exact/substring matches, try Levenshtein
+        // Handles OCR misreads like "Save" → "sve" (distance=1)
+        if (matches.length === 0 && lower.length <= 30) {
+          for (const item of textItems) {
+            const it = (item.text || '').trim().toLowerCase();
+            if (!it || it.length > 30) continue;
+            // Levenshtein distance for short strings
+            const m = lower.length, n = it.length;
+            if (Math.abs(m - n) > 2) continue; // can't be within distance 2
+            const dp = Array(n + 1).fill(0).map((_, i) => i);
+            for (let i = 1; i <= m; i++) {
+              let prev = dp[0]; dp[0] = i;
+              for (let j = 1; j <= n; j++) {
+                const tmp = dp[j];
+                dp[j] = Math.min(dp[j] + 1, dp[j - 1] + 1, prev + (lower[i - 1] === it[j - 1] ? 0 : 1));
+                prev = tmp;
+              }
+            }
+            const dist = dp[n];
+            if (dist <= 2 && dist > 0) {
+              matches.push({ ...item, isExact: false, len: it.length, fuzzy: true, distance: dist });
+            }
+          }
+          if (matches.length > 0) {
+            logger.info(`[browser.act] clickByText LiteParse: fuzzy match found for "${targetText}" (${matches.length} candidates)`);
           }
         }
         if (matches.length === 0) { resolve({ ok: false, error: `LiteParse: no text match for "${targetText}"` }); return; }
-        // Sort: exact first, then shortest (buttons are short)
+        // Sort: exact first, then non-fuzzy, then shortest, then lowest distance
         matches.sort((a, b) => {
           if (a.isExact !== b.isExact) return b.isExact - a.isExact;
+          if (a.fuzzy !== b.fuzzy) return a.fuzzy ? 1 : -1; // non-fuzzy before fuzzy
+          if (a.fuzzy && b.fuzzy) return a.distance - b.distance; // lower distance first
           return a.len - b.len;
         });
         const best = matches[0];
@@ -4471,9 +4533,15 @@ async function browserAct(args) {
     //   force          — if true, bypass actionability checks (default false)
     //   waitForVisible — if true, wait for element to be visible before clicking (default true)
     case 'clickBySelector': {
-      const cssSelector = selector || args.selector;
+      let cssSelector = selector || args.selector;
       if (!cssSelector) {
         return { ok: false, action, sessionId, error: 'clickBySelector: selector is required', executionTime: Date.now() - start };
+      }
+      // Sanitize: fix attribute selectors with embedded quotes (e.g. aria-label='God's Not Dead')
+      const _origSelector = cssSelector;
+      cssSelector = _sanitizeCssSelector(cssSelector);
+      if (cssSelector !== _origSelector) {
+        logger.info(`[browser.act] clickBySelector: sanitized selector "${_origSelector}" → "${cssSelector}"`);
       }
       const forceClick = args.force === true;
       const waitForVisible = args.waitForVisible !== false; // default true

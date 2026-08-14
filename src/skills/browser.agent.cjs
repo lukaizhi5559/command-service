@@ -301,14 +301,23 @@ const VIDEO_PLATFORMS = new Set([
 // (resolveBrowserMeta priorities: DuckDB descriptor → DuckDB meta cache → this seed map → LLM+web_search)
 const KNOWN_BROWSER_SERVICES = {
   // ── Core social / collaboration ─────────────────────────────────────────────────────────────────────
-  gmail:          { startUrl: 'https://mail.google.com',                         signInUrl: 'https://accounts.google.com/signin/v2/identifier',  authSuccessPattern: 'mail.google.com',              isOAuth: true  },
-  google:         { startUrl: 'https://accounts.google.com',                     signInUrl: 'https://accounts.google.com',                       authSuccessPattern: 'myaccount.google.com',         isOAuth: true  },
-  googledocs:     { startUrl: 'https://docs.google.com',                         signInUrl: 'https://accounts.google.com/signin/v2/identifier',  authSuccessPattern: 'docs.google.com/document',     isOAuth: true, hostAliases: ['docs.google.com'] },
-  googlesheets:   { startUrl: 'https://sheets.google.com',                       signInUrl: 'https://accounts.google.com/signin/v2/identifier',  authSuccessPattern: 'docs.google.com/spreadsheets', isOAuth: true, hostAliases: ['sheets.google.com', 'docs.google.com'] },
-  googlecalendar: { startUrl: 'https://calendar.google.com',                     signInUrl: 'https://accounts.google.com/signin/v2/identifier',  authSuccessPattern: 'calendar.google.com',          isOAuth: true, hostAliases: ['calendar.google.com'] },
+  gmail:          { startUrl: 'https://mail.google.com',                         signInUrl: 'https://accounts.google.com/signin/v2/identifier',  authSuccessPattern: 'mail.google.com',              isOAuth: true,
+                   intentUrls: {
+                     mail: 'https://mail.google.com/mail/u/0/#inbox?compose=new',
+                     search: { buildUrl: (task, ctx) => `https://mail.google.com/mail/u/0/#search/${ctx.encodedQuery}` },
+                   } },
+  google:         { startUrl: 'https://accounts.google.com',                     signInUrl: 'https://accounts.google.com',                       authSuccessPattern: 'myaccount.google.com',         isOAuth: true,
+                   intentUrls: { search: { buildUrl: (task, ctx) => `https://www.google.com/search?q=${ctx.encodedQuery}` } } },
+  googledocs:     { startUrl: 'https://docs.google.com',                         signInUrl: 'https://accounts.google.com/signin/v2/identifier',  authSuccessPattern: 'docs.google.com/document',     isOAuth: true, hostAliases: ['docs.google.com'],
+                   intentUrls: { content_create: 'https://docs.google.com/document/create' } },
+  googlesheets:   { startUrl: 'https://sheets.google.com',                       signInUrl: 'https://accounts.google.com/signin/v2/identifier',  authSuccessPattern: 'docs.google.com/spreadsheets', isOAuth: true, hostAliases: ['sheets.google.com', 'docs.google.com'],
+                   intentUrls: { content_create: 'https://docs.google.com/spreadsheets/create' } },
+  googlecalendar: { startUrl: 'https://calendar.google.com',                     signInUrl: 'https://accounts.google.com/signin/v2/identifier',  authSuccessPattern: 'calendar.google.com',          isOAuth: true, hostAliases: ['calendar.google.com'],
+                   intentUrls: { scheduling: 'https://calendar.google.com/calendar/u/0/r' } },
   slack:          { startUrl: 'https://app.slack.com',                           signInUrl: 'https://slack.com/signin',                          authSuccessPattern: 'app.slack.com/client',         isOAuth: true  },
   discord:        { startUrl: 'https://discord.com/channels/@me',                signInUrl: 'https://discord.com/login',                         authSuccessPattern: 'discord.com/channels',         isOAuth: true  },
-  notion:         { startUrl: 'https://app.notion.com',                           signInUrl: 'https://www.notion.com/login',                       authSuccessPattern: 'app.notion.com',                    isOAuth: true, preferAgentBrowser: true, postAuthUrl: 'https://app.notion.com', usePersistentProfile: true, hostAliases: ['www.notion.so', 'www.notion.com', 'notion.so', 'notion.com', 'notion.new'], _metaRevision: 2  },
+  notion:         { startUrl: 'https://app.notion.com',                           signInUrl: 'https://www.notion.com/login',                       authSuccessPattern: 'app.notion.com',                    isOAuth: true, preferAgentBrowser: true, postAuthUrl: 'https://app.notion.com', usePersistentProfile: true, hostAliases: ['www.notion.so', 'www.notion.com', 'notion.so', 'notion.com', 'notion.new'], _metaRevision: 2,
+                   intentUrls: { content_create: 'https://notion.new' }  },
   figma:          { startUrl: 'https://www.figma.com',                           signInUrl: 'https://www.figma.com/login',                       authSuccessPattern: 'figma.com/files',              isOAuth: true  },
   linear:         { startUrl: 'https://linear.app',                              signInUrl: 'https://linear.app/login',                          authSuccessPattern: 'linear.app/',                  isOAuth: true  },
   jira:           { startUrl: 'https://id.atlassian.com',                        signInUrl: 'https://id.atlassian.com',                          authSuccessPattern: 'atlassian.net',                isOAuth: true  },
@@ -316,12 +325,15 @@ const KNOWN_BROWSER_SERVICES = {
   airtable:       { startUrl: 'https://airtable.com',                            signInUrl: 'https://airtable.com/login',                        authSuccessPattern: 'airtable.com/',                isOAuth: true  },
   hubspot:        { startUrl: 'https://app.hubspot.com',                         signInUrl: 'https://app.hubspot.com/login',                     authSuccessPattern: 'app.hubspot.com/',             isOAuth: true  },
   salesforce:     { startUrl: 'https://login.salesforce.com',                    signInUrl: 'https://login.salesforce.com',                      authSuccessPattern: 'lightning.force.com',          isOAuth: true  },
-  twitter:        { startUrl: 'https://twitter.com',                             signInUrl: 'https://twitter.com/i/flow/login',                  authSuccessPattern: 'twitter.com/home',             isOAuth: true, hostAliases: ['x.com'] },
+  twitter:        { startUrl: 'https://twitter.com',                             signInUrl: 'https://twitter.com/i/flow/login',                  authSuccessPattern: 'twitter.com/home',             isOAuth: true, hostAliases: ['x.com'],
+                   intentUrls: { social: 'https://x.com/compose/post', content_create: 'https://x.com/compose/post' } },
   facebook:       { startUrl: 'https://www.facebook.com',                        signInUrl: 'https://www.facebook.com/login',                    authSuccessPattern: 'facebook.com/',                isOAuth: true  },
   instagram:      { startUrl: 'https://www.instagram.com',                       signInUrl: 'https://www.instagram.com/accounts/login',          authSuccessPattern: 'instagram.com/',               isOAuth: true  },
-  linkedin:       { startUrl: 'https://www.linkedin.com',                        signInUrl: 'https://www.linkedin.com/login',                    authSuccessPattern: 'linkedin.com/feed',            isOAuth: true  },
+  linkedin:       { startUrl: 'https://www.linkedin.com',                        signInUrl: 'https://www.linkedin.com/login',                    authSuccessPattern: 'linkedin.com/feed',            isOAuth: true,
+                   intentUrls: { social: 'https://www.linkedin.com/feed/?shareActive=true', content_create: 'https://www.linkedin.com/post/new' } },
   // ── Email ───────────────────────────────────────────────────────────────────────────────────────────
-  outlook:        { startUrl: 'https://outlook.live.com',                        signInUrl: 'https://login.live.com',                            authSuccessPattern: 'outlook.live.com/mail',        isOAuth: true  },
+  outlook:        { startUrl: 'https://outlook.live.com',                        signInUrl: 'https://login.live.com',                            authSuccessPattern: 'outlook.live.com/mail',        isOAuth: true,
+                   intentUrls: { mail: 'https://outlook.live.com/mail/0/deeplink/compose' } },
   yahoo:          { startUrl: 'https://mail.yahoo.com',                          signInUrl: 'https://login.yahoo.com',                           authSuccessPattern: 'mail.yahoo.com',               isOAuth: true  },
   protonmail:     { startUrl: 'https://mail.proton.me',                          signInUrl: 'https://account.proton.me/login',                   authSuccessPattern: 'mail.proton.me',               isOAuth: true  },
   fastmail:       { startUrl: 'https://www.fastmail.com',                        signInUrl: 'https://www.fastmail.com/login/',                   authSuccessPattern: 'fastmail.com',                 isOAuth: true  },
@@ -329,17 +341,35 @@ const KNOWN_BROWSER_SERVICES = {
   // ── Social media ────────────────────────────────────────────────────────────────────────────────────
   tiktok:         { startUrl: 'https://www.tiktok.com',                          signInUrl: 'https://www.tiktok.com/login',                      authSuccessPattern: 'tiktok.com/foryou',            isOAuth: true  },
   pinterest:      { startUrl: 'https://www.pinterest.com',                       signInUrl: 'https://www.pinterest.com/login',                   authSuccessPattern: 'pinterest.com/',               isOAuth: true  },
-  reddit:         { startUrl: 'https://www.reddit.com',                          signInUrl: 'https://www.reddit.com/login',                      authSuccessPattern: 'reddit.com/',                  isOAuth: true  },
+  reddit:         { startUrl: 'https://www.reddit.com',                          signInUrl: 'https://www.reddit.com/login',                      authSuccessPattern: 'reddit.com/',                  isOAuth: true,
+                   intentUrls: {
+                     social: { buildUrl: (task) => { const m = task.match(/r\/([\w-]+)/i); return m ? `https://www.reddit.com/r/${m[1]}/submit` : 'https://www.reddit.com/submit'; } },
+                     content_create: { buildUrl: (task) => { const m = task.match(/r\/([\w-]+)/i); return m ? `https://www.reddit.com/r/${m[1]}/submit` : 'https://www.reddit.com/submit'; } },
+                     search: { buildUrl: (task, ctx) => `https://www.reddit.com/search/?q=${ctx.encodedQuery}` },
+                   } },
   snapchat:       { startUrl: 'https://accounts.snapchat.com',                   signInUrl: 'https://accounts.snapchat.com',                     authSuccessPattern: 'accounts.snapchat.com',        isOAuth: true  },
   mastodon:       { startUrl: 'https://mastodon.social',                         signInUrl: 'https://mastodon.social/auth/sign_in',              authSuccessPattern: 'mastodon.social/home',         isOAuth: true  },
   bluesky:        { startUrl: 'https://bsky.app',                                signInUrl: 'https://bsky.app/login',                            authSuccessPattern: 'bsky.app',                     isOAuth: true  },
   threads:        { startUrl: 'https://www.threads.net',                         signInUrl: 'https://www.threads.net/login',                     authSuccessPattern: 'threads.net',                  isOAuth: true  },
-  youtube:        { startUrl: 'https://www.youtube.com',                         signInUrl: 'https://accounts.google.com/signin/v2/identifier',  authSuccessPattern: 'youtube.com',                  isOAuth: false },
+  youtube:        { startUrl: 'https://www.youtube.com',                         signInUrl: 'https://accounts.google.com/signin/v2/identifier',  authSuccessPattern: 'youtube.com',                  isOAuth: false,
+                   intentUrls: {
+                     media_play: { buildUrl: (task) => { const m = task.match(/(?:play|watch|search)\s+(?:for\s+)?(.+)/i); return m ? `https://www.youtube.com/results?search_query=${encodeURIComponent(m[1].trim())}` : 'https://www.youtube.com'; } },
+                     content_create: 'https://studio.youtube.com/videos/upload',
+                     search: { buildUrl: (task, ctx) => `https://www.youtube.com/results?search_query=${ctx.encodedQuery}` },
+                   } },
   twitch:         { startUrl: 'https://www.twitch.tv',                           signInUrl: 'https://www.twitch.tv/login',                       authSuccessPattern: 'twitch.tv',                    isOAuth: true  },
   // ── Music streaming ──────────────────────────────────────────────────────────────────────────────────
-  spotify:        { startUrl: 'https://open.spotify.com',                        signInUrl: 'https://accounts.spotify.com/en/login',             authSuccessPattern: 'open.spotify.com/collection,open.spotify.com/playlist,open.spotify.com/album,open.spotify.com/artist',  isOAuth: true },
+  spotify:        { startUrl: 'https://open.spotify.com',                        signInUrl: 'https://accounts.spotify.com/en/login',             authSuccessPattern: 'open.spotify.com/collection,open.spotify.com/playlist,open.spotify.com/album,open.spotify.com/artist',  isOAuth: true,
+                   intentUrls: {
+                     media_play: 'https://open.spotify.com',
+                     content_create: { url: 'https://open.spotify.com/playlist/new', when: /\b(create|make|new)\b.*\bplaylist\b/i },
+                   } },
   // ── Developer tools ─────────────────────────────────────────────────────────────────────────────────
-  github:         { startUrl: 'https://github.com',                              signInUrl: 'https://github.com/login',                          authSuccessPattern: 'github.com/',                  isOAuth: true  },
+  github:         { startUrl: 'https://github.com',                              signInUrl: 'https://github.com/login',                          authSuccessPattern: 'github.com/',                  isOAuth: true,
+                   intentUrls: {
+                     content_create: { buildUrl: (task) => { const m = task.match(/(?:in|on)\s+([\w-]+\/[\w-]+)/i); return m ? `https://github.com/${m[1]}/issues/new` : null; } },
+                     search: { buildUrl: (task, ctx) => { const m = task.match(/(?:in|on)\s+([\w-]+\/[\w-]+)/i); return m ? `https://github.com/${m[1]}/issues?q=${ctx.encodedQuery}` : `https://github.com/search?q=${ctx.encodedQuery}`; } },
+                   } },
   gitlab:         { startUrl: 'https://gitlab.com',                              signInUrl: 'https://gitlab.com/users/sign_in',                  authSuccessPattern: 'gitlab.com/',                  isOAuth: true  },
   bitbucket:      { startUrl: 'https://bitbucket.org',                           signInUrl: 'https://id.atlassian.com',                          authSuccessPattern: 'bitbucket.org/',               isOAuth: true  },
   shortcut:       { startUrl: 'https://app.shortcut.com',                        signInUrl: 'https://app.shortcut.com/login',                    authSuccessPattern: 'app.shortcut.com/',            isOAuth: true  },
@@ -583,7 +613,8 @@ const KNOWN_BROWSER_SERVICES = {
   biblegateway:   { startUrl: 'https://www.biblegateway.com',                   authSuccessPattern: 'biblegateway.com',             isOAuth: false },
   duckduckgo:     { startUrl: 'https://duckduckgo.com',                         authSuccessPattern: 'duckduckgo.com',               isOAuth: false },
   bing:           { startUrl: 'https://www.bing.com',                           authSuccessPattern: 'bing.com',                     isOAuth: false },
-  medium:         { startUrl: 'https://medium.com',                             authSuccessPattern: 'medium.com',                   isOAuth: false },
+  medium:         { startUrl: 'https://medium.com',                             authSuccessPattern: 'medium.com',                   isOAuth: false,
+                   intentUrls: { content_create: 'https://medium.com/new-story' } },
   quora:          { startUrl: 'https://www.quora.com',                          authSuccessPattern: 'quora.com',                    isOAuth: false },
   hackernews:     { startUrl: 'https://news.ycombinator.com',                   authSuccessPattern: 'news.ycombinator.com',         isOAuth: false },
   arxiv:          { startUrl: 'https://arxiv.org',                              authSuccessPattern: 'arxiv.org',                    isOAuth: false },
@@ -592,7 +623,24 @@ const KNOWN_BROWSER_SERVICES = {
   craigslist:     { startUrl: 'https://www.craigslist.org',                     authSuccessPattern: 'craigslist.org',               isOAuth: false },
   zillow:         { startUrl: 'https://www.zillow.com',                         authSuccessPattern: 'zillow.com',                   isOAuth: false },
   weather:        { startUrl: 'https://weather.com',                            authSuccessPattern: 'weather.com',                  isOAuth: false },
-  googlemaps:     { startUrl: 'https://www.google.com/maps',                    authSuccessPattern: 'google.com/maps',              isOAuth: false },
+  googlemaps:     { startUrl: 'https://www.google.com/maps',                    authSuccessPattern: 'google.com/maps',              isOAuth: false,
+                   intentUrls: { maps: { buildUrl: (task, ctx) => ctx.dest ? `https://www.google.com/maps/search/${encodeURIComponent(ctx.dest)}` : null } } },
+  // ── Services referenced by intent templates but missing from registry ───────────────────────────────
+  applemaps:      { startUrl: 'https://maps.apple.com',                          authSuccessPattern: 'maps.apple.com',              isOAuth: false,
+                   intentUrls: { maps: { buildUrl: (task, ctx) => ctx.dest ? `https://maps.apple.com/?q=${encodeURIComponent(ctx.dest)}` : null } } },
+  calendly:       { startUrl: 'https://calendly.com',                           signInUrl: 'https://calendly.com/login',                       authSuccessPattern: 'calendly.com',                isOAuth: true,
+                   intentUrls: { scheduling: 'https://calendly.com/events/new' } },
+  youtubemusic:   { startUrl: 'https://music.youtube.com',                      authSuccessPattern: 'music.youtube.com',           isOAuth: false,
+                   intentUrls: { media_play: { buildUrl: (task) => { const m = task.match(/(?:play|search)\s+(?:for\s+)?(.+)/i); return m ? `https://music.youtube.com/search?q=${encodeURIComponent(m[1].trim())}` : 'https://music.youtube.com'; } } } },
+  applemusic:     { startUrl: 'https://music.apple.com',                        authSuccessPattern: 'music.apple.com',             isOAuth: false,
+                   intentUrls: { media_play: 'https://music.apple.com' } },
+  youtubekids:    { startUrl: 'https://www.youtubekids.com',                    authSuccessPattern: 'youtubekids.com',             isOAuth: false,
+                   intentUrls: { media_play: 'https://www.youtubekids.com' } },
+  w3schools:      { startUrl: 'https://www.w3schools.com',                      authSuccessPattern: 'w3schools.com',               isOAuth: false,
+                   intentUrls: {
+                     search: { buildUrl: (task, ctx) => `https://www.w3schools.com/search/search.asp?q=${ctx.encodedQuery}` },
+                     docs: '/',
+                   } },
 };
 
 function lookupBrowserService(service) {
@@ -3221,14 +3269,31 @@ async function _resolveTaskDeepLink(agentId, serviceKey, baseStartUrl, task, exi
       }
     }
 
+    // ── Helper: extract encoded search query from task text ────────────────
+    const _getEncodedQuery = (taskText, svcKey) => {
+      const _sq = _extractSearchQuery(taskText, svcKey);
+      if (_sq.hasCriteria) return encodeURIComponent(_sq.query);
+      const qMatch = taskText.match(/\b(?:search|find|look\s*up|google)\s+(?:for\s+)?(.+?)$/i);
+      return qMatch?.[1] ? encodeURIComponent(String(qMatch[1]).trim().replace(/[?.!]+$/g, '')) : '';
+    };
+
+    // ── Helper: resolve an intentUrls template entry to a URL (or null) ────
+    const _resolveIntentTemplate = (template, taskText, ctx) => {
+      if (!template) return null;
+      if (typeof template === 'string') return template;
+      if (template.when && !template.when.test(taskText)) return null;
+      if (template.buildUrl) return template.buildUrl(taskText, ctx);
+      if (template.url) return template.url;
+      return null;
+    };
+
+    // ── Generic intent URL builder (data-driven via KNOWN_BROWSER_SERVICES.intentUrls) ──
     const _buildIntentTemplateUrl = () => {
       const svc = String(serviceKey || '').toLowerCase().replace(/[^a-z0-9]/g, '');
       const startUrlBase = baseStartUrl.replace(/\/$/, '');
+      const svcEntry = lookupBrowserService(svc);
 
-      // ── CHAT / RESEARCH ──────────────────────────────────────────────────
-      // Chatbot services: go directly to chat interface URL. Without this,
-      // CHAT/RESEARCH intent falls through to discover_task_url (web search)
-      // which finds random public pages like claude.ai/public/artifacts/...
+      // 1. CHAT/RESEARCH — use SERVICE_CHAT_URLS (already data-driven)
       if (intent === INTENTS.CHAT || intent === INTENTS.RESEARCH) {
         const _chatUrl = SERVICE_CHAT_URLS[svc];
         if (_chatUrl) return _chatUrl;
@@ -3238,217 +3303,61 @@ async function _resolveTaskDeepLink(agentId, serviceKey, baseStartUrl, task, exi
         }
       }
 
-      // ── MAPS ─────────────────────────────────────────────────────────────
+      // 2. Read-only check — skip template for read-only tasks on write intents
+      const _WRITE_INTENTS = [INTENTS.MAIL, INTENTS.SOCIAL, INTENTS.CONTENT_CREATE, INTENTS.SCHEDULING, INTENTS.COMMERCE];
+      if (_WRITE_INTENTS.includes(intent) && _isReadOnlyTask(task, intent)) {
+        // Special case: MAIL read-only tries search-criteria URL first
+        if (intent === INTENTS.MAIL) {
+          const _searchUrl = _buildSearchCriteriaUrl(intent, serviceKey, baseStartUrl, baseHost, task);
+          if (_searchUrl) return _searchUrl;
+        }
+        return null; // let discovery pipeline run
+      }
+
+      // 3. MAPS — extract destination, then use intentUrls
       if (intent === INTENTS.MAPS) {
         const _destMatch = task.match(/(?:directions\s+to|navigate\s+to|find\s+nearby|locate(?:\s+a|\s+the)?|route\s+to)\s+(.+)/i);
         const _dest = _destMatch?.[1]?.trim().replace(/[?.!]+$/g, '');
-        if (_dest) {
-          if (svc === 'googlemaps' || baseHost === 'google.com' || baseStartUrl.includes('google.com/maps')) {
-            return `https://www.google.com/maps/search/${encodeURIComponent(_dest)}`;
-          }
-          if (svc === 'applemaps' || baseHost === 'apple.com') {
-            return `https://maps.apple.com/?q=${encodeURIComponent(_dest)}`;
-          }
-        }
-        if (svc === 'googlemaps' || baseStartUrl.includes('google.com/maps')) return baseStartUrl;
+        const _mapsCtx = { dest: _dest, task, encodedQuery: '' };
+        const _mapsResult = _resolveIntentTemplate(svcEntry?.intentUrls?.maps, task, _mapsCtx);
+        if (_mapsResult) return _mapsResult;
+        // Fallback: if no dest and service is googlemaps, use startUrl
+        if (!_dest && (svc === 'googlemaps' || baseStartUrl.includes('google.com/maps'))) return baseStartUrl;
+        return null;
       }
 
-      // ── MEDIA_PLAY ───────────────────────────────────────────────────────
-      // Play/stream music or video — go to the player/search URL, not the homepage.
-      if (intent === INTENTS.MEDIA_PLAY) {
-        if (svc === 'spotify') return 'https://open.spotify.com';
-        if (svc === 'youtube' || baseHost === 'youtube.com') {
-          const _playMatch = task.match(/(?:play|watch|search)\s+(?:for\s+)?(.+)/i);
-          if (_playMatch) return `https://www.youtube.com/results?search_query=${encodeURIComponent(_playMatch[1].trim())}`;
-          return 'https://www.youtube.com';
-        }
-        if (svc === 'youtubemusic' || baseHost === 'music.youtube.com') {
-          const _playMatch = task.match(/(?:play|search)\s+(?:for\s+)?(.+)/i);
-          if (_playMatch) return `https://music.youtube.com/search?q=${encodeURIComponent(_playMatch[1].trim())}`;
-          return 'https://music.youtube.com';
-        }
-        if (svc === 'applemusic' || baseHost === 'music.apple.com') return 'https://music.apple.com';
-        if (svc === 'youtubekids' || baseHost === 'youtubekids.com') return 'https://www.youtubekids.com';
-        // Generic: fall through to layer 2/3 for unknown media services
+      // 4. Per-service intentUrls lookup
+      if (svcEntry?.intentUrls) {
+        const _ctx = { task, encodedQuery: _getEncodedQuery(task, svc), dest: null };
+        const _result = _resolveIntentTemplate(svcEntry.intentUrls[intent], task, _ctx);
+        if (_result) return _result;
       }
 
-      // ── MAIL ──────────────────────────────────────────────────────────────
-      if (intent === INTENTS.MAIL) {
-        if (svc === 'gmail' || baseHost === 'mail.google.com') {
-          if (_isReadOnlyTask(task, intent)) {
-            // Read-only mail task: try to build a search URL from criteria
-            const _searchUrl = _buildSearchCriteriaUrl(intent, serviceKey, baseStartUrl, baseHost, task);
-            if (_searchUrl) return _searchUrl;
-            return null; // no criteria — let discovery pipeline find a search/filter URL
-          }
-          return 'https://mail.google.com/mail/u/0/#inbox?compose=new';
-        }
-        if (svc === 'outlook' || baseHost === 'outlook.live.com' || baseHost === 'outlook.office.com') {
-          if (_isReadOnlyTask(task, intent)) {
-            const _searchUrl = _buildSearchCriteriaUrl(intent, serviceKey, baseStartUrl, baseHost, task);
-            if (_searchUrl) return _searchUrl;
-            return null; // let discovery pipeline find a search/filter URL
-          }
-          return 'https://outlook.live.com/mail/0/deeplink/compose';
-        }
+      // 5. Generic path-based intents (settings, support, dashboard, console)
+      const _GENERIC_PATH_INTENTS = {
+        [INTENTS.SETTINGS]: '/settings',
+        [INTENTS.SUPPORT]: '/help',
+        [INTENTS.DASHBOARD]: '/dashboard',
+        [INTENTS.CONSOLE]: '/console',
+      };
+      if (_GENERIC_PATH_INTENTS[intent]) {
+        return `${startUrlBase}${_GENERIC_PATH_INTENTS[intent]}`;
       }
 
-      // ── SOCIAL (read-only check) ──────────────────────────────────────────
-      // "show me tweets from @user" is read-only — don't return compose URL.
-      if (intent === INTENTS.SOCIAL) {
-        if (_isReadOnlyTask(task, intent)) return null; // let discovery pipeline run
-        if (svc === 'twitter' || svc === 'x' || baseHost === 'x.com') {
-          return 'https://x.com/compose/post';
-        }
-        if (svc === 'linkedin' || baseHost === 'linkedin.com') {
-          return 'https://www.linkedin.com/feed/?shareActive=true';
-        }
-        if (svc === 'reddit' || baseHost === 'reddit.com') {
-          const subMatch = task.match(/r\/([\w-]+)/i);
-          if (subMatch) return `https://www.reddit.com/r/${subMatch[1]}/submit`;
-          return 'https://www.reddit.com/submit';
-        }
-      }
-
-      // ── CONTENT_CREATE (read-only check) ──────────────────────────────────
-      // "list my open issues" or "show my documents" is read-only — don't return create URL.
-      if (intent === INTENTS.CONTENT_CREATE) {
-        if (_isReadOnlyTask(task, intent)) return null; // let discovery pipeline run
-        if (svc === 'googledocs' || baseHost === 'docs.google.com') {
-          return 'https://docs.google.com/document/create';
-        }
-        if (svc === 'googlesheets' || baseHost === 'sheets.google.com') {
-          return 'https://docs.google.com/spreadsheets/create';
-        }
-        if (svc === 'github' || baseHost === 'github.com') {
-          const repoMatch = task.match(/(?:in|on)\s+([\w-]+\/[\w-]+)/i);
-          if (repoMatch) return `https://github.com/${repoMatch[1]}/issues/new`;
-          return null;
-        }
-        if (svc === 'twitter' || svc === 'x' || baseHost === 'x.com') {
-          return 'https://x.com/compose/post';
-        }
-        if (svc === 'reddit' || baseHost === 'reddit.com') {
-          const subMatch = task.match(/r\/([\w-]+)/i);
-          if (subMatch) return `https://www.reddit.com/r/${subMatch[1]}/submit`;
-          return 'https://www.reddit.com/submit';
-        }
-        if (svc === 'medium' || baseHost === 'medium.com') {
-          return 'https://medium.com/new-story';
-        }
-        if (svc === 'youtube' || baseHost === 'youtube.com' || baseHost === 'studio.youtube.com') {
-          return 'https://studio.youtube.com/videos/upload';
-        }
-        if (svc === 'linkedin' || baseHost === 'linkedin.com') {
-          return 'https://www.linkedin.com/post/new';
-        }
-        if (svc === 'notion' || baseHost === 'app.notion.com') {
-          return 'https://notion.new';
-        }
-      }
-
-      // ── SCHEDULING (read-only check) ──────────────────────────────────────
-      // "check my calendar" or "what's on my schedule" is read-only — don't return calendar URL.
-      if (intent === INTENTS.SCHEDULING) {
-        if (_isReadOnlyTask(task, intent)) return null; // let discovery pipeline run
-        if (svc === 'googlecalendar' || svc === 'calendar' || baseHost === 'calendar.google.com') {
-          return 'https://calendar.google.com/calendar/u/0/r';
-        }
-        if (svc === 'calendly' || baseHost === 'calendly.com') {
-          return 'https://calendly.com/events/new';
-        }
-      }
-
-      // ── COMMERCE (read-only check) ────────────────────────────────────────
-      // "show my orders" or "check my cart" is read-only — don't return checkout URL.
-      if (intent === INTENTS.COMMERCE) {
-        if (_isReadOnlyTask(task, intent)) return null; // let discovery pipeline run
-      }
-      if (intent === INTENTS.CONTENT_CREATE) {
-        if (svc === 'googledocs' || baseHost === 'docs.google.com') {
-          return 'https://docs.google.com/document/create';
-        }
-        if (svc === 'googlesheets' || baseHost === 'sheets.google.com') {
-          return 'https://docs.google.com/spreadsheets/create';
-        }
-        if (svc === 'github' || baseHost === 'github.com') {
-          const repoMatch = task.match(/(?:in|on)\s+([\w-]+\/[\w-]+)/i);
-          if (repoMatch) return `https://github.com/${repoMatch[1]}/issues/new`;
-          return null;
-        }
-        if (svc === 'twitter' || svc === 'x' || baseHost === 'x.com') {
-          return 'https://x.com/compose/post';
-        }
-        if (svc === 'reddit' || baseHost === 'reddit.com') {
-          const subMatch = task.match(/r\/([\w-]+)/i);
-          if (subMatch) return `https://www.reddit.com/r/${subMatch[1]}/submit`;
-          return 'https://www.reddit.com/submit';
-        }
-        if (svc === 'medium' || baseHost === 'medium.com') {
-          return 'https://medium.com/new-story';
-        }
-        if (svc === 'youtube' || baseHost === 'youtube.com' || baseHost === 'studio.youtube.com') {
-          return 'https://studio.youtube.com/videos/upload';
-        }
-        if (svc === 'linkedin' || baseHost === 'linkedin.com') {
-          return 'https://www.linkedin.com/post/new';
-        }
-        if (svc === 'notion' || baseHost === 'app.notion.com') {
-          return 'https://notion.new';
-        }
-      }
-
-      // ── SEARCH ────────────────────────────────────────────────────────────
-      if (intent === INTENTS.SEARCH || isSearchLike) {
-        // Try extracting structured search criteria first (e.g., "unread from X not from Y")
-        const _sq = _extractSearchQuery(task, svc);
-        const _sqEncoded = _sq.hasCriteria ? encodeURIComponent(_sq.query) : '';
-
-        // Fall back to raw query text
-        const qMatch = task.match(/\b(?:search|find|look\s*up|google)\s+(?:for\s+)?(.+?)$/i);
-        const q = _sqEncoded || (qMatch?.[1] ? encodeURIComponent(String(qMatch[1]).trim().replace(/[?.!]+$/g, '')) : '');
-        if (!q) return null;
-
-        // Known search URL patterns per service
-        if (baseHost === 'google.com') return `https://www.google.com/search?q=${q}`;
-        if (baseHost === 'youtube.com') return `https://www.youtube.com/results?search_query=${q}`;
-        if (baseHost === 'w3schools.com') return `https://www.w3schools.com/search/search.asp?q=${q}`;
-        if (svc === 'gmail' || baseHost === 'mail.google.com') return `https://mail.google.com/mail/u/0/#search/${q}`;
-        if (svc === 'github' || baseHost === 'github.com') {
-          const repoMatch = task.match(/(?:in|on)\s+([\w-]+\/[\w-]+)/i);
-          if (repoMatch) return `https://github.com/${repoMatch[1]}/issues?q=${q}`;
-          return `https://github.com/search?q=${q}`;
-        }
-        if (svc === 'reddit' || baseHost === 'reddit.com') return `https://www.reddit.com/search/?q=${q}`;
-        // Generic: if the service has a /search path, use it with ?q=
-        // (discovery pipeline will verify this exists)
-        return null; // let discovery pipeline find the search URL pattern
-      }
-
-      // ── SETTINGS ──────────────────────────────────────────────────────────
-      if (intent === INTENTS.SETTINGS) {
-        return `${startUrlBase}/settings`;
-      }
-
-      // ── SUPPORT ───────────────────────────────────────────────────────────
-      if (intent === INTENTS.SUPPORT) {
-        return `${startUrlBase}/help`;
-      }
-
-      // ── DASHBOARD ──────────────────────────────────────────────────────────
-      if (intent === INTENTS.DASHBOARD) {
-        return `${startUrlBase}/dashboard`;
-      }
-
-      // ── DOCS ──────────────────────────────────────────────────────────────
+      // 6. DOCS
       if (intent === INTENTS.DOCS) {
+        if (svcEntry?.intentUrls?.docs) return _resolveIntentTemplate(svcEntry.intentUrls.docs, task, {});
         if (baseHost === 'w3schools.com') return `${startUrlBase}/`;
         return `https://docs.${baseHost}`;
       }
 
-      // ── CONSOLE ────────────────────────────────────────────────────────────
-      if (intent === INTENTS.CONSOLE) {
-        return `${startUrlBase}/console`;
+      // 7. SEARCH — per-service handled in step 4; generic fallback to discovery
+      if (intent === INTENTS.SEARCH || isSearchLike) {
+        const _q = _getEncodedQuery(task, svc);
+        if (!_q) return null;
+        // Per-service search URL already handled in step 4 via intentUrls.search
+        // If we reach here, no per-service search template matched — let discovery find it
+        return null;
       }
 
       return null;
@@ -5468,6 +5377,33 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
     }
   }
 
+  // ── URL-first validation: reject non-app subdomains ────────────────────────
+  // If URL-first navigation landed on a blog/newsroom/support subdomain instead
+  // of the service's app domain, fall back to the canonical app domain. This
+  // prevents web search from sending the agent to newsroom.spotify.com when the
+  // task is to create a playlist on open.spotify.com.
+  if (_urlFirstNavigationSelected && _postEnforcementUrl) {
+    try {
+      const _postHost = new URL(_postEnforcementUrl).hostname.replace(/^www\./, '');
+      const _svcEntry = lookupBrowserService(_svcKey || '');
+      const _appDomain = _svcEntry?.start_url ? new URL(_svcEntry.start_url).hostname.replace(/^www\./, '') : null;
+      const _nonAppSubdomains = ['newsroom', 'blog', 'support', 'help', 'docs', 'developer', 'fortherecord', 'investor', 'press', 'news', 'community'];
+      const _subdomain = _postHost.split('.')[0].toLowerCase();
+      if (_appDomain && _postHost !== _appDomain && !_postHost.endsWith('.' + _appDomain) && _nonAppSubdomains.includes(_subdomain)) {
+        logger.warn(`[browser.agent] URL-first validation: ${_postHost} is a non-app subdomain — falling back to https://${_appDomain}`);
+        const _fallbackUrl = `https://${_appDomain}`;
+        try {
+          await callBrowserAct({ action: 'navigate', url: _fallbackUrl, sessionId, timeoutMs: 30000 }, 60000);
+          _postEnforcementUrl = _fallbackUrl;
+          startUrl = _fallbackUrl;
+          logger.info(`[browser.agent] URL-first validation: navigated to canonical app domain ${_fallbackUrl}`);
+        } catch (_navErr) {
+          logger.warn(`[browser.agent] URL-first validation: fallback navigation failed: ${_navErr.message}`);
+        }
+      }
+    } catch (_) {}
+  }
+
   // ── Proactive search-syntax discovery ───────────────────────────────────────
   // For search/filter/count-style tasks, discover the service's query operators
   // (e.g. Gmail's "is:unread") ahead of planning so the LLM can compose an
@@ -5521,7 +5457,7 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
   // the session goes blank (about:blank) — it must navigate back to startUrl, NOT
   // invent its own fallback destination (e.g. google.com search).
   const _recoveryAnchor = startUrl
-    ? `IMPORTANT: You are working on ${startUrl} (browser session: ${sessionId}). If the page ever shows about:blank, a blank page, or you lose the site, navigate back to ${startUrl} immediately — do NOT navigate to any other website as a fallback.`
+    ? `IMPORTANT: You are working on ${startUrl} (browser session: ${sessionId}). If the page ever shows about:blank, a blank page, a 404 / "Page not found" error, or you lose the site, navigate back to ${startUrl} immediately — do NOT navigate to any other website as a fallback.`
     : null;
   const _effectiveTask = _svcInfo?.preTaskGoal
     ? `${_svcInfo.preTaskGoal}\n\nTask: ${task}`
