@@ -362,7 +362,7 @@ const KNOWN_BROWSER_SERVICES = {
   spotify:        { startUrl: 'https://open.spotify.com',                        signInUrl: 'https://accounts.spotify.com/en/login',             authSuccessPattern: 'open.spotify.com/collection,open.spotify.com/playlist,open.spotify.com/album,open.spotify.com/artist',  isOAuth: true,
                    intentUrls: {
                      media_play: 'https://open.spotify.com',
-                     content_create: { url: 'https://open.spotify.com/playlist/new', when: /\b(create|make|new)\b.*\bplaylist\b/i },
+                     content_create: { url: 'https://open.spotify.com', when: /\b(create|make|new)\b.*\bplaylist\b/i },
                    } },
   // ── Developer tools ─────────────────────────────────────────────────────────────────────────────────
   github:         { startUrl: 'https://github.com',                              signInUrl: 'https://github.com/login',                          authSuccessPattern: 'github.com/',                  isOAuth: true,
@@ -2884,8 +2884,10 @@ async function verifyDeepLinkUrl(url, sessionId, expectedHost, timeoutMs = 15000
 }
 
 // HTTP helper to call another skill in this command-service process
-function callSkill(skillName, args, timeoutMs = 120000) {
+function callSkill(skillName, args, timeoutMs = 120000, signal) {
   return new Promise((resolve, reject) => {
+    // Fast-fail if already aborted (avoids opening a socket).
+    if (signal && signal.aborted) { reject(new Error('aborted')); return; }
     const body = JSON.stringify({ payload: { skill: skillName, args } });
     const req = http.request({
       hostname: '127.0.0.1',
@@ -2903,7 +2905,14 @@ function callSkill(skillName, args, timeoutMs = 120000) {
       });
     });
     req.on('timeout', () => { req.destroy(); reject(new Error(`skill(${skillName}) timeout`)); });
-    req.on('error', reject);
+    // AbortSignal: destroy the loopback socket when the caller cancels. This
+    // closes the inner command.automate request (browser.agent → playwright.agent)
+    // so the server-side loop stops too.
+    const onAbort = () => { req.destroy(new Error('aborted')); };
+    if (signal) signal.addEventListener('abort', onAbort, { once: true });
+    const cleanup = () => { if (signal) signal.removeEventListener('abort', onAbort); };
+    req.on('error', (err) => { cleanup(); reject(err); });
+    req.on('close', cleanup);
     req.write(body);
     req.end();
   });
@@ -3781,6 +3790,7 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
         overallTimeoutMs: 120000,
         _progressCallbackUrl,
         _stepIndex,
+        _abortSignal: args._abortSignal,
       });
       logger.info(`[browser.agent] run: planExtend result — ok=${_extendResult?.ok}, error=${_extendResult?.error || 'n/a'}`);
       return _extendResult;
@@ -6513,7 +6523,8 @@ When extracting page content with run-code, prioritize these selectors over gene
         authConfirmedAt: (_getCachedAuthCheck(agentId)?.ts ?? null),
         _progressCallbackUrl,
         _stepIndex,
-    }, 600000));
+        _abortSignal: args._abortSignal,
+    }, 600000, args._abortSignal));
 
     let agentResultText = String(agentResult?.result ?? agentResult?.stdout ?? '');
 
@@ -6757,7 +6768,8 @@ When extracting page content with run-code, prioritize these selectors over gene
               _progressCallbackUrl,
               _stepIndex,
               _loginWallRetried: true,  // prevent recursive retry
-            }, 600000));
+              _abortSignal: args._abortSignal,
+            }, 600000, args._abortSignal));
             return {
               ok: _retryResult?.ok ?? false,
               agentId,
@@ -7090,6 +7102,12 @@ When extracting page content with run-code, prioritize these selectors over gene
 
     return _runResult;
   } catch (err) {
+    // If the user cancelled, surface a clean cancelled result instead of a
+    // generic delegation-failure error (which would trigger LLM recovery).
+    if (args._abortSignal?.aborted || /aborted/i.test(err.message || '')) {
+      logger.info(`[browser.agent] run: cancelled by user for ${agentId}`);
+      return { ok: false, agentId, task, error: 'Cancelled by user', cancelled: true };
+    }
     return { ok: false, agentId, task, error: `playwright.agent delegation failed: ${err.message}` };
   }
 }
@@ -8002,7 +8020,7 @@ const BROWSER_CATEGORY_SCHEMAS = {
 // ---------------------------------------------------------------------------
 
 // Capture Playwright screenshot + run LiteParse → text items with bounding boxes
-async function _liteparseCapture(page) {
+async function _liteparseCapture(page, options = {}) {
   if (!LIT_AVAILABLE) {
     const _ok = await ensureLitAvailable();
     if (!_ok) return { ok: false, error: 'LiteParse CLI not available' };
@@ -8010,7 +8028,14 @@ async function _liteparseCapture(page) {
 
   const _screenshotPath = path.join(os.tmpdir(), `playwright_${Date.now()}.png`);
   try {
-    await page.screenshot({ path: _screenshotPath, fullPage: false });
+    // Support optional clipping region (for Tier 1.8 visual discovery — examining
+    // just an opened menu instead of the full page). `clip` follows Playwright's
+    // screenshot clip shape: { x, y, width, height } in CSS pixels.
+    const _shotOpts = { path: _screenshotPath, fullPage: false };
+    if (options && options.clip && typeof options.clip === 'object') {
+      _shotOpts.clip = options.clip;
+    }
+    await page.screenshot(_shotOpts);
   } catch (e) {
     return { ok: false, error: `screenshot failed: ${e.message}` };
   }

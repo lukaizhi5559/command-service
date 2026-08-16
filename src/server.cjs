@@ -26,6 +26,45 @@ process.on('unhandledRejection', (reason) => {
   logger.warn(`[server] unhandledRejection (suppressed): ${reason}`);
 });
 
+// ── Active automation controller registry ──────────────────────────────────
+// Every /command.automate request registers its AbortController here so the
+// /automation.cancel endpoint can abort all in-flight runs at once. Controllers
+// are removed on completion/error/close to avoid unbounded growth.
+const activeAutomationControllers = new Set();
+
+// ── Forceful playwright-cli + Chrome cleanup ───────────────────────────────
+// Mirrors cleanupStalePlaywrightSessions() (startup) so the /automation.cancel
+// endpoint can forcibly kill the playwright-cli daemon + Chrome processes that
+// keep running after a graceful abort. Returns a summary of what was killed.
+function forceKillPlaywright() {
+  const { spawnSync } = require('child_process');
+  const { findCli } = require('./skills/browser.act.cjs');
+  let cli = null;
+  try { cli = findCli(); } catch (_) { cli = null; }
+  const summary = { closeAll: false, killAll: false, chromeKilled: 0 };
+  if (cli) {
+    try {
+      const closeAll = spawnSync(cli, ['close-all'], { timeout: 10000, encoding: 'utf8' });
+      summary.closeAll = closeAll.status === 0;
+      if (summary.closeAll) logger.info('[automation.cancel] playwright-cli close-all ✓');
+    } catch (e) { logger.warn(`[automation.cancel] close-all failed (non-fatal): ${e.message}`); }
+    try {
+      const killAll = spawnSync(cli, ['kill-all'], { timeout: 10000, encoding: 'utf8' });
+      summary.killAll = killAll.status === 0;
+      if (summary.killAll) logger.info('[automation.cancel] playwright-cli kill-all ✓');
+    } catch (e) { logger.warn(`[automation.cancel] kill-all failed (non-fatal): ${e.message}`); }
+  }
+  // Kill orphaned Chrome processes using ThinkDrop browser profiles. Scoped to
+  // user-data-dir=...thinkdrop/browser-profiles so the user's personal Chrome
+  // is never touched (same pattern as startup cleanup at line ~1474).
+  try {
+    const pkillRes = spawnSync('pkill', ['-f', 'Google Chrome.*user-data-dir=.*\\.thinkdrop/browser-profiles'], { timeout: 5000, encoding: 'utf8' });
+    summary.chromeKilled = pkillRes.status === 0 ? 1 : 0;
+    if (summary.chromeKilled) logger.info('[automation.cancel] killed orphaned Chrome browser-profile processes ✓');
+  } catch (e) { logger.warn(`[automation.cancel] pkill Chrome failed (non-fatal): ${e.message}`); }
+  return summary;
+}
+
 // Shared infrastructure for skills — intelligence + storage
 // Any skill can require these directly:
 //   const { ask } = require('../skill-llm.cjs');
@@ -120,10 +159,10 @@ class CommandServiceMCPServer {
         return await this._skillCliAgent(args);
 
       case 'browser.agent':
-        return await this._skillBrowserAgent(args);
+        return await this._skillBrowserAgent(args, opts);
 
       case 'playwright.agent':
-        return await this._skillPlaywrightAgent(args);
+        return await this._skillPlaywrightAgent(args, opts);
 
       case 'creator.agent':
         return await this._skillCreatorAgent(args);
@@ -227,7 +266,11 @@ class CommandServiceMCPServer {
     return await cliAgent(args);
   }
 
-  async _skillBrowserAgent(args) {
+  async _skillBrowserAgent(args, opts = {}) {
+    // Thread the server-side AbortSignal (tied to the HTTP socket lifecycle)
+    // into the skill so long-running browser.agent runs stop when the caller
+    // cancels. The skill reads args._abortSignal and checks it in its loops.
+    if (opts.signal) args = { ...args, _abortSignal: opts.signal };
     return await browserAgent(args);
   }
 
@@ -263,7 +306,10 @@ class CommandServiceMCPServer {
     return await userAgent(args);
   }
 
-  async _skillPlaywrightAgent(args) {
+  async _skillPlaywrightAgent(args, opts = {}) {
+    // Thread the server-side AbortSignal into the skill so the turn-loop can
+    // break out cleanly when the caller cancels.
+    if (opts.signal) args = { ...args, _abortSignal: opts.signal };
     return await playwrightAgent(args);
   }
 
@@ -929,6 +975,10 @@ class CommandServiceMCPServer {
         // (end-of-stream), even though the HTTP connection is still alive.
         if (req.socket) req.socket.on('close', onClose);
         req.on('aborted', onClose);
+        // Register this controller so /automation.cancel can abort it. Removed
+        // on completion/error/close to avoid unbounded growth.
+        activeAutomationControllers.add(controller);
+        const _unregister = () => activeAutomationControllers.delete(controller);
         req.on('end', async () => {
           try {
             const { payload } = JSON.parse(body);
@@ -956,6 +1006,42 @@ class CommandServiceMCPServer {
             logger.error(`[server] command.automate failed: ${err.stack || err.message}`, payloadContext);
             res.writeHead(200);
             res.end(JSON.stringify({ success: true, data: { ok: false, error: err.message } }));
+          } finally {
+            _unregister();
+          }
+        });
+        // Also unregister if the socket closes before 'end' fires.
+        if (req.socket) req.socket.on('close', _unregister);
+        return;
+      }
+
+      // ── POST /automation.cancel ─────────────────────────────────────────────
+      // Called by main.js when the user clicks Cancel. Aborts every in-flight
+      // command.automate run (graceful signal propagation) AND force-kills the
+      // playwright-cli daemon + Chrome processes so the browser actually stops.
+      // This is the belt-and-suspenders fallback when graceful signal threading
+      // races or the playwright agent is mid-action.
+      if (req.method === 'POST' && req.url === '/automation.cancel') {
+        let body = '';
+        req.on('data', chunk => { body += chunk; });
+        req.on('end', () => {
+          try {
+            const abortedCount = activeAutomationControllers.size;
+            logger.info(`[automation.cancel] Aborting ${abortedCount} active automation run(s)`);
+            for (const ctrl of activeAutomationControllers) {
+              try { ctrl.abort(); } catch (_) {}
+            }
+            activeAutomationControllers.clear();
+            // Forceful cleanup: kill playwright-cli daemons + Chrome processes
+            // using ThinkDrop browser profiles (same pattern as startup cleanup).
+            try { forceKillPlaywright(); }
+            catch (fkErr) { logger.warn(`[automation.cancel] forceKillPlaywright error (non-fatal): ${fkErr.message}`); }
+            res.writeHead(200);
+            res.end(JSON.stringify({ ok: true, aborted: abortedCount }));
+          } catch (err) {
+            logger.error(`[automation.cancel] failed: ${err.message}`);
+            res.writeHead(500);
+            res.end(JSON.stringify({ ok: false, error: err.message }));
           }
         });
         return;
@@ -1459,20 +1545,8 @@ async function seedOAuthCredentials() {
 // No browser sessions should survive an app restart.
 // ---------------------------------------------------------------------------
 function cleanupStalePlaywrightSessions() {
-  const { spawnSync } = require('child_process');
-  const { findCli } = require('./skills/browser.act.cjs');
   try {
-    const cli = findCli();
-    const closeAll = spawnSync(cli, ['close-all'], { timeout: 10000, encoding: 'utf8' });
-    if (closeAll.status === 0) logger.info('[startup] playwright-cli close-all ✓');
-    const killAll = spawnSync(cli, ['kill-all'], { timeout: 10000, encoding: 'utf8' });
-    if (killAll.status === 0) logger.info('[startup] playwright-cli kill-all ✓');
-    // Kill orphaned Chrome processes that used ThinkDrop browser profiles.
-    // close-all/kill-all only kills playwright-cli daemons, not the Chrome
-    // instances they spawned. On macOS, a running Chrome from any profile
-    // intercepts new launchPersistentContext calls and causes "Failed to launch".
-    const pkillRes = spawnSync('pkill', ['-f', 'Google Chrome.*user-data-dir=.*\\.thinkdrop/browser-profiles'], { timeout: 5000, encoding: 'utf8' });
-    if (pkillRes.status === 0) logger.info('[startup] killed orphaned Chrome browser-profile processes ✓');
+    forceKillPlaywright();
   } catch (err) {
     logger.warn('[startup] playwright-cli session cleanup failed (non-fatal)', { error: err.message });
   }

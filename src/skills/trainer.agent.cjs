@@ -954,6 +954,11 @@ function _processEvent(session, evt, tabIndex) {
   const uiStep = _eventToUIStep(evt);
   logger.info(`[trainer.agent] push event: type=${evt.type} tab=${evt.tabIndex} uiStep=${!!uiStep}`);
   if (uiStep) _postProgress(agentId, { type: 'training:step-recorded', ...uiStep });
+
+  // ── Guided training: match event to current step ──────────────────────
+  if (session.guidedPlan && session.guidedCursor !== undefined) {
+    _tryMatchGuidedStep(session, evt);
+  }
 }
 
 // DEAD CODE PRESERVED FOR REFERENCE — replaced by _setupExposeFunction
@@ -2425,6 +2430,510 @@ ${JSON.stringify(keyboardActions, null, 2)}`;
 }
 
 // ---------------------------------------------------------------------------
+// Guided plan-first training — LLM generates a step plan, user does each step
+// manually while CDP recorder watches and marks each step learned (brain→check),
+// then auto-saves a URL-first recipe (per step: destination URL + DOM interactions).
+// ---------------------------------------------------------------------------
+
+// Generate a step-by-step plan from the user's task via LLM.
+// Returns: { ok, plan: [{ step, description, expectedType, expectedText?, expectedUrl? }] }
+async function generateGuidedPlan(task, agentId, startUrl) {
+  if (!task) return { ok: false, error: 'task is required' };
+
+  const prompt = `You are a browser automation training planner. Given a user's task and the starting URL of a web service, break the task into a sequence of MANUAL steps that the user will perform one at a time while the system watches and learns.
+
+TASK: ${task}
+AGENT: ${agentId}
+START URL: ${startUrl}
+
+Output ONLY valid JSON (no markdown fences) with this shape:
+{
+  "plan": [
+    {
+      "step": 1,
+      "description": "<short imperative instruction for the user, e.g. 'Create a new playlist named Christian Music'>",
+      "expectedType": "navigate|click|fill|submit|select|check",
+      "expectedText": "<text the user will click or field label they will fill — used for fuzzy matching recorded events>",
+      "expectedUrl": "<URL fragment or path the user will land on after this step, if known — used to match navigate events>"
+    }
+  ]
+}
+
+Rules:
+- Each step is ONE meaningful user action (click a button, fill a field, submit a form).
+- Do NOT include "navigate to start URL" as a step — the system does that automatically.
+- For "create a playlist named X and add artists A, B, C", produce: step 1 = create playlist (fill name + click create), steps 2-4 = search each artist + click "Add to playlist".
+- expectedType is the DOM event type the system should watch for to confirm this step: "click" for button clicks, "fill" for text input, "submit" for form submit, "navigate" for page changes, "select" for dropdowns, "check" for checkboxes.
+- expectedText is the visible text of the element the user will interact with (button label, field placeholder, link text). Used for fuzzy matching.
+- expectedUrl is optional — only set when the step lands on a distinct URL (e.g. /search, /playlists). Leave empty if the step happens on the same page as the previous step.
+- Keep descriptions short and actionable — the user reads them one at a time.
+- 1-8 steps max. If the task is genuinely one action, output a single-step plan.`;
+
+  try {
+    const raw = await askWithMessages([
+      { role: 'system', content: 'You are a browser automation training planner. Output ONLY valid JSON.' },
+      { role: 'user', content: prompt },
+    ], { maxTokens: 1200, temperature: 0.1, responseTimeoutMs: 20000 });
+
+    let json = (raw || '').trim();
+    json = json.replace(/^```(?:json)?\s*\n?/i, '').replace(/\n?```\s*$/, '');
+    const parsed = JSON.parse(json);
+    if (!parsed.plan || !Array.isArray(parsed.plan) || parsed.plan.length === 0) {
+      return { ok: false, error: 'LLM returned no plan array' };
+    }
+    // Normalize: ensure step numbers are sequential
+    parsed.plan = parsed.plan.map((p, i) => ({ ...p, step: i + 1 }));
+    return { ok: true, plan: parsed.plan };
+  } catch (err) {
+    logger.warn(`[trainer.agent] generateGuidedPlan failed: ${err.message}`);
+    return { ok: false, error: err.message };
+  }
+}
+
+// Start guided training: navigate to start URL, inject recorder, emit first step.
+async function actionGuidedTrain(args) {
+  const { agentId, task, plan, startUrl: startUrlOverride = null } = args || {};
+
+  if (!agentId) return { ok: false, error: 'agentId is required' };
+  if (!task) return { ok: false, error: 'task is required' };
+  if (!plan || !Array.isArray(plan) || plan.length === 0) return { ok: false, error: 'plan is required (array of steps)' };
+  if (activeSessions.has(agentId)) return { ok: false, error: 'Training already in progress' };
+
+  const agentFile = agentId.endsWith('.agent') ? `${agentId}.md` : `${agentId}.agent.md`;
+  const agentPath = path.join(AGENTS_DIR, agentFile);
+
+  let descriptor = '';
+  if (fs.existsSync(agentPath)) {
+    descriptor = fs.readFileSync(agentPath, 'utf8');
+  } else {
+    // HTTP fallback (same as actionTrain)
+    try {
+      const CMD_PORT = parseInt(process.env.COMMAND_SERVICE_PORT || '3007', 10);
+      const listResult = await new Promise((resolve, reject) => {
+        const body = JSON.stringify({});
+        const req = http.request(
+          { hostname: '127.0.0.1', port: CMD_PORT, path: '/agents.list', method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) } },
+          (res) => {
+            let d = '';
+            res.on('data', c => { d += c; });
+            res.on('end', () => { try { resolve(JSON.parse(d)); } catch { resolve(null); } });
+          }
+        );
+        req.on('error', reject);
+        req.write(body); req.end();
+      });
+      const agents = listResult?.agents || [];
+      const _norm = id => (id || '').replace(/\.agent$/, '').toLowerCase().trim();
+      const match = agents.find(a => _norm(a.id) === _norm(agentId) || a.id === agentId);
+      if (match?.descriptor) descriptor = match.descriptor;
+    } catch (httpErr) {
+      logger.warn(`[trainer.agent] guided train HTTP fallback failed: ${httpErr.message}`);
+    }
+    if (!descriptor) return { ok: false, error: `Agent not found: ${agentId}` };
+  }
+
+  const startUrlMatch = descriptor.match(/^start_url:\s*(.+)$/m);
+  if (!startUrlMatch) return { ok: false, error: 'Agent missing start_url' };
+  const descriptorStartUrl = startUrlMatch[1].trim();
+  const effectiveStartUrl = startUrlOverride || descriptorStartUrl;
+  const hostname = new URL(descriptorStartUrl).hostname.replace(/^www\./, '');
+
+  const sessionId = `${agentId}_guided`;
+  const session = {
+    agentId, hostname, startUrl: effectiveStartUrl, sessionId,
+    rawEvents: [],
+    startTime: Date.now(),
+    pollInterval: null,
+    cancelRequested: false,
+    injectedTabs: new Set(),
+    httpServer: null,
+    httpPort: null,
+    trainMode: 'guided',
+    trainTask: task,
+    isHereMode: false,
+    ownsSession: true,
+    // Guided training fields
+    guidedPlan: plan,
+    guidedCursor: 0,
+    guidedMatchedEvents: [], // per-step: [{ step, events: [evt, ...], destinationUrl }]
+    guidedStepStartTime: Date.now(),
+  };
+  // Initialize matched-events slots
+  for (let i = 0; i < plan.length; i++) {
+    session.guidedMatchedEvents.push({ step: i + 1, events: [], destinationUrl: null });
+  }
+  activeSessions.set(agentId, session);
+
+  logger.info(`[trainer.agent] Starting guided training for ${agentId}: ${plan.length} steps, task="${task.slice(0, 80)}"`);
+
+  try {
+    const { browserAct } = require('./browser.act.cjs');
+    _postProgress(agentId, { type: 'training:start', hostname, startUrl: effectiveStartUrl, mode: 'guided', plan });
+
+    await _startEventHttpServer(session);
+    logger.info(`[trainer.agent] Guided event HTTP server ready on port ${session.httpPort}`);
+
+    // Navigate to start URL
+    await browserAct({ action: 'navigate', url: effectiveStartUrl, sessionId, headed: true, timeoutMs: 30000 });
+    await browserAct({ action: 'waitForStableText', sessionId, headed: true, timeoutMs: 8000 }).catch(() => {});
+    await _injectRecorderScript(session, 0);
+    _startTabWatcher(session);
+
+    // Emit first guided step to UI (brain icon = not yet learned)
+    const firstStep = plan[0];
+    _postProgress(agentId, {
+      type: 'training:guided-step',
+      stepIndex: 0,
+      totalSteps: plan.length,
+      description: firstStep.description,
+      expectedType: firstStep.expectedType,
+      expectedText: firstStep.expectedText || null,
+      expectedUrl: firstStep.expectedUrl || null,
+      brainIcon: true,
+    });
+    logger.info(`[trainer.agent] Guided step 1/${plan.length}: "${firstStep.description}"`);
+
+    return { ok: true, agentId, message: `Guided training started (${plan.length} steps).` };
+  } catch (err) {
+    logger.error(`[trainer.agent] Guided train start failed: ${err.message}`);
+    activeSessions.delete(agentId);
+    return { ok: false, error: err.message };
+  }
+}
+
+// Try to match an incoming event to the current guided step.
+// On match: record event, advance cursor, emit step-learned + next step.
+function _tryMatchGuidedStep(session, evt) {
+  const cursor = session.guidedCursor;
+  const plan = session.guidedPlan;
+  if (cursor >= plan.length) return; // all steps done
+
+  const currentStep = plan[cursor];
+  const matchedSlot = session.guidedMatchedEvents[cursor];
+
+  // Always record the event into the current step's event list (for recipe building)
+  matchedSlot.events.push(evt);
+
+  // Track the latest navigate URL as the step's destination URL
+  if (evt.type === 'navigate' && evt.url) {
+    matchedSlot.destinationUrl = evt.url;
+  }
+
+  // Match logic: does this event satisfy the current step's expectedType + expectedText?
+  let matched = false;
+  const expectedType = (currentStep.expectedType || '').toLowerCase();
+  const expectedText = (currentStep.expectedText || '').toLowerCase();
+  const expectedUrl = (currentStep.expectedUrl || '').toLowerCase();
+
+  if (expectedType === evt.type) {
+    // Type matches — check text/URL if provided
+    if (expectedType === 'navigate') {
+      // For navigate steps: match if expectedUrl is empty OR the event URL contains expectedUrl
+      if (!expectedUrl || evt.url?.toLowerCase().includes(expectedUrl)) {
+        matched = true;
+      }
+    } else if (expectedType === 'fill' || expectedType === 'submit' || expectedType === 'select' || expectedType === 'check') {
+      // For fill/submit/select/check: match on type (text matching is unreliable for inputs)
+      matched = true;
+    } else if (expectedType === 'click') {
+      // For click: fuzzy match on elementText or selector containing expectedText
+      const elText = (evt.elementText || '').toLowerCase();
+      const sel = (evt.selector || '').toLowerCase();
+      if (!expectedText || elText.includes(expectedText) || sel.includes(expectedText.replace(/\s+/g, ''))) {
+        matched = true;
+      }
+    } else {
+      // Other types: type match is enough
+      matched = true;
+    }
+  }
+
+  if (!matched) return;
+
+  // Step matched — mark learned, advance cursor
+  logger.info(`[trainer.agent] Guided step ${cursor + 1}/${plan.length} matched (type=${evt.type}) — marking learned`);
+  _postProgress(session.agentId, {
+    type: 'training:step-learned',
+    stepIndex: cursor,
+    totalSteps: plan.length,
+    description: currentStep.description,
+    matchedEventType: evt.type,
+  });
+
+  session.guidedCursor = cursor + 1;
+
+  // All steps done? Auto-save.
+  if (session.guidedCursor >= plan.length) {
+    logger.info(`[trainer.agent] All ${plan.length} guided steps learned — auto-saving recipe`);
+    _postProgress(session.agentId, {
+      type: 'training:guided-complete',
+      totalSteps: plan.length,
+      message: 'All steps learned! Saving recipe...',
+    });
+    // Derive skill name from task
+    const _skillName = _deriveGuidedSkillName(session.agentId, session.trainTask);
+    // Auto-save (async, don't block event processing)
+    actionSaveGuidedTraining({ agentId: session.agentId, skillName: _skillName })
+      .catch(err => logger.error(`[trainer.agent] Guided auto-save failed: ${err.message}`));
+    return;
+  }
+
+  // Emit next step to UI
+  const nextStep = plan[session.guidedCursor];
+  session.guidedStepStartTime = Date.now();
+  _postProgress(session.agentId, {
+    type: 'training:guided-step',
+    stepIndex: session.guidedCursor,
+    totalSteps: plan.length,
+    description: nextStep.description,
+    expectedType: nextStep.expectedType,
+    expectedText: nextStep.expectedText || null,
+    expectedUrl: nextStep.expectedUrl || null,
+    brainIcon: true,
+  });
+  logger.info(`[trainer.agent] Guided step ${session.guidedCursor + 1}/${plan.length}: "${nextStep.description}"`);
+}
+
+// Skip the current guided step (user did it but auto-detection missed).
+function actionGuidedSkipStep(args) {
+  const { agentId } = args || {};
+  const session = activeSessions.get(agentId);
+  if (!session || !session.guidedPlan) return { ok: false, error: 'No active guided training session' };
+  if (session.guidedCursor >= session.guidedPlan.length) return { ok: false, error: 'All steps already complete' };
+
+  const cursor = session.guidedCursor;
+  const currentStep = session.guidedPlan[cursor];
+  logger.info(`[trainer.agent] Guided step ${cursor + 1} skipped by user`);
+
+  // Use the last recorded navigate URL as destination if available
+  const matchedSlot = session.guidedMatchedEvents[cursor];
+  if (!matchedSlot.destinationUrl) {
+    const lastNav = session.rawEvents.filter(e => e.type === 'navigate').pop();
+    if (lastNav) matchedSlot.destinationUrl = lastNav.url;
+  }
+
+  _postProgress(agentId, {
+    type: 'training:step-learned',
+    stepIndex: cursor,
+    totalSteps: session.guidedPlan.length,
+    description: currentStep.description,
+    matchedEventType: 'skip',
+  });
+
+  session.guidedCursor = cursor + 1;
+
+  if (session.guidedCursor >= session.guidedPlan.length) {
+    logger.info(`[trainer.agent] All guided steps complete (after skip) — auto-saving recipe`);
+    _postProgress(agentId, {
+      type: 'training:guided-complete',
+      totalSteps: session.guidedPlan.length,
+      message: 'All steps learned! Saving recipe...',
+    });
+    const _skillName = _deriveGuidedSkillName(agentId, session.trainTask);
+    actionSaveGuidedTraining({ agentId, skillName: _skillName })
+      .catch(err => logger.error(`[trainer.agent] Guided auto-save failed: ${err.message}`));
+    return { ok: true, skipped: true, allComplete: true };
+  }
+
+  const nextStep = session.guidedPlan[session.guidedCursor];
+  _postProgress(agentId, {
+    type: 'training:guided-step',
+    stepIndex: session.guidedCursor,
+    totalSteps: session.guidedPlan.length,
+    description: nextStep.description,
+    expectedType: nextStep.expectedType,
+    expectedText: nextStep.expectedText || null,
+    expectedUrl: nextStep.expectedUrl || null,
+    brainIcon: true,
+  });
+  return { ok: true, skipped: true };
+}
+
+// Derive a dot-separated skill name from the task text.
+function _deriveGuidedSkillName(agentId, task) {
+  const _agentIdClean = _skillDirId(agentId);
+  const _intentName = (task || 'trained')
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, '')
+    .trim()
+    .split(/\s+/)
+    .slice(0, 4)
+    .join('.');
+  return `${_agentIdClean}.${_intentName || 'trained'}`;
+}
+
+// Save guided training as a URL-first recipe.
+// Per step: record ONLY the destination URL (last navigate before the step's key
+// interaction) + the DOM interactions on that page. Discard intermediate navigations.
+async function actionSaveGuidedTraining(args) {
+  const { agentId, skillName } = args || {};
+  if (!agentId) return { ok: false, error: 'agentId is required' };
+  if (!skillName) return { ok: false, error: 'skillName is required' };
+
+  // Validate dot-name format
+  if (!/^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)+$/.test(skillName)) {
+    return { ok: false, error: 'Skill name must be dot-separated (e.g. spotify.create.playlist)' };
+  }
+
+  const session = activeSessions.get(agentId);
+  if (!session) return { ok: false, error: 'No active training session' };
+  if (!session.guidedPlan) return { ok: false, error: 'Not a guided training session' };
+
+  // Stop polling
+  if (session.pollInterval) clearInterval(session.pollInterval);
+  session.cancelRequested = true;
+
+  _postProgress(agentId, { type: 'training:saving', message: 'Building URL-first recipe...' });
+
+  try {
+    // Build URL-first recipe from guided matched events
+    const recipe = _buildGuidedRecipe(session, skillName);
+
+    // Save recipe file
+    const skillDir = path.join(SKILLS_DIR, _skillDirId(agentId));
+    if (!fs.existsSync(skillDir)) fs.mkdirSync(skillDir, { recursive: true });
+    const recipePath = path.join(skillDir, `${skillName}.recipe.json`);
+    fs.writeFileSync(recipePath, JSON.stringify(recipe, null, 2), 'utf8');
+
+    // Register in agent descriptor
+    _registerSkillInAgent(agentId, skillName, recipe);
+
+    // Clean up session
+    if (session.httpServer) {
+      session.httpServer.close(() => {
+        logger.info(`[trainer.agent] Guided event HTTP server closed (port ${session.httpPort})`);
+      });
+    }
+    if (session.ownsSession !== false) {
+      const { browserAct } = require('./browser.act.cjs');
+      browserAct({ action: 'close', sessionId: session.sessionId }).catch(() => {});
+    }
+    activeSessions.delete(agentId);
+
+    logger.info(`[trainer.agent] Guided recipe saved: ${recipePath} (${recipe.waypoints.length} waypoints)`);
+    _postProgress(agentId, {
+      type: 'training:saved',
+      skillName,
+      recipePath,
+      waypointCount: recipe.waypoints.length,
+      message: `Skill "${skillName}" saved with ${recipe.waypoints.length} waypoints.`,
+    });
+
+    return { ok: true, skillName, recipePath, recipe };
+  } catch (err) {
+    logger.error(`[trainer.agent] Guided save failed: ${err.message}`);
+    _postProgress(agentId, { type: 'training:error', message: err.message });
+    return { ok: false, error: err.message };
+  }
+}
+
+// Build a URL-first recipe from guided matched events.
+// Per step: ONE navigate waypoint (destination URL) + DOM interaction waypoints.
+// Intermediate navigations within a step are discarded.
+function _buildGuidedRecipe(session, skillName) {
+  const { agentId, startUrl, guidedPlan, guidedMatchedEvents, trainTask } = session;
+  const waypoints = [];
+  let stepNum = 0;
+
+  for (let i = 0; i < guidedPlan.length; i++) {
+    const planStep = guidedPlan[i];
+    const matched = guidedMatchedEvents[i];
+    if (!matched || !matched.events || matched.events.length === 0) {
+      logger.warn(`[trainer.agent] Guided recipe: step ${i + 1} has no matched events — skipping`);
+      continue;
+    }
+
+    // Find the destination URL: the LAST navigate event in this step's events
+    // (the URL where the key interaction happened). If no navigate in this step,
+    // carry forward the previous step's destination URL.
+    const navEvents = matched.events.filter(e => e.type === 'navigate' && e.url && e.url !== 'about:blank');
+    const destUrl = navEvents.length > 0 ? navEvents[navEvents.length - 1].url : (waypoints.length > 0 ? null : startUrl);
+
+    if (destUrl) {
+      stepNum++;
+      waypoints.push({
+        step: stepNum,
+        type: 'navigate',
+        url: destUrl,
+        checkpoint: planStep.description,
+      });
+    }
+
+    // Add DOM interaction waypoints — skip navigate events (already recorded above)
+    // and skip the very first navigate if it's just the start URL (URL-first skips it).
+    for (const evt of matched.events) {
+      if (evt.type === 'navigate') continue; // handled as destination URL above
+      if (evt.type === 'click' || evt.type === 'dblclick') {
+        stepNum++;
+        waypoints.push({
+          step: stepNum,
+          type: evt.type,
+          selector: evt.selector,
+          altSelectors: evt.altSelectors || [],
+          elementText: evt.elementText || '',
+          href: evt.href || '',
+        });
+      } else if (evt.type === 'fill' || evt.type === 'paste') {
+        stepNum++;
+        // value="" — runtime fills from task (search query, playlist name are task-specific)
+        waypoints.push({
+          step: stepNum,
+          type: evt.type === 'paste' ? 'paste' : 'fill',
+          selector: evt.selector,
+          altSelectors: evt.altSelectors || [],
+          value: '', // task-specific — runtime fills from task
+        });
+      } else if (evt.type === 'submit') {
+        stepNum++;
+        waypoints.push({ step: stepNum, type: 'submit', selector: evt.selector });
+      } else if (evt.type === 'keycombo') {
+        stepNum++;
+        waypoints.push({
+          step: stepNum,
+          type: 'keycombo',
+          key: evt.key || 'Enter',
+          ctrl: evt.ctrl || false, shift: evt.shift || false, alt: evt.alt || false,
+          selector: evt.selector || '',
+        });
+      } else if (evt.type === 'select') {
+        stepNum++;
+        waypoints.push({ step: stepNum, type: 'select', selector: evt.selector, value: '' });
+      } else if (evt.type === 'check') {
+        stepNum++;
+        waypoints.push({
+          step: stepNum, type: 'check', selector: evt.selector,
+          label: evt.label || '', checked: evt.checked,
+        });
+      } else if (evt.type === 'hover') {
+        stepNum++;
+        waypoints.push({
+          step: stepNum, type: 'hover', selector: evt.selector,
+          altSelectors: evt.altSelectors || [],
+        });
+      }
+      // Skip scroll, focus, tab-new — not meaningful for recipe replay
+    }
+  }
+
+  // Determine target URL: last navigate waypoint's URL
+  const lastNav = waypoints.filter(w => w.type === 'navigate').pop();
+
+  return {
+    name: skillName,
+    agentId: _skillDirId(agentId),
+    startUrl,
+    targetUrl: lastNav?.url || startUrl,
+    waypoints,
+    targetDescription: trainTask ? trainTask.slice(0, 200) : `Guided recipe: ${skillName}`,
+    created: new Date().toISOString(),
+    userConfirmed: true,
+    urlFirst: true,
+    guidedTraining: true,
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Module exports
 // ---------------------------------------------------------------------------
 module.exports = {
@@ -2437,4 +2946,9 @@ module.exports = {
   saveAutoRecipe,
   distillKeyboardScript,
   distillHumanCorrection,
+  // Guided plan-first training
+  generateGuidedPlan,
+  actionGuidedTrain,
+  actionGuidedSkipStep,
+  actionSaveGuidedTraining,
 };

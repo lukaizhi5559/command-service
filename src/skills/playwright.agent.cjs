@@ -8743,6 +8743,2049 @@ Output ONLY the JSON action:`;
   }
 }
 
+// ---------------------------------------------------------------------------
+// Tier 1.8: Visual Discovery Loop
+// Slow, screenshot-first observer for menu-driven multi-step flows.
+// For each sub-task: capture OCR → propose ONE action → execute → re-capture →
+// compare → backtrack or proceed. Probes hidden menus, backtracks on no-ops,
+// and uses structural verification (not just text presence).
+// Falls back to Tier 1.9 if it can't complete.
+// ---------------------------------------------------------------------------
+
+const VISUAL_DISCOVERY_SYSTEM_PROMPT = `You are a browser automation agent. You receive the current page state and a sub-task. You output ONE action as JSON.
+
+Available actions:
+  clickByText   { "action": "clickByText", "text": "<exact text of element>" }
+  type          { "action": "type", "text": "<text to type>", "fieldText": "<input placeholder/label>" }
+  press         { "action": "press", "key": "Enter|Tab|Escape|ArrowDown|ArrowUp|ArrowLeft|ArrowRight|Meta+a|Meta+c|Meta+v" }
+  pressEscape   { "action": "pressEscape" }
+  scroll        { "action": "scroll", "direction": "down|up", "amount": 300 }
+  hover         { "action": "hover", "text": "<text of element to hover over>" }
+  return        { "action": "return", "data": "done" }
+
+Output format (JSON only, no explanation):
+{
+  "action": "...",
+  "text": "...",
+  "fieldText": "...",
+  "key": "...",
+  "url": "...",
+  "direction": "...",
+  "amount": 300,
+  "expectChange": "what should change after this action",
+  "reasoning": "1 sentence why"
+}
+
+Rules:
+- Output ONLY the JSON action, no explanation outside the JSON.
+- When a popup/menu/dialog is open, act INSIDE it. Do not dismiss it unless it's unrelated.
+- Use clickByText with the EXACT text of the element you want to click.
+- If content might be below the fold, use scroll to reveal it.
+- After typing into a field, press Enter or click the confirm/save button.
+- If a notification/toast appeared confirming your action, the sub-task may be complete — return done.
+- If a tab needs switching, clickByText the tab label.
+- If an accordion/tree node needs expanding, clickByText its label.
+- If a checkbox/toggle needs toggling, clickByText its label.
+- If a select/dropdown needs changing, clickByText its current value to open options.
+- Do NOT navigate — you are already on the correct page (URL-first navigation is handled before this tier). Work only with elements visible on the current page. If you believe you're on the wrong page, return done with an explanation.
+- If nothing on screen helps, click a REVEALABLE TRIGGER to open hidden UI.
+- If the page is loading, WAIT — do not act until loading completes.
+- If there are validation errors, fix the inputs before proceeding.
+- If you need to hover to reveal content, use the hover action.
+- Do NOT click elements inside cookie/consent/privacy dialogs — dismiss with pressEscape.
+- Do NOT click disabled buttons — they won't work. Fix prerequisites first.
+- In menus and listboxes, you can use press ArrowDown/ArrowUp to navigate between items and press Enter to select. This is often more reliable than clickByText for menu items.
+- You may need MULTIPLE actions inside a popup: type to filter/search, then click a result. Don't dismiss the popup after the first action if more steps are needed.
+- PREFER EXACT text matches. Avoid 1-2 word fragments — use the full label.
+- When a dialog/modal is open, ONLY interact with elements INSIDE it. Background elements are unreachable — clicking them will close the modal.
+- To rename or edit text in a dialog, use type with the input's placeholder or label as fieldText. Do NOT clickByText the current text value — that clicks the label behind the modal.
+- After typing a new value into a dialog input, click Save or press Enter to confirm. Do not click outside the dialog.
+- Think: what would a human do next to get one step closer to the goal?
+
+REVEALABLE TRIGGERS — structural hints (click to open hidden UI):
+- collapsed: element has aria-expanded="false" — can be expanded to reveal content
+- expanded: element has aria-expanded="true" — already open, may have sub-items
+- has-popup: element declares aria-haspopup — opens a popup/menu/dialog
+- controls: element has aria-controls — controls visibility of another element
+- owns: element has aria-owns — owns child elements (may be dynamically populated)
+- toggle: element has data-toggle/data-bs-toggle — toggles UI state
+- icon-only: element has no visible text but has an icon — could be a menu/more button
+- in-nav: element is inside a nav/aside/navigation container
+- in-toolbar: element is inside a toolbar/menubar
+- in-menu: element is inside a menu/listbox
+- interactive: standard interactive element (button/link/etc.) with no special semantics`;
+
+// DOM helper: find candidate menu triggers that can reveal hidden UI.
+// Fully structural/ARIA-based — NO regex on text content. The LLM reads the
+// text from OCR and decides what's relevant; we only provide structural metadata.
+// Returns array of { text, ariaLabel, tag, role, rect, hint, hintList, inNav, inToolbar, inMenu }
+async function _probeRevealableMenus(page) {
+  if (!page) return [];
+  try {
+    const _menus = await page.evaluate(() => {
+      const _out = [];
+      // All-encompassing structural selector — captures every interactive pattern
+      // without matching on text content or app-specific data attributes.
+      const _sel = [
+        // Standard interactive elements
+        'button', 'a', '[role="button"]', '[role="link"]',
+        '[role="menuitem"]', '[role="menuitemcheckbox"]', '[role="menuitemradio"]',
+        '[role="tab"]', '[role="option"]', '[role="treeitem"]',
+        // ARIA expansion/popup semantics (any value — "false" = collapsed, "true" = expanded)
+        '[aria-haspopup]', '[aria-expanded]', '[aria-controls]', '[aria-owns]',
+        // Framework toggle patterns (Bootstrap, etc.)
+        '[data-toggle]', '[data-bs-toggle]', '[data-dismiss]', '[data-target]',
+        // Elements with click handlers or tabindex (interactive but not standard tags)
+        '[onclick]', '[tabindex]:not([tabindex="-1"])',
+        // Input-like elements that might trigger UI (search, combobox)
+        '[role="combobox"]', '[role="searchbox"]', 'input[type="search"]',
+        'input[type="submit"]', 'input[type="button"]', 'input[type="image"]',
+      ].join(', ');
+      const _seen = new Set();
+      const _els = Array.from(document.querySelectorAll(_sel));
+      for (const el of _els) {
+        if (_seen.has(el)) continue;
+        _seen.add(el);
+        const r = el.getBoundingClientRect();
+        if (r.width < 5 || r.height < 5) continue;
+        const s = window.getComputedStyle(el);
+        if (s.display === 'none' || s.visibility === 'hidden' || parseFloat(s.opacity) === 0) continue;
+        // Skip elements inside noise dialogs (cookie/consent/privacy)
+        let _inNoise = false;
+        let _cur = el;
+        while (_cur) {
+          if (_cur.getAttribute && (_cur.getAttribute('role') === 'dialog' || _cur.getAttribute('aria-modal') === 'true')) {
+            const _dt = (_cur.innerText || '').toLowerCase();
+            if (/cookie|consent|privacy|language|gdpr/.test(_dt)) { _inNoise = true; break; }
+          }
+          _cur = _cur.parentElement;
+        }
+        if (_inNoise) continue;
+
+        // Extract structural properties — NO text content matching
+        const _text = (el.innerText || el.textContent || '').trim().slice(0, 40);
+        const _aria = (el.getAttribute('aria-label') || '').trim().slice(0, 40);
+        const _tag = el.tagName.toLowerCase();
+        const _role = el.getAttribute('role') || '';
+        const _expanded = el.getAttribute('aria-expanded');
+        const _hasPopup = el.hasAttribute('aria-haspopup');
+        const _testid = (el.getAttribute('data-testid') || '').toLowerCase();
+
+        // Classify by STRUCTURAL properties only — zero regex on text
+        const _hintList = [];
+        if (_expanded === 'false') _hintList.push('collapsed');
+        if (_expanded === 'true') _hintList.push('expanded');
+        if (_hasPopup) _hintList.push('has-popup');
+        if (el.hasAttribute('aria-controls')) _hintList.push('controls');
+        if (el.hasAttribute('aria-owns')) _hintList.push('owns');
+        if (el.hasAttribute('data-toggle') || el.hasAttribute('data-bs-toggle')) _hintList.push('toggle');
+        // Icon-only button: no text/aria-label but has icon child
+        const _hasIconChild = el.querySelector('svg, img, i[class*="icon"], [class*="icon"]');
+        if (!_text && !_aria && _hasIconChild) _hintList.push('icon-only');
+        // Contextual containers — where the element lives
+        const _inNav = !!el.closest('nav, aside, [role="navigation"]');
+        const _inToolbar = !!el.closest('[role="toolbar"], [role="menubar"]');
+        const _inMenu = !!el.closest('[role="menu"], [role="listbox"]');
+        if (_inNav) _hintList.push('in-nav');
+        if (_inToolbar) _hintList.push('in-toolbar');
+        if (_inMenu) _hintList.push('in-menu');
+        // Fallback: standard interactive with no special semantics
+        if (_hintList.length === 0) _hintList.push('interactive');
+
+        _out.push({
+          text: _text || _aria || '(no label)',
+          ariaLabel: _aria,
+          tag: _tag,
+          role: _role,
+          rect: { x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height) },
+          hint: _hintList.join(' '),
+          hintList: _hintList,
+          inNav: _inNav,
+          inToolbar: _inToolbar,
+          inMenu: _inMenu,
+          testid: _testid,
+        });
+      }
+      // Sort by structural relevance — collapsed/has-popup most likely to reveal hidden UI
+      const _priority = {
+        'collapsed': 0,      // can be expanded — highest priority
+        'has-popup': 1,      // declared popup behavior
+        'controls': 2,       // controls another element's visibility
+        'owns': 2,           // owns another element
+        'toggle': 3,         // toggle behavior
+        'icon-only': 4,      // might be a menu button with no visible label
+        'in-nav': 5,         // navigation context
+        'in-toolbar': 5,     // toolbar context
+        'in-menu': 6,        // menu context
+        'expanded': 7,       // already open
+        'interactive': 8,    // generic catch-all
+      };
+      _out.sort((a, b) => {
+        const _aBest = Math.min(...a.hintList.map(h => _priority[h] ?? 9));
+        const _bBest = Math.min(...b.hintList.map(h => _priority[h] ?? 9));
+        return _aBest - _bBest;
+      });
+      return _out.slice(0, 20);
+    }).catch(() => []);
+    return _menus;
+  } catch (_) { return []; }
+}
+
+// Classify a raw popup element in Node.js (after page.evaluate returns role/className/rect).
+function _classifyPopup(role, className, rect, winWidth) {
+  const classes = (className || '').toLowerCase();
+  if (role === 'menu' || role === 'menubar') return 'menu';
+  if (role === 'listbox') return 'listbox';
+  if (role === 'dialog' || role === 'alertdialog') {
+    const r = rect || {};
+    if ((r.x || 0) < 50 || ((r.x || 0) + (r.w || 0)) > (winWidth || 1280) - 50) return 'sheet';
+    return 'dialog';
+  }
+  if (role === 'tooltip') return 'tooltip';
+  if (role === 'status' || role === 'alert' || role === 'log') return 'status';
+  if (role === 'tabpanel') return 'tabpanel';
+  if (role === 'tree') return 'tree';
+  if (role === 'grid') return 'calendar';
+  if (role === 'popover') return 'popover';
+
+  if (classes.includes('dropdown') || classes.includes('select-menu') || classes.includes('menu-popup') || classes.includes('context-menu') || classes.includes('menu-dropdown')) return 'menu';
+  if (classes.includes('popover') || classes.includes('flyout')) return 'popover';
+  if (classes.includes('autocomplete') || classes.includes('suggestions') || classes.includes('combobox-popup') || classes.includes('combobox-list')) return 'listbox';
+  if (classes.includes('drawer') || classes.includes('sheet')) return 'sheet';
+  if (classes.includes('calendar') || classes.includes('datepicker') || classes.includes('calendar-popup') || classes.includes('datepicker-popup')) return 'calendar';
+  if (classes.includes('color-picker')) return 'popover';
+  if (classes.includes('modal')) return 'dialog';
+  if (classes.includes('tooltip')) return 'tooltip';
+  if (classes.includes('toast') || classes.includes('snackbar') || classes.includes('alert-banner') || classes.includes('notification')) return 'status';
+
+  return 'unknown';
+}
+
+// Universal DOM state observation: structured, deterministic replacement for _captureDomHash.
+async function _captureDomState(page) {
+  if (!page) return _emptyDomState();
+  try {
+    const _t0 = Date.now();
+    const _state = await page.evaluate(() => {
+      const _vpH = window.innerHeight;
+      const _vpW = window.innerWidth;
+
+      function _isVisible(el) {
+        if (!el) return false;
+        if (el.hasAttribute('hidden')) return false;
+        if (el.getAttribute('aria-hidden') === 'true') return false;
+        if (el.hasAttribute('inert')) return false;
+        let _p = el.parentElement;
+        while (_p) {
+          if (_p.hasAttribute('inert')) return false;
+          _p = _p.parentElement;
+        }
+        const r = el.getBoundingClientRect();
+        if (r.width < 2 || r.height < 2) return false;
+        if (r.bottom < 0 || r.top > _vpH || r.right < 0 || r.left > _vpW) return false;
+        const s = window.getComputedStyle(el);
+        if (s.display === 'none' || s.visibility === 'hidden' || parseFloat(s.opacity) === 0) return false;
+        return true;
+      }
+
+      function _isInteractiveClickable(el) {
+        const s = window.getComputedStyle(el);
+        if (s.pointerEvents === 'none') return false;
+        return true;
+      }
+
+      function _visibleText(el) {
+        return (el.innerText || el.textContent || '').trim().slice(0, 60);
+      }
+
+      function _ariaLabel(el) {
+        return (el.getAttribute('aria-label') || '').trim().slice(0, 60);
+      }
+
+      function _rectObj(r) {
+        return { x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height) };
+      }
+
+      function _isComplianceDialog(el) {
+        const _patterns = ['cookie', 'consent', 'privacy', 'gdpr', 'language', 'opt-out', 'do not sell', 'ccpa'];
+        const _label = (el.getAttribute('aria-label') || '').toLowerCase();
+        const _cls = ((el.getAttribute && el.getAttribute('class')) || '').toLowerCase();
+        const _text = ((el.innerText || '').slice(0, 200) || '').toLowerCase();
+        for (const p of _patterns) {
+          if (_label.includes(p) || _cls.includes(p)) return true;
+          if (_text.includes(p) && _text.length < 300) return true;
+        }
+        return false;
+      }
+
+      function _isDisabled(el) {
+        return el.hasAttribute('disabled') ||
+          el.getAttribute('aria-disabled') === 'true' ||
+          window.getComputedStyle(el).cursor === 'not-allowed';
+      }
+
+      // ── Popup detection ──
+      const POPUP_SELECTORS = [
+        '[role="menu"]', '[role="menubar"]', '[role="listbox"]', '[role="dialog"]',
+        '[role="alertdialog"]', '[role="tooltip"]', '[role="tabpanel"]', '[role="tree"]',
+        '[role="status"]', '[role="alert"]', '[role="log"]', '[role="popover"]', '[role="grid"]',
+        '[aria-modal="true"]',
+        '[data-radix-popper-content-wrapper]', '[data-radix-portal]',
+        '[data-headlessui-portal]', '[data-headlessui-state="open"]',
+        '[data-floating-ui-portal]',
+        '[data-mui-portal]', '.MuiPopover-root', '.MuiDialog-root', '.MuiMenu-root',
+        '.ant-dropdown', '.ant-popover', '.ant-modal', '.ant-select-dropdown', '.ant-menu-popup', '.ant-cascader-menus',
+        '[data-chakra-portal]', '.chakra-portal',
+        '.mantine-Popover-dropdown', '.mantine-Menu-dropdown', '.mantine-Modal-root',
+        '.p-dropdown-panel', '.p-menu', '.p-dialog', '.p-overlay-panel',
+        '.dropdown-menu.show', '.modal.show', '.popover.show',
+        '.ion-popover', '.ion-modal',
+        '[data-state="open"]',
+        'dialog[open]', '[popover]:not([hidden])',
+        '[class*="dropdown-menu"]', '[class*="dropdown-content"]', '[class*="dropdown-list"]', '[class*="select-dropdown"]',
+        '[class*="menu-popup"]', '[class*="menu-dropdown"]', '[class*="context-menu"]',
+        '[class*="popover-content"]', '[class*="popover-body"]', '[class*="flyout"]',
+        '[class*="tooltip-content"]', '[class*="modal-content"]', '[class*="modal-body"]', '[class*="dialog-content"]',
+        '[class*="drawer-content"]', '[class*="sheet-content"]', '[class*="sidebar-overlay"]', '[class*="panel-content"]',
+        '[class*="autocomplete-dropdown"]', '[class*="suggestions-list"]', '[class*="combobox-list"]',
+        '[class*="calendar-popup"]', '[class*="datepicker-popup"]', '[class*="color-picker-popup"]',
+        '[class*="notification-toast"]', '[class*="toast-container"]', '[class*="alert-banner"]', '[class*="snackbar"]',
+      ];
+
+      const _popupEls = new Set();
+      const _popups = [];
+      for (const sel of POPUP_SELECTORS) {
+        for (const el of document.querySelectorAll(sel)) {
+          if (_popupEls.has(el)) continue;
+          if (!_isVisible(el)) continue;
+          // Skip elements inside an already-detected popup
+          let _parent = el.parentElement;
+          let _inside = false;
+          while (_parent) {
+            if (_popupEls.has(_parent)) { _inside = true; break; }
+            _parent = _parent.parentElement;
+          }
+          if (_inside) continue;
+          // Skip compliance / cookie dialogs from popups list (but record cookieConsentVisible)
+          if (_isComplianceDialog(el)) continue;
+
+          const r = _rectObj(el.getBoundingClientRect());
+          const _role = el.getAttribute('role') || '';
+          const _cls = (el.getAttribute('class') || '').toLowerCase();
+          const _items = [];
+          const _itemSelector = 'button, a, [role="menuitem"], [role="menuitemcheckbox"], [role="menuitemradio"], [role="option"], [role="tab"], [role="treeitem"], [role="gridcell"], [role="button"], [role="link"]';
+          for (const _item of el.querySelectorAll(_itemSelector)) {
+            if (!_isVisible(_item) || !_isInteractiveClickable(_item)) continue;
+            const _ir = _item.getBoundingClientRect();
+            _items.push({
+              text: _visibleText(_item),
+              tag: _item.tagName.toLowerCase(),
+              role: _item.getAttribute('role') || '',
+              ariaLabel: _ariaLabel(_item),
+              x: Math.round(_ir.x + _ir.width / 2),
+              y: Math.round(_ir.y + _ir.height / 2),
+              disabled: _isDisabled(_item),
+            });
+          }
+          _items.sort((a, b) => a.y - b.y || a.x - b.x);
+
+          let _hasInput = false;
+          let _inputPlaceholder = '';
+          for (const _inp of el.querySelectorAll('input, textarea, [contenteditable="true"], [role="searchbox"], [role="textbox"]')) {
+            if (_isVisible(_inp)) { _hasInput = true; _inputPlaceholder = (_inp.placeholder || _inp.getAttribute('aria-label') || '').slice(0, 40); break; }
+          }
+
+          _popupEls.add(el);
+          _popups.push({
+            role: _role,
+            className: _cls,
+            tagName: el.tagName.toLowerCase(),
+            rect: r,
+            zIndex: parseInt(window.getComputedStyle(el).zIndex) || 0,
+            text: _visibleText(el),
+            items: _items.slice(0, 20),
+            hasInput,
+            inputPlaceholder: _inputPlaceholder,
+          });
+        }
+      }
+
+      // Sort popups by z-index then DOM depth (deepest last)
+      _popups.sort((a, b) => (b.zIndex || 0) - (a.zIndex || 0));
+
+      // ── Inputs (not inside popups) ──
+      const _inputs = [];
+      const _inputSelectors = 'input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"]):not([type="file"]):not([type="color"]):not([type="range"]), textarea, [contenteditable="true"], [role="textbox"], [role="searchbox"], [role="combobox"]';
+      for (const el of document.querySelectorAll(_inputSelectors)) {
+        if (!_isVisible(el) || el.closest('[role="menu"], [role="dialog"], [role="listbox"]')) continue;
+        const r = el.getBoundingClientRect();
+        _inputs.push({
+          type: el.type || el.getAttribute('role') || 'text',
+          placeholder: (el.placeholder || _ariaLabel(el) || '').slice(0, 40),
+          value: (el.value || '').slice(0, 80),
+          x: Math.round(r.x + r.width / 2),
+          y: Math.round(r.y + r.height / 2),
+          isFocused: document.activeElement === el,
+          disabled: _isDisabled(el),
+          readonly: !!el.readOnly,
+          invalid: el.getAttribute('aria-invalid') === 'true',
+          required: el.required || el.getAttribute('aria-required') === 'true',
+        });
+      }
+
+      // ── Selects ──
+      const _selects = [];
+      for (const el of document.querySelectorAll('select, [role="listbox"]:not([role*="popup"])')) {
+        if (!_isVisible(el) || el.closest('[role="menu"], [role="dialog"]')) continue;
+        const r = el.getBoundingClientRect();
+        const _opts = Array.from(el.querySelectorAll('option, [role="option"]')).map(o => ({
+          text: _visibleText(o),
+          value: o.value || o.getAttribute('value') || '',
+          selected: o.selected || o.getAttribute('aria-selected') === 'true',
+        })).slice(0, 20);
+        _selects.push({
+          placeholder: (el.getAttribute('aria-label') || '').slice(0, 40),
+          value: (el.value || '').slice(0, 40),
+          options: _opts,
+          x: Math.round(r.x + r.width / 2),
+          y: Math.round(r.y + r.height / 2),
+        });
+      }
+
+      // ── Checkboxes / Radios / Toggles / Sliders / File inputs ──
+      const _checkboxes = [];
+      const _radios = new Map();
+      const _toggles = [];
+      const _sliders = [];
+      const _fileInputs = [];
+      for (const el of document.querySelectorAll('input[type="checkbox"], input[type="radio"], input[type="range"], input[type="file"], input[type="color"], [role="checkbox"], [role="radio"], [role="switch"], [role="slider"]')) {
+        if (!_isVisible(el)) continue;
+        const r = el.getBoundingClientRect();
+        const _common = { x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2), disabled: _isDisabled(el) };
+        const _role = el.getAttribute('role') || el.type || '';
+        if (_role === 'checkbox' || el.type === 'checkbox') _checkboxes.push({ label: _ariaLabel(el) || _visibleText(el), checked: el.checked || el.getAttribute('aria-checked') === 'true', ..._common });
+        else if (_role === 'radio' || el.type === 'radio') {
+          const _name = el.name || el.getAttribute('name') || el.getAttribute('aria-label') || 'radio group';
+          if (!_radios.has(_name)) _radios.set(_name, { name: _name, options: [], x: _common.x, y: _common.y });
+          _radios.get(_name).options.push({ label: _ariaLabel(el) || _visibleText(el), checked: el.checked || el.getAttribute('aria-checked') === 'true' });
+        }
+        else if (_role === 'switch') _toggles.push({ label: _ariaLabel(el) || _visibleText(el), checked: el.getAttribute('aria-checked') === 'true', ..._common });
+        else if (_role === 'slider' || el.type === 'range') _sliders.push({ label: _ariaLabel(el) || _visibleText(el), min: el.min || '0', max: el.max || '100', value: el.value || '0', ..._common });
+        else if (el.type === 'file' || el.type === 'color') _fileInputs.push({ accept: el.accept || '', multiple: el.multiple, ..._common });
+      }
+
+      // ── Buttons / Links (not inside popups) ──
+      const _buttons = [];
+      for (const el of document.querySelectorAll('button, a, [role="button"], [role="link"], [role="tab"], input[type="submit"], input[type="button"]')) {
+        if (!_isVisible(el) || !_isInteractiveClickable(el) || el.closest('[role="menu"], [role="dialog"], [role="listbox"]')) continue;
+        const r = el.getBoundingClientRect();
+        const _text = _visibleText(el) || _ariaLabel(el);
+        _buttons.push({
+          text: _text,
+          tag: el.tagName.toLowerCase(),
+          role: el.getAttribute('role') || '',
+          ariaLabel: _ariaLabel(el),
+          x: Math.round(r.x + r.width / 2),
+          y: Math.round(r.y + r.height / 2),
+          disabled: _isDisabled(el),
+        });
+      }
+
+      // ── Tabs / Accordions / Trees / Expanded elements ──
+      const _tabs = [];
+      let _activeTabPanel = null;
+      for (const el of document.querySelectorAll('[role="tab"]')) {
+        const r = el.getBoundingClientRect();
+        _tabs.push({
+          text: _visibleText(el),
+          role: 'tab',
+          ariaSelected: el.getAttribute('aria-selected') || 'false',
+          x: Math.round(r.x + r.width / 2),
+          y: Math.round(r.y + r.height / 2),
+          panelId: el.getAttribute('aria-controls') || '',
+        });
+      }
+      const _activePanelId = _tabs.find(t => t.ariaSelected === 'true')?.panelId;
+      if (_activePanelId) {
+        const _panel = document.getElementById(_activePanelId);
+        if (_panel && _isVisible(_panel)) {
+          const r = _panel.getBoundingClientRect();
+          _activeTabPanel = { text: _visibleText(_panel).slice(0, 200), x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height) };
+        }
+      }
+
+      const _accordions = [];
+      const _expandedElements = [];
+      for (const el of document.querySelectorAll('details, [aria-expanded]')) {
+        if (!_isVisible(el)) continue;
+        const _expanded = el.open || el.getAttribute('aria-expanded') === 'true';
+        if (el.tagName.toLowerCase() === 'details' || el.hasAttribute('aria-expanded')) {
+          const r = el.getBoundingClientRect();
+          _accordions.push({ text: _visibleText(el).slice(0, 40), expanded: _expanded, x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2) });
+        }
+        if (_expanded) {
+          const r = el.getBoundingClientRect();
+          _expandedElements.push({ text: _visibleText(el).slice(0, 40), tag: el.tagName.toLowerCase(), role: el.getAttribute('role') || '', x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2) });
+        }
+      }
+
+      const _treeItems = [];
+      for (const el of document.querySelectorAll('[role="treeitem"]')) {
+        if (!_isVisible(el)) continue;
+        const r = el.getBoundingClientRect();
+        let _level = 0; let _p = el.parentElement;
+        while (_p) { if (_p.getAttribute('role') === 'tree' || _p.getAttribute('role') === 'group' || _p.getAttribute('role') === 'treeitem') _level++; _p = _p.parentElement; }
+        _treeItems.push({ text: _visibleText(el).slice(0, 40), level: _level, expanded: el.getAttribute('aria-expanded') === 'true', x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2) });
+      }
+
+      // ── Loading / Toasts / Validation errors / Confirm dialogs ──
+      const _loadingIndicators = [];
+      let _isLoading = false;
+      for (const el of document.querySelectorAll('[role="progressbar"], [class*="loading"], [class*="spinner"], [class*="skeleton"]')) {
+        if (!_isVisible(el)) continue;
+        _isLoading = true;
+        const r = el.getBoundingClientRect();
+        const _role = el.getAttribute('role') || 'spinner';
+        _loadingIndicators.push({ type: _role === 'progressbar' ? 'progressbar' : (el.getAttribute('class') || '').includes('skeleton') ? 'skeleton' : 'spinner', text: _visibleText(el).slice(0, 40), x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2) });
+      }
+
+      const _toasts = [];
+      for (const el of document.querySelectorAll('[role="status"], [role="alert"], [class*="toast"], [class*="snackbar"], [class*="notification"]')) {
+        if (!_isVisible(el)) continue;
+        const r = el.getBoundingClientRect();
+        const _cls = (el.getAttribute('class') || '').toLowerCase();
+        let _type = 'info';
+        if (_cls.includes('success') || _cls.includes('ok')) _type = 'success';
+        else if (_cls.includes('error') || _cls.includes('fail')) _type = 'error';
+        else if (_cls.includes('warning') || _cls.includes('warn')) _type = 'warning';
+        _toasts.push({ text: _visibleText(el).slice(0, 120), role: el.getAttribute('role') || 'status', type: _type, x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2) });
+      }
+
+      const _validationErrors = [];
+      for (const el of document.querySelectorAll('[aria-invalid="true"]')) {
+        if (!_isVisible(el)) continue;
+        const _errId = el.getAttribute('aria-errormessage') || el.getAttribute('aria-describedby');
+        let _msg = '';
+        if (_errId) { const _err = document.getElementById(_errId); if (_err) _msg = _visibleText(_err); }
+        _validationErrors.push({ field: (el.placeholder || _ariaLabel(el) || 'field').slice(0, 40), message: _msg.slice(0, 120) });
+      }
+
+      const _confirmDialogs = [];
+      for (const el of document.querySelectorAll('[role="alertdialog"], [role="dialog"]')) {
+        if (!_isVisible(el) || _isComplianceDialog(el)) continue;
+        const _text = _visibleText(el).slice(0, 120);
+        if (!_text.includes('?') && !_text.toLowerCase().includes('are you sure')) continue;
+        const r = el.getBoundingClientRect();
+        const _opts = [];
+        for (const _btn of el.querySelectorAll('button, [role="button"], [role="menuitem"]')) {
+          if (!_isVisible(_btn)) continue;
+          const _br = _btn.getBoundingClientRect();
+          _opts.push({ text: _visibleText(_btn) || _ariaLabel(_btn), x: Math.round(_br.x + _br.width / 2), y: Math.round(_br.y + _br.height / 2) });
+        }
+        _confirmDialogs.push({ text: _text, options: _opts.slice(0, 6), x: Math.round(r.x), y: Math.round(r.y) });
+      }
+
+      // ── Auth / Cookie consent ──
+      const _loginUrl = /\/login|\/signin|\/sign-in|\/auth|\/account\/login/i.test(window.location.pathname);
+      const _loginText = /sign\s*(in|up|into)|log\s*(in|into)|create\s*account|welcome\s*back/i.test((document.body.innerText || '').slice(0, 2000));
+      const _oauthButtons = document.querySelectorAll('[class*="oauth"], [class*="social-login"], button[aria-label*="Google"], button[aria-label*="Apple"], button[aria-label*="GitHub"]');
+      let _cookieConsentVisible = false;
+      const _cookieText = /cookie|consent|privacy|gdpr|do not sell|tracking|advertising/i;
+      for (const el of document.querySelectorAll('[role="dialog"], [class*="cookie"], [class*="consent"], [class*="gdpr"], #onetrust-banner-sdk, #cybotcookiepopup')) {
+        if (!_isVisible(el)) continue;
+        const _txt = (el.innerText || '').toLowerCase();
+        if (_cookieText.test(_txt) || el.id.includes('cookie') || el.id.includes('consent')) { _cookieConsentVisible = true; break; }
+      }
+
+      // ── Media / Embedded ──
+      const _iframes = [];
+      for (const el of document.querySelectorAll('iframe')) { const r = el.getBoundingClientRect(); if (_isVisible(el)) _iframes.push({ src: (el.src || '').slice(0, 120), title: (el.title || '').slice(0, 40), x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height) }); }
+      const _videos = [];
+      for (const el of document.querySelectorAll('video, audio')) { const r = el.getBoundingClientRect(); if (_isVisible(el)) _videos.push({ type: el.tagName.toLowerCase(), playing: !el.paused, x: Math.round(r.x), y: Math.round(r.y) }); }
+      const _canvases = [];
+      for (const el of document.querySelectorAll('canvas')) { const r = el.getBoundingClientRect(); if (_isVisible(el)) _canvases.push({ x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height) }); }
+
+      // ── Pagination / Load more ──
+      let _pagination = null;
+      for (const el of document.querySelectorAll('[role="navigation"], nav')) {
+        if (!_isVisible(el)) continue;
+        const _links = Array.from(el.querySelectorAll('a, button, [role="button"]'));
+        const _current = _links.find(a => a.getAttribute('aria-current') === 'page' || a.classList.contains('active') || a.classList.contains('current'));
+        if (_current) {
+          const _currentPage = parseInt(_current.textContent, 10) || 1;
+          const _totalPages = Math.max(..._links.map(a => parseInt(a.textContent, 10)).filter(n => !isNaN(n))) || _currentPage;
+          _pagination = { currentPage: _currentPage, totalPages: _totalPages, nextPageButton: null, prevPageButton: null };
+          break;
+        }
+      }
+
+      let _loadMoreButton = null;
+      for (const el of document.querySelectorAll('button, a, [role="button"]')) {
+        if (!_isVisible(el)) continue;
+        const _txt = _visibleText(el).toLowerCase();
+        if (/load more|show more|see more|view more/.test(_txt)) {
+          const r = el.getBoundingClientRect();
+          _loadMoreButton = { text: _visibleText(el), x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2), disabled: _isDisabled(el) };
+          break;
+        }
+      }
+
+      // ── Active element ──
+      const _active = document.activeElement;
+      const _activeElement = (!_active || _active === document.body) ? null : (() => {
+        const r = _active.getBoundingClientRect();
+        return {
+          tag: _active.tagName.toLowerCase(),
+          role: _active.getAttribute('role') || '',
+          type: _active.type || '',
+          placeholder: (_active.placeholder || _ariaLabel(_active) || '').slice(0, 40),
+          x: Math.round(r.x + r.width / 2),
+          y: Math.round(r.y + r.height / 2),
+        };
+      })();
+
+      // ── Draggable / hover reveal ──
+      const _draggableItems = [];
+      for (const el of document.querySelectorAll('[draggable="true"]')) {
+        if (!_isVisible(el)) continue;
+        const r = el.getBoundingClientRect();
+        _draggableItems.push({ text: _visibleText(el).slice(0, 40), tag: el.tagName.toLowerCase(), x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2) });
+      }
+      const _hoverRevealTriggers = [];
+      for (const el of document.querySelectorAll('[aria-haspopup], [data-toggle], [data-bs-toggle]')) {
+        if (!_isVisible(el)) continue;
+        const r = el.getBoundingClientRect();
+        _hoverRevealTriggers.push({ text: _visibleText(el).slice(0, 40), tag: el.tagName.toLowerCase(), role: el.getAttribute('role') || '', x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2) });
+      }
+
+      // ── Hash ──
+      const _hashParts = [];
+      for (const el of document.querySelectorAll('button, a, [role="button"], [role="link"], input, [contenteditable], [role="dialog"], [aria-modal="true"], [role="menu"], [role="listbox"]')) {
+        if (!_isVisible(el)) continue;
+        const _t = _visibleText(el) || _ariaLabel(el) || el.value || '';
+        _hashParts.push(`${el.tagName}|${el.getAttribute('role') || ''}|${_t}`);
+      }
+      let _h = 0;
+      const _joined = _hashParts.join('§');
+      for (let i = 0; i < _joined.length; i++) { _h = ((_h << 5) - _h + _joined.charCodeAt(i)) | 0; }
+      const _hash = `${_h}_${_hashParts.length}`;
+
+      const _scrollY = Math.round(window.scrollY);
+      const _scrollableHeight = Math.max(document.body.scrollHeight, document.documentElement.scrollHeight);
+      return {
+        title: document.title || '',
+        hash: _hash,
+        url: window.location.href,
+        scrollY: _scrollY,
+        viewportHeight: _vpH,
+        scrollableHeight: _scrollableHeight,
+        canScrollDown: (_scrollY + _vpH) < (_scrollableHeight - 2),
+        canScrollUp: _scrollY > 2,
+        popups: _popups.slice(0, 5),
+        inputs: _inputs.slice(0, 10),
+        selects: _selects.slice(0, 5),
+        checkboxes: _checkboxes.slice(0, 10),
+        radios: Array.from(_radios.values()).slice(0, 5),
+        toggles: _toggles.slice(0, 10),
+        sliders: _sliders.slice(0, 5),
+        fileInputs: _fileInputs.slice(0, 5),
+        buttons: _buttons.slice(0, 30),
+        draggableItems: _draggableItems.slice(0, 10),
+        hoverRevealTriggers: _hoverRevealTriggers.slice(0, 12),
+        tabs: _tabs.slice(0, 10),
+        activeTabPanel: _activeTabPanel,
+        accordions: _accordions.slice(0, 10),
+        expandedElements: _expandedElements.slice(0, 10),
+        treeItems: _treeItems.slice(0, 15),
+        isLoading,
+        loadingIndicators: _loadingIndicators.slice(0, 3),
+        toasts: _toasts.slice(0, 3),
+        validationErrors: _validationErrors.slice(0, 5),
+        confirmDialogs: _confirmDialogs.slice(0, 3),
+        isLoginWall: _loginUrl || (_loginText && _oauthButtons.length > 0),
+        cookieConsentVisible: _cookieConsentVisible,
+        oauthProviders: [],
+        iframes: _iframes.slice(0, 5),
+        videos: _videos.slice(0, 5),
+        canvases: _canvases.slice(0, 5),
+        pagination: _pagination,
+        loadMoreButton: _loadMoreButton,
+        disabledButtons: _buttons.filter(b => b.disabled).map(b => ({ text: b.text, reason: b.disabled ? 'unknown' : 'unknown', x: b.x, y: b.y })).slice(0, 10),
+        activeElement: _activeElement,
+      };
+    }).catch(() => null);
+
+    if (!_state) return _emptyDomState();
+
+    // Classify popups in Node.js using the captured role / className / rect
+    const _vpW = page.viewportSize()?.width || 1280;
+    for (const p of _state.popups) {
+      p.type = _classifyPopup(p.role, p.className, p.rect, _vpW);
+      p.hash = `${p.type}|${p.role}|${p.items.length}|${p.text}|${p.items.map(i => i.text).join(',')}`;
+    }
+
+    logger.info(`[playwright.agent] _captureDomState: ${Date.now() - _t0}ms`);
+    return _state;
+  } catch (e) {
+    logger.warn(`[playwright.agent] _captureDomState failed: ${e.message}`);
+    return _emptyDomState();
+  }
+}
+
+function _emptyDomState() {
+  return {
+    title: '',
+    hash: '',
+    url: '',
+    scrollY: 0,
+    viewportHeight: 800,
+    scrollableHeight: 800,
+    canScrollDown: false,
+    canScrollUp: false,
+    popups: [],
+    inputs: [],
+    selects: [],
+    checkboxes: [],
+    radios: [],
+    toggles: [],
+    sliders: [],
+    fileInputs: [],
+    buttons: [],
+    draggableItems: [],
+    hoverRevealTriggers: [],
+    tabs: [],
+    activeTabPanel: null,
+    accordions: [],
+    expandedElements: [],
+    treeItems: [],
+    isLoading: false,
+    loadingIndicators: [],
+    toasts: [],
+    validationErrors: [],
+    confirmDialogs: [],
+    isLoginWall: false,
+    cookieConsentVisible: false,
+    oauthProviders: [],
+    iframes: [],
+    videos: [],
+    canvases: [],
+    pagination: null,
+    loadMoreButton: null,
+    disabledButtons: [],
+    activeElement: null,
+  };
+}
+
+function _compareDomState(before, after, expectChange) {
+  // 1. Navigation
+  if (before.url !== after.url) {
+    return { direction: 'closer', reason: `navigated: ${before.url} → ${after.url}`, navigated: true };
+  }
+
+  // 2. Popup opened
+  const beforePopupCount = before.popups.length;
+  const afterPopupCount = after.popups.length;
+  if (afterPopupCount > beforePopupCount) {
+    const newPopup = after.popups[afterPopupCount - 1];
+    return {
+      direction: 'closer',
+      reason: `${newPopup.type} opened with ${newPopup.items.length} items`,
+      popupOpened: true,
+      popup: newPopup,
+    };
+  }
+
+  // 3. expectChange popup hint
+  if (expectChange && afterPopupCount > beforePopupCount && /menu|popup|dialog|dropdown/i.test(expectChange)) {
+    return { direction: 'closer', reason: 'popup opened matching expectChange', popupOpened: true };
+  }
+
+  // 4. Popup closed
+  if (beforePopupCount > 0 && afterPopupCount === 0) {
+    return { direction: 'same', reason: 'popup closed', popupClosed: true };
+  }
+
+  // 5. Popup contents changed
+  if (beforePopupCount > 0 && afterPopupCount > 0) {
+    const beforeHash = before.popups.map(p => p.hash).join('|');
+    const afterHash = after.popups.map(p => p.hash).join('|');
+    if (beforeHash !== afterHash) {
+      return {
+        direction: 'closer',
+        reason: 'popup contents changed',
+        popupChanged: true,
+        popup: after.popups[0],
+      };
+    }
+  }
+
+  // 6. Toast/notification appeared
+  if (after.toasts.length > before.toasts.length) {
+    const newToast = after.toasts[after.toasts.length - 1];
+    return {
+      direction: 'closer',
+      reason: `notification appeared: "${newToast.text.slice(0, 60)}"`,
+      toastAppeared: true,
+      toast: newToast,
+    };
+  }
+
+  // 7. Tab switched
+  const beforeSelectedTab = before.tabs.find(t => t.ariaSelected === 'true');
+  const afterSelectedTab = after.tabs.find(t => t.ariaSelected === 'true');
+  if (beforeSelectedTab && afterSelectedTab && beforeSelectedTab.text !== afterSelectedTab.text) {
+    return {
+      direction: 'closer',
+      reason: `tab switched: "${beforeSelectedTab.text}" → "${afterSelectedTab.text}"`,
+      tabSwitched: true,
+    };
+  }
+
+  // 8. Accordion/section expanded
+  if (after.expandedElements.length > before.expandedElements.length) {
+    const newExpanded = after.expandedElements[after.expandedElements.length - 1];
+    return {
+      direction: 'closer',
+      reason: `element expanded: "${newExpanded.text.slice(0, 40)}"`,
+      expanded: true,
+    };
+  }
+
+  // 9. Tree node expanded
+  const beforeExpandedTrees = before.treeItems.filter(t => t.expanded).length;
+  const afterExpandedTrees = after.treeItems.filter(t => t.expanded).length;
+  if (afterExpandedTrees > beforeExpandedTrees) {
+    return { direction: 'closer', reason: 'tree node expanded', treeExpanded: true };
+  }
+
+  // 10. Focus moved to an input
+  if (!before.activeElement && after.activeElement) {
+    return { direction: 'closer', reason: `focus moved to ${after.activeElement.tag}`, focusChanged: true };
+  }
+
+  // 11. Scroll position changed
+  if (Math.abs(after.scrollY - before.scrollY) > 100) {
+    return {
+      direction: 'closer',
+      reason: `scrolled ${after.scrollY > before.scrollY ? 'down' : 'up'} (${Math.abs(after.scrollY - before.scrollY)}px)`,
+      scrolled: true,
+    };
+  }
+
+  // 12. Loading state changed
+  if (before.isLoading && !after.isLoading) {
+    return { direction: 'closer', reason: 'loading completed', loadingCompleted: true };
+  }
+  if (!before.isLoading && after.isLoading) {
+    return { direction: 'same', reason: 'loading started', loadingStarted: true };
+  }
+
+  // 13. Validation errors
+  if (after.validationErrors.length > before.validationErrors.length) {
+    return {
+      direction: 'same',
+      reason: `validation error: ${after.validationErrors[after.validationErrors.length - 1].message}`,
+      validationError: true,
+    };
+  }
+  if (before.validationErrors.length > 0 && after.validationErrors.length === 0) {
+    return { direction: 'closer', reason: 'validation errors cleared', errorsCleared: true };
+  }
+
+  // 14. Input value changed
+  const inputChanged = after.inputs.some(inp => {
+    const match = before.inputs.find(b => b.placeholder === inp.placeholder);
+    return match && inp.value !== match.value;
+  });
+  if (inputChanged) {
+    return { direction: 'closer', reason: 'input value changed', inputChanged: true };
+  }
+
+  // 15. Checkbox/toggle state changed
+  const toggleChanged = after.checkboxes.some(cb => {
+    const match = before.checkboxes.find(b => b.label === cb.label);
+    return match && cb.checked !== match.checked;
+  }) || after.toggles.some(tg => {
+    const match = before.toggles.find(b => b.label === tg.label);
+    return match && tg.checked !== match.checked;
+  });
+  if (toggleChanged) {
+    return { direction: 'closer', reason: 'toggle/checkbox state changed', toggleChanged: true };
+  }
+
+  // 16. Pagination changed
+  if (before.pagination?.currentPage !== after.pagination?.currentPage) {
+    return {
+      direction: 'closer',
+      reason: `page changed: ${before.pagination?.currentPage} → ${after.pagination?.currentPage}`,
+      paginated: true,
+    };
+  }
+
+  // 17. New buttons/inputs appeared
+  if (before.hash !== after.hash) {
+    const newButtons = after.buttons.filter(b => !before.buttons.some(b2 => b2.text === b.text && Math.abs(b2.x - b.x) < 50 && Math.abs(b2.y - b.y) < 50));
+    if (newButtons.length > 0) {
+      return {
+        direction: 'closer',
+        reason: `${newButtons.length} new button(s) appeared: ${newButtons.slice(0, 3).map(b => `"${b.text}"`).join(', ')}`,
+        newButtons: true,
+      };
+    }
+    const newInputs = after.inputs.filter(i => !before.inputs.some(i2 => i2.placeholder === i.placeholder && Math.abs(i2.x - i.x) < 50 && Math.abs(i2.y - i.y) < 50));
+    if (newInputs.length > 0) {
+      return {
+        direction: 'closer',
+        reason: `${newInputs.length} new input(s) appeared`,
+        newInputs: true,
+      };
+    }
+    return { direction: 'closer', reason: 'DOM state changed', hashChanged: true };
+  }
+
+  // 18. Nothing changed
+  return { direction: 'same', reason: 'no DOM change', hashChanged: false };
+}
+
+// Compute a structured diff between before/after DOM states.
+// Returns raw new/removed elements for the LLM to interpret.
+function _computeStateDiff(before, after) {
+  const diff = {
+    newButtons: [], newInputs: [], newPopups: [], newExpanded: [],
+    newToasts: [], removedButtons: [], newOcrText: [], removedOcrText: [],
+    hasChanges: false,
+  };
+
+  // New buttons (by text+position match)
+  diff.newButtons = after.buttons.filter(b =>
+    !before.buttons.some(b2 => b2.text === b.text && Math.abs(b2.x - b.x) < 50 && Math.abs(b2.y - b.y) < 50)
+  ).map(b => ({ text: b.text, tag: b.tag, role: b.role, x: b.x, y: b.y }));
+
+  // Removed buttons
+  diff.removedButtons = before.buttons.filter(b =>
+    !after.buttons.some(b2 => b2.text === b.text && Math.abs(b2.x - b.x) < 50 && Math.abs(b2.y - b.y) < 50)
+  ).map(b => ({ text: b.text }));
+
+  // New inputs
+  diff.newInputs = after.inputs.filter(i =>
+    !before.inputs.some(i2 => i2.placeholder === i.placeholder && Math.abs(i2.x - i.x) < 50 && Math.abs(i2.y - i.y) < 50)
+  ).map(i => ({ placeholder: i.placeholder, type: i.type, x: i.x, y: i.y }));
+
+  // New popups
+  if (after.popups.length > before.popups.length) {
+    diff.newPopups = after.popups.slice(before.popups.length);
+  }
+
+  // Newly expanded elements
+  diff.newExpanded = after.expandedElements.filter(e =>
+    !before.expandedElements.some(e2 => e2.text === e.text)
+  );
+
+  // New toasts
+  diff.newToasts = after.toasts.length > before.toasts.length
+    ? after.toasts.slice(before.toasts.length) : [];
+
+  diff.hasChanges = diff.newButtons.length > 0 || diff.newInputs.length > 0 ||
+    diff.newPopups.length > 0 || diff.newExpanded.length > 0 ||
+    diff.newToasts.length > 0 || diff.removedButtons.length > 0;
+
+  return diff;
+}
+
+// Format a state diff into a human-readable block for the LLM prompt.
+function _buildDiffPromptBlock(diff, ocrDiff) {
+  if (!diff && !ocrDiff) return 'WHAT CHANGED: nothing — your action had no visible effect.';
+  const _lines = [];
+
+  if (diff) {
+    if (diff.newButtons.length > 0) {
+      _lines.push(`New buttons/links appeared:`);
+      for (const b of diff.newButtons.slice(0, 10)) {
+        _lines.push(`  - "${b.text}" ${b.tag}${b.role ? `[role=${b.role}]` : ''} at (${b.x},${b.y})`);
+      }
+    }
+    if (diff.newInputs.length > 0) {
+      _lines.push(`New input fields appeared:`);
+      for (const i of diff.newInputs.slice(0, 5)) {
+        _lines.push(`  - "${i.placeholder}" type=${i.type} at (${i.x},${i.y})`);
+      }
+    }
+    if (diff.newPopups.length > 0) {
+      _lines.push(`New popups/menus/dialogs appeared:`);
+      for (const p of diff.newPopups.slice(0, 3)) {
+        _lines.push(`  - ${p.role || p.tagName} text="${(p.text || '').slice(0, 60)}" with ${p.items?.length || 0} items`);
+      }
+    }
+    if (diff.newExpanded.length > 0) {
+      _lines.push(`Elements expanded:`);
+      for (const e of diff.newExpanded.slice(0, 5)) {
+        _lines.push(`  - "${e.text}"`);
+      }
+    }
+    if (diff.newToasts.length > 0) {
+      _lines.push(`Notifications appeared:`);
+      for (const t of diff.newToasts.slice(0, 3)) {
+        _lines.push(`  - "${t.text.slice(0, 60)}"`);
+      }
+    }
+    if (diff.removedButtons.length > 0) {
+      _lines.push(`Elements disappeared: ${diff.removedButtons.slice(0, 5).map(b => `"${b.text}"`).join(', ')}`);
+    }
+  }
+
+  if (ocrDiff && ocrDiff.changed) {
+    if (ocrDiff.added.length > 0) {
+      _lines.push(`New text appeared on screen: ${ocrDiff.added.slice(0, 10).map(t => `"${t}"`).join(', ')}`);
+    }
+    if (ocrDiff.removed.length > 0) {
+      _lines.push(`Text disappeared from screen: ${ocrDiff.removed.slice(0, 5).map(t => `"${t}"`).join(', ')}`);
+    }
+  }
+
+  if (_lines.length === 0) {
+    return 'WHAT CHANGED: nothing — your action had no visible effect.';
+  }
+  return 'WHAT CHANGED AFTER YOUR LAST ACTION:\n' + _lines.join('\n');
+}
+
+// Compare before/after state to determine if an action moved us closer to the sub-task.
+// Returns { direction: 'closer'|'same'|'farther', reason, ocrDiff }
+function _visualCompare({ beforeOcr, afterOcr, beforeDomHash, afterDomHash, subTask, expectChange }) {
+  const _ocrDiff = _diffOcrText(beforeOcr, afterOcr);
+  const _domChanged = beforeDomHash && afterDomHash && beforeDomHash !== afterDomHash;
+
+  // Extract entity terms from sub-task (reuse logic similar to _structuralVerifySubTask)
+  const _desc = (subTask.description || '').toLowerCase();
+  const _quoted = (subTask.description + ' ' + subTask.verification).match(/['"]([^'"]{2,50})['"]/g) || [];
+  const _entityTerms = [];
+  for (const q of _quoted) {
+    const t = q.replace(/['"]/g, '').trim().toLowerCase();
+    if (t.length > 1 && !/^(save|enter|cancel|ok|done|close|add|create|new)$/i.test(t)) _entityTerms.push(t);
+  }
+  const _caps = (subTask.description + ' ' + subTask.verification).match(/\b[A-Z][a-zA-Z]{2,}\b/g) || [];
+  const _stop = new Set(['The', 'And', 'Then', 'Create', 'Search', 'Add', 'Click', 'Open', 'Page', 'Playlist', 'Repeat', 'Process', 'Find', 'Top', 'Songs', 'Track', 'Tracks', 'Menu', 'Button', 'Sidebar', 'URL', 'Music', 'Artist', 'Artists', 'Album', 'Song']);
+  for (const c of _caps) {
+    if (!_stop.has(c)) _entityTerms.push(c.toLowerCase());
+  }
+
+  // Check if entity terms newly appeared in afterOcr
+  const _beforeText = (beforeOcr || []).map(i => (i.text || '').toLowerCase()).join(' ');
+  const _afterText = (afterOcr || []).map(i => (i.text || '').toLowerCase()).join(' ');
+  const _newEntities = _entityTerms.filter(t => !_beforeText.includes(t) && _afterText.includes(t));
+  const _lostEntities = _entityTerms.filter(t => _beforeText.includes(t) && !_afterText.includes(t));
+
+  // Check if expectChange description matches new OCR items
+  const _expectLower = (expectChange || '').toLowerCase();
+  let _expectMatched = false;
+  if (_expectLower && _ocrDiff.added.length > 0) {
+    const _addedText = _ocrDiff.added.join(' ').toLowerCase();
+    // Match key words from expectChange against added OCR text.
+    // Use an array-based stop word set (NOT regex .includes — RegExp has no .includes method).
+    const _stopWords = new Set([
+      'the', 'should', 'would', 'after', 'this', 'action', 'visible',
+      'screen', 'page', 'dialog', 'menu', 'button', 'field', 'input', 'element',
+    ]);
+    const _expectWords = _expectLower.split(/\s+/).filter(w => w.length > 3 && !_stopWords.has(w));
+    if (_expectWords.some(w => _addedText.includes(w))) _expectMatched = true;
+  }
+
+  // Decision logic
+  if (_newEntities.length > 0) {
+    return { direction: 'closer', reason: `new entity terms appeared: ${_newEntities.join(', ')}`, ocrDiff: _ocrDiff };
+  }
+  if (_expectMatched) {
+    return { direction: 'closer', reason: `expected change matched: "${expectChange.slice(0, 80)}"`, ocrDiff: _ocrDiff };
+  }
+  if (_ocrDiff.changed && _domChanged) {
+    return { direction: 'closer', reason: `state changed (${_ocrDiff.added.length} added, ${_ocrDiff.removed.length} removed)`, ocrDiff: _ocrDiff };
+  }
+  if (_lostEntities.length > 0 && _newEntities.length === 0) {
+    return { direction: 'farther', reason: `entity terms disappeared: ${_lostEntities.join(', ')}`, ocrDiff: _ocrDiff };
+  }
+  if (!_domChanged && !_ocrDiff.changed) {
+    return { direction: 'same', reason: 'no observable change (DOM + OCR unchanged)', ocrDiff: _ocrDiff };
+  }
+  return { direction: 'same', reason: `state changed but no entity/expectChange match (${_ocrDiff.added.length} added, ${_ocrDiff.removed.length} removed)`, ocrDiff: _ocrDiff };
+}
+
+// Draw a magenta click-aim dot + label DIRECTLY on the Playwright page (not the
+// Electron GhostLayer, which is in a different coordinate space). This ensures
+// the highlight appears at the exact CSS pixel coordinates where the click will
+// happen. The dot auto-removes after 2 seconds. Non-fatal.
+async function _highlightClickInPage(page, x, y, label) {
+  if (!page) return;
+  try {
+    await page.evaluate(({ x, y, label }) => {
+      const _id = 'td-click-aim-' + Date.now();
+      const dot = document.createElement('div');
+      dot.id = _id;
+      dot.style.cssText = [
+        'position:fixed',
+        `left:${Math.round(x - 14)}px`,
+        `top:${Math.round(y - 14)}px`,
+        'width:28px',
+        'height:28px',
+        'border:3px solid #ff00ff',
+        'border-radius:50%',
+        'background:rgba(255,0,255,0.15)',
+        'z-index:2147483647',
+        'pointer-events:none',
+        'box-shadow:0 0 12px #ff00ff,0 0 4px #ff00ff',
+      ].join(';');
+      // Crosshair lines
+      const hLine = document.createElement('div');
+      hLine.style.cssText = `position:fixed;left:${Math.round(x - 20)}px;top:${Math.round(y)}px;width:40px;height:1px;background:#ff00ff;z-index:2147483647;pointer-events:none;`;
+      const vLine = document.createElement('div');
+      vLine.style.cssText = `position:fixed;left:${Math.round(x)}px;top:${Math.round(y - 20)}px;width:1px;height:40px;background:#ff00ff;z-index:2147483647;pointer-events:none;`;
+      // Label
+      const lbl = document.createElement('div');
+      lbl.style.cssText = [
+        'position:fixed',
+        `left:${Math.round(x + 18)}px`,
+        `top:${Math.round(y - 14)}px`,
+        'background:#ff00ff',
+        'color:#000',
+        'padding:2px 8px',
+        'font-size:12px',
+        'font-family:monospace',
+        'font-weight:bold',
+        'z-index:2147483647',
+        'pointer-events:none',
+        'border-radius:3px',
+        'white-space:nowrap',
+        'max-width:300px',
+        'overflow:hidden',
+        'text-overflow:ellipsis',
+      ].join(';');
+      lbl.textContent = label ? `click: ${label.slice(0, 40)}` : 'click';
+      document.body.appendChild(dot);
+      document.body.appendChild(hLine);
+      document.body.appendChild(vLine);
+      document.body.appendChild(lbl);
+      setTimeout(() => {
+        dot.remove(); hLine.remove(); vLine.remove(); lbl.remove();
+      }, 2000);
+    }, { x: Math.round(x), y: Math.round(y), label: label || '' });
+  } catch (_) { /* non-fatal — page may have navigated */ }
+}
+
+// DOM-based click: find a visible interactive element (button, link, menuitem,
+// option, tab, [role="button"], etc.) whose text or aria-label matches the
+// target, and return its center coordinates in CSS pixels. This is more reliable
+// than OCR text boxes because it hits the actual clickable element.
+// If containerSelector is provided (as { role, className } object), search ONLY within that element (no page-wide fallback).
+// Returns { ok: true, x, y, text, tag } or { ok: false }.
+async function _clickByTextDom(page, target, containerSelector = null, options = {}) {
+  if (!page || !target) return { ok: false };
+  const _mode = (options?.mode || 'click');
+  try {
+    const _result = await page.evaluate(({ targetText, containerSel, mode }) => {
+      const _target = (targetText || '').toLowerCase().trim();
+      if (!_target) return null;
+
+      // Build container selector string from { role, className } object
+      let _containerEl = null;
+      if (containerSel && containerSel.role) {
+        let _sel = `[role="${containerSel.role}"]`;
+        if (containerSel.className) {
+          _sel += '.' + CSS.escape(containerSel.className);
+        }
+        _containerEl = document.querySelector(_sel);
+      }
+
+      // Find the top popup by z-index for overlay blocking
+      let _topPopupZ = -1;
+      let _topPopupRect = null;
+      const _popupSel = '[role="dialog"], [role="alertdialog"], [aria-modal="true"], [role="menu"], [role="listbox"]';
+      for (const _pel of document.querySelectorAll(_popupSel)) {
+        const _s = window.getComputedStyle(_pel);
+        if (_s.display === 'none' || _s.visibility === 'hidden' || parseFloat(_s.opacity) === 0) continue;
+        const _r = _pel.getBoundingClientRect();
+        if (_r.width < 10 || _r.height < 10) continue;
+        const _z = parseInt(_s.zIndex) || 0;
+        if (_z > _topPopupZ) {
+          _topPopupZ = _z;
+          _topPopupRect = { x: _r.x + _r.width / 2, y: _r.y + _r.height / 2 };
+        }
+      }
+
+      function _isInsidePopup(el) {
+        let _cur = el;
+        while (_cur) {
+          if (_cur.getAttribute && (_cur.getAttribute('role') === 'dialog' || _cur.getAttribute('role') === 'alertdialog' || _cur.getAttribute('aria-modal') === 'true' || _cur.getAttribute('role') === 'menu' || _cur.getAttribute('role') === 'listbox')) {
+            return true;
+          }
+          _cur = _cur.parentElement;
+        }
+        return false;
+      }
+
+      function _scoreElement(el) {
+        const _text = (el.innerText || el.textContent || '').trim().toLowerCase();
+        const _aria = (el.getAttribute('aria-label') || '').trim().toLowerCase();
+        const _elType = (el.type || '').toLowerCase();
+        const _useValue = el.tagName === 'INPUT' && ['submit', 'button', 'reset', 'image'].includes(_elType);
+        const _val = _useValue ? (el.value || '').trim().toLowerCase() : '';
+        const _ph = (el.placeholder || '').trim().toLowerCase();
+        const _label = _text + ' ' + _aria + ' ' + _val + ' ' + _ph;
+        if (!_label.trim()) return null;
+        let _score = Infinity;
+        if (_text === _target || _aria === _target || _val === _target || _ph === _target) _score = 0;
+        else if (_text.includes(_target) || _aria.includes(_target) || _val.includes(_target) || _ph.includes(_target)) _score = 1;
+        else if (_text.startsWith(_target) || _aria.startsWith(_target) || _ph.startsWith(_target)) _score = 2;
+        else {
+          const _targetWords = _target.split(/\s+/).filter(w => w.length > 2);
+          if (_targetWords.length > 0 && _targetWords.every(w => _label.includes(w))) {
+            _score = 3 + Math.abs(_text.length - _target.length) / 10;
+          }
+        }
+        if (_score === Infinity) return null;
+        const r = el.getBoundingClientRect();
+        return {
+          x: Math.round(r.x + r.width / 2),
+          y: Math.round(r.y + r.height / 2),
+          text: (el.innerText || el.textContent || el.getAttribute('aria-label') || el.placeholder || el.value || '').trim().slice(0, 40),
+          tag: el.tagName.toLowerCase(),
+          role: el.getAttribute('role') || '',
+          _score,
+          _rect: { x: r.x + r.width / 2, y: r.y + r.height / 2 },
+        };
+      }
+
+      function _findInRoot(root) {
+        const _clickSelectors = [
+          'button', 'a', '[role="button"]', '[role="link"]',
+          '[role="menuitem"]', '[role="menuitemcheckbox"]', '[role="menuitemradio"]',
+          '[role="tab"]', '[role="option"]', '[role="treeitem"]',
+          'input[type="submit"]', 'input[type="button"]',
+        ];
+        const _fieldSelectors = _clickSelectors.concat([
+          'input[type="text"]', 'input[type="search"]', 'input:not([type])',
+          'textarea', '[contenteditable="true"]', '[role="textbox"]', '[role="searchbox"]',
+        ]);
+        const _sel = (mode === 'field' ? _fieldSelectors : _clickSelectors).join(', ');
+        const _els = Array.from(root.querySelectorAll(_sel));
+        let _candidates = [];
+        for (const el of _els) {
+          const r = el.getBoundingClientRect();
+          if (r.width < 5 || r.height < 5) continue;
+          const s = window.getComputedStyle(el);
+          if (s.display === 'none' || s.visibility === 'hidden' || parseFloat(s.opacity) === 0) continue;
+          // Skip noise dialogs
+          let _inNoise = false;
+          let _cur = el;
+          while (_cur) {
+            if (_cur.getAttribute && _cur.getAttribute('role') === 'dialog') {
+              const _dt = (_cur.innerText || '').toLowerCase();
+              if (/cookie|consent|privacy|language|gdpr/.test(_dt)) { _inNoise = true; break; }
+            }
+            _cur = _cur.parentElement;
+          }
+          if (_inNoise) continue;
+          // Z-index overlay blocking: if a popup is on top and this element is not inside it, skip
+          if (_topPopupZ > 0 && !_isInsidePopup(el)) {
+            const _elZ = parseInt(s.zIndex) || 0;
+            if (_elZ < _topPopupZ) continue;
+          }
+          const _scored = _scoreElement(el);
+          if (_scored) _candidates.push(_scored);
+        }
+        if (_candidates.length === 0) return null;
+        // Sort by score, then by proximity to popup center
+        _candidates.sort((a, b) => {
+          if (a._score !== b._score) return a._score - b._score;
+          // Tie-break: prefer element closer to top popup center
+          if (_topPopupRect) {
+            const _da = Math.hypot(a._rect.x - _topPopupRect.x, a._rect.y - _topPopupRect.y);
+            const _db = Math.hypot(b._rect.x - _topPopupRect.x, b._rect.y - _topPopupRect.y);
+            return _da - _db;
+          }
+          return 0;
+        });
+        return _candidates[0];
+      }
+
+      // When container is provided, search ONLY inside it — no page-wide fallback
+      if (containerSel && containerSel.role && !_containerEl) return null;
+      return _findInRoot(_containerEl || document);
+    }, { targetText: target, containerSel: containerSelector, mode: _mode });
+    if (_result) {
+      delete _result._score;
+      delete _result._rect;
+      return { ok: true, ..._result };
+    }
+  } catch (_) { /* page may have navigated */ }
+  return { ok: false };
+}
+
+// Main Tier 1.8 entry point — DOM-primary visual discovery loop
+async function _executeVisualDiscoveryLoop({ goal, verificationGoal, sessionId, headed, timeoutMs, agentContext, deadline, start, heartbeat, hostname, _preDecomposedSubTasks = null, _progressCallbackUrl, _stepIndex }) {
+  const _vdStart = Date.now();
+  logger.info(`[playwright.agent] Tier 1.8 (Visual Discovery): starting for goal="${goal.slice(0, 80)}"`);
+
+  try {
+    const page = engine.getPage(sessionId);
+    if (!page) return { ok: false, error: 'no page' };
+
+    // Use pre-decomposed sub-tasks (from playwrightAgent's early decomposition)
+    let _subTasks = _preDecomposedSubTasks;
+    if (!_subTasks) {
+      const _decomp = await _decomposeGoalIntoSubTasks(goal, sessionId);
+      if (_decomp.ok && _decomp.subTasks) _subTasks = _decomp.subTasks;
+    }
+    if (!_subTasks || _subTasks.length === 0) {
+      logger.warn(`[playwright.agent] Tier 1.8: no sub-tasks — falling through`);
+      return { ok: false, error: 'no sub-tasks available' };
+    }
+    logger.info(`[playwright.agent] Tier 1.8: ${_subTasks.length} sub-tasks`);
+
+    // Auto-complete navigate-type sub-tasks — URL-first handles navigation, not Tier 1.8
+    const _navigateRe = /^(navigate|go to|open|visit|log in|login|sign in|reach)/i;
+    for (const _st of _subTasks) {
+      if (!_st.completed && _navigateRe.test(_st.description)) {
+        _st.completed = true;
+        logger.info(`[playwright.agent] Tier 1.8: auto-completed navigate sub-task #${_st.id} "${_st.description.slice(0, 60)}" (URL-first handles navigation)`);
+      }
+    }
+
+    const _vdTranscript = [];
+    const MAX_ACTIONS_PER_SUBTASK = 8;
+    const MAX_NO_OP_BEFORE_BACKTRACK = 2;
+    let _prevOcrItems = null;
+
+    // Emit tier progress
+    postProgress(_progressCallbackUrl, {
+      type: 'agent:tier',
+      stepIndex: _stepIndex,
+      tier: 'visual-discovery',
+      message: `Visual Discovery loop: ${_subTasks.length} sub-tasks`,
+    });
+
+    for (let _stIdx = 0; _stIdx < _subTasks.length; _stIdx++) {
+      const _st = _subTasks[_stIdx];
+      if (_st.completed) continue;
+      if (Date.now() > deadline) {
+        logger.warn(`[playwright.agent] Tier 1.8: deadline exceeded at sub-task #${_st.id}`);
+        return { ok: false, error: 'deadline exceeded', transcript: _vdTranscript, subTasks: _subTasks };
+      }
+
+      logger.info(`[playwright.agent] Tier 1.8: sub-task #${_st.id}/${_subTasks.length} — "${_st.description.slice(0, 80)}"`);
+
+      postProgress(_progressCallbackUrl, {
+        type: 'agent:tier',
+        stepIndex: _stepIndex,
+        tier: 'visual-discovery',
+        message: `Sub-task ${_st.id}/${_subTasks.length}: ${_st.description.slice(0, 80)}`,
+      });
+
+      // 1. Capture beforeState: DOM state (primary) + OCR (supplement/fallback)
+      let _beforeState = await _captureDomState(page);
+      let _currentUrl = _beforeState.url || '';
+      let _beforeOcr = null;
+      if (_prevOcrItems && (Date.now() - (_prevOcrItems._ts || 0)) < 3000 && _prevOcrItems._url === _currentUrl) {
+        _beforeOcr = _prevOcrItems;
+        logger.info(`[playwright.agent] Tier 1.8: reusing cached OCR from previous sub-task (${_beforeOcr.length} items)`);
+      } else {
+        const _cap = await _liteparseCapture(page);
+        if (!_cap.ok) {
+          logger.warn(`[playwright.agent] Tier 1.8: LiteParser capture failed — falling through`);
+          return { ok: false, error: 'LiteParser capture failed', transcript: _vdTranscript, subTasks: _subTasks };
+        }
+        _beforeOcr = _cap.textItems || [];
+        _beforeOcr._ts = Date.now();
+        _beforeOcr._imgW = _cap.imageWidth;
+        _beforeOcr._imgH = _cap.imageHeight;
+        _beforeOcr._url = _currentUrl;
+      }
+
+      // Probe revealable menus
+      let _revealableMenus = await _probeRevealableMenus(page);
+      logger.info(`[playwright.agent] Tier 1.8: ${_revealableMenus.length} revealable menu candidates, ${_beforeState.popups.length} popups, ${_beforeState.buttons.length} buttons`);
+
+      const _imgW0 = _beforeOcr._imgW || 1280;
+      const _imgH0 = _beforeOcr._imgH || 800;
+      const _noiseRects = await _getNoiseDialogRects(page, _imgW0, _imgH0);
+
+      let _actionCount = 0;
+      let _noOpCount = 0;
+      let _probedMenuIdx = 0;
+      const _recentClicks = [];
+      const _recentActions = [];
+      let _lastDiff = null;
+      let _lastOcrDiff = null;
+
+      // 2. Action loop for this sub-task
+      while (_actionCount < MAX_ACTIONS_PER_SUBTASK) {
+        if (Date.now() > deadline) break;
+
+        // Re-fetch page in case it closed mid-action
+        const page = engine.getPage(sessionId);
+        if (!page || page.isClosed()) {
+          logger.warn(`[playwright.agent] Tier 1.8: page closed mid-action — breaking`);
+          break;
+        }
+
+        // Loop detection: if the last 2 clicks were at the same coordinates AND no popup is open,
+        // force a backtrack (pressEscape + try a different approach)
+        if (_recentClicks.length >= 2 && _beforeState.popups.length === 0) {
+          const _last = _recentClicks[_recentClicks.length - 1];
+          const _prev = _recentClicks[_recentClicks.length - 2];
+          if (_last.x === _prev.x && _last.y === _prev.y) {
+            // Check if new elements appeared despite same coord click — if so, don't Escape
+            const _hasNew = _lastDiff && (_lastDiff.newButtons.length > 0 || _lastDiff.newInputs.length > 0 || _lastDiff.newPopups.length > 0);
+            const _hasNewOcr = _lastOcrDiff && _lastOcrDiff.added && _lastOcrDiff.added.length > 0;
+            if (_hasNew || _hasNewOcr) {
+              logger.info(`[playwright.agent] Tier 1.8: same coord clicked twice but new elements appeared — skipping Escape`);
+              _recentClicks.length = 0;
+              _noOpCount = 0;
+              continue;
+            }
+            logger.warn(`[playwright.agent] Tier 1.8: loop detected — same coord (${_last.x},${_last.y}) clicked twice — forcing backtrack`);
+            await page.keyboard.press('Escape').catch(() => {});
+            await page.waitForTimeout(400);
+            _beforeState = await _captureDomState(page);
+            const _reCap = await _liteparseCapture(page);
+            if (_reCap.ok) {
+              _beforeOcr = _reCap.textItems || [];
+              _beforeOcr._ts = Date.now();
+              _beforeOcr._imgW = _reCap.imageWidth;
+              _beforeOcr._imgH = _reCap.imageHeight;
+              _beforeOcr._url = _beforeState.url || '';
+            }
+            _revealableMenus = await _probeRevealableMenus(page);
+            _recentClicks.length = 0;
+            _noOpCount = 0;
+            _probedMenuIdx++;
+            _lastDiff = null;
+            _lastOcrDiff = null;
+            continue;
+          }
+        }
+
+        // Loading state detection: if page is loading, wait and re-capture
+        if (_beforeState.isLoading) {
+          logger.info(`[playwright.agent] Tier 1.8: page is loading — waiting 1s and re-capturing`);
+          await page.waitForTimeout(1000);
+          _beforeState = await _captureDomState(page);
+          if (!_beforeState.isLoading) {
+            logger.info(`[playwright.agent] Tier 1.8: loading completed — continuing`);
+            continue;
+          }
+          // Still loading after 1s — wait more
+          await page.waitForTimeout(1000);
+          _beforeState = await _captureDomState(page);
+          if (_beforeState.isLoading) {
+            logger.warn(`[playwright.agent] Tier 1.8: still loading after 2s — proceeding anyway`);
+          }
+          continue;
+        }
+
+        // Build DOM state prompt block
+        const _domBlock = _buildDomStatePromptBlock(_beforeState);
+
+        // Build filtered OCR for prompt (supplement)
+        const _ocrFiltered = _filterOcrForPrompt(_beforeOcr, {
+          imageWidth: _beforeOcr._imgW || 1280,
+          imageHeight: _beforeOcr._imgH || 800,
+          noiseDialogRects: _noiseRects,
+        });
+        const _ocrForPrompt = _ocrFiltered.formatted;
+
+        // Build revealable menus list for prompt
+        const _menusForPrompt = _revealableMenus.slice(0, 12).map((m, i) => {
+          const _ctx = [];
+          if (m.inNav) _ctx.push('nav');
+          if (m.inToolbar) _ctx.push('toolbar');
+          if (m.inMenu) _ctx.push('menu');
+          const _ctxStr = _ctx.length > 0 ? ` in-${_ctx.join('+')}` : '';
+          const _roleStr = m.role ? `[role=${m.role}]` : '';
+          return `  [${i}] "${m.text}" ${m.tag}${_roleStr}[${m.hint}]${_ctxStr} at (${m.rect.x},${m.rect.y}) ${m.rect.w}x${m.rect.h}`;
+        }).join('\n');
+
+        // Build sub-task progress block
+        const _progressBlock = _buildSubTaskProgressBlock(_subTasks);
+
+        // Build diff block from last action
+        const _diffBlock = _buildDiffPromptBlock(_lastDiff, _lastOcrDiff);
+
+        // Build recent actions block
+        let _recentActionsBlock = '';
+        if (_recentActions.length > 0) {
+          _recentActionsBlock = 'RECENT ACTIONS (avoid repeating the same action):\n' +
+            _recentActions.map((a, i) => `  ${i + 1}. ${a.action}${a.text ? ` "${a.text}"` : ''} → ${a.ok ? 'ok' : 'failed'}${a.result ? ` (${a.result.slice(0, 80)})` : ''}`).join('\n') + '\n';
+        }
+
+        const _turnUser = `SUB-TASK #${_st.id}: ${_st.description}
+VERIFICATION: ${_st.verification}
+EXPECTED STATE AFTER: ${_st.expectedState || '(not specified)'}
+
+SUB-TASK PROGRESS:
+${_progressBlock}
+
+${_recentActionsBlock}
+${_actionCount > 0 ? _diffBlock + '\n' : ''}
+CURRENT PAGE STATE:
+URL: ${_beforeState.url || '(unknown)'}
+Title: ${_beforeState.title || '(none)'}
+Scroll: ${_beforeState.scrollY}px${_beforeState.canScrollDown ? ' (can scroll down)' : ''}${_beforeState.canScrollUp ? ' (can scroll up)' : ''}
+
+${_domBlock}
+
+OCR TEXT ITEMS (supplement — what's visually visible):
+${_ocrForPrompt.slice(0, 2000)}
+
+REVEALABLE TRIGGERS (click to open hidden UI):
+${_menusForPrompt || '(none detected)'}
+
+${_noOpCount > 0 ? `\n⚠️ LAST ${_noOpCount} ACTION(S) HAD NO EFFECT. Try a COMPLETELY different approach — probe a hidden menu, scroll, or reconsider.\n` : ''}
+${agentContext ? `\nSITE-SPECIFIC RULES:\n${agentContext}\n` : ''}
+${_actionCount === 0 ? 'What is your first action to complete this sub-task?' : `Action ${_actionCount + 1}/${MAX_ACTIONS_PER_SUBTASK}. What is your next action?`}
+
+Output ONLY the JSON action:`;
+
+        let _actionRaw;
+        try {
+          _actionRaw = await askWithMessages([
+            { role: 'system', content: VISUAL_DISCOVERY_SYSTEM_PROMPT },
+            { role: 'user', content: _turnUser },
+          ], { temperature: 0.1, maxTokens: 400, responseTimeoutMs: 20000 });
+        } catch (_llmErr) {
+          logger.warn(`[playwright.agent] Tier 1.8: LLM call failed: ${_llmErr.message}`);
+          if (_llmErr.message.includes('Circuit breaker')) break;
+          _actionCount++;
+          continue;
+        }
+
+        if (!_actionRaw || _actionRaw.length === 0) {
+          logger.warn(`[playwright.agent] Tier 1.8: LLM returned empty response`);
+          _actionCount++;
+          continue;
+        }
+
+        const _action = parseJson(_actionRaw);
+        if (!_action || !_action.action) {
+          logger.warn(`[playwright.agent] Tier 1.8: unparseable action: ${(_actionRaw || '').slice(0, 100)}`);
+          _actionCount++;
+          continue;
+        }
+
+        // Return = sub-task done
+        if (_action.action === 'return') {
+          let _retUrl = '';
+          try { _retUrl = page.url(); } catch (_) {}
+          const _retText = await page.evaluate(() => document.body.innerText.slice(0, 8000)).catch(() => '');
+          const _sv = await _structuralVerifySubTask(_st, { page, pageUrl: _retUrl, pageText: _retText, transcript: _vdTranscript, sessionId });
+          if (_sv.verified) {
+            _st.completed = true;
+            logger.info(`[playwright.agent] Tier 1.8: sub-task #${_st.id} completed (return + structural verification: ${_sv.gate}: ${_sv.reason})`);
+            _vdTranscript.push({ action: _action, outcome: { ok: true }, subTask: _st.id });
+            break;
+          } else {
+            const _basic = await _checkSubTaskCompletion(_st, page, _retUrl, _retText);
+            if (_basic) {
+              _st.completed = true;
+              logger.info(`[playwright.agent] Tier 1.8: sub-task #${_st.id} completed (return + basic verification passed)`);
+              _vdTranscript.push({ action: _action, outcome: { ok: true }, subTask: _st.id });
+              break;
+            }
+            logger.warn(`[playwright.agent] Tier 1.8: sub-task #${_st.id} return rejected — verification not met (${_sv.gate}: ${_sv.reason})`);
+            _actionCount++;
+            continue;
+          }
+        }
+
+        // 3. Determine popup container for scoped clicks
+        const _popupContainer = _beforeState.popups.length > 0 ? _beforeState.popups[0] : null;
+        const _containerSelector = _popupContainer
+          ? { role: _popupContainer.role, className: _popupContainer.className ? _popupContainer.className.split(' ')[0] : '' }
+          : null;
+
+        // 4. Execute the action
+        let _outcome;
+        const _imgW = _beforeOcr._imgW || 1280;
+        const _imgH = _beforeOcr._imgH || 800;
+        const _vpW = page.viewportSize()?.width || 1280;
+        const _vpH = page.viewportSize()?.height || 800;
+        const _scaleX = _vpW / _imgW;
+        const _scaleY = _vpH / _imgH;
+
+        try {
+          if (_action.action === 'pressEscape') {
+            await page.keyboard.press('Escape');
+            _outcome = { ok: true, result: 'Escape pressed' };
+            logger.info(`[playwright.agent] Tier 1.8: pressed Escape`);
+          } else if (_action.action === 'press') {
+            await page.keyboard.press(_action.key || 'Enter');
+            _outcome = { ok: true, result: `Pressed ${_action.key || 'Enter'}` };
+            logger.info(`[playwright.agent] Tier 1.8: pressed ${_action.key || 'Enter'}`);
+          } else if (_action.action === 'scroll') {
+            const _dir = _action.direction || 'down';
+            const _amount = _action.amount || 300;
+            const _dy = _dir === 'up' ? -_amount : _amount;
+            await page.mouse.wheel(0, _dy);
+            await page.waitForTimeout(400);
+            _outcome = { ok: true, result: `Scrolled ${_dir} ${_amount}px` };
+            logger.info(`[playwright.agent] Tier 1.8: scrolled ${_dir} ${_amount}px`);
+          } else if (_action.action === 'hover') {
+            const _hoverTarget = _action.text || '';
+            const _domHover = await _clickByTextDom(page, _hoverTarget, _containerSelector);
+            if (_domHover.ok) {
+              await page.mouse.move(_domHover.x, _domHover.y);
+              await page.waitForTimeout(500);
+              _outcome = { ok: true, result: `Hovered "${_domHover.text}" at (${_domHover.x}, ${_domHover.y})` };
+              logger.info(`[playwright.agent] Tier 1.8: hovered "${_domHover.text}" at (${_domHover.x}, ${_domHover.y})`);
+            } else {
+              _outcome = { ok: false, error: `No DOM match for hover target "${_hoverTarget}"` };
+            }
+          } else if (_action.action === 'clickByText') {
+            const _target = _action.text || '';
+            // ── Strategy 1: DOM-based click (PRIMARY — scoped to popup if open) ──
+            const _domClick = await _clickByTextDom(page, _target, _containerSelector);
+            if (_domClick.ok) {
+              const _clickX = _domClick.x;
+              const _clickY = _domClick.y;
+              logger.info(`[playwright.agent] Tier 1.8: clicking "${_domClick.text}" at (${_clickX}, ${_clickY}) via DOM match (${_domClick.tag}${_domClick.role ? `[role=${_domClick.role}]` : ''}) for "${_target}"${_containerSelector ? ' (in popup)' : ''}`);
+              await _highlightClickInPage(page, _clickX, _clickY, _domClick.text);
+              await page.waitForTimeout(400);
+              await page.mouse.click(_clickX, _clickY);
+              _outcome = { ok: true, result: `Clicked "${_domClick.text}" at (${_clickX}, ${_clickY}) via DOM` };
+              _recentClicks.push({ x: _clickX, y: _clickY }); if (_recentClicks.length > 3) _recentClicks.shift();
+            } else {
+              // ── Strategy 2: OCR-based click with STRICT type filtering (fallback) ──
+              const _candidates = (_ocrFiltered.filtered.length > 0 ? _ocrFiltered.filtered : _beforeOcr)
+                .filter(item => item._type === 'button' || item._type === 'link' || item._type === 'input');
+              let _bestItem = null;
+              let _bestScore = Infinity;
+              for (const item of _candidates) {
+                const _m = _fuzzyMatchText(_target, item.text, 2);
+                if (_m.match) {
+                  const _lenPenalty = item.text.length < _target.length ? (_target.length - item.text.length) * 2 : 0;
+                  const _score = _m.distance + _lenPenalty + (_m.exact ? -2 : 0);
+                  if (_score < _bestScore) { _bestScore = _score; _bestItem = item; }
+                }
+              }
+              if (_bestItem) {
+                const _clickX = Math.round((_bestItem.x + (_bestItem.width || 0) / 2) * _scaleX);
+                const _clickY = Math.round((_bestItem.y + (_bestItem.height || 0) / 2) * _scaleY);
+                logger.info(`[playwright.agent] Tier 1.8: clicking "${_bestItem.text}" at (${_clickX}, ${_clickY}) — OCR match for "${_target}" (score=${_bestScore}, type=${_bestItem._type})`);
+                await _highlightClickInPage(page, _clickX, _clickY, _bestItem.text);
+                await page.waitForTimeout(400);
+                await page.mouse.click(_clickX, _clickY);
+                _outcome = { ok: true, result: `Clicked "${_bestItem.text}" at (${_clickX}, ${_clickY}) via OCR` };
+                _recentClicks.push({ x: _clickX, y: _clickY }); if (_recentClicks.length > 3) _recentClicks.shift();
+              } else {
+                // ── Strategy 3: Revealable menus DOM rect (last resort) ──
+                const _menuMatch = _revealableMenus.find(m => _fuzzyMatchText(_target, m.text, 2).match || _fuzzyMatchText(_target, m.ariaLabel || '', 2).match);
+                if (_menuMatch) {
+                  const _clickX = Math.round((_menuMatch.rect.x + _menuMatch.rect.w / 2) * _scaleX);
+                  const _clickY = Math.round((_menuMatch.rect.y + _menuMatch.rect.h / 2) * _scaleY);
+                  logger.info(`[playwright.agent] Tier 1.8: clicking menu "${_menuMatch.text}" at (${_clickX}, ${_clickY}) via DOM rect`);
+                  await _highlightClickInPage(page, _clickX, _clickY, _menuMatch.text);
+                  await page.waitForTimeout(400);
+                  await page.mouse.click(_clickX, _clickY);
+                  _outcome = { ok: true, result: `Clicked menu "${_menuMatch.text}" at (${_clickX}, ${_clickY})` };
+                  _recentClicks.push({ x: _clickX, y: _clickY }); if (_recentClicks.length > 3) _recentClicks.shift();
+                } else {
+                  _outcome = { ok: false, error: `No DOM/OCR/menu match for "${_target}"` };
+                  logger.warn(`[playwright.agent] Tier 1.8: no match for "${_target}"`);
+                }
+              }
+            }
+          } else if (_action.action === 'type') {
+            const _fieldTarget = _action.fieldText || '';
+            // ── Strategy 1: DOM-based field finding (PRIMARY — scoped to popup if open) ──
+            const _domField = await _clickByTextDom(page, _fieldTarget, _containerSelector, { mode: 'field' });
+            if (_domField.ok) {
+              const _clickX = _domField.x;
+              const _clickY = _domField.y;
+              logger.info(`[playwright.agent] Tier 1.8: clicking field "${_domField.text}" at (${_clickX}, ${_clickY}) via DOM then typing "${_action.text}"${_containerSelector ? ' (in popup)' : ''}`);
+              await _highlightClickInPage(page, _clickX, _clickY, _domField.text);
+              await page.waitForTimeout(400);
+              await page.mouse.click(_clickX, _clickY);
+              await page.waitForTimeout(200);
+              await page.mouse.click(_clickX, _clickY, { clickCount: 3 });
+              await page.waitForTimeout(100);
+              await page.keyboard.press('Meta+A');
+              await page.keyboard.press('Delete');
+              await page.keyboard.type(_action.text || '', { delay: 50 });
+              _outcome = { ok: true, result: `Typed "${_action.text}" into "${_domField.text}" via DOM` };
+            } else {
+              // ── Strategy 2: OCR-based with strict input filtering ──
+              const _candidates = (_ocrFiltered.filtered.length > 0 ? _ocrFiltered.filtered : _beforeOcr)
+                .filter(item => item._type === 'input');
+              let _fieldItem = null;
+              let _fieldScore = Infinity;
+              for (const item of _candidates) {
+                const _m = _fuzzyMatchText(_fieldTarget, item.text, 2);
+                if (_m.match) {
+                  const _score = _m.distance + (_m.exact ? -2 : 0);
+                  if (_score < _fieldScore) { _fieldScore = _score; _fieldItem = item; }
+                }
+              }
+              if (_fieldItem) {
+                const _clickX = Math.round((_fieldItem.x + (_fieldItem.width || 0) / 2) * _scaleX);
+                const _clickY = Math.round((_fieldItem.y + (_fieldItem.height || 0) / 2) * _scaleY);
+                logger.info(`[playwright.agent] Tier 1.8: clicking field "${_fieldItem.text}" at (${_clickX}, ${_clickY}) via OCR then typing "${_action.text}"`);
+                await _highlightClickInPage(page, _clickX, _clickY, _fieldItem.text);
+                await page.waitForTimeout(400);
+                await page.mouse.click(_clickX, _clickY);
+                await page.waitForTimeout(200);
+                await page.mouse.click(_clickX, _clickY, { clickCount: 3 });
+                await page.waitForTimeout(100);
+                await page.keyboard.press('Meta+A');
+                await page.keyboard.press('Delete');
+                await page.keyboard.type(_action.text || '', { delay: 50 });
+                _outcome = { ok: true, result: `Typed "${_action.text}" into "${_fieldItem.text}" via OCR` };
+              } else {
+                // ── Strategy 3: Revealable menus for input fields ──
+                const _fieldMenuMatch = _revealableMenus.find(m => _fuzzyMatchText(_fieldTarget, m.text, 2).match || _fuzzyMatchText(_fieldTarget, m.ariaLabel || '', 2).match);
+                if (_fieldMenuMatch) {
+                  const _clickX = Math.round((_fieldMenuMatch.rect.x + _fieldMenuMatch.rect.w / 2) * _scaleX);
+                  const _clickY = Math.round((_fieldMenuMatch.rect.y + _fieldMenuMatch.rect.h / 2) * _scaleY);
+                  logger.info(`[playwright.agent] Tier 1.8: clicking field menu "${_fieldMenuMatch.text}" at (${_clickX}, ${_clickY}) then typing "${_action.text}"`);
+                  await _highlightClickInPage(page, _clickX, _clickY, _fieldMenuMatch.text);
+                  await page.waitForTimeout(400);
+                  await page.mouse.click(_clickX, _clickY);
+                  await page.waitForTimeout(200);
+                  await page.keyboard.type(_action.text || '', { delay: 50 });
+                  _outcome = { ok: true, result: `Typed "${_action.text}" into "${_fieldMenuMatch.text}"` };
+                } else {
+                  _outcome = { ok: false, error: `No DOM/OCR/menu match for field "${_fieldTarget}"` };
+                  logger.warn(`[playwright.agent] Tier 1.8: no match for field "${_fieldTarget}"`);
+                }
+              }
+            }
+          } else {
+            _outcome = { ok: false, error: `Unknown action: ${_action.action}` };
+          }
+        } catch (_execErr) {
+          _outcome = { ok: false, error: _execErr.message };
+        }
+        _vdTranscript.push({ action: _action, outcome: _outcome, subTask: _st.id });
+        _actionCount++;
+
+        // Track recent actions for prompt awareness
+        _recentActions.push({
+          action: _action.action,
+          text: _action.text || _action.fieldText || '',
+          ok: _outcome.ok,
+          result: _outcome.ok ? (_outcome.result || '') : (_outcome.error || ''),
+        });
+        if (_recentActions.length > 3) _recentActions.shift();
+
+        postProgress(_progressCallbackUrl, {
+          type: 'agent:turn',
+          stepIndex: _stepIndex,
+          turn: _actionCount,
+          maxTurns: MAX_ACTIONS_PER_SUBTASK,
+          action: _action,
+          outcome: _outcome,
+          thoughts: _action.reasoning || '',
+        });
+
+        if (!_outcome.ok) {
+          logger.warn(`[playwright.agent] Tier 1.8: action failed: ${_outcome.error}`);
+          continue;
+        }
+
+        // 5. Wait for page to settle after click/type/scroll
+        await page.waitForTimeout(800);
+
+        // 6. Capture afterState via DOM state (primary)
+        const _afterState = await _captureDomState(page);
+
+        // 7. Compare DOM states (deterministic)
+        let _compare = _compareDomState(_beforeState, _afterState, _action.expectChange);
+        logger.info(`[playwright.agent] Tier 1.8: DOM compare → ${_compare.direction} — ${_compare.reason}`);
+
+        // 7a. Compute state diff for next prompt (regardless of compare direction)
+        _lastDiff = _computeStateDiff(_beforeState, _afterState);
+
+        // 7b. If DOM comparison is inconclusive (same), fall back to OCR comparison
+        if (_compare.direction === 'same') {
+          const _afterCap = await _liteparseCapture(page);
+          let _afterOcr = _beforeOcr;
+          if (_afterCap.ok) {
+            _afterOcr = _afterCap.textItems || [];
+            _afterOcr._ts = Date.now();
+            _afterOcr._imgW = _afterCap.imageWidth;
+            _afterOcr._imgH = _afterCap.imageHeight;
+            _afterOcr._url = _afterState.url || '';
+          }
+          const _ocrCompare = _visualCompare({
+            beforeOcr: _beforeOcr,
+            afterOcr: _afterOcr,
+            beforeDomHash: _beforeState.hash,
+            afterDomHash: _afterState.hash,
+            subTask: _st,
+            expectChange: _action.expectChange,
+          });
+          if (_ocrCompare.direction !== 'same') {
+            _compare = _ocrCompare;
+            logger.info(`[playwright.agent] Tier 1.8: OCR fallback compare → ${_compare.direction} — ${_compare.reason}`);
+          }
+          // Compute OCR diff for prompt
+          _lastOcrDiff = _diffOcrText(_beforeOcr, _afterOcr);
+          // Update OCR cache
+          _beforeOcr = _afterOcr;
+          _prevOcrItems = _afterOcr;
+        } else {
+          _lastOcrDiff = null;
+        }
+
+        if (_compare.direction === 'same') {
+          _noOpCount++;
+          if (_noOpCount >= MAX_NO_OP_BEFORE_BACKTRACK) {
+            logger.warn(`[playwright.agent] Tier 1.8: ${_noOpCount} no-ops — backtracking`);
+            // Smart backtrack: if diff shows new elements appeared, don't Escape — let LLM try them
+            const _hasNewElements = _lastDiff && (_lastDiff.newButtons.length > 0 || _lastDiff.newInputs.length > 0 || _lastDiff.newPopups.length > 0);
+            const _hasNewOcr = _lastOcrDiff && _lastOcrDiff.added && _lastOcrDiff.added.length > 0;
+            if (_hasNewElements || _hasNewOcr) {
+              logger.info(`[playwright.agent] Tier 1.8: new elements detected in diff — skipping Escape, letting LLM interact`);
+              _noOpCount = 0;
+              _beforeState = _afterState;
+              continue;
+            }
+            // Smart backtrack: if popup is open, try scrolling first before dismissing
+            if (_afterState.popups.length > 0 && _afterState.canScrollDown) {
+              logger.info(`[playwright.agent] Tier 1.8: popup open + can scroll — trying scroll before Escape`);
+              await page.mouse.wheel(0, 300);
+              await page.waitForTimeout(400);
+              _beforeState = await _captureDomState(page);
+              _noOpCount = 0;
+              continue;
+            }
+            // Press Escape to dismiss current context
+            await page.keyboard.press('Escape').catch(() => {});
+            await page.waitForTimeout(400);
+            // Re-capture after escape
+            _beforeState = await _captureDomState(page);
+            const _reCap = await _liteparseCapture(page);
+            if (_reCap.ok) {
+              _beforeOcr = _reCap.textItems || [];
+              _beforeOcr._ts = Date.now();
+              _beforeOcr._imgW = _reCap.imageWidth;
+              _beforeOcr._imgH = _reCap.imageHeight;
+              _beforeOcr._url = _beforeState.url || '';
+            }
+            _revealableMenus = await _probeRevealableMenus(page);
+            _probedMenuIdx++;
+            _noOpCount = 0;
+            _recentClicks.length = 0;
+            _lastDiff = null;
+            _lastOcrDiff = null;
+            if (_probedMenuIdx > _revealableMenus.length + 3) {
+              logger.warn(`[playwright.agent] Tier 1.8: exhausted revealable menus — breaking sub-task`);
+              break;
+            }
+            continue;
+          }
+        } else {
+          _noOpCount = 0;
+        }
+
+        // Update beforeState for next iteration
+        _beforeState = _afterState;
+
+        // 8. Structural verification — only on return, toastAppeared, or navigated
+        const _shouldVerify = _action.action === 'return' || _compare.toastAppeared || _compare.navigated;
+        if (_shouldVerify) {
+          let _pageUrl = '', _pageText = '';
+          try { _pageUrl = page.url(); } catch (_) {}
+          _pageText = await page.evaluate(() => document.body.innerText.slice(0, 8000)).catch(() => '');
+
+          const _sv = await _structuralVerifySubTask(_st, { page, pageUrl: _pageUrl, pageText: _pageText, transcript: _vdTranscript, sessionId });
+          if (_sv.verified) {
+            _st.completed = true;
+            logger.info(`[playwright.agent] Tier 1.8: sub-task #${_st.id} completed (structural verification after ${_actionCount} action(s): ${_sv.gate}: ${_sv.reason})`);
+            const _finalCap = await _liteparseCapture(page);
+            if (_finalCap.ok) {
+              _prevOcrItems = _finalCap.textItems || [];
+              _prevOcrItems._ts = Date.now();
+              _prevOcrItems._imgW = _finalCap.imageWidth;
+              _prevOcrItems._imgH = _finalCap.imageHeight;
+              _prevOcrItems._url = _pageUrl;
+            }
+            break;
+          }
+
+          // Also try basic verification as secondary check
+          const _basicVerify = await _checkSubTaskCompletion(_st, page, _pageUrl, _pageText);
+          if (_basicVerify) {
+            _st.completed = true;
+            logger.info(`[playwright.agent] Tier 1.8: sub-task #${_st.id} completed (basic verification after ${_actionCount} action(s))`);
+            const _finalCap = await _liteparseCapture(page);
+            if (_finalCap.ok) {
+              _prevOcrItems = _finalCap.textItems || [];
+              _prevOcrItems._ts = Date.now();
+              _prevOcrItems._imgW = _finalCap.imageWidth;
+              _prevOcrItems._imgH = _finalCap.imageHeight;
+              _prevOcrItems._url = _pageUrl;
+            }
+            break;
+          }
+        }
+      } // end action loop
+
+      if (!_st.completed) {
+        logger.warn(`[playwright.agent] Tier 1.8: sub-task #${_st.id} not completed after ${_actionCount} actions — will fall through`);
+      }
+
+      postProgress(_progressCallbackUrl, {
+        type: 'agent:tier',
+        stepIndex: _stepIndex,
+        tier: 'visual-discovery',
+        message: _st.completed ? `Sub-task ${_st.id} completed` : `Sub-task ${_st.id} incomplete`,
+      });
+    } // end sub-task loop
+
+    // Check if all sub-tasks are complete
+    const _allComplete = _subTasks.every(s => s.completed);
+    if (_allComplete) {
+      const _execTime = Date.now() - _vdStart;
+      logger.info(`[playwright.agent] Tier 1.8: all ${_subTasks.length} sub-tasks completed in ${_execTime}ms`);
+      return {
+        ok: true,
+        result: `All ${_subTasks.length} sub-tasks completed (Tier 1.8 Visual Discovery)`,
+        transcript: _vdTranscript,
+        routingDecision: 'visual_discovery',
+        sessionId,
+        subTasks: _subTasks,
+      };
+    }
+
+    const _incomplete = _subTasks.filter(s => !s.completed).map(s => `#${s.id} ${s.description}`);
+    logger.warn(`[playwright.agent] Tier 1.8: ${_incomplete.length} sub-tasks incomplete: ${_incomplete.join(', ')}`);
+    return { ok: false, error: `Tier 1.8: ${_incomplete.length} sub-tasks incomplete`, transcript: _vdTranscript, subTasks: _subTasks };
+  } catch (e) {
+    logger.warn(`[playwright.agent] Tier 1.8 error: ${e.message}`);
+    return { ok: false, error: e.message };
+  }
+}
+
+// Build a human-readable DOM state block for the LLM prompt
+function _buildDomStatePromptBlock(state) {
+  const _lines = [];
+
+  // Popups (highest priority — act inside them)
+  if (state.popups.length > 0) {
+    _lines.push('OPEN POPUPS/MENUS/DIALOGS (act INSIDE these):');
+    for (let i = 0; i < state.popups.length; i++) {
+      const p = state.popups[i];
+      _lines.push(`  [popup ${i}] type=${p.type} role="${p.role}" text="${p.text}"${p.hasInput ? ` (has input: "${p.inputPlaceholder}")` : ''}`);
+      const _items = p.items.filter(it => !it.disabled).slice(0, 15);
+      for (const it of _items) {
+        _lines.push(`    - "${it.text}" ${it.tag}${it.role ? `[role=${it.role}]` : ''} at (${it.x},${it.y})${it.disabled ? ' [disabled]' : ''}`);
+      }
+      if (p.items.length > 15) _lines.push(`    ... and ${p.items.length - 15} more items`);
+    }
+  }
+
+  // Confirm dialogs
+  if (state.confirmDialogs.length > 0) {
+    _lines.push('CONFIRM DIALOGS:');
+    for (const d of state.confirmDialogs) {
+      _lines.push(`  "${d.text}" options: ${d.options.map(o => `"${o.text}"`).join(', ')}`);
+    }
+  }
+
+  // Toasts/notifications
+  if (state.toasts.length > 0) {
+    _lines.push('NOTIFICATIONS/TOASTS:');
+    for (const t of state.toasts) {
+      _lines.push(`  [${t.type}] "${t.text}"`);
+    }
+  }
+
+  // Validation errors
+  if (state.validationErrors.length > 0) {
+    _lines.push('VALIDATION ERRORS (fix these before proceeding):');
+    for (const e of state.validationErrors) {
+      _lines.push(`  field "${e.field}": ${e.message || '(invalid)'}`);
+    }
+  }
+
+  // Buttons
+  const _enabledButtons = state.buttons.filter(b => !b.disabled).slice(0, 25);
+  if (_enabledButtons.length > 0) {
+    _lines.push('BUTTONS/LINKS:');
+    for (const b of _enabledButtons) {
+      _lines.push(`  "${b.text}" ${b.tag}${b.role ? `[role=${b.role}]` : ''} at (${b.x},${b.y})`);
+    }
+  }
+
+  // Inputs
+  if (state.inputs.length > 0) {
+    _lines.push('INPUT FIELDS:');
+    for (const inp of state.inputs) {
+      _lines.push(`  "${inp.placeholder}" type=${inp.type}${inp.value ? ` value="${inp.value}"` : ''}${inp.isFocused ? ' [focused]' : ''}${inp.required ? ' [required]' : ''}${inp.invalid ? ' [invalid]' : ''} at (${inp.x},${inp.y})`);
+    }
+  }
+
+  // Selects
+  if (state.selects.length > 0) {
+    _lines.push('SELECTS:');
+    for (const sel of state.selects) {
+      _lines.push(`  "${sel.placeholder}" value="${sel.value}" options: ${sel.options.map(o => `${o.selected ? '►' : ''}"${o.text}"`).join(', ')}`);
+    }
+  }
+
+  // Checkboxes/Toggles
+  const _toggles = [...state.checkboxes, ...state.toggles];
+  if (_toggles.length > 0) {
+    _lines.push('CHECKBOXES/TOGGLES:');
+    for (const cb of _toggles) {
+      _lines.push(`  "${cb.label}" ${cb.checked ? '[✓]' : '[ ]'} at (${cb.x},${cb.y})`);
+    }
+  }
+
+  // Tabs
+  if (state.tabs.length > 0) {
+    _lines.push('TABS:');
+    for (const t of state.tabs) {
+      _lines.push(`  "${t.text}" ${t.ariaSelected === 'true' ? '[active]' : ''} at (${t.x},${t.y})`);
+    }
+  }
+
+  // Accordions/expanded elements
+  if (state.accordions.length > 0) {
+    _lines.push('ACCORDIONS:');
+    for (const a of state.accordions) {
+      _lines.push(`  "${a.text}" ${a.expanded ? '[expanded]' : '[collapsed]'} at (${a.x},${a.y})`);
+    }
+  }
+
+  // Tree items
+  if (state.treeItems.length > 0) {
+    _lines.push('TREE ITEMS:');
+    for (const t of state.treeItems) {
+      _lines.push(`  ${'  '.repeat(t.level)}"${t.text}" ${t.expanded ? '[expanded]' : ''}`);
+    }
+  }
+
+  // Pagination
+  if (state.pagination) {
+    _lines.push(`PAGINATION: page ${state.pagination.currentPage}/${state.pagination.totalPages}`);
+  }
+
+  // Load more
+  if (state.loadMoreButton) {
+    _lines.push(`LOAD MORE: "${state.loadMoreButton.text}" at (${state.loadMoreButton.x},${state.loadMoreButton.y})${state.loadMoreButton.disabled ? ' [disabled]' : ''}`);
+  }
+
+  // Cookie consent
+  if (state.cookieConsentVisible) {
+    _lines.push('⚠️ COOKIE CONSENT DIALOG VISIBLE — dismiss with pressEscape');
+  }
+
+  // Login wall
+  if (state.isLoginWall) {
+    _lines.push('⚠️ LOGIN WALL DETECTED — may need authentication');
+  }
+
+  return _lines.length > 0 ? _lines.join('\n') : '(no interactive elements detected)';
+}
+
 async function _executeStateDiffLoop({ goal, verificationGoal, sessionId, headed, timeoutMs, agentContext, deadline, start, heartbeat, hostname, _preDecomposedSubTasks = null, _progressCallbackUrl = null, _stepIndex = null }) {
   const _sdStart = Date.now();
   logger.info(`[playwright.agent] state-diff loop: starting for goal="${goal.slice(0, 80)}"`);
@@ -8992,7 +11035,7 @@ Output ONLY the JSON action:`;
   }
 }
 
-async function _executeTurnLoopFallback({ goal, verificationGoal, sessionId, headed, timeoutMs, agentContext, transcript, deadline, start, extractedText, heartbeat, textAlreadyEntered, maxTurns = 8, hostname, _discoveryAlreadyAttempted = false, _preDecomposedSubTasks = null, _inheritedActionSignatureCounts = null, _inheritedJitDiscoveryFired = null, _progressCallbackUrl, _stepIndex }) {
+async function _executeTurnLoopFallback({ goal, verificationGoal, sessionId, headed, timeoutMs, agentContext, transcript, deadline, start, extractedText, heartbeat, textAlreadyEntered, maxTurns = 8, hostname, _discoveryAlreadyAttempted = false, _preDecomposedSubTasks = null, _inheritedActionSignatureCounts = null, _inheritedJitDiscoveryFired = null, _progressCallbackUrl, _stepIndex, _abortSignal = null }) {
   const MAX_TURNS = maxTurns;
   const _loopTranscript = [...transcript];
 
@@ -9061,6 +11104,11 @@ async function _executeTurnLoopFallback({ goal, verificationGoal, sessionId, hea
   for (let turn = 1; turn <= MAX_TURNS; turn++) {
     if (Date.now() > deadline) {
       logger.warn(`[playwright.agent] turn-loop: deadline exceeded at turn ${turn}`);
+      break;
+    }
+    // Abort check — user clicked Cancel. Break out of the turn-loop cleanly.
+    if (_abortSignal && _abortSignal.aborted) {
+      logger.info(`[playwright.agent] turn-loop: cancelled by signal at turn ${turn}`);
       break;
     }
 
@@ -10356,6 +12404,7 @@ Turn ${turn}/${MAX_TURNS}. What is your next action? (DO NOT snapshot - act dire
         _preDecomposedSubTasks: _subTasks,
         _inheritedActionSignatureCounts: _actionSignatureCounts,
         _inheritedJitDiscoveryFired: _jitDiscoveryFiredForSubTask,
+        _abortSignal,
       }).catch((e) => { logger.warn(`[playwright.agent] turn-loop: discovery retry error (non-fatal): ${e.message}`); return null; });
 
       if (_retryResult?.ok) {
@@ -10568,7 +12617,13 @@ async function playwrightAgent(args) {
     overallTimeoutMs      = 120000,
     _progressCallbackUrl,
     _stepIndex            = 0,
+    _abortSignal          = null,
   } = args || {};
+
+  // Abort helper — true when the caller cancelled (user clicked Cancel).
+  // Checked at the top of every long loop so the agent stops promptly instead
+  // of running on after the HTTP request was destroyed.
+  const _aborted = () => !!(_abortSignal && _abortSignal.aborted);
 
   // ── Strip recovery-anchor preamble from goal ──────────────────────────────
   // browser.agent.cjs:5418 prepends "IMPORTANT: You are working on <url>..." to the
@@ -10627,6 +12682,15 @@ async function playwrightAgent(args) {
   // Start page heartbeat — continuous page state capture for LLM context
   const _heartbeat = new _PageHeartbeat(sessionId, 1000, 30);
   _heartbeat.start();
+
+  // Early abort check — if the caller already cancelled (e.g. user clicked
+  // Cancel during auth/probe before this run started), stop immediately.
+  if (_aborted()) {
+    logger.info(`[playwright.agent] cancelled before run — stopping heartbeat and returning`);
+    _heartbeat.stop();
+    try { await browserAct({ action: 'close', sessionId }); } catch (_) {}
+    return { ok: false, goal, sessionId, error: 'Cancelled by user', cancelled: true, turns: 0, transcript: [], executionTime: Date.now() - start };
+  }
 
   const transcript = [];
   let finalResult = null; // set by a 'return' step if present
@@ -11988,12 +14052,55 @@ async function playwrightAgent(args) {
     logger.warn(`[playwright.agent] phase 1.7: page study failed (non-fatal): ${_studyErr.message}`);
   }
 
-  // ── Tier 1.9: LiteParser-First Action Loop ────────────────────────────────
-  // Screenshot + OCR coordinates for deterministic, shadow-DOM-proof clicking.
-  // Runs before Tier 2 (Focused Plan-Execute) for multi-step goals.
-  // Falls through to Tier 2 if it can't complete.
-  if (_preDecomposedSubTasks && _preDecomposedSubTasks.length > 1) {
-    logger.info(`[playwright.agent] Tier 1.9: multi-step goal detected (${_preDecomposedSubTasks.length} sub-tasks) — trying LiteParser-first loop`);
+  // ── Tier 1.8 + Tier 1.9: DISABLED — multi-step goals fall through to Phase 2 turn-loop ──
+  // Tier 1.8 (Visual Discovery Loop, _executeVisualDiscoveryLoop) and Tier 1.9
+  // (LiteParser-First Loop, _executeLiteparseFirstLoop) were alternative multi-step
+  // executors that ran before Phase 2. They were insufficiently tested and produced
+  // brittle clicks (e.g. repeatedly clicking the global search field instead of the
+  // playlist menu on Spotify). Phase 2 (Focused Plan-Execute / LLM turn-loop) handles
+  // multi-step goals correctly and is the canonical executor.
+  // Function definitions are preserved above for future re-enable.
+  // To re-enable: set ENABLE_TIER18_19=1 (or remove the _tier18_19_Enabled guard).
+  const _tier18_19_Enabled = process.env.ENABLE_TIER18_19 === '1';
+  if (_tier18_19_Enabled && _preDecomposedSubTasks && _preDecomposedSubTasks.length > 1) {
+    const _visualDiscoveryEnabled = process.env.ENABLE_VISUAL_DISCOVERY !== 'false';
+
+    // ── Tier 1.8: Visual Discovery Loop (primary) ──────────────────────────
+    if (_visualDiscoveryEnabled) {
+      logger.info(`[playwright.agent] Tier 1.8: multi-step goal detected (${_preDecomposedSubTasks.length} sub-tasks) — trying Visual Discovery loop`);
+      try {
+        const _vdResult = await _executeVisualDiscoveryLoop({
+          goal: _finalGoal,
+          verificationGoal: effectiveGoal,
+          sessionId,
+          headed,
+          timeoutMs,
+          agentContext,
+          deadline: _deadline,
+          start,
+          heartbeat: _heartbeat,
+          hostname,
+          _preDecomposedSubTasks,
+          _progressCallbackUrl,
+          _stepIndex,
+        });
+        if (_vdResult.ok) {
+          _vdResult.executionTime = Date.now() - start;
+          _heartbeat.stop();
+          return _vdResult;
+        }
+        logger.warn(`[playwright.agent] Tier 1.8 failed: ${_vdResult.error || 'unknown'} — falling through to Tier 1.9`);
+        // Pass sub-tasks + transcript to Tier 1.9 so it doesn't re-decompose
+        if (_vdResult.subTasks) {
+          _preDecomposedSubTasks = _vdResult.subTasks;
+        }
+      } catch (_vdErr) {
+        logger.warn(`[playwright.agent] Tier 1.8 error: ${_vdErr.message} — falling through to Tier 1.9`);
+      }
+    }
+
+    // ── Tier 1.9: LiteParser-First Action Loop (fallback) ──────────────────
+    logger.info(`[playwright.agent] Tier 1.9: trying LiteParser-first loop${_visualDiscoveryEnabled ? ' (fallback after Tier 1.8)' : ' (primary — visual discovery disabled)'}`);
     try {
       const _lpResult = await _executeLiteparseFirstLoop({
         goal: _finalGoal,
@@ -12023,8 +14130,10 @@ async function playwrightAgent(args) {
     } catch (_lpErr) {
       logger.warn(`[playwright.agent] Tier 1.9 error: ${_lpErr.message} — falling through to Phase 2`);
     }
+  } else if (_preDecomposedSubTasks && _preDecomposedSubTasks.length > 1) {
+    logger.info(`[playwright.agent] Tier 1.8/1.9 disabled (ENABLE_TIER18_19!=1) — multi-step goal falling through to Phase 2 turn-loop`);
   } else {
-    logger.info(`[playwright.agent] Tier 1.9: skipping (single-step or no sub-tasks) — falling through to Phase 2`);
+    logger.info(`[playwright.agent] Tier 1.8/1.9: skipping (single-step or no sub-tasks) — falling through to Phase 2`);
   }
 
   // ── Phase 2: Focused Plan-Execute (one LLM call, 3-5 steps, verify each) ──
@@ -12166,11 +14275,20 @@ async function playwrightAgent(args) {
       _preDecomposedSubTasks,
       _progressCallbackUrl,
       _stepIndex,
+      _abortSignal,
     });
     if (_turnLoopResult.ok) {
       _turnLoopResult.executionTime = Date.now() - start;
       _heartbeat.stop();
       return _turnLoopResult;
+    }
+    // If the user cancelled, return a clean cancelled result instead of
+    // surfacing an ask_user failure card (which would prompt LLM recovery).
+    if (_aborted()) {
+      logger.info(`[playwright.agent] cancelled by user after turn-loop — returning cancelled result`);
+      _heartbeat.stop();
+      try { await browserAct({ action: 'close', sessionId }); } catch (_) {}
+      return { ok: false, goal, sessionId, error: 'Cancelled by user', cancelled: true, turns: transcript.length, transcript, executionTime: Date.now() - start };
     }
     logger.warn(`[playwright.agent] turn-loop failed: ${_turnLoopResult.error || 'unknown'} - surfacing ask_user`);
     _heartbeat.stop();
@@ -13406,6 +15524,7 @@ Output a JSON plan: { "plan": [ { "action": "type", "selector": "eXX", "text": "
             maxTurns,
             hostname,
             _preDecomposedSubTasks,
+            _abortSignal,
           });
           if (_turnLoopResult.ok) {
             logger.info(`[playwright.agent] turn-loop fallback succeeded — returning`);
@@ -13686,6 +15805,7 @@ Output a JSON plan: { "plan": [ { "action": "type", "selector": "eXX", "text": "
             maxTurns,
             hostname,
             _preDecomposedSubTasks,
+            _abortSignal,
           });
           if (_turnLoopResult.ok) {
             logger.info(`[playwright.agent] turn-loop fallback succeeded after unparseable repair — returning`);
@@ -14299,6 +16419,7 @@ Return JSON: { "thoughts": "strategy explanation", "plan": [...steps] }`;
           maxTurns,
           hostname,
           _preDecomposedSubTasks,
+          _abortSignal,
         });
         if (_turnLoopResult.ok) {
           logger.info(`[playwright.agent] turn-loop fallback succeeded after overall timeout — returning`);
