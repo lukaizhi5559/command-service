@@ -456,25 +456,13 @@ class CommandServiceMCPServer {
     skillScheduler.start().catch(err => logger.warn('[Server] Skill scheduler start failed', { error: err.message }));
 
     // ── explore.agent maintenance scan services ──────────────────────────────
-    // Idle watcher: polls system idle every 5min, fires maintenance scan after 30min idle + 24h cooldown
+    // Auto-scan (idle watcher) has been DISABLED — skills are now created via the
+    // trainer agent, not by automatic page scanning. The idle watcher generated
+    // low-quality skills with stale selectors that were never used (use_count: 0).
     // Scan scheduler: reads ~/.thinkdrop/scan-schedule.json, registers node-cron job if configured
-    // Auto-scan is opt-in — check settings file before starting idle watcher
     try {
-      let autoScanEnabled = false;
-      try {
-        const settingsPath = path.join(os.homedir(), '.thinkdrop', 'settings.json');
-        if (fs.existsSync(settingsPath)) {
-          const settings = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
-          autoScanEnabled = !!settings.autoScanEnabled;
-        }
-      } catch (_) { /* ignore read errors, default to false */ }
-      
-      if (autoScanEnabled) {
-        startIdleWatcher();
-        logger.info('[Server] Idle watcher started (auto-scan enabled)');
-      } else {
-        logger.info('[Server] Idle watcher not started (auto-scan disabled by default — enable in Agents tab)');
-      }
+      // Auto-scan disabled — do not start idle watcher even if setting is enabled
+      logger.info('[Server] Auto-scan disabled — use trainer to create skills');
       startScanScheduler(); // Always start scan scheduler (cron-based, user-configured)
     } catch (err) {
       logger.warn('[Server] explore.agent maintenance services failed to start (non-fatal)', { error: err.message });
@@ -936,22 +924,21 @@ class CommandServiceMCPServer {
         return;
       }
 
-      // ── POST /scan.idle-watcher — enable/disable idle watcher ────────────────
+      // ── POST /scan.idle-watcher — DISABLED (auto-scan removed) ───────────────
       if (req.method === 'POST' && req.url === '/scan.idle-watcher') {
         let body = '';
         req.on('data', chunk => { body += chunk; });
         req.on('end', () => {
           try {
             const { enabled } = JSON.parse(body || '{}');
+            // Auto-scan is permanently disabled — ignore enable requests
             if (enabled) {
-              startIdleWatcher();
-              logger.info('[IdleWatcher] Started via /scan.idle-watcher');
-            } else {
-              stopIdleWatcher();
-              logger.info('[IdleWatcher] Stopped via /scan.idle-watcher');
+              logger.warn('[IdleWatcher] /scan.idle-watcher enable request ignored — auto-scan disabled');
             }
+            // Always stop if somehow running
+            stopIdleWatcher();
             res.writeHead(200);
-            res.end(JSON.stringify({ ok: true, enabled: !!enabled }));
+            res.end(JSON.stringify({ ok: true, enabled: false }));
           } catch (err) {
             res.writeHead(400);
             res.end(JSON.stringify({ ok: false, error: err.message }));

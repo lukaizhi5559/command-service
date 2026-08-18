@@ -2640,7 +2640,7 @@ Respond with ONLY a valid JSON object — no markdown, no explanation:
     // ── Step 5: Write patched recipe to disk ──────────────────────────────
     const _skillDirId = (id) => id.replace(/\.agent$/, '').replace(/[^a-z0-9_]/gi, '_');
     const skillDir = path.join(SKILLS_DIR, _skillDirId(agentId));
-    const recipePath = path.join(skillDir, `${recipeName}.recipe.json`);
+    const recipePath = path.join(skillDir, `${recipeName}.skill.json`);
 
     if (!fs.existsSync(skillDir)) {
       logger.warn(`[browser.agent] recipe-doctor: skill dir not found: ${skillDir}`);
@@ -3751,7 +3751,7 @@ function _isSigninWall(href) {
   return false;
 }
 
-async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAuth, skipAuth, manualLogin = false, preflightProbe = false, forceAuthProbe = false, requireCookieConfirmation = false, _progressCallbackUrl, _stepIndex, _loginWallRetried = false, _emitThinking = null, _authOnly = false, planExtend = false, sessionId: _planExtendSessionId = null }) {
+async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAuth, skipAuth, manualLogin = false, preflightProbe = false, forceAuthProbe = false, requireCookieConfirmation = false, _progressCallbackUrl, _stepIndex, _loginWallRetried = false, _emitThinking = null, _authOnly = false, planExtend = false, sessionId: _planExtendSessionId = null, _abortSignal = null }) {
   // Derive agentId from url hostname when caller omits it (LLM sometimes emits only url)
   let agentId = _agentIdArg;
   if (!agentId && url) {
@@ -3790,7 +3790,7 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
         overallTimeoutMs: 120000,
         _progressCallbackUrl,
         _stepIndex,
-        _abortSignal: args._abortSignal,
+        _abortSignal: _abortSignal,
       });
       logger.info(`[browser.agent] run: planExtend result — ok=${_extendResult?.ok}, error=${_extendResult?.error || 'n/a'}`);
       return _extendResult;
@@ -5678,9 +5678,14 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
       const waypointSteps = recipe.waypoints.map(wp => {
         if (wp.type === 'navigate') return `  ${wp.step}. NAVIGATE to ${wp.url} (checkpoint: ${wp.checkpoint || wp.pageTitle || ''})`;
         if (wp.type === 'click') return `  ${wp.step}. CLICK "${wp.elementText || ''}" selector: ${wp.selector}${wp.altSelectors?.length ? ` (alt: ${wp.altSelectors[0]})` : ''}`;
+        if (wp.type === 'fill') return `  ${wp.step}. FILL ${wp.selector} with "${wp.value || '<from task>'}"${wp.altSelectors?.length ? ` (alt: ${wp.altSelectors[0]})` : ''}`;
         if (wp.type === 'check') return `  ${wp.step}. CHECK "${wp.label || ''}" selector: ${wp.selector} → ${wp.checked ? 'on' : 'off'}`;
         if (wp.type === 'drag') return `  ${wp.step}. DRAG from ${wp.fromSelector} by (${(wp.toX || 0) - (wp.fromX || 0)}, ${(wp.toY || 0) - (wp.fromY || 0)})px`;
         if (wp.type === 'scroll') return `  ${wp.step}. SCROLL ${wp.deltaY > 0 ? 'down' : 'up'} ${Math.abs(wp.deltaY || 0)}px to reveal content`;
+        if (wp.type === 'select') return `  ${wp.step}. SELECT ${wp.selector} value: "${wp.value || ''}"`;
+        if (wp.type === 'submit') return `  ${wp.step}. SUBMIT ${wp.selector}`;
+        if (wp.type === 'keycombo') return `  ${wp.step}. KEYCOMBO ${[wp.ctrl?'Ctrl':'',wp.shift?'Shift':'',wp.alt?'Alt':'',wp.key].filter(Boolean).join('+')} on ${wp.selector}`;
+        if (wp.type === 'hover') return `  ${wp.step}. HOVER ${wp.selector}${wp.altSelectors?.length ? ` (alt: ${wp.altSelectors[0]})` : ''}`;
         return `  ${wp.step}. ${wp.type.toUpperCase()} ${wp.selector || wp.url || ''}`;
       }).join('\n');
 
@@ -6523,8 +6528,8 @@ When extracting page content with run-code, prioritize these selectors over gene
         authConfirmedAt: (_getCachedAuthCheck(agentId)?.ts ?? null),
         _progressCallbackUrl,
         _stepIndex,
-        _abortSignal: args._abortSignal,
-    }, 600000, args._abortSignal));
+        _abortSignal: _abortSignal,
+    }, 600000, _abortSignal));
 
     let agentResultText = String(agentResult?.result ?? agentResult?.stdout ?? '');
 
@@ -6768,8 +6773,8 @@ When extracting page content with run-code, prioritize these selectors over gene
               _progressCallbackUrl,
               _stepIndex,
               _loginWallRetried: true,  // prevent recursive retry
-              _abortSignal: args._abortSignal,
-            }, 600000, args._abortSignal));
+              _abortSignal: _abortSignal,
+            }, 600000, _abortSignal));
             return {
               ok: _retryResult?.ok ?? false,
               agentId,
@@ -7104,7 +7109,7 @@ When extracting page content with run-code, prioritize these selectors over gene
   } catch (err) {
     // If the user cancelled, surface a clean cancelled result instead of a
     // generic delegation-failure error (which would trigger LLM recovery).
-    if (args._abortSignal?.aborted || /aborted/i.test(err.message || '')) {
+    if (_abortSignal?.aborted || /aborted/i.test(err.message || '')) {
       logger.info(`[browser.agent] run: cancelled by user for ${agentId}`);
       return { ok: false, agentId, task, error: 'Cancelled by user', cancelled: true };
     }

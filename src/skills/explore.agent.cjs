@@ -699,7 +699,7 @@ function _buildToolsFromRecipes(hostname) {
     
     const entries = fs.readdirSync(skillsDir);
     for (const entry of entries) {
-      if (!entry.endsWith('.recipe.json')) continue;
+      if (!entry.endsWith('.skill.json') && !entry.endsWith('.recipe.json')) continue;
       
       const recipePath = path.join(skillsDir, entry);
       try {
@@ -710,7 +710,7 @@ function _buildToolsFromRecipes(hostname) {
         if (!hasExtractions && !recipe.returns) continue;
         
         // Build tool entry
-        const toolName = recipe.name?.replace(/\./g, '_') || entry.replace('.recipe.json', '');
+        const toolName = recipe.name?.replace(/\./g, '_') || entry.replace(/\.(skill|recipe)\.json$/, '');
         const tool = {
           name: toolName,
           recipe: recipe.name,
@@ -3192,108 +3192,17 @@ async function scanDomain(args) {
       return { ok: false, hostname, reason: 'cancelled' };
     }
 
-    // Generate skills from all discovered actions (skill cache)
+    // ── Skill generation DISABLED ──────────────────────────────────────────────
+    // Skills are now created via the trainer agent (recording user interactions),
+    // not by auto-scanning pages. The domain map is still built and saved below
+    // — it's useful for content extraction hints and page state identification.
+    // generateSkillFromAction() and generateNavigateHistorySkill() are disabled.
     let skillsGenerated = 0;
     let actionCount = 0;
-    
-    logger.info(`[explore.agent] Starting skill generation from ${Object.keys(newMap.states || {}).length} states...`);
-    
-    for (const [stateKey, state] of Object.entries(newMap.states || {})) {
-      const actionKeys = Object.keys(state.actions || {});
-      logger.info(`[explore.agent] Processing state "${stateKey}" with ${actionKeys.length} actions`);
-      
-      for (const [actionKey, action] of Object.entries(state.actions || {})) {
-        actionCount++;
-        try {
-          const skill = generateSkillFromAction(hostname, stateKey, actionKey);
-          if (skill && !skill.error) {
-            // Skip if the skill file already exists — 7-day freshness guards re-scanning,
-            // so we never need to overwrite a skill that was generated in a prior scan.
-            const _existingSkillPath = path.join(SKILLS_DIR, skill.name, 'index.cjs');
-            if (fs.existsSync(_existingSkillPath)) {
-              logger.info(`[explore.agent] Skipping existing skill: ${skill.name}`);
-              continue;
-            }
-            // Save skill with metadata for cache management
-            const _stateEntry = newMap.states[stateKey] || {};
-            const _actionEntry = _stateEntry.actions?.[actionKey] || {};
-            const skillWithMeta = {
-              ...skill,
-              _meta: {
-                agent_id: agentId,
-                source_domain: hostname,
-                source_action: actionKey,
-                source_state_key: stateKey,
-                source_url: _stateEntry.source_url || null,
-                url_pattern: _stateEntry.url_pattern || null,
-                context_type: _stateEntry.context_type || 'page',
-                reveals: _actionEntry._reveals || null,
-                created_at: new Date().toISOString(),
-                goal_tied: true,  // All scanned skills are goal-tied initially
-                use_count: 0,
-                last_used: null
-              }
-            };
-            
-            // Register in skill registry
-            await _registerSkill(skillWithMeta);
-            skillsGenerated++;
-            logger.info(`[explore.agent] Generated skill: ${skill.name || actionKey}`);
-            
-            if (skillsGenerated % 3 === 0) {
-              _postProgress(_progressCallbackUrl, {
-                type: 'explore:scan_skill_progress',
-                hostname,
-                message: `⚡ Generated ${skillsGenerated}/${totalActions} skills...`,
-                current: skillsGenerated,
-                total: totalActions
-              });
-            }
-          } else if (skill?.error) {
-            logger.warn(`[explore.agent] Skill generation failed for ${actionKey}: ${skill.error}`);
-          }
-        } catch (e) {
-          logger.warn(`[explore.agent] Failed to generate skill for ${actionKey}: ${e.message}`);
-        }
-      }
-    }
-    
-    // Generate navigate_history skill from collected data
     const dataItems = Object.values(newMap.states || {}).flatMap(state => state.data || []);
-    const historyItems = dataItems.filter(d => d.type === 'history');
-    
-    if (historyItems.length > 0) {
-      try {
-        const navigateSkill = generateNavigateHistorySkill(hostname, historyItems);
-        if (navigateSkill && !navigateSkill.error) {
-          const _navHistoryTs = new Date().toISOString();
-          const skillWithMeta = {
-            ...navigateSkill,
-            _meta: {
-              agent_id: agentId,
-              source_domain: hostname,
-              source_action: 'navigate_history',
-              created_at: _navHistoryTs,
-              scanned_at: _navHistoryTs,
-              history_count: historyItems.length,
-              goal_tied: true,
-              use_count: 0,
-              last_used: null
-            }
-          };
-          await _registerSkill(skillWithMeta);
-          skillsGenerated++;
-          logger.info(`[explore.agent] Generated navigate_history skill with ${historyItems.length} history items`);
-        }
-      } catch (e) {
-        logger.warn(`[explore.agent] Failed to generate navigate_history skill: ${e.message}`);
-      }
-    }
-    
-    // Count data items collected
     const dataItemsCount = dataItems.length;
-    
-    logger.info(`[explore.agent] Skill generation complete: ${skillsGenerated}/${actionCount} skills generated from ${Object.keys(newMap.states || {}).length} states, ${dataItemsCount} data items collected`);
+
+    logger.info(`[explore.agent] Skill generation skipped (disabled) — domain map built with ${Object.keys(newMap.states || {}).length} states, ${dataItemsCount} data items collected`);
     
     // Send completion summary with requiresDismissal flag to prevent auto-dismiss
     const summaryStats = {
@@ -3547,6 +3456,12 @@ function _postMaintenanceProgress(payload) {
 // Core: _runMaintenanceScan
 // ---------------------------------------------------------------------------
 async function _runMaintenanceScan(opts = {}) {
+  // DISABLED — Maintenance scans generated low-quality skills with stale selectors.
+  // Skills are now created via the trainer agent. Domain maps are still refreshed
+  // by scanDomain() when called directly (e.g. post-automation or manual refresh).
+  logger.info('[explore.agent] maintenance scan disabled — use trainer to create skills');
+  return { ok: false, reason: 'maintenance scan disabled' };
+  // eslint-disable-next-line no-unreachable
   if (_maintenanceRunning) {
     logger.info('[explore.agent] maintenance scan already running — skipping');
     return { ok: false, reason: 'already_running' };
@@ -3719,9 +3634,14 @@ function startScanScheduler() {
 }
 
 // ---------------------------------------------------------------------------
-// startIdleWatcher — polls ioreg every 5min, fires scan when idle ≥ 30min
+// startIdleWatcher — DISABLED: polls ioreg every 5min, fires scan when idle ≥ 30min
+// Auto-scan has been disabled. Skills are created via the trainer agent instead.
 // ---------------------------------------------------------------------------
 function startIdleWatcher() {
+  // DISABLED — auto-scan removed. This function is now a no-op.
+  logger.info('[explore.agent] startIdleWatcher: disabled — auto-scan removed, use trainer to create skills');
+  return;
+  // eslint-disable-next-line no-unreachable
   if (_idleWatcherTimer) return;
 
   async function _idleTick() {
@@ -3788,11 +3708,14 @@ function stopIdleWatcher() {
  * @returns {Object} Generated skill code and metadata
  */
 function generateSkillFromAction(hostname, stateKey, actionKey, customParams = {}) {
+  // DISABLED — Skills are now created via the trainer agent, not by auto-scanning.
+  // This function previously generated index.cjs + skill.json files from domain map
+  // actions, but all 168 generated skills had use_count: 0 and stale selectors.
+  // Use trainer.agent.cjs to create skills by recording user interactions instead.
+  return { error: 'Skill generation disabled — use trainer.agent to create skills' };
+  // eslint-disable-next-line no-unreachable
   // Load domain map
   const domainMap = _loadDomainMap(hostname);
-  if (!domainMap || !domainMap.states[stateKey] || !domainMap.states[stateKey].actions[actionKey]) {
-    return { error: `Action not found: ${hostname}.${stateKey}.${actionKey}` };
-  }
   
   const action = domainMap.states[stateKey].actions[actionKey];
   const { skill_name, interaction, locators, accepts_params, param_mapping, examples, follow_up_actions } = action;
@@ -3882,7 +3805,10 @@ function generateSkillFromAction(hostname, stateKey, actionKey, customParams = {
 }
 
 // Generate navigate_history skill from collected history data
+// DISABLED — Skills are now created via the trainer agent.
 function generateNavigateHistorySkill(hostname, historyItems) {
+  return { error: 'Navigate history skill generation disabled — use trainer.agent to create skills' };
+  // eslint-disable-next-line no-unreachable
   if (!historyItems || historyItems.length === 0) {
     return { error: 'No history items provided' };
   }
@@ -4477,6 +4403,12 @@ module.exports = {
 // agentName: e.g. 'perplexity_history_search_agent'
 // ---------------------------------------------------------------------------
 function generateCompositeAgentSkill(hostname, agentName, orderedActions) {
+  // DISABLED — Composite skills are now created via the trainer agent's auto-split
+  // + recipe system, not by synthesizing from external_skill steps.
+  // This function previously generated index.cjs files with stale selectors.
+  // Use trainer.agent.cjs to create skills by recording user interactions instead.
+  return { error: 'Composite skill generation disabled — use trainer.agent to create skills' };
+  // eslint-disable-next-line no-unreachable
   if (!orderedActions || orderedActions.length < 2) {
     return { error: 'Need at least 2 actions to generate a composite agent skill' };
   }

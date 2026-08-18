@@ -7,7 +7,7 @@
 // 2. Injects CDP event listener script to capture user clicks/navigations
 // 3. Polls captured events and emits them to the UI as recorded steps
 // 4. On "Save": LLM cleans raw events into a minimal waypoint recipe JSON
-// 5. Recipe saved to ~/.thinkdrop/skills/<agentId>/<dotName>.recipe.json
+// 5. Skill saved to ~/.thinkdrop/skills/<agentId>/<dotName>.skill.json
 //
 // Called from main.js when user clicks "Train" on an agent
 // ---------------------------------------------------------------------------
@@ -66,35 +66,89 @@ const CDP_RECORDER_SCRIPT = `
   window.__tdRecorderActive = true;
   window.__tdTrainEvents = window.__tdTrainEvents || [];
 
-  // ── Selector helpers ──────────────────────────────────────────────────────
+  // ── Selector helpers (ported from explore.agent.cjs _buildSmartSelectors) ───
+  // Tiered priority: data-testid → data-qa → role+aria-label → aria-label →
+  // role+text → name → placeholder → href → contenteditable → semantic classes → text
+  // Dynamic IDs (react-12345, ember-6789) are skipped.
 
-  // Walk up to 4 ancestor levels looking for a stable anchor (id/testid/aria-label)
-  // before falling back to tag+class. Produces scoped selectors like
-  // '#editor-container > div' instead of bare 'div.cm-line:nth-child(4)'.
+  function isDynamicId(id) {
+    if (!id || typeof id !== 'string') return false;
+    return /^[a-z]+-\\d{4,}$/i.test(id);
+  }
+
+  function filterSemanticClasses(className) {
+    if (!className || typeof className !== 'string') return [];
+    return className.split(/\\s+/).filter(function(c) {
+      return c && c.length > 2 &&
+        !/^css-[a-z0-9]{5,}$/i.test(c) &&
+        !/^[a-z0-9]{8,}$/i.test(c) &&
+        !/^style_[a-z0-9]+$/i.test(c);
+    });
+  }
+
   function getSelector(el) {
     if (!el || !el.tagName) return 'body';
-    if (el.id) return '#' + el.id;
-    if (el.getAttribute('data-testid')) return '[data-testid="' + el.getAttribute('data-testid') + '"]';
-    if (el.getAttribute('aria-label')) return '[aria-label="' + el.getAttribute('aria-label') + '"]';
-    // Walk up ancestors for a stable anchor
+    var tag = el.tagName.toLowerCase();
+    var id = el.id || null;
+    var dataTestId = el.getAttribute('data-testid');
+    var dataQa = el.getAttribute('data-qa');
+    var ariaLabel = el.getAttribute('aria-label');
+    var role = el.getAttribute('role') || (tag === 'button' ? 'button' : tag === 'a' ? 'link' : null);
+    var name = el.getAttribute('name');
+    var placeholder = el.getAttribute('placeholder');
+
+    // Tier 1: ID (if not dynamic)
+    if (id && !isDynamicId(id)) return '[id="' + id + '"]';
+
+    // Tier 2: Data attributes (very stable)
+    if (dataTestId) return '[data-testid="' + dataTestId + '"]';
+    if (dataQa) return '[data-qa="' + dataQa + '"]';
+
+    // Tier 3: Role + ARIA label (gold standard for semantic selectors)
+    if (role && ariaLabel && ariaLabel.length > 2) return '[role="' + role + '"][aria-label="' + ariaLabel + '"]';
+    if (ariaLabel && ariaLabel.length > 2) return '[aria-label="' + ariaLabel + '"]';
+
+    // Tier 3b: Role + text (for buttons with clear text labels)
+    var text = (el.textContent || '').trim().substring(0, 30);
+    if (role && text && text.length > 0 && text.length < 30) return '[role="' + role + '"]:has-text("' + text.replace(/"/g, '\\\\"') + '")';
+
+    // Tier 4: Name attribute (for inputs)
+    if (name) return tag + '[name="' + name + '"]';
+
+    // Tier 5: Placeholder (for inputs)
+    if (placeholder && placeholder.length > 3) return '[placeholder="' + placeholder + '"]';
+
+    // Tier 6: Walk up ancestors for a stable anchor (id/testid/aria-label)
     var ancestor = el.parentElement;
     for (var i = 0; i < 4 && ancestor && ancestor !== document.body; i++, ancestor = ancestor.parentElement) {
-      if (ancestor.id) return '#' + ancestor.id + ' ' + el.tagName.toLowerCase();
-      if (ancestor.getAttribute('data-testid')) return '[data-testid="' + ancestor.getAttribute('data-testid') + '"] ' + el.tagName.toLowerCase();
-      if (ancestor.getAttribute('aria-label')) return '[aria-label="' + ancestor.getAttribute('aria-label') + '"] ' + el.tagName.toLowerCase();
+      var aId = ancestor.id;
+      var aTestId = ancestor.getAttribute('data-testid');
+      var aAriaLabel = ancestor.getAttribute('aria-label');
+      if (aId && !isDynamicId(aId)) return '[id="' + aId + '"] ' + tag;
+      if (aTestId) return '[data-testid="' + aTestId + '"] ' + tag;
+      if (aAriaLabel && aAriaLabel.length > 2) return '[aria-label="' + aAriaLabel + '"] ' + tag;
     }
-    // Fallback: tag + stable classes + nth-child
-    var path = el.tagName.toLowerCase();
-    if (el.className && typeof el.className === 'string') {
-      var cls = el.className.split(/\\s+/).filter(function(c) { return c && !c.startsWith('_') && c.length > 1; }).slice(0, 2).join('.');
-      if (cls) path += '.' + cls;
+
+    // Tier 7: Semantic CSS classes (filter out hashed/minified classes)
+    var semanticClasses = filterSemanticClasses(el.className);
+    if (semanticClasses.length > 0) {
+      var path = tag + '.' + semanticClasses.slice(0, 2).join('.');
+      var parent = el.parentElement;
+      if (parent) {
+        var siblings = Array.from(parent.children).filter(function(c) { return c.tagName === el.tagName; });
+        if (siblings.length > 1) path += ':nth-child(' + (siblings.indexOf(el) + 1) + ')';
+      }
+      return path;
     }
-    var parent = el.parentElement;
-    if (parent) {
-      var siblings = Array.from(parent.children).filter(function(c) { return c.tagName === el.tagName; });
-      if (siblings.length > 1) path += ':nth-child(' + (siblings.indexOf(el) + 1) + ')';
+
+    // Tier 8: Fallback — tag + nth-child
+    var fallback = tag;
+    var parent2 = el.parentElement;
+    if (parent2) {
+      var siblings2 = Array.from(parent2.children).filter(function(c) { return c.tagName === el.tagName; });
+      if (siblings2.length > 1) fallback += ':nth-child(' + (siblings2.indexOf(el) + 1) + ')';
     }
-    return path;
+    return fallback;
   }
 
   function getAltSelectors(el) {
@@ -103,8 +157,32 @@ const CDP_RECORDER_SCRIPT = `
     var tag = el.tagName.toLowerCase();
     var text = (el.textContent || '').trim().substring(0, 50);
     var href = el.getAttribute('href') || '';
+    var id = el.id || null;
+    var dataTestId = el.getAttribute('data-testid');
+    var dataQa = el.getAttribute('data-qa');
+    var ariaLabel = el.getAttribute('aria-label');
+    var ariaLabelledBy = el.getAttribute('aria-labelledby');
+    var role = el.getAttribute('role') || (tag === 'button' ? 'button' : tag === 'a' ? 'link' : null);
+    var name = el.getAttribute('name');
+    var placeholder = el.getAttribute('placeholder');
 
-    // href-based (most deterministic for links)
+    // Tier 1: ID (if not dynamic and not already primary)
+    if (id && !isDynamicId(id)) {
+      alts.push('[id="' + id + '"]');
+      if (role) alts.push('[id="' + id + '"][role="' + role + '"]');
+    }
+
+    // Tier 2: Data attributes
+    if (dataQa) alts.push('[data-qa="' + dataQa + '"]');
+
+    // Tier 3: ARIA-based
+    if (ariaLabel) {
+      alts.push(tag + '[aria-label="' + ariaLabel + '"]');
+      if (role) alts.push('[role="' + role + '"][aria-label="' + ariaLabel + '"]');
+    }
+    if (ariaLabelledBy) alts.push(tag + '[aria-labelledby="' + ariaLabelledBy + '"]');
+
+    // href-based (for links)
     if (href && text && tag === 'a') {
       alts.push(tag + '[href*="' + href.split('?')[0].split('/').pop() + '"]:has-text("' + text.substring(0, 20) + '")');
     }
@@ -122,20 +200,13 @@ const CDP_RECORDER_SCRIPT = `
       alts.push(tag + ':text-is("' + text.substring(0, 30) + '")');
     }
 
-    // ARIA-based
-    var role = el.getAttribute('role') || (tag === 'button' ? 'button' : tag === 'a' ? 'link' : null);
-    var ariaLabel = el.getAttribute('aria-label');
-    var ariaLabelledBy = el.getAttribute('aria-labelledby');
-    if (ariaLabel) {
-      alts.push(tag + '[aria-label="' + ariaLabel + '"]');
-      if (role) alts.push('[role="' + role + '"][aria-label="' + ariaLabel + '"]');
-    }
-    if (ariaLabelledBy) alts.push(tag + '[aria-labelledby="' + ariaLabelledBy + '"]');
+    // Name + placeholder
+    if (name) alts.push(tag + '[name="' + name + '"]');
+    if (placeholder && placeholder.length > 3) alts.push('[placeholder="' + placeholder + '"]');
 
     // Class+text
-    var classes = el.className && typeof el.className === 'string'
-      ? el.className.split(/\\s+/).filter(function(c) { return c && !c.match(/^_/) && c.length > 2; }).slice(0, 2) : [];
-    if (classes.length > 0 && text) alts.push(tag + '.' + classes.join('.') + ':has-text("' + text.substring(0, 20) + '")');
+    var classes = filterSemanticClasses(el.className);
+    if (classes.length > 0 && text) alts.push(tag + '.' + classes.slice(0, 2).join('.') + ':has-text("' + text.substring(0, 20) + '")');
 
     // Legacy
     if (text) alts.push('text=' + text);
@@ -591,7 +662,9 @@ async function actionTrain(args) {
   // missing steps (e.g. type the update + click Post) on the page they're
   // already on. Distillation prepends the deep-link navigate automatically.
   const isHereMode = mode === 'here' && (browserSessionId || startUrlOverride);
-  const sessionId = isHereMode ? browserSessionId : `${agentId}_train`;
+  // Use the persistent profile session (same as browser.agent.cjs) so auth
+  // cookies are preserved. Format: '<agentId without .agent>_agent'.
+  const sessionId = isHereMode ? browserSessionId : `${agentId.replace(/\.agent$/, '')}_agent`;
   const effectiveStartUrl = isHereMode ? (startUrlOverride || descriptorStartUrl) : descriptorStartUrl;
 
   const session = {
@@ -601,6 +674,7 @@ async function actionTrain(args) {
     pollInterval: null,
     cancelRequested: false,
     injectedTabs: new Set(), // tab indices where recorder script has been injected
+    ctxBound: false,          // whether context.exposeBinding has been called
     httpServer: null,        // local HTTP event-push server
     httpPort: null,
     // Failure-handoff context — used by distillation to convert the demo into a
@@ -727,11 +801,15 @@ function _getBaseDomain(hostname) {
 // Replaces every window.__tdTrainEvents.push( with an async fetch POST.
 // ---------------------------------------------------------------------------
 function _buildRecorderScript(port) {
-  // Replace the array-push token with a fire-and-forget fetch POST.
-  // The object literal + closing ); that follow each push( are valid call args.
+  // Replace the array-push token with a binding-preferred push that falls back
+  // to fetch. The CDP binding (window.__tdPushEvent) is installed via
+  // page.exposeFunction and bypasses Content-Security-Policy — fetch to
+  // http://127.0.0.1 is blocked by Spotify's CSP (and many modern sites).
+  // The fetch fallback is kept for the CLI (playwright-cli) path where
+  // exposeFunction is not available.
   return CDP_RECORDER_SCRIPT
     .split('window.__tdTrainEvents.push(')
-    .join(`(function(ev){try{fetch('http://127.0.0.1:${port}/e',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(ev)}).catch(function(){});}catch(e_){}})(`);
+    .join(`(function(ev){try{if(window.__tdPushEvent){window.__tdPushEvent(ev);}else{fetch('http://127.0.0.1:${port}/e',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(ev)}).catch(function(){});}}catch(e_){}})(`);
 }
 
 // ---------------------------------------------------------------------------
@@ -787,18 +865,97 @@ async function _injectRecorderScript(session, tabIndex) {
     session.targetDomain = _extractTargetDomain(agentId, session.startUrl);
   }
 
-  // _buildRecorderScript bakes in the fetch endpoint.
-  // Also stamp each event with the tab index by patching the fetch token.
-  // We inline _tabIndex into every event object passed to the fetch call.
+  // _buildRecorderScript bakes in the push-token (binding-preferred, fetch fallback).
+  // Stamp each event with the tab index by patching the JSON.stringify(ev) token.
   const baseScript = _buildRecorderScript(httpPort);
-  // Patch: insert ev._tabIndex=N before each fetch body JSON.stringify(ev)
   const script = baseScript
     .split('JSON.stringify(ev)')
     .join(`JSON.stringify(Object.assign(ev,{_tabIndex:${tabIndex}}))`);
-  const scriptJson = JSON.stringify(script);
 
-  // The run-code vm context only has `page` and `__end__` — no process/global.
-  // We just inject a plain script tag; no exposeFunction needed.
+  // ── Engine path: context.exposeBinding + page.addInitScript ────────────────
+  // context.exposeBinding creates a CDP binding (window.__tdPushEvent) that
+  // bypasses Content-Security-Policy — fetch to http://127.0.0.1 is blocked by
+  // Spotify and many modern sites' CSP. Unlike page.exposeFunction, context-level
+  // bindings persist across ALL pages in the context (new tabs, navigations,
+  // SPA reloads) automatically. addInitScript re-injects the recorder script on
+  // every new document.
+  let engineInjected = false;
+  try {
+    const engine = require('./browser-engine.cjs');
+    const ctx = engine.getContext(sessionId);
+    const page = engine.getPage(sessionId);
+    if (ctx && page && !page.isClosed()) {
+      // context.exposeBinding can only be called ONCE per context per name.
+      // Track which contexts have already been bound via a module-level Set.
+      if (!session.ctxBound) {
+        try {
+          // Playwright exposeBinding passes (source, ...args) where source is
+          // { frame, page, context }. The actual event data is the 2nd argument.
+          // Bug fix: previously only (evt) was declared, so evt was actually the
+          // source object — all recorded events were undefined.
+          await ctx.exposeBinding('__tdPushEvent', (source, evt) => {
+            try {
+              const _tabIdx = evt?._tabIndex !== undefined ? evt._tabIndex : tabIndex;
+              _processEvent(session, evt, _tabIdx);
+            } catch (e) {
+              logger.warn(`[trainer.agent] __tdPushEvent callback error: ${e.message}`);
+            }
+          });
+          session.ctxBound = true;
+          logger.info(`[trainer.agent] Context binding __tdPushEvent registered for session=${sessionId}`);
+        } catch (e) {
+          if (/already exposed/i.test(e.message)) {
+            session.ctxBound = true;
+          } else {
+            logger.warn(`[trainer.agent] context.exposeBinding failed: ${e.message}`);
+          }
+        }
+      }
+
+      // addInitScript runs on every new document (navigations, reloads, SPA route
+      // changes that trigger a document reload). This is critical for Spotify which
+      // does full page reloads when switching between some sections.
+      await page.addInitScript(script);
+
+      // Also inject into the current document immediately (addInitScript only
+      // fires on FUTURE navigations). Use evaluate for the current page.
+      try {
+        await page.evaluate((code) => {
+          if (!window.__tdRecorderActive) {
+            const s = document.createElement('script');
+            s.textContent = code;
+            (document.head || document.documentElement).appendChild(s);
+          }
+        }, script);
+      } catch (_) {}
+
+      // Inject into existing child frames too
+      for (const frame of page.frames()) {
+        if (frame === page.mainFrame()) continue;
+        try {
+          await frame.evaluate((code) => {
+            if (!window.__tdRecorderActive) {
+              const s = document.createElement('script');
+              s.textContent = code;
+              (document.head || document.documentElement).appendChild(s);
+            }
+          }, script);
+        } catch (_) {}
+      }
+
+      logger.info(`[trainer.agent] Recorder injected on tab ${tabIndex} via engine (context.exposeBinding + addInitScript)`);
+      session.injectedTabs.add(tabIndex);
+      engineInjected = true;
+      return;
+    }
+  } catch (e) {
+    logger.warn(`[trainer.agent] Engine injection failed on tab ${tabIndex}: ${e.message} — falling back to run-code`);
+  }
+
+  if (engineInjected) return;
+
+  // ── CLI fallback: run-code + addScriptTag (no exposeFunction available) ─────
+  const scriptJson = JSON.stringify(script);
   const injectCode = `async page => {
     const src = ${scriptJson};
 
@@ -1658,7 +1815,7 @@ async function actionSaveTraining(args) {
     const skillDir = path.join(SKILLS_DIR, _skillDirId(agentId));
     if (!fs.existsSync(skillDir)) fs.mkdirSync(skillDir, { recursive: true });
 
-    const recipePath = path.join(skillDir, `${skillName}.recipe.json`);
+    const recipePath = path.join(skillDir, `${skillName}.skill.json`);
     fs.writeFileSync(recipePath, JSON.stringify(recipe, null, 2), 'utf8');
 
     // Update agent descriptor with trained_skills entry
@@ -1697,13 +1854,97 @@ async function actionSaveTraining(args) {
 }
 
 // ---------------------------------------------------------------------------
+// URL-first collapse: collapse intermediate navigation into a single navigate
+// to the final destination URL before the first real interaction.
+// ---------------------------------------------------------------------------
+function _collapseNavigation(events) {
+  if (!events || events.length === 0) return events;
+
+  const INTERACTION_TYPES = ['click', 'dblclick', 'fill', 'select', 'check', 'submit',
+    'paste', 'keycombo', 'drag', 'hover', 'focus', 'rightclick', 'extract'];
+  const NAV_TYPES = ['navigate', 'tab-new'];
+
+  // Find the index of the first real interaction event
+  // Nav-clicks (clicks with http(s) hrefs) are treated as navigation, not interaction
+  let firstInteractionIdx = -1;
+  for (let i = 0; i < events.length; i++) {
+    const e = events[i];
+    if (INTERACTION_TYPES.includes(e.type)) {
+      // Skip nav-clicks — they're navigation, not interaction
+      if (e.type === 'click' && e.href && /^https?:\/\//i.test(e.href)) continue;
+      firstInteractionIdx = i;
+      break;
+    }
+  }
+
+  // No interaction found — return events as-is (pure navigation flow)
+  if (firstInteractionIdx === -1) return events;
+
+  // Collect all navigation events before the first interaction
+  const navEvents = events.slice(0, firstInteractionIdx).filter(e => NAV_TYPES.includes(e.type));
+  // Also check for click events with http(s) hrefs that are effectively navigation
+  const navClicks = events.slice(0, firstInteractionIdx).filter(
+    e => e.type === 'click' && e.href && /^https?:\/\//i.test(e.href)
+  );
+
+  // If there are no navigation events and no nav-clicks, nothing to collapse
+  if (navEvents.length === 0 && navClicks.length === 0) return events;
+
+  // Find the final destination URL — scan backwards from the first interaction
+  // for the last navigation event (navigate, tab-new) OR nav-click (click with
+  // http(s) href). The last one wins since it's the most recent destination.
+  let finalUrl = null;
+  let finalTitle = '';
+  for (let i = firstInteractionIdx - 1; i >= 0; i--) {
+    const e = events[i];
+    if (e.type === 'navigate' || e.type === 'tab-new') {
+      finalUrl = e.url;
+      finalTitle = e.pageTitle || '';
+      break;
+    }
+    if (e.type === 'click' && e.href && /^https?:\/\//i.test(e.href)) {
+      finalUrl = e.href;
+      finalTitle = e.elementText || '';
+      break;
+    }
+  }
+
+  if (!finalUrl) return events; // can't collapse without a URL
+
+  // Build the collapsed event list:
+  // 1. Single navigate waypoint to the final URL
+  // 2. All interaction events from firstInteractionIdx onward
+  const collapsed = [
+    {
+      type: 'navigate',
+      url: finalUrl,
+      pageTitle: finalTitle,
+      timestamp: events[0].timestamp,
+      _collapsed: true, // marker for debugging
+    },
+    ...events.slice(firstInteractionIdx),
+  ];
+
+  logger.info(`[trainer.agent] _collapseNavigation: collapsed ${firstInteractionIdx} nav events into single navigate to ${finalUrl}`);
+  return collapsed;
+}
+
+// ---------------------------------------------------------------------------
 // Build waypoint recipe from raw events using LLM
 // ---------------------------------------------------------------------------
 async function _buildRecipe(session, skillName) {
   const { agentId, hostname, startUrl, rawEvents } = session;
 
+  // ── URL-first collapse ──────────────────────────────────────────────────────
+  // Collapse all intermediate navigation (navigate events, nav clicks) into a
+  // SINGLE navigate waypoint to the final destination URL before the first real
+  // interaction (click/fill/check/etc). This makes the recipe deterministic —
+  // next run goes straight to the target page instead of replaying brittle
+  // intermediate navigation selectors.
+  const collapsedEvents = _collapseNavigation(rawEvents);
+
   // Format events for LLM
-  const eventSummary = rawEvents.map((e, i) => {
+  const eventSummary = collapsedEvents.map((e, i) => {
     switch (e.type) {
       case 'navigate': return `${i + 1}. [NAV] ${e.url} (title: "${e.pageTitle || ''}")`;
       case 'click': return `${i + 1}. [CLICK] "${e.elementText || ''}" selector: ${e.selector}${e.href ? ` href: ${e.href}` : ''}`;
@@ -1840,6 +2081,9 @@ Map each RAW EVENT to the appropriate waypoint type from the catalog. Output ONL
 function _buildFallbackRecipe(session, skillName) {
   const { agentId, startUrl, hostname, rawEvents } = session;
 
+  // Apply URL-first collapse to raw events
+  const collapsedEvents = _collapseNavigation(rawEvents);
+
   // Extract unique navigations and significant clicks
   const waypoints = [];
   let step = 0;
@@ -1847,7 +2091,7 @@ function _buildFallbackRecipe(session, skillName) {
 
   const returns = {};
 
-  for (const evt of rawEvents) {
+  for (const evt of collapsedEvents) {
     if (evt.type === 'navigate' && !seenUrls.has(evt.url)) {
       seenUrls.add(evt.url);
       step++;
@@ -1887,7 +2131,7 @@ function _buildFallbackRecipe(session, skillName) {
     }
   }
 
-  const lastNav = rawEvents.filter(e => e.type === 'navigate').pop();
+  const lastNav = collapsedEvents.filter(e => e.type === 'navigate').pop();
 
   return {
     name: skillName,
@@ -1967,7 +2211,7 @@ function actionListSkills(args) {
   const skillDir = path.join(SKILLS_DIR, _skillDirId(agentId));
   if (!fs.existsSync(skillDir)) return { ok: true, skills: [] };
 
-  const files = fs.readdirSync(skillDir).filter(f => f.endsWith('.recipe.json'));
+  const files = fs.readdirSync(skillDir).filter(f => f.endsWith('.skill.json') || f.endsWith('.recipe.json'));
   const skills = files.map(f => {
     try {
       const recipe = JSON.parse(fs.readFileSync(path.join(skillDir, f), 'utf8'));
@@ -1992,10 +2236,14 @@ function actionListSkills(args) {
 // Load a specific recipe by skill name (used by browser.agent at runtime)
 // ---------------------------------------------------------------------------
 function loadRecipe(agentId, skillName) {
-  const recipePath = path.join(SKILLS_DIR, _skillDirId(agentId), `${skillName}.recipe.json`);
-  if (!fs.existsSync(recipePath)) return null;
+  // Try .skill.json first, then fall back to .recipe.json for backward compatibility
+  const skillDir = path.join(SKILLS_DIR, _skillDirId(agentId));
+  const skillPath = path.join(skillDir, `${skillName}.skill.json`);
+  const recipePath = path.join(skillDir, `${skillName}.recipe.json`);
+  const filePath = fs.existsSync(skillPath) ? skillPath : (fs.existsSync(recipePath) ? recipePath : null);
+  if (!filePath) return null;
   try {
-    return JSON.parse(fs.readFileSync(recipePath, 'utf8'));
+    return JSON.parse(fs.readFileSync(filePath, 'utf8'));
   } catch { return null; }
 }
 
@@ -2017,11 +2265,11 @@ function findMatchingRecipe(agentId, taskText, opts = {}) {
 
   const normalized = taskText.toLowerCase().replace(/[\s_]+/g, '.');
   const taskLower = taskText.toLowerCase();
-  const files = fs.readdirSync(skillDir).filter(f => f.endsWith('.recipe.json'));
+  const files = fs.readdirSync(skillDir).filter(f => f.endsWith('.skill.json') || f.endsWith('.recipe.json'));
 
   // Pass 1: exact name match in task text (original fuzzy match)
   for (const f of files) {
-    const name = f.replace('.recipe.json', '');
+    const name = f.replace(/\.(skill|recipe)\.json$/, '');
     if (normalized.includes(name)) {
       try {
         const recipe = JSON.parse(fs.readFileSync(path.join(skillDir, f), 'utf8'));
@@ -2204,7 +2452,7 @@ async function saveAutoRecipe(agentId, task, transcript, targetUrl, playbookCont
 
   // Save recipe file
   if (!fs.existsSync(skillDir)) fs.mkdirSync(skillDir, { recursive: true });
-  const recipePath = path.join(skillDir, `${skillName}.recipe.json`);
+  const recipePath = path.join(skillDir, `${skillName}.skill.json`);
   fs.writeFileSync(recipePath, JSON.stringify(recipe, null, 2), 'utf8');
 
   // Register in agent descriptor
@@ -2460,9 +2708,12 @@ Output ONLY valid JSON (no markdown fences) with this shape:
 }
 
 Rules:
-- Each step is ONE meaningful user action (click a button, fill a field, submit a form).
-- Do NOT include "navigate to start URL" as a step — the system does that automatically.
-- For "create a playlist named X and add artists A, B, C", produce: step 1 = create playlist (fill name + click create), steps 2-4 = search each artist + click "Add to playlist".
+- Each step is ONE high-level user action, phrased as what the user is accomplishing (e.g. "Create the 'Christian Music' playlist", "Add Lecrae to the playlist", "Add KB to the playlist", "Add Newsboys to the playlist"). Do NOT phrase steps as low-level UI clicks like "Click the 'Create playlist' button in the sidebar".
+- Use the exact playlist name, artist names, search terms, and other specifics extracted from the task. If the task says "make a playlist off my favorite music songs" and mentions "Christian Music", "Lecrae", "KB", "Newsboys", use those exact names in the step descriptions.
+- If the task includes [Additional context: ...], extract the specific names, values, and items from it and use them in your step descriptions. For example, if the additional context says "User's preferred Spotify playlist name is 'Christian Music'" and "User's favorite songs for the playlist are top songs from Lecrae, KB, and Newsboys", produce steps: 1) Create the 'Christian Music' playlist, 2) Add Lecrae to the playlist, 3) Add KB to the playlist, 4) Add Newsboys to the playlist.
+- For a playlist-creation task with N artists, produce exactly 1 + N steps: step 1 = create the playlist, steps 2..N+1 = add each artist to the playlist.
+- For each "add artist" step, the expected interaction is: search for the artist, then add a song to the playlist. expectedType should be "click" (for the final "Add to playlist" / "Add" button click).
+- Do NOT include "navigate to start URL" or "open Spotify" as a step — the system navigates to the start URL automatically.
 - expectedType is the DOM event type the system should watch for to confirm this step: "click" for button clicks, "fill" for text input, "submit" for form submit, "navigate" for page changes, "select" for dropdowns, "check" for checkboxes.
 - expectedText is the visible text of the element the user will interact with (button label, field placeholder, link text). Used for fuzzy matching.
 - expectedUrl is optional — only set when the step lands on a distinct URL (e.g. /search, /playlists). Leave empty if the step happens on the same page as the previous step.
@@ -2473,7 +2724,7 @@ Rules:
     const raw = await askWithMessages([
       { role: 'system', content: 'You are a browser automation training planner. Output ONLY valid JSON.' },
       { role: 'user', content: prompt },
-    ], { maxTokens: 1200, temperature: 0.1, responseTimeoutMs: 20000 });
+    ], { maxTokens: 2000, temperature: 0.1, responseTimeoutMs: 20000 });
 
     let json = (raw || '').trim();
     json = json.replace(/^```(?:json)?\s*\n?/i, '').replace(/\n?```\s*$/, '');
@@ -2539,7 +2790,10 @@ async function actionGuidedTrain(args) {
   const effectiveStartUrl = startUrlOverride || descriptorStartUrl;
   const hostname = new URL(descriptorStartUrl).hostname.replace(/^www\./, '');
 
-  const sessionId = `${agentId}_guided`;
+  // Persistent profile session — reuse the same sessionId that browser.agent
+  // uses so auth cookies are preserved. Format: '<agentId without .agent>_agent'.
+  // (browser.agent.cjs line 4105-4110 uses `${agentId.replace('.agent', '')}_agent`.)
+  const sessionId = `${agentId.replace(/\.agent$/, '')}_agent`;
   const session = {
     agentId, hostname, startUrl: effectiveStartUrl, sessionId,
     rawEvents: [],
@@ -2547,6 +2801,7 @@ async function actionGuidedTrain(args) {
     pollInterval: null,
     cancelRequested: false,
     injectedTabs: new Set(),
+    ctxBound: false,
     httpServer: null,
     httpPort: null,
     trainMode: 'guided',
@@ -2713,6 +2968,10 @@ function actionGuidedSkipStep(args) {
     if (lastNav) matchedSlot.destinationUrl = lastNav.url;
   }
 
+  // Persist any events that were recorded while the step was active
+  session.rawEvents.push(...matchedSlot.events);
+  matchedSlot.events = [];
+
   _postProgress(agentId, {
     type: 'training:step-learned',
     stepIndex: cursor,
@@ -2793,7 +3052,7 @@ async function actionSaveGuidedTraining(args) {
     // Save recipe file
     const skillDir = path.join(SKILLS_DIR, _skillDirId(agentId));
     if (!fs.existsSync(skillDir)) fs.mkdirSync(skillDir, { recursive: true });
-    const recipePath = path.join(skillDir, `${skillName}.recipe.json`);
+    const recipePath = path.join(skillDir, `${skillName}.skill.json`);
     fs.writeFileSync(recipePath, JSON.stringify(recipe, null, 2), 'utf8');
 
     // Register in agent descriptor
@@ -2845,10 +3104,18 @@ function _buildGuidedRecipe(session, skillName) {
     }
 
     // Find the destination URL: the LAST navigate event in this step's events
-    // (the URL where the key interaction happened). If no navigate in this step,
+    // (the URL where the key interaction happened). Also check for clicks with
+    // http(s) hrefs that are effectively navigation. If no navigate in this step,
     // carry forward the previous step's destination URL.
     const navEvents = matched.events.filter(e => e.type === 'navigate' && e.url && e.url !== 'about:blank');
-    const destUrl = navEvents.length > 0 ? navEvents[navEvents.length - 1].url : (waypoints.length > 0 ? null : startUrl);
+    const navClicks = matched.events.filter(e => e.type === 'click' && e.href && /^https?:\/\//i.test(e.href));
+    let destUrl = null;
+    if (navEvents.length > 0) {
+      destUrl = navEvents[navEvents.length - 1].url;
+    } else if (navClicks.length > 0) {
+      destUrl = navClicks[navClicks.length - 1].href;
+    }
+    if (!destUrl && waypoints.length === 0) destUrl = startUrl;
 
     if (destUrl) {
       stepNum++;
@@ -2861,9 +3128,10 @@ function _buildGuidedRecipe(session, skillName) {
     }
 
     // Add DOM interaction waypoints — skip navigate events (already recorded above)
-    // and skip the very first navigate if it's just the start URL (URL-first skips it).
+    // and skip nav-clicks (clicks with http(s) hrefs that are now navigation).
     for (const evt of matched.events) {
       if (evt.type === 'navigate') continue; // handled as destination URL above
+      if (evt.type === 'click' && evt.href && /^https?:\/\//i.test(evt.href)) continue; // nav-click — handled as navigate
       if (evt.type === 'click' || evt.type === 'dblclick') {
         stepNum++;
         waypoints.push({

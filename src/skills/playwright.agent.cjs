@@ -281,6 +281,8 @@ async function _detectOpenMenus(sessionId, headed, timeoutMs = 5000) {
         else if (c.getAttribute('role')) _sel = `[role="${c.getAttribute('role')}"]`;
         else if (c.getAttribute('aria-label')) _sel = `[aria-label="${c.getAttribute('aria-label')}"]`;
         else _sel = `[class*="${(c.className || '').split(' ')[0] || 'menu'}"]`;
+        // Capture bounding rect for Tier 1.6 OCR clipping
+        const _r = c.getBoundingClientRect();
         menus.push({
           selector: _sel,
           role: c.getAttribute('role') || '',
@@ -288,6 +290,12 @@ async function _detectOpenMenus(sessionId, headed, timeoutMs = 5000) {
           class: (c.className || '').slice(0, 80),
           itemcount: items.length,
           items: items.slice(0, 15),
+          boundingRect: {
+            x: Math.round(_r.x),
+            y: Math.round(_r.y),
+            width: Math.round(_r.width),
+            height: Math.round(_r.height),
+          },
         });
       }
       // Sort: menus with more items first (likely the active menu)
@@ -8070,12 +8078,236 @@ RULES:
   using that input over a global page-level search. The DOM signals list inputs
   with context attributes — pick the input whose context matches the destination
   section.
+- CREATE/NEW RULE: For goals like "create a X", "make a new X", "add a new X",
+  "create a playlist/album/folder/project/document":
+  First click the "Create"/"New"/"Add" button on the page to open the creation
+  dialog or dropdown. Do NOT type the name into a search bar — search bars
+  (placeholder "What do you want to play?", "Search...", "Search for...") are for
+  searching, not creating. After clicking Create, a dialog or dropdown will
+  appear — then fill the name field in that dialog. If a dropdown appears after
+  clicking Create, the next step's click will handle selecting the appropriate
+  option (e.g. "Create a playlist") to open the actual creation dialog.
 
 Return JSON: {"steps": [...], "thoughts": "brief explanation"}`;
 
-async function _focusedPlanExecute({ goal, verificationGoal, sessionId, headed, timeoutMs, agentContext, deadline, start, heartbeat, _ocrText, _domSignals }) {
+// ---------------------------------------------------------------------------
+// Tier 1.6: Structured OCR Overlay Interaction
+// Uses DOM to open a menu/dropdown/popup/modal, then captures only that
+// overlay's region with LiteParser OCR, restructures the fragmented word-items
+// into clean { id, type, text, bounds } rows, and asks the LLM to pick the
+// right option or fill fields + click a button.
+// ---------------------------------------------------------------------------
+
+const { structureOcrOverlayItems, formatOverlayForLLM, pickOverlayAction } = require('./ocrOverlayStructure.cjs');
+
+function _isOverlayInteractionTask(goal, domSignals) {
+  if (!goal) return false;
+  const _g = goal.toLowerCase();
+  // Goal keywords that imply opening an overlay and selecting/filling
+  const _overlayKeywords = /\b(menu|dropdown|popup|modal|dialog|select|choose|pick from|open\s+\w+\s+options|tab|switch to|create\s+(?:a\s+)?(?:playlist|folder|project|document)|edit\s+details|context\s+menu)\b/i;
+  if (_overlayKeywords.test(_g)) return true;
+  // DOM signals: aria-haspopup, aria-expanded on the page
+  if (domSignals && typeof domSignals === 'string') {
+    if (/aria-expanded|aria-haspopup|role="combobox"|role="tablist"/i.test(domSignals)) return true;
+  }
+  return false;
+}
+
+async function _detectOverlayRect(sessionId) {
+  const _page = engine?.getPage?.(sessionId);
+  if (!_page) return null;
+  try {
+    const rect = await _page.evaluate(() => {
+      const sels = '[role="menu"], [role="listbox"], [role="dialog"], [aria-modal="true"], ' +
+        '[role="combobox"], [role="tablist"], ' +
+        '[class*="dropdown" i], [class*="popover" i], [class*="popup" i], ' +
+        '[class*="modal" i], [class*="overlay" i]';
+      for (const el of document.querySelectorAll(sels)) {
+        const r = el.getBoundingClientRect();
+        const s = window.getComputedStyle(el);
+        if (r.width < 2 || r.height < 2) continue;
+        if (s.display === 'none' || s.visibility === 'hidden' || parseFloat(s.opacity) === 0) continue;
+        const top = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+        if (!top || (top !== el && !el.contains(top))) continue;
+        return { x: Math.round(r.x), y: Math.round(r.y), width: Math.round(r.width), height: Math.round(r.height) };
+      }
+      return null;
+    }).catch(() => null);
+    return rect;
+  } catch (_) { return null; }
+}
+
+async function _executeOverlayInteraction({ goal, sessionId, headed, timeoutMs, triggerText, triggerSelector, overlayRect: _providedRect, skipTriggerClick = false }) {
+  const _oiStart = Date.now();
+  logger.info(`[playwright.agent] Tier 1.6 (overlay interaction): starting for goal="${goal.slice(0, 80)}"${skipTriggerClick ? ' [menu already open]' : ''}`);
+  const { browserAct } = require('./browser.act.cjs');
+  const { _liteparseCapture } = require('./browser.agent.cjs');
+  const _page = engine?.getPage?.(sessionId);
+  if (!_page) return { ok: false, error: 'no page available' };
+
+  try {
+    // 1. Open the overlay via DOM click (if trigger provided and menu not already open)
+    if (!skipTriggerClick && (triggerText || triggerSelector)) {
+      logger.info(`[playwright.agent] Tier 1.6: clicking trigger "${triggerText || triggerSelector}"`);
+      if (triggerSelector) {
+        await browserAct({ action: 'click', sessionId, headed, timeoutMs: 5000, selector: triggerSelector });
+      } else {
+        await browserAct({ action: 'clickByText', sessionId, headed, timeoutMs: 5000, text: triggerText });
+      }
+    }
+
+    // 2. Wait for overlay animation (skip if menu was already open)
+    if (!skipTriggerClick) {
+      await new Promise(r => setTimeout(r, 400));
+    }
+
+    // 3. Use provided rect or detect the open overlay region via DOM
+    let overlayRect = _providedRect || await _detectOverlayRect(sessionId);
+
+    // Fallback: if no DOM overlay container found, use the trigger element's bounds + expansion
+    if (!overlayRect && (triggerText || triggerSelector)) {
+      try {
+        const triggerRect = await _page.evaluate((sel, txt) => {
+          let el = null;
+          if (sel) el = document.querySelector(sel);
+          if (!el && txt) {
+            el = Array.from(document.querySelectorAll('button, a, [role="button"], [aria-haspopup]'))
+              .find(e => (e.innerText || e.textContent || '').trim().toLowerCase().includes(txt.toLowerCase()));
+          }
+          if (!el) return null;
+          const r = el.getBoundingClientRect();
+          return { x: Math.round(r.x), y: Math.round(r.y), width: Math.round(r.width), height: Math.round(r.height) };
+        }, triggerSelector || null, triggerText || null).catch(() => null);
+        if (triggerRect) {
+          // Expand downward by 300px, width 250px (typical menu size)
+          overlayRect = {
+            x: Math.max(0, triggerRect.x - 20),
+            y: triggerRect.y + triggerRect.height,
+            width: Math.max(triggerRect.width + 40, 250),
+            height: 300,
+          };
+        }
+      } catch (_) {}
+    }
+
+    if (!overlayRect) {
+      logger.warn(`[playwright.agent] Tier 1.6: no overlay detected — falling through`);
+      return { ok: false, error: 'no overlay detected' };
+    }
+
+    logger.info(`[playwright.agent] Tier 1.6: overlay rect = ${JSON.stringify(overlayRect)}`);
+
+    // 4. Capture region OCR
+    const _cap = await _liteparseCapture(_page, { clip: overlayRect });
+    if (!_cap.ok || !_cap.textItems || _cap.textItems.length === 0) {
+      logger.warn(`[playwright.agent] Tier 1.6: LiteParser capture failed or empty — falling through`);
+      return { ok: false, error: 'OCR capture failed' };
+    }
+
+    // 5. Structure the OCR items
+    const rows = structureOcrOverlayItems(_cap.textItems, {
+      imageWidth: _cap.imageWidth,
+      imageHeight: _cap.imageHeight,
+    });
+    if (rows.length === 0) {
+      logger.warn(`[playwright.agent] Tier 1.6: structured rows empty — falling through`);
+      return { ok: false, error: 'no structured rows' };
+    }
+
+    logger.info(`[playwright.agent] Tier 1.6: ${rows.length} structured rows:\n${formatOverlayForLLM(rows).split('\n').map(l => '  ' + l).join('\n')}`);
+
+    // 6. LLM select
+    const _pickResult = await pickOverlayAction(rows, goal, askWithMessages);
+    if (!_pickResult.ok) {
+      logger.warn(`[playwright.agent] Tier 1.6: LLM pick failed: ${_pickResult.error} — falling through`);
+      return { ok: false, error: `LLM pick failed: ${_pickResult.error}` };
+    }
+
+    // 7. Execute the LLM's decision
+    const _viewportWidth = _page.viewportSize()?.width || 1280;
+    const _viewportHeight = _page.viewportSize()?.height || 800;
+    // When a clip/overlayRect was used, OCR coordinates are relative to the clipped
+    // region, not the full viewport. We must:
+    // 1. Scale OCR coords by (overlayRect.width / imageWidth) to get CSS-pixel offsets
+    // 2. Add overlayRect.x/y to get full-viewport coordinates
+    const _hasClip = !!(overlayRect && overlayRect.width && overlayRect.height);
+    const _originX = _hasClip ? overlayRect.x : 0;
+    const _originY = _hasClip ? overlayRect.y : 0;
+    const _scaleX = _hasClip
+      ? overlayRect.width / (_cap.imageWidth || overlayRect.width)
+      : _viewportWidth / (_cap.imageWidth || _viewportWidth);
+    const _scaleY = _hasClip
+      ? overlayRect.height / (_cap.imageHeight || overlayRect.height)
+      : _viewportHeight / (_cap.imageHeight || _viewportHeight);
+
+    if (_pickResult.action === 'pick') {
+      // Pick one row — click its center
+      const sel = _pickResult.selection;
+      const clickX = Math.round(_originX + (sel.x + sel.width / 2) * _scaleX);
+      const clickY = Math.round(_originY + (sel.y + sel.height / 2) * _scaleY);
+      logger.info(`[playwright.agent] Tier 1.6: clicking "${sel.text}" at (${clickX}, ${clickY}) — scale=(${_scaleX}, ${_scaleY}), origin=(${_originX}, ${_originY})`);
+      await _page.mouse.click(clickX, clickY);
+      return { ok: true, action: 'pick', selectedText: sel.text, clickedAt: { x: clickX, y: clickY }, reason: _pickResult.reason, rows, executionTime: Date.now() - _oiStart };
+    } else if (_pickResult.action === 'fill_and_click') {
+      // Fill fields + click button
+      const transcript = [];
+      for (const fill of _pickResult.fills || []) {
+        logger.info(`[playwright.agent] Tier 1.6: filling field "${fill.text}" with "${fill.value}"`);
+        // Try DOM focus first (find input by placeholder/label within the overlay region)
+        try {
+          const focused = await _page.evaluate((rect, labelText) => {
+            const inputs = document.querySelectorAll('input, textarea, [contenteditable], [role="textbox"]');
+            for (const inp of inputs) {
+              const r = inp.getBoundingClientRect();
+              if (r.x < rect.x || r.x > rect.x + rect.width) continue;
+              if (r.y < rect.y || r.y > rect.y + rect.height) continue;
+              const label = (inp.getAttribute('placeholder') || inp.getAttribute('aria-label') || inp.getAttribute('aria-placeholder') || '').toLowerCase();
+              if (label.includes(labelText.toLowerCase()) || labelText.toLowerCase().includes(label)) {
+                inp.focus();
+                return true;
+              }
+            }
+            return false;
+          }, overlayRect, fill.text).catch(() => false);
+          if (focused) {
+            await _page.keyboard.type(fill.value);
+            transcript.push({ action: 'fill', field: fill.text, value: fill.value, ok: true });
+          } else {
+            // Fallback: click the field by OCR coords, then type
+            const clickX = Math.round(_originX + (fill.x + 50) * _scaleX);
+            const clickY = Math.round(_originY + (fill.y + fill.height / 2) * _scaleY);
+            await _page.mouse.click(clickX, clickY);
+            await new Promise(r => setTimeout(r, 200));
+            await _page.keyboard.type(fill.value);
+            transcript.push({ action: 'fill', field: fill.text, value: fill.value, ok: true, method: 'ocr-coords' });
+          }
+        } catch (e) {
+          transcript.push({ action: 'fill', field: fill.text, value: fill.value, ok: false, error: e.message });
+        }
+      }
+      // Click the button
+      if (_pickResult.click) {
+        const btn = _pickResult.click;
+        const clickX = Math.round(_originX + (btn.x + btn.width / 2) * _scaleX);
+        const clickY = Math.round(_originY + (btn.y + btn.height / 2) * _scaleY);
+        logger.info(`[playwright.agent] Tier 1.6: clicking button "${btn.text}" at (${clickX}, ${clickY})`);
+        await _page.mouse.click(clickX, clickY);
+        transcript.push({ action: 'click', button: btn.text, ok: true });
+      }
+      return { ok: true, action: 'fill_and_click', transcript, reason: _pickResult.reason, rows, executionTime: Date.now() - _oiStart };
+    }
+
+    return { ok: false, error: 'unknown action type from LLM', executionTime: Date.now() - _oiStart };
+  } catch (e) {
+    logger.warn(`[playwright.agent] Tier 1.6 error: ${e.message}`);
+    return { ok: false, error: e.message, executionTime: Date.now() - _oiStart };
+  }
+}
+
+async function _focusedPlanExecute({ goal, verificationGoal, sessionId, headed, timeoutMs, agentContext, deadline, start, heartbeat, _ocrText, _domSignals, pageStudyBlock, domainLockBlock, failedApproachesBlock, recordFailedApproach }) {
   const _peStart = Date.now();
   logger.info(`[playwright.agent] focused Plan-Execute: starting for goal="${goal.slice(0, 80)}"`);
+  logger.info(`[playwright.agent] focused Plan-Execute: pageStudyBlock length=${(pageStudyBlock || '').length}${pageStudyBlock ? `, first 200 chars: ${pageStudyBlock.slice(0, 200)}` : ' (empty)'}`);
 
   try {
     const page = engine.getPage(sessionId);
@@ -8089,6 +8321,7 @@ async function _focusedPlanExecute({ goal, verificationGoal, sessionId, headed, 
     // 2. ONE LLM call with full context
     const _userPrompt = `GOAL: ${goal}
 ${agentContext ? `\nAGENT CONTEXT:\n${agentContext}` : ''}
+${pageStudyBlock || ''}
 ${_ocrText ? `\nOCR SCREEN CAPTURE:\n${_ocrText.slice(0, 1000)}\n` : ''}
 ${_domSignals ? `\nDOM STATE SIGNALS:\n${_domSignals.slice(0, 1000)}\n` : ''}
 VISIBLE PAGE TEXT (first 2000 chars):
@@ -8098,6 +8331,8 @@ ARIA SNAPSHOT (first 3000 chars):
 ${_snap.slice(0, 3000)}
 
 Generate 3-5 steps to complete this task.`;
+
+    logger.info(`[playwright.agent] focused Plan-Execute: prompt (first 500 chars): ${_userPrompt.slice(0, 500)}`);
 
     const _response = await askWithMessages([
       { role: 'system', content: FOCUSED_PLAN_EXECUTE_PROMPT },
@@ -8133,6 +8368,11 @@ Generate 3-5 steps to complete this task.`;
       const _step = _steps[_i];
       logger.info(`[playwright.agent] focused Plan-Execute: step ${_i + 1}/${_steps.length} — ${_step.action}`);
 
+      // Capture state before click for post-click menu detection (Tier 1.6).
+      const _isClickStep = _step.action === 'click';
+      const _urlBefore = _isClickStep ? await page.evaluate(() => window.location.href).catch(() => '') : '';
+      const _bodyLenBefore = _isClickStep ? await page.evaluate(() => document.body.innerText.length).catch(() => 0) : 0;
+
       const _result = await browserAct({ ..._step, sessionId, headed, timeoutMs: timeoutMs || 15000 });
       _peTranscript.push({ step: _i + 1, action: _step, outcome: { ok: _result.ok, error: _result.error, result: _result.result }, thoughts: `Plan-Execute step ${_i + 1}` });
 
@@ -8142,8 +8382,74 @@ Generate 3-5 steps to complete this task.`;
         _lastMutatingStepTs = Date.now();
       }
 
+      // ── Post-click Tier 1.6: detect menu/dropdown and pick the right item ──
+      // After a successful click, check if a menu appeared. If so, use Tier 1.6
+      // (OCR + structure + LLM pick) to click the right menu item before proceeding.
+      // This handles cases where the LLM's plan assumes a click leads directly to a
+      // form/dialog, but actually opens a dropdown menu that needs an intermediate click.
+      if (_result.ok && _isClickStep) {
+        try {
+          await new Promise(r => setTimeout(r, 400)); // wait for menu animation
+          const _urlAfter = await page.evaluate(() => window.location.href).catch(() => '');
+          const _bodyLenAfter = await page.evaluate(() => document.body.innerText.length).catch(() => 0);
+
+          // Only proceed if: no navigation + something appeared on screen
+          if (_urlAfter === _urlBefore && _bodyLenAfter > _bodyLenBefore + 30) {
+            logger.info(`[playwright.agent] focused Plan-Execute: bodyLen ${_bodyLenBefore} → ${_bodyLenAfter} after click — checking for menu`);
+
+            // Resolve trigger text from the clicked element (for overlay rect fallback)
+            let _triggerText = _step.text || null;
+            if (!_triggerText && _step.selector) {
+              _triggerText = await page.evaluate((sel) => {
+                const el = sel.startsWith('td') ? document.querySelector(`[data-td-ref="${sel}"]`) : document.querySelector(sel);
+                return el ? (el.innerText || el.textContent || '').trim().slice(0, 50) : null;
+              }, _step.selector).catch(() => null);
+            }
+
+            // Try DOM-based menu detection first (for overlay rect)
+            const _openMenus = await _detectOpenMenus(sessionId, headed, 3000);
+            let _menuRect = null;
+            if (_openMenus.length > 0 && _openMenus[0].items.length >= 2) {
+              _menuRect = _openMenus[0].boundingRect;
+              logger.info(`[playwright.agent] focused Plan-Execute: DOM menu detected (${_openMenus[0].items.length} items)`);
+            }
+
+            // Call Tier 1.6 — with menu rect if found, or triggerText for fallback rect
+            const _overlayResult = await _executeOverlayInteraction({
+              goal, sessionId, headed, timeoutMs,
+              triggerText: _triggerText,
+              triggerSelector: _step.selector && !_step.selector.startsWith('td') ? _step.selector : null,
+              overlayRect: _menuRect,
+              skipTriggerClick: true, // menu is already open — don't click trigger again
+            });
+
+            if (_overlayResult.ok) {
+              logger.info(`[playwright.agent] focused Plan-Execute: Tier 1.6 succeeded (${_overlayResult.action}) — ${_overlayResult.reason || ''}`);
+              _peTranscript.push({
+                step: _i + 1, action: { action: 'tier1.6_pick', text: _overlayResult.selectedText || '' },
+                outcome: { ok: true, ..._overlayResult },
+                thoughts: `Tier 1.6 in Plan-Execute: ${_overlayResult.reason || ''}`,
+              });
+              _lastMutatingStepTs = Date.now();
+            } else {
+              logger.warn(`[playwright.agent] focused Plan-Execute: Tier 1.6 failed: ${_overlayResult.error} — continuing with planned steps`);
+            }
+          }
+        } catch (_t16Err) {
+          logger.warn(`[playwright.agent] focused Plan-Execute: post-click Tier 1.6 error: ${_t16Err.message}`);
+        }
+      }
+
       if (!_result.ok) {
         logger.warn(`[playwright.agent] focused Plan-Execute: step ${_i + 1} failed — ${_result.error}`);
+        // Record this failed step in the session ledger (process of elimination)
+        if (typeof recordFailedApproach === 'function') {
+          recordFailedApproach(
+            `step: ${_step.action}${_step.selector ? `(${_step.selector})` : ''}${_step.text ? ` "${_step.text}"` : ''}`,
+            _result.error,
+            ''
+          );
+        }
         // One replan attempt: re-snapshot + re-plan remaining steps from the fresh state.
         if (!_replanned) {
           _replanned = true;
@@ -8152,11 +8458,32 @@ Generate 3-5 steps to complete this task.`;
             const _replanSnapRes = await browserAct({ action: 'snapshot', sessionId, headed, timeoutMs: 10000 }).catch(() => ({ ok: false }));
             const _replanSnap = _replanSnapRes?.ok ? String(_replanSnapRes.result || '') : '';
             const _replanPageText = await page.evaluate(() => document.body.innerText.slice(0, 3000)).catch(() => '');
+
+            // Re-run page study on the fresh snapshot so the re-plan is grounded in the current page state
+            let _replanStudyBlock = pageStudyBlock || '';
+            try {
+              const _replanStudyRaw = await askWithMessages([
+                { role: 'system', content: PAGE_STUDY_PROMPT + (domainLockBlock || '') },
+                { role: 'user',   content: `GOAL: ${goal}\n\nSNAPSHOT:\n${pruneSnapshot(extractInteractiveRefs(_replanSnap))}` },
+              ], { temperature: 0.1, maxTokens: 1000, responseTimeoutMs: 15000 });
+              const _replanPageStudy = parseJson(_replanStudyRaw);
+              if (_replanPageStudy && typeof _replanPageStudy === 'object') {
+                logger.info(`[playwright.agent] focused Plan-Execute: internal replan page study — pageType=${_replanPageStudy.pageType}, confidence=${_replanPageStudy.confidence}, elements=${_replanPageStudy.keyElements?.length || 0}`);
+                _replanStudyBlock = `\nPAGE ANALYSIS (from pre-plan study phase — use this to guide your plan):\n- Page type: ${_replanPageStudy.pageType || 'unknown'}\n- Right page: ${_replanPageStudy.rightPage}\n- Confidence: ${_replanPageStudy.confidence}\n- Key elements: ${JSON.stringify((_replanPageStudy.keyElements || []).slice(0, 10))}\n- Expected flow: ${(_replanPageStudy.expectedFlow || []).join(' → ')}\n- Potential blockers: ${(_replanPageStudy.potentialBlockers || []).join('; ')}\n`;
+              } else {
+                logger.warn(`[playwright.agent] focused Plan-Execute: internal replan page study unparseable — using original study block`);
+              }
+            } catch (_replanStudyErr) {
+              logger.warn(`[playwright.agent] focused Plan-Execute: internal replan page study failed (non-fatal): ${_replanStudyErr.message}`);
+            }
+
             const _failedStepNote = `The previous plan failed at step ${_i + 1} (${_step.action}) with error: ${_result.error}. The page state below is a FRESH snapshot taken after that failure.`;
             const _replanPrompt = `GOAL: ${goal}
 ${agentContext ? `\nAGENT CONTEXT:\n${agentContext}` : ''}
+${_replanStudyBlock}
 ${_ocrText ? `\nOCR SCREEN CAPTURE:\n${_ocrText.slice(0, 1000)}\n` : ''}
 ${_domSignals ? `\nDOM STATE SIGNALS:\n${_domSignals.slice(0, 1000)}\n` : ''}
+${failedApproachesBlock || ''}
 ${_failedStepNote}
 
 VISIBLE PAGE TEXT (first 2000 chars):
@@ -8165,7 +8492,7 @@ ${_replanPageText.slice(0, 2000)}
 ARIA SNAPSHOT (first 3000 chars):
 ${_replanSnap.slice(0, 3000)}
 
-Generate 3-5 steps to complete this task FROM THE CURRENT PAGE STATE. The prior steps ${_i > 0 ? `(steps 1-${_i}) already succeeded — do NOT repeat them. ` : ''}Re-plan from here.`;
+Generate 3-5 steps to complete this task FROM THE CURRENT PAGE STATE. Steps 1-${_i} already succeeded — do NOT repeat them. If the FAILED APPROACHES block above lists an action, do NOT retry it — try a DIFFERENT approach.`;
 
             const _replanResponse = await askWithMessages([
               { role: 'system', content: FOCUSED_PLAN_EXECUTE_PROMPT },
@@ -11412,6 +11739,44 @@ ${_composeSel ? `- SUGGESTED COMPOSE SELECTOR: ${_composeSel}` : ''}`;
         const _activeMenu = _openMenus[0];
         _activeMenuScope = _activeMenu.selector;
         _activeMenuItems = _activeMenu.items.map(i => i.text).filter(Boolean);
+
+        // ── Tier 1.6: Structured OCR overlay handler ──────────────────────────
+        // When a menu is open, OCR its region, restructure via
+        // ocrOverlayStructure.cjs, and ask the LLM to pick the right row.
+        // This is more accurate than the DOM-scraped text hint below because:
+        //   (a) OCR captures what's actually visible (not filtered by EXCLUDE_CONTEXT)
+        //   (b) ocrOverlayStructure.cjs clusters fragments into clean rows
+        //   (c) The LLM sees structured { id, type, text, description } rows
+        // Falls back to the text hint if Tier 1.6 fails.
+        if (_activeMenuItems.length >= 2 && _activeMenu.boundingRect && _activeMenu.boundingRect.width > 10) {
+          try {
+            logger.info(`[playwright.agent] turn-loop: Tier 1.6 overlay handler — OCR menu region ${JSON.stringify(_activeMenu.boundingRect)} (${_activeMenuItems.length} DOM items)`);
+            const _overlayResult = await _executeOverlayInteraction({
+              goal, sessionId, headed, timeoutMs,
+              overlayRect: _activeMenu.boundingRect,
+              skipTriggerClick: true, // menu is already open
+            });
+            if (_overlayResult.ok) {
+              logger.info(`[playwright.agent] turn-loop: Tier 1.6 succeeded (${_overlayResult.action}) — ${_overlayResult.reason || ''}`);
+              // Record the action in the loop transcript
+              _loopTranscript.push({
+                step: turn,
+                action: { action: 'overlay_interaction', tier: '1.6', selectedText: _overlayResult.selectedText || '' },
+                outcome: { ok: true, ..._overlayResult },
+                thoughts: `Tier 1.6 overlay handler: ${_overlayResult.reason || ''}`,
+              });
+              // Skip the normal LLM turn — Tier 1.6 already clicked the right item.
+              // Continue to next turn iteration for state capture + verification.
+              _openMenuHint = '';
+              continue; // skip to next turn — don't run LLM this iteration
+            }
+            logger.warn(`[playwright.agent] turn-loop: Tier 1.6 failed: ${_overlayResult.error} — falling back to text hint`);
+          } catch (_t16Err) {
+            logger.warn(`[playwright.agent] turn-loop: Tier 1.6 error: ${_t16Err.message} — falling back to text hint`);
+          }
+        }
+
+        // Fallback: text hint (existing behavior)
         if (_activeMenuItems.length > 0) {
           const _itemsList = _activeMenuItems.map(t => `    - "${t}"`).join('\n');
           const _multiModal = _openMenus.length > 1 ? ` Multiple dialogs are open. If the element you need is NOT inside this menu, DISMISS the others first (press Escape or click their Cancel/Close) before interacting with it.` : '';
@@ -11631,6 +11996,7 @@ ${_lastActionSignature && _lastActionSignature.startsWith('no_progress:') ? `\n�
 ${_lastActionSignature === 'return_rejected' || (_lastActionSignature && _lastActionSignature.startsWith('return_rejected:')) ? `\n❌ RETURN REJECTED: You declared the goal done, but verification found the goal was NOT actually achieved.${_lastActionSignature && _lastActionSignature.startsWith('return_rejected:') ? ` Verification reason: "${_lastActionSignature.slice('return_rejected:'.length)}"` : ' (expected text is missing from the page/title).'} Do NOT return again until you have actually completed the task. Look at the PAGE TEXT, OCR, and DOM STATE SIGNALS above — identify what the verification reason says is missing, then perform the action that actually completes the goal. For example: if you only searched for X but the goal was to add X to Y, you need to perform the add action (e.g. open the item's overflow/.../more-options button on its row and choose "Add to Y"), not just search. If you typed text into the wrong field, close the dialog (press Escape) and try the correct element.\n` : ''}
 ${_lastActionSignature && _lastActionSignature.startsWith('hidden_element:') ? `\n🔍 HIDDEN ELEMENT: The element "${_lastActionSignature.slice('hidden_element:'.length)}" exists in the DOM but is NOT VISIBLE. It may be hidden by a UI mode (compact mode, collapsed toolbar, minimized section) or by a parent container. Try: (a) press a keyboard shortcut to toggle the UI mode (e.g. { "action": "press", "key": "Control+Shift+F" } for compact mode in many editors), (b) look for a toggle/expand/collapse button in the snapshot and click it to reveal the element, (c) press Ctrl+/ or ? to open the app's keyboard shortcut help overlay to find the right shortcut, or (d) check the OCR — if the expected UI area (e.g. title bar, toolbar section) is missing from the screen, a UI mode is likely hiding it. Also check the APP KNOWLEDGE block above for known shortcuts and UI mode toggles for this app.\n` : ''}
 ${_lastActionSignature === 'multiple_modals' ? '\n🪟 MULTIPLE DIALOGS OPEN: Several dialogs/menus are on screen at once (e.g. cookie/language/location/privacy on top of the task dialog). The same click keeps being applied to the WRONG dialog. You must FIRST dismiss the irrelevant dialogs — press Escape or click their Cancel/Close/Not now/Done button. Then perform the click inside the correct dialog (e.g. the "Edit details" dialog or the "Add to playlist" dialog). If a clickByText would match several dialogs, use clickBySelector with a ref id from the specific dialog you want, or press Escape to clear the non-goal modals first.\n' : ''}${_lastActionSignature && _lastActionSignature.startsWith('jit_fix:') ? `\n💡 JIT RESEARCH FIX: Web research found this specific fix for the current issue: ${_lastActionSignature.slice('jit_fix:'.length)} — apply this fix now.\n` : ''}
+${_formatFailedApproachesBlock()}
 Turn ${turn}/${MAX_TURNS}. What is your next action? (DO NOT snapshot - act directly)`;
 
     let _actionRaw;
@@ -11827,6 +12193,7 @@ Turn ${turn}/${MAX_TURNS}. What is your next action? (DO NOT snapshot - act dire
         _noProgressHintInjected = true;
         _lastActionSignature = `no_progress:${act.action}`;
         logger.warn(`[playwright.agent] turn-loop: no-progress hint — blocked action "${act.action}" repeated ${blockedCount}× — injecting hint`);
+        _recordFailedApproach(`turn-loop: ${act.action} repeated ${blockedCount}×`, 'no progress / blocked', '');
 
         // JIT sub-task discovery for the current sub-task
         if (hostname && _discoverTaskProcedure && _subTasks && _subTasks.length > 0) {
@@ -11901,6 +12268,7 @@ Turn ${turn}/${MAX_TURNS}. What is your next action? (DO NOT snapshot - act dire
           _loopTranscript.push({ action: _action, outcome: { ok: false, error: 'skipped duplicate — page state unchanged, try a different approach or return done' } });
           // Inject hint into next turn by modifying the goal temporarily
           _lastActionSignature = 'duplicate_noop';
+          _recordFailedApproach(`turn-loop: ${_action.action}(${_action.selector || _action.text || _action.url || ''})`, 'duplicate no-op / page unchanged', '');
           continue;
         }
       }
@@ -11925,6 +12293,7 @@ Turn ${turn}/${MAX_TURNS}. What is your next action? (DO NOT snapshot - act dire
         }
         _loopTranscript.push({ action: _action, outcome: { ok: false, error: 'skipped duplicate type/fill — same text already entered via different selector' } });
         _lastActionSignature = 'duplicate_noop';
+        _recordFailedApproach(`turn-loop: ${_action.action} text="${(_action.text || '').slice(0, 40)}"`, 'duplicate type/fill — same text already entered', '');
         continue;
       }
     }
@@ -12026,6 +12395,7 @@ Turn ${turn}/${MAX_TURNS}. What is your next action? (DO NOT snapshot - act dire
         } else {
           // Inject hint into next turn via _lastActionSignature (read by the goal builder below)
           _lastActionSignature = `no_progress:${_action.action}`;
+          _recordFailedApproach(`turn-loop: ${_action.action}(${_action.selector || _action.text || ''})`, 'no progress / stuck', '');
         }
 
         // Just-in-time app-knowledge research: the agent is stuck — search for
@@ -14037,8 +14407,21 @@ async function playwrightAgent(args) {
     const _studyRaw = await askWithMessages([
       { role: 'system', content: PAGE_STUDY_PROMPT + domainLockBlock },
       { role: 'user',   content: `GOAL: ${_finalGoal}\n\nSNAPSHOT:\n${pruneSnapshot(extractInteractiveRefs(currentSnapshot))}` },
-    ], { temperature: 0.1, maxTokens: 600, responseTimeoutMs: 15000 });
+    ], { temperature: 0.1, maxTokens: 1000, responseTimeoutMs: 15000 });
     _pageStudy = parseJson(_studyRaw);
+    if (!_pageStudy && _studyRaw) {
+      logger.warn(`[playwright.agent] phase 1.7: page study response unparseable — retrying with simpler prompt. Raw (first 300 chars): ${_studyRaw.slice(0, 300)}`);
+      const _retryRaw = await askWithMessages([
+        { role: 'system', content: 'Respond with ONLY a JSON object, no markdown fences, no explanation. Format: {"pageType":"...","rightPage":true,"confidence":0.9,"keyElements":[{"ref":"...","role":"...","label":"...","purpose":"..."}],"expectedFlow":["..."],"potentialBlockers":["..."],"wrongPageReason":null}' },
+        { role: 'user', content: `GOAL: ${_finalGoal}\n\nSNAPSHOT:\n${pruneSnapshot(extractInteractiveRefs(currentSnapshot)).slice(0, 2000)}\n\nReturn the JSON object now.` },
+      ], { temperature: 0, maxTokens: 800, responseTimeoutMs: 15000 });
+      _pageStudy = parseJson(_retryRaw);
+      if (_pageStudy) {
+        logger.info(`[playwright.agent] phase 1.7: page study succeeded on retry — pageType=${_pageStudy.pageType}`);
+      } else {
+        logger.warn(`[playwright.agent] phase 1.7: page study retry also unparseable. Raw retry (first 300 chars): ${(_retryRaw || '').slice(0, 300)}`);
+      }
+    }
     if (_pageStudy && typeof _pageStudy === 'object') {
       logger.info(`[playwright.agent] phase 1.7: page study — pageType=${_pageStudy.pageType}, rightPage=${_pageStudy.rightPage}, confidence=${_pageStudy.confidence}, elements=${_pageStudy.keyElements?.length || 0}`);
       if (_pageStudy.rightPage === false && (_pageStudy.confidence || 0) < 0.3) {
@@ -14136,77 +14519,215 @@ async function playwrightAgent(args) {
     logger.info(`[playwright.agent] Tier 1.8/1.9: skipping (single-step or no sub-tasks) — falling through to Phase 2`);
   }
 
-  // ── Phase 2: Focused Plan-Execute (one LLM call, 3-5 steps, verify each) ──
-  // Handles ALL interaction types: click, fill, type, press, hover, select, scroll,
-  // drag, upload, check, tab-select, getPageText. Falls back to mini turn-loop on failure.
-  logger.info(`[playwright.agent] phase 2: URL-first tiers did not complete - trying focused Plan-Execute`);
+  // ── NOTE: Tier 1.6 (Structured OCR Overlay) was previously a pre-Phase-2 gate
+  // that tried to detect overlay tasks from the goal text. It always failed
+  // because no overlay was open yet (the page just loaded). Tier 1.6 is now
+  // integrated INTO the turn-loop's open-menu detection — it fires when
+  // _detectOpenMenus finds an open menu, OCRs the menu region, restructures
+  // via ocrOverlayStructure.cjs, and asks the LLM to pick the right row.
+  // See _executeOverlayInteraction + the turn-loop open-menu handler.
+
+  // ── Phase 2: Focused Plan-Execute loop with re-study/re-plan on state changes ──
+  // Plan-Execute is run repeatedly. After each attempt:
+  //   - If goal is verified (ok=true), return immediately
+  //   - If state changed significantly (URL, body length >200, modal count), re-study and re-run
+  //   - If state did not change or max attempts reached, break and fall back to turn-loop
+  logger.info(`[playwright.agent] phase 2: URL-first tiers did not complete - trying focused Plan-Execute (loop)`);
+
   let _ocrTextForPE = '';
   let _domSignalsForPE = '';
-  try {
-    const _pePage = engine.getPage(sessionId);
-    if (_pePage) {
-      // Page-level capture (Playwright screenshot → LiteParse) — no overlay hide/show.
-      const _cap = await _ocrCaptureViaPage(sessionId).catch(() => ({ ok: false }));
-      if (_cap.ok) _ocrTextForPE = _cap.text.slice(0, 1500);
-      // Reuse DOM signals logic
-      const _signals = await _pePage.evaluate(() => {
-        const signals = [];
-        function makeSelector(el) {
-          if (el.id) return `#${el.id}`;
-          const parts = [el.tagName.toLowerCase()];
-          if (el.getAttribute('aria-label')) parts.push(`[aria-label='${el.getAttribute('aria-label')}']`);
-          else if (el.getAttribute('contenteditable')) parts.push(`[contenteditable='${el.getAttribute('contenteditable')}']`);
-          else if (el.getAttribute('role')) parts.push(`[role='${el.getAttribute('role')}']`);
-          return parts.join('');
+  async function _refreshPeInputs() {
+    _ocrTextForPE = '';
+    _domSignalsForPE = '';
+    try {
+      const _pePage = engine.getPage(sessionId);
+      if (_pePage) {
+        const _cap = await _ocrCaptureViaPage(sessionId).catch(() => ({ ok: false }));
+        if (_cap.ok) _ocrTextForPE = _cap.text.slice(0, 1500);
+        const _signals = await _pePage.evaluate(() => {
+          const signals = [];
+          function makeSelector(el) {
+            if (el.id) return `#${el.id}`;
+            const parts = [el.tagName.toLowerCase()];
+            if (el.getAttribute('aria-label')) parts.push(`[aria-label='${el.getAttribute('aria-label')}']`);
+            else if (el.getAttribute('contenteditable')) parts.push(`[contenteditable='${el.getAttribute('contenteditable')}']`);
+            else if (el.getAttribute('role')) parts.push(`[role='${el.getAttribute('role')}']`);
+            return parts.join('');
+          }
+          document.querySelectorAll('[contenteditable], [aria-expanded], [aria-modal], [placeholder], [aria-placeholder]').forEach(el => {
+            signals.push({ selector: makeSelector(el), tag: el.tagName, ce: el.getAttribute('contenteditable'), label: el.getAttribute('aria-label'), text: (el.innerText || '').slice(0, 40) });
+          });
+          return signals.slice(0, 15);
+        }).catch(() => []);
+        if (_signals.length > 0) {
+          _domSignalsForPE = _signals.map(s => `${s.selector} <${s.tag}>${s.ce ? ' ce=' + s.ce : ''}${s.label ? ' label="' + s.label + '"' : ''}${s.text ? ' text="' + s.text + '"' : ''}`).join('\n  ');
         }
-        document.querySelectorAll('[contenteditable], [aria-expanded], [aria-modal], [placeholder], [aria-placeholder]').forEach(el => {
-          signals.push({ selector: makeSelector(el), tag: el.tagName, ce: el.getAttribute('contenteditable'), label: el.getAttribute('aria-label'), text: (el.innerText || '').slice(0, 40) });
-        });
-        return signals.slice(0, 15);
-      }).catch(() => []);
-      if (_signals.length > 0) {
-        _domSignalsForPE = _signals.map(s => `${s.selector} <${s.tag}>${s.ce ? ' ce=' + s.ce : ''}${s.label ? ' label="' + s.label + '"' : ''}${s.text ? ' text="' + s.text + '"' : ''}`).join('\n  ');
       }
+    } catch (_) {}
+  }
+  await _refreshPeInputs();
+
+  const MAX_PE_ATTEMPTS = 3;
+  let _peAttempt = 0;
+  let _lastPeState = { url: '', bodyLen: 0, modalCount: 0 };
+  let _peLoopResult = null;
+  let _peLoopStudyBlock = _studyBlock;
+
+  // ── Session-scoped "failed approaches" ledger (process of elimination) ──
+  // Records approaches that did not achieve the goal, so subsequent LLM prompts
+  // (Plan-Execute, replan, turn-loop) can avoid repeating them. General mechanism
+  // — works for any site, not Spotify-specific.
+  const _failedApproaches = [];
+  function _recordFailedApproach(approach, result, url) {
+    const _entry = { approach: String(approach || '').slice(0, 200), result: String(result || '').slice(0, 200), url: url || '' };
+    if (!_failedApproaches.some(a => a.approach === _entry.approach && a.result === _entry.result)) {
+      _failedApproaches.push(_entry);
+      if (_failedApproaches.length > 8) _failedApproaches.shift();
+      logger.info(`[playwright.agent] failed-approaches: recorded #${_failedApproaches.length}: "${_entry.approach}" → "${_entry.result}"`);
+    }
+  }
+  function _formatFailedApproachesBlock() {
+    if (_failedApproaches.length === 0) return '';
+    const _lines = _failedApproaches.map((a, i) =>
+      `${i + 1}. Tried: ${a.approach} → Result: ${a.result}${a.url ? ` (on ${a.url})` : ''}`
+    );
+    return `\nFAILED APPROACHES (these did not achieve the goal — do NOT retry the same actions; try a DIFFERENT approach):\n${_lines.join('\n')}\n`;
+  }
+
+  // Capture initial state
+  try {
+    const _pePage0 = engine.getPage(sessionId);
+    if (_pePage0) {
+      _lastPeState = await _pePage0.evaluate(() => ({
+        url: window.location.href,
+        bodyLen: (document.body.innerText || '').length,
+        modalCount: document.querySelectorAll('[role="dialog"], [role="alertdialog"], [aria-modal="true"]').length,
+      })).catch(() => _lastPeState);
     }
   } catch (_) {}
 
-  try {
-    const _peResult = await _focusedPlanExecute({
-      goal: _finalGoal,
-      verificationGoal: effectiveGoal,
-      sessionId,
-      headed,
-      timeoutMs,
-      agentContext,
-      deadline: _deadline,
-      start,
-      heartbeat: _heartbeat,
-      _ocrText: _ocrTextForPE,
-      _domSignals: _domSignalsForPE,
-    });
-    if (_peResult.ok) {
-      _peResult.executionTime = Date.now() - start;
-      _heartbeat.stop();
-      return _peResult;
-    }
-    logger.warn(`[playwright.agent] focused Plan-Execute failed: ${_peResult.error || 'unknown'} — falling back to mini turn-loop`);
-    // If Plan-Execute typed text but failed verification because the text is still
-    // in the compose element (not yet submitted), signal to the turn-loop that text
-    // is already entered. Only applies when the failure reason explicitly indicates
-    // text was found but not sent — avoids false positives when text was typed into
-    // the wrong field.
-    if (_peResult?.transcript) {
-      const _typedText = _peResult.transcript.some(t =>
-        t.outcome?.ok && ['type', 'fill', 'reactFill'].includes(t.action?.action)
-      );
-      const _failReason = String(_peResult.error || '');
-      if (_typedText && /text still in compose|not sent|not completed/i.test(_failReason)) {
-        _textAlreadyEntered = true;
-        logger.info(`[playwright.agent] Plan-Execute typed text but failed verification (${_failReason.slice(0, 60)}) — setting _textAlreadyEntered=true for turn-loop`);
+  while (_peAttempt < MAX_PE_ATTEMPTS) {
+    _peAttempt++;
+    logger.info(`[playwright.agent] phase 2: Plan-Execute attempt ${_peAttempt}/${MAX_PE_ATTEMPTS}`);
+
+    let _peResult = null;
+    try {
+      _peResult = await _focusedPlanExecute({
+        goal: _finalGoal,
+        verificationGoal: effectiveGoal,
+        sessionId,
+        headed,
+        timeoutMs,
+        agentContext,
+        deadline: _deadline,
+        start,
+        heartbeat: _heartbeat,
+        _ocrText: _ocrTextForPE,
+        _domSignals: _domSignalsForPE,
+        pageStudyBlock: _peLoopStudyBlock,
+        domainLockBlock,
+        failedApproachesBlock: _formatFailedApproachesBlock(),
+        recordFailedApproach: _recordFailedApproach,
+      });
+
+      if (_peResult && _peResult.ok) {
+        _peResult.executionTime = Date.now() - start;
+        _heartbeat.stop();
+        return _peResult;
       }
+      _peLoopResult = _peResult;
+      logger.warn(`[playwright.agent] focused Plan-Execute attempt ${_peAttempt} failed: ${_peResult?.error || 'unknown'}`);
+      // Record failed approach in the session ledger (process of elimination)
+      const _stepsSummary = (_peLoopResult?.transcript || [])
+        .filter(t => t.action?.action && t.action.action !== 'replan')
+        .slice(0, 5)
+        .map(t => `${t.action.action}${t.action.selector ? `(${t.action.selector})` : ''}${t.action.text ? ` "${t.action.text}"` : ''}`)
+        .join(', ');
+      _recordFailedApproach(
+        `Plan-Execute attempt ${_peAttempt}: ${_stepsSummary || 'unknown steps'}`,
+        _peLoopResult?.error || 'goal not met',
+        ''
+      );
+    } catch (_peErr) {
+      logger.warn(`[playwright.agent] focused Plan-Execute attempt ${_peAttempt} error: ${_peErr.message}`);
+      _peLoopResult = { ok: false, error: _peErr.message };
+      _recordFailedApproach(`Plan-Execute attempt ${_peAttempt}`, _peErr.message, '');
     }
-  } catch (_peErr) {
-    logger.warn(`[playwright.agent] focused Plan-Execute error: ${_peErr.message} — falling back to state-diff loop`);
+
+    // Decide whether to re-study and re-plan
+    let _peEndState = { url: '', bodyLen: 0, modalCount: 0 };
+    try {
+      const _pePage1 = engine.getPage(sessionId);
+      if (_pePage1) {
+        _peEndState = await _pePage1.evaluate(() => ({
+          url: window.location.href,
+          bodyLen: (document.body.innerText || '').length,
+          modalCount: document.querySelectorAll('[role="dialog"], [role="alertdialog"], [aria-modal="true"]').length,
+        })).catch(() => _peEndState);
+      }
+    } catch (_) {}
+
+    const _urlChanged = _peEndState.url && _lastPeState.url && _peEndState.url !== _lastPeState.url;
+    const _bodyChanged = Math.abs((_peEndState.bodyLen || 0) - (_lastPeState.bodyLen || 0)) > 200;
+    const _modalChanged = _peEndState.modalCount !== _lastPeState.modalCount;
+    const _stateChanged = _urlChanged || _bodyChanged || _modalChanged;
+
+    if (!_stateChanged || _peAttempt >= MAX_PE_ATTEMPTS) {
+      logger.warn(`[playwright.agent] phase 2: Plan-Execute loop stopping — stateChanged=${_stateChanged}, attempts=${_peAttempt}`);
+      break;
+    }
+
+    _lastPeState = _peEndState;
+    logger.info(`[playwright.agent] phase 2: state changed during Plan-Execute (url: ${_urlChanged}, body: ${_lastPeState.bodyLen}→${_peEndState.bodyLen}, modals: ${_lastPeState.modalCount}→${_peEndState.modalCount}) — re-studying page and re-planning`);
+
+    // Refresh snapshot for the new page state
+    try {
+      const _reSnap = await browserAct({ action: 'snapshot', sessionId, headed, timeoutMs: 10000 }).catch(() => ({ ok: false }));
+      if (_reSnap.ok && _reSnap.result) currentSnapshot = _reSnap.result;
+    } catch (_) {}
+
+    // Re-run page study on the new page state
+    try {
+      const _reStudyRefs = pruneSnapshot(extractInteractiveRefs(currentSnapshot));
+      logger.info(`[playwright.agent] phase 2-replan: extracted refs (${_reStudyRefs.length} chars, first 500): ${_reStudyRefs.slice(0, 500)}`);
+      const _reStudyRaw = await askWithMessages([
+        { role: 'system', content: PAGE_STUDY_PROMPT + domainLockBlock },
+        { role: 'user',   content: `GOAL: ${_finalGoal}\n\nSNAPSHOT:\n${_reStudyRefs}` },
+      ], { temperature: 0.1, maxTokens: 1000, responseTimeoutMs: 15000 });
+      let _rePageStudy = parseJson(_reStudyRaw);
+      if (!_rePageStudy && _reStudyRaw) {
+        logger.warn(`[playwright.agent] phase 2-replan: re-study response unparseable — retrying with minimal prompt. Raw (first 300 chars): ${_reStudyRaw.slice(0, 300)}`);
+        const _minimalRaw = await askWithMessages([
+          { role: 'system', content: 'Return valid JSON only, no markdown, no prose: {"pageType":"...","rightPage":true,"confidence":0.9,"keyElements":[{"ref":"...","label":"...","purpose":"..."}],"expectedFlow":["..."],"potentialBlockers":[]}' },
+          { role: 'user', content: `GOAL: ${_finalGoal}\n\nSNAPSHOT:\n${_reStudyRefs.slice(0, 1500)}\n\nReturn only the JSON.` },
+        ], { temperature: 0, maxTokens: 600, responseTimeoutMs: 10000 });
+        _rePageStudy = parseJson(_minimalRaw);
+      }
+      if (_rePageStudy && typeof _rePageStudy === 'object') {
+        logger.info(`[playwright.agent] phase 2-replan: re-study — pageType=${_rePageStudy.pageType}, confidence=${_rePageStudy.confidence}, elements=${_rePageStudy.keyElements?.length || 0}`);
+        logger.info(`[playwright.agent] phase 2-replan: re-study details: ${JSON.stringify(_rePageStudy).slice(0, 800)}`);
+        _peLoopStudyBlock = `\nPAGE ANALYSIS (from pre-plan study phase — use this to guide your plan):\n- Page type: ${_rePageStudy.pageType || 'unknown'}\n- Right page: ${_rePageStudy.rightPage}\n- Confidence: ${_rePageStudy.confidence}\n- Key elements: ${JSON.stringify((_rePageStudy.keyElements || []).slice(0, 10))}\n- Expected flow: ${(_rePageStudy.expectedFlow || []).join(' → ')}\n- Potential blockers: ${(_rePageStudy.potentialBlockers || []).join('; ')}\n`;
+      } else {
+        logger.warn(`[playwright.agent] phase 2-replan: re-study response unparseable after retry — proceeding without`);
+      }
+    } catch (_reStudyErr) {
+      logger.warn(`[playwright.agent] phase 2-replan: re-study failed (non-fatal): ${_reStudyErr.message}`);
+    }
+
+    // Refresh OCR + DOM signals for the next Plan-Execute attempt
+    await _refreshPeInputs();
+  }
+
+  // Preserve text-already-entered signal for the turn-loop
+  if (_peLoopResult?.transcript) {
+    const _typedText = _peLoopResult.transcript.some(t =>
+      t.outcome?.ok && ['type', 'fill', 'reactFill'].includes(t.action?.action)
+    );
+    const _failReason = String(_peLoopResult.error || '');
+    if (_typedText && /text still in compose|not sent|not completed/i.test(_failReason)) {
+      _textAlreadyEntered = true;
+      logger.info(`[playwright.agent] Plan-Execute typed text but failed verification (${_failReason.slice(0, 60)}) — setting _textAlreadyEntered=true for turn-loop`);
+    }
   }
 
   // ── Phase 2a: State-Diff Loop (gated behind flag) ────────────────────────
@@ -14215,7 +14736,7 @@ async function playwrightAgent(args) {
   // expected after-state before moving on. Falls back to the turn-loop if it
   // can't complete. Uses _resolveActionTarget for ambiguous clickByText targets.
   // Disabled by default — set ENABLE_STATE_DIFF_LOOP=true to enable.
-  const _stateDiffLoopEnabled = process.env.ENABLE_STATE_DIFF_LOOP !== 'false';
+  const _stateDiffLoopEnabled = process.env.ENABLE_STATE_DIFF_LOOP === 'true';
   if (_stateDiffLoopEnabled) {
     logger.info(`[playwright.agent] phase 2a: Plan-Execute did not complete - trying state-diff loop`);
     try {
@@ -14411,7 +14932,7 @@ Output a JSON plan: { "plan": [ { "action": "type", "selector": "eXX", "text": "
 
   const planMessages = [
     { role: 'system', content: _planSystemPrompt },
-    { role: 'user',   content: `GOAL: ${_finalGoal}${_studyBlock}${_activeElBlock}\n\nSNAPSHOT:\n${pruneSnapshot(extractInteractiveRefs(_planningSnapshot))}${agentContext ? `\n\nAGENT CONTEXT (agent instructions — follow these for site-specific behaviour):\n${agentContext}` : ''}` },
+    { role: 'user',   content: `GOAL: ${_finalGoal}${_studyBlock}${_activeElBlock}${failedApproachesBlock || ''}\n\nSNAPSHOT:\n${pruneSnapshot(extractInteractiveRefs(_planningSnapshot))}${agentContext ? `\n\nAGENT CONTEXT (agent instructions — follow these for site-specific behaviour):\n${agentContext}` : ''}` },
   ];
   // Dynamic token cap: short focused tasks (< 400 chars) seldom produce > 3 steps
   // so 800 tokens avoids wasting 1-2s on padding. Complex multi-site goals get 2048.

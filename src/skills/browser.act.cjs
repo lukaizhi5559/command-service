@@ -7618,7 +7618,13 @@ If no videos found, return []. Do not explain, only output the JSON array.`;
       if (_ctx) {
         try {
           const _pages = _ctx.pages();
-          if (_pages[idx]) { await _pages[idx].bringToFront(); return { ok: true, action, sessionId, executionTime: Date.now() - start }; }
+          if (_pages[idx]) {
+            await _pages[idx].bringToFront();
+            // Update the engine's active page so subsequent getPage() calls
+            // (e.g. for recorder injection) return the newly-selected tab.
+            engine.setActivePage(sessionId, _pages[idx]);
+            return { ok: true, action, sessionId, executionTime: Date.now() - start };
+          }
         } catch (e) { logger.warn(`[browser.act] tab-select (engine) failed: ${e.message} — falling back to CLI`); }
       }
       return run(['tab-select', String(idx)], `tab-select ${idx}`);
