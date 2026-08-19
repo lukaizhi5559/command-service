@@ -66,6 +66,11 @@ const CDP_RECORDER_SCRIPT = `
   window.__tdRecorderActive = true;
   window.__tdTrainEvents = window.__tdTrainEvents || [];
 
+  // Ping the trainer backend to confirm the recorder is alive and the CDP binding works
+  if (window.__tdPushEvent) {
+    window.__tdPushEvent({ type: 'recorder_init', url: location.href, _tabIndex: 0, timestamp: Date.now() });
+  }
+
   // ── Selector helpers (ported from explore.agent.cjs _buildSmartSelectors) ───
   // Tiered priority: data-testid → data-qa → role+aria-label → aria-label →
   // role+text → name → placeholder → href → contenteditable → semantic classes → text
@@ -870,7 +875,9 @@ async function _injectRecorderScript(session, tabIndex) {
   const baseScript = _buildRecorderScript(httpPort);
   const script = baseScript
     .split('JSON.stringify(ev)')
-    .join(`JSON.stringify(Object.assign(ev,{_tabIndex:${tabIndex}}))`);
+    .join(`JSON.stringify(Object.assign(ev,{_tabIndex:${tabIndex}}))`)
+    .split('window.__tdPushEvent(ev)')
+    .join(`(ev._tabIndex = ${tabIndex}, window.__tdPushEvent(ev))`);
 
   // ── Engine path: context.exposeBinding + page.addInitScript ────────────────
   // context.exposeBinding creates a CDP binding (window.__tdPushEvent) that
@@ -895,6 +902,11 @@ async function _injectRecorderScript(session, tabIndex) {
           // source object — all recorded events were undefined.
           await ctx.exposeBinding('__tdPushEvent', (source, evt) => {
             try {
+              if (!evt || typeof evt !== 'object') {
+                logger.warn(`[trainer.agent] __tdPushEvent received non-object: ${typeof evt}`);
+                return;
+              }
+              logger.info(`[trainer.agent] __tdPushEvent received: type=${evt.type || '?'} url=${evt.url || '?'} tab=${evt._tabIndex || tabIndex}`);
               const _tabIdx = evt?._tabIndex !== undefined ? evt._tabIndex : tabIndex;
               _processEvent(session, evt, _tabIdx);
             } catch (e) {
@@ -915,35 +927,47 @@ async function _injectRecorderScript(session, tabIndex) {
       // addInitScript runs on every new document (navigations, reloads, SPA route
       // changes that trigger a document reload). This is critical for Spotify which
       // does full page reloads when switching between some sections.
+      // NOTE: we pass the string here for future docs; for the current doc we use
+      // direct function evaluation to bypass `script-src` CSP on sites like Spotify.
       await page.addInitScript(script);
 
-      // Also inject into the current document immediately (addInitScript only
-      // fires on FUTURE navigations). Use evaluate for the current page.
+      // Directly evaluate the recorder on the current page in the main world.
+      // This avoids creating a `<script>` DOM element, which is blocked by CSP.
+      // We wrap the string as a Node function so Playwright serializes and runs
+      // the IIFE body directly without needing `eval` in the browser.
+      const recorderFn = new Function(script);
+      let currentDocActive = false;
       try {
-        await page.evaluate((code) => {
-          if (!window.__tdRecorderActive) {
-            const s = document.createElement('script');
-            s.textContent = code;
-            (document.head || document.documentElement).appendChild(s);
-          }
-        }, script);
-      } catch (_) {}
+        await page.evaluate(recorderFn);
+        currentDocActive = true;
+      } catch (e) {
+        logger.warn(`[trainer.agent] page.evaluate direct recorder injection failed on tab ${tabIndex}: ${e.message}`);
+      }
+
+      // Verify the recorder actually activated and the binding is reachable
+      try {
+        const status = await page.evaluate(() => ({
+          active: !!window.__tdRecorderActive,
+          hasPush: typeof window.__tdPushEvent === 'function',
+          eventCount: (window.__tdTrainEvents || []).length,
+          url: (typeof window !== 'undefined' && window.location && window.location.href) || '',
+        }));
+        logger.info(`[trainer.agent] Recorder status on tab ${tabIndex}: active=${status.active} hasPush=${status.hasPush} eventCount=${status.eventCount} url="${status.url}"`);
+      } catch (e) {
+        logger.warn(`[trainer.agent] Recorder status check failed on tab ${tabIndex}: ${e.message}`);
+      }
 
       // Inject into existing child frames too
       for (const frame of page.frames()) {
         if (frame === page.mainFrame()) continue;
         try {
-          await frame.evaluate((code) => {
-            if (!window.__tdRecorderActive) {
-              const s = document.createElement('script');
-              s.textContent = code;
-              (document.head || document.documentElement).appendChild(s);
-            }
-          }, script);
-        } catch (_) {}
+          await frame.evaluate(recorderFn);
+        } catch (e) {
+          logger.warn(`[trainer.agent] Frame recorder injection failed on tab ${tabIndex}: ${e.message}`);
+        }
       }
 
-      logger.info(`[trainer.agent] Recorder injected on tab ${tabIndex} via engine (context.exposeBinding + addInitScript)`);
+      logger.info(`[trainer.agent] Recorder injected on tab ${tabIndex} via engine (context.exposeBinding + addInitScript) currentDocActive=${currentDocActive}`);
       session.injectedTabs.add(tabIndex);
       engineInjected = true;
       return;
@@ -1054,6 +1078,7 @@ function _startTabWatcher(session) {
 // ---------------------------------------------------------------------------
 function _processEvent(session, evt, tabIndex) {
   if (!evt || session.cancelRequested) return;
+  if (evt.type === 'recorder_init') return; // internal ping, not a user action
   const { agentId } = session;
   const targetDomain = session.targetDomain;
 
@@ -1854,6 +1879,230 @@ async function actionSaveTraining(args) {
 }
 
 // ---------------------------------------------------------------------------
+// Preview auto-split: analyze recorded events and return proposed skill split
+// Does NOT save to disk — returns preview data for the review UI
+// ---------------------------------------------------------------------------
+async function actionPreviewSplit(args) {
+  const { agentId, skillName } = args || {};
+  if (!agentId) return { ok: false, error: 'agentId is required' };
+  if (!skillName) return { ok: false, error: 'skillName is required' };
+
+  const session = activeSessions.get(agentId);
+  if (!session) return { ok: false, error: 'No active training session' };
+  if (session.rawEvents.length < 2) return { ok: false, error: 'Not enough recorded steps' };
+
+  // Stop polling during preview
+  if (session.pollInterval) clearInterval(session.pollInterval);
+  session.cancelRequested = true;
+
+  _postProgress(agentId, { type: 'training:saving', message: 'Analyzing recorded steps…' });
+
+  try {
+    // Auto-split events into action segments
+    const actions = await _autoSplitEvents(session);
+    const collapsed = _collapseNavigation(session.rawEvents);
+
+    if (actions.length <= 1) {
+      // Single action — no split needed
+      const skillPreview = await _buildSkillPreview(session, collapsed, 0, collapsed.length, skillName, actions[0]);
+      return { ok: true, agentId, singleAction: true, skills: [skillPreview], recipe: null };
+    }
+
+    // Multi-action — build skill previews + recipe preview
+    const skills = [];
+    const cleanAgentId = agentId.replace(/\.agent$/, '');
+    const baseName = skillName.replace(/\.(skill|recipe)$/, '');
+
+    for (let i = 0; i < actions.length; i++) {
+      const action = actions[i];
+      const actionEvents = collapsed.slice(action.eventStart, action.eventEnd);
+      const actionSkillName = `${baseName}.${action.name.replace(/\s+/g, '_').toLowerCase()}`;
+      const skillPreview = await _buildSkillPreview(session, actionEvents, action.eventStart, action.eventEnd, actionSkillName, action);
+      skills.push(skillPreview);
+    }
+
+    // Build recipe preview
+    const recipeName = `${baseName}.recipe`;
+    const allParams = [];
+    const paramFlow = {};
+    const seenParams = new Set();
+    for (const skill of skills) {
+      for (const param of skill.params || []) {
+        if (!seenParams.has(param.name)) {
+          seenParams.add(param.name);
+          allParams.push(param);
+        }
+        if (!paramFlow[param.name]) paramFlow[param.name] = [];
+        paramFlow[param.name].push(skill.name);
+      }
+    }
+
+    const recipe = {
+      name: recipeName,
+      agentId: cleanAgentId,
+      skills: skills.map(s => ({ skill: s.name })),
+      params: allParams,
+      paramFlow,
+    };
+
+    logger.info(`[trainer.agent] actionPreviewSplit: ${skills.length} skills + recipe "${recipeName}"`);
+    return { ok: true, agentId, singleAction: false, skills, recipe };
+  } catch (err) {
+    logger.error(`[trainer.agent] Preview split failed: ${err.message}`);
+    _postProgress(agentId, { type: 'training:error', message: err.message });
+    return { ok: false, error: err.message };
+  }
+}
+
+// Build a skill preview from a segment of events
+async function _buildSkillPreview(session, events, eventStart, eventEnd, skillName, action) {
+  // Apply param detection to this segment
+  const segmentEvents = events.map(e => ({ ...e }));
+  const detectedParams = _detectParamsFallback(segmentEvents, session);
+
+  // Build waypoints from segment events (reuse fallback recipe builder logic)
+  const waypoints = [];
+  let step = 0;
+  const seenUrls = new Set();
+
+  for (const evt of segmentEvents) {
+    if (evt.type === 'navigate' && !seenUrls.has(evt.url)) {
+      seenUrls.add(evt.url);
+      step++;
+      waypoints.push({ step, type: 'navigate', url: evt.url, pageTitle: evt.pageTitle || '', checkpoint: `Page loaded: ${evt.pageTitle || evt.url}` });
+    } else if (evt.type === 'click' && evt.elementText) {
+      step++;
+      waypoints.push({ step, type: 'click', selector: evt.selector, altSelectors: evt.altSelectors || [], elementText: evt.elementText, href: evt.href || '' });
+    } else if (evt.type === 'dblclick') {
+      step++;
+      waypoints.push({ step, type: 'dblclick', selector: evt.selector, altSelectors: evt.altSelectors || [], elementText: evt.elementText || '' });
+    } else if (evt.type === 'fill') {
+      step++;
+      waypoints.push({ step, type: 'fill', selector: evt.selector, altSelectors: evt.altSelectors || [], value: evt.value || '', paramRef: evt._paramRef || undefined, originalValue: evt._originalValue || undefined });
+    } else if (evt.type === 'paste') {
+      step++;
+      waypoints.push({ step, type: 'paste', selector: evt.selector, altSelectors: evt.altSelectors || [], text: evt.text || '', paramRef: evt._paramRef || undefined, originalValue: evt._originalValue || undefined });
+    } else if (evt.type === 'select') {
+      step++;
+      waypoints.push({ step, type: 'select', selector: evt.selector, value: evt.value || '', paramRef: evt._paramRef || undefined });
+    } else if (evt.type === 'check') {
+      step++;
+      waypoints.push({ step, type: 'check', selector: evt.selector, label: evt.label || '', checked: evt.checked });
+    } else if (evt.type === 'submit') {
+      step++;
+      waypoints.push({ step, type: 'submit', selector: evt.selector });
+    } else if (evt.type === 'keycombo') {
+      step++;
+      waypoints.push({ step, type: 'keycombo', key: evt.key || 'Enter', ctrl: evt.ctrl || false, shift: evt.shift || false, alt: evt.alt || false, selector: evt.selector || '' });
+    } else if (evt.type === 'hover') {
+      step++;
+      waypoints.push({ step, type: 'hover', selector: evt.selector, altSelectors: evt.altSelectors || [] });
+    }
+  }
+
+  const lastNav = segmentEvents.filter(e => e.type === 'navigate').pop();
+
+  return {
+    id: `skill_${eventStart}_${eventEnd}`,
+    name: skillName,
+    description: action?.description || skillName,
+    eventStart,
+    eventEnd,
+    waypoints,
+    params: detectedParams,
+    startUrl: session.startUrl,
+    targetUrl: lastNav?.url || session.startUrl,
+    targetDescription: action?.description || `Target: ${lastNav?.url || session.startUrl}`,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Save skills + recipe from user-adjusted review data
+// ---------------------------------------------------------------------------
+async function actionSaveSkillsAndRecipe(args) {
+  const { agentId, skills, recipe } = args || {};
+  if (!agentId) return { ok: false, error: 'agentId is required' };
+  if (!Array.isArray(skills) || skills.length === 0) return { ok: false, error: 'skills array is required' };
+
+  const session = activeSessions.get(agentId);
+  if (!session) return { ok: false, error: 'No active training session' };
+
+  _postProgress(agentId, { type: 'training:saving', message: `Saving ${skills.length} skill(s)…` });
+
+  try {
+    const skillDir = path.join(SKILLS_DIR, _skillDirId(agentId));
+    if (!fs.existsSync(skillDir)) fs.mkdirSync(skillDir, { recursive: true });
+
+    const savedSkills = [];
+    for (const skill of skills) {
+      // Build the skill JSON from the preview data
+      const skillJson = {
+        name: skill.name,
+        agentId: _skillDirId(agentId),
+        startUrl: skill.startUrl || session.startUrl,
+        targetUrl: skill.targetUrl || skill.startUrl || session.startUrl,
+        params: skill.params || [],
+        waypoints: skill.waypoints || [],
+        targetDescription: skill.description || skill.targetDescription || '',
+        created: new Date().toISOString(),
+        userConfirmed: true,
+        urlFirst: true,
+      };
+
+      const skillPath = path.join(skillDir, `${skill.name}.skill.json`);
+      fs.writeFileSync(skillPath, JSON.stringify(skillJson, null, 2), 'utf8');
+      _registerSkillInAgent(agentId, skill.name, skillJson);
+      savedSkills.push({ name: skill.name, path: skillPath });
+      logger.info(`[trainer.agent] Saved skill: ${skillPath}`);
+    }
+
+    let savedRecipe = null;
+    if (recipe && recipe.skills && recipe.skills.length > 0) {
+      const recipeJson = {
+        name: recipe.name,
+        agentId: _skillDirId(agentId),
+        skills: recipe.skills,
+        params: recipe.params || [],
+        paramFlow: recipe.paramFlow || {},
+        created: new Date().toISOString(),
+        userConfirmed: true,
+      };
+      const recipePath = path.join(skillDir, `${recipe.name}.recipe.json`);
+      fs.writeFileSync(recipePath, JSON.stringify(recipeJson, null, 2), 'utf8');
+      _registerSkillInAgent(agentId, recipe.name, recipeJson);
+      savedRecipe = { name: recipe.name, path: recipePath };
+      logger.info(`[trainer.agent] Saved recipe: ${recipePath}`);
+    }
+
+    // Clean up session
+    if (session.httpServer) {
+      session.httpServer.close(() => {
+        logger.info(`[trainer.agent] Event HTTP server closed after save (port ${session.httpPort})`);
+      });
+    }
+    if (session.ownsSession !== false) {
+      const { browserAct } = require('./browser.act.cjs');
+      browserAct({ action: 'close', sessionId: session.sessionId }).catch(() => {});
+    }
+    activeSessions.delete(agentId);
+
+    _postProgress(agentId, {
+      type: 'training:saved',
+      skillName: savedSkills[0]?.name,
+      recipePath: savedRecipe?.path,
+      waypointCount: savedSkills.reduce((sum, s) => sum + (s.waypoints?.length || 0), 0),
+      message: `Saved ${savedSkills.length} skill(s)${savedRecipe ? ` + recipe` : ''}.`,
+    });
+
+    return { ok: true, savedSkills, savedRecipe };
+  } catch (err) {
+    logger.error(`[trainer.agent] Save skills+recipe failed: ${err.message}`);
+    _postProgress(agentId, { type: 'training:error', message: err.message });
+    return { ok: false, error: err.message };
+  }
+}
+
+// ---------------------------------------------------------------------------
 // URL-first collapse: collapse intermediate navigation into a single navigate
 // to the final destination URL before the first real interaction.
 // ---------------------------------------------------------------------------
@@ -1988,6 +2237,11 @@ Create a MINIMAL waypoint recipe. Rules:
 7. Include URL checkpoints for navigation waypoints
 8. EXTRACT waypoints capture data from the page - preserve them for WALT tool returns
 9. For fill waypoints that contain task-specific text (email body, post text, etc.), set value to "" (empty) — the runtime will fill from the task. Only keep static values (e.g. a fixed subject line).
+10. PARAMETER DETECTION: Analyze each fill/paste waypoint's value. Classify as:
+    - TASK-SPECIFIC: The value is something the user would change each time (item name, search query, message body, form field value, post text). Replace with {{param_name}} and add paramRef: "param_name". Add the param to the params array.
+    - STATIC: The value is a constant that never changes (a fixed subject line, a default selection, a label). Keep the literal value.
+    Name params descriptively (snake_case): item_name, search_query, message_body, field_value.
+    Use generic descriptions, not the literal recorded values.
 
 WAYPOINT TYPE CATALOG (use only what the workflow needs):
 - navigate: { step, type: "navigate", url, pageTitle?, checkpoint? }
@@ -2027,7 +2281,8 @@ Map each RAW EVENT to the appropriate waypoint type from the catalog. Output ONL
   "agentId": "${agentId}",
   "startUrl": "${startUrl}",
   "targetUrl": "<final URL>",
-  "waypoints": [<array of waypoints, mix types as needed>],
+  "params": [<array of param specs: { "name": "param_name", "type": "string", "description": "...", "required": true, "example": "..." }>],
+  "waypoints": [<array of waypoints, mix types as needed. Fill waypoints with task-specific values use "{{param_name}}" and paramRef: "param_name">],
   "returns": {<if extract waypoints: "extractName": { "type": "string", "description": "..." }>},
   "targetDescription": "<description>",
   "created": "${new Date().toISOString()}"
@@ -2049,6 +2304,27 @@ Map each RAW EVENT to the appropriate waypoint type from the catalog. Output ONL
     recipe.agentId = agentId;
     recipe.startUrl = startUrl;
     recipe.created = recipe.created || new Date().toISOString();
+
+    // ── Params validation ──────────────────────────────────────────────────
+    // Ensure params array exists and is consistent with paramRef in waypoints
+    if (!Array.isArray(recipe.params)) recipe.params = [];
+    if (Array.isArray(recipe.waypoints)) {
+      // Collect all paramRefs referenced in waypoints
+      const referencedParams = new Set();
+      for (const wp of recipe.waypoints) {
+        if (wp.paramRef) referencedParams.add(wp.paramRef);
+      }
+      // Add any referenced param that's missing from params array
+      for (const ref of referencedParams) {
+        if (!recipe.params.find(p => p.name === ref)) {
+          recipe.params.push({ name: ref, type: 'string', description: ref.replace(/_/g, ' '), required: true });
+        }
+      }
+      // Remove params not referenced by any waypoint (unless they have a reason to exist)
+      recipe.params = recipe.params.filter(p =>
+        referencedParams.has(p.name) || !p.required
+      );
+    }
 
     // ── URL-first post-processing ──────────────────────────────────────────
     // Convert any click waypoint with a full http(s) href that precedes a form
@@ -2076,6 +2352,88 @@ Map each RAW EVENT to the appropriate waypoint type from the catalog. Output ONL
 }
 
 // ---------------------------------------------------------------------------
+// Heuristic param detection (fallback when LLM is unavailable)
+// Detects task-specific fill/paste values and converts them to {{param_name}}
+// ---------------------------------------------------------------------------
+function _deriveParamName(label, selector, existingCount) {
+  // Try to extract from aria-label in altSelectors
+  if (label) {
+    const m = label.match(/aria-label="([^"]+)"/);
+    if (m) {
+      return m[1].toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '').substring(0, 30) || `param_${existingCount + 1}`;
+    }
+  }
+  // Try placeholder
+  if (label) {
+    const m = label.match(/placeholder="([^"]+)"/);
+    if (m) {
+      return m[1].toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '').substring(0, 30) || `param_${existingCount + 1}`;
+    }
+  }
+  // Try to extract from selector
+  if (selector) {
+    const m = selector.match(/\[name="([^"]+)"/);
+    if (m) return m[1].toLowerCase().replace(/[^a-z0-9_]/g, '_');
+    const m2 = selector.match(/#([a-z][a-z0-9_-]+)/i);
+    if (m2 && !/^(react|ember|__next|tab)-\d/i.test(m2[1])) return m2[1].toLowerCase().replace(/[^a-z0-9_]/g, '_');
+  }
+  return `param_${existingCount + 1}`;
+}
+
+function _detectParamsFallback(events, session) {
+  const params = [];
+  const taskText = (session.trainTask || '').toLowerCase();
+  const usedNames = new Set();
+
+  for (const evt of events) {
+    if (evt.type !== 'fill' && evt.type !== 'paste') continue;
+    const value = evt.value || evt.text || '';
+    if (!value || value.length < 2) continue;
+
+    // Static heuristics: URLs, emails, numbers-only, very short constants
+    if (/^https?:\/\//i.test(value)) continue;
+    if (/^[\w.+-]+@[\w-]+\.\w+$/.test(value)) continue;
+    if (/^\d+$/.test(value)) continue;
+    if (value.length < 3) continue;
+
+    // Task-specific: value appears in (or is substring of) the training task
+    const isTaskSpecific = taskText && (
+      taskText.includes(value.toLowerCase().substring(0, 30)) ||
+      value.toLowerCase().substring(0, 20).split(/\s+/).some(w => w.length > 3 && taskText.includes(w))
+    );
+
+    if (!isTaskSpecific && value.length < 5) continue; // short constants are static
+
+    // Derive param name
+    let paramName = _deriveParamName(
+      evt.altSelectors?.find(s => s.includes('aria-label=') || s.includes('placeholder=')),
+      evt.selector,
+      params.length
+    );
+    // Ensure uniqueness
+    let baseName = paramName;
+    let suffix = 1;
+    while (usedNames.has(paramName)) {
+      paramName = `${baseName}_${suffix++}`;
+    }
+    usedNames.add(paramName);
+
+    params.push({
+      name: paramName,
+      type: 'string',
+      description: paramName.replace(/_/g, ' '),
+      required: true,
+      example: value.substring(0, 50),
+    });
+    evt._paramRef = paramName;
+    evt._originalValue = value;
+    if (evt.type === 'fill') evt.value = `{{${paramName}}}`;
+    else evt.text = `{{${paramName}}}`;
+  }
+  return params;
+}
+
+// ---------------------------------------------------------------------------
 // Fallback recipe builder (no LLM needed)
 // ---------------------------------------------------------------------------
 function _buildFallbackRecipe(session, skillName) {
@@ -2084,11 +2442,13 @@ function _buildFallbackRecipe(session, skillName) {
   // Apply URL-first collapse to raw events
   const collapsedEvents = _collapseNavigation(rawEvents);
 
-  // Extract unique navigations and significant clicks
+  // Detect params heuristically (mutates fill/paste events to set {{param}})
+  const detectedParams = _detectParamsFallback(collapsedEvents, session);
+
+  // Build waypoints from collapsed events
   const waypoints = [];
   let step = 0;
   const seenUrls = new Set();
-
   const returns = {};
 
   for (const evt of collapsedEvents) {
@@ -2113,19 +2473,69 @@ function _buildFallbackRecipe(session, skillName) {
         href: evt.href || '',
         expectedResult: `Navigate or interact with "${evt.elementText}"`,
       });
+    } else if (evt.type === 'dblclick') {
+      step++;
+      waypoints.push({
+        step, type: 'dblclick',
+        selector: evt.selector, altSelectors: evt.altSelectors || [],
+        elementText: evt.elementText || '',
+      });
+    } else if (evt.type === 'fill') {
+      step++;
+      waypoints.push({
+        step, type: 'fill',
+        selector: evt.selector, altSelectors: evt.altSelectors || [],
+        value: evt.value || '',
+        paramRef: evt._paramRef || undefined,
+      });
+    } else if (evt.type === 'paste') {
+      step++;
+      waypoints.push({
+        step, type: 'paste',
+        selector: evt.selector, altSelectors: evt.altSelectors || [],
+        text: evt.text || '',
+        paramRef: evt._paramRef || undefined,
+      });
+    } else if (evt.type === 'select') {
+      step++;
+      waypoints.push({
+        step, type: 'select',
+        selector: evt.selector, value: evt.value || '',
+        paramRef: evt._paramRef || undefined,
+      });
+    } else if (evt.type === 'check') {
+      step++;
+      waypoints.push({
+        step, type: 'check',
+        selector: evt.selector, label: evt.label || '', checked: evt.checked,
+      });
+    } else if (evt.type === 'submit') {
+      step++;
+      waypoints.push({ step, type: 'submit', selector: evt.selector });
+    } else if (evt.type === 'keycombo') {
+      step++;
+      waypoints.push({
+        step, type: 'keycombo',
+        key: evt.key || 'Enter',
+        ctrl: evt.ctrl || false, shift: evt.shift || false, alt: evt.alt || false,
+        selector: evt.selector || '',
+      });
+    } else if (evt.type === 'hover') {
+      step++;
+      waypoints.push({
+        step, type: 'hover',
+        selector: evt.selector, altSelectors: evt.altSelectors || [],
+      });
     } else if (evt.type === 'extract') {
       step++;
       waypoints.push({
-        step,
-        type: 'extract',
-        selector: evt.selector,
-        extractName: evt.extractName,
+        step, type: 'extract',
+        selector: evt.selector, extractName: evt.extractName,
         extractType: evt.extractType || 'text',
         description: `Extract ${evt.extractName} from page`,
       });
-      // Add to returns schema
       returns[evt.extractName] = {
-        type: evt.extractType === 'html' ? 'string' : 'string',
+        type: 'string',
         description: `Extracted ${evt.extractName} from ${evt.selector}`,
       };
     }
@@ -2138,11 +2548,153 @@ function _buildFallbackRecipe(session, skillName) {
     agentId,
     startUrl,
     targetUrl: lastNav?.url || startUrl,
+    params: detectedParams.length > 0 ? detectedParams : undefined,
     waypoints,
     returns: Object.keys(returns).length > 0 ? returns : undefined,
     targetDescription: `Target page: ${lastNav?.pageTitle || lastNav?.url || startUrl}`,
     created: new Date().toISOString(),
   };
+}
+
+// ---------------------------------------------------------------------------
+// Auto-split multi-action events into separate action segments
+// Uses LLM to detect action boundaries, with heuristic fallback
+// ---------------------------------------------------------------------------
+async function _autoSplitEvents(session) {
+  const { agentId, rawEvents, trainTask } = session;
+  if (!rawEvents || rawEvents.length < 3) {
+    return [{ name: 'default', description: trainTask || 'Recorded action', eventStart: 0, eventEnd: rawEvents?.length || 0, params: [] }];
+  }
+
+  // Pre-process: replace task-specific values with {{value}} for LLM
+  const collapsed = _collapseNavigation(rawEvents);
+  const eventsForLLM = collapsed.map(e => ({ ...e }));
+  const taskText = (trainTask || '').toLowerCase();
+  for (const evt of eventsForLLM) {
+    if (evt.type === 'fill' || evt.type === 'paste') {
+      const val = evt.value || evt.text || '';
+      if (val && val.length > 3 && !/^https?:\/\//i.test(val) && !/^[\w.+-]+@[\w-]+\.\w+$/.test(val)) {
+        const isTaskSpecific = taskText && taskText.includes(val.toLowerCase().substring(0, 20));
+        if (isTaskSpecific) {
+          if (evt.type === 'fill') evt.value = '{{value}}';
+          else evt.text = '{{value}}';
+        }
+      }
+    }
+  }
+
+  // Build event summary for LLM
+  const eventSummary = eventsForLLM.map((e, i) => {
+    switch (e.type) {
+      case 'navigate': return `${i + 1}. [NAV] ${e.url}`;
+      case 'click': return `${i + 1}. [CLICK] "${e.elementText || ''}" selector: ${e.selector}${e.href ? ` href: ${e.href}` : ''}`;
+      case 'fill': return `${i + 1}. [FILL] ${e.selector} value: "${(e.value || '').substring(0, 80)}"`;
+      case 'paste': return `${i + 1}. [PASTE] ${e.selector} text: "${(e.text || '').substring(0, 80)}"`;
+      case 'submit': return `${i + 1}. [SUBMIT] ${e.selector}`;
+      case 'check': return `${i + 1}. [CHECK] "${e.label || ''}" selector: ${e.selector}`;
+      case 'select': return `${i + 1}. [SELECT] ${e.selector} value: "${e.value || ''}"`;
+      case 'keycombo': return `${i + 1}. [KEYCOMBO] ${e.key} on ${e.selector}`;
+      case 'dblclick': return `${i + 1}. [DBLCLICK] "${e.elementText || ''}" selector: ${e.selector}`;
+      default: return `${i + 1}. [${e.type.toUpperCase()}] ${e.selector || e.url || ''}`;
+    }
+  }).join('\n');
+
+  const prompt = `Analyze this sequence of browser interaction events and identify ACTION BOUNDARIES.
+An action boundary is where one logical task ends and another begins.
+
+Signals for action boundaries:
+- A form submit or "Save"/"Create"/"Done" button click followed by a navigation to a new page section
+- A semantic shift from "creating" to "searching" or from "composing" to "sending"
+- A significant pause (>3 seconds) followed by a new navigation
+
+NOTE: {{value}} placeholders in FILL events represent user-provided values that will
+become skill parameters. Do NOT treat them as literal strings — they are parametric inputs.
+
+${trainTask ? `ORIGINAL TASK: ${trainTask}` : ''}
+
+RAW EVENTS (task-specific values replaced with {{value}}):
+${eventSummary}
+
+Output JSON:
+{
+  "actions": [
+    {
+      "name": "create.item",
+      "description": "Create a new item with a given name",
+      "eventStart": 1,
+      "eventEnd": 5,
+      "params": [{ "name": "item_name", "type": "string", "required": true }]
+    }
+  ]
+}
+
+If there is only ONE action, return a single-element array. Output ONLY valid JSON.`;
+
+  try {
+    const response = await askWithMessages([
+      { role: 'system', content: 'You identify action boundaries in browser interaction sequences. Output ONLY valid JSON.' },
+      { role: 'user', content: prompt },
+    ], { maxTokens: 800, temperature: 0.2 });
+
+    let json = (response || '').trim().replace(/^```(?:json)?\s*\n?/i, '').replace(/\n?```\s*$/, '');
+    const parsed = JSON.parse(json);
+    if (parsed.actions && Array.isArray(parsed.actions) && parsed.actions.length > 0) {
+      // Convert 1-based indices to 0-based
+      for (const action of parsed.actions) {
+        action.eventStart = Math.max(0, (action.eventStart || 1) - 1);
+        action.eventEnd = action.eventEnd || collapsed.length;
+      }
+      logger.info(`[trainer.agent] _autoSplitEvents: LLM split into ${parsed.actions.length} actions`);
+      return parsed.actions;
+    }
+  } catch (e) {
+    logger.warn(`[trainer.agent] _autoSplitEvents LLM failed, using heuristic: ${e.message}`);
+  }
+
+  // Heuristic fallback: split at submit events or save/create/done clicks
+  return _heuristicSplit(collapsed, trainTask);
+}
+
+// Heuristic split: looks for submit events and save/create/done button clicks
+function _heuristicSplit(events, trainTask) {
+  const BOUNDARY_RE = /\b(save|create|done|submit|send|publish|post|confirm)\b/i;
+  const boundaries = [0]; // start of first action
+
+  for (let i = 0; i < events.length; i++) {
+    const evt = events[i];
+    if (evt.type === 'submit') {
+      boundaries.push(i + 1); // next action starts after submit
+    } else if (evt.type === 'click' && evt.elementText && BOUNDARY_RE.test(evt.elementText)) {
+      // Check if followed by a navigation (stronger signal)
+      const next = events[i + 1];
+      if (next && (next.type === 'navigate' || next.type === 'tab-new')) {
+        boundaries.push(i + 1);
+      }
+    }
+  }
+
+  // If only 1 boundary (the start), no split needed
+  if (boundaries.length <= 1) {
+    return [{ name: 'default', description: trainTask || 'Recorded action', eventStart: 0, eventEnd: events.length, params: [] }];
+  }
+
+  // Build action segments
+  const actions = [];
+  for (let i = 0; i < boundaries.length; i++) {
+    const start = boundaries[i];
+    const end = i < boundaries.length - 1 ? boundaries[i + 1] : events.length;
+    if (end <= start) continue;
+    actions.push({
+      name: `action_${actions.length + 1}`,
+      description: `Action ${actions.length + 1}`,
+      eventStart: start,
+      eventEnd: end,
+      params: [],
+    });
+  }
+
+  logger.info(`[trainer.agent] _heuristicSplit: split into ${actions.length} actions`);
+  return actions;
 }
 
 // ---------------------------------------------------------------------------
@@ -2699,7 +3251,7 @@ Output ONLY valid JSON (no markdown fences) with this shape:
   "plan": [
     {
       "step": 1,
-      "description": "<short imperative instruction for the user, e.g. 'Create a new playlist named Christian Music'>",
+      "description": "<short imperative instruction for the user, e.g. 'Create a new item named <name>'>",
       "expectedType": "navigate|click|fill|submit|select|check",
       "expectedText": "<text the user will click or field label they will fill — used for fuzzy matching recorded events>",
       "expectedUrl": "<URL fragment or path the user will land on after this step, if known — used to match navigate events>"
@@ -2708,15 +3260,15 @@ Output ONLY valid JSON (no markdown fences) with this shape:
 }
 
 Rules:
-- Each step is ONE high-level user action, phrased as what the user is accomplishing (e.g. "Create the 'Christian Music' playlist", "Add Lecrae to the playlist", "Add KB to the playlist", "Add Newsboys to the playlist"). Do NOT phrase steps as low-level UI clicks like "Click the 'Create playlist' button in the sidebar".
-- Use the exact playlist name, artist names, search terms, and other specifics extracted from the task. If the task says "make a playlist off my favorite music songs" and mentions "Christian Music", "Lecrae", "KB", "Newsboys", use those exact names in the step descriptions.
-- If the task includes [Additional context: ...], extract the specific names, values, and items from it and use them in your step descriptions. For example, if the additional context says "User's preferred Spotify playlist name is 'Christian Music'" and "User's favorite songs for the playlist are top songs from Lecrae, KB, and Newsboys", produce steps: 1) Create the 'Christian Music' playlist, 2) Add Lecrae to the playlist, 3) Add KB to the playlist, 4) Add Newsboys to the playlist.
-- For a playlist-creation task with N artists, produce exactly 1 + N steps: step 1 = create the playlist, steps 2..N+1 = add each artist to the playlist.
-- For each "add artist" step, the expected interaction is: search for the artist, then add a song to the playlist. expectedType should be "click" (for the final "Add to playlist" / "Add" button click).
-- Do NOT include "navigate to start URL" or "open Spotify" as a step — the system navigates to the start URL automatically.
+- Each step is ONE high-level user action, phrased as what the user is accomplishing (e.g. "Create the '<name>' <item>", "Add <entry> to the collection", "Add <entry> to the collection"). Do NOT phrase steps as low-level UI clicks like "Click the 'Create' button in the sidebar".
+- Use the exact item names, entry names, search terms, and other specifics extracted from the task. If the task says "create a collection off my favorite items" and mentions "<name>", "<entry1>", "<entry2>", "<entry3>", use those exact names in the step descriptions.
+- If the task includes [Additional context: ...], extract the specific names, values, and items from it and use them in your step descriptions. For example, if the additional context says "User's preferred collection name is '<name>'" and "User's favorite items for the collection are <entry1>, <entry2>, <entry3>", produce steps: 1) Create the '<name>' collection, 2) Add <entry1> to the collection, 3) Add <entry2> to the collection, 4) Add <entry3> to the collection.
+- For a creation task with N items, produce exactly 1 + N steps: step 1 = create the collection/item, steps 2..N+1 = add each item to it.
+- For each "add item" step, the expected interaction is: search for the item, then add it to the collection. expectedType should be "click" (for the final "Add" / "Add to collection" button click).
+- Do NOT include "navigate to start URL" or "open the site" as a step — the system navigates to the start URL automatically.
 - expectedType is the DOM event type the system should watch for to confirm this step: "click" for button clicks, "fill" for text input, "submit" for form submit, "navigate" for page changes, "select" for dropdowns, "check" for checkboxes.
 - expectedText is the visible text of the element the user will interact with (button label, field placeholder, link text). Used for fuzzy matching.
-- expectedUrl is optional — only set when the step lands on a distinct URL (e.g. /search, /playlists). Leave empty if the step happens on the same page as the previous step.
+- expectedUrl is optional — only set when the step lands on a distinct URL (e.g. /search, /items). Leave empty if the step happens on the same page as the previous step.
 - Keep descriptions short and actionable — the user reads them one at a time.
 - 1-8 steps max. If the task is genuinely one action, output a single-step plan.`;
 
@@ -3032,7 +3584,7 @@ async function actionSaveGuidedTraining(args) {
 
   // Validate dot-name format
   if (!/^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)+$/.test(skillName)) {
-    return { ok: false, error: 'Skill name must be dot-separated (e.g. spotify.create.playlist)' };
+    return { ok: false, error: 'Skill name must be dot-separated (e.g. app.create.item)' };
   }
 
   const session = activeSessions.get(agentId);
@@ -3144,7 +3696,7 @@ function _buildGuidedRecipe(session, skillName) {
         });
       } else if (evt.type === 'fill' || evt.type === 'paste') {
         stepNum++;
-        // value="" — runtime fills from task (search query, playlist name are task-specific)
+        // value="" — runtime fills from task (search query, item name are task-specific)
         waypoints.push({
           step: stepNum,
           type: evt.type === 'paste' ? 'paste' : 'fill',
@@ -3207,6 +3759,8 @@ function _buildGuidedRecipe(session, skillName) {
 module.exports = {
   actionTrain,
   actionSaveTraining,
+  actionPreviewSplit,
+  actionSaveSkillsAndRecipe,
   actionCancelTraining,
   actionListSkills,
   loadRecipe,

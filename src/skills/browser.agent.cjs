@@ -5762,7 +5762,193 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
           return (ls.ok && eligible.length === 1) ? trainerAgent.loadRecipe(_agentIdClean, eligible[0].name) : null;
         })();
 
-      if (_execRecipe && _execRecipe.waypoints && _execRecipe.waypoints.length > 0) {
+      if (_execRecipe && _execRecipe.skills && Array.isArray(_execRecipe.skills) && _execRecipe.skills.length > 0) {
+        // ── RECIPE (skill chain) execution ──────────────────────────────────
+        _activeRecipe = _execRecipe;
+        logger.info(`[browser.agent] recipe-chain: executing recipe "${_execRecipe.name}" with ${_execRecipe.skills.length} skills`);
+
+        // Extract recipe-level params
+        let _recipeParams = {};
+        if (_execRecipe.params && Array.isArray(_execRecipe.params) && _execRecipe.params.length > 0) {
+          const requiredParams = _execRecipe.params.filter(p => p.required);
+          const paramPrompt = `Extract parameter values from this user task.
+TASK: "${task}"
+PARAMS:
+${_execRecipe.params.map(p => `- ${p.name} (${p.type}${p.required ? ', required' : ''}): "${p.description}"`).join('\n')}
+
+Output ONLY valid JSON: {${_execRecipe.params.map(p => `"${p.name}": "<extracted value or null>"`).join(', ')}}`;
+
+          try {
+            const { askWithMessages } = require('../skill-helpers/skill-llm.cjs');
+            const paramResponse = await askWithMessages([
+              { role: 'system', content: 'You extract parameter values from user tasks. Output ONLY valid JSON.' },
+              { role: 'user', content: paramPrompt },
+            ], { maxTokens: 500, temperature: 0.1 });
+            let paramJson = (paramResponse || '').trim().replace(/^```(?:json)?\s*\n?/i, '').replace(/\n?```\s*$/, '');
+            _recipeParams = JSON.parse(paramJson);
+            logger.info(`[browser.agent] recipe-chain: params extracted: ${JSON.stringify(_recipeParams)}`);
+          } catch (e) {
+            logger.warn(`[browser.agent] recipe-chain: param extraction failed: ${e.message}`);
+          }
+
+          // Check for missing required params → ask_user
+          const missing = requiredParams.filter(p => !_recipeParams[p.name]);
+          if (missing.length > 0) {
+            logger.info(`[browser.agent] recipe-chain: missing required params: ${missing.map(p => p.name).join(', ')}`);
+            return {
+              ok: false, agentId, task,
+              askUser: true,
+              question: missing.length === 1
+                ? `What's the ${missing[0].description || missing[0].name}?`
+                : `I need a few details: ${missing.map(p => p.description || p.name).join(', ')}`,
+              options: [],
+              freeText: true,
+              paramPrompt: true,
+              _missingParams: missing.map(p => p.name),
+            };
+          }
+        }
+
+        // Execute each skill in the recipe chain
+        let _chainFailed = false;
+        for (const skillRef of _execRecipe.skills) {
+          if (_chainFailed) break;
+          const childSkill = trainerAgent.loadRecipe(_agentIdClean, skillRef.skill);
+          if (!childSkill || !childSkill.waypoints || childSkill.waypoints.length === 0) {
+            logger.warn(`[browser.agent] recipe-chain: could not load skill "${skillRef.skill}", skipping`);
+            continue;
+          }
+
+          // Distribute params via paramFlow
+          const skillParams = {};
+          if (_execRecipe.paramFlow) {
+            for (const [paramName, skillNames] of Object.entries(_execRecipe.paramFlow)) {
+              if (skillNames.includes(skillRef.skill) && _recipeParams[paramName]) {
+                skillParams[paramName] = _recipeParams[paramName];
+              }
+            }
+          }
+          logger.info(`[browser.agent] recipe-chain: executing skill "${skillRef.skill}" with params: ${JSON.stringify(skillParams)}`);
+
+          // Domain continuity check between skills
+          let _skipSkillNav = false;
+          if (_currentBrowserState?.url && childSkill.targetUrl) {
+            try {
+              const currentHostname = new URL(_currentBrowserState.url).hostname;
+              const targetHostname = new URL(childSkill.targetUrl).hostname;
+              const currentBaseDomain = currentHostname.split('.').slice(-2).join('.');
+              const targetBaseDomain = targetHostname.split('.').slice(-2).join('.');
+              const targetPath = new URL(childSkill.targetUrl).pathname;
+              if (currentBaseDomain === targetBaseDomain && _currentBrowserState.url.includes(targetPath.replace(/\/$/, ''))) {
+                _skipSkillNav = true;
+                logger.info(`[browser.agent] recipe-chain: already at target for "${skillRef.skill}", skipping nav`);
+              }
+            } catch {}
+          }
+
+          // Execute child skill waypoints (inline, reusing the waypoint execution logic)
+          let _wpFailed = false;
+          for (const wp of childSkill.waypoints) {
+            if (_wpFailed) break;
+            try {
+              if (wp.type === 'navigate' && !_skipSkillNav) {
+                const navRes = await callBrowserAct({ action: 'navigate', url: wp.url, sessionId });
+                if (navRes?.exitCode !== 0 && navRes?.ok !== true) {
+                  logger.warn(`[browser.agent] recipe-chain: nav failed for "${skillRef.skill}" step ${wp.step}`);
+                }
+                _skipSkillNav = false; // only skip the first nav
+              } else if (wp.type === 'click') {
+                const clickSelectors = [wp.selector, ...(wp.altSelectors || [])].filter(Boolean);
+                let clicked = false;
+                for (const sel of clickSelectors) {
+                  const clickRes = await callBrowserAct({ action: 'click', selector: sel, sessionId });
+                  if (clickRes?.exitCode === 0 || clickRes?.ok === true) { clicked = true; break; }
+                }
+                if (!clicked) logger.warn(`[browser.agent] recipe-chain: click failed step ${wp.step} (non-fatal)`);
+              } else if (wp.type === 'fill') {
+                let _fillValue = wp.value || '';
+                if (wp.paramRef && skillParams[wp.paramRef]) {
+                  _fillValue = skillParams[wp.paramRef];
+                  logger.info(`[browser.agent] recipe-chain: param sub ${wp.paramRef}="${_fillValue.substring(0, 50)}"`);
+                }
+                const fillSelectors = [wp.selector, ...(wp.altSelectors || [])].filter(Boolean);
+                let filled = false;
+                for (const sel of fillSelectors) {
+                  const fillRes = await callBrowserAct({ action: 'type', selector: sel, text: _fillValue, sessionId });
+                  if (fillRes?.exitCode === 0 || fillRes?.ok === true) { filled = true; break; }
+                }
+                if (!filled) { logger.warn(`[browser.agent] recipe-chain: fill failed step ${wp.step}`); _wpFailed = true; }
+              } else if (wp.type === 'paste') {
+                let pasteText = wp.text || wp.value || '';
+                if (wp.paramRef && skillParams[wp.paramRef]) pasteText = skillParams[wp.paramRef];
+                const pasteSelectors = [wp.selector, ...(wp.altSelectors || [])].filter(Boolean);
+                let pasted = false;
+                for (const sel of pasteSelectors) {
+                  const pasteCode = `(function(){ const el = document.querySelector(${JSON.stringify(sel)}); if (!el) return false; el.focus(); document.execCommand('insertText', false, ${JSON.stringify(pasteText)}); return true; })()`;
+                  const pasteRes = await callBrowserAct({ action: 'evaluate', text: pasteCode, sessionId });
+                  const result = String(pasteRes?.result || pasteRes?.data || '').replace(/^"|"$/g, '');
+                  if (result === 'true' || pasteRes?.exitCode === 0) { pasted = true; break; }
+                }
+                if (!pasted) logger.warn(`[browser.agent] recipe-chain: paste failed step ${wp.step} (non-fatal)`);
+              } else if (wp.type === 'submit') {
+                const submitSelectors = [wp.selector, ...(wp.altSelectors || [])].filter(Boolean);
+                let submitted = false;
+                for (const sel of submitSelectors) {
+                  const submitRes = await callBrowserAct({ action: 'click', selector: sel, sessionId });
+                  if (submitRes?.exitCode === 0 || submitRes?.ok === true) { submitted = true; break; }
+                }
+                if (!submitted) logger.warn(`[browser.agent] recipe-chain: submit failed step ${wp.step} (non-fatal)`);
+              } else if (wp.type === 'select') {
+                let _selectValue = wp.value || '';
+                if (wp.paramRef && skillParams[wp.paramRef]) _selectValue = skillParams[wp.paramRef];
+                const selectSelectors = [wp.selector, ...(wp.altSelectors || [])].filter(Boolean);
+                let selected = false;
+                for (const sel of selectSelectors) {
+                  const selectRes = await callBrowserAct({ action: 'select', selector: sel, value: _selectValue, sessionId });
+                  if (selectRes?.exitCode === 0 || selectRes?.ok === true) { selected = true; break; }
+                }
+                if (!selected) logger.warn(`[browser.agent] recipe-chain: select failed step ${wp.step} (non-fatal)`);
+              } else if (wp.type === 'keycombo') {
+                const key = [wp.ctrl ? 'Control' : '', wp.shift ? 'Shift' : '', wp.alt ? 'Alt' : '', wp.key].filter(Boolean).join('+') || wp.key || 'Enter';
+                await callBrowserAct({ action: 'press', key, selector: wp.selector, sessionId });
+              } else if (wp.type === 'check') {
+                const checkSelectors = [wp.selector, ...(wp.altSelectors || [])].filter(Boolean);
+                for (const sel of checkSelectors) {
+                  const checkRes = await callBrowserAct({ action: 'check', selector: sel, sessionId });
+                  if (checkRes?.exitCode === 0 || checkRes?.ok === true) break;
+                }
+              } else if (wp.type === 'hover') {
+                const hoverSelectors = [wp.selector, ...(wp.altSelectors || [])].filter(Boolean);
+                for (const sel of hoverSelectors) {
+                  const hoverRes = await callBrowserAct({ action: 'hover', selector: sel, sessionId });
+                  if (hoverRes?.exitCode === 0 || hoverRes?.ok === true) break;
+                }
+              } else if (wp.type === 'dblclick') {
+                const dblSelectors = [wp.selector, ...(wp.altSelectors || [])].filter(Boolean);
+                for (const sel of dblSelectors) {
+                  const dblRes = await callBrowserAct({ action: 'dblclick', selector: sel, sessionId });
+                  if (dblRes?.exitCode === 0 || dblRes?.ok === true) break;
+                }
+              }
+            } catch (wpErr) {
+              logger.warn(`[browser.agent] recipe-chain: waypoint ${wp.step} error: ${wpErr.message}`);
+            }
+          }
+
+          if (_wpFailed) {
+            _chainFailed = true;
+            logger.warn(`[browser.agent] recipe-chain: skill "${skillRef.skill}" failed, aborting chain`);
+          } else {
+            logger.info(`[browser.agent] recipe-chain: skill "${skillRef.skill}" completed ✓`);
+          }
+        }
+
+        if (!_chainFailed) {
+          _recipeExecutedOk = true;
+          logger.info(`[browser.agent] recipe-chain: all skills completed ✓`);
+        }
+
+      } else if (_execRecipe && _execRecipe.waypoints && _execRecipe.waypoints.length > 0) {
         _activeRecipe = _execRecipe; // hoist for recipe-doctor access at askUser time
         // ── Domain continuity check ─────────────────────────────────────────
         // Check if we're already on the target domain (trained recipe target)
@@ -5781,6 +5967,50 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
               logger.info(`[browser.agent] domain-continuity: already at target (${_currentBrowserState.url}), skipping recipe navigation`);
             }
           } catch {}
+        }
+
+        // ── Param extraction ──────────────────────────────────────────────────
+        // If the skill/recipe has a params schema, extract values from the task
+        // text using LLM. Missing required params → return ask_user.
+        let _extractedParams = {};
+        if (_execRecipe.params && Array.isArray(_execRecipe.params) && _execRecipe.params.length > 0) {
+          const requiredParams = _execRecipe.params.filter(p => p.required);
+          const paramPrompt = `Extract parameter values from this user task.
+TASK: "${task}"
+PARAMS:
+${_execRecipe.params.map(p => `- ${p.name} (${p.type}${p.required ? ', required' : ''}): "${p.description}"`).join('\n')}
+
+Output ONLY valid JSON: {${_execRecipe.params.map(p => `"${p.name}": "<extracted value or null>"`).join(', ')}}`;
+
+          try {
+            const { askWithMessages } = require('../skill-helpers/skill-llm.cjs');
+            const paramResponse = await askWithMessages([
+              { role: 'system', content: 'You extract parameter values from user tasks. Output ONLY valid JSON.' },
+              { role: 'user', content: paramPrompt },
+            ], { maxTokens: 500, temperature: 0.1 });
+            let paramJson = (paramResponse || '').trim().replace(/^```(?:json)?\s*\n?/i, '').replace(/\n?```\s*$/, '');
+            _extractedParams = JSON.parse(paramJson);
+            logger.info(`[browser.agent] skill params extracted: ${JSON.stringify(_extractedParams)}`);
+          } catch (e) {
+            logger.warn(`[browser.agent] param extraction failed: ${e.message}`);
+          }
+
+          // Check for missing required params → ask_user
+          const missing = requiredParams.filter(p => !_extractedParams[p.name]);
+          if (missing.length > 0) {
+            logger.info(`[browser.agent] missing required params: ${missing.map(p => p.name).join(', ')}`);
+            return {
+              ok: false, agentId, task,
+              askUser: true,
+              question: missing.length === 1
+                ? `What's the ${missing[0].description || missing[0].name}?`
+                : `I need a few details: ${missing.map(p => p.description || p.name).join(', ')}`,
+              options: [],
+              freeText: true,
+              paramPrompt: true,
+              _missingParams: missing.map(p => p.name),
+            };
+          }
         }
 
         if (!_skipNavigation) {
@@ -5978,10 +6208,15 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
 
               } else if (wp.type === 'fill') {
                 // Fill an input/textarea — fatal if all selectors fail
+                let _fillValue = wp.value || '';
+                if (wp.paramRef && _extractedParams[wp.paramRef]) {
+                  _fillValue = _extractedParams[wp.paramRef];
+                  logger.info(`[browser.agent] recipe-exec: param substitution ${wp.paramRef}="${_fillValue.substring(0, 50)}"`);
+                }
                 const fillSelectors = [wp.selector, ...(wp.altSelectors || [])].filter(Boolean);
                 let filled = false;
                 for (const sel of fillSelectors) {
-                  const fillRes = await callBrowserAct({ action: 'type', selector: sel, text: wp.value || '', sessionId });
+                  const fillRes = await callBrowserAct({ action: 'type', selector: sel, text: _fillValue, sessionId });
                   if (fillRes?.exitCode === 0 || fillRes?.ok === true) {
                     filled = true;
                     logger.info(`[browser.agent] recipe-exec: step ${wp.step} fill "${sel}" ✓`);
@@ -6008,13 +6243,18 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
 
               } else if (wp.type === 'select') {
                 // Select a dropdown option — non-fatal
+                let _selectValue = wp.value || '';
+                if (wp.paramRef && _extractedParams[wp.paramRef]) {
+                  _selectValue = _extractedParams[wp.paramRef];
+                  logger.info(`[browser.agent] recipe-exec: param substitution ${wp.paramRef}="${_selectValue.substring(0, 50)}"`);
+                }
                 const selectSelectors = [wp.selector, ...(wp.altSelectors || [])].filter(Boolean);
                 let selected = false;
                 for (const sel of selectSelectors) {
-                  const selectRes = await callBrowserAct({ action: 'select', selector: sel, value: wp.value || '', sessionId });
+                  const selectRes = await callBrowserAct({ action: 'select', selector: sel, value: _selectValue, sessionId });
                   if (selectRes?.exitCode === 0 || selectRes?.ok === true) {
                     selected = true;
-                    logger.info(`[browser.agent] recipe-exec: step ${wp.step} select "${wp.value}" on "${sel}" ✓`);
+                    logger.info(`[browser.agent] recipe-exec: step ${wp.step} select "${_selectValue}" on "${sel}" ✓`);
                     break;
                   }
                 }
@@ -6051,7 +6291,11 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
               } else if (wp.type === 'paste') {
                 // Paste text into an element — non-fatal
                 const pasteSelectors = [wp.selector, ...(wp.altSelectors || [])].filter(Boolean);
-                const pasteText = wp.text || wp.value || '';
+                let pasteText = wp.text || wp.value || '';
+                if (wp.paramRef && _extractedParams[wp.paramRef]) {
+                  pasteText = _extractedParams[wp.paramRef];
+                  logger.info(`[browser.agent] recipe-exec: param substitution ${wp.paramRef}="${pasteText.substring(0, 50)}"`);
+                }
                 let pasted = false;
                 for (const sel of pasteSelectors) {
                   const pasteCode = `(function(){ const el = document.querySelector(${JSON.stringify(sel)}); if (!el) return false; el.focus(); document.execCommand('insertText', false, ${JSON.stringify(pasteText)}); return true; })()`;

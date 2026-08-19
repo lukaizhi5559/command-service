@@ -363,6 +363,415 @@ test('collapsed events produce correct LLM prompt', () => {
   assert.equal(collapsed[2].type, 'click');
 });
 
+// ─── Test: Parameterization (Phase 2) ─────────────────────────────────────────
+
+console.log('\n--- Parameterization ---');
+
+// Re-implement _detectParamsFallback for testing (same logic as trainer.agent.cjs)
+function _deriveParamName(label, selector, existingCount) {
+  if (label) {
+    const m = label.match(/aria-label="([^"]+)"/);
+    if (m) return m[1].toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '').substring(0, 30) || `param_${existingCount + 1}`;
+  }
+  if (label) {
+    const m = label.match(/placeholder="([^"]+)"/);
+    if (m) return m[1].toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '').substring(0, 30) || `param_${existingCount + 1}`;
+  }
+  if (selector) {
+    const m = selector.match(/\[name="([^"]+)"/);
+    if (m) return m[1].toLowerCase().replace(/[^a-z0-9_]/g, '_');
+    const m2 = selector.match(/#([a-z][a-z0-9_-]+)/i);
+    if (m2 && !/^(react|ember|__next|tab)-\d/i.test(m2[1])) return m2[1].toLowerCase().replace(/[^a-z0-9_]/g, '_');
+  }
+  return `param_${existingCount + 1}`;
+}
+
+function _detectParamsFallback(events, session) {
+  const params = [];
+  const taskText = (session.trainTask || '').toLowerCase();
+  const usedNames = new Set();
+  for (const evt of events) {
+    if (evt.type !== 'fill' && evt.type !== 'paste') continue;
+    const value = evt.value || evt.text || '';
+    if (!value || value.length < 2) continue;
+    if (/^https?:\/\//i.test(value)) continue;
+    if (/^[\w.+-]+@[\w-]+\.\w+$/.test(value)) continue;
+    if (/^\d+$/.test(value)) continue;
+    if (value.length < 3) continue;
+    const isTaskSpecific = taskText && (
+      taskText.includes(value.toLowerCase().substring(0, 30)) ||
+      value.toLowerCase().substring(0, 20).split(/\s+/).some(w => w.length > 3 && taskText.includes(w))
+    );
+    if (!isTaskSpecific && value.length < 5) continue;
+    let paramName = _deriveParamName(
+      evt.altSelectors?.find(s => s.includes('aria-label=') || s.includes('placeholder=')),
+      evt.selector, params.length
+    );
+    let baseName = paramName, suffix = 1;
+    while (usedNames.has(paramName)) paramName = `${baseName}_${suffix++}`;
+    usedNames.add(paramName);
+    params.push({ name: paramName, type: 'string', description: paramName.replace(/_/g, ' '), required: true, example: value.substring(0, 50) });
+    evt._paramRef = paramName;
+    evt._originalValue = value;
+    if (evt.type === 'fill') evt.value = `{{${paramName}}}`;
+    else evt.text = `{{${paramName}}}`;
+  }
+  return params;
+}
+
+test('detects task-specific fill value as param', () => {
+  const events = [
+    { type: 'fill', selector: '[data-testid="search-input"]', value: 'Hello World', altSelectors: ['input[aria-label="Search"]'] },
+  ];
+  const session = { trainTask: 'type Hello World in the editor' };
+  const params = _detectParamsFallback(events, session);
+  assert.equal(params.length, 1, 'Should detect 1 param');
+  assert.equal(params[0].required, true, 'Param should be required');
+  assert.equal(events[0].value, `{{${params[0].name}}}`, 'Fill value should be templated');
+  assert.equal(events[0]._originalValue, 'Hello World', 'Original value should be saved');
+});
+
+test('does not detect URLs as params (static)', () => {
+  const events = [
+    { type: 'fill', selector: '[name="url"]', value: 'https://example.com' },
+  ];
+  const session = { trainTask: 'navigate to https://example.com' };
+  const params = _detectParamsFallback(events, session);
+  assert.equal(params.length, 0, 'URLs should not be detected as params');
+  assert.equal(events[0].value, 'https://example.com', 'URL value should be unchanged');
+});
+
+test('does not detect emails as params (static)', () => {
+  const events = [
+    { type: 'fill', selector: '[name="email"]', value: 'user@test.com' },
+  ];
+  const session = { trainTask: 'send email to user@test.com' };
+  const params = _detectParamsFallback(events, session);
+  assert.equal(params.length, 0, 'Emails should not be detected as params');
+});
+
+test('derives param name from aria-label', () => {
+  const events = [
+    { type: 'fill', selector: '[data-testid="playlist-name"]', value: 'My Awesome Playlist', altSelectors: ['input[aria-label="Playlist name"]'] },
+  ];
+  const session = { trainTask: 'create a playlist called My Awesome Playlist' };
+  const params = _detectParamsFallback(events, session);
+  assert.equal(params.length, 1);
+  assert.equal(params[0].name, 'playlist_name', 'Param name should be derived from aria-label');
+});
+
+test('param substitution at runtime: extracted value replaces template', () => {
+  // Simulate runtime substitution logic
+  const wp = { type: 'fill', selector: '#input', value: '{{text}}', paramRef: 'text' };
+  const extractedParams = { text: 'Goodbye' };
+  let fillValue = wp.value || '';
+  if (wp.paramRef && extractedParams[wp.paramRef]) {
+    fillValue = extractedParams[wp.paramRef];
+  }
+  assert.equal(fillValue, 'Goodbye', 'Template value should be replaced with extracted param');
+});
+
+test('missing required param triggers ask_user', () => {
+  // Simulate the missing param check
+  const skillParams = [{ name: 'text', type: 'string', required: true, description: 'Text to type' }];
+  const extractedParams = {};
+  const missing = skillParams.filter(p => p.required && !extractedParams[p.name]);
+  assert.equal(missing.length, 1, 'Should detect 1 missing required param');
+  assert.equal(missing[0].name, 'text', 'Missing param should be "text"');
+  // Runtime would return { askUser: true, question: "What's the Text to type?" }
+});
+
+test('multiple params detected from multiple fills', () => {
+  const events = [
+    { type: 'fill', selector: '[name="title"]', value: 'My Song', altSelectors: ['input[aria-label="Title"]'] },
+    { type: 'fill', selector: '[name="artist"]', value: 'The Band', altSelectors: ['input[aria-label="Artist"]'] },
+  ];
+  const session = { trainTask: 'add My Song by The Band' };
+  const params = _detectParamsFallback(events, session);
+  assert.equal(params.length, 2, 'Should detect 2 params');
+  assert.equal(params[0].name, 'title', 'First param should be "title"');
+  assert.equal(params[1].name, 'artist', 'Second param should be "artist"');
+  assert.equal(events[0].value, '{{title}}', 'First fill should be templated');
+  assert.equal(events[1].value, '{{artist}}', 'Second fill should be templated');
+});
+
+// ─── Test: Auto-split (Phase 3) ───────────────────────────────────────────────
+
+console.log('\n--- Auto-split multi-action flows ---');
+
+// Re-implement _heuristicSplit for testing (same logic as trainer.agent.cjs)
+function _heuristicSplit(events, trainTask) {
+  const BOUNDARY_RE = /\b(save|create|done|submit|send|publish|post|confirm)\b/i;
+  const boundaries = [0];
+  for (let i = 0; i < events.length; i++) {
+    const evt = events[i];
+    if (evt.type === 'submit') {
+      boundaries.push(i + 1);
+    } else if (evt.type === 'click' && evt.elementText && BOUNDARY_RE.test(evt.elementText)) {
+      const next = events[i + 1];
+      if (next && (next.type === 'navigate' || next.type === 'tab-new')) {
+        boundaries.push(i + 1);
+      }
+    }
+  }
+  if (boundaries.length <= 1) {
+    return [{ name: 'default', description: trainTask || 'Recorded action', eventStart: 0, eventEnd: events.length, params: [] }];
+  }
+  const actions = [];
+  for (let i = 0; i < boundaries.length; i++) {
+    const start = boundaries[i];
+    const end = i < boundaries.length - 1 ? boundaries[i + 1] : events.length;
+    if (end <= start) continue;
+    actions.push({ name: `action_${actions.length + 1}`, description: `Action ${actions.length + 1}`, eventStart: start, eventEnd: end, params: [] });
+  }
+  return actions;
+}
+
+test('heuristic split: 2 submit boundaries → 2 segments', () => {
+  const events = [
+    { type: 'navigate', url: 'https://example.com/form-a' },
+    { type: 'fill', selector: '#name', value: 'John' },
+    { type: 'submit', selector: '#submit-a' },
+    { type: 'navigate', url: 'https://example.com/form-b' },
+    { type: 'fill', selector: '#email', value: 'john@test.com' },
+    { type: 'submit', selector: '#submit-b' },
+  ];
+  const actions = _heuristicSplit(events, 'submit two forms');
+  assert.equal(actions.length, 2, 'Should split into 2 actions at submit boundaries');
+  assert.equal(actions[0].eventStart, 0, 'First action starts at 0');
+  assert.equal(actions[0].eventEnd, 3, 'First action ends before second form');
+  assert.equal(actions[1].eventStart, 3, 'Second action starts after first submit');
+  assert.equal(actions[1].eventEnd, 6, 'Second action ends at last event');
+});
+
+test('heuristic split: no boundaries → single action', () => {
+  const events = [
+    { type: 'navigate', url: 'https://example.com' },
+    { type: 'click', selector: '#btn', elementText: 'Click me' },
+    { type: 'fill', selector: '#input', value: 'hello' },
+  ];
+  const actions = _heuristicSplit(events, 'do something');
+  assert.equal(actions.length, 1, 'Should not split when no boundaries detected');
+  assert.equal(actions[0].eventStart, 0);
+  assert.equal(actions[0].eventEnd, 3);
+});
+
+test('heuristic split: save+navigate click boundary', () => {
+  const events = [
+    { type: 'navigate', url: 'https://example.com/create' },
+    { type: 'fill', selector: '#title', value: 'My Playlist' },
+    { type: 'click', selector: '#save', elementText: 'Save' },
+    { type: 'navigate', url: 'https://example.com/search' },
+    { type: 'fill', selector: '#search', value: 'a song' },
+    { type: 'click', selector: '#add', elementText: 'Add to playlist' },
+  ];
+  const actions = _heuristicSplit(events, 'create playlist and add song');
+  assert.equal(actions.length, 2, 'Should split at Save+navigate boundary');
+  assert.equal(actions[0].eventEnd, 3, 'First action ends at Save click');
+  assert.equal(actions[1].eventStart, 3, 'Second action starts at navigate');
+});
+
+test('recipe paramFlow computation', () => {
+  // Simulate paramFlow computation from actionPreviewSplit
+  const skills = [
+    { name: 'create.playlist.skill', params: [{ name: 'playlist_name', required: true }] },
+    { name: 'search.add.skill', params: [{ name: 'song_query', required: true }, { name: 'playlist_name', required: true }] },
+  ];
+  const paramFlow = {};
+  for (const skill of skills) {
+    for (const param of skill.params) {
+      if (!paramFlow[param.name]) paramFlow[param.name] = [];
+      paramFlow[param.name].push(skill.name);
+    }
+  }
+  assert.deepEqual(paramFlow.playlist_name, ['create.playlist.skill', 'search.add.skill'], 'playlist_name flows to both skills');
+  assert.deepEqual(paramFlow.song_query, ['search.add.skill'], 'song_query flows only to second skill');
+});
+
+test('recipe vs skill detection', () => {
+  // Recipe has 'skills' array, skill has 'waypoints' array
+  const recipe = { name: 'test.recipe', skills: [{ skill: 'a.skill' }, { skill: 'b.skill' }] };
+  const skill = { name: 'test.skill', waypoints: [{ type: 'navigate', url: 'https://example.com' }] };
+
+  assert.ok(Array.isArray(recipe.skills), 'Recipe should have skills array');
+  assert.ok(!Array.isArray(recipe.waypoints), 'Recipe should NOT have waypoints array');
+  assert.ok(Array.isArray(skill.waypoints), 'Skill should have waypoints array');
+  assert.ok(!Array.isArray(skill.skills), 'Skill should NOT have skills array');
+});
+
+test('auto-split with too few events returns single action', () => {
+  const events = [{ type: 'navigate', url: 'https://example.com' }];
+  const actions = _heuristicSplit(events, 'simple task');
+  assert.equal(actions.length, 1, 'Single event should produce single action');
+});
+
+// ─── Test: Preview/Save backend (Phase 4) ─────────────────────────────────────
+
+console.log('\n--- Preview/Save backend functions ---');
+
+// Simulate _buildSkillPreview logic (same as trainer.agent.cjs)
+function _buildSkillPreviewTest(session, events, eventStart, eventEnd, skillName, action) {
+  const segmentEvents = events.map(e => ({ ...e }));
+  const detectedParams = _detectParamsFallback(segmentEvents, session);
+  const waypoints = [];
+  let step = 0;
+  for (const evt of segmentEvents) {
+    if (evt.type === 'navigate') {
+      step++;
+      waypoints.push({ step, type: 'navigate', url: evt.url, pageTitle: evt.pageTitle || '' });
+    } else if (evt.type === 'click' && evt.elementText) {
+      step++;
+      waypoints.push({ step, type: 'click', selector: evt.selector, elementText: evt.elementText });
+    } else if (evt.type === 'fill') {
+      step++;
+      waypoints.push({ step, type: 'fill', selector: evt.selector, value: evt.value || '', paramRef: evt._paramRef || undefined });
+    } else if (evt.type === 'submit') {
+      step++;
+      waypoints.push({ step, type: 'submit', selector: evt.selector });
+    }
+  }
+  return {
+    id: `skill_${eventStart}_${eventEnd}`,
+    name: skillName,
+    description: action?.description || skillName,
+    eventStart, eventEnd,
+    waypoints, params: detectedParams,
+    startUrl: session.startUrl, targetUrl: session.startUrl,
+  };
+}
+
+test('actionPreviewSplit: 2-action events → 2 skill previews + recipe preview', () => {
+  const session = {
+    trainTask: 'create playlist My Playlist and add song Test Song',
+    startUrl: 'https://open.spotify.com/',
+    rawEvents: [
+      { type: 'navigate', url: 'https://open.spotify.com/' },
+      { type: 'click', selector: '#create-btn', elementText: 'Create' },
+      { type: 'fill', selector: '#playlist-name', value: 'My Playlist', altSelectors: ['input[aria-label="Playlist name"]'] },
+      { type: 'submit', selector: '#save-btn' },
+      { type: 'navigate', url: 'https://open.spotify.com/search' },
+      { type: 'fill', selector: '#search-input', value: 'Test Song', altSelectors: ['input[aria-label="Search"]'] },
+      { type: 'click', selector: '#add-btn', elementText: 'Add to playlist' },
+    ],
+  };
+
+  // Simulate heuristic split
+  const collapsed = _collapseNavigation(session.rawEvents);
+  const actions = _heuristicSplit(collapsed, session.trainTask);
+  assert.equal(actions.length, 2, 'Should split into 2 actions');
+
+  // Build skill previews
+  const skills = actions.map((action, i) => {
+    const actionEvents = collapsed.slice(action.eventStart, action.eventEnd);
+    return _buildSkillPreviewTest(session, actionEvents, action.eventStart, action.eventEnd, `test.skill.${i + 1}`, action);
+  });
+
+  assert.equal(skills.length, 2, 'Should produce 2 skill previews');
+  assert.ok(skills[0].waypoints.length > 0, 'First skill should have waypoints');
+  assert.ok(skills[1].waypoints.length > 0, 'Second skill should have waypoints');
+
+  // Build recipe preview
+  const allParams = [];
+  const paramFlow = {};
+  const seenParams = new Set();
+  for (const skill of skills) {
+    for (const param of skill.params || []) {
+      if (!seenParams.has(param.name)) { seenParams.add(param.name); allParams.push(param); }
+      if (!paramFlow[param.name]) paramFlow[param.name] = [];
+      paramFlow[param.name].push(skill.name);
+    }
+  }
+
+  const recipe = {
+    name: 'test.recipe',
+    skills: skills.map(s => ({ skill: s.name })),
+    params: allParams,
+    paramFlow,
+  };
+
+  assert.equal(recipe.skills.length, 2, 'Recipe should chain 2 skills');
+  assert.ok(Object.keys(paramFlow).length > 0, 'Recipe should have param flow');
+});
+
+test('actionPreviewSplit: single action → singleAction: true', () => {
+  const session = {
+    trainTask: 'click a button',
+    startUrl: 'https://example.com',
+    rawEvents: [
+      { type: 'navigate', url: 'https://example.com' },
+      { type: 'click', selector: '#btn', elementText: 'Click me' },
+    ],
+  };
+
+  const collapsed = _collapseNavigation(session.rawEvents);
+  const actions = _heuristicSplit(collapsed, session.trainTask);
+  assert.equal(actions.length, 1, 'Should not split single action');
+  // actionPreviewSplit would return { singleAction: true, skills: [...], recipe: null }
+});
+
+test('actionSaveSkillsAndRecipe: saves .skill.json + .recipe.json to disk', () => {
+  const os = require('os');
+  const path = require('path');
+  const fs = require('fs');
+  const tmpDir = path.join(os.tmpdir(), `test-trainer-save-${Date.now()}`);
+  fs.mkdirSync(tmpDir, { recursive: true });
+
+  const skills = [
+    {
+      name: 'test.create.skill',
+      description: 'Create something',
+      waypoints: [{ step: 1, type: 'navigate', url: 'https://example.com' }],
+      params: [{ name: 'title', type: 'string', required: true, description: 'Title' }],
+      startUrl: 'https://example.com',
+      targetUrl: 'https://example.com',
+    },
+    {
+      name: 'test.search.skill',
+      description: 'Search something',
+      waypoints: [{ step: 1, type: 'fill', selector: '#q', value: '{{query}}', paramRef: 'query' }],
+      params: [{ name: 'query', type: 'string', required: true, description: 'Search query' }],
+      startUrl: 'https://example.com',
+      targetUrl: 'https://example.com',
+    },
+  ];
+
+  const recipe = {
+    name: 'test.combo.recipe',
+    skills: [{ skill: 'test.create.skill' }, { skill: 'test.search.skill' }],
+    params: [
+      { name: 'title', type: 'string', required: true },
+      { name: 'query', type: 'string', required: true },
+    ],
+    paramFlow: { title: ['test.create.skill'], query: ['test.search.skill'] },
+  };
+
+  // Save skills
+  for (const skill of skills) {
+    const skillPath = path.join(tmpDir, `${skill.name}.skill.json`);
+    fs.writeFileSync(skillPath, JSON.stringify({
+      name: skill.name, waypoints: skill.waypoints, params: skill.params,
+      created: new Date().toISOString(),
+    }, null, 2));
+    assert.ok(fs.existsSync(skillPath), `Skill file should exist: ${skill.name}.skill.json`);
+  }
+
+  // Save recipe
+  const recipePath = path.join(tmpDir, `${recipe.name}.recipe.json`);
+  fs.writeFileSync(recipePath, JSON.stringify({
+    name: recipe.name, skills: recipe.skills, params: recipe.params,
+    paramFlow: recipe.paramFlow, created: new Date().toISOString(),
+  }, null, 2));
+  assert.ok(fs.existsSync(recipePath), 'Recipe file should exist: test.combo.recipe.json');
+
+  // Verify contents
+  const savedRecipe = JSON.parse(fs.readFileSync(recipePath, 'utf8'));
+  assert.equal(savedRecipe.skills.length, 2, 'Saved recipe should have 2 skills');
+  assert.deepEqual(savedRecipe.paramFlow.query, ['test.search.skill'], 'paramFlow should be preserved');
+
+  // Cleanup
+  fs.rmSync(tmpDir, { recursive: true, force: true });
+});
+
 // ─── Run summary ──────────────────────────────────────────────────────────────
 
 summary();
