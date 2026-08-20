@@ -6033,7 +6033,7 @@ Return ONLY valid JSON:
     let _dom = null;
     if (_page) {
       try {
-        _dom = await _page.evaluate(() => {
+        _dom = await _page.evaluate((goalText) => {
           const isInsideModal = (el) => {
             let cur = el;
             while (cur) {
@@ -6046,8 +6046,16 @@ Return ONLY valid JSON:
             const attrs = [el.getAttribute('aria-label'), el.getAttribute('placeholder'), el.getAttribute('name'), el.id].filter(Boolean).join(' ').toLowerCase();
             return /title|name|subject|rename|document/i.test(attrs);
           };
+          // Create-goal + open-modal gate: for "create/make/new X" goals, an open
+          // modal means the typed name is an uncommitted draft (Save not clicked
+          // yet). Don't count title-ish inputs inside modals until the modal closes
+          // and the created item appears in the parent page.
+          const _hasOpenModal = document.querySelectorAll('[role="dialog"], [aria-modal="true"]').length > 0;
+          const _isCreateGoal = /\b(create|make|new)\b/i.test(goalText || '');
+          const _gateCreateModal = _hasOpenModal && _isCreateGoal;
           const parts = [];
           parts.push('TITLE:' + (document.title || ''));
+          if (_gateCreateModal) parts.push('GATE:create-modal-open');
           // Non-modal visible input values
           const inputs = Array.from(document.querySelectorAll('input, textarea'));
           for (const el of inputs) {
@@ -6061,6 +6069,10 @@ Return ONLY valid JSON:
             if (!val) continue;
             // Title-ish inputs count even in modals (rename dialog, event title).
             // Non-title inputs only count when NOT in a modal.
+            // EXCEPTION: for create goals with an open modal, skip title-ish
+            // inputs inside modals — the name is an uncommitted draft until
+            // Save is clicked and the modal closes.
+            if (_gateCreateModal && titleish && inModal) continue;
             if (titleish || !inModal) {
               parts.push('INPUT:' + (titleish ? '[titleish]' : '[nonmodal]') + ' ' + val);
             }
@@ -6091,14 +6103,16 @@ Return ONLY valid JSON:
           // Body innerText
           parts.push('BODY:' + (document.body?.innerText || '').slice(0, 3000));
           return parts.join('\n');
-        }).catch(() => null);
+        }, goal || '').catch(() => null);
       } catch (_) {}
     }
     if (!_dom) {
       // Fallback: session not engine-owned — use browserAct evaluate for the DOM check.
       // The browser.act layer can interact with ANY session (engine-owned or not).
       try {
+        const _baGoal = (goal || '').replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/"/g, '\\"').replace(/\n/g, '\\n');
         const _baRes = await browserAct({ action: 'evaluate', text: `(() => {
+          const goalText = "${_baGoal}";
           const isInsideModal = (el) => {
             let cur = el;
             while (cur) {
@@ -6111,8 +6125,12 @@ Return ONLY valid JSON:
             const attrs = [el.getAttribute('aria-label'), el.getAttribute('placeholder'), el.getAttribute('name'), el.id].filter(Boolean).join(' ').toLowerCase();
             return /title|name|subject|rename|document/i.test(attrs);
           };
+          const _hasOpenModal = document.querySelectorAll('[role="dialog"], [aria-modal="true"]').length > 0;
+          const _isCreateGoal = /\\b(create|make|new)\\b/i.test(goalText || '');
+          const _gateCreateModal = _hasOpenModal && _isCreateGoal;
           const parts = [];
           parts.push('TITLE:' + (document.title || ''));
+          if (_gateCreateModal) parts.push('GATE:create-modal-open');
           const inputs = Array.from(document.querySelectorAll('input, textarea'));
           for (const el of inputs) {
             const rect = el.getBoundingClientRect();
@@ -6122,6 +6140,7 @@ Return ONLY valid JSON:
             const titleish = isTitleish(el);
             const val = (el.value || '').slice(0, 300);
             if (!val) continue;
+            if (_gateCreateModal && titleish && inModal) continue;
             if (titleish || !inModal) {
               parts.push('INPUT:' + (titleish ? '[titleish]' : '[nonmodal]') + ' ' + val);
             }
@@ -7984,6 +8003,12 @@ RULES:
   Enter or blur. If reactFill reports verified=true but the page text/OCR still shows
   the OLD value on the next turn, follow reactFill with { "action": "press", "key": "Enter" }
   to commit, then re-check. Do NOT repeat the same reactFill — it will not help.
+- MODAL-COMMIT RULE: When you fill a name/title field inside a creation or edit
+  dialog/modal, you MUST then click the dialog's "Save"/"Create"/"Done" button
+  (use clickByText with scope='[role="dialog"]') or press Enter to commit. The
+  change is NOT saved until the dialog is submitted. Do NOT return "done" while
+  a modal is still open — first close it by clicking Save or pressing Escape,
+  then verify the change persisted on the main page.
 - After each action, you'll see the result. Adapt based on what happened.
 - When the goal is achieved, output { "action": "return", "data": "what you did" }.
 - The ARIA snapshot may NOT show contenteditable elements. If the PAGE TEXT or PROBE
@@ -8087,6 +8112,12 @@ RULES:
   appear — then fill the name field in that dialog. If a dropdown appears after
   clicking Create, the next step's click will handle selecting the appropriate
   option (e.g. "Create a playlist") to open the actual creation dialog.
+  COMMIT RULE: After filling the name field in the creation dialog, you MUST
+  include a final step to click the "Save"/"Create"/"Done"/"Confirm" button (or
+  press Enter) to commit the creation and close the dialog. The item is NOT
+  created until the dialog is submitted — typing the name alone is not enough.
+  After submitting, the dialog should close and the new item should appear in
+  the page/list.
 
 Return JSON: {"steps": [...], "thoughts": "brief explanation"}`;
 
@@ -8293,6 +8324,13 @@ async function _executeOverlayInteraction({ goal, sessionId, headed, timeoutMs, 
         logger.info(`[playwright.agent] Tier 1.6: clicking button "${btn.text}" at (${clickX}, ${clickY})`);
         await _page.mouse.click(clickX, clickY);
         transcript.push({ action: 'click', button: btn.text, ok: true });
+      } else {
+        // No button row found by OCR — press Enter to commit the fill.
+        // This handles modals where the Save button was not detected as a
+        // separate row (e.g. clustered with surrounding text by OCR).
+        logger.info(`[playwright.agent] Tier 1.6: no button row — pressing Enter to commit fill`);
+        await _page.keyboard.press('Enter');
+        transcript.push({ action: 'press', key: 'Enter', ok: true, reason: 'no button row — Enter as commit' });
       }
       return { ok: true, action: 'fill_and_click', transcript, reason: _pickResult.reason, rows, executionTime: Date.now() - _oiStart };
     }

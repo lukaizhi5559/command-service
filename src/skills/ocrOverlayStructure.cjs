@@ -321,6 +321,50 @@ function structureOcrOverlayItems(items, opts = {}) {
     }
   }
 
+  // ── Step 5d: Button-rescue pass — extract known button labels from clustered rows ──
+  // OCR sometimes clusters a button label with surrounding text on adjacent lines
+  // (e.g. "Save" absorbed into "By proceeding, you agree..."). The standard
+  // classification above only matches when the ENTIRE row text is a button label.
+  // This pass scans row-item-link rows for known button labels as whole words
+  // and splits them out as separate button rows so they're visible to the LLM.
+  // Only runs in modal context (has inputs) to avoid splitting menu items.
+  if (_hasInputs) {
+    const _rescued = [];
+    for (let i = 0; i < classified.length; i++) {
+      const row = classified[i];
+      if (row.type !== 'row-item-link') { _rescued.push(row); continue; }
+      // Check if the row text contains a known button label as a whole word
+      const _words = row.text.split(/\s+/);
+      const _buttonWord = _words.find(w => _BUTTON_LABELS.test(w.toLowerCase()));
+      if (!_buttonWord || _words.length <= 1) {
+        // Already a pure button label (handled by 5c) or no button word found
+        _rescued.push(row);
+        continue;
+      }
+      // Split: create a button row for the rescued label, keep the rest as-is
+      // Use the same y as the original row (button is on the same line or close)
+      _rescued.push({
+        ...row,
+        type: 'button',
+        text: _buttonWord,
+        description: row.description || null,
+      });
+      // Keep the original row text minus the button word, but only if there's
+      // meaningful text left (more than just punctuation/short fragments)
+      const _remaining = _words.filter(w => w !== _buttonWord).join(' ').trim();
+      if (_remaining.length > 3) {
+        _rescued.push({
+          ...row,
+          text: _remaining,
+          type: 'row-item-link',
+          description: null,
+        });
+      }
+    }
+    classified.length = 0;
+    classified.push(..._rescued);
+  }
+
   // ── Step 6: Pair descriptions with parent links ─────────────────────────
   // Also filter out noise rows (single-char OCR misreads that aren't real words)
   const final = [];
@@ -385,7 +429,10 @@ async function pickOverlayAction(rows, goal, askWithMessages) {
 
   const hasInputs = rows.some(r => r.type === 'input-field');
   const hasButtons = rows.some(r => r.type === 'button');
-  const isModal = hasInputs && hasButtons;
+  // A modal with inputs always needs fill+commit, even if no button row was
+  // detected (OCR may have missed the Save button). The caller will press Enter
+  // as the commit action if no button is returned.
+  const isModal = hasInputs;
 
   const overlayStr = formatOverlayForLLM(rows);
 
@@ -397,8 +444,12 @@ GOAL: ${goal}
 
 ${overlayStr}
 
+If there is a Save/Create/Done/Submit button, include it as the click action.
+If no button is visible in the items, set "click" to null — the caller will
+press Enter to commit the fill.
+
 Respond with ONLY a JSON object (no markdown fences):
-{"actions": [{"type": "fill", "id": <number>, "value": "<text to type>"}, {"type": "click", "id": <number>}], "reason": "<one sentence>"}`;
+{"actions": [{"type": "fill", "id": <number>, "value": "<text to type>"}, {"type": "click", "id": <number or null>}], "reason": "<one sentence>"}`;
   } else {
     prompt = `You are selecting an item from an overlay (menu, dropdown, popup, tab bar). Given the user's goal and the items below, pick the ONE item that best matches what the user wants to do.
 

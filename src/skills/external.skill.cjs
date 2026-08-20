@@ -32,6 +32,7 @@ const path = require('path');
 const os = require('os');
 const fs = require('fs');
 const logger = require('../logger.cjs');
+const { browserAct } = require('./browser.act.cjs');
 
 const SKILLS_BASE_DIR = path.join(os.homedir(), '.thinkdrop', 'skills');
 const DEFAULT_TIMEOUT_MS = 30000;
@@ -88,6 +89,24 @@ async function fetchSkillRecordFromUserSkillsDir(name) {
           enabled: true,
           source: 'user-skills-dir',
         };
+      }
+    }
+
+    // Trainer recipe fallback: e.g. spotify/spotify.create.music.playlist.skill.json
+    const firstSegment = name.split('.')[0];
+    if (firstSegment) {
+      const agentSkillDir = path.join(SKILLS_BASE_DIR, firstSegment);
+      if (fs.existsSync(agentSkillDir)) {
+        const newRecipePath = path.join(agentSkillDir, `${name}.json`);
+        if (fs.existsSync(newRecipePath)) {
+          logger.info(`[external.skill] Found trainer recipe at ${newRecipePath}`);
+          return { name, execPath: newRecipePath, execType: 'recipe', enabled: true, source: 'user-skills-dir' };
+        }
+        const legacyRecipePath = path.join(agentSkillDir, `${name}.skill.json`);
+        if (fs.existsSync(legacyRecipePath)) {
+          logger.info(`[external.skill] Found trainer recipe at ${legacyRecipePath}`);
+          return { name, execPath: legacyRecipePath, execType: 'recipe', enabled: true, source: 'user-skills-dir' };
+        }
       }
     }
     return null;
@@ -390,6 +409,112 @@ async function fetchSkillRecord(name, timeoutMs) {
     req.write(body);
     req.end();
   });
+}
+
+// ── Recipe skill runner ───────────────────────────────────────────────────────
+// Executes a trained waypoint recipe (.skill.json) by running each waypoint
+// through browser.act in sequence. Params from skillArgs are substituted for
+// {{paramRef}} placeholders in fill/paste/select values.
+//
+// Recipe schema:
+//   {
+//     name, startUrl, targetUrl, params: [{ name, type, required, description }],
+//     waypoints: [{ step, type, selector, altSelectors?, value?, paramRef?, ... }]
+//   }
+//
+// Returns: { ok, output?, error? }
+//
+async function runRecipeSkill(resolvedPath, skillArgs, timeoutMs) {
+  let recipe;
+  try {
+    recipe = JSON.parse(fs.readFileSync(resolvedPath, 'utf8'));
+  } catch (e) {
+    return { ok: false, error: `Failed to read recipe at ${resolvedPath}: ${e.message}` };
+  }
+
+  const waypoints = Array.isArray(recipe.waypoints) ? recipe.waypoints : [];
+  if (waypoints.length === 0) {
+    return { ok: false, error: `Recipe ${recipe.name} has no waypoints` };
+  }
+
+  const sessionId = skillArgs?.sessionId;
+  if (!sessionId) {
+    return { ok: false, error: 'Recipe execution requires a sessionId' };
+  }
+
+  // Build args with defaults from recipe params
+  const args = { ...(skillArgs || {}) };
+  for (const p of recipe.params || []) {
+    if (args[p.name] === undefined && p.example !== undefined) {
+      args[p.name] = p.example;
+    }
+  }
+
+  // Resolve params in a value string like "{{playlist_name}}"
+  const resolveValue = (value) => {
+    if (typeof value !== 'string' || !value.includes('{{')) return value;
+    return value.replace(/\{\{(\s*[^}\\s]+\s*)\}\}/g, (_, rawName) => {
+      const name = rawName.trim();
+      return args[name] !== undefined ? String(args[name]) : _;
+    });
+  };
+
+  // If the recipe does not start with a navigation, jump to startUrl first
+  const effectiveWaypoints = waypoints.slice();
+  if (effectiveWaypoints[0].type !== 'navigate' && recipe.startUrl) {
+    effectiveWaypoints.unshift({ step: 0, type: 'navigate', url: recipe.startUrl });
+  }
+
+  const actionTimeout = Math.min(timeoutMs || 15000, 30000);
+
+  for (const wp of effectiveWaypoints) {
+    const selector = wp.selector || (wp.altSelectors && wp.altSelectors[0]) || '';
+    const value = resolveValue(wp.value || '');
+
+    let actionArgs = { sessionId, timeoutMs: actionTimeout };
+    if (selector) actionArgs.selector = selector;
+
+    try {
+      let res;
+      switch (wp.type) {
+        case 'navigate':
+          res = await browserAct({ ...actionArgs, action: 'navigate', url: wp.url || recipe.startUrl, timeoutMs: actionTimeout });
+          break;
+        case 'click':
+        case 'dblclick':
+        case 'rightclick':
+          res = await browserAct({ ...actionArgs, action: 'click', timeoutMs: actionTimeout });
+          break;
+        case 'fill':
+          res = await browserAct({ ...actionArgs, action: 'fill', text: value, timeoutMs: actionTimeout });
+          break;
+        case 'paste':
+          res = await browserAct({ ...actionArgs, action: 'type', text: value, timeoutMs: actionTimeout });
+          break;
+        case 'select':
+          res = await browserAct({ ...actionArgs, action: 'select', value, timeoutMs: actionTimeout });
+          break;
+        case 'check':
+          res = await browserAct({ ...actionArgs, action: 'check', checked: !!wp.checked, timeoutMs: actionTimeout });
+          break;
+        case 'submit':
+          res = await browserAct({ ...actionArgs, action: 'press', key: 'Enter', timeoutMs: actionTimeout });
+          break;
+        case 'keycombo':
+          res = await browserAct({ ...actionArgs, action: 'press', key: wp.key || 'Enter', timeoutMs: actionTimeout });
+          break;
+        default:
+          return { ok: false, error: `Unknown waypoint type: ${wp.type}` };
+      }
+      if (res && !res.ok) {
+        return { ok: false, error: `Waypoint ${wp.step} (${wp.type}) failed: ${res.error || 'unknown'}` };
+      }
+    } catch (e) {
+      return { ok: false, error: `Waypoint ${wp.step} (${wp.type}) threw: ${e.message}` };
+    }
+  }
+
+  return { ok: true, output: `Completed ${effectiveWaypoints.length} waypoints for ${recipe.name}` };
 }
 
 // ── Project skill runner ───────────────────────────────────────────────────────
@@ -770,8 +895,10 @@ async function run(args) {
       result = await runNodeSkill(resolvedPath, mergedSkillArgs, timeoutMs, context);
     } else if (execType === 'shell') {
       result = await runShellSkill(resolvedPath, mergedSkillArgs, timeoutMs);
+    } else if (execType === 'recipe') {
+      result = await runRecipeSkill(resolvedPath, mergedSkillArgs, timeoutMs);
     } else {
-      return { ok: false, skillName: name, error: `Unknown exec_type "${execType}". Must be "python", "node", "shell", or "project".` };
+      return { ok: false, skillName: name, error: `Unknown exec_type "${execType}". Must be "python", "node", "shell", "project", or "recipe".` };
     }
 
     // If the skill itself returned ok:false with a non-trivial error, report it as a potential

@@ -31,6 +31,17 @@ function _skillDirId(agentId) {
   return agentId.endsWith('.agent') ? agentId.slice(0, -6) : agentId;
 }
 
+// Build the on-disk filename for a skill/recipe.
+// Skill names already end with `.skill` (e.g. `spotify.create.playlist.skill`),
+// so we append `.json` instead of `.skill.json` to avoid the double extension.
+function _skillFileName(skillName) {
+  if (!skillName) return `${skillName}.skill.json`;
+  if (skillName.endsWith('.skill') || skillName.endsWith('.recipe')) {
+    return `${skillName}.json`;
+  }
+  return `${skillName}.skill.json`;
+}
+
 // ---------------------------------------------------------------------------
 // Progress reporting to Electron UI
 // ---------------------------------------------------------------------------
@@ -78,7 +89,27 @@ const CDP_RECORDER_SCRIPT = `
 
   function isDynamicId(id) {
     if (!id || typeof id !== 'string') return false;
-    return /^[a-z]+-\\d{4,}$/i.test(id);
+    // IDs with 4+ trailing digits: button-1234, input-5678
+    if (/^[a-z]+-\\d{4,}$/i.test(id)) return true;
+    // Hashed/suffixed IDs: text-input-8ba291fde73c1845, abc-1a2b3c4d5e6f7890
+    if (/[a-f0-9]{8,}$/i.test(id)) return true;
+    // Pure long hex IDs
+    if (/^[a-f0-9]{12,}$/i.test(id)) return true;
+    // css-in-js and style scoping
+    if (/^css-[a-z0-9]{5,}$/i.test(id)) return true;
+    if (/^style_[a-z0-9]+$/i.test(id)) return true;
+    return false;
+  }
+
+  // Extract a stable prefix from a dynamic ID by stripping the trailing
+  // hash/numeric suffix. e.g. text-input-8ba291fde73c1845 → text-input-
+  function getStableIdPrefix(id) {
+    if (!id || typeof id !== 'string') return null;
+    var prefix = id.replace(/[a-f0-9]{8,}$/i, '');
+    if (prefix.length >= 4 && prefix.indexOf('-') !== -1) return prefix;
+    prefix = id.replace(/\\d{4,}$/, '');
+    if (prefix.length >= 4 && prefix.indexOf('-') !== -1) return prefix;
+    return null;
   }
 
   function filterSemanticClasses(className) {
@@ -104,6 +135,19 @@ const CDP_RECORDER_SCRIPT = `
 
     // Tier 1: ID (if not dynamic)
     if (id && !isDynamicId(id)) return '[id="' + id + '"]';
+
+    // Tier 1b: Dynamic ID with a meaningful prefix — combine prefix + stable attr
+    // e.g. text-input-8ba291fde73c1845 + placeholder="Playlist name" →
+    //      [id^="text-input-"][placeholder="Playlist name"]
+    if (id && isDynamicId(id)) {
+      var prefix = getStableIdPrefix(id);
+      if (prefix) {
+        if (placeholder && placeholder.length > 3) return '[id^="' + prefix + '"][placeholder="' + placeholder + '"]';
+        if (name) return '[id^="' + prefix + '"][name="' + name + '"]';
+        if (ariaLabel && ariaLabel.length > 2) return '[id^="' + prefix + '"][aria-label="' + ariaLabel + '"]';
+        if (role) return '[id^="' + prefix + '"][role="' + role + '"]';
+      }
+    }
 
     // Tier 2: Data attributes (very stable)
     if (dataTestId) return '[data-testid="' + dataTestId + '"]';
@@ -175,6 +219,16 @@ const CDP_RECORDER_SCRIPT = `
     if (id && !isDynamicId(id)) {
       alts.push('[id="' + id + '"]');
       if (role) alts.push('[id="' + id + '"][role="' + role + '"]');
+    }
+
+    // Tier 1b: Dynamic ID with meaningful prefix — add prefix-combined alts
+    if (id && isDynamicId(id)) {
+      var prefix = getStableIdPrefix(id);
+      if (prefix) {
+        if (placeholder && placeholder.length > 3) alts.push('[id^="' + prefix + '"][placeholder="' + placeholder + '"]');
+        if (name) alts.push('[id^="' + prefix + '"][name="' + name + '"]');
+        if (ariaLabel) alts.push('[id^="' + prefix + '"][aria-label="' + ariaLabel + '"]');
+      }
     }
 
     // Tier 2: Data attributes
@@ -388,6 +442,10 @@ const CDP_RECORDER_SCRIPT = `
     if (['INPUT', 'TEXTAREA', 'SELECT'].indexOf(el.tagName) === -1) return;
     if (el.tagName === 'INPUT' && (el.type === 'checkbox' || el.type === 'radio')) return;
     var selector = getSelector(el);
+    // Cancel any pending input-debounce timer for this selector — change supersedes
+    // it, and without this both the debounced input fill AND the change fill get
+    // pushed, producing a doubled fill step in the recording.
+    if (_inputTimers[selector]) { clearTimeout(_inputTimers[selector]); delete _inputTimers[selector]; }
     window.__tdTrainEvents.push({
       type: el.tagName === 'SELECT' ? 'select' : 'fill',
       selector: selector, altSelectors: getAltSelectors(el),
@@ -612,7 +670,8 @@ const CDP_RECORDER_SCRIPT = `
 // Main training action — start CDP recording session
 // ---------------------------------------------------------------------------
 async function actionTrain(args) {
-  const { agentId, mode = 'fresh', task = null, startUrl: startUrlOverride = null, keepSession = false, browserSessionId = null } = args || {};
+  let { agentId, mode = 'fresh', task = null, startUrl: startUrlOverride = null, keepSession = false, browserSessionId = null } = args || {};
+  if (agentId) agentId = agentId.toLowerCase();
 
   if (!agentId) return { ok: false, error: 'agentId is required' };
   if (activeSessions.has(agentId)) return { ok: false, error: 'Training already in progress' };
@@ -1132,15 +1191,42 @@ function _processEvent(session, evt, tabIndex) {
     if (lastEnter && Math.abs((evt.timestamp || 0) - (lastEnter.timestamp || 0)) < 300) return;
   }
 
+  // 9. Skip hover — not a meaningful user action for recipe building
+  if (evt.type === 'hover') return;
+
+  // 10. Skip focus — focus shifts are not recipe steps; the subsequent fill/click is
+  if (evt.type === 'focus') return;
+
+  // 11. Skip keycombo that is not Enter (arrow keys, Escape, F-keys, etc.)
+  if (evt.type === 'keycombo' && evt.key !== 'Enter') return;
+
+  // 12. Skip clicks on browser chrome / navigation elements (top-bar-forward, etc.)
+  if (['click','dblclick'].includes(evt.type) && evt.selector) {
+    const _navPattern = /top-bar|topbar|forward|back|navigate|nav-bar|navigation/i;
+    if (_navPattern.test(evt.selector) || _navPattern.test(evt.elementText || '')) return;
+  }
+
+  // 13. Fill dedup: same type+selector+value within 2s (catches input+change doubling
+  //     when other events arrived between the debounced input fill and the change fill)
+  if (evt.type === 'fill' && evt.value) {
+    const _recent = session.rawEvents.slice(-5);
+    for (const prev of _recent) {
+      if (prev.type === 'fill' && prev.selector === evt.selector
+          && prev.value === evt.value
+          && Math.abs((evt.timestamp || 0) - (prev.timestamp || 0)) < 2000) return;
+    }
+  }
+
   session.rawEvents.push(evt);
   const uiStep = _eventToUIStep(evt);
   logger.info(`[trainer.agent] push event: type=${evt.type} tab=${evt.tabIndex} uiStep=${!!uiStep}`);
   if (uiStep) _postProgress(agentId, { type: 'training:step-recorded', ...uiStep });
 
-  // ── Guided training: match event to current step ──────────────────────
-  if (session.guidedPlan && session.guidedCursor !== undefined) {
-    _tryMatchGuidedStep(session, evt);
-  }
+  // NOTE: Guided training no longer auto-matches events to steps. All events
+  // go to rawEvents regardless of which guided step is "current". On Save,
+  // the LLM organizes the full path via actionPreviewSplit (using the guided
+  // plan as context hints). The guided checklist is purely a UI guide — the
+  // user manually marks steps done via agents:guided-train-done/skip.
 }
 
 // DEAD CODE PRESERVED FOR REFERENCE — replaced by _setupExposeFunction
@@ -1812,14 +1898,15 @@ function _eventToUIStep(evt) {
 // Save training — LLM cleans events into waypoint recipe, saves to disk
 // ---------------------------------------------------------------------------
 async function actionSaveTraining(args) {
-  const { agentId, skillName } = args || {};
+  let { agentId, skillName } = args || {};
+  if (agentId) agentId = agentId.toLowerCase();
 
   if (!agentId) return { ok: false, error: 'agentId is required' };
   if (!skillName) return { ok: false, error: 'skillName is required' };
 
-  // Validate dot-name format — one or more dot-separated segments
-  if (!/^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)+$/.test(skillName)) {
-    return { ok: false, error: 'Skill name must be dot-separated (e.g. w3schools.editor or w3schools.tryit.editor)' };
+  // Validate dot-name format — must end with .skill suffix
+  if (!/^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)*\.skill$/.test(skillName)) {
+    return { ok: false, error: 'Skill name must be dot-separated and end with .skill (e.g. w3schools.tryit.skill)' };
   }
 
   const session = activeSessions.get(agentId);
@@ -1840,7 +1927,7 @@ async function actionSaveTraining(args) {
     const skillDir = path.join(SKILLS_DIR, _skillDirId(agentId));
     if (!fs.existsSync(skillDir)) fs.mkdirSync(skillDir, { recursive: true });
 
-    const recipePath = path.join(skillDir, `${skillName}.skill.json`);
+    const recipePath = path.join(skillDir, _skillFileName(skillName));
     fs.writeFileSync(recipePath, JSON.stringify(recipe, null, 2), 'utf8');
 
     // Update agent descriptor with trained_skills entry
@@ -1883,7 +1970,8 @@ async function actionSaveTraining(args) {
 // Does NOT save to disk — returns preview data for the review UI
 // ---------------------------------------------------------------------------
 async function actionPreviewSplit(args) {
-  const { agentId, skillName } = args || {};
+  let { agentId, skillName, guidedPlan } = args || {};
+  if (agentId) agentId = agentId.toLowerCase();
   if (!agentId) return { ok: false, error: 'agentId is required' };
   if (!skillName) return { ok: false, error: 'skillName is required' };
 
@@ -1891,20 +1979,39 @@ async function actionPreviewSplit(args) {
   if (!session) return { ok: false, error: 'No active training session' };
   if (session.rawEvents.length < 2) return { ok: false, error: 'Not enough recorded steps' };
 
-  // Stop polling during preview
-  if (session.pollInterval) clearInterval(session.pollInterval);
-  session.cancelRequested = true;
+  // Use guidedPlan from args, or fall back to session.guidedPlan if present
+  const planContext = guidedPlan || session.guidedPlan || null;
 
+  // Stop polling during preview — but do NOT set cancelRequested (that would
+  // make the session look cancelled to actionCancelTraining checks). We use a
+  // separate flag so cancel can still interrupt the preview.
+  if (session.pollInterval) clearInterval(session.pollInterval);
+  session.previewInProgress = true;
+
+  logger.info(`[trainer.agent] actionPreviewSplit started: ${session.rawEvents.length} raw events, skillName="${skillName}"`);
   _postProgress(agentId, { type: 'training:saving', message: 'Analyzing recorded steps…' });
 
   try {
-    // Auto-split events into action segments
-    const actions = await _autoSplitEvents(session);
+    // Auto-split events into action segments (with optional guided plan context)
+    const actions = await _autoSplitEvents(session, planContext);
+
+    // Check if cancelled during LLM call
+    if (session.cancelRequested || !activeSessions.has(agentId)) {
+      logger.info('[trainer.agent] actionPreviewSplit cancelled by user');
+      return { ok: false, error: 'Preview cancelled by user', cancelled: true };
+    }
+
+    // Check for reject response from LLM
+    if (actions.rejected) {
+      logger.info(`[trainer.agent] _autoSplitEvents rejected: ${actions.reason}`);
+      return { ok: false, rejected: true, reason: actions.reason || 'Could not understand the recorded actions' };
+    }
     const collapsed = _collapseNavigation(session.rawEvents);
 
     if (actions.length <= 1) {
       // Single action — no split needed
       const skillPreview = await _buildSkillPreview(session, collapsed, 0, collapsed.length, skillName, actions[0]);
+      session.previewInProgress = false;
       return { ok: true, agentId, singleAction: true, skills: [skillPreview], recipe: null };
     }
 
@@ -1916,7 +2023,7 @@ async function actionPreviewSplit(args) {
     for (let i = 0; i < actions.length; i++) {
       const action = actions[i];
       const actionEvents = collapsed.slice(action.eventStart, action.eventEnd);
-      const actionSkillName = `${baseName}.${action.name.replace(/\s+/g, '_').toLowerCase()}`;
+      const actionSkillName = `${baseName}.${action.name.replace(/\s+/g, '_').toLowerCase()}.skill`;
       const skillPreview = await _buildSkillPreview(session, actionEvents, action.eventStart, action.eventEnd, actionSkillName, action);
       skills.push(skillPreview);
     }
@@ -1946,9 +2053,11 @@ async function actionPreviewSplit(args) {
     };
 
     logger.info(`[trainer.agent] actionPreviewSplit: ${skills.length} skills + recipe "${recipeName}"`);
+    session.previewInProgress = false;
     return { ok: true, agentId, singleAction: false, skills, recipe };
   } catch (err) {
     logger.error(`[trainer.agent] Preview split failed: ${err.message}`);
+    session.previewInProgress = false;
     _postProgress(agentId, { type: 'training:error', message: err.message });
     return { ok: false, error: err.message };
   }
@@ -1956,9 +2065,25 @@ async function actionPreviewSplit(args) {
 
 // Build a skill preview from a segment of events
 async function _buildSkillPreview(session, events, eventStart, eventEnd, skillName, action) {
-  // Apply param detection to this segment
   const segmentEvents = events.map(e => ({ ...e }));
-  const detectedParams = _detectParamsFallback(segmentEvents, session);
+
+  // Apply LLM-detected param mappings (if the LLM provided them in the action)
+  if (action?.paramMappings && Array.isArray(action.paramMappings)) {
+    for (const mapping of action.paramMappings) {
+      // eventIndex is relative to the full collapsed array; convert to segment-local index
+      const localIdx = mapping.eventIndex - eventStart;
+      const evt = segmentEvents[localIdx];
+      if (evt && (evt.type === 'fill' || evt.type === 'paste')) {
+        evt._paramRef = mapping.paramName;
+        evt._originalValue = mapping.originalValue || '';
+        if (evt.type === 'fill') evt.value = `{{${mapping.paramName}}}`;
+        else evt.text = `{{${mapping.paramName}}}`;
+      }
+    }
+  }
+
+  // Use LLM-detected params if available, otherwise fall back to heuristic
+  const detectedParams = action?.params || _detectParamsFallback(segmentEvents, session);
 
   // Build waypoints from segment events (reuse fallback recipe builder logic)
   const waypoints = [];
@@ -1994,10 +2119,9 @@ async function _buildSkillPreview(session, events, eventStart, eventEnd, skillNa
     } else if (evt.type === 'keycombo') {
       step++;
       waypoints.push({ step, type: 'keycombo', key: evt.key || 'Enter', ctrl: evt.ctrl || false, shift: evt.shift || false, alt: evt.alt || false, selector: evt.selector || '' });
-    } else if (evt.type === 'hover') {
-      step++;
-      waypoints.push({ step, type: 'hover', selector: evt.selector, altSelectors: evt.altSelectors || [] });
     }
+    // NOTE: hover/focus are intentionally NOT emitted as waypoints — they are
+    // not meaningful recipe steps. The subsequent click/fill is what matters.
   }
 
   const lastNav = segmentEvents.filter(e => e.type === 'navigate').pop();
@@ -2020,9 +2144,20 @@ async function _buildSkillPreview(session, events, eventStart, eventEnd, skillNa
 // Save skills + recipe from user-adjusted review data
 // ---------------------------------------------------------------------------
 async function actionSaveSkillsAndRecipe(args) {
-  const { agentId, skills, recipe } = args || {};
+  let { agentId, skills, recipe } = args || {};
+  if (agentId) agentId = agentId.toLowerCase();
   if (!agentId) return { ok: false, error: 'agentId is required' };
   if (!Array.isArray(skills) || skills.length === 0) return { ok: false, error: 'skills array is required' };
+
+  // Validate skill names end with .skill, recipe name ends with .recipe
+  for (const s of skills) {
+    if (s.name && !s.name.endsWith('.skill')) {
+      return { ok: false, error: `Skill name "${s.name}" must end with .skill` };
+    }
+  }
+  if (recipe && recipe.name && !recipe.name.endsWith('.recipe')) {
+    return { ok: false, error: `Recipe name "${recipe.name}" must end with .recipe` };
+  }
 
   const session = activeSessions.get(agentId);
   if (!session) return { ok: false, error: 'No active training session' };
@@ -2049,7 +2184,7 @@ async function actionSaveSkillsAndRecipe(args) {
         urlFirst: true,
       };
 
-      const skillPath = path.join(skillDir, `${skill.name}.skill.json`);
+      const skillPath = path.join(skillDir, _skillFileName(skill.name));
       fs.writeFileSync(skillPath, JSON.stringify(skillJson, null, 2), 'utf8');
       _registerSkillInAgent(agentId, skill.name, skillJson);
       savedSkills.push({ name: skill.name, path: skillPath });
@@ -2230,7 +2365,7 @@ ${eventSummary}
 Create a MINIMAL waypoint recipe. Rules:
 1. URL-FIRST: If a click has an href that is a full http(s) URL and opens a form/composer, replace the click chain (navigate + opening clicks) with a SINGLE navigate waypoint to that href URL. This makes the recipe deterministic — next run skips the brittle click selectors entirely.
 2. Merge consecutive clicks that lead to the same page into a single navigate waypoint
-3. Remove noise (duplicate navigations, insignificant clicks)
+3. Remove noise (duplicate navigations, insignificant clicks, hover events, focus events — these are NEVER waypoints)
 4. Each waypoint should represent a meaningful navigation step
 5. The LAST waypoint is the TARGET — where the user wants the AI to start working
 6. Include the primary CSS selector AND alternative selectors for each click waypoint
@@ -2520,12 +2655,6 @@ function _buildFallbackRecipe(session, skillName) {
         ctrl: evt.ctrl || false, shift: evt.shift || false, alt: evt.alt || false,
         selector: evt.selector || '',
       });
-    } else if (evt.type === 'hover') {
-      step++;
-      waypoints.push({
-        step, type: 'hover',
-        selector: evt.selector, altSelectors: evt.altSelectors || [],
-      });
     } else if (evt.type === 'extract') {
       step++;
       waypoints.push({
@@ -2560,7 +2689,7 @@ function _buildFallbackRecipe(session, skillName) {
 // Auto-split multi-action events into separate action segments
 // Uses LLM to detect action boundaries, with heuristic fallback
 // ---------------------------------------------------------------------------
-async function _autoSplitEvents(session) {
+async function _autoSplitEvents(session, guidedPlan) {
   const { agentId, rawEvents, trainTask } = session;
   if (!rawEvents || rawEvents.length < 3) {
     return [{ name: 'default', description: trainTask || 'Recorded action', eventStart: 0, eventEnd: rawEvents?.length || 0, params: [] }];
@@ -2599,6 +2728,15 @@ async function _autoSplitEvents(session) {
     }
   }).join('\n');
 
+  // Build guided plan context if available (guided training mode)
+  let guidedContext = '';
+  if (guidedPlan && Array.isArray(guidedPlan) && guidedPlan.length > 0) {
+    const planLines = guidedPlan.map((s, i) =>
+      `${i + 1}. ${s.description || s.step || `Step ${i + 1}`}${s.expectedType ? ` (expected: ${s.expectedType}${s.expectedText ? ` "${s.expectedText}"` : ''})` : ''}`
+    ).join('\n');
+    guidedContext = `\nGUIDED PLAN (the user was guided through these steps — use as HINTS for action boundaries and naming):\n${planLines}\n\nThe guided steps are HINTS, not rigid boundaries. Organize the raw events into a strategic path, using the guided steps as semantic context for where one action ends and the next begins.\n`;
+  }
+
   const prompt = `Analyze this sequence of browser interaction events and identify ACTION BOUNDARIES.
 An action boundary is where one logical task ends and another begins.
 
@@ -2610,34 +2748,61 @@ Signals for action boundaries:
 NOTE: {{value}} placeholders in FILL events represent user-provided values that will
 become skill parameters. Do NOT treat them as literal strings — they are parametric inputs.
 
+PARAMETER DETECTION: For each action, identify fill/paste values that are TASK-SPECIFIC
+(values the user would change each time — names, queries, messages, descriptions). Map
+each to a descriptive param_name. Static values (URLs, fixed labels) should NOT be params.
+${guidedContext}
 ${trainTask ? `ORIGINAL TASK: ${trainTask}` : ''}
 
 RAW EVENTS (task-specific values replaced with {{value}}):
 ${eventSummary}
 
-Output JSON:
+Output JSON — two options:
+
+OPTION 1 — if you can understand the actions:
 {
   "actions": [
     {
-      "name": "create.item",
-      "description": "Create a new item with a given name",
+      "name": "create.playlist",
+      "description": "Create a new playlist with a given name",
       "eventStart": 1,
-      "eventEnd": 5,
-      "params": [{ "name": "item_name", "type": "string", "required": true }]
+      "eventEnd": 8,
+      "params": [
+        { "name": "playlist_name", "type": "string", "required": true, "description": "Name of the playlist to create" }
+      ],
+      "paramMappings": [
+        { "eventIndex": 3, "paramName": "playlist_name", "originalValue": "Christian Test" }
+      ]
     }
   ]
 }
 
+OPTION 2 — if the events are too chaotic, unclear, or don't form a coherent action:
+{ "actions": [], "rejected": true, "reason": "The recorded events don't form a clear, repeatable action. Try recording again with a specific task in mind." }
+
 If there is only ONE action, return a single-element array. Output ONLY valid JSON.`;
 
   try {
+    logger.info('[trainer.agent] _autoSplitEvents: calling LLM for action split...');
     const response = await askWithMessages([
       { role: 'system', content: 'You identify action boundaries in browser interaction sequences. Output ONLY valid JSON.' },
       { role: 'user', content: prompt },
-    ], { maxTokens: 800, temperature: 0.2 });
+    ], { maxTokens: 1000, temperature: 0.2, responseTimeoutMs: 15000 });
+
+    // Check if cancelled during LLM call
+    if (session.cancelRequested) {
+      logger.info('[trainer.agent] _autoSplitEvents cancelled by user during LLM call');
+      return { rejected: true, reason: 'Cancelled by user' };
+    }
 
     let json = (response || '').trim().replace(/^```(?:json)?\s*\n?/i, '').replace(/\n?```\s*$/, '');
     const parsed = JSON.parse(json);
+
+    // Check for reject response
+    if (parsed.rejected) {
+      return { rejected: true, reason: parsed.reason || 'Could not understand the recorded actions' };
+    }
+
     if (parsed.actions && Array.isArray(parsed.actions) && parsed.actions.length > 0) {
       // Convert 1-based indices to 0-based
       for (const action of parsed.actions) {
@@ -2647,11 +2812,17 @@ If there is only ONE action, return a single-element array. Output ONLY valid JS
       logger.info(`[trainer.agent] _autoSplitEvents: LLM split into ${parsed.actions.length} actions`);
       return parsed.actions;
     }
+
+    // Empty actions array without rejected flag — treat as reject
+    if (parsed.actions && parsed.actions.length === 0) {
+      return { rejected: true, reason: parsed.reason || 'LLM returned no actions' };
+    }
   } catch (e) {
     logger.warn(`[trainer.agent] _autoSplitEvents LLM failed, using heuristic: ${e.message}`);
   }
 
   // Heuristic fallback: split at submit events or save/create/done clicks
+  logger.info('[trainer.agent] _autoSplitEvents: using heuristic fallback');
   return _heuristicSplit(collapsed, trainTask);
 }
 
@@ -2698,7 +2869,7 @@ function _heuristicSplit(events, trainTask) {
 }
 
 // ---------------------------------------------------------------------------
-// Register trained skill in agent's .md descriptor
+// Register trained skill in agent's .md descriptor and user-memory DB
 // ---------------------------------------------------------------------------
 function _registerSkillInAgent(agentId, skillName, recipe) {
   try {
@@ -2717,6 +2888,43 @@ function _registerSkillInAgent(agentId, skillName, recipe) {
 
     fs.writeFileSync(agentPath, descriptor, 'utf8');
     logger.info(`[trainer.agent] Registered ${skillName} in ${agentId}.agent.md`);
+
+    // Also register in user-memory DB so parseSkill/external.skill can find it
+    const skillPath = path.join(SKILLS_DIR, _skillDirId(agentId), _skillFileName(skillName));
+    const memoryUrl = process.env.MCP_USER_MEMORY_URL || process.env.USER_MEMORY_SERVICE_URL || 'http://127.0.0.1:3001';
+    const parsedUrl = new URL(memoryUrl);
+    const upsertReq = http.request({
+      hostname: parsedUrl.hostname,
+      port: parsedUrl.port || 3001,
+      path: '/skill.upsert',
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+    }, res => {
+      if (res.statusCode === 200) {
+        logger.info(`[trainer.agent] Registered ${skillName} in user-memory DB`);
+      } else {
+        let err = '';
+        res.on('data', c => { err += c; });
+        res.on('end', () => { logger.warn(`[trainer.agent] user-memory skill.upsert returned ${res.statusCode}: ${err}`); });
+      }
+      res.resume();
+    });
+    upsertReq.on('error', err => { logger.warn(`[trainer.agent] user-memory skill.upsert failed: ${err.message}`); });
+    upsertReq.write(JSON.stringify({
+      version: 'mcp.v1',
+      service: 'user-memory',
+      action: 'skill.upsert',
+      payload: {
+        name: skillName,
+        description: recipe.targetDescription || `Trained skill ${skillName}`,
+        execPath: skillPath,
+        execType: 'recipe',
+        enabled: true,
+        sourceDomain: _skillDirId(agentId),
+        sourceAction: recipe.targetDescription || '',
+      },
+    }));
+    upsertReq.end();
   } catch (e) {
     logger.error(`[trainer.agent] Failed to register skill: ${e.message}`);
   }
@@ -2726,7 +2934,8 @@ function _registerSkillInAgent(agentId, skillName, recipe) {
 // Cancel training — stop WebSocket server, close browser
 // ---------------------------------------------------------------------------
 function actionCancelTraining(args) {
-  const { agentId } = args || {};
+  let { agentId } = args || {};
+  if (agentId) agentId = agentId.toLowerCase();
 
   const session = activeSessions.get(agentId);
   if (!session) return { ok: false, error: 'No active training session' };
@@ -2757,7 +2966,8 @@ function actionCancelTraining(args) {
 // List trained skills for an agent
 // ---------------------------------------------------------------------------
 function actionListSkills(args) {
-  const { agentId } = args || {};
+  let { agentId } = args || {};
+  if (agentId) agentId = agentId.toLowerCase();
   if (!agentId) return { ok: false, error: 'agentId is required' };
 
   const skillDir = path.join(SKILLS_DIR, _skillDirId(agentId));
@@ -2788,11 +2998,14 @@ function actionListSkills(args) {
 // Load a specific recipe by skill name (used by browser.agent at runtime)
 // ---------------------------------------------------------------------------
 function loadRecipe(agentId, skillName) {
-  // Try .skill.json first, then fall back to .recipe.json for backward compatibility
+  // Try new naming first (skill.json), then legacy .skill.json, then .recipe.json
   const skillDir = path.join(SKILLS_DIR, _skillDirId(agentId));
-  const skillPath = path.join(skillDir, `${skillName}.skill.json`);
+  const newPath = path.join(skillDir, _skillFileName(skillName));
+  const legacySkillPath = path.join(skillDir, `${skillName}.skill.json`);
   const recipePath = path.join(skillDir, `${skillName}.recipe.json`);
-  const filePath = fs.existsSync(skillPath) ? skillPath : (fs.existsSync(recipePath) ? recipePath : null);
+  const filePath = fs.existsSync(newPath) ? newPath
+    : (fs.existsSync(legacySkillPath) ? legacySkillPath
+      : (fs.existsSync(recipePath) ? recipePath : null));
   if (!filePath) return null;
   try {
     return JSON.parse(fs.readFileSync(filePath, 'utf8'));
@@ -3004,7 +3217,7 @@ async function saveAutoRecipe(agentId, task, transcript, targetUrl, playbookCont
 
   // Save recipe file
   if (!fs.existsSync(skillDir)) fs.mkdirSync(skillDir, { recursive: true });
-  const recipePath = path.join(skillDir, `${skillName}.skill.json`);
+  const recipePath = path.join(skillDir, _skillFileName(skillName));
   fs.writeFileSync(recipePath, JSON.stringify(recipe, null, 2), 'utf8');
 
   // Register in agent descriptor
@@ -3238,6 +3451,7 @@ ${JSON.stringify(keyboardActions, null, 2)}`;
 // Generate a step-by-step plan from the user's task via LLM.
 // Returns: { ok, plan: [{ step, description, expectedType, expectedText?, expectedUrl? }] }
 async function generateGuidedPlan(task, agentId, startUrl) {
+  if (agentId) agentId = agentId.toLowerCase();
   if (!task) return { ok: false, error: 'task is required' };
 
   const prompt = `You are a browser automation training planner. Given a user's task and the starting URL of a web service, break the task into a sequence of MANUAL steps that the user will perform one at a time while the system watches and learns.
@@ -3295,11 +3509,14 @@ Rules:
 
 // Start guided training: navigate to start URL, inject recorder, emit first step.
 async function actionGuidedTrain(args) {
-  const { agentId, task, plan, startUrl: startUrlOverride = null } = args || {};
+  let { agentId, task, plan, startUrl: startUrlOverride = null } = args || {};
+  if (agentId) agentId = agentId.toLowerCase();
 
   if (!agentId) return { ok: false, error: 'agentId is required' };
   if (!task) return { ok: false, error: 'task is required' };
-  if (!plan || !Array.isArray(plan) || plan.length === 0) return { ok: false, error: 'plan is required (array of steps)' };
+  // plan is now optional — guided steps are no longer used. We keep the param
+  // for backwards compat but ignore it. Training is unified: record all →
+  // LLM organizes on Save.
   if (activeSessions.has(agentId)) return { ok: false, error: 'Training already in progress' };
 
   const agentFile = agentId.endsWith('.agent') ? `${agentId}.md` : `${agentId}.agent.md`;
@@ -3343,8 +3560,7 @@ async function actionGuidedTrain(args) {
   const hostname = new URL(descriptorStartUrl).hostname.replace(/^www\./, '');
 
   // Persistent profile session — reuse the same sessionId that browser.agent
-  // uses so auth cookies are preserved. Format: '<agentId without .agent>_agent'.
-  // (browser.agent.cjs line 4105-4110 uses `${agentId.replace('.agent', '')}_agent`.)
+  // uses so auth cookies are preserved.
   const sessionId = `${agentId.replace(/\.agent$/, '')}_agent`;
   const session = {
     agentId, hostname, startUrl: effectiveStartUrl, sessionId,
@@ -3360,26 +3576,17 @@ async function actionGuidedTrain(args) {
     trainTask: task,
     isHereMode: false,
     ownsSession: true,
-    // Guided training fields
-    guidedPlan: plan,
-    guidedCursor: 0,
-    guidedMatchedEvents: [], // per-step: [{ step, events: [evt, ...], destinationUrl }]
-    guidedStepStartTime: Date.now(),
   };
-  // Initialize matched-events slots
-  for (let i = 0; i < plan.length; i++) {
-    session.guidedMatchedEvents.push({ step: i + 1, events: [], destinationUrl: null });
-  }
   activeSessions.set(agentId, session);
 
-  logger.info(`[trainer.agent] Starting guided training for ${agentId}: ${plan.length} steps, task="${task.slice(0, 80)}"`);
+  logger.info(`[trainer.agent] Starting training for ${agentId}: task="${task.slice(0, 80)}"`);
 
   try {
     const { browserAct } = require('./browser.act.cjs');
-    _postProgress(agentId, { type: 'training:start', hostname, startUrl: effectiveStartUrl, mode: 'guided', plan });
+    _postProgress(agentId, { type: 'training:start', hostname, startUrl: effectiveStartUrl, mode: 'freeform' });
 
     await _startEventHttpServer(session);
-    logger.info(`[trainer.agent] Guided event HTTP server ready on port ${session.httpPort}`);
+    logger.info(`[trainer.agent] Event HTTP server ready on port ${session.httpPort}`);
 
     // Navigate to start URL
     await browserAct({ action: 'navigate', url: effectiveStartUrl, sessionId, headed: true, timeoutMs: 30000 });
@@ -3387,181 +3594,15 @@ async function actionGuidedTrain(args) {
     await _injectRecorderScript(session, 0);
     _startTabWatcher(session);
 
-    // Emit first guided step to UI (brain icon = not yet learned)
-    const firstStep = plan[0];
-    _postProgress(agentId, {
-      type: 'training:guided-step',
-      stepIndex: 0,
-      totalSteps: plan.length,
-      description: firstStep.description,
-      expectedType: firstStep.expectedType,
-      expectedText: firstStep.expectedText || null,
-      expectedUrl: firstStep.expectedUrl || null,
-      brainIcon: true,
-    });
-    logger.info(`[trainer.agent] Guided step 1/${plan.length}: "${firstStep.description}"`);
-
-    return { ok: true, agentId, message: `Guided training started (${plan.length} steps).` };
+    return { ok: true, agentId, message: 'Training started. Record interactions and click Save.' };
   } catch (err) {
-    logger.error(`[trainer.agent] Guided train start failed: ${err.message}`);
+    logger.error(`[trainer.agent] Train start failed: ${err.message}`);
     activeSessions.delete(agentId);
     return { ok: false, error: err.message };
   }
 }
 
-// Try to match an incoming event to the current guided step.
-// On match: record event, advance cursor, emit step-learned + next step.
-function _tryMatchGuidedStep(session, evt) {
-  const cursor = session.guidedCursor;
-  const plan = session.guidedPlan;
-  if (cursor >= plan.length) return; // all steps done
-
-  const currentStep = plan[cursor];
-  const matchedSlot = session.guidedMatchedEvents[cursor];
-
-  // Always record the event into the current step's event list (for recipe building)
-  matchedSlot.events.push(evt);
-
-  // Track the latest navigate URL as the step's destination URL
-  if (evt.type === 'navigate' && evt.url) {
-    matchedSlot.destinationUrl = evt.url;
-  }
-
-  // Match logic: does this event satisfy the current step's expectedType + expectedText?
-  let matched = false;
-  const expectedType = (currentStep.expectedType || '').toLowerCase();
-  const expectedText = (currentStep.expectedText || '').toLowerCase();
-  const expectedUrl = (currentStep.expectedUrl || '').toLowerCase();
-
-  if (expectedType === evt.type) {
-    // Type matches — check text/URL if provided
-    if (expectedType === 'navigate') {
-      // For navigate steps: match if expectedUrl is empty OR the event URL contains expectedUrl
-      if (!expectedUrl || evt.url?.toLowerCase().includes(expectedUrl)) {
-        matched = true;
-      }
-    } else if (expectedType === 'fill' || expectedType === 'submit' || expectedType === 'select' || expectedType === 'check') {
-      // For fill/submit/select/check: match on type (text matching is unreliable for inputs)
-      matched = true;
-    } else if (expectedType === 'click') {
-      // For click: fuzzy match on elementText or selector containing expectedText
-      const elText = (evt.elementText || '').toLowerCase();
-      const sel = (evt.selector || '').toLowerCase();
-      if (!expectedText || elText.includes(expectedText) || sel.includes(expectedText.replace(/\s+/g, ''))) {
-        matched = true;
-      }
-    } else {
-      // Other types: type match is enough
-      matched = true;
-    }
-  }
-
-  if (!matched) return;
-
-  // Step matched — mark learned, advance cursor
-  logger.info(`[trainer.agent] Guided step ${cursor + 1}/${plan.length} matched (type=${evt.type}) — marking learned`);
-  _postProgress(session.agentId, {
-    type: 'training:step-learned',
-    stepIndex: cursor,
-    totalSteps: plan.length,
-    description: currentStep.description,
-    matchedEventType: evt.type,
-  });
-
-  session.guidedCursor = cursor + 1;
-
-  // All steps done? Auto-save.
-  if (session.guidedCursor >= plan.length) {
-    logger.info(`[trainer.agent] All ${plan.length} guided steps learned — auto-saving recipe`);
-    _postProgress(session.agentId, {
-      type: 'training:guided-complete',
-      totalSteps: plan.length,
-      message: 'All steps learned! Saving recipe...',
-    });
-    // Derive skill name from task
-    const _skillName = _deriveGuidedSkillName(session.agentId, session.trainTask);
-    // Auto-save (async, don't block event processing)
-    actionSaveGuidedTraining({ agentId: session.agentId, skillName: _skillName })
-      .catch(err => logger.error(`[trainer.agent] Guided auto-save failed: ${err.message}`));
-    return;
-  }
-
-  // Emit next step to UI
-  const nextStep = plan[session.guidedCursor];
-  session.guidedStepStartTime = Date.now();
-  _postProgress(session.agentId, {
-    type: 'training:guided-step',
-    stepIndex: session.guidedCursor,
-    totalSteps: plan.length,
-    description: nextStep.description,
-    expectedType: nextStep.expectedType,
-    expectedText: nextStep.expectedText || null,
-    expectedUrl: nextStep.expectedUrl || null,
-    brainIcon: true,
-  });
-  logger.info(`[trainer.agent] Guided step ${session.guidedCursor + 1}/${plan.length}: "${nextStep.description}"`);
-}
-
-// Skip the current guided step (user did it but auto-detection missed).
-function actionGuidedSkipStep(args) {
-  const { agentId } = args || {};
-  const session = activeSessions.get(agentId);
-  if (!session || !session.guidedPlan) return { ok: false, error: 'No active guided training session' };
-  if (session.guidedCursor >= session.guidedPlan.length) return { ok: false, error: 'All steps already complete' };
-
-  const cursor = session.guidedCursor;
-  const currentStep = session.guidedPlan[cursor];
-  logger.info(`[trainer.agent] Guided step ${cursor + 1} skipped by user`);
-
-  // Use the last recorded navigate URL as destination if available
-  const matchedSlot = session.guidedMatchedEvents[cursor];
-  if (!matchedSlot.destinationUrl) {
-    const lastNav = session.rawEvents.filter(e => e.type === 'navigate').pop();
-    if (lastNav) matchedSlot.destinationUrl = lastNav.url;
-  }
-
-  // Persist any events that were recorded while the step was active
-  session.rawEvents.push(...matchedSlot.events);
-  matchedSlot.events = [];
-
-  _postProgress(agentId, {
-    type: 'training:step-learned',
-    stepIndex: cursor,
-    totalSteps: session.guidedPlan.length,
-    description: currentStep.description,
-    matchedEventType: 'skip',
-  });
-
-  session.guidedCursor = cursor + 1;
-
-  if (session.guidedCursor >= session.guidedPlan.length) {
-    logger.info(`[trainer.agent] All guided steps complete (after skip) — auto-saving recipe`);
-    _postProgress(agentId, {
-      type: 'training:guided-complete',
-      totalSteps: session.guidedPlan.length,
-      message: 'All steps learned! Saving recipe...',
-    });
-    const _skillName = _deriveGuidedSkillName(agentId, session.trainTask);
-    actionSaveGuidedTraining({ agentId, skillName: _skillName })
-      .catch(err => logger.error(`[trainer.agent] Guided auto-save failed: ${err.message}`));
-    return { ok: true, skipped: true, allComplete: true };
-  }
-
-  const nextStep = session.guidedPlan[session.guidedCursor];
-  _postProgress(agentId, {
-    type: 'training:guided-step',
-    stepIndex: session.guidedCursor,
-    totalSteps: session.guidedPlan.length,
-    description: nextStep.description,
-    expectedType: nextStep.expectedType,
-    expectedText: nextStep.expectedText || null,
-    expectedUrl: nextStep.expectedUrl || null,
-    brainIcon: true,
-  });
-  return { ok: true, skipped: true };
-}
-
-// Derive a dot-separated skill name from the task text.
+// Derive a dot-separated skill name from the task text. Always ends with .skill.
 function _deriveGuidedSkillName(agentId, task) {
   const _agentIdClean = _skillDirId(agentId);
   const _intentName = (task || 'trained')
@@ -3571,186 +3612,7 @@ function _deriveGuidedSkillName(agentId, task) {
     .split(/\s+/)
     .slice(0, 4)
     .join('.');
-  return `${_agentIdClean}.${_intentName || 'trained'}`;
-}
-
-// Save guided training as a URL-first recipe.
-// Per step: record ONLY the destination URL (last navigate before the step's key
-// interaction) + the DOM interactions on that page. Discard intermediate navigations.
-async function actionSaveGuidedTraining(args) {
-  const { agentId, skillName } = args || {};
-  if (!agentId) return { ok: false, error: 'agentId is required' };
-  if (!skillName) return { ok: false, error: 'skillName is required' };
-
-  // Validate dot-name format
-  if (!/^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)+$/.test(skillName)) {
-    return { ok: false, error: 'Skill name must be dot-separated (e.g. app.create.item)' };
-  }
-
-  const session = activeSessions.get(agentId);
-  if (!session) return { ok: false, error: 'No active training session' };
-  if (!session.guidedPlan) return { ok: false, error: 'Not a guided training session' };
-
-  // Stop polling
-  if (session.pollInterval) clearInterval(session.pollInterval);
-  session.cancelRequested = true;
-
-  _postProgress(agentId, { type: 'training:saving', message: 'Building URL-first recipe...' });
-
-  try {
-    // Build URL-first recipe from guided matched events
-    const recipe = _buildGuidedRecipe(session, skillName);
-
-    // Save recipe file
-    const skillDir = path.join(SKILLS_DIR, _skillDirId(agentId));
-    if (!fs.existsSync(skillDir)) fs.mkdirSync(skillDir, { recursive: true });
-    const recipePath = path.join(skillDir, `${skillName}.skill.json`);
-    fs.writeFileSync(recipePath, JSON.stringify(recipe, null, 2), 'utf8');
-
-    // Register in agent descriptor
-    _registerSkillInAgent(agentId, skillName, recipe);
-
-    // Clean up session
-    if (session.httpServer) {
-      session.httpServer.close(() => {
-        logger.info(`[trainer.agent] Guided event HTTP server closed (port ${session.httpPort})`);
-      });
-    }
-    if (session.ownsSession !== false) {
-      const { browserAct } = require('./browser.act.cjs');
-      browserAct({ action: 'close', sessionId: session.sessionId }).catch(() => {});
-    }
-    activeSessions.delete(agentId);
-
-    logger.info(`[trainer.agent] Guided recipe saved: ${recipePath} (${recipe.waypoints.length} waypoints)`);
-    _postProgress(agentId, {
-      type: 'training:saved',
-      skillName,
-      recipePath,
-      waypointCount: recipe.waypoints.length,
-      message: `Skill "${skillName}" saved with ${recipe.waypoints.length} waypoints.`,
-    });
-
-    return { ok: true, skillName, recipePath, recipe };
-  } catch (err) {
-    logger.error(`[trainer.agent] Guided save failed: ${err.message}`);
-    _postProgress(agentId, { type: 'training:error', message: err.message });
-    return { ok: false, error: err.message };
-  }
-}
-
-// Build a URL-first recipe from guided matched events.
-// Per step: ONE navigate waypoint (destination URL) + DOM interaction waypoints.
-// Intermediate navigations within a step are discarded.
-function _buildGuidedRecipe(session, skillName) {
-  const { agentId, startUrl, guidedPlan, guidedMatchedEvents, trainTask } = session;
-  const waypoints = [];
-  let stepNum = 0;
-
-  for (let i = 0; i < guidedPlan.length; i++) {
-    const planStep = guidedPlan[i];
-    const matched = guidedMatchedEvents[i];
-    if (!matched || !matched.events || matched.events.length === 0) {
-      logger.warn(`[trainer.agent] Guided recipe: step ${i + 1} has no matched events — skipping`);
-      continue;
-    }
-
-    // Find the destination URL: the LAST navigate event in this step's events
-    // (the URL where the key interaction happened). Also check for clicks with
-    // http(s) hrefs that are effectively navigation. If no navigate in this step,
-    // carry forward the previous step's destination URL.
-    const navEvents = matched.events.filter(e => e.type === 'navigate' && e.url && e.url !== 'about:blank');
-    const navClicks = matched.events.filter(e => e.type === 'click' && e.href && /^https?:\/\//i.test(e.href));
-    let destUrl = null;
-    if (navEvents.length > 0) {
-      destUrl = navEvents[navEvents.length - 1].url;
-    } else if (navClicks.length > 0) {
-      destUrl = navClicks[navClicks.length - 1].href;
-    }
-    if (!destUrl && waypoints.length === 0) destUrl = startUrl;
-
-    if (destUrl) {
-      stepNum++;
-      waypoints.push({
-        step: stepNum,
-        type: 'navigate',
-        url: destUrl,
-        checkpoint: planStep.description,
-      });
-    }
-
-    // Add DOM interaction waypoints — skip navigate events (already recorded above)
-    // and skip nav-clicks (clicks with http(s) hrefs that are now navigation).
-    for (const evt of matched.events) {
-      if (evt.type === 'navigate') continue; // handled as destination URL above
-      if (evt.type === 'click' && evt.href && /^https?:\/\//i.test(evt.href)) continue; // nav-click — handled as navigate
-      if (evt.type === 'click' || evt.type === 'dblclick') {
-        stepNum++;
-        waypoints.push({
-          step: stepNum,
-          type: evt.type,
-          selector: evt.selector,
-          altSelectors: evt.altSelectors || [],
-          elementText: evt.elementText || '',
-          href: evt.href || '',
-        });
-      } else if (evt.type === 'fill' || evt.type === 'paste') {
-        stepNum++;
-        // value="" — runtime fills from task (search query, item name are task-specific)
-        waypoints.push({
-          step: stepNum,
-          type: evt.type === 'paste' ? 'paste' : 'fill',
-          selector: evt.selector,
-          altSelectors: evt.altSelectors || [],
-          value: '', // task-specific — runtime fills from task
-        });
-      } else if (evt.type === 'submit') {
-        stepNum++;
-        waypoints.push({ step: stepNum, type: 'submit', selector: evt.selector });
-      } else if (evt.type === 'keycombo') {
-        stepNum++;
-        waypoints.push({
-          step: stepNum,
-          type: 'keycombo',
-          key: evt.key || 'Enter',
-          ctrl: evt.ctrl || false, shift: evt.shift || false, alt: evt.alt || false,
-          selector: evt.selector || '',
-        });
-      } else if (evt.type === 'select') {
-        stepNum++;
-        waypoints.push({ step: stepNum, type: 'select', selector: evt.selector, value: '' });
-      } else if (evt.type === 'check') {
-        stepNum++;
-        waypoints.push({
-          step: stepNum, type: 'check', selector: evt.selector,
-          label: evt.label || '', checked: evt.checked,
-        });
-      } else if (evt.type === 'hover') {
-        stepNum++;
-        waypoints.push({
-          step: stepNum, type: 'hover', selector: evt.selector,
-          altSelectors: evt.altSelectors || [],
-        });
-      }
-      // Skip scroll, focus, tab-new — not meaningful for recipe replay
-    }
-  }
-
-  // Determine target URL: last navigate waypoint's URL
-  const lastNav = waypoints.filter(w => w.type === 'navigate').pop();
-
-  return {
-    name: skillName,
-    agentId: _skillDirId(agentId),
-    startUrl,
-    targetUrl: lastNav?.url || startUrl,
-    waypoints,
-    targetDescription: trainTask ? trainTask.slice(0, 200) : `Guided recipe: ${skillName}`,
-    created: new Date().toISOString(),
-    userConfirmed: true,
-    urlFirst: true,
-    guidedTraining: true,
-  };
+  return `${_agentIdClean}.${_intentName || 'trained'}.skill`;
 }
 
 // ---------------------------------------------------------------------------
@@ -3768,9 +3630,10 @@ module.exports = {
   saveAutoRecipe,
   distillKeyboardScript,
   distillHumanCorrection,
-  // Guided plan-first training
+  // Guided plan-first training (simplified — no step checklist)
   generateGuidedPlan,
   actionGuidedTrain,
-  actionGuidedSkipStep,
-  actionSaveGuidedTraining,
+  // Exposed for main.js guided-train-finish handler
+  _deriveGuidedSkillName,
+  _getActiveSession: (agentId) => activeSessions.get((agentId || '').toLowerCase()),
 };
