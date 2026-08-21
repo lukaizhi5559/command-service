@@ -8228,30 +8228,73 @@ async function _executeOverlayInteraction({ goal, sessionId, headed, timeoutMs, 
 
     logger.info(`[playwright.agent] Tier 1.6: overlay rect = ${JSON.stringify(overlayRect)}`);
 
-    // 4. Capture region OCR
-    const _cap = await _liteparseCapture(_page, { clip: overlayRect });
-    if (!_cap.ok || !_cap.textItems || _cap.textItems.length === 0) {
-      logger.warn(`[playwright.agent] Tier 1.6: LiteParser capture failed or empty — falling through`);
-      return { ok: false, error: 'OCR capture failed' };
+    // 4-6. OCR capture → structure → LLM pick, with smart scroll for off-screen items.
+    // If the first capture doesn't yield a confident pick, scroll the overlay (or
+    // page) by ~80% of the capture height and re-capture, up to MAX_SCROLL times.
+    // This handles long scrollable dropdowns/modals where the target row is below
+    // the fold on any site, regardless of how the overlay is implemented.
+    const MAX_SCROLL_ATTEMPTS = 3;
+    let _pickResult = null;
+    let _cap = null;
+    let rows = [];
+    let scrollAttempt = 0;
+    let _scrolledAtLeastOnce = false;
+
+    while (scrollAttempt <= MAX_SCROLL_ATTEMPTS) {
+      _cap = await _liteparseCapture(_page, { clip: overlayRect });
+      if (_cap?.ok && _cap.textItems && _cap.textItems.length > 0) {
+        rows = structureOcrOverlayItems(_cap.textItems, {
+          imageWidth: _cap.imageWidth,
+          imageHeight: _cap.imageHeight,
+        });
+        if (rows.length > 0) {
+          logger.info(`[playwright.agent] Tier 1.6: scroll=${scrollAttempt}, ${rows.length} rows:\n${formatOverlayForLLM(rows).split('\n').map(l => '  ' + l).join('\n')}`);
+          _pickResult = await pickOverlayAction(rows, goal, askWithMessages);
+          if (_pickResult?.ok) break; // confident pick — stop scrolling
+          logger.info(`[playwright.agent] Tier 1.6: scroll=${scrollAttempt} no confident pick (${_pickResult?.error || 'unknown'}) — will scroll and retry`);
+        } else {
+          logger.info(`[playwright.agent] Tier 1.6: scroll=${scrollAttempt} structured rows empty — will scroll and retry`);
+        }
+      } else {
+        logger.info(`[playwright.agent] Tier 1.6: scroll=${scrollAttempt} OCR capture empty — will scroll and retry`);
+      }
+
+      if (scrollAttempt === MAX_SCROLL_ATTEMPTS) break;
+
+      // Scroll the overlay (or page) down by ~80% of the capture height.
+      // Find the first scrollable ancestor of the overlay's center point.
+      const scrollDelta = Math.round((overlayRect.height || 300) * 0.8);
+      const scrolled = await _page.evaluate((rect, delta) => {
+        const cx = rect.x + rect.width / 2, cy = rect.y + rect.height / 2;
+        let el = document.elementFromPoint(cx, cy);
+        while (el && el !== document.body && el !== document.documentElement) {
+          const s = window.getComputedStyle(el);
+          if ((s.overflowY === 'auto' || s.overflowY === 'scroll') && el.scrollHeight > el.clientHeight + 2) {
+            const before = el.scrollTop;
+            el.scrollBy(0, delta);
+            return { scrolled: el.scrollTop !== before, target: 'overlay', delta: el.scrollTop - before };
+          }
+          el = el.parentElement;
+        }
+        // Fallback: scroll the page body
+        const before = window.scrollY;
+        window.scrollBy(0, delta);
+        return { scrolled: window.scrollY !== before, target: 'page', delta: window.scrollY - before };
+      }, overlayRect, scrollDelta).catch(() => null);
+
+      if (!scrolled || !scrolled.scrolled) {
+        logger.info(`[playwright.agent] Tier 1.6: no scrollable container found or already at bottom — stopping`);
+        break;
+      }
+      _scrolledAtLeastOnce = true;
+      logger.info(`[playwright.agent] Tier 1.6: scrolled ${scrolled.target} by ${scrolled.delta}px (attempt ${scrollAttempt + 1}/${MAX_SCROLL_ATTEMPTS})`);
+      await new Promise(r => setTimeout(r, 350)); // wait for scroll + any lazy render
+      scrollAttempt++;
     }
 
-    // 5. Structure the OCR items
-    const rows = structureOcrOverlayItems(_cap.textItems, {
-      imageWidth: _cap.imageWidth,
-      imageHeight: _cap.imageHeight,
-    });
-    if (rows.length === 0) {
-      logger.warn(`[playwright.agent] Tier 1.6: structured rows empty — falling through`);
-      return { ok: false, error: 'no structured rows' };
-    }
-
-    logger.info(`[playwright.agent] Tier 1.6: ${rows.length} structured rows:\n${formatOverlayForLLM(rows).split('\n').map(l => '  ' + l).join('\n')}`);
-
-    // 6. LLM select
-    const _pickResult = await pickOverlayAction(rows, goal, askWithMessages);
-    if (!_pickResult.ok) {
-      logger.warn(`[playwright.agent] Tier 1.6: LLM pick failed: ${_pickResult.error} — falling through`);
-      return { ok: false, error: `LLM pick failed: ${_pickResult.error}` };
+    if (!_pickResult?.ok) {
+      logger.warn(`[playwright.agent] Tier 1.6: no confident pick after ${scrollAttempt + 1} capture(s)${_scrolledAtLeastOnce ? ' (with scrolling)' : ''} — falling through`);
+      return { ok: false, error: _pickResult?.error || 'no confident pick after scrolling' };
     }
 
     // 7. Execute the LLM's decision
@@ -17109,4 +17152,7 @@ module.exports = {
   // URL comparison helpers (exported for testing)
   _urlsEqual,
   _isCanonicalRedirect,
+  // Tier 1.6 overlay interaction (exported for instruction.runner.cjs)
+  _detectOverlayRect,
+  _executeOverlayInteraction,
 };

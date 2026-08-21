@@ -4383,6 +4383,10 @@ async function browserAct(args) {
       // sidebar SPAN when the intended target is a menu item inside an open
       // "Add to playlist" submenu. General — works for any open menu/dialog.
       const menuScope = args.menuScope || null;
+      // scopeRect: when an overlay is detected but no CSS selector is available
+      // (no id/data-testid), scope candidates by bounding box instead. Works for
+      // any overlay type (menu, popup, dropdown, modal).
+      const scopeRect = args.scopeRect || null;
       if (!targetText) {
         return { ok: false, action, sessionId, error: 'clickByText: text is required', executionTime: Date.now() - start };
       }
@@ -4393,7 +4397,7 @@ async function browserAct(args) {
           { executionTime: Date.now() - start });
       }
       try {
-        const result = await _ePage.evaluate(({ text, tag, exact, shadow, scope, menuScope }) => {
+        const result = await _ePage.evaluate(({ text, tag, exact, shadow, scope, menuScope, scopeRect }) => {
           const lower = text.toLowerCase();
           // Build candidate list: tag filter + visible elements
           const candidates = [];
@@ -4422,6 +4426,19 @@ async function browserAct(args) {
                 }
               }
             }
+          }
+          // ── Scope rect filtering ──
+          // When scopeRect is provided (overlay detected by geometry but no CSS
+          // selector available), filter candidates to those whose center is within
+          // the rect. Works for any overlay type (menu, popup, dropdown, modal).
+          if (scopeRect) {
+            els = els.filter(el => {
+              const r = el.getBoundingClientRect();
+              const cx = r.left + r.width / 2;
+              const cy = r.top + r.height / 2;
+              return cx >= scopeRect.x && cx <= scopeRect.x + scopeRect.width &&
+                     cy >= scopeRect.y && cy <= scopeRect.y + scopeRect.height;
+            });
           }
           for (const el of els) {
             // Skip hidden / display:none
@@ -4482,13 +4499,23 @@ async function browserAct(args) {
             const bIsButton = b.el.tagName === 'BUTTON' || b.el.getAttribute('role') === 'button' || (b.el.tagName === 'INPUT' && (b.el.type === 'submit' || b.el.type === 'button'));
             if (aIsButton && !bIsButton) return -1;
             if (!aIsButton && bIsButton) return 1;
+            // In an overlay scope (menu, popup, dropdown, modal), prefer the
+            // outermost/row element (largest area). The inner text spans are
+            // smaller and clicking them may not trigger the row's click handler.
+            if (menuScope || scopeRect) {
+              const aRect = a.el.getBoundingClientRect();
+              const bRect = b.el.getBoundingClientRect();
+              const aArea = aRect.width * aRect.height;
+              const bArea = bRect.width * bRect.height;
+              if (aArea !== bArea) return bArea - aArea;
+            }
             return a.len - b.len;
           });
           const target = candidates[0].el;
           target.scrollIntoView({ block: 'center', behavior: 'instant' });
           target.click();
           return { ok: true, clickedText: candidates[0].text, tag: target.tagName, matchCount: candidates.length };
-        }, { text: targetText, tag: tagFilter, exact, shadow: searchShadow, scope: scopeSelector, menuScope });
+        }, { text: targetText, tag: tagFilter, exact, shadow: searchShadow, scope: scopeSelector, menuScope, scopeRect });
         if (!result.ok) {
           logger.warn(`[browser.act] clickByText "${targetText}" failed (DOM): ${result.error} — trying LiteParser coordinate fallback`);
           // LiteParser fallback: screenshot → OCR text → click at coordinates

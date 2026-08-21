@@ -33,6 +33,7 @@ const os = require('os');
 const fs = require('fs');
 const logger = require('../logger.cjs');
 const { browserAct } = require('./browser.act.cjs');
+const { askWithMessages } = require('../skill-helpers/skill-llm.cjs');
 
 const SKILLS_BASE_DIR = path.join(os.homedir(), '.thinkdrop', 'skills');
 const DEFAULT_TIMEOUT_MS = 30000;
@@ -424,6 +425,68 @@ async function fetchSkillRecord(name, timeoutMs) {
 //
 // Returns: { ok, output?, error? }
 //
+
+// ---------------------------------------------------------------------------
+// Agent skill runner: delegates to playwrightAgent with natural language instructions.
+// The agent snapshots the live DOM, finds elements by intent, and executes step-by-step.
+// No CSS selectors are stored or replayed — the agent adapts to the live page.
+// ---------------------------------------------------------------------------
+async function runAgentSkill(recipe, skillArgs, timeoutMs) {
+  const sessionId = skillArgs?.sessionId;
+  if (!sessionId) {
+    return { ok: false, error: 'Agent skill execution requires a sessionId' };
+  }
+
+  const instructions = recipe.instructions || '';
+  if (!instructions) {
+    return { ok: false, error: `Agent skill "${recipe.name}" has no instructions` };
+  }
+
+  // Build args with defaults from recipe params (use example values if arg is missing)
+  const args = { ...(skillArgs || {}) };
+  for (const p of recipe.params || []) {
+    if (args[p.name] === undefined && p.example !== undefined) {
+      args[p.name] = p.example;
+    }
+  }
+
+  // Fail fast on missing required params (don't let the agent hallucinate values)
+  for (const p of recipe.params || []) {
+    if (p.required && (args[p.name] === undefined || args[p.name] === null || args[p.name] === '')) {
+      return { ok: false, error: `Missing required parameter: ${p.name}` };
+    }
+  }
+
+  logger.info(`[external.skill] runAgentSkill: "${recipe.name}" instructions="${instructions.substring(0, 200)}" sessionId=${sessionId}`);
+
+  try {
+    // Use the deterministic instruction runner instead of the autonomous playwrightAgent.
+    // The runner parses instructions into steps, snapshots the DOM for each step,
+    // resolves elements via focused LLM calls, and executes via browserAct directly.
+    // This avoids the playwrightAgent's 12-turn loop that restarts tasks and creates
+    // duplicate actions (e.g. creating multiple playlists).
+    const { runInstructionSkill } = require('./instruction.runner.cjs');
+    const result = await runInstructionSkill({
+      instructions,
+      params: recipe.params || [],
+      skillArgs: args,
+      startUrl: recipe.startUrl,
+      sessionId,
+      timeoutMs: timeoutMs || 90000,
+    });
+
+    logger.info(`[external.skill] runAgentSkill: "${recipe.name}" ok=${result?.ok}${result?.error ? ' error=' + result.error : ''}`);
+    return {
+      ok: !!result?.ok,
+      output: result?.output || (result?.ok ? `Completed agent skill ${recipe.name}` : ''),
+      error: result?.ok ? undefined : (result.error || 'Agent skill failed'),
+    };
+  } catch (e) {
+    logger.error(`[external.skill] runAgentSkill threw: ${e.message}`);
+    return { ok: false, error: `Agent skill "${recipe.name}" failed: ${e.message}` };
+  }
+}
+
 async function runRecipeSkill(resolvedPath, skillArgs, timeoutMs) {
   let recipe;
   try {
@@ -432,14 +495,84 @@ async function runRecipeSkill(resolvedPath, skillArgs, timeoutMs) {
     return { ok: false, error: `Failed to read recipe at ${resolvedPath}: ${e.message}` };
   }
 
-  const waypoints = Array.isArray(recipe.waypoints) ? recipe.waypoints : [];
-  if (waypoints.length === 0) {
-    return { ok: false, error: `Recipe ${recipe.name} has no waypoints` };
-  }
-
   const sessionId = skillArgs?.sessionId;
   if (!sessionId) {
     return { ok: false, error: 'Recipe execution requires a sessionId' };
+  }
+
+  // ── Agent-based skill: delegate to playwrightAgent with natural language instructions ──
+  // New format: { execType: "agent", instructions: "...", params: [...], startUrl: "..." }
+  // The agent snapshots the live DOM, finds elements by intent, and executes step-by-step.
+  if (recipe.execType === 'agent' || (recipe.instructions && !Array.isArray(recipe.waypoints))) {
+    logger.info(`[external.skill] Agent skill "${recipe.name}" — delegating to playwrightAgent`);
+    return await runAgentSkill(recipe, skillArgs, timeoutMs);
+  }
+
+  // ── Composite recipe: chain multiple .skill.json files ───────────────────
+  // A composite .recipe.json has a `skills: [{ skill: "name.skill" }]` array
+  // referencing other skill files in the same directory. We run each in order,
+  // passing paramFlow between them (extract returns feed the next skill's args).
+  if (Array.isArray(recipe.skills) && recipe.skills.length > 0 && !Array.isArray(recipe.waypoints)) {
+    logger.info(`[external.skill] Composite recipe "${recipe.name}" — chaining ${recipe.skills.length} skill(s)`);
+    const recipeDir = path.dirname(resolvedPath);
+    const chainArgs = { ...(skillArgs || {}) };
+
+    // Initialize args with defaults from recipe params
+    for (const p of recipe.params || []) {
+      if (chainArgs[p.name] === undefined && p.example !== undefined) {
+        chainArgs[p.name] = p.example;
+      }
+    }
+
+    let totalWaypoints = 0;
+    for (let i = 0; i < recipe.skills.length; i++) {
+      const skillRef = recipe.skills[i];
+      const skillName = skillRef.skill || skillRef.name;
+      if (!skillName) {
+        return { ok: false, error: `Composite recipe ${recipe.name}: skill #${i + 1} has no name` };
+      }
+
+      // Resolve the referenced skill file from the same directory
+      const skillFileCandidates = [
+        path.join(recipeDir, `${skillName}.json`),
+        path.join(recipeDir, `${skillName}.skill.json`),
+        path.join(recipeDir, `${skillName}.recipe.json`),
+      ];
+      let skillFilePath = null;
+      for (const candidate of skillFileCandidates) {
+        if (fs.existsSync(candidate)) { skillFilePath = candidate; break; }
+      }
+      if (!skillFilePath) {
+        return { ok: false, error: `Composite recipe ${recipe.name}: skill "${skillName}" not found in ${recipeDir}` };
+      }
+
+      logger.info(`[external.skill] Composite recipe step ${i + 1}/${recipe.skills.length}: running ${skillName} from ${skillFilePath}`);
+
+      // Run the referenced skill (which may itself be a single-skill .skill.json
+      // or a nested composite .recipe.json — recursion handles both)
+      const subResult = await runRecipeSkill(skillFilePath, chainArgs, timeoutMs);
+      if (!subResult.ok) {
+        return { ok: false, error: `Composite recipe ${recipe.name} failed at skill "${skillName}": ${subResult.error}` };
+      }
+
+      totalWaypoints += subResult.waypointCount || 0;
+
+      // Propagate extract returns into chainArgs for the next skill
+      if (subResult.returns && typeof subResult.returns === 'object') {
+        for (const [key, val] of Object.entries(subResult.returns)) {
+          chainArgs[key] = val;
+        }
+        logger.info(`[external.skill] Composite recipe: propagated returns from ${skillName}: ${Object.keys(subResult.returns).join(', ')}`);
+      }
+    }
+
+    return { ok: true, output: `Completed composite recipe ${recipe.name} (${recipe.skills.length} skills, ${totalWaypoints} waypoints)`, waypointCount: totalWaypoints };
+  }
+
+  // ── Single-skill recipe: run waypoints directly ──────────────────────────
+  const waypoints = Array.isArray(recipe.waypoints) ? recipe.waypoints : [];
+  if (waypoints.length === 0) {
+    return { ok: false, error: `Recipe ${recipe.name} has no waypoints and no chained skills` };
   }
 
   // Build args with defaults from recipe params
@@ -466,55 +599,178 @@ async function runRecipeSkill(resolvedPath, skillArgs, timeoutMs) {
   }
 
   const actionTimeout = Math.min(timeoutMs || 15000, 30000);
+  const returns = {};
 
   for (const wp of effectiveWaypoints) {
-    const selector = wp.selector || (wp.altSelectors && wp.altSelectors[0]) || '';
     const value = resolveValue(wp.value || '');
 
-    let actionArgs = { sessionId, timeoutMs: actionTimeout };
-    if (selector) actionArgs.selector = selector;
+    // Navigate waypoints don't need selector resolution
+    if (wp.type === 'navigate') {
+      try {
+        const res = await browserAct({ sessionId, action: 'navigate', url: wp.url || recipe.startUrl, timeoutMs: actionTimeout });
+        if (res && !res.ok) {
+          return { ok: false, error: `Waypoint ${wp.step} (navigate) failed: ${res.error || 'unknown'}` };
+        }
+      } catch (e) {
+        return { ok: false, error: `Waypoint ${wp.step} (navigate) threw: ${e.message}` };
+      }
+      continue;
+    }
 
-    try {
-      let res;
-      switch (wp.type) {
-        case 'navigate':
-          res = await browserAct({ ...actionArgs, action: 'navigate', url: wp.url || recipe.startUrl, timeoutMs: actionTimeout });
-          break;
-        case 'click':
-        case 'dblclick':
-        case 'rightclick':
-          res = await browserAct({ ...actionArgs, action: 'click', timeoutMs: actionTimeout });
-          break;
-        case 'fill':
-          res = await browserAct({ ...actionArgs, action: 'fill', text: value, timeoutMs: actionTimeout });
-          break;
-        case 'paste':
-          res = await browserAct({ ...actionArgs, action: 'type', text: value, timeoutMs: actionTimeout });
-          break;
-        case 'select':
-          res = await browserAct({ ...actionArgs, action: 'select', value, timeoutMs: actionTimeout });
-          break;
-        case 'check':
-          res = await browserAct({ ...actionArgs, action: 'check', checked: !!wp.checked, timeoutMs: actionTimeout });
-          break;
-        case 'submit':
-          res = await browserAct({ ...actionArgs, action: 'press', key: 'Enter', timeoutMs: actionTimeout });
-          break;
-        case 'keycombo':
-          res = await browserAct({ ...actionArgs, action: 'press', key: wp.key || 'Enter', timeoutMs: actionTimeout });
-          break;
-        default:
-          return { ok: false, error: `Unknown waypoint type: ${wp.type}` };
+    // Extract waypoints — not yet implemented
+    if (wp.type === 'extract') {
+      logger.info(`[external.skill] Extract waypoint ${wp.step} skipped in runtime (not yet implemented)`);
+      continue;
+    }
+
+    // Build candidate selectors: primary + all altSelectors
+    const selectors = [wp.selector, ...(wp.altSelectors || [])].filter(Boolean);
+
+    // Determine the browserAct action and extra args for this waypoint type
+    const actionMap = {
+      click:     { action: 'click',  extraArgs: {} },
+      dblclick:  { action: 'click',  extraArgs: {} },
+      rightclick:{ action: 'click',  extraArgs: {} },
+      fill:      { action: 'fill',   extraArgs: { text: value } },
+      paste:     { action: 'type',   extraArgs: { text: value } },
+      select:    { action: 'select', extraArgs: { value } },
+      check:     { action: 'check',  extraArgs: { checked: !!wp.checked } },
+      submit:    { action: 'press',  extraArgs: { key: 'Enter' } },
+      keycombo:  { action: 'press',  extraArgs: { key: wp.key || 'Enter' } },
+    };
+    const actionInfo = actionMap[wp.type];
+    if (!actionInfo) {
+      return { ok: false, error: `Unknown waypoint type: ${wp.type}` };
+    }
+
+    let res = null;
+    let lastError = '';
+
+    // ── Fast path: try each candidate selector ──────────────────────────
+    for (const sel of selectors) {
+      try {
+        res = await browserAct({ sessionId, selector: sel, action: actionInfo.action, ...actionInfo.extraArgs, timeoutMs: actionTimeout });
+        if (res && res.ok) break;
+        lastError = res?.error || 'not found';
+      } catch (e) {
+        lastError = e.message;
       }
-      if (res && !res.ok) {
-        return { ok: false, error: `Waypoint ${wp.step} (${wp.type}) failed: ${res.error || 'unknown'}` };
+    }
+
+    // ── LLM path: if all selectors failed, find element by intent ───────
+    if (!res || !res.ok) {
+      const intent = wp.intent || (wp.elementText ? `${wp.type} the "${wp.elementText}" element` : null);
+      if (intent) {
+        logger.info(`[external.skill] Waypoint ${wp.step} (${wp.type}): all ${selectors.length} selector(s) failed — trying LLM intent resolution`);
+        try {
+          const ref = await _resolveElementByIntent(sessionId, intent, wp.elementText, wp.type, actionTimeout);
+          if (ref) {
+            logger.info(`[external.skill] LLM resolved intent to ref=${ref}`);
+            res = await browserAct({ sessionId, selector: ref, action: actionInfo.action, ...actionInfo.extraArgs, timeoutMs: actionTimeout });
+            if (!res || !res.ok) {
+              lastError = res?.error || `LLM ref ${ref} failed`;
+            }
+          } else {
+            lastError = `LLM could not find element for intent: "${intent}"`;
+          }
+        } catch (e) {
+          lastError = `LLM resolution error: ${e.message}`;
+        }
       }
-    } catch (e) {
-      return { ok: false, error: `Waypoint ${wp.step} (${wp.type}) threw: ${e.message}` };
+    }
+
+    if (!res || !res.ok) {
+      const triedCount = selectors.length + (wp.intent || wp.elementText ? 1 : 0);
+      return { ok: false, error: `Waypoint ${wp.step} (${wp.type}) failed: tried ${triedCount} approach(es) — ${lastError}` };
+    }
+
+    // ── Verify expectedResult (if present) ──────────────────────────────
+    // For click waypoints with expectedResult: { type: "url_pattern", pattern: "/playlist/*" }
+    // Wait briefly for navigation, then check if the URL matches the pattern.
+    if (wp.expectedResult && wp.expectedResult.type === 'url_pattern') {
+      const pattern = wp.expectedResult.pattern;
+      try {
+        // Wait 2 seconds for navigation to settle
+        await new Promise(r => setTimeout(r, 2000));
+        const urlRes = await browserAct({ action: 'getPageText', sessionId, timeoutMs: 5000 });
+        // getPageText doesn't give us the URL — use a snapshot which includes URL
+        const snapRes = await browserAct({ action: 'snapshot', sessionId, headed: true, timeoutMs: 5000 });
+        const currentUrl = snapRes?.url || snapRes?.result?.match(/URL:\s*(\S+)/)?.[1] || '';
+        if (currentUrl) {
+          // Convert pattern to regex: /playlist/* → /playlist/[^/]+
+          const regex = new RegExp(pattern.replace(/\*/g, '[^/?]+').replace(/[.+?^${}()|[\]\\]/g, '\\$&').replace(/\\\*/g, '[^/?]+'));
+          if (!regex.test(currentUrl)) {
+            logger.warn(`[external.skill] Waypoint ${wp.step}: expectedResult pattern ${pattern} did not match URL ${currentUrl} — continuing anyway`);
+          } else {
+            logger.info(`[external.skill] Waypoint ${wp.step}: expectedResult pattern ${pattern} matched URL ${currentUrl}`);
+          }
+        }
+      } catch (e) {
+        logger.warn(`[external.skill] Waypoint ${wp.step}: expectedResult verification error: ${e.message}`);
+      }
     }
   }
 
-  return { ok: true, output: `Completed ${effectiveWaypoints.length} waypoints for ${recipe.name}` };
+  return { ok: true, output: `Completed ${effectiveWaypoints.length} waypoints for ${recipe.name}`, waypointCount: effectiveWaypoints.length, returns };
+}
+
+// ---------------------------------------------------------------------------
+// LLM element resolution: snapshot DOM → ask LLM to find element by intent
+// Returns a tdN ref string, or null if the LLM can't find a matching element.
+// Uses browser-engine.cjs's buildRefTree via browserAct({ action: 'snapshot' }).
+// ---------------------------------------------------------------------------
+async function _resolveElementByIntent(sessionId, intent, elementText, actionType, timeoutMs) {
+  // Take a DOM snapshot — this tags elements with tdN refs and returns YAML
+  const snapResult = await browserAct({ action: 'snapshot', sessionId, headed: true, timeoutMs: Math.min(timeoutMs, 10000) });
+  if (!snapResult || !snapResult.ok) {
+    logger.warn(`[external.skill] LLM resolution: snapshot failed — ${snapResult?.error || 'unknown'}`);
+    return null;
+  }
+
+  const snapshotYaml = snapResult.result || snapResult.stdout || '';
+  if (!snapshotYaml || snapshotYaml.length < 10) {
+    logger.warn(`[external.skill] LLM resolution: empty snapshot`);
+    return null;
+  }
+
+  // Trim snapshot to avoid token explosion (keep first 4000 chars)
+  const trimmedSnapshot = snapshotYaml.length > 4000
+    ? snapshotYaml.slice(0, 4000) + '\n... (truncated)'
+    : snapshotYaml;
+
+  const systemPrompt = `You find a specific UI element on a web page. You will be given:
+1. An intent describing what element to interact with
+2. A DOM snapshot with element refs (tdN format)
+
+Return ONLY a JSON object (no markdown, no explanation):
+{"ref": "tdN", "confidence": "high|medium|low"}
+
+If no matching element exists, return: {"ref": null}`;
+
+  const userPrompt = `I need to ${intent}.
+
+Current page snapshot:
+${trimmedSnapshot}
+
+Which element should I interact with? Return the ref (e.g. td5).`;
+
+  try {
+    const response = await askWithMessages([
+      { role: 'system', content: systemPrompt },
+      { role: 'user', content: userPrompt },
+    ], { temperature: 0, maxTokens: 50, responseTimeoutMs: 10000 });
+
+    const raw = (response || '').trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '');
+    const parsed = JSON.parse(raw);
+    if (parsed.ref && typeof parsed.ref === 'string') {
+      return parsed.ref;
+    }
+    logger.info(`[external.skill] LLM resolution: no ref returned for intent "${intent}"`);
+    return null;
+  } catch (e) {
+    logger.warn(`[external.skill] LLM resolution parse error: ${e.message}`);
+    return null;
+  }
 }
 
 // ── Project skill runner ───────────────────────────────────────────────────────
@@ -664,7 +920,7 @@ async function _findFreePort(preferredPort) {
 }
 
 async function run(args) {
-  const { name, args: skillArgs, timeoutMs: rawTimeout, secretKeys, ...flatRest } = args || {};
+  const { name, args: skillArgs, timeoutMs: rawTimeout, secretKeys, execPath: directExecPath, ...flatRest } = args || {};
   const timeoutMs = Math.min(rawTimeout || DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS);
   // Defense-in-depth: LLMs sometimes emit skill params flat alongside "name" instead of
   // nesting them under "args". Merge any unknown top-level keys into skillArgs so the
@@ -677,7 +933,50 @@ async function run(args) {
     return { ok: false, error: 'external.skill requires args.name (the skill name to execute)' };
   }
 
-  logger.info(`[external.skill] Executing skill: ${name}`);
+  logger.info(`[external.skill] Executing skill: ${name}${directExecPath ? ` (direct execPath: ${directExecPath})` : ''}`);
+
+  // ── Direct execPath override ──────────────────────────────────────────────
+  // When the caller supplies an absolute execPath (e.g. the training preview
+  // runner pointing at a temp .skill.json), skip the user-memory / disk lookup
+  // and use it directly. The path must still pass validateExecPath for safety.
+  if (directExecPath) {
+    let resolvedDirectPath;
+    try {
+      resolvedDirectPath = validateExecPath(directExecPath);
+    } catch (err) {
+      return { ok: false, skillName: name, error: `Invalid direct execPath "${directExecPath}": ${err.message}` };
+    }
+    logger.info(`[external.skill] Using direct execPath override: ${resolvedDirectPath}`);
+
+    // Infer execType from extension
+    const ext = path.extname(resolvedDirectPath).toLowerCase();
+    let directExecType = 'recipe';
+    if (ext === '.cjs' || ext === '.js') directExecType = 'node';
+    else if (ext === '.py') directExecType = 'python';
+    else if (ext === '.sh') directExecType = 'shell';
+
+    try {
+      let result;
+      if (directExecType === 'recipe') {
+        result = await runRecipeSkill(resolvedDirectPath, mergedSkillArgs, timeoutMs);
+      } else if (directExecType === 'node') {
+        const context = await buildSkillContext(name, [], []);
+        result = await runNodeSkill(resolvedDirectPath, mergedSkillArgs, timeoutMs, context);
+      } else if (directExecType === 'python') {
+        const context = await buildSkillContext(name, [], []);
+        result = await runPythonSkill(resolvedDirectPath, mergedSkillArgs, timeoutMs, context);
+      } else if (directExecType === 'shell') {
+        result = await runShellSkill(resolvedDirectPath, mergedSkillArgs, timeoutMs);
+      } else {
+        return { ok: false, skillName: name, error: `Unknown direct execType "${directExecType}"` };
+      }
+      logger.info(`[external.skill] Direct execPath result: ok=${result?.ok}${result?.error ? ` error=${result.error}` : ''}`);
+      return { ...result, skillName: name };
+    } catch (e) {
+      logger.error(`[external.skill] Direct execPath threw: ${e.message}`);
+      return { ok: false, skillName: name, error: `Direct execPath failed: ${e.message}` };
+    }
+  }
 
   let skillRecord;
   let skillSource = 'user-memory';
@@ -907,7 +1206,11 @@ async function run(args) {
       _reportRuntimeFailure(name, result.error, resolvedPath).catch(() => {});
     }
 
-    logger.info(`[external.skill] Skill "${name}" completed successfully`);
+    if (result && result.ok) {
+      logger.info(`[external.skill] Skill "${name}" completed successfully`);
+    } else {
+      logger.warn(`[external.skill] Skill "${name}" completed with error: ${result?.error || 'unknown'}`);
+    }
     return { ...result, skillName: name, execType };
   } catch (err) {
     logger.error(`[external.skill] Skill "${name}" failed: ${err.message}`);

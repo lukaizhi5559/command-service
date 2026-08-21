@@ -300,6 +300,55 @@ const CDP_RECORDER_SCRIPT = `
     return raw;
   }
 
+  // Clean elementText: prefer aria-label, then the longest clean child/leaf label,
+  // then normalized innerText. Avoid concatenating multiple child labels.
+  function cleanElementText(el) {
+    var aria = el.getAttribute('aria-label');
+    if (aria && aria.trim()) return trimWordBoundary(aria.trim().replace(/\s+/g, ' '), 80);
+
+    // Collect all leaf text candidates: direct text nodes and leaf span/label/p/div children
+    var candidates = [];
+
+    // Direct text nodes
+    for (var i = 0; i < el.childNodes.length; i++) {
+      var node = el.childNodes[i];
+      if (node.nodeType === 3) {
+        var t = node.textContent.trim();
+        if (t) candidates.push(t);
+      }
+    }
+
+    // Leaf child elements (no element children of their own)
+    var children = el.querySelectorAll('span, label, div, p, h1, h2, h3, h4, h5, h6');
+    for (var i = 0; i < children.length; i++) {
+      var child = children[i];
+      if (child.children.length > 0) continue; // only leaves
+      var t = (child.innerText || child.textContent || '').trim();
+      if (t) candidates.push(t);
+    }
+
+    var firstText = '';
+    if (candidates.length > 0) {
+      // Prefer the longest leaf text that looks like a description (not a short header)
+      candidates.sort(function(a, b) { return b.length - a.length; });
+      firstText = candidates[0];
+    }
+
+    if (!firstText) firstText = (el.innerText || '').trim();
+
+    // Normalize whitespace and strip counter patterns
+    firstText = firstText.replace(/\s+/g, ' ');
+    firstText = firstText.replace(/\\s*\\d+\\/\\d+/g, '').replace(/\\s*\\+\\s*$/g, '').trim();
+    return trimWordBoundary(firstText, 80);
+  }
+
+  function trimWordBoundary(text, max) {
+    if (!text || text.length <= max) return text;
+    var cut = text.lastIndexOf(' ', max);
+    if (cut < max / 2) cut = max; // if no good cut found, take up to max
+    return text.substring(0, cut).trim();
+  }
+
   // ── Checkbox / Radio ──────────────────────────────────────────────────────
   document.addEventListener('click', function(e) {
     var el = e.target;
@@ -322,7 +371,7 @@ const CDP_RECORDER_SCRIPT = `
     var el = getClickTarget(raw);
     var selector = getSelector(el);
     if (selector === 'body' || selector === 'html') return;
-    var text = (el.textContent || '').trim().substring(0, 60);
+    var text = cleanElementText(el);
     var href = el.href || (el.closest('a') || {}).href || '';
     window.__tdTrainEvents.push({
       type: 'click', selector: selector, altSelectors: getAltSelectors(el),
@@ -340,7 +389,7 @@ const CDP_RECORDER_SCRIPT = `
     if (selector === 'body' || selector === 'html') return;
     window.__tdTrainEvents.push({
       type: 'dblclick', selector: selector, altSelectors: getAltSelectors(el),
-      elementText: (el.textContent || '').trim().substring(0, 60),
+      elementText: cleanElementText(el),
       elementTag: el.tagName.toLowerCase(),
       url: location.href, timestamp: Date.now()
     });
@@ -426,10 +475,13 @@ const CDP_RECORDER_SCRIPT = `
     _inputTimers[selector] = setTimeout(function() {
       var value = el.value !== undefined ? el.value : (el.innerText || el.textContent || '');
       if (!value) return; // skip empty
+      var fieldLabel = (el.getAttribute('aria-label') || el.placeholder || el.getAttribute('name') || el.getAttribute('id') || '').trim();
       window.__tdTrainEvents.push({
         type: isRange ? 'fill' : (el.tagName === 'SELECT' ? 'select' : 'fill'),
         selector: selector, altSelectors: getAltSelectors(el),
         value: String(value).substring(0, 2000),
+        elementText: cleanElementText(el) || fieldLabel,
+        placeholder: el.placeholder || '',
         elementTag: el.tagName.toLowerCase(),
         url: location.href, timestamp: Date.now()
       });
@@ -446,10 +498,14 @@ const CDP_RECORDER_SCRIPT = `
     // it, and without this both the debounced input fill AND the change fill get
     // pushed, producing a doubled fill step in the recording.
     if (_inputTimers[selector]) { clearTimeout(_inputTimers[selector]); delete _inputTimers[selector]; }
+    var fieldLabel = (el.getAttribute('aria-label') || el.placeholder || el.getAttribute('name') || el.getAttribute('id') || '').trim();
     window.__tdTrainEvents.push({
       type: el.tagName === 'SELECT' ? 'select' : 'fill',
       selector: selector, altSelectors: getAltSelectors(el),
-      value: el.value, elementTag: el.tagName.toLowerCase(),
+      value: el.value,
+      elementText: cleanElementText(el) || fieldLabel,
+      placeholder: el.placeholder || '',
+      elementTag: el.tagName.toLowerCase(),
       url: location.href, timestamp: Date.now()
     });
   }, true);
@@ -618,9 +674,13 @@ const CDP_RECORDER_SCRIPT = `
       root.__tdInputTimers[selector] = setTimeout(function() {
         var value = el.value !== undefined ? el.value : (el.innerText || el.textContent || '');
         if (!value) return;
+        var fieldLabel = (el.getAttribute('aria-label') || el.placeholder || el.getAttribute('name') || el.getAttribute('id') || '').trim();
         window.__tdTrainEvents.push({
           type: 'fill', selector: selector, altSelectors: getAltSelectors(el),
-          value: String(value).substring(0, 2000), elementTag: el.tagName.toLowerCase(),
+          value: String(value).substring(0, 2000),
+          elementText: cleanElementText(el) || fieldLabel,
+          placeholder: el.placeholder || '',
+          elementTag: el.tagName.toLowerCase(),
           url: location.href, inShadow: true, timestamp: Date.now()
         });
       }, 800);
@@ -1038,8 +1098,34 @@ async function _injectRecorderScript(session, tabIndex) {
   if (engineInjected) return;
 
   // ── CLI fallback: run-code + addScriptTag (no exposeFunction available) ─────
+  // The CLI path can't use context.exposeBinding, so we use page.exposeFunction
+  // to create window.__tdPushEvent as a binding that forwards events to the HTTP
+  // server. This bypasses CSP (which blocks fetch to http://127.0.0.1 on Spotify
+  // and many modern sites). If exposeFunction fails (e.g. already exposed), the
+  // recorder script's fetch fallback still works on sites without strict CSP.
   const scriptJson = JSON.stringify(script);
   const injectCode = `async page => {
+    // Set up __tdPushEvent binding BEFORE injecting the recorder script.
+    // page.exposeFunction creates a CDP binding that bypasses CSP.
+    try {
+      await page.exposeFunction('__tdPushEvent', (evt) => {
+        try {
+          const http = require('http');
+          const data = JSON.stringify(evt);
+          const req = http.request('http://127.0.0.1:${httpPort}/e', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(data) },
+          });
+          req.on('error', () => {});
+          req.write(data);
+          req.end();
+        } catch(_) {}
+        return 'ok';
+      });
+    } catch(e) {
+      // exposeFunction throws if already exposed — that's fine, the binding still works
+    }
+
     const src = ${scriptJson};
 
     // Use addScriptTag on first inject; fall back to evaluate for re-injects after nav
@@ -2006,11 +2092,19 @@ async function actionPreviewSplit(args) {
       logger.info(`[trainer.agent] _autoSplitEvents rejected: ${actions.reason}`);
       return { ok: false, rejected: true, reason: actions.reason || 'Could not understand the recorded actions' };
     }
-    const collapsed = _collapseNavigation(session.rawEvents);
+    // For instruction-based skills, don't use _collapseNavigation (which drops
+    // essential clicks like "open dropdown menu" before a dynamic-URL navigation).
+    // Instead, pass raw events to _buildInstructionSkill, which already cleans
+    // noise via _cleanEventsForInstruction and lets the LLM identify essential steps.
+    const collapsed = session.rawEvents;
 
     if (actions.length <= 1) {
       // Single action — no split needed
-      const skillPreview = await _buildSkillPreview(session, collapsed, 0, collapsed.length, skillName, actions[0]);
+      const skillPreview = await _buildInstructionSkill(session, collapsed, 0, collapsed.length, skillName, actions[0]);
+      if (skillPreview.rejected) {
+        session.previewInProgress = false;
+        return { ok: false, rejected: true, reason: skillPreview.reason };
+      }
       session.previewInProgress = false;
       return { ok: true, agentId, singleAction: true, skills: [skillPreview], recipe: null };
     }
@@ -2024,7 +2118,11 @@ async function actionPreviewSplit(args) {
       const action = actions[i];
       const actionEvents = collapsed.slice(action.eventStart, action.eventEnd);
       const actionSkillName = `${baseName}.${action.name.replace(/\s+/g, '_').toLowerCase()}.skill`;
-      const skillPreview = await _buildSkillPreview(session, actionEvents, action.eventStart, action.eventEnd, actionSkillName, action);
+      const skillPreview = await _buildInstructionSkill(session, actionEvents, action.eventStart, action.eventEnd, actionSkillName, action);
+      if (skillPreview.rejected) {
+        session.previewInProgress = false;
+        return { ok: false, rejected: true, reason: skillPreview.reason };
+      }
       skills.push(skillPreview);
     }
 
@@ -2063,7 +2161,259 @@ async function actionPreviewSplit(args) {
   }
 }
 
-// Build a skill preview from a segment of events
+// Clean noisy recording events before generating instructions.
+// Drops hover/focus/drag noise, merges duplicate fills, dedupes rapid clicks.
+function _cleanEventsForInstruction(events) {
+  const cleaned = [];
+  const DROP_TYPES = new Set(['hover', 'focus', 'drag', 'blur', 'scroll']);
+  let lastClickKey = null;
+  let lastClickTime = 0;
+  let lastFillKey = null;
+  let lastFillTime = 0;
+  let lastNavUrl = null;
+
+  for (const evt of events) {
+    // Drop noise events entirely
+    if (DROP_TYPES.has(evt.type)) continue;
+
+    // Dedupe consecutive navigates to the same URL
+    if (evt.type === 'navigate') {
+      const url = (evt.url || '').split('?')[0]; // ignore query params
+      if (url === lastNavUrl) continue;
+      lastNavUrl = url;
+      cleaned.push(evt);
+      continue;
+    }
+
+    // Dedupe rapid clicks on the same element (within 800ms)
+    if (evt.type === 'click') {
+      const key = `${evt.selector || ''}|${evt.elementText || ''}`;
+      const now = evt.timestamp || 0;
+      if (key === lastClickKey && now - lastClickTime < 800) continue;
+      lastClickKey = key;
+      lastClickTime = now;
+      cleaned.push(evt);
+      continue;
+    }
+
+    // Merge rapid fills on the same field (within 2s) — keep only the latest value
+    if (evt.type === 'fill' || evt.type === 'paste') {
+      const key = `${evt.selector || ''}`;
+      const now = evt.timestamp || 0;
+      if (key === lastFillKey && now - lastFillTime < 2000) {
+        // Replace the last fill's value with this one
+        const last = cleaned[cleaned.length - 1];
+        if (last && (last.type === 'fill' || last.type === 'paste') && (last.selector || '') === key) {
+          if (evt.type === 'fill') last.value = evt.value;
+          else last.text = evt.text;
+          lastFillTime = now;
+          continue;
+        }
+      }
+      lastFillKey = key;
+      lastFillTime = now;
+      cleaned.push(evt);
+      continue;
+    }
+
+    // Keep all other event types (submit, select, check, keycombo, dblclick)
+    cleaned.push(evt);
+  }
+
+  return cleaned;
+}
+
+// Build an instruction-based skill preview from a segment of events.
+// Instead of generating CSS-selector waypoints, this calls the LLM to convert
+// the raw browser interactions into a natural language instruction that
+// playwrightAgent can execute against the live DOM at runtime.
+async function _buildInstructionSkill(session, events, eventStart, eventEnd, skillName, action) {
+  // Clean noise from the recording before generating instructions
+  const segmentEvents = _cleanEventsForInstruction(events);
+
+  // Filter out all navigate events except the first one before sending to the LLM
+  let navigateCount = 0;
+  const filteredEvents = segmentEvents.filter(e => {
+    if (e.type === 'navigate') {
+      if (navigateCount === 0) { navigateCount++; return true; }
+      return false;
+    }
+    return true;
+  });
+
+  // Build a human-readable event summary for the LLM (no selectors — just intent)
+  // Use the recorded elementText as-is (cleaned by the browser recorder) and include field labels for fill
+  const eventSummary = filteredEvents.map((e, i) => {
+    switch (e.type) {
+      case 'navigate': return `${i + 1}. Started at ${e.url}`;
+      case 'click': {
+        const text = (e.elementText || 'an element').trim();
+        return `${i + 1}. Clicked "${text}"`;
+      }
+      case 'dblclick': {
+        const text = (e.elementText || 'an element').trim();
+        return `${i + 1}. Double-clicked "${text}"`;
+      }
+      case 'fill': {
+        const fieldName = (e.elementText || e.placeholder || 'a text field').trim();
+        return `${i + 1}. Typed "${(e.value || '').substring(0, 80)}" into the "${fieldName}" field`;
+      }
+      case 'paste': return `${i + 1}. Pasted text into the "${(e.elementText || e.placeholder || 'a field').trim()}" field`;
+      case 'select': return `${i + 1}. Selected "${e.value || ''}" from the "${(e.elementText || 'dropdown').trim()}" dropdown`;
+      case 'check': return `${i + 1}. ${e.checked ? 'Checked' : 'Unchecked'} "${e.label || 'a checkbox'}"`;
+      case 'submit': return `${i + 1}. Submitted a form`;
+      case 'keycombo': return `${i + 1}. Pressed ${e.key || 'Enter'}${e.ctrl ? ' + Ctrl/Meta' : ''}`;
+      default: return null;
+    }
+  }).filter(Boolean).join('\n');
+
+  const trainTask = session.trainTask || action?.description || '';
+
+  const prompt = `You are writing STEP-BY-STEP INSTRUCTIONS for an AI agent that will perform this task on the same website.
+
+The user recorded themselves performing the task once. Here is what they did (each "Clicked" line uses the exact text of the element that was clicked):
+${eventSummary}
+
+${trainTask ? `The task was: "${trainTask}"\n` : ''}Write instructions the agent can follow. The agent will start at the startUrl and read the live DOM. Every "Click" step MUST use text that actually exists on the page or in a dropdown/modal — the agent matches by exact or partial element text.
+
+CRITICAL RULES:
+1. Use the EXACT text of the element that was clicked. Do NOT invent vague descriptions like "the playlist you wish to edit" or "the playlist title" or "the field". If the event says Clicked "Church Music", write "Click "Church Music"". If it says Clicked "Edit details", write "Click "Edit details"".
+2. ONLY the startUrl is a literal URL. Do NOT include any other "Navigate to" steps — if a click causes a page change, the agent will follow it automatically. Never hardcode dynamic URLs like /playlist/<id> from the recording.
+3. If the recording starts already on a page (e.g. already on a specific playlist page), the first step is the first click recorded on that page — NOT a step about selecting the playlist or navigating there again.
+4. Replace any value the user would change each time (names, titles, messages, search queries) with a {{param_name}} placeholder. Add each to the params array with a description and example.
+5. Keep static values (button labels, fixed menu items, playlist names, headings) as-is — do NOT parameterize them.
+6. KEEP IT SHORT — only the essential steps. A typical skill is 3-5 steps, NOT 7+.
+7. Drop duplicate actions (e.g. clicking "Edit details" twice is a recording artifact).
+8. Drop optional cosmetic steps (e.g. "Choose photo") unless they are the core task.
+9. MERGE multiple fills on the same field into a single "Type" step with the final value.
+10. Do NOT merge sequential clicks that open menus/dialogs. If the user clicked "Create" then clicked "Create a playlist" from the dropdown, keep BOTH as separate steps.
+11. Use EXACTLY these action formats (one action per sentence, separated by ". "):
+    - Click the "X" button
+    - Click "X"
+    - Type "{{param_name}}" into the "Field Name" field
+    - Type "{{param_name}}" into the "Name" field (use the real field label from the recording)
+    - Select "value" from the "Dropdown" dropdown
+    - Press Enter
+    - Check "X"
+    - Submit the form
+12. If the recording contains multiple unrelated actions, return rejected: true.
+
+GOOD example: "Click the "Create" button. Click "Create a playlist". Click "Name & details". Type "{{playlist_name}}" into the "Name" field. Click "Save"."
+GOOD example: "Click "Church Music". Click "Edit details". Type "{{playlist_name}}" into the "Name" field. Click "Save"."
+BAD example: "Click the playlist you wish to edit. Click the playlist title to open the edit details dialog. Type "{{playlist_name}}" into the text field. Click "Save"."
+
+Output ONLY valid JSON:
+{
+  "name": "${skillName}",
+  "description": "<one sentence describing what this skill does>",
+  "params": [{ "name": "param_name", "type": "string", "required": true, "description": "...", "example": "..." }],
+  "instructions": "<generic step-by-step guide with {{param}} placeholders>",
+  "startUrl": "<initial URL where the agent should start>",
+  "rejected": false
+}
+
+If the recording is too chaotic or contains multiple unrelated actions:
+{ "rejected": true, "reason": "This recording contains multiple actions. Please record one action at a time." }`;
+
+  try {
+    logger.info(`[trainer.agent] _buildInstructionSkill: calling LLM for ${segmentEvents.length} events, skillName="${skillName}"`);
+    const response = await askWithMessages([
+      { role: 'system', content: 'You convert browser recordings into clear instructions for AI agents. Output ONLY valid JSON.' },
+      { role: 'user', content: prompt },
+    ], { maxTokens: 1000, temperature: 0.2, responseTimeoutMs: 20000 });
+
+    if (session.cancelRequested) {
+      return { rejected: true, reason: 'Cancelled by user' };
+    }
+
+    let json = (response || '').trim().replace(/^```(?:json)?\s*\n?/i, '').replace(/\n?```\s*$/, '');
+    const parsed = JSON.parse(json);
+
+    if (parsed.rejected) {
+      return { rejected: true, reason: parsed.reason || 'Could not understand the recording' };
+    }
+
+    // Ensure required fields
+    const result = {
+      id: `skill_${eventStart}_${eventEnd}`,
+      name: skillName,
+      description: parsed.description || action?.description || skillName,
+      eventStart,
+      eventEnd,
+      instructions: parsed.instructions || '',
+      params: parsed.params || [],
+      startUrl: parsed.startUrl || session.startUrl,
+      execType: 'agent',
+    };
+
+    logger.info(`[trainer.agent] _buildInstructionSkill: generated ${result.instructions.length} chars of instructions, ${result.params.length} params`);
+    return result;
+  } catch (e) {
+    logger.warn(`[trainer.agent] _buildInstructionSkill LLM failed: ${e.message} — falling back to heuristic instructions`);
+    // Fallback: build simple instructions from events
+    return _buildInstructionFallback(session, segmentEvents, eventStart, eventEnd, skillName, action);
+  }
+}
+
+// Heuristic fallback: build instructions from events without LLM
+function _buildInstructionFallback(session, events, eventStart, eventEnd, skillName, action) {
+  // Clean noise from the recording first
+  const cleanedEvents = _cleanEventsForInstruction(events);
+  const steps = [];
+  const params = [];
+  const usedParamNames = new Set();
+
+  for (const evt of cleanedEvents) {
+    if (evt.type === 'navigate') {
+      steps.push(`Navigate to ${evt.url}`);
+    } else if (evt.type === 'click' && evt.elementText) {
+      steps.push(`Click the "${evt.elementText}" button`);
+    } else if (evt.type === 'dblclick') {
+      steps.push(`Double-click "${evt.elementText || 'the element'}"`);
+    } else if (evt.type === 'fill') {
+      const val = evt.value || '';
+      // Treat as param if non-static
+      const isStatic = /^https?:\/\//i.test(val) || /^[\w.+-]+@[\w-]+\.\w+$/.test(val) || /^\d+$/.test(val) || val.length < 3;
+      if (isStatic) {
+        steps.push(`Type "${val}" into the text field`);
+      } else {
+        let paramName = 'value';
+        const placeholder = evt.altSelectors?.find(s => s.includes('placeholder='))?.match(/placeholder="([^"]+)"/)?.[1];
+        if (placeholder) paramName = placeholder.toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '');
+        let baseName = paramName, suffix = 1;
+        while (usedParamNames.has(paramName)) paramName = `${baseName}_${suffix++}`;
+        usedParamNames.add(paramName);
+        params.push({ name: paramName, type: 'string', required: true, description: paramName.replace(/_/g, ' '), example: val.substring(0, 50) });
+        steps.push(`Type "{{${paramName}}}" into the text field`);
+      }
+    } else if (evt.type === 'paste') {
+      steps.push('Paste text into the field');
+    } else if (evt.type === 'select') {
+      steps.push(`Select "${evt.value || ''}" from the dropdown`);
+    } else if (evt.type === 'check') {
+      steps.push(`${evt.checked ? 'Check' : 'Uncheck'} the "${evt.label || 'checkbox'}"`);
+    } else if (evt.type === 'submit') {
+      steps.push('Submit the form');
+    } else if (evt.type === 'keycombo') {
+      steps.push(`Press ${evt.key || 'Enter'}`);
+    }
+  }
+
+  const lastNav = cleanedEvents.filter(e => e.type === 'navigate').pop();
+  return {
+    id: `skill_${eventStart}_${eventEnd}`,
+    name: skillName,
+    description: action?.description || skillName,
+    eventStart,
+    eventEnd,
+    instructions: steps.join('. ') + '.',
+    params,
+    startUrl: lastNav?.url || session.startUrl,
+    execType: 'agent',
+  };
+}
+
+// Build a skill preview from a segment of events (legacy waypoint format — kept for backward compat)
 async function _buildSkillPreview(session, events, eventStart, eventEnd, skillName, action) {
   const segmentEvents = events.map(e => ({ ...e }));
 
@@ -2094,34 +2444,68 @@ async function _buildSkillPreview(session, events, eventStart, eventEnd, skillNa
     if (evt.type === 'navigate' && !seenUrls.has(evt.url)) {
       seenUrls.add(evt.url);
       step++;
-      waypoints.push({ step, type: 'navigate', url: evt.url, pageTitle: evt.pageTitle || '', checkpoint: `Page loaded: ${evt.pageTitle || evt.url}` });
+      waypoints.push({ step, type: 'navigate', intent: `Navigate to ${evt.url}`, url: evt.url, pageTitle: evt.pageTitle || '', checkpoint: `Page loaded: ${evt.pageTitle || evt.url}` });
     } else if (evt.type === 'click' && evt.elementText) {
       step++;
-      waypoints.push({ step, type: 'click', selector: evt.selector, altSelectors: evt.altSelectors || [], elementText: evt.elementText, href: evt.href || '' });
+      const intent = evt._expectedResult
+        ? `Click the "${evt.elementText}" ${evt.elementTag || 'element'} to trigger navigation (expect: ${evt._expectedResult.pattern})`
+        : `Click the "${evt.elementText}" ${evt.elementTag || 'element'}`;
+      const wp = { step, type: 'click', intent, selector: evt.selector, altSelectors: evt.altSelectors || [], elementText: evt.elementText, href: evt.href || '' };
+      if (evt._expectedResult) wp.expectedResult = evt._expectedResult;
+      waypoints.push(wp);
     } else if (evt.type === 'dblclick') {
       step++;
-      waypoints.push({ step, type: 'dblclick', selector: evt.selector, altSelectors: evt.altSelectors || [], elementText: evt.elementText || '' });
+      const intent = `Double-click the "${evt.elementText || 'element'}" ${evt.elementTag || 'element'}`;
+      const wp = { step, type: 'dblclick', intent, selector: evt.selector, altSelectors: evt.altSelectors || [], elementText: evt.elementText || '' };
+      if (evt._expectedResult) wp.expectedResult = evt._expectedResult;
+      waypoints.push(wp);
     } else if (evt.type === 'fill') {
       step++;
-      waypoints.push({ step, type: 'fill', selector: evt.selector, altSelectors: evt.altSelectors || [], value: evt.value || '', paramRef: evt._paramRef || undefined, originalValue: evt._originalValue || undefined });
+      const fillText = evt.value || '';
+      const intent = `Type "${fillText.substring(0, 50)}" into the "${(evt.elementText || evt.selector || '').substring(0, 40)}" field`;
+      waypoints.push({ step, type: 'fill', intent, selector: evt.selector, altSelectors: evt.altSelectors || [], value: evt.value || '', paramRef: evt._paramRef || undefined, originalValue: evt._originalValue || undefined });
     } else if (evt.type === 'paste') {
       step++;
-      waypoints.push({ step, type: 'paste', selector: evt.selector, altSelectors: evt.altSelectors || [], text: evt.text || '', paramRef: evt._paramRef || undefined, originalValue: evt._originalValue || undefined });
+      const intent = `Paste text into the "${(evt.elementText || evt.selector || '').substring(0, 40)}" field`;
+      waypoints.push({ step, type: 'paste', intent, selector: evt.selector, altSelectors: evt.altSelectors || [], text: evt.text || '', paramRef: evt._paramRef || undefined, originalValue: evt._originalValue || undefined });
     } else if (evt.type === 'select') {
       step++;
-      waypoints.push({ step, type: 'select', selector: evt.selector, value: evt.value || '', paramRef: evt._paramRef || undefined });
+      const intent = `Select "${evt.value || ''}" from the dropdown`;
+      waypoints.push({ step, type: 'select', intent, selector: evt.selector, value: evt.value || '', paramRef: evt._paramRef || undefined });
     } else if (evt.type === 'check') {
       step++;
-      waypoints.push({ step, type: 'check', selector: evt.selector, label: evt.label || '', checked: evt.checked });
+      const intent = `Check the "${evt.label || 'checkbox'}" ${evt.inputType || 'checkbox'}`;
+      waypoints.push({ step, type: 'check', intent, selector: evt.selector, label: evt.label || '', checked: evt.checked });
     } else if (evt.type === 'submit') {
       step++;
-      waypoints.push({ step, type: 'submit', selector: evt.selector });
+      waypoints.push({ step, type: 'submit', intent: 'Submit the form', selector: evt.selector });
     } else if (evt.type === 'keycombo') {
       step++;
-      waypoints.push({ step, type: 'keycombo', key: evt.key || 'Enter', ctrl: evt.ctrl || false, shift: evt.shift || false, alt: evt.alt || false, selector: evt.selector || '' });
+      const intent = `Press ${evt.key || 'Enter'}${evt.ctrl ? ' + Ctrl/Meta' : ''}${evt.shift ? ' + Shift' : ''}`;
+      waypoints.push({ step, type: 'keycombo', intent, key: evt.key || 'Enter', ctrl: evt.ctrl || false, shift: evt.shift || false, alt: evt.alt || false, selector: evt.selector || '' });
     }
     // NOTE: hover/focus are intentionally NOT emitted as waypoints — they are
     // not meaningful recipe steps. The subsequent click/fill is what matters.
+  }
+
+  // ── Dedupe pass: merge consecutive same-type/same-selector waypoints ──────
+  // This removes duplicate clicks (e.g. clicking a modal twice) within a 500ms window
+  const deduped = [];
+  for (const wp of waypoints) {
+    const prev = deduped[deduped.length - 1];
+    if (prev &&
+        prev.type === wp.type &&
+        prev.selector === wp.selector &&
+        (prev.elementText || '') === (wp.elementText || '') &&
+        !prev.expectedResult && !wp.expectedResult) {
+      // Skip duplicate — keep the first one
+      continue;
+    }
+    deduped.push(wp);
+  }
+  // Re-number steps after dedupe
+  for (let i = 0; i < deduped.length; i++) {
+    deduped[i].step = i + 1;
   }
 
   const lastNav = segmentEvents.filter(e => e.type === 'navigate').pop();
@@ -2132,7 +2516,7 @@ async function _buildSkillPreview(session, events, eventStart, eventEnd, skillNa
     description: action?.description || skillName,
     eventStart,
     eventEnd,
-    waypoints,
+    waypoints: deduped,
     params: detectedParams,
     startUrl: session.startUrl,
     targetUrl: lastNav?.url || session.startUrl,
@@ -2177,6 +2561,10 @@ async function actionSaveSkillsAndRecipe(args) {
         startUrl: skill.startUrl || session.startUrl,
         targetUrl: skill.targetUrl || skill.startUrl || session.startUrl,
         params: skill.params || [],
+        // Instruction-based skills (new format) — execType: "agent" + instructions
+        execType: skill.execType || 'agent',
+        instructions: skill.instructions || '',
+        // Waypoint-based skills (legacy format) — kept for backward compat
         waypoints: skill.waypoints || [],
         targetDescription: skill.description || skill.targetDescription || '',
         created: new Date().toISOString(),
@@ -2238,78 +2626,173 @@ async function actionSaveSkillsAndRecipe(args) {
 }
 
 // ---------------------------------------------------------------------------
-// URL-first collapse: collapse intermediate navigation into a single navigate
-// to the final destination URL before the first real interaction.
+// URL-first collapse: keep only the final action page's navigation.
+//
+// Model:
+//   nav A → click → click → nav B → click → nav C → click → fill → click
+//                    (noise)            (noise)
+//
+//   Stable URL at C (e.g. /settings):
+//     Skill = [navigate C] + [interactions on C]
+//
+//   Dynamic ID at C (e.g. /playlist/<ID>):
+//     Skill = [trigger click "Create Playlist" with expectedResult: url_pattern /playlist/*]
+//             + [interactions on C]
+//     (the navigate is a RESULT of the click, not a step — verified not hardcoded)
+//
+//   No navigation (all on one page):
+//     Skill = [interactions only] (runtime uses startUrl)
 // ---------------------------------------------------------------------------
 function _collapseNavigation(events) {
   if (!events || events.length === 0) return events;
 
   const INTERACTION_TYPES = ['click', 'dblclick', 'fill', 'select', 'check', 'submit',
-    'paste', 'keycombo', 'drag', 'hover', 'focus', 'rightclick', 'extract'];
+    'paste', 'keycombo', 'drag', 'rightclick', 'extract'];
   const NAV_TYPES = ['navigate', 'tab-new'];
 
-  // Find the index of the first real interaction event
-  // Nav-clicks (clicks with http(s) hrefs) are treated as navigation, not interaction
-  let firstInteractionIdx = -1;
-  for (let i = 0; i < events.length; i++) {
-    const e = events[i];
-    if (INTERACTION_TYPES.includes(e.type)) {
-      // Skip nav-clicks — they're navigation, not interaction
-      if (e.type === 'click' && e.href && /^https?:\/\//i.test(e.href)) continue;
-      firstInteractionIdx = i;
+  // Check if a URL path contains a dynamic ID segment
+  // Examples: /playlist/0SfpMOvydhMMG4w5xeZJ1X, /post/123456, /items/abc123def456
+  function hasDynamicId(url) {
+    try {
+      const u = new URL(url);
+      const segments = u.pathname.split('/').filter(Boolean);
+      for (const seg of segments) {
+        // Hex-like (8+ chars), base62 (15+ chars), or pure digits (5+ chars)
+        if (/^[0-9a-fA-F]{8,}$/.test(seg)) return true;
+        if (/^[A-Za-z0-9_-]{15,}$/.test(seg) && /[A-Z]/.test(seg) && /[a-z]/.test(seg)) return true;
+        if (/^\d{5,}$/.test(seg)) return true;
+      }
+      return false;
+    } catch (_) { return false; }
+  }
+
+  // Convert a dynamic URL to a pattern (replace ID segments with *)
+  // /playlist/0SfpMOvydhMMG4w5xeZJ1X → /playlist/*
+  function urlToPattern(url) {
+    try {
+      const u = new URL(url);
+      const segments = u.pathname.split('/');
+      const patternSegments = segments.map(seg => {
+        if (!seg) return seg;
+        if (/^[0-9a-fA-F]{8,}$/.test(seg)) return '*';
+        if (/^[A-Za-z0-9_-]{15,}$/.test(seg) && /[A-Z]/.test(seg) && /[a-z]/.test(seg)) return '*';
+        if (/^\d{5,}$/.test(seg)) return '*';
+        return seg;
+      });
+      return patternSegments.join('/');
+    } catch (_) { return url; }
+  }
+
+  // Split events into page segments: each segment = [nav event] + [interactions until next nav]
+  // The first segment may not have a nav event (if recording starts on a page)
+  const segments = [];
+  let currentSeg = { navEvent: null, interactions: [] };
+
+  for (const evt of events) {
+    if (NAV_TYPES.includes(evt.type)) {
+      // Start a new segment
+      if (currentSeg.navEvent || currentSeg.interactions.length > 0) {
+        segments.push(currentSeg);
+      }
+      currentSeg = { navEvent: evt, interactions: [] };
+    } else if (evt.type === 'click' && evt.href && /^https?:\/\//i.test(evt.href)) {
+      // Nav-click (click with http(s) href) — treat as navigation
+      if (currentSeg.navEvent || currentSeg.interactions.length > 0) {
+        segments.push(currentSeg);
+      }
+      currentSeg = { navEvent: { type: 'navigate', url: evt.href, pageTitle: evt.elementText || '', timestamp: evt.timestamp, _fromClick: true }, interactions: [] };
+    } else if (INTERACTION_TYPES.includes(evt.type)) {
+      currentSeg.interactions.push(evt);
+    }
+    // Skip hover/focus/scroll — they're noise
+  }
+  if (currentSeg.navEvent || currentSeg.interactions.length > 0) {
+    segments.push(currentSeg);
+  }
+
+  // Find the last segment with meaningful interactions
+  let lastActionSegIdx = -1;
+  for (let i = segments.length - 1; i >= 0; i--) {
+    if (segments[i].interactions.length > 0) {
+      lastActionSegIdx = i;
       break;
     }
   }
 
-  // No interaction found — return events as-is (pure navigation flow)
-  if (firstInteractionIdx === -1) return events;
+  // No interactions at all — return as-is (pure navigation)
+  if (lastActionSegIdx === -1) return events;
 
-  // Collect all navigation events before the first interaction
-  const navEvents = events.slice(0, firstInteractionIdx).filter(e => NAV_TYPES.includes(e.type));
-  // Also check for click events with http(s) hrefs that are effectively navigation
-  const navClicks = events.slice(0, firstInteractionIdx).filter(
-    e => e.type === 'click' && e.href && /^https?:\/\//i.test(e.href)
-  );
+  const lastSeg = segments[lastActionSegIdx];
+  const finalUrl = lastSeg.navEvent?.url || null;
+  const finalTitle = lastSeg.navEvent?.pageTitle || '';
 
-  // If there are no navigation events and no nav-clicks, nothing to collapse
-  if (navEvents.length === 0 && navClicks.length === 0) return events;
+  // Case 1: No navigation event for the last action segment — interactions only
+  if (!finalUrl) {
+    logger.info(`[trainer.agent] _collapseNavigation: no nav for last action segment — keeping ${lastSeg.interactions.length} interactions only`);
+    return lastSeg.interactions;
+  }
 
-  // Find the final destination URL — scan backwards from the first interaction
-  // for the last navigation event (navigate, tab-new) OR nav-click (click with
-  // http(s) href). The last one wins since it's the most recent destination.
-  let finalUrl = null;
-  let finalTitle = '';
-  for (let i = firstInteractionIdx - 1; i >= 0; i--) {
-    const e = events[i];
-    if (e.type === 'navigate' || e.type === 'tab-new') {
-      finalUrl = e.url;
-      finalTitle = e.pageTitle || '';
-      break;
-    }
-    if (e.type === 'click' && e.href && /^https?:\/\//i.test(e.href)) {
-      finalUrl = e.href;
-      finalTitle = e.elementText || '';
-      break;
+  // Case 2: Final URL is stable (no dynamic ID) — navigate + interactions
+  if (!hasDynamicId(finalUrl)) {
+    const collapsed = [
+      {
+        type: 'navigate',
+        url: finalUrl,
+        pageTitle: finalTitle,
+        timestamp: lastSeg.navEvent.timestamp,
+        _collapsed: true,
+      },
+      ...lastSeg.interactions,
+    ];
+    logger.info(`[trainer.agent] _collapseNavigation: stable URL — navigate to ${finalUrl} + ${lastSeg.interactions.length} interactions (dropped ${events.length - collapsed.length} noise events)`);
+    return collapsed;
+  }
+
+  // Case 3: Final URL has a dynamic ID — find the trigger click in the previous segment
+  // The trigger click is the last click before the navigation that led to the dynamic URL
+  const pattern = urlToPattern(finalUrl);
+  let triggerClick = null;
+
+  if (lastActionSegIdx > 0) {
+    const prevSeg = segments[lastActionSegIdx - 1];
+    // Find the last click in the previous segment (the one that triggered the navigation)
+    for (let i = prevSeg.interactions.length - 1; i >= 0; i--) {
+      const evt = prevSeg.interactions[i];
+      if (evt.type === 'click' || evt.type === 'dblclick') {
+        triggerClick = evt;
+        break;
+      }
     }
   }
 
-  if (!finalUrl) return events; // can't collapse without a URL
+  if (triggerClick) {
+    // Mark the trigger click with expectedResult for runtime verification
+    const triggerWithExpect = {
+      ...triggerClick,
+      _expectedResult: { type: 'url_pattern', pattern },
+    };
+    const collapsed = [
+      triggerWithExpect,
+      ...lastSeg.interactions,
+    ];
+    logger.info(`[trainer.agent] _collapseNavigation: dynamic URL ${finalUrl} → keeping trigger click "${triggerClick.elementText || triggerClick.selector}" with expectedResult pattern ${pattern} + ${lastSeg.interactions.length} interactions (dropped ${events.length - collapsed.length} noise events)`);
+    return collapsed;
+  }
 
-  // Build the collapsed event list:
-  // 1. Single navigate waypoint to the final URL
-  // 2. All interaction events from firstInteractionIdx onward
+  // Fallback: no trigger click found — use navigate with the pattern (not the raw URL)
+  // This is less ideal but better than hardcoding the specific ID
   const collapsed = [
     {
       type: 'navigate',
-      url: finalUrl,
+      url: finalUrl.replace(/\/[0-9a-fA-F]{8,}([/?]|$)/, '/*$1').replace(/\/[A-Za-z0-9_-]{15,}([/?]|$)/, '/*$1').replace(/\/\d{5,}([/?]|$)/, '/*$1'),
       pageTitle: finalTitle,
-      timestamp: events[0].timestamp,
-      _collapsed: true, // marker for debugging
+      timestamp: lastSeg.navEvent.timestamp,
+      _collapsed: true,
+      _dynamicUrl: true,
     },
-    ...events.slice(firstInteractionIdx),
+    ...lastSeg.interactions,
   ];
-
-  logger.info(`[trainer.agent] _collapseNavigation: collapsed ${firstInteractionIdx} nav events into single navigate to ${finalUrl}`);
+  logger.info(`[trainer.agent] _collapseNavigation: dynamic URL with no trigger click — navigate pattern + ${lastSeg.interactions.length} interactions`);
   return collapsed;
 }
 
@@ -2531,13 +3014,11 @@ function _detectParamsFallback(events, session) {
     if (/^\d+$/.test(value)) continue;
     if (value.length < 3) continue;
 
-    // Task-specific: value appears in (or is substring of) the training task
-    const isTaskSpecific = taskText && (
-      taskText.includes(value.toLowerCase().substring(0, 30)) ||
-      value.toLowerCase().substring(0, 20).split(/\s+/).some(w => w.length > 3 && taskText.includes(w))
-    );
-
-    if (!isTaskSpecific && value.length < 5) continue; // short constants are static
+    // Treat ALL non-static fill/paste values as task-specific params.
+    // The old heuristic required the value to appear in the training task text,
+    // but that fails when the user types an example value (e.g. "test ten")
+    // that isn't mentioned in the task description ("Create a new playlist").
+    // Better to over-parameterize than to hardcode user content.
 
     // Derive param name
     let paramName = _deriveParamName(
@@ -2698,16 +3179,13 @@ async function _autoSplitEvents(session, guidedPlan) {
   // Pre-process: replace task-specific values with {{value}} for LLM
   const collapsed = _collapseNavigation(rawEvents);
   const eventsForLLM = collapsed.map(e => ({ ...e }));
-  const taskText = (trainTask || '').toLowerCase();
   for (const evt of eventsForLLM) {
     if (evt.type === 'fill' || evt.type === 'paste') {
       const val = evt.value || evt.text || '';
-      if (val && val.length > 3 && !/^https?:\/\//i.test(val) && !/^[\w.+-]+@[\w-]+\.\w+$/.test(val)) {
-        const isTaskSpecific = taskText && taskText.includes(val.toLowerCase().substring(0, 20));
-        if (isTaskSpecific) {
-          if (evt.type === 'fill') evt.value = '{{value}}';
-          else evt.text = '{{value}}';
-        }
+      // Mark as parametric unless it's clearly static (URL, email, pure number, very short)
+      if (val && val.length > 2 && !/^https?:\/\//i.test(val) && !/^[\w.+-]+@[\w-]+\.\w+$/.test(val) && !/^\d+$/.test(val)) {
+        if (evt.type === 'fill') evt.value = '{{value}}';
+        else evt.text = '{{value}}';
       }
     }
   }
@@ -2745,12 +3223,23 @@ Signals for action boundaries:
 - A semantic shift from "creating" to "searching" or from "composing" to "sending"
 - A significant pause (>3 seconds) followed by a new navigation
 
+MULTI-ACTION DETECTION: If the recording shows meaningful interactions on MULTIPLE different
+pages (not just navigation clicks, but fill/submit/create actions on different URLs), split
+into separate skills — one per action page. Each skill should represent ONE logical action.
+If the actions are too complex, unclear, or the user tried to record too many things at once,
+return the rejected option with a helpful message like "This recording contains multiple
+actions. Please record one action at a time for best results."
+
 NOTE: {{value}} placeholders in FILL events represent user-provided values that will
 become skill parameters. Do NOT treat them as literal strings — they are parametric inputs.
 
 PARAMETER DETECTION: For each action, identify fill/paste values that are TASK-SPECIFIC
-(values the user would change each time — names, queries, messages, descriptions). Map
-each to a descriptive param_name. Static values (URLs, fixed labels) should NOT be params.
+(values the user would change each time — names, queries, messages, descriptions, titles).
+Map each to a descriptive param_name (snake_case). Static values (URLs, fixed labels,
+email addresses, pure numbers) should NOT be params.
+IMPORTANT: Even if a fill value does NOT appear in the original task text, if it looks like
+user-provided content (a name, title, description, query, message), treat it as a parameter.
+Only treat values as static if they are clearly constants (URLs, emails, numbers, fixed labels).
 ${guidedContext}
 ${trainTask ? `ORIGINAL TASK: ${trainTask}` : ''}
 
@@ -2777,7 +3266,7 @@ OPTION 1 — if you can understand the actions:
   ]
 }
 
-OPTION 2 — if the events are too chaotic, unclear, or don't form a coherent action:
+OPTION 2 — if the events are too chaotic, unclear, or contain multiple unrelated actions:
 { "actions": [], "rejected": true, "reason": "The recorded events don't form a clear, repeatable action. Try recording again with a specific task in mind." }
 
 If there is only ONE action, return a single-element array. Output ONLY valid JSON.`;
@@ -3618,12 +4107,32 @@ function _deriveGuidedSkillName(agentId, task) {
 // ---------------------------------------------------------------------------
 // Module exports
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Clear recorded events for an agent — keeps the session alive but resets
+// rawEvents so the user can re-record without cancelling and re-training.
+// ---------------------------------------------------------------------------
+function actionClearEvents(args) {
+  let { agentId } = args || {};
+  if (agentId) agentId = agentId.toLowerCase();
+
+  const session = activeSessions.get(agentId);
+  if (!session) return { ok: false, error: 'No active training session' };
+
+  session.rawEvents = [];
+  session.injectedTabs = session.injectedTabs || new Set();
+  // Reset per-tab last indices so polling re-collects from scratch
+  if (session._tabLastIndices) session._tabLastIndices.clear();
+  logger.info(`[trainer.agent] Cleared raw events for ${agentId}`);
+  return { ok: true };
+}
+
 module.exports = {
   actionTrain,
   actionSaveTraining,
   actionPreviewSplit,
   actionSaveSkillsAndRecipe,
   actionCancelTraining,
+  actionClearEvents,
   actionListSkills,
   loadRecipe,
   findMatchingRecipe,
