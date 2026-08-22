@@ -42,14 +42,20 @@ function structureOcrOverlayItems(items, opts = {}) {
   const filtered = [];
   for (const item of items) {
     const text = (item.text || '').trim();
-    // Drop empty, but keep single-letter words (like "a") — they're real words
-    // that join with others in a row. Only drop single-char if it's not a letter.
     if (text.length === 0) continue;
-    if (text.length === 1 && !/[a-z]/i.test(text)) continue;
-    if (_PUNCT_ONLY_RE.test(text)) continue;
-    if (_ICON_CHARS_RE.test(text)) continue;
+    // Keep icon chars and single non-letter chars as icon candidates —
+    // they're useful for icon inference in the OCR fast path.
+    const isIconChar = _ICON_CHARS_RE.test(text) ||
+      (text.length === 1 && !/[a-z0-9]/i.test(text));
+    const isPunctOnly = _PUNCT_ONLY_RE.test(text);
     // Drop very low-confidence short items (likely OCR misreads of icons)
     if (text.length <= 3 && (item.confidence || 1.0) < 0.6) continue;
+    if (isIconChar) {
+      // Keep icon chars — mark them as icon candidates
+      filtered.push({ ...item, text, _isIconCandidate: true });
+      continue;
+    }
+    if (isPunctOnly && text.length > 3) continue; // long punctuation = noise
     filtered.push({ ...item, text });
   }
   if (filtered.length === 0) return [];
@@ -82,6 +88,12 @@ function structureOcrOverlayItems(items, opts = {}) {
       (other.x || 0) > right &&
       Math.abs((other.y || 0) - (item.y || 0)) < 40
     );
+    // Keep icon candidates even if they're in the icon column — they may be
+    // standalone icon buttons (e.g. "+" create button)
+    if (item._isIconCandidate) {
+      iconFiltered.push(item);
+      continue;
+    }
     if (isInIconColumn && hasTextToRight && text.length <= 3 && !_MENU_WORDS.has(text.toLowerCase())) {
       // Likely an icon misread (e.g. "Q", "M1", "®")
       continue;
@@ -213,6 +225,11 @@ function structureOcrOverlayItems(items, opts = {}) {
     const textLen = text.length;
     const h = row._medianItemHeight;
     const isLargeFont = h > medianHeight * 1.4;
+
+    // Icon: non-alphanumeric char(s) or marked as icon candidate
+    if (row._isIconCandidate || (textLen <= 2 && !/[a-z0-9]/i.test(text))) {
+      return { ...row, type: 'icon' };
+    }
 
     // Divider: very short text or only symbols
     if (textLen <= 2 && _PUNCT_ONLY_RE.test(text)) {

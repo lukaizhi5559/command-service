@@ -5814,8 +5814,61 @@ Output ONLY valid JSON: {${_execRecipe.params.map(p => `"${p.name}": "<extracted
         for (const skillRef of _execRecipe.skills) {
           if (_chainFailed) break;
           const childSkill = trainerAgent.loadRecipe(_agentIdClean, skillRef.skill);
-          if (!childSkill || !childSkill.waypoints || childSkill.waypoints.length === 0) {
+          if (!childSkill) {
             logger.warn(`[browser.agent] recipe-chain: could not load skill "${skillRef.skill}", skipping`);
+            continue;
+          }
+          // Agent-based child skill — delegate to instruction.runner (keyboard nav)
+          if (childSkill.execType === 'agent' || (childSkill.instructions && (!childSkill.waypoints || childSkill.waypoints.length === 0))) {
+            logger.info(`[browser.agent] recipe-chain: agent skill "${skillRef.skill}" — delegating to instruction.runner`);
+            // Distribute params via paramFlow
+            const _agentChildParams = {};
+            if (_execRecipe.paramFlow) {
+              for (const [paramName, skillNames] of Object.entries(_execRecipe.paramFlow)) {
+                if (skillNames.includes(skillRef.skill) && _recipeParams[paramName]) {
+                  _agentChildParams[paramName] = _recipeParams[paramName];
+                }
+              }
+            }
+            try {
+              const { runInstructionSkill } = require('./instruction.runner.cjs');
+              const _childResult = await runInstructionSkill({
+                instructions: childSkill.instructions,
+                keyPath: childSkill.keyPath || null,
+                params: childSkill.params || [],
+                skillArgs: { sessionId, ..._agentChildParams },
+                startUrl: childSkill.startUrl,
+                sessionId,
+                timeoutMs: 120000,
+              });
+              if (!_childResult?.ok) {
+                _chainFailed = true;
+                logger.warn(`[browser.agent] recipe-chain: agent skill "${skillRef.skill}" failed: ${_childResult?.error}`);
+              } else {
+                logger.info(`[browser.agent] recipe-chain: agent skill "${skillRef.skill}" completed ✓`);
+                // Cache keyPath if discovered
+                if (_childResult.discoveredKeyPath && _childResult.discoveredKeyPath.length > 0 && !childSkill.keyPath) {
+                  try {
+                    childSkill.keyPath = _childResult.discoveredKeyPath;
+                    const skillDir = path.join(trainerAgent.SKILLS_DIR || path.join(require('os').homedir(), '.thinkdrop', 'skills'), _agentIdClean);
+                    const skillPath = path.join(skillDir, `${childSkill.name}.skill.json`);
+                    if (fs.existsSync(skillPath)) {
+                      fs.writeFileSync(skillPath, JSON.stringify(childSkill, null, 2));
+                      logger.info(`[browser.agent] recipe-chain: cached keyPath for "${childSkill.name}" to ${skillPath}`);
+                    }
+                  } catch (e) {
+                    logger.warn(`[browser.agent] recipe-chain: could not cache keyPath for "${childSkill.name}": ${e.message}`);
+                  }
+                }
+              }
+            } catch (_childErr) {
+              _chainFailed = true;
+              logger.warn(`[browser.agent] recipe-chain: agent skill "${skillRef.skill}" error: ${_childErr.message}`);
+            }
+            continue;
+          }
+          if (!childSkill.waypoints || childSkill.waypoints.length === 0) {
+            logger.warn(`[browser.agent] recipe-chain: skill "${skillRef.skill}" has no waypoints and is not agent-based, skipping`);
             continue;
           }
 
@@ -5946,6 +5999,105 @@ Output ONLY valid JSON: {${_execRecipe.params.map(p => `"${p.name}": "<extracted
         if (!_chainFailed) {
           _recipeExecutedOk = true;
           logger.info(`[browser.agent] recipe-chain: all skills completed ✓`);
+        }
+
+      } else if (_execRecipe && (_execRecipe.execType === 'agent' ||
+                 (_execRecipe.instructions && (!_execRecipe.waypoints || _execRecipe.waypoints.length === 0)))) {
+        // ── AGENT SKILL execution (instructions-based, keyboard nav) ──────────
+        // Agent-based skills have execType:'agent' with text instructions and no
+        // waypoints. Delegate to instruction.runner.cjs which uses keyboard
+        // navigation (Tab/Arrow/Enter/Type) to execute the steps.
+        _activeRecipe = _execRecipe;
+        logger.info(`[browser.agent] agent-skill: executing "${_execRecipe.name}" via instruction.runner`);
+
+        // ── Param extraction ──────────────────────────────────────────────────
+        let _agentSkillParams = {};
+        if (_execRecipe.params && Array.isArray(_execRecipe.params) && _execRecipe.params.length > 0) {
+          const requiredParams = _execRecipe.params.filter(p => p.required);
+          const paramPrompt = `Extract parameter values from this user task.
+TASK: "${task}"
+PARAMS:
+${_execRecipe.params.map(p => `- ${p.name} (${p.type}${p.required ? ', required' : ''}): "${p.description}"`).join('\n')}
+
+Output ONLY valid JSON: {${_execRecipe.params.map(p => `"${p.name}": "<extracted value or null>"`).join(', ')}}`;
+
+          try {
+            const { askWithMessages } = require('../skill-helpers/skill-llm.cjs');
+            const paramResponse = await askWithMessages([
+              { role: 'system', content: 'You extract parameter values from user tasks. Output ONLY valid JSON.' },
+              { role: 'user', content: paramPrompt },
+            ], { maxTokens: 500, temperature: 0.1 });
+            let paramJson = (paramResponse || '').trim().replace(/^```(?:json)?\s*\n?/i, '').replace(/\n?```\s*$/, '');
+            _agentSkillParams = JSON.parse(paramJson);
+            logger.info(`[browser.agent] agent-skill: params extracted: ${JSON.stringify(_agentSkillParams)}`);
+          } catch (e) {
+            logger.warn(`[browser.agent] agent-skill: param extraction failed: ${e.message}`);
+          }
+
+          // Check for missing required params → ask_user
+          const missing = requiredParams.filter(p => !_agentSkillParams[p.name]);
+          if (missing.length > 0) {
+            logger.info(`[browser.agent] agent-skill: missing required params: ${missing.map(p => p.name).join(', ')}`);
+            return {
+              ok: false, agentId, task,
+              askUser: true,
+              question: missing.length === 1
+                ? `What's the ${missing[0].description || missing[0].name}?`
+                : `I need a few details: ${missing.map(p => p.description || p.name).join(', ')}`,
+              options: [],
+              freeText: true,
+              paramPrompt: true,
+              _missingParams: missing.map(p => p.name),
+            };
+          }
+        }
+
+        // Delegate to instruction.runner.cjs (keyboard nav)
+        try {
+          const { runInstructionSkill } = require('./instruction.runner.cjs');
+          const _agentSkillResult = await runInstructionSkill({
+            instructions: _execRecipe.instructions,
+            keyPath: _execRecipe.keyPath || null,
+            params: _execRecipe.params || [],
+            skillArgs: { sessionId, ..._agentSkillParams },
+            startUrl: _execRecipe.startUrl,
+            sessionId,
+            timeoutMs: 120000,
+          });
+
+          if (_agentSkillResult?.ok) {
+            _recipeExecutedOk = true;
+            logger.info(`[browser.agent] agent-skill: "${_execRecipe.name}" completed ✓`);
+
+            // Cache keyPath back to the skill file for fast subsequent runs
+            if (_agentSkillResult.discoveredKeyPath && _agentSkillResult.discoveredKeyPath.length > 0 && !_execRecipe.keyPath) {
+              try {
+                _execRecipe.keyPath = _agentSkillResult.discoveredKeyPath;
+                const trainerAgent = require('./trainer.agent.cjs');
+                const skillDir = path.join(trainerAgent.SKILLS_DIR || path.join(require('os').homedir(), '.thinkdrop', 'skills'), _agentIdClean);
+                const skillPath = path.join(skillDir, `${_execRecipe.name}.skill.json`);
+                if (fs.existsSync(skillPath)) {
+                  fs.writeFileSync(skillPath, JSON.stringify(_execRecipe, null, 2));
+                  logger.info(`[browser.agent] agent-skill: cached keyPath (${_agentSkillResult.discoveredKeyPath.length} steps) to ${skillPath}`);
+                }
+              } catch (e) {
+                logger.warn(`[browser.agent] agent-skill: could not cache keyPath: ${e.message}`);
+              }
+            }
+
+            return {
+              ok: true, agentId, task,
+              result: _agentSkillResult.output || `Completed skill ${_execRecipe.name}`,
+              sessionId,
+              recipeUsed: true,
+              routingDecision: 'agent_skill_delegate',
+            };
+          } else {
+            logger.warn(`[browser.agent] agent-skill: "${_execRecipe.name}" failed: ${_agentSkillResult?.error} — falling through to playwright.agent`);
+            // Fall through to playwrightAgent (don't return)
+          }
+        } catch (_agentSkillErr) {
+          logger.warn(`[browser.agent] agent-skill: execution error: ${_agentSkillErr.message} — falling through to playwright.agent`);
         }
 
       } else if (_execRecipe && _execRecipe.waypoints && _execRecipe.waypoints.length > 0) {

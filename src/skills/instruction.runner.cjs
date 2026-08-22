@@ -20,6 +20,9 @@ const { browserAct } = require('./browser.act.cjs');
 const { askWithMessages } = require('../skill-helpers/skill-llm.cjs');
 
 const logger = require('../logger.cjs');
+const fs = require('fs');
+const path = require('path');
+const os = require('os');
 
 // ---------------------------------------------------------------------------
 // Session-level LLM analysis cache
@@ -50,18 +53,31 @@ function _sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-// Read document.activeElement info (tag, text, role, ref, rect)
+// Read document.activeElement info (tag, text, role, ref, rect, icon signals)
 async function _readActiveElement(sessionId) {
   const res = await browserAct({
     action: 'evaluate', sessionId, headed: true, timeoutMs: 3000,
     text: `(() => {
       const el = document.activeElement;
       if (!el || el === document.body) return null;
+      // Inject data-td-ref if missing (for real Playwright selector clicks)
+      // Uses tm- prefix to distinguish from DOM scanner's tdN refs
+      let ref = el.getAttribute('data-td-ref');
+      if (!ref || !ref.startsWith('tm-')) {
+        ref = 'tm-' + Math.random().toString(36).slice(2, 10);
+        el.setAttribute('data-td-ref', ref);
+      }
       const text = (el.getAttribute('aria-label') || el.getAttribute('placeholder') || el.innerText || el.textContent || '').trim().replace(/\\s+/g, ' ').slice(0, 120);
       const r = el.getBoundingClientRect();
+      const hasSvg = !!el.querySelector('svg');
+      const ariaLabel = el.getAttribute('aria-label') || '';
+      const isIconLike = text.length < 3 && (hasSvg || (r.width < 50 && r.height < 50) || el.getAttribute('role') === 'button' || el.tagName === 'BUTTON');
       return { tag: el.tagName.toLowerCase(), role: el.getAttribute('role') || '', text,
-               ref: el.getAttribute('data-td-ref') || '',
+               ref,
                type: el.tagName === 'INPUT' ? (el.type || 'text') : '',
+               ariaLabel,
+               isIconLike,
+               hasSvg,
                x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height) };
     })()`,
   });
@@ -321,88 +337,758 @@ function _stringMatch(targetText, focusedText) {
 }
 
 // ---------------------------------------------------------------------------
-// Overlay navigation mode detection (arrow vs tab)
+// Overlay navigation mode detection — REMOVED
 // ---------------------------------------------------------------------------
+// The overlay probe was removed because it interfered with the dropdown scan.
+// After a Playwright click opens a dropdown, the probe pressed Tab/Shift+Tab
+// which moved focus away from the dropdown. buildTabMap's ArrowRight→ArrowDown
+// →Tab scan handles dropdown entry naturally without a separate probe.
 
-// After pressing Enter on a trigger, probe to determine if the overlay that
-// opened uses ArrowDown (dropdown) or Tab (modal) for navigation.
-// Returns "arrow" or "tab".
-async function _detectOverlayNavMode(sessionId) {
-  await _sleep(300); // wait for overlay to appear
+// ---------------------------------------------------------------------------
+// Tab-map: arrow-key-first scan with loop detection
+// ---------------------------------------------------------------------------
+// Builds a complete map of focusable elements on the current page state.
+// Tries Arrow Right first (horizontal regions), then Arrow Down (vertical
+// lists like dropdowns/menus), then Tab (general navigation).
+// Stops on loop detection (seen same element signature twice) or safety cap.
+// Returns array of { id, tag, text, ariaLabel, placeholder, role, type,
+//   x, y, w, h, isIconLike, hasSvg, ref } with real coordinates.
 
-  const baseline = await _readActiveElement(sessionId);
-  const baselineKey = `${baseline?.tag}|${baseline?.text}|${baseline?.ref}`;
-
-  // Try ArrowDown first
-  await browserAct({ action: 'press', sessionId, key: 'ArrowDown', headed: true, timeoutMs: 2000 });
-  await _sleep(80);
-  let focused = await _readActiveElement(sessionId);
-  if (focused && `${focused.tag}|${focused.text}|${focused.ref}` !== baselineKey) {
-    logger.info(`[instruction.runner] Overlay probe: ArrowDown changed focus → ARROW mode`);
-    // Shift+ArrowUp to undo the probe (go back to first item or baseline)
-    await browserAct({ action: 'press', sessionId, key: 'ArrowUp', headed: true, timeoutMs: 2000 });
-    await _sleep(50);
-    return 'arrow';
-  }
-
-  // ArrowDown didn't change — try Tab
-  await browserAct({ action: 'press', sessionId, key: 'Tab', headed: true, timeoutMs: 2000 });
-  await _sleep(80);
-  focused = await _readActiveElement(sessionId);
-  if (focused && `${focused.tag}|${focused.text}|${focused.ref}` !== baselineKey) {
-    logger.info(`[instruction.runner] Overlay probe: Tab changed focus → TAB mode`);
-    // Shift+Tab to undo
-    await browserAct({ action: 'press', sessionId, key: 'Shift+Tab', headed: true, timeoutMs: 2000 });
-    await _sleep(50);
-    return 'tab';
-  }
-
-  // Try ArrowDown again (some menus need 2 presses to focus first item)
-  await browserAct({ action: 'press', sessionId, key: 'ArrowDown', headed: true, timeoutMs: 2000 });
-  await _sleep(80);
-  focused = await _readActiveElement(sessionId);
-  if (focused && `${focused.tag}|${focused.text}|${focused.ref}` !== baselineKey) {
-    logger.info(`[instruction.runner] Overlay probe: 2nd ArrowDown changed focus → ARROW mode`);
-    await browserAct({ action: 'press', sessionId, key: 'ArrowUp', headed: true, timeoutMs: 2000 });
-    await _sleep(50);
-    return 'arrow';
-  }
-
-  // Try Tab again
-  await browserAct({ action: 'press', sessionId, key: 'Tab', headed: true, timeoutMs: 2000 });
-  await _sleep(80);
-  focused = await _readActiveElement(sessionId);
-  if (focused && `${focused.tag}|${focused.text}|${focused.ref}` !== baselineKey) {
-    logger.info(`[instruction.runner] Overlay probe: 2nd Tab changed focus → TAB mode`);
-    await browserAct({ action: 'press', sessionId, key: 'Shift+Tab', headed: true, timeoutMs: 2000 });
-    await _sleep(50);
-    return 'tab';
-  }
-
-  // Nothing changed — default to Tab mode
-  logger.info(`[instruction.runner] Overlay probe: no focus change — defaulting to TAB mode`);
-  return 'tab';
+// Generate a signature for an element to detect loops
+function _elementSignature(el) {
+  if (!el) return 'null';
+  return `${el.tag}|${el.text || ''}|${el.x || 0},${el.y || 0}`;
 }
 
-// Check if we're inside an overlay (modal/dropdown) by checking if Escape
-// changes the activeElement or closes something
-async function _isInsideOverlay(sessionId) {
-  const before = await _readActiveElement(sessionId);
-  const beforeKey = `${before?.tag}|${before?.text}|${before?.ref}`;
-  await browserAct({ action: 'press', sessionId, key: 'Escape', headed: true, timeoutMs: 2000 });
-  await _sleep(100);
-  const after = await _readActiveElement(sessionId);
-  const afterKey = `${after?.tag}|${after?.text}|${after?.ref}`;
-  if (beforeKey !== afterKey) {
-    // Escape changed focus — we were inside an overlay. But now we closed it.
-    // We need to re-open it. This is destructive, so we only use this for
-    // the "should we reset to address bar" decision, not for detection.
-    // Actually, let's NOT use this — it's destructive. Return false.
-    // Re-press the trigger to reopen... but we don't know the trigger.
-    // Better: just return false and let the caller decide.
-    return false;
+// Distinguish a real focus change from a scroll-induced coordinate shift.
+// If tag + text + x are the same but only y changed, the page scrolled
+// (ArrowDown on a regular page) — not a real focus change.
+function _isRealFocusChange(before, after) {
+  if (!before) return !!after;
+  if (!after) return false;
+  // Same element but y changed = scroll, not focus change
+  if (before.tag === after.tag &&
+      (before.text || '') === (after.text || '') &&
+      (before.x || 0) === (after.x || 0) &&
+      (before.y || 0) !== (after.y || 0)) {
+    return false; // scroll
   }
+  return _elementSignature(before) !== _elementSignature(after);
+}
+
+// ---------------------------------------------------------------------------
+// Fuzzy text matching — handles garbled training text where characters are
+// dropped within words (e.g. "playli t" → "playlist", "ong" → "song").
+// ---------------------------------------------------------------------------
+
+// Normalize text: lowercase, remove all spaces and punctuation
+function _normalizeText(s) {
+  return (s || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+}
+
+// Check if a is a subsequence of b (all chars of a appear in b in order)
+function _isSubsequence(a, b) {
+  let i = 0;
+  for (let j = 0; j < b.length && i < a.length; j++) {
+    if (a[i] === b[j]) i++;
+  }
+  return i === a.length;
+}
+
+// Levenshtein distance (edit distance) between two strings
+function _levenshtein(a, b) {
+  const m = a.length, n = b.length;
+  if (m === 0) return n;
+  if (n === 0) return m;
+  const dp = Array.from({ length: m + 1 }, () => new Array(n + 1).fill(0));
+  for (let i = 0; i <= m; i++) dp[i][0] = i;
+  for (let j = 0; j <= n; j++) dp[0][j] = j;
+  for (let i = 1; i <= m; i++) {
+    for (let j = 1; j <= n; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      dp[i][j] = Math.min(dp[i - 1][j] + 1, dp[i][j - 1] + 1, dp[i - 1][j - 1] + cost);
+    }
+  }
+  return dp[m][n];
+}
+
+// Fuzzy match: returns true if target (garbled) likely refers to candidate (real).
+// 1. Subsequence check: garbled text is a subsequence of real text (chars dropped)
+// 2. Length guard: shorter string must be ≥ 70% of longer string's length
+// 3. Levenshtein fallback: edit distance < 30% of longer string's length
+function _fuzzyTextMatch(target, candidate) {
+  if (!target || !candidate) return false;
+  const t = _normalizeText(target);
+  const c = _normalizeText(candidate);
+  if (t === c) return true;
+  if (t.length === 0 || c.length === 0) return false;
+
+  const longer = t.length >= c.length ? t : c;
+  const shorter = t.length >= c.length ? c : t;
+
+  // Length guard — too different in length = not a match
+  if (shorter.length < longer.length * 0.7) return false;
+
+  // Subsequence check (handles character-dropping garbling)
+  if (_isSubsequence(shorter, longer)) return true;
+
+  // Levenshtein fallback
+  const dist = _levenshtein(t, c);
+  if (dist < longer.length * 0.3) return true;
+
   return false;
+}
+
+// ---------------------------------------------------------------------------
+// Tab-map persistence — save/load to ~/.thinkdrop/domain-maps/{domain}.tab-map.json
+// ---------------------------------------------------------------------------
+
+// Get the current domain from the browser session
+async function _getDomainFromSession(sessionId) {
+  try {
+    const result = await browserAct({
+      action: 'evaluate', sessionId, headed: true, timeoutMs: 3000,
+      text: 'window.location.hostname',
+    });
+    return result?.result || result?.value || null;
+  } catch (e) {
+    return null;
+  }
+}
+
+// Get the path for the domain's tab-map file
+function _tabMapFilePath(domain) {
+  const dir = path.join(os.homedir(), '.thinkdrop', 'domain-maps');
+  return path.join(dir, `${domain}.tab-map.json`);
+}
+
+// Load the persisted tab-map for a domain (returns array of elements or empty)
+function _loadTabMap(domain) {
+  if (!domain) return [];
+  try {
+    const filePath = _tabMapFilePath(domain);
+    if (!fs.existsSync(filePath)) return [];
+    const data = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+    if (data?.elements && Array.isArray(data.elements)) {
+      logger.info(`[instruction.runner] Loaded tab-map for ${domain}: ${data.elements.length} elements`);
+      return data.elements;
+    }
+  } catch (e) {
+    logger.warn(`[instruction.runner] Failed to load tab-map for ${domain}: ${e.message}`);
+  }
+  return [];
+}
+
+// Save the tab-map for a domain (merges new elements with existing ones)
+function _saveTabMap(domain, map) {
+  if (!domain || !map || map.length === 0) return;
+  try {
+    const filePath = _tabMapFilePath(domain);
+    const dir = path.dirname(filePath);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+
+    // Load existing elements to merge
+    let existing = [];
+    try {
+      if (fs.existsSync(filePath)) {
+        const data = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+        existing = data?.elements || [];
+      }
+    } catch (e) { /* ignore — start fresh */ }
+
+    // Merge: add new elements (by signature) that don't exist in the persisted map
+    const existingSigs = new Set(existing.map(e => `${e.tag}|${e.text || ''}|${e.x || 0},${e.y || 0}`));
+    let added = 0;
+    for (const el of map) {
+      const sig = `${el.tag}|${el.text || ''}|${el.x || 0},${el.y || 0}`;
+      if (!existingSigs.has(sig)) {
+        existing.push({
+          tag: el.tag,
+          text: el.text || '',
+          ariaLabel: el.ariaLabel || '',
+          role: el.role || '',
+          x: el.x || 0,
+          y: el.y || 0,
+          w: el.w || 0,
+          h: el.h || 0,
+          key: el.key || 'Tab',
+        });
+        existingSigs.add(sig);
+        added++;
+      }
+    }
+
+    const output = {
+      domain,
+      lastUpdated: new Date().toISOString(),
+      elements: existing,
+    };
+    fs.writeFileSync(filePath, JSON.stringify(output, null, 2));
+    logger.info(`[instruction.runner] Saved tab-map for ${domain}: ${existing.length} elements (${added} new)`);
+  } catch (e) {
+    logger.warn(`[instruction.runner] Failed to save tab-map for ${domain}: ${e.message}`);
+  }
+}
+
+// Build a tab-map by scanning all focusable elements in the current state.
+// Per-step fallback: ArrowRight → ArrowDown → Tab (each step tries all 3 keys).
+//   - ArrowRight: enters dropdowns from trigger, horizontal menus
+//   - ArrowDown: vertical lists (dropdowns, menus)
+//   - Tab: general navigation (modals, page elements)
+// Set-based deduplication: O(1) check for seen elements.
+// Starter tracking: first element added to map; when we loop back to it,
+//   the current region is fully scanned. Tab then exits to the next region.
+// Safety cap: 150 elements (prevents scanning 30k YouTube comments).
+// skipReset: when true, don't reset focus to page top (for scanning inside
+//   an open dropdown/modal — resetting would close the overlay).
+async function buildTabMap(sessionId, maxElements = 150, options = {}) {
+  const { skipReset = false } = options;
+  const map = [];
+  const seenSet = new Set(); // O(1) deduplication
+  let idCounter = 0;
+  let starterSig = null; // first element — when we loop back, scan is done
+
+  if (!skipReset) {
+    await _resetFocusToPageTop(sessionId);
+  }
+
+  for (let i = 0; i < maxElements; i++) {
+    const before = await _readActiveElement(sessionId);
+    let current = before; // tracks current focus position (may shift via arrows)
+    let advanced = false;
+
+    // 1. Try ArrowRight (enters dropdowns from trigger, horizontal menus)
+    await browserAct({ action: 'press', sessionId, key: 'ArrowRight', headed: true, timeoutMs: 2000 });
+    await _sleep(60);
+    let after = await _readActiveElement(sessionId);
+
+    if (_isRealFocusChange(current, after)) {
+      const sig = _elementSignature(after);
+      if (!seenSet.has(sig)) {
+        // New element — add to set + map
+        seenSet.add(sig);
+        if (!starterSig) starterSig = sig;
+        map.push({ id: ++idCounter, ...after, key: 'ArrowRight' });
+        advanced = true;
+      } else {
+        // Seen element — update current position, fall through to ArrowDown
+        current = after;
+      }
+    }
+    // else: no focus change — current stays the same, fall through to ArrowDown
+
+    // 2. Try ArrowDown (vertical lists: dropdowns, menus — may scroll page)
+    if (!advanced) {
+      await browserAct({ action: 'press', sessionId, key: 'ArrowDown', headed: true, timeoutMs: 2000 });
+      await _sleep(60);
+      after = await _readActiveElement(sessionId);
+
+      if (_isRealFocusChange(current, after)) {
+        const sig = _elementSignature(after);
+        if (!seenSet.has(sig)) {
+          seenSet.add(sig);
+          if (!starterSig) starterSig = sig;
+          map.push({ id: ++idCounter, ...after, key: 'ArrowDown' });
+          advanced = true;
+        } else {
+          // Seen element — update current, fall through to Tab
+          current = after;
+        }
+      }
+    }
+
+    // 3. Try Tab (general navigation — modals, page elements)
+    if (!advanced) {
+      await browserAct({ action: 'press', sessionId, key: 'Tab', headed: true, timeoutMs: 2000 });
+      await _sleep(60);
+      after = await _readActiveElement(sessionId);
+
+      if (!after) break; // nothing focusable
+
+      if (_isRealFocusChange(current, after)) {
+        const sig = _elementSignature(after);
+        if (!seenSet.has(sig)) {
+          seenSet.add(sig);
+          if (!starterSig) starterSig = sig;
+          map.push({ id: ++idCounter, ...after, key: 'Tab' });
+          advanced = true;
+        } else {
+          // Tab led to a seen element — check if it's the starter (looped back)
+          if (sig === starterSig) {
+            logger.info(`[instruction.runner] buildTabMap: looped back to starter — scan done`);
+            break;
+          }
+          // Seen but not starter — all keys exhausted
+          break;
+        }
+      } else {
+        // Tab didn't change focus — end of focusable elements
+        break;
+      }
+    }
+
+    // If nothing advanced, all keys led to seen elements or no change
+    if (!advanced) break;
+  }
+
+  logger.info(`[instruction.runner] buildTabMap: scanned ${map.length} elements (cap=${maxElements}, skipReset=${skipReset})`);
+
+  // Persist the tab-map for this domain (merges with existing elements)
+  const domain = await _getDomainFromSession(sessionId);
+  if (domain) {
+    _saveTabMap(domain, map);
+  }
+
+  return map;
+}
+
+// ---------------------------------------------------------------------------
+// Page search: window.find() + Ctrl+F fallback + tab-to-nearby
+// ---------------------------------------------------------------------------
+// Finds specific text content on the page using browser-native search.
+// Used for dynamic content (playlist names, comments, emails) that can't
+// be cached in the tab-map. After finding text, can tab to nearby elements.
+
+// Search for text on the page using window.find() (Chrome supports this).
+// Returns the focused element after the search, or null if not found.
+// After page search finds text, walk to the nearest input/textarea if the
+// focused element is not itself an input. window.find() often focuses the
+// container element (e.g. <main> or <div>) instead of the actual <input>.
+async function _focusNearestInput(sessionId, text) {
+  const escaped = JSON.stringify(text);
+  try {
+    const res = await browserAct({
+      action: 'evaluate', sessionId, headed: true, timeoutMs: 3000,
+      text: `(() => {
+        const el = document.activeElement;
+        if (!el) return null;
+        // Already an input/textarea — return it
+        if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') {
+          return { tag: el.tagName.toLowerCase(), text: '', placeholder: el.placeholder || '', ariaLabel: el.getAttribute('aria-label') || '' };
+        }
+        const target = ${escaped};
+        const targetLower = target.toLowerCase();
+        // Search descendants for input with matching placeholder/aria-label
+        const matches = (sel) => {
+          const list = el.querySelectorAll(sel);
+          for (const input of list) {
+            const ph = (input.placeholder || '').toLowerCase();
+            const al = (input.getAttribute('aria-label') || '').toLowerCase();
+            if (ph.includes(targetLower) || al.includes(targetLower)) {
+              input.focus();
+              return { tag: input.tagName.toLowerCase(), text: '', placeholder: input.placeholder || '', ariaLabel: input.getAttribute('aria-label') || '' };
+            }
+          }
+          return null;
+        };
+        let r = matches('input, textarea');
+        if (r) return r;
+        // Search parent's descendants (siblings and cousins)
+        const parent = el.parentElement;
+        if (parent) {
+          r = matches('input, textarea');
+          if (r) return r;
+        }
+        // Search whole document for matching input
+        const all = document.querySelectorAll('input, textarea');
+        for (const input of all) {
+          const ph = (input.placeholder || '').toLowerCase();
+          const al = (input.getAttribute('aria-label') || '').toLowerCase();
+          if (ph.includes(targetLower) || al.includes(targetLower)) {
+            input.focus();
+            return { tag: input.tagName.toLowerCase(), text: '', placeholder: input.placeholder || '', ariaLabel: input.getAttribute('aria-label') || '' };
+          }
+        }
+        return null;
+      })()`,
+    });
+    if (res?.result) {
+      logger.info(`[instruction.runner] _focusNearestInput: focused ${res.result.tag} placeholder="${res.result.placeholder}" for "${text}"`);
+      return res.result;
+    }
+  } catch (e) {
+    logger.warn(`[instruction.runner] _focusNearestInput failed: ${e.message}`);
+  }
+  return null;
+}
+
+async function pageSearch(sessionId, text) {
+  if (!text) return null;
+
+  // Try window.find() first — programmatic, works in Playwright
+  try {
+    const res = await browserAct({
+      action: 'evaluate', sessionId, headed: true, timeoutMs: 3000,
+      text: `window.find(${JSON.stringify(text)}, false, false, true)`,
+    });
+    const found = res?.result === true || res?.result === 'true';
+    if (found) {
+      await _sleep(100);
+      let focused = await _readActiveElement(sessionId);
+      // If focused element is not an input, try to walk to nearest input
+      // (window.find often focuses the container, not the actual input)
+      if (focused && focused.tag !== 'input' && focused.tag !== 'textarea') {
+        const inputEl = await _focusNearestInput(sessionId, text);
+        if (inputEl) {
+          focused = await _readActiveElement(sessionId);
+        }
+      }
+      if (focused) {
+        logger.info(`[instruction.runner] pageSearch: window.find found "${text}" → focused ${focused.tag} "${(focused.text || '').substring(0, 40)}"`);
+        return focused;
+      }
+    }
+  } catch (e) {
+    logger.warn(`[instruction.runner] pageSearch: window.find failed: ${e.message}`);
+  }
+
+  // Fallback: Ctrl+F (Meta+F on Mac) via keyboard
+  try {
+    const isMac = process.platform === 'darwin';
+    const findKey = isMac ? 'Meta+f' : 'Control+f';
+    await browserAct({ action: 'press', sessionId, key: findKey, headed: true, timeoutMs: 2000 });
+    await _sleep(300);
+
+    // Type the search text character by character
+    for (const char of text) {
+      await browserAct({ action: 'press', sessionId, key: char, headed: true, timeoutMs: 1000 });
+      await _sleep(30);
+    }
+    await browserAct({ action: 'press', sessionId, key: 'Enter', headed: true, timeoutMs: 2000 });
+    await _sleep(300);
+
+    // Close find bar
+    await browserAct({ action: 'press', sessionId, key: 'Escape', headed: true, timeoutMs: 1500 });
+    await _sleep(100);
+
+    let focused = await _readActiveElement(sessionId);
+    if (focused && focused.tag !== 'input' && focused.tag !== 'textarea') {
+      const inputEl = await _focusNearestInput(sessionId, text);
+      if (inputEl) {
+        focused = await _readActiveElement(sessionId);
+      }
+    }
+    if (focused) {
+      logger.info(`[instruction.runner] pageSearch: Ctrl+F found "${text}" → focused ${focused.tag} "${(focused.text || '').substring(0, 40)}"`);
+      return focused;
+    }
+  } catch (e) {
+    logger.warn(`[instruction.runner] pageSearch: Ctrl+F fallback failed: ${e.message}`);
+  }
+
+  logger.info(`[instruction.runner] pageSearch: "${text}" not found on page`);
+  return null;
+}
+
+// Search for text, then tab forward to find a nearby element matching a label.
+// Used for: "Click Reply on John Smith's comment" → find "John Smith", tab to "Reply".
+// Returns the focused element matching the nearbyLabel, or the search result if no match.
+async function pageSearchAndTabTo(sessionId, searchText, nearbyLabel, maxTabs = 5) {
+  const found = await pageSearch(sessionId, searchText);
+  if (!found) return null;
+  if (!nearbyLabel) return found;
+
+  const labelLower = nearbyLabel.toLowerCase().trim();
+  // Check if the found element itself matches
+  const foundText = (found.text || '').toLowerCase();
+  const foundAria = (found.ariaLabel || '').toLowerCase();
+  if (foundText.includes(labelLower) || foundAria.includes(labelLower)) {
+    return found;
+  }
+
+  // Tab forward looking for the nearby element
+  for (let i = 0; i < maxTabs; i++) {
+    await browserAct({ action: 'press', sessionId, key: 'Tab', headed: true, timeoutMs: 2000 });
+    await _sleep(60);
+    const focused = await _readActiveElement(sessionId);
+    if (!focused) continue;
+    const fText = (focused.text || '').toLowerCase();
+    const fAria = (focused.ariaLabel || '').toLowerCase();
+    if (fText.includes(labelLower) || fAria.includes(labelLower)) {
+      logger.info(`[instruction.runner] pageSearchAndTabTo: found "${nearbyLabel}" after ${i + 1} tabs from "${searchText}"`);
+      return focused;
+    }
+  }
+
+  logger.info(`[instruction.runner] pageSearchAndTabTo: found "${searchText}" but couldn't tab to "${nearbyLabel}"`);
+  return found; // return the search result even if nearby element not found
+}
+
+// ---------------------------------------------------------------------------
+// LLM selection from tab-map
+// ---------------------------------------------------------------------------
+// Formats the tab-map as a simplified numbered list (no coordinates) for the
+// LLM to pick the best match. Maps the LLM's pick back to the full entry
+// with real coordinates for clicking.
+
+// Format a tab-map entry as a simplified line for the LLM
+function _formatTabMapEntryForLLM(entry) {
+  const parts = [entry.tag || 'element'];
+  if (entry.text && entry.text.length > 0) {
+    parts.push(`"${entry.text.substring(0, 60)}"`);
+  }
+  if (entry.ariaLabel && entry.ariaLabel.length > 0) {
+    parts.push(`ariaLabel="${entry.ariaLabel.substring(0, 40)}"`);
+  }
+  if (entry.placeholder && entry.placeholder.length > 0) {
+    parts.push(`placeholder="${entry.placeholder.substring(0, 40)}"`);
+  }
+  if (entry.isIconLike) {
+    parts.push('icon');
+  }
+  if (entry.role && entry.role !== entry.tag) {
+    parts.push(`role=${entry.role}`);
+  }
+  return parts.join(' ');
+}
+
+// Ask the LLM to pick the best element from a tab-map for a given step.
+// Returns the full tab-map entry (with coordinates) or null.
+async function _llmPickFromTabMap(tabMap, stepAction, verifyText, value) {
+  if (!tabMap || tabMap.length === 0) return null;
+
+  // Build simplified list
+  const listStr = tabMap.map(e => `${e.id} - ${_formatTabMapEntryForLLM(e)}`).join('\n');
+
+  const actionDesc = stepAction === 'fill'
+    ? `Type "${value || ''}" into the matching field`
+    : stepAction === 'click'
+    ? `Click the matching element`
+    : `${stepAction} the matching element`;
+
+  const prompt = `Step: ${actionDesc} — target: "${verifyText}"
+
+Available elements:
+${listStr}
+
+Which element number EXACTLY matches the step target?
+- The element's text, ariaLabel, or placeholder must closely match the target text
+- "Create" does NOT match "Create a playlist with a song or episode" (different text)
+- "Create" only matches if the target is exactly "Create" or "Create button"
+- If NO element closely matches, output 0
+Output ONLY the number, or 0 if no match.`;
+
+  try {
+    const response = await askWithMessages([
+      { role: 'system', content: 'You pick the exactly matching element from a list. Output ONLY the number, or 0 if no exact match. Nothing else.' },
+      { role: 'user', content: prompt },
+    ], { maxTokens: 10, temperature: 0, responseTimeoutMs: 8000 });
+
+    const id = parseInt((response || '').trim().replace(/\D/g, ''), 10);
+    if (id > 0) {
+      const entry = tabMap.find(e => e.id === id);
+      if (entry) {
+        logger.info(`[instruction.runner] LLM picked element #${id} (${_formatTabMapEntryForLLM(entry)}) for "${verifyText}"`);
+        return entry;
+      }
+    }
+    logger.info(`[instruction.runner] LLM returned ${id} (no match) for "${verifyText}" — trying fuzzy fallback`);
+
+    // Fuzzy fallback: if LLM returned 0, try fuzzy matching the target text
+    // against each tab-map entry's text/ariaLabel. Handles garbled training text
+    // where characters are dropped within words (e.g. "playli t" → "playlist").
+    let bestEntry = null;
+    let bestScore = 0;
+    for (const entry of tabMap) {
+      const candidateText = entry.text || entry.ariaLabel || entry.placeholder || '';
+      if (!candidateText) continue;
+      if (_fuzzyTextMatch(verifyText, candidateText)) {
+        // Use the word-overlap score to pick the best match among fuzzy matches
+        const score = _fuzzyTextScore(verifyText, candidateText);
+        if (score > bestScore) {
+          bestScore = score;
+          bestEntry = entry;
+        }
+      }
+    }
+    if (bestEntry) {
+      logger.info(`[instruction.runner] Fuzzy fallback picked element #${bestEntry.id} (${_formatTabMapEntryForLLM(bestEntry)}) for "${verifyText}" (score=${bestScore.toFixed(2)})`);
+      return bestEntry;
+    }
+  } catch (e) {
+    logger.warn(`[instruction.runner] LLM pick from tab-map failed: ${e.message}`);
+  }
+  return null;
+}
+
+
+// ---------------------------------------------------------------------------
+// Uses LiteParser+OCR to get visible text/icon coordinates, then tabs through
+// the page. For each tab stop, checks THREE data points against ALL OCR rows:
+//   1. Bounds overlap (≥30% of smaller rect)
+//   2. Fuzzy text match (≥0.5 word overlap)
+//   3. Icon inference (both active element and OCR row are icon-like)
+// A match requires at least 2 of 3 applicable data points to pass.
+// Bounds overlap is always required — never match without coordinate agreement.
+// Re-OCRs when the active element scrolls outside the current screenshot.
+// Falls back to the slow path (_discoverKeyPathStep) on any failure.
+
+// Calculate overlap percentage between two rects (0-100).
+function _rectOverlapPercent(a, b) {
+  const overlapX = Math.max(0, Math.min(a.x + a.width, b.x + b.width) - Math.max(a.x, b.x));
+  const overlapY = Math.max(0, Math.min(a.y + a.height, b.y + b.height) - Math.max(a.y, b.y));
+  const overlapArea = overlapX * overlapY;
+  const aArea = (a.width || 0) * (a.height || 0);
+  const bArea = (b.width || 0) * (b.height || 0);
+  const smallerArea = Math.min(aArea, bArea);
+  if (smallerArea <= 0) return 0;
+  return (overlapArea / smallerArea) * 100;
+}
+
+// Fuzzy text score: returns a score 0-1 based on word-level overlap.
+// Handles OCR garbling: "Create playli t" → 1.0 match with "Create playlist".
+function _fuzzyTextScore(a, b) {
+  if (!a || !b) return 0;
+  const aLower = a.toLowerCase().trim();
+  const bLower = b.toLowerCase().trim();
+  if (aLower === bLower) return 1.0;
+  const aWords = aLower.split(/\s+/).filter(w => w.length > 2);
+  const bWords = bLower.split(/\s+/).filter(w => w.length > 2);
+  if (aWords.length === 0 || bWords.length === 0) return 0;
+  const matched = aWords.filter(w => bWords.some(bw => bw.includes(w) || w.includes(bw)));
+  return matched.length / Math.max(aWords.length, bWords.length);
+}
+
+// Check if an OCR row is icon-like (non-alphanumeric, small, or type:'icon').
+function _isOcrRowIconLike(row) {
+  if (!row) return false;
+  if (row.type === 'icon') return true;
+  const text = (row.text || '').trim();
+  if (text.length === 0) return false;
+  if (text.length <= 2 && !/[a-z0-9]/i.test(text)) return true;
+  if ((row.width || 0) < 50 && (row.height || 0) < 50 && text.length < 3) return true;
+  return false;
+}
+
+// OCR fast path step: capture → structure → tab, checking 2-of-3 per tab stop.
+// Returns { ok, count, navMode, focusedText, ref, mouse, matchedBy, scores }
+// or { ok: false, error, fallback: true } (caller should fall back to slow path).
+async function _ocrFastPathStep(sessionId, verifyText, navMode = 'tab', maxTabs = 60, stepAction = '') {
+  const target = (verifyText || '').toLowerCase().trim();
+  if (!target) return { ok: false, error: 'no verify text', fallback: true };
+
+  // 1. Get the Playwright page from the engine
+  let engine, page;
+  try {
+    engine = require('./browser-engine.cjs');
+    page = engine.getPage(sessionId);
+  } catch (e) {
+    return { ok: false, error: `engine access failed: ${e.message}`, fallback: true };
+  }
+  if (!page) return { ok: false, error: 'no page available for OCR', fallback: true };
+
+  // 2. Initial OCR capture
+  let _liteparseCapture;
+  try {
+    ({ _liteparseCapture } = require('./browser.agent.cjs'));
+  } catch (e) {
+    return { ok: false, error: `could not load _liteparseCapture: ${e.message}`, fallback: true };
+  }
+  const { structureOcrOverlayItems } = require('./ocrOverlayStructure.cjs');
+
+  let cap = await _liteparseCapture(page);
+  if (!cap?.ok || !cap.textItems || cap.textItems.length === 0) {
+    return { ok: false, error: `OCR capture failed: ${cap?.error || 'no text items'}`, fallback: true };
+  }
+
+  let ocrRows = structureOcrOverlayItems(cap.textItems);
+  if (ocrRows.length === 0) {
+    return { ok: false, error: 'no OCR rows after structuring', fallback: true };
+  }
+  let screenshotHeight = cap.imageHeight || 800;
+  logger.info(`[instruction.runner] OCR fast path: captured ${ocrRows.length} rows, screenshot ${cap.imageWidth}x${screenshotHeight}`);
+
+  // 3. Tab through, checking 2-of-3 data points against ALL OCR rows per stop
+  const key = navMode === 'arrow' ? 'ArrowDown' : 'Tab';
+  const isFillStep = stepAction === 'fill';
+  const isClickStep = stepAction === 'click' || stepAction === 'dblclick' || stepAction === 'select';
+
+  for (let i = 0; i < maxTabs; i++) {
+    await browserAct({ action: 'press', sessionId, key, headed: true, timeoutMs: 2000 });
+    await _sleep(80);
+    await _scrollActiveIntoView(sessionId);
+
+    const focused = await _readActiveElement(sessionId);
+    if (!focused) continue;
+
+    // ── Re-OCR if active element is outside current screenshot bounds ──
+    if (focused.y + focused.h < 0 || focused.y > screenshotHeight) {
+      logger.info(`[instruction.runner] OCR fast path: element at y=${focused.y} outside OCR bounds (0..${screenshotHeight}) — re-capturing (tab ${i + 1})`);
+      cap = await _liteparseCapture(page);
+      if (cap?.ok && cap.textItems && cap.textItems.length > 0) {
+        ocrRows = structureOcrOverlayItems(cap.textItems);
+        screenshotHeight = cap.imageHeight || 800;
+        logger.info(`[instruction.runner] OCR fast path: re-captured ${ocrRows.length} rows`);
+      }
+    }
+
+    const focusedRect = { x: focused.x, y: focused.y, width: focused.w, height: focused.h };
+    const focusedText = focused.text || '';
+    const focusedIsIcon = !!(focused.isIconLike || focusedText.length < 3);
+
+    // Check against ALL OCR rows — 2 of 3 data points
+    for (const row of ocrRows) {
+      const rowRect = { x: row.x, y: row.y, width: row.width, height: row.height };
+      const rowText = row.text || '';
+      const rowIsIcon = _isOcrRowIconLike(row);
+
+      // Data point 1: bounds overlap (always required)
+      const overlapPct = _rectOverlapPercent(focusedRect, rowRect);
+      const boundsMatch = overlapPct >= 30;
+      if (!boundsMatch) continue; // no coordinate agreement → skip this row
+
+      // Data point 2: fuzzy text match — OCR row text vs step's verifyText
+      // (is this the element we're looking for? not just a consistency check)
+      let textMatch = false;
+      let textApplicable = true;
+      if (focusedIsIcon && rowIsIcon) {
+        textApplicable = false; // both icons — text is N/A
+      } else if (rowText.length > 0) {
+        // Match OCR row text against the step target
+        textMatch = _fuzzyTextScore(rowText, verifyText) >= 0.5;
+        // Also try active element's ariaLabel (e.g. icon button with label "Create")
+        if (!textMatch && focused.ariaLabel && focused.ariaLabel.length > 0) {
+          textMatch = _fuzzyTextScore(focused.ariaLabel, verifyText) >= 0.5;
+        }
+      } else {
+        textApplicable = false; // OCR row has no text
+      }
+
+      // Data point 3: icon inference
+      let iconMatch = false;
+      let iconApplicable = focusedIsIcon || rowIsIcon;
+      if (iconApplicable && focusedIsIcon && rowIsIcon) {
+        iconMatch = true; // both icon-like + bounds overlap → icon inference passes
+      } else if (iconApplicable && (focusedIsIcon || rowIsIcon) && overlapPct >= 50) {
+        // One is icon, one is text — if bounds strongly overlap, count it
+        iconMatch = true;
+      }
+
+      // Count matches (only applicable data points count)
+      const applicableCount = 1 + (textApplicable ? 1 : 0) + (iconApplicable ? 1 : 0);
+      const matchCount = 1 + (textMatch ? 1 : 0) + (iconMatch ? 1 : 0); // bounds always counts (we already continued if no bounds)
+      const threshold = Math.ceil(applicableCount * 0.67); // 2 of 3, or 2 of 2
+
+      if (matchCount >= threshold) {
+        // Verify element type via probe (same as slow path)
+        const editable = await _isEditableByProbe(sessionId);
+        if (isFillStep && !editable) {
+          logger.info(`[instruction.runner] OCR fast path: 2-of-3 match on row "${rowText}" but not editable — keep tabbing`);
+          continue;
+        }
+        if (isClickStep && editable) {
+          logger.info(`[instruction.runner] OCR fast path: 2-of-3 match on row "${rowText}" but editable (not a button) — keep tabbing`);
+          continue;
+        }
+        logger.info(`[instruction.runner] OCR fast path: found "${verifyText}" after ${i + 1} ${key}s — 2-of-3 match (bounds=${overlapPct.toFixed(0)}% text=${textMatch} icon=${iconMatch} row="${rowText}" focused="${focusedText.substring(0, 40)}" editable=${editable})`);
+        return { ok: true, count: i + 1, navMode, focusedText, ref: focused.ref || null,
+                 mouse: false, matchedBy: 'ocr_2of3',
+                 scores: { bounds: overlapPct, text: textMatch, icon: iconMatch, ocrRowText: rowText } };
+      }
+    }
+  }
+
+  return { ok: false, error: `OCR fast path: could not find "${verifyText}" after ${maxTabs} ${key}s`, fallback: true };
 }
 
 // ---------------------------------------------------------------------------
@@ -549,79 +1235,53 @@ async function _executeCachedKeyPathStep(sessionId, step) {
   const cachedCount = step.cachedCount || 0;
   const navMode = step.navMode || 'tab';
   const key = navMode === 'arrow' ? 'ArrowDown' : 'Tab';
-  const reverseKey = navMode === 'arrow' ? 'ArrowUp' : 'Shift+Tab';
+  const WINDOW = 3;
 
+  // Focus is at the expected starting point for this step (the previous action left it there).
+  // Search a ±3 window around the cached count. This gives flexibility for minor page state
+  // changes without calling the LLM for every single tabbed element.
+  logger.info(`[instruction.runner] Cached keyPath: searching ±${WINDOW} around count=${cachedCount} (mode=${navMode}) for "${step.verifyText}"`);
+
+  let startCount;
   if (cachedCount === 0) {
-    // No keys to press — verify current focus
-    const focused = await _readActiveElement(sessionId);
-    if (focused?.text && await _llmMatchFocusedItem(step.verifyText, focused.text)) {
-      return { ok: true, focusedText: focused.text, ref: focused.ref, newCount: 0 };
-    }
-    // Fall through to backtracking
+    // Target should be at the current focus; also allow up to WINDOW steps forward.
+    startCount = 0;
   } else {
-    // Fast: press cached keys without LLM checking
-    for (let i = 0; i < cachedCount; i++) {
+    startCount = Math.max(0, cachedCount - WINDOW);
+    // Move to the start of the window quickly without LLM checks
+    for (let i = 0; i < startCount; i++) {
       await browserAct({ action: 'press', sessionId, key, headed: true, timeoutMs: 2000 });
-      await _sleep(50); // faster on cached path
+      await _sleep(40);
     }
     await _scrollActiveIntoView(sessionId);
-
-    // Verify
-    const focused = await _readActiveElement(sessionId);
-    if (focused?.text && await _llmMatchFocusedItem(step.verifyText, focused.text)) {
-      logger.info(`[instruction.runner] Cached path: verified "${focused.text}" at count=${cachedCount}`);
-      return { ok: true, focusedText: focused.text, ref: focused.ref, newCount: cachedCount };
-    }
-
-    logger.info(`[instruction.runner] Cached path: count=${cachedCount} missed — backtracking`);
   }
 
-  // Backtrack: proportional window
-  const backCount = Math.max(5, Math.floor(cachedCount * 0.2));
-  const forwardCount = Math.max(10, Math.floor(cachedCount * 0.3));
-
-  // Shift+Tab/ArrowUp back
-  for (let i = 0; i < backCount; i++) {
-    await browserAct({ action: 'press', sessionId, key: reverseKey, headed: true, timeoutMs: 2000 });
-    await _sleep(80);
-    await _scrollActiveIntoView(sessionId);
+  const endCount = cachedCount + WINDOW;
+  for (let pos = startCount; pos <= endCount; pos++) {
     const focused = await _readActiveElement(sessionId);
     if (focused?.text && await _llmMatchFocusedItem(step.verifyText, focused.text)) {
-      const newCount = Math.max(0, cachedCount - i - 1);
-      logger.info(`[instruction.runner] Backtrack: found at count=${newCount} (back ${i + 1})`);
-      return { ok: true, focusedText: focused.text, ref: focused.ref, newCount };
+      logger.info(`[instruction.runner] Cached keyPath: found "${focused.text}" at count=${pos} (cached ${cachedCount})`);
+      return { ok: true, focusedText: focused.text, ref: focused.ref, newCount: pos };
+    }
+    // Advance one key, unless this is the last position in the window
+    if (pos < endCount) {
+      await browserAct({ action: 'press', sessionId, key, headed: true, timeoutMs: 2000 });
+      await _sleep(40);
+      await _scrollActiveIntoView(sessionId);
     }
   }
 
-  // Tab/ArrowDown forward from cached position
-  // First, re-press the cached keys to get back to cached position
-  for (let i = 0; i < backCount; i++) {
-    await browserAct({ action: 'press', sessionId, key, headed: true, timeoutMs: 2000 });
-    await _sleep(50);
-  }
-  // Now go forward
-  for (let i = 0; i < forwardCount; i++) {
-    await browserAct({ action: 'press', sessionId, key, headed: true, timeoutMs: 2000 });
-    await _sleep(80);
-    await _scrollActiveIntoView(sessionId);
-    const focused = await _readActiveElement(sessionId);
-    if (focused?.text && await _llmMatchFocusedItem(step.verifyText, focused.text)) {
-      const newCount = cachedCount + i + 1;
-      logger.info(`[instruction.runner] Forward search: found at count=${newCount} (forward ${i + 1})`);
-      return { ok: true, focusedText: focused.text, ref: focused.ref, newCount };
-    }
-  }
+  logger.info(`[instruction.runner] Cached keyPath: ±${WINDOW} window around ${cachedCount} missed — falling back to re-discovery`);
 
   // Full re-discovery: reset to address bar and search from 0
-  logger.info(`[instruction.runner] Backtrack failed — full re-discovery from address bar`);
   await _pressEscape(sessionId); // close any stray overlay
   await _resetFocusToPageTop(sessionId);
-  const discoverResult = await _discoverKeyPathStep(sessionId, step.verifyText, navMode, 50, step.allowMouse || false, step.stepAction || '');
+  const discoverResult = await _discoverKeyPathStep(sessionId, step.verifyText, navMode, 50, true, step.stepAction || '');
   if (discoverResult?.ok) {
     return { ok: true, focusedText: discoverResult.focusedText, ref: discoverResult.ref, newCount: discoverResult.count };
   }
 
-  return { ok: false, error: `Could not find "${step.verifyText}" near cached position ${cachedCount} or after re-discovery` };
+  return { ok: false, error: `Could not find "${step.verifyText}" near cached position ${cachedCount} (±${WINDOW}) or after re-discovery` };
 }
 
 // ---------------------------------------------------------------------------
@@ -904,7 +1564,7 @@ async function runInstructionSkill({ instructions, keyPath, params, skillArgs, s
   // Execute each step
   const stepResults = [];
   const discoveredKeyPath = []; // build this for caching
-  let currentOverlayMode = null; // tracks if we're inside an overlay (arrow/tab)
+  // currentOverlayMode removed — buildTabMap handles arrow/tab detection internally
 
   for (let i = 0; i < steps.length; i++) {
     if (Date.now() > deadline) {
@@ -924,7 +1584,6 @@ async function runInstructionSkill({ instructions, keyPath, params, skillArgs, s
         }
         await _sleep(2000);
         await _resetFocusToPageTop(sessionId);
-        currentOverlayMode = null;
         // Clear LLM cache on page navigation — elements on the new page may share
         // focusKey (tag|text) with unrelated elements on the old page
         _clearLlmCache(sessionId);
@@ -963,7 +1622,7 @@ async function runInstructionSkill({ instructions, keyPath, params, skillArgs, s
       }
 
       // Determine nav mode for this step
-      let navMode = step.navMode || currentOverlayMode || 'tab';
+      let navMode = step.navMode || 'tab';
 
       // Decide if this step can use the mouse fallback.
       // All action types can use mouse fallback — clickByText + probe will verify
@@ -976,12 +1635,165 @@ async function runInstructionSkill({ instructions, keyPath, params, skillArgs, s
 
       // Navigate to the target element
       let navResult;
-      if (hasCachedPath && step.cachedCount !== undefined) {
-        // Fast path: use cached count
-        navResult = await _executeCachedKeyPathStep(sessionId, { ...step, navMode, stepAction });
-      } else {
-        // Slow path: discover the path
-        navResult = await _discoverKeyPathStep(sessionId, verifyText, navMode, 50, allowMouse, stepAction);
+
+      // ── Tab-map approach (first run only, not cached) ──────────────────
+      // Build a fresh tab-map of the current state, feed to LLM to pick the
+      // target element, click at its coordinates. Falls back to page search
+      // (window.find) for content, then OCR for visual elements, then the
+      // old slow path as a last resort.
+      //
+      // skipReset: if the previous step opened an overlay (dropdown/modal),
+      // don't reset focus to page top — that would close the overlay.
+      // Instead, scan from the current focus position inside the overlay.
+      const skipReset = (i > 0 && stepResults[i - 1]?.opensOverlay);
+      if (!hasCachedPath) {
+        try {
+          // 1. Build tab-map for current state
+          const tabMap = await buildTabMap(sessionId, 150, { skipReset });
+
+          // 2. Ask LLM to pick the best element
+          let pickedEntry = await _llmPickFromTabMap(tabMap, stepAction, verifyText, step.value);
+
+          if (pickedEntry) {
+            // 3. Click/focus the picked element via real Playwright click
+            //    using data-td-ref selector (trusted mouse event with real coordinates)
+            const cssSelector = pickedEntry.ref ? `[data-td-ref="${pickedEntry.ref}"]` : null;
+            logger.info(`[instruction.runner] Tab-map: clicking "${pickedEntry.text || pickedEntry.ariaLabel || verifyText}" via selector ${cssSelector || '(no ref)'}`);
+
+            let clickOk = false;
+            let clickedViaPlaywright = false; // tracks if Playwright click activated the element
+            if (cssSelector) {
+              // Real Playwright click via data-td-ref — trusted mouse event
+              try {
+                const clickResult = await browserAct({ action: 'click', sessionId, selector: cssSelector, headed: true, timeoutMs: 5000 });
+                clickOk = !!clickResult?.ok;
+                clickedViaPlaywright = clickOk;
+                if (clickOk) {
+                  logger.info(`[instruction.runner] Tab-map: Playwright click succeeded for "${verifyText}"`);
+                } else {
+                  logger.info(`[instruction.runner] Tab-map: Playwright click failed for "${verifyText}" — trying tab-count fallback`);
+                }
+              } catch (e) {
+                logger.warn(`[instruction.runner] Tab-map: Playwright click error: ${e.message} — trying tab-count fallback`);
+              }
+            }
+
+            // Fallback: tab to element by count (focus only — action phase handles Enter)
+            if (!clickOk && pickedEntry.id) {
+              try {
+                await _resetFocusToPageTop(sessionId);
+                const tabCount = Math.min(pickedEntry.id, 50);
+                for (let t = 0; t < tabCount; t++) {
+                  await browserAct({ action: 'press', sessionId, key: 'Tab', headed: true, timeoutMs: 2000 });
+                  await _sleep(40);
+                }
+                // Don't press Enter here — the action phase handles activation.
+                // Pressing Enter here would cause double-activation (Enter here + Enter in action phase).
+                clickOk = true;
+                logger.info(`[instruction.runner] Tab-map: tab-count fallback (${tabCount} tabs) for "${verifyText}"`);
+              } catch (e) {
+                logger.warn(`[instruction.runner] Tab-map: tab-count fallback failed: ${e.message}`);
+              }
+            }
+
+            // Verify we're on the right element
+            if (clickOk) {
+              const focused = await _readActiveElement(sessionId);
+              if (focused) {
+                const editable = await _isEditableByProbe(sessionId);
+                // mouse: true when Playwright click activated the element →
+                // action phase skips Enter/Space (prevents double-activation)
+                const mouseFlag = clickedViaPlaywright;
+                if (stepAction === 'fill' && editable) {
+                  navResult = { ok: true, count: 0, navMode, focusedText: focused.text, ref: focused.ref || null, mouse: mouseFlag, matchedBy: 'tabmap_llm' };
+                } else if ((stepAction === 'click' || stepAction === 'dblclick') && !editable) {
+                  navResult = { ok: true, count: 0, navMode, focusedText: focused.text, ref: focused.ref || null, mouse: mouseFlag, matchedBy: 'tabmap_llm' };
+                } else {
+                  logger.info(`[instruction.runner] Tab-map: picked element but type mismatch (editable=${editable}, action=${stepAction}) — trying page search`);
+                }
+              }
+            }
+          }
+
+          // 4. If tab-map didn't work, try page search (window.find)
+          if (!navResult) {
+            logger.info(`[instruction.runner] Tab-map did not find "${verifyText}" — trying page search`);
+            const searchResult = await pageSearch(sessionId, verifyText);
+            if (searchResult) {
+              const editable = await _isEditableByProbe(sessionId);
+              if (stepAction === 'fill' && editable) {
+                navResult = { ok: true, count: 0, navMode, focusedText: searchResult.text, ref: searchResult.ref || null, mouse: false, matchedBy: 'page_search' };
+              } else if ((stepAction === 'click' || stepAction === 'dblclick') && !editable) {
+                navResult = { ok: true, count: 0, navMode, focusedText: searchResult.text, ref: searchResult.ref || null, mouse: false, matchedBy: 'page_search' };
+              } else {
+                // Page search found the text but wrong element type — try tabbing to nearby
+                logger.info(`[instruction.runner] Page search found text but type mismatch — trying tab to nearby`);
+              }
+            }
+          }
+
+          // 5. If page search didn't work, try OCR fast path
+          if (!navResult) {
+            logger.info(`[instruction.runner] Page search did not find "${verifyText}" — trying OCR fast path`);
+            navResult = await _ocrFastPathStep(sessionId, verifyText, navMode, 60, stepAction);
+            if (navResult?.fallback || !navResult?.ok) {
+              logger.info(`[instruction.runner] OCR fast path did not succeed: ${navResult?.error}`);
+              navResult = null;
+            }
+          }
+
+        } catch (_tabMapErr) {
+          logger.warn(`[instruction.runner] Tab-map approach error: ${_tabMapErr.message} — falling back to slow path`);
+          navResult = null;
+        }
+      }
+
+      // ── Direct DOM query fallback for fill steps ──────────────────────
+      // Before falling back to the slow 50-tab path, try a direct DOM query
+      // for inputs matching the target placeholder/aria-label. This is fast
+      // and avoids wasting 5 minutes tabbing when the input doesn't exist.
+      if (!navResult && stepAction === 'fill') {
+        try {
+          const domQuery = await browserAct({
+            action: 'evaluate', sessionId, headed: true, timeoutMs: 3000,
+            text: `(() => {
+              const target = ${JSON.stringify(verifyText)};
+              const targetLower = target.toLowerCase();
+              const inputs = document.querySelectorAll('input, textarea, [contenteditable="true"], [contenteditable=""]');
+              for (const input of inputs) {
+                const ph = (input.placeholder || '').toLowerCase();
+                const al = (input.getAttribute('aria-label') || '').toLowerCase();
+                const lbl = (input.getAttribute('aria-labelledby') || '').toLowerCase();
+                if (ph.includes(targetLower) || al.includes(targetLower) || lbl.includes(targetLower)) {
+                  input.focus();
+                  const rect = input.getBoundingClientRect();
+                  return { tag: input.tagName.toLowerCase(), text: '', placeholder: input.placeholder || '',
+                           ariaLabel: input.getAttribute('aria-label') || '',
+                           x: rect.x, y: rect.y, w: rect.width, h: rect.height };
+                }
+              }
+              return null;
+            })()`,
+          });
+          if (domQuery?.result) {
+            logger.info(`[instruction.runner] DOM query found input for "${verifyText}": ${domQuery.result.tag} placeholder="${domQuery.result.placeholder}"`);
+            navResult = { ok: true, count: 0, navMode: 'tab', focusedText: '', ref: null, mouse: false, matchedBy: 'dom_query' };
+          }
+        } catch (e) {
+          logger.warn(`[instruction.runner] DOM query fallback failed: ${e.message}`);
+        }
+      }
+
+      // ── Cached path or slow discovery (fallback) ────────────────────────
+      if (!navResult) {
+        if (hasCachedPath && step.cachedCount !== undefined) {
+          // Fast path: use cached count
+          navResult = await _executeCachedKeyPathStep(sessionId, { ...step, navMode, stepAction });
+        } else {
+          // Slow path: reset focus to top first, then discover the path
+          await _resetFocusToPageTop(sessionId);
+          navResult = await _discoverKeyPathStep(sessionId, verifyText, navMode, 50, allowMouse, stepAction);
+        }
       }
 
       if (!navResult?.ok) {
@@ -1034,11 +1846,9 @@ async function runInstructionSkill({ instructions, keyPath, params, skillArgs, s
           }
         }
 
-        // After Enter on a trigger, detect overlay mode for the NEXT step
+        // After a click step, mark as opensOverlay so the next step's
+        // buildTabMap uses skipReset=true (scan from current focus, not page top)
         if (actionResult?.ok) {
-          const overlayMode = await _detectOverlayNavMode(sessionId);
-          currentOverlayMode = overlayMode === 'arrow' ? 'arrow' : null; // null = tab (default)
-          // Store opensOverlay info in discovered path
           discoveredKeyPath.push({
             description: step.target ? `Click "${step.target}"` : `Step ${i + 1}`,
             verifyText,
@@ -1048,13 +1858,8 @@ async function runInstructionSkill({ instructions, keyPath, params, skillArgs, s
             mouse: navResult.mouse || false,
             stepAction: stepAction || '',
             opensOverlay: true,
-            overlayNavMode: overlayMode,
           });
-          // If we have a cached path, update the overlayNavMode
-          if (hasCachedPath && i + 1 < steps.length) {
-            steps[i + 1].navMode = overlayMode;
-          }
-          stepResults.push({ step: i + 1, ...step, ok: true, ref: navResult.ref, focusedText: navResult.focusedText });
+          stepResults.push({ step: i + 1, ...step, ok: true, ref: navResult.ref, focusedText: navResult.focusedText, opensOverlay: true });
           await _sleep(1000); // wait for overlay/page to settle
           continue;
         }
@@ -1083,11 +1888,6 @@ async function runInstructionSkill({ instructions, keyPath, params, skillArgs, s
 
       // Wait between steps for page to settle
       await _sleep(1500);
-
-      // After non-Enter actions, reset overlay mode
-      if (actionType !== 'Enter') {
-        currentOverlayMode = null;
-      }
 
     } catch (e) {
       logger.error(`[instruction.runner] Step ${i + 1} threw: ${e.message}`);
