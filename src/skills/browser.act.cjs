@@ -3125,6 +3125,44 @@ async function browserAct(args) {
       };
     }
 
+    // ── Click by CSS selector (real Playwright click for focus reset) ────────
+    case 'clickSelector': {
+      const selector = args?.selector || 'body';
+      const _ePage = engine.getPage(sessionId);
+      if (_ePage) {
+        try {
+          await _ePage.click(selector, { timeout: 3000 });
+          logger.info(`[browser.act] clickSelector "${selector}" ok (engine)`);
+          return { ok: true, action, sessionId, executionTime: Date.now() - start };
+        } catch (e) {
+          logger.warn(`[browser.act] clickSelector "${selector}" failed: ${e.message}`);
+          return { ok: false, action, sessionId, error: e.message, executionTime: Date.now() - start };
+        }
+      }
+      return { ok: false, action, sessionId, error: 'No engine page for session', executionTime: Date.now() - start };
+    }
+
+    // ── Click at coordinates (real mouse click for focus reset) ──────────────
+    case 'clickAt': {
+      const cx = Number(args?.x);
+      const cy = Number(args?.y);
+      if (!Number.isFinite(cx) || !Number.isFinite(cy)) {
+        return { ok: false, action, sessionId, error: 'clickAt requires numeric x and y', executionTime: Date.now() - start };
+      }
+      const _ePage = engine.getPage(sessionId);
+      if (_ePage) {
+        try {
+          await _ePage.mouse.click(cx, cy);
+          logger.info(`[browser.act] clickAt (${cx}, ${cy}) ok (engine)`);
+          return { ok: true, action, sessionId, executionTime: Date.now() - start };
+        } catch (e) {
+          logger.warn(`[browser.act] clickAt (${cx}, ${cy}) failed: ${e.message}`);
+          return { ok: false, action, sessionId, error: e.message, executionTime: Date.now() - start };
+        }
+      }
+      return { ok: false, action, sessionId, error: 'No engine page for session', executionTime: Date.now() - start };
+    }
+
     // ── Click ────────────────────────────────────────────────────────────────
     case 'click':
     case 'dblclick': {
@@ -4401,7 +4439,7 @@ async function browserAct(args) {
           const lower = text.toLowerCase();
           // Build candidate list: tag filter + visible elements
           const candidates = [];
-          const baseSelector = tag ? tag.toLowerCase() : 'button, a, [role="button"], [role="link"], input[type="submit"], input[type="button"], div, span';
+          const baseSelector = tag ? tag.toLowerCase() : 'button, a, [role="button"], [role="link"], input[type="submit"], input[type="button"], input:not([type="hidden"]), textarea, div, span';
           const root = scope ? document.querySelector(scope) : document;
           if (!root) return { ok: false, error: `Scope element not found: ${scope}` };
           let els = Array.from(root.querySelectorAll(baseSelector));
@@ -4447,10 +4485,13 @@ async function browserAct(args) {
             const style = window.getComputedStyle(el);
             if (style.display === 'none' || style.visibility === 'hidden') continue;
             const elText = (el.innerText || el.textContent || '').trim();
-            if (!elText) continue;
-            const isExact = elText.toLowerCase() === lower;
-            const isSub = elText.toLowerCase().includes(lower);
-            if (exact ? isExact : isSub) candidates.push({ el, text: elText, len: elText.length, isExact });
+            // Also check placeholder attributes (for input/textarea fields with no innerText)
+            const placeholder = (el.getAttribute('placeholder') || el.getAttribute('aria-placeholder') || el.getAttribute('data-placeholder') || '').trim();
+            const matchText = elText || placeholder;
+            if (!matchText) continue;
+            const isExact = matchText.toLowerCase() === lower;
+            const isSub = matchText.toLowerCase().includes(lower);
+            if (exact ? isExact : isSub) candidates.push({ el, text: matchText, len: matchText.length, isExact, isPlaceholder: !elText && !!placeholder });
           }
           // Search shadow DOM if requested
           if (shadow && candidates.length === 0) {
@@ -4459,10 +4500,12 @@ async function browserAct(args) {
                 const shadowEls = Array.from(host.shadowRoot.querySelectorAll(baseSelector));
                 for (const el of shadowEls) {
                   const elText = (el.innerText || el.textContent || '').trim();
-                  if (!elText) continue;
-                  const isExact = elText.toLowerCase() === lower;
-                  const isSub = elText.toLowerCase().includes(lower);
-                  if (exact ? isExact : isSub) candidates.push({ el, text: elText, len: elText.length, isExact });
+                  const placeholder = (el.getAttribute('placeholder') || el.getAttribute('aria-placeholder') || el.getAttribute('data-placeholder') || '').trim();
+                  const matchText = elText || placeholder;
+                  if (!matchText) continue;
+                  const isExact = matchText.toLowerCase() === lower;
+                  const isSub = matchText.toLowerCase().includes(lower);
+                  if (exact ? isExact : isSub) candidates.push({ el, text: matchText, len: matchText.length, isExact, isPlaceholder: !elText && !!placeholder });
                 }
               }
             }

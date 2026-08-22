@@ -431,7 +431,7 @@ async function fetchSkillRecord(name, timeoutMs) {
 // The agent snapshots the live DOM, finds elements by intent, and executes step-by-step.
 // No CSS selectors are stored or replayed — the agent adapts to the live page.
 // ---------------------------------------------------------------------------
-async function runAgentSkill(recipe, skillArgs, timeoutMs) {
+async function runAgentSkill(recipe, skillArgs, timeoutMs, recipePath) {
   const sessionId = skillArgs?.sessionId;
   if (!sessionId) {
     return { ok: false, error: 'Agent skill execution requires a sessionId' };
@@ -460,31 +460,61 @@ async function runAgentSkill(recipe, skillArgs, timeoutMs) {
   logger.info(`[external.skill] runAgentSkill: "${recipe.name}" instructions="${instructions.substring(0, 200)}" sessionId=${sessionId}`);
 
   try {
-    // Use the deterministic instruction runner instead of the autonomous playwrightAgent.
-    // The runner parses instructions into steps, snapshots the DOM for each step,
-    // resolves elements via focused LLM calls, and executes via browserAct directly.
-    // This avoids the playwrightAgent's 12-turn loop that restarts tasks and creates
-    // duplicate actions (e.g. creating multiple playlists).
+    // Use the keyboard-path instruction runner.
+    // First run: discovers the key path (Tab/Arrow/Enter) from the address bar — slow.
+    // Subsequent runs: uses cached keyPath for fast, deterministic replay.
     const { runInstructionSkill } = require('./instruction.runner.cjs');
     const result = await runInstructionSkill({
       instructions,
+      keyPath: recipe.keyPath || null, // cached keyboard path (null = first run, will discover)
       params: recipe.params || [],
       skillArgs: args,
       startUrl: recipe.startUrl,
       sessionId,
-      timeoutMs: timeoutMs || 90000,
+      timeoutMs: timeoutMs || 120000, // longer timeout for first-run discovery
     });
+
+    // Cache the discovered key path back to the recipe for fast subsequent runs
+    if (result?.discoveredKeyPath && result.discoveredKeyPath.length > 0 && !recipe.keyPath) {
+      try {
+        recipe.keyPath = result.discoveredKeyPath;
+        // Use the provided recipePath (direct execPath) or fall back to _findRecipePath
+        const savePath = recipePath || _findRecipePath(recipe.name);
+        if (savePath) {
+          fs.writeFileSync(savePath, JSON.stringify(recipe, null, 2));
+          logger.info(`[external.skill] Cached keyPath for "${recipe.name}" (${result.discoveredKeyPath.length} steps) to ${savePath}`);
+        }
+      } catch (e) {
+        logger.warn(`[external.skill] Could not cache keyPath: ${e.message}`);
+      }
+    }
 
     logger.info(`[external.skill] runAgentSkill: "${recipe.name}" ok=${result?.ok}${result?.error ? ' error=' + result.error : ''}`);
     return {
       ok: !!result?.ok,
       output: result?.output || (result?.ok ? `Completed agent skill ${recipe.name}` : ''),
       error: result?.ok ? undefined : (result.error || 'Agent skill failed'),
+      discoveredKeyPath: result?.discoveredKeyPath || null,
     };
   } catch (e) {
     logger.error(`[external.skill] runAgentSkill threw: ${e.message}`);
     return { ok: false, error: `Agent skill "${recipe.name}" failed: ${e.message}` };
   }
+}
+
+// Helper: find the recipe file path by skill name
+function _findRecipePath(skillName) {
+  try {
+    const skillsDir = path.join(__dirname, '..', 'skills-installed');
+    if (!fs.existsSync(skillsDir)) return null;
+    const files = fs.readdirSync(skillsDir);
+    for (const f of files) {
+      if (f.includes(skillName) && f.endsWith('.json')) {
+        return path.join(skillsDir, f);
+      }
+    }
+  } catch {}
+  return null;
 }
 
 async function runRecipeSkill(resolvedPath, skillArgs, timeoutMs) {
@@ -505,7 +535,7 @@ async function runRecipeSkill(resolvedPath, skillArgs, timeoutMs) {
   // The agent snapshots the live DOM, finds elements by intent, and executes step-by-step.
   if (recipe.execType === 'agent' || (recipe.instructions && !Array.isArray(recipe.waypoints))) {
     logger.info(`[external.skill] Agent skill "${recipe.name}" — delegating to playwrightAgent`);
-    return await runAgentSkill(recipe, skillArgs, timeoutMs);
+    return await runAgentSkill(recipe, skillArgs, timeoutMs, resolvedPath);
   }
 
   // ── Composite recipe: chain multiple .skill.json files ───────────────────

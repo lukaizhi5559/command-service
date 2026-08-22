@@ -302,9 +302,46 @@ const CDP_RECORDER_SCRIPT = `
 
   // Clean elementText: prefer aria-label, then the longest clean child/leaf label,
   // then normalized innerText. Avoid concatenating multiple child labels.
+  // Also captures debug info into window.__tdLastCleanDebug for diagnosis.
+  function _charCodes(s) {
+    // Show char codes for non-ASCII or non-printable chars (invisible char detection)
+    var codes = [];
+    for (var i = 0; i < s.length; i++) {
+      var c = s.charCodeAt(i);
+      if (c > 127 || (c < 32 && c !== 10 && c !== 13 && c !== 9)) {
+        codes.push({ i: i, char: s[i], code: c, hex: '0x' + c.toString(16) });
+      }
+    }
+    return codes;
+  }
   function cleanElementText(el) {
     var aria = el.getAttribute('aria-label');
-    if (aria && aria.trim()) return trimWordBoundary(aria.trim().replace(/\s+/g, ' '), 80);
+    var debug = { tag: el.tagName, ariaLabel: aria, candidates: [], result: '' };
+    if (aria && aria.trim()) {
+      var ariaResult = trimWordBoundary(aria.trim().replace(/\s+/g, ' '), 80);
+      debug.result = ariaResult;
+      debug.source = 'aria-label';
+      window.__tdLastCleanDebug = debug;
+      return ariaResult;
+    }
+
+    // Resolve aria-labelledby / aria-describedby references to get clean text
+    // from elements outside the click target (e.g. Spotify menu row titles).
+    var ariaId = el.getAttribute('aria-labelledby') || el.getAttribute('aria-describedby');
+    if (ariaId) {
+      var ref = document.getElementById(ariaId);
+      if (ref) {
+        var refText = (ref.textContent || ref.innerText || '').trim().replace(/\s+/g, ' ');
+        if (refText) {
+          var refResult = trimWordBoundary(refText, 80);
+          debug.result = refResult;
+          debug.source = 'aria-ref';
+          debug.ariaRef = ariaId;
+          window.__tdLastCleanDebug = debug;
+          return refResult;
+        }
+      }
+    }
 
     // Collect all leaf text candidates: direct text nodes and leaf span/label/p/div children
     var candidates = [];
@@ -314,7 +351,10 @@ const CDP_RECORDER_SCRIPT = `
       var node = el.childNodes[i];
       if (node.nodeType === 3) {
         var t = node.textContent.trim();
-        if (t) candidates.push(t);
+        if (t) {
+          candidates.push(t);
+          debug.candidates.push({ source: 'textNode', text: t.substring(0, 80), len: t.length, charCodes: _charCodes(t.substring(0, 80)) });
+        }
       }
     }
 
@@ -323,8 +363,13 @@ const CDP_RECORDER_SCRIPT = `
     for (var i = 0; i < children.length; i++) {
       var child = children[i];
       if (child.children.length > 0) continue; // only leaves
-      var t = (child.innerText || child.textContent || '').trim();
-      if (t) candidates.push(t);
+      // Prefer textContent (raw DOM text) over innerText (rendered) to avoid
+      // CSS/pseudo text that drops characters like 's' (Spotify menu items)
+      var t = (child.textContent || child.innerText || '').trim();
+      if (t) {
+        candidates.push(t);
+        debug.candidates.push({ source: child.tagName.toLowerCase(), text: t.substring(0, 80), len: t.length, charCodes: _charCodes(t.substring(0, 80)) });
+      }
     }
 
     var firstText = '';
@@ -332,14 +377,24 @@ const CDP_RECORDER_SCRIPT = `
       // Prefer the longest leaf text that looks like a description (not a short header)
       candidates.sort(function(a, b) { return b.length - a.length; });
       firstText = candidates[0];
+      debug.source = 'longest-leaf';
     }
 
-    if (!firstText) firstText = (el.innerText || '').trim();
+    if (!firstText) {
+      // Prefer textContent (raw DOM) over innerText for the same reason
+      firstText = (el.textContent || el.innerText || '').trim();
+      debug.source = 'textContent-fallback';
+    }
 
     // Normalize whitespace and strip counter patterns
     firstText = firstText.replace(/\s+/g, ' ');
     firstText = firstText.replace(/\\s*\\d+\\/\\d+/g, '').replace(/\\s*\\+\\s*$/g, '').trim();
-    return trimWordBoundary(firstText, 80);
+    var result = trimWordBoundary(firstText, 80);
+    debug.result = result;
+    debug.rawTextContent = (el.textContent || '').substring(0, 100);
+    debug.rawTextCharCodes = _charCodes(debug.rawTextContent);
+    window.__tdLastCleanDebug = debug;
+    return result;
   }
 
   function trimWordBoundary(text, max) {
@@ -373,10 +428,12 @@ const CDP_RECORDER_SCRIPT = `
     if (selector === 'body' || selector === 'html') return;
     var text = cleanElementText(el);
     var href = el.href || (el.closest('a') || {}).href || '';
+    var debugInfo = window.__tdLastCleanDebug || null;
     window.__tdTrainEvents.push({
       type: 'click', selector: selector, altSelectors: getAltSelectors(el),
       elementText: text, elementTag: el.tagName.toLowerCase(),
-      href: href, url: location.href, timestamp: Date.now()
+      href: href, url: location.href, timestamp: Date.now(),
+      _debug: debugInfo
     });
   }, true);
 
@@ -473,17 +530,22 @@ const CDP_RECORDER_SCRIPT = `
     var selector = getSelector(el);
     clearTimeout(_inputTimers[selector]);
     _inputTimers[selector] = setTimeout(function() {
-      var value = el.value !== undefined ? el.value : (el.innerText || el.textContent || '');
+      // For contenteditable, prefer textContent over innerText to preserve case
+      // and avoid CSS text-transform / rendered text stripping.
+      var value = el.value !== undefined ? el.value : (isCE ? (el.textContent || el.innerText || '') : (el.value || el.innerText || el.textContent || ''));
       if (!value) return; // skip empty
       var fieldLabel = (el.getAttribute('aria-label') || el.placeholder || el.getAttribute('name') || el.getAttribute('id') || '').trim();
+      var elementText = cleanElementText(el) || fieldLabel;
+      var debugInfo = window.__tdLastCleanDebug || null;
       window.__tdTrainEvents.push({
         type: isRange ? 'fill' : (el.tagName === 'SELECT' ? 'select' : 'fill'),
         selector: selector, altSelectors: getAltSelectors(el),
         value: String(value).substring(0, 2000),
-        elementText: cleanElementText(el) || fieldLabel,
+        elementText: elementText,
         placeholder: el.placeholder || '',
         elementTag: el.tagName.toLowerCase(),
-        url: location.href, timestamp: Date.now()
+        url: location.href, timestamp: Date.now(),
+        _debug: debugInfo
       });
     }, 800);
   }, true);
@@ -499,14 +561,17 @@ const CDP_RECORDER_SCRIPT = `
     // pushed, producing a doubled fill step in the recording.
     if (_inputTimers[selector]) { clearTimeout(_inputTimers[selector]); delete _inputTimers[selector]; }
     var fieldLabel = (el.getAttribute('aria-label') || el.placeholder || el.getAttribute('name') || el.getAttribute('id') || '').trim();
+    var elementText = cleanElementText(el) || fieldLabel;
+    var debugInfo = window.__tdLastCleanDebug || null;
     window.__tdTrainEvents.push({
       type: el.tagName === 'SELECT' ? 'select' : 'fill',
       selector: selector, altSelectors: getAltSelectors(el),
       value: el.value,
-      elementText: cleanElementText(el) || fieldLabel,
+      elementText: elementText,
       placeholder: el.placeholder || '',
       elementTag: el.tagName.toLowerCase(),
-      url: location.href, timestamp: Date.now()
+      url: location.href, timestamp: Date.now(),
+      _debug: debugInfo
     });
   }, true);
 
@@ -1304,6 +1369,21 @@ function _processEvent(session, evt, tabIndex) {
   }
 
   session.rawEvents.push(evt);
+
+  // Debug: log raw event details for click/fill/paste/dblclick to diagnose garbling
+  if (['click','fill','paste','dblclick','rightclick','select','check'].includes(evt.type)) {
+    logger.info(`[trainer.agent] DEBUG push event: type=${evt.type} selector="${(evt.selector || '').substring(0, 80)}" elementText="${(evt.elementText || '').substring(0, 80)}" placeholder="${(evt.placeholder || '').substring(0, 80)}" value="${(evt.value || '').substring(0, 80)}"`);
+    if (evt._debug) {
+      const ariaRefInfo = evt._debug.ariaRef ? ` ariaRef="${evt._debug.ariaRef}"` : '';
+      logger.info(`[trainer.agent] DEBUG cleanElementText: result="${(evt._debug.result || '').substring(0, 80)}" source=${evt._debug.source} tag=${evt._debug.tag} ariaLabel="${(evt._debug.ariaLabel || '').substring(0, 80)}"${ariaRefInfo} rawTextContent="${(evt._debug.rawTextContent || '').substring(0, 100)}"`);
+      if (evt._debug.candidates && evt._debug.candidates.length > 0) {
+        for (const c of evt._debug.candidates) {
+          logger.info(`[trainer.agent] DEBUG candidate: source=${c.source} text="${c.text}" charCodes=${JSON.stringify(c.charCodes)}`);
+        }
+      }
+    }
+  }
+
   const uiStep = _eventToUIStep(evt);
   logger.info(`[trainer.agent] push event: type=${evt.type} tab=${evt.tabIndex} uiStep=${!!uiStep}`);
   if (uiStep) _postProgress(agentId, { type: 'training:step-recorded', ...uiStep });
@@ -1809,6 +1889,19 @@ function _startEventPoller(session) {
 
         session.rawEvents.push(evt);
 
+        // Debug: log cleanElementText diagnostics for click events
+        if (evt.type === 'click' && evt._debug) {
+          logger.info(`[trainer.agent] cleanElementText DEBUG for click: result="${evt._debug.result}" source=${evt._debug.source} tag=${evt._debug.tag} ariaLabel=${JSON.stringify(evt._debug.ariaLabel)}`);
+          if (evt._debug.candidates && evt._debug.candidates.length > 0) {
+            for (const c of evt._debug.candidates) {
+              logger.info(`[trainer.agent] cleanElementText DEBUG candidate: source=${c.source} len=${c.len} text="${c.text}" charCodes=${JSON.stringify(c.charCodes)}`);
+            }
+          }
+          if (evt._debug.rawTextContent) {
+            logger.info(`[trainer.agent] cleanElementText DEBUG rawTextContent="${evt._debug.rawTextContent}" charCodes=${JSON.stringify(evt._debug.rawTextCharCodes)}`);
+          }
+        }
+
         // Emit to UI
         const uiStep = _eventToUIStep(evt);
         logger.info(`[trainer.agent] emitting step: type=${evt.type} uiStep=${!!uiStep}`);
@@ -2255,10 +2348,10 @@ async function _buildInstructionSkill(session, events, eventStart, eventEnd, ski
         return `${i + 1}. Double-clicked "${text}"`;
       }
       case 'fill': {
-        const fieldName = (e.elementText || e.placeholder || 'a text field').trim();
+        const fieldName = (e.placeholder || e.elementText || 'a text field').trim();
         return `${i + 1}. Typed "${(e.value || '').substring(0, 80)}" into the "${fieldName}" field`;
       }
-      case 'paste': return `${i + 1}. Pasted text into the "${(e.elementText || e.placeholder || 'a field').trim()}" field`;
+      case 'paste': return `${i + 1}. Pasted text into the "${(e.placeholder || e.elementText || 'a field').trim()}" field`;
       case 'select': return `${i + 1}. Selected "${e.value || ''}" from the "${(e.elementText || 'dropdown').trim()}" dropdown`;
       case 'check': return `${i + 1}. ${e.checked ? 'Checked' : 'Unchecked'} "${e.label || 'a checkbox'}"`;
       case 'submit': return `${i + 1}. Submitted a form`;
@@ -2298,16 +2391,17 @@ CRITICAL RULES:
     - Submit the form
 12. If the recording contains multiple unrelated actions, return rejected: true.
 
-GOOD example: "Click the "Create" button. Click "Create a playlist". Click "Name & details". Type "{{playlist_name}}" into the "Name" field. Click "Save"."
-GOOD example: "Click "Church Music". Click "Edit details". Type "{{playlist_name}}" into the "Name" field. Click "Save"."
-BAD example: "Click the playlist you wish to edit. Click the playlist title to open the edit details dialog. Type "{{playlist_name}}" into the text field. Click "Save"."
+GOOD example: "Click the "Create" button. Click "Create a <some-item>". Click "Name & details". Type "{{item_name}}" into the "Name" field. Click "Save"."
+GOOD example: "Click "Church Music". Click "Edit details". Type "{{item_name}}" into the "Name" field. Click "Save"."
+BAD example: "Click the <some-item> you wish to edit. Click the <some-item> title to open the edit details dialog. Type "{{item_name}}" into the text field. Click "Save"."
+BAD example: "Go to https://<some-site>.com/ and create a new <some-item> with the name {{item_name}}." — this is a single GOAL sentence, NOT step-by-step actions. Do NOT write goal sentences. Each sentence must be ONE concrete action (Click, Type, Select, Press).
 
 Output ONLY valid JSON:
 {
   "name": "${skillName}",
   "description": "<one sentence describing what this skill does>",
   "params": [{ "name": "param_name", "type": "string", "required": true, "description": "...", "example": "..." }],
-  "instructions": "<generic step-by-step guide with {{param}} placeholders>",
+  "instructions": "<concrete step-by-step actions with {{param}} placeholders, one action per sentence>",
   "startUrl": "<initial URL where the agent should start>",
   "rejected": false
 }
@@ -2327,10 +2421,66 @@ If the recording is too chaotic or contains multiple unrelated actions:
     }
 
     let json = (response || '').trim().replace(/^```(?:json)?\s*\n?/i, '').replace(/\n?```\s*$/, '');
-    const parsed = JSON.parse(json);
+    let parsed = JSON.parse(json);
 
     if (parsed.rejected) {
       return { rejected: true, reason: parsed.reason || 'Could not understand the recording' };
+    }
+
+    // ── Coerce instructions to string ──
+    // The LLM sometimes returns instructions as an array of steps or an object
+    // instead of a single string. Coerce to string so parseInstructions doesn't
+    // throw with "instructions.split is not a function".
+    if (parsed.instructions !== null && typeof parsed.instructions !== 'string') {
+      if (Array.isArray(parsed.instructions)) {
+        parsed.instructions = parsed.instructions.join('. ');
+        logger.info(`[trainer.agent] _buildInstructionSkill: coerced instructions array to string (${parsed.instructions.length} chars)`);
+      } else if (typeof parsed.instructions === 'object' && parsed.instructions.steps && Array.isArray(parsed.instructions.steps)) {
+        parsed.instructions = parsed.instructions.steps.join('. ');
+        logger.info(`[trainer.agent] _buildInstructionSkill: coerced instructions.steps array to string (${parsed.instructions.length} chars)`);
+      } else if (typeof parsed.instructions === 'object' && parsed.instructions.text) {
+        parsed.instructions = String(parsed.instructions.text);
+        logger.info(`[trainer.agent] _buildInstructionSkill: coerced instructions.text to string (${parsed.instructions.length} chars)`);
+      } else {
+        logger.warn(`[trainer.agent] _buildInstructionSkill: instructions was ${typeof parsed.instructions}, JSON-stringifying`);
+        parsed.instructions = JSON.stringify(parsed.instructions);
+      }
+    }
+
+    // ── Validation: check that parseInstructions can parse the instructions ──
+    // If the LLM produced a high-level goal sentence instead of step-by-step
+    // actions, retry once with a stricter prompt.
+    let { parseInstructions } = require('./instruction.runner.cjs');
+    let parsedSteps = parseInstructions(parsed.instructions || '');
+    if (parsedSteps.length === 0 && !session.cancelRequested) {
+      logger.warn(`[trainer.agent] _buildInstructionSkill: LLM produced unparseable instructions: "${(parsed.instructions || '').substring(0, 120)}" — retrying with stricter prompt`);
+      const retryResponse = await askWithMessages([
+        { role: 'system', content: 'You convert browser recordings into clear instructions for AI agents. Output ONLY valid JSON.' },
+        { role: 'user', content: `Your previous response was NOT step-by-step actions. It was a single goal sentence that cannot be parsed.
+
+BAD (what you wrote): "${parsed.instructions}"
+BAD pattern: "Go to https://... and create a new <some-item> with the name {{item_name}}." — this is ONE goal sentence, NOT steps.
+
+You MUST write CONCRETE step-by-step actions, one action per sentence, separated by ". ".
+
+${prompt}` },
+      ], { maxTokens: 1000, temperature: 0.1, responseTimeoutMs: 20000 });
+
+      if (!session.cancelRequested) {
+        json = (retryResponse || '').trim().replace(/^```(?:json)?\s*\n?/i, '').replace(/\n?```\s*$/, '');
+        parsed = JSON.parse(json);
+        if (parsed.rejected) {
+          return { rejected: true, reason: parsed.reason || 'Could not understand the recording' };
+        }
+        parsedSteps = parseInstructions(parsed.instructions || '');
+        if (parsedSteps.length === 0) {
+          logger.warn(`[trainer.agent] _buildInstructionSkill: retry still unparseable: "${(parsed.instructions || '').substring(0, 120)}" — using fallback`);
+        } else {
+          logger.info(`[trainer.agent] _buildInstructionSkill: retry succeeded — ${parsedSteps.length} steps parsed`);
+        }
+      }
+    } else {
+      logger.info(`[trainer.agent] _buildInstructionSkill: validated — ${parsedSteps.length} steps parsed from instructions`);
     }
 
     // Ensure required fields
@@ -2355,6 +2505,38 @@ If the recording is too chaotic or contains multiple unrelated actions:
   }
 }
 
+// Two-tier generic field label detection (shared logic with instruction.runner.cjs).
+// Returns true if the label is too generic to help locate the field.
+// Tier 1: unambiguously generic words (articles, fillers, generic nouns)
+// Tier 2a: borderline verbs (always generic — they don't name a field)
+// Tier 2b: borderline nouns (preserved if ≥5 chars — they might name a field)
+// Rule: null only if ALL words are Tier 1, OR ALL words are Tier 1+2 AND no Tier 2b noun is ≥5 chars.
+const _GENERIC_TIER1 = new Set([
+  'the', 'a', 'an', 'your', 'our', 'my', 'here', 'there', 'please',
+  'something', 'anything', 'text', 'field', 'input', 'box', 'area', 'placeholder',
+]);
+const _GENERIC_TIER2_VERBS = new Set([
+  'enter', 'type', 'add', 'put', 'write', 'edit',
+]);
+const _GENERIC_TIER2_NOUNS = new Set([
+  'new', 'default', 'empty', 'blank', 'value', 'content', 'data', 'form', 'string',
+]);
+function _isGenericFieldLabel(label) {
+  if (!label) return true;
+  const words = label.toLowerCase().trim().split(/\s+/).filter(w => w.length > 0);
+  if (words.length === 0) return true;
+  const allTier1 = words.every(w => _GENERIC_TIER1.has(w));
+  if (allTier1) return true;
+  const allGeneric = words.every(w =>
+    _GENERIC_TIER1.has(w) || _GENERIC_TIER2_VERBS.has(w) || _GENERIC_TIER2_NOUNS.has(w)
+  );
+  if (allGeneric) {
+    const hasLongNoun = words.some(w => _GENERIC_TIER2_NOUNS.has(w) && w.length >= 5);
+    return !hasLongNoun;
+  }
+  return false;
+}
+
 // Heuristic fallback: build instructions from events without LLM
 function _buildInstructionFallback(session, events, eventStart, eventEnd, skillName, action) {
   // Clean noise from the recording first
@@ -2363,31 +2545,50 @@ function _buildInstructionFallback(session, events, eventStart, eventEnd, skillN
   const params = [];
   const usedParamNames = new Set();
 
+  let navigateCount = 0;
   for (const evt of cleanedEvents) {
     if (evt.type === 'navigate') {
-      steps.push(`Navigate to ${evt.url}`);
+      navigateCount++;
+      // Only the first navigate is the start URL; intermediate navigations are
+      // caused by clicks and the agent will follow them automatically.
+      if (navigateCount === 1) steps.push(`Navigate to ${evt.url}`);
+      continue;
     } else if (evt.type === 'click' && evt.elementText) {
       steps.push(`Click the "${evt.elementText}" button`);
     } else if (evt.type === 'dblclick') {
       steps.push(`Double-click "${evt.elementText || 'the element'}"`);
     } else if (evt.type === 'fill') {
       const val = evt.value || '';
+      // Derive a field label from placeholder, elementText, or aria-label — not generic "text field"
+      const placeholder = evt.placeholder || evt.altSelectors?.find(s => s.includes('placeholder='))?.match(/placeholder="([^"]+)"/)?.[1] || '';
+      const fieldLabel = placeholder || evt.elementText || '';
+      // Use two-tier generic detection to decide if label is too generic to be useful
+      const isGenericLabel = _isGenericFieldLabel(fieldLabel);
+      const labelClause = isGenericLabel ? '' : ` the "${fieldLabel}" field`;
+      if (isGenericLabel && fieldLabel) {
+        logger.info(`[trainer.agent] _buildInstructionFallback: generic field label "${fieldLabel}" — omitting from instruction`);
+      }
       // Treat as param if non-static
       const isStatic = /^https?:\/\//i.test(val) || /^[\w.+-]+@[\w-]+\.\w+$/.test(val) || /^\d+$/.test(val) || val.length < 3;
       if (isStatic) {
-        steps.push(`Type "${val}" into the text field`);
+        steps.push(`Type "${val}" into${labelClause || ' the text field'}`);
       } else {
         let paramName = 'value';
-        const placeholder = evt.altSelectors?.find(s => s.includes('placeholder='))?.match(/placeholder="([^"]+)"/)?.[1];
         if (placeholder) paramName = placeholder.toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '');
         let baseName = paramName, suffix = 1;
         while (usedParamNames.has(paramName)) paramName = `${baseName}_${suffix++}`;
         usedParamNames.add(paramName);
         params.push({ name: paramName, type: 'string', required: true, description: paramName.replace(/_/g, ' '), example: val.substring(0, 50) });
-        steps.push(`Type "{{${paramName}}}" into the text field`);
+        steps.push(`Type "{{${paramName}}}" into${labelClause || ' the text field'}`);
       }
     } else if (evt.type === 'paste') {
-      steps.push('Paste text into the field');
+      const placeholder = evt.placeholder || evt.altSelectors?.find(s => s.includes('placeholder='))?.match(/placeholder="([^"]+)"/)?.[1] || '';
+      const fieldLabel = placeholder || evt.elementText || '';
+      const isGenericLabel = _isGenericFieldLabel(fieldLabel);
+      if (isGenericLabel && fieldLabel) {
+        logger.info(`[trainer.agent] _buildInstructionFallback: generic field label "${fieldLabel}" — omitting from paste instruction`);
+      }
+      steps.push(`Paste text into${isGenericLabel ? ' the field' : ` the "${fieldLabel}" field`}`);
     } else if (evt.type === 'select') {
       steps.push(`Select "${evt.value || ''}" from the dropdown`);
     } else if (evt.type === 'check') {
@@ -2564,6 +2765,9 @@ async function actionSaveSkillsAndRecipe(args) {
         // Instruction-based skills (new format) — execType: "agent" + instructions
         execType: skill.execType || 'agent',
         instructions: skill.instructions || '',
+        // Deterministic keyboard path (discovered during preview run) — enables
+        // fast subsequent runs without re-discovering Tab/Arrow counts.
+        keyPath: skill.keyPath || null,
         // Waypoint-based skills (legacy format) — kept for backward compat
         waypoints: skill.waypoints || [],
         targetDescription: skill.description || skill.targetDescription || '',

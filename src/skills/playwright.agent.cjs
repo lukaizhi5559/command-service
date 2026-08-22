@@ -51,6 +51,10 @@ const engine = require('./browser-engine.cjs');
 const { askWithMessages } = require('../skill-helpers/skill-llm.cjs');
 const skillDb = require('../skill-helpers/skill-db.cjs');
 const { _liteparseVerify, _liteparseSubmit, _liteparseCapture, _domFindSubmitTarget, _validateClickPoint, ensureLitAvailable } = require('./browser.agent.cjs');
+// Lazy-require keyboard nav helpers from instruction.runner.cjs to avoid circular dep
+const _getKbHelpers = () => {
+  try { return require('./instruction.runner.cjs'); } catch { return {}; }
+};
 
 const _COMMAND_PORT = parseInt(process.env.COMMAND_SERVICE_PORT || '3007', 10);
 
@@ -8487,6 +8491,33 @@ Generate 3-5 steps to complete this task.`;
               }, _step.selector).catch(() => null);
             }
 
+            // ── Keyboard nav probe: try ArrowDown to detect+navigate menu ──
+            // If the next planned step is a click targeting a menu item, try
+            // keyboard nav (ArrowDown + Enter) before falling back to OCR.
+            const _nextStep = _steps[_i + 1];
+            if (_nextStep && (_nextStep.action === 'click' || _nextStep.action === 'clickByText') && _nextStep.text) {
+              const _kbHelpers = _getKbHelpers();
+              if (_kbHelpers._selectOverlayItemByKeyboard) {
+                logger.info(`[playwright.agent] focused Plan-Execute: trying keyboard nav for next step target "${_nextStep.text}"`);
+                const _kbResult = await _kbHelpers._selectOverlayItemByKeyboard(sessionId, _nextStep.text, null, _menuRect || null);
+                if (_kbResult?.ok) {
+                  logger.info(`[playwright.agent] focused Plan-Execute: keyboard nav succeeded — selected "${_kbResult.selectedText}"`);
+                  _peTranscript.push({
+                    step: _i + 1, action: { action: 'keyboard_nav', text: _kbResult.selectedText || '' },
+                    outcome: { ok: true, selectedText: _kbResult.selectedText },
+                    thoughts: `Keyboard nav: ArrowDown + Enter selected "${_kbResult.selectedText}"`,
+                  });
+                  _lastMutatingStepTs = Date.now();
+                  // Skip the next step — keyboard nav already selected the item
+                  _i++;
+                  continue;
+                }
+                logger.info(`[playwright.agent] focused Plan-Execute: keyboard nav failed: ${_kbResult?.error} — falling back to Tier 1.6`);
+              } else {
+                logger.info(`[playwright.agent] focused Plan-Execute: keyboard nav not available — falling back to Tier 1.6`);
+              }
+            }
+
             // Try DOM-based menu detection first (for overlay rect)
             const _openMenus = await _detectOpenMenus(sessionId, headed, 3000);
             let _menuRect = null;
@@ -8523,6 +8554,8 @@ Generate 3-5 steps to complete this task.`;
 
       if (!_result.ok) {
         logger.warn(`[playwright.agent] focused Plan-Execute: step ${_i + 1} failed — ${_result.error}`);
+        // Press Escape to dismiss any stale overlay before retrying/replanning
+        try { await page.keyboard.press('Escape').catch(() => {}); await new Promise(r => setTimeout(r, 200)); } catch {}
         // Record this failed step in the session ledger (process of elimination)
         if (typeof recordFailedApproach === 'function') {
           recordFailedApproach(
@@ -10747,6 +10780,23 @@ Output ONLY the JSON action:`;
             }
           } else if (_action.action === 'clickByText') {
             const _target = _action.text || '';
+            // ── Strategy 0: Keyboard nav (ArrowDown + Enter) — deterministic for menus ──
+            const _kbHelpers = _getKbHelpers();
+            if (_kbHelpers._selectOverlayItemByKeyboard) {
+              const _kbResult = await _kbHelpers._selectOverlayItemByKeyboard(sessionId, _target, null, null);
+              if (_kbResult?.ok) {
+                logger.info(`[playwright.agent] Tier 1.8: keyboard nav succeeded for "${_target}" — selected "${_kbResult.selectedText}"`);
+                _outcome = { ok: true, result: `Keyboard nav: selected "${_kbResult.selectedText}"` };
+                _actionCount++;
+                postProgress(_progressCallbackUrl, {
+                  type: 'agent:turn', stepIndex: _stepIndex, turn: _actionCount,
+                  maxTurns: MAX_ACTIONS_PER_SUBTASK, action: _action, outcome: _outcome, thoughts: '',
+                });
+                continue;
+              }
+            } else {
+              logger.info(`[playwright.agent] Tier 1.8: keyboard nav not available — using clickByText`);
+            }
             // ── Strategy 1: DOM-based click (PRIMARY — scoped to popup if open) ──
             const _domClick = await _clickByTextDom(page, _target, _containerSelector);
             if (_domClick.ok) {
