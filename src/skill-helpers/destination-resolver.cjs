@@ -88,6 +88,11 @@ const INTENT_PATTERNS = [
     intent: INTENTS.CONSOLE,
     re: /\b(api[\s_-]?key|api[\s_-]?keys|generate[\s_-]?key|developer[\s_-]?console|create[\s_-]?token|bearer[\s_-]?token|secret[\s_-]?key|api[\s_-]?token)\b/i,
   },
+  // CONTENT_CREATE — create and publish content (before DOCS so "create a document" wins over "Docs")
+  {
+    intent: INTENTS.CONTENT_CREATE,
+    re: /\b(write[\s_-].*(?:post|blog|article)|publish[\s_-].*(?:article|post|video)|upload[\s_-].*(?:video|file|image)|create[\s_-].*(?:page|post|blog|listing|document|doc|spreadsheet|sheet|presentation|slide|form|note|task)|open\s+.*(?:create|make)\s+a\s+(?:new\s+)?(?:document|doc|spreadsheet|sheet|presentation|slide|form|note))\b/i,
+  },
   // DOCS
   {
     intent: INTENTS.DOCS,
@@ -112,11 +117,6 @@ const INTENT_PATTERNS = [
   {
     intent: INTENTS.SEARCH,
     re: /\b(search\s+(?:for|on|google|youtube)?|google\s+(?:for|search|maps|flights)?|site:)/i,
-  },
-  // CONTENT_CREATE — create and publish content (before SOCIAL so "write a post" wins)
-  {
-    intent: INTENTS.CONTENT_CREATE,
-    re: /\b(write[\s_-].*(?:post|blog|article)|publish[\s_-].*(?:article|post|video)|upload[\s_-].*(?:video|file|image)|create[\s_-].*(?:page|post|blog|listing))\b/i,
   },
   // SOCIAL — explicit posting/messaging/following on social or forum platforms
   {
@@ -211,8 +211,12 @@ function _scopeTaskText(task, maxChars = 280) {
  * @param {string} [serviceKey] - The service being resolved (e.g. "gmail",
  *                                "twitter", "chatgpt"). Optional for backward
  *                                compatibility.
+ * @param {boolean} [useLLM=true] - When false, skip LLM classification and
+ *                                  use only the regex fallback (fast, no
+ *                                  network call). Used by appKnowledge
+ *                                  pre-classification in _resolveTaskDeepLink.
  */
-async function classifyTaskIntent(task, serviceKey) {
+async function classifyTaskIntent(task, serviceKey, useLLM = true) {
   const _scopedFull = _scopeTaskText(task, 280);
   const _scopedShort = _scopedFull;
   const _svc = String(serviceKey || '').toLowerCase().replace(/[^a-z0-9]/g, '');
@@ -225,7 +229,7 @@ async function classifyTaskIntent(task, serviceKey) {
   }
 
   // ── Primary: LLM classification ───────────────────────────────────────────
-  if (_skillLlm && _scopedShort.trim().length > 3) {
+  if (useLLM && _skillLlm && _scopedShort.trim().length > 3) {
     try {
       // Dynamically inject service context so the LLM focuses on the relevant
       // portion of a multi-step task for the specific service being resolved.
@@ -247,7 +251,7 @@ Definitions and examples:
 - mail           : send, compose, forward, or reply to email. Examples: "send an email to Bob", "reply to the last message", "compose a new email"
 - social         : post, comment, message, follow, share on a social or forum platform. Examples: "post on X", "comment on Instagram", "tweet this link", "follow Elon on X"
 - commerce       : buy, add to cart, checkout, order, purchase. Examples: "add headphones to cart", "checkout on Amazon", "buy this item"
-- content_create : write, compose, publish, or upload content. Examples: "write a blog post on Medium", "upload a YouTube video", "publish an article"
+- content_create : write, compose, publish, or upload content. Examples: "write a blog post on Medium", "upload a YouTube video", "publish an article", "create a new Google Doc titled Q4 Planning Notes", "create a Google Sheets spreadsheet", "create a Google Slides presentation", "create a new blank document"
 - scheduling     : book, schedule, reserve, appointment, calendar. Examples: "book a table on OpenTable", "schedule a Zoom meeting", "reserve a room"
 - maps           : directions, nearby, navigate, locate. Examples: "directions to the airport", "find nearby gas stations", "navigate to Times Square"
 - download       : download, export, or save a file. Examples: "download the PDF", "export the report", "save the image"
@@ -1219,4 +1223,5 @@ module.exports = {
   SERVICE_CHAT_URLS,
   isAuthFlowUrl,
   AUTH_FLOW_PATH_RE,
+  _isValidDeepLinkUrl,
 };

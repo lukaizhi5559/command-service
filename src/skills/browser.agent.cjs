@@ -400,12 +400,12 @@ Strategy? (0, 1, 2, or 3)`;
       { role: 'user', content: userPrompt },
     ], { maxTokens: 10, temperature: 0.1, responseTimeoutMs: 10000 });
     const num = parseInt((raw || '').trim().replace(/\D/g, ''), 10);
-    const result = [0, 1, 2, 3].includes(num) ? num : 3;
+    const result = [0, 1, 2, 3, 4].includes(num) ? num : 4;
     logger.info(`[browser.agent] _decisionCall: strategy=${result} (raw="${(raw || '').trim()}")`);
     return result;
   } catch (e) {
-    logger.warn(`[browser.agent] _decisionCall failed: ${e.message} — defaulting to 3 (Tab-Map)`);
-    return 3;
+    logger.warn(`[browser.agent] _decisionCall failed: ${e.message} — defaulting to 4 (Tab-Map)`);
+    return 4;
   }
 }
 
@@ -554,6 +554,171 @@ Which shortcut? (return number or 0 for none)`;
   }
 }
 
+// Step-based Tab-Map: extract ordered steps from goal + available elements in one LLM call.
+// Returns array of { action, target?, value?, key? } or null on failure.
+// Caller executes steps in order; on page change, re-extract for new page.
+// If null or <=1 step, caller falls back to per-step _llmNextAction (browse-and-report).
+async function _extractSteps(goal, currentUrl, tabMap, pageCategory, agentContext) {
+  const { askWithMessages } = require('../skill-helpers/skill-llm.cjs');
+
+  const _contextBlock = agentContext
+    ? `\n\nAgent context (service descriptor / playbook — use these labels if relevant):\n${String(agentContext).slice(0, 1200)}`
+    : '';
+
+  // Build element list with [FILLABLE]/[CLICKABLE] markers
+  const elementList = (tabMap || []).map(e => {
+    const _tag = e.tag || '';
+    const _role = e.role || '';
+    const _label = e.text || e.ariaLabel || '';
+    const _isFillable = ['input', 'textarea'].includes(_tag) ||
+                        _role === 'combobox' || _role === 'textbox';
+    const _marker = _isFillable ? '[FILLABLE]' : '[CLICKABLE]';
+    return `${e.id} - ${_tag} "${_label}" ${_role ? `role=${_role} ` : ''}${_marker}`;
+  }).join('\n');
+
+  const systemPrompt = `You are planning the steps to achieve a goal on a web page.
+Look at the goal, the current URL, and the available elements.
+Extract the ordered steps needed to achieve the goal ON THIS PAGE ONLY.
+
+Output ONLY a JSON array. No reasoning, no prose, no markdown, no commentary.
+The array MUST start with [ and end with ].
+
+Allowed actions (use ONLY these exact words):
+  type  — for entering text into [FILLABLE] elements
+  click — for pressing [CLICKABLE] elements (buttons, links)
+  press — for keyboard keys (Enter, Tab, Escape)
+  done  — when the goal is already achieved
+
+NEVER use "fill", "input", "enter", or any other action name. Only type, click, press, done.
+
+Step formats (use EXACTLY these):
+  { "action": "type", "target": "field label", "value": "text to type" }
+  { "action": "click", "target": "button text" }
+  { "action": "press", "key": "Enter" }
+  { "action": "done" }
+
+Rules:
+- Use the EXACT text/label of elements from the available elements list for "target".
+- Use "type" for [FILLABLE] elements, "click" for [CLICKABLE] elements.
+- Extract values to type from the goal text (email addresses, subjects, message bodies, search queries, names).
+- Only include steps that can be done ON THIS PAGE with the available elements.
+- If the page has [FILLABLE] form fields, fill ALL of them before clicking any submit button (Send, Submit, Post, Save, etc.).
+- Do NOT include steps for actions that require a different page (e.g., don't plan clicking a search result if the search hasn't been submitted yet — that's a future page).
+- If the goal is already achieved on this page, return [{ "action": "done" }].
+- If no action on this page gets closer to the goal, return [{ "action": "done" }].
+- For chip/token fields (email To, Recipients, CC, BCC): the system auto-confirms with Enter after Type. Do NOT add a separate press Enter step for chip confirmation.
+- For AI chat (ChatGPT, Claude, etc.): after typing the prompt, add { "action": "press", "key": "Enter" } to submit.
+- Maximum 8 steps per page.
+- If there is only one step, still return an array: [{ "action": "..." }]
+- Output ONLY the JSON array, starting with [ and ending with ]. No other text.`;
+
+  const userPrompt = `Goal: ${goal}
+Current URL: ${currentUrl}
+Page category: ${pageCategory || 'unknown'}${_contextBlock}
+
+Available elements on this page:
+${elementList}
+
+Extract the ordered steps:`;
+
+  try {
+    const raw = await askWithMessages([
+      { role: 'system', content: systemPrompt },
+      { role: 'user', content: userPrompt },
+    ], { maxTokens: 1200, temperature: 0.1, responseTimeoutMs: 15000, taskType: 'planning' });
+
+    // Extract JSON from after </reasoning> tag, or fallback to finding the first [
+    let jsonStr = (raw || '').trim();
+    const reasoningEnd = jsonStr.indexOf('</reasoning>');
+    if (reasoningEnd !== -1) {
+      jsonStr = jsonStr.slice(reasoningEnd + '</reasoning>'.length).trim();
+    } else {
+      const bracketStart = jsonStr.indexOf('[{');
+      if (bracketStart >= 0) jsonStr = jsonStr.slice(bracketStart);
+    }
+    const cleaned = jsonStr.replace(/^```(?:json)?\s*\n?/i, '').replace(/\n?```\s*$/, '').trim();
+
+    let parsed;
+    try {
+      parsed = JSON.parse(cleaned);
+    } catch (parseErr) {
+      // Try extracting JSON from mixed text (e.g., "Here are the steps: [...]")
+      const arrMatch = cleaned.match(/\[[\s\S]*\]/);
+      if (arrMatch) {
+        try { parsed = JSON.parse(arrMatch[0]); } catch (_) {
+          logger.warn(`[browser.agent] _extractSteps: JSON parse failed: ${parseErr.message}. Raw: ${cleaned.slice(0, 500)}`);
+          return null;
+        }
+      } else {
+        logger.warn(`[browser.agent] _extractSteps: JSON parse failed: ${parseErr.message}. Raw: ${cleaned.slice(0, 500)}`);
+        return null;
+      }
+    }
+    // Normalize to array (tolerate object-wrapped responses from light models)
+    let steps;
+    if (Array.isArray(parsed)) {
+      steps = parsed;
+    } else if (parsed && typeof parsed === 'object') {
+      if (Array.isArray(parsed.steps)) steps = parsed.steps;
+      else if (Array.isArray(parsed.actions)) steps = parsed.actions;
+      else if (Array.isArray(parsed.plan)) steps = parsed.plan;
+      else if (Array.isArray(parsed.result)) steps = parsed.result;
+      else if (Array.isArray(parsed.data)) steps = parsed.data;
+      else if (Array.isArray(parsed.output)) steps = parsed.output;
+      else if (parsed.action) steps = [parsed];
+      else {
+        // Last resort: scan all object values for an array of step-like objects
+        const _arrVal = Object.values(parsed).find(v => Array.isArray(v) && v.length > 0 &&
+          v.every(s => s && typeof s === 'object' && typeof s.action === 'string'));
+        if (_arrVal) {
+          steps = _arrVal;
+          logger.info(`[browser.agent] _extractSteps: extracted steps from unknown array property — ${steps.length} step(s)`);
+        } else {
+          logger.warn(`[browser.agent] _extractSteps: response is object without steps array. Raw: ${JSON.stringify(parsed).slice(0, 500)}`);
+          return null;
+        }
+      }
+      logger.info(`[browser.agent] _extractSteps: normalized ${Array.isArray(parsed) ? 'array' : 'object'} to ${steps.length} step(s)`);
+    } else {
+      logger.warn(`[browser.agent] _extractSteps: response not an array or object. Raw: ${String(parsed).slice(0, 500)}`);
+      return null;
+    }
+
+    // Post-process: normalize action names and filter invalid steps (defense in depth)
+    const _actionAliases = { fill: 'type', input: 'type', enter: 'type', write: 'type', set: 'type' };
+    steps = steps.map(s => {
+      const normalized = { ...s };
+      const _act = (normalized.action || '').toLowerCase();
+      if (_actionAliases[_act]) normalized.action = _actionAliases[_act];
+      return normalized;
+    }).filter(s => {
+      if (!['type', 'click', 'press', 'done'].includes(s.action)) {
+        logger.warn(`[browser.agent] _extractSteps: dropping step with invalid action "${s.action}"`);
+        return false;
+      }
+      if (s.action === 'done') return true;
+      if (s.action === 'press') return !!s.key;
+      // type/click need a non-empty target that's not just a tag name
+      const _t = (s.target || '').trim();
+      if (!_t || /^div$/i.test(_t) || /^div\s+""$/i.test(_t)) {
+        logger.warn(`[browser.agent] _extractSteps: dropping step with invalid target "${s.target}"`);
+        return false;
+      }
+      return true;
+    });
+
+    if (steps.length === 0) {
+      logger.warn(`[browser.agent] _extractSteps: all steps filtered out — returning null`);
+      return null;
+    }
+    logger.info(`[browser.agent] _extractSteps: extracted ${steps.length} step(s) from goal — ${steps.map(s => s.action + (s.target ? ` "${s.target}"` : '')).join(', ')}`);
+    return steps;
+  } catch (e) {
+    logger.warn(`[browser.agent] _extractSteps failed: ${e.message}`);
+    return null;
+  }
+}
+
 // Tab-Map strategy: LLM decides one action per step based on available elements.
 // Updated with [FILLABLE]/[CLICKABLE] markers, filled field tracking, and label fixes.
 async function _llmNextAction(goal, currentUrl, tabMap, actionHistory, pageCategory, agentContext, lastVerifyFailed, consumedRefs, filledFields) {
@@ -563,17 +728,43 @@ async function _llmNextAction(goal, currentUrl, tabMap, actionHistory, pageCateg
     ? `\n\nAgent context (service descriptor / playbook — use these labels if relevant):\n${String(agentContext).slice(0, 1500)}`
     : '';
 
-  // Filter out consumed (already-filled) elements
-  const availableElements = (tabMap || []).filter(e => !consumedRefs || !consumedRefs.has(e.ref));
+  // Build element list with [FILLABLE]/[REQUIRED]/[FILLED]/[SUBMIT] markers.
+  // Show ALL elements (don't filter out filled ones) so LLM has full context.
+  // Match filled state by ref OR label (handles rescan case where ref changed).
+  const _submitKeywords = /\b(send|submit|post|publish|save|create|delete|confirm|ok|apply|done|finish|complete|next|continue|yes|update|sign\s*up|register|log\s*in|sign\s*in|place\s*order|buy|checkout|book|reserve|schedule|subscribe)\b/i;
 
-  // Build element list with [FILLABLE]/[CLICKABLE] markers
-  const elementList = availableElements.map(e => {
+  const _filledMap = new Map();
+  if (filledFields && filledFields.length > 0) {
+    for (const f of filledFields) {
+      if (f.ref) _filledMap.set(f.ref, f.value);
+      if (f.label) _filledMap.set(`label:${String(f.label).toLowerCase()}`, f.value);
+    }
+  }
+
+  const elementList = (tabMap || []).map(e => {
     const _tag = e.tag || '';
     const _role = e.role || '';
+    const _label = e.text || e.ariaLabel || '';
     const _isFillable = ['input', 'textarea'].includes(_tag) ||
                         _role === 'combobox' || _role === 'textbox';
-    const _marker = _isFillable ? '[FILLABLE]' : '[CLICKABLE]';
-    return `${e.id} - ${_tag} "${e.text || e.ariaLabel || ''}" ${_role ? `role=${_role} ` : ''}${_marker}`;
+    const _filledValue = _filledMap.get(e.ref) || _filledMap.get(`label:${String(_label).toLowerCase()}`);
+
+    const markers = [];
+    if (_isFillable) {
+      markers.push('[FILLABLE]');
+      if (_filledValue) {
+        markers.push(`[FILLED: "${String(_filledValue).slice(0, 40)}"]`);
+      } else {
+        markers.push('[REQUIRED]');
+      }
+    } else {
+      markers.push('[CLICKABLE]');
+      if (_submitKeywords.test(_label)) {
+        markers.push('[SUBMIT]');
+      }
+    }
+
+    return `${e.id} - ${_tag} "${_label}" ${_role ? `role=${_role} ` : ''}${markers.join(' ')}`;
   }).join('\n');
 
   // Build "Fields already filled" section
@@ -608,7 +799,14 @@ Rules:
 - Use ONLY these verb forms — Click, Type, Press Enter, Press Tab, Press Escape, Navigate, DONE.
 - Use the EXACT text/label of elements as shown in the available elements list.
 - Use Type for [FILLABLE] elements and Click for [CLICKABLE] elements. Do NOT click a [FILLABLE] field — type into it directly.
-- Fields already filled are OMITTED from the available elements list. Do NOT try to fill them again.
+- Elements marked [FILLED: "value"] are already done — do NOT type into them again. Skip to the next [REQUIRED] field.
+- Elements marked [REQUIRED] are form fields that must be filled. Fill all [REQUIRED] fields first.
+- WHILE any [REQUIRED] field is NOT [FILLED], your ONLY allowed actions are:
+    (1) Type into a [REQUIRED] field
+    (2) Click a button that expands/opens the form (e.g., Attach, CC/BCC toggle, formatting toolbar)
+  Do NOT click any other button (Send, Submit, OK, Cancel, Close, etc.) until ALL [REQUIRED] fields are [FILLED].
+- When ALL [REQUIRED] fields are [FILLED], you may click a [SUBMIT] button if the goal requires submission.
+- If all [REQUIRED] fields are [FILLED] and no submission is needed, output DONE.
 - If the goal is already achieved (form submitted, email sent, search results shown), output DONE.
 - If no available element gets closer to the goal, output DONE.
 - For chip/token fields (email To, Recipients, CC, BCC): after Type, the system auto-confirms with Enter. Do NOT add a separate Press Enter for chip confirmation.
@@ -618,7 +816,6 @@ Rules:
 - If a modal/dialog is open (elements like "To", "Subject", "Body", "Send" are visible), work within it.
 - Do NOT repeat actions you've already taken (see action history). Try a different approach.
 - If you've already clicked an element and the page didn't change (see action results), try a different action.
-- For Gmail compose: the recipient field label is "To recipients" (shown as "To" in the UI), the subject field label is "Subject", the body field label is "Message Body", the send button text is "Send".
 - APP KNOWLEDGE RULE: Check the Agent context below for app-specific patterns — slash commands, block creation shortcuts, UI quirks, keyboard shortcuts. Use them when the goal requires app-specific interactions.
 - BLOCK-CREATION RULE: When creating lists/todos/headings in block-based editors (Notion, Google Docs), do NOT type raw markdown. Create each block as a separate step: (1) Type the block-creation shortcut (e.g. "/todo" or "[]" + Space — check Agent context for the app's specific shortcuts), (2) Press Enter if a slash menu appeared, (3) Type the item text, (4) Press Enter to create the next block. Repeat for each item.
 - SEARCH-THEN-CLICK RULE: When clicking search results, skip ads/sponsored results — click the first ORGANIC result.`;
@@ -674,7 +871,7 @@ function _postProgress(callbackUrl, evt) {
 
 const { userAgent } = require('./user.agent.cjs');
 
-const { resolveDestination, recordCorrection, classifyTaskIntent, classifyUrlType, getLearnedCorrection, deleteLearnedCorrection, suggestTaskUrl, getTaskKeywords, getCachedDeepLink, recordDeepLinkCache, deleteDeepLinkCache, getSearchUrlPattern, recordSearchUrlPattern, INTENTS, SERVICE_CHAT_URLS, isAuthFlowUrl } = require('../skill-helpers/destination-resolver.cjs');
+const { resolveDestination, recordCorrection, classifyTaskIntent, classifyUrlType, getLearnedCorrection, deleteLearnedCorrection, suggestTaskUrl, getTaskKeywords, getCachedDeepLink, recordDeepLinkCache, deleteDeepLinkCache, getSearchUrlPattern, recordSearchUrlPattern, INTENTS, SERVICE_CHAT_URLS, isAuthFlowUrl, _isValidDeepLinkUrl } = require('../skill-helpers/destination-resolver.cjs');
 const { killExistingChromeForProfile, clearProfileLock, findCli, shortSessionId, _sniffAuthCookies, engine: browserEngine } = require('./browser.act.cjs');
 const { loadAppKnowledge, saveAppKnowledge, loadAndFormat, isCacheStale, isShortcutCoverageStale, recordVerification } = require('./lib/appKnowledge.cjs');
 
@@ -1068,6 +1265,31 @@ function lookupBrowserService(service) {
   // deriveAgentType() returns 'browser' for any isOAuth:false entry without an explicit type.
   if (!entry.capabilities) return { ...entry, capabilities: ['navigate', 'interact'] };
   return entry;
+}
+
+/**
+ * Seed appKnowledge with known intent→URL mappings from KNOWN_BROWSER_SERVICES.
+ * Called when appKnowledge is empty for a hostname, so the first run benefits
+ * from deterministic templates (e.g. googledocs.content_create → /document/create)
+ * without needing prior verification. Entries start at confidence 0.8 and are
+ * reinforced/decayed via recordVerification on subsequent runs.
+ */
+function _seedIntentUrlsFromKnownServices(hostname, serviceKey) {
+  try {
+    const svcEntry = lookupBrowserService(serviceKey);
+    if (!svcEntry?.intentUrls) return;
+    const { saveIntentUrl } = require('./lib/appKnowledge.cjs');
+    let seeded = 0;
+    for (const [intentKey, urlOrBuilder] of Object.entries(svcEntry.intentUrls)) {
+      // intentUrls values can be strings or { buildUrl } functions; only seed strings
+      if (typeof urlOrBuilder !== 'string') continue;
+      saveIntentUrl(hostname, intentKey, urlOrBuilder);
+      seeded++;
+    }
+    if (seeded > 0) {
+      logger.info(`[browser.agent] app-knowledge: seeded ${seeded} intent_url entries for ${hostname} from KNOWN_BROWSER_SERVICES`);
+    }
+  } catch (_) { /* non-fatal */ }
 }
 
 // Check if currentHost is equivalent to expectedHost, considering configured host aliases.
@@ -3628,12 +3850,30 @@ async function _resolveTaskDeepLink(agentId, serviceKey, baseStartUrl, task, exi
       catch (_) { return serviceKey; }
     })();
 
+    // Compute criteria-task status before the appKnowledge/keyword checks reference it.
+    const _isCriteriaTask = _isSearchCriteriaTask(task);
+
+    // Step -1: appKnowledge intent_url check (highest priority, verified cache).
+    // If we have a verified intent→URL mapping for this hostname+intent, use it
+    // directly. This skips the keyword cache and discovery pipeline entirely.
+    // Entries are seeded from KNOWN_BROWSER_SERVICES.intentUrls and updated via
+    // recordVerification after each run (success bumps confidence, failure decays).
+    if (!_isCriteriaTask && intent && intent !== INTENTS.HOME) {
+      try {
+        const { loadIntentUrl } = require('./lib/appKnowledge.cjs');
+        const _akUrl = loadIntentUrl(baseHost, intent);
+        if (_akUrl?.url && _isValidDeepLinkUrl(_akUrl.url)) {
+          logger.info(`[browser.agent] deep-link: appKnowledge intent_url hit for ${baseHost}/${intent}: ${_akUrl.url} (confidence=${_akUrl.confidence}, verifiedRuns=${_akUrl.verifiedRuns})`);
+          return { url: _akUrl.url, source: 'appKnowledge', intent };
+        }
+      } catch (_) { /* non-fatal */ }
+    }
+
     // Step 0: For search-criteria tasks, build the deterministic search URL FIRST —
     // before checking the keyword cache. A generic cached destination (e.g. the inbox)
     // can't encode filter criteria (unread, from:X, subject:X), so letting the cache win
     // would land the agent on the wrong page. The template must win for criteria tasks.
     // (Defense-in-depth: protects against stale/polluted cache entries.)
-    const _isCriteriaTask = _isSearchCriteriaTask(task);
     const _criteriaUrl = _buildSearchCriteriaUrl(intent, serviceKey, baseStartUrl, baseHost, task);
     if (_criteriaUrl) {
       logger.info(`[browser.agent] deep-link: search-criteria template for ${agentId}: ${_criteriaUrl}`);
@@ -3774,6 +4014,7 @@ async function _resolveTaskDeepLink(agentId, serviceKey, baseStartUrl, task, exi
       if (intent === INTENTS.DOCS) {
         if (svcEntry?.intentUrls?.docs) return _resolveIntentTemplate(svcEntry.intentUrls.docs, task, {});
         if (baseHost === 'w3schools.com') return `${startUrlBase}/`;
+        if (baseHost.startsWith('docs.')) return startUrlBase;
         return `https://docs.${baseHost}`;
       }
 
@@ -3793,7 +4034,13 @@ async function _resolveTaskDeepLink(agentId, serviceKey, baseStartUrl, task, exi
     let candidate = _buildIntentTemplateUrl();
     let candidateSource = candidate ? 'template' : null;
     if (candidate) {
-      logger.info(`[browser.agent] deep-link: using intent template for ${agentId}: ${candidate}`);
+      if (!_isValidDeepLinkUrl(candidate)) {
+        logger.warn(`[browser.agent] deep-link: rejecting invalid template URL for ${agentId}: ${candidate} — falling through to discovery`);
+        candidate = null;
+        candidateSource = null;
+      } else {
+        logger.info(`[browser.agent] deep-link: using intent template for ${agentId}: ${candidate}`);
+      }
     }
 
     // 1.5. Authenticated eval — extract <a href> links from the live browser session.
@@ -4066,6 +4313,20 @@ async function _resolveTaskDeepLink(agentId, serviceKey, baseStartUrl, task, exi
       });
     }
 
+    // Part B.5: Cache intent→URL in appKnowledge for future runs.
+    // This is the verified intent_url cache — future runs with the same
+    // hostname+intent will hit the appKnowledge check (Step -1) and skip
+    // the LLM classification + discovery pipeline entirely.
+    if (candidate && intent && intent !== INTENTS.HOME && baseHost && !_isCriteriaTask) {
+      setImmediate(() => {
+        try {
+          const { saveIntentUrl } = require('./lib/appKnowledge.cjs');
+          saveIntentUrl(baseHost, intent, candidate);
+          logger.info(`[browser.agent] deep-link: cached intent_url ${intent} → ${candidate} in appKnowledge for ${baseHost}`);
+        } catch (_) {}
+      });
+    }
+
     // Part C: For criteria tasks, if the discovered candidate is a search URL (has a
     // query param like ?q=, ?query=, ?search=, ?filter=, or #search/), extract and cache
     // the URL pattern (with {query} placeholder) for future criteria tasks on this service.
@@ -4227,6 +4488,7 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
   // function scope so they are visible outside the if/else branch that populates them.
   let _urlFirstNavigationSelected = false;
   let _deepLinkSource = null;
+  let _deepLinkIntent = null; // intent from _resolveTaskDeepLink (for appKnowledge verification)
   let _urlFirstProbeUsed = false;
 
   const _fs = require('fs');
@@ -4504,7 +4766,25 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
   const _svcInfo         = lookupBrowserService(_svcKey);
 
   let startUrl             = extractDescriptorUrl(existing.descriptor, 'start_url');
-  const signInUrl          = extractDescriptorUrl(existing.descriptor, 'sign_in_url');
+  const _rawSignInUrl      = extractDescriptorUrl(existing.descriptor, 'sign_in_url');
+  // Sanitize bare OAuth endpoints (e.g. accounts.google.com/o/oauth2/auth) to proper
+  // sign-in URLs. _sanitizeBrowserMeta does this in resolveBrowserMeta, but actionRun
+  // reads directly from the descriptor — bypassing that fix. Without this, waitForAuth
+  // navigates to a bare OAuth endpoint that always errors ("Required parameter is missing:
+  // response_type"), causing a 120s timeout even when the user is already authenticated.
+  const signInUrl = (() => {
+    if (!_rawSignInUrl) return _rawSignInUrl;
+    if (!OAUTH_ENDPOINT_RE.test(_rawSignInUrl)) return _rawSignInUrl;
+    try {
+      const _idpHost = new URL(_rawSignInUrl).hostname;
+      if (IDP_LOGIN_MAP[_idpHost]) {
+        logger.warn(`[browser.agent] run: sanitized bare OAuth signInUrl for ${agentId}: ${_rawSignInUrl} → ${IDP_LOGIN_MAP[_idpHost]}`);
+        return IDP_LOGIN_MAP[_idpHost];
+      }
+    } catch (_) {}
+    logger.warn(`[browser.agent] run: could not sanitize OAuth signInUrl for ${agentId} — falling back to startUrl`);
+    return null; // waitForAuth uses (signInUrl || startUrl) — fall back to startUrl
+  })();
   const authSuccessPattern = extractDescriptorUrl(existing.descriptor, 'auth_success_pattern');
   const _hostAliasesDesc   = extractDescriptorUrl(existing.descriptor, 'host_aliases');
   const hostAliases        = _hostAliasesDesc
@@ -4581,6 +4861,16 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
         _appKnowledgeEntries = _cachedEntries;
         logger.info(`[browser.agent] app-knowledge: loaded ${_cachedEntries.length} cached entries for ${_appKnowledgeHost}`);
       } else {
+        // Cache empty or stale — seed intent_url entries from KNOWN_BROWSER_SERVICES
+        // so the first run benefits from deterministic templates (e.g. googledocs
+        // content_create → /document/create) without needing prior verification.
+        _seedIntentUrlsFromKnownServices(_appKnowledgeHost, _svcKey);
+        // Reload after seeding so intent_url entries are available for this run
+        const _seededEntries = loadAppKnowledge(_appKnowledgeHost);
+        if (_seededEntries.length > 0) {
+          _appKnowledgeEntries = _seededEntries;
+          logger.info(`[browser.agent] app-knowledge: loaded ${_seededEntries.length} entries (after seeding) for ${_appKnowledgeHost}`);
+        }
         // Cache empty or stale (all low-confidence) — start research now (parallel with auth check below)
         const _akDomain = existing?.service || _appKnowledgeHost;
         const _akQuery = task ? task.slice(0, 80) : null;
@@ -5608,6 +5898,7 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
     const _deepLinkResult = await _resolveTaskDeepLink(agentId, _svcKey, startUrl, task, null, sessionId);
     const _deepLink = _deepLinkResult?.url || (typeof _deepLinkResult === 'string' ? _deepLinkResult : null);
     _deepLinkSource = _deepLinkResult?.source || null;
+    _deepLinkIntent = _deepLinkResult?.intent || null;
     if (_deepLink) {
       startUrl = _deepLink;
       _urlFirstNavigationSelected = true;
@@ -7294,6 +7585,16 @@ Output ONLY valid JSON: {${_execRecipe.params.map(p => `"${p.name}": "<extracted
                 recordDeepLinkCache(_serviceKey, _bestUrl, _secondaryKeywords, _intent).catch(() => {});
               });
             }
+            // Also cache in appKnowledge intent_url for future runs
+            if (_intent && _intent !== INTENTS.HOME && !_isSearchCriteriaTask(task)) {
+              setImmediate(() => {
+                try {
+                  const { saveIntentUrl } = require('./lib/appKnowledge.cjs');
+                  const _host = (() => { try { return new URL(_bestUrl).hostname.replace(/^www\./, ''); } catch (_) { return ''; } })();
+                  if (_host) saveIntentUrl(_host, _intent, _bestUrl);
+                } catch (_) {}
+              });
+            }
           } else {
             logger.warn(`[browser.agent] deep-link: candidate ${_bestUrl} failed validation — using startUrl ${startUrl}`);
             // If cached URL failed, clear it so we rediscover next time
@@ -7409,7 +7710,8 @@ When extracting page content with run-code, prioritize these selectors over gene
       // Tier 2: Decision call → 0 (DONE), 1 (Just-type), 2 (Meta+F), 3 (Tab-Map)
       // Tier 3: Strategy execution with fallback to Tab-Map
       const _pageCategory = _inferPageCategory(_svcKey, startUrl, task, _appKnowledgeEntries);
-      logger.info(`[browser.agent] tab-map: starting three-tier iterative navigation (category=${_pageCategory}, appKnowledge=${_appKnowledgeEntries?.length || 0} entries)`);
+      const _shortcutCount = _appKnowledgeEntries.filter(e => e.type === 'shortcut').length;
+      logger.info(`[browser.agent] tab-map: starting three-tier iterative navigation (category=${_pageCategory}, appKnowledge=${_appKnowledgeEntries?.length || 0} entries, shortcuts=${_shortcutCount})`);
       const { runIterativeNavigation } = require('./instruction.runner.cjs');
       const _tabMapResult = await runIterativeNavigation({
         goal: task,
@@ -7418,6 +7720,7 @@ When extracting page content with run-code, prioritize these selectors over gene
         urlFirstNav: _urlFirstNavigationSelected,
         pageCategory: _pageCategory,
         agentContext: _agentContext,
+        shortcutCount: _shortcutCount,
         timeoutMs: 120000,
       });
       if (_tabMapResult?.ok) {
@@ -7985,6 +8288,20 @@ When extracting page content with run-code, prioritize these selectors over gene
                 }
             }
         } catch (_) { /* non-fatal */ }
+    }
+
+    // ── appKnowledge intent_url verification ─────────────────────────────────
+    // If the deep-link came from appKnowledge, record success/failure so the
+    // entry's confidence is bumped (success) or decayed (failure). Bad URLs
+    // self-clean: confidence < 0.2 gets dropped by recordVerification.
+    if (_deepLinkSource === 'appKnowledge' && _deepLinkIntent) {
+        const _akHost = (() => { try { return new URL(startUrl).hostname.replace(/^www\./, ''); } catch (_) { return ''; } })();
+        if (_akHost) {
+            const _intentUrlId = `${_akHost}.intent_url.${_deepLinkIntent}`;
+            setImmediate(() => {
+                try { recordVerification(_akHost, _intentUrlId, _runResult.ok === true); } catch (_) { /* non-fatal */ }
+            });
+        }
     }
 
     // ── Save-as-named-skill offer (Phase 3) ────────────────────────────────────
@@ -9397,6 +9714,7 @@ module.exports._liteparseSubmit = _liteparseSubmit;
 module.exports._domFindSubmitTarget = _domFindSubmitTarget;
 module.exports._validateClickPoint = _validateClickPoint;
 module.exports._llmNextAction = _llmNextAction;
+module.exports._extractSteps = _extractSteps;
 module.exports._decisionCall = _decisionCall;
 module.exports._extractValue = _extractValue;
 module.exports._extractSearchText = _extractSearchText;

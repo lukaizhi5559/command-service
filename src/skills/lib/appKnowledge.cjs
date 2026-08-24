@@ -317,6 +317,51 @@ function isShortcutCoverageStale(hostname) {
   return false;
 }
 
+// ─── Intent → URL mappings ─────────────────────────────────────────────────
+// Verified intent→URL cache: stores the correct starting URL for a given
+// hostname + intent (e.g. docs.google.com + content_create → /document/create).
+// Populated by browser.agent after successful runs, seeded from
+// KNOWN_BROWSER_SERVICES.intentUrls on first run. Verified via recordVerification.
+
+/**
+ * Load a verified intent→URL mapping for a hostname + intent.
+ * Returns { url, confidence, verifiedRuns } or null if no entry exists.
+ * Only returns entries with confidence >= 0.4 (below = decayed/untrusted).
+ */
+function loadIntentUrl(hostname, intent) {
+  const h = _safeHostname(hostname);
+  if (!h || !intent) return null;
+  const entries = loadAppKnowledge(h);
+  const match = entries.find(e =>
+    e.type === 'intent_url' &&
+    e.details?.intent === intent &&
+    e.details?.url &&
+    (e.confidence || 0) >= 0.4
+  );
+  if (!match) return null;
+  return { url: match.details.url, confidence: match.confidence || 0, verifiedRuns: match.verifiedRuns || 0 };
+}
+
+/**
+ * Save a verified intent→URL mapping for a hostname.
+ * Uses a stable id so re-saves merge (update) rather than duplicate.
+ * Confidence starts at 0.8 for seeded/template URLs, bumps via recordVerification.
+ */
+function saveIntentUrl(hostname, intent, url, taskPattern = null) {
+  const h = _safeHostname(hostname);
+  if (!h || !intent || !url) return 0;
+  const id = `${h}.intent_url.${intent}`;
+  return saveAppKnowledge(h, [{
+    id,
+    type: 'intent_url',
+    summary: `${intent} → ${url}`,
+    details: { intent, url, taskPattern },
+    source: 'browser_agent_verified',
+    confidence: 0.8,
+    ttlDays: 90, // intent URLs are stable — longer TTL than quirks/shortcuts
+  }]);
+}
+
 module.exports = {
   APP_KNOWLEDGE_DIR,
   loadAppKnowledge,
@@ -326,6 +371,8 @@ module.exports = {
   loadAndFormat,
   isCacheStale,
   isShortcutCoverageStale,
+  loadIntentUrl,
+  saveIntentUrl,
   // Exposed for testing
   _makeId,
   _isExpired,
