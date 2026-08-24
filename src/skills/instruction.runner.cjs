@@ -72,12 +72,28 @@ async function _readActiveElement(sessionId) {
       const hasSvg = !!el.querySelector('svg');
       const ariaLabel = el.getAttribute('aria-label') || '';
       const isIconLike = text.length < 3 && (hasSvg || (r.width < 50 && r.height < 50) || el.getAttribute('role') === 'button' || el.tagName === 'BUTTON');
-      return { tag: el.tagName.toLowerCase(), role: el.getAttribute('role') || '', text,
+      // inDropdown: true when ArrowDown should navigate within a dropdown (not open autocomplete)
+      // - element has role menuitem/menuitemcheckbox/menuitemradio/option (it IS a dropdown item)
+      // - element is inside [role="menu"] or [role="listbox"] AND is NOT an input/textarea/combobox
+      const _role = el.getAttribute('role') || '';
+      const _tag = el.tagName.toLowerCase();
+      const inDropdown = ['menuitem', 'menuitemcheckbox', 'menuitemradio', 'option'].includes(_role) ||
+                         (!['input', 'textarea'].includes(_tag) && _role !== 'combobox' && _role !== 'textbox' &&
+                          !!el.closest('[role="menu"], [role="listbox"]'));
+      // currentValue: what's currently in the field (input.value, textarea.value,
+      // or textContent for contenteditable). Used for stuck-detection after Just-type.
+      const currentValue = (el.value !== undefined && el.value !== ''
+        ? String(el.value)
+        : (el.isContentEditable ? (el.innerText || el.textContent || '') : ''))
+        .trim().replace(/\\s+/g, ' ').slice(0, 120);
+      return { tag: _tag, role: _role, text,
+               currentValue,
                ref,
                type: el.tagName === 'INPUT' ? (el.type || 'text') : '',
                ariaLabel,
                isIconLike,
                hasSvg,
+               inDropdown,
                x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height) };
     })()`,
   });
@@ -121,6 +137,276 @@ async function _isEditableByProbe(sessionId) {
   await _sleep(30);
 
   return isEditable;
+}
+
+// ---------------------------------------------------------------------------
+// Chip/token confirmation: for email To/CC/BCC and similar multi-select
+// inputs, the page converts the typed text into a chip only after Enter is
+// pressed. This function checks the focused element and its context and, if
+// it looks like a token field, presses Enter up to two times and verifies the
+// typed value no longer appears as raw text in the input.
+//
+// Detection layers (any one triggers confirmation):
+// 1. Element name attribute (name="to", name="cc", name="bcc")
+// 2. Combobox semantics (role="combobox", aria-autocomplete="list", aria-owns)
+// 3. Chip-like children in 5 ancestors ([role="listbox"], .chip, .token, etc.)
+// 4. Step target text fallback (target contains "To/Recipients/CC/BCC/Email")
+// 5. Category forcing: if pageCategory="email_compose" and target looks chip-like
+//
+// Safety: after pressing Enter, checks if the compose dialog is still open.
+// If it closed (Enter submitted the form prematurely), stops and returns ok:false.
+// ---------------------------------------------------------------------------
+async function _confirmChipIfNeeded(sessionId, stepTarget, stepValue, pageCategory) {
+  const _chipLike = (target) => /\b(to|recipients|recipient|email|cc|bcc)\b/i.test(target || '');
+  const _categoryForcesChip = pageCategory === 'email_compose';
+
+  try {
+    const res = await browserAct({
+      action: 'evaluate', sessionId, headed: true, timeoutMs: 3000,
+      text: `(() => {
+        const el = document.activeElement;
+        if (!el || el === document.body) return { isChip: false };
+        const name = (el.getAttribute('name') || '').toLowerCase();
+        const role = (el.getAttribute('role') || '').toLowerCase();
+        const autocomplete = (el.getAttribute('aria-autocomplete') || '').toLowerCase();
+        const owns = el.getAttribute('aria-owns') || '';
+        const controls = el.getAttribute('aria-controls') || '';
+        const placeholder = (el.getAttribute('placeholder') || '').toLowerCase();
+        const ariaLabel = (el.getAttribute('aria-label') || '').toLowerCase();
+
+        const nameMatches = ['to', 'cc', 'bcc'].includes(name);
+        const comboLike = role === 'combobox' || autocomplete === 'list' || owns || controls;
+        const labelLike = /\b(to|recipients|recipient|email)\b/.test(placeholder + ' ' + ariaLabel);
+
+        let parent = el.parentElement;
+        let tokenLikeContainer = false;
+        for (let p = 0; p < 5 && parent; p++) {
+          if (parent.querySelector('[role="listbox"], [role="option"], .chip, .token, .recipient, [data-tooltip]')) {
+            tokenLikeContainer = true; break;
+          }
+          parent = parent.parentElement;
+        }
+
+        const isChip = nameMatches || (comboLike && labelLike) || tokenLikeContainer;
+        return { isChip, name, role, autocomplete, labelLike, comboLike, tokenLikeContainer };
+      })()`,
+    });
+    const info = res?.result;
+    logger.info(`[instruction.runner] _confirmChipIfNeeded: pageCategory=${pageCategory}, target="${stepTarget}", value="${String(stepValue || '').slice(0, 40)}", DOM={isChip=${info?.isChip}, name=${info?.name}, role=${info?.role}, comboLike=${info?.comboLike}, labelLike=${info?.labelLike}, tokenLikeContainer=${info?.tokenLikeContainer}}`);
+
+    // Decide whether to confirm:
+    // - DOM signals say chip → confirm
+    // - Category says email_compose + target looks chip-like → force confirm
+    // - Otherwise → skip
+    if (!info?.isChip && !_chipLike(stepTarget) && !(_categoryForcesChip && _chipLike(stepTarget))) {
+      logger.info(`[instruction.runner] _confirmChipIfNeeded: skipping (no chip signals, target not chip-like, category not forcing)`);
+      return { ok: true, pressed: false };
+    }
+    if (!info?.isChip && _categoryForcesChip && _chipLike(stepTarget)) {
+      logger.info(`[instruction.runner] Chip confirmation forced by category=email_compose for target "${stepTarget}"`);
+    } else {
+      logger.info(`[instruction.runner] Chip field detected (name=${info?.name}, role=${info?.role}) — confirming token for "${stepTarget || ''}"`);
+    }
+
+    // Capture pre-Enter state (compose dialog open?)
+    const _preEnter = await browserAct({
+      action: 'evaluate', sessionId, headed: true, timeoutMs: 2000,
+      text: `(() => {
+        const dialog = document.querySelector('[role="dialog"]');
+        return { hasDialog: !!dialog, dialogText: dialog ? (dialog.innerText || '').slice(0, 100) : '' };
+      })()`,
+    });
+
+    for (let attempt = 0; attempt < 2; attempt++) {
+      await browserAct({ action: 'press', sessionId, key: 'Enter', headed: true, timeoutMs: 2000 });
+      await _sleep(400);
+      logger.info(`[instruction.runner] _confirmChipIfNeeded: Enter press #${attempt + 1} sent`);
+
+      // Safety: check compose dialog still open (Enter didn't submit form prematurely)
+      const _postEnter = await browserAct({
+        action: 'evaluate', sessionId, headed: true, timeoutMs: 2000,
+        text: `(() => {
+          const dialog = document.querySelector('[role="dialog"]');
+          return { hasDialog: !!dialog };
+        })()`,
+      });
+      logger.info(`[instruction.runner] _confirmChipIfNeeded: post-Enter dialog check: preHasDialog=${_preEnter?.result?.hasDialog}, postHasDialog=${_postEnter?.result?.hasDialog}`);
+      if (_preEnter?.result?.hasDialog && !_postEnter?.result?.hasDialog) {
+        logger.warn(`[instruction.runner] Enter closed the compose dialog — form may have submitted prematurely. Stopping chip confirmation.`);
+        return { ok: false, pressed: true, prematureSubmit: true };
+      }
+
+      // Check if value became a chip (no longer raw text in input)
+      const stillThere = await browserAct({
+        action: 'evaluate', sessionId, headed: true, timeoutMs: 2000,
+        text: `(() => {
+          const el = document.activeElement;
+          if (!el || el === document.body) return false;
+          const val = el.value !== undefined ? String(el.value) : (el.textContent || '');
+          return val.includes(${JSON.stringify(String(stepValue || ''))});
+        })()`,
+      });
+      logger.info(`[instruction.runner] _confirmChipIfNeeded: stillThere=${stillThere?.result} after attempt ${attempt + 1}`);
+      if (!stillThere?.result) {
+        logger.info(`[instruction.runner] Token confirmed after ${attempt + 1} Enter press(es)`);
+        return { ok: true, pressed: true, attempts: attempt + 1 };
+      }
+      // Value still in input — but for multi-recipient comboboxes (Gmail To/Cc/Bcc),
+      // a chip/pill may have formed alongside the residual input text.
+      // Check if a recipient chip now exists with this value before re-trying Enter.
+      const _chipVal = String(stepValue || '').toLowerCase();
+      const chipFormed = await browserAct({
+        action: 'evaluate', sessionId, headed: true, timeoutMs: 2000,
+        text: `(() => {
+          const composeArea = document.querySelector('[role="dialog"]') || document;
+          // Gmail recipient pills: [data-hovercard-id], [email], .vR .vN, [role="listbox"] [role="option"]
+          const pills = composeArea.querySelectorAll('[data-hovercard-id], [email], .vR .vN, [role="listbox"] [role="option"], [role="option"][data-name]');
+          return Array.from(pills).some(p => {
+            const text = (p.textContent || p.getAttribute('email') || p.getAttribute('data-name') || '').toLowerCase();
+            return text.includes(${JSON.stringify(_chipVal)});
+          });
+        })()`,
+      });
+      if (chipFormed?.result) {
+        logger.info(`[instruction.runner] _confirmChipIfNeeded: chip/pill formed for "${String(stepValue || '').slice(0, 30)}" — value in input is residual, treating as confirmed`);
+        return { ok: true, pressed: true, attempts: attempt + 1, chipFormed: true };
+      }
+      logger.info(`[instruction.runner] Value still present in input after Enter — re-trying`);
+    }
+    // Value still in input after 2 tries → not a chip field, but value is still there
+    // No bad side-effect — the email address is in the To field and will be sent
+    logger.info(`[instruction.runner] Chip confirmation: value remains in input after 2 Enter presses — treating as non-chip field (value preserved)`);
+    return { ok: true, pressed: true, attempts: 2, notChip: true };
+  } catch (e) {
+    logger.warn(`[instruction.runner] Chip confirmation error (non-fatal): ${e.message}`);
+    return { ok: true, pressed: false };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// pressAfter: for AI chat message boxes (Enter submits the prompt) and
+// list item creation (Enter creates the next item). This is the runtime
+// equivalent of playwright.agent's pressAfter="Enter".
+//
+// Category-aware: if pageCategory="ai_chat", any field matching
+// "message/prompt/chat/ask" gets Enter pressed. If pageCategory="document_editor",
+// list-item fields get Enter pressed.
+// ---------------------------------------------------------------------------
+async function _pressAfterIfNeeded(sessionId, stepTarget, stepValue, pageCategory) {
+  const t = (stepTarget || '').toLowerCase();
+  const _isChatMessage = /\b(message|prompt|chat|ask|query)\b/.test(t) && !/\b(subject|body|email|search)\b/.test(t);
+  const _isListItem = /\b(item|todo|task|list|checkbox)\b/.test(t);
+
+  if (!_isChatMessage && !_isListItem) return { ok: true, pressed: false };
+
+  // For AI chat: verify the page has chat indicators before pressing Enter
+  if (_isChatMessage) {
+    try {
+      const res = await browserAct({
+        action: 'evaluate', sessionId, headed: true, timeoutMs: 2000,
+        text: `(() => {
+          const el = document.activeElement;
+          if (!el) return { isChat: false };
+          const ph = (el.getAttribute('placeholder') || el.getAttribute('aria-placeholder') || '').toLowerCase();
+          const role = el.getAttribute('role') || '';
+          const isTextarea = el.tagName === 'TEXTAREA' || role === 'textbox';
+          const hasChatHint = /message|prompt|ask|chat|anything|send/.test(ph);
+          // Check for nearby send button (if present, Enter may not be the submit mechanism)
+          const hasSendBtn = !!document.querySelector('button[data-testid="send-button"], button[aria-label*="Send" i], button[type="submit"]');
+          return { isChat: isTextarea && hasChatHint && !hasSendBtn, ph, hasSendBtn };
+        })()`,
+      });
+      const info = res?.result;
+      if (!info?.isChat) {
+        // If category says ai_chat but there's a send button, skip Enter (user should click Send)
+        if (info?.hasSendBtn) {
+          logger.info(`[instruction.runner] AI chat field has send button — skipping Enter (will click Send instead)`);
+        }
+        return { ok: true, pressed: false };
+      }
+      logger.info(`[instruction.runner] AI chat message field detected (placeholder="${info.ph}") — pressing Enter to submit`);
+    } catch {
+      return { ok: true, pressed: false };
+    }
+  }
+
+  if (_isListItem) {
+    logger.info(`[instruction.runner] List item field detected — pressing Enter to create next item`);
+  }
+
+  await browserAct({ action: 'press', sessionId, key: 'Enter', headed: true, timeoutMs: 2000 });
+  await _sleep(500);
+  return { ok: true, pressed: true };
+}
+
+// ---------------------------------------------------------------------------
+// Submit verification: after clicking Send/Submit/Post, verifies the action
+// succeeded by checking:
+// 1. Compose dialog gone (email compose windows)
+// 2. URL changed away from compose/editor
+// 3. Success snackbar/toast appeared (Gmail "Sending...", LinkedIn "Posted!")
+//
+// Skip for document_editor category (auto-save pages don't have submit verification).
+// ---------------------------------------------------------------------------
+async function _verifySubmitSuccess(sessionId, verifyText, preClickState) {
+  try {
+    await _sleep(1500); // wait for submit to take effect
+
+    // 1. Compose dialog gone?
+    const composeGone = await browserAct({
+      action: 'evaluate', sessionId, headed: true, timeoutMs: 2000,
+      text: `(() => {
+        const dialog = document.querySelector('[role="dialog"]');
+        if (!dialog) return { gone: true, reason: 'no dialog' };
+        const text = (dialog.innerText || '').toLowerCase();
+        const hasSend = !!dialog.querySelector('[data-tooltip*="Send" i], [aria-label*="Send" i]');
+        const isCompose = /compose|recipient|subject|message body/.test(text) || hasSend;
+        return { gone: !isCompose, reason: isCompose ? 'compose still open' : 'dialog changed' };
+      })()`,
+    });
+    if (composeGone?.result?.gone) {
+      logger.info(`[instruction.runner] Submit verified — compose dialog gone`);
+      return { ok: true, reason: 'compose_gone' };
+    }
+
+    // 2. URL changed away from compose?
+    const urlCheck = await browserAct({
+      action: 'evaluate', sessionId, headed: true, timeoutMs: 2000,
+      text: `(() => {
+        const url = window.location.href;
+        const wasCompose = /compose|draft|new/.test(${JSON.stringify(preClickState?.url || '')});
+        const isCompose = /compose|draft|new/.test(url);
+        return { changed: wasCompose && !isCompose, url };
+      })()`,
+    });
+    if (urlCheck?.result?.changed) {
+      logger.info(`[instruction.runner] Submit verified — URL changed away from compose`);
+      return { ok: true, reason: 'url_change' };
+    }
+
+    // 3. Success snackbar/toast?
+    const snackbar = await browserAct({
+      action: 'evaluate', sessionId, headed: true, timeoutMs: 2000,
+      text: `(() => {
+        const toast = document.querySelector('[role="status"], [role="alert"], .snackbar, .toast, [data-testid*="toast" i], [data-testid*="snackbar" i]');
+        if (!toast) return { found: false };
+        const text = (toast.innerText || '').toLowerCase();
+        const successPatterns = ['sent', 'sending', 'posted', 'saved', 'submitted', 'done', 'success'];
+        const matched = successPatterns.some(p => text.includes(p));
+        return { found: matched, text: text.slice(0, 100) };
+      })()`,
+    });
+    if (snackbar?.result?.found) {
+      logger.info(`[instruction.runner] Submit verified — snackbar: "${snackbar.result.text}"`);
+      return { ok: true, reason: 'snackbar' };
+    }
+
+    logger.warn(`[instruction.runner] Submit verification FAILED — compose still open, no URL change, no snackbar`);
+    return { ok: false, reason: 'no verification signal' };
+  } catch (e) {
+    logger.warn(`[instruction.runner] Submit verification error (non-fatal): ${e.message}`);
+    return { ok: true, reason: 'verify-error' }; // non-fatal — don't block on verify errors
+  }
 }
 
 // Press Escape to close any open overlay (menu/dropdown/modal/popover).
@@ -427,7 +713,8 @@ function _fuzzyTextMatch(target, candidate) {
   const shorter = t.length >= c.length ? c : t;
 
   // Length guard — too different in length = not a match
-  if (shorter.length < longer.length * 0.7) return false;
+  // 0.5 threshold allows ~50% character dropping (garbled text from recorder)
+  if (shorter.length < longer.length * 0.5) return false;
 
   // Subsequence check (handles character-dropping garbling)
   if (_isSubsequence(shorter, longer)) return true;
@@ -542,7 +829,7 @@ function _saveTabMap(domain, map) {
 // skipReset: when true, don't reset focus to page top (for scanning inside
 //   an open dropdown/modal — resetting would close the overlay).
 async function buildTabMap(sessionId, maxElements = 150, options = {}) {
-  const { skipReset = false } = options;
+  const { skipReset = false, backward = false } = options;
   const map = [];
   const seenSet = new Set(); // O(1) deduplication
   let idCounter = 0;
@@ -552,13 +839,29 @@ async function buildTabMap(sessionId, maxElements = 150, options = {}) {
     await _resetFocusToPageTop(sessionId);
   }
 
+  // ── Scan flow: ArrowRight → Tab by default, ArrowDown only in dropdowns ──
+  // ArrowDown opens autocomplete on comboboxes and can select wrong items.
+  // Only use ArrowDown when the focused element is inside a dropdown (detected
+  // via ARIA roles: menuitem/option, or inside role=menu/listbox and not an input).
+  // ArrowRight is always safe — it enters dropdowns from triggers and moves
+  // horizontally in menus without opening autocomplete.
+  const _initialEl = await _readActiveElement(sessionId);
+  logger.info(`[instruction.runner] buildTabMap: initial focus tag=${_initialEl?.tag || 'none'}, role=${_initialEl?.role || 'none'}, inDropdown=${!!_initialEl?.inDropdown}`);
+
+  // Key mappings: forward vs backward
+  const keyRight = backward ? 'ArrowLeft'  : 'ArrowRight';
+  const keyDown  = backward ? 'ArrowUp'    : 'ArrowDown';
+  const keyTab   = backward ? 'Shift+Tab'  : 'Tab';
+  const label    = backward ? 'backward'   : 'forward';
+
   for (let i = 0; i < maxElements; i++) {
     const before = await _readActiveElement(sessionId);
     let current = before; // tracks current focus position (may shift via arrows)
     let advanced = false;
+    const _inDropdown = !!before?.inDropdown;
 
-    // 1. Try ArrowRight (enters dropdowns from trigger, horizontal menus)
-    await browserAct({ action: 'press', sessionId, key: 'ArrowRight', headed: true, timeoutMs: 2000 });
+    // 1. Try ArrowRight (forward) / ArrowLeft (backward) — always safe
+    await browserAct({ action: 'press', sessionId, key: keyRight, headed: true, timeoutMs: 2000 });
     await _sleep(60);
     let after = await _readActiveElement(sessionId);
 
@@ -568,18 +871,26 @@ async function buildTabMap(sessionId, maxElements = 150, options = {}) {
         // New element — add to set + map
         seenSet.add(sig);
         if (!starterSig) starterSig = sig;
-        map.push({ id: ++idCounter, ...after, key: 'ArrowRight' });
+        map.push({ id: ++idCounter, ...after, key: keyRight });
         advanced = true;
       } else {
-        // Seen element — update current position, fall through to ArrowDown
+        // Seen element — check if it's the starter (looped back)
+        if (sig === starterSig) {
+          logger.info(`[instruction.runner] buildTabMap (${label}): ${keyRight} looped back to starter — scan done`);
+          break;
+        }
+        // Seen but not starter — fall through to next key
         current = after;
       }
     }
-    // else: no focus change — current stays the same, fall through to ArrowDown
+    // else: no focus change — current stays the same, fall through to next key
 
-    // 2. Try ArrowDown (vertical lists: dropdowns, menus — may scroll page)
-    if (!advanced) {
-      await browserAct({ action: 'press', sessionId, key: 'ArrowDown', headed: true, timeoutMs: 2000 });
+    // 2. Try ArrowDown (forward) / ArrowUp (backward) — ONLY when in a dropdown
+    // ArrowDown opens autocomplete on comboboxes and selects wrong items.
+    // Only use it when the focused element is a menuitem/option or inside a
+    // role=menu/listbox (and not an input/textarea/combobox).
+    if (!advanced && _inDropdown) {
+      await browserAct({ action: 'press', sessionId, key: keyDown, headed: true, timeoutMs: 2000 });
       await _sleep(60);
       after = await _readActiveElement(sessionId);
 
@@ -588,18 +899,23 @@ async function buildTabMap(sessionId, maxElements = 150, options = {}) {
         if (!seenSet.has(sig)) {
           seenSet.add(sig);
           if (!starterSig) starterSig = sig;
-          map.push({ id: ++idCounter, ...after, key: 'ArrowDown' });
+          map.push({ id: ++idCounter, ...after, key: keyDown });
           advanced = true;
         } else {
-          // Seen element — update current, fall through to Tab
+          // Seen element — check if it's the starter (looped back)
+          if (sig === starterSig) {
+            logger.info(`[instruction.runner] buildTabMap (${label}): ${keyDown} looped back to starter — scan done`);
+            break;
+          }
+          // Seen but not starter — fall through to Tab
           current = after;
         }
       }
     }
 
-    // 3. Try Tab (general navigation — modals, page elements)
+    // 3. Try Tab (forward) / Shift+Tab (backward) — always
     if (!advanced) {
-      await browserAct({ action: 'press', sessionId, key: 'Tab', headed: true, timeoutMs: 2000 });
+      await browserAct({ action: 'press', sessionId, key: keyTab, headed: true, timeoutMs: 2000 });
       await _sleep(60);
       after = await _readActiveElement(sessionId);
 
@@ -610,12 +926,12 @@ async function buildTabMap(sessionId, maxElements = 150, options = {}) {
         if (!seenSet.has(sig)) {
           seenSet.add(sig);
           if (!starterSig) starterSig = sig;
-          map.push({ id: ++idCounter, ...after, key: 'Tab' });
+          map.push({ id: ++idCounter, ...after, key: keyTab });
           advanced = true;
         } else {
           // Tab led to a seen element — check if it's the starter (looped back)
           if (sig === starterSig) {
-            logger.info(`[instruction.runner] buildTabMap: looped back to starter — scan done`);
+            logger.info(`[instruction.runner] buildTabMap (${label}): looped back to starter — scan done`);
             break;
           }
           // Seen but not starter — all keys exhausted
@@ -631,7 +947,7 @@ async function buildTabMap(sessionId, maxElements = 150, options = {}) {
     if (!advanced) break;
   }
 
-  logger.info(`[instruction.runner] buildTabMap: scanned ${map.length} elements (cap=${maxElements}, skipReset=${skipReset})`);
+  logger.info(`[instruction.runner] buildTabMap (${label}): scanned ${map.length} elements (cap=${maxElements}, skipReset=${skipReset})`);
 
   // Persist the tab-map for this domain (merges with existing elements)
   const domain = await _getDomainFromSession(sessionId);
@@ -780,6 +1096,77 @@ async function pageSearch(sessionId, text) {
   return null;
 }
 
+// Scroll all scrollable containers down by 80% of their viewport height.
+// Used to trigger lazy/virtualized rendering of off-screen content.
+// scrollIntoView can't be used here because the target element may not exist
+// in the DOM yet (virtualized lists only render items near the viewport).
+async function _scrollPageDown(sessionId) {
+  await browserAct({
+    action: 'evaluate', sessionId, headed: true, timeoutMs: 2000,
+    text: `(() => {
+      // Limit to likely scroll containers instead of querySelectorAll('*')
+      const candidates = document.querySelectorAll('div, main, nav, section, aside, ul, ol');
+      let scrolled = false;
+      for (const el of candidates) {
+        if (el.scrollHeight <= el.clientHeight + 10) continue;
+        const style = getComputedStyle(el);
+        const canScroll = (style.overflowY === 'auto' || style.overflowY === 'scroll' ||
+                           style.overflow === 'auto' || style.overflow === 'scroll');
+        if (canScroll) {
+          el.scrollBy(0, el.clientHeight * 0.8);
+          scrolled = true;
+        }
+      }
+      if (document.documentElement.scrollHeight > window.innerHeight) {
+        window.scrollBy(0, window.innerHeight * 0.8);
+        scrolled = true;
+      }
+      return scrolled;
+    })()`,
+  });
+}
+
+// Scroll all scrollable containers back to top.
+async function _scrollToTop(sessionId) {
+  await browserAct({
+    action: 'evaluate', sessionId, headed: true, timeoutMs: 2000,
+    text: `(() => {
+      const candidates = document.querySelectorAll('div, main, nav, section, aside, ul, ol');
+      for (const el of candidates) {
+        if (el.scrollHeight <= el.clientHeight + 10) continue;
+        const style = getComputedStyle(el);
+        const canScroll = (style.overflowY === 'auto' || style.overflowY === 'scroll' ||
+                           style.overflow === 'auto' || style.overflow === 'scroll');
+        if (canScroll) {
+          el.scrollTo(0, 0);
+        }
+      }
+      window.scrollTo(0, 0);
+      return true;
+    })()`,
+  });
+}
+
+// Page search with scroll retry: try window.find(), scroll if not found, retry.
+// Handles virtualized/lazy-loaded lists where the target isn't in the DOM
+// until the user scrolls near it.
+async function _pageSearchWithScroll(sessionId, text, maxScrolls = 5) {
+  let result = await pageSearch(sessionId, text);
+  if (result) return result;
+
+  for (let i = 0; i < maxScrolls; i++) {
+    await _scrollPageDown(sessionId);
+    await _sleep(500); // wait for virtualized content to render
+    result = await pageSearch(sessionId, text);
+    if (result) {
+      logger.info(`[instruction.runner] pageSearch: found "${text}" after ${i + 1} scrolls`);
+      return result;
+    }
+  }
+  await _scrollToTop(sessionId);
+  return null;
+}
+
 // Search for text, then tab forward to find a nearby element matching a label.
 // Used for: "Click Reply on John Smith's comment" → find "John Smith", tab to "Reply".
 // Returns the focused element matching the nearbyLabel, or the search result if no match.
@@ -844,7 +1231,7 @@ function _formatTabMapEntryForLLM(entry) {
 
 // Ask the LLM to pick the best element from a tab-map for a given step.
 // Returns the full tab-map entry (with coordinates) or null.
-async function _llmPickFromTabMap(tabMap, stepAction, verifyText, value) {
+async function _llmPickFromTabMap(tabMap, stepAction, verifyText, value, contextHint = '') {
   if (!tabMap || tabMap.length === 0) return null;
 
   // Build simplified list
@@ -856,25 +1243,38 @@ async function _llmPickFromTabMap(tabMap, stepAction, verifyText, value) {
     ? `Click the matching element`
     : `${stepAction} the matching element`;
 
-  const prompt = `Step: ${actionDesc} — target: "${verifyText}"
+  const hintBlock = contextHint ? `\nAdditional context: "${contextHint}"` : '';
+
+  const prompt = `Step: ${actionDesc} — target: "${verifyText}"${hintBlock}
 
 Available elements:
 ${listStr}
 
-Which element number EXACTLY matches the step target?
-- The element's text, ariaLabel, or placeholder must closely match the target text
-- "Create" does NOT match "Create a playlist with a song or episode" (different text)
+Which element number matches the step target?
+- The target text may be GARBLED — characters can be dropped within words (e.g. "playli t" = "playlist", "ong" = "song", "epi ode" = "episode")
+- Match if the element's text/ariaLabel/placeholder contains the same words as the target (ignoring dropped characters)
+- "Create" does NOT match "Create a playlist with a song or episode" (different text — one is a single word, the other is a full sentence)
 - "Create" only matches if the target is exactly "Create" or "Create button"
-- If NO element closely matches, output 0
+- If the target is a generic button like "Add" and there are multiple, use the Additional context to pick the right one
+- If NO element matches, output 0
 Output ONLY the number, or 0 if no match.`;
 
   try {
     const response = await askWithMessages([
-      { role: 'system', content: 'You pick the exactly matching element from a list. Output ONLY the number, or 0 if no exact match. Nothing else.' },
+      { role: 'system', content: 'You pick the matching element from a list. The target text may be garbled (characters dropped within words). Match if the words align. Output ONLY the number, or 0 if no match. Nothing else.' },
       { role: 'user', content: prompt },
     ], { maxTokens: 10, temperature: 0, responseTimeoutMs: 8000 });
 
-    const id = parseInt((response || '').trim().replace(/\D/g, ''), 10);
+    const responseText = (response || '').trim();
+    logger.info(`[instruction.runner] LLM pick raw response: "${responseText.substring(0, 80)}" (${responseText.length} chars) for "${verifyText}"`);
+    let id = 0;
+    if (responseText.length <= 3) {
+      id = parseInt(responseText.replace(/\D/g, ''), 10) || 0;
+    } else {
+      // Verbose response — extract first standalone number
+      const match = responseText.match(/\b(\d+)\b/);
+      id = match ? parseInt(match[1], 10) : 0;
+    }
     if (id > 0) {
       const entry = tabMap.find(e => e.id === id);
       if (entry) {
@@ -907,6 +1307,45 @@ Output ONLY the number, or 0 if no match.`;
     }
   } catch (e) {
     logger.warn(`[instruction.runner] LLM pick from tab-map failed: ${e.message}`);
+  }
+  return null;
+}
+
+// Ask the LLM to identify a "reveal" button from the tab-map — one that
+// reveals more content when clicked (e.g. "See more", "Load more", "Show all",
+// "View all", "Expand", "More"). Uses LLM language understanding to handle
+// any phrasing without brittle regex. Returns the entry or null.
+async function _llmPickRevealButton(tabMap) {
+  if (!tabMap || tabMap.length === 0) return null;
+  const listStr = tabMap.map(e => `${e.id} - ${_formatTabMapEntryForLLM(e)}`).join('\n');
+  const prompt = `Available elements:
+${listStr}
+
+Is any element a "reveal" button — one that reveals more content when clicked (e.g. "See more", "Load more", "Show all", "View all", "Expand", "More")?
+Output ONLY the element number, or 0 if none.`;
+  try {
+    const response = await askWithMessages([
+      { role: 'system', content: 'You identify reveal buttons from a list. A reveal button reveals more content when clicked (e.g. "See more", "Load more", "Show all", "View all", "Expand", "More"). Output ONLY the element number, or 0 if none.' },
+      { role: 'user', content: prompt },
+    ], { maxTokens: 10, temperature: 0, responseTimeoutMs: 8000 });
+    const responseText = (response || '').trim();
+    logger.info(`[instruction.runner] LLM reveal-button raw response: "${responseText.substring(0, 80)}" (${responseText.length} chars)`);
+    let id = 0;
+    if (responseText.length <= 3) {
+      id = parseInt(responseText.replace(/\D/g, ''), 10) || 0;
+    } else {
+      const match = responseText.match(/\b(\d+)\b/);
+      id = match ? parseInt(match[1], 10) : 0;
+    }
+    if (id > 0) {
+      const entry = tabMap.find(e => e.id === id);
+      if (entry) {
+        logger.info(`[instruction.runner] LLM identified reveal button #${id} (${_formatTabMapEntryForLLM(entry)})`);
+        return entry;
+      }
+    }
+  } catch (e) {
+    logger.warn(`[instruction.runner] _llmPickRevealButton failed: ${e.message}`);
   }
   return null;
 }
@@ -1306,13 +1745,158 @@ async function _executeAction(sessionId, step) {
     }
     case 'type': {
       if (!step.value && step.value !== 0) return { ok: false, error: 'No value to type' };
-      // Select all existing text first (Ctrl+A / Cmd+A) so the new value replaces it
-      await browserAct({ action: 'press', sessionId, key: 'Meta+a', headed: true, timeoutMs: 2000 });
-      await _sleep(50);
-      // Use `type` (not `fill`) because keyboard navigation already focused the field
-      const result = await browserAct({ action: 'type', sessionId, text: String(step.value), headed: true, timeoutMs: 10000 });
-      await _sleep(300);
-      return { ok: !!result?.ok, error: result?.error };
+      logger.info(`[instruction.runner] _executeAction type: target="${step.target || ''}", value="${String(step.value || '').slice(0, 50)}", pageCategory=${step.pageCategory || 'none'}, ref=${step.ref || 'none'}`);
+
+      const _val = String(step.value || '');
+      const _fillRef = step.ref || null;
+      // Chip confirmation only for actual To/Cc/Bcc/Recipients/Email targets
+      const _targetIsEmailChip = /\b(to|recipients|recipient|email|cc|bcc)\b/i.test(step.target || '');
+
+      // For chip/token fields (Gmail/Outlook To), use reactFill directly.
+      // browserAct type fails on React-controlled comboboxes because React
+      // doesn't update the value until the right events fire. reactFill uses
+      // the native setter + input event dispatch technique and is React-aware.
+      let result;
+      let _usedReactFill = false;
+      if (_targetIsEmailChip && _fillRef) {
+        logger.info(`[instruction.runner] _executeAction type: using reactFill for chip field [data-td-ref="${_fillRef}"]`);
+        result = await browserAct({
+          action: 'reactFill', sessionId, selector: `[data-td-ref="${_fillRef}"]`, text: _val, headed: true, timeoutMs: 10000,
+        });
+        _usedReactFill = !!result?.ok;
+        await _sleep(300);
+        logger.info(`[instruction.runner] _executeAction type: reactFill result ok=${result?.ok}, error=${result?.error || 'none'}`);
+      } else {
+        // Select all existing text first (Ctrl+A / Cmd+A) so the new value replaces it
+        await browserAct({ action: 'press', sessionId, key: 'Meta+a', headed: true, timeoutMs: 2000 });
+        await _sleep(50);
+        // Use `type` (not `fill`) because keyboard navigation already focused the field
+        result = await browserAct({ action: 'type', sessionId, text: _val, headed: true, timeoutMs: 10000 });
+        await _sleep(300);
+        logger.info(`[instruction.runner] _executeAction type: browserAct type result ok=${result?.ok}, error=${result?.error || 'none'}`);
+      }
+
+      // Verify the value actually appeared in the field (or as a chip in the dialog)
+      // NOTE: _fillRef is a string literal — no Node.js variables in the browser evaluate string
+      let _verify = await browserAct({
+        action: 'evaluate', sessionId, headed: true, timeoutMs: 2000,
+        text: `(() => {
+          const el = ${_fillRef ? `document.querySelector('[data-td-ref="${_fillRef}"]') || document.activeElement` : 'document.activeElement'};
+          if (!el || el === document.body) return { ok: false };
+          const v = el.value !== undefined ? String(el.value) : (el.textContent || el.innerText || '');
+          const inDialog = (document.querySelector('[role="dialog"]') || document.body).innerText.includes(${JSON.stringify(_val.slice(0, 50))});
+          return { ok: v.includes(${JSON.stringify(_val.slice(0, 50))}) || inDialog, value: v.slice(0, 100), inDialog };
+        })()`,
+      });
+      logger.info(`[instruction.runner] _executeAction type: verify ok=${_verify?.result?.ok}, value="${_verify?.result?.value || ''}", inDialog=${_verify?.result?.inDialog}`);
+
+      // reactFill fallback for React-controlled inputs that ignore keyboard.type
+      // (only if we didn't already use reactFill and we have a ref)
+      if (!_verify?.result?.ok && !_usedReactFill && _fillRef) {
+        logger.info(`[instruction.runner] type verify failed — trying reactFill fallback with selector [data-td-ref="${_fillRef}"]`);
+        try {
+          const _rfResult = await browserAct({
+            action: 'reactFill', sessionId, selector: `[data-td-ref="${_fillRef}"]`, text: _val, headed: true, timeoutMs: 10000,
+          });
+          if (_rfResult?.ok) {
+            _usedReactFill = true;
+            result = _rfResult;
+            await _sleep(300);
+            logger.info(`[instruction.runner] reactFill fallback succeeded`);
+            _verify = await browserAct({
+              action: 'evaluate', sessionId, headed: true, timeoutMs: 2000,
+              text: `(() => {
+                const el = document.querySelector('[data-td-ref="${_fillRef}"]') || document.activeElement;
+                if (!el || el === document.body) return { ok: false };
+                const v = el.value !== undefined ? String(el.value) : (el.textContent || el.innerText || '');
+                const inDialog = (document.querySelector('[role="dialog"]') || document.body).innerText.includes(${JSON.stringify(_val.slice(0, 50))});
+                return { ok: v.includes(${JSON.stringify(_val.slice(0, 50))}) || inDialog, value: v.slice(0, 100), inDialog };
+              })()`,
+            });
+            logger.info(`[instruction.runner] _executeAction type: post-reactFill verify ok=${_verify?.result?.ok}, value="${_verify?.result?.value || ''}", inDialog=${_verify?.result?.inDialog}`);
+          } else {
+            logger.warn(`[instruction.runner] reactFill fallback failed: ${_rfResult?.error}`);
+          }
+        } catch (e) {
+          logger.warn(`[instruction.runner] reactFill fallback error: ${e.message}`);
+        }
+      }
+
+      // Native setter as final fallback (no ref, or reactFill failed)
+      if (!_verify?.result?.ok) {
+        logger.info(`[instruction.runner] type verify failed — trying native setter fallback`);
+        try {
+          await browserAct({
+            action: 'evaluate', sessionId, headed: true, timeoutMs: 3000,
+            text: `(() => {
+              const el = document.activeElement;
+              if (!el || el === document.body) return false;
+              el.focus();
+              const text = ${JSON.stringify(_val)};
+              if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') {
+                const proto = el.tagName === 'INPUT' ? window.HTMLInputElement.prototype : window.HTMLTextAreaElement.prototype;
+                const setter = Object.getOwnPropertyDescriptor(proto, 'value');
+                if (setter && setter.set) { setter.set.call(el, text); }
+                else { el.value = text; }
+              } else if (el.isContentEditable) {
+                const range = document.createRange();
+                range.selectNodeContents(el);
+                range.deleteContents();
+                const node = document.createTextNode(text);
+                range.insertNode(node);
+              }
+              el.dispatchEvent(new Event('input', { bubbles: true }));
+              el.dispatchEvent(new Event('change', { bubbles: true }));
+              return true;
+            })()`,
+          });
+          await _sleep(200);
+          logger.info(`[instruction.runner] native setter fallback applied`);
+        } catch (e) {
+          logger.warn(`[instruction.runner] native setter fallback failed: ${e.message}`);
+        }
+      }
+
+      // Chip/token confirmation — ONLY for actual To/Cc/Bcc/Recipients/Email targets.
+      // Not for Subject, Message Body, or other non-chip fields.
+      let _chip = { ok: true, pressed: false };
+      if (_targetIsEmailChip) {
+        _chip = await _confirmChipIfNeeded(sessionId, step.target, step.value, step.pageCategory);
+        logger.info(`[instruction.runner] _executeAction type: chip result ok=${_chip.ok}, pressed=${_chip.pressed}, attempts=${_chip.attempts || 0}, notChip=${_chip.notChip || false}, prematureSubmit=${_chip.prematureSubmit || false}`);
+        if (_chip.prematureSubmit) {
+          return { ok: false, error: 'Enter closed compose dialog prematurely during chip confirmation' };
+        }
+      } else {
+        logger.info(`[instruction.runner] _executeAction type: skipping chip confirmation for non-chip target "${step.target}"`);
+      }
+
+      // pressAfter for AI chat / list items — category aware
+      const _pressAfter = (result?.ok || _usedReactFill) ? await _pressAfterIfNeeded(sessionId, step.target, step.value, step.pageCategory) : { ok: true };
+      logger.info(`[instruction.runner] _executeAction type: pressAfter result ok=${_pressAfter.ok}, pressed=${_pressAfter.pressed}`);
+
+      // Retry-based chip fallback: if value still not in field after all attempts,
+      // and step.retryCount >= 3, try pressing Enter as last-resort chip/token confirmation
+      if (!_verify?.result?.ok && (step.retryCount || 0) >= 3) {
+        logger.warn(`[instruction.runner] type failed ${(step.retryCount || 0)}x — trying last-resort Enter for chip/token confirmation`);
+        await browserAct({ action: 'press', sessionId, key: 'Enter', headed: true, timeoutMs: 2000 });
+        await _sleep(400);
+        const _retryVerify = await browserAct({
+          action: 'evaluate', sessionId, headed: true, timeoutMs: 2000,
+          text: `(() => {
+            const el = document.activeElement;
+            if (!el || el === document.body) return { ok: false };
+            const v = el.value !== undefined ? String(el.value) : (el.textContent || el.innerText || '');
+            return { ok: v.includes(${JSON.stringify(_val.slice(0, 50))}) };
+          })()`,
+        });
+        if (_retryVerify?.result?.ok) {
+          logger.info(`[instruction.runner] Last-resort Enter confirmed chip/token — value now in field`);
+          return { ok: true };
+        }
+      }
+
+      const _finalOk = (result?.ok || _usedReactFill) && _chip.ok && _pressAfter.ok;
+      return { ok: _finalOk, error: _finalOk ? undefined : (result?.error || 'type verification failed') };
     }
     case 'escape': {
       await _pressEscape(sessionId);
@@ -1405,11 +1989,22 @@ async function _executeButtonActivation(sessionId) {
 
 function parseInstructions(instructions) {
   const steps = [];
-  const sentences = instructions.split(/\.\s+|\.$/).map(s => s.trim()).filter(Boolean);
-  for (const sentence of sentences) {
-    const step = parseStep(sentence);
+  let rawSteps = [];
+  if (/\n/.test(instructions)) {
+    // Primary: one instruction per line (as specified in the prompt)
+    rawSteps = instructions.split(/\n/).map(s => s.trim()).filter(Boolean);
+  } else {
+    // Fallback: sentence-style for legacy single-line instructions
+    rawSteps = instructions.split(/\.\.\s*|\.\s+|\.$/).map(s => s.trim()).filter(Boolean);
+  }
+  for (const raw of rawSteps) {
+    // Strip leading dash, bullets, and numbering
+    const cleaned = raw.replace(/^[-•\d.]+[.\s)]+/, '').trim();
+    if (!cleaned) continue;
+    const step = parseStep(cleaned);
     if (step) steps.push(step);
   }
+  logger.info(`[instruction.runner] parseInstructions: ${rawSteps.length} raw lines, ${steps.length} parsed steps`);
   return steps;
 }
 
@@ -1428,7 +2023,36 @@ function parseStep(sentence) {
   // Click X (without quotes)
   m = s.match(/^click\s+(?:the\s+)?(.+?)(?:\s+(?:button|link|element|tab|menu|item))?$/i);
   if (m && !m[1].match(/^(?:type|select|press|navigate|check|uncheck|submit)/i)) {
-    return { action: 'click', verifyText: m[1].replace(/^["']|["']$/g, ''), target: m[1].replace(/^["']|["']$/g, '') };
+    let target = m[1].replace(/^["']|["']$/g, '');
+    // Strip CSS selectors — extract the attribute value as a hint
+    if (/^[a-z]+\[/.test(target)) {
+      const attrMatch = target.match(/['"]([^'"]+)['"]/);
+      target = attrMatch ? attrMatch[1] : target.replace(/[^\w\s]/g, ' ').trim();
+      logger.info(`[instruction.runner] parseStep: stripped CSS selector to target="${target}"`);
+    }
+    return { action: 'click', verifyText: target, target };
+  }
+
+  // Fill "value" into the "field" field (safety net — prompt says use Type, but LLM may still use Fill)
+  // Also handles reversed "Fill "field" with "value"" format
+  m = s.match(/^fill\s+["']([^"']*)["']\s+(?:into|in|to|with)\s+(?:the\s+)?["']([^"']*)["'](?:\s+(?:field|input|textarea|box|area))?$/i);
+  if (m) {
+    let value, target;
+    // Detect reversed format: "Fill "field" with "value""
+    if (s.match(/^fill\s+["'][^"']*["']\s+with\s+/i)) {
+      target = _isGenericFieldLabel(m[1]) ? null : m[1];
+      value = m[2];
+    } else {
+      value = m[1];
+      target = _isGenericFieldLabel(m[2]) ? null : m[2];
+    }
+    // Strip CSS selectors from target
+    if (target && /^[a-z]+\[/.test(target)) {
+      const attrMatch = target.match(/['"]([^'"]+)['"]/);
+      target = attrMatch ? attrMatch[1] : target.replace(/[^\w\s]/g, ' ').trim();
+      logger.info(`[instruction.runner] parseStep: stripped CSS selector from Fill target to "${target}"`);
+    }
+    return { action: 'fill', verifyText: target, target, value };
   }
 
   // Type "value" into the "field" field/input/textarea
@@ -1500,8 +2124,11 @@ function parseStep(sentence) {
 // Main entry point
 // ---------------------------------------------------------------------------
 
-async function runInstructionSkill({ instructions, keyPath, params, skillArgs, startUrl, sessionId, timeoutMs }) {
+async function runInstructionSkill({ instructions, keyPath, params, skillArgs, startUrl, sessionId, timeoutMs, pageCategory, urlFirstNav }) {
   if (!sessionId) return { ok: false, error: 'No sessionId provided' };
+  const _pageCategory = pageCategory || 'web_generic';
+  const _urlFirstNav = !!urlFirstNav;
+  logger.info(`[instruction.runner] runInstructionSkill: pageCategory=${_pageCategory}, sessionId=${sessionId}, urlFirstNav=${_urlFirstNav}`);
 
   // Clear session-level LLM analysis cache for this run
   _clearLlmCache(sessionId);
@@ -1524,22 +2151,19 @@ async function runInstructionSkill({ instructions, keyPath, params, skillArgs, s
     }
   }
 
-  // Determine steps: use cached keyPath if available, otherwise parse text instructions
+  // Determine steps: always parse from text instructions.
+  // The buildTabMap + LLM pick + Playwright click approach is used for every run
+  // (both preview and test). The cached keyPath is saved for debugging/analytics
+  // but never used for navigation — clickByText is unreliable for dynamic elements.
   let steps = [];
-  let hasCachedPath = false;
-
-  if (keyPath && Array.isArray(keyPath) && keyPath.length > 0) {
-    steps = keyPath;
-    hasCachedPath = true;
-    logger.info(`[instruction.runner] Using cached keyPath with ${steps.length} steps`);
-  } else if (resolvedInstructions) {
+  if (resolvedInstructions) {
     steps = parseInstructions(resolvedInstructions);
     if (steps.length === 0) {
       return { ok: false, error: 'Could not parse any steps from instructions' };
     }
-    logger.info(`[instruction.runner] Parsed ${steps.length} steps from text instructions (first run — will discover path)`);
+    logger.info(`[instruction.runner] Parsed ${steps.length} steps from text instructions`);
   } else {
-    return { ok: false, error: 'No instructions or keyPath provided' };
+    return { ok: false, error: 'No instructions provided' };
   }
 
   logger.info(`[instruction.runner] Resolved instructions: ${resolvedInstructions.substring(0, 200)}`);
@@ -1558,13 +2182,74 @@ async function runInstructionSkill({ instructions, keyPath, params, skillArgs, s
     }
   }
 
+  // ── URL-first overlay awareness ──────────────────────────────────────────
+  // URL-first navigation may have opened an overlay (modal, dialog, popup,
+  // dropdown, menu, side panel, drawer) that Escape would dismiss. Detect it
+  // via DOM state (not URL patterns) and set overlayActive=true so the first
+  // buildTabMap uses skipReset=true (doesn't send Escape which would close it).
+  // This is DOM-state-based — works for ALL sites regardless of URL pattern.
+  let overlayActive = false;
+  let _urlFirstOverlayDetected = false;
+  let _overlayRecoveryRetried = false;
+  try {
+    const _overlayCheck = await browserAct({
+      action: 'evaluate', sessionId, headed: true, timeoutMs: 3000,
+      text: `(() => {
+        if (document.querySelector('[role="dialog"], [role="alertdialog"], [aria-modal="true"]')) return { hasOverlay: true, type: 'dialog' };
+        if (document.querySelector('[popover]:not([data-popper-hidden])')) return { hasOverlay: true, type: 'popover' };
+        const menu = document.querySelector('[role="menu"], [role="listbox"]');
+        if (menu && menu.offsetParent !== null) return { hasOverlay: true, type: 'menu' };
+        const classMatch = document.querySelector('.modal:not([hidden]), .popup:not([hidden]), .dropdown-menu:not([hidden]), .overlay:not([hidden]), .drawer:not([hidden]), .sheet:not([hidden]), .slide-over:not([hidden])');
+        if (classMatch && classMatch.offsetParent !== null) return { hasOverlay: true, type: 'class' };
+        const expanded = document.querySelector('[aria-expanded="true"]');
+        if (expanded) {
+          const role = expanded.getAttribute('role') || '';
+          if (role === 'combobox' || role === 'button' || expanded.tagName === 'BUTTON') return { hasOverlay: true, type: 'expanded' };
+        }
+        return { hasOverlay: false };
+      })()`,
+    }).catch(() => ({ ok: false }));
+    if (_overlayCheck?.ok && _overlayCheck?.result?.hasOverlay) {
+      overlayActive = true;
+      _urlFirstOverlayDetected = true;
+      logger.info(`[instruction.runner] URL-first overlay detected (type=${_overlayCheck.result.type}) — setting overlayActive=true to preserve it during scan`);
+    }
+  } catch (_) {}
+
   // Reset focus to address bar (known starting point)
-  await _resetFocusToPageTop(sessionId);
+  // Skip if overlay is active — _resetFocusToPageTop sends Escape which would close it
+  if (!overlayActive) {
+    await _resetFocusToPageTop(sessionId);
+  }
+
+  // ── Runtime safety net: skip redundant click step if overlay is already open ─
+  // If URL-first opened an overlay and the first step is a click that would open
+  // it (e.g. "Compose", "New", "Create"), skip it — the action is already done.
+  if (overlayActive && steps.length > 0 && steps[0].action === 'click') {
+    const _clickTarget = (steps[0].target || '').toLowerCase();
+    const _openActionVerbs = ['compose', 'new', 'create', 'add', 'open', 'start', 'edit', 'write', 'draft'];
+    if (_openActionVerbs.some(v => _clickTarget.includes(v))) {
+      logger.info(`[instruction.runner] Overlay already open — skipping Click "${steps[0].target}" (action already triggered by URL-first)`);
+      steps.shift();
+    }
+  }
 
   // Execute each step
   const stepResults = [];
   const discoveredKeyPath = []; // build this for caching
   // currentOverlayMode removed — buildTabMap handles arrow/tab detection internally
+  // Sticky overlay flag: once an overlay (dropdown/modal) opens, all subsequent steps
+  // use skipReset=true (don't reset focus to page top) until a navigate event closes it.
+  // This prevents fill steps inside a modal from closing the modal by resetting focus.
+  let lastFillValue = ''; // hint for the next click when target is a generic button (e.g. "Add")
+
+  // Tab-map cache: one scan per overlay session, reused for all steps via data-td-ref.
+  // Invalidated on: URL change, click fails (ref not found), new overlay/submenu opens,
+  // or LLM returns no match. The data-td-ref attributes persist in the DOM from the
+  // initial scan, so subsequent steps can click directly via [data-td-ref="tm-..."].
+  let _cachedTabMap = null;
+  let _cachedTabMapUrl = null;
+  let _cachedTabMapOverlayActive = null;
 
   for (let i = 0; i < steps.length; i++) {
     if (Date.now() > deadline) {
@@ -1572,7 +2257,7 @@ async function runInstructionSkill({ instructions, keyPath, params, skillArgs, s
     }
 
     const step = steps[i];
-    logger.info(`[instruction.runner] Step ${i + 1}/${steps.length}: ${JSON.stringify({ ...step, value: step.value ? String(step.value).substring(0, 40) : undefined })}`);
+    logger.info(`[instruction.runner] Step ${i + 1}/${steps.length}: ${JSON.stringify({ ...step, value: step.value ? String(step.value).substring(0, 40) : undefined })} [pageCategory=${_pageCategory}]`);
 
     try {
       // Handle navigate steps (URL-first)
@@ -1587,6 +2272,11 @@ async function runInstructionSkill({ instructions, keyPath, params, skillArgs, s
         // Clear LLM cache on page navigation — elements on the new page may share
         // focusKey (tag|text) with unrelated elements on the old page
         _clearLlmCache(sessionId);
+        // Navigation closes any open overlay (dropdown/modal)
+        overlayActive = false;
+        _cachedTabMap = null;        // URL changed — invalidate cache
+        _cachedTabMapUrl = null;
+        _cachedTabMapOverlayActive = null;
         stepResults.push({ step: i + 1, ...step, ok: true });
         discoveredKeyPath.push({ action: 'navigate', url: step.url });
         continue;
@@ -1606,10 +2296,9 @@ async function runInstructionSkill({ instructions, keyPath, params, skillArgs, s
       if (!verifyText) {
         // No target — use the active element (e.g. for fill into focused input)
         if (step.action === 'fill') {
-          // Select all existing text first so the new value replaces it
-          await browserAct({ action: 'press', sessionId, key: 'Meta+a', headed: true, timeoutMs: 2000 });
-          await _sleep(50);
-          const fillResult = await browserAct({ action: 'type', sessionId, text: String(step.value), headed: true, timeoutMs: 10000 });
+          // Use _executeAction so chip confirmation + pressAfter + native setter fallback apply
+          const fillResult = await _executeAction(sessionId, { action: 'Type', value: step.value, target: step.target || '', pageCategory: _pageCategory });
+          lastFillValue = String(step.value || '');
           stepResults.push({ step: i + 1, ...step, ok: !!fillResult?.ok, error: fillResult?.error });
           if (!fillResult?.ok) {
             return { ok: false, error: `Step ${i + 1} type failed: ${fillResult?.error}`, stepResults, discoveredKeyPath };
@@ -1642,17 +2331,120 @@ async function runInstructionSkill({ instructions, keyPath, params, skillArgs, s
       // (window.find) for content, then OCR for visual elements, then the
       // old slow path as a last resort.
       //
-      // skipReset: if the previous step opened an overlay (dropdown/modal),
-      // don't reset focus to page top — that would close the overlay.
-      // Instead, scan from the current focus position inside the overlay.
-      const skipReset = (i > 0 && stepResults[i - 1]?.opensOverlay);
-      if (!hasCachedPath) {
-        try {
-          // 1. Build tab-map for current state
-          const tabMap = await buildTabMap(sessionId, 150, { skipReset });
+      // skipReset: if an overlay (dropdown/modal) is active, don't reset focus
+      // to page top — that would close the overlay. The overlayActive flag is
+      // sticky: once set, it stays true until a navigate event closes the overlay.
+      // This ensures fill steps inside a modal keep skipReset=true.
+      const skipReset = overlayActive || (i > 0 && stepResults[i - 1]?.opensOverlay);
+      try {
+          // ── Tab-map cache: one scan per overlay session ───────────────────
+          // For open overlays, scan once and reuse via data-td-ref selectors.
+          // For landing pages, scan once and reuse until URL changes.
+          // Invalidated on: URL change, click fails, new overlay opens, LLM returns no match.
+          let tabMap;
+          let _usedCachedTabMap = false;
+
+          if (_cachedTabMap && _cachedTabMapOverlayActive === overlayActive) {
+            // Check if URL changed (landing page navigation)
+            const _urlCheck = await browserAct({
+              action: 'evaluate', sessionId, headed: true, timeoutMs: 2000,
+              text: `window.location.href`,
+            }).catch(() => ({ ok: false }));
+            const _url = _urlCheck?.ok ? _urlCheck.result : null;
+            if (_url === _cachedTabMapUrl) {
+              tabMap = _cachedTabMap;
+              _usedCachedTabMap = true;
+              logger.info(`[instruction.runner] Using cached tab-map (${tabMap.length} elements) — URL and overlay state unchanged`);
+            } else {
+              _cachedTabMap = null; // URL changed — invalidate
+            }
+          }
+
+          if (!tabMap) {
+            // Build fresh tab-map (forward scan)
+            tabMap = await buildTabMap(sessionId, 150, { skipReset });
+
+            // If forward scan found very few elements and we're in an overlay,
+            // do a backward scan (Shift+Tab) to find elements before current focus.
+            // In a dialog, Shift+Tab from the first element wraps to the last,
+            // so we find all elements the forward scan missed.
+            // Shift+Tab only moves focus — never clicks, selects, or dismisses.
+            if (overlayActive && tabMap.length < 3) {
+              logger.info(`[instruction.runner] Forward scan found only ${tabMap.length} elements in overlay — doing backward scan (Shift+Tab)`);
+              const backwardMap = await buildTabMap(sessionId, 150, { skipReset: true, backward: true });
+              // Merge: add backward elements that aren't already in the forward map
+              const existingSigs = new Set(tabMap.map(e => _elementSignature(e)));
+              for (const el of backwardMap) {
+                const sig = _elementSignature(el);
+                if (!existingSigs.has(sig)) {
+                  tabMap.push({ id: tabMap.length + 1, ...el });
+                  existingSigs.add(sig);
+                }
+              }
+              logger.info(`[instruction.runner] Merged backward scan: ${tabMap.length} total elements`);
+            }
+
+            _cachedTabMap = tabMap;
+            _cachedTabMapOverlayActive = overlayActive;
+            const _urlRes = await browserAct({
+              action: 'evaluate', sessionId, headed: true, timeoutMs: 2000,
+              text: `window.location.href`,
+            }).catch(() => ({ ok: false }));
+            _cachedTabMapUrl = _urlRes?.ok ? _urlRes.result : null;
+            logger.info(`[instruction.runner] Built fresh tab-map (${tabMap.length} elements) — cached for overlay session (url=${_cachedTabMapUrl})`);
+          }
 
           // 2. Ask LLM to pick the best element
-          let pickedEntry = await _llmPickFromTabMap(tabMap, stepAction, verifyText, step.value);
+          const clickHint = (stepAction === 'click' || stepAction === 'dblclick' || stepAction === 'select') ? lastFillValue : '';
+          let pickedEntry = await _llmPickFromTabMap(tabMap, stepAction, verifyText, step.value, clickHint);
+
+          // If LLM returns no match and we used cached tab-map, invalidate and re-scan
+          if (!pickedEntry && _usedCachedTabMap) {
+            logger.info(`[instruction.runner] LLM returned no match from cached tab-map — invalidating cache and re-scanning`);
+            _cachedTabMap = null;
+            tabMap = await buildTabMap(sessionId, 150, { skipReset });
+            if (overlayActive && tabMap.length < 3) {
+              const backwardMap = await buildTabMap(sessionId, 150, { skipReset: true, backward: true });
+              const existingSigs = new Set(tabMap.map(e => _elementSignature(e)));
+              for (const el of backwardMap) {
+                const sig = _elementSignature(el);
+                if (!existingSigs.has(sig)) {
+                  tabMap.push({ id: tabMap.length + 1, ...el });
+                  existingSigs.add(sig);
+                }
+              }
+            }
+            _cachedTabMap = tabMap;
+            pickedEntry = await _llmPickFromTabMap(tabMap, stepAction, verifyText, step.value, clickHint);
+          }
+
+          // If no match, try reveal button (click steps only, not for small dropdowns).
+          // Uses a separate LLM call to identify reveal buttons — avoids fragile regex
+          // and keeps the main pick call simple (N or 0).
+          // Skip the reveal-button loop for close/X/dismiss targets — these are never
+          // hidden behind a "See more" reveal button. Trying to find one wastes time
+          // and often mis-clicks a wrong element.
+          const isCloseLike = /\b(?:x(?:\s+button)?|close(?:\s+(?:button|icon))?|dismiss(?:\s+button)?|cancel(?:\s+button)?)\b/i.test(verifyText);
+          if (!pickedEntry && !isCloseLike && (stepAction === 'click' || stepAction === 'dblclick' || stepAction === 'select') && tabMap.length > 5) {
+            for (let revealIter = 0; revealIter < 3 && !pickedEntry; revealIter++) {
+              const revealBtn = await _llmPickRevealButton(tabMap);
+              if (!revealBtn) break;
+              const revealSelector = revealBtn.ref ? `[data-td-ref="${revealBtn.ref}"]` : null;
+              if (revealSelector) {
+                try {
+                  await browserAct({ action: 'click', sessionId, selector: revealSelector, headed: true, timeoutMs: 5000 });
+                  logger.info(`[instruction.runner] Clicked reveal button "${revealBtn.text || revealBtn.ariaLabel}" (iter ${revealIter + 1})`);
+                  await _sleep(1500); // wait for content to load/expand
+                } catch (e) {
+                  logger.warn(`[instruction.runner] Reveal button click failed: ${e.message}`);
+                  break;
+                }
+              }
+              // Rebuild tab-map and retry LLM pick
+              const retryTabMap = await buildTabMap(sessionId, 150, { skipReset });
+              pickedEntry = await _llmPickFromTabMap(retryTabMap, stepAction, verifyText, step.value, clickHint);
+            }
+          }
 
           if (pickedEntry) {
             // 3. Click/focus the picked element via real Playwright click
@@ -1671,15 +2463,40 @@ async function runInstructionSkill({ instructions, keyPath, params, skillArgs, s
                 if (clickOk) {
                   logger.info(`[instruction.runner] Tab-map: Playwright click succeeded for "${verifyText}"`);
                 } else {
-                  logger.info(`[instruction.runner] Tab-map: Playwright click failed for "${verifyText}" — trying tab-count fallback`);
+                  logger.info(`[instruction.runner] Tab-map: Playwright click failed for "${verifyText}" — trying coordinate-click fallback`);
                 }
               } catch (e) {
-                logger.warn(`[instruction.runner] Tab-map: Playwright click error: ${e.message} — trying tab-count fallback`);
+                logger.warn(`[instruction.runner] Tab-map: Playwright click error: ${e.message} — trying coordinate-click fallback`);
               }
             }
 
-            // Fallback: tab to element by count (focus only — action phase handles Enter)
-            if (!clickOk && pickedEntry.id) {
+            // Coordinate-click fallback: if selector click failed (data-td-ref lost),
+            // click at the element's center coordinates from the tab-map
+            if (!clickOk && pickedEntry.x !== undefined && pickedEntry.x > 0) {
+              const cx = Math.round(pickedEntry.x + (pickedEntry.w || 0) / 2);
+              const cy = Math.round(pickedEntry.y + (pickedEntry.h || 0) / 2);
+              logger.info(`[instruction.runner] Tab-map: coordinate-click at (${cx}, ${cy}) for "${verifyText}"`);
+              try {
+                const coordResult = await browserAct({ action: 'clickAt', sessionId, x: cx, y: cy, headed: true, timeoutMs: 5000 });
+                clickOk = !!coordResult?.ok;
+                clickedViaPlaywright = clickOk;
+                if (clickOk) {
+                  logger.info(`[instruction.runner] Tab-map: coordinate-click succeeded for "${verifyText}"`);
+                }
+              } catch (e) {
+                logger.warn(`[instruction.runner] Tab-map: coordinate-click failed: ${e.message}`);
+              }
+            }
+
+            // Tab-count fallback: tab to element by count (focus only — action phase handles Enter)
+            // Only for page-level navigation (skipReset=false). Inside overlays, resetting
+            // focus closes the dropdown/modal — coordinate-click handles that case.
+            if (!clickOk) {
+              // Click failed — element may have been re-rendered. Invalidate cache.
+              _cachedTabMap = null;
+              logger.info(`[instruction.runner] Click failed for "${verifyText}" — invalidating tab-map cache`);
+            }
+            if (!clickOk && pickedEntry.id && !skipReset) {
               try {
                 await _resetFocusToPageTop(sessionId);
                 const tabCount = Math.min(pickedEntry.id, 50);
@@ -1698,42 +2515,80 @@ async function runInstructionSkill({ instructions, keyPath, params, skillArgs, s
 
             // Verify we're on the right element
             if (clickOk) {
-              const focused = await _readActiveElement(sessionId);
-              if (focused) {
-                const editable = await _isEditableByProbe(sessionId);
-                // mouse: true when Playwright click activated the element →
-                // action phase skips Enter/Space (prevents double-activation)
-                const mouseFlag = clickedViaPlaywright;
-                if (stepAction === 'fill' && editable) {
-                  navResult = { ok: true, count: 0, navMode, focusedText: focused.text, ref: focused.ref || null, mouse: mouseFlag, matchedBy: 'tabmap_llm' };
-                } else if ((stepAction === 'click' || stepAction === 'dblclick') && !editable) {
-                  navResult = { ok: true, count: 0, navMode, focusedText: focused.text, ref: focused.ref || null, mouse: mouseFlag, matchedBy: 'tabmap_llm' };
-                } else {
-                  logger.info(`[instruction.runner] Tab-map: picked element but type mismatch (editable=${editable}, action=${stepAction}) — trying page search`);
+              if (clickedViaPlaywright && (stepAction === 'click' || stepAction === 'dblclick' || stepAction === 'select')) {
+                // Trust the Playwright click — don't probe. The probe checks
+                // document.activeElement AFTER the click, but the click may have
+                // changed focus (closed modal, navigated) causing false mismatches.
+                navResult = { ok: true, count: 0, navMode, focusedText: pickedEntry.text || pickedEntry.ariaLabel || verifyText, ref: pickedEntry.ref || null, mouse: true, matchedBy: 'tabmap_llm' };
+              } else {
+                const focused = await _readActiveElement(sessionId);
+                if (focused) {
+                  const editable = await _isEditableByProbe(sessionId);
+                  // mouse: true when Playwright click activated the element →
+                  // action phase skips Enter/Space (prevents double-activation)
+                  const mouseFlag = clickedViaPlaywright;
+                  if (stepAction === 'fill' && editable) {
+                    // Use pickedEntry.ref (the element we clicked from tab-map), not focused.ref
+                    // (the active element after click, which may be stale if the click didn't move focus)
+                    navResult = { ok: true, count: 0, navMode, focusedText: focused.text, ref: pickedEntry.ref || focused.ref || null, mouse: mouseFlag, matchedBy: 'tabmap_llm' };
+                  } else if ((stepAction === 'click' || stepAction === 'dblclick') && !editable) {
+                    navResult = { ok: true, count: 0, navMode, focusedText: focused.text, ref: focused.ref || null, mouse: mouseFlag, matchedBy: 'tabmap_llm' };
+                  } else {
+                    logger.info(`[instruction.runner] Tab-map: picked element but type mismatch (editable=${editable}, action=${stepAction}) — trying page search`);
+                  }
                 }
               }
             }
           }
 
-          // 4. If tab-map didn't work, try page search (window.find)
-          if (!navResult) {
-            logger.info(`[instruction.runner] Tab-map did not find "${verifyText}" — trying page search`);
-            const searchResult = await pageSearch(sessionId, verifyText);
+          // 4. If tab-map didn't work, try page search with scroll (window.find).
+          // Only for click/dblclick/select steps — page search can close modals and
+          // is not appropriate for fill steps (inputs should be found via DOM query).
+          // Also skip when overlayActive=true — Ctrl+F+Escape and scrolling can
+          // close the open modal/dropdown, losing the context we need.
+          if (!navResult && !overlayActive && (stepAction === 'click' || stepAction === 'dblclick' || stepAction === 'select')) {
+            logger.info(`[instruction.runner] Tab-map did not find "${verifyText}" — trying page search with scroll`);
+            const searchResult = await _pageSearchWithScroll(sessionId, verifyText, 5);
             if (searchResult) {
-              const editable = await _isEditableByProbe(sessionId);
-              if (stepAction === 'fill' && editable) {
-                navResult = { ok: true, count: 0, navMode, focusedText: searchResult.text, ref: searchResult.ref || null, mouse: false, matchedBy: 'page_search' };
-              } else if ((stepAction === 'click' || stepAction === 'dblclick') && !editable) {
-                navResult = { ok: true, count: 0, navMode, focusedText: searchResult.text, ref: searchResult.ref || null, mouse: false, matchedBy: 'page_search' };
-              } else {
-                // Page search found the text but wrong element type — try tabbing to nearby
-                logger.info(`[instruction.runner] Page search found text but type mismatch — trying tab to nearby`);
+              if (stepAction === 'click' || stepAction === 'dblclick') {
+                // Click the found element via Playwright (ref already injected by _readActiveElement)
+                const cssSelector = searchResult.ref ? `[data-td-ref="${searchResult.ref}"]` : null;
+                let clickOk = false;
+                if (cssSelector) {
+                  try {
+                    const clickResult = await browserAct({ action: 'click', sessionId, selector: cssSelector, headed: true, timeoutMs: 5000 });
+                    clickOk = !!clickResult?.ok;
+                  } catch (e) {
+                    logger.warn(`[instruction.runner] Page search Playwright click failed: ${e.message}`);
+                  }
+                }
+                // Fallback: coordinate click using the focused element's rect
+                if (!clickOk && searchResult.x !== undefined && searchResult.x > 0) {
+                  const cx = Math.round(searchResult.x + (searchResult.w || 0) / 2);
+                  const cy = Math.round(searchResult.y + (searchResult.h || 0) / 2);
+                  try {
+                    const coordResult = await browserAct({ action: 'clickAt', sessionId, x: cx, y: cy, headed: true, timeoutMs: 5000 });
+                    clickOk = !!coordResult?.ok;
+                  } catch (e) {
+                    logger.warn(`[instruction.runner] Page search coordinate click failed: ${e.message}`);
+                  }
+                }
+                if (clickOk) {
+                  navResult = { ok: true, count: 0, navMode, focusedText: searchResult.text, ref: searchResult.ref, mouse: true, matchedBy: 'page_search_click' };
+                }
+              } else if (stepAction === 'fill') {
+                const editable = await _isEditableByProbe(sessionId);
+                if (editable) {
+                  navResult = { ok: true, count: 0, navMode, focusedText: searchResult.text, ref: searchResult.ref || null, mouse: false, matchedBy: 'page_search' };
+                }
               }
             }
           }
 
-          // 5. If page search didn't work, try OCR fast path
-          if (!navResult) {
+          // 5. If page search didn't work, try OCR fast path.
+          // Skip when overlayActive=true — OCR fast path tabs through the page,
+          // which moves focus out of dropdowns/modals and closes them.
+          if (!navResult && !overlayActive) {
             logger.info(`[instruction.runner] Page search did not find "${verifyText}" — trying OCR fast path`);
             navResult = await _ocrFastPathStep(sessionId, verifyText, navMode, 60, stepAction);
             if (navResult?.fallback || !navResult?.ok) {
@@ -1746,12 +2601,13 @@ async function runInstructionSkill({ instructions, keyPath, params, skillArgs, s
           logger.warn(`[instruction.runner] Tab-map approach error: ${_tabMapErr.message} — falling back to slow path`);
           navResult = null;
         }
-      }
 
       // ── Direct DOM query fallback for fill steps ──────────────────────
       // Before falling back to the slow 50-tab path, try a direct DOM query
       // for inputs matching the target placeholder/aria-label. This is fast
       // and avoids wasting 5 minutes tabbing when the input doesn't exist.
+      // For To/Recipients fields, prefer input/textarea[name="to"] and avoid
+      // matching Gmail's "Ask Gmail" search box.
       if (!navResult && stepAction === 'fill') {
         try {
           const domQuery = await browserAct({
@@ -1759,16 +2615,30 @@ async function runInstructionSkill({ instructions, keyPath, params, skillArgs, s
             text: `(() => {
               const target = ${JSON.stringify(verifyText)};
               const targetLower = target.toLowerCase();
+              const _isToField = /\\b(to|recipients|recipient)\\b/i.test(target);
               const inputs = document.querySelectorAll('input, textarea, [contenteditable="true"], [contenteditable=""]');
               for (const input of inputs) {
                 const ph = (input.placeholder || '').toLowerCase();
                 const al = (input.getAttribute('aria-label') || '').toLowerCase();
                 const lbl = (input.getAttribute('aria-labelledby') || '').toLowerCase();
-                if (ph.includes(targetLower) || al.includes(targetLower) || lbl.includes(targetLower)) {
+                const name = (input.getAttribute('name') || '').toLowerCase();
+
+                // Gmail To field: name="to" takes precedence
+                if (_isToField && name === 'to') {
                   input.focus();
                   const rect = input.getBoundingClientRect();
                   return { tag: input.tagName.toLowerCase(), text: '', placeholder: input.placeholder || '',
-                           ariaLabel: input.getAttribute('aria-label') || '',
+                           ariaLabel: input.getAttribute('aria-label') || '', name, focusMatch: 'name-to',
+                           x: rect.x, y: rect.y, w: rect.width, h: rect.height };
+                }
+
+                if (ph.includes(targetLower) || al.includes(targetLower) || lbl.includes(targetLower)) {
+                  // Avoid matching "Ask Gmail" search box when looking for To field
+                  if (_isToField && al.includes('ask gmail')) continue;
+                  input.focus();
+                  const rect = input.getBoundingClientRect();
+                  return { tag: input.tagName.toLowerCase(), text: '', placeholder: input.placeholder || '',
+                           ariaLabel: input.getAttribute('aria-label') || '', name, focusMatch: 'label',
                            x: rect.x, y: rect.y, w: rect.width, h: rect.height };
                 }
               }
@@ -1776,7 +2646,7 @@ async function runInstructionSkill({ instructions, keyPath, params, skillArgs, s
             })()`,
           });
           if (domQuery?.result) {
-            logger.info(`[instruction.runner] DOM query found input for "${verifyText}": ${domQuery.result.tag} placeholder="${domQuery.result.placeholder}"`);
+            logger.info(`[instruction.runner] DOM query found input for "${verifyText}": ${domQuery.result.tag} placeholder="${domQuery.result.placeholder}" match=${domQuery.result.focusMatch}`);
             navResult = { ok: true, count: 0, navMode: 'tab', focusedText: '', ref: null, mouse: false, matchedBy: 'dom_query' };
           }
         } catch (e) {
@@ -1784,27 +2654,61 @@ async function runInstructionSkill({ instructions, keyPath, params, skillArgs, s
         }
       }
 
-      // ── Cached path or slow discovery (fallback) ────────────────────────
+      // ── Slow discovery (final fallback) ────────────────────────────────
       if (!navResult) {
-        if (hasCachedPath && step.cachedCount !== undefined) {
-          // Fast path: use cached count
-          navResult = await _executeCachedKeyPathStep(sessionId, { ...step, navMode, stepAction });
-        } else {
-          // Slow path: reset focus to top first, then discover the path
+        // Slow path: reset focus to top first, then discover the path.
+        // Skip the reset when overlayActive=true — resetting to page top
+        // closes dropdowns/modals. Start discovery from current focus instead.
+        if (!overlayActive) {
           await _resetFocusToPageTop(sessionId);
-          navResult = await _discoverKeyPathStep(sessionId, verifyText, navMode, 50, allowMouse, stepAction);
         }
+        navResult = await _discoverKeyPathStep(sessionId, verifyText, navMode, 50, allowMouse, stepAction);
       }
 
       if (!navResult?.ok) {
+        // ── Overlay recovery: if URL-first was used and first step failed, the
+        // overlay was likely closed by Escape during buildTabMap. Re-navigate to
+        // startUrl to reopen it and retry with overlayActive=true.
+        // The urlFirstNav flag tells us the URL was intentionally chosen to trigger
+        // an action — no URL pattern matching needed.
+        if (i === 0 && _urlFirstNav && !_urlFirstOverlayDetected && startUrl && !_overlayRecoveryRetried) {
+          try {
+            const _postFailCheck = await browserAct({
+              action: 'evaluate', sessionId, headed: true, timeoutMs: 3000,
+              text: `(() => {
+                const visibleDialog = document.querySelector('[role="dialog"], [aria-modal="true"], [role="menu"], [role="listbox"]');
+                const hasVisibleOverlay = visibleDialog && visibleDialog.offsetParent !== null;
+                return { hasVisibleOverlay };
+              })()`,
+            }).catch(() => ({ ok: false }));
+            const _postFailResult = _postFailCheck?.ok ? _postFailCheck.result : null;
+            if (!_postFailResult?.hasVisibleOverlay) {
+              logger.warn(`[instruction.runner] Step 1 failed — URL-first was used but no visible overlay. Overlay was likely closed by Escape. Re-navigating to ${startUrl} to reopen.`);
+              await browserAct({ action: 'navigate', sessionId, url: startUrl, headed: true, timeoutMs: 30000 });
+              await _sleep(2000);
+              // Re-check for overlay after re-navigate
+              const _recheckRes = await browserAct({
+                action: 'evaluate', sessionId, headed: true, timeoutMs: 3000,
+                text: `(() => {
+                  const d = document.querySelector('[role="dialog"], [aria-modal="true"]');
+                  return !!(d && d.offsetParent !== null);
+                })()`,
+              }).catch(() => ({ ok: false }));
+              if (_recheckRes?.ok && (_recheckRes.result === true || _recheckRes.result === 'true')) {
+                overlayActive = true;
+                _urlFirstOverlayDetected = true;
+                logger.info(`[instruction.runner] Overlay reopened after re-navigate — retrying step 1 with overlayActive=true`);
+              } else {
+                logger.info(`[instruction.runner] No overlay after re-navigate — retrying step 1 anyway`);
+              }
+              _overlayRecoveryRetried = true;
+              i--; // retry same step
+              continue;
+            }
+          } catch (_) {}
+        }
         stepResults.push({ step: i + 1, ...step, ok: false, error: navResult?.error });
         return { ok: false, error: `Step ${i + 1} failed: ${navResult?.error}`, stepResults, discoveredKeyPath };
-      }
-
-      // Update cached count if it changed
-      if (hasCachedPath && navResult.newCount !== undefined && navResult.newCount !== step.cachedCount) {
-        logger.info(`[instruction.runner] Updating cached count: ${step.cachedCount} → ${navResult.newCount}`);
-        step.cachedCount = navResult.newCount;
       }
 
       // Execute the action
@@ -1824,7 +2728,8 @@ async function runInstructionSkill({ instructions, keyPath, params, skillArgs, s
             return val !== undefined && val !== null ? String(val) : `{{${name}}}`;
           });
         }
-        actionResult = await _executeAction(sessionId, { action: 'Type', value });
+        lastFillValue = String(value || '');
+        actionResult = await _executeAction(sessionId, { action: 'Type', value, target: step.target || step.verifyText || '', pageCategory: _pageCategory, ref: navResult?.ref });
       } else if (actionType === 'Enter') {
         // Mouse fallback already clicked the element during navigation, so
         // we don't need to press Enter/Space again. The click already happened.
@@ -1849,6 +2754,38 @@ async function runInstructionSkill({ instructions, keyPath, params, skillArgs, s
         // After a click step, mark as opensOverlay so the next step's
         // buildTabMap uses skipReset=true (scan from current focus, not page top)
         if (actionResult?.ok) {
+          overlayActive = true; // sticky — stays true until navigate event
+          _cachedTabMap = null; // new overlay opened — invalidate cache so next step re-scans
+
+          // Submit verification: if the clicked element looks like Send/Submit/Post,
+          // verify the action actually succeeded (compose gone, URL change, snackbar).
+          // Skip for document_editor category (auto-save pages don't have submit verification).
+          const _isSubmit = /\b(send|submit|post|publish|create|save)\b/i.test(verifyText);
+          const _shouldVerify = _isSubmit && _pageCategory !== 'document_editor';
+          if (_shouldVerify) {
+            const _preState = await browserAct({
+              action: 'evaluate', sessionId, headed: true, timeoutMs: 2000,
+              text: `(() => ({ url: window.location.href, bodyLen: document.body.innerText.length }))()`,
+            }).catch(() => ({ result: {} }));
+            const _submitVerify = await _verifySubmitSuccess(sessionId, verifyText, _preState?.result);
+            if (!_submitVerify?.ok) {
+              logger.warn(`[instruction.runner] Submit verification failed for "${verifyText}" — action may not have succeeded`);
+              stepResults.push({ step: i + 1, ...step, ok: true, ref: navResult.ref, focusedText: navResult.focusedText, opensOverlay: true, submitVerified: false });
+              // Try clicking Send again as recovery
+              logger.info(`[instruction.runner] Retrying submit click for "${verifyText}"`);
+              await browserAct({ action: 'clickByText', sessionId, text: verifyText, headed: true, timeoutMs: 10000 });
+              await _sleep(1500);
+              const _retryVerify = await _verifySubmitSuccess(sessionId, verifyText, _preState?.result);
+              if (_retryVerify?.ok) {
+                logger.info(`[instruction.runner] Submit retry succeeded`);
+              }
+            } else {
+              stepResults.push({ step: i + 1, ...step, ok: true, ref: navResult.ref, focusedText: navResult.focusedText, opensOverlay: true, submitVerified: true });
+            }
+          } else {
+            stepResults.push({ step: i + 1, ...step, ok: true, ref: navResult.ref, focusedText: navResult.focusedText, opensOverlay: true });
+          }
+
           discoveredKeyPath.push({
             description: step.target ? `Click "${step.target}"` : `Step ${i + 1}`,
             verifyText,
@@ -1859,7 +2796,6 @@ async function runInstructionSkill({ instructions, keyPath, params, skillArgs, s
             stepAction: stepAction || '',
             opensOverlay: true,
           });
-          stepResults.push({ step: i + 1, ...step, ok: true, ref: navResult.ref, focusedText: navResult.focusedText, opensOverlay: true });
           await _sleep(1000); // wait for overlay/page to settle
           continue;
         }
@@ -1868,6 +2804,14 @@ async function runInstructionSkill({ instructions, keyPath, params, skillArgs, s
       }
 
       if (!actionResult?.ok) {
+        // Retry tracking: for type/fill steps, retry up to 3 times before failing
+        const _retryCount = (step.retryCount || 0) + 1;
+        if (_retryCount <= 3 && (step.action === 'fill' || step.action === 'type')) {
+          logger.warn(`[instruction.runner] Step ${i + 1} type failed (attempt ${_retryCount}/3) — retrying`);
+          step.retryCount = _retryCount;
+          i--; // retry same step
+          continue;
+        }
         stepResults.push({ step: i + 1, ...step, ok: false, error: actionResult?.error || 'Action failed' });
         return { ok: false, error: `Step ${i + 1} action failed: ${actionResult?.error}`, stepResults, discoveredKeyPath };
       }
@@ -1901,15 +2845,819 @@ async function runInstructionSkill({ instructions, keyPath, params, skillArgs, s
 }
 
 // ---------------------------------------------------------------------------
+// Three-tier iterative navigation: decision call + strategies
+// ---------------------------------------------------------------------------
+// Tier 1: URL-first (deterministic) — already done before this function
+// Tier 2: Decision call — LLM returns 0 (DONE), 1 (Just-type), 2 (Meta+F), 3 (Tab-Map)
+// Tier 3: Strategy execution with fallback to Tab-Map
+
+// Parse a single LLM action line into a structured action object.
+function _parseAction(text) {
+  if (!text || typeof text !== 'string') return null;
+  const t = text.trim();
+
+  // DONE
+  if (/^done$/i.test(t)) return { action: 'done' };
+
+  // Click "button text"
+  let m = t.match(/^Click\s+"([^"]+)"\s*$/i);
+  if (m) return { action: 'click', target: m[1] };
+
+  // Type "value" into the "field" field
+  m = t.match(/^Type\s+"([^"]+)"\s+into\s+(?:the\s+)?"([^"]+)"\s+field\s*$/i);
+  if (m) return { action: 'type', value: m[1], target: m[2] };
+
+  // Press Enter / Tab / Escape
+  m = t.match(/^Press\s+(Enter|Tab|Escape)\s*$/i);
+  if (m) return { action: 'press', key: m[1] };
+
+  // Navigate to URL
+  m = t.match(/^Navigate\s+to\s+(https?:\/\/\S+)\s*$/i);
+  if (m) return { action: 'navigate', url: m[1] };
+
+  return null;
+}
+
+// ── State helpers ──────────────────────────────────────────────────────
+
+async function _getUrl(sessionId) {
+  try {
+    const res = await browserAct({ action: 'evaluate', sessionId, headed: true, timeoutMs: 2000, text: 'window.location.href' });
+    return res?.ok ? res.result : '';
+  } catch { return ''; }
+}
+
+async function _detectOverlay(sessionId) {
+  try {
+    const res = await browserAct({
+      action: 'evaluate', sessionId, headed: true, timeoutMs: 2000,
+      text: `(() => {
+        if (document.querySelector('[role="dialog"], [role="alertdialog"], [aria-modal="true"]')) return true;
+        const menu = document.querySelector('[role="menu"], [role="listbox"]');
+        if (menu && menu.offsetParent !== null) return true;
+        const classMatch = document.querySelector('.modal:not([hidden]), .popup:not([hidden]), .overlay:not([hidden]), .drawer:not([hidden]), .sheet:not([hidden])');
+        if (classMatch && classMatch.offsetParent !== null) return true;
+        return false;
+      })()`,
+    });
+    return res?.result === true || res?.result === 'true';
+  } catch { return false; }
+}
+
+// ── Strategy 1: Just-type ──────────────────────────────────────────────
+// The focused element is the right field — just type into it.
+// Returns { ok, pageChanged, error }
+async function _executeJustType(sessionId, value, focusedElement, pageCategory) {
+  if (!focusedElement) return { ok: false, pageChanged: false, error: 'No focused element' };
+
+  const _tag = focusedElement.tag || '';
+  const _role = focusedElement.role || '';
+  const _isFillable = ['input', 'textarea'].includes(_tag) ||
+                      _role === 'combobox' || _role === 'textbox';
+  if (!_isFillable) {
+    return { ok: false, pageChanged: false, error: `Focused element ${_tag} role=${_role} is not fillable` };
+  }
+
+  // Handle special values
+  if (value === 'PRESS_ENTER') {
+    logger.info(`[instruction.runner] Just-type: pressing Enter (field already has text)`);
+    await browserAct({ action: 'press', sessionId, key: 'Enter', headed: true, timeoutMs: 5000 });
+    await _sleep(1000);
+    return { ok: true, pageChanged: false };
+  }
+  if (value === 'SKIP' || !value) {
+    return { ok: false, pageChanged: false, error: 'LLM says skip this field' };
+  }
+
+  logger.info(`[instruction.runner] Just-type: typing "${value.slice(0, 50)}" into ${_tag} "${(focusedElement.text || focusedElement.ariaLabel || '').slice(0, 40)}"`);
+
+  // Detect contenteditable vs form input
+  // Form inputs (input/textarea): use _executeAction (with Meta+a select-all to replace)
+  // Contenteditable (div role=textbox): type at cursor, no Meta+a — supports multi-line block creation
+  const _isFormInput = ['input', 'textarea'].includes(_tag);
+  const _isContenteditable = !_isFormInput && (_role === 'textbox' || _tag === 'div');
+
+  // Multi-line content for contenteditable (block creation in Notion, Google Docs, etc.)
+  // Type each line directly (no Meta+a), press Enter between lines to create new blocks
+  if (_isContenteditable && value.includes('\n')) {
+    const lines = value.split('\n').filter(l => l.length > 0);
+    logger.info(`[instruction.runner] Just-type: multi-line content (${lines.length} lines) for contenteditable`);
+
+    for (let i = 0; i < lines.length; i++) {
+      if (i === 0) {
+        // First line: clear any placeholder/untitled text with Meta+a, then type
+        await browserAct({ action: 'press', sessionId, key: 'Meta+a', headed: true, timeoutMs: 2000 });
+        await _sleep(50);
+      } else {
+        // Press Enter to create a new block, wait for it to settle
+        await browserAct({ action: 'press', sessionId, key: 'Enter', headed: true, timeoutMs: 5000 });
+        await _sleep(500);
+      }
+      // Type the line directly (no Meta+a — we're at cursor position)
+      await browserAct({ action: 'type', sessionId, text: lines[i], headed: true, timeoutMs: 10000 });
+      await _sleep(300);
+    }
+
+    // For AI chat, press Enter after typing to submit
+    if (pageCategory === 'ai_chat') {
+      await _sleep(500);
+      logger.info(`[instruction.runner] Just-type: pressing Enter for ai_chat submit`);
+      await browserAct({ action: 'press', sessionId, key: 'Enter', headed: true, timeoutMs: 5000 });
+      await _sleep(1000);
+    }
+
+    return { ok: true, pageChanged: false };
+  }
+
+  // Single-line or form input: use _executeAction (includes reactFill, Meta+a for form inputs)
+  const result = await _executeAction(sessionId, {
+    action: 'Type',
+    value: value,
+    target: focusedElement.text || focusedElement.ariaLabel || '',
+    pageCategory: pageCategory,
+    ref: focusedElement.ref || null,
+  });
+
+  if (!result?.ok) {
+    return { ok: false, pageChanged: false, error: result?.error || 'Type failed' };
+  }
+
+  // For AI chat, press Enter after typing to submit
+  if (pageCategory === 'ai_chat') {
+    await _sleep(500);
+    logger.info(`[instruction.runner] Just-type: pressing Enter for ai_chat submit`);
+    await browserAct({ action: 'press', sessionId, key: 'Enter', headed: true, timeoutMs: 5000 });
+    await _sleep(1000);
+  }
+
+  return { ok: true, pageChanged: false };
+}
+
+// ── Strategy 2: Meta+F search ──────────────────────────────────────────
+// Find specific text on the page using window.find(), then click the element.
+// Returns { ok, pageChanged, error }
+
+// Find closest clickable ancestor of the currently focused element.
+// Sets data-td-ref on it and returns { ref, tag, role, text }.
+async function _findClosestClickable(sessionId, focused) {
+  // If focused element is already clickable, return it
+  const _tag = focused?.tag || '';
+  const _role = focused?.role || '';
+  if (['a', 'button'].includes(_tag) || ['button', 'link', 'menuitem', 'menuitemradio', 'menuitemcheckbox'].includes(_role)) {
+    return focused;
+  }
+
+  // Walk up to closest clickable ancestor via DOM
+  try {
+    const res = await browserAct({
+      action: 'evaluate', sessionId, headed: true, timeoutMs: 3000,
+      text: `(() => {
+        let el = document.activeElement;
+        while (el && el !== document.body) {
+          const tag = el.tagName.toLowerCase();
+          const role = el.getAttribute('role') || '';
+          if (tag === 'a' || tag === 'button' || role === 'button' || role === 'link' || role === 'menuitem' || role === 'menuitemradio' || role === 'menuitemcheckbox' || el.hasAttribute('onclick')) {
+            let ref = el.getAttribute('data-td-ref');
+            if (!ref || !ref.startsWith('tm-')) {
+              ref = 'tm-' + Math.random().toString(36).slice(2, 10);
+              el.setAttribute('data-td-ref', ref);
+            }
+            const r = el.getBoundingClientRect();
+            return { ref, tag, role, text: (el.innerText || el.textContent || '').trim().replace(/\\s+/g, ' ').slice(0, 80), x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height) };
+          }
+          el = el.parentElement;
+        }
+        return null;
+      })()`,
+    });
+    return res?.result || null;
+  } catch (e) {
+    logger.warn(`[instruction.runner] _findClosestClickable failed: ${e.message}`);
+    return null;
+  }
+}
+
+async function _executeMetaF(sessionId, searchText) {
+  if (!searchText) return { ok: false, pageChanged: false, error: 'No search text' };
+
+  logger.info(`[instruction.runner] Meta+F: searching for "${searchText}"`);
+
+  // Use existing pageSearch to find text and focus element
+  const focused = await pageSearch(sessionId, searchText);
+  if (!focused) {
+    return { ok: false, pageChanged: false, error: `Text "${searchText}" not found on page` };
+  }
+
+  logger.info(`[instruction.runner] Meta+F: found "${searchText}" → focused ${focused.tag} "${(focused.text || '').slice(0, 40)}"`);
+
+  // Find closest clickable ancestor (the focused element might be a container)
+  const clickTarget = await _findClosestClickable(sessionId, focused);
+  if (!clickTarget) {
+    return { ok: false, pageChanged: false, error: `No clickable element found for "${searchText}"` };
+  }
+
+  // Click via Playwright using data-td-ref
+  const cssSelector = `[data-td-ref="${clickTarget.ref}"]`;
+  logger.info(`[instruction.runner] Meta+F: clicking ${clickTarget.tag} "${(clickTarget.text || '').slice(0, 40)}" via ${cssSelector}`);
+
+  try {
+    const clickResult = await browserAct({ action: 'click', sessionId, selector: cssSelector, headed: true, timeoutMs: 5000 });
+    if (!clickResult?.ok) {
+      // Coordinate-click fallback
+      if (clickTarget.x !== undefined && clickTarget.x > 0) {
+        const cx = Math.round(clickTarget.x + (clickTarget.w || 0) / 2);
+        const cy = Math.round(clickTarget.y + (clickTarget.h || 0) / 2);
+        logger.info(`[instruction.runner] Meta+F: coordinate-click at (${cx}, ${cy})`);
+        const coordResult = await browserAct({ action: 'clickAt', sessionId, x: cx, y: cy, headed: true, timeoutMs: 5000 });
+        return { ok: !!coordResult?.ok, pageChanged: true, error: coordResult?.ok ? undefined : 'Coordinate click failed' };
+      }
+      return { ok: false, pageChanged: false, error: 'Click failed' };
+    }
+    await _sleep(1000); // wait for page to settle after click
+    return { ok: true, pageChanged: true };
+  } catch (e) {
+    return { ok: false, pageChanged: false, error: `Click error: ${e.message}` };
+  }
+}
+
+// ── Strategy 3: App Shortcuts ──────────────────────────────────────────
+// Press an app-specific keyboard shortcut from appKnowledge.
+// Returns { ok, pageChanged, error }
+async function _executeShortcut(sessionId, keyCombo) {
+  if (!keyCombo) return { ok: false, pageChanged: false, error: 'No shortcut' };
+
+  logger.info(`[instruction.runner] Shortcut: pressing "${keyCombo}"`);
+
+  const _preUrl = await _getUrl(sessionId);
+  try {
+    const result = await browserAct({ action: 'press', sessionId, key: keyCombo, headed: true, timeoutMs: 5000 });
+    await _sleep(1500); // wait for page to react (dialog open, navigation, etc.)
+    const _postUrl = await _getUrl(sessionId);
+    const pageChanged = _preUrl !== _postUrl;
+    return { ok: !!result?.ok, pageChanged, error: result?.error };
+  } catch (e) {
+    return { ok: false, pageChanged: false, error: `Shortcut error: ${e.message}` };
+  }
+}
+
+// ── Strategy 4: Tab-Map scan session ───────────────────────────────────
+// One scan per form/modal session. Track filled fields, omit from list.
+// Returns { done, ok, error, pickedRef } — done=true when session ends.
+
+// Execute a single Tab-Map action (click/type/press/navigate).
+// Returns { ok, pageChanged, error, pickedRef, rescan }
+async function _executeTabMapAction(sessionId, parsed, tabMap, overlayActive, pageCategory) {
+  const _pageCategory = pageCategory || 'web_generic';
+
+  if (parsed.action === 'done') {
+    return { ok: true, pageChanged: false };
+  }
+
+  if (parsed.action === 'navigate') {
+    const navResult = await browserAct({ action: 'navigate', sessionId, url: parsed.url, headed: true, timeoutMs: 30000 });
+    await _sleep(2000);
+    await _resetFocusToPageTop(sessionId);
+    return { ok: !!navResult?.ok, pageChanged: true, error: navResult?.error };
+  }
+
+  if (parsed.action === 'press') {
+    const keyMap = { Enter: 'Enter', Tab: 'Tab', Escape: 'Escape' };
+    const result = await browserAct({ action: 'press', sessionId, key: keyMap[parsed.key] || parsed.key, headed: true, timeoutMs: 5000 });
+    await _sleep(500);
+    return { ok: !!result?.ok, pageChanged: false, error: result?.error };
+  }
+
+  if (parsed.action === 'click') {
+    const pickedEntry = await _llmPickFromTabMap(tabMap, 'click', parsed.target, '', '');
+    if (!pickedEntry) {
+      // Lazy re-scan signal
+      return { ok: false, pageChanged: false, error: `No element found for "${parsed.target}"`, rescan: true };
+    }
+
+    const _preUrl = await _getUrl(sessionId);
+
+    // Click via data-td-ref selector
+    const cssSelector = pickedEntry.ref ? `[data-td-ref="${pickedEntry.ref}"]` : null;
+    let clickOk = false;
+    if (cssSelector) {
+      logger.info(`[instruction.runner] Tab-Map: clicking "${pickedEntry.text || pickedEntry.ariaLabel || parsed.target}" via ${cssSelector}`);
+      try {
+        const clickResult = await browserAct({ action: 'click', sessionId, selector: cssSelector, headed: true, timeoutMs: 5000 });
+        clickOk = !!clickResult?.ok;
+      } catch (e) {
+        logger.warn(`[instruction.runner] Tab-Map: Playwright click error: ${e.message}`);
+      }
+    }
+    // Coordinate-click fallback
+    if (!clickOk && pickedEntry.x !== undefined && pickedEntry.x > 0) {
+      const cx = Math.round(pickedEntry.x + (pickedEntry.w || 0) / 2);
+      const cy = Math.round(pickedEntry.y + (pickedEntry.h || 0) / 2);
+      logger.info(`[instruction.runner] Tab-Map: coordinate-click at (${cx}, ${cy}) for "${parsed.target}"`);
+      try {
+        const coordResult = await browserAct({ action: 'clickAt', sessionId, x: cx, y: cy, headed: true, timeoutMs: 5000 });
+        clickOk = !!coordResult?.ok;
+      } catch (e) {
+        logger.warn(`[instruction.runner] Tab-Map: coordinate-click error: ${e.message}`);
+      }
+    }
+
+    await _sleep(1000);
+    const _postUrl = await _getUrl(sessionId);
+    const pageChanged = _preUrl !== _postUrl;
+
+    return { ok: clickOk, pageChanged, error: clickOk ? undefined : `Click failed for "${parsed.target}"`, pickedRef: pickedEntry.ref };
+  }
+
+  if (parsed.action === 'type') {
+    const pickedEntry = await _llmPickFromTabMap(tabMap, 'fill', parsed.target, parsed.value, '');
+    if (!pickedEntry) {
+      return { ok: false, pageChanged: false, error: `No element found for "${parsed.target}"`, rescan: true };
+    }
+
+    // Click the field to focus it
+    const cssSelector = pickedEntry.ref ? `[data-td-ref="${pickedEntry.ref}"]` : null;
+    if (cssSelector) {
+      try {
+        await browserAct({ action: 'click', sessionId, selector: cssSelector, headed: true, timeoutMs: 5000 });
+      } catch (e) {
+        logger.warn(`[instruction.runner] Tab-Map type: click field error: ${e.message}`);
+      }
+    }
+    await _sleep(300);
+
+    // Execute the type action (includes reactFill, chip confirmation)
+    const result = await _executeAction(sessionId, {
+      action: 'Type',
+      value: parsed.value,
+      target: parsed.target,
+      pageCategory: _pageCategory,
+      ref: pickedEntry.ref || null,
+    });
+
+    return { ok: !!result?.ok, pageChanged: false, error: result?.error, pickedRef: pickedEntry.ref };
+  }
+
+  return { ok: false, pageChanged: false, error: `Unknown action: ${parsed.action}` };
+}
+
+// Tab-Map inner loop: runs ONE step of the Tab-Map scan session.
+// Returns { done, ok, error, stateChanged, filledRef, filledLabel, filledValue }
+//   done=true when session ends (DONE, state change, or failure)
+async function _tabMapInnerStep(sessionId, goal, actionHistory, currentUrl, overlayActive, pageCategory, agentContext, cachedTabMap, filledFields, consumedRefs, lastVerifyFailed) {
+  const { _llmNextAction } = require('./browser.agent.cjs');
+
+  // 1. Use cached tab-map (scan session — no re-scan unless invalidated by caller)
+  const tabMap = cachedTabMap;
+  if (!tabMap || tabMap.length === 0) {
+    return { done: true, ok: false, error: 'Tab-map is empty' };
+  }
+
+  // 2. Ask LLM for next action
+  const nextAction = await _llmNextAction(goal, currentUrl, tabMap, actionHistory, pageCategory, agentContext, lastVerifyFailed, consumedRefs, filledFields);
+  if (!nextAction) {
+    logger.warn(`[instruction.runner] Tab-Map: LLM returned null — treating as DONE`);
+    return { done: true, ok: true };
+  }
+  logger.info(`[instruction.runner] Tab-Map step: LLM says "${nextAction}"`);
+
+  // 3. Parse the action
+  const parsed = _parseAction(nextAction);
+  if (!parsed) {
+    logger.warn(`[instruction.runner] Tab-Map: couldn't parse "${nextAction}" — treating as DONE`);
+    return { done: true, ok: true };
+  }
+
+  // 4. Handle DONE
+  if (parsed.action === 'done') {
+    return { done: true, ok: true };
+  }
+
+  // 5. Loop detection: same action 3x consecutively
+  const _lastActions = actionHistory.slice(-2);
+  if (_lastActions.length === 2 && _lastActions[0] === nextAction && _lastActions[1] === nextAction) {
+    logger.warn(`[instruction.runner] Tab-Map: loop detected — same action 3x — stopping session`);
+    return { done: true, ok: false, error: 'Loop detected — same action repeated 3 times' };
+  }
+
+  // 6. Execute the action
+  const result = await _executeTabMapAction(sessionId, parsed, tabMap, overlayActive, pageCategory);
+
+  // 7. Handle lazy re-scan signal
+  if (result.rescan) {
+    logger.info(`[instruction.runner] Tab-Map: element not found — signaling re-scan`);
+    return { done: false, ok: false, error: result.error, rescan: true, action: nextAction };
+  }
+
+  // 8. Track filled fields
+  let filledRef = null, filledLabel = null, filledValue = null;
+  if (parsed.action === 'type' && result.ok && result.pickedRef) {
+    filledRef = result.pickedRef;
+    filledLabel = parsed.target;
+    filledValue = parsed.value;
+  }
+
+  // 9. Check for submit actions
+  let submitVerified = false;
+  if (parsed.action === 'click' && /\b(send|submit|post|publish|create|save)\b/i.test(parsed.target || '')) {
+    const _verify = await _verifySubmitSuccess(sessionId, parsed.target, { url: currentUrl });
+    if (_verify?.ok) {
+      submitVerified = true;
+      return { done: true, ok: true, stateChanged: true, action: nextAction };
+    }
+    logger.warn(`[instruction.runner] Tab-Map: submit verification failed — continuing`);
+  }
+
+  // 10. Check for state change
+  const stateChanged = result.pageChanged;
+
+  return {
+    done: stateChanged, // session ends on state change
+    ok: result.ok,
+    error: result.error,
+    stateChanged,
+    filledRef,
+    filledLabel,
+    filledValue,
+    action: nextAction,
+  };
+}
+
+// ── Main iterative navigation loop (three-tier) ───────────────────────
+// Tier 1: URL-first (already done by caller)
+// Tier 2: Decision call → 0 (DONE), 1 (Just-type), 2 (Meta+F), 3 (Tab-Map)
+// Tier 3: Strategy execution with fallback to Tab-Map
+async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, pageCategory, agentContext, timeoutMs = 120000 }) {
+  if (!sessionId) return { ok: false, error: 'No sessionId provided' };
+  const _pageCategory = pageCategory || 'web_generic';
+  const _urlFirstNav = !!urlFirstNav;
+  logger.info(`[instruction.runner] runIterativeNavigation: goal="${String(goal || '').slice(0, 80)}", pageCategory=${_pageCategory}, sessionId=${sessionId}, urlFirstNav=${_urlFirstNav}`);
+
+  _clearLlmCache(sessionId);
+
+  const startTime = Date.now();
+  const actionHistory = [];
+  let _doneVerifyFails = 0;
+
+  // Tab-Map scan session state
+  let _cachedTabMap = null;
+  let _cachedTabMapUrl = null;
+  let _cachedTabMapOverlayActive = null;
+  const filledFields = [];        // { ref, label, value } — for LLM prompt
+  const consumedRefs = new Set(); // refs of filled fields — for filtering element list
+  let inTabMapSession = false;
+  let overlayActive = false;
+
+  // Initial overlay detection (URL-first might have opened a modal)
+  overlayActive = await _detectOverlay(sessionId);
+  if (overlayActive) {
+    logger.info(`[instruction.runner] Iterative: initial overlay detected — overlayActive=true`);
+  }
+
+  let prevUrl = await _getUrl(sessionId);
+
+  // ── Main loop ──────────────────────────────────────────────────────
+  while (Date.now() - startTime < timeoutMs) {
+    // 1. Read current state
+    const currentUrl = await _getUrl(sessionId);
+    const focused = await _readActiveElement(sessionId);
+    const newOverlayActive = await _detectOverlay(sessionId);
+    const stateChanged = currentUrl !== prevUrl || newOverlayActive !== overlayActive;
+    overlayActive = newOverlayActive;
+
+    // 2. If in Tab-Map session and no state change → continue Tab-Map inner loop
+    if (inTabMapSession && !stateChanged) {
+      const stepResult = await _tabMapInnerStep(
+        sessionId, goal, actionHistory, currentUrl, overlayActive, _pageCategory, agentContext,
+        _cachedTabMap, filledFields, consumedRefs, _doneVerifyFails > 0
+      );
+
+      // Handle re-scan signal (element not found in cached tab-map)
+      if (stepResult.rescan) {
+        logger.info(`[instruction.runner] Tab-Map session: re-scanning (element not found)`);
+        _cachedTabMap = null;
+        // Re-scan and retry this step
+        const skipReset = overlayActive;
+        let freshTabMap = await buildTabMap(sessionId, 150, { skipReset });
+        if (overlayActive && freshTabMap.length < 3) {
+          const backwardMap = await buildTabMap(sessionId, 150, { skipReset: true, backward: true });
+          const existingSigs = new Set(freshTabMap.map(e => _elementSignature(e)));
+          for (const el of backwardMap) {
+            const sig = _elementSignature(el);
+            if (!existingSigs.has(sig)) {
+              freshTabMap.push({ id: freshTabMap.length + 1, ...el });
+              existingSigs.add(sig);
+            }
+          }
+        }
+        _cachedTabMap = freshTabMap;
+        _cachedTabMapUrl = currentUrl;
+        _cachedTabMapOverlayActive = overlayActive;
+        _clearLlmCache(sessionId);
+        // Retry the step with fresh tab-map
+        continue;
+      }
+
+      // Record action in history with result
+      if (stepResult.action) {
+        const _note = stepResult.stateChanged ? '→ page changed' : (stepResult.ok ? '→ ok' : '→ FAILED');
+        actionHistory.push(`${stepResult.action} ${_note}`);
+      }
+
+      // Track filled fields
+      // Only consume form inputs (input/textarea) — contenteditable fields (div role=textbox)
+      // may need multiple type actions (e.g. multi-line block creation in Notion), so they
+      // must stay available in the element list for subsequent steps.
+      if (stepResult.filledRef) {
+        const _entry = _cachedTabMap?.find(e => e.ref === stepResult.filledRef);
+        const _isFormInput = _entry && ['input', 'textarea'].includes(_entry.tag);
+        if (_isFormInput) {
+          consumedRefs.add(stepResult.filledRef);
+        }
+        filledFields.push({ ref: stepResult.filledRef, label: stepResult.filledLabel, value: stepResult.filledValue });
+        logger.info(`[instruction.runner] Tab-Map: filled "${stepResult.filledLabel}" — ${_isFormInput ? 'omitting from next LLM call' : 'keeping available (contenteditable)'} (${filledFields.length} fields filled)`);
+      }
+
+      if (stepResult.done) {
+        // Tab-Map session ended
+        inTabMapSession = false;
+        _cachedTabMap = null;
+
+        if (stepResult.ok && !stepResult.error) {
+          // DONE — verify
+          const _isSubmitGoal = /\b(send|submit|post|publish|create|save)\b/i.test(goal || '');
+          if (_isSubmitGoal && _pageCategory !== 'document_editor') {
+            const _verify = await _verifySubmitSuccess(sessionId, 'submit', { url: currentUrl });
+            if (_verify?.ok) {
+              logger.info(`[instruction.runner] Tab-Map: DONE verified — goal achieved in ${actionHistory.length} steps`);
+              return { ok: true, output: `Goal achieved in ${actionHistory.length} steps`, actionHistory };
+            }
+            _doneVerifyFails++;
+            if (_doneVerifyFails >= 3) {
+              logger.warn(`[instruction.runner] Tab-Map: DONE verification failed 3x — giving up`);
+              return { ok: false, error: 'Could not verify goal completion', actionHistory };
+            }
+            logger.info(`[instruction.runner] Tab-Map: DONE but verification failed (${_doneVerifyFails}/3) — re-deciding`);
+            // Fall through to decision call
+          } else {
+            logger.info(`[instruction.runner] Tab-Map: DONE (non-submit goal) — goal achieved in ${actionHistory.length} steps`);
+            return { ok: true, output: `Goal achieved in ${actionHistory.length} steps`, actionHistory };
+          }
+        } else if (stepResult.stateChanged) {
+          // State changed (e.g., Send clicked, page navigated) — re-decide
+          logger.info(`[instruction.runner] Tab-Map: session ended (state changed) — re-deciding`);
+          prevUrl = currentUrl;
+          // Clear filled fields for new page
+          filledFields.length = 0;
+          consumedRefs.clear();
+          _doneVerifyFails = 0;
+          continue; // re-decide
+        } else if (!stepResult.ok) {
+          // Failed — re-decide
+          logger.warn(`[instruction.runner] Tab-Map: session ended (failed: ${stepResult.error}) — re-deciding`);
+          prevUrl = currentUrl;
+          _doneVerifyFails = 0;
+          continue; // re-decide
+        }
+      }
+
+      // Session continues — no state change
+      prevUrl = currentUrl;
+      _doneVerifyFails = 0;
+      await _sleep(1000);
+      continue;
+    }
+
+    // 3. Not in Tab-Map session (or state changed) → decision call
+    inTabMapSession = false;
+    if (stateChanged) {
+      // Clear Tab-Map session state on state change
+      _cachedTabMap = null;
+      filledFields.length = 0;
+      consumedRefs.clear();
+      _clearLlmCache(sessionId);
+      logger.info(`[instruction.runner] State changed (url=${currentUrl !== prevUrl}, overlay=${newOverlayActive !== overlayActive}) — clearing session state`);
+    }
+
+    const { _decisionCall, _extractValue, _extractSearchText } = require('./browser.agent.cjs');
+    const strategy = await _decisionCall(goal, actionHistory, currentUrl, focused, overlayActive, _pageCategory, agentContext);
+    logger.info(`[instruction.runner] Decision: strategy=${strategy} (0=DONE, 1=Just-type, 2=Meta+F, 3=App Shortcuts, 4=Tab-Map)`);
+
+    // 4. Execute strategy
+
+    if (strategy === 0) {
+      // DONE — verify
+      const _isSubmitGoal = /\b(send|submit|post|publish|create|save)\b/i.test(goal || '');
+      if (_isSubmitGoal && _pageCategory !== 'document_editor') {
+        const _verify = await _verifySubmitSuccess(sessionId, 'submit', { url: currentUrl });
+        if (_verify?.ok) {
+          logger.info(`[instruction.runner] DONE verified — goal achieved in ${actionHistory.length} steps`);
+          return { ok: true, output: `Goal achieved in ${actionHistory.length} steps`, actionHistory };
+        }
+        _doneVerifyFails++;
+        if (_doneVerifyFails >= 3) {
+          logger.warn(`[instruction.runner] DONE verification failed 3x — giving up`);
+          return { ok: false, error: 'Could not verify goal completion', actionHistory };
+        }
+        actionHistory.push('DONE → verification failed');
+        logger.info(`[instruction.runner] DONE but verification failed (${_doneVerifyFails}/3) — continuing`);
+        prevUrl = currentUrl;
+        continue;
+      }
+      logger.info(`[instruction.runner] DONE (non-submit goal) — goal achieved in ${actionHistory.length} steps`);
+      return { ok: true, output: `Goal achieved in ${actionHistory.length} steps`, actionHistory };
+    }
+
+    if (strategy === 1) {
+      // Just-type
+      const value = await _extractValue(goal, focused, actionHistory, agentContext, focused?.currentValue || '');
+      const result = await _executeJustType(sessionId, value, focused, _pageCategory);
+      const _note = result.ok ? '→ ok' : '→ FAILED';
+      actionHistory.push(`Just-type "${value.slice(0, 40)}" ${_note}`);
+
+      if (!result.ok) {
+        // Fallback to Tab-Map
+        logger.info(`[instruction.runner] Just-type failed (${result.error}) — falling back to Tab-Map`);
+        inTabMapSession = true;
+        // Build tab-map on next iteration
+        _cachedTabMap = null;
+        prevUrl = currentUrl;
+        continue;
+      }
+
+      // Just-type succeeded — check for state change
+      const postUrl = await _getUrl(sessionId);
+      const _pageChanged = postUrl !== currentUrl;
+
+      // Stuck detection: if we just typed a real value (not PRESS_ENTER/SKIP),
+      // and the value is still in the field, and the page didn't change,
+      // and it's not ai_chat → force Tab-Map next iteration to move to next field.
+      // This prevents infinite loops on combobox/chip fields (e.g. Gmail To) where
+      // the value stays in the input after Enter (chip confirm) and focus doesn't advance.
+      if (!_pageChanged && _pageCategory !== 'ai_chat' && value && value !== 'PRESS_ENTER' && value !== 'SKIP') {
+        const postFocused = await _readActiveElement(sessionId);
+        const existingVal = (postFocused?.currentValue || '').toLowerCase().trim();
+        const typedVal = value.toLowerCase().trim();
+        if (existingVal && typedVal && existingVal.includes(typedVal)) {
+          logger.info(`[instruction.runner] Just-type: value "${value.slice(0, 30)}" still in field after typing + no page change → forcing Tab-Map`);
+          inTabMapSession = true;
+          _cachedTabMap = null;
+          prevUrl = postUrl;
+          continue;
+        }
+      }
+
+      if (_pageChanged) {
+        _cachedTabMap = null;
+        filledFields.length = 0;
+        consumedRefs.clear();
+      }
+      prevUrl = postUrl;
+      _doneVerifyFails = 0;
+      await _sleep(1500);
+      continue;
+    }
+
+    if (strategy === 2) {
+      // Meta+F
+      const searchText = await _extractSearchText(goal, actionHistory);
+      const result = await _executeMetaF(sessionId, searchText);
+      const _note = result.ok ? '→ found+clicked' : '→ not found';
+      actionHistory.push(`Meta+F "${searchText}" ${_note}`);
+
+      if (!result.ok) {
+        // Fallback to Tab-Map
+        logger.info(`[instruction.runner] Meta+F failed (${result.error}) — falling back to Tab-Map`);
+        inTabMapSession = true;
+        _cachedTabMap = null;
+        prevUrl = currentUrl;
+        continue;
+      }
+
+      // Meta+F succeeded — page likely changed (clicked an element)
+      const postUrl = await _getUrl(sessionId);
+      _cachedTabMap = null;
+      filledFields.length = 0;
+      consumedRefs.clear();
+      prevUrl = postUrl;
+      _doneVerifyFails = 0;
+      await _sleep(1500);
+      continue;
+    }
+
+    if (strategy === 3) {
+      // App Shortcuts — press an app-specific keyboard shortcut
+      const { _extractShortcut } = require('./browser.agent.cjs');
+      const _hostname = (() => { try { return new URL(currentUrl).hostname.replace(/^www\./, ''); } catch (_) { return ''; } })();
+      const shortcutResult = await _extractShortcut(goal, actionHistory, _hostname, agentContext);
+      if (!shortcutResult) {
+        // No shortcut found — fallback to Tab-Map
+        logger.info(`[instruction.runner] Shortcut: no shortcut found — falling back to Tab-Map`);
+        inTabMapSession = true;
+        _cachedTabMap = null;
+        prevUrl = currentUrl;
+        continue;
+      }
+      const result = await _executeShortcut(sessionId, shortcutResult.key);
+      const _note = result.ok ? (result.pageChanged ? '→ page changed' : '→ ok') : '→ FAILED';
+      actionHistory.push(`Shortcut "${shortcutResult.key}" ${_note}`);
+
+      // Record verification outcome (decays confidence on failure, triggers re-research eventually)
+      if (_hostname && shortcutResult.entryId) {
+        try {
+          const { recordVerification } = require('./lib/appKnowledge.cjs');
+          recordVerification(_hostname, shortcutResult.entryId, !!result.ok);
+        } catch (_) {}
+      }
+
+      if (!result.ok) {
+        // Fallback to Tab-Map
+        logger.info(`[instruction.runner] Shortcut failed (${result.error}) — falling back to Tab-Map`);
+        inTabMapSession = true;
+        _cachedTabMap = null;
+        prevUrl = currentUrl;
+        continue;
+      }
+
+      // Shortcut succeeded — check for state change
+      const postUrl = await _getUrl(sessionId);
+      if (postUrl !== currentUrl) {
+        _cachedTabMap = null;
+        filledFields.length = 0;
+        consumedRefs.clear();
+      }
+      prevUrl = postUrl;
+      _doneVerifyFails = 0;
+      await _sleep(1000);
+      continue;
+    }
+
+    if (strategy === 4) {
+      // Tab-Map — enter scan session
+      inTabMapSession = true;
+
+      // Build tab-map if not cached or cache invalidated
+      if (!_cachedTabMap || _cachedTabMapOverlayActive !== overlayActive || _cachedTabMapUrl !== currentUrl) {
+        const skipReset = overlayActive;
+        logger.info(`[instruction.runner] Tab-Map: building fresh tab-map (overlayActive=${overlayActive})`);
+        let tabMap = await buildTabMap(sessionId, 150, { skipReset });
+
+        // Backward scan if forward scan found very few elements in an overlay
+        if (overlayActive && tabMap.length < 3) {
+          logger.info(`[instruction.runner] Tab-Map: forward scan found only ${tabMap.length} elements — doing backward scan`);
+          const backwardMap = await buildTabMap(sessionId, 150, { skipReset: true, backward: true });
+          const existingSigs = new Set(tabMap.map(e => _elementSignature(e)));
+          for (const el of backwardMap) {
+            const sig = _elementSignature(el);
+            if (!existingSigs.has(sig)) {
+              tabMap.push({ id: tabMap.length + 1, ...el });
+              existingSigs.add(sig);
+            }
+          }
+          logger.info(`[instruction.runner] Tab-Map: merged backward scan: ${tabMap.length} total elements`);
+        }
+
+        _cachedTabMap = tabMap;
+        _cachedTabMapUrl = currentUrl;
+        _cachedTabMapOverlayActive = overlayActive;
+        _clearLlmCache(sessionId);
+        logger.info(`[instruction.runner] Tab-Map: built fresh tab-map (${tabMap.length} elements) — cached for session`);
+      } else {
+        logger.info(`[instruction.runner] Tab-Map: using cached tab-map (${_cachedTabMap.length} elements)`);
+      }
+
+      prevUrl = currentUrl;
+      _doneVerifyFails = 0;
+      continue; // next iteration will run _tabMapInnerStep
+    }
+
+    // Unknown strategy — default to Tab-Map (4)
+    logger.warn(`[instruction.runner] Unknown strategy ${strategy} — defaulting to Tab-Map (4)`);
+    inTabMapSession = true;
+    _cachedTabMap = null;
+    prevUrl = currentUrl;
+  }
+
+  // Timeout reached
+  logger.warn(`[instruction.runner] Iterative: timeout after ${actionHistory.length} steps`);
+  return { ok: false, error: `Timeout after ${actionHistory.length} steps`, actionHistory };
+}
+
+// ---------------------------------------------------------------------------
 // Exports
 // ---------------------------------------------------------------------------
 
 module.exports = {
   runInstructionSkill,
+  runIterativeNavigation,
   parseInstructions,
   parseStep,
   // Keyboard helpers (exported for playwright.agent.cjs compatibility)
   _readActiveElement,
   _pressEscape,
   _llmMatchFocusedItem,
+  // Three-tier iterative navigation helpers
+  _parseAction,
+  _executeJustType,
+  _executeMetaF,
+  _tabMapInnerStep,
 };

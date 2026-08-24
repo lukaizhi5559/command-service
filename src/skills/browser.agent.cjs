@@ -255,11 +255,428 @@ function getContentExtractionConfig(hostname) {
   return map?.content_extraction || null;
 }
 
+// ---------------------------------------------------------------------------
+// Tab-Map helper: Convert a free-text task into instruction.runner-format
+// text instructions via a single LLM call. The browser is already on the
+// target page (URL-first navigation done), so no Navigate step is emitted
+// unless the task explicitly requires a different URL.
+// instruction.runner's tab-map scan discovers the real elements at runtime
+// and the LLM pick matches them — so exact button labels don't need to be
+// perfect, just close enough for fuzzy matching.
+// ---------------------------------------------------------------------------
+async function _convertGoalToInstructions(task, startUrl, agentContext, hostname) {
+  if (!task || typeof task !== 'string') return null;
+
+  const { askWithMessages } = require('../skill-helpers/skill-llm.cjs');
+
+  const _contextBlock = agentContext
+    ? `\n\nAgent context (service descriptor / playbook — use these labels if relevant):\n${String(agentContext).slice(0, 2000)}`
+    : '';
+  const _urlBlock = startUrl ? `\n\nCurrent page URL: ${startUrl}` : '';
+  const _hostBlock = hostname ? `\nService hostname: ${hostname}` : '';
+
+  const systemPrompt = `You convert a browser automation task into step-by-step keyboard navigation instructions.
+The browser has ALREADY navigated to the target URL (URL-first navigation is done).
+Look at the "Current page URL" below — if it contains an action hash or path like
+"#inbox?compose=new", "/new", "/create", "?action=edit", the action is ALREADY TRIGGERED.
+A modal/dialog/popup/dropdown may be open on screen with fields ready to fill.
+Do NOT click a button to open it — that would dismiss the existing overlay.
+Start directly with typing into the fields.
+
+The task text may say "Compose a new email" or "Create a new document" — this describes
+the GOAL, not a button to click. If the URL already triggered this action, skip the click.
+
+Output ONLY instructions, one per line. No preamble, no explanation, no numbering, no markdown.
+
+Instruction formats (use EXACTLY these verb forms):
+  Click "button text"
+  Type "value" into the "field label" field
+  Press Enter
+  Press Tab
+  Press Escape
+  Navigate to https://url
+
+Rules:
+- CRITICAL: Use ONLY these verb forms — Click, Type, Press Enter, Press Tab, Press Escape, Navigate. Do NOT use "Fill", "Enter text", "Input", "Select text", or any other verb.
+- CRITICAL: NEVER use CSS selectors (div[...], input[...], [aria-label=...], [gh=...]). Use ONLY the visible text/label of buttons and fields as they appear on the page. The system finds elements by their visible text, NOT by CSS selectors.
+- Look at the Current page URL. If it already contains the action (e.g. compose=new, /new, /create, ?action=edit), the action window is ALREADY OPEN — do NOT add a click step to open it. Start directly with Type steps.
+- The task text may say "Compose a new email" or "Create a new document" — this describes the GOAL, not a button to click. If the URL already triggered this action, skip the click.
+- The browser is ALREADY on the target page (URL-first navigation done). Do NOT add a Navigate step unless the task explicitly requires going to a different URL than the current one.
+- Use the EXACT text/label of buttons and fields as they appear on the page. If unsure, use the most likely label based on the service.
+- Extract values to type from the task text (quoted strings, names, search queries, message bodies).
+- Keep it minimal — only the steps needed to accomplish the task, in order.
+- For dropdowns/menus: Click the trigger button, then Click the menu item.
+- End with Press Enter or Click "Submit"/"Send"/"Save" if the action requires confirmation.
+- If the task is a read/extract task (search, list, read), end with the navigation to results — no extract step needed.
+- Do NOT wrap values in {{param}} — use the literal value from the task.
+- CHIP / TOKEN FIELDS (email To, Recipients, CC, BCC, Gmail, Outlook, any recipient input): After every "Type \\"...\\" into the \\"To/Recipients/CC/BCC\\" field" step, you MUST add a separate "Press Enter" step to confirm the chip/token. If the address is still in the input after one Enter, add another "Press Enter" step before continuing to Subject.
+- AI CHAT SUBMIT (ChatGPT, Claude, Gemini, Grok, Perplexity): After "Type \\"...\\" into the \\"message\\" field", add "Press Enter" to submit the prompt. The system waits for the streamed response automatically.
+- LIST ITEM CREATION (Notion todos, checklist items): After typing each item, add "Press Enter" to create the next item.
+- Use the literal field labels shown by the page — for Gmail compose use "To" or "Recipients", not the generic search box.
+- For Gmail compose: the recipient field label is "To", the subject field label is "Subject", the body field label is "Message Body", the send button text is "Send", the compose button text is "Compose".`;
+
+  try {
+    const raw = await askWithMessages([
+      { role: 'system', content: systemPrompt },
+      { role: 'user', content: `Task: ${task}${_urlBlock}${_hostBlock}${_contextBlock}` },
+    ], { maxTokens: 600, temperature: 0.1, responseTimeoutMs: 15000 });
+
+    const text = (raw || '').trim();
+    if (!text) {
+      logger.warn(`[browser.agent] tab-map: task→instructions LLM returned empty`);
+      return null;
+    }
+    const cleaned = text.replace(/^```(?:text|plaintext)?\s*\n?/i, '').replace(/\n?```\s*$/, '').trim();
+    logger.info(`[browser.agent] tab-map: converted task to instructions:\n${cleaned.split('\n').map(l => '  ' + l).join('\n')}`);
+    return cleaned;
+  } catch (e) {
+    logger.warn(`[browser.agent] tab-map: task→instructions LLM failed: ${e.message}`);
+    return null;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Three-tier iterative navigation: decision call + strategies
+// ---------------------------------------------------------------------------
+// Tier 2: Decision call — LLM returns 0 (DONE), 1 (Just-type), 2 (Meta+F), 3 (Tab-Map)
+// Tier 3: Strategy execution with fallback to Tab-Map
+
+// Decision call: returns 0, 1, 2, or 3 based on page state and goal.
+async function _decisionCall(goal, actionHistory, currentUrl, focusedElement, overlayActive, pageCategory, agentContext) {
+  const { askWithMessages } = require('../skill-helpers/skill-llm.cjs');
+
+  const _contextBlock = agentContext
+    ? `\n\nAgent context (service descriptor / playbook — use these labels if relevant):\n${String(agentContext).slice(0, 1000)}`
+    : '';
+
+  const _focusedStr = focusedElement
+    ? `${focusedElement.tag} "${(focusedElement.text || focusedElement.ariaLabel || '').slice(0, 60)}" role=${focusedElement.role || 'none'}`
+    : 'none (body/no focus)';
+
+  const _isFillable = focusedElement
+    ? (['input', 'textarea'].includes(focusedElement.tag) ||
+       ['combobox', 'textbox'].includes(focusedElement.role))
+    : false;
+
+  const systemPrompt = `You decide the next navigation strategy for a browser automation task.
+Look at the goal, what's been done, and the current page state.
+Return ONLY a single number — nothing else:
+  0 = DONE (goal achieved)
+  1 = Just-type (focused element is the right field, just type into it)
+  2 = Meta+F search (find specific text on the page, then click it)
+  3 = App Shortcuts (press an app-specific keyboard shortcut from Agent context)
+  4 = Tab-Map scan (scan all elements, pick one to interact with)
+
+Decision rules:
+- If the focused element is a fillable input AND the goal requires typing into it → return 1
+- If the Agent context contains app shortcuts that match the next sub-goal (e.g. "c" for create event in Calendar, "Cmd+K" for search in Slack/Spotify) → return 3
+- Prefer 3 (shortcuts) over 4 (Tab-Map) when a shortcut directly accomplishes the next sub-goal — shortcuts are faster
+- If the goal requires finding a specific item on the page (conversation name, email subject, menu item, list entry) → return 2
+- If the goal requires interacting with multiple elements (form filling, toolbar buttons, multi-field modal) → return 4
+- If the goal requires creating blocks/list items/headings in a block-based editor (Notion, Google Docs) → return 4 (needs multi-step slash command sequences)
+- If everything in the goal has been accomplished (see action history) → return 0
+- If a modal/dialog is open with multiple fields to fill → return 4
+- If the page just loaded and you're not sure what's available → return 4
+- Check the Agent context for app-specific patterns (shortcuts, slash commands, UI quirks) that might affect the strategy choice
+- When in doubt → return 4`;
+
+  const historyStr = actionHistory.length > 0
+    ? actionHistory.slice(-10).map((a, i) => `  ${i + 1}. ${a}`).join('\n')
+    : '  (none)';
+
+  const userPrompt = `Goal: ${goal}
+Current URL: ${currentUrl}
+Page category: ${pageCategory || 'unknown'}
+Focused element: ${_focusedStr} (fillable: ${_isFillable ? 'yes' : 'no'})
+Overlay/modal active: ${overlayActive ? 'yes' : 'no'}
+Actions taken so far:
+${historyStr}${_contextBlock}
+
+Strategy? (0, 1, 2, or 3)`;
+
+  try {
+    const raw = await askWithMessages([
+      { role: 'system', content: systemPrompt },
+      { role: 'user', content: userPrompt },
+    ], { maxTokens: 10, temperature: 0.1, responseTimeoutMs: 10000 });
+    const num = parseInt((raw || '').trim().replace(/\D/g, ''), 10);
+    const result = [0, 1, 2, 3].includes(num) ? num : 3;
+    logger.info(`[browser.agent] _decisionCall: strategy=${result} (raw="${(raw || '').trim()}")`);
+    return result;
+  } catch (e) {
+    logger.warn(`[browser.agent] _decisionCall failed: ${e.message} — defaulting to 3 (Tab-Map)`);
+    return 3;
+  }
+}
+
+// Value extraction: what to type into the focused field.
+// Returns the value, "PRESS_ENTER", or "SKIP".
+async function _extractValue(goal, focusedElement, actionHistory, agentContext, currentValue = '') {
+  const { askWithMessages } = require('../skill-helpers/skill-llm.cjs');
+
+  const _contextBlock = agentContext
+    ? `\n\nAgent context (service descriptor / playbook — use these labels if relevant):\n${String(agentContext).slice(0, 1000)}`
+    : '';
+
+  const _focusedStr = focusedElement
+    ? `${focusedElement.tag} label="${(focusedElement.text || focusedElement.ariaLabel || '').slice(0, 60)}" placeholder="${(focusedElement.placeholder || '').slice(0, 60)}"`
+    : 'unknown';
+
+  const systemPrompt = `You extract the value to type into a focused field on a web page.
+Look at the goal and what's been done. Return ONLY the value to type — nothing else.
+- If the field already contains the exact value needed, return PRESS_ENTER (if Enter confirms/submits) or SKIP (if no action needed)
+- Do NOT return the same value that's already in the field — either return PRESS_ENTER, SKIP, or a different value
+- If this isn't the right field to type into (wrong field for this goal) → return SKIP
+- Otherwise return the exact value to type (no quotes, no explanation)
+- Extract values from the goal text (quoted strings, names, search queries, message bodies)
+- If the goal requires creating a block (heading, todo, bullet) in a block-based editor, return the block-creation shortcut (e.g. "/h1", "/todo", "[]") — NOT the final text. The system will type the shortcut, press Enter, then ask again for the block text.
+- For block-based editors (Notion, Google Docs): if the goal requires creating multiple blocks (list items, todos, headings), return ALL blocks as a single multi-line value with \\n between each block. Include block-creation shortcuts (e.g. "[] " for todo, "- " for bullet) at the start of each line.
+- Example: for "add a todo list with: Read John 3, Memorize Psalm 23, Pray for family" → return "[] Read John 3\\n[] Memorize Psalm 23\\n[] Pray for family"
+- Check the Agent context for the app's specific block-creation shortcuts and patterns.`;
+
+  const historyStr = actionHistory.slice(-5).map((a, i) => `  ${i + 1}. ${a}`).join('\n');
+
+  const userPrompt = `Goal: ${goal}
+Focused field: ${_focusedStr}
+Current field value: "${(currentValue || '').slice(0, 80)}"
+Actions taken:
+${historyStr}${_contextBlock}
+
+Value to type?`;
+
+  try {
+    const raw = await askWithMessages([
+      { role: 'system', content: systemPrompt },
+      { role: 'user', content: userPrompt },
+    ], { maxTokens: 300, temperature: 0.1, responseTimeoutMs: 10000 });
+    const val = (raw || '').trim().replace(/^```(?:text|plaintext)?\s*\n?/i, '').replace(/\n?```\s*$/, '').trim();
+    logger.info(`[browser.agent] _extractValue: "${val.slice(0, 60)}" for field "${_focusedStr}"`);
+    return val;
+  } catch (e) {
+    logger.warn(`[browser.agent] _extractValue failed: ${e.message}`);
+    return 'SKIP';
+  }
+}
+
+// Search text extraction: what text to search for via Meta+F.
+async function _extractSearchText(goal, actionHistory) {
+  const { askWithMessages } = require('../skill-helpers/skill-llm.cjs');
+
+  const systemPrompt = `You extract the text to search for on a web page using browser find (Ctrl+F).
+The search will find and focus the element containing this text, then click it.
+Look at the goal and what's been done. Return ONLY the search text — nothing else.
+- Return a short, distinctive text snippet that would appear on the page (conversation name, email subject, menu item text)
+- Do NOT include quotes unless they are part of the actual text
+- Keep it concise (2-6 words typically)`;
+
+  const historyStr = actionHistory.slice(-5).map((a, i) => `  ${i + 1}. ${a}`).join('\n');
+
+  const userPrompt = `Goal: ${goal}
+Actions taken:
+${historyStr}
+
+Search text?`;
+
+  try {
+    const raw = await askWithMessages([
+      { role: 'system', content: systemPrompt },
+      { role: 'user', content: userPrompt },
+    ], { maxTokens: 100, temperature: 0.1, responseTimeoutMs: 10000 });
+    const val = (raw || '').trim().replace(/^["']|["']$/g, '').replace(/^```(?:text|plaintext)?\s*\n?/i, '').replace(/\n?```\s*$/, '').trim();
+    logger.info(`[browser.agent] _extractSearchText: "${val}" for goal "${String(goal).slice(0, 50)}"`);
+    return val;
+  } catch (e) {
+    logger.warn(`[browser.agent] _extractSearchText failed: ${e.message}`);
+    return '';
+  }
+}
+
+// Shortcut selection: pick the best keyboard shortcut from appKnowledge.
+// LLM sees a numbered list of natural-language descriptions (no key combos),
+// returns just a number. Number maps to index in shortcuts array for the
+// actual key combo. Returns key combo string or null.
+async function _extractShortcut(goal, actionHistory, hostname, agentContext) {
+  const { askWithMessages } = require('../skill-helpers/skill-llm.cjs');
+  const { loadAppKnowledge } = require('./lib/appKnowledge.cjs');
+
+  // Load shortcut entries from appKnowledge
+  const entries = loadAppKnowledge(hostname);
+  const shortcuts = entries.filter(e => e.type === 'shortcut' && e.details?.shortcut);
+
+  if (shortcuts.length === 0) {
+    logger.info(`[browser.agent] _extractShortcut: no shortcuts in appKnowledge for ${hostname}`);
+    return null;
+  }
+
+  // Build numbered list with natural-language descriptions ONLY (no key combos)
+  const shortcutList = shortcuts.map((s, i) => {
+    // Extract action description from summary (remove "Press X to " prefix)
+    const action = s.summary
+      .replace(/^.*?\bto\s+/i, '')
+      .replace(/\.$/, '')
+      .slice(0, 80);
+    return `${i + 1}. ${action}`;
+  }).join('\n');
+
+  const systemPrompt = `You pick the best keyboard shortcut to press for the current goal.
+Look at the goal, what's been done, and the available shortcuts.
+Return ONLY a number — nothing else.
+- Pick the shortcut that directly accomplishes the next sub-goal
+- Do NOT pick shortcuts for actions already done (see action history)
+- If no shortcut matches the goal → return 0`;
+
+  const historyStr = actionHistory.slice(-5).map((a, i) => `  ${i + 1}. ${a}`).join('\n');
+
+  const userPrompt = `Goal: ${goal}
+Actions taken:
+${historyStr}
+
+Available app shortcuts:
+${shortcutList}
+
+Which shortcut? (return number or 0 for none)`;
+
+  try {
+    const raw = await askWithMessages([
+      { role: 'system', content: systemPrompt },
+      { role: 'user', content: userPrompt },
+    ], { maxTokens: 10, temperature: 0.1, responseTimeoutMs: 10000 });
+    const val = (raw || '').trim();
+    const num = parseInt(val);
+    logger.info(`[browser.agent] _extractShortcut: LLM picked "${val}" (parsed: ${num}) from ${shortcuts.length} shortcuts`);
+    if (!num || num < 1 || num > shortcuts.length) return null;
+    const picked = shortcuts[num - 1];
+    logger.info(`[browser.agent] _extractShortcut: → "${picked.details.shortcut}" (${picked.summary.slice(0, 60)})`);
+    return { key: picked.details.shortcut, entryId: picked.id };
+  } catch (e) {
+    logger.warn(`[browser.agent] _extractShortcut failed: ${e.message}`);
+    return null;
+  }
+}
+
+// Tab-Map strategy: LLM decides one action per step based on available elements.
+// Updated with [FILLABLE]/[CLICKABLE] markers, filled field tracking, and label fixes.
+async function _llmNextAction(goal, currentUrl, tabMap, actionHistory, pageCategory, agentContext, lastVerifyFailed, consumedRefs, filledFields) {
+  const { askWithMessages } = require('../skill-helpers/skill-llm.cjs');
+
+  const _contextBlock = agentContext
+    ? `\n\nAgent context (service descriptor / playbook — use these labels if relevant):\n${String(agentContext).slice(0, 1500)}`
+    : '';
+
+  // Filter out consumed (already-filled) elements
+  const availableElements = (tabMap || []).filter(e => !consumedRefs || !consumedRefs.has(e.ref));
+
+  // Build element list with [FILLABLE]/[CLICKABLE] markers
+  const elementList = availableElements.map(e => {
+    const _tag = e.tag || '';
+    const _role = e.role || '';
+    const _isFillable = ['input', 'textarea'].includes(_tag) ||
+                        _role === 'combobox' || _role === 'textbox';
+    const _marker = _isFillable ? '[FILLABLE]' : '[CLICKABLE]';
+    return `${e.id} - ${_tag} "${e.text || e.ariaLabel || ''}" ${_role ? `role=${_role} ` : ''}${_marker}`;
+  }).join('\n');
+
+  // Build "Fields already filled" section
+  const filledStr = (filledFields && filledFields.length > 0)
+    ? filledFields.map(f => `  ${f.label}: ${String(f.value).slice(0, 60)}`).join('\n')
+    : '  (none)';
+
+  const historyStr = actionHistory.length > 0
+    ? actionHistory.slice(-10).map((a, i) => `  ${i + 1}. ${a}`).join('\n')
+    : '  (none)';
+
+  const verifyNote = lastVerifyFailed
+    ? '\n\nNOTE: You previously said DONE but verification failed — the goal is NOT yet achieved. Try another action.'
+    : '';
+
+  const systemPrompt = `You are navigating a web page to achieve a goal.
+Look at the goal, the current URL, the actions you've already taken, the fields already filled, and the available elements.
+Decide the SINGLE next action that gets closest to achieving the goal.
+
+Output ONLY one action, one line. No preamble, no explanation, no numbering, no markdown.
+
+Action formats (use EXACTLY these verb forms):
+  Click "button text"
+  Type "value" into the "field label" field
+  Press Enter
+  Press Tab
+  Press Escape
+  Navigate to https://url
+  DONE
+
+Rules:
+- Use ONLY these verb forms — Click, Type, Press Enter, Press Tab, Press Escape, Navigate, DONE.
+- Use the EXACT text/label of elements as shown in the available elements list.
+- Use Type for [FILLABLE] elements and Click for [CLICKABLE] elements. Do NOT click a [FILLABLE] field — type into it directly.
+- Fields already filled are OMITTED from the available elements list. Do NOT try to fill them again.
+- If the goal is already achieved (form submitted, email sent, search results shown), output DONE.
+- If no available element gets closer to the goal, output DONE.
+- For chip/token fields (email To, Recipients, CC, BCC): after Type, the system auto-confirms with Enter. Do NOT add a separate Press Enter for chip confirmation.
+- For AI chat (ChatGPT, Claude, etc.): after typing the prompt, add Press Enter to submit.
+- Extract values to type from the goal text (quoted strings, names, search queries, message bodies).
+- If the current URL already has the action triggered (compose=new, /new, /create), start with Type steps directly.
+- If a modal/dialog is open (elements like "To", "Subject", "Body", "Send" are visible), work within it.
+- Do NOT repeat actions you've already taken (see action history). Try a different approach.
+- If you've already clicked an element and the page didn't change (see action results), try a different action.
+- For Gmail compose: the recipient field label is "To recipients" (shown as "To" in the UI), the subject field label is "Subject", the body field label is "Message Body", the send button text is "Send".
+- APP KNOWLEDGE RULE: Check the Agent context below for app-specific patterns — slash commands, block creation shortcuts, UI quirks, keyboard shortcuts. Use them when the goal requires app-specific interactions.
+- BLOCK-CREATION RULE: When creating lists/todos/headings in block-based editors (Notion, Google Docs), do NOT type raw markdown. Create each block as a separate step: (1) Type the block-creation shortcut (e.g. "/todo" or "[]" + Space — check Agent context for the app's specific shortcuts), (2) Press Enter if a slash menu appeared, (3) Type the item text, (4) Press Enter to create the next block. Repeat for each item.
+- SEARCH-THEN-CLICK RULE: When clicking search results, skip ads/sponsored results — click the first ORGANIC result.`;
+
+  const userPrompt = `Goal: ${goal}
+Current URL: ${currentUrl}
+Page category: ${pageCategory || 'unknown'}
+Actions taken so far:
+${historyStr}
+Fields already filled:
+${filledStr}${verifyNote}${_contextBlock}
+
+Available elements on the current page:
+${elementList}
+
+What is the next action?`;
+
+  try {
+    const raw = await askWithMessages([
+      { role: 'system', content: systemPrompt },
+      { role: 'user', content: userPrompt },
+    ], { maxTokens: 100, temperature: 0.1, responseTimeoutMs: 15000 });
+    return (raw || '').trim().replace(/^```(?:text|plaintext)?\s*\n?/i, '').replace(/\n?```\s*$/, '').trim();
+  } catch (e) {
+    logger.warn(`[browser.agent] _llmNextAction failed: ${e.message}`);
+    return null;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Fire-and-forget progress event POST to _progressCallbackUrl
+// Same pattern as playwright.agent.cjs postProgress (line 1913)
+// ---------------------------------------------------------------------------
+function _postProgress(callbackUrl, evt) {
+  if (!callbackUrl) return;
+  try {
+    const http = require('http');
+    const payload = JSON.stringify(evt);
+    const parsed = new URL(callbackUrl);
+    const req = http.request({
+      hostname: parsed.hostname,
+      port:     parseInt(parsed.port, 10),
+      path:     parsed.pathname,
+      method:   'POST',
+      headers:  { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) },
+      timeout:  2000,
+    });
+    req.on('error', () => {});
+    req.write(payload);
+    req.end();
+  } catch (_) {}
+}
+
 const { userAgent } = require('./user.agent.cjs');
 
 const { resolveDestination, recordCorrection, classifyTaskIntent, classifyUrlType, getLearnedCorrection, deleteLearnedCorrection, suggestTaskUrl, getTaskKeywords, getCachedDeepLink, recordDeepLinkCache, deleteDeepLinkCache, getSearchUrlPattern, recordSearchUrlPattern, INTENTS, SERVICE_CHAT_URLS, isAuthFlowUrl } = require('../skill-helpers/destination-resolver.cjs');
 const { killExistingChromeForProfile, clearProfileLock, findCli, shortSessionId, _sniffAuthCookies, engine: browserEngine } = require('./browser.act.cjs');
-const { loadAppKnowledge, saveAppKnowledge, loadAndFormat, isCacheStale, recordVerification } = require('./lib/appKnowledge.cjs');
+const { loadAppKnowledge, saveAppKnowledge, loadAndFormat, isCacheStale, isShortcutCoverageStale, recordVerification } = require('./lib/appKnowledge.cjs');
 
 const BROWSER_ACT_PORT = parseInt(process.env.COMMAND_SERVICE_PORT || '3007', 10);
 
@@ -4155,8 +4572,12 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
     if (_appKnowledgeHost) {
       const _cachedEntries = loadAppKnowledge(_appKnowledgeHost);
       // Use isCacheStale to detect worthless caches (all low-confidence snippet-based entries).
-      // This triggers re-research when LLM synthesis previously failed and fell back to snippets.
-      if (_cachedEntries.length > 0 && !isCacheStale(_appKnowledgeHost)) {
+      // Use isShortcutCoverageStale to detect sparse shortcut data (e.g. twitter.com with
+      // 1 wrong Slack shortcut that never gets re-researched because isCacheStale sees one
+      // high-confidence entry and returns false).
+      const _cacheStale = isCacheStale(_appKnowledgeHost);
+      const _shortcutStale = isShortcutCoverageStale(_appKnowledgeHost);
+      if (_cachedEntries.length > 0 && !_cacheStale && !_shortcutStale) {
         _appKnowledgeEntries = _cachedEntries;
         logger.info(`[browser.agent] app-knowledge: loaded ${_cachedEntries.length} cached entries for ${_appKnowledgeHost}`);
       } else {
@@ -4169,7 +4590,9 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
           query: _akQuery,
           maxResults: 4,
         }).catch(() => null);
-        const _staleReason = _cachedEntries.length > 0 ? 'stale (all low-confidence snippet entries)' : 'empty';
+        const _staleReason = _cacheStale
+          ? 'stale (all low-confidence snippet entries)'
+          : (_shortcutStale ? 'stale (sparse shortcut coverage — < 5 shortcuts and older than 7 days)' : 'empty');
         logger.info(`[browser.agent] app-knowledge: cache ${_staleReason} for ${_appKnowledgeHost} — research started in parallel with auth check`);
       }
     }
@@ -5381,6 +5804,52 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
           logger.info(`[browser.agent] run: URL-first enforcement — already on canonical URL ${_curUrl} (startUrl=${startUrl}) — skipping re-navigation for ${agentId}`);
           _postEnforcementUrl = _curUrl;
         }
+      } else {
+        // Engine is not active (closed after auth) — navigate to startUrl
+        // which will re-launch the engine via _ensureEngine.
+        // Without this, URL-first sets the flag but never navigates, leaving
+        // tab-map and playwright.agent fallthrough with no browser open.
+        logger.info(`[browser.agent] run: URL-first enforcement — engine not active (no current URL), navigating to ${startUrl} for ${agentId}`);
+        const _enforceNav = await callBrowserAct({ action: 'navigate', sessionId, url: startUrl, timeoutMs: 30000 }, 35000);
+        if (_enforceNav?.ok !== false) {
+          // Wait for SPA hydration (up to 6s, 3 × 2s polls)
+          let _hydrated = false;
+          for (let _poll = 0; _poll < 3; _poll++) {
+            await new Promise(r => setTimeout(r, 2000));
+            const _pollTextRes = await callBrowserAct({ action: 'evaluate', text: '(document.body && document.body.innerText ? document.body.innerText.length : 0)', sessionId, timeoutMs: 5000 }, 8000).catch(() => ({ ok: false }));
+            const _pollTextLen = _pollTextRes?.ok ? Number(_pollTextRes.result) : 0;
+            if (_pollTextLen > 50) { _hydrated = true; break; }
+          }
+          logger.info(`[browser.agent] run: URL-first enforcement — navigation complete${_hydrated ? ' (SPA hydrated)' : ' (hydration uncertain)'} for ${agentId}`);
+
+          // Gmail compose dialog readiness check (same as _curUrl branch)
+          const _isGmailComposeUrl = /mail\.google\.com.*compose=new/.test(startUrl);
+          if (_isGmailComposeUrl) {
+            const _composeCheckExpr = "(!!(document.querySelector('div[role=dialog] [contenteditable], div[role=dialog] [role=textbox], div[role=dialog] textarea, div[role=dialog] input[name=to], textarea[name=to]') || document.querySelector('div[role=dialog] form')))";
+            let _composeReady = false;
+            for (let _cPoll = 0; _cPoll < 5; _cPoll++) {
+              const _composeRes = await callBrowserAct({ action: 'evaluate', text: _composeCheckExpr, sessionId, timeoutMs: 5000 }, 8000).catch(() => ({ ok: false }));
+              if (_composeRes?.ok && (_composeRes.result === true || _composeRes.result === 'true')) {
+                _composeReady = true;
+                break;
+              }
+              await new Promise(r => setTimeout(r, 1000));
+            }
+            if (!_composeReady) {
+              logger.warn(`[browser.agent] run: URL-first enforcement — Gmail compose dialog not detected after navigation, retrying once for ${agentId}`);
+              await callBrowserAct({ action: 'navigate', sessionId, url: startUrl, timeoutMs: 30000 }, 35000).catch(() => {});
+              await new Promise(r => setTimeout(r, 3000));
+              const _retryRes = await callBrowserAct({ action: 'evaluate', text: _composeCheckExpr, sessionId, timeoutMs: 5000 }, 8000).catch(() => ({ ok: false }));
+              _composeReady = _retryRes?.ok && (_retryRes.result === true || _retryRes.result === 'true');
+            }
+            logger.info(`[browser.agent] run: URL-first enforcement — Gmail compose dialog ${_composeReady ? 'ready' : 'NOT detected (proceeding anyway)'} for ${agentId}`);
+          }
+
+          _postEnforcementUrl = startUrl;
+        } else {
+          logger.warn(`[browser.agent] run: URL-first enforcement — navigation to ${startUrl} failed for ${agentId}`);
+          _postEnforcementUrl = startUrl;
+        }
       }
     } catch (_enforceErr) {
       logger.warn(`[browser.agent] run: URL-first enforcement error (non-fatal): ${_enforceErr.message}`);
@@ -5428,6 +5897,16 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
       await _discoverSearchSyntax(_svcKey, _searchSyntaxHost, task);
     }
   }
+
+  // Emit tier progress: URL-first navigation complete
+  _postProgress(_progressCallbackUrl, {
+    type: 'agent:tier',
+    stepIndex: _stepIndex ?? 0,
+    tier: 'url-first',
+    message: `URL-first: navigated to ${startUrl}`,
+    agentId,
+    sessionId,
+  });
 
   // Phase 5: Recipe replay and URL-first navigation are no longer mutually exclusive.
   // URL-first provides the initial URL; recipe replay can still run for non-navigation
@@ -6889,6 +7368,92 @@ When extracting page content with run-code, prioritize these selectors over gene
     _agentContext = (_agentContext + _provenanceNote).slice(0, 5800);
     logger.info(`[browser.agent] run: injected deep-link provenance for ${agentId} (source=${_provenanceSource})`);
   }
+
+  // ── Tab-Map: prompt → instructions → instruction.runner ────────────────────
+  // After URL-first navigation + auth, convert the task into instruction.runner-
+  // format text instructions via LLM, then execute via runInstructionSkill
+  // (tab-map scan + LLM pick + Playwright click). This is a peer to URL-first:
+  // deterministic keyboard navigation instead of LLM-per-action turn-loop.
+  // Gated behind THINKDROP_PROMPT_TABMAP=true for A/B testing.
+  // Falls through to playwright.agent on failure.
+  if (process.env.THINKDROP_PROMPT_TABMAP === 'true' && !_recipeExecutedOk) {
+    try {
+      const _tabMapHostname = (() => {
+        try { return new URL(startUrl).hostname.replace(/^www\./, ''); }
+        catch (_) { return null; }
+      })();
+
+      // Emit tier progress: tab-map starting
+      _postProgress(_progressCallbackUrl, {
+        type: 'agent:tier',
+        stepIndex: _stepIndex ?? 0,
+        tier: 'tab-map',
+        message: `Tab-map: three-tier iterative navigation`,
+        agentId,
+        sessionId,
+      });
+
+      // Fail-fast: verify engine is active before proceeding with tab-map.
+      // URL-first enforcement should have navigated and re-launched the engine.
+      // If it didn't (or failed), don't waste time on 50+ key presses that will
+      // all fail — fall through to playwright.agent which has its own engine launch.
+      const _engineCheckRes = await callBrowserAct({ action: 'evaluate', text: 'document.readyState', sessionId, timeoutMs: 5000 }, 8000).catch(() => ({ ok: false }));
+      if (!_engineCheckRes?.ok) {
+        logger.warn(`[browser.agent] tab-map: engine not active (evaluate failed) — skipping tab-map, falling through to playwright.agent`);
+        throw new Error('tab-map skipped: engine not active');
+      }
+      logger.info(`[browser.agent] tab-map: engine active (readyState=${_engineCheckRes.result}) — proceeding`);
+
+      // ── Three-tier iterative navigation ──────────────────────────────
+      // Tier 1: URL-first (already done above)
+      // Tier 2: Decision call → 0 (DONE), 1 (Just-type), 2 (Meta+F), 3 (Tab-Map)
+      // Tier 3: Strategy execution with fallback to Tab-Map
+      const _pageCategory = _inferPageCategory(_svcKey, startUrl, task, _appKnowledgeEntries);
+      logger.info(`[browser.agent] tab-map: starting three-tier iterative navigation (category=${_pageCategory}, appKnowledge=${_appKnowledgeEntries?.length || 0} entries)`);
+      const { runIterativeNavigation } = require('./instruction.runner.cjs');
+      const _tabMapResult = await runIterativeNavigation({
+        goal: task,
+        sessionId,
+        startUrl: _urlFirstNavigationSelected ? startUrl : null,
+        urlFirstNav: _urlFirstNavigationSelected,
+        pageCategory: _pageCategory,
+        agentContext: _agentContext,
+        timeoutMs: 120000,
+      });
+      if (_tabMapResult?.ok) {
+        logger.info(`[browser.agent] tab-map: completed ✓ via iterative navigation`);
+        // Emit tier progress: tab-map completed
+        _postProgress(_progressCallbackUrl, {
+          type: 'agent:tier',
+          stepIndex: _stepIndex ?? 0,
+          tier: 'tab-map',
+          message: `Tab-map: completed via iterative navigation`,
+          agentId,
+          sessionId,
+        });
+        return {
+          ok: true, agentId, task,
+          result: _tabMapResult.output || `Completed via tab-map`,
+          sessionId,
+          recipeUsed: false,
+          routingDecision: 'browser_tabmap',
+        };
+      }
+      logger.warn(`[browser.agent] tab-map: iterative navigation failed: ${_tabMapResult?.error} — falling through to playwright.agent`);
+    } catch (_tabMapErr) {
+      logger.warn(`[browser.agent] tab-map: execution error (non-fatal): ${_tabMapErr.message} — falling through to playwright.agent`);
+    }
+  }
+
+  // Emit tier progress: falling through to playwright.agent (turn-loop)
+  _postProgress(_progressCallbackUrl, {
+    type: 'agent:tier',
+    stepIndex: _stepIndex ?? 0,
+    tier: 'turn-loop',
+    message: `Playwright: delegating to turn-loop agent`,
+    agentId,
+    sessionId,
+  });
 
   try {
     // If recipe was successfully executed, we're already on the target page - don't navigate.
@@ -8417,6 +8982,67 @@ const BROWSER_CATEGORY_SCHEMAS = {
 };
 
 // ---------------------------------------------------------------------------
+// Infer page category from service key, URL, task text, and appKnowledge entries.
+// Used to pass proactive hints to instruction.runner so it knows upfront what
+// nuances are needed (chip confirmation, submit verification, pressAfter, etc.)
+// Priority: KNOWN_BROWSER_SERVICES → appKnowledge entries → URL patterns → task text
+// ---------------------------------------------------------------------------
+function _inferPageCategory(serviceKey, url, task, appKnowledgeEntries = []) {
+  const _svc = (serviceKey || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+  const _url = (url || '').toLowerCase();
+  const _task = (task || '').toLowerCase();
+
+  // 1. Direct service → category mapping (KNOWN_BROWSER_SERVICES)
+  const _SERVICE_CATEGORIES = {
+    gmail: 'email_compose', outlook: 'email_compose', protonmail: 'email_compose',
+    yahoo: 'email_compose', mailgooglecom: 'email_compose',
+    chatgpt: 'ai_chat', openai: 'ai_chat', claude: 'ai_chat', anthropic: 'ai_chat',
+    gemini: 'ai_chat', googleai: 'ai_chat', grok: 'ai_chat', perplexity: 'ai_chat',
+    notion: 'document_editor', googledocs: 'document_editor', googlesheets: 'document_editor',
+    twitter: 'social_feed', x: 'social_feed', facebook: 'social_feed',
+    linkedin: 'social_feed', reddit: 'social_feed',
+    amazon: 'shopping', ebay: 'shopping', etsy: 'shopping',
+    spotify: 'media_player', youtube: 'media_player', applemusic: 'media_player',
+    googlecalendar: 'calendar', outlookcalendar: 'calendar',
+  };
+  if (_SERVICE_CATEGORIES[_svc]) return _SERVICE_CATEGORIES[_svc];
+
+  // 2. appKnowledge entries → category inference
+  //    Look for signals in entry type + summary that indicate page category
+  if (appKnowledgeEntries && appKnowledgeEntries.length > 0) {
+    const _summaries = appKnowledgeEntries.map(e => `${e.type} ${e.summary || ''}`.toLowerCase()).join(' ');
+    const _hasShortcut = appKnowledgeEntries.some(e => e.type === 'shortcut');
+    const _hasWorkflow = appKnowledgeEntries.some(e => e.type === 'workflow');
+    const _hasCommandSystem = appKnowledgeEntries.some(e => e.type === 'command_system');
+
+    // AI chat: shortcut says "Enter" + "message" + "send"
+    if (_hasShortcut && /enter.*message.*send|send.*message.*enter/i.test(_summaries)) return 'ai_chat';
+    // Email compose: workflow/quirk mentions "compose", "recipient", "To field"
+    if ((_hasWorkflow || _summaries.includes('quirk')) && /compose|recipient|to field|cc|bcc|email.*send/i.test(_summaries)) return 'email_compose';
+    // Document editor: command_system with "/" prefix, or shortcut with "Cmd+N" (new page)
+    if (_hasCommandSystem && /slash|\/.*prefix|block insertion/i.test(_summaries)) return 'document_editor';
+    if (_hasShortcut && /cmd\+n|ctrl\+n.*new page/i.test(_summaries)) return 'document_editor';
+    // Media player: shortcut with "play", "pause", "next", "previous"
+    if (_hasShortcut && /play|pause|next track|previous track/i.test(_summaries)) return 'media_player';
+    // Social feed: workflow/quirk mentions "post", "share", "feed"
+    if ((_hasWorkflow || _summaries.includes('quirk')) && /\bpost\b|share.*feed|news feed/i.test(_summaries)) return 'social_feed';
+  }
+
+  // 3. URL-based inference
+  if (/mail\.google\.com|outlook\.live\.com\/mail|proton\.mail/i.test(_url)) return 'email_compose';
+  if (/chat\.openai\.com|claude\.ai|gemini\.google\.com|grok\.com|perplexity\.ai/i.test(_url)) return 'ai_chat';
+  if (/notion\.so|notion\.com|docs\.google\.com/i.test(_url)) return 'document_editor';
+  if (/twitter\.com|x\.com\/compose|facebook\.com\/sharer|linkedin\.com\/feed/i.test(_url)) return 'social_feed';
+
+  // 4. Task-based inference (weakest signal)
+  if (/\b(send|compose|email|reply|forward)\b.*\b(to|recipient|subject|body)\b/i.test(_task)) return 'email_compose';
+  if (/\b(ask|chat|message|prompt)\b.*\b(chatgpt|claude|gemini|grok|perplexity|ai)\b/i.test(_task)) return 'ai_chat';
+  if (/\b(post|tweet|share|update status)\b/i.test(_task)) return 'social_feed';
+
+  return 'web_generic';
+}
+
+// ---------------------------------------------------------------------------
 // LiteParse capture + verify + submit (Playwright screenshot → LiteParse → coordinates)
 // ---------------------------------------------------------------------------
 
@@ -8770,3 +9396,8 @@ module.exports._liteparseVerify = _liteparseVerify;
 module.exports._liteparseSubmit = _liteparseSubmit;
 module.exports._domFindSubmitTarget = _domFindSubmitTarget;
 module.exports._validateClickPoint = _validateClickPoint;
+module.exports._llmNextAction = _llmNextAction;
+module.exports._decisionCall = _decisionCall;
+module.exports._extractValue = _extractValue;
+module.exports._extractSearchText = _extractSearchText;
+module.exports._extractShortcut = _extractShortcut;

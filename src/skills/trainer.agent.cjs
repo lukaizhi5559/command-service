@@ -290,12 +290,21 @@ const CDP_RECORDER_SCRIPT = `
     // Phase 2: contenteditable container
     var ceContainer = raw.closest('[contenteditable="true"]');
     if (ceContainer) return ceContainer;
-    // Phase 3: walk up for stable anchor
+    // Phase 3: walk up for stable anchor — ONLY semantic elements, not containers
+    // Walking up to generic containers (divs with data-testid) captures noise clicks
+    // on modal backgrounds, which produce garbage elementText via longest-leaf extraction.
     var el = raw;
+    var semanticSelector = 'button, a, [role="button"], [role="link"], [role="menuitem"],' +
+      ' [role="tab"], [role="option"], [role="treeitem"], input, summary, [onclick],' +
+      ' [data-testid*="button"], [data-testid*="link"], [data-testid*="menuitem"]';
     for (var i = 0; i < 4; i++) {
       if (!el.parentElement || el.parentElement === document.body) break;
       el = el.parentElement;
-      if (el.id || el.getAttribute('data-testid') || el.getAttribute('aria-label')) return el;
+      // Only return semantic elements with identifiers, not generic containers
+      if ((el.id || el.getAttribute('data-testid') || el.getAttribute('aria-label')) &&
+          el.matches(semanticSelector)) {
+        return el;
+      }
     }
     return raw;
   }
@@ -2316,6 +2325,35 @@ function _cleanEventsForInstruction(events) {
   return cleaned;
 }
 
+// Convert a parsed instruction step back into a sentence string for
+// re-serializing after filtering out redundant steps.
+function _serializeInstructionStep(step) {
+  if (!step) return '';
+  switch (step.action) {
+    case 'navigate':
+      return `Navigate to ${step.url}`;
+    case 'click':
+      return `Click "${step.target || step.verifyText || ''}"`;
+    case 'dblclick':
+      return `Double-click "${step.target || step.verifyText || ''}"`;
+    case 'fill':
+      if (step.target) {
+        return `Type "${step.value}" into the "${step.target}" field`;
+      }
+      return `Type "${step.value}"`;
+    case 'select':
+      return `Select "${step.value}" from the "${step.target}" dropdown`;
+    case 'check':
+      return `Check "${step.target || step.verifyText || ''}"`;
+    case 'uncheck':
+      return `Uncheck "${step.target || step.verifyText || ''}"`;
+    case 'key':
+      return `Press ${step.key || 'Enter'}`;
+    default:
+      return `Click "${step.target || step.verifyText || ''}"`;
+  }
+}
+
 // Build an instruction-based skill preview from a segment of events.
 // Instead of generating CSS-selector waypoints, this calls the LLM to convert
 // the raw browser interactions into a natural language instruction that
@@ -2389,7 +2427,9 @@ CRITICAL RULES:
     - Press Enter
     - Check "X"
     - Submit the form
-12. If the recording contains multiple unrelated actions, return rejected: true.
+12. Do NOT add steps that close or dismiss a dialog (e.g. "Click the X button to close", "Click Close", "Click the dismiss button"). Only include an explicit close/X step if a close/X button was ACTUALLY recorded. ALWAYS preserve Save/Submit/Create/Apply/Confirm clicks that were recorded — they are not close steps and must be included.
+13. Do NOT put {{param_name}} placeholders inside a CLICK target. Params are only for values you TYPE or SELECT, not for button/label text. If the recording clicked a button whose text includes the search term (e.g. "See more lecrae"), write the exact recorded text, not "See more {{song_query}}". If the exact text would be non-reusable, drop that step.
+14. If the recording contains multiple unrelated actions, return rejected: true.
 
 GOOD example: "Click the "Create" button. Click "Create a <some-item>". Click "Name & details". Type "{{item_name}}" into the "Name" field. Click "Save"."
 GOOD example: "Click "Church Music". Click "Edit details". Type "{{item_name}}" into the "Name" field. Click "Save"."
@@ -2481,6 +2521,33 @@ ${prompt}` },
       }
     } else {
       logger.info(`[trainer.agent] _buildInstructionSkill: validated — ${parsedSteps.length} steps parsed from instructions`);
+    }
+
+    // Filter out close/X/dismiss steps the LLM invented that were not actually recorded.
+    // After a Save/Submit/Create, dialogs close automatically; the agent doesn't need
+    // to click an X/Close button that was never recorded.
+    const closeRe = /\b(?:x(?:\s+button)?|close(?:\s+(?:button|icon))?|dismiss(?:\s+button)?|cancel(?:\s+button)?)\b/i;
+    const saveRe = /\b(?:save|submit|create|confirm|apply|done)\b/i;
+    const hasRecordedClose = filteredEvents.some(e => e.type === 'click' && closeRe.test(e.elementText || ''));
+    if (!hasRecordedClose) {
+      const filteredSteps = parsedSteps.filter((step, idx, arr) => {
+        if (!step || step.action !== 'click') return true;
+        const target = (step.verifyText || step.target || '').toLowerCase();
+        if (!closeRe.test(target)) return true;
+        const prev = arr[idx - 1];
+        if (prev) {
+          const prevTarget = (prev.verifyText || prev.target || '').toLowerCase();
+          if (saveRe.test(prevTarget)) return false;
+        }
+        // Also drop a trailing close/X step — the LLM often invents it as a final cleanup
+        if (idx === arr.length - 1) return false;
+        return true;
+      });
+      if (filteredSteps.length !== parsedSteps.length) {
+        parsedSteps = filteredSteps;
+        parsed.instructions = filteredSteps.map(s => _serializeInstructionStep(s)).join('.. ');
+        logger.info(`[trainer.agent] _buildInstructionSkill: dropped ${parsedSteps.length - filteredSteps.length} redundant close/X step(s), new length ${parsedSteps.length}`);
+      }
     }
 
     // Ensure required fields

@@ -158,10 +158,19 @@ async function _askWithMessagesOnce(messages, opts = {}) {
     ws.on('error', (err) => { clearTimeout(t); reject(err); });
   });
 
-  // Build prompt string from messages array if needed
-  const promptText = messages.length === 1 && messages[0].role === 'user'
-    ? messages[0].content
-    : messages.map(m => `${m.role === 'system' ? '<<SYS>>' : '<<USER>>'}${m.content}`).join('\n');
+  // Extract system message and build user prompt.
+  // The backend reads context.systemInstructions for the system message and
+  // passes it as a proper { role: 'system' } message to the LLM provider.
+  // Embedding <<SYS>> tags in the prompt does NOT work — most providers
+  // (GPT, Claude, Gemini, GLM) don't understand Llama-2 chat tags.
+  let systemInstructions = '';
+  let promptText = '';
+  if (messages.length === 1 && messages[0].role === 'user') {
+    promptText = messages[0].content;
+  } else {
+    systemInstructions = messages.filter(m => m.role === 'system').map(m => m.content).join('\n');
+    promptText = messages.filter(m => m.role === 'user').map(m => m.content).join('\n');
+  }
 
   const requestId = `skill_req_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
 
@@ -175,7 +184,8 @@ async function _askWithMessagesOnce(messages, opts = {}) {
         temperature: opts.temperature ?? 0.2,
         stream: true,
         taskType: opts.taskType || 'skill_step',
-        ...(opts.maxTokens != null ? { max_tokens: opts.maxTokens } : {}),
+        // Backend reads options.maxTokens (camelCase), NOT max_tokens (snake_case)
+        ...(opts.maxTokens != null ? { maxTokens: opts.maxTokens } : {}),
       },
       context: {
         recentContext: [],
@@ -183,7 +193,7 @@ async function _askWithMessagesOnce(messages, opts = {}) {
         sessionEntities: [],
         memories: [],
         webSearchResults: [],
-        systemInstructions: opts.systemInstructions || '',
+        systemInstructions: systemInstructions || opts.systemInstructions || '',
       },
     },
     timestamp: Date.now(),
@@ -192,6 +202,7 @@ async function _askWithMessagesOnce(messages, opts = {}) {
 
   let accumulated = '';
   let streamStarted = false;
+  let lastProvider = '';
   const responseTimeoutMs = opts.responseTimeoutMs || RESPONSE_TIMEOUT_MS;
 
   await new Promise((resolve, reject) => {
@@ -222,6 +233,8 @@ async function _askWithMessagesOnce(messages, opts = {}) {
           // timeout and chunks never reset it — a stalled stream hangs forever
           // (observed: 63-second calls burning 70% of the turn-loop budget).
           resetTimeout();
+          const provider = msg.payload?.provider || msg.payload?.chunk?.provider || '';
+          if (provider) lastProvider = provider;
           const chunk = msg.payload?.chunk || msg.payload?.text || '';
           if (chunk) {
             accumulated += chunk;
@@ -261,7 +274,7 @@ async function _askWithMessagesOnce(messages, opts = {}) {
     return '';
   }
   
-  logger.info(`[skill-llm] ask complete (${result.length} chars)`);
+  logger.info(`[skill-llm] ask complete (${result.length} chars, provider=${lastProvider || 'unknown'})`);
   return result;
 }
 

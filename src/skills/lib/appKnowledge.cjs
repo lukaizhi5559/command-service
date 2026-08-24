@@ -222,23 +222,49 @@ function recordVerification(hostname, entryId, success) {
 /**
  * Format entries as a markdown block for injection into _agentContext.
  * Size-capped; confidence-ranked; only includes entries above a minimum threshold.
+ * Shortcuts are extracted into a dedicated section for easy LLM scanning.
  */
 function formatForContext(entries, maxChars = 1200) {
   if (!Array.isArray(entries) || entries.length === 0) return '';
 
+  const hostname = entries[0]._hostname || '';
+  const shortcuts = entries.filter(e => e.type === 'shortcut' && e.details?.shortcut);
+  const others = entries.filter(e => e.type !== 'shortcut');
+
   const lines = [];
   let total = 0;
-  for (const e of entries) {
-    if ((e.confidence || 0) < 0.3) continue; // skip low-confidence
+
+  // Non-shortcut entries first (command_system, ui_mode, workflow, quirk, etc.)
+  for (const e of others) {
+    if ((e.confidence || 0) < 0.3) continue;
     const tag = e.type ? `[${e.type}]` : '';
-    const conf = e.confidence != null ? ` (conf ${(e.confidence).toFixed(2)})` : '';
-    const line = `- ${tag} ${e.summary}${conf}`;
-    if (total + line.length + 1 > maxChars) break;
+    const line = `- ${tag} ${e.summary}`;
+    if (total + line.length + 1 > maxChars * 0.6) break;
     lines.push(line);
     total += line.length + 1;
   }
+
+  // Dedicated shortcuts section (easy for LLM to scan and pick)
+  if (shortcuts.length > 0) {
+    const shortcutLines = [];
+    for (const e of shortcuts) {
+      if ((e.confidence || 0) < 0.3) continue;
+      const key = e.details.shortcut || '';
+      // Extract the action from the summary (text after "to")
+      const action = e.summary.replace(/^.*?\bto\s+/i, '').replace(/\.$/, '').slice(0, 60);
+      const line = `- ${key}: ${action}`;
+      if (total + line.length + 1 > maxChars) break;
+      shortcutLines.push(line);
+      total += line.length + 1;
+    }
+    if (shortcutLines.length > 0) {
+      lines.push(`\n## App Shortcuts (${hostname})`);
+      lines.push(...shortcutLines);
+    }
+  }
+
   if (lines.length === 0) return '';
-  return `## App Knowledge (${entries[0]._hostname || ''})\n${lines.join('\n')}`;
+  return `## App Knowledge (${hostname})\n${lines.join('\n')}`;
 }
 
 /**
@@ -268,6 +294,29 @@ function isCacheStale(hostname) {
   return !hasHighConfidence;
 }
 
+/**
+ * Returns true if the shortcut coverage for a hostname is sparse or outdated.
+ * Triggers re-research when an app has fewer than 5 shortcut entries AND the
+ * cache is older than 7 days. This catches apps with incomplete/wrong shortcut
+ * data (e.g. twitter.com with 1 wrong Slack shortcut that never gets re-researched
+ * because isCacheStale sees one high-confidence entry and returns false).
+ */
+function isShortcutCoverageStale(hostname) {
+  const entries = loadAppKnowledge(hostname);
+  const shortcuts = entries.filter(e => e.type === 'shortcut');
+  if (shortcuts.length < 5) {
+    // Sparse shortcuts — check age of oldest entry
+    const now = Date.now();
+    const oldest = entries.reduce((max, e) => {
+      const age = now - new Date(e.lastVerified || 0).getTime();
+      return age > max ? age : max;
+    }, 0);
+    // Re-research if older than 7 days AND fewer than 5 shortcuts
+    return oldest > 7 * 24 * 60 * 60 * 1000;
+  }
+  return false;
+}
+
 module.exports = {
   APP_KNOWLEDGE_DIR,
   loadAppKnowledge,
@@ -276,6 +325,7 @@ module.exports = {
   formatForContext,
   loadAndFormat,
   isCacheStale,
+  isShortcutCoverageStale,
   // Exposed for testing
   _makeId,
   _isExpired,

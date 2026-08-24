@@ -11493,6 +11493,26 @@ Output ONLY the JSON action:`;
   }
 }
 
+// ── Session-scoped "failed approaches" ledger (process of elimination) ──────
+// Top-level so both _executeTurnLoopFallback and playwrightAgent can access it.
+// Reset to [] at the start of each playwrightAgent() call for per-run isolation.
+let _failedApproaches = [];
+function _recordFailedApproach(approach, result, url) {
+  const _entry = { approach: String(approach || '').slice(0, 200), result: String(result || '').slice(0, 200), url: url || '' };
+  if (!_failedApproaches.some(a => a.approach === _entry.approach && a.result === _entry.result)) {
+    _failedApproaches.push(_entry);
+    if (_failedApproaches.length > 8) _failedApproaches.shift();
+    logger.info(`[playwright.agent] failed-approaches: recorded #${_failedApproaches.length}: "${_entry.approach}" → "${_entry.result}"`);
+  }
+}
+function _formatFailedApproachesBlock() {
+  if (_failedApproaches.length === 0) return '';
+  const _lines = _failedApproaches.map((a, i) =>
+    `${i + 1}. Tried: ${a.approach} → Result: ${a.result}${a.url ? ` (on ${a.url})` : ''}`
+  );
+  return `\nFAILED APPROACHES (these did not achieve the goal — do NOT retry the same actions; try a DIFFERENT approach):\n${_lines.join('\n')}\n`;
+}
+
 async function _executeTurnLoopFallback({ goal, verificationGoal, sessionId, headed, timeoutMs, agentContext, transcript, deadline, start, extractedText, heartbeat, textAlreadyEntered, maxTurns = 8, hostname, _discoveryAlreadyAttempted = false, _preDecomposedSubTasks = null, _inheritedActionSignatureCounts = null, _inheritedJitDiscoveryFired = null, _progressCallbackUrl, _stepIndex, _abortSignal = null }) {
   const MAX_TURNS = maxTurns;
   const _loopTranscript = [...transcript];
@@ -14790,25 +14810,10 @@ Output ONLY valid JSON: {${_matchedSkill.params.map(p => `"${p.name}": "<extract
   let _peLoopStudyBlock = _studyBlock;
 
   // ── Session-scoped "failed approaches" ledger (process of elimination) ──
-  // Records approaches that did not achieve the goal, so subsequent LLM prompts
-  // (Plan-Execute, replan, turn-loop) can avoid repeating them. General mechanism
-  // — works for any site, not Spotify-specific.
-  const _failedApproaches = [];
-  function _recordFailedApproach(approach, result, url) {
-    const _entry = { approach: String(approach || '').slice(0, 200), result: String(result || '').slice(0, 200), url: url || '' };
-    if (!_failedApproaches.some(a => a.approach === _entry.approach && a.result === _entry.result)) {
-      _failedApproaches.push(_entry);
-      if (_failedApproaches.length > 8) _failedApproaches.shift();
-      logger.info(`[playwright.agent] failed-approaches: recorded #${_failedApproaches.length}: "${_entry.approach}" → "${_entry.result}"`);
-    }
-  }
-  function _formatFailedApproachesBlock() {
-    if (_failedApproaches.length === 0) return '';
-    const _lines = _failedApproaches.map((a, i) =>
-      `${i + 1}. Tried: ${a.approach} → Result: ${a.result}${a.url ? ` (on ${a.url})` : ''}`
-    );
-    return `\nFAILED APPROACHES (these did not achieve the goal — do NOT retry the same actions; try a DIFFERENT approach):\n${_lines.join('\n')}\n`;
-  }
+  // Top-level helpers (_failedApproaches, _recordFailedApproach,
+  // _formatFailedApproachesBlock) are defined above _executeTurnLoopFallback
+  // so both the turn-loop and Plan-Execute can access them. Reset per run.
+  _failedApproaches = [];
 
   // Capture initial state
   try {

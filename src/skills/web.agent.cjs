@@ -980,25 +980,41 @@ async function actionResearchAppBehavior({ domain, query, maxResults = 4 }) {
   }
 
   // ── Phase 2: Crawl best pages + LLM-synthesize actionable knowledge ──
-  // Pick the best 1-2 pages to crawl. Prefer official help/support docs for the
-  // service (most reliable), then fall back to high-quality third-party results.
+  // Pick the best pages to crawl. Prefer official help/support docs for the
+  // service (most reliable), then fall back to known shortcut-aggregator sites.
+  // Domain verification: skip results whose source doesn't match the target app
+  // AND isn't a known shortcut aggregator (prevents e.g. Slack shortcuts leaking
+  // into twitter.com's appKnowledge).
   const serviceHost = hostForId.split('.').slice(-2).join('.');
+  const SHORTCUT_AGGREGATOR_SITES = [
+    'shortcut-tools.com', 'cheatography.com', 'keyboardshortcuts.org',
+    'keycombiner.com', 'defkey.com', 'dotnetperls.com', 'coursera.org',
+  ];
+  const _isRelevantSource = (h) => {
+    if (h.includes(serviceHost) || h.includes(appName.toLowerCase().replace(/\s+/g, ''))) return true;
+    if (SHORTCUT_AGGREGATOR_SITES.some(s => h.includes(s))) return true;
+    return false;
+  };
   const crawlCandidates = [];
   const seenUrls = new Set();
   // First: official docs (hostname contains the service domain)
   for (const r of searchResults) {
     try {
       const h = new URL(r.url).hostname.replace(/^www\./, '');
-      if ((h.includes(serviceHost) || h.includes(appName.toLowerCase().replace(/\s+/g, ''))) && !seenUrls.has(r.url)) {
+      if (_isRelevantSource(h) && !seenUrls.has(r.url)) {
         crawlCandidates.push(r);
         seenUrls.add(r.url);
       }
     } catch (_) {}
   }
-  // Then: other results (cheat sheets, tutorials) — but only if they look substantive
+  // Then: other relevant results (cheat sheets, tutorials from aggregators) — but only if they look substantive
   for (const r of searchResults) {
-    if (crawlCandidates.length >= 2) break;
+    if (crawlCandidates.length >= 3) break;
     if (seenUrls.has(r.url)) continue;
+    try {
+      const h = new URL(r.url).hostname.replace(/^www\./, '');
+      if (!_isRelevantSource(h)) continue; // skip irrelevant sources
+    } catch (_) { continue; }
     const text = `${r.title || ''} ${r.snippet || ''}`;
     if (text.length > 50 && /shortcut|keyboard|how to|guide|tutorial|tip|slash|command|block|insert/i.test(text)) {
       crawlCandidates.push(r);
@@ -1012,8 +1028,8 @@ async function actionResearchAppBehavior({ domain, query, maxResults = 4 }) {
   // (_crawl_<hash>), so they're fully independent and can run concurrently.
   let { webCrawl } = require('./web.crawl.cjs');
   const crawledContents = [];
-  const crawlPromises = crawlCandidates.slice(0, 3).map(c =>
-    webCrawl({ url: c.url, maxChars: 6000, timeoutMs: 15000 })
+  const crawlPromises = crawlCandidates.slice(0, 5).map(c =>
+    webCrawl({ url: c.url, maxChars: 8000, timeoutMs: 15000 })
       .then(result => ({ ok: true, ...result, _url: c.url, _title: c.title }))
       .catch(err => {
         logger.warn(`[web.agent] research_app_behavior: crawl failed for ${c.url}: ${err.message}`);
@@ -1034,9 +1050,9 @@ async function actionResearchAppBehavior({ domain, query, maxResults = 4 }) {
     try {
       const { ask } = require('../skill-helpers/skill-llm.cjs');
       const combinedContent = crawledContents
-        .map(c => `--- ${c.title} (${c.url}) ---\n${c.content.slice(0, 3000)}`)
+        .map(c => `--- ${c.title} (${c.url}) ---\n${c.content.slice(0, 4000)}`)
         .join('\n\n')
-        .slice(0, 10000);
+        .slice(0, 15000);
 
       const extractPrompt = `The following is text crawled from help/documentation pages about "${appName}".
 
@@ -1068,7 +1084,7 @@ Return [] if no operational knowledge is found. Do NOT include generic descripti
 TEXT:
 ${combinedContent}`;
 
-      const raw = await ask(extractPrompt, { maxTokens: 1200, temperature: 0, responseTimeoutMs: 30000 });
+      const raw = await ask(extractPrompt, { maxTokens: 4000, temperature: 0, responseTimeoutMs: 30000 });
       const jsonMatch = raw && raw.match(/\[[\s\S]*\]/);
       if (jsonMatch) {
         const parsed = JSON.parse(jsonMatch[0]);
