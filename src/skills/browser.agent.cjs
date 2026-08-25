@@ -411,7 +411,7 @@ Strategy? (0, 1, 2, or 3)`;
 
 // Value extraction: what to type into the focused field.
 // Returns the value, "PRESS_ENTER", or "SKIP".
-async function _extractValue(goal, focusedElement, actionHistory, agentContext, currentValue = '') {
+async function _extractValue(goal, focusedElement, actionHistory, agentContext, currentValue = '', pageContext = {}) {
   const { askWithMessages } = require('../skill-helpers/skill-llm.cjs');
 
   const _contextBlock = agentContext
@@ -424,6 +424,8 @@ async function _extractValue(goal, focusedElement, actionHistory, agentContext, 
 
   const systemPrompt = `You extract the value to type into a focused field on a web page.
 Look at the goal and what's been done. Return ONLY the value to type — nothing else.
+- Extract values ONLY from the goal text. Do NOT invent or hallucinate values that are not in the goal.
+- If the field is empty and the goal specifies a value (email address, name, search query, message body), type that value — do NOT return PRESS_ENTER for an empty field.
 - If the field already contains the exact value needed, return PRESS_ENTER (if Enter confirms/submits) or SKIP (if no action needed)
 - Do NOT return the same value that's already in the field — either return PRESS_ENTER, SKIP, or a different value
 - If this isn't the right field to type into (wrong field for this goal) → return SKIP
@@ -437,6 +439,8 @@ Look at the goal and what's been done. Return ONLY the value to type — nothing
   const historyStr = actionHistory.slice(-5).map((a, i) => `  ${i + 1}. ${a}`).join('\n');
 
   const userPrompt = `Goal: ${goal}
+Page title: ${pageContext.title || 'unknown'}
+Visible text: ${(pageContext.visibleText || '').slice(0, 150)}
 Focused field: ${_focusedStr}
 Current field value: "${(currentValue || '').slice(0, 80)}"
 Actions taken:
@@ -554,10 +558,84 @@ Which shortcut? (return number or 0 for none)`;
   }
 }
 
+// Parse JSON from LLM output — tries </reasoning> tag, then [{, then [...], then JSON.parse.
+// Returns array or null.
+function _parseStepsJson(raw) {
+  let jsonStr = (raw || '').trim();
+  if (!jsonStr) return null;
+  const reasoningEnd = jsonStr.indexOf('</reasoning>');
+  if (reasoningEnd !== -1) {
+    jsonStr = jsonStr.slice(reasoningEnd + '</reasoning>'.length).trim();
+  } else {
+    const bracketStart = jsonStr.indexOf('[{');
+    if (bracketStart >= 0) jsonStr = jsonStr.slice(bracketStart);
+  }
+  const cleaned = jsonStr.replace(/^```(?:json)?\s*\n?/i, '').replace(/\n?```\s*$/, '').trim();
+  try {
+    const parsed = JSON.parse(cleaned);
+    return Array.isArray(parsed) ? parsed : null;
+  } catch {
+    const arrMatch = cleaned.match(/\[[\s\S]*\]/);
+    if (arrMatch) {
+      try { return JSON.parse(arrMatch[0]); } catch { return null; }
+    }
+    return null;
+  }
+}
+
+// Regex fallback — extract steps from prose (fragile but better than nothing).
+// Looks for "type X into Y", "click Z", "press Enter" patterns and matches to tabMap.
+function _regexExtractSteps(raw, goal, tabMap) {
+  if (!raw) return null;
+  const text = String(raw);
+
+  // Look for JSON-like arrays embedded in prose (e.g., "Here are the steps: [{...}]")
+  const arrMatch = text.match(/\[\s*\{[\s\S]*\}\s*\]/);
+  if (arrMatch) {
+    try {
+      const parsed = JSON.parse(arrMatch[0]);
+      if (Array.isArray(parsed) && parsed.length > 0) {
+        logger.info(`[browser.agent] _regexExtractSteps: found JSON array in prose (${parsed.length} steps)`);
+        return parsed;
+      }
+    } catch {}
+  }
+
+  // Look for action patterns: "type X into Y", "click Z", "press Enter"
+  const steps = [];
+  const lines = text.split(/[\n.]+/).map(l => l.trim()).filter(Boolean);
+  for (const line of lines) {
+    const typeMatch = line.match(/(?:type|enter|input|fill)\s+["']?([^"']+?)["']?\s+(?:into|in|on)\s+["']?([^"']+?)["']?(?:\s|$)/i);
+    const clickMatch = line.match(/(?:click|press|select)\s+(?:the\s+)?["']?([^"']+?)["']?(?:\s|$)/i);
+    const pressMatch = line.match(/press\s+(?:the\s+)?["']?([^"']+?)["']?\s+key/i);
+
+    if (typeMatch) {
+      const target = typeMatch[2];
+      const value = typeMatch[1];
+      const el = (tabMap || []).find(e => (e.text || e.ariaLabel || '').toLowerCase().includes(target.toLowerCase()));
+      if (el) steps.push({ action: 'type', target, value });
+    } else if (pressMatch) {
+      steps.push({ action: 'press', key: pressMatch[1] });
+    } else if (clickMatch) {
+      const target = clickMatch[1];
+      if (/enter|tab|escape|shift/i.test(target) && /key/i.test(line)) continue;
+      const el = (tabMap || []).find(e => (e.text || e.ariaLabel || '').toLowerCase().includes(target.toLowerCase()));
+      if (el) steps.push({ action: 'click', target });
+    }
+  }
+
+  if (steps.length > 0) {
+    logger.info(`[browser.agent] _regexExtractSteps: extracted ${steps.length} step(s) from prose`);
+    return steps;
+  }
+  return null;
+}
+
 // Step-based Tab-Map: extract ordered steps from goal + available elements in one LLM call.
 // Returns array of { action, target?, value?, key? } or null on failure.
 // Caller executes steps in order; on page change, re-extract for new page.
 // If null or <=1 step, caller falls back to per-step _llmNextAction (browse-and-report).
+// 3-layer fallback: (1) planning model, (2) complex model with sharper prompt, (3) regex.
 async function _extractSteps(goal, currentUrl, tabMap, pageCategory, agentContext) {
   const { askWithMessages } = require('../skill-helpers/skill-llm.cjs');
 
@@ -610,7 +688,12 @@ Rules:
 - For AI chat (ChatGPT, Claude, etc.): after typing the prompt, add { "action": "press", "key": "Enter" } to submit.
 - Maximum 8 steps per page.
 - If there is only one step, still return an array: [{ "action": "..." }]
-- Output ONLY the JSON array, starting with [ and ending with ]. No other text.`;
+- Output ONLY the JSON array, starting with [ and ending with ]. No other text.
+
+Conflict resolution (common with deep-links that pre-create content):
+- If the goal says "create a new document" but the page already shows a new/blank document (URL contains /document/d/.../edit, title is "Untitled"), the document is already created. Do NOT try to click "New" or "Blank" again. Instead, rename it: find the title/rename field and type the new title from the goal.
+- If an overlay or template picker is open and the document is already created, dismiss it (press Escape) and then rename the document.
+- If the goal mentions multiple actions but some are already done (see page state), only plan the remaining actions.`;
 
   const userPrompt = `Goal: ${goal}
 Current URL: ${currentUrl}
@@ -621,40 +704,22 @@ ${elementList}
 
 Extract the ordered steps:`;
 
-  try {
-    const raw = await askWithMessages([
-      { role: 'system', content: systemPrompt },
-      { role: 'user', content: userPrompt },
-    ], { maxTokens: 1200, temperature: 0.1, responseTimeoutMs: 15000, taskType: 'planning' });
-
-    // Extract JSON from after </reasoning> tag, or fallback to finding the first [
-    let jsonStr = (raw || '').trim();
-    const reasoningEnd = jsonStr.indexOf('</reasoning>');
-    if (reasoningEnd !== -1) {
-      jsonStr = jsonStr.slice(reasoningEnd + '</reasoning>'.length).trim();
-    } else {
-      const bracketStart = jsonStr.indexOf('[{');
-      if (bracketStart >= 0) jsonStr = jsonStr.slice(bracketStart);
-    }
-    const cleaned = jsonStr.replace(/^```(?:json)?\s*\n?/i, '').replace(/\n?```\s*$/, '').trim();
-
-    let parsed;
+  // Helper: call LLM with given taskType + maxTokens
+  const _callLlm = async (sysPrompt, opts) => {
     try {
-      parsed = JSON.parse(cleaned);
-    } catch (parseErr) {
-      // Try extracting JSON from mixed text (e.g., "Here are the steps: [...]")
-      const arrMatch = cleaned.match(/\[[\s\S]*\]/);
-      if (arrMatch) {
-        try { parsed = JSON.parse(arrMatch[0]); } catch (_) {
-          logger.warn(`[browser.agent] _extractSteps: JSON parse failed: ${parseErr.message}. Raw: ${cleaned.slice(0, 500)}`);
-          return null;
-        }
-      } else {
-        logger.warn(`[browser.agent] _extractSteps: JSON parse failed: ${parseErr.message}. Raw: ${cleaned.slice(0, 500)}`);
-        return null;
-      }
+      return await askWithMessages([
+        { role: 'system', content: sysPrompt },
+        { role: 'user', content: userPrompt },
+      ], { maxTokens: opts.maxTokens || 2500, temperature: 0.1, responseTimeoutMs: 20000, taskType: opts.taskType || 'planning' });
+    } catch (e) {
+      logger.warn(`[browser.agent] _extractSteps call failed (${opts.taskType}): ${e.message}`);
+      return '';
     }
-    // Normalize to array (tolerate object-wrapped responses from light models)
+  };
+
+  // Helper: normalize parsed JSON to steps array + post-process
+  const _normalizeSteps = (parsed) => {
+    if (!parsed) return null;
     let steps;
     if (Array.isArray(parsed)) {
       steps = parsed;
@@ -667,7 +732,6 @@ Extract the ordered steps:`;
       else if (Array.isArray(parsed.output)) steps = parsed.output;
       else if (parsed.action) steps = [parsed];
       else {
-        // Last resort: scan all object values for an array of step-like objects
         const _arrVal = Object.values(parsed).find(v => Array.isArray(v) && v.length > 0 &&
           v.every(s => s && typeof s === 'object' && typeof s.action === 'string'));
         if (_arrVal) {
@@ -698,7 +762,6 @@ Extract the ordered steps:`;
       }
       if (s.action === 'done') return true;
       if (s.action === 'press') return !!s.key;
-      // type/click need a non-empty target that's not just a tag name
       const _t = (s.target || '').trim();
       if (!_t || /^div$/i.test(_t) || /^div\s+""$/i.test(_t)) {
         logger.warn(`[browser.agent] _extractSteps: dropping step with invalid target "${s.target}"`);
@@ -711,8 +774,43 @@ Extract the ordered steps:`;
       logger.warn(`[browser.agent] _extractSteps: all steps filtered out — returning null`);
       return null;
     }
-    logger.info(`[browser.agent] _extractSteps: extracted ${steps.length} step(s) from goal — ${steps.map(s => s.action + (s.target ? ` "${s.target}"` : '')).join(', ')}`);
     return steps;
+  };
+
+  try {
+    // Layer 1: planning model (current behavior, but with higher maxTokens)
+    let raw = await _callLlm(systemPrompt, { taskType: 'planning', maxTokens: 2500 });
+    let parsed = _parseStepsJson(raw);
+    let steps = _normalizeSteps(parsed);
+    if (steps) {
+      logger.info(`[browser.agent] _extractSteps: Layer 1 (planning) extracted ${steps.length} step(s) — ${steps.map(s => s.action + (s.target ? ` "${s.target}"` : '')).join(', ')}`);
+      return steps;
+    }
+
+    // Layer 2: complex model retry with sharper prompt (same taskType as planSkillsV2.js)
+    logger.warn(`[browser.agent] _extractSteps: Layer 1 (planning) produced no JSON — retrying with complex model`);
+    const _sharperPrompt = systemPrompt + '\n\nCRITICAL: Your previous response contained reasoning but NO JSON array. Output ONLY the JSON array now. Start with [ and end with ]. No reasoning, no prose, no commentary.';
+    raw = await _callLlm(_sharperPrompt, { taskType: 'complex', maxTokens: 2500 });
+    parsed = _parseStepsJson(raw);
+    steps = _normalizeSteps(parsed);
+    if (steps) {
+      logger.info(`[browser.agent] _extractSteps: Layer 2 (complex) extracted ${steps.length} step(s) — ${steps.map(s => s.action + (s.target ? ` "${s.target}"` : '')).join(', ')}`);
+      return steps;
+    }
+
+    // Layer 3: regex fallback — extract steps from prose (fragile but better than nothing)
+    logger.warn(`[browser.agent] _extractSteps: Layer 2 (complex) also failed — trying regex fallback`);
+    const regexSteps = _regexExtractSteps(raw, goal, tabMap);
+    if (regexSteps) {
+      const normalized = _normalizeSteps(regexSteps);
+      if (normalized) {
+        logger.info(`[browser.agent] _extractSteps: Layer 3 (regex) extracted ${normalized.length} step(s) — ${normalized.map(s => s.action + (s.target ? ` "${s.target}"` : '')).join(', ')}`);
+        return normalized;
+      }
+    }
+
+    logger.warn(`[browser.agent] _extractSteps: all 3 layers failed — returning null`);
+    return null;
   } catch (e) {
     logger.warn(`[browser.agent] _extractSteps failed: ${e.message}`);
     return null;

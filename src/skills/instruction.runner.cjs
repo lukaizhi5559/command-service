@@ -3584,7 +3584,7 @@ async function _checkDone(goal, actionHistory) {
 // LLM-based tier selection — sees goal + URL + real-time page context (title,
 // visible text) + agent context (shortcuts, commands) + page structure (element
 // types) and returns 0-4. Falls back to _selectTierDeterministic on LLM failure.
-async function _selectTierLLM(sessionId, goal, actionHistory, pageCategory, shortcutCount, focused, currentUrl, probe, agentContext) {
+async function _selectTierLLM(sessionId, goal, actionHistory, pageCategory, shortcutCount, focused, currentUrl, probe, agentContext, triedTiers = new Set()) {
   const { askWithMessages } = require('../skill-helpers/skill-llm.cjs');
 
   // 1. DONE check (only if we've taken actions) — keep this deterministic
@@ -3598,6 +3598,25 @@ async function _selectTierLLM(sessionId, goal, actionHistory, pageCategory, shor
     ? `${focused.tag} "${(focused.text || focused.ariaLabel || '').slice(0, 60)}" role=${focused.role || 'none'}`
     : 'none (body/no focus)';
 
+  // 2. Build available tiers (exclude tried tiers — don't give the LLM the choice)
+  // Tier 0 (DONE) is handled above. Tier 4 (Tab-Map) is always available (safe fallback).
+  const _tierDescriptions = {
+    1: '1 = Just-type (type a single value into the currently focused field — ONLY fills ONE field)',
+    2: '2 = Meta+F (find specific text on the page by searching, then click it)',
+    3: '3 = Shortcut keys (press an app-specific keyboard shortcut)',
+    4: '4 = Tab-Map (scan all focusable elements, fill multiple fields, click buttons — for forms and complex UI)',
+  };
+  const _availableTiers = [1, 2, 3, 4].filter(t => !triedTiers.has(t));
+
+  // If only Tab-Map is left, skip the LLM call — just return it
+  if (_availableTiers.length === 1 && _availableTiers[0] === 4) {
+    logger.info(`[instruction.runner] _selectTierLLM: → 4 (Tab-Map) — only available tier (tried: ${[...triedTiers].join(',') || 'none'})`);
+    return 4;
+  }
+
+  // Build the tier options string (only available tiers)
+  const _tierOptions = _availableTiers.map(t => _tierDescriptions[t]).join('\n');
+
   // Trim agentContext to relevant parts (shortcuts, command systems, creation notes)
   const _contextBlock = agentContext
     ? `\n\nApp context (shortcuts, commands, notes):\n${String(agentContext).slice(0, 800)}`
@@ -3605,23 +3624,18 @@ async function _selectTierLLM(sessionId, goal, actionHistory, pageCategory, shor
 
   const systemPrompt = `You decide the navigation strategy for a browser automation task.
 Look at the goal, the current URL, what's visible on the page, the page structure, and available shortcuts.
-Return ONLY a single number — nothing else:
-  0 = DONE (goal already achieved — see action history)
-  1 = Just-type (the page has a primary input/contenteditable that's focused or should be; just type the value from the goal)
-  2 = Meta+F (find specific text on the page by searching, then click it — for finding a specific item in a list)
-  3 = Shortcut keys (press an app-specific keyboard shortcut to accomplish the goal)
-  4 = Tab-Map (scan all focusable elements, pick one to interact with — for multi-field forms, toolbars, complex UI)
+Return ONLY a single number from the available options — nothing else.
 
-Decision rules:
-- If the page shows a blank/new editor (visible text has placeholder like "New page", "Untitled", or the page title suggests a new blank document) and the goal is to create/write/type content → return 1 (Just-type — the title/content area is the primary input)
-- If the page structure shows contenteditable elements (canvas editor) and the goal is to type/write/create → return 1 (Just-type)
+Available strategies:
+${_tierOptions}
+
+CRITICAL RULES:
+- Just-type (1) ONLY types into ONE field. If the page has 2+ <input> or <textarea> fields that need different values (e.g., email To/Subject/Body, registration form), Just-type CANNOT complete the task — return 4 (Tab-Map).
+- If the page has contenteditable elements (canvas editor) and the goal is to type/write/create → return 1 (Just-type)
 - If the page has a single fillable input (search box, chat prompt) and the goal is to search/ask/type → return 1 (Just-type)
-- If the page has multiple <input> form fields (e.g., To, Subject, Body — email compose, registration) and the goal is to fill them → return 4 (Tab-Map)
-- If the goal requires finding a specific item on the page (email subject, conversation name, menu item) → return 2 (Meta+F)
+- If the goal requires finding a specific item on the page → return 2 (Meta+F)
 - If app shortcuts are available (see App context) and a shortcut directly accomplishes the goal → return 3 (Shortcuts)
-- If the goal requires interacting with multiple elements (form filling, toolbar buttons, multi-field modal) → return 4 (Tab-Map)
-- If everything in the goal has been accomplished (see action history) → return 0
-- When in doubt → return 4`;
+- When in doubt → return 4 (Tab-Map)`;
 
   const userPrompt = `Goal: ${goal}
 Current URL: ${currentUrl}
@@ -3634,7 +3648,7 @@ Available shortcuts: ${shortcutCount}
 Actions taken so far:
 ${actionHistory.length > 0 ? actionHistory.slice(-10).map((a, i) => `  ${i + 1}. ${a}`).join('\n') : '  (none)'}${_contextBlock}
 
-Strategy? (0, 1, 2, 3, or 4)`;
+Strategy? (${_availableTiers.join(', ')})`;
 
   try {
     const raw = await askWithMessages([
@@ -3642,8 +3656,9 @@ Strategy? (0, 1, 2, 3, or 4)`;
       { role: 'user', content: userPrompt },
     ], { maxTokens: 10, temperature: 0.1, responseTimeoutMs: 10000 });
     const num = parseInt((raw || '').trim().replace(/\D/g, ''), 10);
-    const result = [0, 1, 2, 3, 4].includes(num) ? num : 4;
-    logger.info(`[instruction.runner] _selectTierLLM: strategy=${result} (raw="${(raw || '').trim()}") — fillable=${fillableCount} (input=${fillableTypes.inputCount}, ce=${fillableTypes.contenteditableCount}), title="${pageTitle}", url=${currentUrl}`);
+    // If LLM returns a tried tier anyway, override to Tab-Map (safe fallback)
+    const result = _availableTiers.includes(num) ? num : 4;
+    logger.info(`[instruction.runner] _selectTierLLM: strategy=${result} (raw="${(raw || '').trim()}") — fillable=${fillableCount} (input=${fillableTypes.inputCount}, ce=${fillableTypes.contenteditableCount}), title="${pageTitle}", tried=[${[...triedTiers].join(',')}], url=${currentUrl}`);
     return result;
   } catch (e) {
     logger.warn(`[instruction.runner] _selectTierLLM failed: ${e.message} — falling back to _selectTierDeterministic`);
@@ -3770,6 +3785,10 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
   let _stepPlan = null;         // extracted steps for current page: [{ action, target?, value?, key? }]
   let _stepIndex = 0;           // current step index in _stepPlan
   let _usingStepFallback = false; // true → use per-step _llmNextAction (browse-and-report)
+  // Tried-tier tracking — omit tried tiers from _selectTierLLM so the LLM can't pick them again.
+  // Cleared on URL change, overlay change, or focus change (so multi-step Just-type like Notion still works).
+  let _triedTiers = new Set();
+  let _prevFocusedRef = null;
 
   // Initial overlay detection (URL-first might have opened a modal)
   overlayActive = await _detectOverlay(sessionId);
@@ -3790,6 +3809,15 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
       ? false  // Mid-step-plan: ignore URL/overlay changes, keep executing steps
       : (currentUrl !== prevUrl || newOverlayActive !== overlayActive);
     overlayActive = newOverlayActive;
+
+    // 1b. Clear tried tiers on state change or focus change
+    // (so multi-step Just-type like Notion: type title → Enter → type body still works)
+    const _focusChanged = (focused?.ref || null) !== (_prevFocusedRef || null);
+    if ((stateChanged || _focusChanged) && _triedTiers.size > 0) {
+      logger.info(`[instruction.runner] Clearing tried tiers (${[..._triedTiers].join(',')}) — stateChanged=${stateChanged}, focusChanged=${_focusChanged}`);
+      _triedTiers.clear();
+    }
+    _prevFocusedRef = focused?.ref || null;
 
     // 2. If in Tab-Map session and no state change → continue Tab-Map inner loop
     if (inTabMapSession && !stateChanged && _cachedTabMap) {
@@ -3939,7 +3967,7 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
     const { _extractValue, _extractSearchText } = require('./browser.agent.cjs');
     // Probe page structure once per iteration (includes fillable types + title + visible text)
     const _probe = await _probePageStructure(sessionId);
-    const strategy = await _selectTierLLM(sessionId, goal, actionHistory, _pageCategory, _shortcutCount, focused, currentUrl, _probe, agentContext);
+    const strategy = await _selectTierLLM(sessionId, goal, actionHistory, _pageCategory, _shortcutCount, focused, currentUrl, _probe, agentContext, _triedTiers);
     logger.info(`[instruction.runner] Decision: strategy=${strategy} (0=DONE, 1=Just-type, 2=Meta+F, 3=App Shortcuts, 4=Tab-Map)`);
 
     // 4. Execute strategy
@@ -3955,10 +3983,11 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
 
     if (strategy === 1) {
       // Just-type
-      const value = await _extractValue(goal, focused, actionHistory, agentContext, focused?.currentValue || '');
+      const value = await _extractValue(goal, focused, actionHistory, agentContext, focused?.currentValue || '', { title: _probe.pageTitle, visibleText: _probe.visibleText });
       const result = await _executeJustType(sessionId, value, focused, _pageCategory);
       const _note = result.ok ? '→ ok' : '→ FAILED';
       actionHistory.push(`Just-type "${value.slice(0, 40)}" ${_note}`);
+      _triedTiers.add(1);
 
       if (!result.ok) {
         // Fallback to Tab-Map
@@ -3995,6 +4024,7 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
       const result = await _executeMetaF(sessionId, searchText);
       const _note = result.ok ? '→ found+clicked' : '→ not found';
       actionHistory.push(`Meta+F "${searchText}" ${_note}`);
+      _triedTiers.add(2);
 
       if (!result.ok) {
         // Fallback to Tab-Map
@@ -4038,6 +4068,7 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
       const result = await _executeShortcut(sessionId, shortcutResult.key);
       const _note = result.ok ? (result.pageChanged ? '→ page changed' : '→ ok') : '→ FAILED';
       actionHistory.push(`Shortcut "${shortcutResult.key}" ${_note}`);
+      _triedTiers.add(3);
 
       // Record verification outcome (decays confidence on failure, triggers re-research eventually)
       if (_hostname && shortcutResult.entryId) {
