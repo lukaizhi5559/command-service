@@ -4009,8 +4009,26 @@ async function browserAct(args) {
           let _preSnap = null;
           if (_typedText.length > 0) {
             _preSnap = await _ePage.evaluate(() => {
-              const el = document.activeElement;
+              let el = document.activeElement;
               if (!el) return null;
+              // ── Leaf detection for contenteditable wrappers ──
+              // Same logic as _readActiveElement: if activeElement is a container
+              // with contenteditable children, use the selection anchor to find
+              // the actual focused leaf. This ensures hasContent checks the leaf's
+              // text, not the container's (which would include title + body).
+              if (el.isContentEditable) {
+                try {
+                  const sel = window.getSelection();
+                  if (sel && sel.rangeCount > 0) {
+                    let node = sel.getRangeAt(0).startContainer;
+                    if (node.nodeType === 3) node = node.parentElement;
+                    while (node && !node.isContentEditable) node = node.parentElement;
+                    if (node && node !== el && el.contains(node)) {
+                      el = node;
+                    }
+                  }
+                } catch (_) {}
+              }
               const rect = el.getBoundingClientRect();
               const ph = el.getAttribute('placeholder') ||
                 el.getAttribute('data-placeholder') ||
@@ -4024,6 +4042,16 @@ async function browserAct(args) {
               const aria = el.getAttribute('aria-label') || '';
               const tooltip = el.getAttribute('data-tooltip') || el.getAttribute('title') || '';
               const pseudoPlaceholder = (val && (val === aria || val === tooltip)) ? val : '';
+              // hasContent: does the focused LEAF have actual content to replace?
+              // NOT aria-label/placeholder — those are shown when the field is empty.
+              // For containers (has contenteditable children): always false — Meta+a
+              // would select the entire page (title + body), not just this field.
+              const isContainer = el.querySelectorAll('[contenteditable="true"], [contenteditable=""]').length > 0;
+              const actualContent = (el.value !== undefined && el.value !== ''
+                ? String(el.value)
+                : (el.isContentEditable ? (el.innerText || el.textContent || '') : '')
+              ).trim();
+              const hasContent = !isContainer && actualContent.length > 0;
               return {
                 tag: el.tagName.toLowerCase(),
                 role: el.getAttribute('role') || '',
@@ -4032,6 +4060,7 @@ async function browserAct(args) {
                 draftPlaceholderText,
                 hasBlankClass: el.classList.contains('ql-blank'),
                 pseudoPlaceholder, // Fix 30c
+                hasContent,
                 rect: { top: rect.top, left: rect.left, width: rect.width, height: rect.height },
                 textBefore: (el.value || el.textContent || el.innerText || '').slice(0, 200),
               };
@@ -4042,7 +4071,10 @@ async function browserAct(args) {
           // already-filled elements (e.g. Reddit's <post-composer-title> where
           // Tier 1.5 typed into a hidden syncing textarea, then Tier 2.5 types
           // again here, doubling the title).
-          if (_typedText.length > 0 && _preSnap) {
+          // Conditional: only Meta+a when the leaf has actual content (hasContent).
+          // Skip for empty fields and containers — Meta+a in a container div
+          // (e.g. Notion wrapper) selects the entire page (title + body).
+          if (_typedText.length > 0 && _preSnap && _preSnap.hasContent) {
             await _ePage.keyboard.press('Meta+a').catch(() => {});
           }
           // insertText for long/hashtag text — avoids autocomplete popup interception

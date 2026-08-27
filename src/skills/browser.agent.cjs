@@ -350,7 +350,7 @@ async function _decisionCall(goal, actionHistory, currentUrl, focusedElement, ov
     : '';
 
   const _focusedStr = focusedElement
-    ? `${focusedElement.tag} "${(focusedElement.text || focusedElement.ariaLabel || '').slice(0, 60)}" role=${focusedElement.role || 'none'}`
+    ? _buildFocusedStr(focusedElement)
     : 'none (body/no focus)';
 
   const _isFillable = focusedElement
@@ -409,44 +409,942 @@ Strategy? (0, 1, 2, or 3)`;
   }
 }
 
+// ── Canvas layout scan ─────────────────────────────────────────────────
+// Lightweight DOM scan that identifies editable regions and their structure.
+// Returns a compact layout overview for the LLM so it can "see" the page layout.
+// Generic — uses ARIA roles, element types, and layout heuristics (not app-specific).
+// Works for: document editors (Notion, Google Docs), code editors (StackBlitz),
+// design canvas (Figma, Mermaid), spreadsheets (Google Sheets, Airtable).
+async function _scanCanvasLayout(sessionId) {
+  try {
+    const res = await callBrowserAct({
+      action: 'evaluate', sessionId, headed: true, timeoutMs: 3000,
+      text: `(() => {
+      // ── Region classifier: maps a DOM element to a region type ──
+      function _classifyRegion(el) {
+        const tag = el.tagName.toLowerCase();
+        const role = el.getAttribute('role') || '';
+        const ariaRoleDesc = el.getAttribute('aria-roledescription') || '';
+        const placeholder = (el.getAttribute('placeholder') || el.getAttribute('data-placeholder') || '').toLowerCase();
+        const cls = (el.className || '').toLowerCase();
+        const ce = el.isContentEditable;
+        const r = el.getBoundingClientRect();
+
+        // 1. Title: explicit aria-roledescription, placeholder, or h1 contenteditable
+        if (ariaRoleDesc.includes('page title') || ariaRoleDesc.includes('title')) return 'title';
+        if (placeholder.includes('untitled') || placeholder.includes('new page')) return 'title';
+        if (tag === 'h1' && ce) return 'title';
+
+        // 2. Code editor: CodeMirror, Monaco, or textarea with code
+        if (cls.includes('cm-editor') || cls.includes('monaco-editor') || el.closest('.cm-editor, .monaco-editor')) return 'editor';
+        if (tag === 'textarea' && (cls.includes('code') || el.closest('[class*="editor"]'))) return 'editor';
+
+        // 3. Preview: iframe
+        if (tag === 'iframe') return 'preview';
+
+        // 4. Terminal: xterm, .terminal, role=log
+        if (cls.includes('xterm') || cls.includes('terminal') || el.closest('.xterm, .terminal, [class*="terminal"]')) return 'terminal';
+        if (role === 'log') return 'terminal';
+
+        // 5. Spreadsheet: role=grid, or canvas with grid pattern (Google Sheets)
+        if (role === 'grid' || el.closest('[role="grid"]')) return 'spreadsheet';
+        if (tag === 'canvas' && r.width > 400 && r.height > 200) {
+          // Heuristic: large canvas in a spreadsheet context
+          if (el.closest('[class*="sheet"], [class*="spreadsheet"], [class*="grid"]')) return 'spreadsheet';
+          return 'canvas'; // Figma, Mermaid, Excalidraw
+        }
+
+        // 6. Formula bar / name box: input with formula/cell labels
+        if (tag === 'input') {
+          const al = (el.getAttribute('aria-label') || '').toLowerCase();
+          if (al.includes('formula') || al.includes('fx')) return 'formula_bar';
+          if (al.includes('name') && r.width < 100) return 'name_box';
+        }
+
+        // 7. SVG canvas (Figma, Mermaid)
+        if (tag === 'svg' && r.width > 200 && r.height > 200) return 'canvas';
+
+        // 8. Sidebar: narrow panel on left/right edge with nav items
+        if (r.width > 0 && r.width < 300 && (r.x < 50 || r.x + r.width > window.innerWidth - 50)) {
+          if (el.querySelector('a, [role="treeitem"], [role="link"], .file-tree, [class*="layer"]')) return 'sidebar';
+        }
+
+        // 9. Toolbar: horizontal bar with many buttons
+        if (r.height < 80 && r.width > 200) {
+          const btns = el.querySelectorAll('[role="button"], button');
+          if (btns.length >= 3 && !ce) return 'toolbar';
+        }
+
+        // 10. Sheet tabs: tablist at bottom of page
+        if (role === 'tablist' && r.y > window.innerHeight * 0.6) return 'sheet_tabs';
+
+        // 11. Properties/inspector: small panel with multiple inputs
+        if (r.width < 350 && r.x + r.width > window.innerWidth - 350) {
+          if (el.querySelectorAll('input, select').length >= 2) return 'properties';
+        }
+
+        // 12. Body: contenteditable that's not title, in main content area
+        if (ce && role === 'textbox') {
+          // Check if parent has page-content or similar
+          const parent = el.closest('[class*="page-content"], [class*="content"], [class*="body"], [class*="block"]');
+          if (parent) return 'body';
+          // Fallback: contenteditable textbox without title signals
+          if (!ariaRoleDesc.includes('title')) return 'body';
+        }
+
+        // 13. Generic contenteditable
+        if (ce) return 'body';
+
+        return null; // not a recognized region
+      }
+
+      // ── Get scoped text (not flattened innerText) ──
+      function _getScopedText(el) {
+        // For inputs/textarea, use .value
+        if (el.value !== undefined && el.value !== '') return String(el.value).slice(0, 150);
+        // For contenteditable, try selection-based text first
+        if (el.isContentEditable) {
+          try {
+            const sel = window.getSelection();
+            if (sel && sel.rangeCount > 0) {
+              let node = sel.getRangeAt(0).startContainer;
+              if (node.nodeType === 3) node = node.parentElement;
+              while (node && node !== el && node.parentElement !== el) node = node.parentElement;
+              const t = (node?.innerText || node?.textContent || '').trim();
+              if (t) return t.slice(0, 150);
+            }
+          } catch (_) {}
+        }
+        // Fallback: first-level child text only (not deeply nested)
+        let text = '';
+        for (const child of el.childNodes) {
+          if (child.nodeType === 3) text += child.textContent + ' ';
+          else if (child.nodeType === 1 && !child.querySelector('svg, [role="button"], button')) {
+            text += (child.innerText || child.textContent || '').slice(0, 80) + ' ';
+          }
+          if (text.length > 150) break;
+        }
+        return text.trim().replace(/\\s+/g, ' ').slice(0, 150);
+      }
+
+      // ── Find all candidate region elements ──
+      const candidates = new Set();
+      // Contenteditable elements
+      document.querySelectorAll('[contenteditable="true"], [contenteditable=""]').forEach(el => {
+        const r = el.getBoundingClientRect();
+        if (r.width > 0 && r.height > 0) candidates.add(el);
+      });
+      // Inputs and textareas (excluding hidden/checkbox/radio)
+      document.querySelectorAll('input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"]):not([type="submit"]):not([type="button"]):not([type="file"]), textarea').forEach(el => {
+        const r = el.getBoundingClientRect();
+        if (r.width > 0 && r.height > 0) candidates.add(el);
+      });
+      // Code editors
+      document.querySelectorAll('.cm-editor, .monaco-editor, [class*="cm-editor"], [class*="monaco-editor"]').forEach(el => {
+        const r = el.getBoundingClientRect();
+        if (r.width > 0 && r.height > 0) candidates.add(el);
+      });
+      // Iframes (preview)
+      document.querySelectorAll('iframe').forEach(el => {
+        const r = el.getBoundingClientRect();
+        if (r.width > 0 && r.height > 0) candidates.add(el);
+      });
+      // Terminals
+      document.querySelectorAll('.xterm, .terminal, [class*="terminal"], [role="log"]').forEach(el => {
+        const r = el.getBoundingClientRect();
+        if (r.width > 0 && r.height > 0) candidates.add(el);
+      });
+      // Spreadsheets
+      document.querySelectorAll('[role="grid"], canvas').forEach(el => {
+        const r = el.getBoundingClientRect();
+        if (r.width > 0 && r.height > 0) candidates.add(el);
+      });
+      // SVGs (canvas apps)
+      document.querySelectorAll('svg').forEach(el => {
+        const r = el.getBoundingClientRect();
+        if (r.width > 200 && r.height > 200) candidates.add(el);
+      });
+      // Toolbars: containers with many buttons
+      document.querySelectorAll('[class*="toolbar"], [class*="page-controls"], [role="toolbar"]').forEach(el => {
+        const r = el.getBoundingClientRect();
+        if (r.width > 0 && r.height > 0) candidates.add(el);
+      });
+      // Tablists at bottom (sheet tabs)
+      document.querySelectorAll('[role="tablist"]').forEach(el => {
+        const r = el.getBoundingClientRect();
+        if (r.width > 0 && r.height > 0) candidates.add(el);
+      });
+
+      // ── Classify and build region list ──
+      // Deduplicate: remove elements contained within other candidates of same type
+      const regions = [];
+      let id = 0;
+      const seen = new WeakSet();
+      for (const el of candidates) {
+        if (seen.has(el)) continue;
+        // Skip if parent candidate already covers this (avoid nested duplicates)
+        let dominated = false;
+        for (const other of candidates) {
+          if (other === el) continue;
+          if (other.contains(el) && !seen.has(other)) {
+            // Keep the more specific (inner) element for contenteditable, outer for containers
+            const otherType = _classifyRegion(other);
+            const elType = _classifyRegion(el);
+            if (otherType === elType && otherType !== 'toolbar' && otherType !== 'preview') {
+              dominated = true;
+              break;
+            }
+          }
+        }
+        if (dominated) continue;
+        seen.add(el);
+
+        const type = _classifyRegion(el);
+        if (!type) continue;
+
+        const r = el.getBoundingClientRect();
+        const text = _getScopedText(el);
+        const editable = el.isContentEditable || ['input', 'textarea'].includes(el.tagName.toLowerCase());
+        const role = el.getAttribute('role') || '';
+
+        // State
+        let state = editable ? (text ? 'filled' : 'empty') : 'not editable';
+        if (type === 'preview') state = 'iframe';
+        if (type === 'spreadsheet') state = 'grid';
+        if (type === 'canvas') state = 'graphic';
+
+        // For body regions, count sub-blocks (Notion-style)
+        let blockCount = 0;
+        if (type === 'body') {
+          const blocks = el.querySelectorAll('[contenteditable="true"], [contenteditable=""]');
+          blockCount = blocks.length;
+          if (blockCount === 0 && el.isContentEditable) blockCount = 1; // single block
+        }
+
+        regions.push({
+          id: ++id,
+          type,
+          text,
+          state,
+          editable,
+          role,
+          x: Math.round(r.x),
+          y: Math.round(r.y),
+          w: Math.round(r.width),
+          h: Math.round(r.height),
+          blockCount,
+        });
+      }
+
+      // Sort by position (y, then x)
+      regions.sort((a, b) => a.y - b.y || a.x - b.x);
+
+      // ── Detect focused region ──
+      let focusedId = -1;
+      try {
+        const sel = window.getSelection();
+        if (sel && sel.rangeCount > 0) {
+          let node = sel.getRangeAt(0).startContainer;
+          if (node.nodeType === 3) node = node.parentElement;
+          for (const reg of regions) {
+            // Find the element for this region by matching position
+            // (we don't store element refs in the return value)
+          }
+        }
+      } catch (_) {}
+      // Fallback: use document.activeElement
+      const active = document.activeElement;
+      if (active && active !== document.body) {
+        for (let i = 0; i < regions.length; i++) {
+          const reg = regions[i];
+          // Match by checking if active element has same position
+          const ar = active.getBoundingClientRect();
+          if (Math.abs(ar.y - reg.y) < 20 && Math.abs(ar.x - reg.x) < 20) {
+            focusedId = reg.id;
+            break;
+          }
+          // Or if active is contenteditable and matches text
+          if (active.isContentEditable && reg.editable && reg.type === 'body') {
+            const activeText = (active.innerText || '').trim().slice(0, 40);
+            if (activeText && reg.text.includes(activeText)) {
+              focusedId = reg.id;
+              break;
+            }
+          }
+        }
+      }
+
+      // ── Format as compact markup ──
+      const lines = regions.map(reg => {
+        const pos = reg.x > 0 ? \`x=\${reg.x}\` : \`y=\${reg.y}\`;
+        const focus = reg.id === focusedId ? ' ← FOCUSED' : '';
+        let content;
+        if (reg.type === 'toolbar') {
+          const btns = [];
+          // Re-find element to count buttons
+          content = '[buttons]';
+        } else if (reg.type === 'preview') {
+          content = '(iframe)';
+        } else if (reg.type === 'spreadsheet') {
+          content = \`grid \${reg.w}x\${reg.h}\`;
+        } else if (reg.type === 'canvas') {
+          content = '(graphic)';
+        } else if (reg.blockCount > 1) {
+          content = \`\${reg.blockCount} blocks\`;
+        } else {
+          content = reg.text ? \`"\${reg.text.slice(0, 60)}"\` : '""';
+        }
+        return \`  #\${reg.id} [\${reg.type}] \${pos}  \${content}\${focus}, \${reg.state}\`;
+      });
+      const layoutText = 'LAYOUT:\\n' + lines.join('\\n');
+
+      return { regions, focusedId, layoutText };
+    })()`,
+    });
+
+    // callBrowserAct returns { result, stdout, ... } — extract the JSON result
+    let raw = '';
+    if (res?.stdout) {
+      const _m = res.stdout.match(/^([\s\S]*?)(?=###\s|$)/i);
+      raw = _m ? _m[1].trim() : res.stdout.trim();
+      if (raw.startsWith('"') && raw.endsWith('"')) raw = raw.slice(1, -1).replace(/\\"/g, '"');
+    } else {
+      raw = String(res?.result || '').replace(/^"|"$/g, '');
+    }
+    let parsed;
+    try { parsed = typeof raw === 'string' ? JSON.parse(raw) : raw; }
+    catch (_) { parsed = null; }
+    if (parsed?.regions?.length > 0) {
+      logger.info(`[browser.agent] _scanCanvasLayout: ${parsed.regions.length} regions, focused=#${parsed.focusedId} — ${parsed.layoutText.replace(/\\n/g, ' | ')}`);
+    }
+    return parsed || { regions: [], focusedId: -1, layoutText: '' };
+  } catch (e) {
+    logger.warn(`[browser.agent] _scanCanvasLayout failed: ${e.message}`);
+    return { regions: [], focusedId: -1, layoutText: '' };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// _readEditorState — unified editor state reader for canvas-based editors.
+//
+// Gives Just-type "total awareness" of where the cursor is in the document:
+//   region (title/body/subject/code/cell), block index, block type, block text,
+//   cursor offset, and all blocks for context.
+//
+// Multi-strategy:
+//   1. DOM-ContentEditable (Notion, Confluence, Gmail, Outlook) — reads from DOM
+//   2. DOM-CodeEditor (CodeMirror, Monaco) — reads editor-specific DOM structure
+//   3. DOM-Spreadsheet (Google Sheets) — reads aria-label cell address
+//   4. OCR-Hybrid (Google Docs canvas) — OCR line clustering + DOM active-element y
+//
+// Returns unified shape:
+//   { region, blockIndex, totalBlocks, blockType, blockText, cursorOffset,
+//     titleText, allBlocks, source }
+// Or null if state can't be determined.
+// ---------------------------------------------------------------------------
+
+// Strategy 1: DOM for contenteditable editors (Notion, Confluence, Gmail, etc.)
+async function _readEditorStateDOM(sessionId) {
+  try {
+    const res = await callBrowserAct({
+      action: 'evaluate', sessionId, headed: true, timeoutMs: 3000,
+      text: `(() => {
+      const active = document.activeElement;
+      if (!active || active === document.body) return null;
+
+      // ── Leaf detection (same as _readActiveElement) ──
+      let el = active;
+      if (el.isContentEditable) {
+        try {
+          const sel = window.getSelection();
+          if (sel && sel.rangeCount > 0) {
+            let node = sel.getRangeAt(0).startContainer;
+            if (node.nodeType === 3) node = node.parentElement;
+            while (node && !node.isContentEditable) node = node.parentElement;
+            if (node && node !== el && el.contains(node)) el = node;
+          }
+        } catch (_) {}
+      }
+
+      // ── Region detection (multi-app, not Notion-specific) ──
+      const tag = el.tagName.toLowerCase();
+      const ariaRoleDesc = el.getAttribute('aria-roledescription') || '';
+      const ariaLabel = (el.getAttribute('aria-label') || '').toLowerCase();
+      const placeholder = (el.getAttribute('placeholder') || el.getAttribute('data-placeholder') || '').toLowerCase();
+      const name = el.getAttribute('name') || '';
+      const isTitle = ariaRoleDesc.includes('title') ||
+                      (tag === 'h1' && el.isContentEditable) ||
+                      placeholder.includes('untitled') || placeholder.includes('new page');
+      const isSubject = (name === 'subject' || ariaLabel.includes('subject')) && !isTitle;
+      const region = isTitle ? 'title' : isSubject ? 'subject' : 'body';
+
+      // ── Cursor position ──
+      let cursorOffset = 0;
+      try {
+        const sel = window.getSelection();
+        if (sel && sel.rangeCount > 0) cursorOffset = sel.anchorOffset || 0;
+      } catch (_) {}
+
+      // ── Current block text ──
+      const blockText = (el.innerText || el.value || '').trim().slice(0, 200);
+
+      // ── Title text (from any title element on page) ──
+      const titleEl = document.querySelector(
+        'h1[contenteditable], [aria-roledescription*="title" i], [aria-roledescription*="page title" i]'
+      );
+      const titleText = titleEl ? (titleEl.innerText || '').trim().slice(0, 100) : '';
+      const subjectEl = document.querySelector('input[name="subject"], [aria-label*="subject" i]');
+      const subjectText = subjectEl ? (subjectEl.value || '').trim().slice(0, 100) : '';
+
+      // ── Block enumeration (app-specific → generic fallback) ──
+      if (isTitle || isSubject) {
+        return {
+          region, blockIndex: 1, totalBlocks: 1,
+          blockType: region, blockText, cursorOffset,
+          titleText: isTitle ? blockText : titleText,
+          allBlocks: [{ index: 1, type: region, text: blockText }],
+          source: 'dom',
+        };
+      }
+
+      // Body region — enumerate all blocks
+      // Strategy A: app-specific block containers (Notion [data-block-id])
+      let blockEls = document.querySelectorAll(
+        '[data-block-id] [contenteditable="true"], [data-block-id] [contenteditable=""], [data-block-id][contenteditable="true"]'
+      );
+      // Strategy B: generic — all contenteditable in main content area
+      if (blockEls.length === 0) {
+        const main = document.querySelector(
+          '[class*="page-content"], [class*="editor-content"], [class*="document-content"], [role="main"], main, [class*="compose"] [class*="body"]'
+        );
+        blockEls = (main || document).querySelectorAll('[contenteditable="true"], [contenteditable=""]');
+      }
+
+      // Deduplicate nested contenteditable (parent + child both contenteditable)
+      const deduped = [];
+      const seen = new Set();
+      blockEls.forEach(b => {
+        if (seen.has(b)) return;
+        // Skip if parent is already in list (avoid nested duplicates)
+        let dominated = false;
+        blockEls.forEach(other => {
+          if (other !== b && other.contains(b) && !seen.has(other)) dominated = true;
+        });
+        if (!dominated) { deduped.push(b); seen.add(b); }
+      });
+
+      // Build block list
+      const blocks = deduped.map((b, i) => {
+        const text = (b.innerText || '').trim().slice(0, 80);
+        const hasCheckbox = !!b.closest('[role="checkbox"], [class*="todo"], [data-type="todo"]');
+        const isHeading = !!b.closest('h1, h2, h3, [class*="heading"], [data-type="heading"]');
+        const isBullet = !!b.closest('[class*="bullet"], [data-type="bullet"], [class*="list-item"]');
+        const isNumbered = !!b.closest('[class*="numbered"], [data-type="numbered"], [class*="ordered"]');
+        const type = hasCheckbox ? 'todo' : isHeading ? 'heading' : isBullet ? 'bullet' : isNumbered ? 'numbered' : 'paragraph';
+        return { index: i + 1, type, text: text || '' };
+      });
+
+      // Find active block index
+      const activeRect = el.getBoundingClientRect();
+      let activeIdx = -1;
+      deduped.forEach((b, i) => {
+        const r = b.getBoundingClientRect();
+        if (Math.abs(r.y - activeRect.y) < 20 && Math.abs(r.x - activeRect.x) < 20) {
+          activeIdx = i;
+        }
+      });
+      // Fallback: match by text
+      if (activeIdx < 0 && blockText) {
+        deduped.forEach((b, i) => {
+          if (activeIdx >= 0) return;
+          if ((b.innerText || '').includes(blockText.slice(0, 40))) activeIdx = i;
+        });
+      }
+      // Fallback: use activeElement directly
+      if (activeIdx < 0) {
+        activeIdx = deduped.findIndex(b => b === el);
+      }
+
+      return {
+        region, blockIndex: activeIdx + 1, totalBlocks: deduped.length,
+        blockType: blocks[activeIdx]?.type || 'paragraph',
+        blockText, cursorOffset,
+        titleText: titleText || subjectText,
+        allBlocks: blocks.slice(0, 15), source: 'dom',
+      };
+    })()`,
+    });
+
+    let raw = '';
+    if (res?.stdout) {
+      const _m = res.stdout.match(/^([\s\S]*?)(?=###\s|$)/i);
+      raw = _m ? _m[1].trim() : res.stdout.trim();
+      if (raw.startsWith('"') && raw.endsWith('"')) raw = raw.slice(1, -1).replace(/\\"/g, '"');
+    } else {
+      raw = String(res?.result || '').replace(/^"|"$/g, '');
+    }
+    let parsed;
+    try { parsed = typeof raw === 'string' ? JSON.parse(raw) : raw; }
+    catch (_) { parsed = null; }
+    return parsed || null;
+  } catch (e) {
+    logger.warn(`[browser.agent] _readEditorStateDOM failed: ${e.message}`);
+    return null;
+  }
+}
+
+// Strategy 2: DOM for code editors (CodeMirror, Monaco)
+async function _readEditorStateCode(sessionId) {
+  try {
+    const res = await callBrowserAct({
+      action: 'evaluate', sessionId, headed: true, timeoutMs: 3000,
+      text: `(() => {
+      // Detect editor type
+      const cmEditor = document.querySelector('.cm-editor, [class*="cm-editor"]');
+      const monacoEditor = document.querySelector('.monaco-editor, [class*="monaco-editor"]');
+
+      if (cmEditor) {
+        // CodeMirror
+        const lines = document.querySelectorAll('.cm-line');
+        const activeLine = document.querySelector('.cm-activeLine');
+        const cursor = document.querySelector('.cm-cursor');
+        const lineTexts = [];
+        lines.forEach((l, i) => {
+          lineTexts.push({ index: i + 1, type: 'code_line', text: (l.textContent || '').slice(0, 80) });
+        });
+        const activeIdx = activeLine ? [...lines].indexOf(activeLine) : -1;
+        return {
+          region: 'code', blockIndex: activeIdx + 1, totalBlocks: lines.length,
+          blockType: 'code_line',
+          blockText: activeLine ? (activeLine.textContent || '').slice(0, 200) : '',
+          cursorOffset: 0, // CodeMirror cursor offset is complex — skip for now
+          titleText: '',
+          allBlocks: lineTexts.slice(0, 15), source: 'dom',
+        };
+      }
+
+      if (monacoEditor) {
+        // Monaco
+        const lines = document.querySelectorAll('.monaco-editor .view-line');
+        const activeLine = document.querySelector('.monaco-editor .current-line');
+        const lineTexts = [];
+        lines.forEach((l, i) => {
+          lineTexts.push({ index: i + 1, type: 'code_line', text: (l.textContent || '').slice(0, 80) });
+        });
+        const activeIdx = activeLine ? [...lines].indexOf(activeLine) : -1;
+        return {
+          region: 'code', blockIndex: activeIdx + 1, totalBlocks: lines.length,
+          blockType: 'code_line',
+          blockText: activeLine ? (activeLine.textContent || '').slice(0, 200) : '',
+          cursorOffset: 0,
+          titleText: '',
+          allBlocks: lineTexts.slice(0, 15), source: 'dom',
+        };
+      }
+
+      return null;
+    })()`,
+    });
+
+    let raw = '';
+    if (res?.stdout) {
+      const _m = res.stdout.match(/^([\s\S]*?)(?=###\s|$)/i);
+      raw = _m ? _m[1].trim() : res.stdout.trim();
+      if (raw.startsWith('"') && raw.endsWith('"')) raw = raw.slice(1, -1).replace(/\\"/g, '"');
+    } else {
+      raw = String(res?.result || '').replace(/^"|"$/g, '');
+    }
+    let parsed;
+    try { parsed = typeof raw === 'string' ? JSON.parse(raw) : raw; }
+    catch (_) { parsed = null; }
+    return parsed || null;
+  } catch (e) {
+    logger.warn(`[browser.agent] _readEditorStateCode failed: ${e.message}`);
+    return null;
+  }
+}
+
+// Strategy 3: DOM for spreadsheets (Google Sheets, Airtable)
+async function _readEditorStateSheet(sessionId) {
+  try {
+    const res = await callBrowserAct({
+      action: 'evaluate', sessionId, headed: true, timeoutMs: 3000,
+      text: `(() => {
+      const active = document.activeElement;
+      if (!active) return null;
+
+      // Google Sheets: active cell has aria-label like "Cell A1 selected"
+      const ariaLabel = active.getAttribute('aria-label') || '';
+      const cellMatch = ariaLabel.match(/cell\\s+([A-Z]+)(\\d+)\\s+selected/i);
+
+      // Formula bar
+      const formulaBar = document.querySelector('input[aria-label*="formula" i], input[aria-label*="fx" i], textarea[aria-label*="formula" i]');
+      const formulaValue = formulaBar ? (formulaBar.value || '') : '';
+
+      // Cell content from active element
+      const cellText = (active.innerText || active.value || '').trim().slice(0, 200);
+
+      if (cellMatch) {
+        const col = cellMatch[1];
+        const row = parseInt(cellMatch[2], 10);
+        return {
+          region: 'cell', blockIndex: 1, totalBlocks: 1,
+          blockType: 'cell',
+          blockText: cellText,
+          cursorOffset: 0,
+          titleText: '',
+          allBlocks: [{ index: 1, type: 'cell', text: \`Cell \${col}\${row}: "\${cellText}"\` }],
+          source: 'dom',
+          cellAddress: \`\${col}\${row}\`,
+          formulaBar: formulaValue,
+        };
+      }
+
+      // Fallback: check for role=gridcell
+      const gridCell = active.closest('[role="gridcell"]');
+      if (gridCell) {
+        const cellText2 = (gridCell.innerText || '').trim().slice(0, 200);
+        return {
+          region: 'cell', blockIndex: 1, totalBlocks: 1,
+          blockType: 'cell',
+          blockText: cellText2,
+          cursorOffset: 0,
+          titleText: '',
+          allBlocks: [{ index: 1, type: 'cell', text: cellText2 }],
+          source: 'dom',
+        };
+      }
+
+      return null;
+    })()`,
+    });
+
+    let raw = '';
+    if (res?.stdout) {
+      const _m = res.stdout.match(/^([\s\S]*?)(?=###\s|$)/i);
+      raw = _m ? _m[1].trim() : res.stdout.trim();
+      if (raw.startsWith('"') && raw.endsWith('"')) raw = raw.slice(1, -1).replace(/\\"/g, '"');
+    } else {
+      raw = String(res?.result || '').replace(/^"|"$/g, '');
+    }
+    let parsed;
+    try { parsed = typeof raw === 'string' ? JSON.parse(raw) : raw; }
+    catch (_) { parsed = null; }
+    return parsed || null;
+  } catch (e) {
+    logger.warn(`[browser.agent] _readEditorStateSheet failed: ${e.message}`);
+    return null;
+  }
+}
+
+// Strategy 4: OCR-Hybrid for canvas editors (Google Docs, Excalidraw, etc.)
+// Uses OCR to get text lines, DOM to get active element position for active-line detection.
+async function _readEditorStateOCR(sessionId) {
+  try {
+    const { structureOcrOverlayItems } = require('./ocrOverlayStructure.cjs');
+    let engine;
+    try { engine = require('./browser-engine.cjs'); } catch (_) { return null; }
+    const page = engine.getPage(sessionId);
+    if (!page) return null;
+
+    // 1. OCR capture
+    const cap = await _liteparseCapture(page);
+    if (!cap?.ok || !cap.textItems || cap.textItems.length === 0) return null;
+
+    // 2. Cluster into rows
+    let rows = structureOcrOverlayItems(cap.textItems);
+    if (rows.length === 0) return null;
+
+    // 3. Filter to content rows (drop buttons, dividers, menu items)
+    //    Content rows are typically in the center-left of the page, not in toolbars
+    const contentRows = rows.filter(r => {
+      if (r.type === 'button' || r.type === 'divider') return false;
+      // Drop rows in toolbar area (y < 80px typically)
+      if ((r.y || 0) < 80) return false;
+      // Drop rows in sidebar (x < 200 and narrow width)
+      if ((r.x || 0) < 200 && (r.width || 0) < 300) return false;
+      return true;
+    });
+    if (contentRows.length === 0) return null;
+
+    // 4. Detect title: first row with large height (title font is bigger)
+    const avgHeight = contentRows.reduce((s, r) => s + (r.height || 0), 0) / contentRows.length;
+    const titleRow = contentRows.find(r => (r.height || 0) > avgHeight * 1.3 && (r.y || 0) < 200);
+    const titleText = titleRow ? (titleRow.text || '').slice(0, 100) : '';
+
+    // 5. Body blocks = content rows after title
+    const bodyRows = titleRow
+      ? contentRows.filter(r => (r.y || 0) > (titleRow.y || 0) + (titleRow.height || 0))
+      : contentRows;
+    const allBlocks = bodyRows.map((r, i) => ({
+      index: i + 1,
+      type: (r.height || 0) > avgHeight * 1.1 ? 'heading' : 'paragraph',
+      text: (r.text || '').slice(0, 80),
+    }));
+
+    // 6. Detect active line (hybrid: DOM active element y → match to nearest OCR row)
+    let activeIndex = -1;
+    try {
+      const activeRes = await callBrowserAct({
+        action: 'evaluate', sessionId, headed: true, timeoutMs: 2000,
+        text: `(() => {
+          const el = document.activeElement;
+          if (!el || el === document.body) return null;
+          const r = el.getBoundingClientRect();
+          return { x: Math.round(r.x), y: Math.round(r.y), h: Math.round(r.height) };
+        })()`,
+      });
+      let activeRaw = '';
+      if (activeRes?.stdout) {
+        const _m = activeRes.stdout.match(/^([\s\S]*?)(?=###\s|$)/i);
+        activeRaw = _m ? _m[1].trim() : activeRes.stdout.trim();
+        if (activeRaw.startsWith('"') && activeRaw.endsWith('"')) activeRaw = activeRaw.slice(1, -1).replace(/\\"/g, '"');
+      } else {
+        activeRaw = String(activeRes?.result || '').replace(/^"|"$/g, '');
+      }
+      let activePos;
+      try { activePos = typeof activeRaw === 'string' ? JSON.parse(activeRaw) : activeRaw; }
+      catch (_) { activePos = null; }
+
+      if (activePos && activePos.y != null) {
+        // Find nearest body row by y-coordinate
+        let minDist = Infinity;
+        bodyRows.forEach((r, i) => {
+          const dist = Math.abs((r.y || 0) - activePos.y);
+          if (dist < minDist) { minDist = dist; activeIndex = i; }
+        });
+      }
+    } catch (_) {}
+
+    // 7. Build result
+    const activeBlock = activeIndex >= 0 ? allBlocks[activeIndex] : null;
+    const cursorOffset = activeBlock ? (activeBlock.text || '').length : 0;
+
+    return {
+      region: activeIndex >= 0 ? 'body' : (titleRow ? 'title' : 'body'),
+      blockIndex: activeIndex >= 0 ? activeIndex + 1 : 0,
+      totalBlocks: allBlocks.length,
+      blockType: activeBlock?.type || 'paragraph',
+      blockText: activeBlock?.text || '',
+      cursorOffset,
+      titleText,
+      allBlocks: allBlocks.slice(0, 15),
+      source: 'ocr',
+    };
+  } catch (e) {
+    logger.warn(`[browser.agent] _readEditorStateOCR failed: ${e.message}`);
+    return null;
+  }
+}
+
+// Main dispatcher: picks the right strategy based on pageCategory
+async function _readEditorState(sessionId, pageCategory) {
+  // Strategy 1: DOM for contenteditable editors
+  if (['document_editor', 'email_compose'].includes(pageCategory)) {
+    const dom = await _readEditorStateDOM(sessionId);
+    // Only accept DOM result if it's useful (has blocks, title, content, or is in title/subject region).
+    // For canvas editors like Google Docs, DOM returns empty blocks and no text — fall through to OCR.
+    if (dom && (dom.totalBlocks > 0 || dom.titleText || dom.blockText || dom.region === 'title' || dom.region === 'subject')) {
+      logger.info(`[browser.agent] _readEditorState: region=${dom.region}, block=${dom.blockIndex}/${dom.totalBlocks}, type=${dom.blockType}, text="${(dom.blockText || '').slice(0, 40)}" (source=${dom.source})`);
+      return dom;
+    }
+  }
+
+  // Strategy 2: DOM for code editors
+  if (pageCategory === 'code_editor') {
+    const code = await _readEditorStateCode(sessionId);
+    if (code) {
+      logger.info(`[browser.agent] _readEditorState: region=${code.region}, line=${code.blockIndex}/${code.totalBlocks} (source=${code.source})`);
+      return code;
+    }
+  }
+
+  // Strategy 3: DOM for spreadsheets
+  if (pageCategory === 'spreadsheet') {
+    const sheet = await _readEditorStateSheet(sessionId);
+    if (sheet) {
+      logger.info(`[browser.agent] _readEditorState: region=${sheet.region}, cell="${sheet.blockText.slice(0, 40)}" (source=${sheet.source})`);
+      return sheet;
+    }
+  }
+
+  // Strategy 4: OCR fallback (canvas editors only — Google Docs, Excalidraw, etc.)
+  // Only run for canvas-prone categories to avoid 1-2s OCR latency on regular web pages.
+  const _ocrEligibleCategories = ['document_editor', 'code_editor', 'design_canvas', 'spreadsheet'];
+  if (_ocrEligibleCategories.includes(pageCategory)) {
+    const ocr = await _readEditorStateOCR(sessionId);
+    if (ocr) {
+      logger.info(`[browser.agent] _readEditorState: region=${ocr.region}, block=${ocr.blockIndex}/${ocr.totalBlocks} (source=${ocr.source})`);
+      return ocr;
+    }
+  }
+
+  logger.info(`[browser.agent] _readEditorState: no state available (category=${pageCategory})`);
+  return null;
+}
+
+// Format editor state into a compact LLM-readable block
+function _formatEditorStateForLLM(editorState) {
+  if (!editorState) return '';
+
+  const lines = [];
+  lines.push('Current position:');
+  lines.push(`  Region: ${editorState.region}`);
+  const _blockStr = editorState.blockIndex > 0
+    ? `${editorState.blockIndex} of ${editorState.totalBlocks} blocks`
+    : `unknown (of ${editorState.totalBlocks} blocks)`;
+  lines.push(`  Block: ${_blockStr}`);
+  lines.push(`  Block type: ${editorState.blockType}`);
+  lines.push(`  Current text: "${(editorState.blockText || '').slice(0, 60)}" ${editorState.blockText ? '(filled)' : '(empty)'}`);
+  lines.push(`  Cursor: position ${editorState.cursorOffset}`);
+
+  if (editorState.titleText) {
+    lines.push('');
+    lines.push(`Document title: "${editorState.titleText}" (filled)`);
+  }
+
+  if (editorState.allBlocks && editorState.allBlocks.length > 0) {
+    lines.push('');
+    lines.push(editorState.region === 'body' ? 'Body blocks:' : 'All blocks:');
+    editorState.allBlocks.forEach(b => {
+      const marker = b.index === editorState.blockIndex ? ' ← YOU ARE HERE' : '';
+      const textStr = b.text ? `"${b.text.slice(0, 50)}"` : '""';
+      lines.push(`    #${b.index} [${b.type}] ${textStr}${marker}`);
+    });
+  }
+
+  return lines.join('\n');
+}
+
+// ---------------------------------------------------------------------------
+// Shared focused-element descriptor builder.
+// Used by all LLM callers (_extractValue, _extractFieldType, _extractCommandPlan,
+// _extractSearchPlan, _decisionCall) so every LLM sees the same rich field info:
+//   tag[contenteditable][aria-roledescription] label="..." placeholder="..."
+// Exported for use by instruction.runner.cjs (_selectTierLLM).
+// ---------------------------------------------------------------------------
+function _buildFocusedStr(focusedElement) {
+  if (!focusedElement) return 'unknown';
+  const ce = focusedElement.isContentEditable ? '[contenteditable]' : '';
+  const ard = focusedElement.ariaRoleDescription ? `[${focusedElement.ariaRoleDescription}]` : '';
+  const label = (focusedElement.text || focusedElement.ariaLabel || '').slice(0, 60);
+  const ph = (focusedElement.placeholder || focusedElement.dataPlaceholder || '').slice(0, 60);
+  return `${focusedElement.tag}${ce}${ard} label="${label}" placeholder="${ph}"`;
+}
+
 // Value extraction: what to type into the focused field.
 // Returns the value, "PRESS_ENTER", or "SKIP".
 async function _extractValue(goal, focusedElement, actionHistory, agentContext, currentValue = '', pageContext = {}) {
   const { askWithMessages } = require('../skill-helpers/skill-llm.cjs');
 
+
   const _contextBlock = agentContext
     ? `\n\nAgent context (service descriptor / playbook — use these labels if relevant):\n${String(agentContext).slice(0, 1000)}`
     : '';
 
-  const _focusedStr = focusedElement
-    ? `${focusedElement.tag} label="${(focusedElement.text || focusedElement.ariaLabel || '').slice(0, 60)}" placeholder="${(focusedElement.placeholder || '').slice(0, 60)}"`
-    : 'unknown';
+  const _focusedStr = _buildFocusedStr(focusedElement);
+
+  const _layoutBlock = pageContext.layoutText
+    ? `\nPage layout (regions, top to bottom):\n${pageContext.layoutText}\n\nThe ← FOCUSED marker shows which region is currently focused.\n- If the focused region's value is already correct AND other regions need content, return PRESS_ENTER or PRESS_TAB to move to the next region.\n- If the focused region is wrong for the current goal, return PRESS_TAB to move to the next region.\n- If a dropdown/menu is open and you need to select an item, return PRESS_ARROW_DOWN then PRESS_ENTER.\n- If a block needs to be exited, return PRESS_ESCAPE.\n`
+    : '';
+
+  const _editorStateBlock = pageContext.editorStateText
+    ? `\n${pageContext.editorStateText}\n`
+    : '';
 
   const systemPrompt = `You extract the value to type into a focused field on a web page.
-Look at the goal and what's been done. Return ONLY the value to type — nothing else.
+Look at the goal, the editor state, and what's been done. Return ONLY the NEXT value to type — nothing else.
+- Return ONLY the NEXT value to type. The system will call you again for the next value. Do NOT return multiple items at once.
 - Extract values ONLY from the goal text. Do NOT invent or hallucinate values that are not in the goal.
+- EXCEPTION: If the goal asks for N items/blocks but doesn't specify what they are (e.g. "add a todo list with three items"), generate generic placeholder items (Item 1, Item 2, ... Item N). The user can edit them later.
 - If the field is empty and the goal specifies a value (email address, name, search query, message body), type that value — do NOT return PRESS_ENTER for an empty field.
 - If the field already contains the exact value needed, return PRESS_ENTER (if Enter confirms/submits) or SKIP (if no action needed)
+- If the focused field already contains the correct value AND the goal has more to do on this page (e.g. title is filled, goal also asks for body content), return PRESS_ENTER to move focus to the next field
+- If the focused field is the wrong field for this goal (e.g. focus is in title, goal is about body content), return PRESS_ENTER to try moving to the next field
 - Do NOT return the same value that's already in the field — either return PRESS_ENTER, SKIP, or a different value
-- If this isn't the right field to type into (wrong field for this goal) → return SKIP
+- If this isn't the right field to type into AND PRESS_ENTER would submit instead of moving focus → return SKIP
 - Otherwise return the exact value to type (no quotes, no explanation)
 - Extract values from the goal text (quoted strings, names, search queries, message bodies)
-- If the goal requires creating a block (heading, todo, bullet) in a block-based editor, return the block-creation shortcut (e.g. "/h1", "/todo", "[]") — NOT the final text. The system will type the shortcut, press Enter, then ask again for the block text.
-- For block-based editors (Notion, Google Docs): if the goal requires creating multiple blocks (list items, todos, headings), return ALL blocks as a single multi-line value with \\n between each block. Include block-creation shortcuts (e.g. "[] " for todo, "- " for bullet) at the start of each line.
-- Example: for "add a todo list with: Read John 3, Memorize Psalm 23, Pray for family" → return "[] Read John 3\\n[] Memorize Psalm 23\\n[] Pray for family"
-- Check the Agent context for the app's specific block-creation shortcuts and patterns.`;
+- ONE VALUE AT A TIME RULE: For block-based editors (Notion, Google Docs, Confluence), return ONLY the next single value to type — NOT all items at once.
+  Use the editor state to determine what's next:
+  - If in title and title is empty → type the title text from the goal
+  - If in title and title is filled → return PRESS_ENTER to move to body
+  - If in body and current block is empty → type the next item from the goal (or the block command like /todo first)
+  - If in body and current block is filled → return PRESS_ENTER to create the next block
+  Use the action history to know what's already been done.
+  Example: goal "add a todo list with: Read, Study, Pray"
+  - Call 1 (in empty body): return "/todo"
+  - Call 2 (in empty todo block): return "Read"
+  - Call 3 (in filled todo block "Read"): return PRESS_ENTER
+  - Call 4 (in empty todo block): return "Study"
+  - Call 5 (in filled todo block "Study"): return PRESS_ENTER
+  - Call 6 (in empty todo block): return "Pray"
+- For block-based editors with a command system (see Agent context for prefix and commands):
+  if the goal requires creating blocks (todo, heading, bullet), return the command for the FIRST block only (e.g. "/todo").
+  The system will type the command, select from dropdown, then type each item in subsequent calls.
+- Do NOT use markdown shortcuts ([] , ##, -) when the app has a command system. Commands are preferred because they create blocks properly and handle continuation.
+- Only use markdown shortcuts ([] , ##, -) for apps WITHOUT a command system (plain markdown editors, GitHub, HackMD).
+- Check the Agent context for the app's specific command prefix and available commands.
+- If the command list is incomplete, infer the command from the goal (e.g. "todo" → "/todo", "heading" → "/h1").
+- KEY ACTIONS: You can return special key commands to navigate between regions:
+  PRESS_ENTER — confirm/create block, run command, submit
+  PRESS_TAB — move to next region, indent in code, next cell in spreadsheets
+  PRESS_ESCAPE — exit dropdown/menu/overlay, exit block
+  PRESS_SPACE — toggle checkbox, expand/collapse
+  PRESS_ARROW_DOWN / PRESS_ARROW_UP / PRESS_ARROW_LEFT / PRESS_ARROW_RIGHT — navigate
+  PRESS_BACKSPACE — delete character/block
+  Key combinations: PRESS_SHIFT+ENTER (soft line break), PRESS_SHIFT+TAB (outdent), PRESS_META+Z (undo), PRESS_META+A (select all)
+- Use the Page layout (if provided) to decide which region needs content and which key to press to navigate.
+- Use the Editor state (if provided) to see exactly which block you're in, what's already typed, and what's next.
+- TITLE FIELD GUARD: If the focused field is a title field (aria-roledescription includes "title", or placeholder includes "New page" or "Untitled", or it's an h1), return the LITERAL title text from the goal — never a command (no leading /). Commands (like /todo) are for body blocks only. If the title is already filled correctly, return PRESS_ENTER to move to the body.
+- FIELD-ORDER RULE (canvas editors): If the focused region is the title (see ← FOCUSED marker in Page layout) and it already contains the correct title, return PRESS_ENTER to move focus to the body. Do NOT return body commands while the title is focused — the title is for the page name only. Body commands (like /todo) must be typed into the body region, not the title.`;
 
   const historyStr = actionHistory.slice(-5).map((a, i) => `  ${i + 1}. ${a}`).join('\n');
 
+  const _ocrBlock = pageContext.ocrContext
+    ? `\nOCR visual text (may include content not in DOM): ${pageContext.ocrContext}\n`
+    : '';
+
   const userPrompt = `Goal: ${goal}
 Page title: ${pageContext.title || 'unknown'}
-Visible text: ${(pageContext.visibleText || '').slice(0, 150)}
+Visible text: ${(pageContext.visibleText || '').slice(0, 150)}${_editorStateBlock}${_layoutBlock}${_ocrBlock}
 Focused field: ${_focusedStr}
 Current field value: "${(currentValue || '').slice(0, 80)}"
 Actions taken:
 ${historyStr}${_contextBlock}
 
 Value to type?`;
+
+  // ── Deterministic title pre-check (skip LLM for obvious cases) ──
+  // If the focused field is a title with existing content AND the goal doesn't
+  // explicitly mention changing the title, return PRESS_ENTER to move to the body.
+  // This prevents the LLM from returning body content (e.g. "Favorite Pizza") for
+  // the title field — a common failure that overwrites the title.
+  const _ard = (focusedElement?.ariaRoleDescription || '').toLowerCase();
+  const _tag = focusedElement?.tag || '';
+  const _ph = (focusedElement?.placeholder || '').toLowerCase();
+  const _isTitle = _ard.includes('title') ||
+                   (_tag === 'h1' && focusedElement?.isContentEditable) ||
+                   _ph.includes('untitled') || _ph.includes('new page');
+
+  // Title "content" should not include placeholder text like "New page" or "Untitled".
+  // If the value equals the placeholder, the field is effectively empty.
+  const _cv = (currentValue || '').trim();
+  const _phText = (focusedElement?.placeholder || '').trim();
+  const _titleHasContent = _cv.length > 0 &&
+                           !(_phText && _cv.toLowerCase() === _phText.toLowerCase());
+
+  // Goal wants title change if it mentions title/name/renaming OR says the page is
+  // "called", "named", "entitled", or "titled" something.
+  const _goalWantsTitleChange = /\b(title|name of the page|page name|rename|call the page|name this page|called|named|entitled|titled)\b/i.test(goal || '');
+
+  // Fire whenever the focused field is a title and the goal is NOT about the title.
+  // This protects the title from body commands whether it's empty (placeholder) or
+  // already filled. It fires on empty title too, so e.g. /todo commands go to body.
+  if (_isTitle && !_goalWantsTitleChange) {
+    logger.info(`[browser.agent] _extractValue: title field focused + goal not about title → PRESS_ENTER`);
+    return 'PRESS_ENTER';
+  }
 
   try {
     const raw = await askWithMessages([
@@ -459,6 +1357,674 @@ Value to type?`;
   } catch (e) {
     logger.warn(`[browser.agent] _extractValue failed: ${e.message}`);
     return 'SKIP';
+  }
+}
+
+// After-action decision: what key to press AFTER typing the value.
+// Returns a number: 0=nothing, 1=Enter, 2=Tab, 3=Escape, 4=Shift+Enter, 5=ArrowDown
+// Separate from _extractValue so _extractValue stays a plain-string return
+// (reliable with light models). This is a tiny single-number call.
+// Deterministic pre-checks skip the LLM for obvious cases.
+async function _extractAfterAction(goal, focusedElement, value, actionHistory, pageContext = {}, agentContext = {}) {
+  // ── Deterministic pre-checks (skip LLM for obvious cases) ──
+
+  // No value or special key → no after-action
+  if (!value || value === 'SKIP' || String(value).startsWith('PRESS_')) return 0;
+
+  // AI chat page → always Enter after typing (form submit)
+  if (pageContext.pageCategory === 'ai_chat') return 1;
+
+  // Title region → Enter to move to body (structural navigation).
+  // Detect title by regionType OR by aria-roledescription/h1 tag. The tag/role
+  // fallback runs even when regionType is set (e.g. OCR misreported 'body' while
+  // the title h1 was actually focused), so Enter is reliably pressed after the
+  // title and focus moves to the body.
+  const _ariaRoleDesc = focusedElement?.ariaRoleDescription || '';
+  const _tag = focusedElement?.tag || '';
+  if (focusedElement?.regionType === 'title' ||
+      _ariaRoleDesc.includes('title') ||
+      (_tag === 'h1' && focusedElement?.isContentEditable)) {
+    return 1;
+  }
+
+  // Multi-line content (has newlines) → no after-action (content has its own structure)
+  if (String(value).includes('\n')) return 0;
+
+  // Value starts with / (block command) → ArrowDown to select first dropdown item
+  if (String(value).startsWith('/')) return 5;
+
+  // Value starts with @ (mention/search command) → ArrowDown to select first match
+  if (String(value).startsWith('@')) return 5;
+
+  // ── LLM call for ambiguous cases ──
+  const { askWithMessages } = require('../skill-helpers/skill-llm.cjs');
+  const _focusedStr = _buildFocusedStr(focusedElement);
+
+  const systemPrompt = `You decide what key to press AFTER typing a value into a field.
+Return ONLY a single number — nothing else:
+0 = nothing (just type the value, no key after)
+1 = press Enter after typing
+2 = press Tab after typing
+3 = press Escape after typing
+4 = press Shift+Enter after typing (soft line break within a block)
+5 = press Arrow Down after typing (select first item in dropdown)
+
+Rules:
+- 1 (Enter): search submit, single-field form submit, chat message send, title→body navigation
+- 0 (nothing): form fields with more fields to fill, multi-line content, just filling a value
+- 2 (Tab): moving to next form field where Tab is the navigation key
+- 3 (Escape): exit dropdown/menu/overlay after typing a filter
+- 4 (Shift+Enter): soft line break within a block (not a new block)
+- 5 (Arrow Down): select first dropdown item after typing a filter (@mentions, slash commands)
+- When in doubt, return 0 — the next iteration will re-evaluate
+Return ONLY the number.`;
+
+  const historyStr = (actionHistory || []).slice(-3).map((a, i) => `  ${i + 1}. ${a}`).join('\n');
+
+  const _editorStateBlock = pageContext.editorStateText
+    ? `\n${pageContext.editorStateText}\n`
+    : '';
+
+  const userPrompt = `Goal: ${goal}
+Page title: ${pageContext.title || 'unknown'}${_editorStateBlock}
+Focused field: ${_focusedStr}
+Value to type: "${String(value || '').slice(0, 80)}"
+Current field value: "${(focusedElement?.currentValue || '').slice(0, 80)}"
+Actions taken:
+${historyStr}
+
+Number (0-5)?`;
+
+  try {
+    const raw = await askWithMessages([
+      { role: 'system', content: systemPrompt },
+      { role: 'user', content: userPrompt },
+    ], { maxTokens: 5, temperature: 0, responseTimeoutMs: 5000 });
+    const num = parseInt((raw || '').trim(), 10);
+    if (num >= 0 && num <= 5) {
+      logger.info(`[browser.agent] _extractAfterAction: ${num} for value="${String(value || '').slice(0, 40)}" field="${_focusedStr}"`);
+      return num;
+    }
+    logger.info(`[browser.agent] _extractAfterAction: invalid "${raw}" → defaulting to 0`);
+    return 0;
+  } catch (e) {
+    logger.warn(`[browser.agent] _extractAfterAction failed: ${e.message}`);
+    return 0;
+  }
+}
+
+// Gesture type detection: returns a number indicating what kind of gesture is needed.
+// 0 = no gesture, 1 = drag-drop, 2 = slider horizontal, 3 = slider vertical
+// Deterministic pre-checks skip the LLM for obvious non-gesture goals.
+async function _extractGestureType(goal, focusedElement, actionHistory, pageContext = {}) {
+  // ── Deterministic pre-checks ──
+  const _hasGestureKeyword = /\b(drag|slide|slider|rearrange|reorder|move.*to|pull|push|adjust)\b/i.test(goal || '');
+  if (!_hasGestureKeyword) return 0;
+
+  // ── LLM call for ambiguous cases ──
+  const { askWithMessages } = require('../skill-helpers/skill-llm.cjs');
+  const _focusedStr = _buildFocusedStr(focusedElement);
+
+  const systemPrompt = `You decide what kind of gesture (if any) is needed for this task.
+Return ONLY a single number — nothing else:
+0 = no gesture needed (regular typing/clicking)
+1 = drag-drop (drag an element to another element)
+2 = slider horizontal (drag a handle left or right)
+3 = slider vertical (drag a handle up or down)
+
+Rules:
+- 1 (drag-drop): "drag X to Y", "move X into Y", "rearrange", "reorder"
+- 2 (slider horizontal): "set slider to", "adjust to N%", horizontal sliders
+- 3 (slider vertical): vertical sliders, volume controls that go up/down
+- 0 (no gesture): typing, clicking buttons, filling forms, navigating
+- When in doubt, return 0
+Return ONLY the number.`;
+
+  const historyStr = (actionHistory || []).slice(-3).map((a, i) => `  ${i + 1}. ${a}`).join('\n');
+
+  const userPrompt = `Goal: ${goal}
+Page title: ${pageContext.title || 'unknown'}
+Focused element: ${_focusedStr}
+Actions taken:
+${historyStr}
+
+Number (0-3)?`;
+
+  try {
+    const raw = await askWithMessages([
+      { role: 'system', content: systemPrompt },
+      { role: 'user', content: userPrompt },
+    ], { maxTokens: 5, temperature: 0, responseTimeoutMs: 5000 });
+    const num = parseInt((raw || '').trim().replace(/\D/g, ''), 10);
+    if (num >= 0 && num <= 3) {
+      logger.info(`[browser.agent] _extractGestureType: ${num} for goal="${String(goal || '').slice(0, 60)}"`);
+      return num;
+    }
+    logger.info(`[browser.agent] _extractGestureType: invalid "${raw}" → defaulting to 0`);
+    return 0;
+  } catch (e) {
+    logger.warn(`[browser.agent] _extractGestureType failed: ${e.message}`);
+    return 0;
+  }
+}
+
+// Gesture target selection: picks source and target (or offset) from a Tab-Map.
+// Returns { sourceEntry, targetEntry, offset } or null.
+// - drag-drop (type=1): sourceEntry + targetEntry from Tab-Map (2 numbers)
+// - slider (type=2/3): sourceEntry from Tab-Map + offset (pixels, from goal % or default)
+async function _extractGestureTargets(gestureType, goal, tabMap, actionHistory = []) {
+  if (!tabMap || tabMap.length === 0) return null;
+  const { askWithMessages } = require('../skill-helpers/skill-llm.cjs');
+
+  // Build simplified list (same format as _llmPickFromTabMap in instruction.runner)
+  const listStr = tabMap.map(e =>
+    `${e.id} - ${e.tag || 'element'}${e.text ? ` "${String(e.text).substring(0, 50)}"` : ''}${e.ariaLabel ? ` [${String(e.ariaLabel).substring(0, 40)}]` : ''}${e.placeholder ? ` placeholder="${String(e.placeholder).substring(0, 40)}"` : ''}`
+  ).join('\n');
+
+  if (gestureType === 1) {
+    // Drag-drop: pick source + target (2 numbers, space-separated)
+    const prompt = `Task: ${goal}
+
+Available elements:
+${listStr}
+
+Which element to DRAG, and which element to DROP IT ON?
+Output TWO numbers separated by a space: source target
+Example: 5 12
+If either element is not in the list, use 0 for it.
+Output ONLY the two numbers.`;
+
+    try {
+      const raw = await askWithMessages([
+        { role: 'system', content: 'You pick two elements from a list. Output ONLY two numbers separated by a space: source target. Use 0 if not found.' },
+        { role: 'user', content: prompt },
+      ], { maxTokens: 10, temperature: 0, responseTimeoutMs: 8000 });
+      const nums = (raw || '').trim().split(/\s+/).map(n => parseInt(n.replace(/\D/g, ''), 10) || 0);
+      const srcId = nums[0] || 0;
+      const tgtId = nums[1] || 0;
+      const sourceEntry = srcId > 0 ? tabMap.find(e => e.id === srcId) : null;
+      const targetEntry = tgtId > 0 ? tabMap.find(e => e.id === tgtId) : null;
+      logger.info(`[browser.agent] _extractGestureTargets (drag-drop): src=#${srcId}, tgt=#${tgtId}`);
+      return { sourceEntry, targetEntry, offset: 0 };
+    } catch (e) {
+      logger.warn(`[browser.agent] _extractGestureTargets (drag-drop) failed: ${e.message}`);
+      return null;
+    }
+  }
+
+  if (gestureType === 2 || gestureType === 3) {
+    // Slider: pick handle (1 number) + compute offset from percentage in goal
+    const pctMatch = (goal || '').match(/(\d+(?:\.\d+)?)\s*%/);
+
+    const prompt = `Task: ${goal}
+
+Available elements:
+${listStr}
+
+Which element is the slider handle to drag?
+Output ONLY the element number, or 0 if not found.`;
+
+    try {
+      const raw = await askWithMessages([
+        { role: 'system', content: 'You pick the slider handle from a list. Output ONLY the number, or 0 if not found.' },
+        { role: 'user', content: prompt },
+      ], { maxTokens: 5, temperature: 0, responseTimeoutMs: 5000 });
+      const srcId = parseInt((raw || '').trim().replace(/\D/g, ''), 10) || 0;
+      const sourceEntry = srcId > 0 ? tabMap.find(e => e.id === srcId) : null;
+
+      // Compute offset from percentage if found, else default 100px
+      let finalOffset = 100;
+      if (pctMatch && sourceEntry) {
+        const pct = parseFloat(pctMatch[1]);
+        const sliderWidth = sourceEntry.w || 200;
+        // Offset from center to target percentage position
+        finalOffset = Math.round((pct / 100) * sliderWidth - sliderWidth / 2);
+      }
+
+      logger.info(`[browser.agent] _extractGestureTargets (slider): handle=#${srcId}, offset=${finalOffset}px${pctMatch ? ` (from ${pctMatch[1]}%)` : ' (default)'}`);
+      return { sourceEntry, targetEntry: null, offset: finalOffset };
+    } catch (e) {
+      logger.warn(`[browser.agent] _extractGestureTargets (slider) failed: ${e.message}`);
+      return null;
+    }
+  }
+
+  return null;
+}
+
+// ---------------------------------------------------------------------------
+// OCR Observation Layer — number-returning visual decisions via LiteParser OCR
+// All return a single number (reliable with light models). Used as pre-tier
+// gatekeepers and during-tier pickers in the iteration loop.
+// ---------------------------------------------------------------------------
+
+// Visual goal verification using OCR text.
+// Returns: 0 = failure (goal not achieved), 1 = done (goal achieved), 2 = wait (page processing)
+async function _ocrVerifyGoal(ocrText, goal, actionHistory = []) {
+  const { askWithMessages } = require('../skill-helpers/skill-llm.cjs');
+  const historyStr = (actionHistory || []).slice(-5).map((a, i) => `  ${i + 1}. ${a}`).join('\n');
+
+  const systemPrompt = `You verify if a browser automation goal has been achieved by looking at the OCR text captured from the page.
+Return ONLY a single number — nothing else:
+0 = failure (goal NOT achieved, something went wrong)
+1 = done (goal achieved successfully — the expected text/content is visible)
+2 = wait (page is still loading or processing — retry later)
+
+Rules:
+- 1 (done): the OCR text shows the expected result (e.g., title text matches, content is present, confirmation message visible)
+- 0 (fail): the OCR text does NOT show the expected result (e.g., title is still "Untitled", error message visible, content missing)
+- 2 (wait): the OCR text shows loading indicators ("Loading...", "Please wait", "Searching...", progress bar text)
+- Check the action history for context on what was attempted
+- When in doubt, return 0 (the tier system will try to fix it)
+Return ONLY the number.`;
+
+  const userPrompt = `Goal: ${goal}
+OCR text from page:
+${(ocrText || '').slice(0, 500)}
+Actions taken:
+${historyStr}
+
+Number (0-2)?`;
+
+  try {
+    const raw = await askWithMessages([
+      { role: 'system', content: systemPrompt },
+      { role: 'user', content: userPrompt },
+    ], { maxTokens: 5, temperature: 0, responseTimeoutMs: 5000 });
+    const num = parseInt((raw || '').trim().replace(/\D/g, ''), 10);
+    if (num >= 0 && num <= 2) {
+      logger.info(`[browser.agent] _ocrVerifyGoal: ${num} for goal="${String(goal || '').slice(0, 60)}"`);
+      return num;
+    }
+    logger.info(`[browser.agent] _ocrVerifyGoal: invalid "${raw}" → defaulting to 0`);
+    return 0;
+  } catch (e) {
+    logger.warn(`[browser.agent] _ocrVerifyGoal failed: ${e.message}`);
+    return 0;
+  }
+}
+
+// Loading detection using OCR text.
+// Returns: 0 = not loading (page is ready), 1 = loading (page is still processing)
+async function _ocrDetectLoading(ocrText, goal) {
+  // ── Deterministic pre-checks ──
+  const _loadingKeywords = /\b(loading|please wait|searching|processing|fetching|spinner|refreshing|updating|saving\.\.\.|submitting)\b/i;
+  if (_loadingKeywords.test(ocrText || '')) return 1;
+  if (!ocrText || ocrText.trim().length < 10) return 0;
+
+  // ── LLM call for ambiguous cases ──
+  const { askWithMessages } = require('../skill-helpers/skill-llm.cjs');
+
+  const systemPrompt = `You detect if a web page is still loading or processing by looking at the OCR text.
+Return ONLY a single number — nothing else:
+0 = not loading (page content is fully rendered and ready for interaction)
+1 = loading (page is still processing — spinner, progress bar, "loading" text, partial content)
+
+Rules:
+- 1 (loading): OCR text contains loading indicators, spinners, "please wait", partial/skeleton content
+- 0 (not loading): OCR text shows full content, no loading indicators
+- When in doubt, return 0 (proceed with interaction)
+Return ONLY the number.`;
+
+  const userPrompt = `Goal: ${goal}
+OCR text from page:
+${(ocrText || '').slice(0, 300)}
+
+Number (0-1)?`;
+
+  try {
+    const raw = await askWithMessages([
+      { role: 'system', content: systemPrompt },
+      { role: 'user', content: userPrompt },
+    ], { maxTokens: 5, temperature: 0, responseTimeoutMs: 3000 });
+    const num = parseInt((raw || '').trim().replace(/\D/g, ''), 10);
+    if (num === 0 || num === 1) {
+      logger.info(`[browser.agent] _ocrDetectLoading: ${num}`);
+      return num;
+    }
+    return 0;
+  } catch (e) {
+    logger.warn(`[browser.agent] _ocrDetectLoading failed: ${e.message}`);
+    return 0;
+  }
+}
+
+// Pick an OCR row by number — replaces JSON-based pickOverlayAction for simple selection.
+// ocrRows: array of { id, text, type?, x, y, width, height } from structureOcrOverlayItems
+// Returns: 0 = no match, 1..N = row id that best matches the goal
+async function _ocrPickRow(ocrRows, goal) {
+  if (!ocrRows || ocrRows.length === 0) return 0;
+  const { askWithMessages } = require('../skill-helpers/skill-llm.cjs');
+
+  const listStr = ocrRows.map(r => `${r.id} - "${r.text || ''}"${r.type ? ` [${r.type}]` : ''}`).join('\n');
+
+  const systemPrompt = `You pick the matching item from a list of OCR text rows.
+Return ONLY a single number — nothing else.
+The number is the row ID that best matches the goal.
+If no row matches, return 0.
+Output ONLY the number.`;
+
+  const userPrompt = `Goal: ${goal}
+
+Available rows:
+${listStr}
+
+Which row number matches the goal? (0 if none)`;
+
+  try {
+    const raw = await askWithMessages([
+      { role: 'system', content: systemPrompt },
+      { role: 'user', content: userPrompt },
+    ], { maxTokens: 5, temperature: 0, responseTimeoutMs: 5000 });
+    const num = parseInt((raw || '').trim().replace(/\D/g, ''), 10) || 0;
+    if (num > 0) {
+      const row = ocrRows.find(r => r.id === num);
+      if (row) {
+        logger.info(`[browser.agent] _ocrPickRow: ${num} ("${row.text}") for goal="${String(goal || '').slice(0, 60)}"`);
+        return num;
+      }
+    }
+    logger.info(`[browser.agent] _ocrPickRow: ${num} (no match) for goal="${String(goal || '').slice(0, 60)}"`);
+    return 0;
+  } catch (e) {
+    logger.warn(`[browser.agent] _ocrPickRow failed: ${e.message}`);
+    return 0;
+  }
+}
+
+// Page state classification using OCR text.
+// Returns: 0=error, 1=done, 2=loading, 3=ready, 4=unexpected
+async function _ocrClassifyState(ocrText, goal, actionHistory = []) {
+  // ── Deterministic pre-checks ──
+  if (!ocrText || ocrText.trim().length < 5) return 3; // empty OCR → assume ready
+  const _loadingKeywords = /\b(loading|please wait|searching|processing|fetching|spinner|refreshing)\b/i;
+  if (_loadingKeywords.test(ocrText)) return 2;
+  const _errorKeywords = /\b(error|failed|something went wrong|try again|invalid|not found|404|500|forbidden)\b/i;
+  if (_errorKeywords.test(ocrText)) return 0;
+
+  // ── LLM call for ambiguous cases ──
+  const { askWithMessages } = require('../skill-helpers/skill-llm.cjs');
+  const historyStr = (actionHistory || []).slice(-3).map((a, i) => `  ${i + 1}. ${a}`).join('\n');
+
+  const systemPrompt = `You classify the state of a web page based on OCR text.
+Return ONLY a single number — nothing else:
+0 = error (validation errors, "something went wrong", error messages visible)
+1 = done (the goal appears to be achieved — expected content is visible)
+2 = loading (page is still processing — spinner, "please wait", partial content)
+3 = ready (page is ready for interaction — form open, content loaded, no errors)
+4 = unexpected (modal, redirect, login wall, unexpected dialog that blocks the goal)
+
+Rules:
+- 0 (error): OCR text shows error messages, validation failures
+- 1 (done): OCR text shows the expected result of the goal (e.g., created content is visible)
+- 2 (loading): OCR text shows loading indicators
+- 3 (ready): OCR text shows normal page content, ready for the next action
+- 4 (unexpected): OCR text shows something blocking (login wall, unexpected modal, redirect to wrong page)
+- When in doubt, return 3 (proceed with tier selection)
+Return ONLY the number.`;
+
+  const userPrompt = `Goal: ${goal}
+OCR text from page:
+${(ocrText || '').slice(0, 400)}
+Actions taken:
+${historyStr}
+
+Number (0-4)?`;
+
+  try {
+    const raw = await askWithMessages([
+      { role: 'system', content: systemPrompt },
+      { role: 'user', content: userPrompt },
+    ], { maxTokens: 5, temperature: 0, responseTimeoutMs: 5000 });
+    const num = parseInt((raw || '').trim().replace(/\D/g, ''), 10);
+    if (num >= 0 && num <= 4) {
+      logger.info(`[browser.agent] _ocrClassifyState: ${num} for goal="${String(goal || '').slice(0, 60)}"`);
+      return num;
+    }
+    logger.info(`[browser.agent] _ocrClassifyState: invalid "${raw}" → defaulting to 3`);
+    return 3;
+  } catch (e) {
+    logger.warn(`[browser.agent] _ocrClassifyState failed: ${e.message}`);
+    return 3;
+  }
+}
+
+// Field-type decision: determines WHAT KIND of typing a field needs.
+// Called after _extractValue returns a value, before typing it.
+// Returns one of: 'type-plain', 'type-edit', 'type-commands', 'type-search'
+// Deterministic pre-checks skip the LLM for obvious cases.
+async function _extractFieldType(goal, focusedElement, value, actionHistory, pageContext = {}, agentContext) {
+  const _val = String(value || '');
+  const _tag = focusedElement?.tag || '';
+  const _role = focusedElement?.role || '';
+
+  // ── Deterministic pre-checks (skip LLM) ──
+
+  // Value starts with / → type-commands (Notion blocks, Slack commands)
+  if (_val.startsWith('/')) {
+    logger.info(`[browser.agent] _extractFieldType: → type-commands (value starts with /)`);
+    return 'type-commands';
+  }
+  // Value starts with @ → type-search (@mentions, assignee pickers)
+  if (_val.startsWith('@')) {
+    logger.info(`[browser.agent] _extractFieldType: → type-search (value starts with @)`);
+    return 'type-search';
+  }
+  // Short single-line <input> → type-plain (search, chat, simple form fields)
+  if (_tag === 'input' && _val.length < 200 && !_val.includes('\n')
+      && !/^[/@\[#]/.test(_val)) {
+    logger.info(`[browser.agent] _extractFieldType: → type-plain (input + short single-line)`);
+    return 'type-plain';
+  }
+  // Contenteditable or textarea with long/multi-line content → type-edit
+  // BUT exclude markdown prefixes ([] , ##, -) which are block shortcuts, not long-form content
+  if ((_role === 'textbox' || _tag === 'textarea' || _tag === 'div')
+      && (_val.length > 200 || _val.includes('\n'))
+      && !/^[/@]/.test(_val)
+      && !/^(##\s|###\s|####\s|- \s|\[\]\s|\* \s|> \s|1\. \s)/.test(_val)) {
+    logger.info(`[browser.agent] _extractFieldType: → type-edit (canvas/textarea + long/multi-line)`);
+    return 'type-edit';
+  }
+  // Markdown shortcuts in block editors → type-plain (no dropdown, direct block creation)
+  // These are fallbacks for apps WITHOUT slash commands (GitHub, HackMD, plain markdown editors)
+  if (/^(##\s|###\s|####\s|- \s|\[\]\s|\* \s|> \s|1\. \s)/.test(_val)
+      && (_role === 'textbox' || _tag === 'textarea' || _tag === 'div')) {
+    logger.info(`[browser.agent] _extractFieldType: → type-plain (markdown prefix in block editor — no dropdown)`);
+    return 'type-plain';
+  }
+
+  // ── LLM fallback for ambiguous cases ──
+  const { askWithMessages } = require('../skill-helpers/skill-llm.cjs');
+
+  const _focusedStr = _buildFocusedStr(focusedElement);
+
+  const _contextBlock = agentContext
+    ? `\n\nAgent context:\n${String(agentContext).slice(0, 800)}`
+    : '';
+
+  const systemPrompt = `You decide what KIND of typing a field needs.
+Look at the focused field, the value to type, and the goal. Return ONLY one of:
+- type-plain: single-line text + Enter (search, chat, simple form fields)
+- type-edit: long-form content (documents, code, essays — generate or edit)
+- type-commands: typing with / or @ commands that open a dropdown (Notion blocks, Slack commands)
+- type-search: typing to filter a dynamic dropdown (@mentions, assignee pickers, page pickers)
+
+Rules:
+- <input> with short single-line value → type-plain
+- contenteditable/textarea with multi-line or long value → type-edit
+- value starts with / and field is a block editor → type-commands
+- value starts with @ and field has a combobox/listbox → type-search
+- TITLE FIELD GUARD: If the focused field is a title (aria-roledescription includes "title", placeholder includes "New page" or "Untitled", or it's an h1/h2), and the value does NOT start with / or @, return type-plain. Titles are never command fields.
+- If unsure → type-plain (safest default)
+Return ONLY the type name, nothing else.`;
+
+  const historyStr = (actionHistory || []).slice(-5).map((a, i) => `  ${i + 1}. ${a}`).join('\n');
+
+  const userPrompt = `Goal: ${goal}
+Page title: ${pageContext.title || 'unknown'}
+Focused field: ${_focusedStr}
+Value to type: "${_val.slice(0, 100)}"${_contextBlock}
+
+Field type?`;
+
+  try {
+    const raw = await askWithMessages([
+      { role: 'system', content: systemPrompt },
+      { role: 'user', content: userPrompt },
+    ], { maxTokens: 20, temperature: 0.1, responseTimeoutMs: 8000 });
+    const val = (raw || '').trim().toLowerCase();
+    const valid = ['type-plain', 'type-edit', 'type-commands', 'type-search'];
+    const match = valid.find(v => val.includes(v));
+    const result = match || 'type-plain';
+    logger.info(`[browser.agent] _extractFieldType: LLM → ${result} (raw="${val}")`);
+    return result;
+  } catch (e) {
+    logger.warn(`[browser.agent] _extractFieldType LLM failed: ${e.message} — defaulting to type-plain`);
+    return 'type-plain';
+  }
+}
+
+// Command plan extraction: for type-commands (e.g. "/todo Buy milk" → trigger="/todo", commandLabel="To-do list", content="Buy milk")
+// Returns { trigger, commandLabel, content } or null on failure.
+async function _extractCommandPlan(goal, focusedElement, value, actionHistory, agentContext) {
+  const { askWithMessages } = require('../skill-helpers/skill-llm.cjs');
+
+  const _focusedStr = _buildFocusedStr(focusedElement);
+
+  const _contextBlock = agentContext
+    ? `\n\nAgent context:\n${String(agentContext).slice(0, 800)}`
+    : '';
+
+  const systemPrompt = `You extract a command plan from a value to type into a block-based editor.
+The value contains a command trigger (like /todo, /h1, @mention) and possibly content after it.
+Return ONLY JSON: {"trigger": "/todo", "commandLabel": "To-do list", "content": "Buy milk"}
+- trigger: the command prefix (e.g. "/todo", "/h1", "/page", "@")
+- commandLabel: the human-readable label of the dropdown option to select (e.g. "To-do list", "Heading 1")
+- content: the text to type AFTER selecting the command (empty string if none)
+If the value is just a trigger with no content, set content to "".
+If the value has multiple lines (e.g. "[] Item 1\\n[] Item 2"), set trigger to the first line's prefix,
+commandLabel to the matching option, and content to the full multi-line value.
+- TITLE FIELD GUARD: If the focused field is a title (h1/h2, aria-roledescription includes "title", placeholder includes "New page" or "Untitled"), return null — titles never use commands.
+- VALIDATION: The trigger MUST appear at the start of the value. If the value does not start with the trigger, return null.`;
+
+  const historyStr = (actionHistory || []).slice(-5).map((a, i) => `  ${i + 1}. ${a}`).join('\n');
+
+  const userPrompt = `Goal: ${goal}
+Focused field: ${_focusedStr}
+Value to type: "${String(value || '').slice(0, 200)}"
+${_contextBlock}
+
+Command plan?`;
+
+  try {
+    const raw = await askWithMessages([
+      { role: 'system', content: systemPrompt },
+      { role: 'user', content: userPrompt },
+    ], { maxTokens: 200, temperature: 0.1, responseTimeoutMs: 10000 });
+    const cleaned = (raw || '').trim().replace(/^```(?:json)?\s*\n?/i, '').replace(/\n?```\s*$/, '').trim();
+    const parsed = JSON.parse(cleaned);
+    if (!parsed.trigger) return null;
+    // Validate: trigger must actually appear at the start of the value.
+    // Prevents hallucinated /h1 for a literal title like "Weekly Goals".
+    if (!value || !String(value).trim().toLowerCase().startsWith(parsed.trigger.toLowerCase())) {
+      logger.info(`[browser.agent] _extractCommandPlan: trigger "${parsed.trigger}" not at start of value — discarding`);
+      return null;
+    }
+    logger.info(`[browser.agent] _extractCommandPlan: trigger="${parsed.trigger}", commandLabel="${parsed.commandLabel}", content="${(parsed.content || '').slice(0, 50)}"`);
+    return parsed;
+  } catch (e) {
+    logger.warn(`[browser.agent] _extractCommandPlan failed: ${e.message}`);
+    return null;
+  }
+}
+
+// Search plan extraction: for type-search (e.g. "@John" → trigger="@", query="John", targetLabel="John Smith")
+// Returns { trigger, query, targetLabel } or null on failure.
+async function _extractSearchPlan(goal, focusedElement, value, actionHistory, agentContext) {
+  const { askWithMessages } = require('../skill-helpers/skill-llm.cjs');
+
+  const _focusedStr = _buildFocusedStr(focusedElement);
+
+  const _contextBlock = agentContext
+    ? `\n\nAgent context:\n${String(agentContext).slice(0, 800)}`
+    : '';
+
+  const systemPrompt = `You extract a search plan from a value to type into a search/mention field.
+The value contains a trigger character (like @) and a query to filter a dropdown.
+Return ONLY JSON: {"trigger": "@", "query": "John", "targetLabel": "John Smith"}
+- trigger: the trigger character (e.g. "@", "#")
+- query: the text to type after the trigger to filter the dropdown
+- targetLabel: the exact label of the option to select from the filtered dropdown (from the goal)`;
+
+  const historyStr = (actionHistory || []).slice(-5).map((a, i) => `  ${i + 1}. ${a}`).join('\n');
+
+  const userPrompt = `Goal: ${goal}
+Focused field: ${_focusedStr}
+Value to type: "${String(value || '').slice(0, 200)}"
+${_contextBlock}
+
+Search plan?`;
+
+  try {
+    const raw = await askWithMessages([
+      { role: 'system', content: systemPrompt },
+      { role: 'user', content: userPrompt },
+    ], { maxTokens: 200, temperature: 0.1, responseTimeoutMs: 10000 });
+    const cleaned = (raw || '').trim().replace(/^```(?:json)?\s*\n?/i, '').replace(/\n?```\s*$/, '').trim();
+    const parsed = JSON.parse(cleaned);
+    if (!parsed.trigger) return null;
+    logger.info(`[browser.agent] _extractSearchPlan: trigger="${parsed.trigger}", query="${parsed.query}", targetLabel="${parsed.targetLabel}"`);
+    return parsed;
+  } catch (e) {
+    logger.warn(`[browser.agent] _extractSearchPlan failed: ${e.message}`);
+    return null;
+  }
+}
+
+// Edit mode decision: determines whether a type-edit goal is "generate" (create new content)
+// or "edit" (modify existing content). Returns 'generate' or 'edit'.
+async function _extractEditMode(goal, focusedElement, currentValue, agentContext) {
+  // Deterministic pre-checks based on goal keywords
+  const _goalLower = (goal || '').toLowerCase();
+  const _editKeywords = /\b(edit|fix|update|modify|refactor|change|replace|add a (section|paragraph|conclusion)|rewrite|revise|correct)\b/i;
+  const _generateKeywords = /\b(write|draft|compose|create|generate|make|build|produce|add)\b/i;
+
+  // If the field already has content and the goal says edit/fix/update → edit mode
+  if (currentValue && currentValue.length > 10 && _editKeywords.test(goal)) {
+    logger.info(`[browser.agent] _extractEditMode: → edit (field has content + goal has edit keyword)`);
+    return 'edit';
+  }
+  // If the field is empty and the goal says write/draft/create → generate mode
+  if ((!currentValue || currentValue.length < 10) && _generateKeywords.test(goal)) {
+    logger.info(`[browser.agent] _extractEditMode: → generate (field empty + goal has generate keyword)`);
+    return 'generate';
+  }
+  // If goal has edit keyword but field is empty → still generate (can't edit nothing)
+  if (_editKeywords.test(goal) && (!currentValue || currentValue.length < 10)) {
+    logger.info(`[browser.agent] _extractEditMode: → generate (edit keyword but field empty)`);
+    return 'generate';
+  }
+  // If goal has generate keyword and field has content → generate (overwrite)
+  if (_generateKeywords.test(goal)) {
+    logger.info(`[browser.agent] _extractEditMode: → generate (generate keyword)`);
+    return 'generate';
+  }
+
+  // LLM fallback for ambiguous cases
+  const { askWithMessages } = require('../skill-helpers/skill-llm.cjs');
+  const _contextBlock = agentContext ? `\n\nAgent context:\n${String(agentContext).slice(0, 500)}` : '';
+
+  try {
+    const raw = await askWithMessages([
+      { role: 'system', content: 'Determine if the goal is about generating new content or editing existing content. Return ONLY "generate" or "edit".' },
+      { role: 'user', content: `Goal: ${goal}\nField has existing content: ${currentValue ? `yes (${currentValue.length} chars)` : 'no'}${_contextBlock}\n\nMode?` },
+    ], { maxTokens: 10, temperature: 0.1, responseTimeoutMs: 5000 });
+    const mode = (raw || '').trim().toLowerCase().startsWith('edit') ? 'edit' : 'generate';
+    logger.info(`[browser.agent] _extractEditMode: LLM → ${mode} (raw="${(raw || '').trim()}")`);
+    return mode;
+  } catch (e) {
+    logger.warn(`[browser.agent] _extractEditMode LLM failed: ${e.message} — defaulting to generate`);
+    return 'generate';
   }
 }
 
@@ -644,6 +2210,9 @@ async function _extractSteps(goal, currentUrl, tabMap, pageCategory, agentContex
     : '';
 
   // Build element list with [FILLABLE]/[CLICKABLE] markers
+  // Include ariaRoleDescription and placeholder so the LLM can identify title fields
+  // (e.g. aria-roledescription="page title", placeholder="Untitled") and avoid typing
+  // block commands into them.
   const elementList = (tabMap || []).map(e => {
     const _tag = e.tag || '';
     const _role = e.role || '';
@@ -651,7 +2220,13 @@ async function _extractSteps(goal, currentUrl, tabMap, pageCategory, agentContex
     const _isFillable = ['input', 'textarea'].includes(_tag) ||
                         _role === 'combobox' || _role === 'textbox';
     const _marker = _isFillable ? '[FILLABLE]' : '[CLICKABLE]';
-    return `${e.id} - ${_tag} "${_label}" ${_role ? `role=${_role} ` : ''}${_marker}`;
+    const _ariaRoleDesc = e.ariaRoleDescription || '';
+    const _placeholder = e.placeholder || '';
+    const _extras = [
+      _ariaRoleDesc ? `aria-roledescription="${_ariaRoleDesc}"` : '',
+      _placeholder ? `placeholder="${_placeholder}"` : '',
+    ].filter(Boolean).join(' ');
+    return `${e.id} - ${_tag} "${_label}" ${_role ? `role=${_role} ` : ''}${_extras ? `${_extras} ` : ''}${_marker}`;
   }).join('\n');
 
   const systemPrompt = `You are planning the steps to achieve a goal on a web page.
@@ -662,17 +2237,29 @@ Output ONLY a JSON array. No reasoning, no prose, no markdown, no commentary.
 The array MUST start with [ and end with ].
 
 Allowed actions (use ONLY these exact words):
-  type  — for entering text into [FILLABLE] elements
-  click — for pressing [CLICKABLE] elements (buttons, links)
-  press — for keyboard keys (Enter, Tab, Escape)
-  done  — when the goal is already achieved
+  type             — for entering text into [FILLABLE] elements
+  click            — for pressing [CLICKABLE] elements (buttons, links)
+  press            — for keyboard keys (Enter, Tab, Escape)
+  navigate         — to navigate to a URL
+  waitForStableText — wait for page content to stabilize (use after search, navigation, or pressing Enter on dynamic pages)
+  getPageText      — read all visible page text (use to capture search results, listings, email counts, or content)
+  scroll           — scroll the page (use when results are below the fold)
+  screenshot       — capture a visual screenshot
+  run-code         — execute custom JavaScript for targeted data extraction
+  done             — when the goal is already achieved
 
-NEVER use "fill", "input", "enter", or any other action name. Only type, click, press, done.
+NEVER use "fill", "input", "enter", or any other action name. Only type, click, press, navigate, waitForStableText, getPageText, scroll, screenshot, run-code, done.
 
 Step formats (use EXACTLY these):
   { "action": "type", "target": "field label", "value": "text to type" }
   { "action": "click", "target": "button text" }
   { "action": "press", "key": "Enter" }
+  { "action": "navigate", "url": "https://..." }
+  { "action": "waitForStableText" }
+  { "action": "getPageText" }
+  { "action": "scroll", "direction": "down" }
+  { "action": "screenshot" }
+  { "action": "run-code", "code": "async page => { return await page.evaluate(() => { ... }) }" }
   { "action": "done" }
 
 Rules:
@@ -690,10 +2277,18 @@ Rules:
 - If there is only one step, still return an array: [{ "action": "..." }]
 - Output ONLY the JSON array, starting with [ and ending with ]. No other text.
 
+CONTENT EXTRACTION RULE: For any goal that involves searching, reading, counting, listing, or checking content (e.g., "search for unread emails", "count messages from X", "list items", "check how many"), ALWAYS end the plan with { "action": "waitForStableText" } followed by { "action": "getPageText" } so the results are captured and returned. Without getPageText, the task result will be empty.
+
 Conflict resolution (common with deep-links that pre-create content):
 - If the goal says "create a new document" but the page already shows a new/blank document (URL contains /document/d/.../edit, title is "Untitled"), the document is already created. Do NOT try to click "New" or "Blank" again. Instead, rename it: find the title/rename field and type the new title from the goal.
 - If an overlay or template picker is open and the document is already created, dismiss it (press Escape) and then rename the document.
-- If the goal mentions multiple actions but some are already done (see page state), only plan the remaining actions.`;
+- If the goal mentions multiple actions but some are already done (see page state), only plan the remaining actions.
+
+TITLE FIELD GUARD (canvas editors like Notion, Google Docs):
+- Title fields are identifiable by aria-roledescription containing "title" or placeholder containing "Untitled"/"New page".
+- Do NOT generate Type steps with block commands (e.g. /todo, /heading, /bullet) targeting title fields. Title fields are for the page name only.
+- If a step would type a command into a title field, add a press Enter step first to move focus to the body, then type the command into the body.
+- Example: goal "create page called X and add a todo list" → [{ "action": "type", "target": "title", "value": "X" }, { "action": "press", "key": "Enter" }, { "action": "type", "target": "body", "value": "/todo\\nItem 1" }].`;
 
   const userPrompt = `Goal: ${goal}
 Current URL: ${currentUrl}
@@ -750,12 +2345,39 @@ Extract the ordered steps:`;
 
     // Post-process: normalize action names and filter invalid steps (defense in depth)
     const _actionAliases = { fill: 'type', input: 'type', enter: 'type', write: 'type', set: 'type' };
+    const _observationActions = ['waitforstabletext', 'getpagetext', 'scroll', 'screenshot', 'run-code', 'navigate'];
     steps = steps.map(s => {
       const normalized = { ...s };
       const _act = (normalized.action || '').toLowerCase();
       if (_actionAliases[_act]) normalized.action = _actionAliases[_act];
       return normalized;
     }).filter(s => {
+      const _act = (s.action || '').toLowerCase();
+      // Observation actions: no target needed, but validate their specific fields
+      if (_observationActions.includes(_act)) {
+        if (_act === 'navigate') {
+          if (!s.url || !/^https?:\/\//i.test(s.url)) {
+            logger.warn(`[browser.agent] _extractSteps: dropping navigate step with invalid url "${s.url}"`);
+            return false;
+          }
+          return true;
+        }
+        if (_act === 'scroll') {
+          if (!s.direction || !['up', 'down', 'left', 'right'].includes(s.direction)) {
+            s.direction = 'down'; // default
+          }
+          return true;
+        }
+        if (_act === 'run-code') {
+          if (!s.code || typeof s.code !== 'string') {
+            logger.warn(`[browser.agent] _extractSteps: dropping run-code step with no code`);
+            return false;
+          }
+          return true;
+        }
+        // waitForStableText, getPageText, screenshot — no validation needed
+        return true;
+      }
       if (!['type', 'click', 'press', 'done'].includes(s.action)) {
         logger.warn(`[browser.agent] _extractSteps: dropping step with invalid action "${s.action}"`);
         return false;
@@ -819,11 +2441,15 @@ Extract the ordered steps:`;
 
 // Tab-Map strategy: LLM decides one action per step based on available elements.
 // Updated with [FILLABLE]/[CLICKABLE] markers, filled field tracking, and label fixes.
-async function _llmNextAction(goal, currentUrl, tabMap, actionHistory, pageCategory, agentContext, lastVerifyFailed, consumedRefs, filledFields) {
+async function _llmNextAction(goal, currentUrl, tabMap, actionHistory, pageCategory, agentContext, lastVerifyFailed, consumedRefs, filledFields, extractedPageText) {
   const { askWithMessages } = require('../skill-helpers/skill-llm.cjs');
 
   const _contextBlock = agentContext
     ? `\n\nAgent context (service descriptor / playbook — use these labels if relevant):\n${String(agentContext).slice(0, 1500)}`
+    : '';
+
+  const _pageTextBlock = extractedPageText && extractedPageText.trim().length > 0
+    ? `\n\nPage text captured (from previous Get page text / Wait for stable text):\n${extractedPageText.slice(0, 3000)}`
     : '';
 
   // Build element list with [FILLABLE]/[REQUIRED]/[FILLED]/[SUBMIT] markers.
@@ -891,10 +2517,16 @@ Action formats (use EXACTLY these verb forms):
   Press Tab
   Press Escape
   Navigate to https://url
+  Wait for stable text
+  Get page text
+  Scroll down
+  Scroll up
+  Screenshot
+  Run code: <javascript>
   DONE
 
 Rules:
-- Use ONLY these verb forms — Click, Type, Press Enter, Press Tab, Press Escape, Navigate, DONE.
+- Use ONLY these verb forms — Click, Type, Press Enter, Press Tab, Press Escape, Navigate, Wait for stable text, Get page text, Scroll down, Scroll up, Screenshot, Run code, DONE.
 - Use the EXACT text/label of elements as shown in the available elements list.
 - Use Type for [FILLABLE] elements and Click for [CLICKABLE] elements. Do NOT click a [FILLABLE] field — type into it directly.
 - Elements marked [FILLED: "value"] are already done — do NOT type into them again. Skip to the next [REQUIRED] field.
@@ -916,7 +2548,9 @@ Rules:
 - If you've already clicked an element and the page didn't change (see action results), try a different action.
 - APP KNOWLEDGE RULE: Check the Agent context below for app-specific patterns — slash commands, block creation shortcuts, UI quirks, keyboard shortcuts. Use them when the goal requires app-specific interactions.
 - BLOCK-CREATION RULE: When creating lists/todos/headings in block-based editors (Notion, Google Docs), do NOT type raw markdown. Create each block as a separate step: (1) Type the block-creation shortcut (e.g. "/todo" or "[]" + Space — check Agent context for the app's specific shortcuts), (2) Press Enter if a slash menu appeared, (3) Type the item text, (4) Press Enter to create the next block. Repeat for each item.
-- SEARCH-THEN-CLICK RULE: When clicking search results, skip ads/sponsored results — click the first ORGANIC result.`;
+- SEARCH-THEN-CLICK RULE: When clicking search results, skip ads/sponsored results — click the first ORGANIC result.
+- CONTENT EXTRACTION RULE: For any goal that involves searching, reading, counting, listing, or checking content (e.g., "search for unread emails", "count messages from X", "list items", "check how many"), after pressing Enter or navigating to trigger a search, use "Wait for stable text" then "Get page text" to capture the results before outputting DONE. Without Get page text, the task result will be empty.
+- PAGE TEXT CAPTURED RULE: If "Page text captured" is shown below and it contains the information needed to answer the goal (e.g., email subjects, counts, search results), output DONE immediately. Do NOT call "Get page text" again — the text is already captured.`;
 
   const userPrompt = `Goal: ${goal}
 Current URL: ${currentUrl}
@@ -924,7 +2558,7 @@ Page category: ${pageCategory || 'unknown'}
 Actions taken so far:
 ${historyStr}
 Fields already filled:
-${filledStr}${verifyNote}${_contextBlock}
+${filledStr}${verifyNote}${_contextBlock}${_pageTextBlock}
 
 Available elements on the current page:
 ${elementList}
@@ -3756,17 +5390,85 @@ function _isReadOnlyMailTask(task) {
 // the action phrase along with the name.
 // Negative lookbehind on "from" prevents matching "not from X" / "but not from X"
 // (those are handled by _NOT_FROM_RE separately).
-const _FROM_TERMINATORS = 'give|show|tell|extract|summarize|and|then|with|for|about|regarding|please|also|now|just|only|but|not|excluding|or|so|because|if|when|while|after|before|since|until|on|in|at|from|to|by';
+const _FROM_TERMINATORS = 'give|show|tell|extract|summarize|and|then|with|for|about|regarding|please|also|now|just|only|but|not|excluding|or|so|because|if|when|while|after|before|since|until|on|in|at|from|to|by|my|our|the|a|an';
 const _FROM_RE = new RegExp('(?<!not |but not )\\b(?:from|sent by|written by)\\s+([A-Za-z][\\w.-]*(?:\\s+(?!' + _FROM_TERMINATORS + '\\b)[A-Za-z][\\w.-]*){0,4})(?:\\s|$|[,.;])', 'i');
 
 // Regex for "not from X" / "but not from X" / "excluding X" → captures excluded name.
 const _NOT_FROM_RE = new RegExp('\\b(?:not from|but not from|excluding|but not|not boss)\\s+([A-Za-z][\\w.-]*(?:\\s+(?!' + _FROM_TERMINATORS + '\\b)[A-Za-z][\\w.-]*){0,4})(?:\\s|$|[,.;])', 'i');
 
-function _extractSearchQuery(task, serviceKey) {
+// ── LLM-based search query extraction ──────────────────────────────────────
+// Primary path: ask the LLM to extract structured search criteria from the task.
+// Returns { query, hasCriteria } or null on failure. Cached per task+service.
+const _searchQueryCache = new Map();
+
+async function _extractSearchQueryLLM(task, serviceKey) {
+  const t = _stripTaskNoise(task);
+  if (!t || t.trim().length < 3) return null;
+  const svc = String(serviceKey || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+  const _cacheKey = `${svc}:${t.slice(0, 200)}`;
+  if (_searchQueryCache.has(_cacheKey)) return _searchQueryCache.get(_cacheKey);
+
+  const { askWithMessages } = require('../skill-helpers/skill-llm.cjs');
+
+  // Build service-specific operator hints
+  const _serviceHints = {
+    gmail: 'Gmail operators: is:unread, is:read, is:starred, from:NAME, -from:NAME, subject:TEXT, label:NAME, has:attachment, category:NAME. Combine with spaces.',
+    outlook: 'Outlook operators: from:NAME, subject:TEXT, has:attachments, category:NAME. Combine with spaces.',
+    github: 'GitHub operators: is:open, is:closed, label:NAME, author:NAME. Plus free-text keywords.',
+  };
+  const _hint = _serviceHints[svc] || 'Use the site\'s native search operators if known, otherwise return plain keywords.';
+
+  const _prompt = `Extract search criteria from this task and return ONLY the search query string.
+
+Service: ${svc || 'generic'}
+${_hint}
+
+Rules:
+- Strip filler/possessive words (my, our, the, a, an) from names — "from my pastor wendal" → from:pastor wendal
+- If the task mentions "unread", include the unread operator (e.g. is:unread)
+- If the task mentions a sender, use from:SENDER_NAME (without filler words)
+- If the task mentions a subject, use subject:SUBJECT_TEXT
+- If the task mentions "not from X" or "excluding X", use -from:X
+- Combine multiple criteria with spaces
+- Return ONLY the query string on one line. No explanation, no quotes, no markdown.
+- If no criteria can be extracted, return an empty line.
+
+Task: ${t}
+Query:`;
+
+  try {
+    const raw = await askWithMessages([
+      { role: 'user', content: _prompt },
+    ], { maxTokens: 200, temperature: 0.0, responseTimeoutMs: 5000 });
+    const query = (raw || '').trim().replace(/^```.*\n?/i, '').replace(/\n?```$/i, '').trim();
+    if (!query) {
+      _searchQueryCache.set(_cacheKey, null);
+      return null;
+    }
+    const result = { query, hasCriteria: true };
+    _searchQueryCache.set(_cacheKey, result);
+    logger.info(`[browser.agent] _extractSearchQueryLLM: "${query}" for task="${t.slice(0, 60)}..." (svc=${svc})`);
+    return result;
+  } catch (e) {
+    logger.debug(`[browser.agent] _extractSearchQueryLLM failed: ${e.message} — falling back to regex`);
+    _searchQueryCache.set(_cacheKey, null);
+    return null;
+  }
+}
+
+async function _extractSearchQuery(task, serviceKey) {
   const t = _stripTaskNoise(task);
   if (!t) return { query: '', hasCriteria: false };
 
   const svc = String(serviceKey || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+
+  // ── Primary: LLM extraction ──
+  const _llmResult = await _extractSearchQueryLLM(task, serviceKey);
+  if (_llmResult && _llmResult.hasCriteria && _llmResult.query) {
+    return _llmResult;
+  }
+
+  // ── Fallback: regex extraction (improved with _FROM_TERMINATORS fix) ──
   const parts = [];
 
   // ── Common criteria extraction ──
@@ -3880,10 +5582,10 @@ function _canPromoteDeepLink(candidate, source, intent, baseHost, serviceKey = '
  * Returns the search URL string, or null if the task has no extractable criteria or
  * the service doesn't support URL-based search.
  */
-function _buildSearchCriteriaUrl(intent, serviceKey, baseStartUrl, baseHost, task) {
+async function _buildSearchCriteriaUrl(intent, serviceKey, baseStartUrl, baseHost, task) {
   if (!_isSearchCriteriaTask(task)) return null;
   const svc = String(serviceKey || '').toLowerCase().replace(/[^a-z0-9]/g, '');
-  const _sq = _extractSearchQuery(task, svc);
+  const _sq = await _extractSearchQuery(task, svc);
   if (!_sq.hasCriteria) return null;
 
   // ── MAIL ──
@@ -3914,7 +5616,7 @@ async function _buildSearchUrlFromPattern(serviceKey, task) {
   const pattern = await getSearchUrlPattern(serviceKey);
   if (!pattern?.urlTemplate) return null;
   const svc = String(serviceKey || '').toLowerCase().replace(/[^a-z0-9]/g, '');
-  const _sq = _extractSearchQuery(task, svc);
+  const _sq = await _extractSearchQuery(task, svc);
   if (!_sq.hasCriteria) return null;
   const _url = pattern.urlTemplate.replace('{query}', encodeURIComponent(_sq.query));
   logger.info(`[browser.agent] search-pattern cache hit for ${serviceKey}: ${_url} (pattern hitCount=${pattern.hitCount || 1})`);
@@ -3972,7 +5674,7 @@ async function _resolveTaskDeepLink(agentId, serviceKey, baseStartUrl, task, exi
     // can't encode filter criteria (unread, from:X, subject:X), so letting the cache win
     // would land the agent on the wrong page. The template must win for criteria tasks.
     // (Defense-in-depth: protects against stale/polluted cache entries.)
-    const _criteriaUrl = _buildSearchCriteriaUrl(intent, serviceKey, baseStartUrl, baseHost, task);
+    const _criteriaUrl = await _buildSearchCriteriaUrl(intent, serviceKey, baseStartUrl, baseHost, task);
     if (_criteriaUrl) {
       logger.info(`[browser.agent] deep-link: search-criteria template for ${agentId}: ${_criteriaUrl}`);
       return { url: _criteriaUrl, source: 'template' };
@@ -4034,8 +5736,8 @@ async function _resolveTaskDeepLink(agentId, serviceKey, baseStartUrl, task, exi
     }
 
     // ── Helper: extract encoded search query from task text ────────────────
-    const _getEncodedQuery = (taskText, svcKey) => {
-      const _sq = _extractSearchQuery(taskText, svcKey);
+    const _getEncodedQuery = async (taskText, svcKey) => {
+      const _sq = await _extractSearchQuery(taskText, svcKey);
       if (_sq.hasCriteria) return encodeURIComponent(_sq.query);
       const qMatch = taskText.match(/\b(?:search|find|look\s*up|google)\s+(?:for\s+)?(.+?)$/i);
       return qMatch?.[1] ? encodeURIComponent(String(qMatch[1]).trim().replace(/[?.!]+$/g, '')) : '';
@@ -4052,7 +5754,7 @@ async function _resolveTaskDeepLink(agentId, serviceKey, baseStartUrl, task, exi
     };
 
     // ── Generic intent URL builder (data-driven via KNOWN_BROWSER_SERVICES.intentUrls) ──
-    const _buildIntentTemplateUrl = () => {
+    const _buildIntentTemplateUrl = async () => {
       const svc = String(serviceKey || '').toLowerCase().replace(/[^a-z0-9]/g, '');
       const startUrlBase = baseStartUrl.replace(/\/$/, '');
       const svcEntry = lookupBrowserService(svc);
@@ -4072,7 +5774,7 @@ async function _resolveTaskDeepLink(agentId, serviceKey, baseStartUrl, task, exi
       if (_WRITE_INTENTS.includes(intent) && _isReadOnlyTask(task, intent)) {
         // Special case: MAIL read-only tries search-criteria URL first
         if (intent === INTENTS.MAIL) {
-          const _searchUrl = _buildSearchCriteriaUrl(intent, serviceKey, baseStartUrl, baseHost, task);
+          const _searchUrl = await _buildSearchCriteriaUrl(intent, serviceKey, baseStartUrl, baseHost, task);
           if (_searchUrl) return _searchUrl;
         }
         return null; // let discovery pipeline run
@@ -4092,7 +5794,7 @@ async function _resolveTaskDeepLink(agentId, serviceKey, baseStartUrl, task, exi
 
       // 4. Per-service intentUrls lookup
       if (svcEntry?.intentUrls) {
-        const _ctx = { task, encodedQuery: _getEncodedQuery(task, svc), dest: null };
+        const _ctx = { task, encodedQuery: await _getEncodedQuery(task, svc), dest: null };
         const _result = _resolveIntentTemplate(svcEntry.intentUrls[intent], task, _ctx);
         if (_result) return _result;
       }
@@ -4118,7 +5820,7 @@ async function _resolveTaskDeepLink(agentId, serviceKey, baseStartUrl, task, exi
 
       // 7. SEARCH — per-service handled in step 4; generic fallback to discovery
       if (intent === INTENTS.SEARCH || isSearchLike) {
-        const _q = _getEncodedQuery(task, svc);
+        const _q = await _getEncodedQuery(task, svc);
         if (!_q) return null;
         // Per-service search URL already handled in step 4 via intentUrls.search
         // If we reach here, no per-service search template matched — let discovery find it
@@ -4129,7 +5831,7 @@ async function _resolveTaskDeepLink(agentId, serviceKey, baseStartUrl, task, exi
     };
 
     // 1. Prefer service intent templates for deterministic URL-first starts.
-    let candidate = _buildIntentTemplateUrl();
+    let candidate = await _buildIntentTemplateUrl();
     let candidateSource = candidate ? 'template' : null;
     if (candidate) {
       if (!_isValidDeepLinkUrl(candidate)) {
@@ -4227,7 +5929,7 @@ async function _resolveTaskDeepLink(agentId, serviceKey, baseStartUrl, task, exi
                 // Build a search URL from the form action + the first search input name
                 const _searchInput = Array.isArray(_sf.inputs) ? _sf.inputs.find(i => /^(q|query|search|filter|s|term|keywords?)$/i.test(i.name || '')) : null;
                 if (_searchInput) {
-                  const _sq = _extractSearchQuery(task, String(serviceKey || '').toLowerCase().replace(/[^a-z0-9]/g, ''));
+                  const _sq = await _extractSearchQuery(task, String(serviceKey || '').toLowerCase().replace(/[^a-z0-9]/g, ''));
                   const _queryVal = _sq.hasCriteria ? _sq.query : '';
                   const _searchUrl = `${_sf.action}${_sf.action.includes('?') ? '&' : '?'}${_searchInput.name}=${encodeURIComponent(_queryVal)}`;
                   // Verify the form action is on-domain
@@ -5585,7 +7287,13 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
           try {
             const _csPage = browserEngine && typeof browserEngine.getPage === 'function' ? browserEngine.getPage(sessionId) : null;
             let _csDomain = '';
-            try { _csDomain = new URL(startUrl).hostname.replace(/^www\./, ''); } catch (_) {}
+            // Use the actual current page URL (after redirect) for cookie domain —
+            // startUrl may be a redirect URL (e.g. notion.new → app.notion.com) whose
+            // auth cookies are on the destination domain, not the original.
+            try {
+              const _hrefForDomain = _curHref && _curHref.match(/^https?:\/\//) ? _curHref : startUrl;
+              _csDomain = new URL(_hrefForDomain).hostname.replace(/^www\./, '');
+            } catch (_) {}
             if (_csPage && _csDomain) {
               const _csResult = await _sniffAuthCookies(browserEngine, sessionId, _csPage, _csDomain);
               if (_csResult.ok) {
@@ -5726,7 +7434,11 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
             try {
               const _csPage = browserEngine && typeof browserEngine.getPage === 'function' ? browserEngine.getPage(sessionId) : null;
               let _csDomain = '';
-              try { _csDomain = new URL(startUrl).hostname.replace(/^www\./, ''); } catch (_) {}
+              // Use actual page URL (after redirect) for cookie domain — same fix as primary sniff above.
+              try {
+                const _hrefForDomain = _curHref && _curHref.match(/^https?:\/\//) ? _curHref : startUrl;
+                _csDomain = new URL(_hrefForDomain).hostname.replace(/^www\./, '');
+              } catch (_) {}
               if (_csPage && _csDomain) {
                 const _csResult = await _sniffAuthCookies(browserEngine, sessionId, _csPage, _csDomain);
                 if (_csResult.ok && _csResult.authed) {
@@ -6059,8 +7771,21 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
                 && /^[a-z]{4,}$/i.test(_slugParts[0])
                 && _slugParts[0].toLowerCase() !== 'untitled';
               if (_hasReadableSlug) {
-                _isCanonicalRedirect = false;
-                logger.info(`[browser.agent] run: URL-first enforcement — current URL has readable slug "${_slugParts[0]}", not a fresh redirect from ${startUrl}`);
+                // Readable slug means the page already exists (e.g., /p/Weekly-Goals-<id>).
+                // Check if the slug matches the goal/task name — if so, stay on this page
+                // instead of re-navigating to the creation URL (which would create a duplicate).
+                const _goalWords = (task || '').toLowerCase()
+                  .replace(/['"]/g, '').replace(/[^\w\s]/g, ' ')
+                  .split(/\s+/).filter(w => w.length >= 4 && !['with', 'under', 'page', 'list', 'block', 'items', 'three', 'sample', 'create', 'titled', 'called'].includes(w));
+                const _slugLower = _lastSegment.toLowerCase();
+                const _slugMatchesGoal = _goalWords.some(w => _slugLower.includes(w));
+                if (_slugMatchesGoal) {
+                  _isCanonicalRedirect = true; // already on the created page — skip navigation
+                  logger.info(`[browser.agent] run: URL-first enforcement — current URL slug matches goal ("${_slugParts[0]}"), staying on ${_curUrl} (not re-navigating to ${startUrl})`);
+                } else {
+                  _isCanonicalRedirect = false;
+                  logger.info(`[browser.agent] run: URL-first enforcement — current URL has readable slug "${_slugParts[0]}" but doesn't match goal — navigating to ${startUrl}`);
+                }
               } else {
                 // URL looks like a fresh page, but also check the page title to be sure
                 const _titleRes = await callBrowserAct({ action: 'evaluate', text: '(document.title || "")', sessionId, timeoutMs: 5000 }, 8000).catch(() => ({ ok: false }));
@@ -7803,6 +9528,53 @@ When extracting page content with run-code, prioritize these selectors over gene
       }
       logger.info(`[browser.agent] tab-map: engine active (readyState=${_engineCheckRes.result}) — proceeding`);
 
+      // ── URL-first short-circuit for read-only search tasks ────────────────
+      // If the URL already encodes search/filter criteria (e.g. Gmail #search/is:unread+from:pastor)
+      // and the goal is a read/count/list task, skip the entire iterative navigation loop
+      // and just waitForStableText + getPageText + return. This avoids unnecessary Tab-Map
+      // scanning, Tab/ArrowRight pressing, and LLM calls for the common case.
+      try {
+        const { _isReadCountListGoal } = require('./instruction.runner.cjs');
+        const _isReadOnlyGoal = _isReadCountListGoal(task);
+        const _urlHasSearchCriteria = /(#search|\?q=|&q=|#query=|&filter=|#filter|is:unread|is:starred|from:|to:|subject:|label:|in:|has:)/i.test(startUrl || '');
+        if (_isReadOnlyGoal && _urlHasSearchCriteria && _urlFirstNavigationSelected) {
+          logger.info(`[browser.agent] tab-map: URL-first short-circuit — read-only goal + URL has search criteria, skipping iterative navigation`);
+          // Wait for page to stabilize (Gmail SPA needs time after #search navigation)
+          const _wstRes = await callBrowserAct({ action: 'waitForStableText', sessionId, headed: true, timeoutMs: 10000 }, 12000).catch(e => ({ ok: false, error: e.message }));
+          logger.info(`[browser.agent] tab-map: short-circuit waitForStableText ok=${_wstRes?.ok} (${_wstRes?.result?.length || 0} chars)`);
+          // Extract page text
+          const _gtRes = await callBrowserAct({ action: 'getPageText', sessionId, headed: true, timeoutMs: 10000 }, 12000).catch(e => ({ ok: false, error: e.message }));
+          const _pageText = _gtRes?.ok ? (_gtRes.result || _gtRes.stdout || '') : '';
+          logger.info(`[browser.agent] tab-map: short-circuit getPageText ok=${_gtRes?.ok} (${_pageText.length} chars)`);
+          // Capture final URL for downstream steps
+          let _shortCircuitUrl = '';
+          try {
+            const _urlRes = await callBrowserAct({ action: 'evaluate', text: 'window.location.href', sessionId, timeoutMs: 3000 }, 5000).catch(() => ({ ok: false }));
+            _shortCircuitUrl = _urlRes?.ok ? String(_urlRes.result || '').trim().replace(/^"|"$/g, '') : '';
+          } catch (_) {}
+          // Emit tier progress: tab-map completed
+          _postProgress(_progressCallbackUrl, {
+            type: 'agent:tier',
+            stepIndex: _stepIndex ?? 0,
+            tier: 'tab-map',
+            message: `Tab-map: completed via URL-first short-circuit`,
+            agentId,
+            sessionId,
+          });
+          const _shortCircuitResult = `Goal achieved via URL-first short-circuit. Page content: ${_pageText.slice(0, 10000)}`;
+          return {
+            ok: true, agentId, task,
+            result: _shortCircuitResult,
+            url: _shortCircuitUrl,
+            sessionId,
+            recipeUsed: false,
+            routingDecision: 'browser_urlfirst_shortcircuit',
+          };
+        }
+      } catch (_scErr) {
+        logger.warn(`[browser.agent] tab-map: URL-first short-circuit error (non-fatal): ${_scErr.message} — proceeding to iterative navigation`);
+      }
+
       // ── Three-tier iterative navigation ──────────────────────────────
       // Tier 1: URL-first (already done above)
       // Tier 2: Decision call → 0 (DONE), 1 (Just-type), 2 (Meta+F), 3 (Tab-Map)
@@ -7832,9 +9604,16 @@ When extracting page content with run-code, prioritize these selectors over gene
           agentId,
           sessionId,
         });
+        // Capture final URL for downstream steps (executeCommand auto-injects it)
+        let _finalUrl = '';
+        try {
+          const _urlRes = await callBrowserAct({ action: 'evaluate', text: 'window.location.href', sessionId, timeoutMs: 3000 }, 5000).catch(() => ({ ok: false }));
+          _finalUrl = _urlRes?.ok ? String(_urlRes.result || '').trim().replace(/^"|"$/g, '') : '';
+        } catch (_) {}
         return {
           ok: true, agentId, task,
           result: _tabMapResult.output || `Completed via tab-map`,
+          url: _finalUrl,
           sessionId,
           recipeUsed: false,
           routingDecision: 'browser_tabmap',
@@ -8349,6 +10128,14 @@ When extracting page content with run-code, prioritize these selectors over gene
     let _autoRecipeCreated = false;
     let _saveSkillOffer = null;
 
+    // Capture final URL for downstream steps (executeCommand auto-injects it
+    // into subsequent browser.agent steps, replacing creation URLs like notion.new/)
+    let _finalUrl = '';
+    try {
+        const _urlRes = await callBrowserAct({ action: 'evaluate', text: 'window.location.href', sessionId, timeoutMs: 3000 }, 5000).catch(() => ({ ok: false }));
+        _finalUrl = _urlRes?.ok ? String(_urlRes.result || '').trim().replace(/^"|"$/g, '') : '';
+    } catch (_) {}
+
     const _runResult = {
         ok: agentResult?.ok ?? false,
         agentId,
@@ -8356,6 +10143,7 @@ When extracting page content with run-code, prioritize these selectors over gene
         sessionId,
         authenticated: true,
         result: agentResultText,
+        url: _finalUrl,
         transcript: agentResult?.transcript || [],
         turns: agentResult?.turns,
         done: agentResult?.done,
@@ -9814,6 +11602,21 @@ module.exports._validateClickPoint = _validateClickPoint;
 module.exports._llmNextAction = _llmNextAction;
 module.exports._extractSteps = _extractSteps;
 module.exports._decisionCall = _decisionCall;
+module.exports._buildFocusedStr = _buildFocusedStr;
 module.exports._extractValue = _extractValue;
+module.exports._extractAfterAction = _extractAfterAction;
+module.exports._extractGestureType = _extractGestureType;
+module.exports._extractGestureTargets = _extractGestureTargets;
+module.exports._ocrVerifyGoal = _ocrVerifyGoal;
+module.exports._ocrDetectLoading = _ocrDetectLoading;
+module.exports._ocrPickRow = _ocrPickRow;
+module.exports._ocrClassifyState = _ocrClassifyState;
+module.exports._scanCanvasLayout = _scanCanvasLayout;
+module.exports._readEditorState = _readEditorState;
+module.exports._formatEditorStateForLLM = _formatEditorStateForLLM;
+module.exports._extractFieldType = _extractFieldType;
+module.exports._extractCommandPlan = _extractCommandPlan;
+module.exports._extractSearchPlan = _extractSearchPlan;
+module.exports._extractEditMode = _extractEditMode;
 module.exports._extractSearchText = _extractSearchText;
 module.exports._extractShortcut = _extractShortcut;

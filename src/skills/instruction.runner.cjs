@@ -20,6 +20,7 @@ const { browserAct } = require('./browser.act.cjs');
 const { askWithMessages } = require('../skill-helpers/skill-llm.cjs');
 
 const logger = require('../logger.cjs');
+const engine = require('./browser-engine.cjs');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
@@ -58,8 +59,27 @@ async function _readActiveElement(sessionId) {
   const res = await browserAct({
     action: 'evaluate', sessionId, headed: true, timeoutMs: 3000,
     text: `(() => {
-      const el = document.activeElement;
+      let el = document.activeElement;
       if (!el || el === document.body) return null;
+      // ── Leaf detection for contenteditable wrappers ──
+      // Notion (and some other editors) set document.activeElement to a large wrapper
+      // div that contains multiple contenteditable children (title h1, body blocks).
+      // Use the selection anchor to find the actual focused contenteditable leaf.
+      if (el.isContentEditable) {
+        try {
+          const sel = window.getSelection();
+          if (sel && sel.rangeCount > 0) {
+            let node = sel.getRangeAt(0).startContainer;
+            if (node.nodeType === 3) node = node.parentElement; // text node → element
+            // Walk up to find the nearest contenteditable element
+            while (node && !node.isContentEditable) node = node.parentElement;
+            // If we found a contenteditable descendant of el (not el itself), use it
+            if (node && node !== el && el.contains(node)) {
+              el = node; // re-assign to the actual focused leaf
+            }
+          }
+        } catch (_) { /* selection API not available */ }
+      }
       // Inject data-td-ref if missing (for real Playwright selector clicks)
       // Uses tm- prefix to distinguish from DOM scanner's tdN refs
       let ref = el.getAttribute('data-td-ref');
@@ -67,7 +87,28 @@ async function _readActiveElement(sessionId) {
         ref = 'tm-' + Math.random().toString(36).slice(2, 10);
         el.setAttribute('data-td-ref', ref);
       }
-      const text = (el.getAttribute('aria-label') || el.getAttribute('placeholder') || el.innerText || el.textContent || '').trim().replace(/\\s+/g, ' ').slice(0, 120);
+      const _role = el.getAttribute('role') || '';
+      const _tag = el.tagName.toLowerCase();
+      const _ariaRoleDescription = el.getAttribute('aria-roledescription') || '';
+      // Scoped text: for contenteditable, use window.getSelection() to read the
+      // focused text node — not the parent's entire innerText (which flattens
+      // nested children like "Add icon Add cover Add comment Weekly Goals").
+      let text = el.getAttribute('aria-label') || el.getAttribute('placeholder') || '';
+      if (!text && el.isContentEditable) {
+        try {
+          const sel = window.getSelection();
+          if (sel && sel.rangeCount > 0) {
+            let node = sel.getRangeAt(0).startContainer;
+            if (node.nodeType === 3) node = node.parentElement; // text node → element
+            // Walk up to find the block-level element directly under the contenteditable
+            while (node && node !== el && node.parentElement !== el) node = node.parentElement;
+            text = (node?.innerText || node?.textContent || '').trim();
+          }
+        } catch (_) { /* selection API not available */ }
+        if (!text) text = el.innerText; // fallback
+      }
+      if (!text) text = el.textContent || '';
+      text = text.trim().replace(/\\s+/g, ' ').slice(0, 120);
       const r = el.getBoundingClientRect();
       const hasSvg = !!el.querySelector('svg');
       const ariaLabel = el.getAttribute('aria-label') || '';
@@ -75,19 +116,35 @@ async function _readActiveElement(sessionId) {
       // inDropdown: true when ArrowDown should navigate within a dropdown (not open autocomplete)
       // - element has role menuitem/menuitemcheckbox/menuitemradio/option (it IS a dropdown item)
       // - element is inside [role="menu"] or [role="listbox"] AND is NOT an input/textarea/combobox
-      const _role = el.getAttribute('role') || '';
-      const _tag = el.tagName.toLowerCase();
       const inDropdown = ['menuitem', 'menuitemcheckbox', 'menuitemradio', 'option'].includes(_role) ||
                          (!['input', 'textarea'].includes(_tag) && _role !== 'combobox' && _role !== 'textbox' &&
                           !!el.closest('[role="menu"], [role="listbox"]'));
       // currentValue: what's currently in the field (input.value, textarea.value,
-      // or textContent for contenteditable). Used for stuck-detection after Just-type.
+      // or scoped text for contenteditable). Used for stuck-detection after Just-type.
+      // For contenteditable, use scoped text (not flattened innerText) to avoid false stuck-detection.
       const currentValue = (el.value !== undefined && el.value !== ''
         ? String(el.value)
-        : (el.isContentEditable ? (el.innerText || el.textContent || '') : ''))
+        : (el.isContentEditable ? text : ''))
         .trim().replace(/\\s+/g, ' ').slice(0, 120);
+      // hasContent: does the focused LEAF have actual typed content to replace?
+      // NOT aria-label/placeholder — those are shown when the field is empty.
+      // For inputs/textarea: check el.value (handles "value as placeholder" sites).
+      // For contenteditable: check el.innerText (actual text, not aria-label).
+      // For containers (has contenteditable children): always false — Meta+a would
+      // select the entire page (title + body), not just this field.
+      const _isContainer = el.querySelectorAll('[contenteditable="true"], [contenteditable=""]').length > 0;
+      const _actualContent = (el.value !== undefined && el.value !== ''
+        ? String(el.value)
+        : (el.isContentEditable ? (el.innerText || el.textContent || '') : '')
+      ).trim();
+      const hasContent = !_isContainer && _actualContent.length > 0;
       return { tag: _tag, role: _role, text,
                currentValue,
+               hasContent,
+               isContentEditable: el.isContentEditable,
+               ariaRoleDescription: _ariaRoleDescription,
+               placeholder: el.getAttribute('placeholder') || '',
+               dataPlaceholder: el.getAttribute('data-placeholder') || '',
                ref,
                type: el.tagName === 'INPUT' ? (el.type || 'text') : '',
                ariaLabel,
@@ -140,147 +197,142 @@ async function _isEditableByProbe(sessionId) {
 }
 
 // ---------------------------------------------------------------------------
+// DOM-based chip/token field detection — replaces fragile text regex.
+//
+// Returns { isChip: boolean, signals: string[] }.
+// Signals (any one triggers):
+//   name-match        — name attribute exactly "to"/"cc"/"bcc"
+//   combobox-list     — role="combobox" + aria-owns/aria-controls
+//   autocomplete-list — aria-autocomplete="list" + aria-owns/aria-controls
+//   token-container   — ancestor (5 levels) has [role="listbox"]/[role="option"]/.chip/.token/.recipient
+//
+// No label/placeholder text matching — "To-do" won't match because its name
+// is not "to", it's not a combobox, and it has no listbox/chip ancestors.
+// ---------------------------------------------------------------------------
+async function _detectChipField(sessionId) {
+  try {
+    const res = await browserAct({
+      action: 'evaluate', sessionId, headed: true, timeoutMs: 3000,
+      text: `(() => {
+        const el = document.activeElement;
+        if (!el || el === document.body) return { isChip: false, signals: [] };
+        const name = (el.getAttribute('name') || '').toLowerCase();
+        const role = (el.getAttribute('role') || '').toLowerCase();
+        const autocomplete = (el.getAttribute('aria-autocomplete') || '').toLowerCase();
+        const owns = el.getAttribute('aria-owns') || '';
+        const controls = el.getAttribute('aria-controls') || '';
+        const signals = [];
+        if (['to', 'cc', 'bcc'].includes(name)) signals.push('name-match');
+        if (role === 'combobox' && (owns || controls)) signals.push('combobox-list');
+        if (autocomplete === 'list' && (owns || controls)) signals.push('autocomplete-list');
+        let parent = el.parentElement;
+        for (let p = 0; p < 5 && parent; p++) {
+          if (parent.querySelector('[role="listbox"], [role="option"], .chip, .token, .recipient')) {
+            signals.push('token-container'); break;
+          }
+          parent = parent.parentElement;
+        }
+        return { isChip: signals.length > 0, signals };
+      })()`,
+    });
+    return res?.result || { isChip: false, signals: [] };
+  } catch (e) {
+    logger.warn(`[instruction.runner] _detectChipField failed: ${e.message}`);
+    return { isChip: false, signals: [], error: e.message };
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Chip/token confirmation: for email To/CC/BCC and similar multi-select
 // inputs, the page converts the typed text into a chip only after Enter is
 // pressed. This function checks the focused element and its context and, if
 // it looks like a token field, presses Enter up to two times and verifies the
 // typed value no longer appears as raw text in the input.
 //
-// Detection layers (any one triggers confirmation):
-// 1. Element name attribute (name="to", name="cc", name="bcc")
-// 2. Combobox semantics (role="combobox", aria-autocomplete="list", aria-owns)
-// 3. Chip-like children in 5 ancestors ([role="listbox"], .chip, .token, etc.)
-// 4. Step target text fallback (target contains "To/Recipients/CC/BCC/Email")
-// 5. Category forcing: if pageCategory="email_compose" and target looks chip-like
+// Detection: uses _detectChipField (DOM-based — no text regex).
 //
 // Safety: after pressing Enter, checks if the compose dialog is still open.
 // If it closed (Enter submitted the form prematurely), stops and returns ok:false.
 // ---------------------------------------------------------------------------
 async function _confirmChipIfNeeded(sessionId, stepTarget, stepValue, pageCategory) {
-  const _chipLike = (target) => /\b(to|recipients|recipient|email|cc|bcc)\b/i.test(target || '');
-  const _categoryForcesChip = pageCategory === 'email_compose';
+  const _chipDetect = await _detectChipField(sessionId);
+  logger.info(`[instruction.runner] _confirmChipIfNeeded: pageCategory=${pageCategory}, target="${stepTarget}", value="${String(stepValue || '').slice(0, 40)}", signals=${JSON.stringify(_chipDetect.signals)}, isChip=${_chipDetect.isChip}`);
 
-  try {
-    const res = await browserAct({
-      action: 'evaluate', sessionId, headed: true, timeoutMs: 3000,
-      text: `(() => {
-        const el = document.activeElement;
-        if (!el || el === document.body) return { isChip: false };
-        const name = (el.getAttribute('name') || '').toLowerCase();
-        const role = (el.getAttribute('role') || '').toLowerCase();
-        const autocomplete = (el.getAttribute('aria-autocomplete') || '').toLowerCase();
-        const owns = el.getAttribute('aria-owns') || '';
-        const controls = el.getAttribute('aria-controls') || '';
-        const placeholder = (el.getAttribute('placeholder') || '').toLowerCase();
-        const ariaLabel = (el.getAttribute('aria-label') || '').toLowerCase();
+  if (!_chipDetect.isChip) {
+    logger.info(`[instruction.runner] _confirmChipIfNeeded: skipping (no DOM chip signals)`);
+    return { ok: true, pressed: false };
+  }
+  logger.info(`[instruction.runner] Chip field detected (signals=${JSON.stringify(_chipDetect.signals)}) — confirming token for "${stepTarget || ''}"`);
 
-        const nameMatches = ['to', 'cc', 'bcc'].includes(name);
-        const comboLike = role === 'combobox' || autocomplete === 'list' || owns || controls;
-        const labelLike = /\b(to|recipients|recipient|email)\b/.test(placeholder + ' ' + ariaLabel);
+  // Capture pre-Enter state (compose dialog open?)
+  const _preEnter = await browserAct({
+    action: 'evaluate', sessionId, headed: true, timeoutMs: 2000,
+    text: `(() => {
+      const dialog = document.querySelector('[role="dialog"]');
+      return { hasDialog: !!dialog, dialogText: dialog ? (dialog.innerText || '').slice(0, 100) : '' };
+    })()`,
+  });
 
-        let parent = el.parentElement;
-        let tokenLikeContainer = false;
-        for (let p = 0; p < 5 && parent; p++) {
-          if (parent.querySelector('[role="listbox"], [role="option"], .chip, .token, .recipient, [data-tooltip]')) {
-            tokenLikeContainer = true; break;
-          }
-          parent = parent.parentElement;
-        }
+  for (let attempt = 0; attempt < 2; attempt++) {
+    await browserAct({ action: 'press', sessionId, key: 'Enter', headed: true, timeoutMs: 2000 });
+    await _sleep(400);
+    logger.info(`[instruction.runner] _confirmChipIfNeeded: Enter press #${attempt + 1} sent`);
 
-        const isChip = nameMatches || (comboLike && labelLike) || tokenLikeContainer;
-        return { isChip, name, role, autocomplete, labelLike, comboLike, tokenLikeContainer };
-      })()`,
-    });
-    const info = res?.result;
-    logger.info(`[instruction.runner] _confirmChipIfNeeded: pageCategory=${pageCategory}, target="${stepTarget}", value="${String(stepValue || '').slice(0, 40)}", DOM={isChip=${info?.isChip}, name=${info?.name}, role=${info?.role}, comboLike=${info?.comboLike}, labelLike=${info?.labelLike}, tokenLikeContainer=${info?.tokenLikeContainer}}`);
-
-    // Decide whether to confirm:
-    // - DOM signals say chip → confirm
-    // - Category says email_compose + target looks chip-like → force confirm
-    // - Otherwise → skip
-    if (!info?.isChip && !_chipLike(stepTarget) && !(_categoryForcesChip && _chipLike(stepTarget))) {
-      logger.info(`[instruction.runner] _confirmChipIfNeeded: skipping (no chip signals, target not chip-like, category not forcing)`);
-      return { ok: true, pressed: false };
-    }
-    if (!info?.isChip && _categoryForcesChip && _chipLike(stepTarget)) {
-      logger.info(`[instruction.runner] Chip confirmation forced by category=email_compose for target "${stepTarget}"`);
-    } else {
-      logger.info(`[instruction.runner] Chip field detected (name=${info?.name}, role=${info?.role}) — confirming token for "${stepTarget || ''}"`);
-    }
-
-    // Capture pre-Enter state (compose dialog open?)
-    const _preEnter = await browserAct({
+    // Safety: check compose dialog still open (Enter didn't submit form prematurely)
+    const _postEnter = await browserAct({
       action: 'evaluate', sessionId, headed: true, timeoutMs: 2000,
       text: `(() => {
         const dialog = document.querySelector('[role="dialog"]');
-        return { hasDialog: !!dialog, dialogText: dialog ? (dialog.innerText || '').slice(0, 100) : '' };
+        return { hasDialog: !!dialog };
       })()`,
     });
-
-    for (let attempt = 0; attempt < 2; attempt++) {
-      await browserAct({ action: 'press', sessionId, key: 'Enter', headed: true, timeoutMs: 2000 });
-      await _sleep(400);
-      logger.info(`[instruction.runner] _confirmChipIfNeeded: Enter press #${attempt + 1} sent`);
-
-      // Safety: check compose dialog still open (Enter didn't submit form prematurely)
-      const _postEnter = await browserAct({
-        action: 'evaluate', sessionId, headed: true, timeoutMs: 2000,
-        text: `(() => {
-          const dialog = document.querySelector('[role="dialog"]');
-          return { hasDialog: !!dialog };
-        })()`,
-      });
-      logger.info(`[instruction.runner] _confirmChipIfNeeded: post-Enter dialog check: preHasDialog=${_preEnter?.result?.hasDialog}, postHasDialog=${_postEnter?.result?.hasDialog}`);
-      if (_preEnter?.result?.hasDialog && !_postEnter?.result?.hasDialog) {
-        logger.warn(`[instruction.runner] Enter closed the compose dialog — form may have submitted prematurely. Stopping chip confirmation.`);
-        return { ok: false, pressed: true, prematureSubmit: true };
-      }
-
-      // Check if value became a chip (no longer raw text in input)
-      const stillThere = await browserAct({
-        action: 'evaluate', sessionId, headed: true, timeoutMs: 2000,
-        text: `(() => {
-          const el = document.activeElement;
-          if (!el || el === document.body) return false;
-          const val = el.value !== undefined ? String(el.value) : (el.textContent || '');
-          return val.includes(${JSON.stringify(String(stepValue || ''))});
-        })()`,
-      });
-      logger.info(`[instruction.runner] _confirmChipIfNeeded: stillThere=${stillThere?.result} after attempt ${attempt + 1}`);
-      if (!stillThere?.result) {
-        logger.info(`[instruction.runner] Token confirmed after ${attempt + 1} Enter press(es)`);
-        return { ok: true, pressed: true, attempts: attempt + 1 };
-      }
-      // Value still in input — but for multi-recipient comboboxes (Gmail To/Cc/Bcc),
-      // a chip/pill may have formed alongside the residual input text.
-      // Check if a recipient chip now exists with this value before re-trying Enter.
-      const _chipVal = String(stepValue || '').toLowerCase();
-      const chipFormed = await browserAct({
-        action: 'evaluate', sessionId, headed: true, timeoutMs: 2000,
-        text: `(() => {
-          const composeArea = document.querySelector('[role="dialog"]') || document;
-          // Gmail recipient pills: [data-hovercard-id], [email], .vR .vN, [role="listbox"] [role="option"]
-          const pills = composeArea.querySelectorAll('[data-hovercard-id], [email], .vR .vN, [role="listbox"] [role="option"], [role="option"][data-name]');
-          return Array.from(pills).some(p => {
-            const text = (p.textContent || p.getAttribute('email') || p.getAttribute('data-name') || '').toLowerCase();
-            return text.includes(${JSON.stringify(_chipVal)});
-          });
-        })()`,
-      });
-      if (chipFormed?.result) {
-        logger.info(`[instruction.runner] _confirmChipIfNeeded: chip/pill formed for "${String(stepValue || '').slice(0, 30)}" — value in input is residual, treating as confirmed`);
-        return { ok: true, pressed: true, attempts: attempt + 1, chipFormed: true };
-      }
-      logger.info(`[instruction.runner] Value still present in input after Enter — re-trying`);
+    logger.info(`[instruction.runner] _confirmChipIfNeeded: post-Enter dialog check: preHasDialog=${_preEnter?.result?.hasDialog}, postHasDialog=${_postEnter?.result?.hasDialog}`);
+    if (_preEnter?.result?.hasDialog && !_postEnter?.result?.hasDialog) {
+      logger.warn(`[instruction.runner] Enter closed the compose dialog — form may have submitted prematurely. Stopping chip confirmation.`);
+      return { ok: false, pressed: true, prematureSubmit: true };
     }
-    // Value still in input after 2 tries → not a chip field, but value is still there
-    // No bad side-effect — the email address is in the To field and will be sent
-    logger.info(`[instruction.runner] Chip confirmation: value remains in input after 2 Enter presses — treating as non-chip field (value preserved)`);
-    return { ok: true, pressed: true, attempts: 2, notChip: true };
-  } catch (e) {
-    logger.warn(`[instruction.runner] Chip confirmation error (non-fatal): ${e.message}`);
-    return { ok: true, pressed: false };
+
+    // Check if value became a chip (no longer raw text in input)
+    const stillThere = await browserAct({
+      action: 'evaluate', sessionId, headed: true, timeoutMs: 2000,
+      text: `(() => {
+        const el = document.activeElement;
+        if (!el || el === document.body) return false;
+        const val = el.value !== undefined ? String(el.value) : (el.textContent || '');
+        return val.includes(${JSON.stringify(String(stepValue || ''))});
+      })()`,
+    });
+    logger.info(`[instruction.runner] _confirmChipIfNeeded: stillThere=${stillThere?.result} after attempt ${attempt + 1}`);
+    if (!stillThere?.result) {
+      logger.info(`[instruction.runner] Token confirmed after ${attempt + 1} Enter press(es)`);
+      return { ok: true, pressed: true, attempts: attempt + 1 };
+    }
+    // Value still in input — but for multi-recipient comboboxes (Gmail To/Cc/Bcc),
+    // a chip/pill may have formed alongside the residual input text.
+    // Check if a recipient chip now exists with this value before re-trying Enter.
+    const _chipVal = String(stepValue || '').toLowerCase();
+    const chipFormed = await browserAct({
+      action: 'evaluate', sessionId, headed: true, timeoutMs: 2000,
+      text: `(() => {
+        const composeArea = document.querySelector('[role="dialog"]') || document;
+        // Gmail recipient pills: [data-hovercard-id], [email], .vR .vN, [role="listbox"] [role="option"]
+        const pills = composeArea.querySelectorAll('[data-hovercard-id], [email], .vR .vN, [role="listbox"] [role="option"], [role="option"][data-name]');
+        return Array.from(pills).some(p => {
+          const text = (p.textContent || p.getAttribute('email') || p.getAttribute('data-name') || '').toLowerCase();
+          return text.includes(${JSON.stringify(_chipVal)});
+        });
+      })()`,
+    });
+    if (chipFormed?.result) {
+      logger.info(`[instruction.runner] _confirmChipIfNeeded: chip/pill formed for "${String(stepValue || '').slice(0, 30)}" — value in input is residual, treating as confirmed`);
+      return { ok: true, pressed: true, attempts: attempt + 1, chipFormed: true };
+    }
+    logger.info(`[instruction.runner] Value still present in input after Enter — re-trying`);
   }
+  // Value still in input after 2 tries → not a chip field, but value is still there
+  // No bad side-effect — the email address is in the To field and will be sent
+  logger.info(`[instruction.runner] Chip confirmation: value remains in input after 2 Enter presses — treating as non-chip field (value preserved)`);
+  return { ok: true, pressed: true, attempts: 2, notChip: true };
 }
 
 // ---------------------------------------------------------------------------
@@ -834,6 +886,25 @@ async function buildTabMap(sessionId, maxElements = 150, options = {}) {
   const seenSet = new Set(); // O(1) deduplication
   let idCounter = 0;
   let starterSig = null; // first element — when we loop back, scan is done
+  let dropdownArrowCount = 0;        // count ArrowDown/ArrowUp used in current dropdown
+  const DROPDOWN_ARROW_LIMIT = 5;    // max ArrowDown attempts before forcing exit
+  let _prevInDropdown = false;       // track previous dropdown state to reset counter
+
+  // Key mappings: forward vs backward
+  const keyRight = backward ? 'ArrowLeft'  : 'ArrowRight';
+  const keyDown  = backward ? 'ArrowUp'    : 'ArrowDown';
+  const keyTab   = backward ? 'Shift+Tab'  : 'Tab';
+  const label    = backward ? 'backward'   : 'forward';
+
+  // If starting inside a dropdown and skipReset, exit it first (press Escape)
+  if (skipReset) {
+    const _preEl = await _readActiveElement(sessionId);
+    if (_preEl?.inDropdown) {
+      logger.info(`[instruction.runner] buildTabMap (${label}): starting inside a dropdown — pressing Escape to exit`);
+      await browserAct({ action: 'press', sessionId, key: 'Escape', headed: true, timeoutMs: 2000 });
+      await _sleep(100);
+    }
+  }
 
   if (!skipReset) {
     await _resetFocusToPageTop(sessionId);
@@ -848,17 +919,17 @@ async function buildTabMap(sessionId, maxElements = 150, options = {}) {
   const _initialEl = await _readActiveElement(sessionId);
   logger.info(`[instruction.runner] buildTabMap: initial focus tag=${_initialEl?.tag || 'none'}, role=${_initialEl?.role || 'none'}, inDropdown=${!!_initialEl?.inDropdown}`);
 
-  // Key mappings: forward vs backward
-  const keyRight = backward ? 'ArrowLeft'  : 'ArrowRight';
-  const keyDown  = backward ? 'ArrowUp'    : 'ArrowDown';
-  const keyTab   = backward ? 'Shift+Tab'  : 'Tab';
-  const label    = backward ? 'backward'   : 'forward';
-
   for (let i = 0; i < maxElements; i++) {
     const before = await _readActiveElement(sessionId);
     let current = before; // tracks current focus position (may shift via arrows)
     let advanced = false;
     const _inDropdown = !!before?.inDropdown;
+
+    // Reset dropdown arrow counter when focus leaves a dropdown
+    if (!_inDropdown && _prevInDropdown) {
+      dropdownArrowCount = 0;
+    }
+    _prevInDropdown = _inDropdown;
 
     // 1. Try ArrowRight (forward) / ArrowLeft (backward) — always safe
     await browserAct({ action: 'press', sessionId, key: keyRight, headed: true, timeoutMs: 2000 });
@@ -889,26 +960,43 @@ async function buildTabMap(sessionId, maxElements = 150, options = {}) {
     // ArrowDown opens autocomplete on comboboxes and selects wrong items.
     // Only use it when the focused element is a menuitem/option or inside a
     // role=menu/listbox (and not an input/textarea/combobox).
+    // Cap at DROPDOWN_ARROW_LIMIT attempts — if exceeded, press Escape to exit
+    // the dropdown and continue scanning the main page.
     if (!advanced && _inDropdown) {
-      await browserAct({ action: 'press', sessionId, key: keyDown, headed: true, timeoutMs: 2000 });
-      await _sleep(60);
-      after = await _readActiveElement(sessionId);
+      dropdownArrowCount++;
 
-      if (_isRealFocusChange(current, after)) {
-        const sig = after?.ref || _elementSignature(after);
-        if (!seenSet.has(sig)) {
-          seenSet.add(sig);
-          if (!starterSig) starterSig = sig;
-          map.push({ id: ++idCounter, ...after, key: keyDown });
-          advanced = true;
-        } else {
-          // Seen element — check if it's the starter (looped back)
-          if (sig === starterSig) {
-            logger.info(`[instruction.runner] buildTabMap (${label}): ${keyDown} looped back to starter (ref=${sig}) — scan done`);
-            break;
+      if (dropdownArrowCount > DROPDOWN_ARROW_LIMIT) {
+        // Too many ArrowDown/Up in this dropdown — force exit
+        logger.info(`[instruction.runner] buildTabMap (${label}): ${keyDown} limit reached (${DROPDOWN_ARROW_LIMIT}) — pressing Escape to exit dropdown`);
+        await browserAct({ action: 'press', sessionId, key: 'Escape', headed: true, timeoutMs: 2000 });
+        await _sleep(100);
+        dropdownArrowCount = 0;
+        // Continue to Tab on the main page (don't set advanced — fall through)
+      } else {
+        await browserAct({ action: 'press', sessionId, key: keyDown, headed: true, timeoutMs: 2000 });
+        await _sleep(60);
+        after = await _readActiveElement(sessionId);
+
+        if (_isRealFocusChange(current, after)) {
+          const sig = after?.ref || _elementSignature(after);
+          if (!seenSet.has(sig)) {
+            seenSet.add(sig);
+            if (!starterSig) starterSig = sig;
+            map.push({ id: ++idCounter, ...after, key: keyDown });
+            advanced = true;
+          } else {
+            // Seen element — check if it's the starter (looped back)
+            if (sig === starterSig) {
+              logger.info(`[instruction.runner] buildTabMap (${label}): ${keyDown} looped back to starter (ref=${sig}) — exiting dropdown`);
+              await browserAct({ action: 'press', sessionId, key: 'Escape', headed: true, timeoutMs: 2000 });
+              await _sleep(100);
+              dropdownArrowCount = 0;
+              // Don't break — continue to Tab on main page
+            } else {
+              // Seen but not starter — fall through to Tab
+              current = after;
+            }
           }
-          // Seen but not starter — fall through to Tab
-          current = after;
         }
       }
     }
@@ -1407,9 +1495,8 @@ async function _ocrFastPathStep(sessionId, verifyText, navMode = 'tab', maxTabs 
   if (!target) return { ok: false, error: 'no verify text', fallback: true };
 
   // 1. Get the Playwright page from the engine
-  let engine, page;
+  let page;
   try {
-    engine = require('./browser-engine.cjs');
     page = engine.getPage(sessionId);
   } catch (e) {
     return { ok: false, error: `engine access failed: ${e.message}`, fallback: true };
@@ -1749,8 +1836,10 @@ async function _executeAction(sessionId, step) {
 
       const _val = String(step.value || '');
       const _fillRef = step.ref || null;
-      // Chip confirmation only for actual To/Cc/Bcc/Recipients/Email targets
-      const _targetIsEmailChip = /\b(to|recipients|recipient|email|cc|bcc)\b/i.test(step.target || '');
+      // DOM-based chip detection (replaces fragile text regex that matched "To-do")
+      const _chipDetect = await _detectChipField(sessionId);
+      const _isChipField = _chipDetect.isChip;
+      logger.info(`[instruction.runner] _executeAction type: chip detect signals=${JSON.stringify(_chipDetect.signals)}, isChip=${_isChipField}`);
 
       // For chip/token fields (Gmail/Outlook To), use reactFill directly.
       // browserAct type fails on React-controlled comboboxes because React
@@ -1758,7 +1847,7 @@ async function _executeAction(sessionId, step) {
       // the native setter + input event dispatch technique and is React-aware.
       let result;
       let _usedReactFill = false;
-      if (_targetIsEmailChip && _fillRef) {
+      if (_isChipField && _fillRef) {
         logger.info(`[instruction.runner] _executeAction type: using reactFill for chip field [data-td-ref="${_fillRef}"]`);
         result = await browserAct({
           action: 'reactFill', sessionId, selector: `[data-td-ref="${_fillRef}"]`, text: _val, headed: true, timeoutMs: 10000,
@@ -1767,13 +1856,49 @@ async function _executeAction(sessionId, step) {
         await _sleep(300);
         logger.info(`[instruction.runner] _executeAction type: reactFill result ok=${result?.ok}, error=${result?.error || 'none'}`);
       } else {
-        // Select all existing text first (Ctrl+A / Cmd+A) so the new value replaces it
-        await browserAct({ action: 'press', sessionId, key: 'Meta+a', headed: true, timeoutMs: 2000 });
-        await _sleep(50);
+        // Select all existing text first (Ctrl+A / Cmd+A) so the new value replaces it.
+        // Conditional: only press Meta+a when editing existing content (step.isEdit === true
+        // AND step.hasContent !== false). Skip for create mode (isEdit=false) — Meta+a in
+        // a container div (e.g. Notion wrapper) selects the entire page (title + body),
+        // causing typing to replace the title. When hasContent is undefined (Tab-Map
+        // paths that didn't pass it), default to pressing Meta+a for backward compat,
+        // but only in edit mode.
+        const _shouldSelectAll = step.isEdit !== false && step.hasContent !== false;
+        // Guard: in editors like Notion, document.activeElement is a wrapper div
+        // containing multiple contenteditable children (title h1 + body blocks).
+        // Meta+a on the wrapper selects the entire page (title + body), and typing
+        // then overwrites both — causing the title to be replaced by body content.
+        // Skip Meta+a when the active element is such a wrapper; type at the cursor
+        // instead (the leaf was already focused by keyboard navigation).
+        let _isWrapper = false;
+        if (_shouldSelectAll) {
+          try {
+            const _wrapperCheck = await browserAct({
+              action: 'evaluate', sessionId, headed: true, timeoutMs: 2000,
+              text: `(() => {
+                let el = document.activeElement;
+                if (!el || el === document.body) return { isWrapper: false, ceChildren: 0 };
+                const ceChildren = el.querySelectorAll('[contenteditable], [contenteditable=""]').length;
+                return { isWrapper: ceChildren > 1, ceChildren };
+              })()`,
+            });
+            _isWrapper = _wrapperCheck?.result?.isWrapper === true;
+            if (_isWrapper) {
+              logger.warn(`[instruction.runner] _executeAction type: active element is a wrapper with ${_wrapperCheck?.result?.ceChildren || 0} contenteditable children — skipping Meta+a`);
+            }
+          } catch (e) {
+            // If the check fails, fall back to the original behavior
+            logger.warn(`[instruction.runner] _executeAction type: wrapper check failed: ${e.message}`);
+          }
+        }
+        if (_shouldSelectAll && !_isWrapper) {
+          await browserAct({ action: 'press', sessionId, key: 'Meta+a', headed: true, timeoutMs: 2000 });
+          await _sleep(50);
+        }
         // Use `type` (not `fill`) because keyboard navigation already focused the field
         result = await browserAct({ action: 'type', sessionId, text: _val, headed: true, timeoutMs: 10000 });
         await _sleep(300);
-        logger.info(`[instruction.runner] _executeAction type: browserAct type result ok=${result?.ok}, error=${result?.error || 'none'}`);
+        logger.info(`[instruction.runner] _executeAction type: browserAct type result ok=${result?.ok}, error=${result?.error || 'none'}, selectAll=${_shouldSelectAll}`);
       }
 
       // Verify the value actually appeared in the field (or as a chip in the dialog)
@@ -1784,7 +1909,11 @@ async function _executeAction(sessionId, step) {
           const el = ${_fillRef ? `document.querySelector('[data-td-ref="${_fillRef}"]') || document.activeElement` : 'document.activeElement'};
           if (!el || el === document.body) return { ok: false };
           const v = el.value !== undefined ? String(el.value) : (el.textContent || el.innerText || '');
-          const inDialog = (document.querySelector('[role="dialog"]') || document.body).innerText.includes(${JSON.stringify(_val.slice(0, 50))});
+          // inDialog verify: only count for combobox-like elements (INPUT/TEXTAREA/combobox),
+          // not contenteditable blocks (e.g. Notion To-do) where text appearing in a dialog
+          // is a false positive from a lingering autocomplete.
+          const isCombobox = el?.getAttribute('role') === 'combobox' || el?.tagName === 'INPUT' || el?.tagName === 'TEXTAREA';
+          const inDialog = isCombobox && (document.querySelector('[role="dialog"]') || document.body).innerText.includes(${JSON.stringify(_val.slice(0, 50))});
           return { ok: v.includes(${JSON.stringify(_val.slice(0, 50))}) || inDialog, value: v.slice(0, 100), inDialog };
         })()`,
       });
@@ -1809,7 +1938,8 @@ async function _executeAction(sessionId, step) {
                 const el = document.querySelector('[data-td-ref="${_fillRef}"]') || document.activeElement;
                 if (!el || el === document.body) return { ok: false };
                 const v = el.value !== undefined ? String(el.value) : (el.textContent || el.innerText || '');
-                const inDialog = (document.querySelector('[role="dialog"]') || document.body).innerText.includes(${JSON.stringify(_val.slice(0, 50))});
+                const isCombobox = el?.getAttribute('role') === 'combobox' || el?.tagName === 'INPUT' || el?.tagName === 'TEXTAREA';
+                const inDialog = isCombobox && (document.querySelector('[role="dialog"]') || document.body).innerText.includes(${JSON.stringify(_val.slice(0, 50))});
                 return { ok: v.includes(${JSON.stringify(_val.slice(0, 50))}) || inDialog, value: v.slice(0, 100), inDialog };
               })()`,
             });
@@ -1868,17 +1998,17 @@ async function _executeAction(sessionId, step) {
         }
       }
 
-      // Chip/token confirmation — ONLY for actual To/Cc/Bcc/Recipients/Email targets.
-      // Not for Subject, Message Body, or other non-chip fields.
+      // Chip/token confirmation — only for DOM-detected chip fields.
+      // Not for Subject, Message Body, To-do blocks, or other non-chip fields.
       let _chip = { ok: true, pressed: false };
-      if (_targetIsEmailChip) {
+      if (_isChipField) {
         _chip = await _confirmChipIfNeeded(sessionId, step.target, step.value, step.pageCategory);
         logger.info(`[instruction.runner] _executeAction type: chip result ok=${_chip.ok}, pressed=${_chip.pressed}, attempts=${_chip.attempts || 0}, notChip=${_chip.notChip || false}, prematureSubmit=${_chip.prematureSubmit || false}`);
         if (_chip.prematureSubmit) {
           return { ok: false, error: 'Enter closed compose dialog prematurely during chip confirmation' };
         }
       } else {
-        logger.info(`[instruction.runner] _executeAction type: skipping chip confirmation for non-chip target "${step.target}"`);
+        logger.info(`[instruction.runner] _executeAction type: skipping chip confirmation (not a chip field)`);
       }
 
       // pressAfter for AI chat / list items — category aware
@@ -2886,6 +3016,23 @@ function _parseAction(text) {
   m = t.match(/^Navigate\s+to\s+(https?:\/\/\S+)\s*$/i);
   if (m) return { action: 'navigate', url: m[1] };
 
+  // Wait for stable text
+  if (/^Wait\s+for\s+stable\s+text\s*$/i.test(t)) return { action: 'waitForStableText' };
+
+  // Get page text
+  if (/^Get\s+page\s+text\s*$/i.test(t)) return { action: 'getPageText' };
+
+  // Scroll down / Scroll up
+  m = t.match(/^Scroll\s+(down|up)\s*$/i);
+  if (m) return { action: 'scroll', direction: m[1].toLowerCase() };
+
+  // Screenshot
+  if (/^Screenshot\s*$/i.test(t)) return { action: 'screenshot' };
+
+  // Run code: <javascript>
+  m = t.match(/^Run\s+code:\s*([\s\S]+)$/i);
+  if (m) return { action: 'run-code', code: m[1].trim() };
+
   return null;
 }
 
@@ -2918,32 +3065,83 @@ async function _detectOverlay(sessionId) {
 // Click the first visible fillable element to focus it (for canvas editors
 // where the title isn't auto-focused). Returns the focused element descriptor
 // or null if no fillable element was found.
+// For Notion-style editors, prefers the title field (contenteditable with "Untitled" placeholder)
+// and skips non-editable div[role=group] placeholder elements.
 async function _clickFirstFillable(sessionId) {
   try {
     const res = await browserAct({
       action: 'evaluate', sessionId, headed: true, timeoutMs: 3000,
       text: `(() => {
+      // Helper: build descriptor for an element
+      function _desc(el) {
+        el.click();
+        el.focus();
+        let ref = el.getAttribute('data-td-ref');
+        if (!ref || !ref.startsWith('tm-')) {
+          ref = 'tm-' + Math.random().toString(36).slice(2, 10);
+          el.setAttribute('data-td-ref', ref);
+        }
+        // Scoped text: for contenteditable, use selection to read focused text node,
+        // not parent's innerText (which flattens nested children like "Add icon Add cover...")
+        let text = el.getAttribute('aria-label') || el.getAttribute('placeholder') || el.getAttribute('data-placeholder') || '';
+        if (!text && el.isContentEditable) {
+          try {
+            const sel = window.getSelection();
+            if (sel && sel.rangeCount > 0) {
+              let node = sel.getRangeAt(0).startContainer;
+              if (node.nodeType === 3) node = node.parentElement;
+              while (node && node !== el && node.parentElement !== el) node = node.parentElement;
+              text = (node?.innerText || node?.textContent || '').trim();
+            }
+          } catch (_) {}
+          if (!text) text = el.innerText;
+        }
+        if (!text) text = el.textContent || '';
+        text = text.trim().replace(/\\s+/g, ' ').slice(0, 120);
+        return { tag: el.tagName.toLowerCase(), role: el.getAttribute('role') || '', text, ref, type: el.tagName === 'INPUT' ? (el.type || 'text') : '', isContentEditable: el.isContentEditable, ariaRoleDescription: el.getAttribute('aria-roledescription') || '', placeholder: el.getAttribute('placeholder') || '', dataPlaceholder: el.getAttribute('data-placeholder') || '' };
+      }
+
+      // 1. Try title field: contenteditable with title signals (generic — works for Notion, Google Docs, etc.)
+      // Signals (strongest first): aria-roledescription*="page title", h1[contenteditable],
+      // placeholder/data-placeholder includes "New page" or "Untitled"
+      const _titleSel = [
+        '[contenteditable="true"][aria-roledescription*="page title"]',
+        '[contenteditable="true"][aria-roledescription*="title"]',
+        'h1[contenteditable="true"]',
+        '[contenteditable="true"][placeholder*="New page"]',
+        '[contenteditable="true"][data-placeholder*="New page"]',
+        '[contenteditable="true"][placeholder*="Untitled"]',
+        '[contenteditable="true"][data-placeholder*="Untitled"]',
+      ].join(', ');
+      const _titleEl = document.querySelector(_titleSel);
+      if (_titleEl) {
+        const r = _titleEl.getBoundingClientRect();
+        if (r.width > 0 && r.height > 0) return _desc(_titleEl);
+      }
+
+      // 2. Fallback: first visible fillable element, skipping non-editable div[role=group] placeholders
       const sel = 'input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"]):not([type="submit"]):not([type="button"]):not([type="file"]), textarea, [contenteditable="true"], [contenteditable=""], [role="textbox"]';
       for (const el of document.querySelectorAll(sel)) {
         const r = el.getBoundingClientRect();
         if (r.width > 0 && r.height > 0) {
-          el.click();
-          el.focus();
-          let ref = el.getAttribute('data-td-ref');
-          if (!ref || !ref.startsWith('tm-')) {
-            ref = 'tm-' + Math.random().toString(36).slice(2, 10);
-            el.setAttribute('data-td-ref', ref);
-          }
-          const text = (el.getAttribute('aria-label') || el.getAttribute('placeholder') || el.innerText || el.textContent || '').trim().replace(/\\s+/g, ' ').slice(0, 120);
-          return { tag: el.tagName.toLowerCase(), role: el.getAttribute('role') || '', text, ref, type: el.tagName === 'INPUT' ? (el.type || 'text') : '' };
+          // Skip non-contenteditable divs with role=group (Notion placeholder "Add icon Add cover...")
+          if (el.tagName === 'DIV' && !el.isContentEditable && el.getAttribute('role') === 'group') continue;
+          return _desc(el);
         }
       }
       return null;
     })()`,
     });
     const raw = res?.result;
-    const parsed = typeof raw === 'string' ? JSON.parse(raw.replace(/^"|"$/g, '').replace(/\\"/g, '"')) : raw;
-    if (parsed) logger.info(`[instruction.runner] _clickFirstFillable: focused ${parsed.tag} role=${parsed.role} text="${parsed.text?.slice(0, 40)}"`);
+    let parsed;
+    try {
+      parsed = typeof raw === 'string' ? JSON.parse(raw.replace(/^"|"$/g, '').replace(/\\"/g, '"')) : raw;
+    } catch (_) {
+      // CLI fallback may return error text instead of JSON — log and return null
+      logger.warn(`[instruction.runner] _clickFirstFillable: could not parse result (engine may be unavailable) — raw="${String(raw || '').slice(0, 80)}"`);
+      return null;
+    }
+    if (parsed) logger.info(`[instruction.runner] _clickFirstFillable: focused ${parsed.tag} role=${parsed.role} ce=${parsed.isContentEditable} text="${parsed.text?.slice(0, 40)}"`);
     return parsed || null;
   } catch (e) {
     logger.warn(`[instruction.runner] _clickFirstFillable failed: ${e.message}`);
@@ -2956,67 +3154,85 @@ async function _clickFirstFillable(sessionId) {
 // If no element is focused (e.g., canvas editor where title isn't auto-focused),
 // click the first visible fillable element to focus it before typing.
 // Returns { ok, pageChanged, error }
-async function _executeJustType(sessionId, value, focusedElement, pageCategory) {
-  if (!focusedElement) {
-    // No focused element — try to click the first visible fillable element
-    logger.info(`[instruction.runner] Just-type: no focused element — clicking first fillable to focus`);
-    const _firstFillable = await _clickFirstFillable(sessionId);
-    if (!_firstFillable) return { ok: false, pageChanged: false, error: 'No focused element and no fillable element found' };
-    focusedElement = _firstFillable;
+// ── Field-type executors (type-plain, type-edit, type-commands, type-search) ──
+// These are called by _executeTypedField after _extractFieldType determines the kind of typing.
+// Each receives: sessionId, value, focusedElement, goal, pageCategory, agentContext, pageContext, ctx
+// ctx = { isEdit, hasContent } — pre-computed by _executeTypedField so all flows share the same edit/create decision.
+
+// ── Backup helper ──
+// Saves a backup of the current field content before any modification.
+// Enables undo for all operations on fields with existing content.
+// Files stored in ~/.thinkdrop/edits/copies/copy-{timestamp}-backup.md
+async function _saveBackup(focusedElement) {
+  const _editsDir = path.join(os.homedir(), '.thinkdrop', 'edits', 'copies');
+  try {
+    fs.mkdirSync(_editsDir, { recursive: true });
+  } catch (e) {
+    logger.warn(`[instruction.runner] _saveBackup: could not create edits dir: ${e.message}`);
+    return;
   }
 
+  const _content = focusedElement?.currentValue || '';
+  if (!_content || _content.length < 5) return;
+
+  const _timestamp = Date.now();
+  const _backupFile = path.join(_editsDir, `copy-${_timestamp}-backup.md`);
+  try {
+    fs.writeFileSync(_backupFile, _content, 'utf8');
+    logger.info(`[instruction.runner] _saveBackup: saved ${_content.length} chars to ${path.basename(_backupFile)}`);
+  } catch (e) {
+    logger.warn(`[instruction.runner] _saveBackup: could not save backup: ${e.message}`);
+    return;
+  }
+
+  // Cleanup: keep only last 20 backup files
+  try {
+    const files = fs.readdirSync(_editsDir)
+      .filter(f => f.startsWith('copy-'))
+      .map(f => ({ name: f, path: path.join(_editsDir, f), mtime: fs.statSync(path.join(_editsDir, f)).mtimeMs }))
+      .sort((a, b) => b.mtime - a.mtime);
+    for (let i = 20; i < files.length; i++) {
+      try { fs.unlinkSync(files[i].path); } catch {}
+    }
+  } catch {}
+}
+
+// type-plain: single-line text + Enter (search, chat, simple form fields).
+// Also handles multi-line contenteditable (block creation) — the existing _executeJustType logic.
+// ctx = { isEdit, hasContent } — Meta+a only when isEdit && hasContent (uniform policy)
+async function _executeTypePlain(sessionId, value, focusedElement, pageCategory, ctx = {}) {
   const _tag = focusedElement.tag || '';
   const _role = focusedElement.role || '';
-  const _isFillable = ['input', 'textarea'].includes(_tag) ||
-                      _role === 'combobox' || _role === 'textbox';
-  if (!_isFillable) {
-    return { ok: false, pageChanged: false, error: `Focused element ${_tag} role=${_role} is not fillable` };
-  }
 
-  // Handle special values
-  if (value === 'PRESS_ENTER') {
-    logger.info(`[instruction.runner] Just-type: pressing Enter (field already has text)`);
-    await browserAct({ action: 'press', sessionId, key: 'Enter', headed: true, timeoutMs: 5000 });
-    await _sleep(1000);
-    return { ok: true, pageChanged: false };
-  }
-  if (value === 'SKIP' || !value) {
-    return { ok: false, pageChanged: false, error: 'LLM says skip this field' };
-  }
-
-  logger.info(`[instruction.runner] Just-type: typing "${value.slice(0, 50)}" into ${_tag} "${(focusedElement.text || focusedElement.ariaLabel || '').slice(0, 40)}"`);
+  logger.info(`[instruction.runner] type-plain: typing "${value.slice(0, 50)}" into ${_tag} "${(focusedElement.text || focusedElement.ariaLabel || '').slice(0, 40)}" (isEdit=${ctx.isEdit}, hasContent=${ctx.hasContent})`);
 
   // Detect contenteditable vs form input
-  // Form inputs (input/textarea): use _executeAction (with Meta+a select-all to replace)
-  // Contenteditable (div role=textbox): type at cursor, no Meta+a — supports multi-line block creation
   const _isFormInput = ['input', 'textarea'].includes(_tag);
   const _isContenteditable = !_isFormInput && (_role === 'textbox' || _tag === 'div');
 
   // Multi-line content for contenteditable (block creation in Notion, Google Docs, etc.)
-  // Type each line directly (no Meta+a), press Enter between lines to create new blocks
   if (_isContenteditable && value.includes('\n')) {
     const lines = value.split('\n').filter(l => l.length > 0);
-    logger.info(`[instruction.runner] Just-type: multi-line content (${lines.length} lines) for contenteditable`);
+    logger.info(`[instruction.runner] type-plain: multi-line content (${lines.length} lines) for contenteditable`);
 
     for (let i = 0; i < lines.length; i++) {
       if (i === 0) {
-        // First line: clear any placeholder/untitled text with Meta+a, then type
-        await browserAct({ action: 'press', sessionId, key: 'Meta+a', headed: true, timeoutMs: 2000 });
-        await _sleep(50);
+        // Only Meta+a when editing existing content; for create mode, just type
+        if (ctx.isEdit && ctx.hasContent) {
+          await browserAct({ action: 'press', sessionId, key: 'Meta+a', headed: true, timeoutMs: 2000 });
+          await _sleep(50);
+        }
       } else {
-        // Press Enter to create a new block, wait for it to settle
         await browserAct({ action: 'press', sessionId, key: 'Enter', headed: true, timeoutMs: 5000 });
         await _sleep(500);
       }
-      // Type the line directly (no Meta+a — we're at cursor position)
       await browserAct({ action: 'type', sessionId, text: lines[i], headed: true, timeoutMs: 10000 });
       await _sleep(300);
     }
 
-    // For AI chat, press Enter after typing to submit
     if (pageCategory === 'ai_chat') {
       await _sleep(500);
-      logger.info(`[instruction.runner] Just-type: pressing Enter for ai_chat submit`);
+      logger.info(`[instruction.runner] type-plain: pressing Enter for ai_chat submit`);
       await browserAct({ action: 'press', sessionId, key: 'Enter', headed: true, timeoutMs: 5000 });
       await _sleep(1000);
     }
@@ -3031,6 +3247,8 @@ async function _executeJustType(sessionId, value, focusedElement, pageCategory) 
     target: focusedElement.text || focusedElement.ariaLabel || '',
     pageCategory: pageCategory,
     ref: focusedElement.ref || null,
+    hasContent: ctx.hasContent || focusedElement.hasContent || false,
+    isEdit: ctx.isEdit || false,
   });
 
   if (!result?.ok) {
@@ -3040,12 +3258,636 @@ async function _executeJustType(sessionId, value, focusedElement, pageCategory) 
   // For AI chat, press Enter after typing to submit
   if (pageCategory === 'ai_chat') {
     await _sleep(500);
-    logger.info(`[instruction.runner] Just-type: pressing Enter for ai_chat submit`);
+    logger.info(`[instruction.runner] type-plain: pressing Enter for ai_chat submit`);
     await browserAct({ action: 'press', sessionId, key: 'Enter', headed: true, timeoutMs: 5000 });
     await _sleep(1000);
   }
 
   return { ok: true, pageChanged: false };
+}
+
+// type-edit: long-form content (generate or edit).
+// Dispatches to _executeTypeGenerate or _executeTypeEditExisting based on isEdit from ctx.
+// ctx.isEdit is pre-computed by _executeTypedField (hoisted edit/create decision).
+async function _executeTypeEdit(sessionId, value, focusedElement, goal, pageCategory, agentContext, pageContext, ctx = {}) {
+  const _currentValue = focusedElement?.currentValue || '';
+  const _isEdit = ctx.isEdit === true && _currentValue && _currentValue.length > 10;
+
+  logger.info(`[instruction.runner] type-edit: isEdit=${_isEdit}, goal="${String(goal || '').slice(0, 60)}"`);
+
+  if (_isEdit) {
+    return _executeTypeEditExisting(sessionId, value, focusedElement, goal, pageCategory, agentContext, pageContext);
+  }
+  return _executeTypeGenerate(sessionId, value, focusedElement, goal, pageCategory, agentContext, pageContext);
+}
+
+// type-edit (generate mode): LLM generates long text from the goal, then types it into the field.
+async function _executeTypeGenerate(sessionId, value, focusedElement, goal, pageCategory, agentContext, pageContext) {
+  const { askWithMessages } = require('../skill-helpers/skill-llm.cjs');
+
+  // If the value from _extractValue is already long/multi-line, use it directly
+  // (the LLM in _extractValue may have already generated the content)
+  if (value && value.length > 100) {
+    logger.info(`[instruction.runner] type-edit (generate): using provided value (${value.length} chars) — typing into field`);
+    return _executeTypePlain(sessionId, value, focusedElement, pageCategory);
+  }
+
+  // Otherwise, generate the content from the goal
+  logger.info(`[instruction.runner] type-edit (generate): generating content from goal`);
+
+  const _contextBlock = agentContext ? `\n\nAgent context:\n${String(agentContext).slice(0, 800)}` : '';
+  const _pageContext = pageContext ? `\nPage title: ${pageContext.title || 'unknown'}` : '';
+
+  const systemPrompt = `You generate long-form content for a web page field based on the goal.
+Return ONLY the content to type — no explanations, no markdown code fences.
+- Generate the full content requested by the goal
+- Use appropriate formatting (paragraphs, lists, etc.) with \\n for line breaks
+- Be thorough and complete
+- Match the requested format (essay, document, code, email body, etc.)`;
+
+  const userPrompt = `Goal: ${goal}
+${_pageContext}${_contextBlock}
+
+Generate the content:`;
+
+  try {
+    const raw = await askWithMessages([
+      { role: 'system', content: systemPrompt },
+      { role: 'user', content: userPrompt },
+    ], { maxTokens: 8000, temperature: 0.3, responseTimeoutMs: 60000, taskType: 'complex' });
+    const generated = (raw || '').trim().replace(/^```(?:text|plaintext|markdown)?\s*\n?/i, '').replace(/\n?```\s*$/, '').trim();
+
+    if (!generated || generated.length < 20) {
+      logger.warn(`[instruction.runner] type-edit (generate): LLM returned too little content (${generated.length} chars) — falling back to type-plain`);
+      return _executeTypePlain(sessionId, value, focusedElement, pageCategory);
+    }
+
+    logger.info(`[instruction.runner] type-edit (generate): generated ${generated.length} chars — typing into field`);
+    return _executeTypePlain(sessionId, generated, focusedElement, pageCategory);
+  } catch (e) {
+    logger.warn(`[instruction.runner] type-edit (generate) failed: ${e.message} — falling back to type-plain`);
+    return _executeTypePlain(sessionId, value, focusedElement, pageCategory);
+  }
+}
+
+// type-edit (edit mode): Meta+A → Meta+C → save to file → edit.agent → Meta+V paste back.
+async function _executeTypeEditExisting(sessionId, value, focusedElement, goal, pageCategory, agentContext, pageContext) {
+  const fs = require('fs');
+  const path = require('path');
+  const os = require('os');
+
+  const _editsDir = path.join(os.homedir(), '.thinkdrop', 'edits', 'copies');
+  try {
+    fs.mkdirSync(_editsDir, { recursive: true });
+  } catch (e) {
+    logger.warn(`[instruction.runner] type-edit (edit): could not create edits dir: ${e.message}`);
+  }
+
+  // 1. Select all + copy (Meta+A → Meta+C)
+  logger.info(`[instruction.runner] type-edit (edit): selecting all and copying field content`);
+  await browserAct({ action: 'press', sessionId, key: 'Meta+a', headed: true, timeoutMs: 2000 });
+  await _sleep(100);
+  await browserAct({ action: 'press', sessionId, key: 'Meta+c', headed: true, timeoutMs: 2000 });
+  await _sleep(200);
+
+  // 2. Read clipboard and save to file
+  let clipboardContent = '';
+  try {
+    const clipRes = await browserAct({
+      action: 'evaluate', sessionId, headed: true, timeoutMs: 3000,
+      text: `(() => {
+        try { return await navigator.clipboard.readText(); }
+        catch (e) { return null; }
+      })()`,
+    });
+    clipboardContent = typeof clipRes?.result === 'string' ? clipRes.result : '';
+  } catch { clipboardContent = ''; }
+
+  if (!clipboardContent || clipboardContent.length < 10) {
+    logger.warn(`[instruction.runner] type-edit (edit): clipboard empty or too short — falling back to generate`);
+    return _executeTypeGenerate(sessionId, value, focusedElement, goal, pageCategory, agentContext, pageContext);
+  }
+
+  // Save to file
+  const _timestamp = Date.now();
+  const _copyFile = path.join(_editsDir, `copy-${_timestamp}.md`);
+  try {
+    fs.writeFileSync(_copyFile, clipboardContent, 'utf8');
+    logger.info(`[instruction.runner] type-edit (edit): saved ${clipboardContent.length} chars to ${path.basename(_copyFile)}`);
+  } catch (e) {
+    logger.warn(`[instruction.runner] type-edit (edit): could not save copy file: ${e.message}`);
+    return _executeTypeGenerate(sessionId, value, focusedElement, goal, pageCategory, agentContext, pageContext);
+  }
+
+  // 3. Call edit.agent to edit the file
+  let editResult;
+  try {
+    const { editAgent } = require('./edit.agent.cjs');
+    editResult = await editAgent({ goal, filePath: _copyFile, agentContext });
+  } catch (e) {
+    logger.warn(`[instruction.runner] type-edit (edit): edit.agent failed: ${e.message}`);
+    return _executeTypeGenerate(sessionId, value, focusedElement, goal, pageCategory, agentContext, pageContext);
+  }
+
+  if (!editResult?.ok) {
+    logger.warn(`[instruction.runner] type-edit (edit): edit.agent returned error: ${editResult?.error}`);
+    return _executeTypeGenerate(sessionId, value, focusedElement, goal, pageCategory, agentContext, pageContext);
+  }
+
+  logger.info(`[instruction.runner] type-edit (edit): edit.agent done — ${editResult.summary}`);
+
+  // 4. Read the edited file
+  let editedContent;
+  try {
+    editedContent = fs.readFileSync(_copyFile, 'utf8');
+  } catch (e) {
+    logger.warn(`[instruction.runner] type-edit (edit): could not read edited file: ${e.message}`);
+    return { ok: false, pageChanged: false, error: 'Could not read edited file' };
+  }
+
+  // 5. Set clipboard to edited content and paste (Meta+V)
+  try {
+    await browserAct({
+      action: 'evaluate', sessionId, headed: true, timeoutMs: 3000,
+      text: `(() => {
+        try { navigator.clipboard.writeText(${JSON.stringify(editedContent)}); return true; }
+        catch (e) { return false; }
+      })()`,
+    });
+    await _sleep(200);
+  } catch (e) {
+    logger.warn(`[instruction.runner] type-edit (edit): could not set clipboard: ${e.message}`);
+  }
+
+  // Select all + paste
+  logger.info(`[instruction.runner] type-edit (edit): pasting edited content (${editedContent.length} chars)`);
+  await browserAct({ action: 'press', sessionId, key: 'Meta+a', headed: true, timeoutMs: 2000 });
+  await _sleep(50);
+  await browserAct({ action: 'press', sessionId, key: 'Meta+v', headed: true, timeoutMs: 5000 });
+  await _sleep(500);
+
+  // 6. Cleanup: keep only last 10 copy files
+  try {
+    const files = fs.readdirSync(_editsDir)
+      .filter(f => f.startsWith('copy-'))
+      .map(f => ({ name: f, path: path.join(_editsDir, f), mtime: fs.statSync(path.join(_editsDir, f)).mtimeMs }))
+      .sort((a, b) => b.mtime - a.mtime);
+    for (let i = 10; i < files.length; i++) {
+      try { fs.unlinkSync(files[i].path); } catch {}
+    }
+  } catch {}
+
+  return { ok: true, pageChanged: false };
+}
+
+// ── Shared dropdown navigation helper ──
+// Used by type-commands and type-search.
+// 1. Type the trigger text (already done by caller)
+// 2. Wait for dropdown to appear (poll for [role="menu"] or [role="listbox"] visible, up to 2s)
+// 3. ArrowDown through options (cap at maxOptions), reading the highlighted option after each press
+// 4. LLM call after each ArrowDown: "Is this the right option? Target: '...', Current: '...', Return YES/NO"
+// 5. If YES → press Enter to select, return { ok: true, selectedLabel }
+// 6. If no match after cap → press Escape, return { ok: false, error: 'No matching option found' }
+async function _executeTypeWithDropdown(sessionId, targetLabel, maxOptions = 10) {
+  const { askWithMessages } = require('../skill-helpers/skill-llm.cjs');
+
+  // Wait for dropdown to appear (poll for visible [role="option"] elements).
+  // Notion's slash menu items have role="option" but are NOT inside a [role="menu"]
+  // or [role="listbox"] container — they're standalone divs.
+  // 5s timeout (25 attempts × 200ms) — Notion's slash menu can take 2-3s on first load
+  let dropdownFound = false;
+  for (let w = 0; w < 25; w++) {
+    await _sleep(200);
+    const res = await browserAct({
+      action: 'evaluate', sessionId, headed: true, timeoutMs: 2000,
+      text: `(() => {
+        const options = document.querySelectorAll('[role="option"], [role="menuitem"], [role="menuitemradio"], [role="menuitemcheckbox"]');
+        for (const opt of options) {
+          const r = opt.getBoundingClientRect();
+          if (r.width > 0 && r.height > 0) return true;
+        }
+        return false;
+      })()`,
+    });
+    if (res?.result === true || res?.result === 'true') {
+      dropdownFound = true;
+      break;
+    }
+  }
+  if (!dropdownFound) {
+    logger.info(`[instruction.runner] _executeTypeWithDropdown: no dropdown appeared after 5s`);
+    return { ok: false, error: 'No dropdown appeared after typing trigger' };
+  }
+  logger.info(`[instruction.runner] _executeTypeWithDropdown: dropdown appeared, searching for "${targetLabel}"`);
+
+  // Read ALL visible options at once via querySelectorAll.
+  // Notion's slash menu is NOT virtualized — all items are in the DOM at once.
+  // The engine path (page.evaluate) returns JS values directly — no JSON.parse needed.
+  let allLabels = [];
+  try {
+    const res = await browserAct({
+      action: 'evaluate', sessionId, headed: true, timeoutMs: 3000,
+      text: `(() => {
+        const options = document.querySelectorAll('[role="option"], [role="menuitem"], [role="menuitemradio"], [role="menuitemcheckbox"]');
+        const labels = [];
+        for (const opt of options) {
+          const r = opt.getBoundingClientRect();
+          if (r.width === 0 || r.height === 0) continue;
+          const text = (opt.innerText || opt.textContent || '').trim().replace(/\\s+/g, ' ').slice(0, 120);
+          if (text && text.length > 0 && !labels.includes(text)) {
+            labels.push(text);
+          }
+        }
+        return labels;
+      })()`,
+    });
+    const raw = res?.result;
+    if (Array.isArray(raw)) {
+      allLabels = raw;
+    } else if (typeof raw === 'string') {
+      try { allLabels = JSON.parse(raw); } catch { allLabels = []; }
+    }
+  } catch (e) {
+    logger.warn(`[instruction.runner] _executeTypeWithDropdown: could not read options: ${e.message}`);
+  }
+
+  if (allLabels.length === 0) {
+    logger.info(`[instruction.runner] _executeTypeWithDropdown: no options found in dropdown — pressing Escape`);
+    await browserAct({ action: 'press', sessionId, key: 'Escape', headed: true, timeoutMs: 2000 });
+    await _sleep(300);
+    return { ok: false, error: `No options found in dropdown` };
+  }
+
+  logger.info(`[instruction.runner] _executeTypeWithDropdown: found ${allLabels.length} options: ${allLabels.slice(0, 5).join(', ')}${allLabels.length > 5 ? '...' : ''}`);
+
+  // LLM call: find the best matching option from the full list.
+  // Return the 1-based index of the best match, or 0 if no match.
+  let matchIndex = -1;
+  try {
+    const numbered = allLabels.map((l, i) => `${i + 1}. ${l}`).join('\n');
+    const raw = await askWithMessages([
+      { role: 'system', content: 'You are a dropdown option matcher. Return ONLY the number (1-based index) of the option that best matches the target. Return 0 if no option matches.' },
+      { role: 'user', content: `Target: "${targetLabel}"\n\nOptions:\n${numbered}\n\nWhich option number matches?` },
+    ], { maxTokens: 5, temperature: 0.1, responseTimeoutMs: 5000 });
+    const parsed = parseInt((raw || '').trim(), 10);
+    if (parsed >= 1 && parsed <= allLabels.length) {
+      matchIndex = parsed - 1;
+    }
+  } catch (e) {
+    logger.warn(`[instruction.runner] _executeTypeWithDropdown: LLM match failed: ${e.message}`);
+  }
+
+  if (matchIndex < 0) {
+    logger.info(`[instruction.runner] _executeTypeWithDropdown: no match found — pressing Escape`);
+    await browserAct({ action: 'press', sessionId, key: 'Escape', headed: true, timeoutMs: 2000 });
+    await _sleep(300);
+    return { ok: false, error: `No matching option found for "${targetLabel}"` };
+  }
+
+  const matchedLabel = allLabels[matchIndex];
+  logger.info(`[instruction.runner] _executeTypeWithDropdown: match found at #${matchIndex + 1}: "${matchedLabel}" — ArrowDown ${matchIndex} times + Enter`);
+
+  // Navigate to the matched option with ArrowDown, then press Enter.
+  // The first option is already highlighted (index 0), so we need matchIndex ArrowDowns.
+  for (let i = 0; i < matchIndex; i++) {
+    await browserAct({ action: 'press', sessionId, key: 'ArrowDown', headed: true, timeoutMs: 2000 });
+    await _sleep(100);
+  }
+  await browserAct({ action: 'press', sessionId, key: 'Enter', headed: true, timeoutMs: 5000 });
+  await _sleep(500);
+  return { ok: true, selectedLabel: matchedLabel };
+}
+
+// type-commands: typing with / or @ commands that open a dropdown (Notion blocks, Slack commands)
+// Flow: load cached command list (or discover) → LLM picks number → type trigger + Enter → type content
+// Fallback: if type+Enter fails verification, fall back to ArrowDown+LLM (_executeTypeWithDropdown)
+async function _executeTypeCommands(sessionId, value, focusedElement, goal, pageCategory, agentContext, pageContext, ctx = {}) {
+  const { _extractCommandPlan } = require('./browser.agent.cjs');
+  const plan = await _extractCommandPlan(goal, focusedElement, value, [], agentContext);
+
+  if (!plan) {
+    logger.info(`[instruction.runner] type-commands: no command plan extracted — falling back to type-plain`);
+    return _executeTypePlain(sessionId, value, focusedElement, pageCategory, ctx);
+  }
+
+  logger.info(`[instruction.runner] type-commands: trigger="${plan.trigger}", commandLabel="${plan.commandLabel}", content="${(plan.content || '').slice(0, 50)}"`);
+
+  // Load cached command list from appKnowledge
+  let cachedCommands = null;
+  let _appHostname = null;
+  try {
+    const _urlRes = await browserAct({ action: 'evaluate', sessionId, headed: true, timeoutMs: 2000, text: 'window.location.hostname' });
+    _appHostname = (typeof _urlRes?.result === 'string' ? _urlRes.result : '').replace(/^www\./, '').replace(/^"|"$/g, '');
+  } catch {}
+  if (_appHostname) {
+    try {
+      const { loadAppKnowledge } = require('./lib/appKnowledge.cjs');
+      const _entries = loadAppKnowledge(_appHostname);
+      const _cmdEntry = _entries.find(e => e.type === 'command_system');
+      if (_cmdEntry && _cmdEntry.details.commands && _cmdEntry.details.commands.length > 0) {
+        cachedCommands = _cmdEntry.details.commands;
+        logger.info(`[instruction.runner] type-commands: loaded ${cachedCommands.length} cached commands from appKnowledge for ${_appHostname}`);
+      }
+    } catch {}
+  }
+
+  // If no cached commands, run discovery first
+  if (!cachedCommands || cachedCommands.length === 0) {
+    logger.info(`[instruction.runner] type-commands: no cached commands — running discovery first`);
+    const _discovered = await _runtimeDiscoverCommands(sessionId, plan.trigger.charAt(0) || '/', _appHostname);
+    if (_discovered && _discovered.length > 0) {
+      cachedCommands = _discovered;
+      // Re-read focus after discovery (may have shifted)
+      // Note: caller (_executeJustType) will also re-read, but we need it here for the title guard
+    }
+  }
+
+  // Use LLM to pick the command number from the cached list
+  let selectedCommand = null;
+  if (cachedCommands && cachedCommands.length > 0) {
+    // Build numbered list for LLM
+    const _numberedList = cachedCommands.map((c, i) => {
+      const _label = typeof c === 'string' ? c : c.label;
+      return `${i + 1}. ${_label}`;
+    }).join('\n');
+
+    try {
+      const raw = await askWithMessages([
+        { role: 'system', content: 'You pick the best command from a list to achieve a goal. Return ONLY the number (e.g. "1"). No explanation.' },
+        { role: 'user', content: `Goal: ${goal}\n\nAvailable commands:\n${_numberedList}\n\nWhich command number achieves this goal?` },
+      ], { maxTokens: 10, temperature: 0.1, responseTimeoutMs: 8000 });
+      const _num = parseInt((raw || '').trim(), 10);
+      if (_num >= 1 && _num <= cachedCommands.length) {
+        selectedCommand = cachedCommands[_num - 1];
+        const _label = typeof selectedCommand === 'string' ? selectedCommand : selectedCommand.label;
+        logger.info(`[instruction.runner] type-commands: LLM picked #${_num} → "${_label}"`);
+      } else {
+        logger.warn(`[instruction.runner] type-commands: LLM returned invalid number "${raw}" — using plan.commandLabel`);
+      }
+    } catch (e) {
+      logger.warn(`[instruction.runner] type-commands: LLM pick failed: ${e.message} — using plan.commandLabel`);
+    }
+  }
+
+  // Determine the trigger text to type.
+  // If LLM picked a command from cache, use its trigger; otherwise use plan.trigger.
+  // Fix: don't prepend the prefix if the trigger already starts with it (avoids //turnbullet).
+  let _triggerText = plan.trigger;
+  if (selectedCommand) {
+    const _trigger = typeof selectedCommand === 'string' ? selectedCommand.toLowerCase() : (selectedCommand.trigger || selectedCommand.label.toLowerCase());
+    // Ensure trigger starts with the prefix (e.g. /) — but don't double it
+    if (_trigger.startsWith(plan.trigger.charAt(0))) {
+      _triggerText = _trigger;
+    } else {
+      _triggerText = plan.trigger.charAt(0) + _trigger;
+    }
+  }
+
+  // 1. Type the trigger (e.g. "/todo" or "/to-do list")
+  // Only Meta+a if editing existing content (rare for commands — commands create new blocks)
+  if (ctx.isEdit && ctx.hasContent) {
+    await browserAct({ action: 'press', sessionId, key: 'Meta+a', headed: true, timeoutMs: 2000 });
+    await _sleep(50);
+  }
+  await browserAct({ action: 'type', sessionId, text: _triggerText, headed: true, timeoutMs: 5000 });
+  await _sleep(300);
+
+  // 2. Wait for dropdown + press Enter to select top match (type+Enter approach)
+  // Notion's slash menu filters as you type, so the top match is usually correct.
+  // Poll for visible [role="option"] elements (Notion's menu items have role="option"
+  // but are NOT inside a [role="menu"] or [role="listbox"] container).
+  let dropdownFound = false;
+  for (let w = 0; w < 25; w++) {
+    await _sleep(200);
+    const res = await browserAct({
+      action: 'evaluate', sessionId, headed: true, timeoutMs: 2000,
+      text: `(() => {
+        const options = document.querySelectorAll('[role="option"], [role="menuitem"], [role="menuitemradio"], [role="menuitemcheckbox"]');
+        for (const opt of options) {
+          const r = opt.getBoundingClientRect();
+          if (r.width > 0 && r.height > 0) return true;
+        }
+        return false;
+      })()`,
+    });
+    if (res?.result === true || res?.result === 'true') {
+      dropdownFound = true;
+      break;
+    }
+  }
+
+  if (!dropdownFound) {
+    logger.warn(`[instruction.runner] type-commands: no dropdown appeared after typing "${_triggerText}" — falling back to type-plain`);
+    // Clean up with Backspace (not Escape — keeps focus in body)
+    await browserAct({ action: 'press', sessionId, key: 'Backspace', headed: true, timeoutMs: 2000 });
+    await _sleep(100);
+    return _executeTypePlain(sessionId, value, focusedElement, pageCategory, ctx);
+  }
+
+  // Press Enter to select the top filtered match
+  logger.info(`[instruction.runner] type-commands: pressing Enter to select top match for "${_triggerText}"`);
+  await browserAct({ action: 'press', sessionId, key: 'Enter', headed: true, timeoutMs: 5000 });
+  await _sleep(500);
+
+  // 3. Verify the correct block was created (check for checkbox/todo DOM for todo commands)
+  let _verifyOk = true;
+  if (plan.commandLabel && /todo|to-do|checkbox/i.test(plan.commandLabel)) {
+    try {
+      const _verifyRes = await browserAct({
+        action: 'evaluate', sessionId, headed: true, timeoutMs: 2000,
+        text: `(() => {
+          const checkboxes = document.querySelectorAll('input[type="checkbox"], [role="checkbox"], [class*="todo"], [data-type="todo"]');
+          let visible = 0;
+          for (const el of checkboxes) {
+            const r = el.getBoundingClientRect();
+            if (r.width > 0 && r.height > 0) visible++;
+          }
+          return visible;
+        })()`,
+      });
+      const _count = parseInt(_verifyRes?.result, 10) || 0;
+      _verifyOk = _count > 0;
+      logger.info(`[instruction.runner] type-commands: verify checkboxes=${_count} ok=${_verifyOk}`);
+    } catch (e) {
+      logger.warn(`[instruction.runner] type-commands: verify failed: ${e.message}`);
+      _verifyOk = false;
+    }
+  }
+
+  // 4. If verify failed, fall back to ArrowDown+LLM approach
+  if (!_verifyOk) {
+    logger.warn(`[instruction.runner] type-commands: type+Enter verify failed — falling back to ArrowDown+LLM`);
+    // Clean up the current state: Backspace to delete the trigger
+    await browserAct({ action: 'press', sessionId, key: 'Backspace', headed: true, timeoutMs: 2000 });
+    await _sleep(200);
+    // Re-type the trigger and use ArrowDown+LLM
+    await browserAct({ action: 'type', sessionId, text: plan.trigger, headed: true, timeoutMs: 5000 });
+    await _sleep(300);
+    const dropdownResult = await _executeTypeWithDropdown(sessionId, plan.commandLabel, 10);
+    if (!dropdownResult.ok) {
+      logger.warn(`[instruction.runner] type-commands: ArrowDown+LLM also failed — falling back to type-plain`);
+      await browserAct({ action: 'press', sessionId, key: 'Backspace', headed: true, timeoutMs: 2000 });
+      await _sleep(100);
+      return _executeTypePlain(sessionId, value, focusedElement, pageCategory, ctx);
+    }
+    logger.info(`[instruction.runner] type-commands: ArrowDown+LLM selected "${dropdownResult.selectedLabel}"`);
+  }
+
+  // 5. Type the content after the command (if any)
+  if (plan.content) {
+    await _sleep(500); // wait for the new block/field to settle
+    logger.info(`[instruction.runner] type-commands: typing content "${plan.content.slice(0, 50)}"`);
+
+    // Multi-line content: type each line, press Enter between
+    if (plan.content.includes('\n')) {
+      const lines = plan.content.split('\n').filter(l => l.length > 0);
+      for (let i = 0; i < lines.length; i++) {
+        if (i > 0) {
+          await browserAct({ action: 'press', sessionId, key: 'Enter', headed: true, timeoutMs: 5000 });
+          await _sleep(500);
+        }
+        await browserAct({ action: 'type', sessionId, text: lines[i], headed: true, timeoutMs: 10000 });
+        await _sleep(300);
+      }
+    } else {
+      await browserAct({ action: 'type', sessionId, text: plan.content, headed: true, timeoutMs: 10000 });
+      await _sleep(300);
+    }
+  }
+
+  return { ok: true, pageChanged: false };
+}
+
+// type-search: typing to filter a dynamic dropdown (@mentions, assignee pickers, page pickers)
+// Flow: type trigger+query → wait for dropdown → ArrowDown + LLM pick → Enter to select
+// ctx = { isEdit, hasContent } — Meta+a only when isEdit && hasContent (uniform policy)
+async function _executeTypeSearch(sessionId, value, focusedElement, goal, pageCategory, agentContext, pageContext, ctx = {}) {
+  const { _extractSearchPlan } = require('./browser.agent.cjs');
+  const plan = await _extractSearchPlan(goal, focusedElement, value, [], agentContext);
+
+  if (!plan) {
+    logger.info(`[instruction.runner] type-search: no search plan extracted — falling back to type-plain`);
+    return _executeTypePlain(sessionId, value, focusedElement, pageCategory, ctx);
+  }
+
+  logger.info(`[instruction.runner] type-search: trigger="${plan.trigger}", query="${plan.query}", targetLabel="${plan.targetLabel}"`);
+
+  // 1. Type the trigger + query (e.g. "@John")
+  // Only Meta+a when editing existing content; for create mode, just type
+  if (ctx.isEdit && ctx.hasContent) {
+    await browserAct({ action: 'press', sessionId, key: 'Meta+a', headed: true, timeoutMs: 2000 });
+    await _sleep(50);
+  }
+  const fullQuery = plan.trigger + plan.query;
+  await browserAct({ action: 'type', sessionId, text: fullQuery, headed: true, timeoutMs: 5000 });
+  await _sleep(500); // extra wait for dynamic dropdown to filter
+
+  // 2. Wait for dropdown + navigate to find the target
+  const dropdownResult = await _executeTypeWithDropdown(sessionId, plan.targetLabel, 10);
+
+  if (!dropdownResult.ok) {
+    logger.warn(`[instruction.runner] type-search: dropdown selection failed (${dropdownResult.error})`);
+    // Press Escape to close dropdown, return failure
+    await browserAct({ action: 'press', sessionId, key: 'Escape', headed: true, timeoutMs: 2000 });
+    await _sleep(300);
+    return { ok: false, pageChanged: false, error: dropdownResult.error };
+  }
+
+  logger.info(`[instruction.runner] type-search: selected "${dropdownResult.selectedLabel}"`);
+  return { ok: true, pageChanged: false };
+}
+
+// Dispatcher: routes to the correct type executor based on fieldType.
+// Hoists the edit/create decision (_extractEditMode) so all type flows share the same
+// Meta+a policy: only select-all when isEdit && hasContent. Also saves a backup before
+// any modification to a field with existing content.
+async function _executeTypedField(sessionId, fieldType, value, focusedElement, goal, pageCategory, agentContext, pageContext) {
+  logger.info(`[instruction.runner] _executeTypedField: fieldType=${fieldType}, value="${String(value || '').slice(0, 40)}"`);
+
+  // ── Uniform edit/create decision ──
+  const _hasContent = focusedElement?.hasContent === true;
+  const _currentValue = focusedElement?.currentValue || '';
+  let _isEdit = false;
+  if (_hasContent && _currentValue.length > 10) {
+    try {
+      const { _extractEditMode } = require('./browser.agent.cjs');
+      _isEdit = (await _extractEditMode(goal, focusedElement, _currentValue, agentContext)) === 'edit';
+    } catch (e) {
+      logger.warn(`[instruction.runner] _executeTypedField: _extractEditMode failed: ${e.message} — defaulting to create`);
+    }
+  }
+  const ctx = { isEdit: _isEdit, hasContent: _hasContent };
+  logger.info(`[instruction.runner] _executeTypedField: isEdit=${_isEdit}, hasContent=${_hasContent}`);
+
+  // ── Save backup before any modification to a field with existing content ──
+  if (_hasContent) {
+    await _saveBackup(focusedElement);
+  }
+
+  switch (fieldType) {
+    case 'type-edit':
+      return _executeTypeEdit(sessionId, value, focusedElement, goal, pageCategory, agentContext, pageContext, ctx);
+    case 'type-commands':
+      return _executeTypeCommands(sessionId, value, focusedElement, goal, pageCategory, agentContext, pageContext, ctx);
+    case 'type-search':
+      return _executeTypeSearch(sessionId, value, focusedElement, goal, pageCategory, agentContext, pageContext, ctx);
+    case 'type-plain':
+    default:
+      return _executeTypePlain(sessionId, value, focusedElement, pageCategory, ctx);
+  }
+}
+
+async function _executeJustType(sessionId, value, focusedElement, pageCategory, goal, agentContext, pageContext) {
+  if (!focusedElement) {
+    // No focused element — try to click the first visible fillable element
+    logger.info(`[instruction.runner] Just-type: no focused element — clicking first fillable to focus`);
+    const _firstFillable = await _clickFirstFillable(sessionId);
+    if (!_firstFillable) return { ok: false, pageChanged: false, error: 'No focused element and no fillable element found' };
+    focusedElement = _firstFillable;
+  }
+
+  const _tag = focusedElement.tag || '';
+  const _role = focusedElement.role || '';
+  const _isFillable = ['input', 'textarea'].includes(_tag) ||
+                      _role === 'combobox' || _role === 'textbox' ||
+                      focusedElement.isContentEditable === true;
+  if (!_isFillable) {
+    return { ok: false, pageChanged: false, error: `Focused element ${_tag} role=${_role} is not fillable` };
+  }
+
+  // Handle special values: PRESS_<KEY> (generic key press support with modifiers)
+  if (value === 'PRESS_ENTER' || (value && value.startsWith('PRESS_'))) {
+    const _keyMap = {
+      enter: 'Enter', tab: 'Tab', escape: 'Escape', space: ' ',
+      arrow_down: 'ArrowDown', arrow_up: 'ArrowUp',
+      arrow_left: 'ArrowLeft', arrow_right: 'ArrowRight',
+      backspace: 'Backspace', delete: 'Delete',
+    };
+    const _modMap = { shift: 'Shift', meta: 'Meta', control: 'Control', ctrl: 'Control', alt: 'Alt' };
+    const _keySpec = value.replace('PRESS_', '');
+    const _parts = _keySpec.split('+');
+    let _key, _mods = [];
+    if (_parts.length > 1) {
+      _mods = _parts.slice(0, -1).map(m => _modMap[m.toLowerCase()] || m);
+      _key = _parts[_parts.length - 1];
+    } else {
+      _key = _parts[0];
+    }
+    const _finalKey = _keyMap[_key.toLowerCase()] || _key;
+    const _combo = [..._mods, _finalKey].join('+');
+    logger.info(`[instruction.runner] Just-type: pressing ${_combo} (from ${value})`);
+    await browserAct({ action: 'press', sessionId, key: _combo, headed: true, timeoutMs: 5000 });
+    await _sleep(800);
+    return { ok: true, pageChanged: false };
+  }
+  if (value === 'SKIP' || !value) {
+    return { ok: false, pageChanged: false, error: 'LLM says skip this field' };
+  }
+
+  // Determine field type and dispatch to the right executor
+  const { _extractFieldType } = require('./browser.agent.cjs');
+  const fieldType = await _extractFieldType(goal, focusedElement, value, [], pageContext || {}, agentContext);
+  return _executeTypedField(sessionId, fieldType, value, focusedElement, goal, pageCategory, agentContext, pageContext);
 }
 
 // ── Strategy 2: Meta+F search ──────────────────────────────────────────
@@ -3277,6 +4119,32 @@ async function _executeTabMapAction(sessionId, parsed, tabMap, overlayActive, pa
     return { ok: !!result?.ok, pageChanged: false, error: result?.error, pickedRef: pickedEntry.ref };
   }
 
+  // ── Observation actions (no element matching needed) ──
+  if (parsed.action === 'waitForStableText') {
+    const result = await browserAct({ action: 'waitForStableText', sessionId, headed: true, timeoutMs: 8000 }).catch(e => ({ ok: false, error: e.message }));
+    return { ok: !!result?.ok, pageChanged: false, error: result?.error, pageText: result?.result || '' };
+  }
+
+  if (parsed.action === 'getPageText') {
+    const result = await browserAct({ action: 'getPageText', sessionId, headed: true, timeoutMs: 10000 }).catch(e => ({ ok: false, error: e.message }));
+    return { ok: !!result?.ok, pageChanged: false, error: result?.error, pageText: result?.result || result?.stdout || '' };
+  }
+
+  if (parsed.action === 'scroll') {
+    const result = await browserAct({ action: 'scroll', sessionId, direction: parsed.direction || 'down', headed: true, timeoutMs: 5000 }).catch(e => ({ ok: false, error: e.message }));
+    return { ok: !!result?.ok, pageChanged: false, error: result?.error };
+  }
+
+  if (parsed.action === 'screenshot') {
+    const result = await browserAct({ action: 'screenshot', sessionId, headed: true, timeoutMs: 5000 }).catch(e => ({ ok: false, error: e.message }));
+    return { ok: !!result?.ok, pageChanged: false, error: result?.error };
+  }
+
+  if (parsed.action === 'run-code') {
+    const result = await browserAct({ action: 'run-code', sessionId, code: parsed.code, headed: true, timeoutMs: 10000 }).catch(e => ({ ok: false, error: e.message }));
+    return { ok: !!result?.ok, pageChanged: false, error: result?.error, pageText: result?.result || result?.stdout || '' };
+  }
+
   return { ok: false, pageChanged: false, error: `Unknown action: ${parsed.action}` };
 }
 
@@ -3356,6 +4224,27 @@ async function _tabMapStepExecute(sessionId, step, stepIndex, stepCount, tabMap,
     };
   }
 
+  // Handle observation actions (no element matching needed)
+  if (step.action === 'waitForStableText' || step.action === 'getPageText' ||
+      step.action === 'scroll' || step.action === 'screenshot' || step.action === 'run-code') {
+    const parsed = { action: step.action, direction: step.direction, code: step.code };
+    const result = await _executeTabMapAction(sessionId, parsed, tabMap, overlayActive, pageCategory, null);
+    const _actionLabel = step.action === 'run-code' ? 'Run code' :
+                         step.action === 'waitForStableText' ? 'Wait for stable text' :
+                         step.action === 'getPageText' ? 'Get page text' :
+                         step.action === 'scroll' ? `Scroll ${step.direction || 'down'}` :
+                         'Screenshot';
+    return {
+      done: false,
+      ok: !!result?.ok,
+      pageChanged: false,
+      stateChanged: false,
+      error: result?.error,
+      extractedText: result?.pageText || '',
+      action: _actionLabel,
+    };
+  }
+
   // Match target to element
   let pickedEntry = null;
   if (step.target) {
@@ -3420,7 +4309,7 @@ async function _tabMapStepExecute(sessionId, step, stepIndex, stepCount, tabMap,
 // Tab-Map inner loop: runs ONE step of the Tab-Map scan session.
 // Returns { done, ok, error, stateChanged, filledRef, filledLabel, filledValue }
 //   done=true when session ends (DONE, state change, or failure)
-async function _tabMapInnerStep(sessionId, goal, actionHistory, currentUrl, overlayActive, pageCategory, agentContext, cachedTabMap, filledFields, consumedRefs, lastVerifyFailed) {
+async function _tabMapInnerStep(sessionId, goal, actionHistory, currentUrl, overlayActive, pageCategory, agentContext, cachedTabMap, filledFields, consumedRefs, lastVerifyFailed, extractedPageText) {
   const { _llmNextAction } = require('./browser.agent.cjs');
 
   // 1. Use cached tab-map (scan session — no re-scan unless invalidated by caller)
@@ -3430,7 +4319,7 @@ async function _tabMapInnerStep(sessionId, goal, actionHistory, currentUrl, over
   }
 
   // 2. Ask LLM for next action
-  const nextAction = await _llmNextAction(goal, currentUrl, tabMap, actionHistory, pageCategory, agentContext, lastVerifyFailed, consumedRefs, filledFields);
+  const nextAction = await _llmNextAction(goal, currentUrl, tabMap, actionHistory, pageCategory, agentContext, lastVerifyFailed, consumedRefs, filledFields, extractedPageText);
   if (!nextAction) {
     logger.warn(`[instruction.runner] Tab-Map: LLM returned null — treating as DONE`);
     return { done: true, ok: true };
@@ -3498,6 +4387,7 @@ async function _tabMapInnerStep(sessionId, goal, actionHistory, currentUrl, over
     filledRef,
     filledLabel,
     filledValue,
+    extractedText: result.pageText || '',
     action: nextAction,
   };
 }
@@ -3562,18 +4452,52 @@ async function _probePageStructure(sessionId) {
   } catch { return { fillableCount: 0, clickableCount: 0, hasAutoFocus: false, fillableTypes: { inputCount: 0, textareaCount: 0, contenteditableCount: 0, roleTextboxCount: 0 }, pageTitle: '', visibleText: '' }; }
 }
 
-// Lightweight DONE check — LLM YES/NO based on goal + action history.
-async function _checkDone(goal, actionHistory) {
+// Count visible checkboxes on the page (input[type=checkbox] or [role=checkbox]).
+// Used by _checkDone to verify "todo list with N items" goals.
+async function _countCheckboxes(sessionId) {
+  try {
+    const res = await browserAct({
+      action: 'evaluate', sessionId, headed: true, timeoutMs: 2000,
+      text: `(() => {
+        const checkboxes = document.querySelectorAll('input[type="checkbox"], [role="checkbox"]');
+        let visible = 0;
+        for (const el of checkboxes) {
+          const r = el.getBoundingClientRect();
+          if (r.width > 0 && r.height > 0) visible++;
+        }
+        return visible;
+      })()`,
+    });
+    const raw = res?.result;
+    return parseInt(typeof raw === 'string' ? raw.replace(/^"|"$/g, '') : raw) || 0;
+  } catch { return 0; }
+}
+
+// Lightweight DONE check — LLM YES/NO based on goal + action history + page state.
+// Page state (title, URL, checkbox count) prevents false DONE declarations.
+async function _checkDone(goal, actionHistory, currentUrl, pageTitle, checkboxCount) {
   if (actionHistory.length === 0) return false;
   const { askWithMessages } = require('../skill-helpers/skill-llm.cjs');
   const historyStr = actionHistory.slice(-10).map((a, i) => `  ${i + 1}. ${a}`).join('\n');
   try {
     const raw = await askWithMessages([
-      { role: 'system', content: 'Has this browser automation goal been completed? Look at the action history. Return ONLY "YES" or "NO".' },
-      { role: 'user', content: `Goal: ${goal}\nActions:\n${historyStr}` },
+      { role: 'system', content: `Has this browser automation goal been completed?
+Look at the action history AND the current page state. Return ONLY "YES" or "NO".
+- Check if the page title matches the goal (e.g. "create a page called X" → title should contain X)
+- Check if checkboxes exist (e.g. "add a todo list with N items" → should have N checkboxes)
+- Do NOT say YES if the actions show SKIP/failures or if the page state doesn't match the goal
+- Do NOT say YES if the actions only show partial completion (e.g. typed title but goal also asks for body content)` },
+      { role: 'user', content: `Goal: ${goal}
+Current URL: ${currentUrl || 'unknown'}
+Page title: "${pageTitle || 'unknown'}"
+Checkboxes on page: ${checkboxCount || 0}
+Actions:
+${historyStr}
+
+Completed?` },
     ], { maxTokens: 5, temperature: 0.1, responseTimeoutMs: 5000 });
     const done = (raw || '').trim().toUpperCase().startsWith('YES');
-    logger.info(`[instruction.runner] _checkDone: ${done ? 'YES' : 'NO'} (raw="${(raw || '').trim()}")`);
+    logger.info(`[instruction.runner] _checkDone: ${done ? 'YES' : 'NO'} (raw="${(raw || '').trim()}", title="${pageTitle || ''}", checkboxes=${checkboxCount || 0})`);
     return done;
   } catch (e) {
     logger.warn(`[instruction.runner] _checkDone failed: ${e.message}`);
@@ -3584,18 +4508,20 @@ async function _checkDone(goal, actionHistory) {
 // LLM-based tier selection — sees goal + URL + real-time page context (title,
 // visible text) + agent context (shortcuts, commands) + page structure (element
 // types) and returns 0-4. Falls back to _selectTierDeterministic on LLM failure.
-async function _selectTierLLM(sessionId, goal, actionHistory, pageCategory, shortcutCount, focused, currentUrl, probe, agentContext, triedTiers = new Set()) {
+async function _selectTierLLM(sessionId, goal, actionHistory, pageCategory, shortcutCount, focused, currentUrl, probe, agentContext, triedTiers = new Set(), disabledTiers = new Set(), layoutText = '', ocrObservation = null) {
   const { askWithMessages } = require('../skill-helpers/skill-llm.cjs');
 
   // 1. DONE check (only if we've taken actions) — keep this deterministic
   if (actionHistory.length > 0) {
-    const done = await _checkDone(goal, actionHistory);
+    const _checkboxCount = await _countCheckboxes(sessionId);
+    const done = await _checkDone(goal, actionHistory, currentUrl, probe?.pageTitle, _checkboxCount);
     if (done) return 0;
   }
 
   const { fillableCount, clickableCount, hasAutoFocus, fillableTypes, pageTitle, visibleText } = probe;
+  const { _buildFocusedStr } = require('./browser.agent.cjs');
   const _focusedStr = focused
-    ? `${focused.tag} "${(focused.text || focused.ariaLabel || '').slice(0, 60)}" role=${focused.role || 'none'}`
+    ? _buildFocusedStr(focused)
     : 'none (body/no focus)';
 
   // 2. Build available tiers (exclude tried tiers — don't give the LLM the choice)
@@ -3605,8 +4531,29 @@ async function _selectTierLLM(sessionId, goal, actionHistory, pageCategory, shor
     2: '2 = Meta+F (find specific text on the page by searching, then click it)',
     3: '3 = Shortcut keys (press an app-specific keyboard shortcut)',
     4: '4 = Tab-Map (scan all focusable elements, fill multiple fields, click buttons — for forms and complex UI)',
+    5: '5 = Gesture (drag-drop, sliders, spatial interactions using mouse coordinates)',
   };
-  const _availableTiers = [1, 2, 3, 4].filter(t => !triedTiers.has(t));
+  const _availableTiers = [1, 2, 3, 4, 5].filter(t => !triedTiers.has(t) && !disabledTiers.has(t));
+
+  // If all tiers are tried, return -1 to signal exhaustion (caller presses Escape + resets)
+  if (_availableTiers.length === 0) {
+    logger.warn(`[instruction.runner] _selectTierLLM: all tiers tried on this state — returning -1 (exhaustion)`);
+    return -1;
+  }
+
+  // Deterministic override: if ALL fillable elements are contenteditable (no input/textarea),
+  // this is a canvas editor (Notion, Google Docs, Confluence). If the goal is about
+  // typing/writing/creating, Just-type is correct — skip the LLM (it often picks Tab-Map
+  // for these, which gets stuck in sidebar menus).
+  // Goal-intent gated: only override when the goal contains type/write/create keywords,
+  // so click/share/export/format goals still go to the LLM.
+  const _typeIntentKeywords = /\b(type|write|create|add|note|list|draft|compose|make|put|fill|name|title|rename|update|edit|change)\b/i;
+  if (fillableCount > 0 && fillableTypes.inputCount === 0 && fillableTypes.textareaCount === 0
+      && fillableTypes.contenteditableCount > 0 && !triedTiers.has(1)
+      && _typeIntentKeywords.test(goal)) {
+    logger.info(`[instruction.runner] _selectTierLLM: → 1 (Just-type) — contenteditable canvas editor (${fillableTypes.contenteditableCount} ce, 0 input, 0 textarea) + goal has type-intent keyword`);
+    return 1;
+  }
 
   // If only Tab-Map is left, skip the LLM call — just return it
   if (_availableTiers.length === 1 && _availableTiers[0] === 4) {
@@ -3635,7 +4582,12 @@ CRITICAL RULES:
 - If the page has a single fillable input (search box, chat prompt) and the goal is to search/ask/type → return 1 (Just-type)
 - If the goal requires finding a specific item on the page → return 2 (Meta+F)
 - If app shortcuts are available (see App context) and a shortcut directly accomplishes the goal → return 3 (Shortcuts)
+- If the goal involves drag-drop, sliders, or spatial interaction (drag, move, slide, rearrange, reorder) → return 5 (Gesture)
 - When in doubt → return 4 (Tab-Map)`;
+
+  const _ocrBlock = ocrObservation
+    ? `\nOCR visual text (may include content not in DOM): ${ocrObservation.fullText || ocrObservation.textItems.slice(0, 10).map(t => t.text).join(' ')}\n`
+    : '';
 
   const userPrompt = `Goal: ${goal}
 Current URL: ${currentUrl}
@@ -3643,7 +4595,7 @@ Page title: ${pageTitle}
 Visible text (first 200 chars): ${visibleText}
 Page category: ${pageCategory || 'unknown'}
 Page structure: ${fillableCount} fillable (input=${fillableTypes.inputCount}, textarea=${fillableTypes.textareaCount}, contenteditable=${fillableTypes.contenteditableCount}), ${clickableCount} clickable, autoFocus=${hasAutoFocus}
-Focused element: ${_focusedStr}
+${layoutText ? `Page layout:\n${layoutText}\n` : ''}${_ocrBlock}Focused element: ${_focusedStr}
 Available shortcuts: ${shortcutCount}
 Actions taken so far:
 ${actionHistory.length > 0 ? actionHistory.slice(-10).map((a, i) => `  ${i + 1}. ${a}`).join('\n') : '  (none)'}${_contextBlock}
@@ -3656,8 +4608,9 @@ Strategy? (${_availableTiers.join(', ')})`;
       { role: 'user', content: userPrompt },
     ], { maxTokens: 10, temperature: 0.1, responseTimeoutMs: 10000 });
     const num = parseInt((raw || '').trim().replace(/\D/g, ''), 10);
-    // If LLM returns a tried tier anyway, override to Tab-Map (safe fallback)
-    const result = _availableTiers.includes(num) ? num : 4;
+    // If LLM returns an invalid/tried/disabled tier, fall back to first available
+    // (default was 4/Tab-Map, but Tab-Map may be disabled for high-shortcut apps)
+    const result = _availableTiers.includes(num) ? num : (_availableTiers[0] || 1);
     logger.info(`[instruction.runner] _selectTierLLM: strategy=${result} (raw="${(raw || '').trim()}") — fillable=${fillableCount} (input=${fillableTypes.inputCount}, ce=${fillableTypes.contenteditableCount}), title="${pageTitle}", tried=[${[...triedTiers].join(',')}], url=${currentUrl}`);
     return result;
   } catch (e) {
@@ -3679,7 +4632,8 @@ Strategy? (${_availableTiers.join(', ')})`;
 async function _selectTierDeterministic(sessionId, goal, actionHistory, pageCategory, shortcutCount, focused, probe) {
   // 1. DONE check (only if we've taken actions)
   if (actionHistory.length > 0) {
-    const done = await _checkDone(goal, actionHistory);
+    const _checkboxCount = await _countCheckboxes(sessionId);
+    const done = await _checkDone(goal, actionHistory, null, probe?.pageTitle, _checkboxCount);
     if (done) return 0;
   }
 
@@ -3727,13 +4681,173 @@ async function _selectTierDeterministic(sessionId, goal, actionHistory, pageCate
   return 4;
 }
 
+// ── Runtime command discovery ──
+// Types the command prefix (e.g. "/") in the current focused field, waits for the dropdown,
+// ArrowDowns through ALL options collecting labels one at a time (Tab-map style),
+// presses Backspace to close the menu and clean up (NOT Escape — in Notion, Escape
+// exits the body block and shifts focus to the title).
+// One-time per-app discovery — after this runs, the full command list is available for future calls.
+// Returns the discovered command list (array of { label, trigger }) or null on failure.
+async function _runtimeDiscoverCommands(sessionId, prefix, hostname) {
+  if (!prefix || !hostname) return null;
+  logger.info(`[instruction.runner] _runtimeDiscoverCommands: typing "${prefix}" to discover commands for ${hostname}`);
+
+  // 1. Type the prefix in the current focused field
+  await browserAct({ action: 'type', sessionId, text: prefix, headed: true, timeoutMs: 5000 });
+  await _sleep(500);
+
+  // 2. Wait for dropdown to appear (poll for visible [role="option"] elements).
+  // Notion's slash menu items have role="option" but are NOT inside a [role="menu"]
+  // or [role="listbox"] container — they're standalone divs. So we poll for
+  // visible [role="option"] elements directly.
+  // 5s timeout (25 attempts × 200ms) — Notion's slash menu can take 2-3s on first load
+  let dropdownFound = false;
+  for (let w = 0; w < 25; w++) {
+    await _sleep(200);
+    const res = await browserAct({
+      action: 'evaluate', sessionId, headed: true, timeoutMs: 2000,
+      text: `(() => {
+        const options = document.querySelectorAll('[role="option"], [role="menuitem"], [role="menuitemradio"], [role="menuitemcheckbox"]');
+        for (const opt of options) {
+          const r = opt.getBoundingClientRect();
+          if (r.width > 0 && r.height > 0) return true;
+        }
+        return false;
+      })()`,
+    });
+    if (res?.result === true || res?.result === 'true') {
+      dropdownFound = true;
+      break;
+    }
+  }
+  if (!dropdownFound) {
+    logger.info(`[instruction.runner] _runtimeDiscoverCommands: no dropdown appeared after typing "${prefix}" (5s timeout) — cleaning up with Backspace`);
+    // Use Backspace instead of Escape — keeps focus in the body block.
+    // In Notion, Escape from a body block exits the block and shifts focus to title.
+    await browserAct({ action: 'press', sessionId, key: 'Backspace', headed: true, timeoutMs: 2000 });
+    await _sleep(200);
+    return null;
+  }
+
+  // 3. Read ALL visible options at once via querySelectorAll.
+  // Notion's slash menu is NOT virtualized — all 25+ items are in the DOM at once.
+  // Each item has role="option" and innerText gives the visible label (stripped of HTML).
+  // The engine path (page.evaluate) returns JS values directly — no JSON.parse needed.
+  const allCommands = []; // [{ label, trigger }]
+  try {
+    const res = await browserAct({
+      action: 'evaluate', sessionId, headed: true, timeoutMs: 3000,
+      text: `(() => {
+        const options = document.querySelectorAll('[role="option"], [role="menuitem"], [role="menuitemradio"], [role="menuitemcheckbox"]');
+        const labels = [];
+        for (const opt of options) {
+          const r = opt.getBoundingClientRect();
+          if (r.width === 0 || r.height === 0) continue;
+          const text = (opt.innerText || opt.textContent || '').trim().replace(/\\s+/g, ' ').slice(0, 120);
+          if (text && text.length > 0 && !labels.includes(text)) {
+            labels.push(text);
+          }
+        }
+        return labels;
+      })()`,
+    });
+    const raw = res?.result;
+    let labels = [];
+    if (Array.isArray(raw)) {
+      labels = raw;
+    } else if (typeof raw === 'string') {
+      // CLI fallback may return a stringified array — try JSON.parse
+      try { labels = JSON.parse(raw); } catch { labels = []; }
+    }
+    for (const label of labels) {
+      allCommands.push({ label, trigger: label.toLowerCase() });
+      if (allCommands.length <= 10) logger.info(`[instruction.runner] _runtimeDiscoverCommands: option ${allCommands.length}: "${label}"`);
+    }
+  } catch (e) {
+    logger.warn(`[instruction.runner] _runtimeDiscoverCommands: could not read options: ${e.message}`);
+  }
+
+  // 4. Close dropdown and clean up the typed prefix.
+  // Use Backspace to delete the '/' — in Notion this also closes the slash menu
+  // and keeps the cursor in the body block. Escape would exit the block.
+  await browserAct({ action: 'press', sessionId, key: 'Backspace', headed: true, timeoutMs: 2000 });
+  await _sleep(200);
+
+  if (allCommands.length === 0) {
+    logger.info(`[instruction.runner] _runtimeDiscoverCommands: no options found in dropdown`);
+    return null;
+  }
+
+  const allLabels = allCommands.map(c => c.label);
+  logger.info(`[instruction.runner] _runtimeDiscoverCommands: discovered ${allCommands.length} commands: ${allLabels.slice(0, 10).join(', ')}${allCommands.length > 10 ? '...' : ''}`);
+
+  // 5. Cache in appKnowledge
+  try {
+    const { loadAppKnowledge, saveAppKnowledge } = require('./lib/appKnowledge.cjs');
+    const entries = loadAppKnowledge(hostname);
+    const cmdEntry = entries.find(e => e.type === 'command_system');
+    if (cmdEntry) {
+      // Update existing entry with discovered commands (merge by label)
+      const existingByLabel = new Map((cmdEntry.details.commands || []).map(c => {
+        // Handle both old format (string) and new format ({label, trigger})
+        const _c = typeof c === 'string' ? { label: c, trigger: c.toLowerCase() } : c;
+        return [_c.label, _c];
+      }));
+      for (const cmd of allCommands) existingByLabel.set(cmd.label, cmd);
+      cmdEntry.details.commands = [...existingByLabel.values()];
+      cmdEntry.details._runtimeDiscovered = true;
+      saveAppKnowledge(hostname, entries);
+      logger.info(`[instruction.runner] _runtimeDiscoverCommands: cached ${cmdEntry.details.commands.length} commands in appKnowledge for ${hostname}`);
+    } else {
+      // Create new command_system entry
+      entries.push({
+        id: `${hostname.replace(/^www\./, '').split('.')[0]}.command_system.runtime`,
+        type: 'command_system',
+        summary: `${hostname} uses the '${prefix}' prefix to open the command menu (runtime-discovered).`,
+        details: { prefix, commands: allCommands, _runtimeDiscovered: true },
+        source: 'runtime_discovery',
+        confidence: 0.9,
+        verifiedRuns: 0,
+        lastVerified: new Date().toISOString(),
+        ttlDays: 90,
+      });
+      saveAppKnowledge(hostname, entries);
+      logger.info(`[instruction.runner] _runtimeDiscoverCommands: created new command_system entry with ${allCommands.length} commands for ${hostname}`);
+    }
+  } catch (e) {
+    logger.warn(`[instruction.runner] _runtimeDiscoverCommands: could not cache in appKnowledge: ${e.message}`);
+  }
+
+  return allCommands;
+}
+
 // ── Main iterative navigation loop (three-tier) ───────────────────────
 // Tier 1: URL-first (already done by caller)
 // Build a descriptive result string from action history + filled fields.
 // This gives the synthesize step enough context to verify what was done
 // without needing to scrape the final page (which may not show the result).
 // Generic — works for any task (email, search, form, Notion, etc.).
-function _buildResultString(goal, actionHistory, filledFields) {
+
+// Check if the goal is a read/count/list/search task that benefits from page text extraction.
+// Excludes mutation goals (send, compose, create, reply, delete, archive) to avoid
+// forcing getPageText on tasks that don't need it.
+function _isReadCountListGoal(goal) {
+  const g = String(goal || '').toLowerCase();
+  // Positive: read/count/list/search/find/show/check/tell me/let me know/how many
+  if (/\b(search|find|look\s*up|count|list|read|show|check|tell\s+me|let\s+me\s+know|how\s+many|unread|inbox|emails?|messages?|subjects?|senders?)\b/i.test(g)) {
+    // Exclude mutation goals
+    if (/\b(send|compose|create|reply|forward|delete|archive|write|draft|post|publish|save|update|rename|move|label|star|mark|flag|trash|spam)\b/i.test(g)) {
+      // But "check unread" or "count unread" should still match even if "mark" appears
+      if (!/\b(check|count|list|how\s+many|tell\s+me|let\s+me\s+know|show\s+me)\b/i.test(g)) {
+        return false;
+      }
+    }
+    return true;
+  }
+  return false;
+}
+
+function _buildResultString(goal, actionHistory, filledFields, extractedPageText) {
   const parts = [];
 
   // Summarize filled fields with their values
@@ -3747,9 +4861,14 @@ function _buildResultString(goal, actionHistory, filledFields) {
   // Summarize key actions (clicks, presses) — strip result notes
   const actions = actionHistory
     .map(a => a.replace(/\s+→.*$/, ''))
-    .filter(a => /^(Click|Press|Type|Shortcut|Meta\+F|Just-type)\b/i.test(a));
+    .filter(a => /^(Click|Press|Type|Shortcut|Meta\+F|Just-type|Wait for stable|Get page text|Scroll|Screenshot|Run code)\b/i.test(a));
   if (actions.length > 0) {
     parts.push(`Actions taken [${actions.join('; ')}]`);
+  }
+
+  // Include extracted page text (from getPageText/run-code steps or auto-extract)
+  if (extractedPageText && typeof extractedPageText === 'string' && extractedPageText.trim().length > 0) {
+    parts.push(`Page content: ${extractedPageText.slice(0, 10000)}`);
   }
 
   if (parts.length === 0) {
@@ -3771,6 +4890,7 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
   const startTime = Date.now();
   const actionHistory = [];
   let _doneVerifyFails = 0;
+  let extractedPageText = '';  // accumulated from getPageText/run-code steps + auto-extract
 
   // Tab-Map scan session state
   let _cachedTabMap = null;
@@ -3781,6 +4901,24 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
   let inTabMapSession = false;
   let overlayActive = false;
   const _shortcutCount = shortcutCount || 0;
+  // Determine which tiers are available for this page:
+  // - URL-first creation deep-links (notion.new, docs.new): Just-type ONLY
+  //   (Tab-Map presses Escape/Home/Search and destroys the page state)
+  // - High-shortcut apps (>= 8 shortcuts: Notion, Google Docs, Sheets): no Tab-Map
+  //   (these apps have keyboard shortcuts for everything; Tab-Map wanders the sidebar)
+  // - Default (forms, generic web, Gmail compose): all tiers
+  const _isCreationDeepLink = _urlFirstNav && _pageCategory === 'document_editor';
+  const _isHighShortcutApp = _shortcutCount >= 8;
+  const _disabledTiers = new Set();
+  if (_isCreationDeepLink) {
+    _disabledTiers.add(2); // no Meta+F
+    _disabledTiers.add(3); // no App Shortcuts
+    _disabledTiers.add(4); // no Tab-Map
+    logger.info(`[instruction.runner] Creation deep-link detected — Just-type ONLY (tiers 2,3,4 disabled)`);
+  } else if (_isHighShortcutApp) {
+    _disabledTiers.add(4); // no Tab-Map
+    logger.info(`[instruction.runner] High-shortcut app (${_shortcutCount} shortcuts) — Tab-Map disabled (tier 4)`);
+  }
   // Step-based Tab-Map state
   let _stepPlan = null;         // extracted steps for current page: [{ action, target?, value?, key? }]
   let _stepIndex = 0;           // current step index in _stepPlan
@@ -3802,7 +4940,7 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
   while (Date.now() - startTime < timeoutMs) {
     // 1. Read current state
     const currentUrl = await _getUrl(sessionId);
-    const focused = await _readActiveElement(sessionId);
+    let focused = await _readActiveElement(sessionId);
     const newOverlayActive = await _detectOverlay(sessionId);
     const _inStepPlan = !_usingStepFallback && _stepPlan && _stepIndex < _stepPlan.length;
     const stateChanged = _inStepPlan
@@ -3851,7 +4989,7 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
         // Per-step LLM fallback (browse-and-report or step execution failed)
         stepResult = await _tabMapInnerStep(
           sessionId, goal, actionHistory, currentUrl, overlayActive, _pageCategory, agentContext,
-          _cachedTabMap, filledFields, consumedRefs, _doneVerifyFails > 0
+          _cachedTabMap, filledFields, consumedRefs, _doneVerifyFails > 0, extractedPageText
         );
       }
 
@@ -3905,12 +5043,29 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
         logger.info(`[instruction.runner] Tab-Map: filled "${stepResult.filledLabel}" — marked [FILLED] for next LLM call (${filledFields.length} fields filled)`);
       }
 
+      // Capture extracted page text from observation steps (getPageText, run-code)
+      if (stepResult.extractedText && stepResult.extractedText.trim().length > 0) {
+        extractedPageText = stepResult.extractedText;
+        logger.info(`[instruction.runner] Tab-Map: captured page text (${stepResult.extractedText.length} chars) from "${stepResult.action}"`);
+      }
+
       // Check if all steps in plan are completed — n/n steps done → success.
       // The step plan IS the source of truth. No regex goal classification,
       // no _pageCategory checks, no _verifySubmitSuccess. If the plan said
       // "type title, press enter" and both steps executed, the goal is achieved.
       if (!_usingStepFallback && _stepPlan && _stepIndex >= _stepPlan.length && !stepResult.done) {
-        const _resultStr = _buildResultString(goal, actionHistory, filledFields);
+        // Auto-extract safety net: for read/count/list goals, if no page text was captured,
+        // wait for stable text + getPageText before returning.
+        if (!extractedPageText && _isReadCountListGoal(goal)) {
+          logger.info(`[instruction.runner] Tab-Map: auto-extracting page text for read/count/list goal (no getPageText in plan)`);
+          await browserAct({ action: 'waitForStableText', sessionId, headed: true, timeoutMs: 8000 }).catch(() => {});
+          const _gtResult = await browserAct({ action: 'getPageText', sessionId, headed: true, timeoutMs: 10000 }).catch(() => null);
+          if (_gtResult?.result || _gtResult?.stdout) {
+            extractedPageText = _gtResult.result || _gtResult.stdout || '';
+            logger.info(`[instruction.runner] Tab-Map: auto-extracted ${extractedPageText.length} chars of page text`);
+          }
+        }
+        const _resultStr = _buildResultString(goal, actionHistory, filledFields, extractedPageText);
         logger.info(`[instruction.runner] Tab-Map: all ${_stepPlan.length} steps executed — done. ${_resultStr}`);
         return { ok: true, output: _resultStr, actionHistory };
       }
@@ -3925,7 +5080,16 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
         if (stepResult.ok && !stepResult.error) {
           // DONE — step plan completed or LLM declared done. No regex
           // verification — the step plan is the source of truth.
-          const _resultStr = _buildResultString(goal, actionHistory, filledFields);
+          if (!extractedPageText && _isReadCountListGoal(goal)) {
+            logger.info(`[instruction.runner] Tab-Map: auto-extracting page text for read/count/list goal (DONE with no getPageText)`);
+            await browserAct({ action: 'waitForStableText', sessionId, headed: true, timeoutMs: 8000 }).catch(() => {});
+            const _gtResult = await browserAct({ action: 'getPageText', sessionId, headed: true, timeoutMs: 10000 }).catch(() => null);
+            if (_gtResult?.result || _gtResult?.stdout) {
+              extractedPageText = _gtResult.result || _gtResult.stdout || '';
+              logger.info(`[instruction.runner] Tab-Map: auto-extracted ${extractedPageText.length} chars of page text`);
+            }
+          }
+          const _resultStr = _buildResultString(goal, actionHistory, filledFields, extractedPageText);
           logger.info(`[instruction.runner] Tab-Map: DONE — ${_resultStr}`);
           return { ok: true, output: _resultStr, actionHistory };
         } else if (stepResult.stateChanged) {
@@ -3939,6 +5103,9 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
         } else if (!stepResult.ok) {
           // Failed — re-decide
           logger.warn(`[instruction.runner] Tab-Map: session ended (failed: ${stepResult.error}) — re-deciding`);
+          // Tab-Map made no progress — add to tried tiers so _selectTierLLM doesn't re-pick it
+          _triedTiers.add(4);
+          logger.info(`[instruction.runner] Tab-Map made no progress — adding 4 to tried tiers`);
           prevUrl = currentUrl;
           continue; // re-decide
         }
@@ -3964,11 +5131,182 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
       logger.info(`[instruction.runner] State changed (url=${currentUrl !== prevUrl}, overlay=${newOverlayActive !== overlayActive}) — clearing session state`);
     }
 
-    const { _extractValue, _extractSearchText } = require('./browser.agent.cjs');
+    const { _extractValue, _extractSearchText, _scanCanvasLayout, _readEditorState, _formatEditorStateForLLM } = require('./browser.agent.cjs');
     // Probe page structure once per iteration (includes fillable types + title + visible text)
     const _probe = await _probePageStructure(sessionId);
-    const strategy = await _selectTierLLM(sessionId, goal, actionHistory, _pageCategory, _shortcutCount, focused, currentUrl, _probe, agentContext, _triedTiers);
-    logger.info(`[instruction.runner] Decision: strategy=${strategy} (0=DONE, 1=Just-type, 2=Meta+F, 3=App Shortcuts, 4=Tab-Map)`);
+
+    // ── Canvas layout scan ──
+    // For canvas-based webapps (document editors, code editors, design canvas, spreadsheets),
+    // scan the DOM layout to give the LLM structural "eyes" — which regions exist, which is
+    // focused, what's filled vs empty. This is generic (uses ARIA roles, element types, layout
+    // heuristics — not app-specific). Runs once per iteration, passed to all tier functions.
+    const _canvasCategories = ['document_editor', 'code_editor', 'design_canvas', 'spreadsheet'];
+    let _canvasLayout = null;
+    if (_canvasCategories.includes(_pageCategory)) {
+      _canvasLayout = await _scanCanvasLayout(sessionId);
+    }
+
+    // ── Editor state (DOM-first, OCR fallback) ──────────────────────────────
+    // Reads real editor state: region (title/body/subject/code/cell), block index,
+    // block type, block text, cursor offset, and all blocks for context.
+    // Gives Just-type "total awareness" of where the cursor is in the document.
+    // More reliable than the canvas layout scan's focused-region detection.
+    const _editorState = await _readEditorState(sessionId, _pageCategory);
+    const _editorStateText = _formatEditorStateForLLM(_editorState);
+
+    // ── Propagate regionType to focusedElement ──────────────────────────────
+    // Prefer _readEditorState (reliable) over _scanCanvasLayout (fragile position matching).
+    // This gives all tiers a generic way to check if focus is in a title, body,
+    // toolbar, etc. — without hardcoding app-specific signals. Flows through
+    // _buildFocusedStr into every LLM call (_extractValue, _extractFieldType,
+    // _extractCommandPlan, _extractSearchText, _extractShortcut).
+    if (_editorState?.region && focused) {
+      focused = { ...focused, regionType: _editorState.region, blockIndex: _editorState.blockIndex };
+      logger.info(`[instruction.runner] focused regionType=${_editorState.region} blockIndex=${_editorState.blockIndex} (from editor state, source=${_editorState.source})`);
+    } else if (_canvasLayout?.focusedId >= 0 && focused) {
+      // Fallback: canvas layout scan (less reliable but better than nothing)
+      const _focusedRegion = _canvasLayout.regions.find(r => r.id === _canvasLayout.focusedId);
+      if (_focusedRegion) {
+        focused = { ...focused, regionType: _focusedRegion.type };
+        logger.info(`[instruction.runner] focused regionType=${_focusedRegion.type} (from canvas layout fallback)`);
+      }
+    }
+
+    // ── LiteParser OCR observation (when DOM scan is insufficient) ────────────
+    // Captures visual text + coordinates that the DOM can't see (shadow DOM,
+    // canvas-rendered text, images with text). Feeds into _selectTier and
+    // _extractValue for visual context. Only runs when DOM scan is insufficient
+    // to avoid slowing down the fast path.
+    let _ocrObservation = null;
+    const _domScanInsufficient = _probe.fillableCount < 3 && _probe.visibleText.length < 100;
+    const _isCanvasPage = _canvasCategories.includes(_pageCategory);
+    if (_domScanInsufficient || _isCanvasPage) {
+      try {
+        const { _liteparseCapture } = require('./browser.agent.cjs');
+        const _ocrPage = engine.getPage(sessionId);
+        if (_ocrPage) {
+          const _cap = await _liteparseCapture(_ocrPage);
+          if (_cap?.ok && _cap.textItems && _cap.textItems.length > 0) {
+            _ocrObservation = {
+              textItems: _cap.textItems.slice(0, 50),  // cap for token budget
+              fullText: (_cap.fullText || '').slice(0, 500),
+              imageWidth: _cap.imageWidth,
+              imageHeight: _cap.imageHeight,
+            };
+            logger.info(`[instruction.runner] OCR observation: ${_cap.textItems.length} items, ${(_cap.fullText || '').length} chars (DOM insufficient: ${_domScanInsufficient}, canvas: ${_isCanvasPage})`);
+          }
+        }
+      } catch (_ocrErr) {
+        logger.warn(`[instruction.runner] OCR observation failed (non-fatal): ${_ocrErr.message}`);
+      }
+    }
+
+    // ── OCR observation decisions (visual verification via OCR) ───────────────
+    // Only runs when OCR observation is available. Uses number-returning LLM calls
+    // (reliable with light models) to make visual decisions the DOM can't see.
+    if (_ocrObservation) {
+      const { _ocrClassifyState, _ocrVerifyGoal, _ocrDetectLoading } = require('./browser.agent.cjs');
+      const _ocrText = _ocrObservation.fullText || _ocrObservation.textItems.map(t => t.text).join(' ');
+
+      // 1. Classify page state (gatekeeper)
+      const _pageState = await _ocrClassifyState(_ocrText, goal, actionHistory);
+
+      if (_pageState === 0) {
+        // Error — log and try Escape to dismiss error
+        logger.warn(`[instruction.runner] OCR state: error detected — pressing Escape`);
+        await browserAct({ action: 'press', sessionId, key: 'Escape', headed: true, timeoutMs: 2000 });
+        await _sleep(500);
+        _triedTiers.clear();
+        _cachedTabMap = null;
+        prevUrl = currentUrl;
+        continue;
+      } else if (_pageState === 1) {
+        // Done — goal appears achieved visually
+        logger.info(`[instruction.runner] OCR state: done — goal achieved (visual verification)`);
+        const _resultStr = `Goal achieved (OCR verified): ${goal}`;
+        return { ok: true, output: _resultStr, actionHistory };
+      } else if (_pageState === 2) {
+        // Loading — confirm with _ocrDetectLoading, then wait
+        const _isLoading = await _ocrDetectLoading(_ocrText, goal);
+        if (_isLoading === 1) {
+          logger.info(`[instruction.runner] OCR state: loading — waiting 30s before retry`);
+          await _sleep(30000);
+          prevUrl = currentUrl;
+          continue;
+        }
+        // _ocrDetectLoading says not loading — proceed (false positive from classify)
+      } else if (_pageState === 4) {
+        // Unexpected state — log and try recovery
+        logger.warn(`[instruction.runner] OCR state: unexpected state detected — pressing Escape and resetting`);
+        await browserAct({ action: 'press', sessionId, key: 'Escape', headed: true, timeoutMs: 2000 });
+        await _sleep(500);
+        _triedTiers.clear();
+        _cachedTabMap = null;
+        prevUrl = currentUrl;
+        continue;
+      }
+      // _pageState === 3 (ready) → proceed to goal verification
+
+      // 2. Goal verification (second opinion after _checkDone)
+      if (actionHistory.length > 0) {
+        const _goalStatus = await _ocrVerifyGoal(_ocrText, goal, actionHistory);
+        if (_goalStatus === 1) {
+          logger.info(`[instruction.runner] OCR verify: goal achieved (visual verification)`);
+          const _resultStr = `Goal achieved (OCR verified): ${goal}`;
+          return { ok: true, output: _resultStr, actionHistory };
+        } else if (_goalStatus === 2) {
+          logger.info(`[instruction.runner] OCR verify: page processing — waiting 30s`);
+          await _sleep(30000);
+          prevUrl = currentUrl;
+          continue;
+        }
+        // _goalStatus === 0 (fail) → proceed to tier selection (try to fix)
+      }
+    }
+
+    // ── General overlay-dismiss safety net ──
+    // If overlay is active, has NO fillable fields, and the goal needs typing (type-intent),
+    // the overlay is blocking → dismiss it. This is general — works for Notion Move-to,
+    // cookie banners, template pickers, etc. Does NOT dismiss overlays WITH fillable fields
+    // (Gmail compose, login forms) — those are needed for the goal.
+    const _typeIntentKeywords = /\b(type|write|create|add|note|list|draft|compose|make|put|fill|name|title|rename|update|edit|change)\b/i;
+    if (overlayActive && _probe.fillableCount === 0 && _typeIntentKeywords.test(goal)) {
+      logger.info(`[instruction.runner] Overlay active with no fillable fields + type-intent goal — dismissing overlay`);
+      await browserAct({ action: 'press', sessionId, key: 'Escape', headed: true, timeoutMs: 2000 });
+      await _sleep(500);
+      const _stillOverlay = await _detectOverlay(sessionId);
+      if (_stillOverlay) {
+        logger.warn(`[instruction.runner] Overlay still active after Escape — trying click outside (top-left)`);
+        await browserAct({ action: 'clickAt', sessionId, x: 5, y: 5, headed: true, timeoutMs: 2000 });
+        await _sleep(500);
+        overlayActive = await _detectOverlay(sessionId);
+      } else {
+        overlayActive = false;
+      }
+      if (!overlayActive) {
+        logger.info(`[instruction.runner] Overlay dismissed — re-probing on next iteration`);
+        _cachedTabMap = null;
+      }
+      continue; // re-probe on next iteration
+    }
+
+    const strategy = await _selectTierLLM(sessionId, goal, actionHistory, _pageCategory, _shortcutCount, focused, currentUrl, _probe, agentContext, _triedTiers, _disabledTiers, _canvasLayout?.layoutText || '', _ocrObservation);
+    logger.info(`[instruction.runner] Decision: strategy=${strategy} (0=DONE, 1=Just-type, 2=Meta+F, 3=App Shortcuts, 4=Tab-Map, 5=Gesture)`);
+
+    // Handle tier exhaustion — all tiers tried on this state with no progress
+    if (strategy === -1) {
+      logger.info(`[instruction.runner] All tiers exhausted — pressing Escape to dismiss overlay and reset`);
+      await browserAct({ action: 'press', sessionId, key: 'Escape', headed: true, timeoutMs: 2000 });
+      await _sleep(500);
+      _triedTiers.clear();  // reset for the new state
+      _cachedTabMap = null;  // force fresh tab-map
+      _stepPlan = null;
+      _stepIndex = 0;
+      _usingStepFallback = false;
+      actionHistory.push('Escape (all tiers exhausted — reset)');
+      prevUrl = await _getUrl(sessionId);
+      continue;
+    }
 
     // 4. Execute strategy
 
@@ -3976,20 +5314,124 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
       // DONE — the LLM decided the goal is achieved. No regex goal
       // classification, no _verifySubmitSuccess. The step plan / LLM
       // decision is the source of truth.
-      const _resultStr = _buildResultString(goal, actionHistory, filledFields);
+      // Auto-extract safety net: for read/count/list goals, if no page text was
+      // captured during the run, wait for stable text + getPageText before returning.
+      if (!extractedPageText && _isReadCountListGoal(goal)) {
+        logger.info(`[instruction.runner] DONE: auto-extracting page text for read/count/list goal (no getPageText in run)`);
+        await browserAct({ action: 'waitForStableText', sessionId, headed: true, timeoutMs: 8000 }).catch(() => {});
+        const _gtResult = await browserAct({ action: 'getPageText', sessionId, headed: true, timeoutMs: 10000 }).catch(() => null);
+        if (_gtResult?.result || _gtResult?.stdout) {
+          extractedPageText = _gtResult.result || _gtResult.stdout || '';
+          logger.info(`[instruction.runner] DONE: auto-extracted ${extractedPageText.length} chars of page text`);
+        }
+      }
+      const _resultStr = _buildResultString(goal, actionHistory, filledFields, extractedPageText);
       logger.info(`[instruction.runner] DONE — ${_resultStr}`);
       return { ok: true, output: _resultStr, actionHistory };
     }
 
     if (strategy === 1) {
       // Just-type
-      const value = await _extractValue(goal, focused, actionHistory, agentContext, focused?.currentValue || '', { title: _probe.pageTitle, visibleText: _probe.visibleText });
-      const result = await _executeJustType(sessionId, value, focused, _pageCategory);
+      // Enrich agentContext with command_system info from appKnowledge so _extractValue
+      // knows the app's command prefix and available commands (prefers commands over markdown).
+      let _enrichedContext = agentContext;
+      let _cmdSystem = null;
+      let _appHostname = null;
+      try {
+        const { loadAppKnowledge } = require('./lib/appKnowledge.cjs');
+        _appHostname = new URL(currentUrl).hostname.replace(/^www\./, '');
+        const _entries = loadAppKnowledge(_appHostname);
+        _cmdSystem = _entries.find(e => e.type === 'command_system');
+        if (_cmdSystem) {
+          const _cmdLabels = (_cmdSystem.details.commands || []).map(c => {
+            const _l = typeof c === 'string' ? c : c?.label;
+            return _l || '';
+          }).filter(Boolean);
+          _enrichedContext = `${agentContext || ''}\n\nCommand system: prefix="${_cmdSystem.details.prefix}", commands=[${_cmdLabels.join(', ')}]. Prefer commands over markdown shortcuts.`;
+        }
+      } catch (_e) { /* appKnowledge not available — proceed with base agentContext */ }
+      // Build OCR context for _extractValue: text items near the focused element
+      let _ocrContextForExtract = '';
+      if (_ocrObservation && _ocrObservation.textItems) {
+        // Include items in the top half of the page (near title/toolbar) or
+        // items whose text matches the focused element's text
+        const _nearbyItems = _ocrObservation.textItems.filter(t => {
+          if (!t.x || !t.y) return false;
+          return t.y < (_ocrObservation.imageHeight || 800) / 2 ||
+                 (focused?.text && t.text && t.text.toLowerCase().includes(String(focused.text).toLowerCase().slice(0, 20)));
+        });
+        _ocrContextForExtract = _nearbyItems.slice(0, 10).map(t => `"${t.text}" at (${Math.round(t.x)},${Math.round(t.y)})`).join(', ');
+      }
+      const value = await _extractValue(goal, focused, actionHistory, _enrichedContext, focused?.currentValue || '', { title: _probe.pageTitle, visibleText: _probe.visibleText, layoutText: _canvasLayout?.layoutText || '', ocrContext: _ocrContextForExtract, editorStateText: _editorStateText || '' });
+
+      // ── Runtime command discovery fallback ──
+      // If _extractValue returned a command (starts with /) but the command is NOT in the
+      // appKnowledge command list, and we haven't done runtime discovery yet, discover now.
+      if (value && value.startsWith('/') && _cmdSystem && _appHostname
+          && !_cmdSystem.details._runtimeDiscovered) {
+        const _knownCmds = new Set((_cmdSystem.details.commands || []).map(c => {
+          const _c = typeof c === 'string' ? c : c?.label;
+          return _c ? _c.toLowerCase() : '';
+        }));
+        const _firstCmd = value.split('\n')[0].toLowerCase();
+        if (!_knownCmds.has(_firstCmd)) {
+          logger.info(`[instruction.runner] Just-type: command "${_firstCmd}" not in appKnowledge list — triggering runtime discovery`);
+          const _discovered = await _runtimeDiscoverCommands(sessionId, _cmdSystem.details.prefix || '/', _appHostname);
+          if (_discovered && _discovered.length > 0) {
+            // Re-enrich context with discovered commands (now array of {label, trigger})
+            const _cmdLabels = _discovered.map(c => typeof c === 'string' ? c : c.label);
+            _enrichedContext = `${agentContext || ''}\n\nCommand system: prefix="${_cmdSystem.details.prefix}", commands=[${_cmdLabels.join(', ')}]. Prefer commands over markdown shortcuts.`;
+            // Re-read focus after discovery — Backspace cleanup should keep focus in body,
+            // but verify to be safe (stale focused variable causes title-field guard to miss)
+            try {
+              focused = await _readActiveElement(sessionId);
+              logger.info(`[instruction.runner] Just-type: re-read focus after discovery — region=${focused?.regionType || 'unknown'}, tag=${focused?.tag || 'unknown'}`);
+            } catch (e) {
+              logger.warn(`[instruction.runner] Just-type: could not re-read focus after discovery: ${e.message}`);
+            }
+            logger.info(`[instruction.runner] Just-type: runtime discovery found ${_discovered.length} commands — continuing with value`);
+          }
+        }
+      }
+
+      // ── Title-field guard: prevent block commands in title region ────────────
+      // Just-type is the only tier that types into the FOCUSED field. If focus is
+      // in a title region (detected generically via _classifyRegion's regionType)
+      // and the value starts with the app's command prefix (from appKnowledge),
+      // press Enter to move focus to the body first. This prevents typing /todo
+      // into the page title.
+      const _cmdPrefix = _cmdSystem?.details?.prefix || '';
+      const _isTitleField = focused?.regionType === 'title';
+      if (_isTitleField && _cmdPrefix && value && value.startsWith(_cmdPrefix)) {
+        logger.info(`[instruction.runner] Just-type: value starts with command prefix "${_cmdPrefix}" but focus is in title region — pressing Enter to move to body first`);
+        await browserAct({ action: 'press', sessionId, key: 'Enter', headed: true, timeoutMs: 5000 });
+        await _sleep(500);
+        actionHistory.push(`Just-type: pressed Enter to move from title to body (value was "${value.slice(0, 30)}...")`);
+        _triedTiers.add(1);
+        prevUrl = currentUrl;
+        continue;
+      }
+
+      const result = await _executeJustType(sessionId, value, focused, _pageCategory, goal, _enrichedContext, { title: _probe.pageTitle, visibleText: _probe.visibleText });
       const _note = result.ok ? '→ ok' : '→ FAILED';
       actionHistory.push(`Just-type "${value.slice(0, 40)}" ${_note}`);
       _triedTiers.add(1);
 
       if (!result.ok) {
+        if (_disabledTiers.has(4)) {
+          // Tab-Map disabled (high-shortcut app or creation deep-link) — retry Just-type
+          // with fresh focus instead of falling back to Tab-Map (which destroys page state)
+          logger.info(`[instruction.runner] Just-type failed (${result.error}) — Tab-Map disabled, retrying with fresh focus`);
+          _triedTiers.delete(1); // allow Just-type retry on next iteration
+          // Click first fillable to re-focus on the right field
+          const _refocused = await _clickFirstFillable(sessionId);
+          if (_refocused) {
+            logger.info(`[instruction.runner] Just-type retry: re-focused ${_refocused.tag} role=${_refocused.role} text="${(_refocused.text || '').slice(0, 40)}"`);
+          }
+          await _sleep(500);
+          prevUrl = currentUrl;
+          continue;
+        }
         // Fallback to Tab-Map
         logger.info(`[instruction.runner] Just-type failed (${result.error}) — falling back to Tab-Map`);
         inTabMapSession = true;
@@ -4002,6 +5444,23 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
       }
 
       // Just-type succeeded — check for state change
+      // ── After-action: press key after typing (LLM-decided) ─────────────────
+      // _extractAfterAction returns a number: 0=nothing, 1=Enter, 2=Tab,
+      // 3=Escape, 4=Shift+Enter, 5=ArrowDown. Deterministic pre-checks handle
+      // obvious cases (title→body, AI chat, commands); LLM only runs for
+      // ambiguous cases. Executes in the same iteration before _checkDone can
+      // intercept on the next iteration.
+      const { _extractAfterAction } = require('./browser.agent.cjs');
+      const _afterAction = await _extractAfterAction(goal, focused, value, actionHistory, { title: _probe.pageTitle, pageCategory: _pageCategory, editorStateText: _editorStateText || '' }, _enrichedContext);
+      if (_afterAction > 0) {
+        const _afterKeyMap = { 1: 'Enter', 2: 'Tab', 3: 'Escape', 4: 'Shift+Enter', 5: 'ArrowDown' };
+        const _afterKey = _afterKeyMap[_afterAction] || 'Enter';
+        logger.info(`[instruction.runner] Just-type: pressing ${_afterKey} after typing (after=${_afterAction})`);
+        await browserAct({ action: 'press', sessionId, key: _afterKey, headed: true, timeoutMs: 5000 });
+        await _sleep(500);
+        actionHistory.push(`Just-type: pressed ${_afterKey} after typing "${value.slice(0, 30)}"`);
+      }
+
       const postUrl = await _getUrl(sessionId);
       const _pageChanged = postUrl !== currentUrl;
 
@@ -4157,6 +5616,132 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
       continue; // next iteration will run step execution or _tabMapInnerStep
     }
 
+    if (strategy === 5) {
+      // Gesture — drag-drop, sliders, spatial interactions using mouse coordinates
+      // Uses 2 number-returning LLM calls (reliable with light models):
+      //   1. _extractGestureType → 0-3 (gesture type)
+      //   2. _extractGestureTargets → source/target element numbers from Tab-Map
+      // Coordinates come from Tab-Map entries (x,y,w,h bounding boxes).
+      // LiteParser OCR is fallback only when Tab-Map can't find the element.
+      const { _extractGestureType, _extractGestureTargets } = require('./browser.agent.cjs');
+      const _gestureType = await _extractGestureType(goal, focused, actionHistory, { title: _probe.pageTitle, visibleText: _probe.visibleText });
+      if (_gestureType === 0) {
+        // Not a gesture task — mark tier tried and continue
+        logger.info(`[instruction.runner] Gesture: type=0 (no gesture needed) — skipping`);
+        _triedTiers.add(5);
+        prevUrl = currentUrl;
+        continue;
+      }
+
+      // Build Tab-Map if not cached (need it to pick source/target by number)
+      if (!_cachedTabMap || _cachedTabMapUrl !== currentUrl) {
+        logger.info(`[instruction.runner] Gesture: building Tab-Map for element selection`);
+        _cachedTabMap = await buildTabMap(sessionId, 150, { skipReset: overlayActive });
+        _cachedTabMapUrl = currentUrl;
+        _cachedTabMapOverlayActive = overlayActive;
+      }
+
+      const _gestureTargets = await _extractGestureTargets(_gestureType, goal, _cachedTabMap, actionHistory);
+      if (!_gestureTargets?.sourceEntry) {
+        logger.warn(`[instruction.runner] Gesture: no source element found in Tab-Map (type=${_gestureType}) — marking tier tried`);
+        _triedTiers.add(5);
+        prevUrl = currentUrl;
+        continue;
+      }
+
+      // Get coordinates from Tab-Map entry bounding boxes
+      const _src = _gestureTargets.sourceEntry;
+      let _srcX = _src.x + _src.w / 2;
+      let _srcY = _src.y + _src.h / 2;
+      let _tgtX, _tgtY;
+
+      if (_gestureType === 1 && _gestureTargets.targetEntry) {
+        // Drag-drop: target coordinates from Tab-Map entry
+        const _tgt = _gestureTargets.targetEntry;
+        _tgtX = _tgt.x + _tgt.w / 2;
+        _tgtY = _tgt.y + _tgt.h / 2;
+      } else if (_gestureType === 2) {
+        // Slider horizontal: offset from source X
+        _tgtX = _srcX + _gestureTargets.offset;
+        _tgtY = _srcY;
+      } else if (_gestureType === 3) {
+        // Slider vertical: offset from source Y
+        _tgtX = _srcX;
+        _tgtY = _srcY + _gestureTargets.offset;
+      } else if (_gestureType === 1 && !_gestureTargets.targetEntry) {
+        // Drag-drop but no target entry — try LiteParser OCR fallback
+        logger.info(`[instruction.runner] Gesture: no target in Tab-Map — trying LiteParser OCR fallback`);
+        try {
+          const { _liteparseCapture } = require('./browser.agent.cjs');
+          const _ocrPage = engine.getPage(sessionId);
+          if (_ocrPage) {
+            const _cap = await _liteparseCapture(_ocrPage);
+            if (_cap?.ok && _cap.textItems) {
+              // Look for target text near the bottom half of the page (drop zones)
+              const _scaleX = (_cap.imageWidth || 1280) / 1280;
+              const _scaleY = (_cap.imageHeight || 800) / 800;
+              // Find any text item that could be a drop target (heuristic: largest text item in lower half)
+              const _candidates = _cap.textItems
+                .filter(t => t.y > (_cap.imageHeight || 800) / 3)
+                .sort((a, b) => (b.width * b.height) - (a.width * a.height));
+              if (_candidates.length > 0) {
+                const _tgt = _candidates[0];
+                _tgtX = (_tgt.x + _tgt.width / 2) * _scaleX;
+                _tgtY = (_tgt.y + _tgt.height / 2) * _scaleY;
+                logger.info(`[instruction.runner] Gesture: OCR fallback found target "${_tgt.text}" at (${_tgtX},${_tgtY})`);
+              }
+            }
+          }
+        } catch (_ocrErr) {
+          logger.warn(`[instruction.runner] Gesture: OCR fallback failed: ${_ocrErr.message}`);
+        }
+      }
+
+      if (!_tgtX || !_tgtY) {
+        logger.warn(`[instruction.runner] Gesture: could not resolve target coordinates (type=${_gestureType})`);
+        _triedTiers.add(5);
+        prevUrl = currentUrl;
+        continue;
+      }
+
+      // Execute gesture via Playwright mouse API
+      const _gesturePage = engine.getPage(sessionId);
+      if (!_gesturePage) {
+        logger.warn(`[instruction.runner] Gesture: no engine page available`);
+        _triedTiers.add(5);
+        prevUrl = currentUrl;
+        continue;
+      }
+
+      const _typeLabel = _gestureType === 1 ? 'drag-drop' : _gestureType === 2 ? 'slider-h' : 'slider-v';
+      logger.info(`[instruction.runner] Gesture: type=${_typeLabel}, from (${Math.round(_srcX)},${Math.round(_srcY)}) to (${Math.round(_tgtX)},${Math.round(_tgtY)})`);
+      try {
+        await _gesturePage.mouse.move(_srcX, _srcY);
+        await _gesturePage.mouse.down();
+        // Move in steps for smooth drag (some apps need intermediate moves)
+        const _steps = 10;
+        for (let _s = 1; _s <= _steps; _s++) {
+          const _ix = _srcX + (_tgtX - _srcX) * (_s / _steps);
+          const _iy = _srcY + (_tgtY - _srcY) * (_s / _steps);
+          await _gesturePage.mouse.move(_ix, _iy);
+          await _sleep(20);
+        }
+        await _gesturePage.mouse.up();
+      } catch (_gestureErr) {
+        logger.warn(`[instruction.runner] Gesture: mouse API failed: ${_gestureErr.message}`);
+        _triedTiers.add(5);
+        prevUrl = currentUrl;
+        continue;
+      }
+      await _sleep(500);
+
+      actionHistory.push(`Gesture: type=${_typeLabel}, from (${Math.round(_srcX)},${Math.round(_srcY)}) to (${Math.round(_tgtX)},${Math.round(_tgtY)})`);
+      _triedTiers.add(5);
+      _doneVerifyFails = 0;
+      await _sleep(1500);
+      continue;
+    }
+
     // Unknown strategy — default to Tab-Map (4)
     logger.warn(`[instruction.runner] Unknown strategy ${strategy} — defaulting to Tab-Map (4)`);
     inTabMapSession = true;
@@ -4189,4 +5774,5 @@ module.exports = {
   _executeJustType,
   _executeMetaF,
   _tabMapInnerStep,
+  _isReadCountListGoal,
 };
