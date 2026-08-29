@@ -344,12 +344,39 @@ async function _confirmChipIfNeeded(sessionId, stepTarget, stepValue, pageCatego
 // "message/prompt/chat/ask" gets Enter pressed. If pageCategory="document_editor",
 // list-item fields get Enter pressed.
 // ---------------------------------------------------------------------------
-async function _pressAfterIfNeeded(sessionId, stepTarget, stepValue, pageCategory) {
+async function _pressAfterIfNeeded(sessionId, stepTarget, stepValue, pageCategory, goal, actionHistory) {
   const t = (stepTarget || '').toLowerCase();
   const _isChatMessage = /\b(message|prompt|chat|ask|query)\b/.test(t) && !/\b(subject|body|email|search)\b/.test(t);
-  const _isListItem = /\b(item|todo|task|list|checkbox)\b/.test(t);
+  // Match both "todo" and "to-do" (Notion's label). \b splits on hyphens, so
+  // "to-do" becomes "to" + "do" — neither matches the old regex. Use to-?do
+  // to handle both spellings. Also match "to_do" for underscore variants.
+  const _isListItem = /\b(item|to[-_]?do|task|list|checkbox)\b/i.test(t);
 
   if (!_isChatMessage && !_isListItem) return { ok: true, pressed: false };
+
+  // For list items: check if this is the last item in the goal (don't press Enter
+  // on the last item — it would create an empty block)
+  if (_isListItem && goal && actionHistory) {
+    // Match both digit counts ("3 items") and word counts ("three items")
+    const _wordNums = { one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7, eight: 8, nine: 9, ten: 10 };
+    const _digitMatch = goal.match(/(\d+)\s+(?:items?|todos?|tasks?|entries|things)/i);
+    const _wordMatch = goal.match(/\b(one|two|three|four|five|six|seven|eight|nine|ten)\s+(?:items?|todos?|tasks?|entries|things)/i);
+    let _targetCount = null;
+    if (_digitMatch) _targetCount = parseInt(_digitMatch[1], 10);
+    else if (_wordMatch) _targetCount = _wordNums[_wordMatch[1].toLowerCase()] || null;
+    if (_targetCount) {
+      // Count how many Just-type actions we've taken (each types one item).
+      // actionHistory entries look like: Just-type "Favorite Pizza" → ok
+      // Exclude command entries (values starting with / like /todo, /page)
+      // and PRESS_ entries (key presses, not typed values).
+      // We count this one too (the +1) because it hasn't been pushed to history yet.
+      const _typedItems = actionHistory.filter(a => /^Just-type\s+\"[^\/]/i.test(a) && !/PRESS_/.test(a)).length + 1;
+      if (_typedItems >= _targetCount) {
+        logger.info(`[instruction.runner] Last list item typed (${_typedItems}/${_targetCount}) — skipping Enter`);
+        return { ok: true, pressed: false };
+      }
+    }
+  }
 
   // For AI chat: verify the page has chat indicators before pressing Enter
   if (_isChatMessage) {
@@ -508,6 +535,21 @@ async function _resetFocusToPageTop(sessionId) {
 
   const focused = await _readActiveElement(sessionId);
   logger.info(`[instruction.runner] Reset to page top — focused: "${focused?.text || '(none/body)'}"`);
+}
+
+// Focus an element by its data-td-ref attribute.
+// Used by buildTabMap to reset focus back to the ArrowRight origin element
+// when ArrowRight didn't advance (prevents getting stuck in a sub-region).
+async function _focusByRef(sessionId, ref) {
+  if (!ref) return false;
+  try {
+    await browserAct({
+      action: 'evaluate', sessionId, headed: true, timeoutMs: 2000,
+      text: `(() => { const el = document.querySelector('[data-td-ref="${ref}"]'); if (el) { el.focus(); el.scrollIntoView({ block: 'center', behavior: 'instant' }); return true; } return false; })()`,
+    });
+    await _sleep(60);
+    return true;
+  } catch { return false; }
 }
 
 // Scroll the active element into the center of the viewport.
@@ -889,6 +931,7 @@ async function buildTabMap(sessionId, maxElements = 150, options = {}) {
   let dropdownArrowCount = 0;        // count ArrowDown/ArrowUp used in current dropdown
   const DROPDOWN_ARROW_LIMIT = 5;    // max ArrowDown attempts before forcing exit
   let _prevInDropdown = false;       // track previous dropdown state to reset counter
+  let _tabThroughSeenCount = 0;      // count Tab landing on seen elements (tab-row escape)
 
   // Key mappings: forward vs backward
   const keyRight = backward ? 'ArrowLeft'  : 'ArrowRight';
@@ -924,6 +967,7 @@ async function buildTabMap(sessionId, maxElements = 150, options = {}) {
     let current = before; // tracks current focus position (may shift via arrows)
     let advanced = false;
     const _inDropdown = !!before?.inDropdown;
+    const _arrowRightOriginRef = before?.ref || null; // ref before ArrowRight pressed
 
     // Reset dropdown arrow counter when focus leaves a dropdown
     if (!_inDropdown && _prevInDropdown) {
@@ -947,14 +991,40 @@ async function buildTabMap(sessionId, maxElements = 150, options = {}) {
       } else {
         // Seen element — check if it's the starter (looped back)
         if (sig === starterSig) {
-          logger.info(`[instruction.runner] buildTabMap (${label}): ${keyRight} looped back to starter (ref=${sig}) — scan done`);
-          break;
+          // ArrowRight cycled back to the starter. This often happens in
+          // tab-rows (e.g., Google Calendar create dialog: Event → Task →
+          // Appointment schedule → Event). Do NOT end the scan here —
+          // reset focus to the origin tab and fall through to Tab so the
+          // scan continues into the tab panel's form fields.
+          logger.info(`[instruction.runner] buildTabMap (${label}): ${keyRight} looped back to starter (ref=${sig}) — resetting to origin, falling through to Tab`);
+          if (_arrowRightOriginRef) {
+            await _focusByRef(sessionId, _arrowRightOriginRef);
+            current = before; // restore to pre-ArrowRight position
+          } else {
+            current = after;
+          }
+          // Do NOT set advanced=true; do NOT break. Fall through to Tab.
+        } else {
+          // Seen but not starter — ArrowRight landed on a seen element.
+          // Reset focus back to the ArrowRight origin so Tab starts from there
+          // (prevents getting stuck in a sub-region / dropdown remnant).
+          if (_arrowRightOriginRef) {
+            logger.info(`[instruction.runner] buildTabMap (${label}): ${keyRight} landed on seen element — resetting focus to origin (${_arrowRightOriginRef})`);
+            await _focusByRef(sessionId, _arrowRightOriginRef);
+            current = before; // restore current to pre-ArrowRight position
+          } else {
+            current = after;
+          }
         }
-        // Seen but not starter — fall through to next key
-        current = after;
+      }
+    } else {
+      // No focus change from ArrowRight — reset focus to origin before falling
+      // through to Tab (prevents Tab from starting inside a sub-region).
+      if (_arrowRightOriginRef) {
+        await _focusByRef(sessionId, _arrowRightOriginRef);
+        current = before;
       }
     }
-    // else: no focus change — current stays the same, fall through to next key
 
     // 2. Try ArrowDown (forward) / ArrowUp (backward) — ONLY when in a dropdown
     // ArrowDown opens autocomplete on comboboxes and selects wrong items.
@@ -1002,32 +1072,44 @@ async function buildTabMap(sessionId, maxElements = 150, options = {}) {
     }
 
     // 3. Try Tab (forward) / Shift+Tab (backward) — always
+    // When Tab lands on seen elements (e.g., a tab-row already scanned by
+    // ArrowRight), keep Tabbing in-place to escape into new form fields.
     if (!advanced) {
-      await browserAct({ action: 'press', sessionId, key: keyTab, headed: true, timeoutMs: 2000 });
-      await _sleep(60);
-      after = await _readActiveElement(sessionId);
+      let _tabRetries = 0;
+      const _MAX_TAB_RETRIES = 5;
+      while (_tabRetries <= _MAX_TAB_RETRIES) {
+        await browserAct({ action: 'press', sessionId, key: keyTab, headed: true, timeoutMs: 2000 });
+        await _sleep(60);
+        after = await _readActiveElement(sessionId);
 
-      if (!after) break; // nothing focusable
+        if (!after) break; // nothing focusable
 
-      if (_isRealFocusChange(current, after)) {
+        if (!_isRealFocusChange(current, after)) {
+          // Tab didn't change focus — end of focusable elements
+          break;
+        }
+
         const sig = after?.ref || _elementSignature(after);
         if (!seenSet.has(sig)) {
+          // New element — add and advance
           seenSet.add(sig);
           if (!starterSig) starterSig = sig;
           map.push({ id: ++idCounter, ...after, key: keyTab });
           advanced = true;
-        } else {
-          // Tab led to a seen element — check if it's the starter (looped back)
-          if (sig === starterSig) {
-            logger.info(`[instruction.runner] buildTabMap (${label}): looped back to starter (ref=${sig}) — scan done`);
-            break;
-          }
-          // Seen but not starter — all keys exhausted
           break;
         }
-      } else {
-        // Tab didn't change focus — end of focusable elements
-        break;
+
+        // Tab landed on a seen element
+        if (sig === starterSig) {
+          logger.info(`[instruction.runner] buildTabMap (${label}): Tab looped back to starter (ref=${sig}) — scan done`);
+          break;
+        }
+
+        // Seen but not starter — Tab through it to reach new fields beyond
+        _tabRetries++;
+        _tabThroughSeenCount++;
+        logger.info(`[instruction.runner] buildTabMap (${label}): Tab landed on seen element (retry ${_tabRetries}/${_MAX_TAB_RETRIES}) — Tabbing past it`);
+        current = after;
       }
     }
 
@@ -1037,6 +1119,61 @@ async function buildTabMap(sessionId, maxElements = 150, options = {}) {
 
   logger.info(`[instruction.runner] buildTabMap (${label}): scanned ${map.length} elements (cap=${maxElements}, skipReset=${skipReset})`);
 
+  // ── DOM-based overlay scan (backup) ─────────────────────────────────────
+  // Focus-cycling can miss custom form fields (Google Calendar title input,
+  // contenteditable widgets, etc.). When an overlay/dialog is open, also query
+  // its DOM directly for visible inputs, contenteditables, buttons, and tabs.
+  // This ensures form fields are discovered even if the focus order doesn't
+  // reach them.
+  try {
+    const _overlayDom = await browserAct({
+      action: 'evaluate', sessionId, headed: true, timeoutMs: 3000,
+      text: `(() => {
+        const overlay = document.querySelector('[role="dialog"], [role="alertdialog"], [aria-modal="true"]');
+        const scope = (overlay && overlay.offsetParent !== null) ? overlay : document;
+        const out = [];
+        const fillable = scope.querySelectorAll('input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"]):not([type="submit"]):not([type="button"]):not([type="file"]), textarea, [contenteditable="true"], [contenteditable=""], [role="textbox"], [role="combobox"]');
+        for (const el of fillable) {
+          const r = el.getBoundingClientRect();
+          if (r.width > 0 && r.height > 0) out.push({
+            tag: el.tagName.toLowerCase(), role: el.getAttribute('role') || '',
+            text: (el.getAttribute('aria-label') || el.placeholder || '').slice(0, 80),
+            ariaLabel: (el.getAttribute('aria-label') || '').slice(0, 80),
+            placeholder: (el.getAttribute('placeholder') || '').slice(0, 80),
+            value: (el.value || el.innerText || '').slice(0, 100),
+            x: r.x, y: r.y, w: r.width, h: r.height
+          });
+        }
+        const clickables = scope.querySelectorAll('button, a, [role="button"], [role="tab"], [role="link"], [role="menuitem"]');
+        for (const el of clickables) {
+          const r = el.getBoundingClientRect();
+          if (r.width > 0 && r.height > 0) out.push({
+            tag: el.tagName.toLowerCase(), role: el.getAttribute('role') || '',
+            text: (el.innerText || el.getAttribute('aria-label') || el.title || '').slice(0, 80),
+            x: r.x, y: r.y, w: r.width, h: r.height
+          });
+        }
+        return JSON.stringify(out);
+      })()`
+    });
+    if (_overlayDom?.ok && _overlayDom.result) {
+      const _domItems = JSON.parse(_overlayDom.result || '[]');
+      let _added = 0;
+      for (const it of _domItems) {
+        const sig = `${it.tag}:${it.text}:${Math.round(it.x)}:${Math.round(it.y)}`;
+        if (!seenSet.has(sig)) {
+          seenSet.add(sig);
+          map.push({ id: ++idCounter, ...it, ref: null });
+          _added++;
+        }
+      }
+      if (_added > 0) {
+        logger.info(`[instruction.runner] buildTabMap (${label}): DOM overlay scan added ${_added} elements (total: ${map.length})`);
+      }
+    }
+  } catch (e) {
+    logger.warn(`[instruction.runner] buildTabMap: DOM overlay scan failed: ${e.message}`);
+  }
   // Persist the tab-map for this domain (merges with existing elements)
   const domain = await _getDomainFromSession(sessionId);
   if (domain) {
@@ -2012,7 +2149,7 @@ async function _executeAction(sessionId, step) {
       }
 
       // pressAfter for AI chat / list items — category aware
-      const _pressAfter = (result?.ok || _usedReactFill) ? await _pressAfterIfNeeded(sessionId, step.target, step.value, step.pageCategory) : { ok: true };
+      const _pressAfter = (result?.ok || _usedReactFill) ? await _pressAfterIfNeeded(sessionId, step.target, step.value, step.pageCategory, step.goal, step.actionHistory) : { ok: true };
       logger.info(`[instruction.runner] _executeAction type: pressAfter result ok=${_pressAfter.ok}, pressed=${_pressAfter.pressed}`);
 
       // Retry-based chip fallback: if value still not in field after all attempts,
@@ -3045,6 +3182,15 @@ async function _getUrl(sessionId) {
   } catch { return ''; }
 }
 
+// Helper: compare URLs ignoring hash, query params, and trailing slash.
+// Used to skip redundant navigate steps when already on the target page.
+function _urlsEquivalent(a, b) {
+  try {
+    const _norm = (u) => (u || '').replace(/#.*$/, '').replace(/\?.*$/, '').replace(/\/$/, '');
+    return _norm(a) === _norm(b);
+  } catch (_) { return false; }
+}
+
 async function _detectOverlay(sessionId) {
   try {
     const res = await browserAct({
@@ -3055,11 +3201,91 @@ async function _detectOverlay(sessionId) {
         if (menu && menu.offsetParent !== null) return true;
         const classMatch = document.querySelector('.modal:not([hidden]), .popup:not([hidden]), .overlay:not([hidden]), .drawer:not([hidden]), .sheet:not([hidden])');
         if (classMatch && classMatch.offsetParent !== null) return true;
+        // Fallback: visible form panel (Google Calendar create event, etc.)
+        // A visible input with "title" placeholder suggests a form panel/dialog
+        const titleInput = document.querySelector('input[placeholder*="title" i], input[aria-label*="title" i]');
+        if (titleInput && titleInput.offsetParent !== null) {
+          const r = titleInput.getBoundingClientRect();
+          if (r.width > 0 && r.height > 0) return true;
+        }
         return false;
       })()`,
     });
     return res?.result === true || res?.result === 'true';
   } catch { return false; }
+}
+
+// ── Alert Detection Layer ──────────────────────────────────────────
+// Detects alerts/dialogs that need special handling BEFORE tier selection.
+// Returns: { type: 'confirmation'|'error'|'success'|null, text, buttons? }
+//   - confirmation: custom modals like "Discard unsaved changes?" (need a decision)
+//   - error: validation errors (fixable or unfixable)
+//   - success: success toasts (informational — may indicate goal done)
+async function _detectAlert(sessionId) {
+  try {
+    const res = await browserAct({
+      action: 'evaluate', sessionId, headed: true, timeoutMs: 2000,
+      text: `(() => {
+        // 1. Custom confirmation modals (alertdialog only)
+        // role="alert" is for inline status/error messages, not interactive
+        // modals. Only alertdialog can block the user and require a decision.
+        const alertDialog = document.querySelector('[role="alertdialog"]');
+        if (alertDialog && alertDialog.offsetParent !== null) {
+          const text = (alertDialog.innerText || '').trim().slice(0, 300);
+          const buttons = Array.from(alertDialog.querySelectorAll('button, [role="button"]'))
+            .filter(b => b.offsetParent !== null && b.getBoundingClientRect().width > 0)
+            .map(b => (b.innerText || b.textContent || '').trim().slice(0, 40));
+          // A real confirmation must have actual text and at least one button to
+          // click. Empty invisible elements (e.g., Gmail compose containers)
+          // should not trigger the alert handler.
+          if (text.length > 0 && buttons.length > 0) {
+            return JSON.stringify({ type: 'confirmation', text, buttons });
+          }
+        }
+
+        // 2. Visible error messages (inline validation / role="alert" / .error classes)
+        const errorEl = document.querySelector('[role="alert"], .error, .error-message, .field-error, .invalid-feedback, .form-error');
+        if (errorEl && errorEl.offsetParent !== null) {
+          const text = (errorEl.innerText || '').trim().slice(0, 300);
+          if (text.length > 0 && /required|invalid|error|failed|missing|cannot|must|denied|not allowed/i.test(text)) {
+            return JSON.stringify({ type: 'error', text, buttons: [] });
+          }
+        }
+
+        // 3. Success toasts
+        const toast = document.querySelector('[role="status"], .toast, .snackbar, [data-testid*="toast" i], [data-testid*="snackbar" i]');
+        if (toast && toast.offsetParent !== null) {
+          const text = (toast.innerText || '').trim().slice(0, 200);
+          if (/saved|created|sent|success|added|completed|done|updated/i.test(text)) {
+            return JSON.stringify({ type: 'success', text, buttons: [] });
+          }
+        }
+
+        // 4. Text-pattern confirmation (Google Calendar "Discard unsaved changes?")
+        const bodyText = (document.body.innerText || '').slice(0, 800);
+        const _confirmPatterns = /discard unsaved|are you sure|continue editing|don.?t save|leave without|unsaved changes/i;
+        if (_confirmPatterns.test(bodyText)) {
+          const allButtons = Array.from(document.querySelectorAll('button, [role="button"]'))
+            .filter(b => b.offsetParent !== null && b.getBoundingClientRect().width > 0);
+          const confirmButtons = allButtons
+            .map(b => (b.innerText || b.textContent || '').trim().slice(0, 40))
+            .filter(t => t.length > 0 && /discard|cancel|continue|save|leave|stay|don.?t|keep/i.test(t));
+          if (confirmButtons.length > 0) {
+            return JSON.stringify({ type: 'confirmation', text: bodyText.slice(0, 200), buttons: confirmButtons });
+          }
+        }
+
+        return 'null';
+      })()`,
+    });
+    const raw = res?.result;
+    if (raw === 'null' || !raw) return null;
+    if (typeof raw === 'string') {
+      try { return JSON.parse(raw.replace(/^"|"$/g, '').replace(/\\"/g, '"')); }
+      catch { return null; }
+    }
+    return raw || null;
+  } catch { return null; }
 }
 
 // Click the first visible fillable element to focus it (for canvas editors
@@ -3200,7 +3426,7 @@ async function _saveBackup(focusedElement) {
 // type-plain: single-line text + Enter (search, chat, simple form fields).
 // Also handles multi-line contenteditable (block creation) — the existing _executeJustType logic.
 // ctx = { isEdit, hasContent } — Meta+a only when isEdit && hasContent (uniform policy)
-async function _executeTypePlain(sessionId, value, focusedElement, pageCategory, ctx = {}) {
+async function _executeTypePlain(sessionId, value, focusedElement, pageCategory, ctx = {}, goal = null, actionHistory = null) {
   const _tag = focusedElement.tag || '';
   const _role = focusedElement.role || '';
 
@@ -3249,6 +3475,8 @@ async function _executeTypePlain(sessionId, value, focusedElement, pageCategory,
     ref: focusedElement.ref || null,
     hasContent: ctx.hasContent || focusedElement.hasContent || false,
     isEdit: ctx.isEdit || false,
+    goal: goal,
+    actionHistory: actionHistory,
   });
 
   if (!result?.ok) {
@@ -3801,7 +4029,7 @@ async function _executeTypeSearch(sessionId, value, focusedElement, goal, pageCa
 // Hoists the edit/create decision (_extractEditMode) so all type flows share the same
 // Meta+a policy: only select-all when isEdit && hasContent. Also saves a backup before
 // any modification to a field with existing content.
-async function _executeTypedField(sessionId, fieldType, value, focusedElement, goal, pageCategory, agentContext, pageContext) {
+async function _executeTypedField(sessionId, fieldType, value, focusedElement, goal, pageCategory, agentContext, pageContext, actionHistory) {
   logger.info(`[instruction.runner] _executeTypedField: fieldType=${fieldType}, value="${String(value || '').slice(0, 40)}"`);
 
   // ── Uniform edit/create decision ──
@@ -3833,14 +4061,21 @@ async function _executeTypedField(sessionId, fieldType, value, focusedElement, g
       return _executeTypeSearch(sessionId, value, focusedElement, goal, pageCategory, agentContext, pageContext, ctx);
     case 'type-plain':
     default:
-      return _executeTypePlain(sessionId, value, focusedElement, pageCategory, ctx);
+      return _executeTypePlain(sessionId, value, focusedElement, pageCategory, ctx, goal, actionHistory);
   }
 }
 
-async function _executeJustType(sessionId, value, focusedElement, pageCategory, goal, agentContext, pageContext) {
+async function _executeJustType(sessionId, value, focusedElement, pageCategory, goal, agentContext, pageContext, overlayActive, actionHistory) {
   if (!focusedElement) {
-    // No focused element — try to click the first visible fillable element
-    logger.info(`[instruction.runner] Just-type: no focused element — clicking first fillable to focus`);
+    // No focused element — check if an overlay/dialog is open
+    if (!overlayActive) {
+      // No overlay open — Just-type without a focused field is unreliable
+      // (would blindly type into "Search for people" or other page-level inputs)
+      logger.info(`[instruction.runner] Just-type: no focused element and no overlay open — refusing to type into random field`);
+      return { ok: false, pageChanged: false, error: 'No focused element and no overlay open — need Tab-Map to pick the right field' };
+    }
+    // Overlay is open — safe to click first fillable inside the dialog
+    logger.info(`[instruction.runner] Just-type: no focused element — clicking first fillable to focus (overlay open)`);
     const _firstFillable = await _clickFirstFillable(sessionId);
     if (!_firstFillable) return { ok: false, pageChanged: false, error: 'No focused element and no fillable element found' };
     focusedElement = _firstFillable;
@@ -3887,7 +4122,7 @@ async function _executeJustType(sessionId, value, focusedElement, pageCategory, 
   // Determine field type and dispatch to the right executor
   const { _extractFieldType } = require('./browser.agent.cjs');
   const fieldType = await _extractFieldType(goal, focusedElement, value, [], pageContext || {}, agentContext);
-  return _executeTypedField(sessionId, fieldType, value, focusedElement, goal, pageCategory, agentContext, pageContext);
+  return _executeTypedField(sessionId, fieldType, value, focusedElement, goal, pageCategory, agentContext, pageContext, actionHistory);
 }
 
 // ── Strategy 2: Meta+F search ──────────────────────────────────────────
@@ -3985,6 +4220,16 @@ async function _executeShortcut(sessionId, keyCombo) {
 
   logger.info(`[instruction.runner] Shortcut: pressing "${keyCombo}"`);
 
+  // Blur focused input so the shortcut key isn't typed into a text field
+  // (e.g., Shift+c would type "c" into the title field without this)
+  try {
+    await browserAct({
+      action: 'evaluate', sessionId, headed: true, timeoutMs: 2000,
+      text: `(() => { const el = document.activeElement; if (el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.isContentEditable)) { el.blur(); } return true; })()`
+    });
+    await _sleep(200); // let blur settle
+  } catch (_) {}
+
   const _preUrl = await _getUrl(sessionId);
   try {
     const result = await browserAct({ action: 'press', sessionId, key: keyCombo, headed: true, timeoutMs: 5000 });
@@ -4011,6 +4256,18 @@ async function _executeTabMapAction(sessionId, parsed, tabMap, overlayActive, pa
   }
 
   if (parsed.action === 'navigate') {
+    // Guard: refuse to navigate while an overlay/dialog is open — navigating
+    // will close the dialog and destroy progress. Trigger re-extraction instead.
+    if (overlayActive) {
+      logger.warn(`[instruction.runner] Tab-Map: refusing navigate to "${parsed.url}" while overlay is open — will re-extract steps`);
+      return { ok: false, pageChanged: false, error: 'navigate-while-overlay-open', rescan: true };
+    }
+    // Guard: skip redundant navigate if current URL already matches target
+    const _currentUrl = await _getUrl(sessionId);
+    if (_urlsEquivalent(_currentUrl, parsed.url)) {
+      logger.info(`[instruction.runner] Tab-Map: skipping navigate — already at ${parsed.url}`);
+      return { ok: true, pageChanged: false };
+    }
     const navResult = await browserAct({ action: 'navigate', sessionId, url: parsed.url, headed: true, timeoutMs: 30000 });
     await _sleep(2000);
     await _resetFocusToPageTop(sessionId);
@@ -4029,6 +4286,13 @@ async function _executeTabMapAction(sessionId, parsed, tabMap, overlayActive, pa
     if (!pickedEntry) {
       // Lazy re-scan signal
       return { ok: false, pageChanged: false, error: `No element found for "${parsed.target}"`, rescan: true };
+    }
+
+    // Clear netLog before submit/save/send clicks so we can verify the API call after
+    const _isSubmitClick = /^(Save|Send|Submit|Create|Done|Confirm|OK|Post|Publish)$/i.test(parsed.target || '');
+    if (_isSubmitClick) {
+      try { engine.clearNetLog(sessionId); } catch (_) {}
+      logger.info(`[instruction.runner] Tab-Map: cleared netLog before submit click "${parsed.target}"`);
     }
 
     const _preUrl = await _getUrl(sessionId);
@@ -4294,8 +4558,12 @@ async function _tabMapStepExecute(sessionId, step, stepIndex, stepCount, tabMap,
   // dropdown closures, and autocomplete selections are within-overlay changes,
   // not page navigation. Only click/press actions can end the session.
   const stateChanged = step.action === 'type' ? false : result.pageChanged;
+  // Only end the session (done=true) on the LAST step of the plan.
+  // For intermediate steps, a URL/state change means we need to re-scan and
+  // continue — NOT that the goal is achieved.
+  const _isLastStep = stepIndex >= stepCount - 1;
   return {
-    done: stateChanged, // session ends on state change (click/press only)
+    done: _isLastStep ? stateChanged : false, // only end session on last step
     ok: result.ok,
     error: result.error,
     stateChanged,
@@ -4321,16 +4589,16 @@ async function _tabMapInnerStep(sessionId, goal, actionHistory, currentUrl, over
   // 2. Ask LLM for next action
   const nextAction = await _llmNextAction(goal, currentUrl, tabMap, actionHistory, pageCategory, agentContext, lastVerifyFailed, consumedRefs, filledFields, extractedPageText);
   if (!nextAction) {
-    logger.warn(`[instruction.runner] Tab-Map: LLM returned null — treating as DONE`);
-    return { done: true, ok: true };
+    logger.warn(`[instruction.runner] Tab-Map: LLM returned null — treating as failure (not done)`);
+    return { done: true, ok: false, error: 'LLM returned null (provider failed)' };
   }
   logger.info(`[instruction.runner] Tab-Map step: LLM says "${nextAction}"`);
 
   // 3. Parse the action
   const parsed = _parseAction(nextAction);
   if (!parsed) {
-    logger.warn(`[instruction.runner] Tab-Map: couldn't parse "${nextAction}" — treating as DONE`);
-    return { done: true, ok: true };
+    logger.warn(`[instruction.runner] Tab-Map: couldn't parse "${nextAction}" — treating as failure (not done)`);
+    return { done: true, ok: false, error: `Could not parse LLM action: "${nextAction}"` };
   }
 
   // 4. Handle DONE
@@ -4505,17 +4773,55 @@ Completed?` },
   }
 }
 
-// LLM-based tier selection — sees goal + URL + real-time page context (title,
+// LLM-first tier selection — sees goal + URL + real-time page context (title,
 // visible text) + agent context (shortcuts, commands) + page structure (element
-// types) and returns 0-4. Falls back to _selectTierDeterministic on LLM failure.
-async function _selectTierLLM(sessionId, goal, actionHistory, pageCategory, shortcutCount, focused, currentUrl, probe, agentContext, triedTiers = new Set(), disabledTiers = new Set(), layoutText = '', ocrObservation = null) {
+// types) + overlay state + focused element and returns 0-5.
+// The LLM is the sole decision-maker; deterministic rules are stripped to just
+// the DONE check. Rich per-tier context injection lets the LLM see what each
+// strategy CAN do in the CURRENT state and pick the best fit.
+async function _selectTierLLM(sessionId, goal, actionHistory, pageCategory, shortcutCount, focused, currentUrl, probe, agentContext, triedTiers = new Set(), disabledTiers = new Set(), layoutText = '', ocrObservation = null, shortcutLabels = '', overlayActive = false, progressCallbackUrl = null, stepIndex = 0, agentId = '', sessionIdForProgress = '', editorState = null, isCreationDeepLink = false, alertActive = false, isLoading = false) {
   const { askWithMessages } = require('../skill-helpers/skill-llm.cjs');
+  const { classifyStatePattern } = require('../skill-helpers/state-patterns.cjs');
+  const { getDeepLinkDescription } = require('../skill-helpers/deep-link-types.cjs');
+  const { getCategoryConfig } = require('../skill-helpers/category-config.cjs');
 
   // 1. DONE check (only if we've taken actions) — keep this deterministic
   if (actionHistory.length > 0) {
     const _checkboxCount = await _countCheckboxes(sessionId);
     const done = await _checkDone(goal, actionHistory, currentUrl, probe?.pageTitle, _checkboxCount);
-    if (done) return 0;
+    if (done) {
+      // Final OCR safety check — only if OCR didn't already run this iteration
+      // (dynamic OCR gating may have skipped it for rich-DOM pages like Notion).
+      // This catches visual mismatches the DOM can't see (e.g., text typed but
+      // not rendered due to a React state bug). ~3s cost, runs once at goal completion.
+      if (!ocrObservation) {
+        try {
+          const { _liteparseCapture, _ocrVerifyGoal } = require('./browser.agent.cjs');
+          const _ocrPage = engine.getPage(sessionId);
+          if (_ocrPage) {
+            const _finalCap = await _liteparseCapture(_ocrPage);
+            if (_finalCap?.ok && _finalCap.textItems?.length > 0) {
+              const _finalText = _finalCap.fullText || _finalCap.textItems.map(t => t.text).join(' ');
+              const _finalVerify = await _ocrVerifyGoal(_finalText, goal, actionHistory);
+              if (_finalVerify?.num !== 1) {
+                logger.warn(`[instruction.runner] _checkDone=YES but final OCR verify disagreed (num=${_finalVerify?.num}, reason="${(_finalVerify?.reason || '').slice(0, 80)}") — continuing iteration`);
+                // Don't return 0 — let the iteration continue to fix the issue
+              } else {
+                logger.info(`[instruction.runner] Final OCR verify confirmed goal achieved — done`);
+                return 0;
+              }
+            }
+          }
+        } catch (_e) {
+          // OCR failed — trust _checkDone's YES (non-fatal)
+          logger.warn(`[instruction.runner] Final OCR verify failed (non-fatal): ${_e.message} — trusting _checkDone=YES`);
+          return 0;
+        }
+      } else {
+        // OCR already ran this iteration and didn't flag done — trust _checkDone
+        return 0;
+      }
+    }
   }
 
   const { fillableCount, clickableCount, hasAutoFocus, fillableTypes, pageTitle, visibleText } = probe;
@@ -4525,14 +4831,6 @@ async function _selectTierLLM(sessionId, goal, actionHistory, pageCategory, shor
     : 'none (body/no focus)';
 
   // 2. Build available tiers (exclude tried tiers — don't give the LLM the choice)
-  // Tier 0 (DONE) is handled above. Tier 4 (Tab-Map) is always available (safe fallback).
-  const _tierDescriptions = {
-    1: '1 = Just-type (type a single value into the currently focused field — ONLY fills ONE field)',
-    2: '2 = Meta+F (find specific text on the page by searching, then click it)',
-    3: '3 = Shortcut keys (press an app-specific keyboard shortcut)',
-    4: '4 = Tab-Map (scan all focusable elements, fill multiple fields, click buttons — for forms and complex UI)',
-    5: '5 = Gesture (drag-drop, sliders, spatial interactions using mouse coordinates)',
-  };
   const _availableTiers = [1, 2, 3, 4, 5].filter(t => !triedTiers.has(t) && !disabledTiers.has(t));
 
   // If all tiers are tried, return -1 to signal exhaustion (caller presses Escape + resets)
@@ -4541,65 +4839,135 @@ async function _selectTierLLM(sessionId, goal, actionHistory, pageCategory, shor
     return -1;
   }
 
-  // Deterministic override: if ALL fillable elements are contenteditable (no input/textarea),
-  // this is a canvas editor (Notion, Google Docs, Confluence). If the goal is about
-  // typing/writing/creating, Just-type is correct — skip the LLM (it often picks Tab-Map
-  // for these, which gets stuck in sidebar menus).
-  // Goal-intent gated: only override when the goal contains type/write/create keywords,
-  // so click/share/export/format goals still go to the LLM.
-  const _typeIntentKeywords = /\b(type|write|create|add|note|list|draft|compose|make|put|fill|name|title|rename|update|edit|change)\b/i;
-  if (fillableCount > 0 && fillableTypes.inputCount === 0 && fillableTypes.textareaCount === 0
-      && fillableTypes.contenteditableCount > 0 && !triedTiers.has(1)
-      && _typeIntentKeywords.test(goal)) {
-    logger.info(`[instruction.runner] _selectTierLLM: → 1 (Just-type) — contenteditable canvas editor (${fillableTypes.contenteditableCount} ce, 0 input, 0 textarea) + goal has type-intent keyword`);
-    return 1;
-  }
-
   // If only Tab-Map is left, skip the LLM call — just return it
   if (_availableTiers.length === 1 && _availableTiers[0] === 4) {
     logger.info(`[instruction.runner] _selectTierLLM: → 4 (Tab-Map) — only available tier (tried: ${[...triedTiers].join(',') || 'none'})`);
+    _emitTierProgress(progressCallbackUrl, stepIndex, 'tab-map', 'Tab-Map: scanning elements and filling form', agentId, sessionIdForProgress);
     return 4;
   }
 
-  // Build the tier options string (only available tiers)
-  const _tierOptions = _availableTiers.map(t => _tierDescriptions[t]).join('\n');
+  // 3. Classify state pattern (deterministic, with guards) ──────────────────
+  // Combines all raw signals into a named pattern with a recommended tier
+  // and fast-path flag. Fast-path skips the LLM call ONLY when all guards pass.
+  const _statePattern = classifyStatePattern({
+    goal,
+    currentUrl,
+    pageCategory: pageCategory || 'web_generic',
+    isCreationDeepLink,
+    overlayActive,
+    alertActive,
+    isLoading,
+    fillableCount,
+    hasAutoFocus,
+    editorState,
+    shortcutCount,
+    shortcutLabels,
+    actionHistory,
+  });
+  const _catConfig = getCategoryConfig(pageCategory);
+  const _deepLinkDesc = getDeepLinkDescription(_statePattern.deepLinkType);
 
-  // Trim agentContext to relevant parts (shortcuts, command systems, creation notes)
-  const _contextBlock = agentContext
-    ? `\n\nApp context (shortcuts, commands, notes):\n${String(agentContext).slice(0, 800)}`
-    : '';
+  logger.info(`[instruction.runner] _selectTierLLM: state pattern=${_statePattern.pattern}, deepLinkType=${_statePattern.deepLinkType}, fastPath=${_statePattern.fastPath}, guardsPassed=${_statePattern.guardsPassed}${_statePattern.guardReason ? ', guardReason=' + _statePattern.guardReason : ''}`);
 
-  const systemPrompt = `You decide the navigation strategy for a browser automation task.
-Look at the goal, the current URL, what's visible on the page, the page structure, and available shortcuts.
-Return ONLY a single number from the available options — nothing else.
+  // 4. Fast-path — skip LLM ONLY if all guards passed and tier is available
+  if (_statePattern.fastPath && _statePattern.tier !== null && _availableTiers.includes(_statePattern.tier)) {
+    logger.info(`[instruction.runner] _selectTierLLM: fast-path → ${_statePattern.tier} (pattern=${_statePattern.pattern}, guards=passed)`);
+    _emitTierProgressForTier(_statePattern.tier, progressCallbackUrl, stepIndex, agentId, sessionIdForProgress);
+    return _statePattern.tier;
+  }
 
-Available strategies:
-${_tierOptions}
+  // 5. Build per-tier descriptions WITH injected state data
+  // Each tier block shows what it CAN do in the CURRENT state, so the LLM can
+  // reason: "overlay is OPEN + 3 fillable fields → Tab-Map" vs "overlay is CLOSED
+  // + Shift+c available → Shortcuts".
+  const _overlayStr = overlayActive ? 'OPEN' : 'CLOSED';
+  const _fillableStr = `${fillableCount} fillable (input=${fillableTypes.inputCount}, textarea=${fillableTypes.textareaCount}, contenteditable=${fillableTypes.contenteditableCount})`;
 
-CRITICAL RULES:
-- Just-type (1) ONLY types into ONE field. If the page has 2+ <input> or <textarea> fields that need different values (e.g., email To/Subject/Body, registration form), Just-type CANNOT complete the task — return 4 (Tab-Map).
-- If the page has contenteditable elements (canvas editor) and the goal is to type/write/create → return 1 (Just-type)
-- If the page has a single fillable input (search box, chat prompt) and the goal is to search/ask/type → return 1 (Just-type)
-- If the goal requires finding a specific item on the page → return 2 (Meta+F)
-- If app shortcuts are available (see App context) and a shortcut directly accomplishes the goal → return 3 (Shortcuts)
-- If the goal involves drag-drop, sliders, or spatial interaction (drag, move, slide, rearrange, reorder) → return 5 (Gesture)
-- When in doubt → return 4 (Tab-Map)`;
+  const _tierBlocks = [];
+  if (_availableTiers.includes(1)) {
+    _tierBlocks.push(`1 - Just-type: Types ONE value into the currently focused field. Fills only ONE field per call.
+   Best when: a single field is focused or auto-focused, and you need to type one value (search, chat, title).
+   Current state: focused=${_focusedStr}, ${_fillableStr}, autoFocus=${hasAutoFocus}
+   NOTE: If multiple fields need filling, Just-type CANNOT do it — use Tab-Map (4) instead.`);
+  }
+  if (_availableTiers.includes(2)) {
+    _tierBlocks.push(`2 - Meta+F: Finds specific text on the page via browser find (Ctrl+F), then clicks the element containing it.
+   Best when: you need to find and click a specific item by its text (a link, button, conversation name).
+   Current state: ${clickableCount} clickable elements on page.
+   NOTE: Only finds text that exists on the page — cannot fill forms or press shortcuts.`);
+  }
+  if (_availableTiers.includes(3)) {
+    const _shortcutBlock = shortcutLabels && shortcutCount > 0
+      ? `Available shortcuts:\n${shortcutLabels}`
+      : `${shortcutCount} shortcuts available (no descriptions)`;
+    _tierBlocks.push(`3 - Shortcut keys: Presses an app-specific keyboard shortcut.
+   Best when: no dialog/overlay is open (overlay=${_overlayStr}) and a shortcut can open/navigate to the next state.
+   ${_shortcutBlock}
+   NOTE: If a dialog is already OPEN, shortcuts that open dialogs are useless — use Tab-Map (4) to fill the form.
+   NOTE: For "create/add/schedule" goals, prefer the CREATE shortcut (e.g., "create event", "create timed event").
+   NOTE: Navigation shortcuts (next period, go to today) do NOT set specific dates — use Tab-Map to pick a date in the form.`);
+  }
+  if (_availableTiers.includes(4)) {
+    _tierBlocks.push(`4 - Tab-Map: Scans all focusable/tab-able elements on the page, then fills multiple fields and clicks buttons in sequence.
+   Best when: a form/dialog is open with multiple fields to fill, or you need to interact with specific UI elements by clicking them.
+   Current state: overlay=${_overlayStr}, ${_fillableStr}, ${clickableCount} clickable
+   NOTE: This is the most versatile tier — it can fill forms, click buttons, and navigate UI. Use it when shortcuts can't do the job.`);
+  }
+  if (_availableTiers.includes(5)) {
+    _tierBlocks.push(`5 - Gesture: Drag-drop, sliders, and spatial interactions using mouse coordinates.
+   Best when: the goal involves dragging, sliding, rearranging, or reordering elements.
+   NOTE: Only use for spatial interactions that can't be done with keyboard or clicks.`);
+  }
 
   const _ocrBlock = ocrObservation
-    ? `\nOCR visual text (may include content not in DOM): ${ocrObservation.fullText || ocrObservation.textItems.slice(0, 10).map(t => t.text).join(' ')}\n`
+    ? `\nOCR visual text (first 200 chars): ${(ocrObservation.fullText || '').slice(0, 200)}\n`
     : '';
+  const _contextBlock = agentContext
+    ? `\nApp context:\n${String(agentContext).slice(0, 600)}\n`
+    : '';
+
+  // 6. Build dynamic system prompt with state pattern + deep link type + category enrichment
+  const _disabledReasons = _buildDisabledReasons(disabledTiers, _statePattern);
+  const _categoryNotes = _catConfig.notes.length > 0
+    ? `\nCATEGORY NOTES (${pageCategory}):\n${_catConfig.notes.map(n => `- ${n}`).join('\n')}\n`
+    : '';
+
+  const systemPrompt = `You decide the navigation strategy for a browser automation task at the CURRENT page state.
+Look at the goal, what's been done, the current page state, and what each strategy CAN do right now.
+Return ONLY a single number — nothing else.
+
+CURRENT STATE PATTERN: ${_statePattern.pattern}
+${_statePattern.description}
+DEEP LINK TYPE: ${_statePattern.deepLinkType}
+${_deepLinkDesc}
+${_disabledReasons ? `\nDISABLED STRATEGIES (do NOT return these):\n${_disabledReasons}\n` : ''}
+DECISION RULES:
+- If a dialog/overlay is OPEN with form fields → return 4 (Tab-Map) to fill the form
+- If no dialog is open and a shortcut can open/navigate to the next state → return 3 (Shortcuts)
+- If a single field is focused and you just need to type one value → return 1 (Just-type)
+- If you need to find and click a specific item by text → return 2 (Meta+F)
+- If the goal involves drag-drop or sliders → return 5 (Gesture)
+- When in doubt → return ${_availableTiers[0]} (first available strategy)
+${_categoryNotes}
+Available strategies:
+${_tierBlocks.join('\n\n')}`;
+
+  const historyStr = actionHistory.length > 0
+    ? actionHistory.slice(-10).map((a, i) => `  ${i + 1}. ${a}`).join('\n')
+    : '  (none)';
 
   const userPrompt = `Goal: ${goal}
 Current URL: ${currentUrl}
 Page title: ${pageTitle}
-Visible text (first 200 chars): ${visibleText}
 Page category: ${pageCategory || 'unknown'}
-Page structure: ${fillableCount} fillable (input=${fillableTypes.inputCount}, textarea=${fillableTypes.textareaCount}, contenteditable=${fillableTypes.contenteditableCount}), ${clickableCount} clickable, autoFocus=${hasAutoFocus}
-${layoutText ? `Page layout:\n${layoutText}\n` : ''}${_ocrBlock}Focused element: ${_focusedStr}
-Available shortcuts: ${shortcutCount}
+State pattern: ${_statePattern.pattern}
+Deep link type: ${_statePattern.deepLinkType}
+Overlay/dialog: ${_overlayStr}
+Focused element: ${_focusedStr}
+Page structure: ${_fillableStr}, ${clickableCount} clickable
+${editorState?.region ? `Editor region: ${editorState.region} (block ${editorState.blockIndex ?? '?'})\n` : ''}${layoutText ? `Page layout:\n${layoutText.slice(0, 300)}\n` : ''}${_ocrBlock}
 Actions taken so far:
-${actionHistory.length > 0 ? actionHistory.slice(-10).map((a, i) => `  ${i + 1}. ${a}`).join('\n') : '  (none)'}${_contextBlock}
-
+${historyStr}${_contextBlock}
 Strategy? (${_availableTiers.join(', ')})`;
 
   try {
@@ -4608,15 +4976,78 @@ Strategy? (${_availableTiers.join(', ')})`;
       { role: 'user', content: userPrompt },
     ], { maxTokens: 10, temperature: 0.1, responseTimeoutMs: 10000 });
     const num = parseInt((raw || '').trim().replace(/\D/g, ''), 10);
-    // If LLM returns an invalid/tried/disabled tier, fall back to first available
-    // (default was 4/Tab-Map, but Tab-Map may be disabled for high-shortcut apps)
-    const result = _availableTiers.includes(num) ? num : (_availableTiers[0] || 1);
-    logger.info(`[instruction.runner] _selectTierLLM: strategy=${result} (raw="${(raw || '').trim()}") — fillable=${fillableCount} (input=${fillableTypes.inputCount}, ce=${fillableTypes.contenteditableCount}), title="${pageTitle}", tried=[${[...triedTiers].join(',')}], url=${currentUrl}`);
+    // If LLM returns an invalid/tried/disabled tier, fall back to the first available
+    // tier. Never hardcode to 4 (Tab-Map) — it may be disabled
+    // (e.g. Creation deep-link = Just-type ONLY) and Tab-Map's Escape would destroy focus.
+    if (!_availableTiers.includes(num)) {
+      logger.warn(`[instruction.runner] _selectTierLLM: LLM returned disabled/invalid tier ${num} — falling back to ${_availableTiers[0]} (available: [${_availableTiers.join(',')}])`);
+    }
+    const result = _availableTiers.includes(num) ? num : _availableTiers[0];
+    logger.info(`[instruction.runner] _selectTierLLM: strategy=${result} (raw="${(raw || '').trim()}") — pattern=${_statePattern.pattern}, deepLink=${_statePattern.deepLinkType}, overlay=${_overlayStr}, fillable=${fillableCount} (input=${fillableTypes.inputCount}, ce=${fillableTypes.contenteditableCount}), tried=[${[...triedTiers].join(',')}], url=${currentUrl}`);
+
+    // Emit progress event so user sees the tier decision in real-time
+    _emitTierProgressForTier(result, progressCallbackUrl, stepIndex, agentId, sessionIdForProgress);
+
     return result;
   } catch (e) {
-    logger.warn(`[instruction.runner] _selectTierLLM failed: ${e.message} — falling back to _selectTierDeterministic`);
-    return _selectTierDeterministic(sessionId, goal, actionHistory, pageCategory, shortcutCount, focused, probe);
+    logger.warn(`[instruction.runner] _selectTierLLM failed: ${e.message} — falling back to ${_availableTiers[0]}`);
+    _emitTierProgressForTier(_availableTiers[0], progressCallbackUrl, stepIndex, agentId, sessionIdForProgress);
+    return _availableTiers[0] || 1;
   }
+}
+
+// Helper: emit tier progress for a given tier number
+function _emitTierProgressForTier(tier, progressCallbackUrl, stepIndex, agentId, sessionId) {
+  const _tierName = { 0: 'done', 1: 'just-type', 2: 'meta+f', 3: 'shortcuts', 4: 'tab-map', 5: 'gesture' }[tier] || 'unknown';
+  const _tierMsg = {
+    0: `Done: goal achieved`,
+    1: `Just-type: typing into focused field`,
+    2: `Meta+F: searching for text on page`,
+    3: `Shortcuts: pressing app keyboard shortcut`,
+    4: `Tab-Map: scanning elements and filling form`,
+    5: `Gesture: spatial interaction`,
+  }[tier] || `Tier ${tier}`;
+  _emitTierProgress(progressCallbackUrl, stepIndex, _tierName, _tierMsg, agentId, sessionId);
+}
+
+// Helper: build human-readable reasons for disabled tiers
+function _buildDisabledReasons(disabledTiers, statePattern) {
+  if (!disabledTiers || disabledTiers.size === 0) return '';
+  const _reasons = [];
+  if (disabledTiers.has(2)) _reasons.push('2 (Meta+F) — disabled: not applicable for this state');
+  if (disabledTiers.has(3)) _reasons.push('3 (Shortcuts) — disabled: not applicable for this state');
+  if (disabledTiers.has(4)) _reasons.push('4 (Tab-Map) — disabled: would destroy focus/state (e.g. creation deep-link)');
+  if (disabledTiers.has(5)) _reasons.push('5 (Gesture) — disabled: no spatial interaction needed');
+  return _reasons.join('\n');
+}
+
+// Helper: emit agent:tier progress event to AutomationProgress.tsx via IPC
+function _emitTierProgress(progressCallbackUrl, stepIndex, tierName, message, agentId, sessionId) {
+  if (!progressCallbackUrl) return;
+  try {
+    const http = require('http');
+    const u = new URL(progressCallbackUrl);
+    const body = JSON.stringify({
+      type: 'agent:tier',
+      stepIndex: stepIndex ?? 0,
+      tier: tierName,
+      message,
+      agentId: agentId || '',
+      sessionId: sessionId || '',
+    });
+    const req = http.request({
+      hostname: u.hostname,
+      port: parseInt(u.port, 10),
+      path: u.pathname,
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
+      timeout: 3000,
+    });
+    req.on('error', () => {});
+    req.on('timeout', () => req.destroy());
+    req.write(body);
+    req.end();
+  } catch (_) { /* non-fatal */ }
 }
 
 // Deterministic tier selection — fallback when LLM is unavailable.
@@ -4629,56 +5060,18 @@ Strategy? (${_availableTiers.join(', ')})`;
 //   5. 2+ fillable → Tab-Map (4) — forms take priority over search
 //   6. 0 fillable + many clickable (>20) → Meta+F (2) — fails → Tab-Map
 //   7. Default → Tab-Map (4)
-async function _selectTierDeterministic(sessionId, goal, actionHistory, pageCategory, shortcutCount, focused, probe) {
-  // 1. DONE check (only if we've taken actions)
+// Deterministic tier selection — stripped down to just the DONE check.
+// The LLM (_selectTierLLM) is the sole decision-maker for all tier selection.
+// This function is kept as a fallback for the DONE check only.
+async function _selectTierDeterministic(sessionId, goal, actionHistory, pageCategory, shortcutCount, focused, probe, triedTiers = new Set(), disabledTiers = new Set(), overlayActive = false, currentUrl = '') {
+  // DONE check only — the LLM handles all tier selection
   if (actionHistory.length > 0) {
     const _checkboxCount = await _countCheckboxes(sessionId);
     const done = await _checkDone(goal, actionHistory, null, probe?.pageTitle, _checkboxCount);
     if (done) return 0;
   }
-
-  const { fillableCount, clickableCount, hasAutoFocus, fillableTypes } = probe;
-  const _isCanvasEditor = (fillableTypes.contenteditableCount + fillableTypes.roleTextboxCount) >= Math.ceil(fillableCount * 0.5);
-  logger.info(`[instruction.runner] _selectTierDeterministic: fillable=${fillableCount} (input=${fillableTypes.inputCount}, ce=${fillableTypes.contenteditableCount}), clickable=${clickableCount}, autoFocus=${hasAutoFocus}, category=${pageCategory}, shortcuts=${shortcutCount}, isCanvas=${_isCanvasEditor}`);
-
-  // 2. Canvas editor (majority contenteditable) + document_editor → Just-type
-  if (_isCanvasEditor && pageCategory === 'document_editor' && fillableCount >= 1) {
-    logger.info(`[instruction.runner] _selectTierDeterministic: → 1 (Just-type) — canvas editor (ce=${fillableTypes.contenteditableCount})`);
-    return 1;
-  }
-
-  // 3. Single fillable + auto-focus → Just-type
-  if (fillableCount <= 1 && hasAutoFocus && focused) {
-    const _isFillable = ['input', 'textarea'].includes(focused.tag) ||
-                        ['combobox', 'textbox'].includes(focused.role);
-    if (_isFillable) {
-      logger.info(`[instruction.runner] _selectTierDeterministic: → 1 (Just-type) — single fillable + auto-focus`);
-      return 1;
-    }
-  }
-
-  // 4. 0-1 fillable + shortcuts available + shortcut-heavy category → Shortcuts
-  const _shortcutCategories = ['media_player', 'calendar', 'social_feed', 'email_compose', 'document_editor'];
-  if (fillableCount <= 1 && shortcutCount > 0 && _shortcutCategories.includes(pageCategory)) {
-    logger.info(`[instruction.runner] _selectTierDeterministic: → 3 (Shortcuts) — ${shortcutCount} shortcuts + category=${pageCategory}`);
-    return 3;
-  }
-
-  // 5. 2+ fillable → Tab-Map (forms take priority over search)
-  if (fillableCount >= 2) {
-    logger.info(`[instruction.runner] _selectTierDeterministic: → 4 (Tab-Map) — ${fillableCount} fillable elements`);
-    return 4;
-  }
-
-  // 6. 0 fillable + many clickable → Meta+F (fails → Tab-Map fallback)
-  if (fillableCount === 0 && clickableCount > 20) {
-    logger.info(`[instruction.runner] _selectTierDeterministic: → 2 (Meta+F) — ${clickableCount} clickable items, no fillable`);
-    return 2;
-  }
-
-  // 7. Default → Tab-Map
-  logger.info(`[instruction.runner] _selectTierDeterministic: → 4 (Tab-Map) — default fallback`);
-  return 4;
+  // No deterministic rule — let LLM decide
+  return -1;
 }
 
 // ── Runtime command discovery ──
@@ -4879,7 +5272,7 @@ function _buildResultString(goal, actionHistory, filledFields, extractedPageText
 
 // Tier 2: _selectTier → 0 (DONE), 1 (Just-type), 2 (Meta+F), 3 (Shortcuts), 4 (Tab-Map)
 // Tier 3: Strategy execution with fallback to Tab-Map
-async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, pageCategory, agentContext, shortcutCount = 0, timeoutMs = 120000 }) {
+async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, pageCategory, agentContext, shortcutCount = 0, shortcutLabels = '', timeoutMs = 120000, progressCallbackUrl = null, stepIndex = 0, agentId = '' }) {
   if (!sessionId) return { ok: false, error: 'No sessionId provided' };
   const _pageCategory = pageCategory || 'web_generic';
   const _urlFirstNav = !!urlFirstNav;
@@ -4901,13 +5294,23 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
   let inTabMapSession = false;
   let overlayActive = false;
   const _shortcutCount = shortcutCount || 0;
+  const _shortcutLabels = shortcutLabels || '';
   // Determine which tiers are available for this page:
   // - URL-first creation deep-links (notion.new, docs.new): Just-type ONLY
   //   (Tab-Map presses Escape/Home/Search and destroys the page state)
-  // - High-shortcut apps (>= 8 shortcuts: Notion, Google Docs, Sheets): no Tab-Map
-  //   (these apps have keyboard shortcuts for everything; Tab-Map wanders the sidebar)
+  // - High-shortcut apps (>= 8 shortcuts: Notion, Google Docs, Sheets, Google Calendar):
+  //   Tab-Map gated DYNAMICALLY per-state (enabled when forms/dialogs/alerts are open,
+  //   disabled when on a bare page to prevent sidebar wandering).
   // - Default (forms, generic web, Gmail compose): all tiers
-  const _isCreationDeepLink = _urlFirstNav && _pageCategory === 'document_editor';
+  // Deep link type classification: use the URL-pattern-based classifier for accurate
+  // detection of creation/search/compose/navigation/read deep links. The legacy
+  // _urlFirstNav && _pageCategory === 'document_editor' fallback was removed because
+  // it fired on existing page URLs auto-injected from prior steps (e.g. Notion's
+  // /p/Weekly-Goals-...?showMoveTo=true), causing false-positive creation_deep_link
+  // classification that disabled Tab-Map and confused the LLM.
+  const { classifyDeepLinkType } = require('../skill-helpers/deep-link-types.cjs');
+  const _deepLinkType = _urlFirstNav ? classifyDeepLinkType(startUrl, _pageCategory) : 'none';
+  const _isCreationDeepLink = _deepLinkType === 'creation';
   const _isHighShortcutApp = _shortcutCount >= 8;
   const _disabledTiers = new Set();
   if (_isCreationDeepLink) {
@@ -4916,8 +5319,10 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
     _disabledTiers.add(4); // no Tab-Map
     logger.info(`[instruction.runner] Creation deep-link detected — Just-type ONLY (tiers 2,3,4 disabled)`);
   } else if (_isHighShortcutApp) {
-    _disabledTiers.add(4); // no Tab-Map
-    logger.info(`[instruction.runner] High-shortcut app (${_shortcutCount} shortcuts) — Tab-Map disabled (tier 4)`);
+    // Tab-Map starts disabled for high-shortcut apps; gated dynamically per-state
+    // in the main loop (enabled when fillable/overlay/alert detected).
+    _disabledTiers.add(4); // no Tab-Map initially
+    logger.info(`[instruction.runner] High-shortcut app (${_shortcutCount} shortcuts) — Tab-Map gated dynamically (tier 4)`);
   }
   // Step-based Tab-Map state
   let _stepPlan = null;         // extracted steps for current page: [{ action, target?, value?, key? }]
@@ -4927,9 +5332,25 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
   // Cleared on URL change, overlay change, or focus change (so multi-step Just-type like Notion still works).
   let _triedTiers = new Set();
   let _prevFocusedRef = null;
+  // Just-type retry counter (caps death-loop when Tab-Map is disabled)
+  let _justTypeRetries = 0;
+  // Alert loop guard: prevent pressing Escape repeatedly for the same alert
+  let _lastAlertKey = null;
+  let _lastAlertCount = 0;
+  const _ESCAPE_UNSAFE_CATEGORIES = ['email_compose', 'document_editor', 'calendar_event_create', 'spreadsheet_edit', 'slides_edit'];
+
 
   // Initial overlay detection (URL-first might have opened a modal)
+  // NOTE: For creation deep-links (notion.new, docs.new), suppress overlay detection.
+  // The page wrapper may be detected as an overlay (dialog role on the editor container),
+  // which would falsely enable Tab-Map and cause it to press Escape — destroying the
+  // freshly created entity's focus. The state pattern classifier handles this correctly
+  // via the creation_deep_link guard (overlay → fastPath=false → LLM decides).
   overlayActive = await _detectOverlay(sessionId);
+  if (_isCreationDeepLink && overlayActive) {
+    logger.info(`[instruction.runner] Creation deep-link — suppressing initial overlay detection (page wrapper is not a form dialog)`);
+    overlayActive = false;
+  }
   if (overlayActive) {
     logger.info(`[instruction.runner] Iterative: initial overlay detected — overlayActive=true`);
   }
@@ -4954,6 +5375,7 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
     if ((stateChanged || _focusChanged) && _triedTiers.size > 0) {
       logger.info(`[instruction.runner] Clearing tried tiers (${[..._triedTiers].join(',')}) — stateChanged=${stateChanged}, focusChanged=${_focusChanged}`);
       _triedTiers.clear();
+      _justTypeRetries = 0; // reset Just-type retry counter on state/focus change
     }
     _prevFocusedRef = focused?.ref || null;
 
@@ -5020,7 +5442,7 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
         // Re-extract steps for the fresh tab-map (unless in fallback mode)
         if (!_usingStepFallback) {
           const { _extractSteps } = require('./browser.agent.cjs');
-          _stepPlan = await _extractSteps(goal, currentUrl, _cachedTabMap, _pageCategory, agentContext);
+          _stepPlan = await _extractSteps(goal, currentUrl, _cachedTabMap, _pageCategory, agentContext, overlayActive, actionHistory);
           _stepIndex = 0;
           if (!_stepPlan || _stepPlan.length <= 1) {
             logger.info(`[instruction.runner] Tab-Map: re-extraction returned ${_stepPlan?.length || 0} step(s) — using per-step LLM`);
@@ -5071,6 +5493,21 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
       }
 
       if (stepResult.done) {
+        // Guard: if we're in a step plan and there are more steps to execute,
+        // a mid-plan state change (URL change, overlay open) should NOT end the
+        // session. Re-scan the tab-map for the new page state and continue.
+        if (!_usingStepFallback && _stepPlan && _stepIndex < _stepPlan.length) {
+          logger.info(`[instruction.runner] Tab-Map: state changed at step ${_stepIndex + 1}/${_stepPlan.length} — re-scanning and continuing (not done)`);
+          inTabMapSession = false;
+          _cachedTabMap = null;
+          _stepPlan = null;
+          _stepIndex = 0;
+          filledFields.length = 0;
+          consumedRefs.clear();
+          prevUrl = currentUrl;
+          continue; // re-decide with fresh tab-map on next iteration
+        }
+
         // Tab-Map session ended
         inTabMapSession = false;
         _cachedTabMap = null;
@@ -5078,6 +5515,19 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
         _stepIndex = 0;
 
         if (stepResult.ok && !stepResult.error) {
+          // Guard: single "navigate" step should not complete a non-navigation goal.
+          // The playbook may have a "navigate to X" step that completes successfully,
+          // but if the goal is to create/edit/add something, a single navigate is
+          // just the first step — not goal completion.
+          const _isNavOnlyGoal = /^navigate to |^go to /i.test(goal);
+          const _onlyNavAction = actionHistory.length <= 2 && actionHistory.some(a => /navigate/i.test(a));
+          if (_onlyNavAction && !_isNavOnlyGoal) {
+            logger.info(`[instruction.runner] Tab-Map: single navigate step completed but goal is not nav-only — treating as state change, not done`);
+            prevUrl = currentUrl;
+            filledFields.length = 0;
+            consumedRefs.clear();
+            continue; // re-decide, don't return done
+          }
           // DONE — step plan completed or LLM declared done. No regex
           // verification — the step plan is the source of truth.
           if (!extractedPageText && _isReadCountListGoal(goal)) {
@@ -5172,15 +5622,27 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
       }
     }
 
-    // ── LiteParser OCR observation (when DOM scan is insufficient) ────────────
+    // ── LiteParser OCR observation (dynamic gating) ────────────────────────
     // Captures visual text + coordinates that the DOM can't see (shadow DOM,
     // canvas-rendered text, images with text). Feeds into _selectTier and
-    // _extractValue for visual context. Only runs when DOM scan is insufficient
-    // to avoid slowing down the fast path.
+    // _extractValue for visual context.
+    //
+    // DYNAMIC GATING: OCR runs only when the DOM can't provide enough context.
+    // - True canvas pages (Figma, Google Sheets, code editors) → always OCR
+    //   (DOM has no text nodes for canvas-rendered content)
+    // - Rich DOM pages (Notion, Google Docs, generic web) → skip OCR when DOM
+    //   has fillable elements + visible text (saves ~7s per iteration)
+    // - DOM ambiguous (no fillable, no visible text) → OCR as fallback
+    //
+    // document_editor is NOT in the true-canvas list because Notion/Google Docs
+    // use contenteditable blocks with full DOM text — OCR is redundant there.
+    // The final OCR verify at goal completion (Step 5) is the safety net.
     let _ocrObservation = null;
-    const _domScanInsufficient = _probe.fillableCount < 3 && _probe.visibleText.length < 100;
-    const _isCanvasPage = _canvasCategories.includes(_pageCategory);
-    if (_domScanInsufficient || _isCanvasPage) {
+    const _trueCanvasCategories = ['code_editor', 'design_canvas', 'spreadsheet'];
+    const _isTrueCanvasPage = _trueCanvasCategories.includes(_pageCategory);
+    const _domRichEnough = _probe.fillableCount >= 1 && _probe.visibleText.length >= 50;
+    const _needsOcr = _isTrueCanvasPage || !_domRichEnough;
+    if (_needsOcr) {
       try {
         const { _liteparseCapture } = require('./browser.agent.cjs');
         const _ocrPage = engine.getPage(sessionId);
@@ -5193,7 +5655,7 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
               imageWidth: _cap.imageWidth,
               imageHeight: _cap.imageHeight,
             };
-            logger.info(`[instruction.runner] OCR observation: ${_cap.textItems.length} items, ${(_cap.fullText || '').length} chars (DOM insufficient: ${_domScanInsufficient}, canvas: ${_isCanvasPage})`);
+            logger.info(`[instruction.runner] OCR observation: ${_cap.textItems.length} items, ${(_cap.fullText || '').length} chars (trueCanvas: ${_isTrueCanvasPage}, domRich: ${_domRichEnough})`);
           }
         }
       } catch (_ocrErr) {
@@ -5209,7 +5671,12 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
       const _ocrText = _ocrObservation.fullText || _ocrObservation.textItems.map(t => t.text).join(' ');
 
       // 1. Classify page state (gatekeeper)
-      const _pageState = await _ocrClassifyState(_ocrText, goal, actionHistory);
+      // Skip on first iteration when no actions have been taken — you can't be "done"
+      // if you haven't done anything yet. This prevents false-positive "done" when
+      // a creation deep-link loads a blank page (e.g., notion.new shows "Untitled").
+      const _pageState = actionHistory.length > 0
+        ? await _ocrClassifyState(_ocrText, goal, actionHistory)
+        : 3; // ready — proceed to tier selection
 
       if (_pageState === 0) {
         // Error — log and try Escape to dismiss error
@@ -5250,17 +5717,176 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
       // 2. Goal verification (second opinion after _checkDone)
       if (actionHistory.length > 0) {
         const _goalStatus = await _ocrVerifyGoal(_ocrText, goal, actionHistory);
-        if (_goalStatus === 1) {
+        // _ocrVerifyGoal returns { num, reason } — compare .num, not the object
+        if (_goalStatus?.num === 1) {
           logger.info(`[instruction.runner] OCR verify: goal achieved (visual verification)`);
           const _resultStr = `Goal achieved (OCR verified): ${goal}`;
           return { ok: true, output: _resultStr, actionHistory };
-        } else if (_goalStatus === 2) {
+        } else if (_goalStatus?.num === 2) {
           logger.info(`[instruction.runner] OCR verify: page processing — waiting 30s`);
           await _sleep(30000);
           prevUrl = currentUrl;
           continue;
         }
-        // _goalStatus === 0 (fail) → proceed to tier selection (try to fix)
+        // _goalStatus.num === 0 (fail) → proceed to tier selection (try to fix)
+      }
+    }
+
+    // ── Alert Handler Layer (before tier selection) ────────────────────
+    // Detects alerts/dialogs, HANDLES them (removes them), and either:
+    // - Returns success (success toast matching goal)
+    // - Returns askUser (unfixable error — surface to user)
+    // - Continues the Tab-Flow (confirmation dismissed, fixable error)
+    // After handling, the agent returns to the previous state to address the root cause.
+    const _alert = await _detectAlert(sessionId);
+    let _alertHandled = false;
+
+    if (_alert) {
+      logger.info(`[instruction.runner] Alert detected: type=${_alert.type}, text="${(_alert.text || '').slice(0, 80)}", buttons=${JSON.stringify(_alert.buttons || [])}`);
+
+      // ── SUCCESS TOAST ──
+      // Informational. If it matches the goal, mark done. Otherwise ignore.
+      if (_alert.type === 'success') {
+        const _goalKeywords = goal.toLowerCase().match(/\b\w{4,}\b/g) || [];
+        const _successText = (_alert.text || '').toLowerCase();
+        const _matches = _goalKeywords.filter(k => _successText.includes(k)).length;
+        if (_matches > 0 || actionHistory.length > 2) {
+          logger.info(`[instruction.runner] Alert: success toast matches goal — done`);
+          return { ok: true, output: `Goal achieved: ${goal} (${_alert.text})`, actionHistory };
+        }
+        // Informational toast (e.g., "Auto-saved") — ignore, continue Tab-Flow
+        logger.info(`[instruction.runner] Alert: informational toast — ignoring`);
+      }
+
+      // ── CONFIRMATION DIALOG ──
+      // Need to make a decision. Click the SAFE button (don't discard/lose data).
+      // After clicking safe button, previous form state is restored → continue Tab-Flow.
+      else if (_alert.type === 'confirmation') {
+        const _alertKey = `${_alert.type}:${_alert.text || ''}:${(_alert.buttons || []).join(',')}`;
+        if (_alertKey === _lastAlertKey) {
+          _lastAlertCount++;
+        } else {
+          _lastAlertKey = _alertKey;
+          _lastAlertCount = 1;
+        }
+
+        const _safeButtonKeywords = /cancel|continue editing|stay|don.?t save|keep|no/i;
+        const _safeButtons = (_alert.buttons || []).filter(b => _safeButtonKeywords.test(b.toLowerCase()));
+
+        if (_safeButtons.length > 0) {
+          // Force Tab-Map to click the safe button
+          _disabledTiers.delete(4); // ensure Tab-Map is available
+          _triedTiers.clear();
+          _cachedTabMap = null;
+          _alertHandled = true;
+          logger.info(`[instruction.runner] Alert: confirmation — forcing Tab-Map to click safe button "${_safeButtons[0]}"`);
+          actionHistory.push(`Alert handler: confirmation dialog — need to click "${_safeButtons[0]}"`);
+          // Fall through to tier selection — Tab-Map will scan, find the safe button, and click it
+        } else if (_lastAlertCount >= 3) {
+          // Same confirmation detected 3+ times — Escape isn't resolving it. Stop
+          // the loop and continue to tier selection so the agent can act normally.
+          logger.warn(`[instruction.runner] Alert: confirmation repeated ${_lastAlertCount} times with no safe button — stopping Escape loop`);
+          // Fall through to tier selection
+        } else if (_ESCAPE_UNSAFE_CATEGORIES.includes(_pageCategory)) {
+          // Compose/edit contexts: Escape would cancel the user's work (close
+          // Gmail compose, Notion editor, etc.). Don't press Escape.
+          logger.warn(`[instruction.runner] Alert: confirmation on ${_pageCategory} — not pressing Escape (would cancel compose)`);
+          // Fall through to tier selection
+        } else {
+          // No safe button found — press Escape once (don't confirm destructive action)
+          logger.info(`[instruction.runner] Alert: confirmation — no safe button, pressing Escape (attempt ${_lastAlertCount})`);
+          await browserAct({ action: 'press', sessionId, key: 'Escape', headed: true, timeoutMs: 2000 });
+          await _sleep(500);
+          _triedTiers.clear();
+          _cachedTabMap = null;
+          prevUrl = currentUrl;
+          continue; // re-probe on next iteration
+        }
+      }
+
+      // ── VALIDATION ERROR ──
+      // Two sub-cases:
+      // a) Fixable (e.g., "Title is required") → force Tab-Map to find and fill missing field
+      // b) Unfixable (e.g., "Server error", "Permission denied") → surface to user via ASK_USER
+      else if (_alert.type === 'error') {
+        const _fixablePatterns = /required|missing|empty|must|please (enter|fill|select|provide)|invalid (email|date|time|format)/i;
+        const _unfixablePatterns = /server error|permission denied|not allowed|access denied|unauthorized|forbidden|500|503|timeout|connection/i;
+        const _errorText = _alert.text || '';
+
+        if (_unfixablePatterns.test(_errorText)) {
+          // Unfixable — surface to user
+          logger.info(`[instruction.runner] Alert: unfixable error — surfacing to user: "${_errorText}"`);
+          return {
+            ok: false,
+            askUser: true,
+            question: `I hit an error I can't resolve: "${_errorText}". How would you like to proceed?`,
+            options: ['Retry', 'Skip this step', 'Cancel task'],
+            actionHistory
+          };
+        }
+
+        if (_fixablePatterns.test(_errorText)) {
+          // Fixable — force Tab-Map to find and fill the missing field
+          _disabledTiers.delete(4); // force Tab-Map
+          _triedTiers.clear();
+          _cachedTabMap = null;
+          _alertHandled = true;
+          logger.info(`[instruction.runner] Alert: fixable validation error — forcing Tab-Map to fix: "${_errorText}"`);
+          actionHistory.push(`Alert handler: validation error — "${_errorText}" — need to fix missing field`);
+          // Fall through to tier selection — Tab-Map will scan, find the missing field, fill it
+        } else {
+          // Unknown error — try to dismiss and continue
+          logger.info(`[instruction.runner] Alert: unknown error — dismissing and continuing: "${_errorText}"`);
+          await browserAct({ action: 'press', sessionId, key: 'Escape', headed: true, timeoutMs: 2000 });
+          await _sleep(500);
+          _triedTiers.clear();
+          _cachedTabMap = null;
+          prevUrl = currentUrl;
+          continue;
+        }
+      }
+    } else {
+      // No alert detected — check for permission/button-only dialog via OCR (secondary layer)
+      // Only run OCR when last action might have triggered an alert but DOM detection found nothing
+      if (actionHistory.length > 0) {
+        const _lastAction = actionHistory[actionHistory.length - 1];
+        const _mightTriggerAlert = /Shortcut|Just-type|press|Save|submit/i.test(_lastAction);
+        if (_mightTriggerAlert && _probe.fillableCount === 0 && !overlayActive) {
+          try {
+            const { _liteparseCapture } = require('./browser.agent.cjs');
+            const _ocrPage = engine.getPage(sessionId);
+            if (_ocrPage) {
+              const _cap = await _liteparseCapture(_ocrPage);
+              if (_cap?.ok && _cap.fullText) {
+                const _ocrAlertPatterns = /discard|are you sure|continue editing|required|error|saved|created|open.*link|block|allow/i;
+                if (_ocrAlertPatterns.test(_cap.fullText)) {
+                  logger.info(`[instruction.runner] OCR alert detected: "${_cap.fullText.slice(0, 100)}"`);
+                  _disabledTiers.delete(4); // force Tab-Map
+                  _triedTiers.clear();
+                  _cachedTabMap = null;
+                  _alertHandled = true;
+                  actionHistory.push(`Alert handler: OCR detected alert — forcing Tab-Map`);
+                }
+              }
+            }
+          } catch (_) {}
+        }
+      }
+    }
+
+    // ── Dynamic Tab-Map gating for high-shortcut apps ──
+    // Enable Tab-Map when there are fillable elements OR an overlay OR an alert was handled
+    // (forms/dialogs/alerts need Tab-Map to scan and click buttons).
+    // Disable Tab-Map when there are 0 fillable elements AND no overlay AND no alert
+    // (sidebar wandering prevention for Notion/Docs/Sheets).
+    if (_isHighShortcutApp && !_isCreationDeepLink) {
+      const _tabMapNeeded = _probe.fillableCount >= 1 || overlayActive || _alertHandled;
+      if (_tabMapNeeded && _disabledTiers.has(4)) {
+        _disabledTiers.delete(4);
+        logger.info(`[instruction.runner] High-shortcut app: enabling Tab-Map (fillable=${_probe.fillableCount}, overlay=${overlayActive}, alertHandled=${_alertHandled})`);
+      } else if (!_tabMapNeeded && !_disabledTiers.has(4)) {
+        _disabledTiers.add(4);
+        logger.info(`[instruction.runner] High-shortcut app: disabling Tab-Map (no fillable, no overlay, no alert — sidebar prevention)`);
       }
     }
 
@@ -5269,8 +5895,9 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
     // the overlay is blocking → dismiss it. This is general — works for Notion Move-to,
     // cookie banners, template pickers, etc. Does NOT dismiss overlays WITH fillable fields
     // (Gmail compose, login forms) — those are needed for the goal.
+    // NOTE: Don't dismiss if an alert was handled (alert handler already dealt with it).
     const _typeIntentKeywords = /\b(type|write|create|add|note|list|draft|compose|make|put|fill|name|title|rename|update|edit|change)\b/i;
-    if (overlayActive && _probe.fillableCount === 0 && _typeIntentKeywords.test(goal)) {
+    if (overlayActive && _probe.fillableCount === 0 && _typeIntentKeywords.test(goal) && !_alertHandled) {
       logger.info(`[instruction.runner] Overlay active with no fillable fields + type-intent goal — dismissing overlay`);
       await browserAct({ action: 'press', sessionId, key: 'Escape', headed: true, timeoutMs: 2000 });
       await _sleep(500);
@@ -5290,20 +5917,22 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
       continue; // re-probe on next iteration
     }
 
-    const strategy = await _selectTierLLM(sessionId, goal, actionHistory, _pageCategory, _shortcutCount, focused, currentUrl, _probe, agentContext, _triedTiers, _disabledTiers, _canvasLayout?.layoutText || '', _ocrObservation);
+    const _alertActiveAtTierSelect = !!_alert && !_alertHandled;
+    const strategy = await _selectTierLLM(sessionId, goal, actionHistory, _pageCategory, _shortcutCount, focused, currentUrl, _probe, agentContext, _triedTiers, _disabledTiers, _canvasLayout?.layoutText || '', _ocrObservation, _shortcutLabels, overlayActive, progressCallbackUrl, stepIndex, agentId, sessionId, _editorState, _isCreationDeepLink, _alertActiveAtTierSelect, false);
     logger.info(`[instruction.runner] Decision: strategy=${strategy} (0=DONE, 1=Just-type, 2=Meta+F, 3=App Shortcuts, 4=Tab-Map, 5=Gesture)`);
 
     // Handle tier exhaustion — all tiers tried on this state with no progress
+    // NOTE: Don't press Escape (might trigger "Discard unsaved changes?" creating a loop).
+    // Instead, force Tab-Map enabled and reset.
     if (strategy === -1) {
-      logger.info(`[instruction.runner] All tiers exhausted — pressing Escape to dismiss overlay and reset`);
-      await browserAct({ action: 'press', sessionId, key: 'Escape', headed: true, timeoutMs: 2000 });
-      await _sleep(500);
+      logger.info(`[instruction.runner] All tiers exhausted — forcing Tab-Map and resetting`);
+      _disabledTiers.delete(4); // force Tab-Map
       _triedTiers.clear();  // reset for the new state
       _cachedTabMap = null;  // force fresh tab-map
       _stepPlan = null;
       _stepIndex = 0;
       _usingStepFallback = false;
-      actionHistory.push('Escape (all tiers exhausted — reset)');
+      actionHistory.push('Reset (all tiers exhausted — Tab-Map forced)');
       prevUrl = await _getUrl(sessionId);
       continue;
     }
@@ -5412,7 +6041,7 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
         continue;
       }
 
-      const result = await _executeJustType(sessionId, value, focused, _pageCategory, goal, _enrichedContext, { title: _probe.pageTitle, visibleText: _probe.visibleText });
+      const result = await _executeJustType(sessionId, value, focused, _pageCategory, goal, _enrichedContext, { title: _probe.pageTitle, visibleText: _probe.visibleText }, overlayActive, actionHistory);
       const _note = result.ok ? '→ ok' : '→ FAILED';
       actionHistory.push(`Just-type "${value.slice(0, 40)}" ${_note}`);
       _triedTiers.add(1);
@@ -5421,7 +6050,13 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
         if (_disabledTiers.has(4)) {
           // Tab-Map disabled (high-shortcut app or creation deep-link) — retry Just-type
           // with fresh focus instead of falling back to Tab-Map (which destroys page state)
-          logger.info(`[instruction.runner] Just-type failed (${result.error}) — Tab-Map disabled, retrying with fresh focus`);
+          // Cap retries at 3 to prevent death-loop
+          _justTypeRetries++;
+          if (_justTypeRetries > 3) {
+            logger.warn(`[instruction.runner] Just-type failed ${_justTypeRetries}x — Tab-Map disabled, giving up`);
+            break;
+          }
+          logger.info(`[instruction.runner] Just-type failed (${result.error}) — Tab-Map disabled, retry ${_justTypeRetries}/3 with fresh focus`);
           _triedTiers.delete(1); // allow Just-type retry on next iteration
           // Click first fillable to re-focus on the right field
           const _refocused = await _clickFirstFillable(sessionId);
@@ -5513,7 +6148,7 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
       // App Shortcuts — press an app-specific keyboard shortcut
       const { _extractShortcut } = require('./browser.agent.cjs');
       const _hostname = (() => { try { return new URL(currentUrl).hostname.replace(/^www\./, ''); } catch (_) { return ''; } })();
-      const shortcutResult = await _extractShortcut(goal, actionHistory, _hostname, agentContext);
+      const shortcutResult = await _extractShortcut(goal, actionHistory, _hostname, agentContext, currentUrl, overlayActive, focused);
       if (!shortcutResult) {
         // No shortcut found — fallback to Tab-Map
         logger.info(`[instruction.runner] Shortcut: no shortcut found — falling back to Tab-Map`);
@@ -5596,7 +6231,7 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
 
         // Extract steps from goal + tab-map (one LLM call)
         const { _extractSteps } = require('./browser.agent.cjs');
-        _stepPlan = await _extractSteps(goal, currentUrl, _cachedTabMap, _pageCategory, agentContext);
+        _stepPlan = await _extractSteps(goal, currentUrl, _cachedTabMap, _pageCategory, agentContext, overlayActive, actionHistory);
         _stepIndex = 0;
 
         if (!_stepPlan || _stepPlan.length <= 1) {

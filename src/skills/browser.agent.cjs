@@ -132,28 +132,16 @@ function _buildExtractionCode(selector, extractType, extractOptions = {}) {
 // ---------------------------------------------------------------------------
 // LLM-based auth detection prompt — semantic analysis of page content
 // ---------------------------------------------------------------------------
-const AUTH_CHECK_PROMPT = `You are analyzing a web page to determine if user authentication is required.
-Given the page TITLE and BODY TEXT, determine if this page requires the user to log in or sign up before they can access the actual service.
+const AUTH_CHECK_PROMPT = `You are analyzing a web page to determine if the user is authenticated.
+Given the page TITLE and BODY TEXT, return ONLY a single number:
+0 = authenticated (user is logged in — page shows real app content: calendar events, emails, files, dashboard data)
+1 = auth required (page is a login form, sign-in page, marketing/landing page, or "create account" page)
 
-Reply ONLY with a JSON object:
-{
-  "authRequired": true|false,
-  "confidence": 0.0-1.0,
-  "reason": "brief explanation"
-}
-
-Indicate authRequired=true if the page shows:
-- Login forms, sign-in buttons, or email/password fields
-- Landing pages that say "Sign in to continue" or similar
-- Marketing pages that require authentication to proceed
-- "Workspace not found" or "Sign in to your workspace" messages
-- Pages that say "Get started" or "Create account" as the primary action
-- Email input fields with text like "Enter your email to sign in"
-
-Indicate authRequired=false if:
-- The user is already logged in and can see their content
-- The page is a publicly accessible dashboard
-- The page shows actual app content (channels, messages, files, etc.)`;
+Rules:
+- 1 (auth required): login forms, "Sign in" buttons, marketing pages, "Get started", "Create account", "Sign in to continue", "Workspace not found"
+- 0 (authenticated): page shows actual app content (calendar with events, inbox with emails, dashboard with data, documents)
+- When in doubt, return 1 (auth required — safer to re-authenticate)
+Return ONLY the number.`;
 
 // ---------------------------------------------------------------------------
 // Auth-check result cache — avoids repeated navigate+evaluate probes
@@ -205,7 +193,8 @@ function _setCachedAuthCheck(agentId, authNeeded) {
 }
 
 // ---------------------------------------------------------------------------
-// LLM-based auth detection — semantic analysis when URL patterns fail
+// LLM-based auth detection — semantic analysis (number return for fast light-model use)
+// Returns: 0 = authenticated, 1 = auth required
 // ---------------------------------------------------------------------------
 async function _detectAuthViaLLM(title, body, agentId) {
   try {
@@ -213,21 +202,18 @@ async function _detectAuthViaLLM(title, body, agentId) {
     const raw = await askWithMessages([
       { role: 'system', content: AUTH_CHECK_PROMPT },
       { role: 'user', content: `TITLE: ${(title || '').slice(0, 200)}\n\nBODY: ${(body || '').slice(0, 1000)}` }
-    ], { temperature: 0.1, maxTokens: 256, responseTimeoutMs: 10000 });
+    ], { temperature: 0, maxTokens: 5, responseTimeoutMs: 5000 });
 
-    const parsed = (() => {
-      try { return JSON.parse(raw); }
-      catch (_) { return null; }
-    })();
-
-    if (parsed?.authRequired && (parsed.confidence ?? 0) >= 0.7) {
-      logger.info(`[browser.agent] LLM auth detection: auth required (confidence=${parsed.confidence}, reason=${parsed.reason})`);
-      return true;
+    const num = parseInt((raw || '').trim().replace(/\D/g, ''), 10);
+    if (num === 0 || num === 1) {
+      logger.info(`[browser.agent] LLM auth detection: ${num === 1 ? 'auth required' : 'authenticated'} for ${agentId}`);
+      return num; // 0 = authed, 1 = auth required
     }
-    return false;
+    logger.info(`[browser.agent] LLM auth detection: invalid "${raw}" → defaulting to 1 (auth required) for ${agentId}`);
+    return 1; // default: auth required (safer)
   } catch (err) {
     logger.warn(`[browser.agent] LLM auth detection failed (non-fatal): ${err.message}`);
-    return false;
+    return 1; // default: auth required (safer)
   }
 }
 
@@ -1338,11 +1324,12 @@ Value to type?`;
   // "called", "named", "entitled", or "titled" something.
   const _goalWantsTitleChange = /\b(title|name of the page|page name|rename|call the page|name this page|called|named|entitled|titled)\b/i.test(goal || '');
 
-  // Fire whenever the focused field is a title and the goal is NOT about the title.
-  // This protects the title from body commands whether it's empty (placeholder) or
-  // already filled. It fires on empty title too, so e.g. /todo commands go to body.
-  if (_isTitle && !_goalWantsTitleChange) {
-    logger.info(`[browser.agent] _extractValue: title field focused + goal not about title → PRESS_ENTER`);
+  // Fire whenever the focused field is a title and the goal is NOT about the title,
+  // AND the title already has content. If the title is empty/placeholder, fall through
+  // to the LLM call so it can decide whether to type a title from context.
+  // This protects a filled title from body commands, but allows typing into an empty title.
+  if (_isTitle && !_goalWantsTitleChange && _titleHasContent) {
+    logger.info(`[browser.agent] _extractValue: title field focused + has content + goal not about title → PRESS_ENTER`);
     return 'PRESS_ENTER';
   }
 
@@ -1606,16 +1593,32 @@ async function _ocrVerifyGoal(ocrText, goal, actionHistory = []) {
 
   const systemPrompt = `You verify if a browser automation goal has been achieved by looking at the OCR text captured from the page.
 Return ONLY a single number — nothing else:
-0 = failure (goal NOT achieved, something went wrong)
-1 = done (goal achieved successfully — the expected text/content is visible)
-2 = wait (page is still loading or processing — retry later)
+0 = failure (goal NOT achieved — page is a marketing/landing page, login page, or expected content is missing)
+1 = done (goal achieved — expected result is visible, e.g., event title visible, confirmation message shown)
+2 = wait (page is loading/processing — retry later)
+
+COUNT QUESTION RULE (OVERRIDES ALL OTHER RULES): If the goal asks "how many", "count", "tell me how many", or "number of":
+- Do NOT check whether the search query, filter text, or named items are visible in the OCR — OCR often truncates filter text.
+- The ONLY thing that matters is a pagination, summary, or total count label in the OCR text.
+- Valid count labels include: "1-50 of many", "1-50 of 127", "Showing 1-50 of many", "X of N", "N items", "N matches", "No results", "Zero items", "About N results".
+- "1-50 of many" IS a valid count label — return 1 (done). "many" means the total is large but the count label IS visible.
+- If ANY count/pagination/total label is visible, return 1 (done) immediately.
+- If "No results" or "Zero items" is visible, return 1 (done) — the count (0) is visible.
+- If NO count/pagination/total label is visible, return 0 (fail) — the page may need to scroll or wait.
+- Do NOT return 1 (done) just because some rows/items are visible — the total count label must be visible.
 
 Rules:
-- 1 (done): the OCR text shows the expected result (e.g., title text matches, content is present, confirmation message visible)
-- 0 (fail): the OCR text does NOT show the expected result (e.g., title is still "Untitled", error message visible, content missing)
-- 2 (wait): the OCR text shows loading indicators ("Loading...", "Please wait", "Searching...", progress bar text)
+- 1 (done): the OCR text shows the expected result (e.g., created content is visible, confirmation message, success toast)
+- 0 (fail): the OCR text does NOT show the expected result (e.g., marketing page text, login form, "Sign in" button, "Get started", content missing)
+- 2 (wait): ONLY return 2 if the OCR text shows EXPLICIT loading indicators ("Loading...", "Please wait", "Searching...", spinner, progress bar, "Saving...")
+- Do NOT return 2 just because a dropdown, dialog, menu, or form is open — that is a stable state, not loading.
+- If the page is stable (dropdown open, form visible, calendar rendered), return 0 or 1, NOT 2.
+- If the page text looks like a marketing/landing page (e.g., "Try Google Calendar", "Sign up for free", product features), return 0
 - Check the action history for context on what was attempted
 - When in doubt, return 0 (the tier system will try to fix it)
+
+NAMED ITEM RULE: If the goal specifies a name, title, or list of items (e.g., "called X", "titled X", "named X", "with three items: A, B, C"), the EXACT name/items MUST appear in the OCR text for the goal to be achieved (1). A blank/empty/placeholder title (e.g., "Untitled", "New page") is NOT achieved. If the named items are not in the OCR text, return 0 (fail). NOTE: This rule does NOT apply to count questions — count questions are governed by the COUNT QUESTION RULE above.
+
 Return ONLY the number.`;
 
   const userPrompt = `Goal: ${goal}
@@ -1627,20 +1630,153 @@ ${historyStr}
 Number (0-2)?`;
 
   try {
+    // ── Deterministic count/pagination pre-check ────────────────────────
+    // For count questions, check if a pagination/count label is already
+    // visible in the OCR text. If so, declare done immediately — skip the
+    // LLM which has proven unreliable for count verification (it ignores
+    // "1-50 of many" and fixates on missing filter text due to OCR truncation).
+    const _isCountGoal = /\b(how many|count|tell me how many|number of)\b/i.test(goal);
+    if (_isCountGoal) {
+      // Conservative patterns — only match unambiguous pagination/count labels.
+      // Does NOT match generic "N emails" / "N messages" (those appear in
+      // sidebars/promos and would cause false positives).
+      const _countRe = new RegExp(
+        // 1. Range pagination: "1-50 of many", "1-50 of 127", "1–50 of 1,234"
+        //    Handles all common dash chars: - – — ‐ and Unicode dash variants
+        '\\b\\d+\\s*[-\\u2010-\\u2015]\\s*\\d+\\s+of\\s+(?:many|[\\d,]+)\\b'
+        // 2. "Showing X-Y of N" (explicit prefix for logging clarity)
+        + '|\\bshowing\\s+\\d+\\s*[-\\u2010-\\u2015]\\s*\\d+\\s+of\\s+(?:many|[\\d,]+)\\b'
+        // 3. Single-number total: "Page 1 of 5", "1 of 50"
+        + '|\\b\\d+\\s+of\\s+[\\d,]+\\b'
+        // 4. Zero results — unambiguous
+        + '|\\b(no\\s+results?|zero\\s+(?:items?|matches?|messages?|emails?)|0\\s+results?)\\b'
+        // 5. "About N results" (Google Search style)
+        + '|\\babout\\s+[\\d,]+\\s+results?\\b',
+        'gi'
+      );
+      if (_countRe.test(ocrText || '')) {
+        logger.info(`[browser.agent] _ocrVerifyGoal: count/pagination label found in OCR — skipping LLM (count question) for goal="${String(goal || '').slice(0, 60)}"`);
+        return { num: 1, reason: 'count-label-detected' };
+      }
+    }
+
     const raw = await askWithMessages([
       { role: 'system', content: systemPrompt },
       { role: 'user', content: userPrompt },
     ], { maxTokens: 5, temperature: 0, responseTimeoutMs: 5000 });
     const num = parseInt((raw || '').trim().replace(/\D/g, ''), 10);
     if (num >= 0 && num <= 2) {
-      logger.info(`[browser.agent] _ocrVerifyGoal: ${num} for goal="${String(goal || '').slice(0, 60)}"`);
-      return num;
+      // For failures (0), ask LLM for a descriptive reason
+      let _reason = num === 1 ? 'goal-achieved' : (num === 2 ? 'loading' : 'ocr-failed');
+      if (num === 0) {
+        try {
+          const reasonRaw = await askWithMessages([
+            { role: 'system', content: 'In one sentence, explain why the browser automation goal was NOT achieved based on the OCR text. Be specific about what is missing or wrong. Return ONLY the explanation.' },
+            { role: 'user', content: `Goal: ${goal}\nOCR text: ${(ocrText || '').slice(0, 400)}\nActions: ${(actionHistory || []).slice(-5).join('; ')}` }
+          ], { maxTokens: 60, temperature: 0, responseTimeoutMs: 5000 });
+          _reason = (reasonRaw || '').trim().slice(0, 120) || 'goal-not-visible-in-ocr';
+        } catch (_) { _reason = 'goal-not-visible-in-ocr'; }
+      }
+      logger.info(`[browser.agent] _ocrVerifyGoal: ${num} reason="${_reason}" for goal="${String(goal || '').slice(0, 60)}"`);
+      return { num, reason: _reason };
     }
     logger.info(`[browser.agent] _ocrVerifyGoal: invalid "${raw}" → defaulting to 0`);
-    return 0;
+    return { num: 0, reason: 'invalid-llm-response' };
   } catch (e) {
     logger.warn(`[browser.agent] _ocrVerifyGoal failed: ${e.message}`);
-    return 0;
+    return { num: 0, reason: 'llm-error' };
+  }
+}
+
+// ── OCR goal verification wrapper ──────────────────────────────────
+// Called at the end of browser.agent run before returning ok:true.
+// Captures OCR text from the page and verifies the goal was achieved.
+// Returns: { verified: bool, reason: string, ocrText?: string }
+// DOM-state + network verification for modal/overlay goals.
+// Checks: (1) submit button was clicked, (2) POST/PUT CRUD call with 2xx in netLog,
+// (3) dialog/overlay closed, (4) no error toast after close.
+// Returns { verified: true/false, reason: string }
+async function _verifyGoalViaDomState(goal, sessionId, actionHistory, tabMapResult) {
+  // 1. Check if the last action was a click on a submit/save/send button
+  const _lastActions = actionHistory.slice(-3);
+  const _hasSubmitClick = _lastActions.some(a => /Click "(Save|Send|Submit|Create|Done|Confirm|OK|Post|Publish)"/i.test(a));
+  if (!_hasSubmitClick) return { verified: false, reason: 'no-submit-click' };
+
+  // 2. Check netLog for POST/PUT with 2xx status (API call triggered by the click)
+  let _netOk = false;
+  let _netInfo = null;
+  try {
+    const _entries = browserEngine?.getNetLog(sessionId) || [];
+    const _crudEntries = _entries.filter(e => /^(POST|PUT|PATCH|DELETE)$/.test(e.method));
+    if (_crudEntries.length > 0) {
+      const _successEntries = _crudEntries.filter(e => e.status >= 200 && e.status < 300);
+      if (_successEntries.length > 0) {
+        _netOk = true;
+        _netInfo = `${_successEntries[0].method} ${_successEntries[0].status} ${_successEntries[0].url.slice(0, 80)}`;
+      } else {
+        // CRUD call happened but failed (4xx/5xx) — include response body for context
+        const _failed = _crudEntries[0];
+        let _errDetail = '';
+        if (_failed.responseBody) {
+          try {
+            const _parsed = JSON.parse(_failed.responseBody);
+            _errDetail = _parsed?.error?.message || _parsed?.error || _parsed?.message || _failed.responseBody.slice(0, 200);
+          } catch (_) {
+            _errDetail = _failed.responseBody.slice(0, 200);
+          }
+        }
+        return { verified: false, reason: `API ${_failed.method} ${_failed.status}: ${_errDetail || 'no error body'}` };
+      }
+    }
+  } catch (_) {}
+
+  // 3. Check if dialog/overlay is now closed + no error toast
+  let _state = null;
+  try {
+    const _overlayCheck = await callBrowserAct({
+      action: 'evaluate', sessionId, timeoutMs: 3000,
+      text: `(() => {
+        const dialog = document.querySelector('[role="dialog"], [role="alertdialog"], [aria-modal="true"]');
+        const alert = document.querySelector('[role="alert"], .toast-error, .error-message');
+        const alertText = alert ? (alert.textContent || '').toLowerCase() : '';
+        const hasError = /error|failed|could not|unable|invalid/.test(alertText);
+        return { dialogOpen: !!dialog, hasErrorAlert: hasError, alertText: alertText.slice(0, 100) };
+      })()`
+    }, 5000);
+    if (_overlayCheck?.ok) _state = _overlayCheck.result;
+  } catch (_) {}
+
+  if (!_state) return { verified: false, reason: 'overlay-check-failed' };
+
+  // 4. Dialog closed + no error → success
+  if (!_state.dialogOpen) {
+    if (_state.hasErrorAlert) {
+      return { verified: false, reason: `error-after-save: "${_state.alertText}"` };
+    }
+    const _netNote = _netOk ? ` + API ${_netInfo}` : ' (no API call captured)';
+    logger.info(`[browser.agent] _verifyGoalViaDomState: verified — dialog closed, no error${_netNote}`);
+    return { verified: true, reason: `dialog-closed-no-error${_netNote}` };
+  }
+
+  return { verified: false, reason: 'dialog-still-open-after-submit' };
+}
+
+async function _verifyGoalWithOcr(goal, sessionId, actionHistory) {
+  try {
+    const _ocrPage = browserEngine && typeof browserEngine.getPage === 'function'
+      ? browserEngine.getPage(sessionId) : null;
+    if (!_ocrPage) return { verified: true, reason: 'no-page-available' };
+    const _cap = await _liteparseCapture(_ocrPage);
+    if (!_cap?.ok || !_cap.fullText) return { verified: true, reason: 'ocr-unavailable' };
+    const _ocrText = _cap.fullText.slice(0, 800);
+    const _ocrResult = await _ocrVerifyGoal(_ocrText, goal, actionHistory);
+    const _num = _ocrResult.num;
+    const _reason = _ocrResult.reason || 'ocr-failed';
+    if (_num === 1) return { verified: true, reason: 'ocr-confirmed', ocrText: _ocrText.slice(0, 200) };
+    if (_num === 2) return { verified: false, reason: 'ocr-loading', wait: true, ocrText: _ocrText.slice(0, 200) };
+    return { verified: false, reason: _reason, ocrText: _ocrText.slice(0, 200) };
+  } catch (e) {
+    return { verified: true, reason: 'ocr-error', error: e.message };
   }
 }
 
@@ -1754,6 +1890,16 @@ Return ONLY a single number — nothing else:
 3 = ready (page is ready for interaction — form open, content loaded, no errors)
 4 = unexpected (modal, redirect, login wall, unexpected dialog that blocks the goal)
 
+COUNT QUESTION RULE (OVERRIDES ALL OTHER RULES): If the goal asks "how many", "count", "tell me how many", or "number of":
+- Do NOT check whether the search query, filter text, or named items are visible in the OCR — OCR often truncates filter text.
+- The ONLY thing that matters is a pagination, summary, or total count label in the OCR text.
+- Valid count labels include: "1-50 of many", "1-50 of 127", "Showing 1-50 of many", "X of N", "N items", "N matches", "No results", "Zero items", "About N results".
+- "1-50 of many" IS a valid count label — return 1 (done). "many" means the total is large but the count label IS visible.
+- If ANY count/pagination/total label is visible, return 1 (done) immediately.
+- If "No results" or "Zero items" is visible, return 1 (done) — the count (0) is visible.
+- If NO count/pagination/total label is visible, return 3 (ready) — the page may need to scroll or wait.
+- Do NOT return 1 (done) just because some rows/items are visible — the total count label must be visible.
+
 Rules:
 - 0 (error): OCR text shows error messages, validation failures
 - 1 (done): OCR text shows the expected result of the goal (e.g., created content is visible)
@@ -1761,6 +1907,9 @@ Rules:
 - 3 (ready): OCR text shows normal page content, ready for the next action
 - 4 (unexpected): OCR text shows something blocking (login wall, unexpected modal, redirect to wrong page)
 - When in doubt, return 3 (proceed with tier selection)
+
+NAMED ITEM RULE: If the goal specifies a name, title, or list of items (e.g., "called X", "titled X", "named X", "with three items: A, B, C"), the EXACT name/items MUST appear in the OCR text for the goal to be "done" (1). A blank/empty/placeholder title (e.g., "Untitled", "New page") is NOT done. If the named items are not in the OCR text, return 3 (ready) or 0 (fail), NOT 1 (done). NOTE: This rule does NOT apply to count questions — count questions are governed by the COUNT QUESTION RULE above.
+
 Return ONLY the number.`;
 
   const userPrompt = `Goal: ${goal}
@@ -2065,7 +2214,7 @@ Search text?`;
 // LLM sees a numbered list of natural-language descriptions (no key combos),
 // returns just a number. Number maps to index in shortcuts array for the
 // actual key combo. Returns key combo string or null.
-async function _extractShortcut(goal, actionHistory, hostname, agentContext) {
+async function _extractShortcut(goal, actionHistory, hostname, agentContext, currentUrl, overlayActive, focusedElement) {
   const { askWithMessages } = require('../skill-helpers/skill-llm.cjs');
   const { loadAppKnowledge } = require('./lib/appKnowledge.cjs');
 
@@ -2088,18 +2237,40 @@ async function _extractShortcut(goal, actionHistory, hostname, agentContext) {
     return `${i + 1}. ${action}`;
   }).join('\n');
 
+  // Build context from URL, overlay state, and focused element
+  const _viewHint = currentUrl.includes('/month/') ? 'Current view: MONTH (n/j jumps months, not days — do NOT use n/j for "go to tomorrow")'
+    : currentUrl.includes('/week/') ? 'Current view: WEEK.'
+    : currentUrl.includes('/day/') ? 'Current view: DAY.'
+    : '';
+  const _overlayHint = overlayActive
+    ? 'A dialog/overlay is ALREADY OPEN. Do NOT pick shortcuts that open dialogs (create, edit, search dialogs). Return 0 if no shortcut applies to the open dialog.'
+    : 'No dialog is open.';
+  const _focusHint = focusedElement
+    ? `Focused element: "${focusedElement.text || focusedElement.tag || 'unknown'}" (${focusedElement.tag || 'unknown'}, role=${focusedElement.role || 'none'}).`
+    : 'No element is focused.';
+
   const systemPrompt = `You pick the best keyboard shortcut to press for the current goal.
-Look at the goal, what's been done, and the available shortcuts.
+Look at the goal, what's been done, the available shortcuts, and the current page context.
 Return ONLY a number — nothing else.
-- Pick the shortcut that directly accomplishes the next sub-goal
+- Pick the shortcut that directly accomplishes the NEXT sub-goal (not the entire goal)
 - Do NOT pick shortcuts for actions already done (see action history)
-- If no shortcut matches the goal → return 0`;
+- If no shortcut matches the goal → return 0
+- If a dialog is already open, do NOT pick shortcuts that open dialogs
+- If the view is MONTH, "next period" shortcuts jump months, not days
+
+PRIORITY RULE for create/add/schedule goals:
+- If the goal says "create", "add", or "schedule" something → pick the CREATE shortcut (e.g., "create a new event", "open the create dialog for a timed event")
+- Prefer the GENERIC create shortcut (e.g., "c — create a new event") over specialized ones like "Shift+c — timed event" or "q — all-day event" unless the goal explicitly asks for a timed/all-day/appointment-schedule event
+- Do NOT pick navigation shortcuts (go to today, next period) for create goals — the date can be set inside the create dialog
+- "Navigate to tomorrow" in a create goal means "set the date to tomorrow in the form", NOT "press n to jump to next month"`;
 
   const historyStr = actionHistory.slice(-5).map((a, i) => `  ${i + 1}. ${a}`).join('\n');
 
   const userPrompt = `Goal: ${goal}
 Actions taken:
 ${historyStr}
+
+Page context: ${_overlayHint} ${_focusHint} ${_viewHint}
 
 Available app shortcuts:
 ${shortcutList}
@@ -2202,7 +2373,7 @@ function _regexExtractSteps(raw, goal, tabMap) {
 // Caller executes steps in order; on page change, re-extract for new page.
 // If null or <=1 step, caller falls back to per-step _llmNextAction (browse-and-report).
 // 3-layer fallback: (1) planning model, (2) complex model with sharper prompt, (3) regex.
-async function _extractSteps(goal, currentUrl, tabMap, pageCategory, agentContext) {
+async function _extractSteps(goal, currentUrl, tabMap, pageCategory, agentContext, overlayActive = false, actionHistory = []) {
   const { askWithMessages } = require('../skill-helpers/skill-llm.cjs');
 
   const _contextBlock = agentContext
@@ -2288,11 +2459,27 @@ TITLE FIELD GUARD (canvas editors like Notion, Google Docs):
 - Title fields are identifiable by aria-roledescription containing "title" or placeholder containing "Untitled"/"New page".
 - Do NOT generate Type steps with block commands (e.g. /todo, /heading, /bullet) targeting title fields. Title fields are for the page name only.
 - If a step would type a command into a title field, add a press Enter step first to move focus to the body, then type the command into the body.
-- Example: goal "create page called X and add a todo list" → [{ "action": "type", "target": "title", "value": "X" }, { "action": "press", "key": "Enter" }, { "action": "type", "target": "body", "value": "/todo\\nItem 1" }].`;
+- Example: goal "create page called X and add a todo list" → [{ "action": "type", "target": "title", "value": "X" }, { "action": "press", "key": "Enter" }, { "action": "type", "target": "body", "value": "/todo\\nItem 1" }].
+
+OVERLAY/DIALOG STATE RULES (critical — check the Overlay/dialog state in the user prompt):
+- If the Overlay/dialog is OPEN, do NOT generate "navigate" steps — the dialog is already open; fill its fields or click its buttons instead. Navigating will close the dialog and destroy progress.
+- If the Overlay/dialog is OPEN, do NOT generate steps to open it again (e.g., "Click Create", "Click Event", "Click New", "Click +"). The dialog is already open.
+- If the Overlay/dialog is OPEN, the form fields in the available elements list are the relevant ones — plan to fill them and then click the submit/save button.
+- If the Overlay/dialog is CLOSED and the goal requires creating something, you may need to click a "Create" button or use a shortcut to open the dialog first.
+- Use the Actions already taken to determine what's been done. Do NOT repeat actions already taken (e.g., if a shortcut was pressed to open the create dialog, don't plan to open it again).
+- If a "navigate" step would go to the same or a parent of the current URL, skip it — it's redundant.`;
+
+  const _overlayStr = overlayActive ? 'OPEN' : 'CLOSED';
+  const _historyStr = (actionHistory && actionHistory.length > 0)
+    ? actionHistory.slice(-10).map((a, i) => `  ${i + 1}. ${a}`).join('\n')
+    : '  (none)';
 
   const userPrompt = `Goal: ${goal}
 Current URL: ${currentUrl}
-Page category: ${pageCategory || 'unknown'}${_contextBlock}
+Page category: ${pageCategory || 'unknown'}
+Overlay/dialog: ${_overlayStr}
+Actions already taken:
+${_historyStr}${_contextBlock}
 
 Available elements on this page:
 ${elementList}
@@ -2565,16 +2752,29 @@ ${elementList}
 
 What is the next action?`;
 
-  try {
-    const raw = await askWithMessages([
-      { role: 'system', content: systemPrompt },
-      { role: 'user', content: userPrompt },
-    ], { maxTokens: 100, temperature: 0.1, responseTimeoutMs: 15000 });
-    return (raw || '').trim().replace(/^```(?:text|plaintext)?\s*\n?/i, '').replace(/\n?```\s*$/, '').trim();
-  } catch (e) {
-    logger.warn(`[browser.agent] _llmNextAction failed: ${e.message}`);
-    return null;
+  // Retry on transient LLM provider failures (e.g. "All LLM providers failed").
+  // 3 attempts total: initial + 2 retries with 500ms / 1500ms backoff.
+  const _MAX_ATTEMPTS = 3;
+  const _BACKOFF_MS = [0, 500, 1500];
+  for (let _attempt = 0; _attempt < _MAX_ATTEMPTS; _attempt++) {
+    if (_BACKOFF_MS[_attempt] > 0) {
+      logger.info(`[browser.agent] _llmNextAction: retrying after ${_BACKOFF_MS[_attempt]}ms (attempt ${_attempt + 1}/${_MAX_ATTEMPTS})`);
+      await new Promise(r => setTimeout(r, _BACKOFF_MS[_attempt]));
+    }
+    try {
+      const raw = await askWithMessages([
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: userPrompt },
+      ], { maxTokens: 100, temperature: 0.1, responseTimeoutMs: 15000 });
+      const _clean = (raw || '').trim().replace(/^```(?:text|plaintext)?\s*\n?/i, '').replace(/\n?```\s*$/, '').trim();
+      if (_clean) return _clean;
+      logger.warn(`[browser.agent] _llmNextAction: empty response on attempt ${_attempt + 1}/${_MAX_ATTEMPTS}`);
+    } catch (e) {
+      logger.warn(`[browser.agent] _llmNextAction failed (attempt ${_attempt + 1}/${_MAX_ATTEMPTS}): ${e.message}`);
+    }
   }
+  logger.warn(`[browser.agent] _llmNextAction: all ${_MAX_ATTEMPTS} attempts failed — returning null`);
+  return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -2651,19 +2851,29 @@ const KNOWN_BROWSER_SERVICES = {
                    intentUrls: {
                      mail: 'https://mail.google.com/mail/u/0/#inbox?compose=new',
                      search: { buildUrl: (task, ctx) => `https://mail.google.com/mail/u/0/#search/${ctx.encodedQuery}` },
+                     contacts: 'https://contacts.google.com',
                    } },
   google:         { startUrl: 'https://accounts.google.com',                     signInUrl: 'https://accounts.google.com',                       authSuccessPattern: 'myaccount.google.com',         isOAuth: true,
                    intentUrls: { search: { buildUrl: (task, ctx) => `https://www.google.com/search?q=${ctx.encodedQuery}` } } },
   googledocs:     { startUrl: 'https://docs.google.com',                         signInUrl: 'https://accounts.google.com/signin/v2/identifier',  authSuccessPattern: 'docs.google.com/document',     isOAuth: true, hostAliases: ['docs.google.com'],
-                   intentUrls: { content_create: 'https://docs.google.com/document/create' } },
+                   intentUrls: {
+                     content_create: 'https://docs.google.com/document/create',
+                     open_existing: { buildUrl: (task, ctx) => `https://docs.google.com/document/u/0/?q=${ctx.encodedQuery}` },
+                   } },
   googlesheets:   { startUrl: 'https://sheets.google.com',                       signInUrl: 'https://accounts.google.com/signin/v2/identifier',  authSuccessPattern: 'docs.google.com/spreadsheets', isOAuth: true, hostAliases: ['sheets.google.com', 'docs.google.com'],
-                   intentUrls: { content_create: 'https://docs.google.com/spreadsheets/create' } },
+                   intentUrls: {
+                     content_create: 'https://docs.google.com/spreadsheets/create',
+                     open_existing: { buildUrl: (task, ctx) => `https://docs.google.com/spreadsheets/u/0/?q=${ctx.encodedQuery}` },
+                   } },
   googlecalendar: { startUrl: 'https://calendar.google.com',                     signInUrl: 'https://accounts.google.com/signin/v2/identifier',  authSuccessPattern: 'calendar.google.com',          isOAuth: true, hostAliases: ['calendar.google.com'],
                    intentUrls: { scheduling: 'https://calendar.google.com/calendar/u/0/r' } },
   slack:          { startUrl: 'https://app.slack.com',                           signInUrl: 'https://slack.com/signin',                          authSuccessPattern: 'app.slack.com/client',         isOAuth: true  },
   discord:        { startUrl: 'https://discord.com/channels/@me',                signInUrl: 'https://discord.com/login',                         authSuccessPattern: 'discord.com/channels',         isOAuth: true  },
   notion:         { startUrl: 'https://app.notion.com',                           signInUrl: 'https://www.notion.com/login',                       authSuccessPattern: 'app.notion.com',                    isOAuth: true, preferAgentBrowser: true, postAuthUrl: 'https://app.notion.com', usePersistentProfile: true, hostAliases: ['www.notion.so', 'www.notion.com', 'notion.so', 'notion.com', 'notion.new'], _metaRevision: 2,
-                   intentUrls: { content_create: 'https://notion.new' }  },
+                   intentUrls: {
+                     content_create: 'https://notion.new',
+                     open_existing: { buildUrl: (task, ctx) => `https://app.notion.com/search?q=${ctx.encodedQuery}` },
+                   } },
   figma:          { startUrl: 'https://www.figma.com',                           signInUrl: 'https://www.figma.com/login',                       authSuccessPattern: 'figma.com/files',              isOAuth: true  },
   linear:         { startUrl: 'https://linear.app',                              signInUrl: 'https://linear.app/login',                          authSuccessPattern: 'linear.app/',                  isOAuth: true  },
   jira:           { startUrl: 'https://id.atlassian.com',                        signInUrl: 'https://id.atlassian.com',                          authSuccessPattern: 'atlassian.net',                isOAuth: true  },
@@ -2672,11 +2882,11 @@ const KNOWN_BROWSER_SERVICES = {
   hubspot:        { startUrl: 'https://app.hubspot.com',                         signInUrl: 'https://app.hubspot.com/login',                     authSuccessPattern: 'app.hubspot.com/',             isOAuth: true  },
   salesforce:     { startUrl: 'https://login.salesforce.com',                    signInUrl: 'https://login.salesforce.com',                      authSuccessPattern: 'lightning.force.com',          isOAuth: true  },
   twitter:        { startUrl: 'https://twitter.com',                             signInUrl: 'https://twitter.com/i/flow/login',                  authSuccessPattern: 'twitter.com/home',             isOAuth: true, hostAliases: ['x.com'],
-                   intentUrls: { social: 'https://x.com/compose/post', content_create: 'https://x.com/compose/post' } },
+                   intentUrls: { social: 'https://x.com/compose/post', content_create: 'https://x.com/compose/post', notifications: 'https://x.com/notifications' } },
   facebook:       { startUrl: 'https://www.facebook.com',                        signInUrl: 'https://www.facebook.com/login',                    authSuccessPattern: 'facebook.com/',                isOAuth: true  },
   instagram:      { startUrl: 'https://www.instagram.com',                       signInUrl: 'https://www.instagram.com/accounts/login',          authSuccessPattern: 'instagram.com/',               isOAuth: true  },
   linkedin:       { startUrl: 'https://www.linkedin.com',                        signInUrl: 'https://www.linkedin.com/login',                    authSuccessPattern: 'linkedin.com/feed',            isOAuth: true,
-                   intentUrls: { social: 'https://www.linkedin.com/feed/?shareActive=true', content_create: 'https://www.linkedin.com/post/new' } },
+                   intentUrls: { social: 'https://www.linkedin.com/feed/?shareActive=true', content_create: 'https://www.linkedin.com/post/new', notifications: 'https://www.linkedin.com/notifications/', contacts: 'https://www.linkedin.com/mynetwork/contacts/' } },
   // ── Email ───────────────────────────────────────────────────────────────────────────────────────────
   outlook:        { startUrl: 'https://outlook.live.com',                        signInUrl: 'https://login.live.com',                            authSuccessPattern: 'outlook.live.com/mail',        isOAuth: true,
                    intentUrls: { mail: 'https://outlook.live.com/mail/0/deeplink/compose' } },
@@ -5304,7 +5514,7 @@ function _isMutationIntent(intent) {
 const _MUTATION_VERBS = {
   [INTENTS.MAIL]:           /\b(send|compose|write|draft|forward|reply|new email|new message|email to|newsletter)\b/i,
   [INTENTS.SOCIAL]:         /\b(post|tweet|retweet|share|comment|like|follow|message|dm|reply|respond)\b/i,
-  [INTENTS.CONTENT_CREATE]: /\b(create|new|upload|publish|write|edit|update|delete|remove|add|submit|post)\b/i,
+  [INTENTS.CONTENT_CREATE]: /\b(create|new|upload|publish|write|delete|remove|add|submit|post)\b/i,
   [INTENTS.SCHEDULING]:     /\b(book|schedule|add event|create event|cancel|reschedule|invite|set up)\b/i,
   [INTENTS.COMMERCE]:       /\b(add to cart|checkout|buy|purchase|order|place order|pay for)\b/i,
 };
@@ -5740,7 +5950,14 @@ async function _resolveTaskDeepLink(agentId, serviceKey, baseStartUrl, task, exi
       const _sq = await _extractSearchQuery(taskText, svcKey);
       if (_sq.hasCriteria) return encodeURIComponent(_sq.query);
       const qMatch = taskText.match(/\b(?:search|find|look\s*up|google)\s+(?:for\s+)?(.+?)$/i);
-      return qMatch?.[1] ? encodeURIComponent(String(qMatch[1]).trim().replace(/[?.!]+$/g, '')) : '';
+      if (qMatch?.[1]) return encodeURIComponent(String(qMatch[1]).trim().replace(/[?.!]+$/g, ''));
+      // "open existing" patterns: "titled X", "called X", "named X", "entitled X",
+      // "document/doc/page/sheet/note X", "for X" in open/find/edit context
+      const _titleMatch = taskText.match(/\b(?:titled|called|named|entitled)\s+["']?([^"'.]+?)["']?(?:\s+and\s+|$)/i);
+      if (_titleMatch?.[1]) return encodeURIComponent(_titleMatch[1].trim().replace(/[?.!]+$/g, ''));
+      const _forMatch = taskText.match(/\b(?:open|find|edit|view|navigate\s+to)\s+(?:the\s+)?(?:edit\s+panel\s+(?:in|for)\s+)?(?:google\s+doc(?:ument)?|doc(?:ument)?|page|sheet|spreadsheet|note|file)\s+(?:for\s+)?["']?([^"'.]+?)["']?(?:\s+and\s+|$)/i);
+      if (_forMatch?.[1]) return encodeURIComponent(_forMatch[1].trim().replace(/[?.!]+$/g, ''));
+      return '';
     };
 
     // ── Helper: resolve an intentUrls template entry to a URL (or null) ────
@@ -5792,6 +6009,20 @@ async function _resolveTaskDeepLink(agentId, serviceKey, baseStartUrl, task, exi
         return null;
       }
 
+      // 3b. OPEN_EXISTING — use per-service open_existing URL if available (optimization).
+      // Otherwise return null → fall through to discovery pipeline (authenticated eval,
+      // web.agent, web.crawl) which uses SEARCH patterns to find search links on ANY site.
+      // Fallback: use the service's start URL (landing page) — NOT the create URL.
+      if (intent === INTENTS.OPEN_EXISTING) {
+        if (svcEntry?.intentUrls?.open_existing) {
+          const _ctx = { task, encodedQuery: await _getEncodedQuery(task, svc), dest: null };
+          const _result = _resolveIntentTemplate(svcEntry.intentUrls.open_existing, task, _ctx);
+          if (_result) return _result;
+        }
+        // No per-service open_existing URL → let discovery pipeline find a search link
+        return null;
+      }
+
       // 4. Per-service intentUrls lookup
       if (svcEntry?.intentUrls) {
         const _ctx = { task, encodedQuery: await _getEncodedQuery(task, svc), dest: null };
@@ -5799,12 +6030,14 @@ async function _resolveTaskDeepLink(agentId, serviceKey, baseStartUrl, task, exi
         if (_result) return _result;
       }
 
-      // 5. Generic path-based intents (settings, support, dashboard, console)
+      // 5. Generic path-based intents (settings, support, dashboard, console, notifications, contacts)
       const _GENERIC_PATH_INTENTS = {
-        [INTENTS.SETTINGS]: '/settings',
-        [INTENTS.SUPPORT]: '/help',
-        [INTENTS.DASHBOARD]: '/dashboard',
-        [INTENTS.CONSOLE]: '/console',
+        [INTENTS.SETTINGS]:      '/settings',
+        [INTENTS.SUPPORT]:       '/help',
+        [INTENTS.DASHBOARD]:     '/dashboard',
+        [INTENTS.CONSOLE]:       '/console',
+        [INTENTS.NOTIFICATIONS]: '/notifications',
+        [INTENTS.CONTACTS]:      '/contacts',
       };
       if (_GENERIC_PATH_INTENTS[intent]) {
         return `${startUrlBase}${_GENERIC_PATH_INTENTS[intent]}`;
@@ -5859,6 +6092,7 @@ async function _resolveTaskDeepLink(agentId, serviceKey, baseStartUrl, task, exi
         if (Array.isArray(evalLinks) && evalLinks.length > 0) {
           const _INTENT_EVAL_PATTERNS = {
             [INTENTS.CONTENT_CREATE]: /\/(new|create|compose|upload|publish|submit|add|draft|editor|write)/i,
+            [INTENTS.OPEN_EXISTING]:  /\/(search|find|browse|explore|discover|docs|document|page|file|recent|home)/i,
             [INTENTS.SOCIAL]:         /\/(compose|post|share|submit|tweet|message|comment|reply|feed)/i,
             [INTENTS.MAIL]:           /\/(compose|draft|new|mail)/i,
             [INTENTS.SETTINGS]:       /\/(settings|account|preferences|profile|billing|subscription|security|privacy)/i,
@@ -5873,6 +6107,8 @@ async function _resolveTaskDeepLink(agentId, serviceKey, baseStartUrl, task, exi
             [INTENTS.DOWNLOAD]:       /\/(download|export|save|archive)/i,
             [INTENTS.COMMERCE]:       /\/(cart|checkout|order|product|buy|shop|store|wishlist)/i,
             [INTENTS.MEDIA_PLAY]:     /\/(watch|listen|player|now-playing|queue|album|track|playlist|episode|stream)/i,
+            [INTENTS.NOTIFICATIONS]:  /\/(notifications?|alerts?|activity)/i,
+            [INTENTS.CONTACTS]:       /\/(contacts?|people|addressbook|address-book)/i,
           };
           const _evalPattern = _INTENT_EVAL_PATTERNS[intent];
           if (_evalPattern) {
@@ -6962,13 +7198,16 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
                /EINVAL.*\.sock/i.test(errStr);
       };
 
-      // UI-driven "Sign in" card (manualLogin) is an explicit auth request: skip the
-      // lazy auth-check probe and open the sign-in URL directly, then waitForAuth.
-      // Without this, the probe navigates to startUrl, the page is not a login wall,
-      // and the function returns ok: true while the user is still unauthenticated.
+      // UI-driven "Sign in" card (manualLogin) is an explicit auth request.
+      // Set _authNeeded=true so waitForAuth is always called regardless of probe
+      // result, but DON'T skip navigation — let the probe navigate to startUrl
+      // first. For Google services, navigating to startUrl (e.g. calendar.google.com)
+      // triggers Google's redirect to accounts.google.com/signin?continue=<startUrl>,
+      // which preserves the continue parameter so Google redirects back to the
+      // service after sign-in. waitForAuth then detects the browser is already on
+      // the auth host and skips re-navigation, preserving the continue param.
       if (_authOnly && manualLogin === true && !_silentPreflightProbe) {
         _authNeeded = true;
-        _skipNavigate = true;
       }
 
       // ── URL-first: resolve caller-provided URL before auth probe ──────────
@@ -6998,6 +7237,22 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
         if (_isChromeSessionConflict(_probeNav)) {
           logger.error(`[browser.agent] run: Chrome session conflict detected for ${agentId} — aborting (no retry)`);
           return { ok: false, agentId, task, error: 'Browser session conflict: Chrome is already running with this profile. Close existing Chrome windows for this agent or restart the app.' };
+        }
+
+        // ── SPA settle wait — give heavy SPAs time to render before auth check ──
+        // domcontentloaded fires before Gmail/Notion/etc. render the inbox/app.
+        // Without this wait, the LLM auth check sees an empty body and falsely
+        // reports "auth required" even when auth cookies are present.
+        // Wait for networkidle (preferred) or fall back to a 3s settle delay.
+        if (_probeNav?.ok !== false) {
+          try {
+            const _settlePage = browserEngine && typeof browserEngine.getPage === 'function' ? browserEngine.getPage(sessionId) : null;
+            if (_settlePage && typeof _settlePage.waitForLoadState === 'function') {
+              await _settlePage.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {});
+            } else {
+              await new Promise(r => setTimeout(r, 3000));
+            }
+          } catch (_) { /* non-fatal — proceed with eval */ }
         }
 
         if (_probeNav?.ok !== false) {
@@ -7095,7 +7350,7 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
             if (_pageInfoRes?.ok !== false) {
               const _pageText = `${_pageInfo.title || ''} ${_pageInfo.body || ''}`.toLowerCase();
               const _PARKING_RE = /\bdomain\s+(for\s+sale|is\s+for\s+sale|available\s+for\s+sale)\b|\bbuy\s+this\s+domain\b|\bmake\s+an?\s+offer\b|\bparked\s+(by|domain|page)\b|\binquire\s+about\s+this\s+domain\b|\bthis\s+domain\s+(may\s+be|is)\s+(for\s+sale|available)\b/;
-              if (_PARKING_RE.test(_pageText) || (Number(_pageInfo.links) < 10 && /for\s+sale|buy|offer|domain/i.test(_pageText))) {
+              if (_PARKING_RE.test(_pageText) || (Number(_pageInfo.links) < 10 && /for\s+sale|buy\s+this\s+domain|make\s+an?\s+offer|parked\s+domain/i.test(_pageText))) {
                 _isParkingPage = true;
                 logger.warn(`[browser.agent] run: parking/squatter content detected on ${_curHost} for ${agentId}`);
               }
@@ -7129,7 +7384,7 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
                 if (_authIndicators.test(_pageText)) {
                   logger.info(`[browser.agent] Auth indicators found in page content, confirming with LLM...`);
                   const _llmDetected = await _detectAuthViaLLM(_pageInfo.title || '', _pageInfo.body || '', agentId);
-                  if (_llmDetected) {
+                  if (_llmDetected === 1) {
                     _onLoginPage = true;
                     logger.info(`[browser.agent] LLM confirmed auth required — treating as login page`);
                   }
@@ -7277,19 +7532,19 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
             logger.warn(`[browser.agent] run: parking content check failed (non-fatal): ${_pageErr.message}`);
           }
 
-          // ── PRIMARY: CDP cookie sniff (ground truth) ──────────────────────────
-          // Cookies are the authoritative signal for "is the user logged in?".
-          // DOM heuristics (hasSignInButton, titleIsLogin, hasUserGlobal, authSuccessPattern)
-          // are fallible — e.g. Spotify's landing page exposes a guest __INITIAL_STATE__.user
-          // and has no "login" in the URL, but shows "Log in" buttons and has no session cookies.
-          // Run the cookie sniff FIRST; only fall back to DOM heuristics if CDP is unavailable.
+          // ── PRIMARY: LLM-based auth detection (semantic, observation-based) ──────
+          // Cookies and DOM regex are hints, not ground truth. NID (Google tracking
+          // cookie) is HttpOnly but doesn't mean logged-in. "Sign in" button regex
+          // doesn't match "Sign in" with a space. The LLM reads the page content
+          // and semantically determines: "Is this a login/marketing page, or the
+          // authenticated app?" This is the authoritative signal.
+          // Cookie sniff is used as a fast-path hint — if no cookies AND LLM says
+          // authed, that's fine (SPA with JS-only sessions). If cookies present but
+          // LLM says auth required, the cookies are stale/tracking (e.g. NID).
           let _cookieAuthed = null; // null = unknown (CDP unavailable), true/false = result
           try {
             const _csPage = browserEngine && typeof browserEngine.getPage === 'function' ? browserEngine.getPage(sessionId) : null;
             let _csDomain = '';
-            // Use the actual current page URL (after redirect) for cookie domain —
-            // startUrl may be a redirect URL (e.g. notion.new → app.notion.com) whose
-            // auth cookies are on the destination domain, not the original.
             try {
               const _hrefForDomain = _curHref && _curHref.match(/^https?:\/\//) ? _curHref : startUrl;
               _csDomain = new URL(_hrefForDomain).hostname.replace(/^www\./, '');
@@ -7299,43 +7554,55 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
               if (_csResult.ok) {
                 _cookieAuthed = _csResult.authed;
                 if (_cookieAuthed) {
-                  logger.info(`[browser.agent] run: auth-check: CDP auth cookies detected (${_csResult.cookies.join(',')}) — authenticated for ${agentId}`);
+                  logger.info(`[browser.agent] run: auth-check: cookie hint: auth cookies present (${_csResult.cookies.join(',')}) — confirming with LLM for ${agentId}`);
                 } else {
-                  logger.info(`[browser.agent] run: auth-check: no auth cookies found (${_csResult.reason}) — auth needed for ${agentId}`);
+                  logger.info(`[browser.agent] run: auth-check: cookie hint: no auth cookies (${_csResult.reason}) — checking with LLM for ${agentId}`);
                 }
-              } else {
-                logger.info(`[browser.agent] run: auth-check: CDP unavailable (${_csResult.reason}) — falling back to DOM heuristics for ${agentId}`);
               }
             }
           } catch (_csErr) {
             logger.debug(`[browser.agent] run: auth-check: cookie sniff failed (non-fatal): ${_csErr.message}`);
           }
 
-          if (_cookieAuthed === true) {
-            // DOM cross-check: if the page shows a sign-in button AND no user global,
-            // the HttpOnly cookies may be an anonymous session (Django sessionid, load
-            // balancer sticky cookie) rather than a real auth session. Don't override
-            // DOM signals — fall through to the DOM heuristic decision tree below.
-            if (_pageInfo.hasSignInButton && !_pageInfo.hasUserGlobal) {
-              logger.info(`[browser.agent] run: auth-check: HttpOnly cookies found but sign-in button visible (no user global) — deferring to DOM heuristics for ${agentId}`);
-              // Don't set _cookieAuthed override; fall through to DOM decision tree
-            } else {
-              // Ground truth: auth cookies present — skip waitForAuth regardless of DOM signals.
-              _pageMetaAuthed = true;
-              _onLoginPage = false;
-              _pageMetaLoginWall = false;
-              _setCachedAuthCheck(agentId, false);
-            }
-          } else if (_cookieAuthed === false) {
-            // Ground truth: no auth cookies — auth needed, regardless of what DOM heuristics say.
+          // ── LLM auth detection (authoritative) ──────────────────────────────
+          // Returns 0 = authenticated, 1 = auth required. Uses page title + body text.
+          // This catches marketing pages (workspace.google.com), login walls, and
+          // sign-in buttons that regex/cookie heuristics miss.
+          logger.info(`[browser.agent] run: auth-check: LLM input — title="${(_pageInfo.title || '').slice(0, 100)}" bodyLen=${(_pageInfo.body || '').length} body="${(_pageInfo.body || '').slice(0, 200)}" for ${agentId}`);
+          const _llmAuthResult = await _detectAuthViaLLM(_pageInfo.title || '', _pageInfo.body || '', agentId);
+
+          if (_llmAuthResult === 0) {
+            // LLM says authenticated — skip waitForAuth regardless of cookie/regex signals
+            logger.info(`[browser.agent] run: auth-check: LLM says authenticated — skipping waitForAuth for ${agentId}`);
+            _pageMetaAuthed = true;
+            _onLoginPage = false;
+            _pageMetaLoginWall = false;
+            _setCachedAuthCheck(agentId, false);
+          } else {
+            // LLM says auth required (1) — auth needed, regardless of cookie hints
+            logger.info(`[browser.agent] run: auth-check: LLM says auth required — calling waitForAuth for ${agentId}`);
             _authNeeded = true;
-          } else
-          // ── FALLBACK: DOM heuristic decision tree (CDP unavailable) ──────────
+          }
+          // Cookie hint is logged but no longer overrides the LLM decision.
+          // DOM heuristic decision tree below is skipped — LLM is authoritative.
+
+          if (!_authNeeded)
+          // ── FALLBACK: DOM heuristic decision tree (only if LLM said authed) ──
+          // This block handles self-heal for parking pages and domain mismatch.
+          // It only runs when the LLM said authenticated (no auth needed).
           {
           // ── Internal web.agent self-heal ───────────────────────────────────────
           // Trigger ONLY for parking/squatter pages — domain mismatch (cross-domain redirect)
           // is treated as an auth redirect and goes to waitForAuth instead.
-          const _needsHeal = _isParkingPage; // domain mismatch alone no longer triggers self-heal — cross-domain redirects are auth redirects, not broken URLs
+          //
+          // AUTH BYPASS: If the LLM confirmed authenticated AND auth cookies are present,
+          // skip the parking self-heal entirely. A real parking/squatter page cannot have
+          // valid session cookies (token_v2, SID, etc.) — the user is logged in, so the
+          // page is a legitimate app page that was falsely flagged by the regex.
+          const _needsHeal = _isParkingPage && !(_pageMetaAuthed && _cookieAuthed === true);
+          if (_isParkingPage && _pageMetaAuthed && _cookieAuthed === true) {
+            logger.info(`[browser.agent] run: parking flag bypassed — LLM confirmed authenticated and auth cookies present for ${agentId} at ${_curHost}`);
+          }
           if (_needsHeal && !_onLoginPage) {
             const _svcName = existing?.service || agentId.replace('.agent', '');
             const _healReason = _isParkingPage ? `parking content on ${_curHost}` : `domain mismatch (expected ${(() => { try { return new URL(startUrl).hostname; } catch(_){return startUrl;} })()}, got ${_curHost})`;
@@ -7392,7 +7659,7 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
                       if (_authIndicatorsRe.test(_healText)) {
                         logger.info(`[browser.agent] self-heal: auth indicators in page content after corrected nav — confirming with LLM for ${agentId}`);
                         const _llmDetected = await _detectAuthViaLLM(_healPageInfo.title || '', _healPageInfo.body || '', agentId);
-                        if (_llmDetected) {
+                        if (_llmDetected === 1) {
                           _healAuthNeeded = true;
                           logger.info(`[browser.agent] self-heal: LLM confirmed auth still required after corrected nav (${_healHref}) — calling waitForAuth`);
                         }
@@ -7915,8 +8182,41 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
             _postEnforcementUrl = startUrl;
           }
         } else {
-          logger.info(`[browser.agent] run: URL-first enforcement — already on canonical URL ${_curUrl} (startUrl=${startUrl}) — skipping re-navigation for ${agentId}`);
-          _postEnforcementUrl = _curUrl;
+          // URL looks canonical — but verify with LLM that this is actually the
+          // authenticated app, not a marketing/landing redirect (e.g. calendar.google.com
+          // redirects to workspace.google.com/products/calendar/ which looks canonical
+          // but is a marketing page, not the app).
+          let _llmSaysAuthRequired = false;
+          try {
+            const _enforcePageRes = await callBrowserAct({
+              action: 'evaluate', sessionId, timeoutMs: 5000,
+              text: `(() => { return JSON.stringify({ title: document.title || '', body: (document.body && document.body.innerText ? document.body.innerText.slice(0, 800) : '') }); })()`
+            }, 8000).catch(() => ({ ok: false }));
+            const _enforcePageData = (typeof _enforcePageRes?.result === 'object' && _enforcePageRes.result !== null)
+              ? _enforcePageRes.result
+              : (() => { try { return JSON.parse(String(_enforcePageRes?.result ?? '{}')); } catch (_) { return {}; } })();
+            const _enforceLlmResult = await _detectAuthViaLLM(_enforcePageData.title || '', _enforcePageData.body || '', agentId);
+            if (_enforceLlmResult === 1) {
+              _llmSaysAuthRequired = true;
+              logger.info(`[browser.agent] run: URL-first enforcement — LLM detected marketing/login page at ${_curUrl} — will navigate to ${startUrl} for ${agentId}`);
+            }
+          } catch (_) {}
+
+          if (_llmSaysAuthRequired) {
+            // Page is a marketing/login redirect — navigate to the real startUrl
+            logger.info(`[browser.agent] run: URL-first enforcement — navigating from marketing page ${_curUrl} to ${startUrl} for ${agentId}`);
+            const _enforceNav = await callBrowserAct({ action: 'navigate', sessionId, url: startUrl, timeoutMs: 30000 }, 35000);
+            if (_enforceNav?.ok !== false) {
+              await new Promise(r => setTimeout(r, 2000));
+              const _postUrlRes = await callBrowserAct({ action: 'evaluate', text: 'window.location.href', sessionId, timeoutMs: 5000 }, 8000).catch(() => ({ ok: false }));
+              _postEnforcementUrl = _postUrlRes?.ok ? String(_postUrlRes.result || '').trim().replace(/^"|"$/g, '') : startUrl;
+            } else {
+              _postEnforcementUrl = startUrl;
+            }
+          } else {
+            logger.info(`[browser.agent] run: URL-first enforcement — already on canonical URL ${_curUrl} (LLM confirmed authenticated app) — skipping re-navigation for ${agentId}`);
+            _postEnforcementUrl = _curUrl;
+          }
         }
       } else {
         // Engine is not active (closed after auth) — navigate to startUrl
@@ -9562,14 +9862,21 @@ When extracting page content with run-code, prioritize these selectors over gene
             sessionId,
           });
           const _shortCircuitResult = `Goal achieved via URL-first short-circuit. Page content: ${_pageText.slice(0, 10000)}`;
-          return {
-            ok: true, agentId, task,
-            result: _shortCircuitResult,
-            url: _shortCircuitUrl,
-            sessionId,
-            recipeUsed: false,
-            routingDecision: 'browser_urlfirst_shortcircuit',
-          };
+          // ── OCR goal verification before returning success ────────────────
+          const _scOcrVerify = await _verifyGoalWithOcr(task, sessionId, []);
+          if (!_scOcrVerify.verified) {
+            logger.warn(`[browser.agent] tab-map: URL-first short-circuit OCR verification failed: ${_scOcrVerify.reason} (OCR: "${_scOcrVerify.ocrText || ''}") — proceeding to iterative navigation instead`);
+          } else {
+            logger.info(`[browser.agent] tab-map: URL-first short-circuit OCR verification passed: ${_scOcrVerify.reason}`);
+            return {
+              ok: true, agentId, task,
+              result: _shortCircuitResult,
+              url: _shortCircuitUrl,
+              sessionId,
+              recipeUsed: false,
+              routingDecision: 'browser_urlfirst_shortcircuit',
+            };
+          }
         }
       } catch (_scErr) {
         logger.warn(`[browser.agent] tab-map: URL-first short-circuit error (non-fatal): ${_scErr.message} — proceeding to iterative navigation`);
@@ -9580,7 +9887,14 @@ When extracting page content with run-code, prioritize these selectors over gene
       // Tier 2: Decision call → 0 (DONE), 1 (Just-type), 2 (Meta+F), 3 (Tab-Map)
       // Tier 3: Strategy execution with fallback to Tab-Map
       const _pageCategory = _inferPageCategory(_svcKey, startUrl, task, _appKnowledgeEntries);
-      const _shortcutCount = _appKnowledgeEntries.filter(e => e.type === 'shortcut').length;
+      const _shortcutEntries = _appKnowledgeEntries.filter(e => e.type === 'shortcut' && e.details?.shortcut);
+      const _shortcutCount = _shortcutEntries.length;
+      // Build compact shortcut list: "c — create a new event" (max 800 chars)
+      const _shortcutLabels = _shortcutEntries.map(s => {
+        const key = s.details?.shortcut || '';
+        const action = (s.summary || '').replace(/^.*?\bto\s+/i, '').replace(/\.$/, '').slice(0, 60);
+        return `${key} — ${action}`;
+      }).join('\n').slice(0, 800);
       logger.info(`[browser.agent] tab-map: starting three-tier iterative navigation (category=${_pageCategory}, appKnowledge=${_appKnowledgeEntries?.length || 0} entries, shortcuts=${_shortcutCount})`);
       const { runIterativeNavigation } = require('./instruction.runner.cjs');
       const _tabMapResult = await runIterativeNavigation({
@@ -9591,10 +9905,65 @@ When extracting page content with run-code, prioritize these selectors over gene
         pageCategory: _pageCategory,
         agentContext: _agentContext,
         shortcutCount: _shortcutCount,
+        shortcutLabels: _shortcutLabels,
         timeoutMs: 120000,
+        progressCallbackUrl: _progressCallbackUrl,
+        stepIndex: _stepIndex,
+        agentId: _agentIdArg,
       });
+      if (_tabMapResult?.askUser) {
+        // Alert handler surfaced an unfixable error — propagate to user
+        logger.info(`[browser.agent] tab-map: surfacing askUser: "${_tabMapResult.question}"`);
+        return {
+          ok: false, agentId, task,
+          askUser: true,
+          question: _tabMapResult.question,
+          options: _tabMapResult.options || [],
+          agentTurns: 0,
+          loopHistory: [],
+        };
+      }
       if (_tabMapResult?.ok) {
         logger.info(`[browser.agent] tab-map: completed ✓ via iterative navigation`);
+
+        // ── DOM-state + network verification (primary for modal/overlay goals) ──
+        // Checks: submit clicked + POST/PUT 2xx in netLog + dialog closed + no error toast.
+        // If verified, skip OCR entirely (OCR can't see modals reliably).
+        const _domVerify = await _verifyGoalViaDomState(task, sessionId, _tabMapResult.actionHistory || [], _tabMapResult);
+        if (_domVerify.verified) {
+          logger.info(`[browser.agent] tab-map: DOM-state verification passed: ${_domVerify.reason}`);
+          // Skip OCR — DOM state + network is sufficient. Continue to success return below.
+        } else if (_domVerify.reason !== 'no-submit-click' && _domVerify.reason !== 'overlay-check-failed') {
+          // Submit was clicked but dialog still open, error toast, or API failure
+          logger.warn(`[browser.agent] tab-map: DOM-state verification failed: ${_domVerify.reason}`);
+          return { ok: false, agentId, task, error: `Goal not achieved — ${_domVerify.reason}` };
+        }
+        // else: no-submit-click or overlay-check-failed → fall through to OCR verification
+
+        // ── OCR goal verification (fallback for non-modal goals) ──────────
+        // Prevents false positives: if the page is a marketing page or the goal
+        // was not actually achieved, return ok:false instead of hallucinating success.
+        if (!_domVerify.verified) {
+        const _ocrVerify = await _verifyGoalWithOcr(task, sessionId, _tabMapResult.actionHistory || []);
+        if (!_ocrVerify.verified) {
+          if (_ocrVerify.wait) {
+            // Page loading — wait and retry once
+            logger.info(`[browser.agent] tab-map: OCR verification says loading — waiting 5s and retrying`);
+            await new Promise(r => setTimeout(r, 5000));
+            const _retryVerify = await _verifyGoalWithOcr(task, sessionId, _tabMapResult.actionHistory || []);
+            if (!_retryVerify.verified) {
+              logger.warn(`[browser.agent] tab-map: OCR goal verification failed (after retry): ${_retryVerify.reason} (OCR: "${_retryVerify.ocrText || ''}")`);
+              return { ok: false, agentId, task, error: `Goal not achieved — OCR verification failed: ${_retryVerify.reason}` };
+            }
+            logger.info(`[browser.agent] tab-map: OCR goal verification passed on retry: ${_retryVerify.reason}`);
+          } else {
+            logger.warn(`[browser.agent] tab-map: OCR goal verification failed: ${_ocrVerify.reason} (OCR: "${_ocrVerify.ocrText || ''}")`);
+            return { ok: false, agentId, task, error: `Goal not achieved — OCR verification failed: ${_ocrVerify.reason}` };
+          }
+        } else {
+          logger.info(`[browser.agent] tab-map: OCR goal verification passed: ${_ocrVerify.reason}`);
+        }
+        } // end if (!_domVerify.verified)
         // Emit tier progress: tab-map completed
         _postProgress(_progressCallbackUrl, {
           type: 'agent:tier',

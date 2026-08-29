@@ -80,7 +80,7 @@ function clearProfileLock(sessionId) {
 }
 
 function _attachNetLog(page, netLog) {
-  page.on('response', (res) => {
+  page.on('response', async (res) => {
     try {
       const m = res.request().method();
       if (!/^(POST|PUT|PATCH|DELETE)$/i.test(m)) return;
@@ -89,8 +89,39 @@ function _attachNetLog(page, netLog) {
       let _payload = null;
       try { _payload = res.request().postData() || null; } catch (_) {}
       if (_payload && _payload.length > 2000) _payload = _payload.slice(0, 2000);
-      netLog.push({ method: m.toUpperCase(), url: u, status: res.status(), ts: Date.now(), payload: _payload });
+
+      // Capture response body for failed responses (4xx/5xx) — contains error message
+      let _responseBody = null;
+      const _status = res.status();
+      if (_status >= 400) {
+        try { _responseBody = (await res.text()).slice(0, 1000); } catch (_) { /* body may be consumed or unavailable */ }
+      }
+
+      netLog.push({ method: m.toUpperCase(), url: u, status: _status, ts: Date.now(), payload: _payload, responseBody: _responseBody });
       if (netLog.length > 100) netLog.shift();
+    } catch (_) {}
+  });
+}
+
+// Native dialog handler — prevents beforeunload/confirm/alert from blocking automation.
+// Without this, Playwright auto-dismisses dialogs silently (beforeunload navigates away,
+// losing form state). We handle each type appropriately:
+// - beforeunload: accept (STAY on page — don't lose form data)
+// - confirm: dismiss (don't confirm destructive actions like "Discard changes?")
+// - alert/prompt: accept (just dismiss)
+function _attachDialogHandler(page) {
+  page.on('dialog', async (dialog) => {
+    const _type = dialog.type();
+    const _message = dialog.message();
+    logger.info(`[browser-engine] Native dialog: type=${_type}, message="${_message.slice(0, 100)}"`);
+    try {
+      if (_type === 'beforeunload') {
+        await dialog.accept(); // stay on the page — don't lose form data
+      } else if (_type === 'confirm') {
+        await dialog.dismiss(); // don't confirm destructive actions
+      } else {
+        await dialog.accept(); // alert/prompt — just dismiss
+      }
     } catch (_) {}
   });
 }
@@ -131,6 +162,56 @@ async function launch(sessionId, opts = {}) {
 
   clearProfileLock(sessionId);
 
+  // ── Block protocol handler permission popups ──────────────────────────────
+  // Chrome shows "X wants to Open web calendar links" / "Open mail links" popups
+  // for webcal:, mailto:, tel: schemes. --disable-features=ProtocolHandler alone
+  // doesn't suppress them. Write Chrome Preferences to exclude these schemes so
+  // the permission prompt never appears. Also clear any cached "Ask" decisions.
+  try {
+    const _prefsDir = path.join(profileDir, 'Default');
+    const _prefsPath = path.join(_prefsDir, 'Preferences');
+    let _prefs = {};
+    if (fs.existsSync(_prefsPath)) {
+      try { _prefs = JSON.parse(fs.readFileSync(_prefsPath, 'utf8')); } catch (_) { _prefs = {}; }
+    }
+    if (!fs.existsSync(_prefsDir)) fs.mkdirSync(_prefsDir, { recursive: true });
+    // protocol_handler.excluded_schemes: true = don't ask, block silently
+    if (!_prefs.protocol_handler) _prefs.protocol_handler = {};
+    if (!_prefs.protocol_handler.excluded_schemes) _prefs.protocol_handler.excluded_schemes = {};
+    _prefs.protocol_handler.excluded_schemes.webcal = true;
+    _prefs.protocol_handler.excluded_schemes.mailto = true;
+    _prefs.protocol_handler.excluded_schemes.tel = true;
+    _prefs.protocol_handler.excluded_schemes.sms = true;
+    // Clear any previously cached "Ask" / allowed protocol decisions so Chrome
+    // doesn't reuse them and show the popup again.
+    if (_prefs.protocol_handler.allowed_origin_protocol_pairs) {
+      delete _prefs.protocol_handler.allowed_origin_protocol_pairs;
+    }
+    if (_prefs.protocol_handler.excluded_origins) {
+      delete _prefs.protocol_handler.excluded_origins;
+    }
+    fs.writeFileSync(_prefsPath, JSON.stringify(_prefs));
+  } catch (_) { /* non-fatal — popup may appear but won't break automation */ }
+
+  // ── Block "Show notifications" permission popup ───────────────────────────
+  // Chrome shows "X wants to show notifications" popup which steals focus
+  // from the page. Write Chrome Preferences to block notifications globally.
+  try {
+    const _prefsDir2 = path.join(profileDir, 'Default');
+    const _prefsPath2 = path.join(_prefsDir2, 'Preferences');
+    let _prefs2 = {};
+    if (fs.existsSync(_prefsPath2)) {
+      try { _prefs2 = JSON.parse(fs.readFileSync(_prefsPath2, 'utf8')); } catch (_) { _prefs2 = {}; }
+    }
+    if (!_prefs2.profile) _prefs2.profile = {};
+    if (!_prefs2.profile.content_settings) _prefs2.profile.content_settings = {};
+    if (!_prefs2.profile.content_settings.exceptions) _prefs2.profile.content_settings.exceptions = {};
+    if (!_prefs2.profile.content_settings.exceptions.notifications) _prefs2.profile.content_settings.exceptions.notifications = {};
+    // setting: 2 = block (1 = allow, 3 = ask)
+    _prefs2.profile.content_settings.exceptions.notifications["*,*"] = { setting: 2 };
+    fs.writeFileSync(_prefsPath2, JSON.stringify(_prefs2));
+  } catch (_) { /* non-fatal */ }
+
   // ── Browser channel selection ──────────────────────────────────────────────
   // Default to the user's installed Google Chrome (channel: 'chrome') instead of
   // Playwright's bundled "Chrome for Testing". Real Chrome is required for OAuth
@@ -148,7 +229,7 @@ async function launch(sessionId, opts = {}) {
     // are 1280x800 and LiteParse/OCR can barely read the small UI text; at 2x they are
     // 2560x1600 which reads cleanly. Coordinate scaling reads the real PNG dimensions.
     deviceScaleFactor: 2,
-    args: ['--disable-blink-features=AutomationControlled', '--no-first-run', '--no-default-browser-check'],
+    args: ['--disable-blink-features=AutomationControlled', '--no-first-run', '--no-default-browser-check', '--disable-features=ProtocolHandler,RegisterProtocolHandler', '--disable-notifications'],
   };
 
   const _envChannel = String(process.env.THINKDROP_BROWSER_CHANNEL || '').toLowerCase();
@@ -220,8 +301,8 @@ async function launch(sessionId, opts = {}) {
 
   const netLog = [];
   const pages = ctx.pages();
-  ctx.on('page', (p) => _attachNetLog(p, netLog));
-  for (const p of pages) _attachNetLog(p, netLog);
+  ctx.on('page', (p) => { _attachNetLog(p, netLog); _attachDialogHandler(p); });
+  for (const p of pages) { _attachNetLog(p, netLog); _attachDialogHandler(p); }
 
   // Register ad-block interception (route blocking + init script) for all future navigations
   await setupInterceptionNode(ctx, sessionId);

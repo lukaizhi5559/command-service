@@ -5,7 +5,7 @@
  * and returns a verdict: ok / auto_correct / ask_user.
  *
  * Flow:
- *   1. classifyTaskIntent(task) → intent string (chat | research | search | docs | console | settings | mail | social | commerce | content_create | scheduling | maps | download | support | dashboard | home)
+ *   1. classifyTaskIntent(task) → intent string (chat | research | search | docs | console | settings | mail | social | commerce | content_create | open_existing | scheduling | maps | download | support | dashboard | notifications | contacts | home)
  *   2. classifyUrlType(url)     → endpoint type the URL represents
  *   3. Compare: if the planned URL type is incompatible with the task intent → mismatch
  *   4. On mismatch:
@@ -70,12 +70,15 @@ const INTENTS = {
   SOCIAL:         'social',         // post, comment, message, follow on social/forum
   COMMERCE:       'commerce',       // buy, cart, checkout, order, purchase
   CONTENT_CREATE: 'content_create', // write, compose, publish, upload content
+  OPEN_EXISTING:  'open_existing',  // open, find, view, or edit an EXISTING document/page/item
   SCHEDULING:     'scheduling',     // book, schedule, reserve, appointment, calendar
   MAPS:           'maps',           // directions, nearby, navigate, locate
   DOWNLOAD:       'download',       // download, export, save a file
   MEDIA_PLAY:     'media_play',     // play, stream, or watch music/video/media
   SUPPORT:        'support',        // contact support, help center, ticket
   DASHBOARD:      'dashboard',      // analytics, stats, admin, overview
+  NOTIFICATIONS:  'notifications',  // check or view notifications and alerts
+  CONTACTS:       'contacts',       // view or find a contact
   HOME:           'home',           // generic visit — open the site's landing page
 };
 
@@ -92,6 +95,21 @@ const INTENT_PATTERNS = [
   {
     intent: INTENTS.CONTENT_CREATE,
     re: /\b(write[\s_-].*(?:post|blog|article)|publish[\s_-].*(?:article|post|video)|upload[\s_-].*(?:video|file|image)|create[\s_-].*(?:page|post|blog|listing|document|doc|spreadsheet|sheet|presentation|slide|form|note|task)|open\s+.*(?:create|make)\s+a\s+(?:new\s+)?(?:document|doc|spreadsheet|sheet|presentation|slide|form|note))\b/i,
+  },
+  // OPEN_EXISTING — open/find/view/edit an existing document/page/item (after CONTENT_CREATE so "create" wins over "open")
+  {
+    intent: INTENTS.OPEN_EXISTING,
+    re: /\b(open\s+(?:the\s+)?(?:edit(?:ing)?\s+panel|existing)|find\s+(?:the\s+)?(?:document|page|doc|spreadsheet|sheet|presentation|slide|note|file)|navigate\s+to\s+(?:the\s+)?(?:document|page|doc)|edit\s+(?:panel|the\s+document)|view\s+(?:the\s+)?(?:document|page|doc)|the\s+document\s+titled|the\s+page\s+called|the\s+page\s+named|existing\s+(?:document|page|doc))\b/i,
+  },
+  // NOTIFICATIONS — check/view notifications and alerts
+  {
+    intent: INTENTS.NOTIFICATIONS,
+    re: /\b(check|view|show)\s+(?:my\s+)?(?:notifications?|alerts?|activity(?:\s+feed)?)\b/i,
+  },
+  // CONTACTS — view/find a contact
+  {
+    intent: INTENTS.CONTACTS,
+    re: /\b(view|find|show|search)\s+(?:my\s+)?(?:a\s+|the\s+)?(?:contacts?|people|address\s+book)\b/i,
   },
   // DOCS
   {
@@ -251,13 +269,17 @@ Definitions and examples:
 - mail           : send, compose, forward, or reply to email. Examples: "send an email to Bob", "reply to the last message", "compose a new email"
 - social         : post, comment, message, follow, share on a social or forum platform. Examples: "post on X", "comment on Instagram", "tweet this link", "follow Elon on X"
 - commerce       : buy, add to cart, checkout, order, purchase. Examples: "add headphones to cart", "checkout on Amazon", "buy this item"
-- content_create : write, compose, publish, or upload content. Examples: "write a blog post on Medium", "upload a YouTube video", "publish an article", "create a new Google Doc titled Q4 Planning Notes", "create a Google Sheets spreadsheet", "create a Google Slides presentation", "create a new blank document"
+- content_create : write, compose, publish, or upload content. Examples: "write a blog post on Medium", "upload a YouTube video", "publish an article", "create a new Google Doc", "create a Google Sheets spreadsheet", "create a Google Slides presentation", "create a new blank document"
+- open_existing  : open, find, view, or edit an EXISTING document, page, or item. Examples: "open the document titled X", "find the page called X", "edit the spreadsheet named X", "open the edit panel for X", "view the file X"
+  IMPORTANT: "open_existing" is NOT "content_create". If the task says "create a new X", it is content_create. If the task says "open X", "find X", "edit X", or "navigate to X" where X is an existing item, it is open_existing.
 - scheduling     : book, schedule, reserve, appointment, calendar. Examples: "book a table on OpenTable", "schedule a Zoom meeting", "reserve a room"
 - maps           : directions, nearby, navigate, locate. Examples: "directions to the airport", "find nearby gas stations", "navigate to Times Square"
 - download       : download, export, or save a file. Examples: "download the PDF", "export the report", "save the image"
 - media_play     : play, stream, or watch media. Examples: "play my Spotify playlist", "watch a YouTube video", "play the first result on YouTube Music"
 - support        : contact support, help center, ticket. Examples: "open a support ticket", "contact customer support"
 - dashboard      : analytics, stats, admin, overview. Examples: "show my dashboard", "view analytics", "open admin panel"
+- notifications  : check or view notifications and alerts. Examples: "check my notifications", "view my alerts", "show my activity feed"
+- contacts       : view or find a contact. Examples: "view my contacts", "find a contact named X", "show my address book"
 - home           : any other generic navigation, visiting a site, opening a page, clicking elements. Examples: "go to github.com", "open Slack", "visit the homepage"
 ${_serviceContext}
 Task: ${_scopedShort}
@@ -464,6 +486,23 @@ const URL_TYPE_PATTERNS = [
       /^https?:\/\/docs\./i,
     ],
   },
+  {
+    type: INTENTS.NOTIFICATIONS,
+    tests: [
+      /\/notifications?/i,
+      /\/alerts?/i,
+      /\/activity/i,
+    ],
+  },
+  {
+    type: INTENTS.CONTACTS,
+    tests: [
+      /\/contacts?/i,
+      /\/people/i,
+      /\/addressbook/i,
+      /\/address-book/i,
+    ],
+  },
 ];
 
 /**
@@ -491,13 +530,16 @@ const INTENT_ACCEPTED_URL_TYPES = {
   [INTENTS.SOCIAL]:         [INTENTS.SOCIAL, INTENTS.HOME, INTENTS.CONTENT_CREATE],
   [INTENTS.COMMERCE]:       [INTENTS.COMMERCE, INTENTS.HOME],
   [INTENTS.CONTENT_CREATE]: [INTENTS.CONTENT_CREATE, INTENTS.HOME, INTENTS.SOCIAL],
+  [INTENTS.OPEN_EXISTING]:  [INTENTS.SEARCH, INTENTS.HOME, INTENTS.DOCS, INTENTS.CONTENT_CREATE],
   [INTENTS.SCHEDULING]:     [INTENTS.SCHEDULING, INTENTS.HOME],
   [INTENTS.MAPS]:           [INTENTS.MAPS, INTENTS.HOME],
   [INTENTS.DOWNLOAD]:       [INTENTS.DOWNLOAD, INTENTS.HOME, INTENTS.DOCS],
   [INTENTS.MEDIA_PLAY]:     [INTENTS.MEDIA_PLAY, INTENTS.HOME, INTENTS.SEARCH],
   [INTENTS.SUPPORT]:        [INTENTS.SUPPORT, INTENTS.HOME],
   [INTENTS.DASHBOARD]:      [INTENTS.DASHBOARD, INTENTS.HOME, INTENTS.CONSOLE, INTENTS.SETTINGS],
-  [INTENTS.HOME]:           [INTENTS.HOME, INTENTS.CHAT, INTENTS.DOCS, INTENTS.CONSOLE, INTENTS.SETTINGS, INTENTS.SOCIAL, INTENTS.COMMERCE, INTENTS.CONTENT_CREATE, INTENTS.SCHEDULING, INTENTS.MAPS, INTENTS.DOWNLOAD, INTENTS.MEDIA_PLAY, INTENTS.SUPPORT, INTENTS.DASHBOARD],
+  [INTENTS.NOTIFICATIONS]:  [INTENTS.DASHBOARD, INTENTS.HOME],
+  [INTENTS.CONTACTS]:       [INTENTS.SOCIAL, INTENTS.HOME],
+  [INTENTS.HOME]:           [INTENTS.HOME, INTENTS.CHAT, INTENTS.DOCS, INTENTS.CONSOLE, INTENTS.SETTINGS, INTENTS.SOCIAL, INTENTS.COMMERCE, INTENTS.CONTENT_CREATE, INTENTS.OPEN_EXISTING, INTENTS.SCHEDULING, INTENTS.MAPS, INTENTS.DOWNLOAD, INTENTS.MEDIA_PLAY, INTENTS.SUPPORT, INTENTS.DASHBOARD, INTENTS.NOTIFICATIONS, INTENTS.CONTACTS],
 };
 
 // ── Per-service fallback chat/home URLs ───────────────────────────────────────

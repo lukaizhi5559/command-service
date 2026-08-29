@@ -6772,11 +6772,60 @@ If no videos found, return []. Do not explain, only output the JSON array.`;
           if (_postNavUrl) {
             const _postNavHost = getHost(_postNavUrl);
             if (_postNavHost && _postNavHost !== authOriginHost && !isHostEquivalent(_postNavHost, authOriginHost)) {
-              _aliases.push(_postNavHost);
-              logger.info(`[browser.act] waitForAuth: service redirected ${authOriginHost} → ${_postNavHost} — adding as runtime alias for session=${sessionId}`);
-              if (authSuccessUrl && authSuccessUrl.includes(authOriginHost)) {
-                authSuccessUrl = authSuccessUrl.replace(authOriginHost, _postNavHost);
-                logger.info(`[browser.act] waitForAuth: updated authSuccessUrl to ${authSuccessUrl} for session=${sessionId}`);
+              // ── Check if redirect target is actually a sign-in page ──────────
+              // The alias was added for twitter.com → x.com (where x.com/i/flow/login
+              // IS still a sign-in page). But Google redirects accounts.google.com →
+              // myaccount.google.com when the user is ALREADY logged in — aliasing
+              // myaccount.google.com traps the state machine in "IN AUTH FLOW" forever.
+              // Only add as alias if the redirect target page is actually a login wall.
+              let _isRedirectSignInPage = true; // default: assume sign-in (preserves prior behavior)
+              try {
+                const _redirectMetaExpr = `(() => {
+                  const title = (document.title || '').toLowerCase();
+                  const titleIsLogin = /sign.?in|log.?in|\\\\blogin\\\\b|authenticate|verify|two.factor|2fa/.test(title);
+                  const signInLinks = document.querySelectorAll(
+                    'a[href*="login"], a[href*="signin"], a[href*="sign-in"], a[href*="signup"], a[href*="register"]'
+                  );
+                  const signInButtons = Array.from(
+                    document.querySelectorAll('button, a[role="button"], [data-testid]')
+                  ).filter(el => {
+                    const text = (el.textContent || el.innerText || '').toLowerCase().trim();
+                    return /^(sign\\s*in|log\\s*in|sign\\s*up|register)\\b/.test(text);
+                  });
+                  const hasSignInButton = signInLinks.length > 0 || signInButtons.length > 0;
+                  const bodyText = (document.body && document.body.innerText) ? document.body.innerText.slice(0, 500) : '';
+                  const hasLoginForm = !!document.querySelector('input[type="email"], input[type="password"], input[name="identifier"], input#identifierId');
+                  return JSON.stringify({ titleIsLogin, hasSignInButton, hasLoginForm, title: document.title || '', bodyLen: bodyText.length });
+                })()`;
+                const _redirectMetaRes = await _authEval(_redirectMetaExpr, 5000);
+                const _redirectMeta = JSON.parse(String(_redirectMetaRes.val || '{}').trim());
+                _isRedirectSignInPage = _redirectMeta.titleIsLogin || _redirectMeta.hasSignInButton || _redirectMeta.hasLoginForm;
+                logger.info(`[browser.act] waitForAuth: redirect target ${_postNavHost} sign-in check: titleIsLogin=${_redirectMeta.titleIsLogin} hasSignInButton=${_redirectMeta.hasSignInButton} hasLoginForm=${_redirectMeta.hasLoginForm} → isSignInPage=${_isRedirectSignInPage} (session=${sessionId})`);
+              } catch (_redirectMetaErr) {
+                logger.debug(`[browser.act] waitForAuth: redirect target meta check failed (non-fatal): ${_redirectMetaErr.message}`);
+              }
+
+              if (_isRedirectSignInPage) {
+                // Redirect target IS a sign-in page (e.g. twitter.com → x.com/i/flow/login)
+                // → add as alias so the state machine treats it as IN AUTH FLOW
+                _aliases.push(_postNavHost);
+                logger.info(`[browser.act] waitForAuth: service redirected ${authOriginHost} → ${_postNavHost} (sign-in page) — adding as runtime alias for session=${sessionId}`);
+                if (authSuccessUrl && authSuccessUrl.includes(authOriginHost)) {
+                  authSuccessUrl = authSuccessUrl.replace(authOriginHost, _postNavHost);
+                  logger.info(`[browser.act] waitForAuth: updated authSuccessUrl to ${authSuccessUrl} for session=${sessionId}`);
+                }
+              } else {
+                // Redirect target is NOT a sign-in page (e.g. accounts.google.com → myaccount.google.com)
+                // → user is already logged in. Don't alias — navigate to authSuccessUrl
+                // so the state machine can detect SUCCESS (or LIMBO if still not at target).
+                logger.info(`[browser.act] waitForAuth: service redirected ${authOriginHost} → ${_postNavHost} (NOT a sign-in page — user likely logged in) — navigating to authSuccessUrl for session=${sessionId}`);
+                if (authSuccessUrl) {
+                  // authSuccessUrl may be a bare hostname pattern (e.g. 'mail.google.com')
+                  const _gotoUrl = /^https?:\/\//i.test(authSuccessUrl)
+                    ? authSuccessUrl
+                    : `https://${authSuccessUrl.split(/[,|]/)[0].trim()}`;
+                  await _authGoto(_gotoUrl, 15000);
+                }
               }
             }
           }
@@ -7347,6 +7396,31 @@ If no videos found, return []. Do not explain, only output the JSON array.`;
               }
             }
             logger.debug(`[browser.act] waitForAuth: in auth flow at ${currentUrl} (${authWallDetections} polls), ${Math.round((deadline - Date.now()) / 1000)}s remaining`);
+
+            // ── Fallback: navigate to authSuccessUrl if page is not a login wall ──
+            // Safety net for cases where the redirect target was aliased but is
+            // actually an authenticated page (e.g. myaccount.google.com after
+            // Google sign-in). If we've been stuck in auth flow for >15s and the
+            // page doesn't look like a login wall, try navigating to the
+            // authSuccessUrl to check if the user is actually logged in.
+            if (authWallDetections >= 8 && !_pageMetaLoginWall && !_hasSignInButton && authSuccessUrl) {
+              try {
+                const _currentPath = new URL(currentUrl).pathname;
+                const _onLoginPath = /\/(login|signin|sign-in|sign_in|auth|oauth|authorize)\b/i.test(_currentPath);
+                if (!_onLoginPath) {
+                  logger.info(`[browser.act] waitForAuth: in-auth-flow fallback — page is not a login wall after ${authWallDetections} polls, navigating to authSuccessUrl for session=${sessionId}`);
+                  const _gotoUrl = /^https?:\/\//i.test(authSuccessUrl)
+                    ? authSuccessUrl
+                    : `https://${authSuccessUrl.split(/[,|]/)[0].trim()}`;
+                  await _authGoto(_gotoUrl, 15000);
+                  // Let the next poll iteration evaluate the new URL — it will
+                  // hit State 1 (SUCCESS) if we're at the auth success URL, or
+                  // State 3 (LIMBO) if we get redirected back to sign-in.
+                }
+              } catch (_fallbackErr) {
+                logger.debug(`[browser.act] waitForAuth: in-auth-flow fallback nav failed (non-fatal): ${_fallbackErr.message}`);
+              }
+            }
             continue;
           }
 
