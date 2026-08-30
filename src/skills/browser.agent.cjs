@@ -736,11 +736,15 @@ async function _readEditorStateDOM(sessionId) {
       action: 'evaluate', sessionId, headed: true, timeoutMs: 3000,
       text: `(() => {
       const active = document.activeElement;
-      if (!active || active === document.body) return null;
+      const hasActive = active && active !== document.body;
 
       // ── Leaf detection (same as _readActiveElement) ──
+      // Only run when there's an actual focused element. When no element is
+      // focused (activeElement === document.body), skip leaf detection but
+      // STILL enumerate all blocks — the LLM needs to see page content to
+      // avoid duplicates even when nothing is focused.
       let el = active;
-      if (el.isContentEditable) {
+      if (hasActive && el.isContentEditable) {
         try {
           const sel = window.getSelection();
           if (sel && sel.rangeCount > 0) {
@@ -753,26 +757,34 @@ async function _readEditorStateDOM(sessionId) {
       }
 
       // ── Region detection (multi-app, not Notion-specific) ──
-      const tag = el.tagName.toLowerCase();
-      const ariaRoleDesc = el.getAttribute('aria-roledescription') || '';
-      const ariaLabel = (el.getAttribute('aria-label') || '').toLowerCase();
-      const placeholder = (el.getAttribute('placeholder') || el.getAttribute('data-placeholder') || '').toLowerCase();
-      const name = el.getAttribute('name') || '';
-      const isTitle = ariaRoleDesc.includes('title') ||
-                      (tag === 'h1' && el.isContentEditable) ||
-                      placeholder.includes('untitled') || placeholder.includes('new page');
-      const isSubject = (name === 'subject' || ariaLabel.includes('subject')) && !isTitle;
-      const region = isTitle ? 'title' : isSubject ? 'subject' : 'body';
+      // When no active element, default to 'body' — the LLM can still see blocks.
+      let region = 'body';
+      let isTitle = false;
+      let isSubject = false;
+      if (hasActive) {
+        const tag = el.tagName.toLowerCase();
+        const ariaRoleDesc = el.getAttribute('aria-roledescription') || '';
+        const ariaLabel = (el.getAttribute('aria-label') || '').toLowerCase();
+        const placeholder = (el.getAttribute('placeholder') || el.getAttribute('data-placeholder') || '').toLowerCase();
+        const name = el.getAttribute('name') || '';
+        isTitle = ariaRoleDesc.includes('title') ||
+                        (tag === 'h1' && el.isContentEditable) ||
+                        placeholder.includes('untitled') || placeholder.includes('new page');
+        isSubject = (name === 'subject' || ariaLabel.includes('subject')) && !isTitle;
+        region = isTitle ? 'title' : isSubject ? 'subject' : 'body';
+      }
 
       // ── Cursor position ──
       let cursorOffset = 0;
-      try {
-        const sel = window.getSelection();
-        if (sel && sel.rangeCount > 0) cursorOffset = sel.anchorOffset || 0;
-      } catch (_) {}
+      if (hasActive) {
+        try {
+          const sel = window.getSelection();
+          if (sel && sel.rangeCount > 0) cursorOffset = sel.anchorOffset || 0;
+        } catch (_) {}
+      }
 
       // ── Current block text ──
-      const blockText = (el.innerText || el.value || '').trim().slice(0, 200);
+      const blockText = hasActive ? (el.innerText || el.value || '').trim().slice(0, 200) : '';
 
       // ── Title text (from any title element on page) ──
       const titleEl = document.querySelector(
@@ -795,15 +807,27 @@ async function _readEditorStateDOM(sessionId) {
 
       // Body region — enumerate all blocks
       // Strategy A: app-specific block containers (Notion [data-block-id])
+      // Use [contenteditable] (no value) to match ALL variants: "true", "", "plaintext-only".
+      // Notion uses contenteditable="plaintext-only" which the old selector [contenteditable="true"]
+      // did NOT match — causing DOM editor state to fail silently and fall back to OCR.
       let blockEls = document.querySelectorAll(
-        '[data-block-id] [contenteditable="true"], [data-block-id] [contenteditable=""], [data-block-id][contenteditable="true"]'
+        '[data-block-id] [contenteditable], [data-block-id][contenteditable]'
       );
+      // Filter to actual editable elements (exclude contenteditable="false")
+      blockEls = Array.from(blockEls).filter(el => el.isContentEditable);
+      // Strategy A2: Notion variant — [data-block-type] or role="listitem"
+      if (blockEls.length === 0) {
+        blockEls = Array.from(document.querySelectorAll(
+          '[data-block-type] [contenteditable], [data-block-type][contenteditable], [role="listitem"] [contenteditable]'
+        )).filter(el => el.isContentEditable);
+      }
       // Strategy B: generic — all contenteditable in main content area
       if (blockEls.length === 0) {
         const main = document.querySelector(
           '[class*="page-content"], [class*="editor-content"], [class*="document-content"], [role="main"], main, [class*="compose"] [class*="body"]'
         );
-        blockEls = (main || document).querySelectorAll('[contenteditable="true"], [contenteditable=""]');
+        blockEls = Array.from((main || document).querySelectorAll('[contenteditable]'))
+          .filter(el => el.isContentEditable);
       }
 
       // Deduplicate nested contenteditable (parent + child both contenteditable)
@@ -830,25 +854,27 @@ async function _readEditorStateDOM(sessionId) {
         return { index: i + 1, type, text: text || '' };
       });
 
-      // Find active block index
-      const activeRect = el.getBoundingClientRect();
+      // Find active block index (only when there's an active element)
       let activeIdx = -1;
-      deduped.forEach((b, i) => {
-        const r = b.getBoundingClientRect();
-        if (Math.abs(r.y - activeRect.y) < 20 && Math.abs(r.x - activeRect.x) < 20) {
-          activeIdx = i;
-        }
-      });
-      // Fallback: match by text
-      if (activeIdx < 0 && blockText) {
+      if (hasActive) {
+        const activeRect = el.getBoundingClientRect();
         deduped.forEach((b, i) => {
-          if (activeIdx >= 0) return;
-          if ((b.innerText || '').includes(blockText.slice(0, 40))) activeIdx = i;
+          const r = b.getBoundingClientRect();
+          if (Math.abs(r.y - activeRect.y) < 20 && Math.abs(r.x - activeRect.x) < 20) {
+            activeIdx = i;
+          }
         });
-      }
-      // Fallback: use activeElement directly
-      if (activeIdx < 0) {
-        activeIdx = deduped.findIndex(b => b === el);
+        // Fallback: match by text
+        if (activeIdx < 0 && blockText) {
+          deduped.forEach((b, i) => {
+            if (activeIdx >= 0) return;
+            if ((b.innerText || '').includes(blockText.slice(0, 40))) activeIdx = i;
+          });
+        }
+        // Fallback: use activeElement directly
+        if (activeIdx < 0) {
+          activeIdx = deduped.findIndex(b => b === el);
+        }
       }
 
       return {
@@ -1134,6 +1160,12 @@ async function _readEditorState(sessionId, pageCategory) {
       logger.info(`[browser.agent] _readEditorState: region=${dom.region}, block=${dom.blockIndex}/${dom.totalBlocks}, type=${dom.blockType}, text="${(dom.blockText || '').slice(0, 40)}" (source=${dom.source})`);
       return dom;
     }
+    // Diagnostic: log why DOM result was rejected so we can fix the selector
+    if (dom) {
+      logger.info(`[browser.agent] _readEditorState: DOM result rejected — region=${dom.region}, totalBlocks=${dom.totalBlocks}, blockText="${(dom.blockText || '').slice(0, 40)}", titleText="${(dom.titleText || '').slice(0, 40)}" — falling back to OCR`);
+    } else {
+      logger.info(`[browser.agent] _readEditorState: DOM returned null — falling back to OCR`);
+    }
   }
 
   // Strategy 2: DOM for code editors
@@ -1265,6 +1297,7 @@ Look at the goal, the editor state, and what's been done. Return ONLY the NEXT v
   - Call 4 (in empty todo block): return "Study"
   - Call 5 (in filled todo block "Study"): return PRESS_ENTER
   - Call 6 (in empty todo block): return "Pray"
+- LIST-ITEM RULE: If the last action in history was "pressed Enter to create next item", the current block is a NEW EMPTY block — type the next item value from the goal. Do NOT return PRESS_ENTER (the block is already empty, Enter was already pressed). The action history entry "pressed Enter to create next item (list-item)" means the system already pressed Enter for you — the current block is empty and ready for the next value.
 - For block-based editors with a command system (see Agent context for prefix and commands):
   if the goal requires creating blocks (todo, heading, bullet), return the command for the FIRST block only (e.g. "/todo").
   The system will type the command, select from dropdown, then type each item in subsequent calls.
@@ -1283,7 +1316,11 @@ Look at the goal, the editor state, and what's been done. Return ONLY the NEXT v
 - Use the Page layout (if provided) to decide which region needs content and which key to press to navigate.
 - Use the Editor state (if provided) to see exactly which block you're in, what's already typed, and what's next.
 - TITLE FIELD GUARD: If the focused field is a title field (aria-roledescription includes "title", or placeholder includes "New page" or "Untitled", or it's an h1), return the LITERAL title text from the goal — never a command (no leading /). Commands (like /todo) are for body blocks only. If the title is already filled correctly, return PRESS_ENTER to move to the body.
-- FIELD-ORDER RULE (canvas editors): If the focused region is the title (see ← FOCUSED marker in Page layout) and it already contains the correct title, return PRESS_ENTER to move focus to the body. Do NOT return body commands while the title is focused — the title is for the page name only. Body commands (like /todo) must be typed into the body region, not the title.`;
+- FIELD-ORDER RULE (canvas editors): If the focused region is the title (see ← FOCUSED marker in Page layout) and it already contains the correct title, return PRESS_ENTER to move focus to the body. Do NOT return body commands while the title is focused — the title is for the page name only. Body commands (like /todo) must be typed into the body region, not the title.
+- EMPTY BLOCK RULE: If the focused field is a list-type block (To-do, Bulleted list, Numbered list, or Toggle — detected by aria-roledescription or aria-label containing "to-do", "bullet", "numbered", or "toggle") and it is EMPTY:
+  - If the goal specifies items AND not all items have been typed yet (check action history), return the NEXT item text from the goal — NOT PRESS_ENTER. Pressing Enter on an empty list block destroys it (converts it back to a plain paragraph).
+  - If ALL items from the goal have already been typed and this is a trailing empty block, return PRESS_BACKSPACE to delete it.
+  - If the goal asks for N items but doesn't specify what they are, generate placeholder items (Item 1, Item 2, ... Item N) as per the EXCEPTION rule above.`;
 
   const historyStr = actionHistory.slice(-5).map((a, i) => `  ${i + 1}. ${a}`).join('\n');
 
@@ -1337,7 +1374,7 @@ Value to type?`;
     const raw = await askWithMessages([
       { role: 'system', content: systemPrompt },
       { role: 'user', content: userPrompt },
-    ], { maxTokens: 300, temperature: 0.1, responseTimeoutMs: 10000 });
+    ], { maxTokens: 300, temperature: 0.1, responseTimeoutMs: 10000, taskType: 'light' });
     const val = (raw || '').trim().replace(/^```(?:text|plaintext)?\s*\n?/i, '').replace(/\n?```\s*$/, '').trim();
     logger.info(`[browser.agent] _extractValue: "${val.slice(0, 60)}" for field "${_focusedStr}"`);
     return val;
@@ -1663,7 +1700,7 @@ Number (0-2)?`;
     const raw = await askWithMessages([
       { role: 'system', content: systemPrompt },
       { role: 'user', content: userPrompt },
-    ], { maxTokens: 5, temperature: 0, responseTimeoutMs: 5000 });
+    ], { maxTokens: 5, temperature: 0, responseTimeoutMs: 5000, taskType: 'classification' });
     const num = parseInt((raw || '').trim().replace(/\D/g, ''), 10);
     if (num >= 0 && num <= 2) {
       // For failures (0), ask LLM for a descriptive reason
@@ -1673,7 +1710,7 @@ Number (0-2)?`;
           const reasonRaw = await askWithMessages([
             { role: 'system', content: 'In one sentence, explain why the browser automation goal was NOT achieved based on the OCR text. Be specific about what is missing or wrong. Return ONLY the explanation.' },
             { role: 'user', content: `Goal: ${goal}\nOCR text: ${(ocrText || '').slice(0, 400)}\nActions: ${(actionHistory || []).slice(-5).join('; ')}` }
-          ], { maxTokens: 60, temperature: 0, responseTimeoutMs: 5000 });
+          ], { maxTokens: 60, temperature: 0, responseTimeoutMs: 5000, taskType: 'light' });
           _reason = (reasonRaw || '').trim().slice(0, 120) || 'goal-not-visible-in-ocr';
         } catch (_) { _reason = 'goal-not-visible-in-ocr'; }
       }
@@ -1812,7 +1849,7 @@ Number (0-1)?`;
     const raw = await askWithMessages([
       { role: 'system', content: systemPrompt },
       { role: 'user', content: userPrompt },
-    ], { maxTokens: 5, temperature: 0, responseTimeoutMs: 3000 });
+    ], { maxTokens: 5, temperature: 0, responseTimeoutMs: 3000, taskType: 'classification' });
     const num = parseInt((raw || '').trim().replace(/\D/g, ''), 10);
     if (num === 0 || num === 1) {
       logger.info(`[browser.agent] _ocrDetectLoading: ${num}`);
@@ -1924,7 +1961,7 @@ Number (0-4)?`;
     const raw = await askWithMessages([
       { role: 'system', content: systemPrompt },
       { role: 'user', content: userPrompt },
-    ], { maxTokens: 5, temperature: 0, responseTimeoutMs: 5000 });
+    ], { maxTokens: 5, temperature: 0, responseTimeoutMs: 5000, taskType: 'classification' });
     const num = parseInt((raw || '').trim().replace(/\D/g, ''), 10);
     if (num >= 0 && num <= 4) {
       logger.info(`[browser.agent] _ocrClassifyState: ${num} for goal="${String(goal || '').slice(0, 60)}"`);
@@ -1997,12 +2034,16 @@ Look at the focused field, the value to type, and the goal. Return ONLY one of:
 - type-edit: long-form content (documents, code, essays — generate or edit)
 - type-commands: typing with / or @ commands that open a dropdown (Notion blocks, Slack commands)
 - type-search: typing to filter a dynamic dropdown (@mentions, assignee pickers, page pickers)
+- type-list-item: typing into a list/checklist/todo item where Enter creates the next item
 
 Rules:
 - <input> with short single-line value → type-plain
 - contenteditable/textarea with multi-line or long value → type-edit
 - value starts with / and field is a block editor → type-commands
 - value starts with @ and field has a combobox/listbox → type-search
+- contenteditable with aria-roledescription containing "to-do", "task", "list item", or "checklist" → type-list-item
+- field inside a todo/checklist/task list where Enter creates the next item → type-list-item
+- value is a short single-line item in a list context (goal mentions "items", "todos", "tasks", "checklist") → type-list-item
 - TITLE FIELD GUARD: If the focused field is a title (aria-roledescription includes "title", placeholder includes "New page" or "Untitled", or it's an h1/h2), and the value does NOT start with / or @, return type-plain. Titles are never command fields.
 - If unsure → type-plain (safest default)
 Return ONLY the type name, nothing else.`;
@@ -2022,7 +2063,7 @@ Field type?`;
       { role: 'user', content: userPrompt },
     ], { maxTokens: 20, temperature: 0.1, responseTimeoutMs: 8000 });
     const val = (raw || '').trim().toLowerCase();
-    const valid = ['type-plain', 'type-edit', 'type-commands', 'type-search'];
+    const valid = ['type-plain', 'type-edit', 'type-commands', 'type-search', 'type-list-item'];
     const match = valid.find(v => val.includes(v));
     const result = match || 'type-plain';
     logger.info(`[browser.agent] _extractFieldType: LLM → ${result} (raw="${val}")`);
@@ -2459,7 +2500,12 @@ TITLE FIELD GUARD (canvas editors like Notion, Google Docs):
 - Title fields are identifiable by aria-roledescription containing "title" or placeholder containing "Untitled"/"New page".
 - Do NOT generate Type steps with block commands (e.g. /todo, /heading, /bullet) targeting title fields. Title fields are for the page name only.
 - If a step would type a command into a title field, add a press Enter step first to move focus to the body, then type the command into the body.
-- Example: goal "create page called X and add a todo list" → [{ "action": "type", "target": "title", "value": "X" }, { "action": "press", "key": "Enter" }, { "action": "type", "target": "body", "value": "/todo\\nItem 1" }].
+- Example: goal "create page called X and add a todo list" → [{ "action": "type", "target": "title", "value": "X" }, { "action": "press", "key": "Enter" }, { "action": "type", "target": "body", "value": "/todo" }, { "action": "press", "key": "Enter" }, { "action": "type", "target": "body", "value": "Item 1" }, { "action": "press", "key": "Enter" }, { "action": "type", "target": "body", "value": "Item 2" }].
+
+MULTI-LINE TYPE RULE (critical for block editors):
+- Each type action must set exactly ONE value. Do NOT include multiple lines (\\n) in a single type action.
+- For block editors (Notion, Google Docs, Confluence): create blocks one at a time — type the command (e.g. /todo), press Enter to select it, then type each item separately with Enter between them.
+- Multi-line type only works for plain <textarea> elements, never for contenteditable block editors.
 
 OVERLAY/DIALOG STATE RULES (critical — check the Overlay/dialog state in the user prompt):
 - If the Overlay/dialog is OPEN, do NOT generate "navigate" steps — the dialog is already open; fill its fields or click its buttons instead. Navigating will close the dialog and destroy progress.

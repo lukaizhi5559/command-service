@@ -117,34 +117,16 @@ function checkRule(code, rule) {
 // ── LLM call to patch violations ─────────────────────────────────────────────
 let _seq = 0;
 async function callLLM(systemPrompt, userPrompt) {
-  const WebSocket = require('ws');
-  const WS_BASE = process.env.LLM_WS_URL || process.env.WEBSOCKET_URL || 'ws://localhost:4000/ws/stream';
-  const url = new URL(WS_BASE);
-  const apiKey = process.env.VSCODE_API_KEY || process.env.BACKEND_API_KEY || process.env.BASE_API_KEY || '';
-  if (apiKey) url.searchParams.set('apiKey', apiKey);
-  url.searchParams.set('userId', 'skill_reviewer');
-  url.searchParams.set('clientId', 'rev_' + Date.now() + '_' + (++_seq));
-  return new Promise((resolve, reject) => {
-    const ws = new WebSocket(url.toString());
-    let answer = '';
-    const timer = setTimeout(() => { ws.close(); reject(new Error('LLM timeout')); }, 90000);
-    ws.on('open', () => ws.send(JSON.stringify({
-      id: 'rev_' + Date.now(), type: 'llm_request',
-      payload: { prompt: userPrompt, provider: 'auto', options: { temperature: 0.1, stream: true, taskType: 'skill_step' },
-        context: { systemInstructions: systemPrompt, recentContext: [], sessionFacts: [], memories: [] } },
-      timestamp: Date.now(), metadata: { source: 'skill_reviewer' },
-    })));
-    ws.on('message', (data) => {
-      try {
-        const msg = JSON.parse(data.toString());
-        if (msg.type === 'llm_stream_chunk') answer += msg.payload?.chunk || msg.payload?.text || '';
-        else if (msg.type === 'llm_stream_end') { clearTimeout(timer); ws.close(); resolve(answer); }
-        else if (msg.type === 'error') { clearTimeout(timer); ws.close(); reject(new Error(msg.payload?.message || 'LLM error')); }
-      } catch { /* ignore */ }
-    });
-    ws.on('error', (e) => { clearTimeout(timer); reject(e); });
-    ws.on('close', () => { clearTimeout(timer); if (answer.trim()) resolve(answer); else reject(new Error('WS closed early')); });
-  });
+  try {
+    const { askWithMessages } = require('../skill-helpers/skill-llm.cjs');
+    const result = await askWithMessages([
+      { role: 'system', content: systemPrompt },
+      { role: 'user', content: userPrompt },
+    ], { temperature: 0.1, taskType: 'skill_step', responseTimeoutMs: 90000 });
+    return result;
+  } catch (e) {
+    throw new Error(`LLM error: ${e.message}`);
+  }
 }
 
 function stripFences(content) {

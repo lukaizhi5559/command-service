@@ -5918,7 +5918,7 @@ If no videos found, return []. Do not explain, only output the JSON array.`;
             action,
             sessionId,
             result: evalResult,
-            stdout: String(evalResult ?? ''),
+            stdout: (typeof evalResult === 'string' ? evalResult : JSON.stringify(evalResult ?? null)),
             executionTime: Date.now() - start,
           };
         } catch (evalErr) {
@@ -5968,7 +5968,7 @@ If no videos found, return []. Do not explain, only output the JSON array.`;
           const wrappedCode = isWrapped ? code : `async page => {\n${code}\n}`;
           const fn = eval(wrappedCode);
           const result = await fn(_ePage);
-          return { ok: true, action, sessionId, result: result, stdout: String(result ?? ''), executionTime: Date.now() - start };
+          return { ok: true, action, sessionId, result: result, stdout: (typeof result === 'string' ? result : JSON.stringify(result ?? null)), executionTime: Date.now() - start };
         } catch (e) {
           logger.warn(`[browser.act] run-code (engine) failed: ${e.message} — falling back to CLI`);
         }

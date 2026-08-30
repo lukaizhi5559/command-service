@@ -19,6 +19,105 @@ const WS_API_KEY = process.env.WEBSOCKET_API_KEY || '';
 const CONNECT_TIMEOUT_MS = 5000;
 const RESPONSE_TIMEOUT_MS = 30000;
 
+// ── Persistent WebSocket connection pool ──────────────────────────────────
+// Reuses WebSocket connections across requests to eliminate ~1-2s TCP
+// handshake + WS upgrade overhead per call. Each connection handles one
+// request at a time; overflow requests create temporary connections that
+// are closed after use. Pool size is capped to avoid resource leaks.
+const MAX_POOL_SIZE = 2;
+let _wsPool = []; // Array of { ws, busy }
+
+function _buildPoolUrl() {
+  const url = new URL(WS_URL);
+  if (WS_API_KEY) url.searchParams.set('apiKey', WS_API_KEY);
+  url.searchParams.set('userId', 'command_service');
+  url.searchParams.set('clientId', `skill_pool_${Math.random().toString(36).slice(2, 8)}`);
+  return url.toString();
+}
+
+/**
+ * Acquire a WebSocket connection from the pool, or create a new one.
+ * Pooled connections are reused across requests; temporary connections
+ * (created when the pool is full and all busy) are closed after use.
+ * @returns {Promise<{ws: WebSocket, pooled: boolean}>}
+ */
+async function _acquireWs() {
+  let WebSocket;
+  try { WebSocket = require('ws'); } catch {
+    throw new Error('[skill-llm] "ws" package not installed in command-service');
+  }
+
+  // Find a free, healthy connection in the pool
+  for (let i = _wsPool.length - 1; i >= 0; i--) {
+    const entry = _wsPool[i];
+    if (entry.ws.readyState !== WebSocket.OPEN) {
+      // Stale/closed connection — remove from pool
+      _wsPool.splice(i, 1);
+      continue;
+    }
+    if (!entry.busy) {
+      entry.busy = true;
+      // Remove only message listeners from previous requests
+      entry.ws.removeAllListeners('message');
+      return { ws: entry.ws, pooled: true };
+    }
+  }
+
+  // No free connection — create a new one
+  const ws = new WebSocket(_buildPoolUrl());
+
+  // Connect with timeout
+  await new Promise((resolve, reject) => {
+    const t = setTimeout(() => {
+      ws.terminate();
+      reject(new Error('[skill-llm] Connection timeout'));
+    }, CONNECT_TIMEOUT_MS);
+    ws.on('open', () => { clearTimeout(t); resolve(); });
+    ws.on('error', (err) => { clearTimeout(t); reject(err); });
+  });
+
+  // If pool isn't full, add to pool for reuse; otherwise it's a temporary connection
+  const pooled = _wsPool.length < MAX_POOL_SIZE;
+  if (pooled) {
+    const entry = { ws, busy: true };
+    _wsPool.push(entry);
+    // Permanent error/close handler — removes from pool on drop
+    ws.on('error', (err) => {
+      logger.warn(`[skill-llm] Pool connection error: ${err.message}`);
+      _wsPool = _wsPool.filter(e => e !== entry);
+    });
+    ws.on('close', () => {
+      _wsPool = _wsPool.filter(e => e !== entry);
+    });
+  }
+
+  return { ws, pooled };
+}
+
+/**
+ * Release a WebSocket connection back to the pool, or close it if temporary/errored.
+ * @param {WebSocket} ws
+ * @param {boolean} errored — if true, destroy the connection
+ */
+function _releaseWs(ws, errored = false) {
+  const entry = _wsPool.find(e => e.ws === ws);
+  if (!entry) {
+    // Temporary connection (pool was full) — close it
+    try { ws.close(); } catch {}
+    return;
+  }
+  if (errored || ws.readyState !== 1) {
+    // Broken connection — remove from pool and close
+    _wsPool = _wsPool.filter(e => e !== entry);
+    try { ws.close(); } catch {}
+    return;
+  }
+  // Healthy — return to pool for reuse
+  entry.busy = false;
+  // Clean up per-request message listeners
+  ws.removeAllListeners('message');
+}
+
 // Circuit breaker state
 let circuitState = {
   failures: 0,
@@ -141,22 +240,9 @@ async function _askWithMessagesOnce(messages, opts = {}) {
     throw new Error('[skill-llm] "ws" package not installed in command-service');
   }
 
-  const url = new URL(WS_URL);
-  if (WS_API_KEY) url.searchParams.set('apiKey', WS_API_KEY);
-  url.searchParams.set('userId', 'command_service');
-  url.searchParams.set('clientId', `skill_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`);
-
-  const ws = new WebSocket(url.toString());
-
-  // Connect
-  await new Promise((resolve, reject) => {
-    const t = setTimeout(() => {
-      ws.terminate();
-      reject(new Error('[skill-llm] Connection timeout'));
-    }, CONNECT_TIMEOUT_MS);
-    ws.on('open', () => { clearTimeout(t); resolve(); });
-    ws.on('error', (err) => { clearTimeout(t); reject(err); });
-  });
+  // Acquire a connection from the pool (reuses persistent connections)
+  const { ws, pooled } = await _acquireWs();
+  let _errored = false;
 
   // Extract system message and build user prompt.
   // The backend reads context.systemInstructions for the system message and
@@ -205,64 +291,79 @@ async function _askWithMessagesOnce(messages, opts = {}) {
   let lastProvider = '';
   const responseTimeoutMs = opts.responseTimeoutMs || RESPONSE_TIMEOUT_MS;
 
-  await new Promise((resolve, reject) => {
-    let t = setTimeout(() => {
-      ws.terminate();
-      reject(new Error('[skill-llm] Response timeout'));
-    }, responseTimeoutMs);
-
-    const resetTimeout = () => {
-      clearTimeout(t);
-      t = setTimeout(() => {
+  try {
+    await new Promise((resolve, reject) => {
+      let t = setTimeout(() => {
+        _errored = true;
         ws.terminate();
         reject(new Error('[skill-llm] Response timeout'));
       }, responseTimeoutMs);
-    };
 
-    ws.on('message', (data) => {
-      try {
-        const msg = JSON.parse(data.toString());
-        if (msg.type === 'llm_stream_start') {
-          streamStarted = true;
-          clearTimeout(t);
-        } else if (msg.type === 'llm_stream_fallback') {
-          resetTimeout();
-        } else if (msg.type === 'llm_stream_chunk') {
-          // Reset the response timeout on each chunk so a slow-but-progressing
-          // stream doesn't get killed. Without this, llm_stream_start clears the
-          // timeout and chunks never reset it — a stalled stream hangs forever
-          // (observed: 63-second calls burning 70% of the turn-loop budget).
-          resetTimeout();
-          const provider = msg.payload?.provider || msg.payload?.chunk?.provider || '';
-          if (provider) lastProvider = provider;
-          const chunk = msg.payload?.chunk || msg.payload?.text || '';
-          if (chunk) {
-            accumulated += chunk;
-            if (opts.onToken) opts.onToken(chunk);
+      const resetTimeout = () => {
+        clearTimeout(t);
+        t = setTimeout(() => {
+          _errored = true;
+          ws.terminate();
+          reject(new Error('[skill-llm] Response timeout'));
+        }, responseTimeoutMs);
+      };
+
+      ws.on('message', (data) => {
+        try {
+          const msg = JSON.parse(data.toString());
+          if (msg.type === 'llm_stream_start') {
+            streamStarted = true;
+            clearTimeout(t);
+          } else if (msg.type === 'llm_stream_fallback') {
+            resetTimeout();
+          } else if (msg.type === 'llm_stream_chunk') {
+            // Reset the response timeout on each chunk so a slow-but-progressing
+            // stream doesn't get killed. Without this, llm_stream_start clears the
+            // timeout and chunks never reset it — a stalled stream hangs forever
+            // (observed: 63-second calls burning 70% of the turn-loop budget).
+            resetTimeout();
+            const provider = msg.payload?.provider || msg.payload?.chunk?.provider || '';
+            if (provider) lastProvider = provider;
+            const chunk = msg.payload?.chunk || msg.payload?.text || '';
+            if (chunk) {
+              accumulated += chunk;
+              if (opts.onToken) opts.onToken(chunk);
+            }
+          } else if (msg.type === 'llm_stream_end') {
+            clearTimeout(t);
+            // Don't close pooled connections — release them back to the pool
+            resolve();
+          } else if (msg.type === 'llm_error') {
+            clearTimeout(t);
+            _errored = true;
+            reject(new Error(msg.payload?.message || '[skill-llm] LLM error'));
+          } else if (msg.type === 'error') {
+            clearTimeout(t);
+            _errored = true;
+            reject(new Error(msg.payload?.message || '[skill-llm] LLM error'));
           }
-        } else if (msg.type === 'llm_stream_end') {
-          clearTimeout(t);
-          ws.close();
-          resolve();
-        } else if (msg.type === 'llm_error') {
-          clearTimeout(t);
-          ws.close();
-          reject(new Error(msg.payload?.message || '[skill-llm] LLM error'));
-        } else if (msg.type === 'error') {
-          clearTimeout(t);
-          ws.close();
-          reject(new Error(msg.payload?.message || '[skill-llm] LLM error'));
-        }
-      } catch (_) {}
-    });
+        } catch (_) {}
+      });
 
-    ws.on('error', (err) => { clearTimeout(t); reject(err); });
-    ws.on('close', () => {
-      clearTimeout(t);
-      if (!streamStarted) reject(new Error('[skill-llm] Connection closed before stream started'));
-      else resolve();
+      ws.on('error', (err) => {
+        clearTimeout(t);
+        _errored = true;
+        reject(err);
+      });
+      ws.on('close', () => {
+        clearTimeout(t);
+        if (!streamStarted) {
+          _errored = true;
+          reject(new Error('[skill-llm] Connection closed before stream started'));
+        } else {
+          resolve();
+        }
+      });
     });
-  });
+  } finally {
+    // Release the connection back to the pool (or close if temporary/errored)
+    _releaseWs(ws, _errored);
+  }
 
   const result = accumulated.trim();
   

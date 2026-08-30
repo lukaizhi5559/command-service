@@ -25,6 +25,7 @@ const CATEGORY_CONFIGS = {
       'Escape exits the current block — do NOT press Escape to dismiss overlays (it loses cursor position)',
       'Slash command (/) opens block insertion menu — use for lists, headings, code blocks',
       'Enter creates a new block; Shift+Enter creates a line break within a block',
+      'For typing content (text, todo, list, items, headings) → ALWAYS use Just-type (1), not Tab-Map. Tab-Map clicks elements and loses cursor position in editors.',
     ],
     commonPatterns: ['canvas_editing', 'creation_deep_link', 'form_dialog_open'],
   },

@@ -2531,59 +2531,21 @@ async function actionListAllAgents() {
 }
 
 // ---------------------------------------------------------------------------
-// Shared: lightweight LLM caller via the VSCode WebSocket backend (port 4000)
+// Shared: lightweight LLM caller via skill-llm.cjs (pooled WebSocket connection)
 // ---------------------------------------------------------------------------
 
-const LLM_WS_URL = process.env.WEBSOCKET_URL || 'ws://localhost:4000/ws/stream';
-const LLM_API_KEY = process.env.VSCODE_API_KEY || '';
-
 async function callLLM(systemPrompt, userQuery, { temperature = 0.2, maxTokens = 1200 } = {}) {
-  let WebSocket;
-  try { WebSocket = require('ws'); } catch { return null; }
-
-  const url = new URL(LLM_WS_URL);
-  if (LLM_API_KEY) url.searchParams.set('apiKey', LLM_API_KEY);
-  url.searchParams.set('userId', 'cli_agent_validator');
-  url.searchParams.set('clientId', `cli_agent_${Date.now()}`);
-
-  return new Promise((resolve) => {
-    let ws;
-    try { ws = new WebSocket(url.toString()); } catch { return resolve(null); }
-
-    let accumulated = '';
-    let streamStarted = false;
-    const connTimeout = setTimeout(() => { try { ws.terminate(); } catch {} resolve(null); }, 8000);
-    const respTimeout = setTimeout(() => { try { ws.terminate(); } catch {} resolve(accumulated || null); }, 60000);
-
-    ws.on('open', () => {
-      clearTimeout(connTimeout);
-      ws.send(JSON.stringify({
-        id: `val_${Date.now()}`,
-        type: 'llm_request',
-        payload: {
-          prompt: userQuery,
-          provider: 'auto',
-          options: { temperature, stream: true, taskType: 'skill_step' },
-          context: { systemInstructions: systemPrompt, recentContext: [], sessionFacts: [], memories: [] },
-        },
-        timestamp: Date.now(),
-        metadata: { source: 'cli_agent_validator' },
-      }));
-    });
-
-    ws.on('message', (data) => {
-      try {
-        const msg = JSON.parse(data.toString());
-        if (msg.type === 'llm_stream_start') { streamStarted = true; }
-        else if (msg.type === 'llm_stream_chunk') { accumulated += (msg.payload?.text || msg.payload?.chunk || ''); }
-        else if (msg.type === 'llm_stream_end') { clearTimeout(respTimeout); ws.close(); resolve(accumulated); }
-        else if (msg.type === 'error') { clearTimeout(respTimeout); ws.close(); resolve(accumulated || null); }
-      } catch {}
-    });
-
-    ws.on('error', () => { clearTimeout(respTimeout); resolve(accumulated || null); });
-    ws.on('close', () => { clearTimeout(respTimeout); resolve(accumulated || null); });
-  });
+  try {
+    const { askWithMessages } = require('../skill-helpers/skill-llm.cjs');
+    const result = await askWithMessages([
+      { role: 'system', content: systemPrompt },
+      { role: 'user', content: userQuery },
+    ], { temperature, maxTokens, taskType: 'skill_step', responseTimeoutMs: 60000 });
+    return result || null;
+  } catch (e) {
+    logger.warn(`[cli.agent] callLLM failed: ${e.message}`);
+    return null;
+  }
 }
 
 // ---------------------------------------------------------------------------

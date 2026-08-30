@@ -336,54 +336,24 @@ async function _confirmChipIfNeeded(sessionId, stepTarget, stepValue, pageCatego
 }
 
 // ---------------------------------------------------------------------------
-// pressAfter: for AI chat message boxes (Enter submits the prompt) and
-// list item creation (Enter creates the next item). This is the runtime
-// equivalent of playwright.agent's pressAfter="Enter".
+// pressAfter: for AI chat message boxes (Enter submits the prompt).
+// This is the runtime equivalent of playwright.agent's pressAfter="Enter".
 //
-// Category-aware: if pageCategory="ai_chat", any field matching
-// "message/prompt/chat/ask" gets Enter pressed. If pageCategory="document_editor",
-// list-item fields get Enter pressed.
+// List item Enter (creating the next todo/task item) is now handled by the
+// type-list-item field type, classified by the _extractFieldType LLM call.
+// That approach is language-independent and generalizes to any app — no regex.
 // ---------------------------------------------------------------------------
-async function _pressAfterIfNeeded(sessionId, stepTarget, stepValue, pageCategory, goal, actionHistory) {
+async function _pressAfterIfNeeded(sessionId, stepTarget, stepValue, pageCategory) {
   const t = (stepTarget || '').toLowerCase();
   const _isChatMessage = /\b(message|prompt|chat|ask|query)\b/.test(t) && !/\b(subject|body|email|search)\b/.test(t);
-  // Match both "todo" and "to-do" (Notion's label). \b splits on hyphens, so
-  // "to-do" becomes "to" + "do" — neither matches the old regex. Use to-?do
-  // to handle both spellings. Also match "to_do" for underscore variants.
-  const _isListItem = /\b(item|to[-_]?do|task|list|checkbox)\b/i.test(t);
 
-  if (!_isChatMessage && !_isListItem) return { ok: true, pressed: false };
-
-  // For list items: check if this is the last item in the goal (don't press Enter
-  // on the last item — it would create an empty block)
-  if (_isListItem && goal && actionHistory) {
-    // Match both digit counts ("3 items") and word counts ("three items")
-    const _wordNums = { one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7, eight: 8, nine: 9, ten: 10 };
-    const _digitMatch = goal.match(/(\d+)\s+(?:items?|todos?|tasks?|entries|things)/i);
-    const _wordMatch = goal.match(/\b(one|two|three|four|five|six|seven|eight|nine|ten)\s+(?:items?|todos?|tasks?|entries|things)/i);
-    let _targetCount = null;
-    if (_digitMatch) _targetCount = parseInt(_digitMatch[1], 10);
-    else if (_wordMatch) _targetCount = _wordNums[_wordMatch[1].toLowerCase()] || null;
-    if (_targetCount) {
-      // Count how many Just-type actions we've taken (each types one item).
-      // actionHistory entries look like: Just-type "Favorite Pizza" → ok
-      // Exclude command entries (values starting with / like /todo, /page)
-      // and PRESS_ entries (key presses, not typed values).
-      // We count this one too (the +1) because it hasn't been pushed to history yet.
-      const _typedItems = actionHistory.filter(a => /^Just-type\s+\"[^\/]/i.test(a) && !/PRESS_/.test(a)).length + 1;
-      if (_typedItems >= _targetCount) {
-        logger.info(`[instruction.runner] Last list item typed (${_typedItems}/${_targetCount}) — skipping Enter`);
-        return { ok: true, pressed: false };
-      }
-    }
-  }
+  if (!_isChatMessage) return { ok: true, pressed: false };
 
   // For AI chat: verify the page has chat indicators before pressing Enter
-  if (_isChatMessage) {
-    try {
-      const res = await browserAct({
-        action: 'evaluate', sessionId, headed: true, timeoutMs: 2000,
-        text: `(() => {
+  try {
+    const res = await browserAct({
+      action: 'evaluate', sessionId, headed: true, timeoutMs: 2000,
+      text: `(() => {
           const el = document.activeElement;
           if (!el) return { isChat: false };
           const ph = (el.getAttribute('placeholder') || el.getAttribute('aria-placeholder') || '').toLowerCase();
@@ -394,23 +364,18 @@ async function _pressAfterIfNeeded(sessionId, stepTarget, stepValue, pageCategor
           const hasSendBtn = !!document.querySelector('button[data-testid="send-button"], button[aria-label*="Send" i], button[type="submit"]');
           return { isChat: isTextarea && hasChatHint && !hasSendBtn, ph, hasSendBtn };
         })()`,
-      });
-      const info = res?.result;
-      if (!info?.isChat) {
-        // If category says ai_chat but there's a send button, skip Enter (user should click Send)
-        if (info?.hasSendBtn) {
-          logger.info(`[instruction.runner] AI chat field has send button — skipping Enter (will click Send instead)`);
-        }
-        return { ok: true, pressed: false };
+    });
+    const info = res?.result;
+    if (!info?.isChat) {
+      // If category says ai_chat but there's a send button, skip Enter (user should click Send)
+      if (info?.hasSendBtn) {
+        logger.info(`[instruction.runner] AI chat field has send button — skipping Enter (will click Send instead)`);
       }
-      logger.info(`[instruction.runner] AI chat message field detected (placeholder="${info.ph}") — pressing Enter to submit`);
-    } catch {
       return { ok: true, pressed: false };
     }
-  }
-
-  if (_isListItem) {
-    logger.info(`[instruction.runner] List item field detected — pressing Enter to create next item`);
+    logger.info(`[instruction.runner] AI chat message field detected (placeholder="${info.ph}") — pressing Enter to submit`);
+  } catch {
+    return { ok: true, pressed: false };
   }
 
   await browserAct({ action: 'press', sessionId, key: 'Enter', headed: true, timeoutMs: 2000 });
@@ -2021,7 +1986,9 @@ async function _executeAction(sessionId, step) {
             });
             _isWrapper = _wrapperCheck?.result?.isWrapper === true;
             if (_isWrapper) {
-              logger.warn(`[instruction.runner] _executeAction type: active element is a wrapper with ${_wrapperCheck?.result?.ceChildren || 0} contenteditable children — skipping Meta+a`);
+              const _ceChildren = _wrapperCheck?.result?.ceChildren || 0;
+              logger.warn(`[instruction.runner] _executeAction type: active element is a wrapper with ${_ceChildren} contenteditable children — aborting (needs re-focus to a leaf)`);
+              return { ok: false, error: `Focused element is a contenteditable wrapper with ${_ceChildren} children — needs re-focus to a leaf` };
             }
           } catch (e) {
             // If the check fails, fall back to the original behavior
@@ -2149,7 +2116,7 @@ async function _executeAction(sessionId, step) {
       }
 
       // pressAfter for AI chat / list items — category aware
-      const _pressAfter = (result?.ok || _usedReactFill) ? await _pressAfterIfNeeded(sessionId, step.target, step.value, step.pageCategory, step.goal, step.actionHistory) : { ok: true };
+      const _pressAfter = (result?.ok || _usedReactFill) ? await _pressAfterIfNeeded(sessionId, step.target, step.value, step.pageCategory) : { ok: true };
       logger.info(`[instruction.runner] _executeAction type: pressAfter result ok=${_pressAfter.ok}, pressed=${_pressAfter.pressed}`);
 
       // Retry-based chip fallback: if value still not in field after all attempts,
@@ -3293,6 +3260,79 @@ async function _detectAlert(sessionId) {
 // or null if no fillable element was found.
 // For Notion-style editors, prefers the title field (contenteditable with "Untitled" placeholder)
 // and skips non-editable div[role=group] placeholder elements.
+// ---------------------------------------------------------------------------
+// Deterministic list-item helpers
+// For goals like "add a todo list with: A, B, C", parse items from the goal
+// and read current todo items from the DOM — bypassing the per-item LLM call
+// which is unreliable when editor state reading fails.
+// ---------------------------------------------------------------------------
+
+// Parse list items from a goal string.
+// Matches patterns like:
+//   "add a todo list with three items: Favorite Pizza, Buy Soda, Big Bag of Chips"
+//   "add a todo list with: A, B, C"
+//   "items: A, B, and C"
+// Returns an array of item strings, or null if no list was found.
+function _parseListItems(goal) {
+  if (!goal) return null;
+  // Find the colon and take everything after it
+  const colonMatch = goal.match(/[:：]\s*(.+)$/);
+  if (!colonMatch) return null;
+  const listPart = colonMatch[1];
+  // Stop at common sentence endings (but keep periods within items like "Mr. Smith")
+  const cleanPart = listPart.split(/\.\s+(?=[A-Z]|\d)/)[0];
+  // Split by commas or " and "
+  const items = cleanPart
+    .split(/(?:,\s*|\s+and\s+)/)
+    .map(s => s.trim().replace(/^["'""\u201c\u201d]|["'""\u201c\u201d]$/g, '').replace(/[.!?;]$/, ''))
+    .filter(Boolean);
+  return items.length >= 2 ? items : null;
+}
+
+// Read current todo list items from the DOM.
+// Notion-specific: looks for todo blocks and reads their text.
+// Returns an array of item text strings (empty array on failure).
+async function _readTodoListItems(sessionId) {
+  try {
+    const res = await browserAct({
+      action: 'evaluate', sessionId, headed: true, timeoutMs: 2000,
+      text: `(() => {
+        const items = [];
+        // Notion: find todo blocks and read their text
+        // Match data-type="todo", data-block-type="todo", or aria-roledescription="to-do"
+        const todoBlocks = document.querySelectorAll(
+          '[data-block-id][data-type="todo"] [contenteditable], ' +
+          '[data-block-type="todo"] [contenteditable], ' +
+          '[data-block-id][data-type="to-do"] [contenteditable], ' +
+          'div[aria-roledescription="to-do"] [contenteditable], ' +
+          'div[aria-roledescription="to-do"][contenteditable]'
+        );
+        todoBlocks.forEach(el => {
+          if (!el.isContentEditable) return;
+          const text = (el.innerText || el.textContent || '').trim();
+          if (text) items.push(text);
+        });
+        return JSON.stringify(items);
+      })()`,
+    });
+    let raw = '';
+    if (res?.stdout) {
+      const _m = res.stdout.match(/^([\s\S]*?)(?=###\s|$)/i);
+      raw = _m ? _m[1].trim() : res.stdout.trim();
+      if (raw.startsWith('"') && raw.endsWith('"')) raw = raw.slice(1, -1).replace(/\\"/g, '"');
+    } else {
+      raw = String(res?.result || '').replace(/^"|"$/g, '');
+    }
+    let parsed;
+    try { parsed = typeof raw === 'string' ? JSON.parse(raw) : raw; }
+    catch (_) { parsed = null; }
+    return Array.isArray(parsed) ? parsed : [];
+  } catch (e) {
+    logger.warn(`[instruction.runner] _readTodoListItems failed: ${e.message}`);
+    return [];
+  }
+}
+
 async function _clickFirstFillable(sessionId) {
   try {
     const res = await browserAct({
@@ -3492,6 +3532,62 @@ async function _executeTypePlain(sessionId, value, focusedElement, pageCategory,
   }
 
   return { ok: true, pageChanged: false };
+}
+
+// type-list-item: typing into a list/checklist/todo item where Enter creates the next item.
+// The LLM classifies the field as type-list-item via _extractFieldType (it sees the full
+// focused element descriptor including aria-roledescription, the goal, and the value).
+// This replaces the old regex-based _pressAfterIfNeeded list-item detection, which was
+// fragile (broke for i18n, non-standard labels, hyphenated names like "to-do").
+// The last-item guard prevents pressing Enter on the final item (would create an empty block).
+async function _executeTypeListItem(sessionId, value, focusedElement, pageCategory, ctx = {}, goal = null, actionHistory = null) {
+  const _tag = focusedElement.tag || '';
+  const _label = (focusedElement.text || focusedElement.ariaLabel || '').slice(0, 40);
+  logger.info(`[instruction.runner] type-list-item: typing "${value.slice(0, 50)}" into ${_tag} "${_label}"`);
+
+  // Type the value (same as type-plain for single-line)
+  const result = await _executeAction(sessionId, {
+    action: 'Type',
+    value: value,
+    target: focusedElement.text || focusedElement.ariaLabel || '',
+    pageCategory: pageCategory,
+    ref: focusedElement.ref || null,
+    hasContent: ctx.hasContent || focusedElement.hasContent || false,
+    isEdit: ctx.isEdit || false,
+  });
+
+  if (!result?.ok) {
+    return { ok: false, pageChanged: false, error: result?.error || 'Type failed' };
+  }
+
+  // Last-item guard: don't press Enter on the last item (would create an empty block).
+  // Parse goal for item count — handles both digit ("3 items") and word ("three items").
+  if (goal && actionHistory) {
+    const _wordNums = { one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7, eight: 8, nine: 9, ten: 10 };
+    const _digitMatch = goal.match(/(\d+)\s+(?:items?|todos?|tasks?|entries|things)/i);
+    const _wordMatch = goal.match(/\b(one|two|three|four|five|six|seven|eight|nine|ten)\s+(?:items?|todos?|tasks?|entries|things)/i);
+    let _targetCount = null;
+    if (_digitMatch) _targetCount = parseInt(_digitMatch[1], 10);
+    else if (_wordMatch) _targetCount = _wordNums[_wordMatch[1].toLowerCase()] || null;
+
+    if (_targetCount) {
+      // Count ONLY type-list-item entries (tagged with "(list-item)" in actionHistory).
+      // This excludes type-plain (e.g. "Weekly Goals" into title) and type-commands
+      // (e.g. "/todo" to create the block) which are not list items.
+      // The +1 accounts for the current item (not yet pushed to actionHistory).
+      const _typedItems = actionHistory.filter(a => /\(list-item\)/.test(a)).length + 1;
+      if (_typedItems >= _targetCount) {
+        logger.info(`[instruction.runner] type-list-item: last item (${_typedItems}/${_targetCount}) — skipping Enter`);
+        return { ok: true, pageChanged: false, pressedEnter: false };
+      }
+    }
+  }
+
+  // Press Enter to create the next list item
+  logger.info(`[instruction.runner] type-list-item: pressing Enter to create next item`);
+  await browserAct({ action: 'press', sessionId, key: 'Enter', headed: true, timeoutMs: 5000 });
+  await _sleep(500);
+  return { ok: true, pageChanged: false, pressedEnter: true };
 }
 
 // type-edit: long-form content (generate or edit).
@@ -4059,6 +4155,8 @@ async function _executeTypedField(sessionId, fieldType, value, focusedElement, g
       return _executeTypeCommands(sessionId, value, focusedElement, goal, pageCategory, agentContext, pageContext, ctx);
     case 'type-search':
       return _executeTypeSearch(sessionId, value, focusedElement, goal, pageCategory, agentContext, pageContext, ctx);
+    case 'type-list-item':
+      return _executeTypeListItem(sessionId, value, focusedElement, pageCategory, ctx, goal, actionHistory);
     case 'type-plain':
     default:
       return _executeTypePlain(sessionId, value, focusedElement, pageCategory, ctx, goal, actionHistory);
@@ -4091,6 +4189,21 @@ async function _executeJustType(sessionId, value, focusedElement, pageCategory, 
   }
 
   // Handle special values: PRESS_<KEY> (generic key press support with modifiers)
+  // ── List-item guard: skip PRESS_ENTER after list-item Enter ──
+  // After type-list-item presses Enter to create the next block, _extractValue may
+  // still return PRESS_ENTER (focus detection reads the OLD block with content,
+  // not the NEW empty one). Pressing Enter on the empty To-do block removes it
+  // (Notion behavior) or creates another empty block — both are wrong.
+  // The actionHistory entry "pressed Enter to create next item" is the sole
+  // reliable trigger — don't check currentValue (focus detection is unreliable
+  // right after Enter creates a new block).
+  if (value === 'PRESS_ENTER') {
+    const _lastAction = (actionHistory && actionHistory[actionHistory.length - 1]) || '';
+    if (_lastAction.includes('pressed Enter to create next item')) {
+      logger.info(`[instruction.runner] Just-type: PRESS_ENTER after list-item Enter — overriding to SKIP (will re-extract next iteration)`);
+      return { ok: false, pageChanged: false, error: 'PRESS_ENTER overridden — empty block after list-item Enter' };
+    }
+  }
   if (value === 'PRESS_ENTER' || (value && value.startsWith('PRESS_'))) {
     const _keyMap = {
       enter: 'Enter', tab: 'Tab', escape: 'Escape', space: ' ',
@@ -4122,7 +4235,10 @@ async function _executeJustType(sessionId, value, focusedElement, pageCategory, 
   // Determine field type and dispatch to the right executor
   const { _extractFieldType } = require('./browser.agent.cjs');
   const fieldType = await _extractFieldType(goal, focusedElement, value, [], pageContext || {}, agentContext);
-  return _executeTypedField(sessionId, fieldType, value, focusedElement, goal, pageCategory, agentContext, pageContext, actionHistory);
+  const result = await _executeTypedField(sessionId, fieldType, value, focusedElement, goal, pageCategory, agentContext, pageContext, actionHistory);
+  // Attach fieldType so the caller can tag actionHistory entries (e.g. list-item tracking)
+  if (result && typeof result === 'object') result.fieldType = fieldType;
+  return result;
 }
 
 // ── Strategy 2: Meta+F search ──────────────────────────────────────────
@@ -4471,6 +4587,15 @@ async function _tabMapStepExecute(sessionId, step, stepIndex, stepCount, tabMap,
     return { done: true, ok: true, action: 'DONE' };
   }
 
+  // Multi-line type guard: a single type action with \n in a block editor
+  // corrupts the page (types into the wrong field, creates wrong blocks).
+  // Abort so the caller falls back to per-step LLM (Just-type) which handles
+  // each item separately via type-list-item.
+  if (step.action === 'type' && typeof step.value === 'string' && step.value.includes('\n')) {
+    logger.warn(`[instruction.runner] Tab-Map step ${stepIndex + 1}: multi-line type value detected (${step.value.split('\n').length} lines) — aborting, falling back to per-step LLM`);
+    return { done: false, ok: false, error: 'Multi-line type action not allowed in Tab-Map — use per-step LLM', fallbackToLlm: true, action: `type (multi-line)` };
+  }
+
   // Handle "press" step (no target needed)
   if (step.action === 'press') {
     const keyMap = { Enter: 'Enter', Tab: 'Tab', Escape: 'Escape' };
@@ -4763,7 +4888,7 @@ Actions:
 ${historyStr}
 
 Completed?` },
-    ], { maxTokens: 5, temperature: 0.1, responseTimeoutMs: 5000 });
+    ], { maxTokens: 5, temperature: 0.1, responseTimeoutMs: 5000, taskType: 'classification' });
     const done = (raw || '').trim().toUpperCase().startsWith('YES');
     logger.info(`[instruction.runner] _checkDone: ${done ? 'YES' : 'NO'} (raw="${(raw || '').trim()}", title="${pageTitle || ''}", checkboxes=${checkboxCount || 0})`);
     return done;
@@ -4858,10 +4983,12 @@ async function _selectTierLLM(sessionId, goal, actionHistory, pageCategory, shor
     alertActive,
     isLoading,
     fillableCount,
+    fillableTypes,
     hasAutoFocus,
     editorState,
     shortcutCount,
     shortcutLabels,
+    clickableCount,
     actionHistory,
   });
   const _catConfig = getCategoryConfig(pageCategory);
@@ -4885,10 +5012,11 @@ async function _selectTierLLM(sessionId, goal, actionHistory, pageCategory, shor
 
   const _tierBlocks = [];
   if (_availableTiers.includes(1)) {
-    _tierBlocks.push(`1 - Just-type: Types ONE value into the currently focused field. Fills only ONE field per call.
+    _tierBlocks.push(`1 - Just-type: Types ONE value into the currently focused field. Fills one field per call.
    Best when: a single field is focused or auto-focused, and you need to type one value (search, chat, title).
+   For document editors: can fill multiple blocks sequentially (type item, press Enter, type next item via type-list-item). Use this for ALL typing in editors — titles, body content, slash commands, list items.
    Current state: focused=${_focusedStr}, ${_fillableStr}, autoFocus=${hasAutoFocus}
-   NOTE: If multiple fields need filling, Just-type CANNOT do it — use Tab-Map (4) instead.`);
+   NOTE: For REAL forms with multiple input/textarea fields (not contenteditable blocks), use Tab-Map (4) instead.`);
   }
   if (_availableTiers.includes(2)) {
     _tierBlocks.push(`2 - Meta+F: Finds specific text on the page via browser find (Ctrl+F), then clicks the element containing it.
@@ -4909,9 +5037,10 @@ async function _selectTierLLM(sessionId, goal, actionHistory, pageCategory, shor
   }
   if (_availableTiers.includes(4)) {
     _tierBlocks.push(`4 - Tab-Map: Scans all focusable/tab-able elements on the page, then fills multiple fields and clicks buttons in sequence.
-   Best when: a form/dialog is open with multiple fields to fill, or you need to interact with specific UI elements by clicking them.
+   Best when: a REAL form/dialog is open with multiple input/textarea fields to fill, or you need to interact with specific UI elements by clicking them.
    Current state: overlay=${_overlayStr}, ${_fillableStr}, ${clickableCount} clickable
-   NOTE: This is the most versatile tier — it can fill forms, click buttons, and navigate UI. Use it when shortcuts can't do the job.`);
+   NOTE: Do NOT use Tab-Map for document editors (Notion, Google Docs) when typing content — it clicks elements and loses cursor position. Use Just-type (1) instead.
+   NOTE: This is the most versatile tier for REAL forms — use it when shortcuts can't do the job.`);
   }
   if (_availableTiers.includes(5)) {
     _tierBlocks.push(`5 - Gesture: Drag-drop, sliders, and spatial interactions using mouse coordinates.
@@ -4942,7 +5071,9 @@ DEEP LINK TYPE: ${_statePattern.deepLinkType}
 ${_deepLinkDesc}
 ${_disabledReasons ? `\nDISABLED STRATEGIES (do NOT return these):\n${_disabledReasons}\n` : ''}
 DECISION RULES:
-- If a dialog/overlay is OPEN with form fields → return 4 (Tab-Map) to fill the form
+- If page category is document_editor AND goal involves typing content (text, todo, list, items, heading, note, bullet, callout, paragraph) → return 1 (Just-type). Editors use contenteditable blocks, not form fields — Just-Type handles them via type-plain, type-commands, type-list-item. Tab-Map clicks elements and loses cursor position in editors.
+- If a dialog/overlay is OPEN with REAL form fields (input/textarea, NOT contenteditable blocks) → return 4 (Tab-Map) to fill the form
+- If a dialog/overlay is OPEN but fillable elements are contenteditable only (no input/textarea) → return 1 (Just-type) — the overlay is likely a navigation dialog, not a form
 - If no dialog is open and a shortcut can open/navigate to the next state → return 3 (Shortcuts)
 - If a single field is focused and you just need to type one value → return 1 (Just-type)
 - If you need to find and click a specific item by text → return 2 (Meta+F)
@@ -5874,19 +6005,65 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
       }
     }
 
+    // ── Notion "Move to" dialog dismissal ──
+    // Notion opens a "Move to" dialog when navigating to a page with
+    // ?showMoveTo=true. This dialog blocks Just-Type from working on the body.
+    // Dismiss it specifically (don't dismiss other dialogs that might be needed).
+    if (overlayActive && _pageCategory === 'document_editor') {
+      try {
+        const _isMoveToDialog = await browserAct({
+          action: 'evaluate', sessionId, headed: true, timeoutMs: 2000,
+          text: `(() => {
+            const d = document.querySelector('[role="dialog"]');
+            if (!d) return false;
+            const t = (d.innerText || '').toLowerCase();
+            return t.includes('move to') || t.includes('move page') || t.includes('move this page');
+          })()`,
+        });
+        if (_isMoveToDialog?.result === true || _isMoveToDialog?.result === 'true') {
+          logger.info(`[instruction.runner] Notion "Move to" dialog detected — dismissing with Escape`);
+          await browserAct({ action: 'press', sessionId, key: 'Escape', headed: true, timeoutMs: 3000 });
+          await _sleep(500);
+          overlayActive = await _detectOverlay(sessionId);
+          if (!overlayActive) {
+            logger.info(`[instruction.runner] "Move to" dialog dismissed — re-probing`);
+            _cachedTabMap = null;
+            continue; // re-probe on next iteration with overlay closed
+          }
+        }
+      } catch (_e) {
+        // Non-fatal — continue with overlay still active
+        logger.warn(`[instruction.runner] "Move to" dialog detection failed (non-fatal): ${_e.message}`);
+      }
+    }
+
     // ── Dynamic Tab-Map gating for high-shortcut apps ──
     // Enable Tab-Map when there are fillable elements OR an overlay OR an alert was handled
     // (forms/dialogs/alerts need Tab-Map to scan and click buttons).
     // Disable Tab-Map when there are 0 fillable elements AND no overlay AND no alert
     // (sidebar wandering prevention for Notion/Docs/Sheets).
+    // EXCEPTION: For editor body-content goals (todo list, items, text blocks),
+    // never enable Tab-Map — Just-Type handles these reliably and Tab-Map
+    // fails on contenteditable wrappers + causes click timeouts.
     if (_isHighShortcutApp && !_isCreationDeepLink) {
-      const _tabMapNeeded = _probe.fillableCount >= 1 || overlayActive || _alertHandled;
-      if (_tabMapNeeded && _disabledTiers.has(4)) {
-        _disabledTiers.delete(4);
-        logger.info(`[instruction.runner] High-shortcut app: enabling Tab-Map (fillable=${_probe.fillableCount}, overlay=${overlayActive}, alertHandled=${_alertHandled})`);
-      } else if (!_tabMapNeeded && !_disabledTiers.has(4)) {
-        _disabledTiers.add(4);
-        logger.info(`[instruction.runner] High-shortcut app: disabling Tab-Map (no fillable, no overlay, no alert — sidebar prevention)`);
+      const _isBodyContentGoal = /\b(todo\s+list|todo\s+items?|add\s+(?:a\s+)?(?:todo|item|text|note|heading|bullet|callout|paragraph))\b/i.test(goal || '');
+      const _bodyFocused = _editorState?.region === 'body' || _editorState?.regionType === 'body';
+
+      if (_isBodyContentGoal && _bodyFocused && !overlayActive) {
+        // Force Tab-Map disabled for body-content goals
+        if (!_disabledTiers.has(4)) {
+          _disabledTiers.add(4);
+          logger.info(`[instruction.runner] High-shortcut app: forcing Tab-Map OFF (body-content goal, body focused — Just-Type only)`);
+        }
+      } else {
+        const _tabMapNeeded = _probe.fillableCount >= 1 || overlayActive || _alertHandled;
+        if (_tabMapNeeded && _disabledTiers.has(4)) {
+          _disabledTiers.delete(4);
+          logger.info(`[instruction.runner] High-shortcut app: enabling Tab-Map (fillable=${_probe.fillableCount}, overlay=${overlayActive}, alertHandled=${_alertHandled})`);
+        } else if (!_tabMapNeeded && !_disabledTiers.has(4)) {
+          _disabledTiers.add(4);
+          logger.info(`[instruction.runner] High-shortcut app: disabling Tab-Map (no fillable, no overlay, no alert — sidebar prevention)`);
+        }
       }
     }
 
@@ -5991,6 +6168,7 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
         });
         _ocrContextForExtract = _nearbyItems.slice(0, 10).map(t => `"${t.text}" at (${Math.round(t.x)},${Math.round(t.y)})`).join(', ');
       }
+
       const value = await _extractValue(goal, focused, actionHistory, _enrichedContext, focused?.currentValue || '', { title: _probe.pageTitle, visibleText: _probe.visibleText, layoutText: _canvasLayout?.layoutText || '', ocrContext: _ocrContextForExtract, editorStateText: _editorStateText || '' });
 
       // ── Runtime command discovery fallback ──
@@ -6043,10 +6221,28 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
 
       const result = await _executeJustType(sessionId, value, focused, _pageCategory, goal, _enrichedContext, { title: _probe.pageTitle, visibleText: _probe.visibleText }, overlayActive, actionHistory);
       const _note = result.ok ? '→ ok' : '→ FAILED';
-      actionHistory.push(`Just-type "${value.slice(0, 40)}" ${_note}`);
+      // Tag list-item entries so the type-list-item last-item guard can count them
+      const _typeTag = result.fieldType === 'type-list-item' ? ' (list-item)' : '';
+      actionHistory.push(`Just-type "${value.slice(0, 40)}"${_typeTag} ${_note}`);
+      // Record the Enter press from type-list-item so _extractValue knows
+      // the current block is a NEW EMPTY block (not still filled with the item).
+      // Without this, _extractValue sees the item as the last action and
+      // returns PRESS_ENTER again — creating a cascade of empty blocks.
+      if (result.fieldType === 'type-list-item' && result.pressedEnter) {
+        actionHistory.push(`Just-type: pressed Enter to create next item`);
+      }
       _triedTiers.add(1);
 
       if (!result.ok) {
+        // List-item guard override — PRESS_ENTER was skipped on empty block.
+        // Don't retry or fall back to Tab-Map — just continue to next iteration
+        // so _extractValue can re-evaluate and return the next item value.
+        if (result.error && result.error.includes('PRESS_ENTER overridden')) {
+          logger.info(`[instruction.runner] Just-type: list-item guard override — continuing to next iteration (no retry, no Tab-Map)`);
+          _triedTiers.delete(1); // allow Just-type on next iteration
+          prevUrl = currentUrl;
+          continue;
+        }
         if (_disabledTiers.has(4)) {
           // Tab-Map disabled (high-shortcut app or creation deep-link) — retry Just-type
           // with fresh focus instead of falling back to Tab-Map (which destroys page state)
@@ -6085,15 +6281,28 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
       // obvious cases (title→body, AI chat, commands); LLM only runs for
       // ambiguous cases. Executes in the same iteration before _checkDone can
       // intercept on the next iteration.
-      const { _extractAfterAction } = require('./browser.agent.cjs');
-      const _afterAction = await _extractAfterAction(goal, focused, value, actionHistory, { title: _probe.pageTitle, pageCategory: _pageCategory, editorStateText: _editorStateText || '' }, _enrichedContext);
-      if (_afterAction > 0) {
-        const _afterKeyMap = { 1: 'Enter', 2: 'Tab', 3: 'Escape', 4: 'Shift+Enter', 5: 'ArrowDown' };
-        const _afterKey = _afterKeyMap[_afterAction] || 'Enter';
-        logger.info(`[instruction.runner] Just-type: pressing ${_afterKey} after typing (after=${_afterAction})`);
-        await browserAct({ action: 'press', sessionId, key: _afterKey, headed: true, timeoutMs: 5000 });
-        await _sleep(500);
-        actionHistory.push(`Just-type: pressed ${_afterKey} after typing "${value.slice(0, 30)}"`);
+      // SKIP for type-list-item fields — _executeTypeListItem already handled
+      // the after-key (Enter to create next item, or skip on last item).
+      // Running _extractAfterAction here would duplicate the key press and
+      // create spurious empty blocks.
+      // SKIP for type-commands fields — _executeTypeCommands already handled
+      // the dropdown selection (typed command, pressed Enter, verified block).
+      // Running _extractAfterAction here would press ArrowDown again AFTER the
+      // dropdown is closed, moving focus away from the created block and
+      // leaving an empty block behind (observed: todo block destroyed).
+      if (result.fieldType !== 'type-list-item' && result.fieldType !== 'type-commands') {
+        const { _extractAfterAction } = require('./browser.agent.cjs');
+        const _afterAction = await _extractAfterAction(goal, focused, value, actionHistory, { title: _probe.pageTitle, pageCategory: _pageCategory, editorStateText: _editorStateText || '' }, _enrichedContext);
+        if (_afterAction > 0) {
+          const _afterKeyMap = { 1: 'Enter', 2: 'Tab', 3: 'Escape', 4: 'Shift+Enter', 5: 'ArrowDown' };
+          const _afterKey = _afterKeyMap[_afterAction] || 'Enter';
+          logger.info(`[instruction.runner] Just-type: pressing ${_afterKey} after typing (after=${_afterAction})`);
+          await browserAct({ action: 'press', sessionId, key: _afterKey, headed: true, timeoutMs: 5000 });
+          await _sleep(500);
+          actionHistory.push(`Just-type: pressed ${_afterKey} after typing "${value.slice(0, 30)}"`);
+        }
+      } else {
+        logger.info(`[instruction.runner] Just-type: skipping _extractAfterAction for type-list-item (already handled)`);
       }
 
       const postUrl = await _getUrl(sessionId);

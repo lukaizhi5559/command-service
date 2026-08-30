@@ -44,6 +44,7 @@ const { classifyDeepLinkType } = require('./deep-link-types.cjs');
  * @param {boolean} [state.alertActive] — confirmation/error alert blocking?
  * @param {boolean} [state.isLoading] — page is loading (spinner detected)?
  * @param {number} [state.fillableCount] — count of fillable elements
+ * @param {Object} [state.fillableTypes] — breakdown: { inputCount, textareaCount, contenteditableCount, roleTextboxCount }
  * @param {boolean} [state.hasAutoFocus] — a field is auto-focused?
  * @param {Object} [state.editorState] — { region, blockIndex, blockType, ... }
  * @param {number} [state.shortcutCount] — count of available shortcuts
@@ -58,11 +59,15 @@ function classifyStatePattern(state) {
   const alertActive = !!s.alertActive;
   const isLoading = !!s.isLoading;
   const fillableCount = Number(s.fillableCount) || 0;
+  const fillableTypes = s.fillableTypes || { inputCount: 0, textareaCount: 0, contenteditableCount: 0, roleTextboxCount: 0 };
+  const _hasRealFormFields = (Number(fillableTypes.inputCount) + Number(fillableTypes.textareaCount)) > 0;
+  const _hasOnlyContenteditable = fillableCount > 0 && !_hasRealFormFields;
   const hasAutoFocus = !!s.hasAutoFocus;
   const editorState = s.editorState || null;
   const pageCategory = String(s.pageCategory || '');
   const shortcutCount = Number(s.shortcutCount) || 0;
   const shortcutLabels = String(s.shortcutLabels || '');
+  const clickableCount = Number(s.clickableCount) || 0;
   const isCreationDeepLinkPre = !!s.isCreationDeepLink;
 
   // Classify deep link type from URL (or use pre-computed flag)
@@ -74,7 +79,8 @@ function classifyStatePattern(state) {
   const isReadCountListGoal = _isReadCountListGoal(goal);
   const isSpatialGoal = _isSpatialGoal(goal);
   const isExplicitSpatial = _isExplicitSpatial(goal);
-  const isFindClickGoal = _isFindClickGoal(goal);
+  const findClickClass = _classifyFindClickGoal(goal);
+  const isFindClickGoal = findClickClass === 'meta-f'; // only clear Meta+F cases fire the pattern
   const shortcutMatches = _shortcutMatchesGoal(goal, shortcutLabels);
 
   // ── Priority-ordered pattern matching ────────────────────────────────
@@ -113,16 +119,28 @@ function classifyStatePattern(state) {
       guardsPassed, guardReason, deepLinkType);
   }
 
+  // 4.5. Editor with overlay (e.g., Notion "Move to" dialog over editor body)
+  // The overlay is NOT a form — it's a navigation/confirmation dialog over the editor.
+  // The editor body is the real target. Recommend Just-Type (tier 1).
+  // Caller should dismiss the overlay before typing.
+  if (overlayActive && _hasOnlyContenteditable && (pageCategory === 'document_editor' || editorState?.region)) {
+    return _result('canvas_editing_with_overlay', 1, false,
+      `Editor ${editorState?.region ? `body (${editorState.region})` : 'page'} is focused with a non-form overlay open — overlay is likely a navigation dialog, not a form. Dismiss overlay and type into the focused block.`,
+      false, 'LLM decides — dismiss overlay if blocking, then type into body', deepLinkType);
+  }
+
   // 5-6. Form dialog open / multi-step form (LLM decides)
-  if (overlayActive && fillableCount >= 2) {
+  // ONLY for REAL form fields (input/textarea), NOT contenteditable editor blocks.
+  // Editors with overlays are handled by canvas_editing_with_overlay (pattern 4.5).
+  if (overlayActive && fillableCount >= 2 && _hasRealFormFields) {
     const multiItem = _isMultiItemGoal(goal);
     if (multiItem) {
       return _result('multi_step_form', 4, false,
-        'Multi-step form dialog is open with multiple fields to fill.',
+        'Multi-step form dialog is open with multiple input/textarea fields to fill.',
         false, 'LLM decides — multi-field form needs Tab-Map or Just-type per field', deepLinkType);
     }
     return _result('form_dialog_open', 4, false,
-      'Form dialog is open with multiple fields.',
+      'Form dialog is open with multiple input/textarea fields.',
       false, 'LLM decides — form may need Tab-Map or Just-type for current field', deepLinkType);
   }
 
@@ -137,23 +155,34 @@ function classifyStatePattern(state) {
       guardsPassed, guardReason, deepLinkType);
   }
 
-  // 8. Find and click text (LLM decides)
-  if (isFindClickGoal && !overlayActive) {
+  // 8. Find and click text (LLM decides) — hybrid: only clear Meta+F cases fire
+  // KEEP !overlayActive gate: Meta+F's window.find() searches the entire page,
+  // not just the overlay. Tab-Map is overlay-scoped and safer inside overlays.
+  // ADD clickableCount > 5: ensures enough things to click to justify text search.
+  // Ambiguous cases ('ambiguous' class) don't fire — let _selectTierLLM decide.
+  // UI element types ('tab-map' class) don't fire — let Tab-Map (priority 13) handle.
+  if (isFindClickGoal && !overlayActive && clickableCount > 5) {
     return _result('find_and_click_text', 2, false,
-      'Goal mentions finding and clicking a specific element.',
+      'Goal involves finding a specific named item by text (proper noun detected, no UI element type).',
       false, 'LLM decides — text may be visible or need scrolling', deepLinkType);
   }
 
-  // 9. Shortcut available (LLM decides)
+  // 9. Shortcut available (LLM decides) — but NOT for editor content goals
   if (!overlayActive && shortcutCount > 0 && shortcutMatches) {
-    return _result('shortcut_available', 3, false,
-      'An app shortcut matches the goal keywords.',
-      false, 'LLM decides — verify shortcut semantically matches the goal', deepLinkType);
+    // Don't recommend shortcuts for editor content goals (typing, not shortcutting)
+    const _isEditorContent = /\b(todo\s+(list|items?)|add\s+(?:a\s+)?(?:todo|item|text|note|heading|bullet|callout|paragraph))\b/i.test(goal);
+    if (!(_isEditorContent && editorState?.region === 'body')) {
+      return _result('shortcut_available', 3, false,
+        'An app shortcut matches the goal keywords.',
+        false, 'LLM decides — verify shortcut semantically matches the goal', deepLinkType);
+    }
   }
 
   // 10. Canvas editing (LLM decides)
+  // Allow even with overlay if the overlay is not a real form (contenteditable-only).
+  // Real form overlays are handled by patterns 5-6 above.
   const editorRegion = editorState?.region;
-  if (editorRegion && ['body', 'cell', 'code', 'canvas'].includes(editorRegion) && !overlayActive) {
+  if (editorRegion && ['body', 'cell', 'code', 'canvas'].includes(editorRegion) && (!overlayActive || _hasOnlyContenteditable)) {
     return _result('canvas_editing', 1, false,
       `Focus is in ${editorRegion} region (block ${editorState.blockIndex ?? '?'}) — type into the focused block.`,
       false, 'LLM decides — verify region matches goal before typing', deepLinkType);
@@ -201,7 +230,14 @@ function _isReadCountListGoal(goal) {
 }
 
 function _isSpatialGoal(goal) {
-  return /\b(drag|drop|reorder|resize|move|slide|arrange|scrub)\b/i.test(goal);
+  // "move" alone is too broad — "move to page", "move email to folder" are navigation, not drag-drop.
+  // Only match "move" with directional words (up/down/left/right/before/after/above/below).
+  // "to" is excluded from _isSpatialGoal because "move X to Y" is usually navigation;
+  // the LLM can still pick Gesture (tier 5) if the goal is clearly drag-drop.
+  // Other verbs (drag/drop/reorder/resize/slide/arrange/scrub) are always spatial.
+  const _strongSpatial = /\b(drag|drop|reorder|resize|slide|arrange|scrub)\b/i.test(goal);
+  const _moveWithDirection = /\bmove\s+\S+\s+(up|down|left|right|before|after|above|below)\b/i.test(goal);
+  return _strongSpatial || _moveWithDirection;
 }
 
 function _isExplicitSpatial(goal) {
@@ -213,12 +249,62 @@ function _isExplicitSpatial(goal) {
   return /\b(drag\s+.+\s+to\b|reorder\s+\S+\s+(by|to|before|after|above|below)\b|resize\s+\S+|move\s+\S+\s+(up|down|left|right|to)\b|slide\s+.+\s+to\b)\b/i.test(goal);
 }
 
+// Hybrid find-and-click classifier: determines if Meta+F or Tab-Map is better.
+// Returns: 'meta-f' (specific named item → Meta+F), 'tab-map' (UI element → Tab-Map),
+//          'ambiguous' (LLM decides), 'none' (not a find-and-click goal)
+function _classifyFindClickGoal(goal) {
+  if (!goal) return 'none';
+
+  const _findVerbs = /\b(find|click|open|go\s+to|navigate\s+to|show\s+me|look\s+up|view|visit|check|move\s+to|select)\b/i;
+  const _contentVerbs = /\b(add|type|create|write|draft|compose|make|fill|name|title|rename|update|edit|change|delete|remove)\b/i;
+  const _uiElementTypes = /\b(button|link|dropdown|tab|menu|navigation|nav\s+bar|sidebar|toolbar|checkbox|toggle|switch|icon|option|row|card)\b/i;
+
+  // Content-creation only → not find-and-click
+  if (_contentVerbs.test(goal) && !_findVerbs.test(goal)) return 'none';
+  // No find-and-click verb → not find-and-click
+  if (!_findVerbs.test(goal)) return 'none';
+
+  const hasUiType = _uiElementTypes.test(goal);
+
+  // Check for a specific name: capitalized word that's NOT the first word and NOT a UI type/stop word
+  // e.g., "find John Smith" → "John" is a name
+  // e.g., "find Wireless Headphones" → "Wireless" is a product name (capitalized)
+  const _words = goal.split(/\s+/);
+  const _stopWords = new Set(['button','link','dropdown','tab','menu','navigation','nav','sidebar',
+    'toolbar','checkbox','toggle','switch','icon','option','row','card','the','a','an',
+    'find','click','open','go','to','navigate','show','me','look','up','view','visit',
+    'check','move','select','about','for','with','from','in','on','at','of','and','or']);
+  const _hasProperNoun = _words.some((w, i) =>
+    i > 0 && /^[A-Z][a-z]/.test(w) && !_stopWords.has(w.toLowerCase()));
+
+  if (hasUiType && _hasProperNoun) {
+    // Both UI type AND proper noun → Tab-Map (UI type is the dominant signal)
+    // e.g., "click the John Smith card" → Tab-Map scans cards and finds "John Smith"
+    return 'tab-map';
+  }
+  if (hasUiType) {
+    // UI type, no proper noun → Tab-Map (e.g., "click Sign In button")
+    return 'tab-map';
+  }
+  if (_hasProperNoun) {
+    // Proper noun, no UI type → Meta+F (e.g., "find John Smith")
+    return 'meta-f';
+  }
+  // No UI type, no proper noun → ambiguous (e.g., "click Submit", "open settings")
+  return 'ambiguous';
+}
+
+// Backward-compatible wrapper for tests that import _isFindClickGoal
 function _isFindClickGoal(goal) {
-  return /\b(find|click|open|select)\b.*\b(button|link|tab|menu|item|icon|option|card|row|entry)\b/i.test(goal);
+  return _classifyFindClickGoal(goal) === 'meta-f';
 }
 
 function _isMultiItemGoal(goal) {
-  // "fill title and date and location" or "fill title, date, location"
+  // Editor content goals (todo items, list items, bullets, headings) are NOT
+  // multi-form-field goals — they're sequential blocks typed via type-list-item.
+  const isEditorContent = /\b(todo\s+(list|items?)|list\s+items?|add\s+(?:a\s+)?(?:todos?|items?|bullets?|headings?|paragraphs?|callouts?))\b/i.test(goal || '');
+  if (isEditorContent) return false;
+  
   const andCount = (goal.match(/\band\b/gi) || []).length;
   const commaCount = (goal.match(/,/g) || []).length;
   return andCount >= 2 || commaCount >= 2;
@@ -227,20 +313,25 @@ function _isMultiItemGoal(goal) {
 function _shortcutMatchesGoal(goal, shortcutLabels) {
   if (!shortcutLabels || !goal) return false;
   const goalLower = goal.toLowerCase();
-  // Extract action verbs from shortcut labels.
-  // Labels are formatted as "key: action description" (e.g. "c: create event")
-  // We extract the action verb (word after the colon) to match against the goal.
   const lines = shortcutLabels.toLowerCase().split(/\n/);
   const actionVerbs = [];
+  // Common nouns that should NOT be matched as action verbs
+  const _nouns = new Set([
+    'today', 'tomorrow', 'week', 'month', 'year', 'event', 'note', 'item',
+    'page', 'day', 'time', 'period', 'view', 'list', 'task', 'todo', 'email',
+    'folder', 'file', 'project', 'label', 'tag', 'filter', 'calendar',
+  ]);
   for (const line of lines) {
-    // Match "key: action" or "key - action" or "key action"
+    // Primary: match "key: action" — extract first word after separator
     const m = line.match(/[:\-]\s*(\w+)/);
-    if (m && m[1] && m[1].length > 2) {
+    if (m && m[1] && m[1].length > 2 && !_nouns.has(m[1])) {
       actionVerbs.push(m[1]);
-    } else {
-      // Fallback: take the longest word in the line (likely the action verb)
-      const words = line.trim().split(/\s+/).filter(w => w.length > 2);
-      if (words.length > 0) actionVerbs.push(words.sort((a, b) => b.length - a.length)[0]);
+      continue;
+    }
+    // Fallback: extract verb after "to " in "Press X to <verb>"
+    const toMatch = line.match(/\bto\s+(\w+)/);
+    if (toMatch && toMatch[1] && toMatch[1].length > 2 && !_nouns.has(toMatch[1])) {
+      actionVerbs.push(toMatch[1]);
     }
   }
   return actionVerbs.some(verb => goalLower.includes(verb));
@@ -253,6 +344,7 @@ module.exports = {
   _isSpatialGoal,
   _isExplicitSpatial,
   _isFindClickGoal,
+  _classifyFindClickGoal,
   _isMultiItemGoal,
   _shortcutMatchesGoal,
 };
