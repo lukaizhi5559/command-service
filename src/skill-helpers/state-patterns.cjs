@@ -141,24 +141,20 @@ function classifyStatePattern(state) {
   // 4.6. Spreadsheet cell entry — BEFORE form patterns to prevent
   // multi_step_form misclassifying spreadsheets (formula bar + name box
   // count as 8 "fillable" inputs, and aria-expanded menus trigger overlayActive).
-  // Spreadsheet cell entry should use Just-type (tier 1) or Shortcuts (tier 3),
+  // Spreadsheet cell entry uses Tier 3 (Shortcuts) — Meta+J to focus each cell
+  // and type the value. This is more reliable than Tier 6 (ArrowGrid) which
+  // depended on _getCurrentCell (unreliable in Google Sheets' canvas-based DOM).
   // NEVER Tab-Map (which scans/clicks elements and types into the formula bar).
   if (pageCategory === 'spreadsheet' && !alertActive && !isLoading) {
-    // If a cell is focused (or auto-focused), use Just-type to type the value
-    if (hasAutoFocus || focused) {
-      return _result('spreadsheet_cell_entry', 1, true,
-        'Spreadsheet cell is focused — type the value into the cell.',
-        true, null, deepLinkType);
-    }
-    // No cell focused — use Shortcuts (Meta+J to focus a cell)
-    if (shortcutCount > 0) {
-      return _result('spreadsheet_cell_focus', 3, true,
-        'Spreadsheet open but no cell focused — use shortcut (Meta+J) to focus target cell.',
+    // Use Tier 3 (Shortcuts) for spreadsheet cell entry — Meta+J is a shortcut
+    if (hasAutoFocus || focused || shortcutCount > 0) {
+      return _result('spreadsheet_cell_entry', 3, true,
+        'Spreadsheet cell entry — use Meta+J shortcut to focus and type each cell.',
         true, null, deepLinkType);
     }
     // No shortcuts available — let LLM decide (but still avoid Tab-Map)
-    return _result('spreadsheet_no_focus', 1, false,
-      'Spreadsheet open, no cell focused, no shortcuts — LLM decides.',
+    return _result('spreadsheet_no_focus', 3, false,
+      'Spreadsheet open, no shortcuts — LLM decides.',
       false, 'LLM decides — need to focus a cell first', deepLinkType);
   }
 

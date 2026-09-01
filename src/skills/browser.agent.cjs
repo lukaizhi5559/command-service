@@ -1420,6 +1420,107 @@ Value to type?`;
   }
 }
 
+// Extract ordered (cell, value) targets from a spreadsheet goal.
+// Returns an array of { cell: 'A1', value: 'item' } pairs.
+// Deterministic pre-check first (parse quoted values + "row N"), LLM fallback.
+async function _extractSpreadsheetTargets(goal, actionHistory) {
+  // ── Deterministic pre-check ──
+  // Pattern 1: "enter column headers 'item', 'estimated cost', 'actual cost' in row 1"
+  // → cells A1, B1, C1, ... (left to right in row N)
+  const _goalLower = (goal || '').toLowerCase();
+  const _quoted = (goal || '').match(/['"][^'"]+['"]/g);
+  const _rowMatch = _goalLower.match(/\brow\s+(\d+)\b/);
+  const _typedCells = actionHistory
+    .filter(a => a.includes('ArrowGrid: typed') || a.includes('Shortcut: typed'))
+    .map(a => { const m = a.match(/cell\s+([A-Z]{1,2}\d+)/i); return m ? m[1].toUpperCase() : null; })
+    .filter(Boolean);
+
+  if (_quoted && _quoted.length > 0 && _rowMatch) {
+    const _rowNum = _rowMatch[1];
+    const _values = _quoted.map(q => q.replace(/^['"]|['"]$/g, ''));
+    // Filter out the sheet/container name — it's the FIRST quoted string
+    // that appears BEFORE the word "spreadsheet" or "sheet" in the goal.
+    // Column header values appear AFTER "headers"/"enter"/"add" and are
+    // NOT the sheet name. Only filter the first match to avoid removing
+    // actual column values (which all appear before "row N" in the goal).
+    const _beforeSpreadsheet = _goalLower.split(/\bspreadsheet\b|\bsheet\b/)[0] || '';
+    const _filteredValues = _values.filter((v, i) => {
+      // Only remove the FIRST quoted string if it appears before "spreadsheet"
+      if (i === 0 && _beforeSpreadsheet.includes(`'${v.toLowerCase()}'`)) return false;
+      return true;
+    });
+    const _targets = _filteredValues.map((v, i) => ({
+      cell: `${String.fromCharCode(65 + i)}${_rowNum}`,
+      value: v,
+    }));
+    // Return only untyped targets
+    const _untyped = _targets.filter(t => !_typedCells.includes(t.cell));
+    if (_untyped.length > 0) {
+      logger.info(`[browser.agent] _extractSpreadsheetTargets: deterministic → ${_untyped.map(t => `${t.cell}="${t.value.slice(0, 20)}"`).join(', ')}`);
+      return _untyped;
+    }
+    // All typed → done
+    if (_targets.length > 0 && _untyped.length === 0) {
+      logger.info(`[browser.agent] _extractSpreadsheetTargets: all ${_targets.length} targets already typed`);
+      return [];
+    }
+  }
+
+  // Pattern 2: explicit cell references — "enter 'Date' in A1 and 'Amount' in C5"
+  const _explicitMatches = (goal || '').matchAll(/['"]([^'"]+)['"]\s+(?:in|into|at)\s+([A-Z]{1,2}\d{1,3})/gi);
+  const _explicitTargets = [];
+  for (const m of _explicitMatches) {
+    _explicitTargets.push({ cell: m[2].toUpperCase(), value: m[1] });
+  }
+  if (_explicitTargets.length > 0) {
+    const _untyped = _explicitTargets.filter(t => !_typedCells.includes(t.cell));
+    if (_untyped.length > 0) {
+      logger.info(`[browser.agent] _extractSpreadsheetTargets: explicit cells → ${_untyped.map(t => `${t.cell}="${t.value.slice(0, 20)}"`).join(', ')}`);
+      return _untyped;
+    }
+  }
+
+  // ── LLM fallback ──
+  const { askWithMessages } = require('../skill-helpers/skill-llm.cjs');
+  const _historyStr = (actionHistory || []).slice(-8).map((a, i) => `  ${i + 1}. ${a}`).join('\n');
+  const _systemPrompt = `You extract spreadsheet cell targets from a goal. Return a JSON array of {cell, value} pairs.
+- cell: the cell address (e.g., A1, B3, AA10)
+- value: the text to type into that cell
+- Return targets in the order they should be entered (left-to-right, top-to-bottom)
+- If the goal says "row N", use cells A{N}, B{N}, C{N}, ... for each value
+- If the goal specifies explicit cells (e.g., "A1" and "C5"), use those
+- Exclude values that are container/sheet names (e.g., 'Trip Budget') — only include cell values
+- Check action history — exclude cells that have already been typed
+- Output ONLY the JSON array, no other text`;
+
+  const _userPrompt = `Goal: ${goal}
+Actions taken:
+${_historyStr || '  (none)'}
+
+Return the remaining (cell, value) targets as JSON:`;
+
+  try {
+    const _response = await askWithMessages([
+      { role: 'system', content: _systemPrompt },
+      { role: 'user', content: _userPrompt },
+    ], { maxTokens: 500, temperature: 0, responseTimeoutMs: 10000 });
+    if (_response) {
+      const _jsonMatch = _response.match(/\[[\s\S]*\]/);
+      if (_jsonMatch) {
+        const _targets = JSON.parse(_jsonMatch[0]);
+        if (Array.isArray(_targets)) {
+          const _untyped = _targets.filter(t => t.cell && t.value && !_typedCells.includes(t.cell.toUpperCase()));
+          logger.info(`[browser.agent] _extractSpreadsheetTargets: LLM → ${_untyped.map(t => `${t.cell}="${String(t.value).slice(0, 20)}"`).join(', ')}`);
+          return _untyped;
+        }
+      }
+    }
+  } catch (e) {
+    logger.warn(`[browser.agent] _extractSpreadsheetTargets LLM fallback failed: ${e.message}`);
+  }
+  return [];
+}
+
 // After-action decision: what key to press AFTER typing the value.
 // Returns a number: 0=nothing, 1=Enter, 2=Tab, 3=Escape, 4=Shift+Enter, 5=ArrowDown
 // Separate from _extractValue so _extractValue stays a plain-string return
@@ -2565,13 +2666,14 @@ async function _computeTabFlow(goal, pageCategory, shortcutLabels, currentUrl, a
 
 Available tiers:
 1 = Just-type (type a value into the focused field)
-3 = Shortcuts (press an app keyboard shortcut)
+3 = Shortcuts (press an app keyboard shortcut — e.g., c, Meta+J, Tab)
 4 = Tab-Map (scan page elements once, click/fill forms — handles ALL fields in one session)
+6 = ArrowGrid (spreadsheet: navigate to adjacent cells with arrow keys, type value)
 0 = Done (goal achieved)
 
 Output format: JSON array of steps, each with:
 - state: expected page state description
-- tier: tier number (0, 1, 3, or 4)
+- tier: tier number (0, 1, 3, 4, or 6)
 - action: what the tier should do
 
 Example for "Add calendar event 'Flight to Denver' on July 15":
@@ -2589,23 +2691,21 @@ Example for "Create Google Sheet 'Trip Budget'":
 
 Example for "Add column headers 'Date', 'Category', 'Description', 'Amount' to spreadsheet":
 [
-  {"state": "spreadsheet open, no cell focused", "tier": 3, "action": "press Meta+J, type 'A1', press Enter to focus cell A1"},
-  {"state": "cell A1 focused", "tier": 1, "action": "type 'Date'"},
-  {"state": "A1 has 'Date'", "tier": 3, "action": "press Tab to move to B1"},
-  {"state": "cell B1 focused", "tier": 1, "action": "type 'Category'"},
-  {"state": "B1 has 'Category'", "tier": 3, "action": "press Tab to move to C1"},
-  {"state": "cell C1 focused", "tier": 1, "action": "type 'Description'"},
-  {"state": "C1 has 'Description'", "tier": 3, "action": "press Tab to move to D1"},
-  {"state": "cell D1 focused", "tier": 1, "action": "type 'Amount'"},
+  {"state": "spreadsheet open", "tier": 3, "action": "Meta+J → A1, type 'Date', Tab to B1"},
+  {"state": "B1 focused", "tier": 3, "action": "Meta+J → B1, type 'Category', Tab to C1"},
+  {"state": "C1 focused", "tier": 3, "action": "Meta+J → C1, type 'Description', Tab to D1"},
+  {"state": "D1 focused", "tier": 3, "action": "Meta+J → D1, type 'Amount', Enter to commit"},
   {"state": "all headers entered", "tier": 0, "action": "done"}
 ]
 
 CRITICAL RULES:
-- Tier 3 (Shortcuts) is for pressing app keyboard shortcuts (e.g., c, Meta+J, Tab between cells)
-- Tier 1 (Just-type) is for typing a value into the focused field
+- Tier 3 (Shortcuts) is for pressing app keyboard shortcuts (e.g., c, Meta+J to focus a cell)
+- Tier 1 (Just-type) is for typing a value into the focused field (non-spreadsheet)
 - Tier 4 (Tab-Map) is for clicking elements or filling multi-field forms. Tab-Map scans ONCE per state and fills ALL fields in one session — do NOT split it into multiple steps for the same overlay/dialog.
+- Tier 6 (ArrowGrid) is DEPRECATED for spreadsheet cell entry — use Tier 3 (Meta+J) instead.
 - Tier 0 means done
-- For spreadsheet cell entry: use Meta+J (tier 3) to focus a cell, then Just-type (tier 1) to type the value, then Tab (tier 3) to move to the next cell. Repeat for each cell.
+- For spreadsheet cell entry: use Tier 3 (Meta+J) for EACH cell. Tier 3 handles the full flow: Meta+J → type cell address → Enter → type value → Tab/Enter. Do NOT use Tier 6 (ArrowGrid) or Tier 1 (Just-type) for spreadsheet cells.
+- For far jumps in spreadsheets (e.g., A1 to F10): use Tier 3 (Meta+J) to jump to each cell and type the value.
 - For creation deep links (docs.google.com/*/create): the entity is already created. For docs, Just-type the title. For sheets, use Tab-Map to click the title bar and rename.
 - Be specific about what action each tier should take
 - Output ONLY the JSON array, no other text`;
@@ -7404,7 +7504,7 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
           action: 'research_app_behavior',
           domain: _akDomain,
           query: _akQuery,
-          maxResults: 4,
+          maxResults: 10,
         }).catch(() => null);
         const _staleReason = _cacheStale
           ? 'stale (all low-confidence snippet entries)'
@@ -12481,6 +12581,7 @@ module.exports._decisionCall = _decisionCall;
 module.exports._buildFocusedStr = _buildFocusedStr;
 module.exports._extractValue = _extractValue;
 module.exports._extractAfterAction = _extractAfterAction;
+module.exports._extractSpreadsheetTargets = _extractSpreadsheetTargets;
 module.exports._extractGestureType = _extractGestureType;
 module.exports._extractGestureTargets = _extractGestureTargets;
 module.exports._ocrVerifyGoal = _ocrVerifyGoal;

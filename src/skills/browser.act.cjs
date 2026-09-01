@@ -2926,6 +2926,9 @@ async function browserAct(args) {
             openSessions.add(sessionId);
             // Inject CSS cosmetic ad-hiding (Layer 3) — non-blocking
             try { await page.evaluate(_AD_BLOCK_SCRIPT); } catch (_) {}
+            // Clean up any blank tabs (about:blank / chrome://newtab) that
+            // accumulated from the initial Chrome launch or failed navigations.
+            closeBlankTabs(sessionId, headed).catch(() => {});
             return {
               ok: true,
               action,

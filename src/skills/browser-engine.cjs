@@ -21,6 +21,14 @@ let _realChromeAvailable = null;
 let _realChromeCooldownUntil = 0;
 const _REAL_CHROME_COOLDOWN_MS = 60 * 1000; // 1 minute cooldown after a launch failure
 
+// Track which sessions are currently using real Chrome (channel='chrome').
+// On macOS, launching a 2nd real Chrome instance redirects to the 1st one's
+// window (creating a blank tab there) and fails with "Opening in existing
+// browser session". To avoid this, concurrent agents skip real Chrome and
+// use bundled Chrome for Testing (CfT) directly — they're already
+// authenticated via persistent profiles, so OAuth isn't needed.
+const _activeRealChromeSessions = new Set();
+
 /**
  * Detect whether the user's real Google Chrome is installed.
  * Checks common install paths per platform. Returns true/false.
@@ -239,9 +247,6 @@ async function launch(sessionId, opts = {}) {
 
   if (_wantChrome) {
     // Check if real Chrome is available (cached after first check).
-    // If a previous launch failed and we're in a cooldown period, skip real
-    // Chrome for now but retry after the cooldown expires (transient failures
-    // like profile locks shouldn't permanently disable real Chrome).
     if (_realChromeAvailable === null) {
       _realChromeAvailable = _detectRealChrome();
       logger.info(`[browser-engine] real Chrome available: ${_realChromeAvailable}`);
@@ -250,44 +255,32 @@ async function launch(sessionId, opts = {}) {
     if (_inCooldown) {
       logger.info(`[browser-engine] real Chrome in cooldown (until ${new Date(_realChromeCooldownUntil).toISOString()}) — using bundled CfT`);
     }
-    if (_realChromeAvailable && !_inCooldown) {
+
+    // ── Concurrent real Chrome guard ──────────────────────────────────────
+    // On macOS, launching a 2nd real Chrome instance redirects to the 1st
+    // one's window (creating a blank tab there) and fails with "Opening in
+    // existing browser session". Skip real Chrome if another session is
+    // already using it — concurrent agents use CfT directly (they're already
+    // authenticated via persistent profiles, so OAuth isn't needed).
+    const _otherRealChromeActive = [..._activeRealChromeSessions].some(s => s !== sessionId);
+    if (_otherRealChromeActive) {
+      logger.info(`[browser-engine] skipping real Chrome — ${_activeRealChromeSessions.size} session(s) already using it (${[..._activeRealChromeSessions].join(', ')}) — using bundled CfT for session=${sessionId}`);
+    }
+
+    if (_realChromeAvailable && !_inCooldown && !_otherRealChromeActive) {
       try {
         ctx = await getChromium().launchPersistentContext(profileDir, { ...launchOpts, channel: 'chrome' });
         _usedChannel = 'chrome';
+        _activeRealChromeSessions.add(sessionId);
       } catch (chromeErr) {
-        // Profile lock error: a zombie Chrome process from a previous run holds the profile
-        // directory. Kill it and retry real Chrome once before falling back to CfT.
+        // On "Opening in existing browser session" or profile lock errors,
+        // fall back to CfT immediately — do NOT retry (the retry produces
+        // extra blank tabs for no benefit, since the SingletonLock cleanup
+        // at the top of launch() already handled zombie processes).
         if (/already in use|profile.*lock|Opening in existing browser session/i.test(chromeErr.message)) {
-          logger.warn(`[browser-engine] real Chrome launch failed (${chromeErr.message}) — attempting zombie cleanup + retry`);
-          try {
-            // Kill any zombie Chrome process holding this profile directory
-            // via the SingletonLock file (PID is embedded in the symlink target).
-            try {
-              const lockPath = path.join(profileDir, 'SingletonLock');
-              if (fs.existsSync(lockPath)) {
-                const target = fs.readlinkSync(lockPath);
-                const m = String(target).match(/-(\d+)$/);
-                if (m) {
-                  const pid = parseInt(m[1], 10);
-                  if (pid) {
-                    try { process.kill(pid, 0); } catch (_) {}
-                    try { process.kill(pid, 'SIGTERM'); } catch (_) {}
-                    await new Promise(r => setTimeout(r, 1500));
-                  }
-                }
-              }
-            } catch (_) {}
-            clearProfileLock(sessionId);
-            // Retry real Chrome after zombie cleanup
-            ctx = await getChromium().launchPersistentContext(profileDir, { ...launchOpts, channel: 'chrome' });
-            _usedChannel = 'chrome';
-            logger.info(`[browser-engine] real Chrome launch succeeded after zombie cleanup`);
-          } catch (retryErr) {
-            logger.warn(`[browser-engine] real Chrome retry failed (${retryErr.message}) — falling back to bundled Chrome for Testing (cooldown ${_REAL_CHROME_COOLDOWN_MS}ms)`);
-            _realChromeCooldownUntil = Date.now() + _REAL_CHROME_COOLDOWN_MS;
-          }
+          logger.warn(`[browser-engine] real Chrome launch failed (${chromeErr.message}) — falling back to bundled CfT (no retry — avoids blank tabs)`);
         } else {
-          logger.warn(`[browser-engine] real Chrome launch failed (${chromeErr.message}) — falling back to bundled Chrome for Testing (cooldown ${_REAL_CHROME_COOLDOWN_MS}ms)`);
+          logger.warn(`[browser-engine] real Chrome launch failed (${chromeErr.message}) — falling back to bundled CfT (cooldown ${_REAL_CHROME_COOLDOWN_MS}ms)`);
           _realChromeCooldownUntil = Date.now() + _REAL_CHROME_COOLDOWN_MS;
         }
       }
@@ -337,6 +330,7 @@ async function closeSession(sessionId) {
   if (!s) return;
   try { await s.context.close(); } catch (e) { logger.warn(`[browser-engine] close: ${e.message}`); }
   clearAdBlockSession(sessionId);
+  _activeRealChromeSessions.delete(sessionId);
   _sessions.delete(sessionId);
 }
 

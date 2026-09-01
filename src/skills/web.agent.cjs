@@ -979,50 +979,103 @@ async function actionResearchAppBehavior({ domain, query, maxResults = 4 }) {
     return { ok: true, query: queries.join(' | '), entries: [], confidence: 0, sourceCount: 0 };
   }
 
-  // ── Phase 2: Crawl best pages + LLM-synthesize actionable knowledge ──
-  // Pick the best pages to crawl. Prefer official help/support docs for the
-  // service (most reliable), then fall back to known shortcut-aggregator sites.
-  // Domain verification: skip results whose source doesn't match the target app
-  // AND isn't a known shortcut aggregator (prevents e.g. Slack shortcuts leaking
-  // into twitter.com's appKnowledge).
+  // ── Phase 2: LLM selects best URLs to crawl ─────────────────────────────
+  // Instead of regex hostname matching, use the LLM to pick the most promising
+  // URLs for app operational knowledge (shortcuts, UI modes, workflows).
+  // This is more robust than substring matching — it understands that
+  // support.google.com is relevant for "google sheets" even though the hostname
+  // doesn't contain "sheets".
   const serviceHost = hostForId.split('.').slice(-2).join('.');
   const SHORTCUT_AGGREGATOR_SITES = [
     'shortcut-tools.com', 'cheatography.com', 'keyboardshortcuts.org',
     'keycombiner.com', 'defkey.com', 'dotnetperls.com', 'coursera.org',
   ];
+  // Keep the regex filter as a fallback in case LLM classification fails
   const _isRelevantSource = (h) => {
     if (h.includes(serviceHost) || h.includes(appName.toLowerCase().replace(/\s+/g, ''))) return true;
     if (SHORTCUT_AGGREGATOR_SITES.some(s => h.includes(s))) return true;
     return false;
   };
-  const crawlCandidates = [];
-  const seenUrls = new Set();
-  // First: official docs (hostname contains the service domain)
+
+  // Build URL candidates list (deduped, with title + snippet for LLM context)
+  const _seenUrls = new Set();
+  const _urlCandidates = [];
   for (const r of searchResults) {
-    try {
-      const h = new URL(r.url).hostname.replace(/^www\./, '');
-      if (_isRelevantSource(h) && !seenUrls.has(r.url)) {
-        crawlCandidates.push(r);
-        seenUrls.add(r.url);
-      }
-    } catch (_) {}
+    if (!r.url || _seenUrls.has(r.url)) continue;
+    _seenUrls.add(r.url);
+    _urlCandidates.push({
+      url: r.url,
+      title: (r.title || '').slice(0, 100),
+      snippet: (r.snippet || r.description || '').slice(0, 200),
+    });
   }
-  // Then: other relevant results (cheat sheets, tutorials from aggregators) — but only if they look substantive
-  for (const r of searchResults) {
-    if (crawlCandidates.length >= 3) break;
-    if (seenUrls.has(r.url)) continue;
+
+  let crawlCandidates = [];
+  if (_urlCandidates.length > 0) {
     try {
-      const h = new URL(r.url).hostname.replace(/^www\./, '');
-      if (!_isRelevantSource(h)) continue; // skip irrelevant sources
-    } catch (_) { continue; }
-    const text = `${r.title || ''} ${r.snippet || ''}`;
-    if (text.length > 50 && /shortcut|keyboard|how to|guide|tutorial|tip|slash|command|block|insert/i.test(text)) {
-      crawlCandidates.push(r);
-      seenUrls.add(r.url);
+      const { ask } = require('../skill-helpers/skill-llm.cjs');
+      const _classifyPrompt = `You are selecting the best URLs to crawl for operational knowledge about "${appName}" (a web application).
+
+Below is a list of search results (URL, title, snippet). Select the 1-3 URLs most likely to contain actionable operational documentation: keyboard shortcuts, UI modes, element selectors, workflow steps, or app quirks.
+
+Prioritize:
+1. Official help/support documentation (e.g., support.google.com, docs.notion.so, help.slack.com)
+2. Comprehensive cheat sheets with structured shortcut lists
+3. Technical tutorials with specific key combos and selectors
+
+Avoid:
+- Blog posts with generic advice (no specific shortcuts)
+- PDF downloads
+- Video-only content
+- Marketing pages
+
+Return ONLY a JSON array of URL strings (max 3), e.g. ["url1", "url2"]:
+${JSON.stringify(_urlCandidates.slice(0, 20), null, 2)}`;
+
+      const raw = await ask(_classifyPrompt, { maxTokens: 500, temperature: 0, responseTimeoutMs: 10000 });
+      const jsonMatch = raw && raw.match(/\[[\s\S]*\]/);
+      if (jsonMatch) {
+        const selectedUrls = JSON.parse(jsonMatch[0]);
+        if (Array.isArray(selectedUrls)) {
+          crawlCandidates = selectedUrls
+            .map(url => searchResults.find(r => r.url === url))
+            .filter(Boolean);
+        }
+      }
+      logger.info(`[web.agent] research_app_behavior: LLM selected ${crawlCandidates.length} crawl candidates for "${appName}"`);
+    } catch (_llmErr) {
+      logger.warn(`[web.agent] research_app_behavior: LLM URL classification failed: ${_llmErr.message} — falling back to regex filter`);
     }
   }
 
-  logger.info(`[web.agent] research_app_behavior: ${crawlCandidates.length} crawl candidates for "${appName}"`);
+  // Fallback: if LLM classification failed or returned nothing, use the old regex filter
+  if (crawlCandidates.length === 0) {
+    crawlCandidates = [];
+    const _fallbackSeen = new Set();
+    for (const r of searchResults) {
+      try {
+        const h = new URL(r.url).hostname.replace(/^www\./, '');
+        if (_isRelevantSource(h) && !_fallbackSeen.has(r.url)) {
+          crawlCandidates.push(r);
+          _fallbackSeen.add(r.url);
+        }
+      } catch (_) {}
+    }
+    for (const r of searchResults) {
+      if (crawlCandidates.length >= 3) break;
+      if (_fallbackSeen.has(r.url)) continue;
+      try {
+        const h = new URL(r.url).hostname.replace(/^www\./, '');
+        if (!_isRelevantSource(h)) continue;
+      } catch (_) { continue; }
+      const text = `${r.title || ''} ${r.snippet || ''}`;
+      if (text.length > 50 && /shortcut|keyboard|how to|guide|tutorial|tip|slash|command|block|insert/i.test(text)) {
+        crawlCandidates.push(r);
+        _fallbackSeen.add(r.url);
+      }
+    }
+    logger.info(`[web.agent] research_app_behavior: regex fallback selected ${crawlCandidates.length} crawl candidates for "${appName}"`);
+  }
 
   // Crawl each candidate in parallel — each crawl uses its own browser session
   // (_crawl_<hash>), so they're fully independent and can run concurrently.
