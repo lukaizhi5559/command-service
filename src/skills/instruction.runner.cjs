@@ -255,6 +255,15 @@ async function _detectChipField(sessionId) {
 // If it closed (Enter submitted the form prematurely), stops and returns ok:false.
 // ---------------------------------------------------------------------------
 async function _confirmChipIfNeeded(sessionId, stepTarget, stepValue, pageCategory) {
+  // Spreadsheets cells are not token/chip fields. The chip detector can false-positive
+  // on spreadsheet formula bars / cell editors because they have ancestors with
+  // role="listbox" or .token classes. Pressing Enter to "confirm a chip" in a
+  // spreadsheet either moves to the next row or converts the value to a formula,
+  // breaking row-1 header entry. Skip chip confirmation entirely for spreadsheets.
+  if (pageCategory === 'spreadsheet') {
+    logger.info('[instruction.runner] _confirmChipIfNeeded: skipping — pageCategory is spreadsheet');
+    return { ok: true, pressed: false };
+  }
   const _chipDetect = await _detectChipField(sessionId);
   logger.info(`[instruction.runner] _confirmChipIfNeeded: pageCategory=${pageCategory}, target="${stepTarget}", value="${String(stepValue || '').slice(0, 40)}", signals=${JSON.stringify(_chipDetect.signals)}, isChip=${_chipDetect.isChip}`);
 
@@ -914,6 +923,34 @@ async function buildTabMap(sessionId, maxElements = 150, options = {}) {
     }
   }
 
+  // If skipReset but focus is trapped in a canvas/grid (document editors:
+  // spreadsheets, code editors, doc editors load with canvas focus), break
+  // out by clicking at the top-left of the page where chrome/toolbar lives.
+  // Don't press Escape (could close a real overlay). Without this, Tab
+  // navigates within the canvas and finds 0 chrome elements.
+  if (skipReset) {
+    const _preEl2 = await _readActiveElement(sessionId);
+    const _isCanvasFocus = _preEl2 && (
+      _preEl2.role === 'grid' || _preEl2.role === 'gridcell' ||
+      _preEl2.tag === 'canvas' ||
+      // Spreadsheet cells are often div[role=textbox] inside [role=grid]
+      (_preEl2.role === 'textbox' && _preEl2.tag === 'div') ||
+      // Code editors: textarea inside .cm-editor/.monaco-editor
+      _preEl2.tag === 'textarea'
+    );
+    if (_isCanvasFocus) {
+      logger.info(`[instruction.runner] buildTabMap (${label}): focus trapped in canvas/grid (tag=${_preEl2.tag}, role=${_preEl2.role}) — clicking top-left to break out`);
+      try {
+        await browserAct({ action: 'clickAt', sessionId, x: 10, y: 60, headed: true, timeoutMs: 3000 });
+        await _sleep(200);
+      } catch (e) {
+        logger.warn(`[instruction.runner] buildTabMap: canvas break-out click failed: ${e.message}`);
+      }
+      const _postEl = await _readActiveElement(sessionId);
+      logger.info(`[instruction.runner] buildTabMap: after break-out — focus tag=${_postEl?.tag || 'none'}, role=${_postEl?.role || 'none'}, text="${_postEl?.text || ''}"`);
+    }
+  }
+
   if (!skipReset) {
     await _resetFocusToPageTop(sessionId);
   }
@@ -1100,23 +1137,40 @@ async function buildTabMap(sessionId, maxElements = 150, options = {}) {
         const fillable = scope.querySelectorAll('input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"]):not([type="submit"]):not([type="button"]):not([type="file"]), textarea, [contenteditable="true"], [contenteditable=""], [role="textbox"], [role="combobox"]');
         for (const el of fillable) {
           const r = el.getBoundingClientRect();
-          if (r.width > 0 && r.height > 0) out.push({
-            tag: el.tagName.toLowerCase(), role: el.getAttribute('role') || '',
-            text: (el.getAttribute('aria-label') || el.placeholder || '').slice(0, 80),
-            ariaLabel: (el.getAttribute('aria-label') || '').slice(0, 80),
-            placeholder: (el.getAttribute('placeholder') || '').slice(0, 80),
-            value: (el.value || el.innerText || '').slice(0, 100),
-            x: r.x, y: r.y, w: r.width, h: r.height
-          });
+          if (r.width > 0 && r.height > 0) {
+            // Inject data-td-ref so DOM-scanned elements are clickable via selector
+            let ref = el.getAttribute('data-td-ref');
+            if (!ref || !ref.startsWith('tm-')) {
+              ref = 'tm-' + Math.random().toString(36).slice(2, 10);
+              el.setAttribute('data-td-ref', ref);
+            }
+            out.push({
+              tag: el.tagName.toLowerCase(), role: el.getAttribute('role') || '',
+              text: (el.getAttribute('aria-label') || el.placeholder || '').slice(0, 80),
+              ariaLabel: (el.getAttribute('aria-label') || '').slice(0, 80),
+              placeholder: (el.getAttribute('placeholder') || '').slice(0, 80),
+              value: (el.value || el.innerText || '').slice(0, 100),
+              ref,
+              x: r.x, y: r.y, w: r.width, h: r.height
+            });
+          }
         }
         const clickables = scope.querySelectorAll('button, a, [role="button"], [role="tab"], [role="link"], [role="menuitem"]');
         for (const el of clickables) {
           const r = el.getBoundingClientRect();
-          if (r.width > 0 && r.height > 0) out.push({
-            tag: el.tagName.toLowerCase(), role: el.getAttribute('role') || '',
-            text: (el.innerText || el.getAttribute('aria-label') || el.title || '').slice(0, 80),
-            x: r.x, y: r.y, w: r.width, h: r.height
-          });
+          if (r.width > 0 && r.height > 0) {
+            let ref = el.getAttribute('data-td-ref');
+            if (!ref || !ref.startsWith('tm-')) {
+              ref = 'tm-' + Math.random().toString(36).slice(2, 10);
+              el.setAttribute('data-td-ref', ref);
+            }
+            out.push({
+              tag: el.tagName.toLowerCase(), role: el.getAttribute('role') || '',
+              text: (el.innerText || el.getAttribute('aria-label') || el.title || '').slice(0, 80),
+              ref,
+              x: r.x, y: r.y, w: r.width, h: r.height
+            });
+          }
         }
         return JSON.stringify(out);
       })()`
@@ -1128,7 +1182,7 @@ async function buildTabMap(sessionId, maxElements = 150, options = {}) {
         const sig = `${it.tag}:${it.text}:${Math.round(it.x)}:${Math.round(it.y)}`;
         if (!seenSet.has(sig)) {
           seenSet.add(sig);
-          map.push({ id: ++idCounter, ...it, ref: null });
+          map.push({ id: ++idCounter, ...it });
           _added++;
         }
       }
@@ -2010,7 +2064,7 @@ async function _executeAction(sessionId, step) {
       let _verify = await browserAct({
         action: 'evaluate', sessionId, headed: true, timeoutMs: 2000,
         text: `(() => {
-          const el = ${_fillRef ? `document.querySelector('[data-td-ref="${_fillRef}"]') || document.activeElement` : 'document.activeElement'};
+          const el = ${_fillRef ? `document.querySelector('[data-td-ref="${_fillRef}"]')` : 'document.activeElement'};
           if (!el || el === document.body) return { ok: false };
           const v = el.value !== undefined ? String(el.value) : (el.textContent || el.innerText || '');
           // inDialog verify: only count for combobox-like elements (INPUT/TEXTAREA/combobox),
@@ -2039,7 +2093,7 @@ async function _executeAction(sessionId, step) {
             _verify = await browserAct({
               action: 'evaluate', sessionId, headed: true, timeoutMs: 2000,
               text: `(() => {
-                const el = document.querySelector('[data-td-ref="${_fillRef}"]') || document.activeElement;
+                const el = document.querySelector('[data-td-ref="${_fillRef}"]');
                 if (!el || el === document.body) return { ok: false };
                 const v = el.value !== undefined ? String(el.value) : (el.textContent || el.innerText || '');
                 const isCombobox = el?.getAttribute('role') === 'combobox' || el?.tagName === 'INPUT' || el?.tagName === 'TEXTAREA';
@@ -2090,7 +2144,7 @@ async function _executeAction(sessionId, step) {
           _verify = await browserAct({
             action: 'evaluate', sessionId, headed: true, timeoutMs: 2000,
             text: `(() => {
-              const el = ${_fillRef ? `document.querySelector('[data-td-ref="${_fillRef}"]') || document.activeElement` : 'document.activeElement'};
+              const el = ${_fillRef ? `document.querySelector('[data-td-ref="${_fillRef}"]')` : 'document.activeElement'};
               if (!el || el === document.body) return { ok: false };
               const v = el.value !== undefined ? String(el.value) : (el.textContent || el.innerText || '');
               return { ok: v.includes(${JSON.stringify(_val.slice(0, 50))}), value: v.slice(0, 100) };
@@ -3415,6 +3469,47 @@ async function _clickFirstFillable(sessionId) {
   }
 }
 
+// ── Spreadsheet cell navigation helper ─────────────────────────────────
+// Focuses a specific cell in Google Sheets / Excel Online via the Name Box.
+// Flow: Cmd+J (Mac) / Ctrl+J (Win) → focus Name Box → type cell address → Enter → cell focused.
+// Returns { ok, cellAddress, error }
+async function _focusSpreadsheetCell(sessionId, cellAddress) {
+  if (!cellAddress) return { ok: false, error: 'No cell address provided' };
+  const _normalizedAddr = String(cellAddress).trim().toUpperCase();
+
+  logger.info(`[instruction.runner] _focusSpreadsheetCell: focusing cell ${_normalizedAddr} via Name Box`);
+
+  // 1. Press Cmd+J (Mac) to focus the Name Box
+  //    Meta=Cmd on macOS, Control=Ctrl on Windows/Linux
+  const _isMac = process.platform === 'darwin';
+  const _nameBoxShortcut = _isMac ? 'Meta+j' : 'Control+j';
+  try {
+    await browserAct({ action: 'press', sessionId, key: _nameBoxShortcut, headed: true, timeoutMs: 5000 });
+    await _sleep(600); // wait for Name Box to focus
+  } catch (e) {
+    return { ok: false, error: `Name Box shortcut failed: ${e.message}` };
+  }
+
+  // 2. Type the cell address into the Name Box
+  try {
+    await browserAct({ action: 'type', sessionId, text: _normalizedAddr, headed: true, timeoutMs: 3000 });
+    await _sleep(200);
+  } catch (e) {
+    return { ok: false, error: `Type cell address failed: ${e.message}` };
+  }
+
+  // 3. Press Enter to jump to the cell
+  try {
+    await browserAct({ action: 'press', sessionId, key: 'Enter', headed: true, timeoutMs: 3000 });
+    await _sleep(500); // wait for cell to be focused
+  } catch (e) {
+    return { ok: false, error: `Enter (cell focus) failed: ${e.message}` };
+  }
+
+  logger.info(`[instruction.runner] _focusSpreadsheetCell: focused cell ${_normalizedAddr} ✓`);
+  return { ok: true, cellAddress: _normalizedAddr };
+}
+
 // ── Strategy 1: Just-type ──────────────────────────────────────────────
 // The focused element is the right field — just type into it.
 // If no element is focused (e.g., canvas editor where title isn't auto-focused),
@@ -4328,23 +4423,61 @@ async function _executeMetaF(sessionId, searchText) {
   }
 }
 
-// ── Strategy 3: App Shortcuts ──────────────────────────────────────────
-// Press an app-specific keyboard shortcut from appKnowledge.
+// ── Strategy 3: Keyboard Navigation / App Shortcuts ────────────────────
+// Press a keyboard action (global nav key or app-specific shortcut).
 // Returns { ok, pageChanged, error }
-async function _executeShortcut(sessionId, keyCombo) {
+// Global navigation keys (Arrow, Tab, Enter, Esc, etc.) keep focus on the
+// current element — they need to act on it (e.g., ArrowRight moves cursor
+// in a cell, Tab moves to next cell). App-specific modifier shortcuts
+// (Cmd+S, Ctrl+Shift+F) blur the focused element first to prevent the key
+// from being typed into a text field.
+const _GLOBAL_NAV_KEY_SET = new Set([
+  'ArrowRight', 'ArrowLeft', 'ArrowUp', 'ArrowDown',
+  'Tab', 'Enter', 'Escape', ' ', 'Space',
+  'Shift+Tab', 'Shift+Enter',
+  'Backspace', 'Delete',
+]);
+
+async function _executeShortcut(sessionId, keyCombo, goal = '', actionHistory = []) {
   if (!keyCombo) return { ok: false, pageChanged: false, error: 'No shortcut' };
 
   logger.info(`[instruction.runner] Shortcut: pressing "${keyCombo}"`);
 
-  // Blur focused input so the shortcut key isn't typed into a text field
-  // (e.g., Shift+c would type "c" into the title field without this)
-  try {
-    await browserAct({
-      action: 'evaluate', sessionId, headed: true, timeoutMs: 2000,
-      text: `(() => { const el = document.activeElement; if (el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.isContentEditable)) { el.blur(); } return true; })()`
-    });
-    await _sleep(200); // let blur settle
-  } catch (_) {}
+  // Multi-step shortcut: Meta+J / Control+J focuses the Name Box, but needs
+  // follow-up typing (cell address + Enter) to actually jump to a cell.
+  // Use _focusSpreadsheetCell which does the full 3-step flow:
+  //   Meta+J → type cell address (e.g. "A1") → Enter → cell focused
+  if (keyCombo === 'Meta+j' || keyCombo === 'Control+j') {
+    // Determine target cell from goal or default to A1
+    let _targetCell = 'A1';
+    const _cellMatch = (goal || '').toLowerCase().match(/\b([a-z]{1,2})(\d{1,3})\b/);
+    if (_cellMatch) {
+      _targetCell = _cellMatch[1].toUpperCase() + _cellMatch[2];
+    } else if (actionHistory.some(a => a.includes('focused A1'))) {
+      // Already focused A1 — advance to next column based on typed count
+      const _typedCount = actionHistory.filter(a => a.includes('Just-type typed') || a.includes('type "')).length;
+      const _nextCol = String.fromCharCode(65 + _typedCount); // A, B, C, ...
+      _targetCell = `${_nextCol}1`;
+    }
+    logger.info(`[instruction.runner] Shortcut: Meta+J → focusing cell ${_targetCell} via _focusSpreadsheetCell`);
+    const _result = await _focusSpreadsheetCell(sessionId, _targetCell);
+    return { ok: _result.ok, pageChanged: false, error: _result.error };
+  }
+
+  // Only blur for modifier shortcuts (Cmd+, Ctrl+, Alt+, Meta+) where typing
+  // the key into a text field is a risk. Global navigation keys (Arrow, Tab,
+  // Enter, Esc, etc.) need the element to stay focused — they act on it.
+  const _isGlobalNavKey = _GLOBAL_NAV_KEY_SET.has(keyCombo)
+    || /^Shift\+(Arrow|Tab|Enter|Space)/.test(keyCombo);
+  if (!_isGlobalNavKey) {
+    try {
+      await browserAct({
+        action: 'evaluate', sessionId, headed: true, timeoutMs: 2000,
+        text: `(() => { const el = document.activeElement; if (el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.isContentEditable)) { el.blur(); } return true; })()`
+      });
+      await _sleep(200); // let blur settle
+    } catch (_) {}
+  }
 
   const _preUrl = await _getUrl(sessionId);
   try {
@@ -4446,6 +4579,57 @@ async function _executeTabMapAction(sessionId, parsed, tabMap, overlayActive, pa
   }
 
   if (parsed.action === 'type') {
+    // ── Spreadsheet cell-focus guard ────────────────────────────────────
+    // In Google Sheets, Tab-Map can accidentally type into the formula bar
+    // (a textarea) instead of a grid cell. If the page is a spreadsheet and
+    // no grid cell is focused, focus the target cell via _focusSpreadsheetCell
+    // (Meta+J → type cell address → Enter) before typing.
+    if (_pageCategory === 'spreadsheet' && parsed.value && !parsed.value.startsWith('PRESS_')) {
+      // Check if a grid cell is currently focused
+      let _isCellFocused = false;
+      try {
+        const _focusCheck = await browserAct({
+          action: 'evaluate', sessionId, headed: true, timeoutMs: 2000,
+          text: `(() => {
+            const el = document.activeElement;
+            if (!el || el === document.body) return false;
+            const ariaLabel = el.getAttribute('aria-label') || '';
+            if (/cell\\s+[A-Z]+\\d+\\s+selected/i.test(ariaLabel)) return true;
+            if (el.closest('[role="gridcell"]')) return true;
+            return false;
+          })()`,
+        });
+        _isCellFocused = !!(_focusCheck?.result);
+      } catch (_) {}
+      if (!_isCellFocused) {
+        let _targetCell = 'A1';
+        const _cellMatch = (parsed.target || '').toLowerCase().match(/\b([a-z]{1,2})(\d{1,3})\b/);
+        if (_cellMatch) _targetCell = _cellMatch[1].toUpperCase() + _cellMatch[2];
+        logger.info(`[instruction.runner] Tab-Map cell-focus guard: no cell focused, focusing ${_targetCell} before typing`);
+        const _cellResult = await _focusSpreadsheetCell(sessionId, _targetCell);
+        if (_cellResult.ok) {
+          await _sleep(300);
+          // Type directly into the focused grid cell — do NOT fall through to
+          // _llmPickFromTabMap (the tab map contains the formula bar/name box,
+          // not grid cells, so it would pick the wrong element).
+          logger.info(`[instruction.runner] Tab-Map cell-focus guard: typing "${parsed.value}" directly into cell ${_targetCell}`);
+          const _typeResult = await browserAct({
+            action: 'type', sessionId, text: parsed.value, headed: true, timeoutMs: 5000,
+          });
+          if (_typeResult?.ok) {
+            await _sleep(200);
+            // Press Tab to move to the next cell (right)
+            await browserAct({ action: 'press', sessionId, key: 'Tab', headed: true, timeoutMs: 3000 }).catch(() => {});
+            return { ok: true, pageChanged: false };
+          }
+          logger.warn(`[instruction.runner] Tab-Map cell-focus guard: type failed: ${_typeResult?.error}`);
+          return { ok: false, pageChanged: false, error: `Cell type failed: ${_typeResult?.error}` };
+        } else {
+          logger.warn(`[instruction.runner] Tab-Map cell-focus guard failed: ${_cellResult.error}`);
+        }
+      }
+    }
+
     let pickedEntry = prePickedEntry || await _llmPickFromTabMap(tabMap, 'fill', parsed.target, parsed.value, '');
     if (!pickedEntry) {
       return { ok: false, pageChanged: false, error: `No element found for "${parsed.target}"`, rescan: true };
@@ -4478,14 +4662,45 @@ async function _executeTabMapAction(sessionId, parsed, tabMap, overlayActive, pa
 
     // Click the field to focus it
     const cssSelector = pickedEntry.ref ? `[data-td-ref="${pickedEntry.ref}"]` : null;
-    if (cssSelector) {
-      try {
-        await browserAct({ action: 'click', sessionId, selector: cssSelector, headed: true, timeoutMs: 5000 });
-      } catch (e) {
-        logger.warn(`[instruction.runner] Tab-Map type: click field error: ${e.message}`);
-      }
+    if (!cssSelector) {
+      logger.warn(`[instruction.runner] Tab-Map type: matched element has no ref — cannot focus, aborting`);
+      return { ok: false, pageChanged: false, error: `Matched element "${parsed.target}" has no ref — cannot focus`, rescan: true };
+    }
+    try {
+      await browserAct({ action: 'click', sessionId, selector: cssSelector, headed: true, timeoutMs: 5000 });
+    } catch (e) {
+      logger.warn(`[instruction.runner] Tab-Map type: click field error: ${e.message}`);
     }
     await _sleep(300);
+
+    // Verify focus moved to the target element before typing.
+    // Without this, typing goes into document.activeElement (e.g. a spreadsheet
+    // cell) and the verify step falsely passes because the cell now contains the text.
+    const _focusCheck = await browserAct({
+      action: 'evaluate', sessionId, headed: true, timeoutMs: 2000,
+      text: `(() => {
+        let el = document.activeElement;
+        if (!el || el === document.body) return { matches: false };
+        let ref = el.getAttribute('data-td-ref') || '';
+        // Walk to contenteditable leaf (same as _readActiveElement)
+        if (!ref && el.isContentEditable) {
+          try {
+            const sel = window.getSelection();
+            if (sel && sel.rangeCount > 0) {
+              let node = sel.getRangeAt(0).startContainer;
+              if (node.nodeType === 3) node = node.parentElement;
+              while (node && !node.isContentEditable) node = node.parentElement;
+              if (node && node !== el) ref = node.getAttribute('data-td-ref') || '';
+            }
+          } catch (_) {}
+        }
+        return { matches: ref === ${JSON.stringify(pickedEntry.ref)}, activeRef: ref };
+      })()`,
+    });
+    if (!_focusCheck?.result?.matches) {
+      logger.warn(`[instruction.runner] Tab-Map type: focus not on target (activeRef=${_focusCheck?.result?.activeRef || 'none'}, expected=${pickedEntry.ref}) — aborting`);
+      return { ok: false, pageChanged: false, error: `Click failed to focus "${parsed.target}" — focus on wrong element`, rescan: true };
+    }
 
     // Execute the type action (includes reactFill, chip confirmation)
     const result = await _executeAction(sessionId, {
@@ -4535,27 +4750,54 @@ async function _matchElementToStep(sessionId, step, tabMap) {
   const target = (step.target || '').toLowerCase().trim();
   if (!target) return null;
 
-  // 1. Exact label match
-  let match = tabMap.find(e => {
+  const _isTypeAction = step.action === 'type';
+
+  // Score each element for how well it matches the target.
+  // For type actions, non-typeable elements (buttons, menu items) are filtered out.
+  // This prevents matching a "Rename" button when we need the "Rename" input.
+  const _scoreElement = (e) => {
     const label = (e.text || e.ariaLabel || '').toLowerCase().trim();
-    return label === target;
-  });
-  if (match) {
-    logger.info(`[instruction.runner] _matchElementToStep: exact match "${step.target}" → #${match.id}`);
-    return match;
+    let score = 0;
+
+    // Label matching
+    if (label === target) score += 3;
+    else if (label.includes(target) || target.includes(label)) score += 2;
+    else if (_fuzzyTextMatch(target, label)) score += 1;
+    else return 0; // no label match at all
+
+    if (!_isTypeAction) return score;
+
+    // For type actions: must be typeable (filter out buttons/menu items)
+    const _isTypeable = e.tag === 'input' || e.tag === 'textarea' ||
+                        e.isContentEditable || e.role === 'textbox' || e.role === 'combobox';
+    if (!_isTypeable) return 0;
+
+    // Bonus signals for type actions:
+    // Has placeholder? (cells don't, title/name fields often do)
+    if (e.placeholder && e.placeholder.length > 0) score += 1;
+    // aria-label matches target? (explicit semantic match)
+    if (e.ariaLabel && e.ariaLabel.toLowerCase().includes(target)) score += 2;
+    // Has a ref? (clickable via selector)
+    if (e.ref) score += 1;
+    // Outside canvas region? (chrome elements are typically at y < 100, small width)
+    if (e.y !== undefined && e.y < 100 && (e.w || 0) < 400) score += 1;
+
+    return score;
+  };
+
+  // Score all elements and pick the highest
+  const scored = tabMap.map(e => ({ entry: e, score: _scoreElement(e) }))
+                       .filter(s => s.score > 0)
+                       .sort((a, b) => b.score - a.score);
+
+  if (scored.length > 0) {
+    const best = scored[0];
+    const _next = scored[1];
+    logger.info(`[instruction.runner] _matchElementToStep: scored match "${step.target}" → #${best.entry.id} (score=${best.score}${_next ? `, next=${_next.score}` : ''})`);
+    return best.entry;
   }
 
-  // 2. Contains match (target is substring of label or vice versa)
-  match = tabMap.find(e => {
-    const label = (e.text || e.ariaLabel || '').toLowerCase().trim();
-    return label.includes(target) || target.includes(label);
-  });
-  if (match) {
-    logger.info(`[instruction.runner] _matchElementToStep: fuzzy match "${step.target}" → #${match.id} "${match.text || match.ariaLabel}"`);
-    return match;
-  }
-
-  // 3. LLM fallback — ask which element ID matches
+  // LLM fallback — ask which element ID matches
   const { askWithMessages } = require('../skill-helpers/skill-llm.cjs');
   const elementList = tabMap.map(e =>
     `${e.id} - ${e.tag || ''} "${e.text || e.ariaLabel || ''}" ${e.role || ''}`
@@ -4566,7 +4808,7 @@ async function _matchElementToStep(sessionId, step, tabMap) {
       { role: 'user', content: `Target: "${step.target}"\nElements:\n${elementList}\n\nWhich element ID matches?` },
     ], { maxTokens: 5, temperature: 0.1, responseTimeoutMs: 5000 });
     const num = parseInt((raw || '').trim().replace(/\D/g, ''), 10);
-    match = tabMap.find(e => e.id === num);
+    const match = tabMap.find(e => e.id === num);
     if (match) {
       logger.info(`[instruction.runner] _matchElementToStep: LLM match "${step.target}" → #${match.id}`);
       return match;
@@ -4833,16 +5075,28 @@ async function _probePageStructure(sessionId) {
       const pageTitle = (document.title || '').slice(0, 100);
       const visibleText = ((scope === document ? document.body : scope).innerText || '').replace(/\\s+/g, ' ').trim().slice(0, 200);
 
+      // ── Page category signals (service-agnostic DOM detection) ──
+      // These signals let the iteration loop override the initial pageCategory guess
+      // when the actual DOM structure indicates a different page type (e.g., spreadsheet
+      // grid vs document editor). Works for any app — Google Sheets, Airtable, Excel Online.
+      const hasGrid = !!document.querySelector('[role="grid"]');
+      const hasGridCell = !!document.querySelector('[role="gridcell"]');
+      const hasCellAria = !!document.querySelector('[aria-label*="Cell"][aria-label*="selected" i]');
+      const hasContentEditableH1 = !!document.querySelector('h1[contenteditable]');
+      const hasTitleRole = !!document.querySelector('[aria-roledescription*="title" i]');
+      const hasFormulaBar = !!document.querySelector('input[aria-label*="formula" i], textarea[aria-label*="formula" i]');
+
       return { fillableCount, clickableCount, hasAutoFocus,
                fillableTypes: { inputCount, textareaCount, contenteditableCount, roleTextboxCount },
-               pageTitle, visibleText };
+               pageTitle, visibleText,
+               categorySignals: { hasGrid, hasGridCell, hasCellAria, hasContentEditableH1, hasTitleRole, hasFormulaBar } };
     })()`,
   });
   try {
     const raw = res?.result;
     const parsed = typeof raw === 'string' ? JSON.parse(raw.replace(/^"|"$/g, '').replace(/\\"/g, '"')) : raw;
-    return parsed || { fillableCount: 0, clickableCount: 0, hasAutoFocus: false, fillableTypes: { inputCount: 0, textareaCount: 0, contenteditableCount: 0, roleTextboxCount: 0 }, pageTitle: '', visibleText: '' };
-  } catch { return { fillableCount: 0, clickableCount: 0, hasAutoFocus: false, fillableTypes: { inputCount: 0, textareaCount: 0, contenteditableCount: 0, roleTextboxCount: 0 }, pageTitle: '', visibleText: '' }; }
+    return parsed || { fillableCount: 0, clickableCount: 0, hasAutoFocus: false, fillableTypes: { inputCount: 0, textareaCount: 0, contenteditableCount: 0, roleTextboxCount: 0 }, pageTitle: '', visibleText: '', categorySignals: {} };
+  } catch { return { fillableCount: 0, clickableCount: 0, hasAutoFocus: false, fillableTypes: { inputCount: 0, textareaCount: 0, contenteditableCount: 0, roleTextboxCount: 0 }, pageTitle: '', visibleText: '', categorySignals: {} }; }
 }
 
 // Count visible checkboxes on the page (input[type=checkbox] or [role=checkbox]).
@@ -4904,7 +5158,7 @@ Completed?` },
 // The LLM is the sole decision-maker; deterministic rules are stripped to just
 // the DONE check. Rich per-tier context injection lets the LLM see what each
 // strategy CAN do in the CURRENT state and pick the best fit.
-async function _selectTierLLM(sessionId, goal, actionHistory, pageCategory, shortcutCount, focused, currentUrl, probe, agentContext, triedTiers = new Set(), disabledTiers = new Set(), layoutText = '', ocrObservation = null, shortcutLabels = '', overlayActive = false, progressCallbackUrl = null, stepIndex = 0, agentId = '', sessionIdForProgress = '', editorState = null, isCreationDeepLink = false, alertActive = false, isLoading = false) {
+async function _selectTierLLM(sessionId, goal, actionHistory, pageCategory, shortcutCount, focused, currentUrl, probe, agentContext, triedTiers = new Set(), disabledTiers = new Set(), layoutText = '', ocrObservation = null, shortcutLabels = '', overlayActive = false, progressCallbackUrl = null, stepIndex = 0, agentId = '', sessionIdForProgress = '', editorState = null, isCreationDeepLink = false, alertActive = false, isLoading = false, tabFlow = null, flowIndex = 0) {
   const { askWithMessages } = require('../skill-helpers/skill-llm.cjs');
   const { classifyStatePattern } = require('../skill-helpers/state-patterns.cjs');
   const { getDeepLinkDescription } = require('../skill-helpers/deep-link-types.cjs');
@@ -4971,6 +5225,30 @@ async function _selectTierLLM(sessionId, goal, actionHistory, pageCategory, shor
     return 4;
   }
 
+  // 2b. Tab-Flow fast-path — if we have a pre-computed flow and the current
+  // state matches the expected state, skip the LLM call and use the flow's tier.
+  // This is a soft guide: if the state doesn't match, fall through to the LLM.
+  if (tabFlow && flowIndex < tabFlow.length) {
+    const _expected = tabFlow[flowIndex];
+    if (_expected.tier !== 0 && _availableTiers.includes(_expected.tier)) {
+      // Check state compatibility (rough match — not exact):
+      // - tier 3 (shortcuts): no overlay, shortcuts available
+      // - tier 4 (tab-map): overlay open OR fillable >= 2 OR no focus
+      // - tier 1 (just-type): field focused or auto-focused
+      const _stateMatches = (
+        (_expected.tier === 3 && !overlayActive && shortcutCount > 0) ||
+        (_expected.tier === 4 && (overlayActive || fillableCount >= 2 || !hasAutoFocus)) ||
+        (_expected.tier === 1 && (hasAutoFocus || focused))
+      );
+      if (_stateMatches) {
+        logger.info(`[instruction.runner] _selectTierLLM: Tab-Flow fast-path → ${_expected.tier} (flow step ${flowIndex}: ${_expected.action || ''})`);
+        _emitTierProgressForTier(_expected.tier, progressCallbackUrl, stepIndex, agentId, sessionIdForProgress);
+        return _expected.tier;
+      }
+      logger.info(`[instruction.runner] _selectTierLLM: Tab-Flow step ${flowIndex} expects tier ${_expected.tier} but state doesn't match — falling through to LLM`);
+    }
+  }
+
   // 3. Classify state pattern (deterministic, with guards) ──────────────────
   // Combines all raw signals into a named pattern with a recommended tier
   // and fast-path flag. Fast-path skips the LLM call ONLY when all guards pass.
@@ -5026,11 +5304,12 @@ async function _selectTierLLM(sessionId, goal, actionHistory, pageCategory, shor
   }
   if (_availableTiers.includes(3)) {
     const _shortcutBlock = shortcutLabels && shortcutCount > 0
-      ? `Available shortcuts:\n${shortcutLabels}`
-      : `${shortcutCount} shortcuts available (no descriptions)`;
-    _tierBlocks.push(`3 - Shortcut keys: Presses an app-specific keyboard shortcut.
-   Best when: no dialog/overlay is open (overlay=${_overlayStr}) and a shortcut can open/navigate to the next state.
-   ${_shortcutBlock}
+      ? `Available app shortcuts:\n${shortcutLabels}`
+      : `${shortcutCount} app shortcuts available (no descriptions)`;
+    _tierBlocks.push(`3 - Keyboard Navigation: Presses a keyboard action — global navigation keys (Arrow keys, Tab, Enter, Escape, Shift+Tab) AND app-specific shortcuts.
+   Best when: you need to navigate between cells/fields/elements, or an app shortcut can open/navigate to the next state.
+   Current state: overlay=${_overlayStr}, ${_shortcutBlock}
+   NOTE: For spreadsheets/canvas editors, use Arrow keys and Tab to navigate between cells — NOT Tab-Map (which clicks elements and loses position).
    NOTE: If a dialog is already OPEN, shortcuts that open dialogs are useless — use Tab-Map (4) to fill the form.
    NOTE: For "create/add/schedule" goals, prefer the CREATE shortcut (e.g., "create event", "create timed event").
    NOTE: Navigation shortcuts (next period, go to today) do NOT set specific dates — use Tab-Map to pick a date in the form.`);
@@ -5072,9 +5351,11 @@ ${_deepLinkDesc}
 ${_disabledReasons ? `\nDISABLED STRATEGIES (do NOT return these):\n${_disabledReasons}\n` : ''}
 DECISION RULES:
 - If page category is document_editor AND goal involves typing content (text, todo, list, items, heading, note, bullet, callout, paragraph) → return 1 (Just-type). Editors use contenteditable blocks, not form fields — Just-Type handles them via type-plain, type-commands, type-list-item. Tab-Map clicks elements and loses cursor position in editors.
+- If page category is spreadsheet AND goal involves navigating to a cell or moving between cells → return 3 (Keyboard Navigation). Use Arrow keys, Tab, or Cmd+J to navigate cells. Do NOT use Tab-Map (4) on spreadsheet grids — the grid is canvas-rendered and Tab-Map cannot reliably interact with cells.
+- If page category is spreadsheet AND a cell is focused AND goal involves typing a value into that cell → return 1 (Just-type). Type the value, then the system will use Keyboard Navigation (3) to move to the next cell.
 - If a dialog/overlay is OPEN with REAL form fields (input/textarea, NOT contenteditable blocks) → return 4 (Tab-Map) to fill the form
 - If a dialog/overlay is OPEN but fillable elements are contenteditable only (no input/textarea) → return 1 (Just-type) — the overlay is likely a navigation dialog, not a form
-- If no dialog is open and a shortcut can open/navigate to the next state → return 3 (Shortcuts)
+- If no dialog is open and a shortcut can open/navigate to the next state → return 3 (Keyboard Navigation)
 - If a single field is focused and you just need to type one value → return 1 (Just-type)
 - If you need to find and click a specific item by text → return 2 (Meta+F)
 - If the goal involves drag-drop or sliders → return 5 (Gesture)
@@ -5087,6 +5368,10 @@ ${_tierBlocks.join('\n\n')}`;
     ? actionHistory.slice(-10).map((a, i) => `  ${i + 1}. ${a}`).join('\n')
     : '  (none)';
 
+  const _flowContext = (tabFlow && flowIndex < tabFlow.length)
+    ? `\nPRE-COMPUTED TAB-FLOW (guide, not requirement):\n${tabFlow.map((s, i) => `  ${i}${i === flowIndex ? ' ← current' : ''}: tier ${s.tier} — ${s.action || ''} (expected: ${s.state || ''})`).join('\n')}\nCurrent flow step: ${flowIndex}\n`
+    : '';
+
   const userPrompt = `Goal: ${goal}
 Current URL: ${currentUrl}
 Page title: ${pageTitle}
@@ -5096,7 +5381,7 @@ Deep link type: ${_statePattern.deepLinkType}
 Overlay/dialog: ${_overlayStr}
 Focused element: ${_focusedStr}
 Page structure: ${_fillableStr}, ${clickableCount} clickable
-${editorState?.region ? `Editor region: ${editorState.region} (block ${editorState.blockIndex ?? '?'})\n` : ''}${layoutText ? `Page layout:\n${layoutText.slice(0, 300)}\n` : ''}${_ocrBlock}
+${editorState?.region ? `Editor region: ${editorState.region} (block ${editorState.blockIndex ?? '?'})\n` : ''}${layoutText ? `Page layout:\n${layoutText.slice(0, 300)}\n` : ''}${_ocrBlock}${_flowContext}
 Actions taken so far:
 ${historyStr}${_contextBlock}
 Strategy? (${_availableTiers.join(', ')})`;
@@ -5405,7 +5690,7 @@ function _buildResultString(goal, actionHistory, filledFields, extractedPageText
 // Tier 3: Strategy execution with fallback to Tab-Map
 async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, pageCategory, agentContext, shortcutCount = 0, shortcutLabels = '', timeoutMs = 120000, progressCallbackUrl = null, stepIndex = 0, agentId = '' }) {
   if (!sessionId) return { ok: false, error: 'No sessionId provided' };
-  const _pageCategory = pageCategory || 'web_generic';
+  let _pageCategory = pageCategory || 'web_generic';
   const _urlFirstNav = !!urlFirstNav;
   logger.info(`[instruction.runner] runIterativeNavigation: goal="${String(goal || '').slice(0, 80)}", pageCategory=${_pageCategory}, sessionId=${sessionId}, urlFirstNav=${_urlFirstNav}`);
 
@@ -5446,9 +5731,14 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
   const _disabledTiers = new Set();
   if (_isCreationDeepLink) {
     _disabledTiers.add(2); // no Meta+F
-    _disabledTiers.add(3); // no App Shortcuts
-    _disabledTiers.add(4); // no Tab-Map
-    logger.info(`[instruction.runner] Creation deep-link detected — Just-type ONLY (tiers 2,3,4 disabled)`);
+    // For spreadsheets, keep Tier 3 (Keyboard Navigation) and Tier 4 (Tab-Map)
+    // enabled — cell navigation (Arrow keys, Tab, Cmd+J) is essential even on
+    // creation deep-links, and form dialogs may open over the grid.
+    if (_pageCategory !== 'spreadsheet') {
+      _disabledTiers.add(3); // no Keyboard Navigation
+      _disabledTiers.add(4); // no Tab-Map
+    }
+    logger.info(`[instruction.runner] Creation deep-link detected — Just-type ONLY${_pageCategory === 'spreadsheet' ? ' (Tier 3+4 enabled for spreadsheet cell nav)' : ' (tiers 2,3,4 disabled)'}`);
   } else if (_isHighShortcutApp) {
     // Tab-Map starts disabled for high-shortcut apps; gated dynamically per-state
     // in the main loop (enabled when fillable/overlay/alert detected).
@@ -5487,6 +5777,36 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
   }
 
   let prevUrl = await _getUrl(sessionId);
+
+  // ── Pre-compute Tab-Flow (soft guide for tier selection) ──────────────
+  // Call LLM once to compute the expected sequence of tiers for this step.
+  // This gives _selectTierLLM context about the overall flow so it doesn't
+  // pick Tab-Map when it should pick Shortcuts, etc.
+  // Cache-first: if a successful flow exists for this goal pattern, skip the LLM call.
+  let _tabFlow = null;
+  let _flowIndex = 0;
+  try {
+    const { _loadTabFlowCache, _computeTabFlow } = require('./browser.agent.cjs');
+    // 1. Try cache
+    _tabFlow = _loadTabFlowCache(agentId, goal);
+    if (_tabFlow) {
+      logger.info(`[instruction.runner] Tab-Flow: cache HIT — using cached flow (${_tabFlow.length} steps)`);
+    } else {
+      // 2. Cache miss → compute via LLM
+      // Build shortcut labels for the LLM
+      const { getCategoryConfig } = require('../skill-helpers/category-config.cjs');
+      const _catConfig = getCategoryConfig(pageCategory);
+      const _shortcutLabels = (_catConfig?.categoryKeys || []).map(k => `${k.key}: ${k.desc}`).join('\n');
+      _tabFlow = await _computeTabFlow(goal, pageCategory, _shortcutLabels, prevUrl, agentId);
+      if (_tabFlow) {
+        logger.info(`[instruction.runner] Tab-Flow: computed ${_tabFlow.length}-step flow — ${_tabFlow.map(s => `tier ${s.tier}(${(s.action || '').slice(0, 30)})`).join(' → ')}`);
+      } else {
+        logger.info(`[instruction.runner] Tab-Flow: no flow computed — falling back to state-reactive only`);
+      }
+    }
+  } catch (e) {
+    logger.warn(`[instruction.runner] Tab-Flow pre-computation failed (non-fatal): ${e.message}`);
+  }
 
   // ── Main loop ──────────────────────────────────────────────────────
   while (Date.now() - startTime < timeoutMs) {
@@ -5672,10 +5992,27 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
           }
           const _resultStr = _buildResultString(goal, actionHistory, filledFields, extractedPageText);
           logger.info(`[instruction.runner] Tab-Map: DONE — ${_resultStr}`);
+          // Tab-Flow: advance flow index on successful Tab-Map completion
+          if (_tabFlow && _flowIndex < _tabFlow.length && _tabFlow[_flowIndex].tier === 4) {
+            _flowIndex++;
+            logger.info(`[instruction.runner] Tab-Flow: Tab-Map session complete — advancing to step ${_flowIndex}`);
+          }
+          // Tab-Flow: save successful flow to cache
+          if (_tabFlow) {
+            try {
+              const { _saveTabFlowCache } = require('./browser.agent.cjs');
+              _saveTabFlowCache(agentId, goal, _tabFlow);
+            } catch (_) {}
+          }
           return { ok: true, output: _resultStr, actionHistory };
         } else if (stepResult.stateChanged) {
           // State changed (e.g., Send clicked, page navigated) — re-decide
           logger.info(`[instruction.runner] Tab-Map: session ended (state changed) — re-deciding`);
+          // Tab-Flow: advance flow index on Tab-Map state change (e.g., Save clicked → page changed)
+          if (_tabFlow && _flowIndex < _tabFlow.length && _tabFlow[_flowIndex].tier === 4) {
+            _flowIndex++;
+            logger.info(`[instruction.runner] Tab-Flow: Tab-Map state change — advancing to step ${_flowIndex}`);
+          }
           prevUrl = currentUrl;
           // Clear filled fields for new page
           filledFields.length = 0;
@@ -5715,6 +6052,26 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
     const { _extractValue, _extractSearchText, _scanCanvasLayout, _readEditorState, _formatEditorStateForLLM } = require('./browser.agent.cjs');
     // Probe page structure once per iteration (includes fillable types + title + visible text)
     const _probe = await _probePageStructure(sessionId);
+
+    // ── Runtime pageCategory detection (overrides initial guess from DOM signals) ──
+    // The initial pageCategory is inferred from service name/URL — a starting guess.
+    // DOM signals are more accurate because they reflect the ACTUAL page state, which
+    // may transition (e.g., creation form → spreadsheet grid). This is service-agnostic
+    // and works for any app with standard ARIA roles (Google Sheets, Airtable, Excel Online).
+    if (_probe?.categorySignals) {
+      const _cs = _probe.categorySignals;
+      const _isSpreadsheetDOM = _cs.hasGrid && _cs.hasGridCell;
+      const _isDocumentEditorDOM = _cs.hasContentEditableH1 || _cs.hasTitleRole;
+
+      if (_isSpreadsheetDOM && _pageCategory !== 'spreadsheet') {
+        logger.info(`[instruction.runner] Runtime category override: ${_pageCategory} → spreadsheet (DOM signals: grid=${_cs.hasGrid}, gridcell=${_cs.hasGridCell}, cellAria=${_cs.hasCellAria})`);
+        _pageCategory = 'spreadsheet';
+      } else if (_isDocumentEditorDOM && _pageCategory === 'spreadsheet' && !_isSpreadsheetDOM) {
+        // Page transitioned from grid to document editor (e.g., opened a doc from sheets)
+        logger.info(`[instruction.runner] Runtime category override: ${_pageCategory} → document_editor (DOM signals: ceH1=${_cs.hasContentEditableH1}, titleRole=${_cs.hasTitleRole})`);
+        _pageCategory = 'document_editor';
+      }
+    }
 
     // ── Canvas layout scan ──
     // For canvas-based webapps (document editors, code editors, design canvas, spreadsheets),
@@ -6095,8 +6452,8 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
     }
 
     const _alertActiveAtTierSelect = !!_alert && !_alertHandled;
-    const strategy = await _selectTierLLM(sessionId, goal, actionHistory, _pageCategory, _shortcutCount, focused, currentUrl, _probe, agentContext, _triedTiers, _disabledTiers, _canvasLayout?.layoutText || '', _ocrObservation, _shortcutLabels, overlayActive, progressCallbackUrl, stepIndex, agentId, sessionId, _editorState, _isCreationDeepLink, _alertActiveAtTierSelect, false);
-    logger.info(`[instruction.runner] Decision: strategy=${strategy} (0=DONE, 1=Just-type, 2=Meta+F, 3=App Shortcuts, 4=Tab-Map, 5=Gesture)`);
+    const strategy = await _selectTierLLM(sessionId, goal, actionHistory, _pageCategory, _shortcutCount, focused, currentUrl, _probe, agentContext, _triedTiers, _disabledTiers, _canvasLayout?.layoutText || '', _ocrObservation, _shortcutLabels, overlayActive, progressCallbackUrl, stepIndex, agentId, sessionId, _editorState, _isCreationDeepLink, _alertActiveAtTierSelect, false, _tabFlow, _flowIndex);
+    logger.info(`[instruction.runner] Decision: strategy=${strategy} (0=DONE, 1=Just-type, 2=Meta+F, 3=Keyboard Nav, 4=Tab-Map, 5=Gesture)`);
 
     // Handle tier exhaustion — all tiers tried on this state with no progress
     // NOTE: Don't press Escape (might trigger "Discard unsaved changes?" creating a loop).
@@ -6133,6 +6490,13 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
       }
       const _resultStr = _buildResultString(goal, actionHistory, filledFields, extractedPageText);
       logger.info(`[instruction.runner] DONE — ${_resultStr}`);
+      // Tab-Flow: save successful flow to cache
+      if (_tabFlow) {
+        try {
+          const { _saveTabFlowCache } = require('./browser.agent.cjs');
+          _saveTabFlowCache(agentId, goal, _tabFlow);
+        } catch (_) {}
+      }
       return { ok: true, output: _resultStr, actionHistory };
     }
 
@@ -6169,7 +6533,7 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
         _ocrContextForExtract = _nearbyItems.slice(0, 10).map(t => `"${t.text}" at (${Math.round(t.x)},${Math.round(t.y)})`).join(', ');
       }
 
-      const value = await _extractValue(goal, focused, actionHistory, _enrichedContext, focused?.currentValue || '', { title: _probe.pageTitle, visibleText: _probe.visibleText, layoutText: _canvasLayout?.layoutText || '', ocrContext: _ocrContextForExtract, editorStateText: _editorStateText || '' });
+      const value = await _extractValue(goal, focused, actionHistory, _enrichedContext, focused?.currentValue || '', { title: _probe.pageTitle, visibleText: _probe.visibleText, layoutText: _canvasLayout?.layoutText || '', ocrContext: _ocrContextForExtract, editorStateText: _editorStateText || '', pageCategory: _pageCategory });
 
       // ── Runtime command discovery fallback ──
       // If _extractValue returned a command (starts with /) but the command is NOT in the
@@ -6197,6 +6561,48 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
               logger.warn(`[instruction.runner] Just-type: could not re-read focus after discovery: ${e.message}`);
             }
             logger.info(`[instruction.runner] Just-type: runtime discovery found ${_discovered.length} commands — continuing with value`);
+          }
+        }
+      }
+
+      // ── Spreadsheet cell-focus guard ─────────────────────────────────────
+      // When pageCategory=spreadsheet and no cell is focused (focus is in body,
+      // formula bar, or nowhere), but the goal involves entering cell data
+      // (columns, headers, row 1, values), use Cmd+J → cell address → Enter
+      // to focus the target cell before Just-type tries to type.
+      // Without this, Just-type types into the formula bar or void instead of a cell.
+      if (_pageCategory === 'spreadsheet' && value && !value.startsWith('PRESS_') && value !== 'SKIP') {
+        const _focusedRegion = focused?.regionType || _editorState?.region || '';
+        const _isCellFocused = _focusedRegion === 'cell' || focused?.cellAddress;
+        if (!_isCellFocused) {
+          // Determine target cell from goal or action history
+          // Default: A1 for first entry; advance via Tab in subsequent iterations
+          const _goalLower = goal.toLowerCase();
+          let _targetCell = null;
+          // Check if goal mentions a specific cell (e.g. "in A1", "cell B2")
+          const _cellMatch = _goalLower.match(/\b([a-z]{1,2})(\d{1,3})\b/);
+          if (_cellMatch) {
+            _targetCell = _cellMatch[1].toUpperCase() + _cellMatch[2];
+          } else if (actionHistory.length === 0 || !actionHistory.some(a => a.includes('_focusSpreadsheetCell'))) {
+            // First cell entry — start at A1
+            _targetCell = 'A1';
+          }
+          if (_targetCell) {
+            logger.info(`[instruction.runner] Spreadsheet cell-focus guard: no cell focused, focusing ${_targetCell} before Just-type`);
+            const _cellResult = await _focusSpreadsheetCell(sessionId, _targetCell);
+            if (_cellResult.ok) {
+              // Re-read focused element to get the now-focused cell
+              try {
+                focused = await _readActiveElement(sessionId);
+                if (_editorState?.region) {
+                  focused = { ...focused, regionType: 'cell', cellAddress: _targetCell };
+                }
+              } catch (_) {}
+              actionHistory.push(`_focusSpreadsheetCell: focused ${_targetCell} via Name Box`);
+              await _sleep(300);
+            } else {
+              logger.warn(`[instruction.runner] Spreadsheet cell-focus guard failed: ${_cellResult.error}`);
+            }
           }
         }
       }
@@ -6232,6 +6638,12 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
         actionHistory.push(`Just-type: pressed Enter to create next item`);
       }
       _triedTiers.add(1);
+
+      // Tab-Flow: advance flow index on successful Just-type
+      if (result.ok && _tabFlow && _flowIndex < _tabFlow.length && _tabFlow[_flowIndex].tier === 1) {
+        _flowIndex++;
+        logger.info(`[instruction.runner] Tab-Flow: Just-type done — advancing to step ${_flowIndex}`);
+      }
 
       if (!result.ok) {
         // List-item guard override — PRESS_ENTER was skipped on empty block.
@@ -6354,24 +6766,32 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
     }
 
     if (strategy === 3) {
-      // App Shortcuts — press an app-specific keyboard shortcut
+      // Keyboard Navigation / App Shortcuts — press a keyboard action
+      // (global nav key like Arrow/Tab/Enter, or app-specific shortcut from appKnowledge)
       const { _extractShortcut } = require('./browser.agent.cjs');
       const _hostname = (() => { try { return new URL(currentUrl).hostname.replace(/^www\./, ''); } catch (_) { return ''; } })();
-      const shortcutResult = await _extractShortcut(goal, actionHistory, _hostname, agentContext, currentUrl, overlayActive, focused);
+      const shortcutResult = await _extractShortcut(goal, actionHistory, _hostname, agentContext, currentUrl, overlayActive, focused, _pageCategory, _editorState);
       if (!shortcutResult) {
-        // No shortcut found — fallback to Tab-Map
-        logger.info(`[instruction.runner] Shortcut: no shortcut found — falling back to Tab-Map`);
-        inTabMapSession = true;
-        _cachedTabMap = null;
-        _stepPlan = null;
-        _stepIndex = 0;
+        // No shortcut found — let the tier selector decide the next tier based on
+        // actual page state (overlay open → Tab-Map, no overlay in grid → Just-type).
+        // Previously this forced Tab-Map by setting inTabMapSession=true, which
+        // bypassed _selectTierLLM and was wrong for spreadsheets (canvas-rendered
+        // grid where Tab-Map clicks lose cell position).
+        logger.info(`[instruction.runner] Shortcut: no shortcut found — letting tier selector decide next tier`);
+        _triedTiers.add(3); // mark shortcut as tried so it's not re-picked
         prevUrl = currentUrl;
         continue;
       }
-      const result = await _executeShortcut(sessionId, shortcutResult.key);
+      const result = await _executeShortcut(sessionId, shortcutResult.key, goal, actionHistory);
       const _note = result.ok ? (result.pageChanged ? '→ page changed' : '→ ok') : '→ FAILED';
       actionHistory.push(`Shortcut "${shortcutResult.key}" ${_note}`);
       _triedTiers.add(3);
+
+      // Tab-Flow: advance flow index on successful Shortcut
+      if (result.ok && _tabFlow && _flowIndex < _tabFlow.length && _tabFlow[_flowIndex].tier === 3) {
+        _flowIndex++;
+        logger.info(`[instruction.runner] Tab-Flow: Shortcut done — advancing to step ${_flowIndex}`);
+      }
 
       // Record verification outcome (decays confidence on failure, triggers re-research eventually)
       if (_hostname && shortcutResult.entryId) {
@@ -6597,6 +7017,13 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
 
   // Timeout reached
   logger.warn(`[instruction.runner] Iterative: timeout after ${actionHistory.length} steps`);
+  // Tab-Flow: record failure for cached flow (increments failCount)
+  if (_tabFlow) {
+    try {
+      const { _failTabFlowCache } = require('./browser.agent.cjs');
+      _failTabFlowCache(agentId, goal);
+    } catch (_) {}
+  }
   return { ok: false, error: `Timeout after ${actionHistory.length} steps`, actionHistory };
 }
 

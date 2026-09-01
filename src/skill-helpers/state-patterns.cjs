@@ -101,6 +101,15 @@ function classifyStatePattern(state) {
 
   // 3. Creation deep link (fast-path if guards pass)
   if (deepLinkType === 'creation') {
+    // For spreadsheets, the creation deep link creates the sheet but the title
+    // needs to be renamed via the title bar — NOT Just-type into cell A1.
+    // Don't fast-path; let the LLM decide (Tab-Map to click title bar).
+    if (pageCategory === 'spreadsheet') {
+      return _result('creation_deep_link_spreadsheet', 4, false,
+        'Spreadsheet created via deep link — title needs renaming via title bar, not cell A1.',
+        false, 'LLM decides — use Tab-Map to click title bar and rename', deepLinkType);
+    }
+    // For docs and other apps, Just-type is correct (title is auto-focused)
     const guardsPassed = !overlayActive && !alertActive && fillableCount >= 1;
     const guardReason = guardsPassed ? null : _guardReason({
       overlay: overlayActive, alert: alertActive, noFillable: fillableCount < 1,
@@ -129,9 +138,34 @@ function classifyStatePattern(state) {
       false, 'LLM decides — dismiss overlay if blocking, then type into body', deepLinkType);
   }
 
+  // 4.6. Spreadsheet cell entry — BEFORE form patterns to prevent
+  // multi_step_form misclassifying spreadsheets (formula bar + name box
+  // count as 8 "fillable" inputs, and aria-expanded menus trigger overlayActive).
+  // Spreadsheet cell entry should use Just-type (tier 1) or Shortcuts (tier 3),
+  // NEVER Tab-Map (which scans/clicks elements and types into the formula bar).
+  if (pageCategory === 'spreadsheet' && !alertActive && !isLoading) {
+    // If a cell is focused (or auto-focused), use Just-type to type the value
+    if (hasAutoFocus || focused) {
+      return _result('spreadsheet_cell_entry', 1, true,
+        'Spreadsheet cell is focused — type the value into the cell.',
+        true, null, deepLinkType);
+    }
+    // No cell focused — use Shortcuts (Meta+J to focus a cell)
+    if (shortcutCount > 0) {
+      return _result('spreadsheet_cell_focus', 3, true,
+        'Spreadsheet open but no cell focused — use shortcut (Meta+J) to focus target cell.',
+        true, null, deepLinkType);
+    }
+    // No shortcuts available — let LLM decide (but still avoid Tab-Map)
+    return _result('spreadsheet_no_focus', 1, false,
+      'Spreadsheet open, no cell focused, no shortcuts — LLM decides.',
+      false, 'LLM decides — need to focus a cell first', deepLinkType);
+  }
+
   // 5-6. Form dialog open / multi-step form (LLM decides)
   // ONLY for REAL form fields (input/textarea), NOT contenteditable editor blocks.
   // Editors with overlays are handled by canvas_editing_with_overlay (pattern 4.5).
+  // NOTE: Spreadsheets are handled by pattern 4.6 above — they never reach here.
   if (overlayActive && fillableCount >= 2 && _hasRealFormFields) {
     const multiItem = _isMultiItemGoal(goal);
     if (multiItem) {
@@ -321,6 +355,27 @@ function _shortcutMatchesGoal(goal, shortcutLabels) {
     'page', 'day', 'time', 'period', 'view', 'list', 'task', 'todo', 'email',
     'folder', 'file', 'project', 'label', 'tag', 'filter', 'calendar',
   ]);
+  // Semantic synonyms: verbs that mean the same thing as shortcut action verbs.
+  // This allows "Add event" to match a shortcut labeled "Create event".
+  const _synonyms = {
+    create: ['create', 'add', 'new', 'make', 'insert', 'start'],
+    delete: ['delete', 'remove', 'trash', 'archive', 'discard'],
+    edit: ['edit', 'modify', 'change', 'update', 'rename', 'set'],
+    find: ['find', 'search', 'look', 'locate'],
+    open: ['open', 'view', 'show', 'navigate', 'go'],
+    save: ['save', 'submit', 'confirm', 'done', 'send'],
+    move: ['move', 'go', 'navigate', 'jump', 'switch'],
+    select: ['select', 'choose', 'pick'],
+    format: ['format', 'style', 'bold', 'italic', 'underline'],
+    insert: ['insert', 'add', 'create', 'new'],
+    focus: ['focus', 'jump', 'go', 'navigate'],
+  };
+  // Build a reverse map: word → synonym group key
+  const _wordToGroup = {};
+  for (const [group, words] of Object.entries(_synonyms)) {
+    for (const w of words) _wordToGroup[w] = group;
+  }
+
   for (const line of lines) {
     // Primary: match "key: action" — extract first word after separator
     const m = line.match(/[:\-]\s*(\w+)/);
@@ -334,7 +389,15 @@ function _shortcutMatchesGoal(goal, shortcutLabels) {
       actionVerbs.push(toMatch[1]);
     }
   }
-  return actionVerbs.some(verb => goalLower.includes(verb));
+  // Check each action verb against the goal — including semantic synonyms
+  return actionVerbs.some(verb => {
+    const group = _wordToGroup[verb];
+    if (group) {
+      // Check all synonyms for this verb's group
+      return _synonyms[group].some(syn => goalLower.includes(syn));
+    }
+    return goalLower.includes(verb);
+  });
 }
 
 module.exports = {

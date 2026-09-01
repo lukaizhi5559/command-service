@@ -1586,13 +1586,27 @@ function _engineActive(sessionId) {
   return engine.isSessionActive(sessionId);
 }
 
+// Chrome launch mutex — serializes engine.launch() calls across concurrent
+// browser agents. On macOS, Chrome redirects new process launches to the
+// existing running instance, causing "Opening in existing browser session"
+// errors and blank pages when multiple agents launch simultaneously.
+// The mutex ensures only one agent launches Chrome at a time.
+let _chromeLaunchLock = Promise.resolve();
+async function _withChromeLock(fn) {
+  const _prev = _chromeLaunchLock;
+  let _resolve;
+  _chromeLaunchLock = new Promise(r => { _resolve = r; });
+  await _prev;
+  try { return await fn(); } finally { _resolve(); }
+}
+
 // Ensure engine session is launched. Returns the Page or null on failure.
 async function _ensureEngine(sessionId, headed) {
   if (engine.isSessionActive(sessionId)) {
     return engine.getPage(sessionId);
   }
   try {
-    await engine.launch(sessionId, { headed });
+    await _withChromeLock(() => engine.launch(sessionId, { headed }));
     openSessions.add(sessionId);
     return engine.getPage(sessionId);
   } catch (err) {
@@ -7089,6 +7103,15 @@ If no videos found, return []. Do not explain, only output the JSON array.`;
             const _curProbe = await _authEval('location.href', 5000);
             _currentUrl = String(_curProbe.val || '').trim();
           } catch (_) {}
+          // Reject blank/invalid URLs — about:blank, empty string, and chrome://
+          // URLs indicate a broken browser state, NOT a successful auth.
+          const _isBlankUrl = !_currentUrl
+            || /^about:blank$/i.test(_currentUrl)
+            || /^chrome:\/\//i.test(_currentUrl);
+          if (_isBlankUrl) {
+            logger.warn(`[browser.act] waitForAuth: done-without-action but URL is blank (${_currentUrl}) — returning failure for session=${sessionId}`);
+            return { ok: false, action, sessionId, error: 'Browser rendered blank page during auth', authResolved: false, executionTime: Date.now() - start };
+          }
           if (_currentUrl === _initialAuthUrl) {
             logger.info(`[browser.act] waitForAuth: done-without-action circuit breaker — URL unchanged (${_currentUrl}), no creds filled, skipping OAuth fallback and poll loop for session=${sessionId}`);
             return { ok: true, action, sessionId, authResolved: true, authCircuitBreaker: true, executionTime: Date.now() - start };

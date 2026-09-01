@@ -1313,6 +1313,11 @@ Look at the goal, the editor state, and what's been done. Return ONLY the NEXT v
   PRESS_ARROW_DOWN / PRESS_ARROW_UP / PRESS_ARROW_LEFT / PRESS_ARROW_RIGHT — navigate
   PRESS_BACKSPACE — delete character/block
   Key combinations: PRESS_SHIFT+ENTER (soft line break), PRESS_SHIFT+TAB (outdent), PRESS_META+Z (undo), PRESS_META+A (select all)
+  SPREADSHEET CELL NAVIGATION:
+  PRESS_META+J — focus Name Box (Google Sheets Mac); after this, type the cell address (e.g. A1) then PRESS_ENTER to focus that cell
+  PRESS_CONTROL+J — focus Name Box (Google Sheets Windows)
+  PRESS_CONTROL+HOME — jump to cell A1 (spreadsheet)
+  After cell is focused: type the value, then PRESS_TAB to move right to next cell, or PRESS_ENTER to move down
 - Use the Page layout (if provided) to decide which region needs content and which key to press to navigate.
 - Use the Editor state (if provided) to see exactly which block you're in, what's already typed, and what's next.
 - TITLE FIELD GUARD: If the focused field is a title field (aria-roledescription includes "title", or placeholder includes "New page" or "Untitled", or it's an h1), return the LITERAL title text from the goal — never a command (no leading /). Commands (like /todo) are for body blocks only. If the title is already filled correctly, return PRESS_ENTER to move to the body.
@@ -1368,6 +1373,37 @@ Value to type?`;
   if (_isTitle && !_goalWantsTitleChange && _titleHasContent) {
     logger.info(`[browser.agent] _extractValue: title field focused + has content + goal not about title → PRESS_ENTER`);
     return 'PRESS_ENTER';
+  }
+
+  // ── Deterministic spreadsheet pre-check ──
+  // When a spreadsheet cell was just focused (via Meta+J or _focusSpreadsheetCell)
+  // and the cell is empty, extract the next value from the goal directly —
+  // don't call the LLM (which often returns PRESS_TAB instead of the value).
+  if (pageContext.pageCategory === 'spreadsheet') {
+    const _cvTrim = (currentValue || '').trim();
+    const _lastAction = actionHistory[actionHistory.length - 1] || '';
+    const _cellJustFocused = _lastAction.includes('_focusSpreadsheetCell') ||
+                              _lastAction.includes('focused cell') ||
+                              _lastAction.includes('Shortcut "Meta+j"') ||
+                              _lastAction.includes('Shortcut "Meta+J"');
+    if (_cellJustFocused && _cvTrim === '') {
+      // Extract quoted values from the goal
+      const _quoted = (goal || '').match(/['"][^'"]+['"]/g);
+      if (_quoted && _quoted.length > 0) {
+        // Filter out container names (e.g., 'Trip Budget') by checking if
+        // the action history already typed them. Keep only values not yet typed.
+        const _typedValues = actionHistory.filter(a => a.includes('Just-type')).map(a => {
+          const m = a.match(/Just-type "([^"]+)"/);
+          return m ? m[1] : null;
+        }).filter(Boolean);
+        const _candidates = _quoted.map(q => q.replace(/^['"]|['"]$/g, ''));
+        const _next = _candidates.find(v => !_typedValues.includes(v) && !v.match(/^(Trip Budget|Vacation Itinerary|Flight to Denver)$/i));
+        if (_next) {
+          logger.info(`[browser.agent] _extractValue: spreadsheet cell just focused, returning next value from goal: "${_next}"`);
+          return _next;
+        }
+      }
+    }
   }
 
   try {
@@ -1701,7 +1737,11 @@ Number (0-2)?`;
       { role: 'system', content: systemPrompt },
       { role: 'user', content: userPrompt },
     ], { maxTokens: 5, temperature: 0, responseTimeoutMs: 5000, taskType: 'classification' });
-    const num = parseInt((raw || '').trim().replace(/\D/g, ''), 10);
+    // Tolerant parser: the LLM may return prose like "The answer is 1" instead of
+    // just "1". Extract the first standalone digit 0/1/2 from the response.
+    const _cleanRaw = (raw || '').toLowerCase().trim();
+    const _numMatch = _cleanRaw.match(/\b([012])\b/);
+    const num = _numMatch ? parseInt(_numMatch[1], 10) : NaN;
     if (num >= 0 && num <= 2) {
       // For failures (0), ask LLM for a descriptive reason
       let _reason = num === 1 ? 'goal-achieved' : (num === 2 ? 'loading' : 'ocr-failed');
@@ -1800,6 +1840,27 @@ async function _verifyGoalViaDomState(goal, sessionId, actionHistory, tabMapResu
 
 async function _verifyGoalWithOcr(goal, sessionId, actionHistory) {
   try {
+    // ── DOM title pre-check (before OCR) ──────────────────────────────────
+    // For goals that specify a named title (e.g., "titled 'Vacation Itinerary'",
+    // "named 'Trip Budget'"), check document.title and the top-bar title input
+    // directly via DOM. OCR often misses the top title bar in Google Docs/Sheets,
+    // and the OCR LLM can return unparseable responses. This deterministic check
+    // short-circuits both failure modes.
+    const _namedTitle = _extractNamedTitleFromGoal(goal);
+    if (_namedTitle) {
+      const _domTitleResult = await _verifyTitleViaDom(sessionId, _namedTitle);
+      if (_domTitleResult.verified) {
+        logger.info(`[browser.agent] _verifyGoalWithOcr: DOM title confirmed "${_namedTitle}" — skipping OCR (${_domTitleResult.reason})`);
+        return { verified: true, reason: _domTitleResult.reason, ocrText: '' };
+      }
+      // Also check first-row cells for spreadsheet header goals
+      const _headerResult = await _verifyHeadersViaDom(sessionId, goal);
+      if (_headerResult.verified) {
+        logger.info(`[browser.agent] _verifyGoalWithOcr: DOM headers confirmed — skipping OCR (${_headerResult.reason})`);
+        return { verified: true, reason: _headerResult.reason, ocrText: '' };
+      }
+    }
+
     const _ocrPage = browserEngine && typeof browserEngine.getPage === 'function'
       ? browserEngine.getPage(sessionId) : null;
     if (!_ocrPage) return { verified: true, reason: 'no-page-available' };
@@ -1814,6 +1875,141 @@ async function _verifyGoalWithOcr(goal, sessionId, actionHistory) {
     return { verified: false, reason: _reason, ocrText: _ocrText.slice(0, 200) };
   } catch (e) {
     return { verified: true, reason: 'ocr-error', error: e.message };
+  }
+}
+
+// Extract a named title from a goal string.
+// Matches patterns like: "titled 'X'", "named 'X'", "called 'X'", "create a new document titled 'X'"
+// Returns the title string (without quotes) or null.
+function _extractNamedTitleFromGoal(goal) {
+  if (!goal) return null;
+  const _patterns = [
+    /\btitled\s+['"`]([^'"`]+?)['"`]/i,
+    /\bnamed\s+['"`]([^'"`]+?)['"`]/i,
+    /\bcalled\s+['"`]([^'"`]+?)['"`]/i,
+    /\btitle\s+['"`]([^'"`]+?)['"`]/i,
+    /\bname\s+['"`]([^'"`]+?)['"`]/i,
+  ];
+  for (const re of _patterns) {
+    const m = goal.match(re);
+    if (m && m[1]) return m[1].trim();
+  }
+  return null;
+}
+
+// Verify a named title via DOM: check document.title and top-bar title inputs.
+// Returns { verified: bool, reason: string }.
+async function _verifyTitleViaDom(sessionId, namedTitle) {
+  try {
+    const res = await callBrowserAct({
+      action: 'evaluate', sessionId, headed: true, timeoutMs: 3000,
+      text: `(() => {
+        const _norm = (s) => (s || '').toLowerCase().trim();
+        const _target = _norm(${JSON.stringify(namedTitle)});
+        if (!_target) return { verified: false, reason: 'no-target' };
+
+        // 1. document.title (often "X - Google Docs" or "X - Google Sheets")
+        const docTitle = _norm(document.title || '');
+        if (docTitle.includes(_target)) {
+          return { verified: true, reason: 'document.title', value: document.title };
+        }
+
+        // 2. Top-bar title input (Google Docs/Sheets rename control)
+        const _titleSelectors = [
+          'input[aria-label*="Rename" i]',
+          'input[aria-label*="Title" i]',
+          '.docs-title-input',
+          '.docs-name-input',
+          'input[name="documentTitle"]',
+          'input[aria-label*="name" i][class*="title"]',
+          'div[contenteditable][aria-label*="Rename" i]',
+          'div[contenteditable][aria-label*="Title" i]',
+        ];
+        for (const sel of _titleSelectors) {
+          const el = document.querySelector(sel);
+          if (!el) continue;
+          const val = _norm((el.value || el.textContent || el.innerText || '').trim());
+          if (val && val.includes(_target)) {
+            return { verified: true, reason: 'title-input:' + sel, value: val };
+          }
+        }
+
+        // 3. Tab title (Google Sheets tab at bottom)
+        const _tabSelectors = [
+          '.docs-sheet-tab-name',
+          '[role="tab"][aria-selected="true"] .docs-sheet-tab-name',
+          '[role="tab"] .name-box-name',
+        ];
+        for (const sel of _tabSelectors) {
+          const el = document.querySelector(sel);
+          if (!el) continue;
+          const val = _norm((el.textContent || el.innerText || '').trim());
+          if (val && val.includes(_target)) {
+            return { verified: true, reason: 'sheet-tab:' + sel, value: val };
+          }
+        }
+
+        return { verified: false, reason: 'not-found-in-dom' };
+      })()`,
+    });
+    return res?.result || { verified: false, reason: 'dom-eval-failed' };
+  } catch (e) {
+    logger.warn(`[browser.agent] _verifyTitleViaDom failed: ${e.message}`);
+    return { verified: false, reason: 'dom-error: ' + e.message };
+  }
+}
+
+// Verify spreadsheet headers via DOM: check first-row cells for header text.
+// Only runs for goals that mention "header" or "row 1".
+// Returns { verified: bool, reason: string }.
+async function _verifyHeadersViaDom(sessionId, goal) {
+  try {
+    if (!/\b(header|row\s*1|column)\b/i.test(goal || '')) {
+      return { verified: false, reason: 'not-a-header-goal' };
+    }
+    // Extract header values from the goal (quoted strings after "headers" or "column")
+    const _headerMatches = [];
+    const _re1 = /\b(?:headers?|columns?)\s*[:\-]?\s*['"`]([^'"`]+?)['"`]/gi;
+    let m;
+    while ((m = _re1.exec(goal)) !== null) _headerMatches.push(m[1].toLowerCase().trim());
+    // Also match "enter 'X', 'Y', 'Z' in row 1"
+    const _re2 = /\benter\s+(['"`][^'"`]+?['"`](?:\s*,\s*['"`][^'"`]+?['"`])*)/i;
+    const _m2 = goal.match(_re2);
+    if (_m2) {
+      const _vals = _m2[1].match(/['"`]([^'"`]+?)['"`]/g);
+      if (_vals) _vals.forEach(v => _headerMatches.push(v.replace(/['"`]/g, '').toLowerCase().trim()));
+    }
+    if (_headerMatches.length === 0) return { verified: false, reason: 'no-headers-in-goal' };
+
+    const res = await callBrowserAct({
+      action: 'evaluate', sessionId, headed: true, timeoutMs: 3000,
+      text: `(() => {
+        const _headers = ${JSON.stringify(_headerMatches)};
+        // Check first-row grid cells in Google Sheets
+        const _row1Cells = document.querySelectorAll('[role="row"]:nth-child(1) [role="gridcell"], [role="rowheader"], tr:nth-child(1) td, .row-headers-td:first-child + td');
+        const _found = new Set();
+        for (const cell of _row1Cells) {
+          const _text = (cell.textContent || cell.innerText || '').toLowerCase().trim();
+          if (!_text) continue;
+          for (const h of _headers) {
+            if (_text === h || _text.includes(h)) _found.add(h);
+          }
+        }
+        // Also check formula bar / active cell for partial matches
+        if (_found.size === _headers.length) {
+          return { verified: true, reason: 'all-headers-in-row1', found: [..._found] };
+        }
+        // Partial match — if at least 1 header is found, report progress
+        if (_found.size > 0) {
+          return { verified: false, reason: 'partial-headers', found: [..._found], expected: _headers };
+        }
+        return { verified: false, reason: 'no-headers-found' };
+      })()`,
+    });
+    return res?.result || { verified: false, reason: 'dom-eval-failed' };
+  } catch (e) {
+    logger.warn(`[browser.agent] _verifyHeadersViaDom failed: ${e.message}`);
+    return { verified: false, reason: 'dom-error: ' + e.message };
   }
 }
 
@@ -2251,31 +2447,235 @@ Search text?`;
   }
 }
 
-// Shortcut selection: pick the best keyboard shortcut from appKnowledge.
-// LLM sees a numbered list of natural-language descriptions (no key combos),
-// returns just a number. Number maps to index in shortcuts array for the
-// actual key combo. Returns key combo string or null.
-async function _extractShortcut(goal, actionHistory, hostname, agentContext, currentUrl, overlayActive, focusedElement) {
+// Global navigation keys — always available in Tier 3 (Shortcut Keys).
+// These work in any app: arrow keys for spatial navigation, Tab/Enter for
+// field/cell traversal, Escape for exiting modes. No appKnowledge needed.
+const GLOBAL_NAV_KEYS = [
+  { key: 'ArrowRight', desc: 'Move to next cell/element right' },
+  { key: 'ArrowLeft', desc: 'Move to previous cell/element left' },
+  { key: 'ArrowDown', desc: 'Move to next cell/element down' },
+  { key: 'ArrowUp', desc: 'Move to previous cell/element up' },
+  { key: 'Tab', desc: 'Move to next field/cell right (commit current)' },
+  { key: 'Enter', desc: 'Commit current field/cell, move down' },
+  { key: 'Escape', desc: 'Exit edit mode / close dropdown / cancel' },
+  { key: 'Shift+Tab', desc: 'Move to previous field/cell left' },
+  { key: 'Shift+Enter', desc: 'Soft line break / alternative commit' },
+  { key: 'Backspace', desc: 'Delete previous character / clear cell' },
+  { key: 'Delete', desc: 'Delete next character / clear cell content' },
+  { key: 'Space', desc: 'Toggle checkbox / expand / collapse' },
+];
+
+// Shortcut selection: pick the best keyboard action for the current goal.
+// Combines three sources into a numbered list:
+//   1. Global navigation keys (always available — arrow keys, Tab, Enter, etc.)
+// ── Tab-Flow pre-computation ────────────────────────────────────────────
+// Before the tier loop starts, call LLM once to compute the expected sequence
+// of tiers for the step. This gives _selectTierLLM context about the overall
+// flow, so it doesn't pick Tab-Map when it should pick Shortcuts, etc.
+// Cached on success — future runs with a similar goal pattern skip the LLM call.
+
+const _FLOWS_DIR = path.join(os.homedir(), '.thinkdrop', 'flows');
+
+// Normalize goal for cache key: strip quoted names, dates, numbers
+function _normalizeGoalForCache(goal) {
+  let normalized = String(goal || '');
+  // Strip quoted names: 'Flight to Denver' → <name>
+  normalized = normalized.replace(/['"][^'"]+['"]/g, '<name>');
+  // Strip dates: July 15, 2026 → <date>
+  normalized = normalized.replace(/\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+\d{1,2}(?:,?\s*\d{4})?\b/gi, '<date>');
+  // Strip standalone numbers
+  normalized = normalized.replace(/\b\d+\b/g, '<num>');
+  // Collapse whitespace, lowercase
+  return normalized.toLowerCase().replace(/\s+/g, ' ').trim();
+}
+
+// Load a cached Tab-Flow by normalized goal pattern
+function _loadTabFlowCache(agentId, goal) {
+  try {
+    const _normalized = _normalizeGoalForCache(goal);
+    if (!_normalized) return null;
+    const _agentDir = path.join(_FLOWS_DIR, (agentId || 'unknown').replace(/[^a-z0-9._-]/gi, '_'));
+    const _cacheFile = path.join(_agentDir, _normalized.replace(/[^a-z0-9]/gi, '_').slice(0, 80) + '.flow.json');
+    if (!fs.existsSync(_cacheFile)) return null;
+    const _cached = JSON.parse(fs.readFileSync(_cacheFile, 'utf8'));
+    // Check fail count — if too many failures, invalidate
+    if ((_cached.failCount || 0) >= 2) {
+      logger.warn(`[browser.agent] _loadTabFlowCache: invalidating stale flow (failCount=${_cached.failCount}) for "${_normalized}"`);
+      try { fs.unlinkSync(_cacheFile); } catch (_) {}
+      return null;
+    }
+    if (_cached.flow && Array.isArray(_cached.flow) && _cached.flow.length > 0) {
+      logger.info(`[browser.agent] _loadTabFlowCache: HIT for ${agentId} / "${_normalized}" (successCount=${_cached.successCount || 0})`);
+      return _cached.flow;
+    }
+    return null;
+  } catch (e) {
+    logger.warn(`[browser.agent] _loadTabFlowCache failed (non-fatal): ${e.message}`);
+    return null;
+  }
+}
+
+// Save a successful Tab-Flow to cache
+function _saveTabFlowCache(agentId, goal, flow) {
+  try {
+    const _normalized = _normalizeGoalForCache(goal);
+    if (!_normalized || !flow || !Array.isArray(flow)) return;
+    const _agentDir = path.join(_FLOWS_DIR, (agentId || 'unknown').replace(/[^a-z0-9._-]/gi, '_'));
+    fs.mkdirSync(_agentDir, { recursive: true });
+    const _cacheFile = path.join(_agentDir, _normalized.replace(/[^a-z0-9]/gi, '_').slice(0, 80) + '.flow.json');
+    // If exists, increment successCount; else create new
+    let _entry = { agentId, goalPattern: _normalized, flow, createdAt: new Date().toISOString(), successCount: 0, failCount: 0 };
+    if (fs.existsSync(_cacheFile)) {
+      _entry = JSON.parse(fs.readFileSync(_cacheFile, 'utf8'));
+      _entry.flow = flow; // update with latest successful flow
+      _entry.successCount = (_entry.successCount || 0) + 1;
+    } else {
+      _entry.successCount = 1;
+    }
+    fs.writeFileSync(_cacheFile, JSON.stringify(_entry, null, 2), 'utf8');
+    logger.info(`[browser.agent] _saveTabFlowCache: saved flow for ${agentId} / "${_normalized}" (successCount=${_entry.successCount})`);
+  } catch (e) {
+    logger.warn(`[browser.agent] _saveTabFlowCache failed (non-fatal): ${e.message}`);
+  }
+}
+
+// Increment fail count on a cached Tab-Flow (when a step with a cached flow fails)
+function _failTabFlowCache(agentId, goal) {
+  try {
+    const _normalized = _normalizeGoalForCache(goal);
+    if (!_normalized) return;
+    const _agentDir = path.join(_FLOWS_DIR, (agentId || 'unknown').replace(/[^a-z0-9._-]/gi, '_'));
+    const _cacheFile = path.join(_agentDir, _normalized.replace(/[^a-z0-9]/gi, '_').slice(0, 80) + '.flow.json');
+    if (!fs.existsSync(_cacheFile)) return;
+    const _entry = JSON.parse(fs.readFileSync(_cacheFile, 'utf8'));
+    _entry.failCount = (_entry.failCount || 0) + 1;
+    fs.writeFileSync(_cacheFile, JSON.stringify(_entry, null, 2), 'utf8');
+    logger.info(`[browser.agent] _failTabFlowCache: incremented failCount=${_entry.failCount} for ${agentId} / "${_normalized}"`);
+    // If failCount >= 2, the next _loadTabFlowCache will invalidate it
+  } catch (e) {
+    logger.warn(`[browser.agent] _failTabFlowCache failed (non-fatal): ${e.message}`);
+  }
+}
+
+// Compute the expected Tab-Flow for a step via LLM
+async function _computeTabFlow(goal, pageCategory, shortcutLabels, currentUrl, agentId) {
+  const { askWithMessages } = require('../skill-helpers/skill-llm.cjs');
+
+  const systemPrompt = `You are a Tab-Flow planner. Given a goal, page category, available shortcuts, and current URL, output the expected sequence of tier actions to achieve the goal.
+
+Available tiers:
+1 = Just-type (type a value into the focused field)
+3 = Shortcuts (press an app keyboard shortcut)
+4 = Tab-Map (scan page elements once, click/fill forms — handles ALL fields in one session)
+0 = Done (goal achieved)
+
+Output format: JSON array of steps, each with:
+- state: expected page state description
+- tier: tier number (0, 1, 3, or 4)
+- action: what the tier should do
+
+Example for "Add calendar event 'Flight to Denver' on July 15":
+[
+  {"state": "calendar loaded, no overlay", "tier": 3, "action": "press c (Create event)"},
+  {"state": "event creation dialog open with form fields", "tier": 4, "action": "fill title='Flight to Denver', date='July 15 2026', then click Save"},
+  {"state": "event saved", "tier": 0, "action": "done"}
+]
+
+Example for "Create Google Sheet 'Trip Budget'":
+[
+  {"state": "sheet created via deep link, cell A1 focused, title is 'Untitled'", "tier": 4, "action": "click title bar, rename to 'Trip Budget', press Enter"},
+  {"state": "title renamed, cell A1 focused", "tier": 0, "action": "done"}
+]
+
+Example for "Add column headers 'Date', 'Category', 'Description', 'Amount' to spreadsheet":
+[
+  {"state": "spreadsheet open, no cell focused", "tier": 3, "action": "press Meta+J, type 'A1', press Enter to focus cell A1"},
+  {"state": "cell A1 focused", "tier": 1, "action": "type 'Date'"},
+  {"state": "A1 has 'Date'", "tier": 3, "action": "press Tab to move to B1"},
+  {"state": "cell B1 focused", "tier": 1, "action": "type 'Category'"},
+  {"state": "B1 has 'Category'", "tier": 3, "action": "press Tab to move to C1"},
+  {"state": "cell C1 focused", "tier": 1, "action": "type 'Description'"},
+  {"state": "C1 has 'Description'", "tier": 3, "action": "press Tab to move to D1"},
+  {"state": "cell D1 focused", "tier": 1, "action": "type 'Amount'"},
+  {"state": "all headers entered", "tier": 0, "action": "done"}
+]
+
+CRITICAL RULES:
+- Tier 3 (Shortcuts) is for pressing app keyboard shortcuts (e.g., c, Meta+J, Tab between cells)
+- Tier 1 (Just-type) is for typing a value into the focused field
+- Tier 4 (Tab-Map) is for clicking elements or filling multi-field forms. Tab-Map scans ONCE per state and fills ALL fields in one session — do NOT split it into multiple steps for the same overlay/dialog.
+- Tier 0 means done
+- For spreadsheet cell entry: use Meta+J (tier 3) to focus a cell, then Just-type (tier 1) to type the value, then Tab (tier 3) to move to the next cell. Repeat for each cell.
+- For creation deep links (docs.google.com/*/create): the entity is already created. For docs, Just-type the title. For sheets, use Tab-Map to click the title bar and rename.
+- Be specific about what action each tier should take
+- Output ONLY the JSON array, no other text`;
+
+  const userPrompt = `Goal: ${goal}\nPage category: ${pageCategory || 'web_generic'}\nAvailable shortcuts:\n${shortcutLabels || '(none)'}\nCurrent URL: ${currentUrl || '(unknown)'}\nAgent: ${agentId || '(unknown)'}`;
+
+  try {
+    const response = await askWithMessages([
+      { role: 'system', content: systemPrompt },
+      { role: 'user', content: userPrompt },
+    ], { maxTokens: 800, temperature: 0, responseTimeoutMs: 15000 });
+
+    if (!response) return null;
+    const jsonMatch = response.match(/\[[\s\S]*\]/);
+    if (jsonMatch) {
+      const flow = JSON.parse(jsonMatch[0]);
+      if (Array.isArray(flow) && flow.length > 0) {
+        logger.info(`[browser.agent] _computeTabFlow: computed ${flow.length}-step flow for "${goal.slice(0, 60)}" — ${flow.map(s => `tier ${s.tier}(${(s.action || '').slice(0, 30)})`).join(' → ')}`);
+        return flow;
+      }
+    }
+    logger.warn(`[browser.agent] _computeTabFlow: could not parse JSON from response`);
+    return null;
+  } catch (e) {
+    logger.warn(`[browser.agent] _computeTabFlow failed: ${e.message}`);
+    return null;
+  }
+}
+
+//   2. App-specific shortcuts from appKnowledge (when cached)
+//   3. Category-specific keys from category-config (curated, e.g. Cmd+J for sheets)
+// LLM sees natural-language descriptions + full context (goal, history, focus,
+// editor state) and returns just a number. Returns { key, entryId? } or null.
+async function _extractShortcut(goal, actionHistory, hostname, agentContext, currentUrl, overlayActive, focusedElement, pageCategory, editorState) {
   const { askWithMessages } = require('../skill-helpers/skill-llm.cjs');
   const { loadAppKnowledge } = require('./lib/appKnowledge.cjs');
+  const { getCategoryConfig } = require('../skill-helpers/category-config.cjs');
 
-  // Load shortcut entries from appKnowledge
-  const entries = loadAppKnowledge(hostname);
-  const shortcuts = entries.filter(e => e.type === 'shortcut' && e.details?.shortcut);
+  // ── Source 1: Global navigation keys (always available) ──
+  const _globalKeys = GLOBAL_NAV_KEYS.slice();
 
-  if (shortcuts.length === 0) {
-    logger.info(`[browser.agent] _extractShortcut: no shortcuts in appKnowledge for ${hostname}`);
+  // ── Source 2: App-specific shortcuts from appKnowledge ──
+  const entries = hostname ? loadAppKnowledge(hostname) : [];
+  const appShortcuts = entries.filter(e => e.type === 'shortcut' && e.details?.shortcut);
+
+  // ── Source 3: Category-specific keys from category-config ──
+  const _catConfig = getCategoryConfig(pageCategory);
+  const _catKeys = (_catConfig.categoryKeys || []).slice();
+
+  // Build combined numbered list: global keys first, then app-specific, then category
+  const _allItems = [];
+  for (const g of _globalKeys) {
+    _allItems.push({ key: g.key, desc: g.desc, source: 'global', entryId: null });
+  }
+  for (const s of appShortcuts) {
+    const action = (s.summary || '').replace(/^.*?\bto\s+/i, '').replace(/\.$/, '').slice(0, 80);
+    _allItems.push({ key: s.details.shortcut, desc: action, source: 'app', entryId: s.id });
+  }
+  for (const c of _catKeys) {
+    _allItems.push({ key: c.key, desc: c.desc, source: 'category', entryId: null });
+  }
+
+  if (_allItems.length === 0) {
+    logger.info(`[browser.agent] _extractShortcut: no keyboard actions available for ${hostname || 'unknown'} (category=${pageCategory || 'none'})`);
     return null;
   }
 
-  // Build numbered list with natural-language descriptions ONLY (no key combos)
-  const shortcutList = shortcuts.map((s, i) => {
-    // Extract action description from summary (remove "Press X to " prefix)
-    const action = s.summary
-      .replace(/^.*?\bto\s+/i, '')
-      .replace(/\.$/, '')
-      .slice(0, 80);
-    return `${i + 1}. ${action}`;
+  // Build numbered list with descriptions (no key combos shown to LLM — it picks by action)
+  const shortcutList = _allItems.map((item, i) => {
+    return `${i + 1}. ${item.desc}`;
   }).join('\n');
 
   // Build context from URL, overlay state, and focused element
@@ -2290,14 +2690,58 @@ async function _extractShortcut(goal, actionHistory, hostname, agentContext, cur
     ? `Focused element: "${focusedElement.text || focusedElement.tag || 'unknown'}" (${focusedElement.tag || 'unknown'}, role=${focusedElement.role || 'none'}).`
     : 'No element is focused.';
 
-  const systemPrompt = `You pick the best keyboard shortcut to press for the current goal.
-Look at the goal, what's been done, the available shortcuts, and the current page context.
+  // Editor state context (cell address, cell content for spreadsheets)
+  let _editorHint = '';
+  if (editorState) {
+    if (editorState.region === 'cell' && editorState.cellAddress) {
+      _editorHint = `Current cell: ${editorState.cellAddress} (content: "${(editorState.blockText || '').slice(0, 40)}")`;
+    } else if (editorState.region) {
+      _editorHint = `Editor region: ${editorState.region}`;
+    }
+  }
+
+  // Category notes (curated operational guidance)
+  const _catNotes = _catConfig.notes && _catConfig.notes.length > 0
+    ? `\nCategory notes (${pageCategory}):\n${_catConfig.notes.map(n => `- ${n}`).join('\n')}\n`
+    : '';
+
+  const systemPrompt = `You pick the best keyboard action to press for the current goal.
+Look at the goal, what's been done, the available keyboard actions, and the current page context.
 Return ONLY a number — nothing else.
-- Pick the shortcut that directly accomplishes the NEXT sub-goal (not the entire goal)
-- Do NOT pick shortcuts for actions already done (see action history)
-- If no shortcut matches the goal → return 0
-- If a dialog is already open, do NOT pick shortcuts that open dialogs
+- Pick the action that directly accomplishes the NEXT sub-goal (not the entire goal)
+- Do NOT pick actions for things already done (see action history)
+- If no action matches the goal → return 0
+- If a dialog is already open, do NOT pick actions that open dialogs
 - If the view is MONTH, "next period" shortcuts jump months, not days
+
+SPREADSHEET CELL NAVIGATION (interleaved workflow):
+You are called MULTIPLE TIMES in a loop — each call handles ONE sub-goal.
+Look at the ACTION HISTORY to see where you are in the workflow, then pick the NEXT action.
+
+The workflow for entering values in a row (e.g., headers in row 1) is:
+  1. If not at the starting cell → pick "Focus Name Box" (Meta+J) — the system handles the full flow (Meta+J → type "A1" → Enter)
+  2. If at the target cell and it's EMPTY → return 0 (the system's Just-type tier will type the value)
+  3. If Just-type just typed a value (see action history) → pick Tab (move to next cell to the right)
+  4. Repeat steps 2-3 for each value in the row
+
+EXAMPLE — Goal: "enter headers 'Date', 'Category', 'Amount' in row 1"
+  Call 1: Not at A1 → pick "Focus Name Box" (Meta+J) — system will type "A1" and press Enter to jump to A1
+  Call 2: At A1, cell is empty → return 0 (Just-type types "Date")
+  Call 3: Action history shows "Just-type typed 'Date'" → pick Tab (move to B1)
+  Call 4: At B1, cell is empty → return 0 (Just-type types "Category")
+  Call 5: Action history shows "Just-type typed 'Category'" → pick Tab (move to C1)
+  Call 6: At C1, cell is empty → return 0 (Just-type types "Amount")
+  Done — all headers entered.
+
+RULES:
+- TYPING is NOT a shortcut action — return 0 when a cell needs a value typed
+- NAVIGATION IS a shortcut action — pick Tab/Arrow/Meta+J when you need to move
+- After Just-type types a value, the system may auto-press Tab — check action history before picking Tab again
+- If the current cell already has the correct value and more cells need values → pick Tab
+- If a dialog/overlay is open, do NOT pick cell navigation shortcuts — use Tab-Map instead
+- To move between cells: use ArrowRight/ArrowLeft/ArrowDown/ArrowUp or Tab/Shift+Tab
+- To jump to a specific cell: use Meta+J (or Control+J on Windows) to focus the Name Box — the system handles the full flow automatically (Meta+J → type cell address → Enter). Do NOT use Control+Home — it does not reliably focus cell A1 in Google Sheets.
+- After typing a value, Tab commits and moves right, Enter commits and moves down
 
 PRIORITY RULE for create/add/schedule goals:
 - If the goal says "create", "add", or "schedule" something → pick the CREATE shortcut (e.g., "create a new event", "open the create dialog for a timed event")
@@ -2311,12 +2755,11 @@ PRIORITY RULE for create/add/schedule goals:
 Actions taken:
 ${historyStr}
 
-Page context: ${_overlayHint} ${_focusHint} ${_viewHint}
-
-Available app shortcuts:
+Page context: ${_overlayHint} ${_focusHint} ${_editorHint} ${_viewHint}${_catNotes}
+Available keyboard actions:
 ${shortcutList}
 
-Which shortcut? (return number or 0 for none)`;
+Which action? (return number or 0 for none)`;
 
   try {
     const raw = await askWithMessages([
@@ -2325,11 +2768,12 @@ Which shortcut? (return number or 0 for none)`;
     ], { maxTokens: 10, temperature: 0.1, responseTimeoutMs: 10000 });
     const val = (raw || '').trim();
     const num = parseInt(val);
-    logger.info(`[browser.agent] _extractShortcut: LLM picked "${val}" (parsed: ${num}) from ${shortcuts.length} shortcuts`);
-    if (!num || num < 1 || num > shortcuts.length) return null;
-    const picked = shortcuts[num - 1];
-    logger.info(`[browser.agent] _extractShortcut: → "${picked.details.shortcut}" (${picked.summary.slice(0, 60)})`);
-    return { key: picked.details.shortcut, entryId: picked.id };
+    const _src = num >= 1 && num <= _allItems.length ? _allItems[num - 1].source : '?';
+    logger.info(`[browser.agent] _extractShortcut: LLM picked "${val}" (parsed: ${num}) from ${_allItems.length} actions (global=${_globalKeys.length}, app=${appShortcuts.length}, category=${_catKeys.length}, picked source=${_src})`);
+    if (!num || num < 1 || num > _allItems.length) return null;
+    const picked = _allItems[num - 1];
+    logger.info(`[browser.agent] _extractShortcut: → "${picked.key}" (${picked.desc.slice(0, 60)}, source=${picked.source})`);
+    return { key: picked.key, entryId: picked.entryId };
   } catch (e) {
     logger.warn(`[browser.agent] _extractShortcut failed: ${e.message}`);
     return null;
@@ -8025,6 +8469,23 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
     if (_deepLink) {
       startUrl = _deepLink;
       _urlFirstNavigationSelected = true;
+      // Check if engine is already on an entity page (not a creation URL).
+      // If the resolved deep-link is a creation URL but the browser is already
+      // on a non-creation page from a prior step (e.g. /d/<id>/edit), stay on
+      // the current page — re-navigating to /create would create a duplicate.
+      try {
+        const { classifyDeepLinkType } = require('../skill-helpers/deep-link-types.cjs');
+        const _curUrlRes = await callBrowserAct({ action: 'evaluate', text: 'window.location.href', sessionId, timeoutMs: 3000 }, 5000).catch(() => ({ ok: false }));
+        const _curUrl = _curUrlRes?.ok ? String(_curUrlRes.result || _curUrlRes.stdout || '').trim().replace(/^"|"$/g, '') : '';
+        if (_curUrl && !/^about:blank$/i.test(_curUrl) && /^https?:\/\//i.test(_curUrl)) {
+          const _curType = classifyDeepLinkType(_curUrl);
+          const _newType = classifyDeepLinkType(startUrl);
+          if (_curType !== 'creation' && _newType === 'creation') {
+            logger.info(`[browser.agent] run: already on entity page ${_curUrl} — skipping creation URL ${startUrl} for ${agentId}`);
+            startUrl = _curUrl;
+          }
+        }
+      } catch (_) {}
     } else {
       const _taskIntent = await classifyTaskIntent(task, _svcKey);
       if (_isMutationIntent(_taskIntent)) {
@@ -11616,7 +12077,7 @@ function _inferPageCategory(serviceKey, url, task, appKnowledgeEntries = []) {
     yahoo: 'email_compose', mailgooglecom: 'email_compose',
     chatgpt: 'ai_chat', openai: 'ai_chat', claude: 'ai_chat', anthropic: 'ai_chat',
     gemini: 'ai_chat', googleai: 'ai_chat', grok: 'ai_chat', perplexity: 'ai_chat',
-    notion: 'document_editor', googledocs: 'document_editor', googlesheets: 'document_editor',
+    notion: 'document_editor', googledocs: 'document_editor', googlesheets: 'spreadsheet',
     twitter: 'social_feed', x: 'social_feed', facebook: 'social_feed',
     linkedin: 'social_feed', reddit: 'social_feed',
     amazon: 'shopping', ebay: 'shopping', etsy: 'shopping',
@@ -12035,3 +12496,8 @@ module.exports._extractSearchPlan = _extractSearchPlan;
 module.exports._extractEditMode = _extractEditMode;
 module.exports._extractSearchText = _extractSearchText;
 module.exports._extractShortcut = _extractShortcut;
+module.exports._computeTabFlow = _computeTabFlow;
+module.exports._normalizeGoalForCache = _normalizeGoalForCache;
+module.exports._loadTabFlowCache = _loadTabFlowCache;
+module.exports._saveTabFlowCache = _saveTabFlowCache;
+module.exports._failTabFlowCache = _failTabFlowCache;
