@@ -148,6 +148,9 @@ async function _readActiveElement(sessionId) {
                ref,
                type: el.tagName === 'INPUT' ? (el.type || 'text') : '',
                ariaLabel,
+               ariaAutoComplete: el.getAttribute('aria-autocomplete') || '',
+               ariaOwns: el.getAttribute('aria-owns') || '',
+               ariaControls: el.getAttribute('aria-controls') || '',
                isIconLike,
                hasSvg,
                inDropdown,
@@ -412,8 +415,10 @@ async function _verifySubmitSuccess(sessionId, verifyText, preClickState) {
         const dialog = document.querySelector('[role="dialog"]');
         if (!dialog) return { gone: true, reason: 'no dialog' };
         const text = (dialog.innerText || '').toLowerCase();
-        const hasSend = !!dialog.querySelector('[data-tooltip*="Send" i], [aria-label*="Send" i]');
-        const isCompose = /compose|recipient|subject|message body/.test(text) || hasSend;
+        const hasSendOrPost = !!dialog.querySelector('[data-tooltip*="Send" i], [aria-label*="Send" i], [data-tooltip*="Post" i], [aria-label*="Post" i]');
+        // Social/email compose dialogs contain compose fields, placeholders, or submit buttons.
+        // Also catch LinkedIn "What do you want to talk about?" / Twitter "What's happening?".
+        const isCompose = /compose|recipient|subject|message body|what do you want to talk about|what's happening|new post|post to anyone|write a message|draft|share your thoughts/.test(text) || hasSendOrPost;
         return { gone: !isCompose, reason: isCompose ? 'compose still open' : 'dialog changed' };
       })()`,
     });
@@ -3201,7 +3206,25 @@ async function runInstructionSkill({ instructions, keyPath, params, skillArgs, s
 // Parse a single LLM action line into a structured action object.
 function _parseAction(text) {
   if (!text || typeof text !== 'string') return null;
-  const t = text.trim();
+  let t = text.trim();
+
+  // ── Pre-processor: strip prose/markdown from chatty LLMs ──
+  // Small/fast LLMs sometimes return "**Action:** Click \"X\"" with reasoning
+  // even when told to output only one line. Extract the action line before
+  // running the exact-match regexes below.
+  if (t.length > 80 || t.includes('\n') || /\*\*/.test(t)) {
+    // Try extracting from "Action:" or "**Action:**" lines
+    const _actionMatch = t.match(/\**\s*Action:\s*\**\s*(Click|Type|Press|Navigate|Wait|Get|Scroll|Screenshot|Run|Done)\b[^\n]*/i);
+    if (_actionMatch) {
+      t = _actionMatch[0].replace(/\*/g, '').replace(/^Action:\s*/i, '').trim();
+    } else {
+      // Try extracting any line that starts with an action verb
+      const _lines = t.split('\n').map(l => l.replace(/\*\*/g, '').trim()).filter(Boolean);
+      const _actionLine = _lines.find(l => /^(Click|Type|Press|Navigate|Wait|Get|Scroll|Screenshot|Run code:|Done)\b/i.test(l));
+      if (_actionLine) t = _actionLine;
+    }
+    logger.info(`[instruction.runner] _parseAction: normalized prose to "${t.slice(0, 80)}"`);
+  }
 
   // DONE
   if (/^done$/i.test(t)) return { action: 'done' };
@@ -3956,15 +3979,28 @@ async function _executeTypeGenerate(sessionId, value, focusedElement, goal, page
 
   const _contextBlock = agentContext ? `\n\nAgent context:\n${String(agentContext).slice(0, 800)}` : '';
   const _pageContext = pageContext ? `\nPage title: ${pageContext.title || 'unknown'}` : '';
+  const _ard = focusedElement?.ariaRoleDescription || '';
 
   const systemPrompt = `You generate long-form content for a web page field based on the goal.
 Return ONLY the content to type — no explanations, no markdown code fences.
+
+Context-aware rules:
+- If pageCategory is "social_feed": return ONLY the post/tweet text. NEVER return code, scripts, or automation instructions. The user wants to post a message, not automate posting.
+- If the field is a code editor (aria-roledescription contains "code" or "editor", or the page is a code playground/IDE): returning code IS appropriate if the goal asks for code.
+- If the goal explicitly asks to "write code", "write a script", "write a function": returning code IS appropriate.
+- Otherwise: return human-readable prose only. NEVER return automation scripts (Playwright, Selenium, Puppeteer, browser automation code).
+
+Content rules:
+- If the value provided is already the complete content the user wants (e.g., a tweet text, a short answer), return it as-is — do NOT expand or generate additional content.
 - Generate the full content requested by the goal
 - Use appropriate formatting (paragraphs, lists, etc.) with \\n for line breaks
 - Be thorough and complete
-- Match the requested format (essay, document, code, email body, etc.)`;
+- Match the requested format (essay, document, prose, email body, code) — but only code when the context allows it (see rules above)`;
 
   const userPrompt = `Goal: ${goal}
+Page category: ${pageCategory || 'unknown'}
+Field: ${focusedElement?.tag || 'unknown'} role=${focusedElement?.role || 'none'} aria-roledescription="${_ard}"
+Provided value: "${String(value || '').slice(0, 200)}"
 ${_pageContext}${_contextBlock}
 
 Generate the content:`;
@@ -4014,7 +4050,7 @@ async function _executeTypeEditExisting(sessionId, value, focusedElement, goal, 
   try {
     const clipRes = await browserAct({
       action: 'evaluate', sessionId, headed: true, timeoutMs: 3000,
-      text: `(() => {
+      text: `(async () => {
         try { return await navigator.clipboard.readText(); }
         catch (e) { return null; }
       })()`,
@@ -4569,7 +4605,7 @@ async function _executeJustType(sessionId, value, focusedElement, pageCategory, 
 
   // Determine field type and dispatch to the right executor
   const { _extractFieldType } = require('./browser.agent.cjs');
-  const fieldType = await _extractFieldType(goal, focusedElement, value, [], pageContext || {}, agentContext);
+  const fieldType = await _extractFieldType(goal, focusedElement, value, [], pageContext || {}, agentContext, pageCategory);
   const result = await _executeTypedField(sessionId, fieldType, value, focusedElement, goal, pageCategory, agentContext, pageContext, actionHistory);
   // Attach fieldType so the caller can tag actionHistory entries (e.g. list-item tracking)
   if (result && typeof result === 'object') result.fieldType = fieldType;
@@ -5078,6 +5114,17 @@ async function _tabMapStepExecute(sessionId, step, stepIndex, stepCount, tabMap,
     return { done: true, ok: true, action: 'DONE' };
   }
 
+  // Open/create button guard: if an overlay/dialog is already open and the
+  // step is a click on an open/create button (e.g. "Start a post", "Compose"),
+  // skip it as a no-op. The composer is already open — don't open another one.
+  const _openCreateKeywords = /\bstart a post\b|\bnew post\b|\bcompose\b|\bnew\s+(?:post|tweet|message|document|page)\b|\bcreate\s+(?:new|post|tweet|message|document|page)?\b/i;
+  if (step.action === 'click' && overlayActive && _openCreateKeywords.test(step.target || '')) {
+    if (pageCategory === 'social_feed' || pageCategory === 'ai_chat' || pageCategory === 'email_compose') {
+      logger.warn(`[instruction.runner] Tab-Map step ${stepIndex + 1}: skipping open/create click "${step.target}" — compose dialog already open (overlayActive=${overlayActive})`);
+      return { done: false, ok: true, stateChanged: false, action: `SKIP "${step.target}"` };
+    }
+  }
+
   // Multi-line type guard: a single type action with \n in a block editor
   // corrupts the page (types into the wrong field, creates wrong blocks).
   // Abort so the caller falls back to per-step LLM (Just-type) which handles
@@ -5160,8 +5207,10 @@ async function _tabMapStepExecute(sessionId, step, stepIndex, stepCount, tabMap,
     filledValue = step.value;
   }
 
-  // Check for submit actions
-  if (step.action === 'click' && /\b(send|submit|post|publish|create|save)\b/i.test(step.target || '')) {
+  // Check for submit actions — only real submit/primary action buttons, not
+  // open/create labels like "Start a post" or "New post".
+  const _submitLabels = /^(Post|Send|Submit|Publish|Save|Create|Share|Tweet|Schedule|Confirm|Apply|Continue|Post\s+it|Send\s+now|Save\s+changes)$/i;
+  if (step.action === 'click' && _submitLabels.test(step.target || '')) {
     const _verify = await _verifySubmitSuccess(sessionId, step.target, { url: currentUrl });
     if (_verify?.ok) {
       return { done: true, ok: true, stateChanged: true, action: `Click "${step.target}"` };
@@ -5459,7 +5508,11 @@ async function _selectTierLLM(sessionId, goal, actionHistory, pageCategory, shor
     : 'none (body/no focus)';
 
   // 2. Build available tiers (exclude tried tiers — don't give the LLM the choice)
-  const _availableTiers = [1, 2, 3, 4, 5, 6].filter(t => !triedTiers.has(t) && !disabledTiers.has(t));
+  // Filter by per-category allowedTiers if the category config specifies one.
+  // This prevents nonsensical tier cycling (e.g. social_feed → Gesture/Arrow-Grid).
+  const _tierCatConfig = getCategoryConfig(pageCategory);
+  const _allowedTiers = _tierCatConfig?.allowedTiers || [1, 2, 3, 4, 5, 6];
+  const _availableTiers = _allowedTiers.filter(t => !triedTiers.has(t) && !disabledTiers.has(t));
 
   // If all tiers are tried, return -1 to signal exhaustion (caller presses Escape + resets)
   if (_availableTiers.length === 0) {
@@ -5966,6 +6019,7 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
   const filledFields = [];        // { ref, label, value } — for LLM prompt
   const consumedRefs = new Set(); // refs of filled fields — for filtering element list
   let inTabMapSession = false;
+  let _tabMapParseRetries = 0; // parse-failure retry counter (Bug A fix — don't block Tab-Map on LLM formatting failures)
   let overlayActive = false;
   // Combine app-knowledge shortcuts with category-config categoryKeys.
   // This ensures that even when app-knowledge research fails (e.g., web search
@@ -6258,6 +6312,7 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
           }
           const _resultStr = _buildResultString(goal, actionHistory, filledFields, extractedPageText);
           logger.info(`[instruction.runner] Tab-Map: DONE — ${_resultStr}`);
+          _tabMapParseRetries = 0; // reset parse-retry counter on success
           // Tab-Flow: advance flow index on successful Tab-Map completion
           if (_tabFlow && _flowIndex < _tabFlow.length && _tabFlow[_flowIndex].tier === 4) {
             _flowIndex++;
@@ -6286,10 +6341,27 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
           continue; // re-decide
         } else if (!stepResult.ok) {
           // Failed — re-decide
-          logger.warn(`[instruction.runner] Tab-Map: session ended (failed: ${stepResult.error}) — re-deciding`);
-          // Tab-Map made no progress — add to tried tiers so _selectTierLLM doesn't re-pick it
-          _triedTiers.add(4);
-          logger.info(`[instruction.runner] Tab-Map made no progress — adding 4 to tried tiers`);
+          // Bug A fix: distinguish parse failures (LLM returned prose instead of
+          // one line) from strategy failures (element not found, click missed).
+          // Parse failures are LLM formatting issues — Tab-Map is still the right
+          // strategy, so retry instead of permanently blocking the tier.
+          const _isParseFailure = stepResult.error && stepResult.error.startsWith('Could not parse LLM action');
+          if (_isParseFailure) {
+            _tabMapParseRetries++;
+            if (_tabMapParseRetries > 2) {
+              logger.warn(`[instruction.runner] Tab-Map: parse failure ${_tabMapParseRetries}x — giving up on Tab-Map (LLM keeps returning prose)`);
+              _triedTiers.add(4);
+              _tabMapParseRetries = 0;
+            } else {
+              logger.warn(`[instruction.runner] Tab-Map: parse failure ${_tabMapParseRetries}/2 (LLM returned prose) — retrying Tab-Map without blocking tier`);
+              // Don't add 4 to triedTiers — Tab-Map is still the right strategy
+            }
+          } else {
+            // Strategy failure — block Tab-Map as before
+            logger.warn(`[instruction.runner] Tab-Map: session ended (failed: ${stepResult.error}) — re-deciding`);
+            _triedTiers.add(4);
+            logger.info(`[instruction.runner] Tab-Map made no progress — adding 4 to tried tiers`);
+          }
           prevUrl = currentUrl;
           continue; // re-decide
         }
@@ -6309,6 +6381,7 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
       _stepPlan = null;
       _stepIndex = 0;
       _usingStepFallback = false;
+      _tabMapParseRetries = 0; // reset parse-retry counter on state change
       filledFields.length = 0;
       consumedRefs.clear();
       _clearLlmCache(sessionId);
@@ -6947,10 +7020,13 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
           prevUrl = currentUrl;
           continue;
         }
-        // Fallback to Tab-Map
+        // Fallback to Tab-Map — let _selectTierLLM pick it on the next iteration.
+        // Bug B fix: previously set inTabMapSession=true with _cachedTabMap=null,
+        // but the guard at the top of the loop requires _cachedTabMap to be non-null,
+        // so it fell through to _selectTierLLM anyway (which might not pick Tab-Map).
+        // Now we just ensure Tab-Map is available and let the normal decision flow run.
         logger.info(`[instruction.runner] Just-type failed (${result.error}) — falling back to Tab-Map`);
-        inTabMapSession = true;
-        // Build tab-map on next iteration
+        _triedTiers.delete(4); // ensure Tab-Map is available for selection
         _cachedTabMap = null;
         _stepPlan = null;
         _stepIndex = 0;
@@ -7014,9 +7090,11 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
       _triedTiers.add(2);
 
       if (!result.ok) {
-        // Fallback to Tab-Map
+        // Fallback to Tab-Map — let _selectTierLLM pick it on the next iteration.
+        // Bug B fix: previously set inTabMapSession=true with _cachedTabMap=null,
+        // which was a dead-end (guard required _cachedTabMap non-null).
         logger.info(`[instruction.runner] Meta+F failed (${result.error}) — falling back to Tab-Map`);
-        inTabMapSession = true;
+        _triedTiers.delete(4); // ensure Tab-Map is available for selection
         _cachedTabMap = null;
         _stepPlan = null;
         _stepIndex = 0;
@@ -7128,9 +7206,11 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
       }
 
       if (!result.ok) {
-        // Fallback to Tab-Map
+        // Fallback to Tab-Map — let _selectTierLLM pick it on the next iteration.
+        // Bug B fix: previously set inTabMapSession=true with _cachedTabMap=null,
+        // which was a dead-end (guard required _cachedTabMap non-null).
         logger.info(`[instruction.runner] Shortcut failed (${result.error}) — falling back to Tab-Map`);
-        inTabMapSession = true;
+        _triedTiers.delete(4); // ensure Tab-Map is available for selection
         _cachedTabMap = null;
         _stepPlan = null;
         _stepIndex = 0;

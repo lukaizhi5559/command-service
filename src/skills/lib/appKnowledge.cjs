@@ -291,7 +291,15 @@ function isCacheStale(hostname) {
   // LLM-synthesized entries (confidence >= 0.7) contain actionable knowledge.
   // JIT research entries (confidence 0.8) are highly actionable recovery moves.
   const hasHighConfidence = entries.some(e => (e.confidence || 0) >= 0.6);
-  return !hasHighConfidence;
+  if (hasHighConfidence) return false;
+  // Snippet-only entries (snippetOnly=true) are cached with a 1h TTL.
+  // They're not actionable but provide context — reuse for 1h before re-researching.
+  const _now = Date.now();
+  const _hasFreshSnippet = entries.some(e =>
+    e.snippetOnly && e.cachedAt && (_now - e.cachedAt) < 3600000 // 1 hour
+  );
+  if (_hasFreshSnippet) return false;
+  return true;
 }
 
 /**

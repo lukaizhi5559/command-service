@@ -39,6 +39,45 @@ const fs = require('fs');
 const logger = require('../logger.cjs');
 const skillLlm = require('../skill-helpers/skill-llm.cjs');
 
+// Robust JSON parser for LLM output — handles truncated strings, dangling
+// commas, missing values, and markdown fences. Mirrors the parseLlmJson
+// utility used in stategraph-module. jsonrepair is resolvable from the
+// workspace root; the require is wrapped in try/catch so the skill still
+// works if the optional dep is absent.
+let _jsonrepair;
+try { _jsonrepair = require('jsonrepair').jsonrepair; } catch (_) { /* optional dep */ }
+
+function _parseGoalJson(raw) {
+  if (!raw) return null;
+  // Strip markdown code fences
+  let s = raw.replace(/^```[a-z]*\n?|```$/g, '').trim();
+  // Extract the outermost balanced JSON object (tracks string state so
+  // braces inside strings don't confuse the depth counter)
+  const start = s.indexOf('{');
+  if (start === -1) return null;
+  let depth = 0, inStr = false, escaped = false, end = -1;
+  for (let i = start; i < s.length; i++) {
+    const c = s[i];
+    if (inStr) {
+      if (escaped) { escaped = false; continue; }
+      if (c === '\\') { escaped = true; continue; }
+      if (c === '"') inStr = false;
+      continue;
+    }
+    if (c === '"') inStr = true;
+    else if (c === '{') depth++;
+    else if (c === '}') { depth--; if (depth === 0) { end = i; break; } }
+  }
+  const jsonStr = end !== -1 ? s.slice(start, end + 1) : s.slice(start);
+  // Attempt 1: direct parse
+  try { const parsed = JSON.parse(jsonStr); if (parsed && typeof parsed === 'object') return parsed; } catch (_) {}
+  // Attempt 2: jsonrepair (handles truncated output, smart quotes, missing values)
+  if (_jsonrepair) {
+    try { const parsed = JSON.parse(_jsonrepair(jsonStr)); if (parsed && typeof parsed === 'object') return parsed; } catch (_) {}
+  }
+  return null;
+}
+
 // ---------------------------------------------------------------------------
 // Internal LLM prompt — translates a plain-language goal into a concrete bash
 // command. Fires ONLY when a plan step passes args.goal (natural language) instead
@@ -63,6 +102,15 @@ When the goal mentions a folder or file by name only with no absolute path (e.g.
 - Example — "count files in the gongzuo folder":
   SRC=$(mdfind -name "gongzuo" -onlyin "$HOME" | grep -v node_modules | head -1); [ -d "$SRC" ] && find "$SRC" -type f | wc -l || echo "0"
 - For other unknown paths: SRC=$(mdfind -name "FILENAME" | grep -v node_modules | head -1)
+
+find grouping rule (CRITICAL — unbalanced groupings cause find to exit 1):
+- When using find with \\( ... -o ... \\) groupings, the \\( and \\) must ALWAYS be balanced.
+- Every \\( must have a matching \\) before any pipe (|) or end of command.
+- Missing \\) causes find to exit with code 1 and produce no output.
+- Example — "list all image files in /path/to/folder":
+  { "cmd": "bash", "argv": ["-c", "find '/path/to/folder' -maxdepth 1 -type f \\( -iname '*.png' -o -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.webp' -o -iname '*.gif' -o -iname '*.bmp' -o -iname '*.tiff' -o -iname '*.heic' \\) | sort"] }
+- WRONG (missing closing \\) — will exit 1):
+  find '/path/to/folder' -type f \\( -iname '*.png' -o -iname '*.jpg' -o -iname '*.gif'
 
 File move/copy safety rules (CRITICAL — bash loop bugs are the #1 failure):
 - NEVER use wildcards that include the destination: mv ~/Desktop/* ~/Desktop/dest/ WRONG (moves dest into itself)
@@ -153,16 +201,33 @@ async function _resolveGoalToCommand(goal, onProgress) {
       const response = await skillLlm.askWithMessages([
         { role: 'system', content: SHELL_RUN_SYSTEM },
         { role: 'user', content: `Goal: ${goal}` },
-      ], { maxTokens: 300 });
-      const raw = (response || '').trim().replace(/^```[a-z]*\n?|```$/g, '').trim();
+      ], { maxTokens: 300, temperature: 0 });
+      const raw = (response || '').trim();
       if (!raw) {
         lastErr = 'LLM returned empty response';
         continue;
       }
-      const parsed = JSON.parse(raw);
-      if (!parsed.cmd || !Array.isArray(parsed.argv)) {
-        lastErr = `LLM returned invalid command shape: ${raw}`;
+      const parsed = _parseGoalJson(raw);
+      if (!parsed) {
+        lastErr = `LLM returned unparseable JSON: ${raw.slice(0, 120)}`;
         continue;
+      }
+      if (!parsed.cmd || !Array.isArray(parsed.argv)) {
+        lastErr = `LLM returned invalid command shape: ${raw.slice(0, 120)}`;
+        continue;
+      }
+      // Structural guard: find groupings must be balanced.
+      // find's \( and \) are arguments to find, not shell syntax, so `bash -n`
+      // cannot catch unbalanced groupings. An unclosed \( causes find to exit 1.
+      const script = (parsed.argv || []).join(' ');
+      if (/\bfind\b/.test(script)) {
+        const openCount = (script.match(/\\\(/g) || []).length;
+        const closeCount = (script.match(/\\\)/g) || []).length;
+        if (openCount !== closeCount) {
+          lastErr = `LLM generated find command with unbalanced grouping (${openCount} '\\(' vs ${closeCount} '\\)') — retrying`;
+          logger.warn(`[shell.run] ${lastErr}: ${script.slice(0, 120)}`);
+          continue;
+        }
       }
       if (onProgress) onProgress({ type: 'shell:goal_resolved', cmd: parsed.cmd, argv: parsed.argv });
       return { ok: true, cmd: parsed.cmd, argv: parsed.argv };
@@ -661,10 +726,22 @@ function _resolveOutputPath(rawPath, cwd) {
   return candidate;
 }
 
+function _isValidOutputPath(rawPath) {
+  if (!rawPath || typeof rawPath !== 'string') return false;
+  const p = rawPath.trim();
+  if (p.length < 2 || p.length > 4096) return false;
+  // Reject tokens with shell-incompatible chars that slipped through pathToken
+  if (/[(){}=]/.test(p)) return false;       // exist_ok=True) , foo(bar)
+  if (p.startsWith('-')) return false;        // flag, not a path
+  if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(p)) return false; // VAR=value
+  return true;
+}
+
 function _extractExpectedOutputs(baseName, argv = [], cwd) {
   const expected = [];
   const seen = new Set();
   const pushExpected = (rawPath, type, toolName) => {
+    if (!_isValidOutputPath(rawPath)) return;
     const absPath = _resolveOutputPath(rawPath, cwd);
     if (!absPath || seen.has(absPath)) return;
     seen.add(absPath);
@@ -706,6 +783,17 @@ function _extractExpectedOutputs(baseName, argv = [], cwd) {
   if (!hasScript) return expected;
 
   const script = argv[1];
+
+  // ── Skip script-body regex parsing for inner-interpreter one-liners ───────
+  // When bash -c invokes python3 -c '...', node -e '...', perl -e '...', etc.,
+  // the inner language's syntax is opaque to shell regex. Method calls like
+  // pathlib.Path(...).mkdir(...) would be misread as shell mkdir commands,
+  // producing false "expected output" paths (e.g. exist_ok=True)).
+  const INNER_INTERPRETER_RE = /\b(python3?|node|ruby|perl|awk)\b\s+(-[ec]|--command|--eval)\b/;
+  if (INNER_INTERPRETER_RE.test(script)) {
+    return expected; // only direct-tool checks (already collected above) apply
+  }
+
   const pathToken = '(?:"([^"]+)"|\'([^\']+)\'|([^\\s\"\'`;|&]+))';
 
   let match;
@@ -795,6 +883,23 @@ function _verifyExpectedOutputs(result, baseName, argv, cwd) {
       ...result,
       outputVerified: true,
       verifiedOutputs: expected.map((entry) => entry.path),
+    };
+  }
+
+  // ── Soft-warning when the command succeeded but the verifier couldn't confirm ──
+  // The verifier is a heuristic — false positives are possible (e.g. complex
+  // pipelines, inner interpreters, dynamic paths). When the command itself
+  // succeeded (exit 0), don't override that with a hard failure. Surface as a
+  // warning so executeCommand can proceed and downstream synthesis can still
+  // verify the actual result from the filesystem. Only hard-fail when the
+  // command itself failed (non-zero exit) — there the verifier adds useful
+  // diagnostic context about what didn't get created.
+  if (result.ok && result.exitCode === 0) {
+    return {
+      ...result,
+      outputVerified: false,
+      verificationWarning: `Could not verify expected output: ${missing.path}`,
+      unverifiedPath: missing.path,
     };
   }
 

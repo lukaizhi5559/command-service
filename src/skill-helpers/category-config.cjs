@@ -33,6 +33,7 @@ const CATEGORY_CONFIGS = {
   // ── Email compose (Gmail, Outlook) ─────────────────────────────────────
   email_compose: {
     regions: ['to', 'cc', 'bcc', 'subject', 'body'],
+    allowedTiers: [1, 4], // Just-type, Tab-Map only — no Meta+F/Gesture/Arrow-Grid
     notes: [
       'Escape closes the compose window — do NOT press Escape unless you want to discard the email',
       'Tab navigates between To/Subject/Body fields — use Tab-Map for multi-field filling',
@@ -44,6 +45,7 @@ const CATEGORY_CONFIGS = {
   // ── AI chat (ChatGPT, Claude, Gemini) ──────────────────────────────────
   ai_chat: {
     regions: ['input'],
+    allowedTiers: [1, 4], // Just-type, Tab-Map only
     notes: [
       'Single input field — type the message and press Enter to send',
       'No multi-field forms — Just-type is almost always correct',
@@ -54,6 +56,7 @@ const CATEGORY_CONFIGS = {
   // ── Social feed (Twitter, LinkedIn, Facebook) ──────────────────────────
   social_feed: {
     regions: ['post_compose', 'comment', 'feed'],
+    allowedTiers: [1, 4], // Just-type, Tab-Map only — no Meta+F/Shortcuts/Gesture/Arrow-Grid
     notes: [
       'Post compose is usually a single field — Just-type works',
       'Reply/comment boxes may need clicking first before typing',
@@ -253,7 +256,7 @@ const CATEGORY_CONFIGS = {
  * Get the category config for a page category.
  * Falls back to 'web_generic' for unknown/null/empty categories.
  * @param {string} category — page category string
- * @returns {{ regions: string[], notes: string[], commonPatterns: string[] }}
+ * @returns {{ regions: string[], notes: string[], commonPatterns: string[], allowedTiers?: number[] }}
  */
 function getCategoryConfig(category) {
   if (!category || typeof category !== 'string') {

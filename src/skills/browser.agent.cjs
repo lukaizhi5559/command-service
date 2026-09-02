@@ -1245,9 +1245,10 @@ function _buildFocusedStr(focusedElement) {
   if (!focusedElement) return 'unknown';
   const ce = focusedElement.isContentEditable ? '[contenteditable]' : '';
   const ard = focusedElement.ariaRoleDescription ? `[${focusedElement.ariaRoleDescription}]` : '';
+  const ac = focusedElement.ariaAutoComplete ? `[autocomplete=${focusedElement.ariaAutoComplete}]` : '';
   const label = (focusedElement.text || focusedElement.ariaLabel || '').slice(0, 60);
   const ph = (focusedElement.placeholder || focusedElement.dataPlaceholder || '').slice(0, 60);
-  return `${focusedElement.tag}${ce}${ard} label="${label}" placeholder="${ph}"`;
+  return `${focusedElement.tag}${ce}${ard}${ac} label="${label}" placeholder="${ph}"`;
 }
 
 // Value extraction: what to type into the focused field.
@@ -2276,12 +2277,12 @@ Number (0-4)?`;
 // Called after _extractValue returns a value, before typing it.
 // Returns one of: 'type-plain', 'type-edit', 'type-commands', 'type-search'
 // Deterministic pre-checks skip the LLM for obvious cases.
-async function _extractFieldType(goal, focusedElement, value, actionHistory, pageContext = {}, agentContext) {
+async function _extractFieldType(goal, focusedElement, value, actionHistory, pageContext = {}, agentContext, pageCategory) {
   const _val = String(value || '');
   const _tag = focusedElement?.tag || '';
   const _role = focusedElement?.role || '';
 
-  // ── Deterministic pre-checks (skip LLM) ──
+  // ── Deterministic fast-paths (near-100% reliable, save a model call) ──
 
   // Value starts with / → type-commands (Notion blocks, Slack commands)
   if (_val.startsWith('/')) {
@@ -2293,30 +2294,12 @@ async function _extractFieldType(goal, focusedElement, value, actionHistory, pag
     logger.info(`[browser.agent] _extractFieldType: → type-search (value starts with @)`);
     return 'type-search';
   }
-  // Short single-line <input> → type-plain (search, chat, simple form fields)
-  if (_tag === 'input' && _val.length < 200 && !_val.includes('\n')
-      && !/^[/@\[#]/.test(_val)) {
-    logger.info(`[browser.agent] _extractFieldType: → type-plain (input + short single-line)`);
-    return 'type-plain';
-  }
-  // Contenteditable or textarea with long/multi-line content → type-edit
-  // BUT exclude markdown prefixes ([] , ##, -) which are block shortcuts, not long-form content
-  if ((_role === 'textbox' || _tag === 'textarea' || _tag === 'div')
-      && (_val.length > 200 || _val.includes('\n'))
-      && !/^[/@]/.test(_val)
-      && !/^(##\s|###\s|####\s|- \s|\[\]\s|\* \s|> \s|1\. \s)/.test(_val)) {
-    logger.info(`[browser.agent] _extractFieldType: → type-edit (canvas/textarea + long/multi-line)`);
-    return 'type-edit';
-  }
-  // Markdown shortcuts in block editors → type-plain (no dropdown, direct block creation)
-  // These are fallbacks for apps WITHOUT slash commands (GitHub, HackMD, plain markdown editors)
-  if (/^(##\s|###\s|####\s|- \s|\[\]\s|\* \s|> \s|1\. \s)/.test(_val)
-      && (_role === 'textbox' || _tag === 'textarea' || _tag === 'div')) {
-    logger.info(`[browser.agent] _extractFieldType: → type-plain (markdown prefix in block editor — no dropdown)`);
-    return 'type-plain';
-  }
 
-  // ── LLM fallback for ambiguous cases ──
+  // ── Signal-driven LLM classifier ──
+  // All other cases go through the LLM with rich signals (pageCategory, URL,
+  // visible text, autocomplete attrs, action history). This replaces the
+  // previous regex rules which misclassified social-feed compose boxes as
+  // type-edit (causing the agent to generate Playwright code into tweet fields).
   const { askWithMessages } = require('../skill-helpers/skill-llm.cjs');
 
   const _focusedStr = _buildFocusedStr(focusedElement);
@@ -2325,32 +2308,39 @@ async function _extractFieldType(goal, focusedElement, value, actionHistory, pag
     ? `\n\nAgent context:\n${String(agentContext).slice(0, 800)}`
     : '';
 
-  const systemPrompt = `You decide what KIND of typing a field needs.
-Look at the focused field, the value to type, and the goal. Return ONLY one of:
-- type-plain: single-line text + Enter (search, chat, simple form fields)
-- type-edit: long-form content (documents, code, essays — generate or edit)
-- type-commands: typing with / or @ commands that open a dropdown (Notion blocks, Slack commands)
-- type-search: typing to filter a dynamic dropdown (@mentions, assignee pickers, page pickers)
-- type-list-item: typing into a list/checklist/todo item where Enter creates the next item
+  const systemPrompt = `You decide what KIND of typing a focused web field needs.
+Return ONLY one of:
+- type-plain: type the value as-is, then submit (Enter or click a button). Use for: search boxes, chat inputs, social media posts/tweets, comments, simple form fields, login fields, short answers. The value IS the final content.
+- type-edit: long-form content creation or editing in a document/code editor. The value may need expansion, restructuring, or generation from the goal. Use for: document bodies (Notion, Google Docs), code editors, essay/article composition, email bodies. The field is a rich editing surface AND the goal asks to write/generate/edit substantial content.
+- type-commands: the value starts with '/' and opens a block/command menu (Notion, Slack, editor slash commands).
+- type-search: the value filters a dynamic dropdown — @mentions, assignee pickers, page pickers. Field has aria-autocomplete or aria-owns/aria-controls pointing to a listbox.
+- type-list-item: typing into a todo/checklist/task item where Enter creates the next item.
 
-Rules:
-- <input> with short single-line value → type-plain
-- contenteditable/textarea with multi-line or long value → type-edit
-- value starts with / and field is a block editor → type-commands
-- value starts with @ and field has a combobox/listbox → type-search
-- contenteditable with aria-roledescription containing "to-do", "task", "list item", or "checklist" → type-list-item
-- field inside a todo/checklist/task list where Enter creates the next item → type-list-item
-- value is a short single-line item in a list context (goal mentions "items", "todos", "tasks", "checklist") → type-list-item
-- TITLE FIELD GUARD: If the focused field is a title (aria-roledescription includes "title", placeholder includes "New page" or "Untitled", or it's an h1/h2), and the value does NOT start with / or @, return type-plain. Titles are never command fields.
-- If unsure → type-plain (safest default)
+Decision signals (weigh by importance):
+1. pageCategory: "social_feed" → almost always type-plain (posts, tweets, comments are short final content). "document_editor" → often type-edit. "spreadsheet" → type-plain for cell entry. "ai_chat" → type-plain.
+2. URL: contains "compose" or "post" → likely type-plain (social compose box). Contains "edit" or "docs" → likely type-edit.
+3. Field aria-label: "Post text", "Tweet", "What's happening" → type-plain. "Page body", "Document", "Code" → type-edit.
+4. Value length: short (<200 chars) and single-line → lean type-plain. Long or multi-line → lean type-edit (but only if the field is an editing surface).
+5. Goal intent: "post/tweet/share X" → type-plain (the value is the post). "write an essay/doc/article about X" → type-edit. "write a script/code" in a code editor → type-edit.
+6. Autocomplete signals: aria-autocomplete="list" + aria-owns/aria-controls → type-search (if value starts with @ or is a search query).
+7. Existing content: field already has content + goal says "edit/fix/update" → type-edit. Field empty + goal says "compose/post" → type-plain.
+8. List context: aria-roledescription contains "to-do", "task", "list item", or "checklist" → type-list-item. Goal mentions "items", "todos", "tasks", "checklist" + short value → type-list-item.
+9. TITLE FIELD GUARD: aria-roledescription includes "title", placeholder includes "New page" or "Untitled", or it's an h1/h2 → type-plain. Titles are never command/edit fields.
+
+If unsure → type-plain (safest default — types the value as-is without generating anything).
 Return ONLY the type name, nothing else.`;
 
   const historyStr = (actionHistory || []).slice(-5).map((a, i) => `  ${i + 1}. ${a}`).join('\n');
 
   const userPrompt = `Goal: ${goal}
+Page category: ${pageCategory || 'unknown'}
+Page URL: ${pageContext.url || 'unknown'}
 Page title: ${pageContext.title || 'unknown'}
+Visible text: ${(pageContext.visibleText || '').slice(0, 200)}
 Focused field: ${_focusedStr}
-Value to type: "${_val.slice(0, 100)}"${_contextBlock}
+Field has content: ${focusedElement?.hasContent ? 'yes' : 'no'} (current: "${(focusedElement?.currentValue || '').slice(0, 80)}")
+Value to type: "${_val.slice(0, 200)}"
+Recent actions: ${historyStr || '(none)'}${_contextBlock}
 
 Field type?`;
 
@@ -2363,7 +2353,7 @@ Field type?`;
     const valid = ['type-plain', 'type-edit', 'type-commands', 'type-search', 'type-list-item'];
     const match = valid.find(v => val.includes(v));
     const result = match || 'type-plain';
-    logger.info(`[browser.agent] _extractFieldType: LLM → ${result} (raw="${val}")`);
+    logger.info(`[browser.agent] _extractFieldType: LLM → ${result} (raw="${val}") — pageCategory=${pageCategory || 'unknown'}, url=${pageContext.url || 'unknown'}`);
     return result;
   } catch (e) {
     logger.warn(`[browser.agent] _extractFieldType LLM failed: ${e.message} — defaulting to type-plain`);
@@ -3057,7 +3047,16 @@ OVERLAY/DIALOG STATE RULES (critical — check the Overlay/dialog state in the u
 - If the Overlay/dialog is OPEN, the form fields in the available elements list are the relevant ones — plan to fill them and then click the submit/save button.
 - If the Overlay/dialog is CLOSED and the goal requires creating something, you may need to click a "Create" button or use a shortcut to open the dialog first.
 - Use the Actions already taken to determine what's been done. Do NOT repeat actions already taken (e.g., if a shortcut was pressed to open the create dialog, don't plan to open it again).
-- If a "navigate" step would go to the same or a parent of the current URL, skip it — it's redundant.`;
+- If a "navigate" step would go to the same or a parent of the current URL, skip it — it's redundant.
+
+SOCIAL_FEED COMPOSE RULE (critical — check URL and overlay state):
+- If the URL contains "shareActive=true", "compose", "posting", or "share" AND the overlay is OPEN, the post composer is ALREADY open. Do NOT generate a "click Start a post" or "click Compose" step — the dialog is already open.
+- The post text is in the goal, usually inside single quotes ('...') or double quotes ("...") or after "with the text" / "saying" / "that says". Extract it exactly, including trailing punctuation (e.g. "great effort team.yah!"). Preserve the exact text — do not clean it up.
+- The compose field is the first [FILLABLE] textbox inside the dialog (usually a div with role=textbox and placeholder like "What do you want to talk about?"). Target it by its placeholder/aria-label if shown in the element list, or by the first [FILLABLE] element in the dialog.
+- Generate exactly these steps:
+  [{ "action": "type", "target": "<compose field label/placeholder>", "value": "<exact post text from goal>" }, { "action": "click", "target": "Post" }]
+- If the goal is to post X and the overlay is open, "done" is NEVER correct — the only correct plan is type + click Post.
+- If no "Post" button is in the current tab-map, still generate the type step. Do not return done until the text is typed.`;
 
   const _overlayStr = overlayActive ? 'OPEN' : 'CLOSED';
   const _historyStr = (actionHistory && actionHistory.length > 0)
@@ -3318,9 +3317,15 @@ Rules:
 - If no available element gets closer to the goal, output DONE.
 - For chip/token fields (email To, Recipients, CC, BCC): after Type, the system auto-confirms with Enter. Do NOT add a separate Press Enter for chip confirmation.
 - For AI chat (ChatGPT, Claude, etc.): after typing the prompt, add Press Enter to submit.
-- Extract values to type from the goal text (quoted strings, names, search queries, message bodies).
-- If the current URL already has the action triggered (compose=new, /new, /create), start with Type steps directly.
+- Extract values to type from the goal text (quoted strings in single or double quotes, names, search queries, message bodies). Preserve the exact text including trailing punctuation.
+- If the current URL already has the action triggered (compose=new, /new, /create, ?shareActive=true, ?compose), start with Type steps directly.
 - If a modal/dialog is open (elements like "To", "Subject", "Body", "Send" are visible), work within it.
+
+SOCIAL_FEED COMPOSE RULE (critical — one step at a time):
+- If a social compose dialog is already open (URL contains "shareActive=true" or the page shows a composer with placeholder like "What do you want to talk about?" or "What's happening?"), do NOT click "Start a post", "New post", "Compose", "Tweet", or similar create buttons — these would open a NEW composer.
+- The compose field is the large [FILLABLE] textbox inside the dialog (role=textbox, usually contenteditable). Type the post text from the goal into it.
+- The submit button is usually "Post" (LinkedIn), "Post" or "Tweet" (Twitter/X), "Share" (Facebook), or "Send" (messaging). Click it only after typing.
+- If the dialog is open and the post text is in the goal, your next action must be Type, not Click.
 - Do NOT repeat actions you've already taken (see action history). Try a different approach.
 - If you've already clicked an element and the page didn't change (see action results), try a different action.
 - APP KNOWLEDGE RULE: Check the Agent context below for app-specific patterns — slash commands, block creation shortcuts, UI quirks, keyboard shortcuts. Use them when the goal requires app-specific interactions.
@@ -3797,6 +3802,43 @@ function lookupBrowserService(service) {
   // deriveAgentType() returns 'browser' for any isOAuth:false entry without an explicit type.
   if (!entry.capabilities) return { ...entry, capabilities: ['navigate', 'interact'] };
   return entry;
+}
+
+/**
+ * Reverse-lookup: given a service key and URL, find the intent type whose
+ * intentUrls entry matches. Returns the intent string (e.g. 'social',
+ * 'content_create', 'mail') or null if no match.
+ *
+ * This is the reverse of _seedIntentUrlsFromKnownServices (which goes
+ * intent→URL). It enables deriving _deepLinkIntent from caller-provided URLs
+ * so that _isCreationDeepLink and the app-knowledge short-circuit can work
+ * without hardcoded query-param checks.
+ *
+ * Only string intentUrls entries are matched — buildUrl functions are dynamic
+ * and can't be reverse-matched. This is fine because string entries are the
+ * common case for creation/compose deep-links (e.g. LinkedIn ?shareActive=true,
+ * Twitter /compose/post, Gmail #inbox?compose=new, notion.new).
+ */
+function _matchIntentUrl(serviceKey, url) {
+  try {
+    const svcEntry = lookupBrowserService(serviceKey);
+    if (!svcEntry?.intentUrls || !url) return null;
+    const _baseUrl = svcEntry.startUrl || 'https://example.com';
+    const _targetUrl = new URL(url, _baseUrl);
+    const _targetHref = _targetUrl.href;
+    for (const [intentKey, urlOrBuilder] of Object.entries(svcEntry.intentUrls)) {
+      if (typeof urlOrBuilder === 'string') {
+        try {
+          const _intentUrl = new URL(urlOrBuilder, _baseUrl);
+          // Full href match — handles query params (?shareActive=true) and hash
+          // (#inbox?compose=new) because URL.href includes both.
+          if (_intentUrl.href === _targetHref) return intentKey;
+        } catch (_) {}
+      }
+      // buildUrl functions are dynamic — can't reverse-match, skip
+    }
+    return null;
+  } catch (_) { return null; }
 }
 
 /**
@@ -7498,18 +7540,35 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
           logger.info(`[browser.agent] app-knowledge: loaded ${_seededEntries.length} entries (after seeding) for ${_appKnowledgeHost}`);
         }
         // Cache empty or stale (all low-confidence) — start research now (parallel with auth check below)
-        const _akDomain = existing?.service || _appKnowledgeHost;
-        const _akQuery = task ? task.slice(0, 80) : null;
-        _appKnowledgePromise = callSkill('web.agent', {
-          action: 'research_app_behavior',
-          domain: _akDomain,
-          query: _akQuery,
-          maxResults: 10,
-        }).catch(() => null);
-        const _staleReason = _cacheStale
-          ? 'stale (all low-confidence snippet entries)'
-          : (_shortcutStale ? 'stale (sparse shortcut coverage — < 5 shortcuts and older than 7 days)' : 'empty');
-        logger.info(`[browser.agent] app-knowledge: cache ${_staleReason} for ${_appKnowledgeHost} — research started in parallel with auth check`);
+        // But first check if we should short-circuit research for this case.
+        // For simple categories (social_feed, ai_chat, email_compose) with a mutation-intent
+        // deep-link (e.g. LinkedIn ?shareActive=true, Twitter /compose/post, Gmail compose=new),
+        // the URL + Tab-Flow is sufficient — research would return no actionable shortcuts/selectors
+        // and block for 60-110s. Skip it entirely.
+        if (!_deepLinkIntent && url) {
+          _deepLinkIntent = _matchIntentUrl(_svcKey, url);
+        }
+        const _simpleCategories = new Set(['social_feed', 'ai_chat', 'email_compose']);
+        const _earlyPageCategory = _inferPageCategory(_svcKey, url || startUrl, task, []);
+        const _isMutationDeepLink = _deepLinkIntent && _isMutationIntent(_deepLinkIntent);
+
+        if (_simpleCategories.has(_earlyPageCategory) && _isMutationDeepLink) {
+          logger.info(`[browser.agent] app-knowledge: skipping research for ${agentId} — ${_earlyPageCategory} with mutation deep-link (intent=${_deepLinkIntent}, URL+Tab-Flow sufficient)`);
+          // Don't set _appKnowledgePromise — it stays null, and the await at the app-knowledge block is skipped
+        } else {
+          const _akDomain = existing?.service || _appKnowledgeHost;
+          const _akQuery = task ? task.slice(0, 80) : null;
+          _appKnowledgePromise = callSkill('web.agent', {
+            action: 'research_app_behavior',
+            domain: _akDomain,
+            query: _akQuery,
+            maxResults: 10,
+          }).catch(() => null);
+          const _staleReason = _cacheStale
+            ? 'stale (all low-confidence snippet entries)'
+            : (_shortcutStale ? 'stale (sparse shortcut coverage — < 5 shortcuts and older than 7 days)' : 'empty');
+          logger.info(`[browser.agent] app-knowledge: cache ${_staleReason} for ${_appKnowledgeHost} — research started in parallel with auth check`);
+        }
       }
     }
   } catch (_akEarlyErr) {
@@ -7813,6 +7872,10 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
           startUrl = _callerUrl;
           _urlFirstNavigationSelected = true;
           _deepLinkSource = 'caller';
+          _deepLinkIntent = _matchIntentUrl(_svcKey, _callerUrl) || _deepLinkIntent;
+          if (_deepLinkIntent) {
+            logger.info(`[browser.agent] run: caller URL matched intent ${_deepLinkIntent} for ${agentId}`);
+          }
           _urlFirstProbeUsed = true;
         } catch (_) {
           logger.warn(`[browser.agent] run: caller-provided url "${url}" is invalid for auth probe — falling back to ${startUrl}`);
@@ -8557,6 +8620,10 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
         startUrl = _callerUrl;
         _urlFirstNavigationSelected = true;
         _deepLinkSource = 'caller';
+        _deepLinkIntent = _matchIntentUrl(_svcKey, _callerUrl) || _deepLinkIntent;
+        if (_deepLinkIntent) {
+          logger.info(`[browser.agent] run: caller URL matched intent ${_deepLinkIntent} for ${agentId}`);
+        }
       } catch (_) {
         logger.warn(`[browser.agent] run: caller-provided url "${url}" is invalid — ignoring`);
       }
@@ -10153,10 +10220,23 @@ Output ONLY valid JSON: {${_execRecipe.params.map(p => `"${p.name}": "<extracted
           const _snippetCachedCount = _cacheableEntries.filter(e => (e.confidence || 0) < 0.7).length;
           logger.info(`[browser.agent] app-knowledge: researched + cached ${_cachedCount} entries for ${_appKnowledgeHost} (LLM: ${_cachedCount - _snippetCachedCount}, snippet-with-shortcut: ${_snippetCachedCount}, confidence=${_research.confidence})${_snippetOnlyEntries.length > 0 ? `, ${_snippetOnlyEntries.length} snippet-only entries in-memory` : ''}`);
         } else {
-          // Use snippet-based entries for this run only (don't cache — they're not actionable)
-          _appKnowledgeEntries = _research.entries;
+          // Cache snippet-only entries with a short TTL (1 hour) so we don't re-research
+          // every run. These entries have no actionable shortcut/selector, but they provide
+          // context that's still useful for the LLM prompt. Mark them with snippetOnly=true
+          // and cachedAt so the staleness check can expire them faster than actionable entries.
+          const _snippetEntriesWithFlag = _research.entries.map(e => ({
+            ...e,
+            snippetOnly: true,
+            cachedAt: Date.now(),
+          }));
+          try {
+            saveAppKnowledge(_appKnowledgeHost, _snippetEntriesWithFlag);
+          } catch (_saveErr) {
+            logger.warn(`[browser.agent] app-knowledge: failed to cache snippet entries (non-fatal): ${_saveErr.message}`);
+          }
+          _appKnowledgeEntries = _snippetEntriesWithFlag;
           _usedSnippetEntries = true;
-          logger.info(`[browser.agent] app-knowledge: ${_research.entries.length} snippet entries for ${_appKnowledgeHost} (NOT cached — no actionable shortcut/selector, will re-research next run)`);
+          logger.info(`[browser.agent] app-knowledge: cached ${_snippetEntriesWithFlag.length} snippet entries for ${_appKnowledgeHost} (1h TTL — no actionable shortcut/selector but will reuse for 1h)`);
         }
       } else {
         logger.info(`[browser.agent] app-knowledge: research returned no entries for ${_appKnowledgeHost} — proceeding without`);
@@ -10375,11 +10455,22 @@ When extracting page content with run-code, prioritize these selectors over gene
     let _provenanceNote = `\n\n## Verified Destination URL\nThe navigation URL (${startUrl}) has been verified (source: ${_provenanceSource}).\nDo NOT search for or navigate to alternative URLs. Use this URL as the first navigation step. If the page loads correctly, proceed directly with the user's task.`;
 
     // ── Creation deep-link detection ────────────────────────────────────────
-    // When the resolved URL is a creation deep-link (e.g. notion.new, docs.google.com/document/create),
-    // the entity has ALREADY been created by navigating to it. Append a note so downstream
-    // tiers don't try to create another entity (pressing Ctrl+N, clicking "New page", etc.).
-    // Generic pattern-based detection — no app-specific hardcoding.
+    // When the resolved URL is a creation deep-link (e.g. notion.new, docs.google.com/document/create,
+    // linkedin.com/feed/?shareActive=true), the entity has ALREADY been created by navigating to it.
+    // Append a note so downstream tiers don't try to create another entity (pressing Ctrl+N,
+    // clicking "New page", etc.).
+    //
+    // Two-tier detection:
+    //   Primary: _deepLinkIntent — if the intent is a mutation intent (CONTENT_CREATE, SOCIAL,
+    //            MAIL, etc.), this is a creation deep-link. This is set by _resolveTaskDeepLink
+    //            or derived from caller-provided URLs via _matchIntentUrl. Fully general —
+    //            works for any service with intentUrls entries, no hardcoded query params.
+    //   Fallback: URL pattern checks (*.new, /new, /create, /compose paths) for cases where
+    //             _deepLinkIntent is not set (e.g. unknown service without intentUrls).
     const _isCreationDeepLink = (() => {
+      // Primary: use _deepLinkIntent if available
+      if (_deepLinkIntent && _isMutationIntent(_deepLinkIntent)) return true;
+      // Fallback: URL pattern checks
       try {
         const _u = new URL(startUrl);
         const _host = _u.hostname.replace(/^www\./, '');
