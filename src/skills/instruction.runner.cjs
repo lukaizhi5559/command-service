@@ -6080,6 +6080,11 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
   // Alert loop guard: prevent pressing Escape repeatedly for the same alert
   let _lastAlertKey = null;
   let _lastAlertCount = 0;
+  // Overlay-dismiss loop guard: prevent infinite Escape+click-outside cycles on
+  // pages with false-positive overlay detection (e.g. Google Cloud Console's
+  // Material Design role="dialog"/role="menu" on layout containers).
+  let _overlayDismissAttempts = 0;
+  const _MAX_OVERLAY_DISMISS_ATTEMPTS = 2;
   const _ESCAPE_UNSAFE_CATEGORIES = ['email_compose', 'document_editor', 'calendar_event_create', 'spreadsheet_edit', 'slides_edit'];
 
 
@@ -6147,6 +6152,7 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
       logger.info(`[instruction.runner] Clearing tried tiers (${[..._triedTiers].join(',')}) — stateChanged=${stateChanged}, focusChanged=${_focusChanged}`);
       _triedTiers.clear();
       _justTypeRetries = 0; // reset Just-type retry counter on state/focus change
+      _overlayDismissAttempts = 0; // reset overlay-dismiss counter on state/focus change
     }
     _prevFocusedRef = focused?.ref || null;
 
@@ -6215,8 +6221,12 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
           const { _extractSteps } = require('./browser.agent.cjs');
           _stepPlan = await _extractSteps(goal, currentUrl, _cachedTabMap, _pageCategory, agentContext, overlayActive, actionHistory);
           _stepIndex = 0;
-          if (!_stepPlan || _stepPlan.length <= 1) {
-            logger.info(`[instruction.runner] Tab-Map: re-extraction returned ${_stepPlan?.length || 0} step(s) — using per-step LLM`);
+          // A 1-step plan with a real action (click, navigate, type, press) is valid —
+          // it's often a navigation step to a new page where steps will be re-extracted.
+          // Only switch to per-step LLM when extraction failed (null) or the only step is "done".
+          const _onlyDone = _stepPlan && _stepPlan.length === 1 && _stepPlan[0].action === 'done';
+          if (!_stepPlan || _onlyDone) {
+            logger.info(`[instruction.runner] Tab-Map: re-extraction returned ${_stepPlan?.length || 0} step(s)${_onlyDone ? ' (only done)' : ''} — using per-step LLM`);
             _usingStepFallback = true;
           }
         }
@@ -6775,25 +6785,40 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
     // cookie banners, template pickers, etc. Does NOT dismiss overlays WITH fillable fields
     // (Gmail compose, login forms) — those are needed for the goal.
     // NOTE: Don't dismiss if an alert was handled (alert handler already dealt with it).
+    // LOOP GUARD: After _MAX_OVERLAY_DISMISS_ATTEMPTS failed attempts, treat as false
+    // positive (e.g. Google Cloud Console's Material Design layout containers) and
+    // proceed to tier selection so the LLM can decide what to do.
     const _typeIntentKeywords = /\b(type|write|create|add|note|list|draft|compose|make|put|fill|name|title|rename|update|edit|change)\b/i;
     if (overlayActive && _probe.fillableCount === 0 && _typeIntentKeywords.test(goal) && !_alertHandled) {
-      logger.info(`[instruction.runner] Overlay active with no fillable fields + type-intent goal — dismissing overlay`);
-      await browserAct({ action: 'press', sessionId, key: 'Escape', headed: true, timeoutMs: 2000 });
-      await _sleep(500);
-      const _stillOverlay = await _detectOverlay(sessionId, _pageCategory);
-      if (_stillOverlay) {
-        logger.warn(`[instruction.runner] Overlay still active after Escape — trying click outside (top-left)`);
-        await browserAct({ action: 'clickAt', sessionId, x: 5, y: 5, headed: true, timeoutMs: 2000 });
+      if (_overlayDismissAttempts < _MAX_OVERLAY_DISMISS_ATTEMPTS) {
+        _overlayDismissAttempts++;
+        logger.info(`[instruction.runner] Overlay active with no fillable fields + type-intent goal — dismissing overlay (attempt ${_overlayDismissAttempts}/${_MAX_OVERLAY_DISMISS_ATTEMPTS})`);
+        await browserAct({ action: 'press', sessionId, key: 'Escape', headed: true, timeoutMs: 2000 });
         await _sleep(500);
-        overlayActive = await _detectOverlay(sessionId, _pageCategory);
+        const _stillOverlay = await _detectOverlay(sessionId, _pageCategory);
+        if (_stillOverlay) {
+          logger.warn(`[instruction.runner] Overlay still active after Escape — trying click outside (top-left)`);
+          await browserAct({ action: 'clickAt', sessionId, x: 5, y: 5, headed: true, timeoutMs: 2000 });
+          await _sleep(500);
+          overlayActive = await _detectOverlay(sessionId, _pageCategory);
+        } else {
+          overlayActive = false;
+        }
+        if (!overlayActive) {
+          logger.info(`[instruction.runner] Overlay dismissed — re-probing on next iteration`);
+          _cachedTabMap = null;
+          _overlayDismissAttempts = 0; // reset on success
+        }
+        continue; // re-probe on next iteration
       } else {
-        overlayActive = false;
+        // Overlay dismiss failed _MAX_OVERLAY_DISMISS_ATTEMPTS times — likely a false
+        // positive (page layout containers with role="dialog"/role="menu", not a real
+        // blocking overlay). Stop trying to dismiss and let the LLM decide what to do.
+        logger.warn(`[instruction.runner] Overlay dismiss failed ${_overlayDismissAttempts}x — treating as false positive, proceeding to tier selection`);
+        overlayActive = false; // treat as not-overlay so tier selection proceeds
+        _overlayDismissAttempts = 0;
+        // Fall through to tier selection (don't continue)
       }
-      if (!overlayActive) {
-        logger.info(`[instruction.runner] Overlay dismissed — re-probing on next iteration`);
-        _cachedTabMap = null;
-      }
-      continue; // re-probe on next iteration
     }
 
     const _alertActiveAtTierSelect = !!_alert && !_alertHandled;
@@ -7269,9 +7294,11 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
         _stepPlan = await _extractSteps(goal, currentUrl, _cachedTabMap, _pageCategory, agentContext, overlayActive, actionHistory);
         _stepIndex = 0;
 
-        if (!_stepPlan || _stepPlan.length <= 1) {
-          // ≤1 step → fall back to per-step LLM (browse-and-report tasks)
-          logger.info(`[instruction.runner] Tab-Map: step extraction returned ${_stepPlan?.length || 0} step(s) — using per-step LLM fallback`);
+        if (!_stepPlan || (_stepPlan.length === 1 && _stepPlan[0].action === 'done')) {
+          // null plan or only "done" → fall back to per-step LLM (browse-and-report tasks)
+          // A 1-step plan with a real action (click, navigate, type, press) is valid and
+          // should be executed directly — it's often a navigation step to a new page.
+          logger.info(`[instruction.runner] Tab-Map: step extraction returned ${_stepPlan?.length || 0} step(s)${_stepPlan && _stepPlan[0]?.action === 'done' ? ' (only done)' : ''} — using per-step LLM fallback`);
           _usingStepFallback = true;
         } else {
           _usingStepFallback = false;

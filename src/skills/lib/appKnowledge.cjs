@@ -351,21 +351,26 @@ function loadIntentUrl(hostname, intent) {
 }
 
 /**
- * Save a verified intent→URL mapping for a hostname.
+ * Save an intent→URL mapping for a hostname.
  * Uses a stable id so re-saves merge (update) rather than duplicate.
- * Confidence starts at 0.8 for seeded/template URLs, bumps via recordVerification.
+ * Confidence starts at 0.35 for unverified template URLs — below the 0.4
+ * loadIntentUrl threshold, so they are NOT used until recordVerification(true)
+ * bumps them up after a successful run. This prevents bad template-generated
+ * URLs (e.g. /apis/credentials/console) from being cached as authoritative.
+ * Pass { verified: true } in opts for URLs that have been confirmed by a run.
  */
-function saveIntentUrl(hostname, intent, url, taskPattern = null) {
+function saveIntentUrl(hostname, intent, url, taskPattern = null, opts = {}) {
   const h = _safeHostname(hostname);
   if (!h || !intent || !url) return 0;
   const id = `${h}.intent_url.${intent}`;
+  const _verified = opts && opts.verified === true;
   return saveAppKnowledge(h, [{
     id,
     type: 'intent_url',
     summary: `${intent} → ${url}`,
     details: { intent, url, taskPattern },
-    source: 'browser_agent_verified',
-    confidence: 0.8,
+    source: _verified ? 'browser_agent_verified' : 'browser_agent_template',
+    confidence: _verified ? 0.8 : 0.35, // below 0.4 threshold until verified
     ttlDays: 90, // intent URLs are stable — longer TTL than quirks/shortcuts
   }]);
 }

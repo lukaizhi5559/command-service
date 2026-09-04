@@ -54,6 +54,7 @@ const fs     = require('fs');
 const { spawn, exec } = require('child_process');
 const logger = require('../logger.cjs');
 const { askWithMessages } = require('../skill-helpers/skill-llm.cjs');
+const { AUTH_CHECK_PROMPT, detectAuthViaLLM } = require('../skill-helpers/auth-check.cjs');
 const shellRun = require('./shell.run.cjs');
 const { buildAdBlockScript } = require('../utils/ad-block-init.js');
 const { BASELINE_DOMAINS } = require('../utils/ad-block-updater.cjs');
@@ -6720,13 +6721,15 @@ If no videos found, return []. Do not explain, only output the JSON array.`;
       // names so we only declare success when NEW auth cookies appear (defence
       // against pre-existing CSRF/locale cookies that survived the exclude rules).
       let _authCookieBaseline = null;   // Set<string> | null
-      // Target domain for cookie sniffing: prefer authSuccessUrl host (the
-      // authenticated app host), else authOriginHost. Strip leading 'www.'.
+      // Target domain for cookie sniffing: use authOriginHost (the actual page URL
+      // host) — this is where the browser is and where session cookies are set.
+      // authSuccessUrl may be a wrong pattern (e.g. "googlecloud.com" when the real
+      // host is console.cloud.google.com), so it's only a fallback.
       let _cookieSniffDomain = null;
       try {
-        const _csHost = authSuccessUrl
+        const _csHost = authOriginHost || (authSuccessUrl
           ? (new URL(authSuccessUrl.includes('://') ? authSuccessUrl : `https://${authSuccessUrl}`).hostname || '')
-          : authOriginHost;
+          : '');
         _cookieSniffDomain = String(_csHost || '').replace(/^www\./, '');
       } catch (_) {}
 
@@ -7419,6 +7422,28 @@ If no videos found, return []. Do not explain, only output the JSON array.`;
               // cookie sniff capability (avoids spamming every poll).
               if (authWallDetections === 1) {
                 logger.info(`[browser.act] waitForAuth: cookie sniff skipped (domain=${_cookieSniffDomain || 'null'}, hasPage=${!!_ePage}) for session=${sessionId}`);
+              }
+            }
+            // ── Dynamic LLM auth detection ─────────────────────────────────────
+            // Works for any service without seeds. When same-domain auth flow and
+            // the page doesn't look like a login wall, confirm authentication
+            // semantically via LLM. Runs every 3 polls (~6s) after the first 3
+            // polls (~6s) to limit LLM cost. Uses a fast light model (maxTokens=5).
+            if (!_pageMetaLoginWall && !_hasSignInButton && authWallDetections >= 3 && authWallDetections % 3 === 0) {
+              try {
+                const _currentPath = new URL(currentUrl).pathname;
+                const _onLoginPath = /\/(login|signin|sign-in|sign_in|auth|oauth|authorize)\b/i.test(_currentPath);
+                if (!_onLoginPath) {
+                  const _bodyRes = await _authEval('document.body.innerText.slice(0, 800)', 5000);
+                  const _bodyText = String(_bodyRes.val || '').trim();
+                  const _llmNum = await detectAuthViaLLM(_pageTitle, _bodyText, sessionId, logger);
+                  if (_llmNum === 0) {
+                    logger.info(`[browser.act] waitForAuth: LLM auth detection — authenticated for session=${sessionId} url=${currentUrl}`);
+                    return { ok: true, action, sessionId, authResolved: true, detectedVia: 'llm_poll', executionTime: Date.now() - start };
+                  }
+                }
+              } catch (_llmErr) {
+                logger.debug(`[browser.act] waitForAuth: LLM auth detection failed (non-fatal): ${_llmErr.message}`);
               }
             }
             logger.debug(`[browser.act] waitForAuth: in auth flow at ${currentUrl} (${authWallDetections} polls), ${Math.round((deadline - Date.now()) / 1000)}s remaining`);

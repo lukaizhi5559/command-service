@@ -130,18 +130,9 @@ function _buildExtractionCode(selector, extractType, extractOptions = {}) {
 }
 
 // ---------------------------------------------------------------------------
-// LLM-based auth detection prompt — semantic analysis of page content
+// LLM-based auth detection — shared helper (skill-helpers/auth-check.cjs)
 // ---------------------------------------------------------------------------
-const AUTH_CHECK_PROMPT = `You are analyzing a web page to determine if the user is authenticated.
-Given the page TITLE and BODY TEXT, return ONLY a single number:
-0 = authenticated (user is logged in — page shows real app content: calendar events, emails, files, dashboard data)
-1 = auth required (page is a login form, sign-in page, marketing/landing page, or "create account" page)
-
-Rules:
-- 1 (auth required): login forms, "Sign in" buttons, marketing pages, "Get started", "Create account", "Sign in to continue", "Workspace not found"
-- 0 (authenticated): page shows actual app content (calendar with events, inbox with emails, dashboard with data, documents)
-- When in doubt, return 1 (auth required — safer to re-authenticate)
-Return ONLY the number.`;
+const { AUTH_CHECK_PROMPT, detectAuthViaLLM: _detectAuthViaLLMImpl } = require('../skill-helpers/auth-check.cjs');
 
 // ---------------------------------------------------------------------------
 // Auth-check result cache — avoids repeated navigate+evaluate probes
@@ -192,29 +183,10 @@ function _setCachedAuthCheck(agentId, authNeeded) {
   _authCheckCache.set(agentId, { ts: Date.now(), authNeeded });
 }
 
-// ---------------------------------------------------------------------------
-// LLM-based auth detection — semantic analysis (number return for fast light-model use)
-// Returns: 0 = authenticated, 1 = auth required
-// ---------------------------------------------------------------------------
+// _detectAuthViaLLM is imported from skill-helpers/auth-check.cjs (see top of file).
+// Wrapper to pass the local logger for consistent log prefixes.
 async function _detectAuthViaLLM(title, body, agentId) {
-  try {
-    const { askWithMessages } = require('../skill-helpers/skill-llm.cjs');
-    const raw = await askWithMessages([
-      { role: 'system', content: AUTH_CHECK_PROMPT },
-      { role: 'user', content: `TITLE: ${(title || '').slice(0, 200)}\n\nBODY: ${(body || '').slice(0, 1000)}` }
-    ], { temperature: 0, maxTokens: 5, responseTimeoutMs: 5000 });
-
-    const num = parseInt((raw || '').trim().replace(/\D/g, ''), 10);
-    if (num === 0 || num === 1) {
-      logger.info(`[browser.agent] LLM auth detection: ${num === 1 ? 'auth required' : 'authenticated'} for ${agentId}`);
-      return num; // 0 = authed, 1 = auth required
-    }
-    logger.info(`[browser.agent] LLM auth detection: invalid "${raw}" → defaulting to 1 (auth required) for ${agentId}`);
-    return 1; // default: auth required (safer)
-  } catch (err) {
-    logger.warn(`[browser.agent] LLM auth detection failed (non-fatal): ${err.message}`);
-    return 1; // default: auth required (safer)
-  }
+  return await _detectAuthViaLLMImpl(title, body, agentId, logger);
 }
 
 // ---------------------------------------------------------------------------
@@ -3012,11 +2984,14 @@ Rules:
 - Use the EXACT text/label of elements from the available elements list for "target".
 - Use "type" for [FILLABLE] elements, "click" for [CLICKABLE] elements.
 - Extract values to type from the goal text (email addresses, subjects, message bodies, search queries, names).
-- Only include steps that can be done ON THIS PAGE with the available elements.
+- Plan steps that can be executed ON THIS PAGE with the available elements.
+- MULTI-PAGE WORKFLOW RULE: If the final target element (e.g., "Create Credentials") is NOT on this page, look for navigation elements (sidebar links, menu items, breadcrumbs, tabs, "Go to" buttons) that would move toward the goal. Plan the navigation click as the first step — the system will re-plan on the new page.
+- A single navigation step (e.g., click "Credentials" in sidebar) is a VALID plan when the page doesn't have the final target. The system handles multi-page workflows by re-extracting steps on each new page.
+- Do NOT return [{ "action": "done" }] just because the final target isn't visible. Only return done if NO element on this page could plausibly move toward the goal.
+- Example: Goal is "create API key" but page shows a console home/404 with sidebar links → plan [{ "action": "click", "target": "Credentials" }] to navigate to the credentials page.
 - If the page has [FILLABLE] form fields, fill ALL of them before clicking any submit button (Send, Submit, Post, Save, etc.).
 - Do NOT include steps for actions that require a different page (e.g., don't plan clicking a search result if the search hasn't been submitted yet — that's a future page).
 - If the goal is already achieved on this page, return [{ "action": "done" }].
-- If no action on this page gets closer to the goal, return [{ "action": "done" }].
 - For chip/token fields (email To, Recipients, CC, BCC): the system auto-confirms with Enter after Type. Do NOT add a separate press Enter step for chip confirmation.
 - For AI chat (ChatGPT, Claude, etc.): after typing the prompt, add { "action": "press", "key": "Enter" } to submit.
 - Maximum 8 steps per page.
@@ -3314,7 +3289,9 @@ Rules:
 - When ALL [REQUIRED] fields are [FILLED], you may click a [SUBMIT] button if the goal requires submission.
 - If all [REQUIRED] fields are [FILLED] and no submission is needed, output DONE.
 - If the goal is already achieved (form submitted, email sent, search results shown), output DONE.
-- If no available element gets closer to the goal, output DONE.
+- MULTI-PAGE NAVIGATION RULE: If the final target element (e.g., "Create Credentials") is NOT on this page, look for navigation elements (sidebar links, menu items, breadcrumbs, tabs, "Go to" buttons) that would move toward the goal. Click the most relevant navigation element — the system will re-plan on the new page.
+- Do NOT output DONE just because the final target isn't visible. Only output DONE if NO element on this page could plausibly move toward the goal.
+- Example: Goal is "create API key" but page shows a console home with sidebar links → Click "Credentials" (sidebar link) to navigate to the credentials page.
 - For chip/token fields (email To, Recipients, CC, BCC): after Type, the system auto-confirms with Enter. Do NOT add a separate Press Enter for chip confirmation.
 - For AI chat (ChatGPT, Claude, etc.): after typing the prompt, add Press Enter to submit.
 - Extract values to type from the goal text (quoted strings in single or double quotes, names, search queries, message bodies). Preserve the exact text including trailing punctuation.
@@ -3857,7 +3834,7 @@ function _seedIntentUrlsFromKnownServices(hostname, serviceKey) {
     for (const [intentKey, urlOrBuilder] of Object.entries(svcEntry.intentUrls)) {
       // intentUrls values can be strings or { buildUrl } functions; only seed strings
       if (typeof urlOrBuilder !== 'string') continue;
-      saveIntentUrl(hostname, intentKey, urlOrBuilder);
+      saveIntentUrl(hostname, intentKey, urlOrBuilder, null, { verified: true });
       seeded++;
     }
     if (seeded > 0) {
@@ -4561,6 +4538,25 @@ function _sanitizeBrowserMeta(meta, service) {
     }
   }
 
+  // Fix authSuccessPattern that doesn't share the same registrable domain as startUrl.
+  // The LLM sometimes returns a marketing domain (e.g. "googlecloud.com") instead of
+  // the actual app domain (e.g. "console.cloud.google.com"). If the pattern's registrable
+  // domain differs from startUrl's, replace with startUrl hostname so waitForAuth's
+  // same-domain success check and cookie sniffing use the correct host.
+  if (meta.authSuccessPattern && meta.startUrl) {
+    try {
+      const startHost = new URL(meta.startUrl).hostname;
+      const patternHost = new URL(
+        meta.authSuccessPattern.includes('://') ? meta.authSuccessPattern : `https://${meta.authSuccessPattern}`
+      ).hostname;
+      const registrable = (h) => h.split('.').slice(-2).join('.');
+      if (registrable(startHost) !== registrable(patternHost)) {
+        logger.warn(`[browser.agent] _sanitizeBrowserMeta: authSuccessPattern "${meta.authSuccessPattern}" registrable domain mismatch with startUrl "${startHost}" — replacing with startUrl hostname`);
+        meta.authSuccessPattern = startHost;
+      }
+    } catch (_) {}
+  }
+
   return meta;
 }
 
@@ -4869,19 +4865,6 @@ function buildBrowserDescriptorMd({ id, service, startUrl, signInUrl, authSucces
     `Use Playwright via browser.act skill for all ${service} operations.`,
     `Session is persistent — use profile: "${service}_agent" so the user logs in once.`,
     `Always start navigation from: ${startUrl}`,
-    '',
-    `## Auth`,
-    `Use action:waitForAuth with url="${signInUrl || startUrl}" and authSuccessUrl="${authSuccessPattern}".`,
-    `Once authenticated, the session is stored at ~/.thinkdrop/browser-sessions/${service}_agent/`,
-    '',
-    `## Navigation Patterns`,
-    `Use { "action": "snapshot" } to read the current DOM state before interacting.`,
-    `Use { "action": "navigate", "url": "..." } to go to specific URLs.`,
-    `Use { "action": "click", "selector": "..." } with ref from snapshot.`,
-    `Use { "action": "fill", "selector": "...", "text": "..." } for standard text inputs and form fields.`,
-    `Use { "action": "type", "text": "..." } for contenteditable areas (email body, chat prompts, rich-text editors).`,
-    `Use { "action": "press", "key": "..." } for keyboard actions (Enter=confirm/submit, Escape=close, Tab=autocomplete).`,
-    `Use { "action": "run-code", "code": "async page => { return await page.evaluate(() => ...) }" } to extract DOM data.`,
   ];
   if (playbooks) {
     parts.push('', '## Playbooks', playbooks);
@@ -4929,11 +4912,13 @@ async function actionBuildAgent({ service, startUrl: explicitUrl, force = false,
     }
   }
 
-  // Resolve playbooks: seed map first, then LLM generation for unknown services.
-  // LLM-generated playbooks are marked with a comment so validate_agent can refine them later.
+  // Resolve playbooks: seed map first, then LLM generation for non-browser services only.
+  // Browser agents use Tab-Flow (keyboard navigation driven by appKnowledge), not CSS-selector
+  // playbooks — so LLM-generated playbooks for unknown browser services are both slow (30s+)
+  // and unused. Seeded playbooks (PLAYBOOK_SEED_MAP) are kept for the playwright.agent fallback.
   let playbooks = PLAYBOOK_SEED_MAP[serviceKey] || null;
   let playbooksSource = playbooks ? 'seeded' : null;
-  if (!playbooks) {
+  if (!playbooks && agentType !== 'browser') {
     try {
       const capList = capabilities.join(', ');
       const buildQuery = `SERVICE: ${serviceKey}\nSTART_URL: ${startUrl}${signInUrl ? '\nSIGN_IN_URL: ' + signInUrl : ''}\nCAPS: ${capList}`;
@@ -6663,6 +6648,9 @@ async function _resolveTaskDeepLink(agentId, serviceKey, baseStartUrl, task, exi
       }
 
       // 5. Generic path-based intents (settings, support, dashboard, console, notifications, contacts)
+      // These paths are relative to the service ORIGIN, not to an arbitrary deep start_url.
+      // Using startUrlBase (which may be a deep path like /apis/credentials) would produce
+      // invalid URLs (e.g. /apis/credentials/console). Derive the origin instead.
       const _GENERIC_PATH_INTENTS = {
         [INTENTS.SETTINGS]:      '/settings',
         [INTENTS.SUPPORT]:       '/help',
@@ -6672,7 +6660,21 @@ async function _resolveTaskDeepLink(agentId, serviceKey, baseStartUrl, task, exi
         [INTENTS.CONTACTS]:      '/contacts',
       };
       if (_GENERIC_PATH_INTENTS[intent]) {
-        return `${startUrlBase}${_GENERIC_PATH_INTENTS[intent]}`;
+        // Use origin for generic paths — they're relative to the site root, not a deep page.
+        let _genericBase = startUrlBase;
+        try {
+          _genericBase = new URL(baseStartUrl).origin; // https://console.cloud.google.com
+        } catch (_) {}
+        // For hosts that are already a console/dashboard (console.*, dash.*, dashboard.*),
+        // the CONSOLE intent should not append /console — the host IS the console.
+        // The runner can navigate to the right section from the console home/sidebar.
+        const _hostRoot = (() => { try { return new URL(baseStartUrl).hostname.replace(/^www\./, ''); } catch (_) { return ''; } })();
+        const _isConsoleHost = /^(console|dash|dashboard)\b/i.test(_hostRoot);
+        if (intent === INTENTS.CONSOLE && _isConsoleHost) {
+          logger.info(`[browser.agent] deep-link: CONSOLE intent on console host "${_hostRoot}" — using origin without /console suffix`);
+          return _genericBase;
+        }
+        return `${_genericBase}${_GENERIC_PATH_INTENTS[intent]}`;
       }
 
       // 6. DOCS
@@ -7478,33 +7480,40 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
   // Pre-navigation: detect when the configured startUrl (e.g. developer API console)
   // does not match the task's intent (e.g. research/chat). Correct silently on high
   // confidence; ask the user when ambiguous. Entirely non-blocking on error.
-  try {
-    const _destResult = await resolveDestination(_svcKey, task, startUrl, agentId);
-    if (_destResult.action === 'auto_correct') {
-      logger.info(`[browser.agent] run: destination auto-correct for "${agentId}": "${startUrl}" → "${_destResult.correctedUrl}" (${_destResult.reason})`);
-      startUrl = _destResult.correctedUrl;
-      // Record the correction so future runs use it without re-checking,
-      // but only when this isn't already a resume (avoid echoing learned corrections).
-      if (!_destResult.fromResumeContext) {
-        setImmediate(() => {
-          recordCorrection(_svcKey, _destResult.intent, _destResult.correctedUrl).catch(() => {});
-        });
+  // SKIP for auth-only manualLogin calls — those are intentionally single-purpose:
+  // navigate to the sign-in page and call waitForAuth. Destination ambiguity would
+  // abort the auth flow before the browser window ever opens.
+  if (!(_authOnly && manualLogin)) {
+    try {
+      const _destResult = await resolveDestination(_svcKey, task, startUrl, agentId);
+      if (_destResult.action === 'auto_correct') {
+        logger.info(`[browser.agent] run: destination auto-correct for "${agentId}": "${startUrl}" → "${_destResult.correctedUrl}" (${_destResult.reason})`);
+        startUrl = _destResult.correctedUrl;
+        // Record the correction so future runs use it without re-checking,
+        // but only when this isn't already a resume (avoid echoing learned corrections).
+        if (!_destResult.fromResumeContext) {
+          setImmediate(() => {
+            recordCorrection(_svcKey, _destResult.intent, _destResult.correctedUrl).catch(() => {});
+          });
+        }
+      } else if (_destResult.action === 'ask_user') {
+        logger.info(`[browser.agent] run: destination ambiguous for "${agentId}" — surfacing ASK_USER`);
+        return {
+          ok:               false,
+          agentId,
+          task,
+          askUser:          true,
+          wrongDestination: true,
+          question:         _destResult.question,
+          options:          _destResult.options || [],
+        };
       }
-    } else if (_destResult.action === 'ask_user') {
-      logger.info(`[browser.agent] run: destination ambiguous for "${agentId}" — surfacing ASK_USER`);
-      return {
-        ok:               false,
-        agentId,
-        task,
-        askUser:          true,
-        wrongDestination: true,
-        question:         _destResult.question,
-        options:          _destResult.options || [],
-      };
+      // action === 'ok': no change needed
+    } catch (_destErr) {
+      logger.warn(`[browser.agent] run: destination-resolver error (non-fatal): ${_destErr.message}`);
     }
-    // action === 'ok': no change needed
-  } catch (_destErr) {
-    logger.warn(`[browser.agent] run: destination-resolver error (non-fatal): ${_destErr.message}`);
+  } else {
+    logger.info(`[browser.agent] run: skipping destination resolution for auth-only manualLogin on ${agentId}`);
   }
 
   // ── App Knowledge: start research in parallel with auth check ─────────────
@@ -8231,6 +8240,13 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
             _onLoginPage = false;
             _pageMetaLoginWall = false;
             _setCachedAuthCheck(agentId, false);
+            // manualLogin: if the page is already authenticated, don't force waitForAuth.
+            // The user may have signed in via a previous session and the persistent profile
+            // has valid cookies. waitForAuth would navigate away and potentially break.
+            if (manualLogin === true) {
+              _authNeeded = false;
+              logger.info(`[browser.agent] run: manualLogin + LLM authenticated — skipping waitForAuth for ${agentId}`);
+            }
           } else {
             // LLM says auth required (1) — auth needed, regardless of cookie hints
             logger.info(`[browser.agent] run: auth-check: LLM says auth required — calling waitForAuth for ${agentId}`);
@@ -10401,7 +10417,7 @@ Output ONLY valid JSON: {${_execRecipe.params.map(p => `"${p.name}": "<extracted
                 try {
                   const { saveIntentUrl } = require('./lib/appKnowledge.cjs');
                   const _host = (() => { try { return new URL(_bestUrl).hostname.replace(/^www\./, ''); } catch (_) { return ''; } })();
-                  if (_host) saveIntentUrl(_host, _intent, _bestUrl);
+                  if (_host) saveIntentUrl(_host, _intent, _bestUrl, null, { verified: true });
                 } catch (_) {}
               });
             }
