@@ -15,8 +15,8 @@
  *   timeoutMs   {number}  Optional. Max time for vision LLM call. Default: 30000.
  *
  * Returns:
- *   { success: true, description, answer, uiState, relevantElements, provider, elapsed }
- *   { success: false, error: string }
+ *   { ok: true, success: true, description, answer, uiState, relevantElements, provider, elapsed, stdout }
+ *   { ok: false, success: false, error: string }
  */
 
 const fs             = require('fs');
@@ -119,12 +119,12 @@ async function imageAnalyze(args = {}) {
   }
 
   if (!filePath) {
-    return { success: false, error: 'filePath is required — provide the absolute path to the image file, or pass priorContracts to auto-discover' };
+    return { ok: false, success: false, error: 'filePath is required — provide the absolute path to the image file, or pass priorContracts to auto-discover' };
   }
 
   const ext = path.extname(filePath).toLowerCase();
   if (!SUPPORTED_EXTENSIONS.has(ext)) {
-    return { success: false, error: `Unsupported image format: ${ext}. Supported: ${[...SUPPORTED_EXTENSIONS].join(', ')}` };
+    return { ok: false, success: false, error: `Unsupported image format: ${ext}. Supported: ${[...SUPPORTED_EXTENSIONS].join(', ')}` };
   }
 
   // Normalize path — macOS screenshot filenames use U+202F NARROW NO-BREAK SPACE
@@ -150,7 +150,7 @@ async function imageAnalyze(args = {}) {
 
   const resolvedPath = resolveFilePath(filePath);
   if (!resolvedPath) {
-    return { success: false, error: `File not found: ${filePath}` };
+    return { ok: false, success: false, error: `File not found: ${filePath}` };
   }
   filePath = resolvedPath;
 
@@ -189,7 +189,7 @@ async function imageAnalyze(args = {}) {
     base64 = buffer.toString('base64');
   } catch (err) {
     if (tempResizedPath) try { fs.unlinkSync(tempResizedPath); } catch (_) {}
-    return { success: false, error: `Failed to read image file: ${err.message}` };
+    return { ok: false, success: false, error: `Failed to read image file: ${err.message}` };
   }
 
   // Cleanup temp file after reading
@@ -235,6 +235,7 @@ async function imageAnalyze(args = {}) {
         const answer = ocrResult.text.trim();
         logger.info('[image.analyze] OCR fallback succeeded', { confidence: ocrResult.confidence, elapsed });
         return {
+          ok: true,
           success: true,
           description: answer,
           answer,
@@ -246,11 +247,11 @@ async function imageAnalyze(args = {}) {
           stdout: answer,
         };
       } else {
-        return { success: false, error: ocrResult?.error || 'OCR fallback returned no text' };
+        return { ok: false, success: false, error: ocrResult?.error || 'OCR fallback returned no text' };
       }
     } catch (ocrErr) {
       logger.warn('[image.analyze] OCR fallback also failed', { error: ocrErr.message });
-      return { success: false, error: `Vision API unavailable and OCR fallback failed: ${ocrErr.message}` };
+      return { ok: false, success: false, error: `Vision API unavailable and OCR fallback failed: ${ocrErr.message}` };
     }
   }
 
@@ -263,6 +264,7 @@ async function imageAnalyze(args = {}) {
   const answerText = analysis.answer || analysis.description || '';
 
   return {
+    ok: true,
     success: true,
     description: analysis.description || analysis.answer || '',
     answer: answerText,
@@ -280,11 +282,13 @@ async function imageAnalyze(args = {}) {
 function getOutputContract(result) {
   if (!result) return null;
 
+  const isSuccess = result.ok === true || result.success === true;
+
   return {
     skill: 'image.analyze',
     timestamp: Date.now(),
-    success: result.success === true,
-    summary: result.success
+    success: isSuccess,
+    summary: isSuccess
       ? `Image analysis completed (${result.provider || 'unknown'})`
       : `Image analysis failed: ${result.error || 'Unknown error'}`,
     outputs: {
@@ -293,7 +297,7 @@ function getOutputContract(result) {
       provider: { type: 'text', value: result.provider || '' },
       confidence: { type: 'number', value: result.confidence || null }
     },
-    error: result.success ? undefined : {
+    error: isSuccess ? undefined : {
       message: result.error || 'Image analysis failed'
     }
   };

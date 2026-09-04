@@ -16,8 +16,8 @@
  *   (none required)
  *
  * Returns:
- *   { success: true, text, appName, windowTitle, url, confidence, elapsed, stdout }
- *   { success: false, error: string }
+ *   { ok: true, success: true, text, appName, windowTitle, url, confidence, elapsed, stdout }
+ *   { ok: false, success: false, error: string }
  */
 
 const http = require('http');
@@ -100,6 +100,7 @@ async function screenCapture(args = {}) {
       });
 
       return {
+        ok: true,
         success: true,
         text,
         appName: result.appName || null,
@@ -119,7 +120,7 @@ async function screenCapture(args = {}) {
   }
 
   logger.error('[screen.capture] Failed after retries', { error: lastError });
-  return { success: false, error: `screen.capture failed: ${lastError}` };
+  return { ok: false, success: false, error: `screen.capture failed: ${lastError}` };
 }
 
 module.exports = { screenCapture };

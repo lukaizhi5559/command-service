@@ -79,6 +79,45 @@ function _parseGoalJson(raw) {
 }
 
 // ---------------------------------------------------------------------------
+// Layer 1: Force-classification for known system queries.
+// Asks the LLM to pick a category number (1-N) or 0 (unknown). When a known
+// category is matched, the pre-validated dump command from SYSTEM_QUERY_REGISTRY
+// is used directly — zero LLM generation, zero field-name hallucination.
+// Mirrors the "return ONLY a single number" pattern from instruction.runner.cjs.
+// ---------------------------------------------------------------------------
+async function _classifySystemQuery(goal, onProgress) {
+  if (!skillLlm.isAvailable()) return 0;
+  const numberedList = SYSTEM_QUERY_REGISTRY.map((r, i) => `${i + 1}. ${r.label}`).join('\n');
+  const systemPrompt = `You classify a shell automation goal into a known system query category.
+Return ONLY a single number — nothing else.
+  1-${SYSTEM_QUERY_REGISTRY.length} = the matching category
+  0 = none of the above (custom task, not a system info query)
+
+Rules:
+- If the goal asks for system/hardware info (disk, memory, CPU, battery, network, OS, processes, display, USB, audio) → return the matching number
+- If the goal is about file operations, app automation, text processing, or anything else → return 0
+- When in doubt → return 0 (let the free-generation path handle it)`;
+
+  try {
+    const raw = await skillLlm.askWithMessages([
+      { role: 'system', content: systemPrompt },
+      { role: 'user', content: `Goal: ${goal}\n\nCategories:\n${numberedList}\n\nWhich category number? (0 = none)` },
+    ], { maxTokens: 5, temperature: 0, taskType: 'classification' });
+    const num = parseInt((raw || '').trim().replace(/\D/g, ''), 10);
+    if (num >= 1 && num <= SYSTEM_QUERY_REGISTRY.length) {
+      if (onProgress) onProgress({ type: 'shell:system_query_classified', category: num, label: SYSTEM_QUERY_REGISTRY[num - 1].label });
+      logger.info(`[shell.run] System query classified: #${num} (${SYSTEM_QUERY_REGISTRY[num - 1].label})`);
+      return num;
+    }
+    logger.info(`[shell.run] System query classification: 0 (no match) — raw="${(raw || '').trim()}"`);
+    return 0;
+  } catch (e) {
+    logger.warn(`[shell.run] _classifySystemQuery failed: ${e.message} — defaulting to 0 (free-generation)`);
+    return 0;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Internal LLM prompt — translates a plain-language goal into a concrete bash
 // command. Fires ONLY when a plan step passes args.goal (natural language) instead
 // of args.argv (pre-built command). The pre-built argv path is 100% unchanged.
@@ -158,6 +197,14 @@ Discovery rule: if the right package or CLI tool is not immediately obvious, rea
 first principles — what file format or protocol is involved, which runtime handles it best,
 what is the canonical library in that ecosystem — then install and use it inline.
 
+macOS system query field names (CRITICAL — do NOT guess field names):
+- diskutil info / outputs: "Disk Size:", "Container Total Space:", "Container Free Space:", "Volume Used Space:"
+- There is NO field called "Total Size" or "Available Space" — never grep for those.
+- For disk space, prefer: df -h /  (POSIX standard, always works, no field-name dependency)
+- For memory, prefer: sysctl -n hw.memsize  (returns bytes — convert with awk)
+- For battery, prefer: pmset -g batt  (raw output, no extraction needed)
+- When unsure about field names, run the source command WITHOUT a pipe first to see the actual output format.
+
 Idempotency rule (CRITICAL — prevents false retry loops):
 For rename, move, create, mkdir, or install operations: ALWAYS check if the goal is already
 achieved BEFORE failing. If the result already exists, exit 0 and print a confirmation.
@@ -178,6 +225,65 @@ Use: pbpaste > "$FILE"  (no existence guard, no idempotency check)
 
 Platform: macOS. Home dir: ${os.homedir()}
 `;
+
+// ---------------------------------------------------------------------------
+// System Query Registry — pre-validated dump commands for known system info queries.
+// Each entry is a RAW DUMP command (no grep/awk extraction) so there is zero
+// field-name hallucination risk. The synthesize step interprets the raw output.
+// Used by Layer 1 (force-classification) when the goal matches a known category.
+// ---------------------------------------------------------------------------
+const SYSTEM_QUERY_REGISTRY = [
+  {
+    label: 'Disk storage / disk space',
+    cmd: 'bash',
+    argv: ['-c', 'df -h / && echo "---" && diskutil info /'],
+  },
+  {
+    label: 'Memory / RAM',
+    cmd: 'bash',
+    argv: ['-c', 'sysctl hw.memsize && echo "---" && vm_stat'],
+  },
+  {
+    label: 'CPU / processor info',
+    cmd: 'bash',
+    argv: ['-c', 'sysctl machdep.cpu.brand_string hw.ncpu hw.physicalcpu hw.logicalcpu'],
+  },
+  {
+    label: 'Battery / power',
+    cmd: 'bash',
+    argv: ['-c', 'pmset -g batt && echo "---" && pmset -g | head -15'],
+  },
+  {
+    label: 'Network / IP addresses',
+    cmd: 'bash',
+    argv: ['-c', 'ifconfig && echo "---" && networksetup -listallhardwareports'],
+  },
+  {
+    label: 'OS version / system info',
+    cmd: 'bash',
+    argv: ['-c', 'sw_vers && echo "---" && uname -a && echo "---" && system_profiler SPHardwareDataType | head -20'],
+  },
+  {
+    label: 'Running processes',
+    cmd: 'bash',
+    argv: ['-c', 'ps aux | head -30'],
+  },
+  {
+    label: 'Screen / display info',
+    cmd: 'bash',
+    argv: ['-c', 'system_profiler SPDisplaysDataType | head -50'],
+  },
+  {
+    label: 'USB / connected devices',
+    cmd: 'bash',
+    argv: ['-c', 'system_profiler SPUSBDataType | head -50'],
+  },
+  {
+    label: 'Audio / sound devices',
+    cmd: 'bash',
+    argv: ['-c', 'system_profiler SPAudioDataType | head -40'],
+  },
+];
 
 /**
  * Resolve a plain-language goal to a concrete { cmd, argv } using the internal LLM.
@@ -237,6 +343,104 @@ async function _resolveGoalToCommand(goal, onProgress) {
   }
   if (onProgress) onProgress({ type: 'shell:goal_failed', error: lastErr });
   return { ok: false, error: lastErr };
+}
+
+// ---------------------------------------------------------------------------
+// Layer 2: Discovery retry for failed pipelines.
+// When a goal-resolved command like `diskutil info / | grep 'Total Size'` fails
+// with exit≠0 and empty stdout, the LLM likely hallucinated field names. This
+// function:
+//   1. Splits the script on the first `|` to get the source command
+//   2. Runs the source raw (no pipe) to see actual output
+//   3. Passes the actual output + goal to the LLM → regenerates extraction
+//   4. Runs the new command
+// Returns the retry result, or null if discovery retry didn't apply / failed.
+// ---------------------------------------------------------------------------
+async function _discoveryRetry(scriptBody, goal, cwd, env, oauthEnv, timeoutMs, stdin, _progressCallback) {
+  if (!scriptBody || !scriptBody.includes('|')) return null;
+  if (!goal) return null; // only applies to goal-resolved commands, not pre-built argv
+  if (!skillLlm.isAvailable()) return null;
+
+  // 1. Extract source command (everything before the first pipe)
+  const pipeIdx = scriptBody.indexOf('|');
+  const sourceCmd = scriptBody.slice(0, pipeIdx).trim();
+  if (!sourceCmd) return null;
+
+  logger.info(`[shell.run] Discovery retry: running source raw: ${sourceCmd.slice(0, 120)}`);
+  if (_progressCallback) _progressCallback({ type: 'shell:discovery_retry', sourceCmd });
+
+  // 2. Run source raw
+  const sourceResult = await runProcess('bash', ['-c', sourceCmd], {
+    cwd,
+    env: { ...oauthEnv, ...env },
+    timeoutMs: Math.min(timeoutMs, MAX_TIMEOUT_MS),
+    stdin,
+  }, null);
+
+  if (!sourceResult.stdout || !sourceResult.stdout.trim()) {
+    logger.warn('[shell.run] Discovery retry: source command produced no output — aborting');
+    return null;
+  }
+
+  // 3. Pass actual output + goal to LLM → regenerate extraction
+  const discoveryPrompt = `You are a macOS shell expert. A previous command failed because it guessed wrong field names or patterns.
+Here is the ACTUAL output of the source command. Generate a new extraction command based on what is ACTUALLY in the output.
+
+Rules:
+- Return ONLY valid JSON: { "cmd": "bash", "argv": ["-c", "<script>"] }
+- No explanation, no markdown, no code fences — only JSON.
+- Use the ACTUAL field names/labels/columns from the output below — do NOT guess.
+- Keep it simple — prefer grep/awk with patterns that match the actual output.
+- If the source output already contains the answer (no extraction needed), just echo it.
+
+Source command: ${sourceCmd}
+Actual output (first 2000 chars):
+${sourceResult.stdout.slice(0, 2000)}`;
+
+  try {
+    const response = await skillLlm.askWithMessages([
+      { role: 'system', content: discoveryPrompt },
+      { role: 'user', content: `Goal: ${goal}` },
+    ], { maxTokens: 300, temperature: 0 });
+
+    const parsed = _parseGoalJson(response);
+    if (!parsed || !parsed.cmd || !Array.isArray(parsed.argv)) {
+      logger.warn(`[shell.run] Discovery retry: LLM returned unparseable JSON — aborting`);
+      return null;
+    }
+
+    logger.info(`[shell.run] Discovery retry: regenerated command: ${(parsed.argv || []).join(' ').slice(0, 120)}`);
+
+    // 4. Run the new command
+    const retryResult = await runProcess(parsed.cmd, parsed.argv, {
+      cwd,
+      env: { ...oauthEnv, ...env },
+      timeoutMs: Math.min(timeoutMs, MAX_TIMEOUT_MS),
+      stdin,
+    }, _progressCallback || null);
+
+    // Verify the retry result
+    const baseName = path.basename(parsed.cmd);
+    const verifiedRetry = _verifyExpectedOutputs(retryResult, baseName, parsed.argv, cwd);
+
+    logger.info(`[shell.run] Discovery retry completed`, {
+      exitCode: verifiedRetry.exitCode,
+      ok: verifiedRetry.ok,
+      stdoutLen: (verifiedRetry.stdout || '').length,
+    });
+
+    return {
+      ...verifiedRetry,
+      cmd: [parsed.cmd, ...(parsed.argv || [])].join(' '),
+      dryRun: false,
+      retried: true,
+      discoveryRetry: true,
+      strictModeInjected: false,
+    };
+  } catch (e) {
+    logger.warn(`[shell.run] Discovery retry failed: ${e.message}`);
+    return null;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1168,13 +1372,27 @@ async function shellRun(args) {
   // resolve it to a concrete command via the internal LLM before proceeding.
   if (goal && !cmd) {
     logger.info('[shell.run] Resolving goal via internal LLM', { goal });
-    const resolved = await _resolveGoalToCommand(goal, _progressCallback || null);
-    if (!resolved.ok) {
-      return { ok: false, stdout: '', stderr: '', exitCode: -1, executionTime: 0, cmd: '', dryRun, error: resolved.error };
+
+    // ── Layer 1: Force-classification for known system queries ──────────
+    // Ask the LLM to pick a category number (1-N) or 0 (unknown). When a
+    // known category is matched, use the pre-validated dump command from
+    // SYSTEM_QUERY_REGISTRY — zero LLM generation, zero field-name hallucination.
+    const categoryNum = await _classifySystemQuery(goal, _progressCallback || null);
+    if (categoryNum > 0) {
+      const entry = SYSTEM_QUERY_REGISTRY[categoryNum - 1];
+      cmd = entry.cmd;
+      argv = entry.argv;
+      logger.info('[shell.run] Goal matched system query registry', { category: categoryNum, label: entry.label, cmd, argv });
+    } else {
+      // ── Fallback: free-generation for custom tasks (existing path) ─────
+      const resolved = await _resolveGoalToCommand(goal, _progressCallback || null);
+      if (!resolved.ok) {
+        return { ok: false, stdout: '', stderr: '', exitCode: -1, executionTime: 0, cmd: '', dryRun, error: resolved.error };
+      }
+      cmd = resolved.cmd;
+      argv = resolved.argv;
+      logger.info('[shell.run] Goal resolved to command', { cmd, argv });
     }
-    cmd = resolved.cmd;
-    argv = resolved.argv;
-    logger.info('[shell.run] Goal resolved to command', { cmd, argv });
   }
   // ─────────────────────────────────────────────────────────────────────────
 
@@ -1253,6 +1471,30 @@ async function shellRun(args) {
     ok: verifiedResult.ok,
     strictModeInjected,
   });
+
+  // ── Layer 2: Discovery retry for failed pipelines ─────────────────────
+  // If the command was a goal-resolved pipeline that failed with empty stdout,
+  // the LLM likely hallucinated field names. Run the source raw, show the LLM
+  // the actual output, and regenerate the extraction.
+  if (
+    verifiedResult.exitCode !== 0 &&
+    !(verifiedResult.stdout || '').trim() &&
+    scriptBody &&
+    scriptBody.includes('|') &&
+    goal  // only for goal-resolved commands, not pre-built argv
+  ) {
+    const discoveryResult = await _discoveryRetry(
+      scriptBody, goal, cwd, env, oauthEnv, timeoutMs, stdin, _progressCallback || null
+    );
+    if (discoveryResult) {
+      // Return the discovery retry result (whether it succeeded or failed).
+      // If it failed too, thin-recovery (Layer 3) in executeCommand.js will handle it.
+      return discoveryResult;
+    }
+    // If discovery retry didn't apply (e.g. source had no output), fall through
+    // to normal return — thin-recovery will handle the failure.
+  }
+  // ────────────────────────────────────────────────────────────────────────
 
   // ── 401/403 auto-retry ──────────────────────────────────────────────────
   // If the command output contains signs of an auth failure AND OAuth tokens
