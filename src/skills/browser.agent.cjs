@@ -1478,14 +1478,11 @@ Return the remaining (cell, value) targets as JSON:`;
       { role: 'user', content: _userPrompt },
     ], { maxTokens: 500, temperature: 0, responseTimeoutMs: 10000 });
     if (_response) {
-      const _jsonMatch = _response.match(/\[[\s\S]*\]/);
-      if (_jsonMatch) {
-        const _targets = JSON.parse(_jsonMatch[0]);
-        if (Array.isArray(_targets)) {
-          const _untyped = _targets.filter(t => t.cell && t.value && !_typedCells.includes(t.cell.toUpperCase()));
-          logger.info(`[browser.agent] _extractSpreadsheetTargets: LLM → ${_untyped.map(t => `${t.cell}="${String(t.value).slice(0, 20)}"`).join(', ')}`);
-          return _untyped;
-        }
+      const _targets = parseLlmJson(_response, logger, '_extractSpreadsheetTargets');
+      if (Array.isArray(_targets)) {
+        const _untyped = _targets.filter(t => t.cell && t.value && !_typedCells.includes(t.cell.toUpperCase()));
+        logger.info(`[browser.agent] _extractSpreadsheetTargets: LLM → ${_untyped.map(t => `${t.cell}="${String(t.value).slice(0, 20)}"`).join(', ')}`);
+        return _untyped;
       }
     }
   } catch (e) {
@@ -1734,7 +1731,7 @@ Output ONLY the element number, or 0 if not found.`;
 
 // Visual goal verification using OCR text.
 // Returns: 0 = failure (goal not achieved), 1 = done (goal achieved), 2 = wait (page processing)
-async function _ocrVerifyGoal(ocrText, goal, actionHistory = []) {
+async function _ocrVerifyGoal(ocrText, goal, actionHistory = [], sessionId = null) {
   const { askWithMessages } = require('../skill-helpers/skill-llm.cjs');
   const historyStr = (actionHistory || []).slice(-5).map((a, i) => `  ${i + 1}. ${a}`).join('\n');
 
@@ -1743,6 +1740,13 @@ Return ONLY a single number — nothing else:
 0 = failure (goal NOT achieved — page is a marketing/landing page, login page, or expected content is missing)
 1 = done (goal achieved — expected result is visible, e.g., event title visible, confirmation message shown)
 2 = wait (page is loading/processing — retry later)
+
+API KEY / TOKEN / CREDENTIAL RULE (CRITICAL):
+For goals that ask to create, retrieve, copy, or extract an API key, token, secret, or credential value:
+- Return 1 ONLY if the OCR text contains an actual key/token string (e.g., "AIza...", "sk-...", a long alphanumeric string), OR a "Your API key" box with a Copy button, OR a success toast like "API key created" / "Copied to clipboard".
+- If the page only shows a "Credentials" header, a list of existing keys, a search bar, or navigation links — return 0 (goal NOT achieved — navigation alone is not completion).
+- Do NOT return 1 just because the credentials page loaded. The actual key value or a creation/copy confirmation MUST be visible.
+- If a "Create credentials" button is visible but no key has been created yet — return 0.
 
 COUNT QUESTION RULE (OVERRIDES ALL OTHER RULES): If the goal asks "how many", "count", "tell me how many", or "number of":
 - Do NOT check whether the search query, filter text, or named items are visible in the OCR — OCR often truncates filter text.
@@ -1821,11 +1825,28 @@ Number (0-2)?`;
       let _reason = num === 1 ? 'goal-achieved' : (num === 2 ? 'loading' : 'ocr-failed');
       if (num === 0) {
         try {
+          // ── DOM-text fallback: if OCR text is sparse, also fetch page innerText ──
+          // LiteParse may miss text in dynamic SPAs or elements rendered after
+          // capture. Fetching document.body.innerText gives the LLM the real page
+          // content to quote from, so the reason reflects the actual blocker
+          // (e.g., "Enable billing to access...") instead of a generic "insufficient".
+          let _domText = '';
+          if ((ocrText || '').length < 50) {
+            try {
+              const _domRes = await callBrowserAct({ action: 'evaluate', text: 'document.body.innerText', sessionId, timeoutMs: 3000 }, 5000).catch(() => ({ ok: false }));
+              if (_domRes?.ok && _domRes?.result) {
+                _domText = String(_domRes.result).trim().replace(/^"|"$/g, '').slice(0, 2000);
+              }
+            } catch (_) {}
+          }
+
+          const _ocrSection = `OCR text: ${(ocrText || '').slice(0, 400)}`;
+          const _domSection = _domText ? `\nDOM text: ${_domText.slice(0, 800)}` : '';
           const reasonRaw = await askWithMessages([
-            { role: 'system', content: 'In one sentence, explain why the browser automation goal was NOT achieved based on the OCR text. Be specific about what is missing or wrong. Return ONLY the explanation.' },
-            { role: 'user', content: `Goal: ${goal}\nOCR text: ${(ocrText || '').slice(0, 400)}\nActions: ${(actionHistory || []).slice(-5).join('; ')}` }
-          ], { maxTokens: 60, temperature: 0, responseTimeoutMs: 5000, taskType: 'light' });
-          _reason = (reasonRaw || '').trim().slice(0, 120) || 'goal-not-visible-in-ocr';
+            { role: 'system', content: 'In one sentence, state why the browser automation goal was NOT achieved. Quote the exact text from the page that indicates the blocker (e.g., \'Page shows: "Enable billing to access..."\'). If no specific blocker text is visible, describe what is missing versus the goal. Return ONLY the explanation.' },
+            { role: 'user', content: `Goal: ${goal}\n${_ocrSection}${_domSection}\nActions: ${(actionHistory || []).slice(-5).join('; ')}` }
+          ], { maxTokens: 80, temperature: 0, responseTimeoutMs: 5000, taskType: 'light' });
+          _reason = (reasonRaw || '').trim().slice(0, 150) || 'goal-not-visible-in-ocr';
         } catch (_) { _reason = 'goal-not-visible-in-ocr'; }
       }
       logger.info(`[browser.agent] _ocrVerifyGoal: ${num} reason="${_reason}" for goal="${String(goal || '').slice(0, 60)}"`);
@@ -1938,10 +1959,23 @@ async function _verifyGoalWithOcr(goal, sessionId, actionHistory) {
     const _ocrPage = browserEngine && typeof browserEngine.getPage === 'function'
       ? browserEngine.getPage(sessionId) : null;
     if (!_ocrPage) return { verified: true, reason: 'no-page-available' };
-    const _cap = await _liteparseCapture(_ocrPage);
+
+    // Wait for the page to stabilize before capturing. If the first capture is
+    // too small (page still loading, spinner, or wrong viewport), wait and retry
+    // once — this is critical for Google Cloud Console where content loads after
+    // the URL change.
+    let _cap = await _liteparseCapture(_ocrPage);
+    let _retry = 0;
+    while (_cap?.ok && _cap.fullText && _cap.fullText.length < 100 && _cap.textItems && _cap.textItems.length < 10 && _retry < 2) {
+      logger.info(`[browser.agent] _verifyGoalWithOcr: OCR capture too small (${_cap.textItems.length} items, ${_cap.fullText.length} chars) — waiting for page to stabilize (retry ${_retry + 1}/2)`);
+      await new Promise(resolve => setTimeout(resolve, 1500));
+      _cap = await _liteparseCapture(_ocrPage);
+      _retry++;
+    }
+
     if (!_cap?.ok || !_cap.fullText) return { verified: true, reason: 'ocr-unavailable' };
     const _ocrText = _cap.fullText.slice(0, 800);
-    const _ocrResult = await _ocrVerifyGoal(_ocrText, goal, actionHistory);
+    const _ocrResult = await _ocrVerifyGoal(_ocrText, goal, actionHistory, sessionId);
     const _num = _ocrResult.num;
     const _reason = _ocrResult.reason || 'ocr-failed';
     if (_num === 1) return { verified: true, reason: 'ocr-confirmed', ocrText: _ocrText.slice(0, 200) };
@@ -2392,6 +2426,21 @@ Command plan?`;
 async function _extractSearchPlan(goal, focusedElement, value, actionHistory, agentContext) {
   const { askWithMessages } = require('../skill-helpers/skill-llm.cjs');
 
+  // ── Deterministic fast-path for global search boxes ──
+  // Google Cloud Console, AI Studio, and other apps have a global search field
+  // (placeholder "Search (/) for resources...", autocomplete=list) that is
+  // already focused after pressing "/". There's no @trigger — just type the
+  // query and submit. The LLM-based path below rejects empty triggers, so we
+  // short-circuit here to avoid the fallback to type-plain.
+  const _label = (focusedElement?.ariaLabel || focusedElement?.placeholder || focusedElement?.text || '').toLowerCase();
+  if (focusedElement?.tag === 'input' && /search\s*\(\/\)|search for resources|enter query|search for|search \//.test(_label)) {
+    const _query = String(value || '').replace(/^\//, '').trim();
+    if (_query) {
+      logger.info(`[browser.agent] _extractSearchPlan: global search fast-path — query="${_query}" (label="${_label.slice(0, 40)}")`);
+      return { trigger: '', query: _query, targetLabel: _query };
+    }
+  }
+
   const _focusedStr = _buildFocusedStr(focusedElement);
 
   const _contextBlock = agentContext
@@ -2670,7 +2719,13 @@ CRITICAL RULES:
 - For far jumps in spreadsheets (e.g., A1 to F10): use Tier 3 (Meta+J) to jump to each cell and type the value.
 - For creation deep links (docs.google.com/*/create): the entity is already created. For docs, Just-type the title. For sheets, use Tab-Map to click the title bar and rename.
 - Be specific about what action each tier should take
-- Output ONLY the JSON array, no other text`;
+- Output ONLY the JSON array, no other text
+
+GOAL-RELEVANCE RULES (CRITICAL):
+- Every step MUST directly contribute to achieving the goal. Do NOT include steps that open unrelated features (e.g., "open Gemini AI chat", "open keyboard shortcuts help") unless the goal explicitly asks for them.
+- Only use shortcuts that are listed in the "Available shortcuts" section. Do NOT invent shortcuts (e.g., "Alt+G") that are not in the list.
+- If the goal involves navigating to a specific page/section, use the search shortcut (/) or navigation shortcut (.) to get there — do NOT open unrelated side panels or chat features.
+- If no available shortcut helps achieve the goal, use Tier 4 (Tab-Map) to click the target element directly.`;
 
   const userPrompt = `Goal: ${goal}\nPage category: ${pageCategory || 'web_generic'}\nAvailable shortcuts:\n${shortcutLabels || '(none)'}\nCurrent URL: ${currentUrl || '(unknown)'}\nAgent: ${agentId || '(unknown)'}`;
 
@@ -2681,13 +2736,10 @@ CRITICAL RULES:
     ], { maxTokens: 800, temperature: 0, responseTimeoutMs: 15000 });
 
     if (!response) return null;
-    const jsonMatch = response.match(/\[[\s\S]*\]/);
-    if (jsonMatch) {
-      const flow = JSON.parse(jsonMatch[0]);
-      if (Array.isArray(flow) && flow.length > 0) {
-        logger.info(`[browser.agent] _computeTabFlow: computed ${flow.length}-step flow for "${goal.slice(0, 60)}" — ${flow.map(s => `tier ${s.tier}(${(s.action || '').slice(0, 30)})`).join(' → ')}`);
-        return flow;
-      }
+    const flow = parseLlmJson(response, logger, '_computeTabFlow');
+    if (Array.isArray(flow) && flow.length > 0) {
+      logger.info(`[browser.agent] _computeTabFlow: computed ${flow.length}-step flow for "${goal.slice(0, 60)}" — ${flow.map(s => `tier ${s.tier}(${(s.action || '').slice(0, 30)})`).join(' → ')}`);
+      return flow;
     }
     logger.warn(`[browser.agent] _computeTabFlow: could not parse JSON from response`);
     return null;
@@ -2701,7 +2753,7 @@ CRITICAL RULES:
 //   3. Category-specific keys from category-config (curated, e.g. Cmd+J for sheets)
 // LLM sees natural-language descriptions + full context (goal, history, focus,
 // editor state) and returns just a number. Returns { key, entryId? } or null.
-async function _extractShortcut(goal, actionHistory, hostname, agentContext, currentUrl, overlayActive, focusedElement, pageCategory, editorState) {
+async function _extractShortcut(goal, actionHistory, hostname, agentContext, currentUrl, overlayActive, focusedElement, pageCategory, editorState, flowHint = '') {
   const { askWithMessages } = require('../skill-helpers/skill-llm.cjs');
   const { loadAppKnowledge } = require('./lib/appKnowledge.cjs');
   const { getCategoryConfig } = require('../skill-helpers/category-config.cjs');
@@ -2813,11 +2865,18 @@ PRIORITY RULE for create/add/schedule goals:
 
   const historyStr = actionHistory.slice(-5).map((a, i) => `  ${i + 1}. ${a}`).join('\n');
 
+  // Tab-Flow hint: when a pre-computed Tab-Flow plan exists, pass the current
+  // step's intended action so the LLM picks the shortcut that matches the plan
+  // instead of independently choosing a different one.
+  const _flowHintBlock = flowHint
+    ? `\nTAB-FLOW PLAN HINT: The pre-computed plan says this step should: ${flowHint}\nPick the keyboard action that best matches this hint. If no action matches, return 0.\n`
+    : '';
+
   const userPrompt = `Goal: ${goal}
 Actions taken:
 ${historyStr}
 
-Page context: ${_overlayHint} ${_focusHint} ${_editorHint} ${_viewHint}${_catNotes}
+Page context: ${_overlayHint} ${_focusHint} ${_editorHint} ${_viewHint}${_catNotes}${_flowHintBlock}
 Available keyboard actions:
 ${shortcutList}
 
@@ -2842,29 +2901,13 @@ Which action? (return number or 0 for none)`;
   }
 }
 
-// Parse JSON from LLM output — tries </reasoning> tag, then [{, then [...], then JSON.parse.
-// Returns array or null.
+// Parse JSON from LLM output — delegates to the shared parseLlmJson utility
+// which handles </reasoning> tags, markdown fences, balanced extraction, and
+// multi-layer repair (missing values, dangling commas, unterminated strings,
+// unbalanced braces, jsonrepair fallback). Returns array or null.
 function _parseStepsJson(raw) {
-  let jsonStr = (raw || '').trim();
-  if (!jsonStr) return null;
-  const reasoningEnd = jsonStr.indexOf('</reasoning>');
-  if (reasoningEnd !== -1) {
-    jsonStr = jsonStr.slice(reasoningEnd + '</reasoning>'.length).trim();
-  } else {
-    const bracketStart = jsonStr.indexOf('[{');
-    if (bracketStart >= 0) jsonStr = jsonStr.slice(bracketStart);
-  }
-  const cleaned = jsonStr.replace(/^```(?:json)?\s*\n?/i, '').replace(/\n?```\s*$/, '').trim();
-  try {
-    const parsed = JSON.parse(cleaned);
-    return Array.isArray(parsed) ? parsed : null;
-  } catch {
-    const arrMatch = cleaned.match(/\[[\s\S]*\]/);
-    if (arrMatch) {
-      try { return JSON.parse(arrMatch[0]); } catch { return null; }
-    }
-    return null;
-  }
+  const parsed = parseLlmJson(raw, logger, '_parseStepsJson');
+  return Array.isArray(parsed) ? parsed : null;
 }
 
 // Regex fallback — extract steps from prose (fragile but better than nothing).
@@ -2874,15 +2917,11 @@ function _regexExtractSteps(raw, goal, tabMap) {
   const text = String(raw);
 
   // Look for JSON-like arrays embedded in prose (e.g., "Here are the steps: [{...}]")
-  const arrMatch = text.match(/\[\s*\{[\s\S]*\}\s*\]/);
-  if (arrMatch) {
-    try {
-      const parsed = JSON.parse(arrMatch[0]);
-      if (Array.isArray(parsed) && parsed.length > 0) {
-        logger.info(`[browser.agent] _regexExtractSteps: found JSON array in prose (${parsed.length} steps)`);
-        return parsed;
-      }
-    } catch {}
+  // Try robust JSON extraction first (handles fences, repair, etc.)
+  const parsed = parseLlmJson(text, logger, '_regexExtractSteps');
+  if (Array.isArray(parsed) && parsed.length > 0) {
+    logger.info(`[browser.agent] _regexExtractSteps: found JSON array in prose (${parsed.length} steps)`);
+    return parsed;
   }
 
   // Look for action patterns: "type X into Y", "click Z", "press Enter"
@@ -2920,11 +2959,18 @@ function _regexExtractSteps(raw, goal, tabMap) {
 // Caller executes steps in order; on page change, re-extract for new page.
 // If null or <=1 step, caller falls back to per-step _llmNextAction (browse-and-report).
 // 3-layer fallback: (1) planning model, (2) complex model with sharper prompt, (3) regex.
-async function _extractSteps(goal, currentUrl, tabMap, pageCategory, agentContext, overlayActive = false, actionHistory = []) {
+async function _extractSteps(goal, currentUrl, tabMap, pageCategory, agentContext, overlayActive = false, actionHistory = [], flowStepHint = '') {
   const { askWithMessages } = require('../skill-helpers/skill-llm.cjs');
 
   const _contextBlock = agentContext
     ? `\n\nAgent context (service descriptor / playbook — use these labels if relevant):\n${String(agentContext).slice(0, 1200)}`
+    : '';
+
+  // Flow step hint: when executing a pre-computed Tab-Flow, tell the LLM what
+  // the current step expects so it generates steps for THAT action, not for the
+  // overall goal (e.g., "click 'Create API key' button" instead of "click Credentials").
+  const _flowHintBlock = flowStepHint
+    ? `\n\nCURRENT FLOW STEP: The automation is executing a pre-planned flow. The current step is: "${flowStepHint}". Generate steps ONLY for this specific action — do not re-plan navigation if the target page is already loaded. If the button/element for this step is visible, plan clicking it. If it's not visible, plan the closest navigation step toward it. Do NOT generate steps for the overall goal — only for this specific flow step.`
     : '';
 
   // Build element list with [FILLABLE]/[CLICKABLE] markers
@@ -3016,6 +3062,19 @@ MULTI-LINE TYPE RULE (critical for block editors):
 - For block editors (Notion, Google Docs, Confluence): create blocks one at a time — type the command (e.g. /todo), press Enter to select it, then type each item separately with Enter between them.
 - Multi-line type only works for plain <textarea> elements, never for contenteditable block editors.
 
+GOAL COMPLETION RULE (critical):
+|- Do NOT return [{ "action": "done" }] or a single navigate/click step if the goal has NOT actually been completed.
+|- If the goal is to "create or retrieve an API key" or similar, the plan must include the actual steps to create or copy the key — not just navigate to the credentials page.
+|- If the page already shows an API key list, plan to either click "Create credentials" → "API key" → type a name → click "Create" → copy the key value, OR click an existing key name to open it and copy the value.
+|- If the final value (API key string, key code, secret) needs to be returned to the user, end the plan with { "action": "waitForStableText" } and { "action": "getPageText" } OR use { "action": "run-code", "code": "..." } to extract the specific key value.
+
+API KEY / CREDENTIALS PAGE RULE (Google Cloud Console, AI Studio, etc.):
+|- If the URL contains "apis/credentials" or the page shows a "Credentials" header with an API key table:
+  - To CREATE a new API key: click "Create credentials" (or "+ Create credentials"), select "API key" from the dropdown, optionally type a name, click "Create", wait for the key to appear, then extract/copy the key value.
+  - To RETRIEVE an existing API key: click the key name in the table (e.g., "Gemini API Key"), then extract the key value.
+  - ALWAYS end the plan with a step that captures the key value (getPageText or run-code or click the key name).
+|- If the goal says "create or retrieve" and existing keys are visible, prefer RETRIEVING an existing key (click the key name, copy the value) over creating a new one — it is faster and safer.
+
 OVERLAY/DIALOG STATE RULES (critical — check the Overlay/dialog state in the user prompt):
 - If the Overlay/dialog is OPEN, do NOT generate "navigate" steps — the dialog is already open; fill its fields or click its buttons instead. Navigating will close the dialog and destroy progress.
 - If the Overlay/dialog is OPEN, do NOT generate steps to open it again (e.g., "Click Create", "Click Event", "Click New", "Click +"). The dialog is already open.
@@ -3043,7 +3102,7 @@ Current URL: ${currentUrl}
 Page category: ${pageCategory || 'unknown'}
 Overlay/dialog: ${_overlayStr}
 Actions already taken:
-${_historyStr}${_contextBlock}
+${_historyStr}${_contextBlock}${_flowHintBlock}
 
 Available elements on this page:
 ${elementList}
@@ -3051,12 +3110,22 @@ ${elementList}
 Extract the ordered steps:`;
 
   // Helper: call LLM with given taskType + maxTokens
+  // responseFormat (optional): OpenAI-shaped structured output request —
+  //   { type: 'json_schema', json_schema: { name, strict, schema } }
+  //   When provided, the backend constrains the LLM to emit valid JSON
+  //   matching the schema, eliminating prose-padding parse failures.
   const _callLlm = async (sysPrompt, opts) => {
     try {
       return await askWithMessages([
         { role: 'system', content: sysPrompt },
         { role: 'user', content: userPrompt },
-      ], { maxTokens: opts.maxTokens || 2500, temperature: 0.1, responseTimeoutMs: 20000, taskType: opts.taskType || 'planning' });
+      ], {
+        maxTokens: opts.maxTokens || 2500,
+        temperature: 0.1,
+        responseTimeoutMs: 20000,
+        taskType: opts.taskType || 'planning',
+        ...(opts.responseFormat ? { responseFormat: opts.responseFormat } : {}),
+      });
     } catch (e) {
       logger.warn(`[browser.agent] _extractSteps call failed (${opts.taskType}): ${e.message}`);
       return '';
@@ -3150,9 +3219,41 @@ Extract the ordered steps:`;
     return steps;
   };
 
+  // ── Structured output schema for Layer 1 ──────────────────────────────
+  // Constrains the planning model to emit a valid JSON array of step objects,
+  // eliminating the prose-padding failure that forced a 26s Layer 2 fallback.
+  // The schema uses `type: 'array'` at the top level so the LLM returns a
+  // bare JSON array `[...]` — _parseStepsJson already handles bare arrays.
+  // If the provider doesn't support response_format, the backend gracefully
+  // degrades (retries without it on 400) and we fall back to Layer 2 as before.
+  const _stepsSchema = {
+    type: 'json_schema',
+    json_schema: {
+      name: 'steps',
+      strict: true,
+      schema: {
+        type: 'array',
+        items: {
+          type: 'object',
+          properties: {
+            action: { type: 'string', enum: ['type', 'click', 'press', 'navigate', 'waitForStableText', 'getPageText', 'scroll', 'screenshot', 'run-code', 'done'] },
+            target: { type: 'string' },
+            value: { type: 'string' },
+            key: { type: 'string' },
+            url: { type: 'string' },
+            direction: { type: 'string' },
+            code: { type: 'string' },
+          },
+          required: ['action'],
+          additionalProperties: false,
+        },
+      },
+    },
+  };
+
   try {
-    // Layer 1: planning model (current behavior, but with higher maxTokens)
-    let raw = await _callLlm(systemPrompt, { taskType: 'planning', maxTokens: 2500 });
+    // Layer 1: planning model with structured output (forces valid JSON array)
+    let raw = await _callLlm(systemPrompt, { taskType: 'planning', maxTokens: 2500, responseFormat: _stepsSchema });
     let parsed = _parseStepsJson(raw);
     let steps = _normalizeSteps(parsed);
     if (steps) {
@@ -3161,6 +3262,9 @@ Extract the ordered steps:`;
     }
 
     // Layer 2: complex model retry with sharper prompt (same taskType as planSkillsV2.js)
+    // No responseFormat here — the complex model (gemini-free) may not support
+    // structured output, and Layer 2 is the fallback when Layer 1's structured
+    // output somehow still fails (e.g., provider rejected the schema).
     logger.warn(`[browser.agent] _extractSteps: Layer 1 (planning) produced no JSON — retrying with complex model`);
     const _sharperPrompt = systemPrompt + '\n\nCRITICAL: Your previous response contained reasoning but NO JSON array. Output ONLY the JSON array now. Start with [ and end with ]. No reasoning, no prose, no commentary.';
     raw = await _callLlm(_sharperPrompt, { taskType: 'complex', maxTokens: 2500 });
@@ -3378,6 +3482,7 @@ const { userAgent } = require('./user.agent.cjs');
 const { resolveDestination, recordCorrection, classifyTaskIntent, classifyUrlType, getLearnedCorrection, deleteLearnedCorrection, suggestTaskUrl, getTaskKeywords, getCachedDeepLink, recordDeepLinkCache, deleteDeepLinkCache, getSearchUrlPattern, recordSearchUrlPattern, INTENTS, SERVICE_CHAT_URLS, isAuthFlowUrl, _isValidDeepLinkUrl } = require('../skill-helpers/destination-resolver.cjs');
 const { killExistingChromeForProfile, clearProfileLock, findCli, shortSessionId, _sniffAuthCookies, engine: browserEngine } = require('./browser.act.cjs');
 const { loadAppKnowledge, saveAppKnowledge, loadAndFormat, isCacheStale, isShortcutCoverageStale, recordVerification } = require('./lib/appKnowledge.cjs');
+const { parseLlmJson } = require('../skill-helpers/parseLlmJson.cjs');
 
 const BROWSER_ACT_PORT = parseInt(process.env.COMMAND_SERVICE_PORT || '3007', 10);
 
@@ -4647,10 +4752,7 @@ async function resolveBrowserMeta(service) {
 
   let meta = null;
   if (raw) {
-    try {
-      const match = raw.match(/\{[\s\S]*\}/);
-      if (match) meta = JSON.parse(match[0]);
-    } catch {}
+    meta = parseLlmJson(raw, logger, '_extractServiceMeta');
   }
 
   // 4d. Cross-validate isOAuth: trust keyword heuristic over LLM when they conflict
@@ -4695,14 +4797,11 @@ async function resolveBrowserMeta(service) {
           { temperature: 0.1, maxTokens: 300 }
         );
         if (retryRaw) {
-          const retryMatch = retryRaw.match(/\{[\s\S]*\}/);
-          if (retryMatch) {
-            const retryMeta = JSON.parse(retryMatch[0]);
-            if (retryMeta.signInUrl && !OAUTH_ENDPOINT_RE.test(retryMeta.signInUrl)) {
-              meta.signInUrl = retryMeta.signInUrl;
-              fixed = true;
-              logger.info(`[browser.agent] resolveBrowserMeta: LLM re-prompt corrected signInUrl → ${meta.signInUrl}`);
-            }
+          const retryMeta = parseLlmJson(retryRaw, logger, 'resolveBrowserMeta.retry');
+          if (retryMeta && retryMeta.signInUrl && !OAUTH_ENDPOINT_RE.test(retryMeta.signInUrl)) {
+            meta.signInUrl = retryMeta.signInUrl;
+            fixed = true;
+            logger.info(`[browser.agent] resolveBrowserMeta: LLM re-prompt corrected signInUrl → ${meta.signInUrl}`);
           }
         }
       } catch (retryErr) {
@@ -5392,10 +5491,8 @@ async function actionValidateAgent({ id, sessionId: explicitSession }) {
   let healthDiagnosis = null;
   const healthRaw = await callLLM(BROWSER_VALIDATOR_SYSTEM_PROMPT, userQuery, { temperature: 0.1, maxTokens: 1400 });
   if (healthRaw) {
-    try {
-      const m = healthRaw.match(/\{[\s\S]*\}/);
-      if (m) healthDiagnosis = JSON.parse(m[0]);
-    } catch {
+    healthDiagnosis = parseLlmJson(healthRaw, logger, 'validate_agent.health');
+    if (!healthDiagnosis) {
       logger.warn(`[browser.agent] validate_agent health parse failed for ${id}`);
     }
   }
@@ -5430,10 +5527,8 @@ async function actionValidateAgent({ id, sessionId: explicitSession }) {
 
   const reviewRaw = await callLLM(BROWSER_PIPELINE_REVIEW_PROMPT, reviewQuery, { temperature: 0.15, maxTokens: 1600 });
   if (reviewRaw) {
-    try {
-      const m = reviewRaw.match(/\{[\s\S]*\}/);
-      if (m) reviewDiagnosis = JSON.parse(m[0]);
-    } catch {
+    reviewDiagnosis = parseLlmJson(reviewRaw, logger, 'validate_agent.review');
+    if (!reviewDiagnosis) {
       logger.warn(`[browser.agent] validate_agent review parse failed for ${id}`);
     }
   }
@@ -6722,7 +6817,7 @@ async function _resolveTaskDeepLink(agentId, serviceKey, baseStartUrl, task, exi
         }, 10000);
         const evalRaw = String(evalResult?.result || evalResult?.stdout || '').trim();
         let evalLinks = null;
-        try { evalLinks = JSON.parse(evalRaw); } catch (_) { const m = evalRaw.match(/\[[\s\S]*\]/); if (m) try { evalLinks = JSON.parse(m[0]); } catch (_) {} }
+        evalLinks = parseLlmJson(evalRaw, logger, '_resolveDeepLink.evalLinks');
         if (Array.isArray(evalLinks) && evalLinks.length > 0) {
           const _INTENT_EVAL_PATTERNS = {
             [INTENTS.CONTENT_CREATE]: /\/(new|create|compose|upload|publish|submit|add|draft|editor|write)/i,
@@ -6786,7 +6881,7 @@ async function _resolveTaskDeepLink(agentId, serviceKey, baseStartUrl, task, exi
             }, 8000);
             const formRaw = String(formEvalResult?.result || formEvalResult?.stdout || '').trim();
             let formList = null;
-            try { formList = JSON.parse(formRaw); } catch (_) { const fm = formRaw.match(/\[[\s\S]*\]/); if (fm) try { formList = JSON.parse(fm[0]); } catch (_) {} }
+            formList = parseLlmJson(formRaw, logger, '_resolveDeepLink.formList');
             if (Array.isArray(formList) && formList.length > 0) {
               // Look for search-like forms: role=search, aria-label contains "search", or inputs named q/query/search/filter
               const _searchForms = formList.filter(f => {
@@ -7099,6 +7194,31 @@ function _isSigninWall(href) {
   return false;
 }
 
+// ── Record agent usage for 24h preflight bypass ────────────────────────────
+// Writes { lastUsed: Date.now(), authed: true } to the persistent auth cache
+// (~/.thinkdrop/preflight-auth-cache.json) so preflightAgents.js can skip the
+// auth probe entirely for agents used within the last 24 hours.
+// Uses the same file format as preflightAgents.js _savePersistentAuthCache.
+function _recordAgentUsage(agentId) {
+  try {
+    const _preflightCachePath = path.join(os.homedir(), '.thinkdrop', 'preflight-auth-cache.json');
+    let cache = {};
+    try {
+      if (fs.existsSync(_preflightCachePath)) {
+        cache = JSON.parse(fs.readFileSync(_preflightCachePath, 'utf8'));
+      }
+    } catch (_) { cache = {}; }
+    const key = (agentId || '').toLowerCase();
+    const existing = cache[key] || {};
+    cache[key] = { ...existing, lastUsed: Date.now(), authed: true };
+    const dir = path.dirname(_preflightCachePath);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    const tmpFile = `${_preflightCachePath}.tmp`;
+    fs.writeFileSync(tmpFile, JSON.stringify(cache, null, 2), 'utf8');
+    fs.renameSync(tmpFile, _preflightCachePath);
+  } catch (_) { /* non-fatal — usage tracking is best-effort */ }
+}
+
 async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAuth, skipAuth, manualLogin = false, preflightProbe = false, forceAuthProbe = false, requireCookieConfirmation = false, _progressCallbackUrl, _stepIndex, _loginWallRetried = false, _emitThinking = null, _authOnly = false, planExtend = false, sessionId: _planExtendSessionId = null, _abortSignal = null }) {
   // Derive agentId from url hostname when caller omits it (LLM sometimes emits only url)
   let agentId = _agentIdArg;
@@ -7118,13 +7238,20 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
   if (!agentId) return { ok: false, error: 'agentId is required' };
   if (!task)    return { ok: false, error: 'task is required' };
 
+  // ── Record agent usage for 24h preflight bypass (best-effort) ──────────
+  // Skip for preflight probes and auth-only checks — those don't count as
+  // real usage. Only record when the agent is actually running a task.
+  if (!preflightProbe && !_authOnly) {
+    _recordAgentUsage(agentId);
+  }
+
   // ── Plan Extension: "Try to finish" from partial-failure QuestionCard ──────
   // When the user clicks "Try to finish", main.js re-invokes browser.agent with
   // planExtend: true and the existing sessionId. Skip the full auth/probe/deeplink
   // flow (the session is already authed and on the target page) and go directly
   // to playwright.agent with a focused goal built from the remaining work.
   if (planExtend && _planExtendSessionId) {
-    logger.info(`[browser.agent] run: planExtend mode — skipping auth/probe/deeplink, delegating to playwright.agent on existing session ${_planExtendSessionId}`);
+    logger.info(`[browser.agent] run: planExtend mode — skipping auth/probe/deeplink, delegating to playwright.agent (planExtend) on existing session ${_planExtendSessionId}`);
     try {
       const { playwrightAgent } = require('./playwright.agent.cjs');
       const _extendResult = await playwrightAgent({
@@ -7365,10 +7492,7 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
 
       let action = null;
       if (llmRaw) {
-        try {
-          const m = llmRaw.match(/\{[\s\S]*\}/);
-          if (m) action = JSON.parse(m[0]);
-        } catch {}
+        action = parseLlmJson(llmRaw, logger, 'api_key_loop');
       }
 
       if (!action || !action.action) {
@@ -7558,7 +7682,7 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
           _deepLinkIntent = _matchIntentUrl(_svcKey, url);
         }
         const _simpleCategories = new Set(['social_feed', 'ai_chat', 'email_compose']);
-        const _earlyPageCategory = _inferPageCategory(_svcKey, url || startUrl, task, []);
+        const _earlyPageCategory = await _inferPageCategory(_svcKey, url || startUrl, task, []);
         const _isMutationDeepLink = _deepLinkIntent && _isMutationIntent(_deepLinkIntent);
 
         if (_simpleCategories.has(_earlyPageCategory) && _isMutationDeepLink) {
@@ -7786,24 +7910,33 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
       logger.info(`[browser.agent] domain-continuity: user-memory query failed: ${_memErr.message}`);
     }
 
-    // ── Engine-level domain continuity check ─────────────────────────────
+    // ── Engine-level domain continuity check (probe-before-kill) ──────────
     // User-memory OCR may be stale or unavailable, but the engine session is the
-    // authoritative source of the current URL. If the engine is already on the
-    // target domain, preserve it instead of restarting.
+    // authoritative source of the current URL. Probe the engine BEFORE deciding
+    // to kill Chrome. Three outcomes:
+    //   1. Probe succeeds + same domain → reuse session (skip kill block entirely)
+    //   2. Probe succeeds + different domain → kill + relaunch (avoids stale state)
+    //   3. Probe fails (no engine, EINVAL, timeout) → kill + relaunch (last resort)
+    // This makes the kill a last resort instead of a default, preventing Chrome
+    // churn when a healthy session from a previous app run is still alive.
     if (!_domainContinuitySkip) {
       try {
-        const _engineHrefRes = await callBrowserAct({ action: 'evaluate', text: 'window.location.href', sessionId, timeoutMs: 5000 }, 8000).catch(() => ({ ok: false }));
+        const _engineHrefRes = await callBrowserAct({ action: 'evaluate', text: 'window.location.href', sessionId, timeoutMs: 3000 }, 5000).catch(() => ({ ok: false }));
         if (_engineHrefRes?.ok && _engineHrefRes?.result) {
           const _engineHref = String(_engineHrefRes.result).trim().replace(/^"|"$/g, '');
           const _engineHost = (() => { try { return new URL(_engineHref).hostname.replace(/^www\./, '').toLowerCase(); } catch (_) { return ''; } })();
           const _startHost = (() => { try { return new URL(startUrl).hostname.replace(/^www\./, '').toLowerCase(); } catch (_) { return ''; } })();
           if (_engineHost && _startHost && isHostAlias(_engineHost, _startHost, hostAliases)) {
             _domainContinuitySkip = true;
-            logger.info(`[browser.agent] domain-continuity: engine session already on ${_engineHref} for session=${sessionId} — skipping restart`);
+            logger.info(`[browser.agent] domain-continuity: reused existing Chrome session on ${_engineHref} for session=${sessionId} — skipping restart`);
+          } else if (_engineHost) {
+            logger.info(`[browser.agent] domain-continuity: engine alive on ${_engineHref} (host=${_engineHost}) but target is ${_startHost} — will kill+relaunch for session=${sessionId}`);
           }
+        } else {
+          logger.debug(`[browser.agent] domain-continuity: engine probe failed (ok=${_engineHrefRes?.ok}) — will kill+relaunch for session=${sessionId}`);
         }
       } catch (_engineContinuityErr) {
-        logger.debug(`[browser.agent] domain-continuity: engine session check failed (non-fatal): ${_engineContinuityErr.message}`);
+        logger.debug(`[browser.agent] domain-continuity: engine probe failed (non-fatal): ${_engineContinuityErr.message} — will kill+relaunch for session=${sessionId}`);
       }
     }
 
@@ -9676,11 +9809,11 @@ Output ONLY valid JSON: {${_execRecipe.params.map(p => `"${p.name}": "<extracted
               routingDecision: 'agent_skill_delegate',
             };
           } else {
-            logger.warn(`[browser.agent] agent-skill: "${_execRecipe.name}" failed: ${_agentSkillResult?.error} — falling through to playwright.agent`);
+            logger.warn(`[browser.agent] agent-skill: "${_execRecipe.name}" failed: ${_agentSkillResult?.error} — falling through to playwright.agent (turn-loop)`);
             // Fall through to playwrightAgent (don't return)
           }
         } catch (_agentSkillErr) {
-          logger.warn(`[browser.agent] agent-skill: execution error: ${_agentSkillErr.message} — falling through to playwright.agent`);
+          logger.warn(`[browser.agent] agent-skill: execution error: ${_agentSkillErr.message} — falling through to playwright.agent (turn-loop)`);
         }
 
       } else if (_execRecipe && _execRecipe.waypoints && _execRecipe.waypoints.length > 0) {
@@ -10537,7 +10670,7 @@ When extracting page content with run-code, prioritize these selectors over gene
       // all fail — fall through to playwright.agent which has its own engine launch.
       const _engineCheckRes = await callBrowserAct({ action: 'evaluate', text: 'document.readyState', sessionId, timeoutMs: 5000 }, 8000).catch(() => ({ ok: false }));
       if (!_engineCheckRes?.ok) {
-        logger.warn(`[browser.agent] tab-map: engine not active (evaluate failed) — skipping tab-map, falling through to playwright.agent`);
+        logger.warn(`[browser.agent] tab-map: engine not active (evaluate failed) — skipping tab-map, falling through to playwright.agent (turn-loop)`);
         throw new Error('tab-map skipped: engine not active');
       }
       logger.info(`[browser.agent] tab-map: engine active (readyState=${_engineCheckRes.result}) — proceeding`);
@@ -10600,7 +10733,7 @@ When extracting page content with run-code, prioritize these selectors over gene
       // Tier 1: URL-first (already done above)
       // Tier 2: Decision call → 0 (DONE), 1 (Just-type), 2 (Meta+F), 3 (Tab-Map)
       // Tier 3: Strategy execution with fallback to Tab-Map
-      const _pageCategory = _inferPageCategory(_svcKey, startUrl, task, _appKnowledgeEntries);
+      const _pageCategory = await _inferPageCategory(_svcKey, startUrl, task, _appKnowledgeEntries);
       const _shortcutEntries = _appKnowledgeEntries.filter(e => e.type === 'shortcut' && e.details?.shortcut);
       const _shortcutCount = _shortcutEntries.length;
       // Build compact shortcut list: "c — create a new event" (max 800 chars)
@@ -10611,6 +10744,10 @@ When extracting page content with run-code, prioritize these selectors over gene
       }).join('\n').slice(0, 800);
       logger.info(`[browser.agent] tab-map: starting three-tier iterative navigation (category=${_pageCategory}, appKnowledge=${_appKnowledgeEntries?.length || 0} entries, shortcuts=${_shortcutCount})`);
       const { runIterativeNavigation } = require('./instruction.runner.cjs');
+      // Scale timeout with Tab-Flow length — 30s per flow step, min 120s
+      const _cachedFlow = _loadTabFlowCache(_agentIdArg, task);
+      const _flowTimeoutMs = _cachedFlow ? Math.max(120000, _cachedFlow.length * 30000) : 120000;
+      logger.info(`[browser.agent] tab-map: timeout=${_flowTimeoutMs}ms${_cachedFlow ? ` (${_cachedFlow.length}-step flow)` : ''}`);
       const _tabMapResult = await runIterativeNavigation({
         goal: task,
         sessionId,
@@ -10620,7 +10757,7 @@ When extracting page content with run-code, prioritize these selectors over gene
         agentContext: _agentContext,
         shortcutCount: _shortcutCount,
         shortcutLabels: _shortcutLabels,
-        timeoutMs: 120000,
+        timeoutMs: _flowTimeoutMs,
         progressCallbackUrl: _progressCallbackUrl,
         stepIndex: _stepIndex,
         agentId: _agentIdArg,
@@ -10693,6 +10830,11 @@ When extracting page content with run-code, prioritize these selectors over gene
           const _urlRes = await callBrowserAct({ action: 'evaluate', text: 'window.location.href', sessionId, timeoutMs: 3000 }, 5000).catch(() => ({ ok: false }));
           _finalUrl = _urlRes?.ok ? String(_urlRes.result || '').trim().replace(/^"|"$/g, '') : '';
         } catch (_) {}
+        // Save Tab-Flow to cache ONLY after verification passed (prevents caching
+        // flows that declared DONE prematurely via the old in-loop save).
+        if (_tabMapResult?.tabFlow && _tabMapResult?.agentId) {
+          try { _saveTabFlowCache(_tabMapResult.agentId, task, _tabMapResult.tabFlow); } catch (_) {}
+        }
         return {
           ok: true, agentId, task,
           result: _tabMapResult.output || `Completed via tab-map`,
@@ -10702,9 +10844,9 @@ When extracting page content with run-code, prioritize these selectors over gene
           routingDecision: 'browser_tabmap',
         };
       }
-      logger.warn(`[browser.agent] tab-map: iterative navigation failed: ${_tabMapResult?.error} — falling through to playwright.agent`);
+      logger.warn(`[browser.agent] tab-map: iterative navigation failed: ${_tabMapResult?.error} — falling through to playwright.agent (turn-loop)`);
     } catch (_tabMapErr) {
-      logger.warn(`[browser.agent] tab-map: execution error (non-fatal): ${_tabMapErr.message} — falling through to playwright.agent`);
+      logger.warn(`[browser.agent] tab-map: execution error (non-fatal): ${_tabMapErr.message} — falling through to playwright.agent (turn-loop)`);
     }
   }
 
@@ -10754,6 +10896,77 @@ When extracting page content with run-code, prioritize these selectors over gene
         _stepIndex,
         _abortSignal: _abortSignal,
     }, 600000, _abortSignal));
+
+    // ── Turn-loop → Tab-Flow re-entry ──
+    // When the turn-loop opens a dialog or navigates (state change), it returns
+    // resumeTabFlow: true. Re-enter Tab-Flow so Tab-Map can scan the new state
+    // and execute the next flow step deterministically. Max 2 re-entries to
+    // prevent infinite loops.
+    let _tabFlowReEntries = 0;
+    while (agentResult?.resumeTabFlow && _tabFlowReEntries < 2) {
+      _tabFlowReEntries++;
+      logger.info(`[browser.agent] turn-loop changed state (re-entry ${_tabFlowReEntries}/2) — re-entering Tab-Flow`);
+      const _flowTimeoutMs = _tabFlow ? Math.max(120000, _tabFlow.length * 30000) : 120000;
+      const { runIterativeNavigation } = require('./instruction.runner.cjs');
+      const _tabMapResult2 = await runIterativeNavigation({
+        goal: task,
+        sessionId,
+        startUrl: _urlFirstNavigationSelected ? startUrl : null,
+        urlFirstNav: _urlFirstNavigationSelected,
+        pageCategory: _pageCategory,
+        agentContext: _agentContext,
+        shortcutCount: _shortcutCount,
+        shortcutLabels: _shortcutLabels,
+        timeoutMs: _flowTimeoutMs,
+        progressCallbackUrl: _progressCallbackUrl,
+        stepIndex: _stepIndex,
+        agentId: _agentIdArg,
+      });
+      if (_tabMapResult2?.ok) {
+        logger.info(`[browser.agent] tab-map: completed ✓ via iterative navigation (re-entry ${_tabFlowReEntries})`);
+        const _domVerify2 = await _verifyGoalViaDomState(task, sessionId, _tabMapResult2.actionHistory || [], _tabMapResult2);
+        if (_domVerify2?.verified) {
+          if (_tabMapResult2?.tabFlow && _tabMapResult2?.agentId) {
+            try { _saveTabFlowCache(_tabMapResult2.agentId, task, _tabMapResult2.tabFlow); } catch (_) {}
+          }
+          return { ok: true, agentId, task, result: _tabMapResult2.output || 'Completed via tab-map (re-entry)', agentTurns: _tabMapResult2.actionHistory?.length || 0 };
+        }
+        const _ocrVerify2 = await _verifyGoalWithOcr(task, sessionId, _tabMapResult2.actionHistory || []);
+        if (_ocrVerify2?.verified) {
+          if (_tabMapResult2?.tabFlow && _tabMapResult2?.agentId) {
+            try { _saveTabFlowCache(_tabMapResult2.agentId, task, _tabMapResult2.tabFlow); } catch (_) {}
+          }
+          return { ok: true, agentId, task, result: _tabMapResult2.output || 'Completed via tab-map (re-entry)', agentTurns: _tabMapResult2.actionHistory?.length || 0 };
+        }
+        // Verification failed — but tab-map made progress. Continue to turn-loop if state changed again.
+        if (!_tabMapResult2?.stateChanged) break;
+        // Re-enter turn-loop for the next state change
+        agentResult = await _withSessionMutex(sessionId, () => callSkill(_agentSkill, {
+          goal: _effectiveTask, agentContext: _agentContext, appKnowledgeEntries: _appKnowledgeEntries,
+          url: undefined, sessionId, agentId, autoConnect: _effectiveAutoConnect,
+          chromeProfile: _usePersistentProfile ? AGENT_BROWSER_PROFILE : undefined,
+          headed: _usePersistentProfile ? true : undefined,
+          maxTurns: _dynamicMaxTurns, timeoutMs: 30000,
+          overallTimeoutMs: Math.max(180000, _dynamicMaxTurns * 10000),
+          recipeWasUsed: true, authConfirmedAt: Date.now(),
+          _progressCallbackUrl, _stepIndex, _abortSignal: _abortSignal,
+        }, 600000, _abortSignal));
+      } else {
+        // Tab-Map didn't complete — check if it changed state for another re-entry
+        if (!_tabMapResult2?.stateChanged) break;
+        // Re-enter turn-loop
+        agentResult = await _withSessionMutex(sessionId, () => callSkill(_agentSkill, {
+          goal: _effectiveTask, agentContext: _agentContext, appKnowledgeEntries: _appKnowledgeEntries,
+          url: undefined, sessionId, agentId, autoConnect: _effectiveAutoConnect,
+          chromeProfile: _usePersistentProfile ? AGENT_BROWSER_PROFILE : undefined,
+          headed: _usePersistentProfile ? true : undefined,
+          maxTurns: _dynamicMaxTurns, timeoutMs: 30000,
+          overallTimeoutMs: Math.max(180000, _dynamicMaxTurns * 10000),
+          recipeWasUsed: true, authConfirmedAt: Date.now(),
+          _progressCallbackUrl, _stepIndex, _abortSignal: _abortSignal,
+        }, 600000, _abortSignal));
+      }
+    }
 
     let agentResultText = String(agentResult?.result ?? agentResult?.stdout ?? '');
 
@@ -11463,8 +11676,7 @@ async function actionScanPage({ service, url: explicitUrl, secretKey }) {
   try {
     const raw = await callLLM(SCAN_PAGE_SYSTEM_PROMPT, userQuery, { temperature: 0.1, maxTokens: 600 });
     if (raw) {
-        const match = raw.match(/\{[\s\S]*\}/);
-        if (match) parsed = JSON.parse(match[0]);
+        parsed = parseLlmJson(raw, logger, 'scan_page');
     }
   } catch (err) {
     logger.warn(`[browser.agent] scan_page: LLM parse failed: ${err.message}`);
@@ -12271,61 +12483,127 @@ const BROWSER_CATEGORY_SCHEMAS = {
 // Infer page category from service key, URL, task text, and appKnowledge entries.
 // Used to pass proactive hints to instruction.runner so it knows upfront what
 // nuances are needed (chip confirmation, submit verification, pressAfter, etc.)
-// Priority: KNOWN_BROWSER_SERVICES → appKnowledge entries → URL patterns → task text
+//
+// Two-tier approach:
+//   Tier 1: Deterministic service-key → category map (takes absolute priority,
+//           cannot be overridden by appKnowledge noise or LLM mis-classification)
+//   Tier 2: LLM number-classification — sees full context (service key, URL,
+//           task, appKnowledge summaries) and understands that "compose" in
+//           Google Cloud means "compose a query", not email compose. Uses the
+//           established "return ONLY a single number" pattern (maxTokens: 5).
+//           Result is cached per (serviceKey, url) for the session.
+//           Defaults to 'web_generic' on failure or timeout (safe fallback).
 // ---------------------------------------------------------------------------
-function _inferPageCategory(serviceKey, url, task, appKnowledgeEntries = []) {
+const _PAGE_CATEGORY_MAP = new Map(); // cache: `${serviceKey}::${url}` → category
+
+const _SERVICE_CATEGORIES = {
+  gmail: 'email_compose', outlook: 'email_compose', protonmail: 'email_compose',
+  yahoo: 'email_compose', mailgooglecom: 'email_compose',
+  chatgpt: 'ai_chat', openai: 'ai_chat', claude: 'ai_chat', anthropic: 'ai_chat',
+  gemini: 'ai_chat', googleai: 'ai_chat', grok: 'ai_chat', perplexity: 'ai_chat',
+  notion: 'document_editor', googledocs: 'document_editor', googlesheets: 'spreadsheet',
+  twitter: 'social_feed', x: 'social_feed', facebook: 'social_feed',
+  linkedin: 'social_feed', reddit: 'social_feed',
+  amazon: 'shopping', ebay: 'shopping', etsy: 'shopping',
+  spotify: 'media_player', youtube: 'media_player', applemusic: 'media_player',
+  googlecalendar: 'calendar', outlookcalendar: 'calendar',
+  // Cloud consoles and dev tools — force web_generic to prevent appKnowledge
+  // noise (e.g. "compose" in a cheatography snippet) from mis-classifying as
+  // email_compose or other specialized categories.
+  googlecloud: 'web_generic', googleai: 'web_generic', aistudio: 'web_generic',
+  googledrive: 'web_generic', gcp: 'web_generic', aws: 'web_generic',
+  azure: 'web_generic', cloudflare: 'web_generic', vercel: 'web_generic',
+  github: 'web_generic', gitlab: 'web_generic', bitbucket: 'web_generic',
+  stripe: 'web_generic', twilio: 'web_generic', sendgrid: 'web_generic',
+  mailgun: 'web_generic', postmark: 'web_generic',
+};
+
+const _LLM_CATEGORY_NUMBERS = [
+  'web_generic',    // 0
+  'email_compose',  // 1
+  'ai_chat',        // 2
+  'document_editor',// 3
+  'spreadsheet',    // 4
+  'social_feed',    // 5
+  'shopping',       // 6
+  'media_player',   // 7
+  'calendar',       // 8
+];
+
+async function _classifyPageCategoryLLM(serviceKey, url, task, appKnowledgeEntries) {
+  const { askWithMessages } = require('../skill-helpers/skill-llm.cjs');
   const _svc = (serviceKey || '').toLowerCase().replace(/[^a-z0-9]/g, '');
   const _url = (url || '').toLowerCase();
   const _task = (task || '').toLowerCase();
 
-  // 1. Direct service → category mapping (KNOWN_BROWSER_SERVICES)
-  const _SERVICE_CATEGORIES = {
-    gmail: 'email_compose', outlook: 'email_compose', protonmail: 'email_compose',
-    yahoo: 'email_compose', mailgooglecom: 'email_compose',
-    chatgpt: 'ai_chat', openai: 'ai_chat', claude: 'ai_chat', anthropic: 'ai_chat',
-    gemini: 'ai_chat', googleai: 'ai_chat', grok: 'ai_chat', perplexity: 'ai_chat',
-    notion: 'document_editor', googledocs: 'document_editor', googlesheets: 'spreadsheet',
-    twitter: 'social_feed', x: 'social_feed', facebook: 'social_feed',
-    linkedin: 'social_feed', reddit: 'social_feed',
-    amazon: 'shopping', ebay: 'shopping', etsy: 'shopping',
-    spotify: 'media_player', youtube: 'media_player', applemusic: 'media_player',
-    googlecalendar: 'calendar', outlookcalendar: 'calendar',
-  };
+  // Build compact appKnowledge summary (max 500 chars)
+  const _akSummary = (appKnowledgeEntries || [])
+    .map(e => `${e.type}: ${e.summary || ''}`.toLowerCase())
+    .join(' | ')
+    .slice(0, 500);
+
+  const systemPrompt = `You classify a web page into a category based on the service, URL, task, and app knowledge.
+Return ONLY a single number — nothing else:
+  0 = web_generic (dashboards, consoles, admin panels, cloud platforms, unknown sites)
+  1 = email_compose (composing/sending email — Gmail, Outlook, ProtonMail)
+  2 = ai_chat (chatting with an AI — ChatGPT, Claude, Gemini chat)
+  3 = document_editor (editing a document — Notion, Google Docs)
+  4 = spreadsheet (cell-based grid editing — Google Sheets)
+  5 = social_feed (posting/sharing to a feed — Twitter, LinkedIn, Facebook)
+  6 = shopping (product pages, checkout — Amazon, eBay)
+  7 = media_player (playing media — Spotify, YouTube)
+  8 = calendar (event scheduling — Google Calendar)
+
+Rules:
+- Cloud consoles (Google Cloud, AWS, Azure) → 0 (web_generic), NOT email even if "compose" appears
+- "compose" in a cloud/dev context means "compose a query", not email → 0
+- When in doubt → 0 (web_generic is the safe default)`;
+
+  const userPrompt = `Service: ${_svc}
+URL: ${_url}
+Task: ${_task}
+App knowledge: ${_akSummary || '(none)'}
+
+Which category number?`;
+
+  try {
+    const raw = await askWithMessages([
+      { role: 'system', content: systemPrompt },
+      { role: 'user', content: userPrompt },
+    ], { maxTokens: 5, temperature: 0, taskType: 'classification', responseTimeoutMs: 8000 });
+    const num = parseInt((raw || '').trim().replace(/\D/g, ''), 10);
+    if (num >= 0 && num < _LLM_CATEGORY_NUMBERS.length) {
+      const category = _LLM_CATEGORY_NUMBERS[num];
+      logger.info(`[browser.agent] _classifyPageCategoryLLM: service=${_svc} url=${_url.slice(0, 60)} → ${category} (num=${num})`);
+      return category;
+    }
+    logger.info(`[browser.agent] _classifyPageCategoryLLM: invalid response "${(raw || '').trim()}" — defaulting to web_generic`);
+    return 'web_generic';
+  } catch (e) {
+    logger.warn(`[browser.agent] _classifyPageCategoryLLM failed: ${e.message} — defaulting to web_generic`);
+    return 'web_generic';
+  }
+}
+
+async function _inferPageCategory(serviceKey, url, task, appKnowledgeEntries = []) {
+  const _svc = (serviceKey || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+  const _url = (url || '').toLowerCase();
+
+  // 1. Direct service → category mapping (deterministic, absolute priority)
   if (_SERVICE_CATEGORIES[_svc]) return _SERVICE_CATEGORIES[_svc];
 
-  // 2. appKnowledge entries → category inference
-  //    Look for signals in entry type + summary that indicate page category
-  if (appKnowledgeEntries && appKnowledgeEntries.length > 0) {
-    const _summaries = appKnowledgeEntries.map(e => `${e.type} ${e.summary || ''}`.toLowerCase()).join(' ');
-    const _hasShortcut = appKnowledgeEntries.some(e => e.type === 'shortcut');
-    const _hasWorkflow = appKnowledgeEntries.some(e => e.type === 'workflow');
-    const _hasCommandSystem = appKnowledgeEntries.some(e => e.type === 'command_system');
-
-    // AI chat: shortcut says "Enter" + "message" + "send"
-    if (_hasShortcut && /enter.*message.*send|send.*message.*enter/i.test(_summaries)) return 'ai_chat';
-    // Email compose: workflow/quirk mentions "compose", "recipient", "To field"
-    if ((_hasWorkflow || _summaries.includes('quirk')) && /compose|recipient|to field|cc|bcc|email.*send/i.test(_summaries)) return 'email_compose';
-    // Document editor: command_system with "/" prefix, or shortcut with "Cmd+N" (new page)
-    if (_hasCommandSystem && /slash|\/.*prefix|block insertion/i.test(_summaries)) return 'document_editor';
-    if (_hasShortcut && /cmd\+n|ctrl\+n.*new page/i.test(_summaries)) return 'document_editor';
-    // Media player: shortcut with "play", "pause", "next", "previous"
-    if (_hasShortcut && /play|pause|next track|previous track/i.test(_summaries)) return 'media_player';
-    // Social feed: workflow/quirk mentions "post", "share", "feed"
-    if ((_hasWorkflow || _summaries.includes('quirk')) && /\bpost\b|share.*feed|news feed/i.test(_summaries)) return 'social_feed';
+  // Check session cache
+  const _cacheKey = `${_svc}::${_url}`;
+  if (_PAGE_CATEGORY_MAP.has(_cacheKey)) {
+    return _PAGE_CATEGORY_MAP.get(_cacheKey);
   }
 
-  // 3. URL-based inference
-  if (/mail\.google\.com|outlook\.live\.com\/mail|proton\.mail/i.test(_url)) return 'email_compose';
-  if (/chat\.openai\.com|claude\.ai|gemini\.google\.com|grok\.com|perplexity\.ai/i.test(_url)) return 'ai_chat';
-  if (/notion\.so|notion\.com|docs\.google\.com/i.test(_url)) return 'document_editor';
-  if (/twitter\.com|x\.com\/compose|facebook\.com\/sharer|linkedin\.com\/feed/i.test(_url)) return 'social_feed';
+  // 2. LLM number-classification (replaces fragile regex tiers 2-4)
+  const _category = await _classifyPageCategoryLLM(serviceKey, url, task, appKnowledgeEntries);
 
-  // 4. Task-based inference (weakest signal)
-  if (/\b(send|compose|email|reply|forward)\b.*\b(to|recipient|subject|body)\b/i.test(_task)) return 'email_compose';
-  if (/\b(ask|chat|message|prompt)\b.*\b(chatgpt|claude|gemini|grok|perplexity|ai)\b/i.test(_task)) return 'ai_chat';
-  if (/\b(post|tweet|share|update status)\b/i.test(_task)) return 'social_feed';
-
-  return 'web_generic';
+  // Cache for the session
+  _PAGE_CATEGORY_MAP.set(_cacheKey, _category);
+  return _category;
 }
 
 // ---------------------------------------------------------------------------

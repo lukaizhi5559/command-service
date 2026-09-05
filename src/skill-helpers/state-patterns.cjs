@@ -46,6 +46,7 @@ const { classifyDeepLinkType } = require('./deep-link-types.cjs');
  * @param {number} [state.fillableCount] — count of fillable elements
  * @param {Object} [state.fillableTypes] — breakdown: { inputCount, textareaCount, contenteditableCount, roleTextboxCount }
  * @param {boolean} [state.hasAutoFocus] — a field is auto-focused?
+ * @param {boolean} [state.focused] — is any element focused (not body)?
  * @param {Object} [state.editorState] — { region, blockIndex, blockType, ... }
  * @param {number} [state.shortcutCount] — count of available shortcuts
  * @param {string} [state.shortcutLabels] — shortcut label text
@@ -63,6 +64,7 @@ function classifyStatePattern(state) {
   const _hasRealFormFields = (Number(fillableTypes.inputCount) + Number(fillableTypes.textareaCount)) > 0;
   const _hasOnlyContenteditable = fillableCount > 0 && !_hasRealFormFields;
   const hasAutoFocus = !!s.hasAutoFocus;
+  const focused = !!s.focused;
   const editorState = s.editorState || null;
   const pageCategory = String(s.pageCategory || '');
   const shortcutCount = Number(s.shortcutCount) || 0;

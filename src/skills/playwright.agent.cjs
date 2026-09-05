@@ -12458,6 +12458,18 @@ Turn ${turn}/${MAX_TURNS}. What is your next action? (DO NOT snapshot - act dire
     // detected as a menu, blocking reactFill/fill). The open-menu hint in the
     // prompt + menuScope injection are sufficient to guide the agent.
     let _outcome;
+    // Capture state before action for state-change detection (turn-loop → Tab-Flow re-entry)
+    let _preActionState = null;
+    try {
+      const _prePage = engine.getPage(sessionId);
+      if (_prePage) {
+        _preActionState = await _prePage.evaluate(() => ({
+          url: window.location.href,
+          bodyLen: (document.body.innerText || '').length,
+          modalCount: document.querySelectorAll('[role="dialog"], [role="alertdialog"], [aria-modal="true"]').length,
+        })).catch(() => null);
+      }
+    } catch (_) {}
     try {
       const _execAction = { ..._action, sessionId, headed, timeoutMs };
       if (_action.action === 'clickByText' && _activeMenuScope && !_action.scope && !_action.menuScope) {
@@ -12693,6 +12705,42 @@ Turn ${turn}/${MAX_TURNS}. What is your next action? (DO NOT snapshot - act dire
             logger.info(`[playwright.agent] turn-loop: waiting for page to stabilize after navigate`);
             await _page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
             await _page.waitForTimeout(2000);  // SPA settle time
+          }
+        } catch (_) {}
+      }
+
+      // ── State-change detection: return to Tab-Flow on significant state change ──
+      // When the turn-loop opens a dialog/modal or navigates (e.g., "Show key" dialog),
+      // return to Tab-Flow so Tab-Map can scan the new state and execute the next
+      // flow step. The turn-loop is a recovery mechanism — once it gets the page
+      // into a new state, Tab-Flow should take over for deterministic execution.
+      if (_outcome.ok && _domMutating && _preActionState && turn >= 2) {
+        try {
+          const _postPage = engine.getPage(sessionId);
+          if (_postPage) {
+            const _postState = await _postPage.evaluate(() => ({
+              url: window.location.href,
+              bodyLen: (document.body.innerText || '').length,
+              modalCount: document.querySelectorAll('[role="dialog"], [role="alertdialog"], [aria-modal="true"]').length,
+            })).catch(() => null);
+            if (_postState) {
+              const _urlChanged = _postState.url !== _preActionState.url;
+              const _modalChanged = _postState.modalCount !== _preActionState.modalCount;
+              const _bodyChanged = Math.abs((_postState.bodyLen || 0) - (_preActionState.bodyLen || 0)) > 200;
+              // Only return to Tab-Flow if a modal OPENED (not closed) or URL changed
+              // — modal closing is just dismissing something, not progress.
+              const _modalOpened = _postState.modalCount > _preActionState.modalCount;
+              if ((_modalOpened || _urlChanged) && (_modalChanged || _bodyChanged || _urlChanged)) {
+                logger.info(`[playwright.agent] turn-loop: state changed after ${_action.action} (url=${_urlChanged}, modal=${_preActionState.modalCount}→${_postState.modalCount}, body=${_preActionState.bodyLen}→${_postState.bodyLen}) — returning to Tab-Flow for re-scan`);
+                return {
+                  ok: false, stateChanged: true, resumeTabFlow: true,
+                  goal, sessionId, transcript: _loopTranscript,
+                  result: `State changed during turn-loop — returning to Tab-Flow`,
+                  error: 'state_changed_resume_tabflow',
+                  routingDecision: 'turn_loop_state_changed',
+                };
+              }
+            }
           }
         } catch (_) {}
       }

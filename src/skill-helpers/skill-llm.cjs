@@ -272,6 +272,11 @@ async function _askWithMessagesOnce(messages, opts = {}) {
         taskType: opts.taskType || 'skill_step',
         // Backend reads options.maxTokens (camelCase), NOT max_tokens (snake_case)
         ...(opts.maxTokens != null ? { maxTokens: opts.maxTokens } : {}),
+        // Structured output: pass responseFormat (camelCase) through to the
+        // backend router, which forwards it to OpenAI-compatible providers as
+        // OpenAI `response_format`. Providers that don't support it gracefully
+        // degrade (backend retries without it on 400).
+        ...(opts.responseFormat ? { responseFormat: opts.responseFormat } : {}),
       },
       context: {
         recentContext: [],

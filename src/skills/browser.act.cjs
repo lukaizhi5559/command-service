@@ -55,6 +55,7 @@ const { spawn, exec } = require('child_process');
 const logger = require('../logger.cjs');
 const { askWithMessages } = require('../skill-helpers/skill-llm.cjs');
 const { AUTH_CHECK_PROMPT, detectAuthViaLLM } = require('../skill-helpers/auth-check.cjs');
+const { parseLlmJson } = require('../skill-helpers/parseLlmJson.cjs');
 const shellRun = require('./shell.run.cjs');
 const { buildAdBlockScript } = require('../utils/ad-block-init.js');
 const { BASELINE_DOMAINS } = require('../utils/ad-block-updater.cjs');
@@ -5781,10 +5782,8 @@ Example: [{"title": "10 Min Workout", "href": "https://www.youtube.com/watch?v=A
 If no videos found, return []. Do not explain, only output the JSON array.`;
 
           const llmResult = await ask(llmExtractionPrompt, { maxTokens: 2000, temperature: 0.1 });
-          const jsonMatch = llmResult.match(/\[[\s\S]*\]/);
-          if (jsonMatch) {
-            const parsedLinks = JSON.parse(jsonMatch[0]);
-            if (Array.isArray(parsedLinks) && parsedLinks.length > 0) {
+          const parsedLinks = parseLlmJson(llmResult, logger, 'browser.act.llmExtraction');
+          if (Array.isArray(parsedLinks) && parsedLinks.length > 0) {
               const llmLinks = parsedLinks.map(v => ({
                 text: v.title || 'Video',
                 href: v.href,
@@ -5804,7 +5803,6 @@ If no videos found, return []. Do not explain, only output the JSON array.`;
                 });
               }
             }
-          }
         } catch (e) {
           logger.warn(`[browser.act] Layer 5 LLM extraction failed: ${e.message}`);
         }
@@ -6968,11 +6966,7 @@ If no videos found, return []. Do not explain, only output the JSON array.`;
               { role: 'system', content: AUTH_FORM_PROMPT },
               { role: 'user',   content: `${_credHint}\n${_histHint}\nVisible inputs: ${_visHint}\n\nPAGE SNAPSHOT:\n${_snapText.slice(0, 6000)}` },
             ], { temperature: 0.1, maxTokens: 128, responseTimeoutMs: 15000 });
-            let _s = _llmRaw.trim().replace(/^```(?:json)?\n?/i, '').replace(/\n?```\s*$/i, '').trim();
-            try { _dec = JSON.parse(_s); } catch (_) {
-              const _m = _s.match(/\{[\s\S]*?\}/);
-              if (_m) try { _dec = JSON.parse(_m[0]); } catch (_) {}
-            }
+            _dec = parseLlmJson(_llmRaw, logger, 'waitForAuth.authLoop');
           } catch (_le) {
             logger.warn(`[browser.act] waitForAuth: auth-loop step ${_step + 1} LLM error — ${_le.message}`);
             break;

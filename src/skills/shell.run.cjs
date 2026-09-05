@@ -38,44 +38,14 @@ const os = require('os');
 const fs = require('fs');
 const logger = require('../logger.cjs');
 const skillLlm = require('../skill-helpers/skill-llm.cjs');
+const { parseLlmJson } = require('../skill-helpers/parseLlmJson.cjs');
 
 // Robust JSON parser for LLM output — handles truncated strings, dangling
-// commas, missing values, and markdown fences. Mirrors the parseLlmJson
-// utility used in stategraph-module. jsonrepair is resolvable from the
-// workspace root; the require is wrapped in try/catch so the skill still
-// works if the optional dep is absent.
-let _jsonrepair;
-try { _jsonrepair = require('jsonrepair').jsonrepair; } catch (_) { /* optional dep */ }
-
+// commas, missing values, markdown fences, and unbalanced braces.
+// Delegates to the shared parseLlmJson utility (same one used by
+// stategraph-module and all other command-service skills).
 function _parseGoalJson(raw) {
-  if (!raw) return null;
-  // Strip markdown code fences
-  let s = raw.replace(/^```[a-z]*\n?|```$/g, '').trim();
-  // Extract the outermost balanced JSON object (tracks string state so
-  // braces inside strings don't confuse the depth counter)
-  const start = s.indexOf('{');
-  if (start === -1) return null;
-  let depth = 0, inStr = false, escaped = false, end = -1;
-  for (let i = start; i < s.length; i++) {
-    const c = s[i];
-    if (inStr) {
-      if (escaped) { escaped = false; continue; }
-      if (c === '\\') { escaped = true; continue; }
-      if (c === '"') inStr = false;
-      continue;
-    }
-    if (c === '"') inStr = true;
-    else if (c === '{') depth++;
-    else if (c === '}') { depth--; if (depth === 0) { end = i; break; } }
-  }
-  const jsonStr = end !== -1 ? s.slice(start, end + 1) : s.slice(start);
-  // Attempt 1: direct parse
-  try { const parsed = JSON.parse(jsonStr); if (parsed && typeof parsed === 'object') return parsed; } catch (_) {}
-  // Attempt 2: jsonrepair (handles truncated output, smart quotes, missing values)
-  if (_jsonrepair) {
-    try { const parsed = JSON.parse(_jsonrepair(jsonStr)); if (parsed && typeof parsed === 'object') return parsed; } catch (_) {}
-  }
-  return null;
+  return parseLlmJson(raw, logger, 'shell.run');
 }
 
 // ---------------------------------------------------------------------------
