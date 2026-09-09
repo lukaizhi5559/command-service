@@ -300,12 +300,14 @@ Rules:
 // Tier 3: Strategy execution with fallback to Tab-Map
 
 // Decision call: returns 0, 1, 2, or 3 based on page state and goal.
-async function _decisionCall(goal, actionHistory, currentUrl, focusedElement, overlayActive, pageCategory, agentContext) {
+async function _decisionCall(goal, actionHistory, currentUrl, focusedElement, overlayActive, pageCategory, agentContext, stepType = null) {
   const { askWithMessages } = require('../skill-helpers/skill-llm.cjs');
 
   const _contextBlock = agentContext
     ? `\n\nAgent context (service descriptor / playbook — use these labels if relevant):\n${String(agentContext).slice(0, 1000)}`
     : '';
+
+  const _stepTypeBlock = stepType ? _buildStepTypePromptBlock(stepType) : '';
 
   const _focusedStr = focusedElement
     ? _buildFocusedStr(focusedElement)
@@ -317,7 +319,7 @@ async function _decisionCall(goal, actionHistory, currentUrl, focusedElement, ov
     : false;
 
   const systemPrompt = `You decide the next navigation strategy for a browser automation task.
-Look at the goal, what's been done, and the current page state.
+Look at the goal, what's been done, and the current page state.${_stepTypeBlock}
 Return ONLY a single number — nothing else:
   0 = DONE (goal achieved)
   1 = Just-type (focused element is the right field, just type into it)
@@ -1819,6 +1821,12 @@ Number (0-2)?`;
     // Tolerant parser: the LLM may return prose like "The answer is 1" instead of
     // just "1". Extract the first standalone digit 0/1/2 from the response.
     const _cleanRaw = (raw || '').toLowerCase().trim();
+    // Empty/null response = LLM provider failure (transient) — return wait/retry
+    // so the caller retries instead of treating it as a hard goal failure.
+    if (!_cleanRaw) {
+      logger.warn(`[browser.agent] _ocrVerifyGoal: empty LLM response — returning wait/retry (transient provider failure)`);
+      return { num: 2, reason: 'llm-empty-response' };
+    }
     const _numMatch = _cleanRaw.match(/\b([012])\b/);
     const num = _numMatch ? parseInt(_numMatch[1], 10) : NaN;
     if (num >= 0 && num <= 2) {
@@ -1856,6 +1864,16 @@ Number (0-2)?`;
     logger.info(`[browser.agent] _ocrVerifyGoal: invalid "${raw}" → defaulting to 0`);
     return { num: 0, reason: 'invalid-llm-response' };
   } catch (e) {
+    // Distinguish LLM provider failures (transient) from genuine goal failures.
+    // When the LLM provider itself fails (e.g., "All LLM providers failed"),
+    // return num=2 (wait/retry) so the caller can retry instead of treating
+    // a transient outage as a hard goal failure.
+    const _errMsg = String(e?.message || e || '');
+    const _isProviderFailure = /all\s+llm\s+providers\s+failed|provider\s+failed|timeout|ECONNRESET|ETIMEDOUT|socket\s+hang\s+up/i.test(_errMsg);
+    if (_isProviderFailure) {
+      logger.warn(`[browser.agent] _ocrVerifyGoal: LLM provider failure (transient) — returning wait/retry: ${e.message}`);
+      return { num: 2, reason: 'llm-provider-failure' };
+    }
     logger.warn(`[browser.agent] _ocrVerifyGoal failed: ${e.message}`);
     return { num: 0, reason: 'llm-error' };
   }
@@ -1941,6 +1959,126 @@ async function _verifyGoalViaDomState(goal, sessionId, actionHistory, tabMapResu
   }
 
   return { verified: false, reason: 'dialog-still-open-after-submit' };
+}
+
+// ── Deterministic URL-arrival verification (no LLM) ──────────────────────────
+// For URL-first search/destination steps: verify the browser landed on the
+// intended URL and the page has meaningful content. Replaces the LLM-based
+// _verifyGoalWithOcr for the common case where the URL itself proves success.
+// Works across all sites — no URL-pattern regex, no site-specific knowledge.
+async function _verifyUrlFirstArrival(sessionId, expectedUrl) {
+  try {
+    const _checkRes = await callBrowserAct({
+      action: 'evaluate', sessionId, timeoutMs: 5000,
+      text: `(() => {
+        const interactive = document.querySelectorAll('input:not([type="hidden"]), textarea, button, [role="button"], [contenteditable], [contenteditable=""], [role="textbox"], a[href]');
+        let visibleInteractive = 0;
+        for (const el of interactive) {
+          const r = el.getBoundingClientRect();
+          if (r.width > 0 && r.height > 0 && el.offsetParent !== null) visibleInteractive++;
+        }
+        return JSON.stringify({
+          url: window.location.href,
+          bodyLen: (document.body && document.body.innerText ? document.body.innerText.length : 0),
+          interactive: visibleInteractive,
+          readyState: document.readyState,
+        });
+      })()`
+    }, 8000).catch(() => ({ ok: false }));
+    if (!_checkRes?.ok) return { verified: false, reason: 'evaluate-failed' };
+
+    let _data;
+    try {
+      _data = typeof _checkRes.result === 'object' && _checkRes.result !== null
+        ? _checkRes.result
+        : JSON.parse(String(_checkRes.result || '{}').replace(/^"|"$/g, '').replace(/\\"/g, '"'));
+    } catch (_) { return { verified: false, reason: 'parse-failed' }; }
+
+    const _curUrl = _data.url || '';
+    const _bodyLen = _data.bodyLen || 0;
+    const _interactive = _data.interactive || 0;
+
+    // URL-arrival check: hostname + pathname match (ignores tracking params)
+    let _urlMatches = false;
+    try {
+      const _cur = new URL(_curUrl);
+      const _exp = new URL(expectedUrl);
+      _urlMatches = _cur.hostname === _exp.hostname && _cur.pathname === _exp.pathname;
+    } catch (_) { _urlMatches = _curUrl.replace(/\/+$/, '') === String(expectedUrl || '').replace(/\/+$/, ''); }
+
+    // Error/404 heuristic: very short body + few interactive elements
+    // (same thresholds as the error-page guard at line ~9457)
+    const _looksLikeError = _bodyLen < 300 && _interactive < 3;
+
+    if (_urlMatches && _bodyLen > 200 && !_looksLikeError) {
+      return { verified: true, reason: 'url-arrival-confirmed', url: _curUrl, bodyLen: _bodyLen };
+    }
+    if (_urlMatches && _looksLikeError) {
+      return { verified: false, reason: 'error-page-detected', url: _curUrl, bodyLen: _bodyLen, interactive: _interactive };
+    }
+    return { verified: false, reason: 'url-mismatch', url: _curUrl, expectedUrl, bodyLen: _bodyLen };
+  } catch (e) {
+    return { verified: false, reason: 'exception: ' + e.message };
+  }
+}
+
+// ── Deterministic add-to-cart verification ────────────────────────────────
+// Checks for non-LLM signals that an "Add to Cart" action succeeded:
+//   1. Cart count badge increased (e.g., #nav-cart-count, Cart (1))
+//   2. Page text contains "Added to Cart", "1 item added", or similar
+//   3. A confirmation modal/popover is visible
+// Returns: { verified: bool, reason: string }
+async function _verifyAddToCart(sessionId, actionHistory) {
+  try {
+    const _lastActions = (actionHistory || []).slice(-5).join(' ');
+    const _hasAddToCartClick = /\b(?:add\s+to\s+(?:cart|bag|basket)|buy\s+now|add\s+to\s+cart)\b/i.test(_lastActions);
+    if (!_hasAddToCartClick) return { verified: false, reason: 'no-add-to-cart-click' };
+
+    // Wait briefly for the confirmation to render
+    await new Promise(r => setTimeout(r, 1500));
+
+    // Check DOM for cart count + confirmation text
+    const _result = await browserAct({
+      action: 'evaluate',
+      sessionId,
+      text: `(() => {
+        // 1. Cart count badge (Amazon: #nav-cart-count, generic: [aria-label*="cart" i])
+        const _cartCountEl = document.querySelector('#nav-cart-count, #nav-cart, [aria-label*="cart" i], [aria-label*="Cart" i]');
+        let _cartCount = null;
+        if (_cartCountEl) {
+          const _text = (_cartCountEl.textContent || _cartCountEl.getAttribute('aria-label') || '').trim();
+          const _m = _text.match(/\\d+/);
+          if (_m) _cartCount = parseInt(_m[0], 10);
+        }
+        // 2. Confirmation text
+        const _bodyText = (document.body?.innerText || '').slice(0, 5000);
+        const _hasConfirm = /\\b(?:added\\s+to\\s+(?:cart|bag|basket)|\\d+\\s+item\\s+added|added\\s+to\\s+your\\s+cart|in\\s+your\\s+cart)\\b/i.test(_bodyText);
+        // 3. Confirmation modal/popover
+        const _hasConfirmModal = !!document.querySelector('[role="dialog"], [role="alertdialog"], .a-modal, [data-testid*="added" i], #attach-popover, #attach-accessory-options');
+        // 4. "Added to Cart" button state (Amazon changes the button text)
+        const _addedButton = !!Array.from(document.querySelectorAll('button, input[type="submit"], [role="button"]')).find(b => {
+          const t = (b.textContent || b.getAttribute('value') || '').trim().toLowerCase();
+          return t === 'added to cart' || t === 'added to bag' || t === 'added to basket' || t === 'in cart';
+        });
+        return { cartCount: _cartCount, hasConfirmText: _hasConfirm, hasConfirmModal: _hasConfirmModal, addedButton: _addedButton };
+      })()`,
+    }).catch(() => null);
+
+    const _data = _result?.result || _result?.stdout;
+    if (_data) {
+      let parsed;
+      try { parsed = typeof _data === 'string' ? JSON.parse(_data) : _data; } catch (_) { parsed = null; }
+      if (parsed) {
+        if (parsed.addedButton) return { verified: true, reason: 'add-to-cart-button-state' };
+        if (parsed.hasConfirmText) return { verified: true, reason: 'add-to-cart-confirmation-text' };
+        if (parsed.hasConfirmModal) return { verified: true, reason: 'add-to-cart-confirmation-modal' };
+        if (parsed.cartCount && parsed.cartCount > 0) return { verified: true, reason: `cart-count=${parsed.cartCount}` };
+      }
+    }
+    return { verified: false, reason: 'no-add-to-cart-signals' };
+  } catch (e) {
+    return { verified: false, reason: 'exception: ' + e.message };
+  }
 }
 
 async function _verifyGoalWithOcr(goal, sessionId, actionHistory) {
@@ -3068,12 +3206,14 @@ function _regexExtractSteps(raw, goal, tabMap) {
 // Caller executes steps in order; on page change, re-extract for new page.
 // If null or <=1 step, caller falls back to per-step _llmNextAction (browse-and-report).
 // 3-layer fallback: (1) planning model, (2) complex model with sharper prompt, (3) regex.
-async function _extractSteps(goal, currentUrl, tabMap, pageCategory, agentContext, overlayActive = false, actionHistory = [], flowStepHint = '') {
+async function _extractSteps(goal, currentUrl, tabMap, pageCategory, agentContext, overlayActive = false, actionHistory = [], flowStepHint = '', stepType = null) {
   const { askWithMessages } = require('../skill-helpers/skill-llm.cjs');
 
   const _contextBlock = agentContext
     ? `\n\nAgent context (service descriptor / playbook — use these labels if relevant):\n${String(agentContext).slice(0, 1200)}`
     : '';
+
+  const _stepTypeBlock = stepType ? _buildStepTypePromptBlock(stepType) : '';
 
   // Flow step hint: when executing a pre-computed Tab-Flow, tell the LLM what
   // the current step expects so it generates steps for THAT action, not for the
@@ -3113,7 +3253,7 @@ async function _extractSteps(goal, currentUrl, tabMap, pageCategory, agentContex
 
   const systemPrompt = `You are planning the steps to achieve a goal on a web page.
 Look at the goal, the current URL, and the available elements.
-Extract the ordered steps needed to achieve the goal ON THIS PAGE ONLY.
+Extract the ordered steps needed to achieve the goal ON THIS PAGE ONLY.${_stepTypeBlock}
 
 Output ONLY a JSON array. No reasoning, no prose, no markdown, no commentary.
 The array MUST start with [ and end with ].
@@ -3153,6 +3293,8 @@ Rules:
 - A single navigation step (e.g., click "Credentials" in sidebar) is a VALID plan when the page doesn't have the final target. The system handles multi-page workflows by re-extracting steps on each new page.
 - Do NOT return [{ "action": "done" }] just because the final target isn't visible. Only return done if NO element on this page could plausibly move toward the goal.
 - Example: Goal is "create API key" but page shows a console home/404 with sidebar links → plan [{ "action": "click", "target": "Credentials" }] to navigate to the credentials page.
+- COMPOUND ON-PAGE-ACTION RULE: If the goal has multiple action clauses (e.g., "click X and then click Y", "open its product page, and click the 'Add to Cart' button"), generate only the steps that can be executed on the CURRENT page. The runner will re-extract steps after any navigation. Do NOT return [{ "action": "done" }] just because the second action's target isn't visible yet — plan the first action and let the runner handle the rest.
+- COMMERCE RULE: If the goal mentions "add to cart", "add to bag", or "add to basket", and an element with that exact label is visible on the current page (e.g., an "Add to Cart" button on a search-result card), click THAT element directly — do not navigate to the product page first.
 - If the page has [FILLABLE] form fields, fill ALL of them before clicking any submit button (Send, Submit, Post, Save, etc.).
 - Do NOT include steps for actions that require a different page (e.g., don't plan clicking a search result if the search hasn't been submitted yet — that's a future page).
 - If the goal is already achieved on this page, return [{ "action": "done" }].
@@ -3177,6 +3319,14 @@ ADD-TO-CART PRODUCT PAGE RULE:
 - Prefer the LARGEST and HIGHEST (smallest y) visible "Add to Cart" button.
 - Never click an "Add to Cart" button inside an ad banner or sponsored product card for the primary action — those redirect to ad/tracking domains or other products.
 - If an "Add to Cart" click would navigate away from the current product page, it is the wrong button; the real one adds to cart in place.
+
+COMMERCE BUTTON DISAMBIGUATION RULE (critical — prevents wrong-button clicks):
+- "Add to Cart" / "Add to Bag" / "Add to Basket" → adds to the shopping cart. Target ONLY these for add-to-cart goals.
+- "Add to List" / "Add to Wishlist" / "Add to Registry" / "Save for Later" / "Add to Save" → does NOT add to cart. NEVER target these when the goal or flow step says "Add to Cart".
+- When the goal/flow step says "Add to Cart", scan the element list for elements whose label contains "cart", "bag", or "basket" (case-insensitive). If found, target the one with the largest area (w*h) and smallest y.
+- If the element list has multiple "Add to cart" buttons (search-results page), target the FIRST one (smallest id) unless the goal specifies a different result.
+- Reject any plan step whose target contains "List", "Wishlist", "Registry", or "Save for Later" when the goal/flow step is about adding to cart.
+- If NO element with "cart"/"bag"/"basket" in its label is visible, do NOT substitute a List/Wishlist button. Instead, scroll or navigate to find the real Add to Cart button.
 
 SEARCH SUBMISSION RULE:
 - A search is only complete when the page shows actual result listings, a result count, or matching items.
@@ -3481,12 +3631,14 @@ Extract the ordered steps:`;
 
 // Tab-Map strategy: LLM decides one action per step based on available elements.
 // Updated with [FILLABLE]/[CLICKABLE] markers, filled field tracking, and label fixes.
-async function _llmNextAction(goal, currentUrl, tabMap, actionHistory, pageCategory, agentContext, lastVerifyFailed, consumedRefs, filledFields, extractedPageText) {
+async function _llmNextAction(goal, currentUrl, tabMap, actionHistory, pageCategory, agentContext, lastVerifyFailed, consumedRefs, filledFields, extractedPageText, stepType = null) {
   const { askWithMessages } = require('../skill-helpers/skill-llm.cjs');
 
   const _contextBlock = agentContext
     ? `\n\nAgent context (service descriptor / playbook — use these labels if relevant):\n${String(agentContext).slice(0, 1500)}`
     : '';
+
+  const _stepTypeBlock = stepType ? _buildStepTypePromptBlock(stepType) : '';
 
   const _pageTextBlock = extractedPageText && extractedPageText.trim().length > 0
     ? `\n\nPage text captured (from previous Get page text / Wait for stable text):\n${extractedPageText.slice(0, 3000)}`
@@ -3548,7 +3700,7 @@ async function _llmNextAction(goal, currentUrl, tabMap, actionHistory, pageCateg
 
   const systemPrompt = `You are navigating a web page to achieve a goal.
 Look at the goal, the current URL, the actions you've already taken, the fields already filled, and the available elements.
-Decide the SINGLE next action that gets closest to achieving the goal.
+Decide the SINGLE next action that gets closest to achieving the goal.${_stepTypeBlock}
 
 Output ONLY one action, one line. No preamble, no explanation, no numbering, no markdown.
 
@@ -3600,6 +3752,7 @@ SOCIAL_FEED COMPOSE RULE (critical — one step at a time):
 - BLOCK-CREATION RULE: When creating lists/todos/headings in block-based editors (Notion, Google Docs), do NOT type raw markdown. Create each block as a separate step: (1) Type the block-creation shortcut (e.g. "/todo" or "[]" + Space — check Agent context for the app's specific shortcuts), (2) Press Enter if a slash menu appeared, (3) Type the item text, (4) Press Enter to create the next block. Repeat for each item.
 - SEARCH-THEN-CLICK RULE: When clicking search results, skip ads/sponsored results — click the first ORGANIC result.
 - DUPLICATE-LABEL RULE: When multiple elements share the same text/label (e.g., multiple "Add to Cart" buttons), prefer the one that is largest (greatest w*h), highest on the page (smallest y), and in the main content column — not in a sidebar or comparison table. Use the @x,y,w,h coordinates shown after each element to decide.
+- COMMERCE BUTTON DISAMBIGUATION RULE (critical): "Add to Cart"/"Add to Bag"/"Add to Basket" adds to the shopping cart. "Add to List"/"Add to Wishlist"/"Add to Registry"/"Save for Later" does NOT add to cart. When the goal or flow step says "Add to Cart", NEVER click "Add to List", "Add to Wishlist", "Add to Registry", or "Save for Later". Target only elements whose label contains "cart", "bag", or "basket". If none is visible, scroll or navigate to find the real Add to Cart button — do not substitute a List/Wishlist button.
 - CONTENT EXTRACTION RULE: For any goal that involves searching, reading, counting, listing, or checking content (e.g., "search for unread emails", "count messages from X", "list items", "check how many"), after pressing Enter or navigating to trigger a search, use "Wait for stable text" then "Get page text" to capture the results before outputting DONE. Without Get page text, the task result will be empty.
 - PAGE TEXT CAPTURED RULE: If "Page text captured" is shown below and it contains the information needed to answer the goal (e.g., email subjects, counts, search results), output DONE immediately. Do NOT call "Get page text" again — the text is already captured.`;
 
@@ -6838,14 +6991,50 @@ const SITE_SEARCH_URL_TEMPLATES = {
   'wikipedia.org':     'https://en.wikipedia.org/wiki/Special:Search?search={query}',
 };
 
+// ── stepType prompt block builder ──────────────────────────────────────────
+// Builds a context block injected into _extractSteps and _llmNextAction system
+// prompts so the LLM knows what kind of interaction each step requires.
+// This is the key awareness signal: the planner already classified the step,
+// and this propagates that classification to the LLM that decides actions.
+function _buildStepTypePromptBlock(stepType) {
+  switch (stepType) {
+    case 'on-page-action':
+      return `\nSTEP TYPE: on-page-action. The browser is ALREADY on the correct page. Do NOT generate "navigate" steps. Click/type/select elements visible on the current page. Phrases like "search results page" or "product page" in the goal describe the CURRENT page — they are NOT instructions to search or navigate.`;
+    case 'navigate':
+      return `\nSTEP TYPE: navigate. This step requires navigating to a URL or performing a search. If the current page is not the target, generate a "navigate" step or use the search field first.`;
+    case 'verify':
+      return `\nSTEP TYPE: verify. Check if the goal was achieved by examining the current page state. Do NOT click or type anything. Return [{ "action": "done" }] if verified, or [{ "action": "getPageText" }] to read the page first.`;
+    case 'extract':
+      return `\nSTEP TYPE: extract. Read content from the current page. Use "getPageText" or "run-code" to extract the requested information. Do NOT navigate or click interactive elements unless needed to reveal the content.`;
+    default:
+      return '';
+  }
+}
+
 // Extract the quoted search term from a "search ... 'X'" task. The quote pattern
 // is boundary-aware: an internal apostrophe followed by a word char (children's)
 // is part of the term, not a quote terminator.
+//
+// SAFETY: The search keyword must appear near the START of the task (first 60 chars).
+// This prevents contextual phrases like "search results page" in the middle of a
+// click/action task from triggering search-term extraction.
+// Additionally, common UI button labels are rejected as search terms — "Add to Cart"
+// is a button label, not a search query.
+const _UI_LABEL_BLOCKLIST = /^(add\s+to\s+(?:cart|bag|basket|list|wishlist)|buy\s+now|checkout|sign\s+(?:in|up|out)|log\s+(?:in|out)|submit|send|save|delete|remove|cancel|close|confirm|continue|next|back|edit|share|follow|like|subscribe|unsubscribe|post|publish|reply|comment)$/i;
 function _extractQuotedSearchTerm(task) {
   const t = String(task || '');
-  if (!/\b(?:search|look\s*up|find|shop|browse)\b/i.test(t)) return null;
-  const m = t.match(/\b(?:search|look\s*up|find|shop\s+for|browse\s+for)\b[^'"]*?["']((?:[^'"]+|'(?=\w))+)["']/i);
-  return m ? m[1].trim() : null;
+  // Anchor: search keyword must be in the first 60 chars of the task
+  const _head = t.slice(0, 60);
+  if (!/\b(?:search\s+for|search\s+on|look\s*up|shop\s+for|browse\s+for)\b/i.test(_head)) return null;
+  const m = t.match(/\b(?:search\s+for|search\s+on|look\s*up|find|shop\s+for|browse\s+for)\b[^'"]*?["']((?:[^'"]+|'(?=\w))+)["']/i);
+  if (!m) return null;
+  const term = m[1].trim();
+  // Reject UI button labels — they are not search queries
+  if (_UI_LABEL_BLOCKLIST.test(term)) {
+    logger.info(`[browser.agent] _extractQuotedSearchTerm: rejecting UI label as search term: "${term}"`);
+    return null;
+  }
+  return term;
 }
 
 /**
@@ -6858,6 +7047,14 @@ async function _buildGenericSearchUrl(serviceKey, baseHost, task) {
   try {
     const q = _extractQuotedSearchTerm(task);
     if (!q) return null;
+    // Guard: reject UI button labels as search queries (defense-in-depth —
+    // _extractQuotedSearchTerm already filters these, but this ensures any
+    // caller that bypasses the extractor still can't build a search URL
+    // for a button label like "Add to Cart").
+    if (_UI_LABEL_BLOCKLIST.test(q)) {
+      logger.info(`[browser.agent] _buildGenericSearchUrl: rejecting UI label query: "${q}"`);
+      return null;
+    }
     const host = String(baseHost || '').replace(/^www\./, '').toLowerCase();
     const tmpl = SITE_SEARCH_URL_TEMPLATES[host] ||
       (Object.entries(SITE_SEARCH_URL_TEMPLATES).find(([d]) => host.endsWith('.' + d)) || [])[1];
@@ -7560,7 +7757,7 @@ function _recordAgentUsage(agentId) {
   } catch (_) { /* non-fatal — usage tracking is best-effort */ }
 }
 
-async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAuth, skipAuth, manualLogin = false, preflightProbe = false, forceAuthProbe = false, requireCookieConfirmation = false, _progressCallbackUrl, _stepIndex, _loginWallRetried = false, _emitThinking = null, _authOnly = false, planExtend = false, sessionId: _planExtendSessionId = null, _abortSignal = null }) {
+async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAuth, skipAuth, manualLogin = false, preflightProbe = false, forceAuthProbe = false, requireCookieConfirmation = false, _progressCallbackUrl, _stepIndex, _stepType = null, _loginWallRetried = false, _emitThinking = null, _authOnly = false, planExtend = false, sessionId: _planExtendSessionId = null, _abortSignal = null }) {
   // Derive agentId from url hostname when caller omits it (LLM sometimes emits only url)
   let agentId = _agentIdArg;
   if (!agentId && url) {
@@ -7946,10 +8143,14 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
   // skip destination resolution AND deep-link resolution. The action lives on the
   // current page — any URL correction or deep-link would send the agent away from
   // the target (e.g., "add to cart" must not be corrected to the cart page URL).
-  const _actionIntent = await classifyTaskIntent(task, _svcKey);
-  const _onPageAction = _isOnPageAction(task, _actionIntent);
+  //
+  // Primary signal: _stepType from the planner (trusted — the planner LLM already
+  // classified the step's interaction mode). Fallback: classifyTaskIntent + _isOnPageAction
+  // (regex/LLM-based — used when stepType is not available, e.g. old plans or manual tasks).
+  const _actionIntent = _stepType === 'on-page-action' ? INTENTS.COMMERCE : await classifyTaskIntent(task, _svcKey);
+  const _onPageAction = _stepType === 'on-page-action' || _isOnPageAction(task, _actionIntent);
   if (_onPageAction) {
-    logger.info(`[browser.agent] run: on-page action (${_actionIntent}) — skipping destination resolution and deep-link resolution for ${agentId}`);
+    logger.info(`[browser.agent] run: on-page action (${_stepType ? `stepType=${_stepType}` : `intent=${_actionIntent}`}) — skipping destination resolution and deep-link resolution for ${agentId}`);
     // Delete any stale learned correction for this service/intent so future
     // on-page action runs aren't poisoned by an old navigation destination (e.g.
     // amazon:commerce → /gp/cart/view.html from a previous bad run).
@@ -11188,9 +11389,8 @@ When extracting page content with run-code, prioritize these selectors over gene
       try {
         const { _isReadCountListGoal } = require('./instruction.runner.cjs');
         const _isReadOnlyGoal = _isReadCountListGoal(task);
-        const _urlHasSearchCriteria = /(#search|\?q=|&q=|#query=|&filter=|#filter|is:unread|is:starred|from:|to:|subject:|label:|in:|has:)/i.test(startUrl || '');
-        if (_isReadOnlyGoal && _urlHasSearchCriteria && _urlFirstNavigationSelected) {
-          logger.info(`[browser.agent] tab-map: URL-first short-circuit — read-only goal + URL has search criteria, skipping iterative navigation`);
+        if (_isReadOnlyGoal && _urlFirstNavigationSelected) {
+          logger.info(`[browser.agent] tab-map: URL-first short-circuit — read-only goal + URL-first navigation, skipping iterative navigation`);
           // Wait for page to stabilize (Gmail SPA needs time after #search navigation)
           const _wstRes = await callBrowserAct({ action: 'waitForStableText', sessionId, headed: true, timeoutMs: 10000 }, 12000).catch(e => ({ ok: false, error: e.message }));
           logger.info(`[browser.agent] tab-map: short-circuit waitForStableText ok=${_wstRes?.ok} (${_wstRes?.result?.length || 0} chars)`);
@@ -11214,12 +11414,15 @@ When extracting page content with run-code, prioritize these selectors over gene
             sessionId,
           });
           const _shortCircuitResult = `Goal achieved via URL-first short-circuit. Page content: ${_pageText.slice(0, 10000)}`;
-          // ── OCR goal verification before returning success ────────────────
-          const _scOcrVerify = await _verifyGoalWithOcr(task, sessionId, []);
-          if (!_scOcrVerify.verified) {
-            logger.warn(`[browser.agent] tab-map: URL-first short-circuit OCR verification failed: ${_scOcrVerify.reason} (OCR: "${_scOcrVerify.ocrText || ''}") — proceeding to iterative navigation instead`);
+          // ── Deterministic URL-arrival verification (no LLM) ───────────────
+          // For URL-first search/destination steps, verify the browser landed on
+          // the intended URL and the page has content. This replaces the LLM-based
+          // OCR verification so the step succeeds even when LLM providers are down.
+          const _scVerify = await _verifyUrlFirstArrival(sessionId, startUrl);
+          if (!_scVerify.verified) {
+            logger.warn(`[browser.agent] tab-map: URL-first short-circuit deterministic check failed: ${_scVerify.reason} — proceeding to iterative navigation`);
           } else {
-            logger.info(`[browser.agent] tab-map: URL-first short-circuit OCR verification passed: ${_scOcrVerify.reason}`);
+            logger.info(`[browser.agent] tab-map: URL-first short-circuit verified via ${_scVerify.reason} (bodyLen=${_scVerify.bodyLen})`);
             return {
               ok: true, agentId, task,
               result: _shortCircuitResult,
@@ -11255,6 +11458,7 @@ When extracting page content with run-code, prioritize these selectors over gene
       logger.info(`[browser.agent] tab-map: timeout=${_flowTimeoutMs}ms${_cachedFlow ? ` (${_cachedFlow.length}-step flow)` : ''}`);
       const _tabMapResult = await runIterativeNavigation({
         goal: task,
+        stepType: _stepType,
         sessionId,
         startUrl: _urlFirstNavigationSelected ? startUrl : null,
         urlFirstNav: _urlFirstNavigationSelected,
@@ -11296,22 +11500,67 @@ When extracting page content with run-code, prioritize these selectors over gene
         }
         // else: no-submit-click or overlay-check-failed → fall through to OCR verification
 
+        // ── Deterministic add-to-cart verification (before OCR) ──────────
+        // For commerce tasks (add to cart/bag/basket), check non-LLM signals:
+        // cart count, confirmation text, confirmation modal, button state.
+        // This avoids OCR LLM failures on add-to-cart confirmation pages.
+        if (/\b(?:add\s+to\s+(?:cart|bag|basket)|buy\s+now|add\s+to\s+cart)\b/i.test(task)) {
+          const _cartVerify = await _verifyAddToCart(sessionId, _tabMapResult.actionHistory || []);
+          if (_cartVerify.verified) {
+            logger.info(`[browser.agent] tab-map: add-to-cart verification passed: ${_cartVerify.reason} — skipping OCR`);
+            if (_tabMapResult?.tabFlow && _tabMapResult?.agentId) {
+              try { _saveTabFlowCache(_tabMapResult.agentId, task, _tabMapResult.tabFlow); } catch (_) {}
+            }
+            return { ok: true, agentId, task, result: _tabMapResult.output || `Item added to cart (${_cartVerify.reason})`, agentTurns: _tabMapResult.actionHistory?.length || 0 };
+          }
+          logger.info(`[browser.agent] tab-map: add-to-cart verification inconclusive (${_cartVerify.reason}) — falling back to OCR`);
+        }
+
         // ── OCR goal verification (fallback for non-modal goals) ──────────
         // Prevents false positives: if the page is a marketing page or the goal
         // was not actually achieved, return ok:false instead of hallucinating success.
         if (!_domVerify.verified) {
+        // ── Deterministic URL-arrival check for URL-first search steps ──────
+        // Before falling back to LLM-based OCR, try a deterministic check:
+        // if URL-first navigation was used and the goal is read-only, verify
+        // the browser landed on the intended URL with meaningful content.
+        // This succeeds without any LLM call, so the step passes even when
+        // LLM providers are down.
+        if (_urlFirstNavigationSelected) {
+          try {
+            const { _isReadCountListGoal: _isReadOnly } = require('./instruction.runner.cjs');
+            if (_isReadOnly(task)) {
+              const _detVerify = await _verifyUrlFirstArrival(sessionId, startUrl);
+              if (_detVerify.verified) {
+                logger.info(`[browser.agent] tab-map: post-navigation deterministic verification passed (${_detVerify.reason}, bodyLen=${_detVerify.bodyLen}) — skipping OCR`);
+                if (_tabMapResult?.tabFlow && _tabMapResult?.agentId) {
+                  try { _saveTabFlowCache(_tabMapResult.agentId, task, _tabMapResult.tabFlow); } catch (_) {}
+                }
+                return { ok: true, agentId, task, result: _tabMapResult.output || 'Completed via URL-first navigation (deterministic verify)', agentTurns: _tabMapResult.actionHistory?.length || 0 };
+              }
+              logger.info(`[browser.agent] tab-map: deterministic check failed (${_detVerify.reason}) — falling back to OCR`);
+            }
+          } catch (_) {}
+        }
         const _ocrVerify = await _verifyGoalWithOcr(task, sessionId, _tabMapResult.actionHistory || []);
         if (!_ocrVerify.verified) {
           if (_ocrVerify.wait) {
-            // Page loading — wait and retry once
-            logger.info(`[browser.agent] tab-map: OCR verification says loading — waiting 5s and retrying`);
-            await new Promise(r => setTimeout(r, 5000));
-            const _retryVerify = await _verifyGoalWithOcr(task, sessionId, _tabMapResult.actionHistory || []);
+            // Page loading or LLM provider transient failure — wait and retry up to 2×.
+            // This handles both slow page loads and transient LLM provider outages
+            // (e.g., "All LLM providers failed") that return num=2 (wait/retry).
+            let _ocrRetry = 0;
+            let _retryVerify = _ocrVerify;
+            while (_ocrRetry < 2 && !_retryVerify.verified && _retryVerify.wait) {
+              _ocrRetry++;
+              logger.info(`[browser.agent] tab-map: OCR verification says loading/provider-failure — waiting 5s and retrying (${_ocrRetry}/2)`);
+              await new Promise(r => setTimeout(r, 5000));
+              _retryVerify = await _verifyGoalWithOcr(task, sessionId, _tabMapResult.actionHistory || []);
+            }
             if (!_retryVerify.verified) {
-              logger.warn(`[browser.agent] tab-map: OCR goal verification failed (after retry): ${_retryVerify.reason} (OCR: "${_retryVerify.ocrText || ''}")`);
+              logger.warn(`[browser.agent] tab-map: OCR goal verification failed (after ${_ocrRetry} retries): ${_retryVerify.reason} (OCR: "${_retryVerify.ocrText || ''}")`);
               return { ok: false, agentId, task, error: `Goal not achieved — OCR verification failed: ${_retryVerify.reason}` };
             }
-            logger.info(`[browser.agent] tab-map: OCR goal verification passed on retry: ${_retryVerify.reason}`);
+            logger.info(`[browser.agent] tab-map: OCR goal verification passed on retry ${_ocrRetry}: ${_retryVerify.reason}`);
           } else {
             logger.warn(`[browser.agent] tab-map: OCR goal verification failed: ${_ocrVerify.reason} (OCR: "${_ocrVerify.ocrText || ''}")`);
             return { ok: false, agentId, task, error: `Goal not achieved — OCR verification failed: ${_ocrVerify.reason}` };
@@ -11382,6 +11631,7 @@ When extracting page content with run-code, prioritize these selectors over gene
     }
     const agentResult = await _withSessionMutex(sessionId, () => callSkill(_agentSkill, {
         goal: _effectiveTask,
+        stepType: _stepType,
         agentContext: _agentContext,
         appKnowledgeEntries: _appKnowledgeEntries,
         url: _playwrightUrl,
@@ -11415,6 +11665,7 @@ When extracting page content with run-code, prioritize these selectors over gene
       const { runIterativeNavigation } = require('./instruction.runner.cjs');
       const _tabMapResult2 = await runIterativeNavigation({
         goal: task,
+        stepType: _stepType,
         sessionId,
         startUrl: _urlFirstNavigationSelected ? startUrl : null,
         urlFirstNav: _urlFirstNavigationSelected,
@@ -11470,6 +11721,32 @@ When extracting page content with run-code, prioritize these selectors over gene
           recipeWasUsed: true, authConfirmedAt: Date.now(),
           _progressCallbackUrl, _stepIndex, _abortSignal: _abortSignal,
         }, 600000, _abortSignal));
+      }
+    }
+
+    // ── Post-re-entry page-state verification ──────────────────────────────────
+    // If we exited the re-entry loop without an ok result (because Tab-Flow
+    // couldn't find a next step or hit the re-entry cap), the turn-loop may
+    // have ALREADY completed the goal before handing off (e.g. an Add-to-Cart
+    // click whose cart-confirmation panel is the "state change" that triggered
+    // the handoff). Verify the CURRENT page state before falling through to
+    // ask_user so a completed task isn't surfaced as a failure.
+    if (agentResult?.resumeTabFlow && !agentResult?.ok) {
+      try {
+        const _reEntryActionHistory = (agentResult?.transcript || []);
+        const _reEntryDomVerify = await _verifyGoalViaDomState(task, sessionId, _reEntryActionHistory, agentResult);
+        if (_reEntryDomVerify?.verified) {
+          logger.info(`[browser.agent] post-re-entry: DOM-state verification passed (${_reEntryDomVerify.reason}) — returning success instead of ask_user`);
+          return { ok: true, agentId, task, result: agentResult?.result || 'Completed via turn-loop state change (post-re-entry verify)', agentTurns: _reEntryActionHistory.length };
+        }
+        const _reEntryOcrVerify = await _verifyGoalWithOcr(task, sessionId, _reEntryActionHistory);
+        if (_reEntryOcrVerify?.verified) {
+          logger.info(`[browser.agent] post-re-entry: OCR verification passed (${_reEntryOcrVerify.reason}) — returning success instead of ask_user`);
+          return { ok: true, agentId, task, result: agentResult?.result || 'Completed via turn-loop state change (post-re-entry OCR verify)', agentTurns: _reEntryActionHistory.length };
+        }
+        logger.info(`[browser.agent] post-re-entry: verification failed (DOM: ${_reEntryDomVerify?.reason || 'n/a'}, OCR: ${_reEntryOcrVerify?.reason || 'n/a'}) — falling through to ask_user`);
+      } catch (_reEntryVerifyErr) {
+        logger.warn(`[browser.agent] post-re-entry: verification error (non-fatal): ${_reEntryVerifyErr.message}`);
       }
     }
 

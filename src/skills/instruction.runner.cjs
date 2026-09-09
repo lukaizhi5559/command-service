@@ -1729,6 +1729,18 @@ function _formatTabMapEntryForLLM(entry) {
   if (entry.role && entry.role !== entry.tag) {
     parts.push(`role=${entry.role}`);
   }
+  if (entry.isSponsored) {
+    parts.push('[SPONSORED]');
+  }
+  // Add [FILLABLE]/[CLICKABLE] marker so the picker LLM has the same context
+  // as _extractSteps/_llmNextAction (which use these markers for type/click decisions).
+  const _isFillable = ['input', 'textarea'].includes(entry.tag) ||
+                      entry.role === 'combobox' || entry.role === 'textbox';
+  parts.push(_isFillable ? '[FILLABLE]' : '[CLICKABLE]');
+  // Add coordinates for disambiguation (largest/highest button selection).
+  if (entry.x !== undefined && entry.y !== undefined && entry.w !== undefined && entry.h !== undefined) {
+    parts.push(`@x=${Math.round(entry.x)},y=${Math.round(entry.y)},w=${Math.round(entry.w)},h=${Math.round(entry.h)}`);
+  }
   return parts.join(' ');
 }
 
@@ -5520,6 +5532,34 @@ async function _executeTabMapAction(sessionId, parsed, tabMap, overlayActive, pa
     const _postUrl = await _getUrl(sessionId);
     const pageChanged = _preUrl !== _postUrl;
 
+    // Post-click commerce verification: if this was an add-to-cart click,
+    // check that the cart was actually updated (not a List/Wishlist redirect).
+    if (clickOk && /\badd\s+to\s+(?:cart|bag|basket)\b/i.test(parsed.target || '')) {
+      await _sleep(800); // extra wait for cart confirmation toast/modal
+      let _commerceVerify = null;
+      try {
+        const _verifyRes = await browserAct({
+          action: 'evaluate', sessionId, headed: true, timeoutMs: 3000,
+          text: `(() => {
+            const body = (document.body && document.body.innerText) ? document.body.innerText.slice(0, 6000) : '';
+            const cartConfirm = /added to (?:your |the |my )?(?:cart|bag|basket)|item(?:s)? added|subtotal|go to (?:cart|bag|basket)|view (?:cart|bag|basket)|\\b\\d+\\s+items? in (?:your |the )?(?:cart|bag|basket)/i.test(body);
+            const listConfirm = /added to (?:your |the |my )?(?:list|wishlist|registry)|saved for later/i.test(body);
+            return JSON.stringify({ cartConfirm, listConfirm });
+          })()`,
+        });
+        _commerceVerify = _verifyRes?.result ? JSON.parse(typeof _verifyRes.result === 'string' ? _verifyRes.result : JSON.stringify(_verifyRes.result)) : null;
+      } catch (e) {
+        logger.warn(`[instruction.runner] Tab-Map: post-click commerce verify failed: ${e.message}`);
+      }
+      if (_commerceVerify) {
+        logger.info(`[instruction.runner] Tab-Map: post-click commerce verify — cartConfirm=${_commerceVerify.cartConfirm}, listConfirm=${_commerceVerify.listConfirm}`);
+        if (_commerceVerify.listConfirm && !_commerceVerify.cartConfirm) {
+          logger.warn(`[instruction.runner] Tab-Map: add-to-cart click hit a List/Wishlist button instead — failing step`);
+          return { ok: false, pageChanged: true, error: 'Clicked Add to List instead of Add to Cart', pickedRef: pickedEntry.ref };
+        }
+      }
+    }
+
     return { ok: clickOk, pageChanged, error: clickOk ? undefined : `Click failed for "${parsed.target}"`, pickedRef: pickedEntry.ref };
   }
 
@@ -5722,11 +5762,24 @@ async function _executeTabMapAction(sessionId, parsed, tabMap, overlayActive, pa
 // Match a step's target text to an element in the tab-map.
 // Tries exact label match, then contains match, then LLM fallback.
 // Returns the element object or null.
-async function _matchElementToStep(sessionId, step, tabMap) {
+async function _matchElementToStep(sessionId, step, tabMap, goalContext = '') {
   const target = (step.target || '').toLowerCase().trim();
   if (!target) return null;
 
   const _isTypeAction = step.action === 'type';
+
+  // Commerce anti-match: if the goal/flow step says "Add to Cart" but the
+  // step target contains "List"/"Wishlist"/"Registry"/"Save for Later",
+  // reject the match and return null (forces re-plan or LLM fallback).
+  const _goalLower = (goalContext || '').toLowerCase();
+  const _goalIsAddToCart = /\badd\b[\s\S]{0,40}\b(?:cart|bag|basket)\b/i.test(_goalLower) ||
+                          /\b(?:cart|bag|basket)\b[\s\S]{0,40}\badd\b/i.test(_goalLower);
+  const _targetIsListButton = /\b(?:add\s+to\s+list|wishlist|registry|save\s+for\s+later|add\s+to\s+save)\b/i.test(target) &&
+                              !/\b(?:cart|bag|basket)\b/i.test(target);
+  if (_goalIsAddToCart && _targetIsListButton) {
+    logger.warn(`[instruction.runner] _matchElementToStep: REJECTING match — goal is add-to-cart but target "${step.target}" is a list/wishlist button`);
+    return null;
+  }
 
   // Score each element for how well it matches the target.
   // For type actions, non-typeable elements (buttons, menu items) are filtered out.
@@ -5746,6 +5799,14 @@ async function _matchElementToStep(sessionId, step, tabMap) {
     // organic results win, while still allowing sponsored targets when the
     // goal explicitly asks for them.
     if (e.isSponsored && !/sponsored|promoted|advertis/i.test(target)) score -= 2;
+
+    // Commerce demotion: when the goal is add-to-cart, heavily demote
+    // List/Wishlist/Registry/Save-for-Later buttons so they can't win
+    // over a real Add to Cart button even on fuzzy/contains matches.
+    if (_goalIsAddToCart && /\b(?:add\s+to\s+list|wishlist|registry|save\s+for\s+later|add\s+to\s+save)\b/i.test(label) &&
+        !/\b(?:cart|bag|basket)\b/i.test(label)) {
+      score -= 5;
+    }
 
     if (!_isTypeAction) return score;
 
@@ -5968,7 +6029,7 @@ async function _classifyOnPageAction(goal, tabMap, ctx = {}) {
 
 // Step-based Tab-Map: runs ONE step from a pre-extracted step plan.
 // Returns same shape as _tabMapInnerStep: { done, ok, error, stateChanged, filledRef, filledLabel, filledValue, rescan, action, fallbackToLlm }
-async function _tabMapStepExecute(sessionId, step, stepIndex, stepCount, tabMap, overlayActive, pageCategory, currentUrl, progressCallbackUrl = null, _outerStepIndex = 0, agentId = '', sessionUuid = '') {
+async function _tabMapStepExecute(sessionId, step, stepIndex, stepCount, tabMap, overlayActive, pageCategory, currentUrl, progressCallbackUrl = null, _outerStepIndex = 0, agentId = '', sessionUuid = '', goalContext = '') {
   logger.info(`[instruction.runner] Tab-Map step ${stepIndex + 1}/${stepCount}: ${JSON.stringify(step)}`);
 
   // Emit tab_map:step_start so the frontend can mark this sub-step as running
@@ -6052,7 +6113,7 @@ async function _tabMapStepExecute(sessionId, step, stepIndex, stepCount, tabMap,
                   { ref: step._preClassifiedRef, id: step._preClassifiedId, text: step.target };
     logger.info(`[instruction.runner] Tab-Map step ${stepIndex + 1}: using pre-classified ref ${step._preClassifiedRef} for "${step.target}"`);
   } else if (step.target) {
-    pickedEntry = await _matchElementToStep(sessionId, step, tabMap);
+    pickedEntry = await _matchElementToStep(sessionId, step, tabMap, goalContext);
     if (!pickedEntry) {
       logger.warn(`[instruction.runner] Tab-Map step ${stepIndex + 1}: no element matched "${step.target}" — falling back to per-step LLM`);
       return { done: false, ok: false, error: `No element matched "${step.target}"`, fallbackToLlm: true, action: `${step.action} "${step.target}"` };
@@ -6167,7 +6228,7 @@ async function _tabMapStepExecute(sessionId, step, stepIndex, stepCount, tabMap,
 // Tab-Map inner loop: runs ONE step of the Tab-Map scan session.
 // Returns { done, ok, error, stateChanged, filledRef, filledLabel, filledValue }
 //   done=true when session ends (DONE, state change, or failure)
-async function _tabMapInnerStep(sessionId, goal, actionHistory, currentUrl, overlayActive, pageCategory, agentContext, cachedTabMap, filledFields, consumedRefs, lastVerifyFailed, extractedPageText) {
+async function _tabMapInnerStep(sessionId, goal, actionHistory, currentUrl, overlayActive, pageCategory, agentContext, cachedTabMap, filledFields, consumedRefs, lastVerifyFailed, extractedPageText, stepType = null) {
   const { _llmNextAction } = require('./browser.agent.cjs');
 
   // 1. Use cached tab-map (scan session — no re-scan unless invalidated by caller)
@@ -6177,7 +6238,7 @@ async function _tabMapInnerStep(sessionId, goal, actionHistory, currentUrl, over
   }
 
   // 2. Ask LLM for next action
-  const nextAction = await _llmNextAction(goal, currentUrl, tabMap, actionHistory, pageCategory, agentContext, lastVerifyFailed, consumedRefs, filledFields, extractedPageText);
+  const nextAction = await _llmNextAction(goal, currentUrl, tabMap, actionHistory, pageCategory, agentContext, lastVerifyFailed, consumedRefs, filledFields, extractedPageText, stepType);
   if (!nextAction) {
     logger.warn(`[instruction.runner] Tab-Map: LLM returned null — treating as failure (not done)`);
     return { done: true, ok: false, error: 'LLM returned null (provider failed)' };
@@ -7012,11 +7073,11 @@ function _isUrlFirstDone(goal, currentUrl) {
 
 // Tier 2: _selectTier → 0 (DONE), 1 (Just-type), 2 (Meta+F), 3 (Shortcuts), 4 (Tab-Map)
 // Tier 3: Strategy execution with fallback to Tab-Map
-async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, pageCategory, agentContext, shortcutCount = 0, shortcutLabels = '', timeoutMs = 120000, progressCallbackUrl = null, stepIndex = 0, agentId = '' }) {
+async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, pageCategory, agentContext, shortcutCount = 0, shortcutLabels = '', timeoutMs = 120000, progressCallbackUrl = null, stepIndex = 0, agentId = '', stepType = null }) {
   if (!sessionId) return { ok: false, error: 'No sessionId provided' };
   let _pageCategory = pageCategory || 'web_generic';
   const _urlFirstNav = !!urlFirstNav;
-  logger.info(`[instruction.runner] runIterativeNavigation: goal="${String(goal || '').slice(0, 80)}", pageCategory=${_pageCategory}, sessionId=${sessionId}, urlFirstNav=${_urlFirstNav}`);
+  logger.info(`[instruction.runner] runIterativeNavigation: goal="${String(goal || '').slice(0, 80)}", pageCategory=${_pageCategory}, sessionId=${sessionId}, urlFirstNav=${_urlFirstNav}, stepType=${stepType || 'none'}`);
 
   _clearLlmCache(sessionId);
 
@@ -7089,6 +7150,7 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
   let _stepPlan = null;         // extracted steps for current page: [{ action, target?, value?, key? }]
   let _stepIndex = 0;           // current step index in _stepPlan
   let _usingStepFallback = false; // true → use per-step _llmNextAction (browse-and-report)
+  let _currentFlowStepHint = ''; // flow step action text for goal-aware matching
   // Tried-tier tracking — omit tried tiers from _selectTierLLM so the LLM can't pick them again.
   // Cleared on URL change, overlay change, or focus change (so multi-step Just-type like Notion still works).
   let _triedTiers = new Set();
@@ -7202,7 +7264,8 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
         stepResult = await _tabMapStepExecute(
           sessionId, _step, _stepIndex, _stepPlan.length,
           _cachedTabMap, overlayActive, _pageCategory, currentUrl,
-          progressCallbackUrl, stepIndex, agentId, sessionId
+          progressCallbackUrl, stepIndex, agentId, sessionId,
+          `${goal} | ${_currentFlowStepHint}`
         );
 
         // Handle fallback-to-LLM signal (element not matched, step failed)
@@ -7240,7 +7303,7 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
         // Per-step LLM fallback (browse-and-report or step execution failed)
         stepResult = await _tabMapInnerStep(
           sessionId, goal, actionHistory, currentUrl, overlayActive, _pageCategory, agentContext,
-          _cachedTabMap, filledFields, consumedRefs, _doneVerifyFails > 0, extractedPageText
+          _cachedTabMap, filledFields, consumedRefs, _doneVerifyFails > 0, extractedPageText, stepType
         );
       }
 
@@ -7279,8 +7342,20 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
                 .replace(/^(?:scan|look at|check|inspect|examine)\s+(?:the\s+)?page\s+and\s+/i, '')
                 .trim()
             : '';
-          _stepPlan = await _extractSteps(goal, currentUrl, _cachedTabMap, _pageCategory, agentContext, overlayActive, actionHistory, _fsh);
+          _currentFlowStepHint = _fsh;
+          _stepPlan = await _extractSteps(goal, currentUrl, _cachedTabMap, _pageCategory, agentContext, overlayActive, actionHistory, _fsh, stepType);
           _stepIndex = 0;
+          // Flow-step hint validation: reject plans that click wrong commerce buttons
+          if (_stepPlan && _fsh && /\badd\s+to\s+(?:cart|bag|basket)\b/i.test(_fsh)) {
+            const _badSteps = _stepPlan.filter(s => s.action === 'click' &&
+              /\b(?:add\s+to\s+list|wishlist|registry|save\s+for\s+later)\b/i.test(s.target || '') &&
+              !/\b(?:cart|bag|basket)\b/i.test(s.target || ''));
+            if (_badSteps.length > 0) {
+              logger.warn(`[instruction.runner] _extractSteps: plan contains wrong-button click(s) [${_badSteps.map(s=>`"${s.target}"`).join(', ')}] for add-to-cart flow step — rejecting plan, falling back to per-step LLM`);
+              _stepPlan = null;
+              _usingStepFallback = true;
+            }
+          }
           // Step plan loop detection
           const _planSig = JSON.stringify((_stepPlan || []).map(s => `${s.action}:${s.target || s.value || s.key || ''}`));
           if (_planSig === _lastPlanSig && _planSig !== '[]' && _planSig !== '') {
@@ -7367,8 +7442,14 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
         // If the goal is not explicitly navigation-only, treat as state change and re-plan.
         const _isNavOnlyGoal = /^navigate to |^go to /i.test(goal);
         const _onlyNavOrClickAction = actionHistory.length <= 2 && actionHistory.some(a => /navigate|click/i.test(a));
-        if (_onlyNavOrClickAction && !_isNavOnlyGoal) {
-          logger.info(`[instruction.runner] Tab-Map: single step completed but goal is not nav-only — treating as state change, not done`);
+        // Compound on-page-action guard: if the goal has multiple action clauses
+        // (e.g., "click X and then click Y", "open its product page, and click
+        // the 'Add to Cart' button") and the last action was a click that changed
+        // the URL, the goal is NOT complete — re-plan on the new page.
+        const _lastClickChangedUrl = stepResult.stateChanged && /click/i.test(stepResult.action || '') && currentUrl !== prevUrl;
+        const _hasCompoundClauses = /\b(?:and\s+then|,?\s+and\s+|then\s+|after\s+.*\s+click)\b/i.test(goal);
+        if ((_onlyNavOrClickAction && !_isNavOnlyGoal) || (_lastClickChangedUrl && _hasCompoundClauses)) {
+          logger.info(`[instruction.runner] Tab-Map: step completed but goal has unmet clauses (compound=${_hasCompoundClauses}, urlChanged=${_lastClickChangedUrl}) — treating as state change, not done`);
           inTabMapSession = false;
           _cachedTabMap = null;
           _stepPlan = null;
@@ -7442,12 +7523,27 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
           // just the first step — not goal completion.
           const _isNavOnlyGoal = /^navigate to |^go to /i.test(goal);
           const _onlyNavAction = actionHistory.length <= 2 && actionHistory.some(a => /navigate/i.test(a));
+          // Compound on-page-action guard: if the goal has multiple action clauses
+          // and the last action changed the URL, the goal is NOT complete.
+          const _lastClickChangedUrl2 = stepResult.stateChanged && /click/i.test(stepResult.action || '') && currentUrl !== prevUrl;
+          const _hasCompoundClauses2 = /\b(?:and\s+then|,?\s+and\s+|then\s+|after\s+.*\s+click)\b/i.test(goal);
           if (_onlyNavAction && !_isNavOnlyGoal) {
             logger.info(`[instruction.runner] Tab-Map: single navigate step completed but goal is not nav-only — treating as state change, not done`);
             prevUrl = currentUrl;
             filledFields.length = 0;
             consumedRefs.clear();
             continue; // re-decide, don't return done
+          }
+          if (_lastClickChangedUrl2 && _hasCompoundClauses2) {
+            logger.info(`[instruction.runner] Tab-Map: step done but goal has unmet clauses (compound=${_hasCompoundClauses2}, urlChanged=${_lastClickChangedUrl2}) — treating as state change, not done`);
+            inTabMapSession = false;
+            _cachedTabMap = null;
+            _stepPlan = null;
+            _stepIndex = 0;
+            filledFields.length = 0;
+            consumedRefs.clear();
+            prevUrl = currentUrl;
+            continue; // re-decide with fresh plan
           }
           // Tab-Flow checklist gate: if a pre-computed flow exists and not all
           // steps are completed, DON'T declare DONE. Reconcile the flow index
@@ -8843,15 +8939,36 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
           }
         }
 
-        // Extract steps from goal + tab-map (one LLM call)
-        const { _extractSteps } = require('./browser.agent.cjs');
-        const _fsh2 = (_tabFlow && _flowIndex < _tabFlow.length && _tabFlow[_flowIndex].tier === 4)
-          ? (_tabFlow[_flowIndex].action || '')
-              .replace(/^(?:scan|look at|check|inspect|examine)\s+(?:the\s+)?page\s+and\s+/i, '')
-              .trim()
-          : '';
-        _stepPlan = await _extractSteps(goal, currentUrl, _cachedTabMap, _pageCategory, agentContext, overlayActive, actionHistory, _fsh2);
-        _stepIndex = 0;
+        // Extract steps from goal + tab-map (one LLM call).
+        // SKIP _extractSteps when we already have a strong pre-classified
+        // commerce click (e.g., "Add to Cart" on a search-result card) — the
+        // classifier already picked the right element, and re-extraction tends
+        // to replace it with a weaker "click the title" step that loses the
+        // add-to-cart intent.
+        const _preClassifiedCommerce = _stepPlan && _stepPlan[0] && _stepPlan[0]._preClassifiedRef
+          && /\b(add\s+to\s+(?:cart|bag|basket)|buy\s+now|checkout)\b/i.test(_stepPlan[0].target || '');
+        if (!_preClassifiedCommerce) {
+          const { _extractSteps } = require('./browser.agent.cjs');
+          const _fsh2 = (_tabFlow && _flowIndex < _tabFlow.length && _tabFlow[_flowIndex].tier === 4)
+            ? (_tabFlow[_flowIndex].action || '')
+                .replace(/^(?:scan|look at|check|inspect|examine)\s+(?:the\s+)?page\s+and\s+/i, '')
+                .trim()
+            : '';
+          _currentFlowStepHint = _fsh2;
+          _stepPlan = await _extractSteps(goal, currentUrl, _cachedTabMap, _pageCategory, agentContext, overlayActive, actionHistory, _fsh2, stepType);
+          _stepIndex = 0;
+        // Flow-step hint validation: reject plans that click wrong commerce buttons
+        if (_stepPlan && _fsh2 && /\badd\s+to\s+(?:cart|bag|basket)\b/i.test(_fsh2)) {
+          const _badSteps = _stepPlan.filter(s => s.action === 'click' &&
+            /\b(?:add\s+to\s+list|wishlist|registry|save\s+for\s+later)\b/i.test(s.target || '') &&
+            !/\b(?:cart|bag|basket)\b/i.test(s.target || ''));
+          if (_badSteps.length > 0) {
+            logger.warn(`[instruction.runner] _extractSteps: plan contains wrong-button click(s) [${_badSteps.map(s=>`"${s.target}"`).join(', ')}] for add-to-cart flow step — rejecting plan, falling back to per-step LLM`);
+            _stepPlan = null;
+            _usingStepFallback = true;
+          }
+        }
+        } // end if (!_preClassifiedCommerce)
 
         // Step plan loop detection
         const _planSig2 = JSON.stringify((_stepPlan || []).map(s => `${s.action}:${s.target || s.value || s.key || ''}`));

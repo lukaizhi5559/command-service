@@ -1091,6 +1091,26 @@ Rules:
 - TAB STRATEGY RULE: You are a smart tabbing agent. Use as many tabs as the task requires to hold page state or extracted content while working across multiple pages WITHIN THE SAME AGENT SESSION (same domain/service). Open tabs dynamically, track them with tab-list, switch context with tab-select, and clean up with tab-close when a tab's work is done. 2-tab pattern (hold + act): tab 0 = Page A open (compose/form/draft/result); tab-new → Page B → getPageText → tab-select 0 → use extracted content in Page A → tab-close 1. 3-tab pattern (gather from multiple sources, act on one): tab 0 = destination; tab-new → Source B → getPageText; tab-new → Source C → getPageText; tab-select 0 → combine B+C → act → tab-close 2, tab-close 1. 5-tab pattern (parallel research, single synthesis): tab 0 = output/synthesis page; tabs 1–4 = tab-new per source → getPageText each; tab-select 0 → synthesize all results → act → close extra tabs in reverse order. Rules: (1) Always getPageText BEFORE switching away from a tab — result carries forward as [DATA FROM PRIOR STEP] context. (2) Use tab-list to audit open tabs when managing many. (3) tab-close completed tabs to keep the session clean. (4) NEVER use tabs to reach a different service — each agent owns its own Chrome session and cookie store.`;
 
 // ---------------------------------------------------------------------------
+// stepType prompt block — injected into LLM prompts so the agent knows what
+// kind of interaction each step requires (navigate vs on-page-action vs verify).
+// Propagated from the planner's stepType field through browser.agent.cjs.
+// ---------------------------------------------------------------------------
+function _buildStepTypeBlock(stepType) {
+  switch (stepType) {
+    case 'on-page-action':
+      return `\nSTEP TYPE: on-page-action. The browser is ALREADY on the correct page. Do NOT navigate away. Interact with elements on the current page only. Phrases like "search results page" or "product page" in the goal describe the CURRENT page — they are NOT instructions to search or navigate.`;
+    case 'navigate':
+      return `\nSTEP TYPE: navigate. This step requires navigating to a URL or performing a search. If the current page is not the target, navigate first.`;
+    case 'verify':
+      return `\nSTEP TYPE: verify. Check if the goal was achieved by examining the current page state. Do NOT click or type anything unless verification requires it.`;
+    case 'extract':
+      return `\nSTEP TYPE: extract. Read content from the current page. Do NOT navigate or click interactive elements unless needed to reveal the content.`;
+    default:
+      return '';
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Phase 1.2 prompt — orientation loop.
 // Called BEFORE plan generation when an interstitial is detected.
 // Asks: is there ONE action that moves toward the goal? Or is the page clear?
@@ -1790,16 +1810,17 @@ function looksLikeInterstitial(snapshotText) {
 // ---------------------------------------------------------------------------
 const MAX_ORIENT_STEPS = 3;
 
-async function orientPage({ goal, snapshot, sessionId, headed, timeoutMs, learnedRulesBlock, domainLockBlock = '' }) {
+async function orientPage({ goal, snapshot, sessionId, headed, timeoutMs, learnedRulesBlock, domainLockBlock = '', stepType = null }) {
   let currentSnapshot = snapshot;
   let _lastHash = snapshotHash(currentSnapshot);
   let _noChangeCount = 0;
+  const _stepTypeBlock = _buildStepTypeBlock(stepType);
   for (let i = 0; i < MAX_ORIENT_STEPS; i++) {
     let orientRaw;
     try {
       orientRaw = await askWithMessages([
         { role: 'system', content: ORIENTATION_SYSTEM_PROMPT + domainLockBlock },
-        { role: 'user', content: `GOAL: ${goal}\n\nSNAPSHOT:\n${trimSnapshot(currentSnapshot, 8000)}${learnedRulesBlock || ''}` },
+        { role: 'user', content: `GOAL: ${goal}${_stepTypeBlock}\n\nSNAPSHOT:\n${trimSnapshot(currentSnapshot, 8000)}${learnedRulesBlock || ''}` },
       ], { temperature: 0.1, maxTokens: 256, responseTimeoutMs: 15000 });
     } catch (err) {
       logger.warn(`[playwright.agent] orientation LLM error (step ${i + 1}/${MAX_ORIENT_STEPS}): ${err.message} — skipping`);
@@ -8458,7 +8479,7 @@ async function _executeOverlayInteraction({ goal, sessionId, headed, timeoutMs, 
   }
 }
 
-async function _focusedPlanExecute({ goal, verificationGoal, sessionId, headed, timeoutMs, agentContext, deadline, start, heartbeat, _ocrText, _domSignals, pageStudyBlock, domainLockBlock, failedApproachesBlock, recordFailedApproach }) {
+async function _focusedPlanExecute({ goal, verificationGoal, sessionId, headed, timeoutMs, agentContext, deadline, start, heartbeat, _ocrText, _domSignals, pageStudyBlock, domainLockBlock, failedApproachesBlock, recordFailedApproach, stepType = null }) {
   const _peStart = Date.now();
   logger.info(`[playwright.agent] focused Plan-Execute: starting for goal="${goal.slice(0, 80)}"`);
   logger.info(`[playwright.agent] focused Plan-Execute: pageStudyBlock length=${(pageStudyBlock || '').length}${pageStudyBlock ? `, first 200 chars: ${pageStudyBlock.slice(0, 200)}` : ' (empty)'}`);
@@ -8473,7 +8494,8 @@ async function _focusedPlanExecute({ goal, verificationGoal, sessionId, headed, 
     const _pageText = await page.evaluate(() => document.body.innerText.slice(0, 3000)).catch(() => '');
 
     // 2. ONE LLM call with full context
-    const _userPrompt = `GOAL: ${goal}
+    const _stepTypeBlock = _buildStepTypeBlock(stepType);
+    const _userPrompt = `GOAL: ${goal}${_stepTypeBlock}
 ${agentContext ? `\nAGENT CONTEXT:\n${agentContext}` : ''}
 ${pageStudyBlock || ''}
 ${_ocrText ? `\nOCR SCREEN CAPTURE:\n${_ocrText.slice(0, 1000)}\n` : ''}
@@ -11582,6 +11604,90 @@ function _formatFailedApproachesBlock() {
   return `\nFAILED APPROACHES (these did not achieve the goal — do NOT retry the same actions; try a DIFFERENT approach):\n${_lines.join('\n')}\n`;
 }
 
+// ── Signal-based goal completion check (cheap, no LLM) ──────────────────────
+// Used both per-turn (before the state_changed_resume_tabflow early return)
+// and at max-turns pre-exhaustion. Combines:
+//   - goal-phrase matching (≥50% of _extractGoalPhrases found in page text)
+//   - cart/basket/bag confirmation gate for add-to-cart goals
+//   - transcript evidence: a successful click on an Add-to-cart/bag element
+//     followed by cart-confirmation text on the page
+// Returns { completed: bool, reason: string, matchedPhrases: string[] }.
+// Conservative by design: only returns completed=true when both the goal
+// semantics and the page-state evidence agree, to avoid false positives on
+// pages that happen to contain "subtotal" / "cart" words incidentally.
+function _isGoalCompletedBySignals({ goal, verificationGoal, pageText, pageUrl, actionHistory }) {
+  const _goal = verificationGoal || goal || '';
+  if (!_goal) return { completed: false, reason: 'no goal' };
+
+  const _pageText = String(pageText || '').toLowerCase();
+  const _pageUrl = String(pageUrl || '').toLowerCase();
+  if (_pageText.length < 20) return { completed: false, reason: 'page text too short' };
+
+  const { phrases: _goalPhrases } = _extractGoalPhrases(_goal);
+
+  // ── Cart/basket/bag goal detection ──
+  const _cartGoal = /\badd\b[\s\S]{0,80}\b(?:cart|basket|bag)\b/i.test(_goal) ||
+                    /\b(?:cart|basket|bag)\b[\s\S]{0,40}\badd\b/i.test(_goal);
+  const _cartConfirmRe = /added to (?:your |the |my )?(?:cart|basket|bag)|item(?:s)? added|added\b.{0,20}\b(?:cart|basket|bag)|(?:cart|basket|bag) subtotal|proceed to (?:buy|checkout)|\b\d+\s+items? in (?:your |the )?(?:cart|basket|bag)|view (?:cart|basket|bag)|go to (?:cart|basket|bag)|shopping (?:cart|basket|bag)|quantity is \d/i;
+  const _cartConfirmed = _cartConfirmRe.test(_pageText);
+
+  // ── Transcript evidence: did the agent click an Add-to-cart/bag element? ──
+  // Look at the last few successful clicks for an add-to-cart/bag selector/text.
+  const _lastClicks = (actionHistory || []).slice(-5).filter(t =>
+    t.outcome?.ok && /click/i.test(t.action?.action || '')
+  );
+  const _clickedAddToCart = _lastClicks.some(t => {
+    const _sel = String(t.action?.selector || t.action?.text || '').toLowerCase();
+    return /add to (?:cart|bag|basket)|add-to-cart|addtocart|aria-label=['"]add to (?:cart|bag|basket)/i.test(_sel);
+  });
+
+  // ── Decision ──
+  // 1. Cart goal with strong evidence: cart-confirmation text AND a recent
+  //    successful click on an Add-to-cart element. This is the Amazon case —
+  //    the click succeeded, the page now shows "Subtotal $X / Go to Cart /
+  //    Quantity is N", and the agent's transcript shows the add-to-cart click.
+  if (_cartGoal && _cartConfirmed && _clickedAddToCart) {
+    return {
+      completed: true,
+      reason: `cart-confirmation signals present (page text + click on add-to-cart element)`,
+      matchedPhrases: [],
+    };
+  }
+
+  // 2. Phrase-based relaxed match (the original pre-exhaustion logic).
+  //    For cart goals, also require cart confirmation text on the page.
+  if (_goalPhrases.length > 0) {
+    const _matchedPhrases = _goalPhrases.filter(p => p.length > 2 && _pageText.includes(p.toLowerCase()));
+    const _matchRatio = _matchedPhrases.length / _goalPhrases.length;
+    const _phraseOk = _matchRatio >= 0.5;
+    const _gateOk = !_cartGoal || _cartConfirmed;
+    if (_phraseOk && _gateOk) {
+      return {
+        completed: true,
+        reason: `${_matchedPhrases.length}/${_goalPhrases.length} goal phrases found in page text (ratio=${_matchRatio.toFixed(2)})${_cartGoal ? ' + cart confirmation' : ''}`,
+        matchedPhrases: _matchedPhrases,
+      };
+    }
+    return {
+      completed: false,
+      reason: `only ${_matchedPhrases.length}/${_goalPhrases.length} goal phrases found (ratio=${_matchRatio.toFixed(2)})${_cartGoal && !_cartConfirmed ? ' + no cart confirmation' : ''}`,
+      matchedPhrases: _matchedPhrases,
+    };
+  }
+
+  // 3. Cart goal with no extractable phrases but strong evidence:
+  //    cart-confirmation text + a recent successful add-to-cart click.
+  if (_cartGoal && _cartConfirmed && _clickedAddToCart) {
+    return {
+      completed: true,
+      reason: `cart-confirmation signals present (no phrases, but page text + click evidence)`,
+      matchedPhrases: [],
+    };
+  }
+
+  return { completed: false, reason: 'no completion signals matched', matchedPhrases: [] };
+}
+
 async function _executeTurnLoopFallback({ goal, verificationGoal, sessionId, headed, timeoutMs, agentContext, transcript, deadline, start, extractedText, heartbeat, textAlreadyEntered, maxTurns = 8, hostname, _discoveryAlreadyAttempted = false, _preDecomposedSubTasks = null, _inheritedActionSignatureCounts = null, _inheritedJitDiscoveryFired = null, _progressCallbackUrl, _stepIndex, _abortSignal = null }) {
   const MAX_TURNS = maxTurns;
   const _loopTranscript = [...transcript];
@@ -12807,6 +12913,66 @@ Turn ${turn}/${MAX_TURNS}. What is your next action? (DO NOT snapshot - act dire
               // turn-loop got the page into a new state that Tab-Map can scan.
               const _modalOpened = _postState.modalCount > _preActionState.modalCount;
               if (_modalOpened || _urlChanged || _bodyChanged) {
+                // ── Completion check BEFORE handing off to Tab-Flow ──
+                // The state change may BE the completion signal (e.g. an Add-to-Cart
+                // click opens a cart side-panel with "Subtotal $X / Go to Cart").
+                // Before returning state_changed_resume_tabflow, verify the goal
+                // isn't already satisfied. This catches the Amazon add-to-cart case
+                // where the click succeeded and the cart confirmation appeared in
+                // the same state change that would otherwise trigger a Tab-Flow
+                // re-entry (which then fails verification and surfaces ask_user).
+                let _stUrl = '';
+                try { _stUrl = _postPage.url(); } catch (_) {}
+                const _stText = await _postPage.evaluate(() => document.body.innerText.slice(0, 5000)).catch(() => '');
+
+                // (a) Sub-task verification — same logic as the post-turn check
+                //     below, but run here so a completed goal short-circuits the
+                //     Tab-Flow handoff.
+                if (_subTasks && _subTasks.length > 0) {
+                  let _newlyCompleted = 0;
+                  for (const _st of _subTasks) {
+                    if (!_st.completed) {
+                      const _done = await _checkSubTaskCompletion(_st, _postPage, _stUrl, _stText);
+                      if (_done) { _st.completed = true; _newlyCompleted++; }
+                    }
+                  }
+                  if (_newlyCompleted > 0) {
+                    logger.info(`[playwright.agent] turn-loop: ${_newlyCompleted} sub-task(s) newly completed at turn ${turn} (pre-handoff check, ${_subTasks.filter(s => s.completed).length}/${_subTasks.length} total)`);
+                  }
+                  if (_subTasks.every(s => s.completed)) {
+                    logger.info(`[playwright.agent] turn-loop: all ${_subTasks.length} sub-tasks completed at turn ${turn} (pre-handoff) — exiting loop early instead of returning to Tab-Flow`);
+                    return {
+                      ok: true,
+                      routingDecision: 'turn_loop_subtask_complete_state_change',
+                      result: _stText.slice(0, 2000) || `All ${_subTasks.length} sub-tasks completed`,
+                      transcript: _loopTranscript,
+                      sessionId,
+                    };
+                  }
+                }
+
+                // (b) Signal-based goal completion (cart/basket/phrase heuristics).
+                //     Catches goals without sub-task decomposition (e.g. when the
+                //     LLM didn't decompose, or when decomposition didn't capture
+                //     the cart-confirmation semantics).
+                const _signals = _isGoalCompletedBySignals({
+                  goal, verificationGoal,
+                  pageText: _stText, pageUrl: _stUrl,
+                  actionHistory: _loopTranscript,
+                });
+                if (_signals.completed) {
+                  logger.info(`[playwright.agent] turn-loop: goal completed at turn ${turn} (pre-handoff signals: ${_signals.reason}) — exiting loop early instead of returning to Tab-Flow`);
+                  return {
+                    ok: true,
+                    goal, sessionId,
+                    turns: _loopTranscript.length, done: true,
+                    result: `Goal completed — ${_signals.reason}. Page content: ${_stText.slice(0, 500)}`,
+                    transcript: _loopTranscript,
+                    routingDecision: 'turn_loop_signals_complete_state_change',
+                    executionTime: Date.now() - start,
+                  };
+                }
+
                 logger.info(`[playwright.agent] turn-loop: state changed after ${_action.action} (url=${_urlChanged}, modal=${_preActionState.modalCount}→${_postState.modalCount}, body=${_preActionState.bodyLen}→${_postState.bodyLen}) — returning to Tab-Flow for re-scan`);
                 return {
                   ok: false, stateChanged: true, resumeTabFlow: true,
@@ -12978,37 +13144,34 @@ Turn ${turn}/${MAX_TURNS}. What is your next action? (DO NOT snapshot - act dire
       // Only used when location-aware was inconclusive (no titled phrases, no title
       // input found on page). Checks if 50%+ of goal phrases appear anywhere in
       // body text — best-effort early-exit for goals without title-targeted phrases.
+      // Reuses _isGoalCompletedBySignals so the cart/basket/bag confirmation gate
+      // and the click-evidence check stay in sync with the per-turn pre-handoff
+      // check above. Also handles cart goals that have no extractable phrases
+      // (e.g. "add the first result to the cart") via the click-evidence path.
       if (!_preExhaustionVerify || _preExhaustionVerify.source === 'inconclusive') {
         const _finalPageText = await _ePage.evaluate(() => document.body.innerText.slice(0, 3000)).catch(() => '');
-        const { phrases: _goalPhrases } = _extractGoalPhrases(verificationGoal || goal);
-        if (_goalPhrases.length > 0) {
-          const _pageLower = _finalPageText.toLowerCase();
-          const _matchedPhrases = _goalPhrases.filter(p => p.length > 2 && _pageLower.includes(p.toLowerCase()));
-          const _matchRatio = _matchedPhrases.length / _goalPhrases.length;
-          // Same commerce outcome gate as the DOM verifier — the product query
-          // phrase lives on any results/product page, so a relaxed pass on an
-          // add-to-cart goal must show cart-confirmation evidence.
-          const _goalForGate = verificationGoal || goal || '';
-          const _cartGoal = /\badd\b[\s\S]{0,80}\b(?:cart|basket|bag)\b/i.test(_goalForGate) ||
-                            /\b(?:cart|basket|bag)\b[\s\S]{0,40}\badd\b/i.test(_goalForGate);
-          const _cartOk = !_cartGoal || /added to (?:your |the |my )?(?:cart|basket|bag)|item(?:s)? added|added\b.{0,20}\b(?:cart|basket|bag)|(?:cart|basket|bag) subtotal|proceed to (?:buy|checkout)|\b\d+\s+items? in (?:your |the )?(?:cart|basket|bag)|view (?:cart|basket|bag)|go to (?:cart|basket|bag)|shopping (?:cart|basket|bag)/i.test(_pageLower);
-          if (_matchRatio >= 0.5 && _cartOk) {
-            logger.info(`[playwright.agent] turn-loop: pre-exhaustion check PASSED (relaxed) — ${_matchedPhrases.length}/${_goalPhrases.length} goal phrases found in page text (ratio=${_matchRatio.toFixed(2)})`);
-            return {
-              ok: true,
-              goal,
-              sessionId,
-              turns: _loopTranscript.length,
-              done: true,
-              result: `Goal appears satisfied — ${_matchedPhrases.length}/${_goalPhrases.length} key phrases found in page text. Page content: ${_finalPageText.slice(0, 500)}`,
-              transcript: _loopTranscript,
-              routingDecision: 'turn_loop_pre_exhaustion_pass',
-              executionTime: Date.now() - start,
-            };
-          } else {
-            logger.info(`[playwright.agent] turn-loop: pre-exhaustion check FAILED — only ${_matchedPhrases.length}/${_goalPhrases.length} goal phrases found (ratio=${_matchRatio.toFixed(2)})`);
-          }
+        let _finalUrl = '';
+        try { _finalUrl = _ePage.url(); } catch (_) {}
+        const _signals = _isGoalCompletedBySignals({
+          goal, verificationGoal,
+          pageText: _finalPageText, pageUrl: _finalUrl,
+          actionHistory: _loopTranscript,
+        });
+        if (_signals.completed) {
+          logger.info(`[playwright.agent] turn-loop: pre-exhaustion check PASSED (signals) — ${_signals.reason}`);
+          return {
+            ok: true,
+            goal,
+            sessionId,
+            turns: _loopTranscript.length,
+            done: true,
+            result: `Goal appears satisfied — ${_signals.reason}. Page content: ${_finalPageText.slice(0, 500)}`,
+            transcript: _loopTranscript,
+            routingDecision: 'turn_loop_pre_exhaustion_pass',
+            executionTime: Date.now() - start,
+          };
         }
+        logger.info(`[playwright.agent] turn-loop: pre-exhaustion check FAILED (signals) — ${_signals.reason}`);
       }
     }
   } catch (_checkErr) {
@@ -13267,6 +13430,7 @@ async function playwrightAgent(args) {
     recipeWasUsed         = false,
     authConfirmedAt       = null,
     overallTimeoutMs      = 120000,
+    stepType              = null,
     _progressCallbackUrl,
     _stepIndex            = 0,
     _abortSignal          = null,
@@ -14631,7 +14795,7 @@ Output ONLY valid JSON: {${_matchedSkill.params.map(p => `"${p.name}": "<extract
 
   if (!_skipOrientationForEditable && looksLikeInterstitial(currentSnapshot)) {
     logger.info(`[playwright.agent] phase 1.2: interstitial detected — running orientation loop (up to ${MAX_ORIENT_STEPS} steps)`);
-    currentSnapshot = await orientPage({ goal, snapshot: currentSnapshot, sessionId, headed, timeoutMs, learnedRulesBlock: '', domainLockBlock });
+    currentSnapshot = await orientPage({ goal, snapshot: currentSnapshot, sessionId, headed, timeoutMs, learnedRulesBlock: '', domainLockBlock, stepType });
 
     // Post-orientation check: if a login/signup gate is STILL blocking after the
     // orientation loop ran, bail immediately with loginWallDetected rather than
@@ -14985,6 +15149,7 @@ Output ONLY valid JSON: {${_matchedSkill.params.map(p => `"${p.name}": "<extract
         domainLockBlock,
         failedApproachesBlock: _formatFailedApproachesBlock(),
         recordFailedApproach: _recordFailedApproach,
+        stepType,
       });
 
       if (_peResult && _peResult.ok) {
@@ -15168,6 +15333,25 @@ Output ONLY valid JSON: {${_matchedSkill.params.map(p => `"${p.name}": "<extract
       try { await browserAct({ action: 'close', sessionId }); } catch (_) {}
       return { ok: false, goal, sessionId, error: 'Cancelled by user', cancelled: true, turns: transcript.length, transcript, executionTime: Date.now() - start };
     }
+    // ── Honor resumeTabFlow: hand off to browser.agent's Tab-Flow re-entry ──
+    // When the turn-loop changed the page state but didn't complete the goal,
+    // _executeTurnLoopFallback returns resumeTabFlow: true so browser.agent
+    // can re-enter Tab-Flow on the new state. Propagate the handoff signal
+    // instead of surfacing ask_user — otherwise the Tab-Flow re-entry loop in
+    // browser.agent never runs and a recoverable state change becomes a
+    // user-facing failure (the Amazon add-to-cart regression).
+    if (_turnLoopResult.resumeTabFlow) {
+      logger.info(`[playwright.agent] turn-loop handed off to Tab-Flow (resumeTabFlow) — propagating to browser.agent instead of surfacing ask_user`);
+      _heartbeat.stop();
+      return {
+        ok: false, stateChanged: true, resumeTabFlow: true,
+        goal, sessionId, transcript: _turnLoopResult.transcript || transcript,
+        result: _turnLoopResult.result || `State changed during turn-loop — returning to Tab-Flow`,
+        error: _turnLoopResult.error || 'state_changed_resume_tabflow',
+        routingDecision: _turnLoopResult.routingDecision || 'turn_loop_state_changed',
+        executionTime: Date.now() - start,
+      };
+    }
     logger.warn(`[playwright.agent] turn-loop failed: ${_turnLoopResult.error || 'unknown'} - surfacing ask_user`);
     _heartbeat.stop();
     return { ..._failureAskUser(`Turn-loop failed: ${_turnLoopResult.error || 'could not complete task'}`, _turnLoopResult.partialProgress), executionTime: Date.now() - start };
@@ -15287,9 +15471,10 @@ Output a JSON plan: { "plan": [ { "action": "type", "selector": "eXX", "text": "
     }
   }
 
+  const _stepTypeBlock = _buildStepTypeBlock(stepType);
   const planMessages = [
     { role: 'system', content: _planSystemPrompt },
-    { role: 'user',   content: `GOAL: ${_finalGoal}${_studyBlock}${_activeElBlock}${failedApproachesBlock || ''}\n\nSNAPSHOT:\n${pruneSnapshot(extractInteractiveRefs(_planningSnapshot))}${agentContext ? `\n\nAGENT CONTEXT (agent instructions — follow these for site-specific behaviour):\n${agentContext}` : ''}` },
+    { role: 'user',   content: `GOAL: ${_finalGoal}${_stepTypeBlock}${_studyBlock}${_activeElBlock}${failedApproachesBlock || ''}\n\nSNAPSHOT:\n${pruneSnapshot(extractInteractiveRefs(_planningSnapshot))}${agentContext ? `\n\nAGENT CONTEXT (agent instructions — follow these for site-specific behaviour):\n${agentContext}` : ''}` },
   ];
   // Dynamic token cap: short focused tasks (< 400 chars) seldom produce > 3 steps
   // so 800 tokens avoids wasting 1-2s on padding. Complex multi-site goals get 2048.
@@ -16408,6 +16593,17 @@ Output a JSON plan: { "plan": [ { "action": "type", "selector": "eXX", "text": "
             logger.info(`[playwright.agent] turn-loop fallback succeeded — returning`);
             return _turnLoopResult;
           }
+          if (_turnLoopResult.resumeTabFlow) {
+            logger.info(`[playwright.agent] turn-loop fallback handed off to Tab-Flow (resumeTabFlow) — propagating to browser.agent`);
+            return {
+              ok: false, stateChanged: true, resumeTabFlow: true,
+              goal, sessionId, transcript: _turnLoopResult.transcript || transcript,
+              result: _turnLoopResult.result || `State changed during turn-loop — returning to Tab-Flow`,
+              error: _turnLoopResult.error || 'state_changed_resume_tabflow',
+              routingDecision: _turnLoopResult.routingDecision || 'turn_loop_state_changed',
+              executionTime: Date.now() - start,
+            };
+          }
           logger.warn(`[playwright.agent] turn-loop fallback failed: ${_turnLoopResult.error} — surfacing ask_user`);
         } catch (_turnLoopErr) {
           logger.warn(`[playwright.agent] turn-loop fallback threw: ${_turnLoopErr.message} — surfacing ask_user`);
@@ -16688,6 +16884,17 @@ Output a JSON plan: { "plan": [ { "action": "type", "selector": "eXX", "text": "
           if (_turnLoopResult.ok) {
             logger.info(`[playwright.agent] turn-loop fallback succeeded after unparseable repair — returning`);
             return _turnLoopResult;
+          }
+          if (_turnLoopResult.resumeTabFlow) {
+            logger.info(`[playwright.agent] turn-loop fallback (unparseable repair) handed off to Tab-Flow (resumeTabFlow) — propagating to browser.agent`);
+            return {
+              ok: false, stateChanged: true, resumeTabFlow: true,
+              goal, sessionId, transcript: _turnLoopResult.transcript || transcript,
+              result: _turnLoopResult.result || `State changed during turn-loop — returning to Tab-Flow`,
+              error: _turnLoopResult.error || 'state_changed_resume_tabflow',
+              routingDecision: _turnLoopResult.routingDecision || 'turn_loop_state_changed',
+              executionTime: Date.now() - start,
+            };
           }
           logger.warn(`[playwright.agent] turn-loop fallback failed after unparseable repair: ${_turnLoopResult.error}`);
         } catch (_turnLoopErr) {
@@ -17302,6 +17509,18 @@ Return JSON: { "thoughts": "strategy explanation", "plan": [...steps] }`;
         if (_turnLoopResult.ok) {
           logger.info(`[playwright.agent] turn-loop fallback succeeded after overall timeout — returning`);
           return _turnLoopResult;
+        }
+        if (_turnLoopResult.resumeTabFlow) {
+          logger.info(`[playwright.agent] turn-loop fallback (timeout) handed off to Tab-Flow (resumeTabFlow) — propagating to browser.agent`);
+          _heartbeat.stop();
+          return {
+            ok: false, stateChanged: true, resumeTabFlow: true,
+            goal, sessionId, transcript: _turnLoopResult.transcript || transcript,
+            result: _turnLoopResult.result || `State changed during turn-loop — returning to Tab-Flow`,
+            error: _turnLoopResult.error || 'state_changed_resume_tabflow',
+            routingDecision: _turnLoopResult.routingDecision || 'turn_loop_state_changed',
+            executionTime: Date.now() - start,
+          };
         }
         logger.warn(`[playwright.agent] turn-loop fallback failed after timeout: ${_turnLoopResult.error} — surfacing ask_user`);
       } catch (_turnLoopErr) {

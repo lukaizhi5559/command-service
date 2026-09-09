@@ -132,9 +132,13 @@ const INTENT_PATTERNS = [
     re: /\b(ask[\s_-]?(?:chatgpt|claude|grok|gemini|ai|the\s+ai|it)|chat[\s_-]?(?:with|gpt)?|converse|have[\s_-]?a[\s_-]?conversation|talk[\s_-]?to[\s_-]?(?:chatgpt|claude|grok|gemini|ai)?|message[\s_-]?the[\s_-]?ai|tell[\s_-]?it|prompt[\s_-]?it)\b/i,
   },
   // SEARCH — explicit search/query phrasing (must come before RESEARCH so "search" wins)
+  // Tightened: bare "search" alone no longer matches — requires "search for", "search on",
+  // "search google", "search youtube", "google for/search/maps/flights", or "site:".
+  // This prevents contextual phrases like "search results page" or "search bar" from
+  // being misclassified as a search command.
   {
     intent: INTENTS.SEARCH,
-    re: /\b(search\s+(?:for|on|google|youtube)?|google\s+(?:for|search|maps|flights)?|site:)/i,
+    re: /\b(search\s+(?:for|on|google|youtube)|google\s+(?:for|search|maps|flights)|site:)/i,
   },
   // SOCIAL — explicit posting/messaging/following on social or forum platforms
   {
@@ -900,8 +904,12 @@ async function suggestTaskUrl(serviceKey, startUrl, intent, task) {
 
   const _taskPreview = _scopeTaskText(task, 200);
 
-  // Detect if this is a search/filter task that needs a search URL
-  const _isSearchTask = /\b(search|find|look\s*up|filter|unread|from:|subject:|label:|starred|is:unread|check.*for|show.*from|list.*from)\b/i.test(_taskPreview);
+  // Detect if this is a search/filter task that needs a search URL.
+  // Conservative: bare "search" or "find" alone don't match — requires explicit
+  // search phrasing ("search for", "find emails from", "look up", filter operators).
+  // This prevents contextual phrases like "find the first result" or "click Add to Cart"
+  // from being misclassified as search tasks that need a search URL.
+  const _isSearchTask = /\b(search\s+for|search\s+on|look\s*up|filter\s+by|unread|from:|subject:|label:|starred|is:unread|find\s+emails?\s+from|show\s+emails?\s+from|list\s+emails?\s+from)\b/i.test(_taskPreview);
 
   const _searchHint = _isSearchTask
     ? `\nIMPORTANT: This task requires searching or filtering. If the service supports URL-based search (e.g., #search/query, ?q=query, ?filter=query, /search?q=query), provide the search URL with the query embedded. For email services, use the service's search operators (e.g., is:unread from:sender). If the service does not support URL-based search, return: none`
