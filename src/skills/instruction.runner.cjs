@@ -5597,7 +5597,7 @@ async function _executeTabMapAction(sessionId, parsed, tabMap, overlayActive, pa
       const _targetLabel = (parsed.target || '').toLowerCase().trim();
       if (!_fuzzyTextMatch(_targetLabel, _pickedLabel)) {
         // LLM picked the wrong element — try deterministic match first
-        const _detMatch = await _matchElementToStep(sessionId, { target: parsed.target }, _sweepTabMap(tabMap, parsed.target));
+        const _detMatch = await _matchElementToStep(sessionId, { target: parsed.target }, tabMap);
         if (_detMatch) {
           const _detLabel = (_detMatch.text || _detMatch.ariaLabel || _detMatch.placeholder || '').toLowerCase().trim();
           if (_fuzzyTextMatch(_targetLabel, _detLabel)) {
@@ -5964,138 +5964,7 @@ async function _classifyOnPageAction(goal, tabMap, ctx = {}) {
   return ON_PAGE_NOT_FOUND;
 }
 
-// ---------------------------------------------------------------------------
-// _sweepTabMap: general deterministic noise filter (no LLM, no I/O, no
-// site-specific selectors). Runs after every tab-map scan (fast path AND
-// Tab-Flow steps). Returns a small candidate array (cap 20) of elements most
-// relevant to the goal. Both the _extractSteps planner and the matcher consume
-// the swept set instead of the raw map, so neither sees chrome/carousel noise.
-//
-// Criteria (all general):
-//   1. Actionability: has ref, non-empty label or typeable, visible geometry
-//   2. Off-screen: drop elements far outside the viewport
-//   3. Chrome: drop header/footer band elements UNLESS they match a goal term
-//   4. Sponsored/ads: drop isSponsored unless goal explicitly says sponsored/ad
-//   5. Goal relevance: keep term-matching elements + large non-chrome buttons
-//      + typeable non-chrome fields
-//   6. Duplicate-label collapse: keep best instance per normalized label
-// ---------------------------------------------------------------------------
-const _SWEEP_STOP = new Set([
-  'the','a','an','and','or','to','for','of','in','on','at','by','with','from',
-  'into','then','first','result','results','item','items','page','site','website',
-  'go','open','navigate','search','find','click','add','my','your','their','this',
-  'that','it','is','are','was','were','be','been','being','have','has','had','do',
-  'does','did','will','would','can','could','should','shall','may','might','must',
-  'i','you','he','she','we','they','me','him','her','us','them','please','want',
-  'need','help','make','get','put','set','use','using','used','new','now','here',
-  'there','up','down','out','over','under','again','more','most','some','any','all',
-  'each','every','other','such','only','own','same','so','than','too','very','just',
-  'about','above','after','against','before','below','between','during','further',
-  'once','off','because','as','until','while','if','but','not','no','yes',
-]);
-const _SWEEP_ACTION_TERMS = new Set([
-  'cart','bag','basket','buy','purchase','checkout','sign','login','log','submit',
-  'send','save','delete','remove','cancel','close','confirm','continue','next',
-  'back','play','pause','follow','like','share','comment','post','reply','subscribe',
-  'join','register','create','edit','update','download','upload','copy','paste',
-  'select','choose','pick','view','show','hide','expand','collapse','enable',
-  'disable','accept','reject','decline','agree','apply','reset','clear','order',
-  'wishlist','favorites','favorite','search','query',
-]);
 
-function _sweepTabMap(tabMap, goal, ctx = {}) {
-  if (!tabMap || tabMap.length === 0) return [];
-  const _viewportW = ctx.viewportW || 1440;
-  const _viewportH = ctx.viewportH || 900;
-  const _goalLower = String(goal || '').toLowerCase();
-  const _goalHasSponsored = /\bsponsored\b|\bpromoted\b|\badvertis|\bad\b/.test(_goalLower);
-
-  // Goal key terms: meaningful tokens (len>=3, not stopwords) + action terms
-  const _goalTerms = (_goalLower.match(/[a-z']+/g) || [])
-    .map(t => t.trim())
-    .filter(t => t.length >= 3 && !_SWEEP_STOP.has(t));
-  const _termSet = new Set([..._goalTerms, ..._SWEEP_ACTION_TERMS]);
-
-  const _matchesTerm = (e) => {
-    const label = ((e.text || '') + ' ' + (e.ariaLabel || '') + ' ' + (e.placeholder || '')).toLowerCase();
-    if (!label.trim()) return false;
-    for (const t of _termSet) {
-      if (label.includes(t)) return true;
-    }
-    return false;
-  };
-  const _area = (e) => (e.w || 0) * (e.h || 0);
-  const _isTypeable = (e) => e.tag === 'input' || e.tag === 'textarea' ||
-    e.isContentEditable || e.role === 'textbox' || e.role === 'combobox';
-  const _isClickable = (e) => e.tag === 'button' || e.tag === 'a' ||
-    e.role === 'button' || e.role === 'link' || e.role === 'menuitem' || e.role === 'tab';
-  // Header band (search bar, nav, logo). Footer band = fully below the fold.
-  const _isChromeBand = (e) => {
-    const y = e.y || 0;
-    if (y < 80) return true;              // header strip
-    if (y > _viewportH) return true;      // fully below the fold
-    return false;
-  };
-  const _isFarOffscreen = (e) => {
-    const x = e.x || 0, y = e.y || 0, w = e.w || 0, h = e.h || 0;
-    if (x + w < -100 || x > _viewportW + 100) return true;
-    if (y + h < -100) return true;        // scrolled far above
-    return false;
-  };
-
-  // Stage 1: actionability + off-screen + sponsored
-  let swept = tabMap.filter(e => {
-    if (!e.ref) return false;
-    const _label = ((e.text || '') + ' ' + (e.ariaLabel || '') + ' ' + (e.placeholder || '')).trim();
-    if (!_label && !_isTypeable(e)) return false;
-    if (_area(e) < 200 && !_isTypeable(e)) return false;
-    if (_isFarOffscreen(e)) return false;
-    if (e.isSponsored && !_goalHasSponsored) return false;
-    return true;
-  });
-
-  // Stage 2: relevance — keep term matches (any position), large non-chrome
-  // buttons, and typeable non-chrome fields. Drop chrome that doesn't match.
-  swept = swept.filter(e => {
-    if (_matchesTerm(e)) return true;                 // term match overrides chrome
-    if (_isChromeBand(e)) return false;               // chrome without term match → drop
-    if (_isClickable(e) && !e.isSponsored && _area(e) >= 8000) return true;  // large primary-action candidate
-    if (_isTypeable(e)) return true;                  // form fields
-    return false;
-  });
-
-  // Stage 3: duplicate-label collapse — keep best instance per normalized label
-  const _byLabel = new Map();
-  const _labelless = [];
-  for (const e of swept) {
-    const _norm = ((e.text || '') + ' ' + (e.ariaLabel || '')).toLowerCase().trim().replace(/\s+/g, ' ');
-    if (!_norm) { _labelless.push(e); continue; }
-    const _existing = _byLabel.get(_norm);
-    if (!_existing) {
-      _byLabel.set(_norm, e);
-    } else {
-      const _ea = _area(e), _xa = _area(_existing);
-      if (_ea > _xa || (_ea === _xa && (e.y || 0) < (_existing.y || 0))) {
-        _byLabel.set(_norm, e);
-      }
-    }
-  }
-  let result = [..._byLabel.values(), ..._labelless];
-
-  // Sort: term-matching first, then by area desc, then y asc
-  result.sort((a, b) => {
-    const _am = _matchesTerm(a) ? 1 : 0;
-    const _bm = _matchesTerm(b) ? 1 : 0;
-    if (_bm !== _am) return _bm - _am;
-    const _ba = _area(b), _aa = _area(a);
-    if (_ba !== _aa) return _ba - _aa;
-    return (a.y || 0) - (b.y || 0);
-  });
-
-  const capped = result.slice(0, 20);
-  logger.info(`[instruction.runner] _sweepTabMap: ${tabMap.length} → ${capped.length} candidates (goal="${_goalLower.slice(0, 40)}", terms=[${_goalTerms.slice(0, 8).join(',')}])`);
-  return capped;
-}
 
 // Step-based Tab-Map: runs ONE step from a pre-extracted step plan.
 // Returns same shape as _tabMapInnerStep: { done, ok, error, stateChanged, filledRef, filledLabel, filledValue, rescan, action, fallbackToLlm }
@@ -6183,11 +6052,7 @@ async function _tabMapStepExecute(sessionId, step, stepIndex, stepCount, tabMap,
                   { ref: step._preClassifiedRef, id: step._preClassifiedId, text: step.target };
     logger.info(`[instruction.runner] Tab-Map step ${stepIndex + 1}: using pre-classified ref ${step._preClassifiedRef} for "${step.target}"`);
   } else if (step.target) {
-    // Sweep noise (chrome/sponsored/carousel duplicates) before matching so the
-    // scorer sees only goal-relevant candidates. This prevents weak carousel
-    // "Add to Cart" duplicates from winning over the buybox button.
-    const _sweptForMatch = _sweepTabMap(tabMap, step.target, { viewportW: 1440, viewportH: 900 });
-    pickedEntry = await _matchElementToStep(sessionId, step, _sweptForMatch);
+    pickedEntry = await _matchElementToStep(sessionId, step, tabMap);
     if (!pickedEntry) {
       logger.warn(`[instruction.runner] Tab-Map step ${stepIndex + 1}: no element matched "${step.target}" — falling back to per-step LLM`);
       return { done: false, ok: false, error: `No element matched "${step.target}"`, fallbackToLlm: true, action: `${step.action} "${step.target}"` };
@@ -7414,7 +7279,7 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
                 .replace(/^(?:scan|look at|check|inspect|examine)\s+(?:the\s+)?page\s+and\s+/i, '')
                 .trim()
             : '';
-          _stepPlan = await _extractSteps(goal, currentUrl, _sweepTabMap(_cachedTabMap, goal), _pageCategory, agentContext, overlayActive, actionHistory, _fsh);
+          _stepPlan = await _extractSteps(goal, currentUrl, _cachedTabMap, _pageCategory, agentContext, overlayActive, actionHistory, _fsh);
           _stepIndex = 0;
           // Step plan loop detection
           const _planSig = JSON.stringify((_stepPlan || []).map(s => `${s.action}:${s.target || s.value || s.key || ''}`));
@@ -8198,47 +8063,7 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
 
     const _alertActiveAtTierSelect = !!_alert && !_alertHandled;
 
-    // ── FAST PATH: simple web tasks → Tab-Map directly (skip tier selection LLM) ──
-    // For the ~80% of tasks that are simple web interactions (shopping, search,
-    // generic forms, read pages), skip the _selectTierLLM call and go straight to
-    // Tab-Map (tier 4). The existing Tab-Map handler does scan→classify→act→verify
-    // per state. If Tab-Map fails repeatedly, _triedTiers blocks this gate and
-    // execution falls through to the full tier system below.
-    // These categories are the hard 20% — Tab-Map scanning is harmful there, so they're excluded.
-    const _FAST_PATH_EXCLUDED_CATEGORIES = new Set([
-      'spreadsheet', 'document_editor', 'code_editor', 'design_canvas',
-      'calendar_event_create', 'calendar', 'email_compose', 'slides_edit',
-    ]);
-    const _isSimpleWebTaskFastPath = !_isCreationDeepLink
-      && !_isHighShortcutApp
-      && !_FAST_PATH_EXCLUDED_CATEGORIES.has(_pageCategory)
-      && !_triedTiers.has(4)
-      && !_alertHandled;
-
-    let strategy;
-    if (_isSimpleWebTaskFastPath) {
-      // Nav-only search goal: if URL-first already took us to the search page,
-      // no need to scan — the task is complete.
-      if (_urlFirstNav && actionHistory.length === 0 && _isUrlFirstDone(goal, currentUrl)) {
-        logger.info(`[instruction.runner] FAST PATH: nav-only search goal and URL matches → done`);
-        strategy = 0;
-      } else if (actionHistory.length > 0) {
-        const _cbCount = await _countCheckboxes(sessionId);
-        const _fastDone = await _checkDone(goal, actionHistory, currentUrl, _probe?.pageTitle, _cbCount);
-        if (_fastDone) {
-          logger.info(`[instruction.runner] FAST PATH: _checkDone=YES → done`);
-          strategy = 0;
-        } else {
-          strategy = 4;
-          logger.info(`[instruction.runner] FAST PATH: simple web task → Tab-Map (tier 4) directly, skipping tier-selection LLM`);
-        }
-      } else {
-        strategy = 4;
-        logger.info(`[instruction.runner] FAST PATH: simple web task (first iteration) → Tab-Map (tier 4) directly`);
-      }
-    } else {
-      strategy = await _selectTierLLM(sessionId, goal, actionHistory, _pageCategory, _shortcutCount, focused, currentUrl, _probe, agentContext, _triedTiers, _disabledTiers, _canvasLayout?.layoutText || '', _ocrObservation, _shortcutLabels, overlayActive, progressCallbackUrl, stepIndex, agentId, sessionId, _editorState, _isCreationDeepLink, _alertActiveAtTierSelect, false, _tabFlow, _flowIndex);
-    }
+    let strategy = await _selectTierLLM(sessionId, goal, actionHistory, _pageCategory, _shortcutCount, focused, currentUrl, _probe, agentContext, _triedTiers, _disabledTiers, _canvasLayout?.layoutText || '', _ocrObservation, _shortcutLabels, overlayActive, progressCallbackUrl, stepIndex, agentId, sessionId, _editorState, _isCreationDeepLink, _alertActiveAtTierSelect, false, _tabFlow, _flowIndex);
     logger.info(`[instruction.runner] Decision: strategy=${strategy} (0=DONE, 1=Just-type, 2=Meta+F, 3=Keyboard Nav, 4=Tab-Map, 5=Gesture)`);
 
     // Handle tier exhaustion — all tiers tried on this state with no progress
@@ -8960,7 +8785,7 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
           let _pageStarterSig = tabMap.starterSig || null;
           let _pageStartId = tabMap.nextId || tabMap.length;
           let _pageLoopedBack = tabMap.loopedBack || false;
-          let _classified = await _classifyOnPageAction(goal, _sweepTabMap(tabMap, goal, { currentUrl, pageCategory: _pageCategory }), { currentUrl, pageCategory: _pageCategory, consumedRefs });
+          let _classified = await _classifyOnPageAction(goal, tabMap, { currentUrl, pageCategory: _pageCategory, consumedRefs });
 
           for (let _page = 1; _page < MAX_PAGES && _classified === ON_PAGE_NOT_FOUND && !_pageLoopedBack; _page++) {
             logger.info(`[instruction.runner] Tab-Map: on-page action "${_onPageTarget}" not found in page ${_page} (${tabMap.length} elements, loopedBack=${_pageLoopedBack}) — paginating to page ${_page + 1}`);
@@ -8982,7 +8807,7 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
             _pageStartId = _contResult.nextId || _pageStartId;
             _pageLoopedBack = _contResult.loopedBack || false;
             logger.info(`[instruction.runner] Tab-Map: page ${_page + 1} added elements (total: ${tabMap.length}, loopedBack=${_pageLoopedBack})`);
-            _classified = await _classifyOnPageAction(goal, _sweepTabMap(tabMap, goal, { currentUrl, pageCategory: _pageCategory }), { currentUrl, pageCategory: _pageCategory, consumedRefs });
+            _classified = await _classifyOnPageAction(goal, tabMap, { currentUrl, pageCategory: _pageCategory, consumedRefs });
           }
 
           if (_classified === ON_PAGE_NOT_FOUND) {
@@ -9025,7 +8850,7 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
               .replace(/^(?:scan|look at|check|inspect|examine)\s+(?:the\s+)?page\s+and\s+/i, '')
               .trim()
           : '';
-        _stepPlan = await _extractSteps(goal, currentUrl, _sweepTabMap(_cachedTabMap, goal), _pageCategory, agentContext, overlayActive, actionHistory, _fsh2);
+        _stepPlan = await _extractSteps(goal, currentUrl, _cachedTabMap, _pageCategory, agentContext, overlayActive, actionHistory, _fsh2);
         _stepIndex = 0;
 
         // Step plan loop detection
