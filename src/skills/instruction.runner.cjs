@@ -16,7 +16,7 @@
 // Just keyboard navigation — the same way screen readers navigate the web.
 // ---------------------------------------------------------------------------
 
-const { browserAct } = require('./browser.act.cjs');
+const { browserAct, _parseCliResult } = require('./browser.act.cjs');
 const { askWithMessages } = require('../skill-helpers/skill-llm.cjs');
 
 const logger = require('../logger.cjs');
@@ -531,6 +531,36 @@ async function _focusByRef(sessionId, ref) {
   } catch { return false; }
 }
 
+// ── Tab-to-ref: navigate to a target ref via Tab/ArrowRight key presses ──
+// Backup focus mechanism for React comboboxes (Gmail To/CC/BCC) where
+// el.focus() (untrusted programmatic call) doesn't move document.activeElement,
+// but Tab (trusted browser-level keyboard event) does. Uses the same
+// ArrowRight→Tab sequence the Tab-Map scan uses, checking data-td-ref after
+// each press until it matches the target ref.
+async function _tabToRef(sessionId, targetRef, maxSteps = 30) {
+  if (!targetRef) return false;
+  const starter = await _slimReadActiveElement(sessionId);
+  const starterRef = starter?.ref || null;
+  for (let i = 0; i < maxSteps; i++) {
+    const current = await _slimReadActiveElement(sessionId);
+    if (current?.ref === targetRef) return true;
+    // ArrowRight first (same as scan), then Tab
+    await browserAct({ action: 'press', sessionId, key: 'ArrowRight', headed: true, timeoutMs: 2000 });
+    await _sleep(20);
+    let after = await _slimReadActiveElement(sessionId);
+    if (after?.ref === targetRef) return true;
+    if (after?.ref === starterRef) {
+      // ArrowRight looped back — try Tab
+      await browserAct({ action: 'press', sessionId, key: 'Tab', headed: true, timeoutMs: 2000 });
+      await _sleep(20);
+      after = await _slimReadActiveElement(sessionId);
+      if (after?.ref === targetRef) return true;
+      if (after?.ref === starterRef) break; // Tab also looped — not reachable
+    }
+  }
+  return false;
+}
+
 // ── Slim active-element read for buildTabMap fast phase ────────────────
 // Returns ONLY the fields needed for loop control during focus-cycling:
 //   { ref, role, tag, text(40ch), x, y, inDropdown }
@@ -597,7 +627,10 @@ async function _bulkReadTabMapMetadata(sessionId) {
           if (!text) text = el.innerText;
         }
         if (!text) text = el.textContent || '';
-        text = text.trim().replace(/\\s+/g, ' ').slice(0, 120);
+        text = text.trim().replace(/\\s+/g, ' ')
+          .replace(/\\b(?:shift|option|opt|alt|ctrl|control|cmd|command|meta)(?:\\s*\\+\\s*(?:shift|option|opt|alt|ctrl|control|cmd|command|meta|[a-z0-9]))*\\b/gi, '')
+          .trim()
+          .slice(0, 120);
         const r = el.getBoundingClientRect();
         const hasSvg = !!el.querySelector('svg');
         const ariaLabel = el.getAttribute('aria-label') || '';
@@ -615,9 +648,34 @@ async function _bulkReadTabMapMetadata(sessionId) {
           : (el.isContentEditable ? text : '')
         ).trim().replace(/\\s+/g, ' ').slice(0, 120);
         const hasContent = !_isContainer && _actualContent.length > 0;
+        // Sponsored/ad detection: the element's own attributes don't carry this
+        // — the "Sponsored" badge lives on a sibling node inside the result card.
+        // Check explicit sponsored containers first (Amazon s-sponsored-result,
+        // Google data-text-ad, FB ads), then look for a leaf badge whose text is
+        // exactly "Sponsored"/"Ad" inside the nearest result-card ancestor.
+        const _isSponsored = (() => {
+          try {
+            if (el.closest('[data-component-type="s-sponsored-result"], .s-sponsored-result, [data-sponsored], [data-text-ad], [data-ad], .ads-ad, [class*="sponsored" i]')) return true;
+            const _card = el.closest('[data-asin], .s-result-item, [role="listitem"], article, li, .g');
+            const _roots = _card && _card !== el ? [el, _card] : [el];
+            for (const _root of _roots) {
+              if (!_root || !_root.querySelectorAll) continue;
+              if (_root.querySelector('.puis-sponsored-label-text, [aria-label*="Sponsored" i], [data-component-type*="sponsored" i]')) return true;
+              let _n = 0;
+              for (const _c of _root.querySelectorAll('span, div, a, i')) {
+                if (++_n > 80) break;
+                if (_c.children.length > 2) continue;
+                const _t = (_c.textContent || '').trim();
+                if (/^(sponsored|ad|advertisement|promoted|sponsored ad)$/i.test(_t)) return true;
+              }
+            }
+            return false;
+          } catch (_) { return false; }
+        })();
         out.push({
           ref, tag: _tag, role: _role, text,
           currentValue, hasContent,
+          isSponsored: _isSponsored,
           isContentEditable: el.isContentEditable,
           ariaRoleDescription: _ariaRoleDescription,
           placeholder: el.getAttribute('placeholder') || '',
@@ -1012,11 +1070,18 @@ function _saveTabMap(domain, map) {
 // skipReset: when true, don't reset focus to page top (for scanning inside
 //   an open dropdown/modal — resetting would close the overlay).
 async function buildTabMap(sessionId, maxElements = 150, options = {}) {
-  const { skipReset = false, backward = false } = options;
+  const { skipReset = false, backward = false, continuation = null } = options;
   const map = [];
-  const seenSet = new Set(); // O(1) deduplication
-  let idCounter = 0;
-  let starterSig = null; // first element — when we loop back, scan is done
+  // Pagination: when `continuation` is provided, seed seenSet/starterSig/idCounter
+  // from the previous page so we dedupe against already-seen elements and
+  // terminate only when Tab loops back to the ORIGINAL starter (true whole-
+  // page coverage), not a per-call starter. `_loopedBack` is set when that
+  // original-starter loop-back happens — the caller uses it to decide between
+  // paginating (more pages) vs. marking Tab-Map exhausted for this state.
+  const seenSet = continuation?.seenSet ? continuation.seenSet : new Set();
+  let idCounter = continuation?.startId ? continuation.startId : 0;
+  let starterSig = continuation?.starterSig ? continuation.starterSig : null; // original starter — whole-page loop-back signal
+  let _loopedBack = false; // set true when Tab hits the original starter
   let dropdownArrowCount = 0;        // count ArrowDown/ArrowUp used in current dropdown
   const DROPDOWN_ARROW_LIMIT = 5;    // max ArrowDown attempts before forcing exit
   let _prevInDropdown = false;       // track previous dropdown state to reset counter
@@ -1224,6 +1289,7 @@ async function buildTabMap(sessionId, maxElements = 150, options = {}) {
         // Tab landed on a seen element
         if (sig === starterSig) {
           logger.info(`[instruction.runner] buildTabMap (${label}): Tab looped back to starter (ref=${sig}) — scan done`);
+          _loopedBack = true;
           break;
         }
 
@@ -1289,6 +1355,7 @@ async function buildTabMap(sessionId, maxElements = 150, options = {}) {
       text: `(() => {
         const overlay = document.querySelector('[role="dialog"], [role="alertdialog"], [aria-modal="true"]');
         const scope = (overlay && overlay.offsetParent !== null) ? overlay : document;
+        const inDialog = overlay && overlay.offsetParent !== null;
         const out = [];
         const fillable = scope.querySelectorAll('input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"]):not([type="submit"]):not([type="button"]):not([type="file"]), textarea, [contenteditable="true"], [contenteditable=""], [role="textbox"], [role="combobox"]');
         for (const el of fillable) {
@@ -1307,6 +1374,7 @@ async function buildTabMap(sessionId, maxElements = 150, options = {}) {
               placeholder: (el.getAttribute('placeholder') || '').slice(0, 80),
               value: (el.value || el.innerText || '').slice(0, 100),
               ref,
+              inDialog: inDialog,
               x: r.x, y: r.y, w: r.width, h: r.height
             });
           }
@@ -1320,10 +1388,38 @@ async function buildTabMap(sessionId, maxElements = 150, options = {}) {
               ref = 'tm-' + Math.random().toString(36).slice(2, 10);
               el.setAttribute('data-td-ref', ref);
             }
+            // Sponsored/ad detection — same heuristic as _bulkReadTabMapMetadata:
+            // the "Sponsored" badge is a sibling inside the result card, not on
+            // the clickable element itself.
+            const _isSponsored = (() => {
+              try {
+                if (el.closest('[data-component-type="s-sponsored-result"], .s-sponsored-result, [data-sponsored], [data-text-ad], [data-ad], .ads-ad, [class*="sponsored" i]')) return true;
+                const _card = el.closest('[data-asin], .s-result-item, [role="listitem"], article, li, .g');
+                const _roots = _card && _card !== el ? [el, _card] : [el];
+                for (const _root of _roots) {
+                  if (!_root || !_root.querySelectorAll) continue;
+                  if (_root.querySelector('.puis-sponsored-label-text, [aria-label*="Sponsored" i], [data-component-type*="sponsored" i]')) return true;
+                  let _n = 0;
+                  for (const _c of _root.querySelectorAll('span, div, a, i')) {
+                    if (++_n > 80) break;
+                    if (_c.children.length > 2) continue;
+                    const _t = (_c.textContent || '').trim();
+                    if (/^(sponsored|ad|advertisement|promoted|sponsored ad)$/i.test(_t)) return true;
+                  }
+                }
+                return false;
+              } catch (_) { return false; }
+            })();
             out.push({
               tag: el.tagName.toLowerCase(), role: el.getAttribute('role') || '',
-              text: (el.innerText || el.getAttribute('aria-label') || el.title || '').slice(0, 80),
+              text: (el.innerText || el.getAttribute('aria-label') || el.title || '')
+                      .replace(/\s+/g, ' ')
+                      .replace(/\\b(?:shift|option|opt|alt|ctrl|control|cmd|command|meta)(?:\\s*\\+\\s*(?:shift|option|opt|alt|ctrl|control|cmd|command|meta|[a-z0-9]))*\\b/gi, '')
+                      .trim()
+                      .slice(0, 80),
               ref,
+              inDialog: inDialog,
+              isSponsored: _isSponsored,
               x: r.x, y: r.y, w: r.width, h: r.height
             });
           }
@@ -1355,6 +1451,13 @@ async function buildTabMap(sessionId, maxElements = 150, options = {}) {
     _saveTabMap(domain, map);
   }
 
+  // Attach pagination state to the returned array (backward-compat: callers
+  // that treat the return as an array still work; the pagination wrapper reads
+  // these extra properties to decide whether to continue to the next page).
+  map.seenSet = seenSet;
+  map.starterSig = starterSig;
+  map.nextId = idCounter;
+  map.loopedBack = _loopedBack;
   return map;
 }
 
@@ -2220,8 +2323,24 @@ async function _executeAction(sessionId, step) {
       let _verify = await browserAct({
         action: 'evaluate', sessionId, headed: true, timeoutMs: 2000,
         text: `(() => {
-          const el = ${_fillRef ? `document.querySelector('[data-td-ref="${_fillRef}"]')` : 'document.activeElement'};
+          let el = ${_fillRef ? `document.querySelector('[data-td-ref="${_fillRef}"]')` : 'document.activeElement'};
+          // Fallback: if the ref is stale (React re-rendered the element) or no ref
+          // was recorded, use the currently focused element. Then find the actual
+          // contenteditable leaf (Notion and similar editors have wrapper divs as
+          // activeElement). This makes the verify robust against stale data-td-ref.
+          if (!el || el === document.body) el = document.activeElement;
           if (!el || el === document.body) return { ok: false };
+          if (el.isContentEditable) {
+            try {
+              const sel = window.getSelection();
+              if (sel && sel.rangeCount > 0) {
+                let node = sel.getRangeAt(0).startContainer;
+                if (node.nodeType === 3) node = node.parentElement;
+                while (node && !node.isContentEditable) node = node.parentElement;
+                if (node && node !== el && el.contains(node)) el = node;
+              }
+            } catch (_) {}
+          }
           const v = el.value !== undefined ? String(el.value) : (el.textContent || el.innerText || '');
           // inDialog verify: only count for combobox-like elements (INPUT/TEXTAREA/combobox),
           // not contenteditable blocks (e.g. Notion To-do) where text appearing in a dialog
@@ -3434,6 +3553,22 @@ function _urlsEquivalent(a, b) {
   } catch (_) { return false; }
 }
 
+// Helper: extract the product-identifying path from a URL (general, not
+// Amazon-specific). Recognizes common product path patterns:
+//   /dp/ASIN, /p/ID, /product/ID, /products/ID, /item/ID, /items/ID
+// Returns the path segment (e.g. "/dp/0310708257") or the full path if no
+// product pattern is recognized. Used by the post-click page-change guard
+// to detect wrong-product navigation (e.g. clicking a carousel "Add to Cart"
+// that navigates to a different product).
+function _extractProductPath(url) {
+  try {
+    const u = new URL(url);
+    const m = u.pathname.match(/\/(?:dp|p|product|products|item|items)\/([^/?#]+)/i);
+    if (m) return `/${m[1].toLowerCase()}`;
+    return u.pathname.replace(/\/$/, '').toLowerCase();
+  } catch (_) { return ''; }
+}
+
 async function _detectOverlay(sessionId, pageCategory) {
   try {
     const res = await browserAct({
@@ -3449,27 +3584,82 @@ async function _detectOverlay(sessionId, pageCategory) {
           const cx = r.x + r.width / 2;
           return (cx < window.innerWidth * 0.15 || cx > window.innerWidth * 0.85);
         };
-        // ── False-positive guard for layout containers ──────────────────
-        // Some apps (Google Cloud Console, AI Studio, Material Design sites)
-        // use role="dialog" or role="menu" on non-blocking page layout
-        // containers. These are NOT real modals — they span most of the
-        // viewport, have no interactive children, or aren't on top via z-index.
-        // Only treat them as overlays if they look like real blocking modals.
+
+        // ── Close button detection (scoped to inside candidate) ──────────
+        // Returns true if the candidate has a close/dismiss button in its
+        // top-right region (top 15%, right 15% of the candidate's bounding box).
+        // This is the strongest overlay signal — full-page editors never have
+        // a close X in their top-right, but modal headers almost always do.
+        const _hasCloseButton = (el, r) => {
+          const buttons = el.querySelectorAll('button, [role="button"], [aria-label*="close" i], [aria-label*="dismiss" i]');
+          for (const b of buttons) {
+            if (b.offsetParent === null) continue;
+            const br = b.getBoundingClientRect();
+            if (br.width <= 0 || br.height <= 0) continue;
+            // Must be in top-right region of the candidate
+            const inTop = (br.y - r.y) < (r.height * 0.15);
+            const inRight = (br.x + br.width) > (r.x + r.width * 0.85);
+            if (!inTop || !inRight) continue;
+            // Check if it looks like a close button
+            const ariaLabel = (b.getAttribute('aria-label') || '').toLowerCase();
+            const text = (b.innerText || b.textContent || '').trim();
+            const cls = (b.className || '').toLowerCase();
+            if (ariaLabel.includes('close') || ariaLabel.includes('dismiss')) return true;
+            if (/^[×✕✗X]$/.test(text)) return true;
+            if (cls.includes('close') || cls.includes('dismiss') || cls.includes('x-btn')) return true;
+            // SVG-icon-only button (no text, single SVG child) in top-right
+            if (!text && b.querySelectorAll('svg').length === 1 && b.children.length <= 1) return true;
+          }
+          return false;
+        };
+
+        // ── Header title detection (scoped to inside candidate) ─────────
+        // Returns true if the candidate has a heading element near its top
+        // (within top 20% of the candidate's bounding box).
+        const _hasHeaderTitle = (el, r) => {
+          const headings = el.querySelectorAll('h1, h2, h3, h4, h5, h6, [role="heading"]');
+          for (const h of headings) {
+            if (h.offsetParent === null) continue;
+            const hr = h.getBoundingClientRect();
+            if (hr.width <= 0 || hr.height <= 0) continue;
+            if ((hr.y - r.y) < (r.height * 0.20)) return true;
+          }
+          // Also check elements with header/title class near the top
+          const titled = el.querySelectorAll('[class*="header" i], [class*="title" i]');
+          for (const t of titled) {
+            if (t.offsetParent === null) continue;
+            const tr = t.getBoundingClientRect();
+            if (tr.width <= 0 || tr.height <= 0) continue;
+            if ((tr.y - r.y) < (r.height * 0.20)) return true;
+          }
+          return false;
+        };
+
+        // ── 5-signal weighted overlay scoring ───────────────────────────
+        // Replaces the old strict z-index gate. The close X is the most
+        // discriminating signal (full-page editors never have one), so it
+        // gets the highest weight. Header title is only supporting because
+        // Notion's page title would otherwise cause false positives.
+        //
+        // Threshold: score >= 3 AND at least one of {position, z-index}
+        // indicates overlay (the positioning prerequisite).
+        //
+        // The positioning prerequisite is critical for Notion/Google Docs
+        // safety: a full-page editor may have a title (header +1) and
+        // temporarily shrink below 90% viewport (bounds +1), but it will
+        // never be position: fixed/absolute/sticky with a non-auto z-index.
         const _isRealModal = (el) => {
           if (!el || el.offsetParent === null) return false;
           const r = el.getBoundingClientRect();
           if (r.width <= 0 || r.height <= 0) return false;
-          // alertdialog and aria-modal are always real modals
+          // alertdialog and aria-modal are always real modals by spec
           const _role = el.getAttribute('role') || '';
           const _ariaModal = el.getAttribute('aria-modal');
           if (_role === 'alertdialog' || _ariaModal === 'true') return true;
-          // ── Heuristic filters for role="dialog" / role="menu" ──
-          // 1. Viewport-span check: if the element covers >90% of viewport
-          //    width or height, it's likely a page layout container, not a modal
-          if (r.width > window.innerWidth * 0.9 || r.height > window.innerHeight * 0.9) return false;
-          // 2. Interactive children check: real modals have buttons, inputs,
-          //    links, or focusable elements inside them. Layout containers
-          //    may have role="dialog" but only contain divs/spans for layout.
+
+          // Interactive children prerequisite: a real modal has ≥1 visible
+          // button/input/contenteditable descendant. No amount of scoring
+          // should override an element with no interactive children.
           const _interactive = el.querySelectorAll('button, a, input, textarea, select, [role="button"], [role="link"], [role="menuitem"], [contenteditable="true"], [contenteditable=""]');
           let _visibleInteractive = 0;
           for (const ie of _interactive) {
@@ -3480,36 +3670,95 @@ async function _detectOverlay(sessionId, pageCategory) {
             }
           }
           if (_visibleInteractive === 0) return false;
-          // 3. z-index check: real modals are on top of the main content.
-          //    If the computed z-index is 'auto' or 0, it's likely a layout
-          //    container (real modals use z-index 100+).
+
+          // ── Compute 5 signals ──
+          let score = 0;
+          let posOk = false;
+
+          // Signal 1: Close button in top-right of candidate (STRONG +3)
+          if (_hasCloseButton(el, r)) score += 3;
+
+          // Signal 2: Header title in top of candidate (+1)
+          if (_hasHeaderTitle(el, r)) score += 1;
+
+          // Signal 3: Bounds — 200px–80% viewport, not a side panel (+1)
+          if (r.width >= 200 && r.height >= 200 &&
+              r.width <= window.innerWidth * 0.8 &&
+              r.height <= window.innerHeight * 0.8 &&
+              !_isSidePanel(el)) score += 1;
+
+          // Signal 4: z-index — non-auto, >= 100 (+1)
           const _z = window.getComputedStyle(el).zIndex;
-          if (_z === 'auto' || _z === '0') {
-            // Exception: if the element has a backdrop/overlay sibling, it's
-            // still a real modal even with z-index auto (some frameworks do this)
-            const _hasBackdrop = !!el.parentElement?.querySelector(':scope > [class*="backdrop"], :scope > [class*="scrim"], :scope > [class*="overlay"]');
-            if (!_hasBackdrop) return false;
-          }
-          return true;
+          const _zOk = (_z !== 'auto' && _z !== '0' && parseInt(_z, 10) >= 100);
+          if (_zOk) { score += 1; posOk = true; }
+
+          // Signal 5: position — fixed/absolute/sticky (+1)
+          const _pos = window.getComputedStyle(el).position;
+          const _posOk = (_pos === 'fixed' || _pos === 'absolute' || _pos === 'sticky');
+          if (_posOk) { score += 1; posOk = true; }
+
+          // Threshold: score >= 3 AND positioning prerequisite
+          return score >= 3 && posOk;
         };
-        const dialog = document.querySelector('[role="dialog"], [role="alertdialog"], [aria-modal="true"]');
-        if (dialog && _isRealModal(dialog) && !_isSidePanel(dialog)) return true;
+
+        // ── Check all dialog candidates, not just the first ──────────────
+        // Some pages have multiple role="dialog" elements; the first one
+        // may be a layout container while the real modal is later in DOM
+        // order.
+        const dialogs = document.querySelectorAll('[role="dialog"], [role="alertdialog"], [aria-modal="true"]');
+        for (const dialog of dialogs) {
+          if (_isRealModal(dialog) && !_isSidePanel(dialog)) return true;
+        }
         const menu = document.querySelector('[role="menu"], [role="listbox"]');
         if (menu && _isRealModal(menu)) return true;
         const classMatch = document.querySelector('.modal:not([hidden]), .popup:not([hidden]), .overlay:not([hidden]), .drawer:not([hidden]), .sheet:not([hidden])');
         if (classMatch && _isRealModal(classMatch) && !_isSidePanel(classMatch)) return true;
-        // Fallback: visible form panel (Google Calendar create event, etc.)
-        // A visible input with "title" placeholder suggests a form panel/dialog.
-        // Skip this fallback for spreadsheets — the document title input is
-        // always present at the top of Google Sheets and is NOT a blocking
-        // overlay. Real dialogs (Insert, Data validation) are caught by the
-        // role="dialog" / .modal checks above.
+
+        // ── Generic form-panel fallback (with full-page editor guard) ───
+        // For dialogs that don't use role="dialog" (some custom frameworks).
+        // CRITICAL: must never match a full-page editor (Notion, Google Docs,
+        // Confluence). Require position: fixed/absolute/sticky OR a dialog/
+        // modal ancestor. This prevents Notion's editor from ever matching.
         ${pageCategory === 'spreadsheet' ? '' : `
-        const titleInput = document.querySelector('input[placeholder*="title" i], input[aria-label*="title" i]');
-        if (titleInput && titleInput.offsetParent !== null) {
-          const r = titleInput.getBoundingClientRect();
-          if (r.width > 0 && r.height > 0) return true;
+        const _isInsideModal = (el) => {
+          return !!(el.closest('[role="dialog"], [role="alertdialog"], [aria-modal="true"], .modal, .popup, .sheet'));
+        };
+        const _hasFormFields = (el) => {
+          const fillable = el.querySelectorAll('input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"]):not([type="submit"]):not([type="button"]):not([type="file"]), textarea, [contenteditable="true"], [contenteditable=""], [role="textbox"]');
+          let count = 0;
+          for (const f of fillable) {
+            const fr = f.getBoundingClientRect();
+            if (fr.width > 0 && fr.height > 0 && f.offsetParent !== null) count++;
+          }
+          return count;
+        };
+        const _hasButtons = (el) => {
+          const btns = el.querySelectorAll('button, [role="button"]');
+          let count = 0;
+          for (const b of btns) {
+            const br = b.getBoundingClientRect();
+            if (br.width > 0 && br.height > 0 && b.offsetParent !== null) count++;
+          }
+          return count;
+        };
+        // Scan for form-panel candidates
+        const candidates = document.querySelectorAll('div, section, aside, form');
+        for (const cand of candidates) {
+          if (cand.offsetParent === null) continue;
+          const cr = cand.getBoundingClientRect();
+          if (cr.width <= 0 || cr.height <= 0) continue;
+          // Must be < 90% viewport (not a full-page editor)
+          if (cr.width > window.innerWidth * 0.9 || cr.height > window.innerHeight * 0.9) continue;
+          if (_isSidePanel(cand)) continue;
+          // Must have 2+ fillable fields AND 1+ buttons
+          if (_hasFormFields(cand) < 2 || _hasButtons(cand) < 1) continue;
+          // Full-page editor guard: must be positioned or inside a modal ancestor
+          const _cpos = window.getComputedStyle(cand).position;
+          const _cposOk = (_cpos === 'fixed' || _cpos === 'absolute' || _cpos === 'sticky');
+          if (!_cposOk && !_isInsideModal(cand)) continue;
+          return true;
         }`}
+
         return false;
       })()`,
     });
@@ -3652,9 +3901,8 @@ async function _readTodoListItems(sessionId) {
     });
     let raw = '';
     if (res?.stdout) {
-      const _m = res.stdout.match(/^([\s\S]*?)(?=###\s|$)/i);
-      raw = _m ? _m[1].trim() : res.stdout.trim();
-      if (raw.startsWith('"') && raw.endsWith('"')) raw = raw.slice(1, -1).replace(/\\"/g, '"');
+      raw = _parseCliResult(res.stdout);
+      if (typeof raw !== 'string') raw = JSON.stringify(raw);
     } else {
       raw = String(res?.result || '').replace(/^"|"$/g, '');
     }
@@ -4963,6 +5211,35 @@ const _GLOBAL_NAV_KEY_SET = new Set([
 // gate DONE on checklist completion so a single Tab-Map sub-plan can't
 // declare the overall goal achieved when only 2/7 flow steps ran.
 
+// Check if a Tab-Map sub-plan step semantically accomplishes a Tab-Flow step.
+// Used to advance the flow index in real-time as each sub-plan step executes,
+// so the flow stays in sync when a sub-plan over-delivers (e.g., extracts
+// "type title + click Save" for a flow step that only said "type title").
+function _subPlanStepMatchesFlowStep(subStep, flowStep) {
+  if (!subStep || !flowStep) return false;
+  const _subAction = String(subStep.action || '').toLowerCase();   // type, click, press
+  const _subTarget = String(subStep.target || '').toLowerCase();
+  const _subValue  = String(subStep.value  || '').toLowerCase();
+  const _subKey    = String(subStep.key    || '').toLowerCase();
+  const _flowAction = String(flowStep.action || '').toLowerCase();
+
+  // Verb alignment: type→type/fill, click→click/press/save, press→press/save/enter
+  const _verbMatch =
+    (_subAction === 'type'  && /type|fill|enter/i.test(_flowAction)) ||
+    (_subAction === 'click' && /click|press|save|submit|send|create|open|select/i.test(_flowAction)) ||
+    (_subAction === 'press' && /press|save|submit|send|enter/i.test(_flowAction));
+  if (!_verbMatch) return false;
+
+  // Value overlap: if the sub-plan step types a value, check it appears in the flow step
+  if (_subValue && _subValue.length > 2 && _flowAction.includes(_subValue)) return true;
+
+  // Target/key word overlap: e.g., sub-plan target "button 'Save'" → flow step
+  // "press Cmd+Enter to save" → "save" word overlap
+  const _targetWords = (_subTarget + ' ' + _subKey).match(/[a-z]{3,}/gi) || [];
+  const _flowWords = _flowAction.match(/[a-z]{3,}/gi) || [];
+  return _targetWords.some(w => _flowWords.includes(w));
+}
+
 // Returns true if all non-done (tier !== 0) steps in the flow have been
 // completed (i.e., flowIndex points past the last action step).
 function _flowComplete(tabFlow, flowIndex) {
@@ -4978,12 +5255,27 @@ function _flowComplete(tabFlow, flowIndex) {
 // If the page navigated, skip past tier-3 navigation/focus steps — the
 // navigation already happened, just via a different tier (e.g., Tab-Map
 // clicked a link instead of pressing Enter in a search field).
-function _reconcileFlowIndex(tabFlow, flowIndex, currentUrl, prevUrl, logger, actionHistory = [], stepResult = null) {
+function _reconcileFlowIndex(tabFlow, flowIndex, currentUrl, prevUrl, logger, actionHistory = [], stepResult = null, progressCallbackUrl = null, stepIndex = 0, agentId = '', sessionId = '') {
   if (!tabFlow || flowIndex >= tabFlow.length) return flowIndex;
   if (currentUrl && prevUrl && currentUrl !== prevUrl) {
     while (flowIndex < tabFlow.length && tabFlow[flowIndex].tier === 3) {
       flowIndex++;
       if (logger) logger.info(`[instruction.runner] Tab-Flow: reconciling — skipping tier 3 step (page already navigated) → step ${flowIndex}`);
+      _emitProgress(progressCallbackUrl, stepIndex, {
+        type: 'tab_flow:step_done',
+        flowIndex,
+        totalSteps: tabFlow.length,
+      }, agentId, sessionId);
+      // Emit step_start for the new step
+      if (flowIndex < tabFlow.length) {
+        _emitProgress(progressCallbackUrl, stepIndex, {
+          type: 'tab_flow:step_start',
+          flowIndex,
+          totalSteps: tabFlow.length,
+          tier: tabFlow[flowIndex].tier,
+          action: tabFlow[flowIndex].action || '',
+        }, agentId, sessionId);
+      }
     }
   }
   // Advance tier 4 steps when the last executed action semantically matches the
@@ -4997,10 +5289,20 @@ function _reconcileFlowIndex(tabFlow, flowIndex, currentUrl, prevUrl, logger, ac
     // Check if the click navigated to a different page (wrong element)
     // Use stepResult.stateChanged if available (captures post-click URL change),
     // otherwise fall back to currentUrl/prevUrl comparison.
+    // Also fire when the step result is a "navigate" action — the flow step was
+    // supposed to click a button, not navigate. Navigating to a different page
+    // doesn't complete the flow step.
+    const _isNavigateAction = String(actionHistory[actionHistory.length - 1] || '').toLowerCase().includes('navigate');
     const _navigatedAway = stepResult?.stateChanged && currentUrl && prevUrl && currentUrl !== prevUrl &&
-      !/credentials|api\/key|apis\/credentials/i.test(currentUrl);
+      (_isNavigateAction || !/credentials|api\/key|apis\/credentials/i.test(currentUrl));
     if (_navigatedAway) {
       if (logger) logger.warn(`[instruction.runner] Tab-Flow: click "${_lastAction.slice(0, 60)}" navigated away from expected page — wrong element, not advancing flow index`);
+      _emitProgress(progressCallbackUrl, stepIndex, {
+        type: 'tab_flow:step_failed',
+        flowIndex,
+        totalSteps: tabFlow.length,
+        reason: 'navigated_away',
+      }, agentId, sessionId);
       return flowIndex; // don't advance — the click was on the wrong element
     }
     // Extract key action words from the flow step (e.g., "create", "api key", "copy")
@@ -5012,7 +5314,71 @@ function _reconcileFlowIndex(tabFlow, flowIndex, currentUrl, prevUrl, logger, ac
     if (_matched) {
       flowIndex++;
       if (logger) logger.info(`[instruction.runner] Tab-Flow: reconciling — advancing past tier 4 step (action "${_lastAction.slice(0, 60)}" matches flow step) → step ${flowIndex}`);
+      _emitProgress(progressCallbackUrl, stepIndex, {
+        type: 'tab_flow:step_done',
+        flowIndex,
+        totalSteps: tabFlow.length,
+      }, agentId, sessionId);
+      // Emit step_start for the new step
+      if (flowIndex < tabFlow.length) {
+        _emitProgress(progressCallbackUrl, stepIndex, {
+          type: 'tab_flow:step_start',
+          flowIndex,
+          totalSteps: tabFlow.length,
+          tier: tabFlow[flowIndex].tier,
+          action: tabFlow[flowIndex].action || '',
+        }, agentId, sessionId);
+      }
     }
+  }
+  return flowIndex;
+}
+
+// State-based resync: advance _flowIndex past all flow steps whose expected
+// state has already been achieved, based on filledFields and actionHistory.
+// More robust than per-step action-text matching — looks at actual state.
+function _resyncFlowIndex(tabFlow, flowIndex, filledFields, actionHistory, logger) {
+  if (!tabFlow || flowIndex >= tabFlow.length) return flowIndex;
+  let advanced = false;
+  while (flowIndex < tabFlow.length) {
+    const step = tabFlow[flowIndex];
+    const action = String(step.action || '').toLowerCase();
+    // Done step — advance if all prior steps are complete
+    if (step.tier === 0) { flowIndex++; advanced = true; continue; }
+    // Fill/type step: extract value from 'value' after =
+    const valueMatch = action.match(/=\s*['"]([^'"]+)['"]/);
+    if (valueMatch) {
+      const expectedValue = valueMatch[1].toLowerCase().trim();
+      const filled = (filledFields || []).some(f =>
+        String(f.value || '').toLowerCase().trim() === expectedValue
+      );
+      if (filled) { flowIndex++; advanced = true; continue; }
+      else break; // not filled yet — stop here
+    }
+    // Click submit step: check actionHistory for a matching click.
+    // Prefer a quoted target ANYWHERE in the action (e.g. "click the 'Add to Cart'
+    // button" → "add to cart"). Falling back to an unquoted capture and stripping
+    // leading articles prevents degenerate targets like "the" matching any prior
+    // click that happens to contain that word (caused premature flow completion —
+    // e.g. 'click "The Jesus Storybook Bible"' satisfied the 'Add to Cart' step).
+    const clickMatch = action.match(/['"]([^'"]{2,})['"]/) ||
+                       action.match(/click\s+([^'"→]+)/);
+    if (clickMatch) {
+      const target = clickMatch[1].trim().toLowerCase().replace(/^(?:the|a|an)\s+/, '');
+      const submitted = target.length >= 3 &&
+        !/^(?:it|this|that|button|link|here|on)$/i.test(target) &&
+        (actionHistory || []).some(a =>
+          a.toLowerCase().includes('click') &&
+          a.toLowerCase().includes(target) &&
+          (a.includes('→ page changed') || a.includes('→ ok'))
+        );
+      if (submitted) { flowIndex++; advanced = true; continue; }
+      else break;
+    }
+    break; // unknown step type — don't advance
+  }
+  if (advanced && logger) {
+    logger.info(`[instruction.runner] Tab-Flow: resync — advanced to step ${flowIndex}/${tabFlow.length} based on filledFields (${(filledFields || []).length}) and actionHistory (${(actionHistory || []).length})`);
   }
   return flowIndex;
 }
@@ -5231,7 +5597,7 @@ async function _executeTabMapAction(sessionId, parsed, tabMap, overlayActive, pa
       const _targetLabel = (parsed.target || '').toLowerCase().trim();
       if (!_fuzzyTextMatch(_targetLabel, _pickedLabel)) {
         // LLM picked the wrong element — try deterministic match first
-        const _detMatch = await _matchElementToStep(sessionId, { target: parsed.target }, tabMap);
+        const _detMatch = await _matchElementToStep(sessionId, { target: parsed.target }, _sweepTabMap(tabMap, parsed.target));
         if (_detMatch) {
           const _detLabel = (_detMatch.text || _detMatch.ariaLabel || _detMatch.placeholder || '').toLowerCase().trim();
           if (_fuzzyTextMatch(_targetLabel, _detLabel)) {
@@ -5254,40 +5620,62 @@ async function _executeTabMapAction(sessionId, parsed, tabMap, overlayActive, pa
       logger.warn(`[instruction.runner] Tab-Map type: matched element has no ref — cannot focus, aborting`);
       return { ok: false, pageChanged: false, error: `Matched element "${parsed.target}" has no ref — cannot focus`, rescan: true };
     }
+    let _clickOk = false;
     try {
-      await browserAct({ action: 'click', sessionId, selector: cssSelector, headed: true, timeoutMs: 5000 });
+      const clickResult = await browserAct({ action: 'click', sessionId, selector: cssSelector, headed: true, timeoutMs: 2000 });
+      _clickOk = !!clickResult?.ok;
     } catch (e) {
       logger.warn(`[instruction.runner] Tab-Map type: click field error: ${e.message}`);
+    }
+
+    // ── Tab-to-ref fallback ──
+    // If CSS click failed (zero-size React comboboxes like Gmail To/CC/BCC
+    // where el.focus() is untrusted and rejected by React), use Tab navigation
+    // (trusted keyboard event) to return to the target — same mechanism the
+    // Tab-Map scan used to visit it.
+    let _tabbed = false;
+    if (!_clickOk) {
+      logger.info(`[instruction.runner] Tab-Map type: CSS click failed for "${parsed.target}" — trying Tab navigation to ref=${pickedEntry.ref}`);
+      _tabbed = await _tabToRef(sessionId, pickedEntry.ref);
+      if (_tabbed) {
+        logger.info(`[instruction.runner] Tab-Map type: Tab-navigated to "${parsed.target}" (ref=${pickedEntry.ref})`);
+      } else {
+        logger.warn(`[instruction.runner] Tab-Map type: Tab navigation also failed for "${parsed.target}" — aborting`);
+        return { ok: false, pageChanged: false, error: `Click and Tab both failed to focus "${parsed.target}"`, rescan: true };
+      }
     }
     await _sleep(300);
 
     // Verify focus moved to the target element before typing.
-    // Without this, typing goes into document.activeElement (e.g. a spreadsheet
+    // Skip when Tab navigation succeeded — focus is on the target by construction.
+    // Without this check, typing goes into document.activeElement (e.g. a spreadsheet
     // cell) and the verify step falsely passes because the cell now contains the text.
-    const _focusCheck = await browserAct({
-      action: 'evaluate', sessionId, headed: true, timeoutMs: 2000,
-      text: `(() => {
-        let el = document.activeElement;
-        if (!el || el === document.body) return { matches: false };
-        let ref = el.getAttribute('data-td-ref') || '';
-        // Walk to contenteditable leaf (same as _readActiveElement)
-        if (!ref && el.isContentEditable) {
-          try {
-            const sel = window.getSelection();
-            if (sel && sel.rangeCount > 0) {
-              let node = sel.getRangeAt(0).startContainer;
-              if (node.nodeType === 3) node = node.parentElement;
-              while (node && !node.isContentEditable) node = node.parentElement;
-              if (node && node !== el) ref = node.getAttribute('data-td-ref') || '';
-            }
-          } catch (_) {}
-        }
-        return { matches: ref === ${JSON.stringify(pickedEntry.ref)}, activeRef: ref };
-      })()`,
-    });
-    if (!_focusCheck?.result?.matches) {
-      logger.warn(`[instruction.runner] Tab-Map type: focus not on target (activeRef=${_focusCheck?.result?.activeRef || 'none'}, expected=${pickedEntry.ref}) — aborting`);
-      return { ok: false, pageChanged: false, error: `Click failed to focus "${parsed.target}" — focus on wrong element`, rescan: true };
+    if (!_tabbed) {
+      const _focusCheck = await browserAct({
+        action: 'evaluate', sessionId, headed: true, timeoutMs: 2000,
+        text: `(() => {
+          let el = document.activeElement;
+          if (!el || el === document.body) return { matches: false };
+          let ref = el.getAttribute('data-td-ref') || '';
+          // Walk to contenteditable leaf (same as _readActiveElement)
+          if (!ref && el.isContentEditable) {
+            try {
+              const sel = window.getSelection();
+              if (sel && sel.rangeCount > 0) {
+                let node = sel.getRangeAt(0).startContainer;
+                if (node.nodeType === 3) node = node.parentElement;
+                while (node && !node.isContentEditable) node = node.parentElement;
+                if (node && node !== el) ref = node.getAttribute('data-td-ref') || '';
+              }
+            } catch (_) {}
+          }
+          return { matches: ref === ${JSON.stringify(pickedEntry.ref)}, activeRef: ref };
+        })()`,
+      });
+      if (!_focusCheck?.result?.matches) {
+        logger.warn(`[instruction.runner] Tab-Map type: focus not on target (activeRef=${_focusCheck?.result?.activeRef || 'none'}, expected=${pickedEntry.ref}) — aborting`);
+        return { ok: false, pageChanged: false, error: `Click failed to focus "${parsed.target}" — focus on wrong element`, rescan: true };
+      }
     }
 
     // Execute the type action (includes reactFill, chip confirmation)
@@ -5353,6 +5741,12 @@ async function _matchElementToStep(sessionId, step, tabMap) {
     else if (_fuzzyTextMatch(target, label)) score += 1;
     else return 0; // no label match at all
 
+    // Sponsored/ad demotion: on search-results pages the first clickable match
+    // is often a sponsored card. Demote (not remove) sponsored elements so
+    // organic results win, while still allowing sponsored targets when the
+    // goal explicitly asks for them.
+    if (e.isSponsored && !/sponsored|promoted|advertis/i.test(target)) score -= 2;
+
     if (!_isTypeAction) return score;
 
     // For type actions: must be typeable (filter out buttons/menu items)
@@ -5373,10 +5767,18 @@ async function _matchElementToStep(sessionId, step, tabMap) {
     return score;
   };
 
-  // Score all elements and pick the highest
+  // Score all elements and pick the highest.
+  // Tie-break by largest area (primary action buttons are bigger than table-row
+  // buttons), then by smallest y (buy box / main action area is higher on page).
   const scored = tabMap.map(e => ({ entry: e, score: _scoreElement(e) }))
                        .filter(s => s.score > 0)
-                       .sort((a, b) => b.score - a.score);
+                       .sort((a, b) => {
+                         if (b.score !== a.score) return b.score - a.score;
+                         const _aArea = (a.entry.w || 0) * (a.entry.h || 0);
+                         const _bArea = (b.entry.w || 0) * (b.entry.h || 0);
+                         if (_bArea !== _aArea) return _bArea - _aArea;
+                         return (a.entry.y || 0) - (b.entry.y || 0);
+                       });
 
   if (scored.length > 0) {
     const best = scored[0];
@@ -5388,11 +5790,11 @@ async function _matchElementToStep(sessionId, step, tabMap) {
   // LLM fallback — ask which element ID matches
   const { askWithMessages } = require('../skill-helpers/skill-llm.cjs');
   const elementList = tabMap.map(e =>
-    `${e.id} - ${e.tag || ''} "${e.text || e.ariaLabel || ''}" ${e.role || ''}`
+    `${e.id} - ${e.tag || ''} "${e.text || e.ariaLabel || ''}" ${e.role || ''}${e.isSponsored ? ' [SPONSORED]' : ''}`
   ).join('\n');
   try {
     const raw = await askWithMessages([
-      { role: 'system', content: 'Return ONLY the element ID number that best matches the target. No other text.' },
+      { role: 'system', content: 'Return ONLY the element ID number that best matches the target. No other text. Elements marked [SPONSORED] are ads — prefer non-sponsored elements unless the target explicitly asks for a sponsored/ad result.' },
       { role: 'user', content: `Target: "${step.target}"\nElements:\n${elementList}\n\nWhich element ID matches?` },
     ], { maxTokens: 5, temperature: 0.1, responseTimeoutMs: 5000 });
     const num = parseInt((raw || '').trim().replace(/\D/g, ''), 10);
@@ -5407,10 +5809,307 @@ async function _matchElementToStep(sessionId, step, tabMap) {
   return null;
 }
 
+// Sentinel returned by _classifyOnPageAction when the target is an on-page
+// action but no element meets the strength threshold. The caller uses this to
+// decide between paginating (more tab-map pages) vs. marking Tab-Map exhausted
+// for this state (if the scan already looped back to the original starter).
+const ON_PAGE_NOT_FOUND = Symbol('on-page-not-found');
+
+// On-page action targets: single click of a known button label. These are
+// commerce/mutation actions performed on the current page (no navigation).
+// The regex is intentionally general — matches "add to cart", "add it to the
+// cart", "add the first result to the cart", "buy now", "add to bag/basket",
+// "add to wishlist", etc. across sites (Amazon, Target, Etsy, etc.). It allows
+// optional words ("it", "the", "to the", "first result", product names) between
+// "add" and "to ... cart/bag/basket" so decomposed multi-step goals like
+// "add the first result to the cart" are still detected as on-page actions.
+const _ON_PAGE_ACTION_RE = /\b(?:add\b[^.]{0,40}?\bto\b[^.]{0,20}?\b(?:cart|bag|basket|wishlist|wish ?list|favorites?|watch ?later)\b|buy\s+now|subscribe\s+(?:now|to))\b/i;
+
+// Detects whether a goal is an on-page action (single click of a known button
+// on the current page, no navigation). Returns the normalized target label
+// (e.g. "Add to Cart") if it is, or null if it isn't.
+function _detectOnPageAction(goal) {
+  if (!goal) return null;
+  const m = _ON_PAGE_ACTION_RE.exec(String(goal));
+  if (!m) return null;
+  // Normalize the matched phrase to a canonical button label.
+  const _raw = m[0].replace(/\s+/g, ' ').trim().toLowerCase();
+  if (/buy\s+now/.test(_raw)) return 'Buy Now';
+  if (/subscribe/.test(_raw)) return 'Subscribe';
+  if (/wishlist|wish ?list/.test(_raw)) return 'Add to Wishlist';
+  if (/favorites?/.test(_raw)) return 'Add to Favorites';
+  if (/watch ?later/.test(_raw)) return 'Add to Watch Later';
+  if (/bag/.test(_raw)) return 'Add to Bag';
+  if (/basket/.test(_raw)) return 'Add to Basket';
+  if (/cart/.test(_raw)) return 'Add to Cart';
+  return m[0].replace(/\s+/g, ' ').trim();
+}
+
+// Whether to force a focus reset to page top before building the tab-map.
+// On shopping product pages the primary action button (Add to Cart, Buy Now)
+// lives in the buybox near the top. When a session is reused after a previous
+// click (e.g. clicking a search result), skipReset=true would start the scan
+// mid-page and miss the buybox. Override to reset focus for shopping primary-
+// action goals so the scan reaches the buybox. Never override when an overlay
+// is open (overlay scans must keep skipReset=true).
+function _shouldForceFocusReset(goal, pageCategory, overlayActive) {
+  if (overlayActive) return false;
+  if (pageCategory !== 'shopping') return false;
+  return !!_detectOnPageAction(goal);
+}
+
+// True if a step target label is an on-page primary action button (Add to Cart,
+// Buy Now, Add to Bag, etc.). Used to decide which clicks get the post-click
+// page-change guard. Broader than _detectOnPageAction (which parses the whole
+// goal) — this matches a bare button label like "Add to Cart".
+const _ON_PAGE_ACTION_LABEL_RE = /^(?:add\s+to\s+(?:cart|bag|basket|wishlist|wish ?list|favorites?|watch ?later)|buy\s+now|subscribe(?:\s+now)?|add\s+to\s+order)$/i;
+function _isOnPageActionLabel(label) {
+  if (!label) return false;
+  return _ON_PAGE_ACTION_LABEL_RE.test(String(label).trim());
+}
+
+// Known ad/tracking redirect domains. A click that navigates here is an
+// ad/affiliate link, not the primary action — reject and retry the next
+// candidate. General list, not site-specific.
+const _AD_TRACKING_DOMAINS = [
+  'amazon-adsystem.com', 'doubleclick.net', 'googleadservices.com',
+  'googlesyndication.com', 'adservice.google.com', 'adnxs.com',
+  'criteo.com', 'taboola.com', 'outbrain.com', 'facebook.com/tr',
+  'analytics.google.com', 'googletagmanager.com', 'scorecardresearch.com',
+  'ads.yahoo.com', 'advertising.com', 'moatads.com', 'rubiconproject.com',
+  'pubmatic.com', 'openx.net', 'casalemedia.com', '3lift.com',
+];
+function _isAdOrTrackingDomain(url) {
+  if (!url) return false;
+  try {
+    const _host = String(url).replace(/^https?:\/\//, '').split('/')[0].toLowerCase();
+    return _AD_TRACKING_DOMAINS.some(d => _host === d || _host.endsWith('.' + d));
+  } catch (_) { return false; }
+}
+
+// Classify an on-page action target against the current tab-map with a
+// strength threshold. This is stricter than _matchElementToStep: it rejects
+// weak/ambiguous matches (e.g. a carousel "Add to Cart" for a different
+// product) so the caller can paginate to find the strong exact buybox button.
+//
+// Returns:
+//   { entry }       — a strong match was found (accept)
+//   ON_PAGE_NOT_FOUND — target is an on-page action but no strong match (reject)
+//   null            — target is NOT an on-page action (caller falls through
+//                     to the existing _extractSteps planner)
+//
+// Strength threshold:
+//   - Accept if best score >= 3 (exact label match)
+//   - OR best score >= 2 AND element is large (w*h >= 20000) AND high on page
+//     (y < 600) AND not sponsored — the buybox button is large and near the top
+//   - Otherwise reject (ON_PAGE_NOT_FOUND) so pagination continues
+async function _classifyOnPageAction(goal, tabMap, ctx = {}) {
+  const target = _detectOnPageAction(goal);
+  if (!target) return null; // not an on-page action — caller falls through
+
+  const _targetLower = target.toLowerCase();
+  const _isProductPageUrl = /\/(?:dp|p|product|products|item|items)\//i.test(ctx.currentUrl || '');
+  const _consumedRefs = ctx.consumedRefs || new Set();
+
+  // Score each element using the same label-matching logic as _matchElementToStep
+  const _scoreElement = (e) => {
+    // Exclude already-tried refs (wrong-target retries)
+    if (e.ref && _consumedRefs.has(e.ref)) return 0;
+    const label = (e.text || e.ariaLabel || '').toLowerCase().trim();
+    if (!label) return 0;
+    let score = 0;
+    if (label === _targetLower) score += 3;
+    else if (label.includes(_targetLower) || _targetLower.includes(label)) score += 2;
+    else if (_fuzzyTextMatch(_targetLower, label)) score += 1;
+    else return 0;
+
+    // Demote sponsored elements (carousel/related-products area)
+    if (e.isSponsored) score -= 2;
+    return score;
+  };
+
+  const scored = (tabMap || [])
+    .map(e => ({ entry: e, score: _scoreElement(e) }))
+    .filter(s => s.score > 0)
+    .sort((a, b) => {
+      if (b.score !== a.score) return b.score - a.score;
+      const _aArea = (a.entry.w || 0) * (a.entry.h || 0);
+      const _bArea = (b.entry.w || 0) * (b.entry.h || 0);
+      if (_bArea !== _aArea) return _bArea - _aArea;
+      return (a.entry.y || 0) - (b.entry.y || 0);
+    });
+
+  if (scored.length === 0) {
+    logger.info(`[instruction.runner] _classifyOnPageAction: no match for "${target}" (tab-map has ${tabMap?.length || 0} elements) → NOT_FOUND`);
+    return ON_PAGE_NOT_FOUND;
+  }
+
+  const best = scored[0];
+  const _area = (best.entry.w || 0) * (best.entry.h || 0);
+  const _high = (best.entry.y || 0) < 600;
+  const _large = _area >= 20000;
+  const _notSponsored = !best.entry.isSponsored;
+
+  // Strength threshold: exact match (score>=3) always accepted.
+  // Weak match (score=2) accepted only if large + high + not sponsored
+  // (the buybox button profile). Otherwise reject so pagination continues.
+  const _accept = best.score >= 3 || (best.score >= 2 && _large && _high && _notSponsored);
+
+  if (_accept) {
+    logger.info(`[instruction.runner] _classifyOnPageAction: accepted "${target}" → #${best.entry.id} (score=${best.score}, area=${_area}, y=${best.entry.y || '?'}, sponsored=${!!best.entry.isSponsored})`);
+    return { entry: best.entry };
+  }
+
+  logger.info(`[instruction.runner] _classifyOnPageAction: weak match "${target}" → #${best.entry.id} (score=${best.score}, area=${_area}, y=${best.entry.y || '?'}, sponsored=${!!best.entry.isSponsored}) → NOT_FOUND (will paginate or exhaust)`);
+  return ON_PAGE_NOT_FOUND;
+}
+
+// ---------------------------------------------------------------------------
+// _sweepTabMap: general deterministic noise filter (no LLM, no I/O, no
+// site-specific selectors). Runs after every tab-map scan (fast path AND
+// Tab-Flow steps). Returns a small candidate array (cap 20) of elements most
+// relevant to the goal. Both the _extractSteps planner and the matcher consume
+// the swept set instead of the raw map, so neither sees chrome/carousel noise.
+//
+// Criteria (all general):
+//   1. Actionability: has ref, non-empty label or typeable, visible geometry
+//   2. Off-screen: drop elements far outside the viewport
+//   3. Chrome: drop header/footer band elements UNLESS they match a goal term
+//   4. Sponsored/ads: drop isSponsored unless goal explicitly says sponsored/ad
+//   5. Goal relevance: keep term-matching elements + large non-chrome buttons
+//      + typeable non-chrome fields
+//   6. Duplicate-label collapse: keep best instance per normalized label
+// ---------------------------------------------------------------------------
+const _SWEEP_STOP = new Set([
+  'the','a','an','and','or','to','for','of','in','on','at','by','with','from',
+  'into','then','first','result','results','item','items','page','site','website',
+  'go','open','navigate','search','find','click','add','my','your','their','this',
+  'that','it','is','are','was','were','be','been','being','have','has','had','do',
+  'does','did','will','would','can','could','should','shall','may','might','must',
+  'i','you','he','she','we','they','me','him','her','us','them','please','want',
+  'need','help','make','get','put','set','use','using','used','new','now','here',
+  'there','up','down','out','over','under','again','more','most','some','any','all',
+  'each','every','other','such','only','own','same','so','than','too','very','just',
+  'about','above','after','against','before','below','between','during','further',
+  'once','off','because','as','until','while','if','but','not','no','yes',
+]);
+const _SWEEP_ACTION_TERMS = new Set([
+  'cart','bag','basket','buy','purchase','checkout','sign','login','log','submit',
+  'send','save','delete','remove','cancel','close','confirm','continue','next',
+  'back','play','pause','follow','like','share','comment','post','reply','subscribe',
+  'join','register','create','edit','update','download','upload','copy','paste',
+  'select','choose','pick','view','show','hide','expand','collapse','enable',
+  'disable','accept','reject','decline','agree','apply','reset','clear','order',
+  'wishlist','favorites','favorite','search','query',
+]);
+
+function _sweepTabMap(tabMap, goal, ctx = {}) {
+  if (!tabMap || tabMap.length === 0) return [];
+  const _viewportW = ctx.viewportW || 1440;
+  const _viewportH = ctx.viewportH || 900;
+  const _goalLower = String(goal || '').toLowerCase();
+  const _goalHasSponsored = /\bsponsored\b|\bpromoted\b|\badvertis|\bad\b/.test(_goalLower);
+
+  // Goal key terms: meaningful tokens (len>=3, not stopwords) + action terms
+  const _goalTerms = (_goalLower.match(/[a-z']+/g) || [])
+    .map(t => t.trim())
+    .filter(t => t.length >= 3 && !_SWEEP_STOP.has(t));
+  const _termSet = new Set([..._goalTerms, ..._SWEEP_ACTION_TERMS]);
+
+  const _matchesTerm = (e) => {
+    const label = ((e.text || '') + ' ' + (e.ariaLabel || '') + ' ' + (e.placeholder || '')).toLowerCase();
+    if (!label.trim()) return false;
+    for (const t of _termSet) {
+      if (label.includes(t)) return true;
+    }
+    return false;
+  };
+  const _area = (e) => (e.w || 0) * (e.h || 0);
+  const _isTypeable = (e) => e.tag === 'input' || e.tag === 'textarea' ||
+    e.isContentEditable || e.role === 'textbox' || e.role === 'combobox';
+  const _isClickable = (e) => e.tag === 'button' || e.tag === 'a' ||
+    e.role === 'button' || e.role === 'link' || e.role === 'menuitem' || e.role === 'tab';
+  // Header band (search bar, nav, logo). Footer band = fully below the fold.
+  const _isChromeBand = (e) => {
+    const y = e.y || 0;
+    if (y < 80) return true;              // header strip
+    if (y > _viewportH) return true;      // fully below the fold
+    return false;
+  };
+  const _isFarOffscreen = (e) => {
+    const x = e.x || 0, y = e.y || 0, w = e.w || 0, h = e.h || 0;
+    if (x + w < -100 || x > _viewportW + 100) return true;
+    if (y + h < -100) return true;        // scrolled far above
+    return false;
+  };
+
+  // Stage 1: actionability + off-screen + sponsored
+  let swept = tabMap.filter(e => {
+    if (!e.ref) return false;
+    const _label = ((e.text || '') + ' ' + (e.ariaLabel || '') + ' ' + (e.placeholder || '')).trim();
+    if (!_label && !_isTypeable(e)) return false;
+    if (_area(e) < 200 && !_isTypeable(e)) return false;
+    if (_isFarOffscreen(e)) return false;
+    if (e.isSponsored && !_goalHasSponsored) return false;
+    return true;
+  });
+
+  // Stage 2: relevance — keep term matches (any position), large non-chrome
+  // buttons, and typeable non-chrome fields. Drop chrome that doesn't match.
+  swept = swept.filter(e => {
+    if (_matchesTerm(e)) return true;                 // term match overrides chrome
+    if (_isChromeBand(e)) return false;               // chrome without term match → drop
+    if (_isClickable(e) && !e.isSponsored && _area(e) >= 8000) return true;  // large primary-action candidate
+    if (_isTypeable(e)) return true;                  // form fields
+    return false;
+  });
+
+  // Stage 3: duplicate-label collapse — keep best instance per normalized label
+  const _byLabel = new Map();
+  const _labelless = [];
+  for (const e of swept) {
+    const _norm = ((e.text || '') + ' ' + (e.ariaLabel || '')).toLowerCase().trim().replace(/\s+/g, ' ');
+    if (!_norm) { _labelless.push(e); continue; }
+    const _existing = _byLabel.get(_norm);
+    if (!_existing) {
+      _byLabel.set(_norm, e);
+    } else {
+      const _ea = _area(e), _xa = _area(_existing);
+      if (_ea > _xa || (_ea === _xa && (e.y || 0) < (_existing.y || 0))) {
+        _byLabel.set(_norm, e);
+      }
+    }
+  }
+  let result = [..._byLabel.values(), ..._labelless];
+
+  // Sort: term-matching first, then by area desc, then y asc
+  result.sort((a, b) => {
+    const _am = _matchesTerm(a) ? 1 : 0;
+    const _bm = _matchesTerm(b) ? 1 : 0;
+    if (_bm !== _am) return _bm - _am;
+    const _ba = _area(b), _aa = _area(a);
+    if (_ba !== _aa) return _ba - _aa;
+    return (a.y || 0) - (b.y || 0);
+  });
+
+  const capped = result.slice(0, 20);
+  logger.info(`[instruction.runner] _sweepTabMap: ${tabMap.length} → ${capped.length} candidates (goal="${_goalLower.slice(0, 40)}", terms=[${_goalTerms.slice(0, 8).join(',')}])`);
+  return capped;
+}
+
 // Step-based Tab-Map: runs ONE step from a pre-extracted step plan.
 // Returns same shape as _tabMapInnerStep: { done, ok, error, stateChanged, filledRef, filledLabel, filledValue, rescan, action, fallbackToLlm }
-async function _tabMapStepExecute(sessionId, step, stepIndex, stepCount, tabMap, overlayActive, pageCategory, currentUrl) {
+async function _tabMapStepExecute(sessionId, step, stepIndex, stepCount, tabMap, overlayActive, pageCategory, currentUrl, progressCallbackUrl = null, _outerStepIndex = 0, agentId = '', sessionUuid = '') {
   logger.info(`[instruction.runner] Tab-Map step ${stepIndex + 1}/${stepCount}: ${JSON.stringify(step)}`);
+
+  // Emit tab_map:step_start so the frontend can mark this sub-step as running
+  _emitProgress(progressCallbackUrl, _outerStepIndex, {
+    type: 'tab_map:step_start',
+    subStepIndex: stepIndex,
+    subStepTotal: stepCount,
+    action: step.action,
+    target: step.target || step.key || step.value || '',
+  }, agentId, sessionUuid);
 
   // Handle "done" step
   if (step.action === 'done') {
@@ -5477,8 +6176,18 @@ async function _tabMapStepExecute(sessionId, step, stepIndex, stepCount, tabMap,
 
   // Match target to element
   let pickedEntry = null;
-  if (step.target) {
-    pickedEntry = await _matchElementToStep(sessionId, step, tabMap);
+  if (step._preClassifiedRef) {
+    // Pre-classified by _classifyOnPageAction (on-page action pagination) —
+    // skip _matchElementToStep and use the pre-picked ref directly.
+    pickedEntry = tabMap.find(e => e.ref === step._preClassifiedRef) ||
+                  { ref: step._preClassifiedRef, id: step._preClassifiedId, text: step.target };
+    logger.info(`[instruction.runner] Tab-Map step ${stepIndex + 1}: using pre-classified ref ${step._preClassifiedRef} for "${step.target}"`);
+  } else if (step.target) {
+    // Sweep noise (chrome/sponsored/carousel duplicates) before matching so the
+    // scorer sees only goal-relevant candidates. This prevents weak carousel
+    // "Add to Cart" duplicates from winning over the buybox button.
+    const _sweptForMatch = _sweepTabMap(tabMap, step.target, { viewportW: 1440, viewportH: 900 });
+    pickedEntry = await _matchElementToStep(sessionId, step, _sweptForMatch);
     if (!pickedEntry) {
       logger.warn(`[instruction.runner] Tab-Map step ${stepIndex + 1}: no element matched "${step.target}" — falling back to per-step LLM`);
       return { done: false, ok: false, error: `No element matched "${step.target}"`, fallbackToLlm: true, action: `${step.action} "${step.target}"` };
@@ -5495,7 +6204,47 @@ async function _tabMapStepExecute(sessionId, step, stepIndex, stepCount, tabMap,
 
   // Execute via existing _executeTabMapAction (handles click/type with all fallbacks)
   // Pass the pre-picked element so _executeTabMapAction doesn't call _llmPickFromTabMap again
+  // For on-page action clicks (Add to Cart, Buy Now, etc.), capture pre-click URL for the
+  // universal post-click guard (detects ad/tracking-domain navigation AND wrong-product drift).
+  const _isOnPageClick = step.action === 'click' && _isOnPageActionLabel(step.target);
+  const _guardPreUrl = (_isOnPageClick || step._preClassifiedRef) ? await _getUrl(sessionId).catch(() => '') : null;
   const result = await _executeTabMapAction(sessionId, parsed, tabMap, overlayActive, pageCategory, pickedEntry);
+
+  // ── Universal post-click guard for on-page actions ──────────────────────
+  // Two checks after an on-page action click:
+  //   1. Ad/tracking-domain navigation: the clicked element was an ad/affiliate
+  //      link (e.g. amazon-adsystem.com), not the real action button. Reject.
+  //   2. Wrong-product drift: the click navigated to a DIFFERENT product page
+  //      (e.g. a carousel "Add to Cart" for a related product). Navigate back.
+  // In both cases signal wrongTarget so the caller retries with the next-best
+  // candidate (consumed refs prevent re-picking the same element).
+  if ((_isOnPageClick || step._preClassifiedRef) && _guardPreUrl && result.pageChanged) {
+    const _postGuardUrl = await _getUrl(sessionId).catch(() => '');
+    if (_postGuardUrl) {
+      // 1. Ad/tracking-domain guard
+      if (_isAdOrTrackingDomain(_postGuardUrl)) {
+        logger.warn(`[instruction.runner] Tab-Map step ${stepIndex + 1}: post-click guard detected ad/tracking-domain navigation (${_postGuardUrl.slice(0, 80)}) — navigating back to original page`);
+        try {
+          await browserAct({ action: 'navigate', sessionId, url: _guardPreUrl, headed: true, timeoutMs: 30000 });
+          await _sleep(2000);
+        } catch (e) {
+          logger.warn(`[instruction.runner] Tab-Map step ${stepIndex + 1}: navigate-back failed: ${e.message}`);
+        }
+        return { done: false, ok: false, error: `Ad/tracking-domain navigation detected by post-click guard`, wrongTarget: true, consumedRef: pickedEntry?.ref, action: `${step.action} "${step.target}"` };
+      }
+      // 2. Wrong-product drift guard
+      if (_extractProductPath(_guardPreUrl) !== _extractProductPath(_postGuardUrl)) {
+        logger.warn(`[instruction.runner] Tab-Map step ${stepIndex + 1}: post-click guard detected wrong-product navigation (pre=${_extractProductPath(_guardPreUrl)}, post=${_extractProductPath(_postGuardUrl)}) — navigating back to original product`);
+        try {
+          await browserAct({ action: 'navigate', sessionId, url: _guardPreUrl, headed: true, timeoutMs: 30000 });
+          await _sleep(2000);
+        } catch (e) {
+          logger.warn(`[instruction.runner] Tab-Map step ${stepIndex + 1}: navigate-back failed: ${e.message}`);
+        }
+        return { done: false, ok: false, error: `Wrong-product navigation detected by post-click guard`, wrongTarget: true, consumedRef: pickedEntry?.ref, action: `${step.action} "${step.target}"` };
+      }
+    }
+  }
 
   // Handle lazy re-scan signal
   if (result.rescan) {
@@ -5530,6 +6279,14 @@ async function _tabMapStepExecute(sessionId, step, stepIndex, stepCount, tabMap,
   // For intermediate steps, a URL/state change means we need to re-scan and
   // continue — NOT that the goal is achieved.
   const _isLastStep = stepIndex >= stepCount - 1;
+  // Emit tab_map:step_done so the frontend can mark this sub-step as done/failed
+  _emitProgress(progressCallbackUrl, _outerStepIndex, {
+    type: 'tab_map:step_done',
+    subStepIndex: stepIndex,
+    subStepTotal: stepCount,
+    ok: result.ok,
+    stateChanged,
+  }, agentId, sessionUuid);
   return {
     done: _isLastStep ? stateChanged : false, // only end session on last step
     ok: result.ok,
@@ -5687,7 +6444,22 @@ async function _probePageStructure(sessionId) {
       const hasTitleRole = !!document.querySelector('[aria-roledescription*="title" i]');
       const hasFormulaBar = !!document.querySelector('input[aria-label*="formula" i], textarea[aria-label*="formula" i]');
 
-      return { fillableCount, clickableCount, hasAutoFocus,
+      // ── Submit button detection ──────────────────────────────────────
+      // Scans visible buttons for submit-like text (Create, Save, Submit, Post,
+      // Publish, etc.). Used by creation deep-link dynamic gating to decide
+      // whether Tab-Map should be enabled after Just-Type fills the title.
+      // Scoped to the overlay if one is open (same scope as fillable/clickable).
+      const _submitPattern = /^(Save|Send|Submit|Create|Done|Confirm|OK|Post|Publish|Add|Update)$/i;
+      let hasSubmitButton = false;
+      const _allButtons = scope.querySelectorAll('button, [role="button"], input[type="submit"]');
+      for (const btn of _allButtons) {
+        const r = btn.getBoundingClientRect();
+        if (r.width <= 0 || r.height <= 0 || btn.offsetParent === null) continue;
+        const text = (btn.innerText || btn.textContent || btn.value || '').trim();
+        if (_submitPattern.test(text)) { hasSubmitButton = true; break; }
+      }
+
+      return { fillableCount, clickableCount, hasAutoFocus, hasSubmitButton,
                fillableTypes: { inputCount, textareaCount, contenteditableCount, roleTextboxCount },
                pageTitle, visibleText,
                categorySignals: { hasGrid, hasGridCell, hasCellAria, hasContentEditableH1, hasTitleRole, hasFormulaBar } };
@@ -5696,8 +6468,8 @@ async function _probePageStructure(sessionId) {
   try {
     const raw = res?.result;
     const parsed = typeof raw === 'string' ? JSON.parse(raw.replace(/^"|"$/g, '').replace(/\\"/g, '"')) : raw;
-    return parsed || { fillableCount: 0, clickableCount: 0, hasAutoFocus: false, fillableTypes: { inputCount: 0, textareaCount: 0, contenteditableCount: 0, roleTextboxCount: 0 }, pageTitle: '', visibleText: '', categorySignals: {} };
-  } catch { return { fillableCount: 0, clickableCount: 0, hasAutoFocus: false, fillableTypes: { inputCount: 0, textareaCount: 0, contenteditableCount: 0, roleTextboxCount: 0 }, pageTitle: '', visibleText: '', categorySignals: {} }; }
+    return parsed || { fillableCount: 0, clickableCount: 0, hasAutoFocus: false, hasSubmitButton: false, fillableTypes: { inputCount: 0, textareaCount: 0, contenteditableCount: 0, roleTextboxCount: 0 }, pageTitle: '', visibleText: '', categorySignals: {} };
+  } catch { return { fillableCount: 0, clickableCount: 0, hasAutoFocus: false, hasSubmitButton: false, fillableTypes: { inputCount: 0, textareaCount: 0, contenteditableCount: 0, roleTextboxCount: 0 }, pageTitle: '', visibleText: '', categorySignals: {} }; }
 }
 
 // Count visible checkboxes on the page (input[type=checkbox] or [role=checkbox]).
@@ -5835,7 +6607,7 @@ async function _selectTierLLM(sessionId, goal, actionHistory, pageCategory, shor
   // This is a soft guide: if the state doesn't match, fall through to the LLM.
   if (tabFlow && flowIndex < tabFlow.length) {
     const _expected = tabFlow[flowIndex];
-    if (_expected.tier !== 0 && _availableTiers.includes(_expected.tier)) {
+    if (_expected.tier !== 0 && _allowedTiers.includes(_expected.tier) && !disabledTiers.has(_expected.tier)) {
       // Check state compatibility (rough match — not exact):
       // - tier 3 (shortcuts): no overlay, shortcuts available
       // - tier 4 (tab-map): overlay open OR fillable >= 2 OR no focus
@@ -5849,6 +6621,13 @@ async function _selectTierLLM(sessionId, goal, actionHistory, pageCategory, shor
       if (_stateMatches) {
         logger.info(`[instruction.runner] _selectTierLLM: Tab-Flow fast-path → ${_expected.tier} (flow step ${flowIndex}: ${_expected.action || ''})`);
         _emitTierProgressForTier(_expected.tier, progressCallbackUrl, stepIndex, agentId, sessionIdForProgress);
+        _emitProgress(progressCallbackUrl, stepIndex, {
+          type: 'tab_flow:step_start',
+          flowIndex,
+          totalSteps: tabFlow.length,
+          tier: _expected.tier,
+          action: _expected.action || '',
+        }, agentId, sessionIdForProgress);
         return _expected.tier;
       }
       logger.info(`[instruction.runner] _selectTierLLM: Tab-Flow step ${flowIndex} expects tier ${_expected.tier} but state doesn't match — falling through to LLM`);
@@ -5880,6 +6659,25 @@ async function _selectTierLLM(sessionId, goal, actionHistory, pageCategory, shor
   const _deepLinkDesc = getDeepLinkDescription(_statePattern.deepLinkType);
 
   logger.info(`[instruction.runner] _selectTierLLM: state pattern=${_statePattern.pattern}, deepLinkType=${_statePattern.deepLinkType}, fastPath=${_statePattern.fastPath}, guardsPassed=${_statePattern.guardsPassed}${_statePattern.guardReason ? ', guardReason=' + _statePattern.guardReason : ''}`);
+
+  // Spreadsheet creation guard: the state pattern recommends Tab-Map for
+  // renaming the title bar, but the LLM sometimes overrides it and picks
+  // Just-type because the grid has many fillable cells. If the quoted title
+  // from the goal is not yet reflected in the page title, force Tab-Map so
+  // the pre-computed rename flow actually executes.
+  if (_statePattern.pattern === 'creation_deep_link_spreadsheet' && _availableTiers.includes(4)) {
+    const _quotedTitleMatch = goal.match(/['"]([^'"]+)['"]/);
+    const _quotedTitle = _quotedTitleMatch ? _quotedTitleMatch[1] : null;
+    const _pageTitleLower = String(pageTitle || '').toLowerCase();
+    const _desiredLower = _quotedTitle ? _quotedTitle.toLowerCase() : null;
+    const _titleMissing = !_desiredLower || !_pageTitleLower.includes(_desiredLower);
+    logger.info(`[instruction.runner] _selectTierLLM: spreadsheet title guard — quotedTitle=${_quotedTitle || 'none'}, pageTitle='${pageTitle || ''}', titleMissing=${_titleMissing}, availableTiers=[${_availableTiers.join(',')}]`);
+    if (_titleMissing) {
+      logger.info(`[instruction.runner] _selectTierLLM: forcing Tab-Map — spreadsheet creation deep-link title not yet reflected (pageTitle='${pageTitle || ''}')`);
+      _emitTierProgressForTier(4, progressCallbackUrl, stepIndex, agentId, sessionIdForProgress);
+      return 4;
+    }
+  }
 
   // 4. Fast-path — skip LLM ONLY if all guards passed and tier is available
   if (_statePattern.fastPath && _statePattern.tier !== null && _availableTiers.includes(_statePattern.tier)) {
@@ -6065,6 +6863,34 @@ function _emitTierProgress(progressCallbackUrl, stepIndex, tierName, message, ag
       message,
       agentId: agentId || '',
       sessionId: sessionId || '',
+    });
+    const req = http.request({
+      hostname: u.hostname,
+      port: parseInt(u.port, 10),
+      path: u.pathname,
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
+      timeout: 3000,
+    });
+    req.on('error', () => {});
+    req.on('timeout', () => req.destroy());
+    req.write(body);
+    req.end();
+  } catch (_) { /* non-fatal */ }
+}
+
+// Helper: emit arbitrary progress event to AutomationProgress.tsx via IPC.
+// Used for tab_flow:* and tab_map:* events that carry structured payloads.
+function _emitProgress(progressCallbackUrl, stepIndex, payload, agentId = '', sessionId = '') {
+  if (!progressCallbackUrl) return;
+  try {
+    const http = require('http');
+    const u = new URL(progressCallbackUrl);
+    const body = JSON.stringify({
+      ...payload,
+      stepIndex: stepIndex ?? 0,
+      agentId: agentId || payload.agentId || '',
+      sessionId: sessionId || payload.sessionId || '',
     });
     const req = http.request({
       hostname: u.hostname,
@@ -6301,6 +7127,24 @@ function _buildResultString(goal, actionHistory, filledFields, extractedPageText
   return `Goal achieved in ${actionHistory.length} steps. ${parts.join('. ')}.`;
 }
 
+// Detect nav-only search goals that are complete after URL-first navigation.
+// Matches "Open X and search for 'Y'" or "Search X for 'Y'" with no trailing action clauses.
+function _isUrlFirstDone(goal, currentUrl) {
+  const g = String(goal || '').toLowerCase().trim();
+  // Must be a pure nav/search goal (no then/and/add/click/buy clauses after the search)
+  if (!/^(?:open|go to|navigate to|visit|search on|search in)?.*?(?:\b(?:search|look up|find)(?:\s+(?:for|on|in))?\s+["']([^"']+)["']\s*)$/i.test(g)) {
+    return false;
+  }
+  const m = g.match(/(?:\b(?:search|look up|find)(?:\s+(?:for|on|in))?\s+["']([^"']+)["'])/i);
+  if (!m) return false;
+  const term = m[1].toLowerCase().replace(/\s+/g, ' ').trim();
+  if (!term) return false;
+  const decoded = decodeURIComponent(String(currentUrl || '')).toLowerCase();
+  const normTerm = term.replace(/[^a-z0-9]/g, '');
+  const normUrl = decoded.replace(/[^a-z0-9]/g, '');
+  return normUrl.includes(normTerm) && decoded.includes('?');
+}
+
 // Tier 2: _selectTier → 0 (DONE), 1 (Just-type), 2 (Meta+F), 3 (Shortcuts), 4 (Tab-Map)
 // Tier 3: Strategy execution with fallback to Tab-Map
 async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, pageCategory, agentContext, shortcutCount = 0, shortcutLabels = '', timeoutMs = 120000, progressCallbackUrl = null, stepIndex = 0, agentId = '' }) {
@@ -6325,6 +7169,11 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
   let inTabMapSession = false;
   let _tabMapParseRetries = 0; // parse-failure retry counter (Bug A fix — don't block Tab-Map on LLM formatting failures)
   let overlayActive = false;
+  // _probe is assigned once per loop iteration at the page-structure probe below.
+  // It must be declared here (before the loop) because the Tab-Map rescan branch
+  // earlier in the same iteration can read it before the probe line runs —
+  // a `const` at the probe site would throw a TDZ error in that path.
+  let _probe = null;
   // Combine app-knowledge shortcuts with category-config categoryKeys.
   // This ensures that even when app-knowledge research fails (e.g., web search
   // returned cached failures), the category-level shortcuts (e.g., Meta+J for
@@ -6399,15 +7248,19 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
 
 
   // Initial overlay detection (URL-first might have opened a modal)
-  // NOTE: For creation deep-links (notion.new, docs.new), suppress overlay detection.
-  // The page wrapper may be detected as an overlay (dialog role on the editor container),
-  // which would falsely enable Tab-Map and cause it to press Escape — destroying the
-  // freshly created entity's focus. The state pattern classifier handles this correctly
-  // via the creation_deep_link guard (overlay → fastPath=false → LLM decides).
+  // For creation deep-links: only suppress overlay detection when the overlay
+  // has NO fillable fields (page wrapper like notion.new). If the overlay has
+  // fillable fields (compose form like linear.new), keep overlayActive=true
+  // so Tab-Map can interact with the form after Just-Type fills the title.
   overlayActive = await _detectOverlay(sessionId, _pageCategory);
   if (_isCreationDeepLink && overlayActive) {
-    logger.info(`[instruction.runner] Creation deep-link — suppressing initial overlay detection (page wrapper is not a form dialog)`);
-    overlayActive = false;
+    const _creationProbe = await _probePageStructure(sessionId);
+    if (_creationProbe.fillableCount === 0) {
+      overlayActive = false;
+      logger.info(`[instruction.runner] Creation deep-link — suppressing overlay detection (page wrapper, no fillable fields)`);
+    } else {
+      logger.info(`[instruction.runner] Creation deep-link — overlay has ${_creationProbe.fillableCount} fillable fields, keeping overlayActive=true (compose form detected)`);
+    }
   }
   if (overlayActive) {
     logger.info(`[instruction.runner] Iterative: initial overlay detected — overlayActive=true`);
@@ -6432,12 +7285,19 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
       // 2. Cache miss → compute via LLM
       // _shortcutLabels already includes categoryKeys (combined at the top of
       // runIterativeNavigation), so we pass it directly.
-      _tabFlow = await _computeTabFlow(goal, pageCategory, _shortcutLabels, prevUrl, agentId);
+      _tabFlow = await _computeTabFlow(goal, pageCategory, _shortcutLabels, prevUrl, agentId, _urlFirstNav, _deepLinkType);
       if (_tabFlow) {
         logger.info(`[instruction.runner] Tab-Flow: computed ${_tabFlow.length}-step flow — ${_tabFlow.map(s => `tier ${s.tier}(${(s.action || '').slice(0, 30)})`).join(' → ')}`);
       } else {
         logger.info(`[instruction.runner] Tab-Flow: no flow computed — falling back to state-reactive only`);
       }
+    }
+    // Emit tab_flow:computed so the frontend can display the pre-computed flow checklist
+    if (_tabFlow && _tabFlow.length > 0) {
+      _emitProgress(progressCallbackUrl, stepIndex, {
+        type: 'tab_flow:computed',
+        flow: _tabFlow.map((s, i) => ({ index: i, tier: s.tier, action: s.action || '', status: 'pending' })),
+      }, agentId, sessionId);
     }
   } catch (e) {
     logger.warn(`[instruction.runner] Tab-Flow pre-computation failed (non-fatal): ${e.message}`);
@@ -6476,7 +7336,8 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
         const _step = _stepPlan[_stepIndex];
         stepResult = await _tabMapStepExecute(
           sessionId, _step, _stepIndex, _stepPlan.length,
-          _cachedTabMap, overlayActive, _pageCategory, currentUrl
+          _cachedTabMap, overlayActive, _pageCategory, currentUrl,
+          progressCallbackUrl, stepIndex, agentId, sessionId
         );
 
         // Handle fallback-to-LLM signal (element not matched, step failed)
@@ -6485,6 +7346,21 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
           _usingStepFallback = true;
           // Don't increment _stepIndex — let per-step LLM take over from here
           // Fall through to per-step LLM below
+        } else if (stepResult.wrongTarget) {
+          // Post-click guard detected wrong-product navigation — invalidate
+          // cache and re-scan. Mark the tried ref as consumed so re-classification
+          // excludes it and picks the next-best candidate.
+          logger.warn(`[instruction.runner] Tab-Map: step ${_stepIndex + 1} wrong-target — invalidating cache, will re-classify excluding tried ref`);
+          const _triedStep = _stepPlan[_stepIndex];
+          if (_triedStep?._preClassifiedRef) consumedRefs.add(_triedStep._preClassifiedRef);
+          if (stepResult.consumedRef) consumedRefs.add(stepResult.consumedRef);
+          _cachedTabMap = null;
+          _stepPlan = null;
+          _stepIndex = 0;
+          _usingStepFallback = false;
+          prevUrl = currentUrl;
+          _doneVerifyFails = 0;
+          continue;
         } else if (!stepResult.ok && !stepResult.rescan && !stepResult.done) {
           // Step failed (e.g., unknown action, click failed) — switch to per-step LLM
           logger.warn(`[instruction.runner] Tab-Map: step ${_stepIndex + 1} failed (${stepResult.error}) — switching to per-step LLM`);
@@ -6510,8 +7386,11 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
         _stepPlan = null;  // re-extract steps for fresh tab-map
         _stepIndex = 0;
         // Re-scan and retry this step
-        const skipReset = overlayActive;
-        let freshTabMap = await buildTabMap(sessionId, 150, { skipReset });
+        const skipReset = overlayActive || (_probe && _probe.fillableCount >= 1);
+        const _forceReset = _shouldForceFocusReset(goal, _pageCategory, overlayActive);
+        const _effectiveSkipReset = _forceReset ? false : skipReset;
+        if (_forceReset) logger.info(`[instruction.runner] Tab-Map: forcing focus reset to page top (shopping on-page action goal)`);
+        let freshTabMap = await buildTabMap(sessionId, 150, { skipReset: _effectiveSkipReset });
         if (overlayActive && freshTabMap.length < 3) {
           const backwardMap = await buildTabMap(sessionId, 150, { skipReset: true, backward: true });
           const existingSigs = new Set(freshTabMap.map(e => _elementSignature(e)));
@@ -6531,8 +7410,11 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
         if (!_usingStepFallback) {
           const { _extractSteps } = require('./browser.agent.cjs');
           const _fsh = (_tabFlow && _flowIndex < _tabFlow.length && _tabFlow[_flowIndex].tier === 4)
-            ? (_tabFlow[_flowIndex].action || '') : '';
-          _stepPlan = await _extractSteps(goal, currentUrl, _cachedTabMap, _pageCategory, agentContext, overlayActive, actionHistory, _fsh);
+            ? (_tabFlow[_flowIndex].action || '')
+                .replace(/^(?:scan|look at|check|inspect|examine)\s+(?:the\s+)?page\s+and\s+/i, '')
+                .trim()
+            : '';
+          _stepPlan = await _extractSteps(goal, currentUrl, _sweepTabMap(_cachedTabMap, goal), _pageCategory, agentContext, overlayActive, actionHistory, _fsh);
           _stepIndex = 0;
           // Step plan loop detection
           const _planSig = JSON.stringify((_stepPlan || []).map(s => `${s.action}:${s.target || s.value || s.key || ''}`));
@@ -6567,11 +7449,41 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
         actionHistory.push(`${stepResult.action} ${_note}`);
       }
 
+      // Advance Tab-Flow index in real-time if this sub-plan step matched the
+      // current flow step. This keeps the flow index in sync as each sub-plan
+      // step executes, so the frontend sees tab_flow:step_done events in
+      // real-time and the flow doesn't re-run completed steps when a sub-plan
+      // over-delivers (e.g., "type title + click Save" accomplishes both the
+      // "type title" flow step AND the "press Cmd+Enter to save" flow step).
+      if (_stepPlan && _stepIndex > 0 && _tabFlow && _flowIndex < _tabFlow.length &&
+          _tabFlow[_flowIndex].tier === 4 && stepResult.ok) {
+        const _executedStep = _stepPlan[_stepIndex - 1]; // step that just ran (index already incremented)
+        if (_subPlanStepMatchesFlowStep(_executedStep, _tabFlow[_flowIndex])) {
+          _flowIndex++;
+          logger.info(`[instruction.runner] Tab-Flow: sub-plan step matched flow step ${_flowIndex - 1} → advancing to step ${_flowIndex}`);
+          _emitProgress(progressCallbackUrl, stepIndex, {
+            type: 'tab_flow:step_done', flowIndex: _flowIndex, totalSteps: _tabFlow.length,
+          }, agentId, sessionId);
+          if (_flowIndex < _tabFlow.length) {
+            _emitProgress(progressCallbackUrl, stepIndex, {
+              type: 'tab_flow:step_start', flowIndex: _flowIndex, totalSteps: _tabFlow.length,
+              tier: _tabFlow[_flowIndex].tier, action: _tabFlow[_flowIndex].action || '',
+            }, agentId, sessionId);
+          }
+        }
+      }
+
       // Track filled fields — all elements are now shown to the LLM with [FILLED] markers,
       // so we no longer need consumedRefs for filtering. Keep filledFields for the markers.
       if (stepResult.filledRef) {
         filledFields.push({ ref: stepResult.filledRef, label: stepResult.filledLabel, value: stepResult.filledValue });
         logger.info(`[instruction.runner] Tab-Map: filled "${stepResult.filledLabel}" — marked [FILLED] for next LLM call (${filledFields.length} fields filled)`);
+      }
+
+      // State-based resync: advance flow index past completed steps
+      // based on actual filledFields and actionHistory state.
+      if (_tabFlow && _flowIndex < _tabFlow.length) {
+        _flowIndex = _resyncFlowIndex(_tabFlow, _flowIndex, filledFields, actionHistory, logger);
       }
 
       // Capture extracted page text from observation steps (getPageText, run-code)
@@ -6607,7 +7519,8 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
         // (a different tier may have accomplished the current step's goal)
         // and continue — the Tab-Flow fast-path will pick the next tier.
         if (!_flowComplete(_tabFlow, _flowIndex)) {
-          _flowIndex = _reconcileFlowIndex(_tabFlow, _flowIndex, currentUrl, prevUrl, logger, actionHistory, stepResult);
+          _flowIndex = _resyncFlowIndex(_tabFlow, _flowIndex, filledFields, actionHistory, logger);
+          _flowIndex = _reconcileFlowIndex(_tabFlow, _flowIndex, currentUrl, prevUrl, logger, actionHistory, stepResult, progressCallbackUrl, stepIndex, agentId, sessionId);
           logger.info(`[instruction.runner] Tab-Map: sub-plan done but Tab-Flow incomplete (step ${_flowIndex}/${_tabFlow.length}) — continuing, not done`);
           inTabMapSession = false;
           _cachedTabMap = null;
@@ -6675,7 +7588,8 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
           // steps are completed, DON'T declare DONE. Reconcile the flow index
           // and continue — the Tab-Flow fast-path will pick the next tier.
           if (!_flowComplete(_tabFlow, _flowIndex)) {
-            _flowIndex = _reconcileFlowIndex(_tabFlow, _flowIndex, currentUrl, prevUrl, logger, actionHistory, stepResult);
+            _flowIndex = _resyncFlowIndex(_tabFlow, _flowIndex, filledFields, actionHistory, logger);
+            _flowIndex = _reconcileFlowIndex(_tabFlow, _flowIndex, currentUrl, prevUrl, logger, actionHistory, stepResult, progressCallbackUrl, stepIndex, agentId, sessionId);
             logger.info(`[instruction.runner] Tab-Map: step done but Tab-Flow incomplete (step ${_flowIndex}/${_tabFlow.length}) — continuing, not done`);
             inTabMapSession = false;
             _cachedTabMap = null;
@@ -6704,6 +7618,11 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
           if (_tabFlow && _flowIndex < _tabFlow.length && _tabFlow[_flowIndex].tier === 4) {
             _flowIndex++;
             logger.info(`[instruction.runner] Tab-Flow: Tab-Map session complete — advancing to step ${_flowIndex}`);
+            _emitProgress(progressCallbackUrl, stepIndex, {
+              type: 'tab_flow:step_done',
+              flowIndex: _flowIndex,
+              totalSteps: _tabFlow.length,
+            }, agentId, sessionId);
           }
           // Note: Tab-Flow cache is saved by browser.agent.cjs AFTER OCR/DOM verification
           // passes, not here. This prevents caching flows that declared DONE prematurely.
@@ -6712,9 +7631,19 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
           // State changed (e.g., Send clicked, page navigated) — re-decide
           logger.info(`[instruction.runner] Tab-Map: session ended (state changed) — re-deciding`);
           // Tab-Flow: advance flow index on Tab-Map state change (e.g., Save clicked → page changed)
-          if (_tabFlow && _flowIndex < _tabFlow.length && _tabFlow[_flowIndex].tier === 4) {
+          // Guard: don't advance if the step was a "navigate" action — the flow step was
+          // supposed to click a button, not navigate. Navigating to a different page
+          // doesn't complete the flow step.
+          const _lastAction = String(actionHistory[actionHistory.length - 1] || '').toLowerCase();
+          const _isNavigateAction = _lastAction.includes('navigate');
+          if (_tabFlow && _flowIndex < _tabFlow.length && _tabFlow[_flowIndex].tier === 4 && !_isNavigateAction) {
             _flowIndex++;
             logger.info(`[instruction.runner] Tab-Flow: Tab-Map state change — advancing to step ${_flowIndex}`);
+            _emitProgress(progressCallbackUrl, stepIndex, {
+              type: 'tab_flow:step_done',
+              flowIndex: _flowIndex,
+              totalSteps: _tabFlow.length,
+            }, agentId, sessionId);
           }
           prevUrl = currentUrl;
           // Clear filled fields for new page
@@ -6772,7 +7701,7 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
 
     const { _extractValue, _extractSearchText, _scanCanvasLayout, _readEditorState, _formatEditorStateForLLM } = require('./browser.agent.cjs');
     // Probe page structure once per iteration (includes fillable types + title + visible text)
-    const _probe = await _probePageStructure(sessionId);
+    _probe = await _probePageStructure(sessionId);
 
     // ── Runtime pageCategory detection (overrides initial guess) ──
     // The initial pageCategory is inferred from service name/URL — a starting guess.
@@ -6890,9 +7819,49 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
       // Skip on first iteration when no actions have been taken — you can't be "done"
       // if you haven't done anything yet. This prevents false-positive "done" when
       // a creation deep-link loads a blank page (e.g., notion.new shows "Untitled").
-      const _pageState = actionHistory.length > 0
-        ? await _ocrClassifyState(_ocrText, goal, actionHistory)
-        : 3; // ready — proceed to tier selection
+      // Also skip when the current Tab-Flow step is tier 3 (shortcut keys) — the
+      // OCR classifier can false-positive on normal page content (e.g., Google
+      // Calendar) and disrupt deterministic shortcut sequences with Escape + tier
+      // reset. Backup: alert handler (line ~7077) + OCR alert detection (line ~7185)
+      // still catch genuine modals after shortcuts.
+      const _currentStepIsShortcut = _tabFlow
+        && _flowIndex < _tabFlow.length
+        && _tabFlow[_flowIndex].tier === 3;
+
+      // ── Modal-aware error guard (structural, not regex) ───────────────────
+      // Before the OCR error classifier presses Escape, check if a usable
+      // modal/composer is open. If so, skip the error classification entirely
+      // — the modal is the task surface, and Escape would close it.
+      // Uses the existing _detectOverlay function (already has _isRealModal
+      // heuristic with viewport-span, interactive-children, and z-index checks).
+      let _hasUsableModal = false;
+      if (!_currentStepIsShortcut && actionHistory.length > 0) {
+        _hasUsableModal = await _detectOverlay(sessionId, _pageCategory);
+        // Also verify the overlay has compose fields (not just a menu/dropdown)
+        if (_hasUsableModal) {
+          const _ocrProbe = await _probePageStructure(sessionId);
+          _hasUsableModal = _ocrProbe.fillableCount > 0;
+        }
+      }
+
+      // ── Dead-end page guard (structural, not regex) ───────────────────────
+      // If there's no usable modal AND the page has no interactive content,
+      // this is a dead-end page (404, error, blank) — navigate away instead
+      // of pressing Escape. Escape doesn't help when there's nothing to dismiss.
+      let _isDeadEndPage = false;
+      if (!_hasUsableModal && !_currentStepIsShortcut && actionHistory.length > 0) {
+        const _deadEndProbe = await _probePageStructure(sessionId);
+        _isDeadEndPage = _deadEndProbe.fillableCount === 0 && _deadEndProbe.clickableCount < 2
+          && (_deadEndProbe.visibleText || '').length < 300;
+      }
+
+      const _pageState = (_currentStepIsShortcut || actionHistory.length === 0)
+        ? 3 // ready — skip gatekeeper for shortcut steps / first iteration
+        : _hasUsableModal
+          ? 3 // usable modal open → ready, skip error classifier
+          : _isDeadEndPage
+            ? 4 // dead-end page → unexpected, navigate away
+            : await _ocrClassifyState(_ocrText, goal, actionHistory);
 
       if (_pageState === 0) {
         // Error — log and try Escape to dismiss error
@@ -6919,7 +7888,19 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
         }
         // _ocrDetectLoading says not loading — proceed (false positive from classify)
       } else if (_pageState === 4) {
-        // Unexpected state — log and try recovery
+        // Unexpected state — check if this is a dead-end page (no interactive content)
+        // If so, navigate to startUrl instead of pressing Escape (Escape
+        // doesn't help on a dead-end page — there's no modal to dismiss).
+        if (_isDeadEndPage && startUrl) {
+          logger.warn(`[instruction.runner] OCR state: dead-end page (no interactive content) — navigating to ${startUrl} instead of Escape`);
+          await browserAct({ action: 'navigate', sessionId, url: startUrl, headed: true, timeoutMs: 30000 });
+          await _sleep(2000);
+          _triedTiers.clear();
+          _cachedTabMap = null;
+          prevUrl = currentUrl;
+          continue;
+        }
+        // Other unexpected state — press Escape as before
         logger.warn(`[instruction.runner] OCR state: unexpected state detected — pressing Escape and resetting`);
         await browserAct({ action: 'press', sessionId, key: 'Escape', headed: true, timeoutMs: 2000 });
         await _sleep(500);
@@ -7152,6 +8133,27 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
       }
     }
 
+    // ── Dynamic Tab-Map gating for creation deep-links ──
+    // After the first Just-Type fills the title, enable Tab-Map if:
+    // 1. The overlay/modal is still open (modal-based form — linear.new, Gmail compose), OR
+    // 2. A submit/create/save button is visible (full-page form — github.com/issues/new, reddit.com/submit)
+    // If neither (auto-save editor — notion.new, docs.new), keep Tab-Map disabled.
+    // EXCEPTION: Spreadsheet creation deep-links (sheets.new, docs.google.com/spreadsheets/create)
+    // are NOT auto-save — the title bar must be clicked and renamed via Tab-Map.
+    if (_isCreationDeepLink) {
+      const _needsTabMapForSpreadsheet = _pageCategory === 'spreadsheet';
+      const _tabMapNeeded = _needsTabMapForSpreadsheet || ((overlayActive || _probe.hasSubmitButton) && actionHistory.length > 0);
+      if (_tabMapNeeded && _disabledTiers.has(4)) {
+        _disabledTiers.delete(4);
+        _triedTiers.clear();
+        _cachedTabMap = null;
+        logger.info(`[instruction.runner] Creation deep-link: enabling Tab-Map (spreadsheet title or submit/overlay detected)`);
+      } else if (!_tabMapNeeded && !_disabledTiers.has(4)) {
+        _disabledTiers.add(4);
+        logger.info(`[instruction.runner] Creation deep-link: keeping Tab-Map disabled (no overlay, no submit button — auto-save page)`);
+      }
+    }
+
     // ── General overlay-dismiss safety net ──
     // If overlay is active, has NO fillable fields, and the goal needs typing (type-intent),
     // the overlay is blocking → dismiss it. This is general — works for Notion Move-to,
@@ -7195,7 +8197,48 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
     }
 
     const _alertActiveAtTierSelect = !!_alert && !_alertHandled;
-    const strategy = await _selectTierLLM(sessionId, goal, actionHistory, _pageCategory, _shortcutCount, focused, currentUrl, _probe, agentContext, _triedTiers, _disabledTiers, _canvasLayout?.layoutText || '', _ocrObservation, _shortcutLabels, overlayActive, progressCallbackUrl, stepIndex, agentId, sessionId, _editorState, _isCreationDeepLink, _alertActiveAtTierSelect, false, _tabFlow, _flowIndex);
+
+    // ── FAST PATH: simple web tasks → Tab-Map directly (skip tier selection LLM) ──
+    // For the ~80% of tasks that are simple web interactions (shopping, search,
+    // generic forms, read pages), skip the _selectTierLLM call and go straight to
+    // Tab-Map (tier 4). The existing Tab-Map handler does scan→classify→act→verify
+    // per state. If Tab-Map fails repeatedly, _triedTiers blocks this gate and
+    // execution falls through to the full tier system below.
+    // These categories are the hard 20% — Tab-Map scanning is harmful there, so they're excluded.
+    const _FAST_PATH_EXCLUDED_CATEGORIES = new Set([
+      'spreadsheet', 'document_editor', 'code_editor', 'design_canvas',
+      'calendar_event_create', 'calendar', 'email_compose', 'slides_edit',
+    ]);
+    const _isSimpleWebTaskFastPath = !_isCreationDeepLink
+      && !_isHighShortcutApp
+      && !_FAST_PATH_EXCLUDED_CATEGORIES.has(_pageCategory)
+      && !_triedTiers.has(4)
+      && !_alertHandled;
+
+    let strategy;
+    if (_isSimpleWebTaskFastPath) {
+      // Nav-only search goal: if URL-first already took us to the search page,
+      // no need to scan — the task is complete.
+      if (_urlFirstNav && actionHistory.length === 0 && _isUrlFirstDone(goal, currentUrl)) {
+        logger.info(`[instruction.runner] FAST PATH: nav-only search goal and URL matches → done`);
+        strategy = 0;
+      } else if (actionHistory.length > 0) {
+        const _cbCount = await _countCheckboxes(sessionId);
+        const _fastDone = await _checkDone(goal, actionHistory, currentUrl, _probe?.pageTitle, _cbCount);
+        if (_fastDone) {
+          logger.info(`[instruction.runner] FAST PATH: _checkDone=YES → done`);
+          strategy = 0;
+        } else {
+          strategy = 4;
+          logger.info(`[instruction.runner] FAST PATH: simple web task → Tab-Map (tier 4) directly, skipping tier-selection LLM`);
+        }
+      } else {
+        strategy = 4;
+        logger.info(`[instruction.runner] FAST PATH: simple web task (first iteration) → Tab-Map (tier 4) directly`);
+      }
+    } else {
+      strategy = await _selectTierLLM(sessionId, goal, actionHistory, _pageCategory, _shortcutCount, focused, currentUrl, _probe, agentContext, _triedTiers, _disabledTiers, _canvasLayout?.layoutText || '', _ocrObservation, _shortcutLabels, overlayActive, progressCallbackUrl, stepIndex, agentId, sessionId, _editorState, _isCreationDeepLink, _alertActiveAtTierSelect, false, _tabFlow, _flowIndex);
+    }
     logger.info(`[instruction.runner] Decision: strategy=${strategy} (0=DONE, 1=Just-type, 2=Meta+F, 3=Keyboard Nav, 4=Tab-Map, 5=Gesture)`);
 
     // Handle tier exhaustion — all tiers tried on this state with no progress
@@ -7233,6 +8276,14 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
       }
       const _resultStr = _buildResultString(goal, actionHistory, filledFields, extractedPageText);
       logger.info(`[instruction.runner] DONE — ${_resultStr}`);
+      // Emit final tab_flow:step_done so the frontend marks all steps as done
+      if (_tabFlow && _tabFlow.length > 0) {
+        _emitProgress(progressCallbackUrl, stepIndex, {
+          type: 'tab_flow:step_done',
+          flowIndex: _tabFlow.length,
+          totalSteps: _tabFlow.length,
+        }, agentId, sessionId);
+      }
       // Note: Tab-Flow cache is saved by browser.agent.cjs AFTER OCR/DOM verification
       return { ok: true, output: _resultStr, actionHistory, tabFlow: _tabFlow, agentId };
     }
@@ -7380,6 +8431,21 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
       if (result.ok && _tabFlow && _flowIndex < _tabFlow.length && _tabFlow[_flowIndex].tier === 1) {
         _flowIndex++;
         logger.info(`[instruction.runner] Tab-Flow: Just-type done — advancing to step ${_flowIndex}`);
+        _emitProgress(progressCallbackUrl, stepIndex, {
+          type: 'tab_flow:step_done',
+          flowIndex: _flowIndex,
+          totalSteps: _tabFlow.length,
+        }, agentId, sessionId);
+        // Emit step_start for the new step so the frontend shows it as running
+        if (_flowIndex < _tabFlow.length) {
+          _emitProgress(progressCallbackUrl, stepIndex, {
+            type: 'tab_flow:step_start',
+            flowIndex: _flowIndex,
+            totalSteps: _tabFlow.length,
+            tier: _tabFlow[_flowIndex].tier,
+            action: _tabFlow[_flowIndex].action || '',
+          }, agentId, sessionId);
+        }
       }
 
       if (!result.ok) {
@@ -7565,7 +8631,13 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
       }
 
       const { _extractShortcut } = require('./browser.agent.cjs');
-      const _hostname = (() => { try { return new URL(currentUrl).hostname.replace(/^www\./, ''); } catch (_) { return ''; } })();
+      const _hostname = (() => {
+        try { return new URL(currentUrl).hostname.replace(/^www\./, ''); } catch (_) {}
+        // Fallback: derive hostname from startUrl when currentUrl is empty
+        // (e.g. daemon-fallback sessions where eval returns empty)
+        try { return new URL(startUrl).hostname.replace(/^www\./, ''); } catch (_) {}
+        return '';
+      })();
 
       // ── Direct key execution for tier-3 flow steps ──
       // When the Tab-Flow step says "press Enter/Escape/Tab/Arrow...", press it
@@ -7574,7 +8646,70 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
       // return 0 and the flow would stall. This bypasses the picker for generic keys.
       if (_tabFlow && _flowIndex < _tabFlow.length && _tabFlow[_flowIndex].tier === 3) {
         const _flowAction = _tabFlow[_flowIndex].action || '';
+
+        // ── Compound tier-3 step handler ──
+        // Compound tier-3 steps like "press /, type 'Credentials', press Enter" have
+        // sub-actions with different tiers (press=3, type=1, press=3). We can't split
+        // them into separate flow steps (the type sub-action would be treated as a
+        // shortcut). Instead, parse and execute them in sequence here.
+        const { _splitCompoundAction } = require('./browser.agent.cjs');
+        const _subActions = _splitCompoundAction(_flowAction);
+        if (_subActions.length > 1) {
+          logger.info(`[instruction.runner] Tab-Flow: compound tier-3 step — executing ${_subActions.length} sub-actions: ${_subActions.map(s => s.slice(0, 30)).join(' | ')}`);
+          let _allOk = true;
+          for (const _subAction of _subActions) {
+            const _pressMatch = _subAction.match(/^press\s+(\S+)\s*(?:\(([^)]+)\))?$/i);
+            const _typeMatch = _subAction.match(/^type\s+['"]([^'"]+)['"]\s*$/i);
+            if (_pressMatch) {
+              const _key = _pressMatch[1];
+              const _directResult = await _executeShortcut(sessionId, _key, goal, actionHistory);
+              const _note = _directResult.ok ? (_directResult.pageChanged ? '→ page changed' : '→ ok') : '→ FAILED';
+              actionHistory.push(`Shortcut "${_key}" ${_note} (compound tier-3 sub-action)`);
+              if (!_directResult.ok) { _allOk = false; break; }
+              await _sleep(500);
+            } else if (_typeMatch) {
+              const _text = _typeMatch[1];
+              const _typeResult = await browserAct({ action: 'type', sessionId, text: _text, headed: true, timeoutMs: 5000 }).catch(e => ({ ok: false, error: e.message }));
+              const _note = _typeResult?.ok ? '→ ok' : '→ FAILED';
+              actionHistory.push(`Type "${_text.slice(0, 20)}" ${_note} (compound tier-3 sub-action)`);
+              if (!_typeResult?.ok) { _allOk = false; break; }
+              await _sleep(500);
+            } else {
+              logger.warn(`[instruction.runner] Tab-Flow: unknown compound sub-action "${_subAction}" — falling through to normal tier selection`);
+              _allOk = false;
+              break;
+            }
+          }
+          _triedTiers.add(3);
+          if (_allOk && _tabFlow[_flowIndex].tier === 3) {
+            _flowIndex++;
+            logger.info(`[instruction.runner] Tab-Flow: compound tier-3 done — advancing to step ${_flowIndex}`);
+            _emitProgress(progressCallbackUrl, stepIndex, {
+              type: 'tab_flow:step_done',
+              flowIndex: _flowIndex,
+              totalSteps: _tabFlow.length,
+            }, agentId, sessionId);
+            if (_flowIndex < _tabFlow.length) {
+              _emitProgress(progressCallbackUrl, stepIndex, {
+                type: 'tab_flow:step_start',
+                flowIndex: _flowIndex,
+                totalSteps: _tabFlow.length,
+                tier: _tabFlow[_flowIndex].tier,
+                action: _tabFlow[_flowIndex].action || '',
+              }, agentId, sessionId);
+            }
+          }
+          prevUrl = currentUrl;
+          continue;
+        }
+
+        // Single tier-3 step — use existing direct key press logic
+        // Handles: named keys (Enter, Escape, Tab, Arrow*, etc.),
+        // single-letter app shortcuts (t, n, q, c, /),
+        // and modifier combos (Cmd+Enter, Meta+Enter, Ctrl+S, etc.)
         const _keyMatch = _flowAction.match(/press\s+(Enter|Escape|Tab|ArrowDown|ArrowUp|ArrowLeft|ArrowRight|Space|Backspace)\b/i);
+        const _modifierMatch = _flowAction.match(/press\s+((?:Cmd|Ctrl|Control|Meta|Shift|Alt|Option)\+\S+)/i);
+        const _singleLetterMatch = _flowAction.match(/press\s+([a-z]|[\/])\b/i);
         if (_keyMatch) {
           const _directKey = _keyMatch[1].charAt(0).toUpperCase() + _keyMatch[1].slice(1).toLowerCase();
           logger.info(`[instruction.runner] Tab-Flow: direct key press "${_directKey}" (from flow step: ${_flowAction})`);
@@ -7585,6 +8720,81 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
           if (_directResult.ok && _tabFlow[_flowIndex].tier === 3) {
             _flowIndex++;
             logger.info(`[instruction.runner] Tab-Flow: direct key done — advancing to step ${_flowIndex}`);
+            _emitProgress(progressCallbackUrl, stepIndex, {
+              type: 'tab_flow:step_done',
+              flowIndex: _flowIndex,
+              totalSteps: _tabFlow.length,
+            }, agentId, sessionId);
+            // Emit step_start for the new step so the frontend shows it as running
+            if (_flowIndex < _tabFlow.length) {
+              _emitProgress(progressCallbackUrl, stepIndex, {
+                type: 'tab_flow:step_start',
+                flowIndex: _flowIndex,
+                totalSteps: _tabFlow.length,
+                tier: _tabFlow[_flowIndex].tier,
+                action: _tabFlow[_flowIndex].action || '',
+              }, agentId, sessionId);
+            }
+          }
+          prevUrl = currentUrl;
+          continue;
+        }
+        if (_modifierMatch) {
+          // Modifier combos: Cmd+Enter, Meta+Enter, Ctrl+S, etc.
+          // Normalize Cmd→Meta for Playwright compatibility
+          const _rawCombo = _modifierMatch[1];
+          const _normalizedKey = _rawCombo.replace(/^Cmd\+/i, 'Meta+').replace(/^Control\+/i, 'Ctrl+').replace(/^Option\+/i, 'Alt+');
+          logger.info(`[instruction.runner] Tab-Flow: direct modifier key press "${_normalizedKey}" (from flow step: ${_flowAction})`);
+          const _modResult = await browserAct({ action: 'press', sessionId, key: _normalizedKey, headed: true, timeoutMs: 5000 }).catch(e => ({ ok: false, error: e.message }));
+          const _modNote = _modResult?.ok ? '→ ok' : '→ FAILED';
+          actionHistory.push(`Shortcut "${_normalizedKey}" ${_modNote} (direct from flow)`);
+          _triedTiers.add(3);
+          if (_modResult?.ok && _tabFlow[_flowIndex].tier === 3) {
+            _flowIndex++;
+            logger.info(`[instruction.runner] Tab-Flow: modifier key done — advancing to step ${_flowIndex}`);
+            _emitProgress(progressCallbackUrl, stepIndex, {
+              type: 'tab_flow:step_done',
+              flowIndex: _flowIndex,
+              totalSteps: _tabFlow.length,
+            }, agentId, sessionId);
+            if (_flowIndex < _tabFlow.length) {
+              _emitProgress(progressCallbackUrl, stepIndex, {
+                type: 'tab_flow:step_start',
+                flowIndex: _flowIndex,
+                totalSteps: _tabFlow.length,
+                tier: _tabFlow[_flowIndex].tier,
+                action: _tabFlow[_flowIndex].action || '',
+              }, agentId, sessionId);
+            }
+          }
+          prevUrl = currentUrl;
+          continue;
+        }
+        if (_singleLetterMatch) {
+          // Single-letter app shortcuts: t (go to today), n (next), q (all-day event), c (create), / (search), etc.
+          const _letter = _singleLetterMatch[1];
+          logger.info(`[instruction.runner] Tab-Flow: direct single-letter key press "${_letter}" (from flow step: ${_flowAction})`);
+          const _letterResult = await _executeShortcut(sessionId, _letter, goal, actionHistory);
+          const _letterNote = _letterResult.ok ? (_letterResult.pageChanged ? '→ page changed' : '→ ok') : '→ FAILED';
+          actionHistory.push(`Shortcut "${_letter}" ${_letterNote} (direct from flow)`);
+          _triedTiers.add(3);
+          if (_letterResult.ok && _tabFlow[_flowIndex].tier === 3) {
+            _flowIndex++;
+            logger.info(`[instruction.runner] Tab-Flow: single-letter key done — advancing to step ${_flowIndex}`);
+            _emitProgress(progressCallbackUrl, stepIndex, {
+              type: 'tab_flow:step_done',
+              flowIndex: _flowIndex,
+              totalSteps: _tabFlow.length,
+            }, agentId, sessionId);
+            if (_flowIndex < _tabFlow.length) {
+              _emitProgress(progressCallbackUrl, stepIndex, {
+                type: 'tab_flow:step_start',
+                flowIndex: _flowIndex,
+                totalSteps: _tabFlow.length,
+                tier: _tabFlow[_flowIndex].tier,
+                action: _tabFlow[_flowIndex].action || '',
+              }, agentId, sessionId);
+            }
           }
           prevUrl = currentUrl;
           continue;
@@ -7618,6 +8828,21 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
       if (result.ok && _tabFlow && _flowIndex < _tabFlow.length && _tabFlow[_flowIndex].tier === 3) {
         _flowIndex++;
         logger.info(`[instruction.runner] Tab-Flow: Shortcut done — advancing to step ${_flowIndex}`);
+        _emitProgress(progressCallbackUrl, stepIndex, {
+          type: 'tab_flow:step_done',
+          flowIndex: _flowIndex,
+          totalSteps: _tabFlow.length,
+        }, agentId, sessionId);
+        // Emit step_start for the new step so the frontend shows it as running
+        if (_flowIndex < _tabFlow.length) {
+          _emitProgress(progressCallbackUrl, stepIndex, {
+            type: 'tab_flow:step_start',
+            flowIndex: _flowIndex,
+            totalSteps: _tabFlow.length,
+            tier: _tabFlow[_flowIndex].tier,
+            action: _tabFlow[_flowIndex].action || '',
+          }, agentId, sessionId);
+        }
       }
 
       // Record verification outcome (decays confidence on failure, triggers re-research eventually)
@@ -7662,9 +8887,16 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
 
       // Build tab-map if not cached or cache invalidated
       if (!_cachedTabMap || _cachedTabMapOverlayActive !== overlayActive || _cachedTabMapUrl !== currentUrl) {
-        const skipReset = overlayActive;
-        logger.info(`[instruction.runner] Tab-Map: building fresh tab-map (overlayActive=${overlayActive})`);
-        let tabMap = await buildTabMap(sessionId, 150, { skipReset });
+        // skipReset when an overlay is open OR the page has fillable fields
+        // (full-page forms like Google Calendar's event editor are not detected
+        // as modal dialogs, but _resetFocusToPageTop presses Escape and would
+        // close them — preserve the form by skipping the reset).
+        const skipReset = overlayActive || (_probe && _probe.fillableCount >= 1);
+        const _forceReset = _shouldForceFocusReset(goal, _pageCategory, overlayActive);
+        const _effectiveSkipReset = _forceReset ? false : skipReset;
+        if (_forceReset) logger.info(`[instruction.runner] Tab-Map: forcing focus reset to page top (shopping on-page action goal)`);
+        logger.info(`[instruction.runner] Tab-Map: building fresh tab-map (overlayActive=${overlayActive}, fillable=${_probe?.fillableCount}, skipReset=${_effectiveSkipReset})`);
+        let tabMap = await buildTabMap(sessionId, 150, { skipReset: _effectiveSkipReset });
 
         // Backward scan if forward scan found very few elements in an overlay
         if (overlayActive && tabMap.length < 3) {
@@ -7687,11 +8919,113 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
         _clearLlmCache(sessionId);
         logger.info(`[instruction.runner] Tab-Map: built fresh tab-map (${tabMap.length} elements) — cached for session`);
 
+        // ── Login-wall safety net ────────────────────────────────────────────
+        // If the tab-map looks like a login/signup form (password/identifier
+        // input + sign-in button + few other elements), the user is not
+        // actually authenticated. This catches stale cookies that passed the
+        // auth check but are no longer valid. Abort the run so the user can
+        // re-authenticate on the next attempt.
+        const _loginWallSignals = tabMap.filter(el => {
+          const tag = (el.tag || '').toLowerCase();
+          const text = (el.text || el.ariaLabel || el.placeholder || '').toLowerCase();
+          // Password/identifier/email input is the strongest signal
+          if (tag === 'input' && /password|identifier|email/.test(text)) return true;
+          // Sign-in / log-in / sign-up button or link
+          if (/^(sign\s*in|log\s*in|sign\s*up|register)\b/.test(text)) return true;
+          return false;
+        });
+        const _nonLoginElements = tabMap.length - _loginWallSignals.length;
+        const _isLoginWall = _loginWallSignals.length >= 2 && _nonLoginElements < 5;
+        if (_isLoginWall) {
+          logger.warn(`[instruction.runner] Tab-Map: login wall detected (${_loginWallSignals.length} login signals, ${_nonLoginElements} other elements) — aborting run, user needs to re-authenticate`);
+          return { ok: false, error: `Login wall detected — authentication required. Please sign in to the service and try again.`, actionHistory, stateChanged: false };
+        }
+
+        // ── Tab-pagination for on-page action goals ──────────────────────────
+        // When the goal is an on-page action (e.g. "click Add to Cart"), the
+        // primary button may be beyond the first 150 tab-stops on long pages
+        // (Amazon product pages have many chrome tab-stops before the buybox).
+        // Paginate: continue tabbing from current focus with carried-over
+        // seenSet/starterSig until classification finds a strong match OR the
+        // scan loops back to the original starter (whole page covered).
+        //
+        // Two-branch NOT_FOUND:
+        //   - NOT_FOUND + NOT looped back → paginate (next 150)
+        //   - NOT_FOUND + HAS looped back → Tab-Map exhausted for this state;
+        //     mark it so _selectTierLLM picks another tier (not Tab-Map again)
+        const _onPageTarget = _detectOnPageAction(goal);
+        if (_onPageTarget && tabMap.length > 0) {
+          const MAX_PAGES = 3; // safety cap (~450 elements, ~40s worst case)
+          let _pageSeenSet = tabMap.seenSet || new Set();
+          let _pageStarterSig = tabMap.starterSig || null;
+          let _pageStartId = tabMap.nextId || tabMap.length;
+          let _pageLoopedBack = tabMap.loopedBack || false;
+          let _classified = await _classifyOnPageAction(goal, _sweepTabMap(tabMap, goal, { currentUrl, pageCategory: _pageCategory }), { currentUrl, pageCategory: _pageCategory, consumedRefs });
+
+          for (let _page = 1; _page < MAX_PAGES && _classified === ON_PAGE_NOT_FOUND && !_pageLoopedBack; _page++) {
+            logger.info(`[instruction.runner] Tab-Map: on-page action "${_onPageTarget}" not found in page ${_page} (${tabMap.length} elements, loopedBack=${_pageLoopedBack}) — paginating to page ${_page + 1}`);
+            const _contResult = await buildTabMap(sessionId, 150, {
+              skipReset: true,
+              continuation: { seenSet: _pageSeenSet, starterSig: _pageStarterSig, startId: _pageStartId },
+            });
+            // Accumulate new elements into the cached tab-map
+            const _existingSigs = new Set(tabMap.map(e => _elementSignature(e)));
+            for (const el of _contResult) {
+              const sig = _elementSignature(el);
+              if (!_existingSigs.has(sig)) {
+                tabMap.push({ id: ++_pageStartId, ...el });
+                _existingSigs.add(sig);
+              }
+            }
+            _pageSeenSet = _contResult.seenSet || _pageSeenSet;
+            _pageStarterSig = _contResult.starterSig || _pageStarterSig;
+            _pageStartId = _contResult.nextId || _pageStartId;
+            _pageLoopedBack = _contResult.loopedBack || false;
+            logger.info(`[instruction.runner] Tab-Map: page ${_page + 1} added elements (total: ${tabMap.length}, loopedBack=${_pageLoopedBack})`);
+            _classified = await _classifyOnPageAction(goal, _sweepTabMap(tabMap, goal, { currentUrl, pageCategory: _pageCategory }), { currentUrl, pageCategory: _pageCategory, consumedRefs });
+          }
+
+          if (_classified === ON_PAGE_NOT_FOUND) {
+            if (_pageLoopedBack) {
+              // Tab-Map exhausted for this state — disable it so the LLM picks another tier
+              logger.info(`[instruction.runner] Tab-Map: full loop done, on-page target "${_onPageTarget}" not found — disabling Tab-Map for this state, falling back to tier selection`);
+              _triedTiers.add(4);
+              _cachedTabMap = null;
+              _stepPlan = null;
+              _stepIndex = 0;
+              prevUrl = currentUrl;
+              _doneVerifyFails = 0;
+              continue; // let _selectTierLLM pick another tier (not 4)
+            }
+            // Should not reach here (loop exits when loopedBack or found), but
+            // if we hit MAX_PAGES without looping back, fall through to normal
+            // step extraction — the planner may still find a usable step.
+            logger.info(`[instruction.runner] Tab-Map: hit MAX_PAGES (${MAX_PAGES}) without finding on-page target — falling through to step extraction`);
+          } else if (_classified && _classified.entry) {
+            // Strong match found — pre-seed the step plan with a direct click
+            // so the planner doesn't re-emit scroll steps. The entry's ref is
+            // used for the click.
+            logger.info(`[instruction.runner] Tab-Map: on-page action classified, pre-seeding click step for "${_onPageTarget}" → #${_classified.entry.id}`);
+            _stepPlan = [{ action: 'click', target: _onPageTarget, _preClassifiedRef: _classified.entry.ref, _preClassifiedId: _classified.entry.id }];
+            _stepIndex = 0;
+            _usingStepFallback = false;
+            _emitProgress(progressCallbackUrl, stepIndex, {
+              type: 'tab_map:plan',
+              flowIndex: _flowIndex,
+              flowAction: _tabFlow?.[_flowIndex]?.action || '',
+              steps: [{ index: 0, action: 'click', target: _onPageTarget }],
+            }, agentId, sessionId);
+          }
+        }
+
         // Extract steps from goal + tab-map (one LLM call)
         const { _extractSteps } = require('./browser.agent.cjs');
         const _fsh2 = (_tabFlow && _flowIndex < _tabFlow.length && _tabFlow[_flowIndex].tier === 4)
-          ? (_tabFlow[_flowIndex].action || '') : '';
-        _stepPlan = await _extractSteps(goal, currentUrl, _cachedTabMap, _pageCategory, agentContext, overlayActive, actionHistory, _fsh2);
+          ? (_tabFlow[_flowIndex].action || '')
+              .replace(/^(?:scan|look at|check|inspect|examine)\s+(?:the\s+)?page\s+and\s+/i, '')
+              .trim()
+          : '';
+        _stepPlan = await _extractSteps(goal, currentUrl, _sweepTabMap(_cachedTabMap, goal), _pageCategory, agentContext, overlayActive, actionHistory, _fsh2);
         _stepIndex = 0;
 
         // Step plan loop detection
@@ -7719,6 +9053,13 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
         } else {
           _usingStepFallback = false;
           logger.info(`[instruction.runner] Tab-Map: executing ${_stepPlan.length} extracted steps`);
+          // Emit tab_map:plan so the frontend can display the sub-plan steps
+          _emitProgress(progressCallbackUrl, stepIndex, {
+            type: 'tab_map:plan',
+            flowIndex: _flowIndex,
+            flowAction: _tabFlow?.[_flowIndex]?.action || '',
+            steps: _stepPlan.map((s, i) => ({ index: i, action: s.action, target: s.target || s.key || s.value || '' })),
+          }, agentId, sessionId);
         }
       } else {
         logger.info(`[instruction.runner] Tab-Map: using cached tab-map (${_cachedTabMap.length} elements)`);
@@ -8064,4 +9405,7 @@ module.exports = {
   _executeMetaF,
   _tabMapInnerStep,
   _isReadCountListGoal,
+  // Exported for testing (flow resync bug — 'the' click-target regression)
+  _resyncFlowIndex,
+  _flowComplete,
 };

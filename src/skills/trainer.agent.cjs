@@ -1254,7 +1254,7 @@ async function _injectRecorderScript(session, tabIndex) {
 // ---------------------------------------------------------------------------
 function _startTabWatcher(session) {
   const { sessionId } = session;
-  const { browserAct } = require('./browser.act.cjs');
+  const { browserAct, _parseCliResult } = require('./browser.act.cjs');
 
   let watching = false;
 
@@ -1267,9 +1267,9 @@ function _startTabWatcher(session) {
       const tabListResult = await browserAct({ action: 'tab-list', sessionId, headed: true, timeoutMs: 5000 });
       const tabListOutput = tabListResult.result || tabListResult.stdout || '';
 
-      const resultSectionMatch = tabListOutput.match(/^([\s\S]*?)(?=###\s|$)/i);
-      const resultSection = resultSectionMatch ? resultSectionMatch[1] : tabListOutput;
-      const tabMatches = [...resultSection.matchAll(/^\s*-\s+(\d+):\s+(?:\(current\)\s+)?\[([^\]]+)\]\(([^)]+)\)/gm)];
+      const resultSection = _parseCliResult(tabListOutput);
+      const resultSectionStr = typeof resultSection === 'string' ? resultSection : String(resultSection || '');
+      const tabMatches = [...resultSectionStr.matchAll(/^\s*-\s+(\d+):\s+(?:\(current\)\s+)?\[([^\]]+)\]\(([^)]+)\)/gm)];
       const tabs = tabMatches.map(m => ({ index: parseInt(m[1]), title: m[2].trim(), url: m[3].trim() }));
 
       for (const tab of tabs) {
@@ -1704,7 +1704,7 @@ function _startEventPoller(session) {
     polling = true;
 
     try {
-      const { browserAct } = require('./browser.act.cjs');
+      const { browserAct, _parseCliResult } = require('./browser.act.cjs');
 
       // ── Multi-tab collection: get list of all tabs ─────────────────────
       const tabListResult = await browserAct({ action: 'tab-list', sessionId, headed: true, timeoutMs: 5000 });
@@ -1714,10 +1714,10 @@ function _startEventPoller(session) {
       // Debug logging to see raw tab-list output
       logger.info(`[trainer.agent] tab-list raw output (${tabListOutput.length} chars): ${JSON.stringify(tabListOutput.substring(0, 300))}`);
 
-      // Parse tab list: extract content before first ### header to avoid duplicates
-      const resultSectionMatch = tabListOutput.match(/^([\s\S]*?)(?=###\s|$)/i);
-      const resultSection = resultSectionMatch ? resultSectionMatch[1] : tabListOutput;
-      const tabMatches = [...resultSection.matchAll(/^\s*-\s+(\d+):\s+(?:\(current\)\s+)?\[([^\]]+)\]\(([^)]+)\)/gm)];
+      // Parse tab list: extract content from ### Result section
+      const resultSection = _parseCliResult(tabListOutput);
+      const resultSectionStr = typeof resultSection === 'string' ? resultSection : String(resultSection || '');
+      const tabMatches = [...resultSectionStr.matchAll(/^\s*-\s+(\d+):\s+(?:\(current\)\s+)?\[([^\]]+)\]\(([^)]+)\)/gm)];
       const tabs = tabMatches.map(m => ({ index: parseInt(m[1]), title: m[2].trim(), url: m[3].trim() }));
 
       if (tabs.length === 0) {

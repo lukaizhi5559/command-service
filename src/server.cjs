@@ -1021,8 +1021,12 @@ class CommandServiceMCPServer {
             activeAutomationControllers.clear();
             // Forceful cleanup: kill playwright-cli daemons + Chrome processes
             // using ThinkDrop browser profiles (same pattern as startup cleanup).
-            try { forceKillPlaywright(); }
-            catch (fkErr) { logger.warn(`[automation.cancel] forceKillPlaywright error (non-fatal): ${fkErr.message}`); }
+            // Only when we actually aborted runs — otherwise we'd kill browser
+            // processes belonging to runs triggered via other code paths.
+            if (abortedCount > 0) {
+              try { forceKillPlaywright(); }
+              catch (fkErr) { logger.warn(`[automation.cancel] forceKillPlaywright error (non-fatal): ${fkErr.message}`); }
+            }
             res.writeHead(200);
             res.end(JSON.stringify({ ok: true, aborted: abortedCount }));
           } catch (err) {

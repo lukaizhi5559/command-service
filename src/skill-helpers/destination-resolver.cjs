@@ -578,6 +578,29 @@ const CORRECTION_NS = 'nav-correction';
 const CONFIDENCE_DECAY_PER_WEEK = 0.05;
 const STALE_THRESHOLD = 0.40;
 
+// ── On-page action detection ─────────────────────────────────────────────────
+// True for tasks whose primary verb is an action on the current page (add to cart,
+// like, follow, reply, etc.) rather than navigation to a URL. These must NOT have
+// their destination corrected — the action lives on the current page.
+// If the task ALSO contains navigation keywords (find, search, go to), it's a
+// compound task — let the resolver find the target page first.
+const _ON_PAGE_ACTION_VERBS = {
+  [INTENTS.COMMERCE]: /\b(add\s+(?:.+?\s+)?to\s+(?:the\s+|my\s+|a\s+|an\s+|your\s+|their\s+)?(?:[\w']+\s+){0,3}?(cart|basket|bag)|save\s+(?:this|the)\s+(?:item|product)|add\s+to\s+(?:wishlist|saved)|subscribe\s+to\s+(?:this|the))\b/i,
+  [INTENTS.SOCIAL]:   /\b(like|follow|star|pin|bookmark|save\s+(?:this|the))\b/i,
+  [INTENTS.MAIL]:     /\b(reply|forward|archive|delete|mark\s+as\s+(?:read|unread))\b/i,
+};
+const _ON_PAGE_NAV_KEYWORDS = /\b(go\s+to|navigate\s+to|open|find|search|look\s+up|browse)\b/i;
+
+function _isOnPageAction(task, intent) {
+  const t = String(task || '').toLowerCase();
+  if (!t) return false;
+  const actionRe = _ON_PAGE_ACTION_VERBS[intent];
+  if (!actionRe || !actionRe.test(t)) return false;
+  // Compound task with navigation keywords — let the resolver find the target page first.
+  if (_ON_PAGE_NAV_KEYWORDS.test(t)) return false;
+  return true;
+}
+
 /**
  * Load a previously recorded destination correction with time-based confidence decay.
  * Returns null if none exists or confidence has decayed below STALE_THRESHOLD.
@@ -627,14 +650,28 @@ async function deleteLearnedCorrection(serviceKey, intent) {
  * Confidence grows with repeated hits (capped at 1.0).
  * Returns true when the underlying write succeeds, false otherwise.
  */
-async function recordCorrection(serviceKey, intent, correctedUrl) {
+async function recordCorrection(serviceKey, intent, correctedUrl, task = '') {
   if (!skillDb) return false;
+  // On-page actions (add to cart, like, follow, reply, etc.) should never have a
+  // destination correction recorded — the action happens on the current page, not
+  // on a destination URL. Recording one poisons future runs (e.g. "add to cart"
+  // → /gp/cart/view.html, which navigates away from the product page).
+  if (_isOnPageAction(task, intent)) {
+    logger.warn(`[destination-resolver] Refusing to record correction for on-page action: ${serviceKey}:${intent} → ${correctedUrl}`);
+    return false;
+  }
   // Defense-in-depth: never persist an auth-flow URL (login, magic-link, oauth,
   // callback, signup, verify, logout, …) as a task destination correction.
   // Such URLs are auth/identity flow pages, not app surfaces — caching them
   // poisons future runs (e.g. claude.ai/magic-link instead of claude.ai/new).
   if (isAuthFlowUrl(correctedUrl)) {
     logger.warn(`[destination-resolver] Refusing to record auth-flow URL as correction for ${serviceKey}:${intent}: ${correctedUrl}`);
+    return false;
+  }
+  // Never persist a query-baked search-results URL as a correction — a future
+  // task on the same service would be navigated to a previous task's query.
+  if (_hasSearchQueryParam(correctedUrl)) {
+    logger.warn(`[destination-resolver] Refusing to record search-query URL as correction for ${serviceKey}:${intent}: ${correctedUrl}`);
     return false;
   }
   try {
@@ -964,6 +1001,36 @@ function _isValidDeepLinkUrl(url) {
 }
 
 /**
+ * Detect URLs that carry a baked-in search query (e.g.
+ * amazon.com/…/s?k=children's+storybook+bible, google.com/search?q=…).
+ * These are valid pages but TERRIBLE deep-link cache entries: they are
+ * query-specific, so a keyword-overlap hit reuses a previous task's search
+ * terms for a different query. Root cause of the Amazon run navigating to a
+ * stale "childrens-storybook-bible" results page.
+ */
+const _SEARCH_URL_PARAMS = new Set([
+  'k', 'q', 'query', 'search_query', 'searchterm', 'search', 'keyword',
+  'keywords', 'term', 'field-keywords', 's', 'st', 'find_desc', '_nkw',
+]);
+function _hasSearchQueryParam(url) {
+  if (!url || typeof url !== 'string') return false;
+  try {
+    const u = new URL(url);
+    for (const key of u.searchParams.keys()) {
+      if (_SEARCH_URL_PARAMS.has(key.toLowerCase())) return true;
+    }
+    // Path-based search endpoints that still take the query in the path or
+    // any other param (e.g. /search/xyz, /results/xyz, /find/xyz).
+    if (u.search.length > 1 && /\/(s|search|search-results|results|find|sch)(\/|$)/i.test(u.pathname)) {
+      return true;
+    }
+    return false;
+  } catch (_) {
+    return false;
+  }
+}
+
+/**
  * Detect generic/landing URLs that should never be cached as deep-links.
  * These are the service's default destinations (inbox, dashboard, home) —
  * caching them adds no value (they're already the startUrl fallback) and
@@ -1064,7 +1131,7 @@ async function getCachedDeepLink(serviceKey, keywords) {
     // them pollutes the keyword index because every task that lands there gets its
     // task keywords absorbed onto the generic URL. Filter them out on read and persist
     // the cleaned entry so the pollution doesn't recur.
-    const _validRoutes = entry.routes.filter(r => _isValidDeepLinkUrl(r.url) && !_isGenericLandingUrl(r.url, serviceKey));
+    const _validRoutes = entry.routes.filter(r => _isValidDeepLinkUrl(r.url) && !_isGenericLandingUrl(r.url, serviceKey) && !_hasSearchQueryParam(r.url));
     if (_validRoutes.length < entry.routes.length) {
       const _removed = entry.routes.length - _validRoutes.length;
       logger.info(`[destination-resolver] cleaning ${_removed} invalid/generic cached route(s) for ${serviceKey}`);
@@ -1117,6 +1184,13 @@ async function recordDeepLinkCache(serviceKey, url, keywords, intent) {
   // task keywords absorbed onto the generic URL.
   if (_isGenericLandingUrl(url, serviceKey)) {
     logger.info(`[destination-resolver] recordDeepLinkCache: skipping generic-landing URL for ${serviceKey}: ${url}`);
+    return false;
+  }
+  // Don't cache query-baked search-results URLs — they are query-specific, so a
+  // future keyword hit would reuse a previous task's search terms. Search URLs
+  // belong in the search-pattern cache (a {query} template), not the deep-link cache.
+  if (_hasSearchQueryParam(url)) {
+    logger.info(`[destination-resolver] recordDeepLinkCache: skipping search-query URL for ${serviceKey}: ${url}`);
     return false;
   }
   try {
@@ -1255,6 +1329,7 @@ module.exports = {
   getLearnedCorrection,
   deleteLearnedCorrection,
   suggestTaskUrl,
+  _isOnPageAction,
   getTaskKeywords,
   getCachedDeepLink,
   recordDeepLinkCache,

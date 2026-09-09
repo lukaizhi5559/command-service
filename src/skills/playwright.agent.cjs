@@ -5493,12 +5493,14 @@ async function _checkSingleVerificationCondition(v, page, url, text, subTaskId) 
   }
 
   // Pattern: "input ... contains X" or "field ... contains X"
+  // Also handles "input with aria-label 'Y' contains X" — Linear uses
+  // aria-label on contenteditable divs, not placeholder on <input>.
   const inputMatch = v.match(/(?:input|field)(?:.*?)(?:contains|has|shows?)\s+['"]?([^'"\n]+?)['"]?(?:\s|$)/);
   if (inputMatch && page) {
     const target = inputMatch[1].toLowerCase().trim();
     try {
       const _found = await page.evaluate((t) => {
-        const els = Array.from(document.querySelectorAll('input, textarea, [contenteditable="true"]'));
+        const els = Array.from(document.querySelectorAll('input, textarea, [contenteditable="true"], [role="textbox"]'));
         for (const el of els) {
           const val = (el.value || el.innerText || el.textContent || '').toLowerCase();
           if (val.includes(t)) return true;
@@ -5507,6 +5509,49 @@ async function _checkSingleVerificationCondition(v, page, url, text, subTaskId) 
       }, target).catch(() => false);
       if (_found) {
         logger.info(`[playwright.agent] sub-task #${subTaskId} verified: input contains "${target}"`);
+        return true;
+      }
+    } catch (_) {}
+  }
+
+  // Pattern: "input with aria-label 'Y' contains X" — Linear-specific
+  const ariaInputMatch = v.match(/aria-label\s+['"]?([^'"\n]+?)['"]?.*?(?:contains|has|shows?)\s+['"]?([^'"\n]+?)['"]?(?:\s|$)/);
+  if (ariaInputMatch && page) {
+    const ariaLabel = ariaInputMatch[1].toLowerCase().trim();
+    const target = ariaInputMatch[2].toLowerCase().trim();
+    try {
+      const _found = await page.evaluate((al, t) => {
+        const els = Array.from(document.querySelectorAll(`[aria-label]`));
+        for (const el of els) {
+          if ((el.getAttribute('aria-label') || '').toLowerCase() !== al) continue;
+          const val = (el.value || el.innerText || el.textContent || '').toLowerCase();
+          if (val.includes(t)) return true;
+        }
+        return false;
+      }, ariaLabel, target).catch(() => false);
+      if (_found) {
+        logger.info(`[playwright.agent] sub-task #${subTaskId} verified: input with aria-label "${ariaLabel}" contains "${target}"`);
+        return true;
+      }
+    } catch (_) {}
+  }
+
+  // Pattern: "button labeled 'X'" or "button text 'X'" — case-insensitive
+  // Linear uses "Create issue" (lowercase 'i'), not "Create Issue".
+  const buttonMatch = v.match(/button\s+(?:labeled|text|shows?)\s+['"]?([^'"\n]+?)['"]?(?:\s|$)/);
+  if (buttonMatch && page) {
+    const target = buttonMatch[1].toLowerCase().trim();
+    try {
+      const _found = await page.evaluate((t) => {
+        const els = Array.from(document.querySelectorAll('button, [role="button"], a[href]'));
+        for (const el of els) {
+          const txt = (el.innerText || el.textContent || '').toLowerCase().trim();
+          if (txt === t || txt.includes(t)) return true;
+        }
+        return false;
+      }, target).catch(() => false);
+      if (_found) {
+        logger.info(`[playwright.agent] sub-task #${subTaskId} verified: button "${target}" visible`);
         return true;
       }
     } catch (_) {}
@@ -5884,11 +5929,20 @@ function _extractGoalPhrases(goal) {
     .replace(/Do NOT click\s+["'][^"']+["']/gi, '') // strip "Do NOT click 'X'" patterns
     .replace(/Do NOT\s+\w+\s+["'][^"']+["']/gi, ''); // strip "Do NOT <verb> 'X'" patterns
 
-  // 1. Quoted phrases — "Q3 Planning Notes" or 'Q3 Planning Notes'
-  const quoted = _cleanGoal.match(/["']([^"']{2,})["']/g);
+  // 1. Quoted phrases — "Q3 Planning Notes" or 'Q3 Planning Notes'.
+  //    Single-quoted phrases may contain internal apostrophes (e.g.
+  //    'children's Bible storybook'). A closing ' is only a quote terminator
+  //    when NOT immediately followed by a word character — '(?=\w) apostrophes
+  //    are contractions/possessives and belong to the phrase. Previously
+  //    /["']([^"']{2,})["']/ stopped at the apostrophe in 'children's,
+  //    extracting just "children" — which trivially passes verification on
+  //    almost any page (false PASS on the Amazon add-to-cart task).
+  const quoted = _cleanGoal.match(/"([^"]{2,})"|(?<![\w'])'([^']*(?:'(?=\w)[^']*)*)'/g);
   if (quoted) {
     for (const q of quoted) {
-      const cleaned = q.replace(/["']/g, '').trim();
+      // Strip only the outer quotes — keep internal apostrophes so the phrase
+      // still matches page text verbatim ("children's" ≠ "childrens").
+      const cleaned = q.replace(/^["']|["']$/g, '').trim();
       if (cleaned.length > 2) phrases.push(cleaned);
     }
   }
@@ -6305,6 +6359,21 @@ Return ONLY valid JSON:
         if (_gate.listIntent && _gate.found < _gate.required) {
           logger.warn(`${_logTag}: BLOCKED (DOM) — all phrases found but list incomplete: found=${_gate.found} required=${_gate.required}`);
           return { pass: false, reason: `List incomplete: found ${_gate.found} of ${_gate.required} required items`, source: 'dom', matchedPhrases: matched, missingPhrases: [] };
+        }
+
+        // ── Commerce outcome gate ──
+        // Phrase matching alone cannot prove a cart mutation: the product query
+        // phrase (e.g. "children's Bible storybook") appears verbatim on ANY
+        // search-results or product page, so a PASS here must also show
+        // add-to-cart confirmation evidence. This is the false-PASS observed
+        // when the agent searched but never clicked Add to Cart.
+        if (/\badd\b[\s\S]{0,80}\b(?:cart|basket|bag)\b/i.test(goal || '') ||
+            /\b(?:cart|basket|bag)\b[\s\S]{0,40}\badd\b/i.test(goal || '')) {
+          const _cartEvidence = /added to (?:your |the |my )?(?:cart|basket|bag)|item(?:s)? added|added\b.{0,20}\b(?:cart|basket|bag)|(?:cart|basket|bag) subtotal|proceed to (?:buy|checkout)|\b\d+\s+items? in (?:your |the )?(?:cart|basket|bag)|view (?:cart|basket|bag)|go to (?:cart|basket|bag)|shopping (?:cart|basket|bag)/i.test(_nonModalLower);
+          if (!_cartEvidence) {
+            logger.warn(`${_logTag}: BLOCKED (DOM) — phrases found but no add-to-cart confirmation on page (goal="${(goal || '').slice(0, 80)}")`);
+            return { pass: false, reason: 'Goal includes add-to-cart but no cart confirmation found on page (e.g., "Added to Cart")', source: 'dom', matchedPhrases: matched, missingPhrases: [] };
+          }
         }
 
         logger.info(`${_logTag}: PASS (DOM) — all ${phrases.length} phrase(s) found [titled=${titledPhrases.length}] matched=${JSON.stringify(matched)} gate=passed(list=${_gate.found}/${_gate.required})`);
@@ -12710,11 +12779,15 @@ Turn ${turn}/${MAX_TURNS}. What is your next action? (DO NOT snapshot - act dire
       }
 
       // ── State-change detection: return to Tab-Flow on significant state change ──
-      // When the turn-loop opens a dialog/modal or navigates (e.g., "Show key" dialog),
-      // return to Tab-Flow so Tab-Map can scan the new state and execute the next
-      // flow step. The turn-loop is a recovery mechanism — once it gets the page
-      // into a new state, Tab-Flow should take over for deterministic execution.
-      if (_outcome.ok && _domMutating && _preActionState && turn >= 2) {
+      // When the turn-loop opens a dialog/modal or clicks something that changes the
+      // page state, return to Tab-Flow so Tab-Map can scan the new state and execute
+      // the next flow step. The turn-loop is a recovery mechanism — once it gets the
+      // page into a new state, Tab-Flow should take over for deterministic execution.
+      // NOTE: Don't resume Tab-Flow on `navigate` actions — navigate is a turn-loop
+      // recovery mechanism. If the Tab-Flow is stuck at a click step, re-entering
+      // Tab-Flow after a navigate won't help (the click step is still incomplete).
+      // Instead, let the turn-loop continue so the LLM can decide the next action.
+      if (_outcome.ok && _domMutating && _preActionState && _action.action !== 'navigate') {
         try {
           const _postPage = engine.getPage(sessionId);
           if (_postPage) {
@@ -12726,11 +12799,14 @@ Turn ${turn}/${MAX_TURNS}. What is your next action? (DO NOT snapshot - act dire
             if (_postState) {
               const _urlChanged = _postState.url !== _preActionState.url;
               const _modalChanged = _postState.modalCount !== _preActionState.modalCount;
-              const _bodyChanged = Math.abs((_postState.bodyLen || 0) - (_preActionState.bodyLen || 0)) > 200;
-              // Only return to Tab-Flow if a modal OPENED (not closed) or URL changed
-              // — modal closing is just dismissing something, not progress.
+              // Lower body-change threshold so opening a composer/picker or adding
+              // significant text is treated as a state change for Tab-Flow re-entry.
+              const _bodyChanged = Math.abs((_postState.bodyLen || 0) - (_preActionState.bodyLen || 0)) > 100;
+              // Only return to Tab-Flow if a modal OPENED (not closed), URL changed,
+              // or the page body changed meaningfully — any of these means the
+              // turn-loop got the page into a new state that Tab-Map can scan.
               const _modalOpened = _postState.modalCount > _preActionState.modalCount;
-              if ((_modalOpened || _urlChanged) && (_modalChanged || _bodyChanged || _urlChanged)) {
+              if (_modalOpened || _urlChanged || _bodyChanged) {
                 logger.info(`[playwright.agent] turn-loop: state changed after ${_action.action} (url=${_urlChanged}, modal=${_preActionState.modalCount}→${_postState.modalCount}, body=${_preActionState.bodyLen}→${_postState.bodyLen}) — returning to Tab-Flow for re-scan`);
                 return {
                   ok: false, stateChanged: true, resumeTabFlow: true,
@@ -12909,7 +12985,14 @@ Turn ${turn}/${MAX_TURNS}. What is your next action? (DO NOT snapshot - act dire
           const _pageLower = _finalPageText.toLowerCase();
           const _matchedPhrases = _goalPhrases.filter(p => p.length > 2 && _pageLower.includes(p.toLowerCase()));
           const _matchRatio = _matchedPhrases.length / _goalPhrases.length;
-          if (_matchRatio >= 0.5) {
+          // Same commerce outcome gate as the DOM verifier — the product query
+          // phrase lives on any results/product page, so a relaxed pass on an
+          // add-to-cart goal must show cart-confirmation evidence.
+          const _goalForGate = verificationGoal || goal || '';
+          const _cartGoal = /\badd\b[\s\S]{0,80}\b(?:cart|basket|bag)\b/i.test(_goalForGate) ||
+                            /\b(?:cart|basket|bag)\b[\s\S]{0,40}\badd\b/i.test(_goalForGate);
+          const _cartOk = !_cartGoal || /added to (?:your |the |my )?(?:cart|basket|bag)|item(?:s)? added|added\b.{0,20}\b(?:cart|basket|bag)|(?:cart|basket|bag) subtotal|proceed to (?:buy|checkout)|\b\d+\s+items? in (?:your |the )?(?:cart|basket|bag)|view (?:cart|basket|bag)|go to (?:cart|basket|bag)|shopping (?:cart|basket|bag)/i.test(_pageLower);
+          if (_matchRatio >= 0.5 && _cartOk) {
             logger.info(`[playwright.agent] turn-loop: pre-exhaustion check PASSED (relaxed) — ${_matchedPhrases.length}/${_goalPhrases.length} goal phrases found in page text (ratio=${_matchRatio.toFixed(2)})`);
             return {
               ok: true,
@@ -14287,12 +14370,17 @@ Output ONLY valid JSON: {${_matchedSkill.params.map(p => `"${p.name}": "<extract
     // askUser so the user can dismiss the modal manually.
     // Only applies to mutation tasks (post/share/send/submit) — read tasks can
     // still extract content from behind modals via getPageText.
-    const _isMutationTask = /\b(post|share|publish|submit|send|tweet|comment|reply|update|create|write|compose)\b/i.test(goal);
+    const _isMutationTask = /\b(post|share|publish|submit|send|tweet|comment|reply|update|create|write|compose|api key|credential|token)\b/i.test(goal);
     const _hasBlockingModal = _probeResult?.hasModalDialog === true || (_probeResult?.modalCount || 0) > 0;
     const _hasNoCompose = (_probeResult?.contentEditableCount || 0) === 0 &&
                           (_probeResult?.roleTextboxCount || 0) === 0 &&
                           (_probeResult?.textareaCount || 0) === 0;
-    if (_isMutationTask && _hasBlockingModal && _hasNoCompose) {
+    // Also check for fillable fields (input, select, button) — a modal with
+    // fillable fields (like "Create API key" dialog) should NOT be blocked.
+    const _hasFillableFields = (_probeResult?.textInputCount || 0) > 0 ||
+                               (_probeResult?.selectCount || 0) > 0 ||
+                               (_probeResult?.buttonCount || 0) > 0;
+    if (_isMutationTask && _hasBlockingModal && _hasNoCompose && !_hasFillableFields) {
       // Extract modal text for the user-facing message
       let _modalText = '';
       try {
@@ -17340,6 +17428,8 @@ module.exports = {
   // URL comparison helpers (exported for testing)
   _urlsEqual,
   _isCanonicalRedirect,
+  // Exported for testing (goal-phrase extraction — apostrophe regression)
+  _extractGoalPhrases,
   // Tier 1.6 overlay interaction (exported for instruction.runner.cjs)
   _detectOverlayRect,
   _executeOverlayInteraction,

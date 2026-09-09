@@ -12,6 +12,26 @@ function getChromium() {
   return _chromium;
 }
 
+// ── Startup check: warn if bundled Chrome for Testing binary is missing ──────
+// Playwright npm installs don't download browsers automatically. If the CfT
+// binary is missing, concurrent agent sessions (which skip real Chrome) will
+// fail to launch the engine and silently fall back to the playwright-cli daemon.
+// This check surfaces the issue early with an actionable warning.
+(function _checkCftBinary() {
+  try {
+    const cftPath = getChromium().executablePath();
+    if (!fs.existsSync(cftPath)) {
+      logger.warn(
+        `[browser-engine] WARNING: bundled Chrome for Testing binary not found at ${cftPath}. ` +
+        `Concurrent agent sessions will fail to launch the engine. ` +
+        `Run: npx playwright install chromium`
+      );
+    }
+  } catch (e) {
+    logger.warn(`[browser-engine] could not verify Chrome for Testing binary: ${e.message}`);
+  }
+})();
+
 // Cached result of whether the user's real Google Chrome is installed.
 // null = not yet checked; true/false = checked. When real Chrome launch fails,
 // a cooldown timestamp is recorded so we skip real Chrome for a while but

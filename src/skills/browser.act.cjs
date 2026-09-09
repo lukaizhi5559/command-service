@@ -910,9 +910,8 @@ async function collectDevToolsData(sessionId, action, result) {
 
     if (networkData.ok && networkData.stdout) {
       try {
-        const rawMatch = networkData.stdout.match(/^([\s\S]*?)(?=###\s|$)/i);
-        const rawJson = (rawMatch ? rawMatch[1] : networkData.stdout).trim().replace(/^"|"$/g, '');
-        const data = JSON.parse(rawJson);
+        const rawJson = _parseCliResult(networkData.stdout);
+        const data = typeof rawJson === 'string' ? JSON.parse(rawJson) : rawJson;
         debugSession.devToolsData.networkRequests.push(...data.requests);
         debugSession.devToolsData.consoleLogs.push(...data.logs);
         
@@ -1013,6 +1012,34 @@ const PLAYWRIGHT_CLI_AVAILABLE = (() => {
     return false;
   }
 })();
+
+// ---------------------------------------------------------------------------
+// playwright-cli stdout parser
+// playwright-cli 0.1.1+ prints output as: ### Result\n<value>\n### Ran Playwright code\n...
+// Older versions printed <value>\n### Ran Playwright code (no ### Result header).
+// This helper handles both formats and returns the bare value (quotes stripped,
+// JSON auto-parsed for objects/arrays).
+// ---------------------------------------------------------------------------
+function _parseCliResult(stdout) {
+  const raw = (stdout || '').trim();
+  if (!raw) return '';
+  // New format: ### Result\n<value>\n### ...
+  const resultHeaderMatch = raw.match(/###\s*Result\s*\n([\s\S]*?)(?=###\s|$)/i);
+  if (resultHeaderMatch) {
+    const val = resultHeaderMatch[1].trim().replace(/^["']|["']$/g, '');
+    if (val.startsWith('{') || val.startsWith('[')) {
+      try { return JSON.parse(val); } catch (_) { /* keep as string */ }
+    }
+    return val;
+  }
+  // Old format: <value>\n### Ran Playwright code (value before first ###)
+  const beforeHeaderMatch = raw.match(/^([\s\S]*?)(?=###\s|$)/i);
+  const val = beforeHeaderMatch ? beforeHeaderMatch[1].trim().replace(/^["']|["']$/g, '') : raw;
+  if (typeof val === 'string' && (val.startsWith('{') || val.startsWith('['))) {
+    try { return JSON.parse(val); } catch (_) { /* keep as string */ }
+  }
+  return val;
+}
 
 // ---------------------------------------------------------------------------
 // Core executor — runs playwright-cli with given args
@@ -1217,8 +1244,7 @@ async function getGmailPageContent(sessionId, timeoutMs = 5000) {
       try {
         const result = await strategy.fn();
         if (result.ok && result.stdout) {
-          const match = result.stdout.match(/^([\s\S]*?)(?=###\s|$)/i);
-          const content = match ? match[1].trim().replace(/^"|"$/g, '') : result.stdout.trim();
+          const content = _parseCliResult(result.stdout);
           if (content && content !== '' && content !== 'null') {
             logger.debug(`[browser.act] Gmail content detected via ${strategy.name}: ${content.length} chars`);
             return content;
@@ -2999,9 +3025,7 @@ async function browserAct(args) {
         }
         try {
           const _urlProbe = await cliRun([...S, 'eval', 'window.location.href'], 3000);
-          const _rawProbe = (_urlProbe.stdout || '').trim();
-          const _probeMatch = _rawProbe.match(/^([\s\S]*?)(?=###\s|$)/i);
-          const _curUrl = (_probeMatch ? _probeMatch[1] : _rawProbe).trim().replace(/^"|"$/g, '');
+          const _curUrl = _parseCliResult(_urlProbe.stdout);
           if (/about:blank/i.test(_curUrl)) {
             logger.warn(`[browser.act] navigate: command succeeded but current URL is about:blank (session=${sessionId})`);
           }
@@ -3430,6 +3454,57 @@ async function browserAct(args) {
             logger.warn(`[browser.act] click (engine) eval failed: ${evalErr.message} — falling back to CLI`);
           }
         }
+
+        // ── Form-field focus fallback ──────────────────────────────────────
+        // Some React-controlled inputs (Gmail To/CC/BCC comboboxes, Outlook
+        // recipients, Jira assignee pickers) have size="0" or width:0 until
+        // they receive focus. Playwright's page.click() requires a visible,
+        // actionable element, so it times out on these zero-size inputs.
+        // As a last resort before failing, query the element by selector and
+        // call el.focus() directly — this works even when Playwright considers
+        // the element "not visible" for clicking. After focus, the element
+        // typically expands to full width and the caller's type/reactFill
+        // logic takes over.
+        // Guard: only for form fields (input, textarea, contenteditable,
+        // combobox, textbox) — never for buttons/links (those need a real
+        // click to fire their handlers).
+        if (selector) {
+          try {
+            const _focusResult = await _ePage.evaluate((sel) => {
+              const el = document.querySelector(sel);
+              if (!el) return { ok: false, reason: 'not found' };
+              // Only focus form fields — not buttons/links
+              const tag = el.tagName;
+              const role = el.getAttribute('role') || '';
+              const isFormField = tag === 'INPUT' || tag === 'TEXTAREA' ||
+                el.isContentEditable ||
+                role === 'combobox' || role === 'textbox' || role === 'searchbox' || role === 'spinbutton';
+              if (!isFormField) return { ok: false, reason: 'not a form field' };
+              // Must be in the viewport (any part) — avoid focusing off-screen inputs
+              const r = el.getBoundingClientRect();
+              if (r.width === 0 && r.height === 0 && !el.isContentEditable) {
+                // Zero-size input — focus anyway (Gmail To expands on focus)
+              } else if (r.x > window.innerWidth || r.y > window.innerHeight ||
+                         r.x + r.width < 0 || r.y + r.height < 0) {
+                return { ok: false, reason: 'off-screen' };
+              }
+              el.focus();
+              el.scrollIntoView({ block: 'center', behavior: 'instant' });
+              // Verify focus moved (or to a descendant for contenteditable wrappers)
+              const active = document.activeElement;
+              const focused = active === el || el.contains(active) ||
+                (el.isContentEditable && active?.isContentEditable && el.contains(active));
+              return { ok: focused, reason: focused ? 'focused' : 'focus failed', activeTag: active?.tagName, activeRole: active?.getAttribute('role') };
+            }, selector);
+            if (_focusResult?.ok) {
+              logger.info(`[browser.act] click (engine) form-field focus fallback ok for "${selector}" (activeTag=${_focusResult.activeTag}, activeRole=${_focusResult.activeRole})`);
+              return { ok: true, action, sessionId, method: 'focus', executionTime: Date.now() - start };
+            }
+            logger.info(`[browser.act] click (engine) form-field focus fallback skipped: ${_focusResult?.reason || 'unknown'}`);
+          } catch (_focusErr) {
+            logger.warn(`[browser.act] click (engine) form-field focus fallback failed: ${_focusErr.message}`);
+          }
+        }
       }
 
       // Engine owns session — no CLI fallback
@@ -3541,10 +3616,7 @@ async function browserAct(args) {
         const evalRaw = (evalRes.stdout || '').trim();
         // playwright-cli echoes back the script source in "### Ran Playwright code" block
         // so we must extract ONLY the ### Result section to avoid false-positive 'not-found' match
-        // playwright-cli output format: <result>\n### Ran Playwright code\n...
-        // No "### Result" header exists — extract everything BEFORE the first ### header.
-        const resultMatch = evalRaw.match(/^([\s\S]*?)(?=###\s|$)/i);
-        const evalResult = resultMatch ? resultMatch[1].trim().replace(/^["']|["']$/g, '') : evalRaw.trim();
+        const evalResult = _parseCliResult(evalRaw);
         // Use startsWith only — the actual result is always "clicked:<text>" or "not-found".
         // includes() would match the script source in the output (e.g. return 'clicked:' + t;).
         const clickSucceeded = evalResult.startsWith('clicked:') &&
@@ -3796,11 +3868,15 @@ async function browserAct(args) {
             await _ePage.keyboard.type(fillText, { timeout: timeoutMs });
             await _ePage.keyboard.press('Tab');
           } else if (fieldType === 'rich-text') {
-            // Contenteditable rich-text editor (LinkedIn, Gmail, Quill, DraftJS):
-            // Focus is already set by the click. Type directly without Meta+a —
-            // Meta+a can select text outside the editor on some sites.
-            logger.info(`[browser.act] fill (engine) rich-text-detect: contenteditable — typing without Meta+a`);
-            await _ePage.keyboard.type(fillText, { delay: 10 });
+            // Contenteditable rich-text editor (LinkedIn, Gmail, Quill, DraftJS,
+            // ProseMirror, etc.): Focus is already set by the click.
+            // Prefer insertText for short text — character-by-character typing
+            // with delay can lose the first character on ProseMirror-style editors
+            // due to focus/selection race conditions.
+            // insertText is atomic and avoids autocomplete popup interception.
+            logger.info(`[browser.act] fill (engine) rich-text-detect: contenteditable — using insertText`);
+            await _ePage.keyboard.insertText(fillText);
+            await _ePage.waitForTimeout(150); // let editor flush
           } else {
             await _ePage.keyboard.press('Meta+a');
             await _ePage.keyboard.type(fillText, { timeout: timeoutMs });
@@ -3983,8 +4059,7 @@ async function browserAct(args) {
         '!!document.activeElement.closest("[role=combobox]")) ? "chip" : "normal"'
       ], 2000).catch(() => null);
       const _chipRaw = (_chipProbe?.stdout || '').trim();
-      const _chipResultMatch = _chipRaw.match(/^([\s\S]*?)(?=###\s|$)/i);
-      const _isChipField = (_chipResultMatch ? _chipResultMatch[1] : _chipRaw).replace(/^["']|["']$/g, '') === 'chip';
+      const _isChipField = _parseCliResult(_chipRaw) === 'chip';
       logger.info(`[browser.act] fill chip-detect: ${_isChipField ? 'chip/combobox — skipping Meta+a' : 'normal input'}`);
 
       let typeRes;
@@ -4096,9 +4171,17 @@ async function browserAct(args) {
           if (_typedText.length > 0 && _preSnap && _preSnap.hasContent) {
             await _ePage.keyboard.press('Meta+a').catch(() => {});
           }
-          // insertText for long/hashtag text — avoids autocomplete popup interception
-          if (/#\w{2,}/.test(_typedText) || _typedText.length > 200) {
+          // insertText for long/hashtag text AND for contenteditable rich-text
+          // editors (Notion, ProseMirror, DraftJS, Quill). Per-keystroke typing
+          // on ProseMirror-style editors can lose the first characters due to
+          // focus/selection race conditions, so insertText (atomic) is preferred.
+          const _isRichText = _preSnap && (_preSnap.editable || _preSnap.role === 'textbox');
+          if (/#\w{2,}/.test(_typedText) || _typedText.length > 200 || _isRichText) {
+            if (_isRichText && _typedText.length <= 200 && !/#\w{2,}/.test(_typedText)) {
+              logger.info(`[browser.act] type (engine) rich-text-detect: contenteditable — using insertText`);
+            }
             await _ePage.keyboard.insertText(_typedText);
+            await _ePage.waitForTimeout(150); // let editor flush (same as fill)
           } else {
             await _ePage.keyboard.type(_typedText, { timeout: timeoutMs });
           }
@@ -4165,6 +4248,57 @@ async function browserAct(args) {
               // PASS: text present (primary) OR placeholder gone OR pseudo-placeholder replaced
               if (!_textPresent && !_placeholderGone && !_pseudoPlaceholderGone) {
                 logger.warn(`[browser.act] type (engine) verification failed — textPresent=${_textPresent} placeholderGone=${_placeholderGone} pseudoPlaceholderGone=${_pseudoPlaceholderGone} value="${_postSnap.value.slice(0, 80)}" posMatch=${_postSnap.posMatch}`);
+                // ── reactFill fallback for contenteditable fields ──────────────
+                // When type verification fails on a contenteditable element
+                // (ProseMirror, DraftJS, Quill, etc.), fall back to reactFill
+                // with the active element's aria-label as the selector.
+                // This is generic — works for any contenteditable field that
+                // has an aria-label.
+                if (_postSnap.role === 'textbox' || _postSnap.editable) {
+                  try {
+                    const _ariaLabel = await _ePage.evaluate(() => (document.activeElement?.getAttribute('aria-label') || ''));
+                    if (_ariaLabel) {
+                      const _rfSelector = `[aria-label="${_ariaLabel}"]`;
+                      logger.info(`[browser.act] type (engine) falling back to reactFill selector="${_rfSelector}"`);
+                      // Inline reactFill: focus, clear, insertText, verify
+                      const _rfOk = await _ePage.evaluate((sel, txt) => {
+                        const el = document.querySelector(sel);
+                        if (!el) return false;
+                        el.focus();
+                        // Clear existing content
+                        const selObj = window.getSelection();
+                        if (selObj && el.isContentEditable) {
+                          selObj.selectAllChildren(el);
+                          selObj.deleteFromDocument();
+                        } else if (el.value !== undefined) {
+                          el.value = '';
+                        }
+                        // Insert text via execCommand (React-aware)
+                        try { document.execCommand('insertText', false, txt); } catch (_) {}
+                        // Dispatch input event for React state sync
+                        el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: txt }));
+                        return true;
+                      }, _rfSelector, _typedText).catch(() => false);
+                      if (_rfOk) {
+                        await _ePage.waitForTimeout(150);
+                        // Verify
+                        const _rfVerify = await _ePage.evaluate((sel, expected) => {
+                          const el = document.querySelector(sel);
+                          if (!el) return { verified: false, actual: '' };
+                          const actual = el.value || el.innerText || el.textContent || '';
+                          return { verified: actual.includes(expected.slice(0, 50)), actual: actual.slice(0, 200) };
+                        }, _rfSelector, _typedText).catch(() => ({ verified: false, actual: '' }));
+                        if (_rfVerify.verified) {
+                          logger.info(`[browser.act] type (engine) reactFill fallback verified: actual="${_rfVerify.actual.slice(0, 60)}"`);
+                          return { ok: true, action, sessionId, verified: true, executionTime: Date.now() - start };
+                        }
+                        logger.warn(`[browser.act] type (engine) reactFill fallback typed but verification failed: actual="${_rfVerify.actual.slice(0, 60)}"`);
+                      }
+                    }
+                  } catch (_rfErr) {
+                    logger.warn(`[browser.act] type (engine) reactFill fallback failed: ${_rfErr.message}`);
+                  }
+                }
                 return {
                   ok: false, action, sessionId,
                   error: `type verification failed: text not present and placeholder still shown. Use reactFill with a selector instead.`,
@@ -5655,17 +5789,11 @@ async function browserAct(args) {
       
       const res = await cliRun([...S, 'eval', evalExpr], Math.min(timeoutMs, 20000));
       const rawOut = (res.stdout || '').trim();
-      const resultMatch = rawOut.match(/^([\s\S]*?)(?=###\s|$)/i);
-      let jsonStr;
-      if (resultMatch) {
-        jsonStr = resultMatch[1].trim().replace(/^["']|["']$/g, '');
-      } else {
-        jsonStr = rawOut;
-      }
+      const jsonStr = _parseCliResult(rawOut);
 
       let extractedContent = null;
       try {
-        extractedContent = JSON.parse(jsonStr);
+        extractedContent = typeof jsonStr === 'string' ? JSON.parse(jsonStr) : jsonStr;
       } catch (e) {
         logger.warn(`[browser.act] Failed to parse extracted content JSON: ${e.message}`);
         extractedContent = { error: 'Failed to parse content' };
@@ -5674,14 +5802,8 @@ async function browserAct(args) {
       // Layer 4: Text-based regex extraction as fallback
       const pageTextRes = await cliRun([...S, 'eval', '(function(){var b=document.body;return b?(b.innerText||b.textContent||"").slice(0,50000):"";})()'], Math.min(timeoutMs, 10000));
       const pageRawOut = (pageTextRes.stdout || '').trim();
-      // Use greedy match to capture everything until the LAST ### marker
-      const pageResultMatch = pageRawOut.match(/^([\s\S]*?)(?=###\s|$)/i);
-      let pageText;
-      if (pageResultMatch) {
-        pageText = pageResultMatch[1].trim().replace(/^"/, '').replace(/"$/, '');
-      } else {
-        pageText = pageRawOut;
-      }
+      let pageText = _parseCliResult(pageRawOut);
+      if (typeof pageText !== 'string') pageText = String(pageText || '');
 
       // Regex extraction for URLs
       const urlRegex = /https?:\/\/[^\s"'\`>\),]+/g;
@@ -5852,13 +5974,8 @@ If no videos found, return []. Do not explain, only output the JSON array.`;
       const evalExpr = '(function(){var b=document.body;var t=document.title||"";var text=b?(b.innerText||b.textContent||"").slice(0,100000):"";return t?"[Page Title: "+t+"]\\n"+text:text;})()';
       const res = await cliRun([...S, 'eval', evalExpr], Math.min(timeoutMs, 20000));
       const rawOut = (res.stdout || '').trim();
-      const resultMatch = rawOut.match(/^([\s\S]*?)(?=###\s|$)/i);
-      let pageText;
-      if (resultMatch) {
-        pageText = resultMatch[1].trim().replace(/^"/, '').replace(/"$/, '');
-      } else {
-        pageText = rawOut;
-      }
+      let pageText = _parseCliResult(rawOut);
+      if (typeof pageText !== 'string') pageText = String(pageText || '');
       if (pageText.length < 200) {
         logger.info(`[browser.act] getPageText: short content (${pageText.length} chars), raw: ${rawOut.slice(0,200)}`);
       }
@@ -5886,13 +6003,7 @@ If no videos found, return []. Do not explain, only output the JSON array.`;
       })()`;
       const res = await cliRun([...S, 'eval', evalExpr], Math.min(timeoutMs, 20000));
       const rawOut = (res.stdout || '').trim();
-      const resultMatch = rawOut.match(/^([\s\S]*?)(?=###\s|$)/i);
-      let jsonStr;
-      if (resultMatch) {
-        jsonStr = resultMatch[1].trim().replace(/^["']|["']$/g, '');
-      } else {
-        jsonStr = rawOut;
-      }
+      const jsonStr = _parseCliResult(rawOut);
 
       let links = [];
       try {
@@ -5949,12 +6060,7 @@ If no videos found, return []. Do not explain, only output the JSON array.`;
       if (!evalRes.ok) return evalRes;
       
       const stdout = evalRes.stdout || '';
-      const match = stdout.match(/^([\s\S]*?)(?=###\s|$)/i);
-      const rawResult = match ? match[1].trim().replace(/^["']|["']$/g, '') : stdout.trim();
-      let result = rawResult;
-      if (typeof rawResult === 'string' && (rawResult.startsWith('{') || rawResult.startsWith('['))) {
-        try { result = JSON.parse(rawResult); } catch { /* keep as string */ }
-      }
+      const result = _parseCliResult(stdout);
       
       return {
         ok: true,
@@ -5997,8 +6103,7 @@ If no videos found, return []. Do not explain, only output the JSON array.`;
       const rcRes = await cliRun([...S, 'run-code', '--', code], timeoutMs);
       logger.info(`[browser.act] run-code → exit ${rcRes.exitCode}`, { stderr: rcRes.stderr?.slice(0, 200) });
       const rcStdout = rcRes.stdout || '';
-      const rcMatch = rcStdout.match(/^([\s\S]*?)(?=###\s|$)/i);
-      const rcResult = rcMatch ? rcMatch[1].trim().replace(/^"|"$/g, '') : rcStdout.trim();
+      const rcResult = _parseCliResult(rcStdout);
       const PLAYWRIGHT_HARD_ERR = /^### Error/im;
       if (!rcRes.ok || PLAYWRIGHT_HARD_ERR.test(rcStdout)) {
         const errMatch = rcStdout.match(/([A-Za-z]*Error:[^\n]+)/);
@@ -6115,8 +6220,7 @@ If no videos found, return []. Do not explain, only output the JSON array.`;
       while (Date.now() < deadline) {
         const evalRes = await cliRun([...S, 'eval', 'document.body.innerText.slice(0,50000)'], 8000);
         if (evalRes.ok) {
-          const pageText = evalRes.stdout.match(/^([\s\S]*?)(?=###\s|$)/i);
-          const textContent = pageText ? pageText[1].trim() : evalRes.stdout.trim();
+          const textContent = _parseCliResult(evalRes.stdout);
           if (textContent.includes(needle)) {
             return { ok: true, action, sessionId, result: needle, executionTime: Date.now() - start };
           }
@@ -6192,10 +6296,7 @@ If no videos found, return []. Do not explain, only output the JSON array.`;
       await cliRun([...S, 'eval', injectScript], 5000).catch(() => {});
 
       // Capture initial URL so we can detect navigation
-      const extractResult = (stdout) => {
-        const m = stdout.trim().match(/^([\s\S]*?)(?=###\s|$)/i);
-        return (m ? m[1].trim() : stdout.trim()).replace(/^"|"$/g, '');
-      };
+      const extractResult = (stdout) => _parseCliResult(stdout);
       let prevUrl = '';
       try {
         prevUrl = extractResult((await cliRun([...S, 'eval', 'location.href'], 4000)).stdout);
@@ -6472,8 +6573,8 @@ If no videos found, return []. Do not explain, only output the JSON array.`;
       try {
         const hostnameCheck = await cliRun([...S, 'eval', 'window.location.hostname'], 2000);
         if (hostnameCheck.ok && hostnameCheck.stdout) {
-          const hostname = hostnameCheck.stdout.match(/^([\s\S]*?)(?=###\s|$)/i);
-          isGmailSession = hostname && hostname[1] && hostname[1].includes('mail.google.com');
+          const hostname = _parseCliResult(hostnameCheck.stdout);
+          isGmailSession = typeof hostname === 'string' && hostname.includes('mail.google.com');
         }
       } catch (error) {
         // If hostname check fails, try session name as fallback
@@ -6521,9 +6622,7 @@ If no videos found, return []. Do not explain, only output the JSON array.`;
           // Fail fast on about:blank so callers can recover instead of re-planning on empty data.
           try {
             const urlProbe = await cliRun([...S, 'eval', 'window.location.href'], 2000);
-            const urlRaw = (urlProbe.stdout || '').trim();
-            const urlMatch = urlRaw.match(/^([\s\S]*?)(?=###\s|$)/i);
-            const curUrl = (urlMatch ? urlMatch[1] : urlRaw).trim().replace(/^"|"$/g, '');
+            const curUrl = _parseCliResult(urlProbe.stdout);
             if (/about:blank/i.test(curUrl)) {
               logger.warn(`[browser.act] waitForStableText: page is about:blank for session=${sessionId}`);
               return {
@@ -6542,13 +6641,8 @@ If no videos found, return []. Do not explain, only output the JSON array.`;
 
           // Use lighter eval for non-Gmail pages to reduce timeout risk
           const r = await cliRun([...S, 'eval', 'document.body.innerText.slice(0,25000)'], 6000);
-          // playwright-cli output format: <result>\n### Ran Playwright code\n...
-          // No "### Result" header — extract everything BEFORE the first ### header.
           const rawOut = (r.stdout || '').trim();
-          const resultMatch = rawOut.match(/^([\s\S]*?)(?=###\s|$)/i);
-          const cur = resultMatch
-            ? resultMatch[1].trim().replace(/^"|"$/g, '')
-            : rawOut;
+          const cur = _parseCliResult(rawOut);
 
           // Detect Chrome restore dialog — dismiss it with Escape (native browser UI, not page DOM)
           if (RESTORE_DIALOG.test(cur)) {
@@ -6626,8 +6720,7 @@ If no videos found, return []. Do not explain, only output the JSON array.`;
         logger.info(`[browser.act] waitForStableText: timeout after ${Date.now() - start}ms — doing final content fetch`);
         const lastRes = await cliRun([...S, 'eval', 'document.body.innerText.slice(0,25000)'], 6000);
         const lastRaw = (lastRes.stdout || '').trim();
-        const lastMatch = lastRaw.match(/^([\s\S]*?)(?=###\s|$)/i);
-        const finalText = lastMatch ? lastMatch[1].trim().replace(/^"|"$/g, '') : lastRaw;
+        const finalText = _parseCliResult(lastRaw);
         const wordCount = finalText.trim().split(/\s+/).filter(Boolean).length;
         logger.info(`[browser.act] waitForStableText: final fetch returned ${finalText.length} chars, ${wordCount} words`);
         return { ok: true, action, sessionId, result: finalText, executionTime: Date.now() - start };
@@ -6653,8 +6746,7 @@ If no videos found, return []. Do not explain, only output the JSON array.`;
         }
         const r = await cliRun([...S, 'eval', expr], tMs).catch(() => ({}));
         const raw = (r.stdout || '').trim();
-        const m = raw.match(/^([\s\S]*?)(?=###\s|$)/i);
-        return { ok: r.ok, val: m ? m[1].trim().replace(/^"|"$/g, '') : raw, stdout: r.stdout || '' };
+        return { ok: r.ok, val: _parseCliResult(raw), stdout: r.stdout || '' };
       };
       const _authClick = async (sel, tMs = 5000) => {
         if (_ePage) { try { await _ePage.click(sel, { timeout: tMs }); return { ok: true }; } catch (_) {} }
@@ -7686,8 +7778,7 @@ If no videos found, return []. Do not explain, only output the JSON array.`;
           let actualUrl = '';
           try {
             const urlProbe = await cliRun([...S, 'eval', 'window.location.href'], 3000);
-            const probeMatch = urlProbe.stdout?.match(/^([\s\S]*?)(?=###\s|$)/i);
-            actualUrl = (probeMatch ? probeMatch[1] : urlProbe.stdout || '').trim().replace(/^"|"$/g, '');
+            actualUrl = _parseCliResult(urlProbe.stdout) || '';
             logger.info(`[browser.act] tab-new cold-start: current URL is ${actualUrl}`);
           } catch (e) {
             logger.warn(`[browser.act] tab-new cold-start: URL check error: ${e.message}`);
@@ -7998,12 +8089,11 @@ If no videos found, return []. Do not explain, only output the JSON array.`;
         snap = snapshotCache.get(_tabKey(sessionId)) || '';
       }
 
-      // playwright-cli output format: <result>\n### Ran Playwright code\n...
-      // Extract the value BEFORE the first ### header.
+      // playwright-cli output format: ### Result\n<value>\n### Ran Playwright code
+      // Use _parseCliResult to extract the value from the ### Result section.
       function extractEvalValue(raw) {
-        const m = (raw || '').match(/^([\s\S]*?)(?=###\s|$)/i);
-        const val = m ? m[1].trim() : (raw || '').trim();
-        return val.replace(/^["']|["']$/g, '').trim();
+        const val = _parseCliResult(raw);
+        return typeof val === 'string' ? val.trim() : String(val || '');
       }
 
       const urlRes = await cliRun([...S, 'eval', 'location.href'], 3000);
@@ -8261,4 +8351,5 @@ module.exports = {
   _classifyAuthCookies,
   _sniffAuthCookies,
   _detachCookieSniffCdp,
+  _parseCliResult,
 };

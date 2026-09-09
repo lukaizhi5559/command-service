@@ -663,9 +663,8 @@ async function _scanCanvasLayout(sessionId) {
     // callBrowserAct returns { result, stdout, ... } — extract the JSON result
     let raw = '';
     if (res?.stdout) {
-      const _m = res.stdout.match(/^([\s\S]*?)(?=###\s|$)/i);
-      raw = _m ? _m[1].trim() : res.stdout.trim();
-      if (raw.startsWith('"') && raw.endsWith('"')) raw = raw.slice(1, -1).replace(/\\"/g, '"');
+      raw = _parseCliResult(res.stdout);
+      if (typeof raw !== 'string') raw = JSON.stringify(raw);
     } else {
       raw = String(res?.result || '').replace(/^"|"$/g, '');
     }
@@ -861,9 +860,8 @@ async function _readEditorStateDOM(sessionId) {
 
     let raw = '';
     if (res?.stdout) {
-      const _m = res.stdout.match(/^([\s\S]*?)(?=###\s|$)/i);
-      raw = _m ? _m[1].trim() : res.stdout.trim();
-      if (raw.startsWith('"') && raw.endsWith('"')) raw = raw.slice(1, -1).replace(/\\"/g, '"');
+      raw = _parseCliResult(res.stdout);
+      if (typeof raw !== 'string') raw = JSON.stringify(raw);
     } else {
       raw = String(res?.result || '').replace(/^"|"$/g, '');
     }
@@ -932,9 +930,8 @@ async function _readEditorStateCode(sessionId) {
 
     let raw = '';
     if (res?.stdout) {
-      const _m = res.stdout.match(/^([\s\S]*?)(?=###\s|$)/i);
-      raw = _m ? _m[1].trim() : res.stdout.trim();
-      if (raw.startsWith('"') && raw.endsWith('"')) raw = raw.slice(1, -1).replace(/\\"/g, '"');
+      raw = _parseCliResult(res.stdout);
+      if (typeof raw !== 'string') raw = JSON.stringify(raw);
     } else {
       raw = String(res?.result || '').replace(/^"|"$/g, '');
     }
@@ -1005,9 +1002,8 @@ async function _readEditorStateSheet(sessionId) {
 
     let raw = '';
     if (res?.stdout) {
-      const _m = res.stdout.match(/^([\s\S]*?)(?=###\s|$)/i);
-      raw = _m ? _m[1].trim() : res.stdout.trim();
-      if (raw.startsWith('"') && raw.endsWith('"')) raw = raw.slice(1, -1).replace(/\\"/g, '"');
+      raw = _parseCliResult(res.stdout);
+      if (typeof raw !== 'string') raw = JSON.stringify(raw);
     } else {
       raw = String(res?.result || '').replace(/^"|"$/g, '');
     }
@@ -1080,9 +1076,8 @@ async function _readEditorStateOCR(sessionId) {
       });
       let activeRaw = '';
       if (activeRes?.stdout) {
-        const _m = activeRes.stdout.match(/^([\s\S]*?)(?=###\s|$)/i);
-        activeRaw = _m ? _m[1].trim() : activeRes.stdout.trim();
-        if (activeRaw.startsWith('"') && activeRaw.endsWith('"')) activeRaw = activeRaw.slice(1, -1).replace(/\\"/g, '"');
+        activeRaw = _parseCliResult(activeRes.stdout);
+        if (typeof activeRaw !== 'string') activeRaw = JSON.stringify(activeRaw);
       } else {
         activeRaw = String(activeRes?.result || '').replace(/^"|"$/g, '');
       }
@@ -1770,6 +1765,12 @@ Rules:
 
 NAMED ITEM RULE: If the goal specifies a name, title, or list of items (e.g., "called X", "titled X", "named X", "with three items: A, B, C"), the EXACT name/items MUST appear in the OCR text for the goal to be achieved (1). A blank/empty/placeholder title (e.g., "Untitled", "New page") is NOT achieved. If the named items are not in the OCR text, return 0 (fail). NOTE: This rule does NOT apply to count questions — count questions are governed by the COUNT QUESTION RULE above.
 
+ADD TO CART RULE: If the goal asks to add an item to a cart/basket/bag (e.g., "add to cart", "add the first result to my cart"):
+- Return 1 ONLY if the OCR text shows explicit cart-confirmation evidence: "Added to Cart", "Added to your cart", "Added to Basket", "item added", a cart-count badge that increased, a cart subtotal, or "Proceed to checkout"/"Go to Cart" confirmation panel.
+- The product page showing the item title or an "Add to Cart" button is NOT proof the item was added — return 0.
+- A search results page is NEVER proof of an added item — return 0.
+- If the goal also says "the first result" / "first non-sponsored result" and the OCR shows the wrong item was added (a different product than the first organic search result), return 0.
+
 Return ONLY the number.`;
 
   const userPrompt = `Goal: ${goal}
@@ -1928,6 +1929,15 @@ async function _verifyGoalViaDomState(goal, sessionId, actionHistory, tabMapResu
     const _netNote = _netOk ? ` + API ${_netInfo}` : ' (no API call captured)';
     logger.info(`[browser.agent] _verifyGoalViaDomState: verified — dialog closed, no error${_netNote}`);
     return { verified: true, reason: `dialog-closed-no-error${_netNote}` };
+  }
+
+  // 4b. Dialog still open BUT API call succeeded → trust the API.
+  // Some apps (e.g., Gmail) keep the compose dialog open briefly after the
+  // send API returns 2xx, or show a "Sending..." toast. A successful API call
+  // with no error alert is a stronger signal than the dialog state.
+  if (_netOk && !_state.hasErrorAlert) {
+    logger.info(`[browser.agent] _verifyGoalViaDomState: verified — API success (${_netInfo}), dialog still open but no error`);
+    return { verified: true, reason: `api-success-dialog-open${_netInfo ? `-${_netInfo}` : ''}` };
   }
 
   return { verified: false, reason: 'dialog-still-open-after-submit' };
@@ -2669,8 +2679,51 @@ function _failTabFlowCache(agentId, goal) {
   }
 }
 
+// Quote-aware compound action splitter.
+// Splits an action string into atomic sub-actions on "then" / "and then" / ","
+// boundaries, but does NOT split on commas inside quotes or on "→" (which is
+// part of a single shortcut sequence like "Meta+J → A1").
+function _splitCompoundAction(action) {
+  const parts = [];
+  let current = '';
+  let inQuote = false;
+  let quoteChar = '';
+  const _pushCurrent = () => {
+    const trimmed = current.trim();
+    if (trimmed) parts.push(trimmed);
+    current = '';
+  };
+  for (let i = 0; i < action.length; i++) {
+    const ch = action[i];
+    if (!inQuote) {
+      // Check for "and then" / "then" boundary (word-boundary aware)
+      const remaining = action.slice(i);
+      const _thenMatch = remaining.match(/^(?:and\s+)?then\b/i);
+      if (_thenMatch) {
+        _pushCurrent();
+        i += _thenMatch[0].length - 1;
+        continue;
+      }
+      if (ch === "'" || ch === '"') {
+        inQuote = true;
+        quoteChar = ch;
+        current += ch;
+      } else if (ch === ',') {
+        _pushCurrent();
+      } else {
+        current += ch;
+      }
+    } else {
+      current += ch;
+      if (ch === quoteChar) inQuote = false;
+    }
+  }
+  _pushCurrent();
+  return parts;
+}
+
 // Compute the expected Tab-Flow for a step via LLM
-async function _computeTabFlow(goal, pageCategory, shortcutLabels, currentUrl, agentId) {
+async function _computeTabFlow(goal, pageCategory, shortcutLabels, currentUrl, agentId, urlFirstNav = false, deepLinkType = 'none') {
   const { askWithMessages } = require('../skill-helpers/skill-llm.cjs');
 
   const systemPrompt = `You are a Tab-Flow planner. Given a goal, page category, available shortcuts, and current URL, output the expected sequence of tier actions to achieve the goal.
@@ -2718,8 +2771,15 @@ CRITICAL RULES:
 - For spreadsheet cell entry: use Tier 3 (Meta+J) for EACH cell. Tier 3 handles the full flow: Meta+J → type cell address → Enter → type value → Tab/Enter. Do NOT use Tier 6 (ArrowGrid) or Tier 1 (Just-type) for spreadsheet cells.
 - For far jumps in spreadsheets (e.g., A1 to F10): use Tier 3 (Meta+J) to jump to each cell and type the value.
 - For creation deep links (docs.google.com/*/create): the entity is already created. For docs, Just-type the title. For sheets, use Tab-Map to click the title bar and rename.
+- For compose deep links (e.g., Gmail #inbox?compose=new): the compose window is ALREADY open. Do NOT include a step to click Compose, New, or Write. Start directly with filling the fields (recipient, subject, body) then click Send.
 - Be specific about what action each tier should take
 - Output ONLY the JSON array, no other text
+
+ATOMIC STEP RULE (critical):
+- Each step must be a SINGLE atomic action. Do NOT combine multiple actions into one step.
+- "click 'Create credentials' button, select 'API key' from the dropdown, then in the API key dialog click 'Copy'" should be split into separate steps: one for clicking 'Create credentials', one for selecting 'API key', one for filling the dialog, one for clicking 'Copy'.
+- If a step requires a dialog to open first (e.g., a "Create" button that opens a form), split it into: (1) click to open dialog, (2) fill dialog fields, (3) click submit button.
+- If a step has multiple sub-actions joined by "then", "and then", or ",", split it into separate steps.
 
 GOAL-RELEVANCE RULES (CRITICAL):
 - Every step MUST directly contribute to achieving the goal. Do NOT include steps that open unrelated features (e.g., "open Gemini AI chat", "open keyboard shortcuts help") unless the goal explicitly asks for them.
@@ -2727,7 +2787,7 @@ GOAL-RELEVANCE RULES (CRITICAL):
 - If the goal involves navigating to a specific page/section, use the search shortcut (/) or navigation shortcut (.) to get there — do NOT open unrelated side panels or chat features.
 - If no available shortcut helps achieve the goal, use Tier 4 (Tab-Map) to click the target element directly.`;
 
-  const userPrompt = `Goal: ${goal}\nPage category: ${pageCategory || 'web_generic'}\nAvailable shortcuts:\n${shortcutLabels || '(none)'}\nCurrent URL: ${currentUrl || '(unknown)'}\nAgent: ${agentId || '(unknown)'}`;
+  const userPrompt = `Goal: ${goal}\nPage category: ${pageCategory || 'web_generic'}\nAvailable shortcuts:\n${shortcutLabels || '(none)'}\nCurrent URL: ${currentUrl || '(unknown)'}\nAgent: ${agentId || '(unknown)'}${urlFirstNav ? `\nURL-FIRST NAVIGATION: true\nDEEP LINK TYPE: ${deepLinkType || 'none'}${deepLinkType === 'compose' ? '\nNOTE: The compose window is ALREADY open. Do NOT include a step to click Compose, New, or Write. Start directly with filling the fields (recipient, subject, body) then click Send.' : ''}${deepLinkType === 'creation' ? '\nNOTE: The entity has ALREADY been created. Do NOT include a step to click New or Create. Start directly with the first input field.' : ''}` : ''}`;
 
   try {
     const response = await askWithMessages([
@@ -2738,8 +2798,57 @@ GOAL-RELEVANCE RULES (CRITICAL):
     if (!response) return null;
     const flow = parseLlmJson(response, logger, '_computeTabFlow');
     if (Array.isArray(flow) && flow.length > 0) {
-      logger.info(`[browser.agent] _computeTabFlow: computed ${flow.length}-step flow for "${goal.slice(0, 60)}" — ${flow.map(s => `tier ${s.tier}(${(s.action || '').slice(0, 30)})`).join(' → ')}`);
-      return flow;
+      // Post-process: split compound steps that combine multiple actions into one.
+      // The LLM sometimes returns steps like "click X, select Y, then click Z" —
+      // these need to be split into atomic steps so the flow index tracks each action.
+      // Use a quote-aware splitter so commas inside quotes (e.g., type 'Hello, world')
+      // are not treated as boundaries.
+      const splitFlow = [];
+      for (const step of flow) {
+        // Validate tier field — default to 4 (Tab-Map) for missing/undefined
+        if (step.tier === undefined || step.tier === null) {
+          step.tier = 4;
+          logger.warn(`[browser.agent] _computeTabFlow: step has undefined tier — defaulting to 4 (Tab-Map)`);
+        }
+        const action = step.action || '';
+        // Split compound tier-4 steps into atomic steps using the quote-aware splitter.
+        // Don't split tier-3 compound steps — they're handled sequentially in the
+        // direct key press handler (sub-actions have different tiers: press/type/press).
+        if (step.tier === 4) {
+          const subActions = _splitCompoundAction(action);
+          if (subActions.length > 1) {
+            for (const subAction of subActions) {
+              splitFlow.push({ ...step, action: subAction });
+            }
+            logger.info(`[browser.agent] _computeTabFlow: split compound tier-4 step "${action.slice(0, 60)}" into ${subActions.length} atomic steps`);
+          } else {
+            splitFlow.push(step);
+          }
+        } else {
+          splitFlow.push(step);
+        }
+      }
+      // ── Safety net: strip redundant open/create step for compose/creation deep links ──
+      // Even with prompt guidance, the LLM may still emit a "click Compose" or
+      // "click New" step when the deep link already opened the form. Strip the
+      // first step if it matches an open/create action for the relevant deep
+      // link type. This is action-text-based (not site-specific).
+      if (urlFirstNav && splitFlow.length > 1) {
+        const _firstAction = String(splitFlow[0].action || '').toLowerCase();
+        let _stripPattern = null;
+        if (deepLinkType === 'compose' && /click.*\b(compose|new|write|draft)\b/i.test(_firstAction)) {
+          _stripPattern = 'compose';
+        } else if (deepLinkType === 'creation' && /click.*\b(new|create|add)\b/i.test(_firstAction)) {
+          _stripPattern = 'creation';
+        }
+        if (_stripPattern) {
+          const _strippedAction = splitFlow[0].action || '';
+          splitFlow.shift();
+          logger.info(`[browser.agent] _computeTabFlow: stripped redundant open step "${_strippedAction.slice(0, 50)}" (deepLinkType=${_stripPattern}) — flow now ${splitFlow.length} steps`);
+        }
+      }
+      logger.info(`[browser.agent] _computeTabFlow: computed ${splitFlow.length}-step flow for "${goal.slice(0, 60)}" — ${splitFlow.map(s => `tier ${s.tier}(${(s.action || '').slice(0, 30)})`).join(' → ')}`);
+      return splitFlow;
     }
     logger.warn(`[browser.agent] _computeTabFlow: could not parse JSON from response`);
     return null;
@@ -2970,14 +3079,20 @@ async function _extractSteps(goal, currentUrl, tabMap, pageCategory, agentContex
   // the current step expects so it generates steps for THAT action, not for the
   // overall goal (e.g., "click 'Create API key' button" instead of "click Credentials").
   const _flowHintBlock = flowStepHint
-    ? `\n\nCURRENT FLOW STEP: The automation is executing a pre-planned flow. The current step is: "${flowStepHint}". Generate steps ONLY for this specific action — do not re-plan navigation if the target page is already loaded. If the button/element for this step is visible, plan clicking it. If it's not visible, plan the closest navigation step toward it. Do NOT generate steps for the overall goal — only for this specific flow step.`
+    ? `\n\nCURRENT FLOW STEP: The automation is executing a pre-planned flow. The current step is: "${flowStepHint}". Generate steps ONLY for this specific action — do not re-plan navigation if the target page is already loaded. If the button/element for this step is visible, plan clicking it. If it's not visible, plan the closest navigation step toward it. Do NOT generate steps for the overall goal — only for this specific flow step. Do NOT generate "navigate" steps if the current page URL already matches the target page (e.g., if the goal is to "click 'Create credentials'" and the page is already on "apis/credentials", do NOT generate a "navigate" step — just click the button).`
     : '';
 
   // Build element list with [FILLABLE]/[CLICKABLE] markers
   // Include ariaRoleDescription and placeholder so the LLM can identify title fields
   // (e.g. aria-roledescription="page title", placeholder="Untitled") and avoid typing
   // block commands into them.
-  const elementList = (tabMap || []).map(e => {
+  // When overlayActive=true, scope the element list to dialog elements only —
+  // this prevents the LLM from generating steps for background page elements.
+  // Fall back to the full tabMap if no dialog elements were marked (e.g., the
+  // dialog doesn't use [role="dialog"] or the DOM overlay scan found nothing).
+  const _dialogElements = overlayActive && tabMap ? tabMap.filter(e => e.inDialog === true) : [];
+  const _scopedTabMap = _dialogElements.length > 0 ? _dialogElements : tabMap;
+  const elementList = (_scopedTabMap || []).map(e => {
     const _tag = e.tag || '';
     const _role = e.role || '';
     const _label = e.text || e.ariaLabel || '';
@@ -2990,7 +3105,10 @@ async function _extractSteps(goal, currentUrl, tabMap, pageCategory, agentContex
       _ariaRoleDesc ? `aria-roledescription="${_ariaRoleDesc}"` : '',
       _placeholder ? `placeholder="${_placeholder}"` : '',
     ].filter(Boolean).join(' ');
-    return `${e.id} - ${_tag} "${_label}" ${_role ? `role=${_role} ` : ''}${_extras ? `${_extras} ` : ''}${_marker}`;
+    const _sponsoredMark = e.isSponsored ? '[SPONSORED] ' : '';
+    const _pos = (e.x !== undefined && e.y !== undefined && e.w !== undefined && e.h !== undefined)
+      ? ` @x=${Math.round(e.x)},y=${Math.round(e.y)},w=${Math.round(e.w)},h=${Math.round(e.h)}` : '';
+    return `${e.id} - ${_tag} "${_label}" ${_role ? `role=${_role} ` : ''}${_extras ? `${_extras} ` : ''}${_sponsoredMark}${_marker}${_pos}`;
   }).join('\n');
 
   const systemPrompt = `You are planning the steps to achieve a goal on a web page.
@@ -3044,6 +3162,27 @@ Rules:
 - If there is only one step, still return an array: [{ "action": "..." }]
 - Output ONLY the JSON array, starting with [ and ending with ]. No other text.
 
+SEARCH-THEN-CLICK RULE: When the goal asks to click a search "result" (e.g., "first result", "first non-sponsored result"), elements marked [SPONSORED] are ads — do NOT target them. Pick the first result element WITHOUT the [SPONSORED] marker unless the goal explicitly asks for a sponsored/ad result.
+
+DUPLICATE-LABEL RULE: When multiple elements share the same text/label (e.g., multiple "Add to Cart" buttons on a product page), prefer the one that is:
+- Largest (greatest w*h) — primary action buttons are bigger than table-row or secondary buttons
+- Highest on the page (smallest y) — the buy box / main action area is above comparison tables and "other sellers" sections
+- In the main content column (not in a sidebar or far-left/far-right edge)
+Use the @x,y,w,h coordinates shown after each element to decide. When targeting a duplicate-label element, include enough context in the target text to disambiguate (e.g., the element ID or position).
+
+ADD-TO-CART PRODUCT PAGE RULE:
+- The primary "Add to Cart" / "Buy Now" / "Add to Bag" button for the current product is in the buybox, usually near the top of the product page, next to the product title, price, and main image.
+- Do NOT target "Add to Cart" buttons inside "Customers who viewed", "Sponsored", "Related items", "Customers also bought", or comparison carousels at the bottom of the page — those are for OTHER products.
+- If the buybox "Add to Cart" is not in the current element list, do NOT scroll down into carousels. Instead, scroll UP to the top of the page or emit a single \`scroll up\` step to bring the buybox into view.
+- Prefer the LARGEST and HIGHEST (smallest y) visible "Add to Cart" button.
+- Never click an "Add to Cart" button inside an ad banner or sponsored product card for the primary action — those redirect to ad/tracking domains or other products.
+- If an "Add to Cart" click would navigate away from the current product page, it is the wrong button; the real one adds to cart in place.
+
+SEARCH SUBMISSION RULE:
+- A search is only complete when the page shows actual result listings, a result count, or matching items.
+- If the URL contains a search parameter (e.g., /s?k=..., ?q=...) but the page only shows an autocomplete dropdown or suggested queries, the search has NOT been submitted. In that case, you MUST emit a 'type' step into the main search input followed by a 'press Enter' or a 'click' on the search/submit button.
+- Do NOT emit an action:done just because the URL or title looks like a search; verify result listings are visible in the element list.
+
 CONTENT EXTRACTION RULE: For any goal that involves searching, reading, counting, listing, or checking content (e.g., "search for unread emails", "count messages from X", "list items", "check how many"), ALWAYS end the plan with { "action": "waitForStableText" } followed by { "action": "getPageText" } so the results are captured and returned. Without getPageText, the task result will be empty.
 
 Conflict resolution (common with deep-links that pre-create content):
@@ -3075,6 +3214,13 @@ API KEY / CREDENTIALS PAGE RULE (Google Cloud Console, AI Studio, etc.):
   - ALWAYS end the plan with a step that captures the key value (getPageText or run-code or click the key name).
 |- If the goal says "create or retrieve" and existing keys are visible, prefer RETRIEVING an existing key (click the key name, copy the value) over creating a new one — it is faster and safer.
 
+CREATE API KEY DIALOG RULE (critical — when the "Create API key" dialog is open):
+- The dialog has a "Name" field (usually pre-filled like "API key 9"), a "Select API restrictions" dropdown (REQUIRED — shows "No APIs selected" until you pick one), and a "Create" button (disabled until an API is selected).
+- The correct sequence is: (1) click the "Select API restrictions" dropdown, (2) select an API (e.g., "Generative Language API" or "Vertex AI API"), (3) click "Create" to generate the key, (4) click "Copy" to copy the key.
+- Do NOT click "Create" before selecting an API — the button is disabled and the click will fail.
+- Do NOT click "Cancel" — that closes the dialog without creating the key.
+- Do NOT generate more than 5 steps for this dialog.
+
 OVERLAY/DIALOG STATE RULES (critical — check the Overlay/dialog state in the user prompt):
 - If the Overlay/dialog is OPEN, do NOT generate "navigate" steps — the dialog is already open; fill its fields or click its buttons instead. Navigating will close the dialog and destroy progress.
 - If the Overlay/dialog is OPEN, do NOT generate steps to open it again (e.g., "Click Create", "Click Event", "Click New", "Click +"). The dialog is already open.
@@ -3082,6 +3228,11 @@ OVERLAY/DIALOG STATE RULES (critical — check the Overlay/dialog state in the u
 - If the Overlay/dialog is CLOSED and the goal requires creating something, you may need to click a "Create" button or use a shortcut to open the dialog first.
 - Use the Actions already taken to determine what's been done. Do NOT repeat actions already taken (e.g., if a shortcut was pressed to open the create dialog, don't plan to open it again).
 - If a "navigate" step would go to the same or a parent of the current URL, skip it — it's redundant.
+
+REQUIRED FIELD RULE (critical — check for required fields in the dialog):
+- If a required field is empty (e.g., a dropdown showing "No APIs selected" with a red border, or a field marked with "*"), select a value from that field BEFORE clicking the primary action (e.g., "Create", "Save", "Submit"). Required fields block the primary action.
+- For a "Create API key" dialog: the "Select API restrictions" dropdown is REQUIRED. Select an API (e.g., "Generative Language API" or "Vertex AI API") before clicking "Create".
+- For a "Create credentials" dialog: if a "Select API" or "API restrictions" field is required, select it first.
 
 SOCIAL_FEED COMPOSE RULE (critical — check URL and overlay state):
 - If the URL contains "shareActive=true", "compose", "posting", or "share" AND the overlay is OPEN, the post composer is ALREADY open. Do NOT generate a "click Start a post" or "click Compose" step — the dialog is already open.
@@ -3216,6 +3367,40 @@ Extract the ordered steps:`;
       logger.warn(`[browser.agent] _extractSteps: all steps filtered out — returning null`);
       return null;
     }
+
+    // Hallucination guard — reject nonsensical plans
+    // A plan with >10 steps is likely a hallucination (the LLM generated a loop of
+    // alternating actions instead of a coherent plan). A plan with an alternating
+    // pattern (e.g., Create/Cancel/Create/Cancel) is also a hallucination.
+    if (steps.length > 10) {
+      logger.warn(`[browser.agent] _extractSteps: plan has ${steps.length} steps — likely hallucination, falling back to per-step LLM`);
+      return null;
+    }
+    // Check for alternating patterns (e.g., Create/Cancel/Create/Cancel)
+    const _actionSig = steps.map(s => `${s.action}:${s.target || ''}`);
+    const _alternating = _actionSig.some((a, i) => i >= 2 && a === _actionSig[i - 2] && _actionSig[i - 1] !== a);
+    if (_alternating) {
+      logger.warn(`[browser.agent] _extractSteps: plan contains alternating pattern — likely hallucination, falling back to per-step LLM`);
+      return null;
+    }
+    // Same-page navigate guard — don't generate "navigate" steps that go to the
+    // same or a parent of the current URL. This prevents the LLM from generating
+    // navigate steps when the page is already loaded.
+    if (steps.some(s => s.action === 'navigate')) {
+      const _currentHost = new URL(currentUrl || 'https://unknown').hostname;
+      const _samePageNav = steps.filter(s => {
+        if (s.action !== 'navigate' || !s.url) return false;
+        try {
+          const _targetUrl = new URL(s.url);
+          return _targetUrl.hostname === _currentHost &&
+                 (currentUrl || '').includes(_targetUrl.pathname);
+        } catch (_) { return false; }
+      });
+      if (_samePageNav.length > 0) {
+        logger.warn(`[browser.agent] _extractSteps: plan contains navigate to same page "${_samePageNav[0].url}" — likely hallucination, falling back to per-step LLM`);
+        return null;
+      }
+    }
     return steps;
   };
 
@@ -3343,7 +3528,9 @@ async function _llmNextAction(goal, currentUrl, tabMap, actionHistory, pageCateg
       }
     }
 
-    return `${e.id} - ${_tag} "${_label}" ${_role ? `role=${_role} ` : ''}${markers.join(' ')}`;
+    const _pos = (e.x !== undefined && e.y !== undefined && e.w !== undefined && e.h !== undefined)
+      ? ` @x=${Math.round(e.x)},y=${Math.round(e.y)},w=${Math.round(e.w)},h=${Math.round(e.h)}` : '';
+    return `${e.id} - ${_tag} "${_label}" ${_role ? `role=${_role} ` : ''}${markers.join(' ')}${_pos}`;
   }).join('\n');
 
   // Build "Fields already filled" section
@@ -3412,6 +3599,7 @@ SOCIAL_FEED COMPOSE RULE (critical — one step at a time):
 - APP KNOWLEDGE RULE: Check the Agent context below for app-specific patterns — slash commands, block creation shortcuts, UI quirks, keyboard shortcuts. Use them when the goal requires app-specific interactions.
 - BLOCK-CREATION RULE: When creating lists/todos/headings in block-based editors (Notion, Google Docs), do NOT type raw markdown. Create each block as a separate step: (1) Type the block-creation shortcut (e.g. "/todo" or "[]" + Space — check Agent context for the app's specific shortcuts), (2) Press Enter if a slash menu appeared, (3) Type the item text, (4) Press Enter to create the next block. Repeat for each item.
 - SEARCH-THEN-CLICK RULE: When clicking search results, skip ads/sponsored results — click the first ORGANIC result.
+- DUPLICATE-LABEL RULE: When multiple elements share the same text/label (e.g., multiple "Add to Cart" buttons), prefer the one that is largest (greatest w*h), highest on the page (smallest y), and in the main content column — not in a sidebar or comparison table. Use the @x,y,w,h coordinates shown after each element to decide.
 - CONTENT EXTRACTION RULE: For any goal that involves searching, reading, counting, listing, or checking content (e.g., "search for unread emails", "count messages from X", "list items", "check how many"), after pressing Enter or navigating to trigger a search, use "Wait for stable text" then "Get page text" to capture the results before outputting DONE. Without Get page text, the task result will be empty.
 - PAGE TEXT CAPTURED RULE: If "Page text captured" is shown below and it contains the information needed to answer the goal (e.g., email subjects, counts, search results), output DONE immediately. Do NOT call "Get page text" again — the text is already captured.`;
 
@@ -3479,8 +3667,8 @@ function _postProgress(callbackUrl, evt) {
 
 const { userAgent } = require('./user.agent.cjs');
 
-const { resolveDestination, recordCorrection, classifyTaskIntent, classifyUrlType, getLearnedCorrection, deleteLearnedCorrection, suggestTaskUrl, getTaskKeywords, getCachedDeepLink, recordDeepLinkCache, deleteDeepLinkCache, getSearchUrlPattern, recordSearchUrlPattern, INTENTS, SERVICE_CHAT_URLS, isAuthFlowUrl, _isValidDeepLinkUrl } = require('../skill-helpers/destination-resolver.cjs');
-const { killExistingChromeForProfile, clearProfileLock, findCli, shortSessionId, _sniffAuthCookies, engine: browserEngine } = require('./browser.act.cjs');
+const { resolveDestination, recordCorrection, classifyTaskIntent, classifyUrlType, getLearnedCorrection, deleteLearnedCorrection, suggestTaskUrl, _isOnPageAction, getTaskKeywords, getCachedDeepLink, recordDeepLinkCache, deleteDeepLinkCache, getSearchUrlPattern, recordSearchUrlPattern, INTENTS, SERVICE_CHAT_URLS, isAuthFlowUrl, _isValidDeepLinkUrl } = require('../skill-helpers/destination-resolver.cjs');
+const { killExistingChromeForProfile, clearProfileLock, findCli, shortSessionId, _sniffAuthCookies, engine: browserEngine, _parseCliResult } = require('./browser.act.cjs');
 const { loadAppKnowledge, saveAppKnowledge, loadAndFormat, isCacheStale, isShortcutCoverageStale, recordVerification } = require('./lib/appKnowledge.cjs');
 const { parseLlmJson } = require('../skill-helpers/parseLlmJson.cjs');
 
@@ -3552,7 +3740,11 @@ const KNOWN_BROWSER_SERVICES = {
                      open_existing: { buildUrl: (task, ctx) => `https://app.notion.com/search?q=${ctx.encodedQuery}` },
                    } },
   figma:          { startUrl: 'https://www.figma.com',                           signInUrl: 'https://www.figma.com/login',                       authSuccessPattern: 'figma.com/files',              isOAuth: true  },
-  linear:         { startUrl: 'https://linear.app',                              signInUrl: 'https://linear.app/login',                          authSuccessPattern: 'linear.app/',                  isOAuth: true  },
+  linear:         { startUrl: 'https://linear.app',                              signInUrl: 'https://linear.app/login',                          authSuccessPattern: 'linear.app/',                  isOAuth: true, hostAliases: ['linear.new'],
+                   intentUrls: {
+                     content_create: 'https://linear.new',
+                     open_existing: { buildUrl: (task, ctx) => `https://linear.app/search?q=${ctx.encodedQuery || ''}` },
+                   } },
   jira:           { startUrl: 'https://id.atlassian.com',                        signInUrl: 'https://id.atlassian.com',                          authSuccessPattern: 'atlassian.net',                isOAuth: true  },
   confluence:     { startUrl: 'https://id.atlassian.com',                        signInUrl: 'https://id.atlassian.com',                          authSuccessPattern: 'atlassian.net/wiki',           isOAuth: true  },
   airtable:       { startUrl: 'https://airtable.com',                            signInUrl: 'https://airtable.com/login',                        authSuccessPattern: 'airtable.com/',                isOAuth: true  },
@@ -4977,6 +5169,38 @@ async function actionBuildAgent({ service, startUrl: explicitUrl, force = false,
   const serviceKey = service.toLowerCase().replace(/[^a-z0-9_]/g, '');
   const agentId    = `${serviceKey}.agent`;
 
+  // ── Duplicate prevention: check if a canonical agent (with separators)
+  // already exists for the same normalized form. e.g. if service="google-calendar"
+  // normalizes to "googlecalendar" but "google_calendar.agent" already exists,
+  // reuse it instead of creating a duplicate with a separate Chrome profile.
+  const _norm = (s) => s.toLowerCase().replace(/[^a-z0-9]/g, '');
+  const _serviceNorm = _norm(serviceKey);
+  if (_serviceNorm !== serviceKey) {
+    try {
+      const _allAgents = await actionListAgents();
+      const _match = (_allAgents?.agents || []).find(a => {
+        const _regNorm = _norm((a.id || '').replace(/\.agent$/, ''));
+        return _regNorm === _serviceNorm && a.id !== agentId;
+      });
+      if (_match) {
+        logger.info(`[browser.agent] build_agent: service "${service}" → canonical agent "${_match.id}" already exists (normalized: "${_serviceNorm}") — reusing instead of creating duplicate "${agentId}"`);
+        const _existing = await actionQueryAgent({ id: _match.id });
+        if (_existing.found) {
+          return {
+            ok: true,
+            agentId: _match.id,
+            alreadyExists: true,
+            service: _existing.service,
+            startUrl: extractDescriptorUrl(_existing.descriptor, 'start_url'),
+            capabilities: _existing.capabilities,
+            mdPath: path.join(AGENTS_DIR, `${_match.id}.md`),
+            descriptor: _existing.descriptor,
+          };
+        }
+      }
+    } catch (_) { /* non-fatal — proceed with normal build */ }
+  }
+
   // Resolve via LLM if not in seed map — never hard-fail on unknown service
   const meta = await resolveBrowserMeta(service);
 
@@ -5007,7 +5231,16 @@ async function actionBuildAgent({ service, startUrl: explicitUrl, force = false,
       return null;
     });
     if (existsResult) {
+      logger.info(`[browser.agent] build_agent: ${agentId} already exists (status=${existsResult.status}, type=${agentType}) — skipping rebuild, preserving authed_at`);
       return { ok: true, agentId, ...existsResult };
+    }
+    // Log why the early-return didn't fire so defensive failures are diagnosable.
+    if (existsResult === null) {
+      const _diag = await withDb(async (db) => {
+        const r = await db.all('SELECT id, type, status FROM agents WHERE id = ?', agentId);
+        return r && r[0] ? { storedType: r[0].type, storedStatus: r[0].status, computedType: agentType } : { found: false };
+      }).catch(() => ({ dbError: true }));
+      logger.info(`[browser.agent] build_agent: ${agentId} defensive check did not early-return — ${JSON.stringify(_diag)}`);
     }
   }
 
@@ -5172,6 +5405,21 @@ async function actionQueryAgent({ service, id }) {
     let rows;
     if (id) {
       rows = await db.all("SELECT * FROM agents WHERE id = ?", id);
+      // Fuzzy match: LLM sometimes generates "google-calendar.agent",
+      // "google.calendar.agent", "google/calendar.agent", "google~calendar.agent",
+      // etc. Normalize any non-alphanumeric separator in the service key to "_"
+      // while preserving the ".agent" suffix.
+      if (!rows || rows.length === 0) {
+        const _normalized = id.replace(/\.agent$/i, '')
+          .replace(/[^a-z0-9]+/gi, '_')
+          + '.agent';
+        if (_normalized !== id) {
+          rows = await db.all("SELECT * FROM agents WHERE id = ?", _normalized);
+          if (rows && rows.length > 0) {
+            logger.info(`[browser.agent] actionQueryAgent: normalized "${id}" → "${_normalized}" (fuzzy match)`);
+          }
+        }
+      }
     } else {
       const serviceKey = (service || '').toLowerCase().replace(/[^a-z0-9_]/g, '');
       rows = await db.all("SELECT * FROM agents WHERE service = ? AND type IN ('browser', 'api_key', 'bearer', 'basic')", serviceKey);
@@ -5828,9 +6076,8 @@ async function diagnoseAndPatchRecipe({ agentId, recipeName, recipe, failureReas
         // playwright-cli output format: <result>\n### Ran Playwright code\n...
         let raw = '';
         if (probeRes.stdout) {
-          const _m = probeRes.stdout.match(/^([\s\S]*?)(?=###\s|$)/i);
-          raw = _m ? _m[1].trim() : probeRes.stdout.trim();
-          if (raw.startsWith('"') && raw.endsWith('"')) raw = raw.slice(1, -1).replace(/\\"/g, '"');
+          raw = _parseCliResult(probeRes.stdout);
+          if (typeof raw !== 'string') raw = JSON.stringify(raw);
         } else {
           raw = String(probeRes?.result || '').replace(/^"|"$/g, '');
         }
@@ -6161,11 +6408,29 @@ async function verifyDeepLinkUrl(url, sessionId, expectedHost, timeoutMs = 15000
       return false;
     }
 
-    const body = await callSkill('browser.act', { action: 'evaluate', text: 'document.title + " " + ((document.body && document.body.innerText) ? document.body.innerText.slice(0, 500) : "")', sessionId, timeoutMs: 5000 }, 8000).catch(() => ({ ok: false }));
-    if (!body?.ok) return false;
-    const text = String(body?.result ?? body?.stdout ?? '').toLowerCase();
-    if (/\b404\b|\bnot found\b|\bsomething went wrong\b|\berror\b|\bunavailable\b/.test(text)) {
-      logger.warn(`[browser.agent] verifyDeepLinkUrl: error indicator found on ${url}`);
+    // Structural error page check — counts interactive elements and body text.
+    // A valid page has interactive content (inputs, buttons, contenteditable, links);
+    // a 404/error page typically has very few and short body text.
+    // This is language-agnostic and works across all sites without per-site text patterns.
+    const structRes = await callSkill('browser.act', { action: 'evaluate', text: `(() => {
+      const interactive = document.querySelectorAll('input:not([type="hidden"]), textarea, button, [role="button"], [contenteditable="true"], [contenteditable=""], [role="textbox"], a[href]');
+      let visibleInteractive = 0;
+      for (const el of interactive) {
+        const r = el.getBoundingClientRect();
+        if (r.width > 0 && r.height > 0 && el.offsetParent !== null) visibleInteractive++;
+      }
+      const bodyText = (document.body && document.body.innerText) ? document.body.innerText : '';
+      return JSON.stringify({ interactive: visibleInteractive, bodyLen: bodyText.length });
+    })()`, sessionId, timeoutMs: 5000 }, 8000).catch(() => ({ ok: false }));
+    if (!structRes?.ok) return false;
+    let _interactive = -1, _bodyLen = -1;
+    try {
+      const _parsed = typeof structRes?.result === 'object' ? structRes.result : JSON.parse(String(structRes?.result || '{}').replace(/^"|"$/g, '').replace(/\\"/g, '"'));
+      _interactive = _parsed.interactive ?? -1;
+      _bodyLen = _parsed.bodyLen ?? -1;
+    } catch (_) {}
+    if (_interactive >= 0 && _interactive < 3 && _bodyLen >= 0 && _bodyLen < 300) {
+      logger.warn(`[browser.agent] verifyDeepLinkUrl: page looks like error/404 (interactive=${_interactive}, bodyLen=${_bodyLen}) on ${url}`);
       return false;
     }
 
@@ -6253,6 +6518,9 @@ function _isPassiveReadTask(task) {
   if (!t) return false;
   return _PASSIVE_READ_VERBS.test(t);
 }
+
+// On-page action detection is implemented in destination-resolver.cjs and imported above.
+// Keeping the same name for internal use.
 
 // ── Sub-class: search-criteria task (needs a search URL or search-box interaction) ──
 // True when the task names filter criteria: unread, from:X, subject:X, label:X,
@@ -6545,6 +6813,67 @@ async function _buildSearchUrlFromPattern(serviceKey, task) {
   return _url;
 }
 
+// ── Generic site-search URL templates ────────────────────────────────────────
+// Deterministic results-page URLs for high-traffic search/shopping sites.
+// "search <site> for 'X'" tasks land directly on a fresh results page via
+// URL-first instead of (a) hitting the keyword cache — which may hold a stale
+// query-baked URL — or (b) typing into the site's search box.
+const SITE_SEARCH_URL_TEMPLATES = {
+  'amazon.com':        'https://www.amazon.com/s?k={query}',
+  'ebay.com':          'https://www.ebay.com/sch/i.html?_nkw={query}',
+  'etsy.com':          'https://www.etsy.com/search?q={query}',
+  'walmart.com':       'https://www.walmart.com/search?q={query}',
+  'target.com':        'https://www.target.com/s?searchTerm={query}',
+  'bestbuy.com':       'https://www.bestbuy.com/site/searchpage.jsp?st={query}',
+  'homedepot.com':     'https://www.homedepot.com/s/{query}',
+  'youtube.com':       'https://www.youtube.com/results?search_query={query}',
+  'google.com':        'https://www.google.com/search?q={query}',
+  'bing.com':          'https://www.bing.com/search?q={query}',
+  'duckduckgo.com':    'https://duckduckgo.com/?q={query}',
+  'github.com':        'https://github.com/search?q={query}',
+  'stackoverflow.com': 'https://stackoverflow.com/search?q={query}',
+  'reddit.com':        'https://www.reddit.com/search/?q={query}',
+  'yelp.com':          'https://www.yelp.com/search?find_desc={query}',
+  'imdb.com':          'https://www.imdb.com/find?q={query}',
+  'wikipedia.org':     'https://en.wikipedia.org/wiki/Special:Search?search={query}',
+};
+
+// Extract the quoted search term from a "search ... 'X'" task. The quote pattern
+// is boundary-aware: an internal apostrophe followed by a word char (children's)
+// is part of the term, not a quote terminator.
+function _extractQuotedSearchTerm(task) {
+  const t = String(task || '');
+  if (!/\b(?:search|look\s*up|find|shop|browse)\b/i.test(t)) return null;
+  const m = t.match(/\b(?:search|look\s*up|find|shop\s+for|browse\s+for)\b[^'"]*?["']((?:[^'"]+|'(?=\w))+)["']/i);
+  return m ? m[1].trim() : null;
+}
+
+/**
+ * Build a deterministic site-search URL for "search <site> for 'X'" tasks
+ * (non-criteria — plain product/content queries, not is:unread-style filters).
+ * Uses the static SITE_SEARCH_URL_TEMPLATES map first, then falls back to the
+ * discovered search-pattern cache. Returns the URL string, or null.
+ */
+async function _buildGenericSearchUrl(serviceKey, baseHost, task) {
+  try {
+    const q = _extractQuotedSearchTerm(task);
+    if (!q) return null;
+    const host = String(baseHost || '').replace(/^www\./, '').toLowerCase();
+    const tmpl = SITE_SEARCH_URL_TEMPLATES[host] ||
+      (Object.entries(SITE_SEARCH_URL_TEMPLATES).find(([d]) => host.endsWith('.' + d)) || [])[1];
+    if (tmpl) return tmpl.replace('{query}', encodeURIComponent(q));
+    // Fallback: a previously discovered {query} pattern for this service.
+    const _pat = await getSearchUrlPattern(String(serviceKey || '').toLowerCase().replace(/[^a-z0-9]/g, '')).catch(() => null);
+    if (_pat?.urlTemplate && _pat.urlTemplate.includes('{query}')) {
+      return _pat.urlTemplate.replace('{query}', encodeURIComponent(q));
+    }
+    return null;
+  } catch (e) {
+    logger.warn(`[browser.agent] _buildGenericSearchUrl error (non-fatal): ${e.message}`);
+    return null;
+  }
+}
+
 async function _resolveTaskDeepLink(agentId, serviceKey, baseStartUrl, task, existingDeepLinkUrl, sessionId) {
   try {
     // If a deep-link was already resolved (e.g., by preflight), skip resolution.
@@ -6612,6 +6941,18 @@ async function _resolveTaskDeepLink(agentId, serviceKey, baseStartUrl, task, exi
         logger.info(`[browser.agent] deep-link: search-pattern cache hit for ${agentId}: ${_patternUrl}`);
         return { url: _patternUrl, source: 'search-pattern' };
       }
+    }
+
+    // Step 0.6: Generic site-search URL — for "search <site> for 'X'" tasks
+    // (plain product/content queries, not criteria tasks). This must run BEFORE
+    // the keyword cache: a cached route with a baked-in query (e.g. an old
+    // .../s?k=previous+query results URL) would otherwise short-circuit the
+    // fresh search. A deterministic template URL always produces the correct
+    // results page for THIS task's query.
+    const _genericSearchUrl = await _buildGenericSearchUrl(serviceKey, baseHost, task);
+    if (_genericSearchUrl) {
+      logger.info(`[browser.agent] deep-link: site-search template for ${agentId}: ${_genericSearchUrl}`);
+      return { url: _genericSearchUrl, source: 'site-search' };
     }
 
     // Step 0.7: CHAT/RESEARCH intent template — for chatbot services, go directly to
@@ -7600,6 +7941,23 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
   // safely under macOS's 104-char Unix socket limit.
   const sessionId = profile;
 
+  // ── On-page action check ───────────────────────────────────────────────────
+  // If the task is an on-page action (add to cart, like, follow, reply, etc.),
+  // skip destination resolution AND deep-link resolution. The action lives on the
+  // current page — any URL correction or deep-link would send the agent away from
+  // the target (e.g., "add to cart" must not be corrected to the cart page URL).
+  const _actionIntent = await classifyTaskIntent(task, _svcKey);
+  const _onPageAction = _isOnPageAction(task, _actionIntent);
+  if (_onPageAction) {
+    logger.info(`[browser.agent] run: on-page action (${_actionIntent}) — skipping destination resolution and deep-link resolution for ${agentId}`);
+    // Delete any stale learned correction for this service/intent so future
+    // on-page action runs aren't poisoned by an old navigation destination (e.g.
+    // amazon:commerce → /gp/cart/view.html from a previous bad run).
+    setImmediate(() => {
+      deleteLearnedCorrection(_svcKey, _actionIntent).catch(() => {});
+    });
+  }
+
   // ── Destination intent mismatch correction ────────────────────────────────────
   // Pre-navigation: detect when the configured startUrl (e.g. developer API console)
   // does not match the task's intent (e.g. research/chat). Correct silently on high
@@ -7607,7 +7965,9 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
   // SKIP for auth-only manualLogin calls — those are intentionally single-purpose:
   // navigate to the sign-in page and call waitForAuth. Destination ambiguity would
   // abort the auth flow before the browser window ever opens.
-  if (!(_authOnly && manualLogin)) {
+  // ALSO skip for on-page actions — those should run on the current page, not be
+  // redirected to a destination URL from a stale correction cache.
+  if (!_onPageAction && !(_authOnly && manualLogin)) {
     try {
       const _destResult = await resolveDestination(_svcKey, task, startUrl, agentId);
       if (_destResult.action === 'auto_correct') {
@@ -7617,7 +7977,7 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
         // but only when this isn't already a resume (avoid echoing learned corrections).
         if (!_destResult.fromResumeContext) {
           setImmediate(() => {
-            recordCorrection(_svcKey, _destResult.intent, _destResult.correctedUrl).catch(() => {});
+            recordCorrection(_svcKey, _destResult.intent, _destResult.correctedUrl, task).catch(() => {});
           });
         }
       } else if (_destResult.action === 'ask_user') {
@@ -7637,7 +7997,11 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
       logger.warn(`[browser.agent] run: destination-resolver error (non-fatal): ${_destErr.message}`);
     }
   } else {
-    logger.info(`[browser.agent] run: skipping destination resolution for auth-only manualLogin on ${agentId}`);
+    if (_onPageAction) {
+      logger.info(`[browser.agent] run: skipping destination resolution for on-page action on ${agentId}`);
+    } else {
+      logger.info(`[browser.agent] run: skipping destination resolution for auth-only manualLogin on ${agentId}`);
+    }
   }
 
   // ── App Knowledge: start research in parallel with auth check ─────────────
@@ -8366,6 +8730,20 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
           logger.info(`[browser.agent] run: auth-check: LLM input — title="${(_pageInfo.title || '').slice(0, 100)}" bodyLen=${(_pageInfo.body || '').length} body="${(_pageInfo.body || '').slice(0, 200)}" for ${agentId}`);
           const _llmAuthResult = await _detectAuthViaLLM(_pageInfo.title || '', _pageInfo.body || '', agentId);
 
+          // ── Defensive override: hasSignInButton + no auth cookies ──────────────
+          // The LLM auth check can false-positive on marketing/landing pages (e.g.
+          // linear.app landing page has a "Log in" button but the LLM sees the
+          // product name in the title and says "authenticated"). When the page
+          // has a sign-in button AND no auth cookies are present, override the
+          // LLM's "authenticated" verdict — the user is clearly NOT logged in.
+          // This only fires when BOTH signals are present, so authenticated pages
+          // with a "Sign in with a different account" button + valid cookies are
+          // not affected.
+          if (_llmAuthResult === 0 && _pageInfo.hasSignInButton && _cookieAuthed !== true) {
+            logger.info(`[browser.agent] run: auth-check: LLM says authenticated but hasSignInButton=true + no auth cookies — overriding to auth required for ${agentId}`);
+            _llmAuthResult = 1;
+          }
+
           if (_llmAuthResult === 0) {
             // LLM says authenticated — skip waitForAuth regardless of cookie/regex signals
             logger.info(`[browser.agent] run: auth-check: LLM says authenticated — skipping waitForAuth for ${agentId}`);
@@ -8380,10 +8758,28 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
               _authNeeded = false;
               logger.info(`[browser.agent] run: manualLogin + LLM authenticated — skipping waitForAuth for ${agentId}`);
             }
-          } else {
-            // LLM says auth required (1) — auth needed, regardless of cookie hints
+          } else if (_llmAuthResult === 1) {
+            // Valid LLM response: auth required — auth needed, regardless of cookie hints
             logger.info(`[browser.agent] run: auth-check: LLM says auth required — calling waitForAuth for ${agentId}`);
             _authNeeded = true;
+          } else {
+            // LLM unavailable (null after 3 retries) — fall back to cookie/metadata heuristics.
+            // The Tab-Map safety net in instruction.runner.cjs will catch stale cookies by
+            // detecting login walls after the scan, so this fallback is safe.
+            if (_cookieAuthed === true || _pageMetaAuthed) {
+              logger.warn(`[browser.agent] run: auth-check: LLM unavailable (null) — falling back to cookie/metadata, treating as authenticated for ${agentId} (cookieAuthed=${_cookieAuthed}, pageMetaAuthed=${_pageMetaAuthed})`);
+              _pageMetaAuthed = true;
+              _onLoginPage = false;
+              _pageMetaLoginWall = false;
+              _setCachedAuthCheck(agentId, false);
+              if (manualLogin === true) {
+                _authNeeded = false;
+                logger.info(`[browser.agent] run: manualLogin + LLM-unavailable fallback — skipping waitForAuth for ${agentId}`);
+              }
+            } else {
+              logger.warn(`[browser.agent] run: auth-check: LLM unavailable (null) and no strong auth signals — treating as auth required for ${agentId}`);
+              _authNeeded = true;
+            }
           }
           // Cookie hint is logged but no longer overrides the LLM decision.
           // DOM heuristic decision tree below is skipped — LLM is authoritative.
@@ -8777,6 +9173,15 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
         logger.warn(`[browser.agent] run: caller-provided url "${url}" is invalid — ignoring`);
       }
     } else {
+    // ── On-page action check ───────────────────────────────────────────────────
+    // If the task is an on-page action (add to cart, like, follow, reply, etc.),
+    // skip deep-link resolution AND the trainer handoff. The action lives on the
+    // current page — navigating to a URL would send the agent away from the target.
+    // The runner starts state-reactively from the current page.
+    // _actionIntent is already computed at the top of run().
+    if (_onPageAction) {
+      logger.info(`[browser.agent] run: on-page action (${_actionIntent}) — skipping deep-link resolution, starting from current page for ${agentId}`);
+    } else {
     // ── Task-specific deep-link resolution ─────────────────────────────────────
     const _deepLinkResult = await _resolveTaskDeepLink(agentId, _svcKey, startUrl, task, null, sessionId);
     const _deepLink = _deepLinkResult?.url || (typeof _deepLinkResult === 'string' ? _deepLinkResult : null);
@@ -8803,8 +9208,7 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
         }
       } catch (_) {}
     } else {
-      const _taskIntent = await classifyTaskIntent(task, _svcKey);
-      if (_isMutationIntent(_taskIntent)) {
+      if (_isMutationIntent(_actionIntent)) {
         const trainerAgent = require('./trainer.agent.cjs');
         const recipe = trainerAgent.findMatchingRecipe(agentId.replace('.agent', ''), task, { allowAutoGenerated: _allowAutoGeneratedRecipes });
         if (!recipe) return {
@@ -8822,6 +9226,7 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
         };
       }
     }
+    }
   }
   }
 
@@ -8831,6 +9236,15 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
   // notion.new). If URL-first was selected, check the current URL and navigate to
   // startUrl unless the current page is genuinely a fresh redirect from the shortcut.
   let _postEnforcementUrl = undefined;
+
+  // On-page actions should never be redirected by URL-first enforcement — the
+  // target element is on the current page. If _urlFirstNavigationSelected was
+  // somehow set (caller URL, deep-link, stale correction), ignore it.
+  if (_onPageAction && _urlFirstNavigationSelected) {
+    logger.info(`[browser.agent] run: on-page action (${_actionIntent}) — skipping URL-first enforcement for ${agentId}`);
+    _urlFirstNavigationSelected = false;
+  }
+
   if (_urlFirstNavigationSelected && startUrl) {
     try {
       const _curUrlRes = await callBrowserAct({ action: 'evaluate', text: 'window.location.href', sessionId, timeoutMs: 5000 }, 8000).catch(() => ({ ok: false }));
@@ -8908,7 +9322,31 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
               if (_startU.hostname !== _curU.hostname) {
                 _isCanonicalRedirect = true;
               } else if (_curU.pathname.length > _startU.pathname.length) {
-                _isCanonicalRedirect = true;
+                // The current page has a longer path than the start URL — this is
+                // usually a canonical redirect (e.g., docs.new → docs.google.com/document/d/<id>).
+                // BUT: if the goal mentions a specific page (e.g., "Credentials"),
+                // check that the current URL contains the expected page path. If the
+                // current page is a generic landing/welcome page (e.g., /welcome) but
+                // the goal expects a specific page (e.g., /apis/credentials), don't
+                // treat it as canonical — navigate to the start URL.
+                const _goalLower = (task || goal || '').toLowerCase();
+                const _expectedPathMap = [
+                  { keywords: ['credentials'], path: 'apis/credentials' },
+                  { keywords: ['api key', 'api keys'], path: 'apis/credentials' },
+                  { keywords: ['apis & services', 'apis and services'], path: 'apis' },
+                  { keywords: ['library'], path: 'apis/library' },
+                  { keywords: ['dashboard'], path: 'apis/dashboard' },
+                  { keywords: ['oauth', 'consent'], path: 'apis/credentials/consent' },
+                ];
+                const _expectedPath = _expectedPathMap.find(m => m.keywords.some(k => _goalLower.includes(k)));
+                if (_expectedPath && !_curUrl.toLowerCase().includes(_expectedPath.path)) {
+                  // Goal expects a specific page but current URL doesn't contain it —
+                  // don't treat as canonical (will navigate to startUrl)
+                  _isCanonicalRedirect = false;
+                  logger.info(`[browser.agent] run: URL-first enforcement — current path "${_curU.pathname}" doesn't match expected "${_expectedPath.path}" from goal — will navigate to ${startUrl}`);
+                } else {
+                  _isCanonicalRedirect = true;
+                }
               }
             }
           }
@@ -8947,6 +9385,71 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
           if (_curUrl.replace(/\/+$/, '') === startUrl.replace(/\/+$/, '')) {
             _isCanonicalRedirect = true;
           }
+        }
+
+        // ── Search-query param guard ──────────────────────────────────────────
+        // The canonical compares above ignore top-level query params (tracking
+        // tokens don't affect page state). But a *search* param (k=, q=, etc.)
+        // DOES define the page: two /s?k=… URLs with different queries are
+        // different pages. If the startUrl carries a search param and the
+        // current URL's value differs, this is not a canonical redirect —
+        // navigate to get the correct query's results.
+        if (_isCanonicalRedirect) {
+          try {
+            const _sqCur = new URL(_curUrl);
+            const _sqStart = new URL(startUrl);
+            if (_sqCur.origin === _sqStart.origin) {
+              const _SEARCH_PARAMS = ['k', 'q', 'query', 'search_query', 'searchterm', 'keyword', 'term', 'field-keywords', 'st', 'find_desc', '_nkw'];
+              for (const _p of _SEARCH_PARAMS) {
+                const _sv = _sqStart.searchParams.get(_p);
+                if (_sv != null && String(_sv).trim() !== '') {
+                  const _cv = _sqCur.searchParams.get(_p);
+                  if ((_cv || '') !== _sv) {
+                    _isCanonicalRedirect = false;
+                    logger.info(`[browser.agent] URL-first enforcement: search param "${_p}" differs (start="${_sv}", current="${_cv}") — not canonical, navigating to ${startUrl}`);
+                    break;
+                  }
+                }
+              }
+            }
+          } catch (_) {}
+        }
+
+        // ── Error page guard (structural, not regex) ──────────────────────────
+        // A longer-path redirect is NOT canonical if the page has no meaningful
+        // interactive content — this catches 404/not-found/error pages that SPAs
+        // render after a redirect (e.g., Linear's /issue/new → /workspace/issue/new
+        // which renders "Issue not found"). A valid page has interactive elements
+        // (inputs, buttons, contenteditable, links); an error page typically has
+        // very few and short body text. This is language-agnostic and works
+        // across all sites without per-site text patterns.
+        if (_isCanonicalRedirect) {
+          try {
+            const _pageCheckRes = await callBrowserAct({
+              action: 'evaluate', sessionId, timeoutMs: 5000,
+              text: `(() => {
+                const interactive = document.querySelectorAll('input:not([type="hidden"]), textarea, button, [role="button"], [contenteditable="true"], [contenteditable=""], [role="textbox"], a[href]');
+                let visibleInteractive = 0;
+                for (const el of interactive) {
+                  const r = el.getBoundingClientRect();
+                  if (r.width > 0 && r.height > 0 && el.offsetParent !== null) visibleInteractive++;
+                }
+                const bodyText = (document.body && document.body.innerText) ? document.body.innerText : '';
+                return JSON.stringify({ interactive: visibleInteractive, bodyLen: bodyText.length });
+              })()`
+            }, 8000).catch(() => ({ ok: false }));
+            let _interactive = -1, _bodyLen = -1;
+            try {
+              const _parsed = typeof _pageCheckRes?.result === 'object' ? _pageCheckRes.result : JSON.parse(String(_pageCheckRes?.result || '{}').replace(/^"|"$/g, '').replace(/\\"/g, '"'));
+              _interactive = _parsed.interactive ?? -1;
+              _bodyLen = _parsed.bodyLen ?? -1;
+            } catch (_) {}
+            // Error page heuristic: < 3 visible interactive elements AND body text < 300 chars
+            if (_interactive >= 0 && _interactive < 3 && _bodyLen >= 0 && _bodyLen < 300) {
+              _isCanonicalRedirect = false;
+              logger.warn(`[browser.agent] URL-first enforcement: page looks like error/404 (interactive=${_interactive}, bodyLen=${_bodyLen}) on ${_curUrl} — will re-navigate to ${startUrl}`);
+            }
+          } catch (_) {}
         }
 
         if (!_isCanonicalRedirect) {
@@ -10418,8 +10921,10 @@ Output ONLY valid JSON: {${_execRecipe.params.map(p => `"${p.name}": "<extracted
   //   Layer 1: LLM-suggested direct URL for this service+task
   //   Layer 2: web.agent discover_task_url (site-scoped + broad web search)
   //   Fallback: startUrl (service home/dashboard)
+  // SKIP for on-page actions — the action (add to cart, like, follow, etc.)
+  // lives on the current page, and resolving a URL would navigate away from it.
   let _deepLinkOverride = null;
-  if (!_trainedRecipeInjected && !_urlFirstNavigationSelected) {
+  if (!_trainedRecipeInjected && !_urlFirstNavigationSelected && !_onPageAction) {
     try {
       const _serviceKey = (existing?.service || agentId.replace(/\.agent$/, '')).toLowerCase().replace(/[^a-z0-9]/g, '');
       const _intent = await classifyTaskIntent(task, _serviceKey);
@@ -10473,7 +10978,7 @@ Output ONLY valid JSON: {${_execRecipe.params.map(p => `"${p.name}": "<extracted
             _deepLinkOverride = _llmSuggest.url;
             logger.info(`[browser.agent] deep-link: verified LLM URL ${_llmSuggest.url} — overriding startUrl from ${startUrl}`);
             if (!_isSearchCriteriaTask(task)) {
-              setImmediate(() => { recordCorrection(_serviceKey, _intent, _llmSuggest.url).catch(() => {}); });
+              setImmediate(() => { recordCorrection(_serviceKey, _intent, _llmSuggest.url, task).catch(() => {}); });
             }
             } else {
               logger.warn(`[browser.agent] deep-link: LLM URL ${_llmSuggest.url} failed validation — falling through to web search`);
@@ -10527,7 +11032,7 @@ Output ONLY valid JSON: {${_execRecipe.params.map(p => `"${p.name}": "<extracted
             // useful as generic intent corrections (see _resolveTaskDeepLink).
             if (!_isSearchCriteriaTask(task)) {
               setImmediate(() => {
-                recordCorrection(_serviceKey, _intent, _bestUrl).catch(() => {});
+                recordCorrection(_serviceKey, _intent, _bestUrl, task).catch(() => {});
               });
             }
             // Also record in keyword-indexed deep-link cache.
@@ -10571,8 +11076,8 @@ Output ONLY valid JSON: {${_execRecipe.params.map(p => `"${p.name}": "<extracted
     } catch (_dlErr) {
       logger.warn(`[browser.agent] deep-link discovery failed (non-fatal): ${_dlErr.message}`);
     }
-  } else if (_urlFirstNavigationSelected) {
-    logger.info(`[browser.agent] deep-link: skipping secondary discovery because URL-first navigation is already selected for ${agentId}`);
+  } else if (_urlFirstNavigationSelected || _onPageAction) {
+    logger.info(`[browser.agent] deep-link: skipping secondary discovery because ${_urlFirstNavigationSelected ? 'URL-first navigation is already selected' : 'this is an on-page action'} for ${agentId}`);
   }
 
   if (_deepLinkOverride) {
@@ -10669,8 +11174,8 @@ When extracting page content with run-code, prioritize these selectors over gene
       // If it didn't (or failed), don't waste time on 50+ key presses that will
       // all fail — fall through to playwright.agent which has its own engine launch.
       const _engineCheckRes = await callBrowserAct({ action: 'evaluate', text: 'document.readyState', sessionId, timeoutMs: 5000 }, 8000).catch(() => ({ ok: false }));
-      if (!_engineCheckRes?.ok) {
-        logger.warn(`[browser.agent] tab-map: engine not active (evaluate failed) — skipping tab-map, falling through to playwright.agent (turn-loop)`);
+      if (!_engineCheckRes?.ok || !_engineCheckRes.result) {
+        logger.warn(`[browser.agent] tab-map: engine not active (evaluate failed or empty result) — skipping tab-map, falling through to playwright.agent (turn-loop)`);
         throw new Error('tab-map skipped: engine not active');
       }
       logger.info(`[browser.agent] tab-map: engine active (readyState=${_engineCheckRes.result}) — proceeding`);
@@ -12948,6 +13453,7 @@ module.exports._profileGetValue = _profileGetValue;
 module.exports._isSigninWall = _isSigninWall;
 module.exports._canPromoteDeepLink = _canPromoteDeepLink;
 module.exports._isMutationIntent = _isMutationIntent;
+module.exports._isOnPageAction = _isOnPageAction;
 module.exports._isUnsafeDeepLinkUrl = _isUnsafeDeepLinkUrl;
 module.exports._resolvePlaybook = _resolvePlaybook;
 // LiteParse-based verify + submit
@@ -12983,6 +13489,7 @@ module.exports._extractEditMode = _extractEditMode;
 module.exports._extractSearchText = _extractSearchText;
 module.exports._extractShortcut = _extractShortcut;
 module.exports._computeTabFlow = _computeTabFlow;
+module.exports._splitCompoundAction = _splitCompoundAction;
 module.exports._normalizeGoalForCache = _normalizeGoalForCache;
 module.exports._loadTabFlowCache = _loadTabFlowCache;
 module.exports._saveTabFlowCache = _saveTabFlowCache;

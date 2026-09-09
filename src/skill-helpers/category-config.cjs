@@ -78,6 +78,7 @@ const CATEGORY_CONFIGS = {
   // ── Spreadsheet (Google Sheets, Airtable) ──────────────────────────────
   spreadsheet: {
     regions: ['cell', 'formula_bar', 'header', 'name_box'],
+    allowedTiers: [1, 2, 3, 4, 6],  // Just-type, Meta+F, Keyboard Nav, Tab-Map, ArrowGrid — no Gesture
     notes: [
       'Cells are addressed by coordinates (A1, B2) — use keyboard navigation, NOT Tab-Map clicks (grid is canvas-rendered)',
       'CELL NAVIGATION: Press Cmd+J (Mac) / Ctrl+J (Windows) to focus the Name Box, type the cell address (e.g. A1), press Enter to focus that cell',
@@ -85,8 +86,9 @@ const CATEGORY_CONFIGS = {
       'Ctrl+Home / Cmd+Fn+LeftArrow jumps to cell A1 directly',
       'Formula bar shows cell content — type to edit',
       'For entering column headers in row 1: navigate to A1 (Cmd+J → A1 → Enter), type first header, Tab to B1, type second header, Tab to C1, etc.',
+      'For new sheets from a creation deep-link, the document title bar at the top is separate from the grid. Use Tab-Map to click the title bar and rename it; do NOT type the title into cell A1.',
     ],
-    commonPatterns: ['canvas_editing', 'cell_navigation', 'spatial_interaction'],
+    commonPatterns: ['canvas_editing', 'cell_navigation', 'cell_entry'],
     // Structured key sequences available for this category (used by Tier 3 Shortcut Keys)
     categoryKeys: [
       { key: 'Meta+j', desc: 'Focus Name Box — then type cell address (e.g. A1) and press Enter to jump to that cell (Mac)' },
