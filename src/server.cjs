@@ -355,6 +355,7 @@ class CommandServiceMCPServer {
       execute_shortcut:          appAgent.actionExecuteShortcut,
       type_text:                 appAgent.actionTypeText,
       run_agent:                 appAgent.actionRunAgent,
+      run_app_flow:              appAgent.actionRunAppFlow,
       get_recent_ocr:            appAgent.getRecentOCR,
       // Phase 3 additional use cases
       monitor_file_upload:       appAgent.actionMonitorFileUpload,

@@ -375,6 +375,57 @@ function saveIntentUrl(hostname, intent, url, taskPattern = null, opts = {}) {
   }]);
 }
 
+// ─── Desktop App Playbook Cache ────────────────────────────────────────────
+// Stores playbooks for desktop app automation, keyed by app + goal-type +
+// sub-goal signature. Survives restarts so playbooks don't need re-computation.
+
+const PLAYBOOK_DIR = path.join(os.homedir(), '.thinkdrop', 'app-playbooks');
+
+function _safeAppName(appName) {
+  return String(appName || '').trim().toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '') || 'unknown';
+}
+
+function _playbookPath(appName, signature) {
+  const subGoalsKey = [...(signature?.subGoals || [])].sort().join('+');
+  const type = signature?.type || 'custom';
+  const fileName = `${_safeAppName(appName)}__${type}__${subGoalsKey}.json`;
+  return path.join(PLAYBOOK_DIR, fileName);
+}
+
+function loadPlaybook(appName, signature) {
+  try {
+    const filePath = _playbookPath(appName, signature);
+    if (!fs.existsSync(filePath)) return null;
+    const data = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+    if (!data || data.failCount >= 2) return null;
+    logger.info(`[appKnowledge] loadPlaybook: HIT for ${appName} (${signature?.type})`);
+    return data;
+  } catch (err) {
+    logger.warn(`[appKnowledge] loadPlaybook failed: ${err.message}`);
+    return null;
+  }
+}
+
+function savePlaybook(appName, signature, playbook, entities) {
+  try {
+    if (!fs.existsSync(PLAYBOOK_DIR)) {
+      fs.mkdirSync(PLAYBOOK_DIR, { recursive: true });
+    }
+    const filePath = _playbookPath(appName, signature);
+    const data = {
+      playbook,
+      entities: entities || {},
+      successCount: 1,
+      failCount: 0,
+      lastUpdated: _nowISO(),
+    };
+    fs.writeFileSync(filePath, JSON.stringify(data, null, 2), 'utf8');
+    logger.info(`[appKnowledge] savePlaybook: saved for ${appName} (${signature?.type})`);
+  } catch (err) {
+    logger.warn(`[appKnowledge] savePlaybook failed: ${err.message}`);
+  }
+}
+
 module.exports = {
   APP_KNOWLEDGE_DIR,
   loadAppKnowledge,
@@ -386,6 +437,8 @@ module.exports = {
   isShortcutCoverageStale,
   loadIntentUrl,
   saveIntentUrl,
+  loadPlaybook,
+  savePlaybook,
   // Exposed for testing
   _makeId,
   _isExpired,

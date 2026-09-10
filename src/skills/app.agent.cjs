@@ -664,6 +664,41 @@ async function _withCaptureWindow(fn) {
   }
 }
 
+/**
+ * Flash-based capture: hides the UnifiedOverlay briefly with a GhostLayer
+ * camera-flash animation, runs the screenshot, then restores the overlay.
+ * Unlike _withCaptureWindow (which requires a drop session) and
+ * _withOverlayHidden (which does a hard hide/show), this keeps the overlay
+ * VISIBLE during App-Flow and only flashes hidden during the actual screenshot.
+ * Falls back to _withOverlayHidden if the flash endpoints are unreachable.
+ */
+async function _withFlash(fn) {
+  const http = require('http');
+  const port = parseInt(process.env.OVERLAY_CONTROL_PORT || '3010', 10);
+  const _post = (path, timeoutMs) => new Promise((resolve) => {
+    let done = false;
+    const finish = (ok) => { if (!done) { done = true; resolve(ok); } };
+    const req = http.request({ hostname: '127.0.0.1', port, path, method: 'POST' }, () => finish(true));
+    req.on('error', () => finish(false));
+    req.end();
+    setTimeout(() => finish(false), timeoutMs);
+  });
+
+  const flashOk = await _post('/overlay/flash', 1500);
+  if (!flashOk) {
+    logger.warn('[app.agent] _withFlash: /overlay/flash unreachable — falling back to hard overlay hide');
+    return _withOverlayHidden(fn);
+  }
+  // Brief settle so the overlay is fully hidden before the screenshot fires.
+  await _sleep(200);
+
+  try {
+    return await fn();
+  } finally {
+    await _post('/overlay/unflash', 800);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Phase 1: Element Finding & Highlighting
 // ---------------------------------------------------------------------------
@@ -3453,11 +3488,72 @@ ${shortcutsSection}`;
   }
 }
 
+// Per-app overrides — only shortcuts CONFIRMED to work in that exact app.
+// Anything not listed here falls back to categoryDefaults (conservative, no
+// focus_ai/quick_open since those are app-specific).
+const APP_SHORTCUT_OVERRIDES = {
+  // Editors with AI assistants
+  'Devin':             { quick_open: 'Cmd+P', focus_ai: 'Cmd+L', save: 'Cmd+S', select_all: 'Cmd+A', copy: 'Cmd+C', paste: 'Cmd+V', cut: 'Cmd+X', undo: 'Cmd+Z', redo: 'Cmd+Shift+Z', find: 'Cmd+F', new_tab: 'Cmd+T', close_window: 'Cmd+W' },
+  'Visual Studio Code': { quick_open: 'Cmd+P', focus_ai: 'Cmd+L', save: 'Cmd+S', select_all: 'Cmd+A', copy: 'Cmd+C', paste: 'Cmd+V', cut: 'Cmd+X', undo: 'Cmd+Z', redo: 'Cmd+Shift+Z', find: 'Cmd+F', new_tab: 'Cmd+T', close_window: 'Cmd+W' },
+  'Code':              { quick_open: 'Cmd+P', focus_ai: 'Cmd+L', save: 'Cmd+S', select_all: 'Cmd+A', copy: 'Cmd+C', paste: 'Cmd+V', cut: 'Cmd+X', undo: 'Cmd+Z', redo: 'Cmd+Shift+Z', find: 'Cmd+F', new_tab: 'Cmd+T', close_window: 'Cmd+W' },
+  'Cursor':            { quick_open: 'Cmd+P', focus_ai: 'Cmd+L', save: 'Cmd+S', select_all: 'Cmd+A', copy: 'Cmd+C', paste: 'Cmd+V', cut: 'Cmd+X', undo: 'Cmd+Z', redo: 'Cmd+Shift+Z', find: 'Cmd+F', new_tab: 'Cmd+T', close_window: 'Cmd+W' },
+  'Windsurf':          { quick_open: 'Cmd+P', focus_ai: 'Cmd+L', save: 'Cmd+S', select_all: 'Cmd+A', copy: 'Cmd+C', paste: 'Cmd+V', cut: 'Cmd+X', undo: 'Cmd+Z', redo: 'Cmd+Shift+Z', find: 'Cmd+F', new_tab: 'Cmd+T', close_window: 'Cmd+W' },
+  // Chat apps — each has its own focus-input shortcut (or none)
+  'Slack':             { save: 'Cmd+S', select_all: 'Cmd+A', copy: 'Cmd+C', paste: 'Cmd+V', cut: 'Cmd+X', undo: 'Cmd+Z', redo: 'Cmd+Shift+Z', find: 'Cmd+F', quick_switcher: 'Cmd+K', new_message: 'Cmd+N' },
+  'Discord':           { save: 'Cmd+S', select_all: 'Cmd+A', copy: 'Cmd+C', paste: 'Cmd+V', cut: 'Cmd+X', undo: 'Cmd+Z', redo: 'Cmd+Shift+Z', find: 'Cmd+F', focus_input: 'Esc', new_message: 'Cmd+N' },
+  'Microsoft Teams':   { save: 'Cmd+S', select_all: 'Cmd+A', copy: 'Cmd+C', paste: 'Cmd+V', cut: 'Cmd+X', undo: 'Cmd+Z', redo: 'Cmd+Shift+Z', find: 'Cmd+F', focus_ai: 'Option+Shift+C', send_message: 'Cmd+Return' },
+  'Telegram':          { save: 'Cmd+S', select_all: 'Cmd+A', copy: 'Cmd+C', paste: 'Cmd+V', cut: 'Cmd+X', undo: 'Cmd+Z', redo: 'Cmd+Shift+Z', find: 'Cmd+F', new_message: 'Cmd+N' },
+  'WhatsApp':          { save: 'Cmd+S', select_all: 'Cmd+A', copy: 'Cmd+C', paste: 'Cmd+V', cut: 'Cmd+X', undo: 'Cmd+Z', redo: 'Cmd+Shift+Z', find: 'Cmd+F', focus_ai: 'Cmd+Shift+M', new_chat: 'Cmd+N' },
+  'Messages':          { save: 'Cmd+S', select_all: 'Cmd+A', copy: 'Cmd+C', paste: 'Cmd+V', cut: 'Cmd+X', undo: 'Cmd+Z', redo: 'Cmd+Shift+Z', find: 'Cmd+F', new_message: 'Cmd+N' },
+  // Browsers
+  'Google Chrome':     { quick_open: 'Cmd+L', save: 'Cmd+S', select_all: 'Cmd+A', copy: 'Cmd+C', paste: 'Cmd+V', cut: 'Cmd+X', undo: 'Cmd+Z', redo: 'Cmd+Shift+Z', find: 'Cmd+F', new_tab: 'Cmd+T', close_window: 'Cmd+W' },
+  'Safari':            { quick_open: 'Cmd+L', save: 'Cmd+S', select_all: 'Cmd+A', copy: 'Cmd+C', paste: 'Cmd+V', cut: 'Cmd+X', undo: 'Cmd+Z', redo: 'Cmd+Shift+Z', find: 'Cmd+F', new_tab: 'Cmd+T', close_window: 'Cmd+W' },
+  'Firefox':           { quick_open: 'Cmd+L', save: 'Cmd+S', select_all: 'Cmd+A', copy: 'Cmd+C', paste: 'Cmd+V', cut: 'Cmd+X', undo: 'Cmd+Z', redo: 'Cmd+Shift+Z', find: 'Cmd+F', new_tab: 'Cmd+T', close_window: 'Cmd+W' },
+};
+
+const SHORTCUT_CATEGORY_DEFAULTS = {
+  editor:    { save: 'Cmd+S', select_all: 'Cmd+A', copy: 'Cmd+C', paste: 'Cmd+V', cut: 'Cmd+X', undo: 'Cmd+Z', redo: 'Cmd+Shift+Z', find: 'Cmd+F' },
+  browser:   { save: 'Cmd+S', select_all: 'Cmd+A', copy: 'Cmd+C', paste: 'Cmd+V', cut: 'Cmd+X', undo: 'Cmd+Z', redo: 'Cmd+Shift+Z', find: 'Cmd+F', new_tab: 'Cmd+T', close_window: 'Cmd+W' },
+  chat:      { save: 'Cmd+S', select_all: 'Cmd+A', copy: 'Cmd+C', paste: 'Cmd+V', cut: 'Cmd+X', undo: 'Cmd+Z', redo: 'Cmd+Shift+Z', find: 'Cmd+F' },
+  terminal:  { save: 'Cmd+S', select_all: 'Cmd+A', copy: 'Cmd+C', paste: 'Cmd+V', cut: 'Cmd+X', find: 'Cmd+F', new_tab: 'Cmd+T', close_window: 'Cmd+W' },
+  design:    { save: 'Cmd+S', select_all: 'Cmd+A', copy: 'Cmd+C', paste: 'Cmd+V', cut: 'Cmd+X', undo: 'Cmd+Z', redo: 'Cmd+Shift+Z', find: 'Cmd+F' },
+  email:     { save: 'Cmd+S', select_all: 'Cmd+A', copy: 'Cmd+C', paste: 'Cmd+V', cut: 'Cmd+X', undo: 'Cmd+Z', redo: 'Cmd+Shift+Z', find: 'Cmd+F' },
+  document:  { save: 'Cmd+S', select_all: 'Cmd+A', copy: 'Cmd+C', paste: 'Cmd+V', cut: 'Cmd+X', undo: 'Cmd+Z', redo: 'Cmd+Shift+Z', find: 'Cmd+F' },
+  other:     { save: 'Cmd+S', select_all: 'Cmd+A', copy: 'Cmd+C', paste: 'Cmd+V', cut: 'Cmd+X', undo: 'Cmd+Z', redo: 'Cmd+Shift+Z', find: 'Cmd+F' },
+};
+
+const SHORTCUT_CORE_ACTIONS = [
+  'quick_open', 'focus_ai', 'save', 'select_all', 'open_file_dialog',
+  'copy', 'paste', 'cut', 'undo', 'redo', 'find', 'new_tab', 'close_window',
+  'new_message', 'quick_switcher', 'focus_input', 'send_message',
+];
+
+// Merge per-app overrides + conservative category defaults into a shortcut list.
+// Existing shortcuts (from descriptor / web research) win — we only ADD missing
+// core actions. Returns a new array; does not mutate the input.
+function _mergeShortcutDefaults(appName, category, shortcuts) {
+  const result = [...shortcuts];
+  const appOverrides = APP_SHORTCUT_OVERRIDES[appName] || {};
+  const catDefaults = SHORTCUT_CATEGORY_DEFAULTS[category] || {};
+  for (const action of SHORTCUT_CORE_ACTIONS) {
+    if (result.find(s => s.action === action)) continue; // descriptor wins
+    const shortcut = appOverrides[action] || catDefaults[action];
+    if (shortcut) {
+      result.push({ action, shortcut, context: appOverrides[action] ? 'app-override' : 'default' });
+    }
+  }
+  return result;
+}
+
 async function actionDiscoverShortcuts({ appName, category }) {
   // 1. Check agent descriptor file first (persists across restarts)
   const cachedShortcuts = _readShortcutsFromDescriptor(appName);
   if (cachedShortcuts) {
-    return { ok: true, shortcuts: cachedShortcuts, source: 'descriptor' };
+    // Merge per-app overrides + category defaults for any missing core actions
+    // so the planner always has quick_open/focus_ai/copy/paste/etc. available
+    // even if the descriptor was persisted before those were added.
+    const merged = _mergeShortcutDefaults(appName, category, cachedShortcuts);
+    return { ok: true, shortcuts: merged, source: 'descriptor' };
   }
 
   // 2. Web crawl with multiple targeted queries; pick the result with the most content.
@@ -3503,10 +3599,14 @@ Include these semantic actions if they are present:
 - quick_open (command palette, quick open, go to file)
 - open_file_dialog (open file dialog)
 - focus_ai (focus AI assistant, open AI chat/panel)
+- focus_input (focus the message/compose input — e.g. Esc in Discord, Option+Shift+C in Teams)
 - save
 - select_all
-- copy, paste
+- copy, paste, cut
+- undo, redo
 - find/search
+- new_tab, close_window
+- new_message, quick_switcher, send_message
 
 Return JSON only:
 {
@@ -3528,23 +3628,12 @@ ${bestContent.slice(0, 8000)}
     }
   }
 
-  // 3. Inject conservative category defaults for missing core actions so the proxy
-  //    workflow can still run. Defaults are marked in the context column so the
-  //    planner can treat them as unverified if needed.
-  const coreActions = ['quick_open', 'focus_ai', 'save', 'select_all', 'open_file_dialog'];
-  const categoryDefaults = {
-    editor: { quick_open: 'Cmd+P', open_file_dialog: 'Cmd+O', focus_ai: 'Cmd+L', save: 'Cmd+S', select_all: 'Cmd+A' },
-    browser: { quick_open: 'Cmd+L', focus_ai: 'Cmd+Shift+A', save: 'Cmd+S', select_all: 'Cmd+A' },
-    chat: { focus_ai: 'Cmd+L', save: 'Cmd+S', select_all: 'Cmd+A' },
-    terminal: { save: 'Cmd+S', select_all: 'Cmd+A' },
-  };
-
-  const defaults = categoryDefaults[category] || {};
-  for (const action of coreActions) {
-    if (!shortcuts.find(s => s.action === action) && defaults[action]) {
-      shortcuts.push({ action, shortcut: defaults[action], context: 'default' });
-    }
-  }
+  // 3. Inject per-app overrides + conservative category defaults for missing
+  //    core actions so the proxy workflow can still run. Per-app overrides are
+  //    CONFIRMED shortcuts for that exact app. Category defaults are only the
+  //    truly universal shortcuts (no focus_ai/quick_open — those are app-specific).
+  //    Descriptor (web-researched) shortcuts already in the list win over both.
+  shortcuts = _mergeShortcutDefaults(appName, category, shortcuts);
 
   // 4. Persist to agent descriptor so future runs skip the web crawl
   _writeShortcutsToDescriptor(appName, category, shortcuts);
@@ -3704,7 +3793,7 @@ async function getRecentOCR({ maxAgeSeconds = 3, appName: targetApp = null, live
       // When requested (e.g. by the monitor), hide the ThinkDrop overlay during
       // the capture so its UI text doesn't taint the OCR and misreport the app.
       const live = liveOverlayHidden
-        ? await _withCaptureWindow(() => screenCapture({}))
+        ? await _withFlash(() => screenCapture({}))
         : await screenCapture({});
       if (live.success && live.text) {
         return {
@@ -6111,15 +6200,10 @@ async function _executeShortcutWithFallback({ appName, action, category }) {
   const result = await actionExecuteShortcut({ appName, action });
   if (result.ok) return result;
 
-  // Conservative category defaults for the proxy workflow.
-  const defaults = {
-    editor: { quick_open: 'Cmd+P', open_file_dialog: 'Cmd+O', focus_ai: 'Cmd+L', save: 'Cmd+S', select_all: 'Cmd+A' },
-    browser: { quick_open: 'Cmd+L', focus_ai: 'Cmd+Shift+A', save: 'Cmd+S', select_all: 'Cmd+A' },
-    chat: { focus_ai: 'Cmd+L', save: 'Cmd+S', select_all: 'Cmd+A' },
-    terminal: { save: 'Cmd+S', select_all: 'Cmd+A' },
-  };
-
-  const defaultShortcut = defaults[category]?.[action];
+  // Per-app overrides + conservative category defaults for the proxy workflow.
+  const appOverrides = APP_SHORTCUT_OVERRIDES[appName] || {};
+  const catDefaults = SHORTCUT_CATEGORY_DEFAULTS[category] || {};
+  const defaultShortcut = appOverrides[action] || catDefaults[action];
   if (defaultShortcut) {
     logger.warn(`[app.agent] actionRunAgent: descriptor action ${action} failed for ${appName}, trying default ${defaultShortcut}`);
     return actionExecuteShortcut({ appName, shortcutOverride: defaultShortcut });
@@ -6406,10 +6490,10 @@ async function actionBuildAgent({ appName, force } = {}) {
     'capture_screen',
   ];
   if (category === 'editor') {
-    capabilities.push('run_agent', 'quick_open', 'focus_ai', 'save');
+    capabilities.push('run_agent', 'run_app_flow', 'quick_open', 'focus_ai', 'save');
   }
   if (category === 'chat') {
-    capabilities.push('passive_read_scroll', 'live_chat_scroll');
+    capabilities.push('run_app_flow', 'passive_read_scroll', 'live_chat_scroll');
   }
 
   // 4. Build shortcut playbooks section
@@ -6501,6 +6585,10 @@ FOCUS_AI: ${focusAi || 'Cmd+I'}
 SAVE: ${save || 'Cmd+S'}
 INSTRUCTION: Opens the file in ${appName}, sends the prompt to the built-in AI assistant, waits for completion, and saves.`);
 
+    playbooks.push(`### Multi-Step App Task (examine, analyze, ask AI, use the LLM, tell me about, explain, summarize)
+ACTION: app.agent { action: "run_app_flow", appName: "${appName}", goal: "<goal>" }
+INSTRUCTION: Runs the App-Flow iterative loop for complex multi-step tasks in ${appName}. Uses five tiers: App Shortcuts (primary), Just-type, Global Shortcuts, Search Text, Monitoring. OCR verification runs between each step. Example: "Examine the instruction.runner.cjs file using Devin LLM" or "In Slack, set a reminder for standup at 9am".`);
+
     playbooks.push(`### Search Within Project (find, search, locate, grep, where is)
 ACTION: app.agent { action: "execute_shortcut", appName: "${appName}", action: "search" }
 SHORTCUT: ${findShortcut('search') || 'Cmd+Shift+F'}
@@ -6513,6 +6601,10 @@ INSTRUCTION: Jumps to the definition of the symbol under the cursor.`);
   }
 
   if (category === 'chat') {
+    playbooks.push(`### Multi-Step Chat Task (set reminder, schedule, send message to, slash command)
+ACTION: app.agent { action: "run_app_flow", appName: "${appName}", goal: "<goal>" }
+INSTRUCTION: Runs the App-Flow iterative loop for complex multi-step tasks in ${appName}. Handles slash commands (/remind), @mentions, and message composition. Example: "In Slack, set a reminder for standup at 9am".`);
+
     playbooks.push(`### Read Latest Messages (read, check, what did, latest, recent, scroll up)
 ACTION: app.agent { action: "passive_read_scroll", appName: "${appName}", mode: "passive" }
 INSTRUCTION: Scrolls to the latest messages in ${appName} and captures the content.`);
@@ -6538,6 +6630,57 @@ INSTRUCTION: Scrolls down in ${appName} to reveal more content. Use direction: "
   if (playbooks.length === 0) return '';
 
   return `## Playbooks\n\n${playbooks.join('\n\n')}`;
+}
+
+// ---------------------------------------------------------------------------
+// App-Flow: new iterative runner mirroring instruction.runner.cjs
+// ---------------------------------------------------------------------------
+
+/**
+ * actionRunAppFlow — runs the App-Flow iterative navigation loop for desktop apps.
+ * Replaces actionRunAgent for complex multi-step tasks. Uses five tiers:
+ *   1 = App Shortcuts (primary), 2 = Just-type, 3 = Global Shortcuts,
+ *   4 = Search Text w/LiteParser, 5 = Monitoring
+ * With force-classification LLM and before/after OCR diff verification.
+ *
+ * @param {string} appName — target app name (e.g. "Devin", "Slack", "Visual Studio Code")
+ * @param {string} goal — the automation goal (e.g. "Ask the AI what file UnifiedOverlay is about")
+ * @param {number} maxDurationMs — max duration (default 300000 = 5 min)
+ * @returns {Promise<{ok, output, actionHistory, elapsed}>}
+ */
+async function actionRunAppFlow({ appName, goal, maxDurationMs = 300000, _progressCallbackUrl = null, _stepIndex = 0 } = {}) {
+  if (!appName) return { ok: false, error: 'appName is required' };
+  if (!goal) return { ok: false, error: 'goal is required' };
+
+  logger.info(`[app.agent] actionRunAppFlow: starting for "${appName}" — goal="${String(goal).slice(0, 80)}"`);
+  try {
+    const { runAppFlow } = require('./app.runner.cjs');
+
+    // 1. Enrich app context (category + shortcuts)
+    const category = KNOWN_APPS[appName] || 'other';
+    const enriched = await enrichAppContext({ appName, category });
+    const shortcuts = enriched?.shortcuts || [];
+
+    logger.info(`[app.agent] actionRunAppFlow: appName="${appName}", goal="${String(goal).slice(0, 80)}", category=${enriched?.category || category}, shortcuts=${shortcuts.length}`);
+
+    // 2. Call runAppFlow
+    const result = await runAppFlow({
+      goal,
+      appName,
+      category: enriched?.category || category,
+      bounds: null,
+      shortcuts,
+      timeoutMs: maxDurationMs,
+      progressCallbackUrl: _progressCallbackUrl,
+      stepIndex: _stepIndex,
+    });
+
+    logger.info(`[app.agent] actionRunAppFlow: result ok=${result?.ok}, output length=${(result?.output || '').length}, elapsed=${result?.elapsed || 0}ms`);
+    return result;
+  } catch (err) {
+    logger.error(`[app.agent] actionRunAppFlow: error: ${err.message}`);
+    return { ok: false, error: err.message, actionHistory: [], elapsed: 0 };
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -6599,6 +6742,7 @@ module.exports = {
   actionExecuteShortcut,
   actionTypeText,
   actionRunAgent,
+  actionRunAppFlow,
   actionBuildAgent,
   actionCheckInstalled,
   // Phase 3: Additional Use Cases
