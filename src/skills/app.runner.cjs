@@ -41,6 +41,24 @@ function _sleep(ms, signal) {
   });
 }
 
+// Diff two OCR text strings — returns only the NEW/changed text (lines in final
+// that are not in initial). Filters out unchanged text so the verifier focuses
+// on what actually changed (e.g., Devin's AI response, typed question text).
+// A no-diff result means the flow had no visible effect.
+function _diffOcrText(initialText, finalText) {
+  if (!finalText) return '';
+  if (!initialText) return finalText;
+
+  const initialLines = new Set(
+    initialText.split('\n').map(l => l.trim()).filter(l => l.length > 0)
+  );
+  const finalLines = finalText.split('\n').map(l => l.trim()).filter(l => l.length > 0);
+
+  // Lines in final that are NOT in initial = new/changed content
+  const diffLines = finalLines.filter(l => !initialLines.has(l));
+  return diffLines.join('\n');
+}
+
 /**
  * _postProgress — fire-and-forget progress event POST to the Electron overlay.
  * Same pattern as browser.agent.cjs _postProgress and instruction.runner.cjs _emitProgress.
@@ -188,23 +206,66 @@ function _markPlaybookCacheFail(appName, signature) {
   }
 }
 
+// ── Playbook Entity Substitution ────────────────────────────────────────────
+// Cached playbooks store literal entity values (filenames, questions) in their
+// step actions. When a new run has different entities (same signature type but
+// different question/file), substitute the old values with the new ones so the
+// cached flow steps use the current run's values instead of stale ones.
+function _substitutePlaybookEntities(playbook, oldEntities, newEntities) {
+  if (!playbook || !oldEntities || !newEntities) return playbook;
+  const subs = [];
+  for (const [key, oldVal] of Object.entries(oldEntities)) {
+    const newVal = newEntities[key];
+    if (newVal != null && oldVal != null && String(newVal) !== String(oldVal)) {
+      subs.push([String(oldVal), String(newVal)]);
+    }
+  }
+  if (subs.length === 0) return playbook;
+  let json = JSON.stringify(playbook);
+  for (const [oldVal, newVal] of subs) {
+    // Escape regex special chars in oldVal for safe literal replacement
+    const oldEsc = JSON.stringify(oldVal).slice(1, -1);
+    const newEsc = JSON.stringify(newVal).slice(1, -1);
+    json = json.split(oldEsc).join(newEsc);
+  }
+  const result = JSON.parse(json);
+  logger.info(`[app.runner] _substitutePlaybookEntities: replaced ${subs.length} entity value(s) in cached playbook`);
+  return result;
+}
+
 // ── Goal Signature Extraction ───────────────────────────────────────────────
 // LLM extracts the goal-type + sub-goals + entities from the goal text.
 // No app-specific examples — generic action names only.
 
 async function _extractGoalSignature(goal, appName, category) {
+  // Build the canonical sub-goal list from the taxonomy for the LLM prompt.
+  const _taxSubGoals = Object.keys(APP_SUBGOAL_TAXONOMY).filter(s => s !== 'done' && s !== 'open_app');
   const systemPrompt = `You analyze a desktop automation goal and extract its sub-goal signature.
 Return JSON only:
 {
   "type": "examine_file" | "send_message" | "create_doc" | "search" | "navigate" | "open_app" | "monitor" | "custom",
-  "subGoals": ["open_file", "focus_ai", "ask_question", "monitor_response"],
-  "entities": { "filename": "instruction.runner.cjs", "question": "what is this file about" }
+  "subGoals": ["new_file", "type_value", "save"],
+  "entities": { "filename": "instruction.runner.cjs", "question": "what is this file about", "content": "console.log('hello')" }
 }
 
 Rules:
-- "subGoals" are GENERIC action names (not app-specific): open_file, focus_ai, ask_question, type_value, press_enter, monitor_response, save, copy, paste, find, scroll, etc.
-- "entities" are the concrete values extracted from the goal (filenames, questions, search terms, etc.) — these get swapped when reusing a cached playbook.
+- "subGoals" are GENERIC action names (not app-specific) from this canonical list:
+  ${_taxSubGoals.join(', ')}
+- "entities" are the concrete values extracted from the goal (filenames, questions, search terms, content to type, line numbers, etc.) — these get swapped when reusing a cached playbook.
 - "type" is a coarse classification for cache lookup.
+
+CRITICAL RULES:
+- Do NOT extract "new file", "new document", "blank file", or "empty file" as a filename. Use the "new_file" sub-goal and leave "filename" empty.
+- Only set "filename" if a specific, existing file path or name is mentioned (e.g. "app.runner.cjs", "/path/to/file.js"). Never set filename to "new_file", "newfile", "untitled", or similar placeholders.
+- "open_file" is for opening an EXISTING file. "new_file" is for creating a new file. Do not confuse them.
+- "new_file" is handled by shell.run (tier 6), not a keyboard shortcut. Extract the content to be typed as entities.content so the temp file extension can be inferred (e.g. console.log → .js, print() → .py).
+- Example: "In VS Code, open a new file and type 'console.log("Hello World");' then save it." → subGoals: ["new_file", "type_value", "save"], entities: { "content": "console.log("Hello World");" }
+- If the goal mentions "go to line N", use "goto_line" sub-goal and set entities.lineNumber to N.
+- If the goal mentions "comment out", "uncomment", or "toggle comment", use "toggle_comment" sub-goal.
+- If the goal mentions "format", "beautify", or "prettify", use "format_document" sub-goal.
+- If the goal mentions "find and replace" or "replace", use "find_replace" sub-goal.
+- If the goal mentions "save as", use "save_as" sub-goal instead of "save".
+- Map user actions to the closest canonical sub-goal from the list above.
 
 Output ONLY the JSON object, no other text.`;
 
@@ -221,6 +282,39 @@ Category: ${category || 'unknown'}`;
     if (!response) return null;
     const parsed = parseLlmJson(response, logger, '_extractGoalSignature');
     if (parsed && parsed.type && Array.isArray(parsed.subGoals)) {
+      // Force monitor_response when ask_question is present — a question always
+      // implies waiting for a response. Without this, the pre-computed flow
+      // ends at ask_question and the runner falls into an infinite loop.
+      if (parsed.subGoals.includes('ask_question') && !parsed.subGoals.includes('monitor_response')) {
+        parsed.subGoals.push('monitor_response');
+      }
+
+      // Deterministic override: if the goal clearly asks for a new file, ensure
+      // the sub-goal is new_file (not open_file) and filename is null.
+      const _preCheck = _preClassifyGoal(goal);
+      if (_preCheck && _preCheck.subGoal === 'new_file') {
+        // Replace any open_file with new_file
+        parsed.subGoals = parsed.subGoals.map(sg => sg === 'open_file' ? 'new_file' : sg);
+        if (!parsed.subGoals.includes('new_file')) {
+          parsed.subGoals.unshift('new_file');
+        }
+        // Clear placeholder filenames
+        if (parsed.entities?.filename && /^(new[_\s-]?file|new[_\s-]?document|untitled|a new file|blank file|empty file)$/i.test(parsed.entities.filename)) {
+          parsed.entities.filename = null;
+        }
+        logger.info(`[app.runner] _extractGoalSignature: pre-check override → new_file (cleared placeholder filename)`);
+      }
+
+      // Sanitize: if filename is a known placeholder, clear it
+      if (parsed.entities?.filename && /^(new[_\s-]?file|new[_\s-]?document|untitled|a new file|blank file|empty file)$/i.test(parsed.entities.filename)) {
+        parsed.entities.filename = null;
+        // If open_file was planned, replace with new_file
+        if (parsed.subGoals.includes('open_file')) {
+          parsed.subGoals[parsed.subGoals.indexOf('open_file')] = 'new_file';
+        }
+        logger.info(`[app.runner] _extractGoalSignature: sanitized placeholder filename → new_file`);
+      }
+
       logger.info(`[app.runner] _extractGoalSignature: type="${parsed.type}", subGoals=[${parsed.subGoals.join(', ')}], entities=${JSON.stringify(parsed.entities || {})}`);
       return parsed;
     }
@@ -245,21 +339,248 @@ async function _captureOcr({ appName } = {}) {
   }
 }
 
+// Fast screenshot-only capture (~100ms) using screenshot-desktop directly.
+// No OCR — just saves a PNG. Used for baseline capture right after Just-Type → Enter.
+// IMPORTANT: screenshot-desktop defaults to format:'jpg' on macOS (passes -t jpg
+// to screencapture) even when the filename ends in .png. We must explicitly pass
+// format:'png' so pngjs/pixelmatch can read the output for pixel-diff settling.
+async function _captureScreenshotOnly() {
+  try {
+    const screenshot = require('screenshot-desktop');
+    const tmpPath = path.join(os.tmpdir(), `app-runner-${Date.now()}.png`);
+    await screenshot({ filename: tmpPath, format: 'png' });
+    return { ok: true, path: tmpPath };
+  } catch (e) {
+    logger.warn(`[app.runner] _captureScreenshotOnly failed: ${e.message}`);
+    return { ok: false, error: e.message };
+  }
+}
+
+// Screenshot capture with the ThinkDrop overlay hidden. Wraps _captureScreenshotOnly
+// in app.agent._withFlash, which fades the GhostLayer/UnifiedOverlay out before the
+// screenshot and back in after. Without this, the overlay's progress text and
+// animations taint both the pixel diff (prevents settle detection) and the OCR
+// (mixes ThinkDrop UI text with the target app's response). Falls back to a plain
+// capture if the overlay control server (port 3010) is unreachable.
+async function _captureScreenshotOnlyHidden() {
+  try {
+    const appAgent = require('./app.agent.cjs');
+    if (typeof appAgent._withFlash === 'function') {
+      return await appAgent._withFlash(() => _captureScreenshotOnly());
+    }
+  } catch (e) {
+    logger.warn(`[app.runner] _captureScreenshotOnlyHidden: _withFlash unavailable — capturing with overlay visible: ${e.message}`);
+  }
+  return await _captureScreenshotOnly();
+}
+
+// Pixel-level diff between two PNG files — returns fraction of changed pixels
+// (0.0 = identical, 1.0 = completely different). Uses pixelmatch + pngjs
+// (both already installed). Runs in ~50-100ms for 1440x900 screenshots.
+// This is the industry-standard technique for detecting screen settling:
+// OCR re-segments between captures (noisy for change detection), but pixels
+// are deterministic — a still screen produces zero diff.
+function _pixelDiffPercent(pathA, pathB) {
+  try {
+    const { PNG } = require('pngjs');
+    const pixelmatch = require('pixelmatch');
+    const imgA = PNG.sync.read(fs.readFileSync(pathA));
+    const imgB = PNG.sync.read(fs.readFileSync(pathB));
+    // If sizes differ (unlikely for same display), use the smaller dimensions
+    const width = Math.min(imgA.width, imgB.width);
+    const height = Math.min(imgA.height, imgB.height);
+    const diff = new PNG({ width, height });
+    const numDiff = pixelmatch(imgA.data, imgB.data, diff.data, width, height, { threshold: 0.1 });
+    return numDiff / (width * height);
+  } catch (e) {
+    logger.warn(`[app.runner] _pixelDiffPercent failed: ${e.message}`);
+    return 1.0; // assume changed on error so we don't get stuck
+  }
+}
+
+// Run LiteParse on a specific PNG file, returning structured rows + text.
+// Wraps appAgent.actionParseScreenshot({ screenshotPath }) so we can OCR a
+// pre-captured baseline screenshot without doing a new screen capture.
+// Honors an AbortSignal so monitoring stops promptly on cancel.
+async function _ocrScreenshot(pngPath, appName, signal) {
+  if (signal?.aborted) return { rows: [], text: '', source: 'aborted' };
+  try {
+    const appAgent = require('./app.agent.cjs');
+    const { structureOcrOverlayItems } = require('./ocrOverlayStructure.cjs');
+
+    const parseResult = await appAgent.actionParseScreenshot({ screenshotPath: pngPath });
+    if (signal?.aborted) return { rows: [], text: '', source: 'aborted' };
+    if (!parseResult?.ok || !parseResult.textItems?.length) {
+      return { rows: [], text: '', source: 'liteparser-empty' };
+    }
+
+    const appBounds = await appAgent._getActiveAppBounds().catch(() => null);
+    if (signal?.aborted) return { rows: [], text: '', source: 'aborted' };
+    const textItems = appBounds
+      ? appAgent._filterItemsByAppBounds(parseResult.textItems, appBounds)
+      : parseResult.textItems;
+    const rows = structureOcrOverlayItems(textItems);
+    const text = textItems.map(i => i.text).join('\n');
+    return { rows, text, appBounds, source: 'liteparser' };
+  } catch (e) {
+    logger.warn(`[app.runner] _ocrScreenshot failed: ${e.message}`);
+    return { rows: [], text: '', source: 'error' };
+  }
+}
+
+// Line-level diff: returns only lines in current OCR that are NOT in baseline.
+// Used to extract just the AI response (or command output) from the full screen.
+function _computeOcrDiff(baselineText, currentText) {
+  if (!baselineText) return currentText || '';
+  const baselineLines = new Set(
+    baselineText.split('\n').map(l => l.trim()).filter(l => l.length > 3)
+  );
+  const currentLines = (currentText || '').split('\n');
+  const diffLines = currentLines.filter(l => {
+    const trimmed = l.trim();
+    return trimmed.length > 3 && !baselineLines.has(trimmed);
+  });
+  return diffLines.join('\n');
+}
+
+// Extract only "content" text from structured OCR rows — excludes UI chrome
+// (buttons, input fields, dividers, links) so the diff focuses on actual
+// response/output text and is not destabilized by UI elements appearing
+// (copy buttons, reaction buttons, timestamps, formatting controls, etc.).
+// Includes row-item-description (body text) and heading (titles/sections).
+function _contentTextFromRows(rows) {
+  if (!Array.isArray(rows)) return '';
+  return rows
+    .filter(r => r && (r.type === 'row-item-description' || r.type === 'heading'))
+    .map(r => (r.text || '').trim())
+    .filter(t => t.length > 0)
+    .join('\n');
+}
+
+// Heuristic: does this short value look like code? Used by _extractAppFieldType
+// to keep code snippets classified as type-edit while forcing chat questions,
+// search queries, and short form inputs to type-plain regardless of appCategory.
+function _looksLikeCode(text) {
+  const t = String(text || '');
+  if (!t) return false;
+  // Common code-leading tokens
+  if (/^\s*(const|let|var|function|class|def|import|export|from|return|if|for|while|async|await|public|private|interface|type|enum|struct|fn|package|namespace)\s/.test(t)) {
+    return true;
+  }
+  // High symbol density (code punctuation)
+  const symbols = (t.match(/[=;{}()[\]<>|&]/g) || []).length;
+  if (symbols >= 3 && symbols / t.length > 0.05) return true;
+  // Path-like / file-like (quick-open paths are handled by type-plain though)
+  // Multi-line with indentation suggests code block
+  if (t.includes('\n') && /\n\s{2,}\S/.test(t)) return true;
+  return false;
+}
+
+// LiteParser availability cache: null = unknown, true/false after first attempt.
+let _liteParserAvailable = null;
+
+// Capture structured OCR via LiteParser + ocrOverlayStructure.cjs.
+// Returns { rows, text, textItems, appBounds, source }.
+// Falls back to Tesseract flat text (via _captureOcr) if LiteParser is unavailable.
+async function _captureStructuredOcr({ appName } = {}) {
+  // Try LiteParser first (structured rows with positions)
+  if (_liteParserAvailable !== false) {
+    try {
+      const appAgent = require('./app.agent.cjs');
+      const { structureOcrOverlayItems } = require('./ocrOverlayStructure.cjs');
+
+      const parseResult = await appAgent.actionParseScreenshot({});
+      if (parseResult.ok && parseResult.textItems && parseResult.textItems.length > 0) {
+        _liteParserAvailable = true;
+        const appBounds = await appAgent._getActiveAppBounds().catch(() => null);
+        const textItems = appBounds
+          ? appAgent._filterItemsByAppBounds(parseResult.textItems, appBounds)
+          : parseResult.textItems;
+        const rows = structureOcrOverlayItems(textItems);
+        const text = textItems.map(i => i.text).join(' ');
+        return { rows, text, textItems, appBounds, source: 'liteparser' };
+      }
+      // LiteParser ran but returned no items — mark as available, fall through
+      _liteParserAvailable = true;
+    } catch (e) {
+      logger.warn(`[app.runner] _captureStructuredOcr: LiteParser failed (${e.message}) — falling back to Tesseract`);
+      _liteParserAvailable = false;
+    }
+  }
+
+  // Fallback: Tesseract flat text (no structured rows)
+  const text = await _captureOcr({ appName });
+  return { rows: [], text, textItems: [], appBounds: null, source: 'tesseract' };
+}
+
+// Extract the chat/response area from structured rows.
+// For editor/chat apps like Devin, the chat area is the largest contiguous
+// block of content rows (not menus, toolbars, buttons, or input fields).
+// Returns empty string if no structured rows (Tesseract fallback).
+function _extractChatArea(rows) {
+  if (!rows || rows.length === 0) return '';
+
+  // Filter to content rows (not icons, dividers, buttons, input fields)
+  const contentRows = rows.filter(r =>
+    r.type !== 'icon' &&
+    r.type !== 'divider' &&
+    r.type !== 'button' &&
+    r.type !== 'input-field' &&
+    r.text && r.text.length > 5
+  );
+
+  if (contentRows.length === 0) return '';
+
+  // Sort by y position
+  contentRows.sort((a, b) => (a.y || 0) - (b.y || 0));
+
+  // Group rows that are within 50px vertically (contiguous blocks)
+  const groups = [];
+  let currentGroup = [];
+  let lastY = -Infinity;
+  for (const row of contentRows) {
+    if ((row.y || 0) - lastY > 50 && currentGroup.length > 0) {
+      groups.push(currentGroup);
+      currentGroup = [];
+    }
+    currentGroup.push(row);
+    lastY = row.y || 0;
+  }
+  if (currentGroup.length > 0) groups.push(currentGroup);
+
+  // Pick the largest group (most rows = chat area)
+  groups.sort((a, b) => b.length - a.length);
+  const chatGroup = groups[0] || [];
+
+  return chatGroup.map(r => r.text).join('\n');
+}
+
 // ── Sub-Goal → Tier mapping ──────────────────────────────────────────────────
 // Maps semantic sub-goal names (from _extractGoalSignature) to App-Flow tiers.
-// Tier 6 = shell.run (open file/folder/document — more reliable than quick-open).
+// Tier 6 = shell.run (open file/folder/document, new file, new window, close window,
+//          goto line — more reliable than shortcuts for these actions).
 const _subGoalToTier = {
   // File / app operations
   open_file:        6,   // shell.run (open -a "<App>" "<path>")
   open_folder:      6,   // shell.run
   open_document:    6,   // shell.run
+  new_file:         6,   // shell.run (create temp file + open in app — more reliable than Cmd+N)
+  save_as:          1,   // App Shortcut: save_as (Cmd+Shift+S — editors)
+  close_tab:        1,   // App Shortcut: close_tab (Cmd+W — most apps)
+  print:            1,   // App Shortcut: print (Cmd+P — non-editor)
   focus_ai:         1,   // App Shortcut: focus_ai (per-app: Cmd+L for Devin/VS Code, Option+Shift+C for Teams, etc.)
   quick_open:       1,   // App Shortcut: quick_open (per-app: Cmd+P for editors, Cmd+L for browsers)
   save:             1,   // App Shortcut: save (Cmd+S — universal)
   new_tab:          1,   // App Shortcut: new_tab (Cmd+T — most apps)
-  close_window:     1,   // App Shortcut: close_window (Cmd+W — most apps)
+  close_window:     6,   // shell.run (osascript quit app — more reliable than Cmd+W)
   new_message:      1,   // App Shortcut: new_message (Cmd+N — most chat apps)
   quick_switcher:   1,   // App Shortcut: quick_switcher (Cmd+K — Slack, Telegram)
+  new_window:       6,   // shell.run (open -n -a "App" or code -n — more reliable than Cmd+Shift+N)
+  split_editor:     1,   // App Shortcut: split_editor (Cmd+\ — editors)
+  send_message:     1,   // App Shortcut: send_message (Enter/Return — chat apps)
+  new_chat:         1,   // App Shortcut: new_chat (Cmd+Shift+L — some apps)
+  clear_chat:       1,   // App Shortcut: clear_chat (Cmd+K — chat apps)
+  regenerate_response: 1, // App Shortcut: regenerate_response (Cmd+R — AI apps)
 
   // Editing operations (system-wide keyboard shortcuts)
   select_all:       1,   // Cmd+A — works in all text fields / document views
@@ -270,6 +591,40 @@ const _subGoalToTier = {
   undo:             1,   // Cmd+Z — works in most apps
   redo:             1,   // Cmd+Shift+Z — works in most apps
   find:             1,   // Cmd+F — universalFind, works in most apps
+  find_replace:     1,   // Option+Cmd+F — find and replace (editors)
+  toggle_comment:   1,   // Cmd+/ — comment/uncomment (editors)
+  format_document:  1,   // Shift+Option+F — format/beautify code (editors)
+
+  // Navigation
+  goto_line:        6,   // shell.run: code -g <file:line> (falls back to tier 1 Ctrl+G if no file path)
+  goto_definition:  1,   // F12 — go to definition (editors)
+  goto_symbol:      1,   // Cmd+Shift+O — go to symbol (editors)
+  back:             1,   // Cmd+[ / Alt+Left — navigate back
+  forward:          1,   // Cmd+] / Alt+Right — navigate forward
+  next_tab:         1,   // Ctrl+Tab — next tab
+  previous_tab:     1,   // Ctrl+Shift+Tab — previous tab
+
+  // View
+  zoom_in:          1,   // Cmd+=
+  zoom_out:         1,   // Cmd+-
+  reset_zoom:       1,   // Cmd+0
+  toggle_sidebar:   1,   // Cmd+B (VS Code)
+  toggle_terminal:  1,   // Ctrl+` (VS Code)
+  toggle_fullscreen: 1,  // Ctrl+Cmd+F
+
+  // Code-specific
+  fold:             1,   // Option+Cmd+[
+  unfold:           1,   // Option+Cmd+]
+  rename_symbol:    1,   // F2
+  quick_fix:        1,   // Cmd+. (VS Code)
+  refactor:         1,   // Ctrl+Shift+R / Cmd+Shift+R
+
+  // App-specific
+  run:              1,   // F5 / Ctrl+Enter
+  build:            1,   // Cmd+Shift+B (VS Code)
+  debug:            1,   // F5 (VS Code with debug config)
+  test:             1,   // Cmd+Shift+T (some editors)
+  refresh:          1,   // Cmd+R
 
   // Typing / input
   type_value:       2,   // Just-type
@@ -316,31 +671,51 @@ function _resolveFilePath(filename) {
   }
 
   const { execSync } = require('child_process');
+  const base = filename.replace(/\.[a-zA-Z0-9]+$/, '');
   try {
-    // Search common project roots for the file by basename
+    // Search common project roots for the file by basename (with extension wildcard).
+    // Use -maxdepth to avoid timeouts on large directory trees.
     const searchRoots = [
-      process.cwd(),
-      path.join(os.homedir(), 'Desktop', 'projects'),
-      path.join(os.homedir(), 'Desktop'),
-      os.homedir(),
+      { root: process.cwd(), maxdepth: 6 },
+      { root: path.join(os.homedir(), 'Desktop', 'projects'), maxdepth: 5 },
+      { root: path.join(os.homedir(), 'Desktop'), maxdepth: 3 },
     ];
-    for (const root of searchRoots) {
+    let candidates = [];
+    for (const { root, maxdepth } of searchRoots) {
       if (!fs.existsSync(root)) continue;
       try {
-        const found = execSync(`find "${root}" -name "${filename}" -type f -not -path "*/node_modules/*" -not -path "*/.git/*" 2>/dev/null | head -1`, {
-          encoding: 'utf8',
-          timeout: 5000,
-        }).trim();
-        if (found) {
-          _pathSearchCache.set(filename, found);
-          return found;
-        }
+        const out = execSync(
+          `find "${root}" -maxdepth ${maxdepth} \\( -name "${filename}" -o -name "${base}.*" \\) -type f -not -path "*/node_modules/*" -not -path "*/.git/*" -not -path "*/dist/*" 2>/dev/null`,
+          { encoding: 'utf8', timeout: 10000 }
+        ).trim();
+        if (out) candidates = candidates.concat(out.split('\n').filter(Boolean));
       } catch (_) { /* ignore find errors */ }
+      if (candidates.length > 0) break; // Stop after first root with matches
+    }
+
+    if (candidates.length === 1) {
+      _pathSearchCache.set(filename, candidates[0]);
+      return candidates[0];
+    }
+
+    if (candidates.length > 1) {
+      // Disambiguate: prefer current project, then shortest path, then most recently modified
+      const scored = candidates.map(p => {
+        let mtime = 0;
+        try { mtime = fs.statSync(p).mtimeMs; } catch (_) {}
+        return { path: p, mtime, depth: p.split('/').length, inCwd: p.startsWith(process.cwd()) ? 1 : 0 };
+      });
+      scored.sort((a, b) => (b.inCwd - a.inCwd) || (a.depth - b.depth) || (b.mtime - a.mtime));
+      const best = scored[0].path;
+      logger.info(`[app.runner] _resolveFilePath: disambiguated "${filename}" to "${best}" (${candidates.length} candidates)`);
+      _pathSearchCache.set(filename, best);
+      return best;
     }
   } catch (_) { /* ignore */ }
 
-  // Fallback — return the filename as-is (shell.run will fail if it doesn't exist)
-  return filename;
+  // No match found — return null so the caller can fail fast and ask for clarification
+  logger.warn(`[app.runner] _resolveFilePath: no file found for "${filename}"`);
+  return null;
 }
 
 // ── Open file/folder/document via shell.run ──────────────────────────────────
@@ -350,9 +725,49 @@ function _resolveFilePath(filename) {
 
 async function _openFileWithShell(appName, filename) {
   const { shellRun } = require('./shell.run.cjs');
+
+  // Known placeholder filenames that should never be treated as real file paths.
+  // These indicate the goal asked for a "new file" but the flow incorrectly
+  // planned an open_file step. Open the app itself instead of failing.
+  const _PLACEHOLDER_FILENAMES = /^(new[_\s-]?file|new[_\s-]?document|untitled|blank[_\s]?file|empty[_\s]?file|a new file|undefined)$/i;
+  if (filename && _PLACEHOLDER_FILENAMES.test(String(filename).trim())) {
+    logger.warn(`[app.runner] _openFileWithShell: placeholder filename "${filename}" detected — opening app instead`);
+    filename = null;
+  }
+
+  // No filename supplied → just open/focus the app itself (e.g. "open -a Slack").
+  // This handles app-flow steps like `open -a 'Slack' via shell.run` that have no
+  // file target, instead of crashing on a file named "undefined".
+  if (!filename) {
+    let cmd, argv;
+    if (process.platform === 'win32') {
+      cmd = 'start';
+      argv = ['""', appName];
+    } else if (process.platform === 'linux') {
+      cmd = 'xdg-open';
+      argv = [appName];
+    } else {
+      // macOS
+      cmd = 'open';
+      argv = ['-a', appName];
+    }
+    logger.info(`[app.runner] _openFileWithShell: ${cmd} ${argv.join(' ')} (no file)`);
+    try {
+      const result = await shellRun({ cmd, argv, timeoutMs: 10000 });
+      if (!result.ok) {
+        return { ok: false, error: `Could not open ${appName}: ${result.error || result.stderr || 'unknown error'}` };
+      }
+      await _sleep(1500);
+      logger.info(`[app.runner] _openFileWithShell: opened/focused ${appName} (no file)`);
+      return { ok: true, opened: null };
+    } catch (err) {
+      return { ok: false, error: `_openFileWithShell failed: ${err.message}` };
+    }
+  }
+
   const resolved = _resolveFilePath(filename);
   if (!resolved) {
-    return { ok: false, error: `Could not resolve file path for "${filename}"` };
+    return { ok: false, error: `Could not locate a file named "${filename}". Please provide the exact path or a file with a known extension.` };
   }
 
   let cmd, argv;
@@ -383,6 +798,125 @@ async function _openFileWithShell(appName, filename) {
   }
 }
 
+// ── Infer file extension from content ─────────────────────────────────────
+// Analyzes the content to be typed to guess the language/extension so the
+// temp file gets proper syntax highlighting in the editor.
+
+function _inferFileExtension(content) {
+  if (!content || typeof content !== 'string') return 'txt';
+  // HTML before TypeScript (HTML tags like <html> would match <\w+> in TS check)
+  if (/<!DOCTYPE|<html|<head|<body/i.test(content)) return 'html';
+  // TypeScript before JavaScript (TS is a superset)
+  if (/\binterface\s+\w+|\btype\s+\w+\s*=|:\s*(string|number|boolean|void)\b/.test(content)) return 'ts';
+  if (/console\.log|require\(|module\.exports|import\s+.*from\s+['"]|export\s+default|=>\s*[{(]/.test(content)) return 'js';
+  if (/^\s*def\s+\w+|^\s*import\s+\w+|^\s*from\s+\w+\s+import|print\s*\(|if\s+__name__\s*==/.test(content)) return 'py';
+  if (/public\s+class|System\.out\.println|import\s+java\./.test(content)) return 'java';
+  if (/package\s+main|func\s+\w+|import\s+\(/.test(content)) return 'go';
+  if (/#include\s+[<"].*\.h[>"]/.test(content) && /\bstd::|namespace\s+|class\s+\w+/.test(content)) return 'cpp';
+  if (/#include\s+[<"]|int\s+main\s*\(/.test(content)) return 'c';
+  if (/@media|@import|^\s*\.\w+\s*\{|^\s*#\w+\s*\{/.test(content)) return 'css';
+  if (/^\s*[\[{]/.test(content) && /"\w+"\s*:/.test(content)) return 'json';
+  if (/^#!\/bin\/(bash|sh)|^echo\s|^export\s/.test(content)) return 'sh';
+  if (/^\s*def\s+\w+|puts\s+|require\s+['"]/.test(content)) return 'rb';
+  if (/\bfn\s+main\s*\(|\buse\s+std::|pub\s+fn\s+/.test(content)) return 'rs';
+  return 'txt';
+}
+
+// ── Create a new file via shell.run ────────────────────────────────────────
+// Creates a temp file with the inferred extension, then opens it in the app.
+// More reliable than Cmd+N (which can mean "new chat" in some apps).
+
+async function _newFileWithShell(appName, content) {
+  const { shellRun } = require('./shell.run.cjs');
+  const ext = _inferFileExtension(content);
+  const tmpFile = path.join(os.tmpdir(), `thinkdrop-untitled-${Date.now()}.${ext}`);
+
+  // Create the temp file
+  const touchResult = await shellRun({ cmd: 'bash', argv: ['-c', `touch "${tmpFile}"`], timeoutMs: 5000 });
+  if (!touchResult.ok) {
+    return { ok: false, error: `Could not create temp file: ${touchResult.error || touchResult.stderr}` };
+  }
+
+  // Open it in the app (reuses _openFileWithShell)
+  const openResult = await _openFileWithShell(appName, tmpFile);
+  if (!openResult.ok) {
+    return { ok: false, error: `Could not open temp file: ${openResult.error}` };
+  }
+
+  logger.info(`[app.runner] _newFileWithShell: created and opened ${tmpFile}`);
+  return { ok: true, opened: tmpFile };
+}
+
+// ── Open a new window via shell.run ────────────────────────────────────────
+// Tries the app's CLI first (e.g. code -n), falls back to `open -n -a "App"`.
+// More reliable than Cmd+Shift+N (ambiguous in some apps).
+
+async function _newWindowWithShell(appName) {
+  const { shellRun } = require('./shell.run.cjs');
+  const _APP_CLI = {
+    'Visual Studio Code': { cmd: 'code', argv: ['-n'] },
+    'Code':              { cmd: 'code', argv: ['-n'] },
+    'Cursor':            { cmd: 'cursor', argv: ['-n'] },
+    'Windsurf':          { cmd: 'windsurf', argv: ['-n'] },
+  };
+  const cli = _APP_CLI[appName];
+  if (cli) {
+    try {
+      const r = await shellRun({ cmd: cli.cmd, argv: cli.argv, timeoutMs: 10000 });
+      if (r.ok) {
+        await _sleep(1500);
+        logger.info(`[app.runner] _newWindowWithShell: ${cli.cmd} ${cli.argv.join(' ')}`);
+        return { ok: true };
+      }
+    } catch (_) { /* fall through to open -n */ }
+  }
+  // Fallback: open -n -a "App"
+  const r = await shellRun({ cmd: 'open', argv: ['-n', '-a', appName], timeoutMs: 10000 });
+  if (!r.ok) {
+    return { ok: false, error: `Could not open new window: ${r.error || r.stderr || 'unknown error'}` };
+  }
+  await _sleep(1500);
+  logger.info(`[app.runner] _newWindowWithShell: open -n -a "${appName}"`);
+  return { ok: true };
+}
+
+// ── Close window / quit app via shell.run ──────────────────────────────────
+// Uses osascript to quit the app. More reliable than Cmd+W (which closes a
+// tab, not a window) or Cmd+Q (which some apps intercept).
+
+async function _closeWindowWithShell(appName) {
+  const { shellRun } = require('./shell.run.cjs');
+  const r = await shellRun({ cmd: 'osascript', argv: ['-e', `quit app "${appName}"`], timeoutMs: 10000 });
+  if (!r.ok) {
+    return { ok: false, error: `Could not quit ${appName}: ${r.error || r.stderr || 'unknown error'}` };
+  }
+  logger.info(`[app.runner] _closeWindowWithShell: quit app "${appName}"`);
+  return { ok: true };
+}
+
+// ── Go to line via shell.run ───────────────────────────────────────────────
+// Uses `code -g <file:line>` for editors that support it.
+// Returns null if not supported (caller falls back to tier 1 Ctrl+G).
+
+async function _gotoLineWithShell(appName, filePath, lineNumber) {
+  const { shellRun } = require('./shell.run.cjs');
+  const _SUPPORTED = {
+    'Visual Studio Code': 'code',
+    'Code': 'code',
+    'Cursor': 'cursor',
+    'Windsurf': 'windsurf',
+  };
+  const cli = _SUPPORTED[appName];
+  if (!cli || !filePath || !lineNumber) return null; // not supported → fall back to tier 1
+  const r = await shellRun({ cmd: cli, argv: ['-g', `${filePath}:${lineNumber}`], timeoutMs: 10000 });
+  if (!r.ok) {
+    return { ok: false, error: `goto line failed: ${r.error || r.stderr || 'unknown error'}` };
+  }
+  await _sleep(1000);
+  logger.info(`[app.runner] _gotoLineWithShell: ${cli} -g ${filePath}:${lineNumber}`);
+  return { ok: true };
+}
+
 // ── 1. App-Flow Pre-computation (V2 — no hardcoded examples) ────────────────
 // LLM synthesizes the tier sequence from the actual shortcut list + sub-goals.
 // No app-specific examples — the LLM must reason about the sequence itself.
@@ -407,13 +941,28 @@ Available tiers:
 3 = Global Shortcuts (press global keys — Tab, Enter, Escape, Arrow keys, Shift+Tab)
 4 = Search Text (use LiteParser OCR to find text on screen, then click/navigate to it)
 5 = Monitoring (wait for a long-running operation to complete — AI response, build, upload, form submission)
-6 = shell.run (open a file/folder/document in the app via shell command — more reliable than quick-open)
+6 = shell.run (open/create files, new window, close window, goto line — more reliable than shortcuts)
 0 = Done (goal achieved)
 
 Sub-goal → tier mapping (use this to decide the tier for each sub-goal):
 - open_file / open_folder / open_document → tier 6 (shell.run: open -a "<App>" "<path>")
-- focus_ai / quick_open / save / new_tab / close_window / new_message / quick_switcher → tier 1 (use the matching shortcut)
+- new_file → tier 6 (shell.run: create temp file + open in app — MORE RELIABLE than Cmd+N, which can mean "new chat" in some apps)
+- new_window → tier 6 (shell.run: open -n -a "<App>" or code -n — MORE RELIABLE than Cmd+Shift+N)
+- close_window → tier 6 (shell.run: osascript quit app — MORE RELIABLE than Cmd+W)
+- goto_line → tier 6 (shell.run: code -g <file:line> when file path is known; falls back to tier 1 if file path unknown)
+- save / save_as → tier 1 (press the save/save_as shortcut — no shell.run equivalent)
+- close_tab → tier 1 (press the matching shortcut)
+- focus_ai / quick_open / new_tab / new_message / quick_switcher → tier 1 (use the matching shortcut)
 - select_all / copy / paste / cut / undo / redo / find → tier 1 (use the matching shortcut)
+- toggle_comment / format_document / find_replace → tier 1 (use the matching shortcut)
+- goto_definition / goto_symbol → tier 1 (use the matching shortcut, then tier 2 to type the symbol)
+- next_tab / previous_tab / back / forward → tier 1 (use the matching shortcut)
+- zoom_in / zoom_out / toggle_sidebar / toggle_terminal / toggle_fullscreen → tier 1 (use the matching shortcut)
+- fold / unfold / rename_symbol / quick_fix / refactor → tier 1 (use the matching shortcut)
+- new_chat / clear_chat / send_message / regenerate_response → tier 1 (use the matching shortcut)
+- split_editor → tier 1 (use the matching shortcut)
+- run / build / debug / test / refresh → tier 1 (use the matching shortcut)
+- print → tier 1 (use the matching shortcut)
 - type_value → tier 2 (type the value into the focused field)
 - ask_question → tier 1 (focus_ai shortcut), then tier 2 (type the question)
 - press_enter / press_tab / press_escape / press_arrow → tier 3
@@ -422,6 +971,11 @@ Sub-goal → tier mapping (use this to decide the tier for each sub-goal):
 
 Mapping rules:
 - For open_file/open_folder/open_document → tier 6, action = "open -a '<App>' '<filename>' via shell.run"
+- For new_file → tier 6, action = "new file via shell.run"
+- For new_window → tier 6, action = "new window via shell.run"
+- For close_window → tier 6, action = "close window via shell.run"
+- For goto_line (file path known) → tier 6, action = "goto line <N> via shell.run"
+- For goto_line (file path unknown) → tier 1, action = "press <goto_line shortcut> (go to line)", then tier 2 action = "type '<lineNumber>' (type-plain)"
 - If a sub-goal has a matching shortcut → tier 1, action = "press <shortcut> (<action>)"
 - If a sub-goal needs typing a value → tier 2, action = "type '<value>' (<sub-mode>)"
   Sub-modes: type-plain (chat/simple), type-commands (/slash), type-edit (long-form/code), type-search (@mentions/pickers), type-list-item (todos), type-filter (quick-open file picker)
@@ -430,19 +984,29 @@ Mapping rules:
 - End with tier 0, action = "done"
 
 CRITICAL RULES:
-- Tier 6 (shell.run) is the PRIMARY way to open files/folders/documents. Do NOT use quick_open (Cmd+P) for opening files — use tier 6 instead.
+- Tier 6 (shell.run) is the PRIMARY way to open/create files, open new windows, close windows, and goto lines. Prefer shell.run over shortcuts whenever a reliable shell command exists.
+- new_file uses tier 6 (shell.run: create temp file + open), NOT tier 1 (Cmd+N). Cmd+N is ambiguous — it can open a new chat in some apps.
+- new_window uses tier 6 (shell.run), NOT tier 1 (Cmd+Shift+N). Cmd+Shift+N is ambiguous in some apps.
+- close_window uses tier 6 (shell.run: quit app), NOT tier 1 (Cmd+W).
+- goto_line uses tier 6 (shell.run: code -g) when the file path is known. Falls back to tier 1 (Ctrl+G) when the file path is unknown.
+- save/save_as remains tier 1 (Cmd+S) — no reliable shell.run equivalent for in-app saving.
+- If the goal is to create a new file and type content, the flow should be: new_file (tier 6) → type_value (tier 2) → save (tier 1) → done (tier 0).
 - Tier 1 (App Shortcuts) is the PRIMARY tier for in-app actions (80-90% of use). Prefer it when a shortcut can accomplish the sub-goal.
 - Tier 2 (Just-type) is for typing into the currently focused field. Use AFTER a tier 1 shortcut has focused the field.
 - Tier 3 (Global Shortcuts) is a fallback for navigation (Enter to confirm, Escape to close, Tab between fields).
 - Tier 5 (Monitoring) is for waiting on long-running operations. Use AFTER an action that triggers a long-running process.
-- Use the entities from the goal signature to fill in concrete values (filenames, questions, etc.).
+- CRITICAL: if the sub-goals contain "ask_question" or the goal is to ask/chat/explain, ALWAYS include a "monitor_response" step (tier 5) before "done". A question always implies waiting for a response.
+- Use the entities from the goal signature to fill in concrete values (filenames, questions, content, line numbers, etc.).
 - Be specific about what action each tier should take. For tier 2, include the sub-mode in parentheses.
 - Output ONLY the JSON array, no other text.
 
 Output format: JSON array of steps, each with:
+- subGoal: canonical sub-goal name from the sub-goals list above (e.g. "new_file", "open_file", "type_value", "save", "goto_line", "done")
 - state: expected app state description
 - tier: tier number (0, 1, 2, 3, 4, 5, or 6)
-- action: what the tier should do`;
+- action: human-readable description of what the tier should do
+
+CRITICAL: Every step MUST include the "subGoal" field set to the exact canonical sub-goal it corresponds to.`;
 
   const userPrompt = `Goal: ${goal}
 App: ${appName || 'unknown'}
@@ -528,38 +1092,474 @@ ${stepsText.slice(0, 4000)}`;
   }
 }
 
-// ── Check if all sub-goals have matching shortcuts ───────────────────────────
-// Returns list of sub-goals that have NO matching shortcut action AND are not
-// handled by tier 6 (shell.run) or other non-shortcut tiers.
+// ── Sub-Goal Taxonomy ────────────────────────────────────────────────────────
+// Single source of truth for all canonical sub-goals. Each entry defines:
+//   tier:           which execution tier handles this sub-goal
+//   shortcutAction: the shortcut action name (for tier 1 sub-goals) or null
+//   phrasings:      regex patterns that match user phrasings for this sub-goal
+//
+// Used by:
+//   - _extractGoalSignature prompt (lists valid sub-goals)
+//   - _subGoalToShortcutAction (maps sub-goal → shortcut action name)
+//   - _subGoalsWithoutShortcuts (derived: all tier !== 1 entries)
+//   - _computeAppFlowV2 prompt (sub-goal → tier mapping)
+//   - _preClassifyGoal (deterministic pre-check before LLM)
 
-// Sub-goals that don't need a shortcut (handled by other tiers)
-const _subGoalsWithoutShortcuts = new Set([
-  'open_file', 'open_folder', 'open_document',  // tier 6 (shell.run)
-  'type_value',                                  // tier 2 (just-type)
-  'press_enter', 'press_tab', 'press_escape', 'press_arrow', // tier 3 (global keys)
-  'monitor_response',                            // tier 5 (monitoring)
-  'done',                                        // tier 0
-]);
+const APP_SUBGOAL_TAXONOMY = {
+  // ── File operations ──
+  new_file: {
+    tier: 6, shortcutAction: null,  // shell.run: create temp file + open in app (more reliable than Cmd+N)
+    phrasings: [
+      /\b(?:open|create|make|add|start)\s+(?:a\s+)?(?:new|blank|empty)\s+(?:file|document|page)\b/i,
+      /\b(?:new|blank|empty)\s+(?:file|document|page)\b/i,
+    ],
+  },
+  open_file: {
+    tier: 6, shortcutAction: null,
+    phrasings: [
+      /\bopen\s+(?:the\s+)?(?:file|document)\b/i,
+      /\bopen\s+(?:a\s+)?(?:file|document)\s+(?!new|blank|empty)\b/i,
+    ],
+  },
+  open_folder: {
+    tier: 6, shortcutAction: null,
+    phrasings: [/\bopen\s+(?:the\s+)?(?:folder|directory)\b/i],
+  },
+  open_document: {
+    tier: 6, shortcutAction: null,
+    phrasings: [/\bopen\s+(?:the\s+)?document\b/i],
+  },
+  save: {
+    tier: 1, shortcutAction: 'save',
+    phrasings: [/\bsave\b/i, /\bsave\s+(?:it|the\s+file|file)\b/i],
+  },
+  save_as: {
+    tier: 1, shortcutAction: 'save_as',
+    phrasings: [/\bsave\s+as\b/i, /\bsave\s+with\s+name\b/i],
+  },
+  close_tab: {
+    tier: 1, shortcutAction: 'close_tab',
+    phrasings: [/\bclose\s+(?:tab|file|this)\b/i],
+  },
+  close_window: {
+    tier: 6, shortcutAction: null,  // shell.run: osascript quit app (more reliable than Cmd+W)
+    phrasings: [/\bclose\s+(?:window|app|application)\b/i, /\bquit\b/i],
+  },
+  print: {
+    tier: 1, shortcutAction: 'print',
+    phrasings: [/\bprint\b/i],
+  },
 
-// Map sub-goal names to shortcut action names (for the ones that DO use shortcuts)
-const _subGoalToShortcutAction = {
-  focus_ai: 'focus_ai',
-  quick_open: 'quick_open',
-  save: 'save',
-  new_tab: 'new_tab',
-  close_window: 'close_window',
-  new_message: 'new_message',
-  quick_switcher: 'quick_switcher',
-  select_all: 'select_all',
-  highlight_all_text: 'select_all',
-  copy: 'copy',
-  paste: 'paste',
-  cut: 'cut',
-  undo: 'undo',
-  redo: 'redo',
-  find: 'find',
-  ask_question: 'focus_ai',  // ask_question uses focus_ai shortcut
+  // ── Edit operations ──
+  undo: {
+    tier: 1, shortcutAction: 'undo',
+    phrasings: [/\bundo\b/i, /\brevert\b/i],
+  },
+  redo: {
+    tier: 1, shortcutAction: 'redo',
+    phrasings: [/\bredo\b/i, /\brepeat\b/i],
+  },
+  cut: {
+    tier: 1, shortcutAction: 'cut',
+    phrasings: [/\bcut\b/i],
+  },
+  copy: {
+    tier: 1, shortcutAction: 'copy',
+    phrasings: [/\bcopy\b/i],
+  },
+  paste: {
+    tier: 1, shortcutAction: 'paste',
+    phrasings: [/\bpaste\b/i],
+  },
+  select_all: {
+    tier: 1, shortcutAction: 'select_all',
+    phrasings: [/\bselect\s+all\b/i, /\bselect\s+everything\b/i, /\bhighlight\s+all\b/i],
+  },
+  toggle_comment: {
+    tier: 1, shortcutAction: 'toggle_comment',
+    phrasings: [/\b(?:comment|uncomment|toggle\s+comment)\b/i, /\bcomment\s+out\b/i],
+  },
+  format_document: {
+    tier: 1, shortcutAction: 'format_document',
+    phrasings: [/\b(?:format|beautify|prettify)\b/i, /\bformat\s+(?:code|document)\b/i],
+  },
+  find: {
+    tier: 1, shortcutAction: 'find',
+    phrasings: [/\bfind\b/i, /\bsearch\b/i, /\bsearch\s+for\b/i, /\bfind\s+text\b/i],
+  },
+  find_replace: {
+    tier: 1, shortcutAction: 'find_replace',
+    phrasings: [/\b(?:find\s+and\s+replace|replace|replace\s+all|substitute)\b/i],
+  },
+
+  // ── Navigation ──
+  goto_line: {
+    tier: 6, shortcutAction: null,  // shell.run: code -g <file:line> (falls back to tier 1 Ctrl+G if no file path)
+    phrasings: [/\b(?:goto|go\s+to|jump\s+to)\s+line\b/i, /\bline\s+\d+\b/i],
+  },
+  goto_definition: {
+    tier: 1, shortcutAction: 'goto_definition',
+    phrasings: [/\b(?:goto|go\s+to|jump\s+to)\s+definition\b/i],
+  },
+  goto_symbol: {
+    tier: 1, shortcutAction: 'goto_symbol',
+    phrasings: [/\b(?:goto|go\s+to|jump\s+to)\s+(?:symbol|function)\b/i],
+  },
+  quick_open: {
+    tier: 1, shortcutAction: 'quick_open',
+    phrasings: [/\bquick\s+open\b/i, /\bcommand\s+palette\b/i, /\bgo\s+to\s+file\b/i],
+  },
+  back: {
+    tier: 1, shortcutAction: 'back',
+    phrasings: [/\bgo\s+back\b/i, /\bnavigate\s+back\b/i, /\bprevious\s+location\b/i],
+  },
+  forward: {
+    tier: 1, shortcutAction: 'forward',
+    phrasings: [/\bgo\s+forward\b/i, /\bnavigate\s+forward\b/i, /\bnext\s+location\b/i],
+  },
+  next_tab: {
+    tier: 1, shortcutAction: 'next_tab',
+    phrasings: [/\bnext\s+tab\b/i, /\bswitch\s+to\s+next\s+tab\b/i],
+  },
+  previous_tab: {
+    tier: 1, shortcutAction: 'previous_tab',
+    phrasings: [/\bprevious\s+tab\b/i, /\bswitch\s+to\s+previous\s+tab\b/i],
+  },
+
+  // ── View ──
+  zoom_in: {
+    tier: 1, shortcutAction: 'zoom_in',
+    phrasings: [/\bzoom\s+in\b/i, /\bmake\s+bigger\b/i],
+  },
+  zoom_out: {
+    tier: 1, shortcutAction: 'zoom_out',
+    phrasings: [/\bzoom\s+out\b/i, /\bmake\s+smaller\b/i],
+  },
+  toggle_sidebar: {
+    tier: 1, shortcutAction: 'toggle_sidebar',
+    phrasings: [/\btoggle\s+sidebar\b/i, /\b(?:show|hide)\s+sidebar\b/i],
+  },
+  toggle_terminal: {
+    tier: 1, shortcutAction: 'toggle_terminal',
+    phrasings: [/\btoggle\s+terminal\b/i, /\b(?:show|hide|open)\s+terminal\b/i],
+  },
+  toggle_fullscreen: {
+    tier: 1, shortcutAction: 'toggle_fullscreen',
+    phrasings: [/\bfullscreen\b/i, /\bfull\s+screen\b/i, /\btoggle\s+fullscreen\b/i],
+  },
+
+  // ── Code-specific (editor category) ──
+  fold: {
+    tier: 1, shortcutAction: 'fold',
+    phrasings: [/\bfold\b/i, /\bcollapse\b/i],
+  },
+  unfold: {
+    tier: 1, shortcutAction: 'unfold',
+    phrasings: [/\bunfold\b/i, /\bexpand\b/i],
+  },
+  rename_symbol: {
+    tier: 1, shortcutAction: 'rename_symbol',
+    phrasings: [/\brename\s+(?:symbol|variable|function)\b/i],
+  },
+  quick_fix: {
+    tier: 1, shortcutAction: 'quick_fix',
+    phrasings: [/\bquick\s+fix\b/i, /\bshow\s+fixes\b/i, /\bcode\s+action\b/i],
+  },
+  refactor: {
+    tier: 1, shortcutAction: 'refactor',
+    phrasings: [/\brefactor\b/i, /\bextract\s+(?:method|variable)\b/i],
+  },
+
+  // ── AI / Chat ──
+  focus_ai: {
+    tier: 1, shortcutAction: 'focus_ai',
+    phrasings: [/\bfocus\s+ai\b/i, /\bopen\s+ai\b/i, /\bask\s+ai\b/i, /\bai\s+assistant\b/i, /\bcopilot\b/i],
+  },
+  ask_question: {
+    tier: 1, shortcutAction: 'focus_ai',  // ask_question uses focus_ai shortcut
+    phrasings: [/\bask\b/i, /\bquestion\b/i, /\bexplain\b/i, /\breview\b/i, /\banalyze\b/i, /\bwhat\s+does\b/i, /\bhow\s+does\b/i],
+  },
+  new_chat: {
+    tier: 1, shortcutAction: 'new_chat',
+    phrasings: [/\bnew\s+chat\b/i, /\bnew\s+conversation\b/i, /\bclear\s+chat\b/i],
+  },
+  clear_chat: {
+    tier: 1, shortcutAction: 'clear_chat',
+    phrasings: [/\bclear\s+(?:chat|conversation)\b/i, /\breset\s+chat\b/i],
+  },
+  send_message: {
+    tier: 1, shortcutAction: 'send_message',
+    phrasings: [/\bsend\s+message\b/i, /\bsubmit\b/i],
+  },
+  regenerate_response: {
+    tier: 1, shortcutAction: 'regenerate_response',
+    phrasings: [/\bregenerate\b/i, /\btry\s+again\b/i, /\bretry\s+ai\b/i],
+  },
+  monitor_response: {
+    tier: 5, shortcutAction: null,
+    phrasings: [/\bwait\s+for\s+response\b/i, /\bwait\s+for\s+ai\b/i, /\bmonitor\s+response\b/i],
+  },
+
+  // ── Chat-specific shortcuts (kept for backwards compatibility) ──
+  new_message: {
+    tier: 1, shortcutAction: 'new_message',
+    phrasings: [/\bnew\s+message\b/i, /\bcompose\s+new\s+message\b/i],
+  },
+  quick_switcher: {
+    tier: 1, shortcutAction: 'quick_switcher',
+    phrasings: [/\bquick\s+switcher\b/i, /\bswitch\s+channel\b/i, /\bswitch\s+conversation\b/i],
+  },
+  focus_input: {
+    tier: 1, shortcutAction: 'focus_input',
+    phrasings: [/\bfocus\s+input\b/i, /\bfocus\s+message\b/i, /\bfocus\s+compose\b/i],
+  },
+  open_file_dialog: {
+    tier: 1, shortcutAction: 'open_file_dialog',
+    phrasings: [/\bopen\s+file\s+dialog\b/i, /\bopen\s+file\s+picker\b/i],
+  },
+
+  // ── Window / Tab management ──
+  new_window: {
+    tier: 6, shortcutAction: null,  // shell.run: open -n -a "App" or code -n (more reliable than Cmd+Shift+N)
+    phrasings: [/\bnew\s+window\b/i, /\bopen\s+new\s+window\b/i],
+  },
+  new_tab: {
+    tier: 1, shortcutAction: 'new_tab',
+    phrasings: [/\bnew\s+tab\b/i, /\bopen\s+new\s+tab\b/i],
+  },
+  split_editor: {
+    tier: 1, shortcutAction: 'split_editor',
+    phrasings: [/\bsplit\s+(?:editor|view|pane)\b/i],
+  },
+
+  // ── Text input ──
+  type_value: {
+    tier: 2, shortcutAction: null,
+    phrasings: [/\b(?:type|enter|write|input|fill\s+in)\b/i],
+  },
+  press_enter: {
+    tier: 3, shortcutAction: null,
+    phrasings: [/\bpress\s+enter\b/i, /\bhit\s+enter\b/i, /\bconfirm\b/i],
+  },
+  press_tab: {
+    tier: 3, shortcutAction: null,
+    phrasings: [/\bpress\s+tab\b/i, /\bnext\s+field\b/i, /\btab\b/i],
+  },
+  press_escape: {
+    tier: 3, shortcutAction: null,
+    phrasings: [/\bpress\s+escape\b/i, /\bcancel\b/i, /\bdismiss\b/i, /\bescape\b/i],
+  },
+  press_arrow: {
+    tier: 3, shortcutAction: null,
+    phrasings: [/\barrow\s+(?:up|down|left|right)\b/i],
+  },
+
+  // ── App-specific ──
+  run: {
+    tier: 1, shortcutAction: 'run',
+    phrasings: [/\brun\s+(?:code|program)\b/i, /\bexecute\b/i, /\brun\b/i],
+  },
+  build: {
+    tier: 1, shortcutAction: 'build',
+    phrasings: [/\bbuild\b/i, /\bcompile\b/i, /\bmake\b/i],
+  },
+  debug: {
+    tier: 1, shortcutAction: 'debug',
+    phrasings: [/\bdebug\b/i, /\bstart\s+debugging\b/i, /\bdebugger\b/i],
+  },
+  test: {
+    tier: 1, shortcutAction: 'test',
+    phrasings: [/\brun\s+tests\b/i, /\btest\b/i, /\brun\s+test\s+suite\b/i],
+  },
+  refresh: {
+    tier: 1, shortcutAction: 'refresh',
+    phrasings: [/\brefresh\b/i, /\breload\b/i, /\breload\s+(?:page|window)\b/i],
+  },
+
+  // ── Meta ──
+  open_app: {
+    tier: 0, shortcutAction: null,  // handled by _focusApp before the flow loop
+    phrasings: [/\bopen\s+(?:the\s+)?app\b/i],
+  },
+  done: {
+    tier: 0, shortcutAction: null,
+    phrasings: [/\bdone\b/i, /\bcomplete\b/i, /\bfinish\b/i],
+  },
 };
+
+// Derive _subGoalsWithoutShortcuts from the taxonomy (all tier !== 1 entries)
+const _subGoalsWithoutShortcuts = new Set(
+  Object.entries(APP_SUBGOAL_TAXONOMY)
+    .filter(([, entry]) => entry.tier !== 1)
+    .map(([name]) => name)
+);
+
+// Derive _subGoalToShortcutAction from the taxonomy (all tier 1 entries with shortcutAction)
+const _subGoalToShortcutAction = Object.fromEntries(
+  Object.entries(APP_SUBGOAL_TAXONOMY)
+    .filter(([, entry]) => entry.tier === 1 && entry.shortcutAction)
+    .map(([name, entry]) => [name, entry.shortcutAction])
+);
+// Add aliases for backwards compatibility
+_subGoalToShortcutAction.highlight_all_text = 'select_all';
+
+/**
+ * Deterministic pre-check: scan the goal text against the taxonomy phrasings.
+ * If a clear match is found for a sub-goal that the LLM commonly misclassifies
+ * (e.g. "new file" → new_file, not open_file), return the correct sub-goal.
+ * This runs BEFORE _extractGoalSignature to catch obvious cases without LLM latency.
+ *
+ * @param {string} goal - the user's goal text
+ * @returns {{ subGoal: string, clearFilename: string|null } | null}
+ */
+function _preClassifyGoal(goal) {
+  if (!goal || typeof goal !== 'string') return null;
+
+  // Check new_file patterns first — this is the most common misclassification.
+  // "open a new file" should be new_file, not open_file.
+  const _NEW_FILE_PATTERNS = APP_SUBGOAL_TAXONOMY.new_file.phrasings;
+  if (_NEW_FILE_PATTERNS.some(re => re.test(goal))) {
+    // Check if a specific filename is also mentioned (e.g. "create a new file called test.js")
+    // If so, we still use new_file but the LLM can extract the filename for the save step.
+    return { subGoal: 'new_file', clearFilename: null };
+  }
+
+  // Check other high-priority patterns
+  for (const [subGoal, entry] of Object.entries(APP_SUBGOAL_TAXONOMY)) {
+    if (subGoal === 'new_file' || subGoal === 'done' || subGoal === 'open_app') continue;
+    if (entry.phrasings && entry.phrasings.some(re => re.test(goal))) {
+      return { subGoal, clearFilename: null };
+    }
+  }
+
+  return null;
+}
+
+// ── Layer 2: Deterministic sub-goal inference from action text ─────────────
+// Used by _validateAndFixFlowSubGoals when the LLM omits or garbles the subGoal
+// field. Infers the canonical sub-goal from the action description + tier number.
+// Patterns are broader than the taxonomy phrasings because the LLM writes
+// action descriptions (not user goal text).
+
+function _inferSubGoalFromAction(action, tier) {
+  if (!action) return null;
+  const a = action.toLowerCase();
+  // Tier 6 actions (shell.run)
+  if (tier === 6) {
+    if (/\bnew\s+(?:file|doc|document|page)\b|\bcreate\s+(?:a\s+|the\s+)?(?:new\s+)?(?:temp|temporary|blank|empty|untitled)\s+(?:file|doc|document)\b|\bnew_file\b/.test(a)) return 'new_file';
+    if (/\bnew\s+window\b|\bnew_window\b/.test(a)) return 'new_window';
+    if (/\bclose\s+window\b|\bquit\s+(?:app|application)\b|\bclose_window\b/.test(a)) return 'close_window';
+    if (/\b(?:goto|go\s+to)\s+line\b|\bgoto_line\b/.test(a)) return 'goto_line';
+    if (/\bopen\s+(?:file|doc|document|folder|directory)\b/.test(a)) return 'open_file';
+  }
+  // Tier 1 actions (shortcuts)
+  if (tier === 1) {
+    if (/\bsave\s+as\b/.test(a)) return 'save_as';
+    if (/\bsave\b/.test(a)) return 'save';
+    if (/\bclose\s+tab\b/.test(a)) return 'close_tab';
+    if (/\bnew\s+tab\b/.test(a)) return 'new_tab';
+    if (/\bfocus\s+ai\b|\bask\s+ai\b|\bcopilot\b/.test(a)) return 'focus_ai';
+    if (/\bquick\s+open\b|\bcommand\s+palette\b/.test(a)) return 'quick_open';
+    if (/\bformat\b|\bbeautify\b|\bprettify\b/.test(a)) return 'format_document';
+    if (/\bcomment\b|\buncomment\b|\btoggle\s+comment\b/.test(a)) return 'toggle_comment';
+    if (/\bfind\s+(?:and\s+)?replace\b|\breplace\b/.test(a)) return 'find_replace';
+    if (/\bfind\b|\bsearch\b/.test(a)) return 'find';
+    if (/\bcopy\b/.test(a)) return 'copy';
+    if (/\bpaste\b/.test(a)) return 'paste';
+    if (/\bcut\b/.test(a)) return 'cut';
+    if (/\bundo\b/.test(a)) return 'undo';
+    if (/\bredo\b/.test(a)) return 'redo';
+    if (/\bselect\s+all\b/.test(a)) return 'select_all';
+    if (/\bgoto\s+definition\b|\bgo\s+to\s+definition\b/.test(a)) return 'goto_definition';
+    if (/\bgoto\s+symbol\b|\bgo\s+to\s+symbol\b/.test(a)) return 'goto_symbol';
+    if (/\brename\s+symbol\b/.test(a)) return 'rename_symbol';
+    if (/\bquick\s+fix\b|\bcode\s+action\b/.test(a)) return 'quick_fix';
+    if (/\btoggle\s+sidebar\b/.test(a)) return 'toggle_sidebar';
+    if (/\btoggle\s+terminal\b|\bopen\s+terminal\b/.test(a)) return 'toggle_terminal';
+    if (/\bfullscreen\b/.test(a)) return 'toggle_fullscreen';
+    if (/\bfold\b|\bcollapse\b/.test(a)) return 'fold';
+    if (/\bunfold\b|\bexpand\b/.test(a)) return 'unfold';
+    if (/\bsplit\s+(?:editor|view|pane)\b/.test(a)) return 'split_editor';
+    if (/\brun\b/.test(a)) return 'run';
+    if (/\bbuild\b|\bcompile\b/.test(a)) return 'build';
+    if (/\brefresh\b|\breload\b/.test(a)) return 'refresh';
+    if (/\bprint\b/.test(a)) return 'print';
+    if (/\bnew\s+chat\b|\bnew\s+conversation\b/.test(a)) return 'new_chat';
+    if (/\bsend\s+message\b|\bsubmit\b/.test(a)) return 'send_message';
+  }
+  // Tier 2 actions (just-type)
+  if (tier === 2) {
+    if (/\btype\b|\benter\b|\bwrite\b|\binput\b|\bfill\s+in\b/.test(a)) return 'type_value';
+  }
+  // Tier 3 actions (global keys)
+  if (tier === 3) {
+    if (/\benter\b|\bconfirm\b|\bsubmit\b/.test(a)) return 'press_enter';
+    if (/\btab\b/.test(a)) return 'press_tab';
+    if (/\bescape\b|\bcancel\b|\bdismiss\b/.test(a)) return 'press_escape';
+    if (/\barrow\b/.test(a)) return 'press_arrow';
+  }
+  // Tier 5 actions (monitoring)
+  if (tier === 5) {
+    if (/\bmonitor\b|\bwait\s+for\b/.test(a)) return 'monitor_response';
+  }
+  // Tier 0 (done)
+  if (tier === 0) return 'done';
+  return null;
+}
+
+// ── Layer 3 helper: count non-done steps before a given index ──────────────
+// Used for positional cross-reference with signature.subGoals. Done steps
+// (tier 0) don't correspond to a sub-goal, so we skip them when counting.
+
+function _countNonDoneStepsBefore(flow, index) {
+  let count = 0;
+  for (let i = 0; i < index; i++) {
+    if (flow[i] && flow[i].tier !== 0) count++;
+  }
+  return count;
+}
+
+// ── Flow validation: ensure every step has a valid subGoal ──────────────────
+// Three-layer defense against LLM omitting or garbling the subGoal field:
+//   Layer 1: subGoal present and valid → keep it
+//   Layer 2: subGoal missing/invalid → infer from action text + tier
+//   Layer 3: action inference fails → positional cross-reference with signature.subGoals
+
+function _validateAndFixFlowSubGoals(flow, signature) {
+  if (!Array.isArray(flow)) return flow;
+  const validSubGoals = new Set(Object.keys(APP_SUBGOAL_TAXONOMY));
+  const sigSubGoals = signature?.subGoals || [];
+
+  for (let i = 0; i < flow.length; i++) {
+    const step = flow[i];
+    const sg = step.subGoal;
+
+    // Layer 1: subGoal present and valid → keep it
+    if (sg && validSubGoals.has(sg)) continue;
+
+    // Layer 2: subGoal missing or invalid → infer from action text
+    const inferred = _inferSubGoalFromAction(step.action || '', step.tier);
+    if (inferred) {
+      logger.warn(`[app.runner] _validateAndFixFlowSubGoals: step ${i} subGoal "${sg || 'missing'}" → inferred "${inferred}" from action "${(step.action || '').slice(0, 60)}"`);
+      step.subGoal = inferred;
+      continue;
+    }
+
+    // Layer 3: cross-reference with signature.subGoals positionally
+    if (step.tier === 0) { step.subGoal = 'done'; continue; }
+    const sigIdx = _countNonDoneStepsBefore(flow, i);
+    if (sigIdx < sigSubGoals.length) {
+      const inferredFromSig = sigSubGoals[sigIdx];
+      logger.warn(`[app.runner] _validateAndFixFlowSubGoals: step ${i} subGoal "${sg || 'missing'}" → positional "${inferredFromSig}" (sig index ${sigIdx})`);
+      step.subGoal = inferredFromSig;
+      continue;
+    }
+
+    // Last resort: log and leave as-is (the tier dispatch will use regex fallback)
+    logger.error(`[app.runner] _validateAndFixFlowSubGoals: step ${i} could not determine subGoal (action="${(step.action || '').slice(0, 80)}", tier=${step.tier})`);
+  }
+  return flow;
+}
 
 function _findMissingSubGoals(signature, shortcuts) {
   if (!signature || !signature.subGoals) return [];
@@ -578,11 +1578,15 @@ function _findMissingSubGoals(signature, shortcuts) {
 
 async function _selectAppTierLLM(goal, actionHistory, appCategory, shortcutCount, shortcutLabels,
   currentOcrText, focusedElement, appFlow, flowIndex, triedTiers = new Set()) {
-  // 1. DONE check (only if we've taken actions) — deterministic first
-  if (actionHistory.length > 0) {
-    const doneResult = await _ocrVerifyAppGoal(currentOcrText, goal, actionHistory);
-    if (doneResult.num === 1) return 0;
-    if (doneResult.num === 2) return 0; // wait → caller handles sleep, but tier 0 means "no action needed this iteration"
+  // 1. App-Flow fast-path — if we have a pre-computed flow, use it directly.
+  //    Skip the premature DONE check; per-step verification is handled after
+  //    the flow completes via initial-vs-final diff.
+  if (appFlow && flowIndex < appFlow.length) {
+    const _expected = appFlow[flowIndex];
+    if (_expected.tier !== 0) {
+      logger.info(`[app.runner] _selectAppTierLLM: App-Flow fast-path → ${_expected.tier} (flow step ${flowIndex}: ${_expected.action || ''})`);
+      return _expected.tier;
+    }
   }
 
   // 2. Build available tiers (exclude tried tiers)
@@ -594,13 +1598,14 @@ async function _selectAppTierLLM(goal, actionHistory, appCategory, shortcutCount
     return -1;
   }
 
-  // 3. App-Flow fast-path — if we have a pre-computed flow and the current state
-  //    matches the expected state, skip the LLM call and use the flow's tier.
-  if (appFlow && flowIndex < appFlow.length) {
-    const _expected = appFlow[flowIndex];
-    if (_expected.tier !== 0 && _availableTiers.includes(_expected.tier)) {
-      logger.info(`[app.runner] _selectAppTierLLM: App-Flow fast-path → ${_expected.tier} (flow step ${flowIndex}: ${_expected.action || ''})`);
-      return _expected.tier;
+  // 3. DONE check — only when flow is exhausted or no flow exists
+  if (actionHistory.length > 0 && (!appFlow || flowIndex >= appFlow.length)) {
+    const doneResult = await _ocrVerifyAppGoal(currentOcrText, goal, actionHistory);
+    if (doneResult.num === 1) return 0;
+    if (doneResult.num === 2) {
+      // wait/retry — do NOT return 0 (that kills the flow)
+      await _sleep(1000);
+      return -2;  // sentinel: wait, no action taken, do not advance flowIndex
     }
   }
 
@@ -619,10 +1624,14 @@ Return ONLY a single number — nothing else:
 3 = Global Shortcuts (press global keys: Tab, Enter, Escape, Arrow keys)
 4 = Search Text (use LiteParser to find text on screen, click it)
 5 = Monitoring (wait for a long-running operation to complete — AI response, build, upload)
-6 = shell.run (open a file/folder/document in the app via shell command)
+6 = shell.run (open/create files, new window, close window, goto line — more reliable than shortcuts)
 
 Decision rules:
 - If a file/folder/document needs to be opened → return 6 (shell.run is more reliable than quick-open)
+- If a new file needs to be created → return 6 (shell.run: create temp file + open — more reliable than Cmd+N)
+- If a new window needs to be opened → return 6 (shell.run: open -n -a "App" or code -n)
+- If the app/window needs to be closed → return 6 (shell.run: osascript quit app)
+- If goto line is needed and the file path is known → return 6 (shell.run: code -g <file:line>)
 - If an app shortcut can accomplish the next sub-goal (focus field, save, copy, paste) → return 1
 - If a field is focused and you need to type a value into it → return 2
 - If no shortcut applies but global keys (Tab, Enter, Escape, Arrows) can navigate → return 3
@@ -696,6 +1705,16 @@ async function _extractAppFieldType(goal, focusedElement, value, appCategory, ac
   if (_val.startsWith('@')) {
     logger.info(`[app.runner] _extractAppFieldType: → type-search (value starts with @)`);
     return 'type-search';
+  }
+
+  // Short single-line non-code values are type-plain regardless of appCategory.
+  // Forces chat questions, search queries, terminal commands, and short form
+  // inputs to type-plain so the LLM classifier doesn't misclassify them as
+  // type-edit just because appCategory=editor. Code snippets still go through
+  // the LLM path via _looksLikeCode.
+  if (_val.length < 200 && !_val.includes('\n') && !_looksLikeCode(_val)) {
+    logger.info(`[app.runner] _extractAppFieldType: → type-plain (short single-line non-code, ${_val.length} chars)`);
+    return 'type-plain';
   }
 
   // ── Signal-driven LLM classifier ──
@@ -780,6 +1799,16 @@ async function _executeAppTypePlain({ appName, value, goal, actionHistory }) {
       await keyboard.pressKey(Key.Return);
       await keyboard.releaseKey(Key.Return);
       logger.info(`[app.runner] type-plain: pressed Enter to submit`);
+
+      // Capture baseline screenshot right after Enter — before any response/output appears.
+      // This is used by monitoring (tier 5) to compute a clean diff of the AI/command response.
+      // The capture is fast (~100ms) and harmless if no monitoring follows.
+      // Use the hidden variant so the ThinkDrop overlay doesn't taint the baseline.
+      const baselineShot = await _captureScreenshotOnlyHidden();
+      if (baselineShot.ok) {
+        logger.info(`[app.runner] type-plain: baseline screenshot captured (${baselineShot.path})`);
+        return { ok: true, typed: value, subMode: 'type-plain', baselineScreenshotPath: baselineShot.path };
+      }
     }
 
     return { ok: true, typed: value, subMode: 'type-plain' };
@@ -849,6 +1878,14 @@ async function _executeAppTypeCommands({ appName, value, goal, actionHistory }) 
       await _sleep(300);
       await keyboard.pressKey(Key.Return);
       await keyboard.releaseKey(Key.Return);
+    }
+
+    // Capture baseline screenshot after final Enter — before any response/output appears
+    // Use the hidden variant so the ThinkDrop overlay doesn't taint the baseline.
+    const baselineShot = await _captureScreenshotOnlyHidden();
+    if (baselineShot.ok) {
+      logger.info(`[app.runner] type-commands: baseline screenshot captured (${baselineShot.path})`);
+      return { ok: true, typed: value, subMode: 'type-commands', commandPlan: plan, baselineScreenshotPath: baselineShot.path };
     }
 
     return { ok: true, typed: value, subMode: 'type-commands', commandPlan: plan };
@@ -930,6 +1967,10 @@ async function _executeAppTypeSearch({ appName, value, goal, actionHistory }) {
       logger.warn(`[app.runner] type-search: no dropdown appeared — trying Enter to submit as plain search`);
       await keyboard.pressKey(Key.Return);
       await keyboard.releaseKey(Key.Return);
+      const baselineShot = await _captureScreenshotOnlyHidden();
+      if (baselineShot.ok) {
+        return { ok: true, typed: value, subMode: 'type-search', note: 'no dropdown — submitted as plain search', baselineScreenshotPath: baselineShot.path };
+      }
       return { ok: true, typed: value, subMode: 'type-search', note: 'no dropdown — submitted as plain search' };
     }
 
@@ -937,6 +1978,14 @@ async function _executeAppTypeSearch({ appName, value, goal, actionHistory }) {
     await keyboard.pressKey(Key.Return);
     await keyboard.releaseKey(Key.Return);
     logger.info(`[app.runner] type-search: pressed Enter to select match for "${plan.query}"`);
+
+    // Capture baseline screenshot after Enter — before any response/output appears
+    // Use the hidden variant so the ThinkDrop overlay doesn't taint the baseline.
+    const baselineShot = await _captureScreenshotOnlyHidden();
+    if (baselineShot.ok) {
+      logger.info(`[app.runner] type-search: baseline screenshot captured (${baselineShot.path})`);
+      return { ok: true, typed: value, subMode: 'type-search', searchPlan: plan, baselineScreenshotPath: baselineShot.path };
+    }
 
     return { ok: true, typed: value, subMode: 'type-search', searchPlan: plan };
   } catch (e) {
@@ -1139,7 +2188,7 @@ Return ONLY the number.`;
 
   const userPrompt = `Goal: ${goal}
 OCR text from screen:
-${(ocrText || '').slice(0, 500)}
+${(ocrText || '').slice(0, 1500)}
 Actions taken:
 ${historyStr}
 
@@ -1149,7 +2198,7 @@ Number (0-2)?`;
     const raw = await askWithMessages([
       { role: 'system', content: systemPrompt },
       { role: 'user', content: userPrompt },
-    ], { maxTokens: 5, temperature: 0, responseTimeoutMs: 5000, taskType: 'classification' });
+    ], { maxTokens: 5, temperature: 0, responseTimeoutMs: 10000, taskType: 'classification' });
 
     const _cleanRaw = (raw || '').toLowerCase().trim();
     if (!_cleanRaw) {
@@ -1220,40 +2269,52 @@ Number (0-2)?`;
 // Wraps actionMonitorWithBackoff polling infrastructure but replaces its
 // free-form JSON LLM calls with force classification (single number 0-3).
 
-async function _ocrVerifyMonitorState(ocrText, goal, appName) {
-  const systemPrompt = `You verify the state of a long-running operation in a desktop app by looking at the OCR text.
+// End-of-run LLM classifier: is the captured text actual content, an error,
+// or a loading/streaming indicator? Called ONCE after plateau detection
+// confirms the response has stopped growing — not in the monitoring loop.
+// This catches frozen spinners and error states that pixel stability can't.
+// Returns: 0 = content (accept as done), 1 = loading (rare after plateau),
+//          2 = error (return as failure), 3 = unknown (treat as content).
+async function _ocrVerifyMonitorState(ocrText, questionToAsk, appName) {
+  const systemPrompt = `You are checking whether a screen capture shows actual content, an error, or a loading state.
+The text below is the DIFF between a baseline capture and the current screen — it contains only the NEW content that appeared.
+The screen has already been confirmed stable (not changing) before this check.
 Return ONLY a single number — nothing else:
-0 = not sure (cannot determine — OCR is jumbled, incomplete, or unclear)
-1 = still processing (spinner, "thinking", "working", streaming text, progress bar, live timer)
-2 = done (response complete, build finished, upload complete — final state is visible)
-3 = error (clear failure — error message, crash, "failed", "cancelled")
+0 = actual content (normal response/output — accept as done)
+1 = loading/streaming indicator (spinner, "thinking", "generating", progress bar)
+2 = error message (crash, failure, "cancelled", "timed out", "error occurred")
+3 = unknown/ambiguous (treat as content — accept as done)
 
 Rules:
-- 2 (done): the OCR shows the final result (complete answer, "build succeeded", "upload complete", success toast). The input box is ready/enabled again. No spinner/progress/timer is still running.
-- 1 (still processing): the OCR shows a spinner, "thinking", "working", "generating", streaming text, a progress bar, or a live elapsed timer. The input box is disabled or a "Stop"/"Cancel" button is visible.
-- 0 (not sure): the OCR is jumbled, truncated, or unclear. Do NOT guess — return 0 so the system retries the capture.
-- 3 (error): the OCR shows an explicit error message, crash, "failed", "cancelled", or "timed out".
-- When in doubt → return 0 (not sure, retry)`;
+- 0 (content): the text contains a coherent response, answer, or output. Even if short or imperfect, if it's real content (not an error or loading indicator), return 0.
+- 1 (loading): the text is ONLY a loading indicator (spinner, "thinking...", "generating response...", progress bar). No actual content yet.
+- 2 (error): the text shows an explicit error message, crash, "failed", "cancelled", "timed out", or "error occurred".
+- 3 (unknown): the text is too short or ambiguous to classify. Treat as content (0) to avoid false negatives.
+- When in doubt → return 0 (content). The screen is already confirmed stable.`;
 
-  const userPrompt = `Goal: ${goal}
+  const userPrompt = `User's question: ${questionToAsk || '(unknown)'}
 App: ${appName || 'unknown'}
-OCR text (first 500 chars): ${(ocrText || '').slice(0, 500)}
+OCR text (first 2000 chars): ${(ocrText || '').slice(0, 2000)}
 
 Number (0-3)?`;
 
   try {
+    // Use taskType: 'complex' so the backend routes to a better model that
+    // actually returns a number (0|1|2|3) instead of prose like "Based on the
+    // provided...". This call is rare (only on stability), so the cost is
+    // negligible compared to calling a cheap model on every noisy change.
     const raw = await askWithMessages([
       { role: 'system', content: systemPrompt },
       { role: 'user', content: userPrompt },
-    ], { maxTokens: 5, temperature: 0, responseTimeoutMs: 5000, taskType: 'classification' });
+    ], { maxTokens: 5, temperature: 0, responseTimeoutMs: 10000, taskType: 'complex' });
 
     const _cleanRaw = (raw || '').toLowerCase().trim();
     if (!_cleanRaw) return { num: 0, reason: 'llm-empty-response' };
     const _numMatch = _cleanRaw.match(/\b([0123])\b/);
     const num = _numMatch ? parseInt(_numMatch[1], 10) : NaN;
     if (num >= 0 && num <= 3) {
-      logger.info(`[app.runner] _ocrVerifyMonitorState: ${num} for goal="${String(goal).slice(0, 60)}"`);
-      return { num, reason: ['not-sure', 'still-processing', 'done', 'error'][num] };
+      logger.info(`[app.runner] _ocrVerifyMonitorState: ${num} for question="${String(questionToAsk).slice(0, 60)}"`);
+      return { num, reason: ['content', 'loading', 'error', 'unknown'][num] };
     }
     return { num: 0, reason: 'invalid-llm-response' };
   } catch (e) {
@@ -1262,84 +2323,383 @@ Number (0-3)?`;
   }
 }
 
-async function _executeMonitoring({ goal, appName, mode = 'passive', maxDurationMs = 300000, actionHistory }) {
-  logger.info(`[app.runner] _executeMonitoring: goal="${String(goal).slice(0, 60)}", mode=${mode}, maxDuration=${maxDurationMs}ms`);
+// Two-phase monitoring: pixel-settle detection + content plateau + end-of-run LLM.
+//
+// Phase 1 — Settle detection (pixel diff, ~500ms polling):
+//   Capture screenshots every 500ms, compute pixel diff between CONSECUTIVE
+//   captures. When diff < 0.05% for 2 consecutive captures, the screen has
+//   settled. Pixel diff is the industry-standard technique (testdriverai,
+//   super-one, OpenAdapt all use it) — OCR re-segments between captures and
+//   is noisy for change detection, but pixels are deterministic.
+//
+// Phase 2 — Content extraction + plateau detection (OCR, no LLM in loop):
+//   Run OCR on the settled frame, compute text diff vs baseline. Track the
+//   diff length across cycles. When the diff stops growing by more than 5%
+//   for 2 consecutive cycles AND exceeds 100 chars, the response is complete.
+//   This is deterministic — no LLM judgment needed for completion detection.
+//
+// Phase 3 — End-of-run LLM check (one call):
+//   After plateau is confirmed (or cycles exhausted), do ONE LLM call to
+//   classify the captured text as content / error / loading. This catches
+//   frozen spinners and error states that pixel stability can't detect.
+//
+// Phase 4 — Fallback:
+//   If the screen never settles in 60s, or all cycles are exhausted, accept
+//   the last diff and run the end-of-run LLM check on it.
+async function _executeMonitoring({ goal, questionToAsk, appName, mode = 'passive', maxDurationMs = 300000, actionHistory, progressCallbackUrl, stepIndex, flowIndex, baselineScreenshotPath, signal }) {
+  logger.info(`[app.runner] _executeMonitoring: goal="${String(goal).slice(0, 60)}", question="${String(questionToAsk || '').slice(0, 60)}", mode=${mode}, maxDuration=${maxDurationMs}ms, baseline=${baselineScreenshotPath ? 'provided' : 'none'}`);
 
   const startTime = Date.now();
-  let checkInterval = 10000; // 10s initial
   let llmCalls = 0;
-  const MAX_LLM_CALLS = 20;
-  let stableCount = 0;
-  let sawProgress = false;
-  const STABLE_POLLS_FOR_COMPLETION = 2;
-  const CHANGE_THRESHOLD = 0.90;
 
-  // Simple text-based change detection (no embeddings — keep it lightweight)
-  let baselineText = await _captureOcr({ appName });
+  // ── Constants ──
+  const SETTLE_POLL_MS = 500;          // poll every 500ms
+  const SETTLE_TIMEOUT_MS = 30000;     // max wait for settling per cycle (was 60s)
+  const SETTLE_THRESHOLD = 0.001;     // 0.1% — includes 0.05-0.06% noise floor
+  const SETTLE_CONSECUTIVE = 2;        // need 2 consecutive stable captures
+  const MAX_SETTLE_CYCLES = 5;         // max settle→OCR rounds (~13s each = ~65s max)
+  const MIN_DIFF_CHARS = 100;          // minimum diff to consider as "response present"
+  const INSTANT_DONE_CHARS = 1500;     // diff this large on a stable screen = strong completion signal
+  const SETTLE_EXTENSION_MS = 10000;   // first extension when initial settle window times out
+  const SETTLE_EXTENSION_CAP_MS = 120000; // 2-minute total cap on extensions per cycle
 
-  while (Date.now() - startTime < maxDurationMs) {
-    await _sleep(checkInterval);
-    if (llmCalls >= MAX_LLM_CALLS) {
-      logger.warn(`[app.runner] _executeMonitoring: hit LLM call limit (${MAX_LLM_CALLS}) — returning timeout`);
-      return { ok: false, error: 'Monitoring LLM call limit reached', llmCalls, elapsed: Date.now() - startTime, finalStatus: 0 };
+  // 1. Use provided baseline or capture one immediately
+  let baselinePath = baselineScreenshotPath || null;
+  if (!baselinePath) {
+    const baselineShot = await _captureScreenshotOnlyHidden();
+    if (baselineShot.ok) {
+      baselinePath = baselineShot.path;
+      logger.info(`[app.runner] _executeMonitoring: captured baseline screenshot (${baselinePath})`);
     }
+  }
 
-    const currentText = await _captureOcr({ appName });
-    if (!currentText || currentText.trim().length < 10) {
-      logger.warn(`[app.runner] _executeMonitoring: empty OCR — retrying quickly`);
-      checkInterval = 3000;
-      continue;
+  // 2. Start OCR on baseline PNG in parallel with first settle cycle
+  const baselineOcrPromise = baselinePath
+    ? _ocrScreenshot(baselinePath, appName, signal)
+    : Promise.resolve({ rows: [], text: '', source: 'no-baseline' });
+
+  let lastDiffText = '';
+  let lastRows = [];
+  let lastDiffLen = 0;
+  let consecutivePlateau = 0;
+
+  // ── Accumulated text tracking ──
+  // During settling, the LLM may stream text that scrolls out of view before
+  // the final OCR. We run background OCR on intermediate screenshots, diff
+  // each against the previous one, and accumulate new lines. This captures
+  // content that would otherwise be lost to scrolling.
+  const accumulatedNewLines = new Set(); // trimmed lines seen as "new"
+  let prevOcrText = '';                  // full OCR text from last background capture
+  let bgOcrPromise = null;               // current background OCR promise
+  let bgOcrShotPath = null;              // path of the screenshot being OCR'd
+
+  // 3. Settle → OCR cycles (no LLM in loop)
+  for (let cycle = 0; cycle < MAX_SETTLE_CYCLES; cycle++) {
+    if (signal?.aborted) {
+      logger.info(`[app.runner] _executeMonitoring: aborted before cycle ${cycle + 1}`);
+      return { ok: false, error: 'aborted', llmCalls, elapsed: Date.now() - startTime, finalStatus: 0, aborted: true };
     }
+    if (Date.now() - startTime >= maxDurationMs) break;
 
-    // Detect change (simple text comparison)
-    const changed = currentText !== baselineText;
+    // ── Phase 1: Settle detection with pixel diff ──
+    _postProgress(progressCallbackUrl, {
+      type: 'app_flow:monitor_progress',
+      stepIndex, flowIndex, tier: 5,
+      elapsed: Math.round((Date.now() - startTime) / 1000),
+      nextCheckInMs: SETTLE_TIMEOUT_MS,
+      message: `Detecting response… (pixel settle, cycle ${cycle + 1}/${MAX_SETTLE_CYCLES})`,
+    });
 
-    if (!changed) {
-      // Screen is STABLE — check completion
-      stableCount++;
-      const shouldCheckCompletion =
-        stableCount >= STABLE_POLLS_FOR_COMPLETION &&
-        (sawProgress || stableCount >= STABLE_POLLS_FOR_COMPLETION * 2) &&
-        llmCalls < MAX_LLM_CALLS;
+    let prevShotPath = baselinePath;
+    let consecutiveStable = 0;
+    const settleStart = Date.now();
+    let settled = false;
 
-      if (shouldCheckCompletion) {
-        stableCount = 0;
-        llmCalls++;
-        const stateResult = await _ocrVerifyMonitorState(currentText, goal, appName);
-        if (stateResult.num === 2) {
-          logger.info(`[app.runner] _executeMonitoring: stability completion confirmed — ${stateResult.reason}`);
-          return { ok: true, summary: currentText, llmCalls, elapsed: Date.now() - startTime, finalStatus: 2 };
-        }
-        if (stateResult.num === 3) {
-          return { ok: false, error: currentText, llmCalls, elapsed: Date.now() - startTime, finalStatus: 3 };
-        }
-        // 0 (not sure) or 1 (still processing) — continue polling
+    // Settle deadline starts at SETTLE_TIMEOUT_MS and is extended (10s → 20s → 40s → 80s)
+    // when the screen keeps changing. Capped at SETTLE_EXTENSION_CAP_MS (120s) per cycle.
+    let settleDeadline = settleStart + SETTLE_TIMEOUT_MS;
+    let nextExtensionMs = SETTLE_EXTENSION_MS;
+    let extensionCount = 0;
+
+    while (Date.now() - startTime < maxDurationMs) {
+      if (signal?.aborted) {
+        logger.info(`[app.runner] _executeMonitoring: aborted during settle poll`);
+        return { ok: false, error: 'aborted', llmCalls, elapsed: Date.now() - startTime, finalStatus: 0, aborted: true };
       }
 
-      // Back off
-      checkInterval = mode === 'active'
-        ? Math.min(checkInterval * 1.2, 30000)
-        : Math.min(checkInterval * 1.5, 60000);
+      // If the current deadline has passed and we still haven't settled, try to extend.
+      if (Date.now() >= settleDeadline) {
+        const totalExtensions = settleDeadline - settleStart - SETTLE_TIMEOUT_MS;
+        if (totalExtensions + nextExtensionMs > SETTLE_EXTENSION_CAP_MS) {
+          logger.info(`[app.runner] _executeMonitoring: settle extension cap reached (${SETTLE_EXTENSION_CAP_MS / 1000}s) — proceeding to OCR`);
+          _postProgress(progressCallbackUrl, {
+            type: 'app_flow:monitor_progress',
+            stepIndex, flowIndex, tier: 5,
+            elapsed: Math.round((Date.now() - startTime) / 1000),
+            nextCheckInMs: 5000,
+            message: `Monitoring: still not stable after ${Math.round((Date.now() - settleStart) / 1000)}s — reading current frame`,
+          });
+          break;
+        }
+        extensionCount++;
+        settleDeadline = Date.now() + nextExtensionMs;
+        logger.info(`[app.runner] _executeMonitoring: settle cycle ${cycle + 1} not stable — extending +${nextExtensionMs / 1000}s (extension ${extensionCount}, total cap ${SETTLE_EXTENSION_CAP_MS / 1000}s)`);
+        _postProgress(progressCallbackUrl, {
+          type: 'app_flow:monitor_progress',
+          stepIndex, flowIndex, tier: 5,
+          elapsed: Math.round((Date.now() - startTime) / 1000),
+          nextCheckInMs: nextExtensionMs,
+          message: `Monitoring: still not stable, extending ${nextExtensionMs / 1000}s (extension ${extensionCount})`,
+        });
+        nextExtensionMs *= 2; // 10 → 20 → 40 → 80 → cap
+      }
+
+      await _sleep(SETTLE_POLL_MS, signal);
+      if (signal?.aborted) {
+        logger.info(`[app.runner] _executeMonitoring: aborted during settle wait`);
+        return { ok: false, error: 'aborted', llmCalls, elapsed: Date.now() - startTime, finalStatus: 0, aborted: true };
+      }
+
+      const newShot = await _captureScreenshotOnlyHidden();
+      if (!newShot.ok) {
+        logger.warn(`[app.runner] _executeMonitoring: screenshot capture failed during settle — retrying`);
+        continue;
+      }
+
+      const diffPercent = _pixelDiffPercent(prevShotPath, newShot.path);
+      const settleElapsed = Math.round((Date.now() - settleStart) / 1000);
+      logger.info(`[app.runner] _executeMonitoring: settle cycle ${cycle + 1} — pixel diff ${(diffPercent * 100).toFixed(2)}% (stable=${consecutiveStable}, ${settleElapsed}s, ext=${extensionCount})`);
+
+      if (diffPercent <= SETTLE_THRESHOLD) {
+        consecutiveStable++;
+        if (consecutiveStable >= SETTLE_CONSECUTIVE) {
+          settled = true;
+          prevShotPath = newShot.path; // keep the latest as the settled frame
+          break;
+        }
+      } else {
+        consecutiveStable = 0;
+      }
+      prevShotPath = newShot.path;
+
+      // ── Background OCR accumulation ──
+      // While waiting for the screen to settle, run OCR on intermediate
+      // screenshots in the background. Diff each against the previous OCR
+      // and accumulate new lines. This captures text that streams and then
+      // scrolls out of view before the final OCR.
+      //
+      // OCR takes ~5-7s, so we only start a new one when the previous one
+      // has completed. The screenshot is captured at the current moment
+      // (mid-stream) and OCR'd while we continue polling.
+      if (!bgOcrPromise && newShot.ok) {
+        bgOcrShotPath = newShot.path;
+        bgOcrPromise = _ocrScreenshot(newShot.path, appName, signal)
+          .catch(() => ({ text: '', rows: [] }));
+      }
+      // Check if the background OCR has completed
+      if (bgOcrPromise) {
+        const settled_now = await Promise.race([
+          bgOcrPromise.then(r => ({ done: true, result: r })),
+          _sleep(50, signal).then(() => ({ done: false })),
+        ]);
+        if (settled_now.done) {
+          const bgResult = settled_now.result;
+          if (bgResult && bgResult.text && bgResult.text.trim().length > 10) {
+            // Diff against previous OCR — keep only new lines not seen before
+            const bgLines = bgResult.text.split('\n').map(l => l.trim()).filter(l => l.length > 3);
+            let newCount = 0;
+            for (const line of bgLines) {
+              if (!accumulatedNewLines.has(line)) {
+                accumulatedNewLines.add(line);
+                newCount++;
+              }
+            }
+            if (newCount > 0) {
+              logger.info(`[app.runner] _executeMonitoring: bg OCR accumulated ${newCount} new line(s) (total ${accumulatedNewLines.size}, cycle ${cycle + 1})`);
+            }
+            prevOcrText = bgResult.text;
+          }
+          bgOcrPromise = null;
+          bgOcrShotPath = null;
+        }
+      }
+    }
+
+    if (!settled) {
+      logger.info(`[app.runner] _executeMonitoring: settle cycle ${cycle + 1} ended without stability after ${Math.round((Date.now() - settleStart) / 1000)}s (extensions=${extensionCount})`);
+    } else {
+      logger.info(`[app.runner] _executeMonitoring: screen settled after ${Math.round((Date.now() - settleStart) / 1000)}s (cycle ${cycle + 1}, extensions=${extensionCount})`);
+    }
+
+    // Wait for any pending background OCR before proceeding to Phase 2
+    if (bgOcrPromise) {
+      logger.info(`[app.runner] _executeMonitoring: waiting for background OCR to complete before Phase 2`);
+      try {
+        const bgResult = await bgOcrPromise;
+        if (bgResult && bgResult.text && bgResult.text.trim().length > 10) {
+          const bgLines = bgResult.text.split('\n').map(l => l.trim()).filter(l => l.length > 3);
+          let newCount = 0;
+          for (const line of bgLines) {
+            if (!accumulatedNewLines.has(line)) {
+              accumulatedNewLines.add(line);
+              newCount++;
+            }
+          }
+          if (newCount > 0) {
+            logger.info(`[app.runner] _executeMonitoring: final bg OCR added ${newCount} new line(s) (total ${accumulatedNewLines.size})`);
+          }
+          prevOcrText = bgResult.text;
+        }
+      } catch (_) { /* non-fatal */ }
+      bgOcrPromise = null;
+      bgOcrShotPath = null;
+    }
+
+    // ── Phase 2: OCR + content plateau detection ──
+    if (signal?.aborted) {
+      return { ok: false, error: 'aborted', llmCalls, elapsed: Date.now() - startTime, finalStatus: 0, aborted: true };
+    }
+
+    _postProgress(progressCallbackUrl, {
+      type: 'app_flow:monitor_progress',
+      stepIndex, flowIndex, tier: 5,
+      elapsed: Math.round((Date.now() - startTime) / 1000),
+      nextCheckInMs: 5000,
+      message: `Reading response… (OCR, cycle ${cycle + 1}/${MAX_SETTLE_CYCLES})`,
+    });
+
+    const finalOcr = await _ocrScreenshot(prevShotPath, appName, signal);
+    if (signal?.aborted) {
+      logger.info(`[app.runner] _executeMonitoring: aborted during OCR`);
+      return { ok: false, error: 'aborted', llmCalls, elapsed: Date.now() - startTime, finalStatus: 0, aborted: true };
+    }
+    if (!finalOcr.text || finalOcr.text.trim().length < 10) {
+      logger.warn(`[app.runner] _executeMonitoring: empty OCR on settled frame — retrying next cycle`);
       continue;
     }
 
-    // Screen changed → progress
-    sawProgress = true;
-    stableCount = 0;
-    baselineText = currentText;
+    lastRows = finalOcr.rows;
 
-    // Check state on change
+    // Compute flat diff vs baseline (all OCR text — the real answer text)
+    const baselineOcr = await baselineOcrPromise;
+    const baselineText = baselineOcr.text || '';
+    const flatDiffText = _computeOcrDiff(baselineText, finalOcr.text);
+
+    // Merge accumulated new lines from background OCR with the final diff.
+    // The accumulated lines capture text that streamed and scrolled out of
+    // view before the final OCR. Add any accumulated lines not already in
+    // the final diff.
+    if (accumulatedNewLines.size > 0) {
+      const finalDiffLines = new Set(flatDiffText.split('\n').map(l => l.trim()).filter(l => l.length > 3));
+      const missingFromFinal = [...accumulatedNewLines].filter(l => !finalDiffLines.has(l));
+      if (missingFromFinal.length > 0) {
+        const merged = flatDiffText + '\n' + missingFromFinal.join('\n');
+        logger.info(`[app.runner] _executeMonitoring: merged ${missingFromFinal.length} accumulated line(s) into final diff (${flatDiffText.length} → ${merged.length} chars)`);
+        lastDiffText = merged;
+      } else {
+        lastDiffText = flatDiffText;
+      }
+    } else {
+      lastDiffText = flatDiffText;
+    }
+
+    const diffLen = flatDiffText.length;
+    logger.info(`[app.runner] _executeMonitoring: OCR diff=${diffLen} chars (cycle ${cycle + 1}, last=${lastDiffLen})`);
+
+    if (diffLen < MIN_DIFF_CHARS) {
+      logger.info(`[app.runner] _executeMonitoring: diff too short (${diffLen} chars) — retrying next cycle`);
+      lastDiffLen = diffLen;
+      continue;
+    }
+
+    const growth = diffLen - lastDiffLen;
+    const growthPercent = lastDiffLen > 0 ? growth / lastDiffLen : 1;
+    lastDiffLen = diffLen;
+
+    // Plateau detection: the diff has stopped changing for 2 consecutive settled cycles.
+    if (settled && Math.abs(growth) < 50 && Math.abs(growthPercent) < 0.05) {
+      consecutivePlateau++;
+      if (consecutivePlateau >= 2) {
+        logger.info(`[app.runner] _executeMonitoring: plateau confirmed — diff stopped growing at ${diffLen} chars (cycle ${cycle + 1})`);
+        break;
+      }
+    } else {
+      consecutivePlateau = 0;
+    }
+
+    // A large diff on a settled screen is a fast path, but only if the diff has stopped growing.
+    // Do not break immediately; wait for plateau confirmation in the next cycle.
+    if (settled && diffLen >= INSTANT_DONE_CHARS) {
+      logger.info(`[app.runner] _executeMonitoring: large settled diff — ${diffLen} chars (cycle ${cycle + 1})`);
+    }
+
+    if (!settled) {
+      logger.info(`[app.runner] _executeMonitoring: diff ${diffLen} chars but screen not settled — continuing to next cycle`);
+    } else {
+      logger.info(`[app.runner] _executeMonitoring: diff ${diffLen} chars — continuing to confirm not growing`);
+    }
+  }
+
+  // ── Phase 2.5: Scroll to bottom so overflowed content is visible ──
+  // Chat/AI panels often stream content past the visible viewport. Jumping to
+  // the bottom before the final OCR ensures we capture the latest generated text.
+  if (lastDiffText.length >= MIN_DIFF_CHARS) {
+    _postProgress(progressCallbackUrl, {
+      type: 'app_flow:monitor_progress',
+      stepIndex, flowIndex, tier: 5,
+      elapsed: Math.round((Date.now() - startTime) / 1000),
+      nextCheckInMs: 3000,
+      message: `Scrolling to latest content…`,
+    });
+    const scrolled = await _scrollToBottom({ appName });
+    if (scrolled) {
+      const postScrollShot = await _captureScreenshotOnlyHidden();
+      if (postScrollShot.ok) {
+        const postScrollOcr = await _ocrScreenshot(postScrollShot.path, appName, signal);
+        if (postScrollOcr.text && postScrollOcr.text.length > 0) {
+          const baselineOcr = await baselineOcrPromise;
+          const newDiff = _computeOcrDiff(baselineOcr.text || '', postScrollOcr.text);
+          if (newDiff.length > lastDiffText.length) {
+            logger.info(`[app.runner] _executeMonitoring: post-scroll diff grew ${lastDiffText.length} → ${newDiff.length} chars`);
+            lastDiffText = newDiff;
+            lastRows = postScrollOcr.rows;
+          } else {
+            logger.info(`[app.runner] _executeMonitoring: post-scroll diff ${newDiff.length} chars did not exceed ${lastDiffText.length} — keeping pre-scroll capture`);
+          }
+        }
+      }
+    }
+  }
+
+  // ── Phase 3: End-of-run LLM check (one call) ──
+  // Classify the captured text as content / error / loading. This catches
+  // frozen spinners and error states that pixel stability can't detect.
+  if (lastDiffText.length >= MIN_DIFF_CHARS) {
+    _postProgress(progressCallbackUrl, {
+      type: 'app_flow:monitor_progress',
+      stepIndex, flowIndex, tier: 5,
+      elapsed: Math.round((Date.now() - startTime) / 1000),
+      nextCheckInMs: 8000,
+      message: `Verifying response… (final check, ${lastDiffText.length} chars)`,
+    });
+
     llmCalls++;
-    const stateResult = await _ocrVerifyMonitorState(currentText, goal, appName);
+    const stateResult = await _ocrVerifyMonitorState(lastDiffText, questionToAsk || goal, appName);
     if (stateResult.num === 2) {
-      logger.info(`[app.runner] _executeMonitoring: completion confirmed on change — ${stateResult.reason}`);
-      return { ok: true, summary: currentText, llmCalls, elapsed: Date.now() - startTime, finalStatus: 2 };
+      // Error detected
+      logger.info(`[app.runner] _executeMonitoring: error detected by LLM — ${stateResult.reason}`);
+      return { ok: false, error: lastDiffText, llmCalls, elapsed: Date.now() - startTime, finalStatus: 3 };
     }
-    if (stateResult.num === 3) {
-      return { ok: false, error: currentText, llmCalls, elapsed: Date.now() - startTime, finalStatus: 3 };
-    }
-    // 0 (not sure) or 1 (still processing) — reset interval and continue
-    checkInterval = 10000;
+    // num === 0 (content) or 1 (loading — unlikely after plateau) → accept as done
+    logger.info(`[app.runner] _executeMonitoring: completion confirmed (LLM=${stateResult.num}, ${lastDiffText.length} chars) — ${stateResult.reason}`);
+    return { ok: true, summary: lastDiffText, chatText: lastDiffText, rows: lastRows, llmCalls, elapsed: Date.now() - startTime, finalStatus: 2 };
+  }
+
+  // ── Phase 4: Fallback — capture full OCR and accept it ──
+  const { rows, text } = await _captureStructuredOcr({ appName });
+  if (text && text.trim().length > 50) {
+    logger.info(`[app.runner] _executeMonitoring: fallback — accepting full OCR (${text.length} chars)`);
+    return { ok: true, summary: text, chatText: _extractChatArea(rows), rows, llmCalls, elapsed: Date.now() - startTime, finalStatus: 2, accepted: true };
   }
 
   return { ok: false, error: 'Monitoring timeout', llmCalls, elapsed: Date.now() - startTime, finalStatus: 0 };
@@ -1362,6 +2722,34 @@ async function _executeAppShortcut({ appName, action, shortcutOverride, verifyWi
 }
 
 // Tier 2: Just-type — dispatches to 5 sub-mode executors (see above)
+
+// Scroll the focused app to the bottom of its content area. Used before final
+// OCR in monitoring so any overflowed chat/AI response text becomes visible.
+async function _scrollToBottom({ appName }) {
+  try {
+    const appAgent = require('./app.agent.cjs');
+    // Cmd+End is the macOS "jump to bottom" shortcut in editors/chat panels.
+    let result = await appAgent.actionExecuteShortcut({
+      appName, shortcutOverride: 'Cmd+End', skipFocusCheck: true,
+    });
+    if (!result?.ok) {
+      // Fallback for apps that use Ctrl+End (e.g. some terminals, web views).
+      result = await appAgent.actionExecuteShortcut({
+        appName, shortcutOverride: 'Ctrl+End', skipFocusCheck: true,
+      });
+    }
+    if (result?.ok) {
+      logger.info(`[app.runner] _scrollToBottom: jumped to bottom in ${appName}`);
+    } else {
+      logger.warn(`[app.runner] _scrollToBottom: jump failed in ${appName} — ${result?.error || 'unknown'}`);
+    }
+    await _sleep(400); // brief settle so the scroll lands before the next capture
+    return result?.ok === true;
+  } catch (err) {
+    logger.warn(`[app.runner] _scrollToBottom failed: ${err.message}`);
+    return false;
+  }
+}
 
 // Tier 3: Global Shortcuts — uses NutJS directly
 async function _executeGlobalShortcut({ appName, key }) {
@@ -1443,7 +2831,7 @@ async function _executeSearchText({ appName, searchText }) {
 // ── 9. Main App-Flow Loop ────────────────────────────────────────────────────
 // Mirrors runIterativeNavigation in instruction.runner.cjs.
 
-async function runAppFlow({ goal, appName, category, bounds, shortcuts, timeoutMs = 120000, agentContext = null, progressCallbackUrl = null, stepIndex = 0 }) {
+async function runAppFlow({ goal, appName, category, bounds, shortcuts, resolvedFilePath = null, timeoutMs = 120000, agentContext = null, progressCallbackUrl = null, stepIndex = 0, signal = null }) {
   if (!goal) return { ok: false, error: 'goal is required' };
   if (!appName) return { ok: false, error: 'appName is required' };
 
@@ -1452,6 +2840,9 @@ async function runAppFlow({ goal, appName, category, bounds, shortcuts, timeoutM
   const actionHistory = [];
   let triedTiers = new Set();
   let flowIndex = 0;
+  let finalOcrFromMonitor = null; // reused from monitoring to avoid extra capture
+  const stepFailures = {}; // key: `${tier}:${actionLabel}` → count
+  let lastTier = 0; // tracks previous tier for settle-delay decisions
 
   logger.info(`[app.runner] runAppFlow: goal="${String(goal).slice(0, 80)}", app="${appName}", category=${category || 'unknown'}, timeout=${timeoutMs}ms`);
 
@@ -1486,8 +2877,10 @@ async function runAppFlow({ goal, appName, category, bounds, shortcuts, timeoutM
   }
   logger.info(`[app.runner] runAppFlow: focused app confirmed: "${focusResult.appName}"`);
 
-  // 2. Capture initial OCR state
-  let currentOcr = await _captureOcr({ appName });
+  // 2. Capture initial OCR state (kept for initial-vs-final diff verification)
+  const initialOcr = await _captureOcr({ appName });
+  let currentOcr = initialOcr;
+  let baselineScreenshotPath = null; // set by Just-Type → Enter for monitoring diff
   logger.info(`[app.runner] runAppFlow: initial OCR (${currentOcr.length} chars)`);
 
   // 3. Build shortcut labels for LLM prompts
@@ -1502,7 +2895,7 @@ async function runAppFlow({ goal, appName, category, bounds, shortcuts, timeoutM
   if (signature) {
     const cached = _loadPlaybookCache(appName, signature);
     if (cached) {
-      appFlow = cached.playbook;
+      appFlow = _substitutePlaybookEntities(cached.playbook, cached.entities, signature.entities);
       logger.info(`[app.runner] runAppFlow: playbook cache HIT (type=${signature.type}, subGoals=[${signature.subGoals.join(',')}])`);
     }
   }
@@ -1523,8 +2916,12 @@ async function runAppFlow({ goal, appName, category, bounds, shortcuts, timeoutM
     }
     appFlow = await _computeAppFlowV2(goal, category, shortcuts, appName, signature);
     if (appFlow && signature) {
+      appFlow = _validateAndFixFlowSubGoals(appFlow, signature);
       _savePlaybookCache(appName, signature, appFlow, signature.entities);
     }
+  } else if (appFlow && signature) {
+    // Validate cached playbooks too (old caches may lack subGoal fields)
+    appFlow = _validateAndFixFlowSubGoals(appFlow, signature);
   }
 
   // Emit computed flow so the UI can show the planned steps
@@ -1539,27 +2936,34 @@ async function runAppFlow({ goal, appName, category, bounds, shortcuts, timeoutM
 
   // 5. Main loop
   while (Date.now() - startTime < timeoutMs) {
-    // 5a. Capture current OCR
-    currentOcr = await _captureOcr({ appName });
+    if (signal?.aborted) {
+      logger.info(`[app.runner] runAppFlow: aborted`);
+      return { ok: false, error: 'aborted', actionHistory, elapsed: Date.now() - startTime, aborted: true };
+    }
+    // If the pre-computed flow is exhausted, break immediately and proceed to
+    // final diff verification. Do NOT call _selectAppTierLLM — it loops forever
+    // when the LLM returns prose instead of numbers.
+    if (appFlow && flowIndex >= appFlow.length) {
+      logger.info(`[app.runner] runAppFlow: App-Flow exhausted (flowIndex=${flowIndex}/${appFlow.length}) — proceeding to final verification`);
+      break;
+    }
 
-    // 5b. Select tier (force classification)
+    // 5b. Select tier (force classification) — no per-iteration OCR capture;
+    //     for app.agent, shortcuts are near-instant and per-step OCR is too
+    //     slow + unreliable. Final verification uses initial-vs-final diff.
     const tier = await _selectAppTierLLM(
       goal, actionHistory, category, shortcutCount, shortcutLabels,
       currentOcr, null, appFlow, flowIndex, triedTiers
     );
 
+    if (tier === -2) {
+      // Verifier needs wait/retry — do not advance flowIndex, just continue
+      continue;
+    }
+
     if (tier === 0) {
-      // Done
-      logger.info(`[app.runner] runAppFlow: DONE — goal achieved`);
-      _postProgress(progressCallbackUrl, {
-        type: 'app_flow:done',
-        stepIndex,
-        ok: true,
-        flowIndex,
-        totalSteps: appFlow?.length || 0,
-        actionHistory,
-      });
-      return { ok: true, output: currentOcr.slice(0, 500), actionHistory, elapsed: Date.now() - startTime };
+      // Flow complete — do final initial-vs-final diff verification
+      break;
     }
 
     if (tier === -1) {
@@ -1581,10 +2985,7 @@ async function runAppFlow({ goal, appName, category, bounds, shortcuts, timeoutM
       continue;
     }
 
-    // 5c. Capture before-OCR for step verification
-    const beforeOcr = currentOcr;
-
-    // 5d. Determine step goal from App-Flow or use generic
+    // 5c. Determine step goal from App-Flow or use generic
     const stepGoal = (appFlow && flowIndex < appFlow.length)
       ? appFlow[flowIndex].action || `tier ${tier} action`
       : `tier ${tier} action`;
@@ -1603,6 +3004,7 @@ async function runAppFlow({ goal, appName, category, bounds, shortcuts, timeoutM
 
     // 5e. Execute tier
     let stepResult;
+    let lastShortcutAction = null;
     let stepActionLabel = '';
 
     try {
@@ -1627,11 +3029,38 @@ async function runAppFlow({ goal, appName, category, bounds, shortcuts, timeoutM
           }
         }
         stepActionLabel = `App Shortcut: ${shortcutAction || 'auto'}`;
+        lastShortcutAction = shortcutAction || null;
+        // If this is a done/complete/finish sentinel, break the flow instead of
+        // trying to execute a non-existent shortcut (which would abort the flow).
+        const _DONE_SENTINELS = new Set(['done', 'complete', 'finish', 'end', 'noop']);
+        if (shortcutAction && _DONE_SENTINELS.has(shortcutAction.toLowerCase())) {
+          logger.info(`[app.runner] runAppFlow: flow-complete sentinel "${shortcutAction}" — breaking loop`);
+          flowIndex++;
+          break;
+        }
         _postProgress(progressCallbackUrl, {
           type: 'app_flow:action_start',
           stepIndex, flowIndex, tier, action: stepActionLabel,
         });
         stepResult = await _executeAppShortcut({ appName, action: shortcutAction });
+
+        // Post-focus_ai verification: confirm the AI input panel actually opened.
+        // If not, retry the shortcut once after a longer delay. Without this,
+        // the subsequent Just-type step types into the void.
+        if (shortcutAction === 'focus_ai' && stepResult?.ok) {
+          await _sleep(1000); // allow panel animation
+          let verifyOcr;
+          try { verifyOcr = await _captureOcr({ appName }); } catch (_) { verifyOcr = ''; }
+          const hasInput = /(ask|message|prompt|chat|input|type.*here|send|devin|copilot)/i.test(verifyOcr);
+          if (!hasInput) {
+            logger.warn(`[app.runner] focus_ai verification: no input field detected in OCR — retrying ${shortcutAction}`);
+            await _sleep(1500);
+            stepResult = await _executeAppShortcut({ appName, action: shortcutAction });
+            if (stepResult?.ok) await _sleep(1000);
+          } else {
+            logger.info(`[app.runner] focus_ai verification: input field detected ✓`);
+          }
+        }
       } else if (tier === 2) {
         // Just-type — extract value from flow or goal
         const flowAction = (appFlow && flowIndex < appFlow.length) ? appFlow[flowIndex].action : '';
@@ -1641,7 +3070,34 @@ async function runAppFlow({ goal, appName, category, bounds, shortcuts, timeoutM
           type: 'app_flow:action_start',
           stepIndex, flowIndex, tier, action: stepActionLabel,
         });
+
+        // Verify the target app is focused before typing — prevents typing
+        // into the wrong window (e.g. after a shell.run step that opened the
+        // app but focus wasn't verified).
+        try {
+          const appAgent = require('./app.agent.cjs');
+          const focusCheck = await appAgent.verifyAppFocused({ appName, waitMs: 500 });
+          if (!focusCheck.focused) {
+            logger.warn(`[app.runner] runAppFlow: Just-type — ${appName} not focused (detected: "${focusCheck.appName || 'unknown'}"), re-focusing…`);
+            const refocus = await _focusApp(appName, { maxRetries: 2, waitMs: 3000 });
+            if (!refocus.ok) {
+              stepResult = { ok: false, error: `Cannot type: ${appName} is not focused (detected: ${focusCheck.appName || 'unknown'})` };
+              lastTier = tier;
+              continue;
+            }
+            await _sleep(500); // brief settle after re-focus
+          }
+        } catch (e) {
+          logger.warn(`[app.runner] runAppFlow: focus check before Just-type failed: ${e.message} — proceeding anyway`);
+        }
+
         stepResult = await _executeJustType({ appName, value, goal, appCategory: category, actionHistory, agentContext });
+
+        // Store baseline screenshot path from Just-Type → Enter for monitoring diff
+        if (stepResult?.baselineScreenshotPath) {
+          baselineScreenshotPath = stepResult.baselineScreenshotPath;
+          logger.info(`[app.runner] runAppFlow: stored baseline screenshot from Just-Type (${baselineScreenshotPath})`);
+        }
       } else if (tier === 3) {
         // Global Shortcuts — extract key from flow or default to Enter
         const flowAction = (appFlow && flowIndex < appFlow.length) ? appFlow[flowIndex].action : '';
@@ -1671,135 +3127,235 @@ async function runAppFlow({ goal, appName, category, bounds, shortcuts, timeoutM
           type: 'app_flow:action_start',
           stepIndex, flowIndex, tier, action: stepActionLabel,
         });
+        // Extract the user's actual question from the goal signature entities
+        // so the LLM verifier can ask "does this text answer THIS question?"
+        // instead of the generic step goal "monitor until response received".
+        const questionToAsk = signature?.entities?.question || stepGoal;
         stepResult = await _executeMonitoring({
-          goal: stepGoal, appName, mode: 'passive',
+          goal: stepGoal, questionToAsk, appName, mode: 'passive',
           maxDurationMs: Math.min(timeoutMs - (Date.now() - startTime), 300000),
           actionHistory,
+          progressCallbackUrl, stepIndex, flowIndex,
+          baselineScreenshotPath,
+          signal,
         });
+        // Reuse monitoring's final OCR as the final diff OCR (saves ~10s capture)
+        if (stepResult?.ok && stepResult.summary) {
+          finalOcrFromMonitor = stepResult.summary;
+        }
       } else if (tier === 6) {
-        // shell.run — open file/folder/document via shell command
-        const flowAction = (appFlow && flowIndex < appFlow.length) ? appFlow[flowIndex].action : '';
-        // Extract filename from flow action or entities
-        let filename = signature?.entities?.filename;
-        if (!filename) {
-          const fnMatch = flowAction.match(/'([^']+)'/);
-          if (fnMatch) filename = fnMatch[1];
+        // shell.run — open file/folder/document, new file, new window, close window, goto line
+        const flowStep = (appFlow && flowIndex < appFlow.length) ? appFlow[flowIndex] : {};
+        let subGoal = flowStep.subGoal;
+        const flowAction = flowStep.action || '';
+
+        // Last-resort fallback: if subGoal is missing (shouldn't happen after
+        // _validateAndFixFlowSubGoals, but defensive for old cached playbooks),
+        // infer from action text with broadened patterns.
+        if (!subGoal) {
+          if (/\bnew\s+(?:file|doc|document|page)\b|\bcreate\s+(?:a\s+|the\s+)?(?:new\s+)?(?:temp|temporary|blank|empty|untitled)\s+(?:file|doc|document)\b/i.test(flowAction)) subGoal = 'new_file';
+          else if (/\bnew\s+window\b/i.test(flowAction)) subGoal = 'new_window';
+          else if (/\bclose\s+window\b|\bquit\s+app/i.test(flowAction)) subGoal = 'close_window';
+          else if (/\b(?:goto|go\s+to)\s+line\b/i.test(flowAction)) subGoal = 'goto_line';
+          else subGoal = 'open_file'; // default
+          logger.warn(`[app.runner] runAppFlow: tier 6 subGoal missing — inferred "${subGoal}" from action "${flowAction.slice(0, 60)}"`);
         }
-        if (!filename) {
-          // Try to extract from goal
-          const goalMatch = goal.match(/(\S+\.\S+)/);
-          if (goalMatch) filename = goalMatch[1];
+
+        if (subGoal === 'new_file') {
+          // new_file via shell.run: create temp file with inferred extension + open in app
+          const content = signature?.entities?.content || signature?.entities?.text || '';
+          stepActionLabel = `shell.run: new file in ${appName}`;
+          _postProgress(progressCallbackUrl, {
+            type: 'app_flow:action_start',
+            stepIndex, flowIndex, tier, action: stepActionLabel,
+          });
+          stepResult = await _newFileWithShell(appName, content);
+          // Validate that a temp file was actually created and opened
+          if (stepResult?.ok && !stepResult.opened) {
+            stepResult = { ok: false, error: 'new_file succeeded but no temp file path was returned' };
+          }
+
+        } else if (subGoal === 'new_window') {
+          // new_window via shell.run: open -n -a "App" or code -n
+          stepActionLabel = `shell.run: new window for ${appName}`;
+          _postProgress(progressCallbackUrl, {
+            type: 'app_flow:action_start',
+            stepIndex, flowIndex, tier, action: stepActionLabel,
+          });
+          stepResult = await _newWindowWithShell(appName);
+
+        } else if (subGoal === 'close_window') {
+          // close_window via shell.run: osascript quit app
+          stepActionLabel = `shell.run: close ${appName}`;
+          _postProgress(progressCallbackUrl, {
+            type: 'app_flow:action_start',
+            stepIndex, flowIndex, tier, action: stepActionLabel,
+          });
+          stepResult = await _closeWindowWithShell(appName);
+
+        } else if (subGoal === 'goto_line') {
+          // goto_line via shell.run: code -g <file:line> (falls back to tier 1 Ctrl+G if no file path)
+          const lineNumber = signature?.entities?.lineNumber || signature?.entities?.line;
+          let filename = resolvedFilePath || signature?.entities?.filename;
+          // Fallback: check for pre-resolved file path injected into goal text
+          if (!filename) {
+            const resolvedMatch = goal.match(/\[Resolved file path:\s*(\S+)\]/);
+            if (resolvedMatch) filename = resolvedMatch[1];
+          }
+          // Fallback: extract any absolute or relative path with a file extension from the goal
+          if (!filename) {
+            const goalMatch = goal.match(/(\S*\/[A-Za-z0-9_\-]+(?:\.[A-Za-z0-9]+)+)/);
+            if (goalMatch) filename = goalMatch[1];
+          }
+          const gotoResult = await _gotoLineWithShell(appName, filename, lineNumber);
+          if (gotoResult === null) {
+            // Not supported (no file path or app doesn't support -g) — fall back to tier 1 Ctrl+G
+            stepActionLabel = `App Shortcut: goto_line (fallback from shell.run)`;
+            _postProgress(progressCallbackUrl, {
+              type: 'app_flow:action_start',
+              stepIndex, flowIndex, tier: 1, action: stepActionLabel,
+            });
+            stepResult = await _executeAppShortcut({ appName, action: 'goto_line' });
+          } else {
+            stepActionLabel = `shell.run: goto line ${lineNumber} in ${filename || appName}`;
+            _postProgress(progressCallbackUrl, {
+              type: 'app_flow:action_start',
+              stepIndex, flowIndex, tier, action: stepActionLabel,
+            });
+            stepResult = gotoResult;
+          }
+
+        } else {
+          // Default: open file/folder/document via shell.run (open_file, open_folder, open_document)
+          // Prefer structured resolved file path from preflight (passed through
+          // planSkillsV2 → app.agent → runAppFlow). This avoids re-parsing the
+          // goal text with regex, which is brittle and can match the wrong
+          // quoted string (e.g. the app name instead of the file path).
+          let filename = resolvedFilePath
+            || signature?.entities?.filename;
+          // Fallback: check for pre-resolved file path injected into goal text
+          if (!filename) {
+            const resolvedMatch = goal.match(/\[Resolved file path:\s*(\S+)\]/);
+            if (resolvedMatch) filename = resolvedMatch[1];
+          }
+          // Fallback: extract any absolute or relative path with a file extension from the goal
+          if (!filename) {
+            const goalMatch = goal.match(/(\S*\/[A-Za-z0-9_\-]+(?:\.[A-Za-z0-9]+)+)/);
+            if (goalMatch) filename = goalMatch[1];
+          }
+          // Last resort: parse the flow action, skipping the app-name quote and taking the path quote
+          if (!filename && flowAction) {
+            const pathMatch = flowAction.match(/open -a '[^']+' '([^']+)'/);
+            if (pathMatch) filename = pathMatch[1];
+          }
+          stepActionLabel = `shell.run: open "${filename}" in ${appName}`;
+          _postProgress(progressCallbackUrl, {
+            type: 'app_flow:action_start',
+            stepIndex, flowIndex, tier, action: stepActionLabel,
+          });
+          stepResult = await _openFileWithShell(appName, filename);
         }
-        stepActionLabel = `shell.run: open "${filename}" in ${appName}`;
-        _postProgress(progressCallbackUrl, {
-          type: 'app_flow:action_start',
-          stepIndex, flowIndex, tier, action: stepActionLabel,
-        });
-        stepResult = await _openFileWithShell(appName, filename);
       }
     } catch (e) {
       stepResult = { ok: false, error: e.message };
     }
 
-    // 5f. Capture after-OCR (skip for tier 5 — monitor already captured final state)
-    const afterOcr = tier === 5 ? (stepResult?.summary || '') : await _captureOcr({ appName });
-
-    // 5g. Verify step (before/after diff)
-    if (tier === 5) {
-      // Monitoring tier — its result IS the verification
-      if (stepResult?.ok) {
-        actionHistory.push(`${stepActionLabel} → verified (monitor complete)`);
-        _postProgress(progressCallbackUrl, {
-          type: 'app_flow:action_done',
-          stepIndex, flowIndex, tier, ok: true, action: stepActionLabel,
-          message: 'Monitoring complete',
-        });
-        flowIndex++;
-        triedTiers.clear();
-        // Check if this was the last step
-        if (appFlow && flowIndex >= appFlow.length) {
-          logger.info(`[app.runner] runAppFlow: App-Flow complete after monitoring`);
-          _postProgress(progressCallbackUrl, {
-            type: 'app_flow:done',
-            stepIndex, ok: true, flowIndex, totalSteps: appFlow.length, actionHistory,
-          });
-          return { ok: true, output: stepResult.summary?.slice(0, 500) || '', actionHistory, elapsed: Date.now() - startTime };
-        }
-      } else {
-        actionHistory.push(`${stepActionLabel} → FAILED (${stepResult?.error || 'monitor failed'})`);
-        _postProgress(progressCallbackUrl, {
-          type: 'app_flow:action_done',
-          stepIndex, flowIndex, tier, ok: false, action: stepActionLabel,
-          error: stepResult?.error || 'monitor failed',
-        });
-        triedTiers.add(tier);
-        if (signature) _markPlaybookCacheFail(appName, signature);
-      }
-    } else if (tier === 6) {
-      // shell.run tier — step result IS the verification (open command succeeded or not)
-      if (stepResult?.ok) {
-        actionHistory.push(`${stepActionLabel} → verified (file opened)`);
-        _postProgress(progressCallbackUrl, {
-          type: 'app_flow:action_done',
-          stepIndex, flowIndex, tier, ok: true, action: stepActionLabel,
-        });
-        flowIndex++;
-        triedTiers.clear();
-      } else {
-        actionHistory.push(`${stepActionLabel} → FAILED (${stepResult?.error || 'open failed'})`);
-        _postProgress(progressCallbackUrl, {
-          type: 'app_flow:action_done',
-          stepIndex, flowIndex, tier, ok: false, action: stepActionLabel,
-          error: stepResult?.error || 'open failed',
-        });
-        triedTiers.add(tier);
-      }
+    // 5f. Verify step — for app.agent, shortcuts are near-instant; trust the
+    //     step result + delay. No per-step OCR capture (too slow, unreliable
+    //     for subtle focus changes, and falsely declares "done" mid-flow).
+    //     Final verification is done via initial-vs-final diff after the loop.
+    if (stepResult?.ok) {
+      actionHistory.push(`${stepActionLabel} → done`);
+      _postProgress(progressCallbackUrl, {
+        type: 'app_flow:action_done',
+        stepIndex, flowIndex, tier, ok: true, action: stepActionLabel,
+      });
+      flowIndex++;
+      triedTiers.clear();
     } else {
-      // Other tiers — verify via before/after OCR diff
-      const stepVerify = await _ocrVerifyAppStep(beforeOcr, afterOcr, stepGoal, actionHistory);
-      if (stepVerify.num === 1) {
-        // Step succeeded
-        actionHistory.push(`${stepActionLabel} → verified`);
-        _postProgress(progressCallbackUrl, {
-          type: 'app_flow:action_done',
-          stepIndex, flowIndex, tier, ok: true, action: stepActionLabel,
-        });
-        flowIndex++;
-        triedTiers.clear();
-      } else if (stepVerify.num === 2) {
-        // Loading — wait and retry
-        actionHistory.push(`${stepActionLabel} → loading`);
-        _postProgress(progressCallbackUrl, {
-          type: 'app_flow:action_done',
-          stepIndex, flowIndex, tier, ok: true, action: stepActionLabel,
-          status: 'loading', message: 'Page loading — waiting…',
-        });
-        await _sleep(1000);
-      } else {
-        // Step failed — mark tier as tried
-        actionHistory.push(`${stepActionLabel} → FAILED (${stepVerify.reason})`);
-        _postProgress(progressCallbackUrl, {
-          type: 'app_flow:action_done',
-          stepIndex, flowIndex, tier, ok: false, action: stepActionLabel,
-          error: stepVerify.reason || 'verification failed',
-        });
-        triedTiers.add(tier);
+      actionHistory.push(`${stepActionLabel} → FAILED (${stepResult?.error || 'unknown'})`);
+      _postProgress(progressCallbackUrl, {
+        type: 'app_flow:action_done',
+        stepIndex, flowIndex, tier, ok: false, action: stepActionLabel,
+        error: stepResult?.error || 'unknown',
+      });
+      triedTiers.add(tier);
+      // Retry budget: abort the flow if the same step fails 2+ times
+      const _failKey = `${tier}:${stepActionLabel}`;
+      stepFailures[_failKey] = (stepFailures[_failKey] || 0) + 1;
+      if (stepFailures[_failKey] >= 2) {
+        logger.error(`[app.runner] runAppFlow: aborting after repeated failure of "${stepActionLabel}" (${stepFailures[_failKey]}x)`);
+        if (signature) _markPlaybookCacheFail(appName, signature);
+        return { ok: false, error: stepResult?.error || `Failed step: ${stepActionLabel}`, elapsed: Date.now() - startTime };
       }
     }
 
-    // 5h. Brief pause between steps
-    await _sleep(500);
+    // 5h. Brief pause between steps — focus_ai opens panels/views that need
+    //     time to animate and focus their input, so wait longer after those.
+    //     After open_file (tier 6), the app needs time to load the file before
+    //     subsequent shortcuts (e.g. focus_ai) can work.
+    const _settleMs = (lastShortcutAction === 'focus_ai') ? 1500
+      : (lastTier === 6) ? 2000
+      : 500;
+    lastTier = tier;
+    await _sleep(_settleMs);
   }
 
-  // Timeout
-  logger.warn(`[app.runner] runAppFlow: timeout after ${Date.now() - startTime}ms`);
-  if (signature) _markPlaybookCacheFail(appName, signature);
+  // 6. Final verification — initial-vs-final diff
+  //    Capture final OCR, diff against initial, test the diff against the goal.
+  //    No-diff means the flow had no effect (failure). Diff is tested to verify
+  //    the goal was achieved.
+  const timedOut = Date.now() - startTime >= timeoutMs;
+  if (timedOut) {
+    logger.warn(`[app.runner] runAppFlow: timeout after ${Date.now() - startTime}ms`);
+    if (signature) _markPlaybookCacheFail(appName, signature);
+    _postProgress(progressCallbackUrl, {
+      type: 'app_flow:done',
+      stepIndex, ok: false, error: 'App-Flow timeout',
+      actionHistory,
+    });
+    return { ok: false, error: 'App-Flow timeout', actionHistory, elapsed: Date.now() - startTime };
+  }
+
+  logger.info(`[app.runner] runAppFlow: flow complete — capturing final OCR for diff verification`);
+  const finalOcr = finalOcrFromMonitor || await _captureOcr({ appName });
+  if (finalOcrFromMonitor) {
+    logger.info(`[app.runner] runAppFlow: reusing monitoring's final OCR (${finalOcrFromMonitor.length} chars) — skipping extra capture`);
+  }
+  const diff = _diffOcrText(initialOcr, finalOcr);
+  logger.info(`[app.runner] runAppFlow: initial-vs-final diff (${diff.length} chars of new/changed content)`);
+
+  if (!diff || diff.trim().length === 0) {
+    // No change between initial and final state — flow did nothing
+    logger.warn(`[app.runner] runAppFlow: initial vs final state identical — flow had no effect`);
+    if (signature) _markPlaybookCacheFail(appName, signature);
+    _postProgress(progressCallbackUrl, {
+      type: 'app_flow:done',
+      stepIndex, ok: false, error: 'No state change detected between initial and final screen',
+      actionHistory,
+    });
+    return { ok: false, error: 'No state change detected between initial and final screen', actionHistory, elapsed: Date.now() - startTime };
+  }
+
+  // Test the diff (new/changed content) against the goal
+  const goalVerify = await _ocrVerifyAppGoal(diff, goal, actionHistory);
+  if (goalVerify.num === 1) {
+    logger.info(`[app.runner] runAppFlow: DONE — goal achieved (diff verified)`);
+    _postProgress(progressCallbackUrl, {
+      type: 'app_flow:done',
+      stepIndex, ok: true, flowIndex, totalSteps: appFlow?.length || 0, actionHistory,
+    });
+    return { ok: true, output: diff.slice(0, 500), actionHistory, elapsed: Date.now() - startTime };
+  }
+
+  // Diff exists but goal not verified — return the diff anyway (partial success)
+  logger.warn(`[app.runner] runAppFlow: flow complete but goal not verified (num=${goalVerify.num})`);
   _postProgress(progressCallbackUrl, {
     type: 'app_flow:done',
-    stepIndex, ok: false, error: 'App-Flow timeout',
-    actionHistory,
+    stepIndex, ok: true, flowIndex, totalSteps: appFlow?.length || 0, actionHistory,
+    verified: false,
   });
-  return { ok: false, error: 'App-Flow timeout', actionHistory, elapsed: Date.now() - startTime };
+  return { ok: true, output: diff.slice(0, 500), actionHistory, elapsed: Date.now() - startTime, verified: false };
 }
 
 // ── Flow Action Extraction Helpers ───────────────────────────────────────────
@@ -1854,6 +3410,14 @@ module.exports = {
   _computeAppFlowV2,
   _researchMissingShortcut,
   _openFileWithShell,
+  _newFileWithShell,
+  _newWindowWithShell,
+  _closeWindowWithShell,
+  _gotoLineWithShell,
+  _inferFileExtension,
   _resolveFilePath,
   _subGoalToTier,
+  _inferSubGoalFromAction,
+  _countNonDoneStepsBefore,
+  _validateAndFixFlowSubGoals,
 };

@@ -957,6 +957,7 @@ class CommandServiceMCPServer {
         // signal so the server-side loop actually stops instead of running on.
         const controller = new AbortController();
         let responded = false;
+        let unregistered = false;
         const onClose = () => { if (!responded) controller.abort(); };
         // Use the socket's close event, not the request stream's close event,
         // because req.on('close') fires as soon as the request body is consumed
@@ -964,9 +965,18 @@ class CommandServiceMCPServer {
         if (req.socket) req.socket.on('close', onClose);
         req.on('aborted', onClose);
         // Register this controller so /automation.cancel can abort it. Removed
-        // on completion/error/close to avoid unbounded growth.
+        // ONLY when the async work truly completes (in the finally block below).
+        // Do NOT unregister on socket close — if we did, /automation.cancel would
+        // find 0 controllers even though the work is still running (because the
+        // signal wasn't being honored). The controller stays in the set until
+        // executeAutomation returns; the abort signal is what actually stops it.
         activeAutomationControllers.add(controller);
-        const _unregister = () => activeAutomationControllers.delete(controller);
+        const _unregister = () => {
+          if (!unregistered) {
+            unregistered = true;
+            activeAutomationControllers.delete(controller);
+          }
+        };
         req.on('end', async () => {
           try {
             const { payload } = JSON.parse(body);
@@ -998,8 +1008,6 @@ class CommandServiceMCPServer {
             _unregister();
           }
         });
-        // Also unregister if the socket closes before 'end' fires.
-        if (req.socket) req.socket.on('close', _unregister);
         return;
       }
 
