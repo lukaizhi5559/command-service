@@ -359,13 +359,13 @@ async function updateConstraint(id, updates) {
 // ── Skill registry helpers ───────────────────────────────────────────────────
 
 async function getSkill(skillName) {
-  const res = await httpPost('/skill.get', { name: skillName });
-  return res?.skill || null;
+  const res = await mcpPost('skill.get', { name: skillName });
+  return res?.data || null;
 }
 
 async function upsertSkill(skillData) {
-  const res = await httpPost('/skill.upsert', skillData);
-  return res?.success !== false;
+  const res = await mcpPost('skill.upsert', skillData);
+  return res?.status === 'ok';
 }
 
 module.exports = {

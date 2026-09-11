@@ -57,6 +57,8 @@ function validateExecPath(execPath) {
  * for index.py (Python) first, then index.cjs (Node.js).
  * Works even when user-memory is unavailable or returns UNAUTHORIZED.
  * Tries both dot-notation (gmail.daily) and kebab-notation (gmail-daily) as dir names.
+ * Reads skill.json / skill.md from the dir to recover contractMd (secrets, oauth,
+ * agentId) so secret/OAuth resolution still works without the user-memory record.
  */
 async function fetchSkillRecordFromUserSkillsDir(name) {
   try {
@@ -70,12 +72,15 @@ async function fetchSkillRecordFromUserSkillsDir(name) {
       const pythonPath = path.join(SKILLS_BASE_DIR, candidate, 'index.py');
       if (fs.existsSync(pythonPath)) {
         logger.info(`[external.skill] Found Python skill at ${pythonPath}`);
+        const dir = path.dirname(pythonPath);
+        const meta = _readSkillMeta(dir, name);
         return {
           name,
           execPath: pythonPath,
           execType: 'python',
           enabled: true,
           source: 'user-skills-dir',
+          ...meta,
         };
       }
     }
@@ -83,13 +88,42 @@ async function fetchSkillRecordFromUserSkillsDir(name) {
       const nodePath = path.join(SKILLS_BASE_DIR, candidate, 'index.cjs');
       if (fs.existsSync(nodePath)) {
         logger.info(`[external.skill] Found Node.js skill at ${nodePath}`);
+        const dir = path.dirname(nodePath);
+        const meta = _readSkillMeta(dir, name);
         return {
           name,
           execPath: nodePath,
           execType: 'node',
           enabled: true,
           source: 'user-skills-dir',
+          ...meta,
         };
+      }
+    }
+
+    // Instruction skills: skill.md with exec_type: instruction frontmatter.
+    // These are knowledge/prompt-only skills (e.g. imported from external URLs
+    // like agenticskills.io). No code execution — just return the markdown body.
+    for (const candidate of candidates) {
+      const skillMdPath = path.join(SKILLS_BASE_DIR, candidate, 'skill.md');
+      if (fs.existsSync(skillMdPath)) {
+        try {
+          const md = fs.readFileSync(skillMdPath, 'utf8');
+          const fmMatch = md.match(/^---\s*\n([\s\S]*?)\n---/);
+          if (fmMatch && /exec_type:\s*instruction\b/i.test(fmMatch[1])) {
+            logger.info(`[external.skill] Found instruction skill at ${skillMdPath}`);
+            const dir = path.dirname(skillMdPath);
+            const meta = _readSkillMeta(dir, name);
+            return {
+              name,
+              execPath: skillMdPath,
+              execType: 'instruction',
+              enabled: true,
+              source: 'user-skills-dir',
+              ...meta,
+            };
+          }
+        } catch (_) { /* not a valid instruction skill, skip */ }
       }
     }
 
@@ -115,6 +149,51 @@ async function fetchSkillRecordFromUserSkillsDir(name) {
     logger.warn(`[external.skill] user-skills-dir fallback failed: ${e.message}`);
     return null;
   }
+}
+
+/**
+ * Read contract metadata (contractMd, agentId, sourceDomain) from a skill directory.
+ * Tries skill.md (full contract with frontmatter) first, then skill.json (structured
+ * fields → synthesized contractMd). Returns {} if neither is found.
+ */
+function _readSkillMeta(skillDir, skillName) {
+  const meta = {};
+  try {
+    // 1. skill.md — full contract with YAML frontmatter (preferred; has secrets/oauth lines)
+    const skillMdPath = path.join(skillDir, 'skill.md');
+    if (fs.existsSync(skillMdPath)) {
+      meta.contractMd = fs.readFileSync(skillMdPath, 'utf8');
+    }
+    // 2. skill.json — structured metadata written by skillCreator / explore.agent
+    const skillJsonPath = path.join(skillDir, 'skill.json');
+    if (fs.existsSync(skillJsonPath)) {
+      const sj = JSON.parse(fs.readFileSync(skillJsonPath, 'utf8'));
+      if (sj.agent_id) meta.agentId = sj.agent_id;
+      if (sj.source_domain) meta.sourceDomain = sj.source_domain;
+      if (sj.source_action) meta.sourceAction = sj.source_action;
+      // Synthesize contractMd from skill.json if skill.md wasn't found
+      if (!meta.contractMd) {
+        const fm = [
+          '---',
+          `name: ${skillName}`,
+          sj.description ? `description: ${sj.description}` : '',
+          `exec_type: ${sj.exec_type || 'node'}`,
+          '',
+        ].filter(Boolean).join('\n');
+        if (Array.isArray(sj.secrets) && sj.secrets.length > 0) {
+          meta.contractMd = fm + '\nsecrets: ' + sj.secrets.join(', ') + '\n---';
+        } else {
+          meta.contractMd = fm + '\n---';
+        }
+        if (Array.isArray(sj.oauth) && sj.oauth.length > 0) {
+          meta.contractMd += '\noauth: ' + sj.oauth.join(', ');
+        }
+      }
+    }
+  } catch (e) {
+    logger.debug(`[external.skill] _readSkillMeta for "${skillName}" failed: ${e.message}`);
+  }
+  return meta;
 }
 
 // ── Build context object passed as 2nd arg to skill run(args, context) ────────
@@ -247,12 +326,46 @@ async function runNodeSkill(execPath, args, timeoutMs, context) {
   });
 }
 
-async function runShellSkill(execPath, args, timeoutMs) {
+/**
+ * Run an instruction skill (knowledge/prompt-only SKILL.md).
+ * Reads the markdown content, strips frontmatter, and returns the body as
+ * instruction content. No code execution — safe for untrusted imported skills.
+ * The instructionMd is consumed by a downstream synthesize step to answer
+ * the user's question using the knowledge content.
+ */
+async function runInstructionSkill(execPath, args, timeoutMs, context) {
+  const content = fs.readFileSync(execPath, 'utf8');
+  // Strip frontmatter — return only the body as instruction content
+  const fmMatch = content.match(/^---\s*\n[\s\S]*?\n---/);
+  const instructionMd = fmMatch ? content.slice(fmMatch[0].length).trim() : content.trim();
+  return {
+    ok: true,
+    output: instructionMd,
+    instructionMd,
+    execType: 'instruction',
+  };
+}
+
+async function runShellSkill(execPath, args, timeoutMs, context) {
   return new Promise((resolve, reject) => {
     const argsJson = JSON.stringify(args || {});
 
+    // Inject secrets as env vars and pass context via SKILL_CONTEXT (same pattern
+    // as runPythonSkill) so shell skills can access secrets/OAuth tokens.
+    const secrets = context?.secrets || {};
+    const oauth = context?.oauth || {};
+    const contextJson = JSON.stringify({
+      secrets,
+      oauth,
+      skillName: context?.skillName || 'shell-skill',
+    });
+
     const child = spawn('bash', [execPath], {
-      env: { ...process.env },
+      env: {
+        ...process.env,
+        ...secrets,
+        SKILL_CONTEXT: contextJson,
+      },
       killSignal: 'SIGTERM'
     });
 
@@ -354,7 +467,7 @@ async function runPythonSkill(execPath, args, timeoutMs, context) {
 async function fetchSkillRecord(name, timeoutMs) {
   const http = require('http');
   const userMemoryUrl = process.env.MCP_USER_MEMORY_URL || process.env.USER_MEMORY_SERVICE_URL || 'http://localhost:3001';
-  const apiKey = process.env.MCP_USER_MEMORY_API_KEY || process.env.USER_MEMORY_API_KEY || process.env.MCP_API_KEY || '';
+  const apiKey = process.env.MCP_USER_MEMORY_API_KEY || process.env.USER_MEMORY_API_KEY || process.env.MCP_API_KEY || process.env.API_KEY || '';
 
   return new Promise((resolve, reject) => {
     const body = JSON.stringify({
@@ -616,7 +729,7 @@ async function runRecipeSkill(resolvedPath, skillArgs, timeoutMs) {
   // Resolve params in a value string like "{{playlist_name}}"
   const resolveValue = (value) => {
     if (typeof value !== 'string' || !value.includes('{{')) return value;
-    return value.replace(/\{\{(\s*[^}\\s]+\s*)\}\}/g, (_, rawName) => {
+    return value.replace(/\{\{(\s*[^}\s]+\s*)\}\}/g, (_, rawName) => {
       const name = rawName.trim();
       return args[name] !== undefined ? String(args[name]) : _;
     });
@@ -728,7 +841,9 @@ async function runRecipeSkill(resolvedPath, skillArgs, timeoutMs) {
         const currentUrl = snapRes?.url || snapRes?.result?.match(/URL:\s*(\S+)/)?.[1] || '';
         if (currentUrl) {
           // Convert pattern to regex: /playlist/* → /playlist/[^/]+
-          const regex = new RegExp(pattern.replace(/\*/g, '[^/?]+').replace(/[.+?^${}()|[\]\\]/g, '\\$&').replace(/\\\*/g, '[^/?]+'));
+          // Escape regex special chars first, then convert * to a wildcard.
+          const escapedPattern = pattern.replace(/[.+?^${}()|[\]\\]/g, '\\$&');
+          const regex = new RegExp(escapedPattern.replace(/\*/g, '[^/?]+'));
           if (!regex.test(currentUrl)) {
             logger.warn(`[external.skill] Waypoint ${wp.step}: expectedResult pattern ${pattern} did not match URL ${currentUrl} — continuing anyway`);
           } else {
@@ -996,7 +1111,7 @@ async function run(args) {
         const context = await buildSkillContext(name, [], []);
         result = await runPythonSkill(resolvedDirectPath, mergedSkillArgs, timeoutMs, context);
       } else if (directExecType === 'shell') {
-        result = await runShellSkill(resolvedDirectPath, mergedSkillArgs, timeoutMs);
+        result = await runShellSkill(resolvedDirectPath, mergedSkillArgs, timeoutMs, context);
       } else {
         return { ok: false, skillName: name, error: `Unknown direct execType "${directExecType}"` };
       }
@@ -1068,8 +1183,12 @@ async function run(args) {
     }
 
     // 4. skill name prefix: "perplexity_ai_navigate_history" → "perplexity_agent"
-    if (!_derivedSessionId && name && /^[a-z][a-z0-9]+_/.test(name)) {
-      _derivedSessionId = name.split('_')[0] + '_agent';
+    //    Also handles dot-notation: "perplexity.ai.navigate" → "perplexity_agent"
+    if (!_derivedSessionId && name) {
+      const firstSeg = name.split(/[._]/)[0];
+      if (firstSeg && /^[a-z]/.test(firstSeg)) {
+        _derivedSessionId = firstSeg + '_agent';
+      }
     }
 
     if (_derivedSessionId) {
@@ -1202,6 +1321,10 @@ async function run(args) {
     } else if (basename === 'cli.json') {
       const skillCliRunner = require('../skill-helpers/skill-cli-runner.cjs');
       result = await skillCliRunner.run(name, mergedSkillArgs, { contractMd: skillRecord.contractMd, timeoutMs, context });
+    } else if (execType === 'instruction') {
+      // Instruction skills: knowledge/prompt-only SKILL.md with exec_type: instruction.
+      // No code execution — just read and return the markdown body.
+      result = await runInstructionSkill(resolvedPath, mergedSkillArgs, timeoutMs, context);
     } else if (resolvedPath.endsWith('.md')) {
       // Contract-based skills: exec_path points to skill.md (not index.cjs).
       // These skills define their execution as shell.run/curl steps in ## Plan / ## Commands.
@@ -1223,11 +1346,11 @@ async function run(args) {
     } else if (execType === 'node') {
       result = await runNodeSkill(resolvedPath, mergedSkillArgs, timeoutMs, context);
     } else if (execType === 'shell') {
-      result = await runShellSkill(resolvedPath, mergedSkillArgs, timeoutMs);
+      result = await runShellSkill(resolvedPath, mergedSkillArgs, timeoutMs, context);
     } else if (execType === 'recipe') {
       result = await runRecipeSkill(resolvedPath, mergedSkillArgs, timeoutMs);
     } else {
-      return { ok: false, skillName: name, error: `Unknown exec_type "${execType}". Must be "python", "node", "shell", "project", or "recipe".` };
+      return { ok: false, skillName: name, error: `Unknown exec_type "${execType}". Must be "python", "node", "shell", "instruction", "project", or "recipe".` };
     }
 
     // If the skill itself returned ok:false with a non-trivial error, report it as a potential
