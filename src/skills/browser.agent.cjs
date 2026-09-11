@@ -7962,6 +7962,9 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
 
   logger.info(`[browser.agent] run agentId=${agentId} type=${agentType} task="${task}"`);
   const _silentPreflightProbe = _authOnly && preflightProbe === true;
+  // Run preflight probes headed so the user sees the browser window and
+  // heavy SPAs (e.g. ChatGPT) hydrate properly with GPU acceleration.
+  const _preflightHeaded = _silentPreflightProbe ? true : undefined;
 
   // ── REST API path (api_key, bearer, basic) — multi-turn agentic loop ──
   if (agentType === 'api_key' || agentType === 'bearer' || agentType === 'basic') {
@@ -8393,9 +8396,9 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
       const _loadRes = await callBrowserAct({ action: 'state-load', sessionId, timeoutMs: 10000 }, 12000).catch(() => ({ ok: false }));
       if (_loadRes?.ok !== false) {
         // Navigate after injecting cookies — probe whether the session is still valid
-        const _stateNav = await callBrowserAct({ action: 'navigate', sessionId, url: startUrl, timeoutMs: 30000, headed: _silentPreflightProbe ? false : undefined }, 35000).catch(() => ({ ok: false }));
+        const _stateNav = await callBrowserAct({ action: 'navigate', sessionId, url: startUrl, timeoutMs: 30000, headed: _preflightHeaded }, 35000).catch(() => ({ ok: false }));
         const _stateHrefRes = _stateNav?.ok !== false
-          ? await callBrowserAct({ action: 'evaluate', text: 'window.location.href', sessionId, timeoutMs: 5000, headed: _silentPreflightProbe ? false : undefined }, 8000).catch((err) => {
+          ? await callBrowserAct({ action: 'evaluate', text: 'window.location.href', sessionId, timeoutMs: 5000, headed: _preflightHeaded }, 8000).catch((err) => {
               logger.error(`[browser.agent] auth-check eval failed (state persistence): ${err.message}`);
               return { ok: false, error: err.message };
             })
@@ -8591,7 +8594,7 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
 
       if (!_skipNavigate) try {
         logger.info(`[browser.agent] run: playwright auth-check — navigating to ${startUrl} for ${agentId}`);
-        const _probeNav = await callBrowserAct({ action: 'navigate', sessionId, url: startUrl, timeoutMs: 30000, headed: _silentPreflightProbe ? false : undefined }, 35000);
+        const _probeNav = await callBrowserAct({ action: 'navigate', sessionId, url: startUrl, timeoutMs: 30000, headed: _preflightHeaded }, 35000);
 
         // ── Chrome session conflict detection — fail fast ──────────────────
         if (_isChromeSessionConflict(_probeNav)) {
@@ -8616,7 +8619,7 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
         }
 
         if (_probeNav?.ok !== false) {
-          const _hrefRes = await callBrowserAct({ action: 'evaluate', text: 'window.location.href', sessionId, timeoutMs: 10000, headed: _silentPreflightProbe ? false : undefined }, 13000).catch((err) => {
+          const _hrefRes = await callBrowserAct({ action: 'evaluate', text: 'window.location.href', sessionId, timeoutMs: 10000, headed: _preflightHeaded }, 13000).catch((err) => {
             logger.error(`[browser.agent] auth-check eval failed (fresh check): ${err.message}`);
             return { ok: false, error: err.message };
           });
@@ -8697,7 +8700,7 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
               })()`,
               sessionId,
               timeoutMs: 5000,
-              headed: _silentPreflightProbe ? false : undefined,
+              headed: _preflightHeaded,
             }, 8000).catch(() => null);
             // browser.act evaluate auto-parses JSON, so result may already be an object.
             // JSON.parse(object) throws — handle both object and string cases.
@@ -8770,7 +8773,7 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
                     })()`,
                     sessionId,
                     timeoutMs: 5000,
-                    headed: _silentPreflightProbe ? false : undefined,
+                    headed: _preflightHeaded,
                   }, 8000).catch(() => null);
                   const _spaInfo = (_spaRes?.ok !== false)
                     ? (typeof _spaRes?.result === 'object' && _spaRes?.result !== null)
@@ -8795,10 +8798,10 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
                   };
                 }
 
-                // ── Tier 3: Poll for SPA hydration (up to 10s, 5 × 2s intervals) ──
-                logger.info(`[browser.agent] run: SPA detected for ${agentId} — polling for hydration (up to 10s)`);
+                // ── Tier 3: Poll for SPA hydration (up to 20s, 10 × 2s intervals) ──
+                logger.info(`[browser.agent] run: SPA detected for ${agentId} — polling for hydration (up to 20s)`);
                 let _hydrated = false;
-                for (let _poll = 0; _poll < 5; _poll++) {
+                for (let _poll = 0; _poll < 10; _poll++) {
                   await new Promise(r => setTimeout(r, 2000));
                   try {
                     const _pollRes = await callBrowserAct({
@@ -8810,7 +8813,7 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
                       })()`,
                       sessionId,
                       timeoutMs: 5000,
-                      headed: _silentPreflightProbe ? false : undefined,
+                      headed: _preflightHeaded,
                     }, 8000);
                     const _pollInfo = (_pollRes?.ok !== false)
                       ? (typeof _pollRes?.result === 'object' && _pollRes?.result !== null)
@@ -8849,7 +8852,7 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
                         })()`,
                         sessionId,
                         timeoutMs: 5000,
-                        headed: _silentPreflightProbe ? false : undefined,
+                        headed: _preflightHeaded,
                       }, 8000).catch(() => null);
                       _pageInfo = (_reEvalRes?.ok !== false)
                         ? (typeof _reEvalRes?.result === 'object' && _reEvalRes.result !== null)
@@ -8874,14 +8877,14 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
                 }
 
                 if (!_hydrated) {
-                  // SPA never hydrated within 10s — treat as crash
-                  logger.warn(`[browser.agent] run: SPA did not hydrate within 10s for ${agentId} (href=${_curHref}) — flagging for retry`);
+                  // SPA never hydrated within 20s — treat as crash
+                  logger.warn(`[browser.agent] run: SPA did not hydrate within 20s for ${agentId} (href=${_curHref}) — flagging for retry`);
                   return {
                     ok: false,
                     chromeCrash: true,
                     agentId,
                     task,
-                    error: 'Browser page blank after 10s SPA hydration wait, will retry once',
+                    error: 'Browser page blank after 20s SPA hydration wait, will retry once',
                     result: null,
                     stdout: null,
                   };
