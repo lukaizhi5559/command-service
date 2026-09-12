@@ -13,14 +13,17 @@
  *   discover_task_url   { domain, task }                → dual search (site-scoped + broad) to find the most direct deep-link URL for a task
  *   discover_search_syntax { domain, task }              → search + crawl official docs to extract a service's search/filter query operators
  *   research_app_behavior { domain, query? }            → targeted web research for app-level operational knowledge (shortcuts, UI modes, quirks)
+ *   find_download         { query, fileExt?, preferDomain? } → find a DIRECT downloadable asset URL (mp3/pdf/png/...)
+ *                                                              verified via HEAD probe so callers can curl it
  */
 
 const http   = require('http');
+const https  = require('https');
 const logger = require('../logger.cjs');
 const { isAuthFlowUrl } = require('../skill-helpers/destination-resolver.cjs');
 
 // Web Search MCP configuration from environment
-const WEB_SEARCH_API_URL = process.env.MCP_WEB_SEARCH_API_URL;
+const WEB_SEARCH_API_URL = process.env.MCP_WEB_SEARCH_URL;
 const WEB_SEARCH_API_KEY = process.env.MCP_WEB_SEARCH_API_KEY;
 
 /**
@@ -29,7 +32,7 @@ const WEB_SEARCH_API_KEY = process.env.MCP_WEB_SEARCH_API_KEY;
  */
 async function searchWeb(query, maxResults = 5) {
   if (!WEB_SEARCH_API_URL) {
-    logger.warn('[web.agent] Web search not configured - MCP_WEB_SEARCH_API_URL missing');
+    logger.warn('[web.agent] Web search not configured - MCP_WEB_SEARCH_URL missing');
     return { ok: false, skipped: true, error: 'Web search not configured' };
   }
 
@@ -39,7 +42,7 @@ async function searchWeb(query, maxResults = 5) {
     wsHostname = _u.hostname;
     wsPort = parseInt(_u.port) || 3002;
   } catch (_) {
-    logger.warn('[web.agent] MCP_WEB_SEARCH_API_URL is not a valid URL — web search skipped');
+    logger.warn('[web.agent] MCP_WEB_SEARCH_URL is not a valid URL — web search skipped');
     return { ok: false, skipped: true, error: 'Web search URL is invalid' };
   }
 
@@ -1248,6 +1251,123 @@ ${combinedContent}`;
   };
 }
 
+// ── find_download ───────────────────────────────────────────────────────────
+// HEAD-probe a URL to learn its Content-Type. Follows redirects (bounded).
+// Some servers reject HEAD — caller treats probe failure as "unknown", not fatal.
+function _probeContentType(url, timeoutMs = 4000, _depth = 0) {
+  return new Promise((resolve) => {
+    if (_depth > 3) return resolve({ ok: false, reason: 'too-many-redirects' });
+    let parsed;
+    try { parsed = new URL(url); } catch (_) { return resolve({ ok: false, reason: 'invalid-url' }); }
+    const lib = parsed.protocol === 'https:' ? https : http;
+    const req = lib.request({
+      hostname: parsed.hostname,
+      port: parsed.port || (parsed.protocol === 'https:' ? 443 : 80),
+      path: parsed.pathname + parsed.search,
+      method: 'HEAD',
+      timeout: timeoutMs,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
+        'Accept': '*/*',
+      },
+    }, (res) => {
+      const status = res.statusCode || 0;
+      if (status >= 300 && status < 400 && res.headers.location) {
+        res.resume();
+        const loc = new URL(res.headers.location, url).toString();
+        return _probeContentType(loc, timeoutMs, _depth + 1).then(resolve);
+      }
+      const contentType = res.headers['content-type'] || '';
+      const contentLength = parseInt(res.headers['content-length'] || '0', 10) || 0;
+      res.resume();
+      resolve({ ok: status >= 200 && status < 300, status, contentType, contentLength, finalUrl: url });
+    });
+    req.on('error', () => resolve({ ok: false, reason: 'network-error' }));
+    req.on('timeout', () => { try { req.destroy(); } catch (_) {} resolve({ ok: false, reason: 'timeout' }); });
+    req.end();
+  });
+}
+
+/**
+ * Find a DIRECT downloadable asset URL (mp3, wav, pdf, png, zip, csv, ...) via
+ * web search. Prefers results whose URL path ends with the requested extension
+ * and HEAD-verifies the top candidates so the caller can curl the asset
+ * directly instead of opening a browser.
+ *
+ * Returns { ok, bestUrl, title, contentType, verified, isPage, allResults }.
+ * isPage:true means no direct asset verified — bestUrl is a page the caller
+ * should route through web.crawl to locate the real media link.
+ */
+async function actionFindDownload({ query, fileExt, preferDomain, maxResults = 5 }) {
+  if (!query) return { ok: false, error: 'query is required' };
+
+  const ext = String(fileExt || '').replace(/^\./, '').toLowerCase();
+  const searchQuery = ext ? `${query} filetype:${ext}` : query;
+  logger.info(`[web.agent] find_download: "${searchQuery.slice(0, 80)}" ext=${ext || 'any'} preferDomain=${preferDomain || 'none'}`);
+
+  const searchResult = await searchWeb(searchQuery, maxResults);
+  if (!searchResult.ok) return searchResult;
+
+  const results = (searchResult.results || [])
+    .filter(r => !_isParkingContent(r.title, r.snippet, r.url));
+  if (results.length === 0) return { ok: false, error: 'No search results returned' };
+
+  const _urlEndsWithExt = (url) => {
+    if (!ext) return false;
+    try { return new URL(url).pathname.toLowerCase().endsWith(`.${ext}`); }
+    catch (_) { return false; }
+  };
+
+  // Score: base _scoreResult + strong bonus for direct-asset URLs
+  const scored = results
+    .map(r => ({ ...r, _isDirectAsset: _urlEndsWithExt(r.url), _score: _scoreResult(r, preferDomain) + (_urlEndsWithExt(r.url) ? 60 : 0) }))
+    .filter(r => r._score >= 0)
+    .sort((a, b) => b._score - a._score);
+
+  if (scored.length === 0) return { ok: false, error: 'All search results were parking/squatter pages' };
+
+  // HEAD-probe the top candidates — reject HTML content types (bot walls,
+  // landing pages) so we never hand curl a URL that saves as .mp3 but is HTML.
+  const probed = [];
+  for (const cand of scored.slice(0, 4)) {
+    const probe = await _probeContentType(cand.url).catch(() => ({ ok: false }));
+    const isHtml = probe.ok ? /text\/html|application\/xhtml/i.test(probe.contentType || '') : null;
+    probed.push({ ...cand, _probe: probe, _isHtml: isHtml });
+    logger.info(`[web.agent] find_download: probe ${cand.url} → ${probe.ok ? `${probe.status} ${probe.contentType}` : `failed (${probe.reason || 'err'})`}`);
+    if (probe.ok && !isHtml) break; // verified non-HTML — good enough, stop probing
+  }
+
+  // Prefer a verified non-HTML direct asset; fall back to any verified
+  // non-HTML URL (a direct link whose path lacks the extension still works).
+  const verifiedAsset = probed.find(p => p._probe.ok && p._isHtml === false && p._isDirectAsset)
+    || probed.find(p => p._probe.ok && p._isHtml === false);
+  if (verifiedAsset) {
+    return {
+      ok: true,
+      bestUrl: verifiedAsset.url,
+      title: verifiedAsset.title,
+      contentType: verifiedAsset._probe.contentType,
+      verified: true,
+      isPage: false,
+      allResults: scored.map(r => ({ url: r.url, title: r.title, score: r._score })),
+    };
+  }
+
+  // No verified direct asset — return the best page URL so the caller can
+  // crawl it for the real media link (isPage signals the plan to use web.crawl).
+  const bestPage = probed.find(p => p._probe.ok) || scored[0];
+  logger.info(`[web.agent] find_download: no verified direct asset — returning best page ${bestPage.url}`);
+  return {
+    ok: true,
+    bestUrl: bestPage.url,
+    title: bestPage.title,
+    contentType: bestPage._probe?.contentType || '',
+    verified: false,
+    isPage: true,
+    allResults: scored.map(r => ({ url: r.url, title: r.title, score: r._score })),
+  };
+}
+
 // Main export handler
 module.exports = async function webAgent(args) {
   const { action, ...params } = args || {};
@@ -1267,6 +1387,8 @@ module.exports = async function webAgent(args) {
       return await actionDiscoverSetup(params);
     case 'research_app_behavior':
       return await actionResearchAppBehavior(params);
+    case 'find_download':
+      return await actionFindDownload(params);
     default:
       return { ok: false, error: `Unknown action: ${action}` };
   }
@@ -1279,5 +1401,7 @@ module.exports.actionDiscoverTaskUrl  = actionDiscoverTaskUrl;
 module.exports.actionDiscoverSearchSyntax = actionDiscoverSearchSyntax;
 module.exports.actionDiscoverSetup    = actionDiscoverSetup;
 module.exports.actionResearchAppBehavior = actionResearchAppBehavior;
+module.exports.actionFindDownload = actionFindDownload;
+module.exports._probeContentType = _probeContentType;
 module.exports._classifyDiscoveryCandidate = _classifyDiscoveryCandidate;
 module.exports.searchWeb = searchWeb;

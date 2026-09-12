@@ -43,8 +43,11 @@ const http          = require('http');
 const os            = require('os');
 const logger        = require('../logger.cjs');
 
-const WEB_SEARCH_PORT    = process.env.MCP_WEB_SEARCH_PORT || 3002;
-const WEB_SEARCH_HOST    = '127.0.0.1';
+const _WS_URL           = process.env.MCP_WEB_SEARCH_URL || 'http://127.0.0.1:3002';
+let   _WS_PARSED;
+try { _WS_PARSED = new URL(_WS_URL); } catch (_) { _WS_PARSED = { hostname: '127.0.0.1', port: '3002' }; }
+const WEB_SEARCH_HOST    = _WS_PARSED.hostname;
+const WEB_SEARCH_PORT    = parseInt(_WS_PARSED.port) || 3002;
 const WEB_SEARCH_API_KEY = process.env.MCP_WEB_SEARCH_API_KEY || process.env.MCP_API_KEY || '';
 const SEARCH_TIMEOUT     = 15000;
 const LLM_TIMEOUT        = 20000;

@@ -838,7 +838,7 @@ const PLATFORM_CONFIG = {
 };
 
 // Web search MCP config (same env vars as web.agent.cjs)
-const _WS_API_URL = process.env.MCP_WEB_SEARCH_API_URL;
+const _WS_API_URL = process.env.MCP_WEB_SEARCH_URL;
 const _WS_API_KEY = process.env.MCP_WEB_SEARCH_API_KEY;
 
 /**

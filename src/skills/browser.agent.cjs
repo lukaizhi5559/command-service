@@ -6095,7 +6095,7 @@ async function _updateStatus(id, status, failureNote) {
 
 async function agentWebSearch(query) {
   const { URL } = require('url');
-  const wsUrl = new URL(process.env.MCCP_WEB_SEARCH_API_URL || 'http://127.0.0.1:3002');
+  const wsUrl = new URL(process.env.MCP_WEB_SEARCH_URL || 'http://127.0.0.1:3002');
   const wsApiKey = process.env.MCP_WEB_SEARCH_API_KEY || '';
   return new Promise((resolve) => {
     const body = JSON.stringify({

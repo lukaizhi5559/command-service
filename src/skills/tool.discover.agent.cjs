@@ -20,7 +20,7 @@ const logger = require('../logger.cjs');
 const { ask } = require('../skill-helpers/skill-llm.cjs');
 const db     = require('../skill-helpers/skill-db.cjs');
 
-const WEB_SEARCH_API_URL = process.env.MCP_WEB_SEARCH_API_URL;
+const WEB_SEARCH_API_URL = process.env.MCP_WEB_SEARCH_URL;
 const WEB_SEARCH_API_KEY = process.env.MCP_WEB_SEARCH_API_KEY;
 
 const SKILL_NAMESPACE = 'tool.discover';
@@ -61,7 +61,7 @@ const TIER3_KEYWORDS = ['pricing', 'subscription', 'credits', 'per month', 'paid
 
 async function _searchWeb(query, maxResults = 8) {
   if (!WEB_SEARCH_API_URL) {
-    logger.warn('[tool.discover] Web search not configured - MCP_WEB_SEARCH_API_URL missing');
+    logger.warn('[tool.discover] Web search not configured - MCP_WEB_SEARCH_URL missing');
     return { ok: false, skipped: true, error: 'Web search not configured' };
   }
 
