@@ -7944,9 +7944,9 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
 
   logger.info(`[browser.agent] run agentId=${agentId} type=${agentType} task="${task}"`);
   const _silentPreflightProbe = _authOnly && preflightProbe === true;
-  // Run preflight probes headed so the user sees the browser window and
-  // heavy SPAs (e.g. ChatGPT) hydrate properly with GPU acceleration.
-  const _preflightHeaded = _silentPreflightProbe ? true : undefined;
+  // Preflight auth probes must be headless: they only sniff for login walls.
+  // The only headed auth flow is explicit manual login (user clicked "Sign in").
+  const _preflightHeaded = _silentPreflightProbe ? false : undefined;
 
   // ── REST API path (api_key, bearer, basic) — multi-turn agentic loop ──
   if (agentType === 'api_key' || agentType === 'bearer' || agentType === 'basic') {
@@ -12906,6 +12906,107 @@ async function actionExtractItems({ sessionId, url } = {}) {
 }
 
 // ---------------------------------------------------------------------------
+// actionExtractUrl — lightweight URL-first authenticated extraction.
+//
+// When web.crawl is bot-blocked by a site (Amazon, etc.), this action uses
+// the agent's persistent authenticated browser profile to navigate to the
+// URL and run the same extract-page-items.cjs script that web.crawl uses.
+// No Tab-Map, no destination resolution, no playwright.agent loop — just
+// navigate + scroll + eval. Fast (~10-15s) and reuses the authenticated
+// session cookies so the site serves real content instead of a bot wall.
+//
+// Args: { agentId, url }
+// Returns: { ok, items, count, stats, url, content, title, fallback: 'authenticated_browser' }
+// ---------------------------------------------------------------------------
+async function actionExtractUrl({ agentId, url } = {}) {
+  if (!agentId) return { ok: false, error: 'agentId is required for extract_url' };
+  if (!url)     return { ok: false, error: 'url is required for extract_url' };
+
+  // Normalize agentId
+  if (!agentId.endsWith('.agent')) agentId = `${agentId}.agent`;
+
+  logger.info(`[browser.agent] extract_url: ${agentId} → ${url}`);
+
+  // Look up the agent descriptor to confirm it exists
+  const existing = await actionQueryAgent({ id: agentId });
+  if (!existing.found) {
+    return { ok: false, error: `No registered agent "${agentId}" for extract_url` };
+  }
+
+  // Use the same stable persistent profile as actionRun (line 8119-8124).
+  // This profile persists cookies across runs so the authenticated session
+  // is reused without re-login.
+  const sessionId = `${agentId.replace('.agent', '')}_agent`;
+
+  // Track whether we opened the session so we only close what we opened
+  let _openedSession = false;
+  try {
+    // Step 1: Navigate the authenticated session to the target URL
+    logger.info(`[browser.agent] extract_url: navigating session=${sessionId} to ${url}`);
+    const navRes = await callBrowserAct({ action: 'navigate', sessionId, url, timeoutMs: 30000, headed: true }, 35000);
+    if (navRes?.ok === false) {
+      return { ok: false, error: `navigation failed: ${navRes?.error || 'unknown'}`, items: [] };
+    }
+    _openedSession = true;
+
+    // Step 2: Wait for SPA render (same as web.crawl's waitMs)
+    await new Promise(r => setTimeout(r, 2500));
+
+    // Step 3: Scroll pass to trigger lazy-loaded images (same as actionExtractItems)
+    try {
+      const scrollSteps = 4;
+      for (let i = 1; i <= scrollSteps; i++) {
+        await callBrowserAct({ action: 'evaluate', text: `(() => window.scrollTo(0, document.body.scrollHeight * ${i / scrollSteps}))()`, sessionId, timeoutMs: 3000, headed: true }, 5000).catch(() => null);
+        await new Promise(r => setTimeout(r, 400));
+      }
+      await callBrowserAct({ action: 'evaluate', text: '(() => window.scrollTo(0, 0))()', sessionId, timeoutMs: 3000, headed: true }, 5000).catch(() => null);
+    } catch (_) { /* scroll pass is best-effort */ }
+
+    // Step 4: Extract page title + content for the synthesize LLM
+    let title = '';
+    let content = '';
+    try {
+      const titleRes = await callBrowserAct({ action: 'evaluate', text: 'document.title', sessionId, timeoutMs: 5000, headed: true }, 8000);
+      title = String(titleRes?.result ?? titleRes?.stdout ?? '').trim().replace(/^"|"$/g, '');
+    } catch (_) {}
+    try {
+      const contentRes = await callBrowserAct({ action: 'evaluate', text: '(document.body && document.body.innerText ? document.body.innerText.slice(0, 20000) : "")', sessionId, timeoutMs: 8000, headed: true }, 10000);
+      content = String(contentRes?.result ?? contentRes?.stdout ?? '').trim().replace(/^"|"$/g, '');
+    } catch (_) {}
+
+    // Step 5: Run the shared extraction script in the page context
+    logger.info(`[browser.agent] extract_url: running extract-page-items script in session=${sessionId}`);
+    const script = buildExtractItemsScript();
+    const evalRes = await callBrowserAct({ action: 'evaluate', text: script, sessionId, timeoutMs: 15000, headed: true }, 20000);
+
+    const rawOutput = evalRes?.result != null ? evalRes.result : evalRes?.stdout;
+    const parsed = parseExtractedItems(typeof rawOutput === 'string' ? rawOutput : JSON.stringify(rawOutput));
+    const items = parsed.items;
+
+    logger.info(`[browser.agent] extract_url: extracted ${items.length} items from ${url}` + (parsed.stats && Object.keys(parsed.stats).length ? ` (stats: ${JSON.stringify(parsed.stats)})` : ''));
+
+    return {
+      ok: true,
+      items,
+      count: items.length,
+      stats: parsed.stats || {},
+      url,
+      content,
+      title,
+      fallback: 'authenticated_browser',
+    };
+  } catch (err) {
+    logger.warn(`[browser.agent] extract_url failed: ${err.message}`);
+    return { ok: false, error: err.message, items: [] };
+  } finally {
+    // Close the session we opened so we don't leave a browser window hanging
+    if (_openedSession) {
+      await callBrowserAct({ action: 'close', sessionId, headed: true }, 8000).catch(() => {});
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
 
 async function browserAgent(args) {
   const { action } = args || {};
@@ -12944,6 +13045,9 @@ async function browserAgent(args) {
     case 'extract_items':
         return await actionExtractItems(args);
 
+    case 'extract_url':
+        return await actionExtractUrl(args);
+
     case 'delete_agent':
         return await actionDeleteAgent(args);
 
@@ -12965,7 +13069,7 @@ async function browserAgent(args) {
     default:
         return {
         ok: false,
-        error: `Unknown action: "${action}". Valid: build_agent | query_agent | list_agents | validate_agent | run | authenticate | explore | scan_domain | scan_page | extract_items | delete_agent | record_failure | resolve_deep_link`,
+        error: `Unknown action: "${action}". Valid: build_agent | query_agent | list_agents | validate_agent | run | authenticate | explore | scan_domain | scan_page | extract_items | extract_url | delete_agent | record_failure | resolve_deep_link`,
         };
   }
 }
