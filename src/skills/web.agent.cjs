@@ -204,7 +204,10 @@ async function actionSearchAndNavigate({ query, preferDomain, maxResults = 5 }) 
     title: best.title,
     snippet: best.snippet,
     score: best._score,
-    allResults: scored.map(r => ({ url: r.url, title: r.title, score: r._score })),
+    // Alternate candidate URLs for the caller (e.g. web.crawl) to retry when
+    // bestUrl turns out to be an error page or thin content.
+    fallbackUrls: scored.slice(1, 4).map(r => r.url),
+    allResults: scored.map(r => ({ url: r.url, title: r.title, snippet: r.snippet, score: r._score })),
   };
 }
 

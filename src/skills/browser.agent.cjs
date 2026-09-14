@@ -27,6 +27,7 @@ const os   = require('os');
 const fs   = require('fs');
 const http = require('http');
 const logger = require('../logger.cjs');
+const { buildExtractItemsScript, parseExtractedItems } = require('./extract-page-items.cjs');
 
 // ---------------------------------------------------------------------------
 // WALT: Build JavaScript extraction code for different extract types
@@ -2108,6 +2109,11 @@ async function _verifyGoalWithOcr(goal, sessionId, actionHistory) {
       ? browserEngine.getPage(sessionId) : null;
     if (!_ocrPage) return { verified: true, reason: 'no-page-available' };
 
+    // If the last action spawned a new tab (target=_blank / window.open), the
+    // tracked page may still be loading — wait for DOM before OCR so we don't
+    // capture a half-rendered or about:blank page.
+    try { await _ocrPage.waitForLoadState('domcontentloaded', { timeout: 8000 }); } catch (_) {}
+
     // Wait for the page to stabilize before capturing. If the first capture is
     // too small (page still loading, spinner, or wrong viewport), wait and retry
     // once — this is critical for Google Cloud Console where content loads after
@@ -3919,6 +3925,7 @@ const KNOWN_BROWSER_SERVICES = {
   // ── Social media ────────────────────────────────────────────────────────────────────────────────────
   tiktok:         { startUrl: 'https://www.tiktok.com',                          signInUrl: 'https://www.tiktok.com/login',                      authSuccessPattern: 'tiktok.com/foryou',            isOAuth: true  },
   pinterest:      { startUrl: 'https://www.pinterest.com',                       signInUrl: 'https://www.pinterest.com/login',                   authSuccessPattern: 'pinterest.com/',               isOAuth: true  },
+  etsy:           { startUrl: 'https://www.etsy.com',                            signInUrl: 'https://www.etsy.com/signin',                       authSuccessPattern: 'etsy.com/',                    isOAuth: true  },
   reddit:         { startUrl: 'https://www.reddit.com',                          signInUrl: 'https://www.reddit.com/login',                      authSuccessPattern: 'reddit.com/',                  isOAuth: true,
                    intentUrls: {
                      social: { buildUrl: (task) => { const m = task.match(/r\/([\w-]+)/i); return m ? `https://www.reddit.com/r/${m[1]}/submit` : 'https://www.reddit.com/submit'; } },
@@ -12850,6 +12857,51 @@ async function actionExplore({ agentId, goal, url, sessionId, maxDepth, maxNavIt
 
 // ---------------------------------------------------------------------------
 
+/**
+ * actionExtractItems — extract structured page cards from an authenticated
+ * browser session. Uses the shared extract-page-items utility so the extraction
+ * logic is identical to web.crawl's extractItems path.
+ *
+ * Requires an active sessionId (the authenticated agent session, e.g. gmail_agent).
+ * The session must already be on the target page (inbox, dashboard, list view).
+ */
+async function actionExtractItems({ sessionId }) {
+  if (!sessionId) {
+    return { ok: false, error: 'sessionId is required for extract_items (the authenticated agent session must already be on the target page)' };
+  }
+
+  logger.info(`[browser.agent] extract_items: extracting cards from session=${sessionId}`);
+
+  try {
+    // Scroll pass to trigger lazy-loaded images before extraction
+    try {
+      const scrollSteps = 4;
+      for (let i = 1; i <= scrollSteps; i++) {
+        await callBrowserAct({ action: 'evaluate', text: `(() => window.scrollTo(0, document.body.scrollHeight * ${i / scrollSteps}))()`, sessionId, timeoutMs: 3000 }, 5000).catch(() => null);
+        await new Promise(r => setTimeout(r, 400));
+      }
+      await callBrowserAct({ action: 'evaluate', text: '(() => window.scrollTo(0, 0))()', sessionId, timeoutMs: 3000 }, 5000).catch(() => null);
+    } catch (_) { /* scroll pass is best-effort */ }
+
+    // Run the shared extraction script in the page context
+    const script = buildExtractItemsScript();
+    const evalRes = await callBrowserAct({ action: 'evaluate', text: script, sessionId, timeoutMs: 12000 }, 18000);
+
+    // The evaluate action returns { ok, result, stdout } — result is the JS value,
+    // stdout is the stringified version. parseExtractedItems handles both.
+    const rawOutput = evalRes?.result != null ? evalRes.result : evalRes?.stdout;
+    const items = parseExtractedItems(typeof rawOutput === 'string' ? rawOutput : JSON.stringify(rawOutput));
+
+    logger.info(`[browser.agent] extract_items: extracted ${items.length} items from session=${sessionId}`);
+    return { ok: true, items, count: items.length };
+  } catch (err) {
+    logger.warn(`[browser.agent] extract_items failed: ${err.message}`);
+    return { ok: false, error: err.message, items: [] };
+  }
+}
+
+// ---------------------------------------------------------------------------
+
 async function browserAgent(args) {
   const { action } = args || {};
 
@@ -12884,6 +12936,9 @@ async function browserAgent(args) {
     case 'scan_page':
         return await actionScanPage(args);
 
+    case 'extract_items':
+        return await actionExtractItems(args);
+
     case 'delete_agent':
         return await actionDeleteAgent(args);
 
@@ -12905,7 +12960,7 @@ async function browserAgent(args) {
     default:
         return {
         ok: false,
-        error: `Unknown action: "${action}". Valid: build_agent | query_agent | list_agents | validate_agent | run | authenticate | explore | scan_domain | scan_page | delete_agent | record_failure | resolve_deep_link`,
+        error: `Unknown action: "${action}". Valid: build_agent | query_agent | list_agents | validate_agent | run | authenticate | explore | scan_domain | scan_page | extract_items | delete_agent | record_failure | resolve_deep_link`,
         };
   }
 }

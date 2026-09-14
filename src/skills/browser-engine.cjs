@@ -314,7 +314,17 @@ async function launch(sessionId, opts = {}) {
 
   const netLog = [];
   const pages = ctx.pages();
-  ctx.on('page', (p) => { _attachNetLog(p, netLog); _attachDialogHandler(p); });
+  ctx.on('page', (p) => {
+    _attachNetLog(p, netLog);
+    _attachDialogHandler(p);
+    // Follow spawned pages: a click on a target=_blank link, window.open, or an
+    // explicit ctx.newPage() creates a page that Chrome raises to the foreground
+    // — the agent should act on what the user now sees. Without this, getPage()
+    // stays pinned to the pre-click tab and snapshots/clicks/OCR verification
+    // silently target the wrong page (e.g. Etsy search → product opens a new tab).
+    const s = _sessions.get(sessionId);
+    if (s) s.activePage = p;
+  });
   for (const p of pages) { _attachNetLog(p, netLog); _attachDialogHandler(p); }
 
   // Register ad-block interception (route blocking + init script) for all future navigations

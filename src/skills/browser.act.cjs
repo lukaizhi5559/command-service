@@ -1599,6 +1599,17 @@ const snapshotCache = new Map();    // "sessionId:tabIndex" → snapshot text
 const currentTabIndex = new Map();  // sessionId → current tab index (default 0)
 
 function _tabKey(sessionId) {
+  // When the engine manages this session, derive the index from the engine's
+  // activePage — it follows spawned tabs (target=_blank, window.open, tab-new),
+  // which currentTabIndex alone can't see. Falls back to currentTabIndex for
+  // the CLI/daemon path.
+  try {
+    const _p = engine.getPage?.(sessionId);
+    if (_p) {
+      const _idx = (engine.getContext(sessionId)?.pages() || []).indexOf(_p);
+      if (_idx >= 0) return `${sessionId}:${_idx}`;
+    }
+  } catch (_) {}
   return `${sessionId}:${currentTabIndex.get(sessionId) || 0}`;
 }
 function _tabKeyFor(sessionId, idx) {
@@ -6837,17 +6848,27 @@ If no videos found, return []. Do not explain, only output the JSON array.`;
           alreadyOpen = await isDaemonAlive(sessionId, headed);
           if (alreadyOpen) openSessions.add(sessionId);
         }
-        // Skip navigation if browser is already on the target login URL's hostname.
+        // Skip navigation if browser is already on the target login URL.
+        // Host equivalence alone is NOT enough: for same-host sign-in pages
+        // (etsy.com/signin, notion.com/login) the path matters — being on the
+        // landing page must not suppress navigation to the login path.
+        // Skip only when the target has a root path OR the current path already
+        // matches the target path (don't reload a form the user is mid-way through).
         // currentUrl is passed by browser.agent (the URL it already probed) — avoids
         // an extra eval call and brittle stdout regex parsing.
         let _skipNav = false;
         if (alreadyOpen && currentUrl) {
           try {
-            const _curHost = new URL(currentUrl).hostname;
-            const _targetHost = new URL(url).hostname;
-            if (isHostEquivalent(_curHost, _targetHost)) {
-              _skipNav = true;
-              logger.info(`[browser.act] waitForAuth: already on ${_curHost} (equivalent to ${_targetHost}) — skipping redundant navigation (session=${sessionId})`);
+            const _cur = new URL(currentUrl);
+            const _tgt = new URL(url);
+            if (isHostEquivalent(_cur.hostname, _tgt.hostname)) {
+              const _normPath = (p) => (p || '/').replace(/\/+$/, '') || '/';
+              _skipNav = _normPath(_tgt.pathname) === '/' || _normPath(_cur.pathname) === _normPath(_tgt.pathname);
+              if (_skipNav) {
+                logger.info(`[browser.act] waitForAuth: already on ${_cur.hostname}${_cur.pathname} (equivalent to ${url}) — skipping redundant navigation (session=${sessionId})`);
+              } else {
+                logger.info(`[browser.act] waitForAuth: on ${_cur.hostname} but path ${_cur.pathname} ≠ ${_tgt.pathname} — navigating to ${url} (session=${sessionId})`);
+              }
             }
           } catch (_) { /* URL parse failed — proceed with navigation */ }
         }

@@ -159,6 +159,11 @@ osascript  — macOS Finder and desktop UI automation. Use ONLY for complex GUI 
 open       — Launch files and URLs by association. Do NOT use for app focus/activation; route
              those goals to app.agent instead.
 
+lp / lpr   — CUPS printing. Sends a file to the default printer.
+             For "print this file" / "print the document" / "print <path>" → use lp, NOT cat.
+             cat displays content on screen; lp sends to a physical printer.
+             Example: lp "/path/to/file.pdf"
+
 GUI focus / app activation rule:
 When the goal is to bring an application to the front, focus it, or activate it, do NOT generate
 a shell command. Instead, return an error indicating that this should be handled by app.agent.
@@ -252,6 +257,26 @@ const SYSTEM_QUERY_REGISTRY = [
     label: 'Audio / sound devices',
     cmd: 'bash',
     argv: ['-c', 'system_profiler SPAudioDataType | head -40'],
+  },
+];
+
+// ---------------------------------------------------------------------------
+// File-Operation Registry — pre-validated commands for known file ops.
+// Each entry has a regex to match the goal, a path extractor, and a cmd builder.
+// Used by Layer 1.5 (force-classification for file operations) when the goal
+// matches a known file-op pattern. Zero LLM generation, zero hallucination.
+// Same pattern as SYSTEM_QUERY_REGISTRY but for parameterized file operations.
+// ---------------------------------------------------------------------------
+const FILE_OP_REGISTRY = [
+  {
+    label: 'Print file',
+    regex: /\bprint\s+(?:this|that|the|current)?\s*(?:file|document|doc)\b/i,
+    extractPath: (goal) => {
+      // Extract /path from the goal string (absolute path with extension)
+      const m = goal.match(/\/[^\s"']+\.\w{1,10}/);
+      return m ? m[0] : null;
+    },
+    buildCmd: (filePath) => ({ cmd: 'lp', argv: [filePath] }),
   },
 ];
 
@@ -751,6 +776,54 @@ const ALLOWED_COMMANDS = new Set([
   'fd', 'bat', 'fzf',
   'mkcert',
   'act',
+
+  // ── Printing (CUPS) ──────────────────────────────────────────────────────────
+  'lp', 'lpr', 'lpstat', 'lpoptions', 'cancel',
+
+  // ── macOS system / desktop ───────────────────────────────────────────────────
+  'sips', 'qlmanage', 'mas', 'softwareupdate', 'installer', 'ditto',
+  'xcodebuild', 'swift', 'xcrun', 'iconv', 'lsof', 'top',
+
+  // ── Text / data processing ───────────────────────────────────────────────────
+  'bc', 'expr', 'test', 'column', 'paste', 'join', 'split', 'tac', 'nl',
+  'xxd', 'perl',
+
+  // ── Crypto / security ────────────────────────────────────────────────────────
+  'openssl', 'gpg', 'age', 'certbot',
+
+  // ── Filesystem (non-destructive) ────────────────────────────────────────────
+  'realpath', 'truncate', 'mktemp',
+
+  // ── Scheduling ──────────────────────────────────────────────────────────────
+  'crontab', 'at', 'atrm', 'atq',
+
+  // ── System info / logging ───────────────────────────────────────────────────
+  'logger', 'dmesg', 'hostnamectl', 'users', 'last', 'logname',
+  'vmstat', 'iostat', 'mpstat', 'sar', 'pstree',
+
+  // ── Database ────────────────────────────────────────────────────────────────
+  'pg_dump',
+
+  // ── PDF / LaTeX ──────────────────────────────────────────────────────────────
+  'pdftoppm', 'pdftocairo', 'pdflatex', 'xelatex', 'lualatex', 'tex',
+
+  // ── Network ──────────────────────────────────────────────────────────────────
+  'nc', 'traceroute', 'ftp', 'sftp', 'telnet',
+
+  // ── Windows / cross-platform ────────────────────────────────────────────────
+  'pwsh', 'powershell', 'reg', 'wmic', 'winget', 'choco', 'scoop',
+
+  // ── Linux package managers ──────────────────────────────────────────────────
+  'apt', 'apt-get', 'dpkg', 'snap', 'flatpak', 'pacman', 'yay', 'paru',
+
+  // ── systemd / init ──────────────────────────────────────────────────────────
+  'systemctl', 'service', 'journalctl', 'timedatectl',
+
+  // NOTE: Destructive system commands (shutdown, reboot, halt, init, telinit,
+  // runlevel, fdisk, parted, fsck, mount, umount) are deliberately NOT in this
+  // list — they surface the allowlist ask_user card so the user explicitly
+  // approves before running. The allowlist is a "recognized command" gate, not
+  // the safety boundary (that's DANGEROUS_COMMANDS + DANGEROUS_SCRIPT_PATTERNS).
 ]);
 
 const USER_ALLOWLIST_PATH = path.join(os.homedir(), '.thinkdrop', 'allowed-commands.json');
@@ -1354,14 +1427,35 @@ async function shellRun(args) {
       argv = entry.argv;
       logger.info('[shell.run] Goal matched system query registry', { category: categoryNum, label: entry.label, cmd, argv });
     } else {
-      // ── Fallback: free-generation for custom tasks (existing path) ─────
-      const resolved = await _resolveGoalToCommand(goal, _progressCallback || null);
-      if (!resolved.ok) {
-        return { ok: false, stdout: '', stderr: '', exitCode: -1, executionTime: 0, cmd: '', dryRun, error: resolved.error };
+      // ── Layer 1.5: Force-classification for known file operations ──────
+      // Check FILE_OP_REGISTRY for patterns like "print this file" that have
+      // pre-validated commands. Zero LLM generation, zero hallucination.
+      // Same pattern as SYSTEM_QUERY_REGISTRY but for parameterized file ops.
+      let _fileOpMatched = false;
+      for (const entry of FILE_OP_REGISTRY) {
+        if (entry.regex.test(goal)) {
+          const filePath = entry.extractPath(goal);
+          if (filePath) {
+            const built = entry.buildCmd(filePath);
+            cmd = built.cmd;
+            argv = built.argv;
+            logger.info('[shell.run] Goal matched file-op registry', { label: entry.label, cmd, argv });
+            _fileOpMatched = true;
+            break;
+          }
+        }
       }
-      cmd = resolved.cmd;
-      argv = resolved.argv;
-      logger.info('[shell.run] Goal resolved to command', { cmd, argv });
+
+      if (!_fileOpMatched) {
+        // ── Fallback: free-generation for custom tasks (existing path) ─────
+        const resolved = await _resolveGoalToCommand(goal, _progressCallback || null);
+        if (!resolved.ok) {
+          return { ok: false, stdout: '', stderr: '', exitCode: -1, executionTime: 0, cmd: '', dryRun, error: resolved.error };
+        }
+        cmd = resolved.cmd;
+        argv = resolved.argv;
+        logger.info('[shell.run] Goal resolved to command', { cmd, argv });
+      }
     }
   }
   // ─────────────────────────────────────────────────────────────────────────
@@ -1383,7 +1477,15 @@ async function shellRun(args) {
       cmd: originalCmdString,
       dryRun,
       error: validation.error,
-      userAllowlistHint: !!validation.userAllowlistHint,
+      // Propagate allowlist ask_user fields so executeCommand.js can surface
+      // the "Allow X and retry" card instead of a generic "failed: null".
+      askUser: validation.askUser || false,
+      question: validation.question || null,
+      options: validation.options || null,
+      _isShellAllowlist: validation._isShellAllowlist || false,
+      // Fix: validation returns userAllowlistPath (not userAllowlistHint);
+      // the hint is true when either the path or the _isShellAllowlist marker is set.
+      userAllowlistHint: !!validation.userAllowlistPath || !!validation._isShellAllowlist,
       commandName: validation.commandName || null,
       userAllowlistPath: validation.userAllowlistPath || null,
       _shellStringInCmd: !!validation._shellStringInCmd,
@@ -1440,6 +1542,10 @@ async function shellRun(args) {
     executionTime: verifiedResult.executionTime,
     ok: verifiedResult.ok,
     strictModeInjected,
+    // Include truncated stderr for diagnostics — distinguishes missing file,
+    // AppleScript/TCC failure, wrong active app, invalid command, printer failure.
+    // Never log stdout (may contain file contents); stderr is usually short error text.
+    stderr: verifiedResult.ok ? undefined : String(verifiedResult.stderr || '').trim().slice(0, 500),
   });
 
   // ── Layer 2: Discovery retry for failed pipelines ─────────────────────
