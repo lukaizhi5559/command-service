@@ -17,6 +17,7 @@
  *   waitMs        {number}  — extra settle wait after navigation (default: 1500)
  *   extractLinks  {boolean} — extract <a href> links (default: false)
  *   extractItems  {boolean} — extract structured page cards via shared utility (default: false)
+ *   extractMedia  {boolean} — also extract video/media items (implies extractItems; default: false)
  *
  * Bot-wall handling: candidates are tried headless first. If all are rejected
  * with an error-page signature, the primary URL is retried once in headed real
@@ -25,7 +26,7 @@
  * result is { ok:false, botBlocked:true } so the caller can escalate.
  *
  * Returns:
- *   { ok, url, title, content, contentLength, truncated, links, items,
+ *   { ok, url, title, content, contentLength, truncated, links, items, itemStats,
  *     elapsedMs, attempts, warmRetry?, botBlocked?, rejectedReason?, error? }
  */
 
@@ -125,11 +126,17 @@ function unwrapEvalResult(stdout) {
 // Detects error/blocked/empty pages so the caller's fallback URLs can be tried.
 // Content match is gated on a thin page to avoid flagging pages that merely
 // mention "error"/"404" in normal prose.
-const _ERROR_PAGE_RE = /error page|page not found|\b404\b|access denied|forbidden|blocked|captcha|pardon our interruption|unusual traffic|are you a robot|service unavailable|temporarily unavailable/i;
+const _ERROR_PAGE_RE = /error page|page not found|\b404\b|access denied|forbidden|blocked|captcha|pardon our interruption|unusual traffic|are you a robot|service unavailable|temporarily unavailable|automated access|robot check|validatecaptcha|\/sorry\/|prove you.{0,20}(?:human|not a robot)/i;
 
 // Returns { reason, signature } — signature:true means an error-page/bot-wall
 // signature matched (safe to report as blocked); signature:false means only the
 // weak thin-page heuristic fired (could be a legitimately sparse page).
+//
+// When `extractItems` is true and the page is thin AND yielded 0 items, we
+// treat it as a likely soft block (signature:true) so the headed warm retry
+// fires — Amazon's headless soft-block returns ~293 chars of JS with no
+// product cards, which the old "thin page, 0 items" (signature:false) path
+// never escalated.
 function _badCrawlReason(res, extractItems) {
   if (!res.ok) return { reason: res.error || 'request failed', signature: false };
   const title = res.title || '';
@@ -139,6 +146,12 @@ function _badCrawlReason(res, extractItems) {
   const len = res.contentLength || (res.content || '').length;
   if (len < 1500 && _ERROR_PAGE_RE.test((res.content || '').slice(0, 500))) {
     return { reason: `error-page signature in thin content (${len} chars)`, signature: true };
+  }
+  // Soft-block signature: items were requested but the page is thin AND empty.
+  // Real listing pages are >2500 chars and produce ≥1 card. A thin 0-item page
+  // is almost always a bot wall (Amazon) or a JS-only render that didn't settle.
+  if (extractItems && (!res.items || res.items.length === 0) && len < 2500) {
+    return { reason: `thin page with 0 extracted items (${len} chars, possible soft block)`, signature: true };
   }
   if (extractItems && (!res.items || res.items.length === 0) && len < 1500) {
     return { reason: `thin page with 0 extracted items (${len} chars)`, signature: false };
@@ -231,6 +244,7 @@ async function _crawlOnce(normalizedUrl, { maxChars, timeoutMs, effectiveWaitMs,
 
     // Step 6: Optionally extract structured page cards (items)
     let items = null;
+    let itemStats = null;
     if (extractItems) {
       progress('Extracting page cards (items)...');
       // Scroll pass to trigger lazy-loaded images before extraction
@@ -245,14 +259,24 @@ async function _crawlOnce(normalizedUrl, { maxChars, timeoutMs, effectiveWaitMs,
       } catch (_) { /* scroll pass is best-effort */ }
 
       const itemsExpr = `() => ${buildExtractItemsScript()}`;
-      const itemsRes = await cliRun([...S, 'eval', itemsExpr], 12000);
-      const itemsRaw = unwrapEvalResult(itemsRes.stdout);
-      items = parseExtractedItems(itemsRaw);
-      if (items && items.length > 0) {
-        progress(`Extracted ${items.length} items from page`);
+      const itemsRes = await cliRun([...S, 'eval', itemsExpr], 20000);
+      // Detect timeout/crash so future runs can tell whether the script
+      // returned empty vs. was killed before it could return anything.
+      if (!itemsRes.ok) {
+        const timedOut = itemsRes.exitCode === null;
+        const reason = timedOut ? 'item extraction timed out' : `item extraction failed (exit=${itemsRes.exitCode})`;
+        progress(`${reason} — stderr: ${(itemsRes.stderr || '').slice(0, 200)}`);
+        itemStats = { error: reason, stderr: (itemsRes.stderr || '').slice(0, 500) };
+        items = [];
       } else {
-        items = null;
+        const itemsRaw = unwrapEvalResult(itemsRes.stdout);
+        const parsed = parseExtractedItems(itemsRaw);
+        // Always expose items as an array (even if empty) so downstream consumers
+        // can tell extraction was attempted. Preserve stats for debugging.
+        items = Array.isArray(parsed.items) ? parsed.items : [];
+        itemStats = parsed.stats || {};
       }
+      progress(`Item extraction finished: ${items.length} items (stats: ${JSON.stringify(itemStats)})`);
     }
 
     return {
@@ -264,6 +288,7 @@ async function _crawlOnce(normalizedUrl, { maxChars, timeoutMs, effectiveWaitMs,
       truncated,
       links,
       items,
+      itemStats,
       elapsedMs: Date.now() - startTime,
     };
 
@@ -295,6 +320,7 @@ async function webCrawl(args) {
     waitMs    = 1500,
     extractLinks = false,
     extractItems = false,
+    extractMedia = false,
     onProgress = null,
   } = args || {};
 
@@ -304,8 +330,11 @@ async function webCrawl(args) {
     return { ok: false, url, error: 'url is required', elapsedMs: 0 };
   }
 
+  // extractMedia implies extractItems — videos ride in the unified items pass.
+  const wantItems = extractItems || extractMedia;
+
   // Bump settle wait when extracting items — lazy images need render time
-  const effectiveWaitMs = extractItems && waitMs < 2500 ? 2500 : waitMs;
+  const effectiveWaitMs = wantItems && waitMs < 2500 ? 2500 : waitMs;
 
   // Candidate list: primary first, then fallbacks (http(s) only, deduped,
   // max 3 total attempts to bound crawl time).
@@ -328,11 +357,11 @@ async function webCrawl(args) {
     if (attempt > 0) progress(`Retrying fallback URL ${attempt + 1}/${candidates.length}: ${candidate}`);
 
     const res = await _crawlOnce(candidate, {
-      maxChars, timeoutMs, effectiveWaitMs, extractLinks, extractItems, progress, startTime,
+      maxChars, timeoutMs, effectiveWaitMs, extractLinks, extractItems: wantItems, progress, startTime,
     });
     lastRes = res;
 
-    const bad = _badCrawlReason(res, extractItems);
+    const bad = _badCrawlReason(res, wantItems);
     if (!bad) {
       return { ...res, elapsedMs: Date.now() - startTime, attempts: attempt + 1 };
     }
@@ -346,9 +375,9 @@ async function webCrawl(args) {
   if (lastBad && lastBad.signature) {
     progress(`All headless attempts blocked — warm retry in headed Chrome: ${candidates[0]}`);
     const warmRes = await _crawlOnce(candidates[0], {
-      maxChars, timeoutMs, effectiveWaitMs, extractLinks, extractItems, progress, startTime, warm: true,
+      maxChars, timeoutMs, effectiveWaitMs, extractLinks, extractItems: wantItems, progress, startTime, warm: true,
     });
-    const warmBad = _badCrawlReason(warmRes, extractItems);
+    const warmBad = _badCrawlReason(warmRes, wantItems);
     if (!warmBad) {
       return { ...warmRes, elapsedMs: Date.now() - startTime, attempts: candidates.length + 1, warmRetry: true };
     }

@@ -9,7 +9,8 @@
  * Actions:
  *   research_domain      { domain, query }              → searches web for domain-specific guidance
  *   get_tutorial_steps   { query }                       → extracts step-by-step instructions from search results
- *   search_and_navigate  { query, preferDomain? }        → searches web, picks best URL to navigate to directly
+ *   search_and_navigate  { query, preferDomain?, listing? } → searches web, picks best URL to navigate to directly
+ *   site_search          { domain, query }                  → resolves a named-site listing/search task to the site's own results URL (template-first, listing-biased search fallback)
  *   discover_task_url   { domain, task }                → dual search (site-scoped + broad) to find the most direct deep-link URL for a task
  *   discover_search_syntax { domain, task }              → search + crawl official docs to extract a service's search/filter query operators
  *   research_app_behavior { domain, query? }            → targeted web research for app-level operational knowledge (shortcuts, UI modes, quirks)
@@ -21,6 +22,21 @@ const http   = require('http');
 const https  = require('https');
 const logger = require('../logger.cjs');
 const { isAuthFlowUrl } = require('../skill-helpers/destination-resolver.cjs');
+const { buildSiteSearchUrl, isSearchResultsUrl } = require('../skill-helpers/site-search.cjs');
+
+/**
+ * Validate that a result has a usable http(s) URL.
+ * Drops LLM-fallback pseudo-results (url:'' or missing) and any malformed
+ * entries before they can be scored / selected as `best`.
+ */
+function _hasValidUrl(r) {
+  try {
+    const u = new URL(r.url);
+    return u.protocol === 'http:' || u.protocol === 'https:';
+  } catch (_) {
+    return false;
+  }
+}
 
 // Web Search MCP configuration from environment
 const WEB_SEARCH_API_URL = process.env.MCP_WEB_SEARCH_URL;
@@ -70,7 +86,13 @@ async function searchWeb(query, maxResults = 5) {
       res.on('end', () => {
         try {
           const parsed = JSON.parse(data);
-          const results = parsed?.data?.results || parsed?.results || [];
+          const raw = parsed?.data?.results || parsed?.results || [];
+          // Drop URL-less / malformed results (e.g. LLM-fallback pseudo-results
+          // with url:'' that would otherwise score 0 and win as `best`).
+          const results = raw.filter(_hasValidUrl);
+          if (results.length < raw.length) {
+            logger.warn(`[web.agent] searchWeb: dropped ${raw.length - results.length} URL-less/invalid result(s)`);
+          }
           logger.info(`[web.agent] searchWeb: ${results.length} results for "${query.slice(0, 60)}"`);
           resolve({ ok: true, results });
         } catch (e) {
@@ -147,8 +169,13 @@ function _classifyDiscoveryCandidate({ url, title, snippet }, serviceDomain) {
 /**
  * Score a search result URL for quality.
  * Higher = better. Penalizes parking pages via content signals, rewards preferDomain match.
+ *
+ * When `opts.listing` is true, applies listing-page bias:
+ *   +40 on-domain URLs containing search markers (/s?, /search, ?q=, ?k=, sch/, _nkw, /find)
+ *   −40 deep-item pages (/dp/, /gp/product, /item/, /itm/, /product, /p/)
+ * This keeps "search <site> for 'X'" tasks on the SERP instead of a single product page.
  */
-function _scoreResult(result, preferDomain) {
+function _scoreResult(result, preferDomain, opts = {}) {
   let score = 50; // baseline
   try {
     const host = new URL(result.url).hostname.replace(/^www\./, '');
@@ -166,6 +193,16 @@ function _scoreResult(result, preferDomain) {
     if (host.startsWith('docs.') || host.startsWith('developer.') || host.startsWith('help.')) score += 15;
     // Boost if snippet has step-like content
     if (result.snippet && /step|how to|navigate|click|select/i.test(result.snippet)) score += 5;
+
+    // Listing-page bias: prefer the site's search/results URL over deep item pages.
+    if (opts.listing && preferDomain) {
+      const pref = preferDomain.toLowerCase().replace(/^www\./, '');
+      const onDomain = host === pref || host.endsWith('.' + pref);
+      if (onDomain) {
+        if (isSearchResultsUrl(result.url)) score += 40;
+        if (/\/(?:dp|gp\/product|item|itm|product|p|listing|watch|video|view)\b/i.test(result.url)) score -= 40;
+      }
+    }
   } catch (_) { score = 0; }
   return score;
 }
@@ -173,11 +210,14 @@ function _scoreResult(result, preferDomain) {
 /**
  * Search the web and return the best URL to navigate to directly.
  * Used by browser.agent internally and as a plan-level skill.
+ *
+ * `listing:true` enables listing-page bias (SERP > deep-item pages) for
+ * "search <site> for 'X'" / "show pics of … on <site>" tasks.
  */
-async function actionSearchAndNavigate({ query, preferDomain, maxResults = 5 }) {
+async function actionSearchAndNavigate({ query, preferDomain, maxResults = 5, listing = false }) {
   if (!query) return { ok: false, error: 'query is required' };
 
-  logger.info(`[web.agent] search_and_navigate: "${query.slice(0, 80)}" preferDomain=${preferDomain || 'none'}`);
+  logger.info(`[web.agent] search_and_navigate: "${query.slice(0, 80)}" preferDomain=${preferDomain || 'none'} listing=${listing}`);
 
   const searchResult = await searchWeb(query, maxResults);
   if (!searchResult.ok) return searchResult;
@@ -187,7 +227,7 @@ async function actionSearchAndNavigate({ query, preferDomain, maxResults = 5 }) 
 
   // Score all results, filter negatives
   const scored = results
-    .map(r => ({ ...r, _score: _scoreResult(r, preferDomain) }))
+    .map(r => ({ ...r, _score: _scoreResult(r, preferDomain, { listing }) }))
     .filter(r => r._score >= 0)
     .sort((a, b) => b._score - a._score);
 
@@ -209,6 +249,54 @@ async function actionSearchAndNavigate({ query, preferDomain, maxResults = 5 }) 
     fallbackUrls: scored.slice(1, 4).map(r => r.url),
     allResults: scored.map(r => ({ url: r.url, title: r.title, snippet: r.snippet, score: r._score })),
   };
+}
+
+/**
+ * Resolve a named-site listing/search task to the site's own results URL.
+ *
+ * For sites with a known search URL template (amazon.com, ebay.com, youtube.com,
+ * ...) this skips web search entirely and returns the deterministic SERP URL —
+ * e.g. `site_search({ domain:'amazon.com', query:'ESV bibles' })` →
+ * `https://www.amazon.com/s?k=ESV%20bibles`. This is the correct landing page
+ * for "show pics of baby clothes for sale on amazon" / "search amazon for X"
+ * tasks: the crawl then extracts structured product cards from the SERP.
+ *
+ * For sites without a known template, falls back to `search_and_navigate` with
+ * listing-biased scoring so the SERP still wins over a deep-item page.
+ *
+ * Returns the same shape as `search_and_navigate` plus `isSiteSearch` and
+ * `trust` ('template' | 'search').
+ */
+async function actionSiteSearch({ domain, query, maxResults = 5 }) {
+  if (!domain) return { ok: false, error: 'domain is required' };
+  if (!query)  return { ok: false, error: 'query is required' };
+
+  const cleanDomain = String(domain).replace(/^https?:\/\//, '').replace(/^www\./, '').replace(/\/$/, '');
+  logger.info(`[web.agent] site_search: domain=${cleanDomain} query="${query.slice(0, 80)}"`);
+
+  // 1. Deterministic template — no web search needed.
+  const templateUrl = await buildSiteSearchUrl(cleanDomain, query);
+  if (templateUrl) {
+    logger.info(`[web.agent] site_search: template hit → ${templateUrl}`);
+    return {
+      ok: true,
+      bestUrl: templateUrl,
+      title: `${cleanDomain} search: ${query}`,
+      snippet: '',
+      score: 100,
+      fallbackUrls: [],
+      allResults: [{ url: templateUrl, title: `${cleanDomain} search`, snippet: '', score: 100 }],
+      isSiteSearch: true,
+      trust: 'template',
+    };
+  }
+
+  // 2. No template — listing-biased web search.
+  logger.info(`[web.agent] site_search: no template for ${cleanDomain}, falling back to listing-biased search`);
+  const searchQuery = `site:${cleanDomain} ${query}`;
+  const nav = await actionSearchAndNavigate({ query: searchQuery, preferDomain: cleanDomain, maxResults, listing: true });
+  if (!nav.ok) return nav;
+  return { ...nav, isSiteSearch: false, trust: 'search' };
 }
 
 /**
@@ -1382,6 +1470,8 @@ module.exports = async function webAgent(args) {
       return await actionGetTutorialSteps(params);
     case 'search_and_navigate':
       return await actionSearchAndNavigate(params);
+    case 'site_search':
+      return await actionSiteSearch(params);
     case 'discover_task_url':
       return await actionDiscoverTaskUrl(params);
     case 'discover_search_syntax':
@@ -1400,6 +1490,7 @@ module.exports = async function webAgent(args) {
 module.exports.actionResearchDomain    = actionResearchDomain;
 module.exports.actionGetTutorialSteps  = actionGetTutorialSteps;
 module.exports.actionSearchAndNavigate = actionSearchAndNavigate;
+module.exports.actionSiteSearch = actionSiteSearch;
 module.exports.actionDiscoverTaskUrl  = actionDiscoverTaskUrl;
 module.exports.actionDiscoverSearchSyntax = actionDiscoverSearchSyntax;
 module.exports.actionDiscoverSetup    = actionDiscoverSetup;

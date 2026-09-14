@@ -6978,25 +6978,12 @@ async function _buildSearchUrlFromPattern(serviceKey, task) {
 // "search <site> for 'X'" tasks land directly on a fresh results page via
 // URL-first instead of (a) hitting the keyword cache — which may hold a stale
 // query-baked URL — or (b) typing into the site's search box.
-const SITE_SEARCH_URL_TEMPLATES = {
-  'amazon.com':        'https://www.amazon.com/s?k={query}',
-  'ebay.com':          'https://www.ebay.com/sch/i.html?_nkw={query}',
-  'etsy.com':          'https://www.etsy.com/search?q={query}',
-  'walmart.com':       'https://www.walmart.com/search?q={query}',
-  'target.com':        'https://www.target.com/s?searchTerm={query}',
-  'bestbuy.com':       'https://www.bestbuy.com/site/searchpage.jsp?st={query}',
-  'homedepot.com':     'https://www.homedepot.com/s/{query}',
-  'youtube.com':       'https://www.youtube.com/results?search_query={query}',
-  'google.com':        'https://www.google.com/search?q={query}',
-  'bing.com':          'https://www.bing.com/search?q={query}',
-  'duckduckgo.com':    'https://duckduckgo.com/?q={query}',
-  'github.com':        'https://github.com/search?q={query}',
-  'stackoverflow.com': 'https://stackoverflow.com/search?q={query}',
-  'reddit.com':        'https://www.reddit.com/search/?q={query}',
-  'yelp.com':          'https://www.yelp.com/search?find_desc={query}',
-  'imdb.com':          'https://www.imdb.com/find?q={query}',
-  'wikipedia.org':     'https://en.wikipedia.org/wiki/Special:Search?search={query}',
-};
+//
+// NOTE: The canonical copy now lives in skill-helpers/site-search.cjs and is
+// shared with web.agent.cjs and executeCommand.js. The local binding below is
+// kept so existing call sites in this file (which reference the constant
+// directly) continue to work without churn.
+const { SITE_SEARCH_URL_TEMPLATES } = require('../skill-helpers/site-search.cjs');
 
 // ── stepType prompt block builder ──────────────────────────────────────────
 // Builds a context block injected into _extractSteps and _llmNextAction system
@@ -7027,22 +7014,10 @@ function _buildStepTypePromptBlock(stepType) {
 // click/action task from triggering search-term extraction.
 // Additionally, common UI button labels are rejected as search terms — "Add to Cart"
 // is a button label, not a search query.
-const _UI_LABEL_BLOCKLIST = /^(add\s+to\s+(?:cart|bag|basket|list|wishlist)|buy\s+now|checkout|sign\s+(?:in|up|out)|log\s+(?:in|out)|submit|send|save|delete|remove|cancel|close|confirm|continue|next|back|edit|share|follow|like|subscribe|unsubscribe|post|publish|reply|comment)$/i;
-function _extractQuotedSearchTerm(task) {
-  const t = String(task || '');
-  // Anchor: search keyword must be in the first 60 chars of the task
-  const _head = t.slice(0, 60);
-  if (!/\b(?:search\s+for|search\s+on|look\s*up|shop\s+for|browse\s+for)\b/i.test(_head)) return null;
-  const m = t.match(/\b(?:search\s+for|search\s+on|look\s*up|find|shop\s+for|browse\s+for)\b[^'"]*?["']((?:[^'"]+|'(?=\w))+)["']/i);
-  if (!m) return null;
-  const term = m[1].trim();
-  // Reject UI button labels — they are not search queries
-  if (_UI_LABEL_BLOCKLIST.test(term)) {
-    logger.info(`[browser.agent] _extractQuotedSearchTerm: rejecting UI label as search term: "${term}"`);
-    return null;
-  }
-  return term;
-}
+//
+// NOTE: Implementation moved to skill-helpers/site-search.cjs (shared with
+// web.agent.cjs). This local binding keeps the existing call sites working.
+const { extractQuotedSearchTerm: _extractQuotedSearchTerm, UI_LABEL_BLOCKLIST: _UI_LABEL_BLOCKLIST } = require('../skill-helpers/site-search.cjs');
 
 /**
  * Build a deterministic site-search URL for "search <site> for 'X'" tasks
@@ -12865,9 +12840,37 @@ async function actionExplore({ agentId, goal, url, sessionId, maxDepth, maxNavIt
  * Requires an active sessionId (the authenticated agent session, e.g. gmail_agent).
  * The session must already be on the target page (inbox, dashboard, list view).
  */
-async function actionExtractItems({ sessionId }) {
+async function actionExtractItems({ sessionId, url } = {}) {
+  // ── Fallback: no authenticated session → use headless web.crawl ──────────
+  // When the planner routes an extraction task to browser.agent without a
+  // session (e.g. misclassified public-web task), fall back to web.crawl's
+  // headless anonymous extraction instead of failing. This reuses the same
+  // extract-page-items.cjs logic that web.crawl uses.
   if (!sessionId) {
-    return { ok: false, error: 'sessionId is required for extract_items (the authenticated agent session must already be on the target page)' };
+    if (!url) {
+      return { ok: false, error: 'extract_items requires either sessionId (authenticated session) or url (for headless fallback)' };
+    }
+    logger.info(`[browser.agent] extract_items: no sessionId — falling back to headless web.crawl for ${url}`);
+    try {
+      const { webCrawl } = require('./web.crawl.cjs');
+      const crawlRes = await webCrawl({
+        url,
+        extractItems: true,
+        maxChars: 20000,
+        timeoutMs: 25000,
+        waitMs: 2500,
+        onProgress: (msg) => logger.info(`[browser.agent] extract_items fallback: ${msg}`),
+      });
+      if (!crawlRes.ok) {
+        return { ok: false, error: crawlRes.error || 'web.crawl fallback failed', items: [] };
+      }
+      const items = Array.isArray(crawlRes.items) ? crawlRes.items : [];
+      logger.info(`[browser.agent] extract_items fallback: extracted ${items.length} items from ${url}` + (crawlRes.itemStats && Object.keys(crawlRes.itemStats).length ? ` (stats: ${JSON.stringify(crawlRes.itemStats)})` : ''));
+      return { ok: true, items, count: items.length, stats: crawlRes.itemStats || {}, url, content: crawlRes.content, fallback: 'web.crawl' };
+    } catch (err) {
+      logger.warn(`[browser.agent] extract_items fallback failed: ${err.message}`);
+      return { ok: false, error: err.message, items: [] };
+    }
   }
 
   logger.info(`[browser.agent] extract_items: extracting cards from session=${sessionId}`);
@@ -12888,12 +12891,14 @@ async function actionExtractItems({ sessionId }) {
     const evalRes = await callBrowserAct({ action: 'evaluate', text: script, sessionId, timeoutMs: 12000 }, 18000);
 
     // The evaluate action returns { ok, result, stdout } — result is the JS value,
-    // stdout is the stringified version. parseExtractedItems handles both.
+    // stdout is the stringified version. parseExtractedItems handles both and
+    // now returns { items, stats }.
     const rawOutput = evalRes?.result != null ? evalRes.result : evalRes?.stdout;
-    const items = parseExtractedItems(typeof rawOutput === 'string' ? rawOutput : JSON.stringify(rawOutput));
+    const parsed = parseExtractedItems(typeof rawOutput === 'string' ? rawOutput : JSON.stringify(rawOutput));
+    const items = parsed.items;
 
-    logger.info(`[browser.agent] extract_items: extracted ${items.length} items from session=${sessionId}`);
-    return { ok: true, items, count: items.length };
+    logger.info(`[browser.agent] extract_items: extracted ${items.length} items from session=${sessionId}` + (parsed.stats && Object.keys(parsed.stats).length ? ` (stats: ${JSON.stringify(parsed.stats)})` : ''));
+    return { ok: true, items, count: items.length, stats: parsed.stats || {} };
   } catch (err) {
     logger.warn(`[browser.agent] extract_items failed: ${err.message}`);
     return { ok: false, error: err.message, items: [] };
