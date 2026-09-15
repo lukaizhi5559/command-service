@@ -236,6 +236,15 @@ function classifyStatePattern(state) {
       false, 'LLM decides — content may be visible or need scrolling', deepLinkType);
   }
 
+  // 12.5. Dense commerce grid — Tab-Map is unreliable on product grids with
+  // dozens of clickable cards. Recommend ESCALATE (-1) to Turn-Loop instead.
+  // Fires when: shopping category + high clickable count + no overlay/form.
+  if (pageCategory === 'shopping' && !overlayActive && fillableCount === 0 && clickableCount > 50) {
+    return _result('dense_commerce_grid', -1, false,
+      'Dense commerce product grid — too many clickable elements for Tab-Map. ESCALATE to Turn-Loop (playwright.agent) which can target elements by selector/text.',
+      false, 'ESCALATE to Turn-Loop — Tab-Map cannot reliably scan 50+ product cards', deepLinkType);
+  }
+
   // 13. Fallback — no focus, need to find something
   return _result('no_focus_need_click', 4, false,
     'No focused field and no overlay — need to find and click something.',
@@ -398,6 +407,60 @@ function _shortcutMatchesGoal(goal, shortcutLabels) {
   });
 }
 
+// ── Semantic read/mutation classification (replaces regex-based goal parsing) ──
+// Source of truth for the interactiveActions enum:
+//   stategraph-module/src/utils/classifyTask.js line 117.
+// Keep _MUTATION_ACTIONS / _NON_MUTATION_ACTIONS in sync with that prompt.
+// Adding a new action = update the classifier prompt + the relevant set below.
+
+// Mutation actions that change state and need postcondition verification,
+// NOT page-text extraction as their primary result.
+const _MUTATION_ACTIONS = new Set([
+  'add_to_cart', 'checkout', 'place_order', 'send_message', 'send_email',
+  'post', 'comment', 'like', 'share', 'follow', 'subscribe', 'retweet', 'react', 'vote',
+  'fill_form', 'submit_form', 'upload', 'publish', 'delete', 'edit', 'create', 'update',
+  'deploy', 'merge_pr', 'approve_pr', 'assign_task', 'settings_change',
+  'filter_ui', 'sort_ui', 'book_reservation',
+]);
+
+// Non-mutation interactive actions — auth, media control, sub-interactions.
+// After these, the user wants to READ/EXTRACT content (what's playing, what's
+// available after login), so auto-extract is the correct behavior.
+const _NON_MUTATION_ACTIONS = new Set([
+  'login', 'oauth',
+  'play_media', 'pause_media', 'skip_media', 'shuffle', 'repeat',
+  'date_picker',
+]);
+
+// The full valid enum (mutations + non-mutations). Used to detect LLM
+// hallucination: if an action isn't in either set, the classifier returned
+// something outside the documented enum.
+const _KNOWN_ACTIONS = new Set([..._MUTATION_ACTIONS, ..._NON_MUTATION_ACTIONS]);
+
+// Returns true for read/search/extract tasks (auto-extract page text).
+// Returns false for mutation tasks (verification is the result).
+// Returns null when classification is unavailable OR an unknown action is
+// present (caller falls back to stepType-based logic).
+//
+// Unknown-action guard: if interactiveActions contains an action not in
+// _KNOWN_ACTIONS, log a warning and return null (fall back to stepType).
+// This catches LLM hallucination without silently misclassifying.
+function isReadExtractionTask(classification, logger = null) {
+  if (!classification) return null;
+  const actions = Array.isArray(classification.interactiveActions)
+    ? classification.interactiveActions : [];
+  if (actions.length === 0) return true;  // no actions → read/search/extract
+  // Guard: unknown action → don't trust the classification, fall back.
+  const _unknown = actions.filter(a => !_KNOWN_ACTIONS.has(a));
+  if (_unknown.length > 0) {
+    if (logger) {
+      logger.warn(`[state-patterns] isReadExtractionTask: unknown interactiveActions [${_unknown.join(',')}] — falling back to stepType`);
+    }
+    return null;
+  }
+  return !actions.some(a => _MUTATION_ACTIONS.has(a));
+}
+
 module.exports = {
   classifyStatePattern,
   // Exported for testing
@@ -408,4 +471,9 @@ module.exports = {
   _classifyFindClickGoal,
   _isMultiItemGoal,
   _shortcutMatchesGoal,
+  // Semantic read/mutation classification
+  isReadExtractionTask,
+  _MUTATION_ACTIONS,
+  _NON_MUTATION_ACTIONS,
+  _KNOWN_ACTIONS,
 };

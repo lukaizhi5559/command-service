@@ -6659,7 +6659,16 @@ const _MUTATION_VERBS = {
 // Read verbs (intent-agnostic) — if present and no mutation verbs, the task IS read-only.
 const _READ_VERBS = /\b(read|check|list|show|show me|count|how many|see|get|fetch|find|search|look\s*up|browse|summarize|extract|monitor|track|unread|recent|latest|view|scan|review|tell me|what are|what's on)\b/i;
 
-function _isReadOnlyTask(task, intent) {
+function _isReadOnlyTask(task, intent, classification = null) {
+  // Prefer semantic classification when available (authoritative — from LLM task classifier).
+  if (classification) {
+    try {
+      const { isReadExtractionTask } = require('../skill-helpers/state-patterns.cjs');
+      const _sem = isReadExtractionTask(classification);
+      if (_sem !== null) return _sem;  // classification available — authoritative
+    } catch (_) { /* fall through to regex */ }
+  }
+  // Regex fallback (legacy/manual tasks without classification)
   const t = String(task || '').toLowerCase();
   if (!t) return false;
   const mutationRe = _MUTATION_VERBS[intent];
@@ -7053,7 +7062,12 @@ async function _buildGenericSearchUrl(serviceKey, baseHost, task) {
   }
 }
 
-async function _resolveTaskDeepLink(agentId, serviceKey, baseStartUrl, task, existingDeepLinkUrl, sessionId) {
+async function _resolveTaskDeepLink(agentId, serviceKey, baseStartUrl, task, existingDeepLinkUrl, sessionId, _dlOpts) {
+  // _dlOpts: { headed, hidden, taskClassification } — propagated to all browser.act calls so
+  // preflight deep-link resolution is headless/hidden (no visible Chrome window).
+  const _dlHeaded = _dlOpts?.headed !== undefined ? _dlOpts.headed : false;
+  const _dlHidden = _dlOpts?.hidden !== undefined ? _dlOpts.hidden : true;
+  const _dlTaskCls = _dlOpts?.taskClassification || null;
   try {
     // If a deep-link was already resolved (e.g., by preflight), skip resolution.
     if (existingDeepLinkUrl) {
@@ -7220,7 +7234,7 @@ async function _resolveTaskDeepLink(agentId, serviceKey, baseStartUrl, task, exi
 
       // 2. Read-only check — skip template for read-only tasks on write intents
       const _WRITE_INTENTS = [INTENTS.MAIL, INTENTS.SOCIAL, INTENTS.CONTENT_CREATE, INTENTS.SCHEDULING, INTENTS.COMMERCE];
-      if (_WRITE_INTENTS.includes(intent) && _isReadOnlyTask(task, intent)) {
+      if (_WRITE_INTENTS.includes(intent) && _isReadOnlyTask(task, intent, _dlTaskCls)) {
         // Special case: MAIL read-only tries search-criteria URL first
         if (intent === INTENTS.MAIL) {
           const _searchUrl = await _buildSearchCriteriaUrl(intent, serviceKey, baseStartUrl, baseHost, task);
@@ -7328,12 +7342,18 @@ async function _resolveTaskDeepLink(agentId, serviceKey, baseStartUrl, task, exi
     // 1.5. Authenticated eval — extract <a href> links from the live browser session.
     // This discovers action URLs only visible to logged-in users (e.g., app menus, dashboards).
     // Also extracts <form> search patterns for read-only/search-criteria tasks.
-    if (!candidate && sessionId) {
+    // Only run when an engine session already exists — otherwise the eval would
+    // spawn a browser just to scan about:blank (the preflight blank-window flash).
+    let _dlHasSession = false;
+    try { _dlHasSession = !!require('./browser-engine.cjs').isSessionActive(sessionId); } catch (_) {}
+    if (!candidate && sessionId && _dlHasSession) {
       try {
         const evalResult = await callSkill('browser.act', {
           action: 'evaluate',
           sessionId,
           text: 'JSON.stringify(Array.from(document.querySelectorAll("a[href]")).map(a=>({href:a.href,text:(a.innerText||"").trim().slice(0,80)})).filter(l=>l.href.startsWith("http")).slice(0,150))',
+          headed: _dlHeaded,
+          hidden: _dlHidden,
         }, 10000);
         const evalRaw = String(evalResult?.result || evalResult?.stdout || '').trim();
         let evalLinks = null;
@@ -7392,12 +7412,14 @@ async function _resolveTaskDeepLink(agentId, serviceKey, baseStartUrl, task, exi
         // 1.5b. Search form extraction — for read-only/search-criteria tasks, look for
         // <form> elements with search role/action and extract the search URL pattern.
         // This catches ?q=, ?filter=, #search/ style search URLs that aren't in <a href> links.
-        if (!candidate && _isReadOnlyTask(task, intent) && _isSearchCriteriaTask(task)) {
+        if (!candidate && _isReadOnlyTask(task, intent, _dlTaskCls) && _isSearchCriteriaTask(task)) {
           try {
             const formEvalResult = await callSkill('browser.act', {
               action: 'evaluate',
               sessionId,
               text: 'JSON.stringify(Array.from(document.querySelectorAll("form")).map(f=>({action:f.action,method:f.method,role:f.getAttribute("role"),ariaLabel:f.getAttribute("aria-label"),inputs:Array.from(f.querySelectorAll("input,textarea")).map(i=>({name:i.name,type:i.type,placeholder:i.placeholder,role:i.getAttribute("role")}))})).filter(f=>f.action&&f.action.startsWith("http")).slice(0,30))',
+              headed: _dlHeaded,
+              hidden: _dlHidden,
             }, 8000);
             const formRaw = String(formEvalResult?.result || formEvalResult?.stdout || '').trim();
             let formList = null;
@@ -7446,7 +7468,7 @@ async function _resolveTaskDeepLink(agentId, serviceKey, baseStartUrl, task, exi
     }
 
     // 2. Try web.agent discover_task_url
-    if (!candidate && !(_isMutationIntent(intent) && !_isReadOnlyTask(task, intent))) {
+    if (!candidate && !(_isMutationIntent(intent) && !_isReadOnlyTask(task, intent, _dlTaskCls))) {
       try {
         const webResult = await callSkill('web.agent', {
           action: 'discover_task_url',
@@ -7466,7 +7488,7 @@ async function _resolveTaskDeepLink(agentId, serviceKey, baseStartUrl, task, exi
 
     // 2.5. Try web.crawl link extraction — crawl the service's start URL and
     // extract <a href> links to discover action URLs not indexed by search engines.
-    if (!candidate && !(_isMutationIntent(intent) && !_isReadOnlyTask(task, intent))) {
+    if (!candidate && !(_isMutationIntent(intent) && !_isReadOnlyTask(task, intent, _dlTaskCls))) {
       try {
         const crawlResult = await callSkill('web.crawl', {
           url: baseStartUrl,
@@ -7739,9 +7761,10 @@ function _recordAgentUsage(agentId) {
   } catch (_) { /* non-fatal — usage tracking is best-effort */ }
 }
 
-async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAuth, skipAuth, manualLogin = false, preflightProbe = false, forceAuthProbe = false, requireCookieConfirmation = false, _progressCallbackUrl, _stepIndex, _stepType = null, _loginWallRetried = false, _emitThinking = null, _authOnly = false, planExtend = false, sessionId: _planExtendSessionId = null, _abortSignal = null }) {
+async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAuth, skipAuth, manualLogin = false, preflightProbe = false, forceAuthProbe = false, requireCookieConfirmation = false, _progressCallbackUrl, _stepIndex, _stepType = null, _taskClassification = null, _loginWallRetried = false, _emitThinking = null, _authOnly = false, planExtend = false, sessionId: _planExtendSessionId = null, _abortSignal = null }) {
   // Derive agentId from url hostname when caller omits it (LLM sometimes emits only url)
   let agentId = _agentIdArg;
+  const _taskCls = _taskClassification;
   if (!agentId && url) {
     try {
       const _host = new URL(url).hostname.replace(/^www\./, '');
@@ -9369,7 +9392,7 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
       logger.info(`[browser.agent] run: on-page action (${_actionIntent}) — skipping deep-link resolution, starting from current page for ${agentId}`);
     } else {
     // ── Task-specific deep-link resolution ─────────────────────────────────────
-    const _deepLinkResult = await _resolveTaskDeepLink(agentId, _svcKey, startUrl, task, null, sessionId);
+    const _deepLinkResult = await _resolveTaskDeepLink(agentId, _svcKey, startUrl, task, null, sessionId, { taskClassification: _taskCls });
     const _deepLink = _deepLinkResult?.url || (typeof _deepLinkResult === 'string' ? _deepLinkResult : null);
     _deepLinkSource = _deepLinkResult?.source || null;
     _deepLinkIntent = _deepLinkResult?.intent || null;
@@ -9715,7 +9738,15 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
           } catch (_) {}
 
           if (_llmSaysAuthRequired) {
-            // Page is a marketing/login redirect — navigate to the real startUrl
+            // Page is a marketing/login redirect — navigate to the real startUrl.
+            // But if _curUrl IS already startUrl (canonical form), re-navigating
+            // changes nothing — the LLM likely false-positived on a header
+            // "Sign in" link (e.g. Amazon shows one even when logged in).
+            const _canon = (u) => { try { const _p = new URL(u); return `${_p.hostname.replace(/^www\./,'')}${_p.pathname.replace(/\/+$/,'')}${_p.search}`; } catch (_) { return String(u || ''); } };
+            if (_canon(_curUrl) === _canon(startUrl)) {
+              logger.info(`[browser.agent] run: URL-first enforcement — already at target URL ${_curUrl} — marketing-page verdict ignored (no-op navigation skipped) for ${agentId}`);
+              _postEnforcementUrl = _curUrl;
+            } else {
             logger.info(`[browser.agent] run: URL-first enforcement — navigating from marketing page ${_curUrl} to ${startUrl} for ${agentId}`);
             const _enforceNav = await callBrowserAct({ action: 'navigate', sessionId, url: startUrl, timeoutMs: 30000 }, 35000);
             if (_enforceNav?.ok !== false) {
@@ -9724,6 +9755,7 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
               _postEnforcementUrl = _postUrlRes?.ok ? String(_postUrlRes.result || '').trim().replace(/^"|"$/g, '') : startUrl;
             } else {
               _postEnforcementUrl = startUrl;
+            }
             }
           } else {
             logger.info(`[browser.agent] run: URL-first enforcement — already on canonical URL ${_curUrl} (LLM confirmed authenticated app) — skipping re-navigation for ${agentId}`);
@@ -11338,7 +11370,22 @@ When extracting page content with run-code, prioritize these selectors over gene
   // deterministic keyboard navigation instead of LLM-per-action turn-loop.
   // Gated behind THINKDROP_PROMPT_TABMAP=true for A/B testing.
   // Falls through to playwright.agent on failure.
-  if (process.env.THINKDROP_PROMPT_TABMAP === 'true' && !_recipeExecutedOk) {
+  //
+  // COMMERCE ROUTING: Skip Tab-Map for dense commerce sites (Amazon, eBay, Etsy,
+  // etc.) when the task involves add-to-cart, checkout, filter, or other
+  // mutations. Tab-Map is unreliable on product grids with 100+ elements —
+  // playwright.agent (Turn-Loop) can target elements by selector/text instead.
+  const _COMMERCE_HOST_RE = /^(www\.)?(amazon|ebay|etsy|walmart|target|aliexpress|bestbuy|shopify|costco|homedepot|lowes)\./i;
+  const _COMMERCE_MUTATION_RE = /\b(add\s+to\s+(cart|bag|basket)|checkout|buy\s+now|purchase|place\s+order|filter\s+by|sort\s+by|add_to_cart|place_order)\b/i;
+  let _skipTabMapForCommerce = false;
+  try {
+    const _tmHost = (() => { try { return new URL(startUrl).hostname; } catch (_) { return null; } })();
+    if (_tmHost && _COMMERCE_HOST_RE.test(_tmHost) && _COMMERCE_MUTATION_RE.test(task)) {
+      _skipTabMapForCommerce = true;
+      logger.info(`[browser.agent] commerce routing: skipping Tab-Map for ${_tmHost} (mutation task: add-to-cart/checkout/filter) — going straight to playwright.agent (Turn-Loop)`);
+    }
+  } catch (_) {}
+  if (process.env.THINKDROP_PROMPT_TABMAP === 'true' && !_recipeExecutedOk && !_skipTabMapForCommerce) {
     try {
       const _tabMapHostname = (() => {
         try { return new URL(startUrl).hostname.replace(/^www\./, ''); }
@@ -11372,8 +11419,12 @@ When extracting page content with run-code, prioritize these selectors over gene
       // and just waitForStableText + getPageText + return. This avoids unnecessary Tab-Map
       // scanning, Tab/ArrowRight pressing, and LLM calls for the common case.
       try {
-        const { _isReadCountListGoal } = require('./instruction.runner.cjs');
-        const _isReadOnlyGoal = _isReadCountListGoal(task);
+        const { isReadExtractionTask } = require('../skill-helpers/state-patterns.cjs');
+        const _semanticRead = isReadExtractionTask(_taskCls, logger);
+        // Fallback to stepType when classification unavailable or unknown-action guard fired
+        const _isReadOnlyGoal = _semanticRead !== null
+          ? _semanticRead
+          : (_stepType !== 'on-page-action');  // extract/navigate/verify → read-like; on-page-action → mutation-like
         if (_isReadOnlyGoal && _urlFirstNavigationSelected) {
           logger.info(`[browser.agent] tab-map: URL-first short-circuit — read-only goal + URL-first navigation, skipping iterative navigation`);
           // Wait for page to stabilize (Gmail SPA needs time after #search navigation)
@@ -11415,6 +11466,8 @@ When extracting page content with run-code, prioritize these selectors over gene
               sessionId,
               recipeUsed: false,
               routingDecision: 'browser_urlfirst_shortcircuit',
+              verified: true,
+              goalVerified: true,
             };
           }
         }
@@ -11444,6 +11497,7 @@ When extracting page content with run-code, prioritize these selectors over gene
       const _tabMapResult = await runIterativeNavigation({
         goal: task,
         stepType: _stepType,
+        taskClassification: _taskCls,
         sessionId,
         startUrl: _urlFirstNavigationSelected ? startUrl : null,
         urlFirstNav: _urlFirstNavigationSelected,
@@ -11496,7 +11550,7 @@ When extracting page content with run-code, prioritize these selectors over gene
             if (_tabMapResult?.tabFlow && _tabMapResult?.agentId) {
               try { _saveTabFlowCache(_tabMapResult.agentId, task, _tabMapResult.tabFlow); } catch (_) {}
             }
-            return { ok: true, agentId, task, result: _tabMapResult.output || `Item added to cart (${_cartVerify.reason})`, agentTurns: _tabMapResult.actionHistory?.length || 0 };
+            return { ok: true, agentId, task, result: `Action completed and verified by automation checks (${_cartVerify.reason}).\n\n${_tabMapResult.output || `Item added to cart (${_cartVerify.reason})`}`, agentTurns: _tabMapResult.actionHistory?.length || 0, verified: true, goalVerified: true };
           }
           logger.info(`[browser.agent] tab-map: add-to-cart verification inconclusive (${_cartVerify.reason}) — falling back to OCR`);
         }
@@ -11521,7 +11575,7 @@ When extracting page content with run-code, prioritize these selectors over gene
                 if (_tabMapResult?.tabFlow && _tabMapResult?.agentId) {
                   try { _saveTabFlowCache(_tabMapResult.agentId, task, _tabMapResult.tabFlow); } catch (_) {}
                 }
-                return { ok: true, agentId, task, result: _tabMapResult.output || 'Completed via URL-first navigation (deterministic verify)', agentTurns: _tabMapResult.actionHistory?.length || 0 };
+                return { ok: true, agentId, task, result: _tabMapResult.output || 'Completed via URL-first navigation (deterministic verify)', agentTurns: _tabMapResult.actionHistory?.length || 0, verified: true, goalVerified: true };
               }
               logger.info(`[browser.agent] tab-map: deterministic check failed (${_detVerify.reason}) — falling back to OCR`);
             }
@@ -11576,11 +11630,13 @@ When extracting page content with run-code, prioritize these selectors over gene
         }
         return {
           ok: true, agentId, task,
-          result: _tabMapResult.output || `Completed via tab-map`,
+          result: `Action completed and verified by automation checks (${_domVerify.verified ? _domVerify.reason : 'OCR goal verification'}).\n\n${_tabMapResult.output || `Completed via tab-map`}`,
           url: _finalUrl,
           sessionId,
           recipeUsed: false,
           routingDecision: 'browser_tabmap',
+          verified: true,
+          goalVerified: true,
         };
       }
       logger.warn(`[browser.agent] tab-map: iterative navigation failed: ${_tabMapResult?.error} — falling through to playwright.agent (turn-loop)`);
@@ -11646,11 +11702,15 @@ When extracting page content with run-code, prioritize these selectors over gene
     while (agentResult?.resumeTabFlow && _tabFlowReEntries < 2) {
       _tabFlowReEntries++;
       logger.info(`[browser.agent] turn-loop changed state (re-entry ${_tabFlowReEntries}/2) — re-entering Tab-Flow`);
-      const _flowTimeoutMs = _tabFlow ? Math.max(120000, _tabFlow.length * 30000) : 120000;
+      const _tabFlowFromResult = agentResult?.tabFlow || null;
+      const _flowTimeoutMs = _tabFlowFromResult?.length
+        ? Math.max(120000, _tabFlowFromResult.length * 30000)
+        : 120000;
       const { runIterativeNavigation } = require('./instruction.runner.cjs');
       const _tabMapResult2 = await runIterativeNavigation({
         goal: task,
         stepType: _stepType,
+        taskClassification: _taskCls,
         sessionId,
         startUrl: _urlFirstNavigationSelected ? startUrl : null,
         urlFirstNav: _urlFirstNavigationSelected,
@@ -11722,12 +11782,12 @@ When extracting page content with run-code, prioritize these selectors over gene
         const _reEntryDomVerify = await _verifyGoalViaDomState(task, sessionId, _reEntryActionHistory, agentResult);
         if (_reEntryDomVerify?.verified) {
           logger.info(`[browser.agent] post-re-entry: DOM-state verification passed (${_reEntryDomVerify.reason}) — returning success instead of ask_user`);
-          return { ok: true, agentId, task, result: agentResult?.result || 'Completed via turn-loop state change (post-re-entry verify)', agentTurns: _reEntryActionHistory.length };
+          return { ok: true, agentId, task, result: `Action completed and verified by automation checks (${_reEntryDomVerify.reason}).\n\n${agentResult?.result || 'Completed via turn-loop state change (post-re-entry verify)'}`, agentTurns: _reEntryActionHistory.length, verified: true, goalVerified: true };
         }
         const _reEntryOcrVerify = await _verifyGoalWithOcr(task, sessionId, _reEntryActionHistory);
         if (_reEntryOcrVerify?.verified) {
           logger.info(`[browser.agent] post-re-entry: OCR verification passed (${_reEntryOcrVerify.reason}) — returning success instead of ask_user`);
-          return { ok: true, agentId, task, result: agentResult?.result || 'Completed via turn-loop state change (post-re-entry OCR verify)', agentTurns: _reEntryActionHistory.length };
+          return { ok: true, agentId, task, result: `Action completed and verified by automation checks (${_reEntryOcrVerify.reason}).\n\n${agentResult?.result || 'Completed via turn-loop state change (post-re-entry OCR verify)'}`, agentTurns: _reEntryActionHistory.length, verified: true, goalVerified: true };
         }
         logger.info(`[browser.agent] post-re-entry: verification failed (DOM: ${_reEntryDomVerify?.reason || 'n/a'}, OCR: ${_reEntryOcrVerify?.reason || 'n/a'}) — falling through to ask_user`);
       } catch (_reEntryVerifyErr) {
@@ -11989,6 +12049,10 @@ When extracting page content with run-code, prioritize these selectors over gene
               transcript: _retryResult?.transcript || [],
               turns: _retryResult?.turns,
               done: _retryResult?.done,
+              verified: (_retryResult?.goalVerified === true || _retryResult?.postconditionVerified === true) || undefined,
+              goalVerified: _retryResult?.goalVerified === true || undefined,
+              postconditionVerified: _retryResult?.postconditionVerified === true || undefined,
+              routingDecision: _retryResult?.routingDecision || undefined,
               error: _retryResult?.error,
               autoRetriedAfterLoginWall: true,
             };
@@ -12199,17 +12263,47 @@ When extracting page content with run-code, prioritize these selectors over gene
         _finalUrl = _urlRes?.ok ? String(_urlRes.result || '').trim().replace(/^"|"$/g, '') : '';
     } catch (_) {}
 
+    // ── Verification evidence propagation ──────────────────────────────────
+    // playwright.agent's internal gates (postcondition state-delta, signals,
+    // LLM goal verification) produce goalVerified/postconditionVerified flags.
+    // Without them, downstream nodes (synthesize, reviewExecution) re-derive
+    // fulfillment from raw page text alone — the weakest signal for mutations —
+    // causing false-negative "hollow result" replans of tasks that succeeded.
+    const _agentVerified = agentResult?.ok === true && (
+      agentResult?.goalVerified === true ||
+      agentResult?.postconditionVerified === true ||
+      agentResult?.stateDiffVerified === true
+    );
+    // Surface a one-line confirmation at the top of the result text so the
+    // synthesize step (and the review judge) can see the verified outcome
+    // instead of guessing from page text. Only for verified results — raw
+    // extraction output stays untouched.
+    let _resultText = agentResultText;
+    if (_agentVerified) {
+      const _ev = agentResult?.postconditionEvidence;
+      const _evBits = [];
+      if (_ev?.preCartCount != null && _ev?.postCartCount != null && _ev.preCartCount !== _ev.postCartCount) _evBits.push(`cart count ${_ev.preCartCount} → ${_ev.postCartCount}`);
+      if (_ev?.preCartSubtotal && _ev?.postCartSubtotal && _ev.preCartSubtotal !== _ev.postCartSubtotal) _evBits.push(`cart subtotal ${_ev.preCartSubtotal} → ${_ev.postCartSubtotal}`);
+      if (_ev?.preModalCount != null && _ev?.postModalCount != null && _ev.preModalCount !== _ev.postModalCount) _evBits.push(`modals ${_ev.preModalCount} → ${_ev.postModalCount}`);
+      const _evStr = _evBits.length > 0 ? ` (${_evBits.join('; ')})` : '';
+      _resultText = `Action completed and verified by automation checks${_evStr}.\n\n${agentResultText}`;
+    }
+
     const _runResult = {
         ok: agentResult?.ok ?? false,
         agentId,
         task,
         sessionId,
         authenticated: true,
-        result: agentResultText,
+        result: _resultText,
         url: _finalUrl,
         transcript: agentResult?.transcript || [],
         turns: agentResult?.turns,
         done: agentResult?.done,
+        verified: _agentVerified || undefined,
+        goalVerified: agentResult?.goalVerified === true || undefined,
+        postconditionVerified: agentResult?.postconditionVerified === true || undefined,
+        routingDecision: agentResult?.routingDecision || undefined,
         httpStatus: Number.isInteger(agentResult?.httpStatus) ? agentResult.httpStatus : undefined,
         error: agentResult?.error,
         // Phase 3: set below after the offer block computes _saveSkillOffer
@@ -12918,14 +13012,14 @@ async function actionExtractItems({ sessionId, url } = {}) {
 // Args: { agentId, url }
 // Returns: { ok, items, count, stats, url, content, title, fallback: 'authenticated_browser' }
 // ---------------------------------------------------------------------------
-async function actionExtractUrl({ agentId, url } = {}) {
+async function actionExtractUrl({ agentId, url, hidden = false } = {}) {
   if (!agentId) return { ok: false, error: 'agentId is required for extract_url' };
   if (!url)     return { ok: false, error: 'url is required for extract_url' };
 
   // Normalize agentId
   if (!agentId.endsWith('.agent')) agentId = `${agentId}.agent`;
 
-  logger.info(`[browser.agent] extract_url: ${agentId} → ${url}`);
+  logger.info(`[browser.agent] extract_url: ${agentId} → ${url}${hidden ? ' (hidden)' : ''}`);
 
   // Look up the agent descriptor to confirm it exists
   const existing = await actionQueryAgent({ id: agentId });
@@ -12943,7 +13037,7 @@ async function actionExtractUrl({ agentId, url } = {}) {
   try {
     // Step 1: Navigate the authenticated session to the target URL
     logger.info(`[browser.agent] extract_url: navigating session=${sessionId} to ${url}`);
-    const navRes = await callBrowserAct({ action: 'navigate', sessionId, url, timeoutMs: 30000, headed: true }, 35000);
+    const navRes = await callBrowserAct({ action: 'navigate', sessionId, url, timeoutMs: 30000, headed: true, hidden }, 35000);
     if (navRes?.ok === false) {
       return { ok: false, error: `navigation failed: ${navRes?.error || 'unknown'}`, items: [] };
     }
@@ -12956,28 +13050,28 @@ async function actionExtractUrl({ agentId, url } = {}) {
     try {
       const scrollSteps = 4;
       for (let i = 1; i <= scrollSteps; i++) {
-        await callBrowserAct({ action: 'evaluate', text: `(() => window.scrollTo(0, document.body.scrollHeight * ${i / scrollSteps}))()`, sessionId, timeoutMs: 3000, headed: true }, 5000).catch(() => null);
+        await callBrowserAct({ action: 'evaluate', text: `(() => window.scrollTo(0, document.body.scrollHeight * ${i / scrollSteps}))()`, sessionId, timeoutMs: 3000, headed: true, hidden }, 5000).catch(() => null);
         await new Promise(r => setTimeout(r, 400));
       }
-      await callBrowserAct({ action: 'evaluate', text: '(() => window.scrollTo(0, 0))()', sessionId, timeoutMs: 3000, headed: true }, 5000).catch(() => null);
+      await callBrowserAct({ action: 'evaluate', text: '(() => window.scrollTo(0, 0))()', sessionId, timeoutMs: 3000, headed: true, hidden }, 5000).catch(() => null);
     } catch (_) { /* scroll pass is best-effort */ }
 
     // Step 4: Extract page title + content for the synthesize LLM
     let title = '';
     let content = '';
     try {
-      const titleRes = await callBrowserAct({ action: 'evaluate', text: 'document.title', sessionId, timeoutMs: 5000, headed: true }, 8000);
+      const titleRes = await callBrowserAct({ action: 'evaluate', text: 'document.title', sessionId, timeoutMs: 5000, headed: true, hidden }, 8000);
       title = String(titleRes?.result ?? titleRes?.stdout ?? '').trim().replace(/^"|"$/g, '');
     } catch (_) {}
     try {
-      const contentRes = await callBrowserAct({ action: 'evaluate', text: '(document.body && document.body.innerText ? document.body.innerText.slice(0, 20000) : "")', sessionId, timeoutMs: 8000, headed: true }, 10000);
+      const contentRes = await callBrowserAct({ action: 'evaluate', text: '(document.body && document.body.innerText ? document.body.innerText.slice(0, 20000) : "")', sessionId, timeoutMs: 8000, headed: true, hidden }, 10000);
       content = String(contentRes?.result ?? contentRes?.stdout ?? '').trim().replace(/^"|"$/g, '');
     } catch (_) {}
 
     // Step 5: Run the shared extraction script in the page context
     logger.info(`[browser.agent] extract_url: running extract-page-items script in session=${sessionId}`);
     const script = buildExtractItemsScript();
-    const evalRes = await callBrowserAct({ action: 'evaluate', text: script, sessionId, timeoutMs: 15000, headed: true }, 20000);
+    const evalRes = await callBrowserAct({ action: 'evaluate', text: script, sessionId, timeoutMs: 15000, headed: true, hidden }, 20000);
 
     const rawOutput = evalRes?.result != null ? evalRes.result : evalRes?.stdout;
     const parsed = parseExtractedItems(typeof rawOutput === 'string' ? rawOutput : JSON.stringify(rawOutput));
@@ -13001,7 +13095,7 @@ async function actionExtractUrl({ agentId, url } = {}) {
   } finally {
     // Close the session we opened so we don't leave a browser window hanging
     if (_openedSession) {
-      await callBrowserAct({ action: 'close', sessionId, headed: true }, 8000).catch(() => {});
+      await callBrowserAct({ action: 'close', sessionId, headed: true, hidden }, 8000).catch(() => {});
     }
   }
 }
@@ -13055,13 +13149,16 @@ async function browserAgent(args) {
         return await actionRecordFailure(args);
 
     case 'resolve_deep_link': {
-        const { agentId: _aId, serviceKey: _svcKey, startUrl: _startUrl, task: _task, sessionId: _sid, existingDeepLinkUrl: _existing } = args;
+        const { agentId: _aId, serviceKey: _svcKey, startUrl: _startUrl, task: _task, sessionId: _sid, existingDeepLinkUrl: _existing, headed: _dlHeaded, hidden: _dlHidden } = args;
         if (!_startUrl || !_task) return { ok: false, error: 'startUrl and task are required for resolve_deep_link' };
-        const _result = await _resolveTaskDeepLink(_aId || 'unknown', _svcKey || '', _startUrl, _task, _existing, _sid);
+        // Default to headless/hidden during preflight to avoid visible Chrome windows.
+        const _dlHeadedResolved = _dlHeaded !== undefined ? _dlHeaded : false;
+        const _dlHiddenResolved = _dlHidden !== undefined ? _dlHidden : true;
+        const _result = await _resolveTaskDeepLink(_aId || 'unknown', _svcKey || '', _startUrl, _task, _existing, _sid, { headed: _dlHeadedResolved, hidden: _dlHiddenResolved });
         const _dlUrl = _result?.url || (typeof _result === 'string' ? _result : null);
         // Close any browser session opened during deep-link resolution (authenticated eval)
         if (_sid) {
-          await callBrowserAct({ action: 'close', sessionId: _sid, headed: false }, 8000).catch(() => {});
+          await callBrowserAct({ action: 'close', sessionId: _sid, headed: _dlHeadedResolved, hidden: _dlHiddenResolved }, 8000).catch(() => {});
         }
         return { ok: !!_dlUrl, deepLinkUrl: _dlUrl, deepLinkSource: _result?.source || null };
     }

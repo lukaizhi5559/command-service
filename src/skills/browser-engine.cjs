@@ -159,7 +159,12 @@ async function launch(sessionId, opts = {}) {
   if (existing?.context) return existing.context;
 
   const headed = opts.headed !== false;
+  const hidden = !!opts.hidden; // headed but window sized 1x1 offscreen — bot-wall bypass without visible window
   const profileDir = opts.profileDir || sessionProfileDir(sessionId);
+
+  if (hidden) {
+    logger.info(`[browser-engine] launching hidden headed session=${sessionId} (1x1 offscreen)`);
+  }
 
   // Check if Chrome is already running with this profile via SingletonLock.
   // If a live Chrome process exists, kill it so we can launch cleanly.
@@ -250,14 +255,25 @@ async function launch(sessionId, opts = {}) {
   //   THINKDROP_BROWSER_CHANNEL=chrome  → force real Chrome (default)
   //   THINKDROP_BROWSER_CHANNEL=cft     → force bundled Chrome for Testing
   // If real Chrome is not installed, gracefully fall back to bundled CfT.
+  // ── Hidden headed mode ─────────────────────────────────────────────────────
+  // When `hidden` is true, launch real headed Chrome (so bot walls still see a
+  // real browser) but size the window 1x1 and position it offscreen so nothing
+  // is visible to the user. Used by public_read web.crawl fallbacks so sites
+  // like Etsy/Amazon/eBay that bot-block headless Chromium still serve content
+  // without showing a Chrome window.
+  const _hiddenArgs = hidden
+    ? ['--window-size=1,1', '--window-position=-32000,-32000', '--window-workspace=-32000']
+    : [];
+  const _hiddenViewport = hidden ? { width: 1, height: 1 } : { width: 1280, height: 800 };
+
   const launchOpts = {
     headless: !headed,
-    viewport: { width: 1280, height: 800 },
+    viewport: _hiddenViewport,
     // deviceScaleFactor is a CONTEXT option, not a viewport property. At 1x, screenshots
     // are 1280x800 and LiteParse/OCR can barely read the small UI text; at 2x they are
     // 2560x1600 which reads cleanly. Coordinate scaling reads the real PNG dimensions.
-    deviceScaleFactor: 2,
-    args: ['--disable-blink-features=AutomationControlled', '--no-first-run', '--no-default-browser-check', '--disable-features=ProtocolHandler,RegisterProtocolHandler', '--disable-notifications'],
+    deviceScaleFactor: hidden ? 1 : 2,
+    args: ['--disable-blink-features=AutomationControlled', '--no-first-run', '--no-default-browser-check', '--disable-features=ProtocolHandler,RegisterProtocolHandler', '--disable-notifications', ..._hiddenArgs],
   };
 
   const _envChannel = String(process.env.THINKDROP_BROWSER_CHANNEL || '').toLowerCase();
@@ -470,6 +486,29 @@ const _DOM_SCANNER_SCRIPT = `(() => {
     return '';
   }
 
+  // Region classification: walk up to the nearest semantic landmark element.
+  // Returns one of: header, nav, main, sidebar, footer, dialog, overlay, main (fallback).
+  // Helps the LLM distinguish primary content from secondary navigation/chrome.
+  function getRegion(el) {
+    let node = el;
+    // Cap the walk to avoid pathological depth on huge SPAs.
+    for (let i = 0; i < 20 && node; i++) {
+      // Open dialog/modal wins over everything else — it's the active context.
+      const role = node.getAttribute && node.getAttribute('role');
+      const ariaModal = node.getAttribute && node.getAttribute('aria-modal');
+      if (role === 'dialog' || ariaModal === 'true') return 'dialog';
+      if (role === 'menu' || role === 'listbox') return 'overlay';
+      const tag = node.tagName && node.tagName.toLowerCase();
+      if (tag === 'header' || role === 'banner') return 'header';
+      if (tag === 'nav' || role === 'navigation') return 'nav';
+      if (tag === 'main' || role === 'main') return 'main';
+      if (tag === 'aside' || role === 'complementary') return 'sidebar';
+      if (tag === 'footer' || role === 'contentinfo') return 'footer';
+      node = node.parentElement;
+    }
+    return 'main';  // default: assume main content
+  }
+
   // Clear stale data-td-ref attributes from previous scans before re-tagging.
   // Without this, re-scans assign the same refs (td1, td2, ...) to new elements
   // while old elements keep their stale tags → duplicate refs → querySelector
@@ -522,6 +561,7 @@ const _DOM_SCANNER_SCRIPT = `(() => {
     const role = getRole(el);
     const type = getType(el);
     const tag = el.tagName.toLowerCase();
+    const region = getRegion(el);
 
     elements.push({
       ref, tag, role, type, label,
@@ -534,6 +574,7 @@ const _DOM_SCANNER_SCRIPT = `(() => {
       name: el.getAttribute('name') || '',
       contenteditable: el.isContentEditable,
       context,
+      region,
     });
   }
 
@@ -593,7 +634,8 @@ const _DOM_SCANNER_SCRIPT = `(() => {
     const flagStr = flags.length > 0 ? ' [' + flags.join(', ') + ']' : '';
     const typeStr = el.type ? ' type=' + el.type : '';
     const ctxStr = el.context ? ' context="' + el.context.slice(0, 40) + '"' : '';
-    lines.push('- [' + el.ref + '] ' + el.role + ' "' + el.label + '"' + typeStr + ctxStr + flagStr);
+    const regionStr = el.region ? ' region=' + el.region : '';
+    lines.push('- [' + el.ref + '] ' + el.role + ' "' + el.label + '"' + typeStr + regionStr + ctxStr + flagStr);
   }
 
   return JSON.stringify({
@@ -636,6 +678,7 @@ async function buildRefTree(page) {
         placeholder: el.placeholder,
         contenteditable: el.contenteditable,
         context: el.context,
+        region: el.region,
       });
     }
     // Low-confidence: if >50% of elements are occluded or from heuristic source

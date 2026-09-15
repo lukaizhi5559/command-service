@@ -1072,6 +1072,40 @@ function _saveTabMap(domain, map) {
 async function buildTabMap(sessionId, maxElements = 150, options = {}) {
   const { skipReset = false, backward = false, continuation = null } = options;
   const map = [];
+
+  // ── Page-density gating ──────────────────────────────────────────────
+  // Abort Tab-Map scanning on dense commerce/product-grid pages where
+  // scanning 150+ focusable elements is slow and unreliable. The LLM tier
+  // selector should ESCALATE to Turn-Loop instead. We check the hostname
+  // and the visible interactive element count before starting the scan.
+  if (!continuation) {  // only gate on the first call, not paginated continuations
+    try {
+      const _hostRes = await browserAct({ action: 'evaluate', sessionId, headed: true, timeoutMs: 2000, text: 'window.location.hostname' });
+      const _host = _hostRes?.ok ? String(_hostRes.result || '').replace(/^"|"$/g, '').toLowerCase() : '';
+      const _COMMERCE_HOSTS = /^(www\.)?(amazon|ebay|etsy|walmart|target|aliexpress|bestbuy|shopify|costco|homedepot|lowes)\./;
+      if (_COMMERCE_HOSTS.test(_host)) {
+        // Count visible interactive elements — if >80, abort Tab-Map.
+        const _countRes = await browserAct({ action: 'evaluate', sessionId, headed: true, timeoutMs: 2000, text: `(() => {
+          const sel = 'a, button, [role="button"], [role="link"], [role="menuitem"], input:not([type="hidden"]), textarea, [contenteditable], [tabindex]:not([tabindex="-1"])';
+          let n = 0;
+          for (const el of document.querySelectorAll(sel)) {
+            const r = el.getBoundingClientRect();
+            if (r.width > 0 && r.height > 0) n++;
+          }
+          return n;
+        })()` });
+        const _interactiveCount = _countRes?.ok ? parseInt(String(_countRes.result || '').replace(/^"|"$/g, ''), 10) || 0 : 0;
+        if (_interactiveCount > 80) {
+          logger.info(`[instruction.runner] buildTabMap: dense grid abort — host=${_host}, interactiveCount=${_interactiveCount} (>80) — returning empty map (ESCALATE to Turn-Loop)`);
+          return [];  // empty array — caller will see 0 elements and the tier selector will ESCALATE
+        }
+      }
+    } catch (_gateErr) {
+      // Non-fatal — proceed with normal Tab-Map if the gate check fails
+      logger.debug(`[instruction.runner] buildTabMap: density gate check failed (non-fatal): ${_gateErr.message}`);
+    }
+  }
+
   // Pagination: when `continuation` is provided, seed seenSet/starterSig/idCounter
   // from the previous page so we dedupe against already-seen elements and
   // terminate only when Tab loops back to the ORIGINAL starter (true whole-
@@ -6385,17 +6419,50 @@ async function _probePageStructure(sessionId) {
         if (_submitPattern.test(text)) { hasSubmitButton = true; break; }
       }
 
+      // ── Region breakdown ─────────────────────────────────────────────
+      // Classify each interactive element by its semantic landmark region
+      // (header/nav/main/sidebar/footer/dialog/overlay). Gives the tier-selection
+      // LLM actual layout context instead of just aggregate counts.
+      function getRegion(el) {
+        let node = el;
+        for (let i = 0; i < 20 && node; i++) {
+          const role = node.getAttribute && node.getAttribute('role');
+          const ariaModal = node.getAttribute && node.getAttribute('aria-modal');
+          if (role === 'dialog' || ariaModal === 'true') return 'dialog';
+          if (role === 'menu' || role === 'listbox') return 'overlay';
+          const tag = node.tagName && node.tagName.toLowerCase();
+          if (tag === 'header' || role === 'banner') return 'header';
+          if (tag === 'nav' || role === 'navigation') return 'nav';
+          if (tag === 'main' || role === 'main') return 'main';
+          if (tag === 'aside' || role === 'complementary') return 'sidebar';
+          if (tag === 'footer' || role === 'contentinfo') return 'footer';
+          node = node.parentElement;
+        }
+        return 'main';
+      }
+      const regionBreakdown = {};
+      function _tally(el, kind) {
+        const r = el.getBoundingClientRect();
+        if (r.width <= 0 || r.height <= 0) return;
+        const region = getRegion(el);
+        if (!regionBreakdown[region]) regionBreakdown[region] = { clickable: 0, fillable: 0 };
+        regionBreakdown[region][kind]++;
+      }
+      for (const el of scope.querySelectorAll('a, button, [role="button"], [role="link"], [role="menuitem"], [role="menuitemradio"], [role="menuitemcheckbox"], [onclick]')) _tally(el, 'clickable');
+      for (const el of scope.querySelectorAll('input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"]):not([type="submit"]):not([type="button"]):not([type="file"]), textarea, [contenteditable="true"], [contenteditable=""], [role="textbox"]')) _tally(el, 'fillable');
+
       return { fillableCount, clickableCount, hasAutoFocus, hasSubmitButton,
                fillableTypes: { inputCount, textareaCount, contenteditableCount, roleTextboxCount },
                pageTitle, visibleText,
+               regionBreakdown,
                categorySignals: { hasGrid, hasGridCell, hasCellAria, hasContentEditableH1, hasTitleRole, hasFormulaBar } };
     })()`,
   });
   try {
     const raw = res?.result;
     const parsed = typeof raw === 'string' ? JSON.parse(raw.replace(/^"|"$/g, '').replace(/\\"/g, '"')) : raw;
-    return parsed || { fillableCount: 0, clickableCount: 0, hasAutoFocus: false, hasSubmitButton: false, fillableTypes: { inputCount: 0, textareaCount: 0, contenteditableCount: 0, roleTextboxCount: 0 }, pageTitle: '', visibleText: '', categorySignals: {} };
-  } catch { return { fillableCount: 0, clickableCount: 0, hasAutoFocus: false, hasSubmitButton: false, fillableTypes: { inputCount: 0, textareaCount: 0, contenteditableCount: 0, roleTextboxCount: 0 }, pageTitle: '', visibleText: '', categorySignals: {} }; }
+    return parsed || { fillableCount: 0, clickableCount: 0, hasAutoFocus: false, hasSubmitButton: false, fillableTypes: { inputCount: 0, textareaCount: 0, contenteditableCount: 0, roleTextboxCount: 0 }, pageTitle: '', visibleText: '', regionBreakdown: {}, categorySignals: {} };
+  } catch { return { fillableCount: 0, clickableCount: 0, hasAutoFocus: false, hasSubmitButton: false, fillableTypes: { inputCount: 0, textareaCount: 0, contenteditableCount: 0, roleTextboxCount: 0 }, pageTitle: '', visibleText: '', regionBreakdown: {}, categorySignals: {} }; }
 }
 
 // Count visible checkboxes on the page (input[type=checkbox] or [role=checkbox]).
@@ -6619,6 +6686,17 @@ async function _selectTierLLM(sessionId, goal, actionHistory, pageCategory, shor
   const _overlayStr = overlayActive ? 'OPEN' : 'CLOSED';
   const _fillableStr = `${fillableCount} fillable (input=${fillableTypes.inputCount}, textarea=${fillableTypes.textareaCount}, contenteditable=${fillableTypes.contenteditableCount})`;
 
+  // Region breakdown — gives the LLM actual layout context.
+  // Shows clickable/fillable counts per semantic region (header/nav/main/sidebar/footer/dialog).
+  // When the LLM sees "main: 80 clickable, 0 fillable" it knows to ESCALATE instead of Tab-Map.
+  const _regionBreakdown = probe.regionBreakdown || {};
+  const _regionEntries = Object.entries(_regionBreakdown);
+  const _regionBreakdownStr = _regionEntries.length > 0
+    ? `Region breakdown:\n${_regionEntries.map(([region, counts]) =>
+        `- ${region}: ${counts.clickable} clickable, ${counts.fillable} fillable`
+      ).join('\n')}\n`
+    : '';
+
   const _tierBlocks = [];
   if (_availableTiers.includes(1)) {
     _tierBlocks.push(`1 - Just-type: Types ONE value into the currently focused field. Fills one field per call.
@@ -6697,10 +6775,16 @@ DECISION RULES:
 - If a single field is focused and you just need to type one value → return 1 (Just-type)
 - If you need to find and click a specific item by text → return 2 (Meta+F)
 - If the goal involves drag-drop or sliders → return 5 (Gesture)
+- If the page is a dense commerce/product grid (e.g. Amazon, eBay, Etsy search results) with many clickable elements in the main region and the goal involves add-to-cart, checkout, filter, or selecting a specific product → return -1 (ESCALATE to Turn-Loop). Tab-Map is unreliable on dense product grids — Turn-Loop can target elements by selector/text instead of scanning focus order.
+- If the region breakdown shows main has >50 clickable and 0 fillable, and the goal is NOT a simple search/type → return -1 (ESCALATE to Turn-Loop). Keyboard navigation cannot efficiently handle pages with dozens of clickable cards.
 - When in doubt → return ${_availableTiers[0]} (first available strategy)
 ${_categoryNotes}
 Available strategies:
-${_tierBlocks.join('\n\n')}`;
+${_tierBlocks.join('\n\n')}
+
+-1 - ESCALATE to Turn-Loop: Hands off the entire remaining task to playwright.agent, which uses a plan-execute-repair loop with CSS selectors and clickByText instead of keyboard focus scanning.
+   Best when: the page is too dense or complex for keyboard navigation — e.g. Amazon/eBay/Etsy product grids, multi-step checkout flows, pages with dozens of clickable cards where Tab-Map would scan 150+ elements and still miss the target.
+   Use the region breakdown above to decide: if the main region has >50 clickable elements and the goal involves clicking a specific product or performing a mutation (add-to-cart, checkout), ESCALATE instead of Tab-Map.`;
 
   const historyStr = actionHistory.length > 0
     ? actionHistory.slice(-10).map((a, i) => `  ${i + 1}. ${a}`).join('\n')
@@ -6719,17 +6803,25 @@ Deep link type: ${_statePattern.deepLinkType}
 Overlay/dialog: ${_overlayStr}
 Focused element: ${_focusedStr}
 Page structure: ${_fillableStr}, ${clickableCount} clickable
-${editorState?.region ? `Editor region: ${editorState.region} (block ${editorState.blockIndex ?? '?'})\n` : ''}${layoutText ? `Page layout:\n${layoutText.slice(0, 300)}\n` : ''}${_ocrBlock}${_flowContext}
+${_regionBreakdownStr}${editorState?.region ? `Editor region: ${editorState.region} (block ${editorState.blockIndex ?? '?'})\n` : ''}${layoutText ? `Page layout:\n${layoutText.slice(0, 300)}\n` : ''}${_ocrBlock}${_flowContext}
 Actions taken so far:
 ${historyStr}${_contextBlock}
-Strategy? You MUST return exactly one of these numbers: ${_availableTiers.join(', ')}. Do NOT return any other number.`;
+Strategy? You MUST return exactly one of these numbers: ${_availableTiers.join(', ')}, or -1 to ESCALATE to Turn-Loop (playwright.agent). Do NOT return any other number.`;
 
   try {
     const raw = await askWithMessages([
       { role: 'system', content: systemPrompt },
       { role: 'user', content: userPrompt },
     ], { maxTokens: 10, temperature: 0.1, responseTimeoutMs: 10000 });
-    const num = parseInt((raw || '').trim().replace(/\D/g, ''), 10);
+    // ESCALATE signal — hand off to playwright.agent (Turn-Loop).
+    // Catch -1 BEFORE the digit-strip regex (which would turn -1 into 1).
+    const _trimmed = (raw || '').trim();
+    if (/^-1\b|ESCALATE/i.test(_trimmed)) {
+      logger.info(`[instruction.runner] _selectTierLLM: ESCALATE (-1) — handing off to playwright.agent (Turn-Loop) — pattern=${_statePattern.pattern}, fillable=${fillableCount}, clickable=${clickableCount}, url=${currentUrl}`);
+      _emitTierProgressForTier(-1, progressCallbackUrl, stepIndex, agentId, sessionIdForProgress);
+      return -1;
+    }
+    const num = parseInt(_trimmed.replace(/\D/g, ''), 10);
     // If LLM returns an invalid/tried/disabled tier, fall back to the first available
     // tier. Never hardcode to 4 (Tab-Map) — it may be disabled
     // (e.g. Creation deep-link = Just-type ONLY) and Tab-Map's Escape would destroy focus.
@@ -6752,8 +6844,9 @@ Strategy? You MUST return exactly one of these numbers: ${_availableTiers.join('
 
 // Helper: emit tier progress for a given tier number
 function _emitTierProgressForTier(tier, progressCallbackUrl, stepIndex, agentId, sessionId) {
-  const _tierName = { 0: 'done', 1: 'just-type', 2: 'meta+f', 3: 'shortcuts', 4: 'tab-map', 5: 'gesture', 6: 'arrow-grid' }[tier] || 'unknown';
+  const _tierName = { '-1': 'escalate', 0: 'done', 1: 'just-type', 2: 'meta+f', 3: 'shortcuts', 4: 'tab-map', 5: 'gesture', 6: 'arrow-grid' }[tier] || 'unknown';
   const _tierMsg = {
+    '-1': `ESCALATE: handing off to playwright.agent (Turn-Loop)`,
     0: `Done: goal achieved`,
     1: `Just-type: typing into focused field`,
     2: `Meta+F: searching for text on page`,
@@ -7007,6 +7100,13 @@ async function _runtimeDiscoverCommands(sessionId, prefix, hostname) {
 // Check if the goal is a read/count/list/search task that benefits from page text extraction.
 // Excludes mutation goals (send, compose, create, reply, delete, archive) to avoid
 // forcing getPageText on tasks that don't need it.
+//
+// DEPRECATED: This function reparses raw natural-language text with ad-hoc regexes
+// and is prone to false positives (e.g. "no-reply@github.com" matches \breply\b).
+// New code should use _shouldAutoExtract(taskClassification, stepType) instead,
+// which consumes the LLM task classifier's semantic interactiveActions field.
+// Do not add new call sites. Existing call sites are being migrated to
+// _shouldAutoExtract. Kept for one release for safety.
 function _isReadCountListGoal(goal) {
   const g = String(goal || '').toLowerCase();
   // Positive: read/count/list/search/find/show/check/tell me/let me know/how many
@@ -7021,6 +7121,24 @@ function _isReadCountListGoal(goal) {
     return true;
   }
   return false;
+}
+
+// ── Semantic auto-extract decision (replaces _isReadCountListGoal) ──────────
+// Uses the LLM task classifier's interactiveActions field (a closed enum) to
+// determine whether this is a read/search/extract task that should auto-extract
+// page text. Falls back to stepType when classification is unavailable or an
+// unknown-action guard fires. Defaults to true (extract) — harmless for
+// mutations, and the previous bug was NOT extracting when we should.
+const { isReadExtractionTask: _isReadExtractionTask } = require('../skill-helpers/state-patterns.cjs');
+
+function _shouldAutoExtract(taskClassification, stepType) {
+  const _sem = _isReadExtractionTask(taskClassification, logger);
+  if (_sem !== null) return _sem;  // classification available — authoritative
+  // Fallback for legacy/manual tasks without classification (or unknown-action guard):
+  // stepType === 'extract' or 'navigate' → read-like; 'on-page-action' → mutation-like.
+  if (stepType === 'extract') return true;
+  if (stepType === 'on-page-action') return false;
+  return true; // safe default — extracting page text is harmless for mutations too
 }
 
 function _buildResultString(goal, actionHistory, filledFields, extractedPageText) {
@@ -7073,7 +7191,7 @@ function _isUrlFirstDone(goal, currentUrl) {
 
 // Tier 2: _selectTier → 0 (DONE), 1 (Just-type), 2 (Meta+F), 3 (Shortcuts), 4 (Tab-Map)
 // Tier 3: Strategy execution with fallback to Tab-Map
-async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, pageCategory, agentContext, shortcutCount = 0, shortcutLabels = '', timeoutMs = 120000, progressCallbackUrl = null, stepIndex = 0, agentId = '', stepType = null }) {
+async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, pageCategory, agentContext, shortcutCount = 0, shortcutLabels = '', timeoutMs = 120000, progressCallbackUrl = null, stepIndex = 0, agentId = '', stepType = null, taskClassification = null }) {
   if (!sessionId) return { ok: false, error: 'No sessionId provided' };
   let _pageCategory = pageCategory || 'web_generic';
   const _urlFirstNav = !!urlFirstNav;
@@ -7480,7 +7598,7 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
 
         // Auto-extract safety net: for read/count/list goals, if no page text was captured,
         // wait for stable text + getPageText before returning.
-        if (!extractedPageText && _isReadCountListGoal(goal)) {
+        if (!extractedPageText && _shouldAutoExtract(taskClassification, stepType)) {
           logger.info(`[instruction.runner] Tab-Map: auto-extracting page text for read/count/list goal (no getPageText in plan)`);
           await browserAct({ action: 'waitForStableText', sessionId, headed: true, timeoutMs: 8000 }).catch(() => {});
           const _gtResult = await browserAct({ action: 'getPageText', sessionId, headed: true, timeoutMs: 10000 }).catch(() => null);
@@ -7563,7 +7681,7 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
           }
           // DONE — step plan completed or LLM declared done. No regex
           // verification — the step plan is the source of truth.
-          if (!extractedPageText && _isReadCountListGoal(goal)) {
+          if (!extractedPageText && _shouldAutoExtract(taskClassification, stepType)) {
             logger.info(`[instruction.runner] Tab-Map: auto-extracting page text for read/count/list goal (DONE with no getPageText)`);
             await browserAct({ action: 'waitForStableText', sessionId, headed: true, timeoutMs: 8000 }).catch(() => {});
             const _gtResult = await browserAct({ action: 'getPageText', sessionId, headed: true, timeoutMs: 10000 }).catch(() => null);
@@ -8160,22 +8278,33 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
     const _alertActiveAtTierSelect = !!_alert && !_alertHandled;
 
     let strategy = await _selectTierLLM(sessionId, goal, actionHistory, _pageCategory, _shortcutCount, focused, currentUrl, _probe, agentContext, _triedTiers, _disabledTiers, _canvasLayout?.layoutText || '', _ocrObservation, _shortcutLabels, overlayActive, progressCallbackUrl, stepIndex, agentId, sessionId, _editorState, _isCreationDeepLink, _alertActiveAtTierSelect, false, _tabFlow, _flowIndex);
-    logger.info(`[instruction.runner] Decision: strategy=${strategy} (0=DONE, 1=Just-type, 2=Meta+F, 3=Keyboard Nav, 4=Tab-Map, 5=Gesture)`);
+    logger.info(`[instruction.runner] Decision: strategy=${strategy} (-1=ESCALATE, 0=DONE, 1=Just-type, 2=Meta+F, 3=Keyboard Nav, 4=Tab-Map, 5=Gesture)`);
 
-    // Handle tier exhaustion — all tiers tried on this state with no progress
-    // NOTE: Don't press Escape (might trigger "Discard unsaved changes?" creating a loop).
-    // Instead, force Tab-Map enabled and reset.
+    // Handle ESCALATE (-1) — hand off the entire remaining task to playwright.agent
+    // (Turn-Loop). Used when the page is too dense/complex for keyboard navigation
+    // (e.g. Amazon/eBay/Etsy product grids, multi-step checkout flows).
     if (strategy === -1) {
-      logger.info(`[instruction.runner] All tiers exhausted — forcing Tab-Map and resetting`);
-      _disabledTiers.delete(4); // force Tab-Map
-      _triedTiers.clear();  // reset for the new state
-      _cachedTabMap = null;  // force fresh tab-map
-      _stepPlan = null;
-      _stepIndex = 0;
-      _usingStepFallback = false;
-      actionHistory.push('Reset (all tiers exhausted — Tab-Map forced)');
-      prevUrl = await _getUrl(sessionId);
-      continue;
+      logger.info(`[instruction.runner] ESCALATE (-1): handing off to playwright.agent (Turn-Loop) — pattern=${_statePattern?.pattern || '?'}, fillable=${_probe?.fillableCount || 0}, clickable=${_probe?.clickableCount || 0}, url=${currentUrl}`);
+      try {
+        const { playwrightAgent } = require('./playwright.agent.cjs');
+        const _escalateResult = await playwrightAgent({
+          goal,
+          sessionId,
+          url: null,  // stay on current page — don't navigate
+          skipAuth: true,
+          headed: true,
+          _stepIndex,
+          _progressCallbackUrl: progressCallbackUrl,
+        });
+        logger.info(`[instruction.runner] ESCALATE: playwright.agent returned ok=${_escalateResult?.ok}`);
+        return _escalateResult;
+      } catch (_escalateErr) {
+        logger.warn(`[instruction.runner] ESCALATE: playwright.agent failed: ${_escalateErr.message} — falling back to Tab-Map`);
+        _disabledTiers.delete(4);
+        _triedTiers.clear();
+        _cachedTabMap = null;
+        strategy = 4;  // fall back to Tab-Map
+      }
     }
 
     // 4. Execute strategy
@@ -8186,7 +8315,7 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
       // decision is the source of truth.
       // Auto-extract safety net: for read/count/list goals, if no page text was
       // captured during the run, wait for stable text + getPageText before returning.
-      if (!extractedPageText && _isReadCountListGoal(goal)) {
+      if (!extractedPageText && _shouldAutoExtract(taskClassification, stepType)) {
         logger.info(`[instruction.runner] DONE: auto-extracting page text for read/count/list goal (no getPageText in run)`);
         await browserAct({ action: 'waitForStableText', sessionId, headed: true, timeoutMs: 8000 }).catch(() => {});
         const _gtResult = await browserAct({ action: 'getPageText', sessionId, headed: true, timeoutMs: 10000 }).catch(() => null);

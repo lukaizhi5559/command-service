@@ -88,9 +88,64 @@ function buildAmazonSerPFixture(numProducts = 24) {
 </html>`;
 }
 
+// ── Build a realistic eBay-style SERP fixture ────────────────────────────────
+// eBay uses <li class="s-item"> cards with lazy-loaded images: the <img> src is
+// a placeholder or missing, while data-src or <picture><source srcset> holds
+// the real image. Verify resolveImg picks the real image.
+function buildEbaySerPFixture(numProducts = 12) {
+  const cards = [];
+  for (let i = 0; i < numProducts; i++) {
+    const id = 100000000 + i;
+    const title = `Vintage Board Game ${i + 1}`;
+    const price = `$${(19.99 + i * 5).toFixed(2)}`;
+    const highRes = `https://i.ebayimg.com/thumbs/images/g/AAAAAOS${id}/s-l400.jpg`;
+    const lowRes = `https://i.ebayimg.com/thumbs/images/g/AAAAAOS${id}/s-l225.jpg`;
+    const altStyle = i % 3 === 0
+      ? `<img src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" data-src="${highRes}" alt="${title}" />`
+      : (i % 3 === 1
+          ? `<picture>
+               <source srcset="${lowRes} 225w, ${highRes} 400w" sizes="225px" />
+               <img src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" alt="${title}" />
+             </picture>`
+          : `<img src="${lowRes}" srcset="${lowRes} 225w, ${highRes} 400w" sizes="225px" alt="${title}" />`);
+    cards.push(`
+      <li class="s-item s-item__pl-on-end" data-view="mi:1682|iid:${id}">
+        <div class="s-item__wrapper clearfix">
+          <div class="s-item__image">
+            <a class="s-item__link" href="https://www.ebay.com/itm/${id}" tabindex="-1">
+              ${altStyle}
+            </a>
+          </div>
+          <div class="s-item__info">
+            <a href="https://www.ebay.com/itm/${id}" class="s-item__title">
+              <span aria-level="3" role="heading">${title}</span>
+            </a>
+            <div class="s-item__details clearfix">
+              <span class="s-item__price">
+                <span class="notranslate">${price}</span>
+              </span>
+            </div>
+          </div>
+        </div>
+      </li>`);
+  }
+  return `<!DOCTYPE html>
+<html>
+<head>
+  <title>Christian board games for sale | eBay</title>
+  <meta property="og:title" content="Christian board games for sale | eBay" />
+</head>
+<body>
+  <ul class="srp-results srp-list clearfix">
+    ${cards.join('\n')}
+  </ul>
+</body>
+</html>`;
+}
+
 // Run the extraction script in a jsdom window context.
-function runExtraction(html) {
-  const dom = new JSDOM(html, { url: 'https://www.amazon.com/s?k=baby%20clothes' });
+function runExtraction(html, url = 'https://www.amazon.com/s?k=baby%20clothes') {
+  const dom = new JSDOM(html, { url });
   const window = dom.window;
   const document = window.document;
 
@@ -164,6 +219,22 @@ async function main() {
   const heavyElapsed = Date.now() - heavyStart;
   assert(heavyResult.items.length >= 24, `heavy DOM extracted ${heavyResult.items.length} items (capped at 24)`);
   assert(heavyElapsed < 3000, `heavy DOM completed in ${heavyElapsed}ms (expected < 3000ms)`);
+
+  console.log('\n── 7. Fixture: eBay-style SERP with lazy images ──');
+  const ebayHtml = buildEbaySerPFixture(12);
+  const ebayStart = Date.now();
+  const ebayResult = runExtraction(ebayHtml, 'https://www.ebay.com/sch/i.html?_nkw=Christian%20board%20games');
+  const ebayElapsed = Date.now() - ebayStart;
+  assert(ebayResult.items.length >= 10, `eBay fixture extracted ${ebayResult.items.length} items (expected >= 10)`);
+  assert(ebayElapsed < 2000, `eBay fixture completed in ${ebayElapsed}ms (expected < 2000ms)`);
+  if (ebayResult.items.length > 0) {
+    const ebi = ebayResult.items[0];
+    assert(!!ebi.imageUrl, `eBay item has imageUrl: "${ebi.imageUrl}"`);
+    assert(!ebi.imageUrl.startsWith('data:'), `eBay imageUrl is NOT a data: placeholder`);
+    assert(ebi.imageUrl.includes('ebayimg.com'), `eBay imageUrl resolved from data-src/srcset/picture`);
+    assert(ebi.url.includes('ebay.com/itm/'), `eBay item has product URL: "${ebi.url}"`);
+    assert(!!ebi.price, `eBay item has price: "${ebi.price}"`);
+  }
 
   console.log(`\n${'='.repeat(60)}`);
   console.log(`Results: ${_pass} passed, ${_fail} failed`);

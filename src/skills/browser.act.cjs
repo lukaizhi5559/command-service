@@ -1640,12 +1640,16 @@ async function _withChromeLock(fn) {
 }
 
 // Ensure engine session is launched. Returns the Page or null on failure.
-async function _ensureEngine(sessionId, headed) {
+// `hidden` launches headed Chrome with a 1x1 offscreen window — used for
+// public_read fallbacks so bot walls still see a real browser but the user
+// sees nothing.
+async function _ensureEngine(sessionId, headed, hidden = false) {
   if (engine.isSessionActive(sessionId)) {
     return engine.getPage(sessionId);
   }
   try {
-    await _withChromeLock(() => engine.launch(sessionId, { headed }));
+    logger.info(`[browser.act] engine launch session=${sessionId} headed=${headed} hidden=${hidden}`);
+    await _withChromeLock(() => engine.launch(sessionId, { headed, hidden }));
     openSessions.add(sessionId);
     return engine.getPage(sessionId);
   } catch (err) {
@@ -2706,6 +2710,7 @@ async function browserAct(args) {
     height,
     filePath,
     headed     = true,
+    hidden     = false,
     timeoutMs  = 15000,
     authSuccessUrl: _authSuccessUrl,
     currentUrl,
@@ -2946,7 +2951,7 @@ async function browserAct(args) {
       // Ad-block init script is registered at launch time via context.addInitScript()
       // and persists automatically for all future navigations.
       if (_engineActive(sessionId) || !openSessions.has(sessionId)) {
-        let page = await _ensureEngine(sessionId, headed);
+        let page = await _ensureEngine(sessionId, headed, hidden);
         if (!page) {
           // Engine launch failed — likely "Opening in existing browser session".
           // Kill any Chrome holding this profile, clear the lock, and retry once.
@@ -2955,7 +2960,7 @@ async function browserAct(args) {
             logger.info(`[browser.act] navigate: killed conflicting Chrome for session=${sessionId} — retrying engine launch`);
             clearProfileLock(sessionId);
             await new Promise(r => setTimeout(r, 500));
-            page = await _ensureEngine(sessionId, headed);
+            page = await _ensureEngine(sessionId, headed, hidden);
           }
         }
         if (page) {
@@ -3224,6 +3229,24 @@ async function browserAct(args) {
       const clickPurpose = args?.purpose || args?.intent || 'default';
       const forceClick = args?.force === true;  // bypass actionability checks (overlay recovery)
 
+      // Build element metadata for the outcome so downstream verifiers (Turn-Loop
+      // postcondition check) can read the resolved element identity (role/name/
+      // region/tag) instead of the opaque ref. Without this, the transcript stores
+      // "td125" and verifiers cannot tell it was an "Add to cart" button.
+      const _elementMeta = (ref, entry) => {
+        if (!entry) return undefined;
+        return {
+          ref: ref || undefined,
+          role: entry.role || '',
+          name: entry.name || '',
+          label: entry.name || '',
+          tag: entry.tag || '',
+          type: entry.type || '',
+          region: entry.region || '',
+          context: entry.context || '',
+        };
+      };
+
       // ── Engine path ──
       const _ePage = engine.getPage(sessionId);
       if (_ePage) {
@@ -3242,7 +3265,7 @@ async function browserAct(args) {
             }
             const _tdClickOk = await _tdRefClick(_ePage, cleanRef, entry, cmd, forceClick, timeoutMs);
             if (_tdClickOk) {
-              return { ok: true, action, sessionId, executionTime: Date.now() - start };
+              return { ok: true, action, sessionId, executionTime: Date.now() - start, element: _elementMeta(cleanRef, entry) };
             }
             logger.warn(`[browser.act] click (engine) tdRef=${cleanRef} all strategies failed — falling through to CSS/eval`);
           }
@@ -3264,7 +3287,7 @@ async function browserAct(args) {
                       await _ePage.click(_sel, { timeout: 5000, force: forceClick });
                     }
                     logger.info(`[browser.act] click (engine) semantic="${_sel}" ok (ref=${cleanRef} bypassed${forceClick ? ' force' : ''})`);
-                    return { ok: true, action, sessionId, executionTime: Date.now() - start };
+                    return { ok: true, action, sessionId, executionTime: Date.now() - start, element: _elementMeta(cleanRef, entry) };
                   } catch (_semErr) {
                     logger.debug(`[browser.act] click (engine) semantic="${_sel}" failed: ${_semErr.message} — trying next`);
                   }
@@ -3291,7 +3314,7 @@ async function browserAct(args) {
                 await locator.click({ timeout: clickTimeout, force: forceClick });
               }
               logger.info(`[browser.act] click (engine) ref=${cleanRef} role=${entry.role} name="${entry.name}" ok${forceClick ? ' (force)' : ''}`);
-              return { ok: true, action, sessionId, executionTime: Date.now() - start };
+              return { ok: true, action, sessionId, executionTime: Date.now() - start, element: _elementMeta(cleanRef, entry) };
             } catch (clickErr) {
               logger.warn(`[browser.act] click (engine) ref=${cleanRef} failed: ${clickErr.message} — trying CSS/eval fallback`);
             }
@@ -3308,7 +3331,7 @@ async function browserAct(args) {
                 await locator.click({ timeout: clickTimeout, force: forceClick });
               }
               logger.info(`[browser.act] click (engine) ref=${cleanRef} text="${entry.name}" (lowConf) ok${forceClick ? ' (force)' : ''}`);
-              return { ok: true, action, sessionId, executionTime: Date.now() - start };
+              return { ok: true, action, sessionId, executionTime: Date.now() - start, element: _elementMeta(cleanRef, entry) };
             } catch (textErr) {
               logger.warn(`[browser.act] click (engine) ref=${cleanRef} text fallback failed: ${textErr.message}`);
             }
@@ -3365,7 +3388,7 @@ async function browserAct(args) {
                 }
               }
               if (_clickedIdx >= 0) {
-                return { ok: true, action, sessionId, executionTime: Date.now() - start };
+                return { ok: true, action, sessionId, executionTime: Date.now() - start, element: _elementMeta(cleanRef, refMap.get(cleanRef)) };
               }
               // All matches exhausted — fall through to error
               logger.warn(`[browser.act] click (engine) CSS="${selector}" — all ${_cssCount} matches clicked but no state change — falling back to CLI`);
@@ -3379,7 +3402,7 @@ async function browserAct(args) {
                   await _ePage.click(selector, { timeout: _singleTimeout, force: forceClick });
                 }
                 logger.info(`[browser.act] click (engine) CSS="${selector}" ok${forceClick ? ' (force)' : ''}`);
-                return { ok: true, action, sessionId, executionTime: Date.now() - start };
+                return { ok: true, action, sessionId, executionTime: Date.now() - start, element: _elementMeta(cleanRef, refMap.get(cleanRef)) };
               } catch (_singleErr) {
                 // On "not visible"/timeout: retry with force:true + state-change verification
                 if (cmd === 'click' && /not visible|not stable|timeout/i.test(_singleErr.message)) {
@@ -3404,7 +3427,7 @@ async function browserAct(args) {
                       const _contentChanged = Math.abs(_stateAfter.bodyLen - _stateBefore.bodyLen) > 50;
                       if (_urlChanged || _modalClosed || _contentChanged) {
                         logger.info(`[browser.act] click (engine) CSS="${selector}" force-click caused state change (url=${_urlChanged}, modal=${_modalClosed}, content=${_contentChanged}) — success`);
-                        return { ok: true, action, sessionId, executionTime: Date.now() - start };
+                        return { ok: true, action, sessionId, executionTime: Date.now() - start, element: _elementMeta(cleanRef, refMap.get(cleanRef)) };
                       }
                     }
                     logger.warn(`[browser.act] click (engine) CSS="${selector}" force-click succeeded but no state change — falling back to CLI`);
@@ -3458,7 +3481,8 @@ async function browserAct(args) {
             })()`);
             if (evalResult && evalResult.startsWith('clicked:') && evalResult !== 'clicked:form') {
               logger.info(`[browser.act] click (engine) eval → ${evalResult}`);
-              return { ok: true, action, sessionId, result: evalResult, executionTime: Date.now() - start };
+              const _matchedText = evalResult.slice('clicked:'.length);
+              return { ok: true, action, sessionId, result: evalResult, executionTime: Date.now() - start, element: { name: _matchedText, label: _matchedText, role: '', tag: '', region: '', context: '' } };
             }
             logger.warn(`[browser.act] click (engine) eval: not found for "${selector}" — falling back to CLI`);
           } catch (evalErr) {
@@ -3644,7 +3668,8 @@ async function browserAct(args) {
           };
         }
         logger.info(`[browser.act] eval-click "${selector}" → ${evalResult}`, { stderr: evalRes.stderr?.slice(0, 80) });
-        return { ok: true, action, sessionId, result: evalResult, executionTime: Date.now() - start };
+        const _matchedTextCli = evalResult.slice('clicked:'.length);
+        return { ok: true, action, sessionId, result: evalResult, executionTime: Date.now() - start, element: { name: _matchedTextCli, label: _matchedTextCli, role: '', tag: '', region: '', context: '' } };
       }
       return run([cmd, ref], `${cmd} ${ref}`);
     }
@@ -6039,7 +6064,14 @@ If no videos found, return []. Do not explain, only output the JSON array.`;
       const expr = text || selector || args.expression || '';
 
       // ── Engine path ──
-      const _ePage = engine.getPage(sessionId);
+      let _ePage = engine.getPage(sessionId);
+      // When the caller explicitly requested headless/hidden execution, launch
+      // the engine with those flags instead of falling to playwright-cli —
+      // the CLI path spawns a headed browser window for session-less evals,
+      // which is the visible flash seen during preflight deep-link resolution.
+      if (!_ePage && (headed === false || hidden === true)) {
+        _ePage = await _ensureEngine(sessionId, headed, hidden);
+      }
       if (_ePage) {
         try {
           // page.evaluate returns JS values directly — no regex parsing needed.

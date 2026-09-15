@@ -37,17 +37,41 @@ function buildExtractItemsScript() {
   // partial results if it is interrupted or errors.
   return `(() => {
     const MAX_ITEMS = 24;
-    const MAX_CARD_LOOPS = 60;
-    const MAX_ANCHORS = 5;
+    const MAX_CARD_LOOPS = 80;
+    const MAX_ANCHORS = 8;
     const MAX_IMGS = 8;
     const items = [];
-    const stats = { ldBlocks: 0, anchorsWithImg: 0, cardCandidates: 0, filtered: 0 };
+    const stats = { ldBlocks: 0, anchorsWithImg: 0, cardCandidates: 0, scoredPositive: 0, filtered: 0 };
     const seen = new Set();
 
     const abs = (u) => { try { return new URL(u, document.baseURI).href; } catch (_) { return ''; } };
-    const isHttp = (u) => /^https?:\/\//i.test(String(u || ''));
+    const isHttp = (u) => /^https?:\\/\\//i.test(String(u || ''));
     const trim = (s) => String(s || '').trim();
     const startsData = (u) => String(u || '').startsWith('data:');
+
+    // Normalize redirect/tracking URLs to their target. Many ad networks and
+    // sponsored-link wrappers encode the real destination in a query param
+    // (commonly 'url', 'dest', 'target', 'redirect'). Decode the first one
+    // that resolves to an http(s) URL on the same host.
+    const normalizeUrl = (u) => {
+      if (!u) return u;
+      try {
+        const parsed = new URL(u);
+        for (const key of ['url', 'dest', 'target', 'redirect', 'u']) {
+          const val = parsed.searchParams.get(key);
+          if (!val) continue;
+          // Try as absolute URL first, then as same-origin path.
+          const decoded = decodeURIComponent(val);
+          if (/^https?:\\/\\//i.test(decoded)) {
+            try { return new URL(decoded).href; } catch (_) {}
+          }
+          if (decoded.startsWith('/')) {
+            try { return new URL(decoded, parsed.origin).href; } catch (_) {}
+          }
+        }
+      } catch (_) {}
+      return u;
+    };
 
     // Pick the largest image URL from a srcset string.
     const bestFromSrcset = (srcset) => {
@@ -63,48 +87,68 @@ function buildExtractItemsScript() {
       return best || (cands[0] ? cands[0].split(/\s+/)[0] : '');
     };
 
-    // Resolve an <img>'s current best image URL, covering lazy-attr variants.
+    // Normalise a raw URL: make absolute and reject data: placeholders.
+    const cleanUrl = (u) => {
+      if (!u) return '';
+      u = trim(u);
+      if (startsData(u)) return '';
+      if (!isHttp(u)) u = abs(u);
+      return isHttp(u) ? u : '';
+    };
+
+    // Resolve an <img>'s best image URL. Many sites (eBay, Etsy, Amazon)
+    // use a placeholder/low-res img.src while the real image lives in
+    // data-src, srcset, or a sibling <picture><source>. We collect all
+    // candidates, reject junk, and return the largest/best remaining URL.
     const resolveImg = (img) => {
       if (!img) return '';
-      let u = '';
-      try { u = img.currentSrc || ''; } catch (_) {}
-      if (!u) u = trim(img.src || '');
-      if (!u && img.dataset) {
-        u = trim(img.dataset.src || img.dataset.lazySrc || img.dataset.original || '');
+      const cands = [];
+      try { const u = cleanUrl(img.currentSrc); if (u) cands.push({ u, w: 0 }); } catch (_) {}
+      const add = (raw, w) => { const u = cleanUrl(raw); if (u) cands.push({ u, w: w || 0 }); };
+      add(img.src);
+      if (img.dataset) {
+        add(img.dataset.src, 100);
+        add(img.dataset.lazySrc, 100);
+        add(img.dataset.original, 100);
       }
-      // Amazon: data-a-dynamic-image is a JSON map of real URLs keyed by URL.
+      if (img.getAttribute) {
+        add(img.getAttribute('data-srcset'), 0);
+        add(img.getAttribute('lazy-srcset'), 0);
+      }
+      if (img.srcset) add(bestFromSrcset(img.srcset), 0);
+      // Amazon: data-a-dynamic-image is a JSON map of URLs keyed by URL.
       if (img.dataset && img.dataset.aDynamicImage) {
         try {
           const map = JSON.parse(img.dataset.aDynamicImage);
-          let best = '', bestW = -1;
           for (const k of Object.keys(map)) {
-            const w = (map[k] && map[k][0]) || 0;
-            if (w > bestW && !startsData(k)) { best = k; bestW = w; }
+            const u = cleanUrl(k);
+            if (u) cands.push({ u, w: (map[k] && map[k][0]) || 0 });
           }
-          if (best) u = best;
         } catch (_) {}
       }
-      if (!u && img.srcset) u = bestFromSrcset(img.srcset);
-      if (!u && img.getAttribute) {
-        const ds = img.getAttribute('data-srcset') || img.getAttribute('lazy-srcset');
-        if (ds) u = bestFromSrcset(ds);
+      // <picture><source srcset> siblings.
+      const pic = img.closest && img.closest('picture');
+      if (pic) {
+        const sources = pic.querySelectorAll('source[srcset]');
+        for (const s of sources) add(bestFromSrcset(s.getAttribute('srcset')), 0);
       }
-      if (u && !isHttp(u)) u = abs(u);
-      if (u && startsData(u)) u = '';
-      return u;
+      if (cands.length === 0) return '';
+      // Prefer the largest width descriptor, then the longest (higher-res) URL.
+      cands.sort((a, b) => (b.w - a.w) || (b.u.length - a.u.length));
+      return cands[0].u;
     };
 
     const imgIsJunk = (img) => {
       if (!img) return false;
       if (img.width === 1 || img.height === 1) return true;
       const u = resolveImg(img);
-      return startsData(u);
+      return !u || startsData(u) || u.length < 12;
     };
 
     const quickText = (el) => (el && el.textContent) ? trim(el.textContent) : '';
     const quickPrice = (txt) => {
       if (!txt) return null;
-      const m = txt.match(/(?:US\s?)?\\$[\\d,]+(?:\\.\\d+)?(?:\\s*[-–]\\s*\\$[\\d,]+(?:\\.\\d+)?)?/);
+      const m = txt.match(/(?:US\s?)?\\$[\\d,]+(?:\\.\\d+)?(?:\s*[-–]\s*\\$[\\d,]+(?:\\.\\d+)?)?/);
       return m ? m[0].trim() : null;
     };
 
@@ -113,7 +157,18 @@ function buildExtractItemsScript() {
       const url = String(it.url || '').trim();
       const imageUrl = String(it.imageUrl || '').trim();
       if (!url && !imageUrl) return;
-      const key = (url || imageUrl) + '|' + (it.title || '') + '|' + (it.mediaType || '');
+      // Dedup by URL path (strip query/tracking params and path segments
+      // containing '=' which are typically tracking refs) so the same product
+      // with different tracking only appears once.
+      let urlPath = url;
+      try {
+        const pu = new URL(url);
+        urlPath = pu.pathname
+          .split('/')
+          .filter(seg => seg && !seg.includes('='))
+          .join('/');
+      } catch (_) {}
+      const key = (urlPath || url || imageUrl) + '|' + (it.title || '') + '|' + (it.mediaType || '');
       if (seen.has(key)) return;
       seen.add(key);
       let hostname = null;
@@ -201,34 +256,120 @@ function buildExtractItemsScript() {
 
       // ── Pass 2: DOM card-candidate pass ────────────────────────────────────
       if (items.length < MAX_ITEMS) {
-        const priceRe = /(?:US\s?)?\\$[\\d,]+(?:\\.\\d+)?|€\s?\\d+|£\s?\\d+|price\s*[: ]?\s*[\\d.,]+/i;
+        const priceRe = /(?:US\s?)?\\$[\\d,]+(?:\\.\\d+)?|€\s?\\d+|£\s?\\d+|price\s*[: ]?\s*\\d[\\d.,]*/i;
         const embedHostRe = /(?:youtube\\.com\\/embed|player\\.vimeo\\.com|www\\.youtube-nocookie\\.com\\/embed|players\\.brightcove\\.net|embed\\.)/i;
+        const pageUrl = abs(document.location.href);
+        const isPageUrl = (u) => !u || u === pageUrl || u === pageUrl + '#' || u.startsWith(pageUrl + '#') || /^javascript:|^data:|^mailto:|^tel:|^#/i.test(u);
 
-        const cardSel = '[data-component-type], [data-asin], li, article, tr, [class*="card"], [class*="item"], [class*="result"], [class*="product"], [class*="tile"], [class*="s-result"]';
+        const inNavLandmark = (el) => {
+          let p = el;
+          while (p) {
+            if (/^(nav|header|footer)$/i.test(p.tagName)) return true;
+            const role = p.getAttribute && p.getAttribute('role');
+            if (role && /^(navigation|banner|contentinfo)$/i.test(role)) return true;
+            p = p.parentElement;
+          }
+          return false;
+        };
+
+        const scoreCard = (card) => {
+          let score = 0;
+          if (inNavLandmark(card)) score -= 20;
+          const cls = String(card.className || '');
+          if (cls.includes('nav') || cls.includes('menu') || cls.includes('flyout') || cls.includes('shortcut') || cls.includes('autocomplete')) score -= 15;
+          const imgs = Array.from(card.querySelectorAll('img'));
+          const goodImgs = imgs.filter(img => !imgIsJunk(img) && resolveImg(img));
+          score += Math.min(goodImgs.length, 2) * 10;
+
+          const anchors = Array.from(card.querySelectorAll('a[href]'));
+          let bestA = null, bestLen = -1;
+          for (const a of anchors) {
+            const u = abs(a.href || '');
+            if (!isHttp(u) || isPageUrl(u)) continue;
+            const txt = trim(a.textContent || '');
+            if (/^sponsored|leave ad feedback|ad feedback$/i.test(txt)) continue;
+            if (txt.length > bestLen) { bestLen = txt.length; bestA = a; }
+          }
+          if (bestA) {
+            score += 15;
+            if (bestLen > 20) score += 10;
+            if (bestLen > 40) score += 5;
+          }
+          if (card.querySelector('h1, h2, h3, h4, [class*="title"], [class*="headline"]')) score += 3;
+          const cardText = quickText(card);
+          if (priceRe.test(cardText)) score += 8;
+          if (/bought in past month|out of \d+ stars|\d+\.\d+ out of \d+ stars|best seller/i.test(cardText)) score += 5;
+          return { score, bestA, goodImgs, cardText };
+        };
+
+        const cardSel = '[data-component-type], [data-asin], article, [class*="card"], [class*="item"], [class*="result"], [class*="product"], [class*="tile"], [class*="s-result"]'; // eslint-disable-line
         const cardEls = Array.from(document.querySelectorAll(cardSel));
         const cardSet = new Set(cardEls);
+
+        // Score every candidate once so we can distinguish a list/grid container
+        // (many card descendants, low score) from a real product card that
+        // happens to contain nested sub-components (many card descendants,
+        // high score — e.g. eBay's .s-item with s-item__image/info children).
+        const scoredAll = cardEls.map((card) => ({ card, ...scoreCard(card) }));
+        const scoreMap = new Map(scoredAll.map(s => [s.card, s.score]));
+
+        // Count total card-candidate descendants for each candidate.
+        const descCount = new Map();
+        for (const el of cardEls) {
+          let n = 0;
+          for (const c of el.querySelectorAll(cardSel)) n++;
+          descCount.set(el, n);
+        }
+
+        // A passthrough/container has many card descendants AND itself scores low.
+        // A real product card (eBay .s-item, Amazon .s-result-item) scores high
+        // even if it has many descendant candidates.
+        const PASSTHROUGH_THRESHOLD = 15;
+        const isPassthrough = (el) => {
+          const desc = descCount.get(el) || 0;
+          if (desc <= 3) return false;
+          const score = scoreMap.get(el) || 0;
+          return score < PASSTHROUGH_THRESHOLD;
+        };
+
+        // A card is "top-level" if no ancestor is a single-card candidate.
+        // Passthroughs (containers with many card descendants) don't swallow children.
         const topCards = cardEls.filter((el) => {
+          if (isPassthrough(el)) return false; // container/wrapper, not a card
           let p = el.parentElement;
-          while (p) { if (cardSet.has(p)) return false; p = p.parentElement; }
+          while (p) {
+            if (cardSet.has(p) && !isPassthrough(p)) return false; // swallowed by a single-card parent
+            p = p.parentElement;
+          }
           return true;
         });
+
+        const scored = topCards.map((card) => ({ card, ...scoreCard(card) })).filter(s => s.score > 0);
+        scored.sort((a, b) => b.score - a.score);
         stats.cardCandidates = topCards.length;
+        stats.scoredPositive = scored.length;
 
-        for (let ci = 0; ci < topCards.length && items.length < MAX_ITEMS && ci < MAX_CARD_LOOPS; ci++) {
-          const card = topCards[ci];
-          const anchors = Array.from(card.querySelectorAll('a[href]')).filter(a => isHttp(abs(a.href)));
-          if (anchors.length === 0) continue;
-          let primary = null, bestLen = -1;
-          for (let ai = 0; ai < anchors.length && ai < MAX_ANCHORS; ai++) {
-            const a = anchors[ai];
-            const len = (a.textContent || '').trim().length;
-            if (len > bestLen) { bestLen = len; primary = a; }
+        for (let ci = 0; ci < scored.length && items.length < MAX_ITEMS && ci < MAX_CARD_LOOPS; ci++) {
+          const { card, bestA, goodImgs, cardText } = scored[ci];
+          if (!bestA && goodImgs.length === 0) continue;
+
+          let primary = bestA;
+          if (!primary) {
+            const firstA = card.querySelector('a[href]');
+            const u = firstA ? abs(firstA.href || '') : '';
+            if (u && !isPageUrl(u)) primary = firstA;
           }
-          if (!primary) primary = anchors[0];
-          const href = abs(primary.href);
-          if (seen.has(href)) continue;
+          const rawUrl = primary ? abs(primary.href || '') : '';
+          const url = normalizeUrl(rawUrl) || rawUrl;
+          let urlPath = url;
+          try {
+            const pu = new URL(url);
+            urlPath = pu.pathname.split('/').filter(seg => seg && !seg.includes('=')).join('/');
+          } catch (_) {}
+          if (!url || isPageUrl(url) || seen.has(urlPath) || seen.has(url)) continue;
 
-          let img = primary.querySelector('img');
+          let img = primary ? primary.querySelector('img') : null;
+          if (!img && goodImgs.length > 0) img = goodImgs[0];
           if (!img) {
             const imgs = Array.from(card.querySelectorAll('img'));
             for (let ii = 0; ii < imgs.length && ii < MAX_IMGS; ii++) {
@@ -237,26 +378,26 @@ function buildExtractItemsScript() {
           }
           if (img && imgIsJunk(img)) img = null;
           const imageUrl = img ? resolveImg(img) : '';
-          if (!imageUrl && !href) continue;
+          if (!imageUrl && !url) continue;
 
-          let title = trim(primary.textContent || '');
+          let title = primary ? trim(primary.textContent || '') : '';
           if (!title && img) title = trim(img.alt || img.title || '');
           if (!title) {
-            const h = card.querySelector('h1, h2, h3, h4, [class*="title"]');
+            const h = card.querySelector('h1, h2, h3, h4, [class*="title"], [class*="headline"]');
             if (h) title = trim(h.textContent);
           }
           title = title.slice(0, 200);
+          if (!title) continue;
 
-          const cardText = quickText(card);
           const priceMatch = cardText.match(priceRe);
           const price = priceMatch ? priceMatch[0].trim() : null;
           let snippet = cardText.replace(title || '', '').replace(price || '', '').trim().slice(0, 160);
-          snippet = snippet.replace(/\\s+/g, ' ').trim() || null;
+          snippet = snippet.replace(/\s+/g, ' ').trim() || null;
 
           const iframe = card.querySelector('iframe[src]');
           const isVideo = iframe && embedHostRe.test(abs(iframe.getAttribute('src') || ''));
 
-          const item = { title: title || null, imageUrl: imageUrl || null, url: href, price, snippet };
+          const item = { title: title || null, imageUrl: imageUrl || null, url: url, price, snippet };
           if (isVideo) {
             item.mediaType = 'video';
             item.embedUrl = abs(iframe.getAttribute('src'));
@@ -290,7 +431,7 @@ function buildExtractItemsScript() {
           const priceMatch = cardText.match(/(?:US\s?)?\\$[\\d,]+(?:\\.\\d+)?/);
           const price = priceMatch ? priceMatch[0].trim() : null;
           let snippet = cardText.replace(title || '', '').replace(price || '', '').trim().slice(0, 160);
-          snippet = snippet.replace(/\\s+/g, ' ').trim() || null;
+          snippet = snippet.replace(/\s+/g, ' ').trim() || null;
           if (!imageUrl && !title) continue;
           addItem({ title: title || null, imageUrl: imageUrl || null, url: href, price, snippet, mediaType: 'card' });
         }
@@ -338,7 +479,7 @@ function buildExtractItemsScript() {
       stats.error = String(err && err.message || err).slice(0, 200);
     }
 
-    // Final filter/cap (also drops junk without images on Amazon if we already have Amazon items)
+    // Final filter/cap
     const filtered = [];
     const dedupe = new Set();
     for (const it of items) {

@@ -321,6 +321,7 @@ async function webCrawl(args) {
     extractLinks = false,
     extractItems = false,
     extractMedia = false,
+    hidden = false,
     onProgress = null,
   } = args || {};
 
@@ -372,7 +373,12 @@ async function webCrawl(args) {
   // All headless candidates rejected — if any rejection looked like an
   // error-page/bot-wall signature, retry the primary URL once in headed real
   // Chrome with a warm persistent profile (same flags browser.act uses).
-  if (lastBad && lastBad.signature) {
+  //
+  // When `hidden` is true (public_read/download tasks), skip the warm retry —
+  // playwright-cli's --headed mode can't be sized 1x1, so it would show a
+  // visible window. Instead return botBlocked so the caller (executeCommand)
+  // can fall back to browser.agent extract_url with the hidden engine path.
+  if (lastBad && lastBad.signature && !hidden) {
     progress(`All headless attempts blocked — warm retry in headed Chrome: ${candidates[0]}`);
     const warmRes = await _crawlOnce(candidates[0], {
       maxChars, timeoutMs, effectiveWaitMs, extractLinks, extractItems: wantItems, progress, startTime, warm: true,
@@ -397,6 +403,22 @@ async function webCrawl(args) {
     }
     // Warm retry got a real but sparse page — return it as ok.
     return { ...warmRes, elapsedMs: Date.now() - startTime, attempts: candidates.length + 1, warmRetry: true, rejectedReason: warmBad.reason };
+  }
+
+  // Hidden mode: skip warm retry, return botBlocked so executeCommand can use
+  // the hidden browser.agent extract_url fallback instead.
+  if (lastBad && lastBad.signature && hidden) {
+    progress(`All headless attempts blocked — returning botBlocked for hidden fallback (warm retry skipped)`);
+    return {
+      ...lastRes,
+      ok: false,
+      botBlocked: true,
+      error: `Page blocked or error page on all attempts (last: ${lastBad.reason})`,
+      rejectedReason: lastBad.reason,
+      elapsedMs: Date.now() - startTime,
+      attempts: candidates.length,
+      warmRetry: false,
+    };
   }
 
   // Rejections were thin-page only (no error signature) — legitimately sparse

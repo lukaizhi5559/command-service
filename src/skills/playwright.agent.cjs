@@ -1098,7 +1098,7 @@ Rules:
 function _buildStepTypeBlock(stepType) {
   switch (stepType) {
     case 'on-page-action':
-      return `\nSTEP TYPE: on-page-action. The browser is ALREADY on the correct page. Do NOT navigate away. Interact with elements on the current page only. Phrases like "search results page" or "product page" in the goal describe the CURRENT page — they are NOT instructions to search or navigate.`;
+      return `\nSTEP TYPE: on-page-action. The browser is ALREADY on the correct page. Do NOT navigate away. Interact with elements on the current page only. Phrases like "search results page" or "product page" in the goal describe the CURRENT page — they are NOT instructions to search or navigate. If the CURRENT URL already encodes the goal's query or the visible page already shows the results/items the goal references, do NOT include steps that re-search, re-navigate, or re-submit — go straight to the interaction the goal describes.`;
     case 'navigate':
       return `\nSTEP TYPE: navigate. This step requires navigating to a URL or performing a search. If the current page is not the target, navigate first.`;
     case 'verify':
@@ -5994,6 +5994,394 @@ function _extractGoalPhrases(goal) {
   return _result;
 }
 
+// ---------------------------------------------------------------------------
+// Unified postcondition verification — site/app-agnostic completion gate.
+//
+// The Turn-Loop previously relied on a fragmented set of completion checks:
+//   - _isGoalCompletedBySignals (cart regex + click-evidence — brittle)
+//   - _verifyGoalCompletion (phrase matching / LLM Tier 0)
+//   - _verifyActionCompletion (send/submit only)
+//   - _structuralVerifySubTask (3-gate: transcript + container + LLM)
+//
+// Each had gaps. The deepest root cause was that browser.act click outcomes
+// carried no element identity (just "td125"), so click-evidence checks that
+// inspected t.action.selector/text for "add to cart" always failed. With the
+// Part A fix, outcomes now carry `element.name` (the resolved aria-label/text).
+//
+// This module provides a single _verifyPostcondition gate that all completion
+// paths call. It classifies the goal's mutation type, captures pre/post state
+// snapshots, and verifies the state delta. Regex/LLM are retained as evidence
+// contributors, not the sole authority.
+//
+// Returns: { status: 'verified'|'unverified'|'failed'|'inconclusive',
+//            reason: string, evidence: object }
+// ---------------------------------------------------------------------------
+
+// Classify a goal into a mutation type + entity + destination + cardinality.
+// Site-agnostic — uses verb + destination keywords, not site-specific patterns.
+function _classifyGoalMutation(goal) {
+  const g = (goal || '').toLowerCase();
+  if (!g) return { type: 'unknown', entity: '', destination: '', cardinality: 1 };
+
+  // Cardinality: "exactly one", "one", "a single", "1" → 1; "two"/"2" → 2; default 1
+  let cardinality = 1;
+  const _cardM = g.match(/\b(?:exactly\s+)?(one|two|three|four|five|six|seven|eight|nine|ten|\d+)\s+(?:item|product|bible|book|song|track|message|email|post|comment|file|document|image|video)s?\b/);
+  if (_cardM) {
+    const _w = _cardM[1];
+    const _numWords = { one:1, two:2, three:3, four:4, five:5, six:6, seven:7, eight:8, nine:9, ten:10 };
+    cardinality = /^\d+$/.test(_w) ? parseInt(_w, 10) : (_numWords[_w] || 1);
+  }
+  // "all"/"every" → 0 means "all" (no fixed count)
+  if (/\b(all|every|each)\b/.test(g)) cardinality = 0;
+
+  // Mutation type detection (order matters — more specific first)
+  const _has = (re) => re.test(g);
+
+  // add_to_cart: add X to cart/basket/bag
+  if (_has(/\badd\b[\s\S]{0,80}\b(?:cart|basket|bag)\b/) || _has(/\b(?:cart|basket|bag)\b[\s\S]{0,40}\badd\b/)) {
+    const _entity = _extractEntityFromGoal(goal, ['cart', 'basket', 'bag']);
+    return { type: 'add_to_cart', entity: _entity, destination: 'cart', cardinality };
+  }
+  // submit: submit a form/application/request
+  if (_has(/\b(submit|send|file)\b[\s\S]{0,40}\b(form|application|request|ticket|claim|report)\b/)) {
+    return { type: 'submit', entity: _extractEntityFromGoal(goal, ['form', 'application', 'request', 'ticket']), destination: '', cardinality };
+  }
+  // post: post/publish/tweet/share a message/update/status
+  if (_has(/\b(post|publish|tweet|share|update|status)\b/)) {
+    return { type: 'post', entity: _extractEntityFromGoal(goal, ['post', 'message', 'update', 'status', 'tweet']), destination: 'feed', cardinality };
+  }
+  // send: send/email/message/reply to someone
+  if (_has(/\b(send|email|message|reply|respond)\b/)) {
+    return { type: 'send', entity: _extractEntityFromGoal(goal, ['email', 'message', 'reply']), destination: 'sent', cardinality };
+  }
+  // comment: comment on a post/video
+  if (_has(/\bcomment\b/)) {
+    return { type: 'comment', entity: _extractEntityFromGoal(goal, ['comment']), destination: 'comments', cardinality };
+  }
+  // save: save/bookmark/favorite/like
+  if (_has(/\b(save|bookmark|favorite|favourite|like|star)\b/)) {
+    return { type: 'save', entity: _extractEntityFromGoal(goal, ['save', 'bookmark', 'favorite']), destination: 'saved', cardinality };
+  }
+  // create: create/make a new X
+  if (_has(/\b(create|make|new)\b[\s\S]{0,40}\b(playlist|document|doc|file|project|folder|album|event|task|todo|note|page|site|repository|repo|issue|ticket|channel|group|team)\b/)) {
+    const _destM = g.match(/\b(playlist|document|doc|file|project|folder|album|event|task|todo|note|page|site|repository|repo|issue|ticket|channel|group|team)\b/);
+    return { type: 'create', entity: _extractEntityFromGoal(goal, ['playlist', 'document', 'project', 'folder', 'album', 'event', 'task', 'note', 'page', 'repository', 'issue', 'ticket', 'channel', 'group', 'team']), destination: _destM ? _destM[1] : '', cardinality };
+  }
+  // move: move/transfer X to Y
+  if (_has(/\b(move|transfer|relocate|copy)\b[\s\S]{0,40}\bto\b/)) {
+    return { type: 'move', entity: _extractEntityFromGoal(goal, ['to']), destination: '', cardinality };
+  }
+  // delete: delete/remove X
+  if (_has(/\b(delete|remove|trash|discard|erase)\b/)) {
+    return { type: 'delete', entity: _extractEntityFromGoal(goal, ['delete', 'remove', 'trash']), destination: '', cardinality };
+  }
+  // edit: edit/update/modify X
+  if (_has(/\b(edit|update|modify|change|rename)\b/)) {
+    return { type: 'edit', entity: _extractEntityFromGoal(goal, ['edit', 'update', 'modify', 'rename']), destination: '', cardinality };
+  }
+  // navigate: go to/open/navigate to a page
+  if (_has(/\b(go to|open|navigate to|visit|browse to)\b/)) {
+    return { type: 'navigate', entity: '', destination: '', cardinality: 0 };
+  }
+  // read: search/find/extract/read — no mutation
+  if (_has(/\b(search|find|extract|read|check|list|show|display|look up|pull up|fetch|retrieve|count|how many|browse|summarize)\b/) &&
+      !_has(/\b(send|post|compose|tweet|share|write|create|submit|publish|edit|update|delete|remove|add|fill|type|reply|comment|draft|rename|move|sort|format|forward)\b/)) {
+    return { type: 'read', entity: '', destination: '', cardinality: 0 };
+  }
+
+  return { type: 'unknown', entity: '', destination: '', cardinality };
+}
+
+// Extract the entity (the thing being acted on) from the goal.
+// Strips the destination keywords so they don't become the entity.
+function _extractEntityFromGoal(goal, stripKeywords) {
+  if (!goal) return '';
+  // Try quoted phrases first
+  const _quoted = goal.match(/["']([^"']{2,60})["']/);
+  if (_quoted) return _quoted[1];
+  // Try "the first X" / "a X" / "an X" patterns
+  const _artM = goal.match(/\b(?:the\s+)?(?:first\s+|a\s+|an\s+)?([A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+){0,3})\b/);
+  if (_artM) {
+    let entity = _artM[1];
+    for (const kw of (stripKeywords || [])) {
+      entity = entity.replace(new RegExp(`\\b${kw}\\b`, 'gi'), '').trim();
+    }
+    return entity.trim();
+  }
+  return '';
+}
+
+// Capture a lightweight page-state snapshot for pre/post comparison.
+// Called before and after each action. Returns a plain object.
+async function _captureStateSnapshot(sessionId, page) {
+  const _empty = { url: '', modalCount: 0, bodyLen: 0, cartCount: null, cartSubtotal: null, formValues: [], listCounts: {} };
+  if (!page) return _empty;
+  try {
+    return await page.evaluate(() => {
+      const _num = (s) => { const m = String(s || '').match(/(\d+(?:[.,]\d+)?)/); return m ? parseFloat(m[1].replace(',', '')) : null; };
+      // URL
+      const url = window.location.href;
+      // Modal count
+      const modalCount = document.querySelectorAll('[role="dialog"], [role="alertdialog"], [aria-modal="true"]').length;
+      // Body length
+      const bodyLen = (document.body?.innerText || '').length;
+
+      // Cart count — generic selectors across e-commerce sites
+      let cartCount = null;
+      const _cartCountEls = document.querySelectorAll(
+        '[data-cart-count], [data-testid*="cart-count"], #nav-cart-count, #nav-cart, [aria-label*="cart" i][aria-label*="item" i], .nav-cart-count, [data-testid*="cart"] [aria-label]'
+      );
+      for (const el of _cartCountEls) {
+        const txt = (el.getAttribute('aria-label') || el.innerText || el.textContent || '').trim();
+        const n = _num(txt);
+        if (n !== null) { cartCount = n; break; }
+      }
+      // Fallback: text pattern "N items in cart"
+      if (cartCount === null) {
+        const _bodyText = (document.body?.innerText || '').slice(0, 5000);
+        const _cm = _bodyText.match(/(\d+)\s+items?\s+in\s+(?:your\s+)?(?:cart|basket|bag)/i);
+        if (_cm) cartCount = parseInt(_cm[1], 10);
+      }
+
+      // Cart subtotal — generic
+      let cartSubtotal = null;
+      const _subtotalEls = document.querySelectorAll(
+        '[data-testid*="subtotal"], [data-testid*="cart-subtotal"], .cart-subtotal, [aria-label*="subtotal" i], #sc-subtotal, .nav-cart-subtotal'
+      );
+      for (const el of _subtotalEls) {
+        const txt = (el.innerText || el.textContent || '').trim();
+        const m = txt.match(/\$?\s*(\d+(?:[.,]\d+)?)/);
+        if (m) { cartSubtotal = parseFloat(m[1].replace(',', '')); break; }
+      }
+      // Fallback: "Subtotal: $X" in body text
+      if (cartSubtotal === null) {
+        const _bodyText = (document.body?.innerText || '').slice(0, 5000);
+        const _sm = _bodyText.match(/subtotal[:\s]*\$?\s*(\d+(?:[.,]\d+)?)/i);
+        if (_sm) cartSubtotal = parseFloat(_sm[1].replace(',', ''));
+      }
+
+      // Form values — visible input/textarea values (for submit/post/send detection)
+      const formValues = [];
+      const _inputs = document.querySelectorAll('input, textarea, [contenteditable="true"], [role="textbox"]');
+      for (const el of _inputs) {
+        const r = el.getBoundingClientRect();
+        if (r.width === 0 && r.height === 0) continue;
+        if (el.type === 'hidden' || el.disabled) continue;
+        const val = (el.value || el.innerText || el.textContent || '').trim().slice(0, 200);
+        if (val) formValues.push(val);
+      }
+
+      // List/container counts — track lists, message threads, cart items
+      const listCounts = {};
+      const _listSelectors = [
+        ['trackList', '[data-testid="track-list"], [data-testid*="playlist-track"], .track-list, .playlist-tracks'],
+        ['messages', '[data-testid*="message"], [role="log"], .message-list, [aria-label*="message" i]'],
+        ['cartItems', '[data-testid*="cart-item"], .cart-item, [aria-label*="cart item" i]'],
+        ['comments', '[data-testid*="comment"], .comment, [aria-label*="comment" i]'],
+        ['searchResults', '[data-testid*="search-result"], .search-result, [data-component-type="s-search-result"]'],
+      ];
+      for (const [key, sel] of _listSelectors) {
+        try {
+          const count = document.querySelectorAll(sel).length;
+          if (count > 0) listCounts[key] = count;
+        } catch (_) {}
+      }
+
+      return { url, modalCount, bodyLen, cartCount, cartSubtotal, formValues: formValues.slice(0, 20), listCounts };
+    }).catch(() => _empty);
+  } catch (_) {
+    return _empty;
+  }
+}
+
+// Unified postcondition verification gate.
+// All Turn-Loop completion paths call this. Returns a status that the caller
+// uses to decide whether to accept completion, reject and continue, or fail.
+//
+// status:
+//   'verified'    — postcondition met, stop the loop
+//   'unverified'  — postcondition not met (but not a hard fail), keep looping
+//   'failed'      — postcondition definitively failed (e.g. action errored), stop
+//   'inconclusive' — couldn't determine (e.g. no state signals), defer to fallback
+async function _verifyPostcondition({ goal, verificationGoal, sessionId, headed, page, preState, postState, actionElement, transcript, mutationType: _overrideType }) {
+  const _goal = verificationGoal || goal || '';
+  const _logTag = '[playwright.agent] postcondition verify';
+  const _mutation = _overrideType ? { type: _overrideType } : _classifyGoalMutation(_goal);
+  const _type = _mutation.type;
+
+  if (_type === 'read' || _type === 'navigate' || _type === 'unknown') {
+    // Read/navigate/unknown goals don't have a state-delta postcondition.
+    // Defer to the existing fallback verifiers.
+    return { status: 'inconclusive', reason: `${_type} goal — no state-delta postcondition`, evidence: {} };
+  }
+
+  const _pre = preState || {};
+  const _post = postState || {};
+  const _evidence = {
+    mutationType: _type,
+    entity: _mutation.entity,
+    destination: _mutation.destination,
+    cardinality: _mutation.cardinality,
+    preCartCount: _pre.cartCount,
+    postCartCount: _post.cartCount,
+    preCartSubtotal: _pre.cartSubtotal,
+    postCartSubtotal: _post.cartSubtotal,
+    preModalCount: _pre.modalCount,
+    postModalCount: _post.modalCount,
+    actionElement: actionElement ? { name: actionElement.name, role: actionElement.role, region: actionElement.region } : null,
+  };
+
+  // ── add_to_cart: cart count/subtotal must increase by cardinality ──
+  if (_type === 'add_to_cart') {
+    // Primary signal: cart count increased
+    if (_pre.cartCount !== null && _post.cartCount !== null) {
+      const _delta = _post.cartCount - _pre.cartCount;
+      if (_delta > 0) {
+        // Cardinality guard: if cardinality is 1 and delta > 1, still verified
+        // (the user asked for 1, got 1+ — the first add was the requested one).
+        // The loop should stop to prevent further additions.
+        const _cardOk = _mutation.cardinality === 0 || _delta >= _mutation.cardinality;
+        if (_cardOk) {
+          logger.info(`${_logTag}: VERIFIED (add_to_cart) — cart count ${_pre.cartCount}→${_post.cartCount} (delta=${_delta})`);
+          return { status: 'verified', reason: `cart count increased ${_pre.cartCount}→${_post.cartCount}`, evidence: _evidence };
+        }
+      }
+      // Cart count didn't increase → unverified
+      logger.info(`${_logTag}: UNVERIFIED (add_to_cart) — cart count ${_pre.cartCount}→${_post.cartCount} (no increase)`);
+      return { status: 'unverified', reason: `cart count did not increase (${_pre.cartCount}→${_post.cartCount})`, evidence: _evidence };
+    }
+    // Fallback: subtotal increased (some sites don't expose cart count)
+    if (_pre.cartSubtotal !== null && _post.cartSubtotal !== null) {
+      const _subDelta = _post.cartSubtotal - _pre.cartSubtotal;
+      if (_subDelta > 0) {
+        logger.info(`${_logTag}: VERIFIED (add_to_cart) — cart subtotal ${_pre.cartSubtotal}→${_post.cartSubtotal} (delta=${_subDelta})`);
+        return { status: 'verified', reason: `cart subtotal increased ${_pre.cartSubtotal}→${_post.cartSubtotal}`, evidence: _evidence };
+      }
+      logger.info(`${_logTag}: UNVERIFIED (add_to_cart) — cart subtotal ${_pre.cartSubtotal}→${_post.cartSubtotal} (no increase)`);
+      return { status: 'unverified', reason: `cart subtotal did not increase (${_pre.cartSubtotal}→${_post.cartSubtotal})`, evidence: _evidence };
+    }
+    // No cart signals available — check action element identity
+    if (actionElement && actionElement.name) {
+      const _name = actionElement.name.toLowerCase();
+      if (/add to (cart|bag|basket)|add-to-cart|addtocart/.test(_name)) {
+        // The action was an add-to-cart click. Check if cart confirmation text appeared.
+        try {
+          const _pageText = page ? await page.evaluate(() => (document.body?.innerText || '').slice(0, 5000)).catch(() => '') : '';
+          const _cartConfirm = /added to (?:your |the |my )?(?:cart|basket|bag)|item(?:s)? added|proceed to (?:buy|checkout)|\b\d+\s+items? in (?:your |the )?(?:cart|basket|bag)/i.test(_pageText);
+          if (_cartConfirm) {
+            logger.info(`${_logTag}: VERIFIED (add_to_cart) — add-to-cart click + cart confirmation text (no count/subtotal signals)`);
+            return { status: 'verified', reason: 'add-to-cart click + cart confirmation text', evidence: _evidence };
+          }
+        } catch (_) {}
+      }
+    }
+    // Inconclusive — no cart signals and no action element evidence
+    logger.info(`${_logTag}: INCONCLUSIVE (add_to_cart) — no cart count/subtotal signals and no action element evidence`);
+    return { status: 'inconclusive', reason: 'no cart count/subtotal signals available', evidence: _evidence };
+  }
+
+  // ── submit/post/send/reply/comment: composer/form disappeared or destination shows new item ──
+  if (_type === 'submit' || _type === 'post' || _type === 'send' || _type === 'reply' || _type === 'comment') {
+    // Primary signal: form values disappeared (composer cleared/closed)
+    if (_pre.formValues && _pre.formValues.length > 0 && _post.formValues) {
+      const _preNonEmpty = _pre.formValues.filter(v => v.length > 0).length;
+      const _postNonEmpty = _post.formValues.filter(v => v.length > 0).length;
+      if (_preNonEmpty > 0 && _postNonEmpty < _preNonEmpty) {
+        logger.info(`${_logTag}: VERIFIED (${_type}) — form values cleared (${_preNonEmpty}→${_postNonEmpty})`);
+        return { status: 'verified', reason: `form/composer cleared (${_preNonEmpty}→${_postNonEmpty} non-empty values)`, evidence: _evidence };
+      }
+    }
+    // Modal closed (composer dialog dismissed)
+    if (_pre.modalCount > 0 && _post.modalCount < _pre.modalCount) {
+      logger.info(`${_logTag}: VERIFIED (${_type}) — modal closed (${_pre.modalCount}→${_post.modalCount})`);
+      return { status: 'verified', reason: `composer modal closed (${_pre.modalCount}→${_post.modalCount})`, evidence: _evidence };
+    }
+    // URL changed (navigated away from composer to destination)
+    if (_pre.url && _post.url && _pre.url !== _post.url) {
+      logger.info(`${_logTag}: VERIFIED (${_type}) — URL changed after submit (${_pre.url.slice(0,60)}→${_post.url.slice(0,60)})`);
+      return { status: 'verified', reason: `navigated after submit (${_pre.url.slice(0, 40)}→${_post.url.slice(0, 40)})`, evidence: _evidence };
+    }
+    // Destination list count increased (e.g. messages, comments)
+    if (_pre.listCounts && _post.listCounts) {
+      for (const _key of ['messages', 'comments']) {
+        if (_pre.listCounts[_key] !== undefined && _post.listCounts[_key] !== undefined) {
+          if (_post.listCounts[_key] > _pre.listCounts[_key]) {
+            logger.info(`${_logTag}: VERIFIED (${_type}) — ${_key} count increased (${_pre.listCounts[_key]}→${_post.listCounts[_key]})`);
+            return { status: 'verified', reason: `${_key} count increased (${_pre.listCounts[_key]}→${_post.listCounts[_key]})`, evidence: _evidence };
+          }
+        }
+      }
+    }
+    logger.info(`${_logTag}: UNVERIFIED (${_type}) — no composer-clear/modal-close/URL-change/list-increase signal`);
+    return { status: 'unverified', reason: `no ${_type} completion signal (composer/modal/URL/list)`, evidence: _evidence };
+  }
+
+  // ── save/create: new item in destination container ──
+  if (_type === 'save' || _type === 'create') {
+    // URL changed to a new item page
+    if (_pre.url && _post.url && _pre.url !== _post.url) {
+      logger.info(`${_logTag}: VERIFIED (${_type}) — URL changed (${_pre.url.slice(0,60)}→${_post.url.slice(0,60)})`);
+      return { status: 'verified', reason: `navigated to new item (${_post.url.slice(0, 60)})`, evidence: _evidence };
+    }
+    // Modal closed (create dialog dismissed)
+    if (_pre.modalCount > 0 && _post.modalCount < _pre.modalCount) {
+      logger.info(`${_logTag}: VERIFIED (${_type}) — create modal closed (${_pre.modalCount}→${_post.modalCount})`);
+      return { status: 'verified', reason: `create modal closed (${_pre.modalCount}→${_post.modalCount})`, evidence: _evidence };
+    }
+    // List count increased in destination
+    if (_pre.listCounts && _post.listCounts) {
+      for (const _key of Object.keys(_post.listCounts)) {
+        if (_pre.listCounts[_key] !== undefined && _post.listCounts[_key] > _pre.listCounts[_key]) {
+          logger.info(`${_logTag}: VERIFIED (${_type}) — ${_key} count increased (${_pre.listCounts[_key]}→${_post.listCounts[_key]})`);
+          return { status: 'verified', reason: `${_key} count increased (${_pre.listCounts[_key]}→${_post.listCounts[_key]})`, evidence: _evidence };
+        }
+      }
+    }
+    logger.info(`${_logTag}: UNVERIFIED (${_type}) — no URL-change/modal-close/list-increase signal`);
+    return { status: 'unverified', reason: `no ${_type} completion signal (URL/modal/list)`, evidence: _evidence };
+  }
+
+  // ── move: item in destination, absent from source ──
+  if (_type === 'move') {
+    if (_pre.url && _post.url && _pre.url !== _post.url) {
+      logger.info(`${_logTag}: VERIFIED (move) — URL changed (${_pre.url.slice(0,60)}→${_post.url.slice(0,60)})`);
+      return { status: 'verified', reason: `navigated to destination (${_post.url.slice(0, 60)})`, evidence: _evidence };
+    }
+    logger.info(`${_logTag}: UNVERIFIED (move) — no URL-change signal`);
+    return { status: 'unverified', reason: 'no move completion signal (URL)', evidence: _evidence };
+  }
+
+  // ── delete: item absent from source ──
+  if (_type === 'delete') {
+    if (_pre.listCounts && _post.listCounts) {
+      for (const _key of Object.keys(_pre.listCounts)) {
+        if (_post.listCounts[_key] !== undefined && _post.listCounts[_key] < _pre.listCounts[_key]) {
+          logger.info(`${_logTag}: VERIFIED (delete) — ${_key} count decreased (${_pre.listCounts[_key]}→${_post.listCounts[_key]})`);
+          return { status: 'verified', reason: `${_key} count decreased (${_pre.listCounts[_key]}→${_post.listCounts[_key]})`, evidence: _evidence };
+        }
+      }
+    }
+    if (_pre.bodyLen && _post.bodyLen && _post.bodyLen < _pre.bodyLen - 50) {
+      logger.info(`${_logTag}: VERIFIED (delete) — body text shrank (${_pre.bodyLen}→${_post.bodyLen})`);
+      return { status: 'verified', reason: `page content shrank (${_pre.bodyLen}→${_post.bodyLen})`, evidence: _evidence };
+    }
+    logger.info(`${_logTag}: UNVERIFIED (delete) — no list-decrease/body-shrink signal`);
+    return { status: 'unverified', reason: 'no delete completion signal (list/body)', evidence: _evidence };
+  }
+
+  // ── edit: body text changed ──
+  if (_type === 'edit') {
+    if (_pre.bodyLen !== undefined && _post.bodyLen !== undefined && _pre.bodyLen !== _post.bodyLen) {
+      logger.info(`${_logTag}: VERIFIED (edit) — body text changed (${_pre.bodyLen}→${_post.bodyLen})`);
+      return { status: 'verified', reason: `page content changed (${_pre.bodyLen}→${_post.bodyLen})`, evidence: _evidence };
+    }
+    logger.info(`${_logTag}: UNVERIFIED (edit) — no body-change signal`);
+    return { status: 'unverified', reason: 'no edit completion signal (body)', evidence: _evidence };
+  }
+
+  return { status: 'inconclusive', reason: `unhandled mutation type: ${_type}`, evidence: _evidence };
+}
+
 // Verify that the goal was actually achieved on the current page.
 // Two tiers:
 //   Tier 1 (DOM, deterministic, ~50ms): one page.evaluate collecting
@@ -8479,7 +8867,7 @@ async function _executeOverlayInteraction({ goal, sessionId, headed, timeoutMs, 
   }
 }
 
-async function _focusedPlanExecute({ goal, verificationGoal, sessionId, headed, timeoutMs, agentContext, deadline, start, heartbeat, _ocrText, _domSignals, pageStudyBlock, domainLockBlock, failedApproachesBlock, recordFailedApproach, stepType = null }) {
+async function _focusedPlanExecute({ goal, verificationGoal, sessionId, headed, timeoutMs, agentContext, deadline, start, heartbeat, _ocrText, _domSignals, pageStudyBlock, domainLockBlock, failedApproachesBlock, recordFailedApproach, stepType = null, peBaseline = null, _progressCallbackUrl = null, _stepIndex = 0, flowCounter = null }) {
   const _peStart = Date.now();
   logger.info(`[playwright.agent] focused Plan-Execute: starting for goal="${goal.slice(0, 80)}"`);
   logger.info(`[playwright.agent] focused Plan-Execute: pageStudyBlock length=${(pageStudyBlock || '').length}${pageStudyBlock ? `, first 200 chars: ${pageStudyBlock.slice(0, 200)}` : ' (empty)'}`);
@@ -8494,8 +8882,10 @@ async function _focusedPlanExecute({ goal, verificationGoal, sessionId, headed, 
     const _pageText = await page.evaluate(() => document.body.innerText.slice(0, 3000)).catch(() => '');
 
     // 2. ONE LLM call with full context
+    const _currentUrl = page.url();
     const _stepTypeBlock = _buildStepTypeBlock(stepType);
     const _userPrompt = `GOAL: ${goal}${_stepTypeBlock}
+CURRENT URL: ${_currentUrl}
 ${agentContext ? `\nAGENT CONTEXT:\n${agentContext}` : ''}
 ${pageStudyBlock || ''}
 ${_ocrText ? `\nOCR SCREEN CAPTURE:\n${_ocrText.slice(0, 1000)}\n` : ''}
@@ -8549,8 +8939,40 @@ Generate 3-5 steps to complete this task.`;
       const _urlBefore = _isClickStep ? await page.evaluate(() => window.location.href).catch(() => '') : '';
       const _bodyLenBefore = _isClickStep ? await page.evaluate(() => document.body.innerText.length).catch(() => 0) : 0;
 
+      // Reserve this step's row in the Automation Flow panel and mark it running
+      // so the in-flight action is visible before the result arrives.
+      const _peDesc = _step.action === 'click' || _step.action === 'clickBySelector' ? `click ${_step.selector || ''}`
+        : _step.action === 'clickByText' ? `click "${_step.text || ''}"`
+        : ['fill', 'type', 'reactFill'].includes(_step.action) ? `type "${String(_step.text || _step.value || '').slice(0, 40)}"`
+        : _step.action === 'navigate' ? `navigate to ${_step.url || ''}`
+        : _step.action === 'press' ? `press ${_step.key || ''}`
+        : _step.action === 'scroll' ? `scroll`
+        : _step.action === 'getPageText' ? `read page text`
+        : _step.action;
+      const _peFlowIdx = flowCounter ? flowCounter.v++ : _i;
+      postProgress(_progressCallbackUrl, {
+        type: 'turn_flow:step',
+        stepIndex: _stepIndex,
+        flowIndex: _peFlowIdx,
+        action: `Step ${_i + 1}/${_steps.length}: ${_peDesc}`,
+        status: 'running',
+      });
+
       const _result = await browserAct({ ..._step, sessionId, headed, timeoutMs: timeoutMs || 15000 });
-      _peTranscript.push({ step: _i + 1, action: _step, outcome: { ok: _result.ok, error: _result.error, result: _result.result }, thoughts: `Plan-Execute step ${_i + 1}` });
+      _peTranscript.push({ step: _i + 1, action: _step, outcome: { ok: _result.ok, error: _result.error, result: _result.result, element: _result.element || null }, thoughts: `Plan-Execute step ${_i + 1}` });
+
+      // Mark the same row done/failed with the resolved element name.
+      {
+        const _peElName = _result.element?.name || '';
+        postProgress(_progressCallbackUrl, {
+          type: 'turn_flow:step',
+          stepIndex: _stepIndex,
+          flowIndex: _peFlowIdx,
+          action: `Step ${_i + 1}/${_steps.length}: ${_peDesc}${_peElName ? ` → ${_peElName}` : ''}`,
+          status: _result.ok ? 'done' : 'failed',
+          outcome: _result.ok ? 'ok' : (_result.error || 'failed'),
+        });
+      }
 
       // Track timestamp of last DOM-mutating step for network verification (Signal B).
       // The netlog logs on 'response' event, so we need the timestamp to filter requests.
@@ -8807,6 +9229,30 @@ Generate 3-5 steps to complete this task FROM THE CURRENT PAGE STATE. Steps 1-${
     // verification paths are unavailable (e.g. add-to-playlist tasks that
     // only searched then reported success with no verification possible).
     if (_goalVerify && !_goalVerify.pass && _goalVerify.source !== 'inconclusive') {
+      // Before accepting the LLM/VLM rejection, run the postcondition gate —
+      // a verified state delta (e.g. cart subtotal increased) beats a
+      // text-slice misjudgment like "does not show the added item" when the
+      // cart page does in fact contain it.
+      if (peBaseline) {
+        try {
+          const _postPeState = await _captureStateSnapshot(sessionId, page);
+          const _lastOkAction = [..._peTranscript].reverse().find(t => t.outcome?.ok && ['click', 'press', 'fill', 'type', 'reactFill', 'tier1.6_pick', 'keyboard_nav'].includes(t.action?.action));
+          const _pc = await _verifyPostcondition({
+            goal, verificationGoal, sessionId, headed, page,
+            preState: peBaseline,
+            postState: _postPeState,
+            actionElement: _lastOkAction?.outcome?.element || null,
+            transcript: _peTranscript,
+          });
+          if (_pc.status === 'verified') {
+            logger.info(`[playwright.agent] focused Plan-Execute: postcondition VERIFIED despite LLM verify-fail — ${_pc.reason}. Overriding to success.`);
+            return { ok: true, result: _resultText, transcript: _peTranscript, routingDecision: 'focused_plan_execute', goalVerified: true, postconditionVerified: true, postconditionEvidence: _pc.evidence };
+          }
+          logger.info(`[playwright.agent] focused Plan-Execute: postcondition check ${_pc.status} — ${_pc.reason}`);
+        } catch (_pcErr) {
+          logger.warn(`[playwright.agent] focused Plan-Execute: postcondition check error (non-fatal): ${_pcErr.message}`);
+        }
+      }
       logger.warn(`[playwright.agent] focused Plan-Execute: goal verification FAILED — ${_goalVerify.reason} — falling back to turn-loop`);
       return {
         ok: false,
@@ -11570,6 +12016,8 @@ Output ONLY the JSON action:`;
         transcript: _sdTranscript,
         routingDecision: 'state_diff_loop',
         sessionId,
+        done: true,
+        goalVerified: true,
       };
     }
 
@@ -11688,7 +12136,7 @@ function _isGoalCompletedBySignals({ goal, verificationGoal, pageText, pageUrl, 
   return { completed: false, reason: 'no completion signals matched', matchedPhrases: [] };
 }
 
-async function _executeTurnLoopFallback({ goal, verificationGoal, sessionId, headed, timeoutMs, agentContext, transcript, deadline, start, extractedText, heartbeat, textAlreadyEntered, maxTurns = 8, hostname, _discoveryAlreadyAttempted = false, _preDecomposedSubTasks = null, _inheritedActionSignatureCounts = null, _inheritedJitDiscoveryFired = null, _progressCallbackUrl, _stepIndex, _abortSignal = null }) {
+async function _executeTurnLoopFallback({ goal, verificationGoal, sessionId, headed, timeoutMs, agentContext, transcript, deadline, start, extractedText, heartbeat, textAlreadyEntered, maxTurns = 8, hostname, _discoveryAlreadyAttempted = false, _preDecomposedSubTasks = null, _inheritedActionSignatureCounts = null, _inheritedJitDiscoveryFired = null, _progressCallbackUrl, _stepIndex, _abortSignal = null, flowCounter = null }) {
   const MAX_TURNS = maxTurns;
   const _loopTranscript = [...transcript];
 
@@ -11699,6 +12147,9 @@ async function _executeTurnLoopFallback({ goal, verificationGoal, sessionId, hea
     tier: 'turn-loop',
     message: `Turn-loop fallback starting (max ${MAX_TURNS} turns)`,
   });
+
+  // Note: turn_flow:start is emitted once at playwrightAgent entry — the
+  // turn-loop only appends turn_flow:step rows via the shared flowCounter.
 
   let _lastActionSignature = null; // for duplicate detection
   let _lastStateHash = null;       // page state hash for no-op detection
@@ -12367,8 +12818,49 @@ Turn ${turn}/${MAX_TURNS}. What is your next action? (DO NOT snapshot - act dire
           result: _result || `All ${_subTasks.length} sub-tasks completed`,
           transcript: _loopTranscript,
           sessionId,
+          done: true,
+          goalVerified: true,
         };
       }
+      // ── Part B: Unified postcondition verification on LLM 'return' ──
+      // Before accepting the LLM's self-declared "done", check the pre/post
+      // state delta. If the postcondition is verified, accept immediately.
+      // If 'failed' or 'unverified', reject and continue the loop.
+      try {
+        const _retPage = engine.getPage(sessionId);
+        if (_retPage && _preActionState) {
+          const _retPostState = await _captureStateSnapshot(sessionId, _retPage);
+          const _lastActionEl = _loopTranscript.length > 0
+            ? (_loopTranscript[_loopTranscript.length - 1].outcome?.element || null)
+            : null;
+          const _pc = await _verifyPostcondition({
+            goal, verificationGoal, sessionId, headed,
+            page: _retPage,
+            preState: _preActionState,
+            postState: _retPostState,
+            actionElement: _lastActionEl,
+            transcript: _loopTranscript,
+          });
+          if (_pc.status === 'verified') {
+            logger.info(`[playwright.agent] turn-loop: return accepted at turn ${turn} — postcondition VERIFIED: ${_pc.reason}`);
+            return {
+              ok: true,
+              goal, sessionId,
+              turns: _loopTranscript.length, done: true,
+              result: _result || `Goal verified — ${_pc.reason}`,
+              transcript: _loopTranscript,
+              routingDecision: 'turn_loop_postcondition_verified_return',
+              goalVerified: true,
+              executionTime: Date.now() - start,
+            };
+          }
+          // 'unverified' or 'inconclusive' → fall through to existing checks
+          logger.info(`[playwright.agent] turn-loop: return postcondition check: ${_pc.status} — ${_pc.reason} — falling through to existing verification`);
+        }
+      } catch (_pcErr) {
+        logger.warn(`[playwright.agent] turn-loop: return postcondition check error (non-fatal): ${_pcErr.message}`);
+      }
+
       // ── 3-gate structural verification for incomplete sub-tasks ────────
       // If sub-tasks exist but not all are marked completed, re-check incomplete
       // sub-tasks using the 3-gate structural verification (action transcript +
@@ -12413,6 +12905,8 @@ Turn ${turn}/${MAX_TURNS}. What is your next action? (DO NOT snapshot - act dire
               result: _result || `All ${_subTasks.length} sub-tasks completed (structural verification)`,
               transcript: _loopTranscript,
               sessionId,
+              done: true,
+              goalVerified: true,
             };
           }
           // Not all sub-tasks verified — reject the return and continue the loop
@@ -12634,15 +13128,14 @@ Turn ${turn}/${MAX_TURNS}. What is your next action? (DO NOT snapshot - act dire
     // prompt + menuScope injection are sufficient to guide the agent.
     let _outcome;
     // Capture state before action for state-change detection (turn-loop → Tab-Flow re-entry)
+    // AND for postcondition verification (Part B — unified verification gate).
+    // _captureStateSnapshot returns a richer object (url, modalCount, bodyLen,
+    // cartCount, cartSubtotal, formValues, listCounts) than the old inline eval.
     let _preActionState = null;
     try {
       const _prePage = engine.getPage(sessionId);
       if (_prePage) {
-        _preActionState = await _prePage.evaluate(() => ({
-          url: window.location.href,
-          bodyLen: (document.body.innerText || '').length,
-          modalCount: document.querySelectorAll('[role="dialog"], [role="alertdialog"], [aria-modal="true"]').length,
-        })).catch(() => null);
+        _preActionState = await _captureStateSnapshot(sessionId, _prePage);
       }
     } catch (_) {}
     try {
@@ -12668,6 +13161,70 @@ Turn ${turn}/${MAX_TURNS}. What is your next action? (DO NOT snapshot - act dire
     }
 
     _loopTranscript.push({ action: _action, outcome: _outcome, verified: _outcome.verified });
+
+    // ── Part B: Unified postcondition verification after each action ──
+    // Capture post-action state and run _verifyPostcondition. If verified,
+    // emit completion and return immediately — this is the primary completion
+    // gate that replaces the brittle regex + click-evidence check.
+    if (_outcome.ok && _preActionState) {
+      try {
+        const _postPage = engine.getPage(sessionId);
+        if (_postPage) {
+          const _postActionState = await _captureStateSnapshot(sessionId, _postPage);
+          const _actionElement = _outcome.element || null;
+          const _pc = await _verifyPostcondition({
+            goal, verificationGoal, sessionId, headed,
+            page: _postPage,
+            preState: _preActionState,
+            postState: _postActionState,
+            actionElement: _actionElement,
+            transcript: _loopTranscript,
+          });
+          if (_pc.status === 'verified') {
+            logger.info(`[playwright.agent] turn-loop: postcondition VERIFIED at turn ${turn} — ${_pc.reason} — exiting loop early`);
+            // Emit completion progress event for the UI
+            postProgress(_progressCallbackUrl, {
+              type: 'agent:complete',
+              stepIndex: _stepIndex,
+              agentId: 'playwright.agent',
+              task: goal,
+              totalTurns: turn,
+              done: true,
+              ok: true,
+              result: `Goal verified — ${_pc.reason}`,
+              reasoning: _pc.reason,
+            });
+            // Emit Turn-Flow done step for the UI
+            postProgress(_progressCallbackUrl, {
+              type: 'turn_flow:step_done',
+              stepIndex: _stepIndex,
+              flowIndex: flowCounter ? flowCounter.v++ : turn - 1,
+              action: `Done — verified: ${_pc.reason}`,
+              status: 'done',
+            });
+            return {
+              ok: true,
+              goal,
+              sessionId,
+              turns: _loopTranscript.length,
+              done: true,
+              result: `Goal verified — ${_pc.reason}. Page content: ${await _postPage.evaluate(() => (document.body?.innerText || '').slice(0, 500)).catch(() => '')}`,
+              transcript: _loopTranscript,
+              routingDecision: 'turn_loop_postcondition_verified',
+              goalVerified: true,
+              executionTime: Date.now() - start,
+            };
+          }
+          // If unverified, log and continue the loop (the existing fallback
+          // checks at return/pre-exhaustion will also run).
+          if (_pc.status === 'unverified') {
+            logger.info(`[playwright.agent] turn-loop: postcondition UNVERIFIED at turn ${turn} — ${_pc.reason} — continuing loop`);
+          }
+        }
+      } catch (_pcErr) {
+        logger.warn(`[playwright.agent] turn-loop: postcondition check error (non-fatal): ${_pcErr.message}`);
+      }
+    }
 
     // ── Slash-command settle: after pressing Enter to confirm a slash command ──
     // (e.g. "/todo" in Notion), the app unmounts the slash-menu popup and remounts a
@@ -12863,6 +13420,30 @@ Turn ${turn}/${MAX_TURNS}. What is your next action? (DO NOT snapshot - act dire
         outcome: _outcome,
         thoughts: '',
       });
+
+      // ── Part E: Turn-Flow step event for the Automation Flow UI ──
+      // Surface each Turn-Loop action as a turn_flow:step so AutomationProgress.tsx
+      // can render a per-turn sub-step in the Automation Flow panel.
+      {
+        const _actionDesc = _action.action === 'clickByText' ? `click "${_action.text || ''}"`
+          : _action.action === 'clickBySelector' ? `click ${_action.selector || ''}`
+          : _action.action === 'click' ? `click ${_action.selector || ''}`
+          : _action.action === 'fill' || _action.action === 'type' || _action.action === 'reactFill' ? `type "${String(_action.text || _action.value || '').slice(0, 40)}"`
+          : _action.action === 'navigate' ? `navigate to ${_action.url || ''}`
+          : _action.action === 'press' ? `press ${_action.key || ''}`
+          : _action.action === 'return' ? `return (${String(_action.data || '').slice(0, 60)})`
+          : _action.action;
+        const _status = _outcome.ok ? 'done' : 'failed';
+        const _elName = _outcome.element?.name || '';
+        postProgress(_progressCallbackUrl, {
+          type: 'turn_flow:step',
+          stepIndex: _stepIndex,
+          flowIndex: flowCounter ? flowCounter.v++ : turn - 1,
+          action: `Turn ${turn}/${MAX_TURNS}: ${_actionDesc}${_elName ? ` → ${_elName}` : ''}`,
+          status: _status,
+          outcome: _outcome.ok ? 'ok' : (_outcome.error || 'failed'),
+        });
+      }
       // Invalidate snapshot cache after DOM-mutating actions
       const _domMutating = ['reactFill', 'clickByText', 'clickBySelector', 'click', 'fill', 'type', 'navigate', 'press'].includes(_action.action);
       if (_domMutating) {
@@ -12947,11 +13528,47 @@ Turn ${turn}/${MAX_TURNS}. What is your next action? (DO NOT snapshot - act dire
                       result: _stText.slice(0, 2000) || `All ${_subTasks.length} sub-tasks completed`,
                       transcript: _loopTranscript,
                       sessionId,
+                      done: true,
+                      goalVerified: true,
                     };
                   }
                 }
 
-                // (b) Signal-based goal completion (cart/basket/phrase heuristics).
+                // (b) Unified postcondition verification (Part B).
+                //     Primary gate — checks pre/post state delta per mutation type.
+                //     Uses _preActionState (captured before the action) and the
+                //     current page state. Falls through to (c) signals if inconclusive.
+                try {
+                  const _postSnap = await _captureStateSnapshot(sessionId, _postPage);
+                  const _lastActionEl = _loopTranscript.length > 0
+                    ? (_loopTranscript[_loopTranscript.length - 1].outcome?.element || null)
+                    : null;
+                  const _pc = await _verifyPostcondition({
+                    goal, verificationGoal, sessionId, headed,
+                    page: _postPage,
+                    preState: _preActionState,
+                    postState: _postSnap,
+                    actionElement: _lastActionEl,
+                    transcript: _loopTranscript,
+                  });
+                  if (_pc.status === 'verified') {
+                    logger.info(`[playwright.agent] turn-loop: postcondition VERIFIED at turn ${turn} (pre-handoff) — ${_pc.reason} — exiting loop early`);
+                    return {
+                      ok: true,
+                      goal, sessionId,
+                      turns: _loopTranscript.length, done: true,
+                      result: `Goal verified — ${_pc.reason}. Page content: ${_stText.slice(0, 500)}`,
+                      transcript: _loopTranscript,
+                      routingDecision: 'turn_loop_postcondition_verified_state_change',
+                      goalVerified: true,
+                      executionTime: Date.now() - start,
+                    };
+                  }
+                } catch (_pcErr) {
+                  logger.warn(`[playwright.agent] turn-loop: pre-handoff postcondition check error (non-fatal): ${_pcErr.message}`);
+                }
+
+                // (c) Signal-based goal completion (cart/basket/phrase heuristics).
                 //     Catches goals without sub-task decomposition (e.g. when the
                 //     LLM didn't decompose, or when decomposition didn't capture
                 //     the cart-confirmation semantics).
@@ -12969,6 +13586,7 @@ Turn ${turn}/${MAX_TURNS}. What is your next action? (DO NOT snapshot - act dire
                     result: `Goal completed — ${_signals.reason}. Page content: ${_stText.slice(0, 500)}`,
                     transcript: _loopTranscript,
                     routingDecision: 'turn_loop_signals_complete_state_change',
+                    goalVerified: true,
                     executionTime: Date.now() - start,
                   };
                 }
@@ -13017,6 +13635,8 @@ Turn ${turn}/${MAX_TURNS}. What is your next action? (DO NOT snapshot - act dire
                 result: _stText.slice(0, 2000) || `All ${_subTasks.length} sub-tasks completed`,
                 transcript: _loopTranscript,
                 sessionId,
+                done: true,
+                goalVerified: true,
               };
             }
           }
@@ -13080,6 +13700,8 @@ Turn ${turn}/${MAX_TURNS}. What is your next action? (DO NOT snapshot - act dire
         routingDecision: 'turn_loop_subtask_complete_pre_exhaustion',
         result: _stPageText || `All ${_subTasks.length} sub-tasks completed`,
         transcript: _loopTranscript,
+        done: true,
+        goalVerified: true,
       };
     }
     // Not all sub-tasks verified — log what's missing and fall through to
@@ -13090,6 +13712,44 @@ Turn ${turn}/${MAX_TURNS}. What is your next action? (DO NOT snapshot - act dire
   try {
     const _ePage = engine.getPage(sessionId);
     if (_ePage) {
+      // ── Part B: Unified postcondition verification (pre-exhaustion) ──
+      // Primary gate — check pre/post state delta before falling through to
+      // the existing location-aware / signals checks. We don't have a fresh
+      // pre-state here (the last action's pre-state is stale), so we pass the
+      // current state as both pre and post — _verifyPostcondition will use the
+      // action element identity and current page state to verify.
+      try {
+        const _exhState = await _captureStateSnapshot(sessionId, _ePage);
+        const _lastActionEl = _loopTranscript.length > 0
+          ? (_loopTranscript[_loopTranscript.length - 1].outcome?.element || null)
+          : null;
+        const _pc = await _verifyPostcondition({
+          goal, verificationGoal, sessionId, headed,
+          page: _ePage,
+          preState: _exhState, // no fresh pre-state at exhaustion; use current
+          postState: _exhState,
+          actionElement: _lastActionEl,
+          transcript: _loopTranscript,
+        });
+        if (_pc.status === 'verified') {
+          logger.info(`[playwright.agent] turn-loop: pre-exhaustion postcondition VERIFIED — ${_pc.reason} — exiting successfully`);
+          let _exhPageText = '';
+          try { _exhPageText = await _ePage.evaluate(() => document.body.innerText.slice(0, 5000)).catch(() => ''); } catch (_) {}
+          return {
+            ok: true,
+            goal, sessionId,
+            turns: _loopTranscript.length, done: true,
+            result: _exhPageText || `Goal verified — ${_pc.reason}`,
+            transcript: _loopTranscript,
+            routingDecision: 'turn_loop_postcondition_verified_pre_exhaustion',
+            goalVerified: true,
+            executionTime: Date.now() - start,
+          };
+        }
+      } catch (_pcErr) {
+        logger.warn(`[playwright.agent] turn-loop: pre-exhaustion postcondition check error (non-fatal): ${_pcErr.message}`);
+      }
+
       // ── Tier 1: Location-aware verification (same as return-check) ──
       // This catches false positives where the goal phrase appears in the wrong
       // location (e.g. "Weekly Goals" typed into the body instead of the title).
@@ -13168,6 +13828,7 @@ Turn ${turn}/${MAX_TURNS}. What is your next action? (DO NOT snapshot - act dire
             result: `Goal appears satisfied — ${_signals.reason}. Page content: ${_finalPageText.slice(0, 500)}`,
             transcript: _loopTranscript,
             routingDecision: 'turn_loop_pre_exhaustion_pass',
+            goalVerified: true,
             executionTime: Date.now() - start,
           };
         }
@@ -13179,6 +13840,17 @@ Turn ${turn}/${MAX_TURNS}. What is your next action? (DO NOT snapshot - act dire
   }
 
   logger.warn(`[playwright.agent] turn-loop: exhausted (${MAX_TURNS} turns) without completing the goal`);
+
+  // ── Turn-Flow done event for the Automation Flow UI (exhaustion) ──
+  // Emit a turn_flow:step_done with status 'failed' so the Automation Flow
+  // panel shows a clear "Exhausted" row when the Turn-Loop runs out of turns.
+  postProgress(_progressCallbackUrl, {
+    type: 'turn_flow:step_done',
+    stepIndex: _stepIndex,
+    flowIndex: flowCounter ? flowCounter.v++ : MAX_TURNS,
+    action: `Exhausted — ${MAX_TURNS} turns without completion`,
+    status: 'failed',
+  });
 
   // ── Discovery-on-exhaust: one-shot task-level research + retry ────────────
   // When the turn-loop exhausts on a complex UI site, search the web for how-to
@@ -13220,6 +13892,7 @@ Turn ${turn}/${MAX_TURNS}. What is your next action? (DO NOT snapshot - act dire
         _inheritedActionSignatureCounts: _actionSignatureCounts,
         _inheritedJitDiscoveryFired: _jitDiscoveryFiredForSubTask,
         _abortSignal,
+        _progressCallbackUrl, _stepIndex, flowCounter,
       }).catch((e) => { logger.warn(`[playwright.agent] turn-loop: discovery retry error (non-fatal): ${e.message}`); return null; });
 
       if (_retryResult?.ok) {
@@ -13494,6 +14167,32 @@ async function playwrightAgent(args) {
   }
 
   logger.info(`[playwright.agent] start goal="${goal}" session=${sessionId} maxRepairs=${maxRepairs}`);
+
+  // ── Turn-Flow visibility ──
+  // Emit turn_flow:start at the top level so the Automation Flow panel appears
+  // for ALL playwright.agent work (Plan-Execute AND Turn-Loop), not just the
+  // turn-loop fallback. flowCounter gives every emitted row a unique index
+  // across phases so PE steps and TL turns never overwrite each other.
+  const _flowCounter = { v: 0 };
+  postProgress(_progressCallbackUrl, {
+    type: 'turn_flow:start',
+    stepIndex: _stepIndex,
+    flowType: 'playwright_agent',
+    goal,
+    maxTurns,
+  });
+  // Terminal Automation Flow row — a clearly visible done/failed step.
+  // Called before each playwrightAgent return so the panel always ends with
+  // a completion marker, regardless of which phase produced the result.
+  const _emitFlowEnd = (ok, msg) => {
+    postProgress(_progressCallbackUrl, {
+      type: 'turn_flow:step_done',
+      stepIndex: _stepIndex,
+      flowIndex: _flowCounter.v++,
+      action: msg || (ok ? 'Done — verified' : 'Failed'),
+      status: ok ? 'done' : 'failed',
+    });
+  };
 
   // Start page heartbeat — continuous page state capture for LLM context
   const _heartbeat = new _PageHeartbeat(sessionId, 1000, 30);
@@ -15115,7 +15814,10 @@ Output ONLY valid JSON: {${_matchedSkill.params.map(p => `"${p.name}": "<extract
   // so both the turn-loop and Plan-Execute can access them. Reset per run.
   _failedApproaches = [];
 
-  // Capture initial state
+  // Capture initial state — both the coarse {url,bodyLen,modalCount} for the
+  // state-change re-plan check and the rich _captureStateSnapshot used as the
+  // pre-mutation baseline for _verifyPostcondition.
+  let _peBaseline = null;
   try {
     const _pePage0 = engine.getPage(sessionId);
     if (_pePage0) {
@@ -15124,12 +15826,49 @@ Output ONLY valid JSON: {${_matchedSkill.params.map(p => `"${p.name}": "<extract
         bodyLen: (document.body.innerText || '').length,
         modalCount: document.querySelectorAll('[role="dialog"], [role="alertdialog"], [aria-modal="true"]').length,
       })).catch(() => _lastPeState);
+      _peBaseline = await _captureStateSnapshot(sessionId, _pePage0).catch(() => null);
     }
   } catch (_) {}
 
   while (_peAttempt < MAX_PE_ATTEMPTS) {
     _peAttempt++;
     logger.info(`[playwright.agent] phase 2: Plan-Execute attempt ${_peAttempt}/${MAX_PE_ATTEMPTS}`);
+
+    // Pre-attempt postcondition guard — if a prior attempt already achieved the
+    // goal (e.g. cart subtotal increased) but its text/LLM verification
+    // misjudged, don't re-run the plan and risk duplicate mutations.
+    if (_peAttempt > 1 && _peBaseline) {
+      try {
+        const _pePageNow = engine.getPage(sessionId);
+        const _peNowState = _pePageNow ? await _captureStateSnapshot(sessionId, _pePageNow).catch(() => null) : null;
+        if (_peNowState) {
+          const _lastOkT = [ ...(_peLoopResult?.transcript || []) ].reverse().find(t => t.outcome?.ok && ['click','press','fill','type','reactFill','tier1.6_pick','keyboard_nav'].includes(t.action?.action));
+          const _pc = await _verifyPostcondition({
+            goal: _finalGoal, verificationGoal: effectiveGoal, sessionId, headed,
+            page: _pePageNow, preState: _peBaseline, postState: _peNowState,
+            actionElement: _lastOkT?.outcome?.element || null,
+            transcript: _peLoopResult?.transcript || [],
+          });
+          if (_pc.status === 'verified') {
+            logger.info(`[playwright.agent] phase 2: postcondition VERIFIED before attempt ${_peAttempt} — ${_pc.reason}. Short-circuiting to success.`);
+            _heartbeat.stop();
+            _emitFlowEnd(true, `Done — verified (${_pc.reason})`);
+            return {
+              ok: true,
+              result: (_peLoopResult?.result) || `Completed: ${_finalGoal}`,
+              transcript: _peLoopResult?.transcript || [],
+              routingDecision: 'focused_plan_execute_postcondition',
+              goalVerified: true,
+              postconditionVerified: true,
+              postconditionEvidence: _pc.evidence,
+              executionTime: Date.now() - start,
+            };
+          }
+        }
+      } catch (_prePcErr) {
+        logger.warn(`[playwright.agent] phase 2: pre-attempt postcondition check error (non-fatal): ${_prePcErr.message}`);
+      }
+    }
 
     let _peResult = null;
     try {
@@ -15150,11 +15889,16 @@ Output ONLY valid JSON: {${_matchedSkill.params.map(p => `"${p.name}": "<extract
         failedApproachesBlock: _formatFailedApproachesBlock(),
         recordFailedApproach: _recordFailedApproach,
         stepType,
+        peBaseline: _peBaseline,
+        _progressCallbackUrl,
+        _stepIndex,
+        flowCounter: _flowCounter,
       });
 
       if (_peResult && _peResult.ok) {
         _peResult.executionTime = Date.now() - start;
         _heartbeat.stop();
+        _emitFlowEnd(true, _peResult.postconditionVerified ? `Done — verified (${_peResult.postconditionEvidence ? 'state delta' : 'postcondition'})` : 'Done — verified');
         return _peResult;
       }
       _peLoopResult = _peResult;
@@ -15280,6 +16024,7 @@ Output ONLY valid JSON: {${_matchedSkill.params.map(p => `"${p.name}": "<extract
       if (_sdResult.ok) {
         _sdResult.executionTime = Date.now() - start;
         _heartbeat.stop();
+        _emitFlowEnd(true, 'Done — verified (state-diff loop)');
         return _sdResult;
       }
       logger.warn(`[playwright.agent] state-diff loop failed: ${_sdResult.error || 'unknown'} — falling back to turn-loop`);
@@ -15319,10 +16064,12 @@ Output ONLY valid JSON: {${_matchedSkill.params.map(p => `"${p.name}": "<extract
       _progressCallbackUrl,
       _stepIndex,
       _abortSignal,
+      flowCounter: _flowCounter,
     });
     if (_turnLoopResult.ok) {
       _turnLoopResult.executionTime = Date.now() - start;
       _heartbeat.stop();
+      _emitFlowEnd(true, _turnLoopResult.postconditionVerified ? 'Done — verified (postcondition)' : 'Done — verified');
       return _turnLoopResult;
     }
     // If the user cancelled, return a clean cancelled result instead of
@@ -15330,6 +16077,7 @@ Output ONLY valid JSON: {${_matchedSkill.params.map(p => `"${p.name}": "<extract
     if (_aborted()) {
       logger.info(`[playwright.agent] cancelled by user after turn-loop — returning cancelled result`);
       _heartbeat.stop();
+      _emitFlowEnd(false, 'Cancelled by user');
       try { await browserAct({ action: 'close', sessionId }); } catch (_) {}
       return { ok: false, goal, sessionId, error: 'Cancelled by user', cancelled: true, turns: transcript.length, transcript, executionTime: Date.now() - start };
     }
@@ -15397,6 +16145,7 @@ Output ONLY valid JSON: {${_matchedSkill.params.map(p => `"${p.name}": "<extract
           }],
           routingDecision: 'script_gen',
           pageType: _pageType,
+          goalVerified: _scriptResult.verified === true,
           executionTime: Date.now() - start,
         };
       }
@@ -15557,7 +16306,7 @@ Output a JSON plan: { "plan": [ { "action": "type", "selector": "eXX", "text": "
 
   if (plan.length === 0) {
     // Goal already satisfied (LLM said "already on the page / no action needed")
-    return { ok: true, goal, sessionId, turns: 0, done: true, result: planParsed.thoughts || 'Goal already satisfied', transcript: [], executionTime: Date.now() - start };
+    return { ok: true, goal, sessionId, turns: 0, done: true, goalVerified: true, result: planParsed.thoughts || 'Goal already satisfied', transcript: [], executionTime: Date.now() - start };
   }
 
   // ── Post-plan attachment guard ────────────────────────────────────────────
@@ -16588,9 +17337,11 @@ Output a JSON plan: { "plan": [ { "action": "type", "selector": "eXX", "text": "
             hostname,
             _preDecomposedSubTasks,
             _abortSignal,
+            _progressCallbackUrl, _stepIndex, flowCounter: _flowCounter,
           });
           if (_turnLoopResult.ok) {
             logger.info(`[playwright.agent] turn-loop fallback succeeded — returning`);
+            _emitFlowEnd(true, 'Done — verified');
             return _turnLoopResult;
           }
           if (_turnLoopResult.resumeTabFlow) {
@@ -16880,9 +17631,11 @@ Output a JSON plan: { "plan": [ { "action": "type", "selector": "eXX", "text": "
             hostname,
             _preDecomposedSubTasks,
             _abortSignal,
+            _progressCallbackUrl, _stepIndex, flowCounter: _flowCounter,
           });
           if (_turnLoopResult.ok) {
             logger.info(`[playwright.agent] turn-loop fallback succeeded after unparseable repair — returning`);
+            _emitFlowEnd(true, 'Done — verified');
             return _turnLoopResult;
           }
           if (_turnLoopResult.resumeTabFlow) {
@@ -17505,9 +18258,11 @@ Return JSON: { "thoughts": "strategy explanation", "plan": [...steps] }`;
           hostname,
           _preDecomposedSubTasks,
           _abortSignal,
+          _progressCallbackUrl, _stepIndex, flowCounter: _flowCounter,
         });
         if (_turnLoopResult.ok) {
           logger.info(`[playwright.agent] turn-loop fallback succeeded after overall timeout — returning`);
+          _emitFlowEnd(true, 'Done — verified');
           return _turnLoopResult;
         }
         if (_turnLoopResult.resumeTabFlow) {
@@ -17527,6 +18282,7 @@ Return JSON: { "thoughts": "strategy explanation", "plan": [...steps] }`;
         logger.warn(`[playwright.agent] turn-loop fallback threw after timeout: ${_turnLoopErr.message} — surfacing ask_user`);
       }
       _heartbeat.stop();
+      _emitFlowEnd(false, `Timed out after ${overallTimeoutMs}ms`);
       return { ..._failureAskUser(`Task timed out after ${overallTimeoutMs}ms`), transcript };
     }
     throw _deadlineErr;
@@ -17544,6 +18300,10 @@ Return JSON: { "thoughts": "strategy explanation", "plan": [...steps] }`;
     ok: true,
     result: finalResult !== null ? String(finalResult) : `Completed: ${goal}`,
   });
+  // ── Turn-Flow done event for the Automation Flow UI ──
+  // Uses _emitFlowEnd so the flowIndex stays in the shared counter space and
+  // the panel ends with a clear "Done" row.
+  _emitFlowEnd(true, `Done — completed in ${transcript.length} step(s)`);
   // Phase 8: Verification layer for Tier 3
   let _tier3Verification = null;
   try {
@@ -17604,6 +18364,7 @@ Return JSON: { "thoughts": "strategy explanation", "plan": [...steps] }`;
     routingDecision: _routingDecision,
     pageType: _pageType,
     verification: _tier3Verification,
+    goalVerified: !_tier3Verification?.fail,
     executionTime: Date.now() - start,
     saveSkillOffer: _saveSkillOffer,
     extractionProvenance: finalResult !== null ? {

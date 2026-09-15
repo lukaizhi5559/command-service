@@ -73,8 +73,8 @@ async function main() {
   // The in-page script uses resolveImg which rejects data: URLs via the
   // startsData() helper and prefers real URLs from data-a-dynamic-image.
   assert(script.includes('startsData'), 'has startsData() helper for data: rejection');
-  assert(script.includes("if (u && startsData(u)) u = '';"), 'rejects data: URLs after resolution');
-  assert(script.includes('!startsData(k)'), 'skips data: keys in aDynamicImage map');
+  assert(script.includes('cleanUrl') && script.includes('startsData(u)'), 'rejects data: URLs after resolution');
+  assert(script.includes('cleanUrl(k)'), 'skips data: keys in aDynamicImage map');
 
   console.log(`\n${'='.repeat(60)}`);
   console.log(`Results: ${_pass} passed, ${_fail} failed`);
