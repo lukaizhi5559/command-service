@@ -1300,11 +1300,21 @@ async function getSearchUrlPattern(serviceKey) {
  * The urlTemplate should contain a {query} placeholder where the task's search
  * criteria will be substituted (e.g., "https://example.com/search?q={query}").
  */
-async function recordSearchUrlPattern(serviceKey, urlTemplate, inputName, source) {
+async function recordSearchUrlPattern(serviceKey, urlTemplate, inputName, source, baseHost) {
   if (!skillDb || !serviceKey || !urlTemplate) return false;
   if (!urlTemplate.includes('{query}')) {
     logger.warn(`[destination-resolver] recordSearchUrlPattern: urlTemplate missing {query} placeholder: ${urlTemplate}`);
     return false;
+  }
+  // Guard: reject invalid patterns for hash-routing SPAs (e.g., Gmail #inbox?q={query}).
+  // The form-extraction pipeline assumes REST-style ?q= params, which is wrong for
+  // hash-routing sites. This prevents cache pollution at the source.
+  if (baseHost) {
+    const _validation = _isValidSearchPattern(urlTemplate, baseHost);
+    if (!_validation.valid) {
+      logger.warn(`[destination-resolver] recordSearchUrlPattern: rejecting invalid pattern for ${serviceKey}: ${urlTemplate} — ${_validation.reason}`);
+      return false;
+    }
   }
   try {
     let entry = await skillDb.get(SEARCH_PATTERN_NS, serviceKey);
@@ -1329,6 +1339,63 @@ async function recordSearchUrlPattern(serviceKey, urlTemplate, inputName, source
   }
 }
 
+/**
+ * Delete all cached search URL patterns for a service.
+ * Used to purge stale/polluted cache entries (e.g., when a form-extraction
+ * recorded a `?q=` pattern for a hash-routing SPA like Gmail that uses `#search/`).
+ */
+async function deleteSearchUrlPattern(serviceKey) {
+  if (!skillDb || !serviceKey) return false;
+  try {
+    return await skillDb.del(SEARCH_PATTERN_NS, serviceKey);
+  } catch (err) {
+    logger.warn(`[destination-resolver] deleteSearchUrlPattern error: ${err.message}`);
+    return false;
+  }
+}
+
+/**
+ * Hash-routing SPA sites that use `#/path` routing instead of `?query=` params.
+ * For these sites, a search pattern with `?q={query}` in the hash is invalid
+ * (e.g., Gmail's `#inbox?q={query}` — Gmail uses `#search/{query}`).
+ * The form-extraction discovery pipeline can record such invalid patterns
+ * because it assumes REST-style query params; this guard rejects them.
+ */
+const _HASH_ROUTING_HOSTS = new Set([
+  'mail.google.com',
+  'outlook.live.com',
+  'outlook.office.com',
+]);
+
+/**
+ * Validate a search URL pattern for a given service.
+ * Returns { valid: boolean, reason?: string }.
+ * Rejects patterns where `{query}` appears as a query param (`?...={query}`)
+ * inside the hash fragment for known hash-routing sites.
+ */
+function _isValidSearchPattern(urlTemplate, baseHost) {
+  if (!urlTemplate || !urlTemplate.includes('{query}')) {
+    return { valid: false, reason: 'missing {query} placeholder' };
+  }
+  // Check for hash-routing sites: if the host is a known hash-routing SPA,
+  // reject patterns where {query} is a query param inside the hash fragment.
+  // Example invalid: https://mail.google.com/mail/u/0/#inbox?q={query}
+  // Example valid:   https://mail.google.com/mail/u/0/#search/{query}
+  try {
+    const _host = String(baseHost || '').toLowerCase().replace(/^www\./, '');
+    if (_HASH_ROUTING_HOSTS.has(_host)) {
+      const _hashIdx = urlTemplate.indexOf('#');
+      if (_hashIdx >= 0) {
+        const _hashPart = urlTemplate.slice(_hashIdx);
+        if (_hashPart.includes('?') && _hashPart.includes('{query}')) {
+          return { valid: false, reason: `hash-routing site ${_host} uses #/path not ?q= in hash` };
+        }
+      }
+    }
+  } catch (_) {}
+  return { valid: true };
+}
+
 module.exports = {
   classifyTaskIntent,
   classifyUrlType,
@@ -1344,6 +1411,8 @@ module.exports = {
   deleteDeepLinkCache,
   getSearchUrlPattern,
   recordSearchUrlPattern,
+  deleteSearchUrlPattern,
+  _isValidSearchPattern,
   INTENTS,
   SERVICE_CHAT_URLS,
   isAuthFlowUrl,

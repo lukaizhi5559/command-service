@@ -45,8 +45,14 @@ const WEB_SEARCH_API_KEY = process.env.MCP_WEB_SEARCH_API_KEY;
 /**
  * Search the web using configured MCP web_search service.
  * Mirrors the agentWebSearch pattern in browser.agent.cjs for correct envelope format.
+ *
+ * @param {string} query
+ * @param {number} maxResults
+ * @param {object} options
+ *   - timeoutMs: per-attempt timeout in ms (default 8000)
+ *   - retries: if true, retry once on timeout (default false)
  */
-async function searchWeb(query, maxResults = 5) {
+async function searchWeb(query, maxResults = 5, options = {}) {
   if (!WEB_SEARCH_API_URL) {
     logger.warn('[web.agent] Web search not configured - MCP_WEB_SEARCH_URL missing');
     return { ok: false, skipped: true, error: 'Web search not configured' };
@@ -62,6 +68,23 @@ async function searchWeb(query, maxResults = 5) {
     return { ok: false, skipped: true, error: 'Web search URL is invalid' };
   }
 
+  const timeoutMs = options.timeoutMs || 8000;
+  const maxAttempts = options.retries ? 2 : 1;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const result = await _searchWebOnce(query, maxResults, timeoutMs, wsHostname, wsPort);
+    if (result.ok || attempt === maxAttempts) return result;
+    // Only retry on timeout, not on parse errors or request errors
+    if (result.error !== 'web search timed out') return result;
+    logger.warn(`[web.agent] searchWeb timed out — retrying (attempt ${attempt + 1}/${maxAttempts}) for "${query.slice(0, 60)}"`);
+  }
+}
+
+/**
+ * Single attempt of searchWeb — extracted so searchWeb can wrap it with retry logic.
+ * Returns { ok, results } or { ok: false, error }.
+ */
+function _searchWebOnce(query, maxResults, timeoutMs, wsHostname, wsPort) {
   return new Promise((resolve) => {
     const body = JSON.stringify({
       version: 'mcp.v1',
@@ -105,9 +128,9 @@ async function searchWeb(query, maxResults = 5) {
       logger.error(`[web.agent] searchWeb request error: ${e.message}`);
       resolve({ ok: false, error: e.message });
     });
-    req.setTimeout(8000, () => {
+    req.setTimeout(timeoutMs, () => {
       req.destroy();
-      logger.warn(`[web.agent] searchWeb timed out for "${query.slice(0, 60)}"`);
+      logger.warn(`[web.agent] searchWeb timed out (${timeoutMs}ms) for "${query.slice(0, 60)}"`);
       resolve({ ok: false, error: 'web search timed out' });
     });
     req.write(body);
@@ -1396,7 +1419,9 @@ async function actionFindDownload({ query, fileExt, preferDomain, maxResults = 5
   const searchQuery = ext ? `${query} filetype:${ext}` : query;
   logger.info(`[web.agent] find_download: "${searchQuery.slice(0, 80)}" ext=${ext || 'any'} preferDomain=${preferDomain || 'none'}`);
 
-  const searchResult = await searchWeb(searchQuery, maxResults);
+  // Use a longer timeout + retry for find_download: image searches trigger the
+  // web-search service to download images to cache, which can take >8s.
+  const searchResult = await searchWeb(searchQuery, maxResults, { timeoutMs: 25000, retries: true });
   if (!searchResult.ok) return searchResult;
 
   const results = (searchResult.results || [])

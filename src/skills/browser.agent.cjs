@@ -1999,12 +1999,22 @@ async function _verifyUrlFirstArrival(sessionId, expectedUrl) {
     const _bodyLen = _data.bodyLen || 0;
     const _interactive = _data.interactive || 0;
 
-    // URL-arrival check: hostname + pathname match (ignores tracking params)
+    // URL-arrival check: hostname + pathname match (ignores tracking params).
+    // Hash-aware: when the expected URL has a hash (e.g., Gmail's #search/query
+    // or #inbox), the current URL's hash must also match. SPA apps like Gmail
+    // encode application state in the hash — #inbox?q=... vs #inbox are different
+    // states. Without this check, Gmail can strip an invalid ?q= from the hash
+    // and land on #inbox, which would falsely match the expected #inbox?q=...
+    // Uses startsWith so SPA routes that append state (e.g., #search/foo?compose=1)
+    // still match the expected prefix (#search/foo).
     let _urlMatches = false;
     try {
       const _cur = new URL(_curUrl);
       const _exp = new URL(expectedUrl);
       _urlMatches = _cur.hostname === _exp.hostname && _cur.pathname === _exp.pathname;
+      if (_urlMatches && _exp.hash && _exp.hash.length > 1) {
+        _urlMatches = _cur.hash === _exp.hash || _cur.hash.startsWith(_exp.hash);
+      }
     } catch (_) { _urlMatches = _curUrl.replace(/\/+$/, '') === String(expectedUrl || '').replace(/\/+$/, ''); }
 
     // Error/404 heuristic: very short body + few interactive elements
@@ -6948,13 +6958,16 @@ async function _buildSearchCriteriaUrl(intent, serviceKey, baseStartUrl, baseHos
   if (!_sq.hasCriteria) return null;
 
   // ── MAIL ──
-  if (intent === INTENTS.MAIL) {
-    if (svc === 'gmail' || baseHost === 'mail.google.com') {
-      return `https://mail.google.com/mail/u/0/#search/${encodeURIComponent(_sq.query)}`;
-    }
-    if (svc === 'outlook' || baseHost === 'outlook.live.com' || baseHost === 'outlook.office.com') {
-      return `https://outlook.live.com/mail/0/deeplink/search?q=${encodeURIComponent(_sq.query)}`;
-    }
+  // Gate: _isSearchCriteriaTask(task) at line 6945 is the real gate.
+  // The old `intent === INTENTS.MAIL` gate was removed because "find emails
+  // from X" classifies as `search`/`open_existing`, not `mail` (which is
+  // send/compose/reply/forward). The intent gate prevented the template
+  // from firing for the exact read/search tasks it should serve.
+  if (svc === 'gmail' || baseHost === 'mail.google.com') {
+    return `https://mail.google.com/mail/u/0/#search/${encodeURIComponent(_sq.query)}`;
+  }
+  if (svc === 'outlook' || baseHost === 'outlook.live.com' || baseHost === 'outlook.office.com') {
+    return `https://outlook.live.com/mail/0/deeplink/search?q=${encodeURIComponent(_sq.query)}`;
   }
   // Future: add search-criteria URL templates for other services here.
   return null;
@@ -6970,10 +6983,24 @@ async function _buildSearchCriteriaUrl(intent, serviceKey, baseStartUrl, baseHos
  * Returns the search URL string, or null if no pattern is cached or the task has
  * no extractable criteria.
  */
-async function _buildSearchUrlFromPattern(serviceKey, task) {
+async function _buildSearchUrlFromPattern(serviceKey, task, baseHost) {
   if (!_isSearchCriteriaTask(task)) return null;
   const pattern = await getSearchUrlPattern(serviceKey);
   if (!pattern?.urlTemplate) return null;
+  // Guard: reject and purge invalid patterns for hash-routing SPAs.
+  // The form-extraction pipeline can record `?q={query}` in the hash for
+  // sites like Gmail that use `#search/{query}`. This catches and purges
+  // such stale patterns so the correct template (Step 0) or the iterative
+  // navigation fallback (Tab-Flow in-app search) takes over.
+  if (baseHost) {
+    const { _isValidSearchPattern, deleteSearchUrlPattern } = require('../skill-helpers/destination-resolver.cjs');
+    const _validation = _isValidSearchPattern(pattern.urlTemplate, baseHost);
+    if (!_validation.valid) {
+      logger.warn(`[browser.agent] search-pattern cache hit for ${serviceKey} but pattern is invalid: ${pattern.urlTemplate} — ${_validation.reason} — purging cache and skipping`);
+      setImmediate(() => { deleteSearchUrlPattern(serviceKey).catch(() => {}); });
+      return null;
+    }
+  }
   const svc = String(serviceKey || '').toLowerCase().replace(/[^a-z0-9]/g, '');
   const _sq = await _extractSearchQuery(task, svc);
   if (!_sq.hasCriteria) return null;
@@ -7129,7 +7156,7 @@ async function _resolveTaskDeepLink(agentId, serviceKey, baseStartUrl, task, exi
     // extraction or web.agent). This lets any site reuse a discovered search form pattern
     // without re-running the full discovery pipeline.
     if (_isCriteriaTask) {
-      const _patternUrl = await _buildSearchUrlFromPattern(serviceKey, task);
+      const _patternUrl = await _buildSearchUrlFromPattern(serviceKey, task, baseHost);
       if (_patternUrl) {
         logger.info(`[browser.agent] deep-link: search-pattern cache hit for ${agentId}: ${_patternUrl}`);
         return { url: _patternUrl, source: 'search-pattern' };
@@ -7451,7 +7478,7 @@ async function _resolveTaskDeepLink(agentId, serviceKey, baseStartUrl, task, exi
                       // the full discovery pipeline next time.
                       const _patternTemplate = `${_sf.action}${_sf.action.includes('?') ? '&' : '?'}${_searchInput.name}={query}`;
                       setImmediate(() => {
-                        recordSearchUrlPattern(serviceKey, _patternTemplate, _searchInput.name, 'form-extraction').catch(() => {});
+                        recordSearchUrlPattern(serviceKey, _patternTemplate, _searchInput.name, 'form-extraction', baseHost).catch(() => {});
                       });
                     }
                   } catch (_) {}
@@ -7656,14 +7683,14 @@ async function _resolveTaskDeepLink(agentId, serviceKey, baseStartUrl, task, exi
           _patternUrl.searchParams.set(_searchParamName, '{query}');
           const _patternTemplate = _patternUrl.toString();
           setImmediate(() => {
-            recordSearchUrlPattern(serviceKey, _patternTemplate, _searchParamName, candidateSource).catch(() => {});
+            recordSearchUrlPattern(serviceKey, _patternTemplate, _searchParamName, candidateSource, baseHost).catch(() => {});
           });
           logger.info(`[browser.agent] deep-link: recording search URL pattern for ${serviceKey}: ${_patternTemplate} (source=${candidateSource})`);
         } else if (_hashSearchMatch) {
           // Gmail-style #search/{query} — build pattern by replacing the hash content
           const _patternTemplate = `${_cUrl.origin}${_cUrl.pathname}#search/{query}`;
           setImmediate(() => {
-            recordSearchUrlPattern(serviceKey, _patternTemplate, 'hash', candidateSource).catch(() => {});
+            recordSearchUrlPattern(serviceKey, _patternTemplate, 'hash', candidateSource, baseHost).catch(() => {});
           });
           logger.info(`[browser.agent] deep-link: recording hash search URL pattern for ${serviceKey}: ${_patternTemplate} (source=${candidateSource})`);
         }
@@ -11459,16 +11486,47 @@ When extracting page content with run-code, prioritize these selectors over gene
             logger.warn(`[browser.agent] tab-map: URL-first short-circuit deterministic check failed: ${_scVerify.reason} — proceeding to iterative navigation`);
           } else {
             logger.info(`[browser.agent] tab-map: URL-first short-circuit verified via ${_scVerify.reason} (bodyLen=${_scVerify.bodyLen})`);
-            return {
-              ok: true, agentId, task,
-              result: _shortCircuitResult,
-              url: _shortCircuitUrl,
-              sessionId,
-              recipeUsed: false,
-              routingDecision: 'browser_urlfirst_shortcircuit',
-              verified: true,
-              goalVerified: true,
-            };
+            // ── Final-state snapshot classification (defense against bad URLs) ──
+            // URL-arrival is necessary but not sufficient: SPA apps (Gmail, Outlook)
+            // may strip invalid query/hash state and land on a generic page (e.g.,
+            // inbox) even when the URL "matched". Run a forced classification on the
+            // captured page text to confirm the goal is actually achieved before
+            // declaring success. If the classifier says fail (0), fall through to
+            // iterative navigation (Tab-Flow will do in-app search/filter).
+            try {
+              const _scClassify = await _ocrVerifyGoal(_pageText.slice(0, 800), task, [], sessionId);
+              if (_scClassify.num !== 1) {
+                logger.warn(`[browser.agent] tab-map: URL-first short-circuit — url matched but goal classifier returned ${_scClassify.num} (reason="${_scClassify.reason || ''}") — falling through to iterative navigation for in-app search`);
+                // Fall through to iterative navigation (do NOT return)
+              } else {
+                logger.info(`[browser.agent] tab-map: URL-first short-circuit — goal classifier confirmed (num=1)`);
+                return {
+                  ok: true, agentId, task,
+                  result: _shortCircuitResult,
+                  url: _shortCircuitUrl,
+                  sessionId,
+                  recipeUsed: false,
+                  routingDecision: 'browser_urlfirst_shortcircuit',
+                  verified: true,
+                  goalVerified: true,
+                };
+              }
+            } catch (_classifyErr) {
+              // Classifier error (e.g., LLM down) — fall back to old behavior
+              // (trust URL-arrival). _ocrVerifyGoal already returns verified:true
+              // for no-page/ocr-unavailable, so this only catches unexpected errors.
+              logger.warn(`[browser.agent] tab-map: URL-first short-circuit classifier error (non-fatal): ${_classifyErr.message} — trusting URL-arrival`);
+              return {
+                ok: true, agentId, task,
+                result: _shortCircuitResult,
+                url: _shortCircuitUrl,
+                sessionId,
+                recipeUsed: false,
+                routingDecision: 'browser_urlfirst_shortcircuit',
+                verified: true,
+                goalVerified: true,
+              };
+            }
           }
         }
       } catch (_scErr) {

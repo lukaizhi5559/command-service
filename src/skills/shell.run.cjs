@@ -32,7 +32,7 @@
  * }
  */
 
-const { spawn } = require('child_process');
+const { spawn, spawnSync } = require('child_process');
 const path = require('path');
 const os = require('os');
 const fs = require('fs');
@@ -290,31 +290,97 @@ const FILE_OP_REGISTRY = [
  *   { type: 'shell:goal_resolved', cmd, argv }
  *   { type: 'shell:goal_failed', error }
  */
+
+// Validate a generated shell script's syntax with `<interpreter> -n`.
+// Returns null if the script parses cleanly, or the stderr error string if not.
+// `<interpreter> -n` only checks syntax (not semantics) and runs no commands, so
+// it is safe and fast. This catches the class of failures where the LLM emits
+// shell-sensitive characters (e.g. unescaped `(` `)` in `find` expressions) that
+// the shell rejects before the command ever runs.
+//
+// `interpreter` defaults to 'bash'. When the LLM returns cmd: "sh" or "zsh",
+// we use that interpreter's own -n parser so zsh-specific syntax is validated
+// against zsh, not bash. If the requested interpreter binary is unavailable,
+// we fall back to `bash -n` (valid sh is always valid bash; zsh is a near
+// superset of bash for syntax-checking purposes).
+//
+// ZSH DUAL-CHECK: zsh's parser accepts unescaped `(` `)` as valid syntax (it
+// treats them as glob qualifiers / array syntax), so `zsh -n` does NOT catch
+// the unescaped-parens class of errors that `bash -n` catches. Since the system
+// prompt instructs the LLM to "Always use bash -c", a zsh-labeled command that
+// fails `bash -n` almost certainly contains bash-style syntax that zsh parses
+// differently — and would fail confusingly at runtime (e.g. "unknown file
+// attribute"). So for zsh, we run `zsh -n` first (catches zsh-specific syntax
+// errors), then `bash -n` as a secondary check (catches the unescaped-parens
+// class). If `bash -n` fails, we return its error so the LLM can fix the syntax.
+function _bashSyntaxCheck(scriptBody, interpreter = 'bash') {
+  if (typeof scriptBody !== 'string' || !scriptBody.trim()) return null;
+  try {
+    const r = spawnSync(interpreter, ['-n', '-c', scriptBody], { encoding: 'utf8' });
+    if (r.status === 0) {
+      // zsh -n passed; run bash -n as a secondary check for the unescaped-parens
+      // class that zsh's parser accepts but that indicates a bash-style command
+      // mislabeled as zsh (the system prompt says "Always use bash -c").
+      if (interpreter === 'zsh') {
+        try {
+          const r2 = spawnSync('bash', ['-n', '-c', scriptBody], { encoding: 'utf8' });
+          if (r2.status !== 0) {
+            return (r2.stderr || '').trim() || `bash -n (zsh secondary) exited with status ${r2.status}`;
+          }
+        } catch (_) { /* bash unavailable — zsh -n passed, accept */ }
+      }
+      return null;
+    }
+    return (r.stderr || '').trim() || `${interpreter} -n exited with status ${r.status}`;
+  } catch (err) {
+    // If the requested interpreter isn't available, fall back to bash -n.
+    // (bash is a superset of sh; valid sh is always valid bash. zsh is a
+    // near-superset of bash, so bash -n catches most zsh syntax errors too.)
+    if (interpreter !== 'bash') {
+      try {
+        const r2 = spawnSync('bash', ['-n', '-c', scriptBody], { encoding: 'utf8' });
+        if (r2.status === 0) return null;
+        return (r2.stderr || '').trim() || `bash -n (fallback) exited with status ${r2.status}`;
+      } catch (_) { /* fall through to warn below */ }
+    }
+    // If bash -n itself can't run, don't block execution — let the real run surface the error.
+    logger.warn(`[shell.run] ${interpreter} -n check unavailable: ${err.message}`);
+    return null;
+  }
+}
+
 async function _resolveGoalToCommand(goal, onProgress) {
   if (!skillLlm.isAvailable()) {
     return { ok: false, error: 'LLM not available to resolve shell goal — provide cmd/argv directly' };
   }
   const MAX_ATTEMPTS = 3;
   let lastErr = '';
+  let syntaxFeedback = ''; // carried into the next LLM attempt when bash -n rejects a script
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
     if (onProgress) onProgress({ type: 'shell:goal_resolving', attempt, maxAttempts: MAX_ATTEMPTS, goal });
     try {
+      const userContent = syntaxFeedback
+        ? `Goal: ${goal}\n\nYour previous attempt failed a bash syntax check:\n${syntaxFeedback}\nFix the shell syntax (e.g. escape parentheses passed to find as \\( \\), quote arguments, balance constructs) and return a valid command.`
+        : `Goal: ${goal}`;
       const response = await skillLlm.askWithMessages([
         { role: 'system', content: SHELL_RUN_SYSTEM },
-        { role: 'user', content: `Goal: ${goal}` },
+        { role: 'user', content: userContent },
       ], { maxTokens: 300, temperature: 0 });
       const raw = (response || '').trim();
       if (!raw) {
         lastErr = 'LLM returned empty response';
+        syntaxFeedback = '';
         continue;
       }
       const parsed = _parseGoalJson(raw);
       if (!parsed) {
         lastErr = `LLM returned unparseable JSON: ${raw.slice(0, 120)}`;
+        syntaxFeedback = '';
         continue;
       }
       if (!parsed.cmd || !Array.isArray(parsed.argv)) {
         lastErr = `LLM returned invalid command shape: ${raw.slice(0, 120)}`;
+        syntaxFeedback = '';
         continue;
       }
       // Structural guard: find groupings must be balanced.
@@ -326,14 +392,34 @@ async function _resolveGoalToCommand(goal, onProgress) {
         const closeCount = (script.match(/\\\)/g) || []).length;
         if (openCount !== closeCount) {
           lastErr = `LLM generated find command with unbalanced grouping (${openCount} '\\(' vs ${closeCount} '\\)') — retrying`;
+          syntaxFeedback = lastErr;
           logger.warn(`[shell.run] ${lastErr}: ${script.slice(0, 120)}`);
           continue;
         }
       }
+      // Syntax check: <interpreter> -n catches shell-level errors the structural
+      // guard misses — most importantly unescaped `(` `)` that the shell parses as
+      // syntax rather than passing to find. Without this, a temperature-0 retry
+      // regenerates the identical broken command (observed in task_94e38046).
+      // Covers bash, sh, and zsh — uses the actual interpreter's -n parser so
+      // zsh-specific syntax is validated against zsh, not bash.
+      const _SHELL_INTERPRETERS = new Set(['bash', 'sh', 'zsh']);
+      const _baseName = path.basename(parsed.cmd || '');
+      if (_SHELL_INTERPRETERS.has(_baseName) && Array.isArray(parsed.argv) && parsed.argv[0] === '-c' && typeof parsed.argv[1] === 'string') {
+        const syntaxErr = _bashSyntaxCheck(parsed.argv[1], _baseName);
+        if (syntaxErr) {
+          lastErr = `${_baseName} -n syntax check failed: ${syntaxErr}`;
+          syntaxFeedback = syntaxErr;
+          logger.warn(`[shell.run] ${lastErr} (script: ${parsed.argv[1].slice(0, 120)})`);
+          continue;
+        }
+      }
+      syntaxFeedback = '';
       if (onProgress) onProgress({ type: 'shell:goal_resolved', cmd: parsed.cmd, argv: parsed.argv });
       return { ok: true, cmd: parsed.cmd, argv: parsed.argv };
     } catch (err) {
       lastErr = `Goal resolution failed: ${err.message}`;
+      syntaxFeedback = '';
     }
   }
   if (onProgress) onProgress({ type: 'shell:goal_failed', error: lastErr });
@@ -402,6 +488,20 @@ ${sourceResult.stdout.slice(0, 2000)}`;
     if (!parsed || !parsed.cmd || !Array.isArray(parsed.argv)) {
       logger.warn(`[shell.run] Discovery retry: LLM returned unparseable JSON — aborting`);
       return null;
+    }
+
+    // Syntax check the regenerated command before executing — same rationale as
+    // _resolveGoalToCommand: a shell syntax error here would surface as a
+    // confusing retry failure instead of falling back to the original error.
+    // Covers bash, sh, and zsh.
+    const _SHELL_INTERPRETERS_DR = new Set(['bash', 'sh', 'zsh']);
+    const _baseNameDR = path.basename(parsed.cmd || '');
+    if (_SHELL_INTERPRETERS_DR.has(_baseNameDR) && Array.isArray(parsed.argv) && parsed.argv[0] === '-c' && typeof parsed.argv[1] === 'string') {
+      const syntaxErr = _bashSyntaxCheck(parsed.argv[1], _baseNameDR);
+      if (syntaxErr) {
+        logger.warn(`[shell.run] Discovery retry: ${_baseNameDR} -n rejected regenerated command: ${syntaxErr} — aborting`);
+        return null;
+      }
     }
 
     logger.info(`[shell.run] Discovery retry: regenerated command: ${(parsed.argv || []).join(' ').slice(0, 120)}`);
