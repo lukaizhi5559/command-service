@@ -5274,7 +5274,11 @@ function _subPlanStepMatchesFlowStep(subStep, flowStep) {
     (_subAction === 'type'  && /type|fill|enter/i.test(_flowAction)) ||
     (_subAction === 'click' && /click|press|save|submit|send|create|open|select/i.test(_flowAction)) ||
     (_subAction === 'press' && /press|save|submit|send|enter/i.test(_flowAction));
-  if (!_verbMatch) return false;
+  // Verb-less flow fragments (e.g. "'Subject' with 'X'" from a split compound
+  // action) carry no action verb — don't reject on the verb gate; the
+  // value/word-overlap checks below still apply.
+  const _flowHasVerb = /\b(click|press|type|fill|enter|navigate|open|select|choose|scroll|wait|get|close|save|submit|send|check|toggle|drag|hover|search|scan|look)\b/i.test(_flowAction);
+  if (!_verbMatch && _flowHasVerb) return false;
 
   // Value overlap: if the sub-plan step types a value, check it appears in the flow step
   if (_subValue && _subValue.length > 2 && _flowAction.includes(_subValue)) return true;
@@ -5295,6 +5299,26 @@ function _flowComplete(tabFlow, flowIndex) {
     if (tabFlow[i].tier !== 0) _lastActionIdx = i;
   }
   return flowIndex >= _lastActionIdx + 1;
+}
+
+// Build a combined flow-step hint covering the contiguous run of tier-4 steps
+// starting at flowIndex. Multi-field forms (e.g. Gmail compose: To/Subject/Body/
+// Send) are split into per-action flow steps by _splitCompoundAction, but they
+// share ONE page state — the extraction LLM should plan all of them in a single
+// sub-plan so one scan fills everything in one session.
+function _tier4RunHint(tabFlow, flowIndex) {
+  if (!tabFlow || flowIndex >= tabFlow.length) return '';
+  if (tabFlow[flowIndex].tier !== 4) return '';
+  const parts = [];
+  for (let i = flowIndex; i < tabFlow.length; i++) {
+    const s = tabFlow[i];
+    if (s.tier !== 4) break;
+    const a = String(s.action || '')
+      .replace(/^(?:scan|look at|check|inspect|examine)\s+(?:the\s+)?page\s+and\s+/i, '')
+      .trim();
+    if (a) parts.push(a);
+  }
+  return parts.join('; ');
 }
 
 // Reconcile the flow index when a different tier accomplished a step's goal.
@@ -5352,11 +5376,21 @@ function _reconcileFlowIndex(tabFlow, flowIndex, currentUrl, prevUrl, logger, ac
       return flowIndex; // don't advance — the click was on the wrong element
     }
     // Extract key action words from the flow step (e.g., "create", "api key", "copy")
-    const _flowKeywords = _flowAction.match(/(?:create|copy|click|press|type|open|close|select|choose|show|retrieve|get)\s+(?:['"]?)(\w+(?:\s+\w+)?)/gi) || [];
-    const _matched = _flowKeywords.some(kw => {
+    const _flowKeywords = _flowAction.match(/(?:create|copy|click|press|type|fill|enter|open|close|select|choose|show|retrieve|get)\s+(?:['"]?)(\w+(?:\s+\w+)?)/gi) || [];
+    let _matched = _flowKeywords.some(kw => {
       const kwClean = kw.replace(/^.*?\s+/, '').replace(/['"]/g, '');
       return _lastAction.includes(kwClean.toLowerCase());
     });
+    // Quoted-phrase overlap: covers verb-less split fragments like
+    // "'Subject' with 'Location Addresses'" — if any quoted phrase in the flow
+    // action appears in the last executed action, the step is satisfied.
+    if (!_matched) {
+      const _quoted = _flowAction.match(/['"]([^'"]{2,})['"]/g) || [];
+      _matched = _quoted.some(q => {
+        const phrase = q.replace(/['"]/g, '').toLowerCase().trim();
+        return phrase.length >= 3 && _lastAction.includes(phrase);
+      });
+    }
     if (_matched) {
       flowIndex++;
       if (logger) logger.info(`[instruction.runner] Tab-Flow: reconciling — advancing past tier 4 step (action "${_lastAction.slice(0, 60)}" matches flow step) → step ${flowIndex}`);
@@ -5391,15 +5425,71 @@ function _resyncFlowIndex(tabFlow, flowIndex, filledFields, actionHistory, logge
     const action = String(step.action || '').toLowerCase();
     // Done step — advance if all prior steps are complete
     if (step.tier === 0) { flowIndex++; advanced = true; continue; }
-    // Fill/type step: extract value from 'value' after =
-    const valueMatch = action.match(/=\s*['"]([^'"]+)['"]/);
-    if (valueMatch) {
-      const expectedValue = valueMatch[1].toLowerCase().trim();
-      const filled = (filledFields || []).some(f =>
-        String(f.value || '').toLowerCase().trim() === expectedValue
-      );
+    // Fill/type step: match against filledFields. Handles "field = 'v'",
+    // "'field' with 'v'", "type 'v' into field", unquoted "with <text>"
+    // fragments, and verb-less split fragments ("'Subject' with 'X'").
+    if (/\bwith\b|\b(?:type|fill|enter)\b|=\s*['"]/.test(action)) {
+      let filled = false;
+      let _looseWith = null;
+      // Field-label candidate: text after "into", or text before "with"/"=".
+      // When present, the filled field's LABEL must agree — otherwise a
+      // different field filled with an equal value falsely satisfies this
+      // step (e.g. Subject="Location Addresses" satisfying "body with the
+      // location addresses" → the body step would be skipped unfilled).
+      const _fillLabel = (() => {
+        const into = action.match(/\binto\s+(?:the\s+)?['"]?([a-z0-9 ._-]{2,40}?)['"]?\s*$/i);
+        if (into) return into[1].trim().toLowerCase();
+        const sep = action.match(/\bwith\b/i) || action.match(/=/);
+        if (sep) {
+          return action.slice(0, sep.index)
+            .replace(/^(?:please\s+)?(?:type|fill|enter|set|write|click)\s+/i, '')
+            .replace(/['"]/g, '').replace(/^(?:the|a|an)\s+/i, '').trim().toLowerCase();
+        }
+        return null;
+      })();
+      const _labelOk = (f) => {
+        if (!_fillLabel) return true;
+        const fl = String(f.label || '').toLowerCase().trim();
+        return fl && (fl === _fillLabel || fl.includes(_fillLabel) || _fillLabel.includes(fl));
+      };
+      const valueMatch = action.match(/=\s*['"]([^'"]+)['"]/) ||
+                         action.match(/\bwith\s+['"]([^'"]+)['"]/) ||
+                         action.match(/(?:type|fill|enter)\s+['"]([^'"]+)['"]/);
+      if (valueMatch) {
+        const expectedValue = valueMatch[1].toLowerCase().trim();
+        filled = (filledFields || []).some(f =>
+          String(f.value || '').toLowerCase().trim() === expectedValue && _labelOk(f)
+        );
+      }
+      // Unquoted "with <value>" fragment (e.g. "and body with the location
+      // addresses") — fuzzy match against filled values, label-gated.
+      if (!filled) {
+        _looseWith = action.match(/\bwith\s+(?:the\s+)?(.+?)\s*$/);
+        if (_looseWith && _looseWith[1].trim().length >= 3) {
+          const frag = _looseWith[1].trim().toLowerCase();
+          filled = (filledFields || []).some(f => {
+            const v = String(f.value || '').toLowerCase().trim();
+            return v && (v === frag || frag.includes(v) || v.includes(frag)) && _labelOk(f);
+          });
+        }
+      }
+      // Quoted field label match (e.g. "'Subject' with 'X'" when the recorded
+      // value differs slightly from the planned one).
+      if (!filled) {
+        const _labelMatch = action.match(/['"]([^'"]{2,})['"]/);
+        if (_labelMatch) {
+          const lbl = _labelMatch[1].trim().toLowerCase();
+          filled = (filledFields || []).some(f => {
+            const fl = String(f.label || '').toLowerCase().trim();
+            return fl && (fl === lbl || fl.includes(lbl) || lbl.includes(fl));
+          });
+        }
+      }
       if (filled) { flowIndex++; advanced = true; continue; }
-      else break; // not filled yet — stop here
+      // Fill-structured step that isn't satisfied → stop. Steps that merely
+      // contain a fill-ish word but no fill structure (e.g. "press Enter to
+      // submit", "click 'Enter' button") fall through to the click matcher.
+      if (valueMatch || _looseWith || /\bwith\b|=\s*['"]/.test(action)) break;
     }
     // Click submit step: check actionHistory for a matching click.
     // Prefer a quoted target ANYWHERE in the action (e.g. "click the 'Add to Cart'
@@ -6886,7 +6976,7 @@ function _emitTierProgress(progressCallbackUrl, stepIndex, tierName, message, ag
     const req = http.request({
       hostname: u.hostname,
       port: parseInt(u.port, 10),
-      path: u.pathname,
+      path: u.pathname + u.search,
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
       timeout: 3000,
@@ -6914,7 +7004,7 @@ function _emitProgress(progressCallbackUrl, stepIndex, payload, agentId = '', se
     const req = http.request({
       hostname: u.hostname,
       port: parseInt(u.port, 10),
-      path: u.pathname,
+      path: u.pathname + u.search,
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
       timeout: 3000,
@@ -7291,6 +7381,61 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
   let _lastPlanSig = '';
   let _planRepeatCount = 0;
 
+  // Same-state re-plan flag: when a sub-plan finishes but the next flow step is
+  // still tier-4 on an unchanged page (e.g. split multi-field form actions),
+  // the cached map is still valid — re-extract instead of rescanning.
+  let _replanAgainstCache = false;
+  let _lastCacheReplanAt = -1; // flowIndex of last cache re-plan (1 per step max)
+
+  // Shared step-plan extraction for the current flow position. Batches the
+  // contiguous tier-4 flow-step run into ONE hint so a multi-field form is
+  // planned as a single sub-plan (one scan fills all fields). Applies the
+  // wrong-button validation + plan-repeat guard + tab_map:plan emit.
+  // Returns the plan, or null when the caller should use per-step fallback.
+  const _reextractSteps = async (mapForExtraction, urlForExtraction) => {
+    const { _extractSteps } = require('./browser.agent.cjs');
+    const _hint = _tier4RunHint(_tabFlow, _flowIndex);
+    _currentFlowStepHint = _hint;
+    const plan = await _extractSteps(
+      goal, urlForExtraction, mapForExtraction, _pageCategory, agentContext,
+      overlayActive, actionHistory, _hint, stepType, filledFields
+    );
+    // Flow-step hint validation: reject plans that click wrong commerce buttons
+    if (plan && _hint && /\badd\s+to\s+(?:cart|bag|basket)\b/i.test(_hint)) {
+      const _badSteps = plan.filter(s => s.action === 'click' &&
+        /\b(?:add\s+to\s+list|wishlist|registry|save\s+for\s+later)\b/i.test(s.target || '') &&
+        !/\b(?:cart|bag|basket)\b/i.test(s.target || ''));
+      if (_badSteps.length > 0) {
+        logger.warn(`[instruction.runner] _extractSteps: plan contains wrong-button click(s) [${_badSteps.map(s=>`"${s.target}"`).join(', ')}] for add-to-cart flow step — rejecting plan, falling back to per-step LLM`);
+        return null;
+      }
+    }
+    // Step plan loop detection
+    const _planSig = JSON.stringify((plan || []).map(s => `${s.action}:${s.target || s.value || s.key || ''}`));
+    if (_planSig === _lastPlanSig && _planSig !== '[]' && _planSig !== '') {
+      _planRepeatCount++;
+      logger.warn(`[instruction.runner] Tab-Map: plan repeated ${_planRepeatCount}× ("${_planSig.slice(0, 80)}") — ${_planRepeatCount >= 3 ? 'skipping Tab-Map' : 'will retry'}`);
+      if (_planRepeatCount >= 3) {
+        _triedTiers.add(4);
+        _planRepeatCount = 0;
+        _lastPlanSig = '';
+        return null;
+      }
+    } else {
+      _planRepeatCount = 0;
+      _lastPlanSig = _planSig;
+    }
+    const _onlyDone = plan && plan.length === 1 && plan[0].action === 'done';
+    if (!plan || _onlyDone) return null;
+    _emitProgress(progressCallbackUrl, stepIndex, {
+      type: 'tab_map:plan',
+      flowIndex: _flowIndex,
+      flowAction: _tabFlow?.[_flowIndex]?.action || '',
+      steps: plan.map((s, i) => ({ index: i, action: s.action, target: s.target || s.key || s.value || '' })),
+    }, agentId, sessionId);
+    return plan;
+  };
+
 
   // Initial overlay detection (URL-first might have opened a modal)
   // For creation deep-links: only suppress overlay detection when the overlay
@@ -7376,6 +7521,23 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
     if (inTabMapSession && !stateChanged && _cachedTabMap) {
       let stepResult;
 
+      // Re-plan against the cached tab-map: the previous sub-plan finished but
+      // the flow still has tier-4 steps on the SAME page state (e.g. split
+      // multi-field compose actions). The cached map is still valid — re-extract
+      // the remaining tier-4 run instead of rescanning the identical DOM.
+      if (_replanAgainstCache) {
+        _replanAgainstCache = false;
+        if (!_usingStepFallback) {
+          logger.info(`[instruction.runner] Tab-Map: re-extracting remaining tier-4 flow actions against cached map (flow step ${_flowIndex}/${_tabFlow?.length || 0}) — no rescan`);
+          _stepPlan = await _reextractSteps(_cachedTabMap, currentUrl);
+          _stepIndex = 0;
+          if (!_stepPlan) {
+            logger.info(`[instruction.runner] Tab-Map: cache re-extraction returned no usable plan — using per-step LLM`);
+            _usingStepFallback = true;
+          }
+        }
+      }
+
       if (!_usingStepFallback && _stepPlan && _stepIndex < _stepPlan.length) {
         // Step-based execution: run ONE step from the pre-extracted plan
         const _step = _stepPlan[_stepIndex];
@@ -7452,49 +7614,13 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
         _cachedTabMapUrl = currentUrl;
         _cachedTabMapOverlayActive = overlayActive;
         _clearLlmCache(sessionId);
-        // Re-extract steps for the fresh tab-map (unless in fallback mode)
+        // Re-extract steps for the fresh tab-map (unless in fallback mode).
+        // Batches the remaining tier-4 flow run into one plan (see _tier4RunHint).
         if (!_usingStepFallback) {
-          const { _extractSteps } = require('./browser.agent.cjs');
-          const _fsh = (_tabFlow && _flowIndex < _tabFlow.length && _tabFlow[_flowIndex].tier === 4)
-            ? (_tabFlow[_flowIndex].action || '')
-                .replace(/^(?:scan|look at|check|inspect|examine)\s+(?:the\s+)?page\s+and\s+/i, '')
-                .trim()
-            : '';
-          _currentFlowStepHint = _fsh;
-          _stepPlan = await _extractSteps(goal, currentUrl, _cachedTabMap, _pageCategory, agentContext, overlayActive, actionHistory, _fsh, stepType);
+          _stepPlan = await _reextractSteps(_cachedTabMap, currentUrl);
           _stepIndex = 0;
-          // Flow-step hint validation: reject plans that click wrong commerce buttons
-          if (_stepPlan && _fsh && /\badd\s+to\s+(?:cart|bag|basket)\b/i.test(_fsh)) {
-            const _badSteps = _stepPlan.filter(s => s.action === 'click' &&
-              /\b(?:add\s+to\s+list|wishlist|registry|save\s+for\s+later)\b/i.test(s.target || '') &&
-              !/\b(?:cart|bag|basket)\b/i.test(s.target || ''));
-            if (_badSteps.length > 0) {
-              logger.warn(`[instruction.runner] _extractSteps: plan contains wrong-button click(s) [${_badSteps.map(s=>`"${s.target}"`).join(', ')}] for add-to-cart flow step — rejecting plan, falling back to per-step LLM`);
-              _stepPlan = null;
-              _usingStepFallback = true;
-            }
-          }
-          // Step plan loop detection
-          const _planSig = JSON.stringify((_stepPlan || []).map(s => `${s.action}:${s.target || s.value || s.key || ''}`));
-          if (_planSig === _lastPlanSig && _planSig !== '[]' && _planSig !== '') {
-            _planRepeatCount++;
-            logger.warn(`[instruction.runner] Tab-Map: plan repeated ${_planRepeatCount}× ("${_planSig.slice(0, 80)}") — ${_planRepeatCount >= 3 ? 'skipping Tab-Map' : 'will retry'}`);
-            if (_planRepeatCount >= 3) {
-              _triedTiers.add(4);
-              _usingStepFallback = true;
-              _planRepeatCount = 0;
-              _lastPlanSig = '';
-            }
-          } else {
-            _planRepeatCount = 0;
-            _lastPlanSig = _planSig;
-          }
-          // A 1-step plan with a real action (click, navigate, type, press) is valid —
-          // it's often a navigation step to a new page where steps will be re-extracted.
-          // Only switch to per-step LLM when extraction failed (null) or the only step is "done".
-          const _onlyDone = _stepPlan && _stepPlan.length === 1 && _stepPlan[0].action === 'done';
-          if (!_stepPlan || _onlyDone) {
-            logger.info(`[instruction.runner] Tab-Map: re-extraction returned ${_stepPlan?.length || 0} step(s)${_onlyDone ? ' (only done)' : ''} — using per-step LLM`);
+          if (!_stepPlan) {
+            logger.info(`[instruction.runner] Tab-Map: re-extraction returned no usable plan — using per-step LLM`);
             _usingStepFallback = true;
           }
         }
@@ -7585,6 +7711,22 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
         if (!_flowComplete(_tabFlow, _flowIndex)) {
           _flowIndex = _resyncFlowIndex(_tabFlow, _flowIndex, filledFields, actionHistory, logger);
           _flowIndex = _reconcileFlowIndex(_tabFlow, _flowIndex, currentUrl, prevUrl, logger, actionHistory, stepResult, progressCallbackUrl, stepIndex, agentId, sessionId);
+          // Same-state tier-4 continuation: the next flow step is still Tab-Map
+          // and the last step didn't change state (e.g. split multi-field form
+          // actions). Keep the session + cached map and re-extract the remaining
+          // tier-4 run — a rescan would rebuild the identical map. Bounded to
+          // one re-plan per flowIndex; if the index doesn't move, the normal
+          // teardown path below still applies.
+          if (_tabFlow && _flowIndex < _tabFlow.length && _tabFlow[_flowIndex].tier === 4 &&
+              !stepResult.stateChanged && _cachedTabMap && _lastCacheReplanAt !== _flowIndex) {
+            _lastCacheReplanAt = _flowIndex;
+            _replanAgainstCache = true;
+            _stepPlan = null;
+            _stepIndex = 0;
+            prevUrl = currentUrl;
+            logger.info(`[instruction.runner] Tab-Map: sub-plan done but next flow step ${_flowIndex} is tier-4 on same state — keeping session, re-planning (no rescan)`);
+            continue;
+          }
           logger.info(`[instruction.runner] Tab-Map: sub-plan done but Tab-Flow incomplete (step ${_flowIndex}/${_tabFlow.length}) — continuing, not done`);
           inTabMapSession = false;
           _cachedTabMap = null;
@@ -7628,6 +7770,27 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
           continue; // re-decide with fresh tab-map on next iteration
         }
 
+        // Same-state tier-4 continuation — checked BEFORE the session teardown
+        // below so the cached map is still available. When the sub-plan/LLM
+        // declares done but the flow still has tier-4 steps on unchanged state
+        // (split multi-field form actions), keep the session + cached map and
+        // re-extract the remaining tier-4 run — rescanning rebuilds the same DOM.
+        if (stepResult.ok && !stepResult.error && !stepResult.stateChanged &&
+            _tabFlow && !_flowComplete(_tabFlow, _flowIndex)) {
+          _flowIndex = _resyncFlowIndex(_tabFlow, _flowIndex, filledFields, actionHistory, logger);
+          _flowIndex = _reconcileFlowIndex(_tabFlow, _flowIndex, currentUrl, prevUrl, logger, actionHistory, stepResult, progressCallbackUrl, stepIndex, agentId, sessionId);
+          if (_flowIndex < _tabFlow.length && _tabFlow[_flowIndex].tier === 4 &&
+              _cachedTabMap && _lastCacheReplanAt !== _flowIndex) {
+            _lastCacheReplanAt = _flowIndex;
+            _replanAgainstCache = true;
+            _stepPlan = null;
+            _stepIndex = 0;
+            prevUrl = currentUrl;
+            logger.info(`[instruction.runner] Tab-Map: done signal but next flow step ${_flowIndex} is tier-4 on same state — keeping session, re-planning (no rescan)`);
+            continue;
+          }
+        }
+
         // Tab-Map session ended
         inTabMapSession = false;
         _cachedTabMap = null;
@@ -7669,6 +7832,8 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
           if (!_flowComplete(_tabFlow, _flowIndex)) {
             _flowIndex = _resyncFlowIndex(_tabFlow, _flowIndex, filledFields, actionHistory, logger);
             _flowIndex = _reconcileFlowIndex(_tabFlow, _flowIndex, currentUrl, prevUrl, logger, actionHistory, stepResult, progressCallbackUrl, stepIndex, agentId, sessionId);
+            // Note: same-state tier-4 continuation is handled BEFORE the session
+            // teardown above — by this point _cachedTabMap is already cleared.
             logger.info(`[instruction.runner] Tab-Map: step done but Tab-Flow incomplete (step ${_flowIndex}/${_tabFlow.length}) — continuing, not done`);
             inTabMapSession = false;
             _cachedTabMap = null;
@@ -9077,42 +9242,10 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
         const _preClassifiedCommerce = _stepPlan && _stepPlan[0] && _stepPlan[0]._preClassifiedRef
           && /\b(add\s+to\s+(?:cart|bag|basket)|buy\s+now|checkout)\b/i.test(_stepPlan[0].target || '');
         if (!_preClassifiedCommerce) {
-          const { _extractSteps } = require('./browser.agent.cjs');
-          const _fsh2 = (_tabFlow && _flowIndex < _tabFlow.length && _tabFlow[_flowIndex].tier === 4)
-            ? (_tabFlow[_flowIndex].action || '')
-                .replace(/^(?:scan|look at|check|inspect|examine)\s+(?:the\s+)?page\s+and\s+/i, '')
-                .trim()
-            : '';
-          _currentFlowStepHint = _fsh2;
-          _stepPlan = await _extractSteps(goal, currentUrl, _cachedTabMap, _pageCategory, agentContext, overlayActive, actionHistory, _fsh2, stepType);
+          // Batches the contiguous tier-4 flow run into one plan (see _tier4RunHint);
+          // validation, plan-repeat guard and tab_map:plan emit live inside.
+          _stepPlan = await _reextractSteps(_cachedTabMap, currentUrl);
           _stepIndex = 0;
-        // Flow-step hint validation: reject plans that click wrong commerce buttons
-        if (_stepPlan && _fsh2 && /\badd\s+to\s+(?:cart|bag|basket)\b/i.test(_fsh2)) {
-          const _badSteps = _stepPlan.filter(s => s.action === 'click' &&
-            /\b(?:add\s+to\s+list|wishlist|registry|save\s+for\s+later)\b/i.test(s.target || '') &&
-            !/\b(?:cart|bag|basket)\b/i.test(s.target || ''));
-          if (_badSteps.length > 0) {
-            logger.warn(`[instruction.runner] _extractSteps: plan contains wrong-button click(s) [${_badSteps.map(s=>`"${s.target}"`).join(', ')}] for add-to-cart flow step — rejecting plan, falling back to per-step LLM`);
-            _stepPlan = null;
-            _usingStepFallback = true;
-          }
-        }
-        } // end if (!_preClassifiedCommerce)
-
-        // Step plan loop detection
-        const _planSig2 = JSON.stringify((_stepPlan || []).map(s => `${s.action}:${s.target || s.value || s.key || ''}`));
-        if (_planSig2 === _lastPlanSig && _planSig2 !== '[]' && _planSig2 !== '') {
-          _planRepeatCount++;
-          logger.warn(`[instruction.runner] Tab-Map: plan repeated ${_planRepeatCount}× ("${_planSig2.slice(0, 80)}") — ${_planRepeatCount >= 3 ? 'skipping Tab-Map' : 'will retry'}`);
-          if (_planRepeatCount >= 3) {
-            _triedTiers.add(4);
-            _usingStepFallback = true;
-            _planRepeatCount = 0;
-            _lastPlanSig = '';
-          }
-        } else {
-          _planRepeatCount = 0;
-          _lastPlanSig = _planSig2;
         }
 
         if (!_stepPlan || (_stepPlan.length === 1 && _stepPlan[0].action === 'done')) {
@@ -9124,13 +9257,8 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
         } else {
           _usingStepFallback = false;
           logger.info(`[instruction.runner] Tab-Map: executing ${_stepPlan.length} extracted steps`);
-          // Emit tab_map:plan so the frontend can display the sub-plan steps
-          _emitProgress(progressCallbackUrl, stepIndex, {
-            type: 'tab_map:plan',
-            flowIndex: _flowIndex,
-            flowAction: _tabFlow?.[_flowIndex]?.action || '',
-            steps: _stepPlan.map((s, i) => ({ index: i, action: s.action, target: s.target || s.key || s.value || '' })),
-          }, agentId, sessionId);
+          // tab_map:plan already emitted by _reextractSteps (or by the
+          // pre-classified seed block above) — no duplicate emit here.
         }
       } else {
         logger.info(`[instruction.runner] Tab-Map: using cached tab-map (${_cachedTabMap.length} elements)`);
@@ -9479,4 +9607,7 @@ module.exports = {
   // Exported for testing (flow resync bug — 'the' click-target regression)
   _resyncFlowIndex,
   _flowComplete,
+  _subPlanStepMatchesFlowStep,
+  _reconcileFlowIndex,
+  _tier4RunHint,
 };

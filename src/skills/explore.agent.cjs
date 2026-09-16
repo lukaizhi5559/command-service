@@ -409,7 +409,7 @@ function _postProgress(callbackUrl, event) {
     const req = http.request({
       hostname: u.hostname,
       port: parseInt(u.port || '80', 10),
-      path: u.pathname,
+      path: u.pathname + u.search,
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
     }, res => { 

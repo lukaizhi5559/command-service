@@ -2876,6 +2876,25 @@ function _splitCompoundAction(action) {
   return parts;
 }
 
+// Verb inheritance for split fragments: mid-sentence fragments lose their
+// action verb (e.g. "fill 'To' with 'a', 'Subject' with 'b'" splits into
+// "'Subject' with 'b'"). Prepend the previous fragment's verb so every atomic
+// step is self-describing for downstream flow matchers.
+const _ACTION_VERB_RE = /^(click|press|type|fill|enter|navigate|open|select|choose|scroll|wait|get|close|save|submit|send|check|toggle|drag|hover|search|scan|look)\b/i;
+function _inheritFragmentVerbs(subActions) {
+  let lastVerb = '';
+  return (subActions || []).map(raw => {
+    let s = String(raw || '').replace(/^and\s+/i, '').trim() || String(raw || '');
+    const m = s.match(_ACTION_VERB_RE);
+    if (m) {
+      lastVerb = m[1].toLowerCase();
+    } else if (lastVerb) {
+      s = `${lastVerb} ${s}`;
+    }
+    return s;
+  });
+}
+
 // Compute the expected Tab-Flow for a step via LLM
 async function _computeTabFlow(goal, pageCategory, shortcutLabels, currentUrl, agentId, urlFirstNav = false, deepLinkType = 'none') {
   const { askWithMessages } = require('../skill-helpers/skill-llm.cjs');
@@ -2934,6 +2953,7 @@ ATOMIC STEP RULE (critical):
 - "click 'Create credentials' button, select 'API key' from the dropdown, then in the API key dialog click 'Copy'" should be split into separate steps: one for clicking 'Create credentials', one for selecting 'API key', one for filling the dialog, one for clicking 'Copy'.
 - If a step requires a dialog to open first (e.g., a "Create" button that opens a form), split it into: (1) click to open dialog, (2) fill dialog fields, (3) click submit button.
 - If a step has multiple sub-actions joined by "then", "and then", or ",", split it into separate steps.
+- NOTE: consecutive tier-4 steps on the SAME dialog/state are batched by the runner into ONE scan session — keeping them atomic is fine (and preferred over a single compound step). Keep atomicity for state-changing actions (dialog openers, submit buttons).
 
 GOAL-RELEVANCE RULES (CRITICAL):
 - Every step MUST directly contribute to achieving the goal. Do NOT include steps that open unrelated features (e.g., "open Gemini AI chat", "open keyboard shortcuts help") unless the goal explicitly asks for them.
@@ -2971,7 +2991,7 @@ GOAL-RELEVANCE RULES (CRITICAL):
         if (step.tier === 4) {
           const subActions = _splitCompoundAction(action);
           if (subActions.length > 1) {
-            for (const subAction of subActions) {
+            for (const subAction of _inheritFragmentVerbs(subActions)) {
               splitFlow.push({ ...step, action: subAction });
             }
             logger.info(`[browser.agent] _computeTabFlow: split compound tier-4 step "${action.slice(0, 60)}" into ${subActions.length} atomic steps`);
@@ -3222,7 +3242,7 @@ function _regexExtractSteps(raw, goal, tabMap) {
 // Caller executes steps in order; on page change, re-extract for new page.
 // If null or <=1 step, caller falls back to per-step _llmNextAction (browse-and-report).
 // 3-layer fallback: (1) planning model, (2) complex model with sharper prompt, (3) regex.
-async function _extractSteps(goal, currentUrl, tabMap, pageCategory, agentContext, overlayActive = false, actionHistory = [], flowStepHint = '', stepType = null) {
+async function _extractSteps(goal, currentUrl, tabMap, pageCategory, agentContext, overlayActive = false, actionHistory = [], flowStepHint = '', stepType = null, filledFields = []) {
   const { askWithMessages } = require('../skill-helpers/skill-llm.cjs');
 
   const _contextBlock = agentContext
@@ -3234,8 +3254,11 @@ async function _extractSteps(goal, currentUrl, tabMap, pageCategory, agentContex
   // Flow step hint: when executing a pre-computed Tab-Flow, tell the LLM what
   // the current step expects so it generates steps for THAT action, not for the
   // overall goal (e.g., "click 'Create API key' button" instead of "click Credentials").
+  // The hint may list multiple ';'-separated actions — a contiguous run of
+  // same-state flow steps (e.g. a multi-field compose form) batched by the
+  // runner so one scan plans them all.
   const _flowHintBlock = flowStepHint
-    ? `\n\nCURRENT FLOW STEP: The automation is executing a pre-planned flow. The current step is: "${flowStepHint}". Generate steps ONLY for this specific action — do not re-plan navigation if the target page is already loaded. If the button/element for this step is visible, plan clicking it. If it's not visible, plan the closest navigation step toward it. Do NOT generate steps for the overall goal — only for this specific flow step. Do NOT generate "navigate" steps if the current page URL already matches the target page (e.g., if the goal is to "click 'Create credentials'" and the page is already on "apis/credentials", do NOT generate a "navigate" step — just click the button).`
+    ? `\n\nCURRENT FLOW STEP(S): The automation is executing a pre-planned flow. The next action(s) on the CURRENT page/dialog state are: "${flowStepHint}". Generate steps covering ALL of these action(s) in order — do not re-plan navigation if the target page is already loaded. If the button/element for a step is visible, plan clicking it. If it's not visible, plan the closest navigation step toward it. Do NOT generate steps for the overall goal — only for the listed flow action(s). Do NOT generate "navigate" steps if the current page URL already matches the target page (e.g., if the goal is to "click 'Create credentials'" and the page is already on "apis/credentials", do NOT generate a "navigate" step — just click the button).`
     : '';
 
   // Build element list with [FILLABLE]/[CLICKABLE] markers
@@ -3248,13 +3271,28 @@ async function _extractSteps(goal, currentUrl, tabMap, pageCategory, agentContex
   // dialog doesn't use [role="dialog"] or the DOM overlay scan found nothing).
   const _dialogElements = overlayActive && tabMap ? tabMap.filter(e => e.inDialog === true) : [];
   const _scopedTabMap = _dialogElements.length > 0 ? _dialogElements : tabMap;
+
+  // Fields already filled this session (by ref or label) — marked [FILLED] so
+  // re-extractions skip them and plan only the remaining actions.
+  const _filledMap = new Map();
+  if (filledFields && filledFields.length > 0) {
+    for (const f of filledFields) {
+      if (f.ref) _filledMap.set(f.ref, f.value);
+      if (f.label) _filledMap.set(`label:${String(f.label).toLowerCase()}`, f.value);
+    }
+  }
+
   const elementList = (_scopedTabMap || []).map(e => {
     const _tag = e.tag || '';
     const _role = e.role || '';
     const _label = e.text || e.ariaLabel || '';
     const _isFillable = ['input', 'textarea'].includes(_tag) ||
                         _role === 'combobox' || _role === 'textbox';
+    const _filledValue = _isFillable
+      ? (_filledMap.get(e.ref) || _filledMap.get(`label:${String(_label).toLowerCase()}`) || (e.value ? String(e.value) : ''))
+      : '';
     const _marker = _isFillable ? '[FILLABLE]' : '[CLICKABLE]';
+    const _filledMark = _filledValue ? ` [FILLED: "${String(_filledValue).slice(0, 40)}"]` : '';
     const _ariaRoleDesc = e.ariaRoleDescription || '';
     const _placeholder = e.placeholder || '';
     const _extras = [
@@ -3264,7 +3302,7 @@ async function _extractSteps(goal, currentUrl, tabMap, pageCategory, agentContex
     const _sponsoredMark = e.isSponsored ? '[SPONSORED] ' : '';
     const _pos = (e.x !== undefined && e.y !== undefined && e.w !== undefined && e.h !== undefined)
       ? ` @x=${Math.round(e.x)},y=${Math.round(e.y)},w=${Math.round(e.w)},h=${Math.round(e.h)}` : '';
-    return `${e.id} - ${_tag} "${_label}" ${_role ? `role=${_role} ` : ''}${_extras ? `${_extras} ` : ''}${_sponsoredMark}${_marker}${_pos}`;
+    return `${e.id} - ${_tag} "${_label}" ${_role ? `role=${_role} ` : ''}${_extras ? `${_extras} ` : ''}${_sponsoredMark}${_marker}${_filledMark}${_pos}`;
   }).join('\n');
 
   const systemPrompt = `You are planning the steps to achieve a goal on a web page.
@@ -3312,6 +3350,7 @@ Rules:
 - COMPOUND ON-PAGE-ACTION RULE: If the goal has multiple action clauses (e.g., "click X and then click Y", "open its product page, and click the 'Add to Cart' button"), generate only the steps that can be executed on the CURRENT page. The runner will re-extract steps after any navigation. Do NOT return [{ "action": "done" }] just because the second action's target isn't visible yet — plan the first action and let the runner handle the rest.
 - COMMERCE RULE: If the goal mentions "add to cart", "add to bag", or "add to basket", and an element with that exact label is visible on the current page (e.g., an "Add to Cart" button on a search-result card), click THAT element directly — do not navigate to the product page first.
 - If the page has [FILLABLE] form fields, fill ALL of them before clicking any submit button (Send, Submit, Post, Save, etc.).
+- Elements marked [FILLED: "..."] are already filled — do NOT plan steps for them; plan only the remaining actions.
 - Do NOT include steps for actions that require a different page (e.g., don't plan clicking a search result if the search hasn't been submitted yet — that's a future page).
 - If the goal is already achieved on this page, return [{ "action": "done" }].
 - For chip/token fields (email To, Recipients, CC, BCC): the system auto-confirms with Enter after Type. Do NOT add a separate press Enter step for chip confirmation.
@@ -3823,7 +3862,7 @@ function _postProgress(callbackUrl, evt) {
     const req = http.request({
       hostname: parsed.hostname,
       port:     parseInt(parsed.port, 10),
-      path:     parsed.pathname,
+      path:     parsed.pathname + parsed.search,
       method:   'POST',
       headers:  { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) },
       timeout:  2000,
@@ -12039,7 +12078,7 @@ When extracting page content with run-code, prioritize these selectors over gene
               stepIndex: _stepIndex ?? 0,
               message: `Sign in to ${_svcDisplay} in the browser window that just opened.`,
             });
-            const _authReq = http.request({ hostname: '127.0.0.1', port: parseInt(new URL(_progressCallbackUrl).port, 10), path: new URL(_progressCallbackUrl).pathname, method: 'POST', headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(_authPayload) }, timeout: 3000 });
+            const _authReq = http.request({ hostname: '127.0.0.1', port: parseInt(new URL(_progressCallbackUrl).port, 10), path: new URL(_progressCallbackUrl).pathname + new URL(_progressCallbackUrl).search, method: 'POST', headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(_authPayload) }, timeout: 3000 });
             _authReq.on('error', () => {});
             _authReq.write(_authPayload);
             _authReq.end();
@@ -12065,7 +12104,7 @@ When extracting page content with run-code, prioritize these selectors over gene
               try {
                 const http = require('http');
                 const _resolvedPayload = JSON.stringify({ type: 'task:auth_resolved', agentId, sessionId, stepIndex: _stepIndex ?? 0 });
-                const _resolvedReq = http.request({ hostname: '127.0.0.1', port: parseInt(new URL(_progressCallbackUrl).port, 10), path: new URL(_progressCallbackUrl).pathname, method: 'POST', headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(_resolvedPayload) }, timeout: 3000 });
+                const _resolvedReq = http.request({ hostname: '127.0.0.1', port: parseInt(new URL(_progressCallbackUrl).port, 10), path: new URL(_progressCallbackUrl).pathname + new URL(_progressCallbackUrl).search, method: 'POST', headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(_resolvedPayload) }, timeout: 3000 });
                 _resolvedReq.on('error', () => {});
                 _resolvedReq.write(_resolvedPayload);
                 _resolvedReq.end();
@@ -14089,6 +14128,7 @@ module.exports._extractSearchText = _extractSearchText;
 module.exports._extractShortcut = _extractShortcut;
 module.exports._computeTabFlow = _computeTabFlow;
 module.exports._splitCompoundAction = _splitCompoundAction;
+module.exports._inheritFragmentVerbs = _inheritFragmentVerbs;
 module.exports._normalizeGoalForCache = _normalizeGoalForCache;
 module.exports._loadTabFlowCache = _loadTabFlowCache;
 module.exports._saveTabFlowCache = _saveTabFlowCache;

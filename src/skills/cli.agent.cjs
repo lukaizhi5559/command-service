@@ -1102,7 +1102,7 @@ async function actionRun({ cli, argv = [], cwd, env, timeoutMs, stdin, agentId, 
       if (_progressCallbackUrl) {
         const _turnPayload = JSON.stringify({ type: 'agent:turn_live', agentId, turn, maxTurns: MAX_TURNS, stepIndex: _stepIndex ?? 0, currentAction: null });
         const http = require('http');
-        const _req = http.request({ hostname: '127.0.0.1', port: parseInt(new URL(_progressCallbackUrl).port, 10), path: new URL(_progressCallbackUrl).pathname, method: 'POST', headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(_turnPayload) }, timeout: 2000 });
+        const _req = http.request({ hostname: '127.0.0.1', port: parseInt(new URL(_progressCallbackUrl).port, 10), path: new URL(_progressCallbackUrl).pathname + new URL(_progressCallbackUrl).search, method: 'POST', headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(_turnPayload) }, timeout: 2000 });
         _req.on('error', () => {}); // fire-and-forget
         _req.write(_turnPayload);
         _req.end();
@@ -1167,7 +1167,7 @@ async function actionRun({ cli, argv = [], cwd, env, timeoutMs, stdin, agentId, 
       if (_progressCallbackUrl) {
         const _actionPayload = JSON.stringify({ type: 'agent:turn_live', agentId, turn, maxTurns: MAX_TURNS, stepIndex: _stepIndex ?? 0, currentAction: action.action, thinking: action.thinking || null });
         const http = require('http');
-        const _req2 = http.request({ hostname: '127.0.0.1', port: parseInt(new URL(_progressCallbackUrl).port, 10), path: new URL(_progressCallbackUrl).pathname, method: 'POST', headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(_actionPayload) }, timeout: 2000 });
+        const _req2 = http.request({ hostname: '127.0.0.1', port: parseInt(new URL(_progressCallbackUrl).port, 10), path: new URL(_progressCallbackUrl).pathname + new URL(_progressCallbackUrl).search, method: 'POST', headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(_actionPayload) }, timeout: 2000 });
         _req2.on('error', () => {});
         _req2.write(_actionPayload);
         _req2.end();
@@ -1209,7 +1209,7 @@ async function actionRun({ cli, argv = [], cwd, env, timeoutMs, stdin, agentId, 
                     stepIndex: _stepIndex ?? 0,
                     message: `Signing in to ${_svcDisplay}… A browser window may open for authorization.`,
                   });
-                  const _req = http.request({ hostname: '127.0.0.1', port: parseInt(new URL(_progressCallbackUrl).port, 10), path: new URL(_progressCallbackUrl).pathname, method: 'POST', headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(_payload) }, timeout: 3000 });
+                  const _req = http.request({ hostname: '127.0.0.1', port: parseInt(new URL(_progressCallbackUrl).port, 10), path: new URL(_progressCallbackUrl).pathname + new URL(_progressCallbackUrl).search, method: 'POST', headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(_payload) }, timeout: 3000 });
                   _req.on('error', () => {});
                   _req.write(_payload);
                   _req.end();
@@ -1226,7 +1226,7 @@ async function actionRun({ cli, argv = [], cwd, env, timeoutMs, stdin, agentId, 
                 try {
                   const http = require('http');
                   const _resolvedPayload = JSON.stringify({ type: 'task:auth_resolved', agentId, stepIndex: _stepIndex ?? 0 });
-                  const _resolvedReq = http.request({ hostname: '127.0.0.1', port: parseInt(new URL(_progressCallbackUrl).port, 10), path: new URL(_progressCallbackUrl).pathname, method: 'POST', headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(_resolvedPayload) }, timeout: 3000 });
+                  const _resolvedReq = http.request({ hostname: '127.0.0.1', port: parseInt(new URL(_progressCallbackUrl).port, 10), path: new URL(_progressCallbackUrl).pathname + new URL(_progressCallbackUrl).search, method: 'POST', headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(_resolvedPayload) }, timeout: 3000 });
                   _resolvedReq.on('error', () => {});
                   _resolvedReq.write(_resolvedPayload);
                   _resolvedReq.end();

@@ -1940,7 +1940,7 @@ function postProgress(callbackUrl, evt) {
     const req = http.request({
       hostname: parsed.hostname,
       port:     parseInt(parsed.port, 10),
-      path:     parsed.pathname,
+      path:     parsed.pathname + parsed.search,
       method:   'POST',
       headers:  { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) },
       timeout:  2000,

@@ -7453,7 +7453,7 @@ If no videos found, return []. Do not explain, only output the JSON array.`;
                 const _req = http.request({
                   hostname: '127.0.0.1',
                   port: parseInt(new URL(_progressCallbackUrl).port, 10),
-                  path: new URL(_progressCallbackUrl).pathname,
+                  path: new URL(_progressCallbackUrl).pathname + new URL(_progressCallbackUrl).search,
                   method: 'POST',
                   headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(_payload) },
                   timeout: 2000,
