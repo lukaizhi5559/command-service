@@ -3837,7 +3837,7 @@ What is the next action?`;
       const raw = await askWithMessages([
         { role: 'system', content: systemPrompt },
         { role: 'user', content: userPrompt },
-      ], { maxTokens: 100, temperature: 0.1, responseTimeoutMs: 15000 });
+      ], { maxTokens: 1200, temperature: 0.1, responseTimeoutMs: 15000 });
       const _clean = (raw || '').trim().replace(/^```(?:text|plaintext)?\s*\n?/i, '').replace(/\n?```\s*$/, '').trim();
       if (_clean) return _clean;
       logger.warn(`[browser.agent] _llmNextAction: empty response on attempt ${_attempt + 1}/${_MAX_ATTEMPTS}`);
@@ -6698,7 +6698,7 @@ function _isMutationIntent(intent) {
 
 // Per-intent mutation verbs — if any of these are present, the task is NOT read-only.
 const _MUTATION_VERBS = {
-  [INTENTS.MAIL]:           /\b(send|compose|write|draft|forward|reply|new email|new message|email to|newsletter)\b/i,
+  [INTENTS.MAIL]:           /\b(send|compose|write|draft|forward|reply|new email|new message|email to|e-?mail\s+(?:me|us|him|her|them)|newsletter)\b/i,
   [INTENTS.SOCIAL]:         /\b(post|tweet|retweet|share|comment|like|follow|message|dm|reply|respond)\b/i,
   [INTENTS.CONTENT_CREATE]: /\b(create|new|upload|publish|write|delete|remove|add|submit|post)\b/i,
   [INTENTS.SCHEDULING]:     /\b(book|schedule|add event|create event|cancel|reschedule|invite|set up)\b/i,
@@ -6744,8 +6744,25 @@ function _isPassiveReadTask(task) {
 // True when the task names filter criteria: unread, from:X, subject:X, label:X,
 // starred, is:unread, "from X", "not from Y", date ranges, etc.
 // These should NOT use the browse shortcut — they need to apply the filter first.
-const _SEARCH_CRITERIA_RE = /\b(unread|read|starred|label|tag|from:|to:|subject:|is:unread|is:read|has:|since:|before:|after:|category:|size:|attachment|filename|cc:|bcc:|not from|doesn't have|exclude)\b/i;
-const _SEARCH_CRITERIA_PHRASE_RE = /\b(?:from|by|sent by|written by|about|regarding|with subject|containing|matching)\s+[A-Z]/i;
+//
+// HARD operators: colon-syntax operators (is:unread, from:bob, has:attachment)
+// that essentially never appear in natural compose phrasing. They survive the
+// semantic veto below so find-then-act tasks ("find the email from Bob and
+// forward it") can still deep-link to a search results page.
+const _HARD_OPERATOR_RE = /\b(?:is:\w+|-?from:[\w.+-]+|has:\w+|label:[\w-]+|category:[\w-]+|filename:[\w.-]+|size:[\w.]+|before:[\w-]+|after:[\w-]+|since:[\w-]+|in:\w+)\b/i;
+// SOFT signals: bare filter words plus to:/subject:/cc:/bcc: — in a compose task
+// those are FIELD names ("subject: hi", "to: bob"), not search operators, so a
+// mutation classification vetoes them. Colon-terms sit outside the \b group —
+// ':' followed by a space has no word boundary, so a trailing \b would never match.
+const _SOFT_CRITERIA_RE = /\b(?:unread|read|starred|label|tag|attachment|not\s+from|doesn't\s+have|exclude)\b|\b(?:to|subject|cc|bcc):/i;
+// Phrase heuristic: "from Wendall", "regarding Q3 Report" — the trailing [A-Z]
+// must be a real capital (proper noun). The old /i flag made [A-Z] match any
+// letter, so "regarding the ..." — common compose phrasing — false-positived.
+const _SEARCH_CRITERIA_PHRASE_RE = /\b(?:[Ff]rom|[Bb]y|[Ss]ent [Bb]y|[Ww]ritten [Bb]y|[Aa]bout|[Rr]egarding|[Ww]ith [Ss]ubject|[Cc]ontaining|[Mm]atching)\s+[A-Z]/;
+// Lowercase-phrase form only counts in an explicit mail/read context:
+// "find emails from my pastor wendall" → criteria; "regarding the walmart
+// addresses email me them" → not (no mail noun preceding the phrase).
+const _SEARCH_CRITERIA_PHRASE_LC_RE = /\b(?:emails?|messages?|mails?|threads?|inbox)\b[^.]{0,40}\b(?:from|sent by|written by|about|regarding|with subject|containing|matching)\s+\w/i;
 
 /**
  * Strip payload noise from task string before regex extraction.
@@ -6769,10 +6786,29 @@ function _stripTaskNoise(task) {
   return t.replace(/\s+/g, ' ').trim();
 }
 
-function _isSearchCriteriaTask(task) {
+function _isSearchCriteriaTask(task, classification = null) {
   const t = _stripTaskNoise(task);
   if (!t) return false;
-  return _SEARCH_CRITERIA_RE.test(t) || _SEARCH_CRITERIA_PHRASE_RE.test(t);
+  const _hard = _HARD_OPERATOR_RE.test(t);
+  if (!_hard && !_SOFT_CRITERIA_RE.test(t)
+      && !_SEARCH_CRITERIA_PHRASE_RE.test(t) && !_SEARCH_CRITERIA_PHRASE_LC_RE.test(t)) {
+    return false;
+  }
+  // Semantic veto: when the once-per-turn classifier (state._taskClassification)
+  // says the task contains a mutation action (send_email, fill_form, post, ...),
+  // soft criteria signals are almost always the message's subject/body fields —
+  // not search filters. Only hard colon-operators survive the veto, so
+  // find-then-act tasks ("find the email from:Bob and forward it") still qualify.
+  if (!_hard && classification) {
+    try {
+      const { isReadExtractionTask } = require('../skill-helpers/state-patterns.cjs');
+      if (isReadExtractionTask(classification, logger) === false) {
+        logger.info(`[browser.agent] search-criteria suppressed by mutation classification (interactiveActions=${JSON.stringify(classification?.interactiveActions)}): "${t.slice(0, 80)}"`);
+        return false;
+      }
+    } catch (_) { /* non-fatal — fall through to regex verdict */ }
+  }
+  return true;
 }
 
 // Backward-compat alias (used by any callers that haven't been updated yet)
@@ -6990,8 +7026,8 @@ function _canPromoteDeepLink(candidate, source, intent, baseHost, serviceKey = '
  * Returns the search URL string, or null if the task has no extractable criteria or
  * the service doesn't support URL-based search.
  */
-async function _buildSearchCriteriaUrl(intent, serviceKey, baseStartUrl, baseHost, task) {
-  if (!_isSearchCriteriaTask(task)) return null;
+async function _buildSearchCriteriaUrl(intent, serviceKey, baseStartUrl, baseHost, task, classification = null) {
+  if (!_isSearchCriteriaTask(task, classification)) return null;
   const svc = String(serviceKey || '').toLowerCase().replace(/[^a-z0-9]/g, '');
   const _sq = await _extractSearchQuery(task, svc);
   if (!_sq.hasCriteria) return null;
@@ -7022,8 +7058,8 @@ async function _buildSearchCriteriaUrl(intent, serviceKey, baseStartUrl, baseHos
  * Returns the search URL string, or null if no pattern is cached or the task has
  * no extractable criteria.
  */
-async function _buildSearchUrlFromPattern(serviceKey, task, baseHost) {
-  if (!_isSearchCriteriaTask(task)) return null;
+async function _buildSearchUrlFromPattern(serviceKey, task, baseHost, classification = null) {
+  if (!_isSearchCriteriaTask(task, classification)) return null;
   const pattern = await getSearchUrlPattern(serviceKey);
   if (!pattern?.urlTemplate) return null;
   // Guard: reject and purge invalid patterns for hash-routing SPAs.
@@ -7151,7 +7187,21 @@ async function _resolveTaskDeepLink(agentId, serviceKey, baseStartUrl, task, exi
       }
     }
 
-    const intent = await classifyTaskIntent(task, serviceKey);
+    // Semantic intent derivation: when the once-per-turn classifier already
+    // labelled the turn with send_email and this agent resolves a mail service,
+    // intent is MAIL — no second LLM classification needed, and raw phrasing
+    // like "email me these addresses" (which lacks the send/compose verbs the
+    // intent regex expects) still routes to the compose template.
+    const _svcNorm = String(serviceKey || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+    const _hostNorm = (() => { try { return new URL(baseStartUrl).hostname; } catch (_) { return ''; } })();
+    const _isMailSvc = /gmail|outlook|mail/.test(_svcNorm) || /mail\.|outlook\./.test(_hostNorm);
+    const _clsActions = Array.isArray(_dlTaskCls?.interactiveActions) ? _dlTaskCls.interactiveActions : [];
+    const _clsMail = _isMailSvc && _clsActions.includes('send_email') ? INTENTS.MAIL : null;
+    if (_clsMail) {
+      logger.info(`[browser.agent] deep-link: intent=MAIL derived from taskClassification (send_email) for ${agentId}`);
+    }
+
+    const intent = _clsMail || await classifyTaskIntent(task, serviceKey);
     const _taskKeywords = getTaskKeywords(task, serviceKey); // LLM-extracted keywords from classifyTaskIntent
     const isSearchLike = intent === INTENTS.SEARCH || /\b(search|look\s*up|google|find)\b/i.test(task);
 
@@ -7161,7 +7211,7 @@ async function _resolveTaskDeepLink(agentId, serviceKey, baseStartUrl, task, exi
     })();
 
     // Compute criteria-task status before the appKnowledge/keyword checks reference it.
-    const _isCriteriaTask = _isSearchCriteriaTask(task);
+    const _isCriteriaTask = _isSearchCriteriaTask(task, _dlTaskCls);
 
     // Step -1: appKnowledge intent_url check (highest priority, verified cache).
     // If we have a verified intent→URL mapping for this hostname+intent, use it
@@ -7184,7 +7234,7 @@ async function _resolveTaskDeepLink(agentId, serviceKey, baseStartUrl, task, exi
     // can't encode filter criteria (unread, from:X, subject:X), so letting the cache win
     // would land the agent on the wrong page. The template must win for criteria tasks.
     // (Defense-in-depth: protects against stale/polluted cache entries.)
-    const _criteriaUrl = await _buildSearchCriteriaUrl(intent, serviceKey, baseStartUrl, baseHost, task);
+    const _criteriaUrl = await _buildSearchCriteriaUrl(intent, serviceKey, baseStartUrl, baseHost, task, _dlTaskCls);
     if (_criteriaUrl) {
       logger.info(`[browser.agent] deep-link: search-criteria template for ${agentId}: ${_criteriaUrl}`);
       return { url: _criteriaUrl, source: 'template' };
@@ -7195,7 +7245,7 @@ async function _resolveTaskDeepLink(agentId, serviceKey, baseStartUrl, task, exi
     // extraction or web.agent). This lets any site reuse a discovered search form pattern
     // without re-running the full discovery pipeline.
     if (_isCriteriaTask) {
-      const _patternUrl = await _buildSearchUrlFromPattern(serviceKey, task, baseHost);
+      const _patternUrl = await _buildSearchUrlFromPattern(serviceKey, task, baseHost, _dlTaskCls);
       if (_patternUrl) {
         logger.info(`[browser.agent] deep-link: search-pattern cache hit for ${agentId}: ${_patternUrl}`);
         return { url: _patternUrl, source: 'search-pattern' };
@@ -7303,7 +7353,7 @@ async function _resolveTaskDeepLink(agentId, serviceKey, baseStartUrl, task, exi
       if (_WRITE_INTENTS.includes(intent) && _isReadOnlyTask(task, intent, _dlTaskCls)) {
         // Special case: MAIL read-only tries search-criteria URL first
         if (intent === INTENTS.MAIL) {
-          const _searchUrl = await _buildSearchCriteriaUrl(intent, serviceKey, baseStartUrl, baseHost, task);
+          const _searchUrl = await _buildSearchCriteriaUrl(intent, serviceKey, baseStartUrl, baseHost, task, _dlTaskCls);
           if (_searchUrl) return _searchUrl;
         }
         return null; // let discovery pipeline run
@@ -7478,7 +7528,7 @@ async function _resolveTaskDeepLink(agentId, serviceKey, baseStartUrl, task, exi
         // 1.5b. Search form extraction — for read-only/search-criteria tasks, look for
         // <form> elements with search role/action and extract the search URL pattern.
         // This catches ?q=, ?filter=, #search/ style search URLs that aren't in <a href> links.
-        if (!candidate && _isReadOnlyTask(task, intent, _dlTaskCls) && _isSearchCriteriaTask(task)) {
+        if (!candidate && _isReadOnlyTask(task, intent, _dlTaskCls) && _isSearchCriteriaTask(task, _dlTaskCls)) {
           try {
             const formEvalResult = await callSkill('browser.act', {
               action: 'evaluate',
@@ -7680,7 +7730,7 @@ async function _resolveTaskDeepLink(agentId, serviceKey, baseStartUrl, task, exi
     const _isPostShareTaskCache = /\b(post|share|publish|update|tweet|feed|status)\b/i.test(_taskLowerCache);
     const _isMessageTaskCache = /\b(message|msg|dm|direct message|chat|reply|respond|inbox)\b/i.test(_taskLowerCache);
     const _skipCacheForMessenger = _isPostShareTaskCache && !_isMessageTaskCache && /\/(messages|messenger)\b/i.test(candidate);
-    if (_mergedKeywords.length > 0 && !_isSearchCriteriaTask(task) && !_skipCacheForMessenger) {
+    if (_mergedKeywords.length > 0 && !_isSearchCriteriaTask(task, _dlTaskCls) && !_skipCacheForMessenger) {
       setImmediate(() => {
         recordDeepLinkCache(serviceKey, candidate, _mergedKeywords, intent).catch(() => {});
       });
@@ -11261,7 +11311,7 @@ Output ONLY valid JSON: {${_execRecipe.params.map(p => `"${p.name}": "<extracted
             if (_llmValid) {
             _deepLinkOverride = _llmSuggest.url;
             logger.info(`[browser.agent] deep-link: verified LLM URL ${_llmSuggest.url} — overriding startUrl from ${startUrl}`);
-            if (!_isSearchCriteriaTask(task)) {
+            if (!_isSearchCriteriaTask(task, _taskCls)) {
               setImmediate(() => { recordCorrection(_serviceKey, _intent, _llmSuggest.url, task).catch(() => {}); });
             }
             } else {
@@ -11314,7 +11364,7 @@ Output ONLY valid JSON: {${_execRecipe.params.map(p => `"${p.name}": "<extracted
             // Record this working URL so future runs benefit immediately.
             // Skip for search-criteria tasks — criteria URLs are too specific to be
             // useful as generic intent corrections (see _resolveTaskDeepLink).
-            if (!_isSearchCriteriaTask(task)) {
+            if (!_isSearchCriteriaTask(task, _taskCls)) {
               setImmediate(() => {
                 recordCorrection(_serviceKey, _intent, _bestUrl, task).catch(() => {});
               });
@@ -11328,13 +11378,13 @@ Output ONLY valid JSON: {${_execRecipe.params.map(p => `"${p.name}": "<extracted
             const _isPostShareSec = /\b(post|share|publish|update|tweet|feed|status)\b/i.test(_taskLowerSec);
             const _isMessageSec = /\b(message|msg|dm|direct message|chat|reply|respond|inbox)\b/i.test(_taskLowerSec);
             const _skipCacheMsgSec = _isPostShareSec && !_isMessageSec && /\/(messages|messenger)\b/i.test(_bestUrl);
-            if (_secondaryKeywords.length > 0 && !_isSearchCriteriaTask(task) && !_skipCacheMsgSec) {
+            if (_secondaryKeywords.length > 0 && !_isSearchCriteriaTask(task, _taskCls) && !_skipCacheMsgSec) {
               setImmediate(() => {
                 recordDeepLinkCache(_serviceKey, _bestUrl, _secondaryKeywords, _intent).catch(() => {});
               });
             }
             // Also cache in appKnowledge intent_url for future runs
-            if (_intent && _intent !== INTENTS.HOME && !_isSearchCriteriaTask(task)) {
+            if (_intent && _intent !== INTENTS.HOME && !_isSearchCriteriaTask(task, _taskCls)) {
               setImmediate(() => {
                 try {
                   const { saveIntentUrl } = require('./lib/appKnowledge.cjs');
@@ -12183,7 +12233,7 @@ When extracting page content with run-code, prioritize these selectors over gene
     // (e.g., #search/is:unread from:pastor wendall) and should NOT be recorded as a
     // generic intent correction. Otherwise future "check gmail" tasks (without criteria)
     // would be auto-corrected to the criteria-specific search URL.
-    if (agentResult?.ok === true && !_isSearchCriteriaTask(task)) {
+    if (agentResult?.ok === true && !_isSearchCriteriaTask(task, _taskCls)) {
         try {
         const _confirmedIntent = await classifyTaskIntent(task, _svcKey);
         const _origUrl = extractDescriptorUrl(existing.descriptor, 'start_url');
@@ -13246,12 +13296,12 @@ async function browserAgent(args) {
         return await actionRecordFailure(args);
 
     case 'resolve_deep_link': {
-        const { agentId: _aId, serviceKey: _svcKey, startUrl: _startUrl, task: _task, sessionId: _sid, existingDeepLinkUrl: _existing, headed: _dlHeaded, hidden: _dlHidden } = args;
+        const { agentId: _aId, serviceKey: _svcKey, startUrl: _startUrl, task: _task, sessionId: _sid, existingDeepLinkUrl: _existing, headed: _dlHeaded, hidden: _dlHidden, taskClassification: _dlCls } = args;
         if (!_startUrl || !_task) return { ok: false, error: 'startUrl and task are required for resolve_deep_link' };
         // Default to headless/hidden during preflight to avoid visible Chrome windows.
         const _dlHeadedResolved = _dlHeaded !== undefined ? _dlHeaded : false;
         const _dlHiddenResolved = _dlHidden !== undefined ? _dlHidden : true;
-        const _result = await _resolveTaskDeepLink(_aId || 'unknown', _svcKey || '', _startUrl, _task, _existing, _sid, { headed: _dlHeadedResolved, hidden: _dlHiddenResolved });
+        const _result = await _resolveTaskDeepLink(_aId || 'unknown', _svcKey || '', _startUrl, _task, _existing, _sid, { headed: _dlHeadedResolved, hidden: _dlHiddenResolved, taskClassification: _dlCls });
         const _dlUrl = _result?.url || (typeof _result === 'string' ? _result : null);
         // Close any browser session opened during deep-link resolution (authenticated eval)
         if (_sid) {
@@ -14091,6 +14141,8 @@ module.exports._profileGetValue = _profileGetValue;
 module.exports._isSigninWall = _isSigninWall;
 module.exports._canPromoteDeepLink = _canPromoteDeepLink;
 module.exports._isMutationIntent = _isMutationIntent;
+module.exports._isSearchCriteriaTask = _isSearchCriteriaTask;
+module.exports._isReadOnlyTask = _isReadOnlyTask;
 module.exports._isOnPageAction = _isOnPageAction;
 module.exports._isUnsafeDeepLinkUrl = _isUnsafeDeepLinkUrl;
 module.exports._resolvePlaybook = _resolvePlaybook;

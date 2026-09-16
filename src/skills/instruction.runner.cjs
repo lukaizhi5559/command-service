@@ -2393,7 +2393,11 @@ async function _executeAction(sessionId, step) {
           // is a false positive from a lingering autocomplete.
           const isCombobox = el?.getAttribute('role') === 'combobox' || el?.tagName === 'INPUT' || el?.tagName === 'TEXTAREA';
           const inDialog = isCombobox && (document.querySelector('[role="dialog"]') || document.body).innerText.includes(${JSON.stringify(_val.slice(0, 50))});
-          return { ok: v.includes(${JSON.stringify(_val.slice(0, 50))}) || inDialog, value: v.slice(0, 100), inDialog };
+          // Normalize whitespace: contenteditable textContent drops \n between
+          // blocks, so a multi-line value's first 50 chars may span a newline
+          // that isn't present in the DOM string.
+          const _nv = v.replace(/\\s+/g, ' ');
+          return { ok: _nv.includes(${JSON.stringify(_val.slice(0, 50).replace(/\s+/g, ' '))}) || inDialog, value: v.slice(0, 100), inDialog };
         })()`,
       });
       logger.info(`[instruction.runner] _executeAction type: verify ok=${_verify?.result?.ok}, value="${_verify?.result?.value || ''}", inDialog=${_verify?.result?.inDialog}`);
@@ -2419,7 +2423,8 @@ async function _executeAction(sessionId, step) {
                 const v = el.value !== undefined ? String(el.value) : (el.textContent || el.innerText || '');
                 const isCombobox = el?.getAttribute('role') === 'combobox' || el?.tagName === 'INPUT' || el?.tagName === 'TEXTAREA';
                 const inDialog = isCombobox && (document.querySelector('[role="dialog"]') || document.body).innerText.includes(${JSON.stringify(_val.slice(0, 50))});
-                return { ok: v.includes(${JSON.stringify(_val.slice(0, 50))}) || inDialog, value: v.slice(0, 100), inDialog };
+                const _nv = v.replace(/\\s+/g, ' ');
+                return { ok: _nv.includes(${JSON.stringify(_val.slice(0, 50).replace(/\s+/g, ' '))}) || inDialog, value: v.slice(0, 100), inDialog };
               })()`,
             });
             logger.info(`[instruction.runner] _executeAction type: post-reactFill verify ok=${_verify?.result?.ok}, value="${_verify?.result?.value || ''}", inDialog=${_verify?.result?.inDialog}`);
@@ -3524,6 +3529,13 @@ function _parseAction(text) {
   if (!text || typeof text !== 'string') return null;
   let t = text.trim();
 
+  // Multi-line Type: values can contain \n and embedded " chars (email bodies,
+  // code snippets). Try the full-text match BEFORE prose normalization, which
+  // would otherwise truncate the value to its first line. Greedy [\s\S]+
+  // captures everything up to the final `" into the "..." field"` anchor.
+  const _mlType = t.match(/^Type\s+"([\s\S]+)"\s+into\s+(?:the\s+)?"([^"]+)"\s+field\s*$/i);
+  if (_mlType) return { action: 'type', value: _mlType[1], target: _mlType[2] };
+
   // ── Pre-processor: strip prose/markdown from chatty LLMs ──
   // Small/fast LLMs sometimes return "**Action:** Click \"X\"" with reasoning
   // even when told to output only one line. Extract the action line before
@@ -3550,7 +3562,7 @@ function _parseAction(text) {
   if (m) return { action: 'click', target: m[1] };
 
   // Type "value" into the "field" field
-  m = t.match(/^Type\s+"([^"]+)"\s+into\s+(?:the\s+)?"([^"]+)"\s+field\s*$/i);
+  m = t.match(/^Type\s+"([\s\S]+)"\s+into\s+(?:the\s+)?"([^"]+)"\s+field\s*$/i);
   if (m) return { action: 'type', value: m[1], target: m[2] };
 
   // Press Enter / Tab / Escape
@@ -5778,6 +5790,16 @@ async function _executeTabMapAction(sessionId, parsed, tabMap, overlayActive, pa
       }
     }
 
+    // Single-line <input> can't hold newlines — a raw \n becomes an Enter
+    // keypress which can submit the form. Collapse newlines to spaces so all
+    // text is preserved without Enter semantics. (textarea/contenteditable
+    // handle \n natively via keyboard.type/insertText.)
+    if (parsed.value && String(parsed.value).includes('\n') &&
+        pickedEntry.tag === 'input' && !pickedEntry.isContentEditable) {
+      logger.info(`[instruction.runner] Tab-Map type: collapsing newlines in value for single-line input "${parsed.target}"`);
+      parsed.value = String(parsed.value).replace(/\s*\n\s*/g, ' ');
+    }
+
     // Click the field to focus it
     const cssSelector = pickedEntry.ref ? `[data-td-ref="${pickedEntry.ref}"]` : null;
     if (!cssSelector) {
@@ -6181,12 +6203,17 @@ async function _tabMapStepExecute(sessionId, step, stepIndex, stepCount, tabMap,
     }
   }
 
-  // Multi-line type guard: a single type action with \n in a block editor
-  // corrupts the page (types into the wrong field, creates wrong blocks).
-  // Abort so the caller falls back to per-step LLM (Just-type) which handles
-  // each item separately via type-list-item.
-  if (step.action === 'type' && typeof step.value === 'string' && step.value.includes('\n')) {
-    logger.warn(`[instruction.runner] Tab-Map step ${stepIndex + 1}: multi-line type value detected (${step.value.split('\n').length} lines) — aborting, falling back to per-step LLM`);
+  // Multi-line type guard: a single type action with \n in a block-structured
+  // editor corrupts the page (types into the wrong field, creates wrong blocks).
+  // Only applies to categories where Enter has structural semantics —
+  // document_editor (Notion, Google Docs: Enter = new block) and spreadsheet
+  // (Enter = commit cell + move down). For all other categories (email_compose,
+  // ai_chat, messaging, social_feed, code_editor, generic forms) \n is a plain
+  // line break handled safely by insertText — let the type proceed normally.
+  const _MULTILINE_GUARD_CATEGORIES = ['document_editor', 'spreadsheet'];
+  if (step.action === 'type' && typeof step.value === 'string' && step.value.includes('\n') &&
+      _MULTILINE_GUARD_CATEGORIES.includes(pageCategory)) {
+    logger.warn(`[instruction.runner] Tab-Map step ${stepIndex + 1}: multi-line type value detected (${step.value.split('\n').length} lines) in ${pageCategory} — aborting, falling back to per-step LLM`);
     return { done: false, ok: false, error: 'Multi-line type action not allowed in Tab-Map — use per-step LLM', fallbackToLlm: true, action: `type (multi-line)` };
   }
 
@@ -6690,7 +6717,7 @@ async function _selectTierLLM(sessionId, goal, actionHistory, pageCategory, shor
   // This is a soft guide: if the state doesn't match, fall through to the LLM.
   if (tabFlow && flowIndex < tabFlow.length) {
     const _expected = tabFlow[flowIndex];
-    if (_expected.tier !== 0 && _allowedTiers.includes(_expected.tier) && !disabledTiers.has(_expected.tier)) {
+    if (_expected.tier !== 0 && _allowedTiers.includes(_expected.tier) && !disabledTiers.has(_expected.tier) && !triedTiers.has(_expected.tier)) {
       // Check state compatibility (rough match — not exact):
       // - tier 3 (shortcuts): no overlay, shortcuts available
       // - tier 4 (tab-map): overlay open OR fillable >= 2 OR no focus

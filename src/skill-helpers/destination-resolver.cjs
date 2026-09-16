@@ -119,7 +119,7 @@ const INTENT_PATTERNS = [
   // MAIL — email actions BEFORE settings to prevent payload keywords triggering settings
   {
     intent: INTENTS.MAIL,
-    re: /\b((?:send|compose|write|draft|forward|reply)(?:\s+\w+){0,3}\s+(?:email|mail)|email[\s_-]to|mail[\s_-]to|newsletter|the\s+email)\b/i,
+    re: /\b((?:send|compose|write|draft|forward|reply)(?:\s+\w+){0,3}\s+(?:email|mail)|e-?mail\s+(?:me|us|him|her|them)\b|email[\s_-]to|mail[\s_-]to|newsletter|the\s+email)\b/i,
   },
   // SETTINGS — account/profile/billing/subscription management
   {
