@@ -3926,7 +3926,7 @@ const KNOWN_BROWSER_SERVICES = {
                      search: { buildUrl: (task, ctx) => `https://mail.google.com/mail/u/0/#search/${ctx.encodedQuery}` },
                      contacts: 'https://contacts.google.com',
                    } },
-  google:         { startUrl: 'https://accounts.google.com',                     signInUrl: 'https://accounts.google.com',                       authSuccessPattern: 'myaccount.google.com',         isOAuth: true,
+  google:         { startUrl: 'https://google.com',                     signInUrl: 'https://accounts.google.com',                       authSuccessPattern: 'google.com',         isOAuth: true,
                    intentUrls: { search: { buildUrl: (task, ctx) => `https://www.google.com/search?q=${ctx.encodedQuery}` } } },
   googledocs:     { startUrl: 'https://docs.google.com',                         signInUrl: 'https://accounts.google.com/signin/v2/identifier',  authSuccessPattern: 'docs.google.com/document',     isOAuth: true, hostAliases: ['docs.google.com'],
                    intentUrls: {
