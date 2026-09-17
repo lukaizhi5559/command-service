@@ -292,7 +292,7 @@ ISOLATION RULES — CRITICAL (user skills run in a sandboxed directory):
 - NEVER use require() with relative paths (e.g. require('./browser.act.cjs'), require('../server.cjs')).
   User skills are installed at ~/.thinkdrop/skills/<name>/index.cjs and CANNOT access any command-service files.
 - NEVER require() these command-service internals — they do NOT exist in user skill context:
-  browser.act.cjs, external.skill.cjs, skill.reviewer.cjs, creator.agent.cjs, skillCreator.skill.cjs,
+  browser.act.cjs, external.skill.cjs, creator.agent.cjs, skillCreator.skill.cjs,
   server.cjs, skill-llm.cjs, skill-db.cjs, logger.cjs — none of these are available to user skills.
 - If the task requires reading a file path from disk, use Node.js built-in fs module: require('fs').
 - If the task requires sending content via a messaging API (SMS, email, Slack), use that service's REST API
@@ -315,58 +315,6 @@ ISOLATION RULES — CRITICAL (user skills run in a sandboxed directory):
 
    Output: raw CommonJS code only. No markdown fences, no explanation.`;
 
-// ── Fetch api_rules from user-memory MCP for detected services ───────────────
-const SKILL_SERVICE_DETECTORS = [
-  { pattern: /clicksend|rest\.clicksend\.com/i,    service: 'clicksend' },
-  { pattern: /twilio/i,                            service: 'twilio' },
-  { pattern: /stripe/i,                            service: 'stripe' },
-  { pattern: /sendgrid/i,                          service: 'sendgrid' },
-  { pattern: /mailgun/i,                           service: 'mailgun' },
-  { pattern: /googleapis|google\.auth/i,           service: 'gmail' },
-  { pattern: /github/i,                            service: 'github' },
-  { pattern: /slack/i,                             service: 'slack' },
-  { pattern: /notion/i,                            service: 'notion' },
-  { pattern: /airtable/i,                          service: 'airtable' },
-  { pattern: /shopify/i,                           service: 'shopify' },
-  { pattern: /discord/i,                           service: 'discord' },
-  { pattern: /vonage|messagebird/i,                service: 'vonage' },
-];
-
-async function fetchApiRulesForSkillGen(combinedText) {
-  const services = new Set();
-  for (const { pattern, service } of SKILL_SERVICE_DETECTORS) {
-    if (pattern.test(combinedText)) services.add(service);
-  }
-  if (!services.size) return '';
-  try {
-    const http = require('http');
-    const MEM_PORT = parseInt(process.env.MEMORY_SERVICE_PORT || '3001', 10);
-    const MEM_API_KEY = process.env.MCP_USER_MEMORY_API_KEY || process.env.USER_MEMORY_API_KEY || process.env.MCP_API_KEY || '';
-    const body = JSON.stringify({ payload: { services: [...services] }, requestId: 'skillgen-' + Date.now() });
-    const raw = await new Promise((resolve) => {
-      const req = http.request({
-        hostname: '127.0.0.1', port: MEM_PORT, path: '/api_rule.search', method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body),
-          ...(MEM_API_KEY ? { 'Authorization': `Bearer ${MEM_API_KEY}` } : {}) },
-        timeout: 5000,
-      }, (res) => { let d = ''; res.on('data', c => { d += c; }); res.on('end', () => resolve(d)); });
-      req.on('error', () => resolve(''));
-      req.on('timeout', () => { req.destroy(); resolve(''); });
-      req.write(body); req.end();
-    });
-    const parsed = raw ? JSON.parse(raw) : null;
-    const results = parsed?.payload?.results || [];
-    if (!results.length) return '';
-    const lines = results.map(r =>
-      `- [${r.service}:${r.ruleType}] ${r.ruleText}` +
-      (r.fixHint ? `\n  FIX: ${r.fixHint}` : '')
-    );
-    return `\n\nAPI_RULES_FROM_DB (HARD REQUIREMENTS — violations will fail at runtime):\n${lines.join('\n')}`;
-  } catch (_) {
-    return '';
-  }
-}
-
 // ── Generate the skill file via LLM ───────────────────────────────────────────
 async function generateSkillCode(iface, agents, validateSpecs, planMd, agentsMd) {
   const validateSpecsSummary = Object.entries(validateSpecs)
@@ -376,10 +324,6 @@ async function generateSkillCode(iface, agents, validateSpecs, planMd, agentsMd)
   const secretsDestructure = iface.secrets.length > 0
     ? 'const { ' + iface.secrets.join(', ') + ' } = secrets;'
     : '// no secrets required';
-
-  // Fetch dynamic api_rules for any services detected in plan + skill name
-  const combinedText = [iface.skillName, planMd, agentsMd].join(' ');
-  const apiRulesSection = await fetchApiRulesForSkillGen(combinedText).catch(() => '');
 
   const userPrompt = [
     '## Skill Interface',
@@ -403,7 +347,6 @@ async function generateSkillCode(iface, agents, validateSpecs, planMd, agentsMd)
     '',
     '## validate.agent specs',
     validateSpecsSummary.slice(0, 2000),
-    ...(apiRulesSection ? ['', apiRulesSection] : []),
     '',
     'Generate the complete .skill.cjs for: ' + iface.skillName,
     'Use local token storage at ~/.thinkdrop/tokens/' + iface.skillName + '.json for OAuth.',
@@ -836,25 +779,6 @@ async function actionGenerateSkill({ projectId, projectDir: projDir } = {}) {
     } catch (e) {
       logger.warn('[skillCreator] retry generation failed (using original)', { error: e.message });
     }
-  }
-
-  // ── skill.reviewer: post-gen validator + auto-patcher ───────────────────────
-  // Queries api_rules for the services used in the generated code.
-  // Auto-patches violations via a targeted LLM call before writing to disk.
-  try {
-    const skillReviewer = require('./skill.reviewer.cjs');
-    const reviewResult  = await skillReviewer({ action: 'review_skill', code: skillCode, skillName: iface.skillName });
-    if (reviewResult.ok && reviewResult.patched) {
-      logger.info('[skillCreator] skill.reviewer auto-patched violations', {
-        skillName: iface.skillName,
-        remaining: reviewResult.violations?.length || 0,
-      });
-      skillCode = reviewResult.code;
-    } else if (!reviewResult.ok) {
-      logger.warn('[skillCreator] skill.reviewer error (non-fatal, proceeding)', { error: reviewResult.error });
-    }
-  } catch (e) {
-    logger.warn('[skillCreator] skill.reviewer not available (non-fatal)', { error: e.message });
   }
 
   // Write the skill file directly to ~/.thinkdrop/skills/<dirName>/index.cjs

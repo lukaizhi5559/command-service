@@ -5,7 +5,7 @@
  *
  * Factory skill that discovers, installs, and manages CLI-backed narrow agents.
  * Each generated agent is stored as a structured .md descriptor in DuckDB at
- * ~/.thinkdrop/agents.db and as a .md file under ~/.thinkdrop/agents/.
+ * ~/.thinkdrop/data/agents.duckdb and as a .md file under ~/.thinkdrop/agents/.
  *
  * Actions:
  *   discover       { cli }                   → checks which/version/help

@@ -1353,12 +1353,6 @@ async function run(args) {
       return { ok: false, skillName: name, error: `Unknown exec_type "${execType}". Must be "python", "node", "shell", "instruction", "project", or "recipe".` };
     }
 
-    // If the skill itself returned ok:false with a non-trivial error, report it as a potential
-    // API contract failure so skill.reviewer can write a learned api_rule.
-    if (!result.ok && result.error && !/missing.*secret|secret.*missing|not found|disabled/i.test(result.error)) {
-      _reportRuntimeFailure(name, result.error, resolvedPath).catch(() => {});
-    }
-
     if (result && result.ok) {
       logger.info(`[external.skill] Skill "${name}" completed successfully`);
     } else {
@@ -1367,21 +1361,8 @@ async function run(args) {
     return { ...result, skillName: name, execType };
   } catch (err) {
     logger.error(`[external.skill] Skill "${name}" failed: ${err.message}`);
-    // Report unexpected runtime exceptions to skill.reviewer for learning
-    _reportRuntimeFailure(name, err.message, resolvedPath).catch(() => {});
     return { ok: false, skillName: name, execType, error: err.message };
   }
-}
-
-// ── Fire-and-forget runtime failure reporter ──────────────────────────────────
-async function _reportRuntimeFailure(skillName, errorMessage, execPath) {
-  try {
-    const fs = require('fs');
-    const skillCode = fs.existsSync(execPath) ? fs.readFileSync(execPath, 'utf8') : '';
-    if (!skillCode) return;
-    const skillReviewer = require('./skill.reviewer.cjs');
-    await skillReviewer({ action: 'report_failure', skillName, errorMessage, skillCode });
-  } catch (_) { /* non-fatal */ }
 }
 
 module.exports = { run };

@@ -5,7 +5,7 @@
  *
  * Factory skill that discovers, builds, and manages Playwright-backed narrow agents.
  * Each generated agent is stored as a structured .md descriptor in DuckDB at
- * ~/.thinkdrop/agents.db and as a .md file under ~/.thinkdrop/agents/.
+ * ~/.thinkdrop/data/agents.duckdb and as a .md file under ~/.thinkdrop/agents/.
  *
  * These agents are purpose-built for specific web services (slack.agent,
  * discord.agent, notion.agent, etc.) that have no CLI. They understand the
@@ -8997,12 +8997,119 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
                   }
                 }
 
+                if (!_hydrated && _silentPreflightProbe) {
+                  // ── Hidden-headed retry ─────────────────────────────────────
+                  // Headless Chrome is bot-walled by Cloudflare on some services
+                  // (e.g. chatgpt.com serves a challenge shell that never
+                  // hydrates — hasMount=false, only challenge scripts present).
+                  // Escalate once to hidden headed mode: real Chrome in a 1x1
+                  // offscreen window — passes headless detection while staying
+                  // invisible to the user (same pattern as web.crawl/extract_url
+                  // hidden fallbacks for bot-walled sites).
+                  logger.warn(`[browser.agent] run: SPA hydration failed headless for ${agentId} — retrying once in hidden headed mode`);
+                  try {
+                    await callBrowserAct({ action: 'close', sessionId, headed: false }, 8000).catch(() => {});
+                    // Let Chrome fully release the profile before relaunching —
+                    // an immediate hidden launch races the SingletonLock and
+                    // silently falls back to a dead context.
+                    await new Promise(r => setTimeout(r, 800));
+                    const _retryUrl = (_curHref && /^https?:\/\//.test(_curHref)) ? _curHref : startUrl;
+                    const _retryNav = await callBrowserAct({
+                      action: 'navigate', sessionId, url: _retryUrl,
+                      timeoutMs: 30000, headed: true, hidden: true,
+                    }, 35000).catch(() => null);
+                    if (_retryNav?.ok !== false) {
+                      for (let _poll = 0; _poll < 10 && !_hydrated; _poll++) {
+                        await new Promise(r => setTimeout(r, 2000));
+                        try {
+                          const _pollRes = await callBrowserAct({
+                            action: 'evaluate',
+                            text: `(() => {
+                              const bodyText = (document.body && document.body.innerText) ? document.body.innerText.trim() : '';
+                              const linkCount = document.querySelectorAll('a').length;
+                              return JSON.stringify({ hasContent: bodyText.length > 0, linkCount, href: location.href, title: document.title || '', bodyLen: bodyText.length });
+                            })()`,
+                            sessionId,
+                            timeoutMs: 5000,
+                            headed: true,
+                            hidden: true,
+                          }, 8000);
+                          const _pollInfo = (_pollRes?.ok !== false)
+                            ? (typeof _pollRes?.result === 'object' && _pollRes?.result !== null)
+                              ? _pollRes.result
+                              : (() => { try { return JSON.parse(String(_pollRes?.result ?? '{}')); } catch (_) { return {}; } })()
+                            : {};
+                          logger.info(`[browser.agent] run: hidden hydration poll ${_poll + 1}/10 for ${agentId} — href=${_pollInfo.href || '?'} title="${(_pollInfo.title || '').slice(0, 60)}" bodyLen=${_pollInfo.bodyLen ?? 0} links=${_pollInfo.linkCount ?? 0}`);
+                          if (_pollInfo.hasContent || Number(_pollInfo.linkCount) > 0) {
+                            _hydrated = true;
+                            logger.info(`[browser.agent] run: SPA hydrated for ${agentId} in hidden headed mode after ${(_poll + 1) * 2}s — links=${_pollInfo.linkCount}`);
+                            // Re-evaluate page info so downstream auth/parking
+                            // checks see the hydrated page, same as the headless path.
+                            const _reEvalRes = await callBrowserAct({
+                              action: 'evaluate',
+                              text: `(() => {
+                                const title = document.title || '';
+                                const body = (document.body && document.body.innerText) ? document.body.innerText.slice(0, 800) : '';
+                                const links = document.querySelectorAll('a').length;
+                                const titleLower = title.toLowerCase();
+                                const titleIsLogin = /sign.?in|log.?in|\\blogin\\b|authenticate|verify|two.factor|2fa/.test(titleLower);
+                                const robotsMeta = document.querySelector('meta[name="robots"]');
+                                const robotsContent = (robotsMeta ? robotsMeta.getAttribute('content') : '').toLowerCase();
+                                const isNoIndex = robotsContent.includes('noindex');
+                                const hasUserGlobal = !!(window.__user || window.currentUser ||
+                                  (window.App && window.App.user) ||
+                                  (window.__INITIAL_STATE__ && window.__INITIAL_STATE__.user));
+                                const signInLinks = document.querySelectorAll(
+                                  'a[href*="login"], a[href*="signin"], a[href*="sign-in"], a[href*="signup"], a[href*="register"]'
+                                );
+                                const signInButtons = Array.from(
+                                  document.querySelectorAll('button, a[role="button"], [data-testid]')
+                                ).filter(el => {
+                                  const text = (el.textContent || el.innerText || '').toLowerCase().trim();
+                                  return /^(sign\\s*in|log\\s*in|sign\\s*up|register)\\b/.test(text);
+                                });
+                                const hasSignInButton = signInLinks.length > 0 || signInButtons.length > 0;
+                                return JSON.stringify({ title, body, links, titleIsLogin, isNoIndex, hasUserGlobal, hasSignInButton });
+                              })()`,
+                              sessionId,
+                              timeoutMs: 5000,
+                              headed: true,
+                              hidden: true,
+                            }, 8000).catch(() => null);
+                            _pageInfo = (_reEvalRes?.ok !== false)
+                              ? (typeof _reEvalRes?.result === 'object' && _reEvalRes.result !== null)
+                                ? _reEvalRes.result
+                                : (() => { try { return JSON.parse(String(_reEvalRes?.result ?? '{}')); } catch (_) { return {}; } })()
+                              : _pageInfo;
+                            // Keep the hidden session alive — the cookie sniff and
+                            // LLM auth check below still need the live page. The
+                            // existing _silentPreflightProbe exits close it.
+                            break;
+                          }
+                        } catch (_hiddenPollErr) {
+                          logger.warn(`[browser.agent] run: hidden headed hydration poll failed for ${agentId} — ${_hiddenPollErr.message}`);
+                          break;
+                        }
+                      }
+                    }
+                  } catch (_hiddenErr) {
+                    logger.warn(`[browser.agent] run: hidden headed retry failed for ${agentId}: ${_hiddenErr.message}`);
+                  }
+                  if (!_hydrated) {
+                    await callBrowserAct({ action: 'close', sessionId, headed: true, hidden: true }, 8000).catch(() => {});
+                  }
+                }
+
                 if (!_hydrated) {
-                  // SPA never hydrated within 20s — treat as crash
+                  // SPA never hydrated within 20s — treat as crash.
+                  // `unverifiable` marks this as "auth state unknown" (bot wall /
+                  // challenge shell) rather than a real login wall or real crash —
+                  // preflight surfaces a parked sign-in card instead of failing.
                   logger.warn(`[browser.agent] run: SPA did not hydrate within 20s for ${agentId} (href=${_curHref}) — flagging for retry`);
                   return {
                     ok: false,
                     chromeCrash: true,
+                    unverifiable: true,
                     agentId,
                     task,
                     error: 'Browser page blank after 20s SPA hydration wait, will retry once',

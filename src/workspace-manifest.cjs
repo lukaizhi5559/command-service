@@ -55,7 +55,7 @@ async function generateManifest() {
 
   // ── Databases ───────────────────────────────────────────────────────────────
   const dbPaths = [
-    { name: 'agents.db', path: path.join(THINKDROP_DIR, 'agents.db') },
+    { name: 'agents.duckdb', path: path.join(THINKDROP_DIR, 'data', 'agents.duckdb') },
     { name: 'user_memory.duckdb', path: path.resolve(__dirname, '../../thinkdrop-user-memory-service/data/user_memory.duckdb') },
     { name: 'conversation.duckdb', path: path.resolve(__dirname, '../../conversation-service/data/conversation.duckdb') },
   ];

@@ -3377,63 +3377,6 @@ function _collectAgentList() {
 }
 
 // ---------------------------------------------------------------------------
-// Browsing discovery — queries memory for frequently visited URLs not yet covered
-// ---------------------------------------------------------------------------
-async function _queryBrowsingDiscovery(knownHostnames) {
-  try {
-    const body = JSON.stringify({
-      version: 'mcp.v1', service: 'user-memory', action: 'memory.retrieve',
-      payload: { query: 'browser website url visit', topK: 200, type: 'screen_capture' },
-    });
-    const raw = await new Promise((resolve) => {
-      const req = http.request({
-        hostname: '127.0.0.1', port: USER_MEMORY_PORT,
-        path: '/memory.retrieve', method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
-        timeout: 8000,
-      }, (r) => {
-        let data = '';
-        r.on('data', c => { data += c; });
-        r.on('end', () => { try { resolve(JSON.parse(data)); } catch (_) { resolve(null); } });
-      });
-      req.on('error', () => resolve(null));
-      req.on('timeout', () => { req.destroy(); resolve(null); });
-      req.write(body);
-      req.end();
-    });
-
-    const results = raw?.data?.results || raw?.results || [];
-    const hostCount = new Map();
-    const cutoffTs = Date.now() - 30 * 24 * 60 * 60 * 1000; // last 30 days
-
-    for (const item of results) {
-      let meta;
-      try { meta = typeof item.metadata === 'string' ? JSON.parse(item.metadata) : item.metadata; } catch (_) { continue; }
-      const url = meta?.url;
-      if (!url || !/^https?:\/\//i.test(url)) continue;
-      if (item.created_at && new Date(item.created_at).getTime() < cutoffTs) continue;
-      let hostname;
-      try { hostname = new URL(url).hostname.replace(/^www\./, ''); } catch (_) { continue; }
-      // Skip already-known agents
-      if (knownHostnames.has(hostname)) continue;
-      // Skip trivial/utility domains
-      if (/^(localhost|127\.|192\.|google\.com$|bing\.com$|duckduckgo\.com$|accounts\.|login\.)/.test(hostname)) continue;
-      hostCount.set(hostname, (hostCount.get(hostname) || 0) + 1);
-    }
-
-    // Filter ≥ 3 visits, sort descending
-    return Array.from(hostCount.entries())
-      .filter(([, count]) => count >= 3)
-      .sort((a, b) => b[1] - a[1])
-      .slice(0, 8)
-      .map(([hostname, visits]) => ({ hostname, visits }));
-  } catch (err) {
-    logger.warn(`[explore.agent] browsing discovery error: ${err.message}`);
-    return [];
-  }
-}
-
-// ---------------------------------------------------------------------------
 // _postMaintenanceProgress — emit progress to Electron renderer via /scan.progress
 // ---------------------------------------------------------------------------
 function _postMaintenanceProgress(payload) {
@@ -3486,7 +3429,10 @@ async function _runMaintenanceScan(opts = {}) {
       try { return new URL(a.startUrl).hostname.replace(/^www\./, ''); } catch (_) { return null; }
     }).filter(Boolean));
 
-    const suggestions = await _queryBrowsingDiscovery(knownHostnames);
+    // Browsing discovery was removed (it queried migrated screen_capture rows
+    // via memory.retrieve — always empty). Re-implement via episodic.search if
+    // maintenance scan is ever re-enabled.
+    const suggestions = [];
     if (suggestions.length > 0) {
       logger.info(`[explore.agent] discovery found ${suggestions.length} candidate site(s): ${suggestions.map(s => s.hostname).join(', ')}`);
       _postMaintenanceProgress({ type: 'maintenance_scan_discovery', suggestions });

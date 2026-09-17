@@ -205,82 +205,10 @@ async function generateValidateAgentSpec(agentId, agentSection, prompt) {
   return callLLM(VALIDATE_AGENT_SYS, userCtx, 90000);
 }
 
-// ── Detect service names from a free-text project description ──────────────────
-const PROMPT_SERVICE_DETECTORS = [
-  { pattern: /clicksend/i,                       service: 'clicksend' },
-  { pattern: /twilio/i,                          service: 'twilio' },
-  { pattern: /stripe/i,                          service: 'stripe' },
-  { pattern: /sendgrid/i,                        service: 'sendgrid' },
-  { pattern: /mailgun/i,                         service: 'mailgun' },
-  { pattern: /gmail|google mail|googleapis/i,    service: 'gmail' },
-  { pattern: /github/i,                          service: 'github' },
-  { pattern: /slack/i,                           service: 'slack' },
-  { pattern: /notion/i,                          service: 'notion' },
-  { pattern: /airtable/i,                        service: 'airtable' },
-  { pattern: /hubspot/i,                         service: 'hubspot' },
-  { pattern: /salesforce/i,                      service: 'salesforce' },
-  { pattern: /openai/i,                          service: 'openai' },
-  { pattern: /anthropic/i,                       service: 'anthropic' },
-  { pattern: /dropbox/i,                         service: 'dropbox' },
-  { pattern: /discord/i,                         service: 'discord' },
-  { pattern: /spotify/i,                         service: 'spotify' },
-  { pattern: /zoom/i,                            service: 'zoom' },
-  { pattern: /jira|atlassian/i,                  service: 'atlassian' },
-  { pattern: /aws |amazon web|s3\b|lambda|ec2/i, service: 'aws' },
-  { pattern: /azure/i,                           service: 'azure' },
-  { pattern: /vonage|messagebird/i,              service: 'vonage' },
-  { pattern: /plaid/i,                           service: 'plaid' },
-  { pattern: /shopify/i,                         service: 'shopify' },
-  { pattern: /sms|text message/i,                service: 'clicksend' },
-];
-
-function detectServicesFromPrompt(text) {
-  const found = new Set();
-  for (const { pattern, service } of PROMPT_SERVICE_DETECTORS) {
-    if (pattern.test(text)) found.add(service);
-  }
-  return [...found];
-}
-
-async function fetchApiRulesForPrompt(promptText) {
-  const services = detectServicesFromPrompt(promptText);
-  if (!services.length) return '';
-  try {
-    const http = require('http');
-    const MEM_PORT = parseInt(process.env.MEMORY_SERVICE_PORT || '3001', 10);
-    const MEM_API_KEY = process.env.MCP_USER_MEMORY_API_KEY || process.env.USER_MEMORY_API_KEY || process.env.MCP_API_KEY || '';
-    const body = JSON.stringify({ payload: { services }, requestId: 'creator-agent-' + Date.now() });
-    const raw = await new Promise((resolve) => {
-      const req = http.request({
-        hostname: '127.0.0.1', port: MEM_PORT, path: '/api_rule.search', method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body),
-          ...(MEM_API_KEY ? { 'Authorization': `Bearer ${MEM_API_KEY}` } : {}) },
-        timeout: 5000,
-      }, (res) => { let d = ''; res.on('data', c => { d += c; }); res.on('end', () => resolve(d)); });
-      req.on('error', () => resolve(''));
-      req.on('timeout', () => { req.destroy(); resolve(''); });
-      req.write(body); req.end();
-    });
-    const parsed = raw ? JSON.parse(raw) : null;
-    const results = parsed?.payload?.results || [];
-    if (!results.length) return '';
-    const lines = results.map(r => `- [${r.service}:${r.ruleType}] ${r.ruleText}`);
-    return `\n\nKNOWN API CONSTRAINTS (from api_rules DB — these are hard requirements, not suggestions):\n${lines.join('\n')}`;
-  } catch (_) {
-    return '';
-  }
-}
-
 async function phase2(id, prompt, bddTests) {
   logger.info('[creator.agent] Phase 2: agent plan', { id });
 
-  // Inject api_rules constraints for detected services into the plan context
-  const apiConstraints = await fetchApiRulesForPrompt(prompt).catch(() => '');
-  const ctx = 'Project:\n' + prompt + (apiConstraints ? apiConstraints : '') + '\n\nAcceptance tests:\n' + bddTests;
-
-  if (apiConstraints) {
-    logger.info('[creator.agent] Phase 2: injecting api_rules constraints into plan prompt', { id });
-  }
+  const ctx = 'Project:\n' + prompt + '\n\nAcceptance tests:\n' + bddTests;
 
   const [planMd, agentsMd] = await Promise.all([
     callLLM(P2_PLAN_SYS, ctx, 120000),

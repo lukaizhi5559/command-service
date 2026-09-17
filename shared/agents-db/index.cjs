@@ -2,7 +2,7 @@ const path = require('path');
 const os = require('os');
 const fs = require('fs');
 
-const AGENTS_DB_PATH = path.join(os.homedir(), '.thinkdrop', 'agents.db');
+const AGENTS_DB_PATH = path.join(os.homedir(), '.thinkdrop', 'data', 'agents.duckdb');
 const AGENTS_DIR = path.join(os.homedir(), '.thinkdrop', 'agents');
 
 const logger = {

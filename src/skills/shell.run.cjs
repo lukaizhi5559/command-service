@@ -1347,7 +1347,13 @@ function validate(args) {
     } else {
       for (const pattern of BLOCKED_ARG_PATTERNS) {
         if (pattern.test(arg)) {
-          return { ok: false, error: `Blocked pattern in argv: "${arg}"` };
+          return {
+            ok: false,
+            error:
+              `Blocked pattern in argv: "${arg}" — spawn() does not expand shell ` +
+              `syntax ($(), backticks). For command substitution or pipes use ` +
+              `cmd:"bash", argv:["-c","<command>"].`
+          };
         }
       }
     }
@@ -1380,6 +1386,49 @@ function validate(args) {
 // ---------------------------------------------------------------------------
 // Execution
 // ---------------------------------------------------------------------------
+
+// Detect commands that capture the screen — direct `screencapture` or a
+// bash/sh/zsh -c script containing screencapture.
+function _involvesScreencapture(baseName, argv) {
+  if (process.platform !== 'darwin') return false;
+  if (baseName === 'screencapture') return true;
+  const isShell = ['bash', 'sh', 'zsh'].includes(baseName);
+  return isShell && Array.isArray(argv) && argv[0] === '-c'
+    && typeof argv[1] === 'string' && /\bscreencapture\b/.test(argv[1]);
+}
+
+// Flash-hide ThinkDrop's own overlay UI around a screenshot so captures look
+// like clean native macOS screenshots (same pattern as app.agent._withFlash).
+// If the overlay control server is unreachable the capture still proceeds —
+// it just includes whatever overlay UI is on screen.
+async function _withScreenshotFlash(fn) {
+  const http = require('http');
+  const port = parseInt(process.env.OVERLAY_CONTROL_PORT || '3010', 10);
+  const post = (urlPath, timeoutMs) => new Promise((resolve) => {
+    let done = false;
+    const finish = (ok) => { if (!done) { done = true; resolve(ok); } };
+    const req = http.request(
+      { hostname: '127.0.0.1', port, path: urlPath, method: 'POST', timeout: timeoutMs },
+      () => finish(true)
+    );
+    req.on('error', () => finish(false));
+    req.on('timeout', () => { req.destroy(); finish(false); });
+    req.end();
+  });
+
+  const flashOk = await post('/overlay/flash', 800);
+  if (!flashOk) {
+    logger.warn('[shell.run] /overlay/flash unreachable — screenshot will include any visible overlay UI');
+  } else {
+    await new Promise(r => setTimeout(r, 250)); // settle so overlay is fully hidden
+  }
+
+  try {
+    return await fn();
+  } finally {
+    if (flashOk) await post('/overlay/unflash', 800);
+  }
+}
 
 function runProcess(cmd, argv, options, onProgress) {
   return new Promise((resolve) => {
@@ -1626,13 +1675,18 @@ async function shellRun(args) {
     });
   }
 
-  const result = await runProcess(cmd, runArgv, {
+  const _runStep = () => runProcess(cmd, runArgv, {
     cwd,
     // OAuth vars are the lowest priority — explicit env arg and process.env override them
     env: { ...oauthEnv, ...env },
     timeoutMs: Math.min(timeoutMs, MAX_TIMEOUT_MS),
     stdin,
   }, _progressCallback || null);
+
+  // Hide ThinkDrop's own UI while screencapture runs (clean screenshots).
+  const result = _involvesScreencapture(baseName, runArgv)
+    ? await _withScreenshotFlash(_runStep)
+    : await _runStep();
 
   const verifiedResult = _verifyExpectedOutputs(result, baseName, runArgv, cwd);
 
@@ -1708,12 +1762,15 @@ async function shellRun(args) {
     } catch (_) {}
 
     const freshEnv   = await loadOAuthEnv();
-    const retryResult = await runProcess(cmd, runArgv, {
+    const _retryStep = () => runProcess(cmd, runArgv, {
       cwd,
       env: { ...freshEnv, ...env },
       timeoutMs: Math.min(timeoutMs, MAX_TIMEOUT_MS),
       stdin,
     });
+    const retryResult = _involvesScreencapture(baseName, runArgv)
+      ? await _withScreenshotFlash(_retryStep)
+      : await _retryStep();
     const verifiedRetryResult = _verifyExpectedOutputs(retryResult, baseName, runArgv, cwd);
     logger.info('shell.run retry completed', {
       cmd, exitCode: verifiedRetryResult.exitCode, executionTime: verifiedRetryResult.executionTime, ok: verifiedRetryResult.ok,

@@ -2989,6 +2989,17 @@ async function browserAct(args) {
       }
 
       // ── CLI fallback path (playwright-cli subprocess) ───────────────────
+      // Hidden sessions are engine-only: the CLI path has no hidden flag, so a
+      // fallback would `open --headed` — a VISIBLE window for a silent probe.
+      // Worse, evaluate(hidden:true) forces the engine path, so the session
+      // would split across two browser instances and never see the real page.
+      if (hidden) {
+        return {
+          ok: false, action, sessionId,
+          error: 'hidden headed engine launch failed — CLI fallback would open a visible window',
+          executionTime: Date.now() - start,
+        };
+      }
       const navTimeout = Math.max(timeoutMs, 30000);
       let alreadyOpen = openSessions.has(sessionId);
       if (!alreadyOpen) {
@@ -3108,10 +3119,10 @@ async function browserAct(args) {
 
     case 'close': {
       openSessions.delete(sessionId);
-      // Close engine session if active
-      if (engine.isSessionActive(sessionId)) {
-        await engine.closeSession(sessionId);
-      }
+      // Always close the engine session — closeSession no-ops when absent.
+      // Skipping it when isSessionActive() is false leaves a stale _sessions
+      // entry whose dead context engine.launch() would early-return forever.
+      await engine.closeSession(sessionId);
       // Also try CLI close (in case CLI daemon is running)
       const res = await cliRun([...S, 'close'], timeoutMs).catch(() => ({ ok: false }));
       for (const k of snapshotCache.keys()) { if (k.startsWith(`${sessionId}:`)) snapshotCache.delete(k); }
@@ -6094,6 +6105,16 @@ If no videos found, return []. Do not explain, only output the JSON array.`;
         } catch (evalErr) {
           logger.warn(`[browser.act] evaluate (engine) failed: ${evalErr.message} — falling back to CLI`);
         }
+      }
+
+      // Hidden sessions are engine-only — the CLI fallback spawns a visible
+      // headed browser for session-less evals, and can't see the hidden page.
+      if (hidden) {
+        return {
+          ok: false, action, sessionId,
+          error: 'hidden engine page unavailable — refusing visible CLI fallback',
+          executionTime: Date.now() - start,
+        };
       }
 
       // ── CLI fallback ──

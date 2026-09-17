@@ -1006,6 +1006,11 @@ class CommandServiceMCPServer {
             res.end(JSON.stringify({ success: true, data: { ok: false, error: err.message } }));
           } finally {
             _unregister();
+            // Detach the socket/request listeners — keep-alive sockets are reused
+            // across requests, so without this each command.automate call adds a
+            // permanent 'close' listener to the shared socket (MaxListenersExceeded).
+            try { req.socket?.removeListener('close', onClose); } catch (_) {}
+            try { req.removeListener('aborted', onClose); } catch (_) {}
           }
         });
         return;

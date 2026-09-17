@@ -156,7 +156,16 @@ function _attachDialogHandler(page) {
 
 async function launch(sessionId, opts = {}) {
   const existing = _sessions.get(sessionId);
-  if (existing?.context) return existing.context;
+  if (existing?.context) {
+    // Validate the cached context still has a live page — a session whose pages
+    // all died (crash, external close) must not be handed back: callers would
+    // get a null page and silently fall through to the CLI path.
+    try {
+      if (existing.context.pages().length > 0) return existing.context;
+    } catch (_) { /* context dead — fall through to relaunch */ }
+    logger.warn(`[browser-engine] session=${sessionId} has a dead context (0 live pages) — relaunching`);
+    _sessions.delete(sessionId);
+  }
 
   const headed = opts.headed !== false;
   const hidden = !!opts.hidden; // headed but window sized 1x1 offscreen — bot-wall bypass without visible window

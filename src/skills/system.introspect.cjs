@@ -20,10 +20,9 @@ const path = require('path');
 const os = require('os');
 const fs = require('fs');
 const logger = require('../logger.cjs');
-const { withDb } = require('@thinkdrop/agents-db');
+const { withDb, AGENTS_DB_PATH } = require('@thinkdrop/agents-db');
 
 const THINKDROP_DIR = path.join(os.homedir(), '.thinkdrop');
-const AGENTS_DB_PATH = path.join(THINKDROP_DIR, 'agents.db');
 const SKILLS_DIR = path.join(THINKDROP_DIR, 'skills');
 const AGENTS_DIR = path.join(THINKDROP_DIR, 'agents');
 
@@ -139,15 +138,15 @@ async function queryDatabases() {
           const countRows = await db.all(`SELECT COUNT(*) as cnt FROM "${name}"`);
           tableDetails.push({ name, rowCount: countRows[0]?.cnt ?? 0 });
         }
-        return { name: 'agents.db', exists: true, tables: tableDetails };
+        return { name: 'agents.duckdb', exists: true, tables: tableDetails };
       });
       results.push(agentsResult);
     } catch (e) {
       logger.warn(`[system.introspect] Failed to query agents.db: ${e.message}`);
-      results.push({ name: 'agents.db', exists: true, tables: [], error: e.message });
+      results.push({ name: 'agents.duckdb', exists: true, tables: [], error: e.message });
     }
   } else {
-    results.push({ name: 'agents.db', exists: false, tables: [] });
+    results.push({ name: 'agents.duckdb', exists: false, tables: [] });
   }
 
   // Handle other databases using openDb/closeDb
