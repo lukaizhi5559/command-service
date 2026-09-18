@@ -14918,6 +14918,55 @@ Output ONLY valid JSON: {${_matchedSkill.params.map(p => `"${p.name}": "<extract
               };
             };
 
+            // Helper: wait for a streamed AI response to finish on chat UIs.
+            // Chat apps (ChatGPT, Grok, Claude) stream answers after submit —
+            // capturing ~1.5s post-submit returns only the prompt echo / nav
+            // text. Poll body innerText length until it grows past the
+            // post-submit baseline and stays stable ~3.5s (max 90s), then
+            // return the final page text.
+            const _awaitAiResponse = async () => {
+              const _lenExpr = '(document.body && document.body.innerText ? document.body.innerText.length : 0)';
+              const _baseRes = await browserAct({ action: 'evaluate', text: _lenExpr, sessionId, headed, timeoutMs: 5000 }).catch(() => null);
+              const _baseline = Number(_baseRes?.result ?? 0) || 0;
+              let _prev = _baseline;
+              let _lastChange = Date.now();
+              const _waitStart = Date.now();
+              const _deadline = _waitStart + 90000;
+              let _grew = false;
+              while (Date.now() < _deadline) {
+                await new Promise(r => setTimeout(r, 500));
+                const _lenRes = await browserAct({ action: 'evaluate', text: _lenExpr, sessionId, headed, timeoutMs: 5000 }).catch(() => null);
+                const _cur = Number(_lenRes?.result ?? 0) || 0;
+                if (_cur !== _prev) { _lastChange = Date.now(); _prev = _cur; }
+                if (_cur > _baseline + 20) _grew = true;
+                // Response grew and is now stable — streaming finished
+                if (_grew && (Date.now() - _lastChange) > 3500) break;
+                // No growth for 8s — no streaming response (or it already
+                // completed before the baseline); bail and capture anyway
+                if (!_grew && (Date.now() - _waitStart) > 8000) break;
+              }
+              const _txtRes = await browserAct({ action: 'getPageText', sessionId, headed, timeoutMs: 15000 }).catch(() => null);
+              return _txtRes?.ok ? String(_txtRes.result || '') : '';
+            };
+
+            // Helper: on chat-compose submissions, wait for the streamed reply
+            // and return the real page content as the result instead of the
+            // "Completed via ..." meta string (which downstream quality gates
+            // read as the agent's answer).
+            const _successWithResponseCapture = async (_method, _vResult) => {
+              if (_isChatCompose) {
+                const _finalText = await _awaitAiResponse();
+                if (_finalText) {
+                  logger.info(`[playwright.agent] Tier 1.7: AI response captured after stream settle (${_finalText.length} chars)`);
+                  const _r = _returnSuccess(_method, _vResult);
+                  _r.result = _finalText;
+                  _r.note = `Completed via Tier 1.7 fast-path (${_method})`;
+                  return _r;
+                }
+              }
+              return _returnSuccess(_method, _vResult);
+            };
+
             let _submitHandled = false;
 
             // ── Layer 1: Chat compose (contenteditable div) → press Enter ────────
@@ -14931,7 +14980,7 @@ Output ONLY valid JSON: {${_matchedSkill.params.map(p => `"${p.name}": "<extract
               if (_enterRes.ok) {
                 const _vResult = await _verifySubmit('Enter');
                 if (_vResult.textOnPage || _vResult.urlChanged) {
-                  return _returnSuccess('type→Enter→verify', _vResult);
+                  return await _successWithResponseCapture('type→Enter→verify', _vResult);
                 }
                 logger.info(`[playwright.agent] Tier 1.7: Enter did not produce verifiable result — trying positional button search`);
               }
@@ -14963,7 +15012,7 @@ Output ONLY valid JSON: {${_matchedSkill.params.map(p => `"${p.name}": "<extract
                 if (_clickRes.ok) {
                   const _vResult = await _verifySubmit('type→click→verify');
                   if (_vResult.textOnPage || _vResult.urlChanged) {
-                    return _returnSuccess('type→click(DOM)→verify', _vResult);
+                    return await _successWithResponseCapture('type→click(DOM)→verify', _vResult);
                   }
                   logger.warn(`[playwright.agent] Tier 1.7: DOM button clicked but no verification — trying positional`);
                 } else {
@@ -15012,7 +15061,7 @@ Output ONLY valid JSON: {${_matchedSkill.params.map(p => `"${p.name}": "<extract
                 if (_clickRes.ok) {
                   const _vResult = await _verifySubmit('type→click→verify');
                   if (_vResult.textOnPage || _vResult.urlChanged) {
-                    return _returnSuccess('type→click(positional)→verify', _vResult);
+                    return await _successWithResponseCapture('type→click(positional)→verify', _vResult);
                   }
                   logger.warn(`[playwright.agent] Tier 1.7: positional button clicked but no verification — trying Enter fallback`);
                 } else {
@@ -15032,7 +15081,7 @@ Output ONLY valid JSON: {${_matchedSkill.params.map(p => `"${p.name}": "<extract
               if (_enterRes.ok) {
                 const _vResult = await _verifySubmit('Enter');
                 if (_vResult.textOnPage || _vResult.urlChanged) {
-                  return _returnSuccess('type→Enter(fallback)→verify', _vResult);
+                  return await _successWithResponseCapture('type→Enter(fallback)→verify', _vResult);
                 }
               }
               logger.warn(`[playwright.agent] Tier 1.7: Enter fallback did not produce verifiable result — falling through to Tier 3`);

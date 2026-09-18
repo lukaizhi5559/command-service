@@ -263,23 +263,32 @@ const _AUTH_COOKIE_NAME_RE = /(sid|sess|session|token|jwt|auth|login|user|acct|a
 // Cookies that look auth-like but are NOT authentication (pre-auth / analytics /
 // prefs). Excluded even when their name matches an auth stem.
 const _AUTH_COOKIE_EXCLUDE_RE = /(csrf|xsrf|locale|lang|theme|mode|guest|anonymous|_ga|_gid|_gat|ab[_-]?test|opt[_-]?out|consent|cookie[_-]?consent|pref|currency|cart|wishlist|recently[_-]?viewed|server|route|sticky|hsession|gdpr|ccpa|euconsent|visitor|anon|feature[_-]?flag)/i;
+// Infra/bot-protection/payment/analytics cookies — httpOnly but NOT sessions.
+// Cloudflare bot-clearance, Stripe fraud signals, Datadog/DataDome, device/fp
+// ids. These false-positive "auth cookies present" for logged-out sessions.
+const _INFRA_COOKIE_RE = /^(cf_clearance|__cf_bm|__cf_obm|__cflb|_cfuvid|__cf_waiting_room|__stripe_(sid|mid)|m|_dd_s|datadome|ak_bmsc|_abck|bm_sz|grok_device_id|x-anonuserid|x-challenge|x-signature|_gcl_au|__cuid|i18nextlng|precise_location_permission|g_state|OptanonConsent|OptanonAlertBoxClosed|mp_[a-f0-9]+_mixpanel)$/i;
 // Strong session indicators — a cookie counts as an auth signal only if it is
 // non-empty AND (httpOnly === true OR its name matches this pattern).
-const _STRONG_SESSION_NAME_RE = /(sid|sess|session|token|jwt|auth)/i;
+const _STRONG_SESSION_NAME_RE = /(sid|sess|session|token|jwt|auth|sso)/i;
 
 // Pure classifier — unit-testable without a browser.
 // cookies: array of { name, value, domain, httpOnly, ... } (CDP/Playwright shape)
 // targetDomain: e.g. 'slack.com' (leading 'www.' stripped by caller)
-// Returns: { authed: boolean, cookies: string[], reason: string }
+// Returns: { authed: boolean, cookies: string[], strongCookies: string[], reason: string }
+//   cookies:       all auth-signal cookies (weak httpOnly + strong-name)
+//   strongCookies: subset whose names carry a session-token stem — the
+//                  trustworthy tier (e.g. __Secure-next-auth.session-token.0)
 function _classifyAuthCookies(cookies, targetDomain) {
-  if (!Array.isArray(cookies) || !targetDomain) return { authed: false, cookies: [], reason: 'no-input' };
+  if (!Array.isArray(cookies) || !targetDomain) return { authed: false, cookies: [], strongCookies: [], reason: 'no-input' };
   const target = targetDomain.toLowerCase().replace(/^www\./, '');
   const matched = [];
+  const strong = [];
   for (const c of cookies) {
     if (!c || typeof c.name !== 'string') continue;
     const name = c.name;
     if (!c.value) continue;                       // empty value → not a live session
     if (_AUTH_COOKIE_EXCLUDE_RE.test(name)) continue;
+    if (_INFRA_COOKIE_RE.test(name)) continue;
     // Domain filter: cookie domain '.slack.com' matches target 'slack.com' and
     // any subdomain; exact 'slack.com' also matches. Subdomain-only cookies
     // (e.g. domain='app.slack.com' when target='slack.com') are still relevant
@@ -299,12 +308,14 @@ function _classifyAuthCookies(cookies, targetDomain) {
     // analytics/prefs cookies that happen to be on the target domain.
     if (isHttpOnly) {
       matched.push(name);
+      if (isStrongName) strong.push(name);
     } else if (isStrongName && _AUTH_COOKIE_NAME_RE.test(name)) {
       matched.push(name);
+      strong.push(name);
     }
   }
-  if (matched.length === 0) return { authed: false, cookies: [], reason: 'no-auth-cookies' };
-  return { authed: true, cookies: matched, reason: `auth-cookies:${matched.join(',')}` };
+  if (matched.length === 0) return { authed: false, cookies: [], strongCookies: [], reason: 'no-auth-cookies' };
+  return { authed: true, cookies: matched, strongCookies: strong, reason: `auth-cookies:${matched.join(',')}` };
 }
 
 // Per-page CDP session cache for cookie sniffing (WeakMap so it GCs with the page).
@@ -7279,8 +7290,37 @@ If no videos found, return []. Do not explain, only output the JSON array.`;
             return { ok: false, action, sessionId, error: 'Browser rendered blank page during auth', authResolved: false, executionTime: Date.now() - start };
           }
           if (_currentUrl === _initialAuthUrl) {
-            logger.info(`[browser.act] waitForAuth: done-without-action circuit breaker — URL unchanged (${_currentUrl}), no creds filled, skipping OAuth fallback and poll loop for session=${sessionId}`);
-            return { ok: true, action, sessionId, authResolved: true, authCircuitBreaker: true, executionTime: Date.now() - start };
+            // Verify the login wall is actually gone before soft-succeeding —
+            // "no form to fill" also matches a logged-out landing page whose
+            // only affordance is a "Sign in" link (e.g. grok.com). If a wall is
+            // still present, fall through to the OAuth fallback + poll loop so
+            // needs_login fires and the user can sign in.
+            let _wallGone = null; // null = couldn't check
+            try {
+              const _dwRes = await _authEval(`(() => {
+                const title = (document.title || '').toLowerCase();
+                const titleIsLogin = /sign.?in|log.?in|\\blogin\\b|authenticate|verify|two.factor|2fa/.test(title);
+                const hasUserGlobal = !!(window.__user || window.currentUser || (window.App && window.App.user) || (window.__INITIAL_STATE__ && window.__INITIAL_STATE__.user));
+                const signInLinks = document.querySelectorAll('a[href*="login"], a[href*="signin"], a[href*="sign-in"], a[href*="signup"], a[href*="register"]');
+                const signInButtons = Array.from(document.querySelectorAll('button, a[role="button"]')).filter(el => /^(sign\\s*in|log\\s*in|sign\\s*up|register)\\b/.test((el.textContent || '').toLowerCase().trim()));
+                return JSON.stringify({ titleIsLogin, hasUserGlobal, hasSignInButton: signInLinks.length > 0 || signInButtons.length > 0, hasPasswordField: !!document.querySelector('input[type="password"]') });
+              })()`, 5000);
+              const _dwStr = String(_dwRes.val || '').trim();
+              if (_dwStr) {
+                const _dw = JSON.parse(_dwStr);
+                _wallGone = _dw.hasUserGlobal || (!_dw.titleIsLogin && !_dw.hasSignInButton && !_dw.hasPasswordField);
+              }
+            } catch (_) {}
+            if (_wallGone === true) {
+              logger.info(`[browser.act] waitForAuth: done-without-action circuit breaker — URL unchanged (${_currentUrl}), no creds filled, no login wall — skipping OAuth fallback and poll loop for session=${sessionId}`);
+              return { ok: true, action, sessionId, authResolved: true, authCircuitBreaker: true, executionTime: Date.now() - start };
+            }
+            if (_wallGone === null) {
+              // Couldn't verify — preserve legacy soft success
+              logger.info(`[browser.act] waitForAuth: done-without-action circuit breaker — URL unchanged (${_currentUrl}), wall check failed, treating as resolved for session=${sessionId}`);
+              return { ok: true, action, sessionId, authResolved: true, authCircuitBreaker: true, executionTime: Date.now() - start };
+            }
+            logger.info(`[browser.act] waitForAuth: done-without-action but login wall still present on ${sessionId} — falling through to sign-in wait`);
           }
           logger.info(`[browser.act] waitForAuth: done-without-action but URL changed (${_initialAuthUrl} → ${_currentUrl}), proceeding to OAuth fallback for session=${sessionId}`);
         }
@@ -7321,6 +7361,7 @@ If no videos found, return []. Do not explain, only output the JSON array.`;
       // then keep polling until the user signs in — no second request needed.
       let authWallDetections = 0;
       let loginNotificationSent = false;
+      let _manualConfirmCount = 0;
 
       while (Date.now() < deadline) {
         await new Promise(r2 => setTimeout(r2, pollInterval));
@@ -7331,11 +7372,62 @@ If no videos found, return []. Do not explain, only output the JSON array.`;
           return { ok: false, action, sessionId, authTimedOut: true, error: 'Session closed (cancelled)', executionTime: Date.now() - start };
         }
 
-        // Manual auth completion — user clicked "I have signed in" button in UI
+        // Manual auth completion — user clicked "I have signed in" button in UI.
+        // Don't trust the click blindly: reload the service page and verify the
+        // auth wall actually cleared before declaring success. A bare click used
+        // to write authVerified → authed_at, which poisoned the 24h preflight
+        // cache when the user hadn't actually finished signing in.
         if (global.__manualAuthCompleteSessions && global.__manualAuthCompleteSessions.has(sessionId)) {
           global.__manualAuthCompleteSessions.delete(sessionId);
-          logger.info(`[browser.act] waitForAuth: manual auth complete for session=${sessionId} — returning success`);
-          return { ok: true, action, sessionId, authResolved: true, manualConfirm: true, executionTime: Date.now() - start };
+          _manualConfirmCount++;
+          let _verified = false;
+          let _checksRan = false;
+          try {
+            // Reload the service URL so post-sign-in state renders — the user may
+            // have completed OAuth in a popup while the main page stayed stale.
+            if (url) { await _authGoto(url, 15000); await new Promise(r2 => setTimeout(r2, 2500)); }
+            // Signal 1: page meta — is the login wall gone?
+            const _mcRes = await _authEval(`(() => {
+              const title = (document.title || '').toLowerCase();
+              const titleIsLogin = /sign.?in|log.?in|\\blogin\\b|authenticate|verify|two.factor|2fa/.test(title);
+              const hasUserGlobal = !!(window.__user || window.currentUser ||
+                (window.App && window.App.user) || (window.__INITIAL_STATE__ && window.__INITIAL_STATE__.user));
+              const signInLinks = document.querySelectorAll('a[href*="login"], a[href*="signin"], a[href*="sign-in"], a[href*="signup"], a[href*="register"]');
+              const signInButtons = Array.from(document.querySelectorAll('button, a[role="button"]')).filter(el => /^(sign\\s*in|log\\s*in|sign\\s*up|register)\\b/.test((el.textContent || '').toLowerCase().trim()));
+              return JSON.stringify({ titleIsLogin, hasUserGlobal, hasSignInButton: signInLinks.length > 0 || signInButtons.length > 0, hasPasswordField: !!document.querySelector('input[type="password"]') });
+            })()`, 5000);
+            const _mcStr = String(_mcRes.val || '').trim();
+            if (_mcStr) {
+              _checksRan = true;
+              const _mc = JSON.parse(_mcStr);
+              if (_mc.hasUserGlobal || (!_mc.titleIsLogin && !_mc.hasSignInButton && !_mc.hasPasswordField)) _verified = true;
+            }
+            // Signal 2: new auth cookies vs the pre-login baseline
+            if (!_verified && _cookieSniffDomain && _ePage && _authCookieBaseline) {
+              const _sniff = await _sniffAuthCookies(engine, sessionId, _ePage, _cookieSniffDomain);
+              if (_sniff.ok) {
+                _checksRan = true;
+                if (_sniff.authed) {
+                  const _newCookies = _sniff.cookies.filter(n => !_authCookieBaseline.has(n));
+                  if (_newCookies.length > 0 || (_sniff.strongCookies || []).length > 0) _verified = true;
+                }
+              }
+            }
+          } catch (_mcErr) {
+            logger.debug(`[browser.act] waitForAuth: manual-confirm verification failed (non-fatal): ${_mcErr.message}`);
+          }
+          if (_verified) {
+            logger.info(`[browser.act] waitForAuth: manual auth complete verified for session=${sessionId} — returning success`);
+            return { ok: true, action, sessionId, authResolved: true, manualConfirm: true, detectedVia: 'manual_confirm_verified', executionTime: Date.now() - start };
+          }
+          if (!_checksRan || _manualConfirmCount >= 2) {
+            // Escape hatch: verification couldn't run (eval/cookie errors), or the
+            // user insists with a second click while detection still sees a wall —
+            // accept rather than trapping them behind a possibly-blind check.
+            logger.warn(`[browser.act] waitForAuth: manual auth complete accepted without verification (checksRan=${_checksRan}, confirms=${_manualConfirmCount}) for session=${sessionId}`);
+            return { ok: true, action, sessionId, authResolved: true, manualConfirm: true, executionTime: Date.now() - start };
+          }
+          logger.warn(`[browser.act] waitForAuth: manual auth confirmed but auth wall persists — continuing to poll session=${sessionId}`);
         }
 
         try {

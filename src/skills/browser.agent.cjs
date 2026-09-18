@@ -186,8 +186,61 @@ function _setCachedAuthCheck(agentId, authNeeded) {
 
 // _detectAuthViaLLM is imported from skill-helpers/auth-check.cjs (see top of file).
 // Wrapper to pass the local logger for consistent log prefixes.
-async function _detectAuthViaLLM(title, body, agentId) {
-  return await _detectAuthViaLLMImpl(title, body, agentId, logger);
+async function _detectAuthViaLLM(title, body, agentId, evidence) {
+  return await _detectAuthViaLLMImpl(title, body, agentId, logger, evidence);
+}
+
+// ---------------------------------------------------------------------------
+// Identity-endpoint probe — the definitive auth signal.
+// Instead of inferring auth from rendered page text, fetch the service's own
+// authenticated API endpoint from inside the page (credentials included): the
+// server itself answers whether the session is live. A 2xx JSON body with
+// identity fields means logged-in; 401/403 means logged out; anything else is
+// inconclusive and the caller falls through to cookie/LLM signals.
+// ---------------------------------------------------------------------------
+
+// Per-service identity endpoints (checked first — cheap, decisive).
+const _AUTH_ENDPOINT_MAP = {
+  'chatgpt.com': ['/backend-api/me', '/backend-api/accounts/check/v4-2023-04-27'],
+  'openai.com': ['/backend-api/me'],
+};
+// Generic candidates for unmapped services.
+const _GENERIC_AUTH_ENDPOINTS = ['/api/me', '/api/user', '/api/session', '/auth/session', '/api/v1/me', '/me'];
+
+// Runs INSIDE the page via evaluate — must be fully self-contained (no closures).
+// eslint-disable-next-line no-unused-vars
+function _authEndpointProbe(paths) {
+  const pick = (j) => {
+    if (!j || typeof j !== 'object') return null;
+    for (const [k, v] of Object.entries(j)) {
+      if (v != null && typeof v !== 'object' && /^(email|sub|username|name|user_?id|id|picture|account_?id|phone)$/i.test(k)) return k;
+    }
+    if (j.user && typeof j.user === 'object' && Object.keys(j.user).length > 0) return 'user';
+    if (j.account && typeof j.account === 'object' && Object.keys(j.account).length > 0) return 'account';
+    return null;
+  };
+  return (async () => {
+    for (const p of paths) {
+      try {
+        const ctrl = new AbortController();
+        const t = setTimeout(() => ctrl.abort(), 4000);
+        const r = await fetch(p, { credentials: 'include', headers: { 'Accept': 'application/json' }, signal: ctrl.signal });
+        clearTimeout(t);
+        if (r.status === 404 || r.status === 405) continue;
+        if (r.status === 401 || r.status === 403) {
+          return JSON.stringify({ verdict: 'required', path: p, status: r.status });
+        }
+        const ct = (r.headers.get('content-type') || '').toLowerCase();
+        if (r.ok && ct.includes('json')) {
+          const j = await r.json().catch(() => null);
+          const key = pick(j);
+          if (key) return JSON.stringify({ verdict: 'authed', path: p, status: r.status, key });
+        }
+        // 2xx non-JSON or JSON without identity fields — inconclusive, try next
+      } catch (_) { /* network/abort — try next candidate */ }
+    }
+    return JSON.stringify({ verdict: 'inconclusive' });
+  })();
 }
 
 // ---------------------------------------------------------------------------
@@ -8817,7 +8870,19 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
                   return /^(sign\s*in|log\s*in|sign\s*up|register)\b/.test(text);
                 });
                 const hasSignInButton = signInLinks.length > 0 || signInButtons.length > 0;
-                return JSON.stringify({ title, body, links, titleIsLogin, isNoIndex, hasUserGlobal, hasSignInButton });
+                const hasPasswordField = !!document.querySelector('input[type="password"]');
+                const hasLoginForm = hasPasswordField || !!document.querySelector('form[action*="login"], form[action*="signin"], form[action*="auth"], form[action*="session"]');
+                const jsUserSignals = [];
+                try {
+                  const _nd = window.__NEXT_DATA__;
+                  if (_nd && _nd.props && _nd.props.pageProps && (_nd.props.pageProps.user || (_nd.props.pageProps.session && _nd.props.pageProps.session.user))) jsUserSignals.push('next-data-user');
+                  if (window.__NUXT__ && window.__NUXT__.state && window.__NUXT__.state.user) jsUserSignals.push('nuxt-user');
+                  for (let _i = 0; _i < localStorage.length; _i++) {
+                    const _k = localStorage.key(_i) || '';
+                    if (/token|auth|session|user/i.test(_k) && /^eyJ[A-Za-z0-9_-]+\./.test(localStorage.getItem(_k) || '')) { jsUserSignals.push('ls-jwt'); break; }
+                  }
+                } catch (_) {}
+                return JSON.stringify({ title, body, links, titleIsLogin, isNoIndex, hasUserGlobal, hasSignInButton, hasPasswordField, hasLoginForm, jsUserSignals });
               })()`,
               sessionId,
               timeoutMs: 5000,
@@ -8864,7 +8929,7 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
               // use LLM semantic analysis to confirm before skipping auth.
               if (!_onLoginPage) {
                 // Quick keyword pre-filter to avoid unnecessary LLM calls
-                const _authIndicators = /sign\s*in|log\s*in|enter\s*your\s*email|workspace\s*not\s+found|where\s+should\s+we\s+begin|get\s+started|create\s+workspace|sign\s*in\s*to\s*continue/i;
+                const _authIndicators = /sign\s*in|log\s*in|enter\s*your\s*email|workspace\s*not\s+found|get\s+started|create\s+workspace|sign\s*in\s*to\s*continue/i;
                 if (_authIndicators.test(_pageText)) {
                   logger.info(`[browser.agent] Auth indicators found in page content, confirming with LLM...`);
                   const _llmDetected = await _detectAuthViaLLM(_pageInfo.title || '', _pageInfo.body || '', agentId);
@@ -8969,7 +9034,19 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
                             return /^(sign\\s*in|log\\s*in|sign\\s*up|register)\\b/.test(text);
                           });
                           const hasSignInButton = signInLinks.length > 0 || signInButtons.length > 0;
-                          return JSON.stringify({ title, body, links, titleIsLogin, isNoIndex, hasUserGlobal, hasSignInButton });
+                          const hasPasswordField = !!document.querySelector('input[type="password"]');
+                          const hasLoginForm = hasPasswordField || !!document.querySelector('form[action*="login"], form[action*="signin"], form[action*="auth"], form[action*="session"]');
+                          const jsUserSignals = [];
+                          try {
+                            const _nd = window.__NEXT_DATA__;
+                            if (_nd && _nd.props && _nd.props.pageProps && (_nd.props.pageProps.user || (_nd.props.pageProps.session && _nd.props.pageProps.session.user))) jsUserSignals.push('next-data-user');
+                            if (window.__NUXT__ && window.__NUXT__.state && window.__NUXT__.state.user) jsUserSignals.push('nuxt-user');
+                            for (let _i = 0; _i < localStorage.length; _i++) {
+                              const _k = localStorage.key(_i) || '';
+                              if (/token|auth|session|user/i.test(_k) && /^eyJ[A-Za-z0-9_-]+\./.test(localStorage.getItem(_k) || '')) { jsUserSignals.push('ls-jwt'); break; }
+                            }
+                          } catch (_) {}
+                          return JSON.stringify({ title, body, links, titleIsLogin, isNoIndex, hasUserGlobal, hasSignInButton, hasPasswordField, hasLoginForm, jsUserSignals });
                         })()`,
                         sessionId,
                         timeoutMs: 5000,
@@ -9069,7 +9146,19 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
                                   return /^(sign\\s*in|log\\s*in|sign\\s*up|register)\\b/.test(text);
                                 });
                                 const hasSignInButton = signInLinks.length > 0 || signInButtons.length > 0;
-                                return JSON.stringify({ title, body, links, titleIsLogin, isNoIndex, hasUserGlobal, hasSignInButton });
+                                const hasPasswordField = !!document.querySelector('input[type="password"]');
+                                const hasLoginForm = hasPasswordField || !!document.querySelector('form[action*="login"], form[action*="signin"], form[action*="auth"], form[action*="session"]');
+                                const jsUserSignals = [];
+                                try {
+                                  const _nd = window.__NEXT_DATA__;
+                                  if (_nd && _nd.props && _nd.props.pageProps && (_nd.props.pageProps.user || (_nd.props.pageProps.session && _nd.props.pageProps.session.user))) jsUserSignals.push('next-data-user');
+                                  if (window.__NUXT__ && window.__NUXT__.state && window.__NUXT__.state.user) jsUserSignals.push('nuxt-user');
+                                  for (let _i = 0; _i < localStorage.length; _i++) {
+                                    const _k = localStorage.key(_i) || '';
+                                    if (/token|auth|session|user/i.test(_k) && /^eyJ[A-Za-z0-9_-]+\./.test(localStorage.getItem(_k) || '')) { jsUserSignals.push('ls-jwt'); break; }
+                                  }
+                                } catch (_) {}
+                                return JSON.stringify({ title, body, links, titleIsLogin, isNoIndex, hasUserGlobal, hasSignInButton, hasPasswordField, hasLoginForm, jsUserSignals });
                               })()`,
                               sessionId,
                               timeoutMs: 5000,
@@ -9123,16 +9212,14 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
             logger.warn(`[browser.agent] run: parking content check failed (non-fatal): ${_pageErr.message}`);
           }
 
-          // ── PRIMARY: LLM-based auth detection (semantic, observation-based) ──────
-          // Cookies and DOM regex are hints, not ground truth. NID (Google tracking
-          // cookie) is HttpOnly but doesn't mean logged-in. "Sign in" button regex
-          // doesn't match "Sign in" with a space. The LLM reads the page content
-          // and semantically determines: "Is this a login/marketing page, or the
-          // authenticated app?" This is the authoritative signal.
-          // Cookie sniff is used as a fast-path hint — if no cookies AND LLM says
-          // authed, that's fine (SPA with JS-only sessions). If cookies present but
-          // LLM says auth required, the cookies are stale/tracking (e.g. NID).
+          // ── Auth decision chain (most definitive signal first) ─────────────
+          // 1. Identity-endpoint probe — the SERVER answers whether this session
+          //    is live (fetch /backend-api/me etc. with credentials).
+          // 2. Strong session cookie + no login form → authed.
+          // 3. LLM tiebreaker — fed all evidence; last resort only.
           let _cookieAuthed = null; // null = unknown (CDP unavailable), true/false = result
+          let _strongCookieNames = [];
+          let _matchedCookieNames = [];
           try {
             const _csPage = browserEngine && typeof browserEngine.getPage === 'function' ? browserEngine.getPage(sessionId) : null;
             let _csDomain = '';
@@ -9144,23 +9231,90 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
               const _csResult = await _sniffAuthCookies(browserEngine, sessionId, _csPage, _csDomain);
               if (_csResult.ok) {
                 _cookieAuthed = _csResult.authed;
-                if (_cookieAuthed) {
-                  logger.info(`[browser.agent] run: auth-check: cookie hint: auth cookies present (${_csResult.cookies.join(',')}) — confirming with LLM for ${agentId}`);
-                } else {
-                  logger.info(`[browser.agent] run: auth-check: cookie hint: no auth cookies (${_csResult.reason}) — checking with LLM for ${agentId}`);
-                }
+                _matchedCookieNames = Array.isArray(_csResult.cookies) ? _csResult.cookies : [];
+                _strongCookieNames = Array.isArray(_csResult.strongCookies) ? _csResult.strongCookies : [];
+                logger.info(`[browser.agent] run: auth-check: cookie sniff for ${agentId} — authed=${_cookieAuthed} matched=[${_matchedCookieNames.join(',')}] strong=[${_strongCookieNames.join(',')}]${_cookieAuthed ? '' : ` reason=${_csResult.reason}`}`);
               }
             }
           } catch (_csErr) {
             logger.debug(`[browser.agent] run: auth-check: cookie sniff failed (non-fatal): ${_csErr.message}`);
           }
 
-          // ── LLM auth detection (authoritative) ──────────────────────────────
-          // Returns 0 = authenticated, 1 = auth required. Uses page title + body text.
+          // ── 1. Identity-endpoint probe (server-verified, definitive) ────────
+          let _endpointVerdict = null; // 'authed' | 'required' | null (inconclusive)
+          let _endpointDetail = '';
+          try {
+            let _epDomain = '';
+            try {
+              const _h = _curHref && _curHref.match(/^https?:\/\//) ? _curHref : startUrl;
+              _epDomain = new URL(_h).hostname.replace(/^www\./, '');
+            } catch (_) {}
+            const _epPaths = _epDomain
+              ? [...(_AUTH_ENDPOINT_MAP[_epDomain] || []), ..._GENERIC_AUTH_ENDPOINTS]
+              : [];
+            if (_epPaths.length > 0) {
+              const _epRes = await callBrowserAct({
+                action: 'evaluate',
+                text: `(${_authEndpointProbe.toString()})(${JSON.stringify(_epPaths)})`,
+                sessionId,
+                timeoutMs: 30000,
+                headed: _preflightHeaded,
+              }, 35000).catch(() => null);
+              const _epInfo = (_epRes?.ok !== false)
+                ? (typeof _epRes?.result === 'object' && _epRes?.result !== null)
+                  ? _epRes.result
+                  : (() => { try { return JSON.parse(String(_epRes?.result ?? '{}')); } catch (_) { return {}; } })()
+                : {};
+              if (_epInfo.verdict === 'authed' || _epInfo.verdict === 'required') {
+                _endpointVerdict = _epInfo.verdict;
+                _endpointDetail = `${_epInfo.path || '?'} → ${_epInfo.status}`;
+              }
+              logger.info(`[browser.agent] run: auth-check: endpoint probe for ${agentId} — ${_epInfo.verdict || 'inconclusive'}${_endpointDetail ? ` (${_endpointDetail})` : ''}`);
+            }
+          } catch (_epErr) {
+            logger.debug(`[browser.agent] run: auth-check: endpoint probe failed (non-fatal): ${_epErr.message}`);
+          }
+
+          const _markAuthed = (via) => {
+            logger.info(`[browser.agent] run: auth-check: ${via} — authenticated for ${agentId}`);
+            _pageMetaAuthed = true;
+            _onLoginPage = false;
+            _pageMetaLoginWall = false;
+            _setCachedAuthCheck(agentId, false);
+            // manualLogin: if the page is already authenticated, don't force waitForAuth.
+            // The user may have signed in via a previous session and the persistent profile
+            // has valid cookies. waitForAuth would navigate away and potentially break.
+            if (manualLogin === true) {
+              _authNeeded = false;
+              logger.info(`[browser.agent] run: manualLogin + ${via} — skipping waitForAuth for ${agentId}`);
+            }
+          };
+
+          if (_endpointVerdict === 'authed') {
+            _markAuthed(`identity endpoint confirmed session (${_endpointDetail})`);
+          } else if (_endpointVerdict === 'required') {
+            // The server itself says the session is dead — definitive.
+            logger.info(`[browser.agent] run: auth-check: identity endpoint says logged out (${_endpointDetail}) — auth required for ${agentId}`);
+            _authNeeded = true;
+          } else if (_strongCookieNames.length > 0 && !_pageInfo.hasPasswordField && !_pageInfo.hasLoginForm && !_pageInfo.titleIsLogin && !_pageInfo.hasSignInButton) {
+            // ── 2. Strong session cookie + no login form → authed ──────────────
+            // A dead session would have redirected to a login form, tripping
+            // the hasPasswordField/hasLoginForm/hasSignInButton gate.
+            _markAuthed(`strong session cookies (${_strongCookieNames.join(',')}) + no login form`);
+          } else {
+          // ── 3. LLM tiebreaker — fed all evidence, last resort only ─────────
+          // Returns 0 = authenticated, 1 = auth required, null = unavailable.
           // This catches marketing pages (workspace.google.com), login walls, and
           // sign-in buttons that regex/cookie heuristics miss.
           logger.info(`[browser.agent] run: auth-check: LLM input — title="${(_pageInfo.title || '').slice(0, 100)}" bodyLen=${(_pageInfo.body || '').length} body="${(_pageInfo.body || '').slice(0, 200)}" for ${agentId}`);
-          const _llmAuthResult = await _detectAuthViaLLM(_pageInfo.title || '', _pageInfo.body || '', agentId);
+          let _llmAuthResult = await _detectAuthViaLLM(_pageInfo.title || '', _pageInfo.body || '', agentId, {
+            endpointStatus: _endpointDetail || _endpointVerdict || 'inconclusive',
+            authCookieNames: _strongCookieNames.length > 0 ? _strongCookieNames : _matchedCookieNames,
+            hasSignInButton: _pageInfo.hasSignInButton,
+            hasPasswordField: _pageInfo.hasPasswordField,
+            hasUserGlobal: _pageInfo.hasUserGlobal,
+            jsUserSignals: _pageInfo.jsUserSignals,
+          });
 
           // ── Defensive override: hasSignInButton + no auth cookies ──────────────
           // The LLM auth check can false-positive on marketing/landing pages (e.g.
@@ -9171,9 +9325,16 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
           // This only fires when BOTH signals are present, so authenticated pages
           // with a "Sign in with a different account" button + valid cookies are
           // not affected.
-          if (_llmAuthResult === 0 && _pageInfo.hasSignInButton && _cookieAuthed !== true) {
+          if (_llmAuthResult === 0 && _pageInfo.hasSignInButton && _strongCookieNames.length === 0 && _cookieAuthed !== true) {
             logger.info(`[browser.agent] run: auth-check: LLM says authenticated but hasSignInButton=true + no auth cookies — overriding to auth required for ${agentId}`);
             _llmAuthResult = 1;
+          }
+          // Symmetric: LLM says required but a strong session cookie is present
+          // and no login form is visible — hybrid views (e.g. authed app showing
+          // an incidental "sign in" link) shouldn't prompt re-auth.
+          if (_llmAuthResult === 1 && _strongCookieNames.length > 0 && !_pageInfo.hasPasswordField && !_pageInfo.hasLoginForm) {
+            logger.info(`[browser.agent] run: auth-check: LLM says auth required but strong session cookies + no login form — overriding to authenticated for ${agentId}`);
+            _llmAuthResult = 0;
           }
 
           if (_llmAuthResult === 0) {
@@ -9213,6 +9374,7 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
               _authNeeded = true;
             }
           }
+          } // end LLM tiebreaker else-branch
           // Cookie hint is logged but no longer overrides the LLM decision.
           // DOM heuristic decision tree below is skipped — LLM is authoritative.
 
@@ -9285,7 +9447,7 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
                         ? _healPageRes.result
                         : (() => { try { return JSON.parse(String(_healPageRes?.result ?? _healPageRes?.stdout ?? '{}')); } catch (_) { return {}; } })();
                       const _healText = `${_healPageInfo.title || ''} ${_healPageInfo.body || ''}`;
-                      const _authIndicatorsRe = /sign\s*in|log\s*in|enter\s*your\s*email|workspace\s*not\s+found|where\s+should\s+we\s+begin|get\s+started|create\s+workspace|sign\s*in\s*to\s*continue|create\s+a\s+free\s+account/i;
+                      const _authIndicatorsRe = /sign\s*in|log\s*in|enter\s*your\s*email|workspace\s*not\s+found|get\s+started|create\s+workspace|sign\s*in\s*to\s*continue|create\s+a\s+free\s+account/i;
                       if (_authIndicatorsRe.test(_healText)) {
                         logger.info(`[browser.agent] self-heal: auth indicators in page content after corrected nav — confirming with LLM for ${agentId}`);
                         const _llmDetected = await _detectAuthViaLLM(_healPageInfo.title || '', _healPageInfo.body || '', agentId);
@@ -9416,11 +9578,15 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
         try { _csDomain = new URL(startUrl).hostname.replace(/^www\./, ''); } catch (_) {}
         if (_csPage && _csDomain) {
           const _csResult = await _sniffAuthCookies(browserEngine, sessionId, _csPage, _csDomain);
-          if (!_csResult.ok || !_csResult.authed) {
-            logger.info(`[browser.agent] run: auth-check: no auth cookies found (requireCookieConfirmation) — auth needed for ${agentId} (reason: ${_csResult.reason || 'no-cookies'})`);
+          // Strong session cookies or a server-verified endpoint confirm auth —
+          // weak httpOnly-only matches (infra/analytics) do not.
+          const _confirmOk = _endpointVerdict === 'authed' ||
+            (_csResult.ok && _csResult.authed && (!Array.isArray(_csResult.strongCookies) || _csResult.strongCookies.length > 0));
+          if (!_confirmOk) {
+            logger.info(`[browser.agent] run: auth-check: no strong auth cookies found (requireCookieConfirmation) — auth needed for ${agentId} (reason: ${_csResult.reason || 'no-cookies'})`);
             _authNeeded = true;
           } else {
-            logger.info(`[browser.agent] run: auth-check: auth cookies confirmed (${_csResult.cookies.join(',')}) — authenticated for ${agentId}`);
+            logger.info(`[browser.agent] run: auth-check: auth cookies confirmed (${(_csResult.cookies || []).join(',')}) — authenticated for ${agentId}`);
           }
         } else {
           logger.info(`[browser.agent] run: auth-check: cookie confirmation required but CDP unavailable — auth needed for ${agentId}`);
@@ -11648,7 +11814,12 @@ When extracting page content with run-code, prioritize these selectors over gene
         const _isReadOnlyGoal = _semanticRead !== null
           ? _semanticRead
           : (_stepType !== 'on-page-action');  // extract/navigate/verify → read-like; on-page-action → mutation-like
-        if (_isReadOnlyGoal && _urlFirstNavigationSelected) {
+        // AI-chat services can never satisfy an ask/research goal from the
+        // landing page — the answer must be generated by submitting a prompt.
+        // _inferPageCategory hits the deterministic _SERVICE_CATEGORIES map for
+        // known chat services, so this is effectively free.
+        const _scPageCategory = await _inferPageCategory(_svcKey, startUrl, task, _appKnowledgeEntries).catch(() => null);
+        if (_isReadOnlyGoal && _urlFirstNavigationSelected && _scPageCategory !== 'ai_chat') {
           logger.info(`[browser.agent] tab-map: URL-first short-circuit — read-only goal + URL-first navigation, skipping iterative navigation`);
           // Wait for page to stabilize (Gmail SPA needs time after #search navigation)
           const _wstRes = await callBrowserAct({ action: 'waitForStableText', sessionId, headed: true, timeoutMs: 10000 }, 12000).catch(e => ({ ok: false, error: e.message }));
@@ -12319,6 +12490,21 @@ When extracting page content with run-code, prioritize these selectors over gene
         }
 
         const _svcDisplayFinal = agentId.replace('.agent', '').replace(/_/g, ' ');
+        // A real login wall was just re-detected during execution — any persisted
+        // authed_at is stale or false (e.g. written by an unverified manual
+        // confirm). Clear it so the next preflight re-probes instead of trusting
+        // the 24h cache and skipping the probe into the same wall.
+        try {
+          await withDb(async (db) => {
+            await db.run(
+              `UPDATE agents SET authed_at = NULL, auth_expires_at = NULL WHERE id = ?`,
+              agentId
+            );
+          });
+          logger.info(`[browser.agent] run: cleared stale authed_at for ${agentId} after login-wall re-detection`);
+        } catch (_clearErr) {
+          logger.warn(`[browser.agent] run: authed_at clear failed (non-fatal): ${_clearErr.message}`);
+        }
         return {
         ok: false,
         agentId,
@@ -12423,13 +12609,14 @@ When extracting page content with run-code, prioritize these selectors over gene
         if (_isSparse && !_hasVideoLinks && !_hasExtractedContent && !_isSearchUrl && !_transcriptHasNoResults) {
           // ── Capture-timing miss retry ────────────────────────────────────────
           // If the result looks like a premature capture (sentinel string from
-          // playwright.agent's "assuming success" fallback, or generic sparse text),
-          // the AI response may still be streaming. Do ONE bounded re-extraction:
-          // wait for text stability on the live session, then re-check.
-          const _looksLikeCaptureMiss = /^Submitted \(|Completed via field map|no verification configured/i.test(agentResultText)
-            || agentResultText.trim().split(/\s+/).filter(Boolean).length < 10;
-          if (_looksLikeCaptureMiss && sessionId) {
-            logger.info(`[browser.agent] Research quality gate: sparse result looks like capture-timing miss — re-extracting from live session (up to 15s)`);
+          // playwright.agent's "assuming success"/fast-path fallbacks, or generic
+          // sparse text), the AI response may still be streaming. Do ONE bounded
+          // re-extraction: wait for text stability on the live session, then
+          // re-check. For research/chat intents any sparse result on a live
+          // session is retry-worthy — the wait exits early (~2s no-growth once
+          // len>200), so genuinely-sparse pages only cost a few seconds.
+          if (sessionId) {
+            logger.info(`[browser.agent] Research quality gate: sparse result on live session — re-extracting after stability wait (up to 15s)`);
             try {
               // Wait for text stability: poll innerText length, exit after 2s no-growth
               const _reExtractDeadline = Date.now() + 15000;
