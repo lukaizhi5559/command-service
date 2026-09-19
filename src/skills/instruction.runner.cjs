@@ -6605,8 +6605,21 @@ async function _countCheckboxes(sessionId) {
 
 // Lightweight DONE check — LLM YES/NO based on goal + action history + page state.
 // Page state (title, URL, checkbox count) prevents false DONE declarations.
-async function _checkDone(goal, actionHistory, currentUrl, pageTitle, checkboxCount) {
+async function _checkDone(goal, actionHistory, currentUrl, pageTitle, checkboxCount, sessionId = null) {
   if (actionHistory.length === 0) return false;
+  // Idempotent-send guard: if a send-API call already succeeded this session,
+  // the email is out — answer YES deterministically instead of letting the LLM
+  // say NO and trigger a re-plan that composes+sends the message AGAIN
+  // (observed: verification miss after Ctrl+Enter → 3 duplicate emails).
+  if (sessionId && /\b(send|email|e-mail|mail|reply|forward)\b/i.test(goal || '')) {
+    try {
+      const { _detectSuccessfulSend } = require('./browser.agent.cjs');
+      if (_detectSuccessfulSend && _detectSuccessfulSend(sessionId)) {
+        logger.info('[instruction.runner] _checkDone: YES (deterministic — send-API already succeeded)');
+        return true;
+      }
+    } catch (_) {}
+  }
   const { askWithMessages } = require('../skill-helpers/skill-llm.cjs');
   const historyStr = actionHistory.slice(-10).map((a, i) => `  ${i + 1}. ${a}`).join('\n');
   try {
@@ -6650,7 +6663,7 @@ async function _selectTierLLM(sessionId, goal, actionHistory, pageCategory, shor
   // 1. DONE check (only if we've taken actions) — keep this deterministic
   if (actionHistory.length > 0) {
     const _checkboxCount = await _countCheckboxes(sessionId);
-    const done = await _checkDone(goal, actionHistory, currentUrl, probe?.pageTitle, _checkboxCount);
+    const done = await _checkDone(goal, actionHistory, currentUrl, probe?.pageTitle, _checkboxCount, sessionId);
     if (done) {
       // Final OCR safety check — only if OCR didn't already run this iteration
       // (dynamic OCR gating may have skipped it for rich-DOM pages like Notion).
@@ -7060,7 +7073,7 @@ async function _selectTierDeterministic(sessionId, goal, actionHistory, pageCate
   // DONE check only — the LLM handles all tier selection
   if (actionHistory.length > 0) {
     const _checkboxCount = await _countCheckboxes(sessionId);
-    const done = await _checkDone(goal, actionHistory, null, probe?.pageTitle, _checkboxCount);
+    const done = await _checkDone(goal, actionHistory, null, probe?.pageTitle, _checkboxCount, sessionId);
     if (done) return 0;
   }
   // No deterministic rule — let LLM decide
@@ -9058,6 +9071,24 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
         // grid where Tab-Map clicks lose cell position).
         logger.info(`[instruction.runner] Shortcut: no shortcut found — letting tier selector decide next tier`);
         _triedTiers.add(3); // mark shortcut as tried so it's not re-picked
+        prevUrl = currentUrl;
+        continue;
+      }
+      // Idempotent-send guard: a modifier+Enter shortcut on a send goal submits
+      // the form (Gmail Ctrl/Cmd+Enter). If a send-API call already succeeded
+      // this session, do NOT press it again — that re-sends the message.
+      let _skipSend = false;
+      if (/(?:Meta|Control|Ctrl|Cmd|Command)\+Enter/i.test(shortcutResult.key || '') &&
+          /\b(send|email|e-mail|mail|reply|forward)\b/i.test(goal || '')) {
+        try {
+          const { _detectSuccessfulSend } = require('./browser.agent.cjs');
+          _skipSend = !!(_detectSuccessfulSend && _detectSuccessfulSend(sessionId));
+        } catch (_) {}
+      }
+      if (_skipSend) {
+        logger.info(`[instruction.runner] Shortcut "${shortcutResult.key}" skipped — send-API already succeeded (idempotent)`);
+        actionHistory.push(`Shortcut "${shortcutResult.key}" → skipped (send already confirmed)`);
+        _triedTiers.add(3);
         prevUrl = currentUrl;
         continue;
       }

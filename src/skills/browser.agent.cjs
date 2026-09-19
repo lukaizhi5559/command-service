@@ -1941,11 +1941,43 @@ Number (0-2)?`;
 // Checks: (1) submit button was clicked, (2) POST/PUT CRUD call with 2xx in netLog,
 // (3) dialog/overlay closed, (4) no error toast after close.
 // Returns { verified: true/false, reason: string }
+// Mail-send endpoints — a successful POST to one of these is terminal proof
+// the message went out. Gmail uses /sync/u/*/i/s, Outlook /sendmail, others
+// /messages/send or sendmsg-style routes.
+const _SEND_ENDPOINT_RE = /\/sync\/[^/]*\/i\/s|\/sendmail|\/messages\/send|sendmsg|smtpsend|\/send(?:\?|\/|$)/i;
+
+// True when the netLog already contains a successful send-API call — i.e. the
+// message was sent even if verification/UI failed to notice. Used both to
+// verify completion AND to block a duplicate send on re-plan loops.
+function _detectSuccessfulSend(sessionId) {
+  try {
+    const _entries = browserEngine?.getNetLog(sessionId) || [];
+    return _entries.some(e =>
+      /^(POST|PUT|PATCH)$/.test(e.method) &&
+      e.status >= 200 && e.status < 300 &&
+      _SEND_ENDPOINT_RE.test(e.url || ''));
+  } catch (_) { return false; }
+}
+
 async function _verifyGoalViaDomState(goal, sessionId, actionHistory, tabMapResult) {
-  // 1. Check if the last action was a click on a submit/save/send button
+  // 1. Check if a recent action was a submit: either a click on a
+  // submit/save/send button OR a keyboard submit combo (Gmail sends via
+  // Ctrl+Enter / Cmd+Enter — recorded as Shortcut "Control+Enter" etc.).
   const _lastActions = actionHistory.slice(-3);
   const _hasSubmitClick = _lastActions.some(a => /Click "(Save|Send|Submit|Create|Done|Confirm|OK|Post|Publish)"/i.test(a));
-  if (!_hasSubmitClick) return { verified: false, reason: 'no-submit-click' };
+  const _hasSubmitKey = _lastActions.some(a =>
+    /(?:Shortcut|Press|Keycombo|keypress)[^\n"']*["']?(?:Meta|Control|Ctrl|Cmd|Command|Alt|Option)\+Enter["']?/i.test(a));
+  const _hasSubmitAction = _hasSubmitClick || _hasSubmitKey;
+
+  // Idempotent-send check: if a send-API call already succeeded for this
+  // session, the goal is met regardless of what the last action looked like —
+  // this stops the re-plan loop from composing and sending the email again.
+  const _sendDetected = _detectSuccessfulSend(sessionId);
+  if (!_hasSubmitAction && !_sendDetected) return { verified: false, reason: 'no-submit-click' };
+  if (_sendDetected && /\b(send|email|e-mail|mail|reply|forward|message)\b/i.test(goal || '')) {
+    logger.info(`[browser.agent] _verifyGoalViaDomState: verified — send-API already succeeded (idempotent, last action may not look like a submit)`);
+    return { verified: true, reason: 'send-api-already-succeeded' };
+  }
 
   // 2. Check netLog for POST/PUT with 2xx status (API call triggered by the click)
   let _netOk = false;
@@ -14479,3 +14511,5 @@ module.exports._normalizeGoalForCache = _normalizeGoalForCache;
 module.exports._loadTabFlowCache = _loadTabFlowCache;
 module.exports._saveTabFlowCache = _saveTabFlowCache;
 module.exports._failTabFlowCache = _failTabFlowCache;
+module.exports._detectSuccessfulSend = _detectSuccessfulSend;
+module.exports._SEND_ENDPOINT_RE = _SEND_ENDPOINT_RE;

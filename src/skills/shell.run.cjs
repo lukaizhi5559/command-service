@@ -198,6 +198,13 @@ Exception — clipboard/pipe writes: when the goal writes clipboard or piped out
 Do NOT check if the file exists first — content changes every run.
 Use: pbpaste > "$FILE"  (no existence guard, no idempotency check)
 
+File-content rule (CRITICAL): when the goal asks to write content/code to a file,
+the file must contain the COMPLETE content — never abbreviate, elide, or end with
+placeholder comments like "// rest of code". Use a quoted heredoc:
+  cat > "$FILE" <<'EOF'
+  ...full content...
+  EOF
+
 Platform: macOS. Home dir: ${os.homedir()}
 `;
 
@@ -349,6 +356,26 @@ function _bashSyntaxCheck(scriptBody, interpreter = 'bash') {
   }
 }
 
+// Truncation guard: `bash -n` does NOT reject an unterminated heredoc (it only
+// warns on stdin), so a maxTokens-truncated generated script would silently
+// write a partial file. Detect heredoc openers with no matching closer line.
+// Openers are only recognised at end-of-line (`cat > f << 'EOF'` style) so
+// bit-shift operators like `a << b` inside heredoc bodies don't false-positive.
+function _looksTruncated(script) {
+  if (typeof script !== 'string') return null;
+  const openerRe = /<<-?\s*['"]?([A-Za-z_][A-Za-z0-9_]*)['"]?\s*$/gm;
+  let m;
+  while ((m = openerRe.exec(script)) !== null) {
+    const tag = m[1];
+    const closerRe = new RegExp(`^${tag}\\s*$`, 'm');
+    // closer must appear on a line AFTER the opener
+    if (!closerRe.test(script.slice(m.index + m[0].length))) {
+      return `unterminated heredoc (missing ${tag} delimiter)`;
+    }
+  }
+  return null;
+}
+
 async function _resolveGoalToCommand(goal, onProgress) {
   if (!skillLlm.isAvailable()) {
     return { ok: false, error: 'LLM not available to resolve shell goal — provide cmd/argv directly' };
@@ -356,6 +383,11 @@ async function _resolveGoalToCommand(goal, onProgress) {
   const MAX_ATTEMPTS = 3;
   let lastErr = '';
   let syntaxFeedback = ''; // carried into the next LLM attempt when bash -n rejects a script
+  // File-writing goals must inline the full content (usually a heredoc), which
+  // easily exceeds a 300-token cap — truncation then writes a partial file.
+  // Scale the budget up; retries go higher still to recover a truncated script.
+  const _isWriteGoal = /\b(write|create|generate|save|put|store|export)\b/i.test(goal)
+    && /\b(file|\.md|\.txt|\.html?|\.jsx?|\.tsx?|\.py|\.css|code|content|script|document|markdown)\b/i.test(goal);
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
     if (onProgress) onProgress({ type: 'shell:goal_resolving', attempt, maxAttempts: MAX_ATTEMPTS, goal });
     try {
@@ -365,7 +397,7 @@ async function _resolveGoalToCommand(goal, onProgress) {
       const response = await skillLlm.askWithMessages([
         { role: 'system', content: SHELL_RUN_SYSTEM },
         { role: 'user', content: userContent },
-      ], { maxTokens: 300, temperature: 0 });
+      ], { maxTokens: _isWriteGoal ? (attempt === 1 ? 4096 : 8192) : 300, temperature: 0 });
       const raw = (response || '').trim();
       if (!raw) {
         lastErr = 'LLM returned empty response';
@@ -396,6 +428,16 @@ async function _resolveGoalToCommand(goal, onProgress) {
           logger.warn(`[shell.run] ${lastErr}: ${script.slice(0, 120)}`);
           continue;
         }
+      }
+      // Truncation guard: a maxTokens-cut script fails open inside bash -n
+      // (unterminated heredoc is a warning, not an error) and would write a
+      // partial file — refuse and let the retry regenerate at a larger budget.
+      const truncReason = _looksTruncated(script);
+      if (truncReason) {
+        lastErr = `LLM-generated command looks truncated (${truncReason}) — refusing to execute a partial script`;
+        syntaxFeedback = lastErr;
+        logger.warn(`[shell.run] ${lastErr}: ${script.slice(-120)}`);
+        continue;
       }
       // Syntax check: <interpreter> -n catches shell-level errors the structural
       // guard misses — most importantly unescaped `(` `)` that the shell parses as
@@ -1843,4 +1885,4 @@ function getOutputContract(result) {
   };
 }
 
-module.exports = { shellRun, validate, getOutputContract, addCommandToAllowlist, ALLOWED_COMMANDS, DANGEROUS_COMMANDS };
+module.exports = { shellRun, validate, getOutputContract, addCommandToAllowlist, ALLOWED_COMMANDS, DANGEROUS_COMMANDS, _looksTruncated };
