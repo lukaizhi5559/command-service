@@ -39,6 +39,8 @@ const fs = require('fs');
 const logger = require('../logger.cjs');
 const skillLlm = require('../skill-helpers/skill-llm.cjs');
 const { parseLlmJson } = require('../skill-helpers/parseLlmJson.cjs');
+// Canonical patterns live in shared/text-patterns.cjs — update there, not here.
+const { isFileWriteGoal } = require('../../../../shared/text-patterns.cjs');
 
 // Robust JSON parser for LLM output — handles truncated strings, dangling
 // commas, missing values, markdown fences, and unbalanced braces.
@@ -386,8 +388,8 @@ async function _resolveGoalToCommand(goal, onProgress) {
   // File-writing goals must inline the full content (usually a heredoc), which
   // easily exceeds a 300-token cap — truncation then writes a partial file.
   // Scale the budget up; retries go higher still to recover a truncated script.
-  const _isWriteGoal = /\b(write|create|generate|save|put|store|export)\b/i.test(goal)
-    && /\b(file|\.md|\.txt|\.html?|\.jsx?|\.tsx?|\.py|\.css|code|content|script|document|markdown)\b/i.test(goal);
+  // isFileWriteGoal: explicit path-in-goal (primary) or write-verb+file-noun.
+  const _isWriteGoal = isFileWriteGoal(goal);
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
     if (onProgress) onProgress({ type: 'shell:goal_resolving', attempt, maxAttempts: MAX_ATTEMPTS, goal });
     try {

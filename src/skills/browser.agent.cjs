@@ -2965,12 +2965,15 @@ function _splitCompoundAction(action) {
 // action verb (e.g. "fill 'To' with 'a', 'Subject' with 'b'" splits into
 // "'Subject' with 'b'"). Prepend the previous fragment's verb so every atomic
 // step is self-describing for downstream flow matchers.
-const _ACTION_VERB_RE = /^(click|press|type|fill|enter|navigate|open|select|choose|scroll|wait|get|close|save|submit|send|check|toggle|drag|hover|search|scan|look)\b/i;
+// Named _DOM_ACTION_VERB_RE to distinguish from shared/text-patterns.cjs
+// ACTION_VERB_RE — that one detects user-action intent, this detects DOM
+// instruction verbs at the start of an instruction fragment.
+const _DOM_ACTION_VERB_RE = /^(click|press|type|fill|enter|navigate|open|select|choose|scroll|wait|get|close|save|submit|send|check|toggle|drag|hover|search|scan|look)\b/i;
 function _inheritFragmentVerbs(subActions) {
   let lastVerb = '';
   return (subActions || []).map(raw => {
     let s = String(raw || '').replace(/^and\s+/i, '').trim() || String(raw || '');
-    const m = s.match(_ACTION_VERB_RE);
+    const m = s.match(_DOM_ACTION_VERB_RE);
     if (m) {
       lastVerb = m[1].toLowerCase();
     } else if (lastVerb) {
