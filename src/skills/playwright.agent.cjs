@@ -5410,7 +5410,7 @@ function _extractGoalEntities(goal) {
   return result;
 }
 
-async function _decomposeGoalIntoSubTasks(goal, sessionId) {
+async function _decomposeGoalIntoSubTasks(goal, sessionId, currentUrl = null) {
   if (!goal || goal.length < 10) return { ok: false, error: 'goal too short' };
   // Don't decompose if the goal already has a [DISCOVERED PROCEDURE] block —
   // the procedure is already step-by-step.
@@ -5422,10 +5422,14 @@ async function _decomposeGoalIntoSubTasks(goal, sessionId) {
     ? `\n\nCRITICAL — ENTITY PRESERVATION:\nThe following entities are mentioned in the goal and MUST each appear in at least one sub-task description: ${_entities.map(e => `"${e}"`).join(', ')}\nDo NOT collapse multiple entities into a single sub-task unless the verification criterion covers ALL of them. If there are 3 artists, create separate sub-tasks for each artist's songs being added (or one sub-task whose verification checks for ALL 3 artists on the destination page).\n`
     : '';
 
+  const _currentUrlBlock = currentUrl
+    ? `\n\nCURRENT PAGE: The browser is ALREADY on "${currentUrl}". Do NOT create navigate/open/go-to sub-tasks for pages already loaded (e.g. "Navigate to the homepage") — start from the first action needed on the current page. Only include a navigation sub-task if the goal requires a page other than the current one.\n`
+    : '';
+
   const _prompt = `Decompose this browser automation goal into ordered sub-tasks. For each sub-task, provide a specific, checkable verification criterion AND a description of the expected page state after the sub-task completes.
 
 Goal: "${goal.slice(0, 1000)}"
-${_entityList}
+${_entityList}${_currentUrlBlock}
 Return JSON only:
 {
   "subTasks": [
@@ -12136,7 +12140,7 @@ function _isGoalCompletedBySignals({ goal, verificationGoal, pageText, pageUrl, 
   return { completed: false, reason: 'no completion signals matched', matchedPhrases: [] };
 }
 
-async function _executeTurnLoopFallback({ goal, verificationGoal, sessionId, headed, timeoutMs, agentContext, transcript, deadline, start, extractedText, heartbeat, textAlreadyEntered, maxTurns = 8, hostname, _discoveryAlreadyAttempted = false, _preDecomposedSubTasks = null, _inheritedActionSignatureCounts = null, _inheritedJitDiscoveryFired = null, _progressCallbackUrl, _stepIndex, _abortSignal = null, flowCounter = null }) {
+async function _executeTurnLoopFallback({ goal, verificationGoal, sessionId, headed, timeoutMs, agentContext, transcript, deadline, start, extractedText, heartbeat, textAlreadyEntered, maxTurns = 8, hostname, url: _targetUrl = null, _discoveryAlreadyAttempted = false, _preDecomposedSubTasks = null, _inheritedActionSignatureCounts = null, _inheritedJitDiscoveryFired = null, _progressCallbackUrl, _stepIndex, _abortSignal = null, flowCounter = null }) {
   const MAX_TURNS = maxTurns;
   const _loopTranscript = [...transcript];
 
@@ -12195,7 +12199,12 @@ async function _executeTurnLoopFallback({ goal, verificationGoal, sessionId, hea
     logger.info(`[playwright.agent] turn-loop: using pre-decomposed sub-tasks (${_subTasks.length} sub-tasks, cached from pre-check)`);
   } else if (!_discoveryAlreadyAttempted) {
     try {
-      const _decomp = await _decomposeGoalIntoSubTasks(goal, sessionId);
+      let _decompUrl = null;
+      try {
+        const _u = await _engineEval(sessionId, 'window.location.href');
+        if (_u?.ok && _u.result) _decompUrl = String(_u.result).trim().replace(/^"|"$/g, '');
+      } catch (_) {}
+      const _decomp = await _decomposeGoalIntoSubTasks(goal, sessionId, _decompUrl);
       if (_decomp.ok && _decomp.subTasks && _decomp.subTasks.length > 0) {
         _subTasks = _decomp.subTasks;
       }
@@ -12676,9 +12685,12 @@ ${_composeSel ? `- SUGGESTED COMPOSE SELECTOR: ${_composeSel}` : ''}`;
       if (_curUrl?.ok) {
         const _cur = String(_curUrl.result).trim().replace(/^"|"$/g, '');
         const _urlMatch = goal.match(/https?:\/\/[^\s"')]+/);
-        if (_urlMatch) {
+        // Prefer a URL embedded in the goal; otherwise fall back to the `url`
+        // arg playwrightAgent was invoked with (URL-first runs land there).
+        const _target = (_urlMatch ? _urlMatch[0] : null) || _targetUrl;
+        if (_target) {
           // Compare base URL (strip query params and hash)
-          const _targetBase = _urlMatch[0].replace(/[?#].*$/, '').replace(/\/$/, '');
+          const _targetBase = _target.replace(/[?#].*$/, '').replace(/\/$/, '');
           const _curBase = _cur.replace(/[?#].*$/, '').replace(/\/$/, '');
           if (_curBase === _targetBase || _cur.startsWith(_targetBase)) {
             _onTargetPage = true;
@@ -12796,7 +12808,18 @@ Turn ${turn}/${MAX_TURNS}. What is your next action? (DO NOT snapshot - act dire
       } catch (_) { /* parse error */ }
     }
 
-    if (!_action || !_action.action) {
+    // Normalize nested action: LLMs sometimes return {"action": {"action": "click", ...}}
+    // or {"action": {"type": "navigate", ...}} — unwrap one level so _action.action
+    // is always a string before dispatch (otherwise it stringifies to "[object Object]").
+    if (_action && typeof _action.action === 'object' && _action.action !== null) {
+      const _nested = _action.action;
+      if (typeof (_nested.action || _nested.type) === 'string') {
+        _action = { ..._nested, action: _nested.action || _nested.type };
+        logger.info(`[playwright.agent] turn-loop: unwrapped nested action object → "${_action.action}"`);
+      }
+    }
+
+    if (!_action || typeof _action.action !== 'string' || !_action.action) {
       logger.warn(`[playwright.agent] turn-loop: unparseable action at turn ${turn}: ${(_actionRaw || '').slice(0, 100)}`);
       _loopTranscript.push({ action: { action: 'parse_error' }, outcome: { ok: false, error: 'unparseable' } });
       continue;
@@ -13876,6 +13899,7 @@ Turn ${turn}/${MAX_TURNS}. What is your next action? (DO NOT snapshot - act dire
       const _procedureBlock = `\n\n[DISCOVERED PROCEDURE for ${hostname}:\n${_discovery.procedure}\nKey UI elements to look for: ${(_discovery.keyUiElements || []).join(', ') || 'n/a'}\nFollow these steps. Look for the specific UI elements mentioned above.]`;
       const _retryResult = await _executeTurnLoopFallback({
         goal: `${goal}${_procedureBlock}`,
+        url: _targetUrl,
         verificationGoal,
         sessionId, headed, timeoutMs, agentContext,
         transcript: _loopTranscript,
@@ -14139,7 +14163,14 @@ async function playwrightAgent(args) {
   // This is LLM-based — no regex. Falls back gracefully if decomposition fails.
   let _preDecomposedSubTasks = null;
   try {
-    const _decomp = await _decomposeGoalIntoSubTasks(goal, sessionId);
+    // Fetch the live URL so decomposition knows what's already loaded —
+    // prevents "Navigate to X" sub-tasks when URL-first nav already landed.
+    let _preDecompUrl = url || null;
+    try {
+      const _u = await _engineEval(sessionId, 'window.location.href');
+      if (_u?.ok && _u.result) _preDecompUrl = String(_u.result).trim().replace(/^"|"$/g, '') || _preDecompUrl;
+    } catch (_) {}
+    const _decomp = await _decomposeGoalIntoSubTasks(goal, sessionId, _preDecompUrl);
     if (_decomp.ok && _decomp.subTasks && _decomp.subTasks.length > 1) {
       _preDecomposedSubTasks = _decomp.subTasks;
       logger.info(`[playwright.agent] pre-check: goal decomposed into ${_preDecomposedSubTasks.length} sub-tasks — will skip field map (multi-step task)`);
@@ -16096,6 +16127,7 @@ Output ONLY valid JSON: {${_matchedSkill.params.map(p => `"${p.name}": "<extract
   try {
     const _turnLoopResult = await _executeTurnLoopFallback({
       goal: _finalGoal,
+      url,
       verificationGoal: effectiveGoal,
       extractedText: _extractedComposeText,
       textAlreadyEntered: _textAlreadyEntered,
@@ -17375,6 +17407,7 @@ Output a JSON plan: { "plan": [ { "action": "type", "selector": "eXX", "text": "
         try {
           const _turnLoopResult = await _executeTurnLoopFallback({
             goal: _finalGoal,
+            url,
             sessionId,
             headed,
             timeoutMs,
@@ -17669,6 +17702,7 @@ Output a JSON plan: { "plan": [ { "action": "type", "selector": "eXX", "text": "
         try {
           const _turnLoopResult = await _executeTurnLoopFallback({
             goal: _finalGoal,
+            url,
             sessionId,
             headed,
             timeoutMs,
@@ -18296,6 +18330,7 @@ Return JSON: { "thoughts": "strategy explanation", "plan": [...steps] }`;
       try {
         const _turnLoopResult = await _executeTurnLoopFallback({
           goal: _finalGoal || goal,
+          url,
           sessionId,
           headed,
           timeoutMs: 30000,

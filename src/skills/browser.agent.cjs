@@ -1436,6 +1436,19 @@ Value to type?`;
       { role: 'user', content: userPrompt },
     ], { maxTokens: 300, temperature: 0.1, responseTimeoutMs: 10000, taskType: 'light' });
     const val = (raw || '').trim().replace(/^```(?:text|plaintext)?\s*\n?/i, '').replace(/\n?```\s*$/, '').trim();
+    // Prose guard: chatty providers prepend explanations like "Based on the
+    // goal, the value to type is 'X'...". Salvage a quoted value if present,
+    // else return SKIP rather than typing the whole paragraph into the field.
+    if (!/^PRESS_/.test(val) && /^(based on|the (value|text|next|correct|appropriate|search|following)|i (will|would|recommend|suggest)|sure|certainly|to (type|enter|achieve|complete|accomplish)|for this goal|looking at|the next value)/i.test(val)) {
+      // Prefer double quotes — single-quote matching would clip apostrophes.
+      const _qm = val.match(/"([^"\n]{1,300})"/) || val.match(/[“‘]([^”’\n]{1,300})[”’]/) || val.match(/'([^'\n]{1,300})'/);
+      if (_qm) {
+        logger.info(`[browser.agent] _extractValue: salvaged quoted value "${_qm[1].slice(0, 60)}" from prose response`);
+        return _qm[1].trim().replace(/[.!?]+$/, '');
+      }
+      logger.warn(`[browser.agent] _extractValue: rejecting prose response: "${val.slice(0, 80)}"`);
+      return 'SKIP';
+    }
     logger.info(`[browser.agent] _extractValue: "${val.slice(0, 60)}" for field "${_focusedStr}"`);
     return val;
   } catch (e) {
@@ -1780,6 +1793,58 @@ Output ONLY the element number, or 0 if not found.`;
 // gatekeepers and during-tier pickers in the iteration loop.
 // ---------------------------------------------------------------------------
 
+// Goal-aware text sampler for verification prompts.
+// DOM innerText (getPageText) puts nav headers first — on pages like an Amazon
+// SERP the actual results appear thousands of chars in, so a plain
+// text.slice(0, N) shows the classifier only nav junk → false "not achieved".
+// Instead, sample: head + windows around occurrences of the goal's quoted
+// terms + tail, capped at maxChars. Pass-through for short texts.
+function _sampleTextForGoal(text, goal, maxChars = 2000) {
+  const t = String(text || '');
+  if (t.length <= maxChars) return t;
+  const HEAD = 400, WIN = 300, TAIL = 300;
+  const windows = [{ start: 0, end: Math.min(HEAD, t.length) }];
+  // Quoted phrases from the goal are the strongest signal (e.g. 'children's
+  // Bible storybook'). Also try the words inside quotes individually if the
+  // full phrase isn't found verbatim.
+  const quoted = (String(goal || '').match(/['"]([^'"]{3,})['"]/g) || [])
+    .map(q => q.replace(/^['"]|['"]$/g, ''));
+  const needles = quoted.length > 0 ? quoted
+    : (String(goal || '').match(/\b[A-Za-z][a-zA-Z]{4,}\b/g) || []).slice(0, 4);
+  const seen = [];
+  for (const needle of needles) {
+    let idx = 0;
+    const lower = t.toLowerCase(), n = needle.toLowerCase();
+    while (seen.length < 3) {
+      const at = lower.indexOf(n, idx);
+      if (at === -1) break;
+      // Skip occurrences already inside an existing window
+      if (!seen.some(s => at >= s - WIN && at <= s + WIN)) {
+        seen.push(at);
+        windows.push({ start: Math.max(0, at - 80), end: Math.min(t.length, at + WIN) });
+      }
+      idx = at + n.length;
+    }
+    if (seen.length >= 3) break;
+  }
+  windows.push({ start: Math.max(0, t.length - TAIL), end: t.length });
+  // Merge overlapping/adjacent windows, sort by position
+  windows.sort((a, b) => a.start - b.start);
+  const merged = [];
+  for (const w of windows) {
+    const last = merged[merged.length - 1];
+    if (last && w.start <= last.end + 40) last.end = Math.max(last.end, w.end);
+    else merged.push({ ...w });
+  }
+  let out = '';
+  for (const w of merged) {
+    const chunk = t.slice(w.start, w.end);
+    if (out.length + chunk.length + 20 > maxChars) break;
+    out += (out ? '\n[…]\n' : '') + chunk;
+  }
+  return out || t.slice(0, maxChars);
+}
+
 // Visual goal verification using OCR text.
 // Returns: 0 = failure (goal not achieved), 1 = done (goal achieved), 2 = wait (page processing)
 async function _ocrVerifyGoal(ocrText, goal, actionHistory = [], sessionId = null) {
@@ -1831,7 +1896,7 @@ Return ONLY the number.`;
 
   const userPrompt = `Goal: ${goal}
 OCR text from page:
-${(ocrText || '').slice(0, 500)}
+${_sampleTextForGoal(ocrText, goal)}
 Actions taken:
 ${historyStr}
 
@@ -1903,7 +1968,7 @@ Number (0-2)?`;
             } catch (_) {}
           }
 
-          const _ocrSection = `OCR text: ${(ocrText || '').slice(0, 400)}`;
+          const _ocrSection = `OCR text: ${_sampleTextForGoal(ocrText, goal, 800)}`;
           const _domSection = _domText ? `\nDOM text: ${_domText.slice(0, 800)}` : '';
           const reasonRaw = await askWithMessages([
             { role: 'system', content: 'In one sentence, state why the browser automation goal was NOT achieved. Quote the exact text from the page that indicates the blocker (e.g., \'Page shows: "Enable billing to access..."\'). If no specific blocker text is visible, describe what is missing versus the goal. Return ONLY the explanation.' },
@@ -2799,7 +2864,23 @@ Search text?`;
       { role: 'system', content: systemPrompt },
       { role: 'user', content: userPrompt },
     ], { maxTokens: 100, temperature: 0.1, responseTimeoutMs: 10000 });
-    const val = (raw || '').trim().replace(/^["']|["']$/g, '').replace(/^```(?:text|plaintext)?\s*\n?/i, '').replace(/\n?```\s*$/, '').trim();
+    let val = (raw || '').trim().replace(/^["']|["']$/g, '').replace(/^```(?:text|plaintext)?\s*\n?/i, '').replace(/\n?```\s*$/, '').trim();
+    // Prose guard: the response must be a short search snippet, not an
+    // explanation. Chatty providers return "Based on the goal, the search
+    // text is 'X'..." — salvage a quoted phrase if present, else reject.
+    // (Observed: a 342-char explanation got typed into the Meta+F find box.)
+    if (val.length > 80 || /\n/.test(val) || /^(based on|the (search|text|query|phrase|term|best|most)|i (would|recommend|suggest|will)|to (find|search|locate)|for this|looking at|the appropriate)/i.test(val)) {
+      // Prefer double quotes — single-quote matching would clip apostrophes
+      // (e.g. "children's Bible storybook" → "children").
+      const _qm = val.match(/"([^"\n]{2,80})"/) || val.match(/[“‘]([^”’\n]{2,80})[”’]/) || val.match(/'([^'\n]{2,80})'/);
+      if (_qm) {
+        val = _qm[1].trim().replace(/[.!?]+$/, '');
+        logger.info(`[browser.agent] _extractSearchText: salvaged quoted text "${val}" from prose response`);
+      } else {
+        logger.warn(`[browser.agent] _extractSearchText: rejecting prose response (${val.length} chars): "${val.slice(0, 80)}"`);
+        return '';
+      }
+    }
     logger.info(`[browser.agent] _extractSearchText: "${val}" for goal "${String(goal).slice(0, 50)}"`);
     return val;
   } catch (e) {
@@ -3257,9 +3338,11 @@ Which action? (return number or 0 for none)`;
     const raw = await askWithMessages([
       { role: 'system', content: systemPrompt },
       { role: 'user', content: userPrompt },
-    ], { maxTokens: 10, temperature: 0.1, responseTimeoutMs: 10000 });
+    ], { maxTokens: 30, temperature: 0.1, responseTimeoutMs: 10000 });
     const val = (raw || '').trim();
-    const num = parseInt(val);
+    // Strict parse: the response must be a bare integer. Prose like
+    // "I would pick action 3 because..." could mislead parseInt — reject it.
+    const num = /^\d{1,3}$/.test(val) ? parseInt(val, 10) : NaN;
     const _src = num >= 1 && num <= _allItems.length ? _allItems[num - 1].source : '?';
     logger.info(`[browser.agent] _extractShortcut: LLM picked "${val}" (parsed: ${num}) from ${_allItems.length} actions (global=${_globalKeys.length}, app=${appShortcuts.length}, category=${_catKeys.length}, picked source=${_src})`);
     if (!num || num < 1 || num > _allItems.length) return null;
@@ -11896,7 +11979,7 @@ When extracting page content with run-code, prioritize these selectors over gene
             // declaring success. If the classifier says fail (0), fall through to
             // iterative navigation (Tab-Flow will do in-app search/filter).
             try {
-              const _scClassify = await _ocrVerifyGoal(_pageText.slice(0, 800), task, [], sessionId);
+              const _scClassify = await _ocrVerifyGoal(_pageText, task, [], sessionId);
               if (_scClassify.num !== 1) {
                 logger.warn(`[browser.agent] tab-map: URL-first short-circuit — url matched but goal classifier returned ${_scClassify.num} (reason="${_scClassify.reason || ''}") — falling through to iterative navigation for in-app search`);
                 // Fall through to iterative navigation (do NOT return)
@@ -14495,6 +14578,7 @@ module.exports._extractSpreadsheetTargets = _extractSpreadsheetTargets;
 module.exports._extractGestureType = _extractGestureType;
 module.exports._extractGestureTargets = _extractGestureTargets;
 module.exports._ocrVerifyGoal = _ocrVerifyGoal;
+module.exports._sampleTextForGoal = _sampleTextForGoal;
 module.exports._ocrDetectLoading = _ocrDetectLoading;
 module.exports._ocrPickRow = _ocrPickRow;
 module.exports._ocrClassifyState = _ocrClassifyState;

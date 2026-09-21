@@ -750,7 +750,7 @@ Does the focused element text match the target? Be STRICT on text matching.
 - "Name & details" matches "My Playlist #5 – Edit details" → NO (focused is the page title, not the target)
 
 Output ONLY "YES" or "NO".` },
-    ], { maxTokens: 5, temperature: 0.1, responseTimeoutMs: 5000 });
+    ], { maxTokens: 20, temperature: 0.1, responseTimeoutMs: 5000 });
     const answer = (response || '').trim().toUpperCase();
     let match = answer.startsWith('YES');
 
@@ -1812,7 +1812,7 @@ Output ONLY the number, or 0 if no match.`;
     const response = await askWithMessages([
       { role: 'system', content: 'You pick the matching element from a list. The target text may be garbled (characters dropped within words). Match if the words align. Output ONLY the number, or 0 if no match. Nothing else.' },
       { role: 'user', content: prompt },
-    ], { maxTokens: 10, temperature: 0, responseTimeoutMs: 8000 });
+    ], { maxTokens: 30, temperature: 0, responseTimeoutMs: 8000 });
 
     const responseText = (response || '').trim();
     logger.info(`[instruction.runner] LLM pick raw response: "${responseText.substring(0, 80)}" (${responseText.length} chars) for "${verifyText}"`);
@@ -1876,7 +1876,7 @@ Output ONLY the element number, or 0 if none.`;
     const response = await askWithMessages([
       { role: 'system', content: 'You identify reveal buttons from a list. A reveal button reveals more content when clicked (e.g. "See more", "Load more", "Show all", "View all", "Expand", "More"). Output ONLY the element number, or 0 if none.' },
       { role: 'user', content: prompt },
-    ], { maxTokens: 10, temperature: 0, responseTimeoutMs: 8000 });
+    ], { maxTokens: 30, temperature: 0, responseTimeoutMs: 8000 });
     const responseText = (response || '').trim();
     logger.info(`[instruction.runner] LLM reveal-button raw response: "${responseText.substring(0, 80)}" (${responseText.length} chars)`);
     let id = 0;
@@ -4723,7 +4723,7 @@ async function _executeTypeWithDropdown(sessionId, targetLabel, maxOptions = 10)
     const raw = await askWithMessages([
       { role: 'system', content: 'You are a dropdown option matcher. Return ONLY the number (1-based index) of the option that best matches the target. Return 0 if no option matches.' },
       { role: 'user', content: `Target: "${targetLabel}"\n\nOptions:\n${numbered}\n\nWhich option number matches?` },
-    ], { maxTokens: 5, temperature: 0.1, responseTimeoutMs: 5000 });
+    ], { maxTokens: 30, temperature: 0.1, responseTimeoutMs: 5000 });
     const parsed = parseInt((raw || '').trim(), 10);
     if (parsed >= 1 && parsed <= allLabels.length) {
       matchIndex = parsed - 1;
@@ -4810,7 +4810,7 @@ async function _executeTypeCommands(sessionId, value, focusedElement, goal, page
       const raw = await askWithMessages([
         { role: 'system', content: 'You pick the best command from a list to achieve a goal. Return ONLY the number (e.g. "1"). No explanation.' },
         { role: 'user', content: `Goal: ${goal}\n\nAvailable commands:\n${_numberedList}\n\nWhich command number achieves this goal?` },
-      ], { maxTokens: 10, temperature: 0.1, responseTimeoutMs: 8000 });
+      ], { maxTokens: 30, temperature: 0.1, responseTimeoutMs: 8000 });
       const _num = parseInt((raw || '').trim(), 10);
       if (_num >= 1 && _num <= cachedCommands.length) {
         selectedCommand = cachedCommands[_num - 1];
@@ -6003,7 +6003,7 @@ async function _matchElementToStep(sessionId, step, tabMap, goalContext = '') {
     const raw = await askWithMessages([
       { role: 'system', content: 'Return ONLY the element ID number that best matches the target. No other text. Elements marked [SPONSORED] are ads — prefer non-sponsored elements unless the target explicitly asks for a sponsored/ad result.' },
       { role: 'user', content: `Target: "${step.target}"\nElements:\n${elementList}\n\nWhich element ID matches?` },
-    ], { maxTokens: 5, temperature: 0.1, responseTimeoutMs: 5000 });
+    ], { maxTokens: 30, temperature: 0.1, responseTimeoutMs: 5000 });
     const num = parseInt((raw || '').trim().replace(/\D/g, ''), 10);
     const match = tabMap.find(e => e.id === num);
     if (match) {
@@ -6638,7 +6638,7 @@ Actions:
 ${historyStr}
 
 Completed?` },
-    ], { maxTokens: 5, temperature: 0.1, responseTimeoutMs: 5000, taskType: 'classification' });
+    ], { maxTokens: 20, temperature: 0.1, responseTimeoutMs: 5000, taskType: 'classification' });
     const done = (raw || '').trim().toUpperCase().startsWith('YES');
     logger.info(`[instruction.runner] _checkDone: ${done ? 'YES' : 'NO'} (raw="${(raw || '').trim()}", title="${pageTitle || ''}", checkboxes=${checkboxCount || 0})`);
     return done;
@@ -6709,7 +6709,11 @@ async function _selectTierLLM(sessionId, goal, actionHistory, pageCategory, shor
   // Filter by per-category allowedTiers if the category config specifies one.
   // This prevents nonsensical tier cycling (e.g. social_feed → Gesture/Arrow-Grid).
   const _tierCatConfig = getCategoryConfig(pageCategory);
-  const _allowedTiers = _tierCatConfig?.allowedTiers || [1, 2, 3, 4, 5, 6];
+  // Default excludes tier 6 (ArrowGrid) — it is spreadsheet-only. Including it
+  // for non-spreadsheet categories caused "focus cell A1" runs on pages like
+  // Amazon. Spreadsheet config lists 6 explicitly in its own allowedTiers.
+  const _defaultTiers = pageCategory === 'spreadsheet' ? [1, 2, 3, 4, 5, 6] : [1, 2, 3, 4, 5];
+  const _allowedTiers = _tierCatConfig?.allowedTiers || _defaultTiers;
   const _availableTiers = _allowedTiers.filter(t => !triedTiers.has(t) && !disabledTiers.has(t));
 
   // If all tiers are tried, return -1 to signal exhaustion (caller presses Escape + resets)
@@ -6942,7 +6946,7 @@ Strategy? You MUST return exactly one of these numbers: ${_availableTiers.join('
     const raw = await askWithMessages([
       { role: 'system', content: systemPrompt },
       { role: 'user', content: userPrompt },
-    ], { maxTokens: 10, temperature: 0.1, responseTimeoutMs: 10000 });
+    ], { maxTokens: 30, temperature: 0.1, responseTimeoutMs: 10000 });
     // ESCALATE signal — hand off to playwright.agent (Turn-Loop).
     // Catch -1 BEFORE the digit-strip regex (which would turn -1 into 1).
     const _trimmed = (raw || '').trim();
@@ -6951,7 +6955,10 @@ Strategy? You MUST return exactly one of these numbers: ${_availableTiers.join('
       _emitTierProgressForTier(-1, progressCallbackUrl, stepIndex, agentId, sessionIdForProgress);
       return -1;
     }
-    const num = parseInt(_trimmed.replace(/\D/g, ''), 10);
+    // Strict parse: the response must be a bare integer. Prose like
+    // "the appropriate strategy is 4 because..." previously got digit-stripped
+    // into a misleading tier pick — now it's rejected and falls back safely.
+    const num = /^-?\d{1,2}$/.test(_trimmed) ? parseInt(_trimmed, 10) : NaN;
     // If LLM returns an invalid/tried/disabled tier, fall back to the first available
     // tier. Never hardcode to 4 (Tab-Map) — it may be disabled
     // (e.g. Creation deep-link = Just-type ONLY) and Tab-Map's Escape would destroy focus.
@@ -7531,6 +7538,28 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
     }
   } catch (e) {
     logger.warn(`[instruction.runner] Tab-Flow pre-computation failed (non-fatal): ${e.message}`);
+  }
+
+  // ── Tier-0-only flow early exit ──────────────────────────────────────
+  // If the planner decided every step is already done (e.g. URL-first nav
+  // landed on the target page and nothing remains), return immediately —
+  // don't enter the navigation loop, call _selectTierLLM, or run tiers.
+  if (_tabFlow && _tabFlow.length > 0 && _tabFlow.every(s => s.tier === 0)) {
+    logger.info(`[instruction.runner] Tab-Flow is done-only (${_tabFlow.length} step(s), all tier 0) — goal already achieved, skipping navigation loop`);
+    if (!extractedPageText && _shouldAutoExtract(taskClassification, stepType)) {
+      await browserAct({ action: 'waitForStableText', sessionId, headed: true, timeoutMs: 8000 }).catch(() => {});
+      const _gtResult = await browserAct({ action: 'getPageText', sessionId, headed: true, timeoutMs: 10000 }).catch(() => null);
+      if (_gtResult?.result || _gtResult?.stdout) {
+        extractedPageText = _gtResult.result || _gtResult.stdout || '';
+      }
+    }
+    const _resultStr = _buildResultString(goal, actionHistory, filledFields, extractedPageText);
+    _emitProgress(progressCallbackUrl, stepIndex, {
+      type: 'tab_flow:step_done',
+      flowIndex: _tabFlow.length,
+      totalSteps: _tabFlow.length,
+    }, agentId, sessionId);
+    return { ok: true, output: _resultStr, actionHistory, tabFlow: _tabFlow, agentId };
   }
 
   // ── Main loop ──────────────────────────────────────────────────────
@@ -8489,7 +8518,7 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
     // (Turn-Loop). Used when the page is too dense/complex for keyboard navigation
     // (e.g. Amazon/eBay/Etsy product grids, multi-step checkout flows).
     if (strategy === -1) {
-      logger.info(`[instruction.runner] ESCALATE (-1): handing off to playwright.agent (Turn-Loop) — pattern=${_statePattern?.pattern || '?'}, fillable=${_probe?.fillableCount || 0}, clickable=${_probe?.clickableCount || 0}, url=${currentUrl}`);
+      logger.info(`[instruction.runner] ESCALATE (-1): handing off to playwright.agent (Turn-Loop) — category=${_pageCategory || '?'}, fillable=${_probe?.fillableCount || 0}, clickable=${_probe?.clickableCount || 0}, url=${currentUrl}`);
       try {
         const { playwrightAgent } = require('./playwright.agent.cjs');
         const _escalateResult = await playwrightAgent({
@@ -9454,7 +9483,14 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
     }
 
     if (strategy === 6) {
-      // ArrowGrid — spreadsheet cell navigation using arrow keys
+      // ArrowGrid — spreadsheet cell navigation using arrow keys.
+      // Hard guard: never run on non-spreadsheet pages, even if the tier was
+      // somehow selected (e.g. misclassified category or a stale flow step).
+      if (_pageCategory !== 'spreadsheet') {
+        logger.warn(`[instruction.runner] ArrowGrid selected on non-spreadsheet page (category=${_pageCategory}) — marking tier tried and re-selecting`);
+        _triedTiers.add(6);
+        continue;
+      }
       // 1. Get current cell from DOM
       const _currentCell = await _getCurrentCell(sessionId);
       if (!_currentCell) {
@@ -9668,4 +9704,7 @@ module.exports = {
   _subPlanStepMatchesFlowStep,
   _reconcileFlowIndex,
   _tier4RunHint,
+  // Exported for testing (prose-rejection + ArrowGrid category guard)
+  _checkDone,
+  _selectTierLLM,
 };
