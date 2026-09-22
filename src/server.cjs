@@ -94,6 +94,7 @@ const { userAgent } = require('./skills/user.agent.cjs');
 const webAgent   = require('./skills/web.agent.cjs');
 const videoAgent = require('./skills/video.agent.cjs');
 const appAgent   = require('./skills/app.agent.cjs');
+const { editAgent } = require('./skills/edit.agent.cjs');
 const skillScheduler = require('./skill-helpers/skill-scheduler.cjs');
 const { startIdleWatcher, stopIdleWatcher, startScanScheduler, runMaintenanceScan, cancelMaintenanceScan, getScanStatus } = require('./skills/explore.agent.cjs');
 const { systemIntrospect } = require('./skills/system.introspect.cjs');
@@ -194,6 +195,9 @@ class CommandServiceMCPServer {
       case 'video.agent':
         return await this._skillVideoAgent(args);
 
+      case 'edit.agent':
+        return await this._skillEditAgent(args);
+
       case 'app.agent':
         return await this._skillAppAgent(args, opts);
 
@@ -244,6 +248,10 @@ class CommandServiceMCPServer {
 
   async _skillFsRead(args) {
     return await fsRead(args);
+  }
+
+  async _skillEditAgent(args) {
+    return await editAgent(args);
   }
 
   async _skillFileWatch(args) {
@@ -405,7 +413,7 @@ class CommandServiceMCPServer {
       success: true,
       service: this.serviceName,
       status: 'healthy',
-      skills: ['shell.run', 'browser.act', 'web.crawl', 'image.analyze', 'fs.read', 'file.watch', 'file.bridge', 'screen.capture', 'external.skill', 'cli.agent', 'browser.agent', 'playwright.agent', 'creator.agent', 'reviewer.agent', 'skillCreator.skill', 'project.builder', 'project.launcher', 'project.editor', 'project.stopper', 'app.agent', 'system.introspect', 'provider.discovery']
+      skills: ['shell.run', 'browser.act', 'web.crawl', 'image.analyze', 'fs.read', 'edit.agent', 'file.watch', 'file.bridge', 'screen.capture', 'external.skill', 'cli.agent', 'browser.agent', 'playwright.agent', 'creator.agent', 'reviewer.agent', 'skillCreator.skill', 'project.builder', 'project.launcher', 'project.editor', 'project.stopper', 'app.agent', 'system.introspect', 'provider.discovery']
     };
   }
 
@@ -524,7 +532,7 @@ class CommandServiceMCPServer {
         res.end(JSON.stringify({
           status: 'healthy',
           service: this.serviceName,
-          skills: ['shell.run', 'browser.act', 'web.crawl', 'image.analyze', 'fs.read', 'file.watch', 'file.bridge', 'screen.capture', 'external.skill', 'cli.agent', 'browser.agent', 'playwright.agent', 'creator.agent', 'reviewer.agent', 'skillCreator.skill', 'project.builder', 'project.launcher', 'project.editor', 'project.stopper', 'app.agent', 'system.introspect', 'provider.discovery']
+          skills: ['shell.run', 'browser.act', 'web.crawl', 'image.analyze', 'fs.read', 'edit.agent', 'file.watch', 'file.bridge', 'screen.capture', 'external.skill', 'cli.agent', 'browser.agent', 'playwright.agent', 'creator.agent', 'reviewer.agent', 'skillCreator.skill', 'project.builder', 'project.launcher', 'project.editor', 'project.stopper', 'app.agent', 'system.introspect', 'provider.discovery']
         }));
         return;
       }
