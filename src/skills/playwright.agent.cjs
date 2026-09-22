@@ -6470,6 +6470,7 @@ Was this goal achieved? Consider:
 - Were the actions taken consistent with completing the goal — or did the agent stop at an intermediate step (e.g. only searched for X but never added/moved/saved it to Y)?
 - For "add/move/save X to Y" goals: is X actually IN Y now (visible on the destination page/section), not just visible in search results?
 - For "create X" goals: does the page show X was created (e.g. URL contains the new item, page text contains the name)?
+- The goal describes a page STATE, not an action log — if the CURRENT PAGE already satisfies the goal (e.g. a deep link already performed the search, or the item is already in the destination), return achieved:true even if individual actions failed, timed out, or were unnecessary.
 
 Return ONLY valid JSON:
 {"achieved": true/false, "reasoning": "1-2 sentence explanation citing the evidence"}`;
@@ -15696,6 +15697,14 @@ Output ONLY valid JSON: {${_matchedSkill.params.map(p => `"${p.name}": "<extract
           if (_sameOrigin && _pathMatch) {
             _goalStateNote = `\n\nNOTE: The browser is ALREADY on ${_curUrl}. Do NOT add a navigate step — start directly with the task actions using refs from the snapshot above.`;
             logger.info(`[playwright.agent] goal-state: already on target URL ${_curUrl} — injecting skip-navigate note`);
+            // Search deep-link: the URL itself executed the search — the results
+            // page is already the goal state. Without this note the planner
+            // re-fills and re-submits the search box ("search again" bug).
+            const _SP = ['k','q','query','search_query','searchterm','keyword','term','field-keywords','st','find_desc','_nkw'];
+            if (_SP.some(p => _tgt.searchParams.get(p)) && /search|find|look for|look up/i.test(goal)) {
+              _goalStateNote += `\n\nNOTE: The search results for the goal's query are ALREADY displayed — URL-first navigation executed the search. Do NOT fill or submit the search box again. If the goal is already satisfied by the current page, return an empty plan (plan: []).`;
+              logger.info(`[playwright.agent] goal-state: search deep-link on results page — injecting "search already executed" note`);
+            }
           }
         } catch (_) {
           // URL parse fallback — use startsWith for non-standard URLs

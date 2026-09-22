@@ -3128,7 +3128,8 @@ GOAL-RELEVANCE RULES (CRITICAL):
 - Every step MUST directly contribute to achieving the goal. Do NOT include steps that open unrelated features (e.g., "open Gemini AI chat", "open keyboard shortcuts help") unless the goal explicitly asks for them.
 - Only use shortcuts that are listed in the "Available shortcuts" section. Do NOT invent shortcuts (e.g., "Alt+G") that are not in the list.
 - If the goal involves navigating to a specific page/section, use the search shortcut (/) or navigation shortcut (.) to get there — do NOT open unrelated side panels or chat features.
-- If no available shortcut helps achieve the goal, use Tier 4 (Tab-Map) to click the target element directly.`;
+- If no available shortcut helps achieve the goal, use Tier 4 (Tab-Map) to click the target element directly.
+- TERMINAL ACTION BOUND: stop at the goal's final requested action. Never include checkout, payment, shipping-address, or order-placement steps unless the goal explicitly asks to complete a purchase. For "add X to cart" goals the flow ends once the item is confirmed in the cart.`;
 
   const userPrompt = `Goal: ${goal}\nPage category: ${pageCategory || 'web_generic'}\nAvailable shortcuts:\n${shortcutLabels || '(none)'}\nCurrent URL: ${currentUrl || '(unknown)'}\nAgent: ${agentId || '(unknown)'}${urlFirstNav ? `\nURL-FIRST NAVIGATION: true\nDEEP LINK TYPE: ${deepLinkType || 'none'}${deepLinkType === 'compose' ? '\nNOTE: The compose window is ALREADY open. Do NOT include a step to click Compose, New, or Write. Start directly with filling the fields (recipient, subject, body) then click Send.' : ''}${deepLinkType === 'creation' ? '\nNOTE: The entity has ALREADY been created. Do NOT include a step to click New or Create. Start directly with the first input field.' : ''}` : ''}`;
 
@@ -10249,7 +10250,10 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
             // But if _curUrl IS already startUrl (canonical form), re-navigating
             // changes nothing — the LLM likely false-positived on a header
             // "Sign in" link (e.g. Amazon shows one even when logged in).
-            const _canon = (u) => { try { const _p = new URL(u); return `${_p.hostname.replace(/^www\./,'')}${_p.pathname.replace(/\/+$/,'')}${_p.search}`; } catch (_) { return String(u || ''); } };
+            // Compare DECODED, sorted query params — raw `_p.search` differs on
+            // encoding alone (%27 vs ', + vs %20) and would defeat this guard,
+            // re-navigating to the identical page ("marketing page" false-positive).
+            const _canon = (u) => { try { const _p = new URL(u); const _q = Array.from(_p.searchParams.entries()).map(([k, v]) => `${k}=${v}`).sort().join('&'); return `${_p.hostname.replace(/^www\./,'')}${_p.pathname.replace(/\/+$/,'')}?${_q}`; } catch (_) { return String(u || ''); } };
             if (_canon(_curUrl) === _canon(startUrl)) {
               logger.info(`[browser.agent] run: URL-first enforcement — already at target URL ${_curUrl} — marketing-page verdict ignored (no-op navigation skipped) for ${agentId}`);
               _postEnforcementUrl = _curUrl;
