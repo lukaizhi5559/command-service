@@ -204,6 +204,45 @@ async function main() {
 
   _llmResponder = null;
 
+  console.log('\n--- rtf converted draft + apply write-back ---');
+  // Build a typo'd .rtf via textutil from a plain-text source.
+  const rtfSrc = write('rtf-src.txt', 'Meeting notes\n\nThe deadline moved to next Wenesday. Please reveiw the attached documnet.\n');
+  const rtfPath = path.join(TMP, 'test.rtf');
+  const conv = spawnSync('textutil', ['-convert', 'rtf', rtfSrc, '-output', rtfPath]);
+  check('rtf fixture created', conv.status === 0 && fs.existsSync(rtfPath), (conv.stderr || '').toString().slice(0, 200));
+
+  _llmResponder = (msgs) => msgs[1].content.includes('"ops"')
+    ? '{"ops":[{"find":"Wenesday","replace":"Wednesday"},{"find":"reveiw","replace":"review"},{"find":"documnet","replace":"document"}]}'
+    : _llmResponse;
+  r = await editAgent({ goal: 'fix the typos', filePath: rtfPath });
+  check('rtf edit ok, draft mode, converted', r.ok === true && r.mode === 'draft' && r.converted === true && fs.existsSync(r.draftPath), JSON.stringify(r));
+  check('rtf draft is a .docx', /\.docx$/.test(r.draftPath || ''), r.draftPath);
+  const rtfDraft = r.draftPath;
+  let back = spawnSync('textutil', ['-convert', 'txt', rtfPath, '-stdout']);
+  check('original rtf untouched', back.stdout.includes('Wenesday'), back.stdout.slice(0, 120));
+
+  // apply — .docx draft writes back to .rtf via textutil (was ext_mismatch before)
+  r = await editAgent({ mode: 'apply', draftPath: rtfDraft, filePath: rtfPath });
+  check('rtf apply ok via docx→rtf write-back', r.ok === true && r.changed === true && r.converted === true, JSON.stringify(r));
+  back = spawnSync('textutil', ['-convert', 'txt', rtfPath, '-stdout']);
+  check('rtf now contains fixes', back.stdout.includes('Wednesday') && back.stdout.includes('review') && back.stdout.includes('document'), back.stdout.slice(0, 200));
+  check('rtf apply made a backup', typeof r.backupPath === 'string' && fs.existsSync(r.backupPath));
+
+  // Non-convertible pair still refuses: .docx draft → .md target
+  const mdTarget = write('target.md', ORIGINAL);
+  r = await editAgent({ mode: 'apply', draftPath: rtfDraft, filePath: mdTarget });
+  check('docx→md still ext_mismatch', r.ok === false && r.reason === 'ext_mismatch', JSON.stringify(r));
+
+  // ── _matchDocPaths — doc-app holder path matching (NSDocument apps report
+  // open documents via AppleScript since lsof can't see their closed fds).
+  const { _matchDocPaths } = require('../src/skills/edit.agent.cjs');
+  const realFile = write('real.md', 'x\n');
+  check('match same path', _matchDocPaths([realFile, '/other/file.txt'], realFile));
+  check('no match for different file', !_matchDocPaths(['/other/file.txt', '/tmp/x.md'], realFile));
+  check('match through /var→/private/var symlink', _matchDocPaths(
+    [realFile.replace('/var/', '/private/var/')], realFile));
+  check('empty list → no match', !_matchDocPaths([], realFile));
+
   console.log(`\n${passed} passed, ${failed} failed`);
   if (failures.length) console.log(`Failures: ${failures.join(', ')}`);
   fs.rmSync(TMP, { recursive: true, force: true });

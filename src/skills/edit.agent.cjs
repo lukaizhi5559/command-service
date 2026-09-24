@@ -152,19 +152,85 @@ function _draftPathFor(filePath, extOverride) {
 // the app may auto-save over an in-place write, so drafts are mandatory.
 // `lsof -F c` returns full command names (the default column truncates ~9
 // chars); lines look like `cTextEdit` / `p1234` — we keep the c-prefixed ones.
+// Document-based apps that hold files via NSDocument-style in-memory buffers —
+// they close the fd after reading, so `lsof` never sees them. Detection requires
+// asking the app for its open documents via AppleScript. (VS Code is excluded
+// deliberately: it watches files and reloads external changes safely.)
+const _DOC_APP_NAMES = [
+  'TextEdit', 'Microsoft Word', 'Microsoft Excel', 'Microsoft PowerPoint',
+  'Pages', 'Numbers', 'Keynote', 'BBEdit', 'CotEditor', 'TextMate',
+  'SubEthaEdit', 'Preview',
+];
+
+// Normalize a path for comparison (resolves symlinks like /var → /private/var).
+function _normPath(p) {
+  try { return fs.realpathSync(String(p).trim()); } catch (_) { return String(p).trim(); }
+}
+
+// Pure matcher — which doc-app path strings refer to targetPath?
+function _matchDocPaths(docPaths, targetPath) {
+  const t = _normPath(targetPath);
+  return docPaths.some(p => _normPath(p) === t);
+}
+
+// Ask each running document app for its open documents and match the target.
+// Two query forms: `path of every document` (TextEdit/BBEdit) and
+// `POSIX path of (file of every document)` (Word/Pages-style file objects).
+// Fails soft per app — osascript errors (non-scriptable, denied automation
+// consent) just skip it.
+function _docAppHolders(filePath) {
+  const holders = [];
+  try {
+    const procs = spawnSync('osascript', ['-e',
+      'tell application "System Events" to get name of every process whose background only is false'],
+      { timeout: 10000, encoding: 'utf8' });
+    if (procs.status !== 0 || !procs.stdout) return holders;
+    const running = new Set(procs.stdout.split(',').map(s => s.trim()).filter(Boolean));
+    const candidates = _DOC_APP_NAMES.filter(a => running.has(a));
+    for (const app of candidates) {
+      const script = [
+        `tell application "${app}"`,
+        '  set out to ""',
+        '  try',
+        '    set ps to path of every document',
+        '    repeat with p in ps',
+        '      set out to out & p & linefeed',
+        '    end repeat',
+        '  on error',
+        '    try',
+        '      set fs to file of every document',
+        '      repeat with f in fs',
+        '        set out to out & (POSIX path of f) & linefeed',
+        '      end repeat',
+        '    end try',
+        '  end try',
+        '  return out',
+        'end tell',
+      ].join('\n');
+      const r = spawnSync('osascript', ['-e', script], { timeout: 15000, encoding: 'utf8' });
+      if (r.status !== 0 || !r.stdout) continue;
+      const docPaths = r.stdout.split('\n').map(s => s.trim()).filter(Boolean);
+      if (_matchDocPaths(docPaths, filePath)) holders.push(app);
+    }
+  } catch (_) {}
+  return holders;
+}
+
 function _openFileHolders(filePath) {
+  const holders = new Set();
   try {
     const r = spawnSync('lsof', ['-F', 'c', '--', filePath], { timeout: 5000, encoding: 'utf8' });
-    if (r.status !== 0 || !r.stdout) return [];
-    return [...new Set(
-      String(r.stdout).split('\n')
-        .filter(l => l.length > 1 && l[0] === 'c')
-        .map(l => l.slice(1).trim())
-        .filter(Boolean)
-    )];
-  } catch (_) {
-    return [];
-  }
+    if (r.status === 0 && r.stdout) {
+      for (const l of String(r.stdout).split('\n')) {
+        if (l.length > 1 && l[0] === 'c') {
+          const name = l.slice(1).trim();
+          if (name) holders.add(name);
+        }
+      }
+    }
+  } catch (_) {}
+  for (const app of _docAppHolders(filePath)) holders.add(app);
+  return [...holders];
 }
 
 function _isFileOpen(filePath) {
@@ -216,22 +282,11 @@ function _unifiedDiff(oldText, newText, label) {
 const _depCache = {};
 function _ensurePyDep(moduleName, pipName) {
   if (_depCache[moduleName]) return _depCache[moduleName];
-  const probe = () => spawnSync('python3', ['-c', `import ${moduleName}`], { timeout: 15000 });
-  try {
-    if (probe().status === 0) return (_depCache[moduleName] = { ok: true });
-    logger.info(`[edit.agent] python module '${moduleName}' missing — pip install --user ${pipName}`);
-    const inst = spawnSync('python3', ['-m', 'pip', 'install', '--user', '--quiet', pipName], { timeout: 180000 });
-    if (inst.status !== 0) {
-      return (_depCache[moduleName] = {
-        ok: false,
-        error: `python module '${moduleName}' missing and 'pip3 install --user ${pipName}' failed — install it manually (or via pipx/venv)`,
-      });
-    }
-    if (probe().status === 0) return (_depCache[moduleName] = { ok: true });
-    return (_depCache[moduleName] = { ok: false, error: `python module '${moduleName}' still missing after install` });
-  } catch (e) {
-    return (_depCache[moduleName] = { ok: false, error: `python3 unavailable: ${e.message}` });
-  }
+  // Shared dep registry — 'python-docx' manifest name covers the 'docx' module.
+  const { ensurePipSync } = require('../skill-helpers/deps.cjs');
+  const depName = pipName || moduleName;
+  const r = ensurePipSync(depName === 'docx' ? 'python-docx' : depName);
+  return (_depCache[moduleName] = r);
 }
 
 // ── Small file editing (≤ SMALL_FILE_MAX) ────────────────────────────────────
@@ -466,7 +521,13 @@ function _applyDraft(draftPath, filePath) {
   if (!fs.existsSync(draftPath)) {
     return { ok: false, error: `Draft not found: ${draftPath}`, reason: 'no_draft' };
   }
-  if (path.extname(draftPath).toLowerCase() !== path.extname(filePath).toLowerCase()) {
+  const _draftExt = path.extname(draftPath).slice(1).toLowerCase();
+  const _targetExt = path.extname(filePath).slice(1).toLowerCase();
+  // A .docx draft may write back to legacy/convertible targets via textutil —
+  // that's how rtf/doc drafts were produced in the first place.
+  const _WRITEBACK_EXTS = new Set(['rtf', 'doc', 'odt', 'wordml', 'html', 'txt']);
+  const _needsWriteBack = _draftExt === 'docx' && _draftExt !== _targetExt && _WRITEBACK_EXTS.has(_targetExt);
+  if (_draftExt !== _targetExt && !_needsWriteBack) {
     return {
       ok: false,
       error: `Draft extension (${path.extname(draftPath)}) does not match target (${path.extname(filePath)}) — converted drafts must be saved manually`,
@@ -507,7 +568,15 @@ function _applyDraft(draftPath, filePath) {
   const backupPath = _backup(filePath);
   const tmp = `${filePath}.thinkdrop-tmp`;
   try {
-    fs.copyFileSync(draftPath, tmp);
+    if (_needsWriteBack) {
+      const r = spawnSync('textutil', ['-convert', _targetExt, draftPath, '-output', tmp], { timeout: 30000 });
+      if (r.status !== 0 || !fs.existsSync(tmp)) {
+        try { fs.unlinkSync(tmp); } catch (_) {}
+        return { ok: false, error: `textutil could not convert draft to ${_targetExt}: ${(r.stderr || '').toString().slice(0, 200)}`, reason: 'office_ops_failed' };
+      }
+    } else {
+      fs.copyFileSync(draftPath, tmp);
+    }
     if (fs.statSync(filePath).mtimeMs !== mtimeAtRead) {
       fs.unlinkSync(tmp);
       return { ok: false, error: 'File changed on disk during apply — re-check and retry', reason: 'mtime_conflict' };
@@ -517,9 +586,9 @@ function _applyDraft(draftPath, filePath) {
     try { fs.unlinkSync(tmp); } catch (_) {}
     return { ok: false, error: `Apply failed: ${e.message}`, reason: 'write_failed' };
   }
-  const summary = `Applied draft ${path.basename(draftPath)} → ${filePath}${_closedIn.length ? ` (closed in ${_closedIn.join(', ')} first)` : ''}`;
+  const summary = `Applied draft ${path.basename(draftPath)} → ${filePath}${_needsWriteBack ? ` (converted docx→${_targetExt})` : ''}${_closedIn.length ? ` (closed in ${_closedIn.join(', ')} first)` : ''}`;
   logger.info(`[edit.agent] ${summary}`);
-  return { ok: true, filePath, changed: true, appliedEdits: 1, skippedEdits: [], backupPath, closedIn: _closedIn, summary, stdout: summary };
+  return { ok: true, filePath, changed: true, appliedEdits: 1, skippedEdits: [], backupPath, closedIn: _closedIn, converted: _needsWriteBack, writeBack: _needsWriteBack ? _targetExt : undefined, summary, stdout: summary };
 }
 
 // ── Main entry point ─────────────────────────────────────────────────────────
@@ -682,4 +751,4 @@ async function editAgent(args = {}) {
   };
 }
 
-module.exports = { editAgent };
+module.exports = { editAgent, _matchDocPaths, _openFileHolders };

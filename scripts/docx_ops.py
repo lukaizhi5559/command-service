@@ -17,6 +17,7 @@
 # With "all": true, every matching paragraph/cell is edited.
 
 import sys
+import os
 import json
 import shutil
 
@@ -59,7 +60,9 @@ def extract(path):
 def apply_ops(src, dst):
     payload = json.load(sys.stdin)
     ops = payload.get('ops', [])[:40]
-    shutil.copyfile(src, dst)
+    # Converted drafts (rtf/doc) live at workPath — src==dst means apply in place.
+    if os.path.realpath(src) != os.path.realpath(dst):
+        shutil.copyfile(src, dst)
     d = docx.Document(dst)
     applied = 0
     missed = 0

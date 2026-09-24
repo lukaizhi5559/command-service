@@ -481,7 +481,7 @@ async function _resolveGoalToCommand(goal, onProgress) {
 //   4. Runs the new command
 // Returns the retry result, or null if discovery retry didn't apply / failed.
 // ---------------------------------------------------------------------------
-async function _discoveryRetry(scriptBody, goal, cwd, env, oauthEnv, timeoutMs, stdin, _progressCallback) {
+async function _discoveryRetry(scriptBody, goal, cwd, env, oauthEnv, timeoutMs, stdin, _progressCallback, protectedPaths) {
   if (!scriptBody || !scriptBody.includes('|')) return null;
   if (!goal) return null; // only applies to goal-resolved commands, not pre-built argv
   if (!skillLlm.isAvailable()) return null;
@@ -500,6 +500,7 @@ async function _discoveryRetry(scriptBody, goal, cwd, env, oauthEnv, timeoutMs, 
     env: { ...oauthEnv, ...env },
     timeoutMs: Math.min(timeoutMs, MAX_TIMEOUT_MS),
     stdin,
+    protectedPaths,
   }, null);
 
   if (!sourceResult.stdout || !sourceResult.stdout.trim()) {
@@ -556,6 +557,7 @@ ${sourceResult.stdout.slice(0, 2000)}`;
       env: { ...oauthEnv, ...env },
       timeoutMs: Math.min(timeoutMs, MAX_TIMEOUT_MS),
       stdin,
+      protectedPaths,
     }, _progressCallback || null);
 
     // Verify the retry result
@@ -1474,8 +1476,42 @@ async function _withScreenshotFlash(fn) {
   }
 }
 
+// ── Protected-path sandbox (Seatbelt) ────────────────────────────────────
+// Attached user files ([File: …]/[Folder: …] tags) must never be rewritten by
+// raw shell commands — they route through edit.agent's draft/backup/diff
+// rails. Rather than parsing scripts for write patterns (unbounded: open(w),
+// sed -i, >, tee, dd, rm, mv, compiled tools, …), deny file-write* on the
+// protected paths at the kernel boundary — every write mechanism fails EPERM,
+// reads unaffected, and it works even when the command references the file
+// indirectly (cwd-relative paths, env vars, child processes).
+const SANDBOX_EXEC = '/usr/bin/sandbox-exec';
+let _sandboxAvailable = null;
+function _sandboxProfile(protectedPaths) {
+  if (!Array.isArray(protectedPaths) || protectedPaths.length === 0) return null;
+  if (_sandboxAvailable === null) {
+    try { _sandboxAvailable = fs.existsSync(SANDBOX_EXEC); } catch (_) { _sandboxAvailable = false; }
+    if (!_sandboxAvailable) logger.warn('[shell.run] sandbox-exec unavailable — protected-path enforcement disabled (fail-open)');
+  }
+  if (!_sandboxAvailable) return null;
+  const rules = [];
+  for (const entry of protectedPaths) {
+    const resolved = typeof entry === 'string' ? entry : entry?.resolved;
+    if (!resolved) continue;
+    // Seatbelt literals match canonical paths — callers must realpath-resolve.
+    const esc = String(resolved).replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+    rules.push(`(deny file-write* (literal "${esc}"))`);
+  }
+  return rules.length ? `(version 1)(allow default)${rules.join('')}` : null;
+}
+
 function runProcess(cmd, argv, options, onProgress) {
-  return new Promise((resolve) => {
+  return new Promise((_resolve) => {
+    const _sbxProfile = _sandboxProfile(options?.protectedPaths);
+    const resolve = (r) => _resolve(_sbxProfile ? { ...r, sandboxed: true } : r);
+    if (_sbxProfile) {
+      argv = ['-p', _sbxProfile, cmd, ...(argv || [])];
+      cmd = SANDBOX_EXEC;
+    }
     const startTime = Date.now();
 
     const spawnOpts = {
@@ -1601,6 +1637,7 @@ async function shellRun(args) {
     stdin,
     goal,
     _progressCallback,
+    protectedPaths,
   } = args || {};
 
   // ── Goal resolution path ─────────────────────────────────────────────────
@@ -1725,6 +1762,7 @@ async function shellRun(args) {
     env: { ...oauthEnv, ...env },
     timeoutMs: Math.min(timeoutMs, MAX_TIMEOUT_MS),
     stdin,
+    protectedPaths,
   }, _progressCallback || null);
 
   // Hide ThinkDrop's own UI while screencapture runs (clean screenshots).
@@ -1758,7 +1796,7 @@ async function shellRun(args) {
     goal  // only for goal-resolved commands, not pre-built argv
   ) {
     const discoveryResult = await _discoveryRetry(
-      scriptBody, goal, cwd, env, oauthEnv, timeoutMs, stdin, _progressCallback || null
+      scriptBody, goal, cwd, env, oauthEnv, timeoutMs, stdin, _progressCallback || null, protectedPaths
     );
     if (discoveryResult) {
       // Return the discovery retry result (whether it succeeded or failed).

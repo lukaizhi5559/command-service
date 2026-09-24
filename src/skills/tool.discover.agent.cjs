@@ -20,8 +20,8 @@ const logger = require('../logger.cjs');
 const { ask } = require('../skill-helpers/skill-llm.cjs');
 const db     = require('../skill-helpers/skill-db.cjs');
 
-const WEB_SEARCH_API_URL = process.env.MCP_WEB_SEARCH_URL;
-const WEB_SEARCH_API_KEY = process.env.MCP_WEB_SEARCH_API_KEY;
+const WEB_SEARCH_API_URL = process.env.MCP_WEB_SEARCH_URL || 'http://127.0.0.1:3002';
+const WEB_SEARCH_API_KEY = process.env.MCP_WEB_SEARCH_API_KEY || process.env.MCP_API_KEY || '';
 
 const SKILL_NAMESPACE = 'tool.discover';
 
