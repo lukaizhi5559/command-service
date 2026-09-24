@@ -4983,10 +4983,26 @@ function _isPureSearchTask(task) {
   // Must be a search/lookup request
   const hasSearchVerb = /\b(search|find|look up|lookup)\b/.test(t);
   if (!hasSearchVerb) return false;
+  // "Extract the list of videos with titles and links" is a LISTING task —
+  // extract refers to SERP results, not consuming a single video's content.
+  // Only treat "extract" as video consumption when it isn't list-scoped.
+  const _isListExtract = /\bextract\b[^.]*\b(list|videos?|results?|links?|titles?|items?)\b/.test(t);
   // Must NOT ask for video consumption/extraction/analysis
-  const videoExtraction = /\b(watch|play|view|open|summarize|summarise|extract|describe|explain|analyze|analyse|learn from|transcript|steps|content)\b/.test(t);
+  const videoExtraction = /\b(watch|play|view|open|summarize|summarise|describe|explain|analyze|analyse|learn from|transcript|steps|content)\b/.test(t)
+    || (/\bextract\b/.test(t) && !_isListExtract);
   if (videoExtraction) return false;
   return true;
+}
+
+// ---------------------------------------------------------------------------
+// _shouldSkipVideoDelegation — keep listing/search tasks in browser.agent
+// instead of delegating to video.agent (which is single-video find+watch).
+// The classifier's mediaListing flag is authoritative when present; the
+// _isPureSearchTask regex is the fallback for unclassified invocations.
+// ---------------------------------------------------------------------------
+function _shouldSkipVideoDelegation(task, taskCls) {
+  if (taskCls?.mediaListing === 'video') return true;
+  return _isPureSearchTask(task);
 }
 
 // ---------------------------------------------------------------------------
@@ -10455,7 +10471,10 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
 
         // Pure search/lookup tasks should stay in browser.agent instead of being handed to video.agent.
         // e.g. "search YouTube for sourdough bread tutorials" should use the Search Videos playbook.
-        if (delegateSkill === 'video.agent' && _isPureSearchTask(task)) {
+        // The classifier's mediaListing flag is authoritative when present — a 'video'
+        // listing task is definitionally a search, regardless of step phrasing. The
+        // regex heuristic is the fallback for unclassified invocations (_taskCls null).
+        if (delegateSkill === 'video.agent' && _shouldSkipVideoDelegation(task, _taskCls)) {
           logger.info(`[browser.agent] run: pure search task detected for ${agentId} — keeping in browser.agent, skipping video.agent delegation`);
           _matchedPlaybook = _matchedPlaybook
             .split(/(?=\n### )/)
@@ -14604,3 +14623,5 @@ module.exports._saveTabFlowCache = _saveTabFlowCache;
 module.exports._failTabFlowCache = _failTabFlowCache;
 module.exports._detectSuccessfulSend = _detectSuccessfulSend;
 module.exports._SEND_ENDPOINT_RE = _SEND_ENDPOINT_RE;
+module.exports._isPureSearchTask = _isPureSearchTask;
+module.exports._shouldSkipVideoDelegation = _shouldSkipVideoDelegation;

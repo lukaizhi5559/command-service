@@ -1,7 +1,7 @@
 // edit.agent.cjs — File-based editing agent for semantic text edits.
 // Works like a mini Devin: reads a file, understands the goal, applies edits,
-// saves — with safety rails. Phase 2 adds draft/apply modes, region-anchored
-// edits for large files, and structured Office handlers.
+// saves — with safety rails. Phase 2 adds draft/apply modes, tiered
+// find/replace ops editing for large files, and structured Office handlers.
 //
 // Used by:
 //   - command.automate dispatch (skill: 'edit.agent') — plan-level file edits
@@ -49,10 +49,10 @@ const logger = _logger;
 // Whole-file rewrites must fit the LLM output budget with margin — 8k chars
 // ≈ 2-3k tokens, well under the 8000-token cap.
 const SMALL_FILE_MAX = 8000;
-// Region-anchored edits cover files up to ~50k tokens of content.
+// Whole-file/chunked ops passes are capped at ~50k tokens of content.
+// Targeted slices (line range / symbol / quoted text) have no cap — the LLM
+// only ever sees a bounded window.
 const LARGE_FILE_MAX = 200000;
-// Region window around an anchor hit (line-aligned, ± this many chars).
-const REGION_RADIUS = 3000;
 // Reject rewrites that come back drastically shorter — the old 30% floor let
 // 50% truncations pass and silently destroyed content.
 const MIN_REWRITE_RATIO = 0.6;
@@ -332,83 +332,490 @@ Edited content:`;
   }
 }
 
-// ── Region-anchored editing (SMALL_FILE_MAX < size ≤ LARGE_FILE_MAX) ─────────
-// Anchor candidates: quoted spans in the goal are literal text the user is
-// pointing at ("fix the 'misstake' typo"). A unique indexOf hit anchors a
-// line-aligned window; the LLM rewrites only that window and we splice it back.
-function _literalAnchors(goal) {
-  const out = [];
-  const re = /["'`]([^"'`\n]{3,120})["'`]/g;
-  let m;
-  while ((m = re.exec(String(goal)))) out.push(m[1]);
-  return out;
+// ── Ops-based editing (SMALL_FILE_MAX < size; targeted slices at any size) ───
+// The LLM emits self-locating {find, replace, occurrence?} ops — find is
+// verbatim text copied from the slice it was shown. Application is
+// deterministic indexOf/replace: no "locate the region" LLM call, no
+// window-rewrite drift, and unchanged text passes through byte-identical.
+
+const OP_FIND_MAX = 2000;        // a giant find is just rewrite-with-extra-steps
+const CHUNK_MAX = 6000;          // global-pass chunk size (paragraph-aligned)
+const WINDOW_MAX = 8000;         // targeted window cap
+const LINE_PAD = 20;             // context lines around an explicit line range
+
+// Whitespace/curly-quote/dash-tolerant indexOf. Returns {index, length} in
+// ORIGINAL coordinates (length = matched span in `text`, may differ from
+// needle length after normalization) or null. opts.ci adds a case-fold tier —
+// locate-only (_findTarget); _applyOps stays strict so ops can't replace text
+// with different casing than the model saw.
+function _normalizedIndexOf(text, needle, opts = {}) {
+  let idx = text.indexOf(needle);
+  if (idx >= 0) return { index: idx, length: needle.length };
+
+  const ci = !!opts.ci;
+  const fold = (ch) => ci ? ch.toLowerCase() : ch;
+  const norm = (s) => {
+    let out = s
+      .replace(/[\u2018\u2019]/g, "'").replace(/[\u201C\u201D]/g, '"')
+      .replace(/[\u2013\u2014]/g, '-').replace(/\s+/g, ' ');
+    return ci ? out.toLowerCase() : out;
+  };
+  const nNeedle = norm(needle);
+
+  // Build normalized text + position map back to original offsets.
+  const posMap = new Int32Array(text.length + 1);
+  const normChars = [];
+  let i = 0, oi = 0;
+  const L = text.length;
+  while (oi < L) {
+    let ch = text[oi];
+    if (ch === '\u2018' || ch === '\u2019') ch = "'";
+    else if (ch === '\u201C' || ch === '\u201D') ch = '"';
+    else if (ch === '\u2013' || ch === '\u2014') ch = '-';
+    ch = fold(ch);
+    if (/\s/.test(ch)) {
+      // collapse whitespace run
+      while (oi < L && /\s/.test(text[oi])) oi++;
+      if (normChars.length && normChars[normChars.length - 1] !== ' ') {
+        normChars.push(' ');
+        posMap[i++] = oi - 1;
+      }
+      continue;
+    }
+    normChars.push(ch);
+    posMap[i++] = oi;
+    oi++;
+  }
+  const nText = normChars.join('');
+  const nIdx = nText.indexOf(nNeedle);
+  if (nIdx < 0) return null;
+  const start = posMap[nIdx];
+  const endOrig = posMap[Math.min(nIdx + nNeedle.length - 1, i - 1)] + 1;
+  return { index: start, length: endOrig - start };
 }
 
-function _regionWindow(content, hitIndex) {
-  let start = Math.max(0, hitIndex - REGION_RADIUS);
-  let end = Math.min(content.length, hitIndex + REGION_RADIUS);
-  // Align to line boundaries so the LLM sees whole lines.
-  if (start > 0) {
-    const nl = content.indexOf('\n', start);
-    start = nl >= 0 && nl < end ? nl + 1 : start;
+// Deterministic op application against one slice of text.
+// Returns { text, applied:[{find,replace,position}] } or { error, reason, op }.
+function _applyOps(text, ops) {
+  const applied = [];
+  for (const [oi, op] of (ops || []).entries()) {
+    const find = String(op?.find ?? '');
+    const replace = String(op?.replace ?? '');
+    if (!find) return { error: `op ${oi}: empty find`, reason: 'op_bad_shape', op };
+    if (find.length > OP_FIND_MAX) {
+      return { error: `op ${oi}: find is ${find.length} chars (cap ${OP_FIND_MAX}) — split into smaller edits`, reason: 'op_too_large', op };
+    }
+    const occNum = typeof op.occurrence === 'number' ? op.occurrence : parseInt(op.occurrence, 10);
+    const occurrence = op.occurrence === 'all' ? 'all' : (Number.isInteger(occNum) && occNum > 0 ? occNum : 'first');
+
+    if (occurrence === 'all') {
+      const hits = [];
+      let from = 0, hit;
+      while ((hit = _normalizedIndexOf(text.slice(from), find))) {
+        hits.push(from + hit.index);
+        from += hit.index + Math.max(hit.length, 1);
+      }
+      if (!hits.length) {
+        // Idempotent re-run: find is gone but its replacement is already
+        // present — treat as already applied rather than an error.
+        if (replace && _normalizedIndexOf(text, replace)) {
+          applied.push({ find: find.slice(0, 80), replace: replace.slice(0, 80), alreadyApplied: true });
+          continue;
+        }
+        return { error: `op ${oi}: could not find "${find.slice(0, 80)}"`, reason: 'op_no_match', op };
+      }
+      // Apply right-to-left so earlier positions stay valid.
+      for (let h = hits.length - 1; h >= 0; h--) {
+        const m = _normalizedIndexOf(text.slice(hits[h]), find);
+        if (m) text = text.slice(0, hits[h]) + replace + text.slice(hits[h] + m.length);
+      }
+      applied.push({ find: find.slice(0, 80), replace: replace.slice(0, 80), position: hits[0], count: hits.length });
+      continue;
+    }
+
+    const first = _normalizedIndexOf(text, find);
+    if (!first) {
+      if (replace && _normalizedIndexOf(text, replace)) {
+        applied.push({ find: find.slice(0, 80), replace: replace.slice(0, 80), alreadyApplied: true });
+        continue;
+      }
+      return { error: `op ${oi}: could not find "${find.slice(0, 80)}"`, reason: 'op_no_match', op };
+    }
+    // Multi-match within the window is NOT an error — the window is already the
+    // declared scope (a paragraph, block, or chunk). 'first' deterministically
+    // edits the first in-window occurrence; the count is recorded in the audit
+    // so the draft review can see boilerplate repeats. occurrence:N selects a
+    // specific one; out-of-range is an error.
+    let extraCount = 0;
+    {
+      let from = first.index + first.length, nx;
+      while ((nx = _normalizedIndexOf(text.slice(from), find))) {
+        extraCount++;
+        from += nx.index + Math.max(nx.length, 1);
+        if (extraCount > 50) break;
+      }
+    }
+    let target = first;
+    if (typeof occurrence === 'number' && occurrence > 1) {
+      let from = first.index + first.length;
+      for (let n = 2; n <= occurrence; n++) {
+        const nx = _normalizedIndexOf(text.slice(from), find);
+        if (!nx) return { error: `op ${oi}: occurrence ${occurrence} of "${find.slice(0, 60)}" not found`, reason: 'op_no_match', op };
+        target = { index: from + nx.index, length: nx.length };
+        from = target.index + target.length;
+      }
+    }
+    text = text.slice(0, target.index) + replace + text.slice(target.index + target.length);
+    applied.push({ find: find.slice(0, 80), replace: replace.slice(0, 80), position: target.index, occurrences: extraCount + 1 });
   }
-  if (end < content.length) {
-    const nl = content.lastIndexOf('\n', end);
-    end = nl > start ? nl : end;
-  }
-  return { start, end };
+  return { text, applied };
 }
 
-// LLM locate fallback: ask for a short verbatim substring nearest the edit
-// site. Validated by indexOf — the model can only point at real text.
-async function _locateAnchor(goal, content, agentContext) {
+// Ask the LLM for ops against ONE slice of text. `contextLabel` tells the
+// model what it's looking at ("part 3 of 9", "lines 4520-4610", "the block
+// containing your target").
+async function _emitOps(goal, text, contextLabel, agentContext) {
   const { askWithMessages } = require('../skill-helpers/skill-llm.cjs');
-  // Send head + tail + line count so the model sees structure without the
-  // whole file (region anchoring exists precisely because it doesn't fit).
-  const head = content.slice(0, 4000);
-  const tail = content.slice(-2000);
+  const { parseLlmJson } = require('../skill-helpers/parseLlmJson.cjs');
+
+  const systemPrompt = `You are a precise text editor that emits SEARCH/REPLACE operations.
+For the given text, return a JSON array of edit ops that accomplish the goal.
+Each op: {"find": "<verbatim text copied EXACTLY from the text>", "replace": "<new text>", "occurrence": "first"|"all"}
+Rules:
+- "find" MUST be copied character-for-character from the text below — it is matched literally
+- Keep "find" as short as possible while staying unique within this text (a line or two, not paragraphs)
+- Use occurrence:"all" to change every match; otherwise each find must be unique
+- To rewrite a whole paragraph/section, find can span it — but prefer several small ops when only parts change
+- If nothing in THIS text needs changing for the goal, return []
+- Return ONLY the JSON array — no explanation, no markdown fences`;
+
   const userPrompt = `Goal: ${goal}
 ${agentContext ? `\nAgent context:\n${String(agentContext).slice(0, 400)}\n` : ''}
-The file is too large to show fully (${content.length} chars). Head and tail:
---- HEAD ---
-${head}
---- TAIL ---
-${tail}
+This is ${contextLabel}:
+---
+${text}
 ---
 
-Reply with ONLY a JSON object: {"anchor":"<a short verbatim substring (5-15 words) copied exactly from the file, nearest the text the goal refers to>"}. The anchor MUST be copied character-for-character from the file.`;
+Edit ops (JSON array):`;
 
   try {
     const raw = await askWithMessages([
-      { role: 'system', content: 'You locate text. Output only JSON.' },
+      { role: 'system', content: systemPrompt },
       { role: 'user', content: userPrompt },
-    ], { maxTokens: 200, temperature: 0, responseTimeoutMs: 30000, taskType: 'fast' });
-    const m = (raw || '').match(/\{[^}]*"anchor"[^}]*\}/s);
-    if (!m) return null;
-    const anchor = JSON.parse(m[0]).anchor;
-    return typeof anchor === 'string' && anchor.length >= 3 ? anchor : null;
+    ], { maxTokens: 4000, temperature: 0.2, responseTimeoutMs: 60000, taskType: 'complex' });
+    const parsed = parseLlmJson(raw, logger, 'edit.agent/ops');
+    if (parsed === null) return null;
+    const ops = Array.isArray(parsed) ? parsed : (Array.isArray(parsed?.ops) ? parsed.ops : null);
+    if (!ops) return null;
+    return ops;
   } catch (e) {
-    logger.warn(`[edit.agent] _locateAnchor failed: ${e.message}`);
+    logger.warn(`[edit.agent] _emitOps failed: ${e.message}`);
     return null;
   }
 }
 
-async function _findRegion(goal, content, agentContext) {
-  const anchors = _literalAnchors(goal);
-  for (const a of anchors) {
-    const first = content.indexOf(a);
-    if (first >= 0 && content.indexOf(a, first + 1) === -1) {
-      return _regionWindow(content, first); // unique literal hit
+// Split content into paragraph-aligned chunks ≤ maxChars. Oversized
+// paragraphs split on single newlines; oversized lines split hard.
+function _chunkContent(content, maxChars = CHUNK_MAX) {
+  const chunks = [];
+  let cur = '';
+  for (const para of content.split(/(\n\n+)/)) {
+    if (cur.length + para.length <= maxChars) { cur += para; continue; }
+    if (cur) { chunks.push(cur); cur = ''; }
+    if (para.length <= maxChars) { cur = para; continue; }
+    // Oversized paragraph — split on lines.
+    for (const line of para.split(/(\n)/)) {
+      if (cur.length + line.length <= maxChars) { cur += line; continue; }
+      if (cur) { chunks.push(cur); cur = ''; }
+      let rest = line;
+      while (rest.length > maxChars) {
+        chunks.push(rest.slice(0, maxChars));
+        rest = rest.slice(maxChars);
+      }
+      cur = rest;
     }
-    if (first >= 0) return { ambiguous: a }; // literal hit, but not unique
   }
-  const anchor = await _locateAnchor(goal, content, agentContext);
-  if (anchor) {
-    const idx = content.indexOf(anchor);
-    if (idx >= 0) return _regionWindow(content, idx);
-    logger.warn(`[edit.agent] LLM anchor not found verbatim: "${anchor.slice(0, 60)}"`);
+  if (cur) chunks.push(cur);
+  return chunks;
+}
+
+// ── Deterministic target location (no LLM) ─────────────────────────────────
+
+// "lines 4543-4590", "line 500", "lines 12 through 30" → line-indexed slice.
+function _lineRangeTarget(goal, content) {
+  const m = String(goal).match(/\blines?\s+(\d+)\s*(?:[-–—]|\s+to\s+|\s+through\s+)\s*(\d+)\b/i)
+        || String(goal).match(/\bline\s+(\d+)\b/i);
+  if (!m) return null;
+  const a = Math.max(1, parseInt(m[1], 10));
+  const b = m[2] ? Math.max(a, parseInt(m[2], 10)) : a;
+  const lines = content.split('\n');
+  if (a > lines.length) return { notFound: `line ${a} beyond end of file (${lines.length} lines)` };
+  const from = Math.max(0, a - 1 - LINE_PAD);
+  const to = Math.min(lines.length, b + LINE_PAD);
+  let start = 0;
+  for (let i = 0; i < from; i++) start += lines[i].length + 1;
+  let end = start;
+  for (let i = from; i < to; i++) end += lines[i].length + 1;
+  return { start, end: Math.min(end, content.length), label: `lines ${from + 1}–${to}` };
+}
+
+// Expand a hit outward to its blank-line-delimited block (paragraph /
+// function body), then add margin. Falls back to ±radius when no blank lines.
+function _blockWindow(content, hitIndex, hitLen = 0) {
+  const pad = 1500;
+  let bs = hitIndex, be = hitIndex + hitLen;
+  // block start: previous blank line before hit
+  const prevBlank = content.lastIndexOf('\n\n', Math.max(0, hitIndex));
+  if (prevBlank >= 0) bs = prevBlank + 2;
+  // block end: next blank line after the hit end
+  const nextBlank = content.indexOf('\n\n', be);
+  if (nextBlank >= 0) be = nextBlank;
+  // margin: one extra block / ~pad chars each side, line-aligned.
+  // Search from BEFORE the boundary blank line — searching from bs-1/be+1
+  // re-finds the same blank line and the margin never expands.
+  const mStart = content.lastIndexOf('\n\n', Math.max(0, bs - 3));
+  const mEnd = content.indexOf('\n\n', be + 2);
+  let start = mStart >= 0 ? mStart + 2 : Math.max(0, bs - pad);
+  let end = mEnd >= 0 ? mEnd : Math.min(content.length, be + pad);
+  if (end - start > WINDOW_MAX) {
+    // Oversized block — center on hit, line-aligned.
+    start = Math.max(bs, hitIndex - Math.floor(WINDOW_MAX / 2));
+    end = Math.min(content.length, start + WINDOW_MAX);
+    const nl = content.indexOf('\n', start);
+    if (nl >= 0 && nl < end) start = nl + 1;
+    const nl2 = content.lastIndexOf('\n', end);
+    if (nl2 > start) end = nl2;
+  }
+  return { start, end };
+}
+
+// Score an identifier hit: definition-context beats call-site.
+function _defScore(content, hitIndex, ident) {
+  const lineStart = content.lastIndexOf('\n', hitIndex - 1) + 1;
+  const before = content.slice(lineStart, hitIndex);
+  const after = content.slice(hitIndex + ident.length, hitIndex + ident.length + 30);
+  if (new RegExp(`(?:function|def|func|fn|sub)\\s*$`, 'i').test(before)) return 3;
+  if (new RegExp(`(?:const|let|var|public|private|static|async|export|function\\*|local)\\s+$`, 'i').test(before)) return 3;
+  if (new RegExp(`^(?:\\s*[:=]|\\s*=>)`).test(after) || /^[ \t]*\(/.test(after) && /[{=]>?\s*$/.test(before)) return 2;
+  if (/^\s*$/.test(before) && /^[ \t]*\(/.test(after)) return 2; // `name(` at line start — likely a def
+  return 0;
+}
+
+// Candidate target strings mined from the goal — longest/most-specific first.
+function _goalFragments(goal) {
+  let g = String(goal);
+  const frags = new Set();
+  // backticked + quoted spans (mine BEFORE stripping — quotes are explicit)
+  for (const m of g.matchAll(/`([^`\n]{3,200})`/g)) frags.add(m[1].trim());
+  for (const m of g.matchAll(/'([^'\n]{3,200})'|"([^"\n]{3,200})"/g)) frags.add((m[1] || m[2]).trim());
+  // Strip noise that would otherwise dominate the n-gram/frags: absolute file
+  // paths, [File:]/[Folder:] tags, URLs. They can never match file CONTENT.
+  g = g
+    .replace(/\[\s*(?:File|Folder)\s*:\s*[^\]]+\]/gi, ' ')
+    .replace(/(?:~|\/[\w.@+-][\w.@+/-]*)+\.\w{1,10}\b/g, ' ')
+    .replace(/\b[\w-]{2,}\.(?:txt|md|markdown|js|mjs|cjs|ts|tsx|py|json|ya?ml|html?|css|csv|xml|docx?|xlsx?|pdf|rtf|log|sh|swift|java|cpp?|h|rb|go|rs)\b/gi, ' ')
+    .replace(/https?:\/\/\S+/g, ' ');
+  // Capitalized runs — "Section 1", "Common Spelling and Typographical
+  // Errors". Require ≥2 words or a digit so sentence-initial words
+  // ("Expand", "Ensure") don't pollute the frag set.
+  for (const m of g.matchAll(/\b[A-Z][\w$]*(?:\s+[A-Z0-9][\w$]*)+\b/g)) {
+    const t = m[0].trim();
+    if (t.length >= 3 && t.length <= 120) frags.add(t);
+  }
+  // sentence/clause fragments
+  for (const f of g.split(/[.;:\n—]|(?:\s+-\s+)/)) {
+    const t = f.trim();
+    if (t.length >= 12 && t.length <= 200) frags.add(t);
+  }
+  // identifiers (camelCase / snake_case / ClassName)
+  for (const m of g.matchAll(/\b([a-zA-Z_$][\w$]{2,}(?:\(\))?)\b/g)) {
+    const id = m[1].replace(/\(\)$/, '');
+    if (/[A-Z_]/.test(id.slice(1)) || id.includes('_')) frags.add(id);
+  }
+  // word n-grams (3-8) for title/heading phrases
+  const words = g.split(/\s+/).filter(Boolean);
+  for (let n = Math.min(8, words.length); n >= 3; n--) {
+    for (let i = 0; i + n <= words.length; i++) {
+      frags.add(words.slice(i, i + n).join(' '));
+    }
+  }
+  return [...frags].filter(f => f.length >= 3).sort((x, y) => y.length - x.length);
+}
+
+const _GLOBAL_SCOPE_RE = /\b(entire|whole)\s+(file|document|content|text)\b|\ball\b[^.]{0,40}\b(in|throughout|across)\b[^.]{0,40}\b(file|document|text)\b|\bevery\s+(line|section|paragraph|instance|occurrence|word|sentence)\b|\beverything\s+in\s+(this|the)\s+(file|document)\b/i;
+
+function _isGlobalScope(goal) {
+  return _GLOBAL_SCOPE_RE.test(String(goal));
+}
+
+// Locate where a targeted goal should edit. Returns {start,end,label,note?}
+// or 'whole' or {notFound} or null.
+function _findTarget(goal, content) {
+  const lr = _lineRangeTarget(goal, content);
+  if (lr) return lr.notFound ? { notFound: lr.notFound } : lr;
+  if (_isGlobalScope(goal)) return 'whole';
+
+  const frags = _goalFragments(goal);
+  // Pass 1: exact/normalized matching. Pass 2 (only if nothing hit): case-
+  // folded — "spelling and typographical errors" in the goal should still
+  // locate "Spelling and Typographical Errors" in the file.
+  for (const ci of [false, true]) {
+    let best = null;
+    for (const frag of frags) {
+      // Collect all hits (normalized fallback included).
+      const hits = [];
+      let from = 0, hit;
+      while ((hit = _normalizedIndexOf(content.slice(from), frag, { ci }))) {
+        hits.push({ index: from + hit.index, length: hit.length });
+        from += hit.index + Math.max(hit.length, 1);
+        if (hits.length > 20) break;
+      }
+      if (!hits.length) continue;
+      // Prefer definition-context hits for identifiers; exact hits beat ci hits.
+      const scored = hits.map(h => ({ ...h, score: _defScore(content, h.index, frag) }));
+      scored.sort((a, b) => b.score - a.score || a.index - b.index);
+      const win = scored[0];
+      const topScore = win.score;
+      const sameScore = scored.filter(h => h.score === topScore);
+      const note = sameScore.length > 1
+        ? `"${frag.slice(0, 50)}" matched ${sameScore.length} locations — editing first occurrence`
+        : (hits.length > 1 ? `"${frag.slice(0, 50)}" matched ${hits.length} locations — editing first occurrence` : undefined);
+      const cand = { hit: win, frag, note, fragLen: frag.length };
+      if (!best || cand.fragLen > best.fragLen) best = cand;
+    }
+    if (best) {
+      const w = _blockWindow(content, best.hit.index, best.hit.length);
+      return { ...w, label: `block at char ${best.hit.index}`, note: best.note };
+    }
   }
   return null;
+}
+
+// ── Semantic block locator (fallback when _findTarget has no anchor) ─────────
+// The model picks a block NUMBER from a numbered outline — integer-only JSON,
+// so the verbatim-quote control-char crash that killed _locateAnchor can't
+// recur. The picked block becomes the ops window.
+
+// Split content into outline blocks: blank-line-delimited, small blocks
+// (<150 chars — lone headings) merged into the FOLLOWING block. >80 blocks →
+// fixed ~4K windows labeled by char range instead.
+function _outlineBlocks(content, maxBlocks = 80) {
+  const raw = [];
+  let pos = 0;
+  for (const part of content.split(/(\n\n+)/)) {
+    if (/^\n\n+$/.test(part)) { pos += part.length; continue; }
+    raw.push({ start: pos, end: pos + part.length });
+    pos += part.length;
+  }
+  // Merge small blocks forward — a lone heading belongs with its body.
+  const merged = [];
+  let pendingStart = null;
+  for (const b of raw) {
+    if (b.end - b.start < 150) {
+      if (pendingStart === null) pendingStart = b.start;
+      continue;
+    }
+    merged.push({ start: pendingStart ?? b.start, end: b.end });
+    pendingStart = null;
+  }
+  if (pendingStart !== null) merged.push({ start: pendingStart, end: content.length });
+  let blocks = merged;
+  if (blocks.length > maxBlocks) {
+    // Coarsen: fixed ~4K windows labeled by char range.
+    blocks = [];
+    const W = 4000;
+    for (let s = 0; s < content.length; s += W) {
+      blocks.push({ start: s, end: Math.min(content.length, s + W) });
+    }
+  }
+  return blocks.map((b, i) => ({
+    i, start: b.start, end: b.end,
+    head: content.slice(b.start, Math.min(b.end, b.start + 90)).replace(/\s+/g, ' ').trim(),
+  }));
+}
+
+async function _locateBlock(goal, content, agentContext) {
+  const { askWithMessages } = require('../skill-helpers/skill-llm.cjs');
+  const { parseLlmJson } = require('../skill-helpers/parseLlmJson.cjs');
+  const blocks = _outlineBlocks(content);
+  const listing = blocks.map(b => `[${b.i}] ${b.head}`).join('\n');
+
+  const userPrompt = `Goal: ${goal}
+${agentContext ? `\nAgent context:\n${String(agentContext).slice(0, 400)}\n` : ''}
+The file has ${blocks.length} blocks. Outline (index + first words of each):
+${listing}
+
+Which block does the goal want edited? Reply with ONLY JSON:
+{"block": N}  — single block index
+{"blocks": [a, b]}  — a span of consecutive blocks
+{"none": true}  — if no block matches the goal`;
+
+  try {
+    const raw = await askWithMessages([
+      { role: 'system', content: 'You pick which numbered block of a file matches the user\'s goal. Output only JSON with a block index — never quote file text.' },
+      { role: 'user', content: userPrompt },
+    ], { maxTokens: 150, temperature: 0, responseTimeoutMs: 30000, taskType: 'fast' });
+    const parsed = parseLlmJson(raw, logger, 'edit.agent/locateBlock');
+    if (!parsed || parsed.none === true) return null;
+    let a = null, b = null;
+    if (Number.isInteger(parsed.block)) { a = b = parsed.block; }
+    else if (Array.isArray(parsed.blocks) && parsed.blocks.length) {
+      const valid = parsed.blocks.filter(Number.isInteger).sort((x, y) => x - y);
+      if (valid.length) { a = valid[0]; b = valid[valid.length - 1]; }
+    }
+    if (a === null || a < 0 || a >= blocks.length) return null;
+    b = Math.min(b ?? a, blocks.length - 1);
+
+    const picked = blocks[a];
+    // Margin: one neighbor block each side.
+    const start = a > 0 ? blocks[a - 1].start : picked.start;
+    const end = b < blocks.length - 1 ? blocks[b + 1].end : blocks[b].end;
+    let w = { start, end };
+    if (w.end - w.start > WINDOW_MAX) {
+      w = { start: picked.start, end: Math.min(content.length, picked.start + WINDOW_MAX) };
+    }
+    // Duplicate-head note — repeated boilerplate sections ("Section 1" ×15).
+    const dupes = blocks.filter(x => x.head === picked.head).length;
+    const note = dupes > 1 ? `"${picked.head.slice(0, 50)}" matches ${dupes} blocks — used #${a}` : undefined;
+    return { ...w, label: `block ${a}${b !== a ? `-${b}` : ''}`, note };
+  } catch (e) {
+    logger.warn(`[edit.agent] _locateBlock failed: ${e.message}`);
+    return null;
+  }
+}
+
+// Global-scope edit: emit + apply ops per paragraph-aligned chunk. An op that
+// misses its chunk gets one retry against the merged boundary region before
+// failing the whole pass — all-or-nothing, no partial writes.
+async function _chunkedOps(goal, content, agentContext, progressCallback) {
+  const chunks = _chunkContent(content);
+  const applied = [];
+  const editedChunks = [];
+  for (let i = 0; i < chunks.length; i++) {
+    if (progressCallback) progressCallback({ type: 'edit:progress', message: `Editing part ${i + 1} of ${chunks.length}`, chunk: i + 1, total: chunks.length });
+    const ops = await _emitOps(goal, chunks[i], `part ${i + 1} of ${chunks.length}`, agentContext);
+    if (ops === null) return { error: 'LLM op emission failed', reason: 'llm_failed' };
+    if (!ops.length) { editedChunks.push(chunks[i]); continue; }
+    let res = _applyOps(chunks[i], ops);
+    if (res.error && res.reason === 'op_no_match' && i > 0) {
+      // Boundary retry: the find may span the chunk split — retry against
+      // prev-tail + this-chunk merged region.
+      const merged = editedChunks.pop() + chunks[i];
+      const mergedRes = _applyOps(merged, ops);
+      if (mergedRes.error) return { error: res.error, reason: res.reason };
+      // Split back at the original boundary (prev chunk may have been edited —
+      // its edited length is merged.length - this chunk's length).
+      const boundary = merged.length - chunks[i].length;
+      editedChunks.push(merged.slice(0, boundary));
+      editedChunks.push(merged.slice(boundary));
+      applied.push(...mergedRes.applied);
+      continue;
+    }
+    if (res.error) return { error: res.error, reason: res.reason };
+    editedChunks.push(res.text);
+    applied.push(...res.applied);
+  }
+  return { edited: editedChunks.join(''), applied };
 }
 
 // ── Office handlers ──────────────────────────────────────────────────────────
@@ -597,6 +1004,102 @@ function _applyDraft(draftPath, filePath) {
 //   filePath  ← filePath | path | file | target
 //   mode      ← mode | writeMode        (inplace | draft | apply)
 //   draftPath ← draftPath | draft       (apply mode)
+// Fire-and-forget progress POST — same convention as cli.agent/browser.agent.
+function _postProgress(callbackUrl, evt) {
+  if (!callbackUrl) return;
+  try {
+    const http = require('http');
+    const payload = JSON.stringify(evt);
+    const parsed = new URL(callbackUrl);
+    const req = http.request({
+      hostname: parsed.hostname,
+      port: parseInt(parsed.port, 10),
+      path: parsed.pathname + parsed.search,
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) },
+      timeout: 2000,
+    });
+    req.on('error', () => {});
+    req.write(payload);
+    req.end();
+  } catch (_) {}
+}
+
+// ── Post-edit validation & format preservation ──────────────────────────────
+
+// Structural sanity before any write: an edit that breaks the file's syntax
+// must never land. Best-effort — only validators for formats we can check.
+// Returns { ok: true } or { ok: false, reason: 'invalid_syntax', detail }.
+function _validateSyntax(filePath, edited) {
+  const ext = (path.extname(filePath).slice(1) || '').toLowerCase();
+  try {
+    if (ext === 'json') {
+      JSON.parse(edited);
+      return { ok: true };
+    }
+    if (ext === 'js' || ext === 'mjs' || ext === 'cjs' || ext === 'jsx' || ext === 'ts' || ext === 'tsx') {
+      // node --check parses without executing. TS/JSX aren't node-checkable —
+      // only run it on plain JS flavors.
+      if (ext === 'js' || ext === 'mjs' || ext === 'cjs') {
+        const tmp = path.join(os.tmpdir(), `edit-agent-check-${Date.now()}-${Math.random().toString(36).slice(2)}.${ext === 'cjs' ? 'cjs' : 'mjs' === ext ? 'mjs' : 'js'}`);
+        fs.writeFileSync(tmp, edited, 'utf8');
+        try {
+          require('child_process').execFileSync(process.execPath, ['--check', tmp], { stdio: 'pipe', timeout: 10000 });
+          return { ok: true };
+        } catch (e) {
+          const detail = String(e.stderr || e.message || '').split('\n').filter(Boolean).slice(0, 4).join('; ');
+          return { ok: false, detail };
+        } finally {
+          try { fs.unlinkSync(tmp); } catch (_) {}
+        }
+      }
+      return { ok: true };
+    }
+    if (ext === 'py') {
+      const tmp = path.join(os.tmpdir(), `edit-agent-check-${Date.now()}-${Math.random().toString(36).slice(2)}.py`);
+      fs.writeFileSync(tmp, edited, 'utf8');
+      try {
+        require('child_process').execFileSync('python3', ['-m', 'py_compile', tmp], { stdio: 'pipe', timeout: 15000 });
+        return { ok: true };
+      } catch (e) {
+        const detail = String(e.stderr || e.message || '').split('\n').filter(Boolean).slice(0, 4).join('; ');
+        return { ok: false, detail };
+      } finally {
+        try { fs.unlinkSync(tmp); } catch (_) {}
+      }
+    }
+    if (ext === 'yaml' || ext === 'yml') {
+      try { require.resolve('yaml'); } catch (_) { return { ok: true }; } // no parser available — skip
+      const YAML = require('yaml');
+      YAML.parse(edited);
+      return { ok: true };
+    }
+  } catch (e) {
+    return { ok: false, detail: String(e.message || e).split('\n').slice(0, 3).join('; ') };
+  }
+  return { ok: true };
+}
+
+// Preserve the original's representation: BOM and dominant line-ending style.
+// An edit must not silently convert a CRLF file to LF or drop a BOM.
+function _preserveFormat(original, edited) {
+  const hadBOM = original.charCodeAt(0) === 0xFEFF;
+  const hasBOM = edited.charCodeAt(0) === 0xFEFF;
+  if (hadBOM && !hasBOM) edited = '\uFEFF' + edited;
+  else if (!hadBOM && hasBOM) edited = edited.slice(1);
+
+  const origCRLF = (original.match(/\r\n/g) || []).length;
+  const origLF = (original.match(/(?<!\r)\n/g) || []).length;
+  const preferCRLF = origCRLF > origLF;
+  if (preferCRLF) {
+    // Normalize to LF first (handles mixed input), then convert to CRLF.
+    edited = edited.replace(/\r\n/g, '\n').replace(/\n/g, '\r\n');
+  } else {
+    edited = edited.replace(/\r\n/g, '\n');
+  }
+  return edited;
+}
+
 async function editAgent(args = {}) {
   const goal = args.goal || args.instruction || args.prompt || args.task || args.edit || null;
   let filePath = args.filePath || args.path || args.file || args.target || null;
@@ -645,16 +1148,14 @@ async function editAgent(args = {}) {
   const content = _readFile(filePath);
   if (content === null) return { ok: false, error: `Could not read file: ${filePath}`, reason: 'file_missing' };
 
-  if (content.length > LARGE_FILE_MAX) {
-    return {
-      ok: false,
-      error: `File too large (${content.length} chars > ${LARGE_FILE_MAX}) — use targeted shell edits (sed/python3) or split the task`,
-      reason: 'file_too_large',
-    };
-  }
-
-  // ── Produce edited content: whole-file for small, region-anchored for large ──
+  // ── Produce edited content ─────────────────────────────────────────────────
+  // ≤8K → whole-file rewrite. Larger → self-locating find/replace ops: a
+  // targeted goal (line range, symbol, quoted text) slices a block-aware
+  // window and ops apply inside it — works at ANY file size; a global goal
+  // ("fix all typos") runs a chunked ops pass, still capped at 200K.
   let edited;
+  let opsApplied = null;
+  let targetNote = null;
   if (content.length <= SMALL_FILE_MAX) {
     logger.info(`[edit.agent] editAgent: goal="${String(goal).slice(0, 80)}", file=${path.basename(filePath)}, size=${content.length} chars (whole-file)`);
     const res = await _llmRewrite(goal, content, agentContext);
@@ -668,22 +1169,49 @@ async function editAgent(args = {}) {
     }
     edited = res.edited;
   } else {
-    logger.info(`[edit.agent] editAgent: goal="${String(goal).slice(0, 80)}", file=${path.basename(filePath)}, size=${content.length} chars (region-anchored)`);
-    const region = await _findRegion(goal, content, agentContext);
-    if (!region) {
-      return { ok: false, error: 'Could not locate the edit region — quote the target text in the goal, or use targeted shell edits', reason: 'region_not_found' };
+    let target = _findTarget(goal, content);
+    if (content.length > LARGE_FILE_MAX && (target === 'whole' || !target)) {
+      return {
+        ok: false,
+        error: `File too large (${content.length} chars > ${LARGE_FILE_MAX}) for a whole-file pass — target a section (quote text or name a line range) or split the task`,
+        reason: 'file_too_large',
+      };
     }
-    if (region.ambiguous) {
-      return { ok: false, error: `Anchor "${String(region.ambiguous).slice(0, 60)}" matches multiple locations — narrow the goal`, reason: 'ambiguous_region' };
+    if (target && target.notFound) {
+      return { ok: false, error: target.notFound, reason: 'region_not_found' };
     }
-    const regionText = content.slice(region.start, region.end);
-    const res = await _llmRewrite(goal, regionText, agentContext, 'region');
-    if (res === null) return { ok: false, error: 'LLM edit failed — no output', reason: 'llm_failed' };
-    if (res.rejected) {
-      return { ok: false, error: `LLM region output rejected — suspiciously short, refusing to write`, reason: 'suspicious_output' };
+    if (!target) {
+      // No verbatim anchor — semantic fallback: the model picks a block index
+      // from a numbered outline (integer-only JSON, can't crash on quotes).
+      target = await _locateBlock(goal, content, agentContext);
     }
-    edited = content.slice(0, region.start) + res.edited + content.slice(region.end);
-    logger.info(`[edit.agent] region edit: chars ${region.start}-${region.end} of ${content.length}`);
+    if (!target) {
+      return { ok: false, error: 'Could not locate the target — quote a few words from the text or name a section/line range', reason: 'region_not_found' };
+    }
+    if (target === 'whole') {
+      logger.info(`[edit.agent] editAgent: goal="${String(goal).slice(0, 80)}", file=${path.basename(filePath)}, size=${content.length} chars (chunked ops)`);
+      const _emitProgress = typeof args._progressCallback === 'function'
+        ? args._progressCallback
+        : (args._progressCallbackUrl
+          ? (evt) => _postProgress(args._progressCallbackUrl, { stepIndex: args._stepIndex ?? 0, ...evt })
+          : null);
+      const res = await _chunkedOps(goal, content, agentContext, _emitProgress);
+      if (res.error) return { ok: false, error: res.error, reason: res.reason || 'op_failed' };
+      edited = res.edited;
+      opsApplied = res.applied;
+      logger.info(`[edit.agent] chunked ops: ${res.applied.length} op(s) applied across ${content.length} chars`);
+    } else {
+      logger.info(`[edit.agent] editAgent: goal="${String(goal).slice(0, 80)}", file=${path.basename(filePath)}, size=${content.length} chars (targeted ops @ ${target.label})`);
+      const windowText = content.slice(target.start, target.end);
+      const ops = await _emitOps(goal, windowText, target.label, agentContext);
+      if (ops === null) return { ok: false, error: 'LLM edit failed — no output', reason: 'llm_failed' };
+      const res = _applyOps(windowText, ops);
+      if (res.error) return { ok: false, error: res.error, reason: res.reason || 'op_failed' };
+      edited = content.slice(0, target.start) + res.text + content.slice(target.end);
+      opsApplied = res.applied;
+      targetNote = target.note || null;
+      logger.info(`[edit.agent] targeted ops: ${res.applied.length} op(s) in window ${target.start}-${target.end} of ${content.length}`);
+    }
   }
 
   // Trim-insensitive compare — the LLM response is .trim()'d, so a file with a
@@ -694,6 +1222,19 @@ async function editAgent(args = {}) {
     logger.info(`[edit.agent] editAgent: no changes made`);
     const summary = 'No changes needed';
     return { ok: true, filePath, changed: false, appliedEdits: 0, skippedEdits: [], summary, stdout: summary };
+  }
+
+  // Preserve the original's BOM + dominant line-ending style, then reject any
+  // edit that breaks the file's syntax — before backup, draft, or write.
+  edited = _preserveFormat(content, edited);
+  const syntax = _validateSyntax(filePath, edited);
+  if (!syntax.ok) {
+    logger.warn(`[edit.agent] syntax check failed for ${path.basename(filePath)}: ${syntax.detail}`);
+    return {
+      ok: false,
+      error: `Edit would produce invalid ${ext || 'file'} syntax — ${syntax.detail}. Nothing was written.`,
+      reason: 'invalid_syntax',
+    };
   }
 
   // mtime guard — if the file changed on disk since we read it (e.g. the app
@@ -727,7 +1268,9 @@ async function editAgent(args = {}) {
     logger.info(`[edit.agent] editAgent: ${summary}`);
     return {
       ok: true, filePath, changed: true, mode: 'draft', draftPath: dp, diff,
-      autoDraft, openIn: _holders, appliedEdits: 1, skippedEdits: [], summary, stdout: summary,
+      autoDraft, openIn: _holders, appliedEdits: 1, skippedEdits: [],
+      opsApplied: opsApplied || undefined, note: targetNote || undefined,
+      summary, stdout: summary,
     };
   }
 
@@ -746,9 +1289,18 @@ async function editAgent(args = {}) {
     appliedEdits: 1,
     skippedEdits: [],
     backupPath,
+    diff: _unifiedDiff(content, edited, path.basename(filePath)),
+    opsApplied: opsApplied || undefined,
+    note: targetNote || undefined,
     summary,
     stdout: summary,
   };
 }
 
-module.exports = { editAgent, _matchDocPaths, _openFileHolders };
+module.exports = {
+  editAgent, _matchDocPaths, _openFileHolders,
+  // exported for unit tests
+  _applyOps, _normalizedIndexOf, _findTarget, _chunkedOps, _chunkContent,
+  _preserveFormat, _validateSyntax, _lineRangeTarget, _blockWindow, _goalFragments, _isGlobalScope,
+  _outlineBlocks, _locateBlock,
+};
