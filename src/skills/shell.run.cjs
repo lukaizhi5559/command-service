@@ -1594,17 +1594,23 @@ function runProcess(cmd, argv, options, onProgress) {
       });
     }, options.timeoutMs);
 
-    proc.on('close', (code) => {
+    proc.on('close', (code, signal) => {
       clearTimeout(timer);
       const executionTime = Date.now() - startTime;
       const exitCode = code ?? -1;
+      // 141 = 128+SIGPIPE — a downstream consumer (head/tail/awk NR<=n) closed
+      // the pipe mid-stream. The injected `set -o pipefail` above reports the
+      // pipeline status as 141 even though the output is complete — SIGPIPE
+      // truncation is the designed behavior of truncating pipes. Treat as
+      // success; keep the code for diagnostics.
+      const sigpipeTruncated = exitCode === 141 || signal === 'SIGPIPE';
       resolve({
-        ok: exitCode === 0,
+        ok: exitCode === 0 || sigpipeTruncated,
         stdout: stdoutBuf,
         stderr: stderrBuf,
         exitCode,
         executionTime,
-        error: exitCode !== 0 ? `Process exited with code ${exitCode}` : undefined
+        error: (exitCode !== 0 && !sigpipeTruncated) ? `Process exited with code ${exitCode}` : undefined
       });
     });
 
