@@ -1387,9 +1387,23 @@ async function buildTabMap(sessionId, maxElements = 150, options = {}) {
     const _overlayDom = await browserAct({
       action: 'evaluate', sessionId, headed: true, timeoutMs: 3000,
       text: `(() => {
-        const overlay = document.querySelector('[role="dialog"], [role="alertdialog"], [aria-modal="true"]');
-        const scope = (overlay && overlay.offsetParent !== null) ? overlay : document;
-        const inDialog = overlay && overlay.offsetParent !== null;
+        // Pick the ACTIVE visible dialog, not the first match — Gmail keeps
+        // several hidden role="dialog" containers (settings quick panel,
+        // stale compose shells). Choose the visible candidate with the most
+        // interactive children.
+        const _dialogs = Array.from(document.querySelectorAll('[role="dialog"], [role="alertdialog"], [aria-modal="true"]'))
+          .filter(d => {
+            if (d.offsetParent === null) return false;
+            const dr = d.getBoundingClientRect();
+            return dr.width > 0 && dr.height > 0;
+          });
+        let overlay = null, _best = -1;
+        for (const d of _dialogs) {
+          const n = d.querySelectorAll('input, textarea, [contenteditable="true"], [contenteditable=""], button, [role="button"], [role="textbox"], [role="combobox"]').length;
+          if (n > _best) { _best = n; overlay = d; }
+        }
+        const scope = overlay || document;
+        const inDialog = !!overlay;
         const out = [];
         const fillable = scope.querySelectorAll('input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"]):not([type="submit"]):not([type="button"]):not([type="file"]), textarea, [contenteditable="true"], [contenteditable=""], [role="textbox"], [role="combobox"]');
         for (const el of fillable) {
@@ -3824,6 +3838,39 @@ async function _detectOverlay(sessionId, pageCategory) {
   } catch { return false; }
 }
 
+// ── Overlay State Key ──────────────────────────────────────────────
+// Stable identity for the currently-active visible dialog: bounding rect +
+// role/aria-label + interactive-child count. Deliberately excludes innerText
+// so typing into fields does NOT change the key — the map stays cached for
+// one scan per dialog state. A different dialog swapping in (overlay stayed
+// "active" but identity changed) produces a different key → stale-map
+// invalidation.
+async function _overlayStateKey(sessionId) {
+  try {
+    const res = await browserAct({
+      action: 'evaluate', sessionId, headed: true, timeoutMs: 2000,
+      text: `(() => {
+        const ds = Array.from(document.querySelectorAll('[role="dialog"], [role="alertdialog"], [aria-modal="true"]'))
+          .filter(d => {
+            if (d.offsetParent === null) return false;
+            const r = d.getBoundingClientRect();
+            return r.width > 0 && r.height > 0;
+          });
+        if (!ds.length) return 'none';
+        let best = null, bestN = -1;
+        for (const d of ds) {
+          const n = d.querySelectorAll('input, textarea, [contenteditable="true"], [contenteditable=""], button, [role="button"], [role="textbox"], [role="combobox"]').length;
+          if (n > bestN) { bestN = n; best = d; }
+        }
+        const r = best.getBoundingClientRect();
+        const al = (best.getAttribute('aria-label') || best.getAttribute('role') || '').slice(0, 40);
+        return 'dlg:' + Math.round(r.x) + ',' + Math.round(r.y) + ',' + Math.round(r.width) + 'x' + Math.round(r.height) + ':' + al + ':' + bestN;
+      })()`,
+    });
+    return res?.ok ? String(res.result || 'none') : null;
+  } catch { return null; }
+}
+
 // ── Alert Detection Layer ──────────────────────────────────────────
 // Detects alerts/dialogs that need special handling BEFORE tier selection.
 // Returns: { type: 'confirmation'|'error'|'success'|null, text, buttons? }
@@ -5286,6 +5333,15 @@ function _subPlanStepMatchesFlowStep(subStep, flowStep) {
     (_subAction === 'type'  && /type|fill|enter/i.test(_flowAction)) ||
     (_subAction === 'click' && /click|press|save|submit|send|create|open|select/i.test(_flowAction)) ||
     (_subAction === 'press' && /press|save|submit|send|enter/i.test(_flowAction));
+  // Merged fill pair: a type sub-step satisfies a "click <field>" flow step
+  // when the field names overlap (prefix-matched, 'recipient' ↔ 'To recipients')
+  // — typing focuses the element, so the explicit click is merged away.
+  if (_subAction === 'type' && /\bclick\b/i.test(_flowAction)) {
+    const _GENERIC = new Set(['click', 'field', 'the', 'button', 'box', 'input', 'into', 'form', 'text', 'area', 'edit', 'enter', 'type', 'fill']);
+    const _flowFieldWords = (_flowAction.match(/[a-z]{3,}/gi) || []).map(w => w.toLowerCase()).filter(w => !_GENERIC.has(w));
+    const _targetFieldWords = (_subTarget.match(/[a-z]{3,}/g) || []).map(w => w.toLowerCase());
+    if (_flowFieldWords.some(w => _targetFieldWords.some(tw => tw.startsWith(w) || w.startsWith(tw)))) return true;
+  }
   // Verb-less flow fragments (e.g. "'Subject' with 'X'" from a split compound
   // action) carry no action verb — don't reject on the verb gate; the
   // value/word-overlap checks below still apply.
@@ -5521,7 +5577,48 @@ function _resyncFlowIndex(tabFlow, flowIndex, filledFields, actionHistory, logge
           (a.includes('→ page changed') || a.includes('→ ok'))
         );
       if (submitted) { flowIndex++; advanced = true; continue; }
-      else break;
+      // Merged fill pair: a "click <field>" step is satisfied when a field it
+      // names has already been filled — typing focuses the element, so the
+      // Tab-Map executor folds the click+type pair into a single type action.
+      // Prefix-matched ('recipient' ↔ 'To recipients').
+      const _GENERIC_WORDS = new Set(['click', 'field', 'the', 'button', 'box', 'input', 'into', 'form', 'text', 'area', 'edit', 'enter', 'type', 'fill']);
+      const _clickWords = (target.match(/[a-z]{3,}/gi) || []).map(w => w.toLowerCase()).filter(w => !_GENERIC_WORDS.has(w));
+      const _filledMatch = _clickWords.length > 0 && (filledFields || []).some(f => {
+        const _labelWords = (String(f.label || '').toLowerCase().match(/[a-z]{3,}/g) || []);
+        return _clickWords.some(w => _labelWords.some(lw => lw.startsWith(w) || w.startsWith(lw)));
+      });
+      if (_filledMatch) { flowIndex++; advanced = true; continue; }
+      // Submit-ish click steps ("click Send") fall through to the
+      // submit-by-any-means check — the executor may have submitted via
+      // keyboard shortcut instead of the button click. Also fall through when
+      // the captured target is a key combo ("press 'Ctrl+Enter' to send") —
+      // the quoted label is the accelerator, but the step's INTENT is submit.
+      const _submitIsh = /\b(send|submit|post|publish|save|apply|confirm|create|tweet|share)\b/i;
+      const _modEnter = /(?:ctrl|cmd|meta|control|command|option|alt)\s*\+\s*enter/i;
+      if (!_submitIsh.test(target) && !_modEnter.test(target) &&
+          !_submitIsh.test(action) && !_modEnter.test(action)) break;
+    }
+    // Submit-by-any-means: flow steps like "press Ctrl+Enter to send" or
+    // "click Send" are satisfied by ANY successful submit in the history —
+    // the executor may use a different submit path than the plan (button click
+    // vs keyboard combo). Requires a shared meaningful word (≥4 chars) so a
+    // bare "Press Enter" form-advance doesn't satisfy a send step.
+    if (/\b(send|submit|post|publish|save|apply|confirm|create|tweet|share)\b/i.test(action) ||
+        /(?:ctrl|cmd|meta|control|command|option|alt)\s*\+\s*enter/i.test(action)) {
+      const _SUBMIT_GENERIC = new Set(['click', 'press', 'with', 'this', 'that', 'into', 'then', 'enter', 'ctrl', 'control', 'meta', 'command', 'email', 'message', 'button', 'form', 'when', 'done']);
+      const _submitWords = (action.match(/[a-z]{4,}/gi) || [])
+        .map(w => w.toLowerCase())
+        .filter(w => !_SUBMIT_GENERIC.has(w));
+      const _sent = (actionHistory || []).some(a => {
+        const al = a.toLowerCase();
+        if (!(al.includes('→ ok') || al.includes('→ page changed'))) return false;
+        // A modifier+Enter press IS a submit accelerator (Gmail Ctrl+Enter etc.)
+        // — counts as satisfying any submit-ish flow step regardless of wording.
+        if (/(?:ctrl|cmd|meta|control|command|option|alt)\+enter/i.test(al)) return true;
+        if (!/\b(send|submit|post|publish|save|apply|confirm|create|tweet|share|enter)\b/i.test(al)) return false;
+        return _submitWords.length === 0 || _submitWords.some(w => al.includes(w));
+      });
+      if (_sent) { flowIndex++; advanced = true; continue; }
     }
     break; // unknown step type — don't advance
   }
@@ -6285,6 +6382,16 @@ async function _tabMapStepExecute(sessionId, step, stepIndex, stepCount, tabMap,
   // universal post-click guard (detects ad/tracking-domain navigation AND wrong-product drift).
   const _isOnPageClick = step.action === 'click' && _isOnPageActionLabel(step.target);
   const _guardPreUrl = (_isOnPageClick || step._preClassifiedRef) ? await _getUrl(sessionId).catch(() => '') : null;
+  // Submit-marker: stamp BEFORE the click so a send-API POST landing in the
+  // netLog right after is attributed to this submit (correlated send detection —
+  // covers endpoints the _SEND_ENDPOINT_RE name list doesn't know).
+  const _submitLabels = /^(Post|Send|Submit|Publish|Save|Create|Share|Tweet|Schedule|Confirm|Apply|Continue|Post\s+it|Send\s+now|Save\s+changes)$/i;
+  if (step.action === 'click' && _submitLabels.test(step.target || '')) {
+    try {
+      const { _markSubmitAttempt } = require('./browser.agent.cjs');
+      _markSubmitAttempt(sessionId, currentUrl ? new URL(currentUrl).hostname : '');
+    } catch (_) {}
+  }
   const result = await _executeTabMapAction(sessionId, parsed, tabMap, overlayActive, pageCategory, pickedEntry);
 
   // ── Universal post-click guard for on-page actions ──────────────────────
@@ -6338,7 +6445,7 @@ async function _tabMapStepExecute(sessionId, step, stepIndex, stepCount, tabMap,
 
   // Check for submit actions — only real submit/primary action buttons, not
   // open/create labels like "Start a post" or "New post".
-  const _submitLabels = /^(Post|Send|Submit|Publish|Save|Create|Share|Tweet|Schedule|Confirm|Apply|Continue|Post\s+it|Send\s+now|Save\s+changes)$/i;
+  // (_submitLabels declared above — also used for the pre-click submit marker.)
   if (step.action === 'click' && _submitLabels.test(step.target || '')) {
     const _verify = await _verifySubmitSuccess(sessionId, step.target, { url: currentUrl });
     if (_verify?.ok) {
@@ -6417,7 +6524,14 @@ async function _tabMapInnerStep(sessionId, goal, actionHistory, currentUrl, over
     return { done: true, ok: false, error: `Loop detected — same action repeated 3 times: "${nextAction}"` };
   }
 
-  // 6. Execute the action
+  // 6. Execute the action — stamp a submit marker first for submit-labeled
+  // clicks so a send-API POST landing right after is attributed to this submit.
+  if (parsed.action === 'click' && /\b(send|submit|post|publish|create|save)\b/i.test(parsed.target || '')) {
+    try {
+      const { _markSubmitAttempt } = require('./browser.agent.cjs');
+      _markSubmitAttempt(sessionId, currentUrl ? new URL(currentUrl).hostname : '');
+    } catch (_) {}
+  }
   const result = await _executeTabMapAction(sessionId, parsed, tabMap, overlayActive, pageCategory);
 
   // 7. Handle lazy re-scan signal
@@ -6665,35 +6779,48 @@ async function _selectTierLLM(sessionId, goal, actionHistory, pageCategory, shor
     const _checkboxCount = await _countCheckboxes(sessionId);
     const done = await _checkDone(goal, actionHistory, currentUrl, probe?.pageTitle, _checkboxCount, sessionId);
     if (done) {
-      // Final OCR safety check — only if OCR didn't already run this iteration
-      // (dynamic OCR gating may have skipped it for rich-DOM pages like Notion).
-      // This catches visual mismatches the DOM can't see (e.g., text typed but
-      // not rendered due to a React state bug). ~3s cost, runs once at goal completion.
+      // A confirmed send-API call is terminal proof — skip the final visual
+      // verify entirely. Post-send inbox state ("1-50 of 36,479") reads as
+      // failure to the verifier and previously overrode the YES, looping the
+      // agent into composing and sending the email again.
+      if (/\b(send|email|e-mail|mail|reply|forward)\b/i.test(goal || '')) {
+        try {
+          const { _detectSuccessfulSend } = require('./browser.agent.cjs');
+          if (_detectSuccessfulSend && _detectSuccessfulSend(sessionId)) {
+            logger.info(`[instruction.runner] _checkDone=YES + send-API confirmed — done (skipping final verify)`);
+            return 0;
+          }
+        } catch (_) {}
+      }
+      // Final snapshot safety check — only if observation didn't already run
+      // this iteration. Uses the in-process Playwright snapshot (ARIA/DOM YAML
+      // + visible text) instead of OCR — same artifact playwright-cli's
+      // `snapshot` produces, on the live engine page.
       if (!ocrObservation) {
         try {
-          const { _liteparseCapture, _ocrVerifyGoal } = require('./browser.agent.cjs');
-          const _ocrPage = engine.getPage(sessionId);
-          if (_ocrPage) {
-            const _finalCap = await _liteparseCapture(_ocrPage);
-            if (_finalCap?.ok && _finalCap.textItems?.length > 0) {
-              const _finalText = _finalCap.fullText || _finalCap.textItems.map(t => t.text).join(' ');
-              const _finalVerify = await _ocrVerifyGoal(_finalText, goal, actionHistory);
-              if (_finalVerify?.num !== 1) {
-                logger.warn(`[instruction.runner] _checkDone=YES but final OCR verify disagreed (num=${_finalVerify?.num}, reason="${(_finalVerify?.reason || '').slice(0, 80)}") — continuing iteration`);
-                // Don't return 0 — let the iteration continue to fix the issue
-              } else {
-                logger.info(`[instruction.runner] Final OCR verify confirmed goal achieved — done`);
-                return 0;
-              }
+          const { _pageObservationText, _ocrVerifyGoal } = require('./browser.agent.cjs');
+          const _finalCap = _pageObservationText ? await _pageObservationText(sessionId) : null;
+          if (_finalCap?.ok && _finalCap.text) {
+            const _finalVerify = await _ocrVerifyGoal(_finalCap.text, goal, actionHistory);
+            if (_finalVerify?.num !== 1) {
+              logger.warn(`[instruction.runner] _checkDone=YES but final snapshot verify disagreed (num=${_finalVerify?.num}, reason="${(_finalVerify?.reason || '').slice(0, 80)}") — continuing iteration`);
+              // Don't return 0 — let the iteration continue to fix the issue
+            } else {
+              logger.info(`[instruction.runner] Final snapshot verify confirmed goal achieved — done`);
+              return 0;
             }
+          } else {
+            // Snapshot unavailable — trust _checkDone's YES
+            logger.info(`[instruction.runner] Final snapshot verify unavailable — trusting _checkDone=YES`);
+            return 0;
           }
         } catch (_e) {
-          // OCR failed — trust _checkDone's YES (non-fatal)
-          logger.warn(`[instruction.runner] Final OCR verify failed (non-fatal): ${_e.message} — trusting _checkDone=YES`);
+          // Verification failed — trust _checkDone's YES (non-fatal)
+          logger.warn(`[instruction.runner] Final snapshot verify failed (non-fatal): ${_e.message} — trusting _checkDone=YES`);
           return 0;
         }
       } else {
-        // OCR already ran this iteration and didn't flag done — trust _checkDone
+        // Observation already ran this iteration and didn't flag done — trust _checkDone
         return 0;
       }
     }
@@ -6877,8 +7004,9 @@ async function _selectTierLLM(sessionId, goal, actionHistory, pageCategory, shor
    NOTE: If no cell is focused, use Shortcuts (3) to focus a cell via Meta+J first.`);
   }
 
+  const _obsLabel = ocrObservation?.source === 'snapshot' ? 'Page snapshot text' : 'OCR visual text';
   const _ocrBlock = ocrObservation
-    ? `\nOCR visual text (first 200 chars): ${(ocrObservation.fullText || '').slice(0, 200)}\n`
+    ? `\n${_obsLabel} (first 200 chars): ${(ocrObservation.fullText || '').slice(0, 200)}\n`
     : '';
   const _contextBlock = agentContext
     ? `\nApp context:\n${String(agentContext).slice(0, 600)}\n`
@@ -7335,6 +7463,12 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
   logger.info(`[instruction.runner] runIterativeNavigation: goal="${String(goal || '').slice(0, 80)}", pageCategory=${_pageCategory}, sessionId=${sessionId}, urlFirstNav=${_urlFirstNav}, stepType=${stepType || 'none'}`);
 
   _clearLlmCache(sessionId);
+  // Drop any submit marker left by a previous task on this session — a stale
+  // marker would let a stray POST count as send evidence for a new send-goal.
+  try {
+    const { _clearSubmitMarker } = require('./browser.agent.cjs');
+    if (_clearSubmitMarker) _clearSubmitMarker(sessionId);
+  } catch (_) {}
 
   const startTime = Date.now();
   const actionHistory = [];
@@ -7345,6 +7479,7 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
   let _cachedTabMap = null;
   let _cachedTabMapUrl = null;
   let _cachedTabMapOverlayActive = null;
+  let _cachedTabMapOverlayKey = null;
   const filledFields = [];        // { ref, label, value } — for LLM prompt
   const consumedRefs = new Set(); // refs of filled fields — for filtering element list
   let inTabMapSession = false;
@@ -7575,6 +7710,21 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
       : (currentUrl !== prevUrl || newOverlayActive !== overlayActive);
     overlayActive = newOverlayActive;
 
+    // 1a. Hard duplicate-send guard — if a send-API call already succeeded this
+    // session, the message is out. Stop immediately regardless of flow/checklist
+    // state: continuing risks composing and sending the same email AGAIN
+    // (observed: flow-index stall + verification miss → duplicate sends).
+    if (/\b(send|email|e-mail|mail|reply|forward)\b/i.test(goal || '') && actionHistory.length > 0) {
+      try {
+        const { _detectSuccessfulSend } = require('./browser.agent.cjs');
+        if (_detectSuccessfulSend && _detectSuccessfulSend(sessionId)) {
+          logger.info(`[instruction.runner] Send-API already succeeded — goal met, stopping (idempotent guard)`);
+          const _resultStr = _buildResultString(goal, actionHistory, filledFields, extractedPageText);
+          return { ok: true, output: _resultStr || `Goal achieved (send confirmed via send-API): ${goal}`, actionHistory };
+        }
+      } catch (_) {}
+    }
+
     // 1b. Clear tried tiers on state change or focus change
     // (so multi-step Just-type like Notion: type title → Enter → type body still works)
     const _focusChanged = (focused?.ref || null) !== (_prevFocusedRef || null);
@@ -7588,6 +7738,24 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
 
     // 2. If in Tab-Map session and no state change → continue Tab-Map inner loop
     if (inTabMapSession && !stateChanged && _cachedTabMap) {
+      // Stale-map revalidation: a different dialog may have swapped in while
+      // overlayActive stayed true (compose closed → confirm dialog opened).
+      // Compare the overlay identity key — typing into fields does not change
+      // it, so same-state fills keep the cached map (one scan per state).
+      if (overlayActive) {
+        const _curOverlayKey = await _overlayStateKey(sessionId);
+        if (_curOverlayKey && _cachedTabMapOverlayKey && _curOverlayKey !== _cachedTabMapOverlayKey) {
+          logger.info(`[instruction.runner] Tab-Map: overlay identity changed (${_cachedTabMapOverlayKey} → ${_curOverlayKey}) — invalidating cached map`);
+          _cachedTabMap = null;
+          _cachedTabMapOverlayKey = null;
+          _stepPlan = null;
+          _stepIndex = 0;
+          _usingStepFallback = false;
+          prevUrl = currentUrl;
+          _doneVerifyFails = 0;
+          continue;
+        }
+      }
       let stepResult;
 
       // Re-plan against the cached tab-map: the previous sub-plan finished but
@@ -7682,6 +7850,7 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
         _cachedTabMap = freshTabMap;
         _cachedTabMapUrl = currentUrl;
         _cachedTabMapOverlayActive = overlayActive;
+        _cachedTabMapOverlayKey = overlayActive ? await _overlayStateKey(sessionId) : null;
         _clearLlmCache(sessionId);
         // Re-extract steps for the fresh tab-map (unless in fallback mode).
         // Batches the remaining tier-4 flow run into one plan (see _tier4RunHint).
@@ -8101,23 +8270,46 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
     const _domRichEnough = _probe.fillableCount >= 1 && _probe.visibleText.length >= 50;
     const _needsOcr = _isTrueCanvasPage || !_domRichEnough;
     if (_needsOcr) {
-      try {
-        const { _liteparseCapture } = require('./browser.agent.cjs');
-        const _ocrPage = engine.getPage(sessionId);
-        if (_ocrPage) {
-          const _cap = await _liteparseCapture(_ocrPage);
-          if (_cap?.ok && _cap.textItems && _cap.textItems.length > 0) {
-            _ocrObservation = {
-              textItems: _cap.textItems.slice(0, 50),  // cap for token budget
-              fullText: (_cap.fullText || '').slice(0, 500),
-              imageWidth: _cap.imageWidth,
-              imageHeight: _cap.imageHeight,
-            };
-            logger.info(`[instruction.runner] OCR observation: ${_cap.textItems.length} items, ${(_cap.fullText || '').length} chars (trueCanvas: ${_isTrueCanvasPage}, domRich: ${_domRichEnough})`);
+      if (_isTrueCanvasPage) {
+        // True-canvas pages (sheets grid, code editors, design canvases) render
+        // content the DOM can't see — OCR is the only text source there.
+        try {
+          const { _liteparseCapture } = require('./browser.agent.cjs');
+          const _ocrPage = engine.getPage(sessionId);
+          if (_ocrPage) {
+            const _cap = await _liteparseCapture(_ocrPage);
+            if (_cap?.ok && _cap.textItems && _cap.textItems.length > 0) {
+              _ocrObservation = {
+                textItems: _cap.textItems.slice(0, 50),  // cap for token budget
+                fullText: (_cap.fullText || '').slice(0, 500),
+                imageWidth: _cap.imageWidth,
+                imageHeight: _cap.imageHeight,
+                source: 'ocr',
+              };
+              logger.info(`[instruction.runner] OCR observation: ${_cap.textItems.length} items, ${(_cap.fullText || '').length} chars (trueCanvas)`);
+            }
           }
+        } catch (_ocrErr) {
+          logger.warn(`[instruction.runner] OCR observation failed (non-fatal): ${_ocrErr.message}`);
         }
-      } catch (_ocrErr) {
-        logger.warn(`[instruction.runner] OCR observation failed (non-fatal): ${_ocrErr.message}`);
+      } else {
+        // DOM-poor non-canvas page — structured observation via the in-process
+        // Playwright snapshot (ARIA/DOM YAML + visible text). Same artifact as
+        // playwright-cli's `snapshot`, on the live authenticated page.
+        try {
+          const { _pageObservationText } = require('./browser.agent.cjs');
+          const _obs = _pageObservationText ? await _pageObservationText(sessionId, 3000) : null;
+          if (_obs?.ok && _obs.text) {
+            _ocrObservation = {
+              textItems: [],      // no coordinates from a YAML snapshot
+              fullText: _obs.text.slice(0, 3000),
+              source: 'snapshot',
+            };
+            logger.info(`[instruction.runner] Snapshot observation: ${_obs.text.length} chars (domRich: ${_domRichEnough})`);
+          }
+        } catch (_obsErr) {
+          logger.warn(`[instruction.runner] Snapshot observation failed (non-fatal): ${_obsErr.message}`);
+        }
       }
     }
 
@@ -8363,20 +8555,17 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
         const _mightTriggerAlert = /Shortcut|Just-type|press|Save|submit/i.test(_lastAction);
         if (_mightTriggerAlert && _probe.fillableCount === 0 && !overlayActive) {
           try {
-            const { _liteparseCapture } = require('./browser.agent.cjs');
-            const _ocrPage = engine.getPage(sessionId);
-            if (_ocrPage) {
-              const _cap = await _liteparseCapture(_ocrPage);
-              if (_cap?.ok && _cap.fullText) {
-                const _ocrAlertPatterns = /discard|are you sure|continue editing|required|error|saved|created|open.*link|block|allow/i;
-                if (_ocrAlertPatterns.test(_cap.fullText)) {
-                  logger.info(`[instruction.runner] OCR alert detected: "${_cap.fullText.slice(0, 100)}"`);
-                  _disabledTiers.delete(4); // force Tab-Map
-                  _triedTiers.clear();
-                  _cachedTabMap = null;
-                  _alertHandled = true;
-                  actionHistory.push(`Alert handler: OCR detected alert — forcing Tab-Map`);
-                }
+            const { _pageObservationText } = require('./browser.agent.cjs');
+            const _cap = _pageObservationText ? await _pageObservationText(sessionId, 2000) : null;
+            if (_cap?.ok && _cap.text) {
+              const _ocrAlertPatterns = /discard|are you sure|continue editing|required|error|saved|created|open.*link|block|allow/i;
+              if (_ocrAlertPatterns.test(_cap.text)) {
+                logger.info(`[instruction.runner] Snapshot alert detected: "${_cap.text.slice(0, 100)}"`);
+                _disabledTiers.delete(4); // force Tab-Map
+                _triedTiers.clear();
+                _cachedTabMap = null;
+                _alertHandled = true;
+                actionHistory.push(`Alert handler: snapshot detected alert — forcing Tab-Map`);
               }
             }
           } catch (_) {}
@@ -9121,6 +9310,14 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
         prevUrl = currentUrl;
         continue;
       }
+      // Stamp a submit marker before modifier+Enter sends (Gmail Ctrl/Cmd+Enter)
+      // so the correlated send detector attributes the following POST.
+      if (/(?:Meta|Control|Ctrl|Cmd|Command)\+Enter/i.test(shortcutResult.key || '')) {
+        try {
+          const { _markSubmitAttempt } = require('./browser.agent.cjs');
+          _markSubmitAttempt(sessionId, currentUrl ? new URL(currentUrl).hostname : '');
+        } catch (_) {}
+      }
       const result = await _executeShortcut(sessionId, shortcutResult.key, goal, actionHistory);
       const _note = result.ok ? (result.pageChanged ? '→ page changed' : '→ ok') : '→ FAILED';
       actionHistory.push(`Shortcut "${shortcutResult.key}" ${_note}`);
@@ -9218,6 +9415,7 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
         _cachedTabMap = tabMap;
         _cachedTabMapUrl = currentUrl;
         _cachedTabMapOverlayActive = overlayActive;
+        _cachedTabMapOverlayKey = overlayActive ? await _overlayStateKey(sessionId) : null;
         _clearLlmCache(sessionId);
         logger.info(`[instruction.runner] Tab-Map: built fresh tab-map (${tabMap.length} elements) — cached for session`);
 
@@ -9379,6 +9577,7 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
         _cachedTabMap = await buildTabMap(sessionId, 150, { skipReset: overlayActive });
         _cachedTabMapUrl = currentUrl;
         _cachedTabMapOverlayActive = overlayActive;
+        _cachedTabMapOverlayKey = overlayActive ? await _overlayStateKey(sessionId) : null;
       }
 
       const _gestureTargets = await _extractGestureTargets(_gestureType, goal, _cachedTabMap, actionHistory);

@@ -1851,7 +1851,7 @@ async function _ocrVerifyGoal(ocrText, goal, actionHistory = [], sessionId = nul
   const { askWithMessages } = require('../skill-helpers/skill-llm.cjs');
   const historyStr = (actionHistory || []).slice(-5).map((a, i) => `  ${i + 1}. ${a}`).join('\n');
 
-  const systemPrompt = `You verify if a browser automation goal has been achieved by looking at the OCR text captured from the page.
+  const systemPrompt = `You verify if a browser automation goal has been achieved by looking at the captured page text/snapshot.
 Return ONLY a single number — nothing else:
 0 = failure (goal NOT achieved — page is a marketing/landing page, login page, or expected content is missing)
 1 = done (goal achieved — expected result is visible, e.g., event title visible, confirmation message shown)
@@ -1895,7 +1895,7 @@ ADD TO CART RULE: If the goal asks to add an item to a cart/basket/bag (e.g., "a
 Return ONLY the number.`;
 
   const userPrompt = `Goal: ${goal}
-OCR text from page:
+Page text/snapshot:
 ${_sampleTextForGoal(ocrText, goal)}
 Actions taken:
 ${historyStr}
@@ -1968,7 +1968,7 @@ Number (0-2)?`;
             } catch (_) {}
           }
 
-          const _ocrSection = `OCR text: ${_sampleTextForGoal(ocrText, goal, 800)}`;
+          const _ocrSection = `Page text: ${_sampleTextForGoal(ocrText, goal, 800)}`;
           const _domSection = _domText ? `\nDOM text: ${_domText.slice(0, 800)}` : '';
           const reasonRaw = await askWithMessages([
             { role: 'system', content: 'In one sentence, state why the browser automation goal was NOT achieved. Quote the exact text from the page that indicates the blocker (e.g., \'Page shows: "Enable billing to access..."\'). If no specific blocker text is visible, describe what is missing versus the goal. Return ONLY the explanation.' },
@@ -2007,9 +2007,29 @@ Number (0-2)?`;
 // (3) dialog/overlay closed, (4) no error toast after close.
 // Returns { verified: true/false, reason: string }
 // Mail-send endpoints — a successful POST to one of these is terminal proof
-// the message went out. Gmail uses /sync/u/*/i/s, Outlook /sendmail, others
-// /messages/send or sendmsg-style routes.
-const _SEND_ENDPOINT_RE = /\/sync\/[^/]*\/i\/s|\/sendmail|\/messages\/send|sendmsg|smtpsend|\/send(?:\?|\/|$)/i;
+// the message went out. Gmail uses /sync/u/*/i/s (e.g. /sync/u/0/i/s), Outlook
+// /sendmail, others /messages/send or sendmsg-style routes.
+const _SEND_ENDPOINT_RE = /\/sync\/[^/]*(?:\/[^/]*)*\/i\/s|\/sendmail|\/messages\/send|sendmsg|smtpsend|\/send(?:\?|\/|$)/i;
+
+// Mutation-looking writes that are NOT sends — Gmail autosaves drafts via
+// /sync/u/*/i/d constantly while composing, and label/read/archive ops are
+// frequent background POSTs. The correlated branch below must exclude these
+// so a draft save right before Send isn't counted as the send itself.
+const _SEND_EXCLUDE_RE = /\/i\/d(?:\?|\/|$)|autosave|\/drafts?|\/settings|\/prefs|\/star|\/unstar|\/read|\/unread|\/archive|\/trash|\/spam|\/labels?|\/mute|\/snooze|\/importance/i;
+
+// Submit markers for correlated send detection — set when a submit/save/send
+// action executes (before the request lands), so a 2xx POST to the same host
+// arriving right after counts as send evidence even when the endpoint name is
+// unknown (Gmail renames RPC paths over time). The named-endpoint fast path
+// always outranks correlation.
+const _submitMarkers = new Map(); // sessionId → { ts, host }
+function _markSubmitAttempt(sessionId, host) {
+  if (!sessionId) return;
+  _submitMarkers.set(sessionId, { ts: Date.now(), host: String(host || '') });
+}
+function _clearSubmitMarker(sessionId) {
+  _submitMarkers.delete(sessionId);
+}
 
 // True when the netLog already contains a successful send-API call — i.e. the
 // message was sent even if verification/UI failed to notice. Used both to
@@ -2017,10 +2037,24 @@ const _SEND_ENDPOINT_RE = /\/sync\/[^/]*\/i\/s|\/sendmail|\/messages\/send|sendm
 function _detectSuccessfulSend(sessionId) {
   try {
     const _entries = browserEngine?.getNetLog(sessionId) || [];
-    return _entries.some(e =>
-      /^(POST|PUT|PATCH)$/.test(e.method) &&
-      e.status >= 200 && e.status < 300 &&
-      _SEND_ENDPOINT_RE.test(e.url || ''));
+    const _okMutation = (e) => /^(POST|PUT|PATCH)$/.test(e.method) && e.status >= 200 && e.status < 300;
+    // Fast path: a 2xx mutation to a known send endpoint.
+    if (_entries.some(e => _okMutation(e) && _SEND_ENDPOINT_RE.test(e.url || ''))) return true;
+    // Correlated fallback: a 2xx mutation POST to the same host within ~30s of
+    // a submit action, that isn't a known non-send write. Covers endpoints the
+    // regex doesn't know (provider renames the RPC path).
+    const _marker = _submitMarkers.get(sessionId);
+    if (!_marker) return false;
+    return _entries.some(e => {
+      if (!_okMutation(e)) return false;
+      if (typeof e.ts === 'number' && (e.ts < _marker.ts - 500 || e.ts > _marker.ts + 30000)) return false;
+      const _u = e.url || '';
+      if (_SEND_EXCLUDE_RE.test(_u)) return false;
+      if (_marker.host) {
+        try { if (new URL(_u).hostname !== _marker.host) return false; } catch (_) { return false; }
+      }
+      return true;
+    });
   } catch (_) { return false; }
 }
 
@@ -2270,33 +2304,33 @@ async function _verifyGoalWithOcr(goal, sessionId, actionHistory) {
     if (!_ocrPage) return { verified: true, reason: 'no-page-available' };
 
     // If the last action spawned a new tab (target=_blank / window.open), the
-    // tracked page may still be loading — wait for DOM before OCR so we don't
-    // capture a half-rendered or about:blank page.
+    // tracked page may still be loading — wait for DOM before the snapshot so we
+    // don't capture a half-rendered or about:blank page.
     try { await _ocrPage.waitForLoadState('domcontentloaded', { timeout: 8000 }); } catch (_) {}
 
     // Wait for the page to stabilize before capturing. If the first capture is
     // too small (page still loading, spinner, or wrong viewport), wait and retry
     // once — this is critical for Google Cloud Console where content loads after
     // the URL change.
-    let _cap = await _liteparseCapture(_ocrPage);
+    let _cap = await _pageObservationText(sessionId);
     let _retry = 0;
-    while (_cap?.ok && _cap.fullText && _cap.fullText.length < 100 && _cap.textItems && _cap.textItems.length < 10 && _retry < 2) {
-      logger.info(`[browser.agent] _verifyGoalWithOcr: OCR capture too small (${_cap.textItems.length} items, ${_cap.fullText.length} chars) — waiting for page to stabilize (retry ${_retry + 1}/2)`);
+    while (_cap?.ok && _cap.text && _cap.text.length < 200 && _retry < 2) {
+      logger.info(`[browser.agent] _verifyGoalWithOcr: snapshot too small (${_cap.text.length} chars) — waiting for page to stabilize (retry ${_retry + 1}/2)`);
       await new Promise(resolve => setTimeout(resolve, 1500));
-      _cap = await _liteparseCapture(_ocrPage);
+      _cap = await _pageObservationText(sessionId);
       _retry++;
     }
 
-    if (!_cap?.ok || !_cap.fullText) return { verified: true, reason: 'ocr-unavailable' };
-    const _ocrText = _cap.fullText.slice(0, 800);
+    if (!_cap?.ok || !_cap.text) return { verified: true, reason: 'snapshot-unavailable' };
+    const _ocrText = _cap.text.slice(0, 800);
     const _ocrResult = await _ocrVerifyGoal(_ocrText, goal, actionHistory, sessionId);
     const _num = _ocrResult.num;
-    const _reason = _ocrResult.reason || 'ocr-failed';
-    if (_num === 1) return { verified: true, reason: 'ocr-confirmed', ocrText: _ocrText.slice(0, 200) };
-    if (_num === 2) return { verified: false, reason: 'ocr-loading', wait: true, ocrText: _ocrText.slice(0, 200) };
+    const _reason = _ocrResult.reason || 'snapshot-failed';
+    if (_num === 1) return { verified: true, reason: 'snapshot-confirmed', ocrText: _ocrText.slice(0, 200) };
+    if (_num === 2) return { verified: false, reason: 'snapshot-loading', wait: true, ocrText: _ocrText.slice(0, 200) };
     return { verified: false, reason: _reason, ocrText: _ocrText.slice(0, 200) };
   } catch (e) {
-    return { verified: true, reason: 'ocr-error', error: e.message };
+    return { verified: true, reason: 'snapshot-error', error: e.message };
   }
 }
 
@@ -2458,7 +2492,7 @@ Rules:
 Return ONLY the number.`;
 
   const userPrompt = `Goal: ${goal}
-OCR text from page:
+Page text/snapshot:
 ${(ocrText || '').slice(0, 300)}
 
 Number (0-1)?`;
@@ -2568,7 +2602,7 @@ NAMED ITEM RULE: If the goal specifies a name, title, or list of items (e.g., "c
 Return ONLY the number.`;
 
   const userPrompt = `Goal: ${goal}
-OCR text from page:
+Page text/snapshot:
 ${(ocrText || '').slice(0, 400)}
 Actions taken:
 ${historyStr}
@@ -3134,14 +3168,29 @@ GOAL-RELEVANCE RULES (CRITICAL):
   const userPrompt = `Goal: ${goal}\nPage category: ${pageCategory || 'web_generic'}\nAvailable shortcuts:\n${shortcutLabels || '(none)'}\nCurrent URL: ${currentUrl || '(unknown)'}\nAgent: ${agentId || '(unknown)'}${urlFirstNav ? `\nURL-FIRST NAVIGATION: true\nDEEP LINK TYPE: ${deepLinkType || 'none'}${deepLinkType === 'compose' ? '\nNOTE: The compose window is ALREADY open. Do NOT include a step to click Compose, New, or Write. Start directly with filling the fields (recipient, subject, body) then click Send.' : ''}${deepLinkType === 'creation' ? '\nNOTE: The entity has ALREADY been created. Do NOT include a step to click New or Create. Start directly with the first input field.' : ''}` : ''}`;
 
   try {
-    const response = await askWithMessages([
-      { role: 'system', content: systemPrompt },
-      { role: 'user', content: userPrompt },
-    ], { maxTokens: 800, temperature: 0, responseTimeoutMs: 15000 });
+    // Retry once on parse failure — the model occasionally wraps the JSON
+    // array in prose/markdown fences, and without a flow the runner falls
+    // back to state-reactive Tab-Map which flails on complex pages (e.g.
+    // Gmail's 196-element inbox DOM — observed 2026-09-29).
+    let flow = null;
+    for (let _attempt = 0; _attempt < 2 && !flow; _attempt++) {
+      const _retryHint = _attempt === 1
+        ? '\n\nRespond with ONLY a raw JSON array of step objects — no markdown, no prose, no code fences.'
+        : '';
+      const response = await askWithMessages([
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: userPrompt + _retryHint },
+      ], { maxTokens: 800, temperature: 0, responseTimeoutMs: 15000 });
 
-    if (!response) return null;
-    const flow = parseLlmJson(response, logger, '_computeTabFlow');
-    if (Array.isArray(flow) && flow.length > 0) {
+      if (!response) continue;
+      const _parsed = parseLlmJson(response, logger, '_computeTabFlow');
+      if (Array.isArray(_parsed) && _parsed.length > 0) {
+        flow = _parsed;
+      } else {
+        logger.warn(`[browser.agent] _computeTabFlow: could not parse JSON from response (attempt ${_attempt + 1}, raw: "${String(response).slice(0, 200)}")`);
+      }
+    }
+    if (flow) {
       // Post-process: split compound steps that combine multiple actions into one.
       // The LLM sometimes returns steps like "click X, select Y, then click Z" —
       // these need to be split into atomic steps so the flow index tracks each action.
@@ -3194,7 +3243,6 @@ GOAL-RELEVANCE RULES (CRITICAL):
       logger.info(`[browser.agent] _computeTabFlow: computed ${splitFlow.length}-step flow for "${goal.slice(0, 60)}" — ${splitFlow.map(s => `tier ${s.tier}(${(s.action || '').slice(0, 30)})`).join(' → ')}`);
       return splitFlow;
     }
-    logger.warn(`[browser.agent] _computeTabFlow: could not parse JSON from response`);
     return null;
   } catch (e) {
     logger.warn(`[browser.agent] _computeTabFlow failed: ${e.message}`);
@@ -14338,6 +14386,35 @@ async function _liteparseCapture(page, options = {}) {
   });
 }
 
+// Snapshot-based page observation — the in-process equivalent of
+// `playwright-cli snapshot` (ARIA/DOM YAML via engine.buildRefTree, falling
+// back to page.ariaSnapshot()). Used for goal/state verification instead of
+// OCR: same page, same authenticated session, no second browser. (The
+// playwright-cli subprocess is blocked on engine-owned sessions — see
+// browser.act.cjs cliRun — so this goes through browser.act's engine path.)
+async function _pageObservationText(sessionId, maxChars = 6000) {
+  try {
+    const snap = await callBrowserAct({ action: 'snapshot', sessionId, headed: true, timeoutMs: 8000 });
+    let yaml = String((snap && (snap.snapshotText || snap.stdout)) || '').trim();
+    // Visible body text — the YAML carries element structure; body text carries
+    // prose the verifier needs (counters, confirmation toasts, body content).
+    let bodyText = '';
+    try {
+      const probe = await callBrowserAct({
+        action: 'evaluate', sessionId, headed: true, timeoutMs: 3000,
+        text: `(() => (document.body && document.body.innerText || '').replace(/\\s+/g, ' ').slice(0, 1500))()`,
+      });
+      bodyText = String(probe?.result ?? probe?.stdout ?? '').replace(/^"|"$/g, '');
+    } catch (_) {}
+    if (!yaml && !bodyText) return { ok: false, error: 'empty-snapshot' };
+    const combined = (yaml ? `Page snapshot (ARIA YAML):\n${yaml}\n` : '') +
+                     (bodyText ? `\nVisible text: ${bodyText}` : '');
+    return { ok: true, text: combined.slice(0, maxChars) };
+  } catch (e) {
+    return { ok: false, error: `snapshot-failed: ${e.message}` };
+  }
+}
+
 // Verify typed text appears in LiteParse output
 async function _liteparseVerify(page, expectText) {
   const _cap = await _liteparseCapture(page);
@@ -14623,5 +14700,9 @@ module.exports._saveTabFlowCache = _saveTabFlowCache;
 module.exports._failTabFlowCache = _failTabFlowCache;
 module.exports._detectSuccessfulSend = _detectSuccessfulSend;
 module.exports._SEND_ENDPOINT_RE = _SEND_ENDPOINT_RE;
+module.exports._SEND_EXCLUDE_RE = _SEND_EXCLUDE_RE;
+module.exports._markSubmitAttempt = _markSubmitAttempt;
+module.exports._clearSubmitMarker = _clearSubmitMarker;
+module.exports._pageObservationText = _pageObservationText;
 module.exports._isPureSearchTask = _isPureSearchTask;
 module.exports._shouldSkipVideoDelegation = _shouldSkipVideoDelegation;
