@@ -393,6 +393,10 @@ class CommandServiceMCPServer {
       clipboard_backup:              appAgent.actionClipboardBackup,
       clipboard_restore:             appAgent.actionClipboardRestore,
       extract_content_via_clipboard: appAgent.actionExtractContentViaClipboard,
+      // Phase 4B — real-browser URL-first lane
+      navigate_url:                  appAgent.actionNavigateUrl,
+      scan_page:                     appAgent.actionScanPage,
+      print_page:                    appAgent.actionPrintPage,
       // Phase 5: Agent factory
       build_agent:                   appAgent.actionBuildAgent,
       check_installed:               appAgent.actionCheckInstalled,

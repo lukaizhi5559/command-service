@@ -6270,6 +6270,273 @@ async function actionExtractContentViaClipboard({ appName, category = 'browser' 
 }
 
 // ---------------------------------------------------------------------------
+// Phase 4B: Real-browser URL-first lane (navigate_url / scan_page / print_page)
+// ---------------------------------------------------------------------------
+// Drive the user's REAL default browser instead of a Playwright session for
+// URL-first read/search tasks — no bot walls (real cookies/profile), no session
+// spin-up, and the user keeps the page in front of them.
+//
+//   navigate_url { url, appName?, via? }  — 'open' (default browser, new tab)
+//                                          or 'type' (Cmd+L just-type, current tab)
+//   scan_page    { appName?, url?, ... }  — URL grab + Cmd+A/Cmd+C page copy →
+//                                          ~/.thinkdrop/copies/ + TTL cache +
+//                                          per-category minChars load verification
+//   print_page   { appName? }             — Cmd+P → Enter (unverifiable)
+
+const _pageCopyEst = require('../skill-helpers/page-copy-estimates.cjs');
+
+const _BROWSER_APP_NAMES = ['Google Chrome', 'Safari', 'Firefox', 'Arc', 'Brave Browser', 'Microsoft Edge', 'Opera'];
+const _isBrowserApp = (name) => _BROWSER_APP_NAMES.some(b => {
+  const a = String(name || '').toLowerCase();
+  const bl = b.toLowerCase();
+  return a.includes(bl) || bl.includes(a);
+});
+
+/**
+ * Read the clipboard's text/html flavor (Chrome/Safari place serialized DOM
+ * HTML on the clipboard for Cmd+A/Cmd+C). Preserves hrefs/structure that the
+ * plain-text flavor loses — enables link/item extraction from page copies.
+ */
+function _readClipboardHtml() {
+  try {
+    const { execSync } = require('child_process');
+    const out = execSync(`osascript -e 'the clipboard as «class HTML»'`, { encoding: 'utf8', timeout: 5000 });
+    const m = out.match(/«data HTML([0-9A-Fa-f]+)»/);
+    if (!m) return null;
+    return Buffer.from(m[1], 'hex').toString('utf8');
+  } catch (_) { return null; }
+}
+
+/**
+ * actionNavigateUrl — open a URL in the user's real browser.
+ * via: 'open' uses `open <url>` (default browser, new tab — deterministic);
+ *      'type' uses Cmd+L → just-type → Enter in the focused browser (current tab);
+ *      'auto' picks 'type' when a browser is frontmost and newTab===false,
+ *      else 'open', with cross-fallback on failure.
+ */
+async function actionNavigateUrl({ url, appName, via = 'auto', newTab } = {}) {
+  if (!url || !/^https?:\/\//i.test(String(url).trim())) {
+    return { ok: false, error: 'navigate_url requires a valid http(s) url' };
+  }
+  url = String(url).trim();
+  const { execFileSync } = require('child_process');
+  const est = _pageCopyEst.estimateForUrl(url);
+
+  const doOpen = async () => {
+    await _withOverlayHidden(async () => {
+      if (appName && appName.toLowerCase() !== 'browser') {
+        execFileSync('open', ['-a', appName, url], { timeout: 5000 });
+      } else {
+        execFileSync('open', [url], { timeout: 5000 });
+      }
+    });
+    return 'open';
+  };
+
+  const doType = async () => {
+    const focusResult = await verifyAppFocused({ appName: appName || 'browser', waitMs: 5000 });
+    if (!focusResult.focused) {
+      return { ok: false, error: `Browser not focused: currently "${focusResult.appName}"` };
+    }
+    const resolvedApp = focusResult.appName || appName;
+    const r1 = await actionExecuteShortcut({ appName: resolvedApp, shortcutOverride: 'Cmd+L', skipFocusCheck: true });
+    if (!r1?.ok) return { ok: false, error: `Cmd+L failed: ${r1?.error || 'unknown'}` };
+    await _sleep(200);
+    const r2 = await actionTypeText({ text: url + '{ENTER}', appName: resolvedApp });
+    if (!r2?.ok) return { ok: false, error: `URL type failed: ${r2?.error || 'unknown'}` };
+    return { ok: true };
+  };
+
+  const tryVia = (v) => v === 'type'
+    ? doType()
+    : doOpen().then(() => ({ ok: true })).catch(e => ({ ok: false, error: e.message }));
+
+  let chosen = via;
+  if (via === 'auto') {
+    // Current-tab typing only makes sense when a browser is already frontmost.
+    const liveWin = await _getActiveAppBounds().catch(() => null);
+    chosen = (newTab === false && liveWin && _isBrowserApp(liveWin.appName)) ? 'type' : 'open';
+  }
+
+  let usedVia = chosen;
+  let res = await tryVia(chosen);
+  if (!res.ok) {
+    const firstErr = res.error;
+    usedVia = chosen === 'type' ? 'open' : 'type';
+    logger.warn(`[app.agent] navigate_url via '${chosen}' failed (${firstErr}) — trying '${usedVia}'`);
+    res = await tryVia(usedVia);
+    if (!res.ok) {
+      return { ok: false, error: `navigate_url failed via 'open' and 'type': ${firstErr}; ${res.error}` };
+    }
+  }
+
+  await _sleep(est.settleMs);
+  logger.info(`[app.agent] navigate_url: ${url} via '${usedVia}' (category=${est.category}, settle=${est.settleMs}ms)`);
+  return { ok: true, url, via: usedVia, category: est.category };
+}
+
+/**
+ * One full copy pass: grab the URL from the address bar, then select-all +
+ * copy the page body. Caller must already be inside _withOverlayHidden with
+ * the browser focused.
+ */
+async function _copyPageOnce(appName, captureHtml) {
+  const { execSync } = require('child_process');
+  const press = (s, ms) => actionExecuteShortcut({ appName, shortcutOverride: s, skipFocusCheck: true }).then(() => _sleep(ms));
+
+  await press('Cmd+L', 250);          // focus address bar
+  await press('Cmd+C', 200);          // copy URL
+  let pageUrl = execSync('pbpaste', { encoding: 'utf8', timeout: 5000 }).trim();
+  if (!/^https?:\/\//i.test(pageUrl)) pageUrl = null; // copy misfire — not a URL
+
+  await press('Tab', 200);            // move focus to page body
+  await press('Cmd+A', 250);          // select all
+  await press('Cmd+C', 400);          // copy page text
+  const content = execSync('pbpaste', { encoding: 'utf8', timeout: 5000 });
+  const html = captureHtml ? _readClipboardHtml() : null;
+
+  // Clear the selection: Cmd+F, Space, Esc (open+close find resets selection).
+  await press('Cmd+F', 150);
+  await press('Space', 150);
+  await press('Escape', 150);
+
+  return { pageUrl, content, html };
+}
+
+/**
+ * actionScanPage — copy the current browser page's full rendered text to
+ * ~/.thinkdrop/copies/, verified against per-URL-category minChars estimates.
+ * Fresh copies (TTL, default 5 min) are served from cache — zero clipboard churn.
+ */
+/**
+ * _getLiveBrowserUrl — read the frontmost tab's URL via AppleScript. Instant,
+ * no clipboard churn. Returns null for browsers without an AppleScript URL
+ * API (Firefox) or any failure.
+ */
+async function _getLiveBrowserUrl(appName) {
+  const { execSync } = require('child_process');
+  const n = String(appName || '').toLowerCase();
+  let script = null;
+  if (n.includes('safari'))            script = 'tell application "Safari" to get URL of front document';
+  else if (n.includes('chrome'))       script = 'tell application "Google Chrome" to get URL of active tab of front window';
+  else if (n.includes('brave'))        script = 'tell application "Brave Browser" to get URL of active tab of front window';
+  else if (n.includes('edge'))         script = 'tell application "Microsoft Edge" to get URL of active tab of front window';
+  else if (n.includes('arc'))          script = 'tell application "Arc" to get URL of active tab of front window';
+  else if (n.includes('opera'))        script = 'tell application "Opera" to get URL of active tab of front window';
+  if (!script) return null;
+  try {
+    const out = execSync(`osascript -e '${script}'`, { encoding: 'utf8', timeout: 2500 }).trim();
+    return out || null;
+  } catch (_) { return null; }
+}
+
+async function actionScanPage({ appName, url, category, maxWaitMs = 10000, useCache = true, captureHtml = false, ttlMs } = {}) {
+  // 1. Focus first — we need the resolved browser app to read the LIVE tab URL
+  //    for cache matching. The old order served "latest fresh copy" for
+  //    url=null — observed: a Google task was synthesized from a 2-min-old
+  //    Amazon copy because the cache key matched nothing and 'latest' won.
+  const focusResult = await verifyAppFocused({ appName: appName || 'browser', waitMs: 5000 });
+  if (!focusResult.focused) {
+    return { ok: false, error: `Browser not focused: currently "${focusResult.appName}"`, focusResult };
+  }
+  const resolvedApp = focusResult.appName || appName;
+
+  // 2. Live tab URL — instant AppleScript read. An explicit url arg wins; the
+  //    live read is what makes "scan whatever's open" cache-safe.
+  const liveUrl = url || await _getLiveBrowserUrl(resolvedApp);
+
+  // 3. Cache hit → return the stored copy ONLY when it matches the live page.
+  //    With no live URL (Firefox etc.) we can't verify the cached page is the
+  //    open one — skip the lookup entirely instead of serving a stale page.
+  if (useCache && liveUrl) {
+    const hit = _pageCopyEst.findFreshCopy(liveUrl, ttlMs || _pageCopyEst.DEFAULT_TTL_MS);
+    if (hit) {
+      const content = _pageCopyEst.readCopy(hit.file);
+      if (content) {
+        logger.info(`[app.agent] scan_page: cache hit for ${hit.url} — ${hit.chars} chars in ${hit.file}`);
+        return { ok: true, content, savedTo: hit.file, url: hit.url, chars: content.length, cached: true };
+      }
+    }
+  } else if (useCache && !liveUrl) {
+    logger.info('[app.agent] scan_page: live URL unreadable — skipping cache lookup (no stale-copy fallback)');
+  }
+
+  // 3. Backup clipboard once, then copy-verify-retry until maxWaitMs.
+  const backupResult = await actionClipboardBackup();
+  if (!backupResult.ok) logger.warn('[app.agent] scan_page: proceeding without clipboard backup');
+
+  const start = Date.now();
+  let last = { pageUrl: null, content: '', html: null };
+  let est = _pageCopyEst.estimateForUrl(liveUrl || url);
+  try {
+    while (true) {
+      await _withOverlayHidden(async () => {
+        last = await _copyPageOnce(resolvedApp, captureHtml);
+      });
+      // Re-estimate against the URL actually grabbed from the address bar —
+      // redirects can land on a different category than the requested URL.
+      if (last.pageUrl) est = _pageCopyEst.estimateForUrl(last.pageUrl);
+      const minChars = category ? (_pageCopyEst.CATEGORY_ESTIMATES[category]?.minChars ?? est.minChars) : est.minChars;
+
+      if (_pageCopyEst.isBotWall(last.content)) {
+        return { ok: false, error: 'bot_detected', url: last.pageUrl || liveUrl || url, chars: last.content.length };
+      }
+      if (last.content.length >= Math.max(minChars, _pageCopyEst.ABSOLUTE_MIN_CHARS)) break;
+      if (Date.now() - start > maxWaitMs) {
+        // Accept thin-but-real content rather than hard-fail — legit sparse
+        // pages exist. Below ABSOLUTE_MIN_CHARS the grab failed (keystrokes
+        // went nowhere) — returning it as ok poisons the copy cache.
+        if (last.content.length >= _pageCopyEst.ABSOLUTE_MIN_CHARS) break;
+        return { ok: false, error: `Page copy empty after ${maxWaitMs}ms`, url: last.pageUrl || liveUrl || url };
+      }
+      await _sleep(est.settleMs);
+    }
+  } finally {
+    await actionClipboardRestore().catch(() => {});
+  }
+
+  const saved = _pageCopyEst.saveCopy({
+    url: last.pageUrl || liveUrl || url || null,
+    content: last.content,
+    appName: resolvedApp,
+    html: last.html,
+  });
+  const minChars = category ? (_pageCopyEst.CATEGORY_ESTIMATES[category]?.minChars ?? est.minChars) : est.minChars;
+  const thin = last.content.length < Math.max(minChars, _pageCopyEst.ABSOLUTE_MIN_CHARS);
+
+  logger.info(`[app.agent] scan_page: ${last.content.length} chars from "${resolvedApp}" url=${last.pageUrl || liveUrl || url || '(unknown)'} → ${saved?.file || '(unsaved)'}${thin ? ' [thin]' : ''}`);
+  return {
+    ok: true,
+    content: last.content,
+    savedTo: saved?.file || null,
+    url: last.pageUrl || liveUrl || url || null,
+    chars: last.content.length,
+    expectedMinChars: minChars,
+    category: est.category,
+    thin: thin || undefined,
+    cached: false,
+  };
+}
+
+/**
+ * actionPrintPage — Cmd+P → Enter in the focused app. Best-effort: there is
+ * no deterministic way to verify a print job from outside the app.
+ */
+async function actionPrintPage({ appName } = {}) {
+  const focusResult = await verifyAppFocused({ appName: appName || 'browser', waitMs: 5000 });
+  if (!focusResult.focused) {
+    return { ok: false, error: `App not focused: currently "${focusResult.appName}"`, focusResult };
+  }
+  const resolvedApp = focusResult.appName || appName;
+  const r = await actionExecuteShortcut({ appName: resolvedApp, shortcutOverride: 'Cmd+P', skipFocusCheck: true });
+  if (!r?.ok) return { ok: false, error: `Cmd+P failed: ${r?.error || 'unknown'}` };
+  await _sleep(1500); // print dialog open
+  await actionTypeText({ text: '{ENTER}', appName: resolvedApp });
+  logger.info(`[app.agent] print_page: Cmd+P→Enter sent to "${resolvedApp}" (unverified)`);
+  return { ok: true, verified: false };
+}
+
+// ---------------------------------------------------------------------------
 // Text typing utility (replaces deprecated ui.typeText)
 // ---------------------------------------------------------------------------
 
@@ -7021,6 +7288,11 @@ module.exports = {
   actionClipboardBackup,
   actionClipboardRestore,
   actionExtractContentViaClipboard,
+
+  // Phase 4B: Real-browser URL-first lane
+  actionNavigateUrl,
+  actionScanPage,
+  actionPrintPage,
 
   // Phase 5: Structured OCR helpers (used by app.runner.cjs monitoring)
   _filterItemsByAppBounds,
