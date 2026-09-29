@@ -806,8 +806,9 @@ class CommandServiceMCPServer {
         req.on('data', chunk => { body += chunk; });
         req.on('end', () => {
           try {
-            const { id, delayMs, label, triggerIntent, triggerPrompt, pendingSteps } = JSON.parse(body || '{}');
-            const result = skillScheduler.registerReminder({ id, delayMs, label, triggerIntent, triggerPrompt, pendingSteps });
+            const { id, delayMs, label, triggerIntent, triggerPrompt, pendingSteps, recur, cron, time } = JSON.parse(body || '{}');
+            const result = skillScheduler.registerReminder({ id, delayMs, label, triggerIntent, triggerPrompt, pendingSteps, recur, cron, time });
+            if (result?.error) { res.writeHead(200); res.end(JSON.stringify({ ok: false, error: result.error })); return; }
             res.writeHead(200);
             res.end(JSON.stringify({ ok: true, ...result }));
           } catch (err) {
@@ -1175,6 +1176,49 @@ class CommandServiceMCPServer {
         return;
       }
 
+      // ── POST /skill.import.inspect — resolve a skill-pack URL to a vetted preview ──
+      if (req.method === 'POST' && req.url === '/skill.import.inspect') {
+        let body = '';
+        req.on('data', chunk => { body += chunk; });
+        req.on('end', async () => {
+          try {
+            const { url } = JSON.parse(body || '{}');
+            if (!url) { res.writeHead(400); res.end(JSON.stringify({ ok: false, error: 'url required' })); return; }
+            const { inspectSkill } = require('./skill-helpers/skill-importer.cjs');
+            const result = await inspectSkill({ url });
+            res.writeHead(200);
+            res.end(JSON.stringify(result));
+          } catch (err) {
+            res.writeHead(200);
+            res.end(JSON.stringify({ ok: false, error: err.message }));
+          }
+        });
+        return;
+      }
+
+      // ── POST /skill.import.install — install an approved preview ───────────
+      // Body: { preview, nameOverride?, descriptionOverride? }
+      // The preview must come from a prior /skill.import.inspect call (it
+      // carries the fetched skillMd + file list). Never installs without it.
+      if (req.method === 'POST' && req.url === '/skill.import.install') {
+        let body = '';
+        req.on('data', chunk => { body += chunk; });
+        req.on('end', async () => {
+          try {
+            const { preview, nameOverride, descriptionOverride } = JSON.parse(body || '{}');
+            if (!preview?.skillMd) { res.writeHead(400); res.end(JSON.stringify({ ok: false, error: 'preview.skillMd required — call /skill.import.inspect first' })); return; }
+            const { installSkill } = require('./skill-helpers/skill-importer.cjs');
+            const result = await installSkill(preview, { nameOverride, descriptionOverride });
+            res.writeHead(200);
+            res.end(JSON.stringify(result));
+          } catch (err) {
+            res.writeHead(500);
+            res.end(JSON.stringify({ ok: false, error: err.message }));
+          }
+        });
+        return;
+      }
+
       // ── POST /agent.cli-build — build/rebuild a CLI agent ──────────────────
       if (req.method === 'POST' && req.url === '/agent.cli-build') {
         let body = '';
@@ -1187,6 +1231,46 @@ class CommandServiceMCPServer {
             const result = await cliAgent({ action: 'build_agent', service, cliTool, force: !!force });
             res.writeHead(200);
             res.end(JSON.stringify(result));
+          } catch (err) {
+            res.writeHead(500);
+            res.end(JSON.stringify({ ok: false, error: err.message }));
+          }
+        });
+        return;
+      }
+
+      // ── POST /agent.cli-install — install the agent's declared CLI bin ─────
+      // Reads install_method/install_pkg from the agent's descriptor (set by
+      // skill imports); falls back to the service registry meta.
+      if (req.method === 'POST' && req.url === '/agent.cli-install') {
+        let body = '';
+        req.on('data', chunk => { body += chunk; });
+        req.on('end', async () => {
+          try {
+            const { agentId } = JSON.parse(body || '{}');
+            if (!agentId) { res.writeHead(400); res.end(JSON.stringify({ ok: false, error: 'agentId required' })); return; }
+            const { cliAgent } = require('./skills/cli.agent.cjs');
+            const q = await cliAgent({ action: 'query_agent', id: agentId });
+            if (!q?.found) { res.writeHead(200); res.end(JSON.stringify({ ok: false, error: `Agent ${agentId} not found` })); return; }
+            const fm = (q.descriptor || '').match(/^---\s*\n([\s\S]*?)\n---/);
+            const get = (k) => fm?.[1]?.match(new RegExp(`^${k}:\\s*(.+)$`, 'm'))?.[1]?.trim();
+            const cliTool = q.cliTool || get('cli_tool');
+            if (!cliTool) { res.writeHead(200); res.end(JSON.stringify({ ok: false, error: 'Agent has no cli_tool' })); return; }
+            const install = await cliAgent({
+              action: 'install',
+              cli: cliTool,
+              service: q.service,
+              method: get('install_method') || undefined,
+              pkg: get('install_pkg') || undefined,
+            });
+            if (install.ok || install.alreadyInstalled) {
+              const v = await cliAgent({ action: 'validate_agent', id: agentId });
+              res.writeHead(200);
+              res.end(JSON.stringify({ ok: true, installed: true, binPath: install.binPath, validate: v }));
+            } else {
+              res.writeHead(200);
+              res.end(JSON.stringify({ ok: false, error: install.error || 'install failed', stdout: install.stdout }));
+            }
           } catch (err) {
             res.writeHead(500);
             res.end(JSON.stringify({ ok: false, error: err.message }));

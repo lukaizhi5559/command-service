@@ -493,6 +493,28 @@ async function start() {
   // Reload any bridge retries that were deferred before a process restart
   reloadBridgePendingRetries();
 
+  // Restore persisted reminders (one-shots re-arm if still pending; recurring re-register)
+  try {
+    const rows = loadPersistedReminders();
+    if (rows.length) {
+      const now = Date.now();
+      let restored = 0;
+      for (const r of rows) {
+        if (r.cron) {
+          registerReminder({ ...r, recur: r.recur || r.cron, delayMs: 0 });
+          restored++;
+        } else if (r.targetMs && r.targetMs > now - 10 * 60 * 1000) {
+          registerReminder({ ...r, delayMs: Math.max(0, r.targetMs - now) });
+          restored++;
+        }
+        // One-shots >10min past due are dropped silently
+      }
+      if (restored) logger.info(`[SkillScheduler] Restored ${restored} persisted reminder(s)`);
+    }
+  } catch (err) {
+    logger.warn(`[SkillScheduler] reminder restore failed: ${err.message}`);
+  }
+
   // Initial sync after a short delay to let services come up
   setTimeout(async () => {
     await syncScheduledSkills();
@@ -628,12 +650,91 @@ function listJobs() {
 //
 // Reminder shape: { id, label, triggerIntent, triggerPrompt, pendingSteps, targetMs, timeout, createdAt }
 const _reminders = new Map();
+const _reminderCrons = new Map(); // id → node-cron job (recurring reminders)
+
+const REMINDERS_FILE = path.join(os.homedir(), '.thinkdrop', 'reminders.json');
+
+function persistReminders() {
+  const fs = require('fs');
+  try {
+    const rows = Array.from(_reminders.values()).map(r => ({
+      id: r.id, label: r.label, triggerIntent: r.triggerIntent, triggerPrompt: r.triggerPrompt,
+      pendingSteps: r.pendingSteps, targetMs: r.targetMs, createdAt: r.createdAt,
+      recur: r.recur || null, cron: r.cron || null, time: r.time || null,
+    }));
+    fs.mkdirSync(path.dirname(REMINDERS_FILE), { recursive: true });
+    fs.writeFileSync(REMINDERS_FILE, JSON.stringify(rows, null, 2), 'utf8');
+  } catch (err) {
+    logger.warn(`[SkillScheduler] persistReminders failed: ${err.message}`);
+  }
+}
+
+function loadPersistedReminders() {
+  const fs = require('fs');
+  try { return JSON.parse(fs.readFileSync(REMINDERS_FILE, 'utf8')); } catch (_) { return []; }
+}
+
+function _parseTimeOfDay(timeStr) {
+  if (!timeStr || typeof timeStr !== 'string') return null;
+  const ts = timeStr.trim().toUpperCase();
+  const m12 = ts.match(/^(\d{1,2})(?::(\d{2}))?\s*(AM|PM)$/);
+  const m24 = ts.match(/^(\d{1,2}):(\d{2})$/);
+  if (m12) {
+    let h = parseInt(m12[1], 10); const m = parseInt(m12[2] || '0', 10);
+    if (m12[3] === 'PM' && h < 12) h += 12;
+    if (m12[3] === 'AM' && h === 12) h = 0;
+    return { h, m };
+  }
+  if (m24) return { h: parseInt(m24[1], 10), m: parseInt(m24[2], 10) };
+  return null;
+}
+
+/**
+ * Normalize a recurrence spec to a cron expression.
+ * Accepts: raw cron (5/6 fields), 'daily', 'hourly', 'weekdays', 'weekends',
+ * 'weekly', 'monthly', 'every morning/evening/night', 'every <dayname>',
+ * 'every N minutes/hours/days'. Optional timeStr pins daily-type recurs.
+ */
+function recurToCron(recur, timeStr) {
+  if (!recur) return null;
+  const r = String(recur).trim().toLowerCase();
+  // Raw cron expression passthrough (5 or 6 fields)
+  if (/^[\d*/,\-]+\s+[\d*/,\-]+\s+[\d*/,\-]+\s+[\d*/,\-]+\s+[\d*/,\-]+(\s+[\d*/,\-]+)?$/.test(r)) return r;
+  const tod = _parseTimeOfDay(timeStr);
+  const h = tod?.h ?? 9, m = tod?.m ?? 0;
+  const DOW = { sunday: 0, monday: 1, tuesday: 2, wednesday: 3, thursday: 4, friday: 5, saturday: 6 };
+
+  const everyN = r.match(/every\s+(\d+)\s*(min(?:ute)?s?|hr|hours?|days?|weeks?)/);
+  if (everyN) {
+    const n = Math.max(1, parseInt(everyN[1], 10));
+    const unit = everyN[2];
+    if (unit.startsWith('min')) return `*/${Math.min(n, 59)} * * * *`;
+    if (unit.startsWith('h')) return `0 */${Math.min(n, 23)} * * *`;
+    if (unit.startsWith('day')) return `${m} ${h} */${n} * *`;
+    if (unit.startsWith('week')) return `${m} ${h} * * ${new Date().getDay()}`;
+  }
+  const dayName = r.match(/every\s+(sunday|monday|tuesday|wednesday|thursday|friday|saturday)/);
+  if (dayName) return `${m} ${h} * * ${DOW[dayName[1]]}`;
+  if (/every\s+morning/.test(r)) return `${tod?.m ?? 0} ${tod?.h ?? 8} * * *`;
+  if (/every\s+evening/.test(r)) return `${tod?.m ?? 0} ${tod?.h ?? 18} * * *`;
+  if (/every\s+(night|evening)/.test(r)) return `${tod?.m ?? 0} ${tod?.h ?? 20} * * *`;
+  if (/weekdays?|every\s+(work\s*)?day/.test(r) || r === 'business days') return `${m} ${h} * * 1-5`;
+  if (/weekends?/.test(r)) return `${m} ${h} * * 0,6`;
+  if (/hourly|every\s+hour/.test(r)) return `${m} * * * *`;
+  if (/weekly|every\s+week/.test(r)) return `${m} ${h} * * ${new Date().getDay()}`;
+  if (/monthly|every\s+month/.test(r)) return `${m} ${h} 1 * *`;
+  if (/daily|every\s+day|each\s+day/.test(r)) return `${m} ${h} * * *`;
+  return null;
+}
 
 const OVERLAY_PORT = parseInt(process.env.OVERLAY_PORT || '3010', 10);
 
-function fireReminder(reminder) {
-  logger.info(`[SkillScheduler] 🔔 Reminder fired: "${reminder.label}" (intent=${reminder.triggerIntent})`);
-  _reminders.delete(reminder.id);
+function fireReminder(reminder, recurring = false) {
+  logger.info(`[SkillScheduler] 🔔 Reminder fired: "${reminder.label}" (intent=${reminder.triggerIntent}${recurring ? ', recurring' : ''})`);
+  if (!recurring) {
+    _reminders.delete(reminder.id);
+    persistReminders();
+  }
 
   // POST to Electron overlay — main.js listens on /reminder/fire
   const firePayload = {
@@ -674,13 +775,16 @@ function fireReminder(reminder) {
  * @param {string|null} opts.pendingSteps — JSON-serialized array of plan steps to execute when reminder fires
  * @returns {{ id, targetMs }}
  */
-function registerReminder({ id, delayMs, label, triggerIntent = 'notify', triggerPrompt = '', pendingSteps = null }) {
+function registerReminder({ id, delayMs = 0, label, triggerIntent = 'notify', triggerPrompt = '', pendingSteps = null, recur = null, cron: cronArg = null, time = null }) {
   // Cancel existing reminder with same ID if any
   if (_reminders.has(id)) {
     clearTimeout(_reminders.get(id).timeout);
+    try { _reminderCrons.get(id)?.stop(); } catch (_) {}
+    _reminderCrons.delete(id);
     _reminders.delete(id);
   }
 
+  const cronExpr = recurToCron(cronArg || recur, time);
   const targetMs = Date.now() + delayMs;
   const reminder = {
     id,
@@ -691,10 +795,35 @@ function registerReminder({ id, delayMs, label, triggerIntent = 'notify', trigge
     targetMs,
     createdAt: Date.now(),
     timeout: null,
+    recur: recur || null,
+    cron: cronExpr,
+    time: time || null,
   };
+
+  if (cronExpr) {
+    let cron;
+    try { cron = require('node-cron'); } catch (_) {}
+    if (!cron || !cron.validate(cronExpr)) {
+      return { id, error: `Invalid recurrence "${recur || cronArg}" — could not derive a cron expression` };
+    }
+    const job = cron.schedule(cronExpr, () => fireReminder(reminder, true), {
+      scheduled: true,
+      timezone: process.env.TZ || Intl.DateTimeFormat().resolvedOptions().timeZone || 'America/New_York',
+    });
+    _reminderCrons.set(id, job);
+    _reminders.set(id, reminder);
+    persistReminders();
+    logger.info(`[SkillScheduler] Recurring reminder registered: "${label}" @ "${cronExpr}" (intent=${triggerIntent})`);
+    return { id, cron: cronExpr, recurring: true };
+  }
+
+  if (!delayMs || delayMs <= 0) {
+    return { id, error: 'No delay or recurrence given — nothing scheduled' };
+  }
 
   reminder.timeout = setTimeout(() => fireReminder(reminder), delayMs);
   _reminders.set(id, reminder);
+  persistReminders();
 
   const targetTime = new Date(targetMs).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
   logger.info(`[SkillScheduler] Reminder registered: "${label}" fires at ${targetTime} (${Math.round(delayMs / 1000)}s, intent=${triggerIntent})`);
@@ -707,8 +836,11 @@ function registerReminder({ id, delayMs, label, triggerIntent = 'notify', trigge
 function cancelReminder(id) {
   const entry = _reminders.get(id);
   if (entry) {
-    clearTimeout(entry.timeout);
+    if (entry.timeout) clearTimeout(entry.timeout);
+    try { _reminderCrons.get(id)?.stop(); } catch (_) {}
+    _reminderCrons.delete(id);
     _reminders.delete(id);
+    persistReminders();
     logger.info(`[SkillScheduler] Reminder cancelled: ${id}`);
     return true;
   }
@@ -726,6 +858,9 @@ function listReminders() {
     triggerPrompt: r.triggerPrompt,
     targetMs: r.targetMs,
     remainingMs: Math.max(0, r.targetMs - Date.now()),
+    recur: r.recur || null,
+    cron: r.cron || null,
+    recurring: !!r.cron,
     createdAt: r.createdAt,
     type: 'reminder',
   }));

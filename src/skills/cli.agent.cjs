@@ -450,13 +450,13 @@ async function actionDiscover({ cli }) {
 // Action: install
 // ---------------------------------------------------------------------------
 
-async function actionInstall({ cli, service, method }) {
+async function actionInstall({ cli, service, method, pkg: pkgOverride }) {
   if (!cli && !service) return { ok: false, error: 'cli or service is required' };
 
   const meta      = service ? lookupService(service) : null;
   const cliName   = cli || meta?.cli;
   const instMethod = method || meta?.method || 'brew';
-  const pkg        = meta?.pkg || cliName;
+  const pkg        = pkgOverride || meta?.pkg || cliName;
   const installUrl = meta?.installUrl || null;
 
   if (!cliName) return { ok: false, error: 'Cannot determine CLI name' };
@@ -2301,7 +2301,8 @@ async function _buildApiKeyAgentDescriptor({ service, serviceKey, agentId, meta,
   return { ok: true, agentId, alreadyExists: false, isApiKey: true, service: serviceKey, apiKeyEnvVar, apiKeyUrl, descriptor, mdPath };
 }
 
-async function actionBuildAgent({ service, cli: explicitCli, force = false }) {
+async function actionBuildAgent({ service, cli, cliTool, force = false }) {
+  const explicitCli = cli || cliTool;
   if (!service) return { ok: false, error: 'service is required' };
 
   const serviceKey = service.toLowerCase().replace(/[^a-z0-9]/g, '');
