@@ -85,6 +85,42 @@ const ABSOLUTE_MIN_CHARS = 80;
 // Bot-wall signatures in copied page text.
 const BOT_WALL_RE = /\b(verify you are human|verify you'?re human|are you a robot|unusual traffic|cf-chl|cloudflare.{0,30}(?:verify|challenge|ray id)|captcha|please complete the security check|access to this page has been denied|pardon our interruption|press & hold|bot detection|ddos protection by)\b/i;
 
+// Error-page signatures — 404/soft-404 pages, empty-result pages. Error pages
+// usually announce early (title/heading), but soft-404s wrapped in site chrome
+// bury the marker — so a marker anywhere counts when the page is thin.
+const ERROR_PAGE_RE = /\b(404\b.{0,20}(?:not found|error)|page (?:not|couldn'?t be) found|no results found|result(?:s)? not found|this page (?:doesn'?t|does not|could not be) (?:exist|found)|the page you (?:requested|are looking for)|we can'?t find (?:that|this|the) page|oops.{0,20}(?:not found|went wrong)|error 404)\b/i;
+const ERROR_PAGE_LEAD_CHARS = 800;   // marker near the top = error page regardless of size
+const ERROR_PAGE_MAX_CHARS = 4000;   // buried marker only counts on thin pages
+
+// Login-wall signatures — page demands a session before showing content. The
+// HTTP fetch tier carries no cookies, so these must escalate to the real
+// browser tier which shares the user's logged-in session.
+const LOGIN_WALL_RE = /\b(sign in to continue|log in to (?:continue|view|read|see)|you must (?:be )?log(?:ged)? ?in|please (?:sign|log) ?in to|create an account to|sign in to (?:read|view|see)|members? only|subscribe to (?:read|view|continue)|this content is (?:only )?(?:available|for) (?:to )?(?:subscribers|members))\b/i;
+const LOGIN_WALL_LEAD_CHARS = 2000;  // login gates usually lead; "subscribe to read" deeper in text is still a wall for full content
+
+/**
+ * Copied/fetched text looks like an error page (404, not-found, empty results).
+ * Marker in the lead OR thin page with a buried marker.
+ */
+function isErrorPage(text) {
+  const s = String(text || '');
+  if (!s) return false;
+  const m = ERROR_PAGE_RE.exec(s);
+  if (!m) return false;
+  return m.index < ERROR_PAGE_LEAD_CHARS || s.length < ERROR_PAGE_MAX_CHARS;
+}
+
+/**
+ * Copied/fetched text is gated behind a login/subscription wall. Matched only
+ * in the lead — a real article mentioning "log in" deep in the body is content.
+ */
+function isLoginWall(text) {
+  const s = String(text || '');
+  if (!s) return false;
+  const m = LOGIN_WALL_RE.exec(s);
+  return !!m && m.index < LOGIN_WALL_LEAD_CHARS;
+}
+
 /**
  * Hostname → page category. Exact match first, then suffix match
  * (smile.amazon.com → amazon.com).
@@ -235,6 +271,8 @@ module.exports = {
   categorizeUrl,
   estimateForUrl,
   isBotWall,
+  isErrorPage,
+  isLoginWall,
   COPIES_DIR,
   COPIES_INDEX,
   DEFAULT_TTL_MS,

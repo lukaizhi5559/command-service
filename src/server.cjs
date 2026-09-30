@@ -397,6 +397,7 @@ class CommandServiceMCPServer {
       navigate_url:                  appAgent.actionNavigateUrl,
       scan_page:                     appAgent.actionScanPage,
       print_page:                    appAgent.actionPrintPage,
+      read_url:                      appAgent.actionReadUrl,
       // Phase 5: Agent factory
       build_agent:                   appAgent.actionBuildAgent,
       check_installed:               appAgent.actionCheckInstalled,

@@ -70,12 +70,25 @@ async function searchWeb(query, maxResults = 5, options = {}) {
 
   const timeoutMs = options.timeoutMs || 8000;
   const maxAttempts = options.retries ? 2 : 1;
+  // Page-resolution always wants the web endpoint — the service's intent
+  // classifier routes "show me X"-style queries to brave-video/brave-image,
+  // which return YouTube/images only. ('goto biblehub and show me genesis 1'
+  // once returned 5/5 YouTube; pinned brave-web returns biblehub.com #1.)
+  const provider = options.provider || 'brave-web';
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    const result = await _searchWebOnce(query, maxResults, timeoutMs, wsHostname, wsPort);
-    if (result.ok || attempt === maxAttempts) return result;
-    // Only retry on timeout, not on parse errors or request errors
-    if (result.error !== 'web search timed out') return result;
+    const result = await _searchWebOnce(query, maxResults, timeoutMs, wsHostname, wsPort, provider);
+    if (result.ok && result.results?.length > 0) return result;
+    const retriableTimeout = result.error === 'web search timed out' && attempt < maxAttempts;
+    if (!retriableTimeout) {
+      // Pinned provider empty/failed — one 'auto' pass re-enters the
+      // service's Brave→DDG→fallback chain so an outage isn't fatal.
+      if (provider !== 'auto') {
+        logger.warn(`[web.agent] searchWeb: ${provider} ${result.ok ? 'returned empty' : `failed (${result.error})`} — one auto-mode retry for provider fallback`);
+        return await _searchWebOnce(query, maxResults, timeoutMs, wsHostname, wsPort, 'auto');
+      }
+      return result;
+    }
     logger.warn(`[web.agent] searchWeb timed out — retrying (attempt ${attempt + 1}/${maxAttempts}) for "${query.slice(0, 60)}"`);
   }
 }
@@ -84,14 +97,14 @@ async function searchWeb(query, maxResults = 5, options = {}) {
  * Single attempt of searchWeb — extracted so searchWeb can wrap it with retry logic.
  * Returns { ok, results } or { ok: false, error }.
  */
-function _searchWebOnce(query, maxResults, timeoutMs, wsHostname, wsPort) {
+function _searchWebOnce(query, maxResults, timeoutMs, wsHostname, wsPort, provider) {
   return new Promise((resolve) => {
     const body = JSON.stringify({
       version: 'mcp.v1',
       service: 'web-search',
       requestId: `ws_${Date.now()}`,
       action: 'search',
-      payload: { query, maxResults },
+      payload: { query, maxResults, provider },
     });
     const req = http.request({
       hostname: wsHostname,

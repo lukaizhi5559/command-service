@@ -6380,7 +6380,7 @@ async function actionNavigateUrl({ url, appName, via = 'auto', newTab } = {}) {
  * copy the page body. Caller must already be inside _withOverlayHidden with
  * the browser focused.
  */
-async function _copyPageOnce(appName, captureHtml) {
+async function _copyPageOnce(appName, captureHtml, deselect = true) {
   const { execSync } = require('child_process');
   const press = (s, ms) => actionExecuteShortcut({ appName, shortcutOverride: s, skipFocusCheck: true }).then(() => _sleep(ms));
 
@@ -6395,10 +6395,15 @@ async function _copyPageOnce(appName, captureHtml) {
   const content = execSync('pbpaste', { encoding: 'utf8', timeout: 5000 });
   const html = captureHtml ? _readClipboardHtml() : null;
 
-  // Clear the selection: Cmd+F, Space, Esc (open+close find resets selection).
-  await press('Cmd+F', 150);
-  await press('Space', 150);
-  await press('Escape', 150);
+  // Clear the selection: Cmd+F, Space, BackSpace, Esc (open+close find resets
+  // selection). Skipped by callers that close the tab right after (read_url
+  // cleanup:'close') — the selection dies with the tab anyway.
+  if (deselect) {
+    await press('Cmd+F', 150);
+    await press('Space', 150);
+    await press('BackSpace', 150);
+    await press('Escape', 150);
+  }
 
   return { pageUrl, content, html };
 }
@@ -6430,7 +6435,7 @@ async function _getLiveBrowserUrl(appName) {
   } catch (_) { return null; }
 }
 
-async function actionScanPage({ appName, url, category, maxWaitMs = 10000, useCache = true, captureHtml = false, ttlMs } = {}) {
+async function actionScanPage({ appName, url, category, maxWaitMs = 10000, useCache = true, captureHtml = false, ttlMs, deselect = true } = {}) {
   // 1. Focus first — we need the resolved browser app to read the LIVE tab URL
   //    for cache matching. The old order served "latest fresh copy" for
   //    url=null — observed: a Google task was synthesized from a 2-min-old
@@ -6471,7 +6476,7 @@ async function actionScanPage({ appName, url, category, maxWaitMs = 10000, useCa
   try {
     while (true) {
       await _withOverlayHidden(async () => {
-        last = await _copyPageOnce(resolvedApp, captureHtml);
+        last = await _copyPageOnce(resolvedApp, captureHtml, deselect);
       });
       // Re-estimate against the URL actually grabbed from the address bar —
       // redirects can land on a different category than the requested URL.
@@ -6516,6 +6521,145 @@ async function actionScanPage({ appName, url, category, maxWaitMs = 10000, useCa
     thin: thin || undefined,
     cached: false,
   };
+}
+
+/**
+ * Close the tab we just opened — but only when the frontmost tab is verifiably
+ * ours. `via === 'type'` means navigate_url fell back to typing into the user's
+ * existing tab (never close it). A live-URL or copied-page-URL match on the
+ * requested/final URL proves the frontmost tab is the one we opened; with no
+ * readable URL (Firefox AppleScript gap) we leave the tab rather than risk
+ * closing the user's page.
+ */
+async function _closeTabIfOurs({ url, pageUrl, appName }) {
+  try {
+    const focusResult = await verifyAppFocused({ appName: appName || 'browser', waitMs: 1500 });
+    if (!focusResult.focused) return { closed: false, note: 'browser-not-focused' };
+    const resolvedApp = focusResult.appName || appName;
+
+    const liveUrl = await _getLiveBrowserUrl(resolvedApp);
+    const targets = [url, pageUrl].filter(Boolean).map(u => _pageCopyEst.normalizeUrl(u));
+    const liveNorm = liveUrl ? _pageCopyEst.normalizeUrl(liveUrl) : null;
+    // pageUrl was grabbed from THIS tab's address bar during the copy — a match
+    // proves our tab is the one that was read; still frontmost ~ms later.
+    const matched = (liveNorm && targets.includes(liveNorm))
+      || (!liveNorm && pageUrl && targets.includes(_pageCopyEst.normalizeUrl(pageUrl)));
+    if (!matched) {
+      return { closed: false, note: liveNorm ? 'front-tab-mismatch' : 'url-unverifiable' };
+    }
+    const r = await actionExecuteShortcut({ appName: resolvedApp, shortcutOverride: 'Cmd+W', skipFocusCheck: true });
+    return { closed: !!r?.ok, note: r?.ok ? undefined : (r?.error || 'cmd+w-failed') };
+  } catch (e) {
+    return { closed: false, note: e?.message || 'close-error' };
+  }
+}
+
+/**
+ * actionReadUrl — tiered "read a URL" composite.
+ *
+ *   Tier 0  http    — plain fetch + HTML→text (invisible, ~1s)
+ *   Tier 1  browser — navigate_url(new tab) → scan_page copy (real session)
+ *   Tier 2  crawl   — web.crawl playwright fallback (invisible, no session)
+ *
+ * Every tier runs the same validators (minChars / isBotWall / isErrorPage /
+ * isLoginWall) so a soft-block page can't false-accept into synthesis.
+ *
+ *   cleanup:'close'    — temp-tab scrape: close our tab after copy (default for
+ *                        answer-only lookups). Never closes a user's tab.
+ *   cleanup:'deselect' — keep the page open, clear the selection highlight
+ *                        (default — the safe mode).
+ *
+ * Returns {ok, content, url, chars, via, reason?, closed?} — `via` records
+ * which tier produced the content ('cache'|'http'|'browser_copy'|'crawl').
+ */
+async function actionReadUrl({ url, cleanup = 'deselect', appName, minChars, maxWaitMs = 12000,
+                               httpFirst = true, crawlFallback = true, fallbackUrls,
+                               useCache = true, ttlMs, captureHtml = false } = {}) {
+  if (!url || !/^https?:\/\//i.test(String(url).trim())) {
+    return { ok: false, error: 'read_url requires a valid http(s) url', reason: 'invalid-url' };
+  }
+  url = String(url).trim();
+
+  // 0. Copy cache — fresh copy skips fetch AND tab churn entirely.
+  if (useCache) {
+    const hit = _pageCopyEst.findFreshCopy(url, ttlMs || _pageCopyEst.DEFAULT_TTL_MS);
+    if (hit) {
+      const content = _pageCopyEst.readCopy(hit.file);
+      if (content && content.length >= _pageCopyEst.ABSOLUTE_MIN_CHARS) {
+        logger.info(`[app.agent] read_url: cache hit for ${hit.url} — ${hit.chars} chars`);
+        return { ok: true, content, savedTo: hit.file, url: hit.url, chars: content.length, via: 'cache', cached: true };
+      }
+    }
+  }
+
+  // 1. HTTP tier — invisible, ~1s. Any failure escalates to the real browser
+  //    (login_wall especially: the browser carries the user's session).
+  if (httpFirst) {
+    const { fetchPageText } = require('../skill-helpers/http-fetch.cjs');
+    const r = await fetchPageText(url, { minChars }).catch(e => ({ ok: false, reason: 'network', error: e?.message }));
+    if (r.ok) {
+      const saved = _pageCopyEst.saveCopy({ url: r.url, content: r.content, appName: 'http', html: null });
+      logger.info(`[app.agent] read_url: http tier OK — ${r.chars} chars from ${r.url}`);
+      return { ok: true, content: r.content, title: r.title, url: r.url, chars: r.chars, via: 'http', savedTo: saved?.file || null };
+    }
+    logger.info(`[app.agent] read_url: http tier failed (${r.reason || 'unknown'}) — escalating to real browser`);
+  }
+
+  // 2. Browser tier — open a NEW tab in the user's real browser and copy it.
+  let scan = { ok: false, error: 'navigate_failed' };
+  let navUsedUserTab = false;
+  const nav = await actionNavigateUrl({ url, appName, via: 'open' });
+  if (nav.ok) {
+    navUsedUserTab = nav.via === 'type'; // cross-fallback navigated the user's current tab
+    scan = await actionScanPage({
+      appName, url, useCache: false, maxWaitMs, captureHtml,
+      deselect: cleanup !== 'close',   // closing discards the selection anyway
+    });
+  }
+
+  let closed = false;
+  let closeNote = null;
+  if (cleanup === 'close' && nav.ok && !navUsedUserTab) {
+    const c = await _closeTabIfOurs({ url, pageUrl: scan.url || null, appName });
+    closed = c.closed; closeNote = c.note;
+  }
+
+  if (scan.ok) {
+    const probe = String(scan.content || '');
+    if (_pageCopyEst.isLoginWall(probe)) {
+      // The real browser session is logged out — a cookie-less crawl can't do
+      // better, so fail honestly instead of paying ~10s for the same wall.
+      logger.warn(`[app.agent] read_url: login wall in browser copy — ${scan.url || url}`);
+      return { ok: false, reason: 'login_wall', url: scan.url || url, chars: probe.length, closed };
+    }
+    if (!_pageCopyEst.isErrorPage(probe)) {
+      logger.info(`[app.agent] read_url: browser tier OK — ${probe.length} chars from ${scan.url || url}${closed ? ' (tab closed)' : ''}`);
+      return {
+        ok: true, content: scan.content, url: scan.url || url, chars: probe.length,
+        via: 'browser_copy', savedTo: scan.savedTo || null, closed,
+        thin: scan.thin || undefined, cached: false,
+      };
+    }
+    logger.warn(`[app.agent] read_url: error page in browser copy — falling back to web.crawl`);
+  } else {
+    logger.warn(`[app.agent] read_url: browser tier failed (${scan.error || 'unknown'}) — falling back to web.crawl`);
+  }
+
+  // 3. Crawl tier — playwright, invisible, retries fallbackUrls internally.
+  if (crawlFallback) {
+    try {
+      const { webCrawl } = require('./web.crawl.cjs');
+      const r = await webCrawl({ url: scan.url || url, fallbackUrls, maxChars: 14000 });
+      if (r?.ok && r.content) {
+        logger.info(`[app.agent] read_url: crawl tier OK — ${(r.content || '').length} chars from ${r.url || url}`);
+        return { ok: true, content: r.content, url: r.url || url, chars: r.content.length, via: 'crawl', closed };
+      }
+      return { ok: false, reason: r?.error || 'crawl_failed', url, closed };
+    } catch (e) {
+      return { ok: false, reason: 'crawl_error', error: e?.message, url, closed };
+    }
+  }
+  return { ok: false, reason: scan.error || 'browser_copy_failed', url, closed };
 }
 
 /**
@@ -7293,6 +7437,7 @@ module.exports = {
   actionNavigateUrl,
   actionScanPage,
   actionPrintPage,
+  actionReadUrl,
 
   // Phase 5: Structured OCR helpers (used by app.runner.cjs monitoring)
   _filterItemsByAppBounds,
