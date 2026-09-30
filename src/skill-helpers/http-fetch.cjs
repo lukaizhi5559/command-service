@@ -99,6 +99,18 @@ async function fetchPageText(url, { timeoutMs = DEFAULT_TIMEOUT_MS, minChars } =
   try {
     const status = res.status || 0;
     const finalUrl = res.url || raw;
+    // Auth bounce: a redirect (finalUrl !== raw) that lands on a sign-in/auth
+    // path or auth-shaped host means the content lives behind a session the
+    // HTTP tier doesn't carry. Same-host bounces count too (facebook.com →
+    // /login?next=…) — the cross-host check misses those. A direct request
+    // for a login URL isn't a bounce; the password-input check below catches it.
+    const _fin = (() => { try { return new URL(finalUrl); } catch (_) { return null; } })();
+    const _redirected = finalUrl !== raw;
+    if (_fin && _redirected
+        && (/^(accounts?|login|signin|auth|sso|id|myaccount|secure)\./i.test(_fin.hostname)
+            || /\/(signin|sign-in|login|auth|sso|oauth|identifier|session|saml)/i.test(_fin.pathname))) {
+      return { ok: false, reason: 'login_wall', status, url: finalUrl };
+    }
     const ct = String(res.headers.get('content-type') || '');
     if (status === 404 || status === 410) return { ok: false, reason: 'error_page', status, url: finalUrl };
     if (status === 401 || status === 403) return { ok: false, reason: status === 401 ? 'login_wall' : 'http-error:403', status, url: finalUrl };
@@ -127,6 +139,14 @@ async function fetchPageText(url, { timeoutMs = DEFAULT_TIMEOUT_MS, minChars } =
     // youtube.com watch page demands ~1200 chars, not the 80-char floor —
     // footer chrome once false-accepted a YouTube page as "content").
     const floor = Math.max(minChars ?? _est.estimateForUrl(finalUrl || url).minChars, _est.ABSOLUTE_MIN_CHARS);
+
+    // Structural login check — language/phrase independent. A thin page that
+    // still ships a password field IS a login/signup form regardless of what
+    // its stripped text says. Runs before the text markers so they become the
+    // last resort instead of the only gate.
+    if (chars < 2500 && /<input[^>]+type=["']?password/i.test(html)) {
+      return { ok: false, reason: 'login_wall', status, url: finalUrl, chars };
+    }
 
     if (_est.isBotWall(title + '\n' + content)) return { ok: false, reason: 'bot_wall', status, url: finalUrl, chars };
     if (_est.isLoginWall(title + '\n' + content)) return { ok: false, reason: 'login_wall', status, url: finalUrl, chars };

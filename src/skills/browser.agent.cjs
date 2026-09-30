@@ -7413,13 +7413,22 @@ async function _buildGenericSearchUrl(serviceKey, baseHost, task) {
   }
 }
 
-async function _resolveTaskDeepLink(agentId, serviceKey, baseStartUrl, task, existingDeepLinkUrl, sessionId, _dlOpts) {
-  // _dlOpts: { headed, hidden, taskClassification } — propagated to all browser.act calls so
-  // preflight deep-link resolution is headless/hidden (no visible Chrome window).
-  const _dlHeaded = _dlOpts?.headed !== undefined ? _dlOpts.headed : false;
-  const _dlHidden = _dlOpts?.hidden !== undefined ? _dlOpts.hidden : true;
-  const _dlTaskCls = _dlOpts?.taskClassification || null;
+/**
+ * Browser-independent deep-link resolution — the cheap tiers of
+ * _resolveTaskDeepLink: preflight URL passthrough, appKnowledge intent_url,
+ * search-criteria templates, search-pattern cache, generic site-search
+ * templates, CHAT/RESEARCH templates, keyword cache, intent templates, and
+ * (optionally) web.agent + LLM suggestion. No browser process required.
+ *
+ * Returns { url, source, intent, isCriteriaTask, baseHost, taskKeywords,
+ *           needsPromote } — needsPromote=true means the caller must still run
+ * the promote/verify gates (_canPromoteDeepLink, off-domain verify).
+ * On no-hit returns { url: null, intent, isCriteriaTask, baseHost, taskKeywords }
+ * so callers can reuse the computed intent/host. Returns null only on error.
+ */
+async function _resolveCheapDeepLink(agentId, serviceKey, baseStartUrl, task, existingDeepLinkUrl, _dlOpts) {
   try {
+    const _dlTaskCls = _dlOpts?.taskClassification || null;
     // If a deep-link was already resolved (e.g., by preflight), skip resolution.
     if (existingDeepLinkUrl) {
       const _existingHost = (() => {
@@ -7432,7 +7441,7 @@ async function _resolveTaskDeepLink(agentId, serviceKey, baseStartUrl, task, exi
       })();
       if (_existingHost && (_existingHost === _baseHost || _existingHost.endsWith('.' + _baseHost) || _baseHost.endsWith('.' + _existingHost))) {
         logger.info(`[browser.agent] deep-link: using pre-resolved deepLinkUrl for ${agentId}: ${existingDeepLinkUrl}`);
-        return { url: existingDeepLinkUrl, source: 'preflight' };
+        return { url: existingDeepLinkUrl, source: 'preflight', intent: null, needsPromote: false };
       }
     }
 
@@ -7473,7 +7482,7 @@ async function _resolveTaskDeepLink(agentId, serviceKey, baseStartUrl, task, exi
         const _akUrl = loadIntentUrl(baseHost, intent);
         if (_akUrl?.url && _isValidDeepLinkUrl(_akUrl.url)) {
           logger.info(`[browser.agent] deep-link: appKnowledge intent_url hit for ${baseHost}/${intent}: ${_akUrl.url} (confidence=${_akUrl.confidence}, verifiedRuns=${_akUrl.verifiedRuns})`);
-          return { url: _akUrl.url, source: 'appKnowledge', intent };
+          return { url: _akUrl.url, source: 'appKnowledge', intent, isCriteriaTask: _isCriteriaTask, baseHost, taskKeywords: _taskKeywords, needsPromote: false };
         }
       } catch (_) { /* non-fatal */ }
     }
@@ -7486,7 +7495,7 @@ async function _resolveTaskDeepLink(agentId, serviceKey, baseStartUrl, task, exi
     const _criteriaUrl = await _buildSearchCriteriaUrl(intent, serviceKey, baseStartUrl, baseHost, task, _dlTaskCls);
     if (_criteriaUrl) {
       logger.info(`[browser.agent] deep-link: search-criteria template for ${agentId}: ${_criteriaUrl}`);
-      return { url: _criteriaUrl, source: 'template' };
+      return { url: _criteriaUrl, source: 'template', intent, isCriteriaTask: _isCriteriaTask, baseHost, taskKeywords: _taskKeywords, needsPromote: false };
     }
 
     // Step 0.5: Search URL pattern cache — for criteria tasks on sites without a hardcoded
@@ -7497,7 +7506,7 @@ async function _resolveTaskDeepLink(agentId, serviceKey, baseStartUrl, task, exi
       const _patternUrl = await _buildSearchUrlFromPattern(serviceKey, task, baseHost, _dlTaskCls);
       if (_patternUrl) {
         logger.info(`[browser.agent] deep-link: search-pattern cache hit for ${agentId}: ${_patternUrl}`);
-        return { url: _patternUrl, source: 'search-pattern' };
+        return { url: _patternUrl, source: 'search-pattern', intent, isCriteriaTask: _isCriteriaTask, baseHost, taskKeywords: _taskKeywords, needsPromote: false };
       }
     }
 
@@ -7510,7 +7519,7 @@ async function _resolveTaskDeepLink(agentId, serviceKey, baseStartUrl, task, exi
     const _genericSearchUrl = await _buildGenericSearchUrl(serviceKey, baseHost, task);
     if (_genericSearchUrl) {
       logger.info(`[browser.agent] deep-link: site-search template for ${agentId}: ${_genericSearchUrl}`);
-      return { url: _genericSearchUrl, source: 'site-search' };
+      return { url: _genericSearchUrl, source: 'site-search', intent, isCriteriaTask: _isCriteriaTask, baseHost, taskKeywords: _taskKeywords, needsPromote: false };
     }
 
     // Step 0.7: CHAT/RESEARCH intent template — for chatbot services, go directly to
@@ -7525,12 +7534,12 @@ async function _resolveTaskDeepLink(agentId, serviceKey, baseStartUrl, task, exi
       const _chatUrl = SERVICE_CHAT_URLS[_svc];
       if (_chatUrl) {
         logger.info(`[browser.agent] deep-link: CHAT/RESEARCH template (pre-cache) for ${agentId}: ${_chatUrl}`);
-        return { url: _chatUrl, source: 'template' };
+        return { url: _chatUrl, source: 'template', intent, isCriteriaTask: _isCriteriaTask, baseHost, taskKeywords: _taskKeywords, needsPromote: false };
       }
       // Fallback: if the service startUrl IS a chat URL, use it directly
       if (/chat\.|claude\.ai|chatgpt\.com|gemini\.google|grok\.com/i.test(baseStartUrl)) {
         logger.info(`[browser.agent] deep-link: CHAT/RESEARCH startUrl fallback (pre-cache) for ${agentId}: ${baseStartUrl}`);
-        return { url: baseStartUrl, source: 'template' };
+        return { url: baseStartUrl, source: 'template', intent, isCriteriaTask: _isCriteriaTask, baseHost, taskKeywords: _taskKeywords, needsPromote: false };
       }
     }
 
@@ -7551,7 +7560,7 @@ async function _resolveTaskDeepLink(agentId, serviceKey, baseStartUrl, task, exi
           logger.warn(`[browser.agent] deep-link: skipping cached Messenger URL for post/share task: ${_cachedDeepLink.url} — falling through to discovery`);
         } else {
           logger.info(`[browser.agent] deep-link: keyword cache hit for ${agentId}: ${_cachedDeepLink.url} (score=${_cachedDeepLink.score.toFixed(2)})`);
-          return { url: _cachedDeepLink.url, source: 'keyword-cache' };
+          return { url: _cachedDeepLink.url, source: 'keyword-cache', intent, isCriteriaTask: _isCriteriaTask, baseHost, taskKeywords: _taskKeywords, needsPromote: false };
         }
       }
     }
@@ -7692,17 +7701,68 @@ async function _resolveTaskDeepLink(agentId, serviceKey, baseStartUrl, task, exi
     };
 
     // 1. Prefer service intent templates for deterministic URL-first starts.
-    let candidate = await _buildIntentTemplateUrl();
-    let candidateSource = candidate ? 'template' : null;
-    if (candidate) {
-      if (!_isValidDeepLinkUrl(candidate)) {
-        logger.warn(`[browser.agent] deep-link: rejecting invalid template URL for ${agentId}: ${candidate} — falling through to discovery`);
-        candidate = null;
-        candidateSource = null;
+    // Template candidates still go through the caller's promote/verify tail —
+    // mark them needsPromote so the promotion gates aren't skipped.
+    const _tmplCandidate = await _buildIntentTemplateUrl();
+    if (_tmplCandidate) {
+      if (!_isValidDeepLinkUrl(_tmplCandidate)) {
+        logger.warn(`[browser.agent] deep-link: rejecting invalid template URL for ${agentId}: ${_tmplCandidate} — falling through to discovery`);
       } else {
-        logger.info(`[browser.agent] deep-link: using intent template for ${agentId}: ${candidate}`);
+        logger.info(`[browser.agent] deep-link: using intent template for ${agentId}: ${_tmplCandidate}`);
+        return { url: _tmplCandidate, source: 'template', intent, isCriteriaTask: _isCriteriaTask, baseHost, taskKeywords: _taskKeywords, needsPromote: true };
       }
     }
+
+    // Optional network-discovery tiers — no browser process involved
+    // (web.agent = Brave HTTP search, suggestTaskUrl = LLM guess). Enabled by
+    // default for browser-free callers (app.agent nav_task); _resolveTaskDeepLink
+    // passes false and runs its own eval→web.agent→crawl→suggest order instead.
+    if (_dlOpts?.networkDiscovery !== false) {
+      try {
+        const webResult = await callSkill('web.agent', {
+          action: 'discover_task_url',
+          domain: baseHost,
+          task,
+        }, 15000);
+        if (webResult?.ok && webResult?.taskUrl) {
+          return { url: webResult.taskUrl, source: 'search', intent, isCriteriaTask: _isCriteriaTask, baseHost, taskKeywords: _taskKeywords, needsPromote: true };
+        }
+      } catch (webErr) {
+        logger.debug(`[browser.agent] cheap deep-link: web.agent failed: ${webErr.message}`);
+      }
+      try {
+        const suggestion = await suggestTaskUrl(serviceKey, baseStartUrl, intent, task);
+        if (suggestion?.ok && suggestion?.url) {
+          return { url: suggestion.url, source: 'suggestion', intent, isCriteriaTask: _isCriteriaTask, baseHost, taskKeywords: _taskKeywords, needsPromote: true };
+        }
+      } catch (_) { /* non-fatal */ }
+    }
+
+    return { url: null, source: null, intent, isCriteriaTask: _isCriteriaTask, baseHost, taskKeywords: _taskKeywords };
+  } catch (err) {
+    logger.warn(`[browser.agent] cheap deep-link error: ${err.message}`);
+    return null;
+  }
+}
+
+async function _resolveTaskDeepLink(agentId, serviceKey, baseStartUrl, task, existingDeepLinkUrl, sessionId, _dlOpts) {
+  // _dlOpts: { headed, hidden, taskClassification } — propagated to all browser.act calls so
+  // preflight deep-link resolution is headless/hidden (no visible Chrome window).
+  const _dlHeaded = _dlOpts?.headed !== undefined ? _dlOpts.headed : false;
+  const _dlHidden = _dlOpts?.hidden !== undefined ? _dlOpts.hidden : true;
+  const _dlTaskCls = _dlOpts?.taskClassification || null;
+  try {
+    const _cheap = await _resolveCheapDeepLink(agentId, serviceKey, baseStartUrl, task, existingDeepLinkUrl, { taskClassification: _dlTaskCls, networkDiscovery: false });
+    if (!_cheap) return null;
+    const intent = _cheap.intent;
+    const _isCriteriaTask = _cheap.isCriteriaTask;
+    const baseHost = _cheap.baseHost;
+    const _taskKeywords = _cheap.taskKeywords || [];
+    if (_cheap.url && !_cheap.needsPromote) {
+      return { url: _cheap.url, source: _cheap.source, intent };
+    }
+    let candidate = _cheap.url || null;
+    let candidateSource = _cheap.url ? (_cheap.source || null) : null;
 
     // 1.5. Authenticated eval — extract <a href> links from the live browser session.
     // This discovers action URLs only visible to logged-in users (e.g., app menus, dashboards).
@@ -14714,7 +14774,43 @@ module.exports._extractSearchPlan = _extractSearchPlan;
 module.exports._extractEditMode = _extractEditMode;
 module.exports._extractSearchText = _extractSearchText;
 module.exports._extractShortcut = _extractShortcut;
+/**
+ * Resolve a service name to its agent identity + start URL — no browser needed.
+ * Sources: KNOWN_BROWSER_SERVICES.startUrl → registered agent descriptor
+ * start_url (~/.thinkdrop/agents/<svc>.agent.md / agents db). Used by the
+ * browser-free lane (app.agent nav_task) to seed deep-link resolution.
+ */
+async function resolveServiceTarget(service) {
+  const serviceKey = String(service || '').toLowerCase().replace(/\.agent$/, '').replace(/\s+/g, '_').replace(/[^a-z0-9_]/g, '');
+  if (!serviceKey) return null;
+  const agentId = `${serviceKey}.agent`;
+  // 1. Known-services seed map
+  const entry = lookupBrowserService(serviceKey);
+  if (entry?.startUrl) return { serviceKey, agentId, startUrl: entry.startUrl, known: true };
+  // 2. Registry descriptor start_url
+  try {
+    const md = path.join(AGENTS_DIR, `${serviceKey}.agent.md`);
+    if (fs.existsSync(md)) {
+      const m = /^start_url:\s*(\S+)\s*$/m.exec(fs.readFileSync(md, 'utf8'));
+      if (m && /^https?:\/\//i.test(m[1])) return { serviceKey, agentId, startUrl: m[1], known: true };
+    }
+  } catch (_) { /* registry file unreadable — try the db */ }
+  // 3. Agents db (registered agents may only exist there)
+  try {
+    const q = await actionQueryAgent({ id: agentId });
+    const startUrl = q?.startUrl || (q?.descriptor ? extractDescriptorUrl(q.descriptor, 'start_url') : null);
+    if (startUrl && /^https?:\/\//i.test(startUrl)) return { serviceKey, agentId, startUrl, known: true };
+  } catch (_) { /* non-fatal */ }
+  return { serviceKey, agentId, startUrl: null, known: false };
+}
+
 module.exports._computeTabFlow = _computeTabFlow;
+module.exports.resolveTaskDeepLinkCheap = _resolveCheapDeepLink;
+module.exports._resolveTaskDeepLink = _resolveTaskDeepLink;
+module.exports.resolveServiceTarget = resolveServiceTarget;
+module.exports.extractSearchQuery = _extractSearchQuery;
+module.exports.lookupBrowserService = lookupBrowserService;
+module.exports.isHostAlias = isHostAlias;
 module.exports._splitCompoundAction = _splitCompoundAction;
 module.exports._inheritFragmentVerbs = _inheritFragmentVerbs;
 module.exports._normalizeGoalForCache = _normalizeGoalForCache;

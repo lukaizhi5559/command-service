@@ -95,7 +95,12 @@ const ERROR_PAGE_MAX_CHARS = 4000;   // buried marker only counts on thin pages
 // Login-wall signatures — page demands a session before showing content. The
 // HTTP fetch tier carries no cookies, so these must escalate to the real
 // browser tier which shares the user's logged-in session.
-const LOGIN_WALL_RE = /\b(sign in to continue|log in to (?:continue|view|read|see)|you must (?:be )?log(?:ged)? ?in|please (?:sign|log) ?in to|create an account to|sign in to (?:read|view|see)|members? only|subscribe to (?:read|view|continue)|this content is (?:only )?(?:available|for) (?:to )?(?:subscribers|members))\b/i;
+// \s+ (not literal spaces) between words — stripped page text breaks phrases
+// across lines ("Sign in\nto continue to Gmail" is the Google login form).
+const LOGIN_WALL_RE = /\b(sign\s+in\s+to\s+continue|log\s+in\s+to\s+(?:continue|view|read|see)|you\s+must\s+(?:be\s+)?log(?:ged)?\s*in|please\s+(?:sign|log)\s*in\s+to|create\s+an\s+account\s+to|sign\s+in\s+to\s+(?:read|view|see)|members?\s+only|subscribe\s+to\s+(?:read|view|continue)|this\s+content\s+is\s+(?:only\s+)?(?:available|for)\s+(?:to\s+)?(?:subscribers|members)|use\s+your\s+google\s+account|choose\s+an\s+account\s+to\s+continue|email\s+or\s+phone|sign\s+in\s+with\s+a\s+different\s+account|unlock\s+to\s+read|join\s+to\s+(?:read|view))\b/i;
+// Proper-noun destinations: "Log into Facebook" — case-sensitive on purpose so
+// lowercase nav chrome ("log in", "login page") can't false-positive.
+const LOGIN_WALL_PROPER_RE = /\bLog\s+(?:in\s+to|into)\s+[A-Z][\w.]+\b/;
 const LOGIN_WALL_LEAD_CHARS = 2000;  // login gates usually lead; "subscribe to read" deeper in text is still a wall for full content
 
 /**
@@ -118,7 +123,9 @@ function isLoginWall(text) {
   const s = String(text || '');
   if (!s) return false;
   const m = LOGIN_WALL_RE.exec(s);
-  return !!m && m.index < LOGIN_WALL_LEAD_CHARS;
+  if (m && m.index < LOGIN_WALL_LEAD_CHARS) return true;
+  const m2 = LOGIN_WALL_PROPER_RE.exec(s);
+  return !!m2 && m2.index < LOGIN_WALL_LEAD_CHARS;
 }
 
 /**

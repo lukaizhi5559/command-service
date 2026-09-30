@@ -6662,6 +6662,124 @@ async function actionReadUrl({ url, cleanup = 'deselect', appName, minChars, max
   return { ok: false, reason: scan.error || 'browser_copy_failed', url, closed };
 }
 
+// ---------------------------------------------------------------------------
+// actionNavTask — browser-free fast lane for "goto <service> and read/search X".
+//
+// Resolves a task-specific deep link through browser.agent's cheap tiers
+// (appKnowledge, criteria/search templates, caches, web.agent, LLM suggest —
+// no browser-engine spawn), then reads the page via read_url (http → real-
+// browser copy → crawl). Only escalates to the full browser.agent run when the
+// cheap path can't satisfy: unresolved, mutation intent, compose/creation
+// deep-link, or a login/error wall in the user's real session.
+// ---------------------------------------------------------------------------
+
+const _NAVTASK_MUTATION_RE = /\b(send|compose|reply|forward|post|tweet|publish|create|upload|book|schedule|buy|purchase|checkout|place\s+order|delete|remove|dm|comment|like|follow|subscribe|add\s+(?:to|a|an|the|new))\b/i;
+
+function _navTaskCallSkill(skillName, args, timeoutMs = 120000) {
+  return new Promise((resolve) => {
+    const http = require('http');
+    const body = JSON.stringify({ payload: { skill: skillName, args } });
+    const req = http.request({
+      hostname: '127.0.0.1',
+      port: parseInt(process.env.COMMAND_SERVICE_PORT || '3007', 10),
+      path: '/command.automate',
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
+      timeout: timeoutMs,
+    }, res => {
+      let raw = '';
+      res.on('data', c => { raw += c; });
+      res.on('end', () => { try { resolve(JSON.parse(raw).data || JSON.parse(raw)); } catch (_) { resolve(null); } });
+    });
+    req.on('timeout', () => { req.destroy(); resolve(null); });
+    req.on('error', () => resolve(null));
+    req.write(body);
+    req.end();
+  });
+}
+
+async function actionNavTask({ task, service, url, escalate = true, appName, timeoutMs = 120000 } = {}) {
+  if (!task && !url) return { ok: false, error: 'nav_task requires task or url' };
+
+  const _escalate = async (why) => {
+    if (!escalate) return { ok: false, reason: why, service: service || null };
+    const _agentId = service
+      ? `${String(service).toLowerCase().replace(/\.agent$/, '').replace(/\s+/g, '_').replace(/[^a-z0-9_]/g, '')}.agent`
+      : null;
+    if (!_agentId) return { ok: false, reason: why };
+    logger.info(`[app.agent] nav_task: escalating to browser.agent (${why}) for ${_agentId}`);
+    const r = await _navTaskCallSkill('browser.agent', { action: 'run', agentId: _agentId, task: task || `Open ${url}` }, timeoutMs);
+    return r || { ok: false, error: 'escalation returned no result', reason: why };
+  };
+
+  let _ba;
+  try { _ba = require('./browser.agent.cjs'); } catch (e) {
+    return { ok: false, error: `browser.agent unavailable: ${e.message}` };
+  }
+
+  // 1. Resolve the target service → startUrl (+agentId). Explicit url wins.
+  let serviceKey = null, agentId = null, startUrl = null;
+  if (url && /^https?:\/\//i.test(String(url).trim())) {
+    startUrl = String(url).trim();
+    try { serviceKey = new URL(startUrl).hostname.replace(/^www\./, '').split('.')[0]; } catch (_) {}
+  } else {
+    const target = await _ba.resolveServiceTarget(service);
+    if (!target?.startUrl) return _escalate(`no startUrl for ${service}`);
+    ({ serviceKey, agentId, startUrl } = target);
+  }
+
+  // 2. Mutation gate — the fast lane is read-only. Any mutation cue (send/
+  //    compose/post/add-to-cart/…) means DOM interaction — escalate even when
+  //    read verbs are also present ("find email from X and forward it").
+  if (_NAVTASK_MUTATION_RE.test(task || '')) return _escalate('mutation task');
+
+  // 3. Cheap deep-link resolution (templates, caches, web.agent, LLM suggest).
+  const dl = await _ba.resolveTaskDeepLinkCheap(agentId || `${serviceKey || 'unknown'}.agent`, serviceKey || '', startUrl, task || `Open ${startUrl}`, null, { networkDiscovery: true });
+
+  let dest = dl?.url || null;
+  if (dest && dl.needsPromote) {
+    // Cheap path has no session for off-domain redirect verification — apply
+    // the promote gate, then require on-domain (host-alias aware).
+    const _baseHost = dl.baseHost || (() => { try { return new URL(startUrl).hostname.replace(/^www\./, ''); } catch (_) { return serviceKey; } })();
+    const _svcEntry = serviceKey ? _ba.lookupBrowserService?.(serviceKey) : null;
+    let _destHost = '';
+    try { _destHost = new URL(dest).hostname.replace(/^www\./, ''); } catch (_) { dest = null; }
+    if (dest && (!_ba._canPromoteDeepLink(dest, dl.source, dl.intent, _baseHost, serviceKey || '')
+                 || !(_destHost === _baseHost || _destHost.endsWith('.' + _baseHost)
+                      || (_ba.isHostAlias && _ba.isHostAlias(_destHost, _baseHost, _svcEntry?.hostAliases))))) {
+      logger.warn(`[app.agent] nav_task: rejected deep-link ${dest} (source=${dl.source}) — escalating`);
+      dest = null;
+    }
+  }
+
+  // 4. compose/creation deep-links open a form — fields need DOM interaction.
+  let dlType = 'none';
+  if (dest) {
+    dlType = require('../skill-helpers/deep-link-types.cjs').classifyDeepLinkType(dest);
+    if (dlType === 'compose' || dlType === 'creation') return _escalate(`deep-link type ${dlType}`);
+  }
+
+  if (!dest) return _escalate('no deep-link resolved');
+
+  // 5. Read the resolved URL. For service-resolved targets skip the HTTP tier:
+  //    cookie-less fetch only ever sees login shells for auth-bound services
+  //    (gmail → accounts.google.com 200 OK sign-in page) — the user's real
+  //    browser session is the point of this lane. Explicit-URL calls keep
+  //    httpFirst since public pages resolve in ~1s without tab churn.
+  //    'deselect' cleanup keeps the tab open — "goto gmail" should leave the
+  //    user looking at the results page.
+  logger.info(`[app.agent] nav_task: ${service || url} → ${dest} (source=${dl.source}, type=${dlType})`);
+  const r = await actionReadUrl({ url: dest, cleanup: 'deselect', appName, maxWaitMs: 15000, httpFirst: !service });
+  if (!r.ok) {
+    logger.warn(`[app.agent] nav_task: read_url failed (${r.reason || r.error || 'unknown'}) for ${dest}`);
+    return _escalate(r.reason || r.error || 'read failed');
+  }
+  return {
+    ok: true, url: r.url || dest, content: r.content, chars: r.chars, via: r.via,
+    deepLinkSource: dl.source, deepLinkType: dlType, thin: r.thin || undefined,
+  };
+}
+
 /**
  * actionPrintPage — Cmd+P → Enter in the focused app. Best-effort: there is
  * no deterministic way to verify a print job from outside the app.
@@ -7438,6 +7556,7 @@ module.exports = {
   actionScanPage,
   actionPrintPage,
   actionReadUrl,
+  actionNavTask,
 
   // Phase 5: Structured OCR helpers (used by app.runner.cjs monitoring)
   _filterItemsByAppBounds,
