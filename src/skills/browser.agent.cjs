@@ -3165,7 +3165,7 @@ GOAL-RELEVANCE RULES (CRITICAL):
 - If no available shortcut helps achieve the goal, use Tier 4 (Tab-Map) to click the target element directly.
 - TERMINAL ACTION BOUND: stop at the goal's final requested action. Never include checkout, payment, shipping-address, or order-placement steps unless the goal explicitly asks to complete a purchase. For "add X to cart" goals the flow ends once the item is confirmed in the cart.`;
 
-  const userPrompt = `Goal: ${goal}\nPage category: ${pageCategory || 'web_generic'}\nAvailable shortcuts:\n${shortcutLabels || '(none)'}\nCurrent URL: ${currentUrl || '(unknown)'}\nAgent: ${agentId || '(unknown)'}${urlFirstNav ? `\nURL-FIRST NAVIGATION: true\nDEEP LINK TYPE: ${deepLinkType || 'none'}${deepLinkType === 'compose' ? '\nNOTE: The compose window is ALREADY open. Do NOT include a step to click Compose, New, or Write. Start directly with filling the fields (recipient, subject, body) then click Send.' : ''}${deepLinkType === 'creation' ? '\nNOTE: The entity has ALREADY been created. Do NOT include a step to click New or Create. Start directly with the first input field.' : ''}` : ''}`;
+  const userPrompt = `Goal: ${goal}\nPage category: ${pageCategory || 'web_generic'}\nAvailable shortcuts:\n${shortcutLabels || '(none)'}\nCurrent URL: ${currentUrl || '(unknown)'}\nAgent: ${agentId || '(unknown)'}${urlFirstNav ? `\nURL-FIRST NAVIGATION: true\nDEEP LINK TYPE: ${deepLinkType || 'none'}${deepLinkType === 'compose' ? '\nNOTE: The compose window is ALREADY open. Do NOT include a step to click Compose, New, or Write. Start directly with filling the fields (recipient, subject, body) then click Send.' : ''}${deepLinkType === 'creation' ? '\nNOTE: The entity has ALREADY been created. Do NOT include a step to click New or Create. Start directly with the first input field.' : ''}${deepLinkType === 'search' ? '\nNOTE: The search has ALREADY been executed by navigating to this URL — the results are loaded. Do NOT include steps to click the search box, type a query, press Enter, or wait for results. Emit tier 0 (done) for the satisfied part; emit real steps only for what remains (e.g. click a specific result, extract fields).' : ''}${deepLinkType === 'read' || deepLinkType === 'navigation' ? '\nNOTE: The destination page/section is ALREADY loaded by this URL. Do NOT include a navigate step. Emit tier 0 (done) if arrival is all the goal needs; emit real steps only for follow-on interaction.' : ''}` : ''}`;
 
   try {
     // Retry once on parse failure — the model occasionally wraps the JSON
@@ -3226,18 +3226,31 @@ GOAL-RELEVANCE RULES (CRITICAL):
       // "click New" step when the deep link already opened the form. Strip the
       // first step if it matches an open/create action for the relevant deep
       // link type. This is action-text-based (not site-specific).
-      if (urlFirstNav && splitFlow.length > 1) {
-        const _firstAction = String(splitFlow[0].action || '').toLowerCase();
-        let _stripPattern = null;
-        if (deepLinkType === 'compose' && /click.*\b(compose|new|write|draft)\b/i.test(_firstAction)) {
-          _stripPattern = 'compose';
-        } else if (deepLinkType === 'creation' && /click.*\b(new|create|add)\b/i.test(_firstAction)) {
-          _stripPattern = 'creation';
+      if (urlFirstNav && splitFlow.length > 0) {
+        const _SEARCH_REPRO_RE = /click.*search|search\s*(box|bar|field)|type.*(query|search)|press\s*enter|hit\s*enter|wait.*(results|load)/i;
+        const _NAV_ONLY_RE = /\bnavigate\b|\bgo\s*to\b|\bopen\s+(?:the\s+)?(page|site|url|link)\b/i;
+        // Strip ALL leading steps that re-do what the deep-link URL already did.
+        while (splitFlow.length > 0) {
+          const _firstAction = String(splitFlow[0].action || '').toLowerCase();
+          let _stripPattern = null;
+          if (deepLinkType === 'compose' && /click.*\b(compose|new|write|draft)\b/i.test(_firstAction)) {
+            _stripPattern = 'compose';
+          } else if (deepLinkType === 'creation' && /click.*\b(new|create|add)\b/i.test(_firstAction)) {
+            _stripPattern = 'creation';
+          } else if (deepLinkType === 'search' && _SEARCH_REPRO_RE.test(_firstAction)) {
+            _stripPattern = 'search';
+          } else if ((deepLinkType === 'read' || deepLinkType === 'navigation') && _NAV_ONLY_RE.test(_firstAction)) {
+            _stripPattern = deepLinkType;
+          }
+          if (!_stripPattern) break;
+          const _strippedAction = splitFlow.shift().action || '';
+          logger.info(`[browser.agent] _computeTabFlow: stripped redundant step "${_strippedAction.slice(0, 50)}" (deepLinkType=${_stripPattern}) — flow now ${splitFlow.length} steps`);
         }
-        if (_stripPattern) {
-          const _strippedAction = splitFlow[0].action || '';
-          splitFlow.shift();
-          logger.info(`[browser.agent] _computeTabFlow: stripped redundant open step "${_strippedAction.slice(0, 50)}" (deepLinkType=${_stripPattern}) — flow now ${splitFlow.length} steps`);
+        // If the URL satisfied the whole goal, return a done-only flow so the
+        // runner's tier-0 early exit fires (no imperative steps, auto-extract).
+        if (splitFlow.length === 0) {
+          logger.info(`[browser.agent] _computeTabFlow: deep-link (${deepLinkType}) satisfied the whole goal — returning done-only flow`);
+          splitFlow.push({ tier: 0, action: 'done — already satisfied by URL' });
         }
       }
       logger.info(`[browser.agent] _computeTabFlow: computed ${splitFlow.length}-step flow for "${goal.slice(0, 60)}" — ${splitFlow.map(s => `tier ${s.tier}(${(s.action || '').slice(0, 30)})`).join(' → ')}`);
@@ -12008,7 +12021,17 @@ When extracting page content with run-code, prioritize these selectors over gene
         // _inferPageCategory hits the deterministic _SERVICE_CATEGORIES map for
         // known chat services, so this is effectively free.
         const _scPageCategory = await _inferPageCategory(_svcKey, startUrl, task, _appKnowledgeEntries).catch(() => null);
-        if (_isReadOnlyGoal && _urlFirstNavigationSelected && _scPageCategory !== 'ai_chat') {
+        // URL evidence dominates task classification: a search/read/navigation
+        // deep-link on a navigate-typed step means the URL already did the work
+        // (e.g. Gmail #search/from:X+is:unread) — even when the task classified
+        // as mutation (filter_ui). Skip the imperative loop entirely; the
+        // URL-arrival verify + goal classifier below still guard bad landings.
+        const _scDeepLinkType = _urlFirstNavigationSelected
+          ? require('../skill-helpers/deep-link-types.cjs').classifyDeepLinkType(startUrl, _scPageCategory)
+          : 'none';
+        const _urlAlreadySatisfies = _stepType === 'navigate'
+          && (['search', 'read', 'navigation'].includes(_scDeepLinkType));
+        if ((_isReadOnlyGoal || _urlAlreadySatisfies) && _urlFirstNavigationSelected && _scPageCategory !== 'ai_chat') {
           logger.info(`[browser.agent] tab-map: URL-first short-circuit — read-only goal + URL-first navigation, skipping iterative navigation`);
           // Wait for page to stabilize (Gmail SPA needs time after #search navigation)
           const _wstRes = await callBrowserAct({ action: 'waitForStableText', sessionId, headed: true, timeoutMs: 10000 }, 12000).catch(e => ({ ok: false, error: e.message }));

@@ -47,10 +47,14 @@ function classifyDeepLinkType(url, pageCategory) {
   if (/(#compose=new|#compose\b|compose=new|\/compose\b)/i.test(fullUrl)) return 'compose';
 
   // 3. Search: #search/, ?q=, ?filter=, &filter=, is:unread, from:, etc.
-  //    Covers Gmail hash-search, generic query params, and filter operators
+  //    Covers Gmail hash-search, generic query params, filter operators, and
+  //    common results-page URL shapes (amazon /s?k=, youtube /results?search_query=,
+  //    github/reddit /search?q=, ebay /sch/?_nkw=).
   if (/(#search\/|\?q=|&q=|#query=|\?filter=|&filter=|#filter\b|is:unread|is:starred|is:read|from:|to:|subject:|label:|in:|has:)/i.test(fullUrl)) {
     return 'search';
   }
+  if (/[?&](k|query|search_query|term|_nkw|find_desc)=/i.test(search)) return 'search';
+  if (/\/(search|results|sch)(\/|$|\?|#)/i.test(path)) return 'search';
 
   // 4. Navigation: /settings, /dashboard, /calendar, /inbox, /admin, etc.
   //    These are section navigations — the page needs interaction, not just reading
