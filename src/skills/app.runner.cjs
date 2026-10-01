@@ -1784,6 +1784,9 @@ async function _executeAppTypePlain({ appName, value, goal, actionHistory }) {
   logger.info(`[app.runner] type-plain: typing "${String(value).slice(0, 50)}"`);
 
   try {
+    // Synthetic keys go to the macOS key window — release it from the
+    // ThinkDrop overlay first so they land on the target app.
+    await require('./app.agent.cjs')._releaseOverlayKey?.();
     // Convert literal \n to {SHIFT+ENTER} for multiline contenteditable
     const normalizedText = String(value).replace(/\n/g, '{SHIFT+ENTER}');
 
@@ -1838,6 +1841,7 @@ async function _executeAppTypeCommands({ appName, value, goal, actionHistory }) 
   const { keyboard, Key } = nut;
 
   try {
+    await require('./app.agent.cjs')._releaseOverlayKey?.();
     // 1. Type the trigger (e.g. "/remind")
     await keyboard.type(plan.trigger);
     await _sleep(800);
@@ -1857,6 +1861,7 @@ async function _executeAppTypeCommands({ appName, value, goal, actionHistory }) 
     if (!dropdownAppeared) {
       logger.warn(`[app.runner] type-commands: no dropdown appeared after typing "${plan.trigger}" — falling back to type-plain`);
       // Press Escape to clear any partial command
+      await appAgent._suppressEscKey?.();
       await keyboard.pressKey(Key.Escape);
       await keyboard.releaseKey(Key.Escape);
       return _executeAppTypePlain({ appName, value, goal, actionHistory });
@@ -1948,6 +1953,7 @@ async function _executeAppTypeSearch({ appName, value, goal, actionHistory }) {
   const { keyboard, Key } = nut;
 
   try {
+    await require('./app.agent.cjs')._releaseOverlayKey?.();
     // 1. Type the trigger + query to filter the dropdown
     await keyboard.type(plan.trigger + plan.query);
     await _sleep(800);
@@ -2004,6 +2010,7 @@ async function _executeAppTypeListItem({ appName, value, goal, actionHistory }) 
 
   try {
     const appAgent = require('./app.agent.cjs');
+    await appAgent._releaseOverlayKey?.();
     // Type the value (same as type-plain for single-line)
     const typeResult = await appAgent.actionTypeText({ appName, text: value });
     if (!typeResult.ok) return typeResult;
@@ -2129,6 +2136,7 @@ async function _executeJustType({ appName, value, goal, appCategory, actionHisto
 
     logger.info(`[app.runner] Just-type: pressing ${value}`);
     try {
+      await require('./app.agent.cjs')._releaseOverlayKey?.();
       await keyboard.pressKey(..._mods, _finalKey);
       await keyboard.releaseKey(..._mods, _finalKey);
       await _sleep(800);
@@ -2778,6 +2786,7 @@ async function _executeGlobalShortcut({ appName, key }) {
 
   logger.info(`[app.runner] _executeGlobalShortcut: pressing ${key}`);
   try {
+    await require('./app.agent.cjs')._releaseOverlayKey?.();
     await keyboard.pressKey(..._mods, _finalKey);
     await keyboard.releaseKey(..._mods, _finalKey);
     await _sleep(500);
@@ -2977,6 +2986,8 @@ async function runAppFlow({ goal, appName, category, bounds, shortcuts, resolved
       });
       const nut = await _getNutKeyboard();
       if (nut) {
+        await require('./app.agent.cjs')._releaseOverlayKey?.();
+        await require('./app.agent.cjs')._suppressEscKey?.();
         await nut.keyboard.pressKey(nut.Key.Escape);
         await nut.keyboard.releaseKey(nut.Key.Escape);
       }

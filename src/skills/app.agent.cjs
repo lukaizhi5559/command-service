@@ -3986,6 +3986,45 @@ const MEMORY_PORT = parseInt(process.env.MEMORY_SERVICE_PORT || '3001', 10);
 const MEMORY_HOST = process.env.MEMORY_SERVICE_HOST || '127.0.0.1';
 const MEMORY_API_KEY = process.env.MCP_USER_MEMORY_API_KEY || process.env.USER_MEMORY_API_KEY || '';
 
+/**
+ * _getActiveAppContext — overlay-aware active-app resolver (user-memory).
+ * When the live frontmost window is one of ours, the monitor's _isSkipApp
+ * rejects it and falls back to the last non-overlay app, so "the current app"
+ * always means the user's app, never the panel. Returns { appName, ... } or null.
+ */
+function _getActiveAppContext() {
+  return new Promise((resolve) => {
+    const http = require('http');
+    const body = JSON.stringify({ payload: {}, requestId: `aac_${Date.now()}` });
+    const req = http.request({
+      hostname: MEMORY_HOST,
+      port: MEMORY_PORT,
+      path: '/memory.getActiveAppContext',
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(body),
+        'x-api-key': MEMORY_API_KEY
+      }
+    }, (res) => {
+      let raw = '';
+      res.on('data', d => { raw += d; });
+      res.on('end', () => {
+        try {
+          const data = JSON.parse(raw);
+          resolve(data.result?.app || data.app || null);
+        } catch (_) {
+          resolve(null);
+        }
+      });
+    });
+    req.on('error', () => resolve(null));
+    req.setTimeout(2500, () => { req.destroy(); resolve(null); });
+    req.write(body);
+    req.end();
+  });
+}
+
 async function getRecentOCR({ maxAgeSeconds = 3, appName: targetApp = null, liveOverlayHidden = false } = {}) {
   const _appMatches = (a, b) => {
     if (!a || !b) return false;
@@ -4871,6 +4910,7 @@ async function actionTeleportToElement({ searchText, followWithTab = false }) {
 
   try {
     const { Key } = nut;
+    await _releaseOverlayKey();
     await nut.keyboard.pressKey(Key.LeftSuper, Key.F);
     await nut.keyboard.releaseKey(Key.LeftSuper, Key.F);
     await _sleep(300);
@@ -4878,6 +4918,7 @@ async function actionTeleportToElement({ searchText, followWithTab = false }) {
     await nut.keyboard.type(searchText);
     await _sleep(300);
 
+    await _suppressEscKey();
     await nut.keyboard.pressKey(Key.Escape);
     await nut.keyboard.releaseKey(Key.Escape);
     await _sleep(200);
@@ -5086,6 +5127,7 @@ async function actionSearchAndClick({ searchText, appName, category, maxMatches 
     try {
       _checkAbort('before_keyboard_open');
       // Open browser find bar and type the search variant.
+      await _releaseOverlayKey();
       await nut.keyboard.pressKey(Key.LeftSuper, Key.F);
       await nut.keyboard.releaseKey(Key.LeftSuper, Key.F);
       await _sleep(500, controller.signal);
@@ -5104,6 +5146,7 @@ async function actionSearchAndClick({ searchText, appName, category, maxMatches 
         await _sleep(200, controller.signal);
 
         // Close the find bar while keeping the page highlight.
+        await _suppressEscKey();
         await nut.keyboard.pressKey(Key.Escape);
         await nut.keyboard.releaseKey(Key.Escape);
         await _sleep(300, controller.signal);
@@ -5129,6 +5172,7 @@ async function actionSearchAndClick({ searchText, appName, category, maxMatches 
       }
 
       // Ensure the find bar is closed.
+      await _suppressEscKey();
       await nut.keyboard.pressKey(Key.Escape);
       await nut.keyboard.releaseKey(Key.Escape);
       await _sleep(200, controller.signal);
@@ -5608,6 +5652,21 @@ async function verifyAppFocused({ appName, waitMs = 5000 }) {
   const _hasBounds = !!(liveWin && liveWin.width > 0 && liveWin.height > 0);
   logger.info(`[app.agent] verifyAppFocused: initial check - liveWin: ${liveWin ? JSON.stringify({ appName: liveWin.appName, hasBounds: _hasBounds, source: liveWin.source || 'unknown' }) : 'null'}, isOverlayActive: ${isOverlayActive}`);
 
+  // Overlay-aware target resolution: when the live frontmost window is one of
+  // ours, active-win can't report the user's app — resolve it via
+  // memory.getActiveAppContext, which skips overlay entries and falls back to
+  // the last non-overlay app. Also supplies a target when none was passed.
+  if (!appName || isOverlayActive) {
+    const ctx = await _getActiveAppContext();
+    const ctxApp = ctx?.appName || null;
+    if (ctxApp && !appName) {
+      appName = ctxApp;
+      logger.info(`[app.agent] verifyAppFocused: resolved active app context → "${ctxApp}" (source=${ctx.source || 'live'})`);
+    } else if (ctxApp && isOverlayActive) {
+      logger.info(`[app.agent] verifyAppFocused: overlay frontmost — getActiveAppContext reports "${ctxApp}", keeping requested "${appName}"`);
+    }
+  }
+
   // Generic browser sentinel: the planner may pass appName="browser" for any
   // browser-category action. If the active window is a known browser, treat it
   // as focused instead of trying to run `open -a "browser"`, which fails.
@@ -5989,7 +6048,8 @@ async function actionExecuteShortcut({ appName, action, shortcutOverride, verify
     else key = Key[part] ?? Key[part.toUpperCase()] ?? Key[part.charAt(0).toUpperCase() + part.slice(1).toLowerCase()];
   }
 
-  if (!key) {
+  // Note: Key.Escape is enum value 0 — a falsy check would drop it.
+  if (key == null) {
     logger.warn(`[app.agent] actionExecuteShortcut: could not map key from shortcut "${shortcutStr}"`);
     return { ok: false, error: `Could not map shortcut keys: "${shortcutStr}"`, shortcut: shortcutStr };
   }
@@ -5999,6 +6059,8 @@ async function actionExecuteShortcut({ appName, action, shortcutOverride, verify
   //    disturb the foreground app, so it is shown AFTER the key has landed.
   logger.info(`[app.agent] actionExecuteShortcut: dispatching "${shortcutStr}" on "${appName}" (action: ${action || 'override'}, modifiers: ${modifiers.length}, key: ${key})`);
   try {
+    await _releaseOverlayKey();
+    if (key === Key.Escape && modifiers.length === 0) await _suppressEscKey();
     await nut.keyboard.pressKey(...modifiers, key);
     await nut.keyboard.releaseKey(...modifiers, key);
   } catch (err) {
@@ -6082,7 +6144,8 @@ async function actionVerifyShortcut({ shortcutStr, targetText, placeholder, appN
         else key = Key[part] ?? Key[part.toUpperCase()] ?? Key[part.charAt(0).toUpperCase() + part.slice(1).toLowerCase()];
       }
 
-      if (key) {
+      if (key != null) {
+        await _releaseOverlayKey();
         await nut.keyboard.pressKey(...modifiers, key);
         await nut.keyboard.releaseKey(...modifiers, key);
       }
@@ -6395,14 +6458,20 @@ async function _copyPageOnce(appName, captureHtml, deselect = true) {
   const content = execSync('pbpaste', { encoding: 'utf8', timeout: 5000 });
   const html = captureHtml ? _readClipboardHtml() : null;
 
-  // Clear the selection: Cmd+F, Space, BackSpace, Esc (open+close find resets
-  // selection). Skipped by callers that close the tab right after (read_url
+  // Clear the all-selection highlight so the tab is left readable: Cmd+A →
+  // Cmd+F → Space → BackSpace → Esc. The 400ms after Cmd+F is load-bearing —
+  // the find bar animates open, and a space typed before its input is focused
+  // lands on the page (scrolls it) leaving the highlight intact. Space forces
+  // the find input to a known state, BackSpace empties it (no matches →
+  // nothing highlighted), Esc closes the bar and returns focus to the page.
+  // Skipped by callers that close the tab right after (read_url
   // cleanup:'close') — the selection dies with the tab anyway.
   if (deselect) {
-    await press('Cmd+F', 150);
-    await press('Space', 150);
-    await press('BackSpace', 150);
-    await press('Escape', 150);
+    await press('Cmd+A', 250);        // re-affirm the page selection
+    await press('Cmd+F', 400);        // open find bar — wait for the animation
+    await press('Space', 250);        // type a space into the find input
+    await press('BackSpace', 200);    // delete it — empty find, no highlight
+    await press('Escape', 200);       // close find bar, focus back on page
   }
 
   return { pageUrl, content, html };
@@ -6673,6 +6742,57 @@ async function actionReadUrl({ url, cleanup = 'deselect', appName, minChars, max
 // deep-link, or a login/error wall in the user's real session.
 // ---------------------------------------------------------------------------
 
+/**
+ * _suppressEscKey — a synthetic Escape is indistinguishable from a real one at
+ * the OS level, and the main process registers Escape globally while the
+ * "AI in Control" lock is armed (Esc = cancel). Without this handshake our own
+ * find-bar-closing Esc cancels the running task ("cancelled by user" on a
+ * scan_page the user never touched). POSTs to the overlay control server so it
+ * ignores Esc for a short window; resolves even if the server is unreachable.
+ */
+function _suppressEscKey() {
+  const http = require('http');
+  const port = parseInt(process.env.OVERLAY_CONTROL_PORT || '3010', 10);
+  return new Promise((resolve) => {
+    let done = false;
+    const finish = () => { if (!done) { done = true; resolve(); } };
+    const req = http.request(
+      { hostname: '127.0.0.1', port, path: '/overlay/suppress-esc', method: 'POST', timeout: 400 },
+      () => finish(),
+    );
+    req.on('error', finish);
+    req.on('timeout', () => { req.destroy(); finish(); });
+    req.end();
+    setTimeout(finish, 500);
+  });
+}
+
+/**
+ * _releaseOverlayKey — the ThinkDrop overlay panels are focusable:true
+ * non-activating windows: they can hold the macOS KEY window (which receives
+ * synthetic keystrokes) while another app stays frontmost. open -a / activate
+ * are no-ops when the target is already frontmost, so they can never take key
+ * back — only the main process can resign it. POSTs to the overlay control
+ * server (gated on an active control lock / AppControl mode) so the panel
+ * releases key focus before we dispatch; resolves even if unreachable.
+ */
+function _releaseOverlayKey() {
+  const http = require('http');
+  const port = parseInt(process.env.OVERLAY_CONTROL_PORT || '3010', 10);
+  return new Promise((resolve) => {
+    let done = false;
+    const finish = () => { if (!done) { done = true; resolve(); } };
+    const req = http.request(
+      { hostname: '127.0.0.1', port, path: '/overlay/release-key', method: 'POST', timeout: 800 },
+      () => finish(),
+    );
+    req.on('error', finish);
+    req.on('timeout', () => { req.destroy(); finish(); });
+    req.end();
+    setTimeout(finish, 900);
+  });
+}
+
 const _NAVTASK_MUTATION_RE = /\b(send|compose|reply|forward|post|tweet|publish|create|upload|book|schedule|buy|purchase|checkout|place\s+order|delete|remove|dm|comment|like|follow|subscribe|add\s+(?:to|a|an|the|new))\b/i;
 
 function _navTaskCallSkill(skillName, args, timeoutMs = 120000) {
@@ -6698,11 +6818,11 @@ function _navTaskCallSkill(skillName, args, timeoutMs = 120000) {
   });
 }
 
-async function actionNavTask({ task, service, url, escalate = true, appName, timeoutMs = 120000 } = {}) {
+async function actionNavTask({ task, service, url, escalate = true, browseFallback = false, appName, timeoutMs = 120000 } = {}) {
   if (!task && !url) return { ok: false, error: 'nav_task requires task or url' };
 
   const _escalate = async (why) => {
-    if (!escalate) return { ok: false, reason: why, service: service || null };
+    if (!escalate || browseFallback) return { ok: false, reason: why, service: service || null };
     const _agentId = service
       ? `${String(service).toLowerCase().replace(/\.agent$/, '').replace(/\s+/g, '_').replace(/[^a-z0-9_]/g, '')}.agent`
       : null;
@@ -6710,6 +6830,33 @@ async function actionNavTask({ task, service, url, escalate = true, appName, tim
     logger.info(`[app.agent] nav_task: escalating to browser.agent (${why}) for ${_agentId}`);
     const r = await _navTaskCallSkill('browser.agent', { action: 'run', agentId: _agentId, task: task || `Open ${url}` }, timeoutMs);
     return r || { ok: false, error: 'escalation returned no result', reason: why };
+  };
+
+  // browseFallback — graceful floor for the public-read fast lane. Instead of
+  // escalating to browser.agent (a heavyweight run for a simple lookup):
+  //   - service resolved but no deep-link → read the canonical startUrl (still
+  //     lands on the right domain, e.g. biblegateway.com, not a mirror);
+  //   - service unresolved → the same broad search + read today's browse plan
+  //     would do (preferDomain nudges ranking toward the named site).
+  const _browseFloor = async (destOverride) => {
+    if (destOverride) {
+      logger.info(`[app.agent] nav_task: browseFallback — reading ${destOverride}`);
+      return actionReadUrl({ url: destOverride, cleanup: 'deselect', appName, maxWaitMs: 15000, httpFirst: !service, crawlFallback: true });
+    }
+    const sr = await _navTaskCallSkill('web.agent', {
+      action: 'search_and_navigate',
+      query: task || `Open ${service || url}`,
+      preferDomain: serviceKey || service || undefined,
+    }, timeoutMs);
+    const best = sr?.bestUrl || null;
+    if (!best) return { ok: false, reason: 'no startUrl and browse fallback found no result', service: service || null };
+    logger.info(`[app.agent] nav_task: browseFallback — search resolved ${best}`);
+    const r = await actionReadUrl({
+      url: best,
+      fallbackUrls: Array.isArray(sr.fallbackUrls) && sr.fallbackUrls.length ? sr.fallbackUrls : undefined,
+      cleanup: 'deselect', appName, httpFirst: true, crawlFallback: true,
+    });
+    return r.ok ? { ...r, deepLinkSource: 'browse_fallback' } : r;
   };
 
   let _ba;
@@ -6724,7 +6871,7 @@ async function actionNavTask({ task, service, url, escalate = true, appName, tim
     try { serviceKey = new URL(startUrl).hostname.replace(/^www\./, '').split('.')[0]; } catch (_) {}
   } else {
     const target = await _ba.resolveServiceTarget(service);
-    if (!target?.startUrl) return _escalate(`no startUrl for ${service}`);
+    if (!target?.startUrl) return browseFallback ? _browseFloor(null) : _escalate(`no startUrl for ${service}`);
     ({ serviceKey, agentId, startUrl } = target);
   }
 
@@ -6759,7 +6906,7 @@ async function actionNavTask({ task, service, url, escalate = true, appName, tim
     if (dlType === 'compose' || dlType === 'creation') return _escalate(`deep-link type ${dlType}`);
   }
 
-  if (!dest) return _escalate('no deep-link resolved');
+  if (!dest) return browseFallback ? _browseFloor(startUrl) : _escalate('no deep-link resolved');
 
   // 5. Read the resolved URL. For service-resolved targets skip the HTTP tier:
   //    cookie-less fetch only ever sees login shells for auth-bound services
@@ -6873,6 +7020,7 @@ async function actionTypeText({ text, appName, delayMs = 0 } = {}) {
   const startTime = Date.now();
 
   try {
+    await _releaseOverlayKey();
     for (const seg of segments) {
       if (seg.type === 'text') {
         if (seg.value.length > 0) {
@@ -6906,6 +7054,7 @@ async function actionTypeText({ text, appName, delayMs = 0 } = {}) {
           const keyName = _TYPE_TEXT_TOKEN_MAP[token];
           const nutKey = Key[keyName];
           if (nutKey !== undefined) {
+            if (nutKey === Key.Escape) await _suppressEscKey();
             await keyboard.pressKey(nutKey);
             await keyboard.releaseKey(nutKey);
           } else {
@@ -7563,4 +7712,7 @@ module.exports = {
   _getActiveAppBounds,
   _withFlash,
   _withOverlayHidden,
+  _suppressEscKey,
+  _releaseOverlayKey,
+  _getActiveAppContext,
 };

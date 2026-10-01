@@ -34,6 +34,10 @@ const SITE_SEARCH_URL_TEMPLATES = {
   'yelp.com':          'https://www.yelp.com/search?find_desc={query}',
   'imdb.com':          'https://www.imdb.com/find?q={query}',
   'wikipedia.org':     'https://en.wikipedia.org/wiki/Special:Search?search={query}',
+  // Mail services use hash/deeplink search routes (query lives in the fragment,
+  // not ?params — see _hasSearchQueryParam in destination-resolver.cjs).
+  'mail.google.com':   'https://mail.google.com/mail/u/0/#search/{query}',
+  'outlook.live.com':  'https://outlook.live.com/mail/0/deeplink/search?q={query}',
 };
 
 // UI button labels are not search queries. Used by _extractQuotedSearchTerm to
@@ -58,6 +62,36 @@ function extractQuotedSearchTerm(task) {
   // Reject UI button labels — they are not search queries
   if (_UI_LABEL_BLOCKLIST.test(term)) return null;
   return term;
+}
+
+/**
+ * Extract an unquoted query from "search (my|the)? <service> for X" phrasing —
+ * e.g. "search my gmail for vidangel emails" → "vidangel". Unlike
+ * extractQuotedSearchTerm, the term does not need quotes, but the task MUST
+ * name one of the provided service names (word-boundary match) — this keeps
+ * generic prose ("the email I searched for on my phone") from misfiring while
+ * letting service-targeted searches resolve deterministically.
+ *
+ * @param {string} task           - The task text.
+ * @param {string|string[]} serviceNames - Service key(s)/host label(s) that must
+ *                                          appear in the task (e.g. ['gmail','mail']).
+ * Returns the extracted query, or null.
+ */
+function extractServiceSearchTerm(task, serviceNames) {
+  const t = String(task || '').trim();
+  if (!t) return null;
+  const names = (Array.isArray(serviceNames) ? serviceNames : [serviceNames])
+    .map(n => String(n || '').toLowerCase().replace(/[^a-z0-9]/g, ''))
+    .filter(Boolean);
+  if (!names.length) return null;
+  const named = names.some(n => new RegExp(`\\b${n}\\b`, 'i').test(t));
+  if (!named) return null;
+  const m = t.match(/\b(?:search|find|look\s*up|look\s+for|browse|check|scan|read)\b[^.?!]{0,60}?\bfor\s+(.+?)\s*[?.!]*$/i);
+  if (!m) return null;
+  // Drop a trailing bare container noun — "vidangel emails" → "vidangel".
+  const q = m[1].trim().replace(/\s+(?:emails?|messages?|mails?|threads?|posts?|items?|results?|products?)$/i, '');
+  if (!q || _UI_LABEL_BLOCKLIST.test(q)) return null;
+  return q;
 }
 
 /**
@@ -144,6 +178,7 @@ module.exports = {
   SITE_SEARCH_URL_TEMPLATES,
   UI_LABEL_BLOCKLIST: _UI_LABEL_BLOCKLIST,
   extractQuotedSearchTerm,
+  extractServiceSearchTerm,
   lookupSiteSearchTemplate,
   buildSiteSearchUrl,
   isListingTask,

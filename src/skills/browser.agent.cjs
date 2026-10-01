@@ -7377,7 +7377,7 @@ function _buildStepTypePromptBlock(stepType) {
 //
 // NOTE: Implementation moved to skill-helpers/site-search.cjs (shared with
 // web.agent.cjs). This local binding keeps the existing call sites working.
-const { extractQuotedSearchTerm: _extractQuotedSearchTerm, UI_LABEL_BLOCKLIST: _UI_LABEL_BLOCKLIST } = require('../skill-helpers/site-search.cjs');
+const { extractQuotedSearchTerm: _extractQuotedSearchTerm, extractServiceSearchTerm: _extractServiceSearchTerm, UI_LABEL_BLOCKLIST: _UI_LABEL_BLOCKLIST } = require('../skill-helpers/site-search.cjs');
 
 /**
  * Build a deterministic site-search URL for "search <site> for 'X'" tasks
@@ -7387,7 +7387,14 @@ const { extractQuotedSearchTerm: _extractQuotedSearchTerm, UI_LABEL_BLOCKLIST: _
  */
 async function _buildGenericSearchUrl(serviceKey, baseHost, task) {
   try {
-    const q = _extractQuotedSearchTerm(task);
+    let q = _extractQuotedSearchTerm(task);
+    if (!q) {
+      // Unquoted "search my gmail for vidangel" phrasing — only fires when the
+      // task names the resolved service, so generic prose can't misfire.
+      const svc = String(serviceKey || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+      const hostLabel = String(baseHost || '').replace(/^www\./, '').split('.')[0];
+      q = _extractServiceSearchTerm(task, [svc, hostLabel]);
+    }
     if (!q) return null;
     // Guard: reject UI button labels as search queries (defense-in-depth —
     // _extractQuotedSearchTerm already filters these, but this ensures any
@@ -7569,6 +7576,10 @@ async function _resolveCheapDeepLink(agentId, serviceKey, baseStartUrl, task, ex
     const _getEncodedQuery = async (taskText, svcKey) => {
       const _sq = await _extractSearchQuery(taskText, svcKey);
       if (_sq.hasCriteria) return encodeURIComponent(_sq.query);
+      // Unquoted "search my <svc> for X" — prefer the service-gated extractor so
+      // the loose regex below can't bake "my gmail for …" into the query.
+      const _svcTerm = _extractServiceSearchTerm(taskText, [String(svcKey || '').toLowerCase().replace(/[^a-z0-9]/g, '')]);
+      if (_svcTerm) return encodeURIComponent(_svcTerm);
       const qMatch = taskText.match(/\b(?:search|find|look\s*up|google)\s+(?:for\s+)?(.+?)$/i);
       if (qMatch?.[1]) return encodeURIComponent(String(qMatch[1]).trim().replace(/[?.!]+$/g, ''));
       // "open existing" patterns: "titled X", "called X", "named X", "entitled X",

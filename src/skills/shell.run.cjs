@@ -1762,6 +1762,17 @@ async function shellRun(args) {
     });
   }
 
+  // ── Key-synthesis release — commands that synthesize OS-level keystrokes
+  // (osascript "System Events keystroke" / "key code") deliver to the macOS
+  // key window, which can be the ThinkDrop overlay panel. Ask the main process
+  // to resign overlay key focus first (no-op unless a task is in flight).
+  if (/\bkeystroke\b|\bkey code\b/i.test(resolvedCmdString)) {
+    try {
+      await require('./app.agent.cjs')._releaseOverlayKey?.();
+      logger.info('shell.run: key-synthesizing command — released overlay key focus', { cmd });
+    } catch (_) { /* non-fatal */ }
+  }
+
   const _runStep = () => runProcess(cmd, runArgv, {
     cwd,
     // OAuth vars are the lowest priority — explicit env arg and process.env override them

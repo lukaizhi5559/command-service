@@ -13,7 +13,7 @@
 
 'use strict';
 
-const { buildSiteSearchUrl, lookupSiteSearchTemplate, isListingTask, isSearchResultsUrl, isDeepItemUrl, extractQuotedSearchTerm } = require('../skill-helpers/site-search.cjs');
+const { buildSiteSearchUrl, lookupSiteSearchTemplate, isListingTask, isSearchResultsUrl, isDeepItemUrl, extractQuotedSearchTerm, extractServiceSearchTerm } = require('../skill-helpers/site-search.cjs');
 const { parseExtractedItems } = require('./extract-page-items.cjs');
 
 let _pass = 0;
@@ -62,6 +62,26 @@ async function main() {
   assert(lookupSiteSearchTemplate('smile.amazon.com') === 'https://www.amazon.com/s?k={query}', 'smile.amazon.com suffix match');
   assert(lookupSiteSearchTemplate('example.com') === null, 'example.com → null');
   assert(lookupSiteSearchTemplate('') === null, 'empty → null');
+  // Mail services — hash/deeplink search routes
+  assert(lookupSiteSearchTemplate('mail.google.com') === 'https://mail.google.com/mail/u/0/#search/{query}', 'mail.google.com template');
+  assert(lookupSiteSearchTemplate('outlook.live.com') === 'https://outlook.live.com/mail/0/deeplink/search?q={query}', 'outlook.live.com template');
+
+  console.log('\n── 2b. buildSiteSearchUrl — mail services ──');
+  const gmail = await buildSiteSearchUrl('mail.google.com', 'vidangel');
+  assert(gmail === 'https://mail.google.com/mail/u/0/#search/vidangel', `mail.google.com → ${gmail}`);
+  const gmailMulti = await buildSiteSearchUrl('mail.google.com', 'vidangel invoice');
+  assert(gmailMulti === 'https://mail.google.com/mail/u/0/#search/vidangel%20invoice', `mail.google.com multi-word → ${gmailMulti}`);
+
+  console.log('\n── 2c. extractServiceSearchTerm ──');
+  assert(extractServiceSearchTerm('search my gmail for vidangel emails', ['gmail', 'mail']) === 'vidangel', 'gmail: "vidangel emails" → "vidangel"');
+  assert(extractServiceSearchTerm('search gmail for vidangel', ['gmail']) === 'vidangel', 'gmail: "vidangel" → "vidangel"');
+  assert(extractServiceSearchTerm('check my gmail for appointment reminders', ['gmail']) === 'appointment reminders', 'gmail multi-word term');
+  assert(extractServiceSearchTerm('search my gmail for vidangel emails', ['amazon']) === null, 'service not named → null');
+  assert(extractServiceSearchTerm('search for hotels in paris', ['gmail']) === null, 'service absent → null');
+  assert(extractServiceSearchTerm('open my gmail', ['gmail']) === null, 'no "for" clause → null');
+  assert(extractServiceSearchTerm('search my mail for vidangel emails', ['gmail', 'mail']) === 'vidangel', 'host label "mail" matches');
+  assert(extractServiceSearchTerm('search my gmail for Sign In', ['gmail']) === null, 'UI label rejected');
+  assert(extractServiceSearchTerm('', ['gmail']) === null, 'empty task → null');
 
   console.log('\n── 3. isListingTask ──');
   assert(isListingTask('show pics of baby clothes for sale on amazon') === true, 'show pics of baby clothes');

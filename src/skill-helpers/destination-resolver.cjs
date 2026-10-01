@@ -1032,6 +1032,19 @@ function _hasSearchQueryParam(url) {
     if (u.search.length > 1 && /\/(s|search|search-results|results|find|sch)(\/|$)/i.test(u.pathname)) {
       return true;
     }
+    // Hash-fragment search URLs — SPA/hash-routed apps put the query in
+    // location.hash instead of ?params:
+    //   gmail:  mail.google.com/mail/u/0/#search/from%3Apastor+wendal
+    //   router: app.example.com/#/search?q=…, /#!/results/…, #?q=…
+    // These are query-baked exactly like ?q= URLs and must never be cached.
+    const h = u.hash || '';
+    if (h.length > 1) {
+      if (/^#\/?!?\/?(?:search|results|find|query|q|s)[\/=]/i.test(h)) return true;
+      const _kv = h.match(/[?&#]([a-z_][\w-]*)=/gi) || [];
+      for (const kv of _kv) {
+        if (_SEARCH_URL_PARAMS.has(kv.replace(/^[?&#]/, '').replace(/=$/, '').toLowerCase())) return true;
+      }
+    }
     return false;
   } catch (_) {
     return false;
@@ -1418,4 +1431,5 @@ module.exports = {
   isAuthFlowUrl,
   AUTH_FLOW_PATH_RE,
   _isValidDeepLinkUrl,
+  _hasSearchQueryParam,
 };

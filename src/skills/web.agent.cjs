@@ -221,7 +221,12 @@ function _scoreResult(result, preferDomain, opts = {}) {
     if (preferDomain) {
       const pref = preferDomain.toLowerCase().replace(/^www\./, '');
       if (host === pref || host.endsWith('.' + pref) || pref.endsWith('.' + host)) score += 40;
-      else if (host.includes(pref) || pref.includes(host.split('.')[0])) score += 20;
+      // Partial credit needs a real name overlap — 'bible' is only 42% of
+      // 'biblegateway', yet it scored bible.com +20 and beat the target site.
+      else if (host.includes(pref)
+               || (host.split('.')[0].length >= 5
+                   && host.split('.')[0].length >= Math.ceil(pref.length * 0.6)
+                   && pref.includes(host.split('.')[0]))) score += 20;
     }
     // Prefer reputable TLDs for dev/doc content
     if (host.endsWith('.org') || host.endsWith('.io') || host.endsWith('.dev')) score += 10;
