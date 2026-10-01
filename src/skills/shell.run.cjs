@@ -207,6 +207,23 @@ placeholder comments like "// rest of code". Use a quoted heredoc:
   ...full content...
   EOF
 
+Multi-repo git rules (CRITICAL — nested repos create gitlink damage):
+- When a directory tree contains nested git repos, NEVER run "git add -A" or
+  "git add ." in the outer repo — it stages each nested repo as a gitlink
+  (mode 160000) instead of committing its contents. Commit each repo separately:
+  cd into it, "git add -A" there, commit there.
+- Discover repos recursively with no shallow depth limit:
+  find BASE -name .git -type d -prune | while read d; do repo=$(dirname "$d"); ...; done
+  -maxdepth is NOT allowed for repo discovery (missed mcp-services/* once).
+- A repo with no changes must be skipped, not force-committed:
+  cd "$repo" && git status --porcelain | grep -q . || { echo "$repo: clean"; continue; }
+- Derive commit messages from the actual diff — "git diff --cached --stat" or
+  "--name-only" — never a placeholder like "Work in progress - automated commit".
+- Prefer a small for/while loop over a long pipeline; print one line per repo:
+  repo name, branch, commit hash, then "remaining:" + git status --short.
+- "commit my work" means COMMIT ONLY — never push to a remote unless the goal
+  explicitly says push.
+
 Platform: macOS. Home dir: ${os.homedir()}
 `;
 
@@ -375,6 +392,24 @@ function _looksTruncated(script) {
       return `unterminated heredoc (missing ${tag} delimiter)`;
     }
   }
+  // Dangling-tail check: a token-capped script often ends mid-operator or on
+  // a bare flag with no operand. `bash -n` accepts several of these (a
+  // trailing `|` or `\` continues to an empty next line; a bare `-` is just
+  // another find argument), so they can slip past syntax validation and fail
+  // confusingly at runtime (observed: `find "$BASE" -type d -` →
+  // "find: -: unknown primary or operator").
+  const tail = script.replace(/\s+$/, '');
+  if (/\\$/.test(tail)) return 'script ends with a line-continuation backslash';
+  if (/(&&|\|\||\||;)\s*$/.test(tail)) return 'script ends with a dangling operator';
+  if (/\b(do|then|elif|else)\s*$/.test(tail)) return 'script ends mid-construct (dangling do/then/else)';
+  // Bare trailing flag — only flags that REQUIRE an operand (find primaries
+  // like -type/-name) or a lone '-' mean a mid-token cut. Flags that take no
+  // operand (git status --short, ls -la) end scripts legitimately, so a
+  // generic "ends with a flag" check would false-positive on them.
+  if (/(?:^|\s)-{1,2}(type|name|iname|path|newer|perm|user|group|size|mtime|regex)\s*$/.test(tail)
+      || /(?:^|\s)-$/.test(tail)) {
+    return 'script ends with a flag that requires an operand';
+  }
   return null;
 }
 
@@ -399,11 +434,24 @@ async function _resolveGoalToCommand(goal, onProgress) {
       const response = await skillLlm.askWithMessages([
         { role: 'system', content: SHELL_RUN_SYSTEM },
         { role: 'user', content: userContent },
-      ], { maxTokens: _isWriteGoal ? (attempt === 1 ? 4096 : 8192) : 300, temperature: 0 });
+      ], { maxTokens: _isWriteGoal ? (attempt === 1 ? 4096 : 8192) : 1200, temperature: 0 });
       const raw = (response || '').trim();
       if (!raw) {
         lastErr = 'LLM returned empty response';
         syntaxFeedback = '';
+        continue;
+      }
+      // Truncation pre-check: parseLlmJson repairs cut-off JSON by closing open
+      // strings/braces, which turns a token-capped response into a "valid"
+      // {cmd,argv} containing a half-written script (observed: a 300-token cut
+      // produced `find "$BASE" -type d -` that passed bash -n then failed at
+      // runtime). A well-formed response ends in } or ] — anything else is a
+      // cut, so regenerate at a larger budget instead of trusting the repair.
+      const _rawStripped = raw.replace(/```(?:json)?\s*/gi, '').trim();
+      if (!/[\}\]]\s*$/.test(_rawStripped)) {
+        lastErr = 'LLM response was token-truncated (unterminated JSON) — retrying at a larger budget';
+        syntaxFeedback = 'Your previous response was cut off mid-JSON. Return a SHORTER, simpler command — prefer a compact one-liner over a long multi-line script.';
+        logger.warn(`[shell.run] ${lastErr}: tail=${_rawStripped.slice(-80)}`);
         continue;
       }
       const parsed = _parseGoalJson(raw);

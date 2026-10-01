@@ -53,6 +53,12 @@ const DEFAULT_MAX_FILE_SIZE = 100 * 1024; // 100KB
 const DEFAULT_MAX_FILES = 20;
 const DEFAULT_TAIL_LINES = 50;
 const MAX_OUTPUT_CHARS = 500 * 1024; // 500KB total output cap
+const MAX_TREE_LINES = 2000;         // tree output line cap (a big monorepo tree can be 10k+ lines)
+const MAX_TREE_CHARS = 96 * 1024;    // char cap too — line caps alone don't bound long paths
+const EXPLORE_FILE_CHARS = 24 * 1024; // per-file content cap inside explore results
+const EXPLORE_TOTAL_CHARS = 128 * 1024; // total content budget across all explored files —
+                                        // uncapped, explore hit 2MB once and the assistant-turn
+                                        // write was rejected (conversation-service ~100KB limit)
 
 const DEFAULT_EXCLUDES = [
   'node_modules',
@@ -266,13 +272,24 @@ function actionTree(resolvedPath, options) {
   const maxDepth = options.maxDepth || DEFAULT_MAX_DEPTH;
 
   const treeLines = buildTree(resolvedPath, { maxDepth, exclude });
-  const treeStr = resolvedPath + '/\n' + treeLines.join('\n');
+  let truncated = false;
+  if (treeLines.length > MAX_TREE_LINES) {
+    treeLines.length = MAX_TREE_LINES;
+    treeLines.push(`... (tree truncated at ${MAX_TREE_LINES} lines)`);
+    truncated = true;
+  }
+  let treeStr = resolvedPath + '/\n' + treeLines.join('\n');
+  if (treeStr.length > MAX_TREE_CHARS) {
+    treeStr = treeStr.slice(0, MAX_TREE_CHARS) + '\n… (tree truncated)';
+    truncated = true;
+  }
 
   return {
     ok: true,
     path: resolvedPath,
     tree: treeStr,
     lineCount: treeLines.length,
+    truncated,
   };
 }
 
@@ -436,6 +453,24 @@ function actionExplore(resolvedPath, options) {
 
   const readOptions = { maxFileSize, encoding: 'utf8' };
   let filesRead = 0;
+  let contentBytes = 0;
+
+  // Per-file and total content budgets — the serialized explore payload is
+  // embedded into step results and the conversation turn; uncapped it reached
+  // ~2MB once and got the history write rejected for size.
+  const pushFile = (bucket, name, result) => {
+    let content = result.content;
+    const remaining = EXPLORE_TOTAL_CHARS - contentBytes;
+    if (remaining <= 0) { summary.truncated = true; return false; }
+    if (content.length > Math.min(EXPLORE_FILE_CHARS, remaining)) {
+      content = content.slice(0, Math.min(EXPLORE_FILE_CHARS, remaining)) + '\n… (truncated)';
+      summary.truncated = true;
+    }
+    contentBytes += content.length;
+    bucket.push({ name, path: result.path || '', content, lines: result.lines, size: result.size });
+    filesRead++;
+    return true;
+  };
 
   // Step 2: Read key files (README, package.json, etc.)
   for (const keyFile of KEY_FILES_PRIORITY) {
@@ -444,14 +479,8 @@ function actionExplore(resolvedPath, options) {
     if (fs.existsSync(candidate)) {
       const result = readSingleFile(candidate, readOptions);
       if (result.ok) {
-        summary.keyFiles.push({
-          name: keyFile,
-          path: candidate,
-          content: result.content,
-          lines: result.lines,
-          size: result.size,
-        });
-        filesRead++;
+        result.path = candidate;
+        if (!pushFile(summary.keyFiles, keyFile, result)) break;
       }
     }
   }
@@ -466,14 +495,8 @@ function actionExplore(resolvedPath, options) {
       if (!alreadyRead) {
         const result = readSingleFile(candidate, readOptions);
         if (result.ok) {
-          summary.entryPoints.push({
-            name: entryPattern,
-            path: candidate,
-            content: result.content,
-            lines: result.lines,
-            size: result.size,
-          });
-          filesRead++;
+          result.path = candidate;
+          if (!pushFile(summary.entryPoints, entryPattern, result)) break;
         }
       }
     }
