@@ -86,6 +86,15 @@ const { projectStop } = require('./skills/project.stopper.cjs');
 const { cliAgent } = require('./skills/cli.agent.cjs');
 const { browserAgent } = require('./skills/browser.agent.cjs');
 const { playwrightAgent } = require('./skills/playwright.agent.cjs');
+const { urlFirstAgent } = require('./skills/url.first.agent.cjs');
+const { justTypeAgent } = require('./skills/just.type.agent.cjs');
+const { metaFindAgent } = require('./skills/meta.find.agent.cjs');
+const { shortcutKeysAgent } = require('./skills/shortcut.keys.agent.cjs');
+const { tabMapAgent } = require('./skills/tab.map.agent.cjs');
+const { gestureAgent } = require('./skills/gesture.agent.cjs');
+const { arrowGridAgent } = require('./skills/arrow.grid.agent.cjs');
+const { turnLoopAgent } = require('./skills/turn.loop.agent.cjs');
+const { domAct } = require('./skills/dom.act.cjs');
 const creatorAgent = require('./skills/creator.agent.cjs');
 const reviewerAgent = require('./skills/reviewer.agent.cjs');
 const skillCreator = require('./skills/skillCreator.skill.cjs');
@@ -166,6 +175,26 @@ class CommandServiceMCPServer {
 
       case 'playwright.agent':
         return await this._skillPlaywrightAgent(args, opts);
+
+      // ── Atomic browser agents (extracted tiers — deterministic, single-purpose)
+      case 'url.first.agent':
+        return await this._skillAtomic(urlFirstAgent, args, opts);
+      case 'just.type.agent':
+        return await this._skillAtomic(justTypeAgent, args, opts);
+      case 'meta.find.agent':
+        return await this._skillAtomic(metaFindAgent, args, opts);
+      case 'shortcut.keys.agent':
+        return await this._skillAtomic(shortcutKeysAgent, args, opts);
+      case 'tab.map.agent':
+        return await this._skillAtomic(tabMapAgent, args, opts);
+      case 'gesture.agent':
+        return await this._skillAtomic(gestureAgent, args, opts);
+      case 'arrow.grid.agent':
+        return await this._skillAtomic(arrowGridAgent, args, opts);
+      case 'turn.loop.agent':
+        return await this._skillAtomic(turnLoopAgent, args, opts);
+      case 'dom.act':
+        return await this._skillAtomic(domAct, args, opts);
 
       case 'creator.agent':
         return await this._skillCreatorAgent(args);
@@ -329,6 +358,13 @@ class CommandServiceMCPServer {
     return await playwrightAgent(args);
   }
 
+  // Shared dispatcher for the atomic browser agents — threads the AbortSignal
+  // through like the monoliths get, so cancellation works uniformly.
+  async _skillAtomic(fn, args, opts = {}) {
+    if (opts.signal) args = { ...args, _abortSignal: opts.signal };
+    return await fn(args);
+  }
+
   async _skillSystemIntrospect(args) {
     return await systemIntrospect(args);
   }
@@ -427,7 +463,7 @@ class CommandServiceMCPServer {
       success: true,
       service: this.serviceName,
       status: 'healthy',
-      skills: ['shell.run', 'browser.act', 'web.crawl', 'image.analyze', 'fs.read', 'edit.agent', 'doc.read', 'media.transcribe', 'file.watch', 'file.bridge', 'screen.capture', 'external.skill', 'cli.agent', 'browser.agent', 'playwright.agent', 'creator.agent', 'reviewer.agent', 'skillCreator.skill', 'project.builder', 'project.launcher', 'project.editor', 'project.stopper', 'app.agent', 'system.introspect', 'provider.discovery', 'user.agent', 'web.agent', 'video.agent', 'tool.discover']
+      skills: ['shell.run', 'browser.act', 'web.crawl', 'image.analyze', 'fs.read', 'edit.agent', 'doc.read', 'media.transcribe', 'file.watch', 'file.bridge', 'screen.capture', 'external.skill', 'cli.agent', 'browser.agent', 'playwright.agent', 'url.first.agent', 'just.type.agent', 'meta.find.agent', 'shortcut.keys.agent', 'tab.map.agent', 'gesture.agent', 'arrow.grid.agent', 'turn.loop.agent', 'dom.act', 'creator.agent', 'reviewer.agent', 'skillCreator.skill', 'project.builder', 'project.launcher', 'project.editor', 'project.stopper', 'app.agent', 'system.introspect', 'provider.discovery', 'user.agent', 'web.agent', 'video.agent', 'tool.discover']
     };
   }
 
@@ -546,7 +582,7 @@ class CommandServiceMCPServer {
         res.end(JSON.stringify({
           status: 'healthy',
           service: this.serviceName,
-          skills: ['shell.run', 'browser.act', 'web.crawl', 'image.analyze', 'fs.read', 'edit.agent', 'doc.read', 'media.transcribe', 'file.watch', 'file.bridge', 'screen.capture', 'external.skill', 'cli.agent', 'browser.agent', 'playwright.agent', 'creator.agent', 'reviewer.agent', 'skillCreator.skill', 'project.builder', 'project.launcher', 'project.editor', 'project.stopper', 'app.agent', 'system.introspect', 'provider.discovery', 'user.agent', 'web.agent', 'video.agent', 'tool.discover']
+          skills: ['shell.run', 'browser.act', 'web.crawl', 'image.analyze', 'fs.read', 'edit.agent', 'doc.read', 'media.transcribe', 'file.watch', 'file.bridge', 'screen.capture', 'external.skill', 'cli.agent', 'browser.agent', 'playwright.agent', 'url.first.agent', 'just.type.agent', 'meta.find.agent', 'shortcut.keys.agent', 'tab.map.agent', 'gesture.agent', 'arrow.grid.agent', 'turn.loop.agent', 'dom.act', 'creator.agent', 'reviewer.agent', 'skillCreator.skill', 'project.builder', 'project.launcher', 'project.editor', 'project.stopper', 'app.agent', 'system.introspect', 'provider.discovery', 'user.agent', 'web.agent', 'video.agent', 'tool.discover']
         }));
         return;
       }

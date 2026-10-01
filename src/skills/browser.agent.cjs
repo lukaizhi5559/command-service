@@ -14836,3 +14836,5 @@ module.exports._clearSubmitMarker = _clearSubmitMarker;
 module.exports._pageObservationText = _pageObservationText;
 module.exports._isPureSearchTask = _isPureSearchTask;
 module.exports._shouldSkipVideoDelegation = _shouldSkipVideoDelegation;
+module.exports._postProgress = _postProgress;
+module.exports._withSessionMutex = _withSessionMutex;

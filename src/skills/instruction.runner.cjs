@@ -7456,6 +7456,288 @@ function _isUrlFirstDone(goal, currentUrl) {
 
 // Tier 2: _selectTier → 0 (DONE), 1 (Just-type), 2 (Meta+F), 3 (Shortcuts), 4 (Tab-Map)
 // Tier 3: Strategy execution with fallback to Tab-Map
+// ---------------------------------------------------------------------------
+// Atomic-agent executors (extracted from the iterative loop's tier branches)
+// These run ONE bounded unit of work for a single tier and return a result
+// object — they never choose tiers, never loop on their own.
+// ---------------------------------------------------------------------------
+
+// Executes one Gesture step (tier 5): detect gesture type, resolve source/target
+// coordinates from Tab-Map (OCR fallback for drag targets), then drag via the
+// Playwright mouse API.
+// Returns { performed, tabMap, tabMapUrl, overlayKey } — performed=true only
+// when a drag actually executed. Callers own tier bookkeeping.
+async function _executeGestureStep({ sessionId, goal, focused, probe, actionHistory, tabMap = null, tabMapUrl = null, overlayActive = false, currentUrl = '' }) {
+  const { _extractGestureType, _extractGestureTargets } = require('./browser.agent.cjs');
+  const _out = { performed: false, tabMap, tabMapUrl, overlayKey: null };
+
+  const _gestureType = await _extractGestureType(goal, focused, actionHistory, { title: probe?.pageTitle, visibleText: probe?.visibleText });
+  if (_gestureType === 0) {
+    // Not a gesture task — nothing to do
+    logger.info(`[instruction.runner] Gesture: type=0 (no gesture needed) — skipping`);
+    return _out;
+  }
+
+  // Build Tab-Map if not cached (need it to pick source/target by number)
+  if (!_out.tabMap || _out.tabMapUrl !== currentUrl) {
+    logger.info(`[instruction.runner] Gesture: building Tab-Map for element selection`);
+    _out.tabMap = await buildTabMap(sessionId, 150, { skipReset: overlayActive });
+    _out.tabMapUrl = currentUrl;
+    _out.overlayKey = overlayActive ? await _overlayStateKey(sessionId) : null;
+  }
+
+  const _gestureTargets = await _extractGestureTargets(_gestureType, goal, _out.tabMap, actionHistory);
+  if (!_gestureTargets?.sourceEntry) {
+    logger.warn(`[instruction.runner] Gesture: no source element found in Tab-Map (type=${_gestureType})`);
+    _out.error = `No source element found in Tab-Map (type=${_gestureType})`;
+    return _out;
+  }
+
+  // Get coordinates from Tab-Map entry bounding boxes
+  const _src = _gestureTargets.sourceEntry;
+  let _srcX = _src.x + _src.w / 2;
+  let _srcY = _src.y + _src.h / 2;
+  let _tgtX, _tgtY;
+
+  if (_gestureType === 1 && _gestureTargets.targetEntry) {
+    // Drag-drop: target coordinates from Tab-Map entry
+    const _tgt = _gestureTargets.targetEntry;
+    _tgtX = _tgt.x + _tgt.w / 2;
+    _tgtY = _tgt.y + _tgt.h / 2;
+  } else if (_gestureType === 2) {
+    // Slider horizontal: offset from source X
+    _tgtX = _srcX + _gestureTargets.offset;
+    _tgtY = _srcY;
+  } else if (_gestureType === 3) {
+    // Slider vertical: offset from source Y
+    _tgtX = _srcX;
+    _tgtY = _srcY + _gestureTargets.offset;
+  } else if (_gestureType === 1 && !_gestureTargets.targetEntry) {
+    // Drag-drop but no target entry — try LiteParser OCR fallback
+    logger.info(`[instruction.runner] Gesture: no target in Tab-Map — trying LiteParser OCR fallback`);
+    try {
+      const { _liteparseCapture } = require('./browser.agent.cjs');
+      const _ocrPage = engine.getPage(sessionId);
+      if (_ocrPage) {
+        const _cap = await _liteparseCapture(_ocrPage);
+        if (_cap?.ok && _cap.textItems) {
+          // Look for target text near the bottom half of the page (drop zones)
+          const _scaleX = (_cap.imageWidth || 1280) / 1280;
+          const _scaleY = (_cap.imageHeight || 800) / 800;
+          // Find any text item that could be a drop target (heuristic: largest text item in lower half)
+          const _candidates = _cap.textItems
+            .filter(t => t.y > (_cap.imageHeight || 800) / 3)
+            .sort((a, b) => (b.width * b.height) - (a.width * a.height));
+          if (_candidates.length > 0) {
+            const _tgt = _candidates[0];
+            _tgtX = (_tgt.x + _tgt.width / 2) * _scaleX;
+            _tgtY = (_tgt.y + _tgt.height / 2) * _scaleY;
+            logger.info(`[instruction.runner] Gesture: OCR fallback found target "${_tgt.text}" at (${_tgtX},${_tgtY})`);
+          }
+        }
+      }
+    } catch (_ocrErr) {
+      logger.warn(`[instruction.runner] Gesture: OCR fallback failed: ${_ocrErr.message}`);
+    }
+  }
+
+  if (!_tgtX || !_tgtY) {
+    logger.warn(`[instruction.runner] Gesture: could not resolve target coordinates (type=${_gestureType})`);
+    _out.error = `Could not resolve target coordinates (type=${_gestureType})`;
+    return _out;
+  }
+
+  // Execute gesture via Playwright mouse API
+  const _gesturePage = engine.getPage(sessionId);
+  if (!_gesturePage) {
+    logger.warn(`[instruction.runner] Gesture: no engine page available`);
+    _out.error = 'No engine page available';
+    return _out;
+  }
+
+  const _typeLabel = _gestureType === 1 ? 'drag-drop' : _gestureType === 2 ? 'slider-h' : 'slider-v';
+  logger.info(`[instruction.runner] Gesture: type=${_typeLabel}, from (${Math.round(_srcX)},${Math.round(_srcY)}) to (${Math.round(_tgtX)},${Math.round(_tgtY)})`);
+  try {
+    await _gesturePage.mouse.move(_srcX, _srcY);
+    await _gesturePage.mouse.down();
+    // Move in steps for smooth drag (some apps need intermediate moves)
+    const _steps = 10;
+    for (let _s = 1; _s <= _steps; _s++) {
+      const _ix = _srcX + (_tgtX - _srcX) * (_s / _steps);
+      const _iy = _srcY + (_tgtY - _srcY) * (_s / _steps);
+      await _gesturePage.mouse.move(_ix, _iy);
+      await _sleep(20);
+    }
+    await _gesturePage.mouse.up();
+  } catch (_gestureErr) {
+    logger.warn(`[instruction.runner] Gesture: mouse API failed: ${_gestureErr.message}`);
+    _out.error = `Mouse API failed: ${_gestureErr.message}`;
+    return _out;
+  }
+  await _sleep(500);
+
+  actionHistory.push(`Gesture: type=${_typeLabel}, from (${Math.round(_srcX)},${Math.round(_srcY)}) to (${Math.round(_tgtX)},${Math.round(_tgtY)})`);
+  await _sleep(1500);
+  _out.performed = true;
+  return _out;
+}
+
+// Executes one ArrowGrid step (tier 6): focus/navigate to the next spreadsheet
+// target cell and type its value. Handles "too far → Name Box" and
+// "no cell focused → focus A1" internally.
+// Returns { markTried, typedOk, resetDoneFails, flowIndexAdvance } — caller owns
+// tier bookkeeping (triedTiers / _doneVerifyFails / _flowIndex).
+async function _executeArrowGridStep({ sessionId, goal, actionHistory, pageCategory, tabFlow = null, flowIndex = 0 }) {
+  const _out = { markTried: false, typedOk: false, resetDoneFails: false, flowIndexAdvance: 0 };
+
+  // Hard guard: never run on non-spreadsheet pages.
+  if (pageCategory !== 'spreadsheet') {
+    logger.warn(`[instruction.runner] ArrowGrid selected on non-spreadsheet page (category=${pageCategory}) — skipping`);
+    _out.markTried = true;
+    _out.error = `Not a spreadsheet page (category=${pageCategory})`;
+    return _out;
+  }
+  // 1. Get current cell from DOM
+  const _currentCell = await _getCurrentCell(sessionId);
+  if (!_currentCell) {
+    // No cell focused — focus A1 via Name Box (Meta+J) and let caller re-enter.
+    logger.info(`[instruction.runner] ArrowGrid: no grid cell focused — focusing A1 via Name Box`);
+    const _focusResult = await _focusSpreadsheetCell(sessionId, 'A1');
+    if (_focusResult?.ok && tabFlow && flowIndex < tabFlow.length && tabFlow[flowIndex].tier === 3) {
+      _out.flowIndexAdvance = 1;
+      logger.info(`[instruction.runner] Tab-Flow: focus step done by ArrowGrid`);
+    }
+    await _sleep(500);
+    return _out;
+  }
+
+  // 2. Get targets from goal
+  const { _extractSpreadsheetTargets } = require('./browser.agent.cjs');
+  const _targets = await _extractSpreadsheetTargets(goal, actionHistory);
+  if (_targets.length === 0) {
+    logger.info(`[instruction.runner] ArrowGrid: no more targets`);
+    _out.markTried = true;
+    return _out;
+  }
+
+  // 3. Find next untyped target
+  const _nextTarget = _targets[0];
+  logger.info(`[instruction.runner] ArrowGrid: current=${_currentCell}, target=${_nextTarget.cell}="${_nextTarget.value.slice(0, 30)}"`);
+
+  // 4. Navigate to target cell if not already there
+  if (_currentCell.toUpperCase() !== _nextTarget.cell.toUpperCase()) {
+    const _arrowMoves = _calculateArrowMoves(_currentCell, _nextTarget.cell);
+    if (_arrowMoves === null) {
+      // Too far — focus the target cell directly via Name Box (Meta+J).
+      logger.info(`[instruction.runner] ArrowGrid: ${_currentCell}→${_nextTarget.cell} too far (>3 moves) — focusing target via Name Box`);
+      const _focusResult = await _focusSpreadsheetCell(sessionId, _nextTarget.cell);
+      if (_focusResult?.ok && tabFlow && flowIndex < tabFlow.length && tabFlow[flowIndex].tier === 3) {
+        _out.flowIndexAdvance = 1;
+        logger.info(`[instruction.runner] Tab-Flow: focus step done by ArrowGrid`);
+      }
+      await _sleep(500);
+      return _out;
+    }
+    // Press arrow keys
+    if (_arrowMoves.length > 0) {
+      for (const _key of _arrowMoves) {
+        await browserAct({ action: 'press', sessionId, key: _key, headed: true, timeoutMs: 3000 });
+        await _sleep(200);
+      }
+      await _sleep(300);
+      // Verify we're at the target cell
+      const _verifyCell = await _getCurrentCell(sessionId);
+      if (_verifyCell && _verifyCell.toUpperCase() === _nextTarget.cell.toUpperCase()) {
+        logger.info(`[instruction.runner] ArrowGrid: navigated ${_currentCell}→${_nextTarget.cell} via ${_arrowMoves.join('+')}`);
+      } else {
+        logger.warn(`[instruction.runner] ArrowGrid: expected ${_nextTarget.cell} but at ${_verifyCell || 'unknown'} — typing anyway`);
+      }
+    }
+  }
+
+  // 5. Type the value into the focused cell.
+  //    Google Sheets grid cells are contenteditable divs — direct type
+  //    sometimes fails verification. Use reactFill on the active element
+  //    via data-td-ref injection, falling back to plain type.
+  const _gridPage = engine.getPage(sessionId);
+  let _typedOk = false;
+  if (_gridPage) {
+    try {
+      // Inject data-td-ref on the active element for reactFill
+      const _ref = await _gridPage.evaluate(() => {
+        const el = document.activeElement;
+        if (!el || el === document.body) return null;
+        let r = el.getAttribute('data-td-ref');
+        if (!r || !r.startsWith('tm-')) {
+          r = 'tm-' + Math.random().toString(36).slice(2, 10);
+          el.setAttribute('data-td-ref', r);
+        }
+        return r;
+      });
+      if (_ref) {
+        const _fillResult = await browserAct({
+          action: 'reactFill', sessionId, selector: `[data-td-ref="${_ref}"]`,
+          text: _nextTarget.value, headed: true, timeoutMs: 5000,
+        });
+        _typedOk = _fillResult?.ok;
+        if (!_typedOk) {
+          logger.warn(`[instruction.runner] ArrowGrid: reactFill failed (${_fillResult?.error}) — trying plain type`);
+        }
+      }
+    } catch (_fillErr) {
+      logger.warn(`[instruction.runner] ArrowGrid: reactFill error: ${_fillErr.message}`);
+    }
+  }
+  if (!_typedOk) {
+    // Fallback: plain type into the focused element
+    const _typeResult = await browserAct({
+      action: 'type', sessionId, text: _nextTarget.value, headed: true, timeoutMs: 5000,
+    });
+    _typedOk = _typeResult?.ok;
+  }
+
+  if (_typedOk) {
+    await _sleep(200);
+    // Commit the cell value. Google Sheets requires Enter or Tab to confirm.
+    // After committing, navigate to the next target cell if there is one:
+    // - If the next target is in the next column (e.g. A1→B1), press Tab
+    //   (moves right and commits in one keystroke).
+    // - If the next target is in the next row (e.g. A1→A2), press Enter
+    //   (moves down and commits).
+    // - If no next target or navigation is complex, just press Enter to
+    //   commit and let the next iteration handle navigation.
+    const _nextNextTarget = _targets[1];
+    let _commitKey = 'Enter';
+    if (_nextNextTarget) {
+      const _navMoves = _calculateArrowMoves(_nextTarget.cell, _nextNextTarget.cell);
+      if (_navMoves && _navMoves.length === 1) {
+        if (_navMoves[0] === 'ArrowRight') {
+          _commitKey = 'Tab'; // Tab commits + moves right in Google Sheets
+        } else if (_navMoves[0] === 'ArrowDown') {
+          _commitKey = 'Enter'; // Enter commits + moves down
+        }
+      }
+    }
+    await browserAct({ action: 'press', sessionId, key: _commitKey, headed: true, timeoutMs: 3000 });
+    await _sleep(200);
+    actionHistory.push(`ArrowGrid: typed "${_nextTarget.value.slice(0, 40)}" into cell ${_nextTarget.cell} (commit: ${_commitKey})`);
+    logger.info(`[instruction.runner] ArrowGrid: typed "${_nextTarget.value.slice(0, 40)}" into cell ${_nextTarget.cell} (commit: ${_commitKey})`);
+    _out.typedOk = true;
+    _out.markTried = true;
+    // Tab-Flow: advance flow index on successful ArrowGrid
+    if (tabFlow && flowIndex < tabFlow.length && tabFlow[flowIndex].tier === 6) {
+      _out.flowIndexAdvance = 1;
+      logger.info(`[instruction.runner] Tab-Flow: ArrowGrid done`);
+    }
+  } else {
+    actionHistory.push(`ArrowGrid: FAILED to type "${_nextTarget.value.slice(0, 40)}" into cell ${_nextTarget.cell}`);
+    logger.warn(`[instruction.runner] ArrowGrid: type failed — will retry on next iteration`);
+  }
+
+  _out.resetDoneFails = true;
+  return _out;
+}
+
 async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, pageCategory, agentContext, shortcutCount = 0, shortcutLabels = '', timeoutMs = 120000, progressCallbackUrl = null, stepIndex = 0, agentId = '', stepType = null, taskClassification = null }) {
   if (!sessionId) return { ok: false, error: 'No sessionId provided' };
   let _pageCategory = pageCategory || 'web_generic';
@@ -9555,301 +9837,38 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
     }
 
     if (strategy === 5) {
-      // Gesture — drag-drop, sliders, spatial interactions using mouse coordinates
-      // Uses 2 number-returning LLM calls (reliable with light models):
-      //   1. _extractGestureType → 0-3 (gesture type)
-      //   2. _extractGestureTargets → source/target element numbers from Tab-Map
-      // Coordinates come from Tab-Map entries (x,y,w,h bounding boxes).
-      // LiteParser OCR is fallback only when Tab-Map can't find the element.
-      const { _extractGestureType, _extractGestureTargets } = require('./browser.agent.cjs');
-      const _gestureType = await _extractGestureType(goal, focused, actionHistory, { title: _probe.pageTitle, visibleText: _probe.visibleText });
-      if (_gestureType === 0) {
-        // Not a gesture task — mark tier tried and continue
-        logger.info(`[instruction.runner] Gesture: type=0 (no gesture needed) — skipping`);
-        _triedTiers.add(5);
-        prevUrl = currentUrl;
-        continue;
-      }
-
-      // Build Tab-Map if not cached (need it to pick source/target by number)
-      if (!_cachedTabMap || _cachedTabMapUrl !== currentUrl) {
-        logger.info(`[instruction.runner] Gesture: building Tab-Map for element selection`);
-        _cachedTabMap = await buildTabMap(sessionId, 150, { skipReset: overlayActive });
-        _cachedTabMapUrl = currentUrl;
+      // Gesture — drag-drop, sliders, spatial interactions using mouse coordinates.
+      // Extracted executor: _executeGestureStep owns detection/coords/mouse API.
+      const _gRes = await _executeGestureStep({
+        sessionId, goal, focused, probe: _probe, actionHistory,
+        tabMap: _cachedTabMap, tabMapUrl: _cachedTabMapUrl,
+        overlayActive, currentUrl,
+      });
+      if (_gRes.tabMap) {
+        _cachedTabMap = _gRes.tabMap;
+        _cachedTabMapUrl = _gRes.tabMapUrl;
         _cachedTabMapOverlayActive = overlayActive;
-        _cachedTabMapOverlayKey = overlayActive ? await _overlayStateKey(sessionId) : null;
+        if (_gRes.overlayKey) _cachedTabMapOverlayKey = _gRes.overlayKey;
       }
-
-      const _gestureTargets = await _extractGestureTargets(_gestureType, goal, _cachedTabMap, actionHistory);
-      if (!_gestureTargets?.sourceEntry) {
-        logger.warn(`[instruction.runner] Gesture: no source element found in Tab-Map (type=${_gestureType}) — marking tier tried`);
-        _triedTiers.add(5);
-        prevUrl = currentUrl;
-        continue;
-      }
-
-      // Get coordinates from Tab-Map entry bounding boxes
-      const _src = _gestureTargets.sourceEntry;
-      let _srcX = _src.x + _src.w / 2;
-      let _srcY = _src.y + _src.h / 2;
-      let _tgtX, _tgtY;
-
-      if (_gestureType === 1 && _gestureTargets.targetEntry) {
-        // Drag-drop: target coordinates from Tab-Map entry
-        const _tgt = _gestureTargets.targetEntry;
-        _tgtX = _tgt.x + _tgt.w / 2;
-        _tgtY = _tgt.y + _tgt.h / 2;
-      } else if (_gestureType === 2) {
-        // Slider horizontal: offset from source X
-        _tgtX = _srcX + _gestureTargets.offset;
-        _tgtY = _srcY;
-      } else if (_gestureType === 3) {
-        // Slider vertical: offset from source Y
-        _tgtX = _srcX;
-        _tgtY = _srcY + _gestureTargets.offset;
-      } else if (_gestureType === 1 && !_gestureTargets.targetEntry) {
-        // Drag-drop but no target entry — try LiteParser OCR fallback
-        logger.info(`[instruction.runner] Gesture: no target in Tab-Map — trying LiteParser OCR fallback`);
-        try {
-          const { _liteparseCapture } = require('./browser.agent.cjs');
-          const _ocrPage = engine.getPage(sessionId);
-          if (_ocrPage) {
-            const _cap = await _liteparseCapture(_ocrPage);
-            if (_cap?.ok && _cap.textItems) {
-              // Look for target text near the bottom half of the page (drop zones)
-              const _scaleX = (_cap.imageWidth || 1280) / 1280;
-              const _scaleY = (_cap.imageHeight || 800) / 800;
-              // Find any text item that could be a drop target (heuristic: largest text item in lower half)
-              const _candidates = _cap.textItems
-                .filter(t => t.y > (_cap.imageHeight || 800) / 3)
-                .sort((a, b) => (b.width * b.height) - (a.width * a.height));
-              if (_candidates.length > 0) {
-                const _tgt = _candidates[0];
-                _tgtX = (_tgt.x + _tgt.width / 2) * _scaleX;
-                _tgtY = (_tgt.y + _tgt.height / 2) * _scaleY;
-                logger.info(`[instruction.runner] Gesture: OCR fallback found target "${_tgt.text}" at (${_tgtX},${_tgtY})`);
-              }
-            }
-          }
-        } catch (_ocrErr) {
-          logger.warn(`[instruction.runner] Gesture: OCR fallback failed: ${_ocrErr.message}`);
-        }
-      }
-
-      if (!_tgtX || !_tgtY) {
-        logger.warn(`[instruction.runner] Gesture: could not resolve target coordinates (type=${_gestureType})`);
-        _triedTiers.add(5);
-        prevUrl = currentUrl;
-        continue;
-      }
-
-      // Execute gesture via Playwright mouse API
-      const _gesturePage = engine.getPage(sessionId);
-      if (!_gesturePage) {
-        logger.warn(`[instruction.runner] Gesture: no engine page available`);
-        _triedTiers.add(5);
-        prevUrl = currentUrl;
-        continue;
-      }
-
-      const _typeLabel = _gestureType === 1 ? 'drag-drop' : _gestureType === 2 ? 'slider-h' : 'slider-v';
-      logger.info(`[instruction.runner] Gesture: type=${_typeLabel}, from (${Math.round(_srcX)},${Math.round(_srcY)}) to (${Math.round(_tgtX)},${Math.round(_tgtY)})`);
-      try {
-        await _gesturePage.mouse.move(_srcX, _srcY);
-        await _gesturePage.mouse.down();
-        // Move in steps for smooth drag (some apps need intermediate moves)
-        const _steps = 10;
-        for (let _s = 1; _s <= _steps; _s++) {
-          const _ix = _srcX + (_tgtX - _srcX) * (_s / _steps);
-          const _iy = _srcY + (_tgtY - _srcY) * (_s / _steps);
-          await _gesturePage.mouse.move(_ix, _iy);
-          await _sleep(20);
-        }
-        await _gesturePage.mouse.up();
-      } catch (_gestureErr) {
-        logger.warn(`[instruction.runner] Gesture: mouse API failed: ${_gestureErr.message}`);
-        _triedTiers.add(5);
-        prevUrl = currentUrl;
-        continue;
-      }
-      await _sleep(500);
-
-      actionHistory.push(`Gesture: type=${_typeLabel}, from (${Math.round(_srcX)},${Math.round(_srcY)}) to (${Math.round(_tgtX)},${Math.round(_tgtY)})`);
+      if (_gRes.performed) _doneVerifyFails = 0;
       _triedTiers.add(5);
-      _doneVerifyFails = 0;
-      await _sleep(1500);
+      prevUrl = currentUrl;
       continue;
     }
 
     if (strategy === 6) {
       // ArrowGrid — spreadsheet cell navigation using arrow keys.
-      // Hard guard: never run on non-spreadsheet pages, even if the tier was
-      // somehow selected (e.g. misclassified category or a stale flow step).
-      if (_pageCategory !== 'spreadsheet') {
-        logger.warn(`[instruction.runner] ArrowGrid selected on non-spreadsheet page (category=${_pageCategory}) — marking tier tried and re-selecting`);
-        _triedTiers.add(6);
-        continue;
+      // Extracted executor: _executeArrowGridStep owns cell nav + typing.
+      const _agRes = await _executeArrowGridStep({
+        sessionId, goal, actionHistory,
+        pageCategory: _pageCategory, tabFlow: _tabFlow, flowIndex: _flowIndex,
+      });
+      if (_agRes.markTried) _triedTiers.add(6);
+      if (_agRes.flowIndexAdvance) {
+        _flowIndex += _agRes.flowIndexAdvance;
+        logger.info(`[instruction.runner] Tab-Flow: ArrowGrid advanced flow to step ${_flowIndex}`);
       }
-      // 1. Get current cell from DOM
-      const _currentCell = await _getCurrentCell(sessionId);
-      if (!_currentCell) {
-        // No cell focused — focus A1 via Name Box (Meta+J) and re-enter ArrowGrid.
-        // Previously this just logged "deferring to Shortcuts" and continued
-        // without actually focusing a cell, causing an infinite loop.
-        logger.info(`[instruction.runner] ArrowGrid: no grid cell focused — focusing A1 via Name Box`);
-        const _focusResult = await _focusSpreadsheetCell(sessionId, 'A1');
-        // If the Tab-Flow's current step is tier 3 (a focus/navigation step),
-        // ArrowGrid has now fulfilled it — advance the flow index so the next
-        // iteration moves to the typing step (tier 6).
-        if (_focusResult?.ok && _tabFlow && _flowIndex < _tabFlow.length && _tabFlow[_flowIndex].tier === 3) {
-          _flowIndex++;
-          logger.info(`[instruction.runner] Tab-Flow: focus step done by ArrowGrid — advancing to step ${_flowIndex}`);
-        }
-        await _sleep(500);
-        prevUrl = currentUrl;
-        continue;
-      }
-
-      // 2. Get targets from goal
-      const { _extractSpreadsheetTargets } = require('./browser.agent.cjs');
-      const _targets = await _extractSpreadsheetTargets(goal, actionHistory);
-      if (_targets.length === 0) {
-        logger.info(`[instruction.runner] ArrowGrid: no more targets — checking DONE`);
-        // Mark tried so we don't infinite-loop on "no targets"
-        _triedTiers.add(6);
-        prevUrl = currentUrl;
-        continue;
-      }
-
-      // 3. Find next untyped target
-      const _nextTarget = _targets[0];
-      logger.info(`[instruction.runner] ArrowGrid: current=${_currentCell}, target=${_nextTarget.cell}="${_nextTarget.value.slice(0, 30)}"`);
-
-      // 4. Navigate to target cell if not already there
-      if (_currentCell.toUpperCase() !== _nextTarget.cell.toUpperCase()) {
-        const _arrowMoves = _calculateArrowMoves(_currentCell, _nextTarget.cell);
-        if (_arrowMoves === null) {
-          // Too far — focus the target cell directly via Name Box (Meta+J).
-          // Previously this just logged "deferring to Shortcuts" and continued
-          // without actually focusing the target, causing an infinite loop.
-          logger.info(`[instruction.runner] ArrowGrid: ${_currentCell}→${_nextTarget.cell} too far (>3 moves) — focusing target via Name Box`);
-          const _focusResult = await _focusSpreadsheetCell(sessionId, _nextTarget.cell);
-          // If the Tab-Flow's current step is tier 3, ArrowGrid has fulfilled it.
-          if (_focusResult?.ok && _tabFlow && _flowIndex < _tabFlow.length && _tabFlow[_flowIndex].tier === 3) {
-            _flowIndex++;
-            logger.info(`[instruction.runner] Tab-Flow: focus step done by ArrowGrid — advancing to step ${_flowIndex}`);
-          }
-          await _sleep(500);
-          prevUrl = currentUrl;
-          continue;
-        }
-        // Press arrow keys
-        if (_arrowMoves.length > 0) {
-          for (const _key of _arrowMoves) {
-            await browserAct({ action: 'press', sessionId, key: _key, headed: true, timeoutMs: 3000 });
-            await _sleep(200);
-          }
-          await _sleep(300);
-          // Verify we're at the target cell
-          const _verifyCell = await _getCurrentCell(sessionId);
-          if (_verifyCell && _verifyCell.toUpperCase() === _nextTarget.cell.toUpperCase()) {
-            logger.info(`[instruction.runner] ArrowGrid: navigated ${_currentCell}→${_nextTarget.cell} via ${_arrowMoves.join('+')}`);
-          } else {
-            logger.warn(`[instruction.runner] ArrowGrid: expected ${_nextTarget.cell} but at ${_verifyCell || 'unknown'} — typing anyway`);
-          }
-        }
-      }
-
-      // 5. Type the value into the focused cell.
-      //    Google Sheets grid cells are contenteditable divs — direct type
-      //    sometimes fails verification. Use reactFill on the active element
-      //    via data-td-ref injection, falling back to plain type.
-      const _gridPage = engine.getPage(sessionId);
-      let _typedOk = false;
-      if (_gridPage) {
-        try {
-          // Inject data-td-ref on the active element for reactFill
-          const _ref = await _gridPage.evaluate(() => {
-            const el = document.activeElement;
-            if (!el || el === document.body) return null;
-            let r = el.getAttribute('data-td-ref');
-            if (!r || !r.startsWith('tm-')) {
-              r = 'tm-' + Math.random().toString(36).slice(2, 10);
-              el.setAttribute('data-td-ref', r);
-            }
-            return r;
-          });
-          if (_ref) {
-            const _fillResult = await browserAct({
-              action: 'reactFill', sessionId, selector: `[data-td-ref="${_ref}"]`,
-              text: _nextTarget.value, headed: true, timeoutMs: 5000,
-            });
-            _typedOk = _fillResult?.ok;
-            if (!_typedOk) {
-              logger.warn(`[instruction.runner] ArrowGrid: reactFill failed (${_fillResult?.error}) — trying plain type`);
-            }
-          }
-        } catch (_fillErr) {
-          logger.warn(`[instruction.runner] ArrowGrid: reactFill error: ${_fillErr.message}`);
-        }
-      }
-      if (!_typedOk) {
-        // Fallback: plain type into the focused element
-        const _typeResult = await browserAct({
-          action: 'type', sessionId, text: _nextTarget.value, headed: true, timeoutMs: 5000,
-        });
-        _typedOk = _typeResult?.ok;
-      }
-
-      if (_typedOk) {
-        await _sleep(200);
-        // Commit the cell value. Google Sheets requires Enter or Tab to confirm.
-        // After committing, navigate to the next target cell if there is one:
-        // - If the next target is in the next column (e.g. A1→B1), press Tab
-        //   (moves right and commits in one keystroke).
-        // - If the next target is in the next row (e.g. A1→A2), press Enter
-        //   (moves down and commits).
-        // - If no next target or navigation is complex, just press Enter to
-        //   commit and let the next iteration handle navigation.
-        const _nextNextTarget = _targets[1];
-        let _commitKey = 'Enter';
-        if (_nextNextTarget) {
-          const _navMoves = _calculateArrowMoves(_nextTarget.cell, _nextNextTarget.cell);
-          if (_navMoves && _navMoves.length === 1) {
-            if (_navMoves[0] === 'ArrowRight') {
-              _commitKey = 'Tab'; // Tab commits + moves right in Google Sheets
-            } else if (_navMoves[0] === 'ArrowDown') {
-              _commitKey = 'Enter'; // Enter commits + moves down
-            }
-          }
-        }
-        await browserAct({ action: 'press', sessionId, key: _commitKey, headed: true, timeoutMs: 3000 });
-        await _sleep(200);
-        actionHistory.push(`ArrowGrid: typed "${_nextTarget.value.slice(0, 40)}" into cell ${_nextTarget.cell} (commit: ${_commitKey})`);
-        logger.info(`[instruction.runner] ArrowGrid: typed "${_nextTarget.value.slice(0, 40)}" into cell ${_nextTarget.cell} (commit: ${_commitKey})`);
-        // Tab-Flow: advance flow index on successful ArrowGrid
-        if (_tabFlow && _flowIndex < _tabFlow.length && _tabFlow[_flowIndex].tier === 6) {
-          _flowIndex++;
-          logger.info(`[instruction.runner] Tab-Flow: ArrowGrid done — advancing to step ${_flowIndex}`);
-        }
-      } else {
-        actionHistory.push(`ArrowGrid: FAILED to type "${_nextTarget.value.slice(0, 40)}" into cell ${_nextTarget.cell}`);
-        logger.warn(`[instruction.runner] ArrowGrid: type failed — will retry on next iteration`);
-      }
-
-      // Mark tier 6 tried for THIS iteration only — it will be re-added to
-      // available tiers on the next loop iteration (triedTiers resets).
-      // Actually _triedTiers does NOT reset automatically — it accumulates.
-      // So we must NOT add 6 here if we want ArrowGrid to be re-selected.
-      // Only add to triedTiers if we successfully typed (to avoid infinite loop
-      // if the state pattern keeps returning 6 but there are no targets).
-      // The state pattern returns 6 when cell is focused — if we typed successfully,
-      // the next call will get the next target. If we failed, we want to retry.
-      // So: only mark tried if we typed OK (to let other tiers verify/done-check).
-      if (_typedOk) {
-        _triedTiers.add(6);
-      }
-      _doneVerifyFails = 0;
+      if (_agRes.resetDoneFails) _doneVerifyFails = 0;
       prevUrl = currentUrl;
       continue;
     }
@@ -9906,4 +9925,17 @@ module.exports = {
   // Exported for testing (prose-rejection + ArrowGrid category guard)
   _checkDone,
   _selectTierLLM,
+  // Exported for atomic agents (skills/*.agent.cjs) — single-tier executors
+  _probePageStructure,
+  buildTabMap,
+  pageSearch,
+  _detectOverlay,
+  _overlayStateKey,
+  _clickFirstFillable,
+  _focusSpreadsheetCell,
+  _getCurrentCell,
+  _calculateArrowMoves,
+  _executeShortcut,
+  _executeGestureStep,
+  _executeArrowGridStep,
 };
