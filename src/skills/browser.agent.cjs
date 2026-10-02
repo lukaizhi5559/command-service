@@ -4164,7 +4164,7 @@ function _postProgress(callbackUrl, evt) {
 
 const { userAgent } = require('./user.agent.cjs');
 
-const { resolveDestination, recordCorrection, classifyTaskIntent, classifyUrlType, getLearnedCorrection, deleteLearnedCorrection, suggestTaskUrl, _isOnPageAction, getTaskKeywords, getCachedDeepLink, recordDeepLinkCache, deleteDeepLinkCache, getSearchUrlPattern, recordSearchUrlPattern, INTENTS, SERVICE_CHAT_URLS, isAuthFlowUrl, _isValidDeepLinkUrl } = require('../skill-helpers/destination-resolver.cjs');
+const { resolveDestination, recordCorrection, classifyTaskIntent, classifyUrlType, getLearnedCorrection, deleteLearnedCorrection, suggestTaskUrl, _isOnPageAction, getTaskKeywords, getCachedDeepLink, recordDeepLinkCache, deleteDeepLinkCache, getSearchUrlPattern, recordSearchUrlPattern, INTENTS, SERVICE_CHAT_URLS, isAuthFlowUrl, _isValidDeepLinkUrl, _isGenericLandingUrl } = require('../skill-helpers/destination-resolver.cjs');
 const { killExistingChromeForProfile, clearProfileLock, findCli, shortSessionId, _sniffAuthCookies, engine: browserEngine, _parseCliResult } = require('./browser.act.cjs');
 const { loadAppKnowledge, saveAppKnowledge, loadAndFormat, isCacheStale, isShortcutCoverageStale, recordVerification } = require('./lib/appKnowledge.cjs');
 const { parseLlmJson } = require('../skill-helpers/parseLlmJson.cjs');
@@ -8167,13 +8167,20 @@ async function _resolveTaskDeepLink(agentId, serviceKey, baseStartUrl, task, exi
     // hostname+intent will hit the appKnowledge check (Step -1) and skip
     // the LLM classification + discovery pipeline entirely.
     if (candidate && intent && intent !== INTENTS.HOME && baseHost && !_isCriteriaTask) {
-      setImmediate(() => {
-        try {
-          const { saveIntentUrl } = require('./lib/appKnowledge.cjs');
-          saveIntentUrl(baseHost, intent, candidate);
-          logger.info(`[browser.agent] deep-link: cached intent_url ${intent} → ${candidate} in appKnowledge for ${baseHost}`);
-        } catch (_) {}
-      });
+      // Same guard recordDeepLinkCache applies: generic landing URLs (bare
+      // root like sheets.new/, inbox, dashboard) must not overwrite an
+      // existing verified intent_url — a weaker candidate evicts the good one.
+      if (_isGenericLandingUrl(candidate, serviceKey)) {
+        logger.info(`[browser.agent] deep-link: skipping intent_url cache for generic-landing URL ${candidate} (${baseHost}/${intent})`);
+      } else {
+        setImmediate(() => {
+          try {
+            const { saveIntentUrl } = require('./lib/appKnowledge.cjs');
+            saveIntentUrl(baseHost, intent, candidate);
+            logger.info(`[browser.agent] deep-link: cached intent_url ${intent} → ${candidate} in appKnowledge for ${baseHost}`);
+          } catch (_) {}
+        });
+      }
     }
 
     // Part C: For criteria tasks, if the discovered candidate is a search URL (has a
@@ -8278,14 +8285,18 @@ function _isSigninWall(href) {
   return false;
 }
 
-// ── Record agent usage for 24h preflight bypass ────────────────────────────
-// Writes { lastUsed: Date.now(), authed: true } to the persistent auth cache
-// (~/.thinkdrop/preflight-auth-cache.json) so preflightAgents.js can skip the
-// auth probe entirely for agents used within the last 24 hours.
+// ── Record agent usage / auth failure in the preflight auth ledger ──────────
+// Writes to ~/.thinkdrop/preflight-auth-cache.json (the authentication ledger
+// preflightAgents.js reads). authed:true is trusted permanently — no TTL —
+// until a login-wall observation writes authed:false + lastAuthFailedAt.
 // Uses the same file format as preflightAgents.js _savePersistentAuthCache.
-function _recordAgentUsage(agentId) {
+function _preflightAuthCachePath() {
+  return process.env.THINKDROP_PREFLIGHT_AUTH_CACHE
+    || path.join(os.homedir(), '.thinkdrop', 'preflight-auth-cache.json');
+}
+function _writePreflightAuthCache(agentId, patch) {
   try {
-    const _preflightCachePath = path.join(os.homedir(), '.thinkdrop', 'preflight-auth-cache.json');
+    const _preflightCachePath = _preflightAuthCachePath();
     let cache = {};
     try {
       if (fs.existsSync(_preflightCachePath)) {
@@ -8294,13 +8305,27 @@ function _recordAgentUsage(agentId) {
     } catch (_) { cache = {}; }
     const key = (agentId || '').toLowerCase();
     const existing = cache[key] || {};
-    cache[key] = { ...existing, lastUsed: Date.now(), authed: true };
+    cache[key] = { ...existing, ...patch };
     const dir = path.dirname(_preflightCachePath);
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
     const tmpFile = `${_preflightCachePath}.tmp`;
     fs.writeFileSync(tmpFile, JSON.stringify(cache, null, 2), 'utf8');
     fs.renameSync(tmpFile, _preflightCachePath);
-  } catch (_) { /* non-fatal — usage tracking is best-effort */ }
+  } catch (_) { /* non-fatal — ledger writes are best-effort */ }
+}
+function _recordAgentUsage(agentId) {
+  _writePreflightAuthCache(agentId, { lastUsed: Date.now(), authed: true, ts: Date.now() });
+}
+// Called when a login wall is observed at runtime — clears the ledger's
+// trusted-authed bit so the next preflight surfaces auth-required directly
+// instead of trusting the dead session.
+function _recordAgentAuthFailure(agentId, reason) {
+  _writePreflightAuthCache(agentId, {
+    authed: false,
+    lastAuthFailedAt: Date.now(),
+    lastAuthFailedReason: reason || 'login wall detected',
+    ts: Date.now(),
+  });
 }
 
 async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAuth, skipAuth, manualLogin = false, preflightProbe = false, forceAuthProbe = false, requireCookieConfirmation = false, _progressCallbackUrl, _stepIndex, _stepType = null, _taskClassification = null, _loginWallRetried = false, _emitThinking = null, _authOnly = false, planExtend = false, sessionId: _planExtendSessionId = null, _abortSignal = null }) {
@@ -8971,6 +8996,10 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
         } else {
           logger.warn(`[browser.agent] run: state-load: auth wall still present for ${agentId} after grace period — deleting stale state, re-authenticating`);
           try { fs.unlinkSync(_stateFile); } catch (_) {}
+          // Real login-wall evidence — invalidate the preflight auth ledger.
+          // If waitForAuth below succeeds, the fresh authed_at (newer than
+          // lastAuthFailedAt) wins in the next preflight decision.
+          _recordAgentAuthFailure(agentId, 'login wall on persisted state load');
           _authNeeded = true;
         }
       } else {
@@ -12894,6 +12923,10 @@ When extracting page content with run-code, prioritize these selectors over gene
         } catch (_clearErr) {
           logger.warn(`[browser.agent] run: authed_at clear failed (non-fatal): ${_clearErr.message}`);
         }
+        // Also invalidate the preflight auth ledger — authed:false +
+        // lastAuthFailedAt make the next preflight go straight to
+        // auth-required instead of trusting the stale session.
+        _recordAgentAuthFailure(agentId, 'login wall detected during run');
         return {
         ok: false,
         agentId,

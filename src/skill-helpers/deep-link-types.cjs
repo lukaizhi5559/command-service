@@ -37,18 +37,21 @@ function classifyDeepLinkType(url, pageCategory) {
   const fullUrl = url; // for hash-embedded query patterns
 
   // 1. Creation: *.new shortcut domains (notion.new, docs.new, sheets.new),
-  //    paths containing /new, /create, Google Calendar template/event-edit
-  //    URLs (?action=TEMPLATE, /eventedit) — entity already created
+  //    paths containing /new, /create — entity already created and open.
+  //    (Google Calendar /eventedit and ?action=TEMPLATE are NOT creation: they
+  //    open an UNSAVED event form — classified compose below.)
   if (host.endsWith('.new') || host === 'new') return 'creation';
   if (/\/(new|create)(\/|$|\?|#)/i.test(path)) return 'creation';
-  if (/[?&]action=TEMPLATE\b/i.test(search)) return 'creation';
-  if (/\/(eventedit|event\/new)(\/|$|\?|#)/i.test(path)) return 'creation';
 
   // 2. Compose: #compose=new, #inbox?compose=new, /compose, share intents
   //    (twitter.com/intent/tweet, linkedin.com/shareArticle, /sharebox) —
   //    Check BEFORE search because compose URLs may contain query-like patterns.
   //    Gmail uses #inbox?compose=new (compose param inside the hash fragment)
   if (/(#compose=new|#compose\b|compose=new|\/compose\b)/i.test(fullUrl)) return 'compose';
+  //    Calendar event forms — /eventedit, /event/new, ?action=TEMPLATE all open
+  //    an unsaved form to fill, not a created entity.
+  if (/[?&]action=TEMPLATE\b/i.test(search)) return 'compose';
+  if (/\/(eventedit|event\/new)(\/|$|\?|#)/i.test(path)) return 'compose';
   //    Also covers feed-level share activators: linkedin.com/feed/?shareActive=true,
   //    ?shareActive, composer-modal params — the modal mounts lazily after load.
   if (/(intent\/(tweet|share|whatsapp)|sharebox|shareArticle|sharing\/share-offsite|deeplink=compose|shareActive\b|[?&]composer\b|composeModal)/i.test(fullUrl)) return 'compose';

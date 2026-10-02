@@ -1432,4 +1432,5 @@ module.exports = {
   AUTH_FLOW_PATH_RE,
   _isValidDeepLinkUrl,
   _hasSearchQueryParam,
+  _isGenericLandingUrl,
 };
