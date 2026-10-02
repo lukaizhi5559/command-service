@@ -27,9 +27,15 @@ const _urlsEquivalent = (...a) => _r()._urlsEquivalent(...a);
 const _readActiveElement = (...a) => _r()._readActiveElement(...a);
 const { _parseAction } = require('./actionParse.cjs');
 const { DIALOG_SELECTOR, FILLABLE_SELECTOR, probeDialogContainer, hasVisibleDialog: _probeDialog, resolveUnnamedFillable } = require('./overlayProbe.cjs');
+const { inferEntryKind, entryLabel, GENERIC_KIND_TARGETS } = require('./elementKind.cjs');
 const _executeAction = (...a) => _r()._executeAction(...a);
 const _extractProductPath = (...a) => _r()._extractProductPath(...a);
 const _verifySubmitSuccess = (...a) => _r()._verifySubmitSuccess(...a);
+
+// Real submit/primary-action labels — EXACT match only. Substring matching
+// (/post/) false-positive'd on audience selectors like LinkedIn's
+// "Post to Anyone" chip (opened a dropdown, then verified a fake submit).
+const _submitLabels = /^(Post|Send|Submit|Publish|Save|Create|Share|Tweet|Schedule|Confirm|Apply|Continue|Post\s+it|Send\s+now|Save\s+changes)$/i;
 
 
 // Reset focus to a known starting point.
@@ -827,7 +833,9 @@ async function buildTabMap(sessionId, maxElements = 150, options = {}) {
         // interactive children.
         const _dialogs = Array.from(document.querySelectorAll('${DIALOG_SELECTOR}'))
           .filter(d => {
-            if (d.offsetParent === null) return false;
+            // offsetParent is null for position:fixed modals (LinkedIn's
+            // .share-box-modal) — rendered-check must not exclude them.
+            if (!d.isConnected || (d.offsetParent === null && getComputedStyle(d).position !== 'fixed')) return false;
             const dr = d.getBoundingClientRect();
             return dr.width > 0 && dr.height > 0;
           });
@@ -1368,7 +1376,7 @@ Output ONLY the number, or 0 if no match.`;
     let bestEntry = null;
     let bestScore = 0;
     for (const entry of tabMap) {
-      const candidateText = entry.text || entry.ariaLabel || entry.placeholder || entry.dataPlaceholder || '';
+      const candidateText = entryLabel(entry);
       if (!candidateText) continue;
       if (_fuzzyTextMatch(verifyText, candidateText)) {
         // Use the word-overlap score to pick the best match among fuzzy matches
@@ -1806,6 +1814,23 @@ async function _executeTabMapAction(sessionId, parsed, tabMap, overlayActive, pa
     // URL, so pageChanged alone can't signal a rescan.
     const _preDialog = await _hasVisibleDialog(sessionId);
 
+    // Stale-[DISABLED] re-probe: the map predates the last type action — React
+    // enables submit buttons on input events, so a scanned-disabled flag may be
+    // stale by the time we click. Check live state; log and proceed if enabled.
+    if (pickedEntry.disabled === true && pickedEntry.ref) {
+      try {
+        const _liveDisabled = await browserAct({
+          action: 'evaluate', sessionId, headed: true, timeoutMs: 2000,
+          text: `(() => { const el = document.querySelector('[data-td-ref="${pickedEntry.ref}"]'); return el ? !!(el.disabled || el.getAttribute('aria-disabled') === 'true') : null; })()`,
+        });
+        if (_liveDisabled?.result === false) {
+          logger.info(`[instruction.runner] Tab-Map: "${parsed.target}" was [DISABLED] at scan but is enabled now — proceeding`);
+        } else if (_liveDisabled?.result === true) {
+          logger.warn(`[instruction.runner] Tab-Map: "${parsed.target}" still disabled — click may no-op`);
+        }
+      } catch (_) {}
+    }
+
     // Click via data-td-ref selector
     const cssSelector = pickedEntry.ref ? `[data-td-ref="${pickedEntry.ref}"]` : null;
     let clickOk = false;
@@ -1944,8 +1969,13 @@ async function _executeTabMapAction(sessionId, parsed, tabMap, overlayActive, pa
     // means the LLM couldn't name the field (LinkedIn Quill composer has no
     // text/aria-label). Resolve deterministically: focused fillable → sole
     // in-dialog fillable → sole fillable on page. Ambiguous → normal pick.
+    const _targetStr = String(parsed.target || '').trim();
+    // Generic inferred-kind targets ("text field", "button", ...) are
+    // unnamed-target equivalents — the LLM named what it *saw*, which was the
+    // inferred label. Resolve deterministically like a "" target.
+    const _isGenericTarget = GENERIC_KIND_TARGETS.has(_targetStr.toLowerCase());
     let _unnamedPick = null;
-    if (!String(parsed.target || '').trim()) {
+    if (!_targetStr || _isGenericTarget) {
       const _fillables = (tabMap || []).filter(e =>
         ['input', 'textarea'].includes(e.tag || '') ||
         e.role === 'combobox' || e.role === 'textbox' || e.isContentEditable ||
@@ -1977,14 +2007,16 @@ async function _executeTabMapAction(sessionId, parsed, tabMap, overlayActive, pa
     // Prevents the per-step LLM fallback from typing values into the wrong field
     // (e.g., typing the email address into Subject instead of To recipients).
     // Skipped for unnamed targets ("" target → nothing to match against).
-    if (!prePickedEntry && String(parsed.target || '').trim()) {
-      const _pickedLabel = (pickedEntry.text || pickedEntry.ariaLabel || pickedEntry.placeholder || pickedEntry.dataPlaceholder || '').toLowerCase().trim();
+    // Generic-kind targets stay in — entryLabel includes the inferred kind so
+    // a pick that landed on the entry rendered as "text field" verifies.
+    if (!prePickedEntry && _targetStr) {
+      const _pickedLabel = entryLabel(pickedEntry).toLowerCase().trim();
       const _targetLabel = (parsed.target || '').toLowerCase().trim();
       if (!_fuzzyTextMatch(_targetLabel, _pickedLabel)) {
         // LLM picked the wrong element — try deterministic match first
         const _detMatch = await _matchElementToStep(sessionId, { target: parsed.target }, tabMap);
         if (_detMatch) {
-          const _detLabel = (_detMatch.text || _detMatch.ariaLabel || _detMatch.placeholder || _detMatch.dataPlaceholder || '').toLowerCase().trim();
+          const _detLabel = entryLabel(_detMatch).toLowerCase().trim();
           if (_fuzzyTextMatch(_targetLabel, _detLabel)) {
             logger.warn(`[instruction.runner] Tab-Map type: LLM picked wrong element "${_pickedLabel}" for "${parsed.target}" — using deterministic match instead`);
             pickedEntry = _detMatch;
@@ -2021,6 +2053,19 @@ async function _executeTabMapAction(sessionId, parsed, tabMap, overlayActive, pa
       return { ok: false, pageChanged: false, error: _err, rescan: true };
     }
 
+    // Replace-semantics: a single-value editor (textarea / contenteditable /
+    // textbox — NOT combobox/autocomplete chip fields where typing appends)
+    // that already holds different content gets select-all before typing, so
+    // the new value replaces. Turns the LLM's "clear it first" instinct into
+    // a no-op instead of an unparseable Press Ctrl+A or a broken run-code.
+    const _existing = String(pickedEntry.value || pickedEntry.currentValue || _focusRes.focusedElement?.currentValue || '').trim();
+    if (_existing && String(parsed.value || '').trim() && _existing !== String(parsed.value).trim() &&
+        (pickedEntry.tag === 'textarea' || pickedEntry.isContentEditable || pickedEntry.role === 'textbox') &&
+        !pickedEntry.ariaAutoComplete && !pickedEntry.ariaOwns) {
+      logger.info(`[instruction.runner] Tab-Map type: "${parsed.target || 'field'}" has existing content — select-all before replace`);
+      await browserAct({ action: 'press', sessionId, key: 'Meta+a', headed: true, timeoutMs: 2000 }).catch(() => {});
+    }
+
     // Delegate typing to the shared just-type engine — same executor
     // just.type.agent uses (PRESS_ keys, chip confirm, reactFill, verify).
     const result = await _executeJustType(
@@ -2053,7 +2098,16 @@ async function _executeTabMapAction(sessionId, parsed, tabMap, overlayActive, pa
   }
 
   if (parsed.action === 'run-code') {
-    const result = await browserAct({ action: 'run-code', sessionId, code: parsed.code, headed: true, timeoutMs: 10000 }).catch(e => ({ ok: false, error: e.message }));
+    // LLM run-code snippets are DOM-level (document.querySelector...) — the
+    // engine run-code path wraps code as `async page => {}` which has no DOM
+    // context and falls back to a CLI that can't attach to engine sessions.
+    // Route DOM code through evaluate (in-page); keep run-code only for
+    // playwright-style snippets that reference the `page` object.
+    const _isDomCode = !/\bpage\s*\./.test(parsed.code);
+    const result = _isDomCode
+      ? await browserAct({ action: 'evaluate', sessionId, headed: true, timeoutMs: 10000,
+          text: `(async () => {\n${parsed.code}\n})()` }).catch(e => ({ ok: false, error: e.message }))
+      : await browserAct({ action: 'run-code', sessionId, code: parsed.code, headed: true, timeoutMs: 10000 }).catch(e => ({ ok: false, error: e.message }));
     return { ok: !!result?.ok, pageChanged: false, error: result?.error, pageText: result?.result || result?.stdout || '' };
   }
 
@@ -2513,7 +2567,6 @@ async function _tabMapStepExecute(sessionId, step, stepIndex, stepCount, tabMap,
   // Submit-marker: stamp BEFORE the click so a send-API POST landing in the
   // netLog right after is attributed to this submit (correlated send detection —
   // covers endpoints the _SEND_ENDPOINT_RE name list doesn't know).
-  const _submitLabels = /^(Post|Send|Submit|Publish|Save|Create|Share|Tweet|Schedule|Confirm|Apply|Continue|Post\s+it|Send\s+now|Save\s+changes)$/i;
   if (step.action === 'click' && _submitLabels.test(step.target || '')) {
     try {
       const { _markSubmitAttempt } = require('../../browser.agent.cjs');
@@ -2719,7 +2772,7 @@ async function _tabMapInnerStep(sessionId, goal, actionHistory, currentUrl, over
 
   // 6. Execute the action — stamp a submit marker first for submit-labeled
   // clicks so a send-API POST landing right after is attributed to this submit.
-  if (parsed.action === 'click' && /\b(send|submit|post|publish|create|save)\b/i.test(parsed.target || '')) {
+  if (parsed.action === 'click' && _submitLabels.test(parsed.target || '')) {
     try {
       const { _markSubmitAttempt } = require('../../browser.agent.cjs');
       _markSubmitAttempt(sessionId, currentUrl ? new URL(currentUrl).hostname : '');
@@ -2743,7 +2796,7 @@ async function _tabMapInnerStep(sessionId, goal, actionHistory, currentUrl, over
 
   // 9. Check for submit actions
   let submitVerified = false;
-  if (parsed.action === 'click' && /\b(send|submit|post|publish|create|save)\b/i.test(parsed.target || '')) {
+  if (parsed.action === 'click' && _submitLabels.test(parsed.target || '')) {
     const _verify = await _verifySubmitSuccess(sessionId, parsed.target, { url: currentUrl });
     if (_verify?.ok) {
       submitVerified = true;

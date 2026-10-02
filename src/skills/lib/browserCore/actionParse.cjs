@@ -18,6 +18,13 @@ const _TYPE_RE = new RegExp(`^Type\\s+"${_TYPE_VALUE}"\\s+into\\s+(?:the\\s+)?"(
 const _TYPE_PREFIX_RE = new RegExp(`^Type\\s+"${_TYPE_VALUE}"\\s+into\\s+(?:the\\s+)?"([^"]*)"\\s+field\\b`, 'i');
 const _TYPE_BARE_RE = new RegExp(`^Type\\s+"${_TYPE_VALUE}"\\s*$`, 'i');
 
+// Press target: modifier chords + named keys + single chars. The tail is
+// constrained to a single char or a known key name so `Press the button`
+// can't parse — executor normalizes ctrl→Control, cmd→Meta, etc.
+const _PRESS_KEY = '((?:(?:ctrl|control|cmd|command|meta|shift|alt|option)\\s*\\+\\s*)*(?:[a-z0-9]|enter|return|tab|escape|esc|space|backspace|delete|del|insert|ins|home|end|pageup|pagedown|pgup|pgdn|up|down|left|right|arrowup|arrowdown|arrowleft|arrowright|f\\d{1,2}))';
+const _PRESS_RE = new RegExp(`^Press\\s+${_PRESS_KEY}\\s*$`, 'i');
+const _PRESS_PREFIX_RE = new RegExp(`^Press\\s+${_PRESS_KEY}\\b\\s+\\S`, 'i');
+
 function _matchActionGrammar(t) {
   if (!t) return null;
 
@@ -36,8 +43,8 @@ function _matchActionGrammar(t) {
   m = t.match(_TYPE_BARE_RE);
   if (m) return { action: 'type', value: m[1], target: '' };
 
-  // Press Enter / Tab / Escape
-  m = t.match(/^Press\s+(Enter|Tab|Escape)\s*$/i);
+  // Press <key> — Enter/Tab/Escape, arrows, chords (Ctrl+A, Cmd+Shift+K…)
+  m = t.match(_PRESS_RE);
   if (m) return { action: 'press', key: m[1] };
 
   // Navigate to URL
@@ -58,10 +65,30 @@ function _matchActionGrammar(t) {
   if (/^Screenshot\s*$/i.test(t)) return { action: 'screenshot' };
 
   // Run code: <javascript>
+  // The grammar placeholder is literal "<javascript>" — LLMs echo it as a
+  // wrapper tag around real code ("Run code: <javascript>\n…code…\n</javascript>").
+  // Unwrap the tags; a bare placeholder with no body is unparseable (reprompt).
   m = t.match(/^Run\s+code:\s*([\s\S]+)$/i);
-  if (m) return { action: 'run-code', code: m[1].trim() };
+  if (m) {
+    const _code = _unwrapCodePlaceholder(m[1]);
+    return _code ? { action: 'run-code', code: _code } : null;
+  }
 
   return null;
+}
+
+// Strip literal <javascript>/<js>/<code>/<script> wrapper tags (and closing
+// tags / code fences) a model echoed around real code. Returns '' when the
+// captured "code" was only the placeholder — caller treats as unparseable.
+function _unwrapCodePlaceholder(code) {
+  let c = String(code || '').trim();
+  c = c.replace(/^<(?:javascript|js|code|script)>\s*/i, '');
+  c = c.replace(/\s*<\/(?:javascript|js|code|script)>\s*$/i, '');
+  c = c.replace(/^\s*```(?:javascript|js)?\s*\n?/i, '').replace(/\n?\s*```\s*$/, '');
+  c = c.trim();
+  // Reject anything still starting with a tag-ish token (never real JS).
+  if (!c || /^<[a-z/!]/i.test(c)) return '';
+  return c;
 }
 
 // Prefix salvage: extract a valid action prefix from a line followed by
@@ -72,14 +99,17 @@ function _matchActionPrefix(line) {
   const _l = line.replace(/\*\*/g, '').trim();
   let m = _l.match(/^Click\s+"([^"]+)"\s+\S/i);
   if (m) return { action: 'click', target: m[1] };
-  m = _l.match(/^Press\s+(Enter|Tab|Escape)\b\s+\S/i);
+  m = _l.match(_PRESS_PREFIX_RE);
   if (m) return { action: 'press', key: m[1] };
   m = _l.match(_TYPE_PREFIX_RE);
   if (m) return { action: 'type', value: m[1], target: m[2] };
   m = _l.match(/^Navigate\s+to\s+(https?:\/\/\S+)/i);
   if (m) return { action: 'navigate', url: m[1] };
   m = _l.match(/^Run\s+code:\s*(\S[\s\S]*)$/i);
-  if (m) return { action: 'run-code', code: m[1].trim() };
+  if (m) {
+    const _code = _unwrapCodePlaceholder(m[1]);
+    return _code ? { action: 'run-code', code: _code } : null;
+  }
   return null;
 }
 
@@ -106,16 +136,28 @@ function _parseAction(text) {
     const _am = l.match(/^Action:\s*(.*)$/i);
     if (_am && _am[1]) _candidates.push(_am[1].trim());
   }
-  for (const l of _lines) {
+  // Verb lines iterate BOTTOM-UP: CoT-style responses state a candidate action,
+  // reason, then emit the corrected final action last — the last line is the
+  // answer (observed: `Click "Post to Anyone"... Wait... Click "Po t" button`
+  // salvaged the rejected first line and clicked the audience selector).
+  for (let i = _lines.length - 1; i >= 0; i--) {
+    const l = _lines[i];
     // NOTE: `Run\s+code` must NOT keep the literal `:` in the alternation —
     // `\b` after a non-word `:` never matches before a space, which made
     // Run-code actions unreachable (observed: "Could not parse LLM action").
-    if (/^(Click|Type|Press|Navigate|Wait|Get|Scroll|Screenshot|Run\s+code|Done)\b/i.test(l)) _candidates.push(l);
+    if (/^(Click|Type|Press|Navigate|Wait|Get|Scroll|Screenshot|Run\s+code|Done)\b/i.test(l)) {
+      // Run code: the code body can span following lines (e.g. wrapped in
+      // <javascript>…</javascript>) — a line-only candidate captures just the
+      // placeholder. Push the rest of the reply so the grammar can unwrap it.
+      if (/^Run\s+code\b/i.test(l) && i < _lines.length - 1) _candidates.push(_lines.slice(i).join('\n'));
+      _candidates.push(l);
+    }
   }
   // Embedded-action suffixes: `Type "...` / `Click "...` / `Press X` appearing
-  // mid-line. Push rightmost-first — in "Wait, I need to reconsider ... Type X"
-  // the final embedded action is the corrected intent.
-  for (const l of _lines) {
+  // mid-line. Push rightmost-first, lines bottom-up — in "Wait, I need to
+  // reconsider ... Type X" the final embedded action is the corrected intent.
+  for (let li = _lines.length - 1; li >= 0; li--) {
+    const l = _lines[li];
     const positions = [];
     _EMBEDDED_VERB_RE.lastIndex = 0;
     let em;

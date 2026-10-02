@@ -48,6 +48,10 @@ const COMMERCE_HOST_RE = /^(www\.)?(amazon|ebay|etsy|walmart|target|aliexpress|b
 const COMMERCE_MUTATION_RE = /\b(add\s+to\s+(cart|bag|basket)|checkout|buy\s+now|purchase|place\s+order|filter\s+by|sort\s+by|add_to_cart|place_order)\b/i;
 // Verb → likely shortcut-bearing goal ("open the create dialog", "compose")
 const SHORTCUT_VERB_RE = /\b(create|compose|new|open|search|navigate|switch|jump|focus)\b/i;
+// Read/extract intent — "search for unread emails", "check my inbox",
+// "read the messages". Content-search goals must NOT reach the keyboard
+// layer — they need navigate-and-extract (tab.map / turn.loop).
+const READ_EXTRACT_RE = /\b(search|find|look|check|read|list|show|get|extract|summari[sz]e|review)\b[\s\S]{0,60}?\b(emails?|mail|messages?|inbox|posts?|comments?|notifications?|results?|items?|documents?|files?|videos?|events?|content|unread|threads?|repl(?:y|ies)|responses?)\b/i;
 
 function hostnameOf(url) {
   try { return new URL(url).hostname; } catch (_) { return ''; }
@@ -62,19 +66,44 @@ function allowedAgents(pageCategory) {
 }
 
 // Cheap deterministic "does the goal match a known app shortcut" check.
+// Abstention-biased: a single-word desc overlap is not enough for a long
+// goal ("search gmail for unread emails" ↔ desc "search mail") — only
+// short goals ("compose", "open compose") keep the single-hit path.
 function matchShortcut(goal, shortcutTable) {
   if (!SHORTCUT_VERB_RE.test(goal)) return null;
   const g = goal.toLowerCase();
+  const goalWordCount = g.split(/\s+/).filter(Boolean).length;
   let best = null;
   for (const s of shortcutTable) {
     const desc = (s.desc || '').toLowerCase();
     if (!desc) continue;
     // e.g. goal "create a new event" matches desc "create a new event" / "create"
     const words = desc.split(/\W+/).filter(w => w.length >= 4);
-    const hits = words.filter(w => g.includes(w)).length;
-    if (hits > 0 && (!best || hits > best.hits)) best = { hits, shortcut: s };
+    // Whole-word match — "mail" must not hit inside "gmail".
+    const hits = words.filter(w => new RegExp(`\\b${w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i').test(goal)).length;
+    const confident = hits >= 2 || (hits === 1 && goalWordCount <= 3);
+    if (confident && (!best || hits > best.hits)) best = { hits, shortcut: s };
   }
   return best?.shortcut || null;
+}
+
+// Ambiguous-verb fallback — word-boundary regexes cannot separate
+// "press the search shortcut" from "search my inbox". One cheap semantic
+// call classifies the lane; on any error we abstain (fall through to the
+// generalist cascade) rather than guess.
+async function _confirmGoalLane(goal) {
+  try {
+    const { askWithMessages } = require('../../../skill-helpers/skill-llm.cjs');
+    const raw = await askWithMessages([
+      { role: 'system', content: 'Classify a browser on-page action goal into exactly one lane. Answer with ONLY the lane name.\n- "shortcut" — press a keyboard shortcut / app hotkey (e.g. "press the compose shortcut", "open the create dialog")\n- "read" — search/read/extract page content for the user (e.g. "search my inbox", "check unread emails", "read the messages")\n- "find" — locate specific text on the current page (e.g. "find the word hello", "jump to the message")\n- "action" — a UI action: click, type, navigate, submit (e.g. "click save", "fill the form")' },
+      { role: 'user', content: `Goal: "${String(goal).slice(0, 200)}"` },
+    ], { maxTokens: 12, temperature: 0, responseTimeoutMs: 4000 });
+    const lane = (raw || '').trim().toLowerCase().replace(/[^a-z]/g, '');
+    return ['shortcut', 'read', 'find', 'action'].includes(lane) ? lane : null;
+  } catch (e) {
+    logger.warn(`[router] lane-confirm LLM failed (${e.message}) — abstaining`);
+    return null;
+  }
 }
 
 /**
@@ -148,11 +177,39 @@ async function routeOnPageAction({ sessionId, goal, pageCategory = 'web_generic'
     if (hit) return hit;
   }
 
+  // 4.5 Read/extract goal — "search for unread emails", "check the inbox".
+  // These are navigate-and-extract tasks (perform the search UI, read the
+  // results), NOT keyboard-shortcut presses — route before the shortcut rule.
+  if (READ_EXTRACT_RE.test(goal)) {
+    const hit = pick('tab.map.agent', 'read-extract')
+      || pick('turn.loop.agent', 'read-extract-fallback');
+    if (hit) return hit;
+  }
+
   // 5. Known app shortcut matches the goal verb
   const shortcuts = loadShortcutTable(hostnameOf(currentUrl));
   if (shortcuts.length > 0 && matchShortcut(goal, shortcuts)) {
     const hit = pick('shortcut.keys.agent', 'shortcut-match');
     if (hit) return hit;
+  }
+
+  // 5b. Ambiguous-verb zone — goal has a shortcut-ish verb but no confident
+  // table match and no read/extract object. One semantic call resolves what
+  // word-boundary regexes can't ("search" = press `/` vs. find content).
+  // Abstains to the generalist cascade on error/timeout.
+  if (SHORTCUT_VERB_RE.test(goal)) {
+    const lane = await _confirmGoalLane(goal);
+    if (lane === 'shortcut') {
+      const hit = pick('shortcut.keys.agent', 'llm-confirm:shortcut');
+      if (hit) return hit;
+    } else if (lane === 'find') {
+      const hit = pick('meta.find.agent', 'llm-confirm:find');
+      if (hit) return hit;
+    } else if (lane === 'read' || lane === 'action') {
+      const hit = pick('tab.map.agent', `llm-confirm:${lane}`)
+        || pick('turn.loop.agent', `llm-confirm:${lane}-fallback`);
+      if (hit) return hit;
+    }
   }
 
   // 6. Find-text-on-page goal

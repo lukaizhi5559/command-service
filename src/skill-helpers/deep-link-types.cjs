@@ -119,9 +119,12 @@ const OVERLAY_URL_RE = /(compose|dialog|modal|popup|wizard|eventedit|action=TEMP
  */
 function deepLinkOpensOverlay(url, deepLinkType) {
   const type = deepLinkType || classifyDeepLinkType(url);
-  if (type === 'compose' || type === 'creation') return true;
-  // Param-key fallback runs regardless of classified type — e.g. ?reply=true
-  // on a 'read'-typed post page still auto-opens a reply box.
+  if (type === 'compose') return true;
+  // 'creation' is not blanket-true: a landed entity page (docs
+  // /document/d/<id>/edit, notion page, etc.) IS the destination — no dialog
+  // is expected, and suppressing focus-reset leaves the body autofocused.
+  // Only URLs still carrying a creation/dialog marker (/new, eventedit,
+  // ?action=TEMPLATE, overlay param keys) imply a dialog may be mounted.
   const u = url ? _safeUrl(url) : null;
   if (u && _urlHasOverlayParamKey(u)) return true;
   return url ? OVERLAY_URL_RE.test(url) : false;

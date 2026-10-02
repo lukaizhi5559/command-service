@@ -451,76 +451,12 @@ async function _pressAfterIfNeeded(sessionId, stepTarget, stepValue, pageCategor
 //
 // Skip for document_editor category (auto-save pages don't have submit verification).
 // ---------------------------------------------------------------------------
+// Extracted to lib/browserCore/submitVerify.cjs (deprecation: shared helpers
+// move to browserCore leaves). Kept as a delegating export so existing call
+// sites — including lazy _r() consumers in tabMap.cjs — keep working.
+const _submitVerifyMod = require('./lib/browserCore/submitVerify.cjs');
 async function _verifySubmitSuccess(sessionId, verifyText, preClickState) {
-  try {
-    await _sleep(1500); // wait for submit to take effect
-
-    // 1. Compose dialog gone?
-    const composeGone = await browserAct({
-      action: 'evaluate', sessionId, headed: true, timeoutMs: 2000,
-      text: `(() => {
-        // Dialog candidates: ARIA + class-contains (LinkedIn's .share-box-modal
-        // has no role=dialog — ARIA-only query false-positives "gone").
-        const _dsel = '[role="dialog"], [role="alertdialog"], [aria-modal="true"], [class*="modal" i], [class*="dialog" i]';
-        let dialog = null;
-        for (const d of document.querySelectorAll(_dsel)) {
-          if (d.offsetParent === null) continue;
-          const r = d.getBoundingClientRect();
-          if (r.width < 100 || r.height < 80) continue;
-          dialog = d; break;
-        }
-        if (!dialog) return { gone: true, reason: 'no dialog' };
-        const text = (dialog.innerText || '').toLowerCase();
-        const hasSendOrPost = !!dialog.querySelector('[data-tooltip*="Send" i], [aria-label*="Send" i], [data-tooltip*="Post" i], [aria-label*="Post" i]');
-        // Social/email compose dialogs contain compose fields, placeholders, or submit buttons.
-        // Also catch LinkedIn "What do you want to talk about?" / Twitter "What's happening?".
-        const isCompose = /compose|recipient|subject|message body|what do you want to talk about|what's happening|new post|post to anyone|write a message|draft|share your thoughts/.test(text) || hasSendOrPost;
-        return { gone: !isCompose, reason: isCompose ? 'compose still open' : 'dialog changed' };
-      })()`,
-    });
-    if (composeGone?.result?.gone) {
-      logger.info(`[instruction.runner] Submit verified — compose dialog gone`);
-      return { ok: true, reason: 'compose_gone' };
-    }
-
-    // 2. URL changed away from compose?
-    const urlCheck = await browserAct({
-      action: 'evaluate', sessionId, headed: true, timeoutMs: 2000,
-      text: `(() => {
-        const url = window.location.href;
-        const wasCompose = /compose|draft|new/.test(${JSON.stringify(preClickState?.url || '')});
-        const isCompose = /compose|draft|new/.test(url);
-        return { changed: wasCompose && !isCompose, url };
-      })()`,
-    });
-    if (urlCheck?.result?.changed) {
-      logger.info(`[instruction.runner] Submit verified — URL changed away from compose`);
-      return { ok: true, reason: 'url_change' };
-    }
-
-    // 3. Success snackbar/toast?
-    const snackbar = await browserAct({
-      action: 'evaluate', sessionId, headed: true, timeoutMs: 2000,
-      text: `(() => {
-        const toast = document.querySelector('[role="status"], [role="alert"], .snackbar, .toast, [data-testid*="toast" i], [data-testid*="snackbar" i]');
-        if (!toast) return { found: false };
-        const text = (toast.innerText || '').toLowerCase();
-        const successPatterns = ['sent', 'sending', 'posted', 'saved', 'submitted', 'done', 'success'];
-        const matched = successPatterns.some(p => text.includes(p));
-        return { found: matched, text: text.slice(0, 100) };
-      })()`,
-    });
-    if (snackbar?.result?.found) {
-      logger.info(`[instruction.runner] Submit verified — snackbar: "${snackbar.result.text}"`);
-      return { ok: true, reason: 'snackbar' };
-    }
-
-    logger.warn(`[instruction.runner] Submit verification FAILED — compose still open, no URL change, no snackbar`);
-    return { ok: false, reason: 'no verification signal' };
-  } catch (e) {
-    logger.warn(`[instruction.runner] Submit verification error (non-fatal): ${e.message}`);
-    return { ok: true, reason: 'verify-error' }; // non-fatal — don't block on verify errors
-  }
+  return _submitVerifyMod.verifySubmitSuccess(sessionId, verifyText, preClickState);
 }
 
 // Press Escape to close any open overlay (menu/dropdown/modal/popover).
@@ -1625,12 +1561,14 @@ async function runInstructionSkill({ instructions, keyPath, params, skillArgs, s
     const _overlayCheck = await browserAct({
       action: 'evaluate', sessionId, headed: true, timeoutMs: 3000,
       text: `(() => {
-        if (document.querySelector('[role="dialog"], [role="alertdialog"], [aria-modal="true"]')) return { hasOverlay: true, type: 'dialog' };
+        const _dviz = (d) => d && d.isConnected && (d.offsetParent !== null || getComputedStyle(d).position === 'fixed') && d.getBoundingClientRect().width > 0;
+        const _dlgAny = document.querySelector('[role="dialog"], [role="alertdialog"], [aria-modal="true"], [class*="modal" i], [class*="dialog" i]');
+        if (_dlgAny && _dviz(_dlgAny)) return { hasOverlay: true, type: 'dialog' };
         if (document.querySelector('[popover]:not([data-popper-hidden])')) return { hasOverlay: true, type: 'popover' };
         const menu = document.querySelector('[role="menu"], [role="listbox"]');
-        if (menu && menu.offsetParent !== null) return { hasOverlay: true, type: 'menu' };
-        const classMatch = document.querySelector('.modal:not([hidden]), .popup:not([hidden]), .dropdown-menu:not([hidden]), .overlay:not([hidden]), .drawer:not([hidden]), .sheet:not([hidden]), .slide-over:not([hidden])');
-        if (classMatch && classMatch.offsetParent !== null) return { hasOverlay: true, type: 'class' };
+        if (menu && _dviz(menu)) return { hasOverlay: true, type: 'menu' };
+        const classMatch = document.querySelector('.modal:not([hidden]), .popup:not([hidden]), .dropdown-menu:not([hidden]), .overlay:not([hidden]), .drawer:not([hidden]), .sheet:not([hidden]), .slide-over:not([hidden]), [class*="modal" i]:not([hidden]), [class*="popup" i]:not([hidden]), [class*="sheet" i]:not([hidden]), [class*="drawer" i]:not([hidden])');
+        if (classMatch && _dviz(classMatch)) return { hasOverlay: true, type: 'class' };
         const expanded = document.querySelector('[aria-expanded="true"]');
         if (expanded) {
           const role = expanded.getAttribute('role') || '';
@@ -2106,8 +2044,8 @@ async function runInstructionSkill({ instructions, keyPath, params, skillArgs, s
             const _postFailCheck = await browserAct({
               action: 'evaluate', sessionId, headed: true, timeoutMs: 3000,
               text: `(() => {
-                const visibleDialog = document.querySelector('[role="dialog"], [aria-modal="true"], [role="menu"], [role="listbox"]');
-                const hasVisibleOverlay = visibleDialog && visibleDialog.offsetParent !== null;
+                const visibleDialog = document.querySelector('[role="dialog"], [aria-modal="true"], [role="menu"], [role="listbox"], [class*="modal" i], [class*="dialog" i]');
+                const hasVisibleOverlay = visibleDialog && (visibleDialog.offsetParent !== null || getComputedStyle(visibleDialog).position === 'fixed');
                 return { hasVisibleOverlay };
               })()`,
             }).catch(() => ({ ok: false }));
@@ -2120,8 +2058,8 @@ async function runInstructionSkill({ instructions, keyPath, params, skillArgs, s
               const _recheckRes = await browserAct({
                 action: 'evaluate', sessionId, headed: true, timeoutMs: 3000,
                 text: `(() => {
-                  const d = document.querySelector('[role="dialog"], [aria-modal="true"]');
-                  return !!(d && d.offsetParent !== null);
+                  const d = document.querySelector('[role="dialog"], [aria-modal="true"], [class*="modal" i], [class*="dialog" i]');
+                  return !!(d && (d.offsetParent !== null || getComputedStyle(d).position === 'fixed'));
                 })()`,
               }).catch(() => ({ ok: false }));
               if (_recheckRes?.ok && (_recheckRes.result === true || _recheckRes.result === 'true')) {
@@ -2401,7 +2339,9 @@ async function _detectOverlay(sessionId, pageCategory) {
         // temporarily shrink below 90% viewport (bounds +1), but it will
         // never be position: fixed/absolute/sticky with a non-auto z-index.
         const _isRealModal = (el) => {
-          if (!el || el.offsetParent === null) return false;
+          // position:fixed containers have offsetParent === null — that alone
+          // can't gate visibility (it's the standard modal positioning).
+          if (!el || (el.offsetParent === null && getComputedStyle(el).position !== 'fixed')) return false;
           const r = el.getBoundingClientRect();
           if (r.width <= 0 || r.height <= 0) return false;
           // alertdialog and aria-modal are always real modals by spec
@@ -2500,7 +2440,7 @@ async function _detectOverlay(sessionId, pageCategory) {
         // Scan for form-panel candidates
         const candidates = document.querySelectorAll('div, section, aside, form');
         for (const cand of candidates) {
-          if (cand.offsetParent === null) continue;
+          if (cand.offsetParent === null && getComputedStyle(cand).position !== 'fixed') continue;
           const cr = cand.getBoundingClientRect();
           if (cr.width <= 0 || cr.height <= 0) continue;
           // Must be < 90% viewport (not a full-page editor)
@@ -2536,7 +2476,7 @@ async function _overlayStateKey(sessionId) {
       text: `(() => {
         const ds = Array.from(document.querySelectorAll('[role="dialog"], [role="alertdialog"], [aria-modal="true"], [class*="modal" i], [class*="dialog" i]'))
           .filter(d => {
-            if (d.offsetParent === null) return false;
+            if (d.offsetParent === null && getComputedStyle(d).position !== 'fixed') return false;
             const r = d.getBoundingClientRect();
             return r.width > 0 && r.height > 0;
           });
@@ -3140,8 +3080,8 @@ async function _probePageStructure(sessionId) {
     action: 'evaluate', sessionId, headed: true, timeoutMs: 3000,
     text: `(() => {
       // Scope to overlay if one is open (don't count background page inputs)
-      const overlay = document.querySelector('[role="dialog"], [role="alertdialog"], [aria-modal="true"]');
-      const scope = (overlay && overlay.offsetParent !== null) ? overlay : document;
+      const overlay = document.querySelector('[role="dialog"], [role="alertdialog"], [aria-modal="true"], [class*="modal" i]');
+      const scope = (overlay && (overlay.offsetParent !== null || getComputedStyle(overlay).position === 'fixed')) ? overlay : document;
 
       const fillableSelector = 'input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"]):not([type="submit"]):not([type="button"]):not([type="file"]), textarea, [contenteditable="true"], [contenteditable=""], [role="textbox"]';
       const fillable = scope.querySelectorAll(fillableSelector);

@@ -185,7 +185,8 @@ async function ensureFieldFocused(sessionId, entry, opts = {}) {
       const wantRole = ${JSON.stringify((entry.role || '').toLowerCase())};
       const tokens = label.split(/\\s+/).filter(t => t.length > 1);
       const dialogs = [...document.querySelectorAll('[role="dialog"],[role="alertdialog"],[aria-modal="true"],[class*="modal" i],[class*="dialog" i]')]
-        .filter(d => d.offsetParent !== null && d.getBoundingClientRect().width > 0);
+        // offsetParent is null for position:fixed modals — don't exclude them
+        .filter(d => (d.offsetParent !== null || getComputedStyle(d).position === 'fixed') && d.getBoundingClientRect().width > 0);
       const scopes = dialogs.length ? dialogs : [document];
       const seen = new Set();
       let best = null, bestScore = 0;

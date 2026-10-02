@@ -35,6 +35,11 @@ const FILLABLE_SELECTOR = [
 // `tag` — when true, the winning container gets data-td-dialog="1" so callers
 // can re-locate it cheaply for membership tests.
 const _FIND_DIALOG_JS = (tag) => `(() => {
+  // Rendered-check: offsetParent is null for position:fixed elements — the
+  // standard modal positioning — so it can't be used alone as a visibility
+  // gate for containers. (Descendants of fixed elements get a non-null
+  // offsetParent, so only container-candidate checks needed this.)
+  const _viz = (el) => !!el && el.isConnected && (el.offsetParent !== null || getComputedStyle(el).position === 'fixed');
   const _isSidePanel = (r) => {
     const cx = r.x + r.width / 2;
     return (cx < window.innerWidth * 0.15 || cx > window.innerWidth * 0.85);
@@ -44,12 +49,12 @@ const _FIND_DIALOG_JS = (tag) => `(() => {
     let n = 0;
     for (const e of els) {
       const er = e.getBoundingClientRect();
-      if (er.width > 0 && er.height > 0 && e.offsetParent !== null) { n++; if (n >= 3) break; }
+      if (er.width > 0 && er.height > 0 && _viz(e)) { n++; if (n >= 3) break; }
     }
     return n;
   };
   const _okCandidate = (el) => {
-    if (!el || el.offsetParent === null) return null;
+    if (!el || !_viz(el)) return null;
     const r = el.getBoundingClientRect();
     if (r.width < 160 || r.height < 80) return null;
     if (r.width > window.innerWidth * 0.9 || r.height > window.innerHeight * 0.9) return null;
@@ -74,7 +79,7 @@ const _FIND_DIALOG_JS = (tag) => `(() => {
   if (!best) {
     let hasBackdrop = false;
     for (const el of document.querySelectorAll('body *')) {
-      if (el.offsetParent === null && getComputedStyle(el).position !== 'fixed') continue;
+      if (!_viz(el)) continue;
       const s = getComputedStyle(el);
       if (s.position !== 'fixed' && s.position !== 'absolute') continue;
       const r = el.getBoundingClientRect();
@@ -147,7 +152,8 @@ async function resolveUnnamedFillable(sessionId) {
         };
         const _vis = (el) => {
           const r = el.getBoundingClientRect();
-          return el.isConnected && r.width > 0 && r.height > 0 && el.offsetParent !== null;
+          return el.isConnected && r.width > 0 && r.height > 0 &&
+            (el.offsetParent !== null || getComputedStyle(el).position === 'fixed');
         };
         const _area = (el) => { const r = el.getBoundingClientRect(); return r.width * r.height; };
         const _finish = (el) => {

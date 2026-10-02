@@ -5380,6 +5380,11 @@ async function verifyTierCompletion(goal, pageType, routingDecision, script, ses
 // "KB" or "Newsboys" when collapsing a multi-entity task into sub-tasks.
 function _extractGoalEntities(goal) {
   if (!goal || typeof goal !== 'string') return [];
+  // Verify-mode goals arrive wrapped in boilerplate ("VERIFICATION ONLY — do
+  // NOT click... report whether this condition holds: <real goal>"). Strip the
+  // wrapper first — its ALL-CAPS words otherwise match the proper-noun
+  // extractor below and spawn phantom sub-tasks ("Add songs by VERIFICATION").
+  goal = goal.replace(/^VERIFICATION ONLY[\s\S]*?condition holds:\s*/i, '');
   const _stop = new Set([
     'The', 'And', 'Then', 'Create', 'Search', 'Add', 'Click', 'Open', 'New',
     'Page', 'Playlist', 'Repeat', 'Process', 'Find', 'Top', 'Songs', 'Track',
@@ -5388,6 +5393,10 @@ function _extractGoalEntities(goal) {
     'Music', 'Artist', 'Artists', 'Album', 'Song', 'Spotify', 'YouTube',
     'Google', 'Chrome', 'Safari', 'Firefox', 'Edge', 'Browser', 'Tab',
     'Window', 'Screen', 'App', 'Application', 'Desktop', 'Mobile',
+    // Boilerplate/instruction caps — survive wrapper variants and prompt
+    // leakage (VERIFY/VERIFICATION wrapper, CRITICAL/NOTE prompt clauses).
+    'VERIFICATION', 'VERIFY', 'ONLY', 'CRITICAL', 'MUST', 'NOTE', 'EACH',
+    'ALL', 'DO', 'NOT', 'AND', 'OR', 'TRUE', 'FALSE', 'IMPORTANT',
   ]);
   const entities = new Set();
   // Quoted phrases (single + double quotes) — these are the most reliable
@@ -5415,6 +5424,28 @@ async function _decomposeGoalIntoSubTasks(goal, sessionId, currentUrl = null) {
   // Don't decompose if the goal already has a [DISCOVERED PROCEDURE] block —
   // the procedure is already step-by-step.
   if (/\[DISCOVERED PROCEDURE/.test(goal)) return { ok: false, error: 'goal has procedure block' };
+
+  // Verify-mode goals ("VERIFICATION ONLY — ... condition holds: <condition>")
+  // are a single check, not a multi-step action plan. Decomposing them via the
+  // action-oriented LLM prompt hallucinates phantom action sub-tasks (observed:
+  // "Add songs by VERIFICATION to the destination" for a Google Docs verify).
+  // Return one deterministic criterion sub-task — the structural-verify gates
+  // evaluate it directly. Skips the LLM call too (verify steps get faster).
+  const _verifyMatch = goal.match(/^VERIFICATION ONLY[\s\S]*?condition holds:\s*([\s\S]+)$/i);
+  if (_verifyMatch) {
+    const _cond = _verifyMatch[1].trim();
+    logger.info(`[playwright.agent] verify-mode goal — single criterion sub-task (no LLM decompose): "${_cond.slice(0, 80)}"`);
+    return {
+      ok: true,
+      subTasks: [{
+        id: 1,
+        description: `Verify: ${_cond.slice(0, 180)}`,
+        verification: _cond.slice(0, 300),
+        expectedState: _cond.slice(0, 300),
+        completed: false,
+      }],
+    };
+  }
 
   // ── Entity preservation: extract entities before LLM call ──
   const _entities = _extractGoalEntities(goal);
@@ -5480,16 +5511,17 @@ Rules:
       const _allDesc = subTasks.map(s => s.description).join(' ').toLowerCase();
       const _missing = _entities.filter(e => !_allDesc.includes(e.toLowerCase()));
       if (_missing.length > 0) {
-        logger.warn(`[playwright.agent] entity preservation: ${_missing.length} entities missing from sub-tasks: ${_missing.join(', ')} — adding fallback sub-tasks`);
-        const _hasPlaylist = /playlist/i.test(_allDesc);
-        const _destination = _hasPlaylist ? 'the playlist' : 'the destination';
+        logger.warn(`[playwright.agent] entity preservation: ${_missing.length} entities missing from sub-tasks: ${_missing.join(', ')} — adding coverage sub-tasks`);
         for (const entity of _missing) {
           const _nextId = Math.max(...subTasks.map(s => s.id)) + 1;
+          // Domain-neutral coverage check — NOT an action step (the old
+          // "Add songs by X to the destination" template was Spotify-shaped
+          // and generated phantom sub-tasks on non-playlist goals).
           subTasks.push({
             id: _nextId,
-            description: `Add songs by ${entity} to ${_destination}`,
-            verification: `${_destination} page text contains "${entity}"`,
-            expectedState: `${_destination} page shows songs by ${entity} in the track list`,
+            description: `Confirm "${entity}" is present on the target page`,
+            verification: `Page text, title, or URL contains "${entity}"`,
+            expectedState: `The target page visibly references "${entity}"`,
             completed: false,
           });
         }
@@ -12226,6 +12258,12 @@ async function _executeTurnLoopFallback({ goal, verificationGoal, sessionId, hea
       break;
     }
 
+    // Hoisted declaration — the Part-B postcondition check on a turn-1
+    // 'return' reads this BEFORE the per-action capture site below; a let
+    // declared at the capture site is in TDZ until then
+    // ("Cannot access '_preActionState' before initialization").
+    let _preActionState = null;
+
     // ── Observe: take a fresh snapshot + page text + probe ──
     const _snap = await _fastSnapshot(sessionId, headed, timeoutMs);
     let _currentSnapshot = '';
@@ -13155,7 +13193,7 @@ Turn ${turn}/${MAX_TURNS}. What is your next action? (DO NOT snapshot - act dire
     // AND for postcondition verification (Part B — unified verification gate).
     // _captureStateSnapshot returns a richer object (url, modalCount, bodyLen,
     // cartCount, cartSubtotal, formValues, listCounts) than the old inline eval.
-    let _preActionState = null;
+    _preActionState = null;
     try {
       const _prePage = engine.getPage(sessionId);
       if (_prePage) {
@@ -18503,6 +18541,8 @@ module.exports = {
   _isCanonicalRedirect,
   // Exported for testing (goal-phrase extraction — apostrophe regression)
   _extractGoalPhrases,
+  _extractGoalEntities,
+  _decomposeGoalIntoSubTasks,
   // Tier 1.6 overlay interaction (exported for instruction.runner.cjs)
   _detectOverlayRect,
   _executeOverlayInteraction,

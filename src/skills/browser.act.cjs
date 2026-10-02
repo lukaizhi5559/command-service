@@ -5576,6 +5576,10 @@ async function browserAct(args) {
     }
 
     // ── Keyboard ─────────────────────────────────────────────────────────────
+    // 'key' is emitted by instruction.runner's keyMap path ({action:'key',
+    // key:'Meta+a'}) — alias to press so engine-owned sessions don't hit the
+    // CLI fallback and get ownership-blocked.
+    case 'key':
     case 'keyboard':
     case 'press': {
       const pressKey = key || text || '';
@@ -5611,7 +5615,11 @@ async function browserAct(args) {
           // "Option" instead of "Alt", "Esc" instead of "Escape". Normalize each
           // +-separated segment before passing to _ePage.keyboard.press().
           const _KEY_NORMALIZE_MAP = { 'ctrl': 'Control', 'cmd': 'Meta', 'command': 'Meta', 'option': 'Alt', 'opt': 'Alt', 'esc': 'Escape', 'return': 'Enter', 'del': 'Delete', 'ins': 'Insert', 'pgup': 'PageUp', 'pgdn': 'PageDown', 'home': 'Home', 'end': 'End', 'space': 'Space' };
-          const _normalizedKey = pressKey.split('+').map(seg => {
+          // Select-all is Meta+A on macOS — Ctrl+A is the emacs line-start
+          // binding there, not select-all. Only the +a chord gets remapped.
+          const _rawKey = (process.platform === 'darwin' && /^(?:ctrl|control)\s*\+\s*a$/i.test(pressKey))
+            ? 'Meta+a' : pressKey;
+          const _normalizedKey = _rawKey.split('+').map(seg => {
             const _lower = seg.trim().toLowerCase();
             return _KEY_NORMALIZE_MAP[_lower] || seg.trim();
           }).join('+');
@@ -6125,6 +6133,13 @@ If no videos found, return []. Do not explain, only output the JSON array.`;
     case 'evaluate': {
       const expr = text || selector || args.expression || '';
 
+      // Reject template placeholders — a literal "<javascript>" / "{{var}}" body
+      // can only ever produce a SyntaxError (or worse, partial execution after
+      // wrapping). Fail fast so the caller reprompts instead of crashing.
+      if (/^\s*<[a-z/!]/i.test(expr) || /\{\{\s*\w+\s*\}\}/.test(expr)) {
+        return { ok: false, action, sessionId, error: `evaluate: unsubstituted placeholder in expression: "${expr.slice(0, 60)}"`, executionTime: Date.now() - start };
+      }
+
       // ── Engine path ──
       let _ePage = engine.getPage(sessionId);
       // When the caller explicitly requested headless/hidden execution, launch
@@ -6154,6 +6169,12 @@ If no videos found, return []. Do not explain, only output the JSON array.`;
             executionTime: Date.now() - start,
           };
         } catch (evalErr) {
+          // When the engine owns this session the CLI fallback is guaranteed
+          // blocked ("must use an engine-native action") — return the real
+          // error instead of a masked ownership rejection.
+          if (engine.isSessionActive && engine.isSessionActive(sessionId)) {
+            return { ok: false, action, sessionId, error: `evaluate (engine) failed: ${evalErr.message}`, executionTime: Date.now() - start };
+          }
           logger.warn(`[browser.act] evaluate (engine) failed: ${evalErr.message} — falling back to CLI`);
         }
       }
@@ -6166,6 +6187,13 @@ If no videos found, return []. Do not explain, only output the JSON array.`;
           error: 'hidden engine page unavailable — refusing visible CLI fallback',
           executionTime: Date.now() - start,
         };
+      }
+
+      // Engine owns the session but no live page was returned — the CLI path
+      // is ownership-blocked anyway; report the real condition, not a masked
+      // "must use an engine-native action" rejection.
+      if (engine.isSessionActive && engine.isSessionActive(sessionId)) {
+        return { ok: false, action, sessionId, error: 'evaluate: engine session active but no live page — CLI fallback is ownership-blocked', executionTime: Date.now() - start };
       }
 
       // ── CLI fallback ──
@@ -6196,6 +6224,10 @@ If no videos found, return []. Do not explain, only output the JSON array.`;
       if (!code) {
         return { ok: false, action, sessionId, error: 'run-code: code is required', executionTime: Date.now() - start };
       }
+      // Same placeholder guard as evaluate — never eval a template token.
+      if (/^\s*<[a-z/!]/i.test(code) || /\{\{\s*\w+\s*\}\}/.test(code)) {
+        return { ok: false, action, sessionId, error: `run-code: unsubstituted placeholder in code: "${code.slice(0, 60)}"`, executionTime: Date.now() - start };
+      }
       // ── Engine path: evaluate the code with page context ──
       const _ePage = engine.getPage(sessionId);
       if (_ePage) {
@@ -6207,8 +6239,15 @@ If no videos found, return []. Do not explain, only output the JSON array.`;
           const result = await fn(_ePage);
           return { ok: true, action, sessionId, result: result, stdout: (typeof result === 'string' ? result : JSON.stringify(result ?? null)), executionTime: Date.now() - start };
         } catch (e) {
+          // Engine-owned session → CLI is ownership-blocked; surface the real error.
+          if (engine.isSessionActive && engine.isSessionActive(sessionId)) {
+            return { ok: false, action, sessionId, error: `run-code (engine) failed: ${e.message}`, executionTime: Date.now() - start };
+          }
           logger.warn(`[browser.act] run-code (engine) failed: ${e.message} — falling back to CLI`);
         }
+      } else if (engine.isSessionActive && engine.isSessionActive(sessionId)) {
+        // Engine owns the session but returned no live page — CLI is dead too.
+        return { ok: false, action, sessionId, error: 'run-code: engine session active but no live page — CLI fallback is ownership-blocked', executionTime: Date.now() - start };
       }
       // ── CLI fallback ──
       const isWrapped = /^async\s+page\s*=>/.test(code) || /^async\s*\(/.test(code);

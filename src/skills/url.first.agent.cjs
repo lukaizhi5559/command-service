@@ -20,6 +20,22 @@ const { isSigninWall } = require('./lib/browserCore/auth.cjs');
 const { deriveSessionId, withSessionMutex } = require('./lib/browserCore/session.cjs');
 const { postProgress } = require('./lib/browserCore/progress.cjs');
 
+// Deep-link semantics live in the REQUESTED URL — create/compose/search
+// deep-links redirect after doing their work (docs.google.com/document/create
+// → /d/<id>/edit), so classifying only the landed URL degrades 'creation'
+// to 'none' and downstream steps redo the action. Prefer the target's type;
+// fall back to the landed URL's type for server-driven semantics.
+function _resolveDeepLinkType(targetUrl, landedUrl) {
+  try {
+    const { classifyDeepLinkType } = require('../skill-helpers/deep-link-types.cjs');
+    const targetType = classifyDeepLinkType(targetUrl) || 'none';
+    if (targetType !== 'none') return targetType;
+    return classifyDeepLinkType(landedUrl) || 'none';
+  } catch (_) {
+    return 'none';
+  }
+}
+
 async function urlFirstAgent(args = {}) {
   const { service, agentId: _agentId, task = '', url: _explicitUrl, headed = true, _progressCallbackUrl } = args;
   const agentId = _agentId || (service ? `${String(service).toLowerCase().replace(/\s+/g, '_')}.agent` : 'default.agent');
@@ -83,14 +99,11 @@ async function urlFirstAgent(args = {}) {
     // Deep-link type tells downstream steps what the landing page already did:
     // 'compose'/'creation' → a dialog auto-opened; 'search' → results already
     // loaded. Passed through so the next step's LLM doesn't redo it.
-    let deepLinkType = 'none';
-    try {
-      deepLinkType = require('../skill-helpers/deep-link-types.cjs').classifyDeepLinkType(landedUrl) || 'none';
-    } catch (_) {}
+    const deepLinkType = _resolveDeepLinkType(targetUrl, landedUrl);
 
     postProgress(_progressCallbackUrl, { tier: 'url-first', message: `url.first.agent: landed ${landedUrl}` });
     return { ok: true, sessionId, agentId, url: landedUrl, deepLinkSource, deepLinkType, output: landedUrl };
   });
 }
 
-module.exports = { urlFirstAgent };
+module.exports = { urlFirstAgent, _resolveDeepLinkType };

@@ -6569,6 +6569,23 @@ async function actionScanPage({ appName, url, category, maxWaitMs = 10000, useCa
     await actionClipboardRestore().catch(() => {});
   }
 
+  // OCR fallback — Cmd+A lands in whatever element holds focus; pages with an
+  // autofocused field (Gmail's search box) copy only that field, yielding thin
+  // text on a visibly full page (observed: 113 chars of chrome text while the
+  // results list was on screen). Screen OCR of the window recovers it.
+  const _minNeeded = Math.max(
+    category ? (_pageCopyEst.CATEGORY_ESTIMATES[category]?.minChars ?? est.minChars) : est.minChars,
+    _pageCopyEst.ABSOLUTE_MIN_CHARS,
+  );
+  if (last.content.length < _minNeeded) {
+    const ocr = await getRecentOCR({ appName: resolvedApp, liveOverlayHidden: true }).catch(() => null);
+    const ocrText = (ocr?.text || '').trim();
+    if (ocrText.length > last.content.length) {
+      logger.info(`[app.agent] scan_page: clipboard thin (${last.content.length} chars) — OCR fallback recovered ${ocrText.length} chars (${ocr?.source || 'db'})`);
+      last = { ...last, content: ocrText };
+    }
+  }
+
   const saved = _pageCopyEst.saveCopy({
     url: last.pageUrl || liveUrl || url || null,
     content: last.content,

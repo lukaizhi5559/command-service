@@ -89,7 +89,24 @@ function extractServiceSearchTerm(task, serviceNames) {
   const m = t.match(/\b(?:search|find|look\s*up|look\s+for|browse|check|scan|read)\b[^.?!]{0,60}?\bfor\s+(.+?)\s*[?.!]*$/i);
   if (!m) return null;
   // Drop a trailing bare container noun — "vidangel emails" → "vidangel".
-  const q = m[1].trim().replace(/\s+(?:emails?|messages?|mails?|threads?|posts?|items?|results?|products?)$/i, '');
+  let q = m[1].trim().replace(/\s+(?:emails?|messages?|mails?|threads?|posts?|items?|results?|products?)$/i, '');
+  // Pipeline-injected wrappers ("(Context from prior turn: X)", "(Resolved
+  // referent — X)") can leak a closing paren into the capture — and
+  // encodeURIComponent leaves ) ] } ' " literal in the URL. Strip trailing
+  // closers only when they're unbalanced (legit "(foo OR bar)" is kept), plus
+  // wrapping quotes.
+  const _CLOSERS = { ')': '(', ']': '[', '}': '{' };
+  let _prev;
+  do {
+    _prev = q;
+    while (q.length > 1) {
+      const _c = q.slice(-1), _o = _CLOSERS[_c];
+      if (!_o) break;
+      if ((q.split(_c).length - 1) <= (q.split(_o).length - 1)) break;
+      q = q.slice(0, -1).trimEnd();
+    }
+    q = q.replace(/^["']+|["']+$/g, '').trim();
+  } while (q !== _prev && q.length);
   if (!q || _UI_LABEL_BLOCKLIST.test(q)) return null;
   return q;
 }

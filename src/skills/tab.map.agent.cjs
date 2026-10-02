@@ -105,6 +105,13 @@ async function tabMapAgent(args = {}) {
       }
       if (res?.filledRef) {
         filledFields.push({ ref: res.filledRef, label: res.filledLabel, value: res.filledValue });
+        // Patch the cached map entry — the map isn't rebuilt after a fill, so
+        // its snapshot value ("Untitled document") would otherwise keep
+        // contradicting the [FILLED] marker and the LLM re-acts on a done field.
+        if (Array.isArray(tabMap)) {
+          const _fe = tabMap.find(e => e.ref === res.filledRef);
+          if (_fe && res.filledValue !== undefined) { _fe.value = res.filledValue; _fe.currentValue = res.filledValue; }
+        }
         // A new fill changes form state — a submit clicked before it may now
         // succeed. Re-enable suppressed submit elements.
         clickedSubmitRefs.clear();

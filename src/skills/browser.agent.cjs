@@ -28,6 +28,7 @@ const fs   = require('fs');
 const http = require('http');
 const logger = require('../logger.cjs');
 const { buildExtractItemsScript, parseExtractedItems } = require('./extract-page-items.cjs');
+const { entryLabel, previewValue } = require('./lib/browserCore/elementKind.cjs');
 
 // ---------------------------------------------------------------------------
 // WALT: Build JavaScript extraction code for different extract types
@@ -1361,7 +1362,7 @@ Look at the goal, the editor state, and what's been done. Return ONLY the NEXT v
 Page title: ${pageContext.title || 'unknown'}
 Visible text: ${(pageContext.visibleText || '').slice(0, 150)}${_editorStateBlock}${_layoutBlock}${_ocrBlock}
 Focused field: ${_focusedStr}
-Current field value: "${(currentValue || '').slice(0, 80)}"
+Current field value: "${previewValue(currentValue, 100)}"
 Actions taken:
 ${historyStr}${_contextBlock}
 
@@ -1624,7 +1625,7 @@ Return ONLY the number.`;
 Page title: ${pageContext.title || 'unknown'}${_editorStateBlock}
 Focused field: ${_focusedStr}
 Value to type: "${String(value || '').slice(0, 80)}"
-Current field value: "${(focusedElement?.currentValue || '').slice(0, 80)}"
+Current field value: "${previewValue(focusedElement?.currentValue, 100)}"
 Actions taken:
 ${historyStr}
 
@@ -2694,7 +2695,7 @@ Page URL: ${pageContext.url || 'unknown'}
 Page title: ${pageContext.title || 'unknown'}
 Visible text: ${(pageContext.visibleText || '').slice(0, 200)}
 Focused field: ${_focusedStr}
-Field has content: ${focusedElement?.hasContent ? 'yes' : 'no'} (current: "${(focusedElement?.currentValue || '').slice(0, 80)}")
+Field has content: ${focusedElement?.hasContent ? 'yes' : 'no'} (current: "${previewValue(focusedElement?.currentValue, 100)}")
 Value to type: "${_val.slice(0, 200)}"
 Recent actions: ${historyStr || '(none)'}${_contextBlock}
 
@@ -2965,21 +2966,6 @@ function _normalizeGoalForCache(goal) {
   normalized = normalized.replace(/\b\d+\b/g, '<num>');
   // Collapse whitespace, lowercase
   return normalized.toLowerCase().replace(/\s+/g, ' ').trim();
-}
-
-// Fallback label for elements with no text/aria/placeholder — infers kind
-// from geometry + cursor (signals a site can't avoid when the element is
-// visible). Used only when every nameable surface is empty (LinkedIn's Quill
-// composer renders as "" without it).
-function _inferEntryKind(e) {
-  const tag = e.tag || '', role = e.role || '';
-  if (e.isContentEditable || e.cursor === 'text' ||
-      role === 'textbox' || role === 'combobox' ||
-      tag === 'input' || tag === 'textarea') return 'text field';
-  if (tag === 'button' || role === 'button' || e.cursor === 'pointer') return 'button';
-  if (e.hasSvg && e.w > 0 && e.w <= 56 && e.h > 0 && e.h <= 56) return 'icon button';
-  if (tag === 'a' || role === 'link') return 'link';
-  return '';
 }
 
 // Load a cached Tab-Flow by normalized goal pattern
@@ -3535,7 +3521,7 @@ async function _extractSteps(goal, currentUrl, tabMap, pageCategory, agentContex
   const elementList = (_scopedTabMap || []).map(e => {
     const _tag = e.tag || '';
     const _role = e.role || '';
-    const _label = e.text || e.ariaLabel || e.placeholder || e.dataPlaceholder || e.ariaRoleDescription || _inferEntryKind(e);
+    const _label = entryLabel(e);
     const _isFillable = ['input', 'textarea'].includes(_tag) ||
                         _role === 'combobox' || _role === 'textbox' ||
                         !!e.isContentEditable || e.cursor === 'text';
@@ -3543,7 +3529,7 @@ async function _extractSteps(goal, currentUrl, tabMap, pageCategory, agentContex
       ? (_filledMap.get(e.ref) || _filledMap.get(`label:${String(_label).toLowerCase()}`) || (e.value ? String(e.value) : ''))
       : '';
     const _marker = _isFillable ? '[FILLABLE]' : '[CLICKABLE]';
-    const _filledMark = _filledValue ? ` [FILLED: "${String(_filledValue).slice(0, 40)}"]` : '';
+    const _filledMark = _filledValue ? ` [FILLED: "${previewValue(_filledValue, 60)}"]` : '';
     const _ariaRoleDesc = e.ariaRoleDescription || '';
     const _placeholder = e.placeholder || '';
     const _extras = [
@@ -3601,7 +3587,7 @@ Rules:
 - COMPOUND ON-PAGE-ACTION RULE: If the goal has multiple action clauses (e.g., "click X and then click Y", "open its product page, and click the 'Add to Cart' button"), generate only the steps that can be executed on the CURRENT page. The runner will re-extract steps after any navigation. Do NOT return [{ "action": "done" }] just because the second action's target isn't visible yet — plan the first action and let the runner handle the rest.
 - COMMERCE RULE: If the goal mentions "add to cart", "add to bag", or "add to basket", and an element with that exact label is visible on the current page (e.g., an "Add to Cart" button on a search-result card), click THAT element directly — do not navigate to the product page first.
 - If the page has [FILLABLE] form fields, fill ALL of them before clicking any submit button (Send, Submit, Post, Save, etc.).
-- Elements marked [FILLED: "..."] are already filled — do NOT plan steps for them; plan only the remaining actions.
+- Elements marked [FILLED: "..."] are already filled — do NOT plan steps for them; plan only the remaining actions. A value ending in "… (N chars)" is truncated for display only — the field holds the full text.
 - Do NOT include steps for actions that require a different page (e.g., don't plan clicking a search result if the search hasn't been submitted yet — that's a future page).
 - If the goal is already achieved on this page, return [{ "action": "done" }].
 - For chip/token fields (email To, Recipients, CC, BCC): the system auto-confirms with Enter after Type. Do NOT add a separate press Enter step for chip confirmation.
@@ -3986,7 +3972,7 @@ async function _llmNextAction(goal, currentUrl, tabMap, actionHistory, pageCateg
     // Fall back through every nameable surface — LinkedIn's Quill composer
     // carries its label only in data-placeholder ("Share your thoughts..."),
     // and without it the LLM has nothing to name (emits `into the "" field`).
-    const _label = e.text || e.ariaLabel || e.placeholder || e.dataPlaceholder || e.ariaRoleDescription || _inferEntryKind(e);
+    const _label = entryLabel(e);
     const _isFillable = ['input', 'textarea'].includes(_tag) ||
                         _role === 'combobox' || _role === 'textbox' ||
                         !!e.isContentEditable || e.cursor === 'text';
@@ -3996,13 +3982,17 @@ async function _llmNextAction(goal, currentUrl, tabMap, actionHistory, pageCateg
     if (_isFillable) {
       markers.push('[FILLABLE]');
       if (_filledValue) {
-        markers.push(`[FILLED: "${String(_filledValue).slice(0, 40)}"]`);
+        markers.push(`[FILLED: "${previewValue(_filledValue, 60)}"]`);
       } else if (!e.readOnly && !e.disabled) {
         markers.push('[REQUIRED]');
       }
     } else {
       markers.push('[CLICKABLE]');
-      if (_submitKeywords.test(_label)) {
+      // Audience/visibility chips contain submit words but open a selector,
+      // not a submit — LinkedIn's "Post to Anyone" got [SUBMIT] and the LLM
+      // clicked it instead of the real Post button.
+      const _isAudiencePicker = /\b(?:post|share|send)\s+to\s+(?:anyone|connections|my network|a group|group)\b|who can see|visibility|audience\b/i.test(_label);
+      if (_submitKeywords.test(_label) && !_isAudiencePicker) {
         markers.push('[SUBMIT]');
       }
     }
@@ -4015,8 +4005,11 @@ async function _llmNextAction(goal, currentUrl, tabMap, actionHistory, pageCateg
     if (e.selected) markers.push('[SELECTED]');
     if (e.focused) markers.push('[FOCUSED]');
 
-    const _val = e.value || e.currentValue;
-    const _valStr = (_val && String(_val).trim()) ? ` value="${String(_val).replace(/\s+/g, ' ').trim().slice(0, 40)}"` : '';
+    // A filled value is the post-verify truth — the cached snapshot's e.value
+    // predates the fill (map isn't rebuilt per step), so prefer it or the LLM
+    // sees [FILLED: "X"] next to value="<old>" and re-acts on a done field.
+    const _val = _filledValue || e.value || e.currentValue;
+    const _valStr = (_val && String(_val).trim()) ? ` value="${previewValue(_val, 60)}"` : '';
     const _pos = (e.x !== undefined && e.y !== undefined && e.w !== undefined && e.h !== undefined)
       ? ` @x=${Math.round(e.x)},y=${Math.round(e.y)},w=${Math.round(e.w)},h=${Math.round(e.h)}` : '';
     return `${e.id} - ${_tag} "${_label}" ${_role ? `role=${_role} ` : ''}${markers.join(' ')}${_valStr}${_pos}`;
@@ -4024,7 +4017,7 @@ async function _llmNextAction(goal, currentUrl, tabMap, actionHistory, pageCateg
 
   // Build "Fields already filled" section
   const filledStr = (filledFields && filledFields.length > 0)
-    ? filledFields.map(f => `  ${f.label}: ${String(f.value).slice(0, 60)}`).join('\n')
+    ? filledFields.map(f => `  ${f.label}: ${previewValue(f.value, 80)}`).join('\n')
     : '  (none)';
 
   const historyStr = actionHistory.length > 0
@@ -4069,6 +4062,7 @@ Rules:
 - Use the EXACT text/label of elements as shown in the available elements list.
 - Use Type for [FILLABLE] elements and Click for [CLICKABLE] elements. Do NOT click a [FILLABLE] field — type into it directly.
 - Elements marked [FILLED: "value"] are already done — do NOT type into them again. Skip to the next [REQUIRED] field.
+- ABBREVIATED VALUE RULE: A value preview ending in "… (N chars)" is truncated for display only — the field holds the FULL text (N characters). Never treat it as partially filled, and never try to clear or complete it.
 - Elements marked [CLICKED] were already clicked — prefer a different element unless re-clicking is clearly needed (pagination, expanders).
 - Elements marked [DISABLED] cannot be interacted with yet — a required field is likely missing first.
 - Elements marked [COLLAPSED] are expandable rows/sections — clicking them reveals hidden fields (then type into the expanded input).
@@ -7097,14 +7091,43 @@ function _stripTaskNoise(task) {
   return t.replace(/\s+/g, ' ').trim();
 }
 
-function _isSearchCriteriaTask(task, classification = null) {
+// Extract the X from a "(Context from prior turn: X)" suffix injected by
+// preflightAgents.js / gatherPlanContext.js for follow-up turns ("try again",
+// "continue"). _stripTaskNoise deletes that marker, so criteria checks that run
+// on the stripped text go blind for bare follow-ups — while raw-text extractors
+// can leak the wrapper's ")". Consumers that need the semantic task should use
+// this clause (or better: classification.followUpTarget, the structured field
+// the marker is rendered from). Captures to the LAST ")" so inner parens in the
+// referent text don't truncate it.
+function _followUpContextClause(task) {
+  const m = String(task || '').match(/\n*\(Context from prior turn:\s*([\s\S]*)\)\s*$/i);
+  return m ? m[1].trim() : '';
+}
+
+// Candidate texts for search-criteria detection/extraction — the stripped head
+// first, then the follow-up referent. For bare follow-ups ("try again") the
+// head carries no task signal; the referent IS the task. For mutation follow-ups
+// ("delete it" + old search context) the head still wins in extraction order —
+// and the classification veto below still suppresses soft-criteria matches on
+// mutation-classified tasks.
+function _searchCriteriaCandidates(task, classification = null) {
+  const out = [];
   const t = _stripTaskNoise(task);
-  if (!t) return false;
-  const _hard = _HARD_OPERATOR_RE.test(t);
-  if (!_hard && !_SOFT_CRITERIA_RE.test(t)
-      && !_SEARCH_CRITERIA_PHRASE_RE.test(t) && !_SEARCH_CRITERIA_PHRASE_LC_RE.test(t)) {
-    return false;
-  }
+  if (t) out.push(t);
+  const ref = (typeof classification?.followUpTarget === 'string' && classification.followUpTarget.trim())
+    ? classification.followUpTarget.trim()
+    : _followUpContextClause(task);
+  if (ref && ref !== t) out.push(ref);
+  return out;
+}
+
+function _isSearchCriteriaTask(task, classification = null) {
+  const _cands = _searchCriteriaCandidates(task, classification);
+  if (!_cands.length) return false;
+  const _hit = (c) => _HARD_OPERATOR_RE.test(c) || _SOFT_CRITERIA_RE.test(c)
+    || _SEARCH_CRITERIA_PHRASE_RE.test(c) || _SEARCH_CRITERIA_PHRASE_LC_RE.test(c);
+  if (!_cands.some(_hit)) return false;
+  const _hard = _cands.some(c => _HARD_OPERATOR_RE.test(c));
   // Semantic veto: when the once-per-turn classifier (state._taskClassification)
   // says the task contains a mutation action (send_email, fill_form, post, ...),
   // soft criteria signals are almost always the message's subject/body fields —
@@ -7114,7 +7137,7 @@ function _isSearchCriteriaTask(task, classification = null) {
     try {
       const { isReadExtractionTask } = require('../skill-helpers/state-patterns.cjs');
       if (isReadExtractionTask(classification, logger) === false) {
-        logger.info(`[browser.agent] search-criteria suppressed by mutation classification (interactiveActions=${JSON.stringify(classification?.interactiveActions)}): "${t.slice(0, 80)}"`);
+        logger.info(`[browser.agent] search-criteria suppressed by mutation classification (interactiveActions=${JSON.stringify(classification?.interactiveActions)}): "${_cands[0].slice(0, 80)}"`);
         return false;
       }
     } catch (_) { /* non-fatal — fall through to regex verdict */ }
@@ -7211,19 +7234,40 @@ Query:`;
   }
 }
 
-async function _extractSearchQuery(task, serviceKey) {
-  const t = _stripTaskNoise(task);
-  if (!t) return { query: '', hasCriteria: false };
+async function _extractSearchQuery(task, serviceKey, classification = null) {
+  // Two-pass over [head, follow-up referent]: for bare follow-ups ("try again")
+  // the head carries no task text — the resolved referent does. Head is tried
+  // first so an explicit new query in the head wins over stale context.
+  const _cands = _searchCriteriaCandidates(task, classification);
+  if (!_cands.length) return { query: '', hasCriteria: false };
 
   const svc = String(serviceKey || '').toLowerCase().replace(/[^a-z0-9]/g, '');
 
-  // ── Primary: LLM extraction ──
-  const _llmResult = await _extractSearchQueryLLM(task, serviceKey);
-  if (_llmResult && _llmResult.hasCriteria && _llmResult.query) {
-    return _llmResult;
-  }
+  // Candidates carrying an explicit criteria signal are extracted first —
+  // otherwise an LLM pass over a bare head ("try again") can return a partial
+  // or hallucinated query ("is:unread") that short-circuits the referent,
+  // which holds the real criteria ("from:Pastor Wendal").
+  const _hit = (c) => _HARD_OPERATOR_RE.test(c) || _SOFT_CRITERIA_RE.test(c)
+    || _SEARCH_CRITERIA_PHRASE_RE.test(c) || _SEARCH_CRITERIA_PHRASE_LC_RE.test(c);
+  const _ordered = [..._cands.filter(_hit), ..._cands.filter(c => !_hit(c))];
 
-  // ── Fallback: regex extraction (improved with _FROM_TERMINATORS fix) ──
+  for (const _tx of _ordered) {
+    if (!_tx || _tx.trim().length < 3) continue;
+
+    // ── Primary: LLM extraction ──
+    const _llmResult = await _extractSearchQueryLLM(_tx, serviceKey);
+    if (_llmResult && _llmResult.hasCriteria && _llmResult.query) {
+      return _llmResult;
+    }
+
+    // ── Fallback: regex extraction (improved with _FROM_TERMINATORS fix) ──
+    const _reResult = _extractSearchQueryRegex(_tx, svc);
+    if (_reResult.hasCriteria) return _reResult;
+  }
+  return { query: '', hasCriteria: false };
+}
+
+function _extractSearchQueryRegex(t, svc) {
   const parts = [];
 
   // ── Common criteria extraction ──
@@ -7340,7 +7384,7 @@ function _canPromoteDeepLink(candidate, source, intent, baseHost, serviceKey = '
 async function _buildSearchCriteriaUrl(intent, serviceKey, baseStartUrl, baseHost, task, classification = null) {
   if (!_isSearchCriteriaTask(task, classification)) return null;
   const svc = String(serviceKey || '').toLowerCase().replace(/[^a-z0-9]/g, '');
-  const _sq = await _extractSearchQuery(task, svc);
+  const _sq = await _extractSearchQuery(task, svc, classification);
   if (!_sq.hasCriteria) return null;
 
   // ── MAIL ──
@@ -7388,7 +7432,7 @@ async function _buildSearchUrlFromPattern(serviceKey, task, baseHost, classifica
     }
   }
   const svc = String(serviceKey || '').toLowerCase().replace(/[^a-z0-9]/g, '');
-  const _sq = await _extractSearchQuery(task, svc);
+  const _sq = await _extractSearchQuery(task, svc, classification);
   if (!_sq.hasCriteria) return null;
   const _url = pattern.urlTemplate.replace('{query}', encodeURIComponent(_sq.query));
   logger.info(`[browser.agent] search-pattern cache hit for ${serviceKey}: ${_url} (pattern hitCount=${pattern.hitCount || 1})`);
@@ -7636,7 +7680,7 @@ async function _resolveCheapDeepLink(agentId, serviceKey, baseStartUrl, task, ex
 
     // ── Helper: extract encoded search query from task text ────────────────
     const _getEncodedQuery = async (taskText, svcKey) => {
-      const _sq = await _extractSearchQuery(taskText, svcKey);
+      const _sq = await _extractSearchQuery(taskText, svcKey, _dlTaskCls);
       if (_sq.hasCriteria) return encodeURIComponent(_sq.query);
       // Unquoted "search my <svc> for X" — prefer the service-gated extractor so
       // the loose regex below can't bake "my gmail for …" into the query.
@@ -7934,7 +7978,7 @@ async function _resolveTaskDeepLink(agentId, serviceKey, baseStartUrl, task, exi
                 // Build a search URL from the form action + the first search input name
                 const _searchInput = Array.isArray(_sf.inputs) ? _sf.inputs.find(i => /^(q|query|search|filter|s|term|keywords?)$/i.test(i.name || '')) : null;
                 if (_searchInput) {
-                  const _sq = await _extractSearchQuery(task, String(serviceKey || '').toLowerCase().replace(/[^a-z0-9]/g, ''));
+                  const _sq = await _extractSearchQuery(task, String(serviceKey || '').toLowerCase().replace(/[^a-z0-9]/g, ''), _dlTaskCls);
                   const _queryVal = _sq.hasCriteria ? _sq.query : '';
                   const _searchUrl = `${_sf.action}${_sf.action.includes('?') ? '&' : '?'}${_searchInput.name}=${encodeURIComponent(_queryVal)}`;
                   // Verify the form action is on-domain
@@ -14900,3 +14944,7 @@ module.exports._isPureSearchTask = _isPureSearchTask;
 module.exports._shouldSkipVideoDelegation = _shouldSkipVideoDelegation;
 module.exports._postProgress = _postProgress;
 module.exports._withSessionMutex = _withSessionMutex;
+module.exports._isSearchCriteriaTask = _isSearchCriteriaTask;
+module.exports._extractSearchQuery = _extractSearchQuery;
+module.exports._extractSearchQueryRegex = _extractSearchQueryRegex;
+module.exports._followUpContextClause = _followUpContextClause;
