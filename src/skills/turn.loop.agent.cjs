@@ -16,11 +16,12 @@
 
 const logger = require('../logger.cjs');
 const { playwrightAgent } = require('./playwright.agent.cjs');
-const { withSessionMutex } = require('./lib/browserCore/session.cjs');
+const { withSessionMutex, deriveSessionId } = require('./lib/browserCore/session.cjs');
 const { postProgress } = require('./lib/browserCore/progress.cjs');
 
 async function turnLoopAgent(args = {}) {
-  const { goal = '', sessionId, mode = 'act', _progressCallbackUrl } = args;
+  const { goal = '', mode = 'act', _progressCallbackUrl } = args;
+  const sessionId = args.sessionId || deriveSessionId(args.agentId || 'default.agent');
   if (!sessionId) return { ok: false, error: 'turn.loop.agent: no sessionId' };
   if (!goal) return { ok: false, error: 'turn.loop.agent: no goal' };
 
@@ -44,6 +45,8 @@ async function turnLoopAgent(args = {}) {
       error: res?.error,
       suggestedAgent: res?.ok ? undefined : 'tab.map.agent',
       sessionId,
+      actionHistory: Array.isArray(res?.actionHistory) ? res.actionHistory
+        : (Array.isArray(res?.turns) ? res.turns.map(t => String(t?.action || t).slice(0, 120)) : undefined),
       raw: res,
     };
   });

@@ -48,6 +48,7 @@ async function gestureAgent(args = {}) {
       error: res?.performed ? undefined : (res?.error || 'Gesture not performed'),
       suggestedAgent: res?.performed ? undefined : 'tab.map.agent',
       sessionId,
+      actionHistory,
     };
   });
 }

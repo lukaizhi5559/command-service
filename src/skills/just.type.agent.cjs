@@ -13,7 +13,7 @@
 // ---------------------------------------------------------------------------
 
 const logger = require('../logger.cjs');
-const { _executeJustType } = require('./instruction.runner.cjs');
+const { _executeJustType } = require('./lib/browserCore/typing.cjs');
 const { _extractValue } = require('./browser.agent.cjs');
 const { readActiveElement, detectOverlay } = require('./lib/browserCore/pageState.cjs');
 const { withSessionMutex } = require('./lib/browserCore/session.cjs');
@@ -45,7 +45,12 @@ async function justTypeAgent(args = {}) {
     postProgress(_progressCallbackUrl, { tier: 'just-type', message: `just.type.agent: typing "${String(value).slice(0, 50)}"` });
     const actionHistory = [];
     const res = await _executeJustType(sessionId, value, focused, pageCategory, goal, agentContext, null, overlayActive, actionHistory);
-    return { ok: !!res?.ok, output: res?.ok ? `Typed "${String(value).slice(0, 60)}"` : undefined, error: res?.error, suggestedAgent: res?.ok ? undefined : 'tab.map.agent', sessionId };
+    // Record what happened — the returned history/fill feeds the cross-step
+    // browser digest and lets the next step's LLM see this field as filled.
+    const _label = (focused?.ariaLabel || focused?.text || focused?.placeholder || '').slice(0, 80);
+    actionHistory.push(`Just-type "${String(value).slice(0, 40)}"${_label ? ` into "${_label}"` : ''} ${res?.ok ? '→ ok' : '→ FAILED'}`);
+    const filledFields = res?.ok ? [{ ref: focused?.ref || null, label: _label || 'focused element', value }] : [];
+    return { ok: !!res?.ok, output: res?.ok ? `Typed "${String(value).slice(0, 60)}"` : undefined, error: res?.error, suggestedAgent: res?.ok ? undefined : 'tab.map.agent', sessionId, actionHistory, filledFields };
   });
 }
 

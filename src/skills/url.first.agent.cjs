@@ -80,8 +80,16 @@ async function urlFirstAgent(args = {}) {
       return { ok: false, needsAuth: true, sessionId, agentId, url: landedUrl, error: `Sign-in wall detected at ${landedUrl}` };
     }
 
+    // Deep-link type tells downstream steps what the landing page already did:
+    // 'compose'/'creation' → a dialog auto-opened; 'search' → results already
+    // loaded. Passed through so the next step's LLM doesn't redo it.
+    let deepLinkType = 'none';
+    try {
+      deepLinkType = require('../skill-helpers/deep-link-types.cjs').classifyDeepLinkType(landedUrl) || 'none';
+    } catch (_) {}
+
     postProgress(_progressCallbackUrl, { tier: 'url-first', message: `url.first.agent: landed ${landedUrl}` });
-    return { ok: true, sessionId, agentId, url: landedUrl, deepLinkSource, output: landedUrl };
+    return { ok: true, sessionId, agentId, url: landedUrl, deepLinkSource, deepLinkType, output: landedUrl };
   });
 }
 

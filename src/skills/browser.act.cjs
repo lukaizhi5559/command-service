@@ -3558,6 +3558,46 @@ async function browserAct(args) {
               return { ok: true, action, sessionId, method: 'focus', executionTime: Date.now() - start };
             }
             logger.info(`[browser.act] click (engine) form-field focus fallback skipped: ${_focusResult?.reason || 'unknown'}`);
+
+            // ── Visible-ancestor activation ────────────────────────────────
+            // Zero-size widget inputs (Gmail PeopleKit To/Cc/Bcc comboboxes,
+            // Outlook recipients) reject direct focus — the input is a shadow
+            // of the visible row; the ROW receives the mouse event and its
+            // handlers focus the input. Walk up to the nearest visible
+            // ancestor, synthesize mousedown+click on it, then re-check focus.
+            // Selector/DOM-based — no coordinate clicks.
+            if (_focusResult && !_focusResult.ok && (_focusResult.reason === 'focus failed' || _focusResult.reason === 'off-screen')) {
+              try {
+                const _ancResult = await _ePage.evaluate((sel) => {
+                  const el = document.querySelector(sel);
+                  if (!el) return { ok: false, reason: 'not found' };
+                  let cur = el.parentElement, hops = 0, anc = null;
+                  while (cur && hops++ < 5) {
+                    const r = cur.getBoundingClientRect();
+                    if (r.width > 4 && r.height > 4) { anc = cur; break; }
+                    cur = cur.parentElement;
+                  }
+                  if (!anc) return { ok: false, reason: 'no visible ancestor' };
+                  const opts = { bubbles: true, cancelable: true, view: window, button: 0 };
+                  anc.dispatchEvent(new MouseEvent('mousedown', opts));
+                  anc.dispatchEvent(new MouseEvent('mouseup', opts));
+                  anc.dispatchEvent(new MouseEvent('click', opts));
+                  // Re-check whether focus reached the target or a descendant
+                  const active = document.activeElement;
+                  const focused = active === el || el.contains(active) ||
+                    (active && active !== document.body && anc.contains(active) &&
+                      (/^(INPUT|TEXTAREA)$/.test(active.tagName || '') || active.isContentEditable));
+                  return { ok: !!focused, reason: focused ? 'ancestor-focused' : 'ancestor-no-focus', activeTag: active?.tagName };
+                }, selector);
+                if (_ancResult?.ok) {
+                  logger.info(`[browser.act] click (engine) ancestor-activation ok for "${selector}" (activeTag=${_ancResult.activeTag})`);
+                  return { ok: true, action, sessionId, method: 'ancestor-mousedown', executionTime: Date.now() - start };
+                }
+                logger.info(`[browser.act] click (engine) ancestor-activation: ${_ancResult?.reason || 'unknown'}`);
+              } catch (_ancErr) {
+                logger.warn(`[browser.act] click (engine) ancestor-activation failed: ${_ancErr.message}`);
+              }
+            }
           } catch (_focusErr) {
             logger.warn(`[browser.act] click (engine) form-field focus fallback failed: ${_focusErr.message}`);
           }

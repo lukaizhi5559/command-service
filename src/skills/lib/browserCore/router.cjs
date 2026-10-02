@@ -132,9 +132,18 @@ async function routeOnPageAction({ sessionId, goal, pageCategory = 'web_generic'
     if (hit) return hit;
   }
 
-  // 4. Autofocused editable element + type/fill goal
+  // 4. Autofocused editable element + type/fill goal — but only for SINGLE-
+  //    field goals. just.type.agent performs exactly one type action; compound
+  //    goals (multiple fields, quoted values, submit verbs, "and" clauses)
+  //    need the tab.map loop (observed: "Fill To/Subject/Body and send"
+  //    routed here → only To filled → step falsely reported done).
   const focusedEditable = !!(focused && (focused.isContentEditable || /^(INPUT|TEXTAREA)$/.test(focused.tag) || focused.role === 'textbox' || focused.role === 'combobox'));
-  if ((probe?.hasAutoFocus || focusedEditable) && TYPE_GOAL_RE.test(goal)) {
+  const _compoundGoal =
+    /\b(?:send|submit|save|post|publish|click|attach|sign)\b/i.test(goal) ||
+    /\b(?:to|subject|body|cc|bcc|from|message|title|description)\s*:/i.test(goal) ||
+    (goal.match(/"[^"]+"/g) || []).length > 1 ||
+    /\band\b[\s\S]*\b(?:type|fill|enter|click|send|press)\b/i.test(goal);
+  if (!_compoundGoal && (probe?.hasAutoFocus || focusedEditable) && TYPE_GOAL_RE.test(goal)) {
     const hit = pick('just.type.agent', 'autofocus-type');
     if (hit) return hit;
   }

@@ -35,6 +35,7 @@ async function metaFindAgent(args = {}) {
       error: res?.error,
       suggestedAgent: res?.ok ? undefined : 'tab.map.agent',
       sessionId,
+      actionHistory: [`Meta+F "${String(searchText).slice(0, 40)}" ${res?.ok ? '→ found' : '→ not found'}`],
     };
   });
 }

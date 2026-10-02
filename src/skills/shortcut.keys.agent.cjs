@@ -55,12 +55,14 @@ async function shortcutKeysAgent(args = {}) {
 
     postProgress(_progressCallbackUrl, { tier: 'shortcuts', message: `shortcut.keys.agent: pressing ${keyCombo}` });
     const res = await _executeShortcut(sessionId, keyCombo, goal, actionHistory);
+    actionHistory.push(`Shortcut: pressed "${keyCombo}" ${res?.ok ? '→ ok' : '→ FAILED'}`);
     return {
       ok: !!res?.ok,
       output: res?.ok ? `Pressed ${keyCombo}` : undefined,
       error: res?.error,
       suggestedAgent: res?.ok ? undefined : 'tab.map.agent',
       sessionId,
+      actionHistory,
     };
   });
 }

@@ -2038,11 +2038,10 @@ function _detectSuccessfulSend(sessionId) {
   try {
     const _entries = browserEngine?.getNetLog(sessionId) || [];
     const _okMutation = (e) => /^(POST|PUT|PATCH)$/.test(e.method) && e.status >= 200 && e.status < 300;
-    // Fast path: a 2xx mutation to a known send endpoint.
-    if (_entries.some(e => _okMutation(e) && _SEND_ENDPOINT_RE.test(e.url || ''))) return true;
-    // Correlated fallback: a 2xx mutation POST to the same host within ~30s of
-    // a submit action, that isn't a known non-send write. Covers endpoints the
-    // regex doesn't know (provider renames the RPC path).
+    // A send-API hit only counts when it followed a submit action in THIS task.
+    // Without a marker, matching POSTs are unrelated background traffic (Gmail
+    // fires sync RPCs — including /i/s — when drafts open/autosave) or stale
+    // entries left over from an earlier task on the same long-lived session.
     const _marker = _submitMarkers.get(sessionId);
     if (!_marker) return false;
     return _entries.some(e => {
@@ -2053,6 +2052,9 @@ function _detectSuccessfulSend(sessionId) {
       if (_marker.host) {
         try { if (new URL(_u).hostname !== _marker.host) return false; } catch (_) { return false; }
       }
+      // Known send endpoint (named fast path) OR any non-excluded same-host
+      // mutation within the window (correlated fallback — covers providers
+      // that rename RPC paths).
       return true;
     });
   } catch (_) { return false; }
@@ -2965,6 +2967,21 @@ function _normalizeGoalForCache(goal) {
   return normalized.toLowerCase().replace(/\s+/g, ' ').trim();
 }
 
+// Fallback label for elements with no text/aria/placeholder — infers kind
+// from geometry + cursor (signals a site can't avoid when the element is
+// visible). Used only when every nameable surface is empty (LinkedIn's Quill
+// composer renders as "" without it).
+function _inferEntryKind(e) {
+  const tag = e.tag || '', role = e.role || '';
+  if (e.isContentEditable || e.cursor === 'text' ||
+      role === 'textbox' || role === 'combobox' ||
+      tag === 'input' || tag === 'textarea') return 'text field';
+  if (tag === 'button' || role === 'button' || e.cursor === 'pointer') return 'button';
+  if (e.hasSvg && e.w > 0 && e.w <= 56 && e.h > 0 && e.h <= 56) return 'icon button';
+  if (tag === 'a' || role === 'link') return 'link';
+  return '';
+}
+
 // Load a cached Tab-Flow by normalized goal pattern
 function _loadTabFlowCache(agentId, goal) {
   try {
@@ -3518,9 +3535,10 @@ async function _extractSteps(goal, currentUrl, tabMap, pageCategory, agentContex
   const elementList = (_scopedTabMap || []).map(e => {
     const _tag = e.tag || '';
     const _role = e.role || '';
-    const _label = e.text || e.ariaLabel || '';
+    const _label = e.text || e.ariaLabel || e.placeholder || e.dataPlaceholder || e.ariaRoleDescription || _inferEntryKind(e);
     const _isFillable = ['input', 'textarea'].includes(_tag) ||
-                        _role === 'combobox' || _role === 'textbox';
+                        _role === 'combobox' || _role === 'textbox' ||
+                        !!e.isContentEditable || e.cursor === 'text';
     const _filledValue = _isFillable
       ? (_filledMap.get(e.ref) || _filledMap.get(`label:${String(_label).toLowerCase()}`) || (e.value ? String(e.value) : ''))
       : '';
@@ -3919,7 +3937,7 @@ Extract the ordered steps:`;
 
 // Tab-Map strategy: LLM decides one action per step based on available elements.
 // Updated with [FILLABLE]/[CLICKABLE] markers, filled field tracking, and label fixes.
-async function _llmNextAction(goal, currentUrl, tabMap, actionHistory, pageCategory, agentContext, lastVerifyFailed, consumedRefs, filledFields, extractedPageText, stepType = null) {
+async function _llmNextAction(goal, currentUrl, tabMap, actionHistory, pageCategory, agentContext, lastVerifyFailed, consumedRefs, filledFields, extractedPageText, stepType = null, clickedRefs = null, clickedSubmitRefs = null, overlayActive = false) {
   const { askWithMessages } = require('../skill-helpers/skill-llm.cjs');
 
   const _contextBlock = agentContext
@@ -3944,13 +3962,34 @@ async function _llmNextAction(goal, currentUrl, tabMap, actionHistory, pageCateg
       if (f.label) _filledMap.set(`label:${String(f.label).toLowerCase()}`, f.value);
     }
   }
+  // Clicked refs — [CLICKED] informational marker for repeat-safe elements;
+  // submit-class clicks are excluded from the list entirely (see below).
+  const _clickedMap = new Set(clickedRefs || []);
+  const _clickedLabelSet = new Set(); // filled below from map entries
+  for (const e of (tabMap || [])) {
+    if (e.ref && _clickedMap.has(e.ref)) _clickedLabelSet.add(String(e.text || e.ariaLabel || '').toLowerCase());
+  }
 
-  const elementList = (tabMap || []).map(e => {
+  const elementList = (tabMap || [])
+    .filter(e => {
+      // Suppress submit-class elements already clicked this session — re-clicking
+      // an unchanged form produces the same no-op/failure. The caller clears the
+      // set when a fill lands (state changed → submit may now work). Also exclude
+      // consumed refs (wrong-target clicks that must not be re-picked).
+      if (e.ref && clickedSubmitRefs && clickedSubmitRefs.has(e.ref)) return false;
+      if (e.ref && consumedRefs && consumedRefs.has(e.ref)) return false;
+      return true;
+    })
+    .map(e => {
     const _tag = e.tag || '';
     const _role = e.role || '';
-    const _label = e.text || e.ariaLabel || '';
+    // Fall back through every nameable surface — LinkedIn's Quill composer
+    // carries its label only in data-placeholder ("Share your thoughts..."),
+    // and without it the LLM has nothing to name (emits `into the "" field`).
+    const _label = e.text || e.ariaLabel || e.placeholder || e.dataPlaceholder || e.ariaRoleDescription || _inferEntryKind(e);
     const _isFillable = ['input', 'textarea'].includes(_tag) ||
-                        _role === 'combobox' || _role === 'textbox';
+                        _role === 'combobox' || _role === 'textbox' ||
+                        !!e.isContentEditable || e.cursor === 'text';
     const _filledValue = _filledMap.get(e.ref) || _filledMap.get(`label:${String(_label).toLowerCase()}`);
 
     const markers = [];
@@ -3958,7 +3997,7 @@ async function _llmNextAction(goal, currentUrl, tabMap, actionHistory, pageCateg
       markers.push('[FILLABLE]');
       if (_filledValue) {
         markers.push(`[FILLED: "${String(_filledValue).slice(0, 40)}"]`);
-      } else {
+      } else if (!e.readOnly && !e.disabled) {
         markers.push('[REQUIRED]');
       }
     } else {
@@ -3967,10 +4006,20 @@ async function _llmNextAction(goal, currentUrl, tabMap, actionHistory, pageCateg
         markers.push('[SUBMIT]');
       }
     }
+    if (e.ref && _clickedMap.has(e.ref)) markers.push('[CLICKED]');
+    if (e.disabled) markers.push('[DISABLED]');
+    if (e.readOnly) markers.push('[READONLY]');
+    if (e.expanded === true) markers.push('[EXPANDED]');
+    if (e.expanded === false) markers.push('[COLLAPSED]');
+    if (e.checked) markers.push('[CHECKED]');
+    if (e.selected) markers.push('[SELECTED]');
+    if (e.focused) markers.push('[FOCUSED]');
 
+    const _val = e.value || e.currentValue;
+    const _valStr = (_val && String(_val).trim()) ? ` value="${String(_val).replace(/\s+/g, ' ').trim().slice(0, 40)}"` : '';
     const _pos = (e.x !== undefined && e.y !== undefined && e.w !== undefined && e.h !== undefined)
       ? ` @x=${Math.round(e.x)},y=${Math.round(e.y)},w=${Math.round(e.w)},h=${Math.round(e.h)}` : '';
-    return `${e.id} - ${_tag} "${_label}" ${_role ? `role=${_role} ` : ''}${markers.join(' ')}${_pos}`;
+    return `${e.id} - ${_tag} "${_label}" ${_role ? `role=${_role} ` : ''}${markers.join(' ')}${_valStr}${_pos}`;
   }).join('\n');
 
   // Build "Fields already filled" section
@@ -3986,11 +4035,19 @@ async function _llmNextAction(goal, currentUrl, tabMap, actionHistory, pageCateg
     ? '\n\nNOTE: You previously said DONE but verification failed — the goal is NOT yet achieved. Try another action.'
     : '';
 
+  const overlayNote = overlayActive
+    ? '\n\nNOTE: A dialog/overlay is currently open — the element list is scoped to it. Work inside the dialog; do NOT look for page-level navigation.'
+    : '';
+
+  const suppressedNote = (clickedSubmitRefs && clickedSubmitRefs.size > 0)
+    ? '\n\nNOTE: A submit/send element was already clicked and is hidden from the list — re-clicking an unchanged form produces the same result. If submission did not take effect, a required field is likely missing or invalid; fill it and the submit element will reappear.'
+    : '';
+
   const systemPrompt = `You are navigating a web page to achieve a goal.
 Look at the goal, the current URL, the actions you've already taken, the fields already filled, and the available elements.
 Decide the SINGLE next action that gets closest to achieving the goal.${_stepTypeBlock}
 
-Output ONLY one action, one line. No preamble, no explanation, no numbering, no markdown.
+Output ONLY one action, one line. No preamble, no explanation, no numbering, no markdown. If you reconsider mid-answer, output ONLY the final corrected action line — never include earlier drafts, reasoning, or restated element states.
 
 Action formats (use EXACTLY these verb forms):
   Click "button text"
@@ -4012,6 +4069,11 @@ Rules:
 - Use the EXACT text/label of elements as shown in the available elements list.
 - Use Type for [FILLABLE] elements and Click for [CLICKABLE] elements. Do NOT click a [FILLABLE] field — type into it directly.
 - Elements marked [FILLED: "value"] are already done — do NOT type into them again. Skip to the next [REQUIRED] field.
+- Elements marked [CLICKED] were already clicked — prefer a different element unless re-clicking is clearly needed (pagination, expanders).
+- Elements marked [DISABLED] cannot be interacted with yet — a required field is likely missing first.
+- Elements marked [COLLAPSED] are expandable rows/sections — clicking them reveals hidden fields (then type into the expanded input).
+- Elements marked [FOCUSED] already have keyboard focus — type into them directly without clicking.
+- [CHECKED]/[SELECTED] elements are already on — do not re-toggle.
 - Elements marked [REQUIRED] are form fields that must be filled. Fill all [REQUIRED] fields first.
 - WHILE any [REQUIRED] field is NOT [FILLED], your ONLY allowed actions are:
     (1) Type into a [REQUIRED] field
@@ -4050,7 +4112,7 @@ Page category: ${pageCategory || 'unknown'}
 Actions taken so far:
 ${historyStr}
 Fields already filled:
-${filledStr}${verifyNote}${_contextBlock}${_pageTextBlock}
+${filledStr}${verifyNote}${overlayNote}${suppressedNote}${_contextBlock}${_pageTextBlock}
 
 Available elements on the current page:
 ${elementList}

@@ -32,7 +32,7 @@ async function arrowGridAgent(args = {}) {
       if (res?.error && res.markTried && !res.typedOk) {
         // Hard failure (non-spreadsheet page) or no more targets
         if (res.error?.includes('Not a spreadsheet')) {
-          return { ok: false, error: res.error, suggestedAgent: 'tab.map.agent', sessionId };
+          return { ok: false, error: res.error, suggestedAgent: 'tab.map.agent', sessionId, actionHistory };
         }
         lastError = res.error;
       }
@@ -40,11 +40,11 @@ async function arrowGridAgent(args = {}) {
       if (res?.markTried && !res?.typedOk && !res?.error) {
         const filled = actionHistory.filter(a => a.startsWith('ArrowGrid: typed')).length;
         logger.info(`[arrow.grid.agent] done — ${filled} cells filled`);
-        return { ok: filled > 0 || actionHistory.length === 0, output: `Filled ${filled} cell(s)`, sessionId };
+        return { ok: filled > 0 || actionHistory.length === 0, output: `Filled ${filled} cell(s)`, sessionId, actionHistory };
       }
       lastError = res?.error || lastError;
     }
-    return { ok: false, error: lastError || `Reached max ${maxSteps} arrow-grid steps`, suggestedAgent: 'tab.map.agent', sessionId };
+    return { ok: false, error: lastError || `Reached max ${maxSteps} arrow-grid steps`, suggestedAgent: 'tab.map.agent', sessionId, actionHistory };
   });
 }
 

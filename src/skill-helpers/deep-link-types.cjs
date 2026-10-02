@@ -36,15 +36,22 @@ function classifyDeepLinkType(url, pageCategory) {
   const search = u.search || '';
   const fullUrl = url; // for hash-embedded query patterns
 
-  // 1. Creation: *.new shortcut domains (notion.new, docs.new, sheets.new)
-  //    or paths containing /new, /create (word-boundary guarded)
+  // 1. Creation: *.new shortcut domains (notion.new, docs.new, sheets.new),
+  //    paths containing /new, /create, Google Calendar template/event-edit
+  //    URLs (?action=TEMPLATE, /eventedit) — entity already created
   if (host.endsWith('.new') || host === 'new') return 'creation';
   if (/\/(new|create)(\/|$|\?|#)/i.test(path)) return 'creation';
+  if (/[?&]action=TEMPLATE\b/i.test(search)) return 'creation';
+  if (/\/(eventedit|event\/new)(\/|$|\?|#)/i.test(path)) return 'creation';
 
-  // 2. Compose: #compose=new, #inbox?compose=new, /compose (email-specific)
+  // 2. Compose: #compose=new, #inbox?compose=new, /compose, share intents
+  //    (twitter.com/intent/tweet, linkedin.com/shareArticle, /sharebox) —
   //    Check BEFORE search because compose URLs may contain query-like patterns.
   //    Gmail uses #inbox?compose=new (compose param inside the hash fragment)
   if (/(#compose=new|#compose\b|compose=new|\/compose\b)/i.test(fullUrl)) return 'compose';
+  //    Also covers feed-level share activators: linkedin.com/feed/?shareActive=true,
+  //    ?shareActive, composer-modal params — the modal mounts lazily after load.
+  if (/(intent\/(tweet|share|whatsapp)|sharebox|shareArticle|sharing\/share-offsite|deeplink=compose|shareActive\b|[?&]composer\b|composeModal)/i.test(fullUrl)) return 'compose';
 
   // 3. Search: #search/, ?q=, ?filter=, &filter=, is:unread, from:, etc.
   //    Covers Gmail hash-search, generic query params, filter operators, and
@@ -68,6 +75,14 @@ function classifyDeepLinkType(url, pageCategory) {
     return 'read';
   }
 
+  // 6. Generic overlay-intent heuristic — param KEY names that imply a
+  //    compose/share/modal UI auto-opens on load. Key-based, not value-based
+  //    (values vary wildly per site): linkedin ?shareActive=true, reddit
+  //    ?submit=true, ?composer, ?new=post, ?draft=, ?modal=share... A false
+  //    positive only costs a short overlay poll — a false negative is the
+  //    "modal never awaited" bug, so over-trigger is intentional.
+  if (_urlHasOverlayParamKey(u)) return 'compose';
+
   return 'none';
 }
 
@@ -89,7 +104,47 @@ function getDeepLinkDescription(type) {
   return descriptions[type] || descriptions.none;
 }
 
+// URL markers that auto-open transient UI (dialogs, modals, compose panels,
+// share boxes, wizards). Used by deepLinkOpensOverlay — keep word-boundary
+// guarded so terms like "news" don't false-positive.
+const OVERLAY_URL_RE = /(compose|dialog|modal|popup|wizard|eventedit|action=TEMPLATE|intent\/|sharebox|shareArticle|[?&#](new|create|draft|compose|edit)=|#new\b|\/new\b)/i;
+
+/**
+ * Whether navigating to this URL is expected to leave a transient overlay
+ * (dialog/compose panel/share box) open on screen. When true, downstream
+ * agents must NOT reset focus (Escape + top-left click would dismiss it).
+ * @param {string} url — the landed URL
+ * @param {string} [deepLinkType] — optional pre-classified type
+ * @returns {boolean}
+ */
+function deepLinkOpensOverlay(url, deepLinkType) {
+  const type = deepLinkType || classifyDeepLinkType(url);
+  if (type === 'compose' || type === 'creation') return true;
+  // Param-key fallback runs regardless of classified type — e.g. ?reply=true
+  // on a 'read'-typed post page still auto-opens a reply box.
+  const u = url ? _safeUrl(url) : null;
+  if (u && _urlHasOverlayParamKey(u)) return true;
+  return url ? OVERLAY_URL_RE.test(url) : false;
+}
+
 // ─── Internal helpers ──────────────────────────────────────────────────────
+
+// Param keys (query OR hash-embedded) that imply transient UI auto-opens.
+const OVERLAY_PARAM_KEY_RE = /^(?:composer?|compose|share(?:active)?|post|tweet|toot|modal|dialog|dialogopen|draft|reply(?:to)?|comment|edit(?:or)?|publish|write|new|create|submit|quickpost|story|message|send|openform|form)$/i;
+
+function _urlHasOverlayParamKey(u) {
+  // u.search for query params; hash may embed a ?query (Gmail #inbox?compose=new)
+  // or be a bare flag (#compose). URLSearchParams tolerates bare keys too.
+  for (const src of [u.search || '', (u.hash || '')]) {
+    const q = src.includes('?') ? src.slice(src.indexOf('?')) : src;
+    try {
+      for (const k of new URLSearchParams(q).keys()) {
+        if (OVERLAY_PARAM_KEY_RE.test(k.replace(/^[#?]/, ''))) return true;
+      }
+    } catch (_) {}
+  }
+  return false;
+}
 
 function _safeUrl(url) {
   try {
@@ -102,4 +157,5 @@ function _safeUrl(url) {
 module.exports = {
   classifyDeepLinkType,
   getDeepLinkDescription,
+  deepLinkOpensOverlay,
 };
