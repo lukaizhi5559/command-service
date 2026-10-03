@@ -399,6 +399,32 @@ function _normalizedIndexOf(text, needle, opts = {}) {
 function _applyOps(text, ops) {
   const applied = [];
   for (const [oi, op] of (ops || []).entries()) {
+    // ── Line-indexed ops — transcription-free addressing (1-based, relative
+    // to this text slice). Optional "expect" sanity-checks the line's content
+    // so a miscount surfaces as a retryable miss instead of a wrong-line edit.
+    if (op && (typeof op.line === 'number' || typeof op.insert_after_line === 'number' || typeof op.delete_line === 'number')) {
+      const n = op.line ?? op.insert_after_line ?? op.delete_line;
+      const lines = text.split('\n');
+      if (n < 1 || n > lines.length) {
+        return { error: `op ${oi}: line ${n} out of range (1-${lines.length})`, reason: 'op_no_match', op };
+      }
+      const expect = String(op.expect ?? '').trim();
+      const lineIdx = n - 1;
+      if (expect) {
+        const hit = _normalizedIndexOf(lines[lineIdx], expect);
+        if (!hit) return { error: `op ${oi}: line ${n} does not contain expected text "${expect.slice(0, 60)}"`, reason: 'op_no_match', op };
+      }
+      if (typeof op.line === 'number' && typeof op.replace === 'string') {
+        lines[lineIdx] = op.replace;
+      } else if (typeof op.insert_after_line === 'number') {
+        lines.splice(lineIdx + 1, 0, ...String(op.text ?? op.replace ?? '').split('\n'));
+      } else {
+        lines.splice(lineIdx, 1);
+      }
+      text = lines.join('\n');
+      applied.push({ line: n, position: lineIdx });
+      continue;
+    }
     const find = String(op?.find ?? '');
     const replace = String(op?.replace ?? '');
     if (!find) return { error: `op ${oi}: empty find`, reason: 'op_bad_shape', op };
@@ -478,14 +504,20 @@ async function _emitOps(goal, text, contextLabel, agentContext) {
   const { askWithMessages } = require('../skill-helpers/skill-llm.cjs');
   const { parseLlmJson } = require('../skill-helpers/parseLlmJson.cjs');
 
-  const systemPrompt = `You are a precise text editor that emits SEARCH/REPLACE operations.
+  const systemPrompt = `You are a precise text editor that emits edit operations.
 For the given text, return a JSON array of edit ops that accomplish the goal.
-Each op: {"find": "<verbatim text copied EXACTLY from the text>", "replace": "<new text>", "occurrence": "first"|"all"}
+Each op is ONE of:
+  {"line": <1-based line number>, "replace": "<new line content>", "expect": "<few words that line contains>"}
+  {"insert_after_line": <line number>, "text": "<line(s) to insert>"}
+  {"delete_line": <line number>, "expect": "<few words that line contains>"}
+  {"find": "<verbatim text copied EXACTLY from the text>", "replace": "<new text>", "occurrence": "first"|"all"}
 Rules:
-- "find" MUST be copied character-for-character from the text below — it is matched literally
-- Keep "find" as short as possible while staying unique within this text (a line or two, not paragraphs)
-- Use occurrence:"all" to change every match; otherwise each find must be unique
-- To rewrite a whole paragraph/section, find can span it — but prefer several small ops when only parts change
+- Lines are numbered 1..N within THIS text, counting every line including blanks
+- PREFER line ops for rewriting whole lines or sections — they need no quoting;
+  add "expect" (a few words from that line) so miscounts are caught safely
+- Use "find" ops only for short inline changes; "find" MUST be copied
+  character-for-character and stay unique within this text
+- To rewrite a whole paragraph/section, prefer line ops — one per line
 - If nothing in THIS text needs changing for the goal, return []
 - Return ONLY the JSON array — no explanation, no markdown fences`;
 
@@ -842,12 +874,13 @@ function _textutilToDocx(filePath) {
 }
 
 // LLM → validated ops array. kind selects the op schema shown to the model.
-async function _officeOps(goal, extracted, kind, agentContext) {
+// retryNote carries feedback from a failed apply pass (missed find strings).
+async function _officeOps(goal, extracted, kind, agentContext, retryNote) {
   const { askWithMessages } = require('../skill-helpers/skill-llm.cjs');
 
   const schema = kind === 'xlsx'
     ? `{"ops":[{"sheet":"<sheet name, optional>","cell":"A1","value":"<new value>"} | {"cell":"B2","number_format":"$#,##0.00"} | {"cell":"C3","bold":true} | {"cell":"C4","italic":true}]}`
-    : `{"ops":[{"find":"<verbatim text to find>","replace":"<replacement>","all":false} | {"append":"<new paragraph text>"}]}`;
+    : `{"ops":[{"para":<index from [N]>,"replace":"<new paragraph text>"} | {"insert_after":<index>,"text":"<new paragraph>"} | {"delete_para":<index>} | {"find":"<verbatim text to find>","replace":"<replacement>","all":false} | {"append":"<new paragraph text>"}]}`;
 
   const userPrompt = `Goal: ${goal}
 ${agentContext ? `\nAgent context:\n${String(agentContext).slice(0, 400)}\n` : ''}
@@ -855,10 +888,13 @@ Extracted ${kind} content:
 ---
 ${extracted.slice(0, 12000)}
 ---
-
+${retryNote ? `\n${retryNote}\n` : ''}
 Reply with ONLY a JSON object of edit operations matching this schema:
 ${schema}
-- "find" strings must be copied verbatim from the extracted content
+- PREFER "para"/"insert_after"/"delete_para" ops for whole-section rewrites (verse blocks, per-person sections) — the [N] indices are shown in the extract; no text quoting needed
+- When a section pairs a reference/heading line with body or quoted content beneath it, emit an op for EACH — the reference line AND the body text — so both stay consistent
+- When the goal updates repeated sections (one per person/entry/item), emit ops for EVERY section, not just the first
+- Use "find" ops only for short inline changes; "find" must be copied VERBATIM (curly quotes, dashes, emoji included) and must NEVER contain newlines
 - Prefer few, precise ops; no more than 40 ops
 - If the goal cannot be expressed as ops, reply {"ops":[]}`;
 
@@ -906,17 +942,51 @@ async function _editOffice(goal, filePath, ext, agentContext) {
   const applied = _py(script, ['apply', workPath, draftPath], JSON.stringify({ ops: o.ops }));
   if (!applied.ok) return { ok: false, error: `apply failed: ${applied.error}`, reason: 'office_ops_failed' };
 
+  let applyMeta = {};
+  try { applyMeta = JSON.parse(applied.stdout.trim().split('\n').pop() || '{}'); } catch (_) {}
+  let totalOps = o.ops.length;
+
+  // One retry pass for ops whose "find" didn't match — re-extract the current
+  // draft and ask the model to re-emit ONLY the missed ops verbatim.
+  if (applyMeta.missed > 0 && Array.isArray(applyMeta.missedOps) && applyMeta.missedOps.length) {
+    const missedFinds = applyMeta.missedOps
+      .map(i => o.ops[i])
+      .filter(op => op && typeof op.find === 'string')
+      .map(op => op.find.slice(0, 160));
+    if (missedFinds.length) {
+      logger.info(`[edit.agent] office: ${missedFinds.length} op(s) missed — retrying with verbatim feedback`);
+      const midExtract = _py(script, ['extract', draftPath]);
+      if (midExtract.ok) {
+        const retryNote = `IMPORTANT: A first edit pass already applied some changes. These "find" strings did NOT match — re-emit ops ONLY for these missed changes, copying find text VERBATIM from the extract below (which reflects the current draft):\n${missedFinds.map(f => `- ${f}`).join('\n')}`;
+        const o2 = await _officeOps(goal, midExtract.stdout, kind, agentContext, retryNote);
+        if (!o2.failed && o2.ops.length) {
+          const applied2 = _py(script, ['apply', draftPath, draftPath], JSON.stringify({ ops: o2.ops }));
+          if (applied2.ok) {
+            let meta2 = {};
+            try { meta2 = JSON.parse(applied2.stdout.trim().split('\n').pop() || '{}'); } catch (_) {}
+            totalOps += o2.ops.length;
+            applyMeta = {
+              applied: (applyMeta.applied || 0) + (meta2.applied || 0),
+              missed: meta2.missed || 0,
+              retried: missedFinds.length,
+            };
+          }
+        }
+      }
+    }
+  }
+
   const after = _py(script, ['extract', draftPath]);
   const diff = after.ok ? _unifiedDiff(before.stdout, after.stdout, path.basename(filePath)) : '';
 
-  let applyMeta = {};
-  try { applyMeta = JSON.parse(applied.stdout.trim().split('\n').pop() || '{}'); } catch (_) {}
   const _officeHolders = _openFileHolders(filePath);
-  const summary = `Draft ${kind} edit on ${path.basename(filePath)}: ${applyMeta.applied ?? o.ops.length} ops applied${applyMeta.missed ? `, ${applyMeta.missed} missed` : ''} → ${draftPath}`;
+  const summary = `Draft ${kind} edit on ${path.basename(filePath)}: ${applyMeta.applied ?? totalOps} ops applied${applyMeta.missed ? `, ${applyMeta.missed} missed` : ''} → ${draftPath}`;
   logger.info(`[edit.agent] office: ${summary}`);
   return {
     ok: true, filePath, changed: true, mode: 'draft', draftPath, diff,
-    appliedEdits: applyMeta.applied ?? o.ops.length, skippedEdits: [],
+    appliedEdits: applyMeta.applied ?? totalOps, skippedEdits: [],
+    missedEdits: applyMeta.missed || 0, retriedOps: applyMeta.retried || 0,
+    partialEdits: (applyMeta.missed || 0) > 0 || undefined,
     converted, openIn: _officeHolders, summary, stdout: summary,
   };
 }

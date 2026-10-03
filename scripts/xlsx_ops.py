@@ -48,15 +48,15 @@ def apply_ops(src, dst):
     ops = payload.get('ops', [])[:40]
     wb = openpyxl.load_workbook(src)
     applied = 0
-    missed = 0
-    for op in ops:
+    missed_ops = []
+    for oi, op in enumerate(ops):
         if not isinstance(op, dict) or 'cell' not in op:
-            missed += 1
+            missed_ops.append(oi)
             continue
         try:
             ws = wb[op['sheet']] if op.get('sheet') else wb.active
         except KeyError:
-            missed += 1
+            missed_ops.append(oi)
             continue
         try:
             cell = ws[str(op['cell'])]
@@ -73,9 +73,10 @@ def apply_ops(src, dst):
                 cell.font = f
             applied += 1
         except Exception:
-            missed += 1
+            missed_ops.append(oi)
     wb.save(dst)
-    print(json.dumps({'applied': applied, 'missed': missed}))
+    print(json.dumps({'applied': applied, 'missed': len(missed_ops),
+                      'missedOps': missed_ops}))
 
 
 if __name__ == '__main__':
