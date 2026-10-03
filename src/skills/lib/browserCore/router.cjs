@@ -163,9 +163,13 @@ async function routeOnPageAction({ sessionId, goal, pageCategory = 'web_generic'
     if (hit) return hit;
   }
 
-  // 3. Spreadsheet grid — only for cell nav/fill goals
+  // 3. Spreadsheet grid — only for cell nav/fill goals. Google Sheets renders
+  //    its grid in CANVAS — DOM grid signals never fire there, so detect the
+  //    editor by URL too (covers docs.google.com/spreadsheets).
   const sig = probe?.categorySignals || {};
-  const isGrid = pageCategory === 'spreadsheet' || (sig.hasGrid && (sig.hasFormulaBar || sig.hasGridCell));
+  const isGrid = pageCategory === 'spreadsheet'
+    || /\/spreadsheets?\//i.test(currentUrl)
+    || (sig.hasGrid && (sig.hasFormulaBar || sig.hasGridCell));
   if (isGrid && /\b(cell|column|row|spreadsheet|sheet|fill|enter|type|a1|b2)\b/i.test(goal)) {
     const hit = pick('arrow.grid.agent', 'spreadsheet-grid');
     if (hit) return hit;

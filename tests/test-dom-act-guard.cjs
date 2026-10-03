@@ -64,5 +64,46 @@ check('single quoted create event → NOT multi-part (tab.map stays)',
 check('simple fill → NOT multi-part', _isMultiPartGoal("type 'hello' into the field") === false);
 check('simple click → NOT multi-part', _isMultiPartGoal('click the Save button') === false);
 
-console.log(`\n${passed} passed, ${failed} failed`);
-if (failures.length) { console.log('FAILURES:', failures.join(' | ')); process.exit(1); }
+console.log('\n--- _normalizeCreateUrl (eventedit create needs ?action=TEMPLATE) ---');
+const { _normalizeCreateUrl } = require('../src/skills/url.first.agent.cjs');
+check('bare eventedit + create task → action=TEMPLATE appended',
+  _normalizeCreateUrl('https://calendar.google.com/calendar/u/0/r/eventedit', 'create a new calendar event') === 'https://calendar.google.com/calendar/u/0/r/eventedit?action=TEMPLATE');
+check('bare eventedit + non-create task → unchanged',
+  _normalizeCreateUrl('https://calendar.google.com/calendar/u/0/r/eventedit', 'edit my event') === 'https://calendar.google.com/calendar/u/0/r/eventedit');
+check('eventedit already paramed → unchanged',
+  _normalizeCreateUrl('https://calendar.google.com/calendar/u/0/r/eventedit?action=TEMPLATE', 'create event') === 'https://calendar.google.com/calendar/u/0/r/eventedit?action=TEMPLATE');
+check('non-calendar URL → unchanged',
+  _normalizeCreateUrl('https://docs.google.com/document/create', 'create doc') === 'https://docs.google.com/document/create');
+
+console.log('\n--- _goalCompletionRejectReason (stateChanged gate) ---');
+const { _goalCompletionRejectReason } = require('../src/skills/lib/browserCore/tabMap.cjs');
+(async () => {
+  // The run-3 calendar bug: compound goal, last action page-changed → reject.
+  check('compound goal + page-changed click → rejected',
+    (await _goalCompletionRejectReason("fill the event with title 'Flight to Denver' and date July 15",
+      ['Click "Previous month" → page changed'], null)) !== null);
+  // Nav goal legitimately ends on nav.
+  check('nav goal + navigate action → allowed',
+    (await _goalCompletionRejectReason('navigate to gmail.com',
+      ['navigate → page changed'], null)) === null);
+  // Submit goal + no submit act → rejected.
+  check('submit goal + no submit act → rejected',
+    (await _goalCompletionRejectReason('send the email to bob',
+      ['Type "hi" into the "Body" field → ok'], null)) !== null);
+  // Submit goal + submit act → allowed.
+  check('submit goal + submit act → allowed',
+    (await _goalCompletionRejectReason('send the email to bob',
+      ['Type "hi" into the "Body" field → ok', 'Click "Send" → page changed'], null)) === null);
+  // Single-clause non-mutation goal → allowed.
+  check('simple fill goal done → allowed',
+    (await _goalCompletionRejectReason("fill 'item' into the name field",
+      ['Type "item" into the "Name" field → ok'], null)) === null);
+
+  console.log('\n--- source-level: stateChanged goes through the gate ---');
+  const _tabMapSrc = require('fs').readFileSync(require('path').join(__dirname, '../src/skills/lib/browserCore/tabMap.cjs'), 'utf8');
+  check('stateChanged path calls _goalCompletionRejectReason', /_goalCompletionRejectReason\(goal, \[\.\.\.\(actionHistory/.test(_tabMapSrc));
+  check('rejected stateChanged rescans instead of done', /stateChanged but goal gate rejected/.test(_tabMapSrc));
+
+    if (failures.length) { console.log('FAILURES:', failures.join(' | ')); process.exit(1); }
+  process.exit(0);
+})();

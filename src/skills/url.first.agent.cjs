@@ -36,6 +36,23 @@ function _resolveDeepLinkType(targetUrl, landedUrl) {
   }
 }
 
+// Normalize create-intent deep links that resolve to inert bare URLs. A bare
+// Google Calendar /eventedit (learned into the deep-link cache from prior
+// edit-page traffic) renders the month GRID, not the event form — the create
+// surface needs ?action=TEMPLATE. Only applied for create-ish tasks.
+function _normalizeCreateUrl(url, task) {
+  try {
+    const u = new URL(url);
+    const isCreateTask = /\b(create|add|new|schedule|book|make)\b/i.test(task || '');
+    if (isCreateTask && u.hostname === 'calendar.google.com' &&
+        /\/eventedit\/?$/i.test(u.pathname) && !u.searchParams.get('action')) {
+      u.searchParams.set('action', 'TEMPLATE');
+      return u.toString();
+    }
+  } catch (_) {}
+  return url;
+}
+
 async function urlFirstAgent(args = {}) {
   const { service, agentId: _agentId, task = '', url: _explicitUrl, headed = true, _progressCallbackUrl } = args;
   const agentId = _agentId || (service ? `${String(service).toLowerCase().replace(/\s+/g, '_')}.agent` : 'default.agent');
@@ -74,6 +91,7 @@ async function urlFirstAgent(args = {}) {
     if (!targetUrl) {
       return { ok: false, sessionId, agentId, error: `No URL resolved for ${agentId}` , suggestedAgent: null };
     }
+    targetUrl = _normalizeCreateUrl(targetUrl, task) || targetUrl;
 
     // 2. Navigate the shared session
     logger.info(`[url.first.agent] navigating ${sessionId} → ${targetUrl} (source=${deepLinkSource || 'startUrl'})`);
@@ -106,4 +124,4 @@ async function urlFirstAgent(args = {}) {
   });
 }
 
-module.exports = { urlFirstAgent, _resolveDeepLinkType };
+module.exports = { urlFirstAgent, _resolveDeepLinkType, _normalizeCreateUrl };

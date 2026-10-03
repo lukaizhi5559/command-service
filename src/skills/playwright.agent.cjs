@@ -2150,18 +2150,28 @@ async function getInteractionScript(service, pageType, taskKeywords = []) {
       const val = entry.value;
       if (!val || !val.script_yaml) continue;
       if (val.status !== 'healthy' && val.status !== 'degraded') continue;
-      // Keyword matching if trigger_keywords present
+      // Keyword matching — EXACT WORD equality only. Substring matching let a
+      // goal keyword ('row' from "row 1") match a stale script's 'browser'
+      // keyword ('row' ⊂ 'browser'), replaying a title-type script that typed
+      // a column header into the live Rename field. A script must never run
+      // on substring luck.
       if (val.trigger_keywords && taskKeywords.length > 0) {
-        const overlap = val.trigger_keywords.filter(k => taskKeywords.some(t => t.toLowerCase().includes(k.toLowerCase()) || k.toLowerCase().includes(t.toLowerCase())));
-        if (overlap.length > 0) {
+        const _taskSet = new Set(taskKeywords.map(t => t.toLowerCase()));
+        const overlap = val.trigger_keywords.filter(k => _taskSet.has(String(k).toLowerCase()));
+        // A single generic-word hit isn't evidence — nearly every task shares
+        // 'the'/'set'/'open'. Require ≥2 matched keywords, or one distinctive
+        // word (≥5 chars, not in the generic set).
+        const _GENERIC = new Set(['the','and','for','with','to','in','on','of','it','my','me','a','an','new','open','set','get','make','page','browser','click','type','fill','form','field','add','into']);
+        const _distinctive = overlap.filter(k => k.length >= 5 && !_GENERIC.has(k.toLowerCase()));
+        if (overlap.length >= 2 || _distinctive.length >= 1) {
           logger.info(`[playwright.agent] script DB: keyword match for ${service} (keywords: ${overlap.join(',')})`);
           return val;
         }
-      } else {
-        // No keywords to match — return first found
-        logger.info(`[playwright.agent] script DB: fallback match for ${service} (key=${entry.key})`);
-        return val;
       }
+      // No trigger keywords or zero overlap → do NOT replay. Scripts carry
+      // mutating steps (type+Enter into whatever is focused); running one on
+      // no goal evidence types values into the wrong field. There is no safe
+      // "first found" fallback.
     }
   } catch (err) {
     logger.warn(`[playwright.agent] script DB lookup failed (non-fatal): ${err.message}`);

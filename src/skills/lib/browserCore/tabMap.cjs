@@ -2669,6 +2669,56 @@ async function _tabMapStepExecute(sessionId, step, stepIndex, stepCount, tabMap,
 //   done=true when session ends (DONE, state change, or failure)
 
 
+// ── Goal-completion gate ────────────────────────────────────────────────────
+// Shared by the explicit-DONE path and the stateChanged path. Returns a reject
+// reason when the action history can't yet support the goal claim, else null.
+// Checks:
+//   - nav-only actions for a non-navigation goal
+//   - compound goal ("X and Y") where the last action navigated — unmet clauses
+//   - submit-implying goal (send/save/create/…) with no submit action or send-API
+//   - rename/title goal whose quoted value isn't in document.title — a value
+//     typed into a dialog input is UNCOMMITTED until Enter/blur lands it
+async function _goalCompletionRejectReason(goal, actionHistory, sessionId) {
+  const _hist = (actionHistory || []).join('\n');
+  const _isNavGoal = /^(navigate to|go to)\b/i.test(goal || '');
+  const _onlyNav = (actionHistory || []).length > 0 && actionHistory.length <= 2 &&
+    actionHistory.every(a => /navigate/i.test(a));
+  const _compound = /(?:and\s+then|,?\s+and\s+|then\s+|after\s+.*\s+click)/i.test(goal || '');
+  const _lastChanged = /→\s*page changed/.test((actionHistory || [])[(actionHistory || []).length - 1] || '');
+  const _submitGoal = /\b(send|submit|save|create|post|publish|apply|checkout|book|order|schedule)\b/i.test(goal || '');
+  const _hasSubmitAct = /click "[^"]*(send|submit|save|post|publish|confirm)[^"]*"|(?:meta|control|ctrl|cmd)\+enter/i.test(_hist);
+  let _sent = false;
+  if (_submitGoal && !_hasSubmitAct) {
+    try {
+      const { _detectSuccessfulSend } = require('../../browser.agent.cjs');
+      _sent = !!_detectSuccessfulSend?.(sessionId);
+    } catch (_) {}
+  }
+  if (_onlyNav && !_isNavGoal) return 'navigate-only actions for a non-navigation goal';
+  if (_compound && _lastChanged) return 'compound goal with unmet clauses after navigation';
+  if (_submitGoal && !_hasSubmitAct && !_sent) return 'goal implies submit/send but no submit action or send-API success was recorded';
+  // Committed-title check: for rename/set-title goals the quoted value must
+  // appear in document.title — an in-field verify passes while the value sits
+  // uncommitted in the input (observed: "Trip Budget" typed into the Sheets
+  // Rename field, never Enter'd, sheet stayed Untitled — then a later script
+  // overwrote it with "item").
+  const _renameGoal = /\b(rename|set the .{0,14}title|title it|name it|call it)\b/i.test(goal || '');
+  if (_renameGoal) {
+    const q = String(goal || '').match(/"([^"]{2,120})"/) || String(goal || '').match(/'([^']{2,120})'/);
+    if (q && sessionId) {
+      try {
+        const res = await browserAct({ action: 'evaluate', sessionId, headed: true, timeoutMs: 2000, text: 'document.title' });
+        const raw = res?.result;
+        const docTitle = typeof raw === 'string' ? raw.replace(/^"|"$/g, '') : '';
+        if (docTitle && !docTitle.toLowerCase().includes(q[1].trim().toLowerCase())) {
+          return `rename value '${q[1].trim()}' not committed — document.title is '${docTitle.slice(0, 60)}'`;
+        }
+      } catch (_) { /* probe failure doesn't reject */ }
+    }
+  }
+  return null;
+}
+
 // Tab-Map inner loop: runs ONE step of the Tab-Map scan session.
 // Returns { done, ok, error, stateChanged, filledRef, filledLabel, filledValue }
 //   done=true when session ends (DONE, state change, or failure)
@@ -2702,25 +2752,7 @@ async function _tabMapInnerStep(sessionId, goal, actionHistory, currentUrl, over
   // 4. Handle DONE — with the guards the old runner loop had (dropped in the
   // atomic extraction): nav-only, compound-clause, and submit-goal checks.
   if (parsed.action === 'done') {
-    const _hist = (actionHistory || []).join('\n');
-    const _isNavGoal = /^(navigate to|go to)\b/i.test(goal || '');
-    const _onlyNav = actionHistory.length > 0 && actionHistory.length <= 2 &&
-      actionHistory.every(a => /navigate/i.test(a));
-    const _compound = /\b(?:and\s+then|,?\s+and\s+|then\s+|after\s+.*\s+click)\b/i.test(goal || '');
-    const _lastChanged = /→\s*page changed/.test(actionHistory[actionHistory.length - 1] || '');
-    const _submitGoal = /\b(send|submit|save|create|post|publish|apply|checkout|book|order|schedule)\b/i.test(goal || '');
-    const _hasSubmitAct = /click "[^"]*(send|submit|save|post|publish|confirm)[^"]*"|(?:meta|control|ctrl|cmd)\+enter/i.test(_hist);
-    let _sent = false;
-    if (_submitGoal && !_hasSubmitAct) {
-      try {
-        const { _detectSuccessfulSend } = require('../../browser.agent.cjs');
-        _sent = !!_detectSuccessfulSend?.(sessionId);
-      } catch (_) {}
-    }
-    const _rejectReason = (_onlyNav && !_isNavGoal) ? 'navigate-only actions for a non-navigation goal'
-      : (_compound && _lastChanged) ? 'compound goal with unmet clauses after navigation'
-      : (_submitGoal && !_hasSubmitAct && !_sent) ? 'goal implies submit/send but no submit action or send-API success was recorded'
-      : null;
+    const _rejectReason = await _goalCompletionRejectReason(goal, actionHistory, sessionId);
     if (_rejectReason) {
       logger.warn(`[instruction.runner] Tab-Map: Done rejected — ${_rejectReason}`);
       return { done: false, ok: false, error: `Done rejected: ${_rejectReason}`, verifyFailed: true, action: nextAction };
@@ -2822,8 +2854,27 @@ async function _tabMapInnerStep(sessionId, goal, actionHistory, currentUrl, over
     };
   }
 
+  // A state-changing action isn't proof of goal completion for non-navigation
+  // goals — a mid-goal click that navigates (calendar month switch, wrong link)
+  // used to end the session as success with zero goal work done. Run the same
+  // completion gate as explicit DONE; on rejection, rescan the NEW page and
+  // keep working — the later explicit DONE goes through the same guards.
+  let _doneViaState = stateChanged;
+  if (_doneViaState && result.ok) {
+    const _scReason = await _goalCompletionRejectReason(goal, [...(actionHistory || []), `${nextAction} → page changed`], sessionId);
+    if (_scReason) {
+      logger.warn(`[instruction.runner] Tab-Map: stateChanged but goal gate rejected (${_scReason}) — rescanning and continuing`);
+      return {
+        done: false, ok: true, rescan: true, stateChanged: true,
+        filledRef, filledLabel, filledValue,
+        clickedRef: parsed.action === 'click' && result.ok ? (result.pickedRef || null) : null,
+        action: nextAction,
+      };
+    }
+  }
+
   return {
-    done: stateChanged, // session ends on state change
+    done: _doneViaState, // session ends on state change
     ok: result.ok,
     error: result.error,
     stateChanged,
@@ -2887,4 +2938,5 @@ module.exports = {
   _classifyOnPageAction,
   _tabMapStepExecute,
   _tabMapInnerStep,
+  _goalCompletionRejectReason,
 };
