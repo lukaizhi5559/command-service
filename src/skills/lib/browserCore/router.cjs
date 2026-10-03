@@ -106,6 +106,16 @@ async function _confirmGoalLane(goal) {
   }
 }
 
+// True when a mutation goal carries several distinct values or a structural
+// spec — beyond tab.map's single-lane step budget; the generalist loop
+// observes+acts across multi-field forms.
+function _isMultiPartGoal(goal) {
+  const g = String(goal || '');
+  return (g.match(/'[^']{2,120}'|"[^"]{2,120}"/g) || []).length >= 2
+    || /\bwith\b[^.]{0,80}\b(columns?|headers?|fields?|rows?|sections?|slides?)\b/i.test(g)
+    || /\b(columns?|headers?|fields?|rows?|sections?)\s+(for|named|called|of)\b[^.]{0,100},/i.test(g);
+}
+
 /**
  * Route an on-page-action goal to an atomic agent.
  * @param {object} p
@@ -224,6 +234,15 @@ async function routeOnPageAction({ sessionId, goal, pageCategory = 'web_generic'
     if (hit) return hit;
   }
 
+  // 7.5 Multi-part mutation goals — several distinct values or a structural
+  //     spec ("with column headers for a, b, c") exceed tab.map's single-lane
+  //     step budget: it fills one field then exhausts before committing the
+  //     rest. The generalist loop observes+acts across multi-field forms.
+  if (_isMultiPartGoal(goal)) {
+    const hit = pick('turn.loop.agent', 'multi-part-goal');
+    if (hit) return hit;
+  }
+
   // 8. Default: actionable elements present → Tab-Map
   if ((probe?.fillableCount || 0) + (probe?.clickableCount || 0) > 0) {
     const hit = pick('tab.map.agent', 'default-actionable');
@@ -236,4 +255,4 @@ async function routeOnPageAction({ sessionId, goal, pageCategory = 'web_generic'
   return fallback;
 }
 
-module.exports = { routeOnPageAction, ONPAGE_AGENTS, TIER_TO_AGENT };
+module.exports = { routeOnPageAction, ONPAGE_AGENTS, TIER_TO_AGENT, _isMultiPartGoal };

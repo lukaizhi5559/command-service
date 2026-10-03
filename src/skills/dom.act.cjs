@@ -20,7 +20,7 @@ const { deriveSessionId } = require('./lib/browserCore/session.cjs');
 const { postProgress } = require('./lib/browserCore/progress.cjs');
 const { detectOverlay } = require('./lib/browserCore/pageState.cjs');
 const { hasVisibleDialog } = require('./lib/browserCore/overlayProbe.cjs');
-const { deepLinkOpensOverlay } = require('../skill-helpers/deep-link-types.cjs');
+const { deepLinkOpensOverlay, classifyDeepLinkType } = require('../skill-helpers/deep-link-types.cjs');
 
 // True when the goal is *only* the create/compose action that a
 // creation/compose deep-link already performed. Any residual work in the
@@ -140,7 +140,14 @@ async function domAct(args = {}) {
     // Mutation-applied guard: a failed executor that already landed the goal's
     // quoted value (e.g. verify criteria were over-strict) must not trigger a
     // re-route — the next agent would blindly re-type into whatever is focused.
-    if (_mutationApplied(res, goal)) {
+    // Two honesty gates before crediting it:
+    //   1. The failure must be a verify-REJECTED done attempt ("Done rejected")
+    //      — exhaustion/element-mismatch errors mean incomplete work, not an
+    //      over-strict verifier.
+    //   2. The page must not still sit on an unsubmitted creation/compose URL
+    //      (eventedit, ?action=TEMPLATE, /new) — a quoted value typed into an
+    //      unsaved form is transient and will be lost on nav.
+    if (_mutationApplied(res, goal) && !(await _stillOnUnsubmittedForm(sessionId))) {
       logger.info(`[dom.act] ${route.agent} reported failure but the goal's value was already applied — treating as complete (verification over-strict)`);
       return {
         ok: true, mutationApplied: true,
@@ -159,9 +166,14 @@ async function domAct(args = {}) {
 
 // Did a failed executor still land the goal's quoted value? Conservative:
 // needs a quoted value in the goal AND a successful fill/type/reactFill
-// carrying it in the result's filledFields/actionHistory/transcript.
+// carrying it in the result's filledFields/actionHistory/transcript — and
+// the failure must be a verify-rejected done claim. Exhaustion ("Exceeded N
+// inner steps", "Element mismatch"), transport and parse errors mean the
+// work is incomplete — the executor never believed it was done.
 function _mutationApplied(res, goal) {
   if (!res || res.ok) return false;
+  const err = String(res.error || res.note || '');
+  if (!/done\s+rejected|verif/i.test(err)) return false;
   const q = String(goal || '').match(/"([^"]{2,120})"/) || String(goal || '').match(/'([^']{2,120})'/);
   const target = q ? q[1].trim().toLowerCase() : '';
   if (!target) return false;
@@ -176,4 +188,36 @@ function _mutationApplied(res, goal) {
     h.toLowerCase().includes(target));
 }
 
-module.exports = { domAct, _isPureCreateGoal, _mutationApplied };
+// True when the current URL is still an unsubmitted creation/compose surface
+// (eventedit form, ?action=TEMPLATE, /new shortcut, compose overlay): values
+// typed there are transient until a Save/submit lands, so a failed executor's
+// fill evidence must not be credited as applied work.
+function _isUnsubmittedFormUrl(url) {
+  const u = String(url || '');
+  if (!u) return false;
+  try {
+    if (classifyDeepLinkType(u) === 'compose') return true;
+    const host = new URL(u).hostname;
+    // Bare *.new create shortcuts (docs.new, sheets.new, cal.new): a live
+    // page still showing the shortcut means the create-redirect is mid-flight
+    // — transient surface, not applied work.
+    if (/\.new$/.test(host)) return true;
+  } catch (_) {}
+  return /\/eventedit(\/|$|\?|#)|action=TEMPLATE|\/new\b|[?&#](?:new|create|draft|compose)=/i.test(u);
+}
+
+// Probe the live page URL; true when it still sits on an unsubmitted form.
+// A dead/unreadable page counts as "still on the form" — conservative: when
+// we can't confirm the work persisted, we don't claim it did.
+async function _stillOnUnsubmittedForm(sessionId) {
+  try {
+    const res = await browserAct({ action: 'evaluate', sessionId, headed: true, timeoutMs: 2000, text: 'window.location.href' });
+    const raw = res?.result;
+    const url = typeof raw === 'string' ? raw.replace(/^"|"$/g, '') : (raw || '');
+    return _isUnsubmittedFormUrl(url);
+  } catch (_) {
+    return true;
+  }
+}
+
+module.exports = { domAct, _isPureCreateGoal, _mutationApplied, _isUnsubmittedFormUrl };

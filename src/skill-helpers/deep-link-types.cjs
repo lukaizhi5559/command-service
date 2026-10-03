@@ -121,6 +121,9 @@ const OVERLAY_URL_RE = /(compose|dialog|modal|popup|wizard|eventedit|action=TEMP
  * @returns {boolean}
  */
 function deepLinkOpensOverlay(url, deepLinkType) {
+  // /eventedit renders a FULL-PAGE event form, not a modal — no dialog can
+  // mount, so callers must not burn the bounded dialog wait on it.
+  if (url && /\/eventedit(\/|$|\?|#)/i.test(url)) return false;
   const type = deepLinkType || classifyDeepLinkType(url);
   if (type === 'compose') return true;
   // 'creation' is not blanket-true: a landed entity page (docs
