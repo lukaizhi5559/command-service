@@ -5475,6 +5475,7 @@ Return JSON only:
 
 Rules:
 - 2-8 sub-tasks (merge trivial steps, but preserve all entities)
+- NEVER invent parameter values absent from the goal — no times, dates, names, recipients, amounts, or durations the user did not state. If a form field is required but the goal omits it, the sub-task is "accept the page's default value" — do NOT fabricate a specific value (e.g. a goal with a date but no time does NOT get a "set time to 8:00 AM" sub-task; the verification for it can never pass on data nobody provided).
 - verification must be checkable from URL, DOM, or visible text — NOT from "the action succeeded"
 - expectedState must describe VISIBLE page elements (text, dialogs, buttons, URL) that would be present after the sub-task completes — this is used as a visual verification gate
 - Each sub-task should be independently verifiable
@@ -12629,11 +12630,23 @@ ${_composeSel ? `- SUGGESTED COMPOSE SELECTOR: ${_composeSel}` : ''}`;
     const _lastAction = _loopTranscript[_loopTranscript.length - 1];
     const _actionFailed = _lastAction && _lastAction.outcome && !_lastAction.outcome.ok;
     if (_isFirstTurn || _domDisagrees || _actionFailed) {
-      logger.info(`[playwright.agent] turn-loop: OCR capture triggered (firstTurn=${_isFirstTurn} domDisagrees=${!!_domDisagrees} actionFailed=${!!_actionFailed})`);
+      // When the engine owns no page for this session (CLI-fallback mode or a
+      // dead context), _ocrCaptureViaPage falls back to OS-level _ocrCapture —
+      // which hides+reshows the ThinkDrop overlay per call (visible flicker)
+      // and may capture a DIFFERENT Chrome window than our session. Skip the
+      // tier instead; DOM/heartbeat evidence still applies.
+      const _enginePageForOcr = (() => { try { return engine.getPage(sessionId); } catch (_) { return null; } })();
+      if (!_enginePageForOcr) {
+        logger.info(`[playwright.agent] turn-loop: skipping OCR tier — no engine page for session=${sessionId} (OS capture would hide/show overlay + may read the wrong window)`);
+      } else {
+        logger.info(`[playwright.agent] turn-loop: OCR capture triggered (firstTurn=${_isFirstTurn} domDisagrees=${!!_domDisagrees} actionFailed=${!!_actionFailed})`);
+      }
       try {
         // Page-level capture (Playwright screenshot → LiteParse) — no overlay hide/show, no flicker.
         // Falls back to OS-level screen.analyze only when no engine page is available.
-        const _cap = await _ocrCaptureViaPage(sessionId);
+        const _cap = _enginePageForOcr
+          ? await _ocrCaptureViaPage(sessionId)
+          : { ok: false, error: 'no engine page for session' };
         if (_cap.ok) {
           _ocrText = _cap.text.slice(0, 1500);
           logger.info(`[playwright.agent] turn-loop: OCR captured ${_ocrText.length} chars (app=${_cap.appName} conf=${_cap.confidence} url=${_cap.url}) textPreview="${_ocrText.slice(0, 300).replace(/\n/g, ' ')}..."`);

@@ -4216,18 +4216,32 @@ const KNOWN_BROWSER_SERVICES = {
                      contacts: 'https://contacts.google.com',
                    } },
   google:         { startUrl: 'https://google.com',                     signInUrl: 'https://accounts.google.com',                       authSuccessPattern: 'google.com',         isOAuth: true,
+                   // Canonical family agent — google_docs/sheets/calendar canonicalize to
+                   // google.agent, so every workspace host is ON-domain for deep-link
+                   // purposes. Without these aliases, sheets.new/docs.new/calendar.google.com
+                   // candidates triggered live verifyDeepLinkUrl navigation in the shared
+                   // session (observed: verify timed out → degraded to google.com startUrl
+                   // and the Sheets task ran on the wrong page).
+                   hostAliases: [
+                     'docs.google.com', 'sheets.google.com', 'calendar.google.com',
+                     'drive.google.com', 'mail.google.com', 'meet.google.com',
+                     'forms.google.com', 'sites.google.com', 'keep.google.com',
+                     'classroom.google.com',
+                     'docs.new', 'sheets.new', 'slides.new', 'cal.new',
+                     'meet.new', 'forms.new', 'keep.new', 'sites.new',
+                   ],
                    intentUrls: { search: { buildUrl: (task, ctx) => `https://www.google.com/search?q=${ctx.encodedQuery}` } } },
-  googledocs:     { startUrl: 'https://docs.google.com',                         signInUrl: 'https://accounts.google.com/signin/v2/identifier',  authSuccessPattern: 'docs.google.com/document',     isOAuth: true, hostAliases: ['docs.google.com'],
+  googledocs:     { startUrl: 'https://docs.google.com',                         signInUrl: 'https://accounts.google.com/signin/v2/identifier',  authSuccessPattern: 'docs.google.com/document',     isOAuth: true, hostAliases: ['docs.google.com', 'docs.new'],
                    intentUrls: {
                      content_create: 'https://docs.google.com/document/create',
                      open_existing: { buildUrl: (task, ctx) => `https://docs.google.com/document/u/0/?q=${ctx.encodedQuery}` },
                    } },
-  googlesheets:   { startUrl: 'https://sheets.google.com',                       signInUrl: 'https://accounts.google.com/signin/v2/identifier',  authSuccessPattern: 'docs.google.com/spreadsheets', isOAuth: true, hostAliases: ['sheets.google.com', 'docs.google.com'],
+  googlesheets:   { startUrl: 'https://sheets.google.com',                       signInUrl: 'https://accounts.google.com/signin/v2/identifier',  authSuccessPattern: 'docs.google.com/spreadsheets', isOAuth: true, hostAliases: ['sheets.google.com', 'docs.google.com', 'sheets.new'],
                    intentUrls: {
                      content_create: 'https://docs.google.com/spreadsheets/create',
                      open_existing: { buildUrl: (task, ctx) => `https://docs.google.com/spreadsheets/u/0/?q=${ctx.encodedQuery}` },
                    } },
-  googlecalendar: { startUrl: 'https://calendar.google.com',                     signInUrl: 'https://accounts.google.com/signin/v2/identifier',  authSuccessPattern: 'calendar.google.com',          isOAuth: true, hostAliases: ['calendar.google.com'],
+  googlecalendar: { startUrl: 'https://calendar.google.com',                     signInUrl: 'https://accounts.google.com/signin/v2/identifier',  authSuccessPattern: 'calendar.google.com',          isOAuth: true, hostAliases: ['calendar.google.com', 'cal.new', 'calendar.new'],
                    intentUrls: { scheduling: 'https://calendar.google.com/calendar/u/0/r' } },
   slack:          { startUrl: 'https://app.slack.com',                           signInUrl: 'https://slack.com/signin',                          authSuccessPattern: 'app.slack.com/client',         isOAuth: true  },
   discord:        { startUrl: 'https://discord.com/channels/@me',                signInUrl: 'https://discord.com/login',                         authSuccessPattern: 'discord.com/channels',         isOAuth: true  },
@@ -4650,14 +4664,17 @@ function isHostAlias(currentHost, expectedHost, aliases) {
   const cb = ch.split('.').slice(-2).join('.');
   const eb = eh.split('.').slice(-2).join('.');
   if (cb === eb) return true;
-  // Check explicit aliases
+  // Check explicit aliases — an alias may only pass when CURRENT host equals
+  // the alias or shares its base domain (e.g. www.sheets.new → sheets.new).
+  // Never compare aliases to expectedHost: if an alias merely shares the
+  // expected base domain, EVERY host would pass (observed bug — googlesheets'
+  // 'docs.google.com' alias base-domained to google.com, whitelisting any
+  // hostname for verification).
   if (aliases && aliases.length > 0) {
     const aliasSet = new Set(aliases.map(a => a.toLowerCase()));
-    if (aliasSet.has(ch) || aliasSet.has(eh)) return true;
-    // Also check base-domain of aliases
+    if (aliasSet.has(ch)) return true;
     for (const a of aliasSet) {
-      const ab = a.split('.').slice(-2).join('.');
-      if (ab === cb || ab === eb) return true;
+      if (a.split('.').slice(-2).join('.') === cb) return true;
     }
   }
   return false;
@@ -6909,10 +6926,16 @@ async function verifyDeepLinkUrl(url, sessionId, expectedHost, timeoutMs = 15000
     }
 
     const nav = await callSkill('browser.act', { action: 'navigate', url, sessionId, timeoutMs }, timeoutMs + 3000).catch(() => ({ ok: false }));
-    if (!nav?.ok) return false;
+    if (!nav?.ok) {
+      logger.warn(`[browser.agent] verifyDeepLinkUrl: TRANSPORT failure navigating to ${url} (browser unreachable/busy — not a content verdict): ${nav?.error || 'no result'}`);
+      return false;
+    }
 
     const loc = await callSkill('browser.act', { action: 'evaluate', text: 'window.location.href', sessionId, timeoutMs: 5000 }, 8000).catch(() => ({ ok: false }));
-    if (!loc?.ok) return false;
+    if (!loc?.ok) {
+      logger.warn(`[browser.agent] verifyDeepLinkUrl: TRANSPORT failure reading location after nav to ${url}: ${loc?.error || 'no result'}`);
+      return false;
+    }
     const curHref = String(loc?.result ?? loc?.stdout ?? '').trim().replace(/^"|"$/g, '');
     if (!curHref) return false;
 
@@ -8131,7 +8154,7 @@ async function _resolveTaskDeepLink(agentId, serviceKey, baseStartUrl, task, exi
       }
       const _verified = await verifyDeepLinkUrl(candidate, sessionId, baseHost, 15000, _svcAliases);
       if (!_verified) {
-        logger.warn(`[browser.agent] deep-link: off-domain candidate failed verification: ${candidate}`);
+        logger.warn(`[browser.agent] deep-link: off-domain candidate failed verification (see TRANSPORT/content breakdown above): ${candidate}`);
         return null;
       }
       logger.info(`[browser.agent] deep-link: off-domain candidate verified via redirect: ${candidate}`);
@@ -14019,9 +14042,16 @@ async function browserAgent(args) {
         const _dlHiddenResolved = _dlHidden !== undefined ? _dlHidden : true;
         const _result = await _resolveTaskDeepLink(_aId || 'unknown', _svcKey || '', _startUrl, _task, _existing, _sid, { headed: _dlHeadedResolved, hidden: _dlHiddenResolved, taskClassification: _dlCls });
         const _dlUrl = _result?.url || (typeof _result === 'string' ? _result : null);
-        // Close any browser session opened during deep-link resolution (authenticated eval)
-        if (_sid) {
+        // Close only sessions opened for a HIDDEN/preflight eval — the cleanup
+        // this exists for. When the caller passed the live shared session
+        // (url.first.agent, headed → hidden:false), closing here kills the
+        // whole persistent Chrome context mid-plan: dead context → relaunch →
+        // "Restore pages?" + about:blank tabs + ~8s per nav step, and the
+        // kill/relaunch race produced launchPersistentContext failures.
+        if (_sid && _dlHiddenResolved) {
           await callBrowserAct({ action: 'close', sessionId: _sid, headed: _dlHeadedResolved, hidden: _dlHiddenResolved }, 8000).catch(() => {});
+        } else if (_sid) {
+          logger.info(`[browser.agent] resolve_deep_link: live shared session ${_sid} — not closing (resolution reuses the caller's session)`);
         }
         return { ok: !!_dlUrl, deepLinkUrl: _dlUrl, deepLinkSource: _result?.source || null };
     }
