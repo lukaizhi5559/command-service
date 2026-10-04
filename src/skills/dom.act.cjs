@@ -21,6 +21,7 @@ const { postProgress } = require('./lib/browserCore/progress.cjs');
 const { detectOverlay } = require('./lib/browserCore/pageState.cjs');
 const { hasVisibleDialog } = require('./lib/browserCore/overlayProbe.cjs');
 const { deepLinkOpensOverlay, classifyDeepLinkType } = require('../skill-helpers/deep-link-types.cjs');
+const { inferPageCategory } = require('../skill-helpers/page-category.cjs');
 
 // True when the goal is *only* the create/compose action that a
 // creation/compose deep-link already performed. Any residual work in the
@@ -48,12 +49,26 @@ const AGENT_RUNNERS = {
 async function domAct(args = {}) {
   const {
     task, goal: _goalArg, agentId = 'default.agent', sessionId: _sid,
-    pageCategory = 'web_generic', agentContext = '', agentHint = null,
+    pageCategory: _pageCategoryArg, agentContext = '', agentHint = null,
     triedAgents = null, _progressCallbackUrl,
     priorNavUrl = null, priorNavType = null,
   } = args;
   const goal = task || _goalArg || '';
   if (!goal) return { ok: false, error: 'dom.act: no task/goal' };
+
+  // Category derivation — the planner may emit pageCategory, but most steps
+  // don't. Infer deterministically (service map → host map → cached LLM) so
+  // category gating (ai_chat just-type, allowedTiers, overlay hints) actually
+  // engages on the atomic path.
+  let pageCategory = _pageCategoryArg;
+  if (!pageCategory || pageCategory === 'web_generic') {
+    try {
+      pageCategory = await inferPageCategory({ agentId, task: goal });
+      if (pageCategory !== _pageCategoryArg) {
+        logger.info(`[dom.act] pageCategory inferred: ${pageCategory} (agentId=${agentId}, was=${_pageCategoryArg || 'none'})`);
+      }
+    } catch (_) { pageCategory = _pageCategoryArg || 'web_generic'; }
+  }
 
   const sessionId = _sid || deriveSessionId(agentId);
 
@@ -116,10 +131,19 @@ async function domAct(args = {}) {
   for (let attempt = 0; attempt < MAX_ROUTE_ATTEMPTS; attempt++) {
     const route = await routeOnPageAction({
       sessionId, goal, pageCategory,
-      agentHint: attempt === 0 ? agentHint : null,
+      // A failing agent steers its successor: just.type's value-not-landed
+      // suggests turn.loop, tab.map exhaustion suggests turn.loop, etc.
+      agentHint: attempt === 0 ? agentHint : (res?.suggestedAgent || null),
       triedAgents: tried,
     });
     lastRoute = route;
+    // The router probed the live URL and may have refined a web_generic
+    // category by hostname — adopt it for the executor (drives just.type's
+    // Enter-on-submit behavior and overlay scoping).
+    if (route.pageCategory && route.pageCategory !== pageCategory) {
+      logger.info(`[dom.act] pageCategory refined by router → ${route.pageCategory}`);
+      pageCategory = route.pageCategory;
+    }
     if (tried.has(route.agent)) break; // forced fallback re-picked a tried agent — stop
     logger.info(`[dom.act] routed "${goal.slice(0, 60)}" → ${route.agent} (rule=${route.rule}, attempt=${attempt + 1})`);
     postProgress(_progressCallbackUrl, { tier: 'route', message: `dom.act → ${route.agent} (${route.rule})` });

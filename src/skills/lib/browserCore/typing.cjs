@@ -153,6 +153,52 @@ async function _saveBackup(focusedElement) {
 // ctx = { isEdit, hasContent } — Meta+a only when isEdit && hasContent (uniform policy)
 
 
+// _verifyTypedValueLanded — post-type confirmation that the typed value is in
+// a fillable element AND that element is (or contains) the focused element.
+// Runs after typing but BEFORE any submit keypress, so a mis-landed value is
+// caught while it's still recoverable (submit clears the field, destroying
+// the evidence).
+//   { ok:true }                          — value found on the focused carrier
+//   { ok:false, error:'value-not-landed' }  — no fillable contains the value
+//   { ok:false, error:'value-misplaced' }   — value is on a non-focused element
+//   { ok:true }                          — unreadable page → don't block
+async function _verifyTypedValueLanded(sessionId, value) {
+  const needle = String(value || '').split('\n').map(s => s.trim()).filter(Boolean)[0] || '';
+  if (!needle || needle.length < 2) return { ok: true };
+  const expr = `(function(){
+    var needle = ${JSON.stringify(needle.slice(0, 80).toLowerCase())};
+    var norm = function(s){ return (s || '').toLowerCase(); };
+    var els = document.querySelectorAll('input, textarea, [contenteditable="true"], [contenteditable=""], [role="textbox"], [role="combobox"], [role="searchbox"]');
+    var carrier = null;
+    for (var i = 0; i < els.length; i++) {
+      var el = els[i];
+      var v = norm(el.value !== undefined ? el.value : (el.innerText || el.textContent));
+      if (v.indexOf(needle) !== -1) { carrier = el; break; }
+    }
+    if (!carrier) return JSON.stringify({ landed: false });
+    var ae = document.activeElement;
+    var focused = ae === carrier || carrier.contains(ae) || ae.contains(carrier);
+    return JSON.stringify({ landed: true, focused: focused });
+  })()`;
+  try {
+    const res = await browserAct({ action: 'evaluate', sessionId, headed: true, timeoutMs: 3000, text: expr });
+    const raw = typeof res?.result === 'string' ? res.result.replace(/^"|"$/g, '') : '';
+    const parsed = JSON.parse(raw || '{}');
+    if (!parsed.landed) {
+      logger.warn(`[instruction.runner] typed value not found in any fillable — value-not-landed`);
+      return { ok: false, error: 'value-not-landed', suggestedAgent: 'turn.loop.agent' };
+    }
+    if (parsed.focused === false) {
+      logger.warn(`[instruction.runner] typed value landed on a non-focused element — value-misplaced`);
+      return { ok: false, error: 'value-misplaced', suggestedAgent: 'turn.loop.agent' };
+    }
+    return { ok: true };
+  } catch (e) {
+    logger.debug?.(`[instruction.runner] _verifyTypedValueLanded unreadable (${e.message}) — not blocking`);
+    return { ok: true };
+  }
+}
+
 // type-plain: single-line text + Enter (search, chat, simple form fields).
 // Also handles multi-line contenteditable (block creation) — the existing _executeJustType logic.
 // ctx = { isEdit, hasContent } — Meta+a only when isEdit && hasContent (uniform policy)
@@ -186,6 +232,9 @@ async function _executeTypePlain(sessionId, value, focusedElement, pageCategory,
       await _sleep(300);
     }
 
+    const _verify = await _verifyTypedValueLanded(sessionId, value);
+    if (!_verify.ok) return { ok: false, pageChanged: false, error: _verify.error, suggestedAgent: _verify.suggestedAgent };
+
     if (pageCategory === 'ai_chat') {
       await _sleep(500);
       logger.info(`[instruction.runner] type-plain: pressing Enter for ai_chat submit`);
@@ -212,6 +261,9 @@ async function _executeTypePlain(sessionId, value, focusedElement, pageCategory,
   if (!result?.ok) {
     return { ok: false, pageChanged: false, error: result?.error || 'Type failed' };
   }
+
+  const _verify = await _verifyTypedValueLanded(sessionId, value);
+  if (!_verify.ok) return { ok: false, pageChanged: false, error: _verify.error, suggestedAgent: _verify.suggestedAgent };
 
   // For AI chat, press Enter after typing to submit
   if (pageCategory === 'ai_chat') {
@@ -280,6 +332,9 @@ async function _executeTypeListItem(sessionId, value, focusedElement, pageCatego
       }
     }
   }
+
+  const _verify = await _verifyTypedValueLanded(sessionId, value);
+  if (!_verify.ok) return { ok: false, pageChanged: false, error: _verify.error, suggestedAgent: _verify.suggestedAgent };
 
   // Press Enter to create the next list item
   logger.info(`[instruction.runner] type-list-item: pressing Enter to create next item`);
@@ -745,6 +800,9 @@ async function _executeTypeCommands(sessionId, value, focusedElement, goal, page
     return _executeTypePlain(sessionId, value, focusedElement, pageCategory, ctx);
   }
 
+  const _verify = await _verifyTypedValueLanded(sessionId, _triggerText || value);
+  if (!_verify.ok) return { ok: false, pageChanged: false, error: _verify.error, suggestedAgent: _verify.suggestedAgent };
+
   // Press Enter to select the top filtered match
   logger.info(`[instruction.runner] type-commands: pressing Enter to select top match for "${_triggerText}"`);
   await browserAct({ action: 'press', sessionId, key: 'Enter', headed: true, timeoutMs: 5000 });
@@ -855,6 +913,9 @@ async function _executeTypeSearch(sessionId, value, focusedElement, goal, pageCa
   const fullQuery = _isGlobalSearch ? plan.query : (plan.trigger + plan.query);
   await browserAct({ action: 'type', sessionId, text: fullQuery, headed: true, timeoutMs: 5000 });
 
+  const _verify = await _verifyTypedValueLanded(sessionId, plan.query || fullQuery);
+  if (!_verify.ok) return { ok: false, pageChanged: false, error: _verify.error, suggestedAgent: _verify.suggestedAgent };
+
   if (_isGlobalSearch) {
     // Global search: submit immediately with Enter, no dropdown wait
     await _sleep(300);
@@ -931,37 +992,8 @@ async function _executeTypedField(sessionId, fieldType, value, focusedElement, g
 
 
 async function _executeJustType(sessionId, value, focusedElement, pageCategory, goal, agentContext, pageContext, overlayActive, actionHistory) {
-  if (!focusedElement) {
-    // No focused element — check if an overlay/dialog is open
-    if (!overlayActive) {
-      // No overlay open — Just-type without a focused field is unreliable
-      // (would blindly type into "Search for people" or other page-level inputs)
-      logger.info(`[instruction.runner] Just-type: no focused element and no overlay open — refusing to type into random field`);
-      return { ok: false, pageChanged: false, error: 'No focused element and no overlay open — need Tab-Map to pick the right field' };
-    }
-    // Overlay is open — safe to click first fillable inside the dialog
-    logger.info(`[instruction.runner] Just-type: no focused element — clicking first fillable to focus (overlay open)`);
-    const _firstFillable = await _clickFirstFillable(sessionId);
-    if (!_firstFillable) return { ok: false, pageChanged: false, error: 'No focused element and no fillable element found' };
-    focusedElement = _firstFillable;
-  }
-
-  const _tag = focusedElement.tag || '';
-  const _role = focusedElement.role || '';
-
-  // Handle special values: PRESS_<KEY> (generic key press support with modifiers)
-  // IMPORTANT: This runs BEFORE the fillable check because pressing a key
-  // (Enter, Escape, Tab) does NOT require a fillable element. After search
-  // navigation, focus may land on a non-fillable container (e.g., cfc-panel)
-  // but we still need to press Enter to submit the search.
-  // ── List-item guard: skip PRESS_ENTER after list-item Enter ──
-  // After type-list-item presses Enter to create the next block, _extractValue may
-  // still return PRESS_ENTER (focus detection reads the OLD block with content,
-  // not the NEW empty one). Pressing Enter on the empty To-do block removes it
-  // (Notion behavior) or creates another empty block — both are wrong.
-  // The actionHistory entry "pressed Enter to create next item" is the sole
-  // reliable trigger — don't check currentValue (focus detection is unreliable
-  // right after Enter creates a new block).
+  // PRESS_<KEY> runs before the no-focus refusal — a keypress needs no fillable
+  // element (End/PageDown scroll the body; Enter submits whatever's focused).
   if (value === 'PRESS_ENTER') {
     const _lastAction = (actionHistory && actionHistory[actionHistory.length - 1]) || '';
     if (_lastAction.includes('pressed Enter to create next item')) {
@@ -975,6 +1007,8 @@ async function _executeJustType(sessionId, value, focusedElement, pageCategory, 
       arrow_down: 'ArrowDown', arrow_up: 'ArrowUp',
       arrow_left: 'ArrowLeft', arrow_right: 'ArrowRight',
       backspace: 'Backspace', delete: 'Delete',
+      end: 'End', home: 'Home', pageup: 'PageUp', pagedown: 'PageDown',
+      up: 'ArrowUp', down: 'ArrowDown', left: 'ArrowLeft', right: 'ArrowRight',
     };
     const _modMap = { shift: 'Shift', meta: 'Meta', control: 'Control', ctrl: 'Control', alt: 'Alt' };
     const _keySpec = value.replace('PRESS_', '');
@@ -993,6 +1027,24 @@ async function _executeJustType(sessionId, value, focusedElement, pageCategory, 
     await _sleep(800);
     return { ok: true, pageChanged: false };
   }
+
+  if (!focusedElement) {
+    // No focused element — check if an overlay/dialog is open
+    if (!overlayActive) {
+      // No overlay open — Just-type without a focused field is unreliable
+      // (would blindly type into "Search for people" or other page-level inputs)
+      logger.info(`[instruction.runner] Just-type: no focused element and no overlay open — refusing to type into random field`);
+      return { ok: false, pageChanged: false, error: 'No focused element and no overlay open — need Tab-Map to pick the right field', suggestedAgent: 'turn.loop.agent' };
+    }
+    // Overlay is open — safe to click first fillable inside the dialog
+    logger.info(`[instruction.runner] Just-type: no focused element — clicking first fillable to focus (overlay open)`);
+    const _firstFillable = await _clickFirstFillable(sessionId);
+    if (!_firstFillable) return { ok: false, pageChanged: false, error: 'No focused element and no fillable element found' };
+    focusedElement = _firstFillable;
+  }
+
+  const _tag = focusedElement.tag || '';
+  const _role = focusedElement.role || '';
 
   // NOW check fillable for actual typing (PRESS_<KEY> already handled above)
   const _isFillable = ['input', 'textarea'].includes(_tag) ||
@@ -1100,6 +1152,7 @@ module.exports = {
   _executeTypeCommands,
   _executeTypeSearch,
   _executeTypedField,
+  _verifyTypedValueLanded,
   _executeJustType,
   _findClosestClickable,
 };

@@ -45,7 +45,7 @@ const CATEGORY_CONFIGS = {
   // ── AI chat (ChatGPT, Claude, Gemini) ──────────────────────────────────
   ai_chat: {
     regions: ['input'],
-    allowedTiers: [1, 4], // Just-type, Tab-Map only
+    allowedTiers: [1, 2, 4], // Just-type, Meta+F (named chat-history items), Tab-Map
     notes: [
       'Single input field — type the message and press Enter to send',
       'No multi-field forms — Just-type is almost always correct',
@@ -56,7 +56,7 @@ const CATEGORY_CONFIGS = {
   // ── Social feed (Twitter, LinkedIn, Facebook) ──────────────────────────
   social_feed: {
     regions: ['post_compose', 'comment', 'feed'],
-    allowedTiers: [1, 4], // Just-type, Tab-Map only — no Meta+F/Shortcuts/Gesture/Arrow-Grid
+    allowedTiers: [1, 2, 4], // Just-type, Meta+F (named posts/profiles), Tab-Map
     notes: [
       'Post compose is usually a single field — Just-type works',
       'Reply/comment boxes may need clicking first before typing',

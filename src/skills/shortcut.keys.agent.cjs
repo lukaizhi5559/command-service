@@ -19,13 +19,18 @@ const { probePageStructure, detectOverlay } = require('./lib/browserCore/pageSta
 const { withSessionMutex } = require('./lib/browserCore/session.cjs');
 const { postProgress } = require('./lib/browserCore/progress.cjs');
 const { browserAct } = require('./browser.act.cjs');
+const { inferPageCategory } = require('../skill-helpers/page-category.cjs');
 
 function hostnameOf(url) { try { return new URL(url).hostname; } catch (_) { return ''; } }
 
 async function shortcutKeysAgent(args = {}) {
-  const { goal = '', sessionId, agentId = '', pageCategory = 'web_generic', agentContext = '', _progressCallbackUrl } = args;
+  const { goal = '', sessionId, agentId = '', agentContext = '', _progressCallbackUrl } = args;
+  let pageCategory = args.pageCategory || 'web_generic';
   if (!sessionId) return { ok: false, error: 'shortcut.keys.agent: no sessionId' };
   if (!goal && !args.keyCombo) return { ok: false, error: 'shortcut.keys.agent: no goal/keyCombo' };
+  if (pageCategory === 'web_generic') {
+    try { pageCategory = await inferPageCategory({ agentId, task: goal }); } catch (_) {}
+  }
 
   return withSessionMutex(sessionId, async () => {
     let keyCombo = args.keyCombo;

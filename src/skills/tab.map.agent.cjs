@@ -20,16 +20,23 @@ const { detectOverlay } = require('./lib/browserCore/pageState.cjs');
 const { withSessionMutex } = require('./lib/browserCore/session.cjs');
 const { postProgress } = require('./lib/browserCore/progress.cjs');
 const { browserAct } = require('./browser.act.cjs');
+const { inferPageCategory } = require('../skill-helpers/page-category.cjs');
 
 async function tabMapAgent(args = {}) {
   const {
-    goal = '', sessionId, agentId = '', pageCategory = 'web_generic',
+    goal = '', sessionId, agentId = '',
     stepType = 'on-page-action', maxSteps = 6,
     expectOverlay = false, _progressCallbackUrl,
   } = args;
+  let pageCategory = args.pageCategory || 'web_generic';
   let agentContext = args.agentContext || '';
   if (!sessionId) return { ok: false, error: 'tab.map.agent: no sessionId' };
   if (!goal) return { ok: false, error: 'tab.map.agent: no goal' };
+
+  // Self-derive category for standalone calls — overlay detection uses it.
+  if (pageCategory === 'web_generic') {
+    try { pageCategory = await inferPageCategory({ agentId, task: goal }); } catch (_) {}
+  }
 
   return withSessionMutex(sessionId, async () => {
     postProgress(_progressCallbackUrl, { tier: 'tab-map', message: `tab.map.agent: ${goal.slice(0, 60)}` });

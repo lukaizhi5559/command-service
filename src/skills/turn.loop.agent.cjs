@@ -18,12 +18,18 @@ const logger = require('../logger.cjs');
 const { playwrightAgent } = require('./playwright.agent.cjs');
 const { withSessionMutex, deriveSessionId } = require('./lib/browserCore/session.cjs');
 const { postProgress } = require('./lib/browserCore/progress.cjs');
+const { inferPageCategory } = require('../skill-helpers/page-category.cjs');
 
 async function turnLoopAgent(args = {}) {
   const { goal = '', mode = 'act', _progressCallbackUrl } = args;
   const sessionId = args.sessionId || deriveSessionId(args.agentId || 'default.agent');
   if (!sessionId) return { ok: false, error: 'turn.loop.agent: no sessionId' };
   if (!goal) return { ok: false, error: 'turn.loop.agent: no goal' };
+  // Self-derive category for standalone calls — playwrightAgent's internal
+  // gates (overlay/field handling) read it.
+  if (!args.pageCategory || args.pageCategory === 'web_generic') {
+    try { args.pageCategory = await inferPageCategory({ agentId: args.agentId, url: args.url, task: goal }); } catch (_) {}
+  }
 
   return withSessionMutex(sessionId, async () => {
     const isVerify = mode === 'verify';
