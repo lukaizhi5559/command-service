@@ -6945,6 +6945,86 @@ async function actionNavTask({ task, service, url, escalate = true, browseFallba
 }
 
 /**
+ * actionReadScreen — composite "describe what's on my screen" read.
+ *
+ * Picks the capture tier at exec time (the only place the live frontmost app
+ * is known):
+ *   browser frontmost → scan_page (real rendered-page copy, ~1-3s)
+ *   otherwise         → getRecentOCR (DB cache → live OCR fallback)
+ *
+ * Detection is strictly passive (_getActiveAppBounds → _getActiveAppContext) —
+ * never verifyAppFocused: its 'browser' sentinel remaps to Chrome and runs
+ * `open -a`, which would hijack focus on a non-browser screen.
+ *
+ * Returns { ok, text, content, appName, url?, via, chars } — `via` records the
+ * tier that produced the text ('browser_scan'|'ocr_cache'|'ocr_live'). Dual
+ * text+content keeps both the app.agent and screen.capture synthesize
+ * collectors working.
+ */
+async function actionReadScreen({ maxWaitMs = 15000 } = {}) {
+  // 1. Passive frontmost-app detect. When the overlay itself is frontmost,
+  //    active-win can't see the user's app — resolve via the monitor heartbeat
+  //    (memory.getActiveAppContext skips overlay entries).
+  let bounds = await _getActiveAppBounds().catch(() => null);
+  const liveApp = bounds?.appName || null;
+  const overlayActive = ['electron', 'thinkdrop'].some(o => (liveApp || '').toLowerCase().includes(o));
+  let appName = liveApp;
+  if (!liveApp || overlayActive) {
+    const ctx = await _getActiveAppContext().catch(() => null);
+    appName = ctx?.appName || liveApp;
+  }
+  logger.info(`[app.agent] read_screen: frontmost app "${appName || 'unknown'}" (live="${liveApp || 'none'}", overlay=${overlayActive})`);
+
+  // 2. Browser tier — real rendered-page copy. Pass the detected app name
+  //    explicitly so scan_page's verifyAppFocused is a no-op focus on the
+  //    already-frontmost app rather than a 'browser' → Chrome remap.
+  if (appName && _isBrowserApp(appName)) {
+    const scan = await actionScanPage({ appName, maxWaitMs });
+    if (scan.ok) {
+      logger.info(`[app.agent] read_screen: browser_scan — ${scan.chars} chars from "${appName}" url=${scan.url || '(unknown)'}`);
+      return {
+        ok: true, text: scan.content, content: scan.content,
+        appName, url: scan.url || null, savedTo: scan.savedTo || null,
+        chars: scan.chars, via: 'browser_scan', cached: scan.cached || false,
+        thin: scan.thin || undefined,
+      };
+    }
+    logger.warn(`[app.agent] read_screen: scan_page failed (${scan.error || 'unknown'}) — falling back to OCR`);
+  }
+
+  // 3. OCR tier — DB cache (<3s) with getRecentOCR's own live-capture fallback.
+  const ocr = await getRecentOCR({ appName, liveOverlayHidden: true }).catch(() => null);
+  const ocrText = (ocr?.text || '').trim();
+  if (ocrText) {
+    const via = ocr.source === 'live' ? 'ocr_live' : 'ocr_cache';
+    logger.info(`[app.agent] read_screen: ${via} — ${ocrText.length} chars app="${ocr.appName || appName || 'unknown'}"`);
+    return {
+      ok: true, text: ocrText, content: ocrText,
+      appName: ocr.appName || appName, windowTitle: ocr.windowTitle || null,
+      chars: ocrText.length, via,
+    };
+  }
+
+  // 4. Last resort — direct screen capture (getRecentOCR's live fallback can
+  //    return empty without throwing when no targetApp was detected).
+  try {
+    const { screenCapture } = require('./screen.capture.cjs');
+    const live = await _withOverlayHidden(() => screenCapture({}));
+    if (live?.success && live.text) {
+      logger.info(`[app.agent] read_screen: ocr_live (direct) — ${live.text.length} chars app="${live.appName || appName || 'unknown'}"`);
+      return {
+        ok: true, text: live.text, content: live.text,
+        appName: live.appName || appName, windowTitle: live.windowTitle || null,
+        chars: live.text.length, via: 'ocr_live',
+      };
+    }
+    return { ok: false, error: live?.error || 'screen capture returned no text', appName };
+  } catch (e) {
+    return { ok: false, error: `read_screen failed: ${e?.message || 'capture error'}`, appName };
+  }
+}
+
+/**
  * actionPrintPage — Cmd+P → Enter in the focused app. Best-effort: there is
  * no deterministic way to verify a print job from outside the app.
  */
@@ -7723,6 +7803,7 @@ module.exports = {
   actionPrintPage,
   actionReadUrl,
   actionNavTask,
+  actionReadScreen,
 
   // Phase 5: Structured OCR helpers (used by app.runner.cjs monitoring)
   _filterItemsByAppBounds,

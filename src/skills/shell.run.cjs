@@ -113,6 +113,11 @@ When the goal mentions a folder or file by name only with no absolute path (e.g.
 - Example — "count files in the gongzuo folder":
   SRC=$(mdfind -name "gongzuo" -onlyin "$HOME" | grep -v node_modules | head -1); [ -d "$SRC" ] && find "$SRC" -type f | wc -l || echo "0"
 - For other unknown paths: SRC=$(mdfind -name "FILENAME" | grep -v node_modules | head -1)
+- PREFER mdfind over find for filename lookups — Spotlight indexes all of ~ and returns instantly.
+  Never run bare "find ~" or "find $HOME" — recursive home scans exceed the timeout.
+  If find is needed, scope it: find ~/Desktop ~/Documents ~/Downloads -maxdepth 4 -name 'FILENAME'
+- macOS has NO "timeout" command (no coreutils) — never emit 'timeout N cmd'. The harness already
+  enforces a timeout externally; in-script timeouts must use another mechanism (e.g. & + sleep + kill).
 
 find grouping rule (CRITICAL — unbalanced groupings cause find to exit 1):
 - When using find with \\( ... -o ... \\) groupings, the \\( and \\) must ALWAYS be balanced.
@@ -165,6 +170,15 @@ lp / lpr   — CUPS printing. Sends a file to the default printer.
              For "print this file" / "print the document" / "print <path>" → use lp, NOT cat.
              cat displays content on screen; lp sends to a physical printer.
              Example: lp "/path/to/file.pdf"
+             IMPORTANT: lp only accepts PDF, PostScript, plain text, and images —
+             .rtf/.doc/.docx/.odt/.pages/.html fail with "Unsupported document-format".
+             Convert office formats to PDF first AND verify the PDF exists before lp:
+               pandoc "$F" -o "/tmp/x.pdf" --pdf-engine=xelatex && lp "/tmp/x.pdf"
+             soffice --headless --convert-to pdf --outdir /tmp "$F" also works when
+             LibreOffice is really installed — check [ -f "/tmp/<base>.pdf" ] after;
+             a bare 'command -v soffice' can pass on a broken shim.
+             NEVER report "file not found" when conversion failed — check whether
+             the file exists ([ -f "$F" ]) separately from whether conversion worked.
 
 GUI focus / app activation rule:
 When the goal is to bring an application to the front, focus it, or activate it, do NOT generate
@@ -223,6 +237,15 @@ Multi-repo git rules (CRITICAL — nested repos create gitlink damage):
   repo name, branch, commit hash, then "remaining:" + git status --short.
 - "commit my work" means COMMIT ONLY — never push to a remote unless the goal
   explicitly says push.
+
+Printing rule (CRITICAL): CUPS lp only accepts PDF, PostScript, plain text,
+and images — it FAILS with "Unsupported document-format" on .rtf/.doc/.docx/
+.odt/.pages/.html. For office documents, convert to PDF first and verify the
+PDF exists before lp:
+  pandoc "<file>" -o /tmp/x.pdf --pdf-engine=xelatex && lp /tmp/x.pdf
+soffice --headless --convert-to pdf also works — but check the produced file
+with [ -f ], since 'command -v soffice' can pass on a broken Homebrew shim.
+If neither works, fall back to: textutil -convert txt then lp.
 
 Platform: macOS. Home dir: ${os.homedir()}
 `;
@@ -293,16 +316,105 @@ const SYSTEM_QUERY_REGISTRY = [
 // matches a known file-op pattern. Zero LLM generation, zero hallucination.
 // Same pattern as SYSTEM_QUERY_REGISTRY but for parameterized file operations.
 // ---------------------------------------------------------------------------
+// Extract an absolute path from a goal string. Layered:
+//   1) quoted path wins — an unambiguous boundary, common for spaced names
+//   2) lazy match to a bounded extension (allows spaces, ~/)
+//   3) right-to-left fs.existsSync walk-back — ground truth for multi-dot
+//      names where a lazy match lands on a mid-name extension
+// Returns a ~ -expanded absolute path or null.
+function _extractAbsPath(goal) {
+  const home = os.homedir();
+  const expand = (p) => p.startsWith('~/') ? p.replace(/^~/, home) : p;
+  // 1) quoted path
+  let m = goal.match(/["'`]((?:\/|~\/)[^"'`]+?)["'`]/);
+  if (m) return expand(m[1].trim());
+  // 2) lazy bounded-extension
+  m = goal.match(/((?:\/|~\/)[\s\S]+?\.\w{1,10})(?=[\s"'`|;&]|$)/);
+  if (m) {
+    const p = expand(m[1].trim().replace(/[.,;:)\]]+$/, ''));
+    try { if (fs.existsSync(p)) return p; } catch (_) { /* fall through */ }
+    // 3) walk back from the full run, cutting at each ext right-to-left
+    const run = goal.match(/((?:\/|~\/)[\s\S]+)/);
+    if (run) {
+      const raw = expand(run[1].trim());
+      const exts = [...raw.matchAll(/\.\w{1,10}/g)].map(x => x.index).reverse();
+      for (const i of exts) {
+        const cand = raw.slice(0, i + (raw.slice(i).match(/^\.\w{1,10}/) || [''])[0].length);
+        try { if (fs.existsSync(cand)) return cand; } catch (_) { /* keep looking */ }
+      }
+    }
+    return p; // nothing on disk — return best-effort so the error names it
+  }
+  return _resolveBareFilename(goal, home);
+}
+
+// Resolve a bare "name.ext" from a goal (no absolute path present) to a real
+// absolute path. Layered like _extractAbsPath: quoted name first, then a
+// dir-priority probe, then an mdfind fallback (Spotlight-indexed, instant).
+// Returns a verified path or null — never a guessed ~/Name that doesn't exist.
+function _resolveBareFilename(goal, home) {
+  const names = [];
+  const seen = new Set();
+  const add = (n) => {
+    if (n && !seen.has(n)) { seen.add(n); names.push(n); }
+  };
+  // quoted names first — "the file named 'kids-weekly-memory-verse.rtf'"
+  for (const qm of goal.matchAll(/["'`]([\w][\w .()&'-]*\.\w{1,10})["'`]/g)) add(qm[1].trim());
+  // then any bare name.ext token
+  for (const bm of goal.matchAll(/\b([\w][\w-]*\.\w{1,10})\b/g)) add(bm[1]);
+  if (!names.length) return null;
+
+  const dirs = [process.cwd(), `${home}/Desktop`, `${home}/Documents`, `${home}/Downloads`, home];
+  for (const name of names) {
+    for (const d of dirs) {
+      const cand = `${d}/${name}`;
+      try { if (fs.existsSync(cand)) return cand; } catch (_) { /* keep looking */ }
+    }
+  }
+  // Spotlight fallback — indexes all of ~, returns instantly.
+  try {
+    const r = spawnSync('mdfind', ['-name', names[0]], { encoding: 'utf8', timeout: 5000 });
+    const hit = (r.stdout || '').split('\n')
+      .map(s => s.trim())
+      .find(s => s.endsWith(`/${names[0]}`) && !s.includes('/node_modules/'));
+    if (hit) { try { if (fs.existsSync(hit)) return hit; } catch (_) { /* fall through */ } }
+  } catch (_) { /* mdfind unavailable */ }
+  return null;
+}
+
 const FILE_OP_REGISTRY = [
   {
     label: 'Print file',
-    regex: /\bprint\s+(?:this|that|the|current)?\s*(?:file|document|doc)\b/i,
-    extractPath: (goal) => {
-      // Extract /path from the goal string (absolute path with extension)
-      const m = goal.match(/\/[^\s"']+\.\w{1,10}/);
-      return m ? m[0] : null;
+    regex: /\bprint\b/i,
+    extractPath: _extractAbsPath,
+    // CUPS/lp only accepts PDF, PostScript, plain text, and images — office
+    // formats (rtf/docx/doc/odt/pages/html) fail with "Unsupported
+    // document-format". Convert to PDF first — soffice when it actually works
+    // (a Homebrew shim can exist with LibreOffice.app missing — verify the
+    // output PDF rather than command -v), then pandoc+xelatex, then
+    // textutil→txt as last resort. Errors name the real failure stage.
+    buildCmd: (filePath) => {
+      const ext = (filePath.match(/\.(\w{1,10})$/) || [])[1]?.toLowerCase() || '';
+      const PRINT_READY = new Set(['pdf', 'ps', 'txt', 'jpg', 'jpeg', 'png', 'heic']);
+      if (PRINT_READY.has(ext)) return { cmd: 'lp', argv: [filePath] };
+      const q = filePath.replace(/(["`\\$])/g, '\\$1');
+      const script = [
+        `SRC="${q}"`,
+        `[ -f "$SRC" ] || { echo "File not found: $SRC" >&2; exit 1; }`,
+        `BASE="$(basename "\${SRC%.*}")"; PDF="/tmp/thinkdrop-print-$BASE.pdf"`,
+        `if command -v soffice >/dev/null 2>&1 && soffice --headless --convert-to pdf --outdir /tmp "$SRC" >/dev/null 2>&1 && [ -f "/tmp/$BASE.pdf" ]; then`,
+        `  cp "/tmp/$BASE.pdf" "$PDF"`,
+        `elif command -v pandoc >/dev/null 2>&1 && pandoc "$SRC" -o "$PDF" --pdf-engine=xelatex >/dev/null 2>&1 && [ -f "$PDF" ]; then`,
+        `  :`,
+        `else`,
+        `  textutil -convert txt "$SRC" -output "/tmp/thinkdrop-print-$BASE.txt" 2>/dev/null && lp "/tmp/thinkdrop-print-$BASE.txt" && { lpstat -o 2>/dev/null | head -3; exit 0; }`,
+        `  echo "Conversion failed: no working converter (soffice/pandoc/textutil) for $SRC" >&2; exit 1`,
+        `fi`,
+        `lp "$PDF" || { echo "Print failed for $PDF" >&2; exit 1; }`,
+        `lpstat -o 2>/dev/null | head -3`,
+      ].join('\n');
+      return { cmd: 'bash', argv: ['-c', script] };
     },
-    buildCmd: (filePath) => ({ cmd: 'lp', argv: [filePath] }),
   },
 ];
 
@@ -478,6 +590,22 @@ async function _resolveGoalToCommand(goal, onProgress) {
           logger.warn(`[shell.run] ${lastErr}: ${script.slice(0, 120)}`);
           continue;
         }
+      }
+      // Print-semantics guard: "print" goals must actually send to CUPS. The
+      // model occasionally reads "print" as "print to stdout" and emits
+      // cat/textutil — the file content on stdout then looks like a successful
+      // print to the downstream synthesize step (observed in task_4a9f9115).
+      // Only enforce lp when the goal is about printing a FILE/DOCUMENT —
+      // "print working directory" or "print the variable" legitimately mean
+      // stdout, not CUPS.
+      const _isPrintFileGoal = /\bprint(?:ing|ed)?\b/i.test(goal)
+        && /(?:file|document|doc|page|photo|pdf|\.(?:pdf|txt|rtf|docx?|odt|pages|png|jpe?g|heic)\b)/i.test(goal)
+        && !/\b(?:working directory|contents?|output|text|variable|result|value|list|screen)\b/i.test(goal);
+      if (_isPrintFileGoal && !/\blp[r]?\b/.test(script)) {
+        lastErr = 'Print goal generated a command with no lp/lpr call (cat/echo only display text) — retrying';
+        syntaxFeedback = 'The goal asks to PRINT the file on a physical printer. You MUST end the pipeline with lp (or lpr) — cat, echo, and textutil alone only DISPLAY text. Convert office formats to PDF/txt first, then lp the result.';
+        logger.warn(`[shell.run] ${lastErr}: ${script.slice(0, 120)}`);
+        continue;
       }
       // Truncation guard: a maxTokens-cut script fails open inside bash -n
       // (unterminated heredoc is a warning, not an error) and would write a
