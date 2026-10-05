@@ -48,11 +48,44 @@ check('cal.new on-domain for googlecalendar', isHostAlias('cal.new', 'calendar.g
 
 console.log('\n--- resolve_deep_link close gate (source-level) ---');
 // The close used to run unconditionally on any sessionId. Assert the gate is
-// present in the action handler: close only fires when _dlHiddenResolved.
+// present in the action handler: close only fires when _dlHiddenResolved AND
+// the session did not already exist before the call (live-session kill fix).
 const src = require('fs').readFileSync(path.join(__dirname, '../src/skills/browser.agent.cjs'), 'utf8');
-const caseBlock = src.match(/case 'resolve_deep_link':[\s\S]{0,2500}/);
+const caseBlock = src.match(/case 'resolve_deep_link':[\s\S]{0,3000}/);
 check('resolve_deep_link case found', !!caseBlock);
-check('close is gated on _dlHiddenResolved', /if\s*\(\s*_sid\s*&&\s*_dlHiddenResolved\s*\)/.test(caseBlock ? caseBlock[0] : ''), caseBlock ? caseBlock[0].slice(0, 900) : '');
+const caseSrc = caseBlock ? caseBlock[0] : '';
+check('close is gated on _dlHiddenResolved', /_sid\s*&&\s*_dlHiddenResolved/.test(caseSrc), caseSrc.slice(0, 900));
+check('liveness is snapshotted BEFORE resolution', /_wasActive\s*=.*isSessionActive[\s\S]{0,400}_resolveTaskDeepLink/.test(caseSrc));
+check('liveSession is threaded into _resolveTaskDeepLink', /liveSession:\s*_wasActive/.test(caseSrc));
+check('close is gated on !_wasActive (pre-existing live session never closed)', /_sid\s*&&\s*_dlHiddenResolved\s*&&\s*!_wasActive/.test(caseSrc));
+
+console.log('\n--- off-domain verify never hijacks a live session (source-level) ---');
+check('off-domain candidates rejected when session is live', /_dlLiveSession[\s\S]{0,400}off-domain candidate rejected/.test(src));
+check('verifyDeepLinkUrl forwards headed/hidden flags', /verifyDeepLinkUrl\([^)]*\{[^}]*headed:\s*_dlHeaded/.test(src) || /_vFlags\.headed/.test(src));
+
+console.log('\n--- actionRun live-session probe guards (source-level) ---');
+check('_preExistingLiveSession computed for silent preflight probes', /_preExistingLiveSession\s*=\s*_silentPreflightProbe[\s\S]{0,200}isSessionActive/.test(src));
+check('restart block skipped for live session', /!_domainContinuitySkip\s*&&\s*!_preExistingLiveSession/.test(src));
+check('probe navigate skipped for live session', /_preExistingLiveSession\s*\?\s*\{\s*ok:\s*true/.test(src));
+check('hidden hydration retry skipped for live session', /_silentPreflightProbe\s*&&\s*!_preExistingLiveSession/.test(src));
+check('self-heal retry nav skipped for live session', /_healedUrl\s*&&\s*!_preExistingLiveSession/.test(src));
+check('_closeProbeSession helper guards probe closes', /_closeProbeSession[\s\S]{0,300}_preExistingLiveSession[\s\S]{0,200}not closing/.test(src));
+check('auth-needed probe exit uses _closeProbeSession', /preflightProbe detected auth-needed[\s\S]{0,300}_closeProbeSession/.test(src));
+check('auth-only exit uses _closeProbeSession', /auth-only call, stop here[\s\S]{0,400}_closeProbeSession/.test(src));
+
+console.log('\n--- browser.act close-all except + resurrection (source-level) ---');
+const actSrc = require('fs').readFileSync(path.join(__dirname, '../src/skills/browser.act.cjs'), 'utf8');
+const closeAllBlock = actSrc.match(/case 'close-all':[\s\S]{0,1500}/);
+check('close-all case found', !!closeAllBlock);
+check('close-all honors args.except', /except/.test(closeAllBlock ? closeAllBlock[0] : '') && /_except\.has\(sid\)/.test(closeAllBlock ? closeAllBlock[0] : ''));
+check('pre-switch resurrection block exists', /_PAGE_ACTION_RE[\s\S]{0,400}resurrecting at last URL/.test(actSrc));
+check('_ensureEngine resumes at lastUrlFor', /lastUrlFor[\s\S]{0,600}resuming/.test(actSrc));
+check('navigate passes skipResume', /_ensureEngine\([^)]*\{\s*skipResume:\s*true\s*\}\)/.test(actSrc));
+
+const engSrc = require('fs').readFileSync(path.join(__dirname, '../src/skills/browser-engine.cjs'), 'utf8');
+check('engine tracks lastUrl on getPage', /s\.lastUrl\s*=\s*_u/.test(engSrc));
+check('closeSession stashes lastUrl into _lastUrls', /_lastUrls\.set\(sessionId/.test(engSrc));
+check('lastUrlFor exported with TTL', /function lastUrlFor\(sessionId, ttlMs/.test(engSrc));
 
 console.log('\n--- turn-loop OS OCR fallback gate (source-level) ---');
 const pwSrc = require('fs').readFileSync(path.join(__dirname, '../src/skills/playwright.agent.cjs'), 'utf8');

@@ -1654,15 +1654,28 @@ async function _withChromeLock(fn) {
 // `hidden` launches headed Chrome with a 1x1 offscreen window — used for
 // public_read fallbacks so bot walls still see a real browser but the user
 // sees nothing.
-async function _ensureEngine(sessionId, headed, hidden = false) {
+// On a FRESH launch (session was dead/closed), resurrect the page at the
+// session's last known URL (engine.lastUrlFor — 30min TTL) unless
+// opts.skipResume — nav-style actions pass it since they load their own URL.
+async function _ensureEngine(sessionId, headed, hidden = false, opts = {}) {
   if (engine.isSessionActive(sessionId)) {
     return engine.getPage(sessionId);
   }
   try {
+    const _resumeUrl = opts.skipResume ? null : engine.lastUrlFor?.(sessionId);
     logger.info(`[browser.act] engine launch session=${sessionId} headed=${headed} hidden=${hidden}`);
     await _withChromeLock(() => engine.launch(sessionId, { headed, hidden }));
     openSessions.add(sessionId);
-    return engine.getPage(sessionId);
+    const _page = engine.getPage(sessionId);
+    if (_page && _resumeUrl) {
+      try {
+        logger.info(`[browser.act] session=${sessionId} resurrected — resuming ${_resumeUrl}`);
+        await _page.goto(_resumeUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+      } catch (_resumeErr) {
+        logger.warn(`[browser.act] resume navigation failed for session=${sessionId}: ${_resumeErr.message}`);
+      }
+    }
+    return _page;
   } catch (err) {
     logger.warn(`[browser.act] engine launch failed for session=${sessionId}: ${err.message}`);
     return null;
@@ -2929,6 +2942,24 @@ async function browserAct(args) {
     }
   };
 
+  // ── Session resurrection ──────────────────────────────────────────────────
+  // Page-requiring actions on a session whose engine context died (cleanup
+  // raced it, the user closed the window between prompts, ...) currently fall
+  // through to the CLI daemon and no-op on about:blank. If we know the last
+  // URL the session was on (engine.lastUrlFor — recorded by getPage/close
+  // and kept ~30min), relaunch and resume it first so the action lands on the
+  // page the user meant. Actions carrying their own url (navigate/open) skip
+  // this — _ensureEngine honors skipResume for them anyway.
+  const _PAGE_ACTION_RE = /^(press|key|keyboard|keydown|keyup|click|dblclick|clickAt|clickSelector|clickByText|clickBySelector|fill|type|reactFill|hover|select|check|upload|paste|pasteAttachment|drag|scroll|screenshot|pdf|extractContent|getText|getPageText|getPageLinks|evaluate|run-code|snapshot|scanCurrentPage|waitForSelector|waitForContent|waitForStableText|back|forward|reload|tab-select|sendEmailWithVerification)$/;
+  if (_PAGE_ACTION_RE.test(action) && sessionId && !url && !engine.isSessionActive(sessionId)) {
+    try {
+      if (engine.lastUrlFor?.(sessionId)) {
+        logger.info(`[browser.act] ${action}: session=${sessionId} not active — resurrecting at last URL`);
+        await _ensureEngine(sessionId, headed, hidden);
+      }
+    } catch (_) {}
+  }
+
   switch (action) {
 
     case 'engine-handoff': {
@@ -2962,7 +2993,7 @@ async function browserAct(args) {
       // Ad-block init script is registered at launch time via context.addInitScript()
       // and persists automatically for all future navigations.
       if (_engineActive(sessionId) || !openSessions.has(sessionId)) {
-        let page = await _ensureEngine(sessionId, headed, hidden);
+        let page = await _ensureEngine(sessionId, headed, hidden, { skipResume: true });
         if (!page) {
           // Engine launch failed — likely "Opening in existing browser session".
           // Kill any Chrome holding this profile, clear the lock, and retry once.
@@ -2971,7 +3002,7 @@ async function browserAct(args) {
             logger.info(`[browser.act] navigate: killed conflicting Chrome for session=${sessionId} — retrying engine launch`);
             clearProfileLock(sessionId);
             await new Promise(r => setTimeout(r, 500));
-            page = await _ensureEngine(sessionId, headed, hidden);
+            page = await _ensureEngine(sessionId, headed, hidden, { skipResume: true });
           }
         }
         if (page) {
@@ -3144,11 +3175,16 @@ async function browserAct(args) {
     }
 
     case 'close-all': {
-      const sessions = [...openSessions];
+      // args.except: sessionIds to preserve (e.g. the active continuation
+      // session or sessions referenced by the current plan). The planner's
+      // fallback cleanup must never kill a session execution is about to use.
+      const _except = new Set(Array.isArray(args?.except) ? args.except : []);
+      let sessions = [...openSessions];
       // Also close engine sessions
       for (const sid of engine.listSessions()) {
         if (!sessions.includes(sid)) sessions.push(sid);
       }
+      sessions = sessions.filter((sid) => !_except.has(sid));
       let closed = 0;
       for (const sid of sessions) {
         openSessions.delete(sid);
@@ -5636,7 +5672,18 @@ async function browserAct(args) {
             } catch (_) {}
             snapshotCache.delete(_tabKey(sessionId));
           }
-          return { ok: true, action, sessionId, executionTime: Date.now() - start };
+
+          // Scroll-class keys: attach a cheap scroll-position observation so
+          // downstream synthesis/review sees evidence of where the page landed.
+          let _obs;
+          if (/^(End|Home|PageUp|PageDown|ArrowDown|ArrowUp|Space)$/i.test(_normalizedKey)) {
+            try {
+              _obs = await _ePage.evaluate(
+                `({scrollY:Math.round(window.scrollY),scrollHeight:document.documentElement.scrollHeight,viewportHeight:window.innerHeight,url:location.href})`
+              ).then(m => m ? { ...m, atBottom: m.scrollY + m.viewportHeight >= m.scrollHeight - 4 } : null).catch(() => null);
+            } catch (_) { _obs = null; }
+          }
+          return { ok: true, action, sessionId, observation: _obs || undefined, executionTime: Date.now() - start };
         } catch (pressErr) {
           logger.warn(`[browser.act] press (engine) failed: ${pressErr.message} — falling back to CLI`);
         }

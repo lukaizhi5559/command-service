@@ -1022,10 +1022,50 @@ async function _executeJustType(sessionId, value, focusedElement, pageCategory, 
     }
     const _finalKey = _keyMap[_key.toLowerCase()] || _key;
     const _combo = [..._mods, _finalKey].join('+');
+
+    // Scroll-position probe — evidence for synthesize/reviewExecution and the
+    // stop condition for scroll-to-bottom loops on infinite-scroll pages.
+    const _readScrollMetrics = async () => {
+      try {
+        const _r = await browserAct({
+          action: 'evaluate', sessionId, headed: true, timeoutMs: 2000,
+          text: `JSON.stringify({scrollY:Math.round(window.scrollY),scrollHeight:document.documentElement.scrollHeight,viewportHeight:window.innerHeight,url:location.href})`,
+        });
+        const _m = JSON.parse(_r?.result || _r?.stdout || 'null');
+        if (_m && typeof _m.scrollY === 'number') {
+          _m.atBottom = _m.scrollY + _m.viewportHeight >= _m.scrollHeight - 4;
+          return _m;
+        }
+      } catch (_) {}
+      return null;
+    };
+
+    // "Scroll to the bottom" on an infinite-scroll page needs repeated End
+    // presses — one press lands mid-feed. Loop until at-bottom or the metrics
+    // plateau (no new content after 2 consecutive presses), bounded at 8.
+    const _isBottomGoal = _finalKey === 'End' && /\bbottom\b/i.test(goal || '');
+    const _isScrollKey = /^(End|Home|PageUp|PageDown|ArrowDown|ArrowUp|Space)$/.test(_finalKey);
+
     logger.info(`[instruction.runner] Just-type: pressing ${_combo} (from ${value})`);
-    await browserAct({ action: 'press', sessionId, key: _combo, headed: true, timeoutMs: 5000 });
-    await _sleep(800);
-    return { ok: true, pageChanged: false };
+    let _obs = null;
+    if (_isBottomGoal) {
+      let _prevKey = null;
+      for (let _i = 0; _i < 8; _i++) {
+        await browserAct({ action: 'press', sessionId, key: _combo, headed: true, timeoutMs: 5000 });
+        await _sleep(700);
+        _obs = await _readScrollMetrics();
+        if (!_obs) break;
+        if (_obs.atBottom) break;
+        const _key = `${_obs.scrollY}|${_obs.scrollHeight}`;
+        if (_key === _prevKey) break; // plateau — no new content rendered
+        _prevKey = _key;
+      }
+    } else {
+      await browserAct({ action: 'press', sessionId, key: _combo, headed: true, timeoutMs: 5000 });
+      await _sleep(800);
+      if (_isScrollKey) _obs = await _readScrollMetrics();
+    }
+    return { ok: true, pageChanged: false, observation: _obs || undefined };
   }
 
   if (!focusedElement) {

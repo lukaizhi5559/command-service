@@ -68,10 +68,14 @@ async function justTypeAgent(args = {}) {
       const value = _pressKeyFromGoal(goal);
       postProgress(_progressCallbackUrl, { tier: 'just-type', message: `just.type.agent: ${value}` });
       const res = await _executeJustType(sessionId, value, focused, pageCategory, goal, agentContext, null, overlayActive, []);
+      const obs = res?.observation;
       return {
         ok: !!res?.ok,
-        output: res?.ok ? `Pressed ${value.replace('PRESS_', '')}` : undefined,
+        output: res?.ok
+          ? `Pressed ${value.replace('PRESS_', '')}` + (obs ? ` — scroll ${obs.scrollY}/${obs.scrollHeight}px${obs.atBottom ? ' (bottom reached)' : ''}` : '')
+          : undefined,
         error: res?.error,
+        observation: obs,
         // No focus and no scrollable page → let turn.loop observe+act.
         suggestedAgent: res?.ok ? undefined : (res?.suggestedAgent || 'turn.loop.agent'),
         sessionId,

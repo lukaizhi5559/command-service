@@ -6918,14 +6918,20 @@ function _isUnsafeDeepLinkUrl(candidateUrl, expectedHost = '') {
   return false;
 }
 
-async function verifyDeepLinkUrl(url, sessionId, expectedHost, timeoutMs = 15000, hostAliases = []) {
+async function verifyDeepLinkUrl(url, sessionId, expectedHost, timeoutMs = 15000, hostAliases = [], _verifyOpts = {}) {
   try {
     if (_isUnsafeDeepLinkUrl(url, expectedHost)) {
       logger.warn(`[browser.agent] verifyDeepLinkUrl: rejected unsafe candidate for ${expectedHost}: ${url}`);
       return false;
     }
 
-    const nav = await callSkill('browser.act', { action: 'navigate', url, sessionId, timeoutMs }, timeoutMs + 3000).catch(() => ({ ok: false }));
+    // headed/hidden are forwarded when present so preflight verification opens
+    // a hidden window instead of flashing a visible Chrome (or hijacking the
+    // caller's live session — callers must not pass a live session here).
+    const _vFlags = {};
+    if (_verifyOpts.headed !== undefined) _vFlags.headed = _verifyOpts.headed;
+    if (_verifyOpts.hidden !== undefined) _vFlags.hidden = _verifyOpts.hidden;
+    const nav = await callSkill('browser.act', { action: 'navigate', url, sessionId, timeoutMs, ..._vFlags }, timeoutMs + 3000).catch(() => ({ ok: false }));
     if (!nav?.ok) {
       logger.warn(`[browser.agent] verifyDeepLinkUrl: TRANSPORT failure navigating to ${url} (browser unreachable/busy — not a content verdict): ${nav?.error || 'no result'}`);
       return false;
@@ -7886,11 +7892,14 @@ async function _resolveCheapDeepLink(agentId, serviceKey, baseStartUrl, task, ex
 }
 
 async function _resolveTaskDeepLink(agentId, serviceKey, baseStartUrl, task, existingDeepLinkUrl, sessionId, _dlOpts) {
-  // _dlOpts: { headed, hidden, taskClassification } — propagated to all browser.act calls so
+  // _dlOpts: { headed, hidden, taskClassification, liveSession } — propagated to all browser.act calls so
   // preflight deep-link resolution is headless/hidden (no visible Chrome window).
+  // liveSession=true means sessionId is a pre-existing persistent session —
+  // resolution may evaluate it read-only but must NEVER navigate or close it.
   const _dlHeaded = _dlOpts?.headed !== undefined ? _dlOpts.headed : false;
   const _dlHidden = _dlOpts?.hidden !== undefined ? _dlOpts.hidden : true;
   const _dlTaskCls = _dlOpts?.taskClassification || null;
+  const _dlLiveSession = _dlOpts?.liveSession === true;
   try {
     const _cheap = await _resolveCheapDeepLink(agentId, serviceKey, baseStartUrl, task, existingDeepLinkUrl, { taskClassification: _dlTaskCls, networkDiscovery: false });
     if (!_cheap) return null;
@@ -8152,7 +8161,14 @@ async function _resolveTaskDeepLink(agentId, serviceKey, baseStartUrl, task, exi
         logger.warn(`[browser.agent] deep-link: off-domain candidate rejected (no sessionId for verification): ${candidate}`);
         return null;
       }
-      const _verified = await verifyDeepLinkUrl(candidate, sessionId, baseHost, 15000, _svcAliases);
+      if (_dlLiveSession) {
+        // verifyDeepLinkUrl navigates sessionId to the candidate — on a live
+        // shared session that hijacks the user's current page mid-plan. The
+        // deep-link is an optimization; reject and let the caller use startUrl.
+        logger.warn(`[browser.agent] deep-link: off-domain candidate rejected (session ${sessionId} is live — verification would hijack the user's page): ${candidate}`);
+        return null;
+      }
+      const _verified = await verifyDeepLinkUrl(candidate, sessionId, baseHost, 15000, _svcAliases, { headed: _dlHeaded, hidden: _dlHidden });
       if (!_verified) {
         logger.warn(`[browser.agent] deep-link: off-domain candidate failed verification (see TRANSPORT/content breakdown above): ${candidate}`);
         return null;
@@ -8736,6 +8752,22 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
   // safely under macOS's 104-char Unix socket limit.
   const sessionId = profile;
 
+  // ── Live-session protection for silent preflight probes ──────────────────
+  // A `_silentPreflightProbe` (authenticate/preflightProbe) must never touch a
+  // session that is already live — that window may be the user's in-flight
+  // automation page from the previous prompt. No kill+relaunch, no navigate to
+  // startUrl (that hijacks the user's current page), no post-probe close.
+  // The probe evaluates the live page in place; off-domain → inconclusive.
+  const _preExistingLiveSession = _silentPreflightProbe === true
+    && (() => { try { return !!(browserEngine?.isSessionActive?.(sessionId)); } catch (_) { return false; } })();
+  const _closeProbeSession = (closeArgs = {}) => {
+    if (_preExistingLiveSession) {
+      logger.info(`[browser.agent] run: live shared session ${sessionId} — probe exit not closing it`);
+      return Promise.resolve();
+    }
+    return callBrowserAct({ action: 'close', sessionId, ...closeArgs }, 8000).catch(() => {});
+  };
+
   // ── On-page action check ───────────────────────────────────────────────────
   // If the task is an on-page action (add to cart, like, follow, reply, etc.),
   // skip destination resolution AND deep-link resolution. The action lives on the
@@ -9107,8 +9139,25 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
       }
     }
 
+    // ── Live-session early-out (silent preflight probes) ───────────────────
+    // If the shared session is already live but the user's page is on a
+    // different domain than this service, probing startUrl would require
+    // hijacking their page — refuse: report the probe inconclusive (same
+    // fail-open shape as a transport error) and leave the session untouched.
+    if (_preExistingLiveSession) {
+      const _liveHrefRes = await callBrowserAct({ action: 'evaluate', text: 'window.location.href', sessionId, timeoutMs: 5000 }, 8000).catch(() => null);
+      const _liveHref = String(_liveHrefRes?.result ?? _liveHrefRes?.stdout ?? '').trim().replace(/^"|"$/g, '');
+      const _liveHost = (() => { try { return new URL(_liveHref).hostname.replace(/^www\./, '').toLowerCase(); } catch (_) { return ''; } })();
+      const _startHost = (() => { try { return new URL(startUrl).hostname.replace(/^www\./, '').toLowerCase(); } catch (_) { return ''; } })();
+      if (!_liveHost || !_startHost || !isHostAlias(_liveHost, _startHost, hostAliases)) {
+        logger.info(`[browser.agent] run: preflightProbe — live session ${sessionId} is on "${_liveHost || 'unknown'}", off-domain for ${agentId} — probe inconclusive, page untouched`);
+        return { ok: true, agentId, authed: false, authVerified: false, unverifiable: true, liveSession: true, error: 'live session on different domain — auth probe skipped' };
+      }
+      logger.info(`[browser.agent] run: preflightProbe — live session ${sessionId} on-domain (${_liveHref}) — probing current page in place`);
+    }
+
     // ── Skip browser restart if domain continuity detected ────────────────
-    if (!_domainContinuitySkip) {
+    if (!_domainContinuitySkip && !_preExistingLiveSession) {
       // ── Close any existing engine session for this session ──────────────
       // Ensures the Playwright Node API engine's Chrome is properly closed,
       // not just the CLI daemon. Prevents "Opening in existing browser session"
@@ -9192,8 +9241,17 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
       }
 
       if (!_skipNavigate) try {
-        logger.info(`[browser.agent] run: playwright auth-check — navigating to ${startUrl} for ${agentId}`);
-        const _probeNav = await callBrowserAct({ action: 'navigate', sessionId, url: startUrl, timeoutMs: 30000, headed: _preflightHeaded }, 35000);
+        // Live shared session → probe the CURRENT page (href eval below reads
+        // window.location.href either way). Navigating it to startUrl would
+        // steal the page the user is looking at.
+        if (!_preExistingLiveSession) {
+          logger.info(`[browser.agent] run: playwright auth-check — navigating to ${startUrl} for ${agentId}`);
+        } else {
+          logger.info(`[browser.agent] run: playwright auth-check — live session ${sessionId} — skipping startUrl nav, probing current page`);
+        }
+        const _probeNav = _preExistingLiveSession
+          ? { ok: true, skipped: 'live-session' }
+          : await callBrowserAct({ action: 'navigate', sessionId, url: startUrl, timeoutMs: 30000, headed: _preflightHeaded }, 35000);
 
         // ── Chrome session conflict detection — fail fast ──────────────────
         if (_isChromeSessionConflict(_probeNav)) {
@@ -9499,7 +9557,7 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
                   }
                 }
 
-                if (!_hydrated && _silentPreflightProbe) {
+                if (!_hydrated && _silentPreflightProbe && !_preExistingLiveSession) {
                   // ── Hidden-headed retry ─────────────────────────────────────
                   // Headless Chrome is bot-walled by Cloudflare on some services
                   // (e.g. chatgpt.com serves a challenge shell that never
@@ -9508,6 +9566,8 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
                   // offscreen window — passes headless detection while staying
                   // invisible to the user (same pattern as web.crawl/extract_url
                   // hidden fallbacks for bot-walled sites).
+                  // Skipped for live shared sessions — the close+relaunch would
+                  // destroy the user's window just to re-measure hydration.
                   logger.warn(`[browser.agent] run: SPA hydration failed headless for ${agentId} — retrying once in hidden headed mode`);
                   try {
                     await callBrowserAct({ action: 'close', sessionId, headed: false }, 8000).catch(() => {});
@@ -9839,7 +9899,7 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
               logger.warn(`[browser.agent] self-heal: web.agent call failed: ${_healErr.message}`);
             }
 
-            if (_healedUrl) {
+            if (_healedUrl && !_preExistingLiveSession) {
               // Update startUrl and invalidate DuckDB meta cache so next run uses the correct URL
               startUrl = _healedUrl;
               try {
@@ -10031,7 +10091,7 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
     // Silent preflight probe should never run interactive login. Signal auth needed and exit.
     if (_authNeeded && _silentPreflightProbe) {
       logger.info(`[browser.agent] run: preflightProbe detected auth-needed for ${agentId} — skipping interactive waitForAuth`);
-      await callBrowserAct({ action: 'close', sessionId, headed: false }, 8000).catch(() => {});
+      await _closeProbeSession({ headed: false });
       return { ok: false, agentId, authed: false, authRequired: true, error: 'auth required' };
     }
 
@@ -10106,7 +10166,7 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
           })();
         }
         if (_authOnly) {
-          await callBrowserAct({ action: 'close', sessionId, headed: false }, 8000).catch(() => {});
+          await _closeProbeSession({ headed: false });
         }
         return { ok: false, error: `waitForAuth failed: ${err.message}` };
       }
@@ -10125,7 +10185,7 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
           })();
         }
         if (_authOnly) {
-          await callBrowserAct({ action: 'close', sessionId, headed: false }, 8000).catch(() => {});
+          await _closeProbeSession({ headed: false });
         }
         return { ok: false, error: `Auth failed for ${agentId}: ${authResult?.error}` };
       }
@@ -10167,8 +10227,9 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
   if (_authOnly) {
     // Headless preflight probes must close the browser so it doesn't stay open between
     // preflight and actual plan execution. The persistent profile keeps cookies.
+    // _closeProbeSession no-ops when the probe ran against a live shared session.
     if (_silentPreflightProbe) {
-      await callBrowserAct({ action: 'close', sessionId, headed: false }, 8000).catch(() => {});
+      await _closeProbeSession({ headed: false });
     }
     logger.info(`[browser.agent] run: auth-only call complete for ${agentId}`);
     return { ok: true, agentId, authed: true, authVerified: true, startUrl };
@@ -14040,7 +14101,14 @@ async function browserAgent(args) {
         // Default to headless/hidden during preflight to avoid visible Chrome windows.
         const _dlHeadedResolved = _dlHeaded !== undefined ? _dlHeaded : false;
         const _dlHiddenResolved = _dlHidden !== undefined ? _dlHidden : true;
-        const _result = await _resolveTaskDeepLink(_aId || 'unknown', _svcKey || '', _startUrl, _task, _existing, _sid, { headed: _dlHeadedResolved, hidden: _dlHiddenResolved, taskClassification: _dlCls });
+        // Snapshot liveness BEFORE resolution — preflight passes the persistent
+        // shared session name (e.g. amazon_agent) with hidden:true, and the
+        // template/cache paths never open a browser. Closing _sid blindly kills
+        // the user's live Chrome window mid-plan (dead context → about:blank →
+        // follow-up actions no-op). Only a session THIS call spawned may close.
+        let _wasActive = false;
+        try { _wasActive = !!(browserEngine?.isSessionActive?.(_sid)); } catch (_) {}
+        const _result = await _resolveTaskDeepLink(_aId || 'unknown', _svcKey || '', _startUrl, _task, _existing, _sid, { headed: _dlHeadedResolved, hidden: _dlHiddenResolved, taskClassification: _dlCls, liveSession: _wasActive });
         const _dlUrl = _result?.url || (typeof _result === 'string' ? _result : null);
         // Close only sessions opened for a HIDDEN/preflight eval — the cleanup
         // this exists for. When the caller passed the live shared session
@@ -14048,7 +14116,7 @@ async function browserAgent(args) {
         // whole persistent Chrome context mid-plan: dead context → relaunch →
         // "Restore pages?" + about:blank tabs + ~8s per nav step, and the
         // kill/relaunch race produced launchPersistentContext failures.
-        if (_sid && _dlHiddenResolved) {
+        if (_sid && _dlHiddenResolved && !_wasActive) {
           await callBrowserAct({ action: 'close', sessionId: _sid, headed: _dlHeadedResolved, hidden: _dlHiddenResolved }, 8000).catch(() => {});
         } else if (_sid) {
           logger.info(`[browser.agent] resolve_deep_link: live shared session ${_sid} — not closing (resolution reuses the caller's session)`);

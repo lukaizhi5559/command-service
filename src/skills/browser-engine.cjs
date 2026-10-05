@@ -364,8 +364,12 @@ function getPage(sessionId) {
   const s = _sessions.get(sessionId);
   if (!s?.context) return null;
   const pages = s.context.pages();
-  if (s.activePage && pages.includes(s.activePage) && !s.activePage.isClosed()) return s.activePage;
+  if (s.activePage && pages.includes(s.activePage) && !s.activePage.isClosed()) {
+    try { const _u = s.activePage.url(); if (_u && !/^about:blank$/i.test(_u)) s.lastUrl = _u; } catch (_) {}
+    return s.activePage;
+  }
   s.activePage = pages.find((p) => !p.isClosed() && !/^about:blank$/i.test(p.url())) || pages.find((p) => !p.isClosed()) || null;
+  if (s.activePage) { try { const _u = s.activePage.url(); if (_u && !/^about:blank$/i.test(_u)) s.lastUrl = _u; } catch (_) {} }
   return s.activePage;
 }
 
@@ -383,10 +387,27 @@ function getContext(sessionId) {
 async function closeSession(sessionId) {
   const s = _sessions.get(sessionId);
   if (!s) return;
+  // Stash the last viewed URL so a later relaunch (continuation prompt after
+  // the window was closed — by cleanup or by the user) can resume the page
+  // instead of landing on about:blank.
+  try {
+    const _u = s.lastUrl || s.activePage?.url?.();
+    if (_u && !/^about:blank$/i.test(_u)) _lastUrls.set(sessionId, { url: _u, at: Date.now() });
+  } catch (_) {}
   try { await s.context.close(); } catch (e) { logger.warn(`[browser-engine] close: ${e.message}`); }
   clearAdBlockSession(sessionId);
   _activeRealChromeSessions.delete(sessionId);
   _sessions.delete(sessionId);
+}
+
+// URLs captured when a session closes or was last active — used by
+// browser.act._ensureEngine to resurrect a dead session at its last page.
+const _lastUrls = new Map();
+function lastUrlFor(sessionId, ttlMs = 30 * 60 * 1000) {
+  const e = _lastUrls.get(sessionId);
+  if (!e) return null;
+  if (Date.now() - e.at > ttlMs) { _lastUrls.delete(sessionId); return null; }
+  return e.url;
 }
 
 function listSessions() { return [..._sessions.keys()]; }
@@ -756,7 +777,7 @@ async function buildRefTree(page) {
 }
 
 module.exports = {
-  launch, getPage, setActivePage, getContext, closeSession, listSessions, isSessionActive,
+  launch, getPage, setActivePage, getContext, closeSession, listSessions, isSessionActive, lastUrlFor,
   getNetLog, clearNetLog, buildRefTree, _DOM_SCANNER_SCRIPT,
   sessionProfileDir, clearProfileLock,
 };
