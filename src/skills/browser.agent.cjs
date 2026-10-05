@@ -4643,6 +4643,12 @@ function _seedIntentUrlsFromKnownServices(hostname, serviceKey) {
     for (const [intentKey, urlOrBuilder] of Object.entries(svcEntry.intentUrls)) {
       // intentUrls values can be strings or { buildUrl } functions; only seed strings
       if (typeof urlOrBuilder !== 'string') continue;
+      // Family check — never seed a template URL that lives outside this host's
+      // declared service family (the gmail↔docs cross-service pollution case).
+      if (!_deepLinkHostAllowed(_hostOfUrl(urlOrBuilder), hostname, svcEntry)) {
+        logger.warn(`[browser.agent] app-knowledge: skip seed ${intentKey}→${urlOrBuilder} — host outside ${hostname} family`);
+        continue;
+      }
       saveIntentUrl(hostname, intentKey, urlOrBuilder, null, { verified: true });
       seeded++;
     }
@@ -4650,6 +4656,35 @@ function _seedIntentUrlsFromKnownServices(hostname, serviceKey) {
       logger.info(`[browser.agent] app-knowledge: seeded ${seeded} intent_url entries for ${hostname} from KNOWN_BROWSER_SERVICES`);
     }
   } catch (_) { /* non-fatal */ }
+}
+
+// Deep-link trust boundary: a cached/discovered destination must stay inside
+// the resolved service's DECLARED domain family —
+//   1. the service's startUrl host (+ its subdomains)
+//   2. registered hostAliases (docs.new, notion.new, calendar.google.com…)
+//   3. hosts of the service's own intentUrls templates (googlesheets →
+//      docs.google.com editors; gmail → contacts.google.com)
+// Cross-SERVICE URLs are rejected (a docs.google.com entry cached under
+// mail.google.com can never navigate again). Unregistered services get rule 1
+// only — declaring hostAliases is how multi-host families opt in.
+// Deliberately NOT isHostAlias: its base-domain compare (google.com==google.com)
+// is too loose for a trust boundary — that leniency is what let this through.
+function _hostOfUrl(u) {
+  try { return new URL(u).hostname.replace(/^www\./, '').toLowerCase(); }
+  catch (_) { return ''; }
+}
+function _deepLinkHostAllowed(urlHost, baseHost, svcEntry) {
+  if (!urlHost || !baseHost) return false;
+  const uh = String(urlHost).toLowerCase().replace(/^www\./, '');
+  const bh = String(baseHost).toLowerCase().replace(/^www\./, '');
+  if (uh === bh || uh.endsWith('.' + bh)) return true;
+  const allowed = new Set((svcEntry?.hostAliases || []).map(a => String(a).toLowerCase()));
+  for (const v of Object.values(svcEntry?.intentUrls || {})) {
+    if (typeof v !== 'string') continue;
+    const h = _hostOfUrl(v);
+    if (h) allowed.add(h);
+  }
+  return allowed.has(uh);
 }
 
 // Check if currentHost is equivalent to expectedHost, considering configured host aliases.
@@ -7601,7 +7636,19 @@ async function _resolveCheapDeepLink(agentId, serviceKey, baseStartUrl, task, ex
       logger.info(`[browser.agent] deep-link: intent=MAIL derived from taskClassification (send_email) for ${agentId}`);
     }
 
-    const intent = _clsMail || await classifyTaskIntent(task, serviceKey);
+    let intent = _clsMail || await classifyTaskIntent(task, serviceKey);
+
+    // Mail-family services declare a `mail` intent with the real compose
+    // deep-link (?compose=new). "Compose/send an email" reliably classifies as
+    // content_create (write/compose verbs) — reclassify so the mail template
+    // wins instead of a discovery/cache path that has no mail template.
+    if (intent === INTENTS.CONTENT_CREATE) {
+      const _mailSvc = lookupBrowserService(serviceKey);
+      if (_mailSvc?.intentUrls?.mail && /\b(e-?mail|compose|send\b)/i.test(task || '')) {
+        logger.info(`[browser.agent] deep-link: reclassified content_create → mail for ${serviceKey} (service declares mail intent)`);
+        intent = 'mail';
+      }
+    }
     const _taskKeywords = getTaskKeywords(task, serviceKey); // LLM-extracted keywords from classifyTaskIntent
     const isSearchLike = intent === INTENTS.SEARCH || /\b(search|look\s*up|google|find)\b/i.test(task);
 
@@ -7622,7 +7669,11 @@ async function _resolveCheapDeepLink(agentId, serviceKey, baseStartUrl, task, ex
       try {
         const { loadIntentUrl } = require('./lib/appKnowledge.cjs');
         const _akUrl = loadIntentUrl(baseHost, intent);
-        if (_akUrl?.url && _isValidDeepLinkUrl(_akUrl.url)) {
+        if (_akUrl?.url && !_deepLinkHostAllowed(_hostOfUrl(_akUrl.url), baseHost, lookupBrowserService(serviceKey))) {
+          // Cross-service cache pollution (docs.google.com under mail.google.com)
+          // — reject before it can navigate. Entry is purged out-of-band.
+          logger.warn(`[browser.agent] deep-link: rejecting appKnowledge intent_url ${_akUrl.url} — host outside ${baseHost} service family`);
+        } else if (_akUrl?.url && _isValidDeepLinkUrl(_akUrl.url)) {
           logger.info(`[browser.agent] deep-link: appKnowledge intent_url hit for ${baseHost}/${intent}: ${_akUrl.url} (confidence=${_akUrl.confidence}, verifiedRuns=${_akUrl.verifiedRuns})`);
           return { url: _akUrl.url, source: 'appKnowledge', intent, isCriteriaTask: _isCriteriaTask, baseHost, taskKeywords: _taskKeywords, needsPromote: false };
         }
@@ -7700,6 +7751,8 @@ async function _resolveCheapDeepLink(agentId, serviceKey, baseStartUrl, task, ex
         const _isMessageTask = /\b(message|msg|dm|direct message|chat|reply|respond|inbox)\b/i.test(_taskLower);
         if (_isPostShareTask && !_isMessageTask && /\/(messages|messenger)\b/i.test(_cachedDeepLink.url)) {
           logger.warn(`[browser.agent] deep-link: skipping cached Messenger URL for post/share task: ${_cachedDeepLink.url} — falling through to discovery`);
+        } else if (!_deepLinkHostAllowed(_hostOfUrl(_cachedDeepLink.url), baseHost, lookupBrowserService(serviceKey))) {
+          logger.warn(`[browser.agent] deep-link: rejecting keyword-cache URL ${_cachedDeepLink.url} — host outside ${baseHost} service family`);
         } else {
           logger.info(`[browser.agent] deep-link: keyword cache hit for ${agentId}: ${_cachedDeepLink.url} (score=${_cachedDeepLink.score.toFixed(2)})`);
           return { url: _cachedDeepLink.url, source: 'keyword-cache', intent, isCriteriaTask: _isCriteriaTask, baseHost, taskKeywords: _taskKeywords, needsPromote: false };
@@ -8211,6 +8264,10 @@ async function _resolveTaskDeepLink(agentId, serviceKey, baseStartUrl, task, exi
       // existing verified intent_url — a weaker candidate evicts the good one.
       if (_isGenericLandingUrl(candidate, serviceKey)) {
         logger.info(`[browser.agent] deep-link: skipping intent_url cache for generic-landing URL ${candidate} (${baseHost}/${intent})`);
+      } else if (!_deepLinkHostAllowed(_hostOfUrl(candidate), baseHost, lookupBrowserService(serviceKey))) {
+        // The write-side hole that polluted mail.google.com with a docs URL —
+        // never cache a candidate that lives outside this service's family.
+        logger.warn(`[browser.agent] deep-link: skipping intent_url cache — candidate host ${_hostOfUrl(candidate)} outside ${baseHost} family`);
       } else {
         setImmediate(() => {
           try {
@@ -14971,3 +15028,5 @@ module.exports._isSearchCriteriaTask = _isSearchCriteriaTask;
 module.exports._extractSearchQuery = _extractSearchQuery;
 module.exports._extractSearchQueryRegex = _extractSearchQueryRegex;
 module.exports._followUpContextClause = _followUpContextClause;
+module.exports._deepLinkHostAllowed = _deepLinkHostAllowed;
+module.exports._hostOfUrl = _hostOfUrl;
