@@ -830,7 +830,7 @@ async function _refreshToken(provider, tok) {
   let clientSecret = tok.client_secret;
   if (!clientId || !clientSecret) {
     try {
-      const keytar = require('keytar');
+      const keytar = require('../../../../shared/secret-resolve.cjs').secretStoreAdapter();
       clientId     = clientId     || await keytar.getPassword('thinkdrop', `${provider.toUpperCase()}_CLIENT_ID`);
       clientSecret = clientSecret || await keytar.getPassword('thinkdrop', `${provider.toUpperCase()}_CLIENT_SECRET`);
     } catch (_) {}
@@ -879,9 +879,9 @@ async function _refreshToken(provider, tok) {
 
     // Persist updated token back to keytar and token file
     try {
-      const keytar = require('keytar');
+      const keytar = require('../../../../shared/secret-resolve.cjs').secretStoreAdapter();
       await keytar.setPassword('thinkdrop', `oauth:${provider}`, JSON.stringify(updated));
-      logger.info(`[loadOAuthEnv] ${provider} access token refreshed and saved to keytar`);
+      logger.info(`[loadOAuthEnv] ${provider} access token refreshed and saved`);
     } catch (_) {}
 
     // Also update the per-skill token file if it exists and matches this provider
@@ -915,7 +915,7 @@ async function _refreshToken(provider, tok) {
 
 async function loadOAuthEnv() {
   let keytar;
-  try { keytar = require('keytar'); } catch (_) { return {}; }
+  try { keytar = require('../../../../shared/secret-resolve.cjs').secretStoreAdapter(); } catch (_) { return {}; }
   const vars = {};
   await Promise.all(OAUTH_PROVIDERS.map(async (provider) => {
     try {
@@ -2023,7 +2023,7 @@ async function shellRun(args) {
     // Invalidate all cached tokens by clearing issued_at so loadOAuthEnv
     // re-evaluates expiry and refreshes each provider.
     try {
-      const keytar = require('keytar');
+      const keytar = require('../../../../shared/secret-resolve.cjs').secretStoreAdapter();
       for (const provider of OAUTH_PROVIDERS) {
         const raw = await keytar.getPassword('thinkdrop', `oauth:${provider}`).catch(() => null);
         if (!raw) continue;

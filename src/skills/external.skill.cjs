@@ -203,7 +203,7 @@ function _readSkillMeta(skillDir, skillName) {
 // context._missingOAuth lists providers that had no token (caller should gate on this)
 async function buildSkillContext(skillName, secretKeys, oauthProviders) {
   let keytar = null;
-  try { keytar = require('keytar'); } catch (_) {}
+  try { keytar = require('../../../../shared/secret-resolve.cjs').secretStoreAdapter(); } catch (_) {}
 
   const secrets = {};
   if (keytar && secretKeys && secretKeys.length > 0) {

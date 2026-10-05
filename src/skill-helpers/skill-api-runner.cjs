@@ -78,15 +78,11 @@ function ensurePackage(skillDir, pkg) {
  */
 async function loadSecrets(skillName, authEnv) {
   const secrets = {};
-  let keytar;
-  try { keytar = require('keytar'); } catch (_) { return secrets; }
-  for (const key of authEnv) {
-    try {
-      const val = await keytar.getPassword(skillName, key)
-        || await keytar.getPassword('thinkdrop', key);
-      if (val) secrets[key] = val;
-    } catch (_) {}
-  }
+  try {
+    const { resolveAgentSecrets } = require('../../../../shared/secret-resolve.cjs');
+    const r = await resolveAgentSecrets(skillName, authEnv, skillName);
+    Object.assign(secrets, r.found);
+  } catch (_) {}
   return secrets;
 }
 

@@ -60,23 +60,20 @@ function probeCLIHelp(helpCmd) {
 }
 
 /**
- * Load secrets for the skill from keytar.
+ * Load secrets for the skill from the encrypted profile store.
+ * Resolves credential:<name>:<ENV>, <name>_<ENV>, skill:<name>:<ENV> keys
+ * (SAFE:/KEYTAR: refs decrypt transparently server-side), plus process.env.
  * @param {string} skillName
  * @param {string[]} authEnv  list of env var names
  * @returns {Record<string, string>}  map of env var name → value (only found ones)
  */
 async function loadSecrets(skillName, authEnv) {
   const secrets = {};
-  let keytar;
-  try { keytar = require('keytar'); } catch (_) { return secrets; }
-  for (const key of authEnv) {
-    try {
-      // Try skill-scoped key first, then global 'thinkdrop' service
-      const val = await keytar.getPassword(skillName, key)
-        || await keytar.getPassword('thinkdrop', key);
-      if (val) secrets[key] = val;
-    } catch (_) {}
-  }
+  try {
+    const { resolveAgentSecrets } = require('../../../../shared/secret-resolve.cjs');
+    const r = await resolveAgentSecrets(skillName, authEnv, skillName);
+    Object.assign(secrets, r.found);
+  } catch (_) {}
   return secrets;
 }
 

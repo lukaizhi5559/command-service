@@ -898,7 +898,7 @@ class CommandServiceMCPServer {
           try {
             const { skillName = '', providers = [] } = JSON.parse(body || '{}');
             let keytar = null;
-            try { keytar = require('keytar'); } catch (_) {}
+            try { keytar = require('../../../shared/secret-resolve.cjs').secretStoreAdapter(); } catch (_) {}
             const statuses = await Promise.all(providers.map(async (provider) => {
               if (!keytar) return { provider, connected: false, expired: false };
               try {
@@ -1643,8 +1643,8 @@ async function ensureUBlockOrigin() {
  */
 async function seedOAuthCredentials() {
   let keytar;
-  try { keytar = require('keytar'); } catch (_) {
-    logger.warn('[startup] keytar unavailable — skipping OAuth credential seeding');
+  try { keytar = require('../../../shared/secret-resolve.cjs').secretStoreAdapter(); } catch (_) {
+    logger.warn('[startup] secret store unavailable — skipping OAuth credential seeding');
     return;
   }
 

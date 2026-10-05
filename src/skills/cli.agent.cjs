@@ -832,6 +832,33 @@ async function actionRun({ cli, argv = [], cwd, env, timeoutMs, stdin, agentId, 
     if (!agentResult.ok) return agentResult;
     const { agent, cliTool, binPath } = agentResult;
 
+    // ── Resolve declared secrets → env for every spawn in this run ─────────
+    // Descriptor `secrets:` frontmatter lists env vars the CLI needs; values
+    // come from the encrypted profile store (SAFE:/KEYTAR: refs) — plaintext
+    // exists only in this process's env map, never written or logged.
+    try {
+      const _sm = (agent.descriptor || '').match(/^secrets:\s*\n((?:\s+-\s*\S+\s*\n?)*)/m)
+        || (agent.descriptor || '').match(/^secrets:\s*\[([^\]]*)\]/m);
+      const _declared = _sm
+        ? (_sm[1].includes('\n')
+            ? _sm[1].split('\n').map(l => l.trim().replace(/^-\s*/, '')).filter(Boolean)
+            : _sm[1].split(',').map(s => s.trim().replace(/['"]/g, '')).filter(Boolean))
+        : [];
+      if (_declared.length) {
+        const { resolveAgentSecrets } = require('../../../../shared/secret-resolve.cjs');
+        const r = await resolveAgentSecrets(agentId, _declared);
+        if (Object.keys(r.found).length) {
+          env = { ...(env || {}), ...r.found };
+          logger.info(`[cli.agent] injected ${Object.keys(r.found).length} secret(s) for ${agentId}: ${Object.keys(r.found).join(', ')}`);
+        }
+        if (r.missing.length) {
+          logger.warn(`[cli.agent] missing secrets for ${agentId}: ${r.missing.join(', ')}`);
+        }
+      }
+    } catch (_secErr) {
+      logger.warn(`[cli.agent] secret resolution failed for ${agentId}: ${_secErr.message}`);
+    }
+
     // ── pre_steps: execute shared services before the CLI loop ──────────────
     // Descriptor frontmatter may declare pre_steps that must run first.
     // Supported purposes:
