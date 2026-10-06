@@ -152,6 +152,17 @@ async function mcpAgent(args = {}) {
           _writeAgentDescriptor({ name, envKeys, tools, status: 'active' });
         }
 
+        // Handshake passed — stamp the smoke-test proof so the capability
+        // index can rank verified agents above unverified ones.
+        try {
+          const { stampDescriptor } = require('../../../shared/capability-index.cjs');
+          await stampDescriptor(agentId, {
+            verified: true,
+            verified_at: new Date().toISOString(),
+            tools_count: tools.length,
+          });
+        } catch (_) {}
+
         logger.info(`[mcp.agent] installed ${name} — ${tools.length} tools`, { agentId });
         return { ok: true, name, agentId, tools: tools.map(t => ({ name: t.name, description: t.description })), envKeys };
       }

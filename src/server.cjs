@@ -1095,6 +1095,34 @@ class CommandServiceMCPServer {
         return;
       }
 
+      // ── POST /capability.infer ──────────────────────────────────────────────
+      // Semantic fallback for capability.search: the LLM proposes candidate
+      // tools, then every proposal is mechanically verified (which / npm view /
+      // brew info / mcp seed / --version probe). Only verified candidates are
+      // returned — hallucinated names die at verification.
+      if (req.method === 'POST' && req.url === '/capability.infer') {
+        let body = '';
+        req.on('data', chunk => { body += chunk; });
+        req.on('end', async () => {
+          try {
+            const payload = JSON.parse(body || '{}');
+            const { inferCapabilities } = require('../../../shared/capability-index.cjs');
+            const goal = payload.query || payload.goal || payload.payload?.query || '';
+            const result = await inferCapabilities(goal, {
+              llmCaller: (prompt) => skillLlm.askWithMessages(
+                [{ role: 'user', content: prompt }],
+                { temperature: 0.2, maxTokens: 600, taskType: 'capability_infer' }),
+            });
+            res.writeHead(200);
+            res.end(JSON.stringify(result));
+          } catch (err) {
+            res.writeHead(400);
+            res.end(JSON.stringify({ ok: false, error: err.message }));
+          }
+        });
+        return;
+      }
+
       // POST /mcp.install — install an external MCP server (plan-check cli-setup).
       if (req.method === 'POST' && req.url === '/mcp.install') {
         let body = '';
@@ -1413,8 +1441,27 @@ class CommandServiceMCPServer {
             });
             if (install.ok || install.alreadyInstalled) {
               const v = await cliAgent({ action: 'validate_agent', id: agentId });
+              // Smoke test — install success ≠ working binary. Probe
+              // --version → --help → version (all read-only, verb-gated);
+              // stamp the result into the descriptor frontmatter so the
+              // capability index and plan-check can rank verified agents.
+              let smoke = null;
+              try {
+                const { capabilityProbe, stampDescriptor } = require('../../../shared/capability-index.cjs');
+                for (const argv of [['--version'], ['--help'], ['version']]) {
+                  const p = await capabilityProbe(cliTool, argv);
+                  if (p.installed !== false) { smoke = { ok: Boolean(p.ok), verb: argv[0], exitCode: p.exitCode }; if (p.ok) break; }
+                  else { smoke = { ok: false, verb: argv[0], error: 'not-installed' }; break; }
+                }
+                await stampDescriptor(agentId, {
+                  verified: smoke?.ok === true,
+                  verified_at: new Date().toISOString(),
+                });
+              } catch (smokeErr) {
+                smoke = { ok: false, error: smokeErr.message };
+              }
               res.writeHead(200);
-              res.end(JSON.stringify({ ok: true, installed: true, binPath: install.binPath, validate: v }));
+              res.end(JSON.stringify({ ok: true, installed: true, binPath: install.binPath, validate: v, verified: smoke?.ok === true, smoke }));
             } else {
               res.writeHead(200);
               res.end(JSON.stringify({ ok: false, error: install.error || 'install failed', stdout: install.stdout }));

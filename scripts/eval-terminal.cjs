@@ -87,6 +87,48 @@ function check(name, cond, extra = '') {
   const castHits = await cap.searchCapabilities('cast video');
   check('cast → catt.agent', castHits.some(h => h.id === 'catt.agent'));
 
+  // ── verbFit — connector vs action verbs ─────────────────────────────────────
+  console.log('\nverbFit');
+  const catt = catts.find(h => h.id === 'catt.agent');
+  if (catt) {
+    check('connector verb → clarify', cap.verbFit('I need to connect to my chromecast', catt) === 'clarify');
+    check('action verb → pin', cap.verbFit('cast video.mp4 to my chromecast', catt) === 'pin');
+    check('unsupported verb → clarify', cap.verbFit('mirror my overlay to the chromecast', catt) === 'clarify');
+    check('play maps to capability → pin', cap.verbFit('play a song on the chromecast', catt) === 'pin');
+  } else {
+    console.log('  SKIP  catt.agent not registered — verbFit tests skipped');
+  }
+
+  // ── capability.infer — LLM proposes, code verifies ──────────────────────────
+  console.log('\ncapability.infer');
+  const noLlm = await cap.inferCapabilities('send a text', {});
+  check('no llmCaller → not ok', noLlm.ok === false);
+  // Stub LLM: one real binary (node — supports --version), one hallucinated name.
+  const inf = await cap.inferCapabilities('list files', {
+    llmCaller: async () => JSON.stringify([
+      { name: 'node', kind: 'cli', why: 'runtime' },
+      { name: 'hallucinated-zzz-999', kind: 'cli', package: 'hallucinated-zzz-999', why: 'fake' },
+    ]),
+  });
+  check('infer returns candidates', inf.ok === true && inf.candidates.some(c => c.service === 'node' && c.installed === true));
+  check('hallucinated name rejected', inf.rejected.some(r => r.name === 'hallucinated-zzz-999'), JSON.stringify(inf.rejected));
+  check('installed candidate verified by probe', inf.candidates.find(c => c.service === 'node')?.verified === true);
+
+  // ── stampDescriptor — verified fields round-trip through service-map ────────
+  {
+    const os = require('os');
+    const fs = require('fs');
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'agents-'));
+    process.env.THINKDROP_AGENTS_DIR = tmp;
+    fs.writeFileSync(path.join(tmp, 'test.agent.md'), '---\nid: test.agent\nservice: test\nstatus: draft\n---\n\n# test\n');
+    const st = cap.stampDescriptor('test.agent', { verified: true, verified_at: '2026-01-01T00:00:00Z' });
+    check('stampDescriptor writes', st.ok === true);
+    const src = fs.readFileSync(path.join(tmp, 'test.agent.md'), 'utf8');
+    check('verified frontmatter present', /^verified: true$/m.test(src) && /^verified_at:/m.test(src));
+    fs.rmSync(tmp, { recursive: true, force: true });
+    delete process.env.THINKDROP_AGENTS_DIR;
+  }
+
   // Envelope shape — /command.automate unwraps body.payload; verify the
   // running service accepts it if it's up (skip silently otherwise).
   try {

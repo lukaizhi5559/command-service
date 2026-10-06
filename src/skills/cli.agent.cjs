@@ -674,6 +674,7 @@ Rules:
   Good (broad): "Many 'gh' operations have no dedicated subcommand — use 'gh api --method GET/PUT/DELETE/POST <REST endpoint>' for all of them. Syntax: run_help [\"api\"] shows full flags. Examples: star=PUT /user/starred/{owner}/{repo}, unstar=DELETE /user/starred/{owner}/{repo}, readme=GET /repos/{owner}/{repo}/readme, releases=GET /repos/{owner}/{repo}/releases, follow_user=PUT /user/following/{username}."
 - ask_user is the LAST RESORT. Do NOT use ask_user until you have run at least one diagnostic probe (run_shell or run_help) after a failure. The user should never see ask_user for a failure that a 1-line shell probe could have explained or resolved.
 - Never use ask_user for CLI version or installation issues — use run_update instead.
+- CAPABILITY-FIT — before your first execution action, compare the task to the descriptor's capabilities. If the asked operation is fundamentally outside what this tool can do (e.g. "mirror my screen" for a tool that only casts media files/URLs), do NOT attempt a nearest approximation and do NOT retry — emit ONE diagnostic probe (run_help) to confirm, then ask_user explaining what the tool CAN do (list 3-5 real capabilities in plain words) and ask whether one of them fits or whether they want a different tool. Never fake success on an unsupported operation.
 - MULTI-TURN ask_user: When processing a resume context where the user selected an option that implies a value is needed (e.g. "Yes, specify duration") but the actual value was NOT provided in the answer, emit another ask_user with an EMPTY options array to collect the specific value via free-text input. Do NOT guess or hallucinate values the user did not explicitly provide. The UI will show a free-text input field when options is empty.
 
 ## Universal Failure Protocol — DIAGNOSE FIRST (applies to every run_cmd exitCode≠0)
@@ -2102,11 +2103,13 @@ Output ONLY valid JSON with this exact structure:
     "capability_slug_1": "--flag1 VALUE --flag2",
     "capability_slug_2": "--other-flag"
   },
+  "synonyms": ["word-or-phrase users might say for this tool or its capabilities"],
   "notes": "any critical env requirements (e.g. required runtimes, auth steps)"
 }
 
 Rules:
 - capability slugs: lowercase_underscore, e.g. "extract_subtitles", "download_video", "extract_audio"
+- synonyms: 4-10 lowercase natural-language terms a non-technical user would say to mean this tool's job (e.g. for a chromecast caster: "chromecast", "cast", "tv", "stream to tv", "google cast"). These feed discovery search — include the service/protocol names the tool talks to.
 - flagMap values: exact flag syntax as you would type it (no binary name, no URL placeholder)
 - Include at most 15 capabilities — prioritize in this order:
   1. HIGHEST PRIORITY — media/content operations: download, extract, subtitle, transcription, audio, video, format selection, playlist, captions, chapters
@@ -2253,6 +2256,13 @@ async function buildDescriptorMd({ id, service, cliName, version, capabilities, 
     ? `pre_steps:\n${preStepsLines.join('\n')}\n`
     : '';
 
+  // Discoverability terms — capability noun tokens + LLM synonyms — so the
+  // capability index can match prompts that never name the tool itself.
+  const kwTokens = new Set([service, cliName]);
+  for (const c of capabilities) for (const t of String(c).split('_')) if (t.length > 2) kwTokens.add(t);
+  for (const s of llmExtraction?.synonyms || []) if (typeof s === 'string' && s.trim()) kwTokens.add(s.trim().toLowerCase());
+  const keywordsYaml = `keywords: [${[...kwTokens].filter(Boolean).join(', ')}]`;
+
   const parts = [
     '---',
     `id: ${id}`,
@@ -2261,6 +2271,7 @@ async function buildDescriptorMd({ id, service, cliName, version, capabilities, 
     `cli_tool: ${cliName}`,
     `capabilities:`,
     capYaml,
+    keywordsYaml,
     `version: ${version || 'unknown'}`,
     ...(preStepsYaml ? [preStepsYaml.trimEnd()] : []),
     '---',
