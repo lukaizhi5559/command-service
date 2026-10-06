@@ -1019,6 +1019,74 @@ class CommandServiceMCPServer {
         return;
       }
 
+      // ── POST /capability.search ─────────────────────────────────────────────
+      // Friction-ranked capability discovery for the planning lane:
+      // "what can accomplish X?" across registered agents, cli-registry,
+      // MCP servers, and zero-install platform affordances. Read-only.
+      if (req.method === 'POST' && req.url === '/capability.search') {
+        let body = '';
+        req.on('data', chunk => { body += chunk; });
+        req.on('end', async () => {
+          try {
+            const payload = JSON.parse(body || '{}');
+            const { searchCapabilities } = require('../../../shared/capability-index.cjs');
+            const query = payload.query || payload.payload?.query || '';
+            const results = await searchCapabilities(query, { limit: payload.limit });
+            res.writeHead(200);
+            res.end(JSON.stringify({ ok: true, query, results }));
+          } catch (err) {
+            res.writeHead(400);
+            res.end(JSON.stringify({ ok: false, error: err.message }));
+          }
+        });
+        return;
+      }
+
+      // ── POST /capability.select ─────────────────────────────────────────────
+      // Commits a chosen capability as a DRAFT .agent.md descriptor — metadata
+      // only; install/auth still flows through /agent.cli-build at plan-check.
+      if (req.method === 'POST' && req.url === '/capability.select') {
+        let body = '';
+        req.on('data', chunk => { body += chunk; });
+        req.on('end', async () => {
+          try {
+            const payload = JSON.parse(body || '{}');
+            const { selectCapability } = require('../../../shared/capability-index.cjs');
+            const result = await selectCapability(payload.name || payload.payload?.name || '');
+            res.writeHead(200);
+            res.end(JSON.stringify(result));
+          } catch (err) {
+            res.writeHead(400);
+            res.end(JSON.stringify({ ok: false, error: err.message }));
+          }
+        });
+        return;
+      }
+
+      // ── POST /capability.probe ──────────────────────────────────────────────
+      // Read-only CLI inspection for the planning lane — verb-allowlisted,
+      // spawn-without-shell, no secret env injection. Detects "installed?",
+      // "authed?", help text. See capability-index.cjs PROBE_VERBS.
+      if (req.method === 'POST' && req.url === '/capability.probe') {
+        let body = '';
+        req.on('data', chunk => { body += chunk; });
+        req.on('end', async () => {
+          try {
+            const payload = JSON.parse(body || '{}');
+            const { capabilityProbe } = require('../../../shared/capability-index.cjs');
+            const tool = payload.tool || payload.payload?.tool || '';
+            const argv = payload.argv || payload.payload?.argv || [];
+            const result = await capabilityProbe(tool, argv);
+            res.writeHead(200);
+            res.end(JSON.stringify(result));
+          } catch (err) {
+            res.writeHead(400);
+            res.end(JSON.stringify({ ok: false, error: err.message }));
+          }
+        });
+        return;
+      }
+
       if (req.method === 'POST' && req.url === '/command.automate') {
         let body = '';
         req.on('data', chunk => { body += chunk; });
