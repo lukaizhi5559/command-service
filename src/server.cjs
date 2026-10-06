@@ -85,6 +85,7 @@ const { projectEdit } = require('./skills/project.editor.cjs');
 const { projectStop } = require('./skills/project.stopper.cjs');
 const { cliAgent } = require('./skills/cli.agent.cjs');
 const { terminalAgent } = require('./skills/terminal.agent.cjs');
+const { mcpAgent } = require('./skills/mcp.agent.cjs');
 const { browserAgent } = require('./skills/browser.agent.cjs');
 const { playwrightAgent } = require('./skills/playwright.agent.cjs');
 const { urlFirstAgent } = require('./skills/url.first.agent.cjs');
@@ -173,6 +174,9 @@ class CommandServiceMCPServer {
 
       case 'terminal.agent':
         return await this._skillTerminalAgent(args, opts);
+
+      case 'mcp.agent':
+        return await this._skillMcpAgent(args);
 
       case 'browser.agent':
         return await this._skillBrowserAgent(args, opts);
@@ -313,6 +317,10 @@ class CommandServiceMCPServer {
 
   async _skillCliAgent(args) {
     return await cliAgent(args);
+  }
+
+  async _skillMcpAgent(args) {
+    return await mcpAgent(args);
   }
 
   async _skillTerminalAgent(args, opts = {}) {
@@ -1077,6 +1085,24 @@ class CommandServiceMCPServer {
             const tool = payload.tool || payload.payload?.tool || '';
             const argv = payload.argv || payload.payload?.argv || [];
             const result = await capabilityProbe(tool, argv);
+            res.writeHead(200);
+            res.end(JSON.stringify(result));
+          } catch (err) {
+            res.writeHead(400);
+            res.end(JSON.stringify({ ok: false, error: err.message }));
+          }
+        });
+        return;
+      }
+
+      // POST /mcp.install — install an external MCP server (plan-check cli-setup).
+      if (req.method === 'POST' && req.url === '/mcp.install') {
+        let body = '';
+        req.on('data', chunk => { body += chunk; });
+        req.on('end', async () => {
+          try {
+            const payload = JSON.parse(body || '{}');
+            const result = await mcpAgent({ action: 'install', ...payload });
             res.writeHead(200);
             res.end(JSON.stringify(result));
           } catch (err) {
