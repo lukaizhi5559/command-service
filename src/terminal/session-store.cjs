@@ -78,7 +78,11 @@ function create(opts = {}) {
   pty.onData((data) => {
     session.meta.lastActivity = Date.now();
     screen.write(data);
-    try { transcript.write(stripAnsi(data)); } catch (_) {}
+    // transcriptPaused — set briefly around user-typed secrets so the echo
+    // never lands in the audit log.
+    if (!session.transcriptPaused || Date.now() > session.transcriptPaused) {
+      try { transcript.write(stripAnsi(data)); } catch (_) {}
+    }
     for (const cb of session.dataListeners) {
       try { cb(data); } catch (_) {}
     }

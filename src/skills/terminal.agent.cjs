@@ -12,6 +12,8 @@
  *   open    { cwd?, env?, cols?, rows?, shell?, argv?, label?,
  *             managedBy?, ownerRunId?, protectedPaths? }   → { sessionId }
  *   send    { sessionId, text } | { sessionId, ctrl }      → typed input
+ *             sensitive: true pauses transcript capture briefly so echoed
+ *             user-typed secrets never reach the audit log.
  *   read    { sessionId, mode?: 'screen'|'tail', lines? }  → visible output
  *   wait    { sessionId, match?, idleMs?, timeoutMs? }     → wait for regex/idle
  *   exec    { cmd, sessionId?, timeoutMs? }                → cmd + exit marker
@@ -119,6 +121,7 @@ function actionSend(args) {
   if (!s) return { ok: false, error: 'session-not-found' };
   if (s.exitCode !== null) return { ok: false, error: 'session-exited', exitCode: s.exitCode };
 
+  if (args.sensitive) s.transcriptPaused = Date.now() + 4000;
   if (args.ctrl) {
     const map = { c: '\x03', d: '\x04', z: '\x1a', l: '\x0c', a: '\x01', e: '\x05', u: '\x15', k: '\x0b', enter: '\r', esc: '\x1b' };
     const key = String(args.ctrl).toLowerCase();
