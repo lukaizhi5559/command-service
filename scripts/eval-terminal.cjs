@@ -139,8 +139,20 @@ function check(name, cond, extra = '') {
     });
     const data = await res.json();
     check('live terminal.agent list via envelope', data?.data?.ok === true || data?.ok === true, JSON.stringify(data).slice(0, 120));
+    const mr = await fetch('http://127.0.0.1:3007/media.resolve', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ query: 'goof troop full episode' }),
+      signal: AbortSignal.timeout(25000),
+    }).then(r => r.json());
+    if (mr?.error === 'Not found' || mr === null) {
+      console.log('  SKIP  media.resolve — endpoint not in the running server (restart command-service)');
+    } else {
+      check('media.resolve returns watch URLs',
+        mr.ok === true && Array.isArray(mr.results) && mr.results.every(r => /^https?:\/\//.test(r.url)),
+        JSON.stringify(mr).slice(0, 150));
+    }
   } catch (_) {
-    console.log('  SKIP  command-service not running — envelope test skipped');
+    console.log('  SKIP  command-service not running — envelope/media tests skipped');
   }
 
   // ── mcp.agent ─────────────────────────────────────────────────────────────

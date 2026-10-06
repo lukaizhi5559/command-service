@@ -1123,6 +1123,52 @@ class CommandServiceMCPServer {
         return;
       }
 
+      // ── POST /media.resolve ─────────────────────────────────────────────────
+      // Deterministic "find a playable video/song" for the planning lane:
+      // yt-dlp ytsearch resolves a name to real watch URLs — independent of
+      // web-search providers, and the URLs feed straight into catt cast.
+      // Read-only metadata extraction; spawn-without-shell; 20s bound.
+      if (req.method === 'POST' && req.url === '/media.resolve') {
+        let body = '';
+        req.on('data', chunk => { body += chunk; });
+        req.on('end', async () => {
+          try {
+            const payload = JSON.parse(body || '{}');
+            const query = String(payload.query || payload.payload?.query || '').trim();
+            if (!query || query.length > 200) { res.writeHead(400); res.end(JSON.stringify({ ok: false, error: 'bad-query' })); return; }
+            const { whichCli } = require('../../../shared/capability-index.cjs');
+            const bin = whichCli('yt-dlp');
+            if (!bin) { res.writeHead(200); res.end(JSON.stringify({ ok: false, error: 'yt-dlp not installed' })); return; }
+            const n = Math.min(Math.max(parseInt(payload.count || 3, 10) || 3, 1), 5);
+            const { spawn } = require('child_process');
+            const result = await new Promise((resolve) => {
+              let out = '', done = false;
+              const finish = (r) => { if (!done) { done = true; resolve(r); } };
+              const proc = spawn(bin, [
+                `ytsearch${n}:${query}`,
+                '--flat-playlist', '--no-warnings', '--no-playlist',
+                '--print', '%(webpage_url)s\t%(title)s',
+              ], { stdio: ['ignore', 'pipe', 'pipe'] });
+              const timer = setTimeout(() => { try { proc.kill('SIGKILL'); } catch (_) {} finish({ ok: false, error: 'timeout' }); }, 20000);
+              proc.stdout.on('data', c => { if (out.length < 8192) out += c; });
+              proc.stderr.resume(); // drain — we only need stdout
+              proc.on('close', (code) => { clearTimeout(timer); finish({ ok: code === 0, exitCode: code ?? -1, output: out }); });
+              proc.on('error', (e) => { clearTimeout(timer); finish({ ok: false, error: e.message }); });
+            });
+            if (!result.ok) { res.writeHead(200); res.end(JSON.stringify({ ok: false, error: result.error || `exit ${result.exitCode}` })); return; }
+            const results = String(result.output || '').split('\n')
+              .map(l => { const [url, ...t] = l.split('\t'); return { url: (url || '').trim(), title: t.join('\t').trim() }; })
+              .filter(r => /^https?:\/\//.test(r.url));
+            res.writeHead(200);
+            res.end(JSON.stringify({ ok: true, results }));
+          } catch (err) {
+            res.writeHead(500);
+            res.end(JSON.stringify({ ok: false, error: err.message }));
+          }
+        });
+        return;
+      }
+
       // POST /mcp.install — install an external MCP server (plan-check cli-setup).
       if (req.method === 'POST' && req.url === '/mcp.install') {
         let body = '';
