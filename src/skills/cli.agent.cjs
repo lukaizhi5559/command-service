@@ -31,6 +31,7 @@ const logger = require('../logger.cjs');
 const { ALLOWED_COMMANDS: SHELL_ALLOWED_COMMANDS } = require('./shell.run.cjs');
 const { terminalAgent } = require('./terminal.agent.cjs');
 const termStore = require('../terminal/session-store.cjs');
+const termKnowledge = require('../terminal/knowledge.cjs');
 
 // Import shared database module
 const { withDb, resetDbCache, AGENTS_DB_PATH, AGENTS_DIR } = require('@thinkdrop/agents-db');
@@ -1093,6 +1094,14 @@ async function actionRun({ cli, argv = [], cwd, env, timeoutMs, stdin, agentId, 
     // Falls back to [] silently if user-memory service is unavailable.
     const skillDb = require('../skill-helpers/skill-db.cjs');
     const learnedRules = await skillDb.getContextRules('cli_agent:' + agentId).catch(() => []);
+    // Terminal-knowledge notes — per-CLI flags/prompts learned from PTY runs.
+    try {
+      const kn = termKnowledge.lookup(cliTool);
+      if (kn) {
+        if (kn.flags?.length) learnedRules.push(`flags that worked before: ${kn.flags.slice(0, 8).join(' ')}`);
+        if (kn.prompts?.length) learnedRules.push(`prompts seen before: ${kn.prompts.slice(0, 5).join('; ')}`);
+      }
+    } catch (_) {}
     if (learnedRules.length > 0) {
       logger.info(`[cli.agent] loaded ${learnedRules.length} learned rule(s) for ${agentId}`, { agentId });
     }
@@ -1587,11 +1596,15 @@ async function actionRun({ cli, argv = [], cwd, env, timeoutMs, stdin, agentId, 
             });
             if (r.ok) {
               observation = `pty exitCode=${r.exitCode}\nscreen:\n${(r.screen || '').slice(-RUN_HELP_CHARS)}`;
+              if (r.exitCode === 0) {
+                try { termKnowledge.record(cliTool, { flags: termKnowledge.extractFlags(action.cmd) }); } catch (_) {}
+              }
             } else {
               observation = `pty ${r.error || 'timeout'} — command is still running. screen:\n${(r.screen || '').slice(-1500)}\nUse pty_send to answer the visible prompt, or pty_exec another command.`;
             }
             if (r.prompt === 'password') {
               observation += `\n[PASSWORD/PASSPHRASE PROMPT ON SCREEN — use ask_user to collect the credential; never guess]`;
+              try { termKnowledge.record(cliTool, { prompt: 'password prompt' }); } catch (_) {}
             }
             logger.info(`[cli.agent] loop turn=${turn} pty_exec exitCode=${r.exitCode} ok=${r.ok}`, { agentId });
           } else {
@@ -1606,7 +1619,15 @@ async function actionRun({ cli, argv = [], cwd, env, timeoutMs, stdin, agentId, 
               // let the program echo/process the input before reading the screen
               await new Promise(res => setTimeout(res, 400));
               const rd = await terminalAgent({ action: 'read', sessionId: sid, mode: 'screen' });
-              observation = `pty_send ok. screen:\n${(rd.output || '').slice(-1500)}`;
+              const newScreen = rd.output || '';
+              observation = `pty_send ok. screen:\n${newScreen.slice(-1500)}`;
+              // Two-strike detection: identical screen after input means the
+              // program ignored us — tell the loop to stop guessing.
+              const _sess = termStore.get(sid);
+              if (_sess && _sess._lastReadScreen && _sess._lastReadScreen === newScreen) {
+                observation += `\n[SCREEN UNCHANGED after input — your input had no effect. Do NOT repeat the same pty_send; ask_user or try a non-interactive flag instead.]`;
+              }
+              if (_sess) _sess._lastReadScreen = newScreen;
             } else {
               observation = `pty_send failed: ${r.error}`;
             }
