@@ -95,6 +95,10 @@ function check(name, cond, extra = '') {
     check('action verb → pin', cap.verbFit('cast video.mp4 to my chromecast', catt) === 'pin');
     check('unsupported verb → clarify', cap.verbFit('mirror my overlay to the chromecast', catt) === 'clarify');
     check('play maps to capability → pin', cap.verbFit('play a song on the chromecast', catt) === 'pin');
+    // Generic-verb stoplist: 'set' collides with set_volume/set_device_alias
+    // but a calendar prompt must not pin a media caster.
+    check('generic verb alone → clarify', cap.verbFit('use this on my screen to send email and set calendar event', catt) === 'clarify');
+    check('set + discriminative token → pin', cap.verbFit('set the volume on the chromecast', catt) === 'pin');
   } else {
     console.log('  SKIP  catt.agent not registered — verbFit tests skipped');
   }
@@ -168,6 +172,24 @@ function check(name, cond, extra = '') {
   }
   const badInstall = await mcpAgent({ action: 'install', name: 'nonexistent-xyz' });
   check('install unknown name rejected', badInstall.ok === false);
+
+  // ── cli.agent generic task-mode run (no agentId → observe→adapt loop) ──────
+  console.log('\ncli.agent generic run');
+  const { cliAgent } = require('../src/skills/cli.agent.cjs');
+  try {
+    const gen = await cliAgent({ action: 'run', task: 'Run `ls /nonexistent-devin-e2e` — it will fail; diagnose why, then run `ls /tmp | head -3` instead and report what you saw.' });
+    check('generic run completes', gen.ok === true, JSON.stringify({ err: gen.error, turns: gen.agentTurns }).slice(0, 200));
+    check('failure observed then adapted', (gen.agentTurns || 0) >= 2
+      && (gen.transcript || []).some(t => /nonexistent|No such file/i.test(t.observation || '') || /nonexistent/i.test(JSON.stringify(t.action || {}))),
+      JSON.stringify((gen.transcript || []).map(t => t.action?.action)).slice(0, 150));
+    const honest = await cliAgent({ action: 'run', task: 'Check whether the tool "zzz-definitely-not-a-tool-9" is installed; if it is not, report that honestly — do NOT install anything.' });
+    check('honest not-found report', honest.ok === true || honest.askUser === true,
+      JSON.stringify({ err: honest.error, turns: honest.agentTurns }).slice(0, 200));
+    check('no fake success', !(honest.ok && /installed|worked/i.test(honest.stdout || '') && !/not|isn/i.test(honest.stdout || '')),
+      (honest.stdout || '').slice(0, 150));
+  } catch (e) {
+    console.log(`  SKIP  generic run — LLM loop unavailable (${e.message})`);
+  }
 
   // ── summary ───────────────────────────────────────────────────────────────
   console.log(`\n${pass} passed, ${fail} failed`);

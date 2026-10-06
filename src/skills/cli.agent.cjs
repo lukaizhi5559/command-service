@@ -805,6 +805,14 @@ Rules:
 - If the task genuinely cannot be expressed as a single CLI invocation, set argv to [] and explain in reasoning`;
 
 async function actionRun({ cli, argv = [], cwd, env, timeoutMs, stdin, agentId, task, _progressCallbackUrl, _stepIndex }) {
+  // ── Generic task-mode: no registered agent — same observe→adapt→retry
+  // discipline, but run_shell becomes the primary verb since there is no
+  // fixed cliTool. Used for goal-shaped steps ("install X", "set up Y") and
+  // AGENT_ESCALATE recovery from failed shell.run steps.
+  if (!agentId && task) {
+    return await _genericRunLoop({ task, cwd, env, timeoutMs, _progressCallbackUrl, _stepIndex });
+  }
+
   // ── Agentic path: agentId + task → LLM infers argv from descriptor ──
   if (agentId && task) {
     const agentResult = await withDb(async (db) => {
@@ -1706,6 +1714,261 @@ async function actionRun({ cli, argv = [], cwd, env, timeoutMs, stdin, agentId, 
     executionTime: result.executionTime,
     error: result.error,
   };
+}
+
+// ---------------------------------------------------------------------------
+// Generic task-mode loop
+// ---------------------------------------------------------------------------
+// actionRun({ task }) with no agentId — there is no registered agent and no
+// fixed cliTool. The LLM drives the same observe→adapt→retry discipline as
+// the descriptor loop, but run_shell is the primary execution verb (any bash
+// line), run_help takes an explicit binary, and pty_exec/pty_send cover
+// interactive installers/auth menus. This is what replaces blind shell.run
+// retries: the loop sees stderr, probes (npm view / brew info / --help), and
+// picks a different approach.
+// ---------------------------------------------------------------------------
+
+const GENERIC_LOOP_PROMPT = `You are a terminal automation agent completing a user task step-by-step.
+There is NO fixed CLI — you choose the tool each turn. Each turn you output exactly ONE JSON action:
+
+  run_shell  – PRIMARY verb — run any command line: { "action": "run_shell", "script": "...", "interpreter": "bash" }
+               interpreters: bash (default) | node | python3
+               installs, probes, execution — anything. Pipes/grep/head allowed.
+  run_cmd    – one binary + args:                  { "action": "run_cmd", "cmd": "<binary>", "argv": [...] }
+  run_help   – read a tool's own docs:             { "action": "run_help", "bin": "<cli>", "subcmd": [...]? }
+  pty_exec   – run inside a real terminal (PTY):   { "action": "pty_exec", "cmd": "<full command line>" }
+               interactive programs only — menus, setup wizards, y/n prompts, sudo, OAuth device flows.
+               Returns the visible screen + exitCode; if still running, drive it with pty_send.
+  pty_send   – type into the PTY:                  { "action": "pty_send", "text": "y" }  |  { "action": "pty_send", "ctrl": "c" }
+  web_search – docs/package names:                 { "action": "web_search", "query": "..." }
+  web_fetch  – read a docs URL:                    { "action": "web_fetch", "url": "..." }
+  done       – task complete:                      { "action": "done", "summary": "..." }
+  ask_user   – need the user:                      { "action": "ask_user", "question": "...", "options": [] }
+
+Each action may include an optional "thinking" field: one sentence (max 120 chars) on why you chose it.
+
+Rules:
+- DIAGNOSE before retry: a non-zero exit gets ONE cheap probe first — never re-run an unchanged failing command.
+- NEVER install a package whose name you have not verified — npm view <pkg> / brew info <pkg> / pip3 index versions <pkg> FIRST. A guessed name 404s; verify, then install.
+- Missing tool → install it (brew/npm/pip3 — whatever the tool's docs say), then verify with "command -v <bin>" or "<bin> --version" before done.
+- Interactive/sudo/password prompts → pty_exec. If the screen asks for a password/passphrase/token, ask_user for the credential first — NEVER guess or invent one.
+- Prefer non-interactive flags/env over menu-driving when one exists (check run_help).
+- Never output done without a verification command's output proving the goal.
+- ask_user is LAST RESORT — at least one diagnostic probe after a failure first.
+- Output JSON only. No prose before or after the object.`;
+
+async function _genericRunLoop({ task, cwd, env, timeoutMs, _progressCallbackUrl, _stepIndex }) {
+  const MAX_TURNS = 12;
+  const OBSERVATION_CHARS = 600;
+  const RUN_HELP_CHARS = 3000;
+  const loopHistory = [];
+  const transcript = [];
+  const failedSigs = new Map(); // action signature → fail count
+  const agentId = 'cli.agent';
+
+  let _ptySessionId = null;
+  const _ensurePtySession = async () => {
+    if (_ptySessionId) return _ptySessionId;
+    const r = await terminalAgent({ action: 'open' });
+    _ptySessionId = r.sessionId;
+    return _ptySessionId;
+  };
+
+  // Pre-seed resume context so a resumed run doesn't re-ask a prior question.
+  const _resumeMatch = String(task).match(/\[Resume context:[\s\S]*?Continue from this point[\s\S]*?\]/);
+  if (_resumeMatch) {
+    loopHistory.push({ turn: 0, action: 'ask_user', observation: `Prior pause: ${_resumeMatch[0].slice(0, 500)} — continue from the user's answer; do NOT repeat resolved questions.` });
+  }
+
+  const temporalContext = `\n\nCurrent date/time: ${new Date().toISOString()} (${process.env.TZ || 'local'})`;
+
+  try {
+    for (let turn = 1; turn <= MAX_TURNS; turn++) {
+      if (_progressCallbackUrl) {
+        try {
+          const http = require('http');
+          const _p = JSON.stringify({ type: 'agent:turn_live', agentId, turn, maxTurns: MAX_TURNS, stepIndex: _stepIndex ?? 0, currentAction: 'thinking', thinking: null });
+          const _rq = http.request({ hostname: '127.0.0.1', port: parseInt(new URL(_progressCallbackUrl).port, 10), path: new URL(_progressCallbackUrl).pathname + new URL(_progressCallbackUrl).search, method: 'POST', headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(_p) }, timeout: 2000 });
+          _rq.on('error', () => {});
+          _rq.write(_p);
+          _rq.end();
+        } catch (_) {}
+      }
+
+      const turnSys = GENERIC_LOOP_PROMPT + temporalContext;
+      const turnUser = buildTurnPrompt(task, loopHistory);
+      const llmRaw = await callLLM(turnSys, turnUser, { temperature: 0.1, maxTokens: 400 });
+
+      let action = null;
+      if (llmRaw) {
+        try {
+          const m = String(llmRaw).match(/\{[\s\S]*\}/);
+          if (m) action = JSON.parse(m[0]);
+        } catch (_) {}
+      }
+      if (!action || !action.action) {
+        loopHistory.push({ turn, action: 'parse_error', observation: `LLM output: ${(llmRaw || 'NULL').slice(0, 200)} — output a single JSON action object.` });
+        continue;
+      }
+
+      logger.info(`[cli.agent] generic loop turn=${turn} action=${action.action}`, { task: String(task).slice(0, 80) });
+      if (_progressCallbackUrl) {
+        try {
+          const http = require('http');
+          const _p = JSON.stringify({ type: 'agent:turn_live', agentId, turn, maxTurns: MAX_TURNS, stepIndex: _stepIndex ?? 0, currentAction: action.action, thinking: action.thinking || null });
+          const _rq = http.request({ hostname: '127.0.0.1', port: parseInt(new URL(_progressCallbackUrl).port, 10), path: new URL(_progressCallbackUrl).pathname + new URL(_progressCallbackUrl).search, method: 'POST', headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(_p) }, timeout: 2000 });
+          _rq.on('error', () => {});
+          _rq.write(_p);
+          _rq.end();
+        } catch (_) {}
+      }
+
+      if (action.action === 'done') {
+        transcript.push({ turn, action, outcome: { ok: true, result: action.summary || '' }, thoughts: action.thinking || null });
+        _autoRegisterInstalledCli(task).catch(() => {});
+        return { ok: true, agentId, task, stdout: action.summary || '', agentTurns: turn, transcript };
+      }
+
+      if (action.action === 'ask_user') {
+        return {
+          ok: false, agentId, task, askUser: true,
+          question: action.question || '', options: action.options || [],
+          agentTurns: turn, transcript,
+        };
+      }
+
+      // Loop guard: identical failing action signature 3× → force a different approach
+      const _sig = JSON.stringify({ a: action.action, s: action.script || action.cmd || action.argv || action.url || '' });
+      const _sigFails = failedSigs.get(_sig) || 0;
+
+      let observation = '';
+
+      if (action.action === 'run_shell') {
+        const script = String(action.script || '').trim();
+        if (!script) {
+          observation = 'run_shell: script is required';
+        } else if (_sigFails >= 2) {
+          observation = 'This exact script already failed twice — change the approach (different tool, different package name, or ask_user).';
+        } else {
+          try {
+            const { shellRun } = require('./shell.run.cjs');
+            const interp = _SHELL_INTERPRETERS.has(action.interpreter) ? action.interpreter : 'bash';
+            const flag = interp === 'node' ? '-e' : '-c';
+            const r = await shellRun({ cmd: interp, argv: [flag, script], timeoutMs: action.timeoutMs || 30000 });
+            const combined = [r.stdout || '', r.stderr || ''].filter(Boolean).join('\n').trim();
+            observation = (combined || `exitCode=${r.exitCode}`).slice(0, RUN_HELP_CHARS);
+            if (r.exitCode !== 0) failedSigs.set(_sig, _sigFails + 1);
+            logger.info(`[cli.agent] generic loop turn=${turn} run_shell interp=${interp} exitCode=${r.exitCode} chars=${combined.length}`);
+          } catch (e) {
+            observation = `run_shell error: ${e.message}`;
+          }
+        }
+
+      } else if (action.action === 'run_cmd') {
+        const cmd = String(action.cmd || '').trim();
+        const bin = cmd ? whichCli(cmd) : null;
+        if (!bin) {
+          observation = `run_cmd: "${cmd}" is not on PATH — verify/install it first (which ${cmd}, npm view, brew info), or run it via run_shell.`;
+        } else {
+          const r = await spawnCapture(bin, Array.isArray(action.argv) ? action.argv : [], { cwd, env, timeoutMs: timeoutMs || 30000 });
+          observation = [`exitCode=${r.exitCode}`, r.stdout, r.stderr].filter(Boolean).join('\n').slice(0, RUN_HELP_CHARS);
+          if (r.exitCode !== 0) failedSigs.set(_sig, _sigFails + 1);
+          logger.info(`[cli.agent] generic loop turn=${turn} run_cmd ${cmd} exitCode=${r.exitCode}`);
+        }
+
+      } else if (action.action === 'run_help') {
+        const bin = String(action.bin || action.cmd || '').trim();
+        if (!bin) {
+          observation = 'run_help: "bin" (the binary name) is required';
+        } else {
+          const binPath = whichCli(bin);
+          if (!binPath) {
+            observation = `run_help: "${bin}" is not installed — verify/install it first (npm view / brew info to find the real package name).`;
+          } else {
+            const sub = Array.isArray(action.subcmd) ? action.subcmd : [];
+            const r = await spawnCapture(binPath, [...sub, '--help'], { timeoutMs: 8000 });
+            observation = (r.stdout || r.stderr || `exitCode=${r.exitCode}`).slice(0, RUN_HELP_CHARS);
+          }
+        }
+
+      } else if (action.action === 'pty_exec' || action.action === 'pty_send') {
+        try {
+          const sid = await _ensurePtySession();
+          if (action.action === 'pty_exec') {
+            const r = await terminalAgent({ action: 'exec', sessionId: sid, cmd: String(action.cmd || ''), timeoutMs: action.timeoutMs || 60000, keepSession: true, _progressCallbackUrl });
+            observation = r.ok
+              ? `pty exitCode=${r.exitCode}\nscreen:\n${(r.screen || '').slice(-RUN_HELP_CHARS)}`
+              : `pty ${r.error || 'timeout'} — still running. screen:\n${(r.screen || '').slice(-1500)}\nUse pty_send to answer the visible prompt.`;
+            if (r.prompt === 'password') {
+              observation += `\n[PASSWORD/PASSPHRASE PROMPT ON SCREEN — use ask_user to collect the credential; never guess]`;
+            }
+            if (r.ok && r.exitCode !== 0) failedSigs.set(_sig, _sigFails + 1);
+            logger.info(`[cli.agent] generic loop turn=${turn} pty_exec exitCode=${r.exitCode} ok=${r.ok}`);
+          } else {
+            let r;
+            if (action.ctrl) r = await terminalAgent({ action: 'send', sessionId: sid, ctrl: action.ctrl });
+            else r = await terminalAgent({ action: 'send', sessionId: sid, text: `${String(action.text ?? '')}\n` });
+            if (r.ok) {
+              await new Promise(res => setTimeout(res, 400));
+              const rd = await terminalAgent({ action: 'read', sessionId: sid, mode: 'screen' });
+              const newScreen = rd.output || '';
+              observation = `pty_send ok. screen:\n${newScreen.slice(-1500)}`;
+              const sess = termStore.get(sid);
+              if (sess && sess._lastReadScreen === newScreen) {
+                observation += `\n[SCREEN UNCHANGED after input — your input had no effect. Do NOT repeat the same pty_send; ask_user or try a non-interactive flag.]`;
+              }
+              if (sess) sess._lastReadScreen = newScreen;
+            } else {
+              observation = `pty_send failed: ${r.error}`;
+            }
+          }
+        } catch (e) {
+          observation = `pty error: ${e.message}`;
+        }
+
+      } else if (action.action === 'web_search') {
+        const snippets = await agentWebSearch(action.query || '');
+        observation = snippets.slice(0, OBSERVATION_CHARS);
+
+      } else if (action.action === 'web_fetch') {
+        const page = await agentWebFetch(action.url || '');
+        observation = page.slice(0, 2000);
+
+      } else {
+        observation = `unknown action: ${action.action} — valid: run_shell, run_cmd, run_help, pty_exec, pty_send, web_search, web_fetch, done, ask_user`;
+      }
+
+      loopHistory.push({ turn, ...action, observation: observation.slice(0, OBSERVATION_CHARS) });
+      transcript.push({ turn, action, observation: observation.slice(0, 300), outcome: { ok: false, error: observation.slice(0, 300) }, thoughts: action.thinking || null });
+    }
+  } finally {
+    if (_ptySessionId) {
+      try { termStore.close(_ptySessionId); } catch (_) {}
+      _ptySessionId = null;
+    }
+  }
+
+  return {
+    ok: false, agentId, task,
+    error: `Generic loop reached MAX_TURNS (${MAX_TURNS}) without completing`,
+    agentTurns: MAX_TURNS, transcript,
+  };
+}
+
+// After a successful generic run, if the task was install-shaped and a new CLI
+// is now on PATH with no registered agent, build its descriptor in the
+// background so the next "use X" task gets the deterministic agent path.
+async function _autoRegisterInstalledCli(task) {
+  const m = String(task).match(/\b(?:install|set\s?up|get|add)\s+(?:the\s+)?["']?([a-zA-Z0-9][\w.-]*)/i);
+  const svc = m?.[1]?.toLowerCase().replace(/[^a-z0-9]/g, '');
+  if (!svc || svc.length < 2) return;
+  try {
+    const rows = await withDb(db => db.all('SELECT id FROM agents WHERE id = ?', `${svc}.agent`).catch(() => []));
+    if (rows?.length) return;
+    if (!whichCli(svc)) return;
+    const r = await actionBuildAgent({ service: svc });
+    logger.info(`[cli.agent] generic run auto-registered ${svc}.agent: ok=${r?.ok === true}`);
+  } catch (_) {}
 }
 
 
