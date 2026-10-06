@@ -84,6 +84,7 @@ const { projectLaunch } = require('./skills/project.launcher.cjs');
 const { projectEdit } = require('./skills/project.editor.cjs');
 const { projectStop } = require('./skills/project.stopper.cjs');
 const { cliAgent } = require('./skills/cli.agent.cjs');
+const { terminalAgent } = require('./skills/terminal.agent.cjs');
 const { browserAgent } = require('./skills/browser.agent.cjs');
 const { playwrightAgent } = require('./skills/playwright.agent.cjs');
 const { urlFirstAgent } = require('./skills/url.first.agent.cjs');
@@ -169,6 +170,9 @@ class CommandServiceMCPServer {
 
       case 'cli.agent':
         return await this._skillCliAgent(args);
+
+      case 'terminal.agent':
+        return await this._skillTerminalAgent(args, opts);
 
       case 'browser.agent':
         return await this._skillBrowserAgent(args, opts);
@@ -309,6 +313,13 @@ class CommandServiceMCPServer {
 
   async _skillCliAgent(args) {
     return await cliAgent(args);
+  }
+
+  async _skillTerminalAgent(args, opts = {}) {
+    // Thread the server-side AbortSignal (tied to the HTTP socket lifecycle)
+    // into the skill so /automation.cancel kills PTY sessions it opened.
+    if (opts.signal) args = { ...args, _abortSignal: opts.signal };
+    return await terminalAgent(args);
   }
 
   async _skillBrowserAgent(args, opts = {}) {

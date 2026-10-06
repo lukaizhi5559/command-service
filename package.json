@@ -32,6 +32,7 @@
   "dependencies": {
     "@nut-tree-fork/nut-js": "^4.2.6",
     "@thinkdrop/agents-db": "file:./shared/agents-db",
+    "@xterm/headless": "^6.0.0",
     "dotenv": "^16.0.0",
     "duckdb": "1.4.4",
     "get-windows": "^9.2.3",
@@ -39,6 +40,7 @@
     "jimp": "^0.22.12",
     "jsonrepair": "^3.13.3",
     "node-cron": "^3.0.3",
+    "node-pty": "^1.1.0",
     "nodemailer": "^8.0.5",
     "playwright": "^1.61.1",
     "screenshot-desktop": "^1.15.0",

@@ -2123,4 +2123,4 @@ function getOutputContract(result) {
   };
 }
 
-module.exports = { shellRun, validate, getOutputContract, addCommandToAllowlist, ALLOWED_COMMANDS, DANGEROUS_COMMANDS, _looksTruncated };
+module.exports = { shellRun, validate, getOutputContract, addCommandToAllowlist, ALLOWED_COMMANDS, DANGEROUS_COMMANDS, _looksTruncated, getCwdRoots, DANGEROUS_SCRIPT_PATTERNS, _sandboxProfile };
