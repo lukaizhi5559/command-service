@@ -2080,6 +2080,11 @@ function getOutputContract(result) {
   if (result.stdout && typeof result.stdout === 'string') {
     // Match absolute paths: /Users/name/... or ~/...
     const pathPatterns = [
+      // Whole-line absolute paths — handles spaces and U+202F narrow no-break
+      // space (macOS "Screenshot 2026-10-05 at 4.09.25 PM.png"), which the
+      // whitespace-delimited patterns below can never match.
+      /(?:^|\n)[ \t]*(\/[^\n]+?\.\w{1,10})[ \t]*(?=\n|$)/g,
+      /(?:^|\n)[ \t]*(~\/[^\n]+?\.\w{1,10})[ \t]*(?=\n|$)/g,
       /(?:^|\s)(\/[^\s\n]+\.\w+)(?=\s|$)/gm,
       /(?:^|\s)(~\/[^\s\n]+\.\w+)(?=\s|$)/gm,
       /"([^"]+\.\w+)"/g,

@@ -159,6 +159,7 @@ async function _saveBackup(focusedElement) {
 // caught while it's still recoverable (submit clears the field, destroying
 // the evidence).
 //   { ok:true }                          — value found on the focused carrier
+//   { ok:true }                          — value consumed into a chip/pill token
 //   { ok:false, error:'value-not-landed' }  — no fillable contains the value
 //   { ok:false, error:'value-misplaced' }   — value is on a non-focused element
 //   { ok:true }                          — unreadable page → don't block
@@ -175,7 +176,34 @@ async function _verifyTypedValueLanded(sessionId, value) {
       var v = norm(el.value !== undefined ? el.value : (el.innerText || el.textContent));
       if (v.indexOf(needle) !== -1) { carrier = el; break; }
     }
-    if (!carrier) return JSON.stringify({ landed: false });
+    if (!carrier) {
+      // Token/chip fields (Gmail To/Cc/Bcc, recipient pickers, tag inputs)
+      // consume the typed value into a pill element that is NOT a fillable —
+      // without this branch every confirmed chip reads as value-not-landed
+      // and the caller re-types in a loop (observed: Gmail To re-typed 5x).
+      // Scoped to the open dialog (compose popups) or the focused field's own
+      // container — a document-wide scan false-positives on recipient spans
+      // rendered elsewhere on the page (e.g. Gmail thread header [email] spans).
+      var PILLSEL = '[data-hovercard-id], [email], .vR .vN, [role="option"][data-name], [role="listbox"] [role="option"]';
+      var scopes = [];
+      var dlg = document.querySelector('[role="dialog"]');
+      if (dlg) scopes.push(dlg);
+      var p = document.activeElement, hops = 0;
+      while (p && p !== document.body && p !== dlg && hops < 6) {
+        if (p.querySelector && p.querySelector(PILLSEL)) { scopes.push(p); break; }
+        p = p.parentElement; hops++;
+      }
+      for (var s = 0; s < scopes.length; s++) {
+        var pills = scopes[s].querySelectorAll(PILLSEL);
+        for (var pi = 0; pi < pills.length; pi++) {
+          var pt = norm(pills[pi].textContent || '') + ' ' +
+                   norm(pills[pi].getAttribute('email') || '') + ' ' +
+                   norm(pills[pi].getAttribute('data-name') || '');
+          if (pt.indexOf(needle) !== -1) return JSON.stringify({ landed: true, focused: true, chip: true });
+        }
+      }
+      return JSON.stringify({ landed: false });
+    }
     var ae = document.activeElement;
     var focused = ae === carrier || carrier.contains(ae) || ae.contains(carrier);
     return JSON.stringify({ landed: true, focused: focused });
@@ -187,6 +215,10 @@ async function _verifyTypedValueLanded(sessionId, value) {
     if (!parsed.landed) {
       logger.warn(`[instruction.runner] typed value not found in any fillable — value-not-landed`);
       return { ok: false, error: 'value-not-landed', suggestedAgent: 'turn.loop.agent' };
+    }
+    if (parsed.chip) {
+      logger.info(`[instruction.runner] typed value consumed into chip/pill token — landed (token field)`);
+      return { ok: true };
     }
     if (parsed.focused === false) {
       logger.warn(`[instruction.runner] typed value landed on a non-focused element — value-misplaced`);
