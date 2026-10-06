@@ -29,6 +29,8 @@ const logger = require('../logger.cjs');
 // Import shell.run's allowlist so run_shell interpreter validation and
 // LLM tool awareness stay in sync with what shell.run will actually accept.
 const { ALLOWED_COMMANDS: SHELL_ALLOWED_COMMANDS } = require('./shell.run.cjs');
+const { terminalAgent } = require('./terminal.agent.cjs');
+const termStore = require('../terminal/session-store.cjs');
 
 // Import shared database module
 const { withDb, resetDbCache, AGENTS_DB_PATH, AGENTS_DIR } = require('@thinkdrop/agents-db');
@@ -635,6 +637,14 @@ Each turn you output exactly ONE JSON action object from this palette:
              bash:    "yt-dlp --help 2>&1 | grep -A3 'sub'"
              node:    "const r=require('child_process').execSync('yt-dlp --version').toString(); console.log(r)"
              python3: "import subprocess,json; r=subprocess.run(['yt-dlp','--version'],capture_output=True); print(r.stdout.decode())"
+  pty_exec   – run a command inside a real terminal (PTY):
+             { "action": "pty_exec", "cmd": "<full command line>" }
+             Use for interactive tools — login menus, setup wizards, y/n prompts,
+             REPLs, anything needing a TTY. Returns the visible screen + exitCode.
+             If the command is still running, the returned screen shows the
+             current prompt — answer it with pty_send.
+  pty_send   – type into the PTY session:  { "action": "pty_send", "text": "y" }   → types text + Enter
+                                           { "action": "pty_send", "ctrl": "c" }  → ^C (also a/d/z/l/esc/enter)
   run_update – upgrade CLI to latest:       { "action": "run_update", "cli": "<name>" }
   web_search – search for docs/examples:   { "action": "web_search", "query": "..." }
   web_fetch  – read a docs/reference URL:  { "action": "web_fetch", "url": "..." }
@@ -727,25 +737,17 @@ Every CLI failure belongs to one of 5 categories. Identify the category from the
   Probe:   run_shell: curl -sI '<url>' 2>&1 | head -5  OR  <cli> whoami 2>&1  OR  <cli> auth status 2>&1
   Fix:     surface the specific finding to the user with ask_user — include what the probe returned.
 
-**Category F — Interactive TUI / requires PTY (terminal emulator)**
+**Category F — Interactive TUI / requires PTY**
   Signals: "No tty detected", "interactive terminal required", "not a tty", "requires a terminal", "must be run in a terminal", "isatty"
-  Root cause: The tool calls isatty() at the OS level. NO flag (-t, --tty, --no-tty, --force-tty, --batch) can bypass a missing PTY — these flags change rendering mode only, not whether a PTY exists.
-  DO NOT: retry with -t or --no-tty — both will fail with the same error. DO NOT: use ask_user for this.
+  You HAVE a terminal: pty_exec runs commands in a real PTY.
 
-  Step F-1 (MANDATORY — skip ALL flag retries):
-    Output run_shell immediately with a non-interactive equivalent that achieves the same goal:
-    - System resource monitor / top processes: run_shell "top -l 1 -n 10 -o cpu 2>/dev/null | head -30 || ps aux --sort=-%cpu | head -15"
-    - Disk usage: run_shell "df -h && du -sh /* 2>/dev/null | sort -rh | head -20"
-    - Memory stats: run_shell "vm_stat 2>/dev/null || free -h 2>/dev/null"
-    - Network stats: run_shell "netstat -an | head -30 || ss -tuln | head -20"
-    - If the tool has a --once, --batch, or --export flag: try run_cmd with that flag instead of run_shell.
+  Step F-1 (MANDATORY): re-run the command with pty_exec — e.g. pty_exec "<cli> <subcommand>". The returned screen shows the interactive prompt/menu.
+  Step F-2: answer prompts with pty_send — { "action": "pty_send", "text": "y" }, { "action": "pty_send", "ctrl": "c" }, arrow-key menus: send "\u001b[B" (down) / "\u001b[A" (up) via pty_send text.
+  Step F-3: when the interaction completes, retry the original task or call done.
 
-  Step F-2: After run_shell succeeds, call done with the output — the task is complete.
-    If run_shell also fails: call done with a clear explanation:
-    "This tool requires an interactive terminal (PTY) and cannot run in the automation environment. Here is equivalent data from system utilities: [any partial output]"
-
-  NEVER use ask_user for "No tty detected" — it is a fixed environment constraint, not a user decision.
-  NEVER retry run_cmd with tty-related flags after seeing this error even once.
+  Preferences: a non-interactive equivalent (flags/env/stdin, e.g. --with-token, config file, --batch) ALWAYS beats menu driving — try run_help for one first. pty_exec is for tools with no non-interactive path.
+  CREDENTIAL RULE: if the screen shows a password/passphrase prompt, NEVER guess or invent the credential — use ask_user to collect it, then pty_send the user's answer. Sudo prompts → ask_user.
+  If the same screen repeats across 2 pty_send turns, stop guessing — ask_user.
 
 **ORDERING RULE:**
 1. Read the error signal → identify category A/B/C/D/E/F
@@ -1120,8 +1122,28 @@ async function actionRun({ cli, argv = [], cwd, env, timeoutMs, stdin, agentId, 
     // as a synthetic turn above, so including it in the task string would be redundant.
     const loopTask = effectiveTask.replace(/\s*\[Resume context:[\s\S]*?\]\s*$/, '').trim();
 
+    // ── Per-run PTY session (lazily opened) — hands for interactive tools ────
+    // Opened on the first pty_exec/pty_send/auto-auth action; closed in the
+    // finally below so a session never outlives its run.
+    let _ptySessionId = null;
+    const _ensurePtySession = async () => {
+      if (_ptySessionId) return _ptySessionId;
+      const r = await terminalAgent({
+        action: 'open',
+        label: `cli.agent:${agentId}`,
+        managedBy: 'agent',
+        ownerRunId: `cli.agent:${agentId}:${Date.now()}`,
+        cwd, env,
+        _progressCallbackUrl,
+      });
+      if (!r.ok) throw new Error(r.error || 'pty-open-failed');
+      _ptySessionId = r.sessionId;
+      return _ptySessionId;
+    };
+
     let _authAttempted = false; // prevents infinite auto-auth retry within the agentic loop
 
+    try {
     for (let turn = 1; turn <= MAX_TURNS; turn++) {
       // ── Real-time turn progress → Electron overlay server ──────────────────
       // POST turn info to the overlay /agent-turn endpoint so the UI can show
@@ -1243,10 +1265,30 @@ async function actionRun({ cli, argv = [], cwd, env, timeoutMs, stdin, agentId, 
                 } catch (_) {}
               }
 
-              // Run the auth command (may open a browser for OAuth)
-              logger.info(`[cli.agent] running auto-auth: ${currentBinPath} ${_authArgv.join(' ')}`, { agentId });
-              const _authResult = await spawnCapture(currentBinPath, _authArgv, { timeoutMs: 180000 });
-              logger.info(`[cli.agent] auto-auth result: exitCode=${_authResult.exitCode}`, { agentId });
+              // Run the auth command under the run's PTY — interactive menus
+              // (gh auth login) and device flows (prints URL+code) are drivable
+              // where pipes would hang. 25s budget: fast for flag-less exits,
+              // but if a menu is still up we hand the screen to the loop.
+              logger.info(`[cli.agent] running auto-auth via pty: ${currentBinPath} ${_authArgv.join(' ')}`, { agentId });
+              const _authSid = await _ensurePtySession();
+              const _authResult = await terminalAgent({
+                action: 'exec', sessionId: _authSid,
+                cmd: `${currentBinPath} ${_authArgv.join(' ')}`,
+                timeoutMs: 25000, keepSession: true,
+                _progressCallbackUrl,
+              });
+              logger.info(`[cli.agent] auto-auth pty result: ok=${_authResult.ok} exitCode=${_authResult.exitCode}`, { agentId });
+
+              if (!_authResult.ok) {
+                // Still running interactively — push the live screen so the next
+                // turn can drive the menu with pty_send instead of blocking.
+                loopHistory.push({
+                  turn,
+                  action: 'auto_auth',
+                  observation: `Auth login is running interactively in the terminal session. Current screen:\n${(_authResult.screen || '').slice(-1200)}\nDrive it with pty_send (answer menus, type tokens). If it printed a URL+code, tell the user via ask_user. After it completes, retry the task.`,
+                });
+                continue; // back to top of agentic loop — LLM sees the screen
+              }
 
               // Emit task:auth_resolved
               if (_progressCallbackUrl) {
@@ -1530,6 +1572,49 @@ async function actionRun({ cli, argv = [], cwd, env, timeoutMs, stdin, agentId, 
         const page = await agentWebFetch(action.url || '');
         observation = page.slice(0, 2000);
 
+      } else if (action.action === 'pty_exec' || action.action === 'pty_send') {
+        // PTY actions — drive a real terminal for interactive tools (login
+        // menus, setup wizards, y/n prompts, REPLs). Session is per-run.
+        try {
+          const sid = await _ensurePtySession();
+          if (action.action === 'pty_exec') {
+            const r = await terminalAgent({
+              action: 'exec', sessionId: sid,
+              cmd: String(action.cmd || ''),
+              timeoutMs: action.timeoutMs || 60000,
+              keepSession: true,
+              _progressCallbackUrl,
+            });
+            if (r.ok) {
+              observation = `pty exitCode=${r.exitCode}\nscreen:\n${(r.screen || '').slice(-RUN_HELP_CHARS)}`;
+            } else {
+              observation = `pty ${r.error || 'timeout'} — command is still running. screen:\n${(r.screen || '').slice(-1500)}\nUse pty_send to answer the visible prompt, or pty_exec another command.`;
+            }
+            if (r.prompt === 'password') {
+              observation += `\n[PASSWORD/PASSPHRASE PROMPT ON SCREEN — use ask_user to collect the credential; never guess]`;
+            }
+            logger.info(`[cli.agent] loop turn=${turn} pty_exec exitCode=${r.exitCode} ok=${r.ok}`, { agentId });
+          } else {
+            let r;
+            if (action.ctrl) {
+              r = await terminalAgent({ action: 'send', sessionId: sid, ctrl: action.ctrl });
+            } else {
+              const text = String(action.text ?? '');
+              r = await terminalAgent({ action: 'send', sessionId: sid, text: `${text}\n` });
+            }
+            if (r.ok) {
+              // let the program echo/process the input before reading the screen
+              await new Promise(res => setTimeout(res, 400));
+              const rd = await terminalAgent({ action: 'read', sessionId: sid, mode: 'screen' });
+              observation = `pty_send ok. screen:\n${(rd.output || '').slice(-1500)}`;
+            } else {
+              observation = `pty_send failed: ${r.error}`;
+            }
+          }
+        } catch (_ptyErr) {
+          observation = `pty error: ${_ptyErr.message}`;
+        }
+
       } else if (action.action === 'run_shell') {
         // Shell composition action — runs a script via bash/node/python3 so the LLM can pipe,
         // grep, head, and combine stdout+stderr. Use for probing ONLY, not primary task execution.
@@ -1565,6 +1650,12 @@ async function actionRun({ cli, argv = [], cwd, env, timeoutMs, stdin, agentId, 
 
       loopHistory.push({ turn, ...action, observation: observation.slice(0, OBSERVATION_CHARS) });
       transcript.push({ turn, action, observation: observation.slice(0, 300), outcome: { ok: false, error: observation.slice(0, 300) }, thoughts: action.thinking || null });
+    }
+    } finally {
+      if (_ptySessionId) {
+        try { termStore.close(_ptySessionId); } catch (_) {}
+        _ptySessionId = null;
+      }
     }
 
     return {
