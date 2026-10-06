@@ -79,6 +79,27 @@ function check(name, cond, extra = '') {
   const hits = await cap.searchCapabilities('list files');
   check('search returns candidates', Array.isArray(hits) && hits.length > 0);
   check('friction sorted', hits.every((h, i) => i === 0 || hits[i - 1].friction <= h.friction));
+  // Registered-agent discovery: catt.agent must match 'chromecast' via
+  // descriptor keywords/capabilities (Bug 2 regression — resolveAgent never
+  // saw it because the index only knew the service name).
+  const catts = await cap.searchCapabilities('chromecast');
+  check('chromecast → catt.agent', catts.some(h => h.id === 'catt.agent'));
+  const castHits = await cap.searchCapabilities('cast video');
+  check('cast → catt.agent', castHits.some(h => h.id === 'catt.agent'));
+
+  // Envelope shape — /command.automate unwraps body.payload; verify the
+  // running service accepts it if it's up (skip silently otherwise).
+  try {
+    const res = await fetch('http://127.0.0.1:3007/command.automate', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ payload: { skill: 'terminal.agent', args: { action: 'list' } } }),
+      signal: AbortSignal.timeout(3000),
+    });
+    const data = await res.json();
+    check('live terminal.agent list via envelope', data?.data?.ok === true || data?.ok === true, JSON.stringify(data).slice(0, 120));
+  } catch (_) {
+    console.log('  SKIP  command-service not running — envelope test skipped');
+  }
 
   // ── mcp.agent ─────────────────────────────────────────────────────────────
   console.log('\nmcp.agent');

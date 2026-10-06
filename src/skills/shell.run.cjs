@@ -560,6 +560,15 @@ async function _resolveGoalToCommand(goal, onProgress) {
       // runtime). A well-formed response ends in } or ] — anything else is a
       // cut, so regenerate at a larger budget instead of trusting the repair.
       const _rawStripped = raw.replace(/```(?:json)?\s*/gi, '').trim();
+      // Prose refusal / chattiness (no JSON at all) is not truncation — the
+      // model is declining or can't map the goal; retrying reproduces the same
+      // prose 3× (observed: "cast to chromecast" → 3 identical paragraphs).
+      // Give up immediately with the model's own explanation as the error.
+      if (!_rawStripped.includes('{')) {
+        lastErr = `LLM returned prose, not a command — goal may not be shell-resolvable: ${raw.slice(0, 160)}`;
+        logger.warn(`[shell.run] ${lastErr}`);
+        break;
+      }
       if (!/[\}\]]\s*$/.test(_rawStripped)) {
         lastErr = 'LLM response was token-truncated (unterminated JSON) — retrying at a larger budget';
         syntaxFeedback = 'Your previous response was cut off mid-JSON. Return a SHORTER, simpler command — prefer a compact one-liner over a long multi-line script.';
