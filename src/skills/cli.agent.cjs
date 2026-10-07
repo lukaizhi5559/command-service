@@ -905,7 +905,13 @@ function buildTurnSystemPrompt(descriptor, learnedRules, userContext) {
   const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'local time';
   const currentDate = new Intl.DateTimeFormat('en-CA', { timeZone: timezone }).format(now);
   const temporalContext = `\n\n## Temporal Context\nCurrent local date: ${currentDate}. Time zone: ${timezone}. For a month/day with no year that has already passed this year, schedule the next occurrence. For an event with no time, create an all-day event. Never invent a historical year.`;
-  return `${CLI_AGENTIC_LOOP_PROMPT}\n\n## Agent Descriptor\n${trimmedDescriptor}${rulesSection}${userContextSection}${temporalContext}`;
+  // Self-knowledge: where ThinkDrop's own logs/data live so the loop can
+  // pty_exec "tail logs/…" instead of guessing why a step failed.
+  let envSection = '';
+  try {
+    envSection = '\n\n' + require('../../../../shared/system-map.cjs').renderEnvironment();
+  } catch (_) {}
+  return `${CLI_AGENTIC_LOOP_PROMPT}\n\n## Agent Descriptor\n${trimmedDescriptor}${rulesSection}${userContextSection}${temporalContext}${envSection}`;
 }
 
 // Builds the user-turn prompt for a loop turn: task + history only (~200-400 chars).
