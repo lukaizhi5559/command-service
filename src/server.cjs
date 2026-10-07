@@ -139,7 +139,8 @@ class CommandServiceMCPServer {
       };
     }
 
-    logger.info('Routing automation skill', { skill });
+    if (skill !== 'terminal.agent') logger.info('Routing automation skill', { skill });
+    else logger.debug('Routing automation skill', { skill });
 
     switch (skill) {
       case 'shell.run':

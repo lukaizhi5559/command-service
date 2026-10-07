@@ -243,7 +243,8 @@ async function actionExec(args, ctx) {
   const timeoutMs = Math.min(args.timeoutMs || DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS);
 
   // Baseline cursor BEFORE sending — output matched from here forward.
-  let cursor = s.screen.rawSince(null).offset;
+  const baseOffset = s.screen.rawSince(null).offset;
+  let cursor = baseOffset;
   s.pty.write(`${cmd}; echo "__TD_EXIT_${nonce}_$?"\n`);
 
   const result = await new Promise((resolve) => {
@@ -275,6 +276,7 @@ async function actionExec(args, ctx) {
     owned,
     exitCode: result.saw ? result.exitCode : -1,
     screen,
+    delta: s.screen.rawSince(baseOffset).data,
     prompt: s.meta.prompt,
     error: result.saw ? undefined : `timeout after ${timeoutMs}ms`,
   };

@@ -389,56 +389,190 @@ async function lookupServiceAsync(service) {
 // build_agent needs: does a real installable CLI exist for this service?
 // ---------------------------------------------------------------------------
 
-async function _verifyPackageExists(method, pkg) {
+// ---------------------------------------------------------------------------
+// Visible-session probes — run through the labeled PTY when a session is open
+// so the investigation streams live in the Terminal pane; spawnCapture stays
+// as the fallback when no session/backend is available.
+// ---------------------------------------------------------------------------
+
+const _ANSI_RE = /\[[0-9;?]*[A-Za-z]|\][^\x07\x1b]*(?:\x07|\\)|\(\S|\][^\x07]*/g;
+
+async function _openVisibleSession(label) {
+  try {
+    const opened = await terminalAgent({ action: 'open', label, managedBy: 'agent' });
+    return opened?.ok ? opened.sessionId : null;
+  } catch (_) { return null; }
+}
+
+// Type a comment line into the session — appears in the transcript as a
+// marker of what the agent is doing between real commands.
+async function _ptyNote(sessionId, text) {
+  if (!sessionId) return;
+  try { await terminalAgent({ action: 'send', sessionId, text: `# ${text}\r` }); } catch {}
+}
+
+/**
+ * Run a probe command inside the shared PTY session. Returns
+ * { used, ok, stdout } — stdout is this command's output only (from `delta`),
+ * ANSI-stripped, echo + exit-marker removed. `used:false` → caller falls
+ * back to spawnCapture.
+ */
+async function _ptyProbe(sessionId, cmd, { timeoutMs = 8000 } = {}) {
+  if (!sessionId) return { used: false };
+  try {
+    const r = await terminalAgent({ action: 'exec', sessionId, cmd, timeoutMs, keepSession: true });
+    if (!r || !r.ok) return { used: true, ok: false, stdout: '', exitCode: r?.exitCode ?? -1 };
+    const stdout = String(r.delta || '')
+      .replace(_ANSI_RE, '')
+      .split('\n')
+      .map(l => l.replace(/\r/g, ''))
+      .filter(l => l.trim() && !l.includes('__TD_EXIT_') && !l.includes(cmd))
+      .join('\n');
+    return { used: true, ok: r.exitCode === 0, exitCode: r.exitCode, stdout };
+  } catch (_) {
+    return { used: false };
+  }
+}
+
+// Probe wrapper — PTY first, pipes fallback. cmd/argv describe the same probe.
+async function _probeCmd(sessionId, cmd, argv, { timeoutMs = 8000, parseStdout = true } = {}) {
+  const shellLine = [cmd, ...argv.map(a => (/\s/.test(a) ? `'${a}'` : a))].join(' ');
+  const pr = await _ptyProbe(sessionId, shellLine, { timeoutMs });
+  if (pr.used) return { ok: pr.ok, stdout: pr.stdout };
+  const r = await spawnCapture(cmd, argv, { timeoutMs });
+  return { ok: r.ok, stdout: parseStdout ? (r.stdout || '') : (r.stdout || r.stderr || '') };
+}
+
+async function _verifyPackageExists(method, pkg, { sessionId = null } = {}) {
   if (!pkg) return false;
   if (method === 'npm') {
-    const r = await spawnCapture('npm', ['view', pkg, 'version'], { timeoutMs: 8000 });
+    const r = await _probeCmd(sessionId, 'npm', ['view', pkg, 'version']);
     return r.ok && !!r.stdout.trim();
   }
   if (method === 'brew') {
-    const r = await spawnCapture('brew', ['info', pkg], { timeoutMs: 8000 });
-    return r.ok;
+    const r = await _probeCmd(sessionId, 'brew', ['info', pkg]);
+    if (r.ok) return true;
+    // Third-party tap ref (<org>/<tap>/<formula>): brew info can't see the
+    // formula until the tap is added — verify the tap repo exists instead
+    // (Homebrew convention: user/tap → github.com/user/homebrew-tap). The
+    // install itself then auto-taps and proves the formula.
+    const tap = pkg.match(/^([\w-]+)\/([\w-]+)\/[\w.-]+$/);
+    if (tap) {
+      for (const repo of [`https://github.com/${tap[1]}/homebrew-${tap[2]}`, `https://github.com/${tap[1]}/${tap[2]}`]) {
+        const lr = await _probeCmd(sessionId, 'git', ['ls-remote', repo, 'HEAD'], { timeoutMs: 15000 });
+        if (lr.ok && /\bHEAD\b|\b[0-9a-f]{40}\b/i.test(lr.stdout)) return true;
+      }
+    }
+    return false;
   }
   return true; // pip/apt/etc — trust meta for now
 }
 
-async function _probeRegistryCandidates(serviceKey) {
+async function _probeRegistryCandidates(serviceKey, { sessionId = null } = {}) {
   if (!serviceKey || !/^[a-z0-9][a-z0-9-]*$/i.test(serviceKey)) return null;
 
   // 1. Already on PATH under the service name or <svc>-cli?
   for (const name of [serviceKey, `${serviceKey}-cli`]) {
-    const p = await whichCli(name);
+    const pr = await _probeCmd(sessionId, 'command', ['-v', name], { timeoutMs: 5000 });
+    const p = pr.ok ? (pr.stdout.trim().split('\n')[0] || null) : null;
     if (p) return { cli: name, method: null, pkg: null, alreadyInstalled: true, path: p };
+    if (!pr.ok && !sessionId) {
+      // spawnCapture('command', ...) fails without a shell — fall back to whichCli
+      const p2 = await whichCli(name);
+      if (p2) return { cli: name, method: null, pkg: null, alreadyInstalled: true, path: p2 };
+    }
   }
 
   const npmCandidates = [serviceKey, `${serviceKey}-cli`, `@${serviceKey}/cli`];
-  const brewCandidates = [serviceKey, `${serviceKey}-cli`];
+  // Includes third-party tap conventions (goreleaser/self-hosted taps):
+  //   nylas/nylas-cli/nylas  — <org>/<svc>-cli/<formula>
+  //   <svc>/tap/<svc>        — common tap naming
+  const brewCandidates = [
+    serviceKey,
+    `${serviceKey}-cli`,
+    `${serviceKey}/${serviceKey}-cli/${serviceKey}`,
+    `${serviceKey}/tap/${serviceKey}`,
+  ];
 
-  const [npmHits, brewHits] = await Promise.all([
-    Promise.all(npmCandidates.map(async (pkg) => {
-      const r = await spawnCapture('npm', ['view', pkg, 'bin', '--json'], { timeoutMs: 8000 });
-      if (!r.ok || !r.stdout.trim()) return null;
-      try {
-        const bin = JSON.parse(r.stdout.trim());
-        // bin as string → binary name is the package's own name;
-        // bin as object → keys are the binary names. No bin = SDK only.
-        let names;
-        if (typeof bin === 'string') names = [pkg.split('/').pop()];
-        else names = Object.keys(bin || {});
-        if (!names.length) return null;
-        return { cli: names[0], method: 'npm', pkg };
-      } catch (_) { return null; }
-    })),
-    Promise.all(brewCandidates.map(async (formula) => {
-      const r = await spawnCapture('brew', ['info', formula], { timeoutMs: 8000 });
-      return r.ok ? { cli: formula, method: 'brew', pkg: formula } : null;
-    })),
-  ]);
+  const npmHits = [];
+  const brewHits = [];
+  for (const pkg of npmCandidates) {
+    const r = await _probeCmd(sessionId, 'npm', ['view', pkg, 'bin', '--json']);
+    if (!r.ok) continue;
+    const m = r.stdout.match(/[\[{][\s\S]*/);
+    if (!m) continue;
+    try {
+      const bin = JSON.parse(m[0]);
+      // bin as string → binary name is the package's own name;
+      // bin as object → keys are the binary names. No bin = SDK only.
+      let names;
+      if (typeof bin === 'string') names = [pkg.split('/').pop()];
+      else names = Object.keys(bin || {});
+      if (!names.length) continue;
+      npmHits.push({ cli: names[0], method: 'npm', pkg });
+    } catch (_) { /* non-JSON output */ }
+  }
+  for (const formula of brewCandidates) {
+    // _verifyPackageExists handles untapped tap refs (org/tap/formula) by
+    // checking the tap's GitHub repo — brew info alone can't see them.
+    if (await _verifyPackageExists('brew', formula, { sessionId })) {
+      brewHits.push({ cli: formula.split('/').pop(), method: 'brew', pkg: formula });
+    }
+  }
 
   const hit = [...npmHits, ...brewHits].find(Boolean) || null;
   if (hit) logger.info(`[cli.agent] registry probe ${serviceKey} → ${hit.method} ${hit.pkg} (cli: ${hit.cli})`);
   else logger.info(`[cli.agent] registry probe ${serviceKey} → no CLI package in npm/brew`);
   return hit;
+}
+
+/**
+ * Web-search probe — the last step before declaring noCli. A human would
+ * google "nylas cli install"; this does the same via web.agent's
+ * discover_setup, which extracts install/auth commands from official docs.
+ * Any installCmd it finds is still verified against the registry before
+ * being trusted — observe→adapt, never trust scraped text blind.
+ */
+async function _webProbeInstall(serviceKey, { sessionId = null } = {}) {
+  try {
+    const webAgent = require('./web.agent.cjs');
+    if (typeof webAgent.actionDiscoverSetup !== 'function') return null;
+    await _ptyNote(sessionId, `web: searching "${serviceKey} CLI install setup"`);
+    const res = await webAgent.actionDiscoverSetup({ service: serviceKey, maxResults: 5 });
+    if (!res?.ok || !res.setupInfo) {
+      await _ptyNote(sessionId, `web: no install recipe found for "${serviceKey}"`);
+      return null;
+    }
+    const info = res.setupInfo;
+    const m = String(info.installCmd || '').match(/^(brew install|npm install -g|pipx install|pip install|pip3 install)\s+([\w/.@-]+)/);
+    if (!m) return null;
+    const method = m[1].startsWith('brew') ? 'brew' : m[1].startsWith('npm') ? 'npm' : 'pip';
+    const pkg = m[2];
+    await _ptyNote(sessionId, `web: found "${m[1]} ${pkg}"${info.setupUrl ? ` @ ${info.setupUrl}` : ''} — verifying`);
+    const verified = await _verifyPackageExists(method, pkg, { sessionId });
+    if (!verified) {
+      logger.warn(`[cli.agent] web probe suggested ${method}:${pkg} but registry could not verify it — skipping`);
+      await _ptyNote(sessionId, `web: ${method}:${pkg} not verifiable in registry — skipping`);
+      return null;
+    }
+    logger.info(`[cli.agent] web probe ${serviceKey} → verified ${method}:${pkg}`);
+    return {
+      cli: pkg.split('/').pop(), method, pkg, viaWeb: true,
+      setupUrl: info.setupUrl || null,
+      credentials: info.credentials || null,
+      authCmd: info.authCmd || null,
+    };
+  } catch (e) {
+    logger.warn(`[cli.agent] web probe failed for "${serviceKey}": ${e.message}`);
+    return null;
+  }
+}
+
+// Full ladder: registry candidates → web search → verified recipe or null.
+async function _findInstallableCli(serviceKey, { sessionId = null } = {}) {
+  const probed = await _probeRegistryCandidates(serviceKey, { sessionId });
+  if (probed) return probed;
+  return await _webProbeInstall(serviceKey, { sessionId });
 }
 
 
@@ -565,21 +699,24 @@ async function actionDiscover({ cli }) {
  * live into the Terminal pane. Returns {ok, used:true} on definitive result,
  * or {used:false} when PTY is unavailable — caller falls back to pipes.
  */
-async function _ptyVisibleExec(label, cmd, { timeoutMs = 180000, expectBin = null } = {}) {
-  let sessionId = null;
+async function _ptyVisibleExec(label, cmd, { timeoutMs = 180000, expectBin = null, sessionId = null } = {}) {
+  let sid = sessionId;
   try {
-    const opened = await terminalAgent({ action: 'open', label, managedBy: 'agent' });
-    if (!opened?.ok || !opened.sessionId) return { used: false };
-    sessionId = opened.sessionId;
-    const r = await terminalAgent({ action: 'exec', sessionId, cmd, timeoutMs, keepSession: true });
+    if (!sid) {
+      const opened = await terminalAgent({ action: 'open', label, managedBy: 'agent' });
+      if (!opened?.ok || !opened.sessionId) return { used: false };
+      sid = opened.sessionId;
+    }
+    const r = await terminalAgent({ action: 'exec', sessionId: sid, cmd, timeoutMs, keepSession: true });
     if (!r.ok) return { used: true, ok: false, error: r.error || 'timeout', screen: r.screen };
-    return { used: true, ok: r.exitCode === 0, exitCode: r.exitCode, screen: r.screen, sessionId };
-  } catch (_) {
+    return { used: true, ok: r.exitCode === 0, exitCode: r.exitCode, screen: r.screen, sessionId: sid };
+  } catch (e) {
+    logger.warn(`[cli.agent] _ptyVisibleExec("${cmd.slice(0, 60)}") threw — falling back to pipes: ${e.message}`);
     return { used: false };
   }
 }
 
-async function actionInstall({ cli, service, method, pkg: pkgOverride, ptyLabel = null }) {
+async function actionInstall({ cli, service, method, pkg: pkgOverride, ptyLabel = null, ptySessionId = null }) {
   if (!cli && !service) return { ok: false, error: 'cli or service is required' };
 
   const meta      = service ? lookupService(service) : null;
@@ -596,14 +733,14 @@ async function actionInstall({ cli, service, method, pkg: pkgOverride, ptyLabel 
   // Visible path — run the install through a labeled PTY session so the user
   // watches it live in the Terminal pane. Only the plain package-manager
   // path goes through PTY; script/vet installs keep their security rails.
-  if (ptyLabel && ['brew', 'npm', 'pip', 'pip3'].includes(instMethod)) {
+  if ((ptyLabel || ptySessionId) && ['brew', 'npm', 'pip', 'pip3'].includes(instMethod)) {
     const cmdMap = {
       brew: `brew install ${pkg}`,
       npm: `npm install -g ${pkg}`,
       pip: `pip3 install ${pkg}`,
       pip3: `pip3 install ${pkg}`,
     };
-    const pr = await _ptyVisibleExec(ptyLabel, cmdMap[instMethod], { timeoutMs: 180000 });
+    const pr = await _ptyVisibleExec(ptyLabel, cmdMap[instMethod], { timeoutMs: 180000, sessionId: ptySessionId });
     if (pr.used) {
       if (!pr.ok) return { ok: false, error: pr.error || `install exited ${pr.exitCode}`, stdout: pr.screen, viaPty: true };
       const binPath = await whichCli(cliName);
@@ -2901,16 +3038,20 @@ async function actionBuildAgent({ service, cli, cliTool, force = false }) {
   const serviceKey = service.toLowerCase().replace(/[^a-z0-9]/g, '');
   const agentId    = `${serviceKey}.agent`;
 
+  // Open the labeled PTY session up front so the whole investigation —
+  // PATH probes, npm view, brew info, web search, install, verify — streams
+  // live in the Terminal pane as one coherent transcript.
+  const ptySessionId = await _openVisibleSession(`cli.agent: ${serviceKey}`);
+
   // Resolve meta via LLM if not in seed cache — never hard-fail on unknown service
   const meta    = await lookupServiceAsync(service);
   let   cliName = explicitCli || meta?.cli;
 
   // OBSERVE before asserting — the meta lookup is an LLM guess (it claimed
   // "nylas: OAuth, no CLI" while `nylas` sat at 8.4.0 on npm). When meta says
-  // no CLI exists, probe npm/brew/PATH before believing it. A probe hit
-  // overrides meta's guess entirely.
+  // no CLI exists, probe PATH/npm/brew/taps, then the web, before believing it.
   if (!cliName) {
-    const probed = await _probeRegistryCandidates(serviceKey);
+    const probed = await _findInstallableCli(serviceKey, { sessionId: ptySessionId });
     if (probed) {
       logger.info(`[cli.agent] build_agent: meta claimed no CLI for "${serviceKey}" but registry probe found ${probed.pkg ? `${probed.method}:${probed.pkg}` : probed.path} — proceeding`);
       if (!probed.alreadyInstalled) {
@@ -2924,10 +3065,10 @@ async function actionBuildAgent({ service, cli, cliTool, force = false }) {
   // Meta can also hand us a wrong package name (guessed '@nylas/cli' → E404).
   // Verify the installable package exists before burning an install attempt.
   if (cliName && !explicitCli && meta?.method && meta?.pkg && meta.method !== 'pip3') {
-    const pkgOk = await _verifyPackageExists(meta.method, meta.pkg);
+    const pkgOk = await _verifyPackageExists(meta.method, meta.pkg, { sessionId: ptySessionId });
     if (!pkgOk) {
       logger.warn(`[cli.agent] build_agent: meta.pkg "${meta.pkg}" (${meta.method}) not in registry — probing candidates instead`);
-      const probed = await _probeRegistryCandidates(serviceKey);
+      const probed = await _findInstallableCli(serviceKey, { sessionId: ptySessionId });
       if (probed && probed.pkg) {
         meta.method = probed.method;
         meta.pkg    = probed.pkg;
@@ -2991,27 +3132,28 @@ async function actionBuildAgent({ service, cli, cliTool, force = false }) {
   // Runs through a labeled PTY session so the install streams live into the
   // Terminal pane (falls back to pipes if PTY is unavailable).
   let discovery = await actionDiscover({ cli: cliName });
-  let _provenBy = null; // {cli, method, pkg} of the install that actually worked
+  let _provenBy = null;   // {cli, method, pkg} of the install that actually worked
+  let _installErr = null; // last install error — surfaced in the failure return
   if (!discovery.installed && meta?.method && meta?.pkg) {
     logger.info(`[cli.agent] build_agent: auto-installing CLI "${cliName}" via ${meta.method}…`);
-    const installResult = await actionInstall({ cli: cliName, service, method: meta.method, ptyLabel: `cli.agent: install ${cliName}` });
+    const installResult = await actionInstall({ cli: cliName, service, method: meta.method, ptyLabel: `cli.agent: install ${cliName}`, ptySessionId });
     if (installResult.ok || installResult.alreadyInstalled) {
       discovery = await actionDiscover({ cli: cliName });
       if (discovery.installed) _provenBy = { cli: cliName, method: meta.method, pkg: meta.pkg };
-    }
+    } else _installErr = installResult.error || null;
   }
   if (!discovery.installed) {
     // Last resort before declaring failure — probe the registries directly.
     // Covers the case where meta named a CLI but its pkg guess was wrong.
-    const probed = await _probeRegistryCandidates(serviceKey);
+    const probed = await _findInstallableCli(serviceKey, { sessionId: ptySessionId });
     if (probed && !probed.alreadyInstalled && probed.pkg && probed.pkg !== meta?.pkg) {
       logger.info(`[cli.agent] build_agent: install failed — probing found alternative ${probed.method}:${probed.pkg}, retrying`);
-      const installResult = await actionInstall({ cli: probed.cli, service, method: probed.method, pkg: probed.pkg, ptyLabel: `cli.agent: install ${probed.cli}` });
+      const installResult = await actionInstall({ cli: probed.cli, service, method: probed.method, pkg: probed.pkg, ptyLabel: `cli.agent: install ${probed.cli}`, ptySessionId });
       if (installResult.ok || installResult.alreadyInstalled) {
         cliName = probed.cli;
         discovery = await actionDiscover({ cli: cliName });
         if (discovery.installed) _provenBy = { cli: probed.cli, method: probed.method, pkg: probed.pkg };
-      }
+      } else _installErr = installResult.error || _installErr;
     }
   }
   if (_provenBy) {
@@ -3024,7 +3166,7 @@ async function actionBuildAgent({ service, cli, cliTool, force = false }) {
     return {
       ok: false,
       agentId,
-      error: `CLI "${cliName}" is not installed and auto-install failed. Try: ${meta?.method || 'brew'} install ${meta?.pkg || cliName}`,
+      error: `CLI "${cliName}" is not installed and auto-install failed. Try: ${meta?.method || 'brew'} install ${meta?.pkg || cliName}${_installErr ? ` (last error: ${_installErr})` : ''}`,
       needsInstall: true,
       installMeta: meta ? { cli: cliName, method: meta.method, pkg: meta.pkg } : null,
     };

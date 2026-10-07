@@ -961,8 +961,8 @@ async function actionDiscoverSetup({ service, cliTool, maxResults = 5 }) {
 
   // Install command patterns
   const installPatterns = [
-    { regex: /(?:brew install|pip install|npm install -g|pipx install)\s+[\w-]+/gi, field: 'installCmd' },
-    { regex: /(?:apt-get install|apt install|snap install)\s+[\w-]+/gi, field: 'installCmd' },
+    { regex: /(?:brew install|pip install|npm install -g|pipx install)\s+[\w/.@-]+/gi, field: 'installCmd' },
+    { regex: /(?:apt-get install|apt install|snap install)\s+[\w/.@-]+/gi, field: 'installCmd' },
   ];
   for (const { regex, field } of installPatterns) {
     const m = allSnippets.match(regex);
@@ -997,6 +997,36 @@ async function actionDiscoverSetup({ service, cliTool, maxResults = 5 }) {
   const bestResult = scored[0];
   if (bestResult?.url) {
     setupInfo.setupUrl = bestResult.url;
+  }
+
+  // Snippets often truncate before the actual install command ("brew install
+  // org/tap/cli" lives mid-page, not in a 160-char snippet). When snippet
+  // extraction came up empty, crawl the top official result and re-run the
+  // command regexes on full page text.
+  if (!setupInfo.installCmd && bestResult?.url) {
+    try {
+      const { webCrawl } = require('./web.crawl.cjs');
+      const crawl = await webCrawl({ url: bestResult.url, maxChars: 6000, timeoutMs: 15000 }).catch(() => ({ ok: false }));
+      if (crawl?.ok && crawl.content) {
+        logger.info(`[web.agent] discover_setup: snippets had no installCmd — crawled ${bestResult.url} (${crawl.content.length} chars)`);
+        for (const { regex, field } of installPatterns) {
+          regex.lastIndex = 0;
+          const m = crawl.content.match(regex);
+          if (m && m[0] && !setupInfo[field]) {
+            setupInfo[field] = m[0].trim();
+            break;
+          }
+        }
+        for (const { regex, field } of authPatterns) {
+          regex.lastIndex = 0;
+          const m = crawl.content.match(regex);
+          if (m && m[0] && !setupInfo[field]) {
+            setupInfo[field] = m[0].trim();
+            break;
+          }
+        }
+      }
+    } catch (_) { /* crawl is best-effort */ }
   }
 
   // Instructions: synthesize from top snippets
