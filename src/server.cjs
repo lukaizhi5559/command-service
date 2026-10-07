@@ -1108,7 +1108,14 @@ class CommandServiceMCPServer {
             const payload = JSON.parse(body || '{}');
             const { inferCapabilities } = require('../../../shared/capability-index.cjs');
             const goal = payload.query || payload.goal || payload.payload?.query || '';
-            const result = await inferCapabilities(goal, {
+            // Screen-referring prompts carry the page's OCR text — the LLM
+            // reads what's actually on screen (e.g. "Nylas CLI — Email,
+            // calendar, contacts for your terminal") instead of guessing.
+            const screenText = String(payload.screenText || '').slice(0, 300);
+            const goalText = screenText
+              ? `${goal}\n\nScreen content (context for what the user means by "this"/"that"):\n${screenText}`
+              : goal;
+            const result = await inferCapabilities(goalText, {
               llmCaller: (prompt) => skillLlm.askWithMessages(
                 [{ role: 'user', content: prompt }],
                 { temperature: 0.2, maxTokens: 600, taskType: 'capability_infer' }),
