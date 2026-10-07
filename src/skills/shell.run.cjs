@@ -1689,6 +1689,63 @@ function _sandboxProfile(protectedPaths) {
   return rules.length ? `(version 1)(allow default)${rules.join('')}` : null;
 }
 
+// ── PTY-visible execution ────────────────────────────────────────────────
+// args._ptySession = session label (e.g. 'task:task_abc') — run the command
+// inside the labeled pane-visible PTY via terminal.agent instead of a blind
+// spawn pipe, so the user watches the step happen. Allowlist/danger gates ran
+// before this point; sandbox-exec wraps the command line so protected paths
+// stay denied inside the PTY too. Returns null when the PTY layer can't be
+// reached — caller falls back to spawn.
+const _ANSI_RE = /\x1b\[[0-9;?]*[a-zA-Z]|\x1b\][^\x07]*(?:\x07|\x1b\\)/g;
+function _ptyQuote(a) {
+  const s = String(a);
+  return /[\s'"$`\\|&;()<>]/.test(s) ? `'${s.replace(/'/g, `'\\''`)}'` : s;
+}
+
+async function _ptyRunProcess(cmd, argv, options, onProgress) {
+  const store = require('../terminal/session-store.cjs');
+  const { terminalAgent } = require('./terminal.agent.cjs');
+  const label = options._ptySession;
+  const existing = store.list().find(s => s.meta?.label === label && s.exitCode === null && !s.killed);
+  const _sbx = _sandboxProfile(options?.protectedPaths);
+  const execParts = _sbx ? [SANDBOX_EXEC, '-p', _sbx, cmd, ...(argv || [])] : [cmd, ...(argv || [])];
+  const r = await terminalAgent({
+    action: 'exec',
+    cmd: execParts.map(_ptyQuote).join(' '),
+    sessionId: existing ? existing.id : undefined,
+    label,
+    keepSession: true, // steps share the task session across the whole plan
+    timeoutMs: Math.min(options.timeoutMs || 30000, 300000),
+    cwd: options.cwd,
+    env: options.env,
+    _progressCallbackUrl: options._progressCallbackUrl || 'http://127.0.0.1:3010/agent-turn',
+  });
+  if (!r || r.error === 'session-not-found') return null; // spawn fallback
+  const clean = String(r.delta || '').replace(_ANSI_RE, '');
+  const text = clean
+    .split('\n')
+    .filter(l => !l.includes('__TD_EXIT'))
+    .filter(l => !/command not found: compdef/.test(l))  // zshrc noise on session open
+    .filter(l => !/^\s*%\s*$/.test(l))                  // zsh end-of-output markers
+    .join('\n')
+    .replace(/(?:^|\n)[^\n]*@\S+\s+[^\n]*[%$#>]\s*$/, '') // trailing user@host prompt line
+    .trim();
+  if (r.error && /^timeout/.test(r.error)) {
+    return { ok: false, stdout: text, stderr: text, exitCode: -1, executionTime: options.timeoutMs || 0, error: `Process timed out after ${options.timeoutMs}ms`, pty: true };
+  }
+  const exitCode = typeof r.exitCode === 'number' ? r.exitCode : -1;
+  return {
+    ok: exitCode === 0,
+    stdout: text,
+    stderr: exitCode !== 0 ? text : '',
+    exitCode,
+    executionTime: 0,
+    error: exitCode !== 0 ? `Process exited with code ${exitCode}` : undefined,
+    pty: true,
+    sandboxed: !!_sbx || undefined,
+  };
+}
+
 function runProcess(cmd, argv, options, onProgress) {
   return new Promise((_resolve) => {
     const _sbxProfile = _sandboxProfile(options?.protectedPaths);
@@ -1833,6 +1890,8 @@ async function shellRun(args) {
     stdin,
     goal,
     _progressCallback,
+    _progressCallbackUrl,
+    _ptySession,
     protectedPaths,
   } = args || {};
 
@@ -1963,14 +2022,24 @@ async function shellRun(args) {
     } catch (_) { /* non-fatal */ }
   }
 
-  const _runStep = () => runProcess(cmd, runArgv, {
+  const _procOpts = {
     cwd,
     // OAuth vars are the lowest priority — explicit env arg and process.env override them
     env: { ...oauthEnv, ...env },
     timeoutMs: Math.min(timeoutMs, MAX_TIMEOUT_MS),
     stdin,
     protectedPaths,
-  }, _progressCallback || null);
+    _ptySession,
+    _progressCallbackUrl,
+  };
+  const _runStep = async () => {
+    if (_ptySession) {
+      const r = await _ptyRunProcess(cmd, runArgv, _procOpts, _progressCallback || null).catch(() => null);
+      if (r) return r;
+      logger.warn('[shell.run] PTY exec unavailable — falling back to spawn', { session: _ptySession });
+    }
+    return runProcess(cmd, runArgv, _procOpts, _progressCallback || null);
+  };
 
   // Hide ThinkDrop's own UI while screencapture runs (clean screenshots).
   const result = _involvesScreencapture(baseName, runArgv)

@@ -151,6 +151,7 @@ function actionNote(args) {
   if (!text) return { ok: false, error: 'text-required' };
   s.screen.write(`\x1b[2m# ${text}\x1b[0m\r\n`);
   (s.meta.narration ||= []).push({ ts: Date.now(), text });
+  emitProgress(args._progressCallbackUrl, { type: 'terminal:activity', sessionId: s.id, kind: 'note', line: `# ${text}` });
   return { ok: true };
 }
 
@@ -245,6 +246,7 @@ async function actionExec(args, ctx) {
   if (!cmd) return { ok: false, error: 'cmd-required' };
   const danger = _dangerScan(cmd);
   if (danger) return { ok: false, error: danger };
+  emitProgress(ctx.cbUrl, { type: 'terminal:activity', sessionId: args.sessionId || null, kind: 'cmd', line: `$ ${cmd}` });
 
   let s = args.sessionId ? store.get(args.sessionId) : null;
   let owned = false;
@@ -298,6 +300,11 @@ async function actionExec(args, ctx) {
     prompt: s.meta.prompt,
     error: result.saw ? undefined : `timeout after ${timeoutMs}ms`,
   };
+  emitProgress(ctx.cbUrl, {
+    type: 'terminal:activity', sessionId: s.id,
+    kind: result.saw && result.exitCode === 0 ? 'ok' : 'error',
+    line: result.saw ? `✓ exit ${result.exitCode} — ${cmd.slice(0, 80)}` : `✗ timeout — ${cmd.slice(0, 80)}`,
+  });
   if (owned && result.saw) {
     // one-shot exec session — clean up unless caller asked to persist
     if (!args.keepSession) store.close(s.id);

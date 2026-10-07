@@ -1072,6 +1072,68 @@ class CommandServiceMCPServer {
         return;
       }
 
+      // ── POST /terminal.exec + /terminal.note ────────────────────────────────
+      // Ambient diagnosis for services that live outside this process
+      // (comms-graph planning lane): run a command in a labeled, pane-visible
+      // PTY session ("thinkdrop: check") — same surface cli.agent uses.
+      const _termSessionForLabel = (label) => {
+        const store = require('./terminal/session-store.cjs');
+        const found = store.list().find(s => s.meta?.label === label && s.exitCode === null && !s.killed);
+        return found ? found.id : null;
+      };
+      if (req.method === 'POST' && req.url === '/terminal.exec') {
+        let body = '';
+        req.on('data', c => { body += c; });
+        req.on('end', async () => {
+          try {
+            const payload = JSON.parse(body || '{}');
+            const label = payload.label || 'thinkdrop: check';
+            const sessionId = payload.sessionId || _termSessionForLabel(label);
+            const { terminalAgent } = require('./skills/terminal.agent.cjs');
+            const r = await terminalAgent({
+              action: 'exec',
+              cmd: payload.cmd || '',
+              sessionId: sessionId || undefined,
+              label,
+              keepSession: true, // 'thinkdrop: check' persists across checks
+              timeoutMs: Math.min(payload.timeoutMs || 30000, 300000),
+              _progressCallbackUrl: payload.cbUrl || 'http://127.0.0.1:3010/agent-turn',
+            });
+            res.writeHead(200);
+            res.end(JSON.stringify(r));
+          } catch (err) {
+            res.writeHead(400);
+            res.end(JSON.stringify({ ok: false, error: err.message }));
+          }
+        });
+        return;
+      }
+      if (req.method === 'POST' && req.url === '/terminal.note') {
+        let body = '';
+        req.on('data', c => { body += c; });
+        req.on('end', async () => {
+          try {
+            const payload = JSON.parse(body || '{}');
+            const label = payload.label || 'thinkdrop: check';
+            let sessionId = payload.sessionId || _termSessionForLabel(label);
+            const { terminalAgent } = require('./skills/terminal.agent.cjs');
+            const cbUrl = payload.cbUrl || 'http://127.0.0.1:3010/agent-turn';
+            if (!sessionId) {
+              const opened = await terminalAgent({ action: 'open', label, managedBy: 'agent', _progressCallbackUrl: cbUrl });
+              if (!opened.ok) throw new Error(opened.error || 'open failed');
+              sessionId = opened.sessionId;
+            }
+            const r = await terminalAgent({ action: 'note', sessionId, text: payload.text || '', _progressCallbackUrl: cbUrl });
+            res.writeHead(200);
+            res.end(JSON.stringify({ ...r, sessionId }));
+          } catch (err) {
+            res.writeHead(400);
+            res.end(JSON.stringify({ ok: false, error: err.message }));
+          }
+        });
+        return;
+      }
+
       // ── POST /capability.probe ──────────────────────────────────────────────
       // Read-only CLI inspection for the planning lane — verb-allowlisted,
       // spawn-without-shell, no secret env injection. Detects "installed?",
