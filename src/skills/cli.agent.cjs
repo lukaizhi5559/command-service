@@ -404,11 +404,21 @@ async function _openVisibleSession(label) {
   } catch (_) { return null; }
 }
 
-// Type a comment line into the session — appears in the transcript as a
-// marker of what the agent is doing between real commands.
+// Write a plain-English marker into the transcript — dimmed comment in the
+// raw stream AND an entry in the session's narration array (Summary view).
 async function _ptyNote(sessionId, text) {
   if (!sessionId) return;
-  try { await terminalAgent({ action: 'send', sessionId, text: `# ${text}\r` }); } catch {}
+  try { await terminalAgent({ action: 'note', sessionId, text }); } catch {}
+}
+
+// Read back the narration accumulated on a session — build_agent returns it
+// so the UI can render "what the agent did" without parsing ANSI.
+async function _readNarration(sessionId) {
+  if (!sessionId) return [];
+  try {
+    const r = await terminalAgent({ action: 'read', sessionId, mode: 'tail', lines: 1 });
+    return (r?.narration || []).map(n => n.text);
+  } catch (_) { return []; }
 }
 
 /**
@@ -459,8 +469,12 @@ async function _verifyPackageExists(method, pkg, { sessionId = null } = {}) {
     const tap = pkg.match(/^([\w-]+)\/([\w-]+)\/[\w.-]+$/);
     if (tap) {
       for (const repo of [`https://github.com/${tap[1]}/homebrew-${tap[2]}`, `https://github.com/${tap[1]}/${tap[2]}`]) {
+        await _ptyNote(sessionId, `brew can't see untapped taps — verifying the tap repo exists: ${repo}`);
         const lr = await _probeCmd(sessionId, 'git', ['ls-remote', repo, 'HEAD'], { timeoutMs: 15000 });
-        if (lr.ok && /\bHEAD\b|\b[0-9a-f]{40}\b/i.test(lr.stdout)) return true;
+        if (lr.ok && /\bHEAD\b|\b[0-9a-f]{40}\b/i.test(lr.stdout)) {
+          await _ptyNote(sessionId, `tap repo confirmed — ${tap[1]}/${tap[2]} is real`);
+          return true;
+        }
       }
     }
     return false;
@@ -472,10 +486,14 @@ async function _probeRegistryCandidates(serviceKey, { sessionId = null } = {}) {
   if (!serviceKey || !/^[a-z0-9][a-z0-9-]*$/i.test(serviceKey)) return null;
 
   // 1. Already on PATH under the service name or <svc>-cli?
+  await _ptyNote(sessionId, `checking if ${serviceKey} is already installed`);
   for (const name of [serviceKey, `${serviceKey}-cli`]) {
     const pr = await _probeCmd(sessionId, 'command', ['-v', name], { timeoutMs: 5000 });
     const p = pr.ok ? (pr.stdout.trim().split('\n')[0] || null) : null;
-    if (p) return { cli: name, method: null, pkg: null, alreadyInstalled: true, path: p };
+    if (p) {
+      await _ptyNote(sessionId, `${name} is already installed at ${p}`);
+      return { cli: name, method: null, pkg: null, alreadyInstalled: true, path: p };
+    }
     if (!pr.ok && !sessionId) {
       // spawnCapture('command', ...) fails without a shell — fall back to whichCli
       const p2 = await whichCli(name);
@@ -508,7 +526,10 @@ async function _probeRegistryCandidates(serviceKey, { sessionId = null } = {}) {
       let names;
       if (typeof bin === 'string') names = [pkg.split('/').pop()];
       else names = Object.keys(bin || {});
-      if (!names.length) continue;
+      if (!names.length) {
+        await _ptyNote(sessionId, `"${pkg}" exists on npm but it's a library (SDK), not a CLI — skipping`);
+        continue;
+      }
       npmHits.push({ cli: names[0], method: 'npm', pkg });
     } catch (_) { /* non-JSON output */ }
   }
@@ -521,8 +542,13 @@ async function _probeRegistryCandidates(serviceKey, { sessionId = null } = {}) {
   }
 
   const hit = [...npmHits, ...brewHits].find(Boolean) || null;
-  if (hit) logger.info(`[cli.agent] registry probe ${serviceKey} → ${hit.method} ${hit.pkg} (cli: ${hit.cli})`);
-  else logger.info(`[cli.agent] registry probe ${serviceKey} → no CLI package in npm/brew`);
+  if (hit) {
+    await _ptyNote(sessionId, `found it: ${hit.method === 'brew' ? 'Homebrew' : 'npm'} package "${hit.pkg}" provides the ${hit.cli} command`);
+    logger.info(`[cli.agent] registry probe ${serviceKey} → ${hit.method} ${hit.pkg} (cli: ${hit.cli})`);
+  } else {
+    await _ptyNote(sessionId, `nothing on npm or Homebrew for "${serviceKey}"`);
+    logger.info(`[cli.agent] registry probe ${serviceKey} → no CLI package in npm/brew`);
+  }
   return hit;
 }
 
@@ -537,7 +563,7 @@ async function _webProbeInstall(serviceKey, { sessionId = null } = {}) {
   try {
     const webAgent = require('./web.agent.cjs');
     if (typeof webAgent.actionDiscoverSetup !== 'function') return null;
-    await _ptyNote(sessionId, `web: searching "${serviceKey} CLI install setup"`);
+    await _ptyNote(sessionId, `nothing in the registries — searching the web for how "${serviceKey}" installs`);
     const res = await webAgent.actionDiscoverSetup({ service: serviceKey, maxResults: 5 });
     if (!res?.ok || !res.setupInfo) {
       await _ptyNote(sessionId, `web: no install recipe found for "${serviceKey}"`);
@@ -548,7 +574,7 @@ async function _webProbeInstall(serviceKey, { sessionId = null } = {}) {
     if (!m) return null;
     const method = m[1].startsWith('brew') ? 'brew' : m[1].startsWith('npm') ? 'npm' : 'pip';
     const pkg = m[2];
-    await _ptyNote(sessionId, `web: found "${m[1]} ${pkg}"${info.setupUrl ? ` @ ${info.setupUrl}` : ''} — verifying`);
+    await _ptyNote(sessionId, `web: official docs say "${m[1]} ${pkg}"${info.setupUrl ? ` (${info.setupUrl})` : ''} — verifying it's real before installing`);
     const verified = await _verifyPackageExists(method, pkg, { sessionId });
     if (!verified) {
       logger.warn(`[cli.agent] web probe suggested ${method}:${pkg} but registry could not verify it — skipping`);
@@ -3081,6 +3107,8 @@ async function actionBuildAgent({ service, cli, cliTool, force = false }) {
           ok: false, noCli: true, service: serviceKey,
           error: `Package "${meta.pkg}" not found in ${meta.method} registry and no alternative CLI located for "${service}".`,
           meta,
+          sessionId: ptySessionId,
+          narration: await _readNarration(ptySessionId),
         };
       }
     }
@@ -3097,6 +3125,8 @@ async function actionBuildAgent({ service, cli, cliTool, force = false }) {
         error: `"${service}" uses OAuth — delegate to browser.agent build_agent for credential setup.`,
         delegateTo: 'browser.agent',
         meta,
+        sessionId: ptySessionId,
+        narration: await _readNarration(ptySessionId),
       };
     }
     if (meta?.isApiKey) {
@@ -3110,6 +3140,8 @@ async function actionBuildAgent({ service, cli, cliTool, force = false }) {
       service: serviceKey,
       error: `No CLI found for "${service}". LLM lookup returned no CLI or install method.`,
       meta,
+      sessionId: ptySessionId,
+      narration: await _readNarration(ptySessionId),
     };
   }
 
@@ -3136,6 +3168,7 @@ async function actionBuildAgent({ service, cli, cliTool, force = false }) {
   let _installErr = null; // last install error — surfaced in the failure return
   if (!discovery.installed && meta?.method && meta?.pkg) {
     logger.info(`[cli.agent] build_agent: auto-installing CLI "${cliName}" via ${meta.method}…`);
+    await _ptyNote(ptySessionId, `installing ${meta.pkg || cliName} via ${meta.method}`);
     const installResult = await actionInstall({ cli: cliName, service, method: meta.method, ptyLabel: `cli.agent: install ${cliName}`, ptySessionId });
     if (installResult.ok || installResult.alreadyInstalled) {
       discovery = await actionDiscover({ cli: cliName });
@@ -3163,12 +3196,15 @@ async function actionBuildAgent({ service, cli, cliTool, force = false }) {
     _persistProvenInstall(serviceKey, _provenBy);
   }
   if (!discovery.installed) {
+    await _ptyNote(ptySessionId, `install did not produce a working "${cliName}" command${_installErr ? ` (${_installErr})` : ''}`);
     return {
       ok: false,
       agentId,
       error: `CLI "${cliName}" is not installed and auto-install failed. Try: ${meta?.method || 'brew'} install ${meta?.pkg || cliName}${_installErr ? ` (last error: ${_installErr})` : ''}`,
       needsInstall: true,
       installMeta: meta ? { cli: cliName, method: meta.method, pkg: meta.pkg } : null,
+      sessionId: ptySessionId,
+      narration: await _readNarration(ptySessionId),
     };
   }
 
@@ -3224,6 +3260,8 @@ async function actionBuildAgent({ service, cli, cliTool, force = false }) {
     capabilities,
     mdPath,
     descriptor,
+    sessionId: ptySessionId,
+    narration: await _readNarration(ptySessionId),
     stdout: `Agent ${agentId} built successfully. CLI: ${cliName} v${discovery.version || 'unknown'}. Capabilities: ${capabilities.join(', ')}.`,
   };
 }

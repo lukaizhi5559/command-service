@@ -138,6 +138,22 @@ function actionSend(args) {
   return { ok: true };
 }
 
+/**
+ * Write a plain-English marker into the transcript — appears as a dimmed
+ * `# …` comment in the raw stream AND lands in s.meta.narration[] for the
+ * Summary view. Unlike `send`, this writes to the screen buffer directly
+ * (not through the shell), so it can't be mistaken for input.
+ */
+function actionNote(args) {
+  const s = store.get(args.sessionId);
+  if (!s) return { ok: false, error: 'session-not-found' };
+  const text = String(args.text || '').replace(/[\r\n]+/g, ' ').slice(0, 300);
+  if (!text) return { ok: false, error: 'text-required' };
+  s.screen.write(`\x1b[2m# ${text}\x1b[0m\r\n`);
+  (s.meta.narration ||= []).push({ ts: Date.now(), text });
+  return { ok: true };
+}
+
 async function actionRead(args) {
   const s = store.get(args.sessionId);
   if (!s) return { ok: false, error: 'session-not-found' };
@@ -157,6 +173,7 @@ async function actionRead(args) {
       exitCode: s.exitCode,
       cols: s.screen.term?.cols,
       rows: s.screen.term?.rows,
+      narration: s.meta.narration || [],
     };
   }
   const mode = args.mode === 'tail' ? 'tail' : 'screen';
@@ -168,6 +185,7 @@ async function actionRead(args) {
     prompt: s.meta.prompt,
     exited: s.exitCode !== null,
     exitCode: s.exitCode,
+    narration: s.meta.narration || [],
   };
 }
 
@@ -311,6 +329,7 @@ async function terminalAgent(args = {}) {
     switch (action) {
       case 'open': return await actionOpen(args, ctx);
       case 'send': return actionSend(args);
+      case 'note': return actionNote(args);
       case 'read': return await actionRead(args);
       case 'wait': return await actionWait(args);
       case 'exec': return await actionExec(args, ctx);
