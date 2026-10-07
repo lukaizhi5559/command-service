@@ -1769,7 +1769,10 @@ async function _genericRunLoop({ task, cwd, env, timeoutMs, _progressCallbackUrl
   let _ptySessionId = null;
   const _ensurePtySession = async () => {
     if (_ptySessionId) return _ptySessionId;
-    const r = await terminalAgent({ action: 'open' });
+    // Label the session so TerminalPane shows meaningful context
+    // ("cli.agent: install nylas") instead of a bare agent id.
+    const _label = `cli.agent: ${String(task || '').slice(0, 40)}`;
+    const r = await terminalAgent({ action: 'open', label: _label, managedBy: 'agent' });
     _ptySessionId = r.sessionId;
     return _ptySessionId;
   };
