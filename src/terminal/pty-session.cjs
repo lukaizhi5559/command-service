@@ -70,7 +70,7 @@ function openSession(opts = {}) {
   const cols = opts.cols || 120;
   const rows = opts.rows || 30;
   const sh = opts.shell ? { cmd: opts.shell, argv: opts.argv || [] } : defaultShell();
-  const env = { ...process.env, TERM: 'xterm-256color', COLORTERM: 'truecolor', ...(opts.env || {}) };
+  const env = { ...process.env, TERM: 'xterm-256color', COLORTERM: 'truecolor', CLICOLOR: '1', ...(opts.env || {}) };
   const cwd = opts.cwd || os.homedir();
 
   // Seatbelt wrap — deny file-write* on protected paths at the kernel
