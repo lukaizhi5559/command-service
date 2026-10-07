@@ -1795,7 +1795,12 @@ function runProcess(cmd, argv, options, onProgress) {
         stderr: stderrBuf,
         exitCode,
         executionTime,
-        error: (exitCode !== 0 && !sigpipeTruncated) ? `Process exited with code ${exitCode}` : undefined
+        // Include the stderr tail in the error string — a bare "exit code 1"
+        // gives recovery/judges nothing to diagnose. stderr carries the real
+        // evidence (npm E404, ENOENT, permission denied, ...).
+        error: (exitCode !== 0 && !sigpipeTruncated)
+          ? `Process exited with code ${exitCode}${stderrBuf.trim() ? ` — ${stderrBuf.trim().split('\n').slice(-3).join(' | ').slice(0, 300)}` : ''}`
+          : undefined
       });
     });
 
