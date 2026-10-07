@@ -142,6 +142,23 @@ async function actionRead(args) {
   const s = store.get(args.sessionId);
   if (!s) return { ok: false, error: 'session-not-found' };
   await s.screen.flush();
+  // 'raw' returns incremental ANSI bytes for xterm.js rendering — the
+  // renderer keeps `offset` per session and polls for deltas.
+  if (args.mode === 'raw') {
+    const { data, offset } = s.screen.rawSince(args.cursor ?? null);
+    return {
+      ok: true,
+      sessionId: s.id,
+      mode: 'raw',
+      data,
+      offset,
+      prompt: s.meta.prompt,
+      exited: s.exitCode !== null,
+      exitCode: s.exitCode,
+      cols: s.screen.term?.cols,
+      rows: s.screen.term?.rows,
+    };
+  }
   const mode = args.mode === 'tail' ? 'tail' : 'screen';
   return {
     ok: true,

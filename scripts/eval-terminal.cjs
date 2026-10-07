@@ -191,6 +191,54 @@ function check(name, cond, extra = '') {
     console.log(`  SKIP  generic run — LLM loop unavailable (${e.message})`);
   }
 
+  // ── terminal.agent raw read mode — xterm byte feed ────────────────────────
+  console.log('\nterminal.agent raw mode');
+  {
+    const { terminalAgent } = require('../src/skills/terminal.agent.cjs');
+    const open = await terminalAgent({ action: 'open', label: 'eval-raw', managedBy: 'agent' });
+    check('open eval session', open.ok === true, open.error);
+    if (open.ok) {
+      const exec = await terminalAgent({ action: 'exec', sessionId: open.sessionId, cmd: 'echo EVAL_RAW_$(echo OK)', timeoutMs: 10000, keepSession: true });
+      check('pty_exec echo', exec.ok === true && exec.exitCode === 0, JSON.stringify(exec).slice(0, 150));
+      const raw1 = await terminalAgent({ action: 'read', sessionId: open.sessionId, mode: 'raw' });
+      check('raw read returns data+offset', raw1.ok === true && typeof raw1.offset === 'number' && raw1.data.includes('EVAL_RAW_OK'),
+        JSON.stringify({ ok: raw1.ok, offset: raw1.offset, found: raw1.data?.includes('EVAL_RAW_OK') }).slice(0, 150));
+      const raw2 = await terminalAgent({ action: 'read', sessionId: open.sessionId, mode: 'raw', cursor: raw1.offset });
+      check('raw read cursor returns only delta', raw2.ok === true && !raw2.data.includes('EVAL_RAW_OK'), '');
+      await terminalAgent({ action: 'close', sessionId: open.sessionId });
+    }
+  }
+
+  // ── cli.agent registry probes — observe-before-assert on install ──────────
+  console.log('\ncli.agent registry probes');
+  {
+    const disc = await cliAgent({ action: 'discover', cli: 'jq' });
+    check('discover jq (installed or findable)', disc.ok === true || disc.installed === true || disc.installed === false,
+      JSON.stringify(disc).slice(0, 150));
+    // build_agent writes to DuckDB — a dev command-service holds the lock, so
+    // lock errors are environmental: SKIP rather than fail.
+    try {
+      // OAuth-service delegation must carry delegateTo through to the caller.
+      const oauth = await cliAgent({ action: 'build_agent', service: 'slack' });
+      check('oauth service resolves — delegateTo or discovered CLI',
+        (oauth.ok === false && oauth.delegateTo === 'browser.agent') || oauth.ok === true,
+        JSON.stringify({ ok: oauth.ok, delegateTo: oauth.delegateTo, err: oauth.error }).slice(0, 200));
+    } catch (e) {
+      if (/lock|duckdb/i.test(e.message)) console.log('  SKIP  build_agent — agents.duckdb locked by running command-service');
+      else check('oauth service resolves', false, e.message);
+    }
+    try {
+      // A nonexistent package must not produce a fake success.
+      const ghost = await cliAgent({ action: 'build_agent', service: 'zzz-nope-nothere-9' });
+      check('nonexistent service fails honestly',
+        ghost.ok === false && !ghost.agentId,
+        JSON.stringify({ ok: ghost.ok, err: ghost.error }).slice(0, 150));
+    } catch (e) {
+      if (/lock|duckdb/i.test(e.message)) console.log('  SKIP  ghost build_agent — agents.duckdb locked by running command-service');
+      else check('nonexistent service fails honestly', false, e.message);
+    }
+  }
+
   // ── summary ───────────────────────────────────────────────────────────────
   console.log(`\n${pass} passed, ${fail} failed`);
   process.exit(fail ? 1 : 0);
