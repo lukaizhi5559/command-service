@@ -165,10 +165,15 @@ function _badCrawlReason(res, extractItems) {
 // for agent sessions. Headless bundled Chromium is bot-walled by sites like
 // eBay; a warm headed session closely mimics a real returning user.
 async function _crawlOnce(normalizedUrl, { maxChars, timeoutMs, effectiveWaitMs, extractLinks, extractItems, progress, startTime, warm = false }) {
-  // Unique session per crawl — never reuses a user-facing session
+  // Unique session per INVOCATION — never reuses a user-facing session and
+  // never collides with a concurrent crawl of the same URL. The session id
+  // used to be md5(url)-derived only: two overlapping crawls of the same URL
+  // shared one playwright-cli session, so the first finisher's `close` killed
+  // the other's page mid-extraction ("Session closed" stderr on eval).
+  const _runId = crypto.randomBytes(3).toString('hex');
   const sessionId = warm
-    ? '_crawl_warm'
-    : `_crawl_${crypto.createHash('md5').update(normalizedUrl).digest('hex').slice(0, 8)}`;
+    ? `_crawl_warm_${_runId}`
+    : `_crawl_${crypto.createHash('md5').update(normalizedUrl).digest('hex').slice(0, 8)}_${_runId}`;
   const S = warm
     ? [`-s=${sessionId}`, '--headed', '--browser=chrome', `--profile=${path.join(os.homedir(), '.thinkdrop', 'browser-profiles', '_crawl_warm')}`]
     : [`-s=${sessionId}`];

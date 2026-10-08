@@ -70,11 +70,9 @@ async function searchWeb(query, maxResults = 5, options = {}) {
 
   const timeoutMs = options.timeoutMs || 8000;
   const maxAttempts = options.retries ? 2 : 1;
-  // Page-resolution always wants the web endpoint — the service's intent
-  // classifier routes "show me X"-style queries to brave-video/brave-image,
-  // which return YouTube/images only. ('goto biblehub and show me genesis 1'
-  // once returned 5/5 YouTube; pinned brave-web returns biblehub.com #1.)
-  const provider = options.provider || 'brave-web';
+  // Page-resolution always wants the web endpoint. Default rides the SERP
+  // auto-chain (Google→Bing→DDG) — explicit provider opt-ins still honored.
+  const provider = options.provider || 'auto';
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     const result = await _searchWebOnce(query, maxResults, timeoutMs, wsHostname, wsPort, provider);
