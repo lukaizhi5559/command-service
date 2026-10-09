@@ -37,6 +37,7 @@ const crypto = require('crypto');
 const logger = require('../logger.cjs');
 const store = require('../terminal/session-store.cjs');
 const { DANGEROUS_SCRIPT_PATTERNS } = require('./shell.run.cjs');
+const { classifyPromptLine, answerFor } = require('../terminal/auto-answer.cjs');
 
 const DEFAULT_TIMEOUT_MS = 30000;
 const MAX_TIMEOUT_MS = 600000;
@@ -68,22 +69,52 @@ function _dangerScan(text) {
   return null;
 }
 
-// Track password prompts per session; emit once per new occurrence.
-function _watchPassword(session, cbUrl) {
-  if (session._pwWatch) return;
-  session._pwWatch = true;
-  let cursor = 0;
-  const check = () => {
-    const { data, offset } = session.screen.rawSince(cursor);
-    cursor = offset;
-    if (PASSWORD_RE.test(data)) {
-      if (session.meta.prompt !== 'password') {
-        session.meta.prompt = 'password';
-        emitProgress(cbUrl, { type: 'terminal:prompt_wait', sessionId: session.id, prompt: 'password' });
+// Input prompts that mean the run is blocked on the user — not just
+// passwords: "Client ID:", "API Key:", yes/no confirms, inquirer menus.
+// A shell prompt never ends like these; matched on the settled screen's
+// last non-empty line so repainting TUIs still register.
+const INPUT_PROMPT_RE = /:\s*$|\?\s*$|\((?:y\/n|n\/y)\)|\[(?:y\/n|n\/y)\]|^\s*[›❯]\s*\S|use\s+arrow\s+keys/i;
+
+// Track input prompts per session; emit once per distinct prompt text.
+function _watchPrompt(session, cbUrl) {
+  if (session._promptWatch) return;
+  session._promptWatch = true;
+  let timer = null;
+  let seq = 0;
+  const classify = (line) => (PASSWORD_RE.test(line) ? 'password'
+    : (INPUT_PROMPT_RE.test(line) ? 'input' : null));
+  const check = async () => {
+    timer = null;
+    const mySeq = ++seq;
+    try {
+      await session.screen.flush();
+      // A newer check scheduled while we awaited flush supersedes this one —
+      // don't let it write stale prompt state back.
+      if (mySeq !== seq) return;
+      if (session.exitCode !== null) return;
+      const lines = session.screen.screen().split('\n');
+      const last = (lines[lines.length - 1] || '').trim();
+      const kind = last ? classify(last) : null;
+      if (kind) {
+        if (session.meta.prompt !== kind || session.meta.promptLine !== last) {
+          session.meta.prompt = kind;
+          session.meta.promptLine = last;
+          emitProgress(cbUrl, {
+            type: 'terminal:prompt_wait', sessionId: session.id,
+            prompt: kind, line: last.slice(0, 120),
+          });
+        }
+      } else if (session.meta.prompt) {
+        // Prompt answered/obscured — clear so the same prompt re-fires later.
+        session.meta.prompt = null;
+        session.meta.promptLine = null;
       }
-    }
+    } catch (_) {}
   };
-  session.dataListeners.add(() => check());
+  session.dataListeners.add(() => {
+    if (timer) return;
+    timer = setTimeout(check, 90);
+  });
 }
 
 async function actionOpen(args, ctx) {
@@ -99,7 +130,7 @@ async function actionOpen(args, ctx) {
     ownerRunId: args.ownerRunId || null,
     protectedPaths: args.protectedPaths,
   });
-  _watchPassword(session, ctx.cbUrl);
+  _watchPrompt(session, ctx.cbUrl);
   if (ctx.abortSignal) {
     ctx.abortSignal.addEventListener('abort', () => { try { store.close(session.id); } catch (_) {} }, { once: true });
   }
@@ -267,22 +298,63 @@ async function actionExec(args, ctx) {
   let cursor = baseOffset;
   s.pty.write(`${cmd}; echo "__TD_EXIT_${nonce}_$?"\n`);
 
-  const result = await new Promise((resolve) => {
+  // Wait for the exit marker; resolves {saw:true,exitCode} or {saw:false} on
+  // timeout. Reused by the auto-answer loop below with a short fuse.
+  const waitForExit = (ms) => new Promise((resolve) => {
     let done = false;
     const finish = (r) => { if (!done) { done = true; clearTimeout(timer); s.dataListeners.delete(onData); resolve(r); } };
     const onData = () => {
       const { data, offset } = s.screen.rawSince(cursor);
       const m = data.match(markerRe);
-      if (m) {
-        cursor = offset;
-        finish({ exitCode: parseInt(m[1], 10), saw: true });
-        return;
-      }
+      if (m) { cursor = offset; finish({ exitCode: parseInt(m[1], 10), saw: true }); return; }
       cursor = offset;
     };
     s.dataListeners.add(onData);
-    const timer = setTimeout(() => finish({ saw: false }), timeoutMs);
+    const timer = setTimeout(() => finish({ saw: false }), ms);
   });
+
+  const result = await waitForExit(timeoutMs);
+
+  // ── Auto-answer (opt-in) — the lane that owns this session established the
+  // user's intent (e.g. a plan-chosen setup). Answer SAFE prompts on their
+  // behalf: generic [Y/n]/continue confirms → 'y'; arrow-key menus → accept
+  // the highlighted default. NEVER prompts (passwords/secrets/2FA/consent/
+  // destructive) and free-text inputs without a queued value stay for the
+  // user — see terminal/auto-answer.cjs.
+  const autoAnswers = [];
+  if (!result.saw && args.autoAnswer && s.exitCode === null) {
+    const directives = { enable: true, confirm: 'y', select: 'default', ...args.autoAnswer };
+    let lastSeen = null;
+    for (let i = 0; i < 6 && s.exitCode === null; i++) {
+      await s.screen.flush();
+      const scr = s.screen.screen();
+      const lines = scr.split('\n').filter(l => l.trim());
+      const last = (lines[lines.length - 1] || '').trim();
+      if (!last) break;
+      const cls = classifyPromptLine(last, scr);
+      const ans = answerFor(cls, directives);
+      if (!ans) {
+        // never/other/input-without-value — leave it for the user; the
+        // prompt_wait event already raised the pane.
+        if (cls.kind === 'never' || cls.kind === 'input') {
+          autoAnswers.push({ kind: cls.kind, answered: false, line: last.slice(0, 120) });
+        }
+        break;
+      }
+      s.pty.write(ans === '\r' ? '\r' : `${ans}\n`);
+      autoAnswers.push({ kind: cls.kind, answered: true, line: last.slice(0, 120), answer: cls.kind === 'confirm' ? ans : '(default)' });
+      emitProgress(ctx.cbUrl, {
+        type: 'terminal:activity', sessionId: s.id, kind: 'auto-answer',
+        line: `auto-answered ${cls.kind}: ${last.slice(0, 80)} → ${cls.kind === 'confirm' ? ans : '(default)'}`,
+      });
+      const w = await waitForExit(5000);
+      if (w.saw) { result.saw = true; result.exitCode = w.exitCode; break; }
+      await s.screen.flush();
+      const nowLast = (s.screen.screen().split('\n').filter(l => l.trim()).pop() || '').trim();
+      if (nowLast === lastSeen) break; // same prompt repainted — stop guessing
+      lastSeen = nowLast;
+    }
+  }
 
   await s.screen.flush();
   const screen = s.screen.screen()
@@ -298,6 +370,7 @@ async function actionExec(args, ctx) {
     screen,
     delta: s.screen.rawSince(baseOffset).data,
     prompt: s.meta.prompt,
+    autoAnswers: autoAnswers.length ? autoAnswers : undefined,
     error: result.saw ? undefined : `timeout after ${timeoutMs}ms`,
   };
   emitProgress(ctx.cbUrl, {

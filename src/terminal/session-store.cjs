@@ -120,7 +120,12 @@ function close(id) {
   s.killed = true;
   try { s.pty.kill(); } catch (_) {}
   try { s.transcript.end(`\n[session closed by request]\n`); } catch (_) {}
-  sessions.delete(id);
+  // Tombstone — keep the record instead of deleting. A pane still showing
+  // this session renders "(exited)" with readable scrollback rather than
+  // flipping to session-not-found / "(no sessions)". send → session-exited.
+  // The idle sweeper reaps dead sessions (~5min), so this doesn't leak.
+  if (s.exitCode === null) s.exitCode = -1;
+  s.meta.lastActivity = Date.now();
   return true;
 }
 
@@ -128,9 +133,12 @@ function killAll() {
   for (const id of [...sessions.keys()]) close(id);
 }
 
-/** Find sessions owned by a run/task (for cleanup + cancel routing). */
+/** Find LIVE sessions owned by a run/task (for cleanup + cancel routing).
+ *  Tombstoned/exited sessions are excluded — callers want things to kill,
+ *  and re-killing a tombstone would only reset its reap clock. */
 function findByOwner(ownerRunId) {
-  return [...sessions.values()].filter(s => s.meta.ownerRunId === ownerRunId);
+  return [...sessions.values()].filter(s =>
+    s.meta.ownerRunId === ownerRunId && !s.killed && s.exitCode === null);
 }
 
 function _ensureSweeper() {

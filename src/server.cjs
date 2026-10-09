@@ -101,6 +101,7 @@ const creatorAgent = require('./skills/creator.agent.cjs');
 const reviewerAgent = require('./skills/reviewer.agent.cjs');
 const skillCreator = require('./skills/skillCreator.skill.cjs');
 const { screenCapture } = require('./skills/screen.capture.cjs');
+const { screenDisplay } = require('./skills/screen.display.cjs');
 const { userAgent } = require('./skills/user.agent.cjs');
 const webAgent   = require('./skills/web.agent.cjs');
 const videoAgent = require('./skills/video.agent.cjs');
@@ -169,6 +170,9 @@ class CommandServiceMCPServer {
 
       case 'screen.capture':
         return await this._skillScreenCapture(args);
+
+      case 'screen.display':
+        return await screenDisplay(args);
 
       case 'cli.agent':
         return await this._skillCliAgent(args);
@@ -484,7 +488,7 @@ class CommandServiceMCPServer {
       success: true,
       service: this.serviceName,
       status: 'healthy',
-      skills: ['shell.run', 'browser.act', 'web.crawl', 'image.analyze', 'fs.read', 'edit.agent', 'doc.read', 'media.transcribe', 'file.watch', 'file.bridge', 'screen.capture', 'external.skill', 'cli.agent', 'browser.agent', 'playwright.agent', 'url.first.agent', 'just.type.agent', 'meta.find.agent', 'shortcut.keys.agent', 'tab.map.agent', 'gesture.agent', 'arrow.grid.agent', 'turn.loop.agent', 'dom.act', 'creator.agent', 'reviewer.agent', 'skillCreator.skill', 'project.builder', 'project.launcher', 'project.editor', 'project.stopper', 'app.agent', 'system.introspect', 'provider.discovery', 'user.agent', 'web.agent', 'video.agent', 'tool.discover']
+      skills: ['shell.run', 'browser.act', 'web.crawl', 'image.analyze', 'fs.read', 'edit.agent', 'doc.read', 'media.transcribe', 'file.watch', 'file.bridge', 'screen.capture', 'screen.display', 'external.skill', 'cli.agent', 'browser.agent', 'playwright.agent', 'url.first.agent', 'just.type.agent', 'meta.find.agent', 'shortcut.keys.agent', 'tab.map.agent', 'gesture.agent', 'arrow.grid.agent', 'turn.loop.agent', 'dom.act', 'creator.agent', 'reviewer.agent', 'skillCreator.skill', 'project.builder', 'project.launcher', 'project.editor', 'project.stopper', 'app.agent', 'system.introspect', 'provider.discovery', 'user.agent', 'web.agent', 'video.agent', 'tool.discover']
     };
   }
 
@@ -603,7 +607,7 @@ class CommandServiceMCPServer {
         res.end(JSON.stringify({
           status: 'healthy',
           service: this.serviceName,
-          skills: ['shell.run', 'browser.act', 'web.crawl', 'image.analyze', 'fs.read', 'edit.agent', 'doc.read', 'media.transcribe', 'file.watch', 'file.bridge', 'screen.capture', 'external.skill', 'cli.agent', 'browser.agent', 'playwright.agent', 'url.first.agent', 'just.type.agent', 'meta.find.agent', 'shortcut.keys.agent', 'tab.map.agent', 'gesture.agent', 'arrow.grid.agent', 'turn.loop.agent', 'dom.act', 'creator.agent', 'reviewer.agent', 'skillCreator.skill', 'project.builder', 'project.launcher', 'project.editor', 'project.stopper', 'app.agent', 'system.introspect', 'provider.discovery', 'user.agent', 'web.agent', 'video.agent', 'tool.discover']
+          skills: ['shell.run', 'browser.act', 'web.crawl', 'image.analyze', 'fs.read', 'edit.agent', 'doc.read', 'media.transcribe', 'file.watch', 'file.bridge', 'screen.capture', 'screen.display', 'external.skill', 'cli.agent', 'browser.agent', 'playwright.agent', 'url.first.agent', 'just.type.agent', 'meta.find.agent', 'shortcut.keys.agent', 'tab.map.agent', 'gesture.agent', 'arrow.grid.agent', 'turn.loop.agent', 'dom.act', 'creator.agent', 'reviewer.agent', 'skillCreator.skill', 'project.builder', 'project.launcher', 'project.editor', 'project.stopper', 'app.agent', 'system.introspect', 'provider.discovery', 'user.agent', 'web.agent', 'video.agent', 'tool.discover']
         }));
         return;
       }
@@ -751,6 +755,48 @@ class CommandServiceMCPServer {
           res.writeHead(500);
           res.end(JSON.stringify({ error: err.message }));
         }
+        return;
+      }
+
+      // ── POST /credential.store — terminal-setup credential proxy ───────────
+      // Called from a setup PTY's `read -s` script: stores a pasted secret in
+      // the user-memory profile store. The bearer key lives only in this
+      // process's env — it never enters the terminal.
+      // Body: { keytarKey, value, service?, label? }
+      if (req.method === 'POST' && req.url === '/credential.store') {
+        let body = '';
+        req.on('data', chunk => { body += chunk; });
+        req.on('end', async () => {
+          try {
+            const { keytarKey, value, service, label } = JSON.parse(body || '{}');
+            if (!keytarKey || value === undefined || value === null || value === '') {
+              res.writeHead(400);
+              res.end(JSON.stringify({ ok: false, error: 'keytarKey and value required' }));
+              return;
+            }
+            const fwd = JSON.stringify({
+              version: 'mcp.v1', service: 'user-memory', action: 'profile.store_secret',
+              requestId: `credstore_${Date.now()}`,
+              payload: { keytarKey, value, service: service || null, label: label || null },
+            });
+            const memUrl = process.env.MCP_USER_MEMORY_URL || 'http://127.0.0.1:3001';
+            const memKey = process.env.MCP_USER_MEMORY_API_KEY || process.env.USER_MEMORY_API_KEY || '';
+            const parsed = new URL(memUrl);
+            const reqHeaders = { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(fwd) };
+            if (memKey) reqHeaders['Authorization'] = `Bearer ${memKey}`;
+            const raw = await new Promise((resolve, reject) => {
+              const r = http.request({ hostname: parsed.hostname, port: Number(parsed.port) || 3001, path: '/profile.store_secret', method: 'POST', headers: reqHeaders }, (resp) => {
+                let d = ''; resp.on('data', c => d += c); resp.on('end', () => resolve({ status: resp.statusCode, body: d }));
+              });
+              r.on('error', reject); r.setTimeout(10000, () => r.destroy(new Error('timeout'))); r.write(fwd); r.end();
+            });
+            res.writeHead(raw.status === 200 ? 200 : 502);
+            res.end(raw.body);
+          } catch (err) {
+            res.writeHead(500);
+            res.end(JSON.stringify({ ok: false, error: err.message }));
+          }
+        });
         return;
       }
 
@@ -1040,7 +1086,14 @@ class CommandServiceMCPServer {
             const payload = JSON.parse(body || '{}');
             const { searchCapabilities } = require('../../../shared/capability-index.cjs');
             const query = payload.query || payload.payload?.query || '';
-            const results = await searchCapabilities(query, { limit: payload.limit });
+            // Registered agents ride along even at score 0 — retrieval is
+            // recall, semantic selection is the decision. The index only
+            // appends them when a scored hit exists, so a no-hit prompt
+            // still returns an empty pool.
+            const results = await searchCapabilities(query, {
+              limit: payload.limit,
+              includeUnmatchedRegistered: payload.includeRegistered !== false,
+            });
             res.writeHead(200);
             res.end(JSON.stringify({ ok: true, query, results }));
           } catch (err) {
@@ -1097,6 +1150,9 @@ class CommandServiceMCPServer {
               label,
               keepSession: true, // 'thinkdrop: check' persists across checks
               timeoutMs: Math.min(payload.timeoutMs || 30000, 300000),
+              // Opt-in per lane: setup lanes pass { enable, confirm:'y',
+              // select:'default' }; auto-answer.cjs's never-list still rules.
+              autoAnswer: payload.autoAnswer || undefined,
               _progressCallbackUrl: payload.cbUrl || 'http://127.0.0.1:3010/agent-turn',
             });
             res.writeHead(200);
@@ -1185,6 +1241,43 @@ class CommandServiceMCPServer {
             });
             res.writeHead(200);
             res.end(JSON.stringify(result));
+          } catch (err) {
+            res.writeHead(400);
+            res.end(JSON.stringify({ ok: false, error: err.message }));
+          }
+        });
+        return;
+      }
+
+      // ── POST /capability.select-best ────────────────────────────────────────
+      // Semantic routing decision: retrieved candidates (verified facts) →
+      // one bounded LLM pick. The gate consumes { pick, fit, reason,
+      // alternatives } + decideGate() to decide pin / needs_setup / clarify /
+      // none. Facts are mechanical; the pick is semantic; neither is a regex.
+      if (req.method === 'POST' && req.url === '/capability.select-best') {
+        let body = '';
+        req.on('data', chunk => { body += chunk; });
+        req.on('end', async () => {
+          try {
+            const payload = JSON.parse(body || '{}');
+            const { selectBestCapability, decideGate } = require('../../../shared/capability-index.cjs');
+            const goal = payload.query || payload.goal || payload.payload?.query || '';
+            const screenText = String(payload.screenText || '').slice(0, 300);
+            const goalText = screenText
+              ? `${goal}\n\nScreen content (context for what the user means by "this"/"that"):\n${screenText}`
+              : goal;
+            const selection = await selectBestCapability(goalText, {
+              limit: payload.limit,
+              // Callers that already ran capability.search hand the retrieved
+              // pool back — one retrieval, one selection, no double scan.
+              candidates: Array.isArray(payload.candidates) && payload.candidates.length ? payload.candidates : undefined,
+              llmCaller: (prompt) => skillLlm.askWithMessages(
+                [{ role: 'user', content: prompt }],
+                { temperature: 0, maxTokens: 300, taskType: 'capability_select',
+                  responseFormat: { type: 'json_object' }, responseTimeoutMs: 8000 }),
+            });
+            res.writeHead(200);
+            res.end(JSON.stringify({ ...selection, decision: selection.ok ? decideGate(selection) : 'fallback' }));
           } catch (err) {
             res.writeHead(400);
             res.end(JSON.stringify({ ok: false, error: err.message }));

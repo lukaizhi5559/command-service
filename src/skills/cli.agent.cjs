@@ -422,6 +422,24 @@ async function _readNarration(sessionId) {
 }
 
 /**
+ * Clean a raw PTY `delta` stream into plain text — strips ANSI escapes,
+ * carriage returns, the echoed command line, and the __TD_EXIT_ sentinel
+ * terminal.agent exec appends. `echo` (optional) is the submitted command;
+ * lines containing it are dropped so the result is program output only.
+ * Returns '' when delta is empty/marker-only (TUI repaints, prompts) —
+ * callers should fall back to the rendered `screen` in that case.
+ */
+function _ptyDeltaText(delta, echo) {
+  return String(delta || '')
+    .replace(_ANSI_RE, '')
+    .split('\n')
+    .map(l => l.replace(/\r/g, ''))
+    .filter(l => l.trim() && !l.includes('__TD_EXIT_') && !(echo && l.includes(echo)))
+    .join('\n')
+    .trim();
+}
+
+/**
  * Run a probe command inside the shared PTY session. Returns
  * { used, ok, stdout } — stdout is this command's output only (from `delta`),
  * ANSI-stripped, echo + exit-marker removed. `used:false` → caller falls
@@ -432,12 +450,7 @@ async function _ptyProbe(sessionId, cmd, { timeoutMs = 8000 } = {}) {
   try {
     const r = await terminalAgent({ action: 'exec', sessionId, cmd, timeoutMs, keepSession: true });
     if (!r || !r.ok) return { used: true, ok: false, stdout: '', exitCode: r?.exitCode ?? -1 };
-    const stdout = String(r.delta || '')
-      .replace(_ANSI_RE, '')
-      .split('\n')
-      .map(l => l.replace(/\r/g, ''))
-      .filter(l => l.trim() && !l.includes('__TD_EXIT_') && !l.includes(cmd))
-      .join('\n');
+    const stdout = _ptyDeltaText(r.delta, cmd);
     return { used: true, ok: r.exitCode === 0, exitCode: r.exitCode, stdout };
   } catch (_) {
     return { used: false };
@@ -987,6 +1000,8 @@ Rules:
   Bad (too narrow): "'gh repo star' does not exist. Use: gh api --method PUT /user/starred/{owner}/{repo}."
   Good (broad): "Many 'gh' operations have no dedicated subcommand — use 'gh api --method GET/PUT/DELETE/POST <REST endpoint>' for all of them. Syntax: run_help [\"api\"] shows full flags. Examples: star=PUT /user/starred/{owner}/{repo}, unstar=DELETE /user/starred/{owner}/{repo}, readme=GET /repos/{owner}/{repo}/readme, releases=GET /repos/{owner}/{repo}/releases, follow_user=PUT /user/following/{username}."
 - ask_user is the LAST RESORT. Do NOT use ask_user until you have run at least one diagnostic probe (run_shell or run_help) after a failure. The user should never see ask_user for a failure that a 1-line shell probe could have explained or resolved.
+- PRIMARY-RESOURCE RULE — when the task needs items belonging to a person or entity (emails from X, events with Y, files by Z), query the PRIMARY resource directly first: list/search the items themselves and filter client-side by name/subject (e.g. "email list --unread", "email search X", "events list"). Auxiliary directories (contacts, address books, indexes, caches) are lookup AIDS, not gates — an empty contacts result means "query the primary resource", NEVER "ask the user for the identifier". Only ask_user for an identifier after the primary-resource listing/search has been tried and genuinely cannot yield it.
+- ANTI-FIXATION — never run more than 2 variations of the same subcommand against the same resource with only filter changes. If 2 attempts return empty/no-match results, that resource doesn't have the answer — pivot to a different resource or strategy (primary-resource listing, different subcommand, run_help for a search command) instead of re-probing the same table.
 - Never use ask_user for CLI version or installation issues — use run_update instead.
 - CAPABILITY-FIT — before your first execution action, compare the task to the descriptor's capabilities. If the asked operation is fundamentally outside what this tool can do (e.g. "mirror my screen" for a tool that only casts media files/URLs), do NOT attempt a nearest approximation and do NOT retry — emit ONE diagnostic probe (run_help) to confirm, then ask_user explaining what the tool CAN do (list 3-5 real capabilities in plain words) and ask whether one of them fits or whether they want a different tool. Never fake success on an unsupported operation.
 - MULTI-TURN ask_user: When processing a resume context where the user selected an option that implies a value is needed (e.g. "Yes, specify duration") but the actual value was NOT provided in the answer, emit another ask_user with an EMPTY options array to collect the specific value via free-text input. Do NOT guess or hallucinate values the user did not explicitly provide. The UI will show a free-text input field when options is empty.
@@ -1569,7 +1584,8 @@ async function actionRun({ cli, argv = [], cwd, env, timeoutMs, stdin, agentId, 
 
         // ── Auto-auth intercept: if this ask_user is about authentication, attempt silent login ──
         const _questionLower = (action.question || '').toLowerCase();
-        const _isAuthQuestion = /\b(auth|login|sign[\s-]?in|not logged|unauthorized|unauthenticated|credentials|token expired|permission denied|403|401)\b/i.test(_questionLower);
+        const _isAuthQuestion = /\b(auth|login|sign[\s-]?in|not logged|unauthorized|unauthenticated|credentials?|token expired|permission denied|api[- ]?key|apikey|access[- ]?token|client[-_ ]?(id|secret)|secret|password)\b/i.test(_questionLower)
+          || (/\bdo you have\b/i.test(_questionLower) && /\b(account|api[- ]?key|key|token|profile|console|dashboard)\b/i.test(_questionLower));
         if (_isAuthQuestion && currentBinPath && !_authAttempted) {
           _authAttempted = true; // prevent infinite retry
           logger.info(`[cli.agent] ask_user appears auth-related for ${agentId} — attempting auto-auth`, { agentId });
@@ -1584,6 +1600,7 @@ async function actionRun({ cli, argv = [], cwd, env, timeoutMs, stdin, agentId, 
                   const _payload = JSON.stringify({
                     type: 'task:auth_required',
                     agentId,
+                    serviceType: 'cli',
                     serviceDisplay: _svcDisplay,
                     loginUrl: '',
                     sessionId: null,
@@ -1918,7 +1935,13 @@ async function actionRun({ cli, argv = [], cwd, env, timeoutMs, stdin, agentId, 
               _progressCallbackUrl,
             });
             if (r.ok) {
-              observation = `pty exitCode=${r.exitCode}\nscreen:\n${(r.screen || '').slice(-RUN_HELP_CHARS)}`;
+              // Prefer the raw delta stream — the rendered viewport shows only
+              // the last ~24 rows, hiding bulk output (dumps, listings).
+              const _ptyOut = _ptyDeltaText(r.delta, String(action.cmd || '')) || (r.screen || '');
+              const _ptyTail = _ptyOut.length > RUN_HELP_CHARS
+                ? `${_ptyOut.slice(0, RUN_HELP_CHARS >> 1)}\n…[${_ptyOut.length - RUN_HELP_CHARS} chars omitted]…\n${_ptyOut.slice(-(RUN_HELP_CHARS >> 1))}`
+                : _ptyOut;
+              observation = `pty exitCode=${r.exitCode}\n${_ptyTail}`;
               if (r.exitCode === 0) {
                 try { termKnowledge.record(cliTool, { flags: termKnowledge.extractFlags(action.cmd) }); } catch (_) {}
               }
@@ -1928,9 +1951,15 @@ async function actionRun({ cli, argv = [], cwd, env, timeoutMs, stdin, agentId, 
             if (r.prompt === 'password') {
               observation += `\n[PASSWORD/PASSPHRASE PROMPT ON SCREEN — use ask_user to collect the credential; never guess]`;
               try { termKnowledge.record(cliTool, { prompt: 'password prompt' }); } catch (_) {}
+            } else if (r.prompt === 'input') {
+              observation += `\n[INPUT PROMPT ON SCREEN — answer it with pty_send (or ask_user if you don't have the value — API keys/secrets/IDs belong to the user)]`;
             }
             logger.info(`[cli.agent] loop turn=${turn} pty_exec exitCode=${r.exitCode} ok=${r.ok}`, { agentId });
           } else {
+            // Baseline raw offset BEFORE the write — echo that lands during
+            // the send round-trip must still count as post-input output.
+            const _sess = termStore.get(sid);
+            const base = await terminalAgent({ action: 'read', sessionId: sid, mode: 'raw', cursor: _sess?._ptyRawCursor ?? null }).catch(() => null);
             let r;
             if (action.ctrl) {
               r = await terminalAgent({ action: 'send', sessionId: sid, ctrl: action.ctrl });
@@ -1944,13 +1973,16 @@ async function actionRun({ cli, argv = [], cwd, env, timeoutMs, stdin, agentId, 
               const rd = await terminalAgent({ action: 'read', sessionId: sid, mode: 'screen' });
               const newScreen = rd.output || '';
               observation = `pty_send ok. screen:\n${newScreen.slice(-1500)}`;
-              // Two-strike detection: identical screen after input means the
-              // program ignored us — tell the loop to stop guessing.
-              const _sess = termStore.get(sid);
-              if (_sess && _sess._lastReadScreen && _sess._lastReadScreen === newScreen) {
-                observation += `\n[SCREEN UNCHANGED after input — your input had no effect. Do NOT repeat the same pty_send; ask_user or try a non-interactive flag instead.]`;
+              // "Input had no effect" must be measured by raw-stream growth,
+              // not screen text — TUIs repaint an identical-looking screen
+              // after valid input (echo-less answers, menu redraws), so a
+              // text compare lies. Count bytes emitted strictly post-write.
+              const raw = await terminalAgent({ action: 'read', sessionId: sid, mode: 'raw', cursor: base?.ok ? base.offset : null }).catch(() => null);
+              const growth = raw?.ok ? (raw.data || '').length : 0;
+              if (_sess && raw?.ok && typeof raw.offset === 'number') _sess._ptyRawCursor = raw.offset;
+              if (raw?.ok && growth === 0) {
+                observation += `\n[NO OUTPUT after input — the program emitted nothing (no echo, no redraw): your input had no effect. Do NOT repeat the same pty_send; ask_user or try a non-interactive flag instead.]`;
               }
-              if (_sess) _sess._lastReadScreen = newScreen;
             } else {
               observation = `pty_send failed: ${r.error}`;
             }
@@ -2185,7 +2217,16 @@ async function _genericRunLoop({ task, cwd, env, timeoutMs, _progressCallbackUrl
             try {
               const sid = await _ensurePtySession();
               r = await terminalAgent({ action: 'exec', sessionId: sid, cmd: script, timeoutMs: action.timeoutMs || 60000, keepSession: true, _progressCallbackUrl });
-              const tail = (r.screen || '').slice(-RUN_HELP_CHARS);
+              // Observe the raw `delta` stream (complete output since exec
+              // start), not `screen` — the rendered viewport is only the last
+              // ~24 rows, so bulk output (pdftotext dumps, cat, listings) was
+              // invisible and the loop burned turns re-running commands that
+              // had already succeeded. `screen` is the fallback for TUI
+              // repaints/prompts whose delta is escape codes, not text.
+              const _stream = _ptyDeltaText(r.delta, script) || (r.screen || '');
+              const tail = _stream.length > RUN_HELP_CHARS
+                ? `${_stream.slice(0, RUN_HELP_CHARS >> 1)}\n…[${_stream.length - RUN_HELP_CHARS} chars omitted]…\n${_stream.slice(-(RUN_HELP_CHARS >> 1))}`
+                : _stream;
               observation = r.ok
                 ? `exitCode=${r.exitCode}\n${tail}`
                 : `pty ${r.error || 'timeout'} — still running. screen:\n${(r.screen || '').slice(-1500)}\nUse pty_send to answer the visible prompt.`;
@@ -2244,9 +2285,16 @@ async function _genericRunLoop({ task, cwd, env, timeoutMs, _progressCallbackUrl
         try {
           const sid = await _ensurePtySession();
           if (action.action === 'pty_exec') {
-            const r = await terminalAgent({ action: 'exec', sessionId: sid, cmd: String(action.cmd || ''), timeoutMs: action.timeoutMs || 60000, keepSession: true, _progressCallbackUrl });
+            const _ptyCmd = String(action.cmd || '');
+            const r = await terminalAgent({ action: 'exec', sessionId: sid, cmd: _ptyCmd, timeoutMs: action.timeoutMs || 60000, keepSession: true, _progressCallbackUrl });
+            // Same fix as run_shell: prefer the raw delta stream over the
+            // rendered viewport so bulk output is actually observable.
+            const _ptyStream = _ptyDeltaText(r.delta, _ptyCmd) || (r.screen || '');
+            const _ptyTail = _ptyStream.length > RUN_HELP_CHARS
+              ? `${_ptyStream.slice(0, RUN_HELP_CHARS >> 1)}\n…[${_ptyStream.length - RUN_HELP_CHARS} chars omitted]…\n${_ptyStream.slice(-(RUN_HELP_CHARS >> 1))}`
+              : _ptyStream;
             observation = r.ok
-              ? `pty exitCode=${r.exitCode}\nscreen:\n${(r.screen || '').slice(-RUN_HELP_CHARS)}`
+              ? `pty exitCode=${r.exitCode}\n${_ptyTail}`
               : `pty ${r.error || 'timeout'} — still running. screen:\n${(r.screen || '').slice(-1500)}\nUse pty_send to answer the visible prompt.`;
             if (r.prompt === 'password') {
               observation += `\n[PASSWORD/PASSPHRASE PROMPT ON SCREEN — use ask_user to collect the credential; never guess]`;
@@ -2254,6 +2302,10 @@ async function _genericRunLoop({ task, cwd, env, timeoutMs, _progressCallbackUrl
             if (r.ok && r.exitCode !== 0) failedSigs.set(_sig, _sigFails + 1);
             logger.info(`[cli.agent] generic loop turn=${turn} pty_exec exitCode=${r.exitCode} ok=${r.ok}`);
           } else {
+            // Baseline raw offset BEFORE the write — echo that lands during
+            // the send round-trip must still count as post-input output.
+            const _sess = termStore.get(sid);
+            const base = await terminalAgent({ action: 'read', sessionId: sid, mode: 'raw', cursor: _sess?._ptyRawCursor ?? null }).catch(() => null);
             let r;
             if (action.ctrl) r = await terminalAgent({ action: 'send', sessionId: sid, ctrl: action.ctrl });
             else r = await terminalAgent({ action: 'send', sessionId: sid, text: `${String(action.text ?? '')}\n` });
@@ -2262,11 +2314,15 @@ async function _genericRunLoop({ task, cwd, env, timeoutMs, _progressCallbackUrl
               const rd = await terminalAgent({ action: 'read', sessionId: sid, mode: 'screen' });
               const newScreen = rd.output || '';
               observation = `pty_send ok. screen:\n${newScreen.slice(-1500)}`;
-              const sess = termStore.get(sid);
-              if (sess && sess._lastReadScreen === newScreen) {
-                observation += `\n[SCREEN UNCHANGED after input — your input had no effect. Do NOT repeat the same pty_send; ask_user or try a non-interactive flag.]`;
+              // "Input had no effect" must be measured by raw-stream growth,
+              // not screen text — TUIs repaint an identical-looking screen
+              // after valid input (echo-less answers, menu redraws).
+              const raw = await terminalAgent({ action: 'read', sessionId: sid, mode: 'raw', cursor: base?.ok ? base.offset : null }).catch(() => null);
+              const growth = raw?.ok ? (raw.data || '').length : 0;
+              if (_sess && raw?.ok && typeof raw.offset === 'number') _sess._ptyRawCursor = raw.offset;
+              if (raw?.ok && growth === 0) {
+                observation += `\n[NO OUTPUT after input — the program emitted nothing (no echo, no redraw): your input had no effect. Do NOT repeat the same pty_send; ask_user or try a non-interactive flag.]`;
               }
-              if (sess) sess._lastReadScreen = newScreen;
             } else {
               observation = `pty_send failed: ${r.error}`;
             }
@@ -2388,7 +2444,8 @@ async function discoverAuthLoginCmd(binPath, cliName) {
 // _discoverVerifyCmd — scans --help output for a read-only subcommand that
 // makes an API call requiring valid auth. Uses heuristic pre-filter + LLM
 // classification (via skill-llm.cjs) to pick the best "verify auth" command.
-// Returns argv array (e.g. ['list']) or null if none found.
+// Returns argv array (e.g. ['list'], or ['auth','status'] for nested CLIs) or
+// null if none found.
 // ---------------------------------------------------------------------------
 
 // Subcommand names that are likely read-only and API-backed, in priority order
@@ -2400,7 +2457,60 @@ const API_BACKED_KEYWORDS = /\bavailable\b|\byour\b|\bagenda\b|\bevents?\b|\brep
 // Description keywords indicating the subcommand is local-only (no auth needed)
 const LOCAL_ONLY_KEYWORDS = /\bconfig\b|\bprofile\b|\bversion\b|\bsettings?\b|\bbuild\b|\blocal\b|\bprint\b|\bhelp\b|\binit\b|\bsetup\b|\binstall\b/i;
 
+// helpParts subcommands whose own --help exposes auth state — for cobra-style
+// CLIs (nylas, gh, kubectl) the real verify is nested: `nylas auth status`.
+const _AUTH_VERIFY_PARENT_RE = /^(auth|authenticate|login|signin|sign-in|account|accounts)$/;
+// Inside an auth namespace, prefer commands that PROVE auth state over list-y
+// ones (`auth list` can exit 0 with "no accounts" — an inconclusive output).
+const _AUTH_VERIFY_ORDER = ['status', 'whoami', 'info', 'show', 'list', 'accounts', 'agenda'];
+
+// Cobra-style command tables: a `Commands:` / `Available Commands:` /
+// `Additional Commands:` header followed by indented `  name   description`
+// rows. Returns [{name, desc}] in order.
+function _parseCobraCommands(helpText) {
+  const rows = [];
+  const sectionRe = /^(?:available\s+|additional\s+)?commands:\s*$/gim;
+  let sm;
+  while ((sm = sectionRe.exec(helpText || '')) !== null) {
+    // sm[0] ends at the ':' (the \s*$ runs to end-of-line but stops before
+    // the \n) — strip the leading newline(s) or the empty-first-line check
+    // below would end the section instantly.
+    const tail = helpText.slice(sm.index + sm[0].length).replace(/^\r?\n+/, '');
+    for (const line of tail.split('\n')) {
+      const row = line.match(/^\s{2,}([a-z][a-z0-9_-]*)\s{2,}(.+?)\s*$/i);
+      if (row) { rows.push({ name: row[1].toLowerCase(), desc: row[2].trim() }); continue; }
+      if (line.trim() === '') break;              // blank line ends the section
+      if (/^\S/.test(line)) break;                // unindented line: next section
+      // indented non-row (e.g. a lone "Commands:" continuation) — skip
+    }
+  }
+  return rows;
+}
+
 async function _discoverVerifyCmd(binPath, cliName, mainHelp, helpParts) {
+  // Nested auth namespace first — the most precise proof. `nylas auth --help`
+  // (already fetched into helpParts by discoverSetupFromHelp) lists
+  // `status`/`whoami`/`list`: `<cli> auth status` is the canonical verify.
+  const nested = [];
+  for (const part of helpParts || []) {
+    const parent = String(part?.subcmd || '').toLowerCase();
+    if (!_AUTH_VERIFY_PARENT_RE.test(parent)) continue;
+    for (const row of _parseCobraCommands(part.output || '')) {
+      if (!VERIFY_CANDIDATES.includes(row.name)) continue;
+      if (LOCAL_ONLY_KEYWORDS.test(row.desc) && !API_BACKED_KEYWORDS.test(row.desc)) continue;
+      nested.push({ argv: [parent, row.name], leaf: row.name, desc: row.desc });
+    }
+  }
+  if (nested.length) {
+    nested.sort((a, b) => {
+      const ai = _AUTH_VERIFY_ORDER.indexOf(a.leaf), bi = _AUTH_VERIFY_ORDER.indexOf(b.leaf);
+      return (ai === -1 ? 99 : ai) - (bi === -1 ? 99 : bi);
+    });
+    const pick = nested[0];
+    logger.info(`[cli.agent] _discoverVerifyCmd: ${cliName} → ['${pick.argv.join("','")}'] (nested auth namespace: "${pick.desc}")`);
+    return pick.argv;
+  }
+
   // Parse positional arguments line: {init,list,search,edit,...}
   // Some CLIs (e.g. gcalcli) also have option enums like --lineart {fancy,unicode,ascii},
   // so we collect ALL {a,b,c} blocks and pick the one with the most items that contains
@@ -2412,30 +2522,43 @@ async function _discoverVerifyCmd(binPath, cliName, mainHelp, helpParts) {
     const items = m[1].split(/,\s*/).map(s => s.trim().toLowerCase()).filter(Boolean);
     if (items.length > 0) allMatches.push({ raw: m[1], items });
   }
-  if (allMatches.length === 0) {
-    logger.debug(`[cli.agent] _discoverVerifyCmd: ${cliName} — no {a,b,c} blocks found in --help`);
-    return null;
-  }
 
-  // Prefer blocks that contain at least one verify candidate; among those, pick the longest.
-  // If no block contains a verify candidate, pick the longest block overall.
-  const candidateMatches = allMatches.filter(match => VERIFY_CANDIDATES.some(v => match.items.includes(v)));
-  const bestMatch = (candidateMatches.length > 0 ? candidateMatches : allMatches)
-    .sort((a, b) => b.items.length - a.items.length)[0];
-
-  const allSubcmds = bestMatch.items;
-  logger.debug(`[cli.agent] _discoverVerifyCmd: ${cliName} — selected ${allSubcmds.length}-item block from ${allMatches.length} total {a,b,c} blocks`);
-
-  // Build subcommand → description map from aligned help text
+  let allSubcmds = [];
   const subcmdDescs = {};
-  for (const sub of allSubcmds) {
-    // Match lines like "    list                list available calendars"
-    const descMatch = mainHelp.match(new RegExp(`^\\s{2,8}${sub}\\s{2,}(.+)$`, 'im'));
-    if (descMatch) {
-      subcmdDescs[sub] = descMatch[1].trim();
-    } else {
-      subcmdDescs[sub] = '';
+  if (allMatches.length) {
+    // Prefer blocks that contain at least one verify candidate; among those, pick the longest.
+    // If no block contains a verify candidate, pick the longest block overall.
+    const candidateMatches = allMatches.filter(match => VERIFY_CANDIDATES.some(v => match.items.includes(v)));
+    const bestMatch = (candidateMatches.length > 0 ? candidateMatches : allMatches)
+      .sort((a, b) => b.items.length - a.items.length)[0];
+
+    allSubcmds = bestMatch.items;
+    logger.debug(`[cli.agent] _discoverVerifyCmd: ${cliName} — selected ${allSubcmds.length}-item block from ${allMatches.length} total {a,b,c} blocks`);
+
+    // Build subcommand → description map from aligned help text
+    for (const sub of allSubcmds) {
+      // Match lines like "    list                list available calendars"
+      const descMatch = mainHelp.match(new RegExp(`^\\s{2,8}${sub}\\s{2,}(.+)$`, 'im'));
+      if (descMatch) {
+        subcmdDescs[sub] = descMatch[1].trim();
+      } else {
+        subcmdDescs[sub] = '';
+      }
     }
+  } else {
+    // Cobra-style fallback — no {a,b,c} enums, but `Commands:`/`Available
+    // Commands:` sections list subcommands with aligned descriptions.
+    for (const row of _parseCobraCommands(mainHelp)) {
+      allSubcmds.push(row.name);
+      subcmdDescs[row.name] = row.desc;
+    }
+    if (allSubcmds.length) {
+      logger.debug(`[cli.agent] _discoverVerifyCmd: ${cliName} — ${allSubcmds.length} cobra-style subcommands from Commands: section`);
+    }
+  }
+  if (!allSubcmds.length) {
+    logger.debug(`[cli.agent] _discoverVerifyCmd: ${cliName} — no subcommand list found in --help`);
+    return null;
   }
 
   // Phase 1: Heuristic pre-filter
@@ -3340,7 +3463,7 @@ function _parseFrontmatterField(descriptor, key) {
 }
 
 async function actionListAllAgents() {
-  return await withDb(async (db) => {
+  const result = await withDb(async (db) => {
     // Unconditional: delete all legacy bare-id rows (e.g. 'youtube', 'gmail')
     // that don't have the canonical '.agent' suffix. Safe to run every call.
     await db.run("DELETE FROM agents WHERE id NOT LIKE '%.agent'").catch(() => {});
@@ -3372,6 +3495,38 @@ async function actionListAllAgents() {
       }),
     };
   });
+
+  // Merge .md-only agents not yet in DB — capability.select drafts and
+  // materialized affordances live here until a build promotes them. Without
+  // this, resolveAgent's registered-check drops their pin (observed:
+  // messages.app.agent materialized by the gate but invisible to agent.list).
+  try {
+    const dbIds = new Set((result.agents || []).map(a => a.id));
+    const _fmField = (src, k) => src.match(new RegExp(`^${k}:\\s*(.+)$`, 'm'))?.[1]?.trim() || null;
+    for (const f of fs.readdirSync(AGENTS_DIR).filter(x => x.endsWith('.agent.md'))) {
+      const id = f.replace(/\.md$/, '');
+      if (dbIds.has(id)) continue;
+      try {
+        const src = fs.readFileSync(path.join(AGENTS_DIR, f), 'utf8');
+        const capsRaw = _fmField(src, 'capabilities');
+        const caps = capsRaw
+          ? capsRaw.replace(/^\[|\]$/g, '').split(',').map(s => s.trim()).filter(Boolean)
+          : [];
+        result.agents.push({
+          id,
+          type: _fmField(src, 'type') || 'cli',
+          service: _fmField(src, 'service') || id.replace(/\.agent$/, ''),
+          cliTool: _fmField(src, 'cli_tool'),
+          capabilities: caps,
+          status: _fmField(src, 'status') || 'draft',
+          lastValidated: null,
+          authedAt: null,
+          start_url: _fmField(src, 'start_url'),
+        });
+      } catch (_) {}
+    }
+  } catch (_) {}
+  return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -4660,7 +4815,7 @@ async function cliAgent(args) {
   }
 }
 
-module.exports = { cliAgent, KNOWN_CLI_MAP, actionListAllAgents, resetDbCache, discoverSetupFromHelp };
+module.exports = { cliAgent, KNOWN_CLI_MAP, actionListAllAgents, resetDbCache, discoverSetupFromHelp, _discoverVerifyCmd, _ptyDeltaText };
 
 // ── One-shot startup migration: ensure ytdlp.agent has transcript capabilities ──
 // Runs 5s after module load to allow DuckDB init. No-ops if already patched.
