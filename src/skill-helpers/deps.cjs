@@ -26,6 +26,14 @@ const { spawnSync } = require('child_process');
 const logger = require('../logger.cjs');
 
 const BIN_DIR = path.join(os.homedir(), '.thinkdrop', 'bin');
+// Canonical location for agent-installed Node libraries. `npm install --prefix`
+// puts packages under <NPM_DEP_DIR>/node_modules — requiring via the absolute
+// modulePath (or setting NODE_PATH=NODE_PATHS for spawned processes) makes them
+// resolvable from ANY cwd. This is the only reliable way to "install an npm
+// package globally": `npm i -g` lands in `npm root -g`, which require() never
+// searches without NODE_PATH.
+const NPM_DEP_DIR = path.join(os.homedir(), '.thinkdrop', 'node-deps');
+const NODE_PATHS = path.join(NPM_DEP_DIR, 'node_modules');
 
 // kind 'pip': probe `python3 -c "import <module>"`, install `pip install --user <pip>`
 // kind 'brew': probe `which <bin>`, install `brew install <brew>`
@@ -136,4 +144,75 @@ function ensurePipSync(name) {
   }
 }
 
-module.exports = { DEPS, ensure, ensurePipSync, which, BIN_DIR };
+/**
+ * Merge NODE_PATH into an env object for spawned node processes — prepends the
+ * ThinkDrop dep dir so `require()` resolves rail-installed packages while
+ * keeping any caller/system NODE_PATH entries.
+ */
+function withNodePath(env = {}) {
+  const existing = env.NODE_PATH || process.env.NODE_PATH || '';
+  const merged = [NODE_PATHS, ...existing.split(path.delimiter).filter(Boolean)].join(path.delimiter);
+  return { ...env, NODE_PATH: merged };
+}
+
+// Probe a node package the way generated scripts will: a real spawned
+// `node -e require()` with NODE_PATH pointed at the dep dir — cwd-invariant.
+function _probeNpm(pkg, { timeoutMs = 15000 } = {}) {
+  try {
+    const r = spawnSync('node', ['-e', `require(${JSON.stringify(pkg)})`], {
+      timeout: timeoutMs,
+      env: withNodePath({ ...process.env }),
+    });
+    if (r.status !== 0) return { ok: false };
+    const mod = require(path.join(NODE_PATHS, pkg, 'package.json'));
+    return { ok: true, version: mod && mod.version || null };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+}
+
+/**
+ * ensureNpm(pkg) — install a Node *library* so require() resolves everywhere.
+ * NOT for CLIs (this puts no binary on PATH — CLI installs use npm -g via
+ * cli.agent's normal lane). Returns
+ *   { ok:true, pkg, version, modulePath, dir } | { ok:false, reason:'missing_dep', error }
+ */
+async function ensureNpm(pkg, opts = {}) {
+  const cacheKey = `npm:${pkg}`;
+  if (_cache[cacheKey]) return _cache[cacheKey];
+  if (!pkg || !/^(@[\w.-]+\/)?[\w.-]+$/.test(pkg)) {
+    return (_cache[cacheKey] = { ok: false, reason: 'missing_dep', error: `invalid npm package name '${pkg}'` });
+  }
+
+  const probed = _probeNpm(pkg);
+  if (probed.ok) {
+    return (_cache[cacheKey] = { ok: true, pkg, version: probed.version, modulePath: path.join(NODE_PATHS, pkg), dir: NPM_DEP_DIR });
+  }
+
+  try {
+    fs.mkdirSync(NPM_DEP_DIR, { recursive: true });
+  } catch (e) {
+    return (_cache[cacheKey] = { ok: false, reason: 'missing_dep', error: `cannot create ${NPM_DEP_DIR}: ${e.message}` });
+  }
+
+  logger.info(`[deps] npm library '${pkg}' missing — npm install --prefix ${NPM_DEP_DIR} ${pkg}`);
+  const inst = spawnSync('npm', ['install', '--prefix', NPM_DEP_DIR, '--no-fund', '--no-audit', '--loglevel=error', pkg], {
+    timeout: opts.timeoutMs || 240000,
+    env: { ...process.env },
+  });
+  if (inst.status !== 0) {
+    const tail = String(inst.stderr || inst.stdout || '').trim().split('\n').slice(-4).join(' | ').slice(0, 400);
+    return (_cache[cacheKey] = {
+      ok: false, reason: 'missing_dep',
+      error: `npm install ${pkg} failed${tail ? ` — ${tail}` : ''} (native modules may need Xcode CLT or a prebuilt binary)`,
+    });
+  }
+
+  const after = _probeNpm(pkg);
+  if (after.ok) {
+    return (_cache[cacheKey] = { ok: true, pkg, version: after.version, modulePath: path.join(NODE_PATHS, pkg), dir: NPM_DEP_DIR });
+  }
+  return (_cache[cacheKey] = { ok: false, reason: 'missing_dep', error: `npm package '${pkg}' installed but require() still fails` });
+}
+
+module.exports = { DEPS, ensure, ensurePipSync, ensureNpm, withNodePath, which, BIN_DIR, NPM_DEP_DIR, NODE_PATHS };

@@ -188,6 +188,13 @@ Discovery rule: if the right package or CLI tool is not immediately obvious, rea
 first principles — what file format or protocol is involved, which runtime handles it best,
 what is the canonical library in that ecosystem — then install and use it inline.
 
+Node library rule (CRITICAL): npm packages that are LIBRARIES (used via require(), not a
+command) are NOT verified with "command -v" or "--version" — they have no binary. Verify
+with 'node -e "require('"'<pkg>'"')"'. 'npm install -g' does NOT make require() work — install
+libraries to the ThinkDrop dep dir instead:
+  npm install --prefix "$HOME/.thinkdrop/node-deps" <pkg>
+NODE_PATH is already set for these shells, so require() resolves after that install.
+
 macOS system query field names (CRITICAL — do NOT guess field names):
 - diskutil info / outputs: "Disk Size:", "Container Total Space:", "Container Free Space:", "Volume Used Space:"
 - There is NO field called "Total Size" or "Available Space" — never grep for those.
@@ -1746,6 +1753,15 @@ async function _ptyRunProcess(cmd, argv, options, onProgress) {
   };
 }
 
+// Lazy NODE_PATH env for spawned shells — resolves rail-installed node libs.
+let _depsHelpers = null;
+function _depNodeEnv() {
+  try {
+    if (!_depsHelpers) _depsHelpers = require('../skill-helpers/deps.cjs');
+    return _depsHelpers.withNodePath({});
+  } catch (_) { return {}; }
+}
+
 function runProcess(cmd, argv, options, onProgress) {
   return new Promise((_resolve) => {
     const _sbxProfile = _sandboxProfile(options?.protectedPaths);
@@ -1758,7 +1774,9 @@ function runProcess(cmd, argv, options, onProgress) {
 
     const spawnOpts = {
       cwd: options.cwd || process.cwd(),
-      env: { ...process.env, ...(options.env || {}) },
+      // NODE_PATH → rail-installed node libraries (~/.thinkdrop/node-deps)
+      // resolve via require() from any cwd; `npm i -g` alone can't do this.
+      env: { ...process.env, ..._depNodeEnv(), ...(options.env || {}) },
       stdio: ['pipe', 'pipe', 'pipe'],
     };
 

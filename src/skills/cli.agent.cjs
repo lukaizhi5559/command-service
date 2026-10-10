@@ -492,7 +492,27 @@ async function _verifyPackageExists(method, pkg, { sessionId = null } = {}) {
     }
     return false;
   }
-  return true; // pip/apt/etc — trust meta for now
+  if (method === 'pip' || method === 'pip3') {
+    // Real check — previously this trusted scraped text blindly, which let an
+    // unrelated product's docs "verify" a same-named pip package (pip:canvas
+    // suggested by canvasmedical.com for npm's canvas graphics library).
+    return await _pypiPackageExists(pkg);
+  }
+  return true; // apt/etc — trust meta for now
+}
+
+// PyPI existence check — real lookup (the old pip branch trusted scraped text
+// blind, which is how a docs page for a *different* product "verified"
+// pip:canvas). Fail-closed: a network error counts as "can't verify".
+async function _pypiPackageExists(pkg) {
+  try {
+    const res = await fetch(`https://pypi.org/pypi/${encodeURIComponent(pkg)}/json`, {
+      signal: AbortSignal.timeout(8000),
+    });
+    return res.status === 200;
+  } catch (_) {
+    return false;
+  }
 }
 
 async function _probeRegistryCandidates(serviceKey, { sessionId = null } = {}) {
@@ -527,11 +547,23 @@ async function _probeRegistryCandidates(serviceKey, { sessionId = null } = {}) {
 
   const npmHits = [];
   const brewHits = [];
+  const libHits = []; // packages that exist but ship NO binary — libraries/SDKs
   for (const pkg of npmCandidates) {
     const r = await _probeCmd(sessionId, 'npm', ['view', pkg, 'bin', '--json']);
-    if (!r.ok) continue;
-    const m = r.stdout.match(/[\[{][\s\S]*/);
-    if (!m) continue;
+    if (!r.ok) continue; // npm view failed (E404) — package doesn't exist under this name
+    const out = (r.stdout || '').trim();
+    // `npm view <pkg> bin` exits 0 (package EXISTS) but prints nothing or
+    // `undefined`/`null` when the manifest has no bin field — that's a library.
+    if (!out || out === 'undefined' || out === 'null') {
+      libHits.push({ cli: null, isLibrary: true, method: 'npm', pkg });
+      continue;
+    }
+    const m = out.match(/[\[{][\s\S]*/);
+    if (!m) {
+      // Truthy non-JSON output → a string-form bin value — it's a CLI.
+      npmHits.push({ cli: pkg.split('/').pop(), method: 'npm', pkg });
+      continue;
+    }
     try {
       const bin = JSON.parse(m[0]);
       // bin as string → binary name is the package's own name;
@@ -540,11 +572,15 @@ async function _probeRegistryCandidates(serviceKey, { sessionId = null } = {}) {
       if (typeof bin === 'string') names = [pkg.split('/').pop()];
       else names = Object.keys(bin || {});
       if (!names.length) {
-        await _ptyNote(sessionId, `"${pkg}" exists on npm but it's a library (SDK), not a CLI — skipping`);
+        await _ptyNote(sessionId, `"${pkg}" exists on npm but it's a library (SDK), not a CLI`);
+        libHits.push({ cli: null, isLibrary: true, method: 'npm', pkg });
         continue;
       }
       npmHits.push({ cli: names[0], method: 'npm', pkg });
-    } catch (_) { /* non-JSON output */ }
+    } catch (_) {
+      // Unparseable but non-empty — conservative: a bin field exists.
+      npmHits.push({ cli: pkg.split('/').pop(), method: 'npm', pkg });
+    }
   }
   for (const formula of brewCandidates) {
     // _verifyPackageExists handles untapped tap refs (org/tap/formula) by
@@ -558,11 +594,28 @@ async function _probeRegistryCandidates(serviceKey, { sessionId = null } = {}) {
   if (hit) {
     await _ptyNote(sessionId, `found it: ${hit.method === 'brew' ? 'Homebrew' : 'npm'} package "${hit.pkg}" provides the ${hit.cli} command`);
     logger.info(`[cli.agent] registry probe ${serviceKey} → ${hit.method} ${hit.pkg} (cli: ${hit.cli})`);
-  } else {
-    await _ptyNote(sessionId, `nothing on npm or Homebrew for "${serviceKey}"`);
-    logger.info(`[cli.agent] registry probe ${serviceKey} → no CLI package in npm/brew`);
+    return hit;
   }
-  return hit;
+
+  // No CLI anywhere — but a same-named LIBRARY may exist. Returning it (instead
+  // of null) lets callers answer "it's a library, not a CLI" AND, critically,
+  // vetoes the open-web discovery that follows a bare null — that's how a
+  // generic name like "canvas" got resolved to canvasmedical.com's pip SDK.
+  if (libHits.length) {
+    const lib = libHits[0];
+    await _ptyNote(sessionId, `"${lib.pkg}" is a ${lib.method} library — no CLI binary to install`);
+    logger.info(`[cli.agent] registry probe ${serviceKey} → library, not CLI (${lib.method}:${lib.pkg})`);
+    return lib;
+  }
+  if (await _pypiPackageExists(serviceKey)) {
+    await _ptyNote(sessionId, `"${serviceKey}" exists on PyPI — a Python library, not a CLI`);
+    logger.info(`[cli.agent] registry probe ${serviceKey} → library, not CLI (pip:${serviceKey})`);
+    return { cli: null, isLibrary: true, method: 'pip', pkg: serviceKey };
+  }
+
+  await _ptyNote(sessionId, `nothing on npm, Homebrew, or PyPI for "${serviceKey}"`);
+  logger.info(`[cli.agent] registry probe ${serviceKey} → no CLI or library package found`);
+  return null;
 }
 
 /**
@@ -577,7 +630,7 @@ async function _webProbeInstall(serviceKey, { sessionId = null } = {}) {
     const webAgent = require('./web.agent.cjs');
     if (typeof webAgent.actionDiscoverSetup !== 'function') return null;
     await _ptyNote(sessionId, `nothing in the registries — searching the web for how "${serviceKey}" installs`);
-    const res = await webAgent.actionDiscoverSetup({ service: serviceKey, maxResults: 5 });
+    const res = await webAgent.actionDiscoverSetup({ service: serviceKey, expectedPkg: serviceKey, maxResults: 5 });
     if (!res?.ok || !res.setupInfo) {
       await _ptyNote(sessionId, `web: no install recipe found for "${serviceKey}"`);
       return null;
@@ -587,6 +640,19 @@ async function _webProbeInstall(serviceKey, { sessionId = null } = {}) {
     if (!m) return null;
     const method = m[1].startsWith('brew') ? 'brew' : m[1].startsWith('npm') ? 'npm' : 'pip';
     const pkg = m[2];
+    // Entity gate — scraped install commands must name THIS package (or a known
+    // <svc>-cli / cli-<svc> alias). A page telling you to install a differently
+    // named package is documentation for a DIFFERENT product that collides on
+    // the same word (observed: canvasmedical.com's docs said "pip install
+    // canvas" — unrelated Python SDK sharing npm canvas's name).
+    const norm = (s) => String(s || '').split('/').pop().toLowerCase().replace(/[^a-z0-9]/g, '');
+    const svc = norm(serviceKey), scraped = norm(pkg);
+    const aliasOk = scraped === svc || scraped === `${svc}cli` || scraped === `cli${svc}`;
+    if (!aliasOk) {
+      logger.warn(`[cli.agent] web probe suggested ${method}:${pkg} but package name doesn't match "${serviceKey}" — rejected (likely a name collision with a different product)`);
+      await _ptyNote(sessionId, `web: "${m[1]} ${pkg}" names a different package than "${serviceKey}" — rejected (name collision, probably a different product)`);
+      return null;
+    }
     await _ptyNote(sessionId, `web: official docs say "${m[1]} ${pkg}"${info.setupUrl ? ` (${info.setupUrl})` : ''} — verifying it's real before installing`);
     const verified = await _verifyPackageExists(method, pkg, { sessionId });
     if (!verified) {
@@ -608,10 +674,111 @@ async function _webProbeInstall(serviceKey, { sessionId = null } = {}) {
 }
 
 // Full ladder: registry candidates → web search → verified recipe or null.
+// A registry-classified LIBRARY (npm no-bin, PyPI module) returns directly —
+// the web is only consulted when NO registry knows the name. This is what
+// makes the "canvasmedical.com" class of bug unreachable: npm already told us
+// canvas is a library, so the entity-blind "canvas CLI install" web search
+// never fires.
 async function _findInstallableCli(serviceKey, { sessionId = null } = {}) {
   const probed = await _probeRegistryCandidates(serviceKey, { sessionId });
   if (probed) return probed;
   return await _webProbeInstall(serviceKey, { sessionId });
+}
+
+// ---------------------------------------------------------------------------
+// Library installs — npm/pip packages with no binary.
+// "Installed" for a library means require()/import resolves, not a binary on
+// PATH. npm libs go to ~/.thinkdrop/node-deps (resolvable via NODE_PATH from
+// any cwd — what "install globally" actually means for libraries); pip libs
+// use pip3 --user (user-site is already on sys.path).
+// ---------------------------------------------------------------------------
+async function _installLibrary({ method, pkg, sessionId = null } = {}) {
+  const { ensureNpm, NPM_DEP_DIR } = require('../skill-helpers/deps.cjs');
+
+  if (method === 'npm') {
+    await _ptyNote(sessionId, `"${pkg}" is an npm library (no CLI binary) — installing to ${NPM_DEP_DIR} so require('${pkg}') resolves everywhere`);
+    const r = await ensureNpm(pkg);
+    if (!r.ok) {
+      await _ptyNote(sessionId, `npm install of "${pkg}" failed: ${r.error}`);
+      return { ok: false, isLibrary: true, method, pkg, error: r.error };
+    }
+    // Visible proof in the shared terminal — PTY env carries NODE_PATH.
+    const v = await _ptyProbe(sessionId, `node -e "require('${pkg}'); console.log('require(${pkg}) resolved — v${r.version || '?'}')"`, { timeoutMs: 20000 });
+    const verified = v.used ? v.ok : true; // ensureNpm already probe-verified via spawn
+    await _ptyNote(sessionId, verified
+      ? `"${pkg}" v${r.version || '?'} installed — require('${pkg}') resolves from any directory`
+      : `"${pkg}" installed but the visible require() check failed`);
+    return {
+      ok: verified, isLibrary: true, method, pkg,
+      version: r.version, location: r.modulePath,
+      stdout: `npm library "${pkg}" installed to ${r.modulePath} (require()-resolvable via NODE_PATH)`,
+    };
+  }
+
+  if (method === 'pip' || method === 'pip3') {
+    const mod = pkg.replace(/-/g, '_');
+    await _ptyNote(sessionId, `"${pkg}" is a Python library — installing with pip3 install --user`);
+    let r = await _ptyVisibleExec(`cli.agent: install ${pkg}`, `pip3 install --user ${pkg}`, { timeoutMs: 240000, sessionId });
+    if (!r.used) r = await spawnCapture('pip3', ['install', '--user', pkg], { timeoutMs: 240000 });
+    if (!r.ok) return { ok: false, isLibrary: true, method, pkg, error: r.error || `pip3 install exited ${r.exitCode}` };
+    const v = await _probeCmd(sessionId, 'python3', ['-c', `import ${mod}`], { timeoutMs: 20000 });
+    if (!v.ok) return { ok: false, isLibrary: true, method, pkg, error: `installed but 'import ${mod}' fails — check the module name` };
+    await _ptyNote(sessionId, `"${pkg}" installed — import ${mod} works`);
+    return { ok: true, isLibrary: true, method, pkg, stdout: `python library "${pkg}" installed (--user) — 'import ${mod}' verified` };
+  }
+
+  return { ok: false, isLibrary: true, method, pkg, error: `no library install lane for method '${method}'` };
+}
+
+// Exact-name library check — does the EXACT package the user named exist as a
+// library (no bin) on npm / PyPI? Candidate expansion (<pkg>-cli etc.) is for
+// CLI discovery; an explicit "install the X package" intent means literally X
+// (npm's `canvas`, not the unrelated `canvas-cli` that also ships a `canvas` bin).
+async function _exactLibraryCheck(pkg, ecoHint, { sessionId = null } = {}) {
+  const tryNpm = async () => {
+    const r = await _probeCmd(sessionId, 'npm', ['view', pkg, 'bin', '--json']);
+    if (!r.ok) return null; // not on npm under this exact name
+    const out = (r.stdout || '').trim();
+    if (!out || out === 'undefined' || out === 'null') return { method: 'npm', pkg };
+    const m = out.match(/[\[{][\s\S]*/);
+    if (!m) return null; // string-form bin → it's a CLI
+    try {
+      const bin = JSON.parse(m[0]);
+      const n = typeof bin === 'string' ? (bin ? 1 : 0) : Object.keys(bin || {}).length;
+      return n === 0 ? { method: 'npm', pkg } : null;
+    } catch (_) { return null; }
+  };
+  const tryPip = async () => (await _pypiPackageExists(pkg) ? { method: 'pip', pkg } : null);
+  return ecoHint === 'pip'
+    ? (await tryPip()) || (await tryNpm())
+    : (await tryNpm()) || (await tryPip());
+}
+
+// Install-intent fast path — "install the <pkg> npm/pip package" has ONE
+// deterministic correct answer when the package is a library. Running it
+// through the CLI-agent pipeline guarantees failure: build_agent probes for a
+// binary that can never exist, then web-searches "X CLI" into name collisions.
+// Returns a result object when the task was a library install (handled or
+// errored), null when it isn't a library-install task.
+async function _tryLibraryInstallIntent(task, { sessionId = null } = {}) {
+  const t = String(task || '');
+  // "install|add|setup (the) <name> (npm|node|pip|python) (package|module|library)"
+  // or "npm install <name>" phrasing. Requires BOTH an ecosystem word and a
+  // package-noun, so "install the Zoom app" / "install ffmpeg" stay on the CLI lane.
+  const m = t.match(/\b(?:install|add|set\s?up|get)\s+(?:the\s+)?([a-z0-9@/_.-]+)\s+(npm|node\.?js|pip|python)\s+(?:package|module|library|dependency|dependencies)\b/i)
+    || t.match(/\b(?:install|add|set\s?up)\s+(?:the\s+)?(npm|node\.?js|pip|python)\s+(?:package|module|library|dependency|dependencies)\s+(?:called\s+|named\s+)?["']?([a-z0-9@/_.-]+)["']?\b/i)
+    || t.match(/\b(?:npm|pip3?|python3?)\s+(?:i|install)\s+(?:-g\s+|--global\s+|--user\s+)?["']?([a-z0-9@/_.-]+)["']?/i);
+  if (!m) return null;
+
+  // Pick the capture group that holds the package name (skip ecosystem words).
+  const pkg = (m[1] && !/^(npm|node\.?js|pip|python)$/i.test(m[1]) ? m[1] : m[2] || '').trim();
+  if (!pkg) return null;
+  const ecoHint = /\b(pip3?|python3?)\b/i.test(t) ? 'pip' : /\b(npm|node\.?js)\b/i.test(t) ? 'npm' : null;
+
+  const lib = await _exactLibraryCheck(pkg, ecoHint, { sessionId });
+  if (!lib) return null; // exact name is a CLI or unknown → normal lanes handle it
+  logger.info(`[cli.agent] library install intent: ${lib.method}:${lib.pkg} — installing as library, not CLI`);
+  return await _installLibrary({ method: lib.method, pkg: lib.pkg, sessionId });
 }
 
 
@@ -2097,6 +2264,7 @@ Rules:
 - DIAGNOSE before retry: a non-zero exit gets ONE cheap probe first — never re-run an unchanged failing command.
 - NEVER install a package whose name you have not verified — npm view <pkg> / brew info <pkg> / pip3 index versions <pkg> FIRST. A guessed name 404s; verify, then install.
 - Missing tool → install it (brew/npm/pip3 — whatever the tool's docs say), then verify with "command -v <bin>" or "<bin> --version" before done.
+- LIBRARIES vs CLIs: npm/pip packages with no binary are LIBRARIES — "command -v" and "--version" can never verify them. Libraries install via 'npm install --prefix "$HOME/.thinkdrop/node-deps" <pkg>' or 'pip3 install --user <pkg>', and verify with 'node -e "require('"'<pkg>'"')"' / 'python3 -c "import <mod>"'. 'npm i -g' does NOT put a library on the require() path.
 - Interactive/sudo/password prompts → pty_exec. If the screen asks for a password/passphrase/token, ask_user for the credential first — NEVER guess or invent one.
 - Prefer non-interactive flags/env over menu-driving when one exists (check run_help).
 - Never output done without a verification command's output proving the goal.
@@ -2104,6 +2272,16 @@ Rules:
 - Output JSON only. No prose before or after the object.`;
 
 async function _genericRunLoop({ task, cwd, env, timeoutMs, _progressCallbackUrl, _stepIndex }) {
+  // Library-install fast path — "install <pkg> npm/pip package" resolves
+  // deterministically through the registry probe + library lane; the CLI loop
+  // would probe for a binary that can never exist and then web-search into
+  // name collisions.
+  const _libResult = await _tryLibraryInstallIntent(task, { sessionId: null }).catch(() => null);
+  if (_libResult) {
+    logger.info(`[cli.agent] generic run resolved via library lane: ${task.slice(0, 80)} → ok=${_libResult.ok}`);
+    return { ..._libResult, agentId: 'cli.agent', task, agentTurns: 0, transcript: [{ action: 'library_install', observation: _libResult.stdout || _libResult.error }] };
+  }
+
   const MAX_TURNS = 12;
   const OBSERVATION_CHARS = 600;
   const RUN_HELP_CHARS = 3000;
@@ -3207,6 +3385,20 @@ async function actionBuildAgent({ service, cli, cliTool, force = false }) {
   // no CLI exists, probe PATH/npm/brew/taps, then the web, before believing it.
   if (!cliName) {
     const probed = await _findInstallableCli(serviceKey, { sessionId: ptySessionId });
+    if (probed?.isLibrary) {
+      // The package exists but ships no binary — it's a library, not a CLI.
+      // Install it through the library lane instead of hunting for a CLI
+      // (the old path web-searched "X CLI" and collided on unrelated products).
+      logger.info(`[cli.agent] build_agent: "${serviceKey}" is a ${probed.method} library — installing via library lane`);
+      const lib = await _installLibrary({ method: probed.method, pkg: probed.pkg, sessionId: ptySessionId });
+      return {
+        ...lib,
+        isLibrary: true, noCli: true, service: serviceKey, agentId,
+        error: lib.ok ? undefined : `"${serviceKey}" is a ${probed.method} library, not a CLI${lib.error ? ` — ${lib.error}` : ''}`,
+        sessionId: ptySessionId,
+        narration: await _readNarration(ptySessionId),
+      };
+    }
     if (probed) {
       logger.info(`[cli.agent] build_agent: meta claimed no CLI for "${serviceKey}" but registry probe found ${probed.pkg ? `${probed.method}:${probed.pkg}` : probed.path} — proceeding`);
       if (!probed.alreadyInstalled) {
@@ -3308,6 +3500,19 @@ async function actionBuildAgent({ service, cli, cliTool, force = false }) {
     // Last resort before declaring failure — probe the registries directly.
     // Covers the case where meta named a CLI but its pkg guess was wrong.
     const probed = await _findInstallableCli(serviceKey, { sessionId: ptySessionId });
+    if (probed?.isLibrary) {
+      // The name resolves to a library package — a CLI under this name cannot
+      // be installed; surface that instead of burning another install attempt.
+      logger.info(`[cli.agent] build_agent: "${serviceKey}" is a ${probed.method} library — no CLI to install`);
+      const lib = await _installLibrary({ method: probed.method, pkg: probed.pkg, sessionId: ptySessionId });
+      return {
+        ...lib,
+        isLibrary: true, noCli: true, service: serviceKey, agentId,
+        error: lib.ok ? undefined : `"${serviceKey}" is a ${probed.method} library, not a CLI${lib.error ? ` — ${lib.error}` : ''}`,
+        sessionId: ptySessionId,
+        narration: await _readNarration(ptySessionId),
+      };
+    }
     if (probed && !probed.alreadyInstalled && probed.pkg && probed.pkg !== meta?.pkg) {
       logger.info(`[cli.agent] build_agent: install failed — probing found alternative ${probed.method}:${probed.pkg}, retrying`);
       const installResult = await actionInstall({ cli: probed.cli, service, method: probed.method, pkg: probed.pkg, ptyLabel: `cli.agent: install ${probed.cli}`, ptySessionId });
@@ -4509,6 +4714,32 @@ async function actionPreflightCheck({ task, clis: explicitClis, agents: explicit
     }
 
     const binPath = await whichCli(cliName);
+
+    // System binaries (osascript, say, pbcopy…) ship with the OS — there is no
+    // install/auth ceremony, so mark them ready and skip auth probing entirely.
+    // (Observed: preflight on osascript → "auth unknown" → the agent went web-
+    // hunting for setup docs and stalled the task.) Only true system dirs —
+    // /usr/local/bin and /opt/homebrew are user-installed tools, not exempt.
+    if (binPath && /^\/(bin|sbin|usr\/bin|usr\/sbin)\//.test(binPath) && !meta.isOAuth && !meta.isApiKey) {
+      detectedClis.push({
+        service:       serviceKey,
+        cli:           cliName,
+        installed:     true,
+        binPath,
+        version:       'system',
+        authed:        true,
+        authStatus:    'not_required',
+        installMethod: null,
+        installPkg:    null,
+        tokenCmd:      null,
+        isApiKey:      false,
+        isOAuth:       false,
+        agentId:       entry._agentId || null,
+        setupInfo:     null,
+      });
+      return;
+    }
+
     if (!binPath) {
       detectedClis.push({
         service:       serviceKey,

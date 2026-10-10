@@ -226,6 +226,18 @@ function _scoreResult(result, preferDomain, opts = {}) {
                    && host.split('.')[0].length >= Math.ceil(pref.length * 0.6)
                    && pref.includes(host.split('.')[0]))) score += 20;
     }
+    // Entity-name overlap: a named target ("the Valley Forge Baptist Church
+    // website") should prefer the host that literally spells the entity —
+    // valleyforgebaptist.org over vfba.org, which generic signals can't
+    // distinguish. No preferDomain is needed for this to fire.
+    if (opts.query) {
+      const qWords = (String(opts.query).toLowerCase().match(/[a-z]{5,}/g) || [])
+        .filter(w => !/^(website|search|about|which|there|their|where|these|those|listed|summary|events|calendar)$/.test(w));
+      let hits = 0;
+      const flat = host.replace(/[^a-z]/g, '');
+      for (const w of qWords) if (flat.includes(w)) hits++;
+      if (hits >= 2) score += hits * 6;
+    }
     // Prefer reputable TLDs for dev/doc content
     if (host.endsWith('.org') || host.endsWith('.io') || host.endsWith('.dev')) score += 10;
     // Prefer official-looking subdomains
@@ -266,7 +278,7 @@ async function actionSearchAndNavigate({ query, preferDomain, maxResults = 5, li
 
   // Score all results, filter negatives
   const scored = results
-    .map(r => ({ ...r, _score: _scoreResult(r, preferDomain, { listing }) }))
+    .map(r => ({ ...r, _score: _scoreResult(r, preferDomain, { listing, query }) }))
     .filter(r => r._score >= 0)
     .sort((a, b) => b._score - a._score);
 
@@ -920,16 +932,49 @@ ${crawlResult.content.slice(0, 3500)}`;
  *
  * @param {string} service   - service name (e.g. "gcalcli", "github")
  * @param {string} [cliTool] - CLI tool name (e.g. "gcalcli", "gh")
+ * @param {string} [ecosystem] - known package ecosystem ('npm'|'brew'|'pip') — biases the query + scoring
+ * @param {string} [expectedPkg] - the package identity we're installing; extracted
+ *          installCmds naming a DIFFERENT package are rejected (name collision
+ *          with a different product — e.g. docs for a same-named SDK)
  * @param {number} [maxResults=5]
  * @returns {Promise<{ok, setupInfo, sources}>}
  */
-async function actionDiscoverSetup({ service, cliTool, maxResults = 5 }) {
+// Package-registry hosts are authoritative for install commands — far more
+// trustworthy than <name>.com guessing (canvasmedical.com beat npmjs.com once
+// purely on domain-name similarity for the wrong product).
+const _REGISTRY_HOST_RE = /(^|\.)(npmjs\.com|pypi\.org|formulae\.brew\.sh|github\.com|crates\.io|rubygems\.org|packagist\.org|nuget\.org|libhunt\.com|libraries\.io)$/;
+function _registryHostBonus(url) {
+  try {
+    const host = new URL(url).hostname.replace(/^www\./, '');
+    return _REGISTRY_HOST_RE.test(host) ? 25 : 0;
+  } catch (_) { return 0; }
+}
+
+// Package-name matcher for entity checking — strips scope, compares basename,
+// accepts <svc>-cli / cli-<svc> / @<svc>/* aliases.
+function _pkgNameMatches(pkgRaw, wantRaw) {
+  const norm = (s) => String(s || '').replace(/^@[\w.-]+\//, '').split('/').pop().toLowerCase().replace(/[^a-z0-9]/g, '');
+  const want = norm(wantRaw);
+  if (!want) return true; // no expectation — accept anything
+  const raw = String(pkgRaw || '').toLowerCase();
+  if (raw.startsWith(`@${want}/`)) return true;
+  const p = norm(raw);
+  return p === want || p === `${want}cli` || p === `cli${want}`;
+}
+function _pkgOfInstallCmd(cmd) {
+  const m = String(cmd || '').match(/(?:install|add)\s+(?:-g\s+|--global\s+|--user\s+)?([\w/.@-]+)/i);
+  return m ? m[1] : '';
+}
+
+async function actionDiscoverSetup({ service, cliTool, ecosystem = null, expectedPkg = null, maxResults = 5 }) {
   if (!service && !cliTool) {
     return { ok: false, error: 'service or cliTool is required' };
   }
 
   const tool = cliTool || service;
-  const searchQuery = `${tool} CLI install authenticate setup guide official documentation`;
+  const searchQuery = ecosystem
+    ? `${tool} ${ecosystem} package install setup documentation`
+    : `${tool} CLI install authenticate setup guide official documentation`;
   logger.info(`[web.agent] discover_setup: searching for "${searchQuery.slice(0, 80)}"`);
 
   const searchResult = await searchWeb(searchQuery, maxResults);
@@ -942,10 +987,10 @@ async function actionDiscoverSetup({ service, cliTool, maxResults = 5 }) {
     return { ok: false, error: 'No search results found', setupInfo: null };
   }
 
-  // Score results — prefer official documentation domains
+  // Score results — prefer official documentation + package-registry hosts
   const preferDomain = `${service}.com`;
   const scored = results
-    .map(r => ({ ...r, _score: _scoreResult(r, preferDomain) }))
+    .map(r => ({ ...r, _score: _scoreResult(r, preferDomain) + _registryHostBonus(r.url) }))
     .filter(r => r._score >= 0)
     .sort((a, b) => b._score - a._score);
 
@@ -957,16 +1002,23 @@ async function actionDiscoverSetup({ service, cliTool, maxResults = 5 }) {
   const allSnippets = scored.map(r => r.snippet || '').join(' ');
   const allText = `${scored.map(r => `${r.title} ${r.snippet}`).join(' ')} `.toLowerCase();
 
-  // Install command patterns
+  // Install command patterns — entity-matched: only accept commands naming
+  // the expected package. A command for a differently named package is a
+  // DIFFERENT product's install line scraped off a colliding docs page.
+  const wantPkg = expectedPkg || tool;
   const installPatterns = [
     { regex: /(?:brew install|pip install|npm install -g|pipx install)\s+[\w/.@-]+/gi, field: 'installCmd' },
     { regex: /(?:apt-get install|apt install|snap install)\s+[\w/.@-]+/gi, field: 'installCmd' },
   ];
   for (const { regex, field } of installPatterns) {
-    const m = allSnippets.match(regex);
-    if (m && m[0] && !setupInfo[field]) {
-      setupInfo[field] = m[0].trim();
+    const matches = allSnippets.match(regex) || [];
+    const pick = matches.find(c => _pkgNameMatches(_pkgOfInstallCmd(c), wantPkg));
+    if (pick && !setupInfo[field]) {
+      setupInfo[field] = pick.trim();
       break;
+    }
+    if (matches.length && !pick) {
+      logger.info(`[web.agent] discover_setup: dropped ${matches.length} installCmd candidate(s) naming other packages (${matches.map(_pkgOfInstallCmd).join(', ')}) — expected "${wantPkg}"`);
     }
   }
 
@@ -1009,9 +1061,10 @@ async function actionDiscoverSetup({ service, cliTool, maxResults = 5 }) {
         logger.info(`[web.agent] discover_setup: snippets had no installCmd — crawled ${bestResult.url} (${crawl.content.length} chars)`);
         for (const { regex, field } of installPatterns) {
           regex.lastIndex = 0;
-          const m = crawl.content.match(regex);
-          if (m && m[0] && !setupInfo[field]) {
-            setupInfo[field] = m[0].trim();
+          const matches = crawl.content.match(regex) || [];
+          const pick = matches.find(c => _pkgNameMatches(_pkgOfInstallCmd(c), wantPkg));
+          if (pick && !setupInfo[field]) {
+            setupInfo[field] = pick.trim();
             break;
           }
         }

@@ -70,7 +70,11 @@ function openSession(opts = {}) {
   const cols = opts.cols || 120;
   const rows = opts.rows || 30;
   const sh = opts.shell ? { cmd: opts.shell, argv: opts.argv || [] } : defaultShell();
-  const env = { ...process.env, TERM: 'xterm-256color', COLORTERM: 'truecolor', CLICOLOR: '1', ...(opts.env || {}) };
+  // NODE_PATH makes rail-installed node libraries (~/.thinkdrop/node-deps)
+  // resolvable via require() in every PTY session — the actual "installed
+  // globally" semantic; `npm i -g` alone never puts packages on the require path.
+  const _depEnv = (() => { try { return require('../skill-helpers/deps.cjs').withNodePath({}); } catch (_) { return {}; } })();
+  const env = { ...process.env, ..._depEnv, TERM: 'xterm-256color', COLORTERM: 'truecolor', CLICOLOR: '1', ...(opts.env || {}) };
   const cwd = opts.cwd || os.homedir();
 
   // Seatbelt wrap — deny file-write* on protected paths at the kernel
