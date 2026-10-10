@@ -16,6 +16,9 @@
  *   timeoutMs     {number}  — navigation + stabilise timeout (default: 20000)
  *   waitMs        {number}  — extra settle wait after navigation (default: 1500)
  *   extractLinks  {boolean} — extract <a href> links (default: false)
+ *   follow        {string}  — intent: after crawling, pick the same-domain
+ *                  link that best matches this goal and crawl it instead
+ *                  (e.g. "calendar events" lands on /calendar). One hop only.
  *   extractItems  {boolean} — extract structured page cards via shared utility (default: false)
  *   extractMedia  {boolean} — also extract video/media items (implies extractItems; default: false)
  *
@@ -66,8 +69,11 @@ function cliRun(args, timeoutMs = 20000) {
     let stdout = '';
     let stderr = '';
 
+    // TMPDIR=/tmp keeps the per-session unix socket path short —
+    // /var/folders/.../playwright-cli/<hash>/<sid>.sock exceeds macOS's
+    // ~104-byte unix socket limit (listen EINVAL) with our session names.
     const proc = spawn(CLI_BIN, args, {
-      env: { ...process.env },
+      env: { ...process.env, TMPDIR: '/tmp' },
       timeout: timeoutMs,
     });
 
@@ -101,22 +107,26 @@ function extractTitleFromText(text) {
 //   <return value here>
 // We want just the return value after the closing ```.
 function unwrapEvalResult(stdout) {
-  const s = stdout || '';
+  let s = stdout || '';
 
-  // Strip the "### Ran Playwright code\n```js\n...\n```\n" header block
-  // and return everything after the closing fence
+  // playwright-cli prints "### Result\n<value>\n### Ran Playwright code\n```..."
+  // — the code block comes AFTER the result. Cut it first, then take the
+  // Result section. (Observed: lastIndexOf('```') landed past the JSON and the
+  // fallback regex then swallowed code like `a[href]` → links parsed as null.)
+  const ranIdx = s.indexOf('### Ran Playwright code');
+  if (ranIdx !== -1) s = s.slice(0, ranIdx);
+
+  // "### Result" section
+  const resIdx = s.search(/^#+\s*Result/m);
+  if (resIdx !== -1) {
+    return s.slice(resIdx).split('\n').slice(1).join('\n').trim();
+  }
+
+  // Older format: code block FIRST, value after the closing fence
   const fenceEnd = s.lastIndexOf('```');
   if (fenceEnd !== -1) {
     const afterFence = s.slice(fenceEnd + 3).trim();
     if (afterFence.length > 0) return afterFence;
-  }
-
-  // Fallback: look for "Result" header
-  const lines = s.split('\n');
-  for (let i = 0; i < lines.length; i++) {
-    if (/^#+\s*Result/i.test(lines[i].trim()) || lines[i].trim() === 'Result') {
-      return lines.slice(i + 1).join('\n').trim();
-    }
   }
 
   return s.trim();
@@ -144,6 +154,13 @@ function _badCrawlReason(res, extractItems) {
     return { reason: `error-page title: "${title.slice(0, 80)}"`, signature: true };
   }
   const len = res.contentLength || (res.content || '').length;
+  // Empty/near-empty extraction — the page loaded but produced no text (JS
+  // render didn't settle, extraction returned nothing). Previously this
+  // passed as ok and a landing-page follow hop saw zero links (observed:
+  // vfba.org crawled to 0 chars and the task summarized an empty page).
+  if (len < 200) {
+    return { reason: `empty extraction (${len} chars — page may not have rendered)`, signature: true };
+  }
   if (len < 1500 && _ERROR_PAGE_RE.test((res.content || '').slice(0, 500))) {
     return { reason: `error-page signature in thin content (${len} chars)`, signature: true };
   }
@@ -176,7 +193,10 @@ async function _crawlOnce(normalizedUrl, { maxChars, timeoutMs, effectiveWaitMs,
     : `_crawl_${crypto.createHash('md5').update(normalizedUrl).digest('hex').slice(0, 8)}_${_runId}`;
   const S = warm
     ? [`-s=${sessionId}`, '--headed', '--browser=chrome', `--profile=${path.join(os.homedir(), '.thinkdrop', 'browser-profiles', '_crawl_warm')}`]
-    : [`-s=${sessionId}`];
+    // Headless must use real Chrome — the bundled `chromium` browser isn't
+    // installed on this machine, so bare `-s=` sessions open nothing and every
+    // extraction silently returns 0 chars (forcing the warm retry each time).
+    : [`-s=${sessionId}`, '--browser=chrome'];
 
   progress(`Opening ${warm ? 'headed Chrome (warm retry)' : 'browser'} and navigating to ${normalizedUrl}`);
 
@@ -206,6 +226,16 @@ async function _crawlOnce(normalizedUrl, { maxChars, timeoutMs, effectiveWaitMs,
     const rawTitle = unwrapEvalResult(titleRes.stdout).replace(/^["']|["']$/g, '').trim();
     const title = rawTitle && rawTitle.length > 2 && rawTitle.length < 200 ? rawTitle : null;
 
+    // Redirect hops (google.com/goto, bit.ly…) leave `url` as the requested
+    // URL — the same-domain link filter in _followLink would then reject every
+    // real link. Report the page's actual location.
+    let landedUrl = normalizedUrl;
+    try {
+      const locRes = await cliRun([...S, 'eval', '() => location.href'], 8000);
+      const loc = unwrapEvalResult(locRes.stdout).replace(/^["']|["']$/g, '').trim();
+      if (/^https?:\/\//.test(loc)) landedUrl = loc;
+    } catch (_) {}
+
     // Step 4: Extract full rendered text
     const evalExpr = `() => (document.body ? (document.body.innerText || document.body.textContent || '') : '').slice(0, ${Math.min(maxChars * 2, 80000)})`;
     const textRes = await cliRun([...S, 'eval', evalExpr], timeoutMs);
@@ -225,6 +255,9 @@ async function _crawlOnce(normalizedUrl, { maxChars, timeoutMs, effectiveWaitMs,
     const contentLength = rawText.length;
 
     progress(`Crawl complete — ${contentLength} chars extracted${truncated ? ' (truncated)' : ''}`);
+    if (contentLength === 0) {
+      progress(`[debug] headless eval empty — nav ok=${navRes.ok} code=${navRes.exitCode} | titleEval code=${titleRes.exitCode} err=${(titleRes.stderr||'').slice(0,160)} | textEval code=${textRes.exitCode} out=${(textRes.stdout||'').slice(0,160)} err=${(textRes.stderr||'').slice(0,160)}`);
+    }
 
     // Step 5: Optionally extract <a href> links from the page
     let links = null;
@@ -286,7 +319,7 @@ async function _crawlOnce(normalizedUrl, { maxChars, timeoutMs, effectiveWaitMs,
 
     return {
       ok: true,
-      url: normalizedUrl,
+      url: landedUrl,
       title: title || extractTitleFromText(content),
       content,
       contentLength,
@@ -327,6 +360,7 @@ async function webCrawl(args) {
     extractItems = false,
     extractMedia = false,
     hidden = false,
+    follow = null,
     onProgress = null,
   } = args || {};
 
@@ -356,6 +390,9 @@ async function webCrawl(args) {
     if (typeof onProgress === 'function') onProgress(msg);
   };
 
+  // follow implies links — the discovery hop needs the page's link table.
+  const wantLinks = extractLinks || !!follow;
+
   let lastRes = null;
   let lastBad = null;
   for (let attempt = 0; attempt < candidates.length; attempt++) {
@@ -363,12 +400,20 @@ async function webCrawl(args) {
     if (attempt > 0) progress(`Retrying fallback URL ${attempt + 1}/${candidates.length}: ${candidate}`);
 
     const res = await _crawlOnce(candidate, {
-      maxChars, timeoutMs, effectiveWaitMs, extractLinks, extractItems: wantItems, progress, startTime,
+      maxChars, timeoutMs, effectiveWaitMs, extractLinks: wantLinks, extractItems: wantItems, progress, startTime,
     });
     lastRes = res;
 
     const bad = _badCrawlReason(res, wantItems);
     if (!bad) {
+      // Discovery hop — the caller asked for content that typically lives on a
+      // subpage (e.g. "calendar events" → /calendar). Pick the best same-domain
+      // link by intent and crawl it once. Returns the subpage's content with
+      // provenance; on no-match, keep the landing page.
+      if (follow && Array.isArray(res.links) && res.links.length) {
+        const followed = await _followLink(res, follow, { maxChars, timeoutMs, effectiveWaitMs, progress, startTime });
+        if (followed) return { ...followed, elapsedMs: Date.now() - startTime, attempts: attempt + 1 };
+      }
       return { ...res, elapsedMs: Date.now() - startTime, attempts: attempt + 1 };
     }
     lastBad = bad;
@@ -386,10 +431,14 @@ async function webCrawl(args) {
   if (lastBad && lastBad.signature && !hidden) {
     progress(`All headless attempts blocked — warm retry in headed Chrome: ${candidates[0]}`);
     const warmRes = await _crawlOnce(candidates[0], {
-      maxChars, timeoutMs, effectiveWaitMs, extractLinks, extractItems: wantItems, progress, startTime, warm: true,
+      maxChars, timeoutMs, effectiveWaitMs, extractLinks: wantLinks, extractItems: wantItems, progress, startTime, warm: true,
     });
     const warmBad = _badCrawlReason(warmRes, wantItems);
     if (!warmBad) {
+      if (follow && Array.isArray(warmRes.links) && warmRes.links.length) {
+        const followed = await _followLink(warmRes, follow, { maxChars, timeoutMs, effectiveWaitMs, progress, startTime });
+        if (followed) return { ...followed, elapsedMs: Date.now() - startTime, attempts: candidates.length + 1, warmRetry: true };
+      }
       return { ...warmRes, elapsedMs: Date.now() - startTime, attempts: candidates.length + 1, warmRetry: true };
     }
     // Still rejected with an error-page signature → honest failure so the
@@ -429,6 +478,79 @@ async function webCrawl(args) {
   // Rejections were thin-page only (no error signature) — legitimately sparse
   // pages. Return the last result as ok so content stays usable.
   return { ...lastRes, elapsedMs: Date.now() - startTime, attempts: candidates.length, rejectedReason: lastBad?.reason || null };
+}
+
+// ── Discovery hop ────────────────────────────────────────────────────────────
+// follow intent: the user asked for content that usually lives on a subpage
+// ("calendar events on the church site" → /calendar). The landing page was
+// crawled already; pick the one same-domain link most likely to hold the
+// target and crawl it. One hop only — deeper traversal is the planner's job.
+async function _followLink(res, intent, { maxChars, timeoutMs, effectiveWaitMs, progress, startTime }) {
+  try {
+    const baseHost = new URL(res.url).hostname;
+    const curClean = res.url.replace(/#.*$/, '').replace(/\/$/, '');
+    const links = (res.links || []).filter(l => {
+      try {
+        const u = new URL(l.href);
+        return u.hostname === baseHost
+          && l.href.replace(/#.*$/, '').replace(/\/$/, '') !== curClean;
+      } catch (_) { return false; }
+    });
+    if (!links.length) return null;
+
+    // Deterministic keyword pass first — nav links are labeled ("Calendar",
+    // "Events", "/events/"), so intent-word overlap is more reliable than a
+    // small-model pick that can grab an unrelated section ("Current Families").
+    const STOP = new Set(['the', 'and', 'for', 'with', 'that', 'this', 'what', 'want', 'know', 'from', 'give', 'have', 'there', 'their', 'about', 'listed', 'website', 'site', 'summary', 'month', 'coming', 'them']);
+    const words = new Set(
+      String(intent).toLowerCase().match(/[a-z]{3,}/g).filter(w => !STOP.has(w))
+    );
+    const score = (l) => {
+      const t = `${l.text || ''} ${l.href || ''}`.toLowerCase();
+      let s = 0;
+      for (const w of words) if (t.includes(w)) s += 2;
+      return s;
+    };
+    let pick = null;
+    let best = 0;
+    for (const l of links.slice(0, 200)) {
+      const s = score(l);
+      if (s > best) { best = s; pick = l; }
+    }
+    if (pick && best >= 2) {
+      progress(`follow: "${intent.slice(0, 60)}" → ${pick.href} (keyword match)`);
+    } else {
+      pick = null;
+      const shortlist = links.slice(0, 40);
+      const { ask } = require('../skill-helpers/skill-llm.cjs');
+      const pickRaw = await ask(
+        `The user wants: "${intent}". The page "${res.title || res.url}" was fetched but is a landing/index page — the target content likely lives on a subpage.\n` +
+        `Pick the ONE link most likely to lead to it. Reply with ONLY the number, or "none" if no link matches.\n\n` +
+        shortlist.map((l, i) => `${i + 1}. ${String(l.text || '').trim() || '(no label)'} — ${l.href}`).join('\n'),
+        { maxTokens: 12, temperature: 0, taskType: 'link_pick' }
+      );
+      const idx = parseInt(String(pickRaw || '').trim(), 10);
+      if (Number.isInteger(idx) && idx >= 1 && idx <= shortlist.length) pick = shortlist[idx - 1];
+      if (!pick) {
+        progress(`follow: no subpage link matched "${intent.slice(0, 60)}" — keeping landing page`);
+        return null;
+      }
+      progress(`follow: "${intent.slice(0, 60)}" → ${pick.href}`);
+    }
+    const target = pick.href;
+    const sub = await _crawlOnce(target, { maxChars, timeoutMs, effectiveWaitMs, extractLinks: false, extractItems: false, progress, startTime });
+    if (!sub || !sub.ok) return null;
+    return {
+      ...sub,
+      followedFrom: res.url,
+      followedLink: { href: target, text: pick.text || '' },
+      landingTitle: res.title || null,
+      landingContent: res.content ? res.content.slice(0, 1500) : null,
+    };
+  } catch (e) {
+    logger.warn(`[web.crawl] follow hop failed: ${e.message}`);
+    return null;
+  }
 }
 
 module.exports = { webCrawl };

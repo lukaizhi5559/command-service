@@ -75,6 +75,19 @@ async function screenDisplay(args = {}) {
     return { ok: false, error: `unknown action "${action}" — use display|clear` };
   }
 
+  // Plan steps carry scene js via {{synthesisAnswer}} — synthesized code often
+  // arrives fenced (```js … ```) or with a leading comment; strip the wrapper
+  // so the sandboxed build() gets a raw function body.
+  if (args.scene && typeof args.scene.js === 'string') {
+    args = {
+      ...args,
+      scene: {
+        ...args.scene,
+        js: args.scene.js.replace(/^\s*```(?:js|javascript|jsx)?\s*\n?/i, '').replace(/\n?\s*```\s*$/i, '').trim(),
+      },
+    };
+  }
+
   let normalizeScreenOutput;
   try {
     ({ normalizeScreenOutput } = require('../../../../shared/screen-output.cjs'));
