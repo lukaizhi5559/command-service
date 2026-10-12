@@ -36,6 +36,10 @@ const termKnowledge = require('../terminal/knowledge.cjs');
 // Import shared database module
 const { withDb, resetDbCache, AGENTS_DB_PATH, AGENTS_DIR } = require('@thinkdrop/agents-db');
 
+// macOS Local Network (TCC) denial probe — distinguishes "no devices found"
+// caused by a missing OS permission from real auth/setup problems.
+const { probeLocalNetwork, LAN_DENIAL_RE, LAN_BLOCK_GUIDANCE } = require('../skill-helpers/lan-probe.cjs');
+
 // Subset of ALLOWED_COMMANDS that are script interpreters (accept -c or -e flag)
 const _SHELL_INTERPRETERS = new Set(
   [...SHELL_ALLOWED_COMMANDS].filter(cmd =>
@@ -1996,6 +2000,20 @@ async function actionRun({ cli, argv = [], cwd, env, timeoutMs, stdin, agentId, 
               observation = `exitCode=${cmdResult.exitCode} stdout="${cmdResult.stdout.slice(0, 300)}" stderr="${summarizeStderr(cmdResult.stderr, 200)}"`;
             }
           }
+          // ── Local Network denial detection ────────────────────────────────
+          // LAN-errno / discovery-empty signatures (EHOSTUNREACH, "No devices
+          // found") may mean macOS denied this app's Local Network permission
+          // rather than a real command error. Confirm via kernel probe and
+          // tell the LLM to surface the fix instead of retrying flags.
+          if (LAN_DENIAL_RE.test(`${cmdResult.stdout || ''} ${cmdResult.stderr || ''}`)) {
+            try {
+              const _lan = await probeLocalNetwork();
+              if (_lan.ok === false) {
+                observation = `[ENVIRONMENT: local-network-blocked] This app's macOS Local Network permission is denied — LAN sends fail with "No route to host" (${_lan.reason}). This is NOT a command or flag problem; retrying cannot fix it. Your next action MUST be ask_user — tell the user: ${LAN_BLOCK_GUIDANCE}\n${observation}`;
+                logger.info(`[cli.agent] loop turn=${turn} LAN probe refused (${_lan.reason}) — Local Network permission likely denied`, { agentId });
+              }
+            } catch (_) {}
+          }
           // ── Loop guard ────────────────────────────────────────────────────
           // Detect exact-argv repeat failures and excessive total failures so
           // the LLM changes approach or asks the user instead of burning turns.
@@ -2519,6 +2537,20 @@ async function _genericRunLoop({ task, cwd, env, timeoutMs, _progressCallbackUrl
 
       } else {
         observation = `unknown action: ${action.action} — valid: run_shell, run_cmd, run_help, pty_exec, pty_send, web_search, web_fetch, done, ask_user`;
+      }
+
+      // Local Network denial — LAN-errno signatures in a command observation
+      // may be macOS refusing this app's Local Network permission, not a real
+      // command error. Confirm via kernel probe and redirect the loop.
+      if (['run_shell', 'run_cmd', 'pty_exec'].includes(action.action)
+          && LAN_DENIAL_RE.test(observation)) {
+        try {
+          const _lan = await probeLocalNetwork();
+          if (_lan.ok === false) {
+            observation = `[ENVIRONMENT: local-network-blocked] This app's macOS Local Network permission is denied — LAN sends fail with "No route to host" (${_lan.reason}). NOT a command problem; retrying cannot fix it. Your next action MUST be ask_user — tell the user: ${LAN_BLOCK_GUIDANCE}\n${observation}`;
+            logger.info(`[cli.agent] generic loop turn=${turn} LAN probe refused (${_lan.reason})`, { task: String(task).slice(0, 60) });
+          }
+        } catch (_) {}
       }
 
       loopHistory.push({ turn, ...action, observation: observation.slice(0, OBSERVATION_CHARS) });
@@ -3157,7 +3189,7 @@ What external primary inputs does "${cliName}" require that a user's natural-lan
   return _inferPreStepsFallback(cliName, helpText);
 }
 
-async function buildDescriptorMd({ id, service, cliName, version, capabilities, helpText, subcommandMap, llmExtraction }) {
+async function buildDescriptorMd({ id, service, cliName, version, capabilities, helpText, subcommandMap, llmExtraction, setupInfo }) {
   const capYaml = capabilities.map(c => `  - ${c}`).join('\n');
 
   // Generate usage playbook from capabilities and subcommandMap
@@ -3191,7 +3223,12 @@ async function buildDescriptorMd({ id, service, cliName, version, capabilities, 
     '',
     `## Instructions`,
     `Use \`${cliName}\` CLI for all ${service} operations.`,
-    `Authentication is persistent after the first \`${cliName} auth login\` (or equivalent).`,
+    // Only claim an auth flow when one was actually discovered in --help —
+    // the unconditional `${cli} auth login` boilerplate produced descriptors
+    // for no-auth tools (catt) that sent users hunting for nonexistent logins.
+    (setupInfo && (setupInfo.authCmd || setupInfo.initCmd || setupInfo.credentials))
+      ? `Authentication is persistent after the first \`${setupInfo.authCmd || setupInfo.initCmd || `${cliName} auth login`}\` (or equivalent).`
+      : `No account authentication is required — \`${cliName}\` operates entirely on this machine / local network.`,
     `Always use \`run_help\` to check flag syntax before running unfamiliar commands.`,
   ];
 
@@ -3549,6 +3586,11 @@ async function actionBuildAgent({ service, cli, cliTool, force = false }) {
     ? llmExtraction.capabilities
     : inferCapabilities(discovery.help || '', meta);
 
+  // Discover whether the CLI actually exposes an auth/init surface so the
+  // descriptor doesn't claim a `<cli> auth login` flow that doesn't exist.
+  let _buildSetupInfo = null;
+  try { _buildSetupInfo = await discoverSetupFromHelp(discovery.binPath, cliName); } catch (_) {}
+
   const descriptor   = await buildDescriptorMd({
     id: agentId,
     service: serviceKey,
@@ -3558,6 +3600,7 @@ async function actionBuildAgent({ service, cli, cliTool, force = false }) {
     helpText: discovery.help,
     subcommandMap: discovery.subcommandMap,
     llmExtraction,
+    setupInfo: _buildSetupInfo,
   });
 
   // Proactively register CLI in shell.run's user allowlist so shell.run can
@@ -4514,7 +4557,7 @@ async function checkAuthStatus(binPath, tokenCmd, timeoutMs = 8000, serviceKey =
     const isHelpText = /^usage:|--help|show this help/i.test(r.stdout.trim());
     if (isHelpText) {
       logger.info(`[cli.agent] checkAuthStatus: ${serviceKey || '?'} exit 0 but output is help text → unknown`);
-      return { authed: null, authStatus: 'unknown', authUser: null };
+      return { authed: null, authStatus: 'unknown', authUser: null, evidence: (r.stdout + ' ' + r.stderr).slice(-400) };
     }
     // Resolve authenticated user identity if we have a service-specific command
     let authUser = null;
@@ -4532,13 +4575,13 @@ async function checkAuthStatus(binPath, tokenCmd, timeoutMs = 8000, serviceKey =
         logger.debug(`[cli.agent] checkAuthStatus: ${serviceKey} identity resolution failed: ${idErr.message}`);
       }
     }
-    return { authed: tokenLike, authStatus: tokenLike ? 'authenticated' : 'no_token_returned', authUser };
+    return { authed: tokenLike, authStatus: tokenLike ? 'authenticated' : 'no_token_returned', authUser, evidence: tokenLike ? undefined : (r.stdout + ' ' + r.stderr).slice(-400) };
   }
   // Non-zero exit
   if (AUTH_FAILURE_PATTERNS.test(combined)) {
     return { authed: false, authStatus: 'not_authenticated', authUser: null };
   }
-  return { authed: null, authStatus: 'unknown', authUser: null };
+  return { authed: null, authStatus: 'unknown', authUser: null, evidence: (r.stdout + ' ' + r.stderr).slice(-400) };
 }
 
 // Parse a JSON array from a raw LLM string (handles markdown fences)
@@ -4775,9 +4818,23 @@ async function actionPreflightCheck({ task, clis: explicitClis, agents: explicit
     }
     const _effectiveTokenCmd = meta.tokenCmd || _earlySetupInfo?.verifyCmd || null;
 
-    let authResult = _effectiveTokenCmd
+    // Only run the live verify probe when the CLI actually HAS an auth
+    // surface. A discovered "verify" subcommand on a no-auth tool reports
+    // nothing about login (e.g. `catt status` → playback info) and can cost
+    // seconds of network discovery — it blew the 5s preflight timeout and
+    // surfaced as "agent did not complete preflight". KNOWN_CLI_MAP tokenCmds
+    // always probe (they exist to check auth); discovered verifyCmds only
+    // probe when --help exposed auth/init/credential commands.
+    const _hasAuthSurface = !!(meta.tokenCmd || meta.isOAuth || meta.isApiKey
+      || _earlySetupInfo?.authCmd || _earlySetupInfo?.initCmd
+      || (Array.isArray(_earlySetupInfo?.credentials) && _earlySetupInfo.credentials.length));
+
+    let authResult = _effectiveTokenCmd && _hasAuthSurface
       ? await checkAuthStatus(binPath, _effectiveTokenCmd, 8000, serviceKey)
       : { authed: null, authStatus: 'no_auth_check', authUser: null };
+    if (_effectiveTokenCmd && !_hasAuthSurface) {
+      logger.info(`[cli.agent] preflight_check: ${cliName} — skipping verify probe (no auth surface in --help)`);
+    }
 
     // ── Post-verify credential expiry guard ──
     // If verify says authenticated, check credential file for token expiry.
@@ -4853,6 +4910,38 @@ async function actionPreflightCheck({ task, clis: explicitClis, agents: explicit
       _finalSetupInfo = { ...(_helpSetupInfo || {}), ...((meta.setupInfo || {})) };
     }
 
+    // ── Local Network (macOS TCC) denial check ──────────────────────────────
+    // A verify probe that died with LAN-errno or discovery-empty output may
+    // reflect the app's missing Local Network permission rather than auth or
+    // device state. The live kernel probe is authoritative — 'No devices
+    // found' is only blamed on permission when LAN sends are actually refused.
+    let _localNetworkBlocked = false;
+    if (authResult.evidence && LAN_DENIAL_RE.test(authResult.evidence)) {
+      try {
+        const _lan = await probeLocalNetwork();
+        if (_lan.ok === false) {
+          _localNetworkBlocked = true;
+          logger.info(`[cli.agent] preflight_check: ${cliName} LAN probe refused (${_lan.reason}) — Local Network permission likely denied`);
+        }
+      } catch (_) {}
+    }
+
+    // ── No-auth-surface reclassification ────────────────────────────────────
+    // An inconclusive verify probe on a CLI whose --help surfaced no
+    // auth/init/credential commands means the tool needs no account
+    // authentication (e.g. catt talks to Chromecast devices, not a login).
+    // Don't park the task on a nonexistent auth flow — setupInfo===null stays
+    // blocked (nothing was discovered at all), so this can't mask real
+    // auth-required tools.
+    const _INCONCLUSIVE = new Set(['unknown', 'no_auth_check', 'no_token_returned']);
+    if (_INCONCLUSIVE.has(_finalAuthStatus) && _finalSetupInfo
+        && !_finalSetupInfo.authCmd && !_finalSetupInfo.initCmd
+        && !_finalSetupInfo.credentials && !meta.isOAuth && !meta.isApiKey) {
+      _finalAuthStatus = 'not_required';
+      authResult.authed = true;
+      logger.info(`[cli.agent] preflight_check: ${cliName} inconclusive probe + no auth surface in --help → not_required`);
+    }
+
     detectedClis.push({
       service:       serviceKey,
       cli:           cliName,
@@ -4862,6 +4951,7 @@ async function actionPreflightCheck({ task, clis: explicitClis, agents: explicit
       authed:        authResult.authed,
       authStatus:    _finalAuthStatus,
       authUser:      authResult.authUser || null,
+      localNetworkBlocked: _localNetworkBlocked,
       installMethod: meta.method,
       installPkg:    meta.pkg,
       installUrl:    meta.installUrl || null,
@@ -4904,6 +4994,12 @@ async function actionPreflightCheck({ task, clis: explicitClis, agents: explicit
     }
     if (c.authStatus === 'token_expired') {
       return `${c.cli} (${c.service}): installed (${c.version}) — TOKEN EXPIRED (re-authentication required)`;
+    }
+    if (c.authStatus === 'not_required') {
+      const lanNote = c.localNetworkBlocked
+        ? ' — ⚠ LOCAL NETWORK ACCESS BLOCKED (enable this app in System Settings → Privacy & Security → Local Network)'
+        : '';
+      return `${c.cli} (${c.service}): installed (${c.version}) — no auth required ✓${lanNote}`;
     }
     return `${c.cli} (${c.service}): installed (${c.version}) — auth unknown`;
   });
