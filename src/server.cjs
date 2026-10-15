@@ -14,6 +14,9 @@ const os   = require('os');
 const path = require('path');
 const http = require('http');
 const logger = require('./logger.cjs');
+// Canonical skill-result envelope — applied at the dispatch boundary below
+// (command.automate response) so every consumer reads {ok, stdout, summary}.
+const { canonicalizeSkillResult } = require('../../../shared/skill-contract.cjs');
 
 // ── Defense-in-depth: keep a single bad deferred callback from killing the
 //    whole command-service (port 3007). These only LOG; they do not mask the
@@ -108,6 +111,7 @@ const videoAgent = require('./skills/video.agent.cjs');
 const appAgent   = require('./skills/app.agent.cjs');
 const { editAgent } = require('./skills/edit.agent.cjs');
 const { docRead } = require('./skills/doc.read.cjs');
+const { taskAgent } = require('./skills/task.agent.cjs');
 const { mediaTranscribe } = require('./skills/media.transcribe.cjs');
 const skillScheduler = require('./skill-helpers/skill-scheduler.cjs');
 const { startIdleWatcher, stopIdleWatcher, startScanScheduler, runMaintenanceScan, cancelMaintenanceScan, getScanStatus } = require('./skills/explore.agent.cjs');
@@ -245,6 +249,9 @@ class CommandServiceMCPServer {
       case 'doc.read':
         return await docRead(args);
 
+      case 'task.agent':
+        return await this._skillTaskAgent(args);
+
       case 'media.transcribe':
         return await mediaTranscribe(args);
 
@@ -322,6 +329,15 @@ class CommandServiceMCPServer {
 
   async _skillCliAgent(args) {
     return await cliAgent(args);
+  }
+
+  async _skillTaskAgent(args) {
+    // Task-level observe→decide→execute loop (pilot). runSkill gives the loop
+    // in-process access to the whole skill registry — same injection pattern
+    // video.agent uses for its sibling skills.
+    return await taskAgent(args, {
+      runSkill: (skill, skillArgs) => this.executeAutomation({ skill, args: skillArgs || {} }),
+    });
   }
 
   async _skillMcpAgent(args) {
@@ -1382,7 +1398,11 @@ class CommandServiceMCPServer {
         req.on('end', async () => {
           try {
             const { payload } = JSON.parse(body);
-            const result = await this.executeAutomation(payload, { signal: controller.signal });
+            // Canonicalize at the single dispatch boundary — every skill
+            // result gets {ok, stdout, summary} before any consumer sees it
+            // (shared/skill-contract.cjs: stdout = data product, never narration).
+            const result = canonicalizeSkillResult(payload?.skill,
+              await this.executeAutomation(payload, { signal: controller.signal }));
             responded = true;
             // Wrap in MCP envelope: envelope success=true always (HTTP 200).
             // The skill's own success/failure is inside data — the StateGraph
@@ -1405,7 +1425,7 @@ class CommandServiceMCPServer {
             })();
             logger.error(`[server] command.automate failed: ${err.stack || err.message}`, payloadContext);
             res.writeHead(200);
-            res.end(JSON.stringify({ success: true, data: { ok: false, error: err.message } }));
+            res.end(JSON.stringify({ success: true, data: canonicalizeSkillResult(payloadContext.skill, { ok: false, error: err.message }) }));
           } finally {
             _unregister();
             // Detach the socket/request listeners — keep-alive sockets are reused

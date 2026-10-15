@@ -8656,6 +8656,12 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
     const MAX_TURNS = 8;
     const OBSERVATION_CHARS = 600;
     const loopHistory = [];
+    // The task's data product: largest successful output seen this run —
+    // done returns it as stdout (contract: stdout = data product, not narration).
+    let _bestOutput = '';
+    const _trackOutput = (text) => {
+      if (typeof text === 'string' && text.length > _bestOutput.length) _bestOutput = text;
+    };
 
     // Resolve credentials once before the loop starts
     const creds = {
@@ -8712,7 +8718,9 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
       logger.info(`[browser.agent] api_key loop turn ${turn}/${MAX_TURNS}: action=${action.action}`);
 
       if (action.action === 'done') {
-        return { ok: true, agentId, task, stdout: action.summary || '', agentTurns: turn, loopHistory };
+        // stdout carries the data product (largest successful output this
+        // run, or the LLM's verbatim result); summary stays narration.
+        return { ok: true, agentId, task, stdout: action.result || _bestOutput || action.summary || '', summary: action.summary || '', agentTurns: turn, loopHistory };
       }
 
       if (action.action === 'ask_user') {
@@ -8735,6 +8743,7 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
           observation = 'run_curl: no curlArgs provided';
         } else {
           const result = await execCurlWithCreds(curlArgs);
+          if (result.exitCode === 0) _trackOutput(result.stdout);
           observation = (result.stdout || result.stderr || result.error || '').slice(0, OBSERVATION_CHARS);
           // Auto-done on HTTP success (exitCode 0 = 2xx when -f is omitted)
           if (result.ok && result.exitCode === 0) {
@@ -8750,9 +8759,11 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
         }
       } else if (action.action === 'web_search') {
         const snippets = await agentWebSearch(action.query || '');
+        _trackOutput(snippets);
         observation = snippets.slice(0, OBSERVATION_CHARS);
       } else if (action.action === 'web_fetch') {
         const page = await agentWebFetch(action.url || '');
+        _trackOutput(page);
         observation = page.slice(0, OBSERVATION_CHARS);
       } else {
         observation = `Unknown action: ${action.action}`;

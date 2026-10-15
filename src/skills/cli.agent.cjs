@@ -1660,6 +1660,13 @@ async function actionRun({ cli, argv = [], cwd, env, timeoutMs, stdin, agentId, 
     };
 
     let _authAttempted = false; // prevents infinite auto-auth retry within the agentic loop
+    // The task's data product: largest successful command output seen so far.
+    // done returns this as stdout — without it the loop discards produced text
+    // and reports only the narration summary (contract: stdout = data product).
+    let _bestOutput = '';
+    const _trackOutput = (text) => {
+      if (typeof text === 'string' && text.length > _bestOutput.length) _bestOutput = text;
+    };
 
     try {
     for (let turn = 1; turn <= MAX_TURNS; turn++) {
@@ -1741,8 +1748,10 @@ async function actionRun({ cli, argv = [], cwd, env, timeoutMs, stdin, agentId, 
       }
 
       if (action.action === 'done') {
-        transcript.push({ turn, action, outcome: { ok: true, result: action.summary || '' }, thoughts: action.thinking || null });
-        return { ok: true, agentId, task, stdout: action.summary || '', agentTurns: turn, transcript };
+        transcript.push({ turn, action, outcome: { ok: true, result: action.result || action.summary || '' }, thoughts: action.thinking || null });
+        // stdout carries the data product (largest successful command output
+        // this run, or the LLM's verbatim result); summary stays narration.
+        return { ok: true, agentId, task, stdout: action.result || _bestOutput || action.summary || '', summary: action.summary || '', agentTurns: turn, transcript };
       }
 
       if (action.action === 'ask_user') {
@@ -1960,6 +1969,7 @@ async function actionRun({ cli, argv = [], cwd, env, timeoutMs, stdin, agentId, 
           // Command succeeded — feed stdout back so the LLM can evaluate: call "done" if the
           // task is fully complete, or continue (e.g. decode base64, save to file, follow a URL)
           // if the output needs further processing. Do NOT auto-exit here.
+          _trackOutput(cmdResult.stdout);
           transcript.push({ turn, action, outcome: { ok: true, result: cmdResult.stdout.slice(0, 300) }, thoughts: action.thinking || null });
           observation = `exitCode=0 stdout="${cmdResult.stdout.slice(0, 800)}"`;
           loopHistory.push({ turn, ...action, observation: observation.slice(0, OBSERVATION_CHARS) });
@@ -2123,6 +2133,7 @@ async function actionRun({ cli, argv = [], cwd, env, timeoutMs, stdin, agentId, 
               // Prefer the raw delta stream — the rendered viewport shows only
               // the last ~24 rows, hiding bulk output (dumps, listings).
               const _ptyOut = _ptyDeltaText(r.delta, String(action.cmd || '')) || (r.screen || '');
+              if (r.exitCode === 0) _trackOutput(_ptyOut);
               const _ptyTail = _ptyOut.length > RUN_HELP_CHARS
                 ? `${_ptyOut.slice(0, RUN_HELP_CHARS >> 1)}\n…[${_ptyOut.length - RUN_HELP_CHARS} chars omitted]…\n${_ptyOut.slice(-(RUN_HELP_CHARS >> 1))}`
                 : _ptyOut;
@@ -2191,6 +2202,7 @@ async function actionRun({ cli, argv = [], cwd, env, timeoutMs, stdin, agentId, 
             const _interpFlag = _interp === 'node' ? '-e' : '-c';
             const _shellR = await shellRun({ cmd: _interp, argv: [_interpFlag, _script], timeoutMs: 15000 });
             const _combined = [_shellR.stdout || '', _shellR.stderr || ''].filter(Boolean).join('\n').trim();
+            if (_shellR.exitCode === 0) _trackOutput(_shellR.stdout || _combined);
             // When probe returns the same short error as the original failure (< 60 chars),
             // the LLM has no new information. Enrich with a diagnostic hint so it knows
             // the input type may be wrong (not just dead) and suggests ytsearch3: recovery.
@@ -2273,7 +2285,13 @@ There is NO fixed CLI — you choose the tool each turn. Each turn you output ex
   pty_send   – type into the PTY:                  { "action": "pty_send", "text": "y" }  |  { "action": "pty_send", "ctrl": "c" }
   web_search – docs/package names:                 { "action": "web_search", "query": "..." }
   web_fetch  – read a docs URL:                    { "action": "web_fetch", "url": "..." }
-  done       – task complete:                      { "action": "done", "summary": "..." }
+  done       – task complete:                      { "action": "done", "summary": "one-line narration", "result": "?" }
+               summary is ALWAYS a one-line status for humans ("Converted resume to text").
+               result is the task's DATA PRODUCT — when the task's goal was to produce
+               text/data (extract, convert, dump, list), carry it verbatim in result
+               when it fits (~under 1500 chars). For bulk output, leave it on the last
+               command's stdout (it is captured automatically) or write it to a file and
+               say the path in summary.
   ask_user   – need the user:                      { "action": "ask_user", "question": "...", "options": [] }
 
 Each action may include an optional "thinking" field: one sentence (max 120 chars) on why you chose it.
@@ -2307,6 +2325,13 @@ async function _genericRunLoop({ task, cwd, env, timeoutMs, _progressCallbackUrl
   const transcript = [];
   const failedSigs = new Map(); // action signature → fail count
   const agentId = 'cli.agent';
+  // The task's data product: largest successful command output seen so far.
+  // done returns this as stdout — without it the loop discards produced text
+  // (e.g. pdftotext output) and reports only the narration summary.
+  let _bestOutput = '';
+  const _trackOutput = (text) => {
+    if (typeof text === 'string' && text.length > _bestOutput.length) _bestOutput = text;
+  };
 
   let _ptySessionId = null;
   let _ptyDead = false;
@@ -2377,9 +2402,12 @@ async function _genericRunLoop({ task, cwd, env, timeoutMs, _progressCallbackUrl
       }
 
       if (action.action === 'done') {
-        transcript.push({ turn, action, outcome: { ok: true, result: action.summary || '' }, thoughts: action.thinking || null });
+        transcript.push({ turn, action, outcome: { ok: true, result: action.result || action.summary || '' }, thoughts: action.thinking || null });
         _autoRegisterInstalledCli(task).catch(() => {});
-        return { ok: true, agentId, task, stdout: action.summary || '', agentTurns: turn, transcript };
+        // stdout must carry the task's data product — the largest successful
+        // command output seen this run (deliverables dwarf probe output), or
+        // the LLM's verbatim result when supplied. summary stays narration.
+        return { ok: true, agentId, task, stdout: action.result || _bestOutput || action.summary || '', summary: action.summary || '', agentTurns: turn, transcript };
       }
 
       if (action.action === 'ask_user') {
@@ -2420,6 +2448,7 @@ async function _genericRunLoop({ task, cwd, env, timeoutMs, _progressCallbackUrl
               // had already succeeded. `screen` is the fallback for TUI
               // repaints/prompts whose delta is escape codes, not text.
               const _stream = _ptyDeltaText(r.delta, script) || (r.screen || '');
+              if (r.ok && r.exitCode === 0) _trackOutput(_stream);
               const tail = _stream.length > RUN_HELP_CHARS
                 ? `${_stream.slice(0, RUN_HELP_CHARS >> 1)}\n…[${_stream.length - RUN_HELP_CHARS} chars omitted]…\n${_stream.slice(-(RUN_HELP_CHARS >> 1))}`
                 : _stream;
@@ -2441,6 +2470,7 @@ async function _genericRunLoop({ task, cwd, env, timeoutMs, _progressCallbackUrl
               const flag = interp === 'node' ? '-e' : '-c';
               const pr = await shellRun({ cmd: interp, argv: [flag, script], timeoutMs: action.timeoutMs || 30000 });
               const combined = [pr.stdout || '', pr.stderr || ''].filter(Boolean).join('\n').trim();
+              if (pr.exitCode === 0) _trackOutput(pr.stdout || combined);
               observation = (combined || `exitCode=${pr.exitCode}`).slice(0, RUN_HELP_CHARS);
               if (pr.exitCode !== 0) failedSigs.set(_sig, _sigFails + 1);
               logger.info(`[cli.agent] generic loop turn=${turn} run_shell interp=${interp} exitCode=${pr.exitCode} chars=${combined.length}`);
@@ -2457,6 +2487,7 @@ async function _genericRunLoop({ task, cwd, env, timeoutMs, _progressCallbackUrl
           observation = `run_cmd: "${cmd}" is not on PATH — verify/install it first (which ${cmd}, npm view, brew info), or run it via run_shell.`;
         } else {
           const r = await spawnCapture(bin, Array.isArray(action.argv) ? action.argv : [], { cwd, env, timeoutMs: timeoutMs || 30000 });
+          if (r.exitCode === 0) _trackOutput(r.stdout);
           observation = [`exitCode=${r.exitCode}`, r.stdout, r.stderr].filter(Boolean).join('\n').slice(0, RUN_HELP_CHARS);
           if (r.exitCode !== 0) failedSigs.set(_sig, _sigFails + 1);
           logger.info(`[cli.agent] generic loop turn=${turn} run_cmd ${cmd} exitCode=${r.exitCode}`);
@@ -2486,6 +2517,7 @@ async function _genericRunLoop({ task, cwd, env, timeoutMs, _progressCallbackUrl
             // Same fix as run_shell: prefer the raw delta stream over the
             // rendered viewport so bulk output is actually observable.
             const _ptyStream = _ptyDeltaText(r.delta, _ptyCmd) || (r.screen || '');
+            if (r.ok && r.exitCode === 0) _trackOutput(_ptyStream);
             const _ptyTail = _ptyStream.length > RUN_HELP_CHARS
               ? `${_ptyStream.slice(0, RUN_HELP_CHARS >> 1)}\n…[${_ptyStream.length - RUN_HELP_CHARS} chars omitted]…\n${_ptyStream.slice(-(RUN_HELP_CHARS >> 1))}`
               : _ptyStream;
