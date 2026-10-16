@@ -38,6 +38,39 @@ function _hasValidUrl(r) {
   }
 }
 
+// Google wraps result links as /goto?url=<opaque token>. The web-search
+// service unwraps them only in a background cache pass, so search responses
+// ship wrapped — a crawl that follows one burns its whole retry budget on a
+// dead/redirecting link. Resolve the navigation-bound candidates here before
+// returning bestUrl/fallbackUrls (goto tokens are short-lived; resolve fresh).
+const _GOTO_RE = /^https?:\/\/[^/]*google\.com\/goto\//i;
+const _GOTO_UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+
+function _resolveRedirect(url, maxHops = 5, timeoutMs = 3000) {
+  return new Promise((resolve) => {
+    if (!_GOTO_RE.test(url || '')) return resolve(url);
+    const hop = (u, depth) => {
+      if (depth >= maxHops) return resolve(u);
+      let mod;
+      try { mod = u.startsWith('https:') ? https : http; } catch (_) { return resolve(url); }
+      const req = mod.get(u, {
+        timeout: timeoutMs,
+        headers: { 'User-Agent': _GOTO_UA },
+      }, (res) => {
+        res.resume();
+        const loc = res.headers.location;
+        if (res.statusCode >= 300 && res.statusCode < 400 && loc) {
+          try { return hop(new URL(loc, u).toString(), depth + 1); } catch (_) { return resolve(u); }
+        }
+        return resolve(u);
+      });
+      req.on('timeout', () => { req.destroy(); resolve(url); });
+      req.on('error', () => resolve(url));
+    };
+    hop(url, 0);
+  });
+}
+
 // Web Search MCP configuration from environment
 const WEB_SEARCH_API_URL = process.env.MCP_WEB_SEARCH_URL;
 const WEB_SEARCH_API_KEY = process.env.MCP_WEB_SEARCH_API_KEY;
@@ -287,6 +320,13 @@ async function actionSearchAndNavigate({ query, preferDomain, maxResults = 5, li
   }
 
   const best = scored[0];
+  // Unwrap google.com/goto links on the candidates that get navigated —
+  // capped at best + 3 fallbacks so a fully-wrapped SERP costs ≤1 request
+  // round of latency, not one per result.
+  await Promise.all(
+    [best, ...scored.slice(1, 4)]
+      .map(async (r) => { r.url = await _resolveRedirect(r.url); }),
+  );
   logger.info(`[web.agent] search_and_navigate: best=${best.url} score=${best._score}`);
 
   return {

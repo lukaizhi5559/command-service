@@ -366,6 +366,13 @@ async function webCrawl(args) {
 
   const startTime = Date.now();
 
+  // Wall-clock budget — the MCP caller times out ~90s while each attempt
+  // stacks several timeoutMs-scoped cliRun calls (open, stabilize, eval),
+  // plus a warm retry and a follow hop. An orphaned crawl keeps the browser
+  // busy and starves the caller's replan; bail early with an honest failure.
+  const CRAWL_BUDGET_MS = parseInt(process.env.WEB_CRAWL_BUDGET_MS || '60000', 10);
+  const overBudget = () => (Date.now() - startTime) > CRAWL_BUDGET_MS;
+
   if (!url || typeof url !== 'string') {
     return { ok: false, url, error: 'url is required', elapsedMs: 0 };
   }
@@ -396,6 +403,10 @@ async function webCrawl(args) {
   let lastRes = null;
   let lastBad = null;
   for (let attempt = 0; attempt < candidates.length; attempt++) {
+    if (attempt > 0 && overBudget()) {
+      progress(`Crawl budget exceeded (${Math.round((Date.now() - startTime) / 1000)}s) — skipping remaining fallbacks`);
+      break;
+    }
     const candidate = candidates[attempt];
     if (attempt > 0) progress(`Retrying fallback URL ${attempt + 1}/${candidates.length}: ${candidate}`);
 
@@ -410,7 +421,7 @@ async function webCrawl(args) {
       // subpage (e.g. "calendar events" → /calendar). Pick the best same-domain
       // link by intent and crawl it once. Returns the subpage's content with
       // provenance; on no-match, keep the landing page.
-      if (follow && Array.isArray(res.links) && res.links.length) {
+      if (follow && !overBudget() && Array.isArray(res.links) && res.links.length) {
         const followed = await _followLink(res, follow, { maxChars, timeoutMs, effectiveWaitMs, progress, startTime });
         if (followed) return { ...followed, elapsedMs: Date.now() - startTime, attempts: attempt + 1 };
       }
@@ -418,6 +429,19 @@ async function webCrawl(args) {
     }
     lastBad = bad;
     progress(`Attempt ${attempt + 1} rejected — ${bad.reason}`);
+  }
+
+  // Budget spent mid-ladder — return an honest failure rather than starting
+  // a warm retry that would outlive the MCP timeout.
+  if (overBudget()) {
+    return {
+      ...(lastRes || {}),
+      ok: false,
+      error: `Crawl time budget exceeded (${Math.round((Date.now() - startTime) / 1000)}s)`,
+      rejectedReason: lastBad?.reason || null,
+      elapsedMs: Date.now() - startTime,
+      attempts: candidates.length,
+    };
   }
 
   // All headless candidates rejected — if any rejection looked like an
