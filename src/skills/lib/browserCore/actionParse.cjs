@@ -186,6 +186,32 @@ function _parseAction(text) {
   const _mlType = t.match(_TYPE_RE);
   if (_mlType) return _sanitize({ action: 'type', value: _mlType[1], target: _mlType[2] });
 
+  // 4. JSON-action fallback — a model primed by the turn-loop contract emits
+  //    {"action":"click","target":"Save"} instead of verb grammar. Map it back
+  //    rather than dying on the format mismatch.
+  try {
+    const _jm = t.match(/\{[\s\S]*\}/);
+    if (_jm) {
+      const _j = JSON.parse(_jm[0]);
+      const _ja = String(_j.action || _j.type || '').toLowerCase();
+      const _tgt = String(_j.target ?? _j.text ?? _j.selector ?? '');
+      let _mapped = null;
+      if (/^(click|press|tap)$/.test(_ja) && _tgt) _mapped = { action: 'click', target: _tgt };
+      else if (/^(type|fill|enter|input)$/.test(_ja) && _j.value != null) _mapped = { action: 'type', value: String(_j.value), target: _tgt };
+      else if (/^press/.test(_ja) && (_j.key || _tgt)) _mapped = { action: 'press', key: String(_j.key || _tgt) };
+      else if (/^(navigate|goto|open|nav)$/.test(_ja) && _j.url) _mapped = { action: 'navigate', url: String(_j.url) };
+      else if (/^(done|finish|complete)$/.test(_ja)) _mapped = { action: 'done' };
+      else if (/^scroll/.test(_ja)) _mapped = { action: 'scroll', direction: /up/i.test(String(_j.direction || '')) ? 'up' : 'down' };
+      else if (/screenshot/.test(_ja)) _mapped = { action: 'screenshot' };
+      else if (/^(wait|waitforstabletext)/.test(_ja)) _mapped = { action: 'waitForStableText' };
+      else if (/^(getpagetext|read|extract)/.test(_ja)) _mapped = { action: 'getPageText' };
+      if (_mapped) {
+        logger.info(`[instruction.runner] _parseAction: mapped JSON action "${_ja}" → ${_mapped.action}`);
+        return _sanitize(_mapped);
+      }
+    }
+  } catch (_) {}
+
   logger.info(`[instruction.runner] _parseAction: no parseable action in "${t.slice(0, 80)}"`);
   return null;
 }

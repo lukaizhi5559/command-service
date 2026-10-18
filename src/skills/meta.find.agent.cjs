@@ -12,11 +12,12 @@
 const logger = require('../logger.cjs');
 const { _executeMetaF } = require('./instruction.runner.cjs');
 const { _extractSearchText } = require('./browser.agent.cjs');
-const { withSessionMutex } = require('./lib/browserCore/session.cjs');
+const { withSessionMutex, qualifyOpenTab } = require('./lib/browserCore/session.cjs');
 const { postProgress } = require('./lib/browserCore/progress.cjs');
 
 async function metaFindAgent(args = {}) {
-  const { goal = '', sessionId, _progressCallbackUrl } = args;
+  const { goal = '', sessionId: _sid, _progressCallbackUrl } = args;
+  const sessionId = qualifyOpenTab(_sid, goal);
   if (!sessionId) return { ok: false, error: 'meta.find.agent: no sessionId' };
   if (!goal && !args.searchText) return { ok: false, error: 'meta.find.agent: no goal/searchText' };
 

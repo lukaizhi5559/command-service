@@ -17,7 +17,7 @@ const logger = require('../logger.cjs');
 const { browserAct } = require('./browser.act.cjs');
 const { resolveServiceTarget } = require('./lib/browserCore/services.cjs');
 const { isSigninWall } = require('./lib/browserCore/auth.cjs');
-const { deriveSessionId, withSessionMutex } = require('./lib/browserCore/session.cjs');
+const { deriveSessionId, withSessionMutex, qualifyOpenTab } = require('./lib/browserCore/session.cjs');
 const { postProgress } = require('./lib/browserCore/progress.cjs');
 
 // Deep-link semantics live in the REQUESTED URL — create/compose/search
@@ -56,7 +56,7 @@ function _normalizeCreateUrl(url, task) {
 async function urlFirstAgent(args = {}) {
   const { service, agentId: _agentId, task = '', url: _explicitUrl, headed = true, _progressCallbackUrl } = args;
   const agentId = _agentId || (service ? `${String(service).toLowerCase().replace(/\s+/g, '_')}.agent` : 'default.agent');
-  const sessionId = args.sessionId || deriveSessionId(agentId);
+  const sessionId = qualifyOpenTab(args.sessionId || deriveSessionId(agentId), task);
 
   return withSessionMutex(sessionId, async () => {
     postProgress(_progressCallbackUrl, { tier: 'url-first', message: `url.first.agent: resolving destination for ${agentId}` });
@@ -95,7 +95,7 @@ async function urlFirstAgent(args = {}) {
 
     // 2. Navigate the shared session
     logger.info(`[url.first.agent] navigating ${sessionId} → ${targetUrl} (source=${deepLinkSource || 'startUrl'})`);
-    const nav = await browserAct({ action: 'navigate', sessionId, url: targetUrl, headed, timeoutMs: 30000 });
+    const nav = await browserAct({ action: 'navigate', sessionId, url: targetUrl, headed, timeoutMs: 30000, activate: true });
     if (!nav?.ok) {
       return { ok: false, sessionId, agentId, url: targetUrl, error: `Navigation failed: ${nav?.error || 'unknown'}` };
     }

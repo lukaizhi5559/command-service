@@ -401,9 +401,9 @@ async function lookupServiceAsync(service) {
 
 const _ANSI_RE = /\[[0-9;?]*[A-Za-z]|\][^\x07\x1b]*(?:\x07|\\)|\(\S|\][^\x07]*/g;
 
-async function _openVisibleSession(label) {
+async function _openVisibleSession(label, protectedPaths) {
   try {
-    const opened = await terminalAgent({ action: 'open', label, managedBy: 'agent' });
+    const opened = await terminalAgent({ action: 'open', label, managedBy: 'agent', protectedPaths });
     return opened?.ok ? opened.sessionId : null;
   } catch (_) { return null; }
 }
@@ -909,11 +909,11 @@ async function actionDiscover({ cli }) {
  * live into the Terminal pane. Returns {ok, used:true} on definitive result,
  * or {used:false} when PTY is unavailable — caller falls back to pipes.
  */
-async function _ptyVisibleExec(label, cmd, { timeoutMs = 180000, expectBin = null, sessionId = null } = {}) {
+async function _ptyVisibleExec(label, cmd, { timeoutMs = 180000, expectBin = null, sessionId = null, protectedPaths } = {}) {
   let sid = sessionId;
   try {
     if (!sid) {
-      const opened = await terminalAgent({ action: 'open', label, managedBy: 'agent' });
+      const opened = await terminalAgent({ action: 'open', label, managedBy: 'agent', protectedPaths });
       if (!opened?.ok || !opened.sessionId) return { used: false };
       sid = opened.sessionId;
     }
@@ -1304,13 +1304,13 @@ Rules:
 - If the task is ambiguous, pick the most common/safe interpretation
 - If the task genuinely cannot be expressed as a single CLI invocation, set argv to [] and explain in reasoning`;
 
-async function actionRun({ cli, argv = [], cwd, env, timeoutMs, stdin, agentId, task, _progressCallbackUrl, _stepIndex }) {
+async function actionRun({ cli, argv = [], cwd, env, timeoutMs, stdin, agentId, task, _progressCallbackUrl, _stepIndex, protectedPaths }) {
   // ── Generic task-mode: no registered agent — same observe→adapt→retry
   // discipline, but run_shell becomes the primary verb since there is no
   // fixed cliTool. Used for goal-shaped steps ("install X", "set up Y") and
   // AGENT_ESCALATE recovery from failed shell.run steps.
   if (!agentId && task) {
-    return await _genericRunLoop({ task, cwd, env, timeoutMs, _progressCallbackUrl, _stepIndex });
+    return await _genericRunLoop({ task, cwd, env, timeoutMs, _progressCallbackUrl, _stepIndex, protectedPaths });
   }
 
   // ── Agentic path: agentId + task → LLM infers argv from descriptor ──
@@ -1653,6 +1653,7 @@ async function actionRun({ cli, argv = [], cwd, env, timeoutMs, stdin, agentId, 
         ownerRunId: `cli.agent:${agentId}:${Date.now()}`,
         cwd, env,
         _progressCallbackUrl,
+        protectedPaths,
       });
       if (!r.ok) throw new Error(r.error || 'pty-open-failed');
       _ptySessionId = r.sessionId;
@@ -2307,7 +2308,7 @@ Rules:
 - ask_user is LAST RESORT — at least one diagnostic probe after a failure first.
 - Output JSON only. No prose before or after the object.`;
 
-async function _genericRunLoop({ task, cwd, env, timeoutMs, _progressCallbackUrl, _stepIndex }) {
+async function _genericRunLoop({ task, cwd, env, timeoutMs, _progressCallbackUrl, _stepIndex, protectedPaths }) {
   // Library-install fast path — "install <pkg> npm/pip package" resolves
   // deterministically through the registry probe + library lane; the CLI loop
   // would probe for a binary that can never exist and then web-search into
@@ -2341,7 +2342,7 @@ async function _genericRunLoop({ task, cwd, env, timeoutMs, _progressCallbackUrl
     // Label the session so TerminalPane shows meaningful context
     // ("cli.agent: install nylas") instead of a bare agent id.
     const _label = `cli.agent: ${String(task || '').slice(0, 40)}`;
-    const r = await terminalAgent({ action: 'open', label: _label, managedBy: 'agent' });
+    const r = await terminalAgent({ action: 'open', label: _label, managedBy: 'agent', protectedPaths });
     if (!r?.ok || !r.sessionId) { _ptyDead = true; throw new Error(r?.error || 'pty-open-failed'); }
     _ptySessionId = r.sessionId;
     return _ptySessionId;

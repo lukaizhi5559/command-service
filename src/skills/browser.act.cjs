@@ -2720,6 +2720,13 @@ async function sendEmailWithVerification(sessionId, sendSelector) {
 // ---------------------------------------------------------------------------
 
 async function browserAct(args) {
+  // A sessionId ending in '.agent' is virtually always a raw agentId passed by
+  // mistake (deriveSessionId convention: 'amazon.agent' → 'amazon_agent').
+  // Normalize it — otherwise the same logical agent forks into two sessions
+  // (and two tabs under the extension: 'ext:amazon.agent' ≠ 'ext:amazon_agent').
+  if (args && typeof args.sessionId === 'string' && /\.agent$/i.test(args.sessionId)) {
+    args = { ...args, sessionId: args.sessionId.replace(/\.agent$/i, '_agent') };
+  }
   const {
     action,
     sessionId  = 'default',
@@ -2750,6 +2757,35 @@ async function browserAct(args) {
 
   if (!action) {
     return { ok: false, error: 'action is required', executionTime: 0 };
+  }
+
+  // ── Extension transport ───────────────────────────────────────────────────
+  // Sessions named 'ext:*' (or explicit transport:'extension') route to the
+  // ThinkDrop Chrome extension — the user's REAL browser via chrome.debugger
+  // CDP + chrome.tabs — instead of launching a Playwright-owned window.
+  //
+  // Auto-prefer (DEFAULT ON): routes ALL sessions through the extension while
+  // it's connected — "use the real logged-in browser whenever it's open",
+  // including cron work via background tabs. Sessions the Playwright engine
+  // already owns stay engine-bound. Set THINKDROP_BROWSER_PREFER_EXT=false to
+  // disable and force the engine path.
+  let _useExt = String(sessionId).startsWith('ext:') || args.transport === 'extension';
+  if (!_useExt && process.env.THINKDROP_BROWSER_PREFER_EXT !== 'false') {
+    try {
+      const _gw = require('../ext.gateway.cjs');
+      if (_gw.hasExtension() && !engine.isSessionActive(sessionId)) {
+        args = { ...args, sessionId: `ext:${sessionId}` };
+        _useExt = true;
+      }
+    } catch (_) { /* gateway unavailable — stay on engine path */ }
+  }
+  if (_useExt) {
+    try {
+      const { browserExtAct } = require('./browser.ext.cjs');
+      return await browserExtAct(args);
+    } catch (extErr) {
+      return { ok: false, action, sessionId, error: `ext transport error: ${extErr.message}`, executionTime: Date.now() - start };
+    }
   }
 
   logger.info(`[browser.act] ${action} session=${sessionId}`, { url, selector, text, key });

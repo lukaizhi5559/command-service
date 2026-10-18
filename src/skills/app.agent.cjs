@@ -6356,6 +6356,51 @@ const _isBrowserApp = (name) => _BROWSER_APP_NAMES.some(b => {
 });
 
 /**
+ * Resolve which extension session a browser-lane call should use — the tab the
+ * call opens/reads becomes bound and visible to /ext.sessions + follow-ups.
+ * Priority: explicit sessionId > agentId-derived > bound-tab host match on url
+ * > host-derived ext:<host>_agent > sole bound session (reads) > null.
+ * Null means the extension is disconnected or nothing resolves — callers keep
+ * their OS path.
+ */
+async function _extSessionFor({ sessionId, agentId, url, allowSole = false, allowRecent = false } = {}) {
+  try {
+    const _gw = require('../ext.gateway.cjs');
+    if (!_gw.hasExtension()) return null;
+    if (sessionId) return sessionId;
+    if (agentId) return `ext:${String(agentId).replace(/\.agent$/i, '')}_agent`;
+    const live = await _gw.sessions().catch(() => null);
+    const alive = (live?.sessions || []).filter(s => s && s.alive !== false);
+    if (url) {
+      const host = String(url).replace(/^https?:\/\//i, '').replace(/^www\./, '').split('/')[0];
+      const label = host.split('.')[0];
+      // Service-named session wins — tabs can host any URL, so a bound tab
+      // whose page happens to match the host is a weaker signal than the
+      // session named for the service (ext:amazon_agent, not whichever tab
+      // last loaded amazon.com).
+      if (label) {
+        const named = alive.find(s => s.sessionId === `ext:${label}_agent`);
+        if (named) return named.sessionId;
+      }
+      const bound = alive.find(s => String(s.url || '').includes(host));
+      if (bound) return bound.sessionId;
+      if (label) return `ext:${label}_agent`;
+    }
+    if (allowSole && alive.length === 1) return alive[0].sessionId;
+    // Untargeted read with several bound sessions → the tab that's active in
+    // its window (the page a just-completed navigate/read left in front), then
+    // most recently touched.
+    if (allowRecent && alive.length) {
+      const front = alive.find(s => s.active);
+      if (front?.sessionId) return front.sessionId;
+      const recent = alive.slice().sort((a, b) => (b.lastSeen || 0) - (a.lastSeen || 0))[0];
+      if (recent?.sessionId) return recent.sessionId;
+    }
+    return null;
+  } catch (_) { return null; }
+}
+
+/**
  * Read the clipboard's text/html flavor (Chrome/Safari place serialized DOM
  * HTML on the clipboard for Cmd+A/Cmd+C). Preserves hrefs/structure that the
  * plain-text flavor loses — enables link/item extraction from page copies.
@@ -6377,13 +6422,27 @@ function _readClipboardHtml() {
  *      'auto' picks 'type' when a browser is frontmost and newTab===false,
  *      else 'open', with cross-fallback on failure.
  */
-async function actionNavigateUrl({ url, appName, via = 'auto', newTab } = {}) {
+async function actionNavigateUrl({ url, appName, via = 'auto', newTab, sessionId, agentId } = {}) {
   if (!url || !/^https?:\/\//i.test(String(url).trim())) {
     return { ok: false, error: 'navigate_url requires a valid http(s) url' };
   }
   url = String(url).trim();
   const { execFileSync } = require('child_process');
   const est = _pageCopyEst.estimateForUrl(url);
+
+  // Extension lane — navigate through the ThinkDrop extension so the tab is
+  // bound to a session (/ext.sessions, follow-ups, scans all see it). An OS
+  // `open` lands in an unbound tab the rest of the pipeline can't address.
+  const sid = await _extSessionFor({ sessionId, agentId, url });
+  if (sid) {
+    const { browserAct } = require('./browser.act.cjs');
+    const res = await browserAct({ action: 'navigate', sessionId: sid, url, activate: true, timeoutMs: 20000 });
+    if (res.ok) {
+      logger.info(`[app.agent] navigate_url: ${url} via 'ext' session=${sid}`);
+      return { ok: true, url, via: 'ext', sessionId: sid, category: est.category };
+    }
+    logger.warn(`[app.agent] navigate_url: ext lane failed (${res.error || 'unknown'}) — falling back to OS`);
+  }
 
   const doOpen = async () => {
     await _withOverlayHidden(async () => {
@@ -6504,7 +6563,45 @@ async function _getLiveBrowserUrl(appName) {
   } catch (_) { return null; }
 }
 
-async function actionScanPage({ appName, url, category, maxWaitMs = 10000, useCache = true, captureHtml = false, ttlMs, deselect = true } = {}) {
+async function actionScanPage({ appName, url, category, maxWaitMs = 10000, useCache = true, captureHtml = false, ttlMs, deselect = true, sessionId, agentId } = {}) {
+  // 0. Extension lane — when the ThinkDrop Chrome extension is connected and a
+  //    bound session can be identified, read the page via in-tab evaluate
+  //    instead of OS focus + Cmd+A/Cmd+C. Equivalent content, no focus theft,
+  //    and it exercises the session binding instead of driving Chrome blind.
+  try {
+    const _gw = require('../ext.gateway.cjs');
+    if (_gw.hasExtension()) {
+      const sid = await _extSessionFor({ sessionId, agentId, url, allowSole: true, allowRecent: true });
+      if (sid) {
+        const { browserAct } = require('./browser.act.cjs');
+        // Poll the in-tab read: right after `navigate` commits, innerText can be
+        // empty or the evaluate can throw while the page is still swapping.
+        const deadline = Date.now() + Math.max(6000, maxWaitMs || 0);
+        let pageUrl = null, content = '', lastErr = null;
+        while (Date.now() < deadline) {
+          try {
+            const res = await browserAct({
+              action: 'evaluate', sessionId: sid, timeoutMs: 8000,
+              text: 'JSON.stringify({url:location.href,text:(document.body&&document.body.innerText)||""})',
+            });
+            if (res.ok && res.result) {
+              try { const p = JSON.parse(res.result); pageUrl = p.url || pageUrl; content = p.text || ''; }
+              catch (_) { content = String(res.result); }
+              if (content.trim().length > 200) break;
+            } else lastErr = res.error || 'evaluate failed';
+          } catch (e) { lastErr = e.message; }
+          await _sleep(700);
+        }
+        if (content.trim()) {
+          const saved = _pageCopyEst.saveCopy({ url: pageUrl || url || null, content, appName: appName || 'browser' });
+          logger.info(`[app.agent] scan_page: ext lane ${content.length} chars session=${sid} url=${pageUrl || '(unknown)'} → ${saved?.file || '(unsaved)'}`);
+          return { ok: true, content, savedTo: saved?.file || null, url: pageUrl || url || null, chars: content.length, via: 'ext_evaluate' };
+        }
+        logger.warn(`[app.agent] scan_page: ext lane empty for session=${sid}${lastErr ? ` (${lastErr})` : ''} — falling back to OS path`);
+      }
+    }
+  } catch (e) { logger.warn(`[app.agent] scan_page: ext lane error (${e.message}) — OS path`); }
+
   // 1. Focus first — we need the resolved browser app to read the LIVE tab URL
   //    for cache matching. The old order served "latest fresh copy" for
   //    url=null — observed: a Google task was synthesized from a 2-min-old
@@ -6660,7 +6757,7 @@ async function _closeTabIfOurs({ url, pageUrl, appName }) {
  */
 async function actionReadUrl({ url, cleanup = 'deselect', appName, minChars, maxWaitMs = 12000,
                                httpFirst = true, crawlFallback = true, fallbackUrls,
-                               useCache = true, ttlMs, captureHtml = false } = {}) {
+                               useCache = true, ttlMs, captureHtml = false, sessionId, agentId } = {}) {
   if (!url || !/^https?:\/\//i.test(String(url).trim())) {
     return { ok: false, error: 'read_url requires a valid http(s) url', reason: 'invalid-url' };
   }
@@ -6694,11 +6791,12 @@ async function actionReadUrl({ url, cleanup = 'deselect', appName, minChars, max
   // 2. Browser tier — open a NEW tab in the user's real browser and copy it.
   let scan = { ok: false, error: 'navigate_failed' };
   let navUsedUserTab = false;
-  const nav = await actionNavigateUrl({ url, appName, via: 'open' });
+  const nav = await actionNavigateUrl({ url, appName, via: 'open', sessionId, agentId });
   if (nav.ok) {
     navUsedUserTab = nav.via === 'type'; // cross-fallback navigated the user's current tab
     scan = await actionScanPage({
       appName, url, useCache: false, maxWaitMs, captureHtml,
+      sessionId: nav.sessionId || sessionId, agentId,
       deselect: cleanup !== 'close',   // closing discards the selection anyway
     });
   }
@@ -6858,7 +6956,7 @@ async function actionNavTask({ task, service, url, escalate = true, browseFallba
   const _browseFloor = async (destOverride) => {
     if (destOverride) {
       logger.info(`[app.agent] nav_task: browseFallback — reading ${destOverride}`);
-      return actionReadUrl({ url: destOverride, cleanup: 'deselect', appName, maxWaitMs: 15000, httpFirst: !service, crawlFallback: true });
+      return actionReadUrl({ url: destOverride, cleanup: 'deselect', appName, maxWaitMs: 15000, httpFirst: !service, crawlFallback: true, agentId: agentId || (serviceKey ? `${serviceKey}.agent` : null) });
     }
     const sr = await _navTaskCallSkill('web.agent', {
       action: 'search_and_navigate',
@@ -6872,6 +6970,7 @@ async function actionNavTask({ task, service, url, escalate = true, browseFallba
       url: best,
       fallbackUrls: Array.isArray(sr.fallbackUrls) && sr.fallbackUrls.length ? sr.fallbackUrls : undefined,
       cleanup: 'deselect', appName, httpFirst: true, crawlFallback: true,
+      agentId: agentId || (serviceKey ? `${serviceKey}.agent` : null),
     });
     return r.ok ? { ...r, deepLinkSource: 'browse_fallback' } : r;
   };
@@ -6933,7 +7032,7 @@ async function actionNavTask({ task, service, url, escalate = true, browseFallba
   //    'deselect' cleanup keeps the tab open — "goto gmail" should leave the
   //    user looking at the results page.
   logger.info(`[app.agent] nav_task: ${service || url} → ${dest} (source=${dl.source}, type=${dlType})`);
-  const r = await actionReadUrl({ url: dest, cleanup: 'deselect', appName, maxWaitMs: 15000, httpFirst: !service });
+  const r = await actionReadUrl({ url: dest, cleanup: 'deselect', appName, maxWaitMs: 15000, httpFirst: !service, agentId: agentId || (serviceKey ? `${serviceKey}.agent` : null) });
   if (!r.ok) {
     logger.warn(`[app.agent] nav_task: read_url failed (${r.reason || r.error || 'unknown'}) for ${dest}`);
     return _escalate(r.reason || r.error || 'read failed');

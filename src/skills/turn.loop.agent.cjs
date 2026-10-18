@@ -16,13 +16,16 @@
 
 const logger = require('../logger.cjs');
 const { playwrightAgent } = require('./playwright.agent.cjs');
-const { withSessionMutex, deriveSessionId } = require('./lib/browserCore/session.cjs');
+const { withSessionMutex, deriveSessionId, qualifyOpenTab } = require('./lib/browserCore/session.cjs');
 const { postProgress } = require('./lib/browserCore/progress.cjs');
 const { inferPageCategory } = require('../skill-helpers/page-category.cjs');
 
 async function turnLoopAgent(args = {}) {
-  const { goal = '', mode = 'act', _progressCallbackUrl } = args;
-  const sessionId = args.sessionId || deriveSessionId(args.agentId || 'default.agent');
+  // dom.act's re-route and BROWSER_ESCALATE both pass `task`; standalone calls
+  // pass `goal`. Accept either (observed: "click on it" re-route → 'no goal').
+  const goal = args.goal || args.task || '';
+  const { mode = 'act', _progressCallbackUrl } = args;
+  const sessionId = qualifyOpenTab(args.sessionId || deriveSessionId(args.agentId || 'default.agent'), goal);
   if (!sessionId) return { ok: false, error: 'turn.loop.agent: no sessionId' };
   if (!goal) return { ok: false, error: 'turn.loop.agent: no goal' };
   // Self-derive category for standalone calls — playwrightAgent's internal

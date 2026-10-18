@@ -16,7 +16,7 @@
 const logger = require('../logger.cjs');
 const { browserAct } = require('./browser.act.cjs');
 const { routeOnPageAction } = require('./lib/browserCore/router.cjs');
-const { deriveSessionId } = require('./lib/browserCore/session.cjs');
+const { deriveSessionId, qualifyOpenTab } = require('./lib/browserCore/session.cjs');
 const { postProgress } = require('./lib/browserCore/progress.cjs');
 const { detectOverlay } = require('./lib/browserCore/pageState.cjs');
 const { hasVisibleDialog } = require('./lib/browserCore/overlayProbe.cjs');
@@ -70,7 +70,7 @@ async function domAct(args = {}) {
     } catch (_) { pageCategory = _pageCategoryArg || 'web_generic'; }
   }
 
-  const sessionId = _sid || deriveSessionId(agentId);
+  const sessionId = qualifyOpenTab(_sid || deriveSessionId(agentId), goal);
 
   // Settle gate: the previous step (url.first) resolves at domcontentloaded —
   // heavy SPAs (Gmail compose, Calendar dialogs) keep rendering after that.
@@ -181,7 +181,12 @@ async function domAct(args = {}) {
       };
     }
     if (attempt === MAX_ROUTE_ATTEMPTS - 1) break;
-    logger.warn(`[dom.act] ${route.agent} failed (${res?.error || 'unknown'}) — re-routing`);
+    // Surface whatever diagnostic the executor gave — error, stopReason,
+    // verdict, last action — a bare "(unknown)" leaves the failure opaque
+    // (observed: turn.loop bail logged 'unknown' when error was unset).
+    const _why = res?.error || res?.stopReason || res?.verdict || res?.reason
+      || res?.note || (res?.actionHistory || []).slice(-1)[0] || 'unknown';
+    logger.warn(`[dom.act] ${route.agent} failed (${_why}) — re-routing`);
     tried.add(route.agent);
     res.routeRule = route.rule;
   }

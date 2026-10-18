@@ -139,6 +139,15 @@ async function _engineEval(sessionId, expr, timeoutMs = 5000) {
   return null;
 }
 
+// Turn-loop observation evaluate — engine page when one exists, else the
+// browserAct 'evaluate' fallback inside _engineEval reaches extension-bound
+// sessions (observed: ext ebay tab → engine.getPage null → 8 blind turns).
+// `fn` is stringified into an IIFE so one expression serves both paths.
+async function _observeEval(sessionId, fn, timeoutMs = 5000) {
+  const r = await _engineEval(sessionId, `(${fn.toString()})()`, timeoutMs);
+  return r && r.ok ? (r.result ?? null) : null;
+}
+
 async function _engineNavigate(sessionId, url, timeoutMs = 30000) {
   const page = engine.getPage(sessionId);
   if (!page) return null;
@@ -6162,9 +6171,9 @@ function _extractEntityFromGoal(goal, stripKeywords) {
 // Called before and after each action. Returns a plain object.
 async function _captureStateSnapshot(sessionId, page) {
   const _empty = { url: '', modalCount: 0, bodyLen: 0, cartCount: null, cartSubtotal: null, formValues: [], listCounts: {} };
-  if (!page) return _empty;
-  try {
-    return await page.evaluate(() => {
+  // No engine page → the same capture runs through _observeEval's browserAct
+  // path so extension-bound sessions get postcondition parity.
+  const _capture = () => {
       const _num = (s) => { const m = String(s || '').match(/(\d+(?:[.,]\d+)?)/); return m ? parseFloat(m[1].replace(',', '')) : null; };
       // URL
       const url = window.location.href;
@@ -6235,7 +6244,11 @@ async function _captureStateSnapshot(sessionId, page) {
       }
 
       return { url, modalCount, bodyLen, cartCount, cartSubtotal, formValues: formValues.slice(0, 20), listCounts };
-    }).catch(() => _empty);
+  };
+  try {
+    if (page) return await page.evaluate(_capture).catch(() => _empty);
+    const _r = await _observeEval(sessionId, _capture);
+    return _r || _empty;
   } catch (_) {
     return _empty;
   }
@@ -12234,6 +12247,10 @@ async function _executeTurnLoopFallback({ goal, verificationGoal, sessionId, hea
   // of the section-specific page).
   const _subTaskStartUrls = new Map(); // subTaskId → URL path when sub-task started
   const _urlDriftFiredFor = new Set(); // subTaskIds where drift hint was already fired
+  // Entity terms for the per-turn goal-entity element scan (dense-grid safety
+  // net — the 80-element snapshot cap can hide the click target entirely).
+  const _goalEntities = _extractGoalEntities(goal);
+
   // ── LLM goal decomposition: break the goal into sub-tasks with semantic
   // verification criteria. This replaces the fragile regex-based phrase
   // extraction as the PRIMARY verification mechanism. Falls back to regex
@@ -12284,21 +12301,18 @@ async function _executeTurnLoopFallback({ goal, verificationGoal, sessionId, hea
     const _prunedSnap = pruneSnapshot(extractInteractiveRefs(_currentSnapshot));
 
     // Get visible page text (ARIA snapshot may not show contenteditable elements)
+    // Works on extension-bound sessions too — _observeEval falls back to
+    // browserAct evaluate when there's no engine page.
     let _pageText = '';
     try {
-      const _ePage = engine.getPage(sessionId);
-      if (_ePage) {
-        _pageText = await _ePage.evaluate(() => document.body.innerText.slice(0, 2000)).catch(() => '');
-      }
+      _pageText = (await _observeEval(sessionId, () => document.body.innerText.slice(0, 2000))) || '';
     } catch (_) {}
 
     // Get probe data for compose elements
     let _probeInfo = '';
     let _probe = null;
     try {
-      const _ePage = engine.getPage(sessionId);
-      if (_ePage) {
-        _probe = await _ePage.evaluate(() => {
+      _probe = await _observeEval(sessionId, () => {
           // Iterate ALL dialogs — querySelector returns the first (may be hidden video.js)
           const _modals = document.querySelectorAll('[role="dialog"], [aria-modal="true"]');
           let _hasVisibleModal = false;
@@ -12336,8 +12350,8 @@ async function _executeTurnLoopFallback({ goal, verificationGoal, sessionId, hea
             activeElementEditable: document.activeElement?.isContentEditable || false,
             activeElementRole: document.activeElement?.getAttribute('role') || null,
           };
-        }).catch(() => null);
-        if (_probe) {
+      });
+      if (_probe) {
           const _composeSel = _probe.hasContentEditable ? 'div[contenteditable="true"]'
             : _probe.hasRoleTextbox ? '[role="textbox"]'
             : _probe.hasTextarea ? 'textarea' : null;
@@ -12349,7 +12363,6 @@ async function _executeTurnLoopFallback({ goal, verificationGoal, sessionId, hea
 - Compose in modal: ${_probe.composeInModal}
 - Active element: <${_probe.activeElementTag}> editable=${_probe.activeElementEditable} role=${_probe.activeElementRole}
 ${_composeSel ? `- SUGGESTED COMPOSE SELECTOR: ${_composeSel}` : ''}`;
-        }
       }
     } catch (_) {}
 
@@ -12364,9 +12377,7 @@ ${_composeSel ? `- SUGGESTED COMPOSE SELECTOR: ${_composeSel}` : ''}`;
     let _domSignals = '';
     let _signals = [];  // declared outside try so search disambiguation can access it
     try {
-      const _ePage = engine.getPage(sessionId);
-      if (_ePage) {
-        _signals = await _ePage.evaluate(() => {
+      _signals = (await _observeEval(sessionId, () => {
           const inputSignals = [];
           const otherSignals = [];
           function makeSelector(el) {
@@ -12472,8 +12483,8 @@ ${_composeSel ? `- SUGGESTED COMPOSE SELECTOR: ${_composeSel}` : ''}`;
           // Inputs first (all of them), then others up to 25 total
           const others = otherSignals.slice(0, Math.max(0, 25 - inputSignals.length));
           return [...inputSignals, ...others];
-        }).catch(() => []);
-        if (_signals.length > 0) {
+      })) || [];
+      if (_signals.length > 0) {
           _domSignals = _signals.map(s => {
             const parts = [s.selector];
             if (s.tag) parts.push(`<${s.tag}>`);
@@ -12492,7 +12503,6 @@ ${_composeSel ? `- SUGGESTED COMPOSE SELECTOR: ${_composeSel}` : ''}`;
           }).join('\n');
           const _inputCount = _signals.filter(s => s.isInput).length;
           logger.info(`[playwright.agent] turn-loop: DOM signals dump (${_signals.length} signals, ${_inputCount} inputs prioritized):\n${_domSignals}`);
-        }
       }
     } catch (_) {}
 
@@ -12558,6 +12568,54 @@ ${_composeSel ? `- SUGGESTED COMPOSE SELECTOR: ${_composeSel}` : ''}`;
         }
       }
     } catch (_) {}
+
+    // ── Goal-entity element scan ──
+    // The snapshot caps at 80 elements — on dense grids (observed: eBay with
+    // 787 interactive elements → snapshot showed only the filter sidebar, the
+    // product target never reached the LLM and it scrolled blind for 8 turns).
+    // Scan the DOM for elements whose text/aria-label matches the goal's
+    // entity terms and inject them as explicit click candidates.
+    let _goalMatchesHint = '';
+    if (_goalEntities.length) {
+      try {
+        const _terms = _goalEntities.map(e => String(e).toLowerCase()).filter(t => t.length > 1).slice(0, 8);
+        if (_terms.length) {
+          const _scanRes = await _engineEval(sessionId, `(() => {
+            const terms = ${JSON.stringify(_terms)};
+            const out = [];
+            const seen = new Set();
+            const els = document.querySelectorAll('a, button, [role="link"], [role="button"], [role="option"], [role="menuitem"], li, h1, h2, h3, [class*="item" i], [class*="card" i], [class*="result" i]');
+            for (const el of els) {
+              const r = el.getBoundingClientRect();
+              if (r.width < 2 || r.height < 2) continue;
+              const t = ((el.innerText || el.textContent || '') + ' ' + (el.getAttribute('aria-label') || '')).trim().toLowerCase();
+              if (!t) continue;
+              const hits = terms.filter(x => t.includes(x));
+              if (hits.length < Math.min(2, terms.length)) continue;
+              let target = el;
+              while (target.children.length === 1 && target.firstElementChild && (target.firstElementChild.innerText || '').toLowerCase().includes(hits[0])) {
+                target = target.firstElementChild;
+              }
+              const key = target.tagName + '|' + (target.href || '') + '|' + t.slice(0, 40);
+              if (seen.has(key)) continue;
+              seen.add(key);
+              let sel = null;
+              if (target.id) sel = '#' + target.id;
+              else if (target.getAttribute('data-testid')) sel = target.tagName.toLowerCase() + '[data-testid="' + target.getAttribute('data-testid') + '"]';
+              out.push({ sel, tag: target.tagName, text: t.slice(0, 140), href: target.href || '', y: Math.round(r.y), hits: hits.length });
+              if (out.length >= 8) break;
+            }
+            return out;
+          })()`, 8000);
+          const _matches = Array.isArray(_scanRes?.result) ? _scanRes.result : [];
+          if (_matches.length) {
+            _goalMatchesHint = `\n🎯 GOAL-MATCHED ELEMENTS (entity scan — the snapshot's 80-element cap may not show these; click them via clickByText or clickBySelector):\n`
+              + _matches.map((m, i) => `  ${i + 1}. <${m.tag.toLowerCase()}> y=${m.y} "${m.text.replace(/\n/g, ' ').slice(0, 110)}"${m.sel ? ` selector="${m.sel}"` : ''}${m.href ? ` href="${m.href.slice(0, 90)}"` : ''}`).join('\n') + '\n';
+            logger.info(`[playwright.agent] turn-loop: goal-entity scan found ${_matches.length} candidate(s) matching [${_terms.join(', ')}]`);
+          }
+        }
+      } catch (_) {}
+    }
 
     // ── Open menu detection (general — uses ARIA roles + class heuristics) ──
     // Detect open menus/dialogs and capture their contents. When a menu is open,
@@ -12832,7 +12890,7 @@ ${textAlreadyEntered ? '\n✅ TEXT ALREADY ENTERED via keyboard.type and verifie
 ${extractedText && !textAlreadyEntered ? `\n📝 TEXT TO TYPE (use this EXACT text in reactFill): "${extractedText}"\n` : ''}
 ${_probeInfo ? _probeInfo + '\n' : ''}
 ${_ocrText ? `\nOCR SCREEN CAPTURE (what's actually visible on screen — TRUST THIS over DOM snapshot. If OCR shows a compose modal with "Create a post" or "What do you want to talk about?", the modal IS open even if the DOM says otherwise. Type text into the compose box or click Post.):\n${_ocrText}\n` : ''}
-${_domSignals ? `\nDOM STATE SIGNALS (active UI elements + ready-made selectors — use these selectors in clickBySelector/reactFill):\n${_domSignals}\n` : ''}${_searchDisambiguationHint || ''}${_urlDriftHint || ''}${_openMenuHint || ''}
+${_domSignals ? `\nDOM STATE SIGNALS (active UI elements + ready-made selectors — use these selectors in clickBySelector/reactFill):\n${_domSignals}\n` : ''}${_searchDisambiguationHint || ''}${_urlDriftHint || ''}${_goalMatchesHint || ''}${_openMenuHint || ''}
 ${_heartbeatHistory ? `\nPAGE STATE HISTORY (last ${Math.min(10, heartbeat.buffer.length)} heartbeat ticks, oldest first — use this to see what appeared/disappeared on the page):\n${_heartbeatHistory}\n` : ''}
 ${_selectorHints}
 VISIBLE PAGE TEXT (first 2000 chars):
@@ -12855,7 +12913,7 @@ Turn ${turn}/${MAX_TURNS}. What is your next action? (DO NOT snapshot - act dire
       _actionRaw = await askWithMessages([
         { role: 'system', content: TURN_LOOP_SYSTEM_PROMPT },
         { role: 'user', content: _turnUser },
-      ], { temperature: 0.1, maxTokens: 400, responseTimeoutMs: 20000 });
+      ], { temperature: 0.1, maxTokens: 600, responseTimeoutMs: 20000 });
     } catch (_llmErr) {
       logger.warn(`[playwright.agent] turn-loop: LLM call failed at turn ${turn}: ${_llmErr.message}`);
       break;
@@ -12864,10 +12922,26 @@ Turn ${turn}/${MAX_TURNS}. What is your next action? (DO NOT snapshot - act dire
     // Parse the action
     let _action = null;
     if (_actionRaw) {
-      try {
-        const _m = _actionRaw.match(/\{[\s\S]*\}/);
-        if (_m) _action = JSON.parse(_m[0]);
-      } catch (_) { /* parse error */ }
+      const _tryParse = (s) => {
+        try { const o = JSON.parse(s); return o && typeof o === 'object' ? o : null; } catch (_) { return null; }
+      };
+      _action = _tryParse(_actionRaw.trim());
+      if (!_action) {
+        // Reasoning prose around the JSON breaks a single greedy match — the
+        // model writes "...matching \"Akko 5098B {\" then the real object.
+        // Scan every balanced {...} span (one nesting level) and take the
+        // first that parses to an object (action check happens below).
+        for (const m of _actionRaw.matchAll(/\{(?:[^{}]|\{[^{}]*\})*\}/g)) {
+          const _o = _tryParse(m[0]);
+          if (_o && (typeof _o.action === 'string' || typeof (_o.action || {}).action === 'string' || typeof _o.type === 'string')) { _action = _o; break; }
+        }
+      }
+      if (!_action) {
+        try {
+          const _m = _actionRaw.match(/\{[\s\S]*\}/);
+          if (_m) _action = JSON.parse(_m[0]);
+        } catch (_) { /* parse error */ }
+      }
     }
 
     // Normalize nested action: LLMs sometimes return {"action": {"action": "click", ...}}
@@ -12913,8 +12987,8 @@ Turn ${turn}/${MAX_TURNS}. What is your next action? (DO NOT snapshot - act dire
       // If 'failed' or 'unverified', reject and continue the loop.
       try {
         const _retPage = engine.getPage(sessionId);
-        if (_retPage && _preActionState) {
-          const _retPostState = await _captureStateSnapshot(sessionId, _retPage);
+        if (_preActionState) {
+          const _retPostState = await _captureStateSnapshot(sessionId, _retPage || null);
           const _lastActionEl = _loopTranscript.length > 0
             ? (_loopTranscript[_loopTranscript.length - 1].outcome?.element || null)
             : null;
@@ -12963,6 +13037,10 @@ Turn ${turn}/${MAX_TURNS}. What is your next action? (DO NOT snapshot - act dire
             if (_structPage) {
               _structPageText = await _structPage.evaluate(() => document.body.innerText.slice(0, 8000)).catch(() => '');
               try { _structPageUrl = _structPage.url(); } catch (_) {}
+            } else {
+              // Extension-bound session — same read via browserAct evaluate.
+              _structPageText = (await _observeEval(sessionId, () => document.body.innerText.slice(0, 8000))) || '';
+              _structPageUrl = String((await _observeEval(sessionId, () => window.location.href)) || '');
             }
           } catch (_) {}
           let _structPassed = 0;
@@ -13159,10 +13237,7 @@ Turn ${turn}/${MAX_TURNS}. What is your next action? (DO NOT snapshot - act dire
         // If state is unchanged, the action was a no-op — skip and inject hint
         let _currentStateHash = null;
         try {
-          const _ePage = engine.getPage(sessionId);
-          if (_ePage) {
-            _currentStateHash = await _ePage.evaluate(() => (document.body?.innerText || '').length + ':' + (document.body?.innerText || '').slice(0, 200)).catch(() => null);
-          }
+          _currentStateHash = await _observeEval(sessionId, () => (document.body?.innerText || '').length + ':' + (document.body?.innerText || '').slice(0, 200));
         } catch (_) {}
         if (_lastStateHash && _currentStateHash && _lastStateHash === _currentStateHash) {
           logger.warn(`[playwright.agent] turn-loop: skipping duplicate ${_action.action} (identical action + unchanged page state) — inject hint to try different approach`);
@@ -13219,9 +13294,10 @@ Turn ${turn}/${MAX_TURNS}. What is your next action? (DO NOT snapshot - act dire
     _preActionState = null;
     try {
       const _prePage = engine.getPage(sessionId);
-      if (_prePage) {
-        _preActionState = await _captureStateSnapshot(sessionId, _prePage);
-      }
+      // _captureStateSnapshot routes through _observeEval when _prePage is
+      // null, so extension-bound sessions get pre/post state parity.
+      _preActionState = await _captureStateSnapshot(sessionId, _prePage || null);
+      if (_preActionState && _preActionState.bodyLen === 0 && !_prePage) _preActionState = null;
     } catch (_) {}
     try {
       const _execAction = { ..._action, sessionId, headed, timeoutMs };
@@ -13254,8 +13330,8 @@ Turn ${turn}/${MAX_TURNS}. What is your next action? (DO NOT snapshot - act dire
     if (_outcome.ok && _preActionState) {
       try {
         const _postPage = engine.getPage(sessionId);
-        if (_postPage) {
-          const _postActionState = await _captureStateSnapshot(sessionId, _postPage);
+        const _postActionState = await _captureStateSnapshot(sessionId, _postPage || null);
+        if (_postActionState && _postActionState.bodyLen > 0) {
           const _actionElement = _outcome.element || null;
           const _pc = await _verifyPostcondition({
             goal, verificationGoal, sessionId, headed,

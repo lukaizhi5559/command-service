@@ -636,6 +636,36 @@ class CommandServiceMCPServer {
         return;
       }
 
+      // ── GET /ext.status ─────────────────────────────────────────────────────
+      // Reports whether the ThinkDrop Chrome extension bridge is connected.
+      if (req.method === 'GET' && req.url === '/ext.status') {
+        try {
+          const extGateway = require('./ext.gateway.cjs');
+          res.writeHead(200);
+          res.end(JSON.stringify(extGateway.status()));
+        } catch (e) {
+          res.writeHead(200);
+          res.end(JSON.stringify({ connected: false, error: e.message }));
+        }
+        return;
+      }
+
+      // ── GET /ext.sessions ───────────────────────────────────────────────────
+      // Bound session → real tab info (url/title). The stategraph uses this
+      // to resolve live-page referents ("on this page", "here") when the
+      // frontmost app isn't the browser.
+      if (req.method === 'GET' && req.url === '/ext.sessions') {
+        try {
+          const extGateway = require('./ext.gateway.cjs');
+          res.writeHead(200);
+          res.end(JSON.stringify(await extGateway.sessions()));
+        } catch (e) {
+          res.writeHead(200);
+          res.end(JSON.stringify({ connected: false, sessions: [], error: e.message }));
+        }
+        return;
+      }
+
       // ── POST /ping ────────────────────────────────────────────────────────────
       // MCP-envelope no-op used by ThinkDropMCPClient preflight checks.
       if (req.method === 'POST' && req.url === '/ping') {
@@ -1287,6 +1317,11 @@ class CommandServiceMCPServer {
               // Callers that already ran capability.search hand the retrieved
               // pool back — one retrieval, one selection, no double scan.
               candidates: Array.isArray(payload.candidates) && payload.candidates.length ? payload.candidates : undefined,
+              // ThinkDrop extension connectivity — comms-graph probes
+              // /ext.status and passes the fact through; when true the
+              // selector treats extension-backed browser agents as the
+              // zero-setup authenticated route (see SELECT rules).
+              extConnected: !!payload.extConnected,
               llmCaller: (prompt) => skillLlm.askWithMessages(
                 [{ role: 'user', content: prompt }],
                 { temperature: 0, maxTokens: 300, taskType: 'capability_select',
@@ -1871,6 +1906,18 @@ class CommandServiceMCPServer {
       res.writeHead(404);
       res.end(JSON.stringify({ error: 'Not found' }));
     });
+
+    // ── ThinkDrop Chrome extension gateway ──────────────────────────────────
+    // WebSocket endpoint ws://localhost:<PORT>/ext — the extension connects
+    // here when its toolbar icon is clicked. /ext.status reports connection.
+    try {
+      const extGateway = require('./ext.gateway.cjs');
+      extGateway.attach(healthServer);
+      logger.info(`[Server] Extension gateway ready at ws://localhost:${PORT}/ext`);
+    } catch (e) {
+      logger.warn(`[Server] Extension gateway failed to attach (non-fatal): ${e.message}`);
+    }
+
     healthServer.listen(PORT, () => {
       logger.info(`Health endpoint listening on http://localhost:${PORT}/health`);
     });
