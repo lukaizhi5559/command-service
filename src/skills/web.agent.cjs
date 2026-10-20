@@ -631,6 +631,19 @@ async function actionDiscoverTaskUrl({ domain, task, maxResults = 5, candidateUr
   if (!domain) return { ok: false, error: 'domain is required' };
   if (!task)   return { ok: false, error: 'task is required' };
 
+  // Defensive strip — callers sometimes hand the raw task text carrying
+  // "(Context from prior turn: …)" / "[Resume context: …]" wrappers, which
+  // poison every search query below ("site:x go to one (Context from …)").
+  try {
+    const { _stripTaskNoise } = require('./browser.agent.cjs');
+    task = _stripTaskNoise(task) || task;
+  } catch (_) {
+    task = String(task)
+      .replace(/\n*\(Context from prior turn:[^)]*\)\s*$/i, ' ')
+      .replace(/\[Resume context:[^\]]*\]/gi, ' ')
+      .replace(/\s+/g, ' ').trim();
+  }
+
   const cleanDomain = domain.replace(/^https?:\/\//, '').replace(/^www\./, '').replace(/\/$/, '');
   const domainBase = cleanDomain.split('.')[0]; // e.g. 'notion' from 'app.notion.com'
   logger.info(`[web.agent] discover_task_url: domain=${cleanDomain} task="${task.slice(0, 80)}" candidateUrl=${candidateUrl || 'none'}`);
@@ -649,89 +662,101 @@ async function actionDiscoverTaskUrl({ domain, task, maxResults = 5, candidateUr
     allCandidates.push({ url: candidateUrl, title: 'Previously verified URL', snippet: '', source: 'verified-cache' });
   }
 
+  // Strategies A–D are independent searchWeb calls — run them concurrently;
+  // serial execution multiplied discovery latency by the worst provider
+  // pacing slot (~3-4× on observed runs). Push-ordering differences don't
+  // matter: candidates are scored and deduped by URL below.
+  const _isSearchTask = /\b(search|find|look\s*up|filter|unread|from:|subject:|label:|starred|is:unread|check.*for|show.*from|list.*from)\b/i.test(task);
+  const serviceName = cleanDomain.split('.')[0]; // 'notion' from 'app.notion.com'
+
   // ── Strategy A: site-scoped search ──────────────────────────────────────
-  const queryA = `site:${cleanDomain} ${task.slice(0, 100)}`;
-  logger.info(`[web.agent] discover_task_url: strategy A (site-scoped): "${queryA.slice(0, 80)}"`);
-  const resultA = await searchWeb(queryA, maxResults).catch(() => ({ ok: false }));
-  if (resultA.ok && resultA.results) {
-    for (const r of resultA.results) {
-      if (!_isParkingContent(r.title, r.snippet, r.url)) {
-        allCandidates.push({ url: r.url, title: r.title, snippet: r.snippet, source: 'site-scoped' });
+  const runA = async () => {
+    const queryA = `site:${cleanDomain} ${task.slice(0, 100)}`;
+    logger.info(`[web.agent] discover_task_url: strategy A (site-scoped): "${queryA.slice(0, 80)}"`);
+    const resultA = await searchWeb(queryA, maxResults).catch(() => ({ ok: false }));
+    if (resultA.ok && resultA.results) {
+      for (const r of resultA.results) {
+        if (!_isParkingContent(r.title, r.snippet, r.url)) {
+          allCandidates.push({ url: r.url, title: r.title, snippet: r.snippet, source: 'site-scoped' });
+        }
       }
     }
-  }
+  };
 
   // ── Strategy B: broad search + snippet URL extraction ───────────────────
-  const queryB = `${cleanDomain} ${task.slice(0, 80)} how to page URL`;
-  logger.info(`[web.agent] discover_task_url: strategy B (broad): "${queryB.slice(0, 80)}"`);
-  const resultB = await searchWeb(queryB, maxResults).catch(() => ({ ok: false }));
-  if (resultB.ok && resultB.results) {
-    for (const r of resultB.results) {
-      if (!_isParkingContent(r.title, r.snippet, r.url)) {
-        // The result URL itself might be on the service domain
-        allCandidates.push({ url: r.url, title: r.title, snippet: r.snippet, source: 'broad-result' });
-        // Also extract URLs mentioned in snippets (tutorials often say "go to exampleapp.com/create")
-        // Include #, ?, =, &, % and other common URL chars so deep links like mail.google.com/mail/u/0/#inbox?compose=new are captured.
-        // Extract URLs matching the full cleanDomain/path pattern
-        const snippetUrls = (r.snippet || '').match(new RegExp(
-          cleanDomain.replace(/\./g, '\\.') + '\\/[a-z0-9\/_#?=&.~%+-]+', 'gi'
-        ));
-        // Also extract shortcut-domain URLs (e.g. notion.new, notion.so) —
-        // serviceName.<tld> patterns that may not match cleanDomain
-        const shortcutSnippetUrls = (r.snippet || '').match(new RegExp(
-          domainBase.replace(/\./g, '\\.') + '\\.[a-z]{2,}(?:\\/[a-z0-9\/_#?=&.~%+-]*)?', 'gi'
-        ));
-        if (snippetUrls) {
-          for (const su of snippetUrls) {
-            const fullUrl = su.startsWith('http') ? su : `https://${su}`;
-            allCandidates.push({ url: fullUrl, title: r.title, snippet: r.snippet, source: 'broad-snippet' });
+  const runB = async () => {
+    const queryB = `${cleanDomain} ${task.slice(0, 80)} how to page URL`;
+    logger.info(`[web.agent] discover_task_url: strategy B (broad): "${queryB.slice(0, 80)}"`);
+    const resultB = await searchWeb(queryB, maxResults).catch(() => ({ ok: false }));
+    if (resultB.ok && resultB.results) {
+      for (const r of resultB.results) {
+        if (!_isParkingContent(r.title, r.snippet, r.url)) {
+          // The result URL itself might be on the service domain
+          allCandidates.push({ url: r.url, title: r.title, snippet: r.snippet, source: 'broad-result' });
+          // Also extract URLs mentioned in snippets (tutorials often say "go to exampleapp.com/create")
+          // Include #, ?, =, &, % and other common URL chars so deep links like mail.google.com/mail/u/0/#inbox?compose=new are captured.
+          // Extract URLs matching the full cleanDomain/path pattern
+          const snippetUrls = (r.snippet || '').match(new RegExp(
+            cleanDomain.replace(/\./g, '\\.') + '\\/[a-z0-9\/_#?=&.~%+-]+', 'gi'
+          ));
+          // Also extract shortcut-domain URLs (e.g. notion.new, notion.so) —
+          // serviceName.<tld> patterns that may not match cleanDomain
+          const shortcutSnippetUrls = (r.snippet || '').match(new RegExp(
+            domainBase.replace(/\./g, '\\.') + '\\.[a-z]{2,}(?:\\/[a-z0-9\/_#?=&.~%+-]*)?', 'gi'
+          ));
+          if (snippetUrls) {
+            for (const su of snippetUrls) {
+              const fullUrl = su.startsWith('http') ? su : `https://${su}`;
+              allCandidates.push({ url: fullUrl, title: r.title, snippet: r.snippet, source: 'broad-snippet' });
+            }
           }
-        }
-        if (shortcutSnippetUrls) {
-          for (const su of shortcutSnippetUrls) {
-            const fullUrl = su.startsWith('http') ? su : `https://${su}`;
-            // Avoid duplicates already added via snippetUrls
-            if (!allCandidates.some(c => c.url === fullUrl)) {
-              allCandidates.push({ url: fullUrl, title: r.title, snippet: r.snippet, source: 'broad-snippet-shortcut' });
+          if (shortcutSnippetUrls) {
+            for (const su of shortcutSnippetUrls) {
+              const fullUrl = su.startsWith('http') ? su : `https://${su}`;
+              // Avoid duplicates already added via snippetUrls
+              if (!allCandidates.some(c => c.url === fullUrl)) {
+                allCandidates.push({ url: fullUrl, title: r.title, snippet: r.snippet, source: 'broad-snippet-shortcut' });
+              }
             }
           }
         }
       }
     }
-  }
+  };
 
   // ── Strategy C: shortcut/direct URL search ─────────────────────────────
   // Search for "<serviceName> <taskType> direct URL shortcut" to find shortcut
   // domains like notion.new, docs.google.com/forms, etc.
-  const serviceName = cleanDomain.split('.')[0]; // 'notion' from 'app.notion.com'
-  const taskType = /create|new|compose|write|draft/i.test(task) ? 'create new page' : task.split(' ').slice(0, 3).join(' ');
-  const queryC = `${serviceName} ${taskType} direct URL shortcut`;
-  logger.info(`[web.agent] discover_task_url: strategy C (shortcut): "${queryC.slice(0, 80)}"`);
-  const resultC = await searchWeb(queryC, maxResults).catch(() => ({ ok: false }));
-  if (resultC.ok && resultC.results) {
-    for (const r of resultC.results) {
-      if (!_isParkingContent(r.title, r.snippet, r.url)) {
-        allCandidates.push({ url: r.url, title: r.title, snippet: r.snippet, source: 'shortcut-result' });
-        // Extract shortcut URLs from snippets — patterns like notion.new, notion.so, etc.
-        const shortcutUrls = (r.snippet || '').match(new RegExp(
-          serviceName.replace(/\./g, '\\\.') + '\\.[a-z]{2,}(?:\\/[a-z0-9\/_#?=&.~%+-]*)?', 'gi'
-        ));
-        if (shortcutUrls) {
-          for (const su of shortcutUrls) {
-            const fullUrl = su.startsWith('http') ? su : `https://${su}`;
-            allCandidates.push({ url: fullUrl, title: r.title, snippet: r.snippet, source: 'shortcut-snippet' });
+  const runC = async () => {
+    const taskType = /create|new|compose|write|draft/i.test(task) ? 'create new page' : task.split(' ').slice(0, 3).join(' ');
+    const queryC = `${serviceName} ${taskType} direct URL shortcut`;
+    logger.info(`[web.agent] discover_task_url: strategy C (shortcut): "${queryC.slice(0, 80)}"`);
+    const resultC = await searchWeb(queryC, maxResults).catch(() => ({ ok: false }));
+    if (resultC.ok && resultC.results) {
+      for (const r of resultC.results) {
+        if (!_isParkingContent(r.title, r.snippet, r.url)) {
+          allCandidates.push({ url: r.url, title: r.title, snippet: r.snippet, source: 'shortcut-result' });
+          // Extract shortcut URLs from snippets — patterns like notion.new, notion.so, etc.
+          const shortcutUrls = (r.snippet || '').match(new RegExp(
+            serviceName.replace(/\./g, '\\\.') + '\\.[a-z]{2,}(?:\\/[a-z0-9\/_#?=&.~%+-]*)?', 'gi'
+          ));
+          if (shortcutUrls) {
+            for (const su of shortcutUrls) {
+              const fullUrl = su.startsWith('http') ? su : `https://${su}`;
+              allCandidates.push({ url: fullUrl, title: r.title, snippet: r.snippet, source: 'shortcut-snippet' });
+            }
           }
         }
       }
     }
-  }
+  };
 
   // ── Strategy D: search URL syntax discovery ────────────────────────────
   // For search/filter tasks, search for "<service> search URL syntax" or
   // "<service> filter URL parameters" to find documentation about the service's
   // search URL format. Extract URL patterns from the results.
-  const _isSearchTask = /\b(search|find|look\s*up|filter|unread|from:|subject:|label:|starred|is:unread|check.*for|show.*from|list.*from)\b/i.test(task);
-  if (_isSearchTask) {
+  const runD = async () => {
+    if (!_isSearchTask) return;
     const queryD = `${serviceName} search URL syntax filter parameters`;
     logger.info(`[web.agent] discover_task_url: strategy D (search syntax): "${queryD.slice(0, 80)}"`);
     const resultD = await searchWeb(queryD, maxResults).catch(() => ({ ok: false }));
@@ -763,7 +788,9 @@ async function actionDiscoverTaskUrl({ domain, task, maxResults = 5, candidateUr
         }
       }
     }
-  }
+  };
+
+  await Promise.all([runA(), runB(), runC(), runD()]);
 
   if (allCandidates.length === 0) {
     logger.info('[web.agent] discover_task_url: no candidates found from any strategy');
