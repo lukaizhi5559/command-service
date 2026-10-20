@@ -17,8 +17,8 @@ function deriveSessionId(agentId) {
 // Serialize work on a browser session — delegates to browser.agent's shared
 // mutex map so atomic agents can't race each other (or a legacy run) on the
 // same session.
-async function withSessionMutex(sessionId, fn) {
-  return _withSessionMutex(sessionId, fn);
+async function withSessionMutex(sessionId, fn, owner) {
+  return _withSessionMutex(sessionId, fn, owner);
 }
 
 // "in an open tab / the open tab" — the user is asking for an ALREADY-OPEN tab
@@ -38,4 +38,30 @@ function qualifyOpenTab(sessionId, text) {
   return OPEN_TAB_RE.test(String(text || '')) ? `open:${sid}` : sid;
 }
 
-module.exports = { deriveSessionId, withSessionMutex, qualifyOpenTab, OPEN_TAB_RE };
+/**
+ * Normalize a bare engine session name to its bound extension session when
+ * one exists. Plans sometimes emit `ebay_agent` (agentId-derived) while the
+ * live binding is `ext:ebay_agent` — skills then ran engine paths and found
+ * "no page" / "no URL resolved" (observed: "go back to my ebay tab" →
+ * turn.loop on `ebay_agent` → turn_loop_exhausted). Returns the input
+ * unchanged when the extension is disconnected or nothing is bound.
+ */
+async function resolveExtSession(sessionId) {
+  const sid = String(sessionId || '');
+  if (!sid || sid.startsWith('ext:') || sid.startsWith('_')) return sid;
+  try {
+    const _gw = require('../../../ext.gateway.cjs');
+    if (!_gw.hasExtension || !_gw.hasExtension()) return sid;
+    const bound = ((await _gw.sessions().catch(() => null))?.sessions || [])
+      .filter(s => s && s.alive !== false);
+    const exact = bound.find(s => s.sessionId === `ext:${sid}`);
+    if (exact) return exact.sessionId;
+    // Name-derived: ebay_agent → ebay, match ext:<name>_agent
+    const base = sid.replace(/_agent$/i, '');
+    const named = bound.find(s => s.sessionId === `ext:${base}_agent`);
+    if (named) return named.sessionId;
+    return sid;
+  } catch (_) { return sid; }
+}
+
+module.exports = { deriveSessionId, withSessionMutex, qualifyOpenTab, resolveExtSession, OPEN_TAB_RE };

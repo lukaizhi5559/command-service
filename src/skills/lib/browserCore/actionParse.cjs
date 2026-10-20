@@ -212,6 +212,36 @@ function _parseAction(text) {
     }
   } catch (_) {}
 
+  // 5. Pure-prose fallback — no JSON, no verb line, no quotes. The model
+  //    narrates intent ("I need to click on the Save button and fill the
+  //    title field"). Map the clearest intent to verb grammar — better one
+  //    concrete step than a wasted turn (observed: calendar fill died on
+  //    'Could not parse LLM action: "I need…').
+  {
+    let _m;
+    if ((_m = t.match(/click\s+(?:on\s+)?(?:the\s+)?["'“]([^"'”]{2,60})["'”]/i))) {
+      return _sanitize({ action: 'click', target: _m[1] });
+    }
+    if ((_m = t.match(/click\s+(?:on\s+)?(?:the\s+)?([A-Z][\w\s&+'-]{1,40}?)(?=\s+(?:button|link|item|option|menu|tab|icon|checkbox|field)\b|[.,;]|$)/i))) {
+      const _tgt = _m[1].trim();
+      if (_tgt.length > 1) return _sanitize({ action: 'click', target: _tgt });
+    }
+    if ((_m = t.match(/type\s+["'“]([^"'”]{1,160})["'”]\s+into\s+(?:the\s+)?["'“]?([^"'”]{0,60})["'”]?/i))) {
+      return _sanitize({ action: 'type', value: _m[1], target: (_m[2] || '').trim() });
+    }
+    if ((_m = t.match(/navigate\s+to\s+(https?:\/\/\S+)/i))) {
+      return _sanitize({ action: 'navigate', url: _m[1] });
+    }
+    if ((_m = t.match(/press\s+(?:the\s+)?(enter|return|tab|escape|esc|space|backspace|delete|home|end|pageup|pagedown)\b/i))) {
+      return _sanitize({ action: 'press', key: _m[1] });
+    }
+    if (/scroll\s+(?:down|further|more)/i.test(t)) return _sanitize({ action: 'scroll', direction: 'down' });
+    if (/scroll\s+up|scroll\s+back/i.test(t)) return _sanitize({ action: 'scroll', direction: 'up' });
+    if (/wait\s+for|let\s+(?:the\s+)?(?:page|form)\s+(?:load|settle)/i.test(t)) {
+      return { action: 'waitForStableText' };
+    }
+  }
+
   logger.info(`[instruction.runner] _parseAction: no parseable action in "${t.slice(0, 80)}"`);
   return null;
 }

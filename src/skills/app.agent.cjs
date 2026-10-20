@@ -3593,16 +3593,16 @@ const APP_SHORTCUT_OVERRIDES = {
   'WhatsApp':          { save: 'Cmd+S', select_all: 'Cmd+A', copy: 'Cmd+C', paste: 'Cmd+V', cut: 'Cmd+X', undo: 'Cmd+Z', redo: 'Cmd+Shift+Z', find: 'Cmd+F', new_chat: 'Cmd+N' },
   'Messages':          { save: 'Cmd+S', select_all: 'Cmd+A', copy: 'Cmd+C', paste: 'Cmd+V', cut: 'Cmd+X', undo: 'Cmd+Z', redo: 'Cmd+Shift+Z', find: 'Cmd+F', new_message: 'Cmd+N' },
   // Browsers
-  'Google Chrome':     { quick_open: 'Cmd+L', save: 'Cmd+S', select_all: 'Cmd+A', copy: 'Cmd+C', paste: 'Cmd+V', cut: 'Cmd+X', undo: 'Cmd+Z', redo: 'Cmd+Shift+Z', find: 'Cmd+F', new_tab: 'Cmd+T', close_window: 'Cmd+W', refresh: 'Cmd+R', zoom_in: 'Cmd+=', zoom_out: 'Cmd+-', reset_zoom: 'Cmd+0', toggle_fullscreen: 'Ctrl+Cmd+F' },
-  'Safari':            { quick_open: 'Cmd+L', save: 'Cmd+S', select_all: 'Cmd+A', copy: 'Cmd+C', paste: 'Cmd+V', cut: 'Cmd+X', undo: 'Cmd+Z', redo: 'Cmd+Shift+Z', find: 'Cmd+F', new_tab: 'Cmd+T', close_window: 'Cmd+W', refresh: 'Cmd+R', zoom_in: 'Cmd+=', zoom_out: 'Cmd+-', reset_zoom: 'Cmd+0', toggle_fullscreen: 'Ctrl+Cmd+F' },
-  'Firefox':           { quick_open: 'Cmd+L', save: 'Cmd+S', select_all: 'Cmd+A', copy: 'Cmd+C', paste: 'Cmd+V', cut: 'Cmd+X', undo: 'Cmd+Z', redo: 'Cmd+Shift+Z', find: 'Cmd+F', new_tab: 'Cmd+T', close_window: 'Cmd+W', refresh: 'Cmd+R', zoom_in: 'Cmd+=', zoom_out: 'Cmd+-', reset_zoom: 'Cmd+0', toggle_fullscreen: 'Ctrl+Cmd+F' },
+  'Google Chrome':     { quick_open: 'Cmd+L', save: 'Cmd+S', select_all: 'Cmd+A', copy: 'Cmd+C', paste: 'Cmd+V', cut: 'Cmd+X', undo: 'Cmd+Z', redo: 'Cmd+Shift+Z', find: 'Cmd+F', new_tab: 'Cmd+T', close_tab: 'Cmd+W', close_window: 'Cmd+W', refresh: 'Cmd+R', zoom_in: 'Cmd+=', zoom_out: 'Cmd+-', reset_zoom: 'Cmd+0', toggle_fullscreen: 'Ctrl+Cmd+F' },
+  'Safari':            { quick_open: 'Cmd+L', save: 'Cmd+S', select_all: 'Cmd+A', copy: 'Cmd+C', paste: 'Cmd+V', cut: 'Cmd+X', undo: 'Cmd+Z', redo: 'Cmd+Shift+Z', find: 'Cmd+F', new_tab: 'Cmd+T', close_tab: 'Cmd+W', close_window: 'Cmd+W', refresh: 'Cmd+R', zoom_in: 'Cmd+=', zoom_out: 'Cmd+-', reset_zoom: 'Cmd+0', toggle_fullscreen: 'Ctrl+Cmd+F' },
+  'Firefox':           { quick_open: 'Cmd+L', save: 'Cmd+S', select_all: 'Cmd+A', copy: 'Cmd+C', paste: 'Cmd+V', cut: 'Cmd+X', undo: 'Cmd+Z', redo: 'Cmd+Shift+Z', find: 'Cmd+F', new_tab: 'Cmd+T', close_tab: 'Cmd+W', close_window: 'Cmd+W', refresh: 'Cmd+R', zoom_in: 'Cmd+=', zoom_out: 'Cmd+-', reset_zoom: 'Cmd+0', toggle_fullscreen: 'Ctrl+Cmd+F' },
 };
 
 const SHORTCUT_CATEGORY_DEFAULTS = {
   // NOTE: new_file, new_window, close_window are handled by shell.run (tier 6) in app.runner.cjs.
   //       goto_line is kept as a fallback (used when shell.run can't handle it — no file path).
   editor:    { save: 'Cmd+S', save_as: 'Cmd+Shift+S', select_all: 'Cmd+A', copy: 'Cmd+C', paste: 'Cmd+V', cut: 'Cmd+X', undo: 'Cmd+Z', redo: 'Cmd+Shift+Z', find: 'Cmd+F', find_replace: 'Option+Cmd+F', new_tab: 'Cmd+T', close_tab: 'Cmd+W', toggle_comment: 'Cmd+/', format_document: 'Shift+Option+F', goto_line: 'Ctrl+G', goto_symbol: 'Cmd+Shift+O', goto_definition: 'F12', rename_symbol: 'F2', quick_fix: 'Cmd+.', toggle_sidebar: 'Cmd+B', toggle_terminal: 'Ctrl+`', toggle_fullscreen: 'Ctrl+Cmd+F', zoom_in: 'Cmd+=', zoom_out: 'Cmd+-', reset_zoom: 'Cmd+0', fold: 'Option+Cmd+[', unfold: 'Option+Cmd+]', split_editor: 'Cmd+\\', run: 'F5', build: 'Cmd+Shift+B', refresh: 'Cmd+R' },
-  browser:   { save: 'Cmd+S', select_all: 'Cmd+A', copy: 'Cmd+C', paste: 'Cmd+V', cut: 'Cmd+X', undo: 'Cmd+Z', redo: 'Cmd+Shift+Z', find: 'Cmd+F', new_tab: 'Cmd+T', close_window: 'Cmd+W', refresh: 'Cmd+R', zoom_in: 'Cmd+=', zoom_out: 'Cmd+-', reset_zoom: 'Cmd+0', toggle_fullscreen: 'Ctrl+Cmd+F' },
+  browser:   { save: 'Cmd+S', select_all: 'Cmd+A', copy: 'Cmd+C', paste: 'Cmd+V', cut: 'Cmd+X', undo: 'Cmd+Z', redo: 'Cmd+Shift+Z', find: 'Cmd+F', new_tab: 'Cmd+T', close_tab: 'Cmd+W', close_window: 'Cmd+W', refresh: 'Cmd+R', zoom_in: 'Cmd+=', zoom_out: 'Cmd+-', reset_zoom: 'Cmd+0', toggle_fullscreen: 'Ctrl+Cmd+F' },
   chat:      { save: 'Cmd+S', select_all: 'Cmd+A', copy: 'Cmd+C', paste: 'Cmd+V', cut: 'Cmd+X', undo: 'Cmd+Z', redo: 'Cmd+Shift+Z', find: 'Cmd+F', send_message: 'Return' },
   terminal:  { save: 'Cmd+S', select_all: 'Cmd+A', copy: 'Cmd+C', paste: 'Cmd+V', cut: 'Cmd+X', find: 'Cmd+F', new_tab: 'Cmd+T', close_window: 'Cmd+W' },
   design:    { save: 'Cmd+S', select_all: 'Cmd+A', copy: 'Cmd+C', paste: 'Cmd+V', cut: 'Cmd+X', undo: 'Cmd+Z', redo: 'Cmd+Shift+Z', find: 'Cmd+F', zoom_in: 'Cmd+=', zoom_out: 'Cmd+-', reset_zoom: 'Cmd+0' },
@@ -6791,12 +6791,32 @@ async function actionReadUrl({ url, cleanup = 'deselect', appName, minChars, max
   // 2. Browser tier — open a NEW tab in the user's real browser and copy it.
   let scan = { ok: false, error: 'navigate_failed' };
   let navUsedUserTab = false;
-  const nav = await actionNavigateUrl({ url, appName, via: 'open', sessionId, agentId });
+  // Ext lane: reads are throwaway — never navigate a bound service tab to a
+  // foreign host (observed: read_url(google.com) hijacked ext:ebay_agent's
+  // tab, evicting the ebay page). Same-host reads reuse the bound tab;
+  // foreign hosts go to the dedicated background session.
+  let readSid = sessionId;
+  try {
+    const _gw = require('../ext.gateway.cjs');
+    if (_gw.hasExtension() && /^ext:/.test(sessionId || '') && !/^ext:bg:/.test(sessionId)) {
+      const _target = new URL(url).hostname.replace(/^www\./, '').toLowerCase();
+      const _bound = ((await _gw.sessions().catch(() => null))?.sessions || [])
+        .find(s => s.sessionId === sessionId);
+      const _boundHost = _bound?.url
+        ? new URL(_bound.url).hostname.replace(/^www\./, '').toLowerCase() : '';
+      if (_boundHost && _target && _boundHost !== _target &&
+          !_boundHost.endsWith('.' + _target) && !_target.endsWith('.' + _boundHost)) {
+        logger.info(`[app.agent] read_url: foreign host ${_target} vs bound ${_boundHost} on ${sessionId} — using ext:bg:read`);
+        readSid = 'ext:bg:read';
+      }
+    }
+  } catch (_) { /* session lookup unavailable — keep caller's sessionId */ }
+  const nav = await actionNavigateUrl({ url, appName, via: 'open', sessionId: readSid, agentId });
   if (nav.ok) {
     navUsedUserTab = nav.via === 'type'; // cross-fallback navigated the user's current tab
     scan = await actionScanPage({
       appName, url, useCache: false, maxWaitMs, captureHtml,
-      sessionId: nav.sessionId || sessionId, agentId,
+      sessionId: nav.sessionId || readSid, agentId,
       deselect: cleanup !== 'close',   // closing discards the selection anyway
     });
   }

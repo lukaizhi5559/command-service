@@ -5416,6 +5416,10 @@ function _extractGoalEntities(goal) {
     // leakage (VERIFY/VERIFICATION wrapper, CRITICAL/NOTE prompt clauses).
     'VERIFICATION', 'VERIFY', 'ONLY', 'CRITICAL', 'MUST', 'NOTE', 'EACH',
     'ALL', 'DO', 'NOT', 'AND', 'OR', 'TRUE', 'FALSE', 'IMPORTANT',
+    // Re-route/plan boilerplate leaks into goals via task strings (observed:
+    // BROWSER_ESCALATE goal yielded entities 'ALREADY, OPEN, Do, Type').
+    'ALREADY', 'OPEN', 'Do', 'Type', 'Click', 'Wait', 'Read', 'Return',
+    'Details', 'Open', 'First', 'Second', 'Item', 'Items', 'Page',
   ]);
   const entities = new Set();
   // Quoted phrases (single + double quotes) — these are the most reliable
@@ -5431,6 +5435,24 @@ function _extractGoalEntities(goal) {
   for (const c of _caps) {
     if (!_stop.has(c) && c.length > 1) {
       entities.add(c);
+    }
+  }
+  // Lowercase content-word fallback — goals like "click on the first
+  // mechanical keyboard listing" have no quoted/capitalized terms, leaving the
+  // goal-entity scan with nothing to match (observed: eBay turn-loop scanned
+  // zero candidates → LLM saw only the capped sidebar → blind scrolling).
+  if (!entities.size) {
+    const _lcStop = new Set([
+      'click', 'open', 'first', 'second', 'third', 'item', 'items', 'page',
+      'into', 'from', 'that', 'this', 'with', 'then', 'when', 'what', 'where',
+      'goto', 'details', 'detail', 'their', 'there', 'here', 'have', 'has',
+      'will', 'would', 'should', 'could', 'about', 'after', 'before', 'each',
+      'link', 'button', 'listing', 'element', 'select', 'take', 'make',
+      'down', 'text', 'value', 'field', 'them', 'they', 'your', 'once',
+    ]);
+    for (const w of (goal.toLowerCase().match(/\b[a-z][a-z0-9-]{3,}\b/g) || [])) {
+      if (!_lcStop.has(w)) entities.add(w);
+      if (entities.size >= 8) break;
     }
   }
   const result = Array.from(entities);
@@ -12275,6 +12297,82 @@ async function _executeTurnLoopFallback({ goal, verificationGoal, sessionId, hea
   }
   logger.info(`[playwright.agent] turn-loop fallback: starting (max ${MAX_TURNS} turns) for goal="${goal.slice(0, 80)}"${_subTasks ? ` [decomposed: ${_subTasks.length} sub-tasks]` : ''}`);
 
+  // ── Deterministic ordinal fast-path ──
+  // "click/open the first|second|Nth item|result|listing|product" is a
+  // deterministic action — the Nth result anchor's href is discoverable
+  // without the LLM, and clicking a link IS navigating it. Doing it here
+  // skips the LLM click path entirely (whose a[href] selectors mismatch DOM
+  // attributes and whose coordinate clicks get occluded by page overlays).
+  try {
+    const _ordGoalM = String(goal || '').match(/\b(first|second|third|fourth|fifth|1st|2nd|3rd|4th|5th)\b[^\n]{0,60}\b(item|items|result|results|listing|listings|product|products|link|links|video|videos|option|options|row|rows|card|cards)\b/i);
+    const _goalIsOpenNth = _ordGoalM && /\b(click|open|go to|goto|select|view|visit|details?)\b/i.test(goal);
+    if (_goalIsOpenNth) {
+      const _ordW = _ordGoalM[1].toLowerCase();
+      const _ordN = { first: 1, '1st': 1, second: 2, '2nd': 2, third: 3, '3rd': 3, fourth: 4, '4th': 4, fifth: 5, '5th': 5 }[_ordW] || 1;
+      const _scanRes = await browserAct({
+        action: 'evaluate', sessionId, headed, timeoutMs: 8000,
+        text: `(() => {
+          const nth = ${_ordN};
+          const vh = window.innerHeight || 800;
+          const curSeg = (location.pathname.split('/').filter(Boolean)[0] || '').toLowerCase();
+          const out = [];
+          for (const el of document.querySelectorAll('a[href]')) {
+            if (el.closest('nav, header, footer, aside, [role="navigation"], [role="banner"], [role="contentinfo"], [role="search"], form')) continue;
+            const r = el.getBoundingClientRect();
+            if (r.width < 40 || r.height < 10) continue;
+            if (r.top < -50 || r.top > vh * 1.5) continue;
+            const t = (el.innerText || el.textContent || '').trim();
+            if (t.length < 15 || t.length > 500) continue;
+            // Result links leave the listing path family (/itm/, /dp/, /watch…);
+            // facet/category links stay in it (/sch/…). Prefer cross-family.
+            let cross = 1;
+            try { cross = (new URL(el.href).pathname.split('/').filter(Boolean)[0] || '').toLowerCase() !== curSeg ? 1 : 0; } catch (_) {}
+            out.push({ text: t.slice(0, 140), href: el.href || '', y: Math.round(r.top), x: Math.round(r.left), cross });
+          }
+          const seen = new Set();
+          const items = out.filter(o => { if (seen.has(o.href)) return false; seen.add(o.href); return true; });
+          items.sort((a, b) => (b.cross - a.cross) || (a.y - b.y) || (a.x - b.x));
+          return items[nth - 1] || null;
+        })()`,
+      });
+      const _ord = _scanRes?.result;
+      if (_ord?.href) {
+        logger.info(`[playwright.agent] ordinal fast-path: ${_ordW} result → "${(_ord.text || '').slice(0, 70)}" → navigate ${String(_ord.href).slice(0, 90)}`);
+        const _urlBefore = (await browserAct({ action: 'evaluate', sessionId, headed, timeoutMs: 4000, text: 'location.href' }).catch(() => null))?.result;
+        const _navRes = await browserAct({ action: 'navigate', sessionId, url: _ord.href, headed, timeoutMs: 30000 });
+        if (_navRes?.ok) {
+          // Verify the bound tab actually left the listing page for the item URL
+          await new Promise(r => setTimeout(r, 1200));
+          const _urlAfter = (await browserAct({ action: 'evaluate', sessionId, headed, timeoutMs: 5000, text: 'location.href' }).catch(() => null))?.result;
+          const _navOk = _urlAfter && String(_urlAfter) !== String(_urlBefore || '');
+          logger.info(`[playwright.agent] ordinal fast-path: navigate ${ _navOk ? 'verified' : 'unverified'} → ${String(_urlAfter || '').slice(0, 110)}`);
+          if (_navOk) {
+            // Include page text so downstream synthesize/report steps have
+            // real content to describe (observed: synthesize complained the
+            // details-page content "was not provided").
+            const _bodyText = (await browserAct({ action: 'evaluate', sessionId, headed, timeoutMs: 6000, text: 'document.body ? document.body.innerText.slice(0, 4000) : ""' }).catch(() => null))?.result || '';
+            return {
+              ok: true,
+              routingDecision: 'turn_loop_ordinal_fastpath',
+              result: `Opened the ${_ordW} result: "${(_ord.text || '').slice(0, 120)}" → ${String(_urlAfter || _ord.href).slice(0, 200)}` + (_bodyText ? `\n\nPage content:\n${String(_bodyText).slice(0, 3000)}` : ''),
+              transcript: _loopTranscript,
+              sessionId,
+              done: true,
+              goalVerified: true,
+            };
+          }
+          logger.warn('[playwright.agent] ordinal fast-path: navigate returned ok but URL unchanged — falling through to LLM loop');
+        } else {
+          logger.warn(`[playwright.agent] ordinal fast-path: navigate failed (${_navRes?.error || 'no result'}) — falling through to LLM loop`);
+        }
+      } else {
+        logger.info('[playwright.agent] ordinal fast-path: no result anchor resolved — falling through to LLM loop');
+      }
+    }
+  } catch (e) {
+    logger.warn(`[playwright.agent] ordinal fast-path error (non-fatal): ${e.message}`);
+  }
+
   for (let turn = 1; turn <= MAX_TURNS; turn++) {
     if (Date.now() > deadline) {
       logger.warn(`[playwright.agent] turn-loop: deadline exceeded at turn ${turn}`);
@@ -12474,14 +12572,41 @@ ${_composeSel ? `- SUGGESTED COMPOSE SELECTOR: ${_composeSel}` : ''}`;
             if (otherSignals.some(s => s.selector === _sel && s.text === _t.slice(0, 80))) return;
             otherSignals.push({ selector: _sel, tag: el.tagName, role: el.getAttribute('role') || '', label: el.getAttribute('aria-label') || '', text: _t.slice(0, 80), expanded: el.getAttribute('aria-expanded') || '' });
           });
+          // 5b. Visible links with real text — product/result anchors are THE
+          //    actionable elements on listing/search pages. Without them the
+          //    LLM sees only sidebar/filter signals and scrolls blindly
+          //    (observed: ebay turn-loop, 25 signals, zero product links).
+          const linkSignals = [];
+          const _vh = window.innerHeight || 800;
+          document.querySelectorAll('a[href]').forEach(el => {
+            if (!isVisible(el)) return;
+            const _t = (el.innerText || el.textContent || '').trim();
+            if (!_t || _t.length < 4) return;
+            const _y = Math.round(el.getBoundingClientRect().top);
+            const _sel = makeSelector(el);
+            linkSignals.push({ selector: _sel, tag: 'A', role: 'link', href: (el.getAttribute('href') || '').slice(0, 140), text: _t.slice(0, 80), y: _y, inView: _y >= -100 && _y <= _vh + 300 });
+          });
+          // In-viewport links first (that's where the products are), then
+          // reading order — a y-ascending sort alone front-loads off-screen
+          // header/nav links (y<0) and crowds out the actual results
+          // (observed: ebay dump showed only nav/related-search links).
+          linkSignals.sort((a, b) => (b.inView - a.inView) || (a.y - b.y));
+          let _linksAdded = 0;
+          for (const l of linkSignals) {
+            if (_linksAdded >= 40) break; // enough coverage
+            if (otherSignals.some(s => s.selector === l.selector && s.text === l.text)) continue;
+            otherSignals.push(l);
+            _linksAdded++;
+          }
           // 6. Shadow DOM hosts
           document.querySelectorAll('*').forEach(el => {
             if (el.shadowRoot) {
               otherSignals.push({ selector: makeSelector(el), tag: el.tagName, shadow: true, label: el.getAttribute('aria-label') });
             }
           });
-          // Inputs first (all of them), then others up to 25 total
-          const others = otherSignals.slice(0, Math.max(0, 25 - inputSignals.length));
+          // Inputs first (all of them), then others up to 60 total (raised
+          // from 25 — a results page needs the product links visible).
+          const others = otherSignals.slice(0, Math.max(0, 60 - inputSignals.length));
           return [...inputSignals, ...others];
       })) || [];
       if (_signals.length > 0) {
@@ -12492,6 +12617,7 @@ ${_composeSel ? `- SUGGESTED COMPOSE SELECTOR: ${_composeSel}` : ''}`;
             if (s.label) parts.push(`label="${s.label}"`);
             if (s.placeholder) parts.push(`placeholder="${s.placeholder}"`);
             if (s.role) parts.push(`role="${s.role}"`);
+            if (s.href) parts.push(`href="${s.href}"`);
             if (s.context) parts.push(`context="${s.context}"`);
             if (s.y !== undefined) parts.push(`y=${s.y}`);
             if (s.expanded) parts.push(`expanded=${s.expanded}`);
@@ -12576,7 +12702,65 @@ ${_composeSel ? `- SUGGESTED COMPOSE SELECTOR: ${_composeSel}` : ''}`;
     // Scan the DOM for elements whose text/aria-label matches the goal's
     // entity terms and inject them as explicit click candidates.
     let _goalMatchesHint = '';
-    if (_goalEntities.length) {
+
+    // ── Ordinal-item scan (runs BEFORE entity scan — strictly more specific) ──
+    // "click the first/second/Nth item|result|listing" resolves the Nth
+    // in-viewport result anchor positionally and hands the LLM the target.
+    // Selector uses the href *attribute* (querySelector-matchable), never the
+    // el.href property which differs in encoding and always misses.
+    const _ordM = String(goal || '').match(/\b(first|second|third|fourth|fifth|1st|2nd|3rd|4th|5th)\b[^\n]{0,40}\b(item|items|result|results|listing|listings|product|products|link|links|video|videos|option|options|row|rows|card|cards)\b/i)
+      || String(goal || '').match(/\b(item|items|result|results|listing|listings|product|products|video|videos)\b[^\n]{0,40}\b(first|second|third|1st|2nd|3rd)\b/i);
+    if (_ordM) {
+      const _ordW = ((_ordM[1] && /first|second|third|fourth|fifth|\d+(st|nd|rd|th)/i.test(_ordM[1])) ? _ordM[1] : _ordM[2] || 'first').toLowerCase();
+      const _ordN = { first: 1, '1st': 1, second: 2, '2nd': 2, third: 3, '3rd': 3, fourth: 4, '4th': 4, fifth: 5, '5th': 5 }[_ordW] || 1;
+      try {
+        const _ordRes = await browserAct({
+          action: 'evaluate', sessionId, headed, timeoutMs: 8000,
+          text: `(() => {
+            const nth = ${_ordN};
+            const vh = window.innerHeight || 800;
+            const curSeg = (location.pathname.split('/').filter(Boolean)[0] || '').toLowerCase();
+            const out = [];
+            for (const el of document.querySelectorAll('a[href]')) {
+              if (el.closest('nav, header, footer, aside, [role="navigation"], [role="banner"], [role="contentinfo"], [role="search"], form')) continue;
+              const r = el.getBoundingClientRect();
+              if (r.width < 40 || r.height < 10) continue;
+              if (r.top < -50 || r.top > vh * 1.5) continue;
+              const t = (el.innerText || el.textContent || '').trim();
+              if (t.length < 15 || t.length > 500) continue;
+              let sel = null;
+              if (el.id) sel = '#' + el.id;
+              else if (el.getAttribute('data-testid')) sel = 'a[data-testid="' + el.getAttribute('data-testid') + '"]';
+              else {
+                const attr = el.getAttribute('href') || '';
+                // Attribute-selector-safe: prefer the raw attribute so
+                // a[href='X'] actually matches; fall back to el.href property
+                // only when the attribute is unusable (relative '#', js:).
+                if (attr && !attr.startsWith('#') && !attr.startsWith('javascript:')) {
+                  sel = 'a[href="' + attr.replace(/"/g, '\\"') + '"]';
+                }
+              }
+              // Result links leave the listing path family (/itm/, /dp/,
+              // /watch…); facet/category links stay in it (/sch/…).
+              let cross = 1;
+              try { cross = (new URL(el.href).pathname.split('/').filter(Boolean)[0] || '').toLowerCase() !== curSeg ? 1 : 0; } catch (_) {}
+              out.push({ sel, tag: 'A', text: t.slice(0, 140), href: el.href || '', y: Math.round(r.top), x: Math.round(r.left), cross });
+            }
+            const seen = new Set();
+            const items = out.filter(o => { if (seen.has(o.href)) return false; seen.add(o.href); return true; });
+            items.sort((a, b) => (b.cross - a.cross) || (a.y - b.y) || (a.x - b.x));
+            return items[nth - 1] || null;
+          })()`,
+        });
+        const _ord = _ordRes?.result;
+        if (_ord && (_ord.sel || _ord.href)) {
+          _goalMatchesHint = `\n🎯 ORDINAL TARGET (${_ordW} item — resolved positionally). Open it: prefer { "action": "navigate", "url": ${JSON.stringify((_ord.href || '').slice(0, 200))} }${_ord.sel ? ` or { "action": "clickBySelector", "selector": ${JSON.stringify(_ord.sel.slice(0, 200))} }` : ''} — do NOT scroll to look for it:\n  <a> y=${_ord.y} "${(_ord.text || '').replace(/\n/g, ' ').slice(0, 110)}"${_ord.sel ? ` selector="${_ord.sel.slice(0, 140)}"` : ''}${_ord.href ? ` href="${_ord.href.slice(0, 90)}"` : ''}\n`;
+          logger.info(`[playwright.agent] turn-loop: ordinal scan resolved ${_ordW} item → "${(_ord.text || '').slice(0, 60)}"`);
+        }
+      } catch (_) {}
+    }
+
+    if (!_goalMatchesHint && _goalEntities.length) {
       try {
         const _terms = _goalEntities.map(e => String(e).toLowerCase()).filter(t => t.length > 1).slice(0, 8);
         if (_terms.length) {
@@ -12602,6 +12786,7 @@ ${_composeSel ? `- SUGGESTED COMPOSE SELECTOR: ${_composeSel}` : ''}`;
               let sel = null;
               if (target.id) sel = '#' + target.id;
               else if (target.getAttribute('data-testid')) sel = target.tagName.toLowerCase() + '[data-testid="' + target.getAttribute('data-testid') + '"]';
+              else if (target.href) sel = target.tagName.toLowerCase() + '[href="' + target.href + '"]';
               out.push({ sel, tag: target.tagName, text: t.slice(0, 140), href: target.href || '', y: Math.round(r.y), hits: hits.length });
               if (out.length >= 8) break;
             }
@@ -12609,7 +12794,7 @@ ${_composeSel ? `- SUGGESTED COMPOSE SELECTOR: ${_composeSel}` : ''}`;
           })()`, 8000);
           const _matches = Array.isArray(_scanRes?.result) ? _scanRes.result : [];
           if (_matches.length) {
-            _goalMatchesHint = `\n🎯 GOAL-MATCHED ELEMENTS (entity scan — the snapshot's 80-element cap may not show these; click them via clickByText or clickBySelector):\n`
+            _goalMatchesHint = `\n🎯 GOAL-MATCHED ELEMENTS (entity scan — the snapshot's 80-element cap may not show these). To open one: prefer clickBySelector with its \`selector\`, or { "action": "navigate", "url": "<href>" } when an href is shown — do NOT invent a different URL and do NOT repeat clickByText on the search text itself:\n`
               + _matches.map((m, i) => `  ${i + 1}. <${m.tag.toLowerCase()}> y=${m.y} "${m.text.replace(/\n/g, ' ').slice(0, 110)}"${m.sel ? ` selector="${m.sel}"` : ''}${m.href ? ` href="${m.href.slice(0, 90)}"` : ''}`).join('\n') + '\n';
             logger.info(`[playwright.agent] turn-loop: goal-entity scan found ${_matches.length} candidate(s) matching [${_terms.join(', ')}]`);
           }
@@ -12941,6 +13126,35 @@ Turn ${turn}/${MAX_TURNS}. What is your next action? (DO NOT snapshot - act dire
           const _m = _actionRaw.match(/\{[\s\S]*\}/);
           if (_m) _action = JSON.parse(_m[0]);
         } catch (_) { /* parse error */ }
+      }
+      if (!_action) {
+        // Pure-prose fallback — some models answer with reasoning and NO JSON
+        // at all ("I need to locate and click on the first mechanical keyboard
+        // listing. Let me scroll down..."). Extract the intended verb instead
+        // of wasting the turn (observed: unparseable→scroll-bail on eBay).
+        const _p = _actionRaw;
+        let _m;
+        if ((_m = _p.match(/["'“]([^"'”]{2,80})["'”]/)) && /click/i.test(_p)) {
+          _action = { action: 'clickByText', text: _m[1] };
+        } else if ((_m = _p.match(/click(?:ing)?\s+(?:on\s+)?(?:the\s+)?([\w][\w\s'&-]{2,60}?)(?=\s+(?:link|button|item|listing|result|product|card|option|element|entry|row|title)\b|[.,;]|$)/i))) {
+          // Strip ordinals/articles — 'first mechanical keyboard' never
+          // substring-matches the product title; 'mechanical keyboard' does.
+          const _tgt = _m[1].trim().replace(/^(?:first|second|third|fourth|next|the|a|an)\s+/i, '').trim();
+          if (_tgt.length > 1) _action = { action: 'clickByText', text: _tgt };
+        } else if ((_m = _p.match(/navigate\s+to\s+(https?:\/\/\S+)/i))) {
+          _action = { action: 'navigate', url: _m[1] };
+        } else if ((_m = _p.match(/press(?:ing)?\s+(?:the\s+)?(enter|return|tab|escape|esc|space|backspace|delete|home|end|pageup|pagedown|arrowup|arrowdown|arrowleft|arrowright)\b/i))) {
+          _action = { action: 'press', key: _m[1] };
+        } else if (/scroll\s+(?:down|further|more)/i.test(_p)) {
+          _action = { action: 'scroll', direction: 'down' };
+        } else if (/scroll\s+up|scroll\s+back/i.test(_p)) {
+          _action = { action: 'scroll', direction: 'up' };
+        } else if (/wait\s+for|let\s+(?:the\s+)?page\s+(?:load|settle)/i.test(_p)) {
+          _action = { action: 'waitForStableText' };
+        } else if (/screenshot|examine|look\s+at|observe|read\s+the\s+page|re-?scan|inspect|find|locate|search\s+for|understand\s+what/i.test(_p)) {
+          _action = { action: 'snapshot' };
+        }
+        if (_action) logger.info(`[playwright.agent] turn-loop: salvaged "${_action.action}" from prose output`);
       }
     }
 
@@ -13301,6 +13515,14 @@ Turn ${turn}/${MAX_TURNS}. What is your next action? (DO NOT snapshot - act dire
     } catch (_) {}
     try {
       const _execAction = { ..._action, sessionId, headed, timeoutMs };
+      // screenshot is a wasted turn in this loop — the model picks it to
+      // "see" the page but the transcript can't consume images (observed:
+      // eBay run burned turns 1/3/4 on screenshots then bailed). Remap to a
+      // snapshot so the intent (observe) produces usable state.
+      if (_execAction.action === 'screenshot') {
+        _execAction.action = 'snapshot';
+        logger.info('[playwright.agent] turn-loop: remapped screenshot→snapshot (no vision channel)');
+      }
       if (_action.action === 'clickByText' && _activeMenuScope && !_action.scope && !_action.menuScope) {
         // Only scope the click to the active menu if the target text actually
         // looks like a menu item. If the agent is trying to click a button in a
@@ -13316,7 +13538,21 @@ Turn ${turn}/${MAX_TURNS}. What is your next action? (DO NOT snapshot - act dire
           logger.warn(`[playwright.agent] turn-loop: clickByText("${_action.text}") does NOT match active menu items (${_activeMenuItems.join(', ')}) and ${_openMenus.length} dialogs are open — leaving unscoped so it can target the correct dialog`);
         }
       }
-      _outcome = await browserAct(_execAction);
+      // Placeholder-target guard — the LLM sometimes echoes the prompt's
+      // action-table syntax back as a target (observed: clickByText with
+      // target "browser_action" — the literal column name — searched for
+      // text "browser_action" and failed). Reject those, inject a hint to
+      // use a real page element instead of burning a turn.
+      {
+        const _ACTION_WORDS = new Set(['browser_action','browser','click','clickbytext','clickbyselector','clickat','fill','reactfill','type','scroll','press','navigate','goto','snapshot','screenshot','evaluate','selector','text','target','url','action','return','done']);
+        const _tgt = String(_execAction.text || _execAction.selector || '').trim().toLowerCase();
+        if (_tgt && _ACTION_WORDS.has(_tgt.replace(/[\s_]/g, ''))) {
+          _outcome = { ok: false, error: `placeholder target "${_execAction.text || _execAction.selector}" — use a real element's text, ref, or CSS selector from the DOM signals` };
+          logger.warn(`[playwright.agent] turn-loop: rejected placeholder target "${_tgt}" for ${_execAction.action} — inject hint`);
+        } else {
+          _outcome = await browserAct(_execAction);
+        }
+      }
     } catch (_execErr) {
       _outcome = { ok: false, error: _execErr.message };
     }
@@ -13773,10 +14009,19 @@ Turn ${turn}/${MAX_TURNS}. What is your next action? (DO NOT snapshot - act dire
       if (_subTasks && _subTasks.length > 0 && _domMutating) {
         try {
           const _stPage = engine.getPage(sessionId);
+          // On the extension lane there is no engine page — pull url/text via
+          // _engineEval (browserAct evaluate) so verification isn't blind.
+          let _stUrl = '', _stText = '';
           if (_stPage) {
-            let _stUrl = '';
             try { _stUrl = _stPage.url(); } catch (_) {}
-            const _stText = await _stPage.evaluate(() => document.body.innerText.slice(0, 5000)).catch(() => '');
+            _stText = await _stPage.evaluate(() => document.body.innerText.slice(0, 5000)).catch(() => '');
+          } else {
+            const _u = await _engineEval(sessionId, 'window.location.href').catch(() => null);
+            if (_u?.ok) _stUrl = String(_u.result || '');
+            const _t = await _engineEval(sessionId, 'document.body ? document.body.innerText.slice(0, 5000) : ""').catch(() => null);
+            if (_t?.ok) _stText = String(_t.result || '');
+          }
+          if (_stPage || _stUrl || _stText) {
             let _newlyCompleted = 0;
             for (const _st of _subTasks) {
               if (!_st.completed) {
@@ -13827,6 +14072,13 @@ Turn ${turn}/${MAX_TURNS}. What is your next action? (DO NOT snapshot - act dire
         if (_preStructPage) {
           _preStructText = await _preStructPage.evaluate(() => document.body.innerText.slice(0, 8000)).catch(() => '');
           try { _preStructUrl = _preStructPage.url(); } catch (_) {}
+        } else {
+          // Extension-bound session — same read via browserAct evaluate. Without
+          // this the verify LLM sees "URL and text unknown" and can never
+          // confirm completed work (observed: calendar event saved but the task
+          // reported turn_loop_exhausted + ask_user).
+          _preStructText = (await _observeEval(sessionId, () => document.body.innerText.slice(0, 8000))) || '';
+          _preStructUrl = String((await _observeEval(sessionId, () => window.location.href)) || '');
         }
       } catch (_) {}
       let _preStructPassed = 0;
@@ -13853,6 +14105,7 @@ Turn ${turn}/${MAX_TURNS}. What is your next action? (DO NOT snapshot - act dire
       try {
         const _ePage = engine.getPage(sessionId);
         if (_ePage) _stPageText = await _ePage.evaluate(() => document.body.innerText.slice(0, 5000)).catch(() => '');
+        else _stPageText = (await _observeEval(sessionId, () => document.body.innerText.slice(0, 5000))) || '';
       } catch (_) {}
       return {
         ok: true,

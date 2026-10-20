@@ -10,7 +10,7 @@
 //
 // Contract:
 //   args: { goal, sessionId, agentId?, pageCategory?, agentContext?, stepType?,
-//           maxSteps?, _progressCallbackUrl? }
+//           maxSteps?, noSubmit?, _progressCallbackUrl? }
 //   returns { ok, output?, error?, suggestedAgent? }
 // ---------------------------------------------------------------------------
 
@@ -26,7 +26,7 @@ async function tabMapAgent(args = {}) {
   const {
     goal = '', sessionId, agentId = '',
     stepType = 'on-page-action', maxSteps = 6,
-    expectOverlay = false, _progressCallbackUrl,
+    expectOverlay = false, noSubmit = false, _progressCallbackUrl,
   } = args;
   let pageCategory = args.pageCategory || 'web_generic';
   let agentContext = args.agentContext || '';
@@ -94,7 +94,7 @@ async function tabMapAgent(args = {}) {
       const res = await _tabMapInnerStep(
         sessionId, goal, actionHistory, currentUrl, overlayActive, pageCategory,
         agentContext, tabMap, filledFields, consumedRefs, lastVerifyFailed,
-        extractedPageText, stepType, clickedRefs, clickedSubmitRefs,
+        extractedPageText, stepType, clickedRefs, clickedSubmitRefs, noSubmit,
       );
 
       // ── Bookkeeping FIRST: record what the step did — including the
@@ -105,6 +105,7 @@ async function tabMapAgent(args = {}) {
       if (res?.action) {
         const note = res.stateChanged ? '→ page changed'
           : res.alreadyFilled ? '→ already filled'
+          : res.noSubmitBlocked ? '→ blocked (no-submit policy)'
           : res.suppressed ? '→ suppressed (already submitted)'
           : res.verifyFailed ? '→ done rejected'
           : res.ok ? '→ ok' : '→ FAILED';
@@ -190,7 +191,7 @@ async function tabMapAgent(args = {}) {
       suggestedAgent: 'turn.loop.agent', sessionId,
       actionHistory, filledFields, clickedRefs: [...clickedRefs],
     };
-  });
+  }, args._mutexOwner);
 }
 
 module.exports = { tabMapAgent };

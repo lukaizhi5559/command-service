@@ -155,6 +155,7 @@ async function _dispatch(args, start) {
       return _env(action, sessionId, start);
     }
 
+    case 'reactFill':
     case 'fill': {
       const res = await gateway.sendCmd({ sessionId, action: 'fill', args: { selector: selector || args.ref || '', text: text ?? value ?? '', ..._fwd } }, timeoutMs + 5000);
       if (!res.ok) return _envErr(action, sessionId, start, res.error);
@@ -163,9 +164,24 @@ async function _dispatch(args, start) {
 
     case 'click':
     case 'clickSelector':
+    case 'clickBySelector':
     case 'dblclick': {
-      const res = await gateway.sendCmd({ sessionId, action, args: { selector: selector || args.ref || '', ..._fwd } }, timeoutMs + 5000);
-      if (!res.ok) return _envErr(action, sessionId, start, res.error);
+      const res = await gateway.sendCmd({ sessionId, action: action === 'clickBySelector' ? 'clickSelector' : action, args: { selector: selector || args.ref || '', ..._fwd } }, timeoutMs + 5000);
+      if (!res.ok) {
+        // a[href='X'] selectors fail when the DOM attribute differs from the
+        // absolute href (re-encoded params, relative form). Clicking a link
+        // is navigating it — fall through to a bound-tab navigate on X.
+        const _hrefM = /^\s*a\[href\s*=\s*['"](https?:\/\/[^'"]+)['"]\s*\]\s*$/i.exec(selector || '');
+        if (_hrefM) {
+          const nav = await gateway.sendCmd({ sessionId, action: 'navigate', args: { url: _hrefM[1], ..._fwd } }, timeoutMs + 5000).catch((e) => ({ ok: false, error: `nav threw: ${e.message}` }));
+          if (nav?.ok) {
+            logger.info(`[browser.ext] click ${selector.slice(0, 50)} not found → navigated bound tab to its href`);
+            return _env(action, sessionId, start, { result: { navigated: _hrefM[1] } });
+          }
+          logger.warn(`[browser.ext] a[href] click fallback: navigate failed → ${nav?.error || 'no result'} (url=${_hrefM[1].slice(0, 90)})`);
+        }
+        return _envErr(action, sessionId, start, res.error);
+      }
       return _env(action, sessionId, start, { result: res.clicked });
     }
 

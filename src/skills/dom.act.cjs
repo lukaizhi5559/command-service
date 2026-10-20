@@ -16,12 +16,13 @@
 const logger = require('../logger.cjs');
 const { browserAct } = require('./browser.act.cjs');
 const { routeOnPageAction } = require('./lib/browserCore/router.cjs');
-const { deriveSessionId, qualifyOpenTab } = require('./lib/browserCore/session.cjs');
+const { deriveSessionId, qualifyOpenTab, resolveExtSession } = require('./lib/browserCore/session.cjs');
 const { postProgress } = require('./lib/browserCore/progress.cjs');
 const { detectOverlay } = require('./lib/browserCore/pageState.cjs');
 const { hasVisibleDialog } = require('./lib/browserCore/overlayProbe.cjs');
 const { deepLinkOpensOverlay, classifyDeepLinkType } = require('../skill-helpers/deep-link-types.cjs');
 const { inferPageCategory } = require('../skill-helpers/page-category.cjs');
+const { _noSubmitGoalRe } = require('./lib/browserCore/tabMap.cjs');
 
 // True when the goal is *only* the create/compose action that a
 // creation/compose deep-link already performed. Any residual work in the
@@ -41,10 +42,21 @@ const AGENT_RUNNERS = {
   'meta.find.agent':    () => require('./meta.find.agent.cjs').metaFindAgent,
   'shortcut.keys.agent':() => require('./shortcut.keys.agent.cjs').shortcutKeysAgent,
   'tab.map.agent':      () => require('./tab.map.agent.cjs').tabMapAgent,
+  'form.fill.agent':    () => require('./form.fill.agent.cjs').formFillAgent,
   'gesture.agent':      () => require('./gesture.agent.cjs').gestureAgent,
   'arrow.grid.agent':   () => require('./arrow.grid.agent.cjs').arrowGridAgent,
   'turn.loop.agent':    () => require('./turn.loop.agent.cjs').turnLoopAgent,
 };
+
+// Fill-the-form goals → form.fill.agent (memory resolution + deterministic
+// fill) instead of tab.map's per-step LLM loop. Fires only when the goal
+// names a form/fields AND the probe confirmed a multi-field surface.
+function _isFillFormGoal(goal, args = {}) {
+  if (args.fields || args.resolvedFields || args.gatheredAnswers) return true;
+  const g = String(goal || '');
+  return /\b(?:fill|complete|enter|type)[^.]{0,40}\b(?:form|application|registration|signup|fields?)\b/i.test(g)
+      || /\b(?:form|application|registration|signup)\b[^.]{0,40}\b(?:fill|complete)\b/i.test(g);
+}
 
 async function domAct(args = {}) {
   const {
@@ -70,7 +82,7 @@ async function domAct(args = {}) {
     } catch (_) { pageCategory = _pageCategoryArg || 'web_generic'; }
   }
 
-  const sessionId = qualifyOpenTab(_sid || deriveSessionId(agentId), goal);
+  const sessionId = qualifyOpenTab(await resolveExtSession(_sid || deriveSessionId(agentId)), goal);
 
   // Settle gate: the previous step (url.first) resolves at domcontentloaded —
   // heavy SPAs (Gmail compose, Calendar dialogs) keep rendering after that.
@@ -144,6 +156,14 @@ async function domAct(args = {}) {
       logger.info(`[dom.act] pageCategory refined by router → ${route.pageCategory}`);
       pageCategory = route.pageCategory;
     }
+    // Form-fill override: explicit fill-the-form goals on a real multi-field
+    // surface belong to form.fill.agent — it resolves values from memory and
+    // fills deterministically instead of burning an LLM call per field.
+    if (route.agent === 'tab.map.agent' && _isFillFormGoal(goal, args)
+        && (route.probe?.fillableCount || 0) >= 2 && !tried.has('form.fill.agent')) {
+      route.agent = 'form.fill.agent';
+      route.rule += '+form-fill';
+    }
     if (tried.has(route.agent)) break; // forced fallback re-picked a tried agent — stop
     logger.info(`[dom.act] routed "${goal.slice(0, 60)}" → ${route.agent} (rule=${route.rule}, attempt=${attempt + 1})`);
     postProgress(_progressCallbackUrl, { tier: 'route', message: `dom.act → ${route.agent} (${route.rule})` });
@@ -158,6 +178,9 @@ async function domAct(args = {}) {
       pageCategory,
       agentContext,
       expectOverlay,
+      // No-submit goals propagate to tab.map/form.fill even when the planner
+      // didn't emit an explicit noSubmit flag — the phrase is self-protecting.
+      noSubmit: args.noSubmit === true || _noSubmitGoalRe.test(goal),
       _progressCallbackUrl,
     });
     if (res?.ok) break;

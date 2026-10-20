@@ -96,6 +96,7 @@ const { justTypeAgent } = require('./skills/just.type.agent.cjs');
 const { metaFindAgent } = require('./skills/meta.find.agent.cjs');
 const { shortcutKeysAgent } = require('./skills/shortcut.keys.agent.cjs');
 const { tabMapAgent } = require('./skills/tab.map.agent.cjs');
+const { formFillAgent } = require('./skills/form.fill.agent.cjs');
 const { gestureAgent } = require('./skills/gesture.agent.cjs');
 const { arrowGridAgent } = require('./skills/arrow.grid.agent.cjs');
 const { turnLoopAgent } = require('./skills/turn.loop.agent.cjs');
@@ -204,6 +205,8 @@ class CommandServiceMCPServer {
         return await this._skillAtomic(shortcutKeysAgent, args, opts);
       case 'tab.map.agent':
         return await this._skillAtomic(tabMapAgent, args, opts);
+      case 'form.fill.agent':
+        return await this._skillAtomic(formFillAgent, args, opts);
       case 'gesture.agent':
         return await this._skillAtomic(gestureAgent, args, opts);
       case 'arrow.grid.agent':
@@ -504,7 +507,7 @@ class CommandServiceMCPServer {
       success: true,
       service: this.serviceName,
       status: 'healthy',
-      skills: ['shell.run', 'browser.act', 'web.crawl', 'image.analyze', 'fs.read', 'edit.agent', 'doc.read', 'media.transcribe', 'file.watch', 'file.bridge', 'screen.capture', 'screen.display', 'external.skill', 'cli.agent', 'browser.agent', 'playwright.agent', 'url.first.agent', 'just.type.agent', 'meta.find.agent', 'shortcut.keys.agent', 'tab.map.agent', 'gesture.agent', 'arrow.grid.agent', 'turn.loop.agent', 'dom.act', 'creator.agent', 'reviewer.agent', 'skillCreator.skill', 'project.builder', 'project.launcher', 'project.editor', 'project.stopper', 'app.agent', 'system.introspect', 'provider.discovery', 'user.agent', 'web.agent', 'video.agent', 'tool.discover']
+      skills: ['shell.run', 'browser.act', 'web.crawl', 'image.analyze', 'fs.read', 'edit.agent', 'doc.read', 'media.transcribe', 'file.watch', 'file.bridge', 'screen.capture', 'screen.display', 'external.skill', 'cli.agent', 'browser.agent', 'playwright.agent', 'url.first.agent', 'just.type.agent', 'meta.find.agent', 'shortcut.keys.agent', 'tab.map.agent', 'form.fill.agent', 'gesture.agent', 'arrow.grid.agent', 'turn.loop.agent', 'dom.act', 'creator.agent', 'reviewer.agent', 'skillCreator.skill', 'project.builder', 'project.launcher', 'project.editor', 'project.stopper', 'app.agent', 'system.introspect', 'provider.discovery', 'user.agent', 'web.agent', 'video.agent', 'tool.discover']
     };
   }
 
@@ -623,7 +626,7 @@ class CommandServiceMCPServer {
         res.end(JSON.stringify({
           status: 'healthy',
           service: this.serviceName,
-          skills: ['shell.run', 'browser.act', 'web.crawl', 'image.analyze', 'fs.read', 'edit.agent', 'doc.read', 'media.transcribe', 'file.watch', 'file.bridge', 'screen.capture', 'screen.display', 'external.skill', 'cli.agent', 'browser.agent', 'playwright.agent', 'url.first.agent', 'just.type.agent', 'meta.find.agent', 'shortcut.keys.agent', 'tab.map.agent', 'gesture.agent', 'arrow.grid.agent', 'turn.loop.agent', 'dom.act', 'creator.agent', 'reviewer.agent', 'skillCreator.skill', 'project.builder', 'project.launcher', 'project.editor', 'project.stopper', 'app.agent', 'system.introspect', 'provider.discovery', 'user.agent', 'web.agent', 'video.agent', 'tool.discover']
+          skills: ['shell.run', 'browser.act', 'web.crawl', 'image.analyze', 'fs.read', 'edit.agent', 'doc.read', 'media.transcribe', 'file.watch', 'file.bridge', 'screen.capture', 'screen.display', 'external.skill', 'cli.agent', 'browser.agent', 'playwright.agent', 'url.first.agent', 'just.type.agent', 'meta.find.agent', 'shortcut.keys.agent', 'tab.map.agent', 'form.fill.agent', 'gesture.agent', 'arrow.grid.agent', 'turn.loop.agent', 'dom.act', 'creator.agent', 'reviewer.agent', 'skillCreator.skill', 'project.builder', 'project.launcher', 'project.editor', 'project.stopper', 'app.agent', 'system.introspect', 'provider.discovery', 'user.agent', 'web.agent', 'video.agent', 'tool.discover']
         }));
         return;
       }

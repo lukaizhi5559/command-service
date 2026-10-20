@@ -151,23 +151,27 @@ const _authCheckCache = new Map(); // agentId → { ts, authNeeded }
 // already returned (loginWallDetected:true) before waitForAuth fires —
 // the mutex enforces this and provides a guard for any future parallel calls.
 // ---------------------------------------------------------------------------
-const _sessionMutex = new Map(); // sessionId → Promise
+const _sessionMutex = new Map(); // sessionId → {promise, owner}
 
-async function _withSessionMutex(sessionId, fn) {
-  // Wait for any in-progress operation on this session to finish first
+async function _withSessionMutex(sessionId, fn, owner) {
+  // Reentrant: a caller that already holds this session's lock (e.g.
+  // form.fill.agent delegating leftovers to tabMapAgent) runs inline —
+  // waiting on our own lock would deadlock.
   const _existing = _sessionMutex.get(sessionId);
   if (_existing) {
+    if (owner && _existing.owner === owner) return await fn();
     logger.warn(`[browser.agent] session mutex: waiting for prior operation on ${sessionId} to finish`);
-    await _existing.catch(() => {}); // wait but don't rethrow prior errors
+    await _existing.promise.catch(() => {}); // wait but don't rethrow prior errors
   }
   let _resolve;
-  const _lock = new Promise(r => { _resolve = r; });
-  _sessionMutex.set(sessionId, _lock);
+  const _entry = { promise: null, owner };
+  _entry.promise = new Promise(r => { _resolve = r; });
+  _sessionMutex.set(sessionId, _entry);
   try {
     return await fn();
   } finally {
     _resolve();
-    if (_sessionMutex.get(sessionId) === _lock) _sessionMutex.delete(sessionId);
+    if (_sessionMutex.get(sessionId) === _entry) _sessionMutex.delete(sessionId);
   }
 }
 
@@ -3923,7 +3927,7 @@ Extract the ordered steps:`;
 
 // Tab-Map strategy: LLM decides one action per step based on available elements.
 // Updated with [FILLABLE]/[CLICKABLE] markers, filled field tracking, and label fixes.
-async function _llmNextAction(goal, currentUrl, tabMap, actionHistory, pageCategory, agentContext, lastVerifyFailed, consumedRefs, filledFields, extractedPageText, stepType = null, clickedRefs = null, clickedSubmitRefs = null, overlayActive = false) {
+async function _llmNextAction(goal, currentUrl, tabMap, actionHistory, pageCategory, agentContext, lastVerifyFailed, consumedRefs, filledFields, extractedPageText, stepType = null, clickedRefs = null, clickedSubmitRefs = null, overlayActive = false, noSubmit = false) {
   const { askWithMessages } = require('../skill-helpers/skill-llm.cjs');
 
   const _contextBlock = agentContext
@@ -4036,6 +4040,10 @@ async function _llmNextAction(goal, currentUrl, tabMap, actionHistory, pageCateg
     ? '\n\nNOTE: A submit/send element was already clicked and is hidden from the list — re-clicking an unchanged form produces the same result. If submission did not take effect, a required field is likely missing or invalid; fill it and the submit element will reappear.'
     : '';
 
+  const noSubmitNote = noSubmit
+    ? '\n\nNO-SUBMIT GOAL (critical): the user explicitly asked NOT to submit, send, save, or confirm this form. NEVER click a [SUBMIT] element (Submit/Send/Save/Post/Create/Confirm/Apply/Continue/Next/Subscribe/Checkout/etc.) and NEVER Press Enter — those actions are blocked and just waste a step. Fill fields only; once every needed field is filled, output DONE.'
+    : '';
+
   const systemPrompt = `You are navigating a web page to achieve a goal.
 Look at the goal, the current URL, the actions you've already taken, the fields already filled, and the available elements.
 Decide the SINGLE next action that gets closest to achieving the goal.${_stepTypeBlock}
@@ -4073,7 +4081,7 @@ Rules:
     (1) Type into a [REQUIRED] field
     (2) Click a button that expands/opens the form (e.g., Attach, CC/BCC toggle, formatting toolbar)
   Do NOT click any other button (Send, Submit, OK, Cancel, Close, etc.) until ALL [REQUIRED] fields are [FILLED].
-- When ALL [REQUIRED] fields are [FILLED], you may click a [SUBMIT] button if the goal requires submission.
+- When ALL [REQUIRED] fields are [FILLED], you may click a [SUBMIT] button if the goal requires submission.${noSubmit ? ' THIS GOAL FORBIDS SUBMISSION — [SUBMIT] elements are shown for context only; never pick them.' : ''}
 - If all [REQUIRED] fields are [FILLED] and no submission is needed, output DONE.
 - If the goal is already achieved (form submitted, email sent, search results shown), output DONE.
 - MULTI-PAGE NAVIGATION RULE: If the final target element (e.g., "Create Credentials") is NOT on this page, look for navigation elements (sidebar links, menu items, breadcrumbs, tabs, "Go to" buttons) that would move toward the goal. Click the most relevant navigation element — the system will re-plan on the new page.
@@ -4106,7 +4114,7 @@ Page category: ${pageCategory || 'unknown'}
 Actions taken so far:
 ${historyStr}
 Fields already filled:
-${filledStr}${verifyNote}${overlayNote}${suppressedNote}${_contextBlock}${_pageTextBlock}
+${filledStr}${verifyNote}${overlayNote}${suppressedNote}${noSubmitNote}${_contextBlock}${_pageTextBlock}
 
 Available elements on the current page:
 ${elementList}
@@ -4242,7 +4250,48 @@ const KNOWN_BROWSER_SERVICES = {
                      open_existing: { buildUrl: (task, ctx) => `https://docs.google.com/spreadsheets/u/0/?q=${ctx.encodedQuery}` },
                    } },
   googlecalendar: { startUrl: 'https://calendar.google.com',                     signInUrl: 'https://accounts.google.com/signin/v2/identifier',  authSuccessPattern: 'calendar.google.com',          isOAuth: true, hostAliases: ['calendar.google.com', 'cal.new', 'calendar.new'],
-                   intentUrls: { scheduling: 'https://calendar.google.com/calendar/u/0/r' } },
+                   intentUrls: { scheduling: { buildUrl: (task) => {
+                     // Land on the full-page event-edit form (not the calendar
+                     // grid — the grid requires a Create→Event menu dance the
+                     // task can stall on). ?action=TEMPLATE opens the form;
+                     // prefilled fields mean tab.map only verifies + Saves.
+                     //   text   → title        dates  → start/end (local, no Z)
+                     //   details→ description  location → where
+                     const _base = 'https://calendar.google.com/calendar/u/0/r/eventedit?action=TEMPLATE';
+                     try {
+                       const _t = String(task || '');
+                       const _title = (_t.match(/(?:event|meeting|appointment)\s+(?:called|named|titled)\s+["']?(.+?)["']?\s+(?=(?:on|for|at|tomorrow|today|next|this|every|in\s)|[?!.,]|$)/i)
+                                     || _t.match(/(?:called|named|titled)\s+["']([^"']+)["']/i)
+                                     || _t.match(/(?:called|named|titled)\s+([A-Z][\w&+-]*(?:\s+[A-Z][\w&+-]*)*)/))?.[1]?.trim() || null;
+                       const _now = new Date();
+                       const _d = new Date(_now);
+                       const _tl = _t.toLowerCase();
+                       if (/\btomorrow\b/.test(_tl)) _d.setDate(_d.getDate() + 1);
+                       else {
+                         const _wd = _tl.match(/\bnext\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b/);
+                         const _md = _t.match(/\b(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s+(\d{1,2})(?:st|nd|rd|th)?\b/i);
+                         const _dy = _tl.match(/\bthis\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b/) || _tl.match(/\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b/);
+                         const _days = { sunday:0, monday:1, tuesday:2, wednesday:3, thursday:4, friday:5, saturday:6 };
+                         if (_wd) { const _tgt = _days[_wd[1]]; const _diff = (_tgt - _d.getDay() + 7) % 7 || 7; _d.setDate(_d.getDate() + _diff); }
+                         else if (_md) { const _mi = 'jan feb mar apr may jun jul aug sep oct nov dec'.split(' ').indexOf(_md[1].slice(0,3).toLowerCase()); if (_mi >= 0) { _d.setMonth(_mi, parseInt(_md[2],10)); if (_d < _now) _d.setFullYear(_d.getFullYear() + 1); } }
+                         else if (_dy) { const _tgt = _days[_dy[1]]; const _diff = (_tgt - _d.getDay() + 7) % 7 || 7; _d.setDate(_d.getDate() + _diff); }
+                         else if (/\bnext\s+week\b/.test(_tl)) _d.setDate(_d.getDate() + 7);
+                         else if (/\btoday\b/.test(_tl)) { /* same day */ }
+                         else return _base; // unparseable date — blank form
+                       }
+                       const _tm = _t.match(/\bat\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b/i) || _t.match(/\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b/i);
+                       let _hh = 9, _mm = 0;
+                       if (_tm) { _hh = parseInt(_tm[1],10) % 12; if ((_tm[3]||'').toLowerCase() === 'pm') _hh += 12; _mm = parseInt(_tm[2]||'0',10); }
+                       const _fmt = (d) => `${d.getFullYear()}${String(d.getMonth()+1).padStart(2,'0')}${String(d.getDate()).padStart(2,'0')}T${String(d.getHours()).padStart(2,'0')}${String(d.getMinutes()).padStart(2,'0')}00`;
+                       _d.setHours(_hh, _mm, 0, 0);
+                       const _end = new Date(_d.getTime() + 60*60*1000); // default 1h
+                       let _u = `${_base}&dates=${_fmt(_d)}/${_fmt(_end)}`;
+                       if (_title) _u += `&text=${encodeURIComponent(_title)}`;
+                       const _loc = _t.match(/\b(?:at|location)\s+["']([^"']+)["']/i)?.[1];
+                       if (_loc) _u += `&location=${encodeURIComponent(_loc)}`;
+                       return _u;
+                     } catch (_) { return _base; }
+                   } } } },
   slack:          { startUrl: 'https://app.slack.com',                           signInUrl: 'https://slack.com/signin',                          authSuccessPattern: 'app.slack.com/client',         isOAuth: true  },
   discord:        { startUrl: 'https://discord.com/channels/@me',                signInUrl: 'https://discord.com/login',                         authSuccessPattern: 'discord.com/channels',         isOAuth: true  },
   notion:         { startUrl: 'https://app.notion.com',                           signInUrl: 'https://www.notion.com/login',                       authSuccessPattern: 'app.notion.com',                    isOAuth: true, preferAgentBrowser: true, postAuthUrl: 'https://app.notion.com', usePersistentProfile: true, hostAliases: ['www.notion.so', 'www.notion.com', 'notion.so', 'notion.com', 'notion.new'], _metaRevision: 2,
@@ -7606,6 +7655,11 @@ async function _buildGenericSearchUrl(serviceKey, baseHost, task) {
 async function _resolveCheapDeepLink(agentId, serviceKey, baseStartUrl, task, existingDeepLinkUrl, _dlOpts) {
   try {
     const _dlTaskCls = _dlOpts?.taskClassification || null;
+    // Cleaned task text for search-query generation — the raw task carries
+    // "(Context from prior turn: …)" / "[Resume context: …]" wrappers that
+    // poison discover_task_url queries. The referent is appended separately
+    // so bare follow-ups still resolve against it.
+    const _discoveryTask = _searchCriteriaCandidates(task, _dlTaskCls).join(' ') || _stripTaskNoise(task) || task;
     // If a deep-link was already resolved (e.g., by preflight), skip resolution.
     if (existingDeepLinkUrl) {
       const _existingHost = (() => {
@@ -7669,6 +7723,31 @@ async function _resolveCheapDeepLink(agentId, serviceKey, baseStartUrl, task, ex
       try {
         const { loadIntentUrl } = require('./lib/appKnowledge.cjs');
         const _akUrl = loadIntentUrl(baseHost, intent);
+        // Code-seeded entries (saved with verified:true at seed time but never
+        // exercised by a real run — verifiedRuns===0) freeze whatever the
+        // intentUrls template said at seed time. When the template has since
+        // changed, code wins over the stale seed (observed: calendar.google.com
+        // scheduling → /calendar/u/0/r base grid instead of /eventedit — every
+        // "create a calendar event" landed on the grid and stalled).
+        if (_akUrl?.url && (_akUrl.verifiedRuns || 0) === 0) {
+          const _tmpl = lookupBrowserService(serviceKey)?.intentUrls?.[intent];
+          let _codeUrl = null;
+          try {
+            if (typeof _tmpl === 'string') _codeUrl = _tmpl;
+            else if (_tmpl?.buildUrl) _codeUrl = _tmpl.buildUrl(task, { task, encodedQuery: '', dest: null });
+            else if (_tmpl?.url) _codeUrl = _tmpl.url;
+          } catch (_) {}
+          if (_codeUrl && _codeUrl !== _akUrl.url && _isValidDeepLinkUrl(_codeUrl)
+              && _deepLinkHostAllowed(_hostOfUrl(_codeUrl), baseHost, lookupBrowserService(serviceKey))) {
+            logger.info(`[browser.agent] deep-link: appKnowledge seed drifted (verifiedRuns=0) ${baseHost}/${intent}: ${_akUrl.url} → ${_codeUrl} — refreshing from code template`);
+            // Only re-seed static string templates — a buildUrl result carries
+            // task-specific params (title/dates) that must not become the seed.
+            if (typeof _tmpl === 'string') {
+              try { require('./lib/appKnowledge.cjs').saveIntentUrl(baseHost, intent, _codeUrl); } catch (_) {}
+            }
+            return { url: _codeUrl, source: 'appKnowledge-refresh', intent, isCriteriaTask: _isCriteriaTask, baseHost, taskKeywords: _taskKeywords, needsPromote: false };
+          }
+        }
         if (_akUrl?.url && !_deepLinkHostAllowed(_hostOfUrl(_akUrl.url), baseHost, lookupBrowserService(serviceKey))) {
           // Cross-service cache pollution (docs.google.com under mail.google.com)
           // — reject before it can navigate. Entry is purged out-of-band.
@@ -7753,6 +7832,11 @@ async function _resolveCheapDeepLink(agentId, serviceKey, baseStartUrl, task, ex
           logger.warn(`[browser.agent] deep-link: skipping cached Messenger URL for post/share task: ${_cachedDeepLink.url} — falling through to discovery`);
         } else if (!_deepLinkHostAllowed(_hostOfUrl(_cachedDeepLink.url), baseHost, lookupBrowserService(serviceKey))) {
           logger.warn(`[browser.agent] deep-link: rejecting keyword-cache URL ${_cachedDeepLink.url} — host outside ${baseHost} service family`);
+        } else if ((_cachedDeepLink.score || 0) < 0.6 || /\/(policies|policy|help|linkbuttons|safety|trust)\b/i.test(_cachedDeepLink.url)) {
+          // Low-confidence or utility/policy pages are not real destinations —
+          // a stale 'ebay → policies/linkbuttons.html' cache entry navigated
+          // the bound tab to a policy page instead of ebay.com.
+          logger.warn(`[browser.agent] deep-link: rejecting low-quality keyword-cache URL ${_cachedDeepLink.url} (score=${(_cachedDeepLink.score||0).toFixed(2)}) — falling through to discovery`);
         } else {
           logger.info(`[browser.agent] deep-link: keyword cache hit for ${agentId}: ${_cachedDeepLink.url} (score=${_cachedDeepLink.score.toFixed(2)})`);
           return { url: _cachedDeepLink.url, source: 'keyword-cache', intent, isCriteriaTask: _isCriteriaTask, baseHost, taskKeywords: _taskKeywords, needsPromote: false };
@@ -7921,7 +8005,7 @@ async function _resolveCheapDeepLink(agentId, serviceKey, baseStartUrl, task, ex
         const webResult = await callSkill('web.agent', {
           action: 'discover_task_url',
           domain: baseHost,
-          task,
+          task: _discoveryTask,
         }, 15000);
         if (webResult?.ok && webResult?.taskUrl) {
           return { url: webResult.taskUrl, source: 'search', intent, isCriteriaTask: _isCriteriaTask, baseHost, taskKeywords: _taskKeywords, needsPromote: true };
@@ -7930,7 +8014,7 @@ async function _resolveCheapDeepLink(agentId, serviceKey, baseStartUrl, task, ex
         logger.debug(`[browser.agent] cheap deep-link: web.agent failed: ${webErr.message}`);
       }
       try {
-        const suggestion = await suggestTaskUrl(serviceKey, baseStartUrl, intent, task);
+        const suggestion = await suggestTaskUrl(serviceKey, baseStartUrl, intent, _discoveryTask);
         if (suggestion?.ok && suggestion?.url) {
           return { url: suggestion.url, source: 'suggestion', intent, isCriteriaTask: _isCriteriaTask, baseHost, taskKeywords: _taskKeywords, needsPromote: true };
         }
@@ -7953,6 +8037,8 @@ async function _resolveTaskDeepLink(agentId, serviceKey, baseStartUrl, task, exi
   const _dlHidden = _dlOpts?.hidden !== undefined ? _dlOpts.hidden : true;
   const _dlTaskCls = _dlOpts?.taskClassification || null;
   const _dlLiveSession = _dlOpts?.liveSession === true;
+  // Cleaned task text for search-query generation (see _resolveCheapDeepLink).
+  const _discoveryTask = _searchCriteriaCandidates(task, _dlTaskCls).join(' ') || _stripTaskNoise(task) || task;
   try {
     const _cheap = await _resolveCheapDeepLink(agentId, serviceKey, baseStartUrl, task, existingDeepLinkUrl, { taskClassification: _dlTaskCls, networkDiscovery: false });
     if (!_cheap) return null;
@@ -8100,7 +8186,7 @@ async function _resolveTaskDeepLink(agentId, serviceKey, baseStartUrl, task, exi
         const webResult = await callSkill('web.agent', {
           action: 'discover_task_url',
           domain: baseHost,
-          task,
+          task: _discoveryTask,
         }, 15000);
         if (webResult?.ok && webResult?.taskUrl) {
           candidate = webResult.taskUrl;
@@ -8123,6 +8209,7 @@ async function _resolveTaskDeepLink(agentId, serviceKey, baseStartUrl, task, exi
           maxChars: 1000,
           timeoutMs: 15000,
           waitMs: 2000,
+          hidden: _dlHidden,
         }, 20000);
         if (crawlResult?.ok && Array.isArray(crawlResult.links) && crawlResult.links.length > 0) {
           // Intent-based path patterns to filter links
@@ -8174,7 +8261,7 @@ async function _resolveTaskDeepLink(agentId, serviceKey, baseStartUrl, task, exi
     // 3. Fallback to LLM-suggested URL
     var _suggestKeywords = [];
     if (!candidate) {
-      const suggestion = await suggestTaskUrl(serviceKey, baseStartUrl, intent, task);
+      const suggestion = await suggestTaskUrl(serviceKey, baseStartUrl, intent, _discoveryTask);
       if (suggestion?.ok && suggestion?.url) {
         candidate = suggestion.url;
         candidateSource = 'suggestion';
@@ -15039,5 +15126,6 @@ module.exports._isSearchCriteriaTask = _isSearchCriteriaTask;
 module.exports._extractSearchQuery = _extractSearchQuery;
 module.exports._extractSearchQueryRegex = _extractSearchQueryRegex;
 module.exports._followUpContextClause = _followUpContextClause;
+module.exports._stripTaskNoise = _stripTaskNoise;
 module.exports._deepLinkHostAllowed = _deepLinkHostAllowed;
 module.exports._hostOfUrl = _hostOfUrl;

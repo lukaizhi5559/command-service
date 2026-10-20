@@ -377,6 +377,44 @@ async function webCrawl(args) {
     return { ok: false, url, error: 'url is required', elapsedMs: 0 };
   }
 
+  // Extension lane — when the target host is already bound to a live ext
+  // session, read THAT tab through the extension instead of launching a
+  // Playwright browser (observed: ebay crawl → headless bot-wall → warm-retry
+  // headed Chrome window while the page sat in the bound real-Chrome tab).
+  // Item extraction (wantItems) still uses the engine pass — the ext lane
+  // only returns page text.
+  try {
+    const _gw = require('../ext.gateway.cjs');
+    if (_gw.hasExtension && _gw.hasExtension() && !extractItems && !extractMedia) {
+      const _host = (() => { try { return new URL(url).hostname.replace(/^www\./, '').toLowerCase(); } catch { return ''; } })();
+      if (_host) {
+        const _bound = (await _gw.sessions() || []).find(s => {
+          if (!s.url) return false;
+          try {
+            const h = new URL(s.url).hostname.replace(/^www\./, '').toLowerCase();
+            return h === _host || h.endsWith('.' + _host) || _host.endsWith('.' + h);
+          } catch { return false; }
+        });
+        if (_bound) {
+          const { browserAct } = require('./browser.act.cjs');
+          const _r = await browserAct({ action: 'evaluate', sessionId: _bound.sessionId, text: 'document.documentElement.innerText.slice(0, 40000)', timeoutMs });
+          const _content = String(_r?.result || '');
+          if (_content.length > 200) {
+            const _t = await browserAct({ action: 'evaluate', sessionId: _bound.sessionId, text: 'document.title', timeoutMs }).catch(() => null);
+            logger.info(`[web.crawl] extension lane — host ${_host} bound to ${_bound.sessionId}, read ${_content.length} chars (no browser spawn)`);
+            if (typeof onProgress === 'function') onProgress(`Reading ${_host} via bound extension tab…`);
+            return {
+              ok: true, url: _bound.url || url,
+              title: typeof _t?.result === 'string' ? _t.result : null,
+              content: _content, contentLength: _content.length,
+              via: 'extension', elapsedMs: Date.now() - startTime, attempts: 0,
+            };
+          }
+        }
+      }
+    }
+  } catch (_) { /* ext lane unavailable — fall through to headless */ }
+
   // extractMedia implies extractItems — videos ride in the unified items pass.
   const wantItems = extractItems || extractMedia;
 
@@ -453,6 +491,55 @@ async function webCrawl(args) {
   // visible window. Instead return botBlocked so the caller (executeCommand)
   // can fall back to browser.agent extract_url with the hidden engine path.
   if (lastBad && lastBad.signature && !hidden) {
+    // Extension warm retry — when the extension is connected, the "warm" path
+    // is a dedicated background tab in the user's REAL Chrome (real profile →
+    // bot walls pass, zero window spawn). This replaces the headed-Playwright
+    // retry, which opened a visible second browser (observed: _crawl_warm
+    // profile window on ebay's SORRY page next to the user's real Chrome).
+    let extWarmTried = false;
+    try {
+      const _gw = require('../ext.gateway.cjs');
+      if (_gw.hasExtension && _gw.hasExtension()) {
+        extWarmTried = true;
+        const { browserAct } = require('./browser.act.cjs');
+        progress(`All headless attempts blocked — warm retry via extension background tab: ${candidates[0]}`);
+        const navRes = await browserAct({ action: 'navigate', sessionId: 'ext:bg:crawl', url: candidates[0], timeoutMs });
+        if (navRes && navRes.ok !== false) {
+          await new Promise(r => setTimeout(r, Math.min(Math.max(effectiveWaitMs, 1500), 4000)));
+          const _t = await browserAct({ action: 'evaluate', sessionId: 'ext:bg:crawl', text: 'document.title', timeoutMs }).catch(() => null);
+          const _c = await browserAct({ action: 'evaluate', sessionId: 'ext:bg:crawl', text: `document.documentElement.innerText.slice(0, ${maxChars || 40000})`, timeoutMs }).catch(() => null);
+          const content = String(_c?.result || '');
+          const extRes = {
+            ok: content.length > 0, url: candidates[0],
+            title: typeof _t?.result === 'string' ? _t.result : null,
+            content, contentLength: content.length, via: 'extension-warm',
+          };
+          const extBad = _badCrawlReason(extRes, wantItems);
+          if (!extBad) {
+            return { ...extRes, elapsedMs: Date.now() - startTime, attempts: candidates.length + 1, warmRetry: true };
+          }
+          progress(`Extension warm retry rejected — ${extBad.reason}`);
+          // Ext lane produced a page but it still looked blocked → honest
+          // failure; never fall through to the headed Playwright window.
+          return {
+            ...extRes, ok: false, botBlocked: true,
+            error: `Page blocked or error page on all attempts (last: ${extBad.reason})`,
+            rejectedReason: extBad.reason, elapsedMs: Date.now() - startTime,
+            attempts: candidates.length + 1, warmRetry: true,
+          };
+        }
+      }
+    } catch (_) { extWarmTried = false; /* ext lane down — headed retry below */ }
+
+    if (extWarmTried) {
+      return {
+        ...(lastRes || {}), ok: false, botBlocked: true,
+        error: 'Extension warm retry failed to navigate',
+        rejectedReason: lastBad.reason, elapsedMs: Date.now() - startTime,
+        attempts: candidates.length, warmRetry: true,
+      };
+    }
+
     progress(`All headless attempts blocked — warm retry in headed Chrome: ${candidates[0]}`);
     const warmRes = await _crawlOnce(candidates[0], {
       maxChars, timeoutMs, effectiveWaitMs, extractLinks: wantLinks, extractItems: wantItems, progress, startTime, warm: true,

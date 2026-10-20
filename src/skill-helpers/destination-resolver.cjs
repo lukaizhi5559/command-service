@@ -1005,6 +1005,12 @@ function _isValidDeepLinkUrl(url) {
     logger.warn(`[destination-resolver] rejecting auth-flow deep-link URL: ${url}`);
     return false;
   }
+  // Reject utility/policy paths — they are never a task destination and a
+  // cached entry once steered 'ebay' to pages.ebay.com/policies/linkbuttons.html
+  if (/\/(policies|policy|help|linkbuttons|safety|trust|legal|terms|privacy)\b/i.test(parsed.pathname)) {
+    logger.warn(`[destination-resolver] rejecting utility-path deep-link URL: ${url}`);
+    return false;
+  }
   return true;
 }
 
@@ -1170,6 +1176,15 @@ async function getCachedDeepLink(serviceKey, keywords) {
         bestScore = score;
         bestMatch = route;
       }
+    }
+
+    // Utility/policy pages are never real destinations — a stale
+    // 'ebay → pages.ebay.com/policies/linkbuttons.html' entry navigated the
+    // bound tab to a policy page instead of ebay.com.
+    const UTILITY_PATH_RE = /\/(policies|policy|help|linkbuttons|safety|trust|legal|terms|privacy)\b/i;
+    if (bestMatch && UTILITY_PATH_RE.test(bestMatch.url)) {
+      logger.warn(`[destination-resolver] Deep-link cache hit rejected (utility path): ${serviceKey} → ${bestMatch.url}`);
+      bestMatch = null; bestScore = 0;
     }
 
     if (bestMatch) {

@@ -17,7 +17,7 @@ const logger = require('../logger.cjs');
 const { browserAct } = require('./browser.act.cjs');
 const { resolveServiceTarget } = require('./lib/browserCore/services.cjs');
 const { isSigninWall } = require('./lib/browserCore/auth.cjs');
-const { deriveSessionId, withSessionMutex, qualifyOpenTab } = require('./lib/browserCore/session.cjs');
+const { deriveSessionId, withSessionMutex, qualifyOpenTab, resolveExtSession } = require('./lib/browserCore/session.cjs');
 const { postProgress } = require('./lib/browserCore/progress.cjs');
 
 // Deep-link semantics live in the REQUESTED URL — create/compose/search
@@ -56,7 +56,7 @@ function _normalizeCreateUrl(url, task) {
 async function urlFirstAgent(args = {}) {
   const { service, agentId: _agentId, task = '', url: _explicitUrl, headed = true, _progressCallbackUrl } = args;
   const agentId = _agentId || (service ? `${String(service).toLowerCase().replace(/\s+/g, '_')}.agent` : 'default.agent');
-  const sessionId = qualifyOpenTab(args.sessionId || deriveSessionId(agentId), task);
+  const sessionId = qualifyOpenTab(await resolveExtSession(args.sessionId || deriveSessionId(agentId)), task);
 
   return withSessionMutex(sessionId, async () => {
     postProgress(_progressCallbackUrl, { tier: 'url-first', message: `url.first.agent: resolving destination for ${agentId}` });

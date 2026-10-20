@@ -120,11 +120,12 @@ function _onMessage(ws, raw) {
       // Track bound-tab URLs — /ext.sessions serves this to the stategraph
       // so live-page referents resolve to the real bound page.
       if (msg.sessionId) {
+        const sid = canonicalSessionId(msg.sessionId);
         if (msg.event === 'tabClosed' || msg.event === 'tabUnbound') {
-          _sessionTabInfo.delete(msg.sessionId);
+          _sessionTabInfo.delete(sid);
         } else if (msg.event === 'tabAdopted' || msg.event === 'tabCreated' || msg.event === 'tabActivated' || msg.event === 'tabNavigated') {
-          const prev = _sessionTabInfo.get(msg.sessionId) || {};
-          _sessionTabInfo.set(msg.sessionId, {
+          const prev = _sessionTabInfo.get(sid) || {};
+          _sessionTabInfo.set(sid, {
             tabId: msg.tabId != null ? msg.tabId : prev.tabId,
             url: msg.url || prev.url || null,
             title: msg.title || prev.title || null,
@@ -200,10 +201,26 @@ function attach(httpServer) {
  * Returns the extension's raw result message payload.
  * Never throws on timeout — returns {ok:false, error} instead.
  */
+// Session IDs must be canonical 'ext:<name>' on the wire. Several callers
+// (deep-link nav, browser.agent, plan steps) still pass raw names like
+// 'ebay_agent' — the extension then binds a *separate* session record, so a
+// navigate under 'ebay_agent' and a snapshot under 'ext:ebay_agent' hit
+// different tabs (observed: nav went to the real ebay tab while snapshots
+// scanned a fresh about:blank). Normalize at the boundary: prefer a live
+// registered session when one matches, else prefix 'ext:'.
+function canonicalSessionId(sessionId) {
+  if (!sessionId || typeof sessionId !== 'string') return sessionId;
+  if (sessionId.startsWith('ext:')) return sessionId;
+  const suffixed = `ext:${sessionId}_agent`;
+  if (_sessionTabInfo.has(suffixed)) return suffixed;
+  return `ext:${sessionId}`;
+}
+
 async function sendCmd({ sessionId, action, args = {} }, timeoutMs = 20000) {
   if (!hasExtension()) {
     return { ok: false, error: 'ThinkDrop extension not connected — click the ThinkDrop icon in Chrome to connect' };
   }
+  sessionId = canonicalSessionId(sessionId);
   const id = _nextCmdId++;
   const payload = { type: 'cmd', id, sessionId, action, args };
   return new Promise((resolve) => {

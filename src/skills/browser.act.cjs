@@ -1569,7 +1569,20 @@ function shortSessionId(sessionId) {
 // appears when multiple sessions fight over a single shared persistent profile.
 function sessionFlags(sessionId, headed = true) {
   const flags = [`-s=${shortSessionId(sessionId)}`];
-  if (headed) flags.push('--headed');
+  // No visible engine window while the extension is connected — visible work
+  // belongs on ext lanes (bound/open/bg tabs in the user's real Chrome), and
+  // engine callers with headed:true are probes that work headless. Observed:
+  // web.crawl's warm retry opened a second _crawl_warm Chrome window next to
+  // the user's real Chrome. hidden/1x1 launches don't go through this path.
+  if (headed) {
+    let _extLive = false;
+    try { _extLive = !!require('../ext.gateway.cjs').hasExtension?.(); } catch (_) { /* gateway absent */ }
+    if (_extLive) {
+      logger.info(`[browser.act] suppressing --headed for session=${sessionId} — extension connected (visible work belongs on the ext lane)`);
+    } else {
+      flags.push('--headed');
+    }
+  }
 
   // Use real Chrome by default — bundled Chrome for Testing is bot-detected by
   // Google OAuth / Cloudflare Turnstile (ChatGPT login spinner issue).
@@ -5687,10 +5700,16 @@ async function browserAct(args) {
           // "Option" instead of "Alt", "Esc" instead of "Escape". Normalize each
           // +-separated segment before passing to _ePage.keyboard.press().
           const _KEY_NORMALIZE_MAP = { 'ctrl': 'Control', 'cmd': 'Meta', 'command': 'Meta', 'option': 'Alt', 'opt': 'Alt', 'esc': 'Escape', 'return': 'Enter', 'del': 'Delete', 'ins': 'Insert', 'pgup': 'PageUp', 'pgdn': 'PageDown', 'home': 'Home', 'end': 'End', 'space': 'Space' };
-          // Select-all is Meta+A on macOS — Ctrl+A is the emacs line-start
-          // binding there, not select-all. Only the +a chord gets remapped.
-          const _rawKey = (process.platform === 'darwin' && /^(?:ctrl|control)\s*\+\s*a$/i.test(pressKey))
-            ? 'Meta+a' : pressKey;
+          // Ctrl+<letter> is meaningless as a web-app shortcut on macOS —
+          // Cmd is the accelerator key there (Ctrl+A is the emacs line-start
+          // binding, not select-all; Control+c just copied nothing for 90s in
+          // an observed turn-loop). Remap every single-letter Ctrl chord to
+          // Meta so LLM-emitted "Control+c" lands as Cmd+C.
+          const _rawKey = (() => {
+            if (process.platform !== 'darwin') return pressKey;
+            const m = String(pressKey || '').match(/^(?:ctrl|control)\s*\+\s*([a-z])$/i);
+            return m ? `Meta+${m[1].toLowerCase()}` : pressKey;
+          })();
           const _normalizedKey = _rawKey.split('+').map(seg => {
             const _lower = seg.trim().toLowerCase();
             return _KEY_NORMALIZE_MAP[_lower] || seg.trim();

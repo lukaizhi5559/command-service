@@ -37,6 +37,16 @@ const _verifySubmitSuccess = (...a) => _r()._verifySubmitSuccess(...a);
 // "Post to Anyone" chip (opened a dropdown, then verified a fake submit).
 const _submitLabels = /^(Post|Send|Submit|Publish|Save|Create|Share|Tweet|Schedule|Confirm|Apply|Continue|Post\s+it|Send\s+now|Save\s+changes)$/i;
 
+// Negated-submit goal detection — "fill the form but DON'T submit it" /
+// "without submitting" / "leave it ready". When this matches, submit-class
+// actions are hard-blocked and the completion gate must NOT require a submit.
+const _noSubmitGoalRe = /don'?t\s+(?:submit|send|save|post)|do\s+not\s+(?:submit|send|save|post)|without\s+(?:submitt?ing|sending|saving|posting|submit|send|save|post)|never\s+(?:submit|send)|leave\s+(?:it|the\s+form)\s+(?:ready|open|unsent|unsubmitted)|fill\s+(?:only|but)|just\s+fill/i;
+
+// Broad submit-class matcher for the no-submit hard gate — wider than
+// _submitLabels so wizard buttons (Next/Continue), order/checkout CTAs and
+// sign-in/register buttons are also suppressed.
+const _broadSubmitLabels = /\b(send|submit|post|publish|save|create|confirm|apply|sign\s*up|register|log\s*in|sign\s*in|place\s*order|buy|checkout|book|reserve|schedule|subscribe|next|continue|finish|complete|update)\b/i;
+
 
 // Reset focus to a known starting point.
 // Playwright's `page.keyboard.press` sends keys to the page DOM, not the
@@ -2685,7 +2695,8 @@ async function _goalCompletionRejectReason(goal, actionHistory, sessionId) {
     actionHistory.every(a => /navigate/i.test(a));
   const _compound = /(?:and\s+then|,?\s+and\s+|then\s+|after\s+.*\s+click)/i.test(goal || '');
   const _lastChanged = /→\s*page changed/.test((actionHistory || [])[(actionHistory || []).length - 1] || '');
-  const _submitGoal = /\b(send|submit|save|create|post|publish|apply|checkout|book|order|schedule)\b/i.test(goal || '');
+  const _noSubmitGoal = _noSubmitGoalRe.test(goal || '');
+  const _submitGoal = !_noSubmitGoal && /\b(send|submit|save|create|post|publish|apply|checkout|book|order|schedule)\b/i.test(goal || '');
   const _hasSubmitAct = /click "[^"]*(send|submit|save|post|publish|confirm)[^"]*"|(?:meta|control|ctrl|cmd)\+enter/i.test(_hist);
   let _sent = false;
   if (_submitGoal && !_hasSubmitAct) {
@@ -2722,8 +2733,11 @@ async function _goalCompletionRejectReason(goal, actionHistory, sessionId) {
 // Tab-Map inner loop: runs ONE step of the Tab-Map scan session.
 // Returns { done, ok, error, stateChanged, filledRef, filledLabel, filledValue }
 //   done=true when session ends (DONE, state change, or failure)
-async function _tabMapInnerStep(sessionId, goal, actionHistory, currentUrl, overlayActive, pageCategory, agentContext, cachedTabMap, filledFields, consumedRefs, lastVerifyFailed, extractedPageText, stepType = null, clickedRefs = null, clickedSubmitRefs = null) {
+async function _tabMapInnerStep(sessionId, goal, actionHistory, currentUrl, overlayActive, pageCategory, agentContext, cachedTabMap, filledFields, consumedRefs, lastVerifyFailed, extractedPageText, stepType = null, clickedRefs = null, clickedSubmitRefs = null, noSubmit = false) {
   const { _llmNextAction } = require('../../browser.agent.cjs');
+  // Goal-level no-submit detection — callers pass noSubmit explicitly, but a
+  // bare dom.act/tab.map step carrying "fill but don't submit" must self-protect.
+  const _noSubmit = noSubmit || _noSubmitGoalRe.test(goal || '');
 
   // 1. Use cached tab-map (scan session — no re-scan unless invalidated by caller)
   const tabMap = cachedTabMap;
@@ -2732,7 +2746,7 @@ async function _tabMapInnerStep(sessionId, goal, actionHistory, currentUrl, over
   }
 
   // 2. Ask LLM for next action
-  const nextAction = await _llmNextAction(goal, currentUrl, tabMap, actionHistory, pageCategory, agentContext, lastVerifyFailed, consumedRefs, filledFields, extractedPageText, stepType, clickedRefs, clickedSubmitRefs, overlayActive);
+  const nextAction = await _llmNextAction(goal, currentUrl, tabMap, actionHistory, pageCategory, agentContext, lastVerifyFailed, consumedRefs, filledFields, extractedPageText, stepType, clickedRefs, clickedSubmitRefs, overlayActive, _noSubmit);
   if (!nextAction) {
     logger.warn(`[instruction.runner] Tab-Map: LLM returned null — treating as failure (not done)`);
     return { done: true, ok: false, error: 'LLM returned null (provider failed)' };
@@ -2799,6 +2813,20 @@ async function _tabMapInnerStep(sessionId, goal, actionHistory, currentUrl, over
     if (_supLabel && _pt && (_supLabel.includes(_pt) || _pt.includes(_supLabel) || _fuzzyTextMatch(_pt, _supLabel))) {
       logger.warn(`[instruction.runner] Tab-Map: submit "${parsed.target}" already clicked with unchanged fields — suppressing re-click`);
       return { done: false, ok: true, suppressed: true, action: nextAction };
+    }
+  }
+
+  // 5d. No-submit hard gate — under an explicit no-submit policy the LLM may
+  // still pick a submit-class element (markers stay visible for context).
+  // Block submit-class clicks AND Enter/Return presses (implicit form
+  // submission). Tab/Escape presses and plain fills stay allowed.
+  if (_noSubmit) {
+    const _submitClick = parsed.action === 'click' &&
+      (_submitLabels.test(parsed.target || '') || _broadSubmitLabels.test(parsed.target || ''));
+    const _submitPress = parsed.action === 'press' && /^(enter|return)$/i.test(parsed.key || '');
+    if (_submitClick || _submitPress) {
+      logger.warn(`[instruction.runner] Tab-Map: no-submit policy blocked "${nextAction}" — fill-only goal`);
+      return { done: false, ok: true, noSubmitBlocked: true, suppressed: true, action: nextAction };
     }
   }
 
@@ -2939,4 +2967,7 @@ module.exports = {
   _tabMapStepExecute,
   _tabMapInnerStep,
   _goalCompletionRejectReason,
+  _noSubmitGoalRe,
+  _broadSubmitLabels,
+  _submitLabels,
 };
