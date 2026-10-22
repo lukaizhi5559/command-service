@@ -27,13 +27,20 @@ const CONFIRM_RE = /\?\s*[\[(]?(?:y(?:es)?\s*[/|]\s*n(?:o)?|n(?:o)?\s*[/|]\s*y(?
 // Arrow-key/menu TUIs — inquirer-style "› option" marker or the explicit hint.
 const MENU_RE = /use\s+arrow\s+keys|\(arrow keys\)|[›❯→]\s*\S/i;
 
+// less/more hold the foreground and eat everything typed until 'q' — their
+// telltales are a bare ':' / '(END)' / '--More--' / '(press RETURN)' on the
+// last line, or less's own help banner on screen.
+const PAGER_LINE_RE = /^\s*:\s*$|^\s*\(END\)\s*$|--More--|\(press RETURN\)\s*$/i;
+const PAGER_SCREEN_RE = /SUMMARY OF LESS COMMANDS|Press RETURN for more/i;
+
 /**
- * classifyPromptLine — { kind: 'never'|'confirm'|'menu'|'input'|'other' }
+ * classifyPromptLine — { kind: 'never'|'pager'|'confirm'|'menu'|'input'|'other' }
  * `line` is the prompt's last visible line; `screen` the trailing context.
  */
 function classifyPromptLine(line, screen) {
   const tail = `${line}\n${String(screen || '').split('\n').slice(-6).join('\n')}`;
   if (NEVER_AUTO_RE.test(tail)) return { kind: 'never', line };
+  if (PAGER_LINE_RE.test(line) || PAGER_SCREEN_RE.test(tail)) return { kind: 'pager', line };
   if (CONFIRM_RE.test(line)) return { kind: 'confirm', line };
   if (MENU_RE.test(tail)) return { kind: 'menu', line };
   if (/:\s*$/.test(line) || /\?\s*$/.test(line)) return { kind: 'input', line };
@@ -50,6 +57,10 @@ function classifyPromptLine(line, screen) {
 function answerFor(prompt, directives) {
   if (!prompt || prompt.kind === 'never' || !directives || !directives.enable) return null;
   switch (prompt.kind) {
+    case 'pager':
+      // 'q' just closes the pager — safe under any opt-in lane; a pager is
+      // never a consent prompt.
+      return directives.pager === false ? null : 'q';
     case 'confirm':
       if (directives.confirm === 'n') return 'n';
       if (directives.confirm === false) return null;
@@ -70,4 +81,4 @@ function answerFor(prompt, directives) {
   }
 }
 
-module.exports = { classifyPromptLine, answerFor, NEVER_AUTO_RE };
+module.exports = { classifyPromptLine, answerFor, NEVER_AUTO_RE, PAGER_LINE_RE, PAGER_SCREEN_RE };

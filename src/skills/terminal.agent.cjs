@@ -37,7 +37,7 @@ const crypto = require('crypto');
 const logger = require('../logger.cjs');
 const store = require('../terminal/session-store.cjs');
 const { DANGEROUS_SCRIPT_PATTERNS } = require('./shell.run.cjs');
-const { classifyPromptLine, answerFor } = require('../terminal/auto-answer.cjs');
+const { classifyPromptLine, answerFor, PAGER_LINE_RE, PAGER_SCREEN_RE } = require('../terminal/auto-answer.cjs');
 
 const DEFAULT_TIMEOUT_MS = 30000;
 const MAX_TIMEOUT_MS = 600000;
@@ -81,8 +81,9 @@ function _watchPrompt(session, cbUrl) {
   session._promptWatch = true;
   let timer = null;
   let seq = 0;
-  const classify = (line) => (PASSWORD_RE.test(line) ? 'password'
-    : (INPUT_PROMPT_RE.test(line) ? 'input' : null));
+  const classify = (line, scr) => (PASSWORD_RE.test(line) ? 'password'
+    : (PAGER_LINE_RE.test(line) || PAGER_SCREEN_RE.test(scr || '') ? 'pager'
+    : (INPUT_PROMPT_RE.test(line) ? 'input' : null)));
   const check = async () => {
     timer = null;
     const mySeq = ++seq;
@@ -92,9 +93,10 @@ function _watchPrompt(session, cbUrl) {
       // don't let it write stale prompt state back.
       if (mySeq !== seq) return;
       if (session.exitCode !== null) return;
-      const lines = session.screen.screen().split('\n');
+      const scr = session.screen.screen();
+      const lines = scr.split('\n');
       const last = (lines[lines.length - 1] || '').trim();
-      const kind = last ? classify(last) : null;
+      const kind = last ? classify(last, scr) : null;
       if (kind) {
         if (session.meta.prompt !== kind || session.meta.promptLine !== last) {
           session.meta.prompt = kind;
@@ -293,10 +295,33 @@ async function actionExec(args, ctx) {
   const markerRe = new RegExp(`__TD_EXIT_${nonce}_(\\d+)`);
   const timeoutMs = Math.min(args.timeoutMs || DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS);
 
+  // Foreground check — a pager holding the tty, or a leftover process from a
+  // previously timed-out exec, eats anything written now as keystrokes.
+  // Unstick first: 'q' releases pagers; ^C drops whatever else was stuck.
+  await s.screen.flush();
+  const _preScr = s.screen.screen();
+  const _preLast = (_preScr.split('\n').filter(l => l.trim()).pop() || '').trim();
+  const _paged = PAGER_LINE_RE.test(_preLast) || PAGER_SCREEN_RE.test(_preScr);
+  if (s.meta._execStuck || _paged) {
+    const stuck = !!s.meta._execStuck;
+    s.meta._execStuck = false;
+    emitProgress(ctx.cbUrl, { type: 'terminal:activity', sessionId: s.id, kind: 'note', line: _paged ? '# pager held the foreground — sending q' : '# unsticking foreground (q, ^C)' });
+    s.pty.write('q');
+    await new Promise(r => setTimeout(r, 200));
+    if (stuck) { s.pty.write('\x03'); await new Promise(r => setTimeout(r, 300)); }
+    await s.screen.flush();
+  }
+
   // Baseline cursor BEFORE sending — output matched from here forward.
   const baseOffset = s.screen.rawSince(null).offset;
   let cursor = baseOffset;
-  s.pty.write(`${cmd}; echo "__TD_EXIT_${nonce}_$?"\n`);
+  // No pager on the exec path — an agent can never answer one, and a pager
+  // would hold the foreground so the queued exit marker never echoes.
+  // `export` (not a `VAR= cmd` prefix) so compound commands (`for`, `if`,
+  // `{ ... }`) still parse. Once per session.
+  const _envPfx = s.meta._pagerOff ? '' : 'export GIT_PAGER=cat PAGER=cat MANPAGER=cat; ';
+  s.meta._pagerOff = true;
+  s.pty.write(`${_envPfx}${cmd}; echo "__TD_EXIT_${nonce}_$?"\n`);
 
   // Wait for the exit marker; resolves {saw:true,exitCode} or {saw:false} on
   // timeout. Reused by the auto-answer loop below with a short fuse.
@@ -314,6 +339,22 @@ async function actionExec(args, ctx) {
   });
 
   const result = await waitForExit(timeoutMs);
+
+  // Pager recovery — output paged into less/more (a resized viewer pane can
+  // shrink the PTY under the output) holds the foreground, and the queued
+  // exit marker only echoes after it exits. 'q' releases it — the marker
+  // then lands and we still capture the real exit code.
+  if (!result.saw && s.exitCode === null) {
+    await s.screen.flush();
+    const scr = s.screen.screen();
+    const last = (scr.split('\n').filter(l => l.trim()).pop() || '').trim();
+    if (PAGER_LINE_RE.test(last) || PAGER_SCREEN_RE.test(scr)) {
+      emitProgress(ctx.cbUrl, { type: 'terminal:activity', sessionId: s.id, kind: 'auto-answer', line: 'auto-answered pager → q' });
+      s.pty.write('q');
+      const w = await waitForExit(4000);
+      if (w.saw) { result.saw = true; result.exitCode = w.exitCode; }
+    }
+  }
 
   // ── Auto-answer (opt-in) — the lane that owns this session established the
   // user's intent (e.g. a plan-chosen setup). Answer SAFE prompts on their
@@ -356,6 +397,11 @@ async function actionExec(args, ctx) {
     }
   }
 
+  // A timed-out exec left its foreground running — flag it so the next exec
+  // on this shared session unsticks it instead of typing into it.
+  if (!result.saw && s.exitCode === null) s.meta._execStuck = true;
+  else delete s.meta._execStuck;
+
   await s.screen.flush();
   const screen = s.screen.screen()
     .split('\n')
@@ -388,9 +434,15 @@ async function actionExec(args, ctx) {
 function actionResize(args) {
   const s = store.get(args.sessionId);
   if (!s) return { ok: false, error: 'session-not-found' };
-  s.pty.resize(args.cols || 120, args.rows || 30);
-  s.meta.cols = args.cols || 120;
-  s.meta.rows = args.rows || 30;
+  // Agent sessions are machine exec targets — a small viewer pane must not
+  // shrink them below a sane floor, or paged output holds the foreground and
+  // eats exec input. User panes keep the exact fit.
+  const floor = s.meta.managedBy === 'agent' ? { cols: 80, rows: 24 } : { cols: 0, rows: 0 };
+  const cols = Math.max(args.cols || 120, floor.cols);
+  const rows = Math.max(args.rows || 30, floor.rows);
+  s.pty.resize(cols, rows);
+  s.meta.cols = cols;
+  s.meta.rows = rows;
   return { ok: true };
 }
 

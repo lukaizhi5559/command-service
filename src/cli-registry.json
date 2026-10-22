@@ -1,6 +1,12 @@
 {
   "calendar": {
-    "keywords": ["google calendar", "gcal", "calendar events", "my calendar", "calendar"],
+    "keywords": [
+      "google calendar",
+      "gcal",
+      "calendar events",
+      "my calendar",
+      "calendar"
+    ],
     "providers": {
       "google": {
         "tool": "curl",
