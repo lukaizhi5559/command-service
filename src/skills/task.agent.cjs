@@ -64,6 +64,11 @@ Reply with ONLY one JSON object:
        tool output is captured automatically — just say where it came from.
   {"action":"ask_user","question":"...","options":[]}
      — blocked on something only the user can supply (choice, credential, file).
+  {"action":"plan_update","reason":"what's missing or wrong","proposal":"how the plan should change","addRefs":[{"type":"file","path":"/abs/discovered"}]}
+     — STOP when you discover the PLAN itself is incomplete or wrong (a missing
+       task, a wrong assumption, a newly discovered input the plan didn't
+       know). The planner revises plan.md and the run resumes — do NOT hack
+       around a broken plan, and do NOT use this for ordinary step failures.
 
 Rules:
 - Documents: use doc.read — it owns pdf/docx/xlsx/pptx extraction. Pandoc CANNOT
@@ -75,6 +80,45 @@ Rules:
 - When the task's answer is already in an observed result, call done NOW —
   do not run redundant verification commands.
 - Paths must be absolute. Quote paths that contain spaces or non-ASCII chars.`;
+
+// ── Context refs resolution ─────────────────────────────────────────────────
+// args.refs: [{type:'plan'|'file'|'folder'|'path', path, note?}] carried from
+// the plan's frontmatter through dispatch. The 'plan' ref is the durable
+// contract — read the .md fresh so a paused/restarted run realigns to current
+// statuses instead of stale dispatch-time text.
+function _resolveRefs(refs, taskNum) {
+  const fs = require('fs');
+  const parts = [];
+  const planRef = (refs || []).find(r => r && r.type === 'plan' && r.path);
+  if (planRef) {
+    try {
+      const content = fs.readFileSync(planRef.path, 'utf8');
+      const pf = require('../../../../shared/plan-format.cjs');
+      const tasks = pf.parseTasks(content);
+      const fm = pf.parseFrontmatter(content) || {};
+      const title = (String(content).match(/^# Plan:\s*(.+)$/m) || [])[1] || '';
+      const desc = (String(content).match(/^# Plan:[^\n]*\n+([\s\S]*?)(?=\n## )/m) || [])[1] || '';
+      const mine = taskNum ? tasks.find(t => t.num === taskNum) : null;
+      const siblings = tasks.filter(t => !mine || t.num !== mine.num)
+        .map(t => `  Task ${t.num} "${t.title}" — ${t.status}${t.result ? ` → ${String(t.result).slice(0, 160)}` : ''}`)
+        .join('\n');
+      parts.push(
+        `PLAN CONTEXT (from ${planRef.path} — re-read at dispatch; statuses are LIVE):\n` +
+        `Plan: ${title || fm.id || 'untitled'} — status: ${fm.status || 'unknown'}\n` +
+        (desc ? `${desc.slice(0, 800)}\n` : '') +
+        (mine ? `\nYOUR TASK BLOCK (Task ${mine.num}):\n${mine.body.trim().slice(0, 2500)}\n` : '') +
+        (siblings ? `\nSIBLING TASKS (live status — do NOT redo ✅ done work):\n${siblings}` : ''));
+    } catch (e) {
+      parts.push(`PLAN CONTEXT: could not read ${planRef.path} (${e.message})`);
+    }
+  }
+  const otherRefs = (refs || []).filter(r => r && r.type !== 'plan' && r.path);
+  if (otherRefs.length) {
+    parts.push('CONTEXT FILES/FOLDERS (absolute paths — fs.read or shell against them as needed):\n'
+      + otherRefs.map(r => `  [${r.type}] ${r.path}${r.note ? ` — ${r.note}` : ''}`).join('\n'));
+  }
+  return parts.length ? `\n\n${parts.join('\n\n')}` : '';
+}
 
 async function _callLLM(systemPrompt, userPrompt, { temperature = 0.1, maxTokens = 500 } = {}) {
   try {
@@ -151,7 +195,7 @@ function _buildTurnUser(task, history) {
 }
 
 async function taskAgent(args = {}, deps = {}) {
-  const { task, cwd, env, timeoutMs, _progressCallbackUrl, _stepIndex } = args;
+  const { task, cwd, env, timeoutMs, _progressCallbackUrl, _stepIndex, refs, taskNum, planId } = args;
   const runSkill = typeof deps.runSkill === 'function' ? deps.runSkill : null;
   if (!task || typeof task !== 'string') {
     return { ok: false, agentId: AGENT_ID, error: 'task.agent requires args.task (string)' };
@@ -165,7 +209,11 @@ async function taskAgent(args = {}, deps = {}) {
     ? `\n\nPRIOR TASK RESULTS (context):\n${args.priorResults
         .map(p => `[task ${p.taskNum}] ${String(p.result || '').slice(0, 3000)}`).join('\n')}`
     : '';
-  const fullTask = task + prior;
+  // Context refs — plan file (live Task-N + sibling statuses on restart) and
+  // file/folder pointers. The .md is the durable carrier; realign to it rather
+  // than the dispatch-time prompt text.
+  const refContext = _resolveRefs(refs, taskNum);
+  const fullTask = task + prior + refContext;
 
   const catalog = CALLABLE_SKILLS.map(([n, d]) => `  ${n} — ${d}`).join('\n');
   const systemPrompt = `${LOOP_PROMPT}\n\nAVAILABLE SKILLS:\n${catalog}\n\nCurrent date/time: ${new Date().toISOString()} (${process.env.TZ || 'local'})`;
@@ -219,6 +267,24 @@ async function taskAgent(args = {}, deps = {}) {
           ok: true, agentId: AGENT_ID, task,
           stdout: action.result || _bestOutput || action.summary || '',
           summary: action.summary || '',
+          agentTurns: turn, transcript,
+        };
+      }
+
+      if (action.action === 'plan_update') {
+        // Loop-back into planning — the task discovered the plan itself is
+        // wrong/incomplete. Terminal non-fatal outcome: stategraph surfaces
+        // 'plan_update' to comms-graph, which revises this plan's .md and
+        // auto-resumes the run.
+        transcript.push({ turn, action, outcome: { ok: false, needsPlanUpdate: true } });
+        return {
+          ok: false, agentId: AGENT_ID, task,
+          needsPlanUpdate: true,
+          reason: String(action.reason || '').slice(0, 2000),
+          proposal: String(action.proposal || '').slice(0, 4000),
+          addRefs: Array.isArray(action.addRefs) ? action.addRefs : [],
+          planId: planId || null,
+          summary: `requested plan revision: ${String(action.reason || '').slice(0, 120)}`,
           agentTurns: turn, transcript,
         };
       }

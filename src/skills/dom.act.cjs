@@ -23,6 +23,7 @@ const { hasVisibleDialog } = require('./lib/browserCore/overlayProbe.cjs');
 const { deepLinkOpensOverlay, classifyDeepLinkType } = require('../skill-helpers/deep-link-types.cjs');
 const { inferPageCategory } = require('../skill-helpers/page-category.cjs');
 const { _noSubmitGoalRe } = require('./lib/browserCore/tabMap.cjs');
+const { resolveOrdinalItem } = require('./lib/browserCore/ordinal.cjs');
 
 // True when the goal is *only* the create/compose action that a
 // creation/compose deep-link already performed. Any residual work in the
@@ -35,6 +36,10 @@ function _isPureCreateGoal(goal, priorNavType) {
   const g = String(goal || '').trim();
   if (!g) return false;
   return _CREATE_ACTION_RE.test(g) && !_RESIDUAL_WORK_RE.test(g);
+}
+
+function _hostOf(u) {
+  try { return new URL(u).hostname.replace(/^www\./, ''); } catch (_) { return null; }
 }
 
 const AGENT_RUNNERS = {
@@ -84,6 +89,30 @@ async function domAct(args = {}) {
 
   const sessionId = qualifyOpenTab(await resolveExtSession(_sid || deriveSessionId(agentId)), goal);
 
+  // Bound-page precondition — an on-page goal presumes a live bound page.
+  // A dead/missing/blank binding must surface as a structured failure so the
+  // caller can re-navigate to the context URL and retry, rather than let
+  // probes "succeed" on about:blank and route a real goal to an empty page
+  // (observed: "click the third item" ran entirely on a minted about:blank,
+  // then turn.loop navigated it to an unrelated laptop SERP).
+  let _boundPageUrl = null;
+  try {
+    const _hrefRes = await browserAct({ action: 'evaluate', sessionId, headed: true, timeoutMs: 4000, text: 'location.href' });
+    const _href = String(_hrefRes?.result ?? '').replace(/^"|"$/g, '');
+    if (!_hrefRes?.ok || /^(about:|chrome:|edge:|brave:|chrome-extension:)/i.test(_href)) {
+      logger.warn(`[dom.act] bound-page-missing: session=${sessionId} url=${_href || '(none)'} err=${_hrefRes?.error || 'none'}`);
+      return {
+        ok: false,
+        error: 'bound-page-missing',
+        detail: _hrefRes?.error || `bound tab is on '${_href || 'no url'}'`,
+        expectedHost: _hostOf(priorNavUrl),
+        actualUrl: _href || null,
+        sessionId,
+      };
+    }
+    _boundPageUrl = _href;
+  } catch (_) { /* probe failure is non-fatal — routing reports its own errors */ }
+
   // Settle gate: the previous step (url.first) resolves at domcontentloaded —
   // heavy SPAs (Gmail compose, Calendar dialogs) keep rendering after that.
   // Wait for page text to stabilize so the probe sees the real post-nav state.
@@ -131,6 +160,38 @@ async function domAct(args = {}) {
     logger.info(`[dom.act] already satisfied — "${goal.slice(0, 60)}" done by ${priorNavType} deep-link (${priorNavUrl || 'unknown url'})`);
     postProgress(_progressCallbackUrl, { tier: 'done', message: `dom.act: already satisfied by navigation` });
     return { ok: true, alreadySatisfied: true, sessionId, agentId, url: priorNavUrl, output: `Already done — ${priorNavType} deep-link created it (${priorNavUrl || ''})` };
+  }
+
+  // Deterministic ordinal lane — "click/open the Nth item/result/listing"
+  // resolves positionally against the live DOM: enumerate result-shaped
+  // anchors in visual order and navigate to the Nth href. No LLM loop, no
+  // element-map scan — and a navigate can't be occluded by page overlays.
+  try {
+    const _ordItem = await resolveOrdinalItem(browserAct, { sessionId, goal, headed: true });
+    if (_ordItem?.href) {
+      postProgress(_progressCallbackUrl, { tier: 'route', message: `dom.act → ordinal: opening item #${_ordItem.nth}` });
+      const _nav = await browserAct({ action: 'navigate', sessionId, url: _ordItem.href, headed: true, timeoutMs: 30000 });
+      if (_nav?.ok) {
+        await new Promise(r => setTimeout(r, 1200));
+        const _urlAfter = (await browserAct({ action: 'evaluate', sessionId, headed: true, timeoutMs: 5000, text: 'location.href' }).catch(() => null))?.result;
+        const _navOk = _urlAfter && String(_urlAfter) !== String(_boundPageUrl || '');
+        if (_navOk) {
+          const _bodyText = (await browserAct({ action: 'evaluate', sessionId, headed: true, timeoutMs: 6000, text: 'document.body ? document.body.innerText.slice(0, 4000) : ""' }).catch(() => null))?.result || '';
+          logger.info(`[dom.act] ordinal lane: item #${_ordItem.nth} → ${String(_urlAfter).slice(0, 110)}`);
+          return {
+            ok: true,
+            resolvedAgent: 'dom.act:ordinal',
+            routeRule: 'ordinal-item',
+            sessionId,
+            url: String(_urlAfter),
+            output: `Opened item #${_ordItem.nth}: "${(_ordItem.text || '').slice(0, 120)}" → ${String(_urlAfter).slice(0, 200)}` + (_bodyText ? `\n\nPage content:\n${String(_bodyText).slice(0, 3000)}` : ''),
+          };
+        }
+        logger.warn('[dom.act] ordinal lane: navigate returned ok but URL unchanged — falling through to router');
+      }
+    }
+  } catch (e) {
+    logger.warn(`[dom.act] ordinal lane error (non-fatal): ${e.message}`);
   }
 
   // Bounded re-route: a routed agent that fails (e.g. shortcut agent finds no

@@ -65,20 +65,40 @@ function _cachedSessions() {
   }));
 }
 
+async function _reconcileSessions(timeoutMs = 4000) {
+  // Live query — hydrated/restored bindings emit no events, so the event-fed
+  // cache alone under-reports. It also OVER-reports after downtime: a
+  // tabClosed/unbind emitted while the socket was dead is gone forever,
+  // leaving a phantom binding that points at a dead tab (observed: the
+  // amazon_agent binding survived in cache after the real tab died, and a
+  // follow-up click minted about:blank instead of adopting the live tab).
+  // The extension's listSessions is authoritative — merge AND prune.
+  let res = await sendCmd({ sessionId: 'ext:default', action: 'listSessions' }, timeoutMs);
+  // MV3 cold-boot: a suspended worker can exceed the timeout hydrating
+  // before it answers — one retry beats falling back to a stale cache.
+  if (!res?.ok && /timed out/i.test(res?.error || '')) {
+    res = await sendCmd({ sessionId: 'ext:default', action: 'listSessions' }, timeoutMs + 2000);
+  }
+  if (!(res?.ok && Array.isArray(res.sessions))) return null;
+  const now = Date.now();
+  const liveIds = new Set();
+  for (const s of res.sessions) {
+    if (!s?.sessionId) continue;
+    if (s.alive !== false) liveIds.add(s.sessionId);
+    _sessionTabInfo.set(s.sessionId, { tabId: s.tabId, url: s.url, title: s.title, lastSeen: now });
+  }
+  for (const sid of [..._sessionTabInfo.keys()]) {
+    if (!liveIds.has(sid)) _sessionTabInfo.delete(sid);
+  }
+  return res.sessions;
+}
+
 async function sessions() {
   const connected = hasExtension();
   if (!connected) return { connected: false, sessions: _cachedSessions() };
-  // Live query — hydrated/restored bindings emit no events, so the event-fed
-  // cache alone under-reports. Merge the extension's authoritative list.
   try {
-    const res = await sendCmd({ sessionId: 'ext:default', action: 'listSessions' }, 4000);
-    if (res?.ok && Array.isArray(res.sessions)) {
-      const now = Date.now();
-      for (const s of res.sessions) {
-        if (s?.sessionId) _sessionTabInfo.set(s.sessionId, { tabId: s.tabId, url: s.url, title: s.title, lastSeen: now });
-      }
-      return { connected: true, sessions: res.sessions.filter(s => s && s.alive !== false && s.url) };
-    }
+    const live = await _reconcileSessions();
+    if (live) return { connected: true, sessions: live.filter(s => s && s.alive !== false && s.url) };
   } catch (_) { /* fall through to cache */ }
   return { connected: true, sessions: _cachedSessions() };
 }
@@ -101,6 +121,10 @@ function _onMessage(ws, raw) {
       _extInfo.ua = msg.ua || '';
       logger.info(`[ext.gateway] extension hello (ua=${(msg.ua || '').slice(0, 60)})`);
       try { ws.send(JSON.stringify({ type: 'hello-ack' })); } catch (_) {}
+      // Reconnect after downtime — lifecycle events emitted while the socket
+      // was dead are gone forever; reconcile the session cache against the
+      // extension's authoritative registry before the next /ext.sessions read.
+      _reconcileSessions().catch(() => {});
       break;
 
     case 'result': {

@@ -51,6 +51,7 @@ const engine = require('./browser-engine.cjs');
 const { askWithMessages } = require('../skill-helpers/skill-llm.cjs');
 const skillDb = require('../skill-helpers/skill-db.cjs');
 const { _liteparseVerify, _liteparseSubmit, _liteparseCapture, _domFindSubmitTarget, _validateClickPoint, ensureLitAvailable } = require('./browser.agent.cjs');
+const { ORDINAL_SCAN, ORDINAL_GOAL_RE, ORDINAL_OPEN_VERB_RE, ORDINAL_WORDS } = require('./lib/browserCore/ordinal.cjs');
 // Lazy-require keyboard nav helpers from instruction.runner.cjs to avoid circular dep
 const _getKbHelpers = () => {
   try { return require('./instruction.runner.cjs'); } catch { return {}; }
@@ -12304,36 +12305,14 @@ async function _executeTurnLoopFallback({ goal, verificationGoal, sessionId, hea
   // skips the LLM click path entirely (whose a[href] selectors mismatch DOM
   // attributes and whose coordinate clicks get occluded by page overlays).
   try {
-    const _ordGoalM = String(goal || '').match(/\b(first|second|third|fourth|fifth|1st|2nd|3rd|4th|5th)\b[^\n]{0,60}\b(item|items|result|results|listing|listings|product|products|link|links|video|videos|option|options|row|rows|card|cards)\b/i);
-    const _goalIsOpenNth = _ordGoalM && /\b(click|open|go to|goto|select|view|visit|details?)\b/i.test(goal);
+    const _ordGoalM = String(goal || '').match(ORDINAL_GOAL_RE);
+    const _goalIsOpenNth = _ordGoalM && ORDINAL_OPEN_VERB_RE.test(goal);
     if (_goalIsOpenNth) {
       const _ordW = _ordGoalM[1].toLowerCase();
-      const _ordN = { first: 1, '1st': 1, second: 2, '2nd': 2, third: 3, '3rd': 3, fourth: 4, '4th': 4, fifth: 5, '5th': 5 }[_ordW] || 1;
+      const _ordN = ORDINAL_WORDS[_ordW] || 1;
       const _scanRes = await browserAct({
         action: 'evaluate', sessionId, headed, timeoutMs: 8000,
-        text: `(() => {
-          const nth = ${_ordN};
-          const vh = window.innerHeight || 800;
-          const curSeg = (location.pathname.split('/').filter(Boolean)[0] || '').toLowerCase();
-          const out = [];
-          for (const el of document.querySelectorAll('a[href]')) {
-            if (el.closest('nav, header, footer, aside, [role="navigation"], [role="banner"], [role="contentinfo"], [role="search"], form')) continue;
-            const r = el.getBoundingClientRect();
-            if (r.width < 40 || r.height < 10) continue;
-            if (r.top < -50 || r.top > vh * 1.5) continue;
-            const t = (el.innerText || el.textContent || '').trim();
-            if (t.length < 15 || t.length > 500) continue;
-            // Result links leave the listing path family (/itm/, /dp/, /watch…);
-            // facet/category links stay in it (/sch/…). Prefer cross-family.
-            let cross = 1;
-            try { cross = (new URL(el.href).pathname.split('/').filter(Boolean)[0] || '').toLowerCase() !== curSeg ? 1 : 0; } catch (_) {}
-            out.push({ text: t.slice(0, 140), href: el.href || '', y: Math.round(r.top), x: Math.round(r.left), cross });
-          }
-          const seen = new Set();
-          const items = out.filter(o => { if (seen.has(o.href)) return false; seen.add(o.href); return true; });
-          items.sort((a, b) => (b.cross - a.cross) || (a.y - b.y) || (a.x - b.x));
-          return items[nth - 1] || null;
-        })()`,
+        text: ORDINAL_SCAN(_ordN),
       });
       const _ord = _scanRes?.result;
       if (_ord?.href) {
@@ -12712,45 +12691,11 @@ ${_composeSel ? `- SUGGESTED COMPOSE SELECTOR: ${_composeSel}` : ''}`;
       || String(goal || '').match(/\b(item|items|result|results|listing|listings|product|products|video|videos)\b[^\n]{0,40}\b(first|second|third|1st|2nd|3rd)\b/i);
     if (_ordM) {
       const _ordW = ((_ordM[1] && /first|second|third|fourth|fifth|\d+(st|nd|rd|th)/i.test(_ordM[1])) ? _ordM[1] : _ordM[2] || 'first').toLowerCase();
-      const _ordN = { first: 1, '1st': 1, second: 2, '2nd': 2, third: 3, '3rd': 3, fourth: 4, '4th': 4, fifth: 5, '5th': 5 }[_ordW] || 1;
+      const _ordN = ORDINAL_WORDS[_ordW] || 1;
       try {
         const _ordRes = await browserAct({
           action: 'evaluate', sessionId, headed, timeoutMs: 8000,
-          text: `(() => {
-            const nth = ${_ordN};
-            const vh = window.innerHeight || 800;
-            const curSeg = (location.pathname.split('/').filter(Boolean)[0] || '').toLowerCase();
-            const out = [];
-            for (const el of document.querySelectorAll('a[href]')) {
-              if (el.closest('nav, header, footer, aside, [role="navigation"], [role="banner"], [role="contentinfo"], [role="search"], form')) continue;
-              const r = el.getBoundingClientRect();
-              if (r.width < 40 || r.height < 10) continue;
-              if (r.top < -50 || r.top > vh * 1.5) continue;
-              const t = (el.innerText || el.textContent || '').trim();
-              if (t.length < 15 || t.length > 500) continue;
-              let sel = null;
-              if (el.id) sel = '#' + el.id;
-              else if (el.getAttribute('data-testid')) sel = 'a[data-testid="' + el.getAttribute('data-testid') + '"]';
-              else {
-                const attr = el.getAttribute('href') || '';
-                // Attribute-selector-safe: prefer the raw attribute so
-                // a[href='X'] actually matches; fall back to el.href property
-                // only when the attribute is unusable (relative '#', js:).
-                if (attr && !attr.startsWith('#') && !attr.startsWith('javascript:')) {
-                  sel = 'a[href="' + attr.replace(/"/g, '\\"') + '"]';
-                }
-              }
-              // Result links leave the listing path family (/itm/, /dp/,
-              // /watch…); facet/category links stay in it (/sch/…).
-              let cross = 1;
-              try { cross = (new URL(el.href).pathname.split('/').filter(Boolean)[0] || '').toLowerCase() !== curSeg ? 1 : 0; } catch (_) {}
-              out.push({ sel, tag: 'A', text: t.slice(0, 140), href: el.href || '', y: Math.round(r.top), x: Math.round(r.left), cross });
-            }
-            const seen = new Set();
-            const items = out.filter(o => { if (seen.has(o.href)) return false; seen.add(o.href); return true; });
-            items.sort((a, b) => (b.cross - a.cross) || (a.y - b.y) || (a.x - b.x));
-            return items[nth - 1] || null;
-          })()`,
+          text: ORDINAL_SCAN(_ordN),
         });
         const _ord = _ordRes?.result;
         if (_ord && (_ord.sel || _ord.href)) {
@@ -13550,7 +13495,28 @@ Turn ${turn}/${MAX_TURNS}. What is your next action? (DO NOT snapshot - act dire
           _outcome = { ok: false, error: `placeholder target "${_execAction.text || _execAction.selector}" — use a real element's text, ref, or CSS selector from the DOM signals` };
           logger.warn(`[playwright.agent] turn-loop: rejected placeholder target "${_tgt}" for ${_execAction.action} — inject hint`);
         } else {
-          _outcome = await browserAct(_execAction);
+          // Bound-host navigate guard — on a bound-context session, an LLM
+          // 'navigate' to a foreign host is almost always goal drift
+          // (observed: "click the third item" decomposed into "navigate to a
+          // search page" and landed on a laptop SERP). Same-family hosts
+          // (product/checkout paths, subdomains) and hosts the goal itself
+          // names still pass.
+          const _navBlockedHost = (_execAction.action === 'navigate' && _execAction.url && hostname)
+            ? (() => {
+                try {
+                  const h = new URL(_execAction.url).hostname.replace(/^www\./, '').toLowerCase();
+                  const sameFamily = h === hostname || h.endsWith('.' + hostname) || hostname.endsWith('.' + h);
+                  const namedInGoal = h && String(goal || '').toLowerCase().includes(h.split('.')[0]);
+                  return (!sameFamily && !namedInGoal) ? h : null;
+                } catch (_) { return null; }
+              })()
+            : null;
+          if (_navBlockedHost) {
+            _outcome = { ok: false, error: `navigate blocked — this session is bound to '${hostname}', not '${_navBlockedHost}'. Interact with the current page, or click a link that leads where you need.` };
+            logger.warn(`[playwright.agent] turn-loop: blocked foreign-host navigate → ${_navBlockedHost} (bound=${hostname})`);
+          } else {
+            _outcome = await browserAct(_execAction);
+          }
         }
       }
     } catch (_execErr) {
@@ -13577,7 +13543,27 @@ Turn ${turn}/${MAX_TURNS}. What is your next action? (DO NOT snapshot - act dire
             actionElement: _actionElement,
             transcript: _loopTranscript,
           });
-          if (_pc.status === 'verified') {
+          // Bound-host postcondition — a "verified" done on a foreign host is
+          // goal drift, not success (observed: the loop declared done on a
+          // laptop SERP after decomposing "navigate to a search page").
+          // Same-family hosts and hosts the goal names still count; clicks
+          // that legitimately land cross-host (oauth, affiliate) keep working
+          // only when the goal itself implies leaving the site.
+          const _pcDrift = _pc.status === 'verified' && hostname && _postActionState.url
+            ? (() => {
+                try {
+                  const h = new URL(_postActionState.url).hostname.replace(/^www\./, '').toLowerCase();
+                  const sameFam = h === hostname || h.endsWith('.' + hostname) || hostname.endsWith('.' + h);
+                  const named = h && String(goal || '').toLowerCase().includes(h.split('.')[0]);
+                  return (h && !sameFam && !named) ? h : null;
+                } catch (_) { return null; }
+              })()
+            : null;
+          if (_pcDrift) {
+            logger.warn(`[playwright.agent] turn-loop: postcondition 'verified' on foreign host ${_pcDrift} (bound=${hostname}) — treating as drift`);
+            _loopTranscript.push({ action: { drift_guard: _pcDrift }, outcome: { ok: false, error: `verified rejected — page left bound host '${hostname}' for '${_pcDrift}'` } });
+          }
+          if (_pc.status === 'verified' && !_pcDrift) {
             logger.info(`[playwright.agent] turn-loop: postcondition VERIFIED at turn ${turn} — ${_pc.reason} — exiting loop early`);
             // Emit completion progress event for the UI
             postProgress(_progressCallbackUrl, {
@@ -14951,6 +14937,20 @@ async function playwrightAgent(args) {
       try { hostname = new URL(url).hostname.replace(/^www\./, '').toLowerCase(); }
       catch (_) { /* hostname stays null */ }
     }
+  }
+  // No nav-first URL — a bound session already sits on a live page, and the
+  // page's own hostname IS the bound context. Compute it unconditionally so
+  // DOMAIN LOCK and the turn-loop's foreign-nav guard engage for on-page
+  // goals too (observed: "click the third item" on ext:amazon_agent wandered
+  // to a laptop SERP because hostname was null without args.url).
+  if (!hostname) {
+    try {
+      const _liveHost = await _engineEval(sessionId, 'window.location.hostname');
+      if (_liveHost?.ok && _liveHost.result) {
+        const _h = String(_liveHost.result).trim().replace(/^"|"$/g, '').replace(/^www\./, '').toLowerCase();
+        if (_h && !/^(newtab|blank|devtools|extensions)$/i.test(_h)) hostname = _h;
+      }
+    } catch (_) {}
   }
   const domainLockBlock = hostname
     ? `\n\nDOMAIN LOCK — ABSOLUTE:\nYou are automating '${hostname}'. NEVER navigate to any external site (not Google, Bing, DuckDuckGo, or anywhere outside ${hostname}). Any navigate step MUST stay on '${hostname}'.`

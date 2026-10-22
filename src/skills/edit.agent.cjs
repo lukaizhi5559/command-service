@@ -936,7 +936,12 @@ async function _editOffice(goal, filePath, ext, agentContext) {
 
   const o = await _officeOps(goal, before.stdout, kind, agentContext);
   if (o.failed) return { ok: false, error: 'LLM did not produce valid edit ops', reason: 'llm_failed' };
-  if (!o.ops.length) return { ok: false, error: 'Goal could not be expressed as structured ops — try app.agent for in-app editing', reason: 'office_ops_failed' };
+  // Empty ops = the goal couldn't be expressed against the real document text
+  // (requested phrase absent, formatting-only change, etc.). This is NOT an
+  // ops-engine failure — tag it `unexpressible` and delegate to app.agent so
+  // _thinPostFailureHandler escalates to in-app editing instead of the
+  // cli.agent PTY loop, which cannot out-edit a structured editor.
+  if (!o.ops.length) return { ok: false, error: 'Goal could not be expressed as structured ops — try app.agent for in-app editing', reason: 'unexpressible', delegateTo: 'app.agent' };
 
   const draftPath = converted ? workPath : _draftPathFor(filePath, kind);
   const applied = _py(script, ['apply', workPath, draftPath], JSON.stringify({ ops: o.ops }));

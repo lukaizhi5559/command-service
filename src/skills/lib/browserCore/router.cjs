@@ -7,6 +7,24 @@
 // page has loaded, using real DOM signals (probePageStructure) instead of a
 // plan-time guess. Pure heuristics — one optional cheap LLM lane-confirm call.
 //
+// Lane contract (what each executor is FOR):
+//   ordinal-item    — handled UPSTREAM in dom.act (browserCore/ordinal.cjs):
+//                     "click the Nth item/result" → enumerate anchors →
+//                     navigate to Nth href. Never reaches this cascade.
+//   just.type       — single focused-field typing / lone keypress / scroll
+//   meta.find       — locate + click named text on the current page
+//   shortcut.keys   — app hotkeys (Gmail 'c', Calendar 'c')
+//   tab.map         — bounded element-map loop: compound/multi-element work,
+//                     dialogs/overlays, multi-part goals, read-extract, and
+//                     the default-actionable floor. ALSO runs inside
+//                     form.fill (leftover fields) — it is not form-specific.
+//   form.fill       — (dom.act gate, not a route) deterministic profile-data
+//                     form fill: memory-resolved values, never submits.
+//   gesture         — drag/slider/swipe
+//   arrow.grid      — spreadsheet cell grids
+//   turn.loop       — multi-step/ambiguous/recovery LLM loop; foreign-host
+//                     navigates are blocked when a bound context exists.
+//
 // Cascade order (first match wins; gated by category allowedTiers):
 //   1. agentHint        — valid planner hint overrides everything
 //   2. gesture verbs    — drag/slider/swipe goal               → gesture.agent
