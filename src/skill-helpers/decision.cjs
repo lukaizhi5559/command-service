@@ -60,7 +60,10 @@ async function askDecision(questions, opts = {}) {
           ...(opts.image ? { image: opts.image } : {}),
         },
       }),
-      signal: opts.signal || AbortSignal.timeout(opts.timeoutMs || DEFAULT_TIMEOUT_MS),
+      // Batch-scaled timeout — ~60-120ms/question on the small-tier model;
+      // a flat 3s ceiling made >8-question batches always time out.
+      signal: opts.signal || AbortSignal.timeout(opts.timeoutMs
+        || (process.env.DECISION_TIMEOUT_MS ? DEFAULT_TIMEOUT_MS : Math.min(1200 + 250 * (Array.isArray(questions) ? questions.length : 1), 12000))),
     });
     const body = await res.json().catch(() => null);
     if (!body || body.status !== 'ok' || !body.data?.answers) return null;
