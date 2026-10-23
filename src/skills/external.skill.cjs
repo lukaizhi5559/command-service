@@ -899,6 +899,35 @@ ${trimmedSnapshot}
 
 Which element should I interact with? Return the ref (e.g. td5).`;
 
+  // ── Local decision fast path — bounded pick over the snapshot's refs ────
+  // Extract the tdN refs + their line context as options. Over the option
+  // cap → skip to remote (dense snapshots need the bigger model anyway).
+  {
+    const _refLines = [];
+    for (const line of trimmedSnapshot.split('\n')) {
+      const m = line.match(/\btd\d+\b/);
+      if (m) _refLines.push({ ref: m[0], line: line.trim().slice(0, 160) });
+    }
+    if (_refLines.length > 0 && _refLines.length <= 25) {
+      const _decision = require('../skill-helpers/decision.cjs');
+      const _picked = await _decision.boundedDecision({
+        site: 'externalSkill.resolveRef',
+        questions: [{
+          id: 'ref', type: 'choice',
+          question: `Which element should be interacted with to "${intent}"? Pick "none" if no element matches.`,
+          options: [..._refLines.map(r => `${r.ref}: ${r.line}`), 'none'],
+        }],
+        state: `I need to ${intent}.\nCurrent page snapshot (refs in tdN format):\n${trimmedSnapshot.slice(0, 2000)}`,
+        local: (a) => {
+          const i = a.ref?.index;
+          return (i != null && i < _refLines.length) ? _refLines[i].ref : null;
+        },
+        remote: async () => null,
+        logger,
+      });
+      if (_picked) return _picked;
+    }
+  }
   try {
     const response = await askWithMessages([
       { role: 'system', content: systemPrompt },

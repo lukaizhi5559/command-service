@@ -479,6 +479,26 @@ Respond with ONLY a JSON object (no markdown fences):
   }
 
   let raw;
+  let parsed;
+  // ── Local decision fast path — single-pick overlays are a bounded choice ──
+  // (Modal fill+click stays generative — it needs per-field values.)
+  if (!isModal && rows.length <= 25) {
+    const _decision = require('../skill-helpers/decision.cjs');
+    const _row = await _decision.boundedDecision({
+      site: 'ocrOverlay.pick',
+      questions: [{
+        id: 'item', type: 'choice',
+        question: 'Which overlay item best matches what the user wants to do?',
+        options: rows.map(r => `[${r.id}] ${r.type}: "${String(r.text || '').slice(0, 120)}"${r.description ? ` — "${String(r.description).slice(0, 80)}"` : ''}`),
+      }],
+      state: `GOAL: ${goal}\n\n${overlayStr}`,
+      local: (a) => (a.item?.index != null && a.item.index < rows.length) ? rows[a.item.index] : null,
+      remote: async () => null,
+      logger: console,
+    });
+    if (_row) parsed = { id: _row.id, reason: 'local-decision' };
+  }
+  if (!parsed) {
   try {
     raw = await askWithMessages([
       { role: 'system', content: 'You are a browser automation overlay selector. Output ONLY valid JSON.' },
@@ -489,7 +509,6 @@ Respond with ONLY a JSON object (no markdown fences):
   }
 
   // Parse JSON from response
-  let parsed;
   try {
     let json = (raw || '').trim();
     json = json.replace(/^```(?:json)?\s*\n?/i, '').replace(/\n?```\s*$/, '');
@@ -498,6 +517,7 @@ Respond with ONLY a JSON object (no markdown fences):
     parsed = JSON.parse(json);
   } catch (e) {
     return { ok: false, error: `LLM response parse failed: ${e.message}`, raw };
+  }
   }
 
   if (isModal) {

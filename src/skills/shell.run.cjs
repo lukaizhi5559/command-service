@@ -70,6 +70,30 @@ Rules:
 - If the goal is about file operations, app automation, text processing, or anything else → return 0
 - When in doubt → return 0 (let the free-generation path handle it)`;
 
+  // ── Local decision fast path — choice over the registry categories ──────
+  {
+    const _decision = require('../skill-helpers/decision.cjs');
+    const _n = await _decision.boundedDecision({
+      site: 'shellRun.classifySystemQuery',
+      questions: [{
+        id: 'cat', type: 'choice',
+        question: 'Does this shell automation goal ask for system/hardware info matching one of the categories? Goals about file operations, app automation, text processing, or anything else → pick "none". When in doubt → "none".',
+        options: [...SYSTEM_QUERY_REGISTRY.map(r => r.label), 'none'],
+      }],
+      state: `Goal: ${goal}`,
+      local: (a) => {
+        const i = a.cat?.index;
+        return (i != null && i < SYSTEM_QUERY_REGISTRY.length) ? i + 1 : null;
+      },
+      remote: async () => null,
+      logger,
+    });
+    if (_n != null) {
+      if (onProgress) onProgress({ type: 'shell:system_query_classified', category: _n, label: SYSTEM_QUERY_REGISTRY[_n - 1].label });
+      logger.info(`[shell.run] System query classified (local): #${_n} (${SYSTEM_QUERY_REGISTRY[_n - 1].label})`);
+      return _n;
+    }
+  }
   try {
     const raw = await skillLlm.askWithMessages([
       { role: 'system', content: systemPrompt },

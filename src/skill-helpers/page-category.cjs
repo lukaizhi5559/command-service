@@ -125,6 +125,26 @@ App knowledge: ${_akSummary || '(none)'}
 
 Which category number?`;
 
+  // ── Local decision fast path — choice over the category labels ──────────
+  {
+    const _decision = require('./decision.cjs');
+    const _cat = await _decision.boundedDecision({
+      site: 'pageCategory.classify',
+      questions: [{
+        id: 'cat', type: 'choice',
+        question: 'Classify this web page into a category. Cloud consoles (Google Cloud, AWS, Azure) are web_generic — "compose" in a cloud/dev context means "compose a query", not email. When in doubt pick web_generic.',
+        options: _LLM_CATEGORY_NUMBERS.map(c => `${c}`),
+      }],
+      state: `Service: ${_svc}\nURL: ${_url}\nTask: ${_task}\nApp knowledge: ${_akSummary || '(none)'}`,
+      local: (a) => (a.cat?.index != null && a.cat.index < _LLM_CATEGORY_NUMBERS.length) ? _LLM_CATEGORY_NUMBERS[a.cat.index] : null,
+      remote: async () => null,
+      logger,
+    });
+    if (_cat) {
+      logger.info(`[page-category] _classifyPageCategoryLLM: local decision service=${_svc} url=${_url.slice(0, 60)} → ${_cat}`);
+      return _cat;
+    }
+  }
   try {
     const raw = await askWithMessages([
       { role: 'system', content: systemPrompt },

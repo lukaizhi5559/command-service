@@ -250,6 +250,36 @@ async function classifyTaskIntent(task, serviceKey, useLLM = true) {
     return typeof _cached === 'string' ? _cached : _cached.intent;
   }
 
+  // ── Local decision fast path — choice over the intent enum ──────────────
+  // Keywords (used only by getCachedDeepLink) are derived lexically — the
+  // intent itself is the bounded part.
+  if (useLLM && _scopedShort.trim().length > 3) {
+    try {
+      const _decision = require('./decision.cjs');
+      const _intents = [...VALID_INTENTS];
+      const _local = await _decision.boundedDecision({
+        site: 'destinationResolver.classifyTaskIntent',
+        questions: [{
+          id: 'intent', type: 'choice',
+          question: `Classify this browser task into exactly one intent category.${_svc ? ` The user is performing this task via the "${_svc}" service — classify the intent in the context of what they want to do with ${_svc}, not other services mentioned in the task.` : ''}`,
+          options: _intents,
+        }],
+        state: `Task: ${_scopedShort}`,
+        local: (a) => (a.intent?.index != null && a.intent.index < _intents.length) ? _intents[a.intent.index] : null,
+        remote: async () => null,
+        logger,
+      });
+      if (_local) {
+        const _kw = _scopedShort.toLowerCase().split(/[^a-z0-9]+/)
+          .filter(w => w.length > 3 && !['the','with','this','that','from','into','want','please','make','open','goto','send','check','find','show','have','your','then','also','using'].includes(w))
+          .slice(0, 8);
+        logger.debug(`[destination-resolver] local intent: "${_local}" for task: "${_scopedShort.slice(0, 60)}"`);
+        _intentCache.set(_cacheKey, { intent: _local, keywords: _kw });
+        return _local;
+      }
+    } catch (_de) { /* fail-open → remote/regex below */ }
+  }
+
   // ── Primary: LLM classification ───────────────────────────────────────────
   if (useLLM && _skillLlm && _scopedShort.trim().length > 3) {
     try {

@@ -26,6 +26,7 @@ const fs = require('fs');
 const os = require('os');
 const logger = require('../logger.cjs');
 const { askWithMessages, ask: skillLlmAsk } = require('../skill-helpers/skill-llm.cjs');
+const _decision = require('../skill-helpers/decision.cjs');
 const { parseLlmJson } = require('../skill-helpers/parseLlmJson.cjs');
 const { loadPlaybook, savePlaybook } = require('./lib/appKnowledge.cjs');
 
@@ -1685,6 +1686,37 @@ Available tiers (tried tiers excluded): ${_availableTiers.join(', ')}
 
 Number?`;
 
+  // ── Local decision fast path — choice over available tiers ──────────────
+  {
+    const _TIER_LABELS = {
+      0: '0 - Done: everything in the goal has been accomplished',
+      1: '1 - App Shortcuts: app-specific keyboard shortcuts',
+      2: '2 - Just-type: type a value into the focused field (plain/commands/edit/search/list-item)',
+      3: '3 - Global Shortcuts: Tab, Enter, Escape, arrows, Shift+Tab',
+      4: '4 - Search Text: OCR-find text on screen then click/navigate to it',
+      5: '5 - Monitoring: poll until a long-running operation finishes',
+    };
+    const _opts = _availableTiers.filter(t => _TIER_LABELS[t] != null).map(t => _TIER_LABELS[t]);
+    const _t = await _decision.boundedDecision({
+      site: 'appRunner.selectTier',
+      questions: [{
+        id: 'tier', type: 'choice',
+        question: 'Which strategy should be tried next to accomplish the goal? Pick the done option only if the goal is fully accomplished.',
+        options: _opts,
+      }],
+      state: `Goal: ${goal}\nApp category: ${appCategory || 'unknown'}\nAvailable shortcuts: ${shortcutCount}\nFocused element: ${focusedElement ? 'yes' : 'no'}\nCurrent OCR (first 300): ${(currentOcrText || '').slice(0, 300)}\nRecent actions:\n${historyStr || '(none)'}`,
+      local: (a) => {
+        const i = a.tier?.index;
+        return (i != null && i < _opts.length) ? parseInt(_opts[i][0], 10) : null;
+      },
+      remote: async () => null,
+      logger,
+    });
+    if (_t != null) {
+      logger.info(`[app.runner] _selectAppTierLLM: local decision → ${_t}`);
+      return _t;
+    }
+  }
   try {
     const raw = await askWithMessages([
       { role: 'system', content: systemPrompt },
@@ -1766,6 +1798,26 @@ Recent actions: ${historyStr || '(none)'}
 
 Field type?`;
 
+  // ── Local decision fast path — choice over the 5 type labels ─────────────
+  {
+    const _types = ['type-plain', 'type-edit', 'type-commands', 'type-search', 'type-list-item'];
+    const _t = await _decision.boundedDecision({
+      site: 'appRunner.fieldType',
+      questions: [{
+        id: 'ft', type: 'choice',
+        question: `What kind of typing does the focused field need? "type-plain": type value as-is then submit (search/chat/simple fields/short answers). "type-edit": long-form content or editing in a document/code editor. "type-commands": value opens a '/' command menu. "type-search": value filters a dynamic dropdown (@mentions, pickers). "type-list-item": todo/checklist item where Enter creates the next item.`,
+        options: _types,
+      }],
+      state: `Goal: ${goal}\nApp category: ${appCategory || 'unknown'}\nValue to type: "${_val.slice(0, 200)}"\nRecent actions: ${historyStr || '(none)'}`,
+      local: (a) => (a.ft?.index != null && a.ft.index < _types.length) ? _types[a.ft.index] : null,
+      remote: async () => null,
+      logger,
+    });
+    if (_t) {
+      logger.info(`[app.runner] _extractAppFieldType: local decision → ${_t}`);
+      return _t;
+    }
+  }
   try {
     const raw = await askWithMessages([
       { role: 'system', content: systemPrompt },
@@ -2244,6 +2296,29 @@ ${historyStr}
 
 Number (0-2)?`;
 
+  // ── Local decision fast path — 3-way outcome choice ─────────────────────
+  {
+    const _r = await _decision.boundedDecision({
+      site: 'appRunner.ocrVerifyGoal',
+      questions: [{
+        id: 'v', type: 'choice',
+        question: `Does the OCR text show the goal's expected result?${_noSubmit ? ' NO-SUBMIT GOAL: verify the requested text is present in the app input field — do NOT expect a sent/posted confirmation.' : ''}`,
+        options: [
+          '0 - fail: the OCR text does NOT show the expected result',
+          '1 - done: the OCR text shows the expected result (goal achieved)',
+          '2 - wait: the OCR text shows explicit loading indicators (Loading..., spinner, progress bar)',
+        ],
+      }],
+      state: `Goal: ${goal}\nOCR text:\n${(ocrText || '').slice(0, 1500)}\nActions taken:\n${historyStr}`,
+      local: (a) => (a.v?.index != null && a.v.index <= 2) ? a.v.index : null,
+      remote: async () => null,
+      logger,
+    });
+    if (_r != null) {
+      logger.info(`[app.runner] _ocrVerifyAppGoal: local decision → ${_r} for goal="${String(goal).slice(0, 60)}"`);
+      return { num: _r, reason: _r === 1 ? 'goal-achieved' : (_r === 2 ? 'loading' : 'ocr-failed') };
+    }
+  }
   try {
     const raw = await askWithMessages([
       { role: 'system', content: systemPrompt },
@@ -2294,6 +2369,29 @@ Actions taken: ${historyStr}
 
 Number (0-2)?`;
 
+  // ── Local decision fast path — 3-way outcome choice ─────────────────────
+  {
+    const _r = await _decision.boundedDecision({
+      site: 'appRunner.ocrVerifyStep',
+      questions: [{
+        id: 'v', type: 'choice',
+        question: 'Comparing the before and after OCR text: was the step goal achieved? If before and after are nearly identical the action had no effect — pick fail.',
+        options: [
+          '0 - fail: step goal NOT achieved — no relevant change detected',
+          '1 - success: step goal achieved — expected change visible in the after-OCR',
+          '2 - wait: after-OCR shows explicit loading indicators (Loading..., spinner)',
+        ],
+      }],
+      state: `Step goal: ${stepGoal}\nBefore OCR (first 500): ${(beforeOcr || '').slice(0, 500)}\nAfter OCR (first 500): ${(afterOcr || '').slice(0, 500)}\nActions taken: ${historyStr}`,
+      local: (a) => (a.v?.index != null && a.v.index <= 2) ? a.v.index : null,
+      remote: async () => null,
+      logger,
+    });
+    if (_r != null) {
+      logger.info(`[app.runner] _ocrVerifyAppStep: local decision → ${_r} for stepGoal="${String(stepGoal).slice(0, 60)}"`);
+      return { num: _r, reason: _r === 1 ? 'success' : (_r === 2 ? 'loading' : 'no-change') };
+    }
+  }
   try {
     const raw = await askWithMessages([
       { role: 'system', content: systemPrompt },
@@ -2353,6 +2451,28 @@ Number (0-3)?`;
     // actually returns a number (0|1|2|3) instead of prose like "Based on the
     // provided...". This call is rare (only on stability), so the cost is
     // negligible compared to calling a cheap model on every noisy change.
+    // ── Local decision fast path — 4-way state choice ────────────────────
+    const _r = await _decision.boundedDecision({
+      site: 'appRunner.ocrVerifyMonitor',
+      questions: [{
+        id: 'v', type: 'choice',
+        question: 'The text below is the DIFF between a baseline screen capture and the current screen (only NEW content). The screen is already confirmed stable. What does the diff show? When in doubt pick content.',
+        options: [
+          '0 - content: coherent response/answer/output — accept as done',
+          '1 - loading: ONLY a loading indicator (spinner, "thinking", "generating", progress bar) — no actual content',
+          '2 - error: explicit error message, crash, "failed", "cancelled", "timed out"',
+          '3 - unknown: too short or ambiguous — treat as content',
+        ],
+      }],
+      state: `User's question: ${questionToAsk || '(unknown)'}\nApp: ${appName || 'unknown'}\nOCR text (first 2000): ${(ocrText || '').slice(0, 2000)}`,
+      local: (a) => (a.v?.index != null && a.v.index <= 3) ? a.v.index : null,
+      remote: async () => null,
+      logger,
+    });
+    if (_r != null) {
+      logger.info(`[app.runner] _ocrVerifyMonitorState: local decision → ${_r}`);
+      return { num: _r, reason: ['content', 'loading', 'error', 'unknown'][_r] };
+    }
     const raw = await askWithMessages([
       { role: 'system', content: systemPrompt },
       { role: 'user', content: userPrompt },

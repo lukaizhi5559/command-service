@@ -14,6 +14,9 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const { askWithMessages } = require('../../../skill-helpers/skill-llm.cjs');
+// Local decision-model access (phi4 decision.answer — bounded picks).
+const _decision = require('../../../skill-helpers/decision.cjs');
+
 const { _tabToRef, _slimReadActiveElement, ensureFieldFocused } = require('./focusField.cjs');
 const { _executeJustType } = require('./typing.cjs');
 
@@ -1355,6 +1358,28 @@ Which element number matches the step target?
 - If NO element matches, output 0
 Output ONLY the number, or 0 if no match.`;
 
+  // ── Local decision fast path — bounded pick over the element list ────────
+  if (tabMap.length <= 25) {
+    const _local = await _decision.boundedDecision({
+      site: 'tabMap.pickFromTabMap',
+      questions: [{
+        id: 'el', type: 'choice',
+        question: `Which element matches the step target "${verifyText}"? The target text may be GARBLED — characters can be dropped within words ("playli t" = "playlist"). Match if the element text/label contains the same words ignoring dropped characters. A bare "Create" does NOT match "Create a playlist with a song or episode" — it only matches an exactly-"Create" element.${contextHint ? ` Additional context: "${contextHint}".` : ''} Pick "none" if no element matches.`,
+        options: [...tabMap.map(e => `${e.id} - ${_formatTabMapEntryForLLM(e)}`.slice(0, 160)), 'none'],
+      }],
+      state: `Step: ${actionDesc} — target: "${verifyText}"${hintBlock}`,
+      local: (a) => {
+        const i = a.el?.index;
+        return (i != null && i < tabMap.length) ? tabMap[i] : null;
+      },
+      remote: async () => null,
+      logger,
+    });
+    if (_local) {
+      logger.info(`[instruction.runner] Local decision picked element #${_local.id} (${_formatTabMapEntryForLLM(_local)}) for "${verifyText}"`);
+      return _local;
+    }
+  }
   try {
     const response = await askWithMessages([
       { role: 'system', content: 'You pick the matching element from a list. The target text may be garbled (characters dropped within words). Match if the words align. Output ONLY the number, or 0 if no match. Nothing else.' },
@@ -1425,6 +1450,28 @@ ${listStr}
 
 Is any element a "reveal" button — one that reveals more content when clicked (e.g. "See more", "Load more", "Show all", "View all", "Expand", "More")?
 Output ONLY the element number, or 0 if none.`;
+  // ── Local decision fast path ───────────────────────────────────────────
+  if (tabMap.length <= 25) {
+    const _local = await _decision.boundedDecision({
+      site: 'tabMap.revealButton',
+      questions: [{
+        id: 'el', type: 'choice',
+        question: 'Is any element a "reveal" button — one that reveals more content when clicked (e.g. "See more", "Load more", "Show all", "View all", "Expand", "More")? Pick "none" if none qualifies.',
+        options: [...tabMap.map(e => `${e.id} - ${_formatTabMapEntryForLLM(e)}`.slice(0, 160)), 'none'],
+      }],
+      state: `Available elements:\n${listStr}`,
+      local: (a) => {
+        const i = a.el?.index;
+        return (i != null && i < tabMap.length) ? tabMap[i] : null;
+      },
+      remote: async () => null,
+      logger,
+    });
+    if (_local) {
+      logger.info(`[instruction.runner] Local decision identified reveal button #${_local.id} (${_formatTabMapEntryForLLM(_local)})`);
+      return _local;
+    }
+  }
   try {
     const response = await askWithMessages([
       { role: 'system', content: 'You identify reveal buttons from a list. A reveal button reveals more content when clicked (e.g. "See more", "Load more", "Show all", "View all", "Expand", "More"). Output ONLY the element number, or 0 if none.' },
@@ -2223,6 +2270,29 @@ async function _matchElementToStep(sessionId, step, tabMap, goalContext = '') {
   const elementList = tabMap.map(e =>
     `${e.id} - ${e.tag || ''} "${e.text || e.ariaLabel || ''}" ${e.role || ''}${e.isSponsored ? ' [SPONSORED]' : ''}`
   ).join('\n');
+
+  // ── Local decision fast path — bounded pick (≤25) with sponsored demotion ─
+  if (tabMap.length <= 25) {
+    const _local = await _decision.boundedDecision({
+      site: 'tabMap.matchElementToStep',
+      questions: [{
+        id: 'el', type: 'choice',
+        question: `Which element best matches the target "${step.target}"? Elements marked [SPONSORED] are ads — prefer non-sponsored elements unless the target explicitly asks for a sponsored/ad result. Pick "none" if nothing matches.`,
+        options: [...tabMap.map(e => `${e.id} - ${e.tag || ''} "${e.text || e.ariaLabel || ''}" ${e.role || ''}${e.isSponsored ? ' [SPONSORED]' : ''}`.slice(0, 160)), 'none'],
+      }],
+      state: `Target: "${step.target}"\nElements:\n${elementList}`,
+      local: (a) => {
+        const i = a.el?.index;
+        return (i != null && i < tabMap.length) ? tabMap[i] : null;
+      },
+      remote: async () => null,
+      logger,
+    });
+    if (_local) {
+      logger.info(`[instruction.runner] _matchElementToStep: local decision match "${step.target}" → #${_local.id}`);
+      return _local;
+    }
+  }
   try {
     const raw = await askWithMessages([
       { role: 'system', content: 'Return ONLY the element ID number that best matches the target. No other text. Elements marked [SPONSORED] are ads — prefer non-sponsored elements unless the target explicitly asks for a sponsored/ad result.' },

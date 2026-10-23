@@ -158,6 +158,29 @@ function matchShortcut(goal, shortcutTable) {
 // generalist cascade) rather than guess.
 async function _confirmGoalLane(goal) {
   try {
+    // ── Local decision fast path — 4-lane choice ──────────────────────────
+    const _decision = require('../../../skill-helpers/decision.cjs');
+    const _local = await _decision.boundedDecision({
+      site: 'router.confirmGoalLane',
+      questions: [{
+        id: 'lane', type: 'choice',
+        question: 'Classify this browser on-page action goal into exactly one lane.',
+        options: [
+          'shortcut — press a keyboard shortcut / app hotkey (e.g. "press the compose shortcut", "open the create dialog")',
+          'read — search/read/extract page content for the user (e.g. "search my inbox", "check unread emails", "read the messages")',
+          'find — locate specific text on the current page (e.g. "find the word hello", "jump to the message")',
+          'action — a UI action: click, type, navigate, submit (e.g. "click save", "fill the form")',
+        ],
+      }],
+      state: `Goal: "${String(goal).slice(0, 200)}"`,
+      local: (a) => {
+        const i = a.lane?.index;
+        return (i != null && i <= 3) ? ['shortcut', 'read', 'find', 'action'][i] : null;
+      },
+      remote: async () => null,
+      logger,
+    });
+    if (_local) return _local;
     const { askWithMessages } = require('../../../skill-helpers/skill-llm.cjs');
     const raw = await askWithMessages([
       { role: 'system', content: 'Classify a browser on-page action goal into exactly one lane. Answer with ONLY the lane name.\n- "shortcut" — press a keyboard shortcut / app hotkey (e.g. "press the compose shortcut", "open the create dialog")\n- "read" — search/read/extract page content for the user (e.g. "search my inbox", "check unread emails", "read the messages")\n- "find" — locate specific text on the current page (e.g. "find the word hello", "jump to the message")\n- "action" — a UI action: click, type, navigate, submit (e.g. "click save", "fill the form")' },

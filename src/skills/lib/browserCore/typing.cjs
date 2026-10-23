@@ -401,6 +401,7 @@ async function _executeTypeEdit(sessionId, value, focusedElement, goal, pageCate
 // type-edit (generate mode): LLM generates long text from the goal, then types it into the field.
 async function _executeTypeGenerate(sessionId, value, focusedElement, goal, pageCategory, agentContext, pageContext) {
   const { askWithMessages } = require('../../../skill-helpers/skill-llm.cjs');
+const _decision = require('../../../skill-helpers/decision.cjs');
 
   // If the value from _extractValue is already long/multi-line, use it directly
   // (the LLM in _extractValue may have already generated the content)
@@ -666,7 +667,26 @@ async function _executeTypeWithDropdown(sessionId, targetLabel, maxOptions = 10)
   // LLM call: find the best matching option from the full list.
   // Return the 1-based index of the best match, or 0 if no match.
   let matchIndex = -1;
-  try {
+  // ── Local decision fast path — bounded pick over the option list ─────────
+  if (allLabels.length <= 25) {
+    const _li = await _decision.boundedDecision({
+      site: 'typing.dropdownMatch',
+      questions: [{
+        id: 'opt', type: 'choice',
+        question: `Which dropdown option best matches the target "${targetLabel}"? Pick "none" if no option matches.`,
+        options: [...allLabels.map(l => String(l).slice(0, 160)), 'none'],
+      }],
+      state: `Target: "${targetLabel}"\nOptions: ${allLabels.join(' | ')}`,
+      local: (a) => {
+        const i = a.opt?.index;
+        return (i != null && i < allLabels.length) ? i : null;
+      },
+      remote: async () => null,
+      logger,
+    });
+    if (_li != null) matchIndex = _li;
+  }
+  if (matchIndex < 0) try {
     const numbered = allLabels.map((l, i) => `${i + 1}. ${l}`).join('\n');
     const raw = await askWithMessages([
       { role: 'system', content: 'You are a dropdown option matcher. Return ONLY the number (1-based index) of the option that best matches the target. Return 0 if no option matches.' },
@@ -759,7 +779,29 @@ async function _executeTypeCommands(sessionId, value, focusedElement, goal, page
       return `${i + 1}. ${_label}`;
     }).join('\n');
 
-    try {
+    // ── Local decision fast path — bounded pick over the command list ──────
+    if (cachedCommands.length <= 26) {
+      selectedCommand = await _decision.boundedDecision({
+        site: 'typing.commandPick',
+        questions: [{
+          id: 'cmd', type: 'choice',
+          question: 'Which command best achieves the goal?',
+          options: cachedCommands.map(c => String(typeof c === 'string' ? c : c.label).slice(0, 160)),
+        }],
+        state: `Goal: ${goal}\nAvailable commands: ${_numberedList}`,
+        local: (a) => {
+          const i = a.cmd?.index;
+          return (i != null && i < cachedCommands.length) ? cachedCommands[i] : null;
+        },
+        remote: async () => null,
+        logger,
+      });
+      if (selectedCommand) {
+        const _l = typeof selectedCommand === 'string' ? selectedCommand : selectedCommand.label;
+        logger.info(`[instruction.runner] type-commands: local decision picked → "${_l}"`);
+      }
+    }
+    if (!selectedCommand) try {
       const raw = await askWithMessages([
         { role: 'system', content: 'You pick the best command from a list to achieve a goal. Return ONLY the number (e.g. "1"). No explanation.' },
         { role: 'user', content: `Goal: ${goal}\n\nAvailable commands:\n${_numberedList}\n\nWhich command number achieves this goal?` },

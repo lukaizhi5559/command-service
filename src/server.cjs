@@ -1325,6 +1325,37 @@ class CommandServiceMCPServer {
               // selector treats extension-backed browser agents as the
               // zero-setup authenticated route (see SELECT rules).
               extConnected: !!payload.extConnected,
+              // Bounded local pick over the vetted pool — the selector still
+              // validates the returned id against the pool before honoring it.
+              localCaller: (pool, q, table) => {
+                try {
+                  const { boundedDecision } = require('./skill-helpers/decision.cjs');
+                  return boundedDecision({
+                    site: 'capability.selectBest',
+                    questions: [
+                      {
+                        id: 'pick', type: 'choice',
+                        question: 'Which single candidate best satisfies the request? Pick "none" if no candidate fits.',
+                        options: [...pool.map((c, i) => `${i + 1}. ${c.id}`), 'none'],
+                      },
+                      {
+                        id: 'fit', type: 'choice',
+                        question: 'How well does the picked candidate fit the request?',
+                        options: ['exact — directly does what was asked', 'partial — related but needs clarification', 'none — does not fit'],
+                      },
+                    ],
+                    state: `REQUEST: ${q}\n\nCANDIDATES:\n${table}`,
+                    local: (a) => {
+                      const i = a.pick?.index;
+                      const pick = (i != null && i < pool.length) ? String(pool[i].id) : null;
+                      const fi = a.fit?.index;
+                      return { pick, fit: ['exact', 'partial', 'none'][fi] || 'none', reason: 'local-decision', alternatives: [] };
+                    },
+                    remote: async () => null,
+                    logger: console,
+                  });
+                } catch (_) { return null; }
+              },
               llmCaller: (prompt) => skillLlm.askWithMessages(
                 [{ role: 'user', content: prompt }],
                 { temperature: 0, maxTokens: 300, taskType: 'capability_select',

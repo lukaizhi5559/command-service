@@ -126,6 +126,40 @@ Labels:
 ${labels.map((l) => `- "${l}"`).join('\n')}
 
 JSON object only, no prose.`;
+  // ── Local decision fast path — one batched choice per label ─────────────
+  // Custom-attribute slugs are deterministic (slugify the label), so the
+  // model only picks: canonical key | custom | ignore.
+  if (labels.length <= 12) {
+    const _decision = require('../skill-helpers/decision.cjs');
+    const _slug = (t) => String(t).toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '').slice(0, 40);
+    const _qs = labels.map((label, i) => ({
+      id: `l${i}`, type: 'choice',
+      question: `Map the web-form field label "${label}" to a canonical profile key. Pick "custom" if it's a named custom attribute (e.g. "Rider number"), or "ignore" if it is not a fillable user-data field (search box, captcha, file upload, newsletter checkbox).`,
+      options: [...canonical, 'custom', 'ignore'],
+    }));
+    const _map = await _decision.boundedDecision({
+      site: 'formFill.labelMap',
+      questions: _qs,
+      state: `Canonical keys: ${canonical.join(', ')}\nLabels: ${labels.join(', ')}`,
+      local: (a) => {
+        const out = {};
+        labels.forEach((label, i) => {
+          const idx = a[`l${i}`]?.index;
+          if (idx == null) return;
+          if (idx < canonical.length) out[label] = canonical[idx];
+          else if (idx === canonical.length) out[label] = `self:${_slug(label)}`;
+          // 'ignore' → omit
+        });
+        return Object.keys(out).length ? out : null;
+      },
+      remote: async () => null,
+      logger,
+    });
+    if (_map) {
+      logger.info(`[form.fill] local decision mapped ${Object.keys(_map).length}/${labels.length} labels`);
+      return _map;
+    }
+  }
   try {
     const resp = await askWithMessages([{ role: 'user', content: prompt }]);
     const text = String(resp || '');
