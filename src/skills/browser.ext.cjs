@@ -166,8 +166,25 @@ async function _dispatch(args, start) {
     case 'clickSelector':
     case 'clickBySelector':
     case 'dblclick': {
-      const res = await gateway.sendCmd({ sessionId, action: action === 'clickBySelector' ? 'clickSelector' : action, args: { selector: selector || args.ref || '', ..._fwd } }, timeoutMs + 5000);
+      const _sel = selector || args.ref || '';
+      // Ref-stale fingerprint: for tdN/eN refs, forward the tag+label the
+      // snapshot recorded so the extension refuses to click when the live
+      // DOM renumbered the ref onto a different element (Gmail SPA re-render).
+      let _expect = null;
+      if (/^(td|e|ff)\d+$/i.test(_sel)) {
+        const _meta = _extRefMaps.get(sessionId)?.get(_sel);
+        if (_meta) _expect = { expectTag: _meta.tag || '', expectLabel: String(_meta.name || '').slice(0, 80) };
+      }
+      const res = await gateway.sendCmd({ sessionId, action: action === 'clickBySelector' ? 'clickSelector' : action, args: { selector: _sel, ..._fwd, ...(_expect || {}) } }, timeoutMs + 5000);
       if (!res.ok) {
+        if (res.error === 'ref-stale' || /^ref-stale/i.test(res.error || '')) {
+          // Invalidate the cached snapshot so the next action re-scans fresh
+          // refs instead of repeating the dead ref.
+          _extSnapshots.delete(sessionId);
+          _extRefMaps.delete(sessionId);
+          logger.warn(`[browser.ext] ref-stale on ${_sel} (session=${sessionId}) — snapshot invalidated; ${res.detail || ''}`);
+          return _envErr(action, sessionId, start, `ref-stale: ${res.detail || `ref ${_sel} no longer matches its snapshot element — re-snapshot and retry`}`);
+        }
         // a[href='X'] selectors fail when the DOM attribute differs from the
         // absolute href (re-encoded params, relative form). Clicking a link
         // is navigating it — fall through to a bound-tab navigate on X.

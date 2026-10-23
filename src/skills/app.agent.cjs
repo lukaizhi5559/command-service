@@ -5997,7 +5997,10 @@ async function _detectAppByOCRDifference(appName) {
   }
 }
 
-async function actionExecuteShortcut({ appName, action, shortcutOverride, verifyWith, skipFocusCheck = false }) {
+async function actionExecuteShortcut({ appName, action, shortcutAction, shortcutOverride, verifyWith, skipFocusCheck = false }) {
+  // The skill dispatcher strips args.action for routing, so plan steps carry
+  // the semantic shortcut name as shortcutAction (e.g. 'focus_ai').
+  if (!action && shortcutAction) action = shortcutAction;
   // Treat "done"/"complete"/"finish"/"end"/"noop" as no-op completion sentinels.
   // The App-Flow playbook ends with a "done" step, but no app has a "done"
   // shortcut — this guard prevents the flow from aborting on a missing shortcut.

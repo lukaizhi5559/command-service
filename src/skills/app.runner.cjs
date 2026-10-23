@@ -31,6 +31,11 @@ const { loadPlaybook, savePlaybook } = require('./lib/appKnowledge.cjs');
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
+// "don't submit / without sending / leave it ready" — suppresses every
+// Enter/Return the runner would otherwise press after typing. Mirrors
+// _noSubmitGoalRe in lib/browserCore/tabMap.cjs (keep in sync).
+const _noSubmitGoalRe = /don'?t\s+(?:submit|send|save|post)|do\s+not\s+(?:submit|send|save|post)|without\s+(?:submitt?ing|sending|saving|posting|submit|send|save|post)|never\s+(?:submit|send)|leave\s+(?:it|the\s+form)\s+(?:ready|open|unsent|unsubmitted)|fill\s+(?:only|but)|just\s+(?:type|fill)/i;
+
 function _sleep(ms, signal) {
   return new Promise((resolve) => {
     const t = setTimeout(resolve, ms);
@@ -287,6 +292,22 @@ Category: ${category || 'unknown'}`;
       // ends at ask_question and the runner falls into an infinite loop.
       if (parsed.subGoals.includes('ask_question') && !parsed.subGoals.includes('monitor_response')) {
         parsed.subGoals.push('monitor_response');
+      }
+
+      // No-submit override — "type X without submitting / don't send" must
+      // never produce send/submit sub-goals or a send_message signature
+      // (observed: "Type 'hello' in the chat window without submitting" →
+      // send_message → Enter pressed twice).
+      if (_noSubmitGoalRe.test(String(goal || ''))) {
+        const _beforeSg = parsed.subGoals.join(',');
+        parsed.subGoals = parsed.subGoals.filter(sg => !/send|submit|post|press_enter/i.test(String(sg)));
+        if (!parsed.subGoals.some(sg => /type|fill|write|input/i.test(String(sg)))) {
+          parsed.subGoals.push('type_value');
+        }
+        if (parsed.type === 'send_message') parsed.type = 'custom';
+        if (parsed.subGoals.join(',') !== _beforeSg) {
+          logger.info(`[app.runner] _extractGoalSignature: no-submit goal — stripped send/submit sub-goals (${_beforeSg} → ${parsed.subGoals.join(',')})`);
+        }
       }
 
       // Deterministic override: if the goal clearly asks for a new file, ensure
@@ -1796,8 +1817,13 @@ async function _executeAppTypePlain({ appName, value, goal, actionHistory }) {
     if (!typeResult.ok) return typeResult;
 
     // For quick-open / search / chat: press Enter to submit
-    // (unless the value already ends with {ENTER} which actionTypeText handled)
-    if (!String(value).endsWith('{ENTER}')) {
+    // (unless the value already ends with {ENTER} which actionTypeText handled,
+    // or the goal forbids submitting — "type hello without submitting")
+    const _noSubmit = _noSubmitGoalRe.test(String(goal || ''));
+    if (_noSubmit) {
+      logger.info(`[app.runner] type-plain: no-submit goal — text left in the input, Enter suppressed`);
+    }
+    if (!_noSubmit && !String(value).endsWith('{ENTER}')) {
       await _sleep(300);
       await keyboard.pressKey(Key.Return);
       await keyboard.releaseKey(Key.Return);
@@ -1879,10 +1905,12 @@ async function _executeAppTypeCommands({ appName, value, goal, actionHistory }) 
       if (!typeResult.ok) {
         logger.warn(`[app.runner] type-commands: content typing failed: ${typeResult.error}`);
       }
-      // Press Enter to submit the content
-      await _sleep(300);
-      await keyboard.pressKey(Key.Return);
-      await keyboard.releaseKey(Key.Return);
+      // Press Enter to submit the content — suppressed on no-submit goals
+      if (!_noSubmitGoalRe.test(String(goal || ''))) {
+        await _sleep(300);
+        await keyboard.pressKey(Key.Return);
+        await keyboard.releaseKey(Key.Return);
+      }
     }
 
     // Capture baseline screenshot after final Enter — before any response/output appears
@@ -1970,6 +1998,10 @@ async function _executeAppTypeSearch({ appName, value, goal, actionHistory }) {
     }
 
     if (!dropdownAppeared) {
+      if (_noSubmitGoalRe.test(String(goal || ''))) {
+        logger.warn(`[app.runner] type-search: no dropdown appeared — no-submit goal, leaving typed query unsubmitted`);
+        return { ok: true, typed: value, subMode: 'type-search', note: 'no dropdown — no-submit goal, query left in input' };
+      }
       logger.warn(`[app.runner] type-search: no dropdown appeared — trying Enter to submit as plain search`);
       await keyboard.pressKey(Key.Return);
       await keyboard.releaseKey(Key.Return);
@@ -2027,7 +2059,12 @@ async function _executeAppTypeListItem({ appName, value, goal, actionHistory }) 
       return { ok: true, typed: value, subMode: 'type-list-item', listItemIndex: _typedItems };
     }
 
-    // Press Enter to create the next item
+    // Press Enter to create the next item — suppressed on no-submit goals
+    // ("type hello in the chat window without submitting" must not send it).
+    if (_noSubmitGoalRe.test(String(goal || ''))) {
+      logger.info(`[app.runner] type-list-item: no-submit goal — Enter suppressed`);
+      return { ok: true, typed: value, subMode: 'type-list-item', listItemIndex: _typedItems };
+    }
     await _sleep(300);
     await keyboard.pressKey(Key.Return);
     await keyboard.releaseKey(Key.Return);
@@ -2180,6 +2217,11 @@ async function _executeJustType({ appName, value, goal, appCategory, actionHisto
 async function _ocrVerifyAppGoal(ocrText, goal, actionHistory) {
   const historyStr = (actionHistory || []).slice(-5).map((a, i) => `  ${i + 1}. ${a}`).join('\n');
 
+  // No-submit goals verify differently: success = the typed text is present
+  // in the app's INPUT field — not "the message was sent". Without this hint
+  // the verifier looks for a sent confirmation that can never exist.
+  const _noSubmit = _noSubmitGoalRe.test(String(goal || ''));
+
   const systemPrompt = `You verify if a desktop app automation goal has been achieved by looking at the OCR text captured from the screen.
 Return ONLY a single number — nothing else:
 0 = failure (goal NOT achieved — expected content is missing, app is in wrong state)
@@ -2191,7 +2233,7 @@ Rules:
 - 0 (fail): the OCR text does NOT show the expected result
 - 2 (wait): ONLY return 2 if the OCR text shows EXPLICIT loading indicators ("Loading...", "Please wait", "Searching...", spinner, progress bar)
 - When in doubt, return 0 (the tier system will try to fix it)
-
+${_noSubmit ? `- NO-SUBMIT GOAL: this goal asks to type text WITHOUT submitting/sending it. Verify the requested text is present in the app's input field — do NOT expect a sent/posted confirmation, and do NOT fail the goal because nothing was sent.\n` : ''}
 Return ONLY the number.`;
 
   const userPrompt = `Goal: ${goal}
@@ -3073,9 +3115,15 @@ async function runAppFlow({ goal, appName, category, bounds, shortcuts, resolved
           }
         }
       } else if (tier === 2) {
-        // Just-type — extract value from flow or goal
+        // Just-type — extract value from flow, signature entities, or goal
         const flowAction = (appFlow && flowIndex < appFlow.length) ? appFlow[flowIndex].action : '';
-        let value = _extractTypeValueFromFlow(flowAction, goal);
+        let value = _extractTypeValueFromFlow(flowAction, goal) ?? signature?.entities?.content ?? signature?.entities?.question ?? null;
+        if (value == null || value === '') {
+          logger.warn(`[app.runner] runAppFlow: Just-type — no type value extractable (flow="${String(flowAction).slice(0, 60)}") — failing step`);
+          stepResult = { ok: false, error: 'no type value extractable — goal has no quoted text and entities.content is empty' };
+          flowIndex++;
+          continue;
+        }
         stepActionLabel = `Just-type: "${String(value).slice(0, 40)}"`;
         _postProgress(progressCallbackUrl, {
           type: 'app_flow:action_start',
@@ -3116,6 +3164,14 @@ async function runAppFlow({ goal, appName, category, bounds, shortcuts, resolved
         const keyMatch = flowAction.match(/press\s+(\S+)/i);
         if (keyMatch) key = keyMatch[1];
         stepActionLabel = `Global Shortcut: ${key}`;
+        // No-submit hard gate — Enter/Return submits in chat/command inputs.
+        if (/^enter|return$/i.test(key) && _noSubmitGoalRe.test(String(goal || ''))) {
+          logger.info(`[app.runner] runAppFlow: skipping tier-3 "${key}" — no-submit goal`);
+          stepResult = { ok: true, skipped: 'no-submit goal — Enter suppressed' };
+          flowIndex++;
+          actionHistory.push(`${stepActionLabel} (skipped — no-submit)`);
+          continue;
+        }
         _postProgress(progressCallbackUrl, {
           type: 'app_flow:action_start',
           stepIndex, flowIndex, tier, action: stepActionLabel,
@@ -3359,14 +3415,16 @@ async function runAppFlow({ goal, appName, category, bounds, shortcuts, resolved
     return { ok: true, output: diff.slice(0, 500), actionHistory, elapsed: Date.now() - startTime };
   }
 
-  // Diff exists but goal not verified — return the diff anyway (partial success)
+  // Diff exists but goal not verified — the actions ran but the expected
+  // end-state wasn't confirmed. Report unconfirmed, NOT success (observed:
+  // ok:true here let synthesize claim "2/2 tasks done" after a failed goal).
   logger.warn(`[app.runner] runAppFlow: flow complete but goal not verified (num=${goalVerify.num})`);
   _postProgress(progressCallbackUrl, {
     type: 'app_flow:done',
-    stepIndex, ok: true, flowIndex, totalSteps: appFlow?.length || 0, actionHistory,
+    stepIndex, ok: false, flowIndex, totalSteps: appFlow?.length || 0, actionHistory,
     verified: false,
   });
-  return { ok: true, output: diff.slice(0, 500), actionHistory, elapsed: Date.now() - startTime, verified: false };
+  return { ok: false, unconfirmed: true, error: `goal not verified — actions executed but the expected result was not confirmed on screen`, output: diff.slice(0, 500), actionHistory, elapsed: Date.now() - startTime, verified: false };
 }
 
 // ── Flow Action Extraction Helpers ───────────────────────────────────────────
@@ -3378,8 +3436,15 @@ function _extractTypeValueFromFlow(flowAction, goal) {
   if (singleQuoteMatch) return singleQuoteMatch[1];
   const doubleQuoteMatch = flowAction.match(/type\s+"([^"]+)"/i);
   if (doubleQuoteMatch) return doubleQuoteMatch[1];
-  // If no quoted value found, use the goal as the value
-  return goal || '';
+  // Fall back to quoted text in the GOAL — "Type 'hello' in the chat window"
+  // still yields 'hello' when the flow action dropped the quotes.
+  const goalSingle = String(goal || '').match(/(?:type|write|enter|input|fill|say|ask)\s+'([^']+)'/i);
+  if (goalSingle) return goalSingle[1];
+  const goalDouble = String(goal || '').match(/(?:type|write|enter|input|fill|say|ask)\s+"([^"]+)"/i);
+  if (goalDouble) return goalDouble[1];
+  // NEVER fall back to the raw goal text — typing the instruction sentence
+  // into the app is always wrong (observed: goal typed verbatim + Enter).
+  return null;
 }
 
 function _extractSearchTextFromFlow(flowAction, goal) {
@@ -3431,4 +3496,5 @@ module.exports = {
   _inferSubGoalFromAction,
   _countNonDoneStepsBefore,
   _validateAndFixFlowSubGoals,
+  _extractTypeValueFromFlow,
 };

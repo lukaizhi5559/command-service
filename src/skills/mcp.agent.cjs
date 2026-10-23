@@ -122,6 +122,18 @@ async function mcpAgent(args = {}) {
           def = { command: seed.command, args: seed.args || [], env: seed.env || {} };
         }
 
+        // Seed placeholder substitution — e.g. the filesystem server's
+        // "{dirs}" token expands to the allowed directories the caller
+        // passed. Installing the literal placeholder always handshakes-fail.
+        if (def.args?.some(a => a === '{dirs}')) {
+          const dirs = (Array.isArray(args.dirs) ? args.dirs : [])
+            .map(d => String(d || '').trim()).filter(Boolean);
+          if (!dirs.length) {
+            return { ok: false, error: `dirs-required: ${name} needs allowed directories — pass dirs[]` };
+          }
+          def = { ...def, args: def.args.flatMap(a => (a === '{dirs}' ? dirs : [a])) };
+        }
+
         // Vet: npx -y <pkg> → confirm the package exists in the registry
         const npxIdx = def.args?.indexOf('-y');
         if (def.command === 'npx' && npxIdx !== -1 && def.args[npxIdx + 1]) {

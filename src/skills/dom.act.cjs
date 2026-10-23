@@ -97,20 +97,40 @@ async function domAct(args = {}) {
   // then turn.loop navigated it to an unrelated laptop SERP).
   let _boundPageUrl = null;
   try {
-    const _hrefRes = await browserAct({ action: 'evaluate', sessionId, headed: true, timeoutMs: 4000, text: 'location.href' });
-    const _href = String(_hrefRes?.result ?? '').replace(/^"|"$/g, '');
-    if (!_hrefRes?.ok || /^(about:|chrome:|edge:|brave:|chrome-extension:)/i.test(_href)) {
-      logger.warn(`[dom.act] bound-page-missing: session=${sessionId} url=${_href || '(none)'} err=${_hrefRes?.error || 'none'}`);
+    // A bound tab can race a fresh chrome.tabs.create / in-flight navigation —
+    // the tab exists but is still about:blank when this step starts. Poll a
+    // short window (fast-exit on a real http(s) URL, earlier still when the
+    // host already matches the prior nav target) before declaring the binding
+    // dead. Observed: tab checked ~250ms after creation, about:blank →
+    // bound-page-missing → turn-loop burned 8 turns on an empty page.
+    const _expectHost = _hostOf(priorNavUrl);
+    const _blankish = (h) => !h || /^(about:|chrome:|edge:|brave:|chrome-extension:)/i.test(h);
+    const _readHref = async () => {
+      const r = await browserAct({ action: 'evaluate', sessionId, headed: true, timeoutMs: 4000, text: 'location.href' }).catch(() => null);
+      return { ok: !!r?.ok, href: String(r?.result ?? '').replace(/^"|"$/g, ''), error: r?.error };
+    };
+    let _last = await _readHref();
+    let _deadline = Date.now() + 12000;
+    while (_last.ok && _blankish(_last.href) && Date.now() < _deadline) {
+      await new Promise(r => setTimeout(r, 400));
+      _last = await _readHref();
+      if (_last.ok && !_blankish(_last.href)) {
+        const h = _hostOf(_last.href);
+        if (!_expectHost || !h || h === _expectHost || h.endsWith('.' + _expectHost) || Date.now() > _deadline - 9000) break;
+      }
+    }
+    if (!_last.ok || _blankish(_last.href)) {
+      logger.warn(`[dom.act] bound-page-missing: session=${sessionId} url=${_last.href || '(none)'} err=${_last.error || 'none'} (after poll)`);
       return {
         ok: false,
         error: 'bound-page-missing',
-        detail: _hrefRes?.error || `bound tab is on '${_href || 'no url'}'`,
-        expectedHost: _hostOf(priorNavUrl),
-        actualUrl: _href || null,
+        detail: _last.error || `bound tab is on '${_last.href || 'no url'}'`,
+        expectedHost: _expectHost,
+        actualUrl: _last.href || null,
         sessionId,
       };
     }
-    _boundPageUrl = _href;
+    _boundPageUrl = _last.href;
   } catch (_) { /* probe failure is non-fatal — routing reports its own errors */ }
 
   // Settle gate: the previous step (url.first) resolves at domcontentloaded —
@@ -188,6 +208,34 @@ async function domAct(args = {}) {
           };
         }
         logger.warn('[dom.act] ordinal lane: navigate returned ok but URL unchanged — falling through to router');
+      }
+    } else if (_ordItem?.rowClick && _ordItem.sel) {
+      // SPA row target (Gmail tr.zA, ARIA grid rows) — no href to navigate;
+      // click the marked row and require an observable state change (URL or
+      // body text) so a dead click can't be reported as success.
+      postProgress(_progressCallbackUrl, { tier: 'route', message: `dom.act → ordinal: clicking row #${_ordItem.nth}` });
+      const _preText = (await browserAct({ action: 'evaluate', sessionId, headed: true, timeoutMs: 5000, text: 'location.href + "|" + (document.body ? document.body.innerText.length : 0)' }).catch(() => null))?.result || '';
+      let _clicked = await browserAct({ action: 'click', sessionId, selector: _ordItem.sel, headed: true, timeoutMs: 10000 }).catch(() => null);
+      if (!_clicked?.ok && _ordItem.x != null) {
+        _clicked = await browserAct({ action: 'clickAt', sessionId, x: _ordItem.x, y: _ordItem.y, headed: true, timeoutMs: 10000 }).catch(() => null);
+      }
+      if (_clicked?.ok) {
+        await new Promise(r => setTimeout(r, 1500));
+        const _postText = (await browserAct({ action: 'evaluate', sessionId, headed: true, timeoutMs: 5000, text: 'location.href + "|" + (document.body ? document.body.innerText.length : 0)' }).catch(() => null))?.result || '';
+        if (_postText !== _preText) {
+          const _urlAfter = String(_postText).split('|')[0];
+          const _bodyText = (await browserAct({ action: 'evaluate', sessionId, headed: true, timeoutMs: 6000, text: 'document.body ? document.body.innerText.slice(0, 4000) : ""' }).catch(() => null))?.result || '';
+          logger.info(`[dom.act] ordinal lane: row #${_ordItem.nth} clicked → ${_urlAfter.slice(0, 110)}`);
+          return {
+            ok: true,
+            resolvedAgent: 'dom.act:ordinal',
+            routeRule: 'ordinal-row',
+            sessionId,
+            url: _urlAfter,
+            output: `Opened item #${_ordItem.nth}: "${(_ordItem.text || '').slice(0, 120)}" → ${_urlAfter.slice(0, 200)}` + (_bodyText ? `\n\nPage content:\n${String(_bodyText).slice(0, 3000)}` : ''),
+          };
+        }
+        logger.warn('[dom.act] ordinal lane: row click reported ok but page state unchanged — falling through to router');
       }
     }
   } catch (e) {

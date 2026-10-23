@@ -5586,7 +5586,16 @@ async function _checkSingleVerificationCondition(v, page, url, text, subTaskId) 
   const urlMatch = v.match(/url contains ['"]?([^'"\n]+?)['"]?(?:\s|$)/);
   if (urlMatch) {
     const frag = urlMatch[1].toLowerCase().trim();
-    if (frag && url.includes(frag)) {
+    // Guard against trivially-true fragments: an LLM-written condition like
+    // "URL contains a" or "URL contains the" passes on every real URL and
+    // short-circuits verification of the actual goal. Require either an
+    // explicitly quoted fragment or ≥4 non-stopword chars.
+    const quoted = /url contains ['"]/.test(v);
+    const _urlFragStop = /^(a|an|the|is|of|to|in|on|for|and|or|it|its|at|by|be|page|url|view|site|link|text|content|loaded|visible|shown)$/;
+    const usable = frag && (quoted || (frag.length >= 4 && !_urlFragStop.test(frag)));
+    if (frag && !usable) {
+      logger.warn(`[playwright.agent] sub-task #${subTaskId}: ignoring trivial URL fragment "${frag}" (unquoted, too short/stopword)`);
+    } else if (usable && url.includes(frag)) {
       logger.info(`[playwright.agent] sub-task #${subTaskId} verified: URL contains "${frag}"`);
       return true;
     }
@@ -6115,6 +6124,19 @@ function _classifyGoalMutation(goal) {
 
   // Mutation type detection (order matters — more specific first)
   const _has = (re) => re.test(g);
+
+  // Non-mutative guard: open/read/view/click/select goals must never be
+  // classified as mutations just because a bare noun ("message", "email",
+  // "post") appears — observed: "open the first message" → type 'send', so
+  // the verifier looked for a sent-state that could never exist.
+  const _mutatingVerb = /\b(send|post|compose|tweet|share|write|create|submit|publish|edit|update|delete|remove|add|fill|type|reply|comment|draft|rename|move|sort|format|forward|like|star|bookmark|favorite|save|follow|join|upload|download|install|buy|purchase|order|book|reserve|pay|checkout|sign up|register|log ?in|sign ?in|mute|block|archive|pin|mute|schedule|cancel)\b/;
+  if (/\b(open|read|view|click|select|check|show|display|look|see|expand|inspect|reveal|preview|go to|navigate to|visit|browse to|find|search for|pull up|fetch|retrieve|scroll)\b/.test(g)
+      && !_mutatingVerb.test(g)) {
+    if (_has(/\b(go to|navigate to|visit|browse to|pull up)\b/) && !_has(/\b(message|email|thread|post|article|result|item|link|row|card|entry)\b/)) {
+      return { type: 'navigate', entity: '', destination: '', cardinality: 0 };
+    }
+    return { type: 'read', entity: '', destination: '', cardinality: 0 };
+  }
 
   // add_to_cart: add X to cart/basket/bag
   if (_has(/\badd\b[\s\S]{0,80}\b(?:cart|basket|bag)\b/) || _has(/\b(?:cart|basket|bag)\b[\s\S]{0,40}\badd\b/)) {
@@ -12344,8 +12366,37 @@ async function _executeTurnLoopFallback({ goal, verificationGoal, sessionId, hea
         } else {
           logger.warn(`[playwright.agent] ordinal fast-path: navigate failed (${_navRes?.error || 'no result'}) — falling through to LLM loop`);
         }
+      } else if (_ord?.rowClick && _ord.sel) {
+        // SPA row target (Gmail tr.zA, ARIA grid rows) — no href to navigate;
+        // click the marked row and require an observable state change.
+        logger.info(`[playwright.agent] ordinal fast-path: ${_ordW} row → "${(_ord.text || '').slice(0, 70)}" → click ${_ord.sel}`);
+        const _preState = (await browserAct({ action: 'evaluate', sessionId, headed, timeoutMs: 4000, text: 'location.href + "|" + (document.body ? document.body.innerText.length : 0)' }).catch(() => null))?.result || '';
+        let _clickRes = await browserAct({ action: 'click', sessionId, selector: _ord.sel, headed, timeoutMs: 10000 }).catch(() => null);
+        if (!_clickRes?.ok && _ord.x != null) {
+          _clickRes = await browserAct({ action: 'clickAt', sessionId, x: _ord.x, y: _ord.y, headed, timeoutMs: 10000 }).catch(() => null);
+        }
+        if (_clickRes?.ok) {
+          await new Promise(r => setTimeout(r, 1500));
+          const _postState = (await browserAct({ action: 'evaluate', sessionId, headed, timeoutMs: 5000, text: 'location.href + "|" + (document.body ? document.body.innerText.length : 0)' }).catch(() => null))?.result || '';
+          if (_postState !== _preState) {
+            const _bodyText = (await browserAct({ action: 'evaluate', sessionId, headed, timeoutMs: 6000, text: 'document.body ? document.body.innerText.slice(0, 4000) : ""' }).catch(() => null))?.result || '';
+            logger.info(`[playwright.agent] ordinal fast-path: row click verified → ${String(_postState).split('|')[0].slice(0, 110)}`);
+            return {
+              ok: true,
+              routingDecision: 'turn_loop_ordinal_rowclick',
+              result: `Opened the ${_ordW} item: "${(_ord.text || '').slice(0, 120)}"` + (_bodyText ? `\n\nPage content:\n${String(_bodyText).slice(0, 3000)}` : ''),
+              transcript: _loopTranscript,
+              sessionId,
+              done: true,
+              goalVerified: true,
+            };
+          }
+          logger.warn('[playwright.agent] ordinal fast-path: row click reported ok but page state unchanged — falling through to LLM loop');
+        } else {
+          logger.warn(`[playwright.agent] ordinal fast-path: row click failed (${_clickRes?.error || 'no result'}) — falling through to LLM loop`);
+        }
       } else {
-        logger.info('[playwright.agent] ordinal fast-path: no result anchor resolved — falling through to LLM loop');
+        logger.info('[playwright.agent] ordinal fast-path: no result anchor/row resolved — falling through to LLM loop');
       }
     }
   } catch (e) {
@@ -12687,8 +12738,8 @@ ${_composeSel ? `- SUGGESTED COMPOSE SELECTOR: ${_composeSel}` : ''}`;
     // in-viewport result anchor positionally and hands the LLM the target.
     // Selector uses the href *attribute* (querySelector-matchable), never the
     // el.href property which differs in encoding and always misses.
-    const _ordM = String(goal || '').match(/\b(first|second|third|fourth|fifth|1st|2nd|3rd|4th|5th)\b[^\n]{0,40}\b(item|items|result|results|listing|listings|product|products|link|links|video|videos|option|options|row|rows|card|cards)\b/i)
-      || String(goal || '').match(/\b(item|items|result|results|listing|listings|product|products|video|videos)\b[^\n]{0,40}\b(first|second|third|1st|2nd|3rd)\b/i);
+    const _ordM = String(goal || '').match(/\b(first|second|third|fourth|fifth|1st|2nd|3rd|4th|5th)\b[^\n]{0,40}\b(item|items|result|results|listing|listings|product|products|link|links|video|videos|option|options|row|rows|card|cards|message|messages|email|emails|thread|threads|conversation|conversations)\b/i)
+      || String(goal || '').match(/\b(item|items|result|results|listing|listings|product|products|video|videos|message|messages|email|emails|thread|threads)\b[^\n]{0,40}\b(first|second|third|1st|2nd|3rd)\b/i);
     if (_ordM) {
       const _ordW = ((_ordM[1] && /first|second|third|fourth|fifth|\d+(st|nd|rd|th)/i.test(_ordM[1])) ? _ordM[1] : _ordM[2] || 'first').toLowerCase();
       const _ordN = ORDINAL_WORDS[_ordW] || 1;
@@ -13785,11 +13836,45 @@ Turn ${turn}/${MAX_TURNS}. What is your next action? (DO NOT snapshot - act dire
       } else {
         logger.info(`[playwright.agent] turn-loop: action ${_action.action} succeeded at turn ${turn}`);
       }
+
+      // Dead-click detection (ext sessions): a click on an open/read-class
+      // goal that reports ok:true but produces zero observable state change
+      // (same URL, same modal count, ~same body length) is a no-op — usually
+      // a stale tdN ref or a decorative wrapper element. Record it as a
+      // failed approach so the LLM stops re-issuing the same dead click.
+      // Engine-page sessions already get this via the state-changed and
+      // postcondition paths; extension-bound sessions had no equivalent.
+      if (_outcome.ok && /^ext:/.test(String(sessionId)) && /click/i.test(String(_action.action)) && _preActionState
+          && /\b(open|view|read|click|select|expand|show|reveal|display|go to|navigate|visit|launch|start)\b/i.test(String(goal || ''))) {
+        try {
+          const _dead = await _captureStateSnapshot(sessionId, null).catch(() => null);
+          if (_dead && _dead.bodyLen > 0
+              && _dead.url === _preActionState.url
+              && _dead.modalCount === _preActionState.modalCount
+              && Math.abs((_dead.bodyLen || 0) - (_preActionState.bodyLen || 0)) <= 100) {
+            const _sig = `${_action.action} ${(_action.selector || _action.text || _action.url || '')}`.trim();
+            logger.warn(`[playwright.agent] turn-loop: dead-click — ${_sig} reported ok but page state unchanged (url=${_dead.url})`);
+            _recordFailedApproach(_sig, 'click produced no page change — element ref may be stale; re-snapshot or target a different element', _dead.url);
+            _loopTranscript.push({ action: { dead_click: _sig }, outcome: { ok: false, error: 'click produced no page change — element ref may be stale; re-snapshot or target a different element' } });
+            _outcome.verified = false;
+          }
+        } catch (_) {}
+      }
+
       // Track state hash for duplicate detection
       try {
         const _ePage = engine.getPage(sessionId);
         if (_ePage) {
           _lastStateHash = await _ePage.evaluate(() => (document.body?.innerText || '').length + ':' + (document.body?.innerText || '').slice(0, 200)).catch(() => null);
+        } else if (/^ext:/.test(String(sessionId))) {
+          // Extension-bound session — no engine page, but the same signal is
+          // available through browserAct. Include the URL so SPA navigations
+          // (e.g. Gmail #inbox → #inbox/<id>) register as a state change.
+          const _st = await browserAct({
+            action: 'evaluate', sessionId, headed: true, timeoutMs: 4000,
+            text: `location.href + '|' + (document.body?.innerText || '').length + ':' + (document.body?.innerText || '').slice(0, 200)`,
+          }).catch(() => null);
+          if (_st?.ok) _lastStateHash = String(_st.result ?? '').replace(/^"|"$/g, '');
         }
       } catch (_) {}
 

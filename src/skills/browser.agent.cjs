@@ -8180,7 +8180,21 @@ async function _resolveTaskDeepLink(agentId, serviceKey, baseStartUrl, task, exi
       }
     }
 
-    // 2. Try web.agent discover_task_url
+    // 2. LLM-suggested URL — instant, before any network discovery. For known
+    // services it resolves the same URL the search/crawl tiers eventually
+    // land on anyway (observed: Gmail task burned ~8s of web.agent timeouts +
+    // a 2s public crawl, then suggestion produced #inbox anyway).
+    var _suggestKeywords = [];
+    if (!candidate) {
+      const suggestion = await suggestTaskUrl(serviceKey, baseStartUrl, intent, _discoveryTask);
+      if (suggestion?.ok && suggestion?.url) {
+        candidate = suggestion.url;
+        candidateSource = 'suggestion';
+      }
+      _suggestKeywords = suggestion?.keywords || [];
+    }
+
+    // 2.5. Try web.agent discover_task_url — only when suggestion found nothing.
     if (!candidate && !(_isMutationIntent(intent) && !_isReadOnlyTask(task, intent, _dlTaskCls))) {
       try {
         const webResult = await callSkill('web.agent', {
@@ -8199,9 +8213,13 @@ async function _resolveTaskDeepLink(agentId, serviceKey, baseStartUrl, task, exi
       }
     }
 
-    // 2.5. Try web.crawl link extraction — crawl the service's start URL and
+    // 2.6. Try web.crawl link extraction — crawl the service's start URL and
     // extract <a href> links to discover action URLs not indexed by search engines.
-    if (!candidate && !(_isMutationIntent(intent) && !_isReadOnlyTask(task, intent, _dlTaskCls))) {
+    // Skipped for registered services: their start URL resolves to a logged-out
+    // landing page, so the crawl can't see the authenticated action links anyway.
+    let _isKnownService = false;
+    try { _isKnownService = !!lookupBrowserService(serviceKey); } catch (_) {}
+    if (!candidate && !_isKnownService && !(_isMutationIntent(intent) && !_isReadOnlyTask(task, intent, _dlTaskCls))) {
       try {
         const crawlResult = await callSkill('web.crawl', {
           url: baseStartUrl,
@@ -8256,17 +8274,6 @@ async function _resolveTaskDeepLink(agentId, serviceKey, baseStartUrl, task, exi
       } catch (crawlErr) {
         logger.debug(`[browser.agent] deep-link: web.crawl failed: ${crawlErr.message}`);
       }
-    }
-
-    // 3. Fallback to LLM-suggested URL
-    var _suggestKeywords = [];
-    if (!candidate) {
-      const suggestion = await suggestTaskUrl(serviceKey, baseStartUrl, intent, _discoveryTask);
-      if (suggestion?.ok && suggestion?.url) {
-        candidate = suggestion.url;
-        candidateSource = 'suggestion';
-      }
-      _suggestKeywords = suggestion?.keywords || [];
     }
 
     if (!candidate) return null;
