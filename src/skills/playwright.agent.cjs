@@ -18682,12 +18682,45 @@ or
 
 Set canRetry:false only if the goal is fundamentally impossible on this page/site.`;
 
-      const _judgeRaw = await askWithMessages([
+      // ── Local decision fast path — achieved/canRetry are bounded nouls ──
+      // reason/evidence prose stays remote: it feeds the replan prompt and
+      // the login-wall/duplicate-content regexes, which need real text.
+      let _judgeResult = null;
+      try {
+        const _decision = require('../skill-helpers/decision.cjs');
+        _judgeResult = await _decision.boundedDecision({
+          site: 'playwright.judge',
+          questions: [
+            {
+              id: 'achieved', type: 'noul',
+              question: 'Was the goal accomplished? PAGE CONTENT IS PRIMARY EVIDENCE — a successful action history alone is not sufficient; the current page state must show concrete evidence of the goal. For rich-text/canvas editors, successful type/fill actions matching the goal text count as evidence even if the DOM snapshot is sparse. Autosave indicators ("Saving…", "Syncing…") are normal and are NOT evidence of failure.',
+            },
+            {
+              id: 'canRetry', type: 'noul',
+              question: 'If the goal was NOT accomplished, could another attempt plausibly succeed? Answer no only if the goal is fundamentally impossible on this page/site.',
+            },
+          ],
+          state: _judgePrompt.slice(0, 6000),
+          local: (a) => {
+            const achieved = a.achieved?.bool === true;
+            return {
+              achieved,
+              reason: 'local-decision',
+              canRetry: a.canRetry?.bool !== false,
+            };
+          },
+          remote: async () => null,
+          logger,
+        });
+      } catch (_jdErr) { _judgeResult = null; }
+      let _judgeRaw = null;
+      if (!_judgeResult) {
+      _judgeRaw = await askWithMessages([
         { role: 'system', content: 'You are a browser automation judge. Evaluate whether the user\'s goal was accomplished by considering BOTH the action history (including verified outcomes) and the current page state. Respond with JSON only.' },
         { role: 'user', content: _judgePrompt },
       ], { temperature: 0.0, maxTokens: 120, responseTimeoutMs: 20000 });
-
-      const _judgeResult = parseJson(_judgeRaw);
+      }
+      _judgeResult = _judgeResult || parseJson(_judgeRaw);
       logger.info(`[playwright.agent] Goal-achievement judge: achieved=${_judgeResult?.achieved} reason="${_judgeResult?.reason}" recipeWasUsed=${recipeWasUsed}`);
 
       if (_judgeResult && _judgeResult.achieved === false) {
