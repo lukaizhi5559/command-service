@@ -247,9 +247,26 @@ async function domAct(args = {}) {
   // candidate. Prevents one wrong classification from dead-ending the step.
   const tried = new Set(triedAgents || []);
   const MAX_ROUTE_ATTEMPTS = 3;
+  // Total step budget — a routed agent's inner LLM loop can stall for minutes
+  // on slow providers (observed: a "type into the field" step ran 2m17s until
+  // the user cancelled). Bound the whole route loop and propagate an abort
+  // signal so cooperative executors (turn.loop/playwright) stop mid-loop
+  // instead of running on as a zombie while a re-route fires.
+  const STEP_BUDGET_MS = Number(args.stepTimeoutMs || process.env.DOM_ACT_STEP_BUDGET_MS || 120000);
+  const _stepDeadline = Date.now() + STEP_BUDGET_MS;
+  const _budgetAbort = new AbortController();
+  const _onCallerAbort = () => _budgetAbort.abort();
+  if (args._abortSignal) {
+    if (args._abortSignal.aborted) _budgetAbort.abort();
+    else args._abortSignal.addEventListener('abort', _onCallerAbort, { once: true });
+  }
   let res = null;
   let lastRoute = null;
   for (let attempt = 0; attempt < MAX_ROUTE_ATTEMPTS; attempt++) {
+    if (Date.now() > _stepDeadline) {
+      logger.warn(`[dom.act] step budget ${Math.round(STEP_BUDGET_MS / 1000)}s exceeded before attempt ${attempt + 1} — stopping`);
+      break;
+    }
     const route = await routeOnPageAction({
       sessionId, goal, pageCategory,
       // A failing agent steers its successor: just.type's value-not-landed
@@ -279,19 +296,45 @@ async function domAct(args = {}) {
 
     const run = AGENT_RUNNERS[route.agent];
     if (!run) break;
-    res = await run()({
-      ...args,
-      goal,
-      sessionId,
-      agentId,
-      pageCategory,
-      agentContext,
-      expectOverlay,
-      // No-submit goals propagate to tab.map/form.fill even when the planner
-      // didn't emit an explicit noSubmit flag — the phrase is self-protecting.
-      noSubmit: args.noSubmit === true || _noSubmitGoalRe.test(goal),
-      _progressCallbackUrl,
-    });
+    // Progress heartbeat — the UI otherwise sits on a static "Still working
+    // on…" while the inner loop burns remote LLM calls. Post which executor
+    // is running and for how long.
+    const _attemptStart = Date.now();
+    const _hb = setInterval(() => {
+      postProgress(_progressCallbackUrl, {
+        tier: 'work',
+        message: `dom.act: ${route.agent} working (${Math.round((Date.now() - _attemptStart) / 1000)}s)`,
+      });
+    }, 10000);
+    _hb.unref?.();
+    const _remaining = Math.max(_stepDeadline - Date.now(), 1000);
+    const _budgetTimer = setTimeout(() => _budgetAbort.abort(), _remaining);
+    _budgetTimer.unref?.();
+    try {
+      res = await run()({
+        ...args,
+        goal,
+        sessionId,
+        agentId,
+        pageCategory,
+        agentContext,
+        expectOverlay,
+        // No-submit goals propagate to tab.map/form.fill even when the planner
+        // didn't emit an explicit noSubmit flag — the phrase is self-protecting.
+        noSubmit: args.noSubmit === true || _noSubmitGoalRe.test(goal),
+        _abortSignal: _budgetAbort.signal,
+        _progressCallbackUrl,
+      });
+    } finally {
+      clearTimeout(_budgetTimer);
+      clearInterval(_hb);
+    }
+    if (Date.now() > _stepDeadline && !res?.ok) {
+      logger.warn(`[dom.act] ${route.agent} exceeded step budget (${Math.round(STEP_BUDGET_MS / 1000)}s) — stopping instead of re-routing`);
+      res = { ...(res || {}), ok: false, error: res?.error || 'dom.act-step-timeout', stopReason: 'step-budget-exceeded' };
+      lastRoute = route;
+      break;
+    }
     if (res?.ok) break;
     // Mutation-applied guard: a failed executor that already landed the goal's
     // quoted value (e.g. verify criteria were over-strict) must not trigger a
@@ -312,6 +355,22 @@ async function domAct(args = {}) {
         output: res.output || res.result || `Applied: ${goal.slice(0, 80)}`,
       };
     }
+    // Unquoted typed-value early exit — _mutationApplied needs a quoted value,
+    // but planner steps often phrase the value bare ("type in the ask anything
+    // field how are you doing"). Probe editable elements for a 4+-word window
+    // of the goal's tail — if the text landed, a failed verify/exhaustion
+    // shouldn't trigger a re-route that re-types into whatever is focused.
+    if (/\b(?:type|enter|input|write|put|fill)\b/i.test(goal) && await _typedValueLanded(sessionId, goal)) {
+      if (!(await _stillOnUnsubmittedForm(sessionId))) {
+        logger.info(`[dom.act] ${route.agent} failed but the typed value is present in a page field — treating as complete`);
+        return {
+          ok: true, mutationApplied: true,
+          note: 'typed value present in page field; verification inconclusive',
+          resolvedAgent: route.agent, routeRule: route.rule, sessionId,
+          output: res?.output || res?.result || `Applied: ${goal.slice(0, 80)}`,
+        };
+      }
+    }
     if (attempt === MAX_ROUTE_ATTEMPTS - 1) break;
     // Surface whatever diagnostic the executor gave — error, stopReason,
     // verdict, last action — a bare "(unknown)" leaves the failure opaque
@@ -322,7 +381,41 @@ async function domAct(args = {}) {
     tried.add(route.agent);
     res.routeRule = route.rule;
   }
+  if (args._abortSignal) {
+    try { args._abortSignal.removeEventListener('abort', _onCallerAbort); } catch (_) {}
+  }
   return { ...(res || {}), resolvedAgent: lastRoute?.agent, routeRule: res?.routeRule || lastRoute?.rule, sessionId };
+}
+
+// Did a type-goal's value actually land in a page field? Probes editable
+// elements (input/textarea/contenteditable/textbox) for a 4+-word window of
+// the goal's tail — the typed value is usually the goal's trailing phrase
+// ("…how are you doing"), while the field name sits mid-goal and lives in
+// placeholder attributes (never in el.value), so suffix windows distinguish
+// the two without an LLM call.
+async function _typedValueLanded(sessionId, goal) {
+  try {
+    const words = String(goal || '').toLowerCase().replace(/["'`]/g, '').split(/\s+/).filter(w => w.length > 1);
+    if (words.length < 4) return false;
+    const probes = [];
+    for (let k = 4; k <= Math.min(8, words.length); k++) probes.push(words.slice(-k).join(' '));
+    const res = await browserAct({
+      action: 'evaluate', sessionId, headed: true, timeoutMs: 4000,
+      text: `(() => {
+        const probes = ${JSON.stringify(probes)};
+        const els = document.querySelectorAll('input, textarea, [contenteditable="true"], [contenteditable=""], [role="textbox"]');
+        for (const el of els) {
+          const v = String(el.value || el.innerText || '').toLowerCase().replace(/\\s+/g, ' ').trim();
+          if (v.length < 8) continue;
+          for (const p of probes) { if (v.includes(p)) return p; }
+        }
+        return '';
+      })()`,
+    });
+    const hit = String(res?.result || '').replace(/^"|"$/g, '');
+    if (hit) logger.info(`[dom.act] typed-value probe hit: field contains "${hit.slice(0, 60)}"`);
+    return !!hit;
+  } catch (_) { return false; }
 }
 
 // Did a failed executor still land the goal's quoted value? Conservative:
