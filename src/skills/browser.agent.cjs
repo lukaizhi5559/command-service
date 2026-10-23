@@ -3925,6 +3925,109 @@ Extract the ordered steps:`;
   }
 }
 
+// ── Local decision-model path for _llmNextAction ───────────────────────────
+// One remote generation per inner-loop step costs 5–30s. The same decision
+// decomposes into bounded System One questions: verb choice + element choice
+// (chunked >24) → deterministic action-line synthesis. Type values still come
+// from _extractValue (deterministic quote-parse fast path, remote LLM tail);
+// Navigate needs a URL present in the goal; anything else → remote fallback.
+const _NL_VERBS = [
+  'done', 'click', 'type', 'press_enter', 'press_tab', 'press_escape',
+  'navigate', 'wait_for_stable_text', 'get_page_text', 'scroll_down',
+  'scroll_up', 'screenshot',
+];
+
+async function _localNextAction({ goal, currentUrl, decEls, actionHistory, pageCategory, noSubmit, overlayActive, filledFields, agentContext, lastVerifyFailed, focusedElement, pageContext, signal, logger }) {
+  const { askDecision } = require('../skill-helpers/decision.cjs');
+  if (decEls.length === 0) return null;
+
+  const state = [
+    `Goal: ${goal}`,
+    `Current URL: ${currentUrl}`,
+    `Page category: ${pageCategory || 'unknown'}`,
+    actionHistory.length ? `Actions taken: ${actionHistory.slice(-6).join(' | ')}` : null,
+    filledFields?.length ? `Fields already filled: ${filledFields.map(f => f.label).join(', ')}` : null,
+    overlayActive ? 'A dialog/overlay is open — work inside it' : null,
+    noSubmit ? 'NO-SUBMIT goal: never pick a submit/send/save action' : null,
+    lastVerifyFailed ? 'A previous DONE verdict failed verification — the goal is not achieved' : null,
+    `Elements (${decEls.length}): ${decEls.map(e => `${e.id} ${e.tag} "${e.label}" ${e.markers}`).join('; ').slice(0, 8000)}`,
+  ].filter(Boolean).join('\n');
+
+  const verbQ = {
+    id: 'verb', type: 'choice',
+    question: 'Decide the SINGLE next action verb to achieve the goal. done = goal already achieved (all required fields filled + submitted if needed). click = a CLICKABLE element. type = a FILLABLE field. navigate = go to a URL mentioned in the goal. wait_for_stable_text/get_page_text = capture results before done on read/search goals. Do NOT pick done just because the target is not visible — prefer a navigation click that moves toward the goal.',
+    options: _NL_VERBS,
+  };
+
+  const small = decEls.length <= 24;
+  const elQ = small ? [{
+    id: 'element', type: 'choice',
+    question: 'If the action is click/type, which element index moves toward the goal? Prefer [REQUIRED] unfilled fields for type, the goal-named [CLICKABLE] for click. For search results pick the first ORGANIC result, never sponsored/ad. Pick "none" if the action needs no element.',
+    options: [...decEls.map(e => `${e.id} ${e.tag} "${e.label}" ${e.markers}`.slice(0, 160)), 'none'],
+  }] : [];
+
+  const r1 = await askDecision([verbQ, ...elQ], { state, signal, timeoutMs: 4000 });
+  const verbIdx = r1?.answers?.verb?.index;
+  if (verbIdx == null || verbIdx < 0 || verbIdx >= _NL_VERBS.length) return null;
+  const verb = _NL_VERBS[verbIdx];
+
+  switch (verb) {
+    case 'done': return 'DONE';
+    case 'press_enter': return 'Press Enter';
+    case 'press_tab': return 'Press Tab';
+    case 'press_escape': return 'Press Escape';
+    case 'wait_for_stable_text': return 'Wait for stable text';
+    case 'get_page_text': return 'Get page text';
+    case 'scroll_down': return 'Scroll down';
+    case 'scroll_up': return 'Scroll up';
+    case 'screenshot': return 'Screenshot';
+    case 'navigate': {
+      const m = String(goal || '').match(/https?:\/\/[^\s"'<>]+/);
+      return m ? `Navigate to ${m[0]}` : null;
+    }
+    case 'click':
+    case 'type': {
+      // Element pick — chunk→drill-down when >24 elements.
+      let el = null;
+      if (small) {
+        const ei = r1.answers.element?.index;
+        el = (ei != null && ei < decEls.length) ? decEls[ei] : null;
+      } else {
+        const chunks = [];
+        for (let i = 0; i < decEls.length; i += 24) chunks.push(decEls.slice(i, i + 24));
+        const r2 = await askDecision([{
+          id: 'chunk', type: 'choice',
+          question: 'The page has many elements grouped in order. Which group contains the element the goal needs (required field, named button/link, or organic result)?',
+          options: chunks.map((c, i) => `${i + 1}: ${c[0].label.slice(0, 40)} … ${c[c.length - 1].label.slice(0, 40)} (${c.length} elements)`),
+        }], { state, signal, timeoutMs: 4000 });
+        const ci = r2?.answers?.chunk?.index;
+        const chunk = (ci != null && chunks[ci]) ? chunks[ci] : null;
+        if (!chunk) return null;
+        const r3 = await askDecision([{
+          id: 'element', type: 'choice',
+          question: 'Which element moves toward the goal? Prefer [REQUIRED] unfilled fields for type, the goal-named [CLICKABLE] for click. First ORGANIC result for search results.',
+          options: chunk.map(e => `${e.id} ${e.tag} "${e.label}" ${e.markers}`.slice(0, 160)),
+        }], { state, signal, timeoutMs: 4000 });
+        const ei = r3?.answers?.element?.index;
+        el = (ei != null && chunk[ei]) ? chunk[ei] : null;
+      }
+      if (!el) return null;
+      // noSubmit guard — never emit a submit click the deterministic layer
+      // would have suppressed.
+      if (noSubmit && el.markers.includes('[SUBMIT]')) return null;
+      if (verb === 'click') return `Click "${el.label}"`;
+      // type — value still comes from _extractValue (deterministic fast path
+      // handles quoted goals; remote LLM only for generated content)
+      const val = await _extractValue(goal, focusedElement || { label: el.label }, actionHistory, agentContext, '', pageContext || {});
+      const v = (typeof val === 'string' ? val : val?.value || '').trim();
+      if (!v || /^PRESS_/i.test(v)) return null;
+      return `Type "${v}" into the "${el.label}" field`;
+    }
+    default:
+      return null;
+  }
+}
+
 // Tab-Map strategy: LLM decides one action per step based on available elements.
 // Updated with [FILLABLE]/[CLICKABLE] markers, filled field tracking, and label fixes.
 async function _llmNextAction(goal, currentUrl, tabMap, actionHistory, pageCategory, agentContext, lastVerifyFailed, consumedRefs, filledFields, extractedPageText, stepType = null, clickedRefs = null, clickedSubmitRefs = null, overlayActive = false, noSubmit = false) {
@@ -3960,6 +4063,7 @@ async function _llmNextAction(goal, currentUrl, tabMap, actionHistory, pageCateg
     if (e.ref && _clickedMap.has(e.ref)) _clickedLabelSet.add(String(e.text || e.ariaLabel || '').toLowerCase());
   }
 
+  const _decEls = []; // compact element records for the decision path
   const elementList = (tabMap || [])
     .filter(e => {
       // Suppress submit-class elements already clicked this session — re-clicking
@@ -4016,7 +4120,9 @@ async function _llmNextAction(goal, currentUrl, tabMap, actionHistory, pageCateg
     const _valStr = (_val && String(_val).trim()) ? ` value="${previewValue(_val, 60)}"` : '';
     const _pos = (e.x !== undefined && e.y !== undefined && e.w !== undefined && e.h !== undefined)
       ? ` @x=${Math.round(e.x)},y=${Math.round(e.y)},w=${Math.round(e.w)},h=${Math.round(e.h)}` : '';
-    return `${e.id} - ${_tag} "${_label}" ${_role ? `role=${_role} ` : ''}${markers.join(' ')}${_valStr}${_pos}`;
+    const _markerStr = markers.join(' ');
+    _decEls.push({ id: e.id, ref: e.ref, tag: _tag, label: _label, role: _role, markers: _markerStr });
+    return `${e.id} - ${_tag} "${_label}" ${_role ? `role=${_role} ` : ''}${_markerStr}${_valStr}${_pos}`;
   }).join('\n');
 
   // Build "Fields already filled" section
@@ -4121,8 +4227,43 @@ ${elementList}
 
 What is the next action?`;
 
-  // Retry on transient LLM provider failures (e.g. "All LLM providers failed").
-  // 3 attempts total: initial + 2 retries with 500ms / 1500ms backoff.
+  // ── Local decision fast path ────────────────────────────────────────────
+  // Verb + element are bounded picks — a warm System One call answers in
+  // ~100–300ms vs 5–30s remote generation. Type values still flow through
+  // _extractValue; anything the local path can't decide → remote loop below.
+  const { decisionEnabled: _decOn, shadowMode: _decShadow } = require('../skill-helpers/decision.cjs');
+  if (_decOn()) {
+    const _localP = _localNextAction({
+      goal, currentUrl, decEls: _decEls, actionHistory, pageCategory, noSubmit,
+      overlayActive, filledFields, agentContext, lastVerifyFailed,
+      pageContext: { url: currentUrl, pageText: extractedPageText },
+      logger,
+    }).catch(e => { logger.debug(`[browser.agent] local nextAction failed: ${e.message}`); return null; });
+
+    if (_decShadow()) {
+      // Run remote regardless; log agreement, remote stays authoritative.
+      const [localLine, remoteLine] = await Promise.all([_localP, (async () => {
+        try { return await _remoteNextAction(systemPrompt, userPrompt, logger); } catch { return null; }
+      })()]);
+      logger.info(`[DecisionShadow] site=browser.agent.nextAction agree=${!!localLine && localLine === remoteLine} local=${JSON.stringify(localLine)?.slice(0, 120)} remote=${JSON.stringify(remoteLine)?.slice(0, 120)}`);
+      if (remoteLine) return remoteLine;
+    } else {
+      const localLine = await _localP;
+      if (localLine) {
+        logger.info(`[browser.agent] Local decision nextAction: "${localLine}"`);
+        return localLine;
+      }
+    }
+  }
+
+  return _remoteNextAction(systemPrompt, userPrompt, logger);
+}
+
+// Remote generative path for _llmNextAction — retry on transient provider
+// failures (e.g. "All LLM providers failed"). 3 attempts: initial + 2 retries
+// with 500ms / 1500ms backoff.
+async function _remoteNextAction(systemPrompt, userPrompt, logger) {
+  const { askWithMessages } = require('../skill-helpers/skill-llm.cjs');
   const _MAX_ATTEMPTS = 3;
   const _BACKOFF_MS = [0, 500, 1500];
   for (let _attempt = 0; _attempt < _MAX_ATTEMPTS; _attempt++) {

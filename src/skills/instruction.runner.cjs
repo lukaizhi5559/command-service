@@ -3228,30 +3228,41 @@ async function _checkDone(goal, actionHistory, currentUrl, pageTitle, checkboxCo
   }
   const { askWithMessages } = require('../skill-helpers/skill-llm.cjs');
   const historyStr = actionHistory.slice(-10).map((a, i) => `  ${i + 1}. ${a}`).join('\n');
-  try {
-    const raw = await askWithMessages([
-      { role: 'system', content: `Has this browser automation goal been completed?
+  const _state = `Goal: ${goal}
+Current URL: ${currentUrl || 'unknown'}
+Page title: "${pageTitle || 'unknown'}"
+Checkboxes on page: ${checkboxCount || 0}
+Actions:
+${historyStr}`;
+  return require('../skill-helpers/decision.cjs').boundedDecision({
+    site: 'instruction.runner.checkDone',
+    questions: [{
+      id: 'done', type: 'noul',
+      question: 'Has this browser automation goal been completed, judging by the action history AND current page state? The page title should match (e.g. "create a page called X" → title contains X); checkbox goals should show the right count. false if actions show SKIP/failures, page state doesn\'t match, or completion is only partial (e.g. typed title but goal also wants body content).',
+    }],
+    state: _state,
+    local: (a) => a.done?.bool ?? null,
+    remote: async () => {
+      try {
+        const raw = await askWithMessages([
+          { role: 'system', content: `Has this browser automation goal been completed?
 Look at the action history AND the current page state. Return ONLY "YES" or "NO".
 - Check if the page title matches the goal (e.g. "create a page called X" → title should contain X)
 - Check if checkboxes exist (e.g. "add a todo list with N items" → should have N checkboxes)
 - Do NOT say YES if the actions show SKIP/failures or if the page state doesn't match the goal
 - Do NOT say YES if the actions only show partial completion (e.g. typed title but goal also asks for body content)` },
-      { role: 'user', content: `Goal: ${goal}
-Current URL: ${currentUrl || 'unknown'}
-Page title: "${pageTitle || 'unknown'}"
-Checkboxes on page: ${checkboxCount || 0}
-Actions:
-${historyStr}
-
-Completed?` },
-    ], { maxTokens: 20, temperature: 0.1, responseTimeoutMs: 5000, taskType: 'classification' });
-    const done = (raw || '').trim().toUpperCase().startsWith('YES');
-    logger.info(`[instruction.runner] _checkDone: ${done ? 'YES' : 'NO'} (raw="${(raw || '').trim()}", title="${pageTitle || ''}", checkboxes=${checkboxCount || 0})`);
-    return done;
-  } catch (e) {
-    logger.warn(`[instruction.runner] _checkDone failed: ${e.message}`);
-    return false;
-  }
+          { role: 'user', content: `${_state}\n\nCompleted?` },
+        ], { maxTokens: 20, temperature: 0.1, responseTimeoutMs: 5000, taskType: 'classification' });
+        const done = (raw || '').trim().toUpperCase().startsWith('YES');
+        logger.info(`[instruction.runner] _checkDone: ${done ? 'YES' : 'NO'} (raw="${(raw || '').trim()}", title="${pageTitle || ''}", checkboxes=${checkboxCount || 0})`);
+        return done;
+      } catch (e) {
+        logger.warn(`[instruction.runner] _checkDone failed: ${e.message}`);
+        return false;
+      }
+    },
+    logger,
+  });
 }
 
 // LLM-first tier selection — sees goal + URL + real-time page context (title,
@@ -3561,6 +3572,30 @@ ${_regionBreakdownStr}${editorState?.region ? `Editor region: ${editorState.regi
 Actions taken so far:
 ${historyStr}${_contextBlock}
 Strategy? You MUST return exactly one of these numbers: ${_availableTiers.join(', ')}, or -1 to ESCALATE to Turn-Loop (playwright.agent). Do NOT return any other number.`;
+
+  // ── Local decision fast path — bounded pick over available tiers ─────────
+  const _tierNames = { 0: 'done', 1: 'just-type', 2: 'meta+f', 3: 'shortcuts', 4: 'tab-map', 5: 'gesture', 6: 'arrow-grid' };
+  const _localTier = await require('../skill-helpers/decision.cjs').boundedDecision({
+    site: 'instruction.runner.selectTier',
+    questions: [{
+      id: 'tier', type: 'choice',
+      question: `Which navigation strategy fits the current page state and goal? Current state pattern: ${_statePattern.pattern} (${_statePattern.description}). Deep link: ${_statePattern.deepLinkType}. Rules: document_editor+typing→just-type; spreadsheet cell-nav→shortcuts, cell-value→just-type; dialog with real form fields→tab-map, contenteditable-only dialog→just-type; shortcut can open next state→shortcuts; single focused field→just-type; find item by text→meta+f; drag-drop/sliders→gesture; dense commerce grid or >50 clickable with complex goal→escalate; spreadsheet with focused cell→arrow-grid.`,
+      options: [..._availableTiers.map(t => `${t} ${_tierNames[t] || 'tier'}`), 'escalate — hand off to Turn-Loop (playwright)'],
+    }],
+    state: userPrompt,
+    local: (a) => {
+      const i = a.tier?.index;
+      if (i == null) return null;
+      return i < _availableTiers.length ? _availableTiers[i] : -1;
+    },
+    remote: async () => null,
+    logger,
+  });
+  if (_localTier != null) {
+    logger.info(`[instruction.runner] _selectTierLLM: local decision strategy=${_localTier} — pattern=${_statePattern.pattern}, url=${currentUrl}`);
+    _emitTierProgressForTier(_localTier, progressCallbackUrl, stepIndex, agentId, sessionIdForProgress);
+    return _localTier;
+  }
 
   try {
     const raw = await askWithMessages([
