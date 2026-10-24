@@ -7973,10 +7973,16 @@ async function _resolveCheapDeepLink(agentId, serviceKey, baseStartUrl, task, ex
           logger.warn(`[browser.agent] deep-link: skipping cached Messenger URL for post/share task: ${_cachedDeepLink.url} — falling through to discovery`);
         } else if (!_deepLinkHostAllowed(_hostOfUrl(_cachedDeepLink.url), baseHost, lookupBrowserService(serviceKey))) {
           logger.warn(`[browser.agent] deep-link: rejecting keyword-cache URL ${_cachedDeepLink.url} — host outside ${baseHost} service family`);
-        } else if ((_cachedDeepLink.score || 0) < 0.6 || /\/(policies|policy|help|linkbuttons|safety|trust)\b/i.test(_cachedDeepLink.url)) {
+        } else if ((_cachedDeepLink.score || 0) < (_dlTaskCls?.newDestination === true ? 0.85 : 0.6)
+            || /\/(policies|policy|help|linkbuttons|safety|trust|notifications)\b/i.test(_cachedDeepLink.url)) {
           // Low-confidence or utility/policy pages are not real destinations —
           // a stale 'ebay → policies/linkbuttons.html' cache entry navigated
-          // the bound tab to a policy page instead of ebay.com.
+          // the bound tab to a policy page instead of ebay.com, and a 0.63
+          // 'gmail → mail.google.com/notifications' hit hijacked "check my
+          // gmail" onto a notification surface that isn't the inbox. Service-
+          // home navs (newDestination) get a higher bar — the canonical
+          // startUrl is the truthful destination for coincidental-vocabulary
+          // matches.
           logger.warn(`[browser.agent] deep-link: rejecting low-quality keyword-cache URL ${_cachedDeepLink.url} (score=${(_cachedDeepLink.score||0).toFixed(2)}) — falling through to discovery`);
         } else {
           logger.info(`[browser.agent] deep-link: keyword cache hit for ${agentId}: ${_cachedDeepLink.url} (score=${_cachedDeepLink.score.toFixed(2)})`);
@@ -8078,6 +8084,16 @@ async function _resolveCheapDeepLink(agentId, serviceKey, baseStartUrl, task, ex
       // These paths are relative to the service ORIGIN, not to an arbitrary deep start_url.
       // Using startUrlBase (which may be a deep path like /apis/credentials) would produce
       // invalid URLs (e.g. /apis/credentials/console). Derive the origin instead.
+      // GUARD: when the service declares an intentUrls map at all, it is the
+      // service's KNOWN deep-link surface — an intent absent from it must not
+      // guess a generic path that may 404 ("check my gmail" misclassified as
+      // notifications → mail.google.com/notifications 404). Fall through to
+      // discovery (web.agent/suggestTaskUrl/eval) which finds a real URL.
+      const _GENERIC_PATH_SET = new Set([INTENTS.SETTINGS, INTENTS.SUPPORT, INTENTS.DASHBOARD, INTENTS.CONSOLE, INTENTS.NOTIFICATIONS, INTENTS.CONTACTS]);
+      if (svcEntry?.intentUrls && !svcEntry.intentUrls[intent] && _GENERIC_PATH_SET.has(intent)) {
+        logger.info(`[browser.agent] deep-link: ${svc}.intentUrls declares no "${intent}" — refusing generic-path guess, falling to discovery/startUrl`);
+        return null;
+      }
       const _GENERIC_PATH_INTENTS = {
         [INTENTS.SETTINGS]:      '/settings',
         [INTENTS.SUPPORT]:       '/help',
@@ -8503,6 +8519,11 @@ async function _resolveTaskDeepLink(agentId, serviceKey, baseStartUrl, task, exi
         // The write-side hole that polluted mail.google.com with a docs URL —
         // never cache a candidate that lives outside this service's family.
         logger.warn(`[browser.agent] deep-link: skipping intent_url cache — candidate host ${_hostOfUrl(candidate)} outside ${baseHost} family`);
+      } else if (/\/(policies|policy|help|linkbuttons|safety|trust|notifications)\b/i.test(candidate)) {
+        // Same utility-path rule as the keyword-cache read guard: a guessed
+        // /notifications path (e.g. "check my gmail" → mail.google.com/
+        // notifications, which 404s) must never become a learned intent_url.
+        logger.warn(`[browser.agent] deep-link: skipping intent_url cache — utility-path candidate ${candidate}`);
       } else {
         setImmediate(() => {
           try {

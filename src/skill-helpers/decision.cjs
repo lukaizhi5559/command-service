@@ -31,7 +31,17 @@ function _log() {
 }
 
 function decisionEnabled() { return process.env.DECISION_LOCAL !== '0'; }
-function shadowMode() { return process.env.DECISION_SHADOW === '1'; }
+// DECISION_SHADOW_SITES — comma list ("prefix*" wildcard): when set, only the
+// listed sites run shadow; all other sites go authoritative-local (fail-open
+// remote on error/low-confidence). Unset → DECISION_SHADOW=1 shadows all.
+function _shadowSiteMatches(site) {
+  const list = (process.env.DECISION_SHADOW_SITES || '').split(',').map(s => s.trim()).filter(Boolean);
+  if (!list.length) return true;
+  return list.some(pat => pat.endsWith('*')
+    ? String(site || '').startsWith(pat.slice(0, -1))
+    : String(site || '') === pat);
+}
+function shadowMode(site) { return process.env.DECISION_SHADOW === '1' && _shadowSiteMatches(site); }
 
 /**
  * Ask the local decision model a batch of typed questions.
@@ -63,7 +73,7 @@ async function askDecision(questions, opts = {}) {
       // Batch-scaled timeout — ~60-120ms/question on the small-tier model;
       // a flat 3s ceiling made >8-question batches always time out.
       signal: opts.signal || AbortSignal.timeout(opts.timeoutMs
-        || (process.env.DECISION_TIMEOUT_MS ? DEFAULT_TIMEOUT_MS : Math.min(1200 + 250 * (Array.isArray(questions) ? questions.length : 1), 12000))),
+        || (process.env.DECISION_TIMEOUT_MS ? DEFAULT_TIMEOUT_MS : Math.min(6000 + 400 * (Array.isArray(questions) ? questions.length : 1), 15000))),
     });
     const body = await res.json().catch(() => null);
     if (!body || body.status !== 'ok' || !body.data?.answers) return null;
@@ -92,12 +102,12 @@ async function boundedDecision(cfg) {
   const { site, questions, state, local, remote, logger = _log(), minConfidence, signal } = cfg;
   const ask = cfg.askDecision === undefined ? askDecision : cfg.askDecision;
   const enabled = typeof ask === 'function' && decisionEnabled();
-  const shadow = enabled && shadowMode();
+  const shadow = enabled && shadowMode(site);
 
   if (!enabled) return remote();
 
   const runLocal = async () => {
-    const r = await ask(questions, { state, signal });
+    const r = await ask(questions, { state, signal, ...(cfg.image ? { image: cfg.image } : {}) });
     if (!r?.answers) return { value: null, ms: null };
     if (minConfidence != null) {
       for (const q of questions) {

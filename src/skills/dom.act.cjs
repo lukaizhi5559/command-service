@@ -242,6 +242,35 @@ async function domAct(args = {}) {
     logger.warn(`[dom.act] ordinal lane error (non-fatal): ${e.message}`);
   }
 
+  // Confirm/verify-only goals ("confirm you are on YouTube", "verify the page
+  // is loaded", "make sure we're on gmail") are READ steps that leaked into the
+  // on-page-action lane. The bound page's own URL answers them in one evaluate —
+  // routing them into the cascade sent "navigate"-containing confirm text to
+  // tab.map's 150-element scan loop (observed: youtube/amazon/chatgpt scans).
+  // Guard: requires an explicit destination token after on/at/in, so action
+  // goals ("check the box", "verify the email exists") can never match.
+  try {
+    const _confirmM = goal.match(/\b(?:confirm|verify|ensure|make sure)\b[\s\S]{0,80}?\b(?:on|at|in)\s+(?:the\s+|my\s+)?([a-z0-9-]+)/i);
+    if (_confirmM && !/\b(?:click|type|fill|enter\s+text|press|scroll|select|submit|send|add\s+to)\b/i.test(goal)) {
+      const _want = _confirmM[1].toLowerCase();
+      const _ev = await browserAct({ action: 'evaluate', sessionId, headed: true, timeoutMs: 5000, text: 'location.href' }).catch(() => null);
+      const _href = String(_ev?.result || '').toLowerCase();
+      if (_href && _href.includes(_want)) {
+        logger.info(`[dom.act] confirm-only goal — bound page already on "${_want}" — done without agent scan`);
+        postProgress(_progressCallbackUrl, { tier: 'route', message: `dom.act: confirmed on ${_want}` });
+        return {
+          ok: true,
+          resolvedAgent: 'dom.act:confirm',
+          routeRule: 'confirm-only',
+          sessionId,
+          url: _href,
+          output: `Confirmed: the page is on ${_href}`,
+        };
+      }
+      if (_href) logger.info(`[dom.act] confirm goal — bound page is ${_href.slice(0, 70)}, not "${_want}" — routing normally`);
+    }
+  } catch (_) {}
+
   // Bounded re-route: a routed agent that fails (e.g. shortcut agent finds no
   // matching hotkey) is added to triedAgents and the router picks the next-best
   // candidate. Prevents one wrong classification from dead-ending the step.
@@ -275,6 +304,19 @@ async function domAct(args = {}) {
       triedAgents: tried,
     });
     lastRoute = route;
+    // Vision-verify: the screenshot already satisfies the goal — done with no
+    // agent (e.g. "confirm you are on YouTube" on the loaded homepage).
+    if (route?.verifySatisfied) {
+      logger.info(`[dom.act] vision:verify — goal already satisfied on ${String(route.currentUrl || '').slice(0, 80)}`);
+      return {
+        ok: true,
+        resolvedAgent: 'dom.act:vision-verify',
+        routeRule: route.rule,
+        sessionId,
+        url: route.currentUrl || undefined,
+        output: `Confirmed by page screenshot: the goal is already satisfied on ${route.currentUrl || 'the bound page'}.`,
+      };
+    }
     // The router probed the live URL and may have refined a web_generic
     // category by hostname — adopt it for the executor (drives just.type's
     // Enter-on-submit behavior and overlay scoping).

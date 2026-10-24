@@ -60,6 +60,11 @@ async function resolveExtSession(sessionId) {
     const base = sid.replace(/_agent$/i, '');
     const named = bound.find(s => s.sessionId === `ext:${base}_agent`);
     if (named) return named.sessionId;
+    // Extension-first policy (F9-B): when the extension is connected, browser
+    // work runs in the user's real Chrome — `ext:<name>` binds on first use
+    // (adopt-or-create). The Playwright engine is the fallback for when the
+    // extension is absent, not a peer transport.
+    if (_gw.hasExtension()) return `ext:${sid}`;
     return sid;
   } catch (_) { return sid; }
 }

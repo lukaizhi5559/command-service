@@ -48,6 +48,24 @@ const http   = require('http');
 const logger = require('../logger.cjs');
 const { browserAct, getDebuggingContext, invalidateEngineSnapshot } = require('./browser.act.cjs');
 const engine = require('./browser-engine.cjs');
+const { extPage } = require('./lib/browserCore/ext.page.cjs');
+// Page provider — extension-first policy (F9): `ext:` sessions get the
+// page-shaped adapter over the Chrome extension so interactive work runs in
+// the user's real browser; everything else keeps the Playwright engine.
+// Sites that genuinely need engine internals (CDP, buildRefTree, OCR
+// screenshots, tracing) keep calling `engine.getPage` directly.
+function _getPage(sessionId) {
+  const sid = String(sessionId || '');
+  if (sid.startsWith('ext:')) { const p = extPage(sid); if (p) return p; }
+  try { return engine.getPage(sessionId); } catch (_) { return null; }
+}
+
+// page.url() is SYNC on Playwright pages but ASYNC on extPage wrappers
+// (CDP evaluate round-trip). await Promise.resolve covers both; always
+// coerce to string so callers' .toLowerCase() never sees a Promise.
+async function _pageUrlOf(p) {
+  try { return String(await Promise.resolve(p?.url?.()) || ''); } catch (_) { return ''; }
+}
 const { askWithMessages } = require('../skill-helpers/skill-llm.cjs');
 const skillDb = require('../skill-helpers/skill-db.cjs');
 const { _liteparseVerify, _liteparseSubmit, _liteparseCapture, _domFindSubmitTarget, _validateClickPoint, ensureLitAvailable } = require('./browser.agent.cjs');
@@ -116,7 +134,7 @@ function _urlsEqual(urlA, urlB) {
 // ---------------------------------------------------------------------------
 
 async function _engineEval(sessionId, expr, timeoutMs = 5000) {
-  const page = engine.getPage(sessionId);
+  const page = _getPage(sessionId);
   if (page) {
     try {
       const result = await page.evaluate(expr);
@@ -150,7 +168,7 @@ async function _observeEval(sessionId, fn, timeoutMs = 5000) {
 }
 
 async function _engineNavigate(sessionId, url, timeoutMs = 30000) {
-  const page = engine.getPage(sessionId);
+  const page = _getPage(sessionId);
   if (!page) return null;
   try {
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: timeoutMs });
@@ -166,6 +184,9 @@ async function _engineNavigate(sessionId, url, timeoutMs = 30000) {
 // without ref binding (e.g., orientation steps). For action-bound refs, use
 // _fastSnapshot() which goes through browserAct({ action: 'snapshot' }).
 async function _engineSnapshot(sessionId) {
+  // ext sessions: the extension snapshot injects the same DOM scanner —
+  // return its result via _fastSnapshot instead of engine.buildRefTree.
+  if (String(sessionId || '').startsWith('ext:')) return _fastSnapshot(sessionId, true);
   const page = engine.getPage(sessionId);
   if (!page) return null;
   try {
@@ -190,7 +211,7 @@ async function _fastSnapshot(sessionId, headed, timeoutMs = 15000) {
 // ---------------------------------------------------------------------------
 async function _detectOpenMenus(sessionId, headed, timeoutMs = 5000) {
   try {
-    const _page = engine?.getPage?.(sessionId);
+    const _page = _getPage(sessionId);
     if (!_page) return [];
     const _menus = await _page.evaluate(() => {
       function isVisible(el) {
@@ -341,11 +362,11 @@ async function _captureState(sessionId, headed, captureMode = 'cheap') {
   let _modalCount = 0;
 
   try {
-    const _page = engine?.getPage?.(sessionId);
+    const _page = _getPage(sessionId);
     if (!_page) return { url: '', domHash: '', pageText: '', modalCount: 0, timestamp: _ts, ok: false };
 
     // URL
-    try { _url = _page.url(); } catch (_) {}
+    _url = await _pageUrlOf(_page);
 
     // Page text (always capture — cheap)
     try {
@@ -658,7 +679,7 @@ async function _resolveActionTarget({ sessionId, text, subTaskContext, liteparse
   const _targetText = (text || '').trim().toLowerCase();
   if (!_targetText) return { ok: false, resolved: false, reason: 'no text provided' };
 
-  const _page = engine?.getPage?.(sessionId);
+  const _page = _getPage(sessionId);
   if (!_page) return { ok: false, resolved: false, reason: 'no page' };
 
   // 1. Get DOM candidates with bounding boxes + dialog containment info
@@ -827,7 +848,7 @@ async function _resolveActionTarget({ sessionId, text, subTaskContext, liteparse
 // ---------------------------------------------------------------------------
 async function _filterSnapshotToModal(sessionId, fullSnapshot) {
   if (!fullSnapshot) return { ok: false, error: 'no snapshot provided' };
-  const page = engine.getPage(sessionId);
+  const page = _getPage(sessionId);
   if (!page) return { ok: false, error: 'no engine page' };
 
   // ── Step 1: DOM query to confirm modal exists and check for compose element ──
@@ -1608,7 +1629,7 @@ function _isSubmitLikeClick(step, hasFillOrType) {
 // preClickState: { url, modalCount, bodyLen } captured BEFORE the click.
 // Returns { verified: boolean, reason: string }.
 async function _verifySubmitStateChange(sessionId, preClickState, timeoutMs = 3000) {
-  const page = engine.getPage(sessionId);
+  const page = _getPage(sessionId);
   if (!page) return { verified: true, reason: 'No engine page — skipping verification' };
 
   // If no pre-click state was captured, we can't verify — skip (don't false-positive)
@@ -2942,7 +2963,7 @@ Rules:
 
 async function _generateSelectorMap(sessionId, hostname, goal, timeoutMs) {
   try {
-    const page = engine.getPage(sessionId);
+    const page = _getPage(sessionId);
     if (!page) return null;
 
     // Gather page HTML structure for LLM analysis
@@ -3006,7 +3027,7 @@ async function _generateSelectorMap(sessionId, hostname, goal, timeoutMs) {
 // Gathers page HTML with placeholders + positions, asks LLM for unified field map.
 async function _generateFieldMap(sessionId, hostname, goal, timeoutMs, options = {}) {
   try {
-    const page = engine.getPage(sessionId);
+    const page = _getPage(sessionId);
     if (!page) return null;
 
     // Gather page HTML — include placeholders, positions, and CSS-relevant attributes
@@ -3171,7 +3192,7 @@ async function _verifyField(page, field, expectedValue) {
 
 // Execute a selector map: type each field, verify, submit, verify submit
 async function _executeSelectorMap(sessionId, fieldValues, selectorMap, timeoutMs) {
-  const page = engine.getPage(sessionId);
+  const page = _getPage(sessionId);
   if (!page) return { ok: false, error: 'no engine page' };
 
   const transcript = [];
@@ -3663,7 +3684,7 @@ async function _captureStreamingResponse(sessionId, page, postSubmitBaselineText
 // CSS selector check for CSS fallback path.
 // Submit phase: skipped for autoSave pages (Notion, Google Docs).
 async function _executeFieldMap(sessionId, fieldValues, fieldMap, timeoutMs, options = {}) {
-  const page = engine.getPage(sessionId);
+  const page = _getPage(sessionId);
   if (!page) return { ok: false, error: 'no engine page' };
 
   const transcript = [];
@@ -4292,7 +4313,7 @@ async function _executeFieldMap(sessionId, fieldValues, fieldMap, timeoutMs, opt
     if (sv.type === 'url_change') {
       const newUrl = await page.evaluate(() => location.href);
       // Compare to the URL captured before submit — use page.url() as baseline
-      const preSubmitUrl = page.url();
+      const preSubmitUrl = await _pageUrlOf(page);
       if (newUrl !== preSubmitUrl) {
         logger.info(`[playwright.agent] field map: submit verified — URL changed`);
         return { ok: true, transcript, result: 'Submitted (URL changed)' };
@@ -4995,10 +5016,10 @@ async function _summarizePartialProgress({ goal, transcript, sessionId, hostname
   let _pageState = '';
   try {
     const engine = require('./browser.engine.cjs');
-    const page = engine.getPage(sessionId);
+    const page = _getPage(sessionId);
     if (page) {
       let _url = '';
-      try { _url = page.url(); } catch (_) {}
+      _url = await _pageUrlOf(page);
       const _text = await page.evaluate(() => document.body.innerText.slice(0, 500)).catch(() => '');
       _pageState = `Current URL: ${_url}\nPage text (first 500 chars): ${_text}`;
     }
@@ -5059,7 +5080,7 @@ async function _verifyComposeTextGone(sessionId, expectedText) {
     const _snippet = String(expectedText || '').slice(0, 30).toLowerCase();
     if (!_snippet) return { gone: false, reason: 'no expected text' };
 
-    const page = engine.getPage(sessionId);
+    const page = _getPage(sessionId);
     if (page) {
       const _result = await page.evaluate((snippet) => {
         const composeEls = Array.from(document.querySelectorAll(
@@ -5113,7 +5134,7 @@ async function _verifyComposeTextGone(sessionId, expectedText) {
 // or no longer contains a compose element. Gone → PASS. Still open → WEAK FAIL.
 async function _verifyComposeGone(sessionId) {
   try {
-    const page = engine.getPage(sessionId);
+    const page = _getPage(sessionId);
     if (page) {
       const _result = await page.evaluate(() => {
         const modal = document.querySelector('[role="dialog"], [aria-modal="true"]');
@@ -5975,6 +5996,27 @@ Was this sub-task completed? Consider:
 Return ONLY valid JSON:
 {"completed": true/false, "reasoning": "1-2 sentence explanation"}`;
 
+    // Typed-decision fast path — "was this sub-task completed?" is a bounded
+    // noul. Local decides when enabled; remote `ask` stays as fail-open path.
+    try {
+      const _decision = require('../skill-helpers/decision.cjs');
+      const _dv = await _decision.boundedDecision({
+        site: 'playwright.gate3',
+        questions: [{
+          id: 'completed', type: 'noul',
+          question: `Was this sub-task completed? "${subTask.description}" — criterion: ${subTask.verification || subTask.description}. Judge on BOTH the current page state AND the action transcript: successful actions consistent with the goal count as evidence (e.g. clicking + typing into an element proves it existed and was usable), even if the page-text excerpt doesn't literally show it. Reserve "no" for genuine absence of evidence.`,
+        }],
+        state: `URL: ${pageUrl || '(unknown)'}\nPAGE TEXT: ${(pageText || '').slice(0, 1500)}\nACTIONS:\n${_transcriptSummary || '(none)'}`,
+        local: (a) => a.completed ? { completed: a.completed.bool === true, reasoning: `local p=${a.completed.probability?.toFixed(2)}` } : null,
+        remote: async () => null,
+        logger,
+      });
+      if (_dv && typeof _dv.completed === 'boolean') {
+        logger.info(`[playwright.agent] structural verify sub-task #${subTask.id}: Gate 3 ${_dv.completed ? 'PASSED' : 'FAILED'} — local decision (${_dv.reasoning})`);
+        return { verified: _dv.completed, gate: 'llm', reason: _dv.reasoning };
+      }
+    } catch (_) { /* decision path unavailable — fall through to remote ask */ }
+
     const _raw = await ask(_llmPrompt, { maxTokens: 150, temperature: 0, responseTimeoutMs: 10000 });
     const _text2 = (typeof _raw === 'string' ? _raw : _raw?.text || _raw?.content || '').trim();
     const _stripped = _text2.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '').trim();
@@ -6513,7 +6555,7 @@ async function _verifyGoalCompletion({ goal, sessionId, headed, pageType, transc
   const _logTag = '[playwright.agent] goal verification';
 
   let _page = null;
-  try { _page = engine.getPage(sessionId); } catch (_) {}
+  try { _page = _getPage(sessionId); } catch (_) {}
 
   // ── Tier 0: LLM semantic verification for goals with no extractable phrases ──
   // Phrase extraction yields nothing when the goal's target is a parameter rather
@@ -6552,7 +6594,7 @@ async function _verifyGoalCompletion({ goal, sessionId, headed, pageType, transc
 
         let _pageUrlForLlm = '';
         try {
-          if (_page) _pageUrlForLlm = _page.url();
+          if (_page) _pageUrlForLlm = await _pageUrlOf(_page);
         } catch (_) {}
 
         const _llmPrompt = `You are verifying whether a browser automation goal was achieved. Base your assessment ONLY on the evidence below — do not assume actions succeeded just because they returned ok.
@@ -7009,7 +7051,7 @@ async function _ocrCaptureViaPage(sessionIdOrPage = 'playwright_agent') {
   if (sessionIdOrPage && typeof sessionIdOrPage === 'object' && typeof sessionIdOrPage.screenshot === 'function') {
     _page = sessionIdOrPage;
   } else {
-    try { _page = engine.getPage(sessionIdOrPage); } catch (_) {}
+    try { _page = _getPage(sessionIdOrPage); } catch (_) {}
   }
   if (!_page) {
     // No engine page — fall back to OS-level capture (rare; only outside browser.agent).
@@ -7365,7 +7407,7 @@ async function _waitForComposeFocus(page, timeoutMs = 12000, frameOrPage = null)
       if (_noComposeFound && !_urlRetryDone) {
         _urlRetryDone = true;
         let _curUrl = '';
-        try { _curUrl = page.url(); } catch (_) {}
+        _curUrl = await _pageUrlOf(page);
         if (/shareActive=true|compose\/post|compose=new|\/compose\b/i.test(_curUrl)) {
           logger.info(`[playwright.agent] waiting for compose focus: no modal — retrying URL-first navigation to ${_curUrl}`);
           try {
@@ -7696,7 +7738,7 @@ async function _ocrVerify(expectText, typeTs, page) {
 }
 
 async function _scriptUrlFastPath(sessionId, text, goal, startTs, deadline, heartbeat, headed) {
-  const page = engine.getPage(sessionId);
+  const page = _getPage(sessionId);
   if (!page) return null;
 
   const transcript = [];
@@ -8371,7 +8413,7 @@ async function _executeScriptGeneration({ goal, sessionId, headed, timeoutMs, ag
   // Try to extract key selectors from the page for the LLM
   let _selectorHints = '';
   try {
-    const _ePage = engine.getPage(sessionId);
+    const _ePage = _getPage(sessionId);
     if (_ePage) {
       const _hints = await _ePage.evaluate(() => {
         const hints = [];
@@ -8475,7 +8517,7 @@ Generate the JavaScript function to complete this task:`;
   // by probing for common success indicators (modal closed, success text, etc.)
   let _verified = false;
   try {
-    const _ePage = engine.getPage(sessionId);
+    const _ePage = _getPage(sessionId);
     if (_ePage) {
       const _verifyResult = await _ePage.evaluate(() => {
         // Modal closed = success for compose/post tasks
@@ -8733,7 +8775,7 @@ function _isOverlayInteractionTask(goal, domSignals) {
 }
 
 async function _detectOverlayRect(sessionId) {
-  const _page = engine?.getPage?.(sessionId);
+  const _page = _getPage(sessionId);
   if (!_page) return null;
   try {
     const rect = await _page.evaluate(() => {
@@ -8761,7 +8803,7 @@ async function _executeOverlayInteraction({ goal, sessionId, headed, timeoutMs, 
   logger.info(`[playwright.agent] Tier 1.6 (overlay interaction): starting for goal="${goal.slice(0, 80)}"${skipTriggerClick ? ' [menu already open]' : ''}`);
   const { browserAct } = require('./browser.act.cjs');
   const { _liteparseCapture } = require('./browser.agent.cjs');
-  const _page = engine?.getPage?.(sessionId);
+  const _page = _getPage(sessionId);
   if (!_page) return { ok: false, error: 'no page available' };
 
   try {
@@ -8979,7 +9021,7 @@ async function _focusedPlanExecute({ goal, verificationGoal, sessionId, headed, 
   logger.info(`[playwright.agent] focused Plan-Execute: pageStudyBlock length=${(pageStudyBlock || '').length}${pageStudyBlock ? `, first 200 chars: ${pageStudyBlock.slice(0, 200)}` : ' (empty)'}`);
 
   try {
-    const page = engine.getPage(sessionId);
+    const page = _getPage(sessionId);
     if (!page) return { ok: false, error: 'no page' };
 
     // 1. Get fresh snapshot + page text
@@ -8988,7 +9030,7 @@ async function _focusedPlanExecute({ goal, verificationGoal, sessionId, headed, 
     const _pageText = await page.evaluate(() => document.body.innerText.slice(0, 3000)).catch(() => '');
 
     // 2. ONE LLM call with full context
-    const _currentUrl = page.url();
+    const _currentUrl = await _pageUrlOf(page);
     const _stepTypeBlock = _buildStepTypeBlock(stepType);
     const _userPrompt = `GOAL: ${goal}${_stepTypeBlock}
 CURRENT URL: ${_currentUrl}
@@ -9437,7 +9479,7 @@ async function _executeLiteparseFirstLoop({ goal, verificationGoal, sessionId, h
   logger.info(`[playwright.agent] Tier 1.9 (LiteParser-first): starting for goal="${goal.slice(0, 80)}"`);
 
   try {
-    const page = engine.getPage(sessionId);
+    const page = _getPage(sessionId);
     if (!page) return { ok: false, error: 'no page' };
 
     // Decompose goal into sub-tasks (with expectedState)
@@ -9580,7 +9622,7 @@ Output ONLY the JSON action:`;
         // Return = sub-task done
         if (_action.action === 'return') {
           let _retUrl = '';
-          try { _retUrl = page.url(); } catch (_) {}
+          _retUrl = await _pageUrlOf(page);
           const _verifyResult = await _checkSubTaskCompletion(_st, page, _retUrl, await page.evaluate(() => document.body.innerText.slice(0, 8000)).catch(() => ''));
           if (_verifyResult) {
             _st.completed = true;
@@ -9749,7 +9791,7 @@ Output ONLY the JSON action:`;
 
         // 5. Check verification
         let _pageUrl = '', _pageText = '';
-        try { _pageUrl = page.url(); } catch (_) {}
+        _pageUrl = await _pageUrlOf(page);
         _pageText = await page.evaluate(() => document.body.innerText.slice(0, 8000)).catch(() => '');
 
         const _verified = await _checkSubTaskCompletion(_st, page, _pageUrl, _pageText);
@@ -9792,7 +9834,7 @@ Output ONLY the JSON action:`;
         // Try structural verification as fallback
         let _structPageText = '', _structPageUrl = '';
         try { _structPageText = await page.evaluate(() => document.body.innerText.slice(0, 8000)).catch(() => ''); } catch (_) {}
-        try { _structPageUrl = page.url(); } catch (_) {}
+        _structPageUrl = await _pageUrlOf(page);
         const _sv = await _structuralVerifySubTask(_st, { page, pageUrl: _structPageUrl, pageText: _structPageText, transcript: _lpTranscript, sessionId });
         if (_sv.verified) {
           _st.completed = true;
@@ -11108,7 +11150,7 @@ async function _executeVisualDiscoveryLoop({ goal, verificationGoal, sessionId, 
   logger.info(`[playwright.agent] Tier 1.8 (Visual Discovery): starting for goal="${goal.slice(0, 80)}"`);
 
   try {
-    const page = engine.getPage(sessionId);
+    const page = _getPage(sessionId);
     if (!page) return { ok: false, error: 'no page' };
 
     // Use pre-decomposed sub-tasks (from playwrightAgent's early decomposition)
@@ -11203,7 +11245,7 @@ async function _executeVisualDiscoveryLoop({ goal, verificationGoal, sessionId, 
         if (Date.now() > deadline) break;
 
         // Re-fetch page in case it closed mid-action
-        const page = engine.getPage(sessionId);
+        const page = _getPage(sessionId);
         if (!page || page.isClosed()) {
           logger.warn(`[playwright.agent] Tier 1.8: page closed mid-action — breaking`);
           break;
@@ -11356,7 +11398,7 @@ Output ONLY the JSON action:`;
         // Return = sub-task done
         if (_action.action === 'return') {
           let _retUrl = '';
-          try { _retUrl = page.url(); } catch (_) {}
+          _retUrl = await _pageUrlOf(page);
           const _retText = await page.evaluate(() => document.body.innerText.slice(0, 8000)).catch(() => '');
           const _sv = await _structuralVerifySubTask(_st, { page, pageUrl: _retUrl, pageText: _retText, transcript: _vdTranscript, sessionId });
           if (_sv.verified) {
@@ -11692,7 +11734,7 @@ Output ONLY the JSON action:`;
         const _shouldVerify = _action.action === 'return' || _compare.toastAppeared || _compare.navigated;
         if (_shouldVerify) {
           let _pageUrl = '', _pageText = '';
-          try { _pageUrl = page.url(); } catch (_) {}
+          _pageUrl = await _pageUrlOf(page);
           _pageText = await page.evaluate(() => document.body.innerText.slice(0, 8000)).catch(() => '');
 
           const _sv = await _structuralVerifySubTask(_st, { page, pageUrl: _pageUrl, pageText: _pageText, transcript: _vdTranscript, sessionId });
@@ -11892,7 +11934,7 @@ async function _executeStateDiffLoop({ goal, verificationGoal, sessionId, headed
   logger.info(`[playwright.agent] state-diff loop: starting for goal="${goal.slice(0, 80)}"`);
 
   try {
-    const page = engine.getPage(sessionId);
+    const page = _getPage(sessionId);
     if (!page) return { ok: false, error: 'no page' };
 
     // Decompose goal into sub-tasks (with expectedState)
@@ -11990,7 +12032,7 @@ Output ONLY the JSON action:`;
         if (_action.action === 'return') {
           // Verify the sub-task is actually complete
           let _retUrl = '';
-          try { _retUrl = page.url(); } catch (_) {}
+          _retUrl = await _pageUrlOf(page);
           const _verifyResult = await _checkSubTaskCompletion(_st, page, _retUrl, await page.evaluate(() => document.body.innerText.slice(0, 8000)).catch(() => ''));
           if (_verifyResult) {
             _st.completed = true;
@@ -12076,7 +12118,7 @@ Output ONLY the JSON action:`;
         // 6. Check verification
         let _pageUrl = '', _pageText = '';
         try {
-          try { _pageUrl = page.url(); } catch (_) {}
+          _pageUrl = await _pageUrlOf(page);
           _pageText = await page.evaluate(() => document.body.innerText.slice(0, 8000)).catch(() => '');
         } catch (_) {}
 
@@ -12097,7 +12139,7 @@ Output ONLY the JSON action:`;
         let _structPageText = '', _structPageUrl = '';
         try {
           _structPageText = await page.evaluate(() => document.body.innerText.slice(0, 8000)).catch(() => '');
-          try { _structPageUrl = page.url(); } catch (_) {}
+          _structPageUrl = await _pageUrlOf(page);
         } catch (_) {}
         const _sv = await _structuralVerifySubTask(_st, { page, pageUrl: _structPageUrl, pageText: _structPageText, transcript: _sdTranscript, sessionId });
         if (_sv.verified) {
@@ -12258,6 +12300,7 @@ async function _executeTurnLoopFallback({ goal, verificationGoal, sessionId, hea
   // turn-loop only appends turn_flow:step rows via the shared flowCounter.
 
   let _lastActionSignature = null; // for duplicate detection
+  const _staleRefIds = new Set();  // refs that went stale this run — positional ids re-bind after re-renders
   let _lastStateHash = null;       // page state hash for no-op detection
   // Stash for LLM return data that was rejected by goal verification. If the
   // pre-exhaustion check later passes, this content (which often contains the
@@ -12917,7 +12960,7 @@ ${_composeSel ? `- SUGGESTED COMPOSE SELECTOR: ${_composeSel}` : ''}`;
     // logs every turn. Skip DOM verify entirely for non-compose tasks.
     const _isComposeTask = /\bpost\b|\bshare\b|\btweet\b|\bcompose\b|\bwrite\b|\bmessage\b|\bsend\b|\bemail\b/i.test(goal);
     if (!textAlreadyEntered && extractedText && _isComposeTask) {
-      const _ePage = engine.getPage(sessionId);
+      const _ePage = _getPage(sessionId);
       if (_ePage) {
         const _domCheck = await _domVerify(_ePage, extractedText).catch(() => null);
         if (_domCheck?.ok) {
@@ -12944,7 +12987,7 @@ ${_composeSel ? `- SUGGESTED COMPOSE SELECTOR: ${_composeSel}` : ''}`;
     if (_ocrText && !textAlreadyEntered && extractedText &&
         /create a post|what do you want to talk about|compose|share a post|what's on your mind/i.test(_ocrText)) {
       logger.info(`[playwright.agent] turn-loop: OCR shows compose modal — typing into focused element`);
-      const _ePage = engine.getPage(sessionId);
+      const _ePage = _getPage(sessionId);
       if (_ePage) {
         const _clearMod = process.platform === 'darwin' ? 'Meta+A' : 'Control+A';
         await _ePage.keyboard.press(_clearMod).catch(() => {});
@@ -13086,7 +13129,7 @@ ${_lastActionSignature && _lastActionSignature.startsWith('no_progress:') ? `\n�
 ${_lastActionSignature === 'return_rejected' || (_lastActionSignature && _lastActionSignature.startsWith('return_rejected:')) ? `\n❌ RETURN REJECTED: You declared the goal done, but verification found the goal was NOT actually achieved.${_lastActionSignature && _lastActionSignature.startsWith('return_rejected:') ? ` Verification reason: "${_lastActionSignature.slice('return_rejected:'.length)}"` : ' (expected text is missing from the page/title).'} Do NOT return again until you have actually completed the task. Look at the PAGE TEXT, OCR, and DOM STATE SIGNALS above — identify what the verification reason says is missing, then perform the action that actually completes the goal. For example: if you only searched for X but the goal was to add X to Y, you need to perform the add action (e.g. open the item's overflow/.../more-options button on its row and choose "Add to Y"), not just search. If you typed text into the wrong field, close the dialog (press Escape) and try the correct element.\n` : ''}
 ${_lastActionSignature && _lastActionSignature.startsWith('hidden_element:') ? `\n🔍 HIDDEN ELEMENT: The element "${_lastActionSignature.slice('hidden_element:'.length)}" exists in the DOM but is NOT VISIBLE. It may be hidden by a UI mode (compact mode, collapsed toolbar, minimized section) or by a parent container. Try: (a) press a keyboard shortcut to toggle the UI mode (e.g. { "action": "press", "key": "Control+Shift+F" } for compact mode in many editors), (b) look for a toggle/expand/collapse button in the snapshot and click it to reveal the element, (c) press Ctrl+/ or ? to open the app's keyboard shortcut help overlay to find the right shortcut, or (d) check the OCR — if the expected UI area (e.g. title bar, toolbar section) is missing from the screen, a UI mode is likely hiding it. Also check the APP KNOWLEDGE block above for known shortcuts and UI mode toggles for this app.\n` : ''}
 ${_lastActionSignature === 'multiple_modals' ? '\n🪟 MULTIPLE DIALOGS OPEN: Several dialogs/menus are on screen at once (e.g. cookie/language/location/privacy on top of the task dialog). The same click keeps being applied to the WRONG dialog. You must FIRST dismiss the irrelevant dialogs — press Escape or click their Cancel/Close/Not now/Done button. Then perform the click inside the correct dialog (e.g. the "Edit details" dialog or the "Add to playlist" dialog). If a clickByText would match several dialogs, use clickBySelector with a ref id from the specific dialog you want, or press Escape to clear the non-goal modals first.\n' : ''}${_lastActionSignature && _lastActionSignature.startsWith('jit_fix:') ? `\n💡 JIT RESEARCH FIX: Web research found this specific fix for the current issue: ${_lastActionSignature.slice('jit_fix:'.length)} — apply this fix now.\n` : ''}
-${_formatFailedApproachesBlock()}
+${_staleRefIds.size ? `\n⚠️ STALE REFS: Refs ${[..._staleRefIds].join(', ')} went stale — the page re-renders and these positional ids rebind to different elements each snapshot. Do NOT target them again even though they still appear in the snapshot. Use clickByText with the element's visible label, clickBySelector with a stable attribute selector (e.g. div[contenteditable='true']), or a DIFFERENT ref.\n` : ''}${_formatFailedApproachesBlock()}
 Turn ${turn}/${MAX_TURNS}. What is your next action? (DO NOT snapshot - act directly)`;
 
     let _actionRaw;
@@ -13196,7 +13239,7 @@ Turn ${turn}/${MAX_TURNS}. What is your next action? (DO NOT snapshot - act dire
       // state delta. If the postcondition is verified, accept immediately.
       // If 'failed' or 'unverified', reject and continue the loop.
       try {
-        const _retPage = engine.getPage(sessionId);
+        const _retPage = _getPage(sessionId);
         if (_preActionState) {
           const _retPostState = await _captureStateSnapshot(sessionId, _retPage || null);
           const _lastActionEl = _loopTranscript.length > 0
@@ -13243,10 +13286,10 @@ Turn ${turn}/${MAX_TURNS}. What is your next action? (DO NOT snapshot - act dire
           let _structPageUrl = '';
           let _structPage = null;
           try {
-            _structPage = engine.getPage(sessionId);
+            _structPage = _getPage(sessionId);
             if (_structPage) {
               _structPageText = await _structPage.evaluate(() => document.body.innerText.slice(0, 8000)).catch(() => '');
-              try { _structPageUrl = _structPage.url(); } catch (_) {}
+              _structPageUrl = await _pageUrlOf(_structPage);
             } else {
               // Extension-bound session — same read via browserAct evaluate.
               _structPageText = (await _observeEval(sessionId, () => document.body.innerText.slice(0, 8000))) || '';
@@ -13503,7 +13546,7 @@ Turn ${turn}/${MAX_TURNS}. What is your next action? (DO NOT snapshot - act dire
     // cartCount, cartSubtotal, formValues, listCounts) than the old inline eval.
     _preActionState = null;
     try {
-      const _prePage = engine.getPage(sessionId);
+      const _prePage = _getPage(sessionId);
       // _captureStateSnapshot routes through _observeEval when _prePage is
       // null, so extension-bound sessions get pre/post state parity.
       _preActionState = await _captureStateSnapshot(sessionId, _prePage || null);
@@ -13582,7 +13625,7 @@ Turn ${turn}/${MAX_TURNS}. What is your next action? (DO NOT snapshot - act dire
     // gate that replaces the brittle regex + click-evidence check.
     if (_outcome.ok && _preActionState) {
       try {
-        const _postPage = engine.getPage(sessionId);
+        const _postPage = _getPage(sessionId);
         const _postActionState = await _captureStateSnapshot(sessionId, _postPage || null);
         if (_postActionState && _postActionState.bodyLen > 0) {
           const _actionElement = _outcome.element || null;
@@ -13786,6 +13829,22 @@ Turn ${turn}/${MAX_TURNS}. What is your next action? (DO NOT snapshot - act dire
 
     if (!_outcome.ok) {
       logger.warn(`[playwright.agent] turn-loop: action ${_action.action} failed at turn ${turn}: ${_outcome.error}`);
+      // Stale-ref handling: refs are positional (derived from DOM order), so a
+      // re-render produces the SAME ref id bound to a different element — a
+      // plain "re-snapshot and retry" picks the same doomed ref forever.
+      // Record it as a failed approach AND blocklist the ref id so the next
+      // turn must target by text/selector instead of the stale ref.
+      if (_outcome.error && /ref-stale/i.test(_outcome.error)) {
+        const _staleRef = (_outcome.error.match(/ref (td\d+)/i) || [])[1] || _action.ref || '';
+        if (_staleRef) _staleRefIds.add(_staleRef);
+        const _expectedEl = (_outcome.error.match(/expected \w+ "([^"]+)"/) || [])[1] || '';
+        _recordFailedApproach(
+          `${_action.action} ref=${_staleRef || _action.ref || '?'}`,
+          `stale ref — element re-rendered since snapshot${_expectedEl ? `; the target was "${_expectedEl}" — use clickByText("${_expectedEl}") or a fresh ref` : ' — target by text/selector instead'}`,
+          _pageUrlNow || undefined
+        );
+        _lastActionSignature = `stale_ref:${_staleRef}`;
+      }
       // Hidden-element detection: when an action fails with "not visible" or a
       // visibility-related error, the element exists in the DOM but is hidden by
       // a UI mode (compact mode, collapsed toolbar, minimized section). Flag it
@@ -13863,7 +13922,7 @@ Turn ${turn}/${MAX_TURNS}. What is your next action? (DO NOT snapshot - act dire
 
       // Track state hash for duplicate detection
       try {
-        const _ePage = engine.getPage(sessionId);
+        const _ePage = _getPage(sessionId);
         if (_ePage) {
           _lastStateHash = await _ePage.evaluate(() => (document.body?.innerText || '').length + ':' + (document.body?.innerText || '').slice(0, 200)).catch(() => null);
         } else if (/^ext:/.test(String(sessionId))) {
@@ -13924,7 +13983,7 @@ Turn ${turn}/${MAX_TURNS}. What is your next action? (DO NOT snapshot - act dire
       // settled page (with modal/compose element if applicable).
       if (_action.action === 'navigate') {
         try {
-          const _page = engine.getPage(sessionId);
+          const _page = _getPage(sessionId);
           if (_page) {
             logger.info(`[playwright.agent] turn-loop: waiting for page to stabilize after navigate`);
             await _page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
@@ -13944,7 +14003,7 @@ Turn ${turn}/${MAX_TURNS}. What is your next action? (DO NOT snapshot - act dire
       // Instead, let the turn-loop continue so the LLM can decide the next action.
       if (_outcome.ok && _domMutating && _preActionState && _action.action !== 'navigate') {
         try {
-          const _postPage = engine.getPage(sessionId);
+          const _postPage = _getPage(sessionId);
           if (_postPage) {
             const _postState = await _postPage.evaluate(() => ({
               url: window.location.href,
@@ -13971,7 +14030,7 @@ Turn ${turn}/${MAX_TURNS}. What is your next action? (DO NOT snapshot - act dire
                 // the same state change that would otherwise trigger a Tab-Flow
                 // re-entry (which then fails verification and surfaces ask_user).
                 let _stUrl = '';
-                try { _stUrl = _postPage.url(); } catch (_) {}
+                _stUrl = await _pageUrlOf(_postPage);
                 const _stText = await _postPage.evaluate(() => document.body.innerText.slice(0, 5000)).catch(() => '');
 
                 // (a) Sub-task verification — same logic as the post-turn check
@@ -14079,12 +14138,12 @@ Turn ${turn}/${MAX_TURNS}. What is your next action? (DO NOT snapshot - act dire
       // exit when all sub-tasks are done (without waiting for LLM 'return').
       if (_subTasks && _subTasks.length > 0 && _domMutating) {
         try {
-          const _stPage = engine.getPage(sessionId);
+          const _stPage = _getPage(sessionId);
           // On the extension lane there is no engine page — pull url/text via
           // _engineEval (browserAct evaluate) so verification isn't blind.
           let _stUrl = '', _stText = '';
           if (_stPage) {
-            try { _stUrl = _stPage.url(); } catch (_) {}
+            _stUrl = await _pageUrlOf(_stPage);
             _stText = await _stPage.evaluate(() => document.body.innerText.slice(0, 5000)).catch(() => '');
           } else {
             const _u = await _engineEval(sessionId, 'window.location.href').catch(() => null);
@@ -14139,10 +14198,10 @@ Turn ${turn}/${MAX_TURNS}. What is your next action? (DO NOT snapshot - act dire
       let _preStructText = '';
       let _preStructUrl = '';
       try {
-        _preStructPage = engine.getPage(sessionId);
+        _preStructPage = _getPage(sessionId);
         if (_preStructPage) {
           _preStructText = await _preStructPage.evaluate(() => document.body.innerText.slice(0, 8000)).catch(() => '');
-          try { _preStructUrl = _preStructPage.url(); } catch (_) {}
+          _preStructUrl = await _pageUrlOf(_preStructPage);
         } else {
           // Extension-bound session — same read via browserAct evaluate. Without
           // this the verify LLM sees "URL and text unknown" and can never
@@ -14174,7 +14233,7 @@ Turn ${turn}/${MAX_TURNS}. What is your next action? (DO NOT snapshot - act dire
       logger.info(`[playwright.agent] turn-loop: pre-exhaustion check — all ${_subTasks.length} sub-tasks verified complete`);
       let _stPageText = '';
       try {
-        const _ePage = engine.getPage(sessionId);
+        const _ePage = _getPage(sessionId);
         if (_ePage) _stPageText = await _ePage.evaluate(() => document.body.innerText.slice(0, 5000)).catch(() => '');
         else _stPageText = (await _observeEval(sessionId, () => document.body.innerText.slice(0, 5000))) || '';
       } catch (_) {}
@@ -14195,7 +14254,7 @@ Turn ${turn}/${MAX_TURNS}. What is your next action? (DO NOT snapshot - act dire
     logger.warn(`[playwright.agent] turn-loop: pre-exhaustion — ${_stillIncompletePre.length} sub-tasks NOT verified: ${_stillIncompletePre.join(', ')} — falling through to regex verification`);
   }
   try {
-    const _ePage = engine.getPage(sessionId);
+    const _ePage = _getPage(sessionId);
     if (_ePage) {
       // ── Part B: Unified postcondition verification (pre-exhaustion) ──
       // Primary gate — check pre/post state delta before falling through to
@@ -14296,7 +14355,7 @@ Turn ${turn}/${MAX_TURNS}. What is your next action? (DO NOT snapshot - act dire
       if (!_preExhaustionVerify || _preExhaustionVerify.source === 'inconclusive') {
         const _finalPageText = await _ePage.evaluate(() => document.body.innerText.slice(0, 3000)).catch(() => '');
         let _finalUrl = '';
-        try { _finalUrl = _ePage.url(); } catch (_) {}
+        _finalUrl = await _pageUrlOf(_ePage);
         const _signals = _isGoalCompletedBySignals({
           goal, verificationGoal,
           pageText: _finalPageText, pageUrl: _finalUrl,
@@ -14451,7 +14510,7 @@ class _PageHeartbeat {
   }
 
   async _tick() {
-    const page = engine.getPage(this.sessionId);
+    const page = _getPage(this.sessionId);
     if (!page) return;
     this.tickCount++;
     const _tickNum = this.tickCount;
@@ -14933,7 +14992,7 @@ async function playwrightAgent(args) {
     if (!_hasMutation && (_isBrowseMatch || _urlHasSearchQuery)) {
       logger.info(`[playwright.agent] browse/read task detected — extracting content (no turn-loop) [browseMatch=${_isBrowseMatch} searchCriteria=${_hasSearchCriteria} urlHasQuery=${_urlHasSearchQuery}]`);
       try {
-        const _browsePage = engine.getPage(sessionId);
+        const _browsePage = _getPage(sessionId);
         if (_browsePage) {
           await browserAct({ action: 'waitForStableText', sessionId, headed, timeoutMs: 15000 }).catch(() => {});
           await _browsePage.waitForTimeout(2000); // extra settle for dynamic content
@@ -16339,7 +16398,7 @@ Output ONLY valid JSON: {${_matchedSkill.params.map(p => `"${p.name}": "<extract
     _ocrTextForPE = '';
     _domSignalsForPE = '';
     try {
-      const _pePage = engine.getPage(sessionId);
+      const _pePage = _getPage(sessionId);
       if (_pePage) {
         const _cap = await _ocrCaptureViaPage(sessionId).catch(() => ({ ok: false }));
         if (_cap.ok) _ocrTextForPE = _cap.text.slice(0, 1500);
@@ -16383,13 +16442,14 @@ Output ONLY valid JSON: {${_matchedSkill.params.map(p => `"${p.name}": "<extract
   // pre-mutation baseline for _verifyPostcondition.
   let _peBaseline = null;
   try {
-    const _pePage0 = engine.getPage(sessionId);
+    const _pePage0 = _getPage(sessionId);
     if (_pePage0) {
-      _lastPeState = await _pePage0.evaluate(() => ({
+      const _st0 = await _pePage0.evaluate(() => ({
         url: window.location.href,
         bodyLen: (document.body.innerText || '').length,
         modalCount: document.querySelectorAll('[role="dialog"], [role="alertdialog"], [aria-modal="true"]').length,
-      })).catch(() => _lastPeState);
+      })).catch(() => null);
+      if (_st0 && typeof _st0 === 'object') _lastPeState = _st0;
       _peBaseline = await _captureStateSnapshot(sessionId, _pePage0).catch(() => null);
     }
   } catch (_) {}
@@ -16403,7 +16463,7 @@ Output ONLY valid JSON: {${_matchedSkill.params.map(p => `"${p.name}": "<extract
     // misjudged, don't re-run the plan and risk duplicate mutations.
     if (_peAttempt > 1 && _peBaseline) {
       try {
-        const _pePageNow = engine.getPage(sessionId);
+        const _pePageNow = _getPage(sessionId);
         const _peNowState = _pePageNow ? await _captureStateSnapshot(sessionId, _pePageNow).catch(() => null) : null;
         if (_peNowState) {
           const _lastOkT = [ ...(_peLoopResult?.transcript || []) ].reverse().find(t => t.outcome?.ok && ['click','press','fill','type','reactFill','tier1.6_pick','keyboard_nav'].includes(t.action?.action));
@@ -16487,13 +16547,14 @@ Output ONLY valid JSON: {${_matchedSkill.params.map(p => `"${p.name}": "<extract
     // Decide whether to re-study and re-plan
     let _peEndState = { url: '', bodyLen: 0, modalCount: 0 };
     try {
-      const _pePage1 = engine.getPage(sessionId);
+      const _pePage1 = _getPage(sessionId);
       if (_pePage1) {
-        _peEndState = await _pePage1.evaluate(() => ({
+        const _st1 = await _pePage1.evaluate(() => ({
           url: window.location.href,
           bodyLen: (document.body.innerText || '').length,
           modalCount: document.querySelectorAll('[role="dialog"], [role="alertdialog"], [aria-modal="true"]').length,
-        })).catch(() => _peEndState);
+        })).catch(() => null);
+        if (_st1 && typeof _st1 === 'object') _peEndState = _st1;
       }
     } catch (_) {}
 
@@ -17475,7 +17536,7 @@ Output a JSON plan: { "plan": [ { "action": "type", "selector": "eXX", "text": "
           let _preClickState = null;
           if (step.action === 'click' && _isSubmitLikeClick(step, _hasFillOrType)) {
             try {
-              const _page = engine.getPage(sessionId);
+              const _page = _getPage(sessionId);
               if (_page) {
                 _preClickState = await _page.evaluate(() => ({
                   url: window.location.href,
@@ -17961,7 +18022,7 @@ Output a JSON plan: { "plan": [ { "action": "type", "selector": "eXX", "text": "
           // Dispatch a synthetic click event on the resolved element. This bypasses
           // all Playwright actionability checks and works even when the element is
           // fully covered by an overlay.
-          const _ePage = engine.getPage(sessionId);
+          const _ePage = _getPage(sessionId);
           if (_ePage && _overlaySelector) {
             // Resolve the ref to a DOM element and click it via JS
             const _evalClickRes = await _ePage.evaluate((sel) => {
@@ -17989,7 +18050,7 @@ Output a JSON plan: { "plan": [ { "action": "type", "selector": "eXX", "text": "
           // Pressing Escape closes modals. When the "overlay" IS the composer modal
           // (e.g. LinkedIn's #interop-outlet), Escape destroys the very modal we
           // want to interact with — causing the whack-a-mole loop.
-          const _ePage2 = engine.getPage(sessionId);
+          const _ePage2 = _getPage(sessionId);
           let _hasModal = false;
           if (_ePage2) {
             try {

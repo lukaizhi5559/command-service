@@ -152,6 +152,71 @@ function matchShortcut(goal, shortcutTable) {
   return best?.shortcut || null;
 }
 
+// ── Vision lane (F25) ─────────────────────────────────────────────────────
+// A screenshot + the local vision decision model resolves lanes that
+// word-boundary regexes can't — text-only confirms misclassified "Confirm you
+// are on YouTube" as 'action' → tab.map's 150-element scan, because nothing
+// could see the homepage was already loaded. The `verify` lane short-circuits
+// those goals entirely: screenshot already satisfies the goal → done, no agent.
+const _VISION_LANES = [
+  'keypress-or-type — one obvious focused/primary input on the page (chat box, search field); a single type or Enter finishes the goal',
+  'find-click — the named link/button the goal references is visible; locate and click it',
+  'overlay-form — a modal/dialog or multi-field form is open; needs the element-map fill loop',
+  'read-extract — the page is a content list/feed/article and the goal is to read or extract from it',
+  'drag-or-swipe — a slider, carousel, scrub bar, or sortable/drag surface is visible',
+  'multi-step — dense interactive page; the goal needs a multi-step observe→act loop (commerce grid, wizard)',
+  'verify — the goal is already satisfied by what the screenshot shows; no action needed',
+];
+const _VISION_LANE_TO_AGENT = {
+  'keypress-or-type': 'just.type.agent',
+  'find-click': 'meta.find.agent',
+  'overlay-form': 'tab.map.agent',
+  'read-extract': 'tab.map.agent',
+  'drag-or-swipe': 'gesture.agent',
+  'multi-step': 'turn.loop.agent',
+};
+
+async function _capturePageImage(sessionId) {
+  try {
+    const sid = String(sessionId || '');
+    if (sid.startsWith('ext:')) {
+      const { extPage } = require('./ext.page.cjs');
+      const p = extPage(sid);
+      if (!p) return null;
+      const buf = await p.screenshot({}).catch(() => null);
+      return Buffer.isBuffer(buf) ? buf.toString('base64') : null;
+    }
+    const engine = require('../../browser-engine.cjs');
+    const pg = engine.getPage?.(sid);
+    if (!pg || typeof pg.screenshot !== 'function') return null;
+    const buf = await pg.screenshot({ type: 'jpeg', quality: 55 }).catch(() => null);
+    return buf ? buf.toString('base64') : null;
+  } catch (_) { return null; }
+}
+
+async function _visionGoalLane({ goal, image, currentUrl, probe, overlayActive }) {
+  try {
+    const _decision = require('../../../skill-helpers/decision.cjs');
+    return await _decision.boundedDecision({
+      site: 'router.lanePick',
+      questions: [{
+        id: 'lane', type: 'choice',
+        question: `Look at this page screenshot. Goal: "${goal}". Which single lane executes it best? Choose "verify" ONLY if the screenshot already satisfies the goal.`,
+        options: _VISION_LANES,
+      }],
+      image,
+      state: `Goal: "${String(goal).slice(0, 200)}"\nURL: ${currentUrl || '?'}\noverlayOpen: ${overlayActive ? 'yes' : 'no'}\nprobe: fillables=${probe?.fillableCount || 0} clickables=${probe?.clickableCount || 0}`,
+      minConfidence: 0.45,
+      local: (a) => {
+        const i = a.lane?.index;
+        return (i != null && i < _VISION_LANES.length) ? _VISION_LANES[i].split(' ')[0] : null;
+      },
+      remote: async () => null,
+      logger,
+    });
+  } catch (_) { return null; }
+}
+
 // Ambiguous-verb fallback — word-boundary regexes cannot separate
 // "press the search shortcut" from "search my inbox". One cheap semantic
 // call classifies the lane; on any error we abstain (fall through to the
@@ -212,12 +277,28 @@ function _isMultiPartGoal(goal) {
  * Exported for headless tests; `confirmLane` is injectable (default: real LLM
  * call) so tests never hit the network.
  */
-async function _routeFromSignals({ goal, pageCategory = 'web_generic', focused, probe, overlayActive, currentUrl, triedAgents, agentHint, confirmLane }) {
+async function _routeFromSignals({ goal, pageCategory = 'web_generic', focused, probe, overlayActive, currentUrl, triedAgents, agentHint, confirmLane, sessionId }) {
   const allowed = allowedAgents(pageCategory);
   const tried = triedAgents instanceof Set ? triedAgents : new Set(triedAgents || []);
   const pick = (agent, rule) => {
     if (!allowed.has(agent) || tried.has(agent)) return null;
     return { agent, rule, probe, overlayActive, currentUrl, focused, pageCategory };
+  };
+  // Vision lane — captured lazily, once per route call. A screenshot + bounded
+  // vision decision resolves lanes regexes can't (and sees goals already
+  // satisfied on screen → 'verify' → done, no agent scan).
+  let _visionTried = false;
+  const _visionLane = async () => {
+    if (_visionTried) return null;
+    _visionTried = true;
+    const _image = sessionId ? await _capturePageImage(sessionId) : null;
+    if (!_image) return null;
+    return _visionGoalLane({ goal: stripQuoted(goal), image: _image, currentUrl, probe, overlayActive });
+  };
+  const _visionHit = (lane) => {
+    if (lane === 'verify') return { agent: null, rule: 'vision:verify', verifySatisfied: true, probe, overlayActive, currentUrl, focused, pageCategory };
+    const agent = lane && _VISION_LANE_TO_AGENT[lane];
+    return agent ? (pick(agent, `vision:${lane}`) || pick('turn.loop.agent', `vision:${lane}-fallback`)) : null;
   };
 
   const goalVerbs = stripQuoted(goal);
@@ -310,9 +391,11 @@ async function _routeFromSignals({ goal, pageCategory = 'web_generic', focused, 
   }
 
   // 5b. Ambiguous-verb zone — goal has a shortcut-ish verb but no confident
-  //     table match and no read/extract object. One semantic call resolves
-  //     what word-boundary regexes can't. Runs on the sanitized goal.
+  //     table match and no read/extract object. Vision lane first (it can SEE
+  //     the page); the text-only semantic call remains the no-image fallback.
   if (SHORTCUT_VERB_RE.test(goalVerbs)) {
+    const _vHit = _visionHit(await _visionLane());
+    if (_vHit) return _vHit;
     const lane = await (confirmLane || _confirmGoalLane)(goalVerbs);
     if (lane === 'shortcut') {
       const hit = pick('shortcut.keys.agent', 'llm-confirm:shortcut');
@@ -361,6 +444,14 @@ async function _routeFromSignals({ goal, pageCategory = 'web_generic', focused, 
     if (hit) return hit;
   }
 
+  // 7.9 Vision lane for survivors — nothing deterministic matched. A quick look
+  //     at the page resolves goals the floor would dump into tab.map's scan
+  //     (e.g. a visible "Send" button → meta.find; a slider → gesture).
+  {
+    const _vHit = _visionHit(await _visionLane());
+    if (_vHit) return _vHit;
+  }
+
   // 8. Default: actionable elements present → Tab-Map
   if ((probe?.fillableCount || 0) + (probe?.clickableCount || 0) > 0) {
     const hit = pick('tab.map.agent', 'default-actionable');
@@ -407,7 +498,7 @@ async function routeOnPageAction({ sessionId, goal, pageCategory = 'web_generic'
       pageCategory = refined;
     }
   }
-  return _routeFromSignals({ goal, pageCategory, focused, probe, overlayActive, currentUrl, triedAgents, agentHint });
+  return _routeFromSignals({ goal, pageCategory, focused, probe, overlayActive, currentUrl, triedAgents, agentHint, sessionId });
 }
 
 module.exports = {

@@ -1211,7 +1211,7 @@ async function getCachedDeepLink(serviceKey, keywords) {
     // Utility/policy pages are never real destinations — a stale
     // 'ebay → pages.ebay.com/policies/linkbuttons.html' entry navigated the
     // bound tab to a policy page instead of ebay.com.
-    const UTILITY_PATH_RE = /\/(policies|policy|help|linkbuttons|safety|trust|legal|terms|privacy)\b/i;
+    const UTILITY_PATH_RE = /\/(policies|policy|help|linkbuttons|safety|trust|legal|terms|privacy|notifications)\b/i;
     if (bestMatch && UTILITY_PATH_RE.test(bestMatch.url)) {
       logger.warn(`[destination-resolver] Deep-link cache hit rejected (utility path): ${serviceKey} → ${bestMatch.url}`);
       bestMatch = null; bestScore = 0;
