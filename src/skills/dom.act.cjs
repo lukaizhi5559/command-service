@@ -211,6 +211,48 @@ async function domAct(args = {}) {
     return { ok: true, alreadySatisfied: true, routeRule: 'activation-goal', sessionId, agentId, url: _boundPageUrl || priorNavUrl || null, output: 'Activated the bound tab and confirmed the page is loaded' };
   }
 
+  // Google Docs title gate — the doc is canvas-rendered but its title lives in
+  // the known `.docs-title-input` box. A "set/rename the document title" goal
+  // is a deterministic focus→select→type→Enter over the REAL input path
+  // (a JS .value write doesn't commit to Docs' model). Routing it to
+  // turn.loop burned a 6-turn observe loop on a node whose address is known.
+  const _boundHost = _boundPageUrl ? _hostOf(_boundPageUrl) : null;
+  if (_boundHost === 'docs.google.com'
+      && /\b(?:set|rename|change|update|name|title)\b[^.]{0,40}\b(?:title|name|document|doc)\b/i.test(goal)) {
+    const _tm = /(?:titled?|title\s+(?:to|as)|named?|called?|as)\s*["'‘“]([^"'’”]+)["'’”]/i.exec(goal)
+      || /["'‘“]([^"'’”]+)["'’”]/.exec(goal)
+      || /\btitle\s+to\s+(.+?)\s*$/i.exec(goal);
+    const _newTitle = _tm ? _tm[1].trim() : null;
+    if (_newTitle) {
+      postProgress(_progressCallbackUrl, { tier: 'route', message: `dom.act → docs title: "${_newTitle.slice(0, 40)}"` });
+      try {
+        const _focus = await browserAct({
+          action: 'evaluate', sessionId, headed: true, timeoutMs: 6000,
+          text: `(() => { const i = document.querySelector('input.docs-title-input') || document.querySelector('.docs-title-outer input') || document.querySelector('[aria-label*="Rename" i], [data-tooltip*="Rename" i]'); if (!i) return 'no-title-input'; i.focus(); if (i.select) i.select(); return 'focused'; })()`,
+        });
+        if (_focus?.ok && String(_focus.result || '').includes('focused')) {
+          await browserAct({ action: 'type', sessionId, text: _newTitle, headed: true, timeoutMs: 15000 });
+          await browserAct({ action: 'press', sessionId, key: 'Enter', headed: true, timeoutMs: 8000 });
+          const _verify = await browserAct({
+            action: 'evaluate', sessionId, headed: true, timeoutMs: 6000,
+            text: `(document.title || '') + '|' + ((document.querySelector('input.docs-title-input') || {}).value || '')`,
+          });
+          const _v = String(_verify?.result || '');
+          const _titleSet = _v.toLowerCase().includes(_newTitle.toLowerCase());
+          logger.info(`[dom.act] docs-title: "${_newTitle.slice(0, 50)}" → ${_titleSet ? 'VERIFIED' : 'unverified'} (${_v.slice(0, 90)})`);
+          return {
+            ok: true, resolvedAgent: 'dom.act:docs-title', routeRule: 'docs-title',
+            sessionId, agentId, url: _boundPageUrl, verified: _titleSet, mutationApplied: true,
+            output: `Set the document title to "${_newTitle}"${_titleSet ? ' (verified in tab title)' : ''}`,
+          };
+        }
+        logger.warn(`[dom.act] docs-title: title input not found (${_focus?.result || _focus?.error || 'probe failed'}) — falling through to router`);
+      } catch (e) {
+        logger.warn(`[dom.act] docs-title failed: ${e.message} — falling through to router`);
+      }
+    }
+  }
+
   // Deterministic ordinal lane — "click/open the Nth item/result/listing"
   // resolves positionally against the live DOM: enumerate result-shaped
   // anchors in visual order and navigate to the Nth href. No LLM loop, no
