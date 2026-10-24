@@ -221,7 +221,7 @@ async function _visionGoalLane({ goal, image, currentUrl, probe, overlayActive }
 // "press the search shortcut" from "search my inbox". One cheap semantic
 // call classifies the lane; on any error we abstain (fall through to the
 // generalist cascade) rather than guess.
-async function _confirmGoalLane(goal) {
+async function _confirmGoalLane(goal, ctx = {}) {
   try {
     // ── Local decision fast path — 4-lane choice ──────────────────────────
     const _decision = require('../../../skill-helpers/decision.cjs');
@@ -237,7 +237,13 @@ async function _confirmGoalLane(goal) {
           'action — a UI action: click, type, navigate, submit (e.g. "click save", "fill the form")',
         ],
       }],
-      state: `Goal: "${String(goal).slice(0, 200)}"`,
+      state: [
+        `Goal: "${String(goal).slice(0, 200)}"`,
+        ctx.currentUrl ? `URL: ${ctx.currentUrl}` : '',
+        ctx.pageCategory ? `pageCategory: ${ctx.pageCategory}` : '',
+        ctx.probe ? `probe: fillables=${ctx.probe.fillableCount || 0} clickables=${ctx.probe.clickableCount || 0} autofocus=${ctx.probe.hasAutoFocus ? 'yes' : 'no'}` : '',
+        ctx.focused?.tag ? `focused: <${String(ctx.focused.tag).toLowerCase()}>${ctx.focused.role ? ` role=${ctx.focused.role}` : ''}${ctx.focused.isContentEditable ? ' editable' : ''}` : '',
+      ].filter(Boolean).join('\n'),
       local: (a) => {
         const i = a.lane?.index;
         return (i != null && i <= 3) ? ['shortcut', 'read', 'find', 'action'][i] : null;
@@ -277,7 +283,51 @@ function _isMultiPartGoal(goal) {
  * Exported for headless tests; `confirmLane` is injectable (default: real LLM
  * call) so tests never hit the network.
  */
-async function _routeFromSignals({ goal, pageCategory = 'web_generic', focused, probe, overlayActive, currentUrl, triedAgents, agentHint, confirmLane, sessionId }) {
+// First-order gate — does this goal act on the CURRENT page's content at all?
+// Activation/navigation/window-level goals are not on-page actions; force-fitting
+// them into an element lane makes the executor invent clicks (observed: "Ensure
+// ChatGPT is in focus" → tab.map clicked through the chat sidebar). A bounded
+// noul decision sees the full page snapshot — on any failure it abstains and the
+// deterministic cascade below runs as before (fail-open).
+async function _onPageGate({ goal, currentUrl, pageCategory, probe, overlayActive, focused }) {
+  try {
+    const _decision = require('../../../skill-helpers/decision.cjs');
+    return await _decision.boundedDecision({
+      site: 'router.onPage',
+      questions: [{
+        id: 'surface', type: 'choice',
+        question: 'Does this goal act on the CURRENT page\'s content — clicking, typing, reading, or finding elements inside it? Or is it a window/tab-level or navigation goal (activate, bring to foreground, ensure loaded/ready/open, switch tabs)?',
+        options: [
+          'on_page — interact with or read elements inside the current page (click, type, fill, read, find, scroll)',
+          'not_on_page — window/tab/session-level or navigation work (activate, bring to front, ensure open/ready/focused, switch to another tab)',
+        ],
+      }],
+      state: [
+        `Goal: "${String(goal || '').slice(0, 200)}"`,
+        `URL: ${currentUrl || '?'}`,
+        `pageCategory: ${pageCategory || 'web_generic'}`,
+        `probe: fillables=${probe?.fillableCount || 0} clickables=${probe?.clickableCount || 0} autofocus=${probe?.hasAutoFocus ? 'yes' : 'no'}`,
+        `overlayOpen: ${overlayActive ? 'yes' : 'no'}`,
+        focused?.tag ? `focused: <${String(focused.tag).toLowerCase()}>${focused.role ? ` role=${focused.role}` : ''}${focused.isContentEditable ? ' editable' : ''}` : 'focused: none',
+      ].join('\n'),
+      local: (a) => {
+        const i = a.surface?.index;
+        return i === 0 ? 'on_page' : i === 1 ? 'not_on_page' : null;
+      },
+      remote: async () => null,
+      logger,
+    });
+  } catch (_) { return null; }
+}
+
+async function _routeFromSignals({ goal, pageCategory = 'web_generic', focused, probe, overlayActive, currentUrl, triedAgents, agentHint, confirmLane, sessionId, onPageCheck }) {
+  // 0. On-page binary — the goal's surface is decided BEFORE any lane pick so
+  //    non-page goals never reach an element executor. Injectable for tests.
+  const _surface = await (onPageCheck !== undefined ? onPageCheck : _onPageGate({ goal, currentUrl, pageCategory, probe, overlayActive, focused }));
+  if (_surface === 'not_on_page') {
+    logger.info(`[router] onPage gate: "${String(goal || '').slice(0, 60)}" is NOT an on-page action — no element lane`);
+    return { agent: null, rule: 'router.onPage:not_on_page', notOnPage: true, probe, overlayActive, currentUrl, focused, pageCategory };
+  }
   const allowed = allowedAgents(pageCategory);
   const tried = triedAgents instanceof Set ? triedAgents : new Set(triedAgents || []);
   const pick = (agent, rule) => {
@@ -396,7 +446,7 @@ async function _routeFromSignals({ goal, pageCategory = 'web_generic', focused, 
   if (SHORTCUT_VERB_RE.test(goalVerbs)) {
     const _vHit = _visionHit(await _visionLane());
     if (_vHit) return _vHit;
-    const lane = await (confirmLane || _confirmGoalLane)(goalVerbs);
+    const lane = await (confirmLane || _confirmGoalLane)(goalVerbs, { currentUrl, pageCategory, probe, focused });
     if (lane === 'shortcut') {
       const hit = pick('shortcut.keys.agent', 'llm-confirm:shortcut');
       if (hit) return hit;

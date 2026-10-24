@@ -83,6 +83,12 @@ async function tabMapAgent(args = {}) {
     let lastVerifyFailed = false;
     let extractedPageText = '';
     let lastError = null;
+    // Rescan budget — each rebuild costs ~20s of DOM traversal. Goals that keep
+    // staling the map (unsatisfiable on this page — e.g. an activation goal
+    // misrouted here) used to burn the whole step budget on rebuilds; cap them
+    // so a stale-loop fails fast instead of scanning forever.
+    let rescans = 0;
+    const MAX_RESCANS = 2;
 
     // Hollow-done guard: the LLM can answer "Done" without executing any
     // action (observed after a replan — it saw the open compose dialog and
@@ -171,6 +177,11 @@ async function tabMapAgent(args = {}) {
         if (res.overlayOpened === true) overlayActive = true;
         else if (res.overlayOpened === false) overlayActive = false;
         logger.info(`[tab.map.agent] rescan signaled (${res.error || (res.overlayOpened ? 'dialog opened' : 'stale element')}) — rebuilding tab-map`);
+        if (++rescans > MAX_RESCANS) {
+          lastError = `tab-map rebuilds exhausted (${MAX_RESCANS}) — goal likely unsatisfiable on this page`;
+          logger.warn(`[tab.map.agent] ${lastError} — suggesting turn.loop`);
+          return { ok: false, error: lastError, suggestedAgent: 'turn.loop.agent', sessionId };
+        }
         tabMap = await buildTabMap(sessionId, 150, { skipReset: overlayActive }).catch(() => tabMap);
         const newUrl = await readUrl();
         if (newUrl) { tabMapUrl = newUrl; currentUrl = newUrl; }

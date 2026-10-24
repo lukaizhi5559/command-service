@@ -38,6 +38,19 @@ function _isPureCreateGoal(goal, priorNavType) {
   return _CREATE_ACTION_RE.test(g) && !_RESIDUAL_WORK_RE.test(g);
 }
 
+// Activation/readiness goals — "ensure X is in focus and ready for
+// interaction", "bring the session to the foreground", "activate the tab".
+// Lead verb + readiness-state noun required; a residual ACTION verb vetoes
+// ("ready to type", "ensure the field is filled" fall through to the router).
+const _ACTIVATION_LEAD_RE = /^\s*(?:please\s+)?(?:ensure|make\s+sure|confirm|verify|check\s+(?:that|if)|wait\s+(?:until|for)|activate|bring|focus|switch\s+to|prepare|set\s+up)\b/i;
+const _ACTIVATION_STATE_RE = /\b(in\s+focus|focused|ready|open|load(?:ed|ing)?|activat\w+|foreground|forefront|front|visible|usable|prepared|available|for\s+interaction|interact)/i;
+const _ACTIVATION_RESIDUAL_RE = /\b(type|fill|write|enter|send|click|press|submit|post|scroll|select|choose|download|upload|compose|reply|forward|delete)\w*\s+(?:"[^"]+"|'[^']+'|[a-z])/i;
+function _isActivationGoal(goal) {
+  const g = String(goal || '').trim();
+  if (!g || g.length > 200) return false;
+  return _ACTIVATION_LEAD_RE.test(g) && _ACTIVATION_STATE_RE.test(g) && !_ACTIVATION_RESIDUAL_RE.test(g);
+}
+
 function _hostOf(u) {
   try { return new URL(u).hostname.replace(/^www\./, ''); } catch (_) { return null; }
 }
@@ -182,6 +195,22 @@ async function domAct(args = {}) {
     return { ok: true, alreadySatisfied: true, sessionId, agentId, url: priorNavUrl, output: `Already done — ${priorNavType} deep-link created it (${priorNavUrl || ''})` };
   }
 
+  // Activation/readiness gate — "ensure X is in focus and ready", "bring the
+  // session to the foreground", "activate the tab" are WINDOW-level ops, not
+  // on-page actions. Routing them to an element executor lets it wander —
+  // observed: "Ensure ChatGPT is in focus" → tab.map.agent's forced element
+  // picks clicked through the user's chat sidebar (3× ~20s rescans, then
+  // exhausted). Satisfy deterministically: activate the bound tab+window via
+  // tab-select — the settle gate above already confirmed the page is stable.
+  // Narrow: only fires when the goal is PURELY activation/readiness — a
+  // residual action verb (fill/click/send…) falls through to the router.
+  if (_isActivationGoal(goal)) {
+    postProgress(_progressCallbackUrl, { tier: 'route', message: 'dom.act → activate: bringing bound tab to foreground' });
+    try { await browserAct({ action: 'tab-select', sessionId, headed: true, timeoutMs: 5000 }); } catch (_) {}
+    logger.info(`[dom.act] activation satisfied — "${goal.slice(0, 60)}" (tab-select on ${sessionId})`);
+    return { ok: true, alreadySatisfied: true, routeRule: 'activation-goal', sessionId, agentId, url: _boundPageUrl || priorNavUrl || null, output: 'Activated the bound tab and confirmed the page is loaded' };
+  }
+
   // Deterministic ordinal lane — "click/open the Nth item/result/listing"
   // resolves positionally against the live DOM: enumerate result-shaped
   // anchors in visual order and navigate to the Nth href. No LLM loop, no
@@ -304,6 +333,13 @@ async function domAct(args = {}) {
       triedAgents: tried,
     });
     lastRoute = route;
+    // On-page gate: the goal isn't a page action at all (activation/window-
+    // level) — satisfy it deterministically instead of picking an executor.
+    if (route?.notOnPage) {
+      logger.info(`[dom.act] router.onPage: goal is not on-page — activating bound tab instead of forcing an element lane ("${goal.slice(0, 60)}")`);
+      try { await browserAct({ action: 'tab-select', sessionId, headed: true, timeoutMs: 5000 }); } catch (_) {}
+      return { ok: true, alreadySatisfied: true, routeRule: route.rule, sessionId, agentId, url: route.currentUrl || _boundPageUrl || null, output: 'Goal was window/tab-level, not an on-page action — activated the bound tab.' };
+    }
     // Vision-verify: the screenshot already satisfies the goal — done with no
     // agent (e.g. "confirm you are on YouTube" on the loaded homepage).
     if (route?.verifySatisfied) {
