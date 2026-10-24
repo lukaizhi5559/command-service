@@ -55,6 +55,58 @@ function _hostOf(u) {
   try { return new URL(u).hostname.replace(/^www\./, ''); } catch (_) { return null; }
 }
 
+// ── Email-compose field extraction ──────────────────────────────────────────
+// Two grammars, kept separate on purpose:
+//   labeled  — "To: x@y.com, Subject: 'Q3', Body: 'hi'" (planner-emitted shape;
+//              values slice between label boundaries, quoted runs captured
+//              verbatim, unquoted values end at the first , or ;)
+//   freeform — "send a quick email to x@y.com saying the update is ready"
+//              (bare-email + `saying` body)
+// Recipient values validate — URLs/domains/sentence captures are rejected so a
+// false-positive parse can never be typed into the page or sent to.
+const _EMAIL_LABEL_RE = /(?:^|[,;\s—–])(to|cc|bcc|subject|body)\s*:/gi;
+const _EMAIL_FREEFORM_TO_RE = /(?:email|e-mail|mail|message|to|recipient)\s+([\w.+-]+@[\w-]+\.[\w.]+)/i;
+const _EMAIL_SAYING_RE = /\bsaying\s+["'‘“]?([^"'’”]+)["'’”]?/i;
+const _EMAIL_QUOTED_SUBJ_RE = /\bsubject\s*[:=]?\s*["'‘“]([^"'’”]+)["'’”]/i;
+const _EMAIL_VALID_TO_RE = /^[\w.+-]+@[\w-]+\.[\w.]+$/;
+const _EMAIL_VALID_NAME_RE = /^[\w][\w .'-]{1,60}$/;
+
+function _parseEmailFields(text) {
+  const fields = {};
+  const hits = [];
+  let m;
+  while ((m = _EMAIL_LABEL_RE.exec(text || ''))) {
+    hits.push({ key: m[1].toLowerCase(), segStart: m.index, valStart: m.index + m[0].length });
+  }
+  for (let i = 0; i < hits.length; i++) {
+    const end = i + 1 < hits.length ? hits[i + 1].segStart : (text || '').length;
+    let v = String(text || '').slice(hits[i].valStart, end).trim();
+    const q = /^["'‘“]([^"'’”]+)["'’”]/.exec(v);
+    if (q) v = q[1].trim();
+    else v = v.replace(/[,;][\s\S]*$/, '').trim();
+    if (v && !fields[hits[i].key]) fields[hits[i].key] = v;
+  }
+  if (!fields.to) {
+    const em = _EMAIL_FREEFORM_TO_RE.exec(text || '');
+    if (em) fields.to = em[1];
+  }
+  if (!fields.body) {
+    const sm = _EMAIL_SAYING_RE.exec(text || '');
+    if (sm) fields.body = sm[1].trim();
+  }
+  if (!fields.subject) {
+    const sub = _EMAIL_QUOTED_SUBJ_RE.exec(text || '');
+    if (sub) fields.subject = sub[1].trim();
+  }
+  for (const k of ['to', 'cc', 'bcc']) {
+    if (fields[k] && !_EMAIL_VALID_TO_RE.test(fields[k]) && !_EMAIL_VALID_NAME_RE.test(fields[k])) delete fields[k];
+  }
+  return fields;
+}
+
+const _EMAIL_SEND_RE = /\b(?:send|dispatch|deliver|fire\s+off|shoot\s+off)\b/i;
+const _EMAIL_DRAFT_ONLY_RE = /\b(?:draft|don'?t\s+send|do\s+not\s+send|just\s+(?:write|compose|draft)|no\s+send|without\s+sending|save\s+(?:it\s+)?as\s+(?:a\s+)?draft)\b/i;
+
 const AGENT_RUNNERS = {
   'just.type.agent':    () => require('./just.type.agent.cjs').justTypeAgent,
   'meta.find.agent':    () => require('./meta.find.agent.cjs').metaFindAgent,
@@ -249,6 +301,81 @@ async function domAct(args = {}) {
         logger.warn(`[dom.act] docs-title: title input not found (${_focus?.result || _focus?.error || 'probe failed'}) — falling through to router`);
       } catch (e) {
         logger.warn(`[dom.act] docs-title failed: ${e.message} — falling through to router`);
+      }
+    }
+  }
+
+  // Email-compose gate — a send/compose-email goal on an email_compose surface
+  // is an app workflow, not a generic form: known selectors carry the values
+  // (goal-parsed, NOT profile-resolved — form.fill's contract can't see "To:
+  // X saying Y"), recipients commit as chips via Enter, and the send itself is
+  // sendEmailWithVerification (validated click → post-send proof). Observed:
+  // "Send a quick email to X saying Y" → routed to form.fill → nothing-filled
+  // → false failure. Fail-closed: a send goal with no valid recipient and no
+  // committed chip does not reach the send call.
+  const _isComposeCtx = pageCategory === 'email_compose' || _boundHost === 'mail.google.com';
+  if (_isComposeCtx) {
+    const _fields = _parseEmailFields(goal) ;
+    const _taskFields = _parseEmailFields(task);
+    for (const k of ['to', 'cc', 'bcc', 'subject', 'body']) {
+      if (!_fields[k] && _taskFields[k]) _fields[k] = _taskFields[k];
+    }
+    const _wantsSend = _EMAIL_SEND_RE.test(goal) && !_EMAIL_DRAFT_ONLY_RE.test(goal);
+    if (Object.keys(_fields).length || _wantsSend) {
+      postProgress(_progressCallbackUrl, { tier: 'route', message: `dom.act → email-compose: ${Object.keys(_fields).join('+') || 'send-only'}` });
+      try {
+        const _fill = async (sel, value, commitChip) => {
+          const c = await browserAct({ action: 'click', selector: sel, sessionId, headed: true, timeoutMs: 8000 });
+          if (!c?.ok) return false;
+          const t = await browserAct({ action: 'type', text: value, sessionId, headed: true, timeoutMs: 15000 });
+          if (!t?.ok) return false;
+          if (commitChip) {
+            await browserAct({ action: 'press', key: 'Enter', sessionId, headed: true, timeoutMs: 5000 });
+            await new Promise(r => setTimeout(r, 500));
+          }
+          return true;
+        };
+        const _filled = [];
+        for (const k of ['to', 'cc', 'bcc']) {
+          if (_fields[k]) {
+            if (await _fill('input[name="to"],textarea[name="to"]', _fields[k], true)) _filled.push(k);
+          }
+        }
+        if (_fields.subject) {
+          if (await _fill('input[name="subjectbox"]', _fields.subject, false)) _filled.push('subject');
+        }
+        if (_fields.body) {
+          if (await _fill('div[aria-label="Message Body"]', _fields.body, false)) _filled.push('body');
+        }
+        if (_wantsSend) {
+          const _send = await browserAct({
+            action: 'sendEmailWithVerification', sessionId,
+            selector: 'div[data-tooltip*="Send"]', headed: true, timeoutMs: 30000,
+          });
+          if (_send?.ok) {
+            logger.info(`[dom.act] email-compose: filled [${_filled.join(',')}] + VERIFIED SEND (session=${sessionId})`);
+            return {
+              ok: true, resolvedAgent: 'dom.act:email-compose', routeRule: 'email-compose+send',
+              sessionId, agentId, url: _boundPageUrl, verified: true, mutationApplied: true,
+              output: `Email ${_filled.length ? `filled (${_filled.join(', ')}) and ` : ''}sent — verified compose closed`,
+            };
+          }
+          logger.warn(`[dom.act] email-compose: send verification failed — ${_send?.error || 'unknown'}`);
+          return {
+            ok: false, resolvedAgent: 'dom.act:email-compose', routeRule: 'email-compose+send',
+            sessionId, agentId, url: _boundPageUrl, mutationApplied: _filled.length > 0,
+            error: `email-compose: send failed after filling [${_filled.join(',')}] — ${_send?.error || 'unknown'}`,
+            missingInputs: _fields.to ? undefined : [{ field: 'to', question: 'Who is the recipient?' }],
+          };
+        }
+        logger.info(`[dom.act] email-compose: filled [${_filled.join(',')}] (draft — no send intent)`);
+        return {
+          ok: true, resolvedAgent: 'dom.act:email-compose', routeRule: 'email-compose',
+          sessionId, agentId, url: _boundPageUrl, verified: _filled.length > 0, mutationApplied: _filled.length > 0,
+          output: `Email draft filled (${_filled.join(', ') || 'nothing parsed'}) — left unsent`,
+        };
+      } catch (e) {
+        logger.warn(`[dom.act] email-compose failed: ${e.message} — falling through to router`);
       }
     }
   }

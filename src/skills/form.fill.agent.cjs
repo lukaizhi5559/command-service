@@ -586,12 +586,18 @@ async function formFillAgent(args = {}) {
 
     const stillMissing = missingFields.filter((m) => m.required !== false).map((m) => m.key);
     const totalFilled = filledCount + leftoversHandled.length;
-    const status = totalFilled > 0 ? (stillMissing.length || validationIssues.length ? 'partial' : 'filled') : 'nothing-filled';
-    // Honest contract: ok:false is reserved for infra failures (no form, dead
-    // session). A partial fill is a successful UPDATE with reported issues.
-    const ok = totalFilled > 0 || stillMissing.length === 0;
+    const alreadyHad = filledFields.filter((f) => f.note === 'already-had-value').length;
+    const status = totalFilled > 0 ? (stillMissing.length || validationIssues.length ? 'partial' : 'filled') : (alreadyHad ? 'already-filled' : 'nothing-filled');
+    // Honest contract: ok:false for infra failures AND for zero-fill runs with
+    // unresolved fields — that's missing information (goal wanted values the
+    // profile/args/gather sources couldn't resolve), not a successful no-op.
+    // The old rule (totalFilled>0 || stillMissing===0) passed nothing-filled
+    // whenever no field was marked required — Gmail compose filled 0 fields
+    // and reported ok:true. already-had-value alone stays a success.
+    const missingInfo = totalFilled === 0 && alreadyHad === 0 && missingFields.length > 0;
+    const ok = totalFilled > 0 || alreadyHad > 0 || missingFields.length === 0;
     const issueText = validationIssues.map((v) => `${v.label || v.key}: ${v.messages[0]}`).join('; ');
-    const summary = `form.fill: ${status} — filled ${totalFilled + filledFields.filter((f) => f.note === 'already-had-value').length} field(s)` +
+    const summary = `form.fill: ${status} — filled ${totalFilled + alreadyHad} field(s)` +
       (issueText ? ` — validation issues: ${issueText.slice(0, 220)}` : '') +
       (stillMissing.length ? ` — missing: ${stillMissing.join(', ')}` : '') +
       (wantsSubmit ? ' (submit allowed)' : ' (no-submit enforced)');
@@ -603,6 +609,16 @@ async function formFillAgent(args = {}) {
       ok,
       status,
       output: summary,
+      ...(missingInfo ? {
+        error: summary,
+        reason: 'missing-information',
+        missingInputs: missingFields.map((m) => ({
+          field: m.key,
+          label: m.label || m.key,
+          required: m.required !== false,
+          question: `What value should go in "${m.label || m.key}"?`,
+        })),
+      } : {}),
       filledFields,
       missingFields: missingFields.filter((m) => valueFor(m.key) == null),
       validationIssues,

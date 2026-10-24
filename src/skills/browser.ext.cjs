@@ -271,6 +271,93 @@ async function _dispatch(args, start) {
       return _env(action, sessionId, start, { result: res.cookies, stdout: JSON.stringify(res.cookies?.length || 0) });
     }
 
+    case 'sendEmailWithVerification': {
+      // Verified Gmail send over the extension transport — mirrors the
+      // engine/CLI sequence in browser.act (validate → commit raw recipient
+      // → click Send → post-send verify) via evaluate/press/click commands.
+      const _eval = async (expression, t = 8000) => {
+        const r = await gateway.sendCmd({ sessionId, action: 'evaluate', args: { expression, ..._fwd } }, t + 5000);
+        if (!r?.ok) return null;
+        try { return typeof r.result === 'string' ? JSON.parse(r.result) : r.result; } catch (_) { return r.result; }
+      };
+      const _VALIDATE = `(() => {
+        const chips = document.querySelectorAll('[data-hovercard-id],[email],[data-name].vM,.vR,.afV');
+        const recipientInput = document.querySelector('input[name="to"],textarea[name="to"]');
+        const rawToText = (recipientInput?.value || '').trim();
+        const subject = (document.querySelector('input[name="subjectbox"]')?.value || '').trim();
+        const body = (document.querySelector('div[aria-label="Message Body"]')?.innerText || '').trim();
+        const composeVisible = !!document.querySelector('div[aria-label="New Message"],div[aria-label="Message Body"],.T-I-KE');
+        return JSON.stringify({ hasChip: chips.length > 0, hasRawTo: rawToText.length > 3 && rawToText.includes('@'), rawToText: rawToText.slice(0,50), subject: subject.slice(0,50), bodyLen: body.length, composeVisible });
+      })()`;
+      const _POST = `(() => {
+        const composeOpen = !!document.querySelector('div[aria-label="Message Body"],div[aria-label="New Message"]');
+        const t = (document.body?.innerText || '').toLowerCase().slice(0, 3000);
+        const sentToast = /message sent|view message/.test(t);
+        const sendAnyway = /send anyway|send without|without subject|no subject/.test(t);
+        const errEl = document.querySelector('[role="alert"],.Kj-JD-Jz');
+        return JSON.stringify({ composeOpen, sentToast, sendAnyway, errText: (errEl?.innerText || '').slice(0, 120) });
+      })()`;
+
+      // 1. Pre-send validation — recipient chip or committable raw text.
+      let val = await _eval(_VALIDATE);
+      if (val && !val.hasChip && !val.hasRawTo) {
+        return _envErr(action, sessionId, start, 'sendEmailWithVerification: No recipient chip confirmed — fill the To field and press Enter to create a chip before sending');
+      }
+      if (val && val.hasRawTo && !val.hasChip) {
+        logger.info(`[browser.ext] sendEmailWithVerification: recipient "${val.rawToText}" raw text — Enter to commit chip`);
+        await gateway.sendCmd({ sessionId, action: 'press', args: { key: 'Enter', ..._fwd } }, 8000).catch(() => {});
+        await new Promise(r => setTimeout(r, 600));
+        val = await _eval(_VALIDATE);
+        if (val && !val.hasChip && !val.hasRawTo) {
+          return _envErr(action, sessionId, start, 'sendEmailWithVerification: recipient did not commit to a chip');
+        }
+      }
+      logger.info(`[browser.ext] sendEmailWithVerification: validation ok — chip=${val?.hasChip} subject="${val?.subject}" bodyLen=${val?.bodyLen}`);
+
+      // 2. Click Send — selector → tooltip → aria → Ctrl+Enter on body focus.
+      let sendClicked = false;
+      const _tryClick = async (sel) => {
+        if (!sel) return false;
+        const r = await gateway.sendCmd({ sessionId, action: 'click', args: { selector: sel, ..._fwd } }, 8000).catch(() => null);
+        return !!r?.ok;
+      };
+      for (const sel of [selector, 'div[data-tooltip*="Send"]', 'div[role="button"][aria-label*="Send"]', 'div[aria-label*="Send"]']) {
+        if (await _tryClick(sel)) { sendClicked = true; break; }
+      }
+      if (!sendClicked) {
+        await gateway.sendCmd({ sessionId, action: 'click', args: { selector: 'div[aria-label="Message Body"]', ..._fwd } }, 5000).catch(() => {});
+        const r = await gateway.sendCmd({ sessionId, action: 'press', args: { key: 'Control+Enter', ..._fwd } }, 8000).catch(() => null);
+        sendClicked = !!r?.ok;
+      }
+      if (!sendClicked) {
+        return _envErr(action, sessionId, start, 'sendEmailWithVerification: all send strategies failed — could not locate or click Send button');
+      }
+
+      // 3. Post-send verify — compose closed or sent toast; "send anyway"
+      //    dialogs auto-accepted; error banners surfaced.
+      await new Promise(r => setTimeout(r, 1500));
+      let post = await _eval(_POST);
+      if (post?.sendAnyway) {
+        logger.info('[browser.ext] sendEmailWithVerification: "send anyway" dialog — auto-accepting');
+        await gateway.sendCmd({ sessionId, action: 'clickByText', args: { text: 'Send anyway', ..._fwd } }, 8000).catch(() => {});
+        await gateway.sendCmd({ sessionId, action: 'clickByText', args: { text: 'OK', ..._fwd } }, 5000).catch(() => {});
+        await new Promise(r => setTimeout(r, 1500));
+        post = await _eval(_POST);
+      }
+      if (post?.errText) {
+        return _envErr(action, sessionId, start, `sendEmailWithVerification: Gmail error after send — ${post.errText}`);
+      }
+      if (post && (post.sentToast || !post.composeOpen)) {
+        logger.info(`[browser.ext] sendEmailWithVerification: email sent (sentToast=${post.sentToast}, composeGone=${!post.composeOpen})`);
+        return _env(action, sessionId, start, { result: 'Email sent and verified successfully' });
+      }
+      if (!post) {
+        logger.warn('[browser.ext] sendEmailWithVerification: post-send probe failed — click succeeded, assuming sent');
+        return _env(action, sessionId, start, { result: 'Email sent (unverified — post-send probe failed)' });
+      }
+      return _envErr(action, sessionId, start, 'sendEmailWithVerification: compose window still open with no confirmation — send may not have fired');
+    }
+
     case 'resize':
       return _env(action, sessionId, start, { note: 'resize is a no-op on real browser tabs' });
 
