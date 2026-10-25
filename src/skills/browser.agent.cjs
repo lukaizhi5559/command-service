@@ -413,19 +413,36 @@ ${historyStr}${_contextBlock}
 
 Strategy? (0, 1, 2, or 3)`;
 
-  try {
-    const raw = await askWithMessages([
-      { role: 'system', content: systemPrompt },
-      { role: 'user', content: userPrompt },
-    ], { maxTokens: 10, temperature: 0.1, responseTimeoutMs: 10000 });
-    const num = parseInt((raw || '').trim().replace(/\D/g, ''), 10);
-    const result = [0, 1, 2, 3, 4].includes(num) ? num : 4;
-    logger.info(`[browser.agent] _decisionCall: strategy=${result} (raw="${(raw || '').trim()}")`);
-    return result;
-  } catch (e) {
-    logger.warn(`[browser.agent] _decisionCall failed: ${e.message} — defaulting to 4 (Tab-Map)`);
-    return 4;
-  }
+  const remotePick = async () => {
+    try {
+      const raw = await askWithMessages([
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: userPrompt },
+      ], { maxTokens: 10, temperature: 0.1, responseTimeoutMs: 10000 });
+      const num = parseInt((raw || '').trim().replace(/\D/g, ''), 10);
+      const result = [0, 1, 2, 3, 4].includes(num) ? num : 4;
+      logger.info(`[browser.agent] _decisionCall: strategy=${result} (raw="${(raw || '').trim()}")`);
+      return result;
+    } catch (e) {
+      logger.warn(`[browser.agent] _decisionCall failed: ${e.message} — defaulting to 4 (Tab-Map)`);
+      return 4;
+    }
+  };
+
+  // ── Local decision-model path: 5-way strategy pick as a choice question ──
+  const { boundedDecision } = require('../skill-helpers/decision.cjs');
+  return boundedDecision({
+    site: 'browserAgent.decisionCall',
+    questions: [{
+      id: 'strategy', type: 'choice',
+      question: 'What is the best next navigation strategy for this browser automation step? "done" = goal achieved; "just_type" = focused element is the right field, type into it; "meta_f_search" = find specific text on the page then click it; "app_shortcut" = press an app-specific keyboard shortcut; "tab_map" = scan all elements and pick one to interact with (default when unsure).',
+      options: ['done', 'just_type', 'meta_f_search', 'app_shortcut', 'tab_map'],
+    }],
+    state: userPrompt,
+    local: (a) => a.strategy?.index ?? null,
+    remote: remotePick,
+    logger,
+  });
 }
 
 // ── Canvas layout scan ─────────────────────────────────────────────────
@@ -1635,22 +1652,39 @@ ${historyStr}
 
 Number (0-5)?`;
 
-  try {
-    const raw = await askWithMessages([
-      { role: 'system', content: systemPrompt },
-      { role: 'user', content: userPrompt },
-    ], { maxTokens: 5, temperature: 0, responseTimeoutMs: 5000 });
-    const num = parseInt((raw || '').trim(), 10);
-    if (num >= 0 && num <= 5) {
-      logger.info(`[browser.agent] _extractAfterAction: ${num} for value="${String(value || '').slice(0, 40)}" field="${_focusedStr}"`);
-      return num;
+  const remotePick = async () => {
+    try {
+      const raw = await askWithMessages([
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: userPrompt },
+      ], { maxTokens: 5, temperature: 0, responseTimeoutMs: 5000 });
+      const num = parseInt((raw || '').trim(), 10);
+      if (num >= 0 && num <= 5) {
+        logger.info(`[browser.agent] _extractAfterAction: ${num} for value="${String(value || '').slice(0, 40)}" field="${_focusedStr}"`);
+        return num;
+      }
+      logger.info(`[browser.agent] _extractAfterAction: invalid "${raw}" → defaulting to 0`);
+      return 0;
+    } catch (e) {
+      logger.warn(`[browser.agent] _extractAfterAction failed: ${e.message}`);
+      return 0;
     }
-    logger.info(`[browser.agent] _extractAfterAction: invalid "${raw}" → defaulting to 0`);
-    return 0;
-  } catch (e) {
-    logger.warn(`[browser.agent] _extractAfterAction failed: ${e.message}`);
-    return 0;
-  }
+  };
+
+  // ── Local decision-model path: 6-way key pick as a choice question ──
+  const { boundedDecision } = require('../skill-helpers/decision.cjs');
+  return boundedDecision({
+    site: 'browserAgent.afterAction',
+    questions: [{
+      id: 'key', type: 'choice',
+      question: 'What key should be pressed AFTER typing this value into the focused field? "none" = no key after typing (default for multi-field forms); "enter" = submit/search send/message send; "tab" = move to next form field; "escape" = exit dropdown/menu/overlay; "shift_enter" = soft line break within a block; "arrow_down" = select first item in a dropdown (@mentions, slash commands).',
+      options: ['none', 'enter', 'tab', 'escape', 'shift_enter', 'arrow_down'],
+    }],
+    state: userPrompt,
+    local: (a) => a.key?.index ?? null,
+    remote: remotePick,
+    logger,
+  });
 }
 
 // Gesture type detection: returns a number indicating what kind of gesture is needed.
@@ -1690,22 +1724,39 @@ ${historyStr}
 
 Number (0-3)?`;
 
-  try {
-    const raw = await askWithMessages([
-      { role: 'system', content: systemPrompt },
-      { role: 'user', content: userPrompt },
-    ], { maxTokens: 5, temperature: 0, responseTimeoutMs: 5000 });
-    const num = parseInt((raw || '').trim().replace(/\D/g, ''), 10);
-    if (num >= 0 && num <= 3) {
-      logger.info(`[browser.agent] _extractGestureType: ${num} for goal="${String(goal || '').slice(0, 60)}"`);
-      return num;
+  const remotePick = async () => {
+    try {
+      const raw = await askWithMessages([
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: userPrompt },
+      ], { maxTokens: 5, temperature: 0, responseTimeoutMs: 5000 });
+      const num = parseInt((raw || '').trim().replace(/\D/g, ''), 10);
+      if (num >= 0 && num <= 3) {
+        logger.info(`[browser.agent] _extractGestureType: ${num} for goal="${String(goal || '').slice(0, 60)}"`);
+        return num;
+      }
+      logger.info(`[browser.agent] _extractGestureType: invalid "${raw}" → defaulting to 0`);
+      return 0;
+    } catch (e) {
+      logger.warn(`[browser.agent] _extractGestureType failed: ${e.message}`);
+      return 0;
     }
-    logger.info(`[browser.agent] _extractGestureType: invalid "${raw}" → defaulting to 0`);
-    return 0;
-  } catch (e) {
-    logger.warn(`[browser.agent] _extractGestureType failed: ${e.message}`);
-    return 0;
-  }
+  };
+
+  // ── Local decision-model path: 4-way gesture pick as a choice question ──
+  const { boundedDecision } = require('../skill-helpers/decision.cjs');
+  return boundedDecision({
+    site: 'browserAgent.gestureType',
+    questions: [{
+      id: 'gesture', type: 'choice',
+      question: 'What kind of gesture (if any) does this task need? "none" = regular typing/clicking/navigating; "drag_drop" = drag an element onto another element; "slider_horizontal" = drag a handle left/right; "slider_vertical" = drag a handle up/down.',
+      options: ['none', 'drag_drop', 'slider_horizontal', 'slider_vertical'],
+    }],
+    state: userPrompt,
+    local: (a) => a.gesture?.index ?? null,
+    remote: remotePick,
+    logger,
+  });
 }
 
 // Gesture target selection: picks source and target (or offset) from a Tab-Map.
@@ -1734,22 +1785,50 @@ Example: 5 12
 If either element is not in the list, use 0 for it.
 Output ONLY the two numbers.`;
 
-    try {
-      const raw = await askWithMessages([
-        { role: 'system', content: 'You pick two elements from a list. Output ONLY two numbers separated by a space: source target. Use 0 if not found.' },
-        { role: 'user', content: prompt },
-      ], { maxTokens: 10, temperature: 0, responseTimeoutMs: 8000 });
-      const nums = (raw || '').trim().split(/\s+/).map(n => parseInt(n.replace(/\D/g, ''), 10) || 0);
-      const srcId = nums[0] || 0;
-      const tgtId = nums[1] || 0;
-      const sourceEntry = srcId > 0 ? tabMap.find(e => e.id === srcId) : null;
-      const targetEntry = tgtId > 0 ? tabMap.find(e => e.id === tgtId) : null;
-      logger.info(`[browser.agent] _extractGestureTargets (drag-drop): src=#${srcId}, tgt=#${tgtId}`);
-      return { sourceEntry, targetEntry, offset: 0 };
-    } catch (e) {
-      logger.warn(`[browser.agent] _extractGestureTargets (drag-drop) failed: ${e.message}`);
-      return null;
+    const remotePick = async () => {
+      try {
+        const raw = await askWithMessages([
+          { role: 'system', content: 'You pick two elements from a list. Output ONLY two numbers separated by a space: source target. Use 0 if not found.' },
+          { role: 'user', content: prompt },
+        ], { maxTokens: 10, temperature: 0, responseTimeoutMs: 8000 });
+        const nums = (raw || '').trim().split(/\s+/).map(n => parseInt(n.replace(/\D/g, ''), 10) || 0);
+        const srcId = nums[0] || 0;
+        const tgtId = nums[1] || 0;
+        const sourceEntry = srcId > 0 ? tabMap.find(e => e.id === srcId) : null;
+        const targetEntry = tgtId > 0 ? tabMap.find(e => e.id === tgtId) : null;
+        logger.info(`[browser.agent] _extractGestureTargets (drag-drop): src=#${srcId}, tgt=#${tgtId}`);
+        return { sourceEntry, targetEntry, offset: 0 };
+      } catch (e) {
+        logger.warn(`[browser.agent] _extractGestureTargets (drag-drop) failed: ${e.message}`);
+        return null;
+      }
+    };
+
+    // ── Local decision-model path: two choice picks over the element list ──
+    // systemone choice caps at 26 options — remote stays for larger tabMaps.
+    if (tabMap.length <= 25) {
+      const { boundedDecision } = require('../skill-helpers/decision.cjs');
+      const _opts = [...tabMap.map(e => `#${e.id} ${e.tag || 'element'}${e.text ? ` "${String(e.text).substring(0, 50)}"` : ''}`), 'none'];
+      return boundedDecision({
+        site: 'browserAgent.gestureTargetsDrag',
+        questions: [
+          { id: 'source', type: 'choice', question: 'Which element should be DRAGGED for this task? Pick "none" if not in the list.', options: _opts },
+          { id: 'target', type: 'choice', question: 'Which element should it be DROPPED ON? Pick "none" if not in the list.', options: _opts },
+        ],
+        state: prompt,
+        local: (a) => {
+          const si = a.source?.index, ti = a.target?.index;
+          if (si == null && ti == null) return null;
+          const sourceEntry = (si != null && si < tabMap.length) ? tabMap[si] : null;
+          const targetEntry = (ti != null && ti < tabMap.length) ? tabMap[ti] : null;
+          logger.info(`[browser.agent] _extractGestureTargets (drag-drop, local): src=#${sourceEntry?.id || 0}, tgt=#${targetEntry?.id || 0}`);
+          return { sourceEntry, targetEntry, offset: 0 };
+        },
+        remote: remotePick,
+        logger,
+      });
     }
+    return remotePick();
   }
 
   if (gestureType === 2 || gestureType === 3) {
@@ -1764,29 +1843,65 @@ ${listStr}
 Which element is the slider handle to drag?
 Output ONLY the element number, or 0 if not found.`;
 
-    try {
-      const raw = await askWithMessages([
-        { role: 'system', content: 'You pick the slider handle from a list. Output ONLY the number, or 0 if not found.' },
-        { role: 'user', content: prompt },
-      ], { maxTokens: 5, temperature: 0, responseTimeoutMs: 5000 });
-      const srcId = parseInt((raw || '').trim().replace(/\D/g, ''), 10) || 0;
-      const sourceEntry = srcId > 0 ? tabMap.find(e => e.id === srcId) : null;
+    const remotePick = async () => {
+      try {
+        const raw = await askWithMessages([
+          { role: 'system', content: 'You pick the slider handle from a list. Output ONLY the number, or 0 if not found.' },
+          { role: 'user', content: prompt },
+        ], { maxTokens: 5, temperature: 0, responseTimeoutMs: 5000 });
+        const srcId = parseInt((raw || '').trim().replace(/\D/g, ''), 10) || 0;
+        const sourceEntry = srcId > 0 ? tabMap.find(e => e.id === srcId) : null;
 
-      // Compute offset from percentage if found, else default 100px
-      let finalOffset = 100;
-      if (pctMatch && sourceEntry) {
-        const pct = parseFloat(pctMatch[1]);
-        const sliderWidth = sourceEntry.w || 200;
-        // Offset from center to target percentage position
-        finalOffset = Math.round((pct / 100) * sliderWidth - sliderWidth / 2);
+        // Compute offset from percentage if found, else default 100px
+        let finalOffset = 100;
+        if (pctMatch && sourceEntry) {
+          const pct = parseFloat(pctMatch[1]);
+          const sliderWidth = sourceEntry.w || 200;
+          // Offset from center to target percentage position
+          finalOffset = Math.round((pct / 100) * sliderWidth - sliderWidth / 2);
+        }
+
+        logger.info(`[browser.agent] _extractGestureTargets (slider): handle=#${srcId}, offset=${finalOffset}px${pctMatch ? ` (from ${pctMatch[1]}%)` : ' (default)'}`);
+        return { sourceEntry, targetEntry: null, offset: finalOffset };
+      } catch (e) {
+        logger.warn(`[browser.agent] _extractGestureTargets (slider) failed: ${e.message}`);
+        return null;
       }
+    };
 
-      logger.info(`[browser.agent] _extractGestureTargets (slider): handle=#${srcId}, offset=${finalOffset}px${pctMatch ? ` (from ${pctMatch[1]}%)` : ' (default)'}`);
-      return { sourceEntry, targetEntry: null, offset: finalOffset };
-    } catch (e) {
-      logger.warn(`[browser.agent] _extractGestureTargets (slider) failed: ${e.message}`);
-      return null;
+    // ── Local decision-model path: choice pick over the element list ──
+    if (tabMap.length <= 25) {
+      const { boundedDecision } = require('../skill-helpers/decision.cjs');
+      const _opts = [...tabMap.map(e => `#${e.id} ${e.tag || 'element'}${e.text ? ` "${String(e.text).substring(0, 50)}"` : ''}`), 'none'];
+      const picked = await boundedDecision({
+        site: 'browserAgent.gestureTargetSlider',
+        questions: [{ id: 'handle', type: 'choice', question: 'Which element is the slider handle to drag? Pick "none" if not in the list.', options: _opts }],
+        state: prompt,
+        local: (a) => {
+          const i = a.handle?.index;
+          if (i == null) return null;                       // no answer → remote
+          if (i >= tabMap.length) return 'NONE';            // explicit 'none'
+          return tabMap[i];
+        },
+        remote: remotePick,
+        logger,
+      });
+      if (picked === 'NONE') return { sourceEntry: null, targetEntry: null, offset: 0 };
+      if (picked && typeof picked === 'object' && picked.id != null && !picked.sourceEntry) {
+        const sourceEntry = picked;
+        let finalOffset = 100;
+        if (pctMatch) {
+          const pct = parseFloat(pctMatch[1]);
+          const sliderWidth = sourceEntry.w || 200;
+          finalOffset = Math.round((pct / 100) * sliderWidth - sliderWidth / 2);
+        }
+        logger.info(`[browser.agent] _extractGestureTargets (slider, local): handle=#${sourceEntry.id}, offset=${finalOffset}px`);
+        return { sourceEntry, targetEntry: null, offset: finalOffset };
+      }
+      // remotePick's { sourceEntry, targetEntry, offset } or null
+      return picked;
     }
+    return remotePick();
   }
 
   return null;
@@ -1938,21 +2053,42 @@ Number (0-2)?`;
       }
     }
 
-    const raw = await askWithMessages([
-      { role: 'system', content: systemPrompt },
-      { role: 'user', content: userPrompt },
-    ], { maxTokens: 5, temperature: 0, responseTimeoutMs: 5000, taskType: 'classification' });
-    // Tolerant parser: the LLM may return prose like "The answer is 1" instead of
-    // just "1". Extract the first standalone digit 0/1/2 from the response.
-    const _cleanRaw = (raw || '').toLowerCase().trim();
-    // Empty/null response = LLM provider failure (transient) — return wait/retry
-    // so the caller retries instead of treating it as a hard goal failure.
-    if (!_cleanRaw) {
-      logger.warn(`[browser.agent] _ocrVerifyGoal: empty LLM response — returning wait/retry (transient provider failure)`);
-      return { num: 2, reason: 'llm-empty-response' };
-    }
-    const _numMatch = _cleanRaw.match(/\b([012])\b/);
-    const num = _numMatch ? parseInt(_numMatch[1], 10) : NaN;
+    const remoteVerdict = async () => {
+      const raw = await askWithMessages([
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: userPrompt },
+      ], { maxTokens: 5, temperature: 0, responseTimeoutMs: 5000, taskType: 'classification' });
+      // Tolerant parser: the LLM may return prose like "The answer is 1" instead of
+      // just "1". Extract the first standalone digit 0/1/2 from the response.
+      const _cleanRaw = (raw || '').toLowerCase().trim();
+      // Empty/null response = LLM provider failure (transient) — return wait/retry
+      // so the caller retries instead of treating it as a hard goal failure.
+      if (!_cleanRaw) {
+        logger.warn(`[browser.agent] _ocrVerifyGoal: empty LLM response — returning wait/retry (transient provider failure)`);
+        return 2;
+      }
+      const _numMatch = _cleanRaw.match(/\b([012])\b/);
+      const n = _numMatch ? parseInt(_numMatch[1], 10) : NaN;
+      if (!(n >= 0 && n <= 2)) {
+        logger.info(`[browser.agent] _ocrVerifyGoal: invalid "${raw}" → defaulting to 0`);
+      }
+      return (n >= 0 && n <= 2) ? n : 0;
+    };
+
+    // ── Local decision-model path: 3-way verdict as a choice question ──
+    const { boundedDecision } = require('../skill-helpers/decision.cjs');
+    const num = await boundedDecision({
+      site: 'browserAgent.ocrVerifyGoal',
+      questions: [{
+        id: 'verdict', type: 'choice',
+        question: 'Does the page text show the goal was achieved? "failed" = goal NOT achieved, blocked, or named item missing; "achieved" = goal done; "loading" = ONLY on explicit loading indicators ("Loading...", "Please wait", spinner, progress bar) — stable open dropdowns/forms are NOT loading.',
+        options: ['failed', 'achieved', 'loading'],
+      }],
+      state: userPrompt,
+      local: (a) => a.verdict?.index ?? null,
+      remote: remoteVerdict,
+      logger,
+    });
     if (num >= 0 && num <= 2) {
       // For failures (0), ask LLM for a descriptive reason
       let _reason = num === 1 ? 'goal-achieved' : (num === 2 ? 'loading' : 'ocr-failed');
@@ -1985,8 +2121,7 @@ Number (0-2)?`;
       logger.info(`[browser.agent] _ocrVerifyGoal: ${num} reason="${_reason}" for goal="${String(goal || '').slice(0, 60)}"`);
       return { num, reason: _reason };
     }
-    logger.info(`[browser.agent] _ocrVerifyGoal: invalid "${raw}" → defaulting to 0`);
-    return { num: 0, reason: 'invalid-llm-response' };
+    return { num: 0, reason: 'invalid-verdict-response' };
   } catch (e) {
     // Distinguish LLM provider failures (transient) from genuine goal failures.
     // When the LLM provider itself fails (e.g., "All LLM providers failed"),
@@ -2504,21 +2639,37 @@ ${(ocrText || '').slice(0, 300)}
 
 Number (0-1)?`;
 
-  try {
-    const raw = await askWithMessages([
-      { role: 'system', content: systemPrompt },
-      { role: 'user', content: userPrompt },
-    ], { maxTokens: 5, temperature: 0, responseTimeoutMs: 3000, taskType: 'classification' });
-    const num = parseInt((raw || '').trim().replace(/\D/g, ''), 10);
-    if (num === 0 || num === 1) {
-      logger.info(`[browser.agent] _ocrDetectLoading: ${num}`);
-      return num;
+  const remotePick = async () => {
+    try {
+      const raw = await askWithMessages([
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: userPrompt },
+      ], { maxTokens: 5, temperature: 0, responseTimeoutMs: 3000, taskType: 'classification' });
+      const num = parseInt((raw || '').trim().replace(/\D/g, ''), 10);
+      if (num === 0 || num === 1) {
+        logger.info(`[browser.agent] _ocrDetectLoading: ${num}`);
+        return num;
+      }
+      return 0;
+    } catch (e) {
+      logger.warn(`[browser.agent] _ocrDetectLoading failed: ${e.message}`);
+      return 0;
     }
-    return 0;
-  } catch (e) {
-    logger.warn(`[browser.agent] _ocrDetectLoading failed: ${e.message}`);
-    return 0;
-  }
+  };
+
+  // ── Local decision-model path: loading yes/no as a noul question ──
+  const { boundedDecision } = require('../skill-helpers/decision.cjs');
+  return boundedDecision({
+    site: 'browserAgent.ocrDetectLoading',
+    questions: [{
+      id: 'loading', type: 'noul',
+      question: 'Is this page still loading or processing (spinner, progress bar, "loading"/"please wait" text, partial/skeleton content)? true = still loading; false = fully rendered, ready for interaction.',
+    }],
+    state: userPrompt,
+    local: (a) => a.loading?.bool == null ? null : (a.loading.bool ? 1 : 0),
+    remote: remotePick,
+    logger,
+  });
 }
 
 // Pick an OCR row by number — replaces JSON-based pickOverlayAction for simple selection.
@@ -2543,25 +2694,50 @@ ${listStr}
 
 Which row number matches the goal? (0 if none)`;
 
-  try {
-    const raw = await askWithMessages([
-      { role: 'system', content: systemPrompt },
-      { role: 'user', content: userPrompt },
-    ], { maxTokens: 5, temperature: 0, responseTimeoutMs: 5000 });
-    const num = parseInt((raw || '').trim().replace(/\D/g, ''), 10) || 0;
-    if (num > 0) {
-      const row = ocrRows.find(r => r.id === num);
-      if (row) {
-        logger.info(`[browser.agent] _ocrPickRow: ${num} ("${row.text}") for goal="${String(goal || '').slice(0, 60)}"`);
-        return num;
+  const remotePick = async () => {
+    try {
+      const raw = await askWithMessages([
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: userPrompt },
+      ], { maxTokens: 5, temperature: 0, responseTimeoutMs: 5000 });
+      const num = parseInt((raw || '').trim().replace(/\D/g, ''), 10) || 0;
+      if (num > 0) {
+        const row = ocrRows.find(r => r.id === num);
+        if (row) {
+          logger.info(`[browser.agent] _ocrPickRow: ${num} ("${row.text}") for goal="${String(goal || '').slice(0, 60)}"`);
+          return num;
+        }
       }
+      logger.info(`[browser.agent] _ocrPickRow: ${num} (no match) for goal="${String(goal || '').slice(0, 60)}"`);
+      return 0;
+    } catch (e) {
+      logger.warn(`[browser.agent] _ocrPickRow failed: ${e.message}`);
+      return 0;
     }
-    logger.info(`[browser.agent] _ocrPickRow: ${num} (no match) for goal="${String(goal || '').slice(0, 60)}"`);
-    return 0;
-  } catch (e) {
-    logger.warn(`[browser.agent] _ocrPickRow failed: ${e.message}`);
-    return 0;
+  };
+
+  // ── Local decision-model path: choice pick over the row list ──
+  // systemone choice caps at 26 options — remote stays for larger lists.
+  if (ocrRows.length <= 25) {
+    const { boundedDecision } = require('../skill-helpers/decision.cjs');
+    return boundedDecision({
+      site: 'browserAgent.ocrPickRow',
+      questions: [{
+        id: 'row', type: 'choice',
+        question: 'Which row best matches the goal? Pick "none" if no row matches.',
+        options: [...ocrRows.map(r => `#${r.id} "${String(r.text || '').slice(0, 60)}"${r.type ? ` [${r.type}]` : ''}`), 'none'],
+      }],
+      state: userPrompt,
+      local: (a) => {
+        const i = a.row?.index;
+        if (i == null) return null;
+        return (i < ocrRows.length) ? ocrRows[i].id : 0;
+      },
+      remote: remotePick,
+      logger,
+    });
   }
+  return remotePick();
 }
 
 // Page state classification using OCR text.
@@ -2616,22 +2792,39 @@ ${historyStr}
 
 Number (0-4)?`;
 
-  try {
-    const raw = await askWithMessages([
-      { role: 'system', content: systemPrompt },
-      { role: 'user', content: userPrompt },
-    ], { maxTokens: 5, temperature: 0, responseTimeoutMs: 5000, taskType: 'classification' });
-    const num = parseInt((raw || '').trim().replace(/\D/g, ''), 10);
-    if (num >= 0 && num <= 4) {
-      logger.info(`[browser.agent] _ocrClassifyState: ${num} for goal="${String(goal || '').slice(0, 60)}"`);
-      return num;
+  const remotePick = async () => {
+    try {
+      const raw = await askWithMessages([
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: userPrompt },
+      ], { maxTokens: 5, temperature: 0, responseTimeoutMs: 5000, taskType: 'classification' });
+      const num = parseInt((raw || '').trim().replace(/\D/g, ''), 10);
+      if (num >= 0 && num <= 4) {
+        logger.info(`[browser.agent] _ocrClassifyState: ${num} for goal="${String(goal || '').slice(0, 60)}"`);
+        return num;
+      }
+      logger.info(`[browser.agent] _ocrClassifyState: invalid "${raw}" → defaulting to 3`);
+      return 3;
+    } catch (e) {
+      logger.warn(`[browser.agent] _ocrClassifyState failed: ${e.message}`);
+      return 3;
     }
-    logger.info(`[browser.agent] _ocrClassifyState: invalid "${raw}" → defaulting to 3`);
-    return 3;
-  } catch (e) {
-    logger.warn(`[browser.agent] _ocrClassifyState failed: ${e.message}`);
-    return 3;
-  }
+  };
+
+  // ── Local decision-model path: 5-way page state as a choice question ──
+  const { boundedDecision } = require('../skill-helpers/decision.cjs');
+  return boundedDecision({
+    site: 'browserAgent.ocrClassifyState',
+    questions: [{
+      id: 'state', type: 'choice',
+      question: 'What is the page state? "error" = error messages/validation failures; "done" = goal achieved, expected result visible; "loading" = still processing, spinner/please wait; "ready" = normal page content, ready for next action (default when unsure); "unexpected" = something blocking — login wall, unexpected modal, wrong page.',
+      options: ['error', 'done', 'loading', 'ready', 'unexpected'],
+    }],
+    state: userPrompt,
+    local: (a) => a.state?.index ?? null,
+    remote: remotePick,
+    logger,
+  });
 }
 
 // Field-type decision: determines WHAT KIND of typing a field needs.
@@ -2705,21 +2898,38 @@ Recent actions: ${historyStr || '(none)'}${_contextBlock}
 
 Field type?`;
 
-  try {
-    const raw = await askWithMessages([
-      { role: 'system', content: systemPrompt },
-      { role: 'user', content: userPrompt },
-    ], { maxTokens: 20, temperature: 0.1, responseTimeoutMs: 8000 });
-    const val = (raw || '').trim().toLowerCase();
-    const valid = ['type-plain', 'type-edit', 'type-commands', 'type-search', 'type-list-item'];
-    const match = valid.find(v => val.includes(v));
-    const result = match || 'type-plain';
-    logger.info(`[browser.agent] _extractFieldType: LLM → ${result} (raw="${val}") — pageCategory=${pageCategory || 'unknown'}, url=${pageContext.url || 'unknown'}`);
-    return result;
-  } catch (e) {
-    logger.warn(`[browser.agent] _extractFieldType LLM failed: ${e.message} — defaulting to type-plain`);
-    return 'type-plain';
-  }
+  const remotePick = async () => {
+    try {
+      const raw = await askWithMessages([
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: userPrompt },
+      ], { maxTokens: 20, temperature: 0.1, responseTimeoutMs: 8000 });
+      const val = (raw || '').trim().toLowerCase();
+      const valid = ['type-plain', 'type-edit', 'type-commands', 'type-search', 'type-list-item'];
+      const match = valid.find(v => val.includes(v));
+      const result = match || 'type-plain';
+      logger.info(`[browser.agent] _extractFieldType: LLM → ${result} (raw="${val}") — pageCategory=${pageCategory || 'unknown'}, url=${pageContext.url || 'unknown'}`);
+      return result;
+    } catch (e) {
+      logger.warn(`[browser.agent] _extractFieldType LLM failed: ${e.message} — defaulting to type-plain`);
+      return 'type-plain';
+    }
+  };
+
+  // ── Local decision-model path: 5-way field-type pick as a choice question ──
+  const { boundedDecision } = require('../skill-helpers/decision.cjs');
+  return boundedDecision({
+    site: 'browserAgent.fieldType',
+    questions: [{
+      id: 'ftype', type: 'choice',
+      question: 'What KIND of typing does this focused field need? "type-plain" = type value as-is then submit (search boxes, chat inputs, social posts, comments, simple form fields, titles — safest default); "type-edit" = long-form content creation/editing in a document or code editor; "type-commands" = value starts with "/" opening a block/command menu; "type-search" = value filters a dynamic dropdown (@mentions, pickers); "type-list-item" = todo/checklist/task item where Enter creates the next item.',
+      options: ['type-plain', 'type-edit', 'type-commands', 'type-search', 'type-list-item'],
+    }],
+    state: userPrompt,
+    local: (a) => a.ftype?.label ?? null,
+    remote: remotePick,
+    logger,
+  });
 }
 
 // Command plan extraction: for type-commands (e.g. "/todo Buy milk" → trigger="/todo", commandLabel="To-do list", content="Buy milk")
@@ -2867,18 +3077,36 @@ async function _extractEditMode(goal, focusedElement, currentValue, agentContext
   const { askWithMessages } = require('../skill-helpers/skill-llm.cjs');
   const _contextBlock = agentContext ? `\n\nAgent context:\n${String(agentContext).slice(0, 500)}` : '';
 
-  try {
-    const raw = await askWithMessages([
-      { role: 'system', content: 'Determine if the goal is about generating new content or editing existing content. Return ONLY "generate" or "edit".' },
-      { role: 'user', content: `Goal: ${goal}\nField has existing content: ${currentValue ? `yes (${currentValue.length} chars)` : 'no'}${_contextBlock}\n\nMode?` },
-    ], { maxTokens: 10, temperature: 0.1, responseTimeoutMs: 5000 });
-    const mode = (raw || '').trim().toLowerCase().startsWith('edit') ? 'edit' : 'generate';
-    logger.info(`[browser.agent] _extractEditMode: LLM → ${mode} (raw="${(raw || '').trim()}")`);
-    return mode;
-  } catch (e) {
-    logger.warn(`[browser.agent] _extractEditMode LLM failed: ${e.message} — defaulting to generate`);
-    return 'generate';
-  }
+  const userPrompt = `Goal: ${goal}\nField has existing content: ${currentValue ? `yes (${currentValue.length} chars)` : 'no'}${_contextBlock}\n\nMode?`;
+
+  const remotePick = async () => {
+    try {
+      const raw = await askWithMessages([
+        { role: 'system', content: 'Determine if the goal is about generating new content or editing existing content. Return ONLY "generate" or "edit".' },
+        { role: 'user', content: userPrompt },
+      ], { maxTokens: 10, temperature: 0.1, responseTimeoutMs: 5000 });
+      const mode = (raw || '').trim().toLowerCase().startsWith('edit') ? 'edit' : 'generate';
+      logger.info(`[browser.agent] _extractEditMode: LLM → ${mode} (raw="${(raw || '').trim()}")`);
+      return mode;
+    } catch (e) {
+      logger.warn(`[browser.agent] _extractEditMode LLM failed: ${e.message} — defaulting to generate`);
+      return 'generate';
+    }
+  };
+
+  // ── Local decision-model path: generate-vs-edit as a noul question ──
+  const { boundedDecision } = require('../skill-helpers/decision.cjs');
+  return boundedDecision({
+    site: 'browserAgent.editMode',
+    questions: [{
+      id: 'isEdit', type: 'noul',
+      question: 'Is the goal about editing/modifying EXISTING content in this field (fix, update, rewrite, refactor) rather than generating new content from scratch? true = edit; false = generate.',
+    }],
+    state: userPrompt,
+    local: (a) => a.isEdit?.bool == null ? null : (a.isEdit.bool ? 'edit' : 'generate'),
+    remote: remotePick,
+    logger,
+  });
 }
 
 // Search text extraction: what text to search for via Meta+F.
@@ -3403,25 +3631,53 @@ ${shortcutList}
 
 Which action? (return number or 0 for none)`;
 
-  try {
-    const raw = await askWithMessages([
-      { role: 'system', content: systemPrompt },
-      { role: 'user', content: userPrompt },
-    ], { maxTokens: 30, temperature: 0.1, responseTimeoutMs: 10000 });
-    const val = (raw || '').trim();
-    // Strict parse: the response must be a bare integer. Prose like
-    // "I would pick action 3 because..." could mislead parseInt — reject it.
-    const num = /^\d{1,3}$/.test(val) ? parseInt(val, 10) : NaN;
-    const _src = num >= 1 && num <= _allItems.length ? _allItems[num - 1].source : '?';
-    logger.info(`[browser.agent] _extractShortcut: LLM picked "${val}" (parsed: ${num}) from ${_allItems.length} actions (global=${_globalKeys.length}, app=${appShortcuts.length}, category=${_catKeys.length}, picked source=${_src})`);
-    if (!num || num < 1 || num > _allItems.length) return null;
-    const picked = _allItems[num - 1];
-    logger.info(`[browser.agent] _extractShortcut: → "${picked.key}" (${picked.desc.slice(0, 60)}, source=${picked.source})`);
-    return { key: picked.key, entryId: picked.entryId };
-  } catch (e) {
-    logger.warn(`[browser.agent] _extractShortcut failed: ${e.message}`);
-    return null;
+  const remotePick = async () => {
+    try {
+      const raw = await askWithMessages([
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: userPrompt },
+      ], { maxTokens: 30, temperature: 0.1, responseTimeoutMs: 10000 });
+      const val = (raw || '').trim();
+      // Strict parse: the response must be a bare integer. Prose like
+      // "I would pick action 3 because..." could mislead parseInt — reject it.
+      const num = /^\d{1,3}$/.test(val) ? parseInt(val, 10) : NaN;
+      const _src = num >= 1 && num <= _allItems.length ? _allItems[num - 1].source : '?';
+      logger.info(`[browser.agent] _extractShortcut: LLM picked "${val}" (parsed: ${num}) from ${_allItems.length} actions (global=${_globalKeys.length}, app=${appShortcuts.length}, category=${_catKeys.length}, picked source=${_src})`);
+      if (!num || num < 1 || num > _allItems.length) return null;
+      const picked = _allItems[num - 1];
+      logger.info(`[browser.agent] _extractShortcut: → "${picked.key}" (${picked.desc.slice(0, 60)}, source=${picked.source})`);
+      return { key: picked.key, entryId: picked.entryId };
+    } catch (e) {
+      logger.warn(`[browser.agent] _extractShortcut failed: ${e.message}`);
+      return null;
+    }
+  };
+
+  // ── Local decision-model path: choice pick over the action list ──
+  // systemone choice caps at 26 options — remote stays for larger lists.
+  if (_allItems.length <= 25) {
+    const { boundedDecision } = require('../skill-helpers/decision.cjs');
+    return boundedDecision({
+      site: 'browserAgent.extractShortcut',
+      questions: [{
+        id: 'action', type: 'choice',
+        question: 'Which keyboard action directly accomplishes the NEXT sub-goal? Pick "none" if no action applies (e.g. a cell needs a value typed — typing is not a shortcut action).',
+        options: [..._allItems.map(it => it.desc), 'none'],
+      }],
+      state: userPrompt,
+      local: (a) => {
+        const i = a.action?.index;
+        if (i == null) return null;
+        if (i >= _allItems.length) return 'NONE';
+        const picked = _allItems[i];
+        logger.info(`[browser.agent] _extractShortcut (local): → "${picked.key}" (${picked.desc.slice(0, 60)}, source=${picked.source})`);
+        return { key: picked.key, entryId: picked.entryId };
+      },
+      remote: remotePick,
+      logger,
+    }).then(v => (v === 'NONE' ? null : v));
   }
+  return remotePick();
 }
 
 // Parse JSON from LLM output — delegates to the shared parseLlmJson utility
@@ -7780,6 +8036,43 @@ async function _buildGenericSearchUrl(serviceKey, baseHost, task) {
   }
 }
 
+// ── Cached-URL verdict — tev1 'noul' confirms a cached destination actually
+// serves the task before we navigate to it. Deterministic guards (auth-wall,
+// host-family, utility/NL path, score) run first for the known poison classes;
+// this catches everything else — fabricated paths that look structurally
+// valid, wrong-surface URLs, stale entries. Fail-open: the cache is a
+// performance path — a down decision service must not stall navigation.
+async function _verdictCachedUrl({ task, intent, url, host, source }) {
+  // Deterministic pre-verdict — a deep-link carrying an embedded date that is
+  // already in the past is fabricated/stale (observed: dates=20231026 for a
+  // "tomorrow" task — year 2023). Calendar ignores it and defaults to the
+  // next hour → wrong time. Reject before the model ever sees it.
+  const _dm = String(url || '').match(/[?&](?:dates?|start|dtstart)=(\d{4})(\d{2})(\d{2})/);
+  if (_dm) {
+    const _stamp = Date.UTC(+_dm[1], +_dm[2] - 1, +_dm[3]);
+    if (_stamp < Date.now() - 86400000) {
+      logger.info(`[browser.agent] deep-link verdict: rejecting past-dated url (${_dm[0].slice(0, 30)}) — fabricated/stale date`);
+      return 'skip';
+    }
+  }
+  try {
+    const { boundedDecision, askDecision } = require('../skill-helpers/decision.cjs');
+    const v = await boundedDecision({
+      site: 'deeplink.verdict',
+      askDecision,
+      questions: [{
+        id: 'fit', type: 'noul',
+        question: `Task: "${String(task || '').slice(0, 140)}" (intent: ${intent || 'unknown'}). Cached destination: ${url}. Does this URL correctly serve the task? true = correct destination page; false = wrong or poisoned (login/auth page, fabricated path, unrelated surface).`,
+      }],
+      state: `host=${host || ''} source=${source || ''}`,
+      local: (a) => (a.fit?.bool == null ? null : a.fit.bool),
+      remote: async () => true, // decision down → deterministic guards ran → use
+      logger,
+    });
+    return v === true ? 'use' : 'skip';
+  } catch (_) { return 'use'; }
+}
+
 /**
  * Browser-independent deep-link resolution — the cheap tiers of
  * _resolveTaskDeepLink: preflight URL passthrough, appKnowledge intent_url,
@@ -7812,8 +8105,16 @@ async function _resolveCheapDeepLink(agentId, serviceKey, baseStartUrl, task, ex
         catch (_) { return serviceKey; }
       })();
       if (_existingHost && (_existingHost === _baseHost || _existingHost.endsWith('.' + _baseHost) || _baseHost.endsWith('.' + _existingHost))) {
-        logger.info(`[browser.agent] deep-link: using pre-resolved deepLinkUrl for ${agentId}: ${existingDeepLinkUrl}`);
-        return { url: existingDeepLinkUrl, source: 'preflight', intent: null, needsPromote: false };
+        // Fabricated-date guard — a preflight/plan-emitted URL carrying a
+        // past embedded date (dates=20231026 for "tomorrow") is stale; fall
+        // through to real resolution so buildUrl rebuilds it correctly.
+        const _edm = String(existingDeepLinkUrl).match(/[?&](?:dates?|start|dtstart)=(\d{4})(\d{2})(\d{2})/);
+        if (_edm && Date.UTC(+_edm[1], +_edm[2] - 1, +_edm[3]) < Date.now() - 86400000) {
+          logger.warn(`[browser.agent] deep-link: pre-resolved url has past-dated param (${_edm[0].slice(0, 30)}) — falling through to resolution`);
+        } else {
+          logger.info(`[browser.agent] deep-link: using pre-resolved deepLinkUrl for ${agentId}: ${existingDeepLinkUrl}`);
+          return { url: existingDeepLinkUrl, source: 'preflight', intent: null, needsPromote: false };
+        }
       }
     }
 
@@ -7837,8 +8138,19 @@ async function _resolveCheapDeepLink(agentId, serviceKey, baseStartUrl, task, ex
     // deep-link (?compose=new). "Compose/send an email" reliably classifies as
     // content_create (write/compose verbs) — reclassify so the mail template
     // wins instead of a discovery/cache path that has no mail template.
-    if (intent === INTENTS.CONTENT_CREATE) {
-      const _mailSvc = lookupBrowserService(serviceKey);
+    // Mail-family services + compose phrasing must always resolve to the
+    // compose deep-link (?compose=new). Draft-only phrasing ("draft it, do
+    // not send") often classifies as SEARCH or nothing at all — observed: a
+    // "send an email… draft it" task landed on a Gmail SEARCH page, the
+    // composer never opened, and the task hallucinated a send. Any intent
+    // (or none) yields to mail when the service declares it and the task
+    // carries compose verbs.
+    const _mailSvc = lookupBrowserService(serviceKey);
+    if (_isMailSvc && _mailSvc?.intentUrls?.mail && intent !== 'mail'
+        && /\b(e-?mail|compose|send\b|draft|recipient)/i.test(task || '')) {
+      logger.info(`[browser.agent] deep-link: reclassified ${intent || 'none'} → mail for ${serviceKey} (mail service + compose phrasing)`);
+      intent = 'mail';
+    } else if (intent === INTENTS.CONTENT_CREATE) {
       if (_mailSvc?.intentUrls?.mail && /\b(e-?mail|compose|send\b)/i.test(task || '')) {
         logger.info(`[browser.agent] deep-link: reclassified content_create → mail for ${serviceKey} (service declares mail intent)`);
         intent = 'mail';
@@ -7854,6 +8166,50 @@ async function _resolveCheapDeepLink(agentId, serviceKey, baseStartUrl, task, ex
 
     // Compute criteria-task status before the appKnowledge/keyword checks reference it.
     const _isCriteriaTask = _isSearchCriteriaTask(task, _dlTaskCls);
+
+    // Step -2: Service affinity — a sub-service named in the task outranks
+    // the umbrella service's keyspace. Canonicalization collapses
+    // google_calendar.agent → google.agent, so a calendar task resolves under
+    // 'google' whose cache is a grab-bag (observed: poisoned ServiceLogin +
+    // fabricated /r/day/week/nextweek/5am served while calendar.google.com
+    // held the correct eventedit URL). Consult the affinity service's code
+    // template + verified intent_url FIRST.
+    if (!_isCriteriaTask && intent && intent !== INTENTS.HOME && serviceKey === 'google') {
+      const _AFFINITY = {
+        'google calendar': 'googlecalendar', calendar: 'googlecalendar',
+        gmail: 'gmail', mail: 'gmail',
+        'google docs': 'googledocs', docs: 'googledocs', document: 'googledocs',
+        'google sheets': 'googlesheets', sheets: 'googlesheets', spreadsheet: 'googlesheets',
+        youtube: 'youtube',
+      };
+      const _tl = ` ${String(task || '').toLowerCase()} `;
+      const _affKey = Object.keys(_AFFINITY).find(k => _tl.includes(` ${k} `));
+      const _affSvc = _affKey ? lookupBrowserService(_AFFINITY[_affKey]) : null;
+      if (_affSvc) {
+        try {
+          const _affHost = (_affSvc.hostAliases && _affSvc.hostAliases[0])
+            || new URL(_affSvc.startUrl).hostname.replace(/^www\./, '');
+          const { loadIntentUrl } = require('./lib/appKnowledge.cjs');
+          // Code template first — buildUrl prefills the task's title/dates
+          // (the eventedit?action=TEMPLATE&text=…&dates=… URL).
+          const _tmpl = _affSvc.intentUrls?.[intent];
+          let _affUrl = null;
+          try {
+            if (typeof _tmpl === 'string') _affUrl = _tmpl;
+            else if (_tmpl?.buildUrl) _affUrl = _tmpl.buildUrl(task, { task, encodedQuery: '', dest: null });
+            else if (_tmpl?.url) _affUrl = _tmpl.url;
+          } catch (_) {}
+          if (!_affUrl) _affUrl = loadIntentUrl(_affHost, intent)?.url || null;
+          if (_affUrl && _isValidDeepLinkUrl(_affUrl)
+              && _deepLinkHostAllowed(_hostOfUrl(_affUrl), _affHost, _affSvc)
+              && !_isSigninWall(_affUrl)
+              && await _verdictCachedUrl({ task, intent, url: _affUrl, host: _affHost, source: 'affinity' }) === 'use') {
+            logger.info(`[browser.agent] deep-link: service-affinity ${serviceKey}→${_affKey}: ${_affUrl}`);
+            return { url: _affUrl, source: 'affinity', intent, isCriteriaTask: _isCriteriaTask, baseHost: _affHost, taskKeywords: _taskKeywords, needsPromote: false };
+          }
+        } catch (_) { /* affinity misses are non-fatal */ }
+      }
+    }
 
     // Step -1: appKnowledge intent_url check (highest priority, verified cache).
     // If we have a verified intent→URL mapping for this hostname+intent, use it
@@ -7893,9 +8249,17 @@ async function _resolveCheapDeepLink(agentId, serviceKey, baseStartUrl, task, ex
           // Cross-service cache pollution (docs.google.com under mail.google.com)
           // — reject before it can navigate. Entry is purged out-of-band.
           logger.warn(`[browser.agent] deep-link: rejecting appKnowledge intent_url ${_akUrl.url} — host outside ${baseHost} service family`);
+        } else if (_akUrl?.url && _isSigninWall(_akUrl.url)) {
+          // Auth-wall cached as an intent destination — decay + discover.
+          logger.warn(`[browser.agent] deep-link: rejecting auth-wall appKnowledge intent_url ${_akUrl.url}`);
+          try { recordVerification(baseHost, `${baseHost}.intent_url.${intent}`, false); } catch (_) {}
         } else if (_akUrl?.url && _isValidDeepLinkUrl(_akUrl.url)) {
-          logger.info(`[browser.agent] deep-link: appKnowledge intent_url hit for ${baseHost}/${intent}: ${_akUrl.url} (confidence=${_akUrl.confidence}, verifiedRuns=${_akUrl.verifiedRuns})`);
-          return { url: _akUrl.url, source: 'appKnowledge', intent, isCriteriaTask: _isCriteriaTask, baseHost, taskKeywords: _taskKeywords, needsPromote: false };
+          if (await _verdictCachedUrl({ task, intent, url: _akUrl.url, host: baseHost, source: 'appKnowledge' }) === 'use') {
+            logger.info(`[browser.agent] deep-link: appKnowledge intent_url hit for ${baseHost}/${intent}: ${_akUrl.url} (confidence=${_akUrl.confidence}, verifiedRuns=${_akUrl.verifiedRuns})`);
+            return { url: _akUrl.url, source: 'appKnowledge', intent, isCriteriaTask: _isCriteriaTask, baseHost, taskKeywords: _taskKeywords, needsPromote: false };
+          }
+          logger.warn(`[browser.agent] deep-link verdict: skip appKnowledge ${_akUrl.url} — decaying + falling through`);
+          try { recordVerification(baseHost, `${baseHost}.intent_url.${intent}`, false); } catch (_) {}
         }
       } catch (_) { /* non-fatal */ }
     }
@@ -7973,6 +8337,11 @@ async function _resolveCheapDeepLink(agentId, serviceKey, baseStartUrl, task, ex
           logger.warn(`[browser.agent] deep-link: skipping cached Messenger URL for post/share task: ${_cachedDeepLink.url} — falling through to discovery`);
         } else if (!_deepLinkHostAllowed(_hostOfUrl(_cachedDeepLink.url), baseHost, lookupBrowserService(serviceKey))) {
           logger.warn(`[browser.agent] deep-link: rejecting keyword-cache URL ${_cachedDeepLink.url} — host outside ${baseHost} service family`);
+        } else if (_isSigninWall(_cachedDeepLink.url)) {
+          // An auth redirect cached as a destination — 'google → ServiceLogin'
+          // hijacked a calendar task onto the login page. Reject + discover;
+          // the destination-resolver read guard evicts it out of the store.
+          logger.warn(`[browser.agent] deep-link: rejecting auth-wall keyword-cache URL ${_cachedDeepLink.url}`);
         } else if ((_cachedDeepLink.score || 0) < (_dlTaskCls?.newDestination === true ? 0.85 : 0.6)
             || /\/(policies|policy|help|linkbuttons|safety|trust|notifications)\b/i.test(_cachedDeepLink.url)) {
           // Low-confidence or utility/policy pages are not real destinations —
@@ -7984,6 +8353,10 @@ async function _resolveCheapDeepLink(agentId, serviceKey, baseStartUrl, task, ex
           // startUrl is the truthful destination for coincidental-vocabulary
           // matches.
           logger.warn(`[browser.agent] deep-link: rejecting low-quality keyword-cache URL ${_cachedDeepLink.url} (score=${(_cachedDeepLink.score||0).toFixed(2)}) — falling through to discovery`);
+        } else if (await _verdictCachedUrl({ task, intent, url: _cachedDeepLink.url, host: baseHost, source: 'keyword-cache' }) !== 'use') {
+          // tev1 verdict says the cached URL doesn't serve this task — fall
+          // through to the discovery/template path rather than trust it.
+          logger.warn(`[browser.agent] deep-link verdict: skip keyword-cache ${_cachedDeepLink.url} — falling through to discovery`);
         } else {
           logger.info(`[browser.agent] deep-link: keyword cache hit for ${agentId}: ${_cachedDeepLink.url} (score=${_cachedDeepLink.score.toFixed(2)})`);
           return { url: _cachedDeepLink.url, source: 'keyword-cache', intent, isCriteriaTask: _isCriteriaTask, baseHost, taskKeywords: _taskKeywords, needsPromote: false };
@@ -8524,6 +8897,19 @@ async function _resolveTaskDeepLink(agentId, serviceKey, baseStartUrl, task, exi
         // /notifications path (e.g. "check my gmail" → mail.google.com/
         // notifications, which 404s) must never become a learned intent_url.
         logger.warn(`[browser.agent] deep-link: skipping intent_url cache — utility-path candidate ${candidate}`);
+      } else if (_isSigninWall(candidate)) {
+        // An auth-wall URL is never a learned destination — the login redirect
+        // that landed the run gets cached and re-served forever (observed:
+        // 'google → accounts.google.com/ServiceLogin?service=cl' poisoned the
+        // keyword cache and hijacked a calendar task onto a login page).
+        logger.warn(`[browser.agent] deep-link: skipping intent_url cache — auth-wall candidate ${candidate}`);
+      } else if (/\/(?:next|last|this)[-_]?(?:week|day|month|year)\b|\/(?:mon|tues|wednes|thurs|fri|satur|sun)day\b|\/(?:tomorrow|yesterday)\b|\/\d{1,2}(?:am|pm)\b/i.test(candidate)) {
+        // Fabricated NL-path guard: LLM-suggested URLs that bake the task
+        // words into the path ("create event next week 5am" → /r/day/week/
+        // nextweek/5am) always 404 — and once cached they re-poison every
+        // retry (observed live). COMPOUND segments only — bare /week, /day,
+        // /month are legitimate calendar view routes.
+        logger.warn(`[browser.agent] deep-link: skipping intent_url cache — fabricated NL-path candidate ${candidate}`);
       } else {
         setImmediate(() => {
           try {

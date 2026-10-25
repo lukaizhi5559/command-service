@@ -433,9 +433,21 @@ async function _routeFromSignals({ goal, pageCategory = 'web_generic', focused, 
     if (hit) return hit;
   }
 
-  // 5. Known app shortcut matches the goal verb
+  // 4.9 Fill-shaped goals on a page with fillables — deterministic fill,
+  //     not the LLM loop or a blind keypress.
+  if (/\b(fill|enter|type|set)\b[^.]{0,40}\b(form|field|title|date|time|detail|name|description)\b/i.test(goalVerbs)
+      && (probe?.fillableCount ?? 0) > 0) {
+    const hit = pick('form.fill.agent', 'fill-route');
+    if (hit) return hit;
+  }
+
+  // 5. Known app shortcut matches the goal verb. Only when the goal is
+  //     phrased as a keystroke ("press 'c'", "shortcut") — a click-named goal
+  //     ("click the Create button") should target the visible DOM element,
+  //     not a flaky blind keypress that requires page focus.
   const shortcuts = loadShortcutTable(hostnameOf(currentUrl));
-  if (shortcuts.length > 0 && matchShortcut(goalVerbs, shortcuts)) {
+  if (shortcuts.length > 0 && matchShortcut(goalVerbs, shortcuts)
+      && !/\bclick(?:ed|s|ing)?\b/i.test(goalVerbs)) {
     const hit = pick('shortcut.keys.agent', 'shortcut-match');
     if (hit) return hit;
   }

@@ -437,6 +437,15 @@ async function formFillAgent(args = {}) {
   return withSessionMutex(sessionId, async () => {
     postProgress(_progressCallbackUrl, { tier: 'form-fill', message: `form.fill: scanning form` });
 
+    // ── Shared state gate — same contract as the other tab-flow skills.
+    // satisfied (surface already open/filled) short-circuits before the scan;
+    // redirect (no form on page) routes out; abort kills dead sessions.
+    const { preflightStateGate } = require('./lib/browserCore/stateEyes.cjs');
+    const _gate = await preflightStateGate({ sessionId, skill: 'form.fill', goal });
+    if (_gate.redirect)  return { ok: false, suggestedAgent: _gate.redirect, why: _gate.why, sessionId };
+    if (_gate.satisfied) return { ok: true, alreadySatisfied: true, output: _gate.why, sessionId };
+    if (_gate.abort)     return { ok: false, error: _gate.reason, sessionId };
+
     // 1. No-submit guard — installed BEFORE any fill so even a page script
     //    reacting to input events can't submit while we work.
     if (!wantsSubmit) {
@@ -604,6 +613,28 @@ async function formFillAgent(args = {}) {
 
     postProgress(_progressCallbackUrl, { tier: 'form-fill', message: summary });
     logger.info(`[form.fill] ${summary} session=${sessionId}`);
+
+    // Persist the page shape on any successful fill — the resolve/probe scan
+    // already enumerated fields; cache it so later runs skip discovery.
+    if (ok && fillables.length) {
+      try {
+        const { saveFormMap } = require('./lib/appKnowledge.cjs');
+        const _host = (() => { try { return new URL(scan.url || '').hostname.replace(/^www\./, ''); } catch (_) { return ''; } })();
+        const _intent = /event|meeting|calendar/i.test(goal) ? 'scheduling'
+          : /e-?mail|compose|draft/i.test(goal) ? 'mail' : 'form';
+        if (_host) saveFormMap(_host, _intent, {
+          pageCategory: 'form',
+          fields: mapped.filter(m => m.key || m.label).map(m => ({
+            key: m.key || m.label, semanticRole: m.key || null,
+            selector: m.entry.ariaLabel ? `[aria-label*="${String(m.entry.ariaLabel).slice(0,40).replace(/"/g,'')}" i]`
+                    : m.label ? `[aria-label*="${String(m.label).slice(0,40).replace(/"/g,'')}" i]` : null,
+            required: m.entry.required === true,
+          })).filter(f => f.selector),
+          signature: { dialogOpen: true, hasForm: true, elementStats: { fillables: fillables.length } },
+          postcondition: wantsSubmit ? { dialogCloses: true } : null,
+        });
+      } catch (_) { /* advisory */ }
+    }
 
     return {
       ok,

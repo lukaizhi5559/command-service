@@ -17,6 +17,7 @@
 const logger = require('../logger.cjs');
 const { playwrightAgent } = require('./playwright.agent.cjs');
 const { withSessionMutex, deriveSessionId, qualifyOpenTab, resolveExtSession } = require('./lib/browserCore/session.cjs');
+const { preflightStateGate } = require('./lib/browserCore/stateEyes.cjs');
 const { postProgress } = require('./lib/browserCore/progress.cjs');
 const { inferPageCategory } = require('../skill-helpers/page-category.cjs');
 
@@ -34,9 +35,28 @@ async function turnLoopAgent(args = {}) {
     try { args.pageCategory = await inferPageCategory({ agentId: args.agentId, url: args.url, task: goal }); } catch (_) {}
   }
 
+  // Page-map context — the propagated shape grounds the loop's element
+  // choices on scanned facts instead of hallucinated selectors.
+  if (args.pageMap) {
+    const pm = args.pageMap;
+    const _fields = (pm.fields || []).map(f => `${f.semanticRole || f.key}${f.ref ? `(ref:${f.ref})` : ''}`).join(', ');
+    const _clickables = (Array.isArray(args.tabMap) ? args.tabMap : [])
+      .filter(e => e.text || e.ariaLabel).slice(0, 15)
+      .map(e => `"${(e.text || e.ariaLabel || '').slice(0, 30)}"${e.ref ? `(ref:${e.ref})` : ''}`).join(', ');
+    args.agentContext = `${args.agentContext || ''}\nPage map: category=${pm.pageCategory || '?'} dialog=${pm.signature?.dialogOpen ? 'open' : 'none'} fields=[${_fields}] submit=${pm.submit ? (pm.submit.text || pm.submit.selector || 'yes') : 'none'}${_clickables ? `\nClickables: ${_clickables}` : ''}`.trim();
+  }
+
   return withSessionMutex(sessionId, async () => {
     const isVerify = mode === 'verify';
     postProgress(_progressCallbackUrl, { tier: 'turn-loop', message: `turn.loop.agent (${mode}): ${goal.slice(0, 60)}` });
+
+    // State-eyes preflight — turn.loop's biggest failure mode is a dead
+    // session burning N turns before the streak-bail catches it. The gate
+    // catches session_dead up front plus skill-fit mismatches.
+    const _gate = await preflightStateGate({ sessionId, skill: 'turn.loop', goal });
+    if (_gate.redirect) return { ok: false, suggestedAgent: _gate.redirect, why: _gate.why, sessionId };
+    if (_gate.satisfied) return { ok: true, alreadySatisfied: true, output: _gate.why, sessionId };
+    if (_gate.abort)    return { ok: false, error: _gate.reason, recoverable: false, sessionId };
 
     const res = await playwrightAgent({
       ...args,

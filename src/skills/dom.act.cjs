@@ -133,7 +133,7 @@ async function domAct(args = {}) {
     task, goal: _goalArg, agentId = 'default.agent', sessionId: _sid,
     pageCategory: _pageCategoryArg, agentContext = '', agentHint = null,
     triedAgents = null, _progressCallbackUrl,
-    priorNavUrl = null, priorNavType = null,
+    priorNavUrl = null, priorNavType = null, expectOverlay: _expectOverlayArg = false,
   } = args;
   const goal = task || _goalArg || '';
   if (!goal) return { ok: false, error: 'dom.act: no task/goal' };
@@ -223,7 +223,7 @@ async function domAct(args = {}) {
   const _looseOverlayProbe = () => hasVisibleDialog(sessionId);
 
   let overlaySeen = await _looseOverlayProbe();
-  const expectOverlay = overlaySeen || deepLinkOpensOverlay(priorNavUrl, priorNavType);
+  const expectOverlay = overlaySeen || deepLinkOpensOverlay(priorNavUrl, priorNavType) || _expectOverlayArg;
   if (!overlaySeen && (priorNavUrl || expectOverlay)) {
     const deadline = Date.now() + 6000;
     while (Date.now() < deadline) {
@@ -232,6 +232,14 @@ async function domAct(args = {}) {
       await new Promise(r => setTimeout(r, 500));
     }
     logger.info(`[dom.act] overlay wait (priorNavType=${priorNavType}, expect=${expectOverlay}) → dialog ${overlaySeen ? 'mounted' : 'NOT confirmed after 6s'}`);
+  }
+  // A step that NEEDS a dialog (the prior step produced one — openedDialog
+  // propagated expectOverlay) can't proceed when the wait found none —
+  // whatever follows (tab-map scan, fill) operates on the wrong state.
+  // Observed: 'c' popin dismissed → tab.map scanned the month view and
+  // clicked "31" on the mini calendar, navigating to a different month.
+  if (expectOverlay && !overlaySeen) {
+    return { ok: false, sessionId, agentId, error: 'expected dialog did not mount — prior step may have dismissed it or the shortcut missed focus', suggestedAgent: 'shortcut.keys.agent' };
   }
 
   // Already-satisfied gate: a creation/compose deep-link performs the action
@@ -324,11 +332,41 @@ async function domAct(args = {}) {
     if (Object.keys(_fields).length || _wantsSend) {
       postProgress(_progressCallbackUrl, { tier: 'route', message: `dom.act → email-compose: ${Object.keys(_fields).join('+') || 'send-only'}` });
       try {
+        // Composer presence gate — a compose window must actually be open
+        // before field fills are attempted. Deep-links have landed tasks on
+        // Gmail SEARCH pages where every fill silently failed and the run
+        // still reported ok (observed: filled [] → "sent" hallucination).
+        const _COMPOSER_PROBE = '!!document.querySelector(\'input[name="to"],textarea[name="to"],input[name="subjectbox"],div[aria-label="Message Body"]\')';
+        const _probe = async () => {
+          const r = await browserAct({ action: 'evaluate', sessionId, headed: true, timeoutMs: 6000, text: _COMPOSER_PROBE }).catch(() => null);
+          return r?.result === true || r?.result === 'true';
+        };
+        let _composerOpen = await _probe();
+        if (!_composerOpen && (_fields.to || _fields.subject || _fields.body || _wantsSend)) {
+          // Try opening the composer via the canonical compose deep-link.
+          const _composeUrl = _boundHost === 'mail.google.com'
+            ? 'https://mail.google.com/mail/u/0/#inbox?compose=new'
+            : null;
+          if (_composeUrl) {
+            logger.warn('[dom.act] email-compose: no composer open — navigating to compose deep-link');
+            await browserAct({ action: 'navigate', sessionId, url: _composeUrl, headed: true, timeoutMs: 20000 });
+            await new Promise(r => setTimeout(r, 1500));
+            _composerOpen = await _probe();
+          }
+        }
+        if (!_composerOpen && (_fields.to || _fields.subject || _fields.body)) {
+          logger.warn('[dom.act] email-compose: composer not present and could not be opened — refusing silent no-op');
+          return {
+            ok: false, resolvedAgent: 'dom.act:email-compose', routeRule: 'email-compose',
+            sessionId, agentId, url: _boundPageUrl, mutationApplied: false,
+            error: 'email-compose: no compose window found — deep link did not open a composer',
+          };
+        }
         const _fill = async (sel, value, commitChip) => {
           const c = await browserAct({ action: 'click', selector: sel, sessionId, headed: true, timeoutMs: 8000 });
-          if (!c?.ok) return false;
+          if (!c?.ok) { logger.warn(`[dom.act] email-compose fill: click failed on ${sel} — ${c?.error || 'no element'}`); return false; }
           const t = await browserAct({ action: 'type', text: value, sessionId, headed: true, timeoutMs: 15000 });
-          if (!t?.ok) return false;
+          if (!t?.ok) { logger.warn(`[dom.act] email-compose fill: type failed after ${sel} — ${t?.error || 'unknown'}`); return false; }
           if (commitChip) {
             await browserAct({ action: 'press', key: 'Enter', sessionId, headed: true, timeoutMs: 5000 });
             await new Promise(r => setTimeout(r, 500));

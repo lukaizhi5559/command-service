@@ -1217,6 +1217,19 @@ async function getCachedDeepLink(serviceKey, keywords) {
       bestMatch = null; bestScore = 0;
     }
 
+    // Auth-wall routes are never real destinations — a login redirect that
+    // landed a previous run got cached with the task's keywords and then
+    // re-served forever ('google → accounts.google.com/ServiceLogin?service=cl'
+    // hijacked a calendar task onto a login page). EVICT on read — the
+    // poisoned entry outlives every lookup otherwise.
+    const AUTH_WALL_RE = /(?:accounts\.[\w.-]+\/.*?(?:servicelogin|signin|identifier)|login\.microsoftonline|\/auth\/login\b|\/servicelogin\b)/i;
+    if (bestMatch && AUTH_WALL_RE.test(bestMatch.url)) {
+      logger.warn(`[destination-resolver] Deep-link cache hit rejected (auth wall — evicting): ${serviceKey} → ${bestMatch.url}`);
+      entry.routes = entry.routes.filter(r => r !== bestMatch);
+      setImmediate(() => _persistDeepLinkCache(serviceKey, entry).catch(() => {}));
+      bestMatch = null; bestScore = 0;
+    }
+
     if (bestMatch) {
       bestMatch.hitCount = (bestMatch.hitCount || 0) + 1;
       bestMatch.updatedAt = Date.now();
@@ -1257,6 +1270,13 @@ async function recordDeepLinkCache(serviceKey, url, keywords, intent) {
   // belong in the search-pattern cache (a {query} template), not the deep-link cache.
   if (_hasSearchQueryParam(url)) {
     logger.info(`[destination-resolver] recordDeepLinkCache: skipping search-query URL for ${serviceKey}: ${url}`);
+    return false;
+  }
+  // Auth-wall URLs are never destinations — a login redirect cached with the
+  // task's keywords poisons every future lookup for this service (observed:
+  // 'google → accounts.google.com/ServiceLogin?service=cl').
+  if (/(?:accounts\.[\w.-]+\/.*?(?:servicelogin|signin|identifier)|login\.microsoftonline|\/auth\/login\b|\/servicelogin\b)/i.test(url)) {
+    logger.warn(`[destination-resolver] recordDeepLinkCache: rejecting auth-wall URL for ${serviceKey}: ${url}`);
     return false;
   }
   try {

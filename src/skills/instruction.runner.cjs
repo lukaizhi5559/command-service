@@ -52,6 +52,7 @@ const {
   _executeTypedField, _executeJustType, _findClosestClickable,
 } = require('./lib/browserCore/typing.cjs');
 const { _tabToRef, _slimReadActiveElement } = require('./lib/browserCore/focusField.cjs');
+const { hasVisibleDialog } = require('./lib/browserCore/overlayProbe.cjs');
 
 // ---------------------------------------------------------------------------
 // Session-level LLM analysis cache
@@ -2397,7 +2398,7 @@ async function _detectOverlay(sessionId, pageCategory) {
         // Some pages have multiple role="dialog" elements; the first one
         // may be a layout container while the real modal is later in DOM
         // order.
-        const dialogs = document.querySelectorAll('[role="dialog"], [role="alertdialog"], [aria-modal="true"]');
+        const dialogs = document.querySelectorAll('[role="dialog"], [role="alertdialog"], [aria-modal="true"], [data-popin], [class*="popin" i], [class*="popover" i]');
         for (const dialog of dialogs) {
           if (_isRealModal(dialog) && !_isSidePanel(dialog)) return true;
         }
@@ -2405,7 +2406,7 @@ async function _detectOverlay(sessionId, pageCategory) {
         if (menu && _isRealModal(menu)) return true;
         // Class-contains variants catch non-ARIA modals like LinkedIn's
         // .share-box-modal — _isRealModal scoring gates out false positives.
-        const classCands = document.querySelectorAll('.modal:not([hidden]), .popup:not([hidden]), .overlay:not([hidden]), .drawer:not([hidden]), .sheet:not([hidden]), [class*="modal" i]:not([hidden]), [class*="dialog" i]:not([hidden]), [class*="popup" i]:not([hidden]), [class*="sheet" i]:not([hidden]), [class*="drawer" i]:not([hidden])');
+        const classCands = document.querySelectorAll('.modal:not([hidden]), .popup:not([hidden]), .overlay:not([hidden]), .drawer:not([hidden]), .sheet:not([hidden]), [class*="modal" i]:not([hidden]), [class*="dialog" i]:not([hidden]), [class*="popup" i]:not([hidden]), [class*="sheet" i]:not([hidden]), [class*="drawer" i]:not([hidden]), [class*="popover" i]:not([hidden]), [class*="popin" i]:not([hidden]), [data-popin]:not([hidden]), [jsaction*="dismiss" i]:not([hidden])');
         for (const classMatch of classCands) {
           if (_isRealModal(classMatch) && !_isSidePanel(classMatch)) return true;
         }
@@ -3066,7 +3067,13 @@ async function _executeShortcut(sessionId, keyCombo, goal = '', actionHistory = 
     await _sleep(1500); // wait for page to react (dialog open, navigation, etc.)
     const _postUrl = await _getUrl(sessionId);
     const pageChanged = _preUrl !== _postUrl;
-    return { ok: !!result?.ok, pageChanged, error: result?.error };
+    // Post-press dialog check — a shortcut whose purpose is opening an overlay
+    // ('c' create-event, '+' new doc, '?' shortcut help) must REPORT what
+    // actually appeared so the next step inherits expectOverlay. Without this
+    // the 'dialog NOT confirmed' signal lived only in dom.act's nav classifier
+    // and the follow-on tab.map scan Escape+clicked the live popover away.
+    const _dialogNow = await hasVisibleDialog(sessionId).catch(() => false);
+    return { ok: !!result?.ok, pageChanged, openedDialog: !!_dialogNow, error: result?.error };
   } catch (e) {
     return { ok: false, pageChanged: false, error: `Shortcut error: ${e.message}` };
   }

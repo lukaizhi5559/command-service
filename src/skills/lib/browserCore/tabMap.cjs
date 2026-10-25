@@ -57,6 +57,27 @@ const _broadSubmitLabels = /\b(send|submit|post|publish|save|create|confirm|appl
 // Instead we blur any focused page element and scroll to the top-left, then
 // the next Tab starts from the first focusable element in the page tab order.
 async function _resetFocusToPageTop(sessionId) {
+  // Self-guard: this "observation" helper is state-mutating — Escape +
+  // click-outside kills any live dialog/popover (observed: 'c' opened Google
+  // Calendar's quick-add popin, detection missed it, and this reset dismissed
+  // it mid-scan). Probe FIRST; when a dialog is open, reset focus INSIDE it.
+  const _dialogOpen = await _probeDialog(sessionId, { tag: true }).catch(() => false);
+  if (_dialogOpen) {
+    try {
+      await browserAct({
+        action: 'evaluate', sessionId, headed: true, timeoutMs: 2000,
+        text: `(() => {
+          const d = document.querySelector('[data-td-dialog="1"]');
+          const el = d && d.querySelector('input, textarea, select, [contenteditable]:not([contenteditable="false"]), [role="textbox"], [role="combobox"], button');
+          if (el) { el.focus(); return 'focused-in-dialog'; }
+          return 'dialog-no-field';
+        })()`,
+      });
+      logger.info('[instruction.runner] Reset skipped — dialog open; focused inside it instead');
+    } catch (_) {}
+    return;
+  }
+
   // 1. Send Escape to close any open overlays/menus that might trap focus
   try { await browserAct({ action: 'press', sessionId, key: 'Escape', headed: true, timeoutMs: 1500 }); } catch {}
   await _sleep(100);

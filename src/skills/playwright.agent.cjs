@@ -49,6 +49,7 @@ const logger = require('../logger.cjs');
 const { browserAct, getDebuggingContext, invalidateEngineSnapshot } = require('./browser.act.cjs');
 const engine = require('./browser-engine.cjs');
 const { extPage } = require('./lib/browserCore/ext.page.cjs');
+const { resolveExtSession } = require('./lib/browserCore/session.cjs');
 // Page provider — extension-first policy (F9): `ext:` sessions get the
 // page-shaped adapter over the Chrome extension so interactive work runs in
 // the user's real browser; everything else keeps the Playwright engine.
@@ -5570,6 +5571,32 @@ Rules:
       completed: false,
     }));
 
+    // ── Grounding filter: drop sub-tasks acting on invented entities ──
+    // The entity-preservation check below guards "goal entities must appear".
+    // This guards the reverse: a sub-task's quoted entities must resolve
+    // against the goal OR the live page text. Observed: "Click the Save
+    // button" decomposed into "Type 'Christmas Party'…" — fabricated data
+    // got typed into the user's prefilled form and saved.
+    try {
+      const _pg = await _engineEval(sessionId, 'document.body ? document.body.innerText.slice(0,6000) : ""').catch(() => null);
+      const _pageText = String((_pg && (_pg.result ?? _pg)) || '').toLowerCase();
+      if (_pageText.length > 20) {
+        const _goalL = goal.toLowerCase();
+        subTasks = subTasks.filter(s => {
+          const _quotes = [...String(s.description).matchAll(/['"“”‘’]([^'"“”‘’]{2,60})['"“”‘’]/g)]
+            .map(m => m[1].trim().toLowerCase())
+            .filter(q => q.length >= 2);
+          const _invented = _quotes.filter(q => !_goalL.includes(q) && !_pageText.includes(q));
+          if (_invented.length) {
+            logger.warn(`[playwright.agent] dropping ungrounded sub-task #${s.id} — entities not in goal/page: ${_invented.join(', ')} | "${s.description.slice(0, 80)}"`);
+            return false;
+          }
+          return true;
+        });
+        if (!subTasks.length) return { ok: false, error: 'all sub-tasks dropped by grounding filter' };
+      }
+    } catch (_) { /* blind page → skip filter (fail-open) */ }
+
     // ── Entity preservation validation: check all entities are covered ──
     if (_entities.length > 0) {
       const _allDesc = subTasks.map(s => s.description).join(' ').toLowerCase();
@@ -5736,6 +5763,27 @@ async function _checkSubTaskCompletion(subTask, page, pageUrl, pageText) {
   if (!v) return false;
   const url = (pageUrl || '').toLowerCase();
   const text = (pageText || '').toLowerCase().slice(0, 5000);
+
+  // Terminal sub-tasks (save/submit/send) — after the action lands the
+  // creation surface CLOSES, so pre-save criteria ("page text contains the
+  // title", "url changes to the event id") can never pass on the reset page.
+  // The success signature is: left the creation surface AND no dialog open.
+  // Verified post-hoc by the step-boundary eyes + pre-exhaustion LLM anyway.
+  const _d = (subTask.description || '').toLowerCase();
+  if (/\b(save|submit|send|post|publish|confirm|apply|book|order)\b/.test(_d)
+      && !/eventedit|compose|\/new\b|\/create|\/editor|\/draft/i.test(url)) {
+    let _dlgOpen = null;
+    try {
+      _dlgOpen = await page.evaluate(() =>
+        [...document.querySelectorAll('[role="dialog"],[role="alertdialog"],[aria-modal="true"],[class*="popin" i],[class*="popover" i],[data-popin]')]
+          .some(e => e.isConnected && (e.offsetParent !== null || getComputedStyle(e).position === 'fixed')
+                 && e.getBoundingClientRect().width > 40 && e.getBoundingClientRect().height > 40));
+    } catch (_) { /* blind — fall through to criteria */ }
+    if (_dlgOpen === false) {
+      logger.info(`[playwright.agent] sub-task #${subTask.id} verified (terminal): creation surface closed after "${_d.slice(0, 50)}"`);
+      return true;
+    }
+  }
 
   // Split on " and " for compound verification (e.g. "URL contains /playlist/ and page text contains 'Christian Music'")
   // Only split when " and " is between two verification-like phrases (not inside quotes)
@@ -12286,6 +12334,8 @@ function _isGoalCompletedBySignals({ goal, verificationGoal, pageText, pageUrl, 
 
 async function _executeTurnLoopFallback({ goal, verificationGoal, sessionId, headed, timeoutMs, agentContext, transcript, deadline, start, extractedText, heartbeat, textAlreadyEntered, maxTurns = 8, hostname, url: _targetUrl = null, _discoveryAlreadyAttempted = false, _preDecomposedSubTasks = null, _inheritedActionSignatureCounts = null, _inheritedJitDiscoveryFired = null, _progressCallbackUrl, _stepIndex, _abortSignal = null, flowCounter = null }) {
   const MAX_TURNS = maxTurns;
+  let _sessionDeadStreak = 0;   // consecutive session-level action failures
+  let _reattachTried = false;   // one-shot tab re-resolve on session death
   const _loopTranscript = [...transcript];
 
   // Emit tier progress so the frontend shows turn-loop activity
@@ -12362,6 +12412,30 @@ async function _executeTurnLoopFallback({ goal, verificationGoal, sessionId, hea
     }
   }
   logger.info(`[playwright.agent] turn-loop fallback: starting (max ${MAX_TURNS} turns) for goal="${goal.slice(0, 80)}"${_subTasks ? ` [decomposed: ${_subTasks.length} sub-tasks]` : ''}`);
+
+  // ── State-prune — a sub-task that only asks to OPEN a surface already open
+  // is satisfied. The turn-loop burned all 8 turns "opening the create-event
+  // dialog" on the already-open eventedit form (and typed 'c' into the title
+  // field). Deterministic URL/dialog match against surface nouns only —
+  // 'create the event' style goals without surface nouns are untouched.
+  if (_subTasks && _subTasks.some(s => s && !s.completed)) {
+    try {
+      const _stNowRes = await browserAct({ action: 'evaluate', sessionId, headed, timeoutMs: 2500,
+        text: `JSON.stringify({u: location.href, d: !!document.querySelector('[role="dialog"],[role="alertdialog"],[aria-modal="true"],[class*="popin" i],[class*="popover" i],[class*="modal" i],[class*="dialog" i],[data-popin]')})` });
+      const _stNow = JSON.parse(String(_stNowRes?.result || '{}').replace(/^"|"$/g, ''));
+      const _OPEN_SURFACE_RE = /\b(?:open|show|bring up|launch|pull up|start)\b[^.]{0,50}\b(?:dialog|modal|popup|popover|compose|form|panel|window)\b/i;
+      const _FORM_URL_RE = /eventedit|action=TEMPLATE|\/new\b|compose|\/create|deeplink/i;
+      for (const _st of _subTasks) {
+        if (!_st || _st.completed || !_OPEN_SURFACE_RE.test(_st.description || '')) continue;
+        const _formOpen = _FORM_URL_RE.test(_stNow.u || '');
+        const _dialogOpen = !!_stNow.d && /dialog|modal|popup|popover/i.test(_st.description || '');
+        if (_formOpen || _dialogOpen) {
+          _st.completed = true;
+          logger.info(`[playwright.agent] sub-task #${_st.id} already satisfied — surface open (url=${(_stNow.u || '').slice(0, 80)}, dialog=${_stNow.d})`);
+        }
+      }
+    } catch (_) { /* non-fatal */ }
+  }
 
   // ── Deterministic ordinal fast-path ──
   // "click/open the first|second|Nth item|result|listing|product" is a
@@ -13829,6 +13903,33 @@ Turn ${turn}/${MAX_TURNS}. What is your next action? (DO NOT snapshot - act dire
 
     if (!_outcome.ok) {
       logger.warn(`[playwright.agent] turn-loop: action ${_action.action} failed at turn ${turn}: ${_outcome.error}`);
+      // Session-death fast-bail — "no live tab"/"no engine page" failures are
+      // SESSION-level, not element-level: no amount of scrolls/clicks fixes a
+      // detached tab (observed: 8 turns of identical doomed scrolls after the
+      // event dialog's tab died). Consecutive session errors → attempt ONE
+      // re-resolve of the bound tab; still dead → bail as session_dead so
+      // ThinRecovery escalates to reattach/re-auth instead of retrying.
+      if (/no live tab|no engine page|no sessionId|session.*dead|tab.*not found/i.test(_outcome.error || '')) {
+        _sessionDeadStreak = (_sessionDeadStreak || 0) + 1;
+        if (_sessionDeadStreak >= 2 && !_reattachTried) {
+          _reattachTried = true;
+          logger.warn(`[playwright.agent] turn-loop: ${_sessionDeadStreak} consecutive session-level errors — attempting one tab re-resolve`);
+          try {
+            const _rs = await resolveExtSession(sessionId).catch(() => null);
+            if (_rs && _rs !== sessionId) {
+              logger.info(`[playwright.agent] turn-loop: session re-resolved ${sessionId} → ${_rs}`);
+              sessionId = _rs;
+              _sessionDeadStreak = 0;
+            }
+          } catch (_) {}
+        }
+        if (_sessionDeadStreak >= 3) {
+          logger.warn(`[playwright.agent] turn-loop: session_dead after ${_sessionDeadStreak} session-level failures — bailing`);
+          return { ok: false, error: 'session_dead: tab/session detached — no live tab to act on', recoverable: false, sessionId };
+        }
+      } else if (_sessionDeadStreak > 0) {
+        _sessionDeadStreak = 0; // any non-session error resets — the loop is alive
+      }
       // Stale-ref handling: refs are positional (derived from DOM order), so a
       // re-render produces the SAME ref id bound to a different element — a
       // plain "re-snapshot and retry" picks the same doomed ref forever.
@@ -17531,6 +17632,20 @@ Output a JSON plan: { "plan": [ { "action": "type", "selector": "eXX", "text": "
                 step = { ...step, key: fixed };
               }
             }
+          }
+          // ── Focus guard: single-letter presses are APP shortcuts — 'press c'
+          // with a text field focused types a literal 'c' into the field
+          // instead of firing the shortcut (observed: turn-loop's "open create
+          // dialog via 'c'" produced title "CCCC" on the calendar event form).
+          // Blur editable focus first so the keystroke reaches the page
+          // handler. Multi-char keys (Enter/Tab/arrows) keep in-field meaning.
+          if (step.action === 'press' && /^[a-z0-9]$/i.test(String(step.key || '').split('+').pop() || ' ')) {
+            try {
+              const _b = await browserAct({ action: 'evaluate', sessionId, headed, timeoutMs: 2000,
+                text: `(() => { const el = document.activeElement; if (el && (el.tagName==='INPUT'||el.tagName==='TEXTAREA'||el.isContentEditable)) { el.blur(); return 'blurred'; } return 'not-editable'; })()` });
+              const _br = String(_b?.result || '').replace(/^"|"$/g, '');
+              if (_br === 'blurred') logger.info('[playwright.agent] press guard: blurred editable focus before letter-key shortcut');
+            } catch (_) {}
           }
           // Capture pre-click state for submit verification (used after click succeeds)
           let _preClickState = null;

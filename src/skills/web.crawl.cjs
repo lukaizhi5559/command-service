@@ -633,15 +633,40 @@ async function _followLink(res, intent, { maxChars, timeoutMs, effectiveWaitMs, 
     } else {
       pick = null;
       const shortlist = links.slice(0, 40);
-      const { ask } = require('../skill-helpers/skill-llm.cjs');
-      const pickRaw = await ask(
-        `The user wants: "${intent}". The page "${res.title || res.url}" was fetched but is a landing/index page — the target content likely lives on a subpage.\n` +
-        `Pick the ONE link most likely to lead to it. Reply with ONLY the number, or "none" if no link matches.\n\n` +
-        shortlist.map((l, i) => `${i + 1}. ${String(l.text || '').trim() || '(no label)'} — ${l.href}`).join('\n'),
-        { maxTokens: 12, temperature: 0, taskType: 'link_pick' }
-      );
-      const idx = parseInt(String(pickRaw || '').trim(), 10);
-      if (Number.isInteger(idx) && idx >= 1 && idx <= shortlist.length) pick = shortlist[idx - 1];
+      const remotePick = async () => {
+        const { ask } = require('../skill-helpers/skill-llm.cjs');
+        const pickRaw = await ask(
+          `The user wants: "${intent}". The page "${res.title || res.url}" was fetched but is a landing/index page — the target content likely lives on a subpage.\n` +
+          `Pick the ONE link most likely to lead to it. Reply with ONLY the number, or "none" if no link matches.\n\n` +
+          shortlist.map((l, i) => `${i + 1}. ${String(l.text || '').trim() || '(no label)'} — ${l.href}`).join('\n'),
+          { maxTokens: 12, temperature: 0, taskType: 'link_pick' }
+        );
+        const idx = parseInt(String(pickRaw || '').trim(), 10);
+        return (Number.isInteger(idx) && idx >= 1 && idx <= shortlist.length) ? shortlist[idx - 1] : null;
+      };
+      // ── Local decision-model path: choice pick over the link shortlist ──
+      // systemone choice caps at 26 options — remote stays for larger lists.
+      if (shortlist.length <= 25) {
+        pick = await require('../skill-helpers/decision.cjs').boundedDecision({
+          site: 'webCrawl.linkPick',
+          questions: [{
+            id: 'link', type: 'choice',
+            question: `The user wants: "${intent}". This page is a landing/index page — which link most likely leads to the target content? Pick "none" if no link matches.`,
+            options: [...shortlist.map(l => `${String(l.text || '').trim() || '(no label)'} — ${l.href}`), 'none'],
+          }],
+          state: `Landing page: "${res.title || res.url}"`,
+          local: (a) => {
+            const i = a.link?.index;
+            if (i == null) return null;
+            return (i < shortlist.length) ? shortlist[i] : 'NONE';
+          },
+          remote: remotePick,
+          logger: null,
+        });
+        if (pick === 'NONE') pick = null;
+      } else {
+        pick = await remotePick();
+      }
       if (!pick) {
         progress(`follow: no subpage link matched "${intent.slice(0, 60)}" — keeping landing page`);
         return null;

@@ -18,9 +18,11 @@ const { _executeJustType } = require('./lib/browserCore/typing.cjs');
 const { _extractValue } = require('./browser.agent.cjs');
 const { readActiveElement, detectOverlay } = require('./lib/browserCore/pageState.cjs');
 const { withSessionMutex } = require('./lib/browserCore/session.cjs');
+const { preflightStateGate } = require('./lib/browserCore/stateEyes.cjs');
 const { postProgress } = require('./lib/browserCore/progress.cjs');
 const { inferPageCategory } = require('../skill-helpers/page-category.cjs');
 const { PRESS_KEY_RE } = require('./lib/browserCore/router.cjs');
+const { browserAct } = require('./browser.act.cjs');
 
 // Map a press/scroll goal to a PRESS_<KEY> value the typing layer understands.
 function _pressKeyFromGoal(goal) {
@@ -57,6 +59,10 @@ async function justTypeAgent(args = {}) {
   }
 
   return withSessionMutex(sessionId, async () => {
+    const _gate = await preflightStateGate({ sessionId, skill: 'just.type', goal });
+    if (_gate.redirect) return { ok: false, suggestedAgent: _gate.redirect, why: _gate.why, sessionId };
+    if (_gate.satisfied) return { ok: true, alreadySatisfied: true, output: _gate.why, sessionId };
+    if (_gate.abort)    return { ok: false, error: _gate.reason, sessionId };
     const [focused, overlay] = await Promise.all([
       readActiveElement(sessionId).catch(() => null),
       detectOverlay(sessionId, pageCategory).catch(() => null),
@@ -83,25 +89,56 @@ async function justTypeAgent(args = {}) {
       };
     }
 
-    if (!focused && !overlayActive) {
+    // Targeted typing — when the propagated page map names a field matching
+    // the goal ("type X into the title field"), focus THAT element before
+    // typing instead of trusting whatever happens to be focused. Live refs
+    // work while the scanned DOM is mounted; durable selector is the fallback.
+    let focusedEl = focused;
+    const _mapFields = Array.isArray(args.pageMap?.fields) ? args.pageMap.fields : [];
+    if (_mapFields.length) {
+      const g = String(goal).toLowerCase();
+      const target = _mapFields.find(f =>
+        (f.semanticRole && new RegExp(`\\b${f.semanticRole}\\b`, 'i').test(g)) ||
+        (f.key && g.includes(String(f.key).toLowerCase())));
+      if (target && (target.ref || target.selector)) {
+        const focusExpr = `(() => {
+          const el = ${target.ref ? `document.querySelector('[data-td-ref="${target.ref}"]') || ` : ''}document.querySelector(${JSON.stringify(target.selector || '')});
+          if (!el) return false;
+          el.scrollIntoView({ block: 'center' });
+          el.focus();
+          if (el.isContentEditable) {
+            const r = document.createRange(); r.selectNodeContents(el); r.collapse(false);
+            const s = getSelection(); s.removeAllRanges(); s.addRange(r);
+          }
+          return document.activeElement === el || el.contains(document.activeElement);
+        })()`;
+        const fr = await browserAct({ action: 'evaluate', sessionId, headed: true, timeoutMs: 3000, text: focusExpr }).catch(() => null);
+        if (fr?.result === true || fr?.result === 'true') {
+          focusedEl = await readActiveElement(sessionId).catch(() => focusedEl);
+          logger.info(`[just.type.agent] map-targeted field "${target.semanticRole || target.key}" focused before typing`);
+        }
+      }
+    }
+
+    if (!focusedEl && !overlayActive) {
       logger.warn('[just.type.agent] no focused element and no overlay — cannot type blindly');
       return { ok: false, error: 'No focused element and no overlay open', suggestedAgent: 'tab.map.agent' };
     }
 
     let value = args.value;
     if (!value) {
-      try { value = await _extractValue(goal, focused, [], agentContext); } catch (_) {}
+      try { value = await _extractValue(goal, focusedEl, [], agentContext); } catch (_) {}
     }
     if (!value) return { ok: false, error: 'Could not extract value to type from goal', suggestedAgent: 'tab.map.agent' };
 
     postProgress(_progressCallbackUrl, { tier: 'just-type', message: `just.type.agent: typing "${String(value).slice(0, 50)}"` });
     const actionHistory = [];
-    const res = await _executeJustType(sessionId, value, focused, pageCategory, goal, agentContext, null, overlayActive, actionHistory);
+    const res = await _executeJustType(sessionId, value, focusedEl, pageCategory, goal, agentContext, null, overlayActive, actionHistory);
     // Record what happened — the returned history/fill feeds the cross-step
     // browser digest and lets the next step's LLM see this field as filled.
-    const _label = (focused?.ariaLabel || focused?.text || focused?.placeholder || '').slice(0, 80);
+    const _label = (focusedEl?.ariaLabel || focusedEl?.text || focusedEl?.placeholder || '').slice(0, 80);
     actionHistory.push(`Just-type "${String(value).slice(0, 40)}"${_label ? ` into "${_label}"` : ''} ${res?.ok ? '→ ok' : '→ FAILED'}`);
-    const filledFields = res?.ok ? [{ ref: focused?.ref || null, label: _label || 'focused element', value }] : [];
+    const filledFields = res?.ok ? [{ ref: focusedEl?.ref || null, label: _label || 'focused element', value }] : [];
     // A mis-landed/not-landed value is a focus problem — hand off to an agent
     // that can click the right field (turn.loop), not another typing tier.
     const failAgent = res?.suggestedAgent || 'tab.map.agent';

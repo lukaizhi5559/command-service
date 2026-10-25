@@ -782,7 +782,7 @@ Which block does the goal want edited? Reply with ONLY JSON:
 {"blocks": [a, b]}  — a span of consecutive blocks
 {"none": true}  — if no block matches the goal`;
 
-  try {
+  const remotePick = async () => {
     const raw = await askWithMessages([
       { role: 'system', content: 'You pick which numbered block of a file matches the user\'s goal. Output only JSON with a block index — never quote file text.' },
       { role: 'user', content: userPrompt },
@@ -797,6 +797,38 @@ Which block does the goal want edited? Reply with ONLY JSON:
     }
     if (a === null || a < 0 || a >= blocks.length) return null;
     b = Math.min(b ?? a, blocks.length - 1);
+    return { a, b };
+  };
+
+  try {
+    let ab = null;
+    // ── Local decision-model path: block pick as choice questions ──
+    // systemone choice caps at 26 options — remote stays for larger outlines.
+    if (blocks.length <= 25) {
+      ab = await require('../skill-helpers/decision.cjs').boundedDecision({
+        site: 'editAgent.locateBlock',
+        questions: [
+          { id: 'first', type: 'choice', question: 'Which block does the goal want edited? Pick "none" if no block matches.', options: [...blocks.map(b => `[${b.i}] ${b.head}`), 'none'] },
+          { id: 'last', type: 'choice', question: 'If the edit spans multiple consecutive blocks, which is the LAST one? Pick the same block as the first question for a single-block edit.', options: [...blocks.map(b => `[${b.i}] ${b.head}`), 'same_as_first'] },
+        ],
+        state: userPrompt,
+        local: (ans) => {
+          const fi = ans.first?.index;
+          if (fi == null) return null;
+          if (fi >= blocks.length) return 'NONE';
+          let bi = ans.last?.index;
+          if (bi == null || bi >= blocks.length || bi < fi) bi = fi;
+          return { a: fi, b: bi };
+        },
+        remote: remotePick,
+        logger,
+      });
+      if (ab === 'NONE') return null;
+    } else {
+      ab = await remotePick();
+    }
+    if (!ab) return null;
+    const a = ab.a, b = ab.b;
 
     const picked = blocks[a];
     // Margin: one neighbor block each side.

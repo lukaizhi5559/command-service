@@ -20,6 +20,11 @@ const DIALOG_SELECTOR = [
   '[role="dialog"]', '[role="alertdialog"]', '[aria-modal="true"]',
   '[class*="modal" i]', '[class*="dialog" i]', '[class*="popup" i]',
   '[class*="sheet" i]', '[class*="drawer" i]',
+  // Google's quick-add style panels — 'c' on Calendar opens a *popin*, not
+  // an aria-modal dialog; the old list missed it and the tab-map reset's
+  // Escape+click-outside killed it while detection reported overlayActive=false.
+  '[class*="popover" i]', '[class*="popin" i]', '[data-popin]', '[data-popup]',
+  '[jsaction*="dismiss" i]',
 ].join(', ');
 
 // Fillable selector shared with the scans — matches contenteditable regardless

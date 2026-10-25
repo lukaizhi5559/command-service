@@ -18,6 +18,9 @@ const logger = require('../logger.cjs');
 const { _tabMapInnerStep, buildTabMap } = require('./lib/browserCore/tabMap.cjs');
 const { detectOverlay } = require('./lib/browserCore/pageState.cjs');
 const { withSessionMutex } = require('./lib/browserCore/session.cjs');
+const { preflightStateGate } = require('./lib/browserCore/stateEyes.cjs');
+const { deriveShape } = require('./lib/browserCore/shapeMap.cjs');
+const { saveFormMap } = require('./lib/appKnowledge.cjs');
 const { postProgress } = require('./lib/browserCore/progress.cjs');
 const { browserAct } = require('./browser.act.cjs');
 const { inferPageCategory } = require('../skill-helpers/page-category.cjs');
@@ -49,6 +52,20 @@ async function tabMapAgent(args = {}) {
     let overlayActive = !!(overlay && overlay.active) || expectOverlay === true;
     logger.info(`[tab.map.agent] overlayActive=${overlayActive} (detected=${!!overlay?.active}, expectOverlay=${expectOverlay}) → skipReset=${overlayActive}`);
 
+    // ── Pre-scan eyes (shared stateEyes gate) — state→skill contract runs
+    // BEFORE the destructive reset. tab.map's own overlay check above is kept
+    // for the fast path; the gate adds dead-session detection, widened dialog
+    // sight, and the tev1 tie-breaker for ambiguous states. A dialog-scoped
+    // verdict sets overlayActive → skipReset protects the live dialog.
+    const _gate = await preflightStateGate({ sessionId, skill: 'tab.map', goal });
+    if (_gate.redirect) return { ok: false, suggestedAgent: _gate.redirect, why: _gate.why, sessionId };
+    if (_gate.satisfied) return { ok: true, alreadySatisfied: true, output: _gate.why, sessionId };
+    if (_gate.abort)    return { ok: false, error: _gate.reason, sessionId };
+    if (!overlayActive && (_gate.dialogScoped || _gate.state?.dialogOpen)) {
+      overlayActive = true;
+      logger.info('[tab.map.agent] gate: dialog detected/expected — dialog-scoped scan, reset skipped');
+    }
+
     let currentUrl = '';
     const readUrl = async () => {
       try {
@@ -64,6 +81,29 @@ async function tabMapAgent(args = {}) {
     if (!tabMap || tabMap.length === 0) {
       return { ok: false, error: 'Tab-map scan returned no actionable elements', suggestedAgent: 'turn.loop.agent', sessionId };
     }
+
+    // ── Shape emit + persist — the scan is the discovery primitive. Derive
+    // the page shape (semantic fields, submit, signature) and cache it under
+    // host+intent so later runs skip the scan entirely.
+    let _pageShape = null;
+    try {
+      _pageShape = deriveShape(tabMap, { url: currentUrl, dialogOpen: overlayActive, includeRefs: true });
+      if (_pageShape) {
+        const _host = (() => { try { return new URL(currentUrl).hostname.replace(/^www\./, ''); } catch (_) { return ''; } })();
+        const _intent = /event|meeting|calendar/i.test(goal) ? 'scheduling'
+          : /e-?mail|compose|draft/i.test(goal) ? 'mail'
+          : /fill|form|sign.?up|register|checkout/i.test(goal) ? 'form' : 'generic';
+        if (_host) {
+          // Cache the durable copy — refs are per-scan ephemeral, selectors persist.
+          saveFormMap(_host, _intent, {
+            ..._pageShape,
+            fields: _pageShape.fields.map(({ ref, ...rest }) => rest),
+            submit: _pageShape.submit ? (({ ref, ...rest }) => rest)(_pageShape.submit) : null,
+          });
+          logger.info(`[tab.map.agent] shape emitted: ${_pageShape.fields.length} fields (${_pageShape.fields.map(f => f.semanticRole || f.key).join('/')}) → form_map[${_host}.${_intent}]`);
+        }
+      }
+    } catch (_) { /* shape persistence is advisory — never fail the scan */ }
 
     const actionHistory = [];
     // Seed from prior browser steps (same session + page only — a navigated
@@ -161,6 +201,8 @@ async function tabMapAgent(args = {}) {
           return {
             ok: true, output: actionHistory.join('; ') || 'done', sessionId,
             actionHistory, filledFields, clickedRefs: [...clickedRefs],
+            pageShape: _pageShape || undefined, pageCategory: _pageShape?.pageCategory || pageCategory,
+            tabMap, tabMapUrl,
           };
         }
         lastError = res.error || 'Tab-map inner step failed';

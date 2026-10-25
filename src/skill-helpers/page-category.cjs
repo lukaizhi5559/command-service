@@ -94,6 +94,13 @@ async function _classifyPageCategoryLLM(serviceKey, url, task, appKnowledgeEntri
   const _svc = _normSvc(serviceKey);
   const _url = (url || '').toLowerCase();
   const _task = (task || '').toLowerCase();
+  // Empty URL → the bound page raced session attach; any category is a guess
+  // (observed: document_editor on a calendar page, which then biased routing
+  // hints). web_generic is the honest neutral.
+  if (!_url) {
+    logger.info(`[page-category] _classifyPageCategoryLLM: empty url (service=${_svc}) — skipping classification`);
+    return 'web_generic';
+  }
 
   // Build compact appKnowledge summary (max 500 chars)
   const _akSummary = (appKnowledgeEntries || [])

@@ -375,6 +375,56 @@ function saveIntentUrl(hostname, intent, url, taskPattern = null, opts = {}) {
   }]);
 }
 
+/**
+ * Load a cached page-shape ("form_map") for a hostname+intent — the shape-level
+ * parallel of intent_url. The shape record carries semantic-role selectors
+ * (never positional ref-ids), a surface signature that disambiguates same-URL
+ * states (quick-add popin shares the month URL), a derived postcondition, and
+ * a selector fingerprint re-validated before consumption.
+ */
+function loadFormMap(hostname, intent) {
+  const h = _safeHostname(hostname);
+  if (!h || !intent) return null;
+  const entries = loadAppKnowledge(h);
+  const match = entries.find(e =>
+    e.type === 'form_map' &&
+    e.details?.intent === intent &&
+    e.details?.fields?.length &&
+    (e.confidence || 0) >= 0.4
+  );
+  if (!match) return null;
+  return { ...match.details, entryId: match.id, confidence: match.confidence || 0 };
+}
+
+/**
+ * Save a page-shape record. Confidence starts 0.35 (below the 0.4 use
+ * threshold) — a shape only becomes consumable after a consumer skill's
+ * postcondition verifies and recordVerification(true) bumps it.
+ */
+function saveFormMap(hostname, intent, shape, opts = {}) {
+  const h = _safeHostname(hostname);
+  if (!h || !intent || !shape || !Array.isArray(shape.fields)) return 0;
+  const id = `${h}.form_map.${intent}`;
+  const _verified = opts && opts.verified === true;
+  return saveAppKnowledge(h, [{
+    id,
+    type: 'form_map',
+    summary: `${intent} form_map → ${shape.fields.length} fields, ${shape.fields.map(f => f.semanticRole || f.key).join('/')}`,
+    details: {
+      intent,
+      pageCategory: shape.pageCategory || null,
+      fields: shape.fields,                       // [{key, semanticRole, selector, label, required}]
+      submit: shape.submit || null,               // {selector, semanticRole, text}
+      signature: shape.signature || null,         // {dialogOpen, hasForm, elementStats} — same-URL disambiguator
+      postcondition: shape.postcondition || null, // {dialogCloses, urlBecomes, entityAppears}
+      fingerprint: Array.isArray(shape.fingerprint) ? shape.fingerprint.slice(0, 8) : null,
+    },
+    source: _verified ? 'form_map_verified' : 'form_map_scanned',
+    confidence: _verified ? 0.8 : 0.35,
+    ttlDays: 30, // page shapes churn faster than intent URLs — shorter TTL
+  }]);
+}
+
 // ─── Desktop App Playbook Cache ────────────────────────────────────────────
 // Stores playbooks for desktop app automation, keyed by app + goal-type +
 // sub-goal signature. Survives restarts so playbooks don't need re-computation.
@@ -437,6 +487,8 @@ module.exports = {
   isShortcutCoverageStale,
   loadIntentUrl,
   saveIntentUrl,
+  loadFormMap,
+  saveFormMap,
   loadPlaybook,
   savePlaybook,
   // Exposed for testing
