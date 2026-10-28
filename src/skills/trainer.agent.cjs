@@ -3649,7 +3649,7 @@ function _registerSkillInAgent(agentId, skillName, recipe) {
     fs.writeFileSync(agentPath, descriptor, 'utf8');
     logger.info(`[trainer.agent] Registered ${skillName} in ${agentId}.agent.md`);
 
-    // Also register in user-memory DB so parseSkill/external.skill can find it
+    // Also register in user-memory DB so the trained-recipe map can find it
     const skillPath = path.join(SKILLS_DIR, _skillDirId(agentId), _skillFileName(skillName));
     const memoryUrl = process.env.MCP_USER_MEMORY_URL || process.env.USER_MEMORY_SERVICE_URL || 'http://127.0.0.1:3001';
     const parsedUrl = new URL(memoryUrl);

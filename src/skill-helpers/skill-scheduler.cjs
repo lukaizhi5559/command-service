@@ -7,7 +7,7 @@
  * and registers a node-cron job for every skill whose schedule ≠ 'on_demand'.
  *
  * When a cron fires it calls POST /command.automate on THIS service (port 3007)
- * with skill: 'external.skill' — completely decoupled from Electron.
+ * — completely decoupled from Electron.
  *
  * Re-syncs every 5 minutes so newly installed skills are picked up automatically
  * without restarting the service.
@@ -245,7 +245,7 @@ function registerRandomWindow(cronId, skillName, execPath, rw) {
 // ── Fire a scheduled skill ────────────────────────────────────────────────────
 
 // ── Tier: notify ─────────────────────────────────────────────────────────────
-// Fires an osascript display notification directly — no external.skill, no HTTP.
+// Fires an osascript display notification directly — no HTTP.
 function fireNotifySkill(skillName, metadata) {
   const { execSync } = require('child_process');
   const msg   = (metadata.message || `ThinkDrop: ${skillName}`).replace(/"/g, '\\"');
@@ -366,7 +366,8 @@ async function fireSkill(skillName, execPath, metadata = {}) {
     return;
   }
 
-  // Default: script tier — route through external.skill
+  // Default: script tier — legacy installed-skill path. external.skill is retired;
+  // dispatch hits the tombstone and logs an honest failure for stale registrations.
   try {
     // /command.automate expects { payload: { skill, args } } — not bare { skill, args }
     const result = await mcpPost(COMMAND_SERVICE_PORT, '/command.automate', {
@@ -532,7 +533,7 @@ async function start() {
 
 /**
  * Immediately register or refresh a single skill's cron job.
- * Called by skillCreator after installing a scheduled skill.
+ * Called when a scheduled job is installed.
  */
 async function registerSkill(skillName, schedule, execPath, metadata = {}) {
   if (!skillName || !schedule || schedule === 'on_demand') return;

@@ -2,7 +2,7 @@
  * Command Service MCP Server
  *
  * Actuation-only MCP service. Owns all "can touch the machine" skills:
- *   - command.automate  → skill router (shell.run, browser.act, image.analyze, fs.read, file.watch, file.bridge, screen.capture, external.skill, cli.agent, browser.agent, web.agent, video.agent, creator.agent, reviewer.agent)
+ *   - command.automate  → skill router (shell.run, browser.act, image.analyze, fs.read, file.watch, file.bridge, screen.capture, cli.agent, browser.agent, web.agent, video.agent)
  *   - health            → service health check
  *
  * Perception, planning, memory, and intent resolution live in other services.
@@ -81,7 +81,6 @@ const { imageAnalyze } = require('./skills/image.analyze.cjs');
 const { fsRead } = require('./skills/fs.read.cjs');
 const { fileWatch } = require('./skills/file.watch.cjs');
 const { fileBridge } = require('./skills/file.bridge.cjs');
-const { run: externalSkillRun } = require('./skills/external.skill.cjs');
 const { run: projectBuilderRun } = require('./skills/project.builder.cjs');
 const { projectLaunch } = require('./skills/project.launcher.cjs');
 const { projectEdit } = require('./skills/project.editor.cjs');
@@ -101,9 +100,13 @@ const { gestureAgent } = require('./skills/gesture.agent.cjs');
 const { arrowGridAgent } = require('./skills/arrow.grid.agent.cjs');
 const { turnLoopAgent } = require('./skills/turn.loop.agent.cjs');
 const { domAct } = require('./skills/dom.act.cjs');
-const creatorAgent = require('./skills/creator.agent.cjs');
-const reviewerAgent = require('./skills/reviewer.agent.cjs');
-const skillCreator = require('./skills/skillCreator.skill.cjs');
+// RETIRED — creator.agent / reviewer.agent / skillCreator.skill:
+// the legacy skill-authoring apparatus is removed. Reusable procedures are
+// authored plans + localPlanTemplates now.
+// recipe.run survives as the executor for trained waypoint/agent recipes
+// (~/.thinkdrop/skills/*.skill.json — data, not code); it backs the
+// 'external.skill' dispatch name used by playwright's external_skill steps.
+const recipeRun = require('./skills/recipe.run.cjs');
 const { screenCapture } = require('./skills/screen.capture.cjs');
 const { screenDisplay } = require('./skills/screen.display.cjs');
 const { userAgent } = require('./skills/user.agent.cjs');
@@ -132,7 +135,7 @@ class CommandServiceMCPServer {
   /**
    * Skill router — dispatches to the appropriate automation skill
    * @param {Object} payload - { skill, args }
-   *   skill: 'shell.run' | 'browser.act' | 'image.analyze' | 'fs.read' | 'file.watch' | 'file.bridge' | 'screen.capture' | 'external.skill' | 'cli.agent' | 'browser.agent'
+   *   skill: 'shell.run' | 'browser.act' | 'image.analyze' | 'fs.read' | 'file.watch' | 'file.bridge' | 'screen.capture' | 'cli.agent' | 'browser.agent'
    *   args:  skill-specific arguments (see skills/ implementations)
    */
   async executeAutomation(payload, opts = {}) {
@@ -170,14 +173,23 @@ class CommandServiceMCPServer {
       case 'file.bridge':
         return await this._skillFileBridge(args);
 
-      case 'external.skill':
-        return await this._skillExternal(args, payload);
-
       case 'screen.capture':
         return await this._skillScreenCapture(args);
 
       case 'screen.display':
         return await screenDisplay(args);
+
+      // 'external.skill' resolves trained recipes only (recipe.run) — playwright's
+      // external_skill steps and agent-test paths dispatch under this name.
+      case 'external.skill':
+        return await this._skillRecipeRun(args);
+
+      // Tombstone — stale dispatches get an honest error instead of "unknown skill".
+      case 'creator.agent':
+      case 'reviewer.agent':
+      case 'skillCreator.skill':
+      case 'skill.review':
+        return await this._skillExternal(args);
 
       case 'cli.agent':
         return await this._skillCliAgent(args);
@@ -215,15 +227,6 @@ class CommandServiceMCPServer {
         return await this._skillAtomic(turnLoopAgent, args, opts);
       case 'dom.act':
         return await this._skillAtomic(domAct, args, opts);
-
-      case 'creator.agent':
-        return await this._skillCreatorAgent(args);
-
-      case 'reviewer.agent':
-        return await this._skillReviewerAgent(args);
-
-      case 'skillCreator.skill':
-        return await this._skillCreator(args);
 
       case 'project.builder':
         return await this._skillProjectBuilder(args);
@@ -327,7 +330,11 @@ class CommandServiceMCPServer {
   }
 
   async _skillExternal(args) {
-    return await externalSkillRun(args);
+    return { success: false, error: 'skill retired — procedures are authored plans, not installed skills' };
+  }
+
+  async _skillRecipeRun(args) {
+    return await recipeRun.run(args);
   }
 
   async _skillCliAgent(args) {
@@ -360,18 +367,6 @@ class CommandServiceMCPServer {
     // cancels. The skill reads args._abortSignal and checks it in its loops.
     if (opts.signal) args = { ...args, _abortSignal: opts.signal };
     return await browserAgent(args);
-  }
-
-  async _skillCreatorAgent(args) {
-    return await creatorAgent(args);
-  }
-
-  async _skillReviewerAgent(args) {
-    return await reviewerAgent(args);
-  }
-
-  async _skillCreator(args) {
-    return await skillCreator(args);
   }
 
   async _skillProjectBuilder(args) {
@@ -507,7 +502,7 @@ class CommandServiceMCPServer {
       success: true,
       service: this.serviceName,
       status: 'healthy',
-      skills: ['shell.run', 'browser.act', 'web.crawl', 'image.analyze', 'fs.read', 'edit.agent', 'doc.read', 'media.transcribe', 'file.watch', 'file.bridge', 'screen.capture', 'screen.display', 'external.skill', 'cli.agent', 'browser.agent', 'playwright.agent', 'url.first.agent', 'just.type.agent', 'meta.find.agent', 'shortcut.keys.agent', 'tab.map.agent', 'form.fill.agent', 'gesture.agent', 'arrow.grid.agent', 'turn.loop.agent', 'dom.act', 'creator.agent', 'reviewer.agent', 'skillCreator.skill', 'project.builder', 'project.launcher', 'project.editor', 'project.stopper', 'app.agent', 'system.introspect', 'provider.discovery', 'user.agent', 'web.agent', 'video.agent', 'tool.discover']
+      skills: ['shell.run', 'browser.act', 'web.crawl', 'image.analyze', 'fs.read', 'edit.agent', 'doc.read', 'media.transcribe', 'file.watch', 'file.bridge', 'screen.capture', 'screen.display', 'cli.agent', 'browser.agent', 'playwright.agent', 'url.first.agent', 'just.type.agent', 'meta.find.agent', 'shortcut.keys.agent', 'tab.map.agent', 'form.fill.agent', 'gesture.agent', 'arrow.grid.agent', 'turn.loop.agent', 'dom.act', 'project.builder', 'project.launcher', 'project.editor', 'project.stopper', 'app.agent', 'system.introspect', 'provider.discovery', 'user.agent', 'web.agent', 'video.agent', 'tool.discover']
     };
   }
 
@@ -544,10 +539,6 @@ class CommandServiceMCPServer {
       logger.debug(`[Server] Profile dir cleanup skipped: ${err.message}`);
     }
 
-    // ── Warm up creator.agent DB (ensures projects table exists) ────────────
-    creatorAgent({ action: 'list_projects' }).catch(() => {});
-    reviewerAgent({ action: 'status', projectId: '__warmup__' }).catch(() => {});
-
     // ── Generate workspace manifest ────────────────────────────────────────────
     // Creates ~/.thinkdrop/manifest.json with agents, skills, DB info for self-awareness
     const { generateManifest } = require('./workspace-manifest.cjs');
@@ -569,26 +560,6 @@ class CommandServiceMCPServer {
       startScanScheduler(); // Always start scan scheduler (cron-based, user-configured)
     } catch (err) {
       logger.warn('[Server] explore.agent maintenance services failed to start (non-fatal)', { error: err.message });
-    }
-
-    // ── Startup skill health scan ─────────────────────────────────────────────
-    // Runs once after the scheduler starts — validates all installed skills and
-    // writes health records to the skill_health table. Non-blocking and non-fatal.
-    try {
-      const skillReview = require('./skills/skill.review.cjs');
-      skillReview({ action: 'scan_all' }, { logger })
-        .then(report => {
-          if (report?.summary) logger.info(`[skill.review] ${report.summary}`);
-          if (report?.invalidSkills?.length > 0) {
-            logger.warn('[skill.review] Invalid skills detected at startup', {
-              count: report.invalidSkills.length,
-              names: report.invalidSkills.map(s => s.name),
-            });
-          }
-        })
-        .catch(err => logger.warn('[skill.review] Startup scan failed (non-fatal)', { error: err.message }));
-    } catch (e) {
-      logger.warn('[skill.review] Could not load skill.review.cjs (non-fatal)', { error: e.message });
     }
 
     // ── Ad-block domain list refresh (non-blocking, every N days) ───────────
@@ -626,7 +597,7 @@ class CommandServiceMCPServer {
         res.end(JSON.stringify({
           status: 'healthy',
           service: this.serviceName,
-          skills: ['shell.run', 'browser.act', 'web.crawl', 'image.analyze', 'fs.read', 'edit.agent', 'doc.read', 'media.transcribe', 'file.watch', 'file.bridge', 'screen.capture', 'screen.display', 'external.skill', 'cli.agent', 'browser.agent', 'playwright.agent', 'url.first.agent', 'just.type.agent', 'meta.find.agent', 'shortcut.keys.agent', 'tab.map.agent', 'form.fill.agent', 'gesture.agent', 'arrow.grid.agent', 'turn.loop.agent', 'dom.act', 'creator.agent', 'reviewer.agent', 'skillCreator.skill', 'project.builder', 'project.launcher', 'project.editor', 'project.stopper', 'app.agent', 'system.introspect', 'provider.discovery', 'user.agent', 'web.agent', 'video.agent', 'tool.discover']
+          skills: ['shell.run', 'browser.act', 'web.crawl', 'image.analyze', 'fs.read', 'edit.agent', 'doc.read', 'media.transcribe', 'file.watch', 'file.bridge', 'screen.capture', 'screen.display', 'cli.agent', 'browser.agent', 'playwright.agent', 'url.first.agent', 'just.type.agent', 'meta.find.agent', 'shortcut.keys.agent', 'tab.map.agent', 'form.fill.agent', 'gesture.agent', 'arrow.grid.agent', 'turn.loop.agent', 'dom.act', 'project.builder', 'project.launcher', 'project.editor', 'project.stopper', 'app.agent', 'system.introspect', 'provider.discovery', 'user.agent', 'web.agent', 'video.agent', 'tool.discover']
         }));
         return;
       }
@@ -850,7 +821,7 @@ class CommandServiceMCPServer {
       }
 
       // ── POST /skill.schedule — register/refresh a skill's cron immediately ──
-      // Called by skillCreator after writing a new scheduled skill.
+      // Called when a scheduled job is registered.
       if (req.method === 'POST' && req.url === '/skill.schedule') {
         let body = '';
         req.on('data', chunk => { body += chunk; });

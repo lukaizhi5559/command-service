@@ -87,6 +87,19 @@ function spawnCapture(cmd, argv = [], opts = {}) {
   });
 }
 
+// cwd contract: an explicit per-action cwd (the model sets action.cwd) wins,
+// then the plan-step cwd (args.cwd). Never resolve to process.cwd() — the
+// command-service repo is the wrong place for arbitrary commands (observed:
+// a recovery `git add -A && git commit && git push` inherited the service cwd
+// and pushed command-service's remote instead of the user's repo). Callers
+// that pass undefined land on spawnCapture's os.homedir() default.
+function _resolveCwd(actionCwd, stepCwd) {
+  const raw = actionCwd || stepCwd;
+  if (typeof raw !== 'string' || !raw.trim()) return undefined;
+  const expanded = raw.trim().replace(/^~(?=\/|$)/, os.homedir());
+  try { return path.resolve(expanded); } catch (_) { return undefined; }
+}
+
 async function whichCli(cli) {
   const r = await spawnCapture('which', [cli], { timeoutMs: 5000 });
   if (r.ok && r.stdout.trim()) return r.stdout.trim();
@@ -1129,9 +1142,9 @@ const CLI_AGENTIC_LOOP_PROMPT = `You are an expert CLI automation agent executin
 You have access to a CLI tool described in the Agent Descriptor below. The descriptor is the ONLY source of truth for what commands exist — do NOT invent or guess commands from training knowledge.
 Each turn you output exactly ONE JSON action object from this palette:
 
-  run_cmd    – execute CLI command:         { "action": "run_cmd", "argv": [...] }
+  run_cmd    – execute CLI command:         { "action": "run_cmd", "argv": [...], "cwd": "/abs/dir" }
   run_help   – read subcommand help:        { "action": "run_help", "subcmd": [...] }
-  run_shell  – script for probing/piping:   { "action": "run_shell", "script": "...", "interpreter": "bash" }
+  run_shell  – script for probing/piping:   { "action": "run_shell", "script": "...", "interpreter": "bash", "cwd": "/abs/dir" }
              interpreters: bash (default) | node | python3
              bash:    "yt-dlp --help 2>&1 | grep -A3 'sub'"
              node:    "const r=require('child_process').execSync('yt-dlp --version').toString(); console.log(r)"
@@ -1154,6 +1167,7 @@ Each action object may include an optional "thinking" field: one sentence (max 1
 
 Rules:
 - argv must NOT include the CLI binary name itself — only the subcommand and its arguments.
+- cwd: when the task targets a specific directory or repository (a path in the task text, a repo name, "in X"), set "cwd" on every run_cmd/run_shell/pty_exec — commands otherwise run in a neutral default directory, NOT inside that repo. For git specifically, prefer 'git -C <repo>' argv over relying on cwd.
 - ONLY use subcommands and flags explicitly listed in the Agent Descriptor. Do NOT guess or invent commands from training knowledge — the descriptor is authoritative. EXCEPTION: if the CLI tool itself emits a WARNING: line recommending a specific flag (e.g. "add --js-runtimes node", "use --config"), you MAY add that exact flag on the next retry even if it is not in the descriptor. This is self-healing behavior — the tool is telling you what it needs.
 - If the required subcommand or flag is NOT in the descriptor, use run_help FIRST — it reads the CLI's own built-in docs in 1 turn and is always more accurate than web_search. For subcommand CLIs (gh, docker, aws) pass the relevant subcmd path. For flag-driven CLIs (yt-dlp, ffmpeg, curl) where flags are not subcommands, pass a relevant section keyword if available, e.g. ["--help"]. Only fall back to web_search if run_help output is insufficient or the operation is completely novel.
 - Do NOT issue web_search on turn 1 if the CLI tool is installed and you only need flag syntax — run_help is faster, free, and the tool's own docs are the authoritative source.
@@ -1696,8 +1710,15 @@ async function actionRun({ cli, argv = [], cwd, env, timeoutMs, stdin, agentId, 
     // done returns this as stdout — without it the loop discards produced text
     // and reports only the narration summary (contract: stdout = data product).
     let _bestOutput = '';
+    // Latest successful output — preferred over _bestOutput on done: the
+    // largest capture is often STALE pre-mutation state (observed: a big
+    // pre-commit `git status` dump won over the commit's own output, so the
+    // run reported "No commit was made" on a commit that landed).
+    let _lastOutput = '';
     const _trackOutput = (text) => {
-      if (typeof text === 'string' && text.length > _bestOutput.length) _bestOutput = text;
+      if (typeof text !== 'string' || !text) return;
+      _lastOutput = text;
+      if (text.length > _bestOutput.length) _bestOutput = text;
     };
 
     try {
@@ -1781,9 +1802,10 @@ async function actionRun({ cli, argv = [], cwd, env, timeoutMs, stdin, agentId, 
 
       if (action.action === 'done') {
         transcript.push({ turn, action, outcome: { ok: true, result: action.result || action.summary || '' }, thoughts: action.thinking || null });
-        // stdout carries the data product (largest successful command output
-        // this run, or the LLM's verbatim result); summary stays narration.
-        return { ok: true, agentId, task, stdout: action.result || _bestOutput || action.summary || '', summary: action.summary || '', agentTurns: turn, transcript };
+        // stdout carries the data product — the LATEST successful command
+        // output (fresh, not the largest stale capture), or the LLM's
+        // verbatim result; summary stays narration.
+        return { ok: true, agentId, task, stdout: action.result || _lastOutput || _bestOutput || action.summary || '', summary: action.summary || '', agentTurns: turn, transcript };
       }
 
       if (action.action === 'ask_user') {
@@ -1979,7 +2001,7 @@ async function actionRun({ cli, argv = [], cwd, env, timeoutMs, stdin, agentId, 
           _argv[0] === 'services' && _argv[1] === 'enable'
         );
         const _stepTimeoutMs = _isGcloudServicesEnable ? 180000 : (timeoutMs || 30000);
-        const cmdResult = await spawnCapture(currentBinPath, _argv, { cwd, env, timeoutMs: _stepTimeoutMs });
+        const cmdResult = await spawnCapture(currentBinPath, _argv, { cwd: _resolveCwd(action.cwd, cwd), env, timeoutMs: _stepTimeoutMs });
         logger.info(`[cli.agent] loop turn=${turn} run_cmd exitCode=${cmdResult.exitCode} stdout="${cmdResult.stdout.slice(0, 200)}" stderr="${(cmdResult.stderr || '').slice(0, 200)}"`, { agentId });
         // Idempotent success: treat "already done" CLi responses as success (e.g. gh repo star on already-starred repo exits 1)
         const alreadyDone = /already starred|already watching|already following|nothing to (do|change)|up.to.date|no changes/i.test(
@@ -2232,7 +2254,7 @@ async function actionRun({ cli, argv = [], cwd, env, timeoutMs, stdin, agentId, 
             const _interp = _SHELL_INTERPRETERS.has(action.interpreter) ? action.interpreter : 'bash';
             // node uses -e (eval), shell interpreters use -c (command)
             const _interpFlag = _interp === 'node' ? '-e' : '-c';
-            const _shellR = await shellRun({ cmd: _interp, argv: [_interpFlag, _script], timeoutMs: 15000 });
+            const _shellR = await shellRun({ cmd: _interp, argv: [_interpFlag, _script], cwd: _resolveCwd(action.cwd, cwd), timeoutMs: 15000 });
             const _combined = [_shellR.stdout || '', _shellR.stderr || ''].filter(Boolean).join('\n').trim();
             if (_shellR.exitCode === 0) _trackOutput(_shellR.stdout || _combined);
             // When probe returns the same short error as the original failure (< 60 chars),
@@ -2306,10 +2328,10 @@ async function actionRun({ cli, argv = [], cwd, env, timeoutMs, stdin, agentId, 
 const GENERIC_LOOP_PROMPT = `You are a terminal automation agent completing a user task step-by-step.
 There is NO fixed CLI — you choose the tool each turn. Each turn you output exactly ONE JSON action:
 
-  run_shell  – PRIMARY verb — run any command line: { "action": "run_shell", "script": "...", "interpreter": "bash" }
+  run_shell  – PRIMARY verb — run any command line: { "action": "run_shell", "script": "...", "interpreter": "bash", "cwd": "/abs/dir" }
                interpreters: bash (default) | node | python3
                installs, probes, execution — anything. Pipes/grep/head allowed.
-  run_cmd    – one binary + args:                  { "action": "run_cmd", "cmd": "<binary>", "argv": [...] }
+  run_cmd    – one binary + args:                  { "action": "run_cmd", "cmd": "<binary>", "argv": [...], "cwd": "/abs/dir" }
   run_help   – read a tool's own docs:             { "action": "run_help", "bin": "<cli>", "subcmd": [...]? }
   pty_exec   – run inside a real terminal (PTY):   { "action": "pty_exec", "cmd": "<full command line>" }
                interactive programs only — menus, setup wizards, y/n prompts, sudo, OAuth device flows.
@@ -2329,6 +2351,7 @@ There is NO fixed CLI — you choose the tool each turn. Each turn you output ex
 Each action may include an optional "thinking" field: one sentence (max 120 chars) on why you chose it.
 
 Rules:
+- cwd: when the task targets a specific directory or repository (a path in the task text, a repo name, "in X"), set "cwd" on every run_shell/run_cmd/pty_exec — commands otherwise run in a neutral default directory, NOT inside that repo. For git, prefer 'git -C <repo>' inside the script/argv over relying on cwd.
 - DIAGNOSE before retry: a non-zero exit gets ONE cheap probe first — never re-run an unchanged failing command.
 - NEVER install a package whose name you have not verified — npm view <pkg> / brew info <pkg> / pip3 index versions <pkg> FIRST. A guessed name 404s; verify, then install.
 - Missing tool → install it (brew/npm/pip3 — whatever the tool's docs say), then verify with "command -v <bin>" or "<bin> --version" before done.
@@ -2361,8 +2384,13 @@ async function _genericRunLoop({ task, cwd, env, timeoutMs, _progressCallbackUrl
   // done returns this as stdout — without it the loop discards produced text
   // (e.g. pdftotext output) and reports only the narration summary.
   let _bestOutput = '';
+  // Latest successful output — preferred over _bestOutput on done so stale
+  // pre-mutation captures can't masquerade as the final result.
+  let _lastOutput = '';
   const _trackOutput = (text) => {
-    if (typeof text === 'string' && text.length > _bestOutput.length) _bestOutput = text;
+    if (typeof text !== 'string' || !text) return;
+    _lastOutput = text;
+    if (text.length > _bestOutput.length) _bestOutput = text;
   };
 
   let _ptySessionId = null;
@@ -2436,10 +2464,10 @@ async function _genericRunLoop({ task, cwd, env, timeoutMs, _progressCallbackUrl
       if (action.action === 'done') {
         transcript.push({ turn, action, outcome: { ok: true, result: action.result || action.summary || '' }, thoughts: action.thinking || null });
         _autoRegisterInstalledCli(task).catch(() => {});
-        // stdout must carry the task's data product — the largest successful
-        // command output seen this run (deliverables dwarf probe output), or
-        // the LLM's verbatim result when supplied. summary stays narration.
-        return { ok: true, agentId, task, stdout: action.result || _bestOutput || action.summary || '', summary: action.summary || '', agentTurns: turn, transcript };
+        // stdout must carry the task's data product — the LATEST successful
+        // command output (fresh, not the largest stale capture), or the
+        // LLM's verbatim result when supplied. summary stays narration.
+        return { ok: true, agentId, task, stdout: action.result || _lastOutput || _bestOutput || action.summary || '', summary: action.summary || '', agentTurns: turn, transcript };
       }
 
       if (action.action === 'ask_user') {
@@ -2472,7 +2500,15 @@ async function _genericRunLoop({ task, cwd, env, timeoutMs, _progressCallbackUrl
           if (interp === 'bash' && !_ptyDead) {
             try {
               const sid = await _ensurePtySession();
-              r = await terminalAgent({ action: 'exec', sessionId: sid, cmd: script, timeoutMs: action.timeoutMs || 60000, keepSession: true, _progressCallbackUrl });
+              // cwd contract: PTY sessions inherit the spawn cwd (the
+              // command-service repo) — prefix an explicit cd so a bare
+              // `git add -A` can't land in the wrong repository. A script
+              // that already cd's wins (its later cd takes effect).
+              const _ptyCwd = _resolveCwd(action.cwd, cwd);
+              const _ptyScript = (_ptyCwd && !/^\s*cd\s/.test(script))
+                ? `cd ${JSON.stringify(_ptyCwd)} && ${script}`
+                : script;
+              r = await terminalAgent({ action: 'exec', sessionId: sid, cmd: _ptyScript, timeoutMs: action.timeoutMs || 60000, keepSession: true, _progressCallbackUrl });
               // Observe the raw `delta` stream (complete output since exec
               // start), not `screen` — the rendered viewport is only the last
               // ~24 rows, so bulk output (pdftotext dumps, cat, listings) was
@@ -2500,7 +2536,7 @@ async function _genericRunLoop({ task, cwd, env, timeoutMs, _progressCallbackUrl
             try {
               const { shellRun } = require('./shell.run.cjs');
               const flag = interp === 'node' ? '-e' : '-c';
-              const pr = await shellRun({ cmd: interp, argv: [flag, script], timeoutMs: action.timeoutMs || 30000 });
+              const pr = await shellRun({ cmd: interp, argv: [flag, script], cwd: _resolveCwd(action.cwd, cwd), timeoutMs: action.timeoutMs || 30000 });
               const combined = [pr.stdout || '', pr.stderr || ''].filter(Boolean).join('\n').trim();
               if (pr.exitCode === 0) _trackOutput(pr.stdout || combined);
               observation = (combined || `exitCode=${pr.exitCode}`).slice(0, RUN_HELP_CHARS);
@@ -2518,7 +2554,7 @@ async function _genericRunLoop({ task, cwd, env, timeoutMs, _progressCallbackUrl
         if (!bin) {
           observation = `run_cmd: "${cmd}" is not on PATH — verify/install it first (which ${cmd}, npm view, brew info), or run it via run_shell.`;
         } else {
-          const r = await spawnCapture(bin, Array.isArray(action.argv) ? action.argv : [], { cwd, env, timeoutMs: timeoutMs || 30000 });
+          const r = await spawnCapture(bin, Array.isArray(action.argv) ? action.argv : [], { cwd: _resolveCwd(action.cwd, cwd), env, timeoutMs: timeoutMs || 30000 });
           if (r.exitCode === 0) _trackOutput(r.stdout);
           observation = [`exitCode=${r.exitCode}`, r.stdout, r.stderr].filter(Boolean).join('\n').slice(0, RUN_HELP_CHARS);
           if (r.exitCode !== 0) failedSigs.set(_sig, _sigFails + 1);

@@ -152,6 +152,16 @@ find grouping rule (CRITICAL — unbalanced groupings cause find to exit 1):
 - WRONG (missing closing \\) — will exit 1):
   find '/path/to/folder' -type f \\( -iname '*.png' -o -iname '*.jpg' -o -iname '*.gif'
 
+MUTATION SCOPE RULE (CRITICAL — unbounded sweeps mutate the wrong repos):
+- Mutating commands (git add/commit/push, mv, rm, chmod, sed -i, > redirect) may ONLY run
+  inside directories the goal explicitly names (a path, a folder ref, or a named project).
+- NEVER generate a sweep that discovers targets by scanning the home directory and then
+  mutates everything it finds — e.g. find ~/ -name .git → git add, Path.home().glob("**/.git")
+  → commit, or ls ~ → rm inside each match. Discovery-then-mutate across ~ is forbidden.
+- If the goal names a parent folder ("all repos in projects"), scope discovery to THAT
+  folder only, shallow: find <named-folder> -maxdepth 2 -name .git — never ~ or $HOME.
+- If no scope is given, emit a non-mutating discovery (list only), never mutate-and-hope.
+
 File move/copy safety rules (CRITICAL — bash loop bugs are the #1 failure):
 - NEVER use wildcards that include the destination: mv ~/Desktop/* ~/Desktop/dest/ WRONG (moves dest into itself)
 - ALWAYS use find with -type f: find SRC -maxdepth 1 -type f -exec mv -n {} DEST/ \\;

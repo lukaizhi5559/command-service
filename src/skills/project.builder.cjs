@@ -457,7 +457,7 @@ async function run(args) {
       // ── All tests passed ────────────────────────────────────────────────────
       logger.info(`[project.builder] ✅ Project "${projectName}" built successfully in ${iterations} iteration(s)`);
 
-      // Stop dev server — runtime will manage it via external.skill
+      // Stop dev server — runtime will manage it
       try { serverProc.kill('SIGTERM'); } catch (_) {}
       serverProc = null;
 
