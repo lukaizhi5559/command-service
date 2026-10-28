@@ -70,6 +70,16 @@ async function urlFirstAgent(args = {}) {
       serviceInfo = await resolveServiceTarget(service || agentId);
     } catch (_) {}
 
+    // taskFacts.destination — resolved ONCE in preflightAgents and carried to
+    // this step in args. Re-resolving here would duplicate the resolution
+    // chain (~seconds) and could disagree with what the planner annotated —
+    // a second independent judgment on the same question. Facts win.
+    if (!targetUrl && args.taskFacts?.destination?.url
+        && (!args.taskFacts.agentId || args.taskFacts.agentId === agentId)) {
+      targetUrl = args.taskFacts.destination.url;
+      deepLinkSource = `taskFacts:${args.taskFacts.destination.source || 'preflight'}`;
+    }
+
     if (!targetUrl && serviceInfo?.startUrl && task) {
       try {
         const { browserAgent } = require('./browser.agent.cjs');

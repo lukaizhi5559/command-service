@@ -434,8 +434,12 @@ async function _routeFromSignals({ goal, pageCategory = 'web_generic', focused, 
   }
 
   // 4.9 Fill-shaped goals on a page with fillables — deterministic fill,
-  //     not the LLM loop or a blind keypress.
-  if (/\b(fill|enter|type|set)\b[^.]{0,40}\b(form|field|title|date|time|detail|name|description)\b/i.test(goalVerbs)
+  //     not the LLM loop or a blind keypress. Creation/scheduling verbs on a
+  //     form-bearing goal count too — "create event titled X at 5pm" is a fill,
+  //     not a keystroke (the 'c' shortcut only opens the form — already open).
+  const _CREATE_FILL_RE = /\b(?:create|make|schedule|book|add|new|compose|set)\b[^.]{0,60}\b(?:event|meeting|appointment|reminder|task|entry|page|doc|document|note|record|card|post|message|invite|reservation|contact)\b/i;
+  if ((/\b(fill|enter|type|set)\b[^.]{0,40}\b(form|field|title|date|time|detail|name|description)\b/i.test(goalVerbs)
+      || _CREATE_FILL_RE.test(goalVerbs))
       && (probe?.fillableCount ?? 0) > 0) {
     const hit = pick('form.fill.agent', 'fill-route');
     if (hit) return hit;
@@ -444,10 +448,15 @@ async function _routeFromSignals({ goal, pageCategory = 'web_generic', focused, 
   // 5. Known app shortcut matches the goal verb. Only when the goal is
   //     phrased as a keystroke ("press 'c'", "shortcut") — a click-named goal
   //     ("click the Create button") should target the visible DOM element,
-  //     not a flaky blind keypress that requires page focus.
+  //     not a flaky blind keypress that requires page focus. Entity-laden
+  //     goals ("titled X at 5pm", quoted content) are fill/save work — the
+  //     desc-word overlap ("create event") is incidental, and pressing the
+  //     shortcut on the open form is a no-op that falsely reports ok.
+  const _ENTITY_LADEN_RE = /\b(?:titled|named|called|entitled|tomorrow|today|tonight|next\s+\w+|at\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?|for\s+\w+day)\b|"[^"]{2,80}"|'[^']{2,80}'/i;
   const shortcuts = loadShortcutTable(hostnameOf(currentUrl));
   if (shortcuts.length > 0 && matchShortcut(goalVerbs, shortcuts)
-      && !/\bclick(?:ed|s|ing)?\b/i.test(goalVerbs)) {
+      && !/\bclick(?:ed|s|ing)?\b/i.test(goalVerbs)
+      && !_ENTITY_LADEN_RE.test(goal)) {
     const hit = pick('shortcut.keys.agent', 'shortcut-match');
     if (hit) return hit;
   }
@@ -460,7 +469,10 @@ async function _routeFromSignals({ goal, pageCategory = 'web_generic', focused, 
     if (_vHit) return _vHit;
     const lane = await (confirmLane || _confirmGoalLane)(goalVerbs, { currentUrl, pageCategory, probe, focused });
     if (lane === 'shortcut') {
-      const hit = pick('shortcut.keys.agent', 'llm-confirm:shortcut');
+      // Entity-laden goals still aren't keystrokes even when the confirm lane
+      // says "shortcut" — fall through to the action lanes instead.
+      const hit = !_ENTITY_LADEN_RE.test(goal)
+        ? pick('shortcut.keys.agent', 'llm-confirm:shortcut') : null;
       if (hit) return hit;
     } else if (lane === 'find') {
       const hit = pick('meta.find.agent', 'llm-confirm:find');

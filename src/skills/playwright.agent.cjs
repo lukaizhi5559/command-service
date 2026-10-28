@@ -168,6 +168,79 @@ async function _observeEval(sessionId, fn, timeoutMs = 5000) {
   return r && r.ok ? (r.result ?? null) : null;
 }
 
+// ---------------------------------------------------------------------------
+// _observePage — one page-evidence read for verification consumers.
+//   Engine sessions: page.evaluate for url/title/innerText (+ optional snapshot
+//   yaml). Extension sessions: _engineEval/browserAct for the same reads + the
+//   ext DOM-scanner snapshot via _fastSnapshot — the snapshot yaml's element
+//   names ARE the visible text on aria-grid surfaces (observed: Calendar grid
+//   innerText ~empty while the 80-element snapshot contained the created event).
+// Returns { url, title, text, structure, textSource, ok } — textSource is
+// 'innerText' | 'snapshot' | 'none' so callers can weight the evidence and the
+// absence of ANY evidence is logged instead of silently passing '' downstream.
+// ---------------------------------------------------------------------------
+async function _observePage(sessionId, opts = {}) {
+  const { includeStructure = true, textLen = 8000, cachedText = '' } = opts;
+  const ev = { url: '', title: '', text: '', structure: '', textSource: 'none', ok: false };
+  const page = _getPage(sessionId);
+  try {
+    if (page) {
+      ev.url = await _pageUrlOf(page);
+      try { ev.title = await page.title().catch(() => ''); } catch (_) {}
+      try {
+        ev.text = await page.evaluate((n) => (document.body?.innerText || '').slice(0, n), textLen).catch(() => '');
+      } catch (_) {}
+      if (includeStructure) {
+        try {
+          const st = await engine.buildRefTree(page);
+          if (st?.yaml) ev.structure = String(st.yaml);
+        } catch (e) {
+          logger.debug(`[playwright.agent] _observePage: engine snapshot failed: ${e.message}`);
+        }
+      }
+    } else {
+      const [_u, _t, _x] = await Promise.all([
+        _engineEval(sessionId, 'window.location.href', 5000).catch(() => null),
+        _engineEval(sessionId, 'document.title || ""', 5000).catch(() => null),
+        _engineEval(sessionId, `(document.body?.innerText || '').slice(0, ${textLen})`, 8000).catch(() => null),
+      ]);
+      if (_u?.ok) ev.url = String(_u.result ?? '');
+      if (_t?.ok) ev.title = String(_t.result ?? '');
+      if (_x?.ok) ev.text = String(_x.result ?? '');
+      if (includeStructure) {
+        try {
+          const snap = await _fastSnapshot(sessionId, true);
+          if (snap?.ok && snap.result) ev.structure = String(snap.result);
+        } catch (e) {
+          logger.debug(`[playwright.agent] _observePage: ext snapshot failed: ${e.message}`);
+        }
+      }
+    }
+  } catch (e) {
+    logger.debug(`[playwright.agent] _observePage error (non-fatal): ${e.message}`);
+  }
+  if ((!ev.text || ev.text.length < 200) && cachedText && cachedText.length > ev.text.length) {
+    ev.text = cachedText;
+  }
+  if ((!ev.text || ev.text.length < 200) && ev.structure) {
+    // Element names are the visible text on aria-grid/menu surfaces — promote
+    // the snapshot structure to text so text-based checks aren't blind.
+    const names = ev.structure.split('\n').map(l => l.trim()).filter(Boolean).join(' ');
+    if (names.length > ev.text.length) {
+      ev.text = names.slice(0, textLen);
+      ev.textSource = 'snapshot';
+    }
+  }
+  if (ev.textSource === 'none' && ev.text) ev.textSource = 'innerText';
+  ev.ok = !!(ev.text || ev.structure || ev.url);
+  if (!ev.ok) {
+    logger.warn(`[playwright.agent] _observePage: NO evidence for session=${sessionId} — url/text/snapshot all empty (engine page=${!!page})`);
+  } else if (ev.textSource === 'none' && !ev.text) {
+    logger.warn(`[playwright.agent] _observePage: empty text for session=${sessionId} (structure=${ev.structure.length} chars, url=${ev.url || 'none'})`);
+  }
+  return ev;
+}
+
 async function _engineNavigate(sessionId, url, timeoutMs = 30000) {
   const page = _getPage(sessionId);
   if (!page) return null;
@@ -364,7 +437,26 @@ async function _captureState(sessionId, headed, captureMode = 'cheap') {
 
   try {
     const _page = _getPage(sessionId);
-    if (!_page) return { url: '', domHash: '', pageText: '', modalCount: 0, timestamp: _ts, ok: false };
+    if (!_page) {
+      // Extension-bound session — read through _observePage/_engineEval instead
+      // of returning blind (previously ok:false → every diff showed
+      // 'state-unavailable' on ext sessions).
+      const _evCap = await _observePage(sessionId, { includeStructure: false, textLen: 3000 }).catch(() => null);
+      if (!_evCap || !_evCap.ok) return { url: '', domHash: '', pageText: '', modalCount: 0, timestamp: _ts, ok: false };
+      _url = _evCap.url;
+      _pageText = _evCap.text;
+      // domHash/modalCount still evaluable through the extension bridge —
+      // same expressions the engine path runs.
+      try {
+        const _dh = await _engineEval(sessionId, `(() => { const els = document.querySelectorAll('button, a, [role="button"], [role="link"], input, [contenteditable], [role="dialog"], [aria-modal="true"], [role="menu"], [role="listbox"]'); const sigs = []; for (const el of els) { const r = el.getBoundingClientRect(); if (r.width === 0 && r.height === 0) continue; const t = (el.innerText || el.textContent || el.value || el.getAttribute('aria-label') || '').trim().slice(0, 40); sigs.push(el.tagName + '|' + (el.getAttribute('role') || '') + '|' + t + '|' + Math.round(r.x) + ',' + Math.round(r.y)); } const j = sigs.join('§'); let h = 0; for (let i = 0; i < j.length; i++) h = ((h << 5) - h + j.charCodeAt(i)) | 0; return h + '_' + sigs.length; })()`, 5000).catch(() => null);
+        if (_dh?.ok) _domHash = String(_dh.result ?? '');
+      } catch (_) {}
+      try {
+        const _mc = await _engineEval(sessionId, `(() => { let c = 0; for (const m of document.querySelectorAll('[role="dialog"],[aria-modal="true"]')) { const r = m.getBoundingClientRect(); if (r.width > 2 && r.height > 2) c++; } return c; })()`, 5000).catch(() => null);
+        if (_mc?.ok) _modalCount = Number(_mc.result) || 0;
+      } catch (_) {}
+      return { url: _url, domHash: _domHash, pageText: _pageText, ocrText: _ocrText, openMenus: _openMenus, modalCount: _modalCount, timestamp: _ts, ok: true };
+    }
 
     // URL
     _url = await _pageUrlOf(_page);
@@ -5833,7 +5925,7 @@ function _buildSubTaskProgressBlock(subTasks) {
 //
 // Returns { verified: boolean, gate: string, reason: string }
 // ---------------------------------------------------------------------------
-async function _structuralVerifySubTask(subTask, { page, pageUrl, pageText, transcript, sessionId }) {
+async function _structuralVerifySubTask(subTask, { page, pageUrl, pageText, transcript, sessionId, evidence }) {
   if (!subTask || subTask.completed) return { verified: true, gate: 'already_completed', reason: 'sub-task already marked complete' };
   const _desc = (subTask.description || '').toLowerCase();
   const _verification = (subTask.verification || '').toLowerCase();
@@ -5842,13 +5934,17 @@ async function _structuralVerifySubTask(subTask, { page, pageUrl, pageText, tran
 
   // Extract key entities from the sub-task description + verification
   const _entityTerms = new Set();
+  const _quotedTerms = [];
   const _quoted = (subTask.description + ' ' + subTask.verification).match(/['"]([^'"]{2,50})['"]/g) || [];
   for (const q of _quoted) {
     const t = q.replace(/['"]/g, '').trim();
-    if (t.length > 1 && !/^\+|\.\.\.$|^save$|^enter$|^cancel$/i.test(t)) _entityTerms.add(t.toLowerCase());
+    if (t.length > 1 && !/^\+|\.\.\.$|^save$|^enter$|^cancel$/i.test(t)) {
+      _entityTerms.add(t.toLowerCase());
+      _quotedTerms.push(t.toLowerCase());
+    }
   }
   const _caps = (subTask.description + ' ' + subTask.verification).match(/\b[A-Z][a-zA-Z]{2,}\b/g) || [];
-  const _stop = new Set(['The', 'And', 'Then', 'Create', 'Search', 'Add', 'Click', 'Open', 'New', 'Page', 'Playlist', 'Repeat', 'Process', 'Find', 'Top', 'Songs', 'Track', 'Tracks', 'Menu', 'Button', 'Sidebar', 'URL', 'Music', 'Artist', 'Artists', 'Album', 'Song']);
+  const _stop = new Set(['The', 'And', 'Then', 'Create', 'Search', 'Add', 'Click', 'Open', 'New', 'Page', 'Playlist', 'Repeat', 'Process', 'Find', 'Top', 'Songs', 'Track', 'Tracks', 'Menu', 'Button', 'Sidebar', 'URL', 'Music', 'Artist', 'Artists', 'Album', 'Song', 'Verify', 'Confirm', 'Ensure', 'Check', 'Observe', 'Report', 'Navigate', 'Scroll', 'Wait', 'Type', 'Fill', 'Read']);
   for (const c of _caps) {
     if (!_stop.has(c)) _entityTerms.add(c.toLowerCase());
   }
@@ -6006,8 +6102,26 @@ async function _structuralVerifySubTask(subTask, { page, pageUrl, pageText, tran
     } catch (e) {
       logger.info(`[playwright.agent] structural verify sub-task #${subTask.id}: Gate 2 ERROR — ${e.message} — falling through to Gate 3`);
     }
+  } else if (evidence && (evidence.structure || evidence.text)) {
+    // ── Gate 2b: Snapshot-structure check (extension sessions) ─────────
+    // No engine page, but the ext DOM snapshot IS the container map — element
+    // names/regions stand in for the track-list/search-container DOM probe.
+    // Deterministic: ALL content entity terms must appear in the evidence;
+    // partial presence is inconclusive → Gate 3 (which now sees the structure).
+    const _evText = `${evidence.structure || ''} ${evidence.text || ''}`.toLowerCase();
+    const _contentTerms = _terms.filter(t => !_genericUiLabels.has(t));
+    // Quoted terms are the strong entities ("Take out trash") — require all of
+    // them; without quoted terms, require all content terms (caps-extracted).
+    const _quotedContent = _quotedTerms.filter(t => !_genericUiLabels.has(t));
+    const _searchTerms2 = _quotedContent.length > 0 ? _quotedContent : (_contentTerms.length > 0 ? _contentTerms : _terms);
+    const _present = _searchTerms2.filter(t => _evText.includes(t));
+    if (_searchTerms2.length > 0 && _present.length === _searchTerms2.length) {
+      logger.info(`[playwright.agent] structural verify sub-task #${subTask.id}: Gate 2b PASSED — all entity terms in page ${evidence.textSource || 'evidence'}: ${_present.join(', ')}`);
+      return { verified: true, gate: 'evidence', reason: `all entity terms present in page structure: ${_present.join(', ')}` };
+    }
+    logger.info(`[playwright.agent] structural verify sub-task #${subTask.id}: Gate 2b INCONCLUSIVE — ${_present.length}/${_searchTerms2.length} terms in page structure — falling through to Gate 3`);
   } else {
-    logger.info(`[playwright.agent] structural verify sub-task #${subTask.id}: Gate 2 SKIPPED — no page object`);
+    logger.info(`[playwright.agent] structural verify sub-task #${subTask.id}: Gate 2 SKIPPED — no page object, no evidence`);
   }
 
   // ── Gate 3: LLM verification ─────────────────────────────────────────
@@ -6032,7 +6146,7 @@ VERIFICATION CRITERION: ${subTask.verification}
 
 CURRENT PAGE URL: ${pageUrl || '(unknown)'}
 CURRENT PAGE TEXT (first 500 chars): ${(pageText || '').slice(0, 500)}
-
+${evidence && evidence.structure ? `VISIBLE PAGE ELEMENTS (snapshot — these are the real on-screen elements):\n${evidence.structure.split('\n').slice(0, 80).join('\n')}\n` : ''}
 ACTIONS TAKEN (last ${Math.min(10, (transcript || []).length)} of ${(transcript || []).length}):
 ${_transcriptSummary || '(no actions)'}
 
@@ -6054,7 +6168,7 @@ Return ONLY valid JSON:
           id: 'completed', type: 'noul',
           question: `Was this sub-task completed? "${subTask.description}" — criterion: ${subTask.verification || subTask.description}. Judge on BOTH the current page state AND the action transcript: successful actions consistent with the goal count as evidence (e.g. clicking + typing into an element proves it existed and was usable), even if the page-text excerpt doesn't literally show it. Reserve "no" for genuine absence of evidence.`,
         }],
-        state: `URL: ${pageUrl || '(unknown)'}\nPAGE TEXT: ${(pageText || '').slice(0, 1500)}\nACTIONS:\n${_transcriptSummary || '(none)'}`,
+        state: `URL: ${pageUrl || '(unknown)'}\nPAGE TEXT${evidence && evidence.textSource === 'snapshot' ? ' (from snapshot elements)' : ''}: ${(pageText || '').slice(0, 1500)}${evidence && evidence.structure ? `\nPAGE STRUCTURE:\n${evidence.structure.split('\n').slice(0, 60).join('\n')}` : ''}\nACTIONS:\n${_transcriptSummary || '(none)'}`,
         local: (a) => a.completed ? { completed: a.completed.bool === true, reasoning: `local p=${a.completed.probability?.toFixed(2)}` } : null,
         remote: async () => null,
         logger,
@@ -6987,7 +7101,20 @@ Return ONLY valid JSON:
       // Phrases extracted but some missing → FAIL (don't fall through to VLM,
       // because the DOM check is authoritative when phrases exist).
       logger.warn(`${_logTag}: FAIL (DOM) — ${missing.length}/${phrases.length} phrase(s) missing [titled=${titledPhrases.length}] missing=${JSON.stringify(missing)} title="${_titleLower.slice(0,80)}" titleishVals="${_titleishVals.slice(0,80)}"`);
-      return { pass: false, reason: `Goal phrases missing from expected locations: ${missing.join(', ')}`, source: 'dom', matchedPhrases: matched, missingPhrases: missing };
+      // Surface-contradiction: the page title names a DIFFERENT work surface
+      // than the goal's target — "take out trash" typed into the bookable-
+      // appointment scheduler, not the event form. Stronger than a missing
+      // phrase: the action happened on the wrong surface, so consumers must
+      // treat this as fatal for the step, not a retryable miss.
+      const _SURFACE_NOUNS = /\b(appointment|event|meeting|e-?mail|message|document|spreadsheet|presentation|slide|post|order|booking|invoice|note|reminder|contact|playlist|photo|product|ticket|invoice|form|survey|quiz)\b/gi;
+      const _goalSurfaces = new Set((String(goal || '').toLowerCase().match(_SURFACE_NOUNS) || []));
+      const _titleSurfaces = (String(_titleLower || '').match(_SURFACE_NOUNS) || []).filter(s => !_goalSurfaces.has(s));
+      const _CONTAINERS = /\b(calendar|mail|inbox|drive|home|dashboard|search|settings|schedule)\b/i;
+      const _contradicted = _titleSurfaces.length > 0 && _goalSurfaces.size > 0 && !_CONTAINERS.test(_titleSurfaces.join(' '));
+      if (_contradicted) {
+        logger.warn(`${_logTag}: SURFACE CONTRADICTION — title surface [${_titleSurfaces.join(', ')}] vs goal surface [${[..._goalSurfaces].join(', ')}]`);
+      }
+      return { pass: false, reason: `Goal phrases missing from expected locations: ${missing.join(', ')}`, source: 'dom', matchedPhrases: matched, missingPhrases: missing, contradicted: _contradicted || undefined, contradictedSurface: _contradicted ? _titleSurfaces[0] : undefined };
     }
     // DOM check errored → fall through to VLM
     logger.warn(`${_logTag}: DOM check errored — falling back to VLM`);
@@ -9669,9 +9796,9 @@ Output ONLY the JSON action:`;
 
         // Return = sub-task done
         if (_action.action === 'return') {
-          let _retUrl = '';
-          _retUrl = await _pageUrlOf(page);
-          const _verifyResult = await _checkSubTaskCompletion(_st, page, _retUrl, await page.evaluate(() => document.body.innerText.slice(0, 8000)).catch(() => ''));
+          const _retEv = await _observePage(sessionId, { includeStructure: false }).catch(() => null);
+          const _retUrl = _retEv?.url || '';
+          const _verifyResult = await _checkSubTaskCompletion(_st, page, _retUrl, _retEv?.text || '');
           if (_verifyResult) {
             _st.completed = true;
             logger.info(`[playwright.agent] Tier 1.9: sub-task #${_st.id} completed (return + verification passed)`);
@@ -9838,9 +9965,9 @@ Output ONLY the JSON action:`;
         }
 
         // 5. Check verification
-        let _pageUrl = '', _pageText = '';
-        _pageUrl = await _pageUrlOf(page);
-        _pageText = await page.evaluate(() => document.body.innerText.slice(0, 8000)).catch(() => '');
+        const _ev19 = await _observePage(sessionId, { includeStructure: false }).catch(() => null);
+        const _pageUrl = _ev19?.url || '';
+        const _pageText = _ev19?.text || '';
 
         const _verified = await _checkSubTaskCompletion(_st, page, _pageUrl, _pageText);
         if (_verified) {
@@ -9880,10 +10007,8 @@ Output ONLY the JSON action:`;
 
       if (!_st.completed) {
         // Try structural verification as fallback
-        let _structPageText = '', _structPageUrl = '';
-        try { _structPageText = await page.evaluate(() => document.body.innerText.slice(0, 8000)).catch(() => ''); } catch (_) {}
-        _structPageUrl = await _pageUrlOf(page);
-        const _sv = await _structuralVerifySubTask(_st, { page, pageUrl: _structPageUrl, pageText: _structPageText, transcript: _lpTranscript, sessionId });
+        const _svEv = await _observePage(sessionId).catch(() => ({ url: '', title: '', text: '', structure: '', textSource: 'none', ok: false }));
+        const _sv = await _structuralVerifySubTask(_st, { page, pageUrl: _svEv.url, pageText: _svEv.text, transcript: _lpTranscript, sessionId, evidence: _svEv });
         if (_sv.verified) {
           _st.completed = true;
           logger.info(`[playwright.agent] Tier 1.9: sub-task #${_st.id} completed via structural verification (${_sv.gate}: ${_sv.reason})`);
@@ -11445,10 +11570,10 @@ Output ONLY the JSON action:`;
 
         // Return = sub-task done
         if (_action.action === 'return') {
-          let _retUrl = '';
-          _retUrl = await _pageUrlOf(page);
-          const _retText = await page.evaluate(() => document.body.innerText.slice(0, 8000)).catch(() => '');
-          const _sv = await _structuralVerifySubTask(_st, { page, pageUrl: _retUrl, pageText: _retText, transcript: _vdTranscript, sessionId });
+          const _retEv = await _observePage(sessionId).catch(() => null);
+          const _retUrl = _retEv?.url || '';
+          const _retText = _retEv?.text || '';
+          const _sv = await _structuralVerifySubTask(_st, { page, pageUrl: _retUrl, pageText: _retText, transcript: _vdTranscript, sessionId, evidence: _retEv });
           if (_sv.verified) {
             _st.completed = true;
             logger.info(`[playwright.agent] Tier 1.8: sub-task #${_st.id} completed (return + structural verification: ${_sv.gate}: ${_sv.reason})`);
@@ -11781,11 +11906,11 @@ Output ONLY the JSON action:`;
         // 8. Structural verification — only on return, toastAppeared, or navigated
         const _shouldVerify = _action.action === 'return' || _compare.toastAppeared || _compare.navigated;
         if (_shouldVerify) {
-          let _pageUrl = '', _pageText = '';
-          _pageUrl = await _pageUrlOf(page);
-          _pageText = await page.evaluate(() => document.body.innerText.slice(0, 8000)).catch(() => '');
+          const _ev18 = await _observePage(sessionId).catch(() => null);
+          const _pageUrl = _ev18?.url || '';
+          const _pageText = _ev18?.text || '';
 
-          const _sv = await _structuralVerifySubTask(_st, { page, pageUrl: _pageUrl, pageText: _pageText, transcript: _vdTranscript, sessionId });
+          const _sv = await _structuralVerifySubTask(_st, { page, pageUrl: _pageUrl, pageText: _pageText, transcript: _vdTranscript, sessionId, evidence: _ev18 });
           if (_sv.verified) {
             _st.completed = true;
             logger.info(`[playwright.agent] Tier 1.8: sub-task #${_st.id} completed (structural verification after ${_actionCount} action(s): ${_sv.gate}: ${_sv.reason})`);
@@ -12079,9 +12204,8 @@ Output ONLY the JSON action:`;
         // Return = sub-task done
         if (_action.action === 'return') {
           // Verify the sub-task is actually complete
-          let _retUrl = '';
-          _retUrl = await _pageUrlOf(page);
-          const _verifyResult = await _checkSubTaskCompletion(_st, page, _retUrl, await page.evaluate(() => document.body.innerText.slice(0, 8000)).catch(() => ''));
+          const _retEv = await _observePage(sessionId, { includeStructure: false }).catch(() => null);
+          const _verifyResult = await _checkSubTaskCompletion(_st, page, _retEv?.url || '', _retEv?.text || '');
           if (_verifyResult) {
             _st.completed = true;
             logger.info(`[playwright.agent] state-diff loop: sub-task #${_st.id} completed (return + verification passed)`);
@@ -12166,8 +12290,9 @@ Output ONLY the JSON action:`;
         // 6. Check verification
         let _pageUrl = '', _pageText = '';
         try {
-          _pageUrl = await _pageUrlOf(page);
-          _pageText = await page.evaluate(() => document.body.innerText.slice(0, 8000)).catch(() => '');
+          const _evSd = await _observePage(sessionId, { includeStructure: false });
+          _pageUrl = _evSd.url;
+          _pageText = _evSd.text;
         } catch (_) {}
 
         const _verified = await _checkSubTaskCompletion(_st, page, _pageUrl, _pageText);
@@ -12184,12 +12309,9 @@ Output ONLY the JSON action:`;
       if (!_st.completed) {
         logger.warn(`[playwright.agent] state-diff loop: sub-task #${_st.id} not completed after ${_actionCount} actions — trying structural verification`);
         // Try structural verification as a fallback
-        let _structPageText = '', _structPageUrl = '';
-        try {
-          _structPageText = await page.evaluate(() => document.body.innerText.slice(0, 8000)).catch(() => '');
-          _structPageUrl = await _pageUrlOf(page);
-        } catch (_) {}
-        const _sv = await _structuralVerifySubTask(_st, { page, pageUrl: _structPageUrl, pageText: _structPageText, transcript: _sdTranscript, sessionId });
+        let _sdEv = null;
+        try { _sdEv = await _observePage(sessionId); } catch (_) {}
+        const _sv = await _structuralVerifySubTask(_st, { page, pageUrl: _sdEv?.url || '', pageText: _sdEv?.text || '', transcript: _sdTranscript, sessionId, evidence: _sdEv });
         if (_sv.verified) {
           _st.completed = true;
           logger.info(`[playwright.agent] state-diff loop: sub-task #${_st.id} completed via structural verification (${_sv.gate}: ${_sv.reason})`);
@@ -13356,26 +13478,18 @@ Turn ${turn}/${MAX_TURNS}. What is your next action? (DO NOT snapshot - act dire
       if (_subTasks && _subTasks.length > 0) {
         const _incomplete = _subTasks.filter(s => !s.completed);
         if (_incomplete.length > 0) {
-          let _structPageText = '';
-          let _structPageUrl = '';
           let _structPage = null;
+          let _structEv = null;
           try {
             _structPage = _getPage(sessionId);
-            if (_structPage) {
-              _structPageText = await _structPage.evaluate(() => document.body.innerText.slice(0, 8000)).catch(() => '');
-              _structPageUrl = await _pageUrlOf(_structPage);
-            } else {
-              // Extension-bound session — same read via browserAct evaluate.
-              _structPageText = (await _observeEval(sessionId, () => document.body.innerText.slice(0, 8000))) || '';
-              _structPageUrl = String((await _observeEval(sessionId, () => window.location.href)) || '');
-            }
-          } catch (_) {}
+            _structEv = await _observePage(sessionId);
+          } catch (_) { _structEv = _structEv || { url: '', title: '', text: '', structure: '', textSource: 'none', ok: false }; }
           let _structPassed = 0;
           const _structDetails = [];
           for (const _st of _incomplete) {
             const _sv = await _structuralVerifySubTask(_st, {
-              page: _structPage, pageUrl: _structPageUrl, pageText: _structPageText,
-              transcript: _loopTranscript, sessionId,
+              page: _structPage, pageUrl: _structEv.url, pageText: _structEv.text,
+              transcript: _loopTranscript, sessionId, evidence: _structEv,
             });
             if (_sv.verified) {
               _st.completed = true;
@@ -13436,6 +13550,19 @@ Turn ${turn}/${MAX_TURNS}. What is your next action? (DO NOT snapshot - act dire
         }
       } catch (_rvErr) {
         logger.warn(`[playwright.agent] turn-loop: return verification error (non-fatal): ${_rvErr.message}`);
+      }
+      if (_returnVerify && !_returnVerify.pass && _returnVerify.contradicted) {
+        // Wrong-surface action — looping here can only produce a false-green
+        // step (the appointment-scheduler fill). Fail the step honestly.
+        logger.warn(`[playwright.agent] turn-loop: return FATAL at turn ${turn} — surface contradiction (${_returnVerify.contradictedSurface || 'wrong surface'}): ${_returnVerify.reason}`);
+        return {
+          ok: false, goal, sessionId, turns: _loopTranscript.length,
+          error: `Action performed on the wrong surface (${_returnVerify.contradictedSurface || 'unknown'}) — ${_returnVerify.reason}`,
+          transcript: _loopTranscript,
+          routingDecision: 'turn_loop_fallback',
+          goalVerified: false, surfaceContradiction: true,
+          executionTime: Date.now() - start,
+        };
       }
       if (_returnVerify && !_returnVerify.pass && _returnVerify.source !== 'inconclusive') {
         // Deterministic fail — reject the return and keep looping with a hint.
@@ -14240,18 +14367,11 @@ Turn ${turn}/${MAX_TURNS}. What is your next action? (DO NOT snapshot - act dire
       if (_subTasks && _subTasks.length > 0 && _domMutating) {
         try {
           const _stPage = _getPage(sessionId);
-          // On the extension lane there is no engine page — pull url/text via
-          // _engineEval (browserAct evaluate) so verification isn't blind.
-          let _stUrl = '', _stText = '';
-          if (_stPage) {
-            _stUrl = await _pageUrlOf(_stPage);
-            _stText = await _stPage.evaluate(() => document.body.innerText.slice(0, 5000)).catch(() => '');
-          } else {
-            const _u = await _engineEval(sessionId, 'window.location.href').catch(() => null);
-            if (_u?.ok) _stUrl = String(_u.result || '');
-            const _t = await _engineEval(sessionId, 'document.body ? document.body.innerText.slice(0, 5000) : ""').catch(() => null);
-            if (_t?.ok) _stText = String(_t.result || '');
-          }
+          // Evidence adapter covers both lanes — engine innerText, ext eval,
+          // or snapshot-derived text when innerText is thin (aria-grid UIs).
+          const _stEv = await _observePage(sessionId, { includeStructure: !_stPage, textLen: 5000 }).catch(() => null);
+          const _stUrl = _stEv?.url || '';
+          const _stText = _stEv?.text || '';
           if (_stPage || _stUrl || _stText) {
             let _newlyCompleted = 0;
             for (const _st of _subTasks) {
@@ -14296,28 +14416,27 @@ Turn ${turn}/${MAX_TURNS}. What is your next action? (DO NOT snapshot - act dire
     const _incompletePre = _subTasks.filter(s => !s.completed);
     if (_incompletePre.length > 0) {
       let _preStructPage = null;
-      let _preStructText = '';
-      let _preStructUrl = '';
+      let _preEv = null;
       try {
         _preStructPage = _getPage(sessionId);
-        if (_preStructPage) {
-          _preStructText = await _preStructPage.evaluate(() => document.body.innerText.slice(0, 8000)).catch(() => '');
-          _preStructUrl = await _pageUrlOf(_preStructPage);
-        } else {
-          // Extension-bound session — same read via browserAct evaluate. Without
-          // this the verify LLM sees "URL and text unknown" and can never
-          // confirm completed work (observed: calendar event saved but the task
-          // reported turn_loop_exhausted + ask_user).
-          _preStructText = (await _observeEval(sessionId, () => document.body.innerText.slice(0, 8000))) || '';
-          _preStructUrl = String((await _observeEval(sessionId, () => window.location.href)) || '');
+        // Reuse the loop's own getPageText capture if it's fresh — avoids a
+        // redundant read and preserves evidence the actions already gathered.
+        let _cachedText = '';
+        for (let _i = _loopTranscript.length - 1; _i >= 0; _i--) {
+          const _t = _loopTranscript[_i];
+          if (_t?.action?.action === 'getPageText' && _t?.outcome?.ok && _t?.outcome?.result) {
+            _cachedText = String(_t.outcome.result);
+            break;
+          }
         }
-      } catch (_) {}
+        _preEv = await _observePage(sessionId, { cachedText: _cachedText });
+      } catch (_) { _preEv = _preEv || { url: '', title: '', text: '', structure: '', textSource: 'none', ok: false }; }
       let _preStructPassed = 0;
       const _preStructDetails = [];
       for (const _st of _incompletePre) {
         const _sv = await _structuralVerifySubTask(_st, {
-          page: _preStructPage, pageUrl: _preStructUrl, pageText: _preStructText,
-          transcript: _loopTranscript, sessionId,
+          page: _preStructPage, pageUrl: _preEv.url, pageText: _preEv.text,
+          transcript: _loopTranscript, sessionId, evidence: _preEv,
         });
         if (_sv.verified) {
           _st.completed = true;
@@ -14454,9 +14573,12 @@ Turn ${turn}/${MAX_TURNS}. What is your next action? (DO NOT snapshot - act dire
       // check above. Also handles cart goals that have no extractable phrases
       // (e.g. "add the first result to the cart") via the click-evidence path.
       if (!_preExhaustionVerify || _preExhaustionVerify.source === 'inconclusive') {
-        const _finalPageText = await _ePage.evaluate(() => document.body.innerText.slice(0, 3000)).catch(() => '');
-        let _finalUrl = '';
-        _finalUrl = await _pageUrlOf(_ePage);
+        // Evidence adapter: engine innerText, ext eval, or snapshot-derived text —
+        // whatever the session can actually produce (previously _ePage.evaluate
+        // was blind/null on ext sessions → "page text too short").
+        const _finEv = await _observePage(sessionId, { includeStructure: false });
+        const _finalPageText = _finEv.text || '';
+        let _finalUrl = _finEv.url || '';
         const _signals = _isGoalCompletedBySignals({
           goal, verificationGoal,
           pageText: _finalPageText, pageUrl: _finalUrl,

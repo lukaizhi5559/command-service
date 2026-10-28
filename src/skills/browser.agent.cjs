@@ -4569,7 +4569,7 @@ function _postProgress(callbackUrl, evt) {
 
 const { userAgent } = require('./user.agent.cjs');
 
-const { resolveDestination, recordCorrection, classifyTaskIntent, classifyUrlType, getLearnedCorrection, deleteLearnedCorrection, suggestTaskUrl, _isOnPageAction, getTaskKeywords, getCachedDeepLink, recordDeepLinkCache, deleteDeepLinkCache, getSearchUrlPattern, recordSearchUrlPattern, INTENTS, SERVICE_CHAT_URLS, isAuthFlowUrl, _isValidDeepLinkUrl, _isGenericLandingUrl } = require('../skill-helpers/destination-resolver.cjs');
+const { resolveDestination, recordCorrection, classifyTaskIntent, classifyTaskIntentForService, classifyUrlType, getLearnedCorrection, deleteLearnedCorrection, suggestTaskUrl, _isOnPageAction, getTaskKeywords, getCachedDeepLink, recordDeepLinkCache, deleteDeepLinkCache, getSearchUrlPattern, recordSearchUrlPattern, INTENTS, SERVICE_CHAT_URLS, isAuthFlowUrl, _isValidDeepLinkUrl, _isGenericLandingUrl } = require('../skill-helpers/destination-resolver.cjs');
 const { killExistingChromeForProfile, clearProfileLock, findCli, shortSessionId, _sniffAuthCookies, engine: browserEngine, _parseCliResult } = require('./browser.act.cjs');
 const { loadAppKnowledge, saveAppKnowledge, loadAndFormat, isCacheStale, isShortcutCoverageStale, recordVerification } = require('./lib/appKnowledge.cjs');
 const { parseLlmJson } = require('../skill-helpers/parseLlmJson.cjs');
@@ -8132,7 +8132,83 @@ async function _resolveCheapDeepLink(agentId, serviceKey, baseStartUrl, task, ex
       logger.info(`[browser.agent] deep-link: intent=MAIL derived from taskClassification (send_email) for ${agentId}`);
     }
 
+    // Step -3: Semantic service affinity — resolve WHICH product the task
+    // targets BEFORE intent classification. The old substring map missed
+    // "google event" (no literal 'calendar'); a bounded decision over the
+    // umbrella's products resolves it semantically. Ordering matters: a
+    // wrong 'home' intent verdict must not block affinity (observed: intent
+    // gate skipped the googlecalendar buildUrl lane → LLM suggested the
+    // literal token 'URL' → navigated to google.com/URL).
+    const _UMBRELLA_AFFINITY = {
+      google: {
+        'google calendar': 'googlecalendar', calendar: 'googlecalendar', event: 'googlecalendar', appointment: 'googlecalendar', meeting: 'googlecalendar', schedule: 'googlecalendar',
+        gmail: 'gmail', mail: 'gmail', email: 'gmail',
+        'google docs': 'googledocs', docs: 'googledocs', document: 'googledocs',
+        'google sheets': 'googlesheets', sheets: 'googlesheets', spreadsheet: 'googlesheets',
+        'google slides': 'googleslides', slides: 'googleslides', presentation: 'googleslides',
+        youtube: 'youtube', video: 'youtube',
+      },
+    };
+    let _affSvc = null, _affKey = null;
+    if (_UMBRELLA_AFFINITY[serviceKey]) {
+      const _AFFINITY = _UMBRELLA_AFFINITY[serviceKey];
+      const _tl = ` ${String(task || '').toLowerCase()} `;
+      const _subKey = Object.keys(_AFFINITY).find(k => _tl.includes(` ${k} `));
+      if (_subKey) {
+        _affKey = _AFFINITY[_subKey];
+      } else {
+        // Semantic fallback — bounded decision over the umbrella's products.
+        try {
+          const _decision = require('../skill-helpers/decision.cjs');
+          const _products = [...new Set(Object.values(_AFFINITY))];
+          const _opts = [..._products, 'none'];
+          const _pick = await _decision.boundedDecision({
+            site: 'browserAgent.serviceAffinity',
+            questions: [{
+              id: 'svc', type: 'choice',
+              question: `This task runs on ${serviceKey}. Which ${serviceKey} product does it target? Pick 'none' if it is a plain web search or does not map to a product.`,
+              options: _opts,
+            }],
+            state: `Task: ${String(task || '').slice(0, 200)}`,
+            local: (a) => (a.svc?.index != null && a.svc.index < _opts.length - 1) ? _opts[a.svc.index] : null,
+            remote: async () => null,
+            logger,
+          });
+          if (_pick) _affKey = _pick;
+        } catch (_) { /* fail-open */ }
+      }
+      _affSvc = _affKey ? lookupBrowserService(_affKey) : null;
+      if (_affSvc) logger.info(`[browser.agent] deep-link: affinity ${serviceKey}→${_affKey} (${_subKey ? 'substring' : 'semantic'})`);
+    }
+    // Concrete services self-affinitize — a service that declares intentUrls IS
+    // its own affinity map. Only umbrella keys populated _affSvc before, so a
+    // concrete serviceKey like googlecalendar skipped the scoped reclassify
+    // and its buildUrl lanes entirely (observed: intent stayed content_create
+    // and a stale appKnowledge seed beat the unused scheduling template).
+    if (!_affSvc) {
+      const _selfSvc = lookupBrowserService(serviceKey);
+      if (_selfSvc?.intentUrls && Object.keys(_selfSvc.intentUrls).length) {
+        _affSvc = _selfSvc;
+        _affKey = _svcNorm;
+      }
+    }
+
     let intent = _clsMail || await classifyTaskIntent(task, serviceKey);
+
+    // Service-scoped intent — when the affinity service declares an intent
+    // menu, classify against IT (3-6 options) instead of trusting the global
+    // 19-enum verdict. 'home'/'none' from the global pass gets a second,
+    // narrower vote rather than silently skipping every deterministic lane.
+    if (_affSvc?.intentUrls && (!_clsMail)) {
+      const _scoped = await classifyTaskIntentForService(task, Object.keys(_affSvc.intentUrls), _affKey)
+        .catch(() => null);
+      if (_scoped && _scoped !== 'home' && _scoped !== intent) {
+        logger.info(`[browser.agent] deep-link: service-scoped reclassify ${intent} → ${_scoped} for ${_affKey}`);
+        intent = _scoped;
+      } else if (_scoped && _scoped !== 'home') {
+        intent = _scoped;
+      }
+    }
 
     // Mail-family services declare a `mail` intent with the real compose
     // deep-link (?compose=new). "Compose/send an email" reliably classifies as
@@ -8167,25 +8243,14 @@ async function _resolveCheapDeepLink(agentId, serviceKey, baseStartUrl, task, ex
     // Compute criteria-task status before the appKnowledge/keyword checks reference it.
     const _isCriteriaTask = _isSearchCriteriaTask(task, _dlTaskCls);
 
-    // Step -2: Service affinity — a sub-service named in the task outranks
-    // the umbrella service's keyspace. Canonicalization collapses
-    // google_calendar.agent → google.agent, so a calendar task resolves under
-    // 'google' whose cache is a grab-bag (observed: poisoned ServiceLogin +
-    // fabricated /r/day/week/nextweek/5am served while calendar.google.com
-    // held the correct eventedit URL). Consult the affinity service's code
-    // template + verified intent_url FIRST.
-    if (!_isCriteriaTask && intent && intent !== INTENTS.HOME && serviceKey === 'google') {
-      const _AFFINITY = {
-        'google calendar': 'googlecalendar', calendar: 'googlecalendar',
-        gmail: 'gmail', mail: 'gmail',
-        'google docs': 'googledocs', docs: 'googledocs', document: 'googledocs',
-        'google sheets': 'googlesheets', sheets: 'googlesheets', spreadsheet: 'googlesheets',
-        youtube: 'youtube',
-      };
-      const _tl = ` ${String(task || '').toLowerCase()} `;
-      const _affKey = Object.keys(_AFFINITY).find(k => _tl.includes(` ${k} `));
-      const _affSvc = _affKey ? lookupBrowserService(_AFFINITY[_affKey]) : null;
-      if (_affSvc) {
+    // Step -2: Service affinity URL lane — uses the service resolved in Step
+    // -3 (substring fast-path or semantic decision). A sub-service outranks
+    // the umbrella's keyspace — 'google' cache is a grab-bag (poisoned
+    // ServiceLogin + fabricated /r/day/week/nextweek/5am served while
+    // calendar.google.com held the correct eventedit URL). The intent
+    // requirement stays on the URL lookup, not the service resolution.
+    if (!_isCriteriaTask && intent && intent !== INTENTS.HOME && _affSvc) {
+      {
         try {
           const _affHost = (_affSvc.hostAliases && _affSvc.hostAliases[0])
             || new URL(_affSvc.startUrl).hostname.replace(/^www\./, '');
@@ -8210,6 +8275,13 @@ async function _resolveCheapDeepLink(agentId, serviceKey, baseStartUrl, task, ex
         } catch (_) { /* affinity misses are non-fatal */ }
       }
     }
+    // Affinity base URL — service resolved but intent is home (or its URL
+    // lane missed): land on the PRODUCT's startUrl, not the umbrella's.
+    // "open google calendar" → calendar.google.com, not google.com.
+    if (!_isCriteriaTask && _affSvc?.startUrl && (!intent || intent === INTENTS.HOME)) {
+      logger.info(`[browser.agent] deep-link: affinity base ${serviceKey}→${_affKey}: ${_affSvc.startUrl}`);
+      return { url: _affSvc.startUrl, source: 'affinity-base', intent, isCriteriaTask: _isCriteriaTask, baseHost: _hostOfUrl(_affSvc.startUrl), taskKeywords: _taskKeywords, needsPromote: false };
+    }
 
     // Step -1: appKnowledge intent_url check (highest priority, verified cache).
     // If we have a verified intent→URL mapping for this hostname+intent, use it
@@ -8219,7 +8291,30 @@ async function _resolveCheapDeepLink(agentId, serviceKey, baseStartUrl, task, ex
     if (!_isCriteriaTask && intent && intent !== INTENTS.HOME) {
       try {
         const { loadIntentUrl } = require('./lib/appKnowledge.cjs');
-        const _akUrl = loadIntentUrl(baseHost, intent);
+        const _svcEntry = lookupBrowserService(serviceKey);
+        // Parameterized builder beats any cache entry for the same intent —
+        // buildUrl encodes live entities (dates=/text=/location=) that no
+        // cached URL can carry. Cache is for intents the registry can't build.
+        const _ctTmpl = _svcEntry?.intentUrls?.[intent];
+        if (_ctTmpl?.buildUrl) {
+          let _bUrl = null;
+          try { _bUrl = _ctTmpl.buildUrl(task, { task, encodedQuery: '', dest: null }); } catch (_) {}
+          if (_bUrl && _isValidDeepLinkUrl(_bUrl)
+              && _deepLinkHostAllowed(_hostOfUrl(_bUrl), baseHost, _svcEntry)
+              && !_isSigninWall(_bUrl)) {
+            logger.info(`[browser.agent] deep-link: code-template ${baseHost}/${intent}: ${_bUrl}`);
+            return { url: _bUrl, source: 'code-template', intent, isCriteriaTask: _isCriteriaTask, baseHost, taskKeywords: _taskKeywords, needsPromote: false };
+          }
+        }
+        let _akUrl = loadIntentUrl(baseHost, intent);
+        // Orphaned intent key — the service declares an intent menu that no
+        // longer contains this intent (e.g. content_create renamed to
+        // scheduling): the entry can never re-validate; purge, don't use.
+        if (_akUrl?.url && _svcEntry?.intentUrls && !_svcEntry.intentUrls[intent]) {
+          logger.warn(`[browser.agent] deep-link: purging orphaned appKnowledge intent_url ${baseHost}/${intent} → ${_akUrl.url} (service menu: ${Object.keys(_svcEntry.intentUrls).join(',')})`);
+          try { require('./lib/appKnowledge.cjs').removeIntentUrl(baseHost, intent); } catch (_) {}
+          _akUrl = null;
+        }
         // Code-seeded entries (saved with verified:true at seed time but never
         // exercised by a real run — verifiedRuns===0) freeze whatever the
         // intentUrls template said at seed time. When the template has since
@@ -8724,6 +8819,42 @@ async function _resolveTaskDeepLink(agentId, serviceKey, baseStartUrl, task, exi
       _suggestKeywords = suggestion?.keywords || [];
     }
 
+    // 2.4. Search-oracle — on local miss, the web itself resolves the URL
+    // semantically (a "<service> create event direct url" query surfaces the
+    // actionable link in result text). Candidates pass the full guard stack
+    // and land in the learned intent_url cache at unverified confidence —
+    // search discovers, cache persists, verification decays.
+    if (!candidate && intent && intent !== INTENTS.HOME) {
+      try {
+        const _q = `${serviceKey} ${String(task || '').slice(0, 120)} direct url link`;
+        const _oracleText = await agentWebSearch(_q);
+        const _urls = (String(_oracleText || '').match(/https?:\/\/[^\s"'<>\])}]+/g) || [])
+          .map(u => u.replace(/[.,;:!?]+$/, ''));
+        const _svcHost = _affSvc ? _hostOfUrl(_affSvc.startUrl) : baseHost;
+        const _hit = _urls.find(u => {
+          const h = _hostOfUrl(u);
+          return h && (h === _svcHost || h.endsWith('.' + _svcHost));
+        });
+        if (_hit && _isValidDeepLinkUrl(_hit) && !_isSigninWall(_hit)
+            && !/^\/(url|link|path|page|website|domain|address)\/?$/i.test(new URL(_hit).pathname)) {
+          candidate = _hit;
+          candidateSource = 'search-oracle';
+          try {
+            // Entity-parameterized URLs (dates=, text=, title=) are specific to
+            // this task — caching them under a generic intent key turns one
+            // task's entities into the next task's seed.
+            if (!/[?&](?:text|dates?|title|subject|body|dtstart|dtend|location)=/i.test(_hit)) {
+              const { saveIntentUrl } = require('./lib/appKnowledge.cjs');
+              saveIntentUrl(_svcHost, intent, _hit, null, { confidence: 0.3 });
+            }
+          } catch (_) { /* advisory */ }
+          logger.info(`[browser.agent] deep-link: search-oracle → ${_hit}`);
+        }
+      } catch (e) {
+        logger.debug(`[browser.agent] deep-link: search-oracle failed: ${e.message}`);
+      }
+    }
+
     // 2.5. Try web.agent discover_task_url — only when suggestion found nothing.
     if (!candidate && !(_isMutationIntent(intent) && !_isReadOnlyTask(task, intent, _dlTaskCls))) {
       try {
@@ -8913,6 +9044,10 @@ async function _resolveTaskDeepLink(agentId, serviceKey, baseStartUrl, task, exi
       } else {
         setImmediate(() => {
           try {
+            // Same entity-param guard as the search-oracle lane — a URL
+            // carrying dates=/text=/title= is one task's data, not a reusable
+            // destination for the intent.
+            if (/[?&](?:text|dates?|title|subject|body|dtstart|dtend|location)=/i.test(candidate)) return;
             const { saveIntentUrl } = require('./lib/appKnowledge.cjs');
             saveIntentUrl(baseHost, intent, candidate);
             logger.info(`[browser.agent] deep-link: cached intent_url ${intent} → ${candidate} in appKnowledge for ${baseHost}`);
@@ -14831,7 +14966,12 @@ async function browserAgent(args) {
         } else if (_sid) {
           logger.info(`[browser.agent] resolve_deep_link: live shared session ${_sid} — not closing (resolution reuses the caller's session)`);
         }
-        return { ok: !!_dlUrl, deepLinkUrl: _dlUrl, deepLinkSource: _result?.source || null };
+        // Pass the full resolution facts back — intent/baseHost/deepLinkType
+        // feed state.taskFacts in preflightAgents (single-source-of-truth task
+        // object) so downstream layers read facts instead of re-deriving.
+        let _dlType = null;
+        try { _dlType = _dlUrl ? require('../skill-helpers/deep-link-types.cjs').classifyDeepLinkType(_dlUrl) : null; } catch (_) {}
+        return { ok: !!_dlUrl, deepLinkUrl: _dlUrl, deepLinkSource: _result?.source || null, deepLinkIntent: _result?.intent || null, baseHost: _result?.baseHost || null, taskKeywords: _result?.taskKeywords || null, deepLinkType: _dlType };
     }
 
     default:

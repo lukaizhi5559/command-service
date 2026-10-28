@@ -376,6 +376,27 @@ function saveIntentUrl(hostname, intent, url, taskPattern = null, opts = {}) {
 }
 
 /**
+ * Remove a cached intent_url entry. Used for orphaned intent keys — a service
+ * renamed its intent (e.g. content_create → scheduling) so the old seed can
+ * never re-validate against the service's declared intentUrls menu.
+ */
+function removeIntentUrl(hostname, intent) {
+  const h = _safeHostname(hostname);
+  if (!h || !intent) return false;
+  try {
+    const p = _cachePath(h);
+    if (!fs.existsSync(p)) return false;
+    const data = JSON.parse(fs.readFileSync(p, 'utf8'));
+    if (!data || !Array.isArray(data.entries)) return false;
+    const id = `${h}.intent_url.${intent}`;
+    const fresh = data.entries.filter(e => e.id !== id);
+    if (fresh.length === data.entries.length) return false;
+    fs.writeFileSync(p, JSON.stringify({ ...data, entries: fresh, lastUpdated: _nowISO() }, null, 2));
+    return true;
+  } catch (_) { return false; }
+}
+
+/**
  * Load a cached page-shape ("form_map") for a hostname+intent — the shape-level
  * parallel of intent_url. The shape record carries semantic-role selectors
  * (never positional ref-ids), a surface signature that disambiguates same-URL
@@ -487,6 +508,7 @@ module.exports = {
   isShortcutCoverageStale,
   loadIntentUrl,
   saveIntentUrl,
+  removeIntentUrl,
   loadFormMap,
   saveFormMap,
   loadPlaybook,

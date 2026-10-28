@@ -14,6 +14,7 @@
 
 const assert  = require('assert').strict;
 const path    = require('path');
+const fs      = require('fs');
 const { EventEmitter } = require('events');
 
 // ─── Shared mutable mock state (reset between tests) ─────────────────────────
@@ -23,6 +24,7 @@ const mockDbRows    = {};     // tableName → rows[]
 let mockSpawnResult = null;   // { stdout, stderr, exitCode } for non-which spawns
 const mockExecFileMap = {};   // cmd → { err, stdout, stderr }
 const execFileCalls = [];     // tracks every execFile(cmd, ...) call
+const mockWhichFails = new Set(); // binary names for which `which <name>` should fail (exit 1)
 
 // ─── Fake WebSocket (ws) ──────────────────────────────────────────────────────
 // callLLM opens a WS, waits for open, sends a request, accumulates stream chunks.
@@ -62,6 +64,25 @@ class MockDuckdbDatabase {
   }
   run(sql, ...p) {
     const cb = p.find(x => typeof x === 'function');
+    // Minimal INSERT OR REPLACE support so writes land in mockDbRows and
+    // subsequent SELECTs see them (e.g. build_agent → re-lookup in the run path).
+    const vals = p.filter(x => typeof x !== 'function');
+    const m = sql.match(/INSERT OR REPLACE INTO\s+(\w+)\s*\(([^)]+)\)\s*VALUES\s*\(([^)]+)\)/i);
+    if (m) {
+      const table    = m[1];
+      const cols     = m[2].split(',').map(s => s.trim());
+      const valExprs = m[3].split(',').map(s => s.trim());
+      let vi = 0;
+      const row = {};
+      cols.forEach((col, i) => {
+        const v = valExprs[i];
+        if (v === '?') row[col] = vals[vi++];
+        else if (/^'.*'$/.test(v)) row[col] = v.slice(1, -1);
+        else row[col] = null; // CURRENT_TIMESTAMP and other expressions
+      });
+      mockDbRows[table] = mockDbRows[table] || [];
+      mockDbRows[table].push(row);
+    }
     if (cb) process.nextTick(() => cb(null));
   }
   all(sql, ...p) {
@@ -105,10 +126,14 @@ const fakeCp = {
     proc.stdout = new EventEmitter();
     proc.stderr = new EventEmitter();
     proc.stdin  = { write: () => {}, end: () => {} };
-    // 'which' lookups must succeed so whichCli() resolves a binary path.
+    // 'which' lookups succeed by default so whichCli() resolves a binary path;
+    // entries in mockWhichFails simulate a genuinely-absent binary (production
+    // reality for api_key/OAuth services like notion).
     const isWhich = (cmd === 'which');
     const res = isWhich
-      ? { stdout: `/usr/local/bin/${argv[0]}\n`, stderr: '', exitCode: 0 }
+      ? (mockWhichFails.has(argv[0])
+          ? { stdout: '', stderr: '', exitCode: 1 }
+          : { stdout: `/usr/local/bin/${argv[0]}\n`, stderr: '', exitCode: 0 })
       : (mockSpawnResult || { stdout: '', stderr: '', exitCode: 0 });
     setImmediate(() => {
       if (res.stdout) proc.stdout.emit('data', res.stdout);
@@ -153,6 +178,17 @@ if (ddbKey) {
   require.cache[ddbKey] = { id: ddbKey, filename: ddbKey, loaded: true, exports: mockDuckdb };
 }
 
+// terminal.agent — cli.agent opens labeled PTY sessions during build_agent and
+// for pty_exec/pty_send loop actions. A failing stub keeps _openVisibleSession
+// returning null so all PTY paths no-op instead of spawning a real terminal.
+try {
+  const termKey = require.resolve('../src/skills/terminal.agent.cjs');
+  require.cache[termKey] = {
+    id: termKey, filename: termKey, loaded: true,
+    exports: { terminalAgent: async () => ({ ok: false, error: 'mock: terminal disabled in tests' }) },
+  };
+} catch (_) { /* terminal.agent unresolvable — non-fatal */ }
+
 // ─── Load skill modules (picks up all mocked dependencies) ───────────────────
 const { cliAgent }     = require('../src/skills/cli.agent.cjs');
 const { browserAgent } = require('../src/skills/browser.agent.cjs');
@@ -196,6 +232,7 @@ async function test(name, fn) {
   mockLLMResponse  = null;
   mockLLMResponses  = null;
   mockSpawnResult = null;
+  mockWhichFails.clear();
   Object.keys(mockDbRows).forEach(k => delete mockDbRows[k]);
   Object.keys(mockExecFileMap).forEach(k => delete mockExecFileMap[k]);
   execFileCalls.length = 0;
@@ -234,6 +271,7 @@ async function runAll() {
   // U-02: cli.agent unknown agentId → needsBuild
   await test('U-02: cli.agent unknown agentId returns needsBuild=true', async () => {
     mockDbRows['agents'] = [];   // empty — agent not found
+    mockWhichFails.add('notion'); // no `notion` binary in production — PATH gate must decline the self-heal
 
     const result = await cliAgent({ action: 'run', agentId: 'notion.agent', task: 'create a page' });
 
@@ -528,6 +566,42 @@ async function runAll() {
     assert.equal(result.authed,       true,  'authed should be true');
     assert.equal(result.authVerified, true,  'authVerified should be true');
     assert.equal(navigateUrl,         'https://app.notion.com', `navigate URL should be canonical after migration, got: ${navigateUrl}`);
+  });
+
+  // U-11: cli.agent missing agentId + binary on PATH → self-heal auto-builds
+  // the agent (registers git.agent in DuckDB) then runs the task. Reproduces
+  // the production git.agent failure: planner referenced an agentId that was
+  // never registered.
+  await test('U-11: cli.agent run auto-builds missing agent when CLI is on PATH', async () => {
+    mockDbRows['agents'] = [];  // git.agent unregistered
+    // Minimal output — no Commands:/{a,b,c} blocks so discoverSetupFromHelp /
+    // _discoverVerifyCmd finish without extra LLM calls.
+    mockSpawnResult = { stdout: 'git version 2.39.0\n', stderr: '', exitCode: 0 };
+    // LLM sequence across the auto-build + agentic run:
+    mockLLMResponses = [
+      '{"cli":"git","hasCli":true}',                                      // resolveCLIMeta (git absent from seed map + cli-registry)
+      '{"capabilities":["commit","status"]}',                              // extractCapabilitiesAndFlags
+      '{"pre_steps":[]}',                                                  // inferPreSteps (buildDescriptorMd)
+      '{"action":"run_cmd","argv":["commit","-m","t"]}',                   // agentic loop turn 1
+      '{"action":"done","result":"committed","summary":"Committed"}',      // agentic loop turn 2
+    ];
+    // Suppress real writes under ~/.thinkdrop (agent .md, allowed-commands.json).
+    const _origWrite = fs.writeFileSync, _origMkdir = fs.mkdirSync;
+    fs.writeFileSync = (p, ...rest) => String(p).includes('.thinkdrop') ? undefined : _origWrite.call(fs, p, ...rest);
+    fs.mkdirSync     = (p, ...rest) => String(p).includes('.thinkdrop') ? undefined : _origMkdir.call(fs, p, ...rest);
+    try {
+      const result = await cliAgent({ action: 'run', agentId: 'git.agent', task: 'commit changes' });
+
+      assert.equal(result.ok,      true,         `ok should be true, got: ${JSON.stringify(result)}`);
+      assert.equal(result.agentId, 'git.agent',  `agentId should be git.agent, got: ${JSON.stringify(result)}`);
+      assert.ok(
+        (mockDbRows['agents'] || []).some(r => r.id === 'git.agent' && r.type === 'cli' && r.cli_tool === 'git'),
+        `auto-build should have registered git.agent (type=cli, cli_tool=git), rows: ${JSON.stringify(mockDbRows['agents'])}`
+      );
+    } finally {
+      fs.writeFileSync = _origWrite;
+      fs.mkdirSync     = _origMkdir;
+    }
   });
 
   // ── Summary ────────────────────────────────────────────────────────────────

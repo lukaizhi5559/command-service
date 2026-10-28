@@ -669,6 +669,25 @@ async function domAct(args = {}) {
   if (args._abortSignal) {
     try { args._abortSignal.removeEventListener('abort', _onCallerAbort); } catch (_) {}
   }
+  // Read-only guard — a mutation goal can never be satisfied by actions that
+  // only READ the page. Observed: a calendar-event delete step returned
+  // "Get page text → ok" and downstream synthesis hedged instead of failing —
+  // the event was never touched. With no click/fill/key/submit/nav evidence
+  // the step did nothing; report unsatisfied so the planner replans.
+  if (res?.ok && !res.alreadySatisfied && !res.mutationApplied
+      && /\b(delete|delte|remove|erase|trash|cancel|send|post|submit|create|add|book|schedule|rename|edit|update|fill|type|click|select|check|purchase|order|pay|reschedul\w*|move|change)\b/i.test(goal)) {
+    const _hist = [...(res.actionHistory || []), ...(res.transcript || [])].map(String);
+    const _mutEvidence = _hist.some(h => /\b(click|fill|type|keypress|press|enter|submit|delet\w*|remov\w*|select|save|send|post|confirm|tap|drag|nav|open)\w*\b/i.test(h));
+    if (!_mutEvidence) {
+      logger.warn(`[dom.act] mutation goal answered by read-only actions only — reporting unsatisfied ("${goal.slice(0, 60)}")`);
+      return {
+        ok: false, unsatisfied: true,
+        error: 'read-only actions cannot satisfy a mutation goal',
+        resolvedAgent: lastRoute?.agent, routeRule: lastRoute?.rule, sessionId,
+        output: res.output || res.result || '',
+      };
+    }
+  }
   return { ...(res || {}), resolvedAgent: lastRoute?.agent, routeRule: res?.routeRule || lastRoute?.rule, sessionId };
 }
 

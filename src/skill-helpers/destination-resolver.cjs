@@ -352,6 +352,38 @@ Answer:`;
   return INTENTS.HOME;
 }
 
+// ── Service-scoped intent ────────────────────────────────────────────────────
+// When the resolved service declares its own intent menu (intentUrls keys),
+// classify against THAT menu (3-6 options) instead of the global 19-enum —
+// "set a google event" against [scheduling, search, home] is unambiguous
+// where the global enum lost it to 'home'. Returns null on no-answer so
+// callers can fall back to the global path.
+async function classifyTaskIntentForService(task, serviceIntents = [], serviceKey = '') {
+  const _scoped = _scopeTaskText(task, 280);
+  if (!_scoped.trim() || !Array.isArray(serviceIntents) || !serviceIntents.length) return null;
+  const _options = [...new Set([...serviceIntents, 'search', 'home'])].filter(i => VALID_INTENTS.has(i) || i === 'search' || i === 'home');
+  try {
+    const _decision = require('./decision.cjs');
+    const _local = await _decision.boundedDecision({
+      site: 'destinationResolver.serviceIntent',
+      questions: [{
+        id: 'intent', type: 'choice',
+        question: `This task targets the "${serviceKey || 'this'}" service, which supports these actions: ${serviceIntents.join(', ')}. Which action does the task want? Pick 'home' only if none fit.`,
+        options: _options,
+      }],
+      state: `Task: ${_scoped}`,
+      local: (a) => (a.intent?.index != null && a.intent.index < _options.length) ? _options[a.intent.index] : null,
+      remote: async () => null,
+      logger,
+    });
+    if (_local) {
+      logger.debug(`[destination-resolver] service-scoped intent: "${_local}" (${serviceKey} menu) for "${_scoped.slice(0, 60)}"`);
+      return _local;
+    }
+  } catch (_) { /* fail-open */ }
+  return null;
+}
+
 // ── URL endpoint type classifier ──────────────────────────────────────────────
 // Given a URL, return the type of endpoint it most likely represents.
 
@@ -971,12 +1003,33 @@ Do not include any explanation, markdown, or trailing punctuation.`;
       return { ok: false, error: 'LLM returned no URL' };
     }
 
+    // Candidate must be URL-shaped before relative resolution — the model
+    // once echoed the format token 'URL', which new URL() happily resolved
+    // to https://www.google.com/URL and the same-host check blessed it.
+    if (!/^(https?:\/\/|\/)/i.test(candidate)) {
+      return { ok: false, error: `LLM returned non-URL candidate: ${candidate.slice(0, 60)}` };
+    }
+
     // Resolve relative URLs against startUrl
     let resolved;
     try {
       resolved = new URL(candidate, cleanStartUrl).href;
     } catch (_) {
       return { ok: false, error: `LLM returned unparseable URL: ${candidate}` };
+    }
+
+    // Post-resolve placeholder check — a single-segment path that is itself
+    // a placeholder word ("/URL", "/link") is model echo, not a destination.
+    if (/^\/(url|link|path|page|website|domain|address)\/?$/i.test(new URL(resolved).pathname)) {
+      return { ok: false, error: `LLM returned placeholder path: ${resolved}` };
+    }
+
+    // Unresolved template tokens — the model echoed a parameterized template
+    // instead of a real destination ("eventedit?eid=EVENT_ID"). Observed: a
+    // Calendar delete task navigated to a literal eid=EVENT_ID URL and looped
+    // waiting-for-input forever.
+    if (_hasUnresolvedToken(resolved)) {
+      return { ok: false, error: `LLM returned URL with unresolved placeholder: ${resolved}` };
     }
 
     // Security: must stay on the expected service domain or a subdomain
@@ -1007,6 +1060,15 @@ const DEEPLINK_NS = 'nav-deeplink';
 const KEYWORD_MATCH_THRESHOLD = 0.5; // raised from 0.4 — 40% overlap was too loose
 const MAX_ROUTE_KEYWORDS = 8; // cap per-route keyword accumulation (LRU) — prevents keyword sponge
 
+/** Unresolved template placeholder in a URL — model echoed a template
+ *  ("eid=EVENT_ID", "{eventId}", "<id>", "?id=YOUR_ID") rather than a real
+ *  destination. All-caps X_Y tokens ≥6 chars and {}/<> markers count; a real
+ *  event id is mixed-case alphanumeric so this doesn't false-positive. */
+const _UNRESOLVED_TOKEN_RE = /\{[^{}]{1,40}\}|<[a-zA-Z_]{2,40}>|(?:^|[=?&#/])(?:[A-Z][A-Z0-9]{2,}_[A-Z0-9_]+|URL|URI|PLACEHOLDER|EXAMPLE|INSERT_[A-Z_]+|YOUR_[A-Z_]+|EVENT_ID|ITEM_ID|TASK_ID|DOC_ID|FILE_ID|PAGE_ID|MESSAGE_ID|THREAD_ID)(?=[=?&#/]|$)/;
+function _hasUnresolvedToken(url) {
+  return _UNRESOLVED_TOKEN_RE.test(String(url || ''));
+}
+
 /**
  * Validate a deep-link URL before caching it.
  * Rejects malformed URLs with duplicated leading labels (docs.docs., mail.mail., www.www.),
@@ -1016,6 +1078,8 @@ function _isValidDeepLinkUrl(url) {
   if (!url || typeof url !== 'string') return false;
   let parsed;
   try { parsed = new URL(url); } catch (_) { return false; }
+  // Unresolved template placeholders — never a real destination.
+  if (_hasUnresolvedToken(url)) return false;
   const host = parsed.hostname.replace(/^www\./, '');
   // Reject duplicated leading labels (e.g., docs.docs.google.com, mail.mail.google.com)
   const labels = host.split('.');
@@ -1482,6 +1546,7 @@ module.exports = {
   getLearnedCorrection,
   deleteLearnedCorrection,
   suggestTaskUrl,
+  classifyTaskIntentForService,
   _isOnPageAction,
   getTaskKeywords,
   getCachedDeepLink,

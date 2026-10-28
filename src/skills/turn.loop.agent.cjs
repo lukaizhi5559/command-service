@@ -71,7 +71,7 @@ async function turnLoopAgent(args = {}) {
     return {
       ok: !!(res?.ok || res?.success || res?.goalVerified),
       output: res?.output || res?.result || res?.finalResult || (res?.ok ? 'done' : undefined),
-      error: res?.error,
+      error: res?.error || (res && res.ok === false ? 'turn.loop failed (no error detail)' : undefined),
       suggestedAgent: res?.ok ? undefined : 'tab.map.agent',
       sessionId,
       actionHistory: Array.isArray(res?.actionHistory) ? res.actionHistory

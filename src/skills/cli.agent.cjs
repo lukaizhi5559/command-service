@@ -1304,6 +1304,42 @@ Rules:
 - If the task is ambiguous, pick the most common/safe interpretation
 - If the task genuinely cannot be expressed as a single CLI invocation, set argv to [] and explain in reasoning`;
 
+// Registry lookup for the agentic run path. missingAgent distinguishes "no row
+// for this id" (self-heal can rebuild the descriptor) from "row exists but the
+// binary is gone" (build_agent early-returns on existing rows — useless here).
+async function _lookupCliRunAgent(agentId, task) {
+  return await withDb(async (db) => {
+    const rows = await db.all(
+      'SELECT id, type, cli_tool, descriptor, status FROM agents WHERE id = ?', agentId
+    ).catch(() => null);
+
+    if (!rows || rows.length === 0) {
+      return { ok: false, error: `No agent found: ${agentId}. Use action:build_agent to create it first.`, needsBuild: true, missingAgent: true };
+    }
+
+    const agent = rows[0];
+    if (agent.status === 'needs_update') {
+      logger.warn(`[cli.agent] run: agent ${agentId} status=needs_update, proceeding anyway`);
+    }
+
+    const cliTool = agent.cli_tool;
+    if (!cliTool) {
+      if (agent.type === 'browser') {
+        return { ok: false, error: `Agent ${agentId} is a browser agent — route through browser.agent instead.`, delegateTo: 'browser.agent' };
+      }
+      return { ok: false, error: `Agent ${agentId} has no cli_tool (type: ${agent.type || 'unknown'}) — cannot run via cli.agent` };
+    }
+
+    const binPath = await whichCli(cliTool);
+    if (!binPath) {
+      return { ok: false, error: `CLI not found: ${cliTool}. Run action:build_agent to reinstall.`, needsBuild: true };
+    }
+
+    logger.info(`[cli.agent] agentic run: ${agentId} task="${task}"`);
+    return { ok: true, agent, cliTool, binPath };
+  });
+}
+
 async function actionRun({ cli, argv = [], cwd, env, timeoutMs, stdin, agentId, task, _progressCallbackUrl, _stepIndex, protectedPaths }) {
   // ── Generic task-mode: no registered agent — same observe→adapt→retry
   // discipline, but run_shell becomes the primary verb since there is no
@@ -1315,31 +1351,26 @@ async function actionRun({ cli, argv = [], cwd, env, timeoutMs, stdin, agentId, 
 
   // ── Agentic path: agentId + task → LLM infers argv from descriptor ──
   if (agentId && task) {
-    const agentResult = await withDb(async (db) => {
-      const rows = await db.all(
-        'SELECT id, cli_tool, descriptor, status FROM agents WHERE id = ?', agentId
-      ).catch(() => null);
+    let agentResult = await _lookupCliRunAgent(agentId, task);
 
-      if (!rows || rows.length === 0) {
-        return { ok: false, error: `No agent found: ${agentId}. Use action:build_agent to create it first.`, needsBuild: true };
+    // Self-heal a missing agent — mirrors browser.agent's run-time auto-build.
+    // Planner context can reference agentIds that were never registered (e.g.
+    // preflight marks a detected-but-unregistered CLI as ready). Only attempt
+    // the build when the binary is already on PATH — a descriptor-only build,
+    // zero install side-effects. No-binary and api_key/OAuth services keep the
+    // needsBuild contract so recovery can schedule an explicit build_agent step.
+    if (!agentResult.ok && agentResult.needsBuild && agentResult.missingAgent) {
+      const serviceKey = String(agentId).replace(/\.agent$/i, '').toLowerCase().replace(/[^a-z0-9]/g, '');
+      if (serviceKey && (await whichCli(serviceKey))) {
+        logger.info(`[cli.agent] run: agent "${agentId}" not found but "${serviceKey}" is on PATH — auto-building`);
+        const buildRes = await actionBuildAgent({ service: serviceKey }).catch(err => ({ ok: false, error: err.message }));
+        if (buildRes?.ok) {
+          agentResult = await _lookupCliRunAgent(agentId, task);
+        } else {
+          logger.warn(`[cli.agent] run: auto-build for "${agentId}" failed: ${buildRes?.error || 'unknown'}`);
+        }
       }
-
-      const agent = rows[0];
-      if (agent.status === 'needs_update') {
-        logger.warn(`[cli.agent] run: agent ${agentId} status=needs_update, proceeding anyway`);
-      }
-
-      const cliTool = agent.cli_tool;
-      if (!cliTool) return { ok: false, error: `Agent ${agentId} has no cli_tool — cannot run` };
-
-      const binPath = await whichCli(cliTool);
-      if (!binPath) {
-        return { ok: false, error: `CLI not found: ${cliTool}. Run action:build_agent to reinstall.`, needsBuild: true };
-      }
-
-      logger.info(`[cli.agent] agentic run: ${agentId} task="${task}"`);
-      return { ok: true, agent, cliTool, binPath };
-    });
+    }
 
     if (!agentResult.ok) return agentResult;
     const { agent, cliTool, binPath } = agentResult;
