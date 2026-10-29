@@ -18,6 +18,9 @@
 // ---------------------------------------------------------------------------
 
 const logger = require('./logger.cjs');
+const http = require('http');
+
+const MEMORY_PORT = parseInt(process.env.MEMORY_SERVICE_PORT || '3001', 10);
 
 let _ws = null;                 // the single connected extension socket
 let _wss = null;
@@ -29,6 +32,27 @@ const _extInfo = { connectedAt: 0, ua: '', sessions: {} };
 // session is on (live-page referents resolve here when the frontmost app
 // isn't the browser).
 const _sessionTabInfo = new Map();
+
+// tabId → {url, title, mediaTitle, state, lastSeen} — live media playback
+// state reported by the media-probe content script. Consumed by the audio
+// journal's is-playing verdict (page-open ≠ playing).
+const _mediaState = new Map();
+
+// Forward media.playing to the memory-service audio journal — fire-and-forget.
+function _postAudioContext(payload) {
+  try {
+    const body = JSON.stringify(payload);
+    const req = http.request({
+      hostname: '127.0.0.1', port: MEMORY_PORT, path: '/audio.context',
+      method: 'POST', headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
+      timeout: 3000,
+    }, (res) => res.resume());
+    req.on('error', () => {});
+    req.on('timeout', () => req.destroy());
+    req.write(body);
+    req.end();
+  } catch (_) {}
+}
 
 // ── Per-session input mutex ──────────────────────────────────────────────────
 // Trusted input (Input.dispatchKeyEvent / mouse) is global in effect — a Tab
@@ -156,6 +180,24 @@ function _onMessage(ws, raw) {
             lastSeen: Date.now(),
           });
         }
+      }
+      // Media probe reports — per-tab playing/paused/ended state for the
+      // audio journal's is-playing verdict (web video, Meet/Zoom-in-browser).
+      if (msg.event === 'media.playing' && msg.tabId != null) {
+        if (msg.state === 'none') {
+          _mediaState.delete(msg.tabId);
+        } else {
+          _mediaState.set(msg.tabId, {
+            url: msg.url || null, title: msg.title || null,
+            mediaTitle: msg.mediaTitle || null, state: msg.state || 'idle',
+            lastSeen: Date.now(),
+          });
+        }
+        _postAudioContext({
+          tabId: msg.tabId, url: msg.url || null, title: msg.title || null,
+          mediaTitle: msg.mediaTitle || null, state: msg.state || null,
+          app: 'web',
+        });
       }
       break;
     }
