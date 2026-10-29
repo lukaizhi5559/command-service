@@ -1367,23 +1367,14 @@ async function actionRun({ cli, argv = [], cwd, env, timeoutMs, stdin, agentId, 
   if (agentId && task) {
     let agentResult = await _lookupCliRunAgent(agentId, task);
 
-    // Self-heal a missing agent — mirrors browser.agent's run-time auto-build.
-    // Planner context can reference agentIds that were never registered (e.g.
-    // preflight marks a detected-but-unregistered CLI as ready). Only attempt
-    // the build when the binary is already on PATH — a descriptor-only build,
-    // zero install side-effects. No-binary and api_key/OAuth services keep the
-    // needsBuild contract so recovery can schedule an explicit build_agent step.
+    // Runtime never auto-builds agents — onboarding (descriptor build,
+    // install, auth) is a compile-time step (capability.select / setup.start).
+    // A missing agentId means the plan referenced something that was never
+    // onboarded or was removed: fail honestly with needsBuild so the caller
+    // escalates to re-planning instead of resurrecting stale/hallucinated
+    // agents from PATH presence alone.
     if (!agentResult.ok && agentResult.needsBuild && agentResult.missingAgent) {
-      const serviceKey = String(agentId).replace(/\.agent$/i, '').toLowerCase().replace(/[^a-z0-9]/g, '');
-      if (serviceKey && (await whichCli(serviceKey))) {
-        logger.info(`[cli.agent] run: agent "${agentId}" not found but "${serviceKey}" is on PATH — auto-building`);
-        const buildRes = await actionBuildAgent({ service: serviceKey }).catch(err => ({ ok: false, error: err.message }));
-        if (buildRes?.ok) {
-          agentResult = await _lookupCliRunAgent(agentId, task);
-        } else {
-          logger.warn(`[cli.agent] run: auto-build for "${agentId}" failed: ${buildRes?.error || 'unknown'}`);
-        }
-      }
+      logger.warn(`[cli.agent] run: agent "${agentId}" is not registered — runtime no longer auto-builds; escalate to compile-time onboarding`);
     }
 
     if (!agentResult.ok) return agentResult;
@@ -4774,14 +4765,28 @@ async function actionPreflightCheck({ task, clis: explicitClis, agents: explicit
       const taskLower = task.toLowerCase();
       const knownServices = Object.keys(KNOWN_CLI_MAP);
       const matchedSet = new Map();
+      // Capability keys that are everyday nouns — the bare word in a task does
+      // NOT claim the CLI. "play the video" isn't ffmpeg (the capability is
+      // video processing); these match only via a specific keyword that
+      // differs from the noun itself ('convert video', 'compress video').
+      const _GENERIC_CAPABILITY_NOUNS = new Set(['video', 'http', 'image']);
+      // Word-boundary match — substring 'pr' would hit "prompt", 'repo' hits
+      // "repose"; a capability claim needs the whole token.
+      const _wordMatch = (text, word) => {
+        const w = String(word || '').trim();
+        if (!w) return false;
+        return new RegExp(`\\b${w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i').test(text);
+      };
       for (const svc of knownServices) {
         const meta = KNOWN_CLI_MAP[svc];
-        if (taskLower.includes(svc)) {
+        const _genericNoun = _GENERIC_CAPABILITY_NOUNS.has(svc);
+        if (!_genericNoun && _wordMatch(taskLower, svc)) {
           matchedSet.set(svc, meta);
           continue;
         }
-        const keywords = Array.isArray(meta._keywords) ? meta._keywords : [];
-        if (keywords.some(k => k && taskLower.includes(k.toLowerCase()))) {
+        const keywords = (Array.isArray(meta._keywords) ? meta._keywords : [])
+          .filter(k => !_genericNoun || String(k).toLowerCase() !== svc);
+        if (keywords.some(k => _wordMatch(taskLower, k))) {
           matchedSet.set(svc, meta);
         }
       }

@@ -9323,27 +9323,12 @@ async function actionRun({ agentId: _agentIdArg, task, url, context, requiresAut
 
   let existing = await actionQueryAgent({ id: agentId });
   if (!existing.found) {
-    // Auto-build the agent transparently — no plan step required for known services.
-    // actionBuildAgent already resolves service metadata from KNOWN_BROWSER_SERVICES so
-    // gemini / googleai / geminiai aliases all work without any extra config.
-    const serviceKey = agentId.replace(/\.agent$/, '');
-    logger.info(`[browser.agent] run: agent "${agentId}" not found — attempting auto-build for service "${serviceKey}"`);
-    try {
-      const buildResult = await actionBuildAgent({ service: serviceKey });
-      if (buildResult.ok) {
-        logger.info(`[browser.agent] run: auto-built "${agentId}" (alreadyExists=${buildResult.alreadyExists}) — re-querying`);
-        existing = await actionQueryAgent({ id: agentId });
-      } else {
-        logger.warn(`[browser.agent] run: auto-build failed for "${agentId}": ${buildResult.error}`);
-      }
-    } catch (buildErr) {
-      logger.warn(`[browser.agent] run: auto-build threw for "${agentId}": ${buildErr.message}`);
-    }
-    // If still not found after auto-build attempt, return the original error with needsBuild:true
-    // so recoverSkill.js fast-path can REPLAN instead of falling through to ASK_USER.
-    if (!existing.found) {
-      return { ok: false, error: `Agent not found: ${agentId}. Build it first with action:build_agent.`, needsBuild: true };
-    }
+    // Runtime never auto-builds agents — onboarding (descriptor build, profile
+    // setup, auth) is a compile-time step (capability.select / setup.start).
+    // Return needsBuild so the caller escalates to re-planning instead of
+    // resurrecting stale/hallucinated agents at execution time.
+    logger.warn(`[browser.agent] run: agent "${agentId}" is not registered — runtime no longer auto-builds; escalate to compile-time onboarding`);
+    return { ok: false, error: `Agent not found: ${agentId}. Onboard it at plan time (capability.select) — runtime does not create agents.`, needsBuild: true };
   }
 
   // Self-heal: .md file was deleted (e.g. to force a playbook refresh) but DuckDB entry still
@@ -14668,15 +14653,11 @@ async function actionExplore({ agentId, goal, url, sessionId, maxDepth, maxNavIt
   // Resolve start URL from agent descriptor (same pattern as actionRun)
   let existing = await actionQueryAgent({ id: agentId });
   if (!existing.found) {
-    const serviceKey = agentId.replace(/\.agent$/, '');
-    logger.info(`[browser.agent] explore: agent "${agentId}" not found — attempting auto-build for "${serviceKey}"`);
-    try {
-        const buildResult = await actionBuildAgent({ service: serviceKey });
-        if (buildResult.ok) existing = await actionQueryAgent({ id: agentId });
-    } catch (_) {}
-    if (!existing.found) {
-        return { ok: false, error: `Agent not found: ${agentId}. Build it first with action:build_agent.`, needsBuild: true };
-    }
+    // Runtime never auto-builds agents — onboarding is a compile-time step
+    // (capability.select / setup.start). needsBuild tells the caller to
+    // escalate to re-planning.
+    logger.warn(`[browser.agent] explore: agent "${agentId}" is not registered — runtime no longer auto-builds; escalate to compile-time onboarding`);
+    return { ok: false, error: `Agent not found: ${agentId}. Onboard it at plan time (capability.select) — runtime does not create agents.`, needsBuild: true };
   }
 
   const startUrl = url || existing.startUrl || existing.descriptor?.match(/start_url:\s*(.+)/)?.[1]?.trim();

@@ -56,13 +56,7 @@
     "keywords": [
       "github",
       "pull request",
-      "pr",
-      "issue",
-      "repo",
       "repository",
-      "commit",
-      "branch",
-      "merge",
       "git hub"
     ],
     "providers": {
@@ -302,7 +296,6 @@
   },
   "video": {
     "keywords": [
-      "video",
       "convert video",
       "ffmpeg",
       "compress video",
