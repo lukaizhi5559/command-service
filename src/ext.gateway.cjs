@@ -84,8 +84,18 @@ function status() {
 }
 
 function _cachedSessions() {
-  return [..._sessionTabInfo.entries()].map(([sessionId, s]) => ({
+  return _decorateSessions([..._sessionTabInfo.entries()].map(([sessionId, s]) => ({
     sessionId, tabId: s.tabId, url: s.url || null, title: s.title || null, lastSeen: s.lastSeen,
+  })));
+}
+
+// Mark tabs the media probe says are actually PLAYING — "this video"/"this
+// song" referents pick the playing tab even when it isn't focused.
+function _decorateSessions(list) {
+  const now = Date.now();
+  return (list || []).map(s => ({
+    ...s,
+    playing: s.tabId != null && _mediaState.get(s.tabId)?.state === 'playing' && now - (_mediaState.get(s.tabId)?.lastSeen || 0) < 30000,
   }));
 }
 
@@ -122,7 +132,7 @@ async function sessions() {
   if (!connected) return { connected: false, sessions: _cachedSessions() };
   try {
     const live = await _reconcileSessions();
-    if (live) return { connected: true, sessions: live.filter(s => s && s.alive !== false && s.url) };
+    if (live) return { connected: true, sessions: _decorateSessions(live.filter(s => s && s.alive !== false && s.url)) };
   } catch (_) { /* fall through to cache */ }
   return { connected: true, sessions: _cachedSessions() };
 }

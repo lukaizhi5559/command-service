@@ -471,10 +471,7 @@ async function _llmMatchFocusedItem(targetText, focusedText, focusedTag = '', fo
   const f = (focusedText || '').toLowerCase().trim();
   if (t === f) return true; // quick exact match, no LLM needed
 
-  try {
-    const response = await askWithMessages([
-      { role: 'system', content: 'You determine if a focused element matches a target label. Output ONLY "YES" or "NO". Be STRICT — match the text, not the element type.' },
-      { role: 'user', content: `Target: "${targetText}"
+  const userPrompt = `Target: "${targetText}"
 Focused element: <${focusedTag}${focusedType ? ' type="' + focusedType + '"' : ''}> "${focusedText}"
 
 Does the focused element text match the target? Be STRICT on text matching.
@@ -492,12 +489,34 @@ Does the focused element text match the target? Be STRICT on text matching.
 - "Add a name" matches "Add a name" → YES
 - "Edit detail" matches "Edit details" → YES
 - "Edit detail" matches "Add an optional description" → NO (different text)
-- "Name & details" matches "My Playlist #5 – Edit details" → NO (focused is the page title, not the target)
+- "Name & details" matches "My Playlist #5 – Edit details" → NO (focused is the page title, not the target)`;
 
-Output ONLY "YES" or "NO".` },
-    ], { maxTokens: 20, temperature: 0.1, responseTimeoutMs: 5000 });
-    const answer = (response || '').trim().toUpperCase();
-    let match = answer.startsWith('YES');
+  try {
+    // ── Local decision fast path — YES/NO verdict on tev ─────────────
+    const _local = await require('../skill-helpers/decision.cjs').boundedDecision({
+      site: 'instruction.runner.matchFocusedItem',
+      questions: [{
+        id: 'match', type: 'choice',
+        question: `Does the focused element match the target label? Strict text match — the focused element must contain at least one meaningful word from the target or be a close synonym. A logo or unrelated label is never a match. "Save" matches "Save changes"/"Save playlist" but not unrelated text. A vague single-word focused element does not match a multi-word target.`,
+        options: ['yes', 'no'],
+      }],
+      state: userPrompt,
+      local: (a) => a.match?.index === 0 ? true : (a.match?.index === 1 ? false : null),
+      remote: async () => null,
+      logger,
+    });
+    let match;
+    if (_local != null) {
+      match = _local;
+      logger.info(`[instruction.runner] local match: target="${targetText}" focused="${focusedText.substring(0, 60)}" → ${match ? 'YES' : 'NO'}`);
+    } else {
+      const response = await askWithMessages([
+        { role: 'system', content: 'You determine if a focused element matches a target label. Output ONLY "YES" or "NO". Be STRICT — match the text, not the element type.' },
+        { role: 'user', content: `${userPrompt}\n\nOutput ONLY "YES" or "NO".` },
+      ], { maxTokens: 20, temperature: 0.1, responseTimeoutMs: 5000 });
+      const answer = (response || '').trim().toUpperCase();
+      match = answer.startsWith('YES');
+    }
 
     // Safety net: reject matches that share no meaningful text with the target.
     // The LLM can be over-eager for custom elements; this catches obvious false positives.

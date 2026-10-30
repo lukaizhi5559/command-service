@@ -532,6 +532,64 @@ async function _pypiPackageExists(pkg) {
   }
 }
 
+// ── Global-install gate ────────────────────────────────────────────────────
+// An LLM-proposed `npm install -g`/`brew install`/… must name a package the
+// registry can verify BEFORE it mutates the machine — a hallucinated service
+// name otherwise persists a real global install mid-recovery (observed: a
+// run installed `npm install -g skill` while chasing an invented service
+// name). Same observe→adapt discipline as the web-recipe entity gate:
+// never trust the proposed install blind.
+const _INSTALL_MGR_RE = /\b(?:sudo\s+)?(npm|pnpm|yarn|brew|pip3?|gem|cargo|apt(?:-get)?)\s+(?:i|install|add|reinstall)\b([^;&|\n`]*)/g;
+const _MGR_METHOD = { npm: 'npm', pnpm: 'npm', yarn: 'npm', brew: 'brew', pip: 'pip', pip3: 'pip' };
+
+// Parse a proposed command (cmd + argv, or a free script) for machine-wide
+// installs. npm/pnpm/yarn count only with an explicit -g/--global flag —
+// `npm install` in a project dir is ordinary work; brew/pip/gem/cargo/apt
+// installs are global by default.
+function _globalInstalls(cmd, argv) {
+  const text = argv ? [cmd, ...(Array.isArray(argv) ? argv : [])].join(' ') : String(cmd || '');
+  const hits = [];
+  for (const m of text.matchAll(_INSTALL_MGR_RE)) {
+    const mgr = m[1].toLowerCase();
+    const tail = m[2] || '';
+    // npm-family installs are only global with an explicit -g/--global;
+    // brew/pip/gem/cargo/apt installs are always machine-wide.
+    const isGlobal = mgr === 'npm' || mgr === 'pnpm' || mgr === 'yarn'
+      ? /(?:^|\s)(?:-g|--global)\b/.test(tail)
+      : true;
+    if (!isGlobal) continue;
+    const pkg = tail.split(/\s+/).find(t => t && !t.startsWith('-') && !/^[A-Za-z_][\w]*=/.test(t));
+    if (pkg) hits.push({ mgr, method: _MGR_METHOD[mgr] || null, pkg });
+  }
+  return hits;
+}
+
+// Verify each proposed global install against its live registry. When a
+// service identity is known (agentic lane), the package must also name THAT
+// service (or its <svc>-cli/cli-<svc> alias) — "npm install -g skill" for an
+// invented service is a real npm package but unrelated to the task at hand.
+// Returns {hits, blocked} — blocked entries carry a why the loop can surface
+// as an observation instead of executing.
+async function _gateGlobalInstalls(cmd, argv, { serviceKey = null, sessionId = null } = {}) {
+  const hits = _globalInstalls(cmd, argv);
+  const blocked = [];
+  for (const h of hits) {
+    if (serviceKey && h.method) {
+      const norm = (s) => String(s || '').split('/').pop().toLowerCase().replace(/[^a-z0-9]/g, '');
+      const svc = norm(serviceKey), p = norm(h.pkg);
+      if (!(p === svc || p === `${svc}cli` || p === `cli${svc}`)) {
+        blocked.push({ ...h, why: `package "${h.pkg}" is unrelated to service "${serviceKey}"` });
+        continue;
+      }
+    }
+    if (h.method) {
+      const ok = await _verifyPackageExists(h.method, h.pkg, { sessionId }).catch(() => false);
+      if (!ok) blocked.push({ ...h, why: `"${h.pkg}" not found in the ${h.method} registry` });
+    }
+  }
+  return { hits, blocked };
+}
+
 async function _probeRegistryCandidates(serviceKey, { sessionId = null } = {}) {
   if (!serviceKey || !/^[a-z0-9][a-z0-9-]*$/i.test(serviceKey)) return null;
 
@@ -690,6 +748,19 @@ async function _webProbeInstall(serviceKey, { sessionId = null } = {}) {
   }
 }
 
+// Name-shape gate — a serviceKey derived from a half-parsed filename is not
+// a service. Observed: a recovery loop hallucinated "handoffcompiletestcjs"
+// (flattened handoffCompile.test.cjs), which then drove a registry probe →
+// web search → install attempt for an invented tool. Dots are stripped by
+// serviceKey normalization, so the detectable shape is the FUSED suffix
+// (…testcjs / …specjs) or an extreme run-on token.
+function _looksLikeFilename(svc) {
+  const s = String(svc || '');
+  return /\.(?:jsx?|tsx?|cjs|mjs|py|sh|rb|go|rs|java|kt|swift|c|cpp|h)$/i.test(s)
+    || /(?:test|spec)(?:c|m)?(?:jsx?|tsx?|py|rb|go|rs)$/i.test(s)
+    || (s.length > 28 && !/[-_@./\\]/.test(s));
+}
+
 // Full ladder: registry candidates → web search → verified recipe or null.
 // A registry-classified LIBRARY (npm no-bin, PyPI module) returns directly —
 // the web is only consulted when NO registry knows the name. This is what
@@ -697,6 +768,11 @@ async function _webProbeInstall(serviceKey, { sessionId = null } = {}) {
 // canvas is a library, so the entity-blind "canvas CLI install" web search
 // never fires.
 async function _findInstallableCli(serviceKey, { sessionId = null } = {}) {
+  if (_looksLikeFilename(serviceKey)) {
+    logger.warn(`[cli.agent] "${serviceKey}" looks like a filename/test artifact, not a service — skipping registry+web probe`);
+    await _ptyNote(sessionId, `"${serviceKey}" isn't a service name — skipping install discovery`);
+    return null;
+  }
   const probed = await _probeRegistryCandidates(serviceKey, { sessionId });
   if (probed) return probed;
   return await _webProbeInstall(serviceKey, { sessionId });
@@ -1992,6 +2068,17 @@ async function actionRun({ cli, argv = [], cwd, env, timeoutMs, stdin, agentId, 
           _argv[0] === 'services' && _argv[1] === 'enable'
         );
         const _stepTimeoutMs = _isGcloudServicesEnable ? 180000 : (timeoutMs || 30000);
+        // Global-install gate — a machine-wide install proposed mid-loop must
+        // name a registry-verifiable package related to THIS service before
+        // it runs. Blocked installs return an observation, not a spawn.
+        const _inst = await _gateGlobalInstalls(require('path').basename(currentBinPath), _argv, { serviceKey: cliTool || agentId });
+        if (_inst.blocked.length) {
+          observation = `[GLOBAL INSTALL BLOCKED] ${_inst.blocked.map(b => `${b.mgr} install ${b.pkg} — ${b.why}`).join('; ')}. Do NOT retry this install; verify the real package name against the service's docs or ask_user.`;
+          logger.warn(`[cli.agent] loop turn=${turn} blocked global install: ${observation.slice(0, 200)}`, { agentId });
+          loopHistory.push({ turn, ...action, observation: observation.slice(0, OBSERVATION_CHARS) });
+          transcript.push({ turn, action, outcome: { ok: false, error: 'global-install-blocked' }, thoughts: action.thinking || null });
+          continue;
+        }
         const cmdResult = await spawnCapture(currentBinPath, _argv, { cwd: _resolveCwd(action.cwd, cwd), env, timeoutMs: _stepTimeoutMs });
         logger.info(`[cli.agent] loop turn=${turn} run_cmd exitCode=${cmdResult.exitCode} stdout="${cmdResult.stdout.slice(0, 200)}" stderr="${(cmdResult.stderr || '').slice(0, 200)}"`, { agentId });
         // Idempotent success: treat "already done" CLi responses as success (e.g. gh repo star on already-starred repo exits 1)
@@ -2477,8 +2564,12 @@ async function _genericRunLoop({ task, cwd, env, timeoutMs, _progressCallbackUrl
 
       if (action.action === 'run_shell') {
         const script = String(action.script || '').trim();
+        const _gate = script ? await _gateGlobalInstalls(script) : { blocked: [] };
         if (!script) {
           observation = 'run_shell: script is required';
+        } else if (_gate.blocked.length) {
+          observation = `[GLOBAL INSTALL BLOCKED] ${_gate.blocked.map(x => `${x.mgr} install ${x.pkg} — ${x.why}`).join('; ')}. Global installs must name a real, verified package — confirm the package exists (run_shell "npm view <pkg>" / "brew info <pkg>") or ask_user.`;
+          logger.warn(`[cli.agent] generic loop turn=${turn} blocked global install in run_shell`, { task: String(task).slice(0, 60) });
         } else if (_sigFails >= 2) {
           observation = 'This exact script already failed twice — change the approach (different tool, different package name, or ask_user).';
         } else {
@@ -2542,7 +2633,11 @@ async function _genericRunLoop({ task, cwd, env, timeoutMs, _progressCallbackUrl
       } else if (action.action === 'run_cmd') {
         const cmd = String(action.cmd || '').trim();
         const bin = cmd ? whichCli(cmd) : null;
-        if (!bin) {
+        const _gate = cmd ? await _gateGlobalInstalls(cmd, action.argv) : { blocked: [] };
+        if (_gate.blocked.length) {
+          observation = `[GLOBAL INSTALL BLOCKED] ${_gate.blocked.map(x => `${x.mgr} install ${x.pkg} — ${x.why}`).join('; ')}. Global installs must name a real, verified package — confirm it first (run_shell "npm view <pkg>" / "brew info <pkg>") or ask_user.`;
+          logger.warn(`[cli.agent] generic loop turn=${turn} blocked global install via run_cmd ${cmd}`, { task: String(task).slice(0, 60) });
+        } else if (!bin) {
           observation = `run_cmd: "${cmd}" is not on PATH — verify/install it first (which ${cmd}, npm view, brew info), or run it via run_shell.`;
         } else {
           const r = await spawnCapture(bin, Array.isArray(action.argv) ? action.argv : [], { cwd: _resolveCwd(action.cwd, cwd), env, timeoutMs: timeoutMs || 30000 });
@@ -2572,6 +2667,11 @@ async function _genericRunLoop({ task, cwd, env, timeoutMs, _progressCallbackUrl
           const sid = await _ensurePtySession();
           if (action.action === 'pty_exec') {
             const _ptyCmd = String(action.cmd || '');
+            const _gate = await _gateGlobalInstalls(_ptyCmd);
+            if (_gate.blocked.length) {
+              observation = `[GLOBAL INSTALL BLOCKED] ${_gate.blocked.map(x => `${x.mgr} install ${x.pkg} — ${x.why}`).join('; ')}. Global installs must name a real, verified package — confirm it first or ask_user.`;
+              logger.warn(`[cli.agent] generic loop turn=${turn} blocked global install in pty_exec`, { task: String(task).slice(0, 60) });
+            } else {
             const r = await terminalAgent({ action: 'exec', sessionId: sid, cmd: _ptyCmd, timeoutMs: action.timeoutMs || 60000, keepSession: true, _progressCallbackUrl });
             // Same fix as run_shell: prefer the raw delta stream over the
             // rendered viewport so bulk output is actually observable.
@@ -2588,6 +2688,7 @@ async function _genericRunLoop({ task, cwd, env, timeoutMs, _progressCallbackUrl
             }
             if (r.ok && r.exitCode !== 0) failedSigs.set(_sig, _sigFails + 1);
             logger.info(`[cli.agent] generic loop turn=${turn} pty_exec exitCode=${r.exitCode} ok=${r.ok}`);
+            }
           } else {
             // Baseline raw offset BEFORE the write — echo that lands during
             // the send round-trip must still count as post-input output.
@@ -5247,7 +5348,7 @@ async function cliAgent(args) {
   }
 }
 
-module.exports = { cliAgent, KNOWN_CLI_MAP, actionListAllAgents, resetDbCache, discoverSetupFromHelp, _discoverVerifyCmd, _ptyDeltaText };
+module.exports = { cliAgent, KNOWN_CLI_MAP, actionListAllAgents, resetDbCache, discoverSetupFromHelp, _discoverVerifyCmd, _ptyDeltaText, _globalInstalls, _gateGlobalInstalls, _looksLikeFilename };
 
 // ── One-shot startup migration: ensure ytdlp.agent has transcript capabilities ──
 // Runs 5s after module load to allow DuckDB init. No-ops if already patched.

@@ -87,9 +87,28 @@ function extractServiceSearchTerm(task, serviceNames) {
   const named = names.some(n => new RegExp(`\\b${n}\\b`, 'i').test(t));
   if (!named) return null;
   const m = t.match(/\b(?:search|find|look\s*up|look\s+for|browse|check|scan|read)\b[^.?!]{0,60}?\bfor\s+(.+?)\s*[?.!]*$/i);
-  if (!m) return null;
+  // Service-terminal phrasing: "goto the latest AI video on youtube",
+  // "watch X on netflix", "play X on spotify" — the query precedes
+  // "on|in|from|via <service>". Natural-language tasks without a search verb
+  // still reach the search URL lane (observed: "goto the latest AI video on
+  // youtube" navigated to search_query= with an empty query).
+  let raw = m ? m[1] : null;
+  if (!raw) {
+    for (const n of names) {
+      const m2 = t.match(new RegExp(
+        `\\b(?:goto|go\\s+to|open|watch|play|get|pull\\s+up|show(?:\\s+me)?|browse|find|search(?:\\s+for)?|read|check|queue|listen\\s+to|stream|view|look\\s+up|look\\s+for)\\s+(?:the\\s+|a\\s+|an\\s+|my\\s+)?(.+?)\\s+(?:on|in|from|via|at)\\s+${n}\\b`,
+        'i'));
+      if (m2) { raw = m2[1]; break; }
+    }
+  }
+  if (!raw) return null;
+  // The `for`-shape can over-capture a trailing "on <service>" ("search for
+  // flights on kayak" → "flights on kayak") — strip the service suffix before
+  // the container-noun cleanup.
+  const _svcTail = new RegExp(`\\s+(?:on|in|from|via|at)\\s+(?:${names.join('|')})\\b[\\w.]*\\s*$`, 'i');
+  raw = String(raw || '').replace(_svcTail, '');
   // Drop a trailing bare container noun — "vidangel emails" → "vidangel".
-  let q = m[1].trim().replace(/\s+(?:emails?|messages?|mails?|threads?|posts?|items?|results?|products?)$/i, '');
+  let q = raw.trim().replace(/\s+(?:emails?|messages?|mails?|threads?|posts?|items?|results?|products?)$/i, '');
   // Pipeline-injected wrappers ("(Context from prior turn: X)", "(Resolved
   // referent — X)") can leak a closing paren into the capture — and
   // encodeURIComponent leaves ) ] } ' " literal in the URL. Strip trailing

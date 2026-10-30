@@ -123,6 +123,26 @@ const { systemIntrospect } = require('./skills/system.introspect.cjs');
 const toolDiscoverAgent = require('./skills/tool.discover.agent.cjs');
 const providerDiscoveryAgent = require('./skills/provider.discovery.agent.cjs');
 
+// ── Dispatchable skill ids — the single source of truth for "what
+// command.automate can run". Mirrors the executeAutomation switch below;
+// served via /service.health and POST /skill.list so stategraph's preflight
+// can distinguish dispatchable *.agent SKILLS (edit.agent, browser.agent, …)
+// from registry AGENTS that need onboarding. A plan-step agentId found here
+// must NOT be treated as an unregistered agent.
+const DISPATCHABLE_SKILLS = [
+  'shell.run', 'browser.act', 'web.crawl', 'image.analyze', 'fs.read',
+  'file.watch', 'file.bridge', 'screen.capture', 'screen.display',
+  'external.skill', 'creator.agent', 'reviewer.agent', 'skillCreator.skill',
+  'skill.review', 'cli.agent', 'terminal.agent', 'mcp.agent', 'browser.agent',
+  'playwright.agent', 'url.first.agent', 'just.type.agent', 'meta.find.agent',
+  'shortcut.keys.agent', 'tab.map.agent', 'form.fill.agent', 'gesture.agent',
+  'arrow.grid.agent', 'turn.loop.agent', 'dom.act', 'project.builder',
+  'project.launcher', 'project.editor', 'project.stopper', 'user.agent',
+  'web.agent', 'video.agent', 'edit.agent', 'doc.read', 'task.agent',
+  'media.transcribe', 'app.agent', 'system.introspect', 'tool.discover',
+  'provider.discovery',
+];
+
 class CommandServiceMCPServer {
   constructor() {
     this.serviceName = process.env.SERVICE_NAME || 'command-service';
@@ -502,7 +522,7 @@ class CommandServiceMCPServer {
       success: true,
       service: this.serviceName,
       status: 'healthy',
-      skills: ['shell.run', 'browser.act', 'web.crawl', 'image.analyze', 'fs.read', 'edit.agent', 'doc.read', 'media.transcribe', 'file.watch', 'file.bridge', 'screen.capture', 'screen.display', 'cli.agent', 'browser.agent', 'playwright.agent', 'url.first.agent', 'just.type.agent', 'meta.find.agent', 'shortcut.keys.agent', 'tab.map.agent', 'form.fill.agent', 'gesture.agent', 'arrow.grid.agent', 'turn.loop.agent', 'dom.act', 'project.builder', 'project.launcher', 'project.editor', 'project.stopper', 'app.agent', 'system.introspect', 'provider.discovery', 'user.agent', 'web.agent', 'video.agent', 'tool.discover']
+      skills: DISPATCHABLE_SKILLS
     };
   }
 
@@ -597,8 +617,17 @@ class CommandServiceMCPServer {
         res.end(JSON.stringify({
           status: 'healthy',
           service: this.serviceName,
-          skills: ['shell.run', 'browser.act', 'web.crawl', 'image.analyze', 'fs.read', 'edit.agent', 'doc.read', 'media.transcribe', 'file.watch', 'file.bridge', 'screen.capture', 'screen.display', 'cli.agent', 'browser.agent', 'playwright.agent', 'url.first.agent', 'just.type.agent', 'meta.find.agent', 'shortcut.keys.agent', 'tab.map.agent', 'form.fill.agent', 'gesture.agent', 'arrow.grid.agent', 'turn.loop.agent', 'dom.act', 'project.builder', 'project.launcher', 'project.editor', 'project.stopper', 'app.agent', 'system.introspect', 'provider.discovery', 'user.agent', 'web.agent', 'video.agent', 'tool.discover']
+          skills: DISPATCHABLE_SKILLS
         }));
+        return;
+      }
+
+      // ── POST /skill.list — dispatchable skill ids. Stategraph's preflight
+      // consults this to tell *.agent skills (run via command.automate) from
+      // registry agents (need onboarding). Distinct from /agent.list.
+      if (req.method === 'POST' && req.url === '/skill.list') {
+        res.writeHead(200);
+        res.end(JSON.stringify({ ok: true, skills: DISPATCHABLE_SKILLS }));
         return;
       }
 

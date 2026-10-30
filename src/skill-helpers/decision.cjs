@@ -138,9 +138,13 @@ async function boundedDecision(cfg) {
       logger.info?.(`[Decision] site=${site} local ${l.ms}ms model=${l.model || '?'}`);
       return l.value;
     }
-    if (l.lowConf) logger.debug?.(`[Decision] site=${site} low-confidence — remote fallback`);
+    // Warn-level: remote fallbacks cost money + latency and were previously
+    // invisible (debug lines never reach persisted logs). One line per site
+    // per failure keeps fallback storms diagnosable.
+    if (l.lowConf) logger.warn?.(`[Decision] site=${site} low-confidence — remote fallback`);
+    else logger.warn?.(`[Decision] site=${site} local returned null — remote fallback`);
   } catch (e) {
-    logger.debug?.(`[Decision] site=${site} failed: ${e.message} — remote fallback`);
+    logger.warn?.(`[Decision] site=${site} failed: ${e.message} — remote fallback`);
   }
   return remote();
 }

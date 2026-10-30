@@ -4569,7 +4569,7 @@ function _postProgress(callbackUrl, evt) {
 
 const { userAgent } = require('./user.agent.cjs');
 
-const { resolveDestination, recordCorrection, classifyTaskIntent, classifyTaskIntentForService, classifyUrlType, getLearnedCorrection, deleteLearnedCorrection, suggestTaskUrl, _isOnPageAction, getTaskKeywords, getCachedDeepLink, recordDeepLinkCache, deleteDeepLinkCache, getSearchUrlPattern, recordSearchUrlPattern, INTENTS, SERVICE_CHAT_URLS, isAuthFlowUrl, _isValidDeepLinkUrl, _isGenericLandingUrl } = require('../skill-helpers/destination-resolver.cjs');
+const { resolveDestination, recordCorrection, classifyTaskIntent, classifyTaskIntentForService, classifyUrlType, getLearnedCorrection, deleteLearnedCorrection, suggestTaskUrl, _isOnPageAction, getTaskKeywords, getCachedDeepLink, recordDeepLinkCache, deleteDeepLinkCache, getSearchUrlPattern, recordSearchUrlPattern, INTENTS, SERVICE_CHAT_URLS, isAuthFlowUrl, _isValidDeepLinkUrl, _isGenericLandingUrl, _isCacheableIntentUrl, _searchPatternFromQueryUrl } = require('../skill-helpers/destination-resolver.cjs');
 const { killExistingChromeForProfile, clearProfileLock, findCli, shortSessionId, _sniffAuthCookies, engine: browserEngine, _parseCliResult } = require('./browser.act.cjs');
 const { loadAppKnowledge, saveAppKnowledge, loadAndFormat, isCacheStale, isShortcutCoverageStale, recordVerification } = require('./lib/appKnowledge.cjs');
 const { parseLlmJson } = require('../skill-helpers/parseLlmJson.cjs');
@@ -4736,9 +4736,9 @@ const KNOWN_BROWSER_SERVICES = {
   threads:        { startUrl: 'https://www.threads.net',                         signInUrl: 'https://www.threads.net/login',                     authSuccessPattern: 'threads.net',                  isOAuth: true  },
   youtube:        { startUrl: 'https://www.youtube.com',                         signInUrl: 'https://accounts.google.com/signin/v2/identifier',  authSuccessPattern: 'youtube.com',                  isOAuth: false,
                    intentUrls: {
-                     media_play: { buildUrl: (task) => { const m = task.match(/(?:play|watch|search)\s+(?:for\s+)?(.+)/i); return m ? `https://www.youtube.com/results?search_query=${encodeURIComponent(m[1].trim())}` : 'https://www.youtube.com'; } },
+                     media_play: { buildUrl: (task, ctx) => { const m = task.match(/(?:play|watch|search|goto|go\s+to|open|find)\s+(?:for\s+|to\s+)?(.+)/i); const q = ctx?.encodedQuery || (m ? encodeURIComponent(m[1].trim().replace(/\s+on\s+\S+\s*$/i, '')) : ''); if (!q) return 'https://www.youtube.com'; const sort = /\b(latest|newest|recent|new)\b/i.test(task) ? '&sp=CAISBAgBEAE%3D' : ''; return `https://www.youtube.com/results?search_query=${q}${sort}`; } },
                      content_create: 'https://studio.youtube.com/videos/upload',
-                     search: { buildUrl: (task, ctx) => `https://www.youtube.com/results?search_query=${ctx.encodedQuery}` },
+                     search: { buildUrl: (task, ctx) => { if (!ctx?.encodedQuery) return null; const sort = /\b(latest|newest|recent|new)\b/i.test(task) ? '&sp=CAISBAgBEAE%3D' : ''; return `https://www.youtube.com/results?search_query=${ctx.encodedQuery}${sort}`; } },
                    } },
   twitch:         { startUrl: 'https://www.twitch.tv',                           signInUrl: 'https://www.twitch.tv/login',                       authSuccessPattern: 'twitch.tv',                    isOAuth: true  },
   // ── Music streaming ──────────────────────────────────────────────────────────────────────────────────
@@ -5102,6 +5102,33 @@ function _seedIntentUrlsFromKnownServices(hostname, serviceKey) {
       logger.info(`[browser.agent] app-knowledge: seeded ${seeded} intent_url entries for ${hostname} from KNOWN_BROWSER_SERVICES`);
     }
   } catch (_) { /* non-fatal */ }
+}
+
+// Guarded intent_url save — reusable destination shapes only. A URL carrying
+// a task-specific query (?q=, search_query=, text=, channel=, …) is one task's
+// data: caching it as the intent's destination poisons future tasks (observed:
+// youtube search → "his videos", google search → "best vegan food
+// Philadelphia"). Query-bearing URLs get salvaged into the {query}
+// search-pattern cache instead — the learned value is the SHAPE, not the
+// string.
+async function _cacheIntentUrl(hostname, intent, url, serviceKey, opts = {}) {
+  if (!hostname || !intent || !url) return false;
+  try {
+    if (_isCacheableIntentUrl(url)) {
+      const { saveIntentUrl } = require('./lib/appKnowledge.cjs');
+      return !!saveIntentUrl(hostname, intent, url, null, opts);
+    }
+    const _tmpl = _searchPatternFromQueryUrl(url);
+    if (_tmpl && serviceKey) {
+      try { await recordSearchUrlPattern(serviceKey, _tmpl, null, 'intent-url-salvage', hostname); } catch (_) {}
+      logger.info(`[browser.agent] intent_url save skipped (task-specific query) — salvaged search pattern: ${_tmpl}`);
+    } else {
+      logger.info(`[browser.agent] intent_url save skipped — not a reusable destination shape: ${url.slice(0, 120)}`);
+    }
+    return false;
+  } catch (_) {
+    return false;
+  }
 }
 
 // Deep-link trust boundary: a cached/discovered destination must stay inside
@@ -8055,6 +8082,29 @@ async function _verdictCachedUrl({ task, intent, url, host, source }) {
       return 'skip';
     }
   }
+  // Deterministic query check — a query-bearing URL whose baked query doesn't
+  // match THIS task's extracted query is a different task's results page
+  // (poisoned cache shape: "watch his videos" → search_query=his+videos served
+  // to an unrelated task). Extract via the service-gated term extractor; an
+  // extraction miss defers to the model rather than guessing.
+  try {
+    const _u = new URL(url);
+    let _baked = null;
+    for (const [k, v] of _u.searchParams.entries()) {
+      if (/^(q|k|query|search_query|searchterm|search|keyword|keywords|term|field-keywords|s|st|find_desc|_nkw)$/i.test(k) && v) { _baked = v; break; }
+    }
+    if (_baked) {
+      const _hostSfx = _u.hostname.replace(/^www\./, '').split('.')[0];
+      const _extracted = _extractServiceSearchTerm(task, [_hostSfx])
+        || (String(task || '').match(/\b(?:search|find|look\s*up|google|goto|watch|play|open|show)\s+(?:for\s+|to\s+|the\s+|a\s+|an\s+|me\s+)*\s*(.+?)\s*(?:\s+on|\s+in)?\s*[?.!]*$/i) || [])[1];
+      const _norm = (x) => String(x || '').toLowerCase().replace(/[^\w\s]/g, ' ').replace(/\s+/g, ' ').trim();
+      if (_extracted && _norm(_baked) !== _norm(_extracted)
+          && !_norm(_extracted).includes(_norm(_baked)) && !_norm(_baked).includes(_norm(_extracted))) {
+        logger.info(`[browser.agent] deep-link verdict: query mismatch — baked "${_baked.slice(0, 60)}" vs task "${_extracted.slice(0, 60)}" — skip`);
+        return 'skip';
+      }
+    }
+  } catch (_) { /* non-fatal — falls to model */ }
   try {
     const { boundedDecision, askDecision } = require('../skill-helpers/decision.cjs');
     const v = await boundedDecision({
@@ -8243,6 +8293,28 @@ async function _resolveCheapDeepLink(agentId, serviceKey, baseStartUrl, task, ex
     // Compute criteria-task status before the appKnowledge/keyword checks reference it.
     const _isCriteriaTask = _isSearchCriteriaTask(task, _dlTaskCls);
 
+    // ── Helper: extract encoded search query from task text ────────────────
+    // Hoisted above the affinity/code-template lanes — their buildUrl calls
+    // need the real query, not a hardcoded '' (empty-query URLs like
+    // search_query= landed with no results and burned the recovery loop).
+    const _getEncodedQuery = async (taskText, svcKey) => {
+      const _sq = await _extractSearchQuery(taskText, svcKey, _dlTaskCls);
+      if (_sq.hasCriteria) return encodeURIComponent(_sq.query);
+      // Unquoted "search my <svc> for X" — prefer the service-gated extractor so
+      // the loose regex below can't bake "my gmail for …" into the query.
+      const _svcTerm = _extractServiceSearchTerm(taskText, [String(svcKey || '').toLowerCase().replace(/[^a-z0-9]/g, '')]);
+      if (_svcTerm) return encodeURIComponent(_svcTerm);
+      const qMatch = taskText.match(/\b(?:search|find|look\s*up|google|goto|go\s+to|open|watch|play|show|pull\s+up|browse|get|listen\s+to|read|check)\s+(?:for\s+|to\s+|the\s+|a\s+|an\s+|me\s+)*\s*(.+?)\s*(?:\s+on|\s+in)?\s*$/i);
+      if (qMatch?.[1]) return encodeURIComponent(String(qMatch[1]).trim().replace(/[?.!]+$/g, ''));
+      // "open existing" patterns: "titled X", "called X", "named X", "entitled X",
+      // "document/doc/page/sheet/note X", "for X" in open/find/edit context
+      const _titleMatch = taskText.match(/\b(?:titled|called|named|entitled)\s+["']?([^"'.]+?)["']?(?:\s+and\s+|$)/i);
+      if (_titleMatch?.[1]) return encodeURIComponent(_titleMatch[1].trim().replace(/[?.!]+$/g, ''));
+      const _forMatch = taskText.match(/\b(?:open|find|edit|view|navigate\s+to)\s+(?:the\s+)?(?:edit\s+panel\s+(?:in|for)\s+)?(?:google\s+doc(?:ument)?|doc(?:ument)?|page|sheet|spreadsheet|note|file)\s+(?:for\s+)?["']?([^"'.]+?)["']?(?:\s+and\s+|$)/i);
+      if (_forMatch?.[1]) return encodeURIComponent(_forMatch[1].trim().replace(/[?.!]+$/g, ''));
+      return '';
+    };
+
     // Step -2: Service affinity URL lane — uses the service resolved in Step
     // -3 (substring fast-path or semantic decision). A sub-service outranks
     // the umbrella's keyspace — 'google' cache is a grab-bag (poisoned
@@ -8261,7 +8333,7 @@ async function _resolveCheapDeepLink(agentId, serviceKey, baseStartUrl, task, ex
           let _affUrl = null;
           try {
             if (typeof _tmpl === 'string') _affUrl = _tmpl;
-            else if (_tmpl?.buildUrl) _affUrl = _tmpl.buildUrl(task, { task, encodedQuery: '', dest: null });
+            else if (_tmpl?.buildUrl) _affUrl = _tmpl.buildUrl(task, { task, encodedQuery: await _getEncodedQuery(task, _affKey), dest: null });
             else if (_tmpl?.url) _affUrl = _tmpl.url;
           } catch (_) {}
           if (!_affUrl) _affUrl = loadIntentUrl(_affHost, intent)?.url || null;
@@ -8298,7 +8370,7 @@ async function _resolveCheapDeepLink(agentId, serviceKey, baseStartUrl, task, ex
         const _ctTmpl = _svcEntry?.intentUrls?.[intent];
         if (_ctTmpl?.buildUrl) {
           let _bUrl = null;
-          try { _bUrl = _ctTmpl.buildUrl(task, { task, encodedQuery: '', dest: null }); } catch (_) {}
+          try { _bUrl = _ctTmpl.buildUrl(task, { task, encodedQuery: await _getEncodedQuery(task, serviceKey), dest: null }); } catch (_) {}
           if (_bUrl && _isValidDeepLinkUrl(_bUrl)
               && _deepLinkHostAllowed(_hostOfUrl(_bUrl), baseHost, _svcEntry)
               && !_isSigninWall(_bUrl)) {
@@ -8326,7 +8398,7 @@ async function _resolveCheapDeepLink(agentId, serviceKey, baseStartUrl, task, ex
           let _codeUrl = null;
           try {
             if (typeof _tmpl === 'string') _codeUrl = _tmpl;
-            else if (_tmpl?.buildUrl) _codeUrl = _tmpl.buildUrl(task, { task, encodedQuery: '', dest: null });
+            else if (_tmpl?.buildUrl) _codeUrl = _tmpl.buildUrl(task, { task, encodedQuery: await _getEncodedQuery(task, serviceKey), dest: null });
             else if (_tmpl?.url) _codeUrl = _tmpl.url;
           } catch (_) {}
           if (_codeUrl && _codeUrl !== _akUrl.url && _isValidDeepLinkUrl(_codeUrl)
@@ -8459,25 +8531,6 @@ async function _resolveCheapDeepLink(agentId, serviceKey, baseStartUrl, task, ex
       }
     }
 
-    // ── Helper: extract encoded search query from task text ────────────────
-    const _getEncodedQuery = async (taskText, svcKey) => {
-      const _sq = await _extractSearchQuery(taskText, svcKey, _dlTaskCls);
-      if (_sq.hasCriteria) return encodeURIComponent(_sq.query);
-      // Unquoted "search my <svc> for X" — prefer the service-gated extractor so
-      // the loose regex below can't bake "my gmail for …" into the query.
-      const _svcTerm = _extractServiceSearchTerm(taskText, [String(svcKey || '').toLowerCase().replace(/[^a-z0-9]/g, '')]);
-      if (_svcTerm) return encodeURIComponent(_svcTerm);
-      const qMatch = taskText.match(/\b(?:search|find|look\s*up|google)\s+(?:for\s+)?(.+?)$/i);
-      if (qMatch?.[1]) return encodeURIComponent(String(qMatch[1]).trim().replace(/[?.!]+$/g, ''));
-      // "open existing" patterns: "titled X", "called X", "named X", "entitled X",
-      // "document/doc/page/sheet/note X", "for X" in open/find/edit context
-      const _titleMatch = taskText.match(/\b(?:titled|called|named|entitled)\s+["']?([^"'.]+?)["']?(?:\s+and\s+|$)/i);
-      if (_titleMatch?.[1]) return encodeURIComponent(_titleMatch[1].trim().replace(/[?.!]+$/g, ''));
-      const _forMatch = taskText.match(/\b(?:open|find|edit|view|navigate\s+to)\s+(?:the\s+)?(?:edit\s+panel\s+(?:in|for)\s+)?(?:google\s+doc(?:ument)?|doc(?:ument)?|page|sheet|spreadsheet|note|file)\s+(?:for\s+)?["']?([^"'.]+?)["']?(?:\s+and\s+|$)/i);
-      if (_forMatch?.[1]) return encodeURIComponent(_forMatch[1].trim().replace(/[?.!]+$/g, ''));
-      return '';
-    };
-
     // ── Helper: resolve an intentUrls template entry to a URL (or null) ────
     const _resolveIntentTemplate = (template, taskText, ctx) => {
       if (!template) return null;
@@ -8519,7 +8572,7 @@ async function _resolveCheapDeepLink(agentId, serviceKey, baseStartUrl, task, ex
       if (intent === INTENTS.MAPS) {
         const _destMatch = task.match(/(?:directions\s+to|navigate\s+to|find\s+nearby|locate(?:\s+a|\s+the)?|route\s+to)\s+(.+)/i);
         const _dest = _destMatch?.[1]?.trim().replace(/[?.!]+$/g, '');
-        const _mapsCtx = { dest: _dest, task, encodedQuery: '' };
+        const _mapsCtx = { dest: _dest, task, encodedQuery: await _getEncodedQuery(task, serviceKey) };
         const _mapsResult = _resolveIntentTemplate(svcEntry?.intentUrls?.maps, task, _mapsCtx);
         if (_mapsResult) return _mapsResult;
         // Fallback: if no dest and service is googlemaps, use startUrl
@@ -8840,13 +8893,10 @@ async function _resolveTaskDeepLink(agentId, serviceKey, baseStartUrl, task, exi
           candidate = _hit;
           candidateSource = 'search-oracle';
           try {
-            // Entity-parameterized URLs (dates=, text=, title=) are specific to
-            // this task — caching them under a generic intent key turns one
-            // task's entities into the next task's seed.
-            if (!/[?&](?:text|dates?|title|subject|body|dtstart|dtend|location)=/i.test(_hit)) {
-              const { saveIntentUrl } = require('./lib/appKnowledge.cjs');
-              saveIntentUrl(_svcHost, intent, _hit, null, { confidence: 0.3 });
-            }
+            // Task-parameterized URLs (dates=, text=, query=, …) are specific
+            // to this task — _cacheIntentUrl stores reusable shapes only and
+            // salvages query URLs into the {query} search-pattern cache.
+            _cacheIntentUrl(_svcHost, intent, _hit, serviceKey, { confidence: 0.3 });
           } catch (_) { /* advisory */ }
           logger.info(`[browser.agent] deep-link: search-oracle → ${_hit}`);
         }
@@ -9043,15 +9093,11 @@ async function _resolveTaskDeepLink(agentId, serviceKey, baseStartUrl, task, exi
         logger.warn(`[browser.agent] deep-link: skipping intent_url cache — fabricated NL-path candidate ${candidate}`);
       } else {
         setImmediate(() => {
-          try {
-            // Same entity-param guard as the search-oracle lane — a URL
-            // carrying dates=/text=/title= is one task's data, not a reusable
-            // destination for the intent.
-            if (/[?&](?:text|dates?|title|subject|body|dtstart|dtend|location)=/i.test(candidate)) return;
-            const { saveIntentUrl } = require('./lib/appKnowledge.cjs');
-            saveIntentUrl(baseHost, intent, candidate);
-            logger.info(`[browser.agent] deep-link: cached intent_url ${intent} → ${candidate} in appKnowledge for ${baseHost}`);
-          } catch (_) {}
+          // Same task-param guard as the search-oracle lane — a URL carrying
+          // dates=/text=/search_query= is one task's data, not a reusable
+          // destination for the intent. _cacheIntentUrl also salvages the
+          // query shape into the {query} search-pattern cache.
+          _cacheIntentUrl(baseHost, intent, candidate, serviceKey);
         });
       }
     }
@@ -12982,9 +13028,10 @@ Output ONLY valid JSON: {${_execRecipe.params.map(p => `"${p.name}": "<extracted
             if (_intent && _intent !== INTENTS.HOME && !_isSearchCriteriaTask(task, _taskCls)) {
               setImmediate(() => {
                 try {
-                  const { saveIntentUrl } = require('./lib/appKnowledge.cjs');
                   const _host = (() => { try { return new URL(_bestUrl).hostname.replace(/^www\./, ''); } catch (_) { return ''; } })();
-                  if (_host) saveIntentUrl(_host, _intent, _bestUrl, null, { verified: true });
+                  // _cacheIntentUrl drops query-bearing landed URLs — a search
+                  // results URL is this task's data, not the intent's shape.
+                  if (_host) _cacheIntentUrl(_host, _intent, _bestUrl, _svcKey, { verified: true });
                 } catch (_) {}
               });
             }

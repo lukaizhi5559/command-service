@@ -352,5 +352,21 @@
       }
     },
     "defaultProvider": "curl"
+  },
+  "skill": {
+    "keywords": [
+      "skill"
+    ],
+    "providers": {
+      "skill": {
+        "tool": "skill",
+        "installCmd": "npm install -g skill",
+        "installSource": "npm",
+        "installPkg": "skill",
+        "probeCmd": "skill --version",
+        "helpCmd": "skill --help"
+      }
+    },
+    "defaultProvider": "skill"
   }
 }

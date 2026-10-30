@@ -43,6 +43,16 @@ const DEFAULT_TIMEOUT_MS = 30000;
 const MAX_TIMEOUT_MS = 600000;
 const PASSWORD_RE = /([Pp]assword( for .+)?:|[Pp]assphrase( for .+)?:|\[sudo\] password)/;
 
+// Shell continuation prompts — a command with an unbalanced quote (or a
+// trailing `|`/`&&`/unclosed heredoc) drops the shell into PS2: zsh prints
+// `quote>`/`dquote>`/`heredoc>`/`pipe>`/…, bash prints a bare `>`. The exit
+// marker can never arrive while the shell waits for the rest of the
+// statement — detect the prompt early and abort instead of burning the
+// whole timeout (observed: a fenced commit message embedded in `bash -c
+// '…'` left the PTY at `quote>` for the full 30 s).
+const CONTINUATION_NAMED_RE = /^[a-z-]*(?:quote|dquote|bquote|heredoc|pipe|cmdsubst|foreach|then|else|while|cont)>\s*$/i;
+const CONTINUATION_BARE_RE = /^>\s*$/;
+
 // ── Progress events (same fire-and-forget POST as cli.agent turn_live) ──────
 function emitProgress(cbUrl, payload) {
   if (!cbUrl) return;
@@ -338,7 +348,43 @@ async function actionExec(args, ctx) {
     const timer = setTimeout(() => finish({ saw: false }), ms);
   });
 
-  const result = await waitForExit(timeoutMs);
+  // Continuation-prompt watch — polls the settled last line for a PS2
+  // prompt. A named prompt (`quote>`, `heredoc>`…) hits on sight; a bare
+  // `>` must be stable across two polls (some TUIs redraw a lone `>` while
+  // repainting). On hit: ^C restores the foreground and the exec fails fast
+  // with a parseable error instead of a 30 s wall.
+  const watchContinuation = () => {
+    let hit = null;
+    let bareStreak = 0;
+    const timer = setInterval(async () => {
+      try {
+        await s.screen.flush();
+        const last = (s.screen.screen().split('\n').filter(l => l.trim()).pop() || '').trim();
+        if (!last) { /* screen still settling */ }
+        else if (CONTINUATION_NAMED_RE.test(last)) hit = last;
+        else if (CONTINUATION_BARE_RE.test(last)) { if (++bareStreak >= 2) hit = last; }
+        else bareStreak = 0;
+      } catch (_) {}
+    }, 400);
+    let check = null;
+    const promise = new Promise((resolve) => {
+      check = setInterval(() => {
+        if (hit) {
+          clearInterval(check); check = null;
+          clearInterval(timer);
+          s.pty.write('\x03');
+          setTimeout(() => resolve({ saw: false, continuation: true, promptLine: hit }), 250);
+        }
+      }, 150);
+    });
+    return { promise, stop: () => { clearInterval(timer); if (check) { clearInterval(check); check = null; } } };
+  };
+  const _contWatch = watchContinuation();
+  const result = await Promise.race([waitForExit(timeoutMs), _contWatch.promise]);
+  _contWatch.stop();
+  if (result.continuation) {
+    emitProgress(ctx.cbUrl, { type: 'terminal:activity', sessionId: s.id, kind: 'error', line: `✗ unbalanced quote — shell waiting at '${result.promptLine}' continuation prompt, aborted` });
+  }
 
   // Pager recovery — output paged into less/more (a resized viewer pane can
   // shrink the PTY under the output) holds the foreground, and the queued
@@ -417,9 +463,12 @@ async function actionExec(args, ctx) {
     delta: s.screen.rawSince(baseOffset).data,
     prompt: s.meta.prompt,
     autoAnswers: autoAnswers.length ? autoAnswers : undefined,
-    error: result.saw ? undefined : `timeout after ${timeoutMs}ms`,
+    error: result.saw ? undefined
+      : result.continuation
+        ? `unbalanced-quote: shell stuck at '${result.promptLine}' continuation prompt — command aborted (check for an unclosed quote/fence in the command)`
+        : `timeout after ${timeoutMs}ms`,
   };
-  emitProgress(ctx.cbUrl, {
+  if (!result.continuation) emitProgress(ctx.cbUrl, {
     type: 'terminal:activity', sessionId: s.id,
     kind: result.saw && result.exitCode === 0 ? 'ok' : 'error',
     line: result.saw ? `✓ exit ${result.exitCode} — ${cmd.slice(0, 80)}` : `✗ timeout — ${cmd.slice(0, 80)}`,

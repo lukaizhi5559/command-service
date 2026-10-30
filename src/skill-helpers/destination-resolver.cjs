@@ -1105,6 +1105,12 @@ function _isValidDeepLinkUrl(url) {
     logger.warn(`[destination-resolver] rejecting utility-path deep-link URL: ${url}`);
     return false;
   }
+  // Reject search-shaped URLs with an empty query — a results page with no
+  // query is a dead end, never a valid task destination.
+  if (_hasEmptySearchParam(url)) {
+    logger.warn(`[destination-resolver] rejecting empty-query deep-link URL: ${url}`);
+    return false;
+  }
   return true;
 }
 
@@ -1120,6 +1126,27 @@ const _SEARCH_URL_PARAMS = new Set([
   'k', 'q', 'query', 'search_query', 'searchterm', 'search', 'keyword',
   'keywords', 'term', 'field-keywords', 's', 'st', 'find_desc', '_nkw',
 ]);
+
+// A search-shaped URL whose query param is EMPTY is never a valid deep link —
+// it lands a "no results" page (observed: youtube /results?search_query= from
+// a buildUrl invoked with encodedQuery:''). Check params + hash-form queries.
+function _hasEmptySearchParam(url) {
+  if (!url || typeof url !== 'string') return false;
+  try {
+    const u = new URL(url);
+    for (const [key, val] of u.searchParams.entries()) {
+      if (_SEARCH_URL_PARAMS.has(key.toLowerCase()) && !String(val || '').trim()) return true;
+    }
+    const h = u.hash || '';
+    if (h.length > 1 && /^#\/?!?\/?(?:search|results|find|query|q|s)[\/=]/i.test(h)) {
+      const rest = h.replace(/^#\/?!?\/?(?:search|results|find|query|q|s)[\/=]/i, '').replace(/^[?&]/, '');
+      if (!rest.trim()) return true;
+    }
+    return false;
+  } catch (_) {
+    return false;
+  }
+}
 function _hasSearchQueryParam(url) {
   if (!url || typeof url !== 'string') return false;
   try {
@@ -1148,6 +1175,47 @@ function _hasSearchQueryParam(url) {
     return false;
   } catch (_) {
     return false;
+  }
+}
+
+// A URL is cacheable as a reusable intent_url only when it encodes a
+// DESTINATION SHAPE (compose page, upload page, create form) — never a
+// task-specific query. Poisoned entries (youtube search → "his videos",
+// google search → "best vegan food Philadelphia") come from success-path
+// saves that stored the landed URL verbatim.
+function _isCacheableIntentUrl(url) {
+  if (!url || typeof url !== 'string') return false;
+  if (_hasSearchQueryParam(url)) return false;
+  if (_hasEmptySearchParam(url)) return false;
+  // Task-content params — one task's data, not a reusable destination shape.
+  if (/[?&#](?:text|body|channel|subject|message|caption|title|dtstart|dtend|dates?|location|redir)=/i.test(url)) return false;
+  return true;
+}
+
+// Convert a query-bearing URL into a {query} search-pattern template — the
+// learned value lives in the search-pattern cache, not intent_url.
+// "https://x.com/results?search_query=cats" → "https://x.com/results?search_query={query}"
+function _searchPatternFromQueryUrl(url) {
+  if (!url || typeof url !== 'string') return null;
+  try {
+    const u = new URL(url);
+    for (const key of u.searchParams.keys()) {
+      if (_SEARCH_URL_PARAMS.has(key.toLowerCase()) && String(u.searchParams.get(key) || '').trim()) {
+        u.searchParams.set(key, '{query}');
+        // URL encodes the braces — restore the literal placeholder so
+        // recordSearchUrlPattern's {query} check and downstream .replace() work.
+        return u.toString().replace(/%7Bquery%7D/i, '{query}');
+      }
+    }
+    // Hash-form: gmail #search/<q>
+    const m = String(u.hash || '').match(/^(#\/?!?\/?(?:search|results|find|query|q|s)\/)(.+)$/i);
+    if (m && m[2].trim()) {
+      u.hash = m[1] + '{query}';
+      return u.toString();
+    }
+    return null;
+  } catch (_) {
+    return null;
   }
 }
 
@@ -1562,5 +1630,8 @@ module.exports = {
   AUTH_FLOW_PATH_RE,
   _isValidDeepLinkUrl,
   _hasSearchQueryParam,
+  _hasEmptySearchParam,
+  _isCacheableIntentUrl,
+  _searchPatternFromQueryUrl,
   _isGenericLandingUrl,
 };

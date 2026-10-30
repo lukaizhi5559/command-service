@@ -7317,17 +7317,43 @@ If no videos found, return []. Do not explain, only output the JSON array.`;
 
           // 5. Ask LLM what to do next
           let _dec = null;
-          try {
-            const _credHint = `Available credentials: has_email=${_hasEmail}, has_password=${_hasPassword}`;
-            const _histHint = _actionHistory.length ? `Completed actions: ${_actionHistory.join(' → ')}` : 'Completed actions: none';
-            const _llmRaw = await askWithMessages([
-              { role: 'system', content: AUTH_FORM_PROMPT },
-              { role: 'user',   content: `${_credHint}\n${_histHint}\nVisible inputs: ${_visHint}\n\nPAGE SNAPSHOT:\n${_snapText.slice(0, 6000)}` },
-            ], { temperature: 0.1, maxTokens: 128, responseTimeoutMs: 15000 });
-            _dec = parseLlmJson(_llmRaw, logger, 'waitForAuth.authLoop');
-          } catch (_le) {
-            logger.warn(`[browser.act] waitForAuth: auth-loop step ${_step + 1} LLM error — ${_le.message}`);
-            break;
+          const _credHint = `Available credentials: has_email=${_hasEmail}, has_password=${_hasPassword}`;
+          const _histHint = _actionHistory.length ? `Completed actions: ${_actionHistory.join(' → ')}` : 'Completed actions: none';
+          const _authState = `${_credHint}\n${_histHint}\nVisible inputs: ${_visHint}\n\nPAGE SNAPSHOT:\n${_snapText.slice(0, 6000)}`;
+
+          // ── Local decision fast path — bounded 4-action pick ─────────
+          // The local pick only supplies `action` (selector is best-effort —
+          // _waitVisible falls back to generic selectors). done/click_submit/
+          // fill_* cover the full AUTH_FORM action space.
+          const _localAction = await require('../skill-helpers/decision.cjs').boundedDecision({
+            site: 'browserAct.authLoop',
+            questions: [{
+              id: 'action', type: 'choice',
+              question: 'What is the next action to complete this login/auth form? fill_email if a visible email/username field is empty and email is available; fill_password if a visible password field is empty and password is available (fill email first when both are visible); click_submit if credentials are filled but a submit/sign-in button is still visible and the page has not advanced; done for 2FA prompts, CAPTCHA, or when the page has moved past credential entry.',
+              options: ['fill_email', 'fill_password', 'click_submit', 'done'],
+            }],
+            state: _authState,
+            local: (a) => {
+              const acts = ['fill_email', 'fill_password', 'click_submit', 'done'];
+              const i = a.action?.index;
+              return (i != null && acts[i]) ? { action: acts[i], selector: null, rationale: 'local-decision' } : null;
+            },
+            remote: async () => null,
+            logger,
+          });
+          if (_localAction) {
+            _dec = _localAction;
+          } else {
+            try {
+              const _llmRaw = await askWithMessages([
+                { role: 'system', content: AUTH_FORM_PROMPT },
+                { role: 'user',   content: _authState },
+              ], { temperature: 0.1, maxTokens: 128, responseTimeoutMs: 15000 });
+              _dec = parseLlmJson(_llmRaw, logger, 'waitForAuth.authLoop');
+            } catch (_le) {
+              logger.warn(`[browser.act] waitForAuth: auth-loop step ${_step + 1} LLM error — ${_le.message}`);
+              break;
+            }
           }
 
           if (!_dec?.action) {

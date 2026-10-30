@@ -10,7 +10,12 @@ const { browserAgent, _withSessionMutex } = require('../../browser.agent.cjs');
 // Keep the same convention so atomic-agent steps share the session a
 // url.first.agent step created.
 function deriveSessionId(agentId) {
-  const base = String(agentId || 'default').replace(/\.agent$/i, '').replace(/_agent$/i, '').replace(/\s+/g, '_');
+  const raw = String(agentId || 'default').trim();
+  // ext:/open:/bg:-prefixed ids are already session names, not agent ids —
+  // deriving again would mint a nonexistent session (ext:default →
+  // ext:default_agent → "no live tab for session 'ext:default_agent'").
+  if (/^(ext:|open:|bg:)/i.test(raw)) return raw;
+  const base = raw.replace(/\.agent$/i, '').replace(/_agent$/i, '').replace(/\s+/g, '_');
   return `${base}_agent`;
 }
 

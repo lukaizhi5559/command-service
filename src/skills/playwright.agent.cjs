@@ -183,8 +183,15 @@ async function _observePage(sessionId, opts = {}) {
   const { includeStructure = true, textLen = 8000, cachedText = '' } = opts;
   const ev = { url: '', title: '', text: '', structure: '', textSource: 'none', ok: false };
   const page = _getPage(sessionId);
+  // ext sessions: a page object here is a wrapper or stale engine registration
+  // that can shadow the live tab — observed ext:default returning engine
+  // page=true while url/text/snapshot all came back empty for 8 turns, while
+  // the browserAct/_fastSnapshot path saw the real tab (80-element snapshot).
+  // The else branch self-heals: _engineEval falls through to browserAct when
+  // the page evaluate throws. Same policy as _engineSnapshot's ext guard.
+  const isExtSession = String(sessionId || '').startsWith('ext:');
   try {
-    if (page) {
+    if (page && !isExtSession) {
       ev.url = await _pageUrlOf(page);
       try { ev.title = await page.title().catch(() => ''); } catch (_) {}
       try {

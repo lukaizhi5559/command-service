@@ -1380,18 +1380,37 @@ Which element number matches the step target?
 Output ONLY the number, or 0 if no match.`;
 
   // ── Local decision fast path — bounded pick over the element list ────────
-  if (tabMap.length <= 25) {
+  // Large lists (>25) exceed the local model's reliable option window — a
+  // deterministic fuzzy pre-filter narrows them to the top candidates first.
+  // If nothing scores (target has zero textual overlap with any element), the
+  // pick stays remote where the model sees the full list.
+  let _candidates = tabMap;
+  if (tabMap.length > 25) {
+    const _scored = tabMap
+      .map(e => ({ e, s: _fuzzyTextScore(verifyText, entryLabel(e) || '') }))
+      .filter(x => x.s > 0)
+      .sort((a, b) => b.s - a.s)
+      .slice(0, 20)
+      .map(x => x.e);
+    if (_scored.length > 0) {
+      _candidates = _scored;
+      logger.info(`[instruction.runner] tabMap pre-filter: ${tabMap.length} → ${_candidates.length} candidates for "${verifyText}"`);
+    } else {
+      _candidates = null; // no fuzzy overlap — remote sees the full list
+    }
+  }
+  if (_candidates && _candidates.length > 0 && _candidates.length <= 25) {
     const _local = await _decision.boundedDecision({
       site: 'tabMap.pickFromTabMap',
       questions: [{
         id: 'el', type: 'choice',
         question: `Which element matches the step target "${verifyText}"? The target text may be GARBLED — characters can be dropped within words ("playli t" = "playlist"). Match if the element text/label contains the same words ignoring dropped characters. A bare "Create" does NOT match "Create a playlist with a song or episode" — it only matches an exactly-"Create" element.${contextHint ? ` Additional context: "${contextHint}".` : ''} Pick "none" if no element matches.`,
-        options: [...tabMap.map(e => `${e.id} - ${_formatTabMapEntryForLLM(e)}`.slice(0, 160)), 'none'],
+        options: [..._candidates.map(e => `${e.id} - ${_formatTabMapEntryForLLM(e)}`.slice(0, 160)), 'none'],
       }],
       state: `Step: ${actionDesc} — target: "${verifyText}"${hintBlock}`,
       local: (a) => {
         const i = a.el?.index;
-        return (i != null && i < tabMap.length) ? tabMap[i] : null;
+        return (i != null && i < _candidates.length) ? _candidates[i] : null;
       },
       remote: async () => null,
       logger,

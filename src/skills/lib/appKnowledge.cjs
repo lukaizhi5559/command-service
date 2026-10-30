@@ -347,7 +347,29 @@ function loadIntentUrl(hostname, intent) {
     (e.confidence || 0) >= 0.4
   );
   if (!match) return null;
+  // Legacy-poison defense: entries predating the save-time guard may still
+  // carry task-specific query strings. Never serve them — the query belongs
+  // to a different task.
+  if (_intentUrlCarriesTaskContent(match.details.url)) {
+    logger.warn(`[appKnowledge] skipping poisoned intent_url ${h}/${intent} → ${String(match.details.url).slice(0, 120)}`);
+    return null;
+  }
   return { url: match.details.url, confidence: match.confidence || 0, verifiedRuns: match.verifiedRuns || 0 };
+}
+
+// A URL is reusable as an intent destination only when it encodes a shape
+// (compose page, upload page, create form) — never a task's search query or
+// entity payload. Kept local (tiny) so appKnowledge has no dependency on
+// destination-resolver at load time.
+const _TASK_QUERY_PARAM_RE = /[?&#](?:q|k|query|search_query|searchterm|search|keyword|keywords|term|field-keywords|s|st|find_desc|_nkw|text|body|channel|subject|message|caption|title|dtstart|dtend|location|redir)=/i;
+function _intentUrlCarriesTaskContent(url) {
+  const u = String(url || '');
+  if (!u) return false;
+  if (u.includes('{query}')) return true;
+  if (_TASK_QUERY_PARAM_RE.test(u)) return true;
+  // Hash-form searches: #search/<q>, #/search?q=
+  if (/#\/?!?\/?(?:search|results|find|query|q|s)[\/=]/i.test(u)) return true;
+  return false;
 }
 
 /**
@@ -362,6 +384,13 @@ function loadIntentUrl(hostname, intent) {
 function saveIntentUrl(hostname, intent, url, taskPattern = null, opts = {}) {
   const h = _safeHostname(hostname);
   if (!h || !intent || !url) return 0;
+  // Persistence-layer poison guard — query-bearing / entity-parameterized
+  // URLs are one task's data, never a reusable intent destination. Callers
+  // salvage these into the {query} search-pattern cache instead.
+  if (_intentUrlCarriesTaskContent(url)) {
+    logger.warn(`[appKnowledge] refusing poisoned intent_url save ${h}/${intent} → ${String(url).slice(0, 120)}`);
+    return 0;
+  }
   const id = `${h}.intent_url.${intent}`;
   const _verified = opts && opts.verified === true;
   return saveAppKnowledge(h, [{
