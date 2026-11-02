@@ -270,6 +270,33 @@ async function main() {
   ar = EA._applyOps('hello world\n', [{ find: 'wrld', replace: 'world' }]);
   check('already-applied → skipped not failed', !ar.error && ar.applied[0].alreadyApplied === true, JSON.stringify(ar));
 
+  // line-op expect retarget — stale "line N" parrots self-heal when the
+  // expected text lives on exactly one other line
+  ar = EA._applyOps('alpha\nbeta target line\ngamma\n', [{ line: 1, replace: 'beta FIXED line', expect: 'target line' }]);
+  check('stale line ref retargets via expect', ar.text === 'alpha\nbeta FIXED line\ngamma\n' && ar.applied[0].retargetedFrom === 1 && ar.applied[0].line === 2, JSON.stringify(ar));
+  ar = EA._applyOps('alpha\ntarget a\ntarget b\n', [{ line: 1, delete_line: 1, expect: 'target' }]);
+  check('ambiguous expect → still op_no_match', ar.error && ar.reason === 'op_no_match', JSON.stringify(ar));
+  ar = EA._applyOps('alpha\nbeta\ngamma\n', [{ line: 1, delete_line: 1, expect: 'nothing anywhere' }]);
+  check('absent expect → still op_no_match', ar.error && ar.reason === 'op_no_match', JSON.stringify(ar));
+
+  // loose (alnum-only) find — catches goal-paraphrased quotes
+  ar = EA._applyOps('x = "Ask or Drag-Drop anything here"\n', [{ find: 'Ask or drop, drag anything here', replace: 'UPDATED' }]);
+  check('paraphrased find → unique loose hit', ar.text === 'x = "UPDATED"\n' && ar.applied[0].loose === true, JSON.stringify(ar));
+  ar = EA._applyOps('Drag-Drop A\n\nDrag-Drop B\n', [{ find: 'drag drop', replace: 'x' }]);
+  check('ambiguous loose → still op_no_match', ar.error && ar.reason === 'op_no_match', JSON.stringify(ar));
+  ar = EA._applyOps('Drag-Drop A\n\nDrag-Drop B\n', [{ find: 'drag drop', replace: 'x', occurrence: 'all' }]);
+  check('occurrence:all stays strict → op_no_match', ar.error && ar.reason === 'op_no_match', JSON.stringify(ar));
+  let lh = EA._looseIndexOf('const p = "Ask or Drag-Drop anything here";', 'ask or drop, drag anything here');
+  check('_looseIndexOf maps to orig coords', lh && 'const p = "Ask or Drag-Drop anything here";'.slice(lh.index, lh.index + lh.length) === 'Ask or Drag-Drop anything here', JSON.stringify(lh));
+
+  // overlapping ops for one target must not stack replacements — a verbatim
+  // op applies, then a paraphrased duplicate's loose-replace is alreadyApplied
+  ar = EA._applyOps('"Ask or Drag-Drop anything here"\n', [
+    { find: '"Ask or Drag-Drop anything here"', replace: '"Ask or Drag-Drop anything here — hint"' },
+    { find: 'Ask or drop, drag anything here', replace: 'Ask or drop, drag anything here — hint' },
+  ]);
+  check('overlapping ops do not stack', ar.text === '"Ask or Drag-Drop anything here — hint"\n' && ar.applied[1].alreadyApplied === true, JSON.stringify(ar));
+
   console.log('\n--- _normalizedIndexOf ---');
   const curly = 'she said \u201Chello wrld\u201D here';
   let nm = EA._normalizedIndexOf(curly, '"hello wrld"');
@@ -444,6 +471,64 @@ async function main() {
   const repAfter = fs.readFileSync(repFile, 'utf8');
   check('only first block edited', (repAfter.match(/believe/g) || []).length === 1 && (repAfter.match(/beleive/g) || []).length === 14);
   check('note flags 15 matches', typeof r.note === 'string' && r.note.includes('15'), r.note);
+
+  console.log('\n--- miss ladder: stale line-range → fragment re-anchor ---');
+  // Real-world regression: goal says "line 56" but the quoted text lives at
+  // ~line 300. First anchored window returns []; the ladder re-anchors via
+  // the quoted fragment and lands the edit. The responder keys on the window
+  // body (between the --- fences), not the goal text that names the target.
+  const _win = (c) => ((c.match(/---\n([\s\S]*?)\n---/) || [])[1] || '');
+  const ladderPad = 'generic padding line\n';
+  const staleContent = ladderPad.repeat(300) + 'const placeholder = "TARGET placeholder";\n' + ladderPad.repeat(300);
+  const staleFile = write('stale-line.md', staleContent); // ~12K, target ~line 301
+  _llmResponder = (msgs) => _win(msgs[1].content).includes('TARGET placeholder')
+    ? '[{"find":"TARGET placeholder","replace":"TARGET placeholder UPDATED"}]'
+    : '[]';
+  r = await editAgent({ goal: "find line 56 where the text is 'TARGET placeholder' and update it", filePath: staleFile });
+  check('stale line anchor recovers via re-anchor', r.ok === true && r.changed === true, JSON.stringify(r).slice(0, 300));
+  check('edit landed at real location', fs.readFileSync(staleFile, 'utf8').includes('TARGET placeholder UPDATED'));
+  check('note records re-anchor', typeof r.note === 'string' && /re-anchored|missed/.test(r.note), r.note);
+
+  console.log('\n--- miss ladder: block-miss → chunked fallback ---');
+  // Goal has no quotable/line anchor that matches; locateBlock picks a wrong
+  // block; whole-file chunked pass finds the real region.
+  const cfContent = 'filler prose block\n\n' + 'x'.repeat(5000) + '\n\nunique NEEDLE-TARGET phrase\n\n' + 'y'.repeat(5000);
+  const cfFile = write('chunk-fallback.md', cfContent);
+  _llmResponder = (msgs) => {
+    const c = msgs[1].content;
+    if (c.includes('blocks. Outline')) return '{"block":0}'; // wrong block on purpose
+    if (c.includes('NEEDLE-TARGET')) return '[{"find":"NEEDLE-TARGET","replace":"NEEDLE-FIXED"}]';
+    return '[]';
+  };
+  r = await editAgent({ goal: 'update the needle phrase to fixed', filePath: cfFile });
+  check('chunked fallback applies edit', r.ok === true && r.changed === true, JSON.stringify(r).slice(0, 300));
+  check('needle replaced', fs.readFileSync(cfFile, 'utf8').includes('NEEDLE-FIXED'));
+
+  console.log('\n--- miss ladder exhausted → no_match ---');
+  const nmFile = write('no-match.md', pad + 'unrelated content\n' + pad);
+  _llmResponder = (msgs) => msgs[1].content.includes('blocks. Outline') ? '{"block":0}' : '[]';
+  r = await editAgent({ goal: 'update the zzz-absent-thing to something else', filePath: nmFile });
+  check('full miss → no_match (not silent no-op)', r.ok === false && r.reason === 'no_match', JSON.stringify(r).slice(0, 300));
+  check('file untouched', !fs.readFileSync(nmFile, 'utf8').includes('something else'));
+
+  console.log('\n--- alreadyApplied stays a legit no-op ---');
+  const aaFile = write('already.md', pad + 'the quick brown fox\n' + pad);
+  _llmResponder = (msgs) => _win(msgs[1].content).includes('quick')
+    ? '[{"find":"quik","replace":"quick"}]' // find absent but replace present → alreadyApplied
+    : '[]';
+  r = await editAgent({ goal: "make sure the word 'quick' is spelled correctly", filePath: aaFile });
+  check('already-satisfied → ok no-change, no no_match', r.ok === true && r.changed === false, JSON.stringify(r).slice(0, 200));
+
+  console.log('\n--- arg aliases: image.analyze + fs.read ---');
+  const { imageAnalyze } = require('../src/skills/image.analyze.cjs');
+  const ia = await imageAnalyze({ imagePath: '/definitely/not/here.png' });
+  check('imagePath alias accepted (not "filePath is required")', ia.ok === false && !/filePath is required/.test(ia.error || ''), ia.error);
+  const { fsRead } = require('../src/skills/fs.read.cjs');
+  const frTarget = path.join(os.homedir(), '.thinkdrop', 'edit-agent-alias-test.md');
+  fs.writeFileSync(frTarget, 'alias probe content\n');
+  const fr = await fsRead({ action: 'read', filePath: frTarget });
+  check('fs.read filePath alias reads', fr && fr.ok === true && (fr.files?.[0]?.content || '').includes('alias probe content'), JSON.stringify(fr).slice(0, 160));
+  fs.rmSync(frTarget, { force: true });
 
   _llmResponder = null;
 

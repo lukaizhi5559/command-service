@@ -39,12 +39,17 @@ const _sessionTabInfo = new Map();
 const _mediaState = new Map();
 
 // Forward media.playing to the memory-service audio journal — fire-and-forget.
+// /audio.* sits behind authMiddleware — the Bearer is required or the journal
+// silently never arms (all posts 401 before handleContext runs).
 function _postAudioContext(payload) {
   try {
     const body = JSON.stringify(payload);
+    const headers = { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) };
+    const key = process.env.MCP_USER_MEMORY_API_KEY;
+    if (key) headers.Authorization = `Bearer ${key}`;
     const req = http.request({
       hostname: '127.0.0.1', port: MEMORY_PORT, path: '/audio.context',
-      method: 'POST', headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
+      method: 'POST', headers,
       timeout: 3000,
     }, (res) => res.resume());
     req.on('error', () => {});
@@ -250,8 +255,11 @@ function attach(httpServer) {
     ws.isAlive = true;
     ws.on('pong', () => { ws.isAlive = true; });
     ws.on('message', (d) => _onMessage(ws, d));
-    ws.on('close', () => {
-      logger.warn('[ext.gateway] extension disconnected');
+    ws.on('close', (code, reason) => {
+      // 1006 = abnormal close (service worker died mid-flight); 1000 = clean.
+      // The code distinguishes an MV3 worker death from a server-side
+      // terminate — the 0.5s hello→disconnect flaps were undiagnosable without it.
+      logger.warn(`[ext.gateway] extension disconnected (code=${code}${reason && reason.length ? ` reason=${reason.toString().slice(0, 80)}` : ''})`);
       if (_ws === ws) _ws = null;
       _rejectAllPending('extension disconnected');
     });

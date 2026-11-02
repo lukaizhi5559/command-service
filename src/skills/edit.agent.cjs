@@ -394,6 +394,76 @@ function _normalizedIndexOf(text, needle, opts = {}) {
   return { index: start, length: endOrig - start };
 }
 
+// Loosest match tier: tokenizes both sides into alnum words (case-folded),
+// then (A) ordered substring on the collapsed word stream — catches
+// case/punctuation drift — or (B) a consecutive-word multiset match —
+// catches transposed words like "drop, drag" vs "Drag-Drop". Weaker evidence
+// than _normalizedIndexOf, so callers must demand uniqueness before
+// applying. Returns {index,length} in original coords.
+function _looseIndexOf(text, needle) {
+  const words = (s) => {
+    const out = [];
+    let i = 0;
+    while (i < s.length) {
+      if (/[\p{L}\p{N}]/u.test(s[i])) {
+        let j = i; const buf = [];
+        while (j < s.length && /[\p{L}\p{N}]/u.test(s[j])) buf.push(s[j++].toLowerCase());
+        out.push({ w: buf.join(''), start: i, end: j });
+        i = j;
+      } else i++;
+    }
+    return out;
+  };
+  const nw = words(needle);
+  if (!nw.length) return null;
+  const tw = words(text);
+  const nNorm = nw.map(x => x.w).join(' ');
+  const tNorm = tw.map(x => x.w).join(' ');
+
+  // Tier A — ordered substring: "ask or drop drag anything here" inside
+  // "x ask or drag drop anything here".
+  const ni = tNorm.indexOf(nNorm);
+  if (ni >= 0) {
+    const nEnd = ni + nNorm.length;
+    let si = -1, ei = -1, off = 0;
+    for (let k = 0; k < tw.length; k++) {
+      const wEnd = off + tw[k].w.length;
+      if (si < 0 && wEnd > ni) si = k;
+      if (wEnd >= nEnd) { ei = k; break; }
+      off = wEnd + 1;
+    }
+    if (si < 0) si = 0;
+    if (ei < 0) ei = tw.length - 1;
+    return { index: tw[si].start, length: tw[ei].end - tw[si].start };
+  }
+
+  // Tier B — sliding consecutive-word multiset: same words, any order.
+  const need = new Map();
+  for (const { w } of nw) need.set(w, (need.get(w) || 0) + 1);
+  outer: for (let i = 0; i + nw.length <= tw.length; i++) {
+    const c = new Map(need);
+    for (let j = 0; j < nw.length; j++) {
+      const w = tw[i + j].w, left = c.get(w);
+      if (!left) continue outer;
+      left > 1 ? c.set(w, left - 1) : c.delete(w);
+    }
+    return { index: tw[i].start, length: tw[i + nw.length - 1].end - tw[i].start };
+  }
+  return null;
+}
+
+// All loose hits, capped — used to prove a loose find is unambiguous.
+function _looseHits(text, needle, cap = 10) {
+  const hits = [];
+  let from = 0, h;
+  while ((h = _looseIndexOf(text.slice(from), needle))) {
+    hits.push({ index: from + h.index, length: h.length });
+    from += h.index + Math.max(h.length, 1);
+    if (hits.length >= cap) break;
+  }
+  return hits;
+}
+
 // Deterministic op application against one slice of text.
 // Returns { text, applied:[{find,replace,position}] } or { error, reason, op }.
 function _applyOps(text, ops) {
@@ -409,10 +479,18 @@ function _applyOps(text, ops) {
         return { error: `op ${oi}: line ${n} out of range (1-${lines.length})`, reason: 'op_no_match', op };
       }
       const expect = String(op.expect ?? '').trim();
-      const lineIdx = n - 1;
-      if (expect) {
-        const hit = _normalizedIndexOf(lines[lineIdx], expect);
-        if (!hit) return { error: `op ${oi}: line ${n} does not contain expected text "${expect.slice(0, 60)}"`, reason: 'op_no_match', op };
+      let lineIdx = n - 1;
+      let retargetedFrom = null;
+      if (expect && !_normalizedIndexOf(lines[lineIdx], expect)) {
+        // Stale line ref — goals often carry a wrong "line N" that the model
+        // parrots into the op. If the expected text lives on exactly one
+        // other line, retarget there; 0 or 2+ candidates stays a safe miss.
+        const alt = [];
+        for (let i = 0; i < lines.length; i++) {
+          if (i !== lineIdx && _normalizedIndexOf(lines[i], expect)) alt.push(i);
+        }
+        if (alt.length === 1) { retargetedFrom = n; lineIdx = alt[0]; }
+        else return { error: `op ${oi}: line ${n} does not contain expected text "${expect.slice(0, 60)}"`, reason: 'op_no_match', op };
       }
       if (typeof op.line === 'number' && typeof op.replace === 'string') {
         lines[lineIdx] = op.replace;
@@ -422,7 +500,7 @@ function _applyOps(text, ops) {
         lines.splice(lineIdx, 1);
       }
       text = lines.join('\n');
-      applied.push({ line: n, position: lineIdx });
+      applied.push({ line: lineIdx + 1, position: lineIdx, ...(retargetedFrom != null ? { retargetedFrom } : {}) });
       continue;
     }
     const find = String(op?.find ?? '');
@@ -444,7 +522,7 @@ function _applyOps(text, ops) {
       if (!hits.length) {
         // Idempotent re-run: find is gone but its replacement is already
         // present — treat as already applied rather than an error.
-        if (replace && _normalizedIndexOf(text, replace)) {
+        if (replace && (_normalizedIndexOf(text, replace) || _looseIndexOf(text, replace))) {
           applied.push({ find: find.slice(0, 80), replace: replace.slice(0, 80), alreadyApplied: true });
           continue;
         }
@@ -459,13 +537,26 @@ function _applyOps(text, ops) {
       continue;
     }
 
-    const first = _normalizedIndexOf(text, find);
+    let first = _normalizedIndexOf(text, find);
+    let looseHit = null;
     if (!first) {
-      if (replace && _normalizedIndexOf(text, replace)) {
+      // Idempotent skip: the intended output is already present (exact or
+      // loose). Chunked passes can emit overlapping ops for one target —
+      // without this, each stacks its replacement onto the previous one's.
+      if (replace && (_normalizedIndexOf(text, replace) || _looseIndexOf(text, replace))) {
         applied.push({ find: find.slice(0, 80), replace: replace.slice(0, 80), alreadyApplied: true });
         continue;
       }
-      return { error: `op ${oi}: could not find "${find.slice(0, 80)}"`, reason: 'op_no_match', op };
+      // Loose retry: the goal's quoted text was paraphrased (case/punctuation
+      // drift, transposed words). A single alnum-level match is unambiguous;
+      // 0 or 2+ stays a safe miss. Multi-occurrence ops stay strict.
+      if (occurrence === 'first' || occurrence === 1) {
+        const hits = _looseHits(text, find);
+        if (hits.length === 1) { first = hits[0]; looseHit = hits[0]; }
+      }
+      if (!first) {
+        return { error: `op ${oi}: could not find "${find.slice(0, 80)}"`, reason: 'op_no_match', op };
+      }
     }
     // Multi-match within the window is NOT an error — the window is already the
     // declared scope (a paragraph, block, or chunk). 'first' deterministically
@@ -492,7 +583,7 @@ function _applyOps(text, ops) {
       }
     }
     text = text.slice(0, target.index) + replace + text.slice(target.index + target.length);
-    applied.push({ find: find.slice(0, 80), replace: replace.slice(0, 80), position: target.index, occurrences: extraCount + 1 });
+    applied.push({ find: find.slice(0, 80), replace: replace.slice(0, 80), position: target.index, occurrences: extraCount + 1, ...(looseHit ? { loose: true } : {}) });
   }
   return { text, applied };
 }
@@ -681,10 +772,13 @@ function _isGlobalScope(goal) {
 }
 
 // Locate where a targeted goal should edit. Returns {start,end,label,note?}
-// or 'whole' or {notFound} or null.
-function _findTarget(goal, content) {
-  const lr = _lineRangeTarget(goal, content);
-  if (lr) return lr.notFound ? { notFound: lr.notFound } : lr;
+// or 'whole' or {notFound} or null. opts.skipLineRange ignores "line N"
+// anchors — used by the retry ladder when the stated lines proved stale.
+function _findTarget(goal, content, opts = {}) {
+  if (!opts.skipLineRange) {
+    const lr = _lineRangeTarget(goal, content);
+    if (lr) return lr.notFound ? { notFound: lr.notFound } : lr;
+  }
   if (_isGlobalScope(goal)) return 'whole';
 
   const frags = _goalFragments(goal);
@@ -848,6 +942,17 @@ Which block does the goal want edited? Reply with ONLY JSON:
   }
 }
 
+// Emit ops for one window and apply them. Shared by the targeted pass and the
+// re-anchor retries in the miss ladder. Returns { text, applied } or
+// { error, reason }.
+async function _opsInWindow(goal, windowText, label, agentContext) {
+  const ops = await _emitOps(goal, windowText, label, agentContext);
+  if (ops === null) return { error: 'LLM edit failed — no output', reason: 'llm_failed' };
+  const res = _applyOps(windowText, ops);
+  if (res.error) return { error: res.error, reason: res.reason || 'op_failed' };
+  return { text: res.text, applied: res.applied };
+}
+
 // Global-scope edit: emit + apply ops per paragraph-aligned chunk. An op that
 // misses its chunk gets one retry against the merged boundary region before
 // failing the whole pass — all-or-nothing, no partial writes.
@@ -855,31 +960,60 @@ async function _chunkedOps(goal, content, agentContext, progressCallback) {
   const chunks = _chunkContent(content);
   const applied = [];
   const editedChunks = [];
+  const deferred = []; // ops that missed their own chunk — retried on the whole
   for (let i = 0; i < chunks.length; i++) {
     if (progressCallback) progressCallback({ type: 'edit:progress', message: `Editing part ${i + 1} of ${chunks.length}`, chunk: i + 1, total: chunks.length });
     const ops = await _emitOps(goal, chunks[i], `part ${i + 1} of ${chunks.length}`, agentContext);
     if (ops === null) return { error: 'LLM op emission failed', reason: 'llm_failed' };
     if (!ops.length) { editedChunks.push(chunks[i]); continue; }
-    let res = _applyOps(chunks[i], ops);
+    const res = _applyOps(chunks[i], ops);
     if (res.error && res.reason === 'op_no_match' && i > 0) {
       // Boundary retry: the find may span the chunk split — retry against
       // prev-tail + this-chunk merged region.
-      const merged = editedChunks.pop() + chunks[i];
+      const prev = editedChunks.pop();
+      const merged = prev + chunks[i];
       const mergedRes = _applyOps(merged, ops);
-      if (mergedRes.error) return { error: res.error, reason: res.reason };
-      // Split back at the original boundary (prev chunk may have been edited —
-      // its edited length is merged.length - this chunk's length).
-      const boundary = merged.length - chunks[i].length;
-      editedChunks.push(merged.slice(0, boundary));
-      editedChunks.push(merged.slice(boundary));
-      applied.push(...mergedRes.applied);
+      if (!mergedRes.error) {
+        // Split back at the original boundary (prev chunk may have been
+        // edited — its edited length is merged.length - this chunk's length).
+        const boundary = merged.length - chunks[i].length;
+        editedChunks.push(merged.slice(0, boundary));
+        editedChunks.push(merged.slice(boundary));
+        applied.push(...mergedRes.applied);
+        continue;
+      }
+      // Merged retry also missed — the op may target another chunk entirely
+      // (models sometimes emit on chunk 0 without locating first). Defer it.
+      editedChunks.push(prev, chunks[i]);
+      deferred.push(...ops);
       continue;
     }
-    if (res.error) return { error: res.error, reason: res.reason };
+    if (res.error) {
+      if (res.reason !== 'op_no_match') return { error: res.error, reason: res.reason };
+      editedChunks.push(chunks[i]);
+      deferred.push(...ops);
+      continue;
+    }
     editedChunks.push(res.text);
     applied.push(...res.applied);
   }
-  return { edited: editedChunks.join(''), applied };
+  let edited = editedChunks.join('');
+  const missed = [];
+  if (deferred.length) {
+    // Final pass on the assembled content — each deferred op is independent:
+    // one bogus find (a model-constructed string) shouldn't sink the ops that
+    // do locate. If every deferred op misses, the error still surfaces.
+    for (const op of deferred) {
+      const res = _applyOps(edited, [op]);
+      if (res.error) { missed.push({ op, error: res.error }); continue; }
+      edited = res.text;
+      applied.push(...res.applied.map(a => ({ ...a, deferred: true })));
+    }
+    if (missed.length && !applied.length) {
+      return { error: missed[0].error, reason: 'op_no_match' };
+    }
+  }
+  return { edited, applied, ...(missed.length ? { missed } : {}) };
 }
 
 // ── Office handlers ──────────────────────────────────────────────────────────
@@ -1221,8 +1355,14 @@ async function editAgent(args = {}) {
     return _applyDraft(draftPath, filePath);
   }
 
-  if (!filePath) return { ok: false, error: 'No filePath provided', reason: 'no_file' };
-  if (!goal) return { ok: false, error: 'No goal provided', reason: 'no_goal' };
+  if (!filePath) {
+    logger.warn(`[edit.agent] editAgent: no filePath/path/file/target arg — args keys: ${Object.keys(args || {}).join(', ') || '(none)'}`);
+    return { ok: false, error: 'No filePath provided', reason: 'no_file' };
+  }
+  if (!goal) {
+    logger.warn('[edit.agent] editAgent: no goal/instruction/prompt/task/edit arg provided');
+    return { ok: false, error: 'No goal provided', reason: 'no_goal' };
+  }
 
   filePath = _expandHome(String(filePath));
 
@@ -1295,29 +1435,95 @@ async function editAgent(args = {}) {
     if (!target) {
       return { ok: false, error: 'Could not locate the target — quote a few words from the text or name a section/line range', reason: 'region_not_found' };
     }
+    const _emitProgress = typeof args._progressCallback === 'function'
+      ? args._progressCallback
+      : (args._progressCallbackUrl
+        ? (evt) => _postProgress(args._progressCallbackUrl, { stepIndex: args._stepIndex ?? 0, ...evt })
+        : null);
     if (target === 'whole') {
       logger.info(`[edit.agent] editAgent: goal="${String(goal).slice(0, 80)}", file=${path.basename(filePath)}, size=${content.length} chars (chunked ops)`);
-      const _emitProgress = typeof args._progressCallback === 'function'
-        ? args._progressCallback
-        : (args._progressCallbackUrl
-          ? (evt) => _postProgress(args._progressCallbackUrl, { stepIndex: args._stepIndex ?? 0, ...evt })
-          : null);
       const res = await _chunkedOps(goal, content, agentContext, _emitProgress);
       if (res.error) return { ok: false, error: res.error, reason: res.reason || 'op_failed' };
       edited = res.edited;
       opsApplied = res.applied;
+      if (res.missed?.length) targetNote = `${res.missed.length} op(s) couldn't be located`;
       logger.info(`[edit.agent] chunked ops: ${res.applied.length} op(s) applied across ${content.length} chars`);
     } else {
       logger.info(`[edit.agent] editAgent: goal="${String(goal).slice(0, 80)}", file=${path.basename(filePath)}, size=${content.length} chars (targeted ops @ ${target.label})`);
-      const windowText = content.slice(target.start, target.end);
-      const ops = await _emitOps(goal, windowText, target.label, agentContext);
-      if (ops === null) return { ok: false, error: 'LLM edit failed — no output', reason: 'llm_failed' };
-      const res = _applyOps(windowText, ops);
-      if (res.error) return { ok: false, error: res.error, reason: res.reason || 'op_failed' };
-      edited = content.slice(0, target.start) + res.text + content.slice(target.end);
-      opsApplied = res.applied;
-      targetNote = target.note || null;
-      logger.info(`[edit.agent] targeted ops: ${res.applied.length} op(s) in window ${target.start}-${target.end} of ${content.length}`);
+      const tried = [target.label];
+      // ── Miss ladder ────────────────────────────────────────────────────────
+      // A location miss — 0 ops emitted, or ops whose find/expect/line refs all
+      // miss the window (op_no_match) — means the anchor was wrong, not that
+      // the goal is satisfied. The old code surfaced that as a successful "no
+      // changes needed". Re-anchor instead; alreadyApplied hits (goal already
+      // satisfied) never escalate. Shape errors (bad op JSON, oversized find)
+      // still fail fast — a different window won't fix them.
+      const _isMiss = (r) => r ? (r.error ? r.reason === 'op_no_match' : !r.applied.length) : true;
+      const _fatal = (r) => (r && r.error && r.reason !== 'op_no_match')
+        ? { ok: false, error: r.error, reason: r.reason } : null;
+      let res = await _opsInWindow(goal, content.slice(target.start, target.end), target.label, agentContext);
+      { const f = _fatal(res); if (f) return f; }
+
+      // Retries see a caveat: whatever anchor the first pass trusted missed,
+      // so quote/content-driven location beats any line refs the model would
+      // otherwise parrot from the goal back into its ops.
+      const retryGoal = goal + '\n(Note: the initially targeted region did not contain the described text — locate the target by its actual content. Copy any "find" strings verbatim from the shown text, NOT from this goal; any line references or quoted text in the goal may be stale or paraphrased.)';
+
+      if (_isMiss(res)) {
+        // Retry 1: alternate deterministic target, skipping the line-range
+        // anchor that just missed (fragments / quoted spans get their shot).
+        const t2 = _findTarget(goal, content, { skipLineRange: true });
+        if (t2 && t2 !== 'whole' && !t2.notFound && (t2.start !== target.start || t2.end !== target.end)) {
+          logger.info(`[edit.agent] targeted ops: miss @ ${target.label} — re-anchoring @ ${t2.label}`);
+          const r2 = await _opsInWindow(retryGoal, content.slice(t2.start, t2.end), t2.label, agentContext);
+          { const f = _fatal(r2); if (f) return f; }
+          tried.push(t2.label);
+          if (!_isMiss(r2)) { res = r2; target = t2; }
+        }
+      }
+      if (_isMiss(res) && !/^block \d/.test(target.label)) {
+        // Retry 2: model-picked outline block (unless the first anchor already
+        // came from _locateBlock — a repeat would pick the same block).
+        const tb = await _locateBlock(goal, content, agentContext);
+        if (tb && (tb.start !== target.start || tb.end !== target.end)) {
+          logger.info(`[edit.agent] targeted ops: miss @ ${target.label} — re-anchoring @ ${tb.label}`);
+          const r3 = await _opsInWindow(retryGoal, content.slice(tb.start, tb.end), tb.label, agentContext);
+          { const f = _fatal(r3); if (f) return f; }
+          tried.push(tb.label);
+          if (!_isMiss(r3)) { res = r3; target = tb; }
+        }
+      }
+      if (_isMiss(res)) {
+        // Retry 3: bounded whole-file pass — the model sees every chunk and
+        // can find the real region semantically regardless of goal drift.
+        if (content.length <= LARGE_FILE_MAX) {
+          logger.info(`[edit.agent] targeted ops missed (${tried.join(', ')}) — falling back to whole-file chunked pass`);
+          const rc = await _chunkedOps(retryGoal, content, agentContext, _emitProgress);
+          if (rc.error) return { ok: false, error: rc.error, reason: rc.reason || 'op_failed' };
+          if (rc.applied.length) {
+            edited = rc.edited;
+            opsApplied = rc.applied;
+            targetNote = `declared anchor missed (${tried.join(' → ')}) — applied via whole-file pass`;
+            if (rc.missed?.length) targetNote += `; ${rc.missed.length} op(s) couldn't be located`;
+            logger.info(`[edit.agent] chunked fallback: ${rc.applied.length} op(s) applied across ${content.length} chars`);
+          }
+        }
+        if (!opsApplied || !opsApplied.length) {
+          return {
+            ok: false, changed: false,
+            reason: (res && res.error && res.reason) ? res.reason : 'no_match',
+            error: `No region in ${path.basename(filePath)} produced edits for this goal (tried: ${tried.join(', ')}${content.length <= LARGE_FILE_MAX ? ', whole-file pass' : ' — file too large for a whole-file pass'})${res && res.error ? ` — last error: ${res.error}` : ''}. The goal may reference text that isn't in the file — re-check the wording or name the section differently.`,
+          };
+        }
+      } else {
+        edited = content.slice(0, target.start) + res.text + content.slice(target.end);
+        opsApplied = res.applied;
+        targetNote = target.note || null;
+        if (tried.length > 1) {
+          targetNote = (targetNote ? `${targetNote}; ` : '') + `re-anchored: ${tried.join(' → ')}`;
+        }
+      }
+      logger.info(`[edit.agent] targeted ops: ${opsApplied.length} op(s) applied (tried: ${tried.join(', ')})`);
     }
   }
 
@@ -1407,7 +1613,7 @@ async function editAgent(args = {}) {
 module.exports = {
   editAgent, _matchDocPaths, _openFileHolders,
   // exported for unit tests
-  _applyOps, _normalizedIndexOf, _findTarget, _chunkedOps, _chunkContent,
+  _applyOps, _normalizedIndexOf, _looseIndexOf, _looseHits, _findTarget, _chunkedOps, _chunkContent,
   _preserveFormat, _validateSyntax, _lineRangeTarget, _blockWindow, _goalFragments, _isGlobalScope,
   _outlineBlocks, _locateBlock,
 };

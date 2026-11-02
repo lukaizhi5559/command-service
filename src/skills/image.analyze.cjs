@@ -238,6 +238,9 @@ async function _analyzeOneImage(filePath, ext, effectiveQuery, timeoutMs, startT
 
 async function imageAnalyze(args = {}) {
   let { filePath, filePaths, query, priorContracts } = args;
+  // Planner arg aliases — plans occasionally emit imagePath/path/file/target.
+  if (!filePath) filePath = args.imagePath || args.path || args.file || args.target || filePath;
+  if (!filePaths) filePaths = args.imagePaths || args.paths || args.files || filePaths;
   const timeoutMs = Math.min(MAX_TIMEOUT, Math.max(5000, parseInt(args.timeoutMs || DEFAULT_TIMEOUT, 10)));
 
   // Reject unresolved template tokens early — a literal {{...}} arg means the

@@ -604,8 +604,6 @@ function actionStat(resolvedPath) {
 async function fsRead(args) {
   const {
     action = 'explore',
-    path: inputPath,
-    paths,
     pattern,
     maxDepth,
     maxFileSize,
@@ -615,6 +613,10 @@ async function fsRead(args) {
     exclude,
     encoding,
   } = args || {};
+  // Planner arg aliases — plans sometimes emit filePath/file/target instead of
+  // path, which used to fail as a bare "path is required".
+  const inputPath = args?.path || args?.filePath || args?.file || args?.target || null;
+  const paths = args?.paths || args?.filePaths || args?.files || null;
 
   logger.info('fs.read invoked', { action, path: inputPath });
 

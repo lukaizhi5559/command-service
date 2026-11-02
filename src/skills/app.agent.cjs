@@ -4004,7 +4004,7 @@ function _getActiveAppContext() {
       headers: {
         'Content-Type': 'application/json',
         'Content-Length': Buffer.byteLength(body),
-        'x-api-key': MEMORY_API_KEY
+        'Authorization': `Bearer ${MEMORY_API_KEY}`
       }
     }, (res) => {
       let raw = '';
@@ -4044,7 +4044,7 @@ async function getRecentOCR({ maxAgeSeconds = 3, appName: targetApp = null, live
       headers: {
         'Content-Type': 'application/json',
         'Content-Length': Buffer.byteLength(body),
-        'x-api-key': MEMORY_API_KEY
+        'Authorization': `Bearer ${MEMORY_API_KEY}`
       }
     };
     const req = http.request(options, (res) => {

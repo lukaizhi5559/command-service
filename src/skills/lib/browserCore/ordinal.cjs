@@ -27,8 +27,8 @@ function ordinalNth(goal) {
 // + link text, prefer anchors that leave the listing's URL path family
 // (results leave /s?k= → /dp/; facets stay), dedupe hrefs, sort by visual
 // reading order. Same heuristics as playwright.agent's ordinal fast-path.
-const ORDINAL_SCAN = (nth) => `(() => {
-  const nth = ${nth};
+// Shared by ORDINAL_SCAN (pick Nth) and LISTING_SCAN (return top-N).
+const _RESULT_ENUM_JS = `
   const vh = window.innerHeight || 800;
   const curSeg = (location.pathname.split('/').filter(Boolean)[0] || '').toLowerCase();
   const out = [];
@@ -57,6 +57,11 @@ const ORDINAL_SCAN = (nth) => `(() => {
   const seen = new Set();
   const items = out.filter(o => { if (seen.has(o.href)) return false; seen.add(o.href); return true; });
   items.sort((a, b) => (b.cross - a.cross) || (a.y - b.y) || (a.x - b.x));
+`;
+
+const ORDINAL_SCAN = (nth) => `(() => {
+  const nth = ${nth};
+  ${_RESULT_ENUM_JS}
   if (items[nth - 1]) return items[nth - 1];
 
   // Row fallback — SPA list surfaces (Gmail tr.zA, ARIA grids, listboxes)
@@ -99,4 +104,22 @@ async function resolveOrdinalItem(browserAct, { sessionId, goal, headed = true, 
   return item && (item.href || item.rowClick) ? { nth, ...item } : null;
 }
 
-module.exports = { ORDINAL_GOAL_RE, ORDINAL_OPEN_VERB_RE, ORDINAL_WORDS, ordinalNth, resolveOrdinalItem, ORDINAL_SCAN };
+// Whole-listing variant — same enumeration, returns the top-N items instead
+// of picking one. Powers dom.act's read-only listing-extract lane (one
+// evaluate instead of an element-map scan loop).
+const LISTING_SCAN = (limit) => `(() => {
+  ${_RESULT_ENUM_JS}
+  return items.slice(0, ${Math.max(1, Math.min(50, limit || 12))});
+})()`;
+
+/**
+ * Enumerate the result-shaped items currently on the page.
+ * @returns {Promise<Array<{sel,text,href,y,x,cross}>|null>} null on eval
+ *          failure; [] when the page shows no result-shaped anchors.
+ */
+async function extractListingItems(browserAct, { sessionId, headed = true, timeoutMs = 8000, limit = 12 }) {
+  const res = await browserAct({ action: 'evaluate', sessionId, headed, timeoutMs, text: LISTING_SCAN(limit) });
+  return Array.isArray(res?.result) ? res.result : null;
+}
+
+module.exports = { ORDINAL_GOAL_RE, ORDINAL_OPEN_VERB_RE, ORDINAL_WORDS, ordinalNth, resolveOrdinalItem, ORDINAL_SCAN, LISTING_SCAN, extractListingItems };

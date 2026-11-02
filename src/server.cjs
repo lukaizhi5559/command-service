@@ -35,6 +35,20 @@ process.on('unhandledRejection', (reason) => {
 // are removed on completion/error/close to avoid unbounded growth.
 const activeAutomationControllers = new Set();
 
+// ── Bounded registry reads ─────────────────────────────────────────────────
+// actionListAllAgents() can wedge (a dead DuckDB connection holds the
+// agents-db serialized mutex forever). Observed: three hung /agent.list reads
+// timed out every caller at 3s, tripped the command circuit breaker, and
+// starved command.automate for the full cooldown. Race the read so the
+// endpoint fails fast instead.
+const AGENT_LIST_TIMEOUT_MS = parseInt(process.env.AGENT_LIST_TIMEOUT_MS || '6000', 10);
+function _raceWithTimeout(promise, ms, label) {
+  return Promise.race([
+    promise,
+    new Promise((_, rej) => setTimeout(() => rej(new Error(`${label} timed out after ${ms}ms`)), ms)),
+  ]);
+}
+
 // ── Forceful playwright-cli + Chrome cleanup ───────────────────────────────
 // Mirrors cleanupStalePlaywrightSessions() (startup) so the /automation.cancel
 // endpoint can forcibly kill the playwright-cli daemon + Chrome processes that
@@ -691,10 +705,11 @@ class CommandServiceMCPServer {
           const osL = require('os');
           const { actionListAllAgents } = require('./skills/cli.agent.cjs');
 
-          // DB agents (may be partial)
+          // DB agents (may be partial). Bounded — a wedged registry read must
+          // not hang this endpoint either; disk-scan still answers.
           let dbAgents = [];
           try {
-            const result = await actionListAllAgents();
+            const result = await _raceWithTimeout(actionListAllAgents(), AGENT_LIST_TIMEOUT_MS, 'agents.list').catch(() => null);
             dbAgents = result?.agents || [];
           } catch (_) {}
 
@@ -1548,12 +1563,15 @@ class CommandServiceMCPServer {
       if (req.method === 'POST' && req.url === '/agent.list') {
         try {
           const { actionListAllAgents } = require('./skills/cli.agent.cjs');
-          const agents = await actionListAllAgents();
+          // Bound the wait — a wedged registry read (dead DuckDB connection
+          // holding the withDb mutex) hangs every caller otherwise (observed:
+          // 3 hung reads tripped the command circuit and starved automate).
+          const agents = await _raceWithTimeout(actionListAllAgents(), AGENT_LIST_TIMEOUT_MS, 'agent.list');
           res.writeHead(200);
           res.end(JSON.stringify({ status: 'ok', action: 'agent.list', data: agents.agents || [] }));
         } catch (err) {
-          res.writeHead(500);
-          res.end(JSON.stringify({ status: 'error', error: err.message }));
+          res.writeHead(503);
+          res.end(JSON.stringify({ status: 'error', error: `agent registry temporarily unavailable (${err.message})` }));
         }
         return;
       }

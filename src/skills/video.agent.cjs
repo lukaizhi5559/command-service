@@ -19,9 +19,33 @@
 const logger = require('../logger.cjs');
 const path = require('path');
 const { injectAdBlock } = require('./browser.act.cjs');
+const _lt = require('../../../../shared/live-tabs.cjs');
+const { transcribeAnything } = require('../skill-helpers/transcribe-anything.cjs');
 
 // User Memory MCP configuration
 const USER_MEMORY_URL = process.env.USER_MEMORY_MCP_URL || 'http://localhost:3001';
+const MEMORY_API_KEY = process.env.MCP_USER_MEMORY_API_KEY || process.env.USER_MEMORY_API_KEY || '';
+
+// ── Extraction session policy ────────────────────────────────────────────────
+// A 'default'-named browserAct session auto-prefers ext:default — the user's
+// REAL front tab — so extractMetadata's navigate used to hijack whatever page
+// was open (observed: "watch this video" reloaded the video tab mid-playback).
+// Extraction work belongs on a dedicated background tab: ext:bg:<name> adopts
+// or creates a tab that never activates (real profile, bot walls bypassed);
+// a plain named session falls back to the Playwright engine when the
+// extension is down (headless — also invisible).
+const EXTRACT_BG_SESSION = 'ext:bg:video_extract';
+const EXTRACT_ENGINE_SESSION = 'video_extract';
+
+function _extractSession(options = {}) {
+  if (options.liveTab) return options.sessionId || 'ext:default';
+  if (options.sessionId) return options.sessionId;
+  try {
+    const gw = require('../ext.gateway.cjs');
+    if (gw.hasExtension()) return EXTRACT_BG_SESSION;
+  } catch (_) { /* gateway unavailable — engine path */ }
+  return EXTRACT_ENGINE_SESSION;
+}
 
 // ── yt-dlp version management ────────────────────────────────────────────────
 // yt-dlp tracks YouTube's internal API and must be updated every ~4-6 weeks.
@@ -195,14 +219,18 @@ function decodeInvalidVideoUrl(videoUrl) {
 /**
  * Extract metadata from video page
  */
-async function extractMetadata(videoUrl, platform, browserAct, sessionId = 'default') {
+async function extractMetadata(videoUrl, platform, browserAct, sessionId = 'default', { skipNavigate = false } = {}) {
   try {
-    // Navigate to video
-    await browserAct({ action: 'navigate', url: videoUrl });
+    // Navigate to video — skipped when the live tab is already on it (reloading
+    // a playing tab kills playback position; the 'in front of me' case).
+    if (!skipNavigate) {
+      await browserAct({ action: 'navigate', url: videoUrl, sessionId });
+    }
     // Explicitly inject ad-blocker (belt-and-suspenders — also fires via browser.act hook)
     // This now sets up: Layer 1 (network route blocking) + Layer 2 (document-start init
     // script that strips YouTube ad data before the player reads it) + Layer 3 (CSS cosmetics).
-    injectAdBlock(sessionId, true).catch(() => {});
+    // skipNavigate = the user's own live tab — never inject into it mid-playback.
+    if (!skipNavigate) injectAdBlock(sessionId, true).catch(() => {});
     await new Promise(r => setTimeout(r, 2000)); // Wait for player load
 
     // Ads are now blocked at the network/player-data level — no DOM polling needed.
@@ -216,6 +244,7 @@ async function extractMetadata(videoUrl, platform, browserAct, sessionId = 'defa
       // Try to get duration from YouTube's movie_player or video element
       const durationResult = await browserAct({
         action: 'evaluate',
+        sessionId,
         expression: `
           (() => {
             const player = document.getElementById('movie_player');
@@ -230,6 +259,7 @@ async function extractMetadata(videoUrl, platform, browserAct, sessionId = 'defa
       // Generic: try to find video element
       const durationResult = await browserAct({
         action: 'evaluate',
+        sessionId,
         expression: `document.querySelector('video')?.duration || 0`
       });
       duration = durationResult?.result || parseFloat(durationResult?.stdout || 0) || 0;
@@ -249,13 +279,14 @@ async function extractMetadata(videoUrl, platform, browserAct, sessionId = 'defa
  * transcript toggle button, causing navigation to a different video before metadata is read.
  * Full transcription is handled by transcribeWithYtDlp (yt-dlp subtitles → Whisper fallback).
  */
-async function extractYouTubeText(videoUrl, browserAct) {
+async function extractYouTubeText(videoUrl, browserAct, sessionId = 'default') {
   const sources = { transcript: null, description: null, comments: [] };
   
   try {
     // Get description using evaluate (no click actions — avoids risk of navigation)
     const descResult = await browserAct({
       action: 'evaluate',
+      sessionId,
       expression: `
         document.querySelector('#description-inline-expander, #description, [class*="description"]')?.textContent?.substring(0, 2000) || null
       `
@@ -273,7 +304,7 @@ async function extractYouTubeText(videoUrl, browserAct) {
 /**
  * Extract generic page content for any video platform
  */
-async function extractGenericPageContent(videoUrl, browserAct) {
+async function extractGenericPageContent(videoUrl, browserAct, sessionId = 'default') {
   const content = {
     title: null,
     description: null,
@@ -289,12 +320,13 @@ async function extractGenericPageContent(videoUrl, browserAct) {
     try {
       const urlCheck = await browserAct({
         action: 'evaluate',
+        sessionId,
         expression: `window.location.href`
       });
       const currentUrl = String(urlCheck?.result || urlCheck?.stdout || '').replace(/^"|"$/g, '').trim();
       if (currentUrl && videoUrl && !currentUrl.includes(new URL(videoUrl).hostname)) {
         logger.warn(`[video.agent] URL drift detected: expected ${videoUrl}, got ${currentUrl} — re-navigating`);
-        await browserAct({ action: 'navigate', url: videoUrl });
+        await browserAct({ action: 'navigate', url: videoUrl, sessionId });
         await new Promise(r => setTimeout(r, 2000));
       }
     } catch (_) { /* non-fatal — proceed with extraction */ }
@@ -302,6 +334,7 @@ async function extractGenericPageContent(videoUrl, browserAct) {
     // Extract page title — prefer og:title (set at page load, stable) over document.title (can drift)
     const titleResult = await browserAct({
       action: 'evaluate',
+      sessionId,
       expression: `
         document.querySelector('meta[property="og:title"]')?.content ||
         document.title?.replace(/ - YouTube$| - Vimeo$/, '') ||
@@ -313,6 +346,7 @@ async function extractGenericPageContent(videoUrl, browserAct) {
     // Extract meta description
     const descResult = await browserAct({
       action: 'evaluate',
+      sessionId,
       expression: `
         document.querySelector('meta[name="description"]')?.content ||
         document.querySelector('meta[property="og:description"]')?.content ||
@@ -325,6 +359,7 @@ async function extractGenericPageContent(videoUrl, browserAct) {
     // Try to extract channel/uploader info
     const channelResult = await browserAct({
       action: 'evaluate',
+      sessionId,
       expression: `
         document.querySelector('[class*="channel" i]')?.textContent?.trim() ||
         document.querySelector('[class*="author" i]')?.textContent?.trim() ||
@@ -338,6 +373,7 @@ async function extractGenericPageContent(videoUrl, browserAct) {
     // Try to extract view count
     const viewsResult = await browserAct({
       action: 'evaluate',
+      sessionId,
       expression: `
         document.querySelector('[class*="view" i]')?.textContent?.match(/[\d,]+(?:\.\d+)?\s*[KM]?\s*(?:views?|views)/i)?.[0] ||
         document.querySelector('[class*="count" i]')?.textContent?.match(/[\d,]+/)?.[0] ||
@@ -349,6 +385,7 @@ async function extractGenericPageContent(videoUrl, browserAct) {
     // Try to extract top comments (first 3)
     const commentsResult = await browserAct({
       action: 'evaluate',
+      sessionId,
       expression: `
         (() => {
           const comments = document.querySelectorAll('[class*="comment" i] [class*="text" i], [class*="comment" i] [class*="content" i], .comment');
@@ -490,68 +527,13 @@ async function transcribeWithYtDlp(videoUrl) {
 
   logger.info(`[video.agent] yt-dlp subtitles unavailable (${ytResult.stderr?.slice(0, 120) || 'no subtitle file written'}) — trying transcribe-anything fallback`);
 
-  // ── FALLBACK: transcribe-anything (Whisper) ───────────────────────────────
-  const _platform = os.platform();
-  const _arch = os.arch();
-  let device = 'cpu';
-  if (_platform === 'darwin' && _arch === 'arm64') {
-    device = 'mlx';
-    logger.info('[video.agent] Using MLX backend (Apple Silicon)');
-  }
-
-  try {
-    const checkResult = spawnSync('python3', ['-c', 'import transcribe_anything'], { timeout: 5000, encoding: 'utf8' });
-    if (checkResult.status !== 0) {
-      logger.info('[video.agent] transcribe-anything not found — attempting pip3 install...');
-      const installResult = spawnSync('pip3', ['install', 'transcribe-anything', '--quiet', '--user'], { timeout: 120000, encoding: 'utf8' });
-      if (installResult.status !== 0) {
-        logger.warn(`[video.agent] pip3 install transcribe-anything failed: ${installResult.stderr}`);
-        return { ok: false, error: 'No subtitles available and transcribe-anything could not be installed' };
-      }
-      logger.info('[video.agent] transcribe-anything installed successfully');
-    }
-  } catch (installErr) {
-    return { ok: false, error: `transcribe-anything check failed: ${installErr.message}` };
-  }
-
-  return new Promise((resolve) => {
-    const pythonScript = `
-import sys, json
-try:
-    from transcribe_anything import transcribe
-    result = transcribe(url_or_file="${videoUrl}", device="${device}", model="large", task="transcribe")
-    print(json.dumps({"success": True, "transcript": result}))
-except Exception as e:
-    print(json.dumps({"success": False, "error": str(e)}))
-`;
-    const pythonProcess = spawn('python3', ['-c', pythonScript], { timeout: 120000 });
-    let stdout = '', stderr = '';
-    pythonProcess.stdout.on('data', d => { stdout += d.toString(); });
-    pythonProcess.stderr.on('data', d => { stderr += d.toString(); });
-    pythonProcess.on('close', (code) => {
-      if (code !== 0) {
-        logger.warn(`[video.agent] transcribe-anything exited ${code}: ${stderr.slice(0, 200)}`);
-        resolve({ ok: false, error: `Transcription failed: ${stderr || 'exit ' + code}` });
-        return;
-      }
-      try {
-        const result = JSON.parse(stdout);
-        if (result.success && result.transcript) {
-          logger.info(`[video.agent] transcribe-anything: ${result.transcript.length} chars`);
-          resolve({ ok: true, transcript: result.transcript, source: 'transcribe-anything' });
-        } else {
-          resolve({ ok: false, error: result.error || 'Unknown transcription error' });
-        }
-      } catch (_) {
-        if (stdout && stdout.length > 100) {
-          resolve({ ok: true, transcript: stdout, source: 'transcribe-anything-raw' });
-        } else {
-          resolve({ ok: false, error: 'Could not parse transcription output' });
-        }
-      }
-    });
-    pythonProcess.on('error', err => resolve({ ok: false, error: `Python not available: ${err.message}` }));
-  });
+  // ── FALLBACK: transcribe-anything (Whisper) via the shared helper ─────────
+  // The helper owns the known footguns: out.txt extraction, static_ffmpeg PATH,
+  // scratch-cwd cleanup, TD_RESULT parsing, cpu default (mlx dep-broken).
+  // 'base' model — 'large' on cpu exceeds any reasonable inline timeout.
+  const tx = await transcribeAnything({ target: videoUrl, model: 'base', timeoutMs: 600000 });
+  if (!tx.ok) return { ok: false, error: `No subtitles and whisper fallback failed: ${tx.error}` };
+  return { ok: true, transcript: tx.transcript, source: 'transcribe-anything' };
 }
 
 /**
@@ -560,33 +542,56 @@ except Exception as e:
 async function synthesizeVideoContent(pageContent, transcription, goal, skillLlm) {
   // Pre-calculate hasTranscript so it's available in catch block
   const hasTranscript = transcription && transcription.length > 100;
+  const pc = pageContent || {};
 
   if (!skillLlm) {
     return { confidence: 0, steps: [], hasTranscript };
   }
 
+  // Goal shape: "what's this video about / summarize / what did they say" wants
+  // a summary — forcing "actionable steps" onto a descriptive goal produces
+  // INSUFFICIENT or nonsense. Tutorial/imperative goals keep the steps prompt.
+  const descriptiveGoal = /\b(what(?:'s| is| does| did| are| was)|summar|explain|about|describe|gist|overview|purpose|tell me|who|when|where|why)\b/i.test(goal || '');
+
   try {
     const { ask } = skillLlm;
 
+    const metaBlock = `=== VIDEO METADATA ===
+Title: ${pc.title || 'Unknown'}
+Channel: ${pc.channel || 'Unknown'}
+Duration: ${pc.duration || 'Unknown'}
+Views: ${pc.views || 'Unknown'}
+
+=== VIDEO DESCRIPTION ===
+${pc.description?.substring(0, 2000) || 'No description'}`;
+
+    const commentsBlock = `=== TOP COMMENTS (Viewer insights) ===
+${(Array.isArray(pc.topComments) ? pc.topComments : []).map(c => `- ${c}`).join('\n') || 'No comments'}`;
+
+    const transcriptBlock = hasTranscript
+      ? `=== AUDIO TRANSCRIPT (What was said) ===\n${transcription.substring(0, 4000)}\n\n`
+      : '';
+
     let prompt;
-    if (hasTranscript) {
+    if (descriptiveGoal) {
+      prompt = `Summarize this video/audio for: "${goal}"
+
+${metaBlock}
+
+${transcriptBlock}${commentsBlock}
+
+Describe what the video/audio is about, its purpose, and the key points.
+If the available information is thin, say so honestly — do not invent detail.
+If there is genuinely nothing usable, respond with "INSUFFICIENT".
+
+SUMMARY:`;
+    } else if (hasTranscript) {
       // Have both page content AND transcription
       prompt = `Synthesize this video content into clear actionable steps for: "${goal}"
 
-=== VIDEO METADATA ===
-Title: ${pageContent.title || 'Unknown'}
-Channel: ${pageContent.channel || 'Unknown'}
-Duration: ${pageContent.duration || 'Unknown'}
-Views: ${pageContent.views || 'Unknown'}
+${metaBlock}
 
-=== VIDEO DESCRIPTION ===
-${pageContent.description?.substring(0, 2000) || 'No description'}
-
-=== AUDIO TRANSCRIPT (What was said) ===
-${transcription.substring(0, 4000)}
-
-=== TOP COMMENTS (Viewer insights) ===
-${(Array.isArray(pageContent.topComments) ? pageContent.topComments : []).map(c => `- ${c}`).join('\n') || 'No comments'}
+${transcriptBlock}${commentsBlock}
 
 Extract 5-10 clear, actionable steps. Format as:
 1. [Action] [Detail]
@@ -599,17 +604,9 @@ STEPS:`;
       // Page content only
       prompt = `Extract actionable steps from this video information for: "${goal}"
 
-=== VIDEO METADATA ===
-Title: ${pageContent.title || 'Unknown'}
-Channel: ${pageContent.channel || 'Unknown'}
-Duration: ${pageContent.duration || 'Unknown'}
-Views: ${pageContent.views || 'Unknown'}
+${metaBlock}
 
-=== VIDEO DESCRIPTION ===
-${pageContent.description?.substring(0, 3000) || 'No description'}
-
-=== TOP COMMENTS ===
-${(Array.isArray(pageContent.topComments) ? pageContent.topComments : []).map(c => `- ${c}`).join('\n') || 'No comments'}
+${commentsBlock}
 
 Extract 3-10 clear, actionable steps based on the information available. Format as:
 1. [Action] [Detail]
@@ -624,6 +621,19 @@ STEPS:`;
 
     if (response.includes('INSUFFICIENT')) {
       return { confidence: 0, steps: [], hasTranscript };
+    }
+
+    if (descriptiveGoal) {
+      const summary = response.trim();
+      if (summary.length < 20) {
+        return { confidence: 0, steps: [], hasTranscript };
+      }
+      return {
+        confidence: hasTranscript ? 0.85 : 0.65,
+        steps: [],
+        summary,
+        hasTranscript
+      };
     }
 
     const steps = response
@@ -655,17 +665,49 @@ async function actionWatchVideo({ videoUrl, goal, options = {} }, dependencies =
     maxDuration = 1800,
     context = 'standalone',
     allowLongVideos = false,
-    sessionId = 'default'
+    liveTab = false,
+    mode = 'auto'
   } = options;
+
+  // mode:'live' — user asked us to actually play+watch; delegate to the
+  // live-observation path (media.play + ambient audio + OCR samples).
+  if (mode === 'live') {
+    return actionWatchLive({ videoUrl, goal, options }, dependencies);
+  }
 
   const effectiveMax = context === 'agent_learning' ? 600 : maxDuration;
 
-  if (!videoUrl) {
-    return { ok: false, error: 'videoUrl is required' };
-  }
+  // Live-tab mode: the plan resolved a bound ext session ("this video"). Read
+  // the URL off that tab when the step didn't bake one in — and never navigate
+  // it away from the page the user is watching.
+  let sessionId = _extractSession(options);
+  let sameTab = false;
 
   if (!browserAct) {
     return { ok: false, error: 'browserAct is required' };
+  }
+
+  if (liveTab || sessionId.startsWith('ext:')) {
+    // ANY ext session: check what it's actually on before navigating. A baked/
+    // hinted session already at the target URL gets sameTab → read-only
+    // extraction (no reload → no lost playback position). A tab on a different
+    // page must NOT be navigated for extraction — demote to a background tab.
+    const liveUrl = await _evalOnTab(browserAct, sessionId, 'window.location.href');
+    if (liveUrl && /^https?:/.test(liveUrl)) {
+      if (!videoUrl) {
+        videoUrl = liveUrl;
+        logger.info(`[video.agent] liveTab: resolved videoUrl from ${sessionId} → ${liveUrl}`);
+      }
+      sameTab = _sameVideoPage(liveUrl, videoUrl);
+      if (!sameTab) {
+        logger.warn(`[video.agent] liveTab: ${sessionId} is on ${liveUrl}, not ${videoUrl} — extracting on background tab instead`);
+        sessionId = _extractSession({ ...options, liveTab: false, sessionId: null });
+      }
+    }
+  }
+
+  if (!videoUrl) {
+    return { ok: false, error: 'videoUrl is required (no live video tab resolved)' };
   }
 
   // ── URL validation: catch fake/malformed YouTube URLs before wasting time ──
@@ -684,15 +726,24 @@ async function actionWatchVideo({ videoUrl, goal, options = {} }, dependencies =
   }
   logger.info(`[video.agent] Watching ${platform} video: ${videoUrl}`);
 
-  // Extract metadata (with ad handling)
-  const metadata = await extractMetadata(videoUrl, platform, browserAct, sessionId);
+  // Whether tier-3 live playback is reachable — exposed on results so the
+  // answer layer can offer it instead of claiming the video is unwatchable.
+  let liveCapable = false;
+  try { liveCapable = !!require('../ext.gateway.cjs').hasExtension(); } catch (_) {}
+
+  // Extract metadata (with ad handling). sameTab → read the live page as-is,
+  // no navigate — the user's playback position is preserved. A metadata failure
+  // no longer aborts the run: the headless transcript path and the generic page
+  // read can still succeed — a dead browser used to kill all three.
+  const metadata = await extractMetadata(videoUrl, platform, browserAct, sessionId, { skipNavigate: sameTab });
 
   if (!metadata.ok) {
-    return metadata;
+    logger.warn(`[video.agent] Metadata extraction failed (${metadata.error}) — continuing with transcript + page fallback`);
+    metadata.duration = metadata.duration || 0;
   }
 
-  // Check duration limits
-  if (metadata.duration > effectiveMax) {
+  // Check duration limits (only meaningful when metadata succeeded)
+  if (metadata.ok && metadata.duration > effectiveMax) {
     if (context === 'agent_learning') {
       return {
         ok: false,
@@ -712,31 +763,35 @@ async function actionWatchVideo({ videoUrl, goal, options = {} }, dependencies =
   // NEW APPROACH: Page content extraction + Audio transcription
   // ===================================================================
 
-  // STEP 1: Extract rich page content (always works)
-  logger.info('[video.agent] Extracting page content...');
-  let pageContent = null;
-  if (platform === 'youtube') {
-    pageContent = await extractYouTubeText(videoUrl, browserAct);
+  // STEP 1+2 in parallel: page content (browser) and transcript (headless
+  // yt-dlp subs → whisper) are independent — neither gates the other.
+  logger.info('[video.agent] Extracting page content + transcript in parallel (yt-dlp subs → transcribe-anything fallback)...');
+  const [pageRes, txRes] = await Promise.allSettled([
+    (async () => {
+      let pc = platform === 'youtube'
+        ? await extractYouTubeText(videoUrl, browserAct, sessionId)
+        : null;
+      // If platform-specific extraction failed or not available, try generic
+      if (!pc || !pc.title) {
+        pc = await extractGenericPageContent(videoUrl, browserAct, sessionId);
+      }
+      return pc;
+    })(),
+    transcribeWithYtDlp(videoUrl),
+  ]);
+
+  const pageContent = pageRes.status === 'fulfilled' ? pageRes.value : null;
+  if (pageRes.status === 'rejected') {
+    logger.warn(`[video.agent] Page content extraction failed: ${pageRes.reason?.message || pageRes.reason}`);
   }
 
-  // If platform-specific extraction failed or not available, try generic
-  if (!pageContent || !pageContent.title) {
-    pageContent = await extractGenericPageContent(videoUrl, browserAct);
-  }
-
-  // STEP 2: Try subtitle/transcript extraction (best effort - don't block on failure)
-  logger.info('[video.agent] Attempting transcript extraction (yt-dlp subs → transcribe-anything fallback)...');
   let transcription = null;
-  try {
-    const txResult = await transcribeWithYtDlp(videoUrl);
-    if (txResult.ok) {
-      transcription = txResult.transcript;
-      logger.info(`[video.agent] Transcript acquired via ${txResult.source}: ${transcription.length} chars`);
-    } else {
-      logger.info(`[video.agent] Transcript unavailable: ${txResult.error}`);
-    }
-  } catch (err) {
-    logger.info(`[video.agent] Transcript error (non-blocking): ${err.message}`);
+  if (txRes.status === 'fulfilled' && txRes.value?.ok) {
+    transcription = txRes.value.transcript;
+    logger.info(`[video.agent] Transcript acquired via ${txRes.value.source}: ${transcription.length} chars`);
+  } else {
+    const txErr = txRes.status === 'rejected' ? (txRes.reason?.message || String(txRes.reason)) : txRes.value?.error;
+    logger.info(`[video.agent] Transcript unavailable: ${txErr}`);
   }
 
   // STEP 3: Combine page content + transcription using LLM
@@ -750,13 +805,32 @@ async function actionWatchVideo({ videoUrl, goal, options = {} }, dependencies =
       duration: metadata.duration,
       pageContent,
       pageTitle: pageContent?.title || null,
-      transcriptLength: transcription?.length || 0
+      transcriptLength: transcription?.length || 0,
+      canWatchLive: liveCapable
     };
   }
 
   const synthesis = await synthesizeVideoContent(pageContent, transcription, goal, skillLlm);
 
   const _pageTitle = pageContent?.title || null;
+
+  // Descriptive goals ("what's this about") return a prose summary, not steps.
+  if (synthesis.summary && synthesis.confidence > 0.4) {
+    return {
+      ok: true,
+      steps: [],
+      stdout: synthesis.summary,
+      summary: synthesis.summary,
+      source: synthesis.hasTranscript ? 'page+transcription' : 'page_only',
+      platform,
+      duration: metadata.duration,
+      confidence: synthesis.confidence,
+      transcriptLength: transcription?.length || 0,
+      pageTitle: _pageTitle,
+      pageContent,
+      canWatchLive: liveCapable
+    };
+  }
 
   if (synthesis.confidence > 0.5 && synthesis.steps.length > 0) {
     const stepsText = synthesis.steps.map((s, i) => `${i + 1}. ${s.text}`).join('\n');
@@ -769,7 +843,8 @@ async function actionWatchVideo({ videoUrl, goal, options = {} }, dependencies =
       duration: metadata.duration,
       confidence: synthesis.confidence,
       transcriptLength: transcription?.length || 0,
-      pageTitle: _pageTitle
+      pageTitle: _pageTitle,
+      canWatchLive: liveCapable
     };
   }
 
@@ -793,7 +868,8 @@ async function actionWatchVideo({ videoUrl, goal, options = {} }, dependencies =
     transcriptLength: transcription?.length || 0,
     pageContent,
     pageTitle: _pageTitle,
-    lowConfidence: true
+    lowConfidence: true,
+    canWatchLive: liveCapable
   };
 }
 
@@ -1323,8 +1399,9 @@ function parseDurationString(str) {
 /**
  * Search for and watch tutorial video — supports YouTube, Vimeo, Rumble, Facebook Video, TikTok
  */
-async function actionFindAndWatchTutorial({ platform, query, goal }, dependencies = {}) {
+async function actionFindAndWatchTutorial({ platform, query, goal, options = {} }, dependencies = {}) {
   const { browserAct, skillLlm } = dependencies;
+  const sessionId = _extractSession(options);
   
   if (!browserAct) {
     return { ok: false, error: 'browserAct is required' };
@@ -1355,7 +1432,7 @@ async function actionFindAndWatchTutorial({ platform, query, goal }, dependencie
       return actionWatchVideo({
         videoUrl: resolved.url,
         goal,
-        options: { context: 'agent_learning', maxDuration: 1200 }
+        options: { ...options, context: 'agent_learning', maxDuration: 1200 }
       }, dependencies);
     }
 
@@ -1364,17 +1441,17 @@ async function actionFindAndWatchTutorial({ platform, query, goal }, dependencie
     const effectiveQuery = resolved.cleanQuery || _normalizeQuery(query);
     const searchUrl = config.searchUrl(effectiveQuery);
     logger.info(`[video.agent] Falling back to platform search page with query: "${effectiveQuery}"`);
-    await browserAct({ action: 'navigate', url: searchUrl });
+    await browserAct({ action: 'navigate', url: searchUrl, sessionId });
 
     // Wait for results to load — use waitForStableText which reliably waits for dynamic content
-    await browserAct({ action: 'waitForStableText', timeoutMs: 8000 });
+    await browserAct({ action: 'waitForStableText', timeoutMs: 8000, sessionId });
 
     let videos = [];
 
     // ── Path A: getPageLinks (CSP-safe with .playwright/cli.config.json bypassCSP:true) ──
     // Returns { links: [{href, text, title}] } — real DOM href attributes, not snapshot YAML
     try {
-      const linksResult = await browserAct({ action: 'getPageLinks' });
+      const linksResult = await browserAct({ action: 'getPageLinks', sessionId });
       const allLinks = linksResult?.links || [];
       logger.info(`[video.agent] getPageLinks returned ${allLinks.length} total links`);
 
@@ -1413,7 +1490,7 @@ async function actionFindAndWatchTutorial({ platform, query, goal }, dependencie
             };
           }));
         })()`;
-        const evalResult = await browserAct({ action: 'evaluate', expression: evalExpr });
+        const evalResult = await browserAct({ action: 'evaluate', expression: evalExpr, sessionId });
         const evalText = evalResult?.stdout || evalResult?.result || '';
         const jsonMatch = evalText.match(/\[[\s\S]*\]/);
         if (jsonMatch) {
@@ -1440,7 +1517,7 @@ async function actionFindAndWatchTutorial({ platform, query, goal }, dependencie
     // YouTube embeds all video data as JSON in the page source — always present regardless of CSP.
     if (videos.length === 0 && platformKey === 'youtube') {
       try {
-        const pageTextResult = await browserAct({ action: 'getPageText' });
+        const pageTextResult = await browserAct({ action: 'getPageText', sessionId });
         const rawText = pageTextResult?.stdout || pageTextResult?.result || '';
         logger.info(`[video.agent] Path C: getPageText returned ${rawText.length} chars`);
 
@@ -1476,7 +1553,7 @@ async function actionFindAndWatchTutorial({ platform, query, goal }, dependencie
     // ── Path D: generic platform URL regex from page text (non-YouTube fallback) ──────────
     if (videos.length === 0 && platformKey !== 'youtube') {
       try {
-        const pageTextResult = await browserAct({ action: 'getPageText' });
+        const pageTextResult = await browserAct({ action: 'getPageText', sessionId });
         const rawText = pageTextResult?.stdout || pageTextResult?.result || '';
         videos = await parseVideosFromSnapshot(rawText, platformKey, query, skillLlm);
         logger.info(`[video.agent] Path D (page text fallback): found ${videos.length} video(s)`);
@@ -1513,7 +1590,7 @@ async function actionFindAndWatchTutorial({ platform, query, goal }, dependencie
     return actionWatchVideo({
       videoUrl: selected.url,
       goal,
-      options: { context: 'agent_learning', maxDuration: 1200 }
+      options: { ...options, context: 'agent_learning', maxDuration: 1200 }
     }, dependencies);
 
   } catch (err) {
@@ -1522,15 +1599,368 @@ async function actionFindAndWatchTutorial({ platform, query, goal }, dependencie
   }
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// Tier 3 — live watch: play the video on a resolved tab, verify ambient audio
+// capture actually lands, and sample OCR + transcript segments while it runs.
+// ═══════════════════════════════════════════════════════════════════════════
+
+const _EXT_DEFAULT_SESSION = 'ext:default';
+const _LIVE_SESSION = 'ext:video_live';
+// Videos longer than this get an explicit heads-up before we settle in to watch.
+const _LIVE_CONFIRM_SEC = 15 * 60;
+const _DEFAULT_POLL_MS = 20000;
+// Media-element readiness after a navigation — SPA players mount late.
+const _MEDIA_PROBE_MS = 8000;
+const _MEDIA_PROBE_INTERVAL_MS = 800;
+
+/**
+ * Evaluate an expression on a browser session; returns the raw value or null.
+ */
+async function _evalOnTab(browserAct, sessionId, expression) {
+  try {
+    const r = await browserAct({ action: 'evaluate', sessionId, expression });
+    const v = r?.result ?? r?.stdout;
+    if (typeof v === 'string') return v.replace(/^"|"$/g, '').trim();
+    return v ?? null;
+  } catch (_) {
+    return null;
+  }
+}
+
+// Media-state evals stringify on-page, but evaluate may also return the raw
+// object — accept either shape.
+function _parseMediaState(v) {
+  if (v && typeof v === 'object') return v;
+  try { return JSON.parse(v || 'null'); } catch (_) { return null; }
+}
+
+/**
+ * Do two URLs point at the same video page? Compares YouTube video IDs
+ * (tracking params differ), else normalized origin+pathname.
+ */
+function _sameVideoPage(a, b) {
+  if (!a || !b) return false;
+  const idA = extractYouTubeVideoId(a), idB = extractYouTubeVideoId(b);
+  if (idA && idB) return idA === idB;
+  try {
+    const ua = new URL(a), ub = new URL(b);
+    return ua.origin === ub.origin && ua.pathname === ub.pathname;
+  } catch (_) {
+    return a === b;
+  }
+}
+
+/**
+ * Minimal JSON http GET for in-process MCP services.
+ */
+function _httpJsonGet(url, headers = {}, timeoutMs = 4000) {
+  return new Promise((resolve) => {
+    try {
+      const u = new URL(url);
+      const req = require('http').request({
+        hostname: u.hostname,
+        port: u.port,
+        path: u.pathname + u.search,
+        method: 'GET',
+        headers,
+      }, (res) => {
+        let data = '';
+        res.on('data', c => { data += c; });
+        res.on('end', () => { try { resolve(JSON.parse(data)); } catch (_) { resolve(null); } });
+      });
+      req.on('error', () => resolve(null));
+      req.setTimeout(timeoutMs, () => { req.destroy(); resolve(null); });
+      req.end();
+    } catch (_) { resolve(null); }
+  });
+}
+
+/**
+ * Fetch ambient audio-journal status — the ground truth for whether capture
+ * is actually confirmed, not just requested.
+ */
+async function _audioStatus() {
+  const base = USER_MEMORY_URL.replace(/\/$/, '');
+  return _httpJsonGet(`${base}/audio.status`, {
+    'Authorization': `Bearer ${MEMORY_API_KEY}`
+  });
+}
+
+/**
+ * Bound extension sessions (playing flags included) — empty when the gateway
+ * or extension is unavailable.
+ */
+async function _extSessions() {
+  try {
+    const gw = require('../ext.gateway.cjs');
+    const list = await gw.sessions();
+    return Array.isArray(list?.sessions) ? list.sessions : (Array.isArray(list) ? list : []);
+  } catch (_) {
+    return [];
+  }
+}
+
+/**
+ * Pick which live tab a watch_live request should use.
+ *   1. Tab whose URL matches the requested video
+ *   2. Tab flagged `playing` by the media probe
+ *   3. ext:default (only when the caller gave us nothing else to go on)
+ * Never picks a bg: extraction tab.
+ */
+async function _resolveLiveSession(browserAct, videoUrl) {
+  const sessions = await _extSessions();
+  const usable = sessions.filter(s => s && s.sessionId && !s.sessionId.startsWith('ext:bg:'));
+
+  if (videoUrl) {
+    const match = usable.find(s => _sameVideoPage(s.url || s.pageUrl || '', videoUrl));
+    if (match) return { sessionId: match.sessionId, url: match.url || videoUrl, how: 'url-match' };
+  }
+  const playing = usable.find(s => s.playing);
+  if (playing) return { sessionId: playing.sessionId, url: playing.url || playing.pageUrl || null, how: 'media-playing' };
+  if (!videoUrl) return { sessionId: _EXT_DEFAULT_SESSION, url: null, how: 'front-tab' };
+  return null;
+}
+
+/** JS that reads the first media element's state on the page. */
+const _MEDIA_STATE_EXPR = `(() => {
+  const m = document.querySelector('video') || document.querySelector('audio');
+  if (!m) return JSON.stringify({ found: false });
+  return JSON.stringify({
+    found: true,
+    duration: isFinite(m.duration) ? m.duration : 0,
+    currentTime: m.currentTime || 0,
+    paused: !!m.paused,
+    ended: !!m.ended,
+    muted: !!m.muted,
+    title: document.title || ''
+  });
+})()`;
+
+/** JS that unmutes and (re)starts playback of the media element. */
+const _MEDIA_PLAY_EXPR = `(() => {
+  const m = document.querySelector('video') || document.querySelector('audio');
+  if (!m) return 'no-media';
+  try { m.muted = false; } catch (e) {}
+  const p = m.play();
+  if (p && p.catch) { p.catch(() => {}); }
+  return 'ok';
+})()`;
+
+/**
+ * watch_live — deliberately play a video on a resolved tab and observe it with
+ * the ambient audio pipeline + OCR samples. This is the tier that makes
+ * "watch this video" mean "actually watch it" rather than "fetch a transcript".
+ */
+async function actionWatchLive({ videoUrl, goal, options = {} }, dependencies = {}) {
+  const { browserAct, skillLlm } = dependencies;
+  const {
+    maxWatchMs = 0,            // 0 = derive from duration
+    pollMs = _DEFAULT_POLL_MS,
+    liveTab = true,
+    sessionId: requestedSession = null,
+  } = options;
+
+  if (!browserAct) return { ok: false, error: 'browserAct is required' };
+
+  // ── Resolve the tab ──────────────────────────────────────────────────────
+  let sessionId = requestedSession;
+  if (_lt.isBackgroundSession(sessionId)) {
+    logger.warn(`[video.agent] watch_live: ignoring bg sessionId '${sessionId}' — re-resolving live tab`);
+    sessionId = null;
+  }
+  // Normalize a bare agent-derived session (youtube_agent) to the bound ext
+  // form (ext:youtube_agent) — the same mapping url.first applies when it
+  // navigated the session this plan's watch step is bound to.
+  if (sessionId && !/^(ext:|open:|bg:|_)/i.test(sessionId)) {
+    try {
+      const { resolveExtSession } = require('./lib/browserCore/session.cjs');
+      sessionId = await resolveExtSession(sessionId);
+    } catch (_) {}
+  }
+  let resolvedUrl = videoUrl || null;
+
+  if (!sessionId) {
+    const pick = await _resolveLiveSession(browserAct, videoUrl);
+    if (pick) {
+      sessionId = pick.sessionId;
+      if (!resolvedUrl) resolvedUrl = pick.url;
+      logger.info(`[video.agent] watch_live: resolved live tab via ${pick.how} → ${sessionId}`);
+    } else if (videoUrl) {
+      // No live tab on it — open a dedicated bound tab (visible; does NOT
+      // navigate whatever the user currently has open in ext:default).
+      sessionId = _LIVE_SESSION;
+      const nav = await browserAct({ action: 'navigate', url: videoUrl, sessionId, activate: true });
+      if (nav?.ok === false) return { ok: false, error: `Could not open live tab: ${nav.error || 'navigate failed'}` };
+      await new Promise(r => setTimeout(r, 2500));
+    } else {
+      return { ok: false, error: 'watch_live: no live video tab found and no videoUrl supplied' };
+    }
+  }
+
+  // ── Verify a media element is really there ────────────────────────────────
+  // SPA players render late — url.first resolves at domcontentloaded but the
+  // <video> tag mounts seconds later. Poll briefly before declaring absence
+  // (auto-stored recovery rule prescribed wait-for-stable before watch_live).
+  let media = null;
+  const _mediaDeadline = Date.now() + _MEDIA_PROBE_MS;
+  while (Date.now() <= _mediaDeadline) {
+    try { media = _parseMediaState(await _evalOnTab(browserAct, sessionId, _MEDIA_STATE_EXPR)); } catch (_) {}
+    if (media?.found) break;
+    media = null;
+    await new Promise(r => setTimeout(r, _MEDIA_PROBE_INTERVAL_MS));
+  }
+  if (!media || !media.found) {
+    return {
+      ok: false,
+      error: `watch_live: no <video>/<audio> element on ${sessionId}`,
+      sessionId,
+      canWatchLive: false
+    };
+  }
+  const durationSec = media.duration || 0;
+  const pageTitle = media.title || '';
+
+  // ── Long-video heads-up ──────────────────────────────────────────────────
+  if (durationSec > _LIVE_CONFIRM_SEC && !options.confirmLong) {
+    return {
+      ok: true,
+      requiresConfirmation: true,
+      durationSec,
+      etaMinutes: Math.ceil(durationSec / 60),
+      sessionId,
+      stdout: `This video is ${Math.ceil(durationSec / 60)} minutes long — watching it in real time will take about that long. Want me to go ahead and watch it anyway?`,
+      warning: `Video is ${Math.ceil(durationSec / 60)}min — live watch takes real time.`
+    };
+  }
+
+  // ── Start playback ────────────────────────────────────────────────────────
+  await _evalOnTab(browserAct, sessionId, _MEDIA_PLAY_EXPR);
+  await new Promise(r => setTimeout(r, 1500));
+  media = null;
+  try { media = _parseMediaState(await _evalOnTab(browserAct, sessionId, _MEDIA_STATE_EXPR)); } catch (_) {}
+  if (media && media.paused && !media.ended) {
+    return {
+      ok: false,
+      error: 'watch_live: playback did not start (autoplay blocked or element not ready)',
+      sessionId,
+      pageTitle
+    };
+  }
+
+  // ── Verify ambient audio capture is actually landing ─────────────────────
+  const statusBefore = await _audioStatus();
+  const segsBefore = statusBefore?.data?.session?.segments ?? statusBefore?.session?.segments ?? 0;
+
+  let audioConfirmed = false;
+  const audioWait = Math.min(30000, Math.max(12000, pollMs));
+  const audioDeadline = Date.now() + audioWait;
+  while (Date.now() < audioDeadline) {
+    await new Promise(r => setTimeout(r, 4000));
+    const st = await _audioStatus();
+    const segsNow = st?.data?.session?.segments ?? st?.session?.segments ?? 0;
+    if (segsNow > segsBefore || st?.data?.capture?.state === 'active' || st?.capture?.state === 'active') {
+      audioConfirmed = true;
+      break;
+    }
+  }
+  logger.info(`[video.agent] watch_live: ambient capture ${audioConfirmed ? 'CONFIRMED' : 'NOT confirmed'} after ${audioWait}ms`);
+
+  // ── Watch loop ────────────────────────────────────────────────────────────
+  const cap = maxWatchMs > 0
+    ? maxWatchMs
+    : Math.min((durationSec ? durationSec * 1150 : 600 * 1000) + 120000, 3600000);
+  const deadline = Date.now() + cap;
+  const segments = [];
+  let lastSegCount = segsBefore;
+  let ended = false;
+  let watchedSec = 0;
+  const startedAt = Date.now();
+
+  while (Date.now() < deadline) {
+    await new Promise(r => setTimeout(r, pollMs));
+    let m = null;
+    try { m = _parseMediaState(await _evalOnTab(browserAct, sessionId, _MEDIA_STATE_EXPR)); } catch (_) {}
+    if (m && m.found) {
+      watchedSec = m.currentTime || watchedSec;
+      if (m.ended) { ended = true; break; }
+      if (m.paused) await _evalOnTab(browserAct, sessionId, _MEDIA_PLAY_EXPR);
+    }
+    const st = await _audioStatus();
+    const sess = st?.data?.session || st?.session || {};
+    const recent = st?.data?.recentSegments || st?.recentSegments || [];
+    if (Array.isArray(recent) && recent.length) {
+      for (const s of recent.slice(-5)) {
+        const t = typeof s === 'string' ? s : (s?.text || s?.transcript || '');
+        if (t && segments[segments.length - 1] !== t) segments.push(t);
+      }
+    }
+    const segsNow = sess.segments ?? lastSegCount;
+    if (segsNow > lastSegCount) { audioConfirmed = true; lastSegCount = segsNow; }
+  }
+
+  const elapsed = Math.round((Date.now() - startedAt) / 1000);
+  const transcriptText = segments.join(' ').trim();
+
+  // ── Summarize what was actually observed ─────────────────────────────────
+  let summary = '';
+  if (skillLlm && transcriptText) {
+    try {
+      const { ask } = skillLlm;
+      summary = (await ask(
+        `Summarize what was heard/seen while watching this video${goal ? ` for the user's goal: "${goal}"` : ''}.\n` +
+        `Page: ${pageTitle}\nWatched ${Math.round(watchedSec)}s of ${Math.round(durationSec)}s.\n\n` +
+        `Captured audio transcript:\n${transcriptText.substring(0, 6000)}\n\nSummary:`,
+        { maxTokens: 700, temperature: 0.3 }
+      )).trim();
+    } catch (_) {}
+  }
+
+  return {
+    ok: true,
+    source: 'live_watch',
+    sessionId,
+    platform: resolvedUrl ? detectPlatform(resolvedUrl) : 'unknown',
+    videoUrl: resolvedUrl,
+    pageTitle,
+    durationSec,
+    watchedSec,
+    elapsedSec: elapsed,
+    ended,
+    audioCapture: audioConfirmed ? 'confirmed' : 'degraded',
+    audioSegments: segments.length,
+    transcript: transcriptText.substring(0, 12000) || null,
+    stdout: summary ||
+      `Watched "${pageTitle || resolvedUrl || 'video'}" live for ${Math.round(elapsed / 60)}min` +
+      ` (${Math.round(watchedSec)}s of ${Math.round(durationSec)}s). ` +
+      (audioConfirmed ? `Captured ${segments.length} audio segments.` :
+        'No ambient audio segments landed — audio capture may not be running; check /audio.status.') +
+      (transcriptText ? `\n\nHeard: ${transcriptText.substring(0, 1500)}` : ''),
+    canWatchLive: true
+  };
+}
+
 // Main export handler
 module.exports = async function videoAgent(args, dependencies = {}) {
   const { action, ...params } = args || {};
-  
+
+  // Flat step args (mode/sessionId/liveTab/...) double as options — the
+  // contract declares them at args top level, not under an options object.
+  const mergedOpts = { ...params, ...(params.options || {}) };
+  delete mergedOpts.action;
+
   switch (action) {
     case 'watch_video':
-      return await actionWatchVideo(params, dependencies);
+      return await actionWatchVideo({ ...params, options: mergedOpts }, dependencies);
+    case 'watch_live':
+      return await actionWatchLive({ ...params, options: mergedOpts }, dependencies);
+    case 'find_and_watch':
     case 'find_and_watch_tutorial':
-      return await actionFindAndWatchTutorial(params, dependencies);
+      return await actionFindAndWatchTutorial({ ...params, options: mergedOpts }, dependencies);
+    case 'watch_from_page':
+      // Same as watch_video but hints live-tab resolution (URL may be absent —
+      // the plan/guard resolves the current tab or passes pageUrl).
+      if (!params.videoUrl && params.pageUrl) params.videoUrl = params.pageUrl;
+      return await actionWatchVideo({ ...params, options: { ...mergedOpts, liveTab: true } }, dependencies);
     default:
       return { ok: false, error: `Unknown action: ${action}` };
   }
@@ -1538,4 +1968,5 @@ module.exports = async function videoAgent(args, dependencies = {}) {
 
 // Export individual actions for direct use
 module.exports.actionWatchVideo = actionWatchVideo;
+module.exports.actionWatchLive = actionWatchLive;
 module.exports.actionFindAndWatchTutorial = actionFindAndWatchTutorial;

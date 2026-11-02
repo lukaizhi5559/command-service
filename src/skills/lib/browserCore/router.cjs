@@ -354,13 +354,15 @@ async function _routeFromSignals({ goal, pageCategory = 'web_generic', focused, 
   const goalVerbs = stripQuoted(goal);
   const focusedEditable = !!(focused && (focused.isContentEditable || /^(INPUT|TEXTAREA)$/.test(focused.tag) || focused.role === 'textbox' || focused.role === 'combobox'));
 
-  // 1. Planner hint — valid on-page agent that isn't tried wins outright.
-  if (agentHint && ONPAGE_AGENTS.has(agentHint)) {
-    const hit = pick(agentHint, `hint:${agentHint}`);
-    if (hit) return hit;
-    logger.warn(`[router] agentHint "${agentHint}" not allowed for category=${pageCategory} or already tried — falling back to cascade`);
-  } else if (agentHint) {
+  // 1. Planner hint — validate early, honor late. A hint used to win
+  //    outright at the top of the cascade, which let an adjudicated pick
+  //    veto page-state evidence (observed: meta.find hint on "Search YouTube
+  //    for X" → meta.find fail → suggested tab.map scan → turn.loop burn).
+  //    The deterministic lanes now run first; the hint is honored just before
+  //    the floor lanes, where the page gives no decisive signal anyway.
+  if (agentHint && !ONPAGE_AGENTS.has(agentHint)) {
     logger.warn(`[router] ignoring invalid agentHint "${agentHint}"`);
+    agentHint = null;
   }
 
   // 2. Gesture verbs
@@ -494,6 +496,16 @@ async function _routeFromSignals({ goal, pageCategory = 'web_generic', focused, 
   if (COMMERCE_HOST_RE.test(hostnameOf(currentUrl)) && COMMERCE_MUTATION_RE.test(goalVerbs)) {
     const hit = pick('turn.loop.agent', 'commerce-mutation');
     if (hit) return hit;
+  }
+
+  // 7.4 Demoted planner hint — every decisive deterministic lane above has
+  //     abstained. The hint still beats the floor lanes (multi-part /
+  //     default-actionable / fallback), where page state is least decisive
+  //     and planner intent is the best signal left.
+  if (agentHint) {
+    const hit = pick(agentHint, `hint:${agentHint}`);
+    if (hit) return hit;
+    logger.warn(`[router] agentHint "${agentHint}" not allowed for category=${pageCategory} or already tried — falling back to cascade`);
   }
 
   // 7.5 Multi-part goals — several distinct values or a structural spec.

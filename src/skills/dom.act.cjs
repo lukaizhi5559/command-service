@@ -23,7 +23,7 @@ const { hasVisibleDialog } = require('./lib/browserCore/overlayProbe.cjs');
 const { deepLinkOpensOverlay, classifyDeepLinkType } = require('../skill-helpers/deep-link-types.cjs');
 const { inferPageCategory } = require('../skill-helpers/page-category.cjs');
 const { _noSubmitGoalRe } = require('./lib/browserCore/tabMap.cjs');
-const { resolveOrdinalItem } = require('./lib/browserCore/ordinal.cjs');
+const { resolveOrdinalItem, extractListingItems } = require('./lib/browserCore/ordinal.cjs');
 
 // True when the goal is *only* the create/compose action that a
 // creation/compose deep-link already performed. Any residual work in the
@@ -37,6 +37,19 @@ function _isPureCreateGoal(goal, priorNavType) {
   if (!g) return false;
   return _CREATE_ACTION_RE.test(g) && !_RESIDUAL_WORK_RE.test(g);
 }
+
+// Listing-extract goals — "extract the video metadata from the results",
+// "list the results", "what videos are shown" — a read of an enumerable
+// listing, answered by one evaluate, never an element-map scan.
+const _LISTING_GOAL_RE = /\b(?:extract|list|enumerate|collect|pull|read|get|show|summari[sz]e|review|what\s+(?:are|is)|which)\b[\s\S]{0,60}?\b(?:results?|listings?|items?|videos?|entries|cards|products?|metadata|titles?|links?|posts?)\b/i;
+// Video-platform hosts where site-search/discovery goals belong to
+// video.agent, not the on-page element executors.
+const _MEDIA_HOST_RE = /^(www\.)?(youtube\.com|youtu\.be|vimeo\.com|rumble\.com|bitchute\.com|tiktok\.com|twitch\.tv|dailymotion\.com|netflix\.com|hulu\.com|disneyplus\.com)$/i;
+// Mutating media discovery — "search YouTube for X", "find videos about Y".
+// Restricted to discovery verbs + media/content nouns so on-page actions on a
+// video page ("click the first result", "play the video", "click Subscribe")
+// never match.
+const _VIDEO_DISCOVERY_GOAL_RE = /\b(?:search|find|discover|look\s+for|browse|locate)\b[\s\S]{0,80}?\b(?:videos?|clips?|channels?|tutorials?|episodes?|streams?)\b/i;
 
 // Activation/readiness goals — "ensure X is in focus and ready for
 // interaction", "bring the session to the foreground", "activate the tab".
@@ -128,6 +141,32 @@ function _isFillFormGoal(goal, args = {}) {
       || /\b(?:form|application|registration|signup)\b[^.]{0,40}\b(?:fill|complete)\b/i.test(g);
 }
 
+// ── Nav-goal floor ─────────────────────────────────────────────────────────
+// A step the planner typed 'navigate', or a goal leading with an outbound nav
+// verb + named destination, is url.first's lane — dom.act dispatches ON the
+// page, it doesn't leave it (observed: a plan emitted stepType:'navigate' +
+// skill dom.act, which scanned the stale bound tab instead of navigating).
+const _NAV_GOAL_RE = /^\s*(?:please\s+)?(?:navigate(?:\s+to)?|go\s+to|goto|visit|head\s+to|take\s+me\s+to|pull\s+up|bring\s+up|fire\s+up|launch|log\s*in(?:to)?|sign\s*in(?:to)?)\b/i;
+const _NAV_OBJ_ELEM_TOKENS = /^(?:the|a|an|my|this|that|these|those|next|previous|last|first|current|same|new|own|other|another|second|third|\d+(?:st|nd|rd|th)|here|there|page|tab|site|website|section|menu|field|box|button|form|dialog|setting|settings|inbox|screen|window|sidebar|panel|dropdown|toolbar|item|result|listing|option|link|document|doc|file|folder|desktop|terminal|browser|email|e-mail|message|chat|card|sheet|cell|image|photo|picture|video|song|post|comment|notification|list|home|back|forward|search|results?|top|bottom|end|start|beginning)s?$/i;
+
+function _navLedGoal(goal) {
+  if (!_NAV_GOAL_RE.test(goal)) return false;
+  const rest = String(goal).replace(_NAV_GOAL_RE, '')
+    .replace(/^\s*(?:the\s+)?(?:search|look|browse|find)\s+(?:for|at|through)?\s*/i, '')
+    .trim();
+  if (!rest) return true;   // bare nav verb — nothing after it to judge
+  const obj = rest.split(/\s+(?:and|then|&|to|from|for|on|in|with|using|via)\b|[,;]/i)[0].trim();
+  if (!obj) return true;
+  const toks = obj.toLowerCase().replace(/['"]/g, '').split(/[\s\-_/]+/).filter(Boolean);
+  return !toks.every(t => _NAV_OBJ_ELEM_TOKENS.test(t));
+}
+
+// Post-nav residual of a fused goal ("goto X and fill the form" → "fill the form").
+function _navResidual(goal) {
+  const m = String(goal || '').match(/\s+and\s+(?:then\s+)?(.+)$/i);
+  return m ? m[1].trim() : null;
+}
+
 async function domAct(args = {}) {
   const {
     task, goal: _goalArg, agentId = 'default.agent', sessionId: _sid,
@@ -135,7 +174,7 @@ async function domAct(args = {}) {
     triedAgents = null, _progressCallbackUrl,
     priorNavUrl = null, priorNavType = null, expectOverlay: _expectOverlayArg = false,
   } = args;
-  const goal = task || _goalArg || '';
+  let goal = task || _goalArg || '';
   if (!goal) return { ok: false, error: 'dom.act: no task/goal' };
 
   // Category derivation — the planner may emit pageCategory, but most steps
@@ -153,6 +192,33 @@ async function domAct(args = {}) {
   }
 
   const sessionId = qualifyOpenTab(await resolveExtSession(_sid || deriveSessionId(agentId)), goal);
+
+  // Nav-goal floor — a navigate-typed step or nav-led goal delegates to
+  // url.first (navigation is its lane; dom.act routes actions ON a page).
+  // Pure nav goals return its result directly; a fused "goto X and do Y"
+  // lands the tab then routes the residual on the new page.
+  if (args._stepType === 'navigate' || _navLedGoal(goal)) {
+    const _resid = _navResidual(goal);
+    try {
+      const { urlFirstAgent } = require('./url.first.agent.cjs');
+      const _nav = await urlFirstAgent({ ...args, sessionId, task: goal, agentId });
+      if (!_nav?.ok) {
+        logger.warn(`[dom.act] nav-goal delegation failed: ${_nav?.error || 'unknown'}`);
+        return { ok: false, sessionId, agentId, error: `off-destination-nav: ${_nav?.error || 'navigation failed'}`, suggestedAgent: 'url.first.agent' };
+      }
+      if (args._stepType === 'navigate' || !_resid) {
+        logger.info(`[dom.act] nav-goal delegated to url.first → ${_nav.url}`);
+        return { ..._nav, sessionId: _nav.sessionId || sessionId };
+      }
+      goal = _resid;
+      priorNavUrl = _nav.url;
+      priorNavType = _nav.deepLinkType || priorNavType;
+      logger.info(`[dom.act] nav-goal landed ${_nav.url} — routing residual "${_resid.slice(0, 60)}"`);
+    } catch (e) {
+      logger.warn(`[dom.act] nav-goal delegation error: ${e.message}`);
+      return { ok: false, sessionId, agentId, error: `off-destination-nav: ${e.message}`, suggestedAgent: 'url.first.agent' };
+    }
+  }
 
   // Bound-page precondition — an on-page goal presumes a live bound page.
   // A dead/missing/blank binding must surface as a structured failure so the
@@ -507,6 +573,54 @@ async function domAct(args = {}) {
     }
   } catch (_) {}
 
+  // Listing-extract gate — read/list/extract-results goals on a page already
+  // showing a result listing need ONE evaluate, not tab.map's element-map
+  // scan or turn.loop's observe→act loop (observed: "Extract video metadata
+  // from the search results page" → meta.find→tab.map→turn.loop, ~4min of
+  // scans). Read-only — safe on the user's visible tab. Empty enumeration
+  // falls through to the router — the goal may need interaction first.
+  if (_LISTING_GOAL_RE.test(goal)) {
+    try {
+      const _items = await extractListingItems(browserAct, { sessionId, headed: true });
+      if (Array.isArray(_items) && _items.length) {
+        logger.info(`[dom.act] listing-extract: ${_items.length} items on ${_boundPageUrl || 'bound page'} — done without agent scan`);
+        const _lines = _items.slice(0, 12).map((it, i) => `${i + 1}. ${it.text}${it.href ? ` — ${it.href}` : ''}`);
+        return {
+          ok: true,
+          resolvedAgent: 'dom.act:listing-extract',
+          routeRule: 'listing-extract',
+          sessionId,
+          agentId,
+          url: _boundPageUrl,
+          output: `Found ${_items.length} items on the page:\n${_lines.join('\n')}`,
+          items: _items,
+        };
+      }
+      logger.info('[dom.act] listing-extract: no result-shaped items on page — routing normally');
+    } catch (e) {
+      logger.warn(`[dom.act] listing-extract probe failed (non-fatal): ${e.message}`);
+    }
+  }
+
+  // Media-discovery veto — on a video platform, a site-search/discovery goal
+  // ("search YouTube for X", "find videos about Y") is NOT an on-page element
+  // task: video.agent resolves it headlessly. Fail fast with a steer the
+  // replan can consume (failedStep.error → suggestion) instead of letting
+  // tab.map/turn.loop wander a results grid for minutes (observed twice in
+  // one run: search + extract each burned meta.find→tab.map→turn.loop).
+  if (_boundHost && _MEDIA_HOST_RE.test(_boundHost) && _VIDEO_DISCOVERY_GOAL_RE.test(goal)) {
+    logger.warn(`[dom.act] media-discovery veto: "${goal.slice(0, 70)}" on ${_boundHost} — refusing element-scan route`);
+    return {
+      ok: false,
+      resolvedAgent: 'dom.act:media-discovery',
+      routeRule: 'media-discovery-veto',
+      sessionId,
+      agentId,
+      url: _boundPageUrl,
+      error: `media-discovery: "${goal.slice(0, 100)}" is site-wide media search, not an on-page element action — replan with video.agent { action: 'find_and_watch', platform: '${_boundHost.split('.')[0]}', query } or web.agent site_search; element-map scanning cannot resolve it`,
+    };
+  }
+
   // Bounded re-route: a routed agent that fails (e.g. shortcut agent finds no
   // matching hotkey) is added to triedAgents and the router picks the next-best
   // candidate. Prevents one wrong classification from dead-ending the step.
@@ -778,4 +892,4 @@ async function _stillOnUnsubmittedForm(sessionId) {
   }
 }
 
-module.exports = { domAct, _isPureCreateGoal, _mutationApplied, _isUnsubmittedFormUrl };
+module.exports = { domAct, _isPureCreateGoal, _mutationApplied, _isUnsubmittedFormUrl, _navLedGoal, _navResidual };
