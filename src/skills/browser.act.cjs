@@ -1004,6 +1004,17 @@ function findCli() {
 const CLI_BIN = findCli();
 logger.info(`[browser.act] playwright-cli binary: ${CLI_BIN}`);
 
+// Per-invocation AbortSignal context — browserAct runs its body inside
+// AsyncLocalStorage so every cliRun spawn below can see the caller's cancel
+// without threading a param through ~100 call sites. Concurrency-safe: each
+// invocation gets its own store, nested calls inherit the outer signal when
+// they don't carry their own.
+const { AsyncLocalStorage } = require('async_hooks');
+const _actCtx = new AsyncLocalStorage();
+function _currentSignal() {
+  try { return _actCtx.getStore()?.signal || null; } catch (_) { return null; }
+}
+
 // Check if playwright-cli is actually available
 const PLAYWRIGHT_CLI_AVAILABLE = (() => {
   try {
@@ -1061,6 +1072,10 @@ function cliRun(args, timeoutMs = 15000) {
   const sessionFlag = args.find((arg) => typeof arg === 'string' && arg.startsWith('-s='));
   const shortId = sessionFlag ? sessionFlag.slice(3) : null;
   const sessionId = shortId ? (_sidCache.get(shortId) || shortId) : null;
+  const _sig = _currentSignal();
+  if (_sig?.aborted) {
+    return Promise.resolve({ ok: false, stdout: '', stderr: 'cancelled', exitCode: -1, executionTime: 0, error: 'cancelled', cancelled: true });
+  }
   if (sessionId && engine.isSessionActive(sessionId)) {
     const error = `Engine owns session ${sessionId}; playwright-cli execution is blocked`;
     logger.warn(`[browser.act] ${error}`);
@@ -1106,22 +1121,47 @@ function cliRun(args, timeoutMs = 15000) {
     const timer = setTimeout(() => {
       if (!resolved) {
         resolved = true;
+        _cleanupAbort();
         logger.warn(`[browser.act] cliRun timeout after ${timeoutMs}ms (pid=${proc.pid}) — letting process finish naturally`);
-        resolve({ 
-          ok: false, 
-          stdout, 
-          stderr, 
-          exitCode: -1, 
-          executionTime: Date.now() - start, 
-          error: `Timed out after ${timeoutMs}ms` 
+        resolve({
+          ok: false,
+          stdout,
+          stderr,
+          exitCode: -1,
+          executionTime: Date.now() - start,
+          error: `Timed out after ${timeoutMs}ms`
         });
       }
     }, timeoutMs);
+
+    // Cancel DOES kill — unlike the timeout path, an abort means the whole
+    // run is being torn down, so the playwright-cli daemon and its browser
+    // must not outlive it (observed: Tab presses kept landing ~1s after
+    // /automation.cancel returned).
+    const _onAbort = () => {
+      if (!resolved) {
+        resolved = true;
+        clearTimeout(timer);
+        try { proc.kill('SIGKILL'); } catch (_) {}
+        resolve({
+          ok: false,
+          stdout,
+          stderr,
+          exitCode: -1,
+          executionTime: Date.now() - start,
+          error: 'cancelled',
+          cancelled: true,
+        });
+      }
+    };
+    if (_sig) _sig.addEventListener('abort', _onAbort, { once: true });
+    const _cleanupAbort = () => { if (_sig) _sig.removeEventListener('abort', _onAbort); };
 
     proc.on('close', code => {
       if (!resolved) {
         resolved = true;
         clearTimeout(timer);
+        _cleanupAbort();
         const executionTime = Date.now() - start;
         const ok = code === 0;
         resolve({ ok, stdout, stderr, exitCode: code ?? -1, executionTime, error: ok ? undefined : stderr.trim() || `exit code ${code}` });
@@ -1132,6 +1172,7 @@ function cliRun(args, timeoutMs = 15000) {
       if (!resolved) {
         resolved = true;
         clearTimeout(timer);
+        _cleanupAbort();
         resolve({ ok: false, stdout, stderr, exitCode: -1, executionTime: Date.now() - start, error: err.message });
       }
     });
@@ -2733,6 +2774,17 @@ async function sendEmailWithVerification(sessionId, sendSelector) {
 // ---------------------------------------------------------------------------
 
 async function browserAct(args) {
+  // Bind this invocation's AbortSignal into the ALS context so every cliRun
+  // spawn inside sees it. Inherit the caller's context when this call carries
+  // no signal of its own (nested probes dispatched by instruction.runner etc).
+  const _sig = args?._abortSignal ?? _currentSignal();
+  if (_sig?.aborted) {
+    return { ok: false, action: args?.action, error: 'cancelled', cancelled: true, executionTime: 0 };
+  }
+  return _actCtx.run({ signal: _sig }, () => _browserActImpl(args));
+}
+
+async function _browserActImpl(args) {
   // A sessionId ending in '.agent' is virtually always a raw agentId passed by
   // mistake (deriveSessionId convention: 'amazon.agent' → 'amazon_agent').
   // Normalize it — otherwise the same logical agent forks into two sessions
@@ -2868,20 +2920,18 @@ async function browserAct(args) {
       // This helps with YouTube extraction and other challenging scenarios
       if (!crashInfo.crashDetected && !res.ok) {
         logger.info(`[browser.act] Attempting fallback to shell.run for action: ${action}`);
-        
+
         try {
-          // Build playwright-cli command from session flags and command args
-          const playwrightCmd = [
-            'playwright-cli',
-            '--session', sessionId,
-            ...(headed ? [] : ['--headless']),
-            ...cmdArgs
-          ].join(' ');
-          
+          // shell.run's contract is {cmd, argv, timeoutMs, cwd} — the previous
+          // shape ({command, timeout, workingDir}) silently dropped everything
+          // and always errored on missing cmd. Same flags cliRun uses, so the
+          // session/profile/browser args match the failed attempt verbatim.
           const fallbackResult = await shellRun.shellRun({
-            command: playwrightCmd,
-            timeout: timeoutMs + 10000, // Extra timeout for fallback
-            workingDir: process.cwd()
+            cmd: 'playwright-cli',
+            argv: [...S, ...cmdArgs],
+            timeoutMs: timeoutMs + 10000, // Extra timeout for fallback
+            cwd: process.cwd(),
+            _abortSignal: _currentSignal(),
           });
           
           if (fallbackResult.ok) {
@@ -8725,4 +8775,9 @@ module.exports = {
   _sniffAuthCookies,
   _detachCookieSniffCdp,
   _parseCliResult,
+  // Orchestrators that fan out into many browserAct calls (instruction.runner,
+  // tab.map, dom runners) bind the cancel signal once around their whole body —
+  // every inner browserAct/cliRun then honors it without per-call threading.
+  runWithActSignal: (signal, fn) => _actCtx.run({ signal: signal ?? _currentSignal() }, fn),
+  _currentSignal,
 };

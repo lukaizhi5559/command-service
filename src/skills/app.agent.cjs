@@ -6425,10 +6425,11 @@ function _readClipboardHtml() {
  *      'auto' picks 'type' when a browser is frontmost and newTab===false,
  *      else 'open', with cross-fallback on failure.
  */
-async function actionNavigateUrl({ url, appName, via = 'auto', newTab, sessionId, agentId } = {}) {
+async function actionNavigateUrl({ url, appName, via = 'auto', newTab, sessionId, agentId, signal = null } = {}) {
   if (!url || !/^https?:\/\//i.test(String(url).trim())) {
     return { ok: false, error: 'navigate_url requires a valid http(s) url' };
   }
+  if (signal?.aborted) return { ok: false, error: 'cancelled', cancelled: true };
   url = String(url).trim();
   const { execFileSync } = require('child_process');
   const est = _pageCopyEst.estimateForUrl(url);
@@ -6436,10 +6437,15 @@ async function actionNavigateUrl({ url, appName, via = 'auto', newTab, sessionId
   // Extension lane — navigate through the ThinkDrop extension so the tab is
   // bound to a session (/ext.sessions, follow-ups, scans all see it). An OS
   // `open` lands in an unbound tab the rest of the pipeline can't address.
-  const sid = await _extSessionFor({ sessionId, agentId, url });
+  // via:'open' means the deterministic OS `open` — the extension lane is only
+  // tried when a session was explicitly targeted (sessionId/agentId) or via is
+  // 'auto'/'type'. _extSessionFor synthesizes ext:<host>_agent even without a
+  // live binding, so without this gate via:'open' still lands in playwright.
+  const sid = (via === 'open' && !sessionId && !agentId) ? null
+    : await _extSessionFor({ sessionId, agentId, url });
   if (sid) {
     const { browserAct } = require('./browser.act.cjs');
-    const res = await browserAct({ action: 'navigate', sessionId: sid, url, activate: true, timeoutMs: 20000 });
+    const res = await browserAct({ action: 'navigate', sessionId: sid, url, activate: true, timeoutMs: 20000, _abortSignal: signal });
     if (res.ok) {
       logger.info(`[app.agent] navigate_url: ${url} via 'ext' session=${sid}`);
       return { ok: true, url, via: 'ext', sessionId: sid, category: est.category };
@@ -6566,14 +6572,18 @@ async function _getLiveBrowserUrl(appName) {
   } catch (_) { return null; }
 }
 
-async function actionScanPage({ appName, url, category, maxWaitMs = 10000, useCache = true, captureHtml = false, ttlMs, deselect = true, sessionId, agentId } = {}) {
+async function actionScanPage({ appName, url, category, maxWaitMs = 10000, useCache = true, captureHtml = false, ttlMs, deselect = true, sessionId, agentId, preferOs = false, signal = null } = {}) {
+  if (signal?.aborted) return { ok: false, error: 'cancelled', cancelled: true };
   // 0. Extension lane — when the ThinkDrop Chrome extension is connected and a
   //    bound session can be identified, read the page via in-tab evaluate
   //    instead of OS focus + Cmd+A/Cmd+C. Equivalent content, no focus theft,
   //    and it exercises the session binding instead of driving Chrome blind.
+  //    preferOs skips session INFERENCE only (an OS-opened tab is unbound — an
+  //    inferred session could be a stale bound tab); an explicit
+  //    sessionId/agentId still resolves its lane.
   try {
     const _gw = require('../ext.gateway.cjs');
-    if (_gw.hasExtension()) {
+    if (_gw.hasExtension() && !(preferOs && !sessionId && !agentId)) {
       const sid = await _extSessionFor({ sessionId, agentId, url, allowSole: true, allowRecent: true });
       if (sid) {
         const { browserAct } = require('./browser.act.cjs');
@@ -6581,11 +6591,12 @@ async function actionScanPage({ appName, url, category, maxWaitMs = 10000, useCa
         // empty or the evaluate can throw while the page is still swapping.
         const deadline = Date.now() + Math.max(6000, maxWaitMs || 0);
         let pageUrl = null, content = '', lastErr = null;
-        while (Date.now() < deadline) {
+        while (!signal?.aborted && Date.now() < deadline) {
           try {
             const res = await browserAct({
               action: 'evaluate', sessionId: sid, timeoutMs: 8000,
               text: 'JSON.stringify({url:location.href,text:(document.body&&document.body.innerText)||""})',
+              _abortSignal: signal,
             });
             if (res.ok && res.result) {
               try { const p = JSON.parse(res.result); pageUrl = p.url || pageUrl; content = p.text || ''; }
@@ -6644,6 +6655,9 @@ async function actionScanPage({ appName, url, category, maxWaitMs = 10000, useCa
   let est = _pageCopyEst.estimateForUrl(liveUrl || url);
   try {
     while (true) {
+      if (signal?.aborted) {
+        return { ok: false, error: 'cancelled', cancelled: true, executionTime: Date.now() - start };
+      }
       await _withOverlayHidden(async () => {
         last = await _copyPageOnce(resolvedApp, captureHtml, deselect);
       });
@@ -6933,8 +6947,9 @@ function _releaseOverlayKey() {
 
 const _NAVTASK_MUTATION_RE = /\b(send|compose|reply|forward|post|tweet|publish|create|upload|book|schedule|buy|purchase|checkout|place\s+order|delete|remove|dm|comment|like|follow|subscribe|add\s+(?:to|a|an|the|new))\b/i;
 
-function _navTaskCallSkill(skillName, args, timeoutMs = 120000) {
+function _navTaskCallSkill(skillName, args, timeoutMs = 120000, signal = null) {
   return new Promise((resolve) => {
+    if (signal?.aborted) return resolve({ ok: false, error: 'cancelled', cancelled: true });
     const http = require('http');
     const body = JSON.stringify({ payload: { skill: skillName, args } });
     const req = http.request({
@@ -6949,15 +6964,20 @@ function _navTaskCallSkill(skillName, args, timeoutMs = 120000) {
       res.on('data', c => { raw += c; });
       res.on('end', () => { try { resolve(JSON.parse(raw).data || JSON.parse(raw)); } catch (_) { resolve(null); } });
     });
+    // Cancel → destroy the request; the server-side AbortController is tied to
+    // the client socket, so this propagates the abort into the nested skill.
+    const _onAbort = () => { try { req.destroy(); } catch (_) {} resolve({ ok: false, error: 'cancelled', cancelled: true }); };
+    if (signal) signal.addEventListener('abort', _onAbort, { once: true });
     req.on('timeout', () => { req.destroy(); resolve(null); });
-    req.on('error', () => resolve(null));
+    req.on('error', () => { if (signal) signal.removeEventListener('abort', _onAbort); resolve(null); });
     req.write(body);
     req.end();
   });
 }
 
-async function actionNavTask({ task, service, url, escalate = true, browseFallback = false, appName, timeoutMs = 120000 } = {}) {
+async function actionNavTask({ task, service, url, escalate = true, browseFallback = false, appName, timeoutMs = 120000, signal = null } = {}) {
   if (!task && !url) return { ok: false, error: 'nav_task requires task or url' };
+  if (signal?.aborted) return { ok: false, error: 'cancelled', cancelled: true };
 
   const _escalate = async (why) => {
     if (!escalate || browseFallback) return { ok: false, reason: why, service: service || null };
@@ -6966,7 +6986,7 @@ async function actionNavTask({ task, service, url, escalate = true, browseFallba
       : null;
     if (!_agentId) return { ok: false, reason: why };
     logger.info(`[app.agent] nav_task: escalating to browser.agent (${why}) for ${_agentId}`);
-    const r = await _navTaskCallSkill('browser.agent', { action: 'run', agentId: _agentId, task: task || `Open ${url}` }, timeoutMs);
+    const r = await _navTaskCallSkill('browser.agent', { action: 'run', agentId: _agentId, task: task || `Open ${url}`, _abortSignal: signal }, timeoutMs, signal);
     return r || { ok: false, error: 'escalation returned no result', reason: why };
   };
 
@@ -6985,7 +7005,8 @@ async function actionNavTask({ task, service, url, escalate = true, browseFallba
       action: 'search_and_navigate',
       query: task || `Open ${service || url}`,
       preferDomain: serviceKey || service || undefined,
-    }, timeoutMs);
+      _abortSignal: signal,
+    }, timeoutMs, signal);
     const best = sr?.bestUrl || null;
     if (!best) return { ok: false, reason: 'no startUrl and browse fallback found no result', service: service || null };
     logger.info(`[app.agent] nav_task: browseFallback — search resolved ${best}`);

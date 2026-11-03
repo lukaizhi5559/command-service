@@ -15504,6 +15504,7 @@ Output ONLY valid JSON: {${_matchedSkill.params.map(p => `"${p.name}": "<extract
           startUrl: _matchedSkill.startUrl || url,
           sessionId,
           timeoutMs: overallTimeoutMs,
+          _abortSignal,
         });
 
         if (_tier05Result?.ok) {

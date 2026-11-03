@@ -707,10 +707,11 @@ async function _resolveGoalToCommand(goal, onProgress) {
 //   4. Runs the new command
 // Returns the retry result, or null if discovery retry didn't apply / failed.
 // ---------------------------------------------------------------------------
-async function _discoveryRetry(scriptBody, goal, cwd, env, oauthEnv, timeoutMs, stdin, _progressCallback, protectedPaths) {
+async function _discoveryRetry(scriptBody, goal, cwd, env, oauthEnv, timeoutMs, stdin, _progressCallback, protectedPaths, _abortSignal) {
   if (!scriptBody || !scriptBody.includes('|')) return null;
   if (!goal) return null; // only applies to goal-resolved commands, not pre-built argv
   if (!skillLlm.isAvailable()) return null;
+  if (_abortSignal?.aborted) return null;
 
   // 1. Extract source command (everything before the first pipe)
   const pipeIdx = scriptBody.indexOf('|');
@@ -727,6 +728,7 @@ async function _discoveryRetry(scriptBody, goal, cwd, env, oauthEnv, timeoutMs, 
     timeoutMs: Math.min(timeoutMs, MAX_TIMEOUT_MS),
     stdin,
     protectedPaths,
+    _abortSignal,
   }, null);
 
   if (!sourceResult.stdout || !sourceResult.stdout.trim()) {
@@ -784,6 +786,7 @@ ${sourceResult.stdout.slice(0, 2000)}`;
       timeoutMs: Math.min(timeoutMs, MAX_TIMEOUT_MS),
       stdin,
       protectedPaths,
+      _abortSignal,
     }, _progressCallback || null);
 
     // Verify the retry result
@@ -1759,6 +1762,7 @@ async function _ptyRunProcess(cmd, argv, options, onProgress) {
     timeoutMs: Math.min(options.timeoutMs || 30000, 300000),
     cwd: options.cwd,
     env: options.env,
+    _abortSignal: options._abortSignal,
     _progressCallbackUrl: options._progressCallbackUrl || 'http://127.0.0.1:3010/agent-turn',
   });
   if (!r || r.error === 'session-not-found') return null; // spawn fallback
@@ -1805,6 +1809,13 @@ function runProcess(cmd, argv, options, onProgress) {
       cmd = SANDBOX_EXEC;
     }
     const startTime = Date.now();
+    const _sig = options?._abortSignal;
+    if (_sig?.aborted) {
+      return resolve({
+        ok: false, stdout: '', stderr: '', exitCode: -1,
+        executionTime: 0, error: 'cancelled', cancelled: true,
+      });
+    }
 
     const spawnOpts = {
       cwd: options.cwd || process.cwd(),
@@ -1875,7 +1886,27 @@ function runProcess(cmd, argv, options, onProgress) {
       proc.stdin.end();
     }
 
+    // Cancel: kill the spawned process (TERM→KILL like the timeout path) and
+    // settle immediately — the 'close' event fires after, its resolve is a
+    // no-op on an already-settled promise.
+    const _onAbort = () => {
+      try { proc.kill('SIGTERM'); } catch (_) {}
+      setTimeout(() => { try { proc.kill('SIGKILL'); } catch (_) {} }, 2000).unref?.();
+      resolve({
+        ok: false,
+        stdout: stdoutBuf,
+        stderr: stderrBuf,
+        exitCode: -1,
+        executionTime: Date.now() - startTime,
+        error: 'cancelled',
+        cancelled: true,
+      });
+    };
+    if (_sig) _sig.addEventListener('abort', _onAbort, { once: true });
+    const _cleanupAbort = () => { if (_sig) _sig.removeEventListener('abort', _onAbort); };
+
     const timer = setTimeout(() => {
+      _cleanupAbort();
       proc.kill('SIGTERM');
       setTimeout(() => { try { proc.kill('SIGKILL'); } catch (_) {} }, 2000);
       resolve({
@@ -1890,6 +1921,7 @@ function runProcess(cmd, argv, options, onProgress) {
 
     proc.on('close', (code, signal) => {
       clearTimeout(timer);
+      _cleanupAbort();
       const executionTime = Date.now() - startTime;
       const exitCode = code ?? -1;
       // 141 = 128+SIGPIPE — a downstream consumer (head/tail/awk NR<=n) closed
@@ -1915,6 +1947,7 @@ function runProcess(cmd, argv, options, onProgress) {
 
     proc.on('error', (err) => {
       clearTimeout(timer);
+      _cleanupAbort();
       resolve({
         ok: false,
         stdout: stdoutBuf,
@@ -1945,7 +1978,12 @@ async function shellRun(args) {
     _progressCallbackUrl,
     _ptySession,
     protectedPaths,
+    _abortSignal,
   } = args || {};
+
+  if (_abortSignal?.aborted) {
+    return { ok: false, stdout: '', stderr: '', exitCode: -1, executionTime: 0, cmd, dryRun, error: 'cancelled', cancelled: true };
+  }
 
   // ── Goal resolution path ─────────────────────────────────────────────────
   // When the planner passes a plain-language args.goal instead of args.argv,
@@ -2083,6 +2121,7 @@ async function shellRun(args) {
     protectedPaths,
     _ptySession,
     _progressCallbackUrl,
+    _abortSignal,
   };
   const _runStep = async () => {
     if (_ptySession) {
@@ -2124,7 +2163,7 @@ async function shellRun(args) {
     goal  // only for goal-resolved commands, not pre-built argv
   ) {
     const discoveryResult = await _discoveryRetry(
-      scriptBody, goal, cwd, env, oauthEnv, timeoutMs, stdin, _progressCallback || null, protectedPaths
+      scriptBody, goal, cwd, env, oauthEnv, timeoutMs, stdin, _progressCallback || null, protectedPaths, _abortSignal
     );
     if (discoveryResult) {
       // Return the discovery retry result (whether it succeeded or failed).
@@ -2177,6 +2216,7 @@ async function shellRun(args) {
       env: { ...freshEnv, ...env },
       timeoutMs: Math.min(timeoutMs, MAX_TIMEOUT_MS),
       stdin,
+      _abortSignal,
     });
     const retryResult = _involvesScreencapture(baseName, runArgv)
       ? await _withScreenshotFlash(_retryStep)

@@ -12034,6 +12034,7 @@ Output ONLY valid JSON: {${_execRecipe.params.map(p => `"${p.name}": "<extracted
                 startUrl: childSkill.startUrl,
                 sessionId,
                 timeoutMs: 120000,
+                _abortSignal,
               });
               if (!_childResult?.ok) {
                 _chainFailed = true;
@@ -12257,6 +12258,7 @@ Output ONLY valid JSON: {${_execRecipe.params.map(p => `"${p.name}": "<extracted
             startUrl: _execRecipe.startUrl,
             sessionId,
             timeoutMs: 120000,
+            _abortSignal,
           });
 
           if (_agentSkillResult?.ok) {
@@ -13313,6 +13315,7 @@ When extracting page content with run-code, prioritize these selectors over gene
         progressCallbackUrl: _progressCallbackUrl,
         stepIndex: _stepIndex,
         agentId: _agentIdArg,
+        _abortSignal,
       });
       if (_tabMapResult?.askUser) {
         // Alert handler surfaced an unfixable error — propagate to user
@@ -13526,6 +13529,7 @@ When extracting page content with run-code, prioritize these selectors over gene
         progressCallbackUrl: _progressCallbackUrl,
         stepIndex: _stepIndex,
         agentId: _agentIdArg,
+        _abortSignal,
       });
       if (_tabMapResult2?.ok) {
         logger.info(`[browser.agent] tab-map: completed ✓ via iterative navigation (re-entry ${_tabFlowReEntries})`);

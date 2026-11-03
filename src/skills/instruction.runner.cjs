@@ -16,7 +16,7 @@
 // Just keyboard navigation — the same way screen readers navigate the web.
 // ---------------------------------------------------------------------------
 
-const { browserAct, _parseCliResult } = require('./browser.act.cjs');
+const { browserAct, _parseCliResult, runWithActSignal } = require('./browser.act.cjs');
 const { askWithMessages } = require('../skill-helpers/skill-llm.cjs');
 
 const logger = require('../logger.cjs');
@@ -1503,8 +1503,15 @@ function parseStep(sentence) {
 // Main entry point
 // ---------------------------------------------------------------------------
 
-async function runInstructionSkill({ instructions, keyPath, params, skillArgs, startUrl, sessionId, timeoutMs, pageCategory, urlFirstNav }) {
+async function runInstructionSkill(opts) {
+  // Bind the caller's AbortSignal into the shared act context — every
+  // browserAct/cliRun inside honors cancel without per-call threading.
+  return runWithActSignal(opts?._abortSignal, () => _runInstructionSkillImpl(opts));
+}
+
+async function _runInstructionSkillImpl({ instructions, keyPath, params, skillArgs, startUrl, sessionId, timeoutMs, pageCategory, urlFirstNav, _abortSignal }) {
   if (!sessionId) return { ok: false, error: 'No sessionId provided' };
+  if (_abortSignal?.aborted) return { ok: false, error: 'cancelled', cancelled: true };
   const _pageCategory = pageCategory || 'web_generic';
   const _urlFirstNav = !!urlFirstNav;
   logger.info(`[instruction.runner] runInstructionSkill: pageCategory=${_pageCategory}, sessionId=${sessionId}, urlFirstNav=${_urlFirstNav}`);
@@ -1640,6 +1647,9 @@ async function runInstructionSkill({ instructions, keyPath, params, skillArgs, s
   let _cachedTabMapOverlayActive = null;
 
   for (let i = 0; i < steps.length; i++) {
+    if (_abortSignal?.aborted) {
+      return { ok: false, error: 'cancelled', cancelled: true, stepResults, discoveredKeyPath };
+    }
     if (Date.now() > deadline) {
       return { ok: false, error: `Timeout after ${overallTimeout}ms at step ${i + 1}/${steps.length}`, stepResults, discoveredKeyPath };
     }
@@ -4291,8 +4301,15 @@ async function _executeArrowGridStep({ sessionId, goal, actionHistory, pageCateg
   return _out;
 }
 
-async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, pageCategory, agentContext, shortcutCount = 0, shortcutLabels = '', timeoutMs = 120000, progressCallbackUrl = null, stepIndex = 0, agentId = '', stepType = null, taskClassification = null }) {
+async function runIterativeNavigation(opts) {
+  // Bind the caller's AbortSignal into the shared act context — every
+  // browserAct/cliRun inside honors cancel without per-call threading.
+  return runWithActSignal(opts?._abortSignal, () => _runIterativeNavigationImpl(opts));
+}
+
+async function _runIterativeNavigationImpl({ goal, sessionId, startUrl, urlFirstNav, pageCategory, agentContext, shortcutCount = 0, shortcutLabels = '', timeoutMs = 120000, progressCallbackUrl = null, stepIndex = 0, agentId = '', stepType = null, taskClassification = null, _abortSignal }) {
   if (!sessionId) return { ok: false, error: 'No sessionId provided' };
+  if (_abortSignal?.aborted) return { ok: false, error: 'cancelled', cancelled: true };
   let _pageCategory = pageCategory || 'web_generic';
   const _urlFirstNav = !!urlFirstNav;
   logger.info(`[instruction.runner] runIterativeNavigation: goal="${String(goal || '').slice(0, 80)}", pageCategory=${_pageCategory}, sessionId=${sessionId}, urlFirstNav=${_urlFirstNav}, stepType=${stepType || 'none'}`);
@@ -4538,6 +4555,10 @@ async function runIterativeNavigation({ goal, sessionId, startUrl, urlFirstNav, 
   // ── Main loop ──────────────────────────────────────────────────────
   let _initialRunUrl = await _getUrl(sessionId).catch(() => '');
   while (Date.now() - startTime < timeoutMs) {
+    if (_abortSignal?.aborted) {
+      logger.info(`[instruction.runner] Cancelled — exiting iterative navigation (elapsed=${Date.now() - startTime}ms)`);
+      return { ok: false, error: 'cancelled', cancelled: true, actionHistory };
+    }
     // 1. Read current state
     const currentUrl = await _getUrl(sessionId);
     let focused = await _readActiveElement(sessionId);

@@ -14,7 +14,7 @@ const path = require('path');
 const os = require('os');
 const fs = require('fs');
 const logger = require('../logger.cjs');
-const { browserAct } = require('./browser.act.cjs');
+const { browserAct, runWithActSignal } = require('./browser.act.cjs');
 const { askWithMessages } = require('../skill-helpers/skill-llm.cjs');
 
 const SKILLS_BASE_DIR = path.join(os.homedir(), '.thinkdrop', 'skills');
@@ -92,11 +92,12 @@ function resolveRecipePath(name, execPath) {
 // The agent snapshots the live DOM, finds elements by intent, and executes step-by-step.
 // No CSS selectors are stored or replayed — the agent adapts to the live page.
 // ---------------------------------------------------------------------------
-async function runAgentSkill(recipe, skillArgs, timeoutMs, recipePath) {
+async function runAgentSkill(recipe, skillArgs, timeoutMs, recipePath, _abortSignal) {
   const sessionId = skillArgs?.sessionId;
   if (!sessionId) {
     return { ok: false, error: 'Agent skill execution requires a sessionId' };
   }
+  if (_abortSignal?.aborted) return { ok: false, error: 'cancelled', cancelled: true };
 
   const instructions = recipe.instructions || '';
   if (!instructions) {
@@ -133,6 +134,7 @@ async function runAgentSkill(recipe, skillArgs, timeoutMs, recipePath) {
       startUrl: recipe.startUrl,
       sessionId,
       timeoutMs: timeoutMs || 120000, // longer timeout for first-run discovery
+      _abortSignal,
     });
 
     // Cache the discovered key path back to the recipe for fast subsequent runs
@@ -178,7 +180,7 @@ function _findRecipePath(skillName) {
   return null;
 }
 
-async function runRecipeSkill(resolvedPath, skillArgs, timeoutMs) {
+async function runRecipeSkill(resolvedPath, skillArgs, timeoutMs, _abortSignal) {
   let recipe;
   try {
     recipe = JSON.parse(fs.readFileSync(resolvedPath, 'utf8'));
@@ -190,13 +192,14 @@ async function runRecipeSkill(resolvedPath, skillArgs, timeoutMs) {
   if (!sessionId) {
     return { ok: false, error: 'Recipe execution requires a sessionId' };
   }
+  if (_abortSignal?.aborted) return { ok: false, error: 'cancelled', cancelled: true };
 
   // ── Agent-based skill: delegate to playwrightAgent with natural language instructions ──
   // New format: { execType: "agent", instructions: "...", params: [...], startUrl: "..." }
   // The agent snapshots the live DOM, finds elements by intent, and executes step-by-step.
   if (recipe.execType === 'agent' || (recipe.instructions && !Array.isArray(recipe.waypoints))) {
     logger.info(`[recipe.run] Agent skill "${recipe.name}" — delegating to playwrightAgent`);
-    return await runAgentSkill(recipe, skillArgs, timeoutMs, resolvedPath);
+    return await runAgentSkill(recipe, skillArgs, timeoutMs, resolvedPath, _abortSignal);
   }
 
   // ── Composite recipe: chain multiple .skill.json files ───────────────────
@@ -217,6 +220,7 @@ async function runRecipeSkill(resolvedPath, skillArgs, timeoutMs) {
 
     let totalWaypoints = 0;
     for (let i = 0; i < recipe.skills.length; i++) {
+      if (_abortSignal?.aborted) return { ok: false, error: 'cancelled', cancelled: true };
       const skillRef = recipe.skills[i];
       const skillName = skillRef.skill || skillRef.name;
       if (!skillName) {
@@ -241,7 +245,7 @@ async function runRecipeSkill(resolvedPath, skillArgs, timeoutMs) {
 
       // Run the referenced skill (which may itself be a single-skill .skill.json
       // or a nested composite .recipe.json — recursion handles both)
-      const subResult = await runRecipeSkill(skillFilePath, chainArgs, timeoutMs);
+      const subResult = await runRecipeSkill(skillFilePath, chainArgs, timeoutMs, _abortSignal);
       if (!subResult.ok) {
         return { ok: false, error: `Composite recipe ${recipe.name} failed at skill "${skillName}": ${subResult.error}` };
       }
@@ -293,6 +297,7 @@ async function runRecipeSkill(resolvedPath, skillArgs, timeoutMs) {
   const returns = {};
 
   for (const wp of effectiveWaypoints) {
+    if (_abortSignal?.aborted) return { ok: false, error: 'cancelled', cancelled: true };
     const value = resolveValue(wp.value || '');
 
     // Navigate waypoints don't need selector resolution
@@ -496,7 +501,7 @@ Which element should I interact with? Return the ref (e.g. td5).`;
 }
 
 async function run(args) {
-  const { name, args: skillArgs, timeoutMs: rawTimeout, execPath: directExecPath, sessionId } = args || {};
+  const { name, args: skillArgs, timeoutMs: rawTimeout, execPath: directExecPath, sessionId, _abortSignal } = args || {};
   const timeoutMs = Math.min(rawTimeout || DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS);
   const mergedSkillArgs = { ...(skillArgs || {}), ...(sessionId ? { sessionId } : {}) };
 
@@ -513,7 +518,9 @@ async function run(args) {
     };
   }
 
-  const result = await runRecipeSkill(resolvedPath, mergedSkillArgs, timeoutMs);
+  // Bind the signal into the act context so every browserAct/cliRun inside
+  // honors cancel; also passed explicitly for the instruction.runner paths.
+  const result = await runWithActSignal(_abortSignal, () => runRecipeSkill(resolvedPath, mergedSkillArgs, timeoutMs, _abortSignal));
   return { ...result, skillName: name, execType: 'recipe' };
 }
 

@@ -187,28 +187,28 @@ class CommandServiceMCPServer {
 
     switch (skill) {
       case 'shell.run':
-        return await this._skillShellRun(args);
+        return await this._skillShellRun(args, opts);
 
       case 'browser.act':
-        return await this._skillBrowserAct(args);
+        return await this._skillBrowserAct(args, opts);
 
       case 'web.crawl':
-        return await this._skillWebCrawl(args);
+        return await this._skillWebCrawl(args, opts);
 
       case 'image.analyze':
-        return await this._skillImageAnalyze(args);
+        return await this._skillImageAnalyze(args, opts);
 
       case 'fs.read':
         return await this._skillFsRead(args);
 
       case 'file.watch':
-        return await this._skillFileWatch(args);
+        return await this._skillFileWatch(args, opts);
 
       case 'file.bridge':
-        return await this._skillFileBridge(args);
+        return await this._skillFileBridge(args, opts);
 
       case 'screen.capture':
-        return await this._skillScreenCapture(args);
+        return await this._skillScreenCapture(args, opts);
 
       case 'screen.display':
         return await screenDisplay(args);
@@ -216,7 +216,7 @@ class CommandServiceMCPServer {
       // 'external.skill' resolves trained recipes only (recipe.run) — playwright's
       // external_skill steps and agent-test paths dispatch under this name.
       case 'external.skill':
-        return await this._skillRecipeRun(args);
+        return await this._skillRecipeRun(args, opts);
 
       // Tombstone — stale dispatches get an honest error instead of "unknown skill".
       case 'creator.agent':
@@ -226,13 +226,13 @@ class CommandServiceMCPServer {
         return await this._skillExternal(args);
 
       case 'cli.agent':
-        return await this._skillCliAgent(args);
+        return await this._skillCliAgent(args, opts);
 
       case 'terminal.agent':
         return await this._skillTerminalAgent(args, opts);
 
       case 'mcp.agent':
-        return await this._skillMcpAgent(args);
+        return await this._skillMcpAgent(args, opts);
 
       case 'browser.agent':
         return await this._skillBrowserAgent(args, opts);
@@ -275,25 +275,25 @@ class CommandServiceMCPServer {
         return await this._skillProjectStopper(args);
 
       case 'user.agent':
-        return await this._skillUserAgent(args);
+        return await this._skillUserAgent(args, opts);
 
       case 'web.agent':
-        return await this._skillWebAgent(args);
+        return await this._skillWebAgent(args, opts);
 
       case 'video.agent':
-        return await this._skillVideoAgent(args);
+        return await this._skillVideoAgent(args, opts);
 
       case 'edit.agent':
-        return await this._skillEditAgent(args);
+        return await this._skillEditAgent(args, opts);
 
       case 'doc.read':
-        return await docRead(args);
+        return await this._skillDocRead(args, opts);
 
       case 'task.agent':
-        return await this._skillTaskAgent(args);
+        return await this._skillTaskAgent(args, opts);
 
       case 'media.transcribe':
-        return await mediaTranscribe(args);
+        return await this._skillMediaTranscribe(args, opts);
 
       case 'app.agent':
         return await this._skillAppAgent(args, opts);
@@ -319,73 +319,90 @@ class CommandServiceMCPServer {
   // Skills — stubs, implementations will live in skills/ and be required here
   // ---------------------------------------------------------------------------
 
-  async _skillShellRun(args) {
-    return await shellRun(args);
+  // Thread the server-side AbortSignal (tied to the HTTP socket lifecycle and
+  // /automation.cancel) into every skill that can run long — the skill reads
+  // args._abortSignal to kill spawned children and break out of loops.
+  _withSignal(args, opts = {}) {
+    return opts.signal ? { ...args, _abortSignal: opts.signal } : args;
   }
 
-  async _skillBrowserAct(args) {
-    return await browserAct(args);
+  async _skillShellRun(args, opts = {}) {
+    return await shellRun(this._withSignal(args, opts));
   }
 
-  async _skillWebCrawl(args) {
-    return await webCrawl(args);
+  async _skillBrowserAct(args, opts = {}) {
+    return await browserAct(this._withSignal(args, opts));
   }
 
-  async _skillWebAgent(args) {
-    return await webAgent(args);
+  async _skillWebCrawl(args, opts = {}) {
+    return await webCrawl(this._withSignal(args, opts));
   }
 
-  async _skillVideoAgent(args) {
-    return await videoAgent(args, { browserAct, skillLlm, cliAgent });
+  async _skillWebAgent(args, opts = {}) {
+    return await webAgent(this._withSignal(args, opts));
   }
 
-  async _skillImageAnalyze(args) {
-    return await imageAnalyze(args);
+  async _skillVideoAgent(args, opts = {}) {
+    return await videoAgent(this._withSignal(args, opts), { browserAct, skillLlm, cliAgent });
+  }
+
+  async _skillImageAnalyze(args, opts = {}) {
+    return await imageAnalyze(this._withSignal(args, opts));
   }
 
   async _skillFsRead(args) {
     return await fsRead(args);
   }
 
-  async _skillEditAgent(args) {
-    return await editAgent(args);
+  async _skillEditAgent(args, opts = {}) {
+    return await editAgent(this._withSignal(args, opts));
   }
 
-  async _skillFileWatch(args) {
-    return await fileWatch(args);
+  async _skillFileWatch(args, opts = {}) {
+    return await fileWatch(this._withSignal(args, opts));
   }
 
-  async _skillScreenCapture(args) {
-    return await screenCapture(args);
+  async _skillScreenCapture(args, opts = {}) {
+    return await screenCapture(this._withSignal(args, opts));
   }
 
-  async _skillFileBridge(args) {
-    return await fileBridge(args);
+  async _skillFileBridge(args, opts = {}) {
+    return await fileBridge(this._withSignal(args, opts));
   }
 
   async _skillExternal(args) {
     return { success: false, error: 'skill retired — procedures are authored plans, not installed skills' };
   }
 
-  async _skillRecipeRun(args) {
-    return await recipeRun.run(args);
+  async _skillRecipeRun(args, opts = {}) {
+    return await recipeRun.run(this._withSignal(args, opts));
   }
 
-  async _skillCliAgent(args) {
-    return await cliAgent(args);
+  async _skillCliAgent(args, opts = {}) {
+    return await cliAgent(this._withSignal(args, opts));
   }
 
-  async _skillTaskAgent(args) {
+  async _skillDocRead(args, opts = {}) {
+    return await docRead(this._withSignal(args, opts));
+  }
+
+  async _skillMediaTranscribe(args, opts = {}) {
+    return await mediaTranscribe(this._withSignal(args, opts));
+  }
+
+  async _skillTaskAgent(args, opts = {}) {
     // Task-level observe→decide→execute loop (pilot). runSkill gives the loop
     // in-process access to the whole skill registry — same injection pattern
-    // video.agent uses for its sibling skills.
+    // video.agent uses for its sibling skills. The same AbortSignal threads
+    // into every nested dispatch so a cancel reaches the whole subtree.
+    if (opts.signal) args = { ...args, _abortSignal: opts.signal };
     return await taskAgent(args, {
-      runSkill: (skill, skillArgs) => this.executeAutomation({ skill, args: skillArgs || {} }),
+      runSkill: (skill, skillArgs) => this.executeAutomation({ skill, args: skillArgs || {} }, opts),
     });
   }
 
-  async _skillMcpAgent(args) {
-    return await mcpAgent(args);
+  async _skillMcpAgent(args, opts = {}) {
+    return await mcpAgent(this._withSignal(args, opts));
   }
 
   async _skillTerminalAgent(args, opts = {}) {
@@ -419,8 +436,8 @@ class CommandServiceMCPServer {
     return await projectStop(args);
   }
 
-  async _skillUserAgent(args) {
-    return await userAgent(args);
+  async _skillUserAgent(args, opts = {}) {
+    return await userAgent(this._withSignal(args, opts));
   }
 
   async _skillPlaywrightAgent(args, opts = {}) {

@@ -9,7 +9,7 @@
 // ---------------------------------------------------------------------------
 
 const logger = require('../../../logger.cjs');
-const { browserAct } = require('../../browser.act.cjs');
+const { browserAct, _currentSignal } = require('../../browser.act.cjs');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
@@ -658,6 +658,13 @@ async function buildTabMap(sessionId, maxElements = 150, options = {}) {
   logger.info(`[instruction.runner] buildTabMap: initial focus tag=${_initialEl?.tag || 'none'}, role=${_initialEl?.role || 'none'}, inDropdown=${!!_initialEl?.inDropdown}`);
 
   for (let i = 0; i < maxElements; i++) {
+    // Cancel: the ALS-bound signal lives on the caller's context — stop
+    // pressing Tab immediately instead of spinning the remaining iterations
+    // on cancelled results (observed: Tab presses landed ~1s after cancel).
+    if (_currentSignal()?.aborted) {
+      logger.info(`[instruction.runner] buildTabMap: cancelled at element ${i}/${maxElements}`);
+      break;
+    }
     const before = await _slimReadActiveElement(sessionId);
     let current = before; // tracks current focus position (may shift via arrows)
     let advanced = false;
@@ -772,7 +779,7 @@ async function buildTabMap(sessionId, maxElements = 150, options = {}) {
     if (!advanced) {
       let _tabRetries = 0;
       const _MAX_TAB_RETRIES = 5;
-      while (_tabRetries <= _MAX_TAB_RETRIES) {
+      while (_tabRetries <= _MAX_TAB_RETRIES && !_currentSignal()?.aborted) {
         await browserAct({ action: 'press', sessionId, key: keyTab, headed: true, timeoutMs: 2000 });
         await _sleep(20);
         after = await _slimReadActiveElement(sessionId);
@@ -1251,6 +1258,7 @@ async function _pageSearchWithScroll(sessionId, text, maxScrolls = 5) {
   if (result) return result;
 
   for (let i = 0; i < maxScrolls; i++) {
+    if (_currentSignal()?.aborted) return null;
     await _scrollPageDown(sessionId);
     await _sleep(500); // wait for virtualized content to render
     result = await pageSearch(sessionId, text);
@@ -1286,6 +1294,7 @@ async function pageSearchAndTabTo(sessionId, searchText, nearbyLabel, maxTabs = 
 
   // Tab forward looking for the nearby element
   for (let i = 0; i < maxTabs; i++) {
+    if (_currentSignal()?.aborted) return found;
     await browserAct({ action: 'press', sessionId, key: 'Tab', headed: true, timeoutMs: 2000 });
     await _sleep(60);
     const focused = await _readActiveElement(sessionId);
