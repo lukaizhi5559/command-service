@@ -1435,7 +1435,14 @@ async function actionRun({ cli, argv = [], cwd, env, timeoutMs, stdin, agentId, 
   // discipline, but run_shell becomes the primary verb since there is no
   // fixed cliTool. Used for goal-shaped steps ("install X", "set up Y") and
   // AGENT_ESCALATE recovery from failed shell.run steps.
-  if (!agentId && task) {
+  // 'cli.agent' as an agentId is the generic loop's own self-brand — it can
+  // never exist in the registry. Treat it as absent → generic loop (observed:
+  // a resume synthesized {agentId:'cli.agent'} → "No agent found" ask_user
+  // loop for 36min).
+  if ((!agentId || agentId === 'cli.agent') && task) {
+    if (agentId === 'cli.agent') {
+      logger.warn('[cli.agent] run: self-referential agentId "cli.agent" — falling back to generic run loop');
+    }
     return await _genericRunLoop({ task, cwd, env, timeoutMs, _progressCallbackUrl, _stepIndex, protectedPaths });
   }
 
@@ -1878,7 +1885,11 @@ async function actionRun({ cli, argv = [], cwd, env, timeoutMs, stdin, agentId, 
       if (action.action === 'ask_user') {
         // Persist any discovered command-mapping rule so future runs skip the discovery turns.
         // Saved regardless of user's Yes/No — the CLI docs truth is independent of the user's choice.
-        if (action.save_rule && typeof action.save_rule === 'string' && action.save_rule.trim()) {
+        // Command-prescription guard: rules may carry facts, never skill
+        // routing — a saved "use browser.act" poisons unrelated later runs
+        // (shared/rule-guard.cjs — same check evaluateSkills applies).
+        if (action.save_rule && typeof action.save_rule === 'string' && action.save_rule.trim()
+            && !require('../../../../shared/rule-guard.cjs').rulePrescribesRouting(action.save_rule)) {
           skillDb.setContextRule('cli_agent:' + agentId, action.save_rule.trim(), 'cli_agent').catch(() => {});
           logger.info(`[cli.agent] saved learned rule for ${agentId}: "${action.save_rule.slice(0, 120)}"`, { agentId });
         }

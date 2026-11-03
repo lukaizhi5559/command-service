@@ -8464,11 +8464,17 @@ If no videos found, return []. Do not explain, only output the JSON array.`;
         : `playwright-cli ${failedAction} usage: ${(cmdHelp || helpText).slice(0, 300)}`;
 
       // 4. Write permanent context_rule so planner never repeats this mistake
+      // Command-prescription guard (shared/rule-guard.cjs): facts only — a
+      // "use browser.act"-style rule injects itself into unrelated runs.
       try {
         const db = require('../skill-helpers/skill-db.cjs');
         const ruleKey = `playwright-cli:${failedAction || 'general'}`;
-        await db.setContextRule(ruleKey, fixSummary);
-        logger.info(`[browser.act] diagnose: wrote context_rule for "${ruleKey}": ${fixSummary.slice(0, 120)}`);
+        if (require('../../../../shared/rule-guard.cjs').rulePrescribesRouting(fixSummary)) {
+          logger.warn(`[browser.act] diagnose: skipping context_rule — prescribes routing/commands: ${fixSummary.slice(0, 120)}`);
+        } else {
+          await db.setContextRule(ruleKey, fixSummary);
+          logger.info(`[browser.act] diagnose: wrote context_rule for "${ruleKey}": ${fixSummary.slice(0, 120)}`);
+        }
       } catch (e) {
         logger.warn(`[browser.act] diagnose: failed to write context_rule — ${e.message}`);
       }
@@ -8633,12 +8639,17 @@ Respond ONLY with valid JSON:
       }
 
       // 6. For RECOVERABLE: auto-write context_rule so replan has the info
+      // Command-prescription guard (shared/rule-guard.cjs): facts only.
       if ((diagnosis.status === 'RECOVERABLE' || diagnosis.status === 'NEEDS_USER') && diagnosis.contextRule) {
         try {
           const db = require('../skill-helpers/skill-db.cjs');
           const domain = pageUrl.replace(/^https?:\/\//, '').split('/')[0];
-          await db.setContextRule(domain, diagnosis.contextRule);
-          logger.info(`[browser.act] examine: wrote context_rule for "${domain}": ${diagnosis.contextRule}`);
+          if (require('../../../../shared/rule-guard.cjs').rulePrescribesRouting(diagnosis.contextRule)) {
+            logger.warn(`[browser.act] examine: skipping context_rule — prescribes routing/commands: ${String(diagnosis.contextRule).slice(0, 120)}`);
+          } else {
+            await db.setContextRule(domain, diagnosis.contextRule);
+            logger.info(`[browser.act] examine: wrote context_rule for "${domain}": ${diagnosis.contextRule}`);
+          }
         } catch (e) {
           logger.warn(`[browser.act] examine: failed to write context_rule — ${e.message}`);
         }
