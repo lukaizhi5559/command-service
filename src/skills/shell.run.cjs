@@ -1743,7 +1743,12 @@ function _sandboxProfile(protectedPaths) {
 const _ANSI_RE = /\x1b\[[0-9;?]*[a-zA-Z]|\x1b\][^\x07]*(?:\x07|\x1b\\)/g;
 function _ptyQuote(a) {
   const s = String(a);
-  return /[\s'"$`\\|&;()<>]/.test(s) ? `'${s.replace(/'/g, `'\\''`)}'` : s;
+  // Safelist, not denylist: only clearly inert token chars stay bare,
+  // everything else is single-quoted. zsh glob/history metacharacters
+  // (? * [ ] { } ~ ! ^ # and leading =) must not reach the PTY shell
+  // unquoted — observed: `open https://google.com/search?q=x` →
+  // "zsh: no matches found" → step failed into cli.agent recovery.
+  return /^[A-Za-z0-9_@%+:,./-]+$/.test(s) ? s : `'${s.replace(/'/g, `'\\''`)}'`;
 }
 
 async function _ptyRunProcess(cmd, argv, options, onProgress) {
@@ -2298,4 +2303,4 @@ function getOutputContract(result) {
   };
 }
 
-module.exports = { shellRun, validate, getOutputContract, addCommandToAllowlist, ALLOWED_COMMANDS, DANGEROUS_COMMANDS, _looksTruncated, getCwdRoots, DANGEROUS_SCRIPT_PATTERNS, _sandboxProfile };
+module.exports = { shellRun, validate, getOutputContract, addCommandToAllowlist, ALLOWED_COMMANDS, DANGEROUS_COMMANDS, _looksTruncated, getCwdRoots, DANGEROUS_SCRIPT_PATTERNS, _sandboxProfile, _ptyQuote };

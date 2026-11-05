@@ -11,9 +11,12 @@
 //   completion  executeCommand tail — vs taskFacts + gathered vars
 //   observation monitorService._recordAppSwitch — ambient app/tab switches
 //
-// `when` matching is deterministic (eq/contains/regex/host-match); the only
-// modeled field is `category`, evaluated by callers against the rule's own
-// authored category list — never an open-ended judgment.
+// `when` matching is deterministic (eq/contains/regex/host-match) with two
+// modeled exceptions: `category` — evaluated by callers against the rule's
+// own authored category list — and `semanticMatch`/`semanticExempt`, a
+// frame/anti-frame predicate judged by the CALLER-injected model via
+// evaluateAsync (deterministic fields AND first as prefilters; this module
+// contains no model calls).
 //
 // `then` actions: block | ask | notify | show_card | enqueue_task.
 // ---------------------------------------------------------------------------
@@ -149,7 +152,17 @@ function removeRule(id) {
 
 function _testRe(pattern, text) {
   try {
-    return new RegExp(pattern, 'i').test(String(text || ''));
+    let p = String(pattern);
+    let flags = 'i';
+    // Model-authored rules sometimes carry inline flag prefixes ((?i), (?m),
+    // (?s)) — JS RegExp can't parse them, which silently kills the match.
+    // Translate a leading (?flags) group into real flags.
+    const m = p.match(/^\(\?([imsu]+)\)/);
+    if (m) {
+      p = p.slice(m[0].length);
+      for (const f of m[1]) if (!flags.includes(f)) flags += f;
+    }
+    return new RegExp(p, flags).test(String(text || ''));
   } catch (_) {
     return false;
   }
@@ -178,6 +191,11 @@ function _subOrRe(pattern, text) {
 
 function whenMatches(when, ctx) {
   if (!when || typeof when !== 'object') return false;
+  // semanticMatch/semanticExempt are deferred to evaluateAsync's injected
+  // judge — a rule asserting a semantic condition can never match the sync
+  // path, so a mixed `hostMatch + semanticMatch` rule can't bypass its
+  // concept check by matching the host alone.
+  if (when.semanticMatch) return false;
   let asserted = false;
   if (when.promptMatch) {
     asserted = true;
@@ -319,6 +337,41 @@ function hasOcrRules() {
   return loadRules().some((r) => r.when && r.when.ocrMatch);
 }
 
+// True when any enabled rule asserts when.semanticMatch — callers that run
+// semantic judging (e.g. monitorService's per-capture OCR eval) gate on this
+// the same way they gate on hasOcrRules().
+function hasSemanticRules() {
+  return loadRules().some((r) => r.when && r.when.semanticMatch);
+}
+
+// Async evaluate — the semantic pass. Deterministic rules resolve via
+// evaluate() unchanged; rules asserting when.semanticMatch are candidates
+// only when their other (deterministic) fields all match, then the caller's
+// injected judge decides the concept:
+//   judge(frame, exempt, ctx) → 'YES' | 'NO' | null   (null/non-YES = no match)
+// judge(frame, exempt, ctx) receives the semanticMatch predicate as `frame`
+// and semanticExempt (may be undefined) as `exempt`. No judge → deterministic
+// hits only. Cooldown + seam filtering apply identically to both passes.
+async function evaluateAsync(ctx, seam, judge) {
+  const hits = evaluate(ctx, seam);
+  if (typeof judge !== 'function') return hits;
+  const now = Date.now();
+  for (const rule of loadRules()) {
+    const s = rule.seam || 'any';
+    if (s !== 'any' && s !== seam) continue;
+    if (_inCooldown(rule, now)) continue;
+    const when = rule.when || {};
+    if (!when.semanticMatch || hits.includes(rule)) continue;
+    const { semanticMatch: _frame, semanticExempt: _exempt, ...rest } = when;
+    // Deterministic fields AND first — a free prefilter before any model call.
+    if (Object.keys(rest).length && !whenMatches(rest, ctx)) continue;
+    try {
+      if ((await judge(String(_frame), _exempt == null ? null : String(_exempt), ctx)) === 'YES') hits.push(rule);
+    } catch (_) { /* judge threw → no match (fail-open) */ }
+  }
+  return hits;
+}
+
 // First blocking/asking rule at a seam — callers short-circuit on these.
 function firstGuardHit(ctx, seam) {
   for (const rule of evaluate(ctx, seam)) {
@@ -336,11 +389,13 @@ module.exports = {
   setRuleEnabled,
   removeRule,
   evaluate,
+  evaluateAsync,
   firstGuardHit,
   whenMatches,
   markFired,
   interpolate,
   hasOcrRules,
+  hasSemanticRules,
   hasPassphrase,
   setPassphrase,
   verifyPassphrase,
