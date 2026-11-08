@@ -27,8 +27,9 @@ const SCREEN_SERVICE_HOST = process.env.SCREEN_SERVICE_HOST || '127.0.0.1';
 const SCREEN_SERVICE_PORT = parseInt(process.env.SCREEN_INTEL_PORT || '3008', 10);
 const DEFAULT_TIMEOUT = 20000;
 
-function httpPost(host, port, urlPath, body, timeoutMs = 15000) {
+function httpPost(host, port, urlPath, body, timeoutMs = 15000, signal = null) {
   return new Promise((resolve, reject) => {
+    if (signal?.aborted) return reject(Object.assign(new Error('aborted'), { aborted: true }));
     const payload = JSON.stringify(body);
     const options = {
       hostname: host,
@@ -53,6 +54,17 @@ function httpPost(host, port, urlPath, body, timeoutMs = 15000) {
       });
     });
 
+    // Wire the caller's abort into the in-flight request — a cancelled run must
+    // not sit on a 20-30s socket timeout while the service retries internally.
+    const onAbort = () => {
+      req.destroy(Object.assign(new Error('aborted'), { aborted: true }));
+    };
+    if (signal) {
+      if (signal.aborted) { onAbort(); return; }
+      signal.addEventListener('abort', onAbort, { once: true });
+      req.on('close', () => { try { signal.removeEventListener('abort', onAbort); } catch (_) {} });
+    }
+
     req.setTimeout(timeoutMs, () => {
       req.destroy(new Error(`screen.analyze timed out after ${timeoutMs}ms`));
     });
@@ -65,11 +77,15 @@ function httpPost(host, port, urlPath, body, timeoutMs = 15000) {
 
 async function screenCapture(args = {}) {
   const baseTimeoutMs = Math.min(60000, Math.max(5000, parseInt(args.timeoutMs || DEFAULT_TIMEOUT, 10)));
+  const signal = args.signal || null;
   const startTime = Date.now();
   const MAX_RETRIES = 2;
 
   let lastError = null;
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    if (signal?.aborted) {
+      return { ok: false, success: false, aborted: true, error: 'screen.capture aborted' };
+    }
     const timeoutMs = baseTimeoutMs + (attempt * 5000);
     logger.info('[screen.capture] Capturing screen via screen-intelligence-service', { attempt: attempt + 1, timeoutMs });
 
@@ -79,12 +95,17 @@ async function screenCapture(args = {}) {
         SCREEN_SERVICE_PORT,
         '/screen.analyze',
         {},
-        timeoutMs
+        timeoutMs,
+        signal
       );
 
       if (!result?.success) {
         lastError = result?.error || 'screen.analyze returned failure';
         logger.warn('[screen.capture] analyze returned failure', { attempt: attempt + 1, error: lastError });
+        // Screen Recording permission won't heal inside a 25s retry window —
+        // fail fast so the caller can surface a real cause instead of grinding.
+        if (/permission/i.test(lastError)) break;
+        if (signal?.aborted) break;
         continue;
       }
 
@@ -113,8 +134,14 @@ async function screenCapture(args = {}) {
     } catch (err) {
       lastError = err.message;
       logger.warn('[screen.capture] attempt failed', { attempt: attempt + 1, error: err.message });
+      if (err.aborted || signal?.aborted) {
+        return { ok: false, success: false, aborted: true, error: 'screen.capture aborted' };
+      }
       if (attempt < MAX_RETRIES) {
         await new Promise(r => setTimeout(r, 1000 * (attempt + 1)));
+        if (signal?.aborted) {
+          return { ok: false, success: false, aborted: true, error: 'screen.capture aborted' };
+        }
       }
     }
   }

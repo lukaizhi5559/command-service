@@ -125,6 +125,12 @@ function close(id) {
   // flipping to session-not-found / "(no sessions)". send → session-exited.
   // The idle sweeper reaps dead sessions (~5min), so this doesn't leak.
   if (s.exitCode === null) s.exitCode = -1;
+  // Wake pending data-listener waits (exec exit-marker, wait-match) — without
+  // this a killed session leaves them parked until their own timeout
+  // (observed: a cancel-aborted exec hung the full 30s on a dead PTY).
+  for (const cb of s.dataListeners) {
+    try { cb(`\n[session closed by request]\n`); } catch (_) {}
+  }
   s.meta.lastActivity = Date.now();
   return true;
 }

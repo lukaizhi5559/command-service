@@ -199,7 +199,17 @@ async function tabMapAgent(args = {}) {
           }
           postProgress(_progressCallbackUrl, { tier: 'tab-map', message: `tab.map.agent: done after ${i + 1} step(s)` });
           return {
-            ok: true, output: actionHistory.join('; ') || 'done', sessionId,
+            ok: true,
+            // Extracted text must reach the step result, not just the action
+            // transcript — a read/extract goal whose output is only "Get page
+            // text → ok" gives downstream synthesize nothing (observed:
+            // "extract the job details from the email" returned narrative,
+            // the page text was discarded).
+            output: extractedPageText
+              ? `${actionHistory.join('; ')}\n\nPage content: ${extractedPageText.slice(0, 10000)}`
+              : (actionHistory.join('; ') || 'done'),
+            pageText: extractedPageText || undefined,
+            sessionId,
             actionHistory, filledFields, clickedRefs: [...clickedRefs],
             pageShape: _pageShape || undefined, pageCategory: _pageShape?.pageCategory || pageCategory,
             tabMap, tabMapUrl,

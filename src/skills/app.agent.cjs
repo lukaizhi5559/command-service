@@ -391,11 +391,11 @@ function extractTextItems(liteparseOutput) {
  * Capture screen using existing screen capture capability
  * @returns {Promise<{ok: boolean, path?: string, error?: string}>}
  */
-async function actionCaptureScreen() {
+async function actionCaptureScreen({ signal = null } = {}) {
   try {
     // Use existing screen.capture skill
     const { screenCapture } = require('./screen.capture.cjs');
-    const result = await screenCapture({});
+    const result = await screenCapture({ signal });
     
     if (result.success && result.text) {
       // For now, we don't get a path back from screenCapture - it returns OCR text
@@ -4025,7 +4025,17 @@ function _getActiveAppContext() {
   });
 }
 
-async function getRecentOCR({ maxAgeSeconds = 3, appName: targetApp = null, liveOverlayHidden = false } = {}) {
+// Fatal capture errors — a screen-capture failure the fallback chains cannot
+// heal: Screen Recording permission denied (TCC), or an abort mid-request.
+// Callers check this after every screenCapture/getRecentOCR call and bail
+// immediately with the typed error instead of grinding every fallback path
+// for tens of seconds while the control lock holds the user's input.
+const _CAPTURE_FATAL_RE = /permission_denied|screen_recording|screen\.capture aborted/i;
+function _captureFatal(r) {
+  return !!(r && (r.aborted || _CAPTURE_FATAL_RE.test(String(r?.error || r?.reason || ''))));
+}
+
+async function getRecentOCR({ maxAgeSeconds = 3, appName: targetApp = null, liveOverlayHidden = false, signal = null } = {}) {
   const _appMatches = (a, b) => {
     if (!a || !b) return false;
     const al = a.toLowerCase();
@@ -4084,8 +4094,13 @@ async function getRecentOCR({ maxAgeSeconds = 3, appName: targetApp = null, live
       // When requested (e.g. by the monitor), hide the ThinkDrop overlay during
       // the capture so its UI text doesn't taint the OCR and misreport the app.
       const live = liveOverlayHidden
-        ? await _withFlash(() => screenCapture({}))
-        : await screenCapture({});
+        ? await _withFlash(() => screenCapture({ signal }))
+        : await screenCapture({ signal });
+      // Fatal capture error (TCC denial / abort) — surface it so aware callers
+      // bail instead of grinding more fallbacks on an impossible capture.
+      if (_captureFatal(live)) {
+        return { text: '', appName: null, windowTitle: null, timestamp: null, available: false, fatal: true, error: live.error || 'screen_recording_permission_denied' };
+      }
       if (live.success && live.text) {
         return {
           text: live.text,
@@ -4189,17 +4204,17 @@ async function _llmCheckRegionRelevance(purposeStatement, beforeText, afterText)
  * is semantically relevant to the scroll goal.
  * Returns { scrolled: boolean, relevant: boolean }
  */
-async function _probeBoundaryForScroll(cx, cy, direction, nut, purposeStatement) {
+async function _probeBoundaryForScroll(cx, cy, direction, nut, purposeStatement, signal = null) {
   try {
     const { screenCapture } = require('./screen.capture.cjs');
     await nut.mouse.move([{ x: cx, y: cy }]);
     await _sleep(400); // longer settle — lets ThinkDrop overlay finish any flicker before OCR
-    const beforeCapture = await screenCapture({});
+    const beforeCapture = await screenCapture({ signal });
     const beforeText = beforeCapture.success ? (beforeCapture.text || '') : '';
     if (direction === 'up') await nut.mouse.scrollUp(150);
     else await nut.mouse.scrollDown(150);
     await _sleep(1000);
-    const afterCapture = await screenCapture({});
+    const afterCapture = await screenCapture({ signal });
     const afterText = afterCapture.success ? (afterCapture.text || '') : '';
     const topBefore = _getTopWords(beforeText, 8);
     const topAfter  = _getTopWords(afterText,  8);
@@ -4273,7 +4288,7 @@ Return JSON only, no markdown fences.`;
   }
 }
 
-async function actionSearchScroll({ scrollPlan, appName, category, scrollCandidates }) {
+async function actionSearchScroll({ scrollPlan, appName, category, scrollCandidates, signal = null }) {
   const { direction, stopKeyword, purposeStatement, maxScrolls } = scrollPlan;
   let nut;
   try {
@@ -4386,7 +4401,7 @@ async function actionSearchScroll({ scrollPlan, appName, category, scrollCandida
       break;
     }
     // Low-confidence or unknown: probe with bigger scroll
-    const probe = await _probeBoundaryForScroll(cx, cy, direction, nut, purposeStatement);
+    const probe = await _probeBoundaryForScroll(cx, cy, direction, nut, purposeStatement, signal);
     if (probe.scrolled && probe.relevant) {
       activeRegion = { cx, cy };
       logger.info(`[app.agent] actionSearchScroll: probe confirmed scroll region at (${cx},${cy})`);
@@ -4412,9 +4427,9 @@ async function actionSearchScroll({ scrollPlan, appName, category, scrollCandida
     let _beforeKb = '';
     try {
       const { screenCapture: _scKb } = require('./screen.capture.cjs');
-      const _beforeCapKb = await _scKb({});
+      const _beforeCapKb = await _scKb({ signal });
       _beforeKb = _beforeCapKb.success ? (_beforeCapKb.text || '') : '';
-    } catch (_) { _beforeKb = (await getRecentOCR()).text || ''; }
+    } catch (_) { _beforeKb = (await getRecentOCR({ signal })).text || ''; }
     try {
       _execSyncFallback(`osascript -e 'tell application "${appName}" to activate'`, { timeout: 2000 });
       await _sleep(300);
@@ -4426,9 +4441,9 @@ async function actionSearchScroll({ scrollPlan, appName, category, scrollCandida
     let _afterKb = '';
     try {
       const { screenCapture: _scKb2 } = require('./screen.capture.cjs');
-      const _afterCapKb = await _scKb2({});
+      const _afterCapKb = await _scKb2({ signal });
       _afterKb = _afterCapKb.success ? (_afterCapKb.text || '') : '';
-    } catch (_) { _afterKb = (await getRecentOCR()).text || ''; }
+    } catch (_) { _afterKb = (await getRecentOCR({ signal })).text || ''; }
     const _kbScrolled = _beforeKb !== _afterKb && _afterKb.length > 20;
     if (_kbScrolled) {
       logger.info('[app.agent] actionSearchScroll: AppleScript keyboard scroll works — entering scroll loop in keyboard mode');
@@ -4466,12 +4481,12 @@ async function actionSearchScroll({ scrollPlan, appName, category, scrollCandida
   const _liveText = async (forceFresh = false) => {
     try {
       if (forceFresh) {
-        const r = await _liveCapture({});
+        const r = await _liveCapture({ signal });
         if (r.success) return { text: r.text || '', confidence: r.confidence || 0 };
-        const cached = await getRecentOCR();
+        const cached = await getRecentOCR({ signal });
         return { text: cached.text || '', confidence: 0 };
       }
-      const cached = await getRecentOCR();
+      const cached = await getRecentOCR({ signal });
       return { text: cached.text || '', confidence: cached.confidence || 0 };
     } catch (_) {
       return { text: '', confidence: 0 };
@@ -4535,6 +4550,10 @@ async function actionSearchScroll({ scrollPlan, appName, category, scrollCandida
   const { execSync: _execSyncKb } = useKeyboardScroll ? require('child_process') : { execSync: null };
 
   while (scrollCount < maxScrolls) {
+    if (signal?.aborted) {
+      logger.info('[app.agent] actionSearchScroll: aborted — stopping scroll loop');
+      return { ok: false, found: false, aborted: true, scrolls: scrollCount, text: lastText };
+    }
     try {
       if (useKeyboardScroll) {
         // Keyboard scroll mode: send Page Up/Down via AppleScript for each step unit
@@ -4798,7 +4817,7 @@ async function actionLiveChatScroll({ scrollPlan, appName, windowTitle, category
   });
 }
 
-async function actionPassiveReadScroll({ scrollPlan, appName, category }) {
+async function actionPassiveReadScroll({ scrollPlan, appName, category, signal = null }) {
   const direction = scrollPlan?.direction || CATEGORY_SCROLL_DEFAULTS[category] || 'down';
   const { stopKeyword, purposeStatement, maxScrolls = 30 } = scrollPlan;
   let nut;
@@ -4857,12 +4876,15 @@ async function actionPassiveReadScroll({ scrollPlan, appName, category }) {
   const { screenCapture: _passiveCapture } = require('./screen.capture.cjs');
   const _freshText = async () => {
     try {
-      const r = await _passiveCapture({});
-      return r.success ? (r.text || '') : (await getRecentOCR()).text || '';
-    } catch (_) { return (await getRecentOCR()).text || ''; }
+      const r = await _passiveCapture({ signal });
+      return r.success ? (r.text || '') : (await getRecentOCR({ signal })).text || '';
+    } catch (_) { return (await getRecentOCR({ signal })).text || ''; }
   };
 
   while (scrollCount < maxScrolls) {
+    if (signal?.aborted) {
+      return { ok: false, found: false, aborted: true, stopReason: 'aborted', scrolls: scrollCount, text: accumulatedText.join('\n') };
+    }
     // Always fresh OCR so we read what is actually on screen now
     const currentText = await _freshText();
     if (currentText) accumulatedText.push(currentText);
@@ -4981,7 +5003,7 @@ async function actionSearchAndClick({ searchText, appName, category, maxMatches 
 
   if (appName) {
     _checkAbort('before_verify_app_focus');
-    const focus = await verifyAppFocused({ appName, waitMs: 5000 });
+    const focus = await verifyAppFocused({ appName, waitMs: 5000, signal });
     if (!focus.focused) {
       return { ok: false, error: `App "${appName}" could not be focused` };
     }
@@ -5007,7 +5029,7 @@ async function actionSearchAndClick({ searchText, appName, category, maxMatches 
   const _captureFreshOCR = async () => {
     _checkAbort('before_capture');
     const { screenCapture } = require('./screen.capture.cjs');
-    const live = await _withCaptureWindow(() => screenCapture({}));
+    const live = await _withCaptureWindow(() => screenCapture({ signal }));
     if (live.success && live.text) {
       return {
         text: live.text,
@@ -5018,7 +5040,7 @@ async function actionSearchAndClick({ searchText, appName, category, maxMatches 
         source: 'live'
       };
     }
-    return getRecentOCR({ appName, liveOverlayHidden: true });
+    return getRecentOCR({ appName, liveOverlayHidden: true, signal });
   };
 
   _checkAbort('before_baseline');
@@ -5277,7 +5299,10 @@ async function actionMonitorWithBackoff({ goal, mode = 'passive', maxDurationMs 
 
   try {
   const startTime = Date.now();
-  let baseline = await getRecentOCR({ appName, liveOverlayHidden: true });
+  let baseline = await getRecentOCR({ appName, liveOverlayHidden: true, signal: monitorSignal });
+  if (baseline?.fatal || _captureFatal(baseline)) {
+    return { ok: false, error: baseline.error || 'screen_recording_permission_denied', fatal: true };
+  }
   let checkInterval = 10000;
   let llmCalls = 0;
   const MAX_LLM_CALLS = 20; // Phase 3 success criteria: <20 LLM calls for 10-min tasks
@@ -5330,7 +5355,7 @@ async function actionMonitorWithBackoff({ goal, mode = 'passive', maxDurationMs 
     // Periodically verify app focus if appName is provided
     if (appName && focusCheckCount % FOCUS_CHECK_INTERVAL === 0) {
       logger.debug(`[app.agent] actionMonitorWithBackoff: checking focus for "${appName}" (check #${focusCheckCount})`);
-      const focusResult = await verifyAppFocused({ appName, waitMs: 2000 });
+      const focusResult = await verifyAppFocused({ appName, waitMs: 2000, signal: monitorSignal });
       
       if (!focusResult.focused) {
         logger.warn(`[app.agent] actionMonitorWithBackoff: app "${appName}" lost focus (detected: "${focusResult.appName}"), attempting to refocus`);
@@ -5342,7 +5367,7 @@ async function actionMonitorWithBackoff({ goal, mode = 'passive', maxDurationMs 
           await _sleep(1000); // Give it time to focus
           
           // Verify refocus was successful
-          const refocusResult = await verifyAppFocused({ appName, waitMs: 2000 });
+          const refocusResult = await verifyAppFocused({ appName, waitMs: 2000, signal: monitorSignal });
           if (refocusResult.focused) {
             logger.info(`[app.agent] actionMonitorWithBackoff: successfully refocused "${appName}"`);
           } else {
@@ -5354,7 +5379,10 @@ async function actionMonitorWithBackoff({ goal, mode = 'passive', maxDurationMs 
       }
     }
     
-    const current = await getRecentOCR({ appName, liveOverlayHidden: true });
+    const current = await getRecentOCR({ appName, liveOverlayHidden: true, signal: monitorSignal });
+    if (current?.fatal || _captureFatal(current)) {
+      return { ok: false, error: current.error || 'screen_recording_permission_denied', fatal: true, llmCalls, elapsed: Date.now() - startTime };
+    }
 
     if (!current.text || current.text.trim().length < 10) {
       // Empty/low-confidence capture is likely a transient capture failure.
@@ -5630,8 +5658,9 @@ async function actionMonitorFormSubmission({ formName, successIndicator, errorIn
   return { ok: false, status: 'timeout', form: formName };
 }
 
-async function verifyAppFocused({ appName, waitMs = 5000 }) {
+async function verifyAppFocused({ appName, waitMs = 5000, signal = null }) {
   const start = Date.now();
+  if (signal?.aborted) return { focused: false, aborted: true, appName };
 
   const _matches = (a, b) => {
     const al = (a || '').toLowerCase();
@@ -5720,9 +5749,10 @@ async function verifyAppFocused({ appName, waitMs = 5000 }) {
     let attempts = 0;
     const maxAttempts = Math.floor(waitMs / 500); // Rough estimate of max attempts
 
-    while (Date.now() - start < waitMs && attempts < maxAttempts) {
+    while (!signal?.aborted && Date.now() - start < waitMs && attempts < maxAttempts) {
       attempts++;
-      await _sleep(retryDelay);
+      await _sleep(retryDelay, signal);
+      if (signal?.aborted) return { focused: false, aborted: true, appName };
       
       const after = await _getActiveAppBounds().catch((err) => {
         logger.debug(`[app.agent] verifyAppFocused: attempt ${attempts} - _getActiveAppBounds failed: ${err.message}`);
@@ -5759,18 +5789,22 @@ async function verifyAppFocused({ appName, waitMs = 5000 }) {
     logger.error(`[app.agent] verifyAppFocused: FAILED - expected "${appName}", got "${finalAppName}" after ${totalWaited}ms, ${attempts} attempts`);
     
     // Try fallback detection methods if active-win failed
+    if (signal?.aborted) return { focused: false, aborted: true, appName };
     if (finalAppName === 'unknown' || !final) {
       logger.info(`[app.agent] verifyAppFocused: trying fallback detection methods...`);
-      
+
       // Fallback 1: Try to detect via window title OCR
-      const titleResult = await _detectAppByWindowTitle(appName);
+      const titleResult = await _detectAppByWindowTitle(appName, signal);
+      if (titleResult.fatal) return { focused: false, appName, fatal: true, error: titleResult.error };
       if (titleResult.detected) {
         logger.info(`[app.agent] verifyAppFocused: fallback OCR detected "${appName}"`);
         return { focused: true, appName, waited: totalWaited, attempts, fallback: 'ocr' };
       }
-      
+      if (signal?.aborted) return { focused: false, aborted: true, appName };
+
       // Fallback 2: Try to detect via OCR difference comparison
-      const deltaResult = await _detectAppByOCRDifference(appName);
+      const deltaResult = await _detectAppByOCRDifference(appName, signal);
+      if (deltaResult.fatal) return { focused: false, appName, fatal: true, error: deltaResult.error };
       if (deltaResult.detected) {
         logger.info(`[app.agent] verifyAppFocused: fallback OCR-delta detected "${appName}" (similarity: ${deltaResult.similarity?.toFixed(3)}, titleChanged: ${deltaResult.titleChanged})`);
         return { focused: true, appName, waited: totalWaited, attempts, fallback: 'ocr-delta', deltaResult };
@@ -5838,12 +5872,12 @@ function _generateAppPatterns(appName) {
 /**
  * Fallback detection method: Try to detect app by analyzing window titles from recent OCR captures
  */
-async function _detectAppByWindowTitle(appName) {
+async function _detectAppByWindowTitle(appName, signal = null) {
   try {
     // Get recent OCR data from user-memory service
     const { screenCapture } = require('./screen.capture.cjs');
-    const recentCapture = await screenCapture({ recent: true });
-    
+    const recentCapture = await screenCapture({ recent: true, signal });
+    if (_captureFatal(recentCapture)) return { detected: false, fatal: true, error: recentCapture.error };
     if (!recentCapture.success || !recentCapture.text) {
       logger.debug(`[app.agent] _detectAppByWindowTitle: no recent OCR data available`);
       return { detected: false };
@@ -5907,14 +5941,15 @@ function _computeOCRSimilarity(text1, text2) {
  * Generic app detection by comparing OCR states before and after attempting to focus the app
  * This works for any macOS application without requiring hardcoded mappings
  */
-async function _detectAppByOCRDifference(appName) {
+async function _detectAppByOCRDifference(appName, signal = null) {
   try {
     logger.debug(`[app.agent] _detectAppByOCRDifference: starting detection for "${appName}"`);
-    
+    if (signal?.aborted) return { detected: false, method: 'ocr-delta', aborted: true };
+
     // 1. Capture baseline OCR state
     const { screenCapture } = require('./screen.capture.cjs');
-    const baseline = await screenCapture({ recent: true });
-    
+    const baseline = await screenCapture({ recent: true, signal });
+    if (_captureFatal(baseline)) return { detected: false, method: 'ocr-delta', fatal: true, error: baseline.error };
     if (!baseline.success || !baseline.text) {
       logger.debug(`[app.agent] _detectAppByOCRDifference: no baseline OCR available`);
       return { detected: false, method: 'ocr-delta', error: 'No baseline OCR' };
@@ -5947,8 +5982,9 @@ async function _detectAppByOCRDifference(appName) {
     }
     
     // 5. Capture post-focus OCR state
-    const afterFocus = await screenCapture({ recent: true });
-    
+    if (signal?.aborted) return { detected: false, method: 'ocr-delta', aborted: true };
+    const afterFocus = await screenCapture({ recent: true, signal });
+    if (_captureFatal(afterFocus)) return { detected: false, method: 'ocr-delta', fatal: true, error: afterFocus.error };
     if (!afterFocus.success || !afterFocus.text) {
       logger.debug(`[app.agent] _detectAppByOCRDifference: no post-focus OCR available`);
       return { detected: false, method: 'ocr-delta', error: 'No post-focus OCR' };
@@ -5997,7 +6033,7 @@ async function _detectAppByOCRDifference(appName) {
   }
 }
 
-async function actionExecuteShortcut({ appName, action, shortcutAction, shortcutOverride, verifyWith, skipFocusCheck = false }) {
+async function actionExecuteShortcut({ appName, action, shortcutAction, shortcutOverride, verifyWith, skipFocusCheck = false, signal = null }) {
   // The skill dispatcher strips args.action for routing, so plan steps carry
   // the semantic shortcut name as shortcutAction (e.g. 'focus_ai').
   if (!action && shortcutAction) action = shortcutAction;
@@ -6017,7 +6053,7 @@ async function actionExecuteShortcut({ appName, action, shortcutAction, shortcut
   }
 
   if (appName && !skipFocusCheck) {
-    const focusResult = await verifyAppFocused({ appName, waitMs: 5000 });
+    const focusResult = await verifyAppFocused({ appName, waitMs: 5000, signal });
     if (!focusResult.focused) {
       return { ok: false, error: `App not focused: expected "${appName}", currently "${focusResult.appName}"`, focusResult };
     }
@@ -6085,9 +6121,10 @@ async function actionExecuteShortcut({ appName, action, shortcutAction, shortcut
     const target = verifyWith.toLowerCase();
     let lastText = '';
     for (let attempt = 0; attempt < 6; attempt++) {
+      if (signal?.aborted) return { ok: false, aborted: true, cancelled: true, dispatched: true, shortcut: shortcutStr };
       let live;
       try {
-        live = await _withCaptureWindow(() => screenCapture({}));
+        live = await _withCaptureWindow(() => screenCapture({ signal }));
       } catch (capErr) {
         logger.warn(`[app.agent] actionExecuteShortcut: live capture failed (attempt ${attempt + 1}): ${capErr.message}`);
       }
@@ -6465,7 +6502,7 @@ async function actionNavigateUrl({ url, appName, via = 'auto', newTab, sessionId
   };
 
   const doType = async () => {
-    const focusResult = await verifyAppFocused({ appName: appName || 'browser', waitMs: 5000 });
+    const focusResult = await verifyAppFocused({ appName: appName || 'browser', waitMs: 5000, signal });
     if (!focusResult.focused) {
       return { ok: false, error: `Browser not focused: currently "${focusResult.appName}"` };
     }
@@ -6620,7 +6657,10 @@ async function actionScanPage({ appName, url, category, maxWaitMs = 10000, useCa
   //    for cache matching. The old order served "latest fresh copy" for
   //    url=null — observed: a Google task was synthesized from a 2-min-old
   //    Amazon copy because the cache key matched nothing and 'latest' won.
-  const focusResult = await verifyAppFocused({ appName: appName || 'browser', waitMs: 5000 });
+  const focusResult = await verifyAppFocused({ appName: appName || 'browser', waitMs: 5000, signal });
+  if (focusResult.fatal || _captureFatal(focusResult)) {
+    return { ok: false, error: focusResult.error || 'screen_recording_permission_denied', fatal: true };
+  }
   if (!focusResult.focused) {
     return { ok: false, error: `Browser not focused: currently "${focusResult.appName}"`, focusResult };
   }
@@ -6692,7 +6732,10 @@ async function actionScanPage({ appName, url, category, maxWaitMs = 10000, useCa
     _pageCopyEst.ABSOLUTE_MIN_CHARS,
   );
   if (last.content.length < _minNeeded) {
-    const ocr = await getRecentOCR({ appName: resolvedApp, liveOverlayHidden: true }).catch(() => null);
+    const ocr = await getRecentOCR({ appName: resolvedApp, liveOverlayHidden: true, signal }).catch(() => null);
+    if (ocr?.fatal || _captureFatal(ocr)) {
+      return { ok: false, error: ocr.error || 'screen_recording_permission_denied', fatal: true };
+    }
     const ocrText = (ocr?.text || '').trim();
     if (ocrText.length > last.content.length) {
       logger.info(`[app.agent] scan_page: clipboard thin (${last.content.length} chars) — OCR fallback recovered ${ocrText.length} chars (${ocr?.source || 'db'})`);
@@ -6731,9 +6774,9 @@ async function actionScanPage({ appName, url, category, maxWaitMs = 10000, useCa
  * readable URL (Firefox AppleScript gap) we leave the tab rather than risk
  * closing the user's page.
  */
-async function _closeTabIfOurs({ url, pageUrl, appName }) {
+async function _closeTabIfOurs({ url, pageUrl, appName, signal = null }) {
   try {
-    const focusResult = await verifyAppFocused({ appName: appName || 'browser', waitMs: 1500 });
+    const focusResult = await verifyAppFocused({ appName: appName || 'browser', waitMs: 1500, signal });
     if (!focusResult.focused) return { closed: false, note: 'browser-not-focused' };
     const resolvedApp = focusResult.appName || appName;
 
@@ -6774,7 +6817,7 @@ async function _closeTabIfOurs({ url, pageUrl, appName }) {
  */
 async function actionReadUrl({ url, cleanup = 'deselect', appName, minChars, maxWaitMs = 12000,
                                httpFirst = true, crawlFallback = true, fallbackUrls,
-                               useCache = true, ttlMs, captureHtml = false, sessionId, agentId } = {}) {
+                               useCache = true, ttlMs, captureHtml = false, sessionId, agentId, signal = null } = {}) {
   if (!url || !/^https?:\/\//i.test(String(url).trim())) {
     return { ok: false, error: 'read_url requires a valid http(s) url', reason: 'invalid-url' };
   }
@@ -6828,20 +6871,21 @@ async function actionReadUrl({ url, cleanup = 'deselect', appName, minChars, max
       }
     }
   } catch (_) { /* session lookup unavailable — keep caller's sessionId */ }
-  const nav = await actionNavigateUrl({ url, appName, via: 'open', sessionId: readSid, agentId });
+  const nav = await actionNavigateUrl({ url, appName, via: 'open', sessionId: readSid, agentId, signal });
   if (nav.ok) {
     navUsedUserTab = nav.via === 'type'; // cross-fallback navigated the user's current tab
     scan = await actionScanPage({
       appName, url, useCache: false, maxWaitMs, captureHtml,
       sessionId: nav.sessionId || readSid, agentId,
       deselect: cleanup !== 'close',   // closing discards the selection anyway
+      signal,
     });
   }
 
   let closed = false;
   let closeNote = null;
   if (cleanup === 'close' && nav.ok && !navUsedUserTab) {
-    const c = await _closeTabIfOurs({ url, pageUrl: scan.url || null, appName });
+    const c = await _closeTabIfOurs({ url, pageUrl: scan.url || null, appName, signal });
     closed = c.closed; closeNote = c.note;
   }
 
@@ -7104,7 +7148,7 @@ async function actionNavTask({ task, service, url, escalate = true, browseFallba
  * text+content keeps both the app.agent and screen.capture synthesize
  * collectors working.
  */
-async function actionReadScreen({ maxWaitMs = 15000 } = {}) {
+async function actionReadScreen({ maxWaitMs = 15000, signal = null } = {}) {
   // 1. Passive frontmost-app detect. When the overlay itself is frontmost,
   //    active-win can't see the user's app — resolve via the monitor heartbeat
   //    (memory.getActiveAppContext skips overlay entries).
@@ -7122,7 +7166,7 @@ async function actionReadScreen({ maxWaitMs = 15000 } = {}) {
   //    explicitly so scan_page's verifyAppFocused is a no-op focus on the
   //    already-frontmost app rather than a 'browser' → Chrome remap.
   if (appName && _isBrowserApp(appName)) {
-    const scan = await actionScanPage({ appName, maxWaitMs });
+    const scan = await actionScanPage({ appName, maxWaitMs, signal });
     if (scan.ok) {
       logger.info(`[app.agent] read_screen: browser_scan — ${scan.chars} chars from "${appName}" url=${scan.url || '(unknown)'}`);
       return {
@@ -7136,7 +7180,7 @@ async function actionReadScreen({ maxWaitMs = 15000 } = {}) {
   }
 
   // 3. OCR tier — DB cache (<3s) with getRecentOCR's own live-capture fallback.
-  const ocr = await getRecentOCR({ appName, liveOverlayHidden: true }).catch(() => null);
+  const ocr = await getRecentOCR({ appName, liveOverlayHidden: true, signal }).catch(() => null);
   const ocrText = (ocr?.text || '').trim();
   if (ocrText) {
     const via = ocr.source === 'live' ? 'ocr_live' : 'ocr_cache';
@@ -7152,7 +7196,7 @@ async function actionReadScreen({ maxWaitMs = 15000 } = {}) {
   //    return empty without throwing when no targetApp was detected).
   try {
     const { screenCapture } = require('./screen.capture.cjs');
-    const live = await _withOverlayHidden(() => screenCapture({}));
+    const live = await _withOverlayHidden(() => screenCapture({ signal }));
     if (live?.success && live.text) {
       logger.info(`[app.agent] read_screen: ocr_live (direct) — ${live.text.length} chars app="${live.appName || appName || 'unknown'}"`);
       return {
@@ -7171,8 +7215,8 @@ async function actionReadScreen({ maxWaitMs = 15000 } = {}) {
  * actionPrintPage — Cmd+P → Enter in the focused app. Best-effort: there is
  * no deterministic way to verify a print job from outside the app.
  */
-async function actionPrintPage({ appName } = {}) {
-  const focusResult = await verifyAppFocused({ appName: appName || 'browser', waitMs: 5000 });
+async function actionPrintPage({ appName, signal = null } = {}) {
+  const focusResult = await verifyAppFocused({ appName: appName || 'browser', waitMs: 5000, signal });
   if (!focusResult.focused) {
     return { ok: false, error: `App not focused: currently "${focusResult.appName}"`, focusResult };
   }
@@ -7229,7 +7273,7 @@ function _parseTypeTextSegments(text) {
   return segments;
 }
 
-async function actionTypeText({ text, appName, delayMs = 0 } = {}) {
+async function actionTypeText({ text, appName, delayMs = 0, signal = null } = {}) {
   if (!text && text !== '') {
     return { ok: false, error: 'text is required' };
   }
@@ -7237,7 +7281,7 @@ async function actionTypeText({ text, appName, delayMs = 0 } = {}) {
   const resolvedDelayMs = Math.min(500, Math.max(0, parseInt(delayMs ?? 0, 10)));
 
   if (appName) {
-    const focusResult = await verifyAppFocused({ appName, waitMs: 5000 });
+    const focusResult = await verifyAppFocused({ appName, waitMs: 5000, signal });
     if (!focusResult.focused) {
       return { ok: false, error: `App not focused: expected "${appName}", currently "${focusResult.appName}"`, focusResult };
     }
@@ -7389,7 +7433,7 @@ async function _executeShortcutWithFallback({ appName, action, category }) {
   return result;
 }
 
-async function actionRunAgent({ appName, task, filePath, prompt, maxDurationMs = 300000 } = {}) {
+async function actionRunAgent({ appName, task, filePath, prompt, maxDurationMs = 300000, signal = null } = {}) {
   if (!appName) {
     return { ok: false, error: 'appName is required' };
   }
@@ -7422,13 +7466,14 @@ async function actionRunAgent({ appName, task, filePath, prompt, maxDurationMs =
   let attemptHistory = [];
 
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    if (signal?.aborted) return { ok: false, aborted: true, cancelled: true, attemptHistory };
     if (attempt > 0) {
       logger.info(`[app.agent] actionRunAgent: retry attempt ${attempt}/${MAX_RETRIES} for ${appName} — last error: ${lastError?.slice(0, 120)}`);
-      await _sleep(retryDelays[attempt - 1] || 2000);
+      await _sleep(retryDelays[attempt - 1] || 2000, signal);
     }
 
     // 1. Verify app focused.
-    const focusResult = await verifyAppFocused({ appName, waitMs: 5000 });
+    const focusResult = await verifyAppFocused({ appName, waitMs: 5000, signal });
     if (!focusResult.focused) {
       lastError = `App not focused: ${appName}`;
       attemptHistory.push({ step: 'focus', attempt, error: lastError });

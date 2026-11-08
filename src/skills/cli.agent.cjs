@@ -1160,6 +1160,176 @@ async function agentWebFetch(url) {
   return '';
 }
 
+// ── LLM action extraction + validation ─────────────────────────────────────
+// Every loop turn passes responseFormat {type:'json_object'} so schema-capable
+// providers CANNOT emit the malformed outputs that burned 5/12 nylas turns
+// (double-JSON, control chars, degenerate "{"). Providers without JSON-mode
+// degrade gracefully (the backend retries the request without it on 400) and
+// this extraction chain is the safety net for them:
+//   balanced-brace JSON candidates → sanitize → DSML tool-call → field regex.
+const LOOP_RESPONSE_FORMAT = { type: 'json_object' };
+
+// Yield each complete top-level {…} substring, tracking string/escape state so
+// braces inside string values don't break the scan. The old greedy /\{[\s\S]*\}/
+// match swallowed TWO concatenated objects and failed to parse either.
+function* _jsonCandidates(src) {
+  let depth = 0, start = -1, inStr = false, esc = false;
+  for (let i = 0; i < src.length; i++) {
+    const c = src[i];
+    if (inStr) {
+      if (esc) esc = false;
+      else if (c === '\\') esc = true;
+      else if (c === '"') inStr = false;
+      continue;
+    }
+    if (c === '"') inStr = true;
+    else if (c === '{') { if (depth === 0) start = i; depth++; }
+    else if (c === '}' && depth > 0) {
+      depth--;
+      if (depth === 0 && start >= 0) yield src.slice(start, i + 1);
+    }
+  }
+}
+
+// DeepSeek-class providers sometimes emit native DSML tool-call syntax instead
+// of the JSON contract (observed: <｜｜DSML｜｜ invoke name="run_shell">
+// <｜｜DSML｜｜ parameter name="script" string="true">…</｜｜DSML｜｜ parameter> —
+// full-width pipes). Salvage the action so those turns aren't lost.
+function _parseDsmlAction(raw) {
+  const src = String(raw || '');
+  if (!/invoke\s+name="/i.test(src)) return null;
+  const m = src.match(/invoke\s+name="([^"]+)"/);
+  if (!m) return null;
+  const action = { action: m[1] };
+  for (const pm of src.matchAll(/parameter\s+name="([^"]+)"[^>]*>([\s\S]*?)<\//g)) {
+    const k = pm[1];
+    let v = pm[2].trim();
+    if (k === 'argv' || k === 'subcmd' || k === 'options') {
+      try { v = JSON.parse(v); } catch (_) { v = v ? v.split(/\s+/) : []; }
+    }
+    action[k] = v;
+  }
+  return action;
+}
+
+function _extractAction(llmRaw) {
+  const src = String(llmRaw || '');
+  if (!src.trim()) return null;
+  for (const cand of _jsonCandidates(src)) {
+    try {
+      const o = JSON.parse(cand);
+      if (o && typeof o.action === 'string') return o;
+    } catch (_) {
+      try {
+        const sanitized = cand
+          .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f]/g, '')   // strip control chars
+          .replace(/\\'/g, "'")                              // \' → '
+          .replace(/\n/g, '\\n')                             // unescaped newlines
+          .replace(/\r/g, '\\r')                             // unescaped CRs
+          .replace(/\t/g, '\\t')                             // unescaped tabs
+          .replace(/,\s*([\]}])/g, '$1');                    // trailing commas
+        const o = JSON.parse(sanitized);
+        if (o && typeof o.action === 'string') return o;
+      } catch (_) {}
+    }
+  }
+  const dsml = _parseDsmlAction(src);
+  if (dsml && typeof dsml.action === 'string') return dsml;
+  // Last resort: field-level recovery from a truncated object. Arg validation
+  // happens afterward — a bare "action" salvage can't spawn arg-less commands.
+  const actionMatch = src.match(/"action"\s*:\s*"([^"]+)"/);
+  if (actionMatch) {
+    const action = { action: actionMatch[1] };
+    for (const [key, re] of [
+      ['question', /"question"\s*:\s*"((?:[^"\\]|\\.)*)"/],
+      ['script', /"script"\s*:\s*"((?:[^"\\]|\\.)*)"/],
+      ['cmd', /"cmd"\s*:\s*"((?:[^"\\]|\\.)*)"/],
+      ['query', /"query"\s*:\s*"((?:[^"\\]|\\.)*)"/],
+      ['url', /"url"\s*:\s*"((?:[^"\\]|\\.)*)"/],
+      ['text', /"text"\s*:\s*"((?:[^"\\]|\\.)*)"/],
+      ['summary', /"summary"\s*:\s*"((?:[^"\\]|\\.)*)"/],
+      ['result', /"result"\s*:\s*"((?:[^"\\]|\\.)*)"/],
+    ]) {
+      const fm = src.match(re);
+      if (fm) action[key] = fm[1].replace(/\\"/g, '"').replace(/\\n/g, '\n');
+    }
+    const arrM = src.match(/"(argv|subcmd|options)"\s*:\s*(\[[\s\S]*?\])/);
+    if (arrM) { try { action[arrM[1]] = JSON.parse(arrM[2]); } catch (_) {} }
+    return action;
+  }
+  return null;
+}
+
+// Naive shell-word splitter — models sometimes emit {"action":"run_cmd",
+// "cmd":"email search Wendal --json"} instead of argv. Splits on whitespace
+// outside quotes so the string can be used as argv.
+function _splitCmdLine(s) {
+  const out = [];
+  const re = /"([^"]*)"|'([^']*)'|(\S+)/g;
+  let m;
+  while ((m = re.exec(String(s || ''))) !== null) out.push(m[1] ?? m[2] ?? m[3]);
+  return out;
+}
+
+// Required fields per action — a parseable-but-argless action used to spawn a
+// bare binary (observed: regex fallback recovered run_cmd with argv=[] → bare
+// `nylas` printed its banner twice and counted as "success").
+function _actionValidationError(action, mode) {
+  if (!action || typeof action.action !== 'string' || !action.action) return 'an "action" field';
+  switch (action.action) {
+    case 'run_cmd':
+      if (mode === 'generic') {
+        return (action.cmd && String(action.cmd).trim()) ? null : '"cmd" (the binary to run)';
+      }
+      return ((Array.isArray(action.argv) && action.argv.length > 0) || (action.cmd && String(action.cmd).trim()))
+        ? null : '"argv" (non-empty array of arguments — the binary itself is added automatically)';
+    case 'run_shell':  return (action.script && String(action.script).trim()) ? null : '"script"';
+    case 'run_help':   return (mode === 'generic' && !(action.bin || action.cmd)) ? '"bin" (the binary whose help to read)' : null;
+    case 'pty_exec':   return (action.cmd && String(action.cmd).trim()) ? null : '"cmd"';
+    case 'pty_send':   return (action.text !== undefined || action.ctrl) ? null : '"text" or "ctrl"';
+    case 'web_search': return (action.query && String(action.query).trim()) ? null : '"query"';
+    case 'web_fetch':  return (action.url && String(action.url).trim()) ? null : '"url"';
+    case 'ask_user':   return (action.question && String(action.question).trim()) ? null : '"question"';
+    case 'done': case 'run_update': return null;
+    default: return null; // unknown actions hit the 'unknown action' observation below
+  }
+}
+
+// Bare-CLI banner detector — a bare invocation's usage/commands dump is NOT
+// task output even though it exits 0 (observed: bare `nylas` counted as
+// success). Short output starting with a usage block, no data shape.
+function _looksLikeBanner(s) {
+  const t = String(s || '').trim();
+  return t.length > 0 && t.length < 1500 && /\busage:/i.test(t) && /\bcommands?:\s/i.test(t);
+}
+
+// stdout that "succeeded" but carries nothing — `[]`, `{}`, or empty. List/
+// search CLIs default-limit results (nylas `email list` → --limit 10), so an
+// empty page is not proof of "no matches".
+function _isEmptyResult(s) {
+  const t = String(s || '').trim();
+  return t === '' || t === '[]' || t === '{}';
+}
+
+// Fire-and-forget POST of a turn_live event to the overlay progress URL —
+// same shape the loops inline; used for the stall "researching" signal.
+function _postTurnLive(cbUrl, payload) {
+  if (!cbUrl) return;
+  try {
+    const http = require('http');
+    const body = JSON.stringify(payload);
+    const req = http.request({
+      hostname: '127.0.0.1', port: parseInt(new URL(cbUrl).port, 10),
+      path: new URL(cbUrl).pathname + new URL(cbUrl).search,
+      method: 'POST', timeout: 2000,
+      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
+    });
+    req.on('error', () => {});
+    req.write(body);
+    req.end();
+  } catch (_) {}
+}
+
 // Builds the systemInstructions for a loop turn: loop prompt + trimmed descriptor.
 // Descriptor is placed in system (not user) to avoid WS bridge prompt-field size limits.
 function buildTurnSystemPrompt(descriptor, learnedRules, userContext) {
@@ -1676,6 +1846,24 @@ async function actionRun({ cli, argv = [], cwd, env, timeoutMs, stdin, agentId, 
     // so the LLM doesn't burn all turns re-running near-identical failing commands.
     const failedArgvSigs = new Map(); // JSON.stringify(argv) → fail count
     let totalFailedRunCmds = 0;
+    // Stall detector — counts consecutive non-progressing turns (parse errors,
+    // arg-less actions, non-zero exits, empty/banner results). At 3+, the next
+    // observation carries a forced research steer (run_help → web_search/web_fetch)
+    // and the UI gets a "researching" turn_live so a stuck loop doesn't spin silently.
+    let _stallScore = 0;
+    const _RESEARCH_ACTIONS = new Set(['run_help', 'web_search', 'web_fetch']);
+    // Docs pointer for the steer — a "Documentation:" line in the descriptor
+    // body first (nylas: https://cli.nylas.com/), else frontmatter setupUrl.
+    const _docsUrl = (agent.descriptor || '').match(/Documentation:\s*(https?:\/\/\S+)/i)?.[1]
+      || (agent.descriptor || '').match(/^setupUrl:\s*(\S+)/m)?.[1]
+      || null;
+    const _stallSteer = () => `[STALLED — ${_stallScore} non-progressing turns. RESEARCH before retrying: run_help on the relevant subcommand reads this CLI's own docs (authoritative); web_search/web_fetch reach the official docs${_docsUrl ? ` (${_docsUrl})` : ''}. Check flag VALUE TYPES (does the flag want an email address, not a name?), flag defaults, and pagination/--limit.]\n`;
+    const _emitStalled = (turn) => {
+      if (_stallScore !== 3) return;
+      logger.warn(`[cli.agent] loop turn=${turn} stalled (${_stallScore}) — steering to research`, { agentId });
+      _postTurnLive(_progressCallbackUrl, { type: 'agent:turn_live', agentId, turn, maxTurns: MAX_TURNS, stepIndex: _stepIndex ?? 0, currentAction: 'researching', stalled: true });
+    };
+    const _bumpStall = (turn) => { _stallScore++; _emitStalled(turn); };
 
     // ── Resume context injection ──────────────────────────────────────────────
     // When main.js resumes after an ask_user pause, it appends a [Resume context:]
@@ -1813,50 +2001,36 @@ async function actionRun({ cli, argv = [], cwd, env, timeoutMs, stdin, agentId, 
       const turnUser = buildTurnPrompt(loopTask, loopHistory);
       logger.info(`[cli.agent] loop turn=${turn} syschars=${turnSys.length} userchars=${turnUser.length}`, { agentId, task: loopTask });
 
-      const llmRaw = await callLLM(turnSys, turnUser, { temperature: 0.1, maxTokens: 400 });
+      // responseFormat json_object: schema-capable providers can't emit the
+      // double-JSON/degenerate outputs that burned nylas turns 4-5+9 — the
+      // extraction chain below covers providers that ignore/degrade it.
+      const llmRaw = await callLLM(turnSys, turnUser, { temperature: 0.1, maxTokens: 400, responseFormat: LOOP_RESPONSE_FORMAT });
 
       logger.info(`[cli.agent] loop turn=${turn} llmRaw=${llmRaw === null ? 'NULL' : `"${(llmRaw || '').slice(0, 300)}"`}`, { agentId });
 
-      let action = null;
-      if (llmRaw) {
-        try {
-          // Greedy match — finds outermost { ... } even with nested braces
-          const m = llmRaw.match(/\{[\s\S]*\}/);
-          if (m) action = JSON.parse(m[0]);
-        } catch (parseErr) {
-          logger.warn(`[cli.agent] loop turn=${turn} JSON parse failed: ${parseErr.message} — attempting sanitize`, { agentId });
-          // ── Fallback: sanitize common LLM JSON errors and retry ──────────
-          try {
-            const m = llmRaw.match(/\{[\s\S]*\}/);
-            if (m) {
-              const sanitized = m[0]
-                .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f]/g, '')   // strip control chars
-                .replace(/\\'/g, "'")                              // \' → '
-                .replace(/\n/g, '\\n')                             // unescaped newlines
-                .replace(/\r/g, '\\r')                             // unescaped CRs
-                .replace(/\t/g, '\\t')                             // unescaped tabs
-                .replace(/,\s*([\]}])/g, '$1');                    // trailing commas
-              action = JSON.parse(sanitized);
-              logger.info(`[cli.agent] loop turn=${turn} JSON sanitize recovered action=${action?.action}`, { agentId });
-            }
-          } catch (_sanitizeErr) {
-            // ── Last resort: regex-extract action + question for ask_user ──
-            const actionMatch = llmRaw.match(/"action"\s*:\s*"([^"]+)"/);
-            const questionMatch = llmRaw.match(/"question"\s*:\s*"((?:[^"\\]|\\.)*)"/);
-            if (actionMatch) {
-              action = { action: actionMatch[1] };
-              if (questionMatch) action.question = questionMatch[1].replace(/\\"/g, '"').replace(/\\n/g, '\n');
-              logger.info(`[cli.agent] loop turn=${turn} regex fallback recovered action=${action.action}`, { agentId });
-            } else {
-              logger.warn(`[cli.agent] loop turn=${turn} all parse fallbacks failed`, { agentId });
-            }
-          }
+      let action = _extractAction(llmRaw);
+      let _actionErr = action ? _actionValidationError(action, 'descriptor') : 'a JSON action object';
+
+      // Malformed output or arg-less action → ONE corrected retry inside the
+      // same turn instead of burning it. The correction names the exact defect
+      // so the model knows what to fix (deepseek's DSML turns recovered this way).
+      if (!action || _actionErr) {
+        const _why = !action
+          ? 'your previous reply was not a parseable JSON action object'
+          : `your "${action.action}" action is missing ${_actionErr}`;
+        logger.warn(`[cli.agent] loop turn=${turn} ${!action ? 'parse_error' : `invalid action (${_actionErr})`} — in-place retry`, { agentId });
+        const _retryRaw = await callLLM(turnSys, `${turnUser}\n\n[CORRECTION] ${_why} — output exactly ONE JSON action object with all required fields.`, { temperature: 0.1, maxTokens: 400, responseFormat: LOOP_RESPONSE_FORMAT });
+        logger.info(`[cli.agent] loop turn=${turn} retry llmRaw=${_retryRaw === null ? 'NULL' : `"${(_retryRaw || '').slice(0, 300)}"`}`, { agentId });
+        if (_retryRaw) {
+          action = _extractAction(_retryRaw);
+          _actionErr = action ? _actionValidationError(action, 'descriptor') : 'a JSON action object';
         }
       }
 
-      if (!action || !action.action) {
-        logger.warn(`[cli.agent] loop turn=${turn} parse_error — no valid action in LLM output`, { agentId });
-        loopHistory.push({ turn, action: 'parse_error', observation: `LLM output: ${(llmRaw || 'NULL').slice(0, 200)}` });
+      if (!action || _actionErr) {
+        _bumpStall(turn);
+        logger.warn(`[cli.agent] loop turn=${turn} parse_error persists after retry`, { agentId });
+        loopHistory.push({ turn, action: 'parse_error', observation: `${_stallScore >= 3 ? _stallSteer() : ''}LLM output: ${(llmRaw || 'NULL').slice(0, 200)} — output a single JSON action object${action ? `; your "${action.action}" was missing ${_actionErr}` : ''}.` });
         continue;
       }
 
@@ -2069,11 +2243,18 @@ async function actionRun({ cli, argv = [], cwd, env, timeoutMs, stdin, agentId, 
       }
 
       let observation = '';
+      // Set true by branches that produced real output this turn — the
+      // fall-through stall check below resets the score on progress and
+      // bumps it on failures/empty results. Research actions skip scoring
+      // entirely (the steer asked for them; penalizing would fight itself).
+      let _productive = false;
 
       if (action.action === 'run_cmd') {
         // Detect long-running gcloud commands and extend the timeout accordingly.
         // `gcloud services enable` can take 60-180s for API activation.
-        const _argv = action.argv || [];
+        // argv from the array field, or split from a cmd string the model
+        // emitted instead — arg-less forms were already rejected by validation.
+        const _argv = (Array.isArray(action.argv) && action.argv.length) ? action.argv : _splitCmdLine(action.cmd);
         const _isGcloudServicesEnable = (
           agentId.toLowerCase().includes('gcloud') &&
           _argv[0] === 'services' && _argv[1] === 'enable'
@@ -2084,9 +2265,10 @@ async function actionRun({ cli, argv = [], cwd, env, timeoutMs, stdin, agentId, 
         // it runs. Blocked installs return an observation, not a spawn.
         const _inst = await _gateGlobalInstalls(require('path').basename(currentBinPath), _argv, { serviceKey: cliTool || agentId });
         if (_inst.blocked.length) {
+          _bumpStall(turn);
           observation = `[GLOBAL INSTALL BLOCKED] ${_inst.blocked.map(b => `${b.mgr} install ${b.pkg} — ${b.why}`).join('; ')}. Do NOT retry this install; verify the real package name against the service's docs or ask_user.`;
           logger.warn(`[cli.agent] loop turn=${turn} blocked global install: ${observation.slice(0, 200)}`, { agentId });
-          loopHistory.push({ turn, ...action, observation: observation.slice(0, OBSERVATION_CHARS) });
+          loopHistory.push({ turn, ...action, observation: ((_stallScore >= 3 ? _stallSteer() : '') + observation).slice(0, OBSERVATION_CHARS) });
           transcript.push({ turn, action, outcome: { ok: false, error: 'global-install-blocked' }, thoughts: action.thinking || null });
           continue;
         }
@@ -2115,6 +2297,18 @@ async function actionRun({ cli, argv = [], cwd, env, timeoutMs, stdin, agentId, 
           _trackOutput(cmdResult.stdout);
           transcript.push({ turn, action, outcome: { ok: true, result: cmdResult.stdout.slice(0, 300) }, thoughts: action.thinking || null });
           observation = `exitCode=0 stdout="${cmdResult.stdout.slice(0, 800)}"`;
+          // Stall classification — an empty page or the CLI's own banner is a
+          // "success" that produced nothing; either one feeds the stall steer.
+          if (_isEmptyResult(cmdResult.stdout)) {
+            _bumpStall(turn);
+            observation += `\n[EMPTY RESULT — the command succeeded but returned nothing. List/search commands often default-limit or paginate (nylas "email list" defaults to --limit 10): try a search subcommand, a larger --limit, or --all before concluding there are no matches.]`;
+          } else if (_looksLikeBanner(cmdResult.stdout)) {
+            _bumpStall(turn);
+            observation += `\n[NOTE: this output is the CLI's own help/banner — a bare invocation, NOT your task's action. Provide the real subcommand + arguments.]`;
+          } else {
+            _stallScore = 0;
+          }
+          if (_stallScore >= 3) observation = _stallSteer() + observation;
           loopHistory.push({ turn, ...action, observation: observation.slice(0, OBSERVATION_CHARS) });
           continue; // transcript already pushed above; skip bottom push
         } else {
@@ -2219,6 +2413,7 @@ async function actionRun({ cli, argv = [], cwd, env, timeoutMs, stdin, agentId, 
         if (!loopMeta) loopMeta = await lookupServiceAsync(cliTool);
         const updateR = await agentRunUpdate(cliTool, loopMeta);
         if (updateR.ok) {
+          _productive = true;
           const newBin = await whichCli(cliTool);
           if (newBin) currentBinPath = newBin;
           // Auto-retry the last failed run_cmd with the fresh binary — saves a full LLM turn.
@@ -2276,7 +2471,7 @@ async function actionRun({ cli, argv = [], cwd, env, timeoutMs, stdin, agentId, 
               // Prefer the raw delta stream — the rendered viewport shows only
               // the last ~24 rows, hiding bulk output (dumps, listings).
               const _ptyOut = _ptyDeltaText(r.delta, String(action.cmd || '')) || (r.screen || '');
-              if (r.exitCode === 0) _trackOutput(_ptyOut);
+              if (r.exitCode === 0) { _trackOutput(_ptyOut); _productive = true; }
               const _ptyTail = _ptyOut.length > RUN_HELP_CHARS
                 ? `${_ptyOut.slice(0, RUN_HELP_CHARS >> 1)}\n…[${_ptyOut.length - RUN_HELP_CHARS} chars omitted]…\n${_ptyOut.slice(-(RUN_HELP_CHARS >> 1))}`
                 : _ptyOut;
@@ -2307,6 +2502,7 @@ async function actionRun({ cli, argv = [], cwd, env, timeoutMs, stdin, agentId, 
               r = await terminalAgent({ action: 'send', sessionId: sid, text: `${text}\n` });
             }
             if (r.ok) {
+              _productive = true;
               // let the program echo/process the input before reading the screen
               await new Promise(res => setTimeout(res, 400));
               const rd = await terminalAgent({ action: 'read', sessionId: sid, mode: 'screen' });
@@ -2346,6 +2542,7 @@ async function actionRun({ cli, argv = [], cwd, env, timeoutMs, stdin, agentId, 
             const _shellR = await shellRun({ cmd: _interp, argv: [_interpFlag, _script], cwd: _resolveCwd(action.cwd, cwd), timeoutMs: 15000 });
             const _combined = [_shellR.stdout || '', _shellR.stderr || ''].filter(Boolean).join('\n').trim();
             if (_shellR.exitCode === 0) _trackOutput(_shellR.stdout || _combined);
+            if (_shellR.exitCode === 0 && _combined) _productive = true;
             // When probe returns the same short error as the original failure (< 60 chars),
             // the LLM has no new information. Enrich with a diagnostic hint so it knows
             // the input type may be wrong (not just dead) and suggests ytsearch3: recovery.
@@ -2364,6 +2561,13 @@ async function actionRun({ cli, argv = [], cwd, env, timeoutMs, stdin, agentId, 
         observation = `unknown action: ${action.action}`;
       }
 
+      // Fall-through stall accounting (the exitCode===0 run_cmd branch above
+      // classifies itself and continues early). Research actions are neutral —
+      // the steer asked for them, so they don't bump or reset the score.
+      if (!_RESEARCH_ACTIONS.has(action.action)) {
+        if (_productive) _stallScore = 0; else _bumpStall(turn);
+        if (_stallScore >= 3) observation = _stallSteer() + observation;
+      }
       loopHistory.push({ turn, ...action, observation: observation.slice(0, OBSERVATION_CHARS) });
       transcript.push({ turn, action, observation: observation.slice(0, 300), outcome: { ok: false, error: observation.slice(0, 300) }, thoughts: action.thinking || null });
     }
@@ -2442,6 +2646,8 @@ Each action may include an optional "thinking" field: one sentence (max 120 char
 Rules:
 - cwd: when the task targets a specific directory or repository (a path in the task text, a repo name, "in X"), set "cwd" on every run_shell/run_cmd/pty_exec — commands otherwise run in a neutral default directory, NOT inside that repo. For git, prefer 'git -C <repo>' inside the script/argv over relying on cwd.
 - DIAGNOSE before retry: a non-zero exit gets ONE cheap probe first — never re-run an unchanged failing command.
+- PTY commands run under zsh: double-quote URLs/args containing ? & * [ ] — an unquoted ? expands as a glob and fails with "no matches found".
+- Never re-run an exact command that already succeeded this session — call done if the goal is met, or verify a different way.
 - NEVER install a package whose name you have not verified — npm view <pkg> / brew info <pkg> / pip3 index versions <pkg> FIRST. A guessed name 404s; verify, then install.
 - Missing tool → install it (brew/npm/pip3 — whatever the tool's docs say), then verify with "command -v <bin>" or "<bin> --version" before done.
 - LIBRARIES vs CLIs: npm/pip packages with no binary are LIBRARIES — "command -v" and "--version" can never verify them. Libraries install via 'npm install --prefix "$HOME/.thinkdrop/node-deps" <pkg>' or 'pip3 install --user <pkg>', and verify with 'node -e "require('"'<pkg>'"')"' / 'python3 -c "import <mod>"'. 'npm i -g' does NOT put a library on the require() path.
@@ -2468,6 +2674,19 @@ async function _genericRunLoop({ task, cwd, env, timeoutMs, _progressCallbackUrl
   const loopHistory = [];
   const transcript = [];
   const failedSigs = new Map(); // action signature → fail count
+  const succeededSigs = new Set(); // signatures that already ran clean — don't re-run (observed: recovery loop opened the same URL twice → duplicate tabs)
+  // Stall detector — same discipline as the descriptor loop: parse errors,
+  // invalid actions, and failing/empty results bump the score; at 3+ the next
+  // observation carries a forced research steer and the UI sees "researching".
+  let _stallScore = 0;
+  const _RESEARCH_ACTIONS = new Set(['run_help', 'web_search', 'web_fetch']);
+  const _stallSteer = () => `[STALLED — ${_stallScore} non-progressing turns. RESEARCH before retrying: run_help on the failing binary reads its own docs; web_search/web_fetch reach official docs pages. Check flag VALUE TYPES, flag defaults, and pagination/--limit.]\n`;
+  const _emitStalled = (turn) => {
+    if (_stallScore !== 3) return;
+    logger.warn(`[cli.agent] generic loop turn=${turn} stalled (${_stallScore}) — steering to research`);
+    _postTurnLive(_progressCallbackUrl, { type: 'agent:turn_live', agentId, turn, maxTurns: MAX_TURNS, stepIndex: _stepIndex ?? 0, currentAction: 'researching', stalled: true });
+  };
+  const _bumpStall = (turn) => { _stallScore++; _emitStalled(turn); };
   const agentId = 'cli.agent';
   // The task's data product: largest successful command output seen so far.
   // done returns this as stdout — without it the loop discards produced text
@@ -2524,17 +2743,26 @@ async function _genericRunLoop({ task, cwd, env, timeoutMs, _progressCallbackUrl
 
       const turnSys = GENERIC_LOOP_PROMPT + temporalContext;
       const turnUser = buildTurnPrompt(task, loopHistory);
-      const llmRaw = await callLLM(turnSys, turnUser, { temperature: 0.1, maxTokens: 400 });
+      const llmRaw = await callLLM(turnSys, turnUser, { temperature: 0.1, maxTokens: 400, responseFormat: LOOP_RESPONSE_FORMAT });
 
-      let action = null;
-      if (llmRaw) {
-        try {
-          const m = String(llmRaw).match(/\{[\s\S]*\}/);
-          if (m) action = JSON.parse(m[0]);
-        } catch (_) {}
+      let action = _extractAction(llmRaw);
+      let _actionErr = action ? _actionValidationError(action, 'generic') : 'a JSON action object';
+      // Same in-place retry as the descriptor loop — malformed output or an
+      // arg-less action gets one corrected attempt inside this turn.
+      if (!action || _actionErr) {
+        const _why = !action
+          ? 'your previous reply was not a parseable JSON action object'
+          : `your "${action.action}" action is missing ${_actionErr}`;
+        logger.warn(`[cli.agent] generic loop turn=${turn} ${!action ? 'parse_error' : `invalid action (${_actionErr})`} — in-place retry`);
+        const _retryRaw = await callLLM(turnSys, `${turnUser}\n\n[CORRECTION] ${_why} — output exactly ONE JSON action object with all required fields.`, { temperature: 0.1, maxTokens: 400, responseFormat: LOOP_RESPONSE_FORMAT });
+        if (_retryRaw) {
+          action = _extractAction(_retryRaw);
+          _actionErr = action ? _actionValidationError(action, 'generic') : 'a JSON action object';
+        }
       }
-      if (!action || !action.action) {
-        loopHistory.push({ turn, action: 'parse_error', observation: `LLM output: ${(llmRaw || 'NULL').slice(0, 200)} — output a single JSON action object.` });
+      if (!action || _actionErr) {
+        _bumpStall(turn);
+        loopHistory.push({ turn, action: 'parse_error', observation: `${_stallScore >= 3 ? _stallSteer() : ''}LLM output: ${(llmRaw || 'NULL').slice(0, 200)} — output a single JSON action object.` });
         continue;
       }
 
@@ -2568,10 +2796,24 @@ async function _genericRunLoop({ task, cwd, env, timeoutMs, _progressCallbackUrl
       }
 
       // Loop guard: identical failing action signature 3× → force a different approach
-      const _sig = JSON.stringify({ a: action.action, s: action.script || action.cmd || action.argv || action.url || '' });
+      // argv is part of the signature — `open urlA` and `open urlB` are
+      // different commands; only the EXACT same call dedups/fails.
+      const _sig = JSON.stringify({ a: action.action, s: action.script || action.cmd || '', argv: action.argv || null, url: action.url || '' });
       const _sigFails = failedSigs.get(_sig) || 0;
 
+      // Dedup: a signature that already SUCCEEDED once this session never
+      // re-runs (observed: the recovery loop ran the same `open <url>` twice →
+      // two browser tabs). Success is recorded per-branch below.
+      if (['run_shell', 'run_cmd', 'pty_exec'].includes(action.action) && succeededSigs.has(_sig)) {
+        loopHistory.push({ turn, ...action, observation: 'This exact command already succeeded earlier this session — do NOT repeat it. If the task goal is met, call done; otherwise verify a different way.' });
+        transcript.push({ turn, action, outcome: { ok: true, result: 'deduped-repeat' }, thoughts: action.thinking || null });
+        continue;
+      }
+
       let observation = '';
+      // Set by branches that produced real output — drives the fall-through
+      // stall check at the bottom (same discipline as the descriptor loop).
+      let _productive = false;
 
       if (action.action === 'run_shell') {
         const script = String(action.script || '').trim();
@@ -2609,13 +2851,17 @@ async function _genericRunLoop({ task, cwd, env, timeoutMs, _progressCallbackUrl
               // had already succeeded. `screen` is the fallback for TUI
               // repaints/prompts whose delta is escape codes, not text.
               const _stream = _ptyDeltaText(r.delta, script) || (r.screen || '');
-              if (r.ok && r.exitCode === 0) _trackOutput(_stream);
+              if (r.ok && r.exitCode === 0) { _trackOutput(_stream); succeededSigs.add(_sig); _productive = true; }
               const tail = _stream.length > RUN_HELP_CHARS
                 ? `${_stream.slice(0, RUN_HELP_CHARS >> 1)}\n…[${_stream.length - RUN_HELP_CHARS} chars omitted]…\n${_stream.slice(-(RUN_HELP_CHARS >> 1))}`
                 : _stream;
               observation = r.ok
                 ? `exitCode=${r.exitCode}\n${tail}`
                 : `pty ${r.error || 'timeout'} — still running. screen:\n${(r.screen || '').slice(-1500)}\nUse pty_send to answer the visible prompt.`;
+              if (r.ok && r.exitCode === 0 && _isEmptyResult(_stream)) {
+                _productive = false;
+                observation += `\n[EMPTY RESULT — succeeded but produced nothing; for list/search commands check defaults/pagination (--limit, --all) before concluding nothing exists.]`;
+              }
               if (r.prompt === 'password') {
                 observation += `\n[PASSWORD/PASSPHRASE PROMPT ON SCREEN — use ask_user to collect the credential; never guess]`;
               }
@@ -2631,8 +2877,11 @@ async function _genericRunLoop({ task, cwd, env, timeoutMs, _progressCallbackUrl
               const flag = interp === 'node' ? '-e' : '-c';
               const pr = await shellRun({ cmd: interp, argv: [flag, script], cwd: _resolveCwd(action.cwd, cwd), timeoutMs: action.timeoutMs || 30000 });
               const combined = [pr.stdout || '', pr.stderr || ''].filter(Boolean).join('\n').trim();
-              if (pr.exitCode === 0) _trackOutput(pr.stdout || combined);
+              if (pr.exitCode === 0) { _trackOutput(pr.stdout || combined); succeededSigs.add(_sig); _productive = !!combined; }
               observation = (combined || `exitCode=${pr.exitCode}`).slice(0, RUN_HELP_CHARS);
+              if (pr.exitCode === 0 && _isEmptyResult(combined)) {
+                observation += `\n[EMPTY RESULT — succeeded but produced nothing; for list/search commands check defaults/pagination (--limit, --all) before concluding nothing exists.]`;
+              }
               if (pr.exitCode !== 0) failedSigs.set(_sig, _sigFails + 1);
               logger.info(`[cli.agent] generic loop turn=${turn} run_shell interp=${interp} exitCode=${pr.exitCode} chars=${combined.length}`);
             } catch (e) {
@@ -2652,8 +2901,11 @@ async function _genericRunLoop({ task, cwd, env, timeoutMs, _progressCallbackUrl
           observation = `run_cmd: "${cmd}" is not on PATH — verify/install it first (which ${cmd}, npm view, brew info), or run it via run_shell.`;
         } else {
           const r = await spawnCapture(bin, Array.isArray(action.argv) ? action.argv : [], { cwd: _resolveCwd(action.cwd, cwd), env, timeoutMs: timeoutMs || 30000 });
-          if (r.exitCode === 0) _trackOutput(r.stdout);
+          if (r.exitCode === 0) { _trackOutput(r.stdout); succeededSigs.add(_sig); _productive = !_isEmptyResult(r.stdout); }
           observation = [`exitCode=${r.exitCode}`, r.stdout, r.stderr].filter(Boolean).join('\n').slice(0, RUN_HELP_CHARS);
+          if (r.exitCode === 0 && _isEmptyResult(r.stdout)) {
+            observation += `\n[EMPTY RESULT — succeeded but produced nothing; for list/search commands check defaults/pagination (--limit, --all) before concluding nothing exists.]`;
+          }
           if (r.exitCode !== 0) failedSigs.set(_sig, _sigFails + 1);
           logger.info(`[cli.agent] generic loop turn=${turn} run_cmd ${cmd} exitCode=${r.exitCode}`);
         }
@@ -2687,7 +2939,7 @@ async function _genericRunLoop({ task, cwd, env, timeoutMs, _progressCallbackUrl
             // Same fix as run_shell: prefer the raw delta stream over the
             // rendered viewport so bulk output is actually observable.
             const _ptyStream = _ptyDeltaText(r.delta, _ptyCmd) || (r.screen || '');
-            if (r.ok && r.exitCode === 0) _trackOutput(_ptyStream);
+            if (r.ok && r.exitCode === 0) { _trackOutput(_ptyStream); succeededSigs.add(_sig); _productive = true; }
             const _ptyTail = _ptyStream.length > RUN_HELP_CHARS
               ? `${_ptyStream.slice(0, RUN_HELP_CHARS >> 1)}\n…[${_ptyStream.length - RUN_HELP_CHARS} chars omitted]…\n${_ptyStream.slice(-(RUN_HELP_CHARS >> 1))}`
               : _ptyStream;
@@ -2709,6 +2961,7 @@ async function _genericRunLoop({ task, cwd, env, timeoutMs, _progressCallbackUrl
             if (action.ctrl) r = await terminalAgent({ action: 'send', sessionId: sid, ctrl: action.ctrl });
             else r = await terminalAgent({ action: 'send', sessionId: sid, text: `${String(action.text ?? '')}\n` });
             if (r.ok) {
+              _productive = true;
               await new Promise(res => setTimeout(res, 400));
               const rd = await terminalAgent({ action: 'read', sessionId: sid, mode: 'screen' });
               const newScreen = rd.output || '';
@@ -2756,6 +3009,12 @@ async function _genericRunLoop({ task, cwd, env, timeoutMs, _progressCallbackUrl
         } catch (_) {}
       }
 
+      // Fall-through stall accounting — research actions are neutral (the
+      // steer asked for them); exec/diagnostic turns score on _productive.
+      if (!_RESEARCH_ACTIONS.has(action.action)) {
+        if (_productive) _stallScore = 0; else _bumpStall(turn);
+        if (_stallScore >= 3) observation = _stallSteer() + observation;
+      }
       loopHistory.push({ turn, ...action, observation: observation.slice(0, OBSERVATION_CHARS) });
       transcript.push({ turn, action, observation: observation.slice(0, 300), outcome: { ok: false, error: observation.slice(0, 300) }, thoughts: action.thinking || null });
     }
@@ -3984,13 +4243,13 @@ async function actionListAllAgents() {
 // Shared: lightweight LLM caller via skill-llm.cjs (pooled WebSocket connection)
 // ---------------------------------------------------------------------------
 
-async function callLLM(systemPrompt, userQuery, { temperature = 0.2, maxTokens = 1200 } = {}) {
+async function callLLM(systemPrompt, userQuery, { temperature = 0.2, maxTokens = 1200, responseFormat = null } = {}) {
   try {
     const { askWithMessages } = require('../skill-helpers/skill-llm.cjs');
     const result = await askWithMessages([
       { role: 'system', content: systemPrompt },
       { role: 'user', content: userQuery },
-    ], { temperature, maxTokens, taskType: 'skill_step', responseTimeoutMs: 60000 });
+    ], { temperature, maxTokens, taskType: 'skill_step', responseTimeoutMs: 60000, ...(responseFormat ? { responseFormat } : {}) });
     return result || null;
   } catch (e) {
     logger.warn(`[cli.agent] callLLM failed: ${e.message}`);

@@ -79,6 +79,13 @@ function _dangerScan(text) {
   return null;
 }
 
+// Write to a live PTY only — a killed/exited session drops input silently
+// (node-pty throws EIO on a dead fd; the script shim's stdin.write EPIPEs).
+function _ptyWrite(s, d) {
+  if (!s || s.killed || s.exitCode !== null || !s.pty) return false;
+  try { s.pty.write(d); return true; } catch (_) { return false; }
+}
+
 // Input prompts that mean the run is blocked on the user — not just
 // passwords: "Client ID:", "API Key:", yes/no confirms, inquirer menus.
 // A shell prompt never ends like these; matched on the settled screen's
@@ -170,14 +177,14 @@ function actionSend(args) {
     const key = String(args.ctrl).toLowerCase();
     const byte = map[key] ?? (key.length === 1 ? String.fromCharCode(key.charCodeAt(0) - 96) : null);
     if (!byte) return { ok: false, error: `unknown-ctrl-key: ${args.ctrl}` };
-    s.pty.write(byte);
+    _ptyWrite(s, byte);
     return { ok: true };
   }
 
   const text = String(args.text ?? '');
   const danger = _dangerScan(text);
   if (danger) return { ok: false, error: danger };
-  s.pty.write(text);
+  _ptyWrite(s, text);
   return { ok: true };
 }
 
@@ -272,6 +279,7 @@ function actionWait(args) {
       const { data, offset } = s.screen.rawSince(cursor);
       cursor = offset;
       if (re && re.test(data)) return finish('match');
+      if (s.killed || s.exitCode !== null) return finish('closed');
       armIdle();
     };
 
@@ -316,9 +324,9 @@ async function actionExec(args, ctx) {
     const stuck = !!s.meta._execStuck;
     s.meta._execStuck = false;
     emitProgress(ctx.cbUrl, { type: 'terminal:activity', sessionId: s.id, kind: 'note', line: _paged ? '# pager held the foreground — sending q' : '# unsticking foreground (q, ^C)' });
-    s.pty.write('q');
+    _ptyWrite(s, 'q');
     await new Promise(r => setTimeout(r, 200));
-    if (stuck) { s.pty.write('\x03'); await new Promise(r => setTimeout(r, 300)); }
+    if (stuck) { _ptyWrite(s, '\x03'); await new Promise(r => setTimeout(r, 300)); }
     await s.screen.flush();
   }
 
@@ -331,7 +339,9 @@ async function actionExec(args, ctx) {
   // `{ ... }`) still parse. Once per session.
   const _envPfx = s.meta._pagerOff ? '' : 'export GIT_PAGER=cat PAGER=cat MANPAGER=cat; ';
   s.meta._pagerOff = true;
-  s.pty.write(`${_envPfx}${cmd}; echo "__TD_EXIT_${nonce}_$?"\n`);
+  if (!_ptyWrite(s, `${_envPfx}${cmd}; echo "__TD_EXIT_${nonce}_$?"\n`)) {
+    return { ok: false, sessionId: s.id, owned, exitCode: -1, error: 'session-closed (aborted)' };
+  }
 
   // Wait for the exit marker; resolves {saw:true,exitCode} or {saw:false} on
   // timeout. Reused by the auto-answer loop below with a short fuse.
@@ -343,6 +353,9 @@ async function actionExec(args, ctx) {
       const m = data.match(markerRe);
       if (m) { cursor = offset; finish({ exitCode: parseInt(m[1], 10), saw: true }); return; }
       cursor = offset;
+      // Session killed/exited underneath us (close() notifies listeners) —
+      // resolve immediately instead of parking until the timeout.
+      if (s.killed || s.exitCode !== null) finish({ saw: false, closed: true });
     };
     s.dataListeners.add(onData);
     const timer = setTimeout(() => finish({ saw: false }), ms);
@@ -372,7 +385,7 @@ async function actionExec(args, ctx) {
         if (hit) {
           clearInterval(check); check = null;
           clearInterval(timer);
-          s.pty.write('\x03');
+          _ptyWrite(s, '\x03');
           setTimeout(() => resolve({ saw: false, continuation: true, promptLine: hit }), 250);
         }
       }, 150);
@@ -396,7 +409,7 @@ async function actionExec(args, ctx) {
     const last = (scr.split('\n').filter(l => l.trim()).pop() || '').trim();
     if (PAGER_LINE_RE.test(last) || PAGER_SCREEN_RE.test(scr)) {
       emitProgress(ctx.cbUrl, { type: 'terminal:activity', sessionId: s.id, kind: 'auto-answer', line: 'auto-answered pager → q' });
-      s.pty.write('q');
+      _ptyWrite(s, 'q');
       const w = await waitForExit(4000);
       if (w.saw) { result.saw = true; result.exitCode = w.exitCode; }
     }
@@ -428,7 +441,7 @@ async function actionExec(args, ctx) {
         }
         break;
       }
-      s.pty.write(ans === '\r' ? '\r' : `${ans}\n`);
+      _ptyWrite(s, ans === '\r' ? '\r' : `${ans}\n`);
       autoAnswers.push({ kind: cls.kind, answered: true, line: last.slice(0, 120), answer: cls.kind === 'confirm' ? ans : '(default)' });
       emitProgress(ctx.cbUrl, {
         type: 'terminal:activity', sessionId: s.id, kind: 'auto-answer',
@@ -464,9 +477,11 @@ async function actionExec(args, ctx) {
     prompt: s.meta.prompt,
     autoAnswers: autoAnswers.length ? autoAnswers : undefined,
     error: result.saw ? undefined
-      : result.continuation
-        ? `unbalanced-quote: shell stuck at '${result.promptLine}' continuation prompt — command aborted (check for an unclosed quote/fence in the command)`
-        : `timeout after ${timeoutMs}ms`,
+      : result.closed
+        ? 'session-closed (aborted)'
+        : result.continuation
+          ? `unbalanced-quote: shell stuck at '${result.promptLine}' continuation prompt — command aborted (check for an unclosed quote/fence in the command)`
+          : `timeout after ${timeoutMs}ms`,
   };
   if (!result.continuation) emitProgress(ctx.cbUrl, {
     type: 'terminal:activity', sessionId: s.id,

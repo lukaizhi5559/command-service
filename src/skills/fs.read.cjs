@@ -43,13 +43,19 @@ const path = require('path');
 const os = require('os');
 const { execFileSync, spawnSync } = require('child_process');
 const logger = require('../logger.cjs');
+const { docRead } = require('./doc.read.cjs');
 
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
 
 const DEFAULT_MAX_DEPTH = 4;
-const DEFAULT_MAX_FILE_SIZE = 100 * 1024; // 100KB
+const DEFAULT_MAX_FILE_SIZE = 256 * 1024; // 256KB
+// Binary office/document formats need a decoder — doc.read owns those
+// (docx/xlsx/pptx/pdf/doc/rtf/odt/wordml). fs.read stays on text formats it
+// already handles raw (txt/md/html…). Planners sometimes emit fs.read on a
+// document anyway — delegate here so every caller succeeds regardless.
+const DOC_DELEGATE_EXTS = new Set(['docx', 'xlsx', 'pptx', 'pdf', 'doc', 'rtf', 'odt', 'wordml']);
 const DEFAULT_MAX_FILES = 20;
 const DEFAULT_TAIL_LINES = 50;
 const MAX_OUTPUT_CHARS = 500 * 1024; // 500KB total output cap
@@ -335,13 +341,26 @@ function readSingleFile(filePath, options) {
   }
 }
 
-function actionRead(args) {
+async function readMaybeDelegate(resolvedPath, options) {
+  const ext = (path.extname(resolvedPath).slice(1) || '').toLowerCase();
+  if (!DOC_DELEGATE_EXTS.has(ext)) return readSingleFile(resolvedPath, options);
+  const r = await docRead({ path: resolvedPath, maxChars: options.maxFileSize });
+  return r.ok
+    ? {
+        path: resolvedPath, ok: true, content: r.text,
+        size: r.chars, lines: (r.text || '').split('\n').length,
+        delegated: 'doc.read', format: r.format,
+      }
+    : { path: resolvedPath, ok: false, error: r.error, delegated: 'doc.read' };
+}
+
+async function actionRead(args) {
   const { maxFileSize, encoding } = args;
   const options = { maxFileSize, encoding };
 
   // Multiple files
   if (args.paths && Array.isArray(args.paths)) {
-    const results = args.paths.map(p => readSingleFile(resolvePath(p), options));
+    const results = await Promise.all(args.paths.map(p => readMaybeDelegate(resolvePath(p), options)));
     const allOk = results.every(r => r.ok);
     return {
       ok: allOk,
@@ -353,7 +372,7 @@ function actionRead(args) {
 
   // Single file
   const resolvedPath = resolvePath(args.path);
-  const result = readSingleFile(resolvedPath, options);
+  const result = await readMaybeDelegate(resolvedPath, options);
   return {
     ok: result.ok,
     files: [result],
@@ -646,7 +665,7 @@ async function fsRead(args) {
       break;
 
     case 'read':
-      result = actionRead({ path: inputPath, paths, maxFileSize, encoding });
+      result = await actionRead({ path: inputPath, paths, maxFileSize, encoding });
       break;
 
     case 'search':

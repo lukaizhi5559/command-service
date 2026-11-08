@@ -89,7 +89,19 @@ function forceKillPlaywright() {
 const skillLlm = require('./skill-helpers/skill-llm.cjs');
 const skillDb = require('./skill-helpers/skill-db.cjs');
 const { shellRun } = require('./skills/shell.run.cjs');
-const { browserAct } = require('./skills/browser.act.cjs');
+const { browserAct: _rawBrowserAct } = require('./skills/browser.act.cjs');
+// Flag-guarded browserAct — internal callers (video.agent transcript, web
+// enrichers) inject this dependency directly and bypass the executeAutomation
+// backstop. When settings.browserAutomation is off they get the same typed
+// error instead of silently launching a browser session.
+const browserAct = async (args) => {
+  const { isBrowserAutomationEnabled } = require('../../../shared/browser-automation.cjs');
+  if (!isBrowserAutomationEnabled()) {
+    return { ok: false, error: 'browser_automation_disabled',
+      message: `Browser automation is disabled (settings.browserAutomation) — browser.act cannot run. Use yt-dlp/API/CLI or shell.run paths instead.` };
+  }
+  return _rawBrowserAct(args);
+};
 const { webCrawl } = require('./skills/web.crawl.cjs');
 const { imageAnalyze } = require('./skills/image.analyze.cjs');
 const { fsRead } = require('./skills/fs.read.cjs');
@@ -157,6 +169,18 @@ const DISPATCHABLE_SKILLS = [
   'provider.discovery',
 ];
 
+// Browser-driving kill switch — settings.browserAutomation=false (or
+// THINKDROP_BROWSER_AUTOMATION=off) removes UI-driving skills from the
+// advertised set so planning/preflight never selects them; the
+// executeAutomation backstop below catches anything that still arrives.
+const { BROWSER_DRIVING_SKILLS, isBrowserAutomationEnabled } =
+  require('../../../shared/browser-automation.cjs');
+function _dispatchableSkills() {
+  return isBrowserAutomationEnabled()
+    ? DISPATCHABLE_SKILLS
+    : DISPATCHABLE_SKILLS.filter(s => !BROWSER_DRIVING_SKILLS.has(s));
+}
+
 class CommandServiceMCPServer {
   constructor() {
     this.serviceName = process.env.SERVICE_NAME || 'command-service';
@@ -179,6 +203,18 @@ class CommandServiceMCPServer {
       return {
         success: false,
         error: 'skill is required'
+      };
+    }
+
+    // Browser-automation kill switch — typed error (not a crash) so
+    // synthesis/review can report "automation is off" and offer the
+    // artifact as text instead of a hollow failure.
+    if (BROWSER_DRIVING_SKILLS.has(skill) && !isBrowserAutomationEnabled()) {
+      logger.info('[Skill] Blocked — browser automation disabled', { skill });
+      return {
+        success: false,
+        error: 'browser_automation_disabled',
+        message: `Browser automation is disabled (settings.browserAutomation) — '${skill}' cannot run. Produce the deliverable as text, or use shell.run/app.agent/CLI paths instead.`,
       };
     }
 
@@ -553,7 +589,7 @@ class CommandServiceMCPServer {
       success: true,
       service: this.serviceName,
       status: 'healthy',
-      skills: DISPATCHABLE_SKILLS
+      skills: _dispatchableSkills()
     };
   }
 
@@ -648,7 +684,7 @@ class CommandServiceMCPServer {
         res.end(JSON.stringify({
           status: 'healthy',
           service: this.serviceName,
-          skills: DISPATCHABLE_SKILLS
+          skills: _dispatchableSkills()
         }));
         return;
       }
@@ -658,7 +694,7 @@ class CommandServiceMCPServer {
       // registry agents (need onboarding). Distinct from /agent.list.
       if (req.method === 'POST' && req.url === '/skill.list') {
         res.writeHead(200);
-        res.end(JSON.stringify({ ok: true, skills: DISPATCHABLE_SKILLS }));
+        res.end(JSON.stringify({ ok: true, skills: _dispatchableSkills() }));
         return;
       }
 
@@ -1499,6 +1535,15 @@ class CommandServiceMCPServer {
         req.on('end', async () => {
           try {
             const { payload } = JSON.parse(body);
+            // Tag the controller with its owning handoff task so a preempting
+            // /automation.cancel (exceptTaskId) can spare the new task's own
+            // in-flight run. The taskId rides on _progressCallbackUrl's query.
+            try {
+              const cbUrl = payload?.args?._progressCallbackUrl;
+              controller._tdTaskId = payload?.args?._handoffTaskId
+                || (cbUrl ? new URL(cbUrl).searchParams.get('taskId') : null)
+                || null;
+            } catch (_) { controller._tdTaskId = null; }
             // Canonicalize at the single dispatch boundary — every skill
             // result gets {ok, stdout, summary} before any consumer sees it
             // (shared/skill-contract.cjs: stdout = data product, never narration).
@@ -1550,12 +1595,17 @@ class CommandServiceMCPServer {
         req.on('data', chunk => { body += chunk; });
         req.on('end', () => {
           try {
-            const abortedCount = activeAutomationControllers.size;
-            logger.info(`[automation.cancel] Aborting ${abortedCount} active automation run(s)`);
-            for (const ctrl of activeAutomationControllers) {
+            // exceptTaskId: a preempting prompt's NEW task — it must survive
+            // the sweep (same contract as /comms.cancel + handoffRunner).
+            const { exceptTaskId = null } = JSON.parse(body || '{}');
+            let abortedCount = 0;
+            for (const ctrl of [...activeAutomationControllers]) {
+              if (exceptTaskId && ctrl._tdTaskId === exceptTaskId) continue;
               try { ctrl.abort(); } catch (_) {}
+              activeAutomationControllers.delete(ctrl);
+              abortedCount++;
             }
-            activeAutomationControllers.clear();
+            logger.info(`[automation.cancel] Aborting ${abortedCount} active automation run(s)${exceptTaskId ? ` (except task ${exceptTaskId})` : ''}`);
             // Forceful cleanup: kill playwright-cli daemons + Chrome processes
             // using ThinkDrop browser profiles (same pattern as startup cleanup).
             // Only when we actually aborted runs — otherwise we'd kill browser

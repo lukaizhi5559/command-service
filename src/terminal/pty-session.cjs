@@ -118,7 +118,7 @@ function _openNodePty(cmd, argv, { cwd, env, cols, rows }) {
   return {
     backend: 'node-pty',
     pid: p.pid,
-    write: (d) => p.write(d),
+    write: (d) => { try { p.write(d); } catch (_) {} },
     onData: (cb) => p.onData(cb),
     onExit: (cb) => p.onExit(({ exitCode }) => cb(exitCode)),
     kill: () => { try { p.kill(); } catch (_) {} },
