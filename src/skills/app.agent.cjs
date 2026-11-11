@@ -396,6 +396,7 @@ async function actionCaptureScreen({ signal = null } = {}) {
     // Use existing screen.capture skill
     const { screenCapture } = require('./screen.capture.cjs');
     const result = await screenCapture({ signal });
+    _noteCaptureResult(result);
     
     if (result.success && result.text) {
       // For now, we don't get a path back from screenCapture - it returns OCR text
@@ -434,9 +435,14 @@ async function _getActiveAppBounds() {
     const timeoutPromise = new Promise((_, reject) => {
       setTimeout(() => reject(new Error('get-windows timeout after 3000ms')), 3000);
     });
-    
+
+    // Permission flags OFF: this call only needs bounds + owner.name, which
+    // come from CGWindowList (ungated). The defaults make the binary run TCC
+    // consent checks for Accessibility (url) and Screen Recording (title) —
+    // on a denied machine the prompt renders buried between windows and the
+    // binary stalls until this timeout fires (upstream issue #150).
     const win = await Promise.race([
-      activeWindow(),
+      activeWindow({ accessibilityPermission: false, screenRecordingPermission: false }),
       timeoutPromise
     ]);
     
@@ -554,6 +560,13 @@ async function _deriveBoundsFromScan(appName) {
       logger.info(`[app.agent] _deriveBoundsFromScan: using cached bounds for "${appName}": ${JSON.stringify(cached.appBounds)}, source: cache`);
       return { ...cached.appBounds, appName, source: 'cache' };
     }
+  }
+
+  // Screen Recording denied — the scan below would only burn ~11s of denied
+  // captures per call. Bounds just stay unknown; callers degrade by name.
+  if (_captureDenied()) {
+    logger.info(`[app.agent] _deriveBoundsFromScan: skipped — capture denied (screen recording not granted)`);
+    return null;
   }
 
   const category = appName ? _getAppCategory(appName) : 'other';
@@ -4035,6 +4048,44 @@ function _captureFatal(r) {
   return !!(r && (r.aborted || _CAPTURE_FATAL_RE.test(String(r?.error || r?.reason || ''))));
 }
 
+// Capture-denial short-circuit. Snapshots belong to the monitor lane — the
+// interactive read path may borrow a frame (via screen-intelligence's
+// /screen.analyze) when Screen Recording is granted, but on denial every
+// caller that "just needs a screenshot" (OCR fallback, bounds derivation,
+// focus OCR) would otherwise burn ~6-11s each on an impossible capture.
+// First fatal result arms a TTL; capture attempts skip while it's fresh.
+// Cleared on any successful capture so a mid-session TCC grant re-enables.
+const _CAPTURE_DENIED_TTL_MS = 90 * 1000;
+let _captureDeniedUntil = 0;
+function _captureDenied() {
+  return Date.now() < _captureDeniedUntil;
+}
+function _noteCaptureResult(r) {
+  if (r?.success || r?.ok) { _captureDeniedUntil = 0; return; }
+  if (_captureFatal(r)) _captureDeniedUntil = Date.now() + _CAPTURE_DENIED_TTL_MS;
+}
+
+// Live frontmost-app name — cross-platform, no permissions (shared/frontmost-
+// app.cjs). Kept as a guarded require + osascript fallback so this skill stays
+// self-contained where shared/ isn't synced.
+let _frontmostAppMod = null;
+try { _frontmostAppMod = require('../../../../shared/frontmost-app.cjs'); } catch (_) {}
+async function _frontmostAppName() {
+  try {
+    const n = await _frontmostAppMod?.getFrontmostAppName?.();
+    if (n) return n;
+  } catch (_) { /* shared module failed — try inline */ }
+  if (process.platform !== 'darwin') return null;
+  try {
+    const { execSync } = require('child_process');
+    const out = execSync(
+      `osascript -e 'tell application "System Events" to get name of first application process whose frontmost is true'`,
+      { encoding: 'utf8', timeout: 1500 }
+    ).trim();
+    return out || null;
+  } catch (_) { return null; }
+}
+
 async function getRecentOCR({ maxAgeSeconds = 3, appName: targetApp = null, liveOverlayHidden = false, signal = null } = {}) {
   const _appMatches = (a, b) => {
     if (!a || !b) return false;
@@ -4087,7 +4138,9 @@ async function getRecentOCR({ maxAgeSeconds = 3, appName: targetApp = null, live
   //   (b) the DB has no capture at all (no record within maxAgeSeconds)
   // fall back to a live screen capture so we always get the correct app's content.
   const _needsLiveFallback = targetApp && (!dbResult.appName || !_appMatches(dbResult.appName, targetApp));
-  if (_needsLiveFallback) {
+  if (_needsLiveFallback && _captureDenied()) {
+    logger.info(`[app.agent] getRecentOCR: DB has "${dbResult.appName}" but target is "${targetApp}" — live capture skipped, screen recording denied`);
+  } else if (_needsLiveFallback) {
     logger.info(`[app.agent] getRecentOCR: DB has "${dbResult.appName}" but target is "${targetApp}" — falling back to live screen capture${liveOverlayHidden ? ' (overlay hidden)' : ''}`);
     try {
       const { screenCapture } = require('./screen.capture.cjs');
@@ -4096,6 +4149,7 @@ async function getRecentOCR({ maxAgeSeconds = 3, appName: targetApp = null, live
       const live = liveOverlayHidden
         ? await _withFlash(() => screenCapture({ signal }))
         : await screenCapture({ signal });
+      _noteCaptureResult(live);
       // Fatal capture error (TCC denial / abort) — surface it so aware callers
       // bail instead of grinding more fallbacks on an impossible capture.
       if (_captureFatal(live)) {
@@ -5674,7 +5728,11 @@ async function verifyAppFocused({ appName, waitMs = 5000, signal = null }) {
     logger.debug(`[app.agent] verifyAppFocused: initial _getActiveAppBounds failed: ${err.message}`);
     return null;
   });
-  const liveAppName = liveWin?.appName || '';
+  // The match below only needs a NAME — bounds are just logged. When the
+  // bounds chain fails (TCC-stalled get-windows / no-bounds AppleScript), the
+  // name-only frontmost probe still answers (~50ms, no permissions).
+  let liveAppName = liveWin?.appName || '';
+  if (!liveAppName) liveAppName = (await _frontmostAppName()) || '';
   const OVERLAY_APPS = ['electron', 'thinkdrop'];
   const isOverlayActive = OVERLAY_APPS.some(o => liveAppName.toLowerCase().includes(o));
 
@@ -5702,17 +5760,17 @@ async function verifyAppFocused({ appName, waitMs = 5000, signal = null }) {
   const BROWSER_APP_NAMES = ['Google Chrome', 'Safari', 'Firefox', 'Arc', 'Brave Browser', 'Microsoft Edge', 'Opera'];
   const _isBrowserAppName = (name) => BROWSER_APP_NAMES.some(b => _matches(name, b));
   if (appName && appName.toLowerCase() === 'browser') {
-    if (liveWin && _isBrowserAppName(liveWin.appName)) {
-      logger.info(`[app.agent] verifyAppFocused: generic "browser" matched active window "${liveWin.appName}"`);
-      return { focused: true, appName: liveWin.appName, waited: 0 };
+    if (_isBrowserAppName(liveAppName)) {
+      logger.info(`[app.agent] verifyAppFocused: generic "browser" matched active window "${liveAppName}"`);
+      return { focused: true, appName: liveAppName, waited: 0 };
     }
     // No active browser detected yet; fall back to a real app name for focus.
     appName = 'Google Chrome';
     logger.info(`[app.agent] verifyAppFocused: generic "browser" remapped to "${appName}" for focus attempt`);
   }
 
-  if (liveWin && _matches(liveWin.appName, appName)) {
-    return { focused: true, appName: liveWin.appName, waited: 0 };
+  if (liveAppName && _matches(liveAppName, appName)) {
+    return { focused: true, appName: liveAppName, waited: 0 };
   }
 
   // If the ThinkDrop overlay is currently in the foreground but we have a
@@ -5733,8 +5791,14 @@ async function verifyAppFocused({ appName, waitMs = 5000, signal = null }) {
   return _withOverlayHidden(async () => {
     const { execSync } = require('child_process');
 
+    // open-then-confirm contract: callers always activate the target first,
+    // then keystrokes. Detection only confirms what we just activated — when
+    // every detector is blind we trust a successful `open -a` and proceed
+    // (flagged `assumed`) rather than hard-fail.
+    let openSucceeded = false;
     try {
       execSync(`open -a "${appName}"`, { timeout: 3000 });
+      openSucceeded = true;
       logger.info(`[app.agent] verifyAppFocused: executed 'open -a "${appName}"'`);
     } catch (err) {
       logger.warn(`[app.agent] verifyAppFocused: failed to open app "${appName}": ${err.message}`);
@@ -5758,13 +5822,15 @@ async function verifyAppFocused({ appName, waitMs = 5000, signal = null }) {
         logger.debug(`[app.agent] verifyAppFocused: attempt ${attempts} - _getActiveAppBounds failed: ${err.message}`);
         return null;
       });
-      
-      const detectedAppName = after?.appName || 'unknown';
+
+      // Name-only probe as the live tier — the bounds chain can fail while the
+      // frontmost name is still perfectly readable (TCC denial, no-bounds apps).
+      const detectedAppName = after?.appName || (await _frontmostAppName()) || 'unknown';
       logger.info(`[app.agent] verifyAppFocused: attempt ${attempts}/${maxAttempts} - detected: "${detectedAppName}", expected: "${appName}", delay: ${retryDelay}ms`);
-      
-      if (after && _matches(after.appName, appName)) {
-        logger.info(`[app.agent] verifyAppFocused: SUCCESS - matched "${after.appName}" after ${Date.now() - start}ms`);
-        return { focused: true, appName: after.appName, waited: Date.now() - start, attempts };
+
+      if (detectedAppName !== 'unknown' && _matches(detectedAppName, appName)) {
+        logger.info(`[app.agent] verifyAppFocused: SUCCESS - matched "${detectedAppName}" after ${Date.now() - start}ms`);
+        return { focused: true, appName: detectedAppName, waited: Date.now() - start, attempts };
       }
       
       // Exponential backoff: double the delay, but don't exceed maxRetryDelay
@@ -5775,22 +5841,23 @@ async function verifyAppFocused({ appName, waitMs = 5000, signal = null }) {
       logger.error(`[app.agent] verifyAppFocused: final _getActiveAppBounds failed: ${err.message}`);
       return null;
     });
-    const finalAppName = final?.appName || 'unknown';
+    const finalAppName = final?.appName || (await _frontmostAppName()) || 'unknown';
     const totalWaited = Date.now() - start;
 
     // The retry loop's time budget can be exhausted by `open -a` + the initial
     // sleep (yielding "0 attempts"), so the app may already be focused by now.
     // Re-check the final result before declaring failure to avoid a false negative.
-    if (final && _matches(final.appName, appName)) {
-      logger.info(`[app.agent] verifyAppFocused: SUCCESS (final check) - matched "${final.appName}" after ${totalWaited}ms`);
-      return { focused: true, appName: final.appName, waited: totalWaited, attempts };
+    if (finalAppName !== 'unknown' && _matches(finalAppName, appName)) {
+      logger.info(`[app.agent] verifyAppFocused: SUCCESS (final check) - matched "${finalAppName}" after ${totalWaited}ms`);
+      return { focused: true, appName: finalAppName, waited: totalWaited, attempts };
     }
 
     logger.error(`[app.agent] verifyAppFocused: FAILED - expected "${appName}", got "${finalAppName}" after ${totalWaited}ms, ${attempts} attempts`);
-    
-    // Try fallback detection methods if active-win failed
+
+    // Try fallback detection methods if active-win failed — all capture-based,
+    // dead weight when Screen Recording is denied.
     if (signal?.aborted) return { focused: false, aborted: true, appName };
-    if (finalAppName === 'unknown' || !final) {
+    if ((finalAppName === 'unknown' || !final) && !_captureDenied()) {
       logger.info(`[app.agent] verifyAppFocused: trying fallback detection methods...`);
 
       // Fallback 1: Try to detect via window title OCR
@@ -5822,15 +5889,25 @@ async function verifyAppFocused({ appName, waitMs = 5000, signal = null }) {
         logger.info(`[app.agent] verifyAppFocused: activated "${appName}" via AppleScript to displace browser`);
         await _sleep(1500);
         const after = await _getActiveAppBounds().catch(() => null);
-        if (after && _matches(after.appName, appName)) {
-          logger.info(`[app.agent] verifyAppFocused: SUCCESS via AppleScript - matched "${after.appName}"`);
-          return { focused: true, appName: after.appName, waited: totalWaited, attempts, fallback: 'applescript' };
+        const afterName = after?.appName || (await _frontmostAppName()) || null;
+        if (afterName && _matches(afterName, appName)) {
+          logger.info(`[app.agent] verifyAppFocused: SUCCESS via AppleScript - matched "${afterName}"`);
+          return { focused: true, appName: afterName, waited: totalWaited, attempts, fallback: 'applescript' };
         }
       } catch (err) {
         logger.debug(`[app.agent] verifyAppFocused: AppleScript activation failed: ${err.message}`);
       }
     }
-    
+
+    // open-then-confirm contract: we activated the target ourselves — a blind
+    // detector ("unknown") can't disprove it came forward, so trust the
+    // successful `open -a` and let the keystrokes land. A detector reporting a
+    // DIFFERENT frontmost app is real evidence and still fails.
+    if (openSucceeded && finalAppName === 'unknown') {
+      logger.warn(`[app.agent] verifyAppFocused: no detection available after ${attempts} attempts — open -a "${appName}" succeeded, proceeding assumed`);
+      return { focused: true, assumed: true, appName, waited: totalWaited, attempts };
+    }
+
     return { focused: false, appName: finalAppName, waited: totalWaited, attempts };
   });
 }
@@ -5877,6 +5954,7 @@ async function _detectAppByWindowTitle(appName, signal = null) {
     // Get recent OCR data from user-memory service
     const { screenCapture } = require('./screen.capture.cjs');
     const recentCapture = await screenCapture({ recent: true, signal });
+    _noteCaptureResult(recentCapture);
     if (_captureFatal(recentCapture)) return { detected: false, fatal: true, error: recentCapture.error };
     if (!recentCapture.success || !recentCapture.text) {
       logger.debug(`[app.agent] _detectAppByWindowTitle: no recent OCR data available`);
@@ -5949,6 +6027,7 @@ async function _detectAppByOCRDifference(appName, signal = null) {
     // 1. Capture baseline OCR state
     const { screenCapture } = require('./screen.capture.cjs');
     const baseline = await screenCapture({ recent: true, signal });
+    _noteCaptureResult(baseline);
     if (_captureFatal(baseline)) return { detected: false, method: 'ocr-delta', fatal: true, error: baseline.error };
     if (!baseline.success || !baseline.text) {
       logger.debug(`[app.agent] _detectAppByOCRDifference: no baseline OCR available`);
@@ -5984,6 +6063,7 @@ async function _detectAppByOCRDifference(appName, signal = null) {
     // 5. Capture post-focus OCR state
     if (signal?.aborted) return { detected: false, method: 'ocr-delta', aborted: true };
     const afterFocus = await screenCapture({ recent: true, signal });
+    _noteCaptureResult(afterFocus);
     if (_captureFatal(afterFocus)) return { detected: false, method: 'ocr-delta', fatal: true, error: afterFocus.error };
     if (!afterFocus.success || !afterFocus.text) {
       logger.debug(`[app.agent] _detectAppByOCRDifference: no post-focus OCR available`);
@@ -6427,10 +6507,15 @@ async function _extSessionFor({ sessionId, agentId, url, allowSole = false, allo
       if (label) return `ext:${label}_agent`;
     }
     if (allowSole && alive.length === 1) return alive[0].sessionId;
-    // Untargeted read with several bound sessions → the tab that's active in
-    // its window (the page a just-completed navigate/read left in front), then
-    // most recently touched.
+    // Untargeted read with several bound sessions → ext:default first — the
+    // extension synthesizes it with the REAL active tab at listSessions time,
+    // so it can't serve a stale bound tab (observed: an untargeted scan_page
+    // read a bound LinkedIn tab while the user was on a different page). The
+    // bound session for the active tab shares the same tab anyway when
+    // ext:default isn't appended (active tab already bound).
     if (allowRecent && alive.length) {
+      const def = alive.find(s => s.sessionId === 'ext:default');
+      if (def) return def.sessionId;
       const front = alive.find(s => s.active);
       if (front?.sessionId) return front.sessionId;
       const recent = alive.slice().sort((a, b) => (b.lastSeen || 0) - (a.lastSeen || 0))[0];
@@ -6734,12 +6819,18 @@ async function actionScanPage({ appName, url, category, maxWaitMs = 10000, useCa
   if (last.content.length < _minNeeded) {
     const ocr = await getRecentOCR({ appName: resolvedApp, liveOverlayHidden: true, signal }).catch(() => null);
     if (ocr?.fatal || _captureFatal(ocr)) {
-      return { ok: false, error: ocr.error || 'screen_recording_permission_denied', fatal: true };
-    }
-    const ocrText = (ocr?.text || '').trim();
-    if (ocrText.length > last.content.length) {
-      logger.info(`[app.agent] scan_page: clipboard thin (${last.content.length} chars) — OCR fallback recovered ${ocrText.length} chars (${ocr?.source || 'db'})`);
-      last = { ...last, content: ocrText };
+      // OCR lane is dead (Screen Recording denied) — but the clipboard grab
+      // already produced real page text. Thin content beats a hard fail.
+      if (last.content.length < _pageCopyEst.ABSOLUTE_MIN_CHARS) {
+        return { ok: false, error: ocr?.error || 'screen_recording_permission_denied', fatal: true };
+      }
+      logger.warn(`[app.agent] scan_page: OCR fallback denied (${ocr?.error || 'capture fatal'}) — keeping thin clipboard content (${last.content.length} chars)`);
+    } else {
+      const ocrText = (ocr?.text || '').trim();
+      if (ocrText.length > last.content.length) {
+        logger.info(`[app.agent] scan_page: clipboard thin (${last.content.length} chars) — OCR fallback recovered ${ocrText.length} chars (${ocr?.source || 'db'})`);
+        last = { ...last, content: ocrText };
+      }
     }
   }
 
@@ -7149,11 +7240,16 @@ async function actionNavTask({ task, service, url, escalate = true, browseFallba
  * collectors working.
  */
 async function actionReadScreen({ maxWaitMs = 15000, signal = null } = {}) {
-  // 1. Passive frontmost-app detect. When the overlay itself is frontmost,
-  //    active-win can't see the user's app — resolve via the monitor heartbeat
-  //    (memory.getActiveAppContext skips overlay entries).
+  // 1. Passive frontmost-app detect — get-windows (permission-flagged, no TCC
+  //    stall) → name-only frontmost probe → monitor heartbeat
+  //    (memory.getActiveAppContext skips overlay entries for when OUR overlay
+  //    is frontmost and live sources can only see it).
   let bounds = await _getActiveAppBounds().catch(() => null);
-  const liveApp = bounds?.appName || null;
+  let liveApp = bounds?.appName || null;
+  // Bounds-less name read — get-windows can fail entirely under TCC denial
+  // while System Events still knows the frontmost app. This is what keeps
+  // the browser tier reachable on denied machines.
+  if (!liveApp) liveApp = await _frontmostAppName();
   const overlayActive = ['electron', 'thinkdrop'].some(o => (liveApp || '').toLowerCase().includes(o));
   let appName = liveApp;
   if (!liveApp || overlayActive) {
@@ -7192,11 +7288,19 @@ async function actionReadScreen({ maxWaitMs = 15000, signal = null } = {}) {
     };
   }
 
-  // 4. Last resort — direct screen capture (getRecentOCR's live fallback can
-  //    return empty without throwing when no targetApp was detected).
+  // 4. Last resort — borrow the monitor lane's camera for a single frame. On
+  //    a denied machine this is a dead end: the monitor isn't capturing either,
+  //    so say so instead of spending ~6s on a doomed screenshot.
+  if (_captureDenied()) {
+    return {
+      ok: false, error: 'screen_monitor_unavailable', appName,
+      hint: 'No recent screen OCR and Screen Recording is not granted — the screen monitor is not capturing. Grant Screen Recording for the monitor to OCR non-browser apps.',
+    };
+  }
   try {
     const { screenCapture } = require('./screen.capture.cjs');
     const live = await _withOverlayHidden(() => screenCapture({ signal }));
+    _noteCaptureResult(live);
     if (live?.success && live.text) {
       logger.info(`[app.agent] read_screen: ocr_live (direct) — ${live.text.length} chars app="${live.appName || appName || 'unknown'}"`);
       return {
