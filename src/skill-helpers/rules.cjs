@@ -102,8 +102,17 @@ function verifyPassphrase(input) {
 function listRules() {
   const doc = _docOrEmpty();
   return (doc.rules || []).map((r) => ({
-    id: r.id, enabled: r.enabled !== false, seam: r.seam || 'any',
-    when: r.when || {}, then: r.then || {},
+    id: r.id,
+    enabled: r.enabled !== false,
+    seam: r.seam || 'any',
+    when: r.when || {},
+    then: r.then || {},
+    source: r.source || 'user',
+    fireOnce: !!r.fireOnce,
+    cooldownMs: typeof r.cooldownMs === 'number' ? r.cooldownMs : null,
+    lastFiredAt: r.lastFiredAt || 0,
+    firedAt: r.firedAt || null,
+    unlockedUntil: r.unlockedUntil || 0,
   }));
 }
 
@@ -146,6 +155,14 @@ function removeRule(id) {
   doc.rules.splice(i, 1);
   _writeDoc(doc);
   return { ok: true };
+}
+
+function clearRules() {
+  const doc = _docOrEmpty();
+  const removed = Array.isArray(doc.rules) ? doc.rules.length : 0;
+  doc.rules = [];
+  _writeDoc(doc);
+  return { ok: true, removed };
 }
 
 // ── Matching ─────────────────────────────────────────────────────────────────
@@ -274,6 +291,28 @@ function _inCooldown(rule, now) {
   return !!rule.lastFiredAt && now - rule.lastFiredAt < cd;
 }
 
+// A passcode unlock suppresses a rule for a grace window. Unlike cooldown
+// this applies to guard actions too — a parent who unlocks a block needs the
+// screen to stay usable until the grace lapses (re-arms on next eval after).
+function _unlocked(rule, now) {
+  return !!(rule.unlockedUntil && rule.unlockedUntil > now);
+}
+
+// Stamp a temporary unlock on a rule — written through to the shared rules
+// file so every evaluating process (main's unlock IPC, monitorService's
+// per-capture eval) sees it on the next read.
+function suppressRule(ruleId, durationMs) {
+  if (!ruleId) return { ok: false, error: 'ruleId required' };
+  const ms = Number(durationMs);
+  if (!Number.isFinite(ms) || ms <= 0) return { ok: false, error: 'durationMs must be > 0' };
+  const doc = _docOrEmpty();
+  const rule = (doc.rules || []).find((r) => r && r.id === ruleId);
+  if (!rule) return { ok: false, error: `rule "${ruleId}" not found` };
+  rule.unlockedUntil = Date.now() + ms;
+  _writeDoc(doc);
+  return { ok: true, unlockedUntil: rule.unlockedUntil };
+}
+
 // Evaluate enabled rules for one seam. seam === 'any' rules run everywhere.
 // Returns [{rule, when}] for every match — callers pick first/strongest.
 function evaluate(ctx, seam) {
@@ -282,6 +321,7 @@ function evaluate(ctx, seam) {
   for (const rule of loadRules()) {
     const s = rule.seam || 'any';
     if (s !== 'any' && s !== seam) continue;
+    if (_unlocked(rule, now)) continue;
     if (_inCooldown(rule, now)) continue;
     if (whenMatches(rule.when, ctx)) out.push(rule);
   }
@@ -359,6 +399,7 @@ async function evaluateAsync(ctx, seam, judge) {
   for (const rule of loadRules()) {
     const s = rule.seam || 'any';
     if (s !== 'any' && s !== seam) continue;
+    if (_unlocked(rule, now)) continue;
     if (_inCooldown(rule, now)) continue;
     const when = rule.when || {};
     if (!when.semanticMatch || hits.includes(rule)) continue;
@@ -388,11 +429,13 @@ module.exports = {
   addRule,
   setRuleEnabled,
   removeRule,
+  clearRules,
   evaluate,
   evaluateAsync,
   firstGuardHit,
   whenMatches,
   markFired,
+  suppressRule,
   interpolate,
   hasOcrRules,
   hasSemanticRules,

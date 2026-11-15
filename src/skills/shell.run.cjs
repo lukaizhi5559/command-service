@@ -814,6 +814,108 @@ ${sourceResult.stdout.slice(0, 2000)}`;
 }
 
 // ---------------------------------------------------------------------------
+// Layer 2.5: Timeout→bounded discovery.
+// A killed command that exceeded its time budget is almost always unbounded in
+// output or scope (e.g. `mdfind "kMDItemKind != ''"` enumerating every indexed
+// file). Unlike _discoveryRetry (which fixes hallucinated PIPELINES), this
+// handles the timeout class for BOTH goal-resolved and pre-built argv commands:
+// one LLM pass proposes a bounded equivalent (mdfind -count, find -maxdepth,
+// head -n, du -sh), which is syntax-checked AND run through validate() so the
+// allowlist/danger gate still applies, then executed once with the same budget.
+// Returns the retry result, or null when discovery didn't apply / failed.
+// ---------------------------------------------------------------------------
+function _isTimeoutResult(r) {
+  return !!(r && r.ok === false && /timed? ?out after/i.test(String(r.error || '')));
+}
+
+async function _timeoutDiscovery(cmdLine, goal, cwd, env, oauthEnv, timeoutMs, stdin, _progressCallback, protectedPaths, _abortSignal) {
+  if (!cmdLine) return null;
+  if (!skillLlm.isAvailable()) return null;
+  if (_abortSignal?.aborted) return null;
+
+  logger.info(`[shell.run] Timeout discovery: requesting bounded variant`, { cmdLine: cmdLine.slice(0, 140) });
+  if (_progressCallback) _progressCallback({ type: 'shell:discovery_retry', sourceCmd: cmdLine, reason: 'timeout' });
+
+  const budgetS = Math.round((Math.min(timeoutMs, MAX_TIMEOUT_MS)) / 1000);
+  const discoveryPrompt = `You are a macOS shell expert. A command was KILLED because it exceeded its ${budgetS}s time budget — almost always because it produces unbounded output or scans an unbounded scope.
+
+Generate ONE bounded equivalent that answers the same intent quickly and terminates well under the budget.
+
+Rules:
+- Return ONLY valid JSON: { "cmd": "bash", "argv": ["-c", "<script>"] }
+- No explanation, no markdown, no code fences — only JSON.
+- For counts, count directly — mdfind -count 'predicate', ls -1 <dir> | wc -l, find <dir> -maxdepth N | wc -l — never enumerate-then-count.
+- For sizes use du -sh <path>; for listings bound the output (-maxdepth, head -n 200).
+- Never run bare "find ~" or recursive home scans — narrow the starting path.
+- Keep the same intent as the original — do NOT invent a different task.
+- macOS has NO "timeout" command — never emit 'timeout N cmd'.
+
+Original command: ${cmdLine}${goal ? `\nOriginal goal: ${goal}` : ''}`;
+
+  try {
+    const response = await skillLlm.askWithMessages([
+      { role: 'system', content: discoveryPrompt },
+      { role: 'user', content: 'Return the bounded command JSON.' },
+    ], { maxTokens: 300, temperature: 0 });
+
+    const parsed = _parseGoalJson(response);
+    if (!parsed || !parsed.cmd || !Array.isArray(parsed.argv)) {
+      logger.warn('[shell.run] Timeout discovery: LLM returned unparseable JSON — aborting');
+      return null;
+    }
+
+    // Same safety rails as goal-resolution: shell syntax check for -c scripts,
+    // then the full validate() gate (allowlist + dangerous-command checks) so a
+    // generated "fix" can't smuggle a non-allowlisted or dangerous binary.
+    const _SHELL_INTERPRETERS_TD = new Set(['bash', 'sh', 'zsh']);
+    const _baseNameTD = path.basename(parsed.cmd || '');
+    if (_SHELL_INTERPRETERS_TD.has(_baseNameTD) && parsed.argv[0] === '-c' && typeof parsed.argv[1] === 'string') {
+      const syntaxErr = _bashSyntaxCheck(parsed.argv[1], _baseNameTD);
+      if (syntaxErr) {
+        logger.warn(`[shell.run] Timeout discovery: ${_baseNameTD} -n rejected regenerated command: ${syntaxErr} — aborting`);
+        return null;
+      }
+    }
+    const v = validate({ cmd: parsed.cmd, argv: parsed.argv, cwd });
+    if (!v.ok) {
+      logger.warn(`[shell.run] Timeout discovery: validate() rejected regenerated command: ${v.error || v.question || 'unknown'} — aborting`);
+      return null;
+    }
+
+    const boundedCmdLine = [parsed.cmd, ...(parsed.argv || [])].join(' ');
+    logger.info(`[shell.run] Timeout discovery: running bounded variant: ${boundedCmdLine.slice(0, 140)}`);
+
+    const retryResult = await runProcess(parsed.cmd, parsed.argv, {
+      cwd,
+      env: { ...oauthEnv, ...env },
+      timeoutMs: Math.min(timeoutMs, MAX_TIMEOUT_MS),
+      stdin,
+      protectedPaths,
+      _abortSignal,
+    }, _progressCallback || null);
+
+    const verifiedRetry = _verifyExpectedOutputs(retryResult, _baseNameTD, parsed.argv, cwd);
+    logger.info('[shell.run] Timeout discovery completed', {
+      exitCode: verifiedRetry.exitCode,
+      ok: verifiedRetry.ok,
+      stdoutLen: (verifiedRetry.stdout || '').length,
+    });
+
+    return {
+      ...verifiedRetry,
+      cmd: boundedCmdLine,
+      dryRun: false,
+      retried: true,
+      timeoutDiscovery: true,
+      strictModeInjected: false,
+    };
+  } catch (e) {
+    logger.warn(`[shell.run] Timeout discovery failed: ${e.message}`);
+    return null;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // OAuth environment variable injection
 // Loads OAuth access/refresh tokens from keychain and exposes them as env vars
 // (e.g. GOOGLE_ACCESS_TOKEN, GITHUB_ACCESS_TOKEN) so shell scripts don't need
@@ -2177,6 +2279,22 @@ async function shellRun(args) {
     }
     // If discovery retry didn't apply (e.g. source had no output), fall through
     // to normal return — thin-recovery will handle the failure.
+  }
+  // ────────────────────────────────────────────────────────────────────────
+
+  // ── Layer 2.5: Timeout→bounded discovery ────────────────────────────────
+  // A timed-out command is almost always unbounded — try ONE LLM-proposed
+  // bounded variant (goal or argv commands alike). On failure, enrich the
+  // error so thin-recovery/planning sees "bad command — bound it", not a
+  // transport mystery.
+  if (_isTimeoutResult(verifiedResult)) {
+    const bounded = await _timeoutDiscovery(
+      resolvedCmdString, goal || null, cwd, env, oauthEnv, timeoutMs, stdin,
+      _progressCallback || null, protectedPaths, _abortSignal
+    );
+    if (bounded) return bounded;
+    verifiedResult.timeout = true;
+    verifiedResult.error = `${verifiedResult.error} — likely unbounded output or scope; prefer a bounded variant (mdfind -count, find -maxdepth N, head -n, du -sh, ls -1 | wc -l) or narrow the path/predicate.`;
   }
   // ────────────────────────────────────────────────────────────────────────
 
