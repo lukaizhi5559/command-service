@@ -474,12 +474,19 @@ async function _ptyProbe(sessionId, cmd, { timeoutMs = 8000 } = {}) {
   }
 }
 
-// Probe wrapper — PTY first, pipes fallback. cmd/argv describe the same probe.
+// Probe wrapper — pipes first, PTY fallback. Pipes give clean stdout for
+// JSON/bin parsing; the PTY stream can carry prompt lines and echo noise
+// (observed: `npm view dentist bin --json` through the PTY picked up a zsh
+// prompt line and misread the empty result as a "string-form bin"). PTY only
+// when spawn can't launch the binary (login-shell PATH: nvm/brew shims).
 async function _probeCmd(sessionId, cmd, argv, { timeoutMs = 8000, parseStdout = true } = {}) {
+  const r = await spawnCapture(cmd, argv, { timeoutMs });
+  if (r.exitCode !== -1 || r.error === 'timeout' || !sessionId) {
+    return { ok: r.ok, stdout: parseStdout ? (r.stdout || '') : (r.stdout || r.stderr || '') };
+  }
   const shellLine = [cmd, ...argv.map(a => (/\s/.test(a) ? `'${a}'` : a))].join(' ');
   const pr = await _ptyProbe(sessionId, shellLine, { timeoutMs });
   if (pr.used) return { ok: pr.ok, stdout: pr.stdout };
-  const r = await spawnCapture(cmd, argv, { timeoutMs });
   return { ok: r.ok, stdout: parseStdout ? (r.stdout || '') : (r.stdout || r.stderr || '') };
 }
 
@@ -635,8 +642,15 @@ async function _probeRegistryCandidates(serviceKey, { sessionId = null } = {}) {
     }
     const m = out.match(/[\[{][\s\S]*/);
     if (!m) {
-      // Truthy non-JSON output → a string-form bin value — it's a CLI.
-      npmHits.push({ cli: pkg.split('/').pop(), method: 'npm', pkg });
+      // Truthy non-JSON output → a string-form bin value — it's a CLI, but
+      // only when it's a plausible single binary-name/path token (optionally
+      // JSON-quoted). Multi-token or multi-line noise — PTY prompt bleed,
+      // npm warnings — is not a bin name; treat it as no-bin.
+      if (/^"?[\w@/.\-]+"?$/.test(out)) {
+        npmHits.push({ cli: pkg.split('/').pop(), method: 'npm', pkg });
+      } else {
+        libHits.push({ cli: null, isLibrary: true, method: 'npm', pkg });
+      }
       continue;
     }
     try {
@@ -2654,6 +2668,8 @@ Rules:
 - Interactive/sudo/password prompts → pty_exec. If the screen asks for a password/passphrase/token, ask_user for the credential first — NEVER guess or invent one.
 - Prefer non-interactive flags/env over menu-driving when one exists (check run_help).
 - Never output done without a verification command's output proving the goal.
+- THINKDROP INTERNALS are not tools: names like "app agent", "cli agent", "evaluate_skills", "url.first.agent", "reminders_app_agent", or any "*.agent" / snake_case identifier that appears in the task text are ThinkDrop's own machinery — they are NOT binaries, npm packages, or products. Never install, run_help, or web_search them.
+- CAPABILITY FIT: if the goal needs something no CLI can do (e.g. writing to a macOS app's data, GUI automation), say so — ask_user naming what IS needed, or done with an honest "cannot complete: <why>" summary. Do NOT fake success; a done reporting failure still counts as done-with-failure and is surfaced to the user.
 - ask_user is LAST RESORT — at least one diagnostic probe after a failure first.
 - Output JSON only. No prose before or after the object.`;
 
@@ -2779,8 +2795,22 @@ async function _genericRunLoop({ task, cwd, env, timeoutMs, _progressCallbackUrl
       }
 
       if (action.action === 'done') {
+        // Honest done — a `done` whose prose says the task failed is a
+        // failure, not a green step. Returning ok:false lets reviewExecution /
+        // evaluateSkills see the real outcome instead of a falsified success.
+        const _doneText = `${action.result || ''}\n${action.summary || ''}`;
+        const _doneFailure = /\b(?:cannot be completed|not possible|unable to|no valid executable|can't be done|could not be completed|is not installed|does not exist|failed to)\b/i.test(_doneText)
+          && !/\b(?:but|instead|however)\b.*\b(?:succeeded|completed|worked|installed)\b/i.test(_doneText);
+        if (_doneFailure) {
+          transcript.push({ turn, action, outcome: { ok: false, error: (action.result || action.summary || '').slice(0, 300) }, thoughts: action.thinking || null });
+          return {
+            ok: false, agentId, task,
+            error: `done reported failure: ${(action.result || action.summary || '').slice(0, 300)}`,
+            agentTurns: turn, transcript,
+          };
+        }
         transcript.push({ turn, action, outcome: { ok: true, result: action.result || action.summary || '' }, thoughts: action.thinking || null });
-        _autoRegisterInstalledCli(task).catch(() => {});
+        _autoRegisterInstalledCli(task, transcript, succeededSigs).catch(() => {});
         // stdout must carry the task's data product — the LATEST successful
         // command output (fresh, not the largest stale capture), or the
         // LLM's verbatim result when supplied. summary stays narration.
@@ -2892,7 +2922,7 @@ async function _genericRunLoop({ task, cwd, env, timeoutMs, _progressCallbackUrl
 
       } else if (action.action === 'run_cmd') {
         const cmd = String(action.cmd || '').trim();
-        const bin = cmd ? whichCli(cmd) : null;
+        const bin = cmd ? await whichCli(cmd) : null;
         const _gate = cmd ? await _gateGlobalInstalls(cmd, action.argv) : { blocked: [] };
         if (_gate.blocked.length) {
           observation = `[GLOBAL INSTALL BLOCKED] ${_gate.blocked.map(x => `${x.mgr} install ${x.pkg} — ${x.why}`).join('; ')}. Global installs must name a real, verified package — confirm it first (run_shell "npm view <pkg>" / "brew info <pkg>") or ask_user.`;
@@ -2915,7 +2945,7 @@ async function _genericRunLoop({ task, cwd, env, timeoutMs, _progressCallbackUrl
         if (!bin) {
           observation = 'run_help: "bin" (the binary name) is required';
         } else {
-          const binPath = whichCli(bin);
+          const binPath = await whichCli(bin);
           if (!binPath) {
             observation = `run_help: "${bin}" is not installed — verify/install it first (npm view / brew info to find the real package name).`;
           } else {
@@ -3035,17 +3065,33 @@ async function _genericRunLoop({ task, cwd, env, timeoutMs, _progressCallbackUrl
 // After a successful generic run, if the task was install-shaped and a new CLI
 // is now on PATH with no registered agent, build its descriptor in the
 // background so the next "use X" task gets the deterministic agent path.
-async function _autoRegisterInstalledCli(task) {
-  const m = String(task).match(/\b(?:install|set\s?up|get|add)\s+(?:the\s+)?["']?([a-zA-Z0-9][\w.-]*)/i);
+// The task text alone is not enough — "add the dentist appointment" must not
+// register a `dentist` CLI. Require an actual install command to have
+// succeeded in this run's transcript AND the binary to resolve on PATH.
+async function _autoRegisterInstalledCli(task, transcript, succeededSigs) {
+  const m = String(task).match(/\b(?:install|set\s?up|setup)\s+(?:the\s+|a\s+|an\s+)?["']?([a-zA-Z0-9][\w.-]*)/i);
   const svc = m?.[1]?.toLowerCase().replace(/[^a-z0-9]/g, '');
-  if (!svc || svc.length < 2) return;
+  const _filler = new Set(['and', 'the', 'a', 'an', 'or', 'then', 'to', 'up', 'it', 'this', 'that', 'new', 'all', 'some', 'cli', 'tool', 'tools', 'package', 'binary', 'app', 'agent']);
+  if (!svc || svc.length < 2 || _filler.has(svc)) return null;
+  const _esc = svc.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const installOk = Array.isArray(transcript) && transcript.some(t => {
+    const a = t?.action;
+    if (!a || !['run_shell', 'run_cmd', 'pty_exec'].includes(a.action)) return false;
+    const cmdText = [a.script, a.cmd, Array.isArray(a.argv) ? a.argv.join(' ') : ''].filter(Boolean).join(' ');
+    if (!new RegExp(`\\b(?:npm\\s+(?:i|install)\\s+(?:-g\\s+|--global\\s+)?|brew\\s+install\\s+|pip3?\\s+install\\s+|gem\\s+install\\s+)[^\\s]*${_esc}\\b`, 'i').test(cmdText)) return false;
+    if (!succeededSigs) return true;
+    const sig = JSON.stringify({ a: a.action, s: a.script || a.cmd || '', argv: a.argv || null, url: a.url || '' });
+    return succeededSigs.has(sig);
+  });
+  if (!installOk) return null;
   try {
     const rows = await withDb(db => db.all('SELECT id FROM agents WHERE id = ?', `${svc}.agent`).catch(() => []));
-    if (rows?.length) return;
-    if (!whichCli(svc)) return;
+    if (rows?.length) return null;
+    if (!(await whichCli(svc))) return null;
     const r = await actionBuildAgent({ service: svc });
     logger.info(`[cli.agent] generic run auto-registered ${svc}.agent: ok=${r?.ok === true}`);
-  } catch (_) {}
+    return svc;
+  } catch (_) { return null; }
 }
 
 
@@ -5618,7 +5664,7 @@ async function cliAgent(args) {
   }
 }
 
-module.exports = { cliAgent, KNOWN_CLI_MAP, actionListAllAgents, resetDbCache, discoverSetupFromHelp, _discoverVerifyCmd, _ptyDeltaText, _globalInstalls, _gateGlobalInstalls, _looksLikeFilename };
+module.exports = { cliAgent, KNOWN_CLI_MAP, actionListAllAgents, resetDbCache, discoverSetupFromHelp, _discoverVerifyCmd, _ptyDeltaText, _globalInstalls, _gateGlobalInstalls, _looksLikeFilename, _autoRegisterInstalledCli, _probeRegistryCandidates };
 
 // ── One-shot startup migration: ensure ytdlp.agent has transcript capabilities ──
 // Runs 5s after module load to allow DuckDB init. No-ops if already patched.

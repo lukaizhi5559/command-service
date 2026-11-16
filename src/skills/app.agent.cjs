@@ -7558,6 +7558,18 @@ async function actionRunAgent({ appName, task, filePath, prompt, maxDurationMs =
     return { ok: false, error: 'Could not extract filePath and prompt from task' };
   }
 
+  // Inline install probe — same discovery discipline as cli.agent (binary
+  // probe) and url.first.agent (URL resolution): verify the app exists
+  // before the focus/OCR loop spends minutes failing on it. 'browser' is a
+  // generic sentinel, not a real bundle — skip it.
+  if (String(appName).toLowerCase() !== 'browser') {
+    const chk = await actionCheckInstalled({ appName }).catch(() => null);
+    if (chk && chk.installed === false) {
+      logger.warn(`[app.agent] actionRunAgent: "${appName}" is not installed — failing fast`);
+      return { ok: false, error: `app not installed: ${appName}`, appName, downloadUrl: chk.downloadUrl || null };
+    }
+  }
+
   const descriptor = _readAgentDescriptor(appName);
   const category = descriptor?.category || _getAppCategory(appName);
 
@@ -7980,6 +7992,15 @@ async function actionRunAppFlow({ appName, goal, resolvedFilePath = null, maxDur
 
   logger.info(`[app.agent] actionRunAppFlow: starting for "${appName}" — goal="${String(goal).slice(0, 80)}"`);
   try {
+    // Inline install probe — verify the app exists before discovery + the
+    // flow loop. 'browser' is a generic sentinel, not a real bundle — skip.
+    if (String(appName).toLowerCase() !== 'browser') {
+      const chk = await actionCheckInstalled({ appName }).catch(() => null);
+      if (chk && chk.installed === false) {
+        logger.warn(`[app.agent] actionRunAppFlow: "${appName}" is not installed — failing fast`);
+        return { ok: false, error: `app not installed: ${appName}`, appName, downloadUrl: chk.downloadUrl || null, actionHistory: [], elapsed: 0 };
+      }
+    }
     const { runAppFlow } = require('./app.runner.cjs');
 
     // 1. Discover shortcuts (web crawl or descriptor cache — no app focus needed)
