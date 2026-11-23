@@ -6694,7 +6694,7 @@ async function _getLiveBrowserUrl(appName) {
   } catch (_) { return null; }
 }
 
-async function actionScanPage({ appName, url, category, maxWaitMs = 10000, useCache = true, captureHtml = false, ttlMs, deselect = true, sessionId, agentId, preferOs = false, signal = null } = {}) {
+async function actionScanPage({ appName, url, category, maxWaitMs = 10000, useCache = true, captureHtml = false, ttlMs, deselect = true, sessionId, agentId, preferOs = false, extOnly = false, signal = null } = {}) {
   if (signal?.aborted) return { ok: false, error: 'cancelled', cancelled: true };
   // 0. Extension lane — when the ThinkDrop Chrome extension is connected and a
   //    bound session can be identified, read the page via in-tab evaluate
@@ -6737,6 +6737,15 @@ async function actionScanPage({ appName, url, category, maxWaitMs = 10000, useCa
       }
     }
   } catch (e) { logger.warn(`[app.agent] scan_page: ext lane error (${e.message}) — OS path`); }
+
+  // extOnly — callers that must not touch the physical UI (planning-lane
+  // reads, read-only page tools) stop here instead of falling through to
+  // the OS clipboard-scrape, which types Cmd+L/Cmd+A/Escape into the
+  // user's live app (observed: planning grill chords into Calendar).
+  if (extOnly) {
+    return { ok: false, error: 'ext_unavailable', via: 'ext_evaluate',
+      message: 'No live extension session could read the page — refusing the OS clipboard-scrape fallback.' };
+  }
 
   // 1. Focus first — we need the resolved browser app to read the LIVE tab URL
   //    for cache matching. The old order served "latest fresh copy" for

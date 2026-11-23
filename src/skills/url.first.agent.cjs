@@ -78,80 +78,157 @@ function _extractDestinationName(task) {
   return s;
 }
 
+/**
+ * resolveDestination — session-free URL resolution. Runs the full discovery
+ * chain (explicit arg > taskFacts > deep-link > registry > web discovery) and
+ * returns { targetUrl, deepLinkSource, serviceInfo } — usable with either
+ * transport ('session' via browserAct or 'open' via shell.run).
+ */
+async function resolveDestination(args, { agentId, sessionId, headed }) {
+  const { service, task = '', url: _explicitUrl } = args;
+  let targetUrl = _explicitUrl || null;
+  let deepLinkSource = _explicitUrl ? 'explicit' : null;
+  let serviceInfo = null;
+
+  try {
+    serviceInfo = await resolveServiceTarget(service || agentId);
+  } catch (_) {}
+
+  // taskFacts.destination — resolved ONCE in preflightAgents and carried to
+  // this step in args. Re-resolving here would duplicate the resolution
+  // chain (~seconds) and could disagree with what the planner annotated —
+  // a second independent judgment on the same question. Facts win.
+  if (!targetUrl && args.taskFacts?.destination?.url
+      && (!args.taskFacts.agentId || args.taskFacts.agentId === agentId)) {
+    targetUrl = args.taskFacts.destination.url;
+    deepLinkSource = `taskFacts:${args.taskFacts.destination.source || 'preflight'}`;
+  }
+
+  if (!targetUrl && serviceInfo?.startUrl && task) {
+    try {
+      const { browserAgent } = require('./browser.agent.cjs');
+      const dl = await browserAgent({
+        action: 'resolve_deep_link',
+        agentId, serviceKey: serviceInfo.serviceKey,
+        startUrl: serviceInfo.startUrl, task, sessionId,
+        headed, hidden: !headed,
+      });
+      if (dl?.ok && dl.deepLinkUrl) {
+        targetUrl = dl.deepLinkUrl;
+        deepLinkSource = dl.deepLinkSource || 'resolved';
+      }
+    } catch (e) {
+      logger.warn(`[url.first.agent] deep-link resolution failed: ${e.message}`);
+    }
+  }
+  if (!targetUrl) targetUrl = serviceInfo?.startUrl || null;
+
+  // Named-destination discovery — the service registry can't enumerate
+  // real-world names ("cathay pacific"), so an unregistered destination
+  // resolves through web.agent's search tier (the same discovery the
+  // url_open template and nav_task use). Extract the name from the task,
+  // search for its official site, navigate to the best result.
+  if (!targetUrl && task) {
+    const _destName = _extractDestinationName(task);
+    const _serviceKey = String(service || agentId || '').replace(/\.agent$/i, '').toLowerCase();
+    // Skip only when the name just restates the service (already searched).
+    if (_destName && _destName.toLowerCase().replace(/[^a-z0-9]+/g, '') !== _serviceKey) {
+      try {
+        const { actionSearchAndNavigate } = require('./web.agent.cjs');
+        const _sr = await actionSearchAndNavigate({ query: `${_destName} official website`, maxResults: 5 });
+        const _best = _sr?.bestUrl || null;
+        if (_sr?.ok && _best && /^https?:\/\//i.test(_best)) {
+          targetUrl = _best;
+          deepLinkSource = 'web-discovery';
+          logger.info(`[url.first.agent] destination "${_destName}" resolved via web.agent → ${_best}`);
+        }
+      } catch (e) {
+        logger.warn(`[url.first.agent] web discovery failed for "${_destName}": ${e.message}`);
+      }
+    }
+  }
+  return { targetUrl, deepLinkSource, serviceInfo };
+}
+
+// ── 'open' transport: default browser, no Playwright/extension session ─────
+// shell.run `open <url>` → verify landed state via /screen/parse OCR (the
+// address bar + page text) rather than window.location.href.
+function _screenPost(path, body, timeoutMs = 20000) {
+  return new Promise((resolve, reject) => {
+    const http = require('http');
+    const payload = JSON.stringify(body);
+    const req = http.request({
+      hostname: process.env.SCREEN_SERVICE_HOST || '127.0.0.1',
+      port: parseInt(process.env.SCREEN_INTEL_PORT || '3008', 10),
+      path, method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) },
+    }, (res) => {
+      let data = '';
+      res.on('data', c => { data += c; });
+      res.on('end', () => { try { resolve(JSON.parse(data)); } catch { resolve(null); } });
+    });
+    req.setTimeout(timeoutMs, () => req.destroy(new Error('timeout')));
+    req.on('error', reject);
+    req.end(payload);
+  });
+}
+
+async function _openTransport(targetUrl, task) {
+  // Default browser via macOS `open` — agnostic, no session/Playwright.
+  const { execFile } = require('child_process');
+  await new Promise((res, rej) => execFile('open', [targetUrl], (e) => e ? rej(e) : res()));
+  await new Promise(r => setTimeout(r, 2500)); // browser launch + nav settle
+
+  // Verify: re-parse → find the domain text in the address bar / page OCR.
+  let landedOk = null;
+  let landedHost = '';
+  try {
+    landedHost = new URL(targetUrl).hostname.replace(/^www\./, '');
+    const parsed = await _screenPost('/screen/parse', { display: 0 });
+    if (parsed?.success) {
+      const labels = (parsed.elements || []).map(e => String(e.label || '').toLowerCase()).join(' ');
+      const hostStem = landedHost.split('.')[0] || '';
+      landedOk = labels.includes(landedHost) || (hostStem.length > 2 && labels.includes(hostStem));
+    }
+  } catch (_) { /* verify best-effort */ }
+  return { landedOk, landedHost };
+}
+
 async function urlFirstAgent(args = {}) {
   const { service, agentId: _agentId, task = '', url: _explicitUrl, headed = true, _progressCallbackUrl } = args;
   const agentId = _agentId || (service ? `${String(service).toLowerCase().replace(/\s+/g, '_')}.agent` : 'default.agent');
+  const transport = args.transport || 'session';
   const sessionId = qualifyOpenTab(await resolveExtSession(args.sessionId || deriveSessionId(agentId)), task);
 
   return withSessionMutex(sessionId, async () => {
     postProgress(_progressCallbackUrl, { tier: 'url-first', message: `url.first.agent: resolving destination for ${agentId}` });
 
     // 1. Resolve start URL: explicit arg > deep-link resolution > service startUrl
-    let targetUrl = _explicitUrl || null;
-    let deepLinkSource = _explicitUrl ? 'explicit' : null;
-    let serviceInfo = null;
-
-    try {
-      serviceInfo = await resolveServiceTarget(service || agentId);
-    } catch (_) {}
-
-    // taskFacts.destination — resolved ONCE in preflightAgents and carried to
-    // this step in args. Re-resolving here would duplicate the resolution
-    // chain (~seconds) and could disagree with what the planner annotated —
-    // a second independent judgment on the same question. Facts win.
-    if (!targetUrl && args.taskFacts?.destination?.url
-        && (!args.taskFacts.agentId || args.taskFacts.agentId === agentId)) {
-      targetUrl = args.taskFacts.destination.url;
-      deepLinkSource = `taskFacts:${args.taskFacts.destination.source || 'preflight'}`;
-    }
-
-    if (!targetUrl && serviceInfo?.startUrl && task) {
-      try {
-        const { browserAgent } = require('./browser.agent.cjs');
-        const dl = await browserAgent({
-          action: 'resolve_deep_link',
-          agentId, serviceKey: serviceInfo.serviceKey,
-          startUrl: serviceInfo.startUrl, task, sessionId,
-          headed, hidden: !headed,
-        });
-        if (dl?.ok && dl.deepLinkUrl) {
-          targetUrl = dl.deepLinkUrl;
-          deepLinkSource = dl.deepLinkSource || 'resolved';
-        }
-      } catch (e) {
-        logger.warn(`[url.first.agent] deep-link resolution failed: ${e.message}`);
-      }
-    }
-    if (!targetUrl) targetUrl = serviceInfo?.startUrl || null;
-
-    // Named-destination discovery — the service registry can't enumerate
-    // real-world names ("cathay pacific"), so an unregistered destination
-    // resolves through web.agent's search tier (the same discovery the
-    // url_open template and nav_task use). Extract the name from the task,
-    // search for its official site, navigate to the best result.
-    if (!targetUrl && task) {
-      const _destName = _extractDestinationName(task);
-      const _serviceKey = String(service || agentId || '').replace(/\.agent$/i, '').toLowerCase();
-      // Skip only when the name just restates the service (already searched).
-      if (_destName && _destName.toLowerCase().replace(/[^a-z0-9]+/g, '') !== _serviceKey) {
-        try {
-          const { actionSearchAndNavigate } = require('./web.agent.cjs');
-          const _sr = await actionSearchAndNavigate({ query: `${_destName} official website`, maxResults: 5 });
-          const _best = _sr?.bestUrl || null;
-          if (_sr?.ok && _best && /^https?:\/\//i.test(_best)) {
-            targetUrl = _best;
-            deepLinkSource = 'web-discovery';
-            logger.info(`[url.first.agent] destination "${_destName}" resolved via web.agent → ${_best}`);
-          }
-        } catch (e) {
-          logger.warn(`[url.first.agent] web discovery failed for "${_destName}": ${e.message}`);
-        }
-      }
-    }
+    const { targetUrl: _resolved, deepLinkSource, serviceInfo } =
+      await resolveDestination(args, { agentId, sessionId, headed });
+    let targetUrl = _resolved;
     if (!targetUrl) {
       return { ok: false, sessionId, agentId, error: `No URL resolved for ${agentId}` , suggestedAgent: null };
     }
     targetUrl = _normalizeCreateUrl(targetUrl, task) || targetUrl;
+
+    // 1b. Agnostic transport: open in the user's default browser.
+    if (transport === 'open') {
+      logger.info(`[url.first.agent] open transport → ${targetUrl} (source=${deepLinkSource || 'startUrl'})`);
+      try {
+        const { landedOk, landedHost } = await _openTransport(targetUrl, task);
+        return {
+          ok: true, sessionId, agentId, transport: 'open',
+          url: targetUrl, landedHost,
+          verified: landedOk,
+          deepLinkSource,
+          deepLinkType: _resolveDeepLinkType(targetUrl, targetUrl),
+          output: targetUrl,
+        };
+      } catch (e) {
+        return { ok: false, sessionId, agentId, transport: 'open', url: targetUrl, error: `open failed: ${e.message}` };
+      }
+    }
 
     // 2. Navigate the shared session
     logger.info(`[url.first.agent] navigating ${sessionId} → ${targetUrl} (source=${deepLinkSource || 'startUrl'})`);

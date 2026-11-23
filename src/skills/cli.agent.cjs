@@ -2671,7 +2671,133 @@ Rules:
 - THINKDROP INTERNALS are not tools: names like "app agent", "cli agent", "evaluate_skills", "url.first.agent", "reminders_app_agent", or any "*.agent" / snake_case identifier that appears in the task text are ThinkDrop's own machinery — they are NOT binaries, npm packages, or products. Never install, run_help, or web_search them.
 - CAPABILITY FIT: if the goal needs something no CLI can do (e.g. writing to a macOS app's data, GUI automation), say so — ask_user naming what IS needed, or done with an honest "cannot complete: <why>" summary. Do NOT fake success; a done reporting failure still counts as done-with-failure and is surfaced to the user.
 - ask_user is LAST RESORT — at least one diagnostic probe after a failure first.
+- GIT MUTATIONS must name their repo: task names a hash/repo → every mutating git command carries 'git -C <repo>' or an explicit cwd. 'git commit --amend <hash>' does NOT amend that hash — it rewrites HEAD and the hash parses as a pathspec; for a non-HEAD commit use 'git -C <repo> rebase -i <hash>^' (scripted) — or ask_user. NEVER fall back to a bare 'git commit --amend'.
+- VERIFY before done: after any mutating command, run a read-only evidence command (git log/show, ls, cat) whose output proves the goal — done without post-state evidence is rejected.
+- PREMISE FAILED errors ("unknown revision", "did not match", "not a git repository", "does not exist") mean the TARGET is wrong, not the flag — re-verify the target (rev-parse/exists) or ask_user; do not retry mutation variants.
 - Output JSON only. No prose before or after the object.`;
+
+// ── Mutation contract — observe → verify → act ─────────────────────────────
+// Deterministic guards around the generic loop's exec actions. Facts the
+// model used to guess (which repo holds this hash, does this path exist,
+// did the mutation actually land) are probed or enforced in the loop itself:
+//   requires — a mutating action must be bound to a verified target before
+//              spawn (git -C / explicit cwd; well-formed history ops)
+//   verifies — a git-targeted task can't call done until a read-only
+//              evidence command ran after the last mutation
+//   premise  — "target doesn't exist" stderr routes the model to
+//              re-resolution, never to blind mutation retries
+const _GIT_MUTATE_RE = /\b(?:commit|amend|rebase|cherry-?pick|revert|reset|push|merge|tag\b|checkout|switch|restore|clean|filter-branch|replace)\b/i;
+const _FS_MUTATE_RE = /\b(?:rm|mv|chmod|chown|chgrp|ln|truncate|dd|rmdir|shred)\b|>\s*[^\s|]/;
+const _HASH_TOKEN_RE = /\b[0-9a-f]{7,40}\b/gi;
+const _PREMISE_ERR_RE = /unknown revision|bad revision|ambiguous argument|did not match|no such ref|invalid object name|not a git repository|no such file|does not exist|cannot find|pathspec/i;
+
+let _repoCandsCache = null;
+// Candidate repositories for hash resolution: the resolved cwd, its
+// siblings/children, and ~/Desktop/projects — the same probe set the
+// preflight _gitRefs seam uses. One level of directory fan-out only.
+function _candidateRepos(cwd) {
+  if (!_repoCandsCache) {
+    const out = new Set();
+    const push = (p) => { try { const a = path.resolve(String(p).replace(/^~(?=\/|$)/, os.homedir())); if (a && fs.existsSync(path.join(a, '.git'))) out.add(a); } catch (_) {} };
+    for (const dir of [process.cwd(), path.join(os.homedir(), 'Desktop', 'projects')]) {
+      try { for (const d of fs.readdirSync(dir, { withFileTypes: true })) if (d.isDirectory()) push(path.join(dir, d.name)); } catch (_) {}
+    }
+    _repoCandsCache = [...out];
+  }
+  const hinted = cwd ? path.resolve(String(cwd)) : null;
+  const list = hinted && fs.existsSync(path.join(hinted, '.git'))
+    ? [hinted, ..._repoCandsCache.filter(r => r !== hinted)]
+    : [..._repoCandsCache];
+  return list.slice(0, 8);
+}
+
+// Deterministic hash→repo resolution inside the loop — `git cat-file -e`
+// against each candidate repo. Returns the repo path or null.
+async function _findHashRepo(hash, cwd) {
+  for (const repo of _candidateRepos(cwd)) {
+    try {
+      const r = await spawnCapture('git', ['-C', repo, 'cat-file', '-e', `${hash}^{commit}`], { timeoutMs: 5000 });
+      if (r.exitCode === 0) return repo;
+    } catch (_) {}
+  }
+  return null;
+}
+
+// Pre-spawn contract check. Returns an observation string that blocks the
+// action (the model sees it as a failed premise, not an executed command),
+// or null to let the action run.
+async function _mutationGuard({ action, task, cwd, logger }) {
+  if (!['run_shell', 'run_cmd', 'pty_exec', 'pty_send'].includes(action.action)) return null;
+  const text = [action.script, action.cmd, ...(Array.isArray(action.argv) ? action.argv : [])].filter(Boolean).join(' ');
+  const isGit = /\bgit\b/.test(text);
+
+  // `git commit --amend <hash>` — malformed: --amend rewrites HEAD only; a
+  // trailing hash operand becomes a pathspec. Observed: after it failed, the
+  // model retried bare `--amend` and rewrote the wrong repo's HEAD.
+  if (isGit && /--amend\b/.test(text)) {
+    const after = (text.split(/--amend\b/)[1] || '');
+    const operands = after
+      .replace(/-m\s+(?:"[^"]*"|'[^']*'|\S+)/g, ' ')
+      .replace(/(^|\s)-{1,2}[\w-]+/g, ' ')
+      .split(/\s+/).filter(Boolean);
+    if (operands.some(t => /^[0-9a-f]{6,40}$/i.test(t))) {
+      return `[MALFORMED GIT] "git commit --amend <hash>" does NOT amend that commit — --amend rewrites HEAD only; the hash parses as a pathspec. To change a non-HEAD commit: script an interactive rebase (GIT_SEQUENCE_EDITOR + GIT_EDITOR with \`git -C <repo> rebase -i <hash>^\`) or reset the branch when the commit IS at HEAD. First VERIFY the hash's repo: \`git -C <repo> rev-parse --verify <hash>^{commit}\`. NEVER fall back to bare \`git commit --amend\` — it rewrites whatever HEAD is checked out. If the target can't be verified, ask_user which repository.`;
+    }
+  }
+
+  // Unbound git mutation — the task names a git target (hash, path, repo
+  // vocabulary) but the command carries no `git -C` and no action.cwd, so it
+  // would run in the neutral default dir and mutate whatever repo sits there.
+  const isGitMutation = isGit && _GIT_MUTATE_RE.test(text);
+  if (isGitMutation && !/\bgit\s+-C\s+\S+/.test(text) && !action.cwd) {
+    const hashes = [...new Set((String(task).match(_HASH_TOKEN_RE) || []).filter(h => /[a-f]/i.test(h)))];
+    const namesTarget = hashes.length > 0 || /\/[\w./-]{3,}/.test(task) || /\b(?:repo|repository)\b/i.test(task);
+    if (namesTarget) {
+      // Probe — resolve the task's hashes against candidate repos now so the
+      // guidance carries the verified binding, not just a warning.
+      let hint = '';
+      if (hashes.length) {
+        const found = [];
+        for (const h of hashes.slice(0, 4)) {
+          const repo = await _findHashRepo(h, _resolveCwd(action.cwd, cwd));
+          if (repo) found.push(`${h} → ${repo}`);
+        }
+        hint = found.length
+          ? ` Probed bindings: ${found.join('; ')} — re-issue every git command as \`git -C <that repo> ...\`.`
+          : ` The hash(es) were NOT found in any local repository (cwd, ~/Desktop/projects) — do NOT guess; ask_user which repository.`;
+        if (logger) logger.info(`[cli.agent] unbound git mutation probed hashes: ${found.join('; ') || 'none'}`, { task: String(task).slice(0, 60) });
+      }
+      return `[UNBOUND GIT MUTATION] The task names a git target but this command has no \`git -C <repo>\` or cwd binding — it would run in a neutral directory and mutate whatever repo happens to be checked out (observed: an amend landed in the parent repo instead of the nested one).${hint}`;
+    }
+  }
+
+  // fs-mutation premise: absolute-path operands that don't exist mean the
+  // command targets a different tree than the task assumes — verify first.
+  if (!isGit && _FS_MUTATE_RE.test(text)) {
+    const absTargets = (text.match(/(?:^|\s)(\/[^\s"'`]+)/g) || [])
+      .map(t => t.trim())
+      .filter(t => t.length > 1 && !/^\/(?:dev|System\/Volumes)\b/.test(t));
+    const missing = absTargets.filter(t => { try { return !fs.existsSync(t); } catch (_) { return false; } });
+    if (missing.length) {
+      return `[PREMISE — target does not exist] ${missing.slice(0, 3).join(', ')}. Verify the path first (ls/stat) — the task may target a different directory/repo than this command assumes.`;
+    }
+  }
+  return null;
+}
+
+// Post-observation mutation/verify tracking + premise-error classification.
+// Returns the possibly-annotated observation.
+function _mutationObserve({ action, observation, ctx }) {
+  const text = [action.script, action.cmd, ...(Array.isArray(action.argv) ? action.argv : [])].filter(Boolean).join(' ');
+  const isMutation = _GIT_MUTATE_RE.test(text) || _FS_MUTATE_RE.test(text);
+  const succeeded = ctx.succeededSigs.has(ctx.sig) || /\bpty\b/.test(observation) === false && /exitCode=0\b/.test(observation);
+  if (isMutation && succeeded) { ctx.sawMutation = true; ctx.verifiedAfterMutation = false; }
+  else if (succeeded && !isMutation && ['run_shell', 'run_cmd', 'pty_exec'].includes(action.action)) ctx.verifiedAfterMutation = true;
+  if (!succeeded && _PREMISE_ERR_RE.test(observation) && isMutation) {
+    return `[PREMISE FAILED — the named target does not exist in this location. Do NOT retry a mutation variant — re-verify the target (\`git -C <repo> rev-parse --verify <hash>^{commit}\`, ls/stat the path) or ask_user which repo/path was meant.]\n${observation}`;
+  }
+  return observation;
+}
 
 async function _genericRunLoop({ task, cwd, env, timeoutMs, _progressCallbackUrl, _stepIndex, protectedPaths }) {
   // Library-install fast path — "install <pkg> npm/pip package" resolves
@@ -2691,6 +2817,10 @@ async function _genericRunLoop({ task, cwd, env, timeoutMs, _progressCallbackUrl
   const transcript = [];
   const failedSigs = new Map(); // action signature → fail count
   const succeededSigs = new Set(); // signatures that already ran clean — don't re-run (observed: recovery loop opened the same URL twice → duplicate tabs)
+  // Mutation contract state — a git-targeted task that ran a mutation can't
+  // call done until a read-only evidence command verified the post-state.
+  let _sawMutation = false;
+  let _verifiedAfterMutation = true;
   // Stall detector — same discipline as the descriptor loop: parse errors,
   // invalid actions, and failing/empty results bump the score; at 3+ the next
   // observation carries a forced research steer and the UI sees "researching".
@@ -2795,6 +2925,16 @@ async function _genericRunLoop({ task, cwd, env, timeoutMs, _progressCallbackUrl
       }
 
       if (action.action === 'done') {
+        // Verify-before-done — a git-targeted task that ran a mutation must
+        // produce post-state evidence first (observed: the agent reported "a
+        // new commit was created" — not the requested amend — and the step
+        // still marked complete).
+        const _taskIsGit = /\bgit\b|\b(?:commit|amend|rebase)\b|\b[0-9a-f]{7,40}\b/i.test(task);
+        if (_taskIsGit && _sawMutation && !_verifiedAfterMutation) {
+          loopHistory.push({ turn, action, observation: '[VERIFY BEFORE DONE] You ran a mutating git command but never checked the post-state. Run a read-only evidence command first (e.g. git -C <repo> log --format="%h %s" -3) and confirm it proves the task goal before calling done again.' });
+          transcript.push({ turn, action, outcome: { ok: false, result: 'done-without-verification' }, thoughts: action.thinking || null });
+          continue;
+        }
         // Honest done — a `done` whose prose says the task failed is a
         // failure, not a green step. Returning ok:false lets reviewExecution /
         // evaluateSkills see the real outcome instead of a falsified success.
@@ -2844,6 +2984,18 @@ async function _genericRunLoop({ task, cwd, env, timeoutMs, _progressCallbackUrl
       // Set by branches that produced real output — drives the fall-through
       // stall check at the bottom (same discipline as the descriptor loop).
       let _productive = false;
+
+      // Mutation contract — verify the action's premise before spawn. A
+      // blocked action returns guidance as a failed-premise observation; the
+      // model's next turn must re-resolve or ask, never retry the same shape.
+      const _contractObs = await _mutationGuard({ action, task, cwd, logger });
+      if (_contractObs) {
+        loopHistory.push({ turn, ...action, observation: _contractObs.slice(0, OBSERVATION_CHARS) });
+        transcript.push({ turn, action, observation: _contractObs.slice(0, 300), outcome: { ok: false, error: 'contract-blocked' }, thoughts: action.thinking || null });
+        logger.warn(`[cli.agent] generic loop turn=${turn} contract-blocked ${action.action}`, { task: String(task).slice(0, 60) });
+        _bumpStall(turn);
+        continue;
+      }
 
       if (action.action === 'run_shell') {
         const script = String(action.script || '').trim();
@@ -3024,6 +3176,13 @@ async function _genericRunLoop({ task, cwd, env, timeoutMs, _progressCallbackUrl
       } else {
         observation = `unknown action: ${action.action} — valid: run_shell, run_cmd, run_help, pty_exec, pty_send, web_search, web_fetch, done, ask_user`;
       }
+
+      // Mutation tracking + premise-error classification — failed mutations
+      // whose stderr is target-shaped get reroute-to-verify guidance.
+      observation = _mutationObserve({
+        action, observation,
+        ctx: { sig: _sig, succeededSigs, get sawMutation() { return _sawMutation; }, set sawMutation(v) { _sawMutation = v; }, get verifiedAfterMutation() { return _verifiedAfterMutation; }, set verifiedAfterMutation(v) { _verifiedAfterMutation = v; } },
+      });
 
       // Local Network denial — LAN-errno signatures in a command observation
       // may be macOS refusing this app's Local Network permission, not a real

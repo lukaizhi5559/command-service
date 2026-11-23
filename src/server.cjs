@@ -126,6 +126,10 @@ const { gestureAgent } = require('./skills/gesture.agent.cjs');
 const { arrowGridAgent } = require('./skills/arrow.grid.agent.cjs');
 const { turnLoopAgent } = require('./skills/turn.loop.agent.cjs');
 const { domAct } = require('./skills/dom.act.cjs');
+const { screenActAgent } = require('./skills/screen.act.agent.cjs');
+const { screenTaskAgent } = require('./skills/screen.task.agent.cjs');
+const { mouseAgent } = require('./skills/mouse.agent.cjs');
+const { keyboardAgent } = require('./skills/keyboard.agent.cjs');
 // RETIRED — creator.agent / reviewer.agent / skillCreator.skill:
 // the legacy skill-authoring apparatus is removed. Reusable procedures are
 // authored plans + localPlanTemplates now.
@@ -166,7 +170,7 @@ const DISPATCHABLE_SKILLS = [
   'project.launcher', 'project.editor', 'project.stopper', 'user.agent',
   'web.agent', 'video.agent', 'edit.agent', 'doc.read', 'task.agent',
   'media.transcribe', 'app.agent', 'system.introspect', 'tool.discover',
-  'provider.discovery',
+  'provider.discovery', 'screen.act.agent', 'screen.task.agent', 'mouse.agent', 'keyboard.agent',
 ];
 
 // Browser-driving kill switch — settings.browserAutomation=false (or
@@ -218,8 +222,77 @@ class CommandServiceMCPServer {
       };
     }
 
+    // Dormant-driver hard block — the legacy UI-driver stack is not
+    // plannable (planSkillsV2 lockdown + prompt contract). Two hazards
+    // gated here:
+    //   1) browser automation OFF → every dormant dispatch is dead work
+    //      (kill-switch) or worse (app.agent's OS lane types chords into
+    //      the user's live apps — observed: a "read-only" read_screen
+    //      sent Cmd+L/Cmd+A/Backspace/Escape into a Calendar page).
+    //   2) app.agent mutating/OS-lane actions → physical input in EVERY
+    //      config; the screen stack replaced them.
+    // Allowlisted: app.agent's non-mutating reads — scan_page+extOnly
+    // (in-tab CDP evaluate; what the planning-lane page.read uses) and
+    // read_url (HTTP fetch). Internal `require()`s never pass this gate.
+    const _DORMANT_DRIVERS = new Set([
+      'app.agent', 'browser.agent', 'playwright.agent', 'browser.act',
+      'dom.act', 'turn.loop.agent', 'gesture.agent', 'arrow.grid.agent',
+      'form.fill.agent', 'web.agent',
+    ]);
+    const _nonMutatingAppRead = skill === 'app.agent'
+      && ((args?.action === 'scan_page' && args?.extOnly === true)
+          || args?.action === 'read_url' || args?.action === 'get_recent_ocr'
+          || args?.action === 'verify_app_focused');
+    // web.agent excluded — headless public-web research, never drives UI.
+    const _dormantBlocked = _DORMANT_DRIVERS.has(skill)
+      && skill !== 'web.agent'
+      && !_nonMutatingAppRead
+      && (!isBrowserAutomationEnabled() || skill === 'app.agent');
+    if (_dormantBlocked) {
+      logger.warn('[Skill] Blocked — dormant driver (legacy UI stack retired)', { skill, action: args?.action, browserOff: !isBrowserAutomationEnabled() });
+      return {
+        success: false,
+        error: 'dormant_driver',
+        message: `'${skill}' is a retired UI driver — plans use screen.task.agent / screen.act.agent; reads use the capture lanes or ext-only evaluate. Update the emitting seam.`,
+      };
+    }
+    if (_DORMANT_DRIVERS.has(skill) && !_nonMutatingAppRead) {
+      logger.warn('[Skill] Dormant driver dispatched — legacy UI stack', { skill, action: args?.action });
+    }
+
     if (skill !== 'terminal.agent') logger.info('Routing automation skill', { skill });
     else logger.debug('Routing automation skill', { skill });
+
+    // ── Physical-input lane ──────────────────────────────────────────────
+    // screen.task/screen.act drive ONE real machine — mouse, keyboard, the
+    // focused window. Two in-flight calls interleave keystrokes and clicks
+    // into the same window (observed: six overlapping Spotify recipe replays
+    // blurred each other's fields). Identical in-flight calls JOIN the same
+    // run — retry loops get the real result instead of a stale replay;
+    // different calls queue. mouse/keyboard stay un-serialized — screen.act
+    // invokes them internally per-event.
+    const _SCREEN_LANE = new Set(['screen.task.agent', 'screen.act.agent']);
+    if (_SCREEN_LANE.has(skill)) {
+      const key = `${skill}:${JSON.stringify(args?.prompt || args?.goal || args?.steps || args)}`;
+      const existing = (this._screenRuns || (this._screenRuns = new Map())).get(key);
+      if (existing) {
+        logger.warn('[screen-lane] joining identical in-flight run', { skill });
+        return existing;
+      }
+      if (this._screenRuns.size) logger.warn('[screen-lane] queued behind in-flight screen run', { skill });
+      this._screenLaneTail = this._screenLaneTail || Promise.resolve();
+      const run = this._screenLaneTail.then(() => {
+        // Queued behind an in-flight run when the caller was cancelled — the
+        // run must not start now (physical input would fire with no owner).
+        if (opts.signal?.aborted) return { ok: false, error: 'cancelled', cancelled: true };
+        return this._skillAtomic(
+          skill === 'screen.task.agent' ? screenTaskAgent : screenActAgent, args, opts);
+      });
+      this._screenLaneTail = run.then(() => undefined, () => undefined);
+      this._screenRuns.set(key, run);
+      run.finally(() => { if (this._screenRuns.get(key) === run) this._screenRuns.delete(key); });
+      return run;
+    }
 
     switch (skill) {
       case 'shell.run':
@@ -297,6 +370,16 @@ class CommandServiceMCPServer {
         return await this._skillAtomic(turnLoopAgent, args, opts);
       case 'dom.act':
         return await this._skillAtomic(domAct, args, opts);
+
+      // ── Screen-level agents (td-ui-parse: pure-vision elements + CGEvent)
+      case 'screen.act.agent':
+        return await this._skillAtomic(screenActAgent, args, opts);
+      case 'screen.task.agent':
+        return await this._skillAtomic(screenTaskAgent, args, opts);
+      case 'mouse.agent':
+        return await this._skillAtomic(mouseAgent, args, opts);
+      case 'keyboard.agent':
+        return await this._skillAtomic(keyboardAgent, args, opts);
 
       case 'project.builder':
         return await this._skillProjectBuilder(args);
@@ -1584,6 +1667,71 @@ class CommandServiceMCPServer {
         return;
       }
 
+      // ── Debug surface — plan/scene inspection + manual iteration stepper ──
+      //   /screen.plan        {prompt} → derived {goal,setup,steps,notes,dest}
+      //   /screen.scene       {prompt|goal,display?} → first observe→mask→decide
+      //   /screen.debug.start {prompt,display?,runSetup?} → plan + setup + scene0
+      //   /screen.debug.step  {runId,commit?} → one iteration (commit:false =
+      //                        package only; true = one normal iter; {action}
+      //                        = caller-forced micro at the proposal seam)
+      //   /screen.debug.state {runId} → ctx.memory dump
+      const _DEBUG_ROUTES = new Set(['/screen.plan', '/screen.scene', '/screen.debug.start', '/screen.debug.step', '/screen.debug.state']);
+      if (req.method === 'POST' && _DEBUG_ROUTES.has(req.url)) {
+        let body = '';
+        req.on('data', c => { body += c; });
+        req.on('end', async () => {
+          const out = (data) => { res.writeHead(200); res.end(JSON.stringify({ success: true, data })); };
+          try {
+            const { payload } = JSON.parse(body || '{}');
+            const { buildTaskPlan } = require('./skills/screen.task.agent.cjs');
+            const { screenDebugStep, screenDebugState } = require('./skills/screen.act.agent.cjs');
+            if (req.url === '/screen.plan') {
+              const r = await buildTaskPlan(payload || {});
+              return out({ ok: true, goal: r.goal, setup: r.plan?.setup || [],
+                steps: r.plan?.steps || [], notes: r.plan?.notes || [],
+                destination: r.plan?.destination || r.plan?.dest || null,
+                entityItems: r.entityItems || null,
+                searchSeeded: payload?._searchSeeded || null });
+            }
+            if (req.url === '/screen.debug.state') return out(screenDebugState(payload || {}));
+            // scene / debug.start / debug.step — a debug-run iteration.
+            const args = { ...(payload || {}) };
+            if (req.url === '/screen.debug.start') {
+              const bp = await buildTaskPlan(args);
+              args.goal = args.goal || args.prompt || bp.goal;
+              args.steps = bp.plan?.steps || [];
+              if (!args.destination && bp.plan?.steps) {
+                const cnv = bp.plan.steps.find(s => /container-nav/i.test(String(s.why || '')));
+                const raw = cnv && (Array.isArray(cnv.match) ? cnv.match[0] : cnv.match);
+                if (raw) args.destination = String(raw).replace(/\s+(playlist|folder|album|list)s?$/i, '');
+              }
+              if (args.runSetup !== false && bp.plan?.setup?.length) {
+                try { const { _internals } = require('./skills/screen.task.agent.cjs'); await _internals.runSetup?.(bp.plan.setup, args); }
+                catch (_) { /* setup best-effort in debug */ }
+              }
+              const r = await screenDebugStep({ ...args, commit: false });
+              return out({ ...r, plan: { setup: bp.plan?.setup || [], steps: bp.plan?.steps || [], notes: bp.plan?.notes || [] }, searchSeeded: args._searchSeeded || null });
+            }
+            const r = await screenDebugStep(args);
+            // askModel — replay the packaged payload through the same
+            // askDecision path (key stays server-side) so callers can see the
+            // model's answer next to the payload it saw.
+            if (args.askModel && r?.debug && r.modelPayload) {
+              try {
+                const { askDecision } = require('./skill-helpers/decision.cjs');
+                r.modelAnswer = await askDecision(r.modelPayload.questions,
+                  { state: r.modelPayload.state, timeoutMs: 20000 });
+              } catch (_) { r.modelAnswer = null; }
+            }
+            return out(r);
+          } catch (e) {
+            res.writeHead(200);
+            res.end(JSON.stringify({ success: true, data: { ok: false, error: e.message } }));
+          }
+        });
+        return;
+      }
+
       // ── POST /automation.cancel ─────────────────────────────────────────────
       // Called by main.js when the user clicks Cancel. Aborts every in-flight
       // command.automate run (graceful signal propagation) AND force-kills the
@@ -1613,6 +1761,15 @@ class CommandServiceMCPServer {
             if (abortedCount > 0) {
               try { forceKillPlaywright(); }
               catch (fkErr) { logger.warn(`[automation.cancel] forceKillPlaywright error (non-fatal): ${fkErr.message}`); }
+              // Screen-input cancel: an in-flight native act (doType is 25ms/char)
+              // keeps typing after the JS abort — tell td-ui-parse to stop now.
+              try {
+                const cr = http.request({ hostname: '127.0.0.1', port: 3008, path: '/screen/cancel',
+                  method: 'POST', headers: { 'Content-Type': 'application/json', 'Content-Length': 2 },
+                  timeout: 3000 }, (r) => r.resume());
+                cr.on('error', () => {}); cr.on('timeout', () => cr.destroy());
+                cr.end('{}');
+              } catch (_) {}
             }
             res.writeHead(200);
             res.end(JSON.stringify({ ok: true, aborted: abortedCount }));

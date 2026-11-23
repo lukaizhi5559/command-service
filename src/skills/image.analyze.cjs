@@ -236,6 +236,23 @@ async function _analyzeOneImage(filePath, ext, effectiveQuery, timeoutMs, startT
   };
 }
 
+// Per-process materialization cache — path+mtimeMs → extraction text. An
+// upstream `image.analyze` step and the executor-side materialization guard
+// (screen.task.agent._materializeImageRefs) share this process, so a goal
+// that already carried {{prev_stdout}} never re-analyzes the same file.
+const _MATERIALIZED = new Map();
+function _mkey(filePath) {
+  try { const s = require('fs').statSync(filePath); return `${filePath}::${s.mtimeMs}`; } catch (_) { return null; }
+}
+function _recordMaterialized(filePath, text) {
+  const k = _mkey(filePath);
+  if (k && text) { if (_MATERIALIZED.size > 50) _MATERIALIZED.delete(_MATERIALIZED.keys().next().value); _MATERIALIZED.set(k, text); }
+}
+function _lookupMaterialized(filePath) {
+  const k = _mkey(filePath);
+  return k ? (_MATERIALIZED.get(k) || null) : null;
+}
+
 async function imageAnalyze(args = {}) {
   let { filePath, filePaths, query, priorContracts } = args;
   // Planner arg aliases — plans occasionally emit imagePath/path/file/target.
@@ -342,6 +359,8 @@ async function imageAnalyze(args = {}) {
     return { ok: false, success: false, error: analyses[0]?.error || 'Image analysis failed' };
   }
 
+  for (const a of okOnes) _recordMaterialized(a.filePath, a.answer);
+
   const elapsed = Date.now() - startTime;
 
   // Single-image result keeps the original flat shape
@@ -413,4 +432,4 @@ function getOutputContract(result) {
   };
 }
 
-module.exports = { imageAnalyze, getOutputContract };
+module.exports = { imageAnalyze, getOutputContract, _lookupMaterialized, _recordMaterialized };

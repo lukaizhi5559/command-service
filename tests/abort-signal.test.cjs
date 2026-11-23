@@ -15,6 +15,8 @@
 const { shellRun } = require('../src/skills/shell.run.cjs');
 const { browserAct, runWithActSignal, _currentSignal } = require('../src/skills/browser.act.cjs');
 const { runInstructionSkill } = require('../src/skills/instruction.runner.cjs');
+const { screenActAgent } = require('../src/skills/screen.act.agent.cjs');
+const { screenTaskAgent } = require('../src/skills/screen.task.agent.cjs');
 
 let passed = 0, failed = 0;
 function ok(cond, label, extra = '') {
@@ -89,6 +91,24 @@ function ok(cond, label, extra = '') {
       sessionId: 't', instructions: '1. press Tab', timeoutMs: 5000, _abortSignal: c.signal,
     });
     ok(r.ok === false && r.cancelled === true, 'instruction.runner: pre-aborted → cancelled', JSON.stringify(r));
+  }
+
+  // ── screen agents — the "cancel kept moving the mouse" lane ──────────────
+
+  // 9. Pre-aborted → screen.act exits before any physical input.
+  {
+    const c = new AbortController();
+    c.abort();
+    const r = await screenActAgent({ sessionId: 't', steps: [], _abortSignal: c.signal });
+    ok(r.ok === false && r.cancelled === true, 'screen.act: pre-aborted → cancelled', JSON.stringify(r));
+  }
+
+  // 10. Pre-aborted → screen.task exits before runSetup/parse/model work.
+  {
+    const c = new AbortController();
+    c.abort();
+    const r = await screenTaskAgent({ sessionId: 't', goal: 'open x', _abortSignal: c.signal });
+    ok(r.ok === false && r.cancelled === true, 'screen.task: pre-aborted → cancelled', JSON.stringify(r));
   }
 
   console.log(`\n${passed} passed, ${failed} failed`);

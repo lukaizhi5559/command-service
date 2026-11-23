@@ -516,6 +516,33 @@ const _DOM_SCANNER_SCRIPT = `(() => {
     return '';
   }
 
+  // Ancestor chain — nearest-first list of meaningful containers. A node
+  // qualifies as a container when it has a structural role OR an accessible
+  // label; this is what lets the scene graph know WHICH menu/dialog/list an
+  // element lives inside (scope, membership), not just that it exists.
+  const CONTAINER_ROLES = /^(dialog|menu|menubar|listbox|list|tree|grid|navigation|main|complementary|banner|form|region|toolbar|tablist|group|feed|article|section)$/i;
+  function getAncestors(el) {
+    const out = [];
+    let node = el.parentElement;
+    for (let i = 0; i < 8 && node && node !== document.documentElement; i++) {
+      const role = node.getAttribute && node.getAttribute('role');
+      const label = (node.getAttribute && (node.getAttribute('aria-label') || node.getAttribute('data-testid')))
+        || (node.querySelector && i < 5 ? ((node.querySelector('h1,h2,h3,[role="heading"]') || {}).innerText || '').trim().slice(0, 60) : '')
+        || '';
+      const isContainer = (role && CONTAINER_ROLES.test(role)) || label;
+      if (isContainer) {
+        out.push({
+          role: role || (node.tagName === 'NAV' ? 'navigation' : node.tagName === 'MAIN' ? 'main' : 'group'),
+          label: String(label || '').slice(0, 80),
+          rect: getRect(node),
+          expanded: node.getAttribute && node.getAttribute('aria-expanded') === 'true' ? true : undefined,
+        });
+      }
+      node = node.parentElement;
+    }
+    return out;
+  }
+
   // Region classification: walk up to the nearest semantic landmark element.
   // Returns one of: header, nav, main, sidebar, footer, dialog, overlay, main (fallback).
   // Helps the LLM distinguish primary content from secondary navigation/chrome.
@@ -573,6 +600,7 @@ const _DOM_SCANNER_SCRIPT = `(() => {
   // Filter and build element list
   const elements = [];
   let counter = 1;
+  const aeForFocus = document.activeElement;
 
   for (const { el, source } of candidates) {
     if (!isVisible(el)) continue;
@@ -605,6 +633,14 @@ const _DOM_SCANNER_SCRIPT = `(() => {
       contenteditable: el.isContentEditable,
       context,
       region,
+      ancestors: getAncestors(el),
+      state: {
+        expanded: el.getAttribute('aria-expanded') === 'true' ? true : (el.getAttribute('aria-expanded') === 'false' ? false : undefined),
+        selected: el.getAttribute('aria-selected') === 'true' || el.getAttribute('aria-current') ? true : undefined,
+        checked: el.getAttribute('aria-checked') === 'true' || (el.tagName === 'INPUT' && el.checked) ? true : undefined,
+        focused: el === aeForFocus || (aeForFocus && el.contains(aeForFocus)) ? true : undefined,
+      },
+      keys: el.getAttribute('aria-keyshortcuts') || el.getAttribute('accesskey') || '',
     });
   }
 
@@ -673,6 +709,8 @@ const _DOM_SCANNER_SCRIPT = `(() => {
     activeElement,
     yaml: lines.join('\\n'),
     count: capped.length,
+    url: location.href,
+    title: document.title || '',
   });
 })()`;
 
